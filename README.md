@@ -1,6 +1,8 @@
 # Pegaflow
 
-![Pegaflow Logo](./assets/logo.png)
+<div align="center">
+  <img src="./assets/logo.png" width="200" />
+</div>
 
 PegaFlow draws its name from Pegasus, the winged horse of ancient myth — a creature born to cross impossible distances with effortless grace.
 
