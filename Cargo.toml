@@ -1,6 +1,3 @@
-[package]
-name = "pegaflow"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
+[workspace]
+members = ["pega-core", "python"]
+resolver = "2"
