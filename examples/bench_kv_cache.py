@@ -24,19 +24,25 @@ import subprocess
 import time
 import signal
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 
 class VLLMServer:
     """Context manager for vLLM server lifecycle."""
 
     def __init__(self, model: str, port: int, use_pegaflow: bool = False,
-                 enable_prefix_caching: bool = False, log_file: Optional[Path] = None):
+                 enable_prefix_caching: bool = False, log_file: Optional[Path] = None,
+                 health_endpoints: Optional[Sequence[str]] = None):
         self.model = model
         self.port = port
         self.use_pegaflow = use_pegaflow
         self.enable_prefix_caching = enable_prefix_caching
         self.log_file = log_file
+        self.health_endpoints = list(health_endpoints) if health_endpoints else [
+            "/health",
+            "/metrics",
+            "/invocations",
+        ]
         self.process: Optional[subprocess.Popen] = None
         self.log_handle = None
         
@@ -114,21 +120,25 @@ class VLLMServer:
         import requests
         
         start_time = time.time()
-        url = f"http://localhost:{self.port}/health"
-        
         print("Waiting for server to be ready...")
         while time.time() - start_time < timeout:
-            try:
-                response = requests.get(url, timeout=1)
-                if response.status_code == 200:
-                    print("✓ Server is ready!\n")
-                    time.sleep(2)  # Extra buffer
-                    return
-            except requests.exceptions.RequestException:
-                pass
+            for endpoint in self.health_endpoints:
+                url = f"http://localhost:{self.port}{endpoint}"
+                try:
+                    response = requests.get(url, timeout=1)
+                    if response.status_code == 200:
+                        print(f"✓ Server is ready! (checked {endpoint})\n")
+                        time.sleep(2)  # Extra buffer
+                        return
+                except requests.exceptions.RequestException:
+                    continue
             time.sleep(2)
         
-        raise TimeoutError(f"Server did not become ready within {timeout} seconds")
+        endpoints_str = ", ".join(self.health_endpoints)
+        raise TimeoutError(
+            f"Server did not become ready within {timeout} seconds "
+            f"(endpoints tried: {endpoints_str})"
+        )
 
 
 def run_benchmark(model: str, port: int, num_prompts: int, input_len: int, output_len: int,
