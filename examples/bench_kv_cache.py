@@ -116,7 +116,7 @@ class VLLMServer:
         raise TimeoutError(f"Server did not become ready within {timeout} seconds")
 
 
-def run_benchmark(port: int, num_prompts: int, input_len: int, output_len: int,
+def run_benchmark(model: str, port: int, num_prompts: int, input_len: int, output_len: int,
                   result_file: Path, label: str, request_rate: float = 1.0,
                   seed: int = 42) -> dict:
     """Run vllm bench serve and return the results."""
@@ -125,7 +125,7 @@ def run_benchmark(port: int, num_prompts: int, input_len: int, output_len: int,
         "--backend", "openai",
         "--host", "localhost",
         "--port", str(port),
-        "--model", "gpt2",  # Model name for API
+        "--model", model,
         "--dataset-name", "random",
         "--random-input-len", str(input_len),
         "--random-output-len", str(output_len),
@@ -315,14 +315,14 @@ def main():
         # Cold cache run
         result_file = run_dir / "baseline_cold.json"
         all_results["baseline_cold"] = run_benchmark(
-            args.baseline_port, args.num_prompts, args.input_len,
+            args.model, args.baseline_port, args.num_prompts, args.input_len,
             args.output_len, result_file, "baseline_cold", args.request_rate, args.seed
         )
 
         # Warm cache run (same requests again - using same seed for identical requests)
         result_file = run_dir / "baseline_warm.json"
         all_results["baseline_warm"] = run_benchmark(
-            args.baseline_port, args.num_prompts, args.input_len,
+            args.model, args.baseline_port, args.num_prompts, args.input_len,
             args.output_len, result_file, "baseline_warm", args.request_rate, args.seed
         )
 
@@ -336,14 +336,14 @@ def main():
         # Cold cache run
         result_file = run_dir / "pegaflow_cold.json"
         all_results["pegaflow_cold"] = run_benchmark(
-            args.pegaflow_port, args.num_prompts, args.input_len,
+            args.model, args.pegaflow_port, args.num_prompts, args.input_len,
             args.output_len, result_file, "pegaflow_cold", args.request_rate, args.seed
         )
 
         # Warm cache run (same requests again - using same seed for identical requests)
         result_file = run_dir / "pegaflow_warm.json"
         all_results["pegaflow_warm"] = run_benchmark(
-            args.pegaflow_port, args.num_prompts, args.input_len,
+            args.model, args.pegaflow_port, args.num_prompts, args.input_len,
             args.output_len, result_file, "pegaflow_warm", args.request_rate, args.seed
         )
 
