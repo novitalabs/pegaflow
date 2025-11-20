@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 cudarc = { version = "0.18.0", features = ["cuda-12040"] }
 tracing = "0.1"
+offset-allocator = "0.2.0"

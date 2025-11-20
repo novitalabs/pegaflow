@@ -1,8 +1,8 @@
-use std::{
-    collections::HashMap,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+pub mod allocator;
 
+use std::{collections::HashMap, sync::Mutex};
+
+use allocator::{Allocation, ScaledOffsetAllocator};
 use tracing::{debug, info, instrument};
 
 pub struct PegaEngine {
@@ -12,8 +12,8 @@ pub struct PegaEngine {
     kv_storage: HashMap<(String, Vec<u8>), Block>,
     /// Pinned memory pool for zero-copy GPU transfers
     pinned_pool_ptr: *mut u8,
-    pinned_pool_size: usize,
-    pinned_pool_offset: AtomicUsize,
+    /// Allocator for managing pinned memory
+    allocator: Mutex<ScaledOffsetAllocator>,
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +34,8 @@ pub struct Block {
     /// Pointer to pinned memory (not owned, managed by PegaEngine's pool)
     pub ptr: *mut u8,
     pub size: usize,
+    /// Allocation handle for freeing memory
+    allocation: Allocation,
 }
 
 impl PegaEngine {
@@ -53,6 +55,10 @@ impl PegaEngine {
             }
         }
 
+        // Create allocator for managing the pinned memory pool
+        let allocator = ScaledOffsetAllocator::new(pool_size as u64)
+            .expect("Failed to create memory allocator");
+
         info!(
             "Allocated pinned memory pool: {} GB ({} bytes)",
             pool_size as f64 / 1e9,
@@ -63,8 +69,7 @@ impl PegaEngine {
             kv_caches: HashMap::new(),
             kv_storage: HashMap::new(),
             pinned_pool_ptr: pool_ptr as *mut u8,
-            pinned_pool_size: pool_size,
-            pinned_pool_offset: AtomicUsize::new(0),
+            allocator: Mutex::new(allocator),
         }
     }
 
@@ -112,23 +117,40 @@ impl PegaEngine {
         self.kv_caches.len()
     }
 
-    /// Allocate pinned memory from the pool (bump allocator, no deallocation)
-    fn allocate_pinned(&self, size: usize) -> *mut u8 {
-        let offset = self.pinned_pool_offset.fetch_add(size, Ordering::SeqCst);
-        if offset + size > self.pinned_pool_size {
-            panic!(
-                "Pinned memory pool exhausted! Used: {:.2} GB / {:.2} GB",
-                (offset + size) as f64 / 1e9,
-                self.pinned_pool_size as f64 / 1e9
-            );
-        }
-        unsafe { self.pinned_pool_ptr.add(offset) }
+    /// Allocate pinned memory from the pool
+    fn allocate_pinned(&self, size: usize) -> Result<(Allocation, *mut u8), String> {
+        let mut allocator = self.allocator.lock().unwrap();
+
+        let allocation = allocator
+            .allocate(size as u64)
+            .map_err(|e| format!("Allocation error: {}", e))?
+            .ok_or_else(|| {
+                let report = allocator.storage_report();
+                format!(
+                    "Pinned memory pool exhausted! Requested: {:.2} MB, Free: {:.2} MB, Largest: {:.2} MB",
+                    size as f64 / 1e6,
+                    report.total_free_bytes as f64 / 1e6,
+                    report.largest_free_allocation_bytes as f64 / 1e6
+                )
+            })?;
+
+        let ptr = unsafe { self.pinned_pool_ptr.add(allocation.offset_bytes as usize) };
+        Ok((allocation, ptr))
+    }
+
+    /// Free pinned memory allocation
+    fn free_pinned(&self, allocation: Allocation) {
+        let mut allocator = self.allocator.lock().unwrap();
+        allocator.free(allocation);
     }
 
     /// Get pinned memory usage statistics
     pub fn get_pinned_memory_usage(&self) -> (usize, usize) {
-        let used = self.pinned_pool_offset.load(Ordering::SeqCst);
-        (used, self.pinned_pool_size)
+        let allocator = self.allocator.lock().unwrap();
+        let report = allocator.storage_report();
+        let total = allocator.total_bytes() as usize;
+        let used = total - report.total_free_bytes as usize;
+        (used, total)
     }
 
     #[instrument(
@@ -177,7 +199,7 @@ impl PegaEngine {
                 .checked_mul(registration.segments)
                 .ok_or_else(|| "Block size overflow".to_string())?;
 
-            let cpu_ptr = self.allocate_pinned(block_size);
+            let (allocation, cpu_ptr) = self.allocate_pinned(block_size)?;
 
             // Copy each segment (K/V) directly to pinned memory
             for segment_idx in 0..registration.segments {
@@ -205,6 +227,7 @@ impl PegaEngine {
                 Block {
                     ptr: cpu_ptr,
                     size: block_size,
+                    allocation,
                 },
             );
         }
@@ -244,6 +267,32 @@ impl PegaEngine {
         let num_blocks = self.kv_storage.len();
         let total_bytes: usize = self.kv_storage.values().map(|block| block.size).sum();
         (num_blocks, total_bytes)
+    }
+
+    /// Remove a KV block and free its memory
+    #[instrument(level = "info", skip(self, block_hash), fields(layer = %layer_name))]
+    pub fn remove_kv_block(&mut self, layer_name: String, block_hash: Vec<u8>) -> bool {
+        let key = (layer_name, block_hash);
+        if let Some(block) = self.kv_storage.remove(&key) {
+            self.free_pinned(block.allocation);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Clear all stored KV blocks and free their memory
+    #[instrument(level = "info", skip(self))]
+    pub fn clear_all_kv_blocks(&mut self) {
+        let allocations: Vec<Allocation> = self
+            .kv_storage
+            .drain()
+            .map(|(_, block)| block.allocation)
+            .collect();
+
+        for allocation in allocations {
+            self.free_pinned(allocation);
+        }
     }
 
     /// Check which KV blocks are available in CPU storage
@@ -471,8 +520,6 @@ unsafe impl Sync for PegaEngine {}
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_cudarc_basic() {
         // Get a stream for GPU 0
