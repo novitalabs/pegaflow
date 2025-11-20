@@ -154,7 +154,7 @@ class PegaKVConnector(KVConnectorBase_V1):
         # STEP 3: Load KV blocks for each request and each layer
         # ============================================================
         try:
-            total_start = time.perf_counter()
+            transfer_start = time.perf_counter()
             total_blocks = 0
             total_layers = 0
 
@@ -182,18 +182,21 @@ class PegaKVConnector(KVConnectorBase_V1):
                         )
                         total_blocks += len(block_ids)
                         total_layers += 1
-                        print(f"[PegaKVConnector] Loaded layer {layer_name} for request {req_id}")
 
                     except Exception as e:
                         print(f"[PegaKVConnector] Failed to load layer {layer_name} for request {req_id}: {e}")
                         # Continue with other layers even if one fails
 
+            transfer_end = time.perf_counter()
             # ============================================================
             # STEP 4: Synchronize CUDA operations
             # ============================================================
             torch.cuda.synchronize()
             total_end = time.perf_counter()
-            total_time_ms = (total_end - total_start) * 1000
+
+            transfer_time_ms = (transfer_end - transfer_start) * 1000
+            sync_time_ms = (total_end - transfer_end) * 1000
+            total_time_ms = transfer_time_ms + sync_time_ms
 
             # Get pinned memory usage
             used_bytes, total_bytes = self.engine.get_pinned_memory_usage()
@@ -202,6 +205,8 @@ class PegaKVConnector(KVConnectorBase_V1):
             usage_pct = (used_bytes / total_bytes * 100) if total_bytes > 0 else 0
 
             print(f"[PegaKVConnector] ===== LOAD SUMMARY =====")
+            print(f"[PegaKVConnector] Transfer time: {transfer_time_ms:.2f} ms")
+            print(f"[PegaKVConnector] CUDA sync time: {sync_time_ms:.2f} ms")
             print(f"[PegaKVConnector] Total time: {total_time_ms:.2f} ms")
             print(f"[PegaKVConnector] Total layers: {total_layers}")
             print(f"[PegaKVConnector] Total blocks: {total_blocks}")

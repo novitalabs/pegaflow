@@ -1,9 +1,11 @@
 pub mod allocator;
 
-use std::{collections::HashMap, sync::Mutex};
+use std::{collections::HashMap, sync::Mutex, time::Instant};
 
 use allocator::{Allocation, ScaledOffsetAllocator};
 use tracing::{debug, info, instrument};
+
+const DEFAULT_PINNED_POOL_BYTES: usize = 10 * 1024 * 1024 * 1024; // 10GB
 
 pub struct PegaEngine {
     /// Store registered KV cache pointers (new IPC wrapper): layer_name -> registration
@@ -42,10 +44,17 @@ impl PegaEngine {
     /// Create a new PegaEngine instance
     #[instrument(level = "info")]
     pub fn new() -> Self {
+        Self::new_with_pool_size(DEFAULT_PINNED_POOL_BYTES)
+    }
+
+    /// Create a new PegaEngine instance with a custom pinned memory pool size
+    pub fn new_with_pool_size(pool_size: usize) -> Self {
         use cudarc::driver::sys;
 
-        // Allocate 10GB pinned memory pool
-        let pool_size = 10 * 1024 * 1024 * 1024; // 10GB
+        if pool_size == 0 {
+            panic!("Pinned memory pool size must be greater than zero");
+        }
+
         let mut pool_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
 
         unsafe {
@@ -117,25 +126,30 @@ impl PegaEngine {
         self.kv_caches.len()
     }
 
-    /// Allocate pinned memory from the pool
-    fn allocate_pinned(&self, size: usize) -> Result<(Allocation, *mut u8), String> {
+    /// Allocate pinned memory from the pool. Panics when the allocation cannot be satisfied.
+    fn allocate_pinned(&self, size: usize) -> (Allocation, *mut u8) {
+        if size == 0 {
+            panic!("Cannot allocate zero bytes from the pinned pool");
+        }
+
         let mut allocator = self.allocator.lock().unwrap();
 
-        let allocation = allocator
-            .allocate(size as u64)
-            .map_err(|e| format!("Allocation error: {}", e))?
-            .ok_or_else(|| {
+        let allocation = match allocator.allocate(size as u64) {
+            Ok(Some(allocation)) => allocation,
+            Ok(None) => {
                 let report = allocator.storage_report();
-                format!(
+                panic!(
                     "Pinned memory pool exhausted! Requested: {:.2} MB, Free: {:.2} MB, Largest: {:.2} MB",
                     size as f64 / 1e6,
                     report.total_free_bytes as f64 / 1e6,
                     report.largest_free_allocation_bytes as f64 / 1e6
-                )
-            })?;
+                );
+            }
+            Err(err) => panic!("Pinned memory allocation error: {}", err),
+        };
 
         let ptr = unsafe { self.pinned_pool_ptr.add(allocation.offset_bytes as usize) };
-        Ok((allocation, ptr))
+        (allocation, ptr)
     }
 
     /// Free pinned memory allocation
@@ -193,32 +207,10 @@ impl PegaEngine {
                 continue;
             }
 
-            // Allocate pinned memory for this block
-            let block_size = registration
-                .bytes_per_block
-                .checked_mul(registration.segments)
-                .ok_or_else(|| "Block size overflow".to_string())?;
+            let block_size = self.block_size(&registration)?;
+            let (allocation, cpu_ptr) = self.allocate_pinned(block_size);
 
-            let (allocation, cpu_ptr) = self.allocate_pinned(block_size)?;
-
-            // Copy each segment (K/V) directly to pinned memory
-            for segment_idx in 0..registration.segments {
-                let offset = self.segment_offset(&registration, block_idx, segment_idx)?;
-                let segment_offset = segment_idx * registration.bytes_per_block;
-                let dst_ptr = unsafe { cpu_ptr.add(segment_offset) };
-
-                // Create a slice for the destination
-                let buffer = unsafe {
-                    std::slice::from_raw_parts_mut(dst_ptr, registration.bytes_per_block)
-                };
-
-                self.copy_gpu_to_cpu(
-                    registration.data_ptr,
-                    offset,
-                    buffer,
-                    registration.bytes_per_block,
-                )?;
-            }
+            self.copy_block_gpu_to_cpu(&registration, block_idx, cpu_ptr)?;
 
             info!("insert key {}-{:?} to kv_storage", layer_name, block_hash);
 
@@ -358,6 +350,7 @@ impl PegaEngine {
         block_ids: Vec<i32>,
         block_hashes: Vec<Vec<u8>>,
     ) -> Result<(), String> {
+        let start_time = Instant::now();
         if block_ids.len() != block_hashes.len() {
             return Err("block_ids and block_hashes must have equal length".into());
         }
@@ -366,6 +359,7 @@ impl PegaEngine {
             return Err(format!("Layer {} not registered", layer_name));
         };
 
+        let mut total_transfer = 0;
         for (block_id, block_hash) in block_ids.into_iter().zip(block_hashes.into_iter()) {
             if block_id < 0 {
                 continue;
@@ -380,7 +374,6 @@ impl PegaEngine {
             }
 
             let key = (layer_name.clone(), block_hash.clone());
-            info!("load key {}-{:?} from kv_storage", layer_name, block_hash);
             let Some(block) = self.kv_storage.get(&key) else {
                 return Err(format!("Missing KV block for layer {}", layer_name));
             };
@@ -397,24 +390,17 @@ impl PegaEngine {
             }
 
             // Copy each segment from pinned memory to GPU
-            for segment_idx in 0..registration.segments {
-                let offset = self.segment_offset(&registration, block_idx, segment_idx)?;
-                let segment_offset = segment_idx * registration.bytes_per_block;
-                let src_ptr = unsafe { block.ptr.add(segment_offset) };
-
-                // Create a slice from pinned memory
-                let segment =
-                    unsafe { std::slice::from_raw_parts(src_ptr, registration.bytes_per_block) };
-
-                self.copy_cpu_to_gpu(
-                    registration.data_ptr,
-                    offset,
-                    segment,
-                    registration.bytes_per_block,
-                )?;
-            }
+            self.copy_block_cpu_to_gpu(&registration, block_idx, block.ptr)?;
+            total_transfer += block.size;
         }
 
+        let end_time = Instant::now();
+        // print cost
+        info!(
+            "load_kv_blocks_to_ipc: total_transfer = {} bytes, time = {} us",
+            total_transfer,
+            (end_time - start_time).as_micros()
+        );
         Ok(())
     }
 
@@ -482,6 +468,135 @@ impl PegaEngine {
             let result = sys::cuMemcpyHtoD_v2(dst_ptr, src_ptr as *const std::ffi::c_void, size);
             if result != sys::cudaError_enum::CUDA_SUCCESS {
                 return Err(format!("cuMemcpyHtoD failed: {:?}", result));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn block_size(&self, registration: &KVCacheRegistration) -> Result<usize, String> {
+        registration
+            .bytes_per_block
+            .checked_mul(registration.segments)
+            .ok_or_else(|| "Block size overflow".to_string())
+    }
+
+    fn is_contiguous_layout(registration: &KVCacheRegistration) -> bool {
+        registration.segments <= 1 || registration.kv_stride_bytes == registration.bytes_per_block
+    }
+
+    fn copy_block_gpu_to_cpu(
+        &self,
+        registration: &KVCacheRegistration,
+        block_idx: usize,
+        dst_ptr: *mut u8,
+    ) -> Result<(), String> {
+        if Self::is_contiguous_layout(registration) {
+            let block_size = self.block_size(registration)?;
+            let offset = self.segment_offset(registration, block_idx, 0)?;
+            let buffer = unsafe { std::slice::from_raw_parts_mut(dst_ptr, block_size) };
+            self.copy_gpu_to_cpu(registration.data_ptr, offset, buffer, block_size)
+        } else {
+            self.copy_gpu_to_cpu_strided(registration, block_idx, dst_ptr)
+        }
+    }
+
+    fn copy_block_cpu_to_gpu(
+        &self,
+        registration: &KVCacheRegistration,
+        block_idx: usize,
+        src_ptr: *const u8,
+    ) -> Result<(), String> {
+        if Self::is_contiguous_layout(registration) {
+            let block_size = self.block_size(registration)?;
+            let offset = self.segment_offset(registration, block_idx, 0)?;
+            let buffer = unsafe { std::slice::from_raw_parts(src_ptr, block_size) };
+            self.copy_cpu_to_gpu(registration.data_ptr, offset, buffer, block_size)
+        } else {
+            self.copy_cpu_to_gpu_strided(registration, block_idx, src_ptr)
+        }
+    }
+
+    fn copy_gpu_to_cpu_strided(
+        &self,
+        registration: &KVCacheRegistration,
+        block_idx: usize,
+        dst_ptr: *mut u8,
+    ) -> Result<(), String> {
+        use cudarc::driver::sys;
+
+        if registration.kv_stride_bytes == 0 {
+            return Err("Invalid KV stride for strided copy".into());
+        }
+
+        let offset = self.segment_offset(registration, block_idx, 0)?;
+        let device_ptr = registration.data_ptr + offset as u64;
+        let request = sys::CUDA_MEMCPY2D_st {
+            srcXInBytes: 0,
+            srcY: 0,
+            srcMemoryType: sys::CUmemorytype_enum::CU_MEMORYTYPE_DEVICE,
+            srcHost: std::ptr::null(),
+            srcDevice: device_ptr as sys::CUdeviceptr,
+            srcArray: std::ptr::null_mut(),
+            srcPitch: registration.kv_stride_bytes,
+            dstXInBytes: 0,
+            dstY: 0,
+            dstMemoryType: sys::CUmemorytype_enum::CU_MEMORYTYPE_HOST,
+            dstHost: dst_ptr as *mut std::ffi::c_void,
+            dstDevice: 0,
+            dstArray: std::ptr::null_mut(),
+            dstPitch: registration.bytes_per_block,
+            WidthInBytes: registration.bytes_per_block,
+            Height: registration.segments,
+        };
+
+        unsafe {
+            let result = sys::cuMemcpy2D_v2(&request);
+            if result != sys::cudaError_enum::CUDA_SUCCESS {
+                return Err(format!("cuMemcpy2D (DtoH) failed: {:?}", result));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn copy_cpu_to_gpu_strided(
+        &self,
+        registration: &KVCacheRegistration,
+        block_idx: usize,
+        src_ptr: *const u8,
+    ) -> Result<(), String> {
+        use cudarc::driver::sys;
+
+        if registration.kv_stride_bytes == 0 {
+            return Err("Invalid KV stride for strided copy".into());
+        }
+
+        let offset = self.segment_offset(registration, block_idx, 0)?;
+        let device_ptr = registration.data_ptr + offset as u64;
+        let request = sys::CUDA_MEMCPY2D_st {
+            srcXInBytes: 0,
+            srcY: 0,
+            srcMemoryType: sys::CUmemorytype_enum::CU_MEMORYTYPE_HOST,
+            srcHost: src_ptr as *const std::ffi::c_void,
+            srcDevice: 0,
+            srcArray: std::ptr::null_mut(),
+            srcPitch: registration.bytes_per_block,
+            dstXInBytes: 0,
+            dstY: 0,
+            dstMemoryType: sys::CUmemorytype_enum::CU_MEMORYTYPE_DEVICE,
+            dstHost: std::ptr::null_mut(),
+            dstDevice: device_ptr as sys::CUdeviceptr,
+            dstArray: std::ptr::null_mut(),
+            dstPitch: registration.kv_stride_bytes,
+            WidthInBytes: registration.bytes_per_block,
+            Height: registration.segments,
+        };
+
+        unsafe {
+            let result = sys::cuMemcpy2D_v2(&request);
+            if result != sys::cudaError_enum::CUDA_SUCCESS {
+                return Err(format!("cuMemcpy2D (HtoD) failed: {:?}", result));
             }
         }
 
