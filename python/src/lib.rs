@@ -148,9 +148,48 @@ impl PegaEngine {
     ) -> PyResult<usize> {
         py.allow_threads(|| {
             self.engine
-                .load_kv_blocks_to_ipc(layer_name, block_ids, block_hashes)
+                .load_kv_blocks_to_ipc(&layer_name, &block_ids, &block_hashes)
         })
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    }
+
+    /// Batch load KV blocks for multiple layers using the same block mapping
+    ///
+    /// This is much more efficient than calling load_kv_blocks_to_ipc in a loop
+    /// from Python, as it avoids Python overhead and data copying.
+    ///
+    /// Args:
+    ///     layer_names: List of layer names to load
+    ///     block_ids: GPU block IDs to load into (list of ints)
+    ///     block_hashes: Content hashes for each block (list of bytes)
+    fn batch_load_kv_blocks(
+        &self,
+        py: Python<'_>,
+        layer_names: Vec<String>,
+        block_ids: Vec<i32>,
+        block_hashes: Vec<Vec<u8>>,
+    ) -> PyResult<(usize, usize)> {
+        py.allow_threads(|| {
+            let mut total_bytes = 0;
+            let mut total_layers = 0;
+
+            for layer_name in &layer_names {
+                match self
+                    .engine
+                    .load_kv_blocks_to_ipc(layer_name, &block_ids, &block_hashes)
+                {
+                    Ok(bytes) => {
+                        total_bytes += bytes;
+                        total_layers += 1;
+                    }
+                    Err(e) => {
+                        // Log error but continue with other layers
+                        println!("Failed to load layer {}: {}", layer_name, e);
+                    }
+                }
+            }
+            Ok((total_layers, total_bytes))
+        })
     }
 
     /// Get pinned memory usage statistics

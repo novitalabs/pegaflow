@@ -172,13 +172,11 @@ class PegaKVConnector(KVConnectorBase_V1):
         # ============================================================
         try:
             load_start = time.perf_counter()
-            total_blocks = 0
-            total_layers = 0
-            total_bytes = 0
-
-            # Aggregate per-layer loads to minimize Python<->Rust crossings.
-            layer_batches: Dict[str, Dict[str, List[Any]]] = {}
-
+            
+            # Aggregate all blocks from all requests
+            all_block_ids: List[int] = []
+            all_block_hashes: List[bytes] = []
+            
             for req_id, load_info in metadata.requests_to_load.items():
                 block_ids = load_info['block_ids']
                 block_hashes = load_info['block_hashes']
@@ -190,37 +188,28 @@ class PegaKVConnector(KVConnectorBase_V1):
                     len(block_ids),
                     num_tokens,
                 )
+                
+                all_block_ids.extend(block_ids)
+                all_block_hashes.extend(block_hashes)
+            
+            if not all_block_ids:
+                return
 
-                for layer_name, layer in forward_context.no_compile_layers.items():
-                    if not hasattr(layer, 'kv_cache'):
-                        continue
-
-                    batch = layer_batches.setdefault(
-                        layer_name, {'block_ids': [], 'block_hashes': []}
-                    )
-                    batch['block_ids'].extend(block_ids)
-                    batch['block_hashes'].extend(block_hashes)
-
-            for layer_name, batch in layer_batches.items():
-                if not batch['block_ids']:
-                    continue
-
-                try:
-                    bytes_transferred = self.engine.load_kv_blocks_to_ipc(
-                        layer_name,
-                        batch['block_ids'],
-                        batch['block_hashes'],
-                    )
-                    total_blocks += len(batch['block_ids'])
-                    total_layers += 1
-                    total_bytes += bytes_transferred
-                except Exception as e:
-                    logger.debug(
-                        "[PegaKVConnector] Failed to load layer %s: %s",
-                        layer_name,
-                        e,
-                        exc_info=True,
-                    )
+            # Identify all KV cache layers
+            target_layers: List[str] = []
+            for layer_name, layer in forward_context.no_compile_layers.items():
+                if hasattr(layer, 'kv_cache'):
+                    target_layers.append(layer_name)
+            
+            # Batch load for all layers in one Rust call
+            num_layers_loaded, total_bytes = self.engine.batch_load_kv_blocks(
+                target_layers,
+                all_block_ids,
+                all_block_hashes
+            )
+            
+            total_blocks = len(all_block_ids) * num_layers_loaded
+            total_layers = num_layers_loaded
 
             transfer_end = time.perf_counter()
             # ============================================================
@@ -253,7 +242,7 @@ class PegaKVConnector(KVConnectorBase_V1):
                 else 0
             )
 
-            logger.debug(
+            logger.info(
                 "[PegaKVConnector] Load details: transfer_time=%.2f ms, sync_time=%.2f ms, "
                 "requests=%d, layers=%d, blocks=%d",
                 transfer_time_ms,

@@ -428,27 +428,27 @@ impl PegaEngine {
     )]
     pub fn load_kv_blocks_to_ipc(
         &self,
-        layer_name: String,
-        block_ids: Vec<i32>,
-        block_hashes: Vec<Vec<u8>>,
+        layer_name: &str,
+        block_ids: &[i32],
+        block_hashes: &[Vec<u8>],
     ) -> Result<usize, String> {
         let start_time = Instant::now();
         if block_ids.len() != block_hashes.len() {
             return Err("block_ids and block_hashes must have equal length".into());
         }
 
-        let Some(registration) = self.kv_caches.get(&layer_name) else {
+        let Some(registration) = self.kv_caches.get(layer_name) else {
             return Err(format!("Layer {} not registered", layer_name));
         };
 
         // Collect valid blocks to load
         let mut blocks_to_load = Vec::new();
-        for (block_id, block_hash) in block_ids.into_iter().zip(block_hashes.into_iter()) {
-            if block_id < 0 {
+        for (block_id, block_hash) in block_ids.iter().zip(block_hashes.iter()) {
+            if *block_id < 0 {
                 continue;
             }
 
-            let block_idx = block_id as usize;
+            let block_idx = *block_id as usize;
             if block_idx >= registration.num_blocks {
                 return Err(format!(
                     "Block {} out of range for layer {} ({} blocks registered)",
@@ -456,7 +456,7 @@ impl PegaEngine {
                 ));
             }
 
-            let key = (layer_name.clone(), block_hash.clone());
+            let key = (layer_name.to_string(), block_hash.clone());
             let Some(block) = self.kv_storage.get(&key) else {
                 return Err(format!("Missing KV block for layer {}", layer_name));
             };
