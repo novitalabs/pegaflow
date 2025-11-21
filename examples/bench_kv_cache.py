@@ -279,8 +279,8 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="/home/sjy/.cache/modelscope/hub/models/Qwen/Qwen3-8B",
-        help="Model to benchmark (default: gpt2)"
+        required=True,
+        help="Path or identifier for the model to benchmark (e.g. /work/models/Llama-3.1-8B)"
     )
     parser.add_argument(
         "--num-prompts",

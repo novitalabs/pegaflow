@@ -49,3 +49,70 @@ PegaFlow draws its name from Pegasus, the winged horse of ancient myth — a cre
 5. **Not a Security or Compliance Component**
 
    No built-in complex authentication, encryption, or multi-tenant isolation; default assumption is deployment in controlled environments, with security handled by infrastructure.
+
+## Examples & Benchmarks
+
+We now ship a working vLLM v1 connector example plus a companion benchmark so you can validate PegaFlow end-to-end directly from [github.com/xiaguan/pegaflow](https://github.com/xiaguan/pegaflow).
+
+### Basic vLLM Connector ("Hello, world")
+
+`examples/basic_vllm.py` wires the PegaKVConnector into vLLM, runs a simple prompt twice, and shows the delta between cold/warm KV cache paths. A uv-driven workflow looks like this:
+
+1. Clone & enter the repo:
+
+   ```bash
+   git clone https://github.com/xiaguan/pegaflow
+   cd pegaflow
+   ```
+
+2. Provision a virtualenv and tooling:
+
+   ```bash
+   uv venv
+   source .venv/bin/activate
+   uv pip install maturin
+   uv install vllm
+   ```
+
+3. Build the PyO3 bindings via maturin:
+
+   ```bash
+   cd python
+   maturin develop --release
+   cd ..
+   ```
+
+4. Run the hello-world connector example:
+
+   ```bash
+   uv run python examples/basic_vllm.py
+   ```
+
+The script loads GPT-2 through vLLM, runs a deterministic prompt twice, and prints both latencies so you can verify the connector is correctly persisting/restoring KV cache.
+
+### LMCache Comparison Bench
+
+`examples/bench_kv_cache.py` automates a full TTFT-focused comparison between LMCache and PegaFlow. Provide your own checkpoint path (we usually test with a Llama-3.1-8B variant on H800):
+
+```bash
+uv run python examples/bench_kv_cache.py \
+  --model /path/to/your/Llama-3.1-8B \
+  --num-prompts 10 \
+  --input-len 4096 \
+  --output-len 1 \
+  --request-rate 1.0 \
+  --with-lmcache
+```
+
+H800 Reference Numbers
+
+Latest TTFT measurements from an H800 (10 prompts, 4K-token prefill, 1-token decode):
+
+| Configuration    | TTFT mean (ms) | TTFT p99 (ms) |
+|------------------|----------------|---------------|
+| LMCache (Cold)   | 138.6          | 191.9         |
+| LMCache (Warm)   | 55.3           | 68.3          |
+| PegaFlow (Cold)  | 193.0          | 302.2         |
+| PegaFlow (Warm)  | 54.7           | 63.2          |
+
+Warm-start latency is virtually identical between LMCache and PegaFlow; cold-start differences highlight remaining optimizations on our side.
