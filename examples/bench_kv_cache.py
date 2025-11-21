@@ -3,7 +3,7 @@
 Benchmark script to compare LMCache performance against PegaFlow's KV cache connector.
 
 This script automates the following workflow:
-1. Start LMCache vLLM server (local CPU backend)
+1. Start LMCache vLLM server (local CPU backend) [optional, enable with --with-lmcache]
 2. Run benchmark CLI - first execution (cold cache)
 3. Run benchmark CLI - second execution (warm cache)
 4. Stop LMCache vLLM server
@@ -11,11 +11,15 @@ This script automates the following workflow:
 6. Run benchmark CLI - first execution (cold cache)
 7. Run benchmark CLI - second execution (warm cache)
 8. Stop vLLM server with PegaFlow
-9. Collect and compare all four sets of results
+9. Collect and compare all sets of results
 10. Save results to a file
 
 Usage:
+    # Default: PegaFlow only (faster for development):
     python examples/bench_kv_cache.py [--model MODEL] [--num-prompts N] [--input-len L] [--output-len O]
+
+    # Full benchmark with LMCache comparison:
+    python examples/bench_kv_cache.py --with-lmcache [--model MODEL] [--num-prompts N] [--input-len L] [--output-len O]
 """
 
 import argparse
@@ -199,9 +203,12 @@ def run_benchmark(model: str, port: int, num_prompts: int, input_len: int, outpu
 
 
 def print_comparison(results: dict, args):
-    """Print a concise summary of the four benchmark runs."""
+    """Print a concise summary of the benchmark runs."""
     print("\n" + "=" * 80)
-    print("LMCACHE vs PEGAFLOW KV CACHE BENCHMARK SUMMARY (TTFT FOCUSED)")
+    if args.with_lmcache:
+        print("LMCACHE vs PEGAFLOW KV CACHE BENCHMARK SUMMARY (TTFT FOCUSED)")
+    else:
+        print("PEGAFLOW KV CACHE BENCHMARK SUMMARY (TTFT FOCUSED)")
     print("=" * 80)
 
     print(
@@ -216,12 +223,17 @@ def print_comparison(results: dict, args):
         )
     )
 
-    configs = [
-        ("lmcache_cold", "LMCache (Cold)"),
-        ("lmcache_warm", "LMCache (Warm)"),
+    # Build configs list based on whether LMCache was included
+    configs = []
+    if args.with_lmcache:
+        configs.extend([
+            ("lmcache_cold", "LMCache (Cold)"),
+            ("lmcache_warm", "LMCache (Warm)"),
+        ])
+    configs.extend([
         ("pegaflow_cold", "PegaFlow (Cold)"),
         ("pegaflow_warm", "PegaFlow (Warm)"),
-    ]
+    ])
 
     columns = [
         ("mean_ttft_ms", "TTFT mean (ms)", 16),
@@ -267,7 +279,7 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="gpt2",
+        default="/home/sjy/.cache/modelscope/hub/models/Qwen/Qwen3-8B",
         help="Model to benchmark (default: gpt2)"
     )
     parser.add_argument(
@@ -279,7 +291,7 @@ def main():
     parser.add_argument(
         "--input-len",
         type=int,
-        default=524,
+        default=2048,
         help="Input prompt length in tokens (default: 1024)"
     )
     parser.add_argument(
@@ -320,6 +332,12 @@ def main():
         help="Random seed for reproducible request generation. "
              "Same seed ensures cold and warm runs use identical requests (default: 42)"
     )
+    parser.add_argument(
+        "--with-lmcache",
+        action="store_true",
+        help="Include LMCache benchmark for comparison. "
+             "By default, only PegaFlow is tested (faster for development)."
+    )
 
     args = parser.parse_args()
 
@@ -333,7 +351,8 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=True)
 
     print("\n" + "="*70)
-    print("PEGAFLOW vs LMCACHE KV CACHE BENCHMARK")
+    benchmark_title = "PEGAFLOW vs LMCACHE KV CACHE BENCHMARK" if args.with_lmcache else "PEGAFLOW KV CACHE BENCHMARK"
+    print(benchmark_title)
     print("="*70)
     print(f"Model:           {args.model}")
     print(f"Num Prompts:     {args.num_prompts}")
@@ -341,38 +360,47 @@ def main():
     print(f"Output Length:   {args.output_len} tokens")
     print(f"Request Rate:    {args.request_rate} req/s")
     print(f"Random Seed:     {args.seed}")
-    print(f"LMCache Port:    {args.lmcache_port}")
+    if args.with_lmcache:
+        print(f"LMCache Port:    {args.lmcache_port}")
     print(f"PegaFlow Port:   {args.pegaflow_port}")
     print(f"Results Dir:     {run_dir}")
+    if not args.with_lmcache:
+        print(f"LMCache:         Skipped (use --with-lmcache to enable)")
     print("="*70)
 
     all_results = {}
 
-    # Phase 1: LMCache vLLM (local CPU backend)
-    print("\n" + "="*70)
-    print("PHASE 1: LMCACHE vLLM (Local CPU Backend)")
-    print("="*70)
+    # Phase 1: LMCache vLLM (local CPU backend) - only run if requested
+    if args.with_lmcache:
+        print("\n" + "="*70)
+        print("PHASE 1: LMCACHE vLLM (Local CPU Backend)")
+        print("="*70)
 
-    lmcache_log = run_dir / "lmcache_server.log"
-    with VLLMServer(args.model, args.lmcache_port, use_lmcache=True,
-                    enable_prefix_caching=False, log_file=lmcache_log):
-        # Cold cache run
-        result_file = run_dir / "lmcache_cold.json"
-        all_results["lmcache_cold"] = run_benchmark(
-            args.model, args.lmcache_port, args.num_prompts, args.input_len,
-            args.output_len, result_file, "lmcache_cold", args.request_rate, args.seed
-        )
+        lmcache_log = run_dir / "lmcache_server.log"
+        with VLLMServer(args.model, args.lmcache_port, use_lmcache=True,
+                        enable_prefix_caching=False, log_file=lmcache_log):
+            # Cold cache run
+            result_file = run_dir / "lmcache_cold.json"
+            all_results["lmcache_cold"] = run_benchmark(
+                args.model, args.lmcache_port, args.num_prompts, args.input_len,
+                args.output_len, result_file, "lmcache_cold", args.request_rate, args.seed
+            )
 
-        # Warm cache run (same requests again - using same seed for identical requests)
-        result_file = run_dir / "lmcache_warm.json"
-        all_results["lmcache_warm"] = run_benchmark(
-            args.model, args.lmcache_port, args.num_prompts, args.input_len,
-            args.output_len, result_file, "lmcache_warm", args.request_rate, args.seed
-        )
+            # Warm cache run (same requests again - using same seed for identical requests)
+            result_file = run_dir / "lmcache_warm.json"
+            all_results["lmcache_warm"] = run_benchmark(
+                args.model, args.lmcache_port, args.num_prompts, args.input_len,
+                args.output_len, result_file, "lmcache_warm", args.request_rate, args.seed
+            )
+    else:
+        print("\n" + "="*70)
+        print("PHASE 1: LMCACHE - SKIPPED (use --with-lmcache to enable)")
+        print("="*70)
 
     # Phase 2: PegaFlow vLLM (with KV connector)
+    phase_num = "1" if not args.with_lmcache else "2"
     print("\n" + "="*70)
-    print("PHASE 2: PEGAFLOW vLLM (KV Cache Connector Enabled)")
+    print(f"PHASE {phase_num}: PEGAFLOW vLLM (KV Cache Connector Enabled)")
     print("="*70)
 
     pegaflow_log = run_dir / "pegaflow_server.log"

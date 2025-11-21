@@ -54,6 +54,7 @@ impl PegaEngine {
     ///     segments: Number of segments per block (1 for blocks-first, 2 for KV-first)
     fn register_kv_cache(
         &mut self,
+        py: Python<'_>,
         layer_name: String,
         data_ptr: u64,
         size_bytes: usize,
@@ -62,20 +63,24 @@ impl PegaEngine {
         kv_stride_bytes: usize,
         segments: usize,
     ) {
-        self.engine.register_kv_cache(
-            layer_name,
-            data_ptr,
-            size_bytes,
-            num_blocks,
-            bytes_per_block,
-            kv_stride_bytes,
-            segments,
-        );
+        py.allow_threads(|| {
+            self.engine.register_kv_cache(
+                layer_name,
+                data_ptr,
+                size_bytes,
+                num_blocks,
+                bytes_per_block,
+                kv_stride_bytes,
+                segments,
+            );
+        })
     }
 
     /// Unregister all KV cache handles
-    fn unregister_all_kv_caches(&mut self) {
-        self.engine.unregister_all_kv_caches();
+    fn unregister_all_kv_caches(&mut self, py: Python<'_>) {
+        py.allow_threads(|| {
+            self.engine.unregister_all_kv_caches();
+        })
     }
 
     /// Get the number of registered KV caches
@@ -91,12 +96,15 @@ impl PegaEngine {
     ///     block_hashes: Content hashes for each block (list of bytes)
     fn save_kv_blocks_from_ipc(
         &mut self,
+        py: Python<'_>,
         layer_name: String,
         block_ids: Vec<i32>,
         block_hashes: Vec<Vec<u8>>,
     ) {
-        self.engine
-            .save_kv_blocks_from_ipc(layer_name, block_ids, block_hashes)
+        py.allow_threads(|| {
+            self.engine
+                .save_kv_blocks_from_ipc(layer_name, block_ids, block_hashes)
+        })
     }
 
     /// Get storage statistics
@@ -115,11 +123,14 @@ impl PegaEngine {
     ///     List of booleans indicating availability for each block
     fn check_kv_blocks_availability(
         &self,
+        py: Python<'_>,
         layer_name: String,
         block_hashes: Vec<Vec<u8>>,
     ) -> Vec<bool> {
-        self.engine
-            .check_kv_blocks_availability(layer_name, block_hashes)
+        py.allow_threads(|| {
+            self.engine
+                .check_kv_blocks_availability(layer_name, block_hashes)
+        })
     }
 
     /// Load KV blocks from CPU memory to GPU via IPC handle
@@ -130,13 +141,16 @@ impl PegaEngine {
     ///     block_hashes: Content hashes for each block (list of bytes)
     fn load_kv_blocks_to_ipc(
         &self,
+        py: Python<'_>,
         layer_name: String,
         block_ids: Vec<i32>,
         block_hashes: Vec<Vec<u8>>,
     ) -> PyResult<usize> {
-        self.engine
-            .load_kv_blocks_to_ipc(layer_name, block_ids, block_hashes)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+        py.allow_threads(|| {
+            self.engine
+                .load_kv_blocks_to_ipc(layer_name, block_ids, block_hashes)
+        })
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
     }
 
     /// Get pinned memory usage statistics
