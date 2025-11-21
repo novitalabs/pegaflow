@@ -20,6 +20,7 @@ Later we can register this class as a dynamic connector in vLLM by
 referencing it via its full import path.
 """
 
+import functools
 import logging
 import os
 import pickle
@@ -43,6 +44,32 @@ logger = logging.getLogger(__name__)
 # Enable INFO logs by default so required operational logs are visible even if
 # the host application doesn't configure logging.
 logger.setLevel(logging.INFO)
+
+# Environment variable to control timing logging
+_ENABLE_TIMING = os.environ.get("PEGAFLOW_ENABLE_TIMING", "1") == "1"
+
+def timing_wrapper(func):
+    """Decorator to log function name and execution time when enabled.
+
+    Enable by setting environment variable: PEGAFLOW_ENABLE_TIMING=1
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        if not _ENABLE_TIMING:
+            return func(*args, **kwargs)
+
+        start = time.perf_counter()
+        try:
+            result = func(*args, **kwargs)
+            return result
+        finally:
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            logger.info(
+                "[PegaKVConnector] %s took %.2f ms",
+                func.__name__,
+                elapsed_ms,
+            )
+    return wrapper
 
 if not logger.hasHandlers():
     _handler = logging.StreamHandler()
@@ -132,6 +159,7 @@ class PegaKVConnector(KVConnectorBase_V1):
     # Worker-side methods
     # ==============================
 
+    @timing_wrapper
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         """
         Start loading the KV cache from the connector to vLLM's paged
@@ -162,33 +190,22 @@ class PegaKVConnector(KVConnectorBase_V1):
             return
 
         total_requests = len(metadata.requests_to_load)
-        logger.debug(
-            "[PegaKVConnector] start_load_kv: Loading KV cache for %d requests",
-            total_requests,
-        )
 
         # ============================================================
         # STEP 3: Load KV blocks for each request and each layer
         # ============================================================
         try:
             load_start = time.perf_counter()
-            
+
             # Aggregate all blocks from all requests
             all_block_ids: List[int] = []
             all_block_hashes: List[bytes] = []
-            
+
             for req_id, load_info in metadata.requests_to_load.items():
                 block_ids = load_info['block_ids']
                 block_hashes = load_info['block_hashes']
                 num_tokens = load_info['num_tokens']
 
-                logger.debug(
-                    "[PegaKVConnector] Loading request %s: %d blocks, %d tokens",
-                    req_id,
-                    len(block_ids),
-                    num_tokens,
-                )
-                
                 all_block_ids.extend(block_ids)
                 all_block_hashes.extend(block_hashes)
             
@@ -218,44 +235,19 @@ class PegaKVConnector(KVConnectorBase_V1):
             torch.cuda.synchronize()
             total_end = time.perf_counter()
 
-            transfer_time_ms = (transfer_end - load_start) * 1000
-            sync_time_ms = (total_end - transfer_end) * 1000
             total_time_us = (total_end - load_start) * 1e6
             total_time_s = total_time_us / 1e6
             bandwidth_gbps = (total_bytes / 1e9) / total_time_s if total_time_s > 0 else 0.0
 
             logger.info(
-                "[PegaKVConnector] load %d blocks (%.2f GB) cost %.0f us, bandwidth=%.2f GB/s",
+                "[PegaKVConnector] loaded %d blocks (%.2f GB) across %d layers for %d reqs, "
+                "cost %.0f us (%.2f GB/s)",
                 total_blocks,
                 total_bytes / 1e9,
+                num_layers_loaded,
+                total_requests,
                 total_time_us,
                 bandwidth_gbps,
-            )
-
-            # Get pinned memory usage
-            used_bytes, total_pinned_bytes = self.engine.get_pinned_memory_usage()
-            used_gb = used_bytes / 1e9
-            total_gb = total_pinned_bytes / 1e9
-            usage_pct = (
-                (used_bytes / total_pinned_bytes * 100)
-                if total_pinned_bytes > 0
-                else 0
-            )
-
-            logger.info(
-                "[PegaKVConnector] Load details: transfer_time=%.2f ms, sync_time=%.2f ms, "
-                "requests=%d, layers=%d, blocks=%d",
-                transfer_time_ms,
-                sync_time_ms,
-                total_requests,
-                total_layers,
-                total_blocks,
-            )
-            logger.debug(
-                "[PegaKVConnector] Pinned memory: %.2f GB / %.2f GB (%.1f%%)",
-                used_gb,
-                total_gb,
-                usage_pct,
             )
 
         except Exception as e:
@@ -304,6 +296,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             'attn_metadata': attn_metadata,
         })
 
+    @timing_wrapper
     def wait_for_save(self) -> None:
         """
         Block until all the save operations is done. This is called
@@ -412,25 +405,11 @@ class PegaKVConnector(KVConnectorBase_V1):
             total_time_ms = (total_end - total_start) * 1000
 
             if total_blocks_saved > 0:
-                # Get pinned memory usage
-                used_bytes, total_bytes = self.engine.get_pinned_memory_usage()
-                used_gb = used_bytes / 1e9
-                total_gb = total_bytes / 1e9
-                usage_pct = (used_bytes / total_bytes * 100) if total_bytes > 0 else 0
-
-                logger.debug(
-                    "[PegaKVConnector] Save summary: total_time=%.2f ms, layers=%d, blocks=%d "
-                    "(avg_per_block=%.2f ms)",
-                    total_time_ms,
-                    total_layers_saved,
+                logger.info(
+                    "[PegaKVConnector] saved %d blocks across %d layers (%.2f ms)",
                     total_blocks_saved,
-                    total_time_ms / total_blocks_saved,
-                )
-                logger.debug(
-                    "[PegaKVConnector] Pinned memory after save: %.2f GB / %.2f GB (%.1f%%)",
-                    used_gb,
-                    total_gb,
-                    usage_pct,
+                    total_layers_saved,
+                    total_time_ms,
                 )
 
         except Exception:
@@ -446,6 +425,7 @@ class PegaKVConnector(KVConnectorBase_V1):
     # Scheduler-side methods
     # ==============================
 
+    @timing_wrapper
     def get_num_new_matched_tokens(
         self,
         request: "Request",
@@ -487,18 +467,10 @@ class PegaKVConnector(KVConnectorBase_V1):
 
         block_hashes = list(getattr(request, "block_hashes", []) or [])
         if len(block_hashes) == 0:
-            logger.debug(
-                "[PegaKVConnector] Request %s: No full block hashes available yet",
-                req_id,
-            )
             return (0, False)
 
         matched_blocks = self._send_lookup_request(req_id, block_hashes)
         if matched_blocks <= 0:
-            logger.debug(
-                "[PegaKVConnector] Request %s: No cached blocks reported by worker",
-                req_id,
-            )
             return (0, False)
 
         available_tokens = min(matched_blocks * self._block_size, num_tokens)
@@ -510,33 +482,11 @@ class PegaKVConnector(KVConnectorBase_V1):
         num_new_tokens = reusable_tokens - num_computed_tokens
 
         if num_new_tokens <= 0:
-            logger.debug(
-                "[PegaKVConnector] Request %s: All available cached tokens already consumed",
-                req_id,
-            )
             return (0, False)
 
-        logger.debug(
-            "[PegaKVConnector] get_num_new_matched_tokens: req=%s, prompt_tokens=%d, "
-            "computed=%d, block_size=%d, hashes=%d, matched_blocks=%d, reuse_tokens=%d",
-            req_id,
-            num_tokens,
-            num_computed_tokens,
-            self._block_size,
-            len(block_hashes),
-            matched_blocks,
-            num_new_tokens,
-        )
-        logger.debug(
-            "[PegaKVConnector] Request %s: Worker reports %d cached blocks (%d tokens), "
-            "scheduler can reuse %d tokens",
-            req_id,
-            matched_blocks,
-            available_tokens,
-            num_new_tokens,
-        )
         return (num_new_tokens, False)
 
+    @timing_wrapper
     def update_state_after_alloc(
         self,
         request: "Request",
@@ -563,28 +513,15 @@ class PegaKVConnector(KVConnectorBase_V1):
         # block hashes is  a list[bytes]
         self._request_block_hashes[req_id] = request.block_hashes
 
-        logger.debug(
-            "[PegaKVConnector] Saved %d block hashes for request %s",
-            len(request.block_hashes),
-            req_id,
-        )
-
-            
-
         # If there are external tokens to load, record this request
         if num_external_tokens > 0:
-            logger.debug(
-                "[PegaKVConnector] Recording request %s for loading %d tokens",
-                req_id,
-                num_external_tokens,
-            )
-
             self._requests_to_load[req_id] = {
                 'request': request,
                 'blocks': blocks,
                 'num_external_tokens': num_external_tokens,
             }
 
+    @timing_wrapper
     def build_connector_meta(self, scheduler_output: "SchedulerOutput") -> KVConnectorMetadata:
         """
         Build the connector metadata for this step.
@@ -609,11 +546,6 @@ class PegaKVConnector(KVConnectorBase_V1):
             if req_id in self._request_block_hashes:
                 saved_hashes = self._request_block_hashes[req_id]
                 block_hashes[req_id] = saved_hashes
-                logger.debug(
-                    "[PegaKVConnector] Using %d content-based block hashes for request %s",
-                    len(saved_hashes),
-                    req_id,
-                )
 
         # ============================================================
         # STEP 2: Process cached requests (already scheduled, now in decode phase)
@@ -658,21 +590,8 @@ class PegaKVConnector(KVConnectorBase_V1):
                             'num_tokens': num_external_tokens,
                         }
 
-                        logger.debug(
-                            "[PegaKVConnector] Prepared load metadata for request %s: %d blocks, %d tokens",
-                            req_id,
-                            num_blocks,
-                            num_external_tokens,
-                        )
-
                     found = True
                     break
-
-            if not found:
-                logger.debug(
-                    "[PegaKVConnector] Request %s not found in scheduled_new_reqs",
-                    req_id,
-                )
 
         # Clear the requests_to_load after processing
         self._requests_to_load.clear()
@@ -710,8 +629,8 @@ class PegaKVConnector(KVConnectorBase_V1):
         thread = threading.Thread(target=self._lookup_server_loop, daemon=True)
         thread.start()
         self._lookup_server_thread = thread
-        logger.debug(
-            "[PegaKVConnector] Lookup server bound to %s",
+        logger.info(
+            "[PegaKVConnector] Lookup server started at %s",
             self._lookup_endpoint,
         )
 
@@ -777,12 +696,7 @@ class PegaKVConnector(KVConnectorBase_V1):
 
         try:
             self._ensure_lookup_client()
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.debug(
-                "[PegaKVConnector] Failed to init lookup client: %s",
-                exc,
-                exc_info=True,
-            )
+        except Exception:
             return 0
 
         payload = pickle.dumps({
@@ -795,23 +709,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             assert self._lookup_client is not None
             self._lookup_client.send(payload)
             reply = self._lookup_client.recv()
-        except zmq.error.Again:
-            elapsed_us = (time.perf_counter() - lookup_start) * 1e6
-            logger.debug(
-                "[PegaKVConnector] Lookup request for %s timed out after %.0f us",
-                req_id,
-                elapsed_us,
-            )
-            return 0
-        except zmq.error.ZMQError as exc:
-            elapsed_us = (time.perf_counter() - lookup_start) * 1e6
-            logger.debug(
-                "[PegaKVConnector] Lookup ZMQ error for %s after %.0f us: %s",
-                req_id,
-                elapsed_us,
-                exc,
-                exc_info=True,
-            )
+        except (zmq.error.Again, zmq.error.ZMQError):
             return 0
         lookup_end = time.perf_counter()
 
@@ -865,16 +763,6 @@ class PegaKVConnector(KVConnectorBase_V1):
 
             shape = tuple(kv_cache.shape)
             stride = tuple(kv_cache.stride())
-            dtype = kv_cache.dtype
-            logger.debug(
-                "[PegaKVConnector] register %s: shape=%s, stride=%s, dtype=%s, storage_bytes=%d",
-                layer_name,
-                shape,
-                stride,
-                dtype,
-                kv_cache.untyped_storage().nbytes(),
-            )
-
             data_ptr = kv_cache.data_ptr()
             size_bytes = kv_cache.untyped_storage().nbytes()
             element_size = kv_cache.element_size()
@@ -893,23 +781,14 @@ class PegaKVConnector(KVConnectorBase_V1):
                 bytes_per_block = stride[1] * element_size
                 kv_stride_bytes = stride[0] * element_size
                 segments = 2
-                logger.debug(
-                    "[PegaKVConnector] Detected KV-first layout for %s: num_blocks=%d, kv_stride_bytes=%d",
-                    layer_name,
-                    num_blocks,
-                    kv_stride_bytes,
-                )
+                layout = "KV-first"
             else:
                 # Blocks-first layout: (num_blocks, ...)
                 num_blocks = shape[0]
                 bytes_per_block = stride[0] * element_size
                 kv_stride_bytes = 0
                 segments = 1
-                logger.debug(
-                    "[PegaKVConnector] Detected blocks-first layout for %s: num_blocks=%d",
-                    layer_name,
-                    num_blocks,
-                )
+                layout = "blocks-first"
 
             if bytes_per_block == 0:
                 raise RuntimeError(
@@ -925,6 +804,12 @@ class PegaKVConnector(KVConnectorBase_V1):
                 kv_stride_bytes,
                 segments,
             )
+
+        logger.info(
+            "[PegaKVConnector] Registered %d KV cache layers (%s layout)",
+            len(kv_caches),
+            layout if kv_caches else "unknown",
+        )
 
     def shutdown(self):
         """Shutdown the connector and unregister all KV caches."""
