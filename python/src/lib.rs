@@ -102,23 +102,26 @@ impl PegaEngine {
         })
     }
 
-    /// Check which KV blocks are available in CPU storage
+    /// Count how many blocks from the prefix are available in CPU storage
+    ///
+    /// Returns the number of contiguous blocks available from the start.
+    /// Stops counting at the first unavailable block.
     ///
     /// Args:
     ///     layer_name: Name of the layer
     ///     block_hashes: List of block hashes to check (list of bytes)
     ///
     /// Returns:
-    ///     List of booleans indicating availability for each block
-    fn check_kv_blocks_availability(
+    ///     Number of contiguous blocks available from the prefix (int)
+    fn count_prefix_hit_blocks(
         &self,
         py: Python<'_>,
         layer_name: String,
         block_hashes: Vec<Vec<u8>>,
-    ) -> Vec<bool> {
+    ) -> usize {
         py.allow_threads(|| {
             self.engine
-                .check_kv_blocks_availability(layer_name, block_hashes)
+                .count_prefix_hit_blocks(&layer_name, &block_hashes)
         })
     }
 

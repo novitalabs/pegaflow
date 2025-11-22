@@ -667,16 +667,10 @@ class PegaKVConnector(KVConnectorBase_V1):
             return 0
 
         layer_name = self._registered_layers[0]
-        availability = self.engine.check_kv_blocks_availability(
+        return self.engine.count_prefix_hit_blocks(
             layer_name,
             block_hashes,
         )
-        hits = 0
-        for available in availability:
-            if not available:
-                break
-            hits += 1
-        return hits
 
     def _ensure_lookup_client(self) -> None:
         if self._lookup_client is not None:

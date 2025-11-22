@@ -432,61 +432,59 @@ impl PegaEngine {
         }
     }
 
-    /// Check which KV blocks are available in CPU storage
+    /// Count how many blocks from the prefix are available in CPU storage
+    ///
+    /// Returns the number of contiguous blocks available from the start.
+    /// Stops counting at the first unavailable block.
     ///
     /// Args:
     ///   - layer_name: Name of the layer
     ///   - block_hashes: List of block hashes to check
     ///
     /// Returns:
-    ///   - Vec<bool>: For each hash, true if available in storage
+    ///   - usize: Number of contiguous blocks available from the prefix
     #[instrument(
         level = "debug",
         skip(self, block_hashes),
         fields(layer = %layer_name, requested = %block_hashes.len()),
         ret
     )]
-    pub fn check_kv_blocks_availability(
+    pub fn count_prefix_hit_blocks(
         &self,
-        layer_name: String,
-        block_hashes: Vec<Vec<u8>>,
-    ) -> Vec<bool> {
+        layer_name: &str,
+        block_hashes: &[Vec<u8>],
+    ) -> usize {
         let layer_id = match self.get_layer_id(&layer_name) {
             Some(id) => id,
             None => {
                 // Layer not registered, all blocks unavailable
-                return vec![false; block_hashes.len()];
+                return 0;
             }
         };
 
-        let mut availability = Vec::with_capacity(block_hashes.len());
+        let mut hit_count = 0;
 
-        for (idx, block_hash) in block_hashes.iter().enumerate() {
+        for block_hash in block_hashes.iter() {
             let available = if let Some(layer_blocks) = self.kv_storage.get(block_hash) {
                 let blocks = layer_blocks.blocks.lock().unwrap();
                 blocks.get(layer_id).and_then(|opt| opt.as_ref()).is_some()
             } else {
                 false
             };
-            availability.push(available);
 
-            let hash_preview: Vec<u8> = block_hash.iter().copied().take(8).collect();
-            debug!(
-                block_index = idx,
-                available,
-                hash_prefix = ?hash_preview,
-                "Checked KV block availability"
-            );
+            if !available {
+                break;
+            }
+            hit_count += 1;
         }
 
-        let num_available = availability.iter().filter(|&&x| x).count();
         debug!(
-            num_available,
+            hit_count,
             total = block_hashes.len(),
-            "Completed KV block availability check"
+            "Counted prefix hit blocks"
         );
 
-        availability
+        hit_count
     }
 
     /// Batch load KV blocks for multiple layers with shared block mapping
