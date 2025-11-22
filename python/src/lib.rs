@@ -53,7 +53,7 @@ impl PegaEngine {
     ///     kv_stride_bytes: Byte stride between K and V when KV-first layout is used
     ///     segments: Number of segments per block (1 for blocks-first, 2 for KV-first)
     fn register_kv_cache(
-        &mut self,
+        &self,
         py: Python<'_>,
         layer_name: String,
         data_ptr: u64,
@@ -77,7 +77,7 @@ impl PegaEngine {
     }
 
     /// Unregister all KV cache handles
-    fn unregister_all_kv_caches(&mut self, py: Python<'_>) {
+    fn unregister_all_kv_caches(&self, py: Python<'_>) {
         py.allow_threads(|| {
             self.engine.unregister_all_kv_caches();
         })
@@ -90,7 +90,7 @@ impl PegaEngine {
     ///     block_ids: GPU block IDs to copy (list of ints)
     ///     block_hashes: Content hashes for each block (list of bytes)
     fn save_kv_blocks_from_ipc(
-        &mut self,
+        &self,
         py: Python<'_>,
         layer_name: String,
         block_ids: Vec<i32>,

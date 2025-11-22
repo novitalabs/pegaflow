@@ -31,7 +31,7 @@ use moka::sync::Cache;
 use std::{
     collections::HashMap,
     ptr::NonNull,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     time::Instant,
 };
 use tracing::{debug, info, instrument};
@@ -69,11 +69,14 @@ impl LayerBlocksWithWeight {
 
 pub struct PegaEngine {
     /// Store registered KV cache pointers (new IPC wrapper): layer_name -> registration
-    kv_caches: HashMap<String, KVCacheRegistration>,
+    /// Wrapped in RwLock for thread-safe registration with concurrent reads
+    kv_caches: RwLock<HashMap<String, KVCacheRegistration>>,
     /// Map layer names to layer IDs for efficient indexing
-    layer_name_to_id: HashMap<String, usize>,
+    /// Wrapped in RwLock for thread-safe registration with concurrent reads
+    layer_name_to_id: RwLock<HashMap<String, usize>>,
     /// Ordered list of layer names (layer_id is the index into this vec)
-    layer_names: Vec<String>,
+    /// Wrapped in RwLock for thread-safe registration with concurrent reads
+    layer_names: RwLock<Vec<String>>,
     /// Store saved KV blocks: block_hash -> Vec<Option<Arc<Block>>> (one per layer)
     /// Cache is already thread-safe, Mutex only protects the LayerBlocks Vec
     kv_storage: Cache<BlockHash, Arc<LayerBlocksWithWeight>>,
@@ -182,9 +185,9 @@ impl PegaEngine {
         let stream = cuda_ctx.new_stream().expect("Failed to create stream");
 
         PegaEngine {
-            kv_caches: HashMap::new(),
-            layer_name_to_id: HashMap::new(),
-            layer_names: Vec::new(),
+            kv_caches: RwLock::new(HashMap::new()),
+            layer_name_to_id: RwLock::new(HashMap::new()),
+            layer_names: RwLock::new(Vec::new()),
             kv_storage,
             pinned_pool,
             stream: stream,
@@ -200,7 +203,7 @@ impl PegaEngine {
         fields(layer = %layer_name, size_bytes, num_blocks, bytes_per_block)
     )]
     pub fn register_kv_cache(
-        &mut self,
+        &self,
         layer_name: String,
         data_ptr: u64,
         size_bytes: usize,
@@ -222,20 +225,33 @@ impl PegaEngine {
             segments,
         };
 
+        // Acquire write locks for registration
+        let mut layer_name_to_id = self.layer_name_to_id.write().expect("layer_name_to_id lock poisoned");
+        let mut layer_names = self.layer_names.write().expect("layer_names lock poisoned");
+        let mut kv_caches = self.kv_caches.write().expect("kv_caches lock poisoned");
+
         // Assign layer_id if this is a new layer
-        if !self.layer_name_to_id.contains_key(&layer_name) {
-            let layer_id = self.layer_names.len();
-            self.layer_name_to_id.insert(layer_name.clone(), layer_id);
-            self.layer_names.push(layer_name.clone());
+        if !layer_name_to_id.contains_key(&layer_name) {
+            let layer_id = layer_names.len();
+            layer_name_to_id.insert(layer_name.clone(), layer_id);
+            layer_names.push(layer_name.clone());
         }
 
-        self.kv_caches.insert(layer_name, registration);
+        kv_caches.insert(layer_name, registration);
     }
 
     /// Unregister all KV cache handles
     #[instrument(level = "info", skip(self))]
-    pub fn unregister_all_kv_caches(&mut self) {
-        self.kv_caches.clear();
+    pub fn unregister_all_kv_caches(&self) {
+        // Acquire write locks for all registration metadata
+        let mut kv_caches = self.kv_caches.write().expect("kv_caches lock poisoned");
+        let mut layer_name_to_id = self.layer_name_to_id.write().expect("layer_name_to_id lock poisoned");
+        let mut layer_names = self.layer_names.write().expect("layer_names lock poisoned");
+
+        // Clear all registration metadata
+        kv_caches.clear();
+        layer_name_to_id.clear();
+        layer_names.clear();
     }
 
     /// Allocate pinned memory from the pool. Returns RAII guard. Panics when the allocation cannot be satisfied.
@@ -245,12 +261,14 @@ impl PegaEngine {
 
     /// Get the layer_id for a given layer_name
     fn get_layer_id(&self, layer_name: &str) -> Option<usize> {
-        self.layer_name_to_id.get(layer_name).copied()
+        let layer_name_to_id = self.layer_name_to_id.read().expect("layer_name_to_id lock poisoned");
+        layer_name_to_id.get(layer_name).copied()
     }
 
     /// Get the total number of layers
     fn num_layers(&self) -> usize {
-        self.layer_names.len()
+        let layer_names = self.layer_names.read().expect("layer_names lock poisoned");
+        layer_names.len()
     }
 
     /// Create a new LayerBlocksWithWeight
@@ -270,7 +288,7 @@ impl PegaEngine {
         fields(layer = %layer_name, blocks = %block_ids.len(), hashes = %block_hashes.len()),
     )]
     pub fn save_kv_blocks_from_ipc(
-        &mut self,
+        &self,
         layer_name: String,
         block_ids: Vec<i32>,
         block_hashes: Vec<Vec<u8>>,
@@ -285,10 +303,14 @@ impl PegaEngine {
             .get_layer_id(&layer_name)
             .unwrap_or_else(|| panic!("Layer {} not registered", layer_name));
 
-        let registration = self
-            .kv_caches
-            .get(&layer_name)
-            .unwrap_or_else(|| panic!("Layer {} not registered", layer_name));
+        // Acquire read lock for kv_caches and clone the registration
+        let registration = {
+            let kv_caches = self.kv_caches.read().expect("kv_caches lock poisoned");
+            kv_caches
+                .get(&layer_name)
+                .cloned()
+                .unwrap_or_else(|| panic!("Layer {} not registered", layer_name))
+        };
 
         // Collect blocks that need to be saved
         let mut blocks_to_save = Vec::with_capacity(block_ids.len());
@@ -444,7 +466,7 @@ impl PegaEngine {
     /// Returns:
     ///   - usize: Number of contiguous blocks available from the prefix
     #[instrument(
-        level = "debug",
+        level = "info",
         skip(self, block_hashes),
         fields(requested = %block_hashes.len()),
         ret
@@ -542,11 +564,15 @@ impl PegaEngine {
                 }
             };
 
-            let registration = match self.kv_caches.get(*layer_name) {
-                Some(reg) => reg,
-                None => {
-                    info!("Layer {} not registered, skipping", layer_name);
-                    continue;
+            // Acquire read lock for kv_caches and clone the registration
+            let registration = {
+                let kv_caches = self.kv_caches.read().expect("kv_caches lock poisoned");
+                match kv_caches.get(*layer_name).cloned() {
+                    Some(reg) => reg,
+                    None => {
+                        info!("Layer {} not registered, skipping", layer_name);
+                        continue;
+                    }
                 }
             };
 
