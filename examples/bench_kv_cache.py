@@ -285,13 +285,13 @@ def main():
     parser.add_argument(
         "--num-prompts",
         type=int,
-        default=80,
+        default=3,
         help="Number of prompts to benchmark (default: 20)"
     )
     parser.add_argument(
         "--input-len",
         type=int,
-        default=2048,
+        default=10000,
         help="Input prompt length in tokens (default: 1024)"
     )
     parser.add_argument(
@@ -321,7 +321,7 @@ def main():
     parser.add_argument(
         "--request-rate",
         type=float,
-        default=4.0,
+        default=1.0,
         help="Request rate in requests per second. Use 1.0 to send requests one by one. "
              "Use 'inf' for sending all at once (default: 1.0)"
     )

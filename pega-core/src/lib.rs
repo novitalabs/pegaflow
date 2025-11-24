@@ -38,7 +38,7 @@ use tracing::{debug, info, instrument};
 
 use crate::pinned_pool::PinnedMemoryPool;
 
-const DEFAULT_PINNED_POOL_BYTES: usize = 50 * 1024 * 1024 * 1024; // 10GB
+const DEFAULT_PINNED_POOL_BYTES: usize = 20 * 1024 * 1024 * 1024; // 10GB
 
 type BlockHash = Vec<u8>;
 
