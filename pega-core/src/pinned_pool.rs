@@ -137,3 +137,7 @@ impl Drop for PinnedMemoryPool {
         info!("Freed pinned memory pool");
     }
 }
+
+// TODO: fix this
+unsafe impl Send for PinnedMemoryPool {}
+unsafe impl Sync for PinnedMemoryPool {}

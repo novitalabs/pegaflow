@@ -45,6 +45,8 @@ impl PegaEngine {
     /// Register a context layer buffer along with its layout metadata.
     ///
     /// Args:
+    ///     instance_id: ID of the model instance
+    ///     device_id: CUDA device ID
     ///     layer_name: Name of the layer
     ///     data_ptr: GPU data pointer (as u64)
     ///     size_bytes: Total size of the tensor in bytes
@@ -52,9 +54,13 @@ impl PegaEngine {
     ///     bytes_per_block: Size of each paged block in bytes
     ///     kv_stride_bytes: Byte stride between K and V when KV-first layout is used
     ///     segments: Number of segments per block (1 for blocks-first, 2 for KV-first)
+    ///     tp_rank: Tensor Parallel rank of the worker
+    ///     tp_size: Total Tensor Parallel size
+    ///     num_layers: Total number of layers in the model
+    #[allow(clippy::too_many_arguments)]
     fn register_context_layer(
         &mut self,
-        context_id: &str,
+        instance_id: &str,
         device_id: i32,
         layer_name: String,
         data_ptr: u64,
@@ -63,10 +69,13 @@ impl PegaEngine {
         bytes_per_block: usize,
         kv_stride_bytes: usize,
         segments: usize,
+        tp_rank: usize,
+        tp_size: usize,
+        num_layers: usize,
     ) -> PyResult<()> {
         self.engine
             .register_context_layer(
-                context_id,
+                instance_id,
                 device_id,
                 layer_name,
                 data_ptr,
@@ -75,37 +84,44 @@ impl PegaEngine {
                 bytes_per_block,
                 kv_stride_bytes,
                 segments,
+                tp_rank,
+                tp_size,
+                num_layers,
             )
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
-    /// Unregister the active inference context
-    fn unregister_context(&mut self, context_id: &str) -> PyResult<()> {
+    /// Unregister the active inference context/instance
+    fn unregister_instance(&mut self, instance_id: &str) -> PyResult<()> {
         self.engine
-            .unregister_context(context_id)
+            .unregister_instance(instance_id)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Save KV blocks from GPU via IPC handle to CPU memory
     ///
     /// Args:
+    ///     instance_id: ID of the model instance
+    ///     tp_rank: Tensor Parallel rank of the worker
     ///     layer_name: Name of the layer
     ///     block_ids: GPU block IDs to copy (list of ints)
     ///     block_hashes: Content hashes for each block (list of bytes)
     fn save_kv_blocks_from_ipc(
         &self,
         py: Python<'_>,
-        context_id: &str,
+        instance_id: &str,
+        tp_rank: usize,
         layer_name: String,
         block_ids: Vec<i32>,
         block_hashes: Vec<Vec<u8>>,
     ) -> PyResult<()> {
-        let context_id_owned = context_id.to_string();
+        let instance_id_owned = instance_id.to_string();
         let layer_name_owned = layer_name;
         let engine = &self.engine;
         py.allow_threads(move || {
             engine.save_kv_blocks_from_ipc(
-                &context_id_owned,
+                &instance_id_owned,
+                tp_rank,
                 &layer_name_owned,
                 block_ids,
                 block_hashes,
@@ -139,13 +155,16 @@ impl PegaEngine {
     fn wait_for_layer_transfer(
         &self,
         py: Python<'_>,
-        context_id: &str,
+        instance_id: &str,
+        tp_rank: usize,
         layer_name: String,
     ) -> PyResult<()> {
-        let context_id_owned = context_id.to_string();
+        let instance_id_owned = instance_id.to_string();
         let engine = &self.engine;
-        py.allow_threads(move || engine.wait_for_layer_transfer(&context_id_owned, &layer_name))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        py.allow_threads(move || {
+            engine.wait_for_layer_transfer(&instance_id_owned, tp_rank, &layer_name)
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Batch load KV blocks for multiple layers using the same block mapping
@@ -157,25 +176,29 @@ impl PegaEngine {
     /// by performing all lookups once and then extracting blocks for each layer.
     ///
     /// Args:
+    ///     instance_id: ID of the model instance
+    ///     tp_rank: Tensor Parallel rank of the worker
     ///     layer_names: List of layer names to load
     ///     block_ids: GPU block IDs to load into (list of ints)
     ///     block_hashes: Content hashes for each block (list of bytes)
     fn batch_load_kv_blocks(
         &self,
         py: Python<'_>,
-        context_id: &str,
+        instance_id: &str,
+        tp_rank: usize,
         layer_names: Vec<String>,
         block_ids: Vec<i32>,
         block_hashes: Vec<Vec<u8>>,
     ) -> PyResult<(usize, usize)> {
-        let context_id_owned = context_id.to_string();
+        let instance_id_owned = instance_id.to_string();
         let engine = &self.engine;
         py.allow_threads(move || {
             let layer_name_refs: Vec<&str> = layer_names.iter().map(|s| s.as_str()).collect();
 
             engine
                 .batch_load_kv_blocks_multi_layer(
-                    &context_id_owned,
+                    &instance_id_owned,
+                    tp_rank,
                     &layer_name_refs,
                     &block_ids,
                     &block_hashes,

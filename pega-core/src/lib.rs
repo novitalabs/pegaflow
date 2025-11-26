@@ -29,7 +29,7 @@ pub use pinned_pool::PinnedAllocation;
 
 use cudarc::driver::{CudaContext, CudaEvent, CudaStream};
 use std::{
-    collections::{hash_map::Entry, HashMap},
+    collections::HashMap,
     fmt,
     sync::{Arc, Mutex, RwLock},
     time::Instant,
@@ -42,21 +42,27 @@ const DEFAULT_PINNED_POOL_BYTES: usize = 30 * 1024 * 1024 * 1024; // 10GB
 
 #[derive(Debug)]
 pub enum EngineError {
-    ContextMissing(String),
+    InstanceMissing(String),
+    WorkerMissing(String, usize),
     InvalidArgument(String),
     CudaInit(String),
     Storage(String),
     Poisoned(&'static str),
+    TopologyMismatch(String), // Context, Details
 }
 
 impl fmt::Display for EngineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            EngineError::ContextMissing(ctx) => write!(f, "context {ctx} not registered"),
+            EngineError::InstanceMissing(ctx) => write!(f, "instance {ctx} not found"),
+            EngineError::WorkerMissing(ctx, rank) => {
+                write!(f, "worker rank {rank} not found in instance {ctx}")
+            }
             EngineError::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
             EngineError::CudaInit(msg) => write!(f, "failed to initialize CUDA: {msg}"),
             EngineError::Storage(msg) => write!(f, "storage error: {msg}"),
             EngineError::Poisoned(what) => write!(f, "internal lock poisoned: {what}"),
+            EngineError::TopologyMismatch(msg) => write!(f, "topology mismatch: {msg}"),
         }
     }
 }
@@ -64,7 +70,8 @@ impl fmt::Display for EngineError {
 impl std::error::Error for EngineError {}
 
 pub struct PegaEngine {
-    contexts: RwLock<HashMap<String, EngineContext>>,
+    /// Manages instances and their workers
+    instances: RwLock<HashMap<String, Arc<InstanceContext>>>,
     /// Storage engine responsible for pinned allocations + block cache
     storage: StorageEngine,
 }
@@ -82,26 +89,11 @@ pub struct KVCacheRegistration {
     pub segments: usize,
 }
 
-struct EngineMetadata {
-    kv_caches: HashMap<String, KVCacheRegistration>,
-    layer_name_to_id: HashMap<String, usize>,
-    layer_names: Vec<String>,
-}
-
-impl EngineMetadata {
-    fn new() -> Self {
-        Self {
-            kv_caches: HashMap::new(),
-            layer_name_to_id: HashMap::new(),
-            layer_names: Vec::new(),
-        }
-    }
-}
-
-struct EngineContext {
-    /// KV metadata associated with this context (mutated only during registration)
-    metadata: EngineMetadata,
-    /// Single stream for all transfers to ensure sequential execution (Layer0 -> Layer1...)
+/// Context for a specific Worker process (one TP rank)
+struct WorkerContext {
+    /// KV cache registrations for this worker (Layer Name -> GPU Ptr Info)
+    kv_caches: Mutex<HashMap<String, KVCacheRegistration>>,
+    /// Single stream for all transfers to ensure sequential execution
     stream: Arc<CudaStream>,
     /// Track per-layer completion events for async loading
     layer_events: Mutex<HashMap<String, CudaEvent>>,
@@ -110,13 +102,13 @@ struct EngineContext {
     device_id: i32,
 }
 
-impl EngineContext {
+impl WorkerContext {
     fn new(cuda_ctx: Arc<CudaContext>, device_id: i32) -> Self {
         let stream = cuda_ctx
             .new_stream()
-            .expect("Failed to create stream for engine context");
+            .expect("Failed to create stream for worker context");
         Self {
-            metadata: EngineMetadata::new(),
+            kv_caches: Mutex::new(HashMap::new()),
             stream,
             layer_events: Mutex::new(HashMap::new()),
             _cuda_ctx: cuda_ctx,
@@ -124,28 +116,14 @@ impl EngineContext {
         }
     }
 
-    fn register_layer(&mut self, layer_name: String, registration: KVCacheRegistration) {
-        if !self.metadata.layer_name_to_id.contains_key(&layer_name) {
-            let layer_id = self.metadata.layer_names.len();
-            self.metadata
-                .layer_name_to_id
-                .insert(layer_name.clone(), layer_id);
-            self.metadata.layer_names.push(layer_name.clone());
-        }
-
-        self.metadata.kv_caches.insert(layer_name, registration);
-    }
-
-    fn get_layer_id(&self, layer_name: &str) -> Option<usize> {
-        self.metadata.layer_name_to_id.get(layer_name).copied()
-    }
-
-    fn num_layers(&self) -> usize {
-        self.metadata.layer_names.len()
+    fn register_layer(&self, layer_name: String, registration: KVCacheRegistration) {
+        let mut caches = self.kv_caches.lock().expect("kv_caches lock poisoned");
+        caches.insert(layer_name, registration);
     }
 
     fn get_registration(&self, layer_name: &str) -> Option<KVCacheRegistration> {
-        self.metadata.kv_caches.get(layer_name).cloned()
+        let caches = self.kv_caches.lock().expect("kv_caches lock poisoned");
+        caches.get(layer_name).cloned()
     }
 
     fn stream(&self) -> Arc<CudaStream> {
@@ -163,6 +141,128 @@ impl EngineContext {
     }
 }
 
+/// Global context for a Model Instance (across all TP ranks)
+struct InstanceContext {
+    id: String,
+    num_layers: usize,
+    tp_size: usize,
+    /// Maps layer name to layer ID (0..num_layers)
+    layer_name_to_id: Mutex<HashMap<String, usize>>,
+    /// Inverse map to ensure stable ordering
+    layer_names: Mutex<Vec<String>>,
+    /// Active workers for this instance, keyed by TP rank
+    workers: RwLock<HashMap<usize, Arc<WorkerContext>>>,
+}
+
+impl InstanceContext {
+    fn new(id: String, num_layers: usize, tp_size: usize) -> Self {
+        Self {
+            id,
+            num_layers,
+            tp_size,
+            layer_name_to_id: Mutex::new(HashMap::new()),
+            layer_names: Mutex::new(Vec::new()),
+            workers: RwLock::new(HashMap::new()),
+        }
+    }
+
+    fn get_or_create_layer_id(&self, layer_name: &str) -> usize {
+        let mut map = self
+            .layer_name_to_id
+            .lock()
+            .expect("layer_name_to_id lock poisoned");
+        if let Some(&id) = map.get(layer_name) {
+            return id;
+        }
+
+        let mut names = self.layer_names.lock().expect("layer_names lock poisoned");
+        let id = names.len();
+        names.push(layer_name.to_string());
+        map.insert(layer_name.to_string(), id);
+        id
+    }
+
+    fn get_layer_id(&self, layer_name: &str) -> Option<usize> {
+        let map = self
+            .layer_name_to_id
+            .lock()
+            .expect("layer_name_to_id lock poisoned");
+        map.get(layer_name).copied()
+    }
+
+    fn total_slots(&self) -> usize {
+        self.num_layers * self.tp_size
+    }
+
+    fn get_slot_index(&self, layer_id: usize, tp_rank: usize) -> Result<usize, EngineError> {
+        if layer_id >= self.num_layers {
+            return Err(EngineError::InvalidArgument(format!(
+                "layer_id {} out of range ({} layers)",
+                layer_id, self.num_layers
+            )));
+        }
+        if tp_rank >= self.tp_size {
+            return Err(EngineError::InvalidArgument(format!(
+                "tp_rank {} out of range (tp_size {})",
+                tp_rank, self.tp_size
+            )));
+        }
+        Ok(layer_id * self.tp_size + tp_rank)
+    }
+
+    fn ensure_worker(
+        &self,
+        tp_rank: usize,
+        device_id: i32,
+    ) -> Result<Arc<WorkerContext>, EngineError> {
+        if tp_rank >= self.tp_size {
+            return Err(EngineError::InvalidArgument(format!(
+                "tp_rank {} exceeds tp_size {}",
+                tp_rank, self.tp_size
+            )));
+        }
+
+        // Fast path: read lock
+        {
+            let workers = self.workers.read().expect("workers read lock poisoned");
+            if let Some(worker) = workers.get(&tp_rank) {
+                if worker.device_id != device_id {
+                    return Err(EngineError::TopologyMismatch(format!(
+                        "worker rank {tp_rank} already bound to device {}, requested {device_id}",
+                        worker.device_id
+                    )));
+                }
+                return Ok(Arc::clone(worker));
+            }
+        }
+
+        // Slow path: write lock
+        let mut workers = self.workers.write().expect("workers write lock poisoned");
+        // Check again in case another thread inserted it
+        if let Some(worker) = workers.get(&tp_rank) {
+            if worker.device_id != device_id {
+                return Err(EngineError::TopologyMismatch(format!(
+                    "worker rank {tp_rank} already bound to device {}, requested {device_id}",
+                    worker.device_id
+                )));
+            }
+            return Ok(Arc::clone(worker));
+        }
+
+        // Create new worker
+        let cuda_ctx = CudaContext::new(device_id as usize)
+            .map_err(|e| EngineError::CudaInit(format!("{e:?}")))?;
+        let worker = Arc::new(WorkerContext::new(cuda_ctx, device_id));
+        workers.insert(tp_rank, Arc::clone(&worker));
+        Ok(worker)
+    }
+
+    fn get_worker(&self, tp_rank: usize) -> Option<Arc<WorkerContext>> {
+        let workers = self.workers.read().expect("workers read lock poisoned");
+        workers.get(&tp_rank).cloned()
+    }
+}
+
 impl PegaEngine {
     /// Create a new PegaEngine instance
     #[instrument(level = "info")]
@@ -174,80 +274,73 @@ impl PegaEngine {
     pub fn new_with_pool_size(pool_size: usize) -> Self {
         let storage = StorageEngine::new(pool_size);
         PegaEngine {
-            contexts: RwLock::new(HashMap::new()),
+            instances: RwLock::new(HashMap::new()),
             storage,
         }
     }
 
-    fn ensure_context(&self, context_id: &str, device_id: i32) -> Result<(), EngineError> {
-        if device_id < 0 {
-            return Err(EngineError::InvalidArgument(format!(
-                "device_id must be >= 0 (got {device_id})"
-            )));
-        }
-
-        let mut contexts = self
-            .contexts
-            .write()
-            .map_err(|_| EngineError::Poisoned("contexts write"))?;
-
-        match contexts.entry(context_id.to_string()) {
-            Entry::Occupied(existing) => {
-                if existing.get().device_id != device_id {
-                    return Err(EngineError::InvalidArgument(format!(
-                        "context {context_id} already bound to device {}, requested device {device_id}",
-                        existing.get().device_id
+    fn get_or_create_instance(
+        &self,
+        instance_id: &str,
+        num_layers: usize,
+        tp_size: usize,
+    ) -> Result<Arc<InstanceContext>, EngineError> {
+        // Fast path
+        {
+            let instances = self.instances.read().expect("instances read lock poisoned");
+            if let Some(instance) = instances.get(instance_id) {
+                // Verify topology matches
+                if instance.num_layers != num_layers || instance.tp_size != tp_size {
+                    return Err(EngineError::TopologyMismatch(format!(
+                        "instance {instance_id} exists with layers={}, tp={}; requested layers={}, tp={}",
+                        instance.num_layers, instance.tp_size, num_layers, tp_size
                     )));
                 }
-            }
-            Entry::Vacant(vacant) => {
-                let cuda_ctx = CudaContext::new(device_id as usize)
-                    .map_err(|e| EngineError::CudaInit(format!("{e:?}")))?;
-                let ctx = EngineContext::new(cuda_ctx, device_id);
-                vacant.insert(ctx);
+                return Ok(Arc::clone(instance));
             }
         }
 
-        Ok(())
-    }
-
-    fn with_context<F, R>(&self, context_id: &str, f: F) -> Result<R, EngineError>
-    where
-        F: FnOnce(&EngineContext) -> Result<R, EngineError>,
-    {
-        let contexts = self
-            .contexts
-            .read()
-            .map_err(|_| EngineError::Poisoned("contexts read"))?;
-        let ctx = contexts
-            .get(context_id)
-            .ok_or_else(|| EngineError::ContextMissing(context_id.to_string()))?;
-        f(ctx)
-    }
-
-    fn with_context_mut<F, R>(&self, context_id: &str, f: F) -> Result<R, EngineError>
-    where
-        F: FnOnce(&mut EngineContext) -> Result<R, EngineError>,
-    {
-        let mut contexts = self
-            .contexts
+        // Slow path
+        let mut instances = self
+            .instances
             .write()
-            .map_err(|_| EngineError::Poisoned("contexts write"))?;
-        let ctx = contexts
-            .get_mut(context_id)
-            .ok_or_else(|| EngineError::ContextMissing(context_id.to_string()))?;
-        f(ctx)
+            .expect("instances write lock poisoned");
+        if let Some(instance) = instances.get(instance_id) {
+            if instance.num_layers != num_layers || instance.tp_size != tp_size {
+                return Err(EngineError::TopologyMismatch(format!(
+                    "instance {instance_id} exists with layers={}, tp={}; requested layers={}, tp={}",
+                    instance.num_layers, instance.tp_size, num_layers, tp_size
+                )));
+            }
+            return Ok(Arc::clone(instance));
+        }
+
+        let instance = Arc::new(InstanceContext::new(
+            instance_id.to_string(),
+            num_layers,
+            tp_size,
+        ));
+        instances.insert(instance_id.to_string(), Arc::clone(&instance));
+        Ok(instance)
+    }
+
+    fn get_instance(&self, instance_id: &str) -> Result<Arc<InstanceContext>, EngineError> {
+        let instances = self.instances.read().expect("instances read lock poisoned");
+        instances
+            .get(instance_id)
+            .cloned()
+            .ok_or_else(|| EngineError::InstanceMissing(instance_id.to_string()))
     }
 
     /// Register a KV cache region with its layout info
     #[instrument(
         level = "debug",
         skip(self),
-        fields(layer = %layer_name, size_bytes, num_blocks, bytes_per_block)
+        fields(instance=%instance_id, rank=%tp_rank, layer=%layer_name)
     )]
     pub fn register_context_layer(
         &self,
-        context_id: &str,
+        instance_id: &str,
         device_id: i32,
         layer_name: String,
         data_ptr: u64,
@@ -256,12 +349,26 @@ impl PegaEngine {
         bytes_per_block: usize,
         kv_stride_bytes: usize,
         segments: usize,
+        tp_rank: usize,
+        tp_size: usize,
+        num_layers: usize,
     ) -> Result<(), EngineError> {
         if bytes_per_block == 0 || num_blocks == 0 || segments == 0 {
             return Err(EngineError::InvalidArgument(format!(
                 "invalid KV cache layout for layer {layer_name}"
             )));
         }
+        if device_id < 0 {
+            return Err(EngineError::InvalidArgument(
+                "device_id must be >= 0".to_string(),
+            ));
+        }
+
+        let instance = self.get_or_create_instance(instance_id, num_layers, tp_size)?;
+        let worker = instance.ensure_worker(tp_rank, device_id)?;
+
+        // Register layer ID in global instance map
+        instance.get_or_create_layer_id(&layer_name);
 
         let registration = KVCacheRegistration {
             data_ptr,
@@ -272,37 +379,34 @@ impl PegaEngine {
             segments,
         };
 
-        self.ensure_context(context_id, device_id)?;
-        self.with_context_mut(context_id, |ctx| {
-            ctx.register_layer(layer_name, registration);
-            Ok(())
-        })
+        worker.register_layer(layer_name, registration);
+        Ok(())
     }
 
-    /// Unregister all KV cache handles
+    /// Unregister instance
     #[instrument(level = "info", skip(self))]
-    pub fn unregister_context(&self, context_id: &str) -> Result<(), EngineError> {
+    pub fn unregister_instance(&self, instance_id: &str) -> Result<(), EngineError> {
         let removed = self
-            .contexts
+            .instances
             .write()
-            .map_err(|_| EngineError::Poisoned("contexts write"))?
-            .remove(context_id);
+            .expect("instances write lock poisoned")
+            .remove(instance_id);
 
         if removed.is_none() {
-            return Err(EngineError::ContextMissing(context_id.to_string()));
+            return Err(EngineError::InstanceMissing(instance_id.to_string()));
         }
-
         Ok(())
     }
 
     #[instrument(
         level = "debug",
         skip(self, block_ids, block_hashes),
-        fields(layer = %layer_name, blocks = %block_ids.len(), hashes = %block_hashes.len()),
+        fields(instance=%instance_id, rank=%tp_rank, layer=%layer_name, blocks=%block_ids.len())
     )]
     pub fn save_kv_blocks_from_ipc(
         &self,
-        context_id: &str,
+        instance_id: &str,
+        tp_rank: usize,
         layer_name: &str,
         block_ids: Vec<i32>,
         block_hashes: Vec<Vec<u8>>,
@@ -315,15 +419,21 @@ impl PegaEngine {
             )));
         }
 
-        let (layer_id, registration, total_layers) = self.with_context(context_id, |ctx| {
-            let layer_id = ctx.get_layer_id(layer_name).ok_or_else(|| {
-                EngineError::InvalidArgument(format!("layer {layer_name} not registered"))
-            })?;
-            let registration = ctx.get_registration(layer_name).ok_or_else(|| {
-                EngineError::InvalidArgument(format!("layer {layer_name} not registered"))
-            })?;
-            Ok((layer_id, registration, ctx.num_layers()))
+        let instance = self.get_instance(instance_id)?;
+        let worker = instance
+            .get_worker(tp_rank)
+            .ok_or_else(|| EngineError::WorkerMissing(instance_id.to_string(), tp_rank))?;
+
+        let layer_id = instance
+            .get_layer_id(layer_name)
+            .ok_or_else(|| EngineError::InvalidArgument(format!("layer {layer_name} unknown")))?;
+
+        let registration = worker.get_registration(layer_name).ok_or_else(|| {
+            EngineError::InvalidArgument(format!("layer {layer_name} not registered on worker"))
         })?;
+
+        let slot_id = instance.get_slot_index(layer_id, tp_rank)?;
+        let total_slots = instance.total_slots();
 
         // Collect blocks that need to be saved
         let mut blocks_to_save = Vec::with_capacity(block_ids.len());
@@ -340,8 +450,8 @@ impl PegaEngine {
                 )));
             }
 
-            // Check if this block_hash already has data for this layer
-            let needs_save = !self.storage.layer_has_block(block_hash, layer_id);
+            // Check if this block_hash already has data for this slot
+            let needs_save = !self.storage.slot_has_block(block_hash, slot_id);
 
             if needs_save {
                 blocks_to_save.push((block_idx, block_hash.clone()));
@@ -417,7 +527,7 @@ impl PegaEngine {
                 ));
 
                 self.storage
-                    .insert_block(block_hash, layer_id, block, total_layers);
+                    .insert_block(block_hash, slot_id, block, total_slots);
             }
         } else {
             // Original logic for contiguous or single-segment layouts
@@ -437,7 +547,7 @@ impl PegaEngine {
                 ));
 
                 self.storage
-                    .insert_block(block_hash, layer_id, block, total_layers);
+                    .insert_block(block_hash, slot_id, block, total_slots);
             }
         }
         Ok(())
@@ -464,6 +574,7 @@ impl PegaEngine {
         let mut hit_count = 0;
 
         for block_hash in block_hashes.iter() {
+            // Storage engine handles "completion" atomically across all layers and TP ranks
             if !self.storage.block_is_complete(block_hash) {
                 break;
             }
@@ -498,24 +609,30 @@ impl PegaEngine {
     #[instrument(
         level = "debug",
         skip(self, block_ids, block_hashes),
-        fields(layers = %layer_names.len(), blocks = %block_ids.len(), hashes = %block_hashes.len(),context_id = %context_id),
+        fields(instance=%instance_id, rank=%tp_rank, layers=%layer_names.len(), blocks=%block_ids.len())
     )]
     pub fn batch_load_kv_blocks_multi_layer(
         &self,
-        context_id: &str,
+        instance_id: &str,
+        tp_rank: usize,
         layer_names: &[&str],
         block_ids: &[i32],
         block_hashes: &[Vec<u8>],
     ) -> Result<Vec<(String, usize)>, EngineError> {
         let start_time = Instant::now();
 
-        // Step 1: Lookup all block_hashes ONCE and cache the LayerBlocks
-        let layer_blocks_cache = self
+        let instance = self.get_instance(instance_id)?;
+        let worker = instance
+            .get_worker(tp_rank)
+            .ok_or_else(|| EngineError::WorkerMissing(instance_id.to_string(), tp_rank))?;
+
+        let stream = worker.stream();
+
+        // Step 1: Lookup all block_hashes ONCE and cache the blocks
+        let shard_blocks_cache = self
             .storage
             .lookup_many(block_hashes)
             .map_err(EngineError::Storage)?;
-
-        let stream = self.with_context(context_id, |ctx| Ok(ctx.stream()))?;
 
         // Step 2: For each layer, extract blocks and perform transfer
         let mut results = Vec::with_capacity(layer_names.len());
@@ -523,31 +640,32 @@ impl PegaEngine {
         for layer_name in layer_names {
             let layer_start = Instant::now();
 
-            let (layer_id, registration) = match self.with_context(context_id, |ctx| {
-                let layer_id = ctx.get_layer_id(layer_name).ok_or_else(|| {
-                    EngineError::InvalidArgument(format!("layer {layer_name} not registered"))
-                })?;
-                let registration = ctx.get_registration(layer_name).ok_or_else(|| {
-                    EngineError::InvalidArgument(format!("layer {layer_name} not registered"))
-                })?;
-                Ok((layer_id, registration))
-            }) {
-                Ok(data) => data,
-                Err(err @ EngineError::InvalidArgument(_)) => {
-                    info!("Layer {} not registered, skipping ({err})", layer_name);
+            let layer_id = match instance.get_layer_id(layer_name) {
+                Some(id) => id,
+                None => {
+                    info!("Layer {} unknown in instance, skipping", layer_name);
                     continue;
                 }
-                Err(err) => return Err(err),
             };
+
+            let registration = match worker.get_registration(layer_name) {
+                Some(reg) => reg,
+                None => {
+                    info!("Layer {} not registered on worker, skipping", layer_name);
+                    continue;
+                }
+            };
+
+            let slot_id = instance.get_slot_index(layer_id, tp_rank)?;
 
             // Collect valid blocks to load for this layer
             let mut blocks_to_load = Vec::with_capacity(block_ids.len());
 
-            for (block_id, layer_blocks_arc) in block_ids.iter().zip(layer_blocks_cache.iter()) {
+            for (block_id, shard_blocks_arc) in block_ids.iter().zip(shard_blocks_cache.iter()) {
                 let block_idx = *block_id as usize;
 
-                let blocks = layer_blocks_arc.lock_blocks();
-                if let Some(block) = blocks.get(layer_id).and_then(|opt| opt.as_ref()) {
+                let blocks = shard_blocks_arc.lock_blocks();
+                if let Some(block) = blocks.get(slot_id).and_then(|opt| opt.as_ref()) {
                     blocks_to_load.push((block_idx, block.clone()));
                 }
             }
@@ -652,10 +770,7 @@ impl PegaEngine {
             // Record event for this layer
             match stream.record_event(None) {
                 Ok(event) => {
-                    self.with_context(context_id, |ctx| {
-                        ctx.record_layer_event(layer_name, event);
-                        Ok(())
-                    })?;
+                    worker.record_layer_event(layer_name, event);
                 }
                 Err(e) => {
                     info!(
@@ -695,10 +810,16 @@ impl PegaEngine {
     /// Block until the most recent async transfer for a layer finishes.
     pub fn wait_for_layer_transfer(
         &self,
-        context_id: &str,
+        instance_id: &str,
+        tp_rank: usize,
         layer_name: &str,
     ) -> Result<(), EngineError> {
-        let event = self.with_context(context_id, |ctx| Ok(ctx.take_layer_event(layer_name)))?;
+        let instance = self.get_instance(instance_id)?;
+        let worker = instance
+            .get_worker(tp_rank)
+            .ok_or_else(|| EngineError::WorkerMissing(instance_id.to_string(), tp_rank))?;
+
+        let event = worker.take_layer_event(layer_name);
 
         if let Some(event) = event {
             event.synchronize().map_err(|e| {
@@ -708,15 +829,3 @@ impl PegaEngine {
         Ok(())
     }
 }
-
-impl Default for PegaEngine {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// Safety: PegaEngine can be safely sent between threads
-// - PinnedMemoryPool owns the CUDA allocation
-// - CUDA context is thread-safe (Arc<CudaContext>)
-unsafe impl Send for PegaEngine {}
-unsafe impl Sync for PegaEngine {}

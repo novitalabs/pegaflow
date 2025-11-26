@@ -6,56 +6,54 @@ use crate::pinned_pool::{PinnedAllocation, PinnedMemoryPool};
 
 const RECLAIM_BATCH_OBJECTS: usize = 256;
 
-// A "layer" in this file always refers to a model layer registered by vLLM
-// (e.g. transformer block 0, 1, ...). vLLM reports the total number of layers
-// up front and that count never changes for the lifetime of the engine, so
-// we treat it as immutable. Any attempt to resize the per-layer vector means
-// the registration logic violated this contract and should panic.
-// NOTE: Storage should avoid depending on per-context routing details; if KV reuse
-// requires context-specific handling it must be addressed in upper layers.
+// A "slot" in this file refers to a specific position in the flattened logical storage,
+// calculated as `layer_id * tp_size + tp_rank`.
+// vLLM/Connectors report the total topology (layers * tp_size) via registration,
+// and this count is immutable for the lifetime of the Instance.
+// NOTE: Storage is generic and operates on flat indices (slots).
 
 pub type BlockHash = Vec<u8>;
-type LayerBlocks = Vec<Option<Arc<Block>>>;
+type ShardBlocks = Vec<Option<Arc<Block>>>;
 
-struct LayerBlocksState {
-    blocks: LayerBlocks,
+struct ShardBlocksState {
+    blocks: ShardBlocks,
     is_complete: bool,
 }
 
-impl LayerBlocksState {
-    fn new(num_layers: usize) -> Self {
+impl ShardBlocksState {
+    fn new(num_slots: usize) -> Self {
         Self {
-            blocks: vec![None; num_layers],
+            blocks: vec![None; num_slots],
             is_complete: false,
         }
     }
 
-    fn mark_layer_ready(&mut self, layer_id: usize, block: Arc<Block>) {
+    fn mark_slot_ready(&mut self, slot_id: usize, block: Arc<Block>) {
         assert!(
-            layer_id < self.blocks.len(),
-            "layer_id {} out of bounds ({} layers)",
-            layer_id,
+            slot_id < self.blocks.len(),
+            "slot_id {} out of bounds ({} slots)",
+            slot_id,
             self.blocks.len()
         );
-        self.blocks[layer_id] = Some(block);
+        self.blocks[slot_id] = Some(block);
         self.is_complete = self.blocks.iter().all(|opt| opt.is_some());
     }
 }
 
-/// Wrapper for per-layer block vectors with a fixed weight for cache eviction.
-pub struct LayerBlocksWithWeight {
-    inner: Mutex<LayerBlocksState>,
+/// Wrapper for per-slot block vectors with a fixed weight for cache eviction.
+pub struct ShardBlocksWithWeight {
+    inner: Mutex<ShardBlocksState>,
 }
 
-impl LayerBlocksWithWeight {
-    pub fn new(num_layers: usize) -> Self {
+impl ShardBlocksWithWeight {
+    pub fn new(num_slots: usize) -> Self {
         Self {
-            inner: Mutex::new(LayerBlocksState::new(num_layers)),
+            inner: Mutex::new(ShardBlocksState::new(num_slots)),
         }
     }
 
-    pub fn lock_blocks(&self) -> LayerBlocksGuard<'_> {
-        LayerBlocksGuard {
+    pub fn lock_blocks(&self) -> ShardBlocksGuard<'_> {
+        ShardBlocksGuard {
             inner: self.lock_state(),
         }
     }
@@ -67,32 +65,32 @@ impl LayerBlocksWithWeight {
             .is_complete
     }
 
-    fn lock_state(&self) -> MutexGuard<'_, LayerBlocksState> {
-        self.inner.lock().expect("layer blocks lock poisoned")
+    fn lock_state(&self) -> MutexGuard<'_, ShardBlocksState> {
+        self.inner.lock().expect("shard blocks lock poisoned")
     }
 }
 
-pub struct LayerBlocksGuard<'a> {
-    inner: MutexGuard<'a, LayerBlocksState>,
+pub struct ShardBlocksGuard<'a> {
+    inner: MutexGuard<'a, ShardBlocksState>,
 }
 
-impl<'a> Deref for LayerBlocksGuard<'a> {
-    type Target = LayerBlocks;
+impl<'a> Deref for ShardBlocksGuard<'a> {
+    type Target = ShardBlocks;
 
     fn deref(&self) -> &Self::Target {
         &self.inner.blocks
     }
 }
 
-impl<'a> DerefMut for LayerBlocksGuard<'a> {
+impl<'a> DerefMut for ShardBlocksGuard<'a> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner.blocks
     }
 }
 
-impl<'a> LayerBlocksGuard<'a> {
-    pub fn mark_layer_ready(&mut self, layer_id: usize, block: Arc<Block>) {
-        self.inner.mark_layer_ready(layer_id, block);
+impl<'a> ShardBlocksGuard<'a> {
+    pub fn mark_slot_ready(&mut self, slot_id: usize, block: Arc<Block>) {
+        self.inner.mark_slot_ready(slot_id, block);
     }
 }
 
@@ -156,7 +154,7 @@ unsafe impl Send for Block {}
 unsafe impl Sync for Block {}
 
 pub struct StorageEngine {
-    kv_storage: Mutex<LruCache<BlockHash, Arc<LayerBlocksWithWeight>>>,
+    kv_storage: Mutex<LruCache<BlockHash, Arc<ShardBlocksWithWeight>>>,
     pinned_pool: Arc<PinnedMemoryPool>,
 }
 
@@ -212,13 +210,13 @@ impl StorageEngine {
         freed_entries
     }
 
-    pub fn layer_has_block(&self, block_hash: &[u8], layer_id: usize) -> bool {
+    pub fn slot_has_block(&self, block_hash: &[u8], slot_id: usize) -> bool {
         let mut cache = self.kv_storage.lock().unwrap();
         cache
             .get(block_hash)
             .map(|blocks| {
                 let blocks = blocks.lock_blocks();
-                blocks.get(layer_id).and_then(|opt| opt.as_ref()).is_some()
+                blocks.get(slot_id).and_then(|opt| opt.as_ref()).is_some()
             })
             .unwrap_or(false)
     }
@@ -234,32 +232,32 @@ impl StorageEngine {
     pub fn insert_block(
         &self,
         block_hash: BlockHash,
-        layer_id: usize,
+        slot_id: usize,
         block: Arc<Block>,
-        total_layers: usize,
+        total_slots: usize,
     ) {
         let mut cache = self.kv_storage.lock().unwrap();
         let entry = cache.get(&block_hash).cloned().unwrap_or_else(|| {
-            let new_blocks = Arc::new(LayerBlocksWithWeight::new(total_layers));
+            let new_blocks = Arc::new(ShardBlocksWithWeight::new(total_slots));
             cache.insert(block_hash.clone(), Arc::clone(&new_blocks));
             new_blocks
         });
         let mut blocks = entry.lock_blocks();
-        blocks.mark_layer_ready(layer_id, block);
+        blocks.mark_slot_ready(slot_id, block);
     }
 
     pub fn lookup_many(
         &self,
         block_hashes: &[Vec<u8>],
-    ) -> Result<Vec<Arc<LayerBlocksWithWeight>>, String> {
+    ) -> Result<Vec<Arc<ShardBlocksWithWeight>>, String> {
         let mut cache = self.kv_storage.lock().unwrap();
         let mut result = Vec::with_capacity(block_hashes.len());
         for hash in block_hashes {
-            let layer_blocks = cache
+            let shard_blocks = cache
                 .get(hash)
                 .cloned()
                 .ok_or_else(|| "Missing KV block hash".to_string())?;
-            result.push(layer_blocks);
+            result.push(shard_blocks);
         }
         Ok(result)
     }

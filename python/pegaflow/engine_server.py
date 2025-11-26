@@ -129,41 +129,44 @@ class PegaEngineServer:
 
         self.running = False
 
-    def _require_context_id(self, payload: Dict[str, Any]) -> str:
-        context_id = payload.get("instance_id") or payload.get("context_id")
-        if not context_id:
+    def _require_instance_id(self, payload: Dict[str, Any]) -> str:
+        instance_id = payload.get("instance_id") or payload.get("context_id")
+        if not instance_id:
             raise ValueError("instance_id not provided in payload")
-        return str(context_id)
+        return str(instance_id)
+
+    def _require_tp_rank(self, payload: Dict[str, Any]) -> int:
+        # If tp_rank is explicitly provided (e.g. from scheduler query?), use it.
+        # Otherwise handle missing case gracefully if possible or raise.
+        rank = payload.get("tp_rank")
+        if rank is None:
+             # Fallback/Error handling? Assuming strictly required for worker ops.
+             # For QUERY from scheduler, it might be missing, but QUERY doesn't need tp_rank now.
+             raise ValueError("tp_rank not provided in payload")
+        return int(rank)
 
     def _get_or_create_context(
         self,
-        context_id: str,
+        context_key: str,
         device_id: Optional[int],
     ) -> _ContextState:
-        if context_id in self._contexts:
-            state = self._contexts[context_id]
+        if context_key in self._contexts:
+            state = self._contexts[context_key]
             if device_id is not None and state.device_id != device_id:
                 raise ValueError(
-                    f"Context {context_id} already bound to device {state.device_id}, got {device_id}"
+                    f"Context {context_key} already bound to device {state.device_id}, got {device_id}"
                 )
             return state
 
         resolved_device = device_id if device_id is not None else self.default_device
         state = _ContextState(device_id=resolved_device)
-        self._contexts[context_id] = state
+        self._contexts[context_key] = state
         return state
 
-    def _drop_context(self, context_id: str) -> None:
-        state = self._contexts.pop(context_id, None)
+    def _drop_context(self, context_key: str) -> None:
+        state = self._contexts.pop(context_key, None)
         if state:
             state.tensors.clear()
-        try:
-            self.engine.unregister_context(context_id)
-        except Exception as exc:
-            if state is None:
-                logger.debug("Context %s already unregistered: %s", context_id, exc)
-            else:
-                logger.error("Failed to unregister context %s: %s", context_id, exc)
 
     def _handle_register_context(self, payload: dict) -> dict:
         """Handle REGISTER_CONTEXT command - register KV cache from IPC handle.
@@ -176,13 +179,18 @@ class PegaEngineServer:
                 'bytes_per_block': int,
                 'kv_stride_bytes': int,
                 'segments': int,
+                'tp_rank': int,
+                'tp_size': int,
+                'num_layers': int,
             }
 
         Returns:
             {'status': 'success'} or {'status': 'error', 'message': str}
         """
         try:
-            context_id = self._require_context_id(payload)
+            instance_id = self._require_instance_id(payload)
+            tp_rank = self._require_tp_rank(payload)
+            
             layer_name = payload['layer_name']
             wrapper_bytes = payload['wrapper_bytes']
             num_blocks = payload['num_blocks']
@@ -191,7 +199,13 @@ class PegaEngineServer:
             segments = payload['segments']
             device_id = payload.get('device_id')
 
-            state = self._get_or_create_context(context_id, device_id)
+            # Topology info
+            tp_size = payload['tp_size']
+            num_layers = payload['num_layers']
+
+            # Use (instance_id, tp_rank) as key for keeping tensors alive in Python process
+            context_key = f"{instance_id}:tp{tp_rank}"
+            state = self._get_or_create_context(context_key, device_id)
 
             # Ensure CUDA operations run on the correct device
             torch.cuda.set_device(state.device_id)
@@ -208,7 +222,7 @@ class PegaEngineServer:
             size_bytes = tensor.untyped_storage().nbytes()
 
             self.engine.register_context_layer(
-                context_id,
+                instance_id,
                 state.device_id,
                 layer_name,
                 data_ptr,
@@ -217,11 +231,14 @@ class PegaEngineServer:
                 bytes_per_block,
                 kv_stride_bytes,
                 segments,
+                tp_rank,
+                tp_size,
+                num_layers,
             )
 
             logger.info(
-                "Registered layer '%s' for context %s (device %d): %d blocks, %d bytes/block, ptr=0x%x",
-                layer_name, context_id, state.device_id, num_blocks, bytes_per_block, data_ptr
+                "Registered layer '%s' for instance %s rank %d (device %d): ptr=0x%x",
+                layer_name, instance_id, tp_rank, state.device_id, data_ptr
             )
 
             return {'status': 'success'}
@@ -233,12 +250,19 @@ class PegaEngineServer:
     def _handle_unregister_context(self, payload: dict) -> dict:
         """Handle UNREGISTER_CONTEXT command - clear registered context."""
         try:
-            context_id = self._require_context_id(payload)
-            self._drop_context(context_id)
-            logger.info("Unregistered context %s", context_id)
+            instance_id = self._require_instance_id(payload)
+            
+            # Clean up python side resources for all known ranks of this instance?
+            # Currently we track keys as "{instance_id}:tp{rank}"
+            keys_to_drop = [k for k in self._contexts.keys() if k.startswith(f"{instance_id}:")]
+            for k in keys_to_drop:
+                self._drop_context(k)
+
+            self.engine.unregister_instance(instance_id)
+            logger.info("Unregistered instance %s", instance_id)
             return {'status': 'success'}
         except Exception as e:
-            logger.error("Failed to unregister context: %s", e, exc_info=True)
+            logger.error("Failed to unregister instance: %s", e, exc_info=True)
             return {'status': 'error', 'message': str(e)}
 
     def _handle_save(self, payload: dict) -> dict:
@@ -255,21 +279,23 @@ class PegaEngineServer:
             {'status': 'success'} or {'status': 'error', 'message': str}
         """
         try:
-            context_id = self._require_context_id(payload)
+            instance_id = self._require_instance_id(payload)
+            tp_rank = self._require_tp_rank(payload)
             layer_name = payload['layer_name']
             block_ids = payload['block_ids']
             block_hashes = payload['block_hashes']
 
             self.engine.save_kv_blocks_from_ipc(
-                context_id,
+                instance_id,
+                tp_rank,
                 layer_name,
                 block_ids,
                 block_hashes
             )
 
             logger.debug(
-                "Saved %d blocks for layer '%s' (context %s)",
-                len(block_ids), layer_name, context_id
+                "Saved %d blocks for layer '%s' (instance %s rank %d)",
+                len(block_ids), layer_name, instance_id, tp_rank
             )
 
             return {'status': 'success'}
@@ -297,21 +323,23 @@ class PegaEngineServer:
             or {'status': 'error', 'message': str}
         """
         try:
-            context_id = self._require_context_id(payload)
+            instance_id = self._require_instance_id(payload)
+            tp_rank = self._require_tp_rank(payload)
             layer_names = payload['layer_names']
             block_ids = payload['block_ids']
             block_hashes = payload['block_hashes']
 
             num_layers_loaded, total_bytes = self.engine.batch_load_kv_blocks(
-                context_id,
+                instance_id,
+                tp_rank,
                 layer_names,
                 block_ids,
                 block_hashes
             )
 
             logger.debug(
-                "Loaded %d blocks across %d layers (%d bytes) for context %s",
-                len(block_ids), num_layers_loaded, total_bytes, context_id
+                "Loaded %d blocks across %d layers (%d bytes) for instance %s rank %d",
+                len(block_ids), num_layers_loaded, total_bytes, instance_id, tp_rank
             )
 
             return {
@@ -362,9 +390,10 @@ class PegaEngineServer:
             {'status': 'success'} or {'status': 'error', 'message': str}
         """
         try:
-            context_id = self._require_context_id(payload)
+            instance_id = self._require_instance_id(payload)
+            tp_rank = self._require_tp_rank(payload)
             layer_name = payload['layer_name']
-            self.engine.wait_for_layer_transfer(context_id, layer_name)
+            self.engine.wait_for_layer_transfer(instance_id, tp_rank, layer_name)
             return {'status': 'success'}
         except Exception as e:
             logger.error("Failed to wait for layer: %s", e, exc_info=True)
@@ -373,8 +402,14 @@ class PegaEngineServer:
     def _handle_shutdown(self, payload: dict) -> dict:
         """Handle SHUTDOWN command - graceful shutdown."""
         logger.info("Received shutdown command")
-        for context_id in list(self._contexts.keys()):
-            self._drop_context(context_id)
+        for context_key in list(self._contexts.keys()):
+            self._drop_context(context_key)
+        
+        # Unregister all instances from engine
+        # (We don't have a method to list all instances from engine, 
+        # but we cleared Python-side contexts. Rust side might still have data.
+        # Ideally we should clear engine too, but maybe not needed for hard shutdown)
+        
         self.running = False
         return {'status': 'success'}
 
@@ -442,8 +477,8 @@ class PegaEngineServer:
         self.running = False
 
         # Unregister all KV caches
-        for context_id in list(self._contexts.keys()):
-            self._drop_context(context_id)
+        for context_key in list(self._contexts.keys()):
+            self._drop_context(context_key)
 
         # Close ZMQ socket
         try:

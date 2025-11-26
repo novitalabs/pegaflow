@@ -73,6 +73,7 @@ def main():
         model="gpt2",
         trust_remote_code=True,
         enforce_eager=True,
+        tensor_parallel_size=1,
         enable_prefix_caching=False,  # Disable vLLM's internal prefix cache
         kv_transfer_config=kv_transfer_config,
     )
@@ -80,14 +81,14 @@ def main():
 
     # Test prompt - use a long prompt (~2048 characters)
     print("\n[Generating long prompt (~2048 chars)...]")
-    prompt = generate_long_prompt(2048)
+    prompt = real_long_prompt()
     print(f"✓ Generated prompt with {len(prompt)} characters")
     print(f"Preview: {prompt[:100]}...")
 
     # Sampling parameters - use temperature=0 for deterministic output
     sampling_params = SamplingParams(
         temperature=0.0,  # Deterministic
-        max_tokens=1,
+        max_tokens=50,
     )
 
     # First run: Generate and save KV cache

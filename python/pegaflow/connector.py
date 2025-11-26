@@ -38,6 +38,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorRole,
 )
+from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 
 # Import CUDA IPC wrapper for cross-process tensor sharing
 from pegaflow.ipc_wrapper import CudaIPCWrapper
@@ -67,7 +68,7 @@ def timing_wrapper(func):
             return result
         finally:
             elapsed_ms = (time.perf_counter() - start) * 1000
-            logger.info(
+            logger.debug(
                 "[PegaKVConnector] %s took %.2f ms",
                 func.__name__,
                 elapsed_ms,
@@ -163,21 +164,35 @@ class PegaKVConnector(KVConnectorBase_V1):
 
         self._instance_id = instance_id
 
+        # Extract TP info and model metadata
+        # Only WORKER role can get tp_rank via get_tensor_model_parallel_rank()
+        # because tensor parallel group is initialized in Worker.init_device(),
+        # which happens after Scheduler (and its connector) is created.
+        # SCHEDULER role doesn't need tp_rank - it only needs tp_size from config.
+        self._tp_size = vllm_config.parallel_config.tensor_parallel_size
+        self._num_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
+
+        self._tp_rank: Optional[int] = None
         self._device_id: Optional[int] = None
-        if role == KVConnectorRole.WORKER and torch.cuda.is_available():
-            try:
-                self._device_id = torch.cuda.current_device()
-            except Exception as exc:
-                logger.warning(
-                    "[PegaKVConnector] Unable to detect CUDA device for worker: %s",
-                    exc,
-                )
+        if role == KVConnectorRole.WORKER:
+            # TP group is initialized by now for workers
+            self._tp_rank = get_tensor_model_parallel_rank()
+            if torch.cuda.is_available():
+                try:
+                    self._device_id = torch.cuda.current_device()
+                except Exception as exc:
+                    logger.warning(
+                        "[PegaKVConnector] Unable to detect CUDA device for worker: %s",
+                        exc,
+                    )
 
         logger.info(
-            "[PegaKVConnector] Initialized role=%s instance_id=%s device=%s",
+            "[PegaKVConnector] Initialized role=%s instance_id=%s device=%s tp_rank=%s tp_size=%d layers=%d",
             role.name,
             self._instance_id,
             self._device_id if self._device_id is not None else "cpu",
+            self._tp_rank if self._tp_rank is not None else "N/A",
+            self._tp_size, self._num_layers
         )
 
         # ZMQ client for connecting to engine server (independent process)
@@ -238,6 +253,8 @@ class PegaKVConnector(KVConnectorBase_V1):
         """
         payload = dict(payload)
         payload.setdefault("instance_id", self._instance_id)
+        if self._tp_rank is not None:
+            payload.setdefault("tp_rank", self._tp_rank)
         if self._device_id is not None:
             payload.setdefault("device_id", self._device_id)
 
@@ -820,6 +837,8 @@ class PegaKVConnector(KVConnectorBase_V1):
                     'bytes_per_block': bytes_per_block,
                     'kv_stride_bytes': kv_stride_bytes,
                     'segments': segments,
+                    'tp_size': self._tp_size,
+                    'num_layers': self._num_layers,
                 }
                 payload['device_id'] = self._device_id
                 self._send_engine_request('REGISTER_CONTEXT', payload)
@@ -841,7 +860,10 @@ class PegaKVConnector(KVConnectorBase_V1):
             return
 
         try:
-            self._send_engine_request('UNREGISTER_CONTEXT', {})
+            # Only tp_rank=0 should unregister the instance to avoid duplicate calls.
+            # All TP ranks share the same instance_id, so only one needs to do cleanup.
+            if self._tp_rank == 0:
+                self._send_engine_request('UNREGISTER_CONTEXT', {})
         except Exception as exc:
             logger.debug(
                 "[PegaKVConnector] Failed to unregister context: %s",
