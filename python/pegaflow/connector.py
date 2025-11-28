@@ -35,15 +35,9 @@ logger = get_connector_logger()
 # Engine server endpoint (independent process)
 _ENGINE_ENDPOINT = os.environ.get("PEGAFLOW_ENGINE_ENDPOINT", "ipc:///tmp/pega_engine.sock")
 
+ReqId = str
 
 class PegaConnectorMetadata(KVConnectorMetadata):
-    """
-    Metadata for PegaFlow KV connector.
-
-    Abstract Metadata used to communicate between the
-    Scheduler KVConnector and Worker KVConnector.
-    """
-
     def __init__(
         self,
         block_hashes: Optional[Dict[str, List[bytes]]] = None,
@@ -137,7 +131,6 @@ class PegaKVConnector(KVConnectorBase_V1):
         )
         self._save_thread.start()
 
-        # State tracking
         self._request_block_hashes = {}  # req_id -> list[bytes]
         self._requests_to_load = {}  # req_id -> dict with load info
         self._registered_layers: list[str] = []
@@ -147,6 +140,14 @@ class PegaKVConnector(KVConnectorBase_V1):
         self._sync_state: Optional[PyLayerSyncState] = None
         self._layer_name_to_id: Dict[str, int] = {}
         self._load_in_progress: bool = False
+
+        # Async save completion tracking (Worker side)
+        self._req_pending_layers: Dict[str, int] = {}  # req_id -> remaining layer count
+        self._completed_saves: set[str] = set()  # req_ids with all layers saved
+        self._save_completion_lock = threading.Lock()
+
+        # Scheduler side: track requests being saved
+        self._requests_being_saved: set[str] = set()  # req_ids currently being saved
 
     # ==============================
     # Engine client helper methods
@@ -229,58 +230,84 @@ class PegaKVConnector(KVConnectorBase_V1):
         layer_name = task['layer_name']
         attn_metadata = task['attn_metadata']
         metadata = task['metadata']
+        request_ids = task.get('request_ids', [])
 
         if attn_metadata.block_table is None:
+            # Still need to decrement counter even if no blocks to save
+            self._decrement_layer_counter(request_ids)
             return
 
-        block_table = attn_metadata.block_table
-        seq_lens = attn_metadata.seq_lens
-        layer_blocks_saved = 0
+        try:
+            # Execute save logic
+            block_table = attn_metadata.block_table
+            seq_lens = attn_metadata.seq_lens
+            layer_blocks_saved = 0
 
-        # Common payload fields
-        payload_base = {
-            "instance_id": self._instance_id,
-            "layer_name": layer_name,
-        }
-        if self._tp_rank is not None:
-            payload_base["tp_rank"] = self._tp_rank
-        if self._device_id is not None:
-            payload_base["device_id"] = self._device_id
+            # Common payload fields
+            payload_base = {
+                "instance_id": self._instance_id,
+                "layer_name": layer_name,
+            }
+            if self._tp_rank is not None:
+                payload_base["tp_rank"] = self._tp_rank
+            if self._device_id is not None:
+                payload_base["device_id"] = self._device_id
+            for seq_idx in range(block_table.shape[0]):
+                if seq_lens is not None:
+                    seq_len = seq_lens[seq_idx].item()
+                    num_blocks = (seq_len + self._block_size - 1) // self._block_size
+                else:
+                    num_blocks = (block_table[seq_idx] != 0).sum().item()
 
-        for seq_idx in range(block_table.shape[0]):
-            if seq_lens is not None:
-                seq_len = seq_lens[seq_idx].item()
-                num_blocks = (seq_len + self._block_size - 1) // self._block_size
-            else:
-                num_blocks = (block_table[seq_idx] != 0).sum().item()
+                if num_blocks == 0:
+                    continue
 
-            if num_blocks == 0:
-                continue
+                active_blocks = block_table[seq_idx, :num_blocks].cpu().tolist()
 
-            active_blocks = block_table[seq_idx, :num_blocks].cpu().tolist()
+                # Find matching block hashes from metadata
+                block_hashes_for_seq = None
+                for req_id, hashes in metadata.block_hashes.items():
+                    if len(hashes) > 0:
+                        num_use = min(num_blocks, len(hashes))
+                        block_hashes_for_seq = hashes[:num_use]
+                        active_blocks = active_blocks[:num_use]
+                        break
 
-            # Find matching block hashes from metadata
-            block_hashes_for_seq = None
-            for req_id, hashes in metadata.block_hashes.items():
-                if len(hashes) > 0:
-                    num_use = min(num_blocks, len(hashes))
-                    block_hashes_for_seq = hashes[:num_use]
-                    active_blocks = active_blocks[:num_use]
-                    break
+                if block_hashes_for_seq is None:
+                    continue
 
-            if block_hashes_for_seq is None:
-                continue
+                # Send SAVE request
+                payload = payload_base.copy()
+                payload.update({
+                    'block_ids': active_blocks,
+                    'block_hashes': block_hashes_for_seq,
+                })
+                self._zmq_send_recv(socket, 'SAVE', payload)
+                layer_blocks_saved += len(block_hashes_for_seq)
 
-            # Send SAVE request
-            payload = payload_base.copy()
-            payload.update({
-                'block_ids': active_blocks,
-                'block_hashes': block_hashes_for_seq,
-            })
-            self._zmq_send_recv(socket, 'SAVE', payload)
-            layer_blocks_saved += len(block_hashes_for_seq)
+        except Exception as e:
+            logger.error(f"[PegaKVConnector] Save failed for layer {layer_name}: {e}", exc_info=True)
+            # Continue processing even on failure (mark failed but continue)
 
-        # We could log per-layer stats here if verbose logging is enabled
+        # Update completion tracking (success or failure, always decrement)
+        self._decrement_layer_counter(request_ids)
+
+    def _decrement_layer_counter(self, request_ids: list[str]) -> None:
+        """Decrement layer counter for requests and mark as completed if all layers done."""
+        with self._save_completion_lock:
+            for req_id in request_ids:
+                if req_id in self._req_pending_layers:
+                    # Decrement counter directly (let it crash if count mismatch)
+                    self._req_pending_layers[req_id] -= 1
+                    assert self._req_pending_layers[req_id] >= 0, \
+                        f"Layer count mismatch for request {req_id}: counter went negative"
+
+                    # Check if all layers complete for this request
+                    if self._req_pending_layers[req_id] == 0:
+                        # All layers processed, mark request complete
+                        self._completed_saves.add(req_id)
+                        del self._req_pending_layers[req_id]
+                        logger.info(f"[PegaKVConnector] Request {req_id} all {len(self._registered_layers)} layers saved")
 
     # ==============================
     # Worker-side methods
@@ -301,10 +328,18 @@ class PegaKVConnector(KVConnectorBase_V1):
             tuple of (sending/saving ids, recving/loading ids).
             The finished saves/sends req ids must belong to a set provided in a
             call to this method (this call or a prior one).
-
-        Note: NOT IMPLEMENTED in PegaFlow - uses base class default.
         """
-        return None, None
+        with self._save_completion_lock:
+            # Find which completed saves are in the finished set
+            finished_sending = self._completed_saves & finished_req_ids
+
+            # Remove from completed set (avoid duplicate reporting)
+            self._completed_saves -= finished_sending
+
+        if finished_sending:
+            logger.info(f"[PegaKVConnector] Finished saving KV for requests: {finished_sending}")
+            return (finished_sending, None)
+        return (None, None)
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """
@@ -384,6 +419,7 @@ class PegaKVConnector(KVConnectorBase_V1):
         metadata = self._get_connector_metadata()
 
         if not metadata.requests_to_load:
+            logger.info("not metadata to load")
             return
 
         total_requests = len(metadata.requests_to_load)
@@ -398,6 +434,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             all_block_hashes.extend(load_info['block_hashes'])
 
         if not all_block_ids:
+            logger.info("not block")
             return
 
         # Identify all KV cache layers
@@ -407,6 +444,7 @@ class PegaKVConnector(KVConnectorBase_V1):
                 target_layers.append(layer_name)
 
         if not target_layers:
+            logger.info("not layers")
             return
 
         self._load_in_progress = True
@@ -475,27 +513,38 @@ class PegaKVConnector(KVConnectorBase_V1):
         if not isinstance(metadata, PegaConnectorMetadata):
             return
 
+        # Extract request IDs from metadata
+        request_ids = list(metadata.block_hashes.keys())
+        if not request_ids:
+            return
+
+        # Initialize pending layer counter for each request (first layer seen)
+        with self._save_completion_lock:
+            for req_id in request_ids:
+                if req_id not in self._req_pending_layers:
+                    # Initialize with total number of registered layers
+                    self._req_pending_layers[req_id] = len(self._registered_layers)
+
         self._save_queue.put({
             'layer_name': layer_name,
             'attn_metadata': attn_metadata,
             'metadata': metadata,
+            'request_ids': request_ids,
         })
 
     @timing_wrapper
     def wait_for_save(self) -> None:
         """
-        Block until all the save operations is done. This is called
-        as the forward context exits to ensure that the async saving
-        from save_kv_layer is complete before finishing the forward.
+        Non-blocking check for save errors.
+        Actual save completion is tracked via get_finished().
 
         This prevents overwrites of paged KV buffer before saving done.
         """
-        self._save_queue.join()
+        with self._save_completion_lock:
+            pending_reqs = len(self._req_pending_layers)
+            if pending_reqs > 0:
+                logger.info(f"[PegaKVConnector] {pending_reqs} requests still have pending layer saves")
 
-        if self._save_exception:
-            e = self._save_exception
-            self._save_exception = None
-            raise e
 
     # ==============================
     # Scheduler-side methods
@@ -508,10 +557,11 @@ class PegaKVConnector(KVConnectorBase_V1):
         Args:
             connector_output (KVConnectorOutput): the worker-side
                 connectors output.
-
-        Note: NOT IMPLEMENTED in PegaFlow - uses base class default.
         """
-        return
+        # Process finished sends - remove from being_saved set
+        for req_id in connector_output.finished_sending or []:
+            self._requests_being_saved.discard(req_id)
+            logger.info(f"[PegaKVConnector] Request {req_id} save completed, blocks can be freed")
 
     def request_finished(
         self,
@@ -531,10 +581,15 @@ class PegaKVConnector(KVConnectorBase_V1):
             get_finished().
             Optional KVTransferParams to be included in the request outputs
             returned by the engine.
-
-        Note: NOT IMPLEMENTED in PegaFlow - uses base class default.
         """
-        return False, None
+        req_id = request.request_id
+
+        # If this request is being saved, delay block freeing
+        if req_id in self._requests_being_saved:
+            logger.info(f"[PegaKVConnector] Request {req_id} blocks held for async save")
+            return (True, None)
+
+        return (False, None)
 
     def take_events(self) -> Iterable["KVCacheEvent"]:
         """
@@ -580,38 +635,29 @@ class PegaKVConnector(KVConnectorBase_V1):
             connectivity issues or eviction), those tokens must not be taken
             into account.
         """
-        prompt_token_ids = request.prompt_token_ids or []
         req_id = request.request_id
-        num_tokens = len(prompt_token_ids)
+        num_tokens = request.num_tokens
         block_hashes = request.block_hashes
 
         lookup_start = time.perf_counter()
         matched_blocks = self._count_available_block_prefix(block_hashes)
         lookup_end = time.perf_counter()
 
-        total_blocks = len(block_hashes)
         elapsed_us = (lookup_end - lookup_start) * 1e6
+
+        num_hit_tokens = matched_blocks * self._block_size - num_computed_tokens
+
+        if num_hit_tokens <= 0:
+            return (0, False)
+
+        if num_hit_tokens == num_tokens:
+            num_hit_tokens -= 1
+
         logger.info(
-            "[PegaKVConnector] scheduler_lookup req=%s hit_blocks=%d/%d (%.1f%%) cost=%.0f us",
-            req_id, matched_blocks, total_blocks,
-            (matched_blocks / total_blocks * 100) if total_blocks > 0 else 0.0,
-            elapsed_us,
+            "[PegaKVConnector] scheduler_lookup req=%s hit_tokens=%d, num_computed_tokens=%d, elapsed_us=%d",
+            req_id, num_hit_tokens, num_computed_tokens, elapsed_us,
         )
-
-        if matched_blocks <= 0:
-            return (0, False)
-
-        available_tokens = min(matched_blocks * self._block_size, num_tokens)
-        if available_tokens <= 1:
-            return (0, False)
-
-        reusable_tokens = available_tokens - 1
-        num_new_tokens = reusable_tokens - num_computed_tokens
-
-        if num_new_tokens <= 0:
-            return (0, False)
-
-        return (num_new_tokens, False)
+        return (num_hit_tokens, False)
 
     @timing_wrapper
     def update_state_after_alloc(
@@ -668,6 +714,11 @@ class PegaKVConnector(KVConnectorBase_V1):
         for i, req_id in enumerate(scheduler_output.scheduled_cached_reqs.req_ids):
             if req_id in self._request_block_hashes:
                 block_hashes[req_id] = self._request_block_hashes[req_id]
+
+        # Mark requests with block_hashes as being saved
+        for req_id, hashes in block_hashes.items():
+            if hashes:
+                self._requests_being_saved.add(req_id)
 
         # Process requests that need to load from CPU storage
         requests_to_load = {}

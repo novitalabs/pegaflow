@@ -500,6 +500,11 @@ impl PegaEngine {
             return Ok(());
         }
 
+        info!(
+            "Saving {} blocks for layer {layer_name} on instance {instance_id} rank {tp_rank}",
+            blocks_to_save.len()
+        );
+
         let block_size = transfer::block_size(&registration).unwrap();
         let num_blocks = blocks_to_save.len();
 
@@ -603,7 +608,7 @@ impl PegaEngine {
     /// Returns:
     ///   - usize: Number of contiguous blocks available from the prefix
     #[instrument(
-        level = "info",
+        level = "debug",
         skip(self, block_hashes),
         fields(requested = %block_hashes.len()),
         ret
