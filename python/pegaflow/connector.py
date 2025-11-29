@@ -535,6 +535,10 @@ class PegaKVConnector(KVConnectorBase_V1):
         # Request tracking (Scheduler side)
         self._trackers: Dict[str, RequestTracker] = {}
         self._registered_layers: list[str] = []
+        # Pending load intents (Scheduler side) - populated in update_state_after_alloc,
+        # consumed in build_connector_meta. This is needed for async loading where
+        # the request enters WAITING_FOR_REMOTE_KVS state before being scheduled.
+        self._pending_load_intents: Dict[str, LoadIntent] = {}
 
         # Block size
         self._block_size = vllm_config.cache_config.block_size
@@ -544,6 +548,12 @@ class PegaKVConnector(KVConnectorBase_V1):
         self._req_pending_layers: Dict[str, int] = {}  # req_id -> remaining layer count
         self._completed_saves: set[str] = set()  # req_ids with all layers saved
         self._save_completion_lock = threading.Lock()
+
+        # Async load tracking (Worker side)
+        # Maps req_id -> PyLoadState for pending async loads
+        self._pending_loads: Dict[str, "PyLoadState"] = {}
+        self._pending_load_reqs: Dict[str, set[str]] = {}  # load_state.shm_name -> set of req_ids
+        self._load_completion_lock = threading.Lock()
 
     # ==============================
     # Engine client helper methods
@@ -701,17 +711,63 @@ class PegaKVConnector(KVConnectorBase_V1):
             The finished saves/sends req ids must belong to a set provided in a
             call to this method (this call or a prior one).
         """
+        finished_sending: set[str] | None = None
+        finished_recving: set[str] | None = None
+
+        # Check for completed saves
         with self._save_completion_lock:
             # Find which completed saves are in the finished set
-            finished_sending = self._completed_saves & finished_req_ids
+            done_saves = self._completed_saves & finished_req_ids
+            if done_saves:
+                # Remove from completed set (avoid duplicate reporting)
+                self._completed_saves -= done_saves
+                finished_sending = done_saves
 
-            # Remove from completed set (avoid duplicate reporting)
-            self._completed_saves -= finished_sending
+        # Check for completed loads (async recv)
+        with self._load_completion_lock:
+            completed_reqs: set[str] = set()
+            completed_shms: list[str] = []
+
+            # Check each pending load state
+            for shm_name, req_ids in self._pending_load_reqs.items():
+                # Get load_state from any req_id in the group
+                sample_req_id = next(iter(req_ids))
+                load_state = self._pending_loads.get(sample_req_id)
+                if load_state is None:
+                    continue
+
+                # Non-blocking check if load completed
+                if load_state.is_ready():
+                    state = load_state.get_state()
+                    if state < 0:
+                        logger.error(
+                            "[PegaKVConnector] async load failed with state=%d for reqs=%s",
+                            state, req_ids,
+                        )
+                        # TODO: report invalid_block_ids
+                    else:
+                        logger.info(
+                            "[PegaKVConnector] async load completed for %d reqs, shm=%s",
+                            len(req_ids), shm_name,
+                        )
+                    completed_reqs.update(req_ids)
+                    completed_shms.append(shm_name)
+
+            # Clean up completed loads
+            for shm_name in completed_shms:
+                req_ids = self._pending_load_reqs.pop(shm_name, set())
+                for req_id in req_ids:
+                    self._pending_loads.pop(req_id, None)
+
+            if completed_reqs:
+                finished_recving = completed_reqs
 
         if finished_sending:
-            logger.info(f"[PegaKVConnector] Finished saving KV for requests: {finished_sending}")
-            return (finished_sending, None)
-        return (None, None)
+            logger.info(f"[PegaKVConnector] finished saving KV for requests: {finished_sending}")
+        if finished_recving:
+            logger.info(f"[PegaKVConnector] finished loading KV for requests: {finished_recving}")
+
+        return (finished_sending, finished_recving)
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """
@@ -774,11 +830,11 @@ class PegaKVConnector(KVConnectorBase_V1):
     @timing_wrapper
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         """
-        Load the KV cache from the connector to vLLM's paged KV buffer.
+        Start loading the KV cache from the connector to vLLM's paged KV buffer.
 
-        This is a synchronous operation: we submit async transfers to the engine,
-        create a LoadState for synchronization, and spin-wait until all transfers
-        complete before returning.
+        This is an ASYNCHRONOUS operation: we submit async transfers to the engine,
+        create a LoadState for synchronization, and return immediately. The actual
+        transfer completion is tracked via get_finished().
 
         Args:
             forward_context (ForwardContext): the forward context.
@@ -797,10 +853,12 @@ class PegaKVConnector(KVConnectorBase_V1):
         # Aggregate all blocks from all load intents
         all_block_ids: List[int] = []
         all_block_hashes: List[bytes] = []
+        request_ids: List[str] = []
 
-        for _, load_intent in metadata.load_intents.items():
+        for req_id, load_intent in metadata.load_intents.items():
             all_block_ids.extend(load_intent.block_ids)
             all_block_hashes.extend(load_intent.block_hashes)
+            request_ids.append(req_id)
 
         if not all_block_ids:
             return
@@ -816,9 +874,10 @@ class PegaKVConnector(KVConnectorBase_V1):
 
         # Create LoadState for synchronization
         load_state = PyLoadState()
+        shm_name = load_state.shm_name()
 
         self._send_engine_request('LOAD', {
-            'load_state_shm': load_state.shm_name(),
+            'load_state_shm': shm_name,
             'layer_names': target_layers,
             'block_ids': all_block_ids,
             'block_hashes': all_block_hashes,
@@ -830,19 +889,16 @@ class PegaKVConnector(KVConnectorBase_V1):
         schedule_end = time.perf_counter()
         schedule_time_us = (schedule_end - load_start) * 1e6
 
-        # Spin-wait for transfers to complete
-        state = load_state.wait()
-        if state < 0:
-            raise RuntimeError(f"KV cache load failed with state={state}")
-
-        transfer_end = time.perf_counter()
-        total_time_us = (transfer_end - load_start) * 1e6
+        # Track pending loads for async completion detection
+        with self._load_completion_lock:
+            for req_id in request_ids:
+                self._pending_loads[req_id] = load_state
+            self._pending_load_reqs[shm_name] = set(request_ids)
 
         logger.info(
-            "[PegaKVConnector] loaded %d blocks across %d layers for %d reqs, "
-            "schedule %.0f us, total %.0f us",
-            num_blocks, num_layers, total_requests,
-            schedule_time_us, total_time_us,
+            "[PegaKVConnector] started async load: %d blocks across %d layers for %d reqs, "
+            "schedule %.0f us, shm=%s",
+            num_blocks, num_layers, total_requests, schedule_time_us, shm_name,
         )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -1047,10 +1103,10 @@ class PegaKVConnector(KVConnectorBase_V1):
 
         logger.info(
             "[PegaKVConnector] scheduler_lookup req=%s hit_blocks=%d computed_blocks=%d "
-            "hit_tokens=%d elapsed_us=%.0f",
+            "hit_tokens=%d elapsed_us=%.0f async=True",
             req_id, hit_blocks, computed_blocks, num_hit_tokens, elapsed_us,
         )
-        return (num_hit_tokens, False)
+        return (num_hit_tokens, True)  # async loading enabled
 
     @timing_wrapper
     def update_state_after_alloc(
@@ -1091,6 +1147,19 @@ class PegaKVConnector(KVConnectorBase_V1):
         # Notify tracker of allocation
         tracker.on_alloc(block_ids, num_external_tokens)
 
+        # For async loading: generate LoadIntent immediately and store it.
+        # This is consumed by build_connector_meta() in the same scheduler step,
+        # even though the request enters WAITING_FOR_REMOTE_KVS state.
+        if num_external_tokens > 0:
+            load_intent = tracker.consume_load_intent()
+            if load_intent is not None:
+                self._pending_load_intents[req_id] = load_intent
+                logger.info(
+                    "[PegaKVConnector] update_state_after_alloc req=%s created LoadIntent: "
+                    "%d blocks, %d tokens",
+                    req_id, len(load_intent.block_ids), load_intent.num_tokens,
+                )
+
         logger.debug(
             "[PegaKVConnector] update_state_after_alloc req=%s blocks=%d external_tokens=%d phase=%s",
             req_id, len(block_ids), num_external_tokens, tracker.phase.value,
@@ -1107,8 +1176,12 @@ class PegaKVConnector(KVConnectorBase_V1):
         Args:
             scheduler_output (SchedulerOutput): the scheduler output object.
         """
-        load_intents: Dict[str, LoadIntent] = {}
         save_intents: Dict[str, SaveIntent] = {}
+
+        # Consume pending load intents (created in update_state_after_alloc for async loading)
+        # This handles requests that enter WAITING_FOR_REMOTE_KVS state
+        load_intents = self._pending_load_intents
+        self._pending_load_intents = {}
 
         # Process new requests
         for req in scheduler_output.scheduled_new_reqs:
@@ -1121,9 +1194,11 @@ class PegaKVConnector(KVConnectorBase_V1):
             num_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
             tracker.on_scheduled(num_tokens)
 
-            # Try to get load intent
-            if load_intent := tracker.consume_load_intent():
-                load_intents[req_id] = load_intent
+            # Load intent already consumed in update_state_after_alloc for async loading
+            # Only try here for sync loading (which we don't use anymore, but keep for safety)
+            if req_id not in load_intents:
+                if load_intent := tracker.consume_load_intent():
+                    load_intents[req_id] = load_intent
 
             # Try to get save intent
             if save_intent := tracker.consume_save_intent():

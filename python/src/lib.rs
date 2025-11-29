@@ -238,6 +238,18 @@ impl PyLoadState {
         self.inner.get()
     }
 
+    /// Alias for get() - used by connector for clarity.
+    fn get_state(&self) -> i64 {
+        self.inner.get()
+    }
+
+    /// Check if load is complete (non-blocking).
+    ///
+    /// Returns True if state is non-zero (completed or error).
+    fn is_ready(&self) -> bool {
+        self.inner.get() != 0
+    }
+
     /// Spin-wait until state becomes non-zero (completed or error).
     ///
     /// Returns the final state value (1 for success, <0 for error).
