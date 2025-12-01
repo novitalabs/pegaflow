@@ -44,7 +44,7 @@ const DEFAULT_PINNED_POOL_BYTES: usize = 30 * 1024 * 1024 * 1024; // 10GB
 #[derive(Debug)]
 pub enum EngineError {
     InstanceMissing(String),
-    WorkerMissing(String, usize),
+    WorkerMissing(String, i32),
     InvalidArgument(String),
     CudaInit(String),
     Storage(String),
@@ -56,8 +56,8 @@ impl fmt::Display for EngineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             EngineError::InstanceMissing(ctx) => write!(f, "instance {ctx} not found"),
-            EngineError::WorkerMissing(ctx, rank) => {
-                write!(f, "worker rank {rank} not found in instance {ctx}")
+            EngineError::WorkerMissing(ctx, device) => {
+                write!(f, "device {device} not found in instance {ctx}")
             }
             EngineError::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
             EngineError::CudaInit(msg) => write!(f, "failed to initialize CUDA: {msg}"),
@@ -71,7 +71,7 @@ impl fmt::Display for EngineError {
 impl std::error::Error for EngineError {}
 
 pub struct PegaEngine {
-    /// Manages instances and their workers
+    /// Manages instances and their GPU contexts
     instances: RwLock<HashMap<String, Arc<InstanceContext>>>,
     /// Storage engine responsible for pinned allocations + block cache
     storage: StorageEngine,
@@ -90,9 +90,9 @@ pub struct KVCacheRegistration {
     pub segments: usize,
 }
 
-/// Context for a specific Worker process (one TP rank)
-struct WorkerContext {
-    /// KV cache registrations for this worker (Layer Name -> GPU Ptr Info)
+/// Context for a specific GPU (one CUDA device)
+struct GpuContext {
+    /// KV cache registrations for this GPU (Layer Name -> GPU Ptr Info)
     kv_caches: Mutex<HashMap<String, KVCacheRegistration>>,
     /// Single stream for all transfers to ensure sequential execution
     stream: Arc<CudaStream>,
@@ -101,11 +101,11 @@ struct WorkerContext {
     device_id: i32,
 }
 
-impl WorkerContext {
+impl GpuContext {
     fn new(cuda_ctx: Arc<CudaContext>, device_id: i32) -> Self {
         let stream = cuda_ctx
             .new_stream()
-            .expect("Failed to create stream for worker context");
+            .expect("Failed to create stream for GPU context");
         Self {
             kv_caches: Mutex::new(HashMap::new()),
             stream,
@@ -129,7 +129,7 @@ impl WorkerContext {
     }
 }
 
-/// Global context for a Model Instance (across all TP ranks)
+/// Global context for a Model Instance (across all device assignments)
 struct InstanceContext {
     id: String,
     num_layers: usize,
@@ -138,8 +138,8 @@ struct InstanceContext {
     layer_name_to_id: Mutex<HashMap<String, usize>>,
     /// Inverse map to ensure stable ordering
     layer_names: Mutex<Vec<String>>,
-    /// Active workers for this instance, keyed by TP rank
-    workers: RwLock<HashMap<usize, Arc<WorkerContext>>>,
+    /// Active GPU contexts for this instance, keyed by CUDA device ID
+    gpu_contexts: RwLock<HashMap<i32, Arc<GpuContext>>>,
 }
 
 impl InstanceContext {
@@ -150,7 +150,7 @@ impl InstanceContext {
             tp_size,
             layer_name_to_id: Mutex::new(HashMap::new()),
             layer_names: Mutex::new(Vec::new()),
-            workers: RwLock::new(HashMap::new()),
+            gpu_contexts: RwLock::new(HashMap::new()),
         }
     }
 
@@ -198,56 +198,45 @@ impl InstanceContext {
         Ok(layer_id * self.tp_size + tp_rank)
     }
 
-    fn ensure_worker(
-        &self,
-        tp_rank: usize,
-        device_id: i32,
-    ) -> Result<Arc<WorkerContext>, EngineError> {
-        if tp_rank >= self.tp_size {
+    fn ensure_gpu(&self, device_id: i32) -> Result<Arc<GpuContext>, EngineError> {
+        if device_id < 0 {
             return Err(EngineError::InvalidArgument(format!(
-                "tp_rank {} exceeds tp_size {}",
-                tp_rank, self.tp_size
+                "device_id {} must be >= 0",
+                device_id
             )));
         }
 
-        // Fast path: read lock
         {
-            let workers = self.workers.read().expect("workers read lock poisoned");
-            if let Some(worker) = workers.get(&tp_rank) {
-                if worker.device_id != device_id {
-                    return Err(EngineError::TopologyMismatch(format!(
-                        "worker rank {tp_rank} already bound to device {}, requested {device_id}",
-                        worker.device_id
-                    )));
-                }
+            let workers = self
+                .gpu_contexts
+                .read()
+                .expect("gpu contexts read lock poisoned");
+            if let Some(worker) = workers.get(&device_id) {
                 return Ok(Arc::clone(worker));
             }
         }
 
-        // Slow path: write lock
-        let mut workers = self.workers.write().expect("workers write lock poisoned");
-        // Check again in case another thread inserted it
-        if let Some(worker) = workers.get(&tp_rank) {
-            if worker.device_id != device_id {
-                return Err(EngineError::TopologyMismatch(format!(
-                    "worker rank {tp_rank} already bound to device {}, requested {device_id}",
-                    worker.device_id
-                )));
-            }
+        let mut workers = self
+            .gpu_contexts
+            .write()
+            .expect("gpu contexts write lock poisoned");
+        if let Some(worker) = workers.get(&device_id) {
             return Ok(Arc::clone(worker));
         }
 
-        // Create new worker
         let cuda_ctx = CudaContext::new(device_id as usize)
             .map_err(|e| EngineError::CudaInit(format!("{e:?}")))?;
-        let worker = Arc::new(WorkerContext::new(cuda_ctx, device_id));
-        workers.insert(tp_rank, Arc::clone(&worker));
+        let worker = Arc::new(GpuContext::new(cuda_ctx, device_id));
+        workers.insert(device_id, Arc::clone(&worker));
         Ok(worker)
     }
 
-    fn get_worker(&self, tp_rank: usize) -> Option<Arc<WorkerContext>> {
-        let workers = self.workers.read().expect("workers read lock poisoned");
-        workers.get(&tp_rank).cloned()
+    fn get_gpu(&self, device_id: i32) -> Option<Arc<GpuContext>> {
+        let workers = self
+            .gpu_contexts
+            .read()
+            .expect("gpu contexts read lock poisoned");
+        workers.get(&device_id).cloned()
     }
 }
 
@@ -324,7 +313,7 @@ impl PegaEngine {
     #[instrument(
         level = "debug",
         skip(self),
-        fields(instance=%instance_id, rank=%tp_rank, layer=%layer_name)
+        fields(instance=%instance_id, rank=%tp_rank, device=%device_id, layer=%layer_name)
     )]
     pub fn register_context_layer(
         &self,
@@ -353,7 +342,7 @@ impl PegaEngine {
         }
 
         let instance = self.get_or_create_instance(instance_id, num_layers, tp_size)?;
-        let worker = instance.ensure_worker(tp_rank, device_id)?;
+        let worker = instance.ensure_gpu(device_id)?;
 
         // Register layer ID in global instance map
         instance.get_or_create_layer_id(&layer_name);
@@ -394,18 +383,20 @@ impl PegaEngine {
     #[instrument(
         level = "debug",
         skip(self, saves),
-        fields(instance=%instance_id, rank=%tp_rank, layers=%saves.len())
+        fields(instance=%instance_id, rank=%tp_rank, device=%device_id, layers=%saves.len())
     )]
     pub fn batch_save_kv_blocks_from_ipc(
         &self,
         instance_id: &str,
         tp_rank: usize,
+        device_id: i32,
         saves: Vec<(String, Vec<i32>, Vec<Vec<u8>>)>,
     ) -> Result<(), EngineError> {
         for (layer_name, block_ids, block_hashes) in saves {
             self.save_kv_blocks_from_ipc_inner(
                 instance_id,
                 tp_rank,
+                device_id,
                 &layer_name,
                 block_ids,
                 block_hashes,
@@ -417,12 +408,13 @@ impl PegaEngine {
     #[instrument(
         level = "debug",
         skip(self, block_ids, block_hashes),
-        fields(instance=%instance_id, rank=%tp_rank, layer=%layer_name, blocks=%block_ids.len())
+        fields(instance=%instance_id, rank=%tp_rank, device=%device_id, layer=%layer_name, blocks=%block_ids.len())
     )]
     pub fn save_kv_blocks_from_ipc(
         &self,
         instance_id: &str,
         tp_rank: usize,
+        device_id: i32,
         layer_name: &str,
         block_ids: Vec<i32>,
         block_hashes: Vec<Vec<u8>>,
@@ -430,6 +422,7 @@ impl PegaEngine {
         self.save_kv_blocks_from_ipc_inner(
             instance_id,
             tp_rank,
+            device_id,
             layer_name,
             block_ids,
             block_hashes,
@@ -440,6 +433,7 @@ impl PegaEngine {
         &self,
         instance_id: &str,
         tp_rank: usize,
+        device_id: i32,
         layer_name: &str,
         block_ids: Vec<i32>,
         block_hashes: Vec<Vec<u8>>,
@@ -454,15 +448,15 @@ impl PegaEngine {
 
         let instance = self.get_instance(instance_id)?;
         let worker = instance
-            .get_worker(tp_rank)
-            .ok_or_else(|| EngineError::WorkerMissing(instance_id.to_string(), tp_rank))?;
+            .get_gpu(device_id)
+            .ok_or_else(|| EngineError::WorkerMissing(instance_id.to_string(), device_id))?;
 
         let layer_id = instance
             .get_layer_id(layer_name)
             .ok_or_else(|| EngineError::InvalidArgument(format!("layer {layer_name} unknown")))?;
 
         let registration = worker.get_registration(layer_name).ok_or_else(|| {
-            EngineError::InvalidArgument(format!("layer {layer_name} not registered on worker"))
+            EngineError::InvalidArgument(format!("layer {layer_name} not registered on device"))
         })?;
 
         let slot_id = instance.get_slot_index(layer_id, tp_rank)?;
@@ -634,12 +628,13 @@ impl PegaEngine {
     #[instrument(
         level = "debug",
         skip(self, block_ids, block_hashes),
-        fields(instance=%instance_id, rank=%tp_rank, layers=%layer_names.len(), blocks=%block_ids.len())
+        fields(instance=%instance_id, rank=%tp_rank, device=%device_id, layers=%layer_names.len(), blocks=%block_ids.len())
     )]
     pub fn batch_load_kv_blocks_multi_layer(
         &self,
         instance_id: &str,
         tp_rank: usize,
+        device_id: i32,
         load_state_shm: &str,
         layer_names: &[&str],
         block_ids: &[i32],
@@ -651,8 +646,8 @@ impl PegaEngine {
 
         let instance = self.get_instance(instance_id)?;
         let worker = instance
-            .get_worker(tp_rank)
-            .ok_or_else(|| EngineError::WorkerMissing(instance_id.to_string(), tp_rank))?;
+            .get_gpu(device_id)
+            .ok_or_else(|| EngineError::WorkerMissing(instance_id.to_string(), device_id))?;
 
         // Lookup all block_hashes ONCE and cache the blocks
         let shard_blocks_cache = self

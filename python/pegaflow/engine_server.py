@@ -145,6 +145,12 @@ class PegaEngineServer:
              raise ValueError("tp_rank not provided in payload")
         return int(rank)
 
+    def _require_device_id(self, payload: Dict[str, Any]) -> int:
+        device_id = payload.get("device_id")
+        if device_id is None:
+            raise ValueError("device_id not provided in payload")
+        return int(device_id)
+
     def _get_or_create_context(
         self,
         context_key: str,
@@ -190,6 +196,7 @@ class PegaEngineServer:
         try:
             instance_id = self._require_instance_id(payload)
             tp_rank = self._require_tp_rank(payload)
+            device_id = self._require_device_id(payload)
 
             layer_name = payload['layer_name']
             wrapper_bytes = payload['wrapper_bytes']
@@ -197,14 +204,15 @@ class PegaEngineServer:
             bytes_per_block = payload['bytes_per_block']
             kv_stride_bytes = payload['kv_stride_bytes']
             segments = payload['segments']
-            device_id = payload.get('device_id')
+
 
             # Topology info
             tp_size = payload['tp_size']
             num_layers = payload['num_layers']
 
-            # Use (instance_id, tp_rank) as key for keeping tensors alive in Python process
-            context_key = f"{instance_id}:tp{tp_rank}"
+            # Use (instance_id, tp_rank, device_id) as key for keeping tensors alive in Python process
+            # Include device_id to support PP where different ranks may have same tp_rank but different devices
+            context_key = f"{instance_id}:tp{tp_rank}:dev{device_id}"
             state = self._get_or_create_context(context_key, device_id)
 
             # Ensure CUDA operations run on the correct device
@@ -252,8 +260,8 @@ class PegaEngineServer:
         try:
             instance_id = self._require_instance_id(payload)
             
-            # Clean up python side resources for all known ranks of this instance?
-            # Currently we track keys as "{instance_id}:tp{rank}"
+            # Clean up python side resources for all known ranks of this instance
+            # Context keys are formatted as "{instance_id}:tp{rank}:dev{device_id}"
             keys_to_drop = [k for k in self._contexts.keys() if k.startswith(f"{instance_id}:")]
             for k in keys_to_drop:
                 self._drop_context(k)
@@ -283,6 +291,7 @@ class PegaEngineServer:
         try:
             instance_id = self._require_instance_id(payload)
             tp_rank = self._require_tp_rank(payload)
+            device_id = self._require_device_id(payload)
             saves_data = payload['saves']
 
             # Convert to list of tuples for Rust
@@ -294,13 +303,14 @@ class PegaEngineServer:
             self.engine.batch_save_kv_blocks_from_ipc(
                 instance_id,
                 tp_rank,
+                device_id,
                 saves
             )
 
             total_blocks = sum(len(s['block_ids']) for s in saves_data)
             logger.debug(
-                "Batch saved %d blocks across %d layers (instance %s rank %d)",
-                total_blocks, len(saves_data), instance_id, tp_rank
+                "Batch saved %d blocks across %d layers (instance %s rank %d device %d)",
+                total_blocks, len(saves_data), instance_id, tp_rank, device_id
             )
 
             return {'status': 'success'}
@@ -326,6 +336,7 @@ class PegaEngineServer:
         try:
             instance_id = self._require_instance_id(payload)
             tp_rank = self._require_tp_rank(payload)
+            device_id = self._require_device_id(payload)
             load_state_shm = payload['load_state_shm']
             layer_names = payload['layer_names']
             block_ids = payload['block_ids']
@@ -334,6 +345,7 @@ class PegaEngineServer:
             self.engine.batch_load_kv_blocks(
                 instance_id,
                 tp_rank,
+                device_id,
                 load_state_shm,
                 layer_names,
                 block_ids,
@@ -341,8 +353,8 @@ class PegaEngineServer:
             )
 
             logger.debug(
-                "Submitted load for %d blocks across %d layers for instance %s rank %d",
-                len(block_ids), len(layer_names), instance_id, tp_rank
+                "Submitted load for %d blocks across %d layers for instance %s rank %d device %d",
+                len(block_ids), len(layer_names), instance_id, tp_rank, device_id
             )
 
             return {'status': 'success'}

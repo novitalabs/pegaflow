@@ -55,6 +55,7 @@ impl PegaEngine {
     ///     kv_stride_bytes: Byte stride between K and V when KV-first layout is used
     ///     segments: Number of segments per block (1 for blocks-first, 2 for KV-first)
     ///     tp_rank: Tensor Parallel rank of the worker
+    ///     device_id: CUDA device ID of the worker
     ///     tp_size: Total Tensor Parallel size
     ///     num_layers: Total number of layers in the model
     #[allow(clippy::too_many_arguments)]
@@ -103,6 +104,7 @@ impl PegaEngine {
     /// Args:
     ///     instance_id: ID of the model instance
     ///     tp_rank: Tensor Parallel rank of the worker
+    ///     device_id: CUDA device ID of the worker
     ///     layer_name: Name of the layer
     ///     block_ids: GPU block IDs to copy (list of ints)
     ///     block_hashes: Content hashes for each block (list of bytes)
@@ -111,6 +113,7 @@ impl PegaEngine {
         py: Python<'_>,
         instance_id: &str,
         tp_rank: usize,
+        device_id: i32,
         layer_name: String,
         block_ids: Vec<i32>,
         block_hashes: Vec<Vec<u8>>,
@@ -122,6 +125,7 @@ impl PegaEngine {
             engine.save_kv_blocks_from_ipc(
                 &instance_id_owned,
                 tp_rank,
+                device_id,
                 &layer_name_owned,
                 block_ids,
                 block_hashes,
@@ -139,6 +143,7 @@ impl PegaEngine {
     /// Args:
     ///     instance_id: ID of the model instance
     ///     tp_rank: Tensor Parallel rank of the worker
+    ///     device_id: CUDA device ID of the worker
     ///     saves: List of dicts, each with keys:
     ///         - layer_name: Name of the layer (str)
     ///         - block_ids: GPU block IDs to copy (list of ints)
@@ -148,12 +153,13 @@ impl PegaEngine {
         py: Python<'_>,
         instance_id: &str,
         tp_rank: usize,
+        device_id: i32,
         saves: Vec<(String, Vec<i32>, Vec<Vec<u8>>)>,
     ) -> PyResult<()> {
         let instance_id_owned = instance_id.to_string();
         let engine = &self.engine;
         py.allow_threads(move || {
-            engine.batch_save_kv_blocks_from_ipc(&instance_id_owned, tp_rank, saves)
+            engine.batch_save_kv_blocks_from_ipc(&instance_id_owned, tp_rank, device_id, saves)
         })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
@@ -199,6 +205,7 @@ impl PegaEngine {
         py: Python<'_>,
         instance_id: &str,
         tp_rank: usize,
+        device_id: i32,
         load_state_shm: &str,
         layer_names: Vec<String>,
         block_ids: Vec<i32>,
@@ -213,6 +220,7 @@ impl PegaEngine {
             engine.batch_load_kv_blocks_multi_layer(
                 &instance_id_owned,
                 tp_rank,
+                device_id,
                 &load_state_shm_owned,
                 &layer_name_refs,
                 &block_ids,

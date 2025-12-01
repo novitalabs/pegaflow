@@ -505,7 +505,11 @@ class PegaKVConnector(KVConnectorBase_V1):
 
         # Extract TP info and model metadata
         self._tp_size = vllm_config.parallel_config.tensor_parallel_size
-        self._num_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
+        # Use total number of layers across all PP ranks for correct slot calculation
+        # TODO: Use get_total_num_hidden_layers() when available in next vLLM release
+        self._num_layers = getattr(
+            vllm_config.model_config.hf_text_config, "num_hidden_layers", 0
+        )
 
         self._tp_rank: Optional[int] = None
         self._device_id: Optional[int] = None
