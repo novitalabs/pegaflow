@@ -1,13 +1,13 @@
 [package]
 name = "pegaflow-py"
 version = "0.0.1"
-edition = "2021"
+edition.workspace = true
 
 [lib]
 name = "pegaflow"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.22", features = ["extension-module"] }
-pega-core = { path = "../pega-core" }
-tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+pyo3.workspace = true
+pega-core.workspace = true
+tracing-subscriber.workspace = true
