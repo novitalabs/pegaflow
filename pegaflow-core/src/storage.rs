@@ -1,4 +1,5 @@
 use hashlink::LruCache;
+use std::num::NonZeroU64;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tracing::info;
@@ -172,7 +173,7 @@ impl StorageEngine {
         }
     }
 
-    pub fn allocate(&self, size: usize) -> Arc<PinnedAllocation> {
+    pub fn allocate(&self, size: NonZeroU64) -> Arc<PinnedAllocation> {
         loop {
             if let Some(allocation) = self.pinned_pool.allocate(size) {
                 return Arc::new(allocation);
@@ -185,7 +186,7 @@ impl StorageEngine {
                 let (used, total) = self.pinned_pool.usage();
                 panic!(
                     "Pinned memory pool exhausted! Requested: {:.2} MB, Used: {:.2} MB, Total: {:.2} MB, Cache empty",
-                    size as f64 / 1e6,
+                    size.get() as f64 / 1e6,
                     used as f64 / 1e6,
                     total as f64 / 1e6
                 );

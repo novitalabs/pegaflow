@@ -33,6 +33,7 @@ use cudarc::driver::{CudaContext, CudaStream};
 use std::{
     collections::HashMap,
     fmt,
+    num::NonZeroU64,
     sync::{Arc, Mutex, RwLock},
 };
 use tracing::{debug, info, instrument};
@@ -496,19 +497,29 @@ impl PegaEngine {
 
         let block_size = transfer::block_size(&registration).unwrap();
         let num_blocks = blocks_to_save.len();
+        let num_blocks_u64 = u64::try_from(num_blocks).expect("num_blocks should fit within u64");
 
         // For layer-first layout with KV stride, allocate separate regions for K and V
         if registration.segments == 2 && registration.kv_stride_bytes > registration.bytes_per_block
         {
             let segment_size = registration.bytes_per_block;
-            let k_total_size = segment_size * num_blocks;
-            let v_total_size = segment_size * num_blocks;
+            let segment_size_u64 =
+                u64::try_from(segment_size).expect("segment size should fit within u64");
+            let k_total_size = segment_size_u64
+                .checked_mul(num_blocks_u64)
+                .and_then(NonZeroU64::new)
+                .expect("allocation size overflow or zero");
+            let v_total_size = k_total_size;
 
             // Allocate separate regions for K and V segments
-            let k_allocation = self.storage.allocate(k_total_size);
-            let v_allocation = self.storage.allocate(v_total_size);
-            let k_base_ptr = k_allocation.as_mut_ptr();
-            let v_base_ptr = v_allocation.as_mut_ptr();
+            let mut k_allocation = self.storage.allocate(k_total_size);
+            let mut v_allocation = self.storage.allocate(v_total_size);
+            let k_base_ptr = Arc::get_mut(&mut k_allocation)
+                .expect("allocation should be unique before cloning")
+                .as_mut_ptr();
+            let v_base_ptr = Arc::get_mut(&mut v_allocation)
+                .expect("allocation should be unique before cloning")
+                .as_mut_ptr();
 
             // Calculate GPU offsets for batching
             let mut k_offsets_with_idx = Vec::with_capacity(num_blocks);
@@ -559,9 +570,16 @@ impl PegaEngine {
             }
         } else {
             // Original logic for contiguous or single-segment layouts
-            let total_size = block_size * num_blocks;
-            let allocation = self.storage.allocate(total_size);
-            let base_ptr = allocation.as_mut_ptr();
+            let block_size_u64 =
+                u64::try_from(block_size).expect("block size should fit within u64");
+            let total_size = block_size_u64
+                .checked_mul(num_blocks_u64)
+                .and_then(NonZeroU64::new)
+                .expect("allocation size overflow or zero");
+            let mut allocation = self.storage.allocate(total_size);
+            let base_ptr = Arc::get_mut(&mut allocation)
+                .expect("allocation should be unique before cloning")
+                .as_mut_ptr();
 
             // Copy blocks and create Block objects
             for (i, (block_idx, block_hash)) in blocks_to_save.into_iter().enumerate() {

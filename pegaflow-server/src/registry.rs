@@ -82,7 +82,7 @@ impl CudaTensorRegistry {
 
     pub fn drop_instance(&mut self, instance_id: &str) -> usize {
         let prefix = format!("{instance_id}:");
-        
+
         // Collect keys to remove first
         let keys_to_remove: Vec<String> = self
             .contexts
@@ -90,18 +90,18 @@ impl CudaTensorRegistry {
             .filter(|key| key.starts_with(&prefix))
             .cloned()
             .collect();
-        
+
         // Count total tensors across all contexts being removed
         let tensor_count: usize = keys_to_remove
             .iter()
             .filter_map(|key| self.contexts.get(key))
             .map(|ctx| ctx.tensors.len())
             .sum();
-        
+
         if tensor_count == 0 {
             return 0;
         }
-        
+
         // Remove contexts under GIL to ensure proper Python object cleanup.
         // The Py<PyAny> inside LayerTensor will be dropped here, which will
         // decrement the reference count and allow Python to garbage collect
@@ -110,18 +110,18 @@ impl CudaTensorRegistry {
             for key in keys_to_remove {
                 self.contexts.remove(&key);
             }
-            
+
             // Force garbage collection to release CUDA IPC memory immediately.
             // Without this, Python's GC may defer cleanup, leaving GPU memory mapped.
             let gc = py.import_bound("gc").expect("gc module");
             let _ = gc.call_method0("collect");
-            
+
             // Clear CUDA memory cache to return memory to the device
             let torch = py.import_bound("torch").expect("torch module");
             let cuda = torch.getattr("cuda").expect("torch.cuda");
             let _ = cuda.call_method0("empty_cache");
         });
-        
+
         tensor_count
     }
 
@@ -129,11 +129,11 @@ impl CudaTensorRegistry {
         // Clear all contexts under GIL to ensure proper Python object cleanup
         Python::with_gil(|py| {
             self.contexts.clear();
-            
+
             // Force garbage collection and clear CUDA cache
             let gc = py.import_bound("gc").expect("gc module");
             let _ = gc.call_method0("collect");
-            
+
             let torch = py.import_bound("torch").expect("torch module");
             let cuda = torch.getattr("cuda").expect("torch.cuda");
             let _ = cuda.call_method0("empty_cache");

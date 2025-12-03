@@ -1,9 +1,9 @@
 use clap::Parser;
 use cudarc::driver::result as cuda_driver;
-use pegaflow_server::proto::engine::engine_server::EngineServer;
-use pegaflow_server::{CudaTensorRegistry, GrpcEngineService};
 use parking_lot::Mutex;
 use pegaflow_core::PegaEngine;
+use pegaflow_server::proto::engine::engine_server::EngineServer;
+use pegaflow_server::{CudaTensorRegistry, GrpcEngineService};
 use pyo3::{types::PyAnyMethods, PyErr, Python};
 use std::error::Error;
 use std::net::SocketAddr;
@@ -29,8 +29,11 @@ struct Cli {
 }
 
 fn init_tracing() {
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "info,pegaflow_server=info,pegaflow_core=info".parse().unwrap());
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        "info,pegaflow_server=info,pegaflow_core=info"
+            .parse()
+            .unwrap()
+    });
     let fmt_layer = tracing_subscriber::fmt::layer();
     let _ = tracing_subscriber::registry()
         .with(env_filter)

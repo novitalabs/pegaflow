@@ -1,5 +1,8 @@
 use offset_allocator::{Allocation as RawAllocation, Allocator as RawAllocator};
-use std::fmt::{Display, Formatter, Result as FmtResult};
+use std::{
+    fmt::{Display, Formatter, Result as FmtResult},
+    num::NonZeroU64,
+};
 
 /// Error variants returned by the scaled allocator wrapper.
 #[derive(Debug, PartialEq, Eq)]
@@ -40,12 +43,11 @@ impl Display for AllocatorError {
 }
 
 /// Represents an allocated region in bytes.
-#[derive(Clone, Copy)]
 pub struct Allocation {
     /// Offset from the start of the managed region, in bytes.
     pub offset_bytes: u64,
     /// Actual size of the allocation in bytes (rounded up to `unit_size`).
-    pub size_bytes: u64,
+    pub size_bytes: NonZeroU64,
     raw: RawAllocation,
 }
 
@@ -62,7 +64,7 @@ impl std::fmt::Debug for Allocation {
 /// while the underlying allocator works with u32-sized units.
 #[derive(Debug)]
 pub struct ScaledOffsetAllocator {
-    unit_size: u64,
+    unit_size: NonZeroU64,
     total_units: u32,
     inner: RawAllocator,
 }
@@ -75,7 +77,7 @@ impl ScaledOffsetAllocator {
     pub fn new(total_bytes: u64) -> Result<Self, AllocatorError> {
         let max_units = u32::MAX as u64;
         let unit_size = if total_bytes > max_units {
-            ceil_div(total_bytes, max_units)
+            total_bytes.div_ceil(max_units)
         } else {
             1
         };
@@ -84,15 +86,13 @@ impl ScaledOffsetAllocator {
 
     /// Create a new allocator that manages `total_bytes`, rounding up to multiples of `unit_size`.
     pub fn new_with_unit_size(total_bytes: u64, unit_size: u64) -> Result<Self, AllocatorError> {
-        if unit_size == 0 {
-            return Err(AllocatorError::InvalidUnitSize);
-        }
+        let unit_size = NonZeroU64::new(unit_size).ok_or(AllocatorError::InvalidUnitSize)?;
 
-        let total_units = ceil_div(total_bytes, unit_size);
+        let total_units = total_bytes.div_ceil(unit_size.get());
         let total_units_u32 =
             u32::try_from(total_units).map_err(|_| AllocatorError::CapacityTooLarge {
                 total_bytes,
-                unit_size,
+                unit_size: unit_size.get(),
             })?;
 
         Ok(Self {
@@ -108,10 +108,10 @@ impl ScaledOffsetAllocator {
             return Ok(None);
         }
 
-        let units = ceil_div(size_bytes, self.unit_size);
+        let units = size_bytes.div_ceil(self.unit_size.get());
         let units_u32 = u32::try_from(units).map_err(|_| AllocatorError::RequestTooLarge {
             requested_bytes: size_bytes,
-            unit_size: self.unit_size,
+            unit_size: self.unit_size.get(),
         })?;
 
         let Some(raw) = self.inner.allocate(units_u32) else {
@@ -119,29 +119,31 @@ impl ScaledOffsetAllocator {
         };
 
         let allocated_units = self.inner.allocation_size(raw) as u64;
+        let size_bytes = NonZeroU64::new(allocated_units * self.unit_size.get())
+            .expect("allocation_size should always be non-zero");
         Ok(Some(Allocation {
-            offset_bytes: raw.offset as u64 * self.unit_size,
-            size_bytes: allocated_units * self.unit_size,
+            offset_bytes: raw.offset as u64 * self.unit_size.get(),
+            size_bytes,
             raw,
         }))
     }
 
     /// Free a previously allocated region.
-    pub fn free(&mut self, allocation: Allocation) {
+    pub fn free(&mut self, allocation: &Allocation) {
         self.inner.free(allocation.raw);
     }
 
     /// Return the total managed capacity in bytes (rounded up to `unit_size`).
     pub fn total_bytes(&self) -> u64 {
-        self.unit_size * self.total_units as u64
+        self.unit_size.get() * self.total_units as u64
     }
 
     /// Return a storage report converted to bytes.
     pub fn storage_report(&self) -> StorageReportBytes {
         let report = self.inner.storage_report();
         StorageReportBytes {
-            total_free_bytes: report.total_free_space as u64 * self.unit_size,
-            largest_free_allocation_bytes: report.largest_free_region as u64 * self.unit_size,
+            total_free_bytes: report.total_free_space as u64 * self.unit_size.get(),
+            largest_free_allocation_bytes: report.largest_free_region as u64 * self.unit_size.get(),
         }
     }
 }
@@ -153,15 +155,6 @@ pub struct StorageReportBytes {
     pub largest_free_allocation_bytes: u64,
 }
 
-fn ceil_div(lhs: u64, rhs: u64) -> u64 {
-    let quotient = lhs / rhs;
-    if lhs % rhs == 0 {
-        quotient
-    } else {
-        quotient + 1
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,7 +163,7 @@ mod tests {
     fn creates_allocator_with_scaled_capacity() {
         let allocator =
             ScaledOffsetAllocator::new_with_unit_size(10 * 1024 * 1024 * 1024, 64).unwrap();
-        assert_eq!(allocator.unit_size, 64);
+        assert_eq!(allocator.unit_size.get(), 64);
         assert_eq!(
             allocator.total_units,
             (10 * 1024 * 1024 * 1024u64 / 64) as u32
@@ -182,7 +175,7 @@ mod tests {
         let mut allocator = ScaledOffsetAllocator::new_with_unit_size(1024, 64).unwrap();
         let allocation = allocator.allocate(1).unwrap().unwrap();
         assert_eq!(allocation.offset_bytes, 0);
-        assert_eq!(allocation.size_bytes, 64);
+        assert_eq!(allocation.size_bytes.get(), 64);
 
         let storage = allocator.storage_report();
         assert_eq!(storage.total_free_bytes, 960);
@@ -195,12 +188,12 @@ mod tests {
         let a = allocator.allocate(64).unwrap().unwrap();
         let b = allocator.allocate(64).unwrap().unwrap();
 
-        allocator.free(a);
-        allocator.free(b);
+        allocator.free(&a);
+        allocator.free(&b);
 
         let merged = allocator.allocate(128).unwrap().unwrap();
         assert_eq!(merged.offset_bytes, 0);
-        assert_eq!(merged.size_bytes, 128);
+        assert_eq!(merged.size_bytes.get(), 128);
     }
 
     #[test]

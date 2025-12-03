@@ -1,4 +1,5 @@
 use std::{
+    num::NonZeroU64,
     ptr::NonNull,
     sync::{Arc, Mutex},
 };
@@ -22,20 +23,20 @@ impl PinnedAllocation {
     }
 
     /// Get a mutable pointer to the allocated memory
-    pub fn as_mut_ptr(&self) -> *mut u8 {
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
         self.ptr.as_ptr()
     }
 
     /// Get the size of the allocation in bytes
-    pub fn size(&self) -> usize {
-        self.allocation.size_bytes as usize
+    pub fn size(&self) -> NonZeroU64 {
+        self.allocation.size_bytes
     }
 }
 
 impl Drop for PinnedAllocation {
     fn drop(&mut self) {
         // Automatically free the allocation when the guard is dropped
-        self.pool.free_internal(self.allocation);
+        self.pool.free_internal(&self.allocation);
     }
 }
 
@@ -81,14 +82,10 @@ impl PinnedMemoryPool {
 
     /// Allocate pinned memory from the pool. Returns None when the allocation cannot be satisfied.
     /// Returns a RAII guard that automatically frees the allocation when dropped.
-    pub fn allocate(self: &Arc<Self>, size: usize) -> Option<PinnedAllocation> {
-        if size == 0 {
-            panic!("Cannot allocate zero bytes from the pinned pool");
-        }
-
+    pub fn allocate(self: &Arc<Self>, size: NonZeroU64) -> Option<PinnedAllocation> {
         let mut allocator = self.allocator.lock().unwrap();
 
-        let allocation = match allocator.allocate(size as u64) {
+        let allocation = match allocator.allocate(size.get()) {
             Ok(Some(allocation)) => allocation,
             Ok(None) => {
                 return None; // Pool exhausted, caller can retry after eviction
@@ -96,7 +93,11 @@ impl PinnedMemoryPool {
             Err(err) => panic!("Pinned memory allocation error: {}", err),
         };
 
-        let ptr = unsafe { self.base_ptr.as_ptr().add(allocation.offset_bytes as usize) };
+        let offset: usize = allocation
+            .offset_bytes
+            .try_into()
+            .expect("allocation offset exceeds usize");
+        let ptr = unsafe { self.base_ptr.as_ptr().add(offset) };
         let ptr = NonNull::new(ptr).expect("PinnedMemoryPool returned null pointer");
 
         Some(PinnedAllocation {
@@ -109,17 +110,17 @@ impl PinnedMemoryPool {
     /// Internal method to free a pinned memory allocation.
     /// This is called automatically by PinnedAllocation's Drop implementation.
     /// Users should not call this directly - use PinnedAllocation RAII instead.
-    pub(crate) fn free_internal(&self, allocation: Allocation) {
+    pub(crate) fn free_internal(&self, allocation: &Allocation) {
         let mut allocator = self.allocator.lock().unwrap();
         allocator.free(allocation);
     }
 
     /// Get (used_bytes, total_bytes) for the pool.
-    pub fn usage(&self) -> (usize, usize) {
+    pub fn usage(&self) -> (u64, u64) {
         let allocator = self.allocator.lock().unwrap();
         let report = allocator.storage_report();
-        let total = allocator.total_bytes() as usize;
-        let used = total - report.total_free_bytes as usize;
+        let total = allocator.total_bytes();
+        let used = total - report.total_free_bytes;
         (used, total)
     }
 }
@@ -138,6 +139,10 @@ impl Drop for PinnedMemoryPool {
     }
 }
 
-// TODO: fix this
+// SAFETY: The pool owns a host-pinned buffer obtained from `cuMemAllocHost_v2` that
+// remains valid for the lifetime of the pool. All mutations of the allocator state
+// are guarded by the internal `Mutex`, and freeing happens exactly once in `Drop`.
+// CUDA pinned host memory can be accessed from any host thread, so it is safe to
+// move and share the pool across threads.
 unsafe impl Send for PinnedMemoryPool {}
 unsafe impl Sync for PinnedMemoryPool {}
