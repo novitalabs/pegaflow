@@ -24,6 +24,7 @@ Usage:
 
 import argparse
 import json
+import shutil
 import subprocess
 import time
 import signal
@@ -83,8 +84,6 @@ class VLLMServer:
             "--port", str(self.port),
             "--trust-remote-code",
             "--data-parallel-size", "1",
-            # set chunk prefill to 1024
-            "--max-num-batched-tokens", "10240",
             "--prefix-caching-hash-algo", "sha256_cbor",
         ])
 
@@ -246,8 +245,10 @@ def print_comparison(results: dict, args):
         )
     )
 
-    # Build configs list based on whether LMCache was included
+    # Build configs list based on what benchmarks were included
     configs = []
+    if args.with_baseline:
+        configs.append(("baseline", "Baseline (No KV)"))
     if args.with_lmcache:
         configs.extend([
             ("lmcache_cold", "LMCache (Cold)"),
@@ -369,7 +370,12 @@ def main():
     parser.add_argument(
         "--torch-profile",
         action="store_true",
-        help="Enable torch profiling (warm run only)"
+        help="Enable torch profiling for both cold and warm runs (saved to separate directories)"
+    )
+    parser.add_argument(
+        "--with-baseline",
+        action="store_true",
+        help="Include pure vLLM baseline (no KV connector, single run) for comparison."
     )
 
     args = parser.parse_args()
@@ -398,17 +404,47 @@ def main():
     print(f"PegaFlow Port:   {args.pegaflow_port}")
     print(f"Results Dir:     {run_dir}")
     print(f"Profiling:       {'Enabled' if args.profile else 'Disabled'}")
+    if not args.with_baseline:
+        print(f"Baseline:        Skipped (use --with-baseline to enable)")
     if not args.with_lmcache:
         print(f"LMCache:         Skipped (use --with-lmcache to enable)")
     print("="*70)
 
     all_results = {}
 
-    # Phase 1: LMCache vLLM (local CPU backend) - only run if requested
+    # Track phase numbering dynamically
+    phase_counter = 1
+
+    # Phase: Pure vLLM Baseline (no KV connector, single run) - only run if requested
+    if args.with_baseline:
+        print("\n" + "="*70)
+        print(f"PHASE {phase_counter}: PURE vLLM BASELINE (No KV Connector)")
+        print("="*70)
+        phase_counter += 1
+
+        baseline_log = run_dir / "baseline_server.log"
+        profile_path = run_dir / "baseline" if args.profile else None
+        with VLLMServer(args.model, args.pegaflow_port, use_pegaflow=False,
+                        use_lmcache=False, enable_prefix_caching=False,
+                        log_file=baseline_log, profile_output=profile_path):
+            # Single run (no warm run needed since there's no external cache)
+            result_file = run_dir / "baseline.json"
+            all_results["baseline"] = run_benchmark(
+                args.model, args.pegaflow_port, args.num_prompts, args.input_len,
+                args.output_len, result_file, "baseline", args.request_rate, args.seed
+            )
+    else:
+        print("\n" + "="*70)
+        print(f"PHASE {phase_counter}: BASELINE - SKIPPED (use --with-baseline to enable)")
+        print("="*70)
+        phase_counter += 1
+
+    # Phase: LMCache vLLM (local CPU backend) - only run if requested
     if args.with_lmcache:
         print("\n" + "="*70)
-        print("PHASE 1: LMCACHE vLLM (Local CPU Backend)")
+        print(f"PHASE {phase_counter}: LMCACHE vLLM (Local CPU Backend)")
         print("="*70)
+        phase_counter += 1
 
         lmcache_log = run_dir / "lmcache_server.log"
         profile_path = run_dir / "lmcache" if args.profile else None
@@ -430,33 +466,57 @@ def main():
             )
     else:
         print("\n" + "="*70)
-        print("PHASE 1: LMCACHE - SKIPPED (use --with-lmcache to enable)")
+        print(f"PHASE {phase_counter}: LMCACHE - SKIPPED (use --with-lmcache to enable)")
         print("="*70)
+        phase_counter += 1
 
-    # Phase 2: PegaFlow vLLM (with KV connector)
-    phase_num = "1" if not args.with_lmcache else "2"
+    # Phase: PegaFlow vLLM (with KV connector)
     print("\n" + "="*70)
-    print(f"PHASE {phase_num}: PEGAFLOW vLLM (KV Cache Connector Enabled)")
+    print(f"PHASE {phase_counter}: PEGAFLOW vLLM (KV Cache Connector Enabled)")
     print("="*70)
 
     pegaflow_log = run_dir / "pegaflow_server.log"
     profile_path = run_dir / "pegaflow" if args.profile else None
-    torch_profile_path = run_dir / "pegaflow_torch_trace" if args.torch_profile else None
+    # Use a temp directory for torch profiler, we'll move files after each run
+    torch_profile_base = run_dir / "torch_trace_tmp" if args.torch_profile else None
+    torch_profile_cold = run_dir / "torch_trace_cold" if args.torch_profile else None
+    torch_profile_warm = run_dir / "torch_trace_warm" if args.torch_profile else None
+    
+    if args.torch_profile:
+        torch_profile_base.mkdir(parents=True, exist_ok=True)
+        torch_profile_cold.mkdir(parents=True, exist_ok=True)
+        torch_profile_warm.mkdir(parents=True, exist_ok=True)
+    
     with VLLMServer(args.model, args.pegaflow_port, use_pegaflow=True,
                     enable_prefix_caching=False, log_file=pegaflow_log,
                     profile_output=profile_path,
-                    torch_profile_output=torch_profile_path):
+                    torch_profile_output=torch_profile_base):
         # Cold cache run
+        if args.torch_profile:
+            import requests
+            print("Starting torch profile for cold run...")
+            requests.post(f"http://localhost:{args.pegaflow_port}/start_profile")
+
         result_file = run_dir / "pegaflow_cold.json"
         all_results["pegaflow_cold"] = run_benchmark(
             args.model, args.pegaflow_port, args.num_prompts, args.input_len,
             args.output_len, result_file, "pegaflow_cold", args.request_rate, args.seed
         )
 
+        if args.torch_profile:
+            import requests
+            print("Stopping torch profile for cold run...")
+            requests.post(f"http://localhost:{args.pegaflow_port}/stop_profile")
+            time.sleep(1)  # Wait for trace files to be written
+            # Move trace files to cold directory
+            for f in torch_profile_base.iterdir():
+                shutil.move(str(f), str(torch_profile_cold / f.name))
+            print(f"  Cold trace saved to: {torch_profile_cold}")
+
         # Warm cache run (same requests again - using same seed for identical requests)
         if args.torch_profile:
             import requests
-            print("Starting torch profile...")
+            print("Starting torch profile for warm run...")
             requests.post(f"http://localhost:{args.pegaflow_port}/start_profile")
 
         result_file = run_dir / "pegaflow_warm.json"
@@ -467,8 +527,15 @@ def main():
 
         if args.torch_profile:
             import requests
-            print("Stopping torch profile...")
+            print("Stopping torch profile for warm run...")
             requests.post(f"http://localhost:{args.pegaflow_port}/stop_profile")
+            time.sleep(1)  # Wait for trace files to be written
+            # Move trace files to warm directory
+            for f in torch_profile_base.iterdir():
+                shutil.move(str(f), str(torch_profile_warm / f.name))
+            print(f"  Warm trace saved to: {torch_profile_warm}")
+            # Remove temp directory
+            torch_profile_base.rmdir()
 
     # Save combined results
     combined_file = run_dir / "combined_results.json"
