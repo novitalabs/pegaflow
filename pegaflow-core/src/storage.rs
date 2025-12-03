@@ -1,8 +1,27 @@
+// ============================================================================
+// StorageEngine eviction + layout notes (mirrors the high-level summary in
+// lib.rs):
+// - Allocation is always attempted first; eviction only happens when the pinned
+//   pool cannot satisfy a request (often due to fragmentation at different
+//   utilization levels). On failure we drop a batch of LRU entries and retry.
+// - Eviction is batched (RECLAIM_BATCH_OBJECTS) so a single allocation failure
+//   can free multiple cached objects at once instead of thrashing.
+// - LRU key: BlockHash (Vec<u8> digest for a shard of KV blocks).
+//   LRU value: Vec<Option<Arc<Block>>> ordered by flat slot id
+//   (slot_id = layer_id * tp_size + tp_rank).
+// - CPU memory picture for one hash (split K/V storage):
+//     BlockHash ->
+//       K range: [slot0 K data][slot1 K data][slot2 K data]...
+//       V range: [slot0 V data][slot1 V data][slot2 V data]...
+//   Slots saved together share one allocation per K and V, so a layer's blocks
+//   sit back-to-back in those ranges. When K/V are co-located, V_ptr is None
+//   and the V bytes follow K in the same allocation.
+// ============================================================================
 use hashlink::LruCache;
 use std::num::NonZeroU64;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, MutexGuard};
-use tracing::info;
+use tracing::{error, info};
 
 use crate::pinned_pool::{PinnedAllocation, PinnedMemoryPool};
 
@@ -113,8 +132,10 @@ pub struct Block {
 
 impl Block {
     pub fn new_contiguous(ptr: *mut u8, size: usize, allocation: Arc<PinnedAllocation>) -> Self {
+        let k_ptr =
+            std::ptr::NonNull::new(ptr).expect("contiguous block K pointer must be non-null");
         Self {
-            k_ptr: unsafe { std::ptr::NonNull::new_unchecked(ptr) },
+            k_ptr,
             v_ptr: None,
             size,
             k_allocation: allocation,
@@ -129,21 +150,31 @@ impl Block {
         k_allocation: Arc<PinnedAllocation>,
         v_allocation: Arc<PinnedAllocation>,
     ) -> Self {
+        let k_ptr = std::ptr::NonNull::new(k_ptr).expect("split block K pointer must be non-null");
+        let v_ptr = std::ptr::NonNull::new(v_ptr).expect("split block V pointer must be non-null");
         Self {
-            k_ptr: unsafe { std::ptr::NonNull::new_unchecked(k_ptr) },
-            v_ptr: Some(unsafe { std::ptr::NonNull::new_unchecked(v_ptr) }),
+            k_ptr,
+            v_ptr: Some(v_ptr),
             size,
             k_allocation,
             v_allocation: Some(v_allocation),
         }
     }
 
-    pub fn k_ptr(&self) -> *mut u8 {
+    pub fn k_ptr_mut(&mut self) -> *mut u8 {
         self.k_ptr.as_ptr()
     }
 
-    pub fn v_ptr(&self) -> Option<*mut u8> {
+    pub fn v_ptr_mut(&mut self) -> Option<*mut u8> {
         self.v_ptr.map(|ptr| ptr.as_ptr())
+    }
+
+    pub fn k_ptr(&self) -> *const u8 {
+        self.k_ptr.as_ptr()
+    }
+
+    pub fn v_ptr(&self) -> Option<*const u8> {
+        self.v_ptr.map(|ptr| ptr.as_ptr() as *const u8)
     }
 
     pub fn size(&self) -> usize {
@@ -163,9 +194,7 @@ pub struct StorageEngine {
 impl StorageEngine {
     pub fn new(capacity_bytes: usize) -> Self {
         let pinned_pool = Arc::new(PinnedMemoryPool::new(capacity_bytes));
-        // Use the pool capacity as the cache weight to keep eviction proportional to bytes.
-        let cache_capacity = capacity_bytes.max(1);
-        let kv_storage = Mutex::new(LruCache::new(cache_capacity));
+        let kv_storage = Mutex::new(LruCache::new_unbounded());
 
         Self {
             kv_storage,
@@ -173,10 +202,10 @@ impl StorageEngine {
         }
     }
 
-    pub fn allocate(&self, size: NonZeroU64) -> Arc<PinnedAllocation> {
+    pub fn allocate(&self, size: NonZeroU64) -> Option<Arc<PinnedAllocation>> {
         loop {
             if let Some(allocation) = self.pinned_pool.allocate(size) {
-                return Arc::new(allocation);
+                return Some(Arc::new(allocation));
             }
 
             let reclaimed = self.reclaim(RECLAIM_BATCH_OBJECTS);
@@ -184,12 +213,13 @@ impl StorageEngine {
                 continue;
             } else {
                 let (used, total) = self.pinned_pool.usage();
-                panic!(
+                error!(
                     "Pinned memory pool exhausted! Requested: {:.2} MB, Used: {:.2} MB, Total: {:.2} MB, Cache empty",
                     size.get() as f64 / 1e6,
                     used as f64 / 1e6,
                     total as f64 / 1e6
                 );
+                return None;
             }
         }
     }

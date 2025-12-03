@@ -512,8 +512,16 @@ impl PegaEngine {
             let v_total_size = k_total_size;
 
             // Allocate separate regions for K and V segments
-            let mut k_allocation = self.storage.allocate(k_total_size);
-            let mut v_allocation = self.storage.allocate(v_total_size);
+            let mut k_allocation = self.storage.allocate(k_total_size).ok_or_else(|| {
+                EngineError::Storage(
+                    "pinned pool exhausted while allocating K segment buffer".to_string(),
+                )
+            })?;
+            let mut v_allocation = self.storage.allocate(v_total_size).ok_or_else(|| {
+                EngineError::Storage(
+                    "pinned pool exhausted while allocating V segment buffer".to_string(),
+                )
+            })?;
             let k_base_ptr = Arc::get_mut(&mut k_allocation)
                 .expect("allocation should be unique before cloning")
                 .as_mut_ptr();
@@ -576,7 +584,11 @@ impl PegaEngine {
                 .checked_mul(num_blocks_u64)
                 .and_then(NonZeroU64::new)
                 .expect("allocation size overflow or zero");
-            let mut allocation = self.storage.allocate(total_size);
+            let mut allocation = self.storage.allocate(total_size).ok_or_else(|| {
+                EngineError::Storage(
+                    "pinned pool exhausted while allocating contiguous block buffer".to_string(),
+                )
+            })?;
             let base_ptr = Arc::get_mut(&mut allocation)
                 .expect("allocation should be unique before cloning")
                 .as_mut_ptr();
@@ -725,10 +737,9 @@ impl PegaEngine {
                                 transfer::segment_offset(&registration, *block_idx, 1)
                                     .expect("V segment offset should be valid");
 
-                            let k_cpu_ptr = block.k_ptr() as *const u8;
+                            let k_cpu_ptr = block.k_ptr();
                             let v_cpu_ptr = block
                                 .v_ptr()
-                                .map(|p| p as *const u8)
                                 .unwrap_or_else(|| unsafe { k_cpu_ptr.add(segment_size) });
 
                             ((k_gpu_offset, k_cpu_ptr), (v_gpu_offset, v_cpu_ptr))
@@ -758,7 +769,7 @@ impl PegaEngine {
                         transfer::copy_block_cpu_to_gpu(
                             &registration,
                             *block_idx,
-                            block.k_ptr() as *const u8,
+                            block.k_ptr(),
                             &stream,
                         )
                         .expect("Block copy should succeed");
