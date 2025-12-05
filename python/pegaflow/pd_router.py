@@ -96,6 +96,11 @@ async def _handle_completion(request: Request, api_path: str):
     p_body["max_tokens"] = 1
     p_body["stream"] = False
     p_body["request_id"] = req_id
+    # Ensure min_tokens <= max_tokens to avoid 400 from P node
+    if "min_tokens" in p_body:
+        p_body["min_tokens"] = min(p_body.get("min_tokens") or 0, 1)
+    else:
+        p_body["min_tokens"] = 0
 
     headers = {"X-Request-Id": req_id}
     p_client = _get_next_p()

@@ -309,7 +309,7 @@ def main():
     parser.add_argument(
         "--num-prompts",
         type=int,
-        default=20,
+        default=50,
         help="Number of prompts to benchmark (default: 20)"
     )
     parser.add_argument(

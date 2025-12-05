@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Benchmark vLLM server using ShareGPT dataset.
+Benchmark vLLM server using ShareGPT dataset with multi-turn conversations.
 
 Usage:
     python share_gpt_bench.py --model meta-llama/Llama-3.1-8B
-    python share_gpt_bench.py --model Qwen/Qwen2.5-7B --num-prompts 200
+    python share_gpt_bench.py --model Qwen/Qwen2.5-7B --num-conversations 50
 """
 import argparse
 import json
@@ -16,7 +16,7 @@ from pathlib import Path
 
 
 # Default ShareGPT dataset URL
-DEFAULT_DATASET_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
+DEFAULT_DATASET_URL = "https://huggingface.co/datasets/philschmid/sharegpt-raw/resolve/main/sharegpt_20230401_clean_lang_split.json"
 
 
 def download_dataset(url: str, output_path: Path):
@@ -40,91 +40,146 @@ def download_dataset(url: str, output_path: Path):
         sys.exit(1)
 
 
-def run_benchmark(args, result_file: Path) -> dict:
-    """Run vllm bench serve with ShareGPT dataset and return the results."""
+def convert_sharegpt_dataset(
+    input_path: Path,
+    output_path: Path,
+    max_items: int,
+    seed: int,
+) -> Path:
+    """Convert ShareGPT dataset to OpenAI format for multi-turn benchmark."""
+    if output_path.exists():
+        print(f"Converted dataset already exists at: {output_path}")
+        return output_path
+
+    print(f"Converting ShareGPT dataset to OpenAI format...")
+    print(f"  Input:  {input_path}")
+    print(f"  Output: {output_path}")
+    print(f"  Max items: {max_items}, Seed: {seed}\n")
+
+    # Find convert_sharegpt_to_openai.py script
+    # Try to find it in vLLM benchmarks directory
+    vllm_bench_dir = Path(__file__).parent.parent.parent / "vllm" / "benchmarks" / "multi_turn"
+    convert_script = vllm_bench_dir / "convert_sharegpt_to_openai.py"
+
+    if not convert_script.exists():
+        # Try alternative locations
+        import shutil
+        convert_script_path = shutil.which("convert_sharegpt_to_openai.py")
+        if convert_script_path:
+            convert_script = Path(convert_script_path)
+        else:
+            raise FileNotFoundError(
+                f"Cannot find convert_sharegpt_to_openai.py. "
+                f"Expected at: {convert_script}\n"
+                f"Please ensure vLLM is installed and the script is available."
+            )
+
     cmd = [
-        "vllm", "bench", "serve",
-        "--backend", "openai",
-        "--host", args.host,
-        "--port", str(args.port),
-        "--model", args.model,
-        "--dataset-name", "sharegpt",
-        "--num-prompts", str(args.num_prompts),
-        "--request-rate", str(args.request_rate),
-        "--seed", str(args.seed),
-        "--save-result",
-        "--result-filename", result_file.name,
-        "--result-dir", str(result_file.parent),
-        "--label", args.label,
+        sys.executable,
+        str(convert_script),
+        str(input_path),
+        str(output_path),
+        "--seed", str(seed),
+        "--max-items", str(max_items),
     ]
-
-    # Add dataset path if provided
-    if args.dataset_path:
-        cmd.extend(["--dataset-path", args.dataset_path])
-
-    print(f"Running ShareGPT benchmark: {args.label}")
-    print(f"Command: {' '.join(cmd)}\n")
 
     result = subprocess.run(cmd, capture_output=True, text=True)
 
     if result.returncode != 0:
-        print(f"Benchmark failed with return code {result.returncode}")
+        print(f"Conversion failed with return code {result.returncode}")
         print(f"STDOUT:\n{result.stdout}")
         print(f"STDERR:\n{result.stderr}")
-        raise RuntimeError(f"Benchmark failed: {args.label}")
+        raise RuntimeError("Failed to convert ShareGPT dataset")
 
-    print(f"✓ Benchmark complete -> {result_file}")
-
-    # Load and return the results
-    with open(result_file, 'r') as f:
-        return json.load(f)
+    print(f"✓ Dataset converted to: {output_path}\n")
+    return output_path
 
 
-def print_results(results: dict, args):
-    """Print benchmark results summary."""
-    print("\n" + "=" * 80)
-    print("SHAREGPT BENCHMARK SUMMARY")
-    print("=" * 80)
-    print(
-        "Model: {model} | Prompts: {num_prompts} | Rate: {request_rate} req/s | Seed: {seed}".format(
-            model=args.model,
-            num_prompts=args.num_prompts,
-            request_rate=args.request_rate,
-            seed=args.seed,
-        )
-    )
+def run_benchmark(args, converted_dataset_path: Path, output_file: Path = None):
+    """Run benchmark_serving_multi_turn.py with ShareGPT dataset."""
+    # Find benchmark_serving_multi_turn.py script
+    vllm_bench_dir = Path(__file__).parent.parent.parent / "vllm" / "benchmarks" / "multi_turn"
+    benchmark_script = vllm_bench_dir / "benchmark_serving_multi_turn.py"
 
-    metrics = [
-        ("mean_ttft_ms", "TTFT mean (ms)"),
-        ("p99_ttft_ms", "TTFT p99 (ms)"),
-        ("request_throughput", "Request throughput (req/s)"),
-        ("output_throughput", "Output throughput (tok/s)"),
-        ("duration", "Duration (s)"),
+    if not benchmark_script.exists():
+        # Try alternative locations
+        import shutil
+        benchmark_script_path = shutil.which("benchmark_serving_multi_turn.py")
+        if benchmark_script_path:
+            benchmark_script = Path(benchmark_script_path)
+        else:
+            raise FileNotFoundError(
+                f"Cannot find benchmark_serving_multi_turn.py. "
+                f"Expected at: {benchmark_script}\n"
+                f"Please ensure vLLM is installed and the script is available."
+            )
+
+    url = f"http://{args.host}:{args.port}"
+    cmd = [
+        sys.executable,
+        str(benchmark_script),
+        "--input-file", str(converted_dataset_path),
+        "--model", args.model,
+        "--url", url,
+        "--seed", str(args.seed),
+        "--request-rate", str(args.request_rate),
+        "--num-clients", str(args.num_clients),
     ]
 
-    print("-" * 80)
-    for key, label in metrics:
-        value = results.get(key)
-        if value is not None:
-            if isinstance(value, float):
-                formatted = f"{value:.3f}" if abs(value) < 100 else f"{value:.1f}"
-            else:
-                formatted = str(value)
-            print(f"{label:<35} {formatted:>15}")
+    # Add optional arguments
+    if args.served_model_name:
+        cmd.extend(["--served-model-name", args.served_model_name])
+    else:
+        cmd.extend(["--served-model-name", args.model])
 
-    print("-" * 80)
-    print("=" * 80)
+    if args.max_active_conversations:
+        cmd.extend(["--max-active-conversations", str(args.max_active_conversations)])
+
+    if args.max_num_requests:
+        cmd.extend(["--max-num-requests", str(args.max_num_requests)])
+
+    if args.max_turns:
+        cmd.extend(["--max-turns", str(args.max_turns)])
+
+    if args.warmup_step:
+        cmd.append("--warmup-step")
+
+    if args.verbose:
+        cmd.append("--verbose")
+
+    if args.excel_output:
+        cmd.append("--excel-output")
+
+    if output_file:
+        cmd.extend(["--output-file", str(output_file)])
+
+    print(f"Running ShareGPT multi-turn benchmark: {args.label}")
+    print(f"Command: {' '.join(cmd)}\n")
+
+    result = subprocess.run(cmd, text=True)
+
+    if result.returncode != 0:
+        print(f"Benchmark failed with return code {result.returncode}")
+        raise RuntimeError(f"Benchmark failed: {args.label}")
+
+    print(f"\n✓ Benchmark complete")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Benchmark vLLM server with ShareGPT dataset"
+        description="Benchmark vLLM server with ShareGPT dataset (multi-turn conversations)"
     )
     parser.add_argument(
         "--model",
         type=str,
         required=True,
-        help="Model name (e.g., meta-llama/Llama-3.1-8B)",
+        help="Model name or path (e.g., meta-llama/Llama-3.1-8B)",
+    )
+    parser.add_argument(
+        "--served-model-name",
+        type=str,
+        default=None,
+        help="Model name used in API (default: same as --model)",
     )
     parser.add_argument(
         "--host",
@@ -142,19 +197,43 @@ def main():
         "--dataset-path",
         type=str,
         default=None,
-        help="Path to ShareGPT dataset JSON file (if not provided, will auto-download to bench_results/)",
+        help="Path to ShareGPT dataset JSON file (if not provided, will auto-download)",
     )
     parser.add_argument(
-        "--num-prompts",
+        "--num-conversations",
         type=int,
         default=100,
-        help="Number of prompts to test (default: 100)",
+        help="Number of conversations to test (default: 50)",
+    )
+    parser.add_argument(
+        "--num-clients",
+        type=int,
+        default=2,
+        help="Number of parallel clients (default: 2)",
+    )
+    parser.add_argument(
+        "--max-active-conversations",
+        type=int,
+        default=None,
+        help="Max number of active conversations at a time (default: None)",
+    )
+    parser.add_argument(
+        "--max-num-requests",
+        type=int,
+        default=None,
+        help="Max number of requests to send (default: None)",
+    )
+    parser.add_argument(
+        "--max-turns",
+        type=int,
+        default=None,
+        help="Maximum number of turns per conversation (default: None, use all turns)",
     )
     parser.add_argument(
         "--request-rate",
         type=float,
-        default=10.0,
-        help="Request rate in requests/sec (default: 10.0)",
+        default=0.5,
+        help="Request rate per client in requests/sec (default: 0.0, no delay)",
     )
     parser.add_argument(
         "--seed",
@@ -163,10 +242,25 @@ def main():
         help="Random seed for reproducibility (default: 42)",
     )
     parser.add_argument(
+        "--warmup-step",
+        action="store_true",
+        help="Run warmup step before benchmark",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose output",
+    )
+    parser.add_argument(
+        "--excel-output",
+        action="store_true",
+        help="Export results to Excel file",
+    )
+    parser.add_argument(
         "--label",
         type=str,
-        default="sharegpt",
-        help="Label for this benchmark run (default: sharegpt)",
+        default="sharegpt_multiturn",
+        help="Label for this benchmark run (default: sharegpt_multiturn)",
     )
     parser.add_argument(
         "--output-dir",
@@ -182,43 +276,58 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = time.strftime("%Y%m%d-%H%M%S")
-    run_dir = output_dir / f"sharegpt_bench_{timestamp}"
+    run_dir = output_dir / f"sharegpt_multiturn_{timestamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # Handle dataset download
     if not args.dataset_path:
-        dataset_path = output_dir / "sharegpt_dataset.json"
+        dataset_path = output_dir / "sharegpt_raw.json"
         download_dataset(DEFAULT_DATASET_URL, dataset_path)
         args.dataset_path = str(dataset_path)
 
+    # Convert ShareGPT dataset to OpenAI format
+    converted_dataset_path = run_dir / "sharegpt_converted.json"
+    convert_sharegpt_dataset(
+        Path(args.dataset_path),
+        converted_dataset_path,
+        max_items=args.num_conversations,
+        seed=args.seed,
+    )
+
     print("\n" + "=" * 70)
-    print("SHAREGPT BENCHMARK")
+    print("SHAREGPT MULTI-TURN BENCHMARK")
     print("=" * 70)
-    print(f"Model:           {args.model}")
-    print(f"Server:          http://{args.host}:{args.port}")
-    print(f"Num Prompts:     {args.num_prompts}")
-    print(f"Request Rate:    {args.request_rate} req/s")
-    print(f"Random Seed:     {args.seed}")
-    print(f"Dataset Path:    {args.dataset_path}")
-    print(f"Results Dir:     {run_dir}")
+    print(f"Model:                    {args.model}")
+    print(f"Served Model Name:        {args.served_model_name or args.model}")
+    print(f"Server:                   http://{args.host}:{args.port}")
+    print(f"Num Conversations:        {args.num_conversations}")
+    print(f"Num Clients:              {args.num_clients}")
+    print(f"Max Active Conversations: {args.max_active_conversations or 'None'}")
+    print(f"Max Turns:                {args.max_turns or 'All'}")
+    print(f"Request Rate:             {args.request_rate} req/s per client")
+    print(f"Random Seed:              {args.seed}")
+    print(f"Raw Dataset:             {args.dataset_path}")
+    print(f"Converted Dataset:        {converted_dataset_path}")
+    print(f"Results Dir:              {run_dir}")
     print("=" * 70 + "\n")
 
     try:
         # Run benchmark
-        result_file = run_dir / f"{args.label}.json"
-        results = run_benchmark(args, result_file)
-
-        # Print summary
-        print_results(results, args)
+        output_file = run_dir / "conversations_output.json" if args.excel_output else None
+        run_benchmark(args, converted_dataset_path, output_file)
 
         print(f"\n✓ Results saved to: {run_dir}")
-        print(f"  Result file: {result_file}\n")
+        if output_file:
+            print(f"  Output conversations: {output_file}")
+        print()
 
     except KeyboardInterrupt:
         print("\nBenchmark interrupted by user")
         sys.exit(0)
     except Exception as e:
         print(f"Error running benchmark: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 
