@@ -4,7 +4,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use tracing::info;
+use bytesize::ByteSize;
+use tracing::{error, info};
 
 use crate::allocator::{Allocation, ScaledOffsetAllocator};
 use crate::metrics::core_metrics;
@@ -85,7 +86,15 @@ impl PinnedMemoryPool {
             Ok(None) => {
                 return None; // Pool exhausted, caller can retry after eviction
             }
-            Err(err) => panic!("Pinned memory allocation error: {}", err),
+            Err(err) => {
+                error!(
+                    requested_bytes = size.get(),
+                    "Pinned memory allocation error: {} (requested {})",
+                    err,
+                    ByteSize(size.get())
+                );
+                return None;
+            }
         };
 
         let metrics = core_metrics();

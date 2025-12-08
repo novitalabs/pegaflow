@@ -46,14 +46,6 @@ pub(crate) fn segment_offset(
     Ok(offset)
 }
 
-/// Calculate total block size (bytes_per_block * segments)
-pub(crate) fn block_size(registration: &KVCacheRegistration) -> Result<usize, String> {
-    registration
-        .bytes_per_block
-        .checked_mul(registration.segments)
-        .ok_or_else(|| "Block size overflow".to_string())
-}
-
 /// Check if the layout is contiguous (single segment or no stride)
 pub(crate) fn is_contiguous_layout(registration: &KVCacheRegistration) -> bool {
     registration.segments <= 1 || registration.kv_stride_bytes == registration.bytes_per_block
@@ -259,7 +251,7 @@ pub(crate) fn copy_block_gpu_to_cpu(
     dst_ptr: *mut u8,
 ) -> Result<(), String> {
     if is_contiguous_layout(registration) {
-        let size = block_size(registration)?;
+        let size = registration.block_size_bytes;
         let offset = segment_offset(registration, block_idx, 0)?;
         let buffer = unsafe { std::slice::from_raw_parts_mut(dst_ptr, size) };
         copy_gpu_to_cpu(registration.data_ptr, offset, buffer, size)
@@ -276,7 +268,7 @@ pub(crate) fn copy_block_cpu_to_gpu(
     stream: &CudaStream,
 ) -> Result<(), String> {
     if is_contiguous_layout(registration) {
-        let size = block_size(registration)?;
+        let size = registration.block_size_bytes;
         let offset = segment_offset(registration, block_idx, 0)?;
         let buffer = unsafe { std::slice::from_raw_parts(src_ptr, size) };
         copy_cpu_to_gpu_async(registration.data_ptr, offset, buffer, size, stream)

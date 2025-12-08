@@ -18,11 +18,12 @@ use crossbeam::sync::ShardedLock;
 //   sit back-to-back in those ranges. When K/V are co-located, V_ptr is None
 //   and the V bytes follow K in the same allocation.
 // ============================================================================
+use bytesize::ByteSize;
 use hashlink::LruCache;
 use std::fmt;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
-use tracing::{error, info};
+use tracing::{debug, error};
 
 use crate::metrics::core_metrics;
 use crate::pinned_pool::{PinnedAllocation, PinnedMemoryPool};
@@ -318,10 +319,10 @@ impl StorageEngine {
             } else {
                 let (used, total) = self.pinned_pool.usage();
                 error!(
-                    "Pinned memory pool exhausted! Requested: {:.2} MB, Used: {:.2} MB, Total: {:.2} MB, Cache empty",
-                    size.get() as f64 / 1e6,
-                    used as f64 / 1e6,
-                    total as f64 / 1e6
+                    "Pinned memory pool exhausted! Requested: {}, Used: {}, Total: {}, Cache empty",
+                    ByteSize(size.get() as u64),
+                    ByteSize(used),
+                    ByteSize(total)
                 );
                 core_metrics().pool_alloc_failures.add(1, &[]);
                 return None;
@@ -344,8 +345,8 @@ impl StorageEngine {
             freed_entries += 1;
         }
 
-        info!("Reclaimed {} blocks from cache", freed_entries);
         if freed_entries > 0 {
+            debug!(freed_entries, "Reclaimed blocks from cache");
             core_metrics()
                 .cache_block_evictions
                 .add(freed_entries as u64, &[]);
@@ -399,12 +400,14 @@ impl StorageEngine {
     ) -> Result<Vec<Arc<Block>>, String> {
         let mut cache = self.kv_storage.lock().unwrap();
         let mut result = Vec::with_capacity(block_hashes.len());
-        for hash in block_hashes {
+        for (idx, hash) in block_hashes.iter().enumerate() {
             let key = BlockKey::new(namespace.to_string(), hash.clone());
-            let shard_blocks = cache
-                .get(&key)
-                .cloned()
-                .ok_or_else(|| "Missing KV block hash".to_string())?;
+            let shard_blocks = cache.get(&key).cloned().ok_or_else(|| {
+                format!(
+                    "missing KV block hash at index {idx} (namespace={namespace}, hash_len={})",
+                    hash.len()
+                )
+            })?;
             result.push(shard_blocks);
         }
         Ok(result)

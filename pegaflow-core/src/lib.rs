@@ -37,7 +37,7 @@ use std::{
     num::NonZeroU64,
     sync::{Arc, Mutex, RwLock},
 };
-use tracing::{debug, info, instrument};
+use tracing::{debug, error, info, instrument};
 
 use crate::metrics::core_metrics;
 use crate::storage::{LayerBlock, StorageEngine};
@@ -92,6 +92,7 @@ pub struct KVCacheRegistration {
     pub size_bytes: usize,
     pub num_blocks: usize,
     pub bytes_per_block: usize,
+    pub block_size_bytes: usize,
     /// Distance in bytes between K and V segments when KV-first layout is used.
     /// Zero when the layout stores a single segment per block.
     pub kv_stride_bytes: usize,
@@ -327,6 +328,7 @@ impl PegaEngine {
     #[instrument(
         level = "debug",
         skip(self),
+        err,
         fields(instance=%instance_id, rank=%tp_rank, device=%device_id, layer=%layer_name)
     )]
     pub fn register_context_layer(
@@ -350,10 +352,61 @@ impl PegaEngine {
                 "invalid KV cache layout for layer {layer_name}"
             )));
         }
+        if segments > 1 && kv_stride_bytes == 0 {
+            return Err(EngineError::InvalidArgument(format!(
+                "kv_stride_bytes must be > 0 when segments > 1 for layer {layer_name}"
+            )));
+        }
         if device_id < 0 {
             return Err(EngineError::InvalidArgument(
                 "device_id must be >= 0".to_string(),
             ));
+        }
+
+        // Validate block sizing/strides up front to avoid runtime overflows
+        let block_size_bytes = bytes_per_block.checked_mul(segments).ok_or_else(|| {
+            EngineError::InvalidArgument(format!(
+                "block size overflow: bytes_per_block={} segments={} for layer {layer_name}",
+                bytes_per_block, segments
+            ))
+        })?;
+
+        // Compute maximum offset + block size for the last segment of the last block
+        let max_block_offset = num_blocks
+            .checked_sub(1)
+            .and_then(|idx| idx.checked_mul(bytes_per_block))
+            .ok_or_else(|| {
+                EngineError::InvalidArgument(format!(
+                    "num_blocks {} too large for layer {layer_name}",
+                    num_blocks
+                ))
+            })?;
+        let max_segment_offset = segments
+            .checked_sub(1)
+            .and_then(|idx| idx.checked_mul(kv_stride_bytes))
+            .ok_or_else(|| {
+                EngineError::InvalidArgument(format!(
+                    "segments/stride overflow for layer {layer_name} (segments={}, stride={})",
+                    segments, kv_stride_bytes
+                ))
+            })?;
+
+        let max_offset = max_block_offset
+            .checked_add(max_segment_offset)
+            .ok_or_else(|| {
+                EngineError::InvalidArgument(format!(
+                    "layout offset overflow for layer {layer_name}"
+                ))
+            })?;
+        let end = max_offset.checked_add(bytes_per_block).ok_or_else(|| {
+            EngineError::InvalidArgument(format!("layout end overflow for layer {layer_name}"))
+        })?;
+        if end > size_bytes {
+            return Err(EngineError::InvalidArgument(format!(
+                "registered memory too small for layer {layer_name}: need at least {} bytes, got {}",
+                end,
+                size_bytes
+            )));
         }
 
         let instance = self.get_or_create_instance(instance_id, namespace, num_layers, tp_size)?;
@@ -367,6 +420,7 @@ impl PegaEngine {
             size_bytes,
             num_blocks,
             bytes_per_block,
+            block_size_bytes,
             kv_stride_bytes,
             segments,
         };
@@ -376,7 +430,7 @@ impl PegaEngine {
     }
 
     /// Unregister instance
-    #[instrument(level = "info", skip(self))]
+    #[instrument(level = "info", skip(self), err)]
     pub fn unregister_instance(&self, instance_id: &str) -> Result<(), EngineError> {
         let removed = self
             .instances
@@ -398,6 +452,7 @@ impl PegaEngine {
     #[instrument(
         level = "debug",
         skip(self, saves),
+        err,
         fields(instance=%instance_id, rank=%tp_rank, device=%device_id, layers=%saves.len())
     )]
     pub fn batch_save_kv_blocks_from_ipc(
@@ -427,6 +482,7 @@ impl PegaEngine {
     #[instrument(
         level = "debug",
         skip(self, block_ids, block_hashes),
+        err,
         fields(instance=%instance_id, rank=%tp_rank, device=%device_id, layer=%layer_name, blocks=%block_ids.len())
     )]
     pub fn save_kv_blocks_from_ipc(
@@ -521,20 +577,16 @@ impl PegaEngine {
             blocks_to_save.len()
         );
 
-        let block_size = transfer::block_size(&registration).unwrap();
+        let block_size = registration.block_size_bytes;
         let num_blocks = blocks_to_save.len();
-        let num_blocks_u64 = u64::try_from(num_blocks).expect("num_blocks should fit within u64");
-
         // For layer-first layout with KV stride, allocate separate regions for K and V
         if registration.segments == 2 && registration.kv_stride_bytes > registration.bytes_per_block
         {
             let segment_size = registration.bytes_per_block;
-            let segment_size_u64 =
-                u64::try_from(segment_size).expect("segment size should fit within u64");
-            let k_total_size = segment_size_u64
-                .checked_mul(num_blocks_u64)
+            let k_total_size = (segment_size as u64)
+                .checked_mul(num_blocks as u64)
                 .and_then(NonZeroU64::new)
-                .expect("allocation size overflow or zero");
+                .expect("allocation size overflow for K segments in layer {layer_name}");
             let v_total_size = k_total_size;
 
             // Allocate separate regions for K and V segments
@@ -543,25 +595,43 @@ impl PegaEngine {
                     "pinned pool exhausted while allocating K segment buffer".to_string(),
                 )
             })?;
+
             let mut v_allocation = self.storage.allocate(v_total_size).ok_or_else(|| {
                 EngineError::Storage(
                     "pinned pool exhausted while allocating V segment buffer".to_string(),
                 )
             })?;
-            let k_base_ptr = Arc::get_mut(&mut k_allocation)
-                .expect("allocation should be unique before cloning")
-                .as_mut_ptr();
-            let v_base_ptr = Arc::get_mut(&mut v_allocation)
-                .expect("allocation should be unique before cloning")
-                .as_mut_ptr();
+
+            // SAFETY: The allocation just created in this scope is not shared with other
+            // threads, so it is safe to get the mutable pointer here *once*, before any
+            // Arc::clone is created.
+            let (k_base_ptr, v_base_ptr) = {
+                let k_ptr = Arc::get_mut(&mut k_allocation)
+                    .expect("k_allocation must be uniquely owned here")
+                    .as_mut_ptr();
+                let v_ptr = Arc::get_mut(&mut v_allocation)
+                    .expect("v_allocation must be uniquely owned here")
+                    .as_mut_ptr();
+                (k_ptr, v_ptr)
+            };
 
             // Calculate GPU offsets for batching
             let mut k_offsets_with_idx = Vec::with_capacity(num_blocks);
             let mut v_offsets_with_idx = Vec::with_capacity(num_blocks);
 
             for (i, (block_idx, _)) in blocks_to_save.iter().enumerate() {
-                let k_offset = transfer::segment_offset(&registration, *block_idx, 0).unwrap();
-                let v_offset = transfer::segment_offset(&registration, *block_idx, 1).unwrap();
+                let k_offset =
+                    transfer::segment_offset(&registration, *block_idx, 0).map_err(|e| {
+                        EngineError::Storage(format!(
+                            "invalid K offset for layer {layer_name} block {block_idx}: {e}"
+                        ))
+                    })?;
+                let v_offset =
+                    transfer::segment_offset(&registration, *block_idx, 1).map_err(|e| {
+                        EngineError::Storage(format!(
+                            "invalid V offset for layer {layer_name} block {block_idx}: {e}"
+                        ))
+                    })?;
                 k_offsets_with_idx.push((k_offset, i));
                 v_offsets_with_idx.push((v_offset, i));
             }
@@ -573,7 +643,11 @@ impl PegaEngine {
                 segment_size,
                 &registration,
             )
-            .unwrap();
+            .map_err(|e| {
+                EngineError::Storage(format!(
+                    "failed to copy K segments for layer {layer_name}: {e}"
+                ))
+            })?;
 
             // Batch copy V segments
             transfer::batch_copy_segments(
@@ -582,7 +656,11 @@ impl PegaEngine {
                 segment_size,
                 &registration,
             )
-            .unwrap();
+            .map_err(|e| {
+                EngineError::Storage(format!(
+                    "failed to copy V segments for layer {layer_name}: {e}"
+                ))
+            })?;
 
             // Create LayerBlock objects after all copying is done
             for (i, (_, block_hash)) in blocks_to_save.into_iter().enumerate() {
@@ -605,25 +683,44 @@ impl PegaEngine {
             }
         } else {
             // Original logic for contiguous or single-segment layouts
-            let block_size_u64 =
-                u64::try_from(block_size).expect("block size should fit within u64");
+            let block_size_u64 = u64::try_from(block_size).map_err(|_| {
+                EngineError::Storage(format!(
+                    "block size {} exceeds supported range for layer {layer_name}",
+                    block_size
+                ))
+            })?;
             let total_size = block_size_u64
-                .checked_mul(num_blocks_u64)
+                .checked_mul(num_blocks as u64)
                 .and_then(NonZeroU64::new)
-                .expect("allocation size overflow or zero");
+                .ok_or_else(|| {
+                    EngineError::Storage(format!(
+                        "allocation size overflow while saving layer {layer_name}"
+                    ))
+                })?;
             let mut allocation = self.storage.allocate(total_size).ok_or_else(|| {
                 EngineError::Storage(
                     "pinned pool exhausted while allocating contiguous block buffer".to_string(),
                 )
             })?;
             let base_ptr = Arc::get_mut(&mut allocation)
-                .expect("allocation should be unique before cloning")
+                .ok_or_else(|| {
+                    EngineError::Storage(format!(
+                        "allocation shared unexpectedly while saving layer {layer_name}"
+                    ))
+                })?
                 .as_mut_ptr();
 
             // Copy blocks and create LayerBlock objects
             for (i, (block_idx, block_hash)) in blocks_to_save.into_iter().enumerate() {
                 let cpu_ptr = unsafe { base_ptr.add(i * block_size) };
-                transfer::copy_block_gpu_to_cpu(&registration, block_idx, cpu_ptr).unwrap();
+                transfer::copy_block_gpu_to_cpu(&registration, block_idx, cpu_ptr).map_err(
+                    |e| {
+                        EngineError::Storage(format!(
+                            "failed to copy block {} for layer {layer_name} to CPU: {e}",
+                            block_idx
+                        ))
+                    },
+                )?;
 
                 let block = Arc::new(LayerBlock::new_contiguous(
                     cpu_ptr,
@@ -663,6 +760,7 @@ impl PegaEngine {
     #[instrument(
         level = "debug",
         skip(self, block_hashes),
+        err,
         fields(instance=%instance_id, requested = %block_hashes.len()),
         ret
     )]
@@ -713,6 +811,7 @@ impl PegaEngine {
     #[instrument(
         level = "debug",
         skip(self, block_ids, block_hashes),
+        err,
         fields(instance=%instance_id, rank=%tp_rank, device=%device_id, layers=%layer_names.len(), blocks=%block_ids.len())
     )]
     pub fn batch_load_kv_blocks_multi_layer(
@@ -745,129 +844,180 @@ impl PegaEngine {
         let layer_names: Vec<String> = layer_names.iter().map(|s| s.to_string()).collect();
         let block_ids = block_ids.to_vec();
         let metrics = core_metrics();
+        let instance_id_owned = instance_id.to_string();
 
         // Spawn background thread to do all work
         std::thread::spawn(move || {
-            let start = std::time::Instant::now();
-            let stream = worker.stream();
-            let mut total_bytes = 0usize;
-            let mut total_blocks = 0usize;
+            let load_result: Result<(), EngineError> = (|| {
+                let start = std::time::Instant::now();
+                let stream = worker.stream();
+                let mut total_bytes = 0usize;
+                let mut total_blocks = 0usize;
 
-            for layer_name in &layer_names {
-                let layer_id = instance.get_layer_id(layer_name).unwrap();
+                for layer_name in &layer_names {
+                    let layer_id = instance.get_layer_id(layer_name).ok_or_else(|| {
+                        EngineError::InvalidArgument(format!(
+                            "layer {layer_name} unknown for instance {instance_id_owned}"
+                        ))
+                    })?;
 
-                let registration = worker.get_registration(layer_name).unwrap();
+                    let registration = worker.get_registration(layer_name).ok_or_else(|| {
+                        EngineError::InvalidArgument(format!(
+                            "layer {layer_name} not registered on device {}",
+                            worker._device_id
+                        ))
+                    })?;
 
-                let slot_id = instance.get_slot_index(layer_id, tp_rank).unwrap();
+                    let slot_id = instance.get_slot_index(layer_id, tp_rank)?;
 
-                // Collect valid blocks to load for this layer
-                let blocks_to_load: Vec<_> = block_ids
-                    .iter()
-                    .zip(block_cache.iter())
-                    .filter_map(|(block_id, block_entry)| {
-                        let block_idx = *block_id as usize;
-                        block_entry
-                            .get_slot(slot_id)
-                            .map(|block| (block_idx, block))
-                    })
-                    .collect();
-
-                if blocks_to_load.is_empty() {
-                    continue;
-                }
-
-                if registration.segments == 2
-                    && registration.kv_stride_bytes > registration.bytes_per_block
-                {
-                    // Optimized path for layer-first layout with KV stride
-                    let segment_size = registration.bytes_per_block;
-
-                    let (k_transfers, v_transfers): (Vec<_>, Vec<_>) = blocks_to_load
+                    // Collect valid blocks to load for this layer
+                    let blocks_to_load: Vec<_> = block_ids
                         .iter()
-                        .map(|(block_idx, block)| {
+                        .zip(block_cache.iter())
+                        .filter_map(|(block_id, block_entry)| {
+                            let Ok(block_idx) = usize::try_from(*block_id) else {
+                                return None;
+                            };
+                            block_entry
+                                .get_slot(slot_id)
+                                .map(|block| (block_idx, block))
+                        })
+                        .collect();
+
+                    if blocks_to_load.is_empty() {
+                        continue;
+                    }
+
+                    if registration.segments == 2
+                        && registration.kv_stride_bytes > registration.bytes_per_block
+                    {
+                        // Optimized path for layer-first layout with KV stride
+                        let segment_size = registration.bytes_per_block;
+
+                        let mut k_transfers = Vec::with_capacity(blocks_to_load.len());
+                        let mut v_transfers = Vec::with_capacity(blocks_to_load.len());
+                        for (block_idx, block) in &blocks_to_load {
                             let k_gpu_offset =
-                                transfer::segment_offset(&registration, *block_idx, 0)
-                                    .expect("K segment offset should be valid");
+                                transfer::segment_offset(&registration, *block_idx, 0).map_err(
+                                    |e| {
+                                        EngineError::Storage(format!(
+                                    "invalid K offset for layer {layer_name} block {block_idx}: {e}"
+                                ))
+                                    },
+                                )?;
                             let v_gpu_offset =
-                                transfer::segment_offset(&registration, *block_idx, 1)
-                                    .expect("V segment offset should be valid");
+                                transfer::segment_offset(&registration, *block_idx, 1).map_err(
+                                    |e| {
+                                        EngineError::Storage(format!(
+                                    "invalid V offset for layer {layer_name} block {block_idx}: {e}"
+                                ))
+                                    },
+                                )?;
 
                             let k_cpu_ptr = block.k_ptr();
                             let v_cpu_ptr = block
                                 .v_ptr()
                                 .unwrap_or_else(|| unsafe { k_cpu_ptr.add(segment_size) });
 
-                            ((k_gpu_offset, k_cpu_ptr), (v_gpu_offset, v_cpu_ptr))
-                        })
-                        .unzip();
+                            k_transfers.push((k_gpu_offset, k_cpu_ptr));
+                            v_transfers.push((v_gpu_offset, v_cpu_ptr));
+                        }
 
-                    transfer::batch_copy_segments_to_gpu(
-                        &k_transfers,
-                        segment_size,
-                        &registration,
-                        &stream,
-                    )
-                    .expect("K segment batch copy should succeed");
-                    transfer::batch_copy_segments_to_gpu(
-                        &v_transfers,
-                        segment_size,
-                        &registration,
-                        &stream,
-                    )
-                    .expect("V segment batch copy should succeed");
-
-                    total_bytes += blocks_to_load.len() * segment_size * 2;
-                    total_blocks += blocks_to_load.len();
-                } else {
-                    // Contiguous or single-segment layouts
-                    for (block_idx, block) in &blocks_to_load {
-                        transfer::copy_block_cpu_to_gpu(
+                        transfer::batch_copy_segments_to_gpu(
+                            &k_transfers,
+                            segment_size,
                             &registration,
-                            *block_idx,
-                            block.k_ptr(),
                             &stream,
                         )
-                        .expect("LayerBlock copy should succeed");
-                        total_bytes += block.size();
+                        .map_err(|e| {
+                            EngineError::Storage(format!(
+                                "failed to copy K segments for layer {layer_name}: {e}"
+                            ))
+                        })?;
+                        transfer::batch_copy_segments_to_gpu(
+                            &v_transfers,
+                            segment_size,
+                            &registration,
+                            &stream,
+                        )
+                        .map_err(|e| {
+                            EngineError::Storage(format!(
+                                "failed to copy V segments for layer {layer_name}: {e}"
+                            ))
+                        })?;
+
+                        total_bytes += blocks_to_load.len() * segment_size * 2;
+                        total_blocks += blocks_to_load.len();
+                    } else {
+                        // Contiguous or single-segment layouts
+                        for (block_idx, block) in &blocks_to_load {
+                            transfer::copy_block_cpu_to_gpu(
+                                &registration,
+                                *block_idx,
+                                block.k_ptr(),
+                                &stream,
+                            )
+                            .map_err(|e| {
+                                EngineError::Storage(format!(
+                                    "failed to copy block {} for layer {layer_name} to GPU: {e}",
+                                    block_idx
+                                ))
+                            })?;
+                            total_bytes += block.size();
+                        }
+                        total_blocks += blocks_to_load.len();
                     }
-                    total_blocks += blocks_to_load.len();
                 }
-            }
 
-            // Record event and wait for all transfers
-            let final_event = stream
-                .record_event(None)
-                .expect("failed to record final event");
+                // Record event and wait for all transfers
+                let final_event = stream.record_event(None).map_err(|e| {
+                    EngineError::Storage(format!(
+                        "failed to record final CUDA event for instance {instance_id_owned}: {e:?}"
+                    ))
+                })?;
 
-            if let Err(e) = final_event.synchronize() {
-                info!("Failed to sync final event: {:?}", e);
+                final_event.synchronize().map_err(|e| {
+                    EngineError::Storage(format!(
+                        "failed to synchronize transfers for instance {instance_id_owned}: {e:?}"
+                    ))
+                })?;
+
+                let elapsed = start.elapsed();
+                let bandwidth_gbps = if elapsed.as_secs_f64() > 0.0 {
+                    (total_bytes as f64 / 1e9) / elapsed.as_secs_f64()
+                } else {
+                    0.0
+                };
+
+                if total_blocks > 0 {
+                    metrics.load_bytes.add(total_bytes as u64, &[]);
+                    metrics
+                        .load_duration_ms
+                        .record(elapsed.as_secs_f64() * 1000.0, &[]);
+                }
+
+                info!(
+                    "Transfers complete: {} blocks, {:.2} MB in {:?} ({:.2} GB/s)",
+                    total_blocks,
+                    total_bytes as f64 / 1e6,
+                    elapsed,
+                    bandwidth_gbps
+                );
+                load_state.set_completed();
+                Ok(())
+            })();
+
+            if let Err(err) = load_result {
+                error!(
+                    ?err,
+                    instance=%instance_id_owned,
+                    device=%device_id,
+                    rank=%tp_rank,
+                    "Batch load failed"
+                );
                 metrics.load_failures.add(1, &[]);
                 load_state.set_error();
-                return;
             }
-
-            let elapsed = start.elapsed();
-            let bandwidth_gbps = if elapsed.as_secs_f64() > 0.0 {
-                (total_bytes as f64 / 1e9) / elapsed.as_secs_f64()
-            } else {
-                0.0
-            };
-
-            if total_blocks > 0 {
-                metrics.load_bytes.add(total_bytes as u64, &[]);
-                metrics
-                    .load_duration_ms
-                    .record(elapsed.as_secs_f64() * 1000.0, &[]);
-            }
-
-            info!(
-                "Transfers complete: {} blocks, {:.2} MB in {:?} ({:.2} GB/s)",
-                total_blocks,
-                total_bytes as f64 / 1e6,
-                elapsed,
-                bandwidth_gbps
-            );
-            load_state.set_completed();
         });
 
         Ok(())

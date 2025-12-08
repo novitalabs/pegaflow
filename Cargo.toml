@@ -34,6 +34,7 @@ opentelemetry_sdk = { version = "0.31.0", features = [
   "metrics",
   "rt-tokio-current-thread",
 ] }
+bytesize = "2.3.1"
 
 # HTTP/Web
 axum = "0.7"
