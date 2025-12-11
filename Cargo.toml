@@ -55,3 +55,5 @@ pyo3-build-config = { version = "0.22", features = ["resolve-config"] }
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 # Dev dependencies
 criterion = "0.5"
+
+tikv-jemallocator = "0.6.1"

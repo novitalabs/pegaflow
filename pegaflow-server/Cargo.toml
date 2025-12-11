@@ -24,6 +24,7 @@ uuid.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 opentelemetry-otlp.workspace = true
+tikv-jemallocator.workspace = true
 
 [build-dependencies]
 tonic-prost-build = "0.14"

@@ -13,4 +13,5 @@ pegaflow-core.workspace = true
 tracing-subscriber.workspace = true
 tokio.workspace = true
 tonic.workspace = true
+tracing.workspace = true
 pegaflow-server = { path = "../pegaflow-server" }

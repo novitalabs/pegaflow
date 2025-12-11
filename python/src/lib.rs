@@ -7,10 +7,11 @@ use pyo3::{exceptions::PyRuntimeError, prelude::*};
 use std::{
     future::Future,
     sync::{Arc, Once, OnceLock},
+    time::Duration,
 };
-use tokio::runtime::Runtime;
+use tokio::runtime::{Handle, Runtime};
 use tonic::{
-    transport::{Channel, Error as TransportError},
+    transport::{Channel, Endpoint},
     Status as GrpcStatus,
 };
 use tracing_subscriber::{
@@ -60,7 +61,7 @@ fn runtime_creation_error(err: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(format!("failed to create Tokio runtime: {err}"))
 }
 
-fn transport_connect_error(endpoint: &str, err: TransportError) -> PyErr {
+fn transport_connect_error(endpoint: &str, err: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(format!(
         "failed to connect to engine server at {endpoint}: {err}"
     ))
@@ -93,7 +94,8 @@ struct PegaEngine {
 #[pyclass]
 struct EngineRpcClient {
     endpoint: String,
-    channel: Channel,
+    client: EngineClient<Channel>,
+    rt_handle: Handle,
 }
 
 impl EngineRpcClient {
@@ -108,13 +110,11 @@ impl EngineRpcClient {
         Fut: Future<Output = Result<T, GrpcStatus>> + Send,
         T: Send,
     {
-        let channel = self.channel.clone();
+        let rt_handle = self.rt_handle.clone();
+        let client = self.client.clone();
         py.allow_threads(move || {
-            let rt = get_runtime()?;
-            rt.block_on(async move {
-                let client = EngineClient::new(channel);
-                f(client).await.map_err(|e| rpc_status_error("rpc", e))
-            })
+            rt_handle
+                .block_on(async move { f(client).await.map_err(|e| rpc_status_error("rpc", e)) })
         })
     }
 }
@@ -332,10 +332,26 @@ impl EngineRpcClient {
     fn new(endpoint: Option<String>) -> PyResult<Self> {
         let endpoint = endpoint.unwrap_or_else(|| "http://127.0.0.1:50055".to_string());
         let rt = get_runtime()?;
+
+        // Avoid per-RPC overhead by eager-connecting and reusing a warmed client handle.
+        let endpoint_cfg = Endpoint::from_shared(endpoint.clone())
+            .map_err(|err| transport_connect_error(&endpoint, err))?
+            .connect_timeout(Duration::from_millis(500))
+            .tcp_nodelay(true)
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .keep_alive_while_idle(true);
+
         let channel = rt
-            .block_on(Channel::from_shared(endpoint.clone()).unwrap().connect())
+            .block_on(endpoint_cfg.connect())
             .map_err(|err| transport_connect_error(&endpoint, err))?;
-        Ok(Self { endpoint, channel })
+        let client = EngineClient::new(channel);
+        let rt_handle = rt.handle().clone();
+
+        Ok(Self {
+            endpoint,
+            client,
+            rt_handle,
+        })
     }
 
     /// Return the configured endpoint.

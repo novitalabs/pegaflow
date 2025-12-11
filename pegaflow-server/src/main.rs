@@ -14,10 +14,20 @@ use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+
 use tokio::sync::Notify;
 use tonic::transport::Server;
 use tracing::{error, info};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{
+    fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter,
+};
+
+#[cfg(not(target_env = "msvc"))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
 
 use utils::parse_memory_size;
 
@@ -47,15 +57,16 @@ struct Cli {
     /// Period (seconds) for exporting OTLP metrics (only used when endpoint is set).
     #[arg(long, default_value_t = 5)]
     metrics_period_secs: u64,
+
+    /// Log level (trace, debug, info, warn, error)
+    #[arg(long, default_value = "info")]
+    log_level: String,
 }
 
-fn init_tracing() {
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        "info,pegaflow_server=info,pegaflow_core=info"
-            .parse()
-            .unwrap()
-    });
-    let fmt_layer = tracing_subscriber::fmt::layer();
+fn init_tracing(log_level: &str) {
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| log_level.parse().unwrap());
+    let fmt_layer = tracing_subscriber::fmt::layer().with_span_events(FmtSpan::CLOSE);
     let _ = tracing_subscriber::registry()
         .with(env_filter)
         .with(fmt_layer)
@@ -121,8 +132,8 @@ fn init_metrics(
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    init_tracing();
     let cli = Cli::parse();
+    init_tracing(&cli.log_level);
 
     // Initialize CUDA in the main thread before starting Tokio runtime
     init_cuda_driver()?;
