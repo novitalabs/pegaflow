@@ -372,22 +372,32 @@ class WorkerConnector:
             saves_list = [(name, ids, hashes)
                           for name, (ids, hashes) in saves_by_layer.items()]
 
-            ok, message = self._ctx.engine_client.save(
-                self._ctx.instance_id,
-                self._ctx.tp_rank,
-                self._ctx.device_id,
-                saves_list,
-            )
+            try:
+                ok, message = self._ctx.engine_client.save(
+                    self._ctx.instance_id,
+                    self._ctx.tp_rank,
+                    self._ctx.device_id,
+                    saves_list,
+                )
 
-            if not ok:
-                raise RuntimeError(f"Save batch failed: {message}")
+                if not ok:
+                    logger.error(
+                        "[PegaKVConnector] Save batch failed: %s (continuing without save)",
+                        message,
+                    )
+                else:
+                    logger.debug(
+                        "[PegaKVConnector] Batch saved %d layers, %d total blocks",
+                        len(saves_list),
+                        sum(len(ids) for _, ids, _ in saves_list),
+                    )
+            except Exception as e:
+                logger.error(
+                    "[PegaKVConnector] Save RPC exception: %s (continuing without save)",
+                    e,
+                )
 
-            logger.debug(
-                "[PegaKVConnector] Batch saved %d layers, %d total blocks",
-                len(saves_list),
-                sum(len(ids) for _, ids, _ in saves_list),
-            )
-
+        # Always decrement layer counter to release blocks, even if save failed
         self._decrement_layer_counter(all_request_ids)
 
     def _decrement_layer_counter(self, request_ids: list[str]) -> None:
