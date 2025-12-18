@@ -160,7 +160,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let service = GrpcEngineService::new(engine, Arc::clone(&registry), Arc::clone(&shutdown));
 
     // Now create and start Tokio runtime after CUDA initialization
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    // Using multi-thread runtime since GPU operations now run in dedicated worker threads
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
 

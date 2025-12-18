@@ -112,52 +112,6 @@ pub(crate) fn copy_cpu_to_gpu_async(
     Ok(())
 }
 
-/// Batch copy segments from GPU to CPU by finding and merging contiguous ranges
-pub(crate) fn batch_copy_segments(
-    offsets_with_idx: &[(usize, usize)],
-    base_ptr: *mut u8,
-    segment_size: usize,
-    registration: &KVCacheRegistration,
-) -> Result<(), String> {
-    let total_segments = offsets_with_idx.len();
-    let mut batch_count = 0;
-    let mut i = 0;
-
-    while i < offsets_with_idx.len() {
-        let (start_offset, start_idx) = offsets_with_idx[i];
-        let mut _end_idx = start_idx;
-        let mut count = 1;
-
-        // Find contiguous range
-        for j in i + 1..offsets_with_idx.len() {
-            let (offset, idx) = offsets_with_idx[j];
-            if offset == start_offset + count * segment_size {
-                _end_idx = idx;
-                count += 1;
-            } else {
-                break;
-            }
-        }
-
-        // Perform batch copy for this contiguous range
-        let total_size = count * segment_size;
-        let cpu_ptr = unsafe { base_ptr.add(start_idx * segment_size) };
-        let buffer = unsafe { std::slice::from_raw_parts_mut(cpu_ptr, total_size) };
-        copy_gpu_to_cpu(registration.data_ptr, start_offset, buffer, total_size)?;
-
-        batch_count += 1;
-        i += count;
-    }
-
-    debug!(
-        "GPU->CPU batch copy: {} segments -> {} batches ({}x reduction)",
-        total_segments,
-        batch_count,
-        total_segments as f32 / batch_count as f32
-    );
-
-    Ok(())
-}
 
 /// Batch copy segments from CPU to GPU by finding and merging contiguous ranges
 pub(crate) fn batch_copy_segments_to_gpu(

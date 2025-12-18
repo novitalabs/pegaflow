@@ -18,6 +18,12 @@ pub struct PinnedAllocation {
     pool: Arc<PinnedMemoryPool>,
 }
 
+// SAFETY: PinnedAllocation points to CUDA pinned memory which is fixed in physical
+// memory and safe to access from any thread. The NonNull<u8> is just a pointer to
+// this pinned memory region.
+unsafe impl Send for PinnedAllocation {}
+unsafe impl Sync for PinnedAllocation {}
+
 impl PinnedAllocation {
     /// Get a const pointer to the allocated memory
     pub fn as_ptr(&self) -> *const u8 {

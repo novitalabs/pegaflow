@@ -190,70 +190,7 @@ impl PegaEngine {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
-    /// Save KV blocks from GPU via IPC handle to CPU memory
-    ///
-    /// Args:
-    ///     instance_id: ID of the model instance
-    ///     tp_rank: Tensor Parallel rank of the worker
-    ///     device_id: CUDA device ID of the worker
-    ///     layer_name: Name of the layer
-    ///     block_ids: GPU block IDs to copy (list of ints)
-    ///     block_hashes: Content hashes for each block (list of bytes)
-    fn save_kv_blocks_from_ipc(
-        &self,
-        py: Python<'_>,
-        instance_id: &str,
-        tp_rank: usize,
-        device_id: i32,
-        layer_name: String,
-        block_ids: Vec<i32>,
-        block_hashes: Vec<Vec<u8>>,
-    ) -> PyResult<()> {
-        let instance_id_owned = instance_id.to_string();
-        let layer_name_owned = layer_name;
-        let engine = &self.engine;
-        py.detach(move || {
-            engine.save_kv_blocks_from_ipc(
-                &instance_id_owned,
-                tp_rank,
-                device_id,
-                &layer_name_owned,
-                block_ids,
-                block_hashes,
-            )
-        })
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-    }
 
-    /// Batch save KV blocks from multiple layers.
-    ///
-    /// This is more efficient than calling save_kv_blocks_from_ipc in a loop
-    /// as it reduces Python-Rust boundary crossings and allows batching
-    /// multiple layer saves into a single call.
-    ///
-    /// Args:
-    ///     instance_id: ID of the model instance
-    ///     tp_rank: Tensor Parallel rank of the worker
-    ///     device_id: CUDA device ID of the worker
-    ///     saves: List of dicts, each with keys:
-    ///         - layer_name: Name of the layer (str)
-    ///         - block_ids: GPU block IDs to copy (list of ints)
-    ///         - block_hashes: Content hashes for each block (list of bytes)
-    fn batch_save_kv_blocks_from_ipc(
-        &self,
-        py: Python<'_>,
-        instance_id: &str,
-        tp_rank: usize,
-        device_id: i32,
-        saves: Vec<(String, Vec<i32>, Vec<Vec<u8>>)>,
-    ) -> PyResult<()> {
-        let instance_id_owned = instance_id.to_string();
-        let engine = &self.engine;
-        py.detach(move || {
-            engine.batch_save_kv_blocks_from_ipc(&instance_id_owned, tp_rank, device_id, saves)
-        })
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-    }
 
     /// Count how many blocks from the prefix are available in CPU storage
     ///

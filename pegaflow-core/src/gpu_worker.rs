@@ -1,0 +1,385 @@
+use std::sync::Arc;
+
+use cudarc::driver::{CudaContext, CudaStream};
+use tokio::sync::{mpsc, oneshot};
+use tracing::{debug, error, info, instrument};
+
+use crate::metrics::core_metrics;
+use crate::storage::LayerBlock;
+use crate::sync_state::LoadState;
+use crate::{transfer, EngineError, KVCacheRegistration};
+
+/// A task to load KV blocks from CPU to GPU for multiple layers
+pub struct LoadTask {
+    pub layers: Vec<LayerLoadData>,
+    pub load_state_shm: String,
+}
+
+/// Data for loading a single layer
+pub struct LayerLoadData {
+    pub layer_name: String,
+    pub registration: KVCacheRegistration,
+    pub blocks: Vec<LoadBlock>,
+}
+
+pub struct LoadBlock {
+    pub block_idx: usize,
+    pub layer_block: Arc<LayerBlock>,
+}
+
+/// A task to save KV blocks from GPU to CPU
+/// Caller pre-allocates pinned memory, worker does the GPU->CPU copy
+pub struct SaveTask {
+    pub registration: KVCacheRegistration,
+    pub blocks: Vec<SaveBlock>,
+    pub reply: oneshot::Sender<Result<(), EngineError>>,
+}
+
+pub struct SaveBlock {
+    pub block_idx: usize,
+    /// Pre-allocated K segment destination pointer (pinned memory)
+    pub k_dst_ptr: *mut u8,
+    /// Pre-allocated V segment destination pointer (pinned memory), if split layout
+    pub v_dst_ptr: Option<*mut u8>,
+}
+
+// SAFETY: SaveBlock contains raw pointers to pinned memory that is managed
+// by PinnedAllocation. The caller ensures the backing memory stays alive
+// until the task completes.
+unsafe impl Send for SaveBlock {}
+
+/// Per-GPU worker pool with dedicated load and save threads
+pub struct GpuWorkerPool {
+    device_id: i32,
+    load_tx: mpsc::UnboundedSender<LoadTask>,
+    save_tx: mpsc::UnboundedSender<SaveTask>,
+}
+
+impl GpuWorkerPool {
+    /// Spawn a new worker pool for the given GPU device
+    #[instrument(level = "info", fields(device = device_id))]
+    pub fn spawn(device_id: i32) -> Result<Self, EngineError> {
+        let (load_tx, load_rx) = mpsc::unbounded_channel();
+        let (save_tx, save_rx) = mpsc::unbounded_channel();
+
+        // Spawn load worker thread
+        let load_device_id = device_id;
+        std::thread::Builder::new()
+            .name(format!("gpu{}-load", device_id))
+            .spawn(move || {
+                if let Err(e) = load_worker_loop(load_device_id, load_rx) {
+                    error!(device = load_device_id, error = ?e, "Load worker failed");
+                }
+            })
+            .map_err(|e| EngineError::CudaInit(format!("Failed to spawn load worker: {e}")))?;
+
+        // Spawn save worker thread
+        let save_device_id = device_id;
+        std::thread::Builder::new()
+            .name(format!("gpu{}-save", device_id))
+            .spawn(move || {
+                if let Err(e) = save_worker_loop(save_device_id, save_rx) {
+                    error!(device = save_device_id, error = ?e, "Save worker failed");
+                }
+            })
+            .map_err(|e| EngineError::CudaInit(format!("Failed to spawn save worker: {e}")))?;
+
+        info!(device = device_id, "GPU worker pool started");
+        Ok(Self {
+            device_id,
+            load_tx,
+            save_tx,
+        })
+    }
+
+    /// Submit a load task (CPU -> GPU) - fire and forget
+    pub fn submit_load(&self, task: LoadTask) -> Result<(), EngineError> {
+        self.load_tx.send(task).map_err(|_| {
+            EngineError::Storage(format!(
+                "Load worker channel closed for device {}",
+                self.device_id
+            ))
+        })
+    }
+
+    /// Submit a save task (GPU -> CPU) - async, wait for completion
+    pub async fn save(
+        &self,
+        registration: KVCacheRegistration,
+        blocks: Vec<SaveBlock>,
+    ) -> Result<(), EngineError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let task = SaveTask {
+            registration,
+            blocks,
+            reply: reply_tx,
+        };
+
+        self.save_tx.send(task).map_err(|_| {
+            EngineError::Storage(format!(
+                "Save worker channel closed for device {}",
+                self.device_id
+            ))
+        })?;
+
+        // Await the result (this is async, won't block tokio runtime)
+        reply_rx.await.map_err(|_| {
+            EngineError::Storage(format!(
+                "Save worker reply channel closed for device {}",
+                self.device_id
+            ))
+        })?
+    }
+
+    pub fn device_id(&self) -> i32 {
+        self.device_id
+    }
+}
+
+/// Load worker thread main loop
+fn load_worker_loop(
+    device_id: i32,
+    mut rx: mpsc::UnboundedReceiver<LoadTask>,
+) -> Result<(), EngineError> {
+    // Initialize CUDA context for this thread
+    let ctx = CudaContext::new(device_id as usize)
+        .map_err(|e| EngineError::CudaInit(format!("Failed to create CUDA context: {e:?}")))?;
+    let stream = ctx
+        .new_stream()
+        .map_err(|e| EngineError::CudaInit(format!("Failed to create CUDA stream: {e:?}")))?;
+
+    info!(device = device_id, "Load worker initialized");
+
+    while let Some(task) = rx.blocking_recv() {
+        let result = process_load_task(&task, &stream);
+
+        // Attach to LoadState and signal completion
+        match LoadState::attach(&task.load_state_shm) {
+            Ok(load_state) => match result {
+                Ok(()) => load_state.set_completed(),
+                Err(ref e) => {
+                    error!(device = device_id, error = ?e, "Load task failed");
+                    core_metrics().load_failures.add(1, &[]);
+                    load_state.set_error();
+                }
+            },
+            Err(e) => {
+                error!(
+                    device = device_id,
+                    shm = task.load_state_shm,
+                    error = ?e,
+                    "Failed to attach to LoadState"
+                );
+                core_metrics().load_failures.add(1, &[]);
+            }
+        }
+    }
+
+    info!(device = device_id, "Load worker shutting down");
+    Ok(())
+}
+
+/// Save worker thread main loop
+fn save_worker_loop(
+    device_id: i32,
+    mut rx: mpsc::UnboundedReceiver<SaveTask>,
+) -> Result<(), EngineError> {
+    // Initialize CUDA context for this thread
+    let _ctx = CudaContext::new(device_id as usize)
+        .map_err(|e| EngineError::CudaInit(format!("Failed to create CUDA context: {e:?}")))?;
+
+    info!(device = device_id, "Save worker initialized");
+
+    while let Some(task) = rx.blocking_recv() {
+        let result = process_save_task(&task);
+        let _ = task.reply.send(result);
+    }
+
+    info!(device = device_id, "Save worker shutting down");
+    Ok(())
+}
+
+/// Process a load task: copy blocks from CPU pinned memory to GPU for multiple layers
+#[instrument(level = "debug", skip(task, stream), fields(layers = task.layers.len()))]
+fn process_load_task(task: &LoadTask, stream: &CudaStream) -> Result<(), EngineError> {
+    let start = std::time::Instant::now();
+    let mut total_bytes = 0usize;
+    let mut total_blocks = 0usize;
+    let metrics = core_metrics();
+
+    for layer_data in &task.layers {
+        let registration = &layer_data.registration;
+
+        if layer_data.blocks.is_empty() {
+            continue;
+        }
+
+        if registration.segments == 2 && registration.kv_stride_bytes > registration.bytes_per_block
+        {
+            // Layer-first layout with KV stride: batch K and V separately
+            let segment_size = registration.bytes_per_block;
+
+            let mut k_transfers = Vec::with_capacity(layer_data.blocks.len());
+            let mut v_transfers = Vec::with_capacity(layer_data.blocks.len());
+
+            for block in &layer_data.blocks {
+                let k_gpu_offset = transfer::segment_offset(registration, block.block_idx, 0)
+                    .map_err(EngineError::Storage)?;
+                let v_gpu_offset = transfer::segment_offset(registration, block.block_idx, 1)
+                    .map_err(EngineError::Storage)?;
+
+                let k_cpu_ptr = block.layer_block.k_ptr();
+                let v_cpu_ptr = block
+                    .layer_block
+                    .v_ptr()
+                    .unwrap_or_else(|| unsafe { k_cpu_ptr.add(segment_size) });
+
+                k_transfers.push((k_gpu_offset, k_cpu_ptr as *const u8));
+                v_transfers.push((v_gpu_offset, v_cpu_ptr as *const u8));
+            }
+
+            transfer::batch_copy_segments_to_gpu(&k_transfers, segment_size, registration, stream)
+                .map_err(|e| {
+                    EngineError::Storage(format!(
+                        "K segment transfer failed for layer {}: {e}",
+                        layer_data.layer_name
+                    ))
+                })?;
+
+            transfer::batch_copy_segments_to_gpu(&v_transfers, segment_size, registration, stream)
+                .map_err(|e| {
+                    EngineError::Storage(format!(
+                        "V segment transfer failed for layer {}: {e}",
+                        layer_data.layer_name
+                    ))
+                })?;
+
+            total_bytes += layer_data.blocks.len() * segment_size * 2;
+            total_blocks += layer_data.blocks.len();
+        } else {
+            // Contiguous or single-segment layout
+            for block in &layer_data.blocks {
+                transfer::copy_block_cpu_to_gpu(
+                    registration,
+                    block.block_idx,
+                    block.layer_block.k_ptr(),
+                    stream,
+                )
+                .map_err(|e| {
+                    EngineError::Storage(format!(
+                        "Block {} transfer failed for layer {}: {e}",
+                        block.block_idx, layer_data.layer_name
+                    ))
+                })?;
+                total_bytes += block.layer_block.size();
+            }
+            total_blocks += layer_data.blocks.len();
+        }
+    }
+
+    // Wait for all transfers to complete
+    let event = stream
+        .record_event(None)
+        .map_err(|e| EngineError::Storage(format!("Failed to record event: {e:?}")))?;
+    event
+        .synchronize()
+        .map_err(|e| EngineError::Storage(format!("Failed to synchronize: {e:?}")))?;
+
+    let elapsed = start.elapsed();
+    let bandwidth_gbps = if elapsed.as_secs_f64() > 0.0 {
+        (total_bytes as f64 / 1e9) / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+
+    if total_blocks > 0 {
+        metrics.load_bytes.add(total_bytes as u64, &[]);
+        metrics
+            .load_duration_ms
+            .record(elapsed.as_secs_f64() * 1000.0, &[]);
+    }
+
+    info!(
+        layers = task.layers.len(),
+        blocks = total_blocks,
+        bytes = total_bytes,
+        elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+        bandwidth_gbps = bandwidth_gbps,
+        "Load task completed"
+    );
+
+    Ok(())
+}
+
+/// Process a save task: copy blocks from GPU to CPU pinned memory
+#[instrument(level = "debug", skip(task), fields(blocks = task.blocks.len()))]
+fn process_save_task(task: &SaveTask) -> Result<(), EngineError> {
+    let registration = &task.registration;
+    let start = std::time::Instant::now();
+    let mut total_bytes = 0usize;
+
+    if registration.segments == 2 && registration.kv_stride_bytes > registration.bytes_per_block {
+        // Layer-first layout: K and V segments stored separately
+        let segment_size = registration.bytes_per_block;
+
+        // Build offset lists for batch copy
+        let mut k_offsets_with_idx = Vec::with_capacity(task.blocks.len());
+        let mut v_offsets_with_idx = Vec::with_capacity(task.blocks.len());
+
+        for (i, block) in task.blocks.iter().enumerate() {
+            let k_offset = transfer::segment_offset(registration, block.block_idx, 0)
+                .map_err(EngineError::Storage)?;
+            let v_offset = transfer::segment_offset(registration, block.block_idx, 1)
+                .map_err(EngineError::Storage)?;
+            k_offsets_with_idx.push((k_offset, i));
+            v_offsets_with_idx.push((v_offset, i));
+        }
+
+        // Copy K segments
+        for (i, block) in task.blocks.iter().enumerate() {
+            let k_offset = k_offsets_with_idx[i].0;
+            let buffer = unsafe { std::slice::from_raw_parts_mut(block.k_dst_ptr, segment_size) };
+            transfer::copy_gpu_to_cpu(registration.data_ptr, k_offset, buffer, segment_size)
+                .map_err(|e| EngineError::Storage(format!("K copy failed: {e}")))?;
+        }
+
+        // Copy V segments
+        for (i, block) in task.blocks.iter().enumerate() {
+            let v_offset = v_offsets_with_idx[i].0;
+            let v_ptr = block
+                .v_dst_ptr
+                .unwrap_or_else(|| unsafe { block.k_dst_ptr.add(segment_size) });
+            let buffer = unsafe { std::slice::from_raw_parts_mut(v_ptr, segment_size) };
+            transfer::copy_gpu_to_cpu(registration.data_ptr, v_offset, buffer, segment_size)
+                .map_err(|e| EngineError::Storage(format!("V copy failed: {e}")))?;
+        }
+
+        total_bytes = task.blocks.len() * segment_size * 2;
+    } else {
+        // Contiguous or single-segment layout
+        for block in &task.blocks {
+            transfer::copy_block_gpu_to_cpu(registration, block.block_idx, block.k_dst_ptr)
+                .map_err(|e| {
+                    EngineError::Storage(format!("Block {} copy failed: {e}", block.block_idx))
+                })?;
+            total_bytes += registration.block_size_bytes;
+        }
+    }
+
+    let elapsed = start.elapsed();
+    let bandwidth_gbps = if elapsed.as_secs_f64() > 0.0 {
+        (total_bytes as f64 / 1e9) / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+
+    debug!(
+        blocks = task.blocks.len(),
+        bytes = total_bytes,
+        elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+        bandwidth_gbps = bandwidth_gbps,
+        "Save task completed"
+    );
+
+    Ok(())
+}

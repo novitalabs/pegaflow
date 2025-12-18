@@ -160,6 +160,7 @@ impl Engine for GrpcEngineService {
 
         self.engine
             .batch_save_kv_blocks_from_ipc(&req.instance_id, tp_rank, req.device_id, saves)
+            .await
             .map_err(Self::map_engine_error)?;
 
         Ok(Response::new(SaveResponse {

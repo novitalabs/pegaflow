@@ -1,4 +1,5 @@
 pub mod allocator;
+pub mod gpu_worker;
 mod metrics;
 pub mod pinned_pool;
 mod storage;
@@ -30,15 +31,16 @@ pub use sync_state::{LoadState, LoadStateError};
 // significantly improving PCIe bandwidth utilization compared to strided copies.
 // ============================================================================
 
-use cudarc::driver::{CudaContext, CudaStream};
+use cudarc::driver::CudaContext;
 use std::{
     collections::HashMap,
     fmt,
     num::NonZeroU64,
     sync::{Arc, Mutex, RwLock},
 };
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, instrument};
 
+use crate::gpu_worker::{GpuWorkerPool, LayerLoadData, LoadBlock, LoadTask, SaveBlock};
 use crate::metrics::core_metrics;
 use crate::storage::{LayerBlock, StorageEngine};
 
@@ -104,24 +106,20 @@ pub struct KVCacheRegistration {
 struct GpuContext {
     /// KV cache registrations for this GPU (Layer Name -> GPU Ptr Info)
     kv_caches: Mutex<HashMap<String, KVCacheRegistration>>,
-    /// Single stream for all transfers to ensure sequential execution
-    stream: Arc<CudaStream>,
     /// Hold CUDA context for the lifetime of the inference context
     _cuda_ctx: Arc<CudaContext>,
-    _device_id: i32,
+    /// Worker pool for async GPU operations (load/save)
+    worker_pool: GpuWorkerPool,
 }
 
 impl GpuContext {
-    fn new(cuda_ctx: Arc<CudaContext>, device_id: i32) -> Self {
-        let stream = cuda_ctx
-            .new_stream()
-            .expect("Failed to create stream for GPU context");
-        Self {
+    fn new(cuda_ctx: Arc<CudaContext>, device_id: i32) -> Result<Self, EngineError> {
+        let worker_pool = GpuWorkerPool::spawn(device_id)?;
+        Ok(Self {
             kv_caches: Mutex::new(HashMap::new()),
-            stream,
             _cuda_ctx: cuda_ctx,
-            _device_id: device_id,
-        }
+            worker_pool,
+        })
     }
 
     fn register_layer(&self, layer_name: String, registration: KVCacheRegistration) {
@@ -134,8 +132,8 @@ impl GpuContext {
         caches.get(layer_name).cloned()
     }
 
-    fn stream(&self) -> Arc<CudaStream> {
-        self.stream.clone()
+    fn worker_pool(&self) -> &GpuWorkerPool {
+        &self.worker_pool
     }
 }
 
@@ -239,7 +237,7 @@ impl InstanceContext {
 
         let cuda_ctx = CudaContext::new(device_id as usize)
             .map_err(|e| EngineError::CudaInit(format!("{e:?}")))?;
-        let worker = Arc::new(GpuContext::new(cuda_ctx, device_id));
+        let worker = Arc::new(GpuContext::new(cuda_ctx, device_id)?);
         workers.insert(device_id, Arc::clone(&worker));
         Ok(worker)
     }
@@ -455,7 +453,7 @@ impl PegaEngine {
         err,
         fields(instance=%instance_id, rank=%tp_rank, device=%device_id, layers=%saves.len())
     )]
-    pub fn batch_save_kv_blocks_from_ipc(
+    pub async fn batch_save_kv_blocks_from_ipc(
         &self,
         instance_id: &str,
         tp_rank: usize,
@@ -463,18 +461,19 @@ impl PegaEngine {
         saves: Vec<(String, Vec<i32>, Vec<Vec<u8>>)>,
     ) -> Result<(), EngineError> {
         let instance = self.get_instance(instance_id)?;
-        let namespace = &instance.namespace;
+        let namespace = instance.namespace.clone();
 
         for (layer_name, block_ids, block_hashes) in saves {
             self.save_kv_blocks_from_ipc_inner(
                 instance_id,
                 tp_rank,
                 device_id,
-                namespace,
+                &namespace,
                 &layer_name,
                 block_ids,
                 block_hashes,
-            )?;
+            )
+            .await?;
         }
         Ok(())
     }
@@ -485,7 +484,7 @@ impl PegaEngine {
         err,
         fields(instance=%instance_id, rank=%tp_rank, device=%device_id, layer=%layer_name, blocks=%block_ids.len())
     )]
-    pub fn save_kv_blocks_from_ipc(
+    pub async fn save_kv_blocks_from_ipc(
         &self,
         instance_id: &str,
         tp_rank: usize,
@@ -506,9 +505,10 @@ impl PegaEngine {
             block_ids,
             block_hashes,
         )
+        .await
     }
 
-    fn save_kv_blocks_from_ipc_inner(
+    async fn save_kv_blocks_from_ipc_inner(
         &self,
         instance_id: &str,
         tp_rank: usize,
@@ -579,6 +579,7 @@ impl PegaEngine {
 
         let block_size = registration.block_size_bytes;
         let num_blocks = blocks_to_save.len();
+
         // For layer-first layout with KV stride, allocate separate regions for K and V
         if registration.segments == 2 && registration.kv_stride_bytes > registration.bytes_per_block
         {
@@ -602,73 +603,40 @@ impl PegaEngine {
                 )
             })?;
 
-            // SAFETY: The allocation just created in this scope is not shared with other
-            // threads, so it is safe to get the mutable pointer here *once*, before any
-            // Arc::clone is created.
-            let (k_base_ptr, v_base_ptr) = {
+            // Get mutable pointers before creating Arc clones
+            // Store as usize to cross await point (pinned memory won't move)
+            let (k_base_addr, v_base_addr) = {
                 let k_ptr = Arc::get_mut(&mut k_allocation)
                     .expect("k_allocation must be uniquely owned here")
                     .as_mut_ptr();
                 let v_ptr = Arc::get_mut(&mut v_allocation)
                     .expect("v_allocation must be uniquely owned here")
                     .as_mut_ptr();
-                (k_ptr, v_ptr)
+                (k_ptr as usize, v_ptr as usize)
             };
 
-            // Calculate GPU offsets for batching
-            let mut k_offsets_with_idx = Vec::with_capacity(num_blocks);
-            let mut v_offsets_with_idx = Vec::with_capacity(num_blocks);
+            // Build SaveBlock list for worker
+            let save_blocks: Vec<SaveBlock> = blocks_to_save
+                .iter()
+                .enumerate()
+                .map(|(i, (block_idx, _))| SaveBlock {
+                    block_idx: *block_idx,
+                    k_dst_ptr: (k_base_addr + i * segment_size) as *mut u8,
+                    v_dst_ptr: Some((v_base_addr + i * segment_size) as *mut u8),
+                })
+                .collect();
 
-            for (i, (block_idx, _)) in blocks_to_save.iter().enumerate() {
-                let k_offset =
-                    transfer::segment_offset(&registration, *block_idx, 0).map_err(|e| {
-                        EngineError::Storage(format!(
-                            "invalid K offset for layer {layer_name} block {block_idx}: {e}"
-                        ))
-                    })?;
-                let v_offset =
-                    transfer::segment_offset(&registration, *block_idx, 1).map_err(|e| {
-                        EngineError::Storage(format!(
-                            "invalid V offset for layer {layer_name} block {block_idx}: {e}"
-                        ))
-                    })?;
-                k_offsets_with_idx.push((k_offset, i));
-                v_offsets_with_idx.push((v_offset, i));
-            }
+            // Execute GPU->CPU copy via worker pool
+            worker
+                .worker_pool()
+                .save(registration.clone(), save_blocks)
+                .await?;
 
-            // Batch copy K segments
-            transfer::batch_copy_segments(
-                &k_offsets_with_idx,
-                k_base_ptr,
-                segment_size,
-                &registration,
-            )
-            .map_err(|e| {
-                EngineError::Storage(format!(
-                    "failed to copy K segments for layer {layer_name}: {e}"
-                ))
-            })?;
-
-            // Batch copy V segments
-            transfer::batch_copy_segments(
-                &v_offsets_with_idx,
-                v_base_ptr,
-                segment_size,
-                &registration,
-            )
-            .map_err(|e| {
-                EngineError::Storage(format!(
-                    "failed to copy V segments for layer {layer_name}: {e}"
-                ))
-            })?;
-
-            // Create LayerBlock objects after all copying is done
+            // Create LayerBlock objects after copying is done
             for (i, (_, block_hash)) in blocks_to_save.into_iter().enumerate() {
-                let k_ptr = unsafe { k_base_ptr.add(i * segment_size) };
-                let v_ptr = unsafe { v_base_ptr.add(i * segment_size) };
+                let k_ptr = (k_base_addr + i * segment_size) as *mut u8;
+                let v_ptr = (v_base_addr + i * segment_size) as *mut u8;
 
-                // We now keep K and V data in separate allocations during their lifetime
-                // This avoids the memory overwrite bug and keeps data contiguous for better batching next time
                 let block = Arc::new(LayerBlock::new_split(
                     k_ptr,
                     v_ptr,
@@ -682,7 +650,7 @@ impl PegaEngine {
                     .map_err(|e| EngineError::Storage(e.to_string()))?;
             }
         } else {
-            // Original logic for contiguous or single-segment layouts
+            // Contiguous or single-segment layouts
             let block_size_u64 = u64::try_from(block_size).map_err(|_| {
                 EngineError::Storage(format!(
                     "block size {} exceeds supported range for layer {layer_name}",
@@ -697,30 +665,42 @@ impl PegaEngine {
                         "allocation size overflow while saving layer {layer_name}"
                     ))
                 })?;
+
             let mut allocation = self.storage.allocate(total_size).ok_or_else(|| {
                 EngineError::Storage(
                     "pinned pool exhausted while allocating contiguous block buffer".to_string(),
                 )
             })?;
-            let base_ptr = Arc::get_mut(&mut allocation)
+
+            // Store as usize to cross await point (pinned memory won't move)
+            let base_addr = Arc::get_mut(&mut allocation)
                 .ok_or_else(|| {
                     EngineError::Storage(format!(
                         "allocation shared unexpectedly while saving layer {layer_name}"
                     ))
                 })?
-                .as_mut_ptr();
+                .as_mut_ptr() as usize;
 
-            // Copy blocks and create LayerBlock objects
-            for (i, (block_idx, block_hash)) in blocks_to_save.into_iter().enumerate() {
-                let cpu_ptr = unsafe { base_ptr.add(i * block_size) };
-                transfer::copy_block_gpu_to_cpu(&registration, block_idx, cpu_ptr).map_err(
-                    |e| {
-                        EngineError::Storage(format!(
-                            "failed to copy block {} for layer {layer_name} to CPU: {e}",
-                            block_idx
-                        ))
-                    },
-                )?;
+            // Build SaveBlock list for worker
+            let save_blocks: Vec<SaveBlock> = blocks_to_save
+                .iter()
+                .enumerate()
+                .map(|(i, (block_idx, _))| SaveBlock {
+                    block_idx: *block_idx,
+                    k_dst_ptr: (base_addr + i * block_size) as *mut u8,
+                    v_dst_ptr: None,
+                })
+                .collect();
+
+            // Execute GPU->CPU copy via worker pool
+            worker
+                .worker_pool()
+                .save(registration.clone(), save_blocks)
+                .await?;
+
+            // Create LayerBlock objects after copying is done
+            for (i, (_, block_hash)) in blocks_to_save.into_iter().enumerate() {
+                let cpu_ptr = (base_addr + i * block_size) as *mut u8;
 
                 let block = Arc::new(LayerBlock::new_contiguous(
                     cpu_ptr,
@@ -803,8 +783,8 @@ impl PegaEngine {
 
     /// Batch load KV blocks for multiple layers asynchronously.
     ///
-    /// This spawns a background thread to perform all transfers and waits via LoadState.
-    /// The function returns immediately after spawning the thread.
+    /// This submits a task to the GPU worker pool which performs all transfers.
+    /// The function returns immediately after submitting the task.
     ///
     /// The connector creates a LoadState, passes the `load_state_shm` to this method,
     /// and then spin-waits on the state until it becomes non-zero (1=success, -1=error).
@@ -827,6 +807,35 @@ impl PegaEngine {
         // Attach to LoadState early so we can set error if something fails
         let load_state = LoadState::attach(load_state_shm)?;
 
+        let result = self.batch_load_kv_blocks_multi_layer_inner(
+            instance_id,
+            tp_rank,
+            device_id,
+            load_state_shm,
+            layer_names,
+            block_ids,
+            block_hashes,
+        );
+
+        // If we failed before submitting to worker, set error on LoadState
+        if let Err(ref e) = result {
+            tracing::error!(error = ?e, "batch_load_kv_blocks_multi_layer failed before worker");
+            load_state.set_error();
+        }
+
+        result
+    }
+
+    fn batch_load_kv_blocks_multi_layer_inner(
+        &self,
+        instance_id: &str,
+        tp_rank: usize,
+        device_id: i32,
+        load_state_shm: &str,
+        layer_names: &[&str],
+        block_ids: &[i32],
+        block_hashes: &[Vec<u8>],
+    ) -> Result<(), EngineError> {
         let instance = self.get_instance(instance_id)?;
         let namespace = &instance.namespace;
 
@@ -840,186 +849,61 @@ impl PegaEngine {
             .lookup_many(namespace, block_hashes)
             .map_err(EngineError::Storage)?;
 
-        // Clone data for thread
-        let layer_names: Vec<String> = layer_names.iter().map(|s| s.to_string()).collect();
-        let block_ids = block_ids.to_vec();
-        let metrics = core_metrics();
-        let instance_id_owned = instance_id.to_string();
+        // Build LoadTask with data for all layers
+        let mut layers = Vec::with_capacity(layer_names.len());
 
-        // Spawn background thread to do all work
-        std::thread::spawn(move || {
-            let load_result: Result<(), EngineError> = (|| {
-                let start = std::time::Instant::now();
-                let stream = worker.stream();
-                let mut total_bytes = 0usize;
-                let mut total_blocks = 0usize;
+        for layer_name in layer_names {
+            let layer_id = instance.get_layer_id(layer_name).ok_or_else(|| {
+                EngineError::InvalidArgument(format!(
+                    "layer {layer_name} unknown for instance {instance_id}"
+                ))
+            })?;
 
-                for layer_name in &layer_names {
-                    let layer_id = instance.get_layer_id(layer_name).ok_or_else(|| {
-                        EngineError::InvalidArgument(format!(
-                            "layer {layer_name} unknown for instance {instance_id_owned}"
-                        ))
-                    })?;
+            let registration = worker.get_registration(layer_name).ok_or_else(|| {
+                EngineError::InvalidArgument(format!(
+                    "layer {layer_name} not registered on device {device_id}"
+                ))
+            })?;
 
-                    let registration = worker.get_registration(layer_name).ok_or_else(|| {
-                        EngineError::InvalidArgument(format!(
-                            "layer {layer_name} not registered on device {}",
-                            worker._device_id
-                        ))
-                    })?;
+            let slot_id = instance.get_slot_index(layer_id, tp_rank)?;
 
-                    let slot_id = instance.get_slot_index(layer_id, tp_rank)?;
+            // Collect valid blocks to load for this layer
+            let blocks: Vec<LoadBlock> = block_ids
+                .iter()
+                .zip(block_cache.iter())
+                .filter_map(|(block_id, block_entry)| {
+                    let block_idx = usize::try_from(*block_id).ok()?;
+                    let layer_block = block_entry.get_slot(slot_id)?;
+                    Some(LoadBlock {
+                        block_idx,
+                        layer_block,
+                    })
+                })
+                .collect();
 
-                    // Collect valid blocks to load for this layer
-                    let blocks_to_load: Vec<_> = block_ids
-                        .iter()
-                        .zip(block_cache.iter())
-                        .filter_map(|(block_id, block_entry)| {
-                            let Ok(block_idx) = usize::try_from(*block_id) else {
-                                return None;
-                            };
-                            block_entry
-                                .get_slot(slot_id)
-                                .map(|block| (block_idx, block))
-                        })
-                        .collect();
-
-                    if blocks_to_load.is_empty() {
-                        continue;
-                    }
-
-                    if registration.segments == 2
-                        && registration.kv_stride_bytes > registration.bytes_per_block
-                    {
-                        // Optimized path for layer-first layout with KV stride
-                        let segment_size = registration.bytes_per_block;
-
-                        let mut k_transfers = Vec::with_capacity(blocks_to_load.len());
-                        let mut v_transfers = Vec::with_capacity(blocks_to_load.len());
-                        for (block_idx, block) in &blocks_to_load {
-                            let k_gpu_offset =
-                                transfer::segment_offset(&registration, *block_idx, 0).map_err(
-                                    |e| {
-                                        EngineError::Storage(format!(
-                                    "invalid K offset for layer {layer_name} block {block_idx}: {e}"
-                                ))
-                                    },
-                                )?;
-                            let v_gpu_offset =
-                                transfer::segment_offset(&registration, *block_idx, 1).map_err(
-                                    |e| {
-                                        EngineError::Storage(format!(
-                                    "invalid V offset for layer {layer_name} block {block_idx}: {e}"
-                                ))
-                                    },
-                                )?;
-
-                            let k_cpu_ptr = block.k_ptr();
-                            let v_cpu_ptr = block
-                                .v_ptr()
-                                .unwrap_or_else(|| unsafe { k_cpu_ptr.add(segment_size) });
-
-                            k_transfers.push((k_gpu_offset, k_cpu_ptr));
-                            v_transfers.push((v_gpu_offset, v_cpu_ptr));
-                        }
-
-                        transfer::batch_copy_segments_to_gpu(
-                            &k_transfers,
-                            segment_size,
-                            &registration,
-                            &stream,
-                        )
-                        .map_err(|e| {
-                            EngineError::Storage(format!(
-                                "failed to copy K segments for layer {layer_name}: {e}"
-                            ))
-                        })?;
-                        transfer::batch_copy_segments_to_gpu(
-                            &v_transfers,
-                            segment_size,
-                            &registration,
-                            &stream,
-                        )
-                        .map_err(|e| {
-                            EngineError::Storage(format!(
-                                "failed to copy V segments for layer {layer_name}: {e}"
-                            ))
-                        })?;
-
-                        total_bytes += blocks_to_load.len() * segment_size * 2;
-                        total_blocks += blocks_to_load.len();
-                    } else {
-                        // Contiguous or single-segment layouts
-                        for (block_idx, block) in &blocks_to_load {
-                            transfer::copy_block_cpu_to_gpu(
-                                &registration,
-                                *block_idx,
-                                block.k_ptr(),
-                                &stream,
-                            )
-                            .map_err(|e| {
-                                EngineError::Storage(format!(
-                                    "failed to copy block {} for layer {layer_name} to GPU: {e}",
-                                    block_idx
-                                ))
-                            })?;
-                            total_bytes += block.size();
-                        }
-                        total_blocks += blocks_to_load.len();
-                    }
-                }
-
-                // Record event and wait for all transfers
-                let final_event = stream.record_event(None).map_err(|e| {
-                    EngineError::Storage(format!(
-                        "failed to record final CUDA event for instance {instance_id_owned}: {e:?}"
-                    ))
-                })?;
-
-                final_event.synchronize().map_err(|e| {
-                    EngineError::Storage(format!(
-                        "failed to synchronize transfers for instance {instance_id_owned}: {e:?}"
-                    ))
-                })?;
-
-                let elapsed = start.elapsed();
-                let bandwidth_gbps = if elapsed.as_secs_f64() > 0.0 {
-                    (total_bytes as f64 / 1e9) / elapsed.as_secs_f64()
-                } else {
-                    0.0
-                };
-
-                if total_blocks > 0 {
-                    metrics.load_bytes.add(total_bytes as u64, &[]);
-                    metrics
-                        .load_duration_ms
-                        .record(elapsed.as_secs_f64() * 1000.0, &[]);
-                }
-
-                info!(
-                    "Transfers complete: {} blocks, {:.2} MB in {:?} ({:.2} GB/s)",
-                    total_blocks,
-                    total_bytes as f64 / 1e6,
-                    elapsed,
-                    bandwidth_gbps
-                );
-                load_state.set_completed();
-                Ok(())
-            })();
-
-            if let Err(err) = load_result {
-                error!(
-                    ?err,
-                    instance=%instance_id_owned,
-                    device=%device_id,
-                    rank=%tp_rank,
-                    "Batch load failed"
-                );
-                metrics.load_failures.add(1, &[]);
-                load_state.set_error();
+            if !blocks.is_empty() {
+                layers.push(LayerLoadData {
+                    layer_name: layer_name.to_string(),
+                    registration,
+                    blocks,
+                });
             }
-        });
+        }
 
-        Ok(())
+        // If no layers have blocks to load, complete immediately
+        if layers.is_empty() {
+            debug!("No blocks to load, completing immediately");
+            let load_state = LoadState::attach(load_state_shm)?;
+            load_state.set_completed();
+            return Ok(());
+        }
+
+        // Submit task to worker pool (fire and forget)
+        let task = LoadTask {
+            layers,
+            load_state_shm: load_state_shm.to_string(),
+        };
+
+        worker.worker_pool().submit_load(task)
     }
 }
