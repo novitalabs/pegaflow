@@ -103,6 +103,7 @@ impl GpuWorkerPool {
     }
 
     /// Submit a save task (GPU -> CPU) - async, wait for completion
+    /// TODO: make sure the source of the blocks is valid until the task is completed
     pub async fn save(
         &self,
         registration: KVCacheRegistration,
