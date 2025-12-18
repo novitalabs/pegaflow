@@ -112,7 +112,7 @@ impl EngineRpcClient {
     {
         let rt_handle = self.rt_handle.clone();
         let client = self.client.clone();
-        py.allow_threads(move || {
+        py.detach(move || {
             rt_handle
                 .block_on(async move { f(client).await.map_err(|e| rpc_status_error("rpc", e)) })
         })
@@ -212,7 +212,7 @@ impl PegaEngine {
         let instance_id_owned = instance_id.to_string();
         let layer_name_owned = layer_name;
         let engine = &self.engine;
-        py.allow_threads(move || {
+        py.detach(move || {
             engine.save_kv_blocks_from_ipc(
                 &instance_id_owned,
                 tp_rank,
@@ -249,7 +249,7 @@ impl PegaEngine {
     ) -> PyResult<()> {
         let instance_id_owned = instance_id.to_string();
         let engine = &self.engine;
-        py.allow_threads(move || {
+        py.detach(move || {
             engine.batch_save_kv_blocks_from_ipc(&instance_id_owned, tp_rank, device_id, saves)
         })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))
@@ -275,7 +275,7 @@ impl PegaEngine {
     ) -> PyResult<usize> {
         let instance_id_owned = instance_id.to_string();
         let engine = &self.engine;
-        py.allow_threads(move || engine.count_prefix_hit_blocks(&instance_id_owned, &block_hashes))
+        py.detach(move || engine.count_prefix_hit_blocks(&instance_id_owned, &block_hashes))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
@@ -308,7 +308,7 @@ impl PegaEngine {
         let instance_id_owned = instance_id.to_string();
         let load_state_shm_owned = load_state_shm.to_string();
         let engine = &self.engine;
-        py.allow_threads(move || {
+        py.detach(move || {
             let layer_name_refs: Vec<&str> = layer_names.iter().map(|s| s.as_str()).collect();
 
             engine.batch_load_kv_blocks_multi_layer(

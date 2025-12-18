@@ -40,7 +40,7 @@ export PYO3_PYTHON=$(which python)
 export LD_LIBRARY_PATH=$(python -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))"):$LD_LIBRARY_PATH
 
 # Start the server (keep running in a separate terminal)
-cargo run -r -p pegaflow-server -- --addr 0.0.0.0:50055 --device 0 --pool-size 30gb
+cargo run -r --bin pegaflow-server -- --addr 0.0.0.0:50055 --device 0 --pool-size 30gb
 ```
 
 **Server Options:**
@@ -142,7 +142,7 @@ Client Request
 1. Start the PegaEngine server (centralized KV cache storage):
 
    ```bash
-   cargo run -r -p pegaflow-server -- --addr 0.0.0.0:50055 --device 0 --pool-size 30gb
+   cargo run -r --bin pegaflow-server -- --addr 0.0.0.0:50055 --device 0 --pool-size 30gb
    ```
 2. Launch P/D setup:
 

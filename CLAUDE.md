@@ -26,13 +26,12 @@ maturin develop --release  # Release build
 ```bash
 cargo bench --bench pinned_copy
 cargo bench --bench uds_latency
-cargo bench --bench bincode_msg
 ```
 
 ### Running Examples
 ```bash
 # Start the PegaEngine server first (required)
-cargo run -r -p pegaflow-server -- --addr 0.0.0.0:50055 --device 0 --pool-size 30gb
+cargo run -r --bin pegaflow-server -- --addr 0.0.0.0:50055 --device 0 --pool-size 30gb
 
 # Then run examples
 uv run python examples/basic_vllm.py

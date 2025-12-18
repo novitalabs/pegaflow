@@ -58,7 +58,7 @@ impl GrpcEngineService {
     }
 
     fn map_py_error(operation: &str, err: PyErr) -> Status {
-        let message = Python::with_gil(|py| err.value_bound(py).to_string());
+        let message = Python::attach(|py| err.value(py).to_string());
         Status::internal(format!("{operation} failed: {message}"))
     }
 

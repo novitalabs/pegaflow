@@ -43,13 +43,11 @@ pub struct CudaTensorRegistry {
 
 impl CudaTensorRegistry {
     pub fn new() -> PyResult<Self> {
-        Python::with_gil(|py| {
-            let torch = py.import_bound("torch")?;
+        Python::attach(|py| {
+            let torch = py.import("torch")?;
             let cuda = torch.getattr("cuda")?;
             cuda.call_method0("init")?;
-            Ok(Self {
-                contexts: HashMap::new(),
-            })
+            Ok(Self { contexts: HashMap::new() })
         })
     }
 
@@ -106,18 +104,18 @@ impl CudaTensorRegistry {
         // The Py<PyAny> inside LayerTensor will be dropped here, which will
         // decrement the reference count and allow Python to garbage collect
         // the CUDA IPC tensors, releasing the mapped GPU memory.
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             for key in keys_to_remove {
                 self.contexts.remove(&key);
             }
 
             // Force garbage collection to release CUDA IPC memory immediately.
             // Without this, Python's GC may defer cleanup, leaving GPU memory mapped.
-            let gc = py.import_bound("gc").expect("gc module");
+            let gc = py.import("gc").expect("gc module");
             let _ = gc.call_method0("collect");
 
             // Clear CUDA memory cache to return memory to the device
-            let torch = py.import_bound("torch").expect("torch module");
+            let torch = py.import("torch").expect("torch module");
             let cuda = torch.getattr("cuda").expect("torch.cuda");
             let _ = cuda.call_method0("empty_cache");
         });
@@ -127,28 +125,28 @@ impl CudaTensorRegistry {
 
     pub fn clear(&mut self) {
         // Clear all contexts under GIL to ensure proper Python object cleanup
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             self.contexts.clear();
 
             // Force garbage collection and clear CUDA cache
-            let gc = py.import_bound("gc").expect("gc module");
+            let gc = py.import("gc").expect("gc module");
             let _ = gc.call_method0("collect");
 
-            let torch = py.import_bound("torch").expect("torch module");
+            let torch = py.import("torch").expect("torch module");
             let cuda = torch.getattr("cuda").expect("torch.cuda");
             let _ = cuda.call_method0("empty_cache");
         });
     }
 
     fn materialize_tensor(device_id: i32, wrapper_bytes: &[u8]) -> PyResult<LayerTensor> {
-        Python::with_gil(|py| {
-            let torch = py.import_bound("torch")?;
-            let pickle = py.import_bound("pickle")?;
+        Python::attach(|py| {
+            let torch = py.import("torch")?;
+            let pickle = py.import("pickle")?;
             let cuda = torch.getattr("cuda")?;
 
             cuda.call_method1("set_device", (device_id,))?;
 
-            let py_bytes = PyBytes::new_bound(py, wrapper_bytes);
+            let py_bytes = PyBytes::new(py, wrapper_bytes);
             let wrapper = pickle.call_method1("loads", (py_bytes,))?;
             let tensor = wrapper.call_method0("to_tensor")?;
 

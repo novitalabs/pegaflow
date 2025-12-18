@@ -9,12 +9,11 @@ tracing.workspace = true
 offset-allocator.workspace = true
 hashlink.workspace = true
 tokio.workspace = true
-bincode.workspace = true
 rand.workspace = true
 shared_memory.workspace = true
 uuid.workspace = true
 crossbeam.workspace = true
-opentelemetry.workspace = true
+opentelemetry.workspace = true  
 bytesize.workspace = true
 
 [dev-dependencies]
@@ -26,8 +25,4 @@ harness = false
 
 [[bench]]
 name = "uds_latency"
-harness = false
-
-[[bench]]
-name = "bincode_msg"
 harness = false

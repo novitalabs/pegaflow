@@ -74,7 +74,7 @@ fn init_tracing(log_level: &str) {
 }
 
 fn format_py_err(err: PyErr) -> String {
-    Python::with_gil(|py| err.value_bound(py).to_string())
+    Python::attach(|py| err.value(py).to_string())
 }
 
 fn init_cuda_driver() -> Result<(), std::io::Error> {
@@ -87,8 +87,8 @@ fn init_cuda_driver() -> Result<(), std::io::Error> {
 }
 
 fn init_python_cuda(device_id: i32) -> Result<(), std::io::Error> {
-    Python::with_gil(|py| -> pyo3::PyResult<()> {
-        let torch = py.import_bound("torch")?;
+    Python::attach(|py| -> pyo3::PyResult<()> {
+        let torch = py.import("torch")?;
         let cuda = torch.getattr("cuda")?;
         cuda.call_method0("init")?;
         cuda.call_method1("set_device", (device_id,))?;
