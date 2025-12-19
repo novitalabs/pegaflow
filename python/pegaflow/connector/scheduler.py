@@ -73,7 +73,11 @@ class SchedulerConnector:
             req_id,
         )
 
-        return (num_hit_tokens, True)
+        # If we've already scheduled loading these blocks, return False
+        # to indicate no NEW async loading is needed
+        needs_async_load = tracker._loaded_blocks < hit_blocks
+
+        return (num_hit_tokens, needs_async_load)
 
     @timing_wrapper
     def update_state_after_alloc(
