@@ -55,6 +55,8 @@ class WorkerConnector:
         self._registered_layers: list[str] = []
         self._layer_name_to_id: dict[str, int] = {}
 
+        self._finished_requests: set[str] = set()
+
     def shutdown(self) -> None:
         self.unregister_context()
         self._save_queue.put(None)
@@ -142,10 +144,18 @@ class WorkerConnector:
         finished_recving: set[str] | None = None
 
         with self._save_completion_lock:
-            done_saves = self._completed_saves & finished_req_ids
-            if done_saves:
-                self._completed_saves -= done_saves
-                finished_sending = done_saves
+            # 1. Add newly finished requests (if they have pending saves) to tracking
+            self._finished_requests.update(finished_req_ids & self._req_pending_layers.keys())
+            
+            # 2. Identify requests whose saves have completed
+            done_sends = self._completed_saves & self._finished_requests
+            
+            if done_sends:
+                # 3. Clean up completed requests
+                self._completed_saves -= done_sends
+                self._finished_requests -= done_sends
+                finished_sending = done_sends
+            
 
         with self._load_completion_lock:
             completed_reqs: set[str] = set()
@@ -192,7 +202,6 @@ class WorkerConnector:
                 "[PegaKVConnector] finished loading KV for requests: %s",
                 finished_recving,
             )
-
         return (finished_sending, finished_recving)
 
     @timing_wrapper

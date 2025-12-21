@@ -6,7 +6,7 @@ import enum
 import hashlib
 import os
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 
@@ -50,6 +50,50 @@ class LoadIntent:
     num_tokens: int
 
 
+@dataclass(slots=True)
+class LoadState:
+    """
+    Mutable state for an in-progress load operation.
+
+    Lifecycle:
+    - Created by on_lookup() when cache hit is detected
+    - Updated by on_alloc() with allocated block IDs
+    - Consumed by consume_load_intent() which returns LoadIntent and clears state
+    """
+    hit_blocks: int
+    computed_blocks: int
+    allocated_blocks: list[int] = field(default_factory=list)
+    external_tokens: int = 0
+
+    def to_intent(
+        self,
+        block_hashes: tuple[bytes, ...],
+        block_size: int,
+    ) -> LoadIntent | None:
+        """
+        Convert to LoadIntent if conditions are met.
+
+        Returns None if:
+        - No external tokens to load
+        - All hits are already computed (prefix cache)
+        - No blocks to load after accounting for computed blocks
+        """
+        if self.external_tokens <= 0 or self.hit_blocks <= self.computed_blocks:
+            return None
+
+        num_blocks = min(self.hit_blocks, len(self.allocated_blocks), len(block_hashes))
+        load_blocks = num_blocks - self.computed_blocks
+        if load_blocks <= 0:
+            return None
+
+        start = self.computed_blocks
+        return LoadIntent(
+            block_ids=tuple(self.allocated_blocks[start:start + load_blocks]),
+            block_hashes=block_hashes[start:start + load_blocks],
+            num_tokens=load_blocks * block_size,
+        )
+
+
 @dataclass(frozen=True)
 class SaveIntent:
     """Intent for a KV save operation."""
@@ -60,27 +104,24 @@ class SaveIntent:
 class RequestTracker:
     """
     Tracks the KV cache state for a single request.
+
+    Load state lifecycle:
+    - on_lookup() creates LoadState (or None if no hit)
+    - on_alloc() updates LoadState with allocated blocks
+    - consume_load_intent() returns LoadIntent and clears LoadState
+    - Preemption: next on_lookup() replaces stale LoadState
     """
 
     __slots__ = (
         'request_id',
         '_block_hashes',
         '_block_size',
-        # Lookup state
-        '_hit_blocks',
-        '_computed_blocks',
-        '_lookup_done',
-        # Allocation state
+        '_load',
         '_allocated_blocks',
-        '_external_tokens',
-        # Progress tracking
         '_scheduled_tokens',
         '_stored_blocks',
-        # Save tracking
         '_total_layers',
         '_saved_layers',
-        # Flags
-        '_load_consumed',
         '_finished',
     )
 
@@ -94,40 +135,17 @@ class RequestTracker:
         self.request_id = request_id
         self._block_hashes = tuple(block_hashes)
         self._block_size = block_size
-
-        # Lookup state
-        self._hit_blocks: int = 0
-        self._computed_blocks: int = 0
-        self._lookup_done: bool = False
-
-        # Allocation state
+        self._load: LoadState | None = None
         self._allocated_blocks: list[int] = []
-        self._external_tokens: int = 0
-
-        # Progress tracking
         self._scheduled_tokens: int = 0
         self._stored_blocks: int = 0
-
-        # Save tracking
         self._total_layers = num_layers
         self._saved_layers: int = 0
-
-        # Flags
-        self._load_consumed: bool = False
         self._finished: bool = False
 
-    # ========== Properties ==========
     @property
     def phase(self) -> RequestPhase:
-        """
-        Current lifecycle phase (derived).
-
-        Matches the pre-refactor behavior to avoid regressions in scheduler
-        expectations.
-        """
-        if not self._lookup_done:
-            return RequestPhase.LOOKUP
-        if self._needs_load and not self._load_consumed:
+        if self._load is not None:
             return RequestPhase.LOADING
         if not self._finished:
             return RequestPhase.ACTIVE
@@ -139,25 +157,30 @@ class RequestTracker:
     def num_blocks(self) -> int:
         return len(self._block_hashes)
 
-    @property
-    def _needs_load(self) -> bool:
-        """Return True if we should load KV from external storage."""
-        return self._external_tokens > 0 and self._hit_blocks > self._computed_blocks
-
-    # ========== Events ==========
     def on_lookup(self, hit_blocks: int, computed_blocks: int) -> None:
-        self._hit_blocks = hit_blocks
-        self._computed_blocks = computed_blocks
-        self._lookup_done = True
+        """New lookup = fresh load state. Handles preemption implicitly."""
+        assert self._load is None
+        self._load = (
+            LoadState(hit_blocks=hit_blocks, computed_blocks=computed_blocks)
+            if hit_blocks > computed_blocks
+            else None
+        )
+        self._allocated_blocks = []
 
     def on_alloc(self, block_ids: list[int], num_external_tokens: int) -> None:
-        # Preserve previously allocated block IDs; vLLM may allocate in chunks.
         self._allocated_blocks.extend(block_ids)
-        if num_external_tokens > 0:
-            self._external_tokens = num_external_tokens
+        if self._load is not None:
+            self._load.allocated_blocks.extend(block_ids)
+            if num_external_tokens > 0:
+                self._load.external_tokens = num_external_tokens
+
+    def consume_load_intent(self) -> LoadIntent | None:
+        load, self._load = self._load, None
+        if load is None:
+            return None
+        return load.to_intent(self._block_hashes, self._block_size)
 
     def on_scheduled(self, num_tokens: int) -> None:
-        # Accumulate tokens across scheduler steps to mirror old behavior.
         self._scheduled_tokens += num_tokens
 
     def on_layer_saved(self) -> None:
@@ -165,29 +188,6 @@ class RequestTracker:
 
     def on_finished(self) -> None:
         self._finished = True
-
-    # ========== Intent consumption ==========
-    def consume_load_intent(self) -> LoadIntent | None:
-        if self._load_consumed or not self._needs_load:
-            return None
-
-        num_blocks = min(
-            self._hit_blocks,
-            len(self._allocated_blocks),
-            len(self._block_hashes),
-        )
-        load_blocks = num_blocks - self._computed_blocks
-        if load_blocks <= 0:
-            return None
-
-        self._load_consumed = True
-        start = self._computed_blocks
-        end = start + load_blocks
-        return LoadIntent(
-            block_ids=tuple(self._allocated_blocks[start:end]),
-            block_hashes=self._block_hashes[start:end],
-            num_tokens=load_blocks * self._block_size,
-        )
 
     def consume_save_intent(self) -> SaveIntent | None:
         saveable = min(
@@ -200,14 +200,12 @@ class RequestTracker:
             return None
 
         start = self._stored_blocks
-        end = start + new_blocks
-        self._stored_blocks = end
+        self._stored_blocks = start + new_blocks
         return SaveIntent(
-            block_ids=tuple(self._allocated_blocks[start:end]),
-            block_hashes=self._block_hashes[start:end],
+            block_ids=tuple(self._allocated_blocks[start:self._stored_blocks]),
+            block_hashes=self._block_hashes[start:self._stored_blocks],
         )
 
-    # ========== Queries ==========
     def should_hold_blocks(self) -> bool:
         return (self._finished and self._stored_blocks > 0 and
                 self._saved_layers < self._total_layers)
@@ -217,10 +215,10 @@ class RequestTracker:
 
     def __repr__(self) -> str:
         return (
-            f"RequestTracker(id={self.request_id}, phase={self.phase.value}, "
-            f"hit={self._hit_blocks}, computed={self._computed_blocks}, "
-            f"allocated={len(self._allocated_blocks)}, stored={self._stored_blocks}, "
-            f"saved_layers={self._saved_layers}/{self._total_layers})")
+            f"RequestTracker({self.request_id}, {self.phase.value}, "
+            f"load={self._load}, alloc={len(self._allocated_blocks)}, "
+            f"stored={self._stored_blocks}, saved={self._saved_layers}/{self._total_layers})"
+        )
 
 
 class PegaConnectorMetadata(KVConnectorMetadata):
@@ -300,6 +298,7 @@ __all__ = [
     "ConnectorContext",
     "ENGINE_ENDPOINT",
     "LoadIntent",
+    "LoadState",
     "PegaConnectorMetadata",
     "RequestPhase",
     "RequestTracker",
