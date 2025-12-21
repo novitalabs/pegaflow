@@ -1,0 +1,110 @@
+name: "CI"
+
+on:
+  push:
+    branches:
+      - "master"
+      - "main"
+  pull_request:
+    branches:
+      - "master"
+      - "main"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  RUST_TOOLCHAIN_NIGHTLY: nightly-2025-02-20
+  CARGO_TERM_COLOR: always
+  CACHE_KEY_SUFFIX: 20250101
+
+jobs:
+  typos-check:
+    name: typos check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run typos check
+        uses: crate-ci/typos@master
+
+  rust-fmt-check:
+    name: rust fmt check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: rustfmt
+      - name: Run rust format check
+        run: |
+          cargo fmt --all -- --check
+
+  rust-clippy-check:
+    name: rust clippy check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: clippy
+      - name: Cache Cargo home
+        uses: actions/cache@v4
+        id: cache
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.toml') }}-${{ env.CACHE_KEY_SUFFIX }}-clippy
+      - name: Run rust clippy check (core)
+        run: |
+          cargo clippy -p pegaflow-core --all-targets -- -D warnings
+      - name: Run rust clippy check (server)
+        run: |
+          cargo clippy -p pegaflow-server --all-targets -- -D warnings
+      # Skip python package clippy for now (requires CUDA)
+
+  cargo-check:
+    name: cargo check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - name: Cache Cargo home
+        uses: actions/cache@v4
+        id: cache
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.toml') }}-${{ env.CACHE_KEY_SUFFIX }}-check
+      - name: Run cargo check (core)
+        run: |
+          cargo check -p pegaflow-core
+      - name: Run cargo check (server)
+        run: |
+          cargo check -p pegaflow-server
+      # Skip python package check (requires CUDA)

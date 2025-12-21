@@ -320,7 +320,7 @@ impl StorageEngine {
                 let (used, total) = self.pinned_pool.usage();
                 error!(
                     "Pinned memory pool exhausted! Requested: {}, Used: {}, Total: {}, Cache empty",
-                    ByteSize(size.get() as u64),
+                    ByteSize(size.get()),
                     ByteSize(used),
                     ByteSize(total)
                 );

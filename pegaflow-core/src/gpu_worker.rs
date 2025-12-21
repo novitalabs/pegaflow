@@ -235,8 +235,8 @@ fn process_load_task(task: &LoadTask, stream: &CudaStream) -> Result<(), EngineE
                     .v_ptr()
                     .unwrap_or_else(|| unsafe { k_cpu_ptr.add(segment_size) });
 
-                k_transfers.push((k_gpu_offset, k_cpu_ptr as *const u8));
-                v_transfers.push((v_gpu_offset, v_cpu_ptr as *const u8));
+                k_transfers.push((k_gpu_offset, k_cpu_ptr));
+                v_transfers.push((v_gpu_offset, v_cpu_ptr));
             }
 
             transfer::batch_copy_segments_to_gpu(&k_transfers, segment_size, registration, stream)
