@@ -202,7 +202,7 @@ impl Engine for GrpcEngineService {
         level = "info",
         skip(self, request),
         fields(instance=%request.get_ref().instance_id, blocks=%request.get_ref().block_hashes.len()),
-        ret 
+        ret
     )]
     async fn query(
         &self,

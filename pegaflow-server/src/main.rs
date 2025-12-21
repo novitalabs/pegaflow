@@ -78,12 +78,8 @@ fn format_py_err(err: PyErr) -> String {
 }
 
 fn init_cuda_driver() -> Result<(), std::io::Error> {
-    cuda_driver::init().map_err(|err| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("failed to initialize CUDA driver: {err}"),
-        )
-    })
+    cuda_driver::init()
+        .map_err(|err| std::io::Error::other(format!("failed to initialize CUDA driver: {err}")))
 }
 
 fn init_python_cuda(device_id: i32) -> Result<(), std::io::Error> {
@@ -95,13 +91,10 @@ fn init_python_cuda(device_id: i32) -> Result<(), std::io::Error> {
         Ok(())
     })
     .map_err(|err| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!(
-                "failed to initialize python/tensor CUDA runtime: {}",
-                format_py_err(err)
-            ),
-        )
+        std::io::Error::other(format!(
+            "failed to initialize python/tensor CUDA runtime: {}",
+            format_py_err(err)
+        ))
     })
 }
 
@@ -142,10 +135,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let registry = CudaTensorRegistry::new().map_err(|err| {
         let msg = format_py_err(err);
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("failed to initialize torch CUDA context: {msg}"),
-        )
+        std::io::Error::other(format!("failed to initialize torch CUDA context: {msg}"))
     })?;
     let registry = Arc::new(Mutex::new(registry));
 

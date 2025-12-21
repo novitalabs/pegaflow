@@ -11,6 +11,7 @@ pub struct TensorMetadata {
 }
 
 struct LayerTensor {
+    #[allow(dead_code)]
     tensor: Py<PyAny>,
     metadata: TensorMetadata,
 }

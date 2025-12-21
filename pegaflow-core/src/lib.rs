@@ -251,6 +251,12 @@ impl InstanceContext {
     }
 }
 
+impl Default for PegaEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PegaEngine {
     /// Create a new PegaEngine instance
     #[instrument(level = "info")]
@@ -329,6 +335,7 @@ impl PegaEngine {
         err,
         fields(instance=%instance_id, rank=%tp_rank, device=%device_id, layer=%layer_name)
     )]
+    #[allow(clippy::too_many_arguments)]
     pub fn register_context_layer(
         &self,
         instance_id: &str,
@@ -508,6 +515,7 @@ impl PegaEngine {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn save_kv_blocks_from_ipc_inner(
         &self,
         instance_id: &str,
@@ -794,6 +802,7 @@ impl PegaEngine {
         err,
         fields(instance=%instance_id, rank=%tp_rank, device=%device_id, layers=%layer_names.len(), blocks=%block_ids.len())
     )]
+    #[allow(clippy::too_many_arguments)]
     pub fn batch_load_kv_blocks_multi_layer(
         &self,
         instance_id: &str,
@@ -826,6 +835,7 @@ impl PegaEngine {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn batch_load_kv_blocks_multi_layer_inner(
         &self,
         instance_id: &str,

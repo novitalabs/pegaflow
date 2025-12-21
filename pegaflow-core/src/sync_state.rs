@@ -218,7 +218,7 @@ fn init_new_mapping(shmem: &Shmem) -> Result<NonNull<LoadStateMem>, LoadStateErr
 
     if offset
         .checked_add(layout.size())
-        .map_or(true, |end| end > shmem.len())
+        .is_none_or(|end| end > shmem.len())
     {
         return Err(LoadStateError::MappingTooSmall {
             actual: shmem.len(),
@@ -264,7 +264,7 @@ fn attach_mapping(shmem: &Shmem) -> Result<NonNull<LoadStateMem>, LoadStateError
 
     if offset
         .checked_add(layout.size())
-        .map_or(true, |end| end > shmem.len())
+        .is_none_or(|end| end > shmem.len())
     {
         return Err(LoadStateError::MappingTooSmall {
             actual: shmem.len(),
