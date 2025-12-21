@@ -78,9 +78,8 @@ fn format_py_err(err: PyErr) -> String {
 }
 
 fn init_cuda_driver() -> Result<(), std::io::Error> {
-    cuda_driver::init().map_err(|err| {
-        std::io::Error::other(format!("failed to initialize CUDA driver: {err}"))
-    })
+    cuda_driver::init()
+        .map_err(|err| std::io::Error::other(format!("failed to initialize CUDA driver: {err}")))
 }
 
 fn init_python_cuda(device_id: i32) -> Result<(), std::io::Error> {
