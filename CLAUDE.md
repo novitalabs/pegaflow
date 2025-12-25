@@ -15,6 +15,12 @@ cargo build --release    # Release build
 cargo test               # Run Rust tests
 ```
 
+### CI Checks (Local)
+Run all CI checks locally before committing:
+```bash
+./scripts/check.sh       # Run fmt, typos, clippy, and cargo check
+```
+
 ### Python Bindings (PyO3 via maturin)
 ```bash
 cd python

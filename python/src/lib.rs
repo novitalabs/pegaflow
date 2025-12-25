@@ -1,5 +1,5 @@
 use pegaflow_core::{LoadState, PegaEngine as CoreEngine};
-use pegaflow_server::proto::engine::{
+use pegaflow_proto::proto::engine::{
     engine_client::EngineClient, HealthRequest, LoadRequest, QueryRequest, RegisterContextRequest,
     ResponseStatus, SaveLayer, SaveRequest, ShutdownRequest, UnregisterRequest,
 };

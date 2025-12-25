@@ -3,8 +3,17 @@ name = "pegaflow-server"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+name = "pegaflow_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pegaflow-server"
+path = "src/main.rs"
+
 [dependencies]
 pegaflow-core.workspace = true
+pegaflow-proto = { path = "../pegaflow-proto" }
 prost.workspace = true
 pyo3 = { workspace = true, features = ["auto-initialize"] }
 cudarc.workspace = true
@@ -27,5 +36,4 @@ opentelemetry-otlp.workspace = true
 tikv-jemallocator.workspace = true
 
 [build-dependencies]
-tonic-prost-build = "0.14"
 pyo3-build-config.workspace = true

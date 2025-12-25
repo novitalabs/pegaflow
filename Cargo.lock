@@ -1337,10 +1337,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "pegaflow-proto"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
 name = "pegaflow-py"
 version = "0.0.1"
 dependencies = [
  "pegaflow-core",
+ "pegaflow-proto",
  "pegaflow-server",
  "pyo3",
  "tokio",
@@ -1361,6 +1372,7 @@ dependencies = [
  "opentelemetry_sdk",
  "parking_lot",
  "pegaflow-core",
+ "pegaflow-proto",
  "prost",
  "pyo3",
  "pyo3-build-config",
@@ -1372,7 +1384,6 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tonic-prost",
- "tonic-prost-build",
  "tracing",
  "tracing-subscriber",
  "uuid",

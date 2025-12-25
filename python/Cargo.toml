@@ -7,11 +7,17 @@ edition.workspace = true
 name = "pegaflow"
 crate-type = ["cdylib"]
 
+# Binary for pegaflow-server (will be included in wheel by maturin)
+[[bin]]
+name = "pegaflow-server-py"
+path = "src/bin/server.rs"
+
 [dependencies]
 pyo3 = { workspace = true, features = ["extension-module"] }
 pegaflow-core.workspace = true
+pegaflow-proto = { path = "../pegaflow-proto" }
+pegaflow-server = { path = "../pegaflow-server" }
 tracing-subscriber.workspace = true
 tokio.workspace = true
 tonic.workspace = true
 tracing.workspace = true
-pegaflow-server = { path = "../pegaflow-server" }

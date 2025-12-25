@@ -1,5 +1,5 @@
 [workspace]
-members = ["pegaflow-core", "python", "pegaflow-server"]
+members = ["pegaflow-core", "pegaflow-proto", "pegaflow-server", "python"]
 resolver = "2"
 
 [workspace.package]

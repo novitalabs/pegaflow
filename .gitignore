@@ -14,6 +14,10 @@ venv/
 examples/bench_results/
 examples/pd_logs/
 
+# Built binaries in Python package (generated during wheel build)
+python/pegaflow/pegaflow-server
+python/pegaflow/pegaflow-server-py
+
 # IDE
 .vscode/
 .idea/
