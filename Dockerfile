@@ -29,13 +29,13 @@ COPY . .
 
 # Build release wheel and stage it for the runtime image
 RUN ./scripts/build-wheel.sh --release \
- && cp target/wheels/pegaflow-*.whl /tmp/pegaflow.whl
+ && cp target/wheels/pegaflow-*.whl /tmp/
 
 
 FROM vllm/vllm-openai:latest
 
-COPY --from=builder /tmp/pegaflow.whl /tmp/pegaflow.whl
-RUN python3 -m pip install --no-cache-dir /tmp/pegaflow.whl \
- && rm /tmp/pegaflow.whl
+COPY --from=builder /tmp/pegaflow-*.whl /tmp/
+RUN python3 -m pip install --no-cache-dir /tmp/pegaflow-*.whl \
+ && rm /tmp/pegaflow-*.whl
 
 WORKDIR /workspace
