@@ -52,8 +52,9 @@ jobs:
 
       - name: Build wheel
         run: |
-          cd python
-          maturin build --release --out ../dist
+          ./scripts/build-wheel.sh --release
+          mkdir -p dist
+          cp target/wheels/*.whl dist/
         env:
           CUDA_PATH: /usr/local/cuda
 
