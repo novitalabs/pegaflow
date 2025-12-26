@@ -105,8 +105,8 @@ fn init_metrics(
     endpoint: Option<String>,
     period_secs: u64,
 ) -> Result<Option<SdkMeterProvider>, Box<dyn Error>> {
-    let Some(endpoint) = endpoint else {
-        info!("OTLP metrics disabled (no endpoint configured)");
+    let Some(endpoint) = endpoint.filter(|s| !s.is_empty()) else {
+        info!("OTLP metrics disabled (no endpoint configured or endpoint is empty)");
         return Ok(None);
     };
 

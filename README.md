@@ -94,6 +94,8 @@ The warm-start path achieves **~9x faster TTFT** compared to cold-start, demonst
 
 To maximize I/O throughput when using PegaFlow with vLLM, we recommend a small patch to vLLM's KV cache block allocation. Sorting block IDs ensures GPU memory addresses are as sequential and contiguous as possible, which improves DMA/RDMA transfer efficiency.
 
+Upstream RFC: https://github.com/vllm-project/vllm/issues/31371
+
 Locate the file `vllm/v1/core/kv_cache_utils.py` in your vLLM installation (e.g., `.venv/lib/python3.10/site-packages/vllm/v1/core/kv_cache_utils.py`), find the `append_n` method in the `FreeKVCacheBlockQueue` class, and add a sorting line:
 
 ```python
