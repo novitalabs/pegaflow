@@ -27,9 +27,10 @@ classifiers = [
 ]
 
 [tool.maturin]
-# The Rust extension module will be named pegaflow.pegaflow
-# This allows: from pegaflow import PegaEngine
 module-name = "pegaflow.pegaflow"
 python-source = "."
-features = ["pyo3/extension-module"]
+# Automatically include binaries defined in Cargo.toml [[bin]] sections
+include = ["pegaflow/pegaflow-server-py"]
 
+[project.scripts]
+pegaflow-server = "pegaflow._server:main"
