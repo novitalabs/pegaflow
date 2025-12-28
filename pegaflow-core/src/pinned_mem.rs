@@ -236,12 +236,18 @@ impl Drop for PinnedMemory {
     fn drop(&mut self) {
         // SAFETY: ptr was registered with cudaHostRegister in allocate_internal
         unsafe {
-            rt::cudaHostUnregister(self.ptr.as_ptr() as *mut libc::c_void);
+            let result = rt::cudaHostUnregister(self.ptr.as_ptr() as *mut libc::c_void);
+            if result != rt::cudaError::cudaSuccess {
+                eprintln!("Warning: cudaHostUnregister failed: {:?}", result);
+            }
         }
 
         // SAFETY: ptr was allocated by mmap with the same size
         unsafe {
-            libc::munmap(self.ptr.as_ptr() as *mut libc::c_void, self.size);
+            if libc::munmap(self.ptr.as_ptr() as *mut libc::c_void, self.size) == -1 {
+                let err = std::io::Error::last_os_error();
+                eprintln!("Warning: munmap failed: {}", err);
+            }
         }
     }
 }
