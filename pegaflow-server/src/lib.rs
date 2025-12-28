@@ -58,6 +58,22 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub use_hugepages: bool,
 
+    /// Enable pre-eviction background monitoring
+    #[arg(long, default_value_t = false)]
+    pub pre_evict: bool,
+
+    /// Pre-eviction threshold: start evicting when free space drops below this (supports units: kb, mb, gb, tb)
+    #[arg(long, default_value = "5gb", value_parser = parse_memory_size)]
+    pub pre_evict_threshold: usize,
+
+    /// Pre-eviction target: evict until free space reaches this target (supports units: kb, mb, gb, tb)
+    #[arg(long, default_value = "8gb", value_parser = parse_memory_size)]
+    pub pre_evict_target: usize,
+
+    /// Pre-eviction check interval in milliseconds
+    #[arg(long, default_value_t = 100)]
+    pub pre_evict_interval_ms: u64,
+
     /// Enable OTLP metrics export over gRPC (e.g. http://127.0.0.1:4317). Leave empty to disable.
     #[arg(long, default_value = "http://127.0.0.1:4321")]
     pub metrics_otel_endpoint: Option<String>,
@@ -154,9 +170,27 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         cli.pool_size,
         cli.use_hugepages
     );
-    let engine = Arc::new(PegaEngine::new_with_pool_size(
+
+    let pre_evict_config = if cli.pre_evict {
+        info!(
+            "Pre-eviction enabled: threshold={:.2} GiB, target={:.2} GiB, interval={}ms",
+            cli.pre_evict_threshold as f64 / (1024.0 * 1024.0 * 1024.0),
+            cli.pre_evict_target as f64 / (1024.0 * 1024.0 * 1024.0),
+            cli.pre_evict_interval_ms
+        );
+        pegaflow_core::PreEvictConfig::new(
+            cli.pre_evict_threshold as u64,
+            cli.pre_evict_target as u64,
+            cli.pre_evict_interval_ms,
+        )
+    } else {
+        pegaflow_core::PreEvictConfig::default()
+    };
+
+    let engine = Arc::new(PegaEngine::new_with_config(
         cli.pool_size,
         cli.use_hugepages,
+        pre_evict_config,
     ));
     let shutdown = Arc::new(Notify::new());
 
