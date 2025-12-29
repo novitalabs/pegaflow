@@ -8,6 +8,7 @@ pub mod sync_state;
 mod transfer;
 
 pub use pinned_pool::PinnedAllocation;
+pub use storage::PreEvictConfig;
 pub use sync_state::{LoadState, LoadStateError};
 
 // ============================================================================
@@ -269,7 +270,18 @@ impl PegaEngine {
     ///
     /// If `use_hugepages` is true, uses 2MB huge pages (requires system config).
     pub fn new_with_pool_size(pool_size: usize, use_hugepages: bool) -> Self {
-        let storage = StorageEngine::new(pool_size, use_hugepages);
+        Self::new_with_config(pool_size, use_hugepages, storage::PreEvictConfig::default())
+    }
+
+    /// Create a new PegaEngine instance with custom pool size and pre-eviction config
+    ///
+    /// If `use_hugepages` is true, uses 2MB huge pages (requires system config).
+    pub fn new_with_config(
+        pool_size: usize,
+        use_hugepages: bool,
+        pre_evict_config: storage::PreEvictConfig,
+    ) -> Self {
+        let storage = StorageEngine::new_with_config(pool_size, use_hugepages, pre_evict_config);
         PegaEngine {
             instances: RwLock::new(HashMap::new()),
             storage,
