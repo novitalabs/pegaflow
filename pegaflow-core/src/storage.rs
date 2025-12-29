@@ -347,14 +347,12 @@ impl LayerBlock {
         self.size
     }
 
-    /// Total pinned memory occupied by this layer block (K + V if split).
+    /// Total pinned memory occupied by this layer block.
+    ///
+    /// For both contiguous and split layouts, `self.size` holds `block_size_bytes`
+    /// which equals `bytes_per_block * segments` (the total K+V size).
     pub fn memory_footprint(&self) -> u64 {
-        let k_bytes = self.size as u64;
-        if self.v_allocation.is_some() {
-            k_bytes * 2 // Split storage: K and V each occupy `size` bytes
-        } else {
-            k_bytes // Contiguous: single allocation
-        }
+        self.size as u64
     }
 }
 

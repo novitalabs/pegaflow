@@ -172,6 +172,23 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     );
 
     let pre_evict_config = if cli.pre_evict {
+        // Validate: target must be greater than threshold to ensure eviction frees memory
+        if cli.pre_evict_target <= cli.pre_evict_threshold {
+            return Err(format!(
+                "--pre-evict-target ({}) must be greater than --pre-evict-threshold ({})",
+                cli.pre_evict_target, cli.pre_evict_threshold
+            )
+            .into());
+        }
+        // Validate: target must not exceed pool capacity
+        if cli.pre_evict_target > cli.pool_size {
+            return Err(format!(
+                "--pre-evict-target ({}) must not exceed --pool-size ({})",
+                cli.pre_evict_target, cli.pool_size
+            )
+            .into());
+        }
+
         info!(
             "Pre-eviction enabled: threshold={:.2} GiB, target={:.2} GiB, interval={}ms",
             cli.pre_evict_threshold as f64 / (1024.0 * 1024.0 * 1024.0),
