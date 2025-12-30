@@ -2,11 +2,11 @@
 //!
 //! This module provides two allocation strategies:
 //!
-//! 1. **Regular pages** (`PinnedMemory::allocate`): Uses `mmap(MAP_POPULATE)` + `cudaHostRegister`.
-//!    Works on any system but slower (~20s for 30GB).
+//! 1. **Write-combined** (`PinnedMemory::allocate`): Uses `cudaHostAlloc` with write-combined flag.
+//!    Optimized for CPU-to-GPU transfers with better write performance.
 //!
 //! 2. **Huge pages** (`PinnedMemory::allocate_hugepages`): Uses `mmap(MAP_HUGETLB)` + `cudaHostRegister`.
-//!    Much faster (~6s for 30GB) but requires pre-configured huge pages:
+//!    Much faster allocation for large buffers but requires pre-configured huge pages:
 //!    ```bash
 //!    # Reserve huge pages (size from /proc/meminfo, typically 2MB)
 //!    sudo sh -c 'echo 15360 > /proc/sys/vm/nr_hugepages'
@@ -15,18 +15,15 @@
 //! # Safety
 //!
 //! The memory returned is:
-//! - Page-aligned (4KB or huge page size depending on allocation method)
 //! - Pinned and registered with CUDA for DMA transfers
 //! - Valid for the lifetime of the `PinnedMemory` struct
-//! - Automatically unmapped and unregistered on drop
+//! - Automatically freed/unmapped and unregistered on drop
 
 use std::io;
 use std::ptr::NonNull;
 use std::sync::OnceLock;
 
 use cudarc::runtime::sys as rt;
-
-const PAGE_SIZE: usize = 4096;
 
 /// Cached huge page size from /proc/meminfo
 static HUGE_PAGE_SIZE: OnceLock<Option<usize>> = OnceLock::new();
@@ -67,6 +64,8 @@ pub fn huge_page_size() -> Option<usize> {
 pub enum PinnedMemError {
     /// mmap failed
     MmapFailed(io::Error),
+    /// cudaHostAlloc failed
+    CudaAllocFailed(rt::cudaError),
     /// cudaHostRegister failed
     CudaRegisterFailed(rt::cudaError),
     /// Size must be greater than zero
@@ -79,6 +78,7 @@ impl std::fmt::Display for PinnedMemError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MmapFailed(e) => write!(f, "mmap failed: {}", e),
+            Self::CudaAllocFailed(e) => write!(f, "cudaHostAlloc failed: {:?}", e),
             Self::CudaRegisterFailed(e) => write!(f, "cudaHostRegister failed: {:?}", e),
             Self::ZeroSize => write!(f, "size must be greater than zero"),
             Self::HugePageSizeUnavailable => write!(
@@ -94,15 +94,15 @@ impl std::error::Error for PinnedMemError {}
 /// Allocation strategy for pinned memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AllocStrategy {
-    /// Regular 4KB pages with MAP_POPULATE
-    Regular,
+    /// Write-combined via cudaHostAlloc
+    WriteCombined,
     /// Huge pages (size from /proc/meminfo, requires system configuration)
     HugePages,
 }
 
-/// RAII wrapper for pinned memory allocated via mmap + cudaHostRegister.
+/// RAII wrapper for CUDA pinned memory.
 ///
-/// Memory is automatically unmapped and unregistered when dropped.
+/// Memory is automatically freed/unmapped and unregistered when dropped.
 pub struct PinnedMemory {
     ptr: NonNull<u8>,
     size: usize,
@@ -117,16 +117,16 @@ unsafe impl Send for PinnedMemory {}
 unsafe impl Sync for PinnedMemory {}
 
 impl PinnedMemory {
-    /// Allocate pinned memory using regular pages.
+    /// Allocate pinned memory using write-combined mode.
     ///
-    /// Uses `mmap(MAP_POPULATE)` to pre-fault pages, then registers with CUDA.
-    /// This works on any system but is slower than huge pages.
+    /// Uses `cudaHostAlloc` with `cudaHostAllocWriteCombined` flag.
+    /// Optimized for CPU-to-GPU transfers.
     ///
     /// # Errors
     ///
-    /// Returns error if mmap or cudaHostRegister fails.
+    /// Returns error if cudaHostAlloc fails.
     pub fn allocate(size: usize) -> Result<Self, PinnedMemError> {
-        Self::allocate_internal(size, AllocStrategy::Regular)
+        Self::allocate_internal(size, AllocStrategy::WriteCombined)
     }
 
     /// Allocate pinned memory using huge pages.
@@ -151,52 +151,54 @@ impl PinnedMemory {
             return Err(PinnedMemError::ZeroSize);
         }
 
-        let (aligned_size, mmap_flags) = match strategy {
-            AllocStrategy::Regular => {
-                let aligned = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-                let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_POPULATE;
-                (aligned, flags)
+        let (ptr, aligned_size) = match strategy {
+            AllocStrategy::WriteCombined => {
+                // Use cudaHostAlloc with write-combined flag
+                let mut ptr: *mut libc::c_void = std::ptr::null_mut();
+                let result =
+                    unsafe { rt::cudaHostAlloc(&mut ptr, size, rt::cudaHostAllocWriteCombined) };
+                if result != rt::cudaError::cudaSuccess {
+                    return Err(PinnedMemError::CudaAllocFailed(result));
+                }
+                (ptr, size)
             }
             AllocStrategy::HugePages => {
                 let huge_page_size =
                     get_huge_page_size().ok_or(PinnedMemError::HugePageSizeUnavailable)?;
                 let aligned = (size + huge_page_size - 1) & !(huge_page_size - 1);
                 let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_HUGETLB;
-                (aligned, flags)
+
+                // SAFETY: mmap with MAP_ANONYMOUS creates a new anonymous mapping.
+                let ptr = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        aligned,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        flags,
+                        -1,
+                        0,
+                    )
+                };
+
+                if ptr == libc::MAP_FAILED {
+                    return Err(PinnedMemError::MmapFailed(std::io::Error::last_os_error()));
+                }
+
+                // Register with CUDA for DMA
+                let result =
+                    unsafe { rt::cudaHostRegister(ptr, aligned, rt::cudaHostRegisterDefault) };
+
+                if result != rt::cudaError::cudaSuccess {
+                    unsafe { libc::munmap(ptr, aligned) };
+                    return Err(PinnedMemError::CudaRegisterFailed(result));
+                }
+
+                (ptr, aligned)
             }
         };
 
-        // SAFETY: mmap with MAP_ANONYMOUS creates a new anonymous mapping.
-        // The flags are valid and size is non-zero and aligned.
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                aligned_size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                mmap_flags,
-                -1,
-                0,
-            )
-        };
-
-        if ptr == libc::MAP_FAILED {
-            return Err(PinnedMemError::MmapFailed(std::io::Error::last_os_error()));
-        }
-
-        // SAFETY: ptr is valid from mmap, and we're registering it with CUDA.
-        // cudaHostRegister pins the memory and makes it accessible for DMA.
-        let result =
-            unsafe { rt::cudaHostRegister(ptr, aligned_size, rt::cudaHostRegisterDefault) };
-
-        if result != rt::cudaError::cudaSuccess {
-            // Clean up mmap on failure
-            // SAFETY: ptr was returned by mmap with the same size
-            unsafe { libc::munmap(ptr, aligned_size) };
-            return Err(PinnedMemError::CudaRegisterFailed(result));
-        }
-
-        // SAFETY: mmap succeeded and returned non-null pointer
-        let ptr = NonNull::new(ptr as *mut u8).expect("mmap returned null but not MAP_FAILED");
+        // SAFETY: allocation succeeded and returned non-null pointer
+        let ptr = NonNull::new(ptr as *mut u8).expect("allocation returned null");
 
         Ok(Self {
             ptr,
@@ -234,19 +236,30 @@ impl PinnedMemory {
 
 impl Drop for PinnedMemory {
     fn drop(&mut self) {
-        // SAFETY: ptr was registered with cudaHostRegister in allocate_internal
-        unsafe {
-            let result = rt::cudaHostUnregister(self.ptr.as_ptr() as *mut libc::c_void);
-            if result != rt::cudaError::cudaSuccess {
-                eprintln!("Warning: cudaHostUnregister failed: {:?}", result);
+        match self.strategy {
+            AllocStrategy::WriteCombined => {
+                // SAFETY: ptr was allocated with cudaHostAlloc
+                let result = unsafe { rt::cudaFreeHost(self.ptr.as_ptr() as *mut libc::c_void) };
+                if result != rt::cudaError::cudaSuccess {
+                    eprintln!("Warning: cudaFreeHost failed: {:?}", result);
+                }
             }
-        }
+            AllocStrategy::HugePages => {
+                // SAFETY: ptr was registered with cudaHostRegister
+                unsafe {
+                    let result = rt::cudaHostUnregister(self.ptr.as_ptr() as *mut libc::c_void);
+                    if result != rt::cudaError::cudaSuccess {
+                        eprintln!("Warning: cudaHostUnregister failed: {:?}", result);
+                    }
+                }
 
-        // SAFETY: ptr was allocated by mmap with the same size
-        unsafe {
-            if libc::munmap(self.ptr.as_ptr() as *mut libc::c_void, self.size) == -1 {
-                let err = std::io::Error::last_os_error();
-                eprintln!("Warning: munmap failed: {}", err);
+                // SAFETY: ptr was allocated by mmap with the same size
+                unsafe {
+                    if libc::munmap(self.ptr.as_ptr() as *mut libc::c_void, self.size) == -1 {
+                        let err = std::io::Error::last_os_error();
+                        eprintln!("Warning: munmap failed: {}", err);
+                    }
+                }
             }
         }
     }
@@ -257,7 +270,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_allocate_regular() {
+    fn test_allocate_write_combined() {
         // Skip if no CUDA context available
         if cudarc::driver::CudaContext::new(0).is_err() {
             return;
@@ -265,7 +278,7 @@ mod tests {
 
         let mem = PinnedMemory::allocate(4096).unwrap();
         assert!(mem.size() >= 4096);
-        assert_eq!(mem.strategy(), AllocStrategy::Regular);
+        assert_eq!(mem.strategy(), AllocStrategy::WriteCombined);
     }
 
     #[test]
