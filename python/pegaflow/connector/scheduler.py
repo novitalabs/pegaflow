@@ -3,7 +3,6 @@ Scheduler-side connector logic.
 """
 
 import time
-import random
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
@@ -29,8 +28,6 @@ class SchedulerConnector:
 
     def __init__(self, context: ConnectorContext):
         self._ctx = context
-        self._save_admission_prob = context.save_admission_prob
-        self._rng = random.Random()
         self._trackers: dict[str, RequestTracker] = {}
         self._pending_load_intents: dict[str, LoadIntent] = {}
         self._held_requests: set[str] = set()
@@ -196,10 +193,6 @@ class SchedulerConnector:
         if tracker:
             tracker.on_finished()
 
-            if not tracker.save_admitted:
-                del self._trackers[req_id]
-                return (False, None)
-
             if tracker.should_hold_blocks():
                 self._held_requests.add(req_id)
                 logger.debug(
@@ -213,25 +206,12 @@ class SchedulerConnector:
     def _get_or_create_tracker(self, request: "Request") -> RequestTracker:
         req_id = request.request_id
         if req_id not in self._trackers:
-            save_admitted = (
-                self._save_admission_prob >= 1.0
-                or self._rng.random() < self._save_admission_prob
-            )
-            tracker = RequestTracker(
+            self._trackers[req_id] = RequestTracker(
                 request_id=req_id,
                 block_hashes=list(request.block_hashes),
                 block_size=self._ctx.block_size,
                 num_layers=self._ctx.num_layers,
-                save_admitted=save_admitted,
             )
-            self._trackers[req_id] = tracker
-
-            if not save_admitted:
-                logger.info(
-                    "[PegaKVConnector] Request %s skipped KV save (p=%.2f)",
-                    req_id,
-                    self._save_admission_prob,
-                )
         return self._trackers[req_id]
 
     def _count_available_block_prefix(self, block_hashes: Iterable[bytes]) -> int:

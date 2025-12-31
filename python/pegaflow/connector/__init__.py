@@ -23,7 +23,6 @@ from pegaflow.connector.common import (
     derive_namespace,
     logger,
     resolve_instance_id,
-    resolve_save_admission_prob,
 )
 from pegaflow.connector.scheduler import SchedulerConnector
 from pegaflow.connector.worker import WorkerConnector
@@ -44,7 +43,6 @@ class PegaKVConnector(KVConnectorBase_V1):
             vllm_config.model_config.hf_text_config, "num_hidden_layers", 0
         )
         block_size = vllm_config.cache_config.block_size
-        save_admission_prob = resolve_save_admission_prob()
 
         tp_rank: Optional[int] = None
         device_id: Optional[int] = None
@@ -68,7 +66,6 @@ class PegaKVConnector(KVConnectorBase_V1):
             tp_rank=tp_rank,
             device_id=device_id,
             engine_client=engine_client,
-            save_admission_prob=save_admission_prob,
         )
 
         self._scheduler: SchedulerConnector | None = None
@@ -79,7 +76,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             self._worker = WorkerConnector(self._ctx)
 
         logger.info(
-            "[PegaKVConnector] Initialized role=%s instance_id=%s device=%s tp_rank=%s tp_size=%d layers=%d namespace=%s save_prob=%.3f",
+            "[PegaKVConnector] Initialized role=%s instance_id=%s device=%s tp_rank=%s tp_size=%d layers=%d namespace=%s",
             role.name,
             instance_id,
             device_id if device_id is not None else "cpu",
@@ -87,7 +84,6 @@ class PegaKVConnector(KVConnectorBase_V1):
             tp_size,
             num_layers,
             namespace,
-            save_admission_prob,
         )
 
     # ==============================

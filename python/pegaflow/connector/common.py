@@ -17,8 +17,6 @@ logger = get_connector_logger()
 
 # Engine server endpoint (gRPC URL)
 ENGINE_ENDPOINT = os.environ.get("PEGAFLOW_ENGINE_ENDPOINT", "http://127.0.0.1:50055")
-SAVE_ADMISSION_ENV = "PEGAFLOW_SAVE_ADMISSION_PROB"
-DEFAULT_SAVE_ADMISSION_PROB = 1.0
 
 
 @dataclass(frozen=True)
@@ -33,7 +31,6 @@ class ConnectorContext:
     tp_rank: int | None
     device_id: int | None
     engine_client: EngineRpcClient
-    save_admission_prob: float
 
 
 class RequestPhase(enum.Enum):
@@ -129,7 +126,6 @@ class RequestTracker:
         "_stored_blocks",
         "_total_layers",
         "_saved_layers",
-        "_save_admitted",
         "_finished",
     )
 
@@ -139,7 +135,6 @@ class RequestTracker:
         block_hashes: list[bytes],
         block_size: int,
         num_layers: int,
-        save_admitted: bool = True,
     ):
         self.request_id = request_id
         self._block_hashes = tuple(block_hashes)
@@ -149,8 +144,7 @@ class RequestTracker:
         self._scheduled_tokens: int = 0
         self._stored_blocks: int = 0
         self._total_layers = num_layers
-        self._saved_layers: int = 0 if save_admitted else num_layers
-        self._save_admitted = save_admitted
+        self._saved_layers: int = 0
         self._finished: bool = False
 
     @property
@@ -166,10 +160,6 @@ class RequestTracker:
     @property
     def num_blocks(self) -> int:
         return len(self._block_hashes)
-
-    @property
-    def save_admitted(self) -> bool:
-        return self._save_admitted
 
     def on_lookup(self, hit_blocks: int, computed_blocks: int) -> None:
         """New lookup = fresh load state. Handles preemption implicitly."""
@@ -197,18 +187,12 @@ class RequestTracker:
         self._scheduled_tokens += num_tokens
 
     def on_layer_saved(self) -> None:
-        if not self._save_admitted:
-            return
-        if self._saved_layers < self._total_layers:
-            self._saved_layers += 1
+        self._saved_layers += 1
 
     def on_finished(self) -> None:
         self._finished = True
 
     def consume_save_intent(self) -> SaveIntent | None:
-        if not self._save_admitted:
-            return None
-
         saveable = min(
             len(self._block_hashes),
             len(self._allocated_blocks),
@@ -239,8 +223,7 @@ class RequestTracker:
         return (
             f"RequestTracker({self.request_id}, {self.phase.value}, "
             f"load={self._load}, alloc={len(self._allocated_blocks)}, "
-            f"stored={self._stored_blocks}, saved={self._saved_layers}/{self._total_layers}, "
-            f"save_admitted={self._save_admitted})"
+            f"stored={self._stored_blocks}, saved={self._saved_layers}/{self._total_layers})"
         )
 
 
@@ -297,47 +280,6 @@ def resolve_instance_id(vllm_config, dp_rank_suffix: bool = True) -> str:
     return instance_id
 
 
-def resolve_save_admission_prob() -> float:
-    """
-    Resolve save admission probability from env.
-
-    Accepts a float in [0, 1]. Values >1 are treated as percentages (divided by 100).
-    Clamps to [0, 1] and falls back to DEFAULT_SAVE_ADMISSION_PROB on parse errors.
-    """
-    raw = os.environ.get(SAVE_ADMISSION_ENV)
-    if raw is None or raw == "":
-        return DEFAULT_SAVE_ADMISSION_PROB
-
-    try:
-        prob = float(raw)
-    except ValueError:
-        logger.warning(
-            "[PegaKVConnector] Invalid %s=%s; using default %.2f",
-            SAVE_ADMISSION_ENV,
-            raw,
-            DEFAULT_SAVE_ADMISSION_PROB,
-        )
-        return DEFAULT_SAVE_ADMISSION_PROB
-
-    if prob > 1.0:
-        prob = prob / 100.0
-        logger.info(
-            "[PegaKVConnector] Interpreting %s as percentage: %.4f",
-            SAVE_ADMISSION_ENV,
-            prob,
-        )
-
-    clamped = max(0.0, min(prob, 1.0))
-    if clamped != prob:
-        logger.warning(
-            "[PegaKVConnector] Clamped %s to %.2f (raw=%.4f)",
-            SAVE_ADMISSION_ENV,
-            clamped,
-            prob,
-        )
-    return clamped
-
-
 def derive_namespace(vllm_config, tp_size: int) -> str:
     """
     Derive namespace for storage isolation.
@@ -372,5 +314,4 @@ __all__ = [
     "derive_namespace",
     "logger",
     "resolve_instance_id",
-    "resolve_save_admission_prob",
 ]
