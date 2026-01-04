@@ -1,0 +1,492 @@
+from __future__ import annotations
+
+import hashlib
+import logging
+import os
+import pickle
+import time
+import uuid
+import weakref
+from typing import TYPE_CHECKING, Sequence
+
+import torch
+
+from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+from sglang.srt.mem_cache.hicache_storage import get_hash_str
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+
+from pegaflow import EngineRpcClient, PyLoadState
+from pegaflow.ipc_wrapper import CudaIPCWrapper
+
+logger = logging.getLogger(__name__)
+
+# Engine server endpoint (gRPC URL)
+ENGINE_ENDPOINT = os.environ.get("PEGAFLOW_ENGINE_ENDPOINT", "http://127.0.0.1:50055")
+
+if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+
+
+def _default_instance_id() -> str:
+    return os.environ.get("PEGAFLOW_INSTANCE_ID", uuid.uuid4().hex)
+
+
+def _default_namespace(model_config: "ModelConfig | None", tp_size: int = 1) -> str:
+    factors = {
+        "model": getattr(model_config, "model_path", None),
+        "dtype": str(getattr(model_config, "dtype", "")),
+        "num_hidden_layers": getattr(model_config, "num_hidden_layers", None),
+        "num_kv_heads": getattr(model_config, "num_key_value_heads", None),
+        "head_dim": getattr(model_config, "head_dim", None),
+        "tp_size": tp_size,
+    }
+
+    # Filter out None values for cleaner hashing
+    factors = {k: v for k, v in factors.items() if v is not None}
+
+    payload = str(sorted(factors.items())).encode()
+    return hashlib.sha256(payload).hexdigest()[:8]
+
+
+def _seed_from_extra_key(extra_key: str | None) -> str | None:
+    if extra_key is None:
+        return None
+    return hashlib.sha256(str(extra_key).encode()).hexdigest()
+
+
+def _resolve_device_id() -> int:
+    """
+    Return the global CUDA device id even when CUDA_VISIBLE_DEVICES masks GPUs.
+
+    torch.cuda.current_device() returns the local index within the visible set,
+    but we need the actual global device ID for operations like CUDA IPC.
+    """
+    local_id = torch.cuda.current_device()
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if not visible:
+        return local_id
+
+    slots = [slot.strip() for slot in visible.split(",") if slot.strip()]
+    try:
+        return int(slots[local_id])
+    except (IndexError, ValueError):
+        return local_id
+
+
+def _hash_pages(
+    token_ids: Sequence[int],
+    page_size: int,
+    prior_hash: str | None = None,
+    extra_key: str | None = None,
+) -> tuple[list[bytes], str | None]:
+    """Compute chained SHA256 hashes per page."""
+    current = prior_hash or _seed_from_extra_key(extra_key)
+    hashes: list[bytes] = []
+
+    for start in range(0, len(token_ids), page_size):
+        page = token_ids[start : start + page_size]
+        current = get_hash_str(page, prior_hash=current)
+        hashes.append(bytes.fromhex(current))
+
+    return hashes, current
+
+
+class PeagflowRadixCache(RadixCache):
+    """RadixCache + PegaFlow RPC backend."""
+
+    def __init__(
+        self,
+        params: "CacheInitParams",
+        model_config: "ModelConfig | None" = None,
+        tp_size: int = 1,
+        rank: int = 0,
+        tp_group=None,
+        instance_id: str | None = None,
+        namespace: str | None = None,
+        engine_endpoint: str | None = None,
+    ):
+        super().__init__(params)
+
+        if EngineRpcClient is None:
+            raise RuntimeError(
+                "pegaflow extension is not available (EngineRpcClient missing)"
+            )
+
+        self.instance_id = instance_id or _default_instance_id()
+        self.namespace = namespace or _default_namespace(model_config, tp_size)
+        self.tp_rank = rank
+        self.tp_size = tp_size
+
+        # Device id inferred from KV cache buffers; fallback to resolved global device
+        self.device_id: int = _resolve_device_id()
+
+        self.engine_client = EngineRpcClient(engine_endpoint or ENGINE_ENDPOINT)
+
+        self._layer_names: list[str] = []
+
+        self._register_kv_caches()
+
+        self.load_stream = torch.cuda.Stream()
+        self.store_stream = torch.cuda.Stream()
+
+        # Cleanup on GC or interpreter shutdown (handles Ctrl+C gracefully)
+        self._finalizer = weakref.finalize(
+            self,
+            PeagflowRadixCache._unregister_context,
+            self.instance_id,
+            self.engine_client,
+            self.tp_rank,
+        )
+
+    # --------------------------------------------------------------------- #
+    # Helpers
+    # --------------------------------------------------------------------- #
+    @staticmethod
+    def _unregister_context(
+        instance_id: str, client: EngineRpcClient, tp_rank: int
+    ) -> None:
+        if tp_rank != 0:
+            return
+        try:
+            logger.info("[PeagflowRadixCache] Unregistering instance=%s", instance_id)
+            ok, msg = client.unregister_context(instance_id)
+            if not ok:
+                logger.warning("[PeagflowRadixCache] Unregister failed: %s", msg)
+        except Exception as e:
+            logger.warning("[PeagflowRadixCache] Unregister exception: %s", e)
+
+    def _register_kv_caches(self) -> None:
+        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+        k_pool = getattr(
+            kvcache,
+            "k_buffer",
+            getattr(self.token_to_kv_pool_allocator, "k_buffer", None),
+        )
+        v_pool = getattr(
+            kvcache,
+            "v_buffer",
+            getattr(self.token_to_kv_pool_allocator, "v_buffer", None),
+        )
+
+        if k_pool is None or v_pool is None:
+            raise RuntimeError(
+                "Unable to locate KV buffers from token_to_kv_pool_allocator"
+            )
+
+        total_layers = len(k_pool) * 2
+        layer_names: list[str] = []
+
+        for idx, (k_tensor, v_tensor) in enumerate(zip(k_pool, v_pool)):
+            base = f"layer{idx}"
+            layer_names.extend(
+                [
+                    self._register_single_layer(
+                        tensor=k_tensor,
+                        layer_name=f"{base}_k",
+                        total_layers=total_layers,
+                    ),
+                    self._register_single_layer(
+                        tensor=v_tensor,
+                        layer_name=f"{base}_v",
+                        total_layers=total_layers,
+                    ),
+                ]
+            )
+
+        self._layer_names = layer_names
+
+    def _register_single_layer(
+        self,
+        tensor: torch.Tensor,
+        layer_name: str,
+        total_layers: int,
+    ) -> str:
+        wrapper = CudaIPCWrapper(tensor)
+        wrapper_bytes = pickle.dumps(wrapper)
+
+        shape = tuple(tensor.shape)
+        stride = tuple(tensor.stride())
+        element_size = tensor.element_size()
+
+        slots = shape[0]
+        stride0_bytes = stride[0] * element_size
+
+        assert self.page_size > 0, "page_size must be > 0 for PegaFlow radix cache"
+        assert (
+            slots % self.page_size == 0
+        ), f"KV slots ({slots}) must be divisible by page_size ({self.page_size})"
+
+        num_blocks = slots // self.page_size
+        bytes_per_block = stride0_bytes * self.page_size
+
+        ok, message = self.engine_client.register_context(
+            self.instance_id,
+            self.namespace,
+            self.tp_rank,
+            self.tp_size,
+            self.device_id,
+            total_layers,
+            layer_name,
+            wrapper_bytes,
+            num_blocks,
+            bytes_per_block,
+            0,  # kv_stride_bytes
+            1,  # segments
+        )
+
+        if not ok:
+            raise RuntimeError(f"Register context failed for {layer_name}: {message}")
+
+        logger.info(
+            "[PeagflowRadixCache] Registered %s (num_blocks=%d, bytes_per_block=%d, page_size=%d)",
+            layer_name,
+            num_blocks,
+            bytes_per_block,
+            self.page_size,
+        )
+
+        return layer_name
+
+    def _split_blocks(
+        self, token_slots: torch.Tensor, start: int, length: int
+    ) -> tuple[list[int], list[int]]:
+        """Return block_ids and token indices grouped by page/block."""
+        block_size = self.page_size
+        block_ids: list[int] = []
+        token_indices: list[int] = []
+
+        for i in range(0, length, block_size):
+            block_token_start = start + i
+            token_indices.append(block_token_start)
+            slot_val = int(token_slots[i].item())
+            block_ids.append(slot_val // block_size)
+
+        return block_ids, token_indices
+
+    def _await_load(self, load_state: PyLoadState, timeout_s: float = 5.0) -> bool:
+        start = time.time()
+        while not load_state.is_ready():
+            if (time.time() - start) > timeout_s:
+                return False
+            time.sleep(0.001)
+        return load_state.get_state() > 0
+
+    # --------------------------------------------------------------------- #
+    # Radix overrides
+    # --------------------------------------------------------------------- #
+    def reset(self):  # type: ignore[override]
+        super().reset()
+
+    def match_prefix(self, key: RadixKey, **kwargs) -> MatchResult:  # type: ignore[override]
+        if self.disable or not key:
+            return super().match_prefix(key, **kwargs)
+
+        original_len = len(key)
+        if self.page_size != 1:
+            aligned_len = original_len // self.page_size * self.page_size
+            key = key[:aligned_len]
+
+        logger.info(
+            "[PeagflowRadixCache] match_prefix start: key_len=%d aligned_len=%d page_size=%d",
+            original_len,
+            len(key),
+            self.page_size,
+        )
+
+        base_res = super().match_prefix(key, **kwargs)
+        value: torch.Tensor = base_res.device_indices
+        last_node: TreeNode = base_res.last_device_node
+
+        logger.info(
+            "[PeagflowRadixCache] match_prefix base hit_len=%d key_len=%d",
+            value.numel(),
+            len(key),
+        )
+
+        if len(key) == 0:
+            logger.info("[PeagflowRadixCache] key aligned to zero, skip cache load")
+            return base_res
+
+        if value.numel() == len(key):
+            return base_res
+
+        uncached_len = len(key) - value.numel()
+        if uncached_len == 0:
+            return base_res
+
+        if self.token_to_kv_pool_allocator.available_size() < uncached_len:
+            self.evict(uncached_len)
+
+        token_slots = self.token_to_kv_pool_allocator.alloc(uncached_len)
+        if token_slots is None or len(token_slots) == 0:
+            logger.info(
+                "[PeagflowRadixCache] alloc returned empty (need=%d)", uncached_len
+            )
+            return base_res
+
+        block_size = self.page_size
+        start_idx = value.numel()
+
+        block_ids, _ = self._split_blocks(token_slots, start_idx, uncached_len)
+
+        prefix_tokens = key.token_ids[:start_idx]
+        prior_hash = None
+        if prefix_tokens:
+            _, prior_hash = _hash_pages(
+                prefix_tokens, block_size, extra_key=key.extra_key
+            )
+
+        missing_tokens = key.token_ids[start_idx : start_idx + uncached_len]
+        block_hashes, _ = _hash_pages(
+            missing_tokens, block_size, prior_hash=prior_hash, extra_key=key.extra_key
+        )
+
+        logger.info(
+            "[PeagflowRadixCache] match_prefix miss: start=%d len=%d blocks=%d",
+            start_idx,
+            uncached_len,
+            len(block_ids),
+        )
+
+        # Query availability before issuing load
+        try:
+            query_res = self.engine_client.query(self.instance_id, block_hashes)
+            hit_blocks = (
+                query_res.get("hit_blocks", 0) if isinstance(query_res, dict) else 0
+            )
+        except Exception as e:
+            logger.warning("[PeagflowRadixCache] query failed: %s", e)
+            hit_blocks = 0
+
+        logger.info(
+            "[PeagflowRadixCache] query result: hit_blocks=%d requested=%d",
+            hit_blocks,
+            len(block_ids),
+        )
+
+        hit_blocks = min(hit_blocks, len(block_ids))
+
+        if hit_blocks == 0:
+            self.token_to_kv_pool_allocator.free(token_slots)
+            return base_res
+
+        block_ids = block_ids[:hit_blocks]
+        block_hashes = block_hashes[:hit_blocks]
+        fetched_tokens = hit_blocks * block_size
+
+        load_state = PyLoadState()
+        ok, message = self.engine_client.load(
+            self.instance_id,
+            self.tp_rank,
+            self.device_id,
+            load_state.shm_name(),
+            self._layer_names,
+            block_ids,
+            block_hashes,
+        )
+
+        if not ok:
+            logger.warning("[PeagflowRadixCache] load failed: %s", message)
+            self.token_to_kv_pool_allocator.free(token_slots)
+            return base_res
+
+        if not self._await_load(load_state):
+            logger.warning("[PeagflowRadixCache] load timed out or failed")
+            self.token_to_kv_pool_allocator.free(token_slots)
+            return base_res
+
+        logger.info(
+            "[PeagflowRadixCache] loaded blocks=%d tokens=%d",
+            hit_blocks,
+            fetched_tokens,
+        )
+
+        # Trim unused slots if partial fetch
+        if fetched_tokens < uncached_len:
+            self.token_to_kv_pool_allocator.free(token_slots[fetched_tokens:])
+            token_slots = token_slots[:fetched_tokens]
+
+        new_node = TreeNode(priority=last_node.priority)
+        start = value.numel()
+        end = start + fetched_tokens
+        new_node.key = key[start:end]
+        new_node.value = token_slots
+        new_node.parent = last_node
+        last_node.children[self.get_child_key_fn(new_node.key)] = new_node
+        last_node = new_node
+
+        value = torch.cat([value, token_slots])
+        self.evictable_size_ += fetched_tokens
+
+        self._record_store_event(new_node.parent)
+        self._record_store_event(new_node)
+
+        return MatchResult(
+            device_indices=value,
+            last_device_node=last_node,
+            last_host_node=last_node,
+        )
+
+    def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:  # type: ignore[override]
+        super().cache_finished_req(req, is_insert=is_insert)
+        if not is_insert:
+            return
+
+        from sglang.srt.server_args import get_global_server_args
+
+        global_server_args = get_global_server_args()
+        topk = global_server_args.speculative_eagle_topk
+        enable_kv_committed_len = topk is None or topk == 1
+        if enable_kv_committed_len:
+            kv_committed_len = req.kv_committed_len
+        else:
+            kv_committed_len = len(req.origin_input_ids) + max(
+                len(req.output_ids) - 1, 0
+            )
+
+        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :kv_committed_len
+        ]
+
+        block_size = self.page_size
+
+        block_hashes, _ = _hash_pages(token_ids, block_size, extra_key=req.extra_key)
+        block_ids: list[int] = []
+        for i in range(0, kv_committed_len, block_size):
+            block_ids.append(int(kv_indices[i].item()) // block_size)
+
+        # Ensure GPU writes are done before save
+        torch.cuda.synchronize()
+
+        saves = [(layer, block_ids, block_hashes) for layer in self._layer_names]
+
+        logger.info(
+            "[PeagflowRadixCache] save req=%s blocks=%d layers=%d",
+            getattr(req, "request_id", None),
+            len(block_ids),
+            len(saves),
+        )
+
+        try:
+            ok, message = self.engine_client.save(
+                self.instance_id,
+                self.tp_rank,
+                self.device_id,
+                saves,
+            )
+            if not ok:
+                logger.warning("[PeagflowRadixCache] save failed: %s", message)
+        except Exception as e:
+            logger.warning("[PeagflowRadixCache] save exception: %s", e)
+
+    def evict(self, num_tokens: int) -> None:  # type: ignore[override]
+        if self.disable:
+            return
+        self.store_stream.synchronize()
+        super().evict(num_tokens)
+
+
+__all__ = ["PeagflowRadixCache"]

@@ -1,5 +1,5 @@
 use cudarc::driver::CudaStream;
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 
 use crate::KVCacheRegistration;
 
@@ -213,23 +213,6 @@ pub(crate) fn copy_block_gpu_to_cpu(
     }
 }
 
-/// Copy a block from CPU to GPU, handling both contiguous and strided layouts
-pub(crate) fn copy_block_cpu_to_gpu(
-    registration: &KVCacheRegistration,
-    block_idx: usize,
-    src_ptr: *const u8,
-    stream: &CudaStream,
-) -> Result<(), String> {
-    if is_contiguous_layout(registration) {
-        let size = registration.block_size_bytes;
-        let offset = segment_offset(registration, block_idx, 0)?;
-        let buffer = unsafe { std::slice::from_raw_parts(src_ptr, size) };
-        copy_cpu_to_gpu_async(registration.data_ptr, offset, buffer, size, stream)
-    } else {
-        copy_cpu_to_gpu_strided(registration, block_idx, src_ptr, stream)
-    }
-}
-
 /// Copy strided block from GPU to CPU (each segment separately)
 fn copy_gpu_to_cpu_strided(
     registration: &KVCacheRegistration,
@@ -250,32 +233,6 @@ fn copy_gpu_to_cpu_strided(
             src_offset,
             buffer,
             registration.bytes_per_block,
-        )?;
-    }
-    Ok(())
-}
-
-/// Copy strided block from CPU to GPU (each segment separately)
-fn copy_cpu_to_gpu_strided(
-    registration: &KVCacheRegistration,
-    block_idx: usize,
-    src_ptr: *const u8,
-    stream: &CudaStream,
-) -> Result<(), String> {
-    // Copy each segment separately using regular cuMemcpy
-    for segment_idx in 0..registration.segments {
-        let dst_offset = segment_offset(registration, block_idx, segment_idx)?;
-        let src_offset = segment_idx * registration.bytes_per_block;
-        let src_segment_ptr = unsafe { src_ptr.add(src_offset) };
-        let buffer =
-            unsafe { std::slice::from_raw_parts(src_segment_ptr, registration.bytes_per_block) };
-
-        copy_cpu_to_gpu_async(
-            registration.data_ptr,
-            dst_offset,
-            buffer,
-            registration.bytes_per_block,
-            stream,
         )?;
     }
     Ok(())

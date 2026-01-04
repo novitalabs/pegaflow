@@ -258,22 +258,26 @@ fn process_load_task(task: &LoadTask, stream: &CudaStream) -> Result<(), EngineE
             total_bytes += layer_data.blocks.len() * segment_size * 2;
             total_blocks += layer_data.blocks.len();
         } else {
-            // Contiguous or single-segment layout
+            // Contiguous or single-segment layout - use batch copy for better performance
+            let block_size = registration.block_size_bytes;
+            let mut transfers = Vec::with_capacity(layer_data.blocks.len());
+
             for block in &layer_data.blocks {
-                transfer::copy_block_cpu_to_gpu(
-                    registration,
-                    block.block_idx,
-                    block.layer_block.k_ptr(),
-                    stream,
-                )
+                let gpu_offset = transfer::segment_offset(registration, block.block_idx, 0)
+                    .map_err(EngineError::Storage)?;
+                let cpu_ptr = block.layer_block.k_ptr();
+                transfers.push((gpu_offset, cpu_ptr));
+            }
+
+            transfer::batch_copy_segments_to_gpu(&transfers, block_size, registration, stream)
                 .map_err(|e| {
                     EngineError::Storage(format!(
-                        "Block {} transfer failed for layer {}: {e}",
-                        block.block_idx, layer_data.layer_name
+                        "Batch transfer failed for layer {}: {e}",
+                        layer_data.layer_name
                     ))
                 })?;
-                total_bytes += block.layer_block.size();
-            }
+
+            total_bytes += layer_data.blocks.len() * block_size;
             total_blocks += layer_data.blocks.len();
         }
     }
