@@ -15,7 +15,7 @@ pub use seal_offload::{
     spawn_seal_offload_task, BlockMeta, DfsOffloadConfig, PrefetchStatus, PrefetchTracker,
     SlotMeta,
 };
-pub use storage::{PreEvictConfig, SealNotification};
+pub use storage::{PreEvictConfig, SealNotification, StorageConfig};
 pub use sync_state::{LoadState, LoadStateError};
 
 // ============================================================================
@@ -273,7 +273,7 @@ impl PegaEngine {
         let (engine, _rx) = Self::new_with_config(
             DEFAULT_PINNED_POOL_BYTES,
             false,
-            storage::PreEvictConfig::default(),
+            storage::StorageConfig::default(),
         );
         engine
     }
@@ -283,21 +283,21 @@ impl PegaEngine {
     /// If `use_hugepages` is true, uses 2MB huge pages (requires system config).
     pub fn new_with_pool_size(pool_size: usize, use_hugepages: bool) -> Self {
         let (engine, _rx) =
-            Self::new_with_config(pool_size, use_hugepages, storage::PreEvictConfig::default());
+            Self::new_with_config(pool_size, use_hugepages, storage::StorageConfig::default());
         engine
     }
 
-    /// Create a new PegaEngine instance with custom pool size and pre-eviction config
+    /// Create a new PegaEngine instance with custom pool size and storage config
     ///
     /// If `use_hugepages` is true, uses 2MB huge pages (requires system config).
     /// Returns (engine, seal_notify_rx) - pass receiver to `spawn_seal_offload_task` for SSD offload.
     pub fn new_with_config(
         pool_size: usize,
         use_hugepages: bool,
-        pre_evict_config: storage::PreEvictConfig,
+        storage_config: impl Into<storage::StorageConfig>,
     ) -> (Self, tokio::sync::mpsc::UnboundedReceiver<SealNotification>) {
         let (storage, seal_notify_rx) =
-            StorageEngine::new_with_config(pool_size, use_hugepages, pre_evict_config);
+            StorageEngine::new_with_config(pool_size, use_hugepages, storage_config);
         (
             PegaEngine {
                 instances: RwLock::new(HashMap::new()),

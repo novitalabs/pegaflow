@@ -64,6 +64,31 @@ impl PreEvictConfig {
     }
 }
 
+/// Configuration for cache + storage behavior.
+#[derive(Debug, Clone)]
+pub struct StorageConfig {
+    pub pre_evict_config: PreEvictConfig,
+    pub enable_lfu_admission: bool,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            pre_evict_config: PreEvictConfig::default(),
+            enable_lfu_admission: true,
+        }
+    }
+}
+
+impl From<PreEvictConfig> for StorageConfig {
+    fn from(pre_evict_config: PreEvictConfig) -> Self {
+        Self {
+            pre_evict_config,
+            ..Default::default()
+        }
+    }
+}
+
 // A "slot" in this file refers to a specific position in the flattened logical storage,
 // calculated as `layer_id * tp_size + tp_rank`.
 // vLLM/Connectors report the total topology (layers * tp_size) via registration,
@@ -305,22 +330,28 @@ impl StorageEngine {
     pub fn new_with_config(
         capacity_bytes: usize,
         use_hugepages: bool,
-        config: PreEvictConfig,
+        config: impl Into<StorageConfig>,
     ) -> (Self, UnboundedReceiver<SealNotification>) {
+        let config = config.into();
         let pinned_pool = Arc::new(PinnedMemoryPool::new(capacity_bytes, use_hugepages));
-        let cache = Arc::new(Mutex::new(TinyLfuCache::new_unbounded(capacity_bytes)));
+        let cache = Arc::new(Mutex::new(TinyLfuCache::new_unbounded(
+            capacity_bytes,
+            config.enable_lfu_admission,
+        )));
         let inflight = DashMap::new();
         let pre_evict_stop = Arc::new(AtomicBool::new(false));
 
         // Create unbounded channel for seal notifications
         let (seal_notify_tx, seal_notify_rx) = mpsc::unbounded_channel();
 
-        let pre_evict_handle = if config.enabled {
+        let pre_evict_config = config.pre_evict_config.clone();
+
+        let pre_evict_handle = if pre_evict_config.enabled {
             info!(
                 "Starting pre-eviction monitor: threshold={}, target={}, interval={}ms",
-                ByteSize(config.threshold_bytes),
-                ByteSize(config.target_bytes),
-                config.check_interval_ms
+                ByteSize(pre_evict_config.threshold_bytes),
+                ByteSize(pre_evict_config.target_bytes),
+                pre_evict_config.check_interval_ms
             );
 
             let pool = Arc::clone(&pinned_pool);
@@ -328,7 +359,7 @@ impl StorageEngine {
             let stop = Arc::clone(&pre_evict_stop);
 
             Some(std::thread::spawn(move || {
-                Self::pre_evict_monitor(pool, cache_clone, config, stop);
+                Self::pre_evict_monitor(pool, cache_clone, pre_evict_config, stop);
             }))
         } else {
             None

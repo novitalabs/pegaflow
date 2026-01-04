@@ -74,6 +74,10 @@ pub struct Cli {
     #[arg(long, default_value_t = 100)]
     pub pre_evict_interval_ms: u64,
 
+    /// Disable TinyLFU admission (falls back to plain LRU inserts)
+    #[arg(long, default_value_t = false)]
+    pub disable_lfu_admission: bool,
+
     /// Enable OTLP metrics export over gRPC (e.g. http://127.0.0.1:4317). Leave empty to disable.
     #[arg(long, default_value = "http://127.0.0.1:4321")]
     pub metrics_otel_endpoint: Option<String>,
@@ -220,8 +224,17 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         pegaflow_core::PreEvictConfig::default()
     };
 
+    let storage_config = pegaflow_core::StorageConfig {
+        pre_evict_config,
+        enable_lfu_admission: !cli.disable_lfu_admission,
+    };
+
+    if cli.disable_lfu_admission {
+        info!("TinyLFU cache admission disabled; falling back to plain LRU inserts");
+    }
+
     let (engine, seal_notify_rx) =
-        PegaEngine::new_with_config(cli.pool_size, cli.use_hugepages, pre_evict_config);
+        PegaEngine::new_with_config(cli.pool_size, cli.use_hugepages, storage_config);
     let engine = Arc::new(engine);
     let shutdown = Arc::new(Notify::new());
 

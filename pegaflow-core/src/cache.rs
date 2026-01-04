@@ -12,15 +12,15 @@ const DEFAULT_BYTES_PER_VALUE: usize = 1024 * 1024; // heuristic: 1MB per block
 /// bloating storage.rs.
 pub(crate) struct TinyLfuCache<K, V> {
     lru: LruCache<K, V>,
-    freq: TinyLfu,
+    freq: Option<TinyLfu>,
 }
 
 impl TinyLfuCache<BlockKey, ArcSealedBlock> {
-    pub fn new_unbounded(capacity_bytes: usize) -> Self {
+    pub fn new_unbounded(capacity_bytes: usize, enable_lfu_admission: bool) -> Self {
         let estimated_items = std::cmp::max(1, capacity_bytes / DEFAULT_BYTES_PER_VALUE);
         Self {
             lru: LruCache::new_unbounded(),
-            freq: TinyLfu::new(estimated_items),
+            freq: enable_lfu_admission.then(|| TinyLfu::new(estimated_items)),
         }
     }
 
@@ -32,7 +32,9 @@ impl TinyLfuCache<BlockKey, ArcSealedBlock> {
     pub fn get(&mut self, key: &BlockKey) -> Option<ArcSealedBlock> {
         let hit = self.lru.get(key).cloned();
         if hit.is_some() {
-            self.freq.incr(key);
+            if let Some(freq) = &self.freq {
+                freq.incr(key);
+            }
         }
         hit
     }
@@ -41,7 +43,9 @@ impl TinyLfuCache<BlockKey, ArcSealedBlock> {
     /// current LRU victim it is dropped. Returns true if inserted.
     pub fn insert(&mut self, key: BlockKey, value: ArcSealedBlock) -> bool {
         // Always record the access so future attempts have a chance.
-        self.freq.incr(&key);
+        if let Some(freq) = &self.freq {
+            freq.incr(&key);
+        }
 
         // Update existing entry eagerly.
         if self.lru.contains_key(&key) {
@@ -49,11 +53,13 @@ impl TinyLfuCache<BlockKey, ArcSealedBlock> {
             return true;
         }
 
-        let candidate_freq = self.freq.get(&key);
-        if let Some((victim_key, _)) = self.lru.iter().next() {
-            let victim_freq = self.freq.get(victim_key);
-            if candidate_freq < victim_freq {
-                return false;
+        if let Some(freq) = &self.freq {
+            let candidate_freq = freq.get(&key);
+            if let Some((victim_key, _)) = self.lru.iter().next() {
+                let victim_freq = freq.get(victim_key);
+                if candidate_freq < victim_freq {
+                    return false;
+                }
             }
         }
 
