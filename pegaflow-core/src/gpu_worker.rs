@@ -205,7 +205,8 @@ fn save_worker_loop(
 fn process_load_task(task: &LoadTask, stream: &CudaStream) -> Result<(), EngineError> {
     let start = std::time::Instant::now();
     let mut total_bytes = 0usize;
-    let mut total_blocks = 0usize;
+    // Use the first layer's block count as the physical block count (all layers have the same)
+    let total_blocks = task.layers.first().map(|l| l.blocks.len()).unwrap_or(0);
     let metrics = core_metrics();
 
     for layer_data in &task.layers {
@@ -256,7 +257,6 @@ fn process_load_task(task: &LoadTask, stream: &CudaStream) -> Result<(), EngineE
                 })?;
 
             total_bytes += layer_data.blocks.len() * segment_size * 2;
-            total_blocks += layer_data.blocks.len();
         } else {
             // Contiguous or single-segment layout - use batch copy for better performance
             let block_size = registration.block_size_bytes;
@@ -278,7 +278,6 @@ fn process_load_task(task: &LoadTask, stream: &CudaStream) -> Result<(), EngineE
                 })?;
 
             total_bytes += layer_data.blocks.len() * block_size;
-            total_blocks += layer_data.blocks.len();
         }
     }
 
