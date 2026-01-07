@@ -4,7 +4,7 @@ use std::hash::Hash;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use crate::storage::{BlockKey, SealedBlock};
+use crate::block::{BlockKey, SealedBlock};
 
 // ============================================================================
 // Constants

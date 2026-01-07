@@ -64,12 +64,10 @@ message QueryRequest {
 
 // Prefetch status enum
 enum PrefetchState {
-  // All requested blocks are in local cache
-  PREFETCH_READY = 0;
-  // Some blocks are being prefetched from DFS
+  // Terminal: all available blocks ready, proceed with hit_blocks
+  PREFETCH_DONE = 0;
+  // Transient: blocks being prefetched from DFS, caller should retry
   PREFETCH_LOADING = 1;
-  // Some blocks don't exist in DFS either
-  PREFETCH_PARTIAL_MISS = 2;
 }
 
 message QueryResponse {

@@ -190,30 +190,6 @@ impl PegaEngine {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
-    /// Count how many blocks from the prefix are available in CPU storage
-    ///
-    /// Returns the number of contiguous blocks available from the start.
-    /// Stops counting at the first unavailable block by inspecting the
-    /// CPU cache completion status directly (no GPU context required).
-    ///
-    /// Args:
-    ///     instance_id: ID of the model instance
-    ///     block_hashes: List of block hashes to check (list of bytes)
-    ///
-    /// Returns:
-    ///     Number of contiguous blocks available from the prefix (int)
-    fn count_prefix_hit_blocks(
-        &self,
-        py: Python<'_>,
-        instance_id: &str,
-        block_hashes: Vec<Vec<u8>>,
-    ) -> PyResult<usize> {
-        let instance_id_owned = instance_id.to_string();
-        let engine = &self.engine;
-        py.detach(move || engine.count_prefix_hit_blocks(&instance_id_owned, &block_hashes))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-    }
-
     /// Batch load KV blocks for multiple layers using the same block mapping.
     ///
     /// This is much more efficient than calling load_kv_blocks_to_ipc in a loop
@@ -479,10 +455,9 @@ impl EngineRpcClient {
             let missing = u64_to_usize(r.missing_blocks, "missing_blocks")?;
 
             let prefetch_state = match PrefetchState::try_from(r.prefetch_state) {
-                Ok(PrefetchState::PrefetchReady) => "ready",
+                Ok(PrefetchState::PrefetchDone) => "done",
                 Ok(PrefetchState::PrefetchLoading) => "loading",
-                Ok(PrefetchState::PrefetchPartialMiss) => "partial_miss",
-                _ => "ready", // Default to ready for unknown states
+                _ => "done", // Default to done for unknown states
             };
 
             Python::attach(|py| {

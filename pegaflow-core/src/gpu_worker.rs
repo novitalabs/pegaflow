@@ -4,8 +4,8 @@ use cudarc::driver::{CudaContext, CudaStream};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, instrument};
 
+use crate::block::LayerBlock;
 use crate::metrics::core_metrics;
-use crate::storage::LayerBlock;
 use crate::sync_state::LoadState;
 use crate::{transfer, EngineError, KVCacheRegistration};
 

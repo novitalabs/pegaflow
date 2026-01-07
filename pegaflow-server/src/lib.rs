@@ -63,22 +63,6 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub use_hugepages: bool,
 
-    /// Enable pre-eviction background monitoring
-    #[arg(long, default_value_t = false)]
-    pub pre_evict: bool,
-
-    /// Pre-eviction threshold: start evicting when free space drops below this (supports units: kb, mb, gb, tb)
-    #[arg(long, default_value = "5gb", value_parser = parse_memory_size)]
-    pub pre_evict_threshold: usize,
-
-    /// Pre-eviction target: evict until free space reaches this target (supports units: kb, mb, gb, tb)
-    #[arg(long, default_value = "8gb", value_parser = parse_memory_size)]
-    pub pre_evict_target: usize,
-
-    /// Pre-eviction check interval in milliseconds
-    #[arg(long, default_value_t = 100)]
-    pub pre_evict_interval_ms: u64,
-
     /// Disable TinyLFU admission (falls back to plain LRU inserts)
     #[arg(long, default_value_t = false)]
     pub disable_lfu_admission: bool,
@@ -95,21 +79,13 @@ pub struct Cli {
     #[arg(long, default_value = "info")]
     pub log_level: String,
 
-    /// Redis URL for seal offload. If set, sealed blocks' keys are written to Redis.
+    /// Enable SSD cache for sealed blocks. Provide the cache file path to enable.
     #[arg(long)]
-    pub redis_url: Option<String>,
+    pub ssd_cache_path: Option<String>,
 
-    /// DFS root directory for block offload (e.g., /mnt/dfs/pega)
-    #[arg(long, default_value = "/tmp/pega")]
-    pub dfs_root: String,
-
-    /// DFS quota in bytes (triggers eviction when exceeded)
-    #[arg(long, default_value = "50gb", value_parser = parse_memory_size)]
-    pub dfs_quota: usize,
-
-    /// DFS quota scan interval in milliseconds
-    #[arg(long, default_value_t = 100)]
-    pub dfs_scan_interval_ms: u64,
+    /// SSD cache capacity (supports units: kb, mb, gb, tb). Default: 512gb
+    #[arg(long, default_value = "512gb", value_parser = parse_memory_size)]
+    pub ssd_cache_capacity: usize,
 }
 
 fn init_tracing(log_level: &str) {
@@ -203,43 +179,23 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         cli.use_hugepages
     );
 
-    let pre_evict_config = if cli.pre_evict {
-        // Validate: target must be greater than threshold to ensure eviction frees memory
-        if cli.pre_evict_target <= cli.pre_evict_threshold {
-            return Err(format!(
-                "--pre-evict-target ({}) must be greater than --pre-evict-threshold ({})",
-                cli.pre_evict_target, cli.pre_evict_threshold
-            )
-            .into());
-        }
-        // Validate: target must not exceed pool capacity
-        if cli.pre_evict_target > cli.pool_size {
-            return Err(format!(
-                "--pre-evict-target ({}) must not exceed --pool-size ({})",
-                cli.pre_evict_target, cli.pool_size
-            )
-            .into());
-        }
-
+    let ssd_cache_config = cli.ssd_cache_path.as_ref().map(|path| {
         info!(
-            "Pre-eviction enabled: threshold={:.2} GiB, target={:.2} GiB, interval={}ms",
-            cli.pre_evict_threshold as f64 / (1024.0 * 1024.0 * 1024.0),
-            cli.pre_evict_target as f64 / (1024.0 * 1024.0 * 1024.0),
-            cli.pre_evict_interval_ms
+            "SSD cache enabled: path={}, capacity={:.2} GiB",
+            path,
+            cli.ssd_cache_capacity as f64 / (1024.0 * 1024.0 * 1024.0)
         );
-        pegaflow_core::PreEvictConfig::new(
-            cli.pre_evict_threshold as u64,
-            cli.pre_evict_target as u64,
-            cli.pre_evict_interval_ms,
-        )
-    } else {
-        pegaflow_core::PreEvictConfig::default()
-    };
+        pegaflow_core::SsdCacheConfig {
+            cache_path: path.into(),
+            capacity_bytes: cli.ssd_cache_capacity as u64,
+            ..Default::default()
+        }
+    });
 
     let storage_config = pegaflow_core::StorageConfig {
-        pre_evict_config,
         enable_lfu_admission: !cli.disable_lfu_admission,
         hint_value_size_bytes: cli.hint_value_size,
+        ssd_cache_config,
     };
 
     if cli.disable_lfu_admission {
@@ -257,50 +213,18 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         init_metrics(cli.metrics_otel_endpoint.clone(), cli.metrics_period_secs)
     })?;
 
-    let (engine, seal_notify_rx) =
-        PegaEngine::new_with_config(cli.pool_size, cli.use_hugepages, storage_config);
-    let engine = Arc::new(engine);
     let shutdown = Arc::new(Notify::new());
 
     runtime.block_on(async move {
-        // Create service - with or without DFS support depending on redis config
-        let service = if let Some(url) = &cli.redis_url {
-            // Spawn the DFS offload task
-            let config = pegaflow_core::DfsOffloadConfig {
-                dfs_root: cli.dfs_root.clone().into(),
-                quota_bytes: cli.dfs_quota as u64,
-                scan_interval_ms: cli.dfs_scan_interval_ms,
-                ..Default::default()
-            };
-            let _offload_handles =
-                pegaflow_core::spawn_dfs_offload_task(seal_notify_rx, url, config).await?;
-
-            // Create Redis connection for query prefetch
-            let redis_client = redis::Client::open(url.as_str()).map_err(|e| {
-                std::io::Error::other(format!("Failed to create Redis client: {e}"))
-            })?;
-            let redis_conn = redis_client
-                .get_multiplexed_async_connection()
-                .await
-                .map_err(|e| std::io::Error::other(format!("Failed to connect to Redis: {e}")))?;
-
-            info!("DFS prefetch enabled with Redis at {}", url);
-            GrpcEngineService::with_dfs(
-                Arc::clone(&engine),
-                Arc::clone(&registry),
-                Arc::clone(&shutdown),
-                redis_conn,
-                cli.dfs_root.into(),
-            )
-        } else {
-            // Drop the receiver since we're not using DFS offload
-            drop(seal_notify_rx);
-            GrpcEngineService::new(
-                Arc::clone(&engine),
-                Arc::clone(&registry),
-                Arc::clone(&shutdown),
-            )
-        };
+        // Create PegaEngine inside tokio runtime context (needed for SSD cache tokio::spawn)
+        let (engine, _seal_notify_rx) =
+            PegaEngine::new_with_config(cli.pool_size, cli.use_hugepages, storage_config);
+        let engine = Arc::new(engine);
+        let service = GrpcEngineService::new(
+            Arc::clone(&engine),
+            Arc::clone(&registry),
+            Arc::clone(&shutdown),
+        );
 
         let shutdown_signal = {
             let notify = Arc::clone(&shutdown);

@@ -21,6 +21,17 @@ pub(crate) struct CoreMetrics {
     pub load_bytes: Counter<u64>,
     pub load_duration_ms: Histogram<f64>,
     pub load_failures: Counter<u64>,
+
+    // SSD cache metrics
+    pub ssd_write_blocks: Counter<u64>,
+    pub ssd_write_bytes: Counter<u64>,
+    pub ssd_write_duration_ms: Histogram<f64>,
+    pub ssd_write_queue_pending: UpDownCounter<i64>,
+
+    pub ssd_prefetch_success: Counter<u64>,
+    pub ssd_prefetch_failures: Counter<u64>,
+    pub ssd_prefetch_duration_ms: Histogram<f64>,
+    pub ssd_prefetch_inflight: UpDownCounter<i64>,
 }
 
 fn init_meter() -> Meter {
@@ -93,6 +104,43 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
             load_failures: meter
                 .u64_counter("pegaflow_load_failures_total")
                 .with_description("Load operation failures (e.g., transfer errors)")
+                .build(),
+
+            ssd_write_blocks: meter
+                .u64_counter("pegaflow_ssd_write_blocks_total")
+                .with_description("Blocks successfully written to SSD cache")
+                .build(),
+            ssd_write_bytes: meter
+                .u64_counter("pegaflow_ssd_write_bytes_total")
+                .with_unit("bytes")
+                .with_description("Bytes written to SSD cache")
+                .build(),
+            ssd_write_duration_ms: meter
+                .f64_histogram("pegaflow_ssd_write_duration_ms")
+                .with_unit("ms")
+                .with_description("SSD block write latency in milliseconds")
+                .build(),
+            ssd_write_queue_pending: meter
+                .i64_up_down_counter("pegaflow_ssd_write_queue_pending")
+                .with_description("Current pending blocks in SSD write queue")
+                .build(),
+
+            ssd_prefetch_success: meter
+                .u64_counter("pegaflow_ssd_prefetch_success_total")
+                .with_description("Blocks successfully prefetched from SSD cache")
+                .build(),
+            ssd_prefetch_failures: meter
+                .u64_counter("pegaflow_ssd_prefetch_failures_total")
+                .with_description("SSD prefetch failures (short read, rebuild error, stale)")
+                .build(),
+            ssd_prefetch_duration_ms: meter
+                .f64_histogram("pegaflow_ssd_prefetch_duration_ms")
+                .with_unit("ms")
+                .with_description("SSD block prefetch latency in milliseconds")
+                .build(),
+            ssd_prefetch_inflight: meter
+                .i64_up_down_counter("pegaflow_ssd_prefetch_inflight")
+                .with_description("Current in-flight SSD prefetch operations")
                 .build(),
         }
     })
