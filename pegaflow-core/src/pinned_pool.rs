@@ -59,6 +59,17 @@ pub struct PinnedMemoryPool {
 impl PinnedMemoryPool {
     /// Upper bound for simultaneous allocations in the pinned pool.
     const MAX_ALLOCS: u32 = 4_000_000;
+    /// Alignment for unit size (512 bytes for Direct I/O compatibility)
+    const UNIT_ALIGNMENT: u64 = 512;
+
+    /// Calculate unit size that fits pool_size into u32 range
+    fn compute_unit_size(pool_size: u64, hint: Option<NonZeroU64>) -> u64 {
+        let max_units = u32::MAX as u64;
+        let min_unit_for_capacity = pool_size.div_ceil(max_units);
+        let base = hint.map(|h| h.get()).unwrap_or(Self::UNIT_ALIGNMENT);
+        let unit = base.max(min_unit_for_capacity);
+        unit.div_ceil(Self::UNIT_ALIGNMENT) * Self::UNIT_ALIGNMENT
+    }
 
     /// Allocate a new pinned memory pool of `pool_size` bytes.
     ///
@@ -78,7 +89,16 @@ impl PinnedMemoryPool {
             PinnedMemory::allocate(pool_size).expect("Failed to allocate pinned memory pool")
         };
 
-        let actual_size = backing.size();
+        let actual_size = backing.size() as u64;
+        let unit_size = Self::compute_unit_size(actual_size, unit_size_hint);
+
+        info!(
+            "Pinned pool: size={}, unit_size={}, max_units={}",
+            ByteSize(actual_size),
+            ByteSize(unit_size),
+            actual_size.div_ceil(unit_size)
+        );
+
         let metrics = core_metrics();
         if let Ok(capacity_i64) = i64::try_from(actual_size) {
             metrics.pool_capacity_bytes.add(capacity_i64, &[]);
@@ -88,23 +108,20 @@ impl PinnedMemoryPool {
                 "Pinned pool capacity exceeds i64::MAX; skipping capacity metric update"
             );
         }
-        let allocator = match unit_size_hint {
-            Some(unit_size) => ScaledOffsetAllocator::new_with_unit_size_and_max_allocs(
-                actual_size as u64,
-                unit_size.get(),
-                Self::MAX_ALLOCS,
+
+        let allocator = ScaledOffsetAllocator::new_with_unit_size_and_max_allocs(
+            actual_size,
+            unit_size,
+            Self::MAX_ALLOCS,
+        )
+        .unwrap_or_else(|err| {
+            panic!(
+                "Failed to create memory allocator (size={}, unit={}): {}",
+                ByteSize(actual_size),
+                ByteSize(unit_size),
+                err
             )
-            .unwrap_or_else(|err| {
-                panic!(
-                    "Failed to create memory allocator with unit size {}: {}",
-                    unit_size, err
-                )
-            }),
-            None => {
-                ScaledOffsetAllocator::new_with_max_allocs(actual_size as u64, Self::MAX_ALLOCS)
-                    .expect("Failed to create memory allocator")
-            }
-        };
+        });
 
         Self {
             backing,

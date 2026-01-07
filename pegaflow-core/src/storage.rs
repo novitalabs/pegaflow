@@ -37,6 +37,9 @@ use crate::ssd_cache::{
 /// Number of LRU blocks to evict per iteration when reclaiming memory
 const RECLAIM_BATCH_SIZE: usize = 64;
 
+/// SSD I/O alignment requirement (O_DIRECT requires 512-byte aligned I/O)
+pub const SSD_ALIGNMENT: usize = 512;
+
 /// Configuration for cache + storage behavior.
 #[derive(Debug, Clone)]
 pub struct StorageConfig {
@@ -185,6 +188,7 @@ impl StorageEngine {
     /// Initialize SSD cache state (file + io_uring + channels, no workers yet)
     fn init_ssd_state(config: SsdCacheConfig) -> std::io::Result<(SsdState, SsdReceivers)> {
         use std::fs::{self, OpenOptions};
+        use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::io::AsRawFd;
 
         if let Some(parent) = config.cache_path.parent() {
@@ -196,6 +200,7 @@ impl StorageEngine {
             .truncate(true)
             .read(true)
             .write(true)
+            .custom_flags(libc::O_DIRECT)
             .open(&config.cache_path)?;
         file.set_len(config.capacity_bytes)?;
 
@@ -304,6 +309,11 @@ impl StorageEngine {
                     .unwrap_or(false)
             },
         )))
+    }
+
+    /// Returns true if SSD cache is enabled.
+    pub fn is_ssd_enabled(&self) -> bool {
+        self.ssd_state.is_some()
     }
 
     // ========================================================================

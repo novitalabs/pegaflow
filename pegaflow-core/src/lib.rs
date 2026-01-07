@@ -54,9 +54,19 @@ use tracing::{debug, instrument};
 
 use crate::gpu_worker::{GpuWorkerPool, LayerLoadData, LoadBlock, LoadTask, SaveBlock};
 use crate::metrics::core_metrics;
-use crate::storage::StorageEngine;
+use crate::storage::{StorageEngine, SSD_ALIGNMENT};
 
 const DEFAULT_PINNED_POOL_BYTES: usize = 30 * 1024 * 1024 * 1024; // 30GB
+
+/// Compute greatest common divisor using Euclidean algorithm
+fn gcd(mut a: usize, mut b: usize) -> usize {
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
+}
 
 #[derive(Debug)]
 pub enum EngineError {
@@ -456,6 +466,17 @@ impl PegaEngine {
 
         // Register layer ID in global instance map
         instance.get_or_create_layer_id(&layer_name);
+
+        if self.storage.is_ssd_enabled() && !bytes_per_block.is_multiple_of(SSD_ALIGNMENT) {
+            let gcd = gcd(bytes_per_block, SSD_ALIGNMENT);
+            let aligned_factor = SSD_ALIGNMENT / gcd;
+            return Err(EngineError::InvalidArgument(format!(
+                "SSD cache requires bytes_per_block to be aligned to {} bytes, but got {} for layer {}. \
+                 Hint: bytes_per_block = stride * block_size. Current block_size likely needs to be multiplied by {} \
+                 to achieve alignment. Consider using block_size that is a multiple of {}.",
+                SSD_ALIGNMENT, bytes_per_block, layer_name, aligned_factor, aligned_factor
+            )));
+        }
 
         let registration = KVCacheRegistration {
             data_ptr,
