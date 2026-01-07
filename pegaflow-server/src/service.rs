@@ -7,9 +7,8 @@ use crate::proto::engine::{
 };
 use crate::registry::{CudaTensorRegistry, TensorMetadata};
 use parking_lot::Mutex;
-use pegaflow_core::{EngineError, PegaEngine, PrefetchStatus, PrefetchTracker};
+use pegaflow_core::{EngineError, PegaEngine, PrefetchStatus};
 use pyo3::{PyErr, Python};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Notify;
@@ -21,12 +20,6 @@ pub struct GrpcEngineService {
     engine: Arc<PegaEngine>,
     registry: Arc<Mutex<CudaTensorRegistry>>,
     shutdown: Arc<Notify>,
-    /// Redis connection for DFS metadata lookup (None if DFS disabled)
-    redis_conn: Option<Arc<tokio::sync::Mutex<redis::aio::MultiplexedConnection>>>,
-    /// Prefetch tracker for DFS prefetch (None if DFS disabled)
-    prefetch_tracker: Option<Arc<PrefetchTracker>>,
-    /// DFS root directory (None if DFS disabled)
-    dfs_root: Option<PathBuf>,
 }
 
 impl GrpcEngineService {
@@ -39,27 +32,6 @@ impl GrpcEngineService {
             engine,
             registry,
             shutdown,
-            redis_conn: None,
-            prefetch_tracker: None,
-            dfs_root: None,
-        }
-    }
-
-    /// Create with DFS prefetch support
-    pub fn with_dfs(
-        engine: Arc<PegaEngine>,
-        registry: Arc<Mutex<CudaTensorRegistry>>,
-        shutdown: Arc<Notify>,
-        redis_conn: redis::aio::MultiplexedConnection,
-        dfs_root: PathBuf,
-    ) -> Self {
-        Self {
-            engine,
-            registry,
-            shutdown,
-            redis_conn: Some(Arc::new(tokio::sync::Mutex::new(redis_conn))),
-            prefetch_tracker: Some(Arc::new(PrefetchTracker::new(1024 * 1024 * 1024))), // max 16 concurrent prefetches
-            dfs_root: Some(dfs_root),
         }
     }
 
@@ -263,61 +235,31 @@ impl Engine for GrpcEngineService {
         let result: Result<Response<QueryResponse>, Status> = async {
             let req = request.into_inner();
 
-            // If DFS is enabled, use async prefetch-aware query
-            if let (Some(redis_conn), Some(tracker), Some(dfs_root)) =
-                (&self.redis_conn, &self.prefetch_tracker, &self.dfs_root)
-            {
-                let mut conn = redis_conn.lock().await;
-                let status = self
-                    .engine
-                    .count_prefix_hit_blocks_async(
-                        &req.instance_id,
-                        &req.block_hashes,
-                        &mut conn,
-                        tracker,
-                        dfs_root,
-                    )
-                    .await
-                    .map_err(Self::map_engine_error)?;
+            // Use SSD prefetch-aware query
+            let status = self
+                .engine
+                .count_prefix_hit_blocks_with_prefetch(&req.instance_id, &req.block_hashes)
+                .map_err(Self::map_engine_error)?;
 
-                let (prefetch_state, hit_blocks, loading_blocks, missing_blocks) = match status {
-                    PrefetchStatus::Ready(n) => (PrefetchState::PrefetchReady, n as u64, 0, 0),
-                    PrefetchStatus::Prefetching { ready, loading } => (
-                        PrefetchState::PrefetchLoading,
-                        ready as u64,
-                        loading as u64,
-                        0,
-                    ),
-                    PrefetchStatus::PartialMiss { ready, missing } => (
-                        PrefetchState::PrefetchPartialMiss,
-                        ready as u64,
-                        0,
-                        missing as u64,
-                    ),
-                };
+            let (prefetch_state, hit_blocks, loading_blocks, missing_blocks) = match status {
+                PrefetchStatus::Done { hit, missing } => {
+                    (PrefetchState::PrefetchDone, hit as u64, 0, missing as u64)
+                }
+                PrefetchStatus::Loading { hit, loading } => (
+                    PrefetchState::PrefetchLoading,
+                    hit as u64,
+                    loading as u64,
+                    0,
+                ),
+            };
 
-                Ok(Response::new(QueryResponse {
-                    status: Some(Self::build_simple_response()),
-                    hit_blocks,
-                    prefetch_state: prefetch_state.into(),
-                    loading_blocks,
-                    missing_blocks,
-                }))
-            } else {
-                // Fallback to sync query (no DFS)
-                let hit_blocks = self
-                    .engine
-                    .count_prefix_hit_blocks(&req.instance_id, &req.block_hashes)
-                    .map_err(Self::map_engine_error)?;
-
-                Ok(Response::new(QueryResponse {
-                    status: Some(Self::build_simple_response()),
-                    hit_blocks: hit_blocks as u64,
-                    prefetch_state: PrefetchState::PrefetchReady.into(),
-                    loading_blocks: 0,
-                    missing_blocks: 0,
-                }))
-            }
+            Ok(Response::new(QueryResponse {
+                status: Some(Self::build_simple_response()),
+                hit_blocks,
+                prefetch_state: prefetch_state.into(),
+                loading_blocks,
+                missing_blocks,
+            }))
         }
         .await;
 

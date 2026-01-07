@@ -31,6 +31,7 @@ class SchedulerConnector:
         self._trackers: dict[str, RequestTracker] = {}
         self._pending_load_intents: dict[str, LoadIntent] = {}
         self._held_requests: set[str] = set()
+        self._prefetch_start_times: dict[str, float] = {}  # req_id -> start time
 
     @timing_wrapper
     def get_num_new_matched_tokens(
@@ -45,7 +46,7 @@ class SchedulerConnector:
         tracker = self._get_or_create_tracker(request)
 
         lookup_start = time.perf_counter()
-        hit_blocks = self._count_available_block_prefix(block_hashes)
+        hit_blocks = self._count_available_block_prefix(block_hashes, req_id)
         lookup_end = time.perf_counter()
         elapsed_us = (lookup_end - lookup_start) * 1e6
 
@@ -219,12 +220,12 @@ class SchedulerConnector:
         return self._trackers[req_id]
 
     def _count_available_block_prefix(
-        self, block_hashes: Iterable[bytes]
+        self, block_hashes: Iterable[bytes], req_id: str
     ) -> int | None:
         """Query available blocks with prefetch support.
 
         Returns:
-            int: Number of blocks ready in cache
+            int: Number of blocks ready in cache (proceed with this)
             None: Blocks are being prefetched from DFS, retry later
         """
         result = self._ctx.engine_client.query(
@@ -238,25 +239,25 @@ class SchedulerConnector:
                     f"Query failed: {result.get('message', 'unknown error')}"
                 )
 
-            prefetch_state = result.get("prefetch_state", "ready")
+            prefetch_state = result.get("prefetch_state", "done")
             hit_blocks = result.get("hit_blocks", 0)
-            loading_blocks = result.get("loading_blocks", 0)
-            missing_blocks = result.get("missing_blocks", 0)
 
             if prefetch_state == "loading":
-                logger.info(
-                    "[PegaKVConnector] Prefetch in progress: hit=%d loading=%d missing=%d",
-                    hit_blocks,
-                    loading_blocks,
-                    missing_blocks,
-                )
+                # Record first time we see loading state
+                if req_id not in self._prefetch_start_times:
+                    self._prefetch_start_times[req_id] = time.perf_counter()
                 return None  # Signal scheduler to retry later
 
-            if prefetch_state == "partial_miss":
-                logger.debug(
-                    "[PegaKVConnector] Partial miss: hit=%d missing=%d",
+            # Prefetch done - log duration if we were tracking
+            if req_id in self._prefetch_start_times:
+                prefetch_duration_ms = (
+                    time.perf_counter() - self._prefetch_start_times.pop(req_id)
+                ) * 1000
+                logger.info(
+                    "[PegaKVConnector] Prefetch completed: req=%s hit_blocks=%d prefetch_duration_ms=%.2f",
+                    req_id,
                     hit_blocks,
-                    missing_blocks,
+                    prefetch_duration_ms,
                 )
 
             return hit_blocks
