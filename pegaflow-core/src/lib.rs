@@ -688,6 +688,7 @@ impl PegaEngine {
                 .await?;
 
             // Create LayerBlock objects after copying is done
+            let mut sealed_blocks = Vec::new();
             for (i, (_, block_hash)) in blocks_to_save.into_iter().enumerate() {
                 let k_ptr = (k_base_addr + i * segment_size) as *mut u8;
                 let v_ptr = (v_base_addr + i * segment_size) as *mut u8;
@@ -700,11 +701,21 @@ impl PegaEngine {
                     Arc::clone(&v_allocation),
                 ));
 
-                // Insert slot; ignore the bool (already checked existence above)
-                let _ = self
+                if let Some(sealed) = self
                     .storage
                     .insert_slot(namespace, block_hash, slot_id, block, total_slots)
-                    .map_err(|e| EngineError::Storage(e.to_string()))?;
+                    .map_err(|e| EngineError::Storage(e.to_string()))?
+                {
+                    sealed_blocks.push(sealed);
+                }
+            }
+
+            // Batch admit with prefix-aware early break:
+            // If block[i] is rejected, block[i+1..] are useless for prefix matching
+            for (key, block) in sealed_blocks {
+                if !self.storage.cache_admit(key, block) {
+                    break;
+                }
             }
         } else {
             // Contiguous or single-segment layouts
@@ -756,6 +767,7 @@ impl PegaEngine {
                 .await?;
 
             // Create LayerBlock objects after copying is done
+            let mut sealed_blocks = Vec::new();
             for (i, (_, block_hash)) in blocks_to_save.into_iter().enumerate() {
                 let cpu_ptr = (base_addr + i * block_size) as *mut u8;
 
@@ -765,11 +777,21 @@ impl PegaEngine {
                     Arc::clone(&allocation),
                 ));
 
-                // Insert slot; ignore the bool (already checked existence above)
-                let _ = self
+                if let Some(sealed) = self
                     .storage
                     .insert_slot(namespace, block_hash, slot_id, block, total_slots)
-                    .map_err(|e| EngineError::Storage(e.to_string()))?;
+                    .map_err(|e| EngineError::Storage(e.to_string()))?
+                {
+                    sealed_blocks.push(sealed);
+                }
+            }
+
+            // Batch admit with prefix-aware early break:
+            // If block[i] is rejected, block[i+1..] are useless for prefix matching
+            for (key, block) in sealed_blocks {
+                if !self.storage.cache_admit(key, block) {
+                    break;
+                }
             }
         }
 
