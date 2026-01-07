@@ -111,7 +111,6 @@ jobs:
       - name: Run cargo check (server)
         run: |
           cargo check -p pegaflow-server
-      # Skip python package check (requires CUDA)
 
   build-wheel:
     name: build Python wheel
