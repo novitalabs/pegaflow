@@ -186,13 +186,16 @@ fn save_worker_loop(
     mut rx: mpsc::UnboundedReceiver<SaveTask>,
 ) -> Result<(), EngineError> {
     // Initialize CUDA context for this thread
-    let _ctx = CudaContext::new(device_id as usize)
+    let ctx = CudaContext::new(device_id as usize)
         .map_err(|e| EngineError::CudaInit(format!("Failed to create CUDA context: {e:?}")))?;
+    let stream = ctx
+        .new_stream()
+        .map_err(|e| EngineError::CudaInit(format!("Failed to create CUDA stream: {e:?}")))?;
 
     info!(device = device_id, "Save worker initialized");
 
     while let Some(task) = rx.blocking_recv() {
-        let result = process_save_task(&task);
+        let result = process_save_task(&task, &stream);
         let _ = task.reply.send(result);
     }
 
@@ -316,59 +319,67 @@ fn process_load_task(task: &LoadTask, stream: &CudaStream) -> Result<(), EngineE
 }
 
 /// Process a save task: copy blocks from GPU to CPU pinned memory
-#[instrument(level = "debug", skip(task), fields(blocks = task.blocks.len()))]
-fn process_save_task(task: &SaveTask) -> Result<(), EngineError> {
+#[instrument(level = "debug", skip(task, stream), fields(blocks = task.blocks.len()))]
+fn process_save_task(task: &SaveTask, stream: &CudaStream) -> Result<(), EngineError> {
     let registration = &task.registration;
     let start = std::time::Instant::now();
-    let mut total_bytes = 0usize;
 
-    if registration.segments == 2 && registration.kv_stride_bytes > registration.bytes_per_block {
+    let total_bytes = if registration.segments == 2
+        && registration.kv_stride_bytes > registration.bytes_per_block
+    {
         // Layer-first layout: K and V segments stored separately
         let segment_size = registration.bytes_per_block;
 
-        // Build offset lists for batch copy
-        let mut k_offsets_with_idx = Vec::with_capacity(task.blocks.len());
-        let mut v_offsets_with_idx = Vec::with_capacity(task.blocks.len());
+        // Build transfer lists for batch copy
+        let mut k_transfers = Vec::with_capacity(task.blocks.len());
+        let mut v_transfers = Vec::with_capacity(task.blocks.len());
 
-        for (i, block) in task.blocks.iter().enumerate() {
+        for block in &task.blocks {
             let k_offset = transfer::segment_offset(registration, block.block_idx, 0)
                 .map_err(EngineError::Storage)?;
             let v_offset = transfer::segment_offset(registration, block.block_idx, 1)
                 .map_err(EngineError::Storage)?;
-            k_offsets_with_idx.push((k_offset, i));
-            v_offsets_with_idx.push((v_offset, i));
-        }
-
-        // Copy K segments
-        for (i, block) in task.blocks.iter().enumerate() {
-            let k_offset = k_offsets_with_idx[i].0;
-            let buffer = unsafe { std::slice::from_raw_parts_mut(block.k_dst_ptr, segment_size) };
-            transfer::copy_gpu_to_cpu(registration.data_ptr, k_offset, buffer, segment_size)
-                .map_err(|e| EngineError::Storage(format!("K copy failed: {e}")))?;
-        }
-
-        // Copy V segments
-        for (i, block) in task.blocks.iter().enumerate() {
-            let v_offset = v_offsets_with_idx[i].0;
             let v_ptr = block
                 .v_dst_ptr
                 .unwrap_or_else(|| unsafe { block.k_dst_ptr.add(segment_size) });
-            let buffer = unsafe { std::slice::from_raw_parts_mut(v_ptr, segment_size) };
-            transfer::copy_gpu_to_cpu(registration.data_ptr, v_offset, buffer, segment_size)
-                .map_err(|e| EngineError::Storage(format!("V copy failed: {e}")))?;
+
+            k_transfers.push((k_offset, block.k_dst_ptr));
+            v_transfers.push((v_offset, v_ptr));
         }
 
-        total_bytes = task.blocks.len() * segment_size * 2;
+        // Batch copy K segments
+        transfer::batch_copy_segments_from_gpu(&k_transfers, segment_size, registration, stream)
+            .map_err(|e| EngineError::Storage(format!("K batch copy failed: {e}")))?;
+
+        // Batch copy V segments
+        transfer::batch_copy_segments_from_gpu(&v_transfers, segment_size, registration, stream)
+            .map_err(|e| EngineError::Storage(format!("V batch copy failed: {e}")))?;
+
+        task.blocks.len() * segment_size * 2
     } else {
-        // Contiguous or single-segment layout
+        // Contiguous or single-segment layout - build transfer list for batch copy
+        let block_size = registration.block_size_bytes;
+        let mut transfers = Vec::with_capacity(task.blocks.len());
+
         for block in &task.blocks {
-            transfer::copy_block_gpu_to_cpu(registration, block.block_idx, block.k_dst_ptr)
-                .map_err(|e| {
-                    EngineError::Storage(format!("Block {} copy failed: {e}", block.block_idx))
-                })?;
-            total_bytes += registration.block_size_bytes;
+            let gpu_offset = transfer::segment_offset(registration, block.block_idx, 0)
+                .map_err(EngineError::Storage)?;
+            transfers.push((gpu_offset, block.k_dst_ptr));
         }
-    }
+
+        transfer::batch_copy_segments_from_gpu(&transfers, block_size, registration, stream)
+            .map_err(|e| EngineError::Storage(format!("Batch copy failed: {e}")))?;
+
+        task.blocks.len() * block_size
+    };
+
+    // Synchronize stream to ensure all copies are complete
+    let event = stream
+        .record_event(None)
+        .map_err(|e| EngineError::Storage(format!("Failed to record event: {e:?}")))?;
+    event
+        .synchronize()
+        .map_err(|e| EngineError::Storage(format!("Failed to synchronize: {e:?}")))?;
 
     let elapsed = start.elapsed();
     let bandwidth_gbps = if elapsed.as_secs_f64() > 0.0 {
