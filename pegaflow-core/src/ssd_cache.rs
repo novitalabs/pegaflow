@@ -11,11 +11,11 @@ use crate::pinned_pool::PinnedAllocation;
 use crate::seal_offload::SlotMeta;
 use crate::uring::UringIoEngine;
 
-/// Default prefetch IO depth (max concurrent read operations)
-const DEFAULT_PREFETCH_IO_DEPTH: usize = 128;
+/// Default write queue depth for SSD writer thread (blocks dropped if full)
+pub const DEFAULT_SSD_WRITE_QUEUE_DEPTH: usize = 8;
 
-/// Default write queue depth for SSD writer thread
-const DEFAULT_WRITE_QUEUE_DEPTH: usize = 1024;
+/// Default prefetch queue depth (limits read tail latency)
+pub const DEFAULT_SSD_PREFETCH_QUEUE_DEPTH: usize = 2;
 
 /// Result of a single prefetch operation: (key, begin_offset, block, duration_ms, block_size)
 type PrefetchResult = (BlockKey, u64, Option<Arc<SealedBlock>>, f64, u64);
@@ -31,10 +31,10 @@ pub struct SsdCacheConfig {
     pub cache_path: PathBuf,
     /// Total logical capacity of the cache (bytes).
     pub capacity_bytes: u64,
-    /// Max pending write requests (blocks). New sealed blocks are dropped if the queue is full.
+    /// Max pending write batches. New sealed blocks are dropped if the queue is full.
     pub write_queue_depth: usize,
-    /// Prefetch IO depth: max concurrent read operations (blocks).
-    pub prefetch_io_depth: usize,
+    /// Max pending prefetch batches (limits read tail latency).
+    pub prefetch_queue_depth: usize,
 }
 
 impl Default for SsdCacheConfig {
@@ -42,8 +42,8 @@ impl Default for SsdCacheConfig {
         Self {
             cache_path: PathBuf::from("/tmp/pegaflow-ssd-cache/cache.bin"),
             capacity_bytes: 512 * 1024 * 1024 * 1024, // 512GB
-            write_queue_depth: DEFAULT_WRITE_QUEUE_DEPTH,
-            prefetch_io_depth: DEFAULT_PREFETCH_IO_DEPTH,
+            write_queue_depth: DEFAULT_SSD_WRITE_QUEUE_DEPTH,
+            prefetch_queue_depth: DEFAULT_SSD_PREFETCH_QUEUE_DEPTH,
         }
     }
 }
@@ -65,10 +65,9 @@ pub struct SsdIndexEntry {
     pub slots: Vec<SlotMeta>,
 }
 
-/// Request to write a sealed block to SSD
-pub struct SsdWriteRequest {
-    pub key: BlockKey,
-    pub block: Weak<SealedBlock>,
+/// Batch of sealed blocks to write to SSD
+pub struct SsdWriteBatch {
+    pub blocks: Vec<(BlockKey, Weak<SealedBlock>)>,
 }
 
 /// Pre-allocated slice from a contiguous allocation (for batched prefetch)
@@ -85,6 +84,11 @@ pub struct PrefetchRequest {
     pub entry: SsdIndexEntry,
     /// Pre-allocated contiguous slice for this block
     pub preallocated: PreallocatedSlice,
+}
+
+/// Batch of prefetch requests (sent as a unit to limit queue depth)
+pub struct PrefetchBatch {
+    pub requests: Vec<PrefetchRequest>,
 }
 
 // ============================================================================
@@ -137,62 +141,193 @@ impl SsdStorageHandle {
 }
 
 // ============================================================================
+// Ring Buffer Allocator
+// ============================================================================
+
+/// Logical ring buffer space allocator.
+/// Tracks head position and handles wrap-around for contiguous allocations.
+struct RingAllocator {
+    head: u64,
+    capacity: u64,
+}
+
+impl RingAllocator {
+    fn new(capacity: u64) -> Self {
+        Self { head: 0, capacity }
+    }
+
+    /// Allocate contiguous space for a batch. Skips wrap-around gap if needed.
+    /// Returns (logical_begin, file_offset).
+    fn allocate(&mut self, size: u64) -> (u64, u64) {
+        let phys = self.head % self.capacity;
+        let space_until_end = self.capacity - phys;
+        if size > space_until_end {
+            // Skip to next wrap point
+            self.head += space_until_end;
+        }
+        let begin = self.head;
+        self.head += size;
+        (begin, begin % self.capacity)
+    }
+
+    fn head(&self) -> u64 {
+        self.head
+    }
+}
+
+// ============================================================================
 // SSD Writer Loop
 // ============================================================================
 
-/// SSD writer task: receives sealed blocks and writes them to SSD.
+/// Prepared write entry for a single block within a batch
+struct PreparedWrite {
+    key: BlockKey,
+    block: Arc<SealedBlock>,
+    /// Offset within the batch's contiguous region
+    offset_in_batch: u64,
+    slots: Vec<SlotMeta>,
+}
+
+/// Batch of prepared writes with shared allocation info
+struct PreparedBatch {
+    writes: Vec<PreparedWrite>,
+    /// Logical begin offset in ring buffer
+    begin: u64,
+    /// Physical file offset
+    file_offset: u64,
+    /// Total batch size
+    total_size: u64,
+}
+
+impl PreparedBatch {
+    fn end(&self) -> u64 {
+        self.begin + self.total_size
+    }
+
+    fn make_entry(&self, w: &PreparedWrite) -> SsdIndexEntry {
+        SsdIndexEntry {
+            begin: self.begin + w.offset_in_batch,
+            end: self.begin + w.offset_in_batch + w.block.memory_footprint(),
+            len: w.block.memory_footprint(),
+            slots: w.slots.clone(),
+        }
+    }
+}
+
+/// SSD writer task: receives batches of sealed blocks and writes them in parallel.
 pub async fn ssd_writer_loop(
     handle: Arc<SsdStorageHandle>,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<SsdWriteRequest>,
+    mut rx: tokio::sync::mpsc::Receiver<SsdWriteBatch>,
     io: Arc<UringIoEngine>,
     capacity: u64,
 ) {
-    // Track logical head position (monotonically increasing)
-    let mut head: u64 = 0;
-    let mut pending: HashSet<BlockKey> = HashSet::new();
+    let mut ring = RingAllocator::new(capacity);
+    let mut seen: HashSet<BlockKey> = HashSet::new();
     let metrics = core_metrics();
 
-    while let Some(req) = rx.recv().await {
-        let key = req.key;
-        if !pending.insert(key.clone()) {
-            continue;
-        }
+    while let Some(batch) = rx.recv().await {
+        // Dequeue: decrement pending count immediately
+        metrics
+            .ssd_write_queue_pending
+            .add(-(batch.blocks.len() as i64), &[]);
 
-        let Some(block) = req.block.upgrade() else {
-            // Block was evicted before we could write it
-            pending.remove(&key);
-            continue;
+        // Phase 1: Prepare - upgrade weak refs with prefix semantics (early break on failure)
+        let prepared = match prepare_batch(&batch, &mut seen, &mut ring, capacity) {
+            Some(p) => p,
+            None => continue,
         };
 
-        let block_size = block.memory_footprint();
-
-        if block_size > capacity || block_size == 0 {
-            warn!(
-                "SSD cache skipping block size is 0 or larger than capacity: {} > {}",
-                block_size, capacity
-            );
-            pending.remove(&key);
+        if prepared.writes.is_empty() {
             continue;
         }
 
-        metrics.ssd_write_queue_pending.add(1, &[]);
+        // Phase 2: Prune tail for the entire batch
+        handle.prune_tail(prepared.end().saturating_sub(capacity));
 
-        // Reserve space in ring buffer, avoiding wrap-around within a single block
-        let phys = head % capacity;
-        let space_until_end = capacity - phys;
-        if block_size > space_until_end {
-            head = head.saturating_add(space_until_end);
+        // Phase 3: Parallel IO
+        let write_start = Instant::now();
+        let mut total_bytes_written: u64 = 0;
+
+        for chunk in prepared.writes.chunks(prepared.writes.len()) {
+            let futures: FuturesUnordered<_> = chunk
+                .iter()
+                .map(|w| {
+                    let io = Arc::clone(&io);
+                    let block = Arc::clone(&w.block);
+                    let offset = prepared.file_offset + w.offset_in_batch;
+                    let slots = w.slots.clone();
+                    async move { write_block_to_ssd(&io, offset, &block, &slots).await }
+                })
+                .collect();
+
+            let results: Vec<_> = futures.collect().await;
+
+            // Phase 4: Publish results
+            for (w, result) in chunk.iter().zip(results) {
+                seen.remove(&w.key);
+
+                match result {
+                    Ok(()) => {
+                        handle.publish_write(w.key.clone(), prepared.make_entry(w), ring.head());
+                        let block_bytes = w.block.memory_footprint();
+                        metrics.ssd_write_bytes.add(block_bytes, &[]);
+                        total_bytes_written += block_bytes;
+                    }
+                    Err(e) => {
+                        warn!("SSD cache write failed for {:?}: {}", w.key, e);
+                    }
+                }
+            }
         }
 
-        let begin = head;
-        let end = head.saturating_add(block_size);
-        let file_offset = begin % capacity;
+        let duration = write_start.elapsed();
+        let duration_secs = duration.as_secs_f64();
+        metrics
+            .ssd_write_duration_ms
+            .record(duration_secs * 1000.0, &[]);
 
-        // Advance tail to evict old entries if needed
-        let desired_tail = end.saturating_sub(capacity);
-        handle.prune_tail(desired_tail);
+        // Record throughput in GB/s
+        if duration_secs > 0.0 && total_bytes_written > 0 {
+            let throughput_gbps = (total_bytes_written as f64) / duration_secs / 1e9;
+            metrics
+                .ssd_write_throughput_gbps
+                .record(throughput_gbps, &[]);
+        }
+    }
 
-        // Collect slot metadata for rebuilding
+    debug!("SSD writer task exiting");
+}
+
+/// Prepare a batch for writing: upgrade weak refs, compute sizes, allocate ring space.
+/// Uses prefix semantics: if any block fails to upgrade, the entire batch is skipped.
+fn prepare_batch(
+    batch: &SsdWriteBatch,
+    seen: &mut HashSet<BlockKey>,
+    ring: &mut RingAllocator,
+    capacity: u64,
+) -> Option<PreparedBatch> {
+    // First pass: upgrade all weak refs and compute total size
+    let mut blocks: Vec<(BlockKey, Arc<SealedBlock>, Vec<SlotMeta>)> = Vec::new();
+    let mut total_size: u64 = 0;
+
+    for (key, weak_block) in &batch.blocks {
+        // Skip duplicates
+        if seen.contains(key) {
+            continue;
+        }
+
+        // Prefix semantics: any upgrade failure means skip entire batch
+        let block = weak_block.upgrade()?;
+
+        let block_size = block.memory_footprint();
+        if block_size == 0 || block_size > capacity {
+            warn!(
+                "SSD cache skipping batch: block size {} (capacity {})",
+                block_size, capacity
+            );
+            return None;
+        }
+
         let slots: Vec<SlotMeta> = block
             .slots()
             .iter()
@@ -202,35 +337,45 @@ pub async fn ssd_writer_loop(
             })
             .collect();
 
-        // Write block data to SSD (with timing)
-        let write_start = Instant::now();
-        if let Err(e) = write_block_to_ssd(&io, file_offset, &block).await {
-            warn!("SSD cache write failed: {}", e);
-            pending.remove(&key);
-            metrics.ssd_write_queue_pending.add(-1, &[]);
-            continue;
-        }
-        let write_duration = write_start.elapsed();
-        metrics
-            .ssd_write_duration_ms
-            .record(write_duration.as_secs_f64() * 1000.0, &[]);
-
-        let entry = SsdIndexEntry {
-            begin,
-            end,
-            len: block_size,
-            slots,
-        };
-
-        handle.publish_write(key.clone(), entry, end);
-        pending.remove(&key);
-        metrics.ssd_write_queue_pending.add(-1, &[]);
-        metrics.ssd_write_blocks.add(1, &[]);
-        metrics.ssd_write_bytes.add(block_size, &[]);
-        head = end;
+        total_size += block_size;
+        blocks.push((key.clone(), block, slots));
     }
 
-    debug!("SSD writer task exiting");
+    if blocks.is_empty() {
+        return Some(PreparedBatch {
+            writes: Vec::new(),
+            begin: 0,
+            file_offset: 0,
+            total_size: 0,
+        });
+    }
+
+    // Allocate contiguous space for entire batch
+    let (begin, file_offset) = ring.allocate(total_size);
+
+    // Second pass: compute per-block offsets within the batch
+    let mut offset_in_batch: u64 = 0;
+    let writes: Vec<PreparedWrite> = blocks
+        .into_iter()
+        .map(|(key, block, slots)| {
+            let w = PreparedWrite {
+                key: key.clone(),
+                block: Arc::clone(&block),
+                offset_in_batch,
+                slots,
+            };
+            seen.insert(key);
+            offset_in_batch += block.memory_footprint();
+            w
+        })
+        .collect();
+
+    Some(PreparedBatch {
+        writes,
+        begin,
+        file_offset,
+        total_size,
+    })
 }
 
 /// Write a sealed block to SSD file using writev.
@@ -241,29 +386,19 @@ async fn write_block_to_ssd(
     io: &UringIoEngine,
     offset: u64,
     block: &SealedBlock,
+    slots_meta: &[SlotMeta],
 ) -> std::io::Result<()> {
-    // Build iovecs and submit in a scope so raw pointers don't cross await
+    // Build iovecs from slot metadata
     let rx = {
-        let mut iovecs = Vec::new();
+        let iovecs: Vec<_> = slots_meta
+            .iter()
+            .zip(block.slots())
+            .flat_map(|(meta, slot)| meta.write_iovecs(slot))
+            .collect();
 
-        for slot in block.slots() {
-            let size = slot.size();
-            if let Some(v_ptr) = slot.v_ptr() {
-                // Split layout: K then V
-                let half = size / 2;
-                iovecs.push((slot.k_ptr(), half));
-                iovecs.push((v_ptr, half));
-            } else {
-                // Contiguous layout
-                iovecs.push((slot.k_ptr(), size));
-            }
-        }
-
-        // Submit vectorized write - iovecs is consumed here
         io.writev_at_async(iovecs, offset)?
     };
 
-    // Now we can safely await (no raw pointers in scope)
     rx.await
         .map_err(|_| std::io::Error::other("writev recv failed"))??;
 
@@ -274,49 +409,64 @@ async fn write_block_to_ssd(
 // SSD Prefetch Loop
 // ============================================================================
 
-/// SSD prefetch worker: receives prefetch requests and loads blocks from SSD.
-/// Uses FuturesUnordered to maintain concurrent IO operations.
+/// SSD prefetch worker: receives batches of prefetch requests and loads blocks from SSD.
+/// Processes all requests in a batch concurrently, then waits for completion before next batch.
 pub async fn ssd_prefetch_loop(
     handle: Arc<SsdStorageHandle>,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<PrefetchRequest>,
+    mut rx: tokio::sync::mpsc::Receiver<PrefetchBatch>,
     io: Arc<UringIoEngine>,
     capacity: u64,
-    io_depth: usize,
 ) {
-    let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
     let metrics = core_metrics();
 
-    loop {
-        tokio::select! {
-            biased;  // Prioritize filling in_flight before processing completions
+    while let Some(batch) = rx.recv().await {
+        if batch.requests.is_empty() {
+            continue;
+        }
 
-            // Accept new request if under IO depth limit
-            Some(req) = rx.recv(), if in_flight.len() < io_depth => {
+        let batch_start = Instant::now();
+        let batch_bytes: u64 = batch.requests.iter().map(|r| r.entry.len).sum();
+
+        // Process all requests in the batch concurrently
+        let futures: FuturesUnordered<_> = batch
+            .requests
+            .into_iter()
+            .map(|req| {
                 let io = Arc::clone(&io);
                 metrics.ssd_prefetch_inflight.add(1, &[]);
-                in_flight.push(execute_prefetch(req, io, capacity));
-            }
-            // Process completed prefetch
-            Some((key, begin, result, duration_ms, _block_size)) = in_flight.next() => {
-                metrics.ssd_prefetch_inflight.add(-1, &[]);
-                metrics.ssd_prefetch_duration_ms.record(duration_ms, &[]);
+                execute_prefetch(req, io, capacity)
+            })
+            .collect();
 
-                // Validate data wasn't overwritten during read
-                let result = if result.is_some() && !handle.is_offset_valid(begin) {
-                    warn!("SSD prefetch: data overwritten during read, discarding");
-                    metrics.ssd_prefetch_failures.add(1, &[]);
-                    None
-                } else if result.is_some() {
-                    metrics.ssd_prefetch_success.add(1, &[]);
-                    result
-                } else {
-                    metrics.ssd_prefetch_failures.add(1, &[]);
-                    None
-                };
-                handle.complete_prefetch(key, result);
-            }
-            // Both channels exhausted
-            else => break,
+        let results: Vec<PrefetchResult> = futures.collect().await;
+
+        // Complete all prefetches
+        for (key, begin, result, duration_ms, _block_size) in results {
+            metrics.ssd_prefetch_inflight.add(-1, &[]);
+            metrics.ssd_prefetch_duration_ms.record(duration_ms, &[]);
+
+            // Validate data wasn't overwritten during read
+            let result = if result.is_some() && !handle.is_offset_valid(begin) {
+                warn!("SSD prefetch: data overwritten during read, discarding");
+                metrics.ssd_prefetch_failures.add(1, &[]);
+                None
+            } else if result.is_some() {
+                metrics.ssd_prefetch_success.add(1, &[]);
+                result
+            } else {
+                metrics.ssd_prefetch_failures.add(1, &[]);
+                None
+            };
+            handle.complete_prefetch(key, result);
+        }
+
+        // Record batch throughput
+        let duration_secs = batch_start.elapsed().as_secs_f64();
+        if duration_secs > 0.0 && batch_bytes > 0 {
+            let throughput_gbps = (batch_bytes as f64) / duration_secs / 1e9;
+            metrics
+                .ssd_prefetch_throughput_gbps
+                .record(throughput_gbps, &[]);
         }
     }
 
@@ -330,61 +480,47 @@ async fn execute_prefetch(
     capacity: u64,
 ) -> PrefetchResult {
     let start = Instant::now();
+    let duration_ms = || start.elapsed().as_secs_f64() * 1000.0;
+    let fail = |key, begin, size| (key, begin, None, duration_ms(), size);
+
     let key = req.key;
     let begin = req.entry.begin;
-    let allocation = req.preallocated.allocation;
-    let alloc_offset = req.preallocated.offset;
-    let len = req.entry.len as usize;
     let block_size = req.entry.len;
 
     // Calculate physical offset in SSD file
     let phys_offset = begin % capacity;
-    if phys_offset + req.entry.len > capacity {
+    if phys_offset + block_size > capacity {
         warn!("SSD prefetch: block wraps around ring buffer");
-        return (
-            key,
-            begin,
-            None,
-            start.elapsed().as_secs_f64() * 1000.0,
-            block_size,
-        );
+        return fail(key, begin, block_size);
     }
 
-    // Build iovecs and submit IO in a scope so raw pointers don't cross await
+    // Build iovecs from slot metadata
     let read_result = {
-        let base_ptr = allocation.as_ptr() as *mut u8;
-        let mut iovecs = Vec::new();
-        let mut current_offset = alloc_offset;
-
-        for slot_meta in &req.entry.slots {
-            let slot_size = slot_meta.size as usize;
-            if slot_meta.is_split {
-                // Split layout: K then V (same as write)
-                let half = slot_size / 2;
-                let k_ptr = unsafe { base_ptr.add(current_offset) };
-                let v_ptr = unsafe { base_ptr.add(current_offset + half) };
-                iovecs.push((k_ptr, half));
-                iovecs.push((v_ptr, half));
-            } else {
-                // Contiguous layout
-                let ptr = unsafe { base_ptr.add(current_offset) };
-                iovecs.push((ptr, slot_size));
-            }
-            current_offset += slot_size;
-        }
+        let base_ptr = req.preallocated.allocation.as_ptr() as *mut u8;
+        let mut current_offset = req.preallocated.offset;
+        let iovecs: Vec<_> = req
+            .entry
+            .slots
+            .iter()
+            .flat_map(|meta| {
+                // SAFETY: preallocated slice is sized to fit all slots
+                let iov = unsafe { meta.read_iovecs(base_ptr, current_offset) };
+                current_offset += meta.size as usize;
+                iov
+            })
+            .collect();
 
         io.readv_at_async(iovecs, phys_offset)
     };
 
-    let duration_ms = || start.elapsed().as_secs_f64() * 1000.0;
-
+    // Await IO result and rebuild block
+    let expected_len = req.entry.len as usize;
     match read_result {
         Ok(rx) => match rx.await {
-            Ok(Ok(bytes_read)) if bytes_read == len => {
-                // Success - rebuild the block
+            Ok(Ok(bytes_read)) if bytes_read == expected_len => {
                 match rebuild_sealed_block_at_offset(
-                    Arc::clone(&allocation),
-                    alloc_offset,
+                    req.preallocated.allocation,
+                    req.preallocated.offset,
                     &req.entry.slots,
                 ) {
                     Ok(sealed) => (
@@ -396,26 +532,26 @@ async fn execute_prefetch(
                     ),
                     Err(e) => {
                         warn!("SSD prefetch: failed to rebuild block: {}", e);
-                        (key, begin, None, duration_ms(), block_size)
+                        fail(key, begin, block_size)
                     }
                 }
             }
-            Ok(Ok(bytes_read)) => {
-                warn!("SSD prefetch: short read {} of {} bytes", bytes_read, len);
-                (key, begin, None, duration_ms(), block_size)
+            Ok(Ok(n)) => {
+                warn!("SSD prefetch: short read {} of {} bytes", n, expected_len);
+                fail(key, begin, block_size)
             }
             Ok(Err(e)) => {
                 warn!("SSD prefetch: read error: {}", e);
-                (key, begin, None, duration_ms(), block_size)
+                fail(key, begin, block_size)
             }
             Err(_) => {
                 warn!("SSD prefetch: read channel closed");
-                (key, begin, None, duration_ms(), block_size)
+                fail(key, begin, block_size)
             }
         },
         Err(e) => {
             warn!("SSD prefetch: failed to submit read: {}", e);
-            (key, begin, None, duration_ms(), block_size)
+            fail(key, begin, block_size)
         }
     }
 }

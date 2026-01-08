@@ -17,7 +17,9 @@ pub use block::{
 };
 pub use pinned_pool::PinnedAllocation;
 pub use seal_offload::SlotMeta;
-pub use ssd_cache::SsdCacheConfig;
+pub use ssd_cache::{
+    SsdCacheConfig, DEFAULT_SSD_PREFETCH_QUEUE_DEPTH, DEFAULT_SSD_WRITE_QUEUE_DEPTH,
+};
 pub use storage::{SealNotification, StorageConfig};
 pub use sync_state::{LoadState, LoadStateError};
 
@@ -731,6 +733,8 @@ impl PegaEngine {
                 }
             }
 
+            self.storage.send_ssd_batch(&sealed_blocks);
+
             // Batch admit with prefix-aware early break:
             // If block[i] is rejected, block[i+1..] are useless for prefix matching
             for (key, block) in sealed_blocks {
@@ -806,6 +810,8 @@ impl PegaEngine {
                     sealed_blocks.push(sealed);
                 }
             }
+
+            self.storage.send_ssd_batch(&sealed_blocks);
 
             // Batch admit with prefix-aware early break:
             // If block[i] is rejected, block[i+1..] are useless for prefix matching

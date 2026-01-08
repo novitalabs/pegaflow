@@ -23,19 +23,28 @@ pub(crate) struct CoreMetrics {
     pub load_failures: Counter<u64>,
 
     // SSD cache metrics
-    pub ssd_write_blocks: Counter<u64>,
     pub ssd_write_bytes: Counter<u64>,
     pub ssd_write_duration_ms: Histogram<f64>,
+    pub ssd_write_throughput_gbps: Histogram<f64>,
     pub ssd_write_queue_pending: UpDownCounter<i64>,
+    pub ssd_write_queue_full: Counter<u64>,
 
     pub ssd_prefetch_success: Counter<u64>,
     pub ssd_prefetch_failures: Counter<u64>,
     pub ssd_prefetch_duration_ms: Histogram<f64>,
+    pub ssd_prefetch_throughput_gbps: Histogram<f64>,
     pub ssd_prefetch_inflight: UpDownCounter<i64>,
+    pub ssd_prefetch_queue_full: Counter<u64>,
 }
 
 fn init_meter() -> Meter {
     global::meter("pegaflow-core")
+}
+
+/// Custom histogram boundaries for SSD throughput (0.5 to 20 GB/s, step 0.5)
+fn ssd_throughput_boundaries() -> Vec<f64> {
+    // 0.5, 1.0, 1.5, ..., 20.0 (40 buckets)
+    (1..=40).map(|i| i as f64 * 0.5).collect()
 }
 
 pub(crate) fn core_metrics() -> &'static CoreMetrics {
@@ -106,10 +115,6 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
                 .with_description("Load operation failures (e.g., transfer errors)")
                 .build(),
 
-            ssd_write_blocks: meter
-                .u64_counter("pegaflow_ssd_write_blocks_total")
-                .with_description("Blocks successfully written to SSD cache")
-                .build(),
             ssd_write_bytes: meter
                 .u64_counter("pegaflow_ssd_write_bytes_total")
                 .with_unit("bytes")
@@ -120,9 +125,19 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
                 .with_unit("ms")
                 .with_description("SSD block write latency in milliseconds")
                 .build(),
+            ssd_write_throughput_gbps: meter
+                .f64_histogram("pegaflow_ssd_write_throughput_gbps")
+                .with_unit("GB/s")
+                .with_description("SSD write throughput per batch in GB/s")
+                .with_boundaries(ssd_throughput_boundaries())
+                .build(),
             ssd_write_queue_pending: meter
                 .i64_up_down_counter("pegaflow_ssd_write_queue_pending")
                 .with_description("Current pending blocks in SSD write queue")
+                .build(),
+            ssd_write_queue_full: meter
+                .u64_counter("pegaflow_ssd_write_queue_full_total")
+                .with_description("Write requests dropped due to full queue")
                 .build(),
 
             ssd_prefetch_success: meter
@@ -138,9 +153,19 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
                 .with_unit("ms")
                 .with_description("SSD block prefetch latency in milliseconds")
                 .build(),
+            ssd_prefetch_throughput_gbps: meter
+                .f64_histogram("pegaflow_ssd_prefetch_throughput_gbps")
+                .with_unit("GB/s")
+                .with_description("SSD prefetch throughput per batch in GB/s")
+                .with_boundaries(ssd_throughput_boundaries())
+                .build(),
             ssd_prefetch_inflight: meter
                 .i64_up_down_counter("pegaflow_ssd_prefetch_inflight")
                 .with_description("Current in-flight SSD prefetch operations")
+                .build(),
+            ssd_prefetch_queue_full: meter
+                .u64_counter("pegaflow_ssd_prefetch_queue_full_total")
+                .with_description("Prefetch requests dropped due to full queue")
                 .build(),
         }
     })

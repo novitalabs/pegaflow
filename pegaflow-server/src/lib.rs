@@ -86,6 +86,14 @@ pub struct Cli {
     /// SSD cache capacity (supports units: kb, mb, gb, tb). Default: 512gb
     #[arg(long, default_value = "512gb", value_parser = parse_memory_size)]
     pub ssd_cache_capacity: usize,
+
+    /// SSD write queue depth (max pending write batches). Default: 8
+    #[arg(long, default_value_t = pegaflow_core::DEFAULT_SSD_WRITE_QUEUE_DEPTH)]
+    pub ssd_write_queue_depth: usize,
+
+    /// SSD prefetch queue depth (max pending prefetch batches). Default: 2
+    #[arg(long, default_value_t = pegaflow_core::DEFAULT_SSD_PREFETCH_QUEUE_DEPTH)]
+    pub ssd_prefetch_queue_depth: usize,
 }
 
 fn init_tracing(log_level: &str) {
@@ -181,14 +189,17 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
     let ssd_cache_config = cli.ssd_cache_path.as_ref().map(|path| {
         info!(
-            "SSD cache enabled: path={}, capacity={:.2} GiB",
+            "SSD cache enabled: path={}, capacity={:.2} GiB, write_queue={}, prefetch_queue={}",
             path,
-            cli.ssd_cache_capacity as f64 / (1024.0 * 1024.0 * 1024.0)
+            cli.ssd_cache_capacity as f64 / (1024.0 * 1024.0 * 1024.0),
+            cli.ssd_write_queue_depth,
+            cli.ssd_prefetch_queue_depth,
         );
         pegaflow_core::SsdCacheConfig {
             cache_path: path.into(),
             capacity_bytes: cli.ssd_cache_capacity as u64,
-            ..Default::default()
+            write_queue_depth: cli.ssd_write_queue_depth,
+            prefetch_queue_depth: cli.ssd_prefetch_queue_depth,
         }
     });
 

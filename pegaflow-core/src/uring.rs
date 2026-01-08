@@ -37,7 +37,7 @@ impl Default for UringConfig {
     fn default() -> Self {
         Self {
             threads: 1,
-            io_depth: 256,
+            io_depth: 128,
             sqpoll: false,
             sqpoll_idle: 10,
         }

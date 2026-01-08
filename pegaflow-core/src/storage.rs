@@ -26,8 +26,8 @@ use crate::cache::TinyLfuCache;
 use crate::metrics::core_metrics;
 use crate::pinned_pool::{PinnedAllocation, PinnedMemoryPool};
 use crate::ssd_cache::{
-    ssd_prefetch_loop, ssd_writer_loop, PreallocatedSlice, PrefetchRequest, SsdCacheConfig,
-    SsdIndexEntry, SsdStorageHandle, SsdWriteRequest,
+    ssd_prefetch_loop, ssd_writer_loop, PreallocatedSlice, PrefetchBatch, PrefetchRequest,
+    SsdCacheConfig, SsdIndexEntry, SsdStorageHandle, SsdWriteBatch,
 };
 
 // ============================================================================
@@ -79,18 +79,18 @@ struct SsdState {
     /// UringIoEngine only holds the raw fd, so dropping this would invalidate all IO.
     _file: Arc<std::fs::File>,
     io: Arc<crate::uring::UringIoEngine>,
-    /// Channel to SSD writer task
-    writer_tx: tokio::sync::mpsc::UnboundedSender<SsdWriteRequest>,
-    /// Channel to prefetch worker (tokio task)
-    prefetch_tx: tokio::sync::mpsc::UnboundedSender<PrefetchRequest>,
+    /// Channel to SSD writer task (bounded to limit queue depth)
+    writer_tx: tokio::sync::mpsc::Sender<SsdWriteBatch>,
+    /// Channel to prefetch worker (bounded to limit queue depth)
+    prefetch_tx: tokio::sync::mpsc::Sender<PrefetchBatch>,
     /// Logical head pointer (next write position)
     head: std::sync::atomic::AtomicU64,
 }
 
 /// Receivers for SSD workers (separated so they can be moved to workers)
 struct SsdReceivers {
-    writer_rx: tokio::sync::mpsc::UnboundedReceiver<SsdWriteRequest>,
-    prefetch_rx: tokio::sync::mpsc::UnboundedReceiver<PrefetchRequest>,
+    writer_rx: tokio::sync::mpsc::Receiver<SsdWriteBatch>,
+    prefetch_rx: tokio::sync::mpsc::Receiver<PrefetchBatch>,
 }
 
 /// Inner state protected by a single mutex
@@ -209,8 +209,8 @@ impl StorageEngine {
             crate::uring::UringConfig::default(),
         )?);
 
-        let (writer_tx, writer_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (prefetch_tx, prefetch_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (writer_tx, writer_rx) = tokio::sync::mpsc::channel(config.write_queue_depth);
+        let (prefetch_tx, prefetch_rx) = tokio::sync::mpsc::channel(config.prefetch_queue_depth);
 
         info!(
             "SSD cache initialized at {} (capacity {})",
@@ -253,24 +253,17 @@ impl StorageEngine {
 
         // Spawn writer task
         let writer_handle = Arc::clone(&handle);
+        let writer_io = Arc::clone(&io);
         tokio::spawn(async move {
-            ssd_writer_loop(writer_handle, writer_rx, io, capacity).await;
+            ssd_writer_loop(writer_handle, writer_rx, writer_io, capacity).await;
         });
 
         // Spawn prefetch task
         let prefetch_handle = Arc::clone(&handle);
         let prefetch_io = Arc::clone(&ssd_state.io);
         let prefetch_capacity = capacity;
-        let prefetch_io_depth = ssd_state.config.prefetch_io_depth;
         tokio::spawn(async move {
-            ssd_prefetch_loop(
-                prefetch_handle,
-                prefetch_rx,
-                prefetch_io,
-                prefetch_capacity,
-                prefetch_io_depth,
-            )
-            .await;
+            ssd_prefetch_loop(prefetch_handle, prefetch_rx, prefetch_io, prefetch_capacity).await;
         });
 
         debug!("SSD workers spawned");
@@ -411,14 +404,6 @@ impl StorageEngine {
             let inflight_block = inner.inflight.remove(&key).expect("just checked");
             let sealed = Arc::new(inflight_block.seal());
 
-            // Send to SSD writer (if configured)
-            if let Some(ref ssd_state) = self.ssd_state {
-                let _ = ssd_state.writer_tx.send(SsdWriteRequest {
-                    key: key.clone(),
-                    block: Arc::downgrade(&sealed),
-                });
-            }
-
             // Notify external consumers (fire-and-forget)
             drop(inner); // Release lock before sending to channel
             if let Some(tx) = &self.seal_notify_tx {
@@ -441,6 +426,38 @@ impl StorageEngine {
         } else {
             core_metrics().cache_block_admission_rejections.add(1, &[]);
             false
+        }
+    }
+
+    /// Send a batch of sealed blocks to SSD writer for async persistence.
+    /// Called after sealing a batch of blocks from seal_offload.
+    /// Drops the batch if write queue is full (backpressure).
+    pub fn send_ssd_batch(&self, blocks: &[(BlockKey, Arc<SealedBlock>)]) {
+        let Some(ref ssd_state) = self.ssd_state else {
+            return;
+        };
+
+        if blocks.is_empty() {
+            return;
+        }
+
+        let batch = SsdWriteBatch {
+            blocks: blocks
+                .iter()
+                .map(|(k, b)| (k.clone(), Arc::downgrade(b)))
+                .collect(),
+        };
+
+        if ssd_state.writer_tx.try_send(batch).is_ok() {
+            core_metrics()
+                .ssd_write_queue_pending
+                .add(blocks.len() as i64, &[]);
+        } else {
+            // Queue full - drop the batch (backpressure)
+            warn!("SSD write queue full, dropping {} blocks", blocks.len());
+            core_metrics()
+                .ssd_write_queue_full
+                .add(blocks.len() as u64, &[]);
         }
     }
 
@@ -588,9 +605,10 @@ impl StorageEngine {
         }
     }
 
-    /// Mark blocks as prefetching and send to prefetch worker.
+    /// Mark blocks as prefetching and send batch to prefetch worker.
     /// Pre-allocates a contiguous memory region for all blocks to ensure
     /// CPU memory locality for subsequent GPU transfers.
+    /// If prefetch queue is full, drops the request (treats as cache miss).
     fn trigger_prefetch(&self, keys: Vec<BlockKey>) {
         let ssd_state = match &self.ssd_state {
             Some(state) => state,
@@ -655,8 +673,11 @@ impl StorageEngine {
             return;
         };
 
-        // Send requests with pre-allocated slices
+        // Build batch with pre-allocated slices
+        let mut requests = Vec::with_capacity(valid_requests.len());
         let mut offset: usize = 0;
+        let keys_for_cleanup: Vec<_> = valid_requests.iter().map(|(k, _)| k.clone()).collect();
+
         for (key, entry) in valid_requests {
             let slice = PreallocatedSlice {
                 allocation: Arc::clone(&allocation),
@@ -664,14 +685,27 @@ impl StorageEngine {
             };
             offset += entry.len as usize;
 
-            let req = PrefetchRequest {
+            requests.push(PrefetchRequest {
                 key,
                 entry,
                 preallocated: slice,
-            };
-            if ssd_state.prefetch_tx.send(req).is_err() {
-                warn!("Prefetch channel closed");
-                break;
+            });
+        }
+
+        // Send batch (non-blocking, drop if queue full)
+        let batch = PrefetchBatch { requests };
+        if ssd_state.prefetch_tx.try_send(batch).is_err() {
+            // Queue full - treat as cache miss, clean up prefetching set
+            warn!(
+                "SSD prefetch queue full, dropping {} blocks",
+                keys_for_cleanup.len()
+            );
+            core_metrics()
+                .ssd_prefetch_queue_full
+                .add(keys_for_cleanup.len() as u64, &[]);
+            let mut inner = self.inner.lock().unwrap();
+            for key in keys_for_cleanup {
+                inner.prefetching.remove(&key);
             }
         }
     }
