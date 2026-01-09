@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-PegaFlow is a high-performance KV cache transfer system for LLM inference, designed to work with vLLM. It provides RDMA-first, high-bandwidth transport optimized for GPU-to-CPU KV cache offloading and loading.
+PegaFlow is a high-performance KV cache transfer system for LLM inference, designed to work with vLLM and SGLang. It provides RDMA-first, high-bandwidth transport optimized for GPU-to-CPU KV cache offloading and loading.
 
 ## Build Commands
 
@@ -51,29 +51,36 @@ uv run python examples/bench_kv_cache.py --model /path/to/model --num-prompts 10
 
 ## Architecture
 
-### Three-Layer Design
+### Four-Crate Design
 
 1. **pegaflow-core** (Rust): Core storage engine
-   - `PegaEngine`: Main engine managing instances, workers, and KV cache storage
-   - `StorageEngine`: Pinned memory allocator + block cache
-   - `transfer`: GPU-CPU transfer operations via CUDA
-   - Supports KV-first tensor layout (K segments contiguous, then V segments)
+   - `PegaEngine`: Main engine managing GPU workers and KV cache storage
+   - `storage.rs`: Block-based storage with content-addressed blocks
+   - `pinned_pool.rs` / `pinned_mem.rs`: Pinned memory allocator
+   - `transfer.rs`: GPU-CPU transfer operations via CUDA
+   - `cache.rs`: LRU cache for blocks
+   - `gpu_worker.rs`: Per-GPU worker handling async operations
 
-2. **python/src/lib.rs** (Rust/PyO3): Python bindings
-   - Exposes `PegaEngine` and `PyLoadState` to Python
-   - All methods delegate to pegaflow-core
+2. **pegaflow-proto** (Rust): Protobuf definitions
+   - gRPC service definitions built with prost/tonic
 
-3. **python/pegaflow/** (Python): vLLM integration
-   - `connector.py`: `PegaKVConnector` (vLLM v1 KV connector)
-   - `engine_server.py`: ZMQ server wrapping PegaEngine
-   - `ipc_wrapper.py`: CUDA IPC handle wrapper
+3. **pegaflow-server** (Rust): gRPC server
+   - `service.rs`: Tonic gRPC service implementation
+   - `registry.rs`: Instance/worker registration
+   - `bin/pegaflow-router.rs`: P/D disaggregation router
+
+4. **python/** (Rust/PyO3 + Python): Python package (`pegaflow-llm` on PyPI)
+   - `src/lib.rs`: PyO3 bindings exposing `PegaEngine` and gRPC client
+   - `pegaflow/connector/`: vLLM v1 KV connector (scheduler + worker split)
+   - `pegaflow/sglang/`: SGLang integration
+   - `pegaflow/ipc_wrapper.py`: CUDA IPC handle wrapper
 
 ### Data Flow
 
 ```
-vLLM Worker <--ZMQ--> PegaEngine Server <--CUDA IPC--> GPU Memory
-                           |
-                    Pinned CPU Memory (KV cache storage)
+vLLM/SGLang Worker <--gRPC--> PegaEngine Server <--CUDA IPC--> GPU Memory
+                                    |
+                             Pinned CPU Memory (KV cache storage)
 ```
 
 ### Key Concepts
@@ -93,14 +100,14 @@ vLLM Worker <--ZMQ--> PegaEngine Server <--CUDA IPC--> GPU Memory
 ### Rust
 - Prefer `NonNull` over `*mut` in unsafe code
 
-### Python (3.9+)
+### Python (3.10+)
 - Use native generics (`list`, `dict`, `set`, `tuple`) instead of `typing.List`, `typing.Dict`, etc.
 - Use PEP 604 union syntax (`X | Y`, `X | None`) instead of `typing.Union`, `typing.Optional`
 - Logging: use `%s` formatting (`logger.info("x=%s", x)`) instead of f-strings to avoid evaluation overhead
 
 ## Environment Variables
 
-- `PEGAFLOW_ENGINE_ENDPOINT`: ZMQ endpoint (default: `ipc:///tmp/pega_engine.sock`)
+- `PEGAFLOW_ENGINE_ENDPOINT`: gRPC endpoint (default: `127.0.0.1:50055`)
 - `PEGAFLOW_INSTANCE_ID`: Override instance ID
 - `RUST_LOG`: Control Rust logging (e.g., `info,pegaflow_core=debug,pegaflow_server=debug`)
 
@@ -120,5 +127,7 @@ kv_transfer_config = KVTransferConfig(
 ## Key Files
 
 - `pegaflow-core/src/lib.rs`: Main PegaEngine implementation
-- `python/pegaflow/connector.py`: vLLM KV connector with RequestTracker state machine
-- `python/pegaflow/engine_server.py`: ZMQ server for multi-process access
+- `pegaflow-core/src/storage.rs`: Block storage engine
+- `pegaflow-server/src/service.rs`: gRPC service implementation
+- `python/pegaflow/connector/scheduler.py`: vLLM scheduler-side connector
+- `python/pegaflow/connector/worker.py`: vLLM worker-side connector

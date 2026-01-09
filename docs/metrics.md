@@ -124,7 +124,7 @@ The `examples/metric/` directory provides a ready-to-use monitoring stack.
 
 ```bash
 cd examples/metric
-docker compose up -d
+docker-compose up -d
 
 # To stop the stack:
 # docker compose down
