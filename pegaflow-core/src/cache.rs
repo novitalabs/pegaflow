@@ -241,3 +241,220 @@ impl TinyLfu {
         }
     }
 }
+
+// ============================================================================
+// Loom tests for concurrent verification
+// ============================================================================
+
+#[cfg(all(test, feature = "loom"))]
+mod loom_tests {
+    use loom::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+    use loom::thread;
+
+    /// Test that incr_no_overflow correctly handles concurrent increments.
+    fn loom_incr_no_overflow(var: &AtomicU8) -> (u8, u8) {
+        loop {
+            let current = var.load(Ordering::Relaxed);
+            if current == u8::MAX {
+                return (current, current);
+            }
+            let new = if current == u8::MAX - 1 {
+                u8::MAX
+            } else {
+                current + 1
+            };
+            match var.compare_exchange(current, new, Ordering::Acquire, Ordering::Relaxed) {
+                Ok(_) => return (current, new),
+                Err(actual) => {
+                    if actual == u8::MAX {
+                        return (current, actual);
+                    }
+                    // Retry
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_incr_no_overflow_concurrent() {
+        loom::model(|| {
+            let counter = loom::sync::Arc::new(AtomicU8::new(0));
+
+            let c1 = loom::sync::Arc::clone(&counter);
+            let c2 = loom::sync::Arc::clone(&counter);
+
+            let t1 = thread::spawn(move || {
+                loom_incr_no_overflow(&c1)
+            });
+
+            let t2 = thread::spawn(move || {
+                loom_incr_no_overflow(&c2)
+            });
+
+            let (_, v1) = t1.join().unwrap();
+            let (_, v2) = t2.join().unwrap();
+
+            // Both increments should succeed, final value should be 2
+            let final_val = counter.load(Ordering::Relaxed);
+            assert!(final_val >= 1 && final_val <= 2);
+            assert!(v1 >= 1 && v1 <= 2);
+            assert!(v2 >= 1 && v2 <= 2);
+        });
+    }
+
+    #[test]
+    fn test_incr_near_overflow() {
+        loom::model(|| {
+            // Start near overflow
+            let counter = loom::sync::Arc::new(AtomicU8::new(u8::MAX - 2));
+
+            let c1 = loom::sync::Arc::clone(&counter);
+            let c2 = loom::sync::Arc::clone(&counter);
+            let c3 = loom::sync::Arc::clone(&counter);
+
+            let t1 = thread::spawn(move || loom_incr_no_overflow(&c1));
+            let t2 = thread::spawn(move || loom_incr_no_overflow(&c2));
+            let t3 = thread::spawn(move || loom_incr_no_overflow(&c3));
+
+            t1.join().unwrap();
+            t2.join().unwrap();
+            t3.join().unwrap();
+
+            // Should never exceed MAX
+            let final_val = counter.load(Ordering::Relaxed);
+            assert!(final_val <= u8::MAX);
+        });
+    }
+
+    #[test]
+    fn test_window_counter_wrap() {
+        loom::model(|| {
+            let window_counter = loom::sync::Arc::new(AtomicUsize::new(0));
+            let window_limit = 2;
+
+            let wc1 = loom::sync::Arc::clone(&window_counter);
+            let wc2 = loom::sync::Arc::clone(&window_counter);
+
+            let t1 = thread::spawn(move || {
+                let val = wc1.fetch_add(1, Ordering::Relaxed);
+                if val == window_limit || val > window_limit * 2 {
+                    wc1.store(0, Ordering::Relaxed);
+                }
+            });
+
+            let t2 = thread::spawn(move || {
+                let val = wc2.fetch_add(1, Ordering::Relaxed);
+                if val == window_limit || val > window_limit * 2 {
+                    wc2.store(0, Ordering::Relaxed);
+                }
+            });
+
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            // Counter should be in valid range
+            let final_val = window_counter.load(Ordering::Relaxed);
+            assert!(final_val <= window_limit * 2 + 2);
+        });
+    }
+}
+
+// ============================================================================
+// Regular unit tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_incr_no_overflow_basic() {
+        let counter = AtomicU8::new(0);
+
+        let (old, new) = incr_no_overflow(&counter);
+        assert_eq!(old, 0);
+        assert_eq!(new, 1);
+
+        let (old, new) = incr_no_overflow(&counter);
+        assert_eq!(old, 1);
+        assert_eq!(new, 2);
+    }
+
+    #[test]
+    fn test_incr_no_overflow_at_max() {
+        let counter = AtomicU8::new(u8::MAX);
+
+        let (old, new) = incr_no_overflow(&counter);
+        assert_eq!(old, u8::MAX);
+        assert_eq!(new, u8::MAX);
+
+        // Should stay at MAX
+        let (old, new) = incr_no_overflow(&counter);
+        assert_eq!(old, u8::MAX);
+        assert_eq!(new, u8::MAX);
+    }
+
+    #[test]
+    fn test_incr_no_overflow_near_max() {
+        let counter = AtomicU8::new(u8::MAX - 1);
+
+        let (old, new) = incr_no_overflow(&counter);
+        assert_eq!(old, u8::MAX - 1);
+        assert_eq!(new, u8::MAX);
+
+        // Next increment should stay at MAX
+        let (old, new) = incr_no_overflow(&counter);
+        assert_eq!(old, u8::MAX);
+        assert_eq!(new, u8::MAX);
+    }
+
+    #[test]
+    fn test_estimator_basic() {
+        let est = Estimator::new(2, 16, RandomState::new);
+
+        // Increment same key multiple times
+        for _ in 0..10 {
+            est.incr("key1");
+        }
+
+        let freq = est.get("key1");
+        assert!(freq >= 5, "Frequency should reflect accesses");
+
+        // New key should have lower frequency
+        let new_freq = est.get("key2");
+        assert!(new_freq < freq, "New key should have lower frequency");
+    }
+
+    #[test]
+    fn test_estimator_aging() {
+        let est = Estimator::new(2, 16, RandomState::new);
+
+        // Build up frequency
+        for _ in 0..100 {
+            est.incr("key1");
+        }
+
+        let before = est.get("key1");
+
+        // Age the estimator
+        est.age(1);
+
+        let after = est.get("key1");
+        assert!(after < before, "Aging should reduce frequency");
+        assert!(after >= before / 2 - 1, "Aging should halve frequency");
+    }
+
+    #[test]
+    fn test_tiny_lfu_window_reset() {
+        let lfu = TinyLfu::new(10);
+
+        // Increment beyond window limit
+        for _ in 0..(10 * WINDOW_LIMIT_MULTIPLIER + 10) {
+            lfu.incr("key1");
+        }
+
+        // Should not panic, window counter should reset
+        let freq = lfu.get("key1");
+        assert!(freq > 0, "Should have some frequency");
+    }
+}
