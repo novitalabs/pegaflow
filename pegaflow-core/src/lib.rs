@@ -860,7 +860,7 @@ impl PegaEngine {
         // Delegate to storage engine's unified check_prefix_and_prefetch
         let status = self
             .storage
-            .check_prefix_and_prefetch(namespace, block_hashes);
+            .check_prefix_and_prefetch(instance_id, namespace, block_hashes);
 
         // Record metrics for terminal state
         match &status {
@@ -942,10 +942,10 @@ impl PegaEngine {
             .get_gpu(device_id)
             .ok_or_else(|| EngineError::WorkerMissing(instance_id.to_string(), device_id))?;
 
-        // Lookup all block_hashes ONCE and cache the blocks
+        // Lookup all block_hashes ONCE (consumes pinned blocks, falls back to cache)
         let block_cache = self
             .storage
-            .cache_lookup_many(namespace, block_hashes)
+            .cache_lookup_many(instance_id, namespace, block_hashes)
             .map_err(EngineError::Storage)?;
 
         // Build LoadTask with data for all layers

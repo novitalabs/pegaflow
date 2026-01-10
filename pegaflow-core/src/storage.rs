@@ -105,6 +105,9 @@ struct StorageInner {
     ssd_index: HashMap<BlockKey, SsdIndexEntry>,
     /// Logical tail pointer for SSD ring buffer eviction
     ssd_tail: u64,
+    /// Pinned blocks between query and load (prevents eviction race)
+    /// Key: (instance_id, block_key), Value: (block, ref_count)
+    pinned_for_load: HashMap<(String, BlockKey), (Arc<SealedBlock>, usize)>,
 }
 
 pub struct StorageEngine {
@@ -149,6 +152,7 @@ impl StorageEngine {
             cache,
             ssd_index: HashMap::new(),
             ssd_tail: 0,
+            pinned_for_load: HashMap::new(),
         });
 
         // Create unbounded channel for seal notifications
@@ -472,10 +476,11 @@ impl StorageEngine {
         inner.cache.contains_key(&key)
     }
 
-    /// Lookup multiple blocks from the cache.
-    /// Returns error if any block is missing (no SSD fallback in this version).
+    /// Lookup multiple blocks for load operation.
+    /// Consumes pinned blocks (removes from pinned_for_load).
     pub fn cache_lookup_many(
         &self,
+        instance_id: &str,
         namespace: &str,
         block_hashes: &[Vec<u8>],
     ) -> Result<Vec<Arc<SealedBlock>>, String> {
@@ -487,12 +492,26 @@ impl StorageEngine {
         let mut inner = self.inner.lock().unwrap();
         let mut result: Vec<Arc<SealedBlock>> = Vec::with_capacity(keys.len());
 
-        for (idx, key) in keys.iter().enumerate() {
-            if let Some(block) = inner.cache.get(key) {
-                result.push(block);
+        for (idx, key) in keys.into_iter().enumerate() {
+            let pin_key = (instance_id.to_string(), key.clone());
+
+            // Consume pinned_for_load (ref_count -1, remove if 0)
+            if let Some((block, count)) = inner.pinned_for_load.get_mut(&pin_key) {
+                let cloned = Arc::clone(block);
+                *count -= 1;
+                if *count == 0 {
+                    inner.pinned_for_load.remove(&pin_key);
+                }
+                result.push(cloned);
             } else {
+                error!(
+                    instance = %instance_id,
+                    idx = idx,
+                    hash_len = key.hash.len(),
+                    "missing pinned KV block"
+                );
                 return Err(format!(
-                    "missing KV block hash at index {} (namespace={}, hash_len={})",
+                    "missing pinned KV block at index {} (namespace={}, hash_len={})",
                     idx,
                     key.namespace,
                     key.hash.len()
@@ -555,19 +574,30 @@ impl StorageEngine {
 
     /// Check prefix blocks and trigger prefetch for blocks in SSD.
     /// Returns status indicating whether caller should retry.
-    pub fn check_prefix_and_prefetch(&self, namespace: &str, hashes: &[Vec<u8>]) -> PrefetchStatus {
+    /// Hit blocks are pinned to prevent eviction before load.
+    pub fn check_prefix_and_prefetch(
+        &self,
+        instance_id: &str,
+        namespace: &str,
+        hashes: &[Vec<u8>],
+    ) -> PrefetchStatus {
         let mut hit = 0usize;
         let mut loading = 0usize;
+        let mut missing = 0usize;
         let mut to_prefetch: Vec<BlockKey> = Vec::new();
 
         {
-            let inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock().unwrap();
+
+            let mut cpu_hit_keys: Vec<BlockKey> = Vec::new();
 
             for hash in hashes {
                 let key = BlockKey::new(namespace.to_string(), hash.clone());
 
-                if inner.cache.contains_key(&key) {
+                // Then check cache
+                if inner.cache.get(&key).is_some() {
                     hit += 1;
+                    cpu_hit_keys.push(key);
                     continue;
                 }
 
@@ -588,8 +618,21 @@ impl StorageEngine {
 
                 // Block not found anywhere - this is a miss
                 // For prefix matching, first miss means remaining blocks are also missing
-                let missing = hashes.len() - hit - loading;
-                return PrefetchStatus::Done { hit, missing };
+                missing = hashes.len() - hit - loading;
+                break;
+            }
+
+            // Pin hit blocks when returning Done (no loading in progress)
+            if loading == 0 {
+                for key in cpu_hit_keys {
+                    let pin_key = (instance_id.to_string(), key.clone());
+                    let block = inner.cache.get(&key).unwrap();
+                    inner
+                        .pinned_for_load
+                        .entry(pin_key)
+                        .and_modify(|(_, count)| *count += 1)
+                        .or_insert_with(|| (Arc::clone(&block), 1));
+                }
             }
         }
 
@@ -601,7 +644,7 @@ impl StorageEngine {
         if loading > 0 {
             PrefetchStatus::Loading { hit, loading }
         } else {
-            PrefetchStatus::Done { hit, missing: 0 }
+            PrefetchStatus::Done { hit, missing }
         }
     }
 
