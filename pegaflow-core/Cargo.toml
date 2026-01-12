@@ -26,6 +26,14 @@ futures = "0.3"
 
 [dev-dependencies]
 criterion.workspace = true
+loom = "0.7"
+tokio-test = "0.4"
+proptest = "1.4"
+tempfile = "3.14"
+
+[features]
+default = []
+loom = ["loom/checkpoint"]
 
 [[bench]]
 name = "pinned_copy"
