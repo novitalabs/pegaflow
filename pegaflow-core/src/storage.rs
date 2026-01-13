@@ -605,7 +605,7 @@ impl StorageEngine {
                     continue;
                 }
 
-                if inner.prefetching.contains(&key) || inner.inflight.contains_key(&key) {
+                if inner.prefetching.contains(&key) {
                     loading += 1;
                     continue;
                 }

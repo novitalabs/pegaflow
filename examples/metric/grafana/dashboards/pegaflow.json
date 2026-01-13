@@ -542,8 +542,84 @@
       "type": "timeseries"
     },
     {
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "stacking": { "group": "A", "mode": "none" }
+          },
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 54 },
+      "id": 20,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "single" }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.01, sum by (le) (rate(pegaflow_ssd_write_throughput_bytes_per_second_per_second_bucket[1m])))",
+          "legendFormat": "write p1 (worst)",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(pegaflow_ssd_write_throughput_bytes_per_second_per_second_bucket[1m])))",
+          "legendFormat": "write p50",
+          "refId": "B"
+        }
+      ],
+      "title": "SSD Write Throughput (per batch)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "stacking": { "group": "A", "mode": "none" }
+          },
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 54 },
+      "id": 21,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "single" }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.01, sum by (le) (rate(pegaflow_ssd_prefetch_throughput_bytes_per_second_per_second_bucket[1m])))",
+          "legendFormat": "prefetch p1 (worst)",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(pegaflow_ssd_prefetch_throughput_bytes_per_second_per_second_bucket[1m])))",
+          "legendFormat": "prefetch p50",
+          "refId": "B"
+        }
+      ],
+      "title": "SSD Prefetch Throughput (per batch)",
+      "type": "timeseries"
+    },
+    {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 54 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 62 },
       "id": 106,
       "title": "SSD Cache Latency",
       "type": "row"
@@ -565,7 +641,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 55 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 63 },
       "id": 14,
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom" },
@@ -603,7 +679,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 55 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 63 },
       "id": 15,
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom" },
@@ -626,7 +702,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 63 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 71 },
       "id": 107,
       "title": "Queue Depth & Backpressure",
       "type": "row"
@@ -648,7 +724,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 64 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 72 },
       "id": 16,
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom" },
@@ -681,7 +757,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 64 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 72 },
       "id": 17,
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom" },
@@ -714,7 +790,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 64 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 72 },
       "id": 18,
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom" },
@@ -737,7 +813,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 72 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 80 },
       "id": 108,
       "title": "Inflight / Leak Tracking",
       "type": "row"
@@ -759,7 +835,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 73 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 81 },
       "id": 19,
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom" },
