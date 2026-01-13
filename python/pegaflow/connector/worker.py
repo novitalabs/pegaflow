@@ -8,13 +8,13 @@ import threading
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
 from pegaflow.connector.common import ConnectorContext, PegaConnectorMetadata, logger
-from pegaflow.logging_utils import timing_wrapper
 from pegaflow.ipc_wrapper import CudaIPCWrapper
+from pegaflow.logging_utils import timing_wrapper
 from pegaflow.pegaflow import PyLoadState
 
 if TYPE_CHECKING:
@@ -67,13 +67,9 @@ class WorkerConnector:
             return
 
         if self._ctx.tp_rank == 0:
-            ok, message = self._ctx.engine_client.unregister_context(
-                self._ctx.instance_id
-            )
+            ok, message = self._ctx.engine_client.unregister_context(self._ctx.instance_id)
             if not ok:
-                logger.warning(
-                    "[PegaKVConnector] Unregister context failed: %s", message
-                )
+                logger.warning("[PegaKVConnector] Unregister context failed: %s", message)
 
         self._registered_layers.clear()
 
@@ -134,9 +130,7 @@ class WorkerConnector:
             )
 
             if not ok:
-                raise RuntimeError(
-                    f"Register context failed for {layer_name}: {message}"
-                )
+                raise RuntimeError(f"Register context failed for {layer_name}: {message}")
 
         logger.info(
             "[PegaKVConnector] Registered %d KV cache layers (%s layout) instance=%s",
@@ -145,17 +139,13 @@ class WorkerConnector:
             self._ctx.instance_id,
         )
 
-    def get_finished(
-        self, finished_req_ids: set[str]
-    ) -> tuple[set[str] | None, set[str] | None]:
+    def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str] | None, set[str] | None]:
         finished_sending: set[str] | None = None
         finished_recving: set[str] | None = None
 
         with self._save_completion_lock:
             # 1. Add newly finished requests (if they have pending saves) to tracking
-            self._finished_requests.update(
-                finished_req_ids & self._req_pending_layers.keys()
-            )
+            self._finished_requests.update(finished_req_ids & self._req_pending_layers.keys())
             # 2. Identify requests whose saves have completed
             done_saves = self._completed_saves & self._finished_requests
             done_saves.update(self._completed_saves & finished_req_ids)
@@ -394,9 +384,7 @@ class WorkerConnector:
             # Otherwise we may copy uninitialized memory (attention kernel is async)
             torch.cuda.synchronize()
 
-            saves_list = [
-                (name, ids, hashes) for name, (ids, hashes) in saves_by_layer.items()
-            ]
+            saves_list = [(name, ids, hashes) for name, (ids, hashes) in saves_by_layer.items()]
 
             try:
                 ok, message = self._ctx.engine_client.save(

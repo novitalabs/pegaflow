@@ -15,7 +15,7 @@ except ImportError:
     PyLoadState = None
 
 # Import Python-based vLLM connector
-from .connector import PegaKVConnector, KVConnectorRole
+from .connector import KVConnectorRole, PegaKVConnector
 
 __version__ = "0.0.1"
 __all__ = [

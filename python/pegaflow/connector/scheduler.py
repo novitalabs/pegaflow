@@ -120,9 +120,7 @@ class SchedulerConnector:
         )
 
     @timing_wrapper
-    def build_connector_meta(
-        self, scheduler_output: "SchedulerOutput"
-    ) -> PegaConnectorMetadata:
+    def build_connector_meta(self, scheduler_output: "SchedulerOutput") -> PegaConnectorMetadata:
         save_intents: dict[str, SaveIntent] = {}
 
         load_intents = self._pending_load_intents
@@ -137,9 +135,8 @@ class SchedulerConnector:
             num_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
             tracker.on_scheduled(num_tokens)
 
-            if req_id not in load_intents:
-                if load_intent := tracker.consume_load_intent():
-                    load_intents[req_id] = load_intent
+            if req_id not in load_intents and (load_intent := tracker.consume_load_intent()):
+                load_intents[req_id] = load_intent
 
             if save_intent := tracker.consume_save_intent():
                 save_intents[req_id] = save_intent
@@ -228,16 +225,12 @@ class SchedulerConnector:
             int: Number of blocks ready in cache (proceed with this)
             None: Blocks are being prefetched from DFS, retry later
         """
-        result = self._ctx.engine_client.query(
-            self._ctx.instance_id, list(block_hashes)
-        )
+        result = self._ctx.engine_client.query(self._ctx.instance_id, list(block_hashes))
 
         # Handle new dict response format
         if isinstance(result, dict):
             if not result.get("ok", False):
-                raise RuntimeError(
-                    f"Query failed: {result.get('message', 'unknown error')}"
-                )
+                raise RuntimeError(f"Query failed: {result.get('message', 'unknown error')}")
 
             prefetch_state = result.get("prefetch_state", "done")
             hit_blocks = result.get("hit_blocks", 0)

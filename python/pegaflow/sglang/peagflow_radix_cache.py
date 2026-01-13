@@ -7,10 +7,10 @@ import pickle
 import time
 import uuid
 import weakref
-from typing import TYPE_CHECKING, Sequence
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import torch
-
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.mem_cache.hicache_storage import get_hash_str
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
@@ -33,7 +33,7 @@ def _default_instance_id() -> str:
     return os.environ.get("PEGAFLOW_INSTANCE_ID", uuid.uuid4().hex)
 
 
-def _default_namespace(model_config: "ModelConfig | None", tp_size: int = 1) -> str:
+def _default_namespace(model_config: ModelConfig | None, tp_size: int = 1) -> str:
     factors = {
         "model": getattr(model_config, "model_path", None),
         "dtype": str(getattr(model_config, "dtype", "")),
@@ -98,8 +98,8 @@ class PeagflowRadixCache(RadixCache):
 
     def __init__(
         self,
-        params: "CacheInitParams",
-        model_config: "ModelConfig | None" = None,
+        params: CacheInitParams,
+        model_config: ModelConfig | None = None,
         tp_size: int = 1,
         rank: int = 0,
         tp_group=None,
@@ -110,9 +110,7 @@ class PeagflowRadixCache(RadixCache):
         super().__init__(params)
 
         if EngineRpcClient is None:
-            raise RuntimeError(
-                "pegaflow extension is not available (EngineRpcClient missing)"
-            )
+            raise RuntimeError("pegaflow extension is not available (EngineRpcClient missing)")
 
         self.instance_id = instance_id or _default_instance_id()
         self.namespace = namespace or _default_namespace(model_config, tp_size)
@@ -144,9 +142,7 @@ class PeagflowRadixCache(RadixCache):
     # Helpers
     # --------------------------------------------------------------------- #
     @staticmethod
-    def _unregister_context(
-        instance_id: str, client: EngineRpcClient, tp_rank: int
-    ) -> None:
+    def _unregister_context(instance_id: str, client: EngineRpcClient, tp_rank: int) -> None:
         if tp_rank != 0:
             return
         try:
@@ -171,14 +167,12 @@ class PeagflowRadixCache(RadixCache):
         )
 
         if k_pool is None or v_pool is None:
-            raise RuntimeError(
-                "Unable to locate KV buffers from token_to_kv_pool_allocator"
-            )
+            raise RuntimeError("Unable to locate KV buffers from token_to_kv_pool_allocator")
 
         total_layers = len(k_pool) * 2
         layer_names: list[str] = []
 
-        for idx, (k_tensor, v_tensor) in enumerate(zip(k_pool, v_pool)):
+        for idx, (k_tensor, v_tensor) in enumerate(zip(k_pool, v_pool, strict=False)):
             base = f"layer{idx}"
             layer_names.extend(
                 [
@@ -321,9 +315,7 @@ class PeagflowRadixCache(RadixCache):
 
         token_slots = self.token_to_kv_pool_allocator.alloc(uncached_len)
         if token_slots is None or len(token_slots) == 0:
-            logger.info(
-                "[PeagflowRadixCache] alloc returned empty (need=%d)", uncached_len
-            )
+            logger.info("[PeagflowRadixCache] alloc returned empty (need=%d)", uncached_len)
             return base_res
 
         block_size = self.page_size
@@ -334,9 +326,7 @@ class PeagflowRadixCache(RadixCache):
         prefix_tokens = key.token_ids[:start_idx]
         prior_hash = None
         if prefix_tokens:
-            _, prior_hash = _hash_pages(
-                prefix_tokens, block_size, extra_key=key.extra_key
-            )
+            _, prior_hash = _hash_pages(prefix_tokens, block_size, extra_key=key.extra_key)
 
         missing_tokens = key.token_ids[start_idx : start_idx + uncached_len]
         block_hashes, _ = _hash_pages(
@@ -353,9 +343,7 @@ class PeagflowRadixCache(RadixCache):
         # Query availability before issuing load
         try:
             query_res = self.engine_client.query(self.instance_id, block_hashes)
-            hit_blocks = (
-                query_res.get("hit_blocks", 0) if isinstance(query_res, dict) else 0
-            )
+            hit_blocks = query_res.get("hit_blocks", 0) if isinstance(query_res, dict) else 0
         except Exception as e:
             logger.warning("[PeagflowRadixCache] query failed: %s", e)
             hit_blocks = 0
@@ -442,14 +430,10 @@ class PeagflowRadixCache(RadixCache):
         if enable_kv_committed_len:
             kv_committed_len = req.kv_committed_len
         else:
-            kv_committed_len = len(req.origin_input_ids) + max(
-                len(req.output_ids) - 1, 0
-            )
+            kv_committed_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_committed_len
-        ]
+        kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, :kv_committed_len]
 
         block_size = self.page_size
 
