@@ -85,6 +85,7 @@ def wait_for_server_ready(endpoint: str, timeout: float = SERVER_STARTUP_TIMEOUT
     """Wait for server to become ready by attempting connections."""
     # Import directly from submodule to avoid triggering __init__.py imports (vllm dependency)
     import importlib
+
     pegaflow_module = importlib.import_module("pegaflow.pegaflow")
     EngineRpcClient = pegaflow_module.EngineRpcClient
 
@@ -166,7 +167,9 @@ class ClientContext:
             raise RuntimeError("CUDA is not available")
 
         if device_id >= torch.cuda.device_count():
-            raise ValueError(f"device_id {device_id} >= available GPUs ({torch.cuda.device_count()})")
+            raise ValueError(
+                f"device_id {device_id} >= available GPUs ({torch.cuda.device_count()})"
+            )
 
         self.engine_client = engine_client
         self.instance_id = instance_id
@@ -273,9 +276,7 @@ class ClientContext:
         """Get KV cache tensor for a specific layer."""
         return self.gpu_kv_caches[layer]
 
-    def get_tensor_slice(
-        self, layer: int, start_block: int, num_blocks: int
-    ) -> torch.Tensor:
+    def get_tensor_slice(self, layer: int, start_block: int, num_blocks: int) -> torch.Tensor:
         """Get a slice of the KV cache tensor for a specific layer."""
         return self.gpu_kv_caches[layer][:, start_block : start_block + num_blocks]
 
@@ -342,9 +343,12 @@ class PegaServerProcess:
 
         cmd = [
             self._binary_path,
-            "--addr", f"127.0.0.1:{self.port}",
-            "--pool-size", self.pool_size,
-            "--device", "0",
+            "--addr",
+            f"127.0.0.1:{self.port}",
+            "--pool-size",
+            self.pool_size,
+            "--device",
+            "0",
         ]
 
         try:
@@ -410,12 +414,11 @@ def engine_client(pega_server: PegaServerProcess):
     """Create an EngineRpcClient connected to the test server."""
     # Import directly from submodule to avoid triggering __init__.py imports (vllm dependency)
     import importlib
+
     pegaflow_module = importlib.import_module("pegaflow.pegaflow")
     EngineRpcClient = pegaflow_module.EngineRpcClient
 
     return EngineRpcClient(pega_server.endpoint)
-
-
 
 
 @pytest.fixture

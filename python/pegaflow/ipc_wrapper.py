@@ -9,6 +9,7 @@ instead of device indices for device identification.
 """
 
 import threading
+
 import torch
 
 
@@ -87,9 +88,7 @@ class CudaIPCWrapper:
         CudaIPCWrapper._discover_gpu_devices()
 
         with CudaIPCWrapper._device_mapping_lock:
-            device_index = CudaIPCWrapper._discovered_device_mapping.get(
-                device_uuid, None
-            )
+            device_index = CudaIPCWrapper._discovered_device_mapping.get(device_uuid, None)
 
         if device_index is None:
             raise RuntimeError(

@@ -15,6 +15,7 @@ from pegaflow.pegaflow import EngineRpcClient
 
 logger = get_connector_logger()
 
+
 @dataclass(frozen=True)
 class ConnectorContext:
     """Shared configuration for scheduler/worker connectors."""
@@ -207,9 +208,7 @@ class RequestTracker:
 
     def should_hold_blocks(self) -> bool:
         return (
-            self._finished
-            and self._stored_blocks > 0
-            and self._saved_layers < self._total_layers
+            self._finished and self._stored_blocks > 0 and self._saved_layers < self._total_layers
         )
 
     def is_done(self) -> bool:
@@ -238,8 +237,7 @@ class PegaConnectorMetadata(KVConnectorMetadata):
 
     def __repr__(self) -> str:
         return (
-            f"PegaConnectorMetadata(loads={len(self.load_intents)}, "
-            f"saves={len(self.save_intents)})"
+            f"PegaConnectorMetadata(loads={len(self.load_intents)}, saves={len(self.save_intents)})"
         )
 
 
@@ -247,9 +245,7 @@ def resolve_instance_id(vllm_config, dp_rank_suffix: bool = True) -> str:
     """Resolve or generate connector instance_id with optional DP rank suffix."""
     instance_id = vllm_config.kv_transfer_config.engine_id
     if instance_id:
-        logger.info(
-            "[PegaKVConnector] Using kv_transfer_config.engine_id: %s", instance_id
-        )
+        logger.info("[PegaKVConnector] Using kv_transfer_config.engine_id: %s", instance_id)
         return instance_id
 
     instance_id = vllm_config.instance_id or os.environ.get("PEGAFLOW_INSTANCE_ID", "")
