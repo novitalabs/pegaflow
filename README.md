@@ -56,6 +56,12 @@ maturin develop --release
 cd ..
 ```
 
+To build a wheel for the Python bindings (for distribution or local use):
+```bash
+cd python
+maturin build --release
+```
+
 ### 4. Run Hello World
 
 ```bash
