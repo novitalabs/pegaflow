@@ -7,11 +7,15 @@ import hashlib
 import os
 import uuid
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 
 from pegaflow.logging_utils import get_connector_logger
 from pegaflow.pegaflow import EngineRpcClient
+
+if TYPE_CHECKING:
+    from pegaflow.connector.state_manager import ServiceStateManager
 
 logger = get_connector_logger()
 
@@ -28,6 +32,7 @@ class ConnectorContext:
     tp_rank: int | None
     device_id: int | None
     engine_client: EngineRpcClient
+    state_manager: "ServiceStateManager"
 
 
 class RequestPhase(enum.Enum):

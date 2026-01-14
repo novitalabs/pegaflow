@@ -25,6 +25,7 @@ from pegaflow.connector.common import (
     resolve_instance_id,
 )
 from pegaflow.connector.scheduler import SchedulerConnector
+from pegaflow.connector.state_manager import ServiceStateManager
 from pegaflow.connector.worker import WorkerConnector
 from pegaflow.logging_utils import timing_wrapper
 from pegaflow.pegaflow import EngineRpcClient
@@ -62,6 +63,8 @@ class PegaKVConnector(KVConnectorBase_V1):
         engine_client = EngineRpcClient(self._engine_endpoint)
         logger.info("[PegaKVConnector] Connected to engine server at %s", self._engine_endpoint)
 
+        self._state_manager = ServiceStateManager(engine_client)
+
         self._ctx = ConnectorContext(
             instance_id=instance_id,
             namespace=namespace,
@@ -71,6 +74,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             tp_rank=tp_rank,
             device_id=device_id,
             engine_client=engine_client,
+            state_manager=self._state_manager,
         )
 
         self._scheduler: SchedulerConnector | None = None
@@ -208,6 +212,8 @@ class PegaKVConnector(KVConnectorBase_V1):
     def shutdown(self):
         if self._worker:
             self._worker.shutdown()
+        if self._state_manager:
+            self._state_manager.shutdown()
 
 
 def _resolve_device_id() -> int:
