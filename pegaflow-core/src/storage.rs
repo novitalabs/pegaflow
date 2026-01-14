@@ -351,15 +351,34 @@ impl StorageEngine {
     // Write path (inflight)
     // ========================================================================
 
-    /// Check if a slot exists in inflight blocks.
-    pub fn inflight_has_slot(&self, namespace: &str, block_hash: &[u8], slot_id: usize) -> bool {
-        let key = BlockKey::new(namespace.to_string(), block_hash.to_vec());
-        let inner = self.inner.lock().unwrap();
-        if let Some(block) = inner.inflight.get(&key) {
-            block.slot_exists(slot_id)
-        } else {
-            false
-        }
+    /// Filter blocks that need to be saved (not in cache and slot not in inflight).
+    /// Returns indices of blocks that need saving. Single lock acquisition.
+    pub fn filter_blocks_to_save(
+        &self,
+        namespace: &str,
+        block_hashes: &[Vec<u8>],
+        slot_id: usize,
+    ) -> Vec<usize> {
+        let mut inner = self.inner.lock().unwrap();
+        block_hashes
+            .iter()
+            .enumerate()
+            .filter(|(_, hash)| {
+                let key = BlockKey::new(namespace.to_string(), hash.to_vec());
+                // Skip if already sealed in cache
+                if inner.cache.get(&key).is_some() {
+                    return false;
+                }
+                // Skip if slot already exists in inflight
+                if let Some(block) = inner.inflight.get(&key) {
+                    if block.slot_exists(slot_id) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .map(|(i, _)| i)
+            .collect()
     }
 
     /// Insert a slot into a block. Handles:
@@ -473,13 +492,6 @@ impl StorageEngine {
     // Read path (cache)
     // ========================================================================
 
-    /// Check if a block exists in the cache (sealed and complete).
-    pub fn cache_contains(&self, namespace: &str, block_hash: &[u8]) -> bool {
-        let key = BlockKey::new(namespace.to_string(), block_hash.to_vec());
-        let inner = self.inner.lock().unwrap();
-        inner.cache.contains_key(&key)
-    }
-
     /// Lookup multiple blocks for load operation.
     /// Consumes pinned blocks (removes from pinned_for_load).
     pub fn cache_lookup_many(
@@ -574,6 +586,44 @@ impl StorageEngine {
         }
 
         (freed_blocks, freed_bytes, largest_free)
+    }
+
+    /// Remove stale inflight blocks that have been stuck for longer than `max_age`.
+    ///
+    /// This is a safety net for rare race conditions where partial blocks can never
+    /// complete (e.g., cache eviction between layer checks). In normal operation,
+    /// this should clean very few or zero blocks.
+    ///
+    /// Returns the number of cleaned blocks.
+    pub fn gc_stale_inflight(&self, max_age: std::time::Duration) -> usize {
+        let mut inner = self.inner.lock().unwrap();
+        let before = inner.inflight.len();
+
+        inner.inflight.retain(|key, block| {
+            let age = block.age();
+            if age > max_age {
+                warn!(
+                    namespace = %key.namespace,
+                    hash_len = key.hash.len(),
+                    filled = block.filled_count(),
+                    total = block.total_slots(),
+                    age_secs = age.as_secs(),
+                    "GC: removing stale inflight block"
+                );
+                // Decrement the inflight gauge for each removed block
+                core_metrics().inflight_blocks.add(-1, &[]);
+                false
+            } else {
+                true
+            }
+        });
+
+        let cleaned = before - inner.inflight.len();
+        if cleaned > 0 {
+            core_metrics().inflight_gc_cleaned.add(cleaned as u64, &[]);
+            info!(cleaned, "GC cleaned stale inflight blocks");
+        }
+        cleaned
     }
 
     /// Check prefix blocks and trigger prefetch for blocks in SSD.
