@@ -237,6 +237,34 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             Arc::clone(&shutdown),
         );
 
+        // Spawn background GC task for stale inflight blocks
+        {
+            let engine = Arc::clone(&engine);
+            let shutdown = Arc::clone(&shutdown);
+            tokio::spawn(async move {
+                const GC_INTERVAL: Duration = Duration::from_secs(300); // 5 minutes
+                const GC_MAX_AGE: Duration = Duration::from_secs(3600); // 60 minutes
+                let mut interval = tokio::time::interval(GC_INTERVAL);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            let cleaned = engine.gc_stale_inflight(GC_MAX_AGE);
+                            if cleaned > 0 {
+                                info!("Inflight GC: cleaned {} stale blocks", cleaned);
+                            }
+                        }
+                        _ = shutdown.notified() => {
+                            info!("Inflight GC task shutting down");
+                            break;
+                        }
+                    }
+                }
+            });
+            info!("Inflight GC task started (interval=5m, max_age=60m)");
+        }
+
         let shutdown_signal = {
             let notify = Arc::clone(&shutdown);
             async move {

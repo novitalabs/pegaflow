@@ -576,6 +576,44 @@ impl StorageEngine {
         (freed_blocks, freed_bytes, largest_free)
     }
 
+    /// Remove stale inflight blocks that have been stuck for longer than `max_age`.
+    ///
+    /// This is a safety net for rare race conditions where partial blocks can never
+    /// complete (e.g., cache eviction between layer checks). In normal operation,
+    /// this should clean very few or zero blocks.
+    ///
+    /// Returns the number of cleaned blocks.
+    pub fn gc_stale_inflight(&self, max_age: std::time::Duration) -> usize {
+        let mut inner = self.inner.lock().unwrap();
+        let before = inner.inflight.len();
+
+        inner.inflight.retain(|key, block| {
+            let age = block.age();
+            if age > max_age {
+                warn!(
+                    namespace = %key.namespace,
+                    hash_len = key.hash.len(),
+                    filled = block.filled_count(),
+                    total = block.total_slots(),
+                    age_secs = age.as_secs(),
+                    "GC: removing stale inflight block"
+                );
+                // Decrement the inflight gauge for each removed block
+                core_metrics().inflight_blocks.add(-1, &[]);
+                false
+            } else {
+                true
+            }
+        });
+
+        let cleaned = before - inner.inflight.len();
+        if cleaned > 0 {
+            core_metrics().inflight_gc_cleaned.add(cleaned as u64, &[]);
+            info!(cleaned, "GC cleaned stale inflight blocks");
+        }
+        cleaned
+    }
+
     /// Check prefix blocks and trigger prefetch for blocks in SSD.
     /// Returns status indicating whether caller should retry.
     /// Hit blocks are pinned to prevent eviction before load.

@@ -4,6 +4,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::pinned_pool::PinnedAllocation;
 
@@ -212,6 +213,7 @@ pub(crate) struct InflightBlock {
     remaining: usize,
     total_slots: usize,
     footprint: u64,
+    created_at: Instant,
 }
 
 impl InflightBlock {
@@ -221,7 +223,23 @@ impl InflightBlock {
             remaining: total_slots,
             total_slots,
             footprint: 0,
+            created_at: Instant::now(),
         }
+    }
+
+    /// Returns the age of this inflight block.
+    pub fn age(&self) -> std::time::Duration {
+        self.created_at.elapsed()
+    }
+
+    /// Returns the number of filled slots.
+    pub fn filled_count(&self) -> usize {
+        self.total_slots - self.remaining
+    }
+
+    /// Returns the total number of slots.
+    pub fn total_slots(&self) -> usize {
+        self.total_slots
     }
 
     pub fn slot_exists(&self, slot_id: usize) -> bool {

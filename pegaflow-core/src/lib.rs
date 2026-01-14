@@ -1005,4 +1005,14 @@ impl PegaEngine {
 
         worker.worker_pool().submit_load(task)
     }
+
+    /// Remove stale inflight blocks that have been stuck for longer than `max_age`.
+    ///
+    /// This is a background GC operation to clean up orphan inflight blocks caused
+    /// by rare race conditions. Should be called periodically (e.g., every 5 minutes).
+    ///
+    /// Returns the number of cleaned blocks.
+    pub fn gc_stale_inflight(&self, max_age: std::time::Duration) -> usize {
+        self.storage.gc_stale_inflight(max_age)
+    }
 }
