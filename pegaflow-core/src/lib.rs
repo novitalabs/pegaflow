@@ -613,9 +613,8 @@ impl PegaEngine {
         let slot_id = instance.get_slot_index(layer_id, tp_rank)?;
         let total_slots = instance.total_slots();
 
-        // Collect blocks that need to be saved
-        let mut blocks_to_save = Vec::with_capacity(block_ids.len());
-
+        // Validate block_ids and collect block_hashes for filtering
+        let mut valid_blocks: Vec<(usize, Vec<u8>)> = Vec::with_capacity(block_ids.len());
         for (block_id, block_hash) in block_ids.iter().zip(block_hashes.iter()) {
             if *block_id < 0 {
                 continue;
@@ -627,28 +626,28 @@ impl PegaEngine {
                     registration.num_blocks
                 )));
             }
-
-            // Check if this block_hash already has data for this slot
-            // Skip if already sealed in cache or slot exists in inflight
-            //
-            // FIXME(race): There's a subtle race condition here. If cache contains the block
-            // when checking layer 0 (skip), but gets evicted before checking layer 1 (write),
-            // we create an inflight block with only slot 1 that can never complete.
-            // Probability is near-zero with large pools, but for robustness we should add
-            // a background GC thread to clean up inflight blocks older than ~1 hour.
-            let needs_save = !self.storage.cache_contains(namespace, block_hash)
-                && !self
-                    .storage
-                    .inflight_has_slot(namespace, block_hash, slot_id);
-
-            if needs_save {
-                blocks_to_save.push((block_idx, block_hash.clone()));
-            }
+            valid_blocks.push((block_idx, block_hash.clone()));
         }
 
-        if blocks_to_save.is_empty() {
+        if valid_blocks.is_empty() {
             return Ok(());
         }
+
+        // Filter blocks that need saving (single lock acquisition)
+        let valid_hashes: Vec<Vec<u8>> = valid_blocks.iter().map(|(_, h)| h.clone()).collect();
+        let indices_to_save = self
+            .storage
+            .filter_blocks_to_save(namespace, &valid_hashes, slot_id);
+
+        if indices_to_save.is_empty() {
+            return Ok(());
+        }
+
+        // Collect only blocks that need saving
+        let blocks_to_save: Vec<(usize, Vec<u8>)> = indices_to_save
+            .into_iter()
+            .map(|i| valid_blocks[i].clone())
+            .collect();
 
         debug!(
             "Saving {} blocks for layer {layer_name} on instance {instance_id} rank {tp_rank}",
