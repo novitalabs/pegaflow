@@ -15,6 +15,7 @@ from pegaflow.connector.common import (
     logger,
 )
 from pegaflow.logging_utils import timing_wrapper
+from pegaflow.pegaflow import PegaFlowBusinessError, PegaFlowServiceError
 
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -233,19 +234,39 @@ class SchedulerConnector:
         if not self._ctx.state_manager.is_available():
             return 0
 
+        block_hash_list = list(block_hashes)
         try:
-            result = self._ctx.engine_client.query(self._ctx.instance_id, list(block_hashes))
-        except Exception as e:
-            # Any exception marks service unavailable
+            result = self._ctx.engine_client.query(self._ctx.instance_id, block_hash_list)
+        except PegaFlowServiceError as e:
+            # Service error (network/internal) - mark unavailable
             self._ctx.state_manager.mark_unavailable(str(e))
             return 0
+        except PegaFlowBusinessError as e:
+            # Business error (invalid args, etc.) - log details and propagate
+            logger.error(
+                "[PegaKVConnector] Query business error: %s, "
+                "req_id=%s, instance_id=%s, num_blocks=%d",
+                e,
+                req_id,
+                self._ctx.instance_id,
+                len(block_hash_list),
+            )
+            raise
 
         # Handle new dict response format
         if isinstance(result, dict):
             if not result.get("ok", False):
+                # Response-level errors are treated as business errors
                 error_msg = result.get("message", "unknown error")
-                self._ctx.state_manager.mark_unavailable(error_msg)
-                return 0
+                logger.error(
+                    "[PegaKVConnector] Query failed: %s, "
+                    "req_id=%s, instance_id=%s, num_blocks=%d",
+                    error_msg,
+                    req_id,
+                    self._ctx.instance_id,
+                    len(block_hash_list),
+                )
+                raise RuntimeError(f"Query failed: {error_msg}")
 
             prefetch_state = result.get("prefetch_state", "done")
             hit_blocks = result.get("hit_blocks", 0)

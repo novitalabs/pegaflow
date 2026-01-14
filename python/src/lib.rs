@@ -3,7 +3,11 @@ use pegaflow_proto::proto::engine::{
     engine_client::EngineClient, HealthRequest, LoadRequest, QueryRequest, RegisterContextRequest,
     ResponseStatus, SaveLayer, SaveRequest, ShutdownRequest, UnregisterRequest,
 };
-use pyo3::{exceptions::PyRuntimeError, prelude::*};
+use pyo3::{
+    create_exception,
+    exceptions::{PyException, PyRuntimeError},
+    prelude::*,
+};
 use std::{
     future::Future,
     sync::{Arc, Once, OnceLock},
@@ -12,8 +16,13 @@ use std::{
 use tokio::runtime::{Handle, Runtime};
 use tonic::{
     transport::{Channel, Endpoint},
-    Status as GrpcStatus,
+    Code, Status as GrpcStatus,
 };
+
+// Custom Python exceptions for error classification
+create_exception!(pegaflow, PegaFlowError, PyException);
+create_exception!(pegaflow, PegaFlowServiceError, PegaFlowError);
+create_exception!(pegaflow, PegaFlowBusinessError, PegaFlowError);
 use tracing_subscriber::{
     fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter,
 };
@@ -62,13 +71,43 @@ fn runtime_creation_error(err: impl std::fmt::Display) -> PyErr {
 }
 
 fn transport_connect_error(endpoint: &str, err: impl std::fmt::Display) -> PyErr {
-    PyRuntimeError::new_err(format!(
+    PegaFlowServiceError::new_err(format!(
         "failed to connect to engine server at {endpoint}: {err}"
     ))
 }
 
+/// Classify gRPC status codes into service vs business errors.
+///
+/// Service errors (server unavailable, should trigger health check):
+/// - UNAVAILABLE: Server not reachable
+/// - DEADLINE_EXCEEDED: Request timed out
+/// - INTERNAL: Server internal error
+/// - ABORTED: Operation aborted
+/// - CANCELLED: Operation cancelled
+///
+/// Business errors (application logic errors, should propagate):
+/// - INVALID_ARGUMENT: Bad request parameters
+/// - FAILED_PRECONDITION: State precondition not met
+/// - NOT_FOUND: Resource not found
+/// - All other codes
+fn is_service_error(code: Code) -> bool {
+    matches!(
+        code,
+        Code::Unavailable
+            | Code::DeadlineExceeded
+            | Code::Internal
+            | Code::Aborted
+            | Code::Cancelled
+    )
+}
+
 fn rpc_status_error(method: &str, err: GrpcStatus) -> PyErr {
-    PyRuntimeError::new_err(format!("{method} RPC failed: {err}"))
+    let msg = format!("{method} RPC failed: {err}");
+    if is_service_error(err.code()) {
+        PegaFlowServiceError::new_err(msg)
+    } else {
+        PegaFlowBusinessError::new_err(msg)
+    }
 }
 
 fn expect_status(method: &str, status: Option<ResponseStatus>) -> PyResult<ResponseStatus> {
@@ -556,5 +595,11 @@ fn pegaflow(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PegaEngine>()?;
     m.add_class::<EngineRpcClient>()?;
     m.add_class::<PyLoadState>()?;
+
+    // Register custom exceptions for error classification
+    m.add("PegaFlowError", m.py().get_type::<PegaFlowError>())?;
+    m.add("PegaFlowServiceError", m.py().get_type::<PegaFlowServiceError>())?;
+    m.add("PegaFlowBusinessError", m.py().get_type::<PegaFlowBusinessError>())?;
+
     Ok(())
 }
