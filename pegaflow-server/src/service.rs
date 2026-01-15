@@ -162,7 +162,7 @@ impl Engine for GrpcEngineService {
         let result: Result<Response<SaveResponse>, Status> = async {
             let req = request.into_inner();
             let tp_rank = Self::usize_from_u32(req.tp_rank, "tp_rank")?;
-            let total_blocks: usize = req.saves.iter().map(|layer| layer.block_ids.len()).sum();
+            let total_blocks: usize = req.saves.first().map(|l| l.block_ids.len()).unwrap_or(0);
 
             let saves = req
                 .saves
