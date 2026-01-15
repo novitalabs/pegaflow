@@ -251,7 +251,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             }
         };
 
-        info!("Starting PegaEngine gRPC server on {}", cli.addr);
+        info!("PegaEngine gRPC server listening on {}", cli.addr);
 
         if let Err(err) = Server::builder()
             .add_service(EngineServer::new(service))

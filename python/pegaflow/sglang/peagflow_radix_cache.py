@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 import torch
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.mem_cache.hicache_storage import get_hash_str
+from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 
 from pegaflow import EngineRpcClient, PyLoadState
@@ -109,11 +110,15 @@ class PeagflowRadixCache(RadixCache):
     ):
         super().__init__(params)
 
+        self.is_mla = isinstance(self.token_to_kv_pool_allocator.get_kvcache(), MLATokenToKVPool)
+
         if EngineRpcClient is None:
             raise RuntimeError("pegaflow extension is not available (EngineRpcClient missing)")
 
         self.instance_id = instance_id or _default_instance_id()
-        self.namespace = namespace or _default_namespace(model_config, tp_size)
+        self.namespace = namespace or _default_namespace(
+            model_config, 1 if self.is_mla else tp_size
+        )
         self.tp_rank = rank
         self.tp_size = tp_size
 
@@ -146,48 +151,68 @@ class PeagflowRadixCache(RadixCache):
         if tp_rank != 0:
             return
         try:
-            logger.info("[PeagflowRadixCache] Unregistering instance=%s", instance_id)
+            logger.debug(f"[PeagflowRadixCache] Unregistering instance={instance_id}")
             ok, msg = client.unregister_context(instance_id)
             if not ok:
-                logger.warning("[PeagflowRadixCache] Unregister failed: %s", msg)
+                logger.warning(f"[PeagflowRadixCache] Unregister failed: {msg}")
         except Exception as e:
-            logger.warning("[PeagflowRadixCache] Unregister exception: %s", e)
+            logger.warning(f"[PeagflowRadixCache] Unregister exception: {e}")
 
     def _register_kv_caches(self) -> None:
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()
-        k_pool = getattr(
-            kvcache,
-            "k_buffer",
-            getattr(self.token_to_kv_pool_allocator, "k_buffer", None),
-        )
-        v_pool = getattr(
-            kvcache,
-            "v_buffer",
-            getattr(self.token_to_kv_pool_allocator, "v_buffer", None),
-        )
+        if self.is_mla:
+            k_pool = getattr(
+                kvcache,
+                "kv_buffer",
+                getattr(self.token_to_kv_pool_allocator, "kv_buffer", None),
+            )
+            if k_pool is None:
+                raise RuntimeError("Unable to locate KV buffers from token_to_kv_pool_allocator")
+        else:
+            k_pool = getattr(
+                kvcache,
+                "k_buffer",
+                getattr(self.token_to_kv_pool_allocator, "k_buffer", None),
+            )
+            v_pool = getattr(
+                kvcache,
+                "v_buffer",
+                getattr(self.token_to_kv_pool_allocator, "v_buffer", None),
+            )
 
-        if k_pool is None or v_pool is None:
-            raise RuntimeError("Unable to locate KV buffers from token_to_kv_pool_allocator")
+            if k_pool is None or v_pool is None:
+                raise RuntimeError("Unable to locate KV buffers from token_to_kv_pool_allocator")
 
-        total_layers = len(k_pool) * 2
+        total_layers = len(k_pool)
+        if not self.is_mla:
+            total_layers *= 2
         layer_names: list[str] = []
 
-        for idx, (k_tensor, v_tensor) in enumerate(zip(k_pool, v_pool, strict=False)):
-            base = f"layer{idx}"
-            layer_names.extend(
-                [
+        if self.is_mla:
+            for idx, k_tensor in enumerate(k_pool):
+                layer_names.append(
                     self._register_single_layer(
                         tensor=k_tensor,
-                        layer_name=f"{base}_k",
+                        layer_name=f"layer{idx}",
                         total_layers=total_layers,
-                    ),
-                    self._register_single_layer(
-                        tensor=v_tensor,
-                        layer_name=f"{base}_v",
-                        total_layers=total_layers,
-                    ),
-                ]
-            )
+                    )
+                )
+        else:
+            for idx, (k_tensor, v_tensor) in enumerate(zip(k_pool, v_pool, strict=False)):
+                layer_names.extend(
+                    [
+                        self._register_single_layer(
+                            tensor=k_tensor,
+                            layer_name=f"layer{idx}_k",
+                            total_layers=total_layers,
+                        ),
+                        self._register_single_layer(
+                            tensor=v_tensor,
+                            layer_name=f"layer{idx}_v",
+                            total_layers=total_layers,
+                        ),
+                    ]
+                )
 
         self._layer_names = layer_names
 
@@ -218,8 +243,8 @@ class PeagflowRadixCache(RadixCache):
         ok, message = self.engine_client.register_context(
             self.instance_id,
             self.namespace,
-            self.tp_rank,
-            self.tp_size,
+            0 if self.is_mla else self.tp_rank,
+            1 if self.is_mla else self.tp_size,
             self.device_id,
             total_layers,
             layer_name,
@@ -234,11 +259,7 @@ class PeagflowRadixCache(RadixCache):
             raise RuntimeError(f"Register context failed for {layer_name}: {message}")
 
         logger.info(
-            "[PeagflowRadixCache] Registered %s (num_blocks=%d, bytes_per_block=%d, page_size=%d)",
-            layer_name,
-            num_blocks,
-            bytes_per_block,
-            self.page_size,
+            f"[PeagflowRadixCache] Registered {layer_name} (num_blocks={num_blocks}, bytes_per_block={bytes_per_block}, page_size={self.page_size})"
         )
 
         return layer_name
@@ -277,36 +298,23 @@ class PeagflowRadixCache(RadixCache):
         if self.disable or not key:
             return super().match_prefix(key, **kwargs)
 
-        original_len = len(key)
-        if self.page_size != 1:
-            aligned_len = original_len // self.page_size * self.page_size
-            key = key[:aligned_len]
-
-        logger.info(
-            "[PeagflowRadixCache] match_prefix start: key_len=%d aligned_len=%d page_size=%d",
-            original_len,
-            len(key),
-            self.page_size,
-        )
-
         base_res = super().match_prefix(key, **kwargs)
         value: torch.Tensor = base_res.device_indices
         last_node: TreeNode = base_res.last_device_node
 
-        logger.info(
-            "[PeagflowRadixCache] match_prefix base hit_len=%d key_len=%d",
-            value.numel(),
-            len(key),
+        logger.debug(
+            f"[PeagflowRadixCache] match_prefix base hit_len={value.numel()} key_len={len(key)}"
         )
 
         if len(key) == 0:
-            logger.info("[PeagflowRadixCache] key aligned to zero, skip cache load")
+            logger.debug("[PeagflowRadixCache] key aligned to zero, skip cache load")
             return base_res
 
         if value.numel() == len(key):
             return base_res
 
         uncached_len = len(key) - value.numel()
+        uncached_len = uncached_len // self.page_size * self.page_size
         if uncached_len == 0:
             return base_res
 
@@ -315,7 +323,7 @@ class PeagflowRadixCache(RadixCache):
 
         token_slots = self.token_to_kv_pool_allocator.alloc(uncached_len)
         if token_slots is None or len(token_slots) == 0:
-            logger.info("[PeagflowRadixCache] alloc returned empty (need=%d)", uncached_len)
+            logger.info(f"[PeagflowRadixCache] alloc returned empty (need={uncached_len})")
             return base_res
 
         block_size = self.page_size
@@ -333,11 +341,8 @@ class PeagflowRadixCache(RadixCache):
             missing_tokens, block_size, prior_hash=prior_hash, extra_key=key.extra_key
         )
 
-        logger.info(
-            "[PeagflowRadixCache] match_prefix miss: start=%d len=%d blocks=%d",
-            start_idx,
-            uncached_len,
-            len(block_ids),
+        logger.debug(
+            f"[PeagflowRadixCache] match_prefix miss: start={start_idx} len={uncached_len} blocks={len(block_ids)}"
         )
 
         # Query availability before issuing load
@@ -345,13 +350,11 @@ class PeagflowRadixCache(RadixCache):
             query_res = self.engine_client.query(self.instance_id, block_hashes)
             hit_blocks = query_res.get("hit_blocks", 0) if isinstance(query_res, dict) else 0
         except Exception as e:
-            logger.warning("[PeagflowRadixCache] query failed: %s", e)
+            logger.warning(f"[PeagflowRadixCache] query failed: {e}")
             hit_blocks = 0
 
-        logger.info(
-            "[PeagflowRadixCache] query result: hit_blocks=%d requested=%d",
-            hit_blocks,
-            len(block_ids),
+        logger.debug(
+            f"[PeagflowRadixCache] query result: hit_blocks={hit_blocks} requested={len(block_ids)}"
         )
 
         hit_blocks = min(hit_blocks, len(block_ids))
@@ -367,7 +370,7 @@ class PeagflowRadixCache(RadixCache):
         load_state = PyLoadState()
         ok, message = self.engine_client.load(
             self.instance_id,
-            self.tp_rank,
+            0 if self.is_mla else self.tp_rank,
             self.device_id,
             load_state.shm_name(),
             self._layer_names,
@@ -376,7 +379,7 @@ class PeagflowRadixCache(RadixCache):
         )
 
         if not ok:
-            logger.warning("[PeagflowRadixCache] load failed: %s", message)
+            logger.warning(f"[PeagflowRadixCache] load failed: {message}")
             self.token_to_kv_pool_allocator.free(token_slots)
             return base_res
 
@@ -385,11 +388,7 @@ class PeagflowRadixCache(RadixCache):
             self.token_to_kv_pool_allocator.free(token_slots)
             return base_res
 
-        logger.info(
-            "[PeagflowRadixCache] loaded blocks=%d tokens=%d",
-            hit_blocks,
-            fetched_tokens,
-        )
+        logger.debug(f"[PeagflowRadixCache] loaded blocks={hit_blocks} tokens={fetched_tokens}")
 
         # Trim unused slots if partial fetch
         if fetched_tokens < uncached_len:
@@ -447,24 +446,23 @@ class PeagflowRadixCache(RadixCache):
 
         saves = [(layer, block_ids, block_hashes) for layer in self._layer_names]
 
-        logger.info(
-            "[PeagflowRadixCache] save req=%s blocks=%d layers=%d",
-            getattr(req, "request_id", None),
-            len(block_ids),
-            len(saves),
+        logger.debug(
+            f"[PeagflowRadixCache] save req={getattr(req, 'request_id', None)} blocks={len(block_ids)} layers={len(saves)}"
         )
 
         try:
+            if self.tp_rank != 0:
+                return
             ok, message = self.engine_client.save(
                 self.instance_id,
-                self.tp_rank,
+                0 if self.is_mla else self.tp_rank,
                 self.device_id,
                 saves,
             )
             if not ok:
-                logger.warning("[PeagflowRadixCache] save failed: %s", message)
+                logger.warning(f"[PeagflowRadixCache] save failed: {message}")
         except Exception as e:
-            logger.warning("[PeagflowRadixCache] save exception: %s", e)
+            logger.warning(f"[PeagflowRadixCache] save exception: {e}")
 
     def evict(self, num_tokens: int) -> None:  # type: ignore[override]
         if self.disable:
