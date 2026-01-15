@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Notify;
 use tonic::{async_trait, Request, Response, Status};
-use tracing::{info, instrument, warn};
+use tracing::{info, instrument, warn, Span};
 
 #[derive(Clone)]
 pub struct GrpcEngineService {
@@ -155,13 +155,14 @@ impl Engine for GrpcEngineService {
     #[instrument(
         level = "info",
         skip(self, request),
-        fields(instance=%request.get_ref().instance_id, tp_rank=%request.get_ref().tp_rank, device=%request.get_ref().device_id, layers=%request.get_ref().saves.len())
+        fields(instance=%request.get_ref().instance_id, tp_rank=%request.get_ref().tp_rank, device=%request.get_ref().device_id, layers=%request.get_ref().saves.len(), blocks = tracing::field::Empty)
     )]
     async fn save(&self, request: Request<SaveRequest>) -> Result<Response<SaveResponse>, Status> {
         let start = Instant::now();
         let result: Result<Response<SaveResponse>, Status> = async {
             let req = request.into_inner();
             let tp_rank = Self::usize_from_u32(req.tp_rank, "tp_rank")?;
+            let total_blocks: usize = req.saves.first().map(|l| l.block_ids.len()).unwrap_or(0);
 
             let saves = req
                 .saves
@@ -169,6 +170,7 @@ impl Engine for GrpcEngineService {
                 .map(|layer| (layer.layer_name, layer.block_ids, layer.block_hashes))
                 .collect();
 
+            Span::current().record("blocks", total_blocks);
             self.engine
                 .batch_save_kv_blocks_from_ipc(&req.instance_id, tp_rank, req.device_id, saves)
                 .await
