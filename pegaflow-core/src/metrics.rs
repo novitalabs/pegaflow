@@ -44,10 +44,10 @@ fn init_meter() -> Meter {
     global::meter("pegaflow-core")
 }
 
-/// Custom histogram boundaries for SSD throughput in bytes/s (0.5 to 20 GB/s, step 0.5 GB/s)
+/// Custom histogram boundaries for SSD throughput in bytes/s (1 to 40 GB/s, step 1 GB/s)
 fn ssd_throughput_boundaries() -> Vec<f64> {
-    // 0.5e9, 1.0e9, 1.5e9, ..., 20.0e9 (40 buckets in bytes/s)
-    (1..=40).map(|i| i as f64 * 0.5e9).collect()
+    // 1.0e9, 2.0e9, 3.0e9, ..., 40.0e9 (40 buckets in bytes/s)
+    (1..=40).map(|i| i as f64 * 1.0e9).collect()
 }
 
 /// Custom histogram boundaries for duration in seconds (1ms to 5s)
