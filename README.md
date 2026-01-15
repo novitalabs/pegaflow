@@ -39,14 +39,29 @@ uv pip install vllm
 export PYO3_PYTHON=$(which python)
 export LD_LIBRARY_PATH=$(python -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))"):$LD_LIBRARY_PATH
 
-# Start the server (keep running in a separate terminal)
-cargo run -r --bin pegaflow-server -- --addr 0.0.0.0:50055 --device 0 --pool-size 30gb
+# Start the server with defaults (127.0.0.1:50055, device 0, 30gb pool)
+cargo run -r
 ```
 
-**Server Options:**
+**Customize pool size** (if needed):
+```bash
+cargo run -r -- --pool-size 50gb
+```
+
+**All available options:**
 - `--addr`: Bind address (default: `127.0.0.1:50055`)
 - `--device`: CUDA device ID (default: `0`)
-- `--pool-size`: Pinned memory pool size (e.g., `10gb`, `500mb`, `1.5tb`)
+- `--pool-size`: Pinned memory pool size (default: `30gb`, supports: `kb`, `mb`, `gb`, `tb`)
+- `--hint-value-size`: Hint for typical value size to tune cache and allocator (optional, supports: `kb`, `mb`, `gb`, `tb`)
+- `--use-hugepages`: Use huge pages for pinned memory (default: `false`, requires pre-configured `/proc/sys/vm/nr_hugepages`)
+- `--disable-lfu-admission`: Disable TinyLFU cache admission, fallback to plain LRU (default: `false`)
+- `--metrics-otel-endpoint`: OTLP metrics export endpoint (default: `http://127.0.0.1:4321`, empty to disable)
+- `--metrics-period-secs`: Metrics export period in seconds (default: `5`)
+- `--log-level`: Log level: `trace`, `debug`, `info`, `warn`, `error` (default: `info`)
+- `--ssd-cache-path`: Enable SSD cache by providing cache file path (optional)
+- `--ssd-cache-capacity`: SSD cache capacity (default: `512gb`, supports: `kb`, `mb`, `gb`, `tb`)
+- `--ssd-write-queue-depth`: SSD write queue depth, max pending write batches (default: `8`)
+- `--ssd-prefetch-queue-depth`: SSD prefetch queue depth, max pending prefetch batches (default: `2`)
 
 ### 3. Build Python Bindings
 
@@ -150,7 +165,7 @@ Client Request
 1. Start the PegaEngine server (centralized KV cache storage):
 
    ```bash
-   cargo run -r --bin pegaflow-server -- --addr 0.0.0.0:50055 --device 0 --pool-size 30gb
+   cargo run -r
    ```
 2. Launch P/D setup:
 
