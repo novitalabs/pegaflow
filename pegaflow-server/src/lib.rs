@@ -4,11 +4,14 @@ pub mod registry;
 pub mod service;
 mod utils;
 
+use colored::Color::{Green, Red, Yellow};
+use logforth::layout::TextLayout;
 pub use registry::CudaTensorRegistry;
 pub use service::GrpcEngineService;
 
 use clap::Parser;
 use cudarc::driver::result as cuda_driver;
+use log::{error, info};
 use opentelemetry::global;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
@@ -22,10 +25,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
 use tonic::transport::Server;
-use tracing::{error, info};
-use tracing_subscriber::{
-    fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter,
-};
 use utils::parse_memory_size;
 
 #[cfg(not(target_env = "msvc"))]
@@ -96,14 +95,21 @@ pub struct Cli {
     pub ssd_prefetch_queue_depth: usize,
 }
 
-fn init_tracing(log_level: &str) {
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| log_level.parse().unwrap());
-    let fmt_layer = tracing_subscriber::fmt::layer().with_span_events(FmtSpan::CLOSE);
-    let _ = tracing_subscriber::registry()
-        .with(env_filter)
-        .with(fmt_layer)
-        .try_init();
+fn init_logging(log_level: &str) {
+    let filter_str = std::env::var("RUST_LOG").unwrap_or_else(|_| log_level.to_string());
+    let filter: logforth::filter::EnvFilter =
+        filter_str.parse().unwrap_or_else(|_| log_level.into());
+    let layout = TextLayout::default()
+        .info_color(Green)
+        .warn_color(Yellow)
+        .error_color(Red);
+
+    logforth::starter_log::builder()
+        .dispatch(|d| {
+            d.filter(filter)
+                .append(logforth::append::Stdout::default().with_layout(layout))
+        })
+        .apply();
 }
 
 fn format_py_err(err: PyErr) -> String {
@@ -160,7 +166,7 @@ fn init_metrics(
 /// Main entry point for pegaflow-server
 pub fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
-    init_tracing(&cli.log_level);
+    init_logging(&cli.log_level);
 
     // Initialize CUDA in the main thread before starting Tokio runtime
     init_cuda_driver()?;

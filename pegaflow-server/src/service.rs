@@ -6,6 +6,7 @@ use crate::proto::engine::{
     SaveResponse, ShutdownRequest, ShutdownResponse, UnregisterRequest, UnregisterResponse,
 };
 use crate::registry::{CudaTensorRegistry, TensorMetadata};
+use log::{info, warn};
 use parking_lot::Mutex;
 use pegaflow_core::{EngineError, PegaEngine, PrefetchStatus};
 use pyo3::{PyErr, Python};
@@ -13,7 +14,6 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Notify;
 use tonic::{async_trait, Request, Response, Status};
-use tracing::{info, instrument, warn, Span};
 
 #[derive(Clone)]
 pub struct GrpcEngineService {
@@ -104,11 +104,6 @@ impl GrpcEngineService {
 
 #[async_trait]
 impl Engine for GrpcEngineService {
-    #[instrument(
-        level = "info",
-        skip(self, request),
-        fields(instance=%request.get_ref().instance_id, tp_rank=%request.get_ref().tp_rank, device=%request.get_ref().device_id, layer=%request.get_ref().layer_name)
-    )]
     async fn register_context(
         &self,
         request: Request<RegisterContextRequest>,
@@ -152,17 +147,11 @@ impl Engine for GrpcEngineService {
         result
     }
 
-    #[instrument(
-        level = "info",
-        skip(self, request),
-        fields(instance=%request.get_ref().instance_id, tp_rank=%request.get_ref().tp_rank, device=%request.get_ref().device_id, layers=%request.get_ref().saves.len(), blocks = tracing::field::Empty)
-    )]
     async fn save(&self, request: Request<SaveRequest>) -> Result<Response<SaveResponse>, Status> {
         let start = Instant::now();
         let result: Result<Response<SaveResponse>, Status> = async {
             let req = request.into_inner();
             let tp_rank = Self::usize_from_u32(req.tp_rank, "tp_rank")?;
-            let total_blocks: usize = req.saves.first().map(|l| l.block_ids.len()).unwrap_or(0);
 
             let saves = req
                 .saves
@@ -170,7 +159,6 @@ impl Engine for GrpcEngineService {
                 .map(|layer| (layer.layer_name, layer.block_ids, layer.block_hashes))
                 .collect();
 
-            Span::current().record("blocks", total_blocks);
             self.engine
                 .batch_save_kv_blocks_from_ipc(&req.instance_id, tp_rank, req.device_id, saves)
                 .await
@@ -186,11 +174,6 @@ impl Engine for GrpcEngineService {
         result
     }
 
-    #[instrument(
-        level = "info",
-        skip(self, request),
-        fields(instance=%request.get_ref().instance_id, tp_rank=%request.get_ref().tp_rank, device=%request.get_ref().device_id, layers=%request.get_ref().layer_names.len(), blocks=%request.get_ref().block_ids.len())
-    )]
     async fn load(&self, request: Request<LoadRequest>) -> Result<Response<LoadResponse>, Status> {
         let start = Instant::now();
         let result: Result<Response<LoadResponse>, Status> = async {
@@ -223,12 +206,6 @@ impl Engine for GrpcEngineService {
         result
     }
 
-    #[instrument(
-        level = "info",
-        skip(self, request),
-        fields(instance=%request.get_ref().instance_id, blocks=%request.get_ref().block_hashes.len()),
-        ret
-    )]
     async fn query(
         &self,
         request: Request<QueryRequest>,
@@ -269,11 +246,6 @@ impl Engine for GrpcEngineService {
         result
     }
 
-    #[instrument(
-        level = "info",
-        skip(self, request),
-        fields(instance=%request.get_ref().instance_id)
-    )]
     async fn unregister_context(
         &self,
         request: Request<UnregisterRequest>,
@@ -306,7 +278,6 @@ impl Engine for GrpcEngineService {
         result
     }
 
-    #[instrument(level = "info", skip(self, _request))]
     async fn shutdown(
         &self,
         _request: Request<ShutdownRequest>,
@@ -330,7 +301,6 @@ impl Engine for GrpcEngineService {
         result
     }
 
-    #[instrument(level = "info", skip(self, _request))]
     async fn health(
         &self,
         _request: Request<HealthRequest>,

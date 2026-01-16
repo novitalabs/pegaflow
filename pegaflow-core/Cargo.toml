@@ -5,7 +5,7 @@ edition.workspace = true
 
 [dependencies]
 cudarc.workspace = true
-tracing.workspace = true
+log.workspace = true
 offset-allocator.workspace = true
 hashlink.workspace = true
 tokio.workspace = true

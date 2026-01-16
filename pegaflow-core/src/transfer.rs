@@ -1,5 +1,5 @@
 use cudarc::driver::CudaStream;
-use tracing::{debug, instrument, warn};
+use log::{debug, warn};
 
 use crate::KVCacheRegistration;
 
@@ -13,7 +13,6 @@ use crate::KVCacheRegistration;
 // ============================================================================
 
 /// Calculate the byte offset for a given block/segment combination.
-#[instrument(level = "debug", skip(registration))]
 pub(crate) fn segment_offset(
     registration: &KVCacheRegistration,
     block_idx: usize,
@@ -46,7 +45,6 @@ pub(crate) fn segment_offset(
 }
 
 /// Copy data from GPU to CPU asynchronously on the provided stream
-#[instrument(level = "debug", skip(stream), fields(offset, size), err)]
 pub(crate) fn copy_gpu_to_cpu_async(
     gpu_base_ptr: u64,
     offset: usize,
@@ -74,7 +72,6 @@ pub(crate) fn copy_gpu_to_cpu_async(
 }
 
 /// Copy data from CPU to GPU asynchronously on the provided stream
-#[instrument(level = "debug", skip(cpu_buffer, stream), fields(offset, size), err)]
 pub(crate) fn copy_cpu_to_gpu_async(
     gpu_base_ptr: u64,
     offset: usize,

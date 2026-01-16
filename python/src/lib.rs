@@ -23,11 +23,8 @@ use tonic::{
 create_exception!(pegaflow, PegaFlowError, PyException);
 create_exception!(pegaflow, PegaFlowServiceError, PegaFlowError);
 create_exception!(pegaflow, PegaFlowBusinessError, PegaFlowError);
-use tracing_subscriber::{
-    fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter,
-};
 
-static INIT_TRACING: Once = Once::new();
+static INIT_LOGGING: Once = Once::new();
 static TOKIO_RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
 /// Get or create the global Tokio runtime (shared across all RPC calls)
@@ -49,20 +46,16 @@ fn get_runtime() -> PyResult<&'static Runtime> {
         .ok_or_else(|| PyRuntimeError::new_err("failed to initialize Tokio runtime"))
 }
 
-fn init_tracing() {
-    INIT_TRACING.call_once(|| {
-        // Default to info for most crates, debug for core if RUST_LOG not set.
-        let env_filter = EnvFilter::try_from_default_env()
-            .or_else(|_| "info,pegaflow_core=info".parse())
-            .unwrap_or_else(|_| EnvFilter::new("info"));
+fn init_logging() {
+    INIT_LOGGING.call_once(|| {
+        let filter_str =
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "info,pegaflow_core=info".to_string());
+        let filter: logforth::filter::EnvFilter =
+            filter_str.parse().unwrap_or_else(|_| "info".into());
 
-        let fmt_layer = tracing_subscriber::fmt::layer().with_span_events(FmtSpan::CLOSE);
-
-        // Ignore errors if already initialized by embedding app.
-        let _ = tracing_subscriber::registry()
-            .with(fmt_layer)
-            .with(env_filter)
-            .try_init();
+        logforth::starter_log::builder()
+            .dispatch(|d| d.filter(filter).append(logforth::append::Stderr::default()))
+            .apply();
     });
 }
 
@@ -163,7 +156,7 @@ impl PegaEngine {
     /// Create a new PegaEngine instance
     #[new]
     fn new() -> Self {
-        init_tracing();
+        init_logging();
         PegaEngine {
             engine: CoreEngine::new(),
         }
@@ -591,7 +584,7 @@ impl PyLoadState {
 /// This module is named "pegaflow" and will be imported as: from pegaflow import PegaEngine
 #[pymodule]
 fn pegaflow(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    init_tracing();
+    init_logging();
     m.add_class::<PegaEngine>()?;
     m.add_class::<EngineRpcClient>()?;
     m.add_class::<PyLoadState>()?;
