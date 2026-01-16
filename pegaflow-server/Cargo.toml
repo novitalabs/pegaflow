@@ -22,8 +22,8 @@ tonic.workspace = true
 tonic-prost.workspace = true
 tokio.workspace = true
 clap.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
+log.workspace = true
+logforth.workspace = true
 parking_lot.workspace = true
 axum.workspace = true
 reqwest.workspace = true
@@ -36,6 +36,7 @@ opentelemetry_sdk.workspace = true
 opentelemetry-otlp.workspace = true
 tikv-jemallocator.workspace = true
 redis.workspace = true
+colored.workspace = true
 
 [build-dependencies]
 pyo3-build-config.workspace = true

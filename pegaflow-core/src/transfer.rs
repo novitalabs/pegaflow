@@ -1,5 +1,4 @@
 use cudarc::driver::CudaStream;
-use tracing::{debug, instrument, warn};
 
 use crate::KVCacheRegistration;
 
@@ -13,7 +12,6 @@ use crate::KVCacheRegistration;
 // ============================================================================
 
 /// Calculate the byte offset for a given block/segment combination.
-#[instrument(level = "debug", skip(registration))]
 pub(crate) fn segment_offset(
     registration: &KVCacheRegistration,
     block_idx: usize,
@@ -46,7 +44,6 @@ pub(crate) fn segment_offset(
 }
 
 /// Copy data from GPU to CPU asynchronously on the provided stream
-#[instrument(level = "debug", skip(stream), fields(offset, size), err)]
 pub(crate) fn copy_gpu_to_cpu_async(
     gpu_base_ptr: u64,
     offset: usize,
@@ -74,7 +71,6 @@ pub(crate) fn copy_gpu_to_cpu_async(
 }
 
 /// Copy data from CPU to GPU asynchronously on the provided stream
-#[instrument(level = "debug", skip(cpu_buffer, stream), fields(offset, size), err)]
 pub(crate) fn copy_cpu_to_gpu_async(
     gpu_base_ptr: u64,
     offset: usize,
@@ -110,24 +106,21 @@ pub(crate) fn copy_cpu_to_gpu_async(
     Ok(())
 }
 
-/// Batch copy segments from CPU to GPU by finding and merging contiguous ranges
+/// Batch copy segments from CPU to GPU by finding and merging contiguous ranges.
+/// Returns the number of CUDA memcpy calls issued.
 pub(crate) fn batch_copy_segments_to_gpu(
     transfers: &[(usize, *const u8)],
     segment_size: usize,
     registration: &KVCacheRegistration,
     stream: &CudaStream,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     let total_segments = transfers.len();
     if total_segments == 0 {
-        warn!("CPU->GPU batch copy: 0 segments -> 0 batches");
-        return Ok(());
+        return Ok(0);
     }
 
     let mut batch_count = 0;
     let mut i = 0;
-    let mut gpu_discontinuous_count = 0;
-    let mut cpu_discontinuous_count = 0;
-    let mut both_discontinuous_count = 0;
 
     while i < total_segments {
         let (start_gpu_offset, start_cpu_ptr) = transfers[i];
@@ -145,14 +138,6 @@ pub(crate) fn batch_copy_segments_to_gpu(
             if gpu_contiguous && cpu_contiguous {
                 count += 1;
             } else {
-                // Track why we couldn't merge
-                if !gpu_contiguous && !cpu_contiguous {
-                    both_discontinuous_count += 1;
-                } else if !gpu_contiguous {
-                    gpu_discontinuous_count += 1;
-                } else {
-                    cpu_discontinuous_count += 1;
-                }
                 break;
             }
         }
@@ -174,45 +159,24 @@ pub(crate) fn batch_copy_segments_to_gpu(
         i += count;
     }
 
-    debug!(
-        "CPU->GPU batch copy: {} segments -> {} batches ({}x reduction)",
-        total_segments,
-        batch_count,
-        total_segments as f32 / batch_count as f32
-    );
-
-    let total_breaks = gpu_discontinuous_count + cpu_discontinuous_count + both_discontinuous_count;
-    if total_breaks > 0 {
-        debug!(
-            "CPU->GPU batch merge breaks: {} total (GPU discontinuous: {}, CPU discontinuous: {}, both: {})",
-            total_breaks,
-            gpu_discontinuous_count,
-            cpu_discontinuous_count,
-            both_discontinuous_count
-        );
-    }
-
-    Ok(())
+    Ok(batch_count)
 }
 
-/// Batch copy segments from GPU to CPU by finding and merging contiguous ranges
+/// Batch copy segments from GPU to CPU by finding and merging contiguous ranges.
+/// Returns the number of CUDA memcpy calls issued.
 pub(crate) fn batch_copy_segments_from_gpu(
     transfers: &[(usize, *mut u8)], // (gpu_offset, cpu_dst_ptr)
     segment_size: usize,
     registration: &KVCacheRegistration,
     stream: &CudaStream,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     let total_segments = transfers.len();
     if total_segments == 0 {
-        warn!("GPU->CPU batch copy: 0 segments -> 0 batches");
-        return Ok(());
+        return Ok(0);
     }
 
     let mut batch_count = 0;
     let mut i = 0;
-    let mut gpu_discontinuous_count = 0;
-    let mut cpu_discontinuous_count = 0;
-    let mut both_discontinuous_count = 0;
 
     while i < total_segments {
         let (start_gpu_offset, start_cpu_ptr) = transfers[i];
@@ -230,14 +194,6 @@ pub(crate) fn batch_copy_segments_from_gpu(
             if gpu_contiguous && cpu_contiguous {
                 count += 1;
             } else {
-                // Track why we couldn't merge
-                if !gpu_contiguous && !cpu_contiguous {
-                    both_discontinuous_count += 1;
-                } else if !gpu_contiguous {
-                    gpu_discontinuous_count += 1;
-                } else {
-                    cpu_discontinuous_count += 1;
-                }
                 break;
             }
         }
@@ -258,23 +214,5 @@ pub(crate) fn batch_copy_segments_from_gpu(
         i += count;
     }
 
-    debug!(
-        "GPU->CPU batch copy: {} segments -> {} batches ({}x reduction)",
-        total_segments,
-        batch_count,
-        total_segments as f32 / batch_count as f32
-    );
-
-    let total_breaks = gpu_discontinuous_count + cpu_discontinuous_count + both_discontinuous_count;
-    if total_breaks > 0 {
-        debug!(
-            "GPU->CPU batch merge breaks: {} total (GPU discontinuous: {}, CPU discontinuous: {}, both: {})",
-            total_breaks,
-            gpu_discontinuous_count,
-            cpu_discontinuous_count,
-            both_discontinuous_count
-        );
-    }
-
-    Ok(())
+    Ok(batch_count)
 }

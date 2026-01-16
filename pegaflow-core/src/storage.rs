@@ -13,11 +13,11 @@
 // Eviction only targets the cache; inflight blocks are never evicted.
 // ============================================================================
 use bytesize::ByteSize;
+use log::{debug, error, info, warn};
 use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
-use tracing::{debug, error, info, warn};
 
 use crate::block::{
     BlockHash, BlockInsertError, BlockKey, InflightBlock, LayerBlock, PrefetchStatus, SealedBlock,
@@ -334,13 +334,13 @@ impl StorageEngine {
 
             let (used, total) = self.pinned_pool.usage();
             error!(
-                requested = %ByteSize(requested_bytes),
-                used = %ByteSize(used),
-                total = %ByteSize(total),
-                largest_free = %ByteSize(largest_free),
+                "Pinned memory pool exhausted; cannot satisfy allocation: requested={} used={} total={} largest_free={} freed_blocks={} freed_bytes={}",
+                ByteSize(requested_bytes),
+                ByteSize(used),
+                ByteSize(total),
+                ByteSize(largest_free),
                 freed_blocks,
-                freed_bytes = %ByteSize(freed_bytes),
-                "Pinned memory pool exhausted; cannot satisfy allocation"
+                ByteSize(freed_bytes)
             );
             core_metrics().pool_alloc_failures.add(1, &[]);
             return None;
@@ -521,10 +521,10 @@ impl StorageEngine {
                 result.push(cloned);
             } else {
                 error!(
-                    instance = %instance_id,
-                    idx = idx,
-                    hash_len = key.hash.len(),
-                    "missing pinned KV block"
+                    "missing pinned KV block: instance={} idx={} hash_len={}",
+                    instance_id,
+                    idx,
+                    key.hash.len()
                 );
                 return Err(format!(
                     "missing pinned KV block at index {} (namespace={}, hash_len={})",
@@ -574,11 +574,11 @@ impl StorageEngine {
 
         if freed_blocks > 0 {
             debug!(
+                "Reclaimed cache blocks toward allocator request: freed_blocks={} freed_bytes={} largest_free={} required={}",
                 freed_blocks,
-                freed_bytes = %ByteSize(freed_bytes),
-                largest_free = %ByteSize(largest_free),
-                required = %ByteSize(required_bytes),
-                "Reclaimed cache blocks toward allocator request"
+                ByteSize(freed_bytes),
+                ByteSize(largest_free),
+                ByteSize(required_bytes)
             );
             core_metrics()
                 .cache_block_evictions
@@ -603,12 +603,12 @@ impl StorageEngine {
             let age = block.age();
             if age > max_age {
                 warn!(
-                    namespace = %key.namespace,
-                    hash_len = key.hash.len(),
-                    filled = block.filled_count(),
-                    total = block.total_slots(),
-                    age_secs = age.as_secs(),
-                    "GC: removing stale inflight block"
+                    "GC: removing stale inflight block: namespace={} hash_len={} filled={} total={} age_secs={}",
+                    key.namespace,
+                    key.hash.len(),
+                    block.filled_count(),
+                    block.total_slots(),
+                    age.as_secs()
                 );
                 // Decrement the inflight gauge for each removed block
                 core_metrics().inflight_blocks.add(-1, &[]);
@@ -621,7 +621,7 @@ impl StorageEngine {
         let cleaned = before - inner.inflight.len();
         if cleaned > 0 {
             core_metrics().inflight_gc_cleaned.add(cleaned as u64, &[]);
-            info!(cleaned, "GC cleaned stale inflight blocks");
+            info!("GC cleaned stale inflight blocks: cleaned={}", cleaned);
         }
         cleaned
     }

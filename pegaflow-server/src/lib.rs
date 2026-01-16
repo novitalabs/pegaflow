@@ -9,6 +9,7 @@ pub use service::GrpcEngineService;
 
 use clap::Parser;
 use cudarc::driver::result as cuda_driver;
+use log::{error, info};
 use opentelemetry::global;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
@@ -22,10 +23,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
 use tonic::transport::Server;
-use tracing::{error, info};
-use tracing_subscriber::{
-    fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter,
-};
 use utils::parse_memory_size;
 
 #[cfg(not(target_env = "msvc"))]
@@ -96,16 +93,6 @@ pub struct Cli {
     pub ssd_prefetch_queue_depth: usize,
 }
 
-fn init_tracing(log_level: &str) {
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| log_level.parse().unwrap());
-    let fmt_layer = tracing_subscriber::fmt::layer().with_span_events(FmtSpan::CLOSE);
-    let _ = tracing_subscriber::registry()
-        .with(env_filter)
-        .with(fmt_layer)
-        .try_init();
-}
-
 fn format_py_err(err: PyErr) -> String {
     Python::attach(|py| err.value(py).to_string())
 }
@@ -160,7 +147,7 @@ fn init_metrics(
 /// Main entry point for pegaflow-server
 pub fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
-    init_tracing(&cli.log_level);
+    pegaflow_core::logging::init_stdout_colored(&cli.log_level);
 
     // Initialize CUDA in the main thread before starting Tokio runtime
     init_cuda_driver()?;

@@ -1,9 +1,9 @@
 use futures::stream::{FuturesUnordered, StreamExt};
+use log::{debug, warn};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::time::Instant;
-use tracing::{debug, warn};
 
 use crate::block::{BlockKey, LayerBlock, SealedBlock};
 use crate::metrics::core_metrics;

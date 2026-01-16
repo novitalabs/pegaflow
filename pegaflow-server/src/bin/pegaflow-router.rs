@@ -21,11 +21,11 @@ use axum::{
     Json, Router,
 };
 use clap::Parser;
+use log::{error, info};
 use reqwest::Client;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio_stream::StreamExt;
-use tracing::{error, info};
 
 #[derive(Clone)]
 struct RouterState {
@@ -389,12 +389,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    pegaflow_core::logging::init_stderr("info");
 
     let args = Args::parse();
 
