@@ -48,6 +48,16 @@ cargo run -r
 cargo run -r -- --pool-size 50gb
 ```
 
+**Enable debug logging** to see internal state and detailed operation logs:
+```bash
+# Option 1: Use --log-level flag
+cargo run -r -- --log-level debug
+
+# Option 2: Use RUST_LOG environment variable for fine-grained control
+RUST_LOG=debug cargo run -r
+RUST_LOG=info,pegaflow_core=debug cargo run -r  # Debug core only
+```
+
 **All available options:**
 - `--addr`: Bind address (default: `127.0.0.1:50055`)
 - `--device`: CUDA device ID (default: `0`)
