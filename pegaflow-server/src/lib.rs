@@ -4,8 +4,6 @@ pub mod registry;
 pub mod service;
 mod utils;
 
-use colored::Color::{Green, Red, Yellow};
-use logforth::layout::TextLayout;
 pub use registry::CudaTensorRegistry;
 pub use service::GrpcEngineService;
 
@@ -95,23 +93,6 @@ pub struct Cli {
     pub ssd_prefetch_queue_depth: usize,
 }
 
-fn init_logging(log_level: &str) {
-    let filter_str = std::env::var("RUST_LOG").unwrap_or_else(|_| log_level.to_string());
-    let filter: logforth::filter::EnvFilter =
-        filter_str.parse().unwrap_or_else(|_| log_level.into());
-    let layout = TextLayout::default()
-        .info_color(Green)
-        .warn_color(Yellow)
-        .error_color(Red);
-
-    logforth::starter_log::builder()
-        .dispatch(|d| {
-            d.filter(filter)
-                .append(logforth::append::Stdout::default().with_layout(layout))
-        })
-        .apply();
-}
-
 fn format_py_err(err: PyErr) -> String {
     Python::attach(|py| err.value(py).to_string())
 }
@@ -166,7 +147,7 @@ fn init_metrics(
 /// Main entry point for pegaflow-server
 pub fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
-    init_logging(&cli.log_level);
+    pegaflow_core::logging::init_stdout_colored(&cli.log_level);
 
     // Initialize CUDA in the main thread before starting Tokio runtime
     init_cuda_driver()?;

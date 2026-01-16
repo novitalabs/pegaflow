@@ -389,12 +389,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
-    let filter_str = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
-    let filter: logforth::filter::EnvFilter = filter_str.parse().unwrap_or_else(|_| "info".into());
-
-    logforth::starter_log::builder()
-        .dispatch(|d| d.filter(filter).append(logforth::append::Stderr::default()))
-        .apply();
+    pegaflow_core::logging::init_stderr("info");
 
     let args = Args::parse();
 

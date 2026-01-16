@@ -2,6 +2,7 @@ pub mod allocator;
 pub mod block;
 mod cache;
 pub mod gpu_worker;
+pub mod logging;
 mod metrics;
 pub mod pinned_mem;
 pub mod pinned_pool;
