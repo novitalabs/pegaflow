@@ -2,13 +2,14 @@
 
 <div align="center">
   <img src="./assets/logo.png" width="200" />
+  <p><em>Named after Pegasus, the winged horse of ancient myth — a creature born to cross impossible distances with effortless grace.</em></p>
 </div>
 
-PegaFlow is a **high-performance KV cache offloading solution** for vLLM v1 on single-node multi-GPU setups.
+PegaFlow is a **high-performance KV cache offloading solution** for LLM inference engines on single-node multi-GPU setups.
 
 ## What is PegaFlow?
 
-PegaFlow enables efficient KV cache transfer and sharing for vLLM inference workloads:
+PegaFlow enables efficient KV cache transfer and sharing for LLM inference workloads:
 
 - **Single-node KV cache offloading** — offload KV cache to host memory and restore it back to GPU with minimal latency
 - **Full parallelism support** — works with Pipeline Parallel (PP), Tensor Parallel (TP), and Data Parallel (DP)
@@ -16,7 +17,11 @@ PegaFlow enables efficient KV cache transfer and sharing for vLLM inference work
 - **P/D disaggregation** — separate prefill and decode phases across GPUs for better resource utilization
 - **~9x TTFT improvement** — warm-start requests achieve dramatically lower time-to-first-token compared to cold-start
 
-PegaFlow draws its name from Pegasus, the winged horse of ancient myth — a creature born to cross impossible distances with effortless grace.
+## Framework Integration
+
+| Framework | Status | Link |
+|-----------|--------|------|
+| SGLang | 🚧 Under Review | [PR #17221](https://github.com/sgl-project/sglang/pull/17221) |
 
 ## Quick Start
 
