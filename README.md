@@ -20,45 +20,25 @@ PegaFlow draws its name from Pegasus, the winged horse of ancient myth — a cre
 
 ## Quick Start
 
-### 1. Clone & Setup
+### 1. Install
 
 ```bash
-git clone https://github.com/xiaguan/pegaflow
-cd pegaflow
-
-uv venv
+uv venv --prompt pegaflow
 source .venv/bin/activate
-uv pip install maturin
-uv pip install vllm
+
+uv pip install pegaflow-llm
 ```
 
-### 2. Start PegaEngine Server
+> Hint for sglang users: If you running in sglang docker, you can create venv with `uv venv --prompt pegaflow --system-site-packages`.
+
+### 2. Start Pegaflow Server
 
 ```bash
-# Set environment variables for PyO3
-export PYO3_PYTHON=$(which python)
-export LD_LIBRARY_PATH=$(python -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))"):$LD_LIBRARY_PATH
-
-# Start the server with defaults (127.0.0.1:50055, device 0, 30gb pool)
-cargo run -r
-```
-
-**Customize pool size** (if needed):
-```bash
-cargo run -r -- --pool-size 50gb
-```
-
-**Enable debug logging** to see internal state and detailed operation logs:
-```bash
-# Option 1: Use --log-level flag
-cargo run -r -- --log-level debug
-
-# Option 2: Use RUST_LOG environment variable for fine-grained control
-RUST_LOG=debug cargo run -r
-RUST_LOG=info,pegaflow_core=debug cargo run -r  # Debug core only
+pegaflow-server
 ```
 
 **All available options:**
+
 - `--addr`: Bind address (default: `127.0.0.1:50055`)
 - `--device`: CUDA device ID (default: `0`)
 - `--pool-size`: Pinned memory pool size (default: `30gb`, supports: `kb`, `mb`, `gb`, `tb`)
@@ -73,6 +53,60 @@ RUST_LOG=info,pegaflow_core=debug cargo run -r  # Debug core only
 - `--ssd-write-queue-depth`: SSD write queue depth, max pending write batches (default: `8`)
 - `--ssd-prefetch-queue-depth`: SSD prefetch queue depth, max pending prefetch batches (default: `2`)
 
+### 3. Connect to Server with client
+
+#### Sglang:
+
+example 1:
+
+```bash
+python3 -m sglang.launch_server --model-path Qwen/Qwen3-0.6B --served-model-name Qwen/Qwen3-0.6B --trust-remote-code --enable-cache-report --page-size 256 --host "0.0.0.0" --port 8000 --mem-fraction-static 0.8 --max-running-requests 32 --enable-pegaflow
+```
+
+example 2:
+
+```bash
+python3 -m sglang.launch_server --model-loader-extra-config "{\"enable_multithread_load\": true, \"num_threads\": 64}"  --model-path deepseek-ai/DeepSeek-V3.2 --served-model-name deepseek-ai/DeepSeek-V3.2 --trust-remote-code --page-size "64" --reasoning-parser deepseek-v3 --tool-call-parser deepseekv32 --enable-cache-report --host "0.0.0.0" --port 8031 --mem-fraction-static 0.83 --max-running-requests 64 --tp-size "8" --enable-pegaflow
+```
+
+#### vLLM:
+
+```bash
+vllm serve Qwen/Qwen3-0.6B --trust-remote-code --kv-transfer-config '{"kv_connector": "PegaKVConnector", "kv_role": "kv_both", "kv_connector_module_path": "pegaflow.connector", "kv_connector_extra_config": {"pegaflow.host": "http://127.0.0.1", "pegaflow.port": 50055}}'
+```
+
+## Development
+
+### Build from source
+
+```bash
+# Set environment variables for PyO3
+export PYO3_PYTHON=$(which python)
+export LD_LIBRARY_PATH=$(python -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))"):$LD_LIBRARY_PATH
+
+# Start the server with defaults (127.0.0.1:50055, device 0, 30gb pool)
+cargo run -r
+```
+
+Additional args:
+
+**Customize pool size** (if needed):
+
+```bash
+cargo run -r -- --pool-size 50gb
+```
+
+**Enable debug logging** to see internal state and detailed operation logs:
+
+```bash
+# Option 1: Use --log-level flag
+cargo run -r -- --log-level debug
+
+# Option 2: Use RUST_LOG environment variable for fine-grained control
+RUST_LOG=debug cargo run -r
+RUST_LOG=info,pegaflow_core=debug cargo run -r  # Debug core only
+```
+
 ### 3. Build Python Bindings
 
 ```bash
@@ -82,18 +116,11 @@ cd ..
 ```
 
 To build a wheel for the Python bindings (for distribution or local use):
+
 ```bash
 cd python
 maturin build --release
 ```
-
-### 4. Run Hello World
-
-```bash
-uv run python examples/basic_vllm.py
-```
-
-The script loads GPT-2 through vLLM, runs a prompt twice (cold + warm), and shows the TTFT difference.
 
 ## Benchmarks
 
@@ -114,10 +141,10 @@ H800 Reference Numbers
 
 PegaFlow TTFT measurements from an H800 with Llama-3.1-8B (8 prompts, 10K-token prefill, 1-token decode, 4.0 req/s):
 
-| Configuration    | TTFT mean (ms) | TTFT p99 (ms) |
-|------------------|----------------|---------------|
-| PegaFlow (Cold)  | 572.5          | 1113.7        |
-| PegaFlow (Warm)  | 61.5           | 77.0          |
+| Configuration   | TTFT mean (ms) | TTFT p99 (ms) |
+| --------------- | -------------- | ------------- |
+| PegaFlow (Cold) | 572.5          | 1113.7        |
+| PegaFlow (Warm) | 61.5           | 77.0          |
 
 The warm-start path achieves **~9x faster TTFT** compared to cold-start, demonstrating effective KV cache sharing across requests.
 
@@ -170,34 +197,12 @@ Client Request
         Response to Client
 ```
 
-### Quick Start
-
-1. Start the PegaEngine server (centralized KV cache storage):
-
-   ```bash
-   cargo run -r
-   ```
-2. Launch P/D setup:
-
-   ```bash
-   uv run python examples/run_vllm_pd_with_pega.py --model Qwen/Qwen3-8B
-   ```
-
-3. Run benchmark:
-
-   ```bash
-   vllm bench serve --port 8000 --seed 42 \
-     --model Qwen/Qwen3-8B \
-     --dataset-name random --random-input-len 5000 --random-output-len 200 \
-     --num-prompts 200 --burstiness 100 --request-rate 1
-   ```
-
 ### Benchmark Results (H800, Qwen3-8B, 5K input tokens)
 
-| Configuration | TTFT mean (ms) | TPOT mean (ms) | TPOT p99 (ms) | ITL p99 (ms) |
-|---------------|----------------|----------------|---------------|--------------|
-| P/D (1P+1D)   | 573.78         | 15.68          | 15.89         | 21.71        |
-| Baseline (DP2)| 438.24         | 22.67          | 24.32         | 142.70       |
+| Configuration  | TTFT mean (ms) | TPOT mean (ms) | TPOT p99 (ms) | ITL p99 (ms) |
+| -------------- | -------------- | -------------- | ------------- | ------------ |
+| P/D (1P+1D)    | 573.78         | 15.68          | 15.89         | 21.71        |
+| Baseline (DP2) | 438.24         | 22.67          | 24.32         | 142.70       |
 
 P/D disaggregation trades higher TTFT for **significantly more stable decode latency** — TPOT p99 drops from 24.32ms to 15.89ms, and ITL p99 improves dramatically from 142.70ms to 21.71ms.
 

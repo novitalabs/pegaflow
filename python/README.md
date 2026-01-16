@@ -51,6 +51,20 @@ missing = engine.get("nonexistent")  # Returns None
 removed = engine.remove("name")  # Returns "PegaFlow"
 ```
 
+#### Sglang Examples:
+
+example 1:
+
+```bash
+python3 -m sglang.launch_server --model-path Qwen/Qwen3-0.6B --served-model-name Qwen/Qwen3-0.6B --trust-remote-code --enable-cache-report --page-size 256 --host "0.0.0.0" --port 8000 --mem-fraction-static 0.8 --max-running-requests 32 --enable-pegaflow
+```
+
+example 2:
+
+```bash
+python3 -m sglang.launch_server --model-loader-extra-config "{\"enable_multithread_load\": true, \"num_threads\": 64}"  --model-path deepseek-ai/DeepSeek-V3.2 --served-model-name deepseek-ai/DeepSeek-V3.2 --trust-remote-code --page-size "64" --reasoning-parser deepseek-v3 --tool-call-parser deepseekv32 --enable-cache-report --host "0.0.0.0" --port 8031 --mem-fraction-static 0.83 --max-running-requests 64 --tp-size "8" --enable-pegaflow
+```
+
 ### vLLM KV Connector
 
 ```python
@@ -84,12 +98,14 @@ The test suite includes integration tests that verify the `EngineRpcClient` can 
 #### Prerequisites
 
 1. **Build the Rust extension**:
+
    ```bash
    cd python
    maturin develop --release
    ```
 
 2. **Build the server binary**:
+
    ```bash
    cd ..
    cargo build --release --bin pegaflow-server
@@ -118,6 +134,7 @@ pytest tests/ --cov=pegaflow --cov-report=html
 #### Test Structure
 
 - **`tests/conftest.py`**: Contains pytest fixtures for:
+
   - `pega_server`: Automatically starts/stops `pegaflow-server` for integration tests
   - `engine_client`: Creates an `EngineRpcClient` connected to the test server
   - `client_context`: Provides a `ClientContext` representing a vLLM instance with GPU KV cache tensors
@@ -130,11 +147,13 @@ pytest tests/ --cov=pegaflow --cov-report=html
 #### Test Fixtures
 
 The `ClientContext` class abstracts a vLLM instance and provides:
+
 - `register_kv_caches()`: Register GPU KV cache tensors with the server
 - `query(block_hashes)`: Query available blocks
 - `unregister_context()`: Unregister context from server
 
 Example test usage:
+
 ```python
 def test_query(client_context):
     """Test query operation."""
@@ -145,4 +164,3 @@ def test_query(client_context):
 ## License
 
 MIT
-
