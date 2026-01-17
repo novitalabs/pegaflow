@@ -1,6 +1,3 @@
-/* This is a Rust benchmark for ScaledOffsetAllocator that simulates a steady-state LLM KV-cache workload, 
-closely mirroring allocator_bench.cpp and production usage. */
-
 use pegaflow_core::allocator::{Allocation, ScaledOffsetAllocator};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
