@@ -13,11 +13,11 @@ impl RpcMetrics {
     fn new() -> Self {
         let meter = global::meter("pegaflow_server_rpc");
         let request_count = meter
-            .u64_counter("pegaflow_rpc_requests_total")
+            .u64_counter("pegaflow_rpc_requests")
             .with_description("Total RPC requests handled by pegaflow server")
             .build();
         let request_duration = meter
-            .f64_histogram("pegaflow_rpc_duration_seconds")
+            .f64_histogram("pegaflow_rpc_duration")
             .with_description("RPC latency in seconds")
             .with_unit("s")
             // Buckets tuned for single-node/IPC workloads, covering sub-ms to ~seconds tail
