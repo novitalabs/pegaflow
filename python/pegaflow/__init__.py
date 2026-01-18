@@ -13,15 +13,9 @@ except ImportError:
     EngineRpcClient = None
     PegaEngine = None
     PyLoadState = None
-
-# Import Python-based vLLM connector
-from .connector import KVConnectorRole, PegaKVConnector
+    raise ImportError(
+        "pegaflow rust extension is not available, check pegaflow-xxx.so file exists"
+    ) from None
 
 __version__ = "0.0.1"
-__all__ = [
-    "PegaEngine",
-    "EngineRpcClient",
-    "PyLoadState",
-    "PegaKVConnector",
-    "KVConnectorRole",
-]
+__all__ = ["PegaEngine", "EngineRpcClient", "PyLoadState"]

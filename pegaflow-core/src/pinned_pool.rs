@@ -5,7 +5,7 @@ use std::{
 };
 
 use bytesize::ByteSize;
-use tracing::{error, info};
+use log::{error, info};
 
 use crate::allocator::{Allocation, ScaledOffsetAllocator};
 use crate::metrics::core_metrics;
@@ -104,8 +104,8 @@ impl PinnedMemoryPool {
             metrics.pool_capacity_bytes.add(capacity_i64, &[]);
         } else {
             error!(
-                capacity_bytes = actual_size,
-                "Pinned pool capacity exceeds i64::MAX; skipping capacity metric update"
+                "Pinned pool capacity exceeds i64::MAX; skipping capacity metric update: capacity_bytes={}",
+                actual_size
             );
         }
 
@@ -141,10 +141,10 @@ impl PinnedMemoryPool {
             }
             Err(err) => {
                 error!(
-                    requested_bytes = size.get(),
-                    "Pinned memory allocation error: {} (requested {})",
+                    "Pinned memory allocation error: {} (requested {}): requested_bytes={}",
                     err,
-                    ByteSize(size.get())
+                    ByteSize(size.get()),
+                    size.get()
                 );
                 return None;
             }
@@ -209,8 +209,8 @@ impl Drop for PinnedMemoryPool {
             metrics.pool_capacity_bytes.add(-capacity_i64, &[]);
         } else {
             error!(
-                capacity_bytes,
-                "Pinned pool capacity exceeds i64::MAX; skipping capacity metric cleanup"
+                "Pinned pool capacity exceeds i64::MAX; skipping capacity metric cleanup: capacity_bytes={}",
+                capacity_bytes
             );
         }
     }

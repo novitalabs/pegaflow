@@ -15,12 +15,12 @@
 // Adapted for PegaFlow: simplified to a single-file engine with blocking read/write APIs.
 
 use io_uring::{opcode, types::Fd, IoUring};
+use log::{info, warn};
 use std::io;
 use std::os::unix::io::RawFd;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 use tokio::sync::oneshot;
-use tracing::{info, warn};
 
 /// Configuration for io_uring engine.
 #[derive(Debug, Clone)]

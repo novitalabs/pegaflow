@@ -6,6 +6,7 @@ use crate::proto::engine::{
     SaveResponse, ShutdownRequest, ShutdownResponse, UnregisterRequest, UnregisterResponse,
 };
 use crate::registry::{CudaTensorRegistry, TensorMetadata};
+use log::{debug, info, warn};
 use parking_lot::Mutex;
 use pegaflow_core::{EngineError, PegaEngine, PrefetchStatus};
 use pyo3::{PyErr, Python};
@@ -13,7 +14,6 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Notify;
 use tonic::{async_trait, Request, Response, Status};
-use tracing::{info, instrument, warn};
 
 #[derive(Clone)]
 pub struct GrpcEngineService {
@@ -104,11 +104,6 @@ impl GrpcEngineService {
 
 #[async_trait]
 impl Engine for GrpcEngineService {
-    #[instrument(
-        level = "info",
-        skip(self, request),
-        fields(instance=%request.get_ref().instance_id, tp_rank=%request.get_ref().tp_rank, device=%request.get_ref().device_id, layer=%request.get_ref().layer_name)
-    )]
     async fn register_context(
         &self,
         request: Request<RegisterContextRequest>,
@@ -116,6 +111,21 @@ impl Engine for GrpcEngineService {
         let start = Instant::now();
         let result: Result<Response<RegisterContextResponse>, Status> = async {
             let req = request.into_inner();
+            debug!(
+                "RPC [register_context]: instance_id={} namespace={} layer_name={} device_id={} tp_rank={} tp_size={} num_layers={} num_blocks={} bytes_per_block={} kv_stride_bytes={} segments={} wrapper_bytes={}",
+                req.instance_id,
+                req.namespace,
+                req.layer_name,
+                req.device_id,
+                req.tp_rank,
+                req.tp_size,
+                req.num_layers,
+                req.num_blocks,
+                req.bytes_per_block,
+                req.kv_stride_bytes,
+                req.segments,
+                req.wrapper_bytes.len()
+            );
             let metadata = self.handle_tensor_registration(&req)?;
 
             let num_blocks = Self::usize_from_u64(req.num_blocks, "num_blocks")?;
@@ -148,29 +158,55 @@ impl Engine for GrpcEngineService {
         }
         .await;
 
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        match &result {
+            Ok(_) => debug!(
+                "RPC [register_context] completed: ok elapsed_ms={:.2}",
+                elapsed_ms
+            ),
+            Err(status) => warn!(
+                "RPC [register_context] failed: code={} message={} elapsed_ms={:.2}",
+                status.code(),
+                status.message(),
+                elapsed_ms
+            ),
+        }
         record_rpc_result("register_context", &result, start);
         result
     }
 
-    #[instrument(
-        level = "info",
-        skip(self, request),
-        fields(instance=%request.get_ref().instance_id, tp_rank=%request.get_ref().tp_rank, device=%request.get_ref().device_id, layers=%request.get_ref().saves.len())
-    )]
     async fn save(&self, request: Request<SaveRequest>) -> Result<Response<SaveResponse>, Status> {
         let start = Instant::now();
-        let result: Result<Response<SaveResponse>, Status> = async {
-            let req = request.into_inner();
-            let tp_rank = Self::usize_from_u32(req.tp_rank, "tp_rank")?;
 
-            let saves = req
-                .saves
+        let req = request.into_inner();
+        let layer_count = req.saves.len();
+        let (total_blocks, total_hashes) =
+            req.saves.iter().fold((0usize, 0usize), |(b, h), layer| {
+                (b + layer.block_ids.len(), h + layer.block_hashes.len())
+            });
+
+        let result: Result<Response<SaveResponse>, Status> = async {
+            let SaveRequest {
+                instance_id,
+                tp_rank,
+                device_id,
+                saves,
+                ..
+            } = req;
+            let tp_rank = Self::usize_from_u32(tp_rank, "tp_rank")?;
+
+            let saves: Vec<_> = saves
                 .into_iter()
                 .map(|layer| (layer.layer_name, layer.block_ids, layer.block_hashes))
                 .collect();
 
+            debug!(
+                "RPC [save]: instance_id={} tp_rank={} device_id={} layers={} blocks={} hashes={}",
+                instance_id, tp_rank, device_id, layer_count, total_blocks, total_hashes
+            );
+
             self.engine
-                .batch_save_kv_blocks_from_ipc(&req.instance_id, tp_rank, req.device_id, saves)
+                .batch_save_kv_blocks_from_ipc(&instance_id, tp_rank, device_id, saves)
                 .await
                 .map_err(Self::map_engine_error)?;
 
@@ -180,31 +216,61 @@ impl Engine for GrpcEngineService {
         }
         .await;
 
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        match &result {
+            Ok(_) => debug!(
+                "RPC [save] completed: ok layers={} blocks={} hashes={} elapsed_ms={:.2}",
+                layer_count, total_blocks, total_hashes, elapsed_ms
+            ),
+            Err(status) => warn!(
+                "RPC [save] failed: code={} message={} elapsed_ms={:.2}",
+                status.code(),
+                status.message(),
+                elapsed_ms
+            ),
+        }
         record_rpc_result("save", &result, start);
         result
     }
 
-    #[instrument(
-        level = "info",
-        skip(self, request),
-        fields(instance=%request.get_ref().instance_id, tp_rank=%request.get_ref().tp_rank, device=%request.get_ref().device_id, layers=%request.get_ref().layer_names.len(), blocks=%request.get_ref().block_ids.len())
-    )]
     async fn load(&self, request: Request<LoadRequest>) -> Result<Response<LoadResponse>, Status> {
         let start = Instant::now();
+
+        let req = request.into_inner();
+        let layer_count = req.layer_names.len();
+        let block_count = req.block_ids.len();
+        let hash_count = req.block_hashes.len();
+
         let result: Result<Response<LoadResponse>, Status> = async {
-            let req = request.into_inner();
-            let tp_rank = Self::usize_from_u32(req.tp_rank, "tp_rank")?;
-            let layer_names = req.layer_names;
+            let LoadRequest {
+                instance_id,
+                tp_rank,
+                device_id,
+                layer_names,
+                block_ids,
+                block_hashes,
+                load_state_shm,
+                ..
+            } = req;
+            let tp_rank = Self::usize_from_u32(tp_rank, "tp_rank")?;
+            debug!(
+                "RPC [load]: instance_id={} tp_rank={} device_id={} layers={} block_ids={} block_hashes={} load_state_shm_len={}",
+                instance_id,
+                tp_rank,
+                device_id,
+                layer_count,
+                block_count,
+                hash_count,
+                load_state_shm.len()
+            );
             let layer_refs: Vec<&str> = layer_names.iter().map(|s| s.as_str()).collect();
-            let block_ids = req.block_ids;
-            let block_hashes = req.block_hashes;
 
             self.engine
                 .batch_load_kv_blocks_multi_layer(
-                    &req.instance_id,
+                    &instance_id,
                     tp_rank,
-                    req.device_id,
-                    &req.load_state_shm,
+                    device_id,
+                    &load_state_shm,
                     &layer_refs,
                     &block_ids,
                     &block_hashes,
@@ -217,16 +283,23 @@ impl Engine for GrpcEngineService {
         }
         .await;
 
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        match &result {
+            Ok(_) => debug!(
+                "RPC [load] completed: ok layers={} blocks={} elapsed_ms={:.2}",
+                layer_count, block_count, elapsed_ms
+            ),
+            Err(status) => warn!(
+                "RPC [load] failed: code={} message={} elapsed_ms={:.2}",
+                status.code(),
+                status.message(),
+                elapsed_ms
+            ),
+        }
         record_rpc_result("load", &result, start);
         result
     }
 
-    #[instrument(
-        level = "info",
-        skip(self, request),
-        fields(instance=%request.get_ref().instance_id, blocks=%request.get_ref().block_hashes.len()),
-        ret
-    )]
     async fn query(
         &self,
         request: Request<QueryRequest>,
@@ -234,6 +307,11 @@ impl Engine for GrpcEngineService {
         let start = Instant::now();
         let result: Result<Response<QueryResponse>, Status> = async {
             let req = request.into_inner();
+            debug!(
+                "RPC [query]: instance_id={} block_hashes={}",
+                req.instance_id,
+                req.block_hashes.len()
+            );
 
             // Use SSD prefetch-aware query
             let status = self
@@ -263,15 +341,29 @@ impl Engine for GrpcEngineService {
         }
         .await;
 
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        match &result {
+            Ok(response) => {
+                let resp = response.get_ref();
+                let state = PrefetchState::try_from(resp.prefetch_state)
+                    .map(|s| format!("{:?}", s))
+                    .unwrap_or_else(|_| format!("Unknown({})", resp.prefetch_state));
+                debug!(
+                    "RPC [query] completed: ok hit={} loading={} missing={} state={} elapsed_ms={:.2}",
+                    resp.hit_blocks, resp.loading_blocks, resp.missing_blocks, state, elapsed_ms
+                )
+            }
+            Err(status) => warn!(
+                "RPC [query] failed: code={} message={} elapsed_ms={:.2}",
+                status.code(),
+                status.message(),
+                elapsed_ms
+            ),
+        }
         record_rpc_result("query", &result, start);
         result
     }
 
-    #[instrument(
-        level = "info",
-        skip(self, request),
-        fields(instance=%request.get_ref().instance_id)
-    )]
     async fn unregister_context(
         &self,
         request: Request<UnregisterRequest>,
@@ -279,6 +371,7 @@ impl Engine for GrpcEngineService {
         let start = Instant::now();
         let result: Result<Response<UnregisterResponse>, Status> = async {
             let req = request.into_inner();
+            debug!("RPC [unregister_context]: instance_id={}", req.instance_id);
             let removed = {
                 let mut registry = self.registry.lock();
                 registry.drop_instance(&req.instance_id)
@@ -300,17 +393,30 @@ impl Engine for GrpcEngineService {
         }
         .await;
 
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        match &result {
+            Ok(_) => debug!(
+                "RPC [unregister_context] completed: ok elapsed_ms={:.2}",
+                elapsed_ms
+            ),
+            Err(status) => warn!(
+                "RPC [unregister_context] failed: code={} message={} elapsed_ms={:.2}",
+                status.code(),
+                status.message(),
+                elapsed_ms
+            ),
+        }
         record_rpc_result("unregister_context", &result, start);
         result
     }
 
-    #[instrument(level = "info", skip(self, _request))]
     async fn shutdown(
         &self,
         _request: Request<ShutdownRequest>,
     ) -> Result<Response<ShutdownResponse>, Status> {
         let start = Instant::now();
         let result: Result<Response<ShutdownResponse>, Status> = async {
+            debug!("RPC [shutdown] requested");
             {
                 let mut registry = self.registry.lock();
                 registry.clear();
@@ -324,23 +430,43 @@ impl Engine for GrpcEngineService {
         }
         .await;
 
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        match &result {
+            Ok(_) => debug!("RPC [shutdown] completed: ok elapsed_ms={:.2}", elapsed_ms),
+            Err(status) => warn!(
+                "RPC [shutdown] failed: code={} message={} elapsed_ms={:.2}",
+                status.code(),
+                status.message(),
+                elapsed_ms
+            ),
+        }
         record_rpc_result("shutdown", &result, start);
         result
     }
 
-    #[instrument(level = "info", skip(self, _request))]
     async fn health(
         &self,
         _request: Request<HealthRequest>,
     ) -> Result<Response<HealthResponse>, Status> {
         let start = Instant::now();
         let result: Result<Response<HealthResponse>, Status> = async {
+            debug!("RPC [health]");
             Ok(Response::new(HealthResponse {
                 status: Some(Self::build_simple_response()),
             }))
         }
         .await;
 
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        match &result {
+            Ok(_) => debug!("RPC [health] completed: ok elapsed_ms={:.2}", elapsed_ms),
+            Err(status) => warn!(
+                "RPC [health] failed: code={} message={} elapsed_ms={:.2}",
+                status.code(),
+                status.message(),
+                elapsed_ms
+            ),
+        }
         record_rpc_result("health", &result, start);
         result
     }

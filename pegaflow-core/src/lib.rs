@@ -2,6 +2,7 @@ pub mod allocator;
 pub mod block;
 mod cache;
 pub mod gpu_worker;
+pub mod logging;
 mod metrics;
 pub mod pinned_mem;
 pub mod pinned_pool;
@@ -46,13 +47,13 @@ pub use sync_state::{LoadState, LoadStateError};
 // ============================================================================
 
 use cudarc::driver::CudaContext;
+use log::{debug, info};
 use std::{
     collections::HashMap,
     fmt,
     num::NonZeroU64,
     sync::{Arc, Mutex, RwLock},
 };
-use tracing::{debug, instrument};
 
 use crate::gpu_worker::{GpuWorkerPool, LayerLoadData, LoadBlock, LoadTask, SaveBlock};
 use crate::metrics::core_metrics;
@@ -283,7 +284,6 @@ impl Default for PegaEngine {
 
 impl PegaEngine {
     /// Create a new PegaEngine instance with default pool size and regular pages
-    #[instrument(level = "info")]
     pub fn new() -> Self {
         let (engine, _rx) = Self::new_with_config(
             DEFAULT_PINNED_POOL_BYTES,
@@ -378,12 +378,6 @@ impl PegaEngine {
     }
 
     /// Register a KV cache region with its layout info
-    #[instrument(
-        level = "debug",
-        skip(self),
-        err,
-        fields(instance=%instance_id, rank=%tp_rank, device=%device_id, layer=%layer_name)
-    )]
     #[allow(clippy::too_many_arguments)]
     pub fn register_context_layer(
         &self,
@@ -490,12 +484,24 @@ impl PegaEngine {
             segments,
         };
 
-        worker.register_layer(layer_name, registration);
+        worker.register_layer(layer_name.clone(), registration);
+        info!(
+            "Registered context: instance={}, namespace={}, device={}, layer={}, \
+             num_blocks={}, bytes_per_block={}, segments={}, tp_rank={}/{}",
+            instance_id,
+            namespace,
+            device_id,
+            layer_name,
+            num_blocks,
+            bytes_per_block,
+            segments,
+            tp_rank,
+            tp_size
+        );
         Ok(())
     }
 
     /// Unregister instance
-    #[instrument(level = "info", skip(self), err)]
     pub fn unregister_instance(&self, instance_id: &str) -> Result<(), EngineError> {
         let removed = self
             .instances
@@ -506,6 +512,7 @@ impl PegaEngine {
         if removed.is_none() {
             return Err(EngineError::InstanceMissing(instance_id.to_string()));
         }
+        info!("Unregistered instance: {}", instance_id);
         Ok(())
     }
 
@@ -514,12 +521,6 @@ impl PegaEngine {
     /// Each element in `saves` is a tuple of (layer_name, block_ids, block_hashes).
     /// This is more efficient than calling save_kv_blocks_from_ipc in a loop
     /// as it reduces Python-Rust boundary crossings.
-    #[instrument(
-        level = "debug",
-        skip(self, saves),
-        err,
-        fields(instance=%instance_id, rank=%tp_rank, device=%device_id, layers=%saves.len())
-    )]
     pub async fn batch_save_kv_blocks_from_ipc(
         &self,
         instance_id: &str,
@@ -545,12 +546,6 @@ impl PegaEngine {
         Ok(())
     }
 
-    #[instrument(
-        level = "debug",
-        skip(self, block_ids, block_hashes),
-        err,
-        fields(instance=%instance_id, rank=%tp_rank, device=%device_id, layer=%layer_name, blocks=%block_ids.len())
-    )]
     pub async fn save_kv_blocks_from_ipc(
         &self,
         instance_id: &str,
@@ -841,12 +836,6 @@ impl PegaEngine {
     ///
     /// When a cache miss is detected but SSD cache has the block, this method automatically
     /// starts a background prefetch from SSD. The caller should retry after a short delay.
-    #[instrument(
-        level = "debug",
-        skip(self, block_hashes),
-        err,
-        fields(instance=%instance_id, requested = %block_hashes.len())
-    )]
     pub fn count_prefix_hit_blocks_with_prefetch(
         &self,
         instance_id: &str,
@@ -884,12 +873,6 @@ impl PegaEngine {
     ///
     /// The connector creates a LoadState, passes the `load_state_shm` to this method,
     /// and then spin-waits on the state until it becomes non-zero (1=success, -1=error).
-    #[instrument(
-        level = "debug",
-        skip(self, block_ids, block_hashes),
-        err,
-        fields(instance=%instance_id, rank=%tp_rank, device=%device_id, layers=%layer_names.len(), blocks=%block_ids.len())
-    )]
     #[allow(clippy::too_many_arguments)]
     pub fn batch_load_kv_blocks_multi_layer(
         &self,
@@ -916,7 +899,10 @@ impl PegaEngine {
 
         // If we failed before submitting to worker, set error on LoadState
         if let Err(ref e) = result {
-            tracing::error!(error = ?e, "batch_load_kv_blocks_multi_layer failed before worker");
+            log::error!(
+                "batch_load_kv_blocks_multi_layer failed before worker: error={:?}",
+                e
+            );
             load_state.set_error();
         }
 

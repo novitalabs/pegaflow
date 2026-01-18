@@ -2,6 +2,7 @@
 name = "pegaflow-server"
 version.workspace = true
 edition.workspace = true
+default-run = "pegaflow-server"
 
 [lib]
 name = "pegaflow_server"
@@ -21,8 +22,8 @@ tonic.workspace = true
 tonic-prost.workspace = true
 tokio.workspace = true
 clap.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
+log.workspace = true
+logforth.workspace = true
 parking_lot.workspace = true
 axum.workspace = true
 reqwest.workspace = true
@@ -37,6 +38,7 @@ opentelemetry-prometheus.workspace = true
 prometheus.workspace = true
 tikv-jemallocator.workspace = true
 redis.workspace = true
+colored.workspace = true
 
 [build-dependencies]
 pyo3-build-config.workspace = true
