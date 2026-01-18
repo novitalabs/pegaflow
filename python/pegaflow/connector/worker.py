@@ -74,9 +74,9 @@ class WorkerConnector:
         self._registered_layers.clear()
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
-        assert (
-            self._ctx.device_id is not None
-        ), "CUDA device id is unknown; cannot register KV caches"
+        assert self._ctx.device_id is not None, (
+            "CUDA device id is unknown; cannot register KV caches"
+        )
 
         self._registered_layers = list(kv_caches.keys())
 
@@ -86,9 +86,9 @@ class WorkerConnector:
 
         layout = "unknown"
         for layer_name, kv_cache in kv_caches.items():
-            assert (
-                kv_cache.storage_offset() == 0
-            ), f"KV cache for {layer_name} must have zero storage offset"
+            assert kv_cache.storage_offset() == 0, (
+                f"KV cache for {layer_name} must have zero storage offset"
+            )
 
             wrapper = CudaIPCWrapper(kv_cache)
             wrapper_bytes = pickle.dumps(wrapper)
@@ -110,9 +110,9 @@ class WorkerConnector:
                 segments = 1
                 layout = "blocks-first"
 
-            assert (
-                bytes_per_block != 0
-            ), f"Invalid bytes_per_block for {layer_name}: stride={stride}"
+            assert bytes_per_block != 0, (
+                f"Invalid bytes_per_block for {layer_name}: stride={stride}"
+            )
 
             ok, message = self._ctx.engine_client.register_context(
                 self._ctx.instance_id,
@@ -421,9 +421,9 @@ class WorkerConnector:
             for req_id in request_ids:
                 if req_id in self._req_pending_layers:
                     self._req_pending_layers[req_id] -= 1
-                    assert (
-                        self._req_pending_layers[req_id] >= 0
-                    ), f"Layer count mismatch for request {req_id}: counter went negative"
+                    assert self._req_pending_layers[req_id] >= 0, (
+                        f"Layer count mismatch for request {req_id}: counter went negative"
+                    )
 
                     if self._req_pending_layers[req_id] == 0:
                         self._completed_saves.add(req_id)

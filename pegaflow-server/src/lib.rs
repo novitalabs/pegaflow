@@ -178,7 +178,10 @@ fn init_metrics(
             .build();
 
         builder = builder.with_reader(reader);
-        info!("OTLP metrics exporter enabled (period={}s)", otlp_period_secs);
+        info!(
+            "OTLP metrics exporter enabled (period={}s)",
+            otlp_period_secs
+        );
     }
 
     let meter_provider = builder.build();
@@ -191,9 +194,7 @@ fn init_metrics(
 }
 
 /// Handler for Prometheus /metrics endpoint
-async fn metrics_handler(
-    axum::extract::State(registry): axum::extract::State<Registry>,
-) -> String {
+async fn metrics_handler(axum::extract::State(registry): axum::extract::State<Registry>) -> String {
     let encoder = TextEncoder::new();
     let metric_families = registry.gather();
     encoder
@@ -314,30 +315,29 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         }
 
         // Start Prometheus HTTP server if configured
-        let metrics_server_handle =
-            if let (Some(metrics_addr), Some(registry)) =
-                (cli.metrics_addr, metrics_state.prometheus_registry.clone())
-            {
-                let app = Router::new()
-                    .route("/metrics", get(metrics_handler))
-                    .with_state(registry);
+        let metrics_server_handle = if let (Some(metrics_addr), Some(registry)) =
+            (cli.metrics_addr, metrics_state.prometheus_registry.clone())
+        {
+            let app = Router::new()
+                .route("/metrics", get(metrics_handler))
+                .with_state(registry);
 
-                let listener = tokio::net::TcpListener::bind(metrics_addr).await?;
-                info!("Starting Prometheus metrics server on {}", metrics_addr);
+            let listener = tokio::net::TcpListener::bind(metrics_addr).await?;
+            info!("Starting Prometheus metrics server on {}", metrics_addr);
 
-                let shutdown = Arc::clone(&shutdown);
-                let handle = tokio::spawn(async move {
-                    axum::serve(listener, app)
-                        .with_graceful_shutdown(async move {
-                            shutdown.notified().await;
-                        })
-                        .await
-                        .ok();
-                });
-                Some(handle)
-            } else {
-                None
-            };
+            let shutdown = Arc::clone(&shutdown);
+            let handle = tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        shutdown.notified().await;
+                    })
+                    .await
+                    .ok();
+            });
+            Some(handle)
+        } else {
+            None
+        };
 
         let shutdown_signal = {
             let notify = Arc::clone(&shutdown);
