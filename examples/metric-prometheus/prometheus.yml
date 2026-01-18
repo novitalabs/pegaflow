@@ -5,4 +5,4 @@ global:
 scrape_configs:
   - job_name: 'pegaflow'
     static_configs:
-      - targets: ['host.docker.internal:9099']
+      - targets: ['host.docker.internal:9091']

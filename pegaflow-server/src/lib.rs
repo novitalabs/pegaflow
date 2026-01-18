@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
 use tonic::transport::Server;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{
     fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter,
 };
@@ -73,11 +73,13 @@ pub struct Cli {
     #[arg(long)]
     pub metrics_addr: Option<SocketAddr>,
 
-    /// Enable OTLP metrics export over gRPC (e.g. http://127.0.0.1:4317). Leave empty to disable.
+    /// **DEPRECATED**: Enable OTLP metrics export over gRPC (e.g. http://127.0.0.1:4317).
+    /// Use `--metrics-addr` for direct Prometheus export instead.
     #[arg(long)]
     pub metrics_otel_endpoint: Option<String>,
 
-    /// Period (seconds) for exporting OTLP metrics (only used when endpoint is set).
+    /// **DEPRECATED**: Period (seconds) for exporting OTLP metrics (only used when endpoint is set).
+    /// Use `--metrics-addr` for direct Prometheus export instead.
     #[arg(long, default_value_t = 5)]
     pub metrics_period_secs: u64,
 
@@ -172,8 +174,13 @@ fn init_metrics(
         info!("Prometheus metrics exporter enabled");
     }
 
-    // Add OTLP exporter if endpoint is configured
+    // Add OTLP exporter if endpoint is configured (DEPRECATED)
     if let Some(endpoint) = otlp_endpoint {
+        warn!(
+            "DEPRECATED: --metrics-otel-endpoint is deprecated and will be removed in a future release. \
+            Use --metrics-addr for direct Prometheus export instead."
+        );
+
         let exporter = opentelemetry_otlp::MetricExporter::builder()
             .with_tonic()
             .with_endpoint(endpoint)
