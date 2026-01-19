@@ -7,14 +7,16 @@ mod utils;
 pub use registry::CudaTensorRegistry;
 pub use service::GrpcEngineService;
 
+use axum::{routing::get, Router};
 use clap::Parser;
 use cudarc::driver::result as cuda_driver;
-use log::{error, info};
+use log::{error, info, warn};
 use opentelemetry::global;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use parking_lot::Mutex;
 use pegaflow_core::PegaEngine;
+use prometheus::{Registry, TextEncoder};
 use proto::engine::engine_server::EngineServer;
 use pyo3::{types::PyAnyMethods, PyErr, Python};
 use std::error::Error;
@@ -64,11 +66,17 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub disable_lfu_admission: bool,
 
-    /// Enable OTLP metrics export over gRPC (e.g. http://127.0.0.1:4317). Leave empty to disable.
-    #[arg(long, default_value = "http://127.0.0.1:4321")]
+    /// Address for Prometheus metrics HTTP endpoint (e.g. 0.0.0.0:9091). Leave empty to disable.
+    #[arg(long, default_value = "0.0.0.0:9091")]
+    pub metrics_addr: Option<SocketAddr>,
+
+    /// **DEPRECATED**: Enable OTLP metrics export over gRPC (e.g. http://127.0.0.1:4317).
+    /// Use `--metrics-addr` for direct Prometheus export instead.
+    #[arg(long)]
     pub metrics_otel_endpoint: Option<String>,
 
-    /// Period (seconds) for exporting OTLP metrics (only used when endpoint is set).
+    /// **DEPRECATED**: Period (seconds) for exporting OTLP metrics (only used when endpoint is set).
+    /// Use `--metrics-addr` for direct Prometheus export instead.
     #[arg(long, default_value_t = 5)]
     pub metrics_period_secs: u64,
 
@@ -118,30 +126,80 @@ fn init_python_cuda(device_id: i32) -> Result<(), std::io::Error> {
     })
 }
 
+struct MetricsState {
+    meter_provider: Option<SdkMeterProvider>,
+    prometheus_registry: Option<Registry>,
+}
+
 fn init_metrics(
-    endpoint: Option<String>,
-    period_secs: u64,
-) -> Result<Option<SdkMeterProvider>, Box<dyn Error>> {
-    let Some(endpoint) = endpoint.filter(|s| !s.is_empty()) else {
-        info!("OTLP metrics disabled (no endpoint configured or endpoint is empty)");
-        return Ok(None);
-    };
+    prometheus_enabled: bool,
+    otlp_endpoint: Option<String>,
+    otlp_period_secs: u64,
+) -> Result<MetricsState, Box<dyn Error>> {
+    let otlp_endpoint = otlp_endpoint.filter(|s| !s.is_empty());
 
-    let exporter = opentelemetry_otlp::MetricExporter::builder()
-        .with_tonic()
-        .with_endpoint(endpoint)
-        .build()?;
+    // If neither Prometheus nor OTLP is enabled, return empty state
+    if !prometheus_enabled && otlp_endpoint.is_none() {
+        info!("Metrics disabled (no Prometheus addr or OTLP endpoint configured)");
+        return Ok(MetricsState {
+            meter_provider: None,
+            prometheus_registry: None,
+        });
+    }
 
-    let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(exporter)
-        .with_interval(Duration::from_secs(period_secs))
-        .build();
+    let mut builder = SdkMeterProvider::builder();
+    let mut prometheus_registry = None;
 
-    let meter_provider = SdkMeterProvider::builder().with_reader(reader).build();
+    // Add Prometheus exporter if enabled
+    if prometheus_enabled {
+        let registry = Registry::new();
+        let exporter = opentelemetry_prometheus::exporter()
+            .with_registry(registry.clone())
+            .build()?;
+        builder = builder.with_reader(exporter);
+        prometheus_registry = Some(registry);
+        info!("Prometheus metrics exporter enabled");
+    }
 
+    // Add OTLP exporter if endpoint is configured (DEPRECATED)
+    if let Some(endpoint) = otlp_endpoint {
+        warn!(
+            "DEPRECATED: --metrics-otel-endpoint is deprecated and will be removed in a future release. \
+            Use --metrics-addr for direct Prometheus export instead."
+        );
+
+        let exporter = opentelemetry_otlp::MetricExporter::builder()
+            .with_tonic()
+            .with_endpoint(endpoint)
+            .build()?;
+
+        let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(exporter)
+            .with_interval(Duration::from_secs(otlp_period_secs))
+            .build();
+
+        builder = builder.with_reader(reader);
+        info!(
+            "OTLP metrics exporter enabled (period={}s)",
+            otlp_period_secs
+        );
+    }
+
+    let meter_provider = builder.build();
     global::set_meter_provider(meter_provider.clone());
-    info!("OTLP metrics exporter enabled (period={}s)", period_secs);
 
-    Ok(Some(meter_provider))
+    Ok(MetricsState {
+        meter_provider: Some(meter_provider),
+        prometheus_registry,
+    })
+}
+
+/// Handler for Prometheus /metrics endpoint
+async fn metrics_handler(axum::extract::State(registry): axum::extract::State<Registry>) -> String {
+    let encoder = TextEncoder::new();
+    let metric_families = registry.gather();
+    encoder
+        .encode_to_string(&metric_families)
+        .unwrap_or_else(|e| format!("# Error encoding metrics: {e}"))
 }
 
 /// Main entry point for pegaflow-server
@@ -207,8 +265,13 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
     // Initialize OTEL metrics BEFORE creating PegaEngine, so that core metrics
     // (pool, cache, save/load) use the real meter provider instead of noop.
-    let meter_provider = runtime.block_on(async {
-        init_metrics(cli.metrics_otel_endpoint.clone(), cli.metrics_period_secs)
+    let metrics_addr = cli.metrics_addr;
+    let metrics_state = runtime.block_on(async {
+        init_metrics(
+            metrics_addr.is_some(),
+            cli.metrics_otel_endpoint.clone(),
+            cli.metrics_period_secs,
+        )
     })?;
 
     let shutdown = Arc::new(Notify::new());
@@ -252,6 +315,31 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             info!("Inflight GC task started (interval=5m, max_age=60m)");
         }
 
+        // Start Prometheus HTTP server if configured
+        let metrics_server_handle = if let (Some(metrics_addr), Some(registry)) =
+            (cli.metrics_addr, metrics_state.prometheus_registry.clone())
+        {
+            let app = Router::new()
+                .route("/metrics", get(metrics_handler))
+                .with_state(registry);
+
+            let listener = tokio::net::TcpListener::bind(metrics_addr).await?;
+            info!("Starting Prometheus metrics server on {}", metrics_addr);
+
+            let shutdown = Arc::clone(&shutdown);
+            let handle = tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        shutdown.notified().await;
+                    })
+                    .await
+                    .ok();
+            });
+            Some(handle)
+        } else {
+            None
+        };
+
         let shutdown_signal = {
             let notify = Arc::clone(&shutdown);
             async move {
@@ -279,8 +367,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
         info!("Server stopped");
 
+        // Stop metrics server if running
+        if let Some(handle) = metrics_server_handle {
+            shutdown.notify_waiters();
+            let _ = handle.await;
+        }
+
         // Flush metrics before exit
-        if let Some(provider) = meter_provider {
+        if let Some(provider) = metrics_state.meter_provider {
             if let Err(err) = provider.shutdown() {
                 error!("Failed to shutdown metrics provider: {err}");
             }

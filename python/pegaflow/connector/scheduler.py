@@ -259,8 +259,7 @@ class SchedulerConnector:
                 # Response-level errors are treated as business errors
                 error_msg = result.get("message", "unknown error")
                 logger.error(
-                    "[PegaKVConnector] Query failed: %s, "
-                    "req_id=%s, instance_id=%s, num_blocks=%d",
+                    "[PegaKVConnector] Query failed: %s, req_id=%s, instance_id=%s, num_blocks=%d",
                     error_msg,
                     req_id,
                     self._ctx.instance_id,

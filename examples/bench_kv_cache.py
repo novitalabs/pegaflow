@@ -46,12 +46,14 @@ class VLLMServer:
         health_endpoints: Optional[Sequence[str]] = None,
         profile_output: Optional[Path] = None,
         torch_profile_output: Optional[Path] = None,
+        max_model_len: Optional[int] = None,
     ):
         self.model = model
         self.port = port
         self.use_pegaflow = use_pegaflow
         self.use_lmcache = use_lmcache
         self.enable_prefix_caching = enable_prefix_caching
+        self.max_model_len = max_model_len
         self.log_file = log_file
         self.health_endpoints = (
             list(health_endpoints)
@@ -107,6 +109,9 @@ class VLLMServer:
                 "64",
             ]
         )
+
+        if self.max_model_len is not None:
+            cmd.extend(["--max-model-len", str(self.max_model_len)])
 
         if not self.enable_prefix_caching:
             cmd.append("--no-enable-prefix-caching")
@@ -439,6 +444,12 @@ def main():
         action="store_true",
         help="Include pure vLLM baseline (no KV connector, single run) for comparison.",
     )
+    parser.add_argument(
+        "--max-model-len",
+        type=int,
+        default=None,
+        help="Maximum model context length. If not specified, uses the model's default.",
+    )
 
     args = parser.parse_args()
 
@@ -468,6 +479,8 @@ def main():
     if args.with_lmcache:
         print(f"LMCache Port:    {args.lmcache_port}")
     print(f"PegaFlow Port:   {args.pegaflow_port}")
+    if args.max_model_len:
+        print(f"Max Model Len:   {args.max_model_len}")
     print(f"Results Dir:     {run_dir}")
     print(f"Profiling:       {'Enabled' if args.profile else 'Disabled'}")
     if not args.with_baseline:
@@ -498,6 +511,7 @@ def main():
             enable_prefix_caching=False,
             log_file=baseline_log,
             profile_output=profile_path,
+            max_model_len=args.max_model_len,
         ):
             # Single run (no warm run needed since there's no external cache)
             result_file = run_dir / "baseline.json"
@@ -536,6 +550,7 @@ def main():
             enable_prefix_caching=False,
             log_file=lmcache_log,
             profile_output=profile_path,
+            max_model_len=args.max_model_len,
         ):
             # Cold cache run
             result_file = run_dir / "lmcache_cold.json"
@@ -597,6 +612,7 @@ def main():
         log_file=pegaflow_log,
         profile_output=profile_path,
         torch_profile_output=torch_profile_base,
+        max_model_len=args.max_model_len,
     ):
         # Cold cache run
         if args.torch_profile:
