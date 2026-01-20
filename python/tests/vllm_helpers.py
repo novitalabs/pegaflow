@@ -37,6 +37,11 @@ class VLLMServer:
     def __enter__(self):
         """Start the vLLM server."""
         env = os.environ.copy()
+        env["VLLM_BATCH_INVARIANT"] = "1"
+        if self.use_pegaflow:
+            env["CUDA_VISIBLE_DEVICES"] = "4,5,6,7"
+        else:
+            env["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
 
         cmd = [
             "vllm",
@@ -46,6 +51,8 @@ class VLLMServer:
             str(self.port),
             "--trust-remote-code",
             "--no-enable-prefix-caching",
+            "--attention-backend",
+            "FLASH_ATTN",
         ]
 
         if self.max_model_len is not None:

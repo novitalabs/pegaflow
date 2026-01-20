@@ -17,6 +17,7 @@ Usage:
         --fuzz-corpus=500 --fuzz-requests=1000 --fuzz-seed=42
 """
 
+import difflib
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -185,6 +186,7 @@ class TestFuzzCorrectness:
 
         failures: list[dict] = []
         stats = {"original": 0, "prefix_50pct": 0, "extended": 0}
+        processed = 0
 
         baseline_log = log_dir / "baseline_fuzz.log"
         pegaflow_log = log_dir / "pegaflow_fuzz.log"
@@ -196,6 +198,7 @@ class TestFuzzCorrectness:
             metrics_start = fetch_pegaflow_metrics(pega_metrics_port)
 
             for i, item in enumerate(access_sequence):
+                processed = i + 1
                 stats[item.access_type] += 1
 
                 if (i + 1) % 100 == 0:
@@ -210,31 +213,35 @@ class TestFuzzCorrectness:
                             {
                                 "prompt_id": item.prompt_id,
                                 "access_type": item.access_type,
-                                "prompt": item.prompt[:200],
-                                "baseline": baseline["text"][:100],
-                                "pegaflow": pegaflow["text"][:100],
+                                "prompt": item.prompt,
+                                "baseline": baseline["text"],
+                                "pegaflow": pegaflow["text"],
                             }
                         )
+                        break
                 except Exception as e:
                     failures.append(
                         {
                             "prompt_id": item.prompt_id,
                             "access_type": item.access_type,
-                            "prompt": item.prompt[:200],
+                            "prompt": item.prompt,
                             "error": str(e),
                         }
                     )
+                    break
 
             metrics_end = fetch_pegaflow_metrics(pega_metrics_port)
 
         # Print report
-        self._print_report(access_sequence, stats, metrics_start, metrics_end, failures)
+        self._print_report(access_sequence, processed, stats, metrics_start, metrics_end, failures)
 
-        assert not failures, f"{len(failures)} mismatches, first: {failures[0]}"
+        if failures:
+            raise AssertionError(self._format_failure(failures[0]))
 
     def _print_report(
         self,
         sequence: list[AccessItem],
+        processed: int,
         stats: dict[str, int],
         m_start: dict[str, float],
         m_end: dict[str, float],
@@ -258,7 +265,7 @@ class TestFuzzCorrectness:
 
         print(f"\n{'=' * 60}")
         print("[Fuzz Report]")
-        print(f"  Total requests: {len(sequence)}")
+        print(f"  Processed: {processed}/{len(sequence)}")
         print(
             f"  Access types: original={stats['original']}, "
             f"prefix_50pct={stats['prefix_50pct']}, extended={stats['extended']}"
@@ -269,3 +276,50 @@ class TestFuzzCorrectness:
         print(f"  Data transfer: save={save_bytes / 1e6:.1f}MB, " f"load={load_bytes / 1e6:.1f}MB")
         print(f"  Failures: {len(failures)}")
         print(f"{'=' * 60}\n")
+
+    def _format_failure(self, failure: dict) -> str:
+        """Format a readable failure message for quick diffing."""
+        prompt = self._snippet(failure.get("prompt", ""))
+        if "error" in failure:
+            return (
+                "[Fuzz Error]\n"
+                f"  prompt_id: {failure.get('prompt_id')}\n"
+                f"  access_type: {failure.get('access_type')}\n"
+                f"  prompt: {prompt}\n"
+                f"  error: {failure.get('error')}"
+            )
+
+        baseline = failure.get("baseline", "")
+        pegaflow = failure.get("pegaflow", "")
+        diff_lines = list(
+            difflib.unified_diff(
+                baseline.splitlines(),
+                pegaflow.splitlines(),
+                fromfile="baseline",
+                tofile="pegaflow",
+                lineterm="",
+            )
+        )
+        max_lines = 40
+        if len(diff_lines) > max_lines:
+            diff_lines = diff_lines[:max_lines] + ["... (diff truncated)"]
+        diff = "\n".join(diff_lines) if diff_lines else "(no diff output)"
+
+        return (
+            "[Fuzz Mismatch]\n"
+            f"  prompt_id: {failure.get('prompt_id')}\n"
+            f"  access_type: {failure.get('access_type')}\n"
+            f"  prompt: {prompt}\n"
+            f"  baseline: {self._snippet(baseline)}\n"
+            f"  pegaflow: {self._snippet(pegaflow)}\n"
+            "  diff:\n"
+            f"{diff}"
+        )
+
+    @staticmethod
+    def _snippet(text: str, max_len: int = 200) -> str:
+        """Compact snippet to keep logs readable."""
+        cleaned = text.replace("\n", "\\n")
+        if len(cleaned) > max_len:
+            return f"{cleaned[:max_len]}..."
+        return cleaned
