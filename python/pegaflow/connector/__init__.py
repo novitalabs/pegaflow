@@ -39,6 +39,7 @@ class PegaKVConnector(KVConnectorBase_V1):
 
         instance_id = resolve_instance_id(vllm_config)
         tp_size = vllm_config.parallel_config.tensor_parallel_size
+        world_size = vllm_config.parallel_config.world_size
         namespace = derive_namespace(vllm_config, tp_size)
         num_layers = getattr(vllm_config.model_config.hf_text_config, "num_hidden_layers", 0)
         block_size = vllm_config.cache_config.block_size
@@ -71,6 +72,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             block_size=block_size,
             num_layers=num_layers,
             tp_size=tp_size,
+            world_size=world_size,
             tp_rank=tp_rank,
             device_id=device_id,
             engine_client=engine_client,
@@ -85,12 +87,13 @@ class PegaKVConnector(KVConnectorBase_V1):
             self._worker = WorkerConnector(self._ctx)
 
         logger.info(
-            "[PegaKVConnector] Initialized role=%s instance_id=%s device=%s tp_rank=%s tp_size=%d layers=%d namespace=%s",
+            "[PegaKVConnector] Initialized role=%s instance_id=%s device=%s tp_rank=%s tp_size=%d world_size=%d layers=%d namespace=%s",
             role.name,
             instance_id,
             device_id if device_id is not None else "cpu",
             tp_rank if tp_rank is not None else "N/A",
             tp_size,
+            world_size,
             num_layers,
             namespace,
         )

@@ -20,6 +20,7 @@ message RegisterContextRequest {
   uint32 tp_size = 10;
   uint32 num_layers = 11;
   string namespace = 12;
+  uint32 world_size = 13;
 }
 
 message RegisterContextResponse {

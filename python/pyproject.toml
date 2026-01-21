@@ -35,6 +35,8 @@ test = [
     "pytest>=8.0",
     "pytest-cov>=4.0",
     "pytest-xdist>=3.0",
+    "datasets>=2.0",
+    "numpy>=1.24",
 ]
 dev = [
     "pegaflow-llm[test]",
@@ -59,6 +61,7 @@ markers = [
     "integration: marks tests as integration tests (require running server)",
     "slow: marks tests as slow (may take > 1 second)",
     "gpu: marks tests that require GPU",
+    "fuzz: marks tests as fuzz tests (long-running, skipped by default)",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",

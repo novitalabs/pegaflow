@@ -119,6 +119,7 @@ class WorkerConnector:
                 self._ctx.namespace,
                 self._ctx.tp_rank,
                 self._ctx.tp_size,
+                self._ctx.world_size,
                 self._ctx.device_id,
                 self._ctx.num_layers,
                 layer_name,

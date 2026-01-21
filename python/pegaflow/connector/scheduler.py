@@ -70,11 +70,12 @@ class SchedulerConnector:
 
         logger.info(
             "[PegaKVConnector] hit_blocks=%d computed_blocks=%d need_to_compute_tokens=%d "
-            "hit_tokens=%d elapsed_us=%.0f for request %s",
+            "hit_tokens=%d num_tokens=%d elapsed_us=%.0f for request %s",
             hit_blocks,
             computed_blocks,
             need_to_compute_tokens,
             num_hit_tokens,
+            num_tokens,
             elapsed_us,
             req_id,
         )

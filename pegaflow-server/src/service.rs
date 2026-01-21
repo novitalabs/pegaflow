@@ -112,13 +112,14 @@ impl Engine for GrpcEngineService {
         let result: Result<Response<RegisterContextResponse>, Status> = async {
             let req = request.into_inner();
             debug!(
-                "RPC [register_context]: instance_id={} namespace={} layer_name={} device_id={} tp_rank={} tp_size={} num_layers={} num_blocks={} bytes_per_block={} kv_stride_bytes={} segments={} wrapper_bytes={}",
+                "RPC [register_context]: instance_id={} namespace={} layer_name={} device_id={} tp_rank={} tp_size={} world_size={} num_layers={} num_blocks={} bytes_per_block={} kv_stride_bytes={} segments={} wrapper_bytes={}",
                 req.instance_id,
                 req.namespace,
                 req.layer_name,
                 req.device_id,
                 req.tp_rank,
                 req.tp_size,
+                req.world_size,
                 req.num_layers,
                 req.num_blocks,
                 req.bytes_per_block,
@@ -134,6 +135,7 @@ impl Engine for GrpcEngineService {
             let segments = Self::usize_from_u32(req.segments, "segments")?;
             let tp_rank = Self::usize_from_u32(req.tp_rank, "tp_rank")?;
             let tp_size = Self::usize_from_u32(req.tp_size, "tp_size")?;
+            let world_size = Self::usize_from_u32(req.world_size, "world_size")?;
             let num_layers = Self::usize_from_u32(req.num_layers, "num_layers")?;
 
             self.engine
@@ -150,6 +152,7 @@ impl Engine for GrpcEngineService {
                     segments,
                     tp_rank,
                     tp_size,
+                    world_size,
                     num_layers,
                 )
                 .map_err(Self::map_engine_error)?;

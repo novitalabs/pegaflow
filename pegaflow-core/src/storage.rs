@@ -629,11 +629,16 @@ impl StorageEngine {
     /// Check prefix blocks and trigger prefetch for blocks in SSD.
     /// Returns status indicating whether caller should retry.
     /// Hit blocks are pinned to prevent eviction before load.
+    ///
+    /// `num_workers` specifies the number of workers that will consume the pinned blocks
+    /// (typically tp_size). The ref_count is incremented by this amount so each worker
+    /// can call cache_lookup_many once.
     pub fn check_prefix_and_prefetch(
         &self,
         instance_id: &str,
         namespace: &str,
         hashes: &[Vec<u8>],
+        num_workers: usize,
     ) -> PrefetchStatus {
         let mut hit = 0usize;
         let mut loading = 0usize;
@@ -677,6 +682,7 @@ impl StorageEngine {
             }
 
             // Pin hit blocks when returning Done (no loading in progress)
+            // Increment ref_count by num_workers so each worker can consume the pin once
             if loading == 0 {
                 for key in cpu_hit_keys {
                     let pin_key = (instance_id.to_string(), key.clone());
@@ -684,8 +690,8 @@ impl StorageEngine {
                     inner
                         .pinned_for_load
                         .entry(pin_key)
-                        .and_modify(|(_, count)| *count += 1)
-                        .or_insert_with(|| (Arc::clone(&block), 1));
+                        .and_modify(|(_, count)| *count += num_workers)
+                        .or_insert_with(|| (Arc::clone(&block), num_workers));
                 }
             }
         }

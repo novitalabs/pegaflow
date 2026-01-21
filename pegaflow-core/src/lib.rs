@@ -169,6 +169,7 @@ struct InstanceContext {
     namespace: String,
     num_layers: usize,
     tp_size: usize,
+    world_size: usize,
     /// Maps layer name to layer ID (0..num_layers)
     layer_name_to_id: Mutex<HashMap<String, usize>>,
     /// Inverse map to ensure stable ordering
@@ -178,12 +179,19 @@ struct InstanceContext {
 }
 
 impl InstanceContext {
-    fn new(id: String, namespace: String, num_layers: usize, tp_size: usize) -> Self {
+    fn new(
+        id: String,
+        namespace: String,
+        num_layers: usize,
+        tp_size: usize,
+        world_size: usize,
+    ) -> Self {
         Self {
             _id: id,
             namespace,
             num_layers,
             tp_size,
+            world_size,
             layer_name_to_id: Mutex::new(HashMap::new()),
             layer_names: Mutex::new(Vec::new()),
             gpu_contexts: RwLock::new(HashMap::new()),
@@ -328,16 +336,20 @@ impl PegaEngine {
         namespace: &str,
         num_layers: usize,
         tp_size: usize,
+        world_size: usize,
     ) -> Result<Arc<InstanceContext>, EngineError> {
         // Fast path
         {
             let instances = self.instances.read().expect("instances read lock poisoned");
             if let Some(instance) = instances.get(instance_id) {
                 // Verify topology matches
-                if instance.num_layers != num_layers || instance.tp_size != tp_size {
+                if instance.num_layers != num_layers
+                    || instance.tp_size != tp_size
+                    || instance.world_size != world_size
+                {
                     return Err(EngineError::TopologyMismatch(format!(
-                        "instance {instance_id} exists with layers={}, tp={}; requested layers={}, tp={}",
-                        instance.num_layers, instance.tp_size, num_layers, tp_size
+                        "instance {instance_id} exists with layers={}, tp={}, world={}; requested layers={}, tp={}, world={}",
+                        instance.num_layers, instance.tp_size, instance.world_size, num_layers, tp_size, world_size
                     )));
                 }
                 return Ok(Arc::clone(instance));
@@ -350,10 +362,13 @@ impl PegaEngine {
             .write()
             .expect("instances write lock poisoned");
         if let Some(instance) = instances.get(instance_id) {
-            if instance.num_layers != num_layers || instance.tp_size != tp_size {
+            if instance.num_layers != num_layers
+                || instance.tp_size != tp_size
+                || instance.world_size != world_size
+            {
                 return Err(EngineError::TopologyMismatch(format!(
-                    "instance {instance_id} exists with layers={}, tp={}; requested layers={}, tp={}",
-                    instance.num_layers, instance.tp_size, num_layers, tp_size
+                    "instance {instance_id} exists with layers={}, tp={}, world={}; requested layers={}, tp={}, world={}",
+                    instance.num_layers, instance.tp_size, instance.world_size, num_layers, tp_size, world_size
                 )));
             }
             return Ok(Arc::clone(instance));
@@ -364,6 +379,7 @@ impl PegaEngine {
             namespace.to_string(),
             num_layers,
             tp_size,
+            world_size,
         ));
         instances.insert(instance_id.to_string(), Arc::clone(&instance));
         Ok(instance)
@@ -393,6 +409,7 @@ impl PegaEngine {
         segments: usize,
         tp_rank: usize,
         tp_size: usize,
+        world_size: usize,
         num_layers: usize,
     ) -> Result<(), EngineError> {
         if bytes_per_block == 0 || num_blocks == 0 || segments == 0 {
@@ -457,7 +474,8 @@ impl PegaEngine {
             )));
         }
 
-        let instance = self.get_or_create_instance(instance_id, namespace, num_layers, tp_size)?;
+        let instance =
+            self.get_or_create_instance(instance_id, namespace, num_layers, tp_size, world_size)?;
         let worker = instance.ensure_gpu(device_id)?;
 
         // Register layer ID in global instance map
@@ -843,12 +861,17 @@ impl PegaEngine {
     ) -> Result<PrefetchStatus, EngineError> {
         let instance = self.get_instance(instance_id)?;
         let namespace = &instance.namespace;
+        let world_size = instance.world_size;
         let metrics = core_metrics();
 
         // Delegate to storage engine's unified check_prefix_and_prefetch
-        let status = self
-            .storage
-            .check_prefix_and_prefetch(instance_id, namespace, block_hashes);
+        // Pass world_size as num_workers so each worker (TP*PP*PCP) can consume the pin once
+        let status = self.storage.check_prefix_and_prefetch(
+            instance_id,
+            namespace,
+            block_hashes,
+            world_size,
+        );
 
         // Record metrics for terminal state
         match &status {

@@ -29,6 +29,7 @@ class ConnectorContext:
     block_size: int
     num_layers: int
     tp_size: int
+    world_size: int
     tp_rank: int | None
     device_id: int | None
     engine_client: EngineRpcClient
