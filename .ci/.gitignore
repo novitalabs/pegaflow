@@ -1,0 +1,9 @@
+# CI generated files
+results/
+.venv/
+
+# Temporary files
+*.log
+*.tmp
+*.pid
+
