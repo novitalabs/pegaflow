@@ -54,6 +54,7 @@ class WorkerConnector:
 
         self._registered_layers: list[str] = []
         self._layer_name_to_id: dict[str, int] = {}
+        self._torch_device: torch.device | None = None
 
         self._finished_requests: set[str] = set()
 
@@ -79,6 +80,7 @@ class WorkerConnector:
         ), "CUDA device id is unknown; cannot register KV caches"
 
         self._registered_layers = list(kv_caches.keys())
+        self._torch_device = next(iter(kv_caches.values())).device
 
         self._layer_name_to_id.clear()
         for layer_id, layer_name in enumerate(kv_caches.keys()):
@@ -383,7 +385,7 @@ class WorkerConnector:
         if saves_by_layer:
             # Ensure all GPU kernels have completed before reading KV cache
             # Otherwise we may copy uninitialized memory (attention kernel is async)
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(self._torch_device)
 
             saves_list = [(name, ids, hashes) for name, (ids, hashes) in saves_by_layer.items()]
 
