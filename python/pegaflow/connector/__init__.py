@@ -18,8 +18,6 @@ from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from pegaflow.connector.common import (
     ConnectorContext,
     PegaConnectorMetadata,
-    RequestPhase,
-    RequestTracker,
     derive_namespace,
     logger,
     resolve_instance_id,
@@ -27,7 +25,6 @@ from pegaflow.connector.common import (
 from pegaflow.connector.scheduler import SchedulerConnector
 from pegaflow.connector.state_manager import ServiceStateManager
 from pegaflow.connector.worker import WorkerConnector
-from pegaflow.logging_utils import timing_wrapper
 from pegaflow.pegaflow import EngineRpcClient
 
 
@@ -101,7 +98,6 @@ class PegaKVConnector(KVConnectorBase_V1):
     # ==============================
     # Worker-side methods
     # ==============================
-    @timing_wrapper
     def start_load_kv(self, forward_context, **kwargs: Any) -> None:
         if not self._worker:
             return
@@ -129,7 +125,6 @@ class PegaKVConnector(KVConnectorBase_V1):
             return
         self._worker.save_kv_layer(metadata, layer_name, kv_layer, attn_metadata, **kwargs)
 
-    @timing_wrapper
     def wait_for_save(self) -> None:
         if not self._worker:
             return
@@ -148,6 +143,10 @@ class PegaKVConnector(KVConnectorBase_V1):
     def unregister_context(self) -> None:
         if self._worker:
             self._worker.unregister_context()
+
+    def handle_preemptions(self, preempted_req_ids: set[str]) -> None:
+        if self._worker:
+            self._worker.handle_preemptions(preempted_req_ids)
 
     # ==============================
     # Scheduler-side methods
@@ -168,7 +167,6 @@ class PegaKVConnector(KVConnectorBase_V1):
     def take_events(self) -> Iterable:
         return ()
 
-    @timing_wrapper
     def get_num_new_matched_tokens(
         self,
         request,
@@ -178,7 +176,6 @@ class PegaKVConnector(KVConnectorBase_V1):
             return (0, False)
         return self._scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
 
-    @timing_wrapper
     def update_state_after_alloc(
         self,
         request,
@@ -188,7 +185,6 @@ class PegaKVConnector(KVConnectorBase_V1):
         if self._scheduler:
             self._scheduler.update_state_after_alloc(request, blocks, num_external_tokens)
 
-    @timing_wrapper
     def build_connector_meta(self, scheduler_output) -> PegaConnectorMetadata:
         if not self._scheduler:
             return PegaConnectorMetadata()
@@ -244,4 +240,4 @@ def _resolve_device_id() -> int:
         return local_id
 
 
-__all__ = ["PegaKVConnector", "KVConnectorRole", "RequestPhase", "RequestTracker"]
+__all__ = ["PegaKVConnector", "KVConnectorRole"]

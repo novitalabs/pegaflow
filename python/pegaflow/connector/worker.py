@@ -14,7 +14,6 @@ import torch
 
 from pegaflow.connector.common import ConnectorContext, PegaConnectorMetadata, logger
 from pegaflow.ipc_wrapper import CudaIPCWrapper
-from pegaflow.logging_utils import timing_wrapper
 from pegaflow.pegaflow import PyLoadState
 
 if TYPE_CHECKING:
@@ -45,6 +44,7 @@ class WorkerConnector:
         self._req_pending_layers: dict[str, int] = {}
         self._completed_saves: set[str] = set()
         self._save_completion_lock = threading.Lock()
+        self._save_completion_events: dict[str, threading.Event] = {}
 
         self._current_save_intents: set[str] = set()
 
@@ -173,15 +173,14 @@ class WorkerConnector:
                     state = load_state.get_state()
                     if state < 0:
                         logger.error(
-                            "[PegaKVConnector] async load failed with state=%d for reqs=%s",
-                            state,
+                            "[PegaKVConnector] async_load_failed: reqs=%s state=%d",
                             req_ids,
+                            state,
                         )
                     else:
-                        logger.debug(
-                            "[PegaKVConnector] async load completed for %d reqs, shm=%s",
-                            len(req_ids),
-                            shm_name,
+                        logger.info(
+                            "[PegaKVConnector] async_load_completed: reqs=%s",
+                            req_ids,
                         )
                     completed_reqs.update(req_ids)
                     completed_shms.append(shm_name)
@@ -195,8 +194,8 @@ class WorkerConnector:
                 finished_recving = completed_reqs
 
         if finished_sending:
-            logger.debug(
-                "[PegaKVConnector] finished saving KV for requests: %s",
+            logger.info(
+                "[PegaKVConnector] async_save_completed: reqs=%s",
                 finished_sending,
             )
         if finished_recving:
@@ -206,7 +205,6 @@ class WorkerConnector:
             )
         return (finished_sending, finished_recving)
 
-    @timing_wrapper
     def start_load_kv(
         self,
         metadata: PegaConnectorMetadata,
@@ -297,6 +295,7 @@ class WorkerConnector:
             for req_id in request_ids:
                 if req_id not in self._req_pending_layers:
                     self._req_pending_layers[req_id] = len(self._registered_layers)
+                    self._save_completion_events[req_id] = threading.Event()
 
         self._save_queue.put(
             SaveTask(
@@ -307,7 +306,6 @@ class WorkerConnector:
             )
         )
 
-    @timing_wrapper
     def wait_for_save(self) -> None:
         skipped_requests: set[str] = set()
 
@@ -432,6 +430,9 @@ class WorkerConnector:
                         self._completed_saves.add(req_id)
                         del self._req_pending_layers[req_id]
                         completed_reqs.append(req_id)
+                        event = self._save_completion_events.pop(req_id, None)
+                        if event:
+                            event.set()
 
         self._handle_save_completion(completed_reqs)
 
@@ -450,6 +451,38 @@ class WorkerConnector:
                 req_id,
                 layer_count,
                 suffix,
+            )
+
+    def handle_preemptions(self, preempted_req_ids: set[str]) -> None:
+        """Wait for preempted requests' saves to complete before blocks are reused.
+
+        Called by vLLM BEFORE preempted blocks are overwritten. This prevents
+        data corruption when async saves are still reading from blocks that
+        will be reassigned to new requests.
+        """
+        if not preempted_req_ids:
+            return
+
+        events_to_wait: list[tuple[str, threading.Event]] = []
+        with self._save_completion_lock:
+            for req_id in preempted_req_ids:
+                event = self._save_completion_events.get(req_id)
+                if event:
+                    events_to_wait.append((req_id, event))
+
+        if events_to_wait:
+            logger.info(
+                "[PegaKVConnector] preemption: waiting for %d requests' saves: %s",
+                len(events_to_wait),
+                [req_id for req_id, _ in events_to_wait],
+            )
+            for req_id, event in events_to_wait:
+                event.wait()
+                logger.info("[PegaKVConnector] preemption: req=%s save completed", req_id)
+        else:
+            logger.info(
+                "[PegaKVConnector] preemption: %d requests (no pending saves)",
+                len(preempted_req_ids),
             )
 
 
