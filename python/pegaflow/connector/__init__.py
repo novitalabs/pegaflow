@@ -18,8 +18,6 @@ from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from pegaflow.connector.common import (
     ConnectorContext,
     PegaConnectorMetadata,
-    RequestPhase,
-    RequestTracker,
     derive_namespace,
     logger,
     resolve_instance_id,
@@ -242,4 +240,4 @@ def _resolve_device_id() -> int:
         return local_id
 
 
-__all__ = ["PegaKVConnector", "KVConnectorRole", "RequestPhase", "RequestTracker"]
+__all__ = ["PegaKVConnector", "KVConnectorRole"]
