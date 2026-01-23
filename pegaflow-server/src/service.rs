@@ -3,7 +3,8 @@ use crate::proto::engine::engine_server::Engine;
 use crate::proto::engine::{
     HealthRequest, HealthResponse, LoadRequest, LoadResponse, PrefetchState, QueryRequest,
     QueryResponse, RegisterContextRequest, RegisterContextResponse, ResponseStatus, SaveRequest,
-    SaveResponse, ShutdownRequest, ShutdownResponse, UnregisterRequest, UnregisterResponse,
+    SaveResponse, ShutdownRequest, ShutdownResponse, UnpinRequest, UnpinResponse,
+    UnregisterRequest, UnregisterResponse,
 };
 use crate::registry::{CudaTensorRegistry, TensorMetadata};
 use log::{debug, info, warn};
@@ -364,6 +365,47 @@ impl Engine for GrpcEngineService {
             ),
         }
         record_rpc_result("query", &result, start);
+        result
+    }
+
+    async fn unpin(
+        &self,
+        request: Request<UnpinRequest>,
+    ) -> Result<Response<UnpinResponse>, Status> {
+        let start = Instant::now();
+        let req = request.into_inner();
+        let hash_count = req.block_hashes.len();
+
+        let result: Result<Response<UnpinResponse>, Status> = async {
+            debug!(
+                "RPC [unpin]: instance_id={} block_hashes={}",
+                req.instance_id, hash_count
+            );
+
+            self.engine
+                .unpin_blocks(&req.instance_id, &req.block_hashes)
+                .map_err(Self::map_engine_error)?;
+
+            Ok(Response::new(UnpinResponse {
+                status: Some(Self::build_simple_response()),
+            }))
+        }
+        .await;
+
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        match &result {
+            Ok(_) => debug!(
+                "RPC [unpin] completed: ok blocks={} elapsed_ms={:.2}",
+                hash_count, elapsed_ms
+            ),
+            Err(status) => warn!(
+                "RPC [unpin] failed: code={} message={} elapsed_ms={:.2}",
+                status.code(),
+                status.message(),
+                elapsed_ms
+            ),
+        }
+        record_rpc_result("unpin", &result, start);
         result
     }
 

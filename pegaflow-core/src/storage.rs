@@ -538,6 +538,38 @@ impl StorageEngine {
         Ok(result)
     }
 
+    /// Unpin blocks that were pinned during query.
+    /// This decrements the ref_count and removes the entry when it reaches 0.
+    /// Returns the number of blocks that were successfully unpinned.
+    pub fn unpin_blocks(
+        &self,
+        instance_id: &str,
+        namespace: &str,
+        block_hashes: &[Vec<u8>],
+    ) -> usize {
+        let keys: Vec<BlockKey> = block_hashes
+            .iter()
+            .map(|hash| BlockKey::new(namespace.to_string(), hash.clone()))
+            .collect();
+
+        let mut inner = self.inner.lock().unwrap();
+        let mut unpinned = 0usize;
+
+        for key in keys {
+            let pin_key = (instance_id.to_string(), key);
+
+            if let Some((_, count)) = inner.pinned_for_load.get_mut(&pin_key) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    inner.pinned_for_load.remove(&pin_key);
+                }
+                unpinned += 1;
+            }
+        }
+
+        unpinned
+    }
+
     // ========================================================================
     // Eviction (cache only)
     // ========================================================================

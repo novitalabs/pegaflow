@@ -1,7 +1,7 @@
 use pegaflow_core::{LoadState, PegaEngine as CoreEngine};
 use pegaflow_proto::proto::engine::{
     engine_client::EngineClient, HealthRequest, LoadRequest, QueryRequest, RegisterContextRequest,
-    ResponseStatus, SaveLayer, SaveRequest, ShutdownRequest, UnregisterRequest,
+    ResponseStatus, SaveLayer, SaveRequest, ShutdownRequest, UnpinRequest, UnregisterRequest,
 };
 use pyo3::{
     create_exception,
@@ -496,6 +496,34 @@ impl EngineRpcClient {
                 Ok(dict.into())
             })
         })
+    }
+
+    /// Unpin blocks that were pinned during query.
+    ///
+    /// This is used when load is cancelled or preempted before consumption.
+    /// Call this to release pinned blocks and prevent memory leaks.
+    ///
+    /// Args:
+    ///     instance_id: Model instance ID
+    ///     block_hashes: List of block hashes to unpin
+    ///
+    /// Returns: (ok: bool, message: str)
+    fn unpin(
+        &self,
+        py: Python<'_>,
+        instance_id: String,
+        block_hashes: Vec<Vec<u8>>,
+    ) -> PyResult<(bool, String)> {
+        self.call(py, |mut c| async move {
+            let resp = c
+                .unpin(UnpinRequest {
+                    instance_id,
+                    block_hashes,
+                })
+                .await?;
+            Ok(resp.into_inner())
+        })
+        .and_then(|r| status_tuple("unpin", r.status))
     }
 
     /// Unregister a context/instance.

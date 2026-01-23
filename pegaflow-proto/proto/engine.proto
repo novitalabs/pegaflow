@@ -83,6 +83,15 @@ message QueryResponse {
   uint64 missing_blocks = 5;
 }
 
+message UnpinRequest {
+  string instance_id = 1;
+  repeated bytes block_hashes = 2;
+}
+
+message UnpinResponse {
+  ResponseStatus status = 1;
+}
+
 message UnregisterRequest {
   string instance_id = 1;
 }
@@ -108,6 +117,7 @@ service Engine {
   rpc Save(SaveRequest) returns (SaveResponse);
   rpc Load(LoadRequest) returns (LoadResponse);
   rpc Query(QueryRequest) returns (QueryResponse);
+  rpc Unpin(UnpinRequest) returns (UnpinResponse);
   rpc UnregisterContext(UnregisterRequest) returns (UnregisterResponse);
   rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
   rpc Health(HealthRequest) returns (HealthResponse);

@@ -889,6 +889,28 @@ impl PegaEngine {
         Ok(status)
     }
 
+    /// Unpin blocks that were pinned during query.
+    /// This is used when load is cancelled or preempted before consumption.
+    /// Returns the number of blocks that were successfully unpinned.
+    pub fn unpin_blocks(
+        &self,
+        instance_id: &str,
+        block_hashes: &[Vec<u8>],
+    ) -> Result<usize, EngineError> {
+        let instance = self.get_instance(instance_id)?;
+        let namespace = &instance.namespace;
+        let unpinned = self
+            .storage
+            .unpin_blocks(instance_id, namespace, block_hashes);
+        debug!(
+            "unpin_blocks: instance_id={} blocks={} unpinned={}",
+            instance_id,
+            block_hashes.len(),
+            unpinned
+        );
+        Ok(unpinned)
+    }
+
     /// Batch load KV blocks for multiple layers asynchronously.
     ///
     /// This submits a task to the GPU worker pool which performs all transfers.

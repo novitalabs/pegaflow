@@ -9,6 +9,7 @@ PegaFlow is a high-performance KV cache transfer system for LLM inference, desig
 ## Build Commands
 
 ### Rust Core
+
 ```bash
 cargo build              # Debug build
 cargo build --release    # Release build
@@ -16,12 +17,15 @@ cargo test               # Run Rust tests
 ```
 
 ### CI Checks (Local)
+
 Run all CI checks locally before committing:
+
 ```bash
 ./scripts/check.sh       # Run fmt, typos, clippy, and cargo check
 ```
 
 ### Python Bindings (PyO3 via maturin)
+
 ```bash
 cd python
 maturin develop          # Dev build
@@ -29,12 +33,14 @@ maturin develop --release  # Release build
 ```
 
 ### Running Benchmarks
+
 ```bash
 cargo bench --bench pinned_copy
 cargo bench --bench uds_latency
 ```
 
 ### Running Examples
+
 ```bash
 # Start the PegaEngine server first (required)
 cargo run -r --bin pegaflow-server -- --addr 0.0.0.0:50055 --device 0 --pool-size 30gb
@@ -45,6 +51,7 @@ uv run python examples/bench_kv_cache.py --model /path/to/model --num-prompts 10
 ```
 
 **Server Configuration:**
+
 - `--addr`: Bind address (default: `127.0.0.1:50055`)
 - `--device`: CUDA device ID (default: `0`)
 - `--pool-size`: Pinned memory pool size (default: `30gb`, supports: `kb`, `mb`, `gb`, `tb`)
@@ -93,14 +100,17 @@ vLLM/SGLang Worker <--gRPC--> PegaEngine Server <--CUDA IPC--> GPU Memory
 ## Code Conventions
 
 ### General
+
 - Use English in comments
 - Use `.venv` for Python virtual environment
 - KV cache uses layer-first layout: all K blocks contiguous, followed by all V blocks
 
 ### Rust
+
 - Prefer `NonNull` over `*mut` in unsafe code
 
 ### Python (3.10+)
+
 - Use native generics (`list`, `dict`, `set`, `tuple`) instead of `typing.List`, `typing.Dict`, etc.
 - Use PEP 604 union syntax (`X | Y`, `X | None`) instead of `typing.Union`, `typing.Optional`
 - Logging: use `%s` formatting (`logger.info("x=%s", x)`) instead of f-strings to avoid evaluation overhead
@@ -114,6 +124,7 @@ vLLM/SGLang Worker <--gRPC--> PegaEngine Server <--CUDA IPC--> GPU Memory
 ## vLLM Integration
 
 Configure vLLM to use PegaFlow:
+
 ```python
 from vllm.distributed.kv_transfer.kv_transfer_agent import KVTransferConfig
 
@@ -123,6 +134,57 @@ kv_transfer_config = KVTransferConfig(
     kv_connector_module_path="pegaflow.connector",
 )
 ```
+
+## Sglang integration
+
+PegaFlow integrates with SGLang by providing a drop-in replacement for the default `RadixCache` that uses the high-throughput PegaEngine server for distributed KV cache management.
+
+### How to Use
+
+1. **Import and Instantiate PeagflowRadixCache**
+
+In your SGLang-based project, swap out the usual RadixCache for `PeagflowRadixCache`:
+
+```python
+from pegaflow.sglang.peagflow_radix_cache import PeagflowRadixCache
+
+# Example instantiation inside the cache initialization logic:
+kv_cache = PeagflowRadixCache(
+    params=cache_params,       # sglang.srt.mem_cache.cache_init_params.CacheInitParams
+    model_config=model_config, # sglang.srt.configs.model_config.ModelConfig
+    tp_size=tp_size,           # Tensor parallel world size
+    rank=tp_rank,              # Local TP rank
+)
+```
+
+2. **Environment Variables**
+
+- `PEGAFLOW_ENGINE_ENDPOINT`: Override the gRPC endpoint for the PegaEngine server. Defaults to `http://127.0.0.1:50055`.
+- `PEGAFLOW_INSTANCE_ID`: Optional override for instance identification across processes.
+
+3. **Automatic CUDA IPC Handling**
+
+`PeagflowRadixCache` automatically registers all layer KV cache tensors for CUDA IPC with the PegaEngine upon construction, making them available for RDMA/pinned memory transfer.
+
+4. **Behavioral Differences vs. Default RadixCache**
+
+- On prefix miss, it queries the PegaEngine for remote blocks and loads missing blocks directly into local GPU buffers.
+- When a request finishes, changed blocks are saved back and announced to the engine.
+- All KV operations (query/load/save) are batched per block and per layer for efficiency.
+- Integration is non-intrusive: simply swap the class during initialization.
+
+5. **Shutdown and Cleanup**
+
+The class automatically unregisters contexts with the engine on deletion, interpreter shutdown, or Ctrl+C.
+
+### Reference
+
+See the implementation in [`pegaflow/python/pegaflow/sglang/peagflow_radix_cache.py`](python/pegaflow/sglang/peagflow_radix_cache.py) for full details and entry points:
+
+- Custom `match_prefix`
+- Remote block query/load/save
+- Context (un)registration
+- Layer-wise registration for MLA/TP
 
 ## Key Files
 

@@ -11,7 +11,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import torch
-from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams, MatchResult
 from sglang.srt.mem_cache.hicache_storage import get_hash_str
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
@@ -103,7 +103,6 @@ class PeagflowRadixCache(RadixCache):
         model_config: ModelConfig | None = None,
         tp_size: int = 1,
         rank: int = 0,
-        tp_group=None,
         instance_id: str | None = None,
         namespace: str | None = None,
         engine_endpoint: str | None = None,
@@ -115,12 +114,16 @@ class PeagflowRadixCache(RadixCache):
         if EngineRpcClient is None:
             raise RuntimeError("pegaflow extension is not available (EngineRpcClient missing)")
 
-        self.instance_id = instance_id or _default_instance_id()
+        self.tp_rank = rank
+        self.tp_size = tp_size
+        self.world_size = 1  # TODO: hardcode
+
+        # Synchronize instance_id across TP ranks via gloo broadcast
+        # Use params.tp_cache_group which already handles DP attention case
+        self.instance_id = self._sync_instance_id(instance_id, params.tp_cache_group)
         self.namespace = namespace or _default_namespace(
             model_config, 1 if self.is_mla else tp_size
         )
-        self.tp_rank = rank
-        self.tp_size = tp_size
 
         # Device id inferred from KV cache buffers; fallback to resolved global device
         self.device_id: int = _resolve_device_id()
@@ -146,12 +149,40 @@ class PeagflowRadixCache(RadixCache):
     # --------------------------------------------------------------------- #
     # Helpers
     # --------------------------------------------------------------------- #
+    def _sync_instance_id(
+        self, instance_id: str | None, tp_cache_group: torch.distributed.ProcessGroup | None
+    ) -> str:
+        """Synchronize instance_id across TP ranks using gloo broadcast.
+
+        Rank 0 generates the instance_id and broadcasts it to all other ranks.
+        """
+        if self.tp_size <= 1 or tp_cache_group is None:
+            # Single rank, no sync needed
+            return instance_id or _default_instance_id()
+
+        # tp_cache_group is a standard PyTorch ProcessGroup (gloo-backed)
+        group_ranks = torch.distributed.get_process_group_ranks(tp_cache_group)
+
+        # Rank 0 generates the instance_id
+        resolved_id = (instance_id or _default_instance_id()) if self.tp_rank == 0 else ""
+
+        # Broadcast the instance_id from rank 0 to all others
+        id_list = [resolved_id]
+        torch.distributed.broadcast_object_list(id_list, src=group_ranks[0], group=tp_cache_group)
+        resolved_id = id_list[0]
+
+        logger.debug(
+            f"[PeagflowRadixCache] Synced instance_id={resolved_id} (tp_rank={self.tp_rank})"
+        )
+
+        return resolved_id
+
     @staticmethod
     def _unregister_context(instance_id: str, client: EngineRpcClient, tp_rank: int) -> None:
         if tp_rank != 0:
             return
         try:
-            logger.debug(f"[PeagflowRadixCache] Unregistering instance={instance_id}")
+            logger.info(f"[PeagflowRadixCache] Unregistering instance={instance_id}")
             ok, msg = client.unregister_context(instance_id)
             if not ok:
                 logger.warning(f"[PeagflowRadixCache] Unregister failed: {msg}")
@@ -245,6 +276,7 @@ class PeagflowRadixCache(RadixCache):
             self.namespace,
             0 if self.is_mla else self.tp_rank,
             1 if self.is_mla else self.tp_size,
+            self.world_size,
             self.device_id,
             total_layers,
             layer_name,
@@ -263,6 +295,17 @@ class PeagflowRadixCache(RadixCache):
         )
 
         return layer_name
+
+    def _unpin_blocks(self, block_hashes: list[bytes]) -> None:
+        """Unpin blocks that were pinned during query but not consumed by load."""
+        if not block_hashes:
+            return
+        try:
+            ok, message = self.engine_client.unpin(self.instance_id, block_hashes)
+            if not ok:
+                logger.warning(f"[PeagflowRadixCache] unpin failed: {message}")
+        except Exception as e:
+            logger.warning(f"[PeagflowRadixCache] unpin failed: {e}")
 
     def _split_blocks(
         self, token_slots: torch.Tensor, start: int, length: int
@@ -294,11 +337,12 @@ class PeagflowRadixCache(RadixCache):
     def reset(self):  # type: ignore[override]
         super().reset()
 
-    def match_prefix(self, key: RadixKey, **kwargs) -> MatchResult:  # type: ignore[override]
+    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:  # type: ignore[override]
+        key: RadixKey = params.key
         if self.disable or not key:
-            return super().match_prefix(key, **kwargs)
+            return super().match_prefix(params)
 
-        base_res = super().match_prefix(key, **kwargs)
+        base_res = super().match_prefix(params)
         value: torch.Tensor = base_res.device_indices
         last_node: TreeNode = base_res.last_device_node
 
@@ -469,6 +513,9 @@ class PeagflowRadixCache(RadixCache):
             return
         self.store_stream.synchronize()
         super().evict(num_tokens)
+
+    def unregister_context(self) -> None:
+        PeagflowRadixCache._unregister_context(self.instance_id, self.engine_client, self.tp_rank)
 
 
 __all__ = ["PeagflowRadixCache"]
