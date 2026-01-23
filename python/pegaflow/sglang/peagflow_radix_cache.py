@@ -109,7 +109,11 @@ class PeagflowRadixCache(RadixCache):
     ):
         super().__init__(params)
 
-        self.is_mla = isinstance(self.token_to_kv_pool_allocator.get_kvcache(), MLATokenToKVPool)
+        device_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        self.start_layer = device_pool.start_layer
+        self.end_layer = device_pool.end_layer
+
+        self.is_mla = isinstance(device_pool, MLATokenToKVPool)
 
         if EngineRpcClient is None:
             raise RuntimeError("pegaflow extension is not available (EngineRpcClient missing)")
@@ -190,10 +194,10 @@ class PeagflowRadixCache(RadixCache):
             logger.warning(f"[PeagflowRadixCache] Unregister exception: {e}")
 
     def _register_kv_caches(self) -> None:
-        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+        device_pool = self.token_to_kv_pool_allocator.get_kvcache()
         if self.is_mla:
             k_pool = getattr(
-                kvcache,
+                device_pool,
                 "kv_buffer",
                 getattr(self.token_to_kv_pool_allocator, "kv_buffer", None),
             )
@@ -201,12 +205,12 @@ class PeagflowRadixCache(RadixCache):
                 raise RuntimeError("Unable to locate KV buffers from token_to_kv_pool_allocator")
         else:
             k_pool = getattr(
-                kvcache,
+                device_pool,
                 "k_buffer",
                 getattr(self.token_to_kv_pool_allocator, "k_buffer", None),
             )
             v_pool = getattr(
-                kvcache,
+                device_pool,
                 "v_buffer",
                 getattr(self.token_to_kv_pool_allocator, "v_buffer", None),
             )
@@ -214,44 +218,48 @@ class PeagflowRadixCache(RadixCache):
             if k_pool is None or v_pool is None:
                 raise RuntimeError("Unable to locate KV buffers from token_to_kv_pool_allocator")
 
-        total_layers = len(k_pool)
+        num_layers = self.end_layer - self.start_layer
+        layer_names: list[str] = [f"layer_{idx}" for idx in range(self.start_layer, self.end_layer)]
         if not self.is_mla:
-            total_layers *= 2
-        layer_names: list[str] = []
+            num_layers *= 2
+
+        registered_layer_names: list[str] = []
 
         if self.is_mla:
-            for idx, k_tensor in enumerate(k_pool):
-                layer_names.append(
-                    self._register_single_layer(
-                        tensor=k_tensor,
-                        layer_name=f"layer{idx}",
-                        total_layers=total_layers,
-                    )
+            for layer_name, k_tensor in zip(layer_names, k_pool, strict=True):
+                self._register_single_layer(
+                    tensor=k_tensor,
+                    layer_name=layer_name,
+                    num_layers=num_layers,
                 )
-        else:
-            for idx, (k_tensor, v_tensor) in enumerate(zip(k_pool, v_pool, strict=False)):
-                layer_names.extend(
-                    [
-                        self._register_single_layer(
-                            tensor=k_tensor,
-                            layer_name=f"layer{idx}_k",
-                            total_layers=total_layers,
-                        ),
-                        self._register_single_layer(
-                            tensor=v_tensor,
-                            layer_name=f"layer{idx}_v",
-                            total_layers=total_layers,
-                        ),
-                    ]
-                )
+                registered_layer_names.append(layer_name)
 
-        self._layer_names = layer_names
+        else:
+            for layer_name, (k_tensor, v_tensor) in zip(
+                layer_names, zip(k_pool, v_pool, strict=True), strict=True
+            ):
+                k_name = f"{layer_name}_k"
+                v_name = f"{layer_name}_v"
+                self._register_single_layer(
+                    tensor=k_tensor,
+                    layer_name=k_name,
+                    num_layers=num_layers,
+                )
+                self._register_single_layer(
+                    tensor=v_tensor,
+                    layer_name=v_name,
+                    num_layers=num_layers,
+                )
+                registered_layer_names.append(k_name)
+                registered_layer_names.append(v_name)
+
+        self._layer_names = registered_layer_names
 
     def _register_single_layer(
         self,
         tensor: torch.Tensor,
         layer_name: str,
-        total_layers: int,
+        num_layers: int,
     ) -> str:
         wrapper = CudaIPCWrapper(tensor)
         wrapper_bytes = pickle.dumps(wrapper)
@@ -278,7 +286,7 @@ class PeagflowRadixCache(RadixCache):
             1 if self.is_mla else self.tp_size,
             self.world_size,
             self.device_id,
-            total_layers,
+            num_layers,
             layer_name,
             wrapper_bytes,
             num_blocks,
@@ -392,6 +400,7 @@ class PeagflowRadixCache(RadixCache):
         # Query availability before issuing load
         try:
             query_res = self.engine_client.query(self.instance_id, block_hashes)
+            logger.debug(f"[PeagflowRadixCache] query hash: {block_hashes[0]}")
             hit_blocks = query_res.get("hit_blocks", 0) if isinstance(query_res, dict) else 0
         except Exception as e:
             logger.warning(f"[PeagflowRadixCache] query failed: {e}")
@@ -488,7 +497,15 @@ class PeagflowRadixCache(RadixCache):
         # Ensure GPU writes are done before save
         torch.cuda.synchronize()
 
-        saves = [(layer, block_ids, block_hashes) for layer in self._layer_names]
+        saves = list(
+            zip(
+                self._layer_names,
+                [block_ids] * len(self._layer_names),
+                [block_hashes] * len(self._layer_names),
+                strict=True,
+            )
+        )
+        logger.debug(f"[PeagflowRadixCache] save hashes: {block_hashes[0]}")
 
         logger.debug(
             f"[PeagflowRadixCache] save req={getattr(req, 'request_id', None)} blocks={len(block_ids)} layers={len(saves)}"
