@@ -512,8 +512,6 @@ class PeagflowRadixCache(RadixCache):
         )
 
         try:
-            if self.tp_rank != 0:
-                return
             ok, message = self.engine_client.save(
                 self.instance_id,
                 0 if self.is_mla else self.tp_rank,
