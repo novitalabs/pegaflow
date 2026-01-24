@@ -21,6 +21,19 @@ env:
   RUSTC_WRAPPER: sccache
 
 jobs:
+  commit-check:
+    name: commit message check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install commitizen
+        run: pip install commitizen
+      - name: Check last commit message
+        run: cz check --rev-range HEAD~1..HEAD
+
   typos-check:
     name: typos check
     runs-on: ubuntu-latest

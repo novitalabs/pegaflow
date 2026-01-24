@@ -94,3 +94,9 @@ python_version = "3.10"
 warn_return_any = true
 warn_unused_ignores = true
 ignore_missing_imports = true
+
+[tool.commitizen]
+name = "cz_conventional_commits"
+version = "0.0.9"
+version_files = ["pyproject.toml:^version"]
+tag_format = "v$version"

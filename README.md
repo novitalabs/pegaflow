@@ -113,7 +113,7 @@ RUST_LOG=debug cargo run -r
 RUST_LOG=info,pegaflow_core=debug cargo run -r  # Debug core only
 ```
 
-### 3. Build Python Bindings
+### Build Python Bindings
 
 ```bash
 cd python
@@ -126,6 +126,25 @@ To build a wheel for the Python bindings (for distribution or local use):
 ```bash
 cd python
 maturin build --release
+```
+### Git commit message format
+
+We use [Commitizen](https://commitizen-tools.github.io/commitizen/) for conventional commit messages.
+You can use the `cz c` command to create properly formatted commits via an interactive prompt:
+
+```bash
+cz c
+```
+
+This will guide you through writing a commit message that follows the [Conventional Commits](https://www.conventionalcommits.org/) specification, making the commit history clean and consistent.
+
+
+### Bump version with cz
+
+```bash
+pip install commitizen
+
+cd python && cz bump --increment PATCH
 ```
 
 ## Benchmarks

@@ -29,3 +29,10 @@ repos:
     rev: v1.28.4
     hooks:
       - id: typos
+
+  # Commit message check
+  - repo: https://github.com/commitizen-tools/commitizen
+    rev: v4.12.1
+    hooks:
+      - id: commitizen
+        stages: [commit-msg]
