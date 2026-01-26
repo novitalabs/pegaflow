@@ -19,7 +19,8 @@ pub use block::{
 pub use pinned_pool::PinnedAllocation;
 pub use seal_offload::SlotMeta;
 pub use ssd_cache::{
-    SsdCacheConfig, DEFAULT_SSD_PREFETCH_QUEUE_DEPTH, DEFAULT_SSD_WRITE_QUEUE_DEPTH,
+    SsdCacheConfig, DEFAULT_SSD_PREFETCH_INFLIGHT, DEFAULT_SSD_PREFETCH_QUEUE_DEPTH,
+    DEFAULT_SSD_WRITE_INFLIGHT, DEFAULT_SSD_WRITE_QUEUE_DEPTH,
 };
 pub use storage::{SealNotification, StorageConfig};
 pub use sync_state::{LoadState, LoadStateError};

@@ -17,6 +17,12 @@ pub const DEFAULT_SSD_WRITE_QUEUE_DEPTH: usize = 8;
 /// Default prefetch queue depth (limits read tail latency)
 pub const DEFAULT_SSD_PREFETCH_QUEUE_DEPTH: usize = 2;
 
+/// Default max concurrent writes (not critical path, keep low)
+pub const DEFAULT_SSD_WRITE_INFLIGHT: usize = 2;
+
+/// Default max concurrent prefetches
+pub const DEFAULT_SSD_PREFETCH_INFLIGHT: usize = 16;
+
 /// Result of a single prefetch operation: (key, begin_offset, block, duration_secs, block_size)
 type PrefetchResult = (BlockKey, u64, Option<Arc<SealedBlock>>, f64, u64);
 
@@ -35,6 +41,10 @@ pub struct SsdCacheConfig {
     pub write_queue_depth: usize,
     /// Max pending prefetch batches (limits read tail latency).
     pub prefetch_queue_depth: usize,
+    /// Max concurrent block writes (not critical path, keep low).
+    pub write_inflight: usize,
+    /// Max concurrent block prefetches.
+    pub prefetch_inflight: usize,
 }
 
 impl Default for SsdCacheConfig {
@@ -44,6 +54,8 @@ impl Default for SsdCacheConfig {
             capacity_bytes: 512 * 1024 * 1024 * 1024, // 512GB
             write_queue_depth: DEFAULT_SSD_WRITE_QUEUE_DEPTH,
             prefetch_queue_depth: DEFAULT_SSD_PREFETCH_QUEUE_DEPTH,
+            write_inflight: DEFAULT_SSD_WRITE_INFLIGHT,
+            prefetch_inflight: DEFAULT_SSD_PREFETCH_INFLIGHT,
         }
     }
 }
@@ -70,25 +82,23 @@ pub struct SsdWriteBatch {
     pub blocks: Vec<(BlockKey, Weak<SealedBlock>)>,
 }
 
-/// Pre-allocated slice from a contiguous allocation (for batched prefetch)
-pub struct PreallocatedSlice {
-    /// Parent allocation (shared via Arc)
-    pub allocation: Arc<PinnedAllocation>,
-    /// Offset within the parent allocation
-    pub offset: usize,
-}
-
-/// Request to prefetch a block from SSD
+/// Request to prefetch a block from SSD (metadata only, allocation done in worker)
 pub struct PrefetchRequest {
     pub key: BlockKey,
     pub entry: SsdIndexEntry,
-    /// Pre-allocated contiguous slice for this block
-    pub preallocated: PreallocatedSlice,
 }
 
 /// Batch of prefetch requests (sent as a unit to limit queue depth)
 pub struct PrefetchBatch {
     pub requests: Vec<PrefetchRequest>,
+}
+
+/// Internal: single block prefetch task with allocated memory
+struct PrefetchTask {
+    key: BlockKey,
+    entry: SsdIndexEntry,
+    allocation: Arc<PinnedAllocation>,
+    alloc_offset: usize,
 }
 
 // ============================================================================
@@ -102,6 +112,8 @@ pub struct SsdStorageHandle {
     complete_prefetch: Arc<dyn Fn(BlockKey, Option<Arc<SealedBlock>>) + Send + Sync>,
     /// Check if a logical offset is still valid (not yet overwritten)
     is_offset_valid: Arc<dyn Fn(u64) -> bool + Send + Sync>,
+    /// Allocate pinned memory for prefetch
+    allocate: Arc<dyn Fn(u64) -> Option<Arc<PinnedAllocation>> + Send + Sync>,
 }
 
 impl SsdStorageHandle {
@@ -110,12 +122,14 @@ impl SsdStorageHandle {
         publish_write: impl Fn(BlockKey, SsdIndexEntry, u64) + Send + Sync + 'static,
         complete_prefetch: impl Fn(BlockKey, Option<Arc<SealedBlock>>) + Send + Sync + 'static,
         is_offset_valid: impl Fn(u64) -> bool + Send + Sync + 'static,
+        allocate: impl Fn(u64) -> Option<Arc<PinnedAllocation>> + Send + Sync + 'static,
     ) -> Self {
         Self {
             prune_tail: Arc::new(prune_tail),
             publish_write: Arc::new(publish_write),
             complete_prefetch: Arc::new(complete_prefetch),
             is_offset_valid: Arc::new(is_offset_valid),
+            allocate: Arc::new(allocate),
         }
     }
 
@@ -137,6 +151,11 @@ impl SsdStorageHandle {
     #[inline]
     pub fn is_offset_valid(&self, begin: u64) -> bool {
         (self.is_offset_valid)(begin)
+    }
+
+    #[inline]
+    pub fn allocate(&self, size: u64) -> Option<Arc<PinnedAllocation>> {
+        (self.allocate)(size)
     }
 }
 
@@ -220,10 +239,12 @@ pub async fn ssd_writer_loop(
     mut rx: tokio::sync::mpsc::Receiver<SsdWriteBatch>,
     io: Arc<UringIoEngine>,
     capacity: u64,
+    write_inflight: usize,
 ) {
     let mut ring = RingAllocator::new(capacity);
     let mut seen: HashSet<BlockKey> = HashSet::new();
     let metrics = core_metrics();
+    let write_inflight = write_inflight.max(1);
 
     while let Some(batch) = rx.recv().await {
         // Dequeue: decrement pending count immediately
@@ -244,11 +265,11 @@ pub async fn ssd_writer_loop(
         // Phase 2: Prune tail for the entire batch
         handle.prune_tail(prepared.end().saturating_sub(capacity));
 
-        // Phase 3: Parallel IO
+        // Phase 3: Parallel IO (limited by write_inflight)
         let write_start = Instant::now();
         let mut total_bytes_written: u64 = 0;
 
-        for chunk in prepared.writes.chunks(prepared.writes.len()) {
+        for chunk in prepared.writes.chunks(write_inflight) {
             let futures: FuturesUnordered<_> = chunk
                 .iter()
                 .map(|w| {
@@ -406,78 +427,173 @@ async fn write_block_to_ssd(
 }
 
 // ============================================================================
-// SSD Prefetch Loop
+// SSD Prefetch Pipeline (Dispatcher + Worker)
 // ============================================================================
 
-/// SSD prefetch worker: receives batches of prefetch requests and loads blocks from SSD.
-/// Processes all requests in a batch concurrently, then waits for completion before next batch.
+/// SSD prefetch entry point. Spawns dispatcher + worker pipeline internally.
 pub async fn ssd_prefetch_loop(
     handle: Arc<SsdStorageHandle>,
-    mut rx: tokio::sync::mpsc::Receiver<PrefetchBatch>,
+    rx: tokio::sync::mpsc::Receiver<PrefetchBatch>,
     io: Arc<UringIoEngine>,
     capacity: u64,
+    prefetch_inflight: usize,
 ) {
-    let metrics = core_metrics();
+    let prefetch_inflight = prefetch_inflight.max(1);
 
-    while let Some(batch) = rx.recv().await {
+    // Bounded channel: capacity = max inflight tasks
+    let (task_tx, task_rx) = tokio::sync::mpsc::channel(prefetch_inflight);
+
+    // Spawn dispatcher and worker
+    let dispatcher = tokio::spawn(ssd_prefetch_dispatcher(handle.clone(), rx, task_tx));
+    let worker = tokio::spawn(ssd_prefetch_worker(
+        handle,
+        task_rx,
+        io,
+        capacity,
+        prefetch_inflight,
+    ));
+
+    // Wait for both to complete
+    let _ = dispatcher.await;
+    let _ = worker.await;
+
+    debug!("SSD prefetch pipeline exiting");
+}
+
+/// Dispatcher: receives batches, allocates memory, splits into block-level tasks.
+async fn ssd_prefetch_dispatcher(
+    handle: Arc<SsdStorageHandle>,
+    mut batch_rx: tokio::sync::mpsc::Receiver<PrefetchBatch>,
+    task_tx: tokio::sync::mpsc::Sender<PrefetchTask>,
+) {
+    while let Some(batch) = batch_rx.recv().await {
         if batch.requests.is_empty() {
             continue;
         }
 
-        let batch_start = Instant::now();
-        let batch_bytes: u64 = batch.requests.iter().map(|r| r.entry.len).sum();
+        // Batch-level allocation (preserves memory contiguity for GPU transfers)
+        let total_size: u64 = batch.requests.iter().map(|r| r.entry.len).sum();
+        let allocation = match handle.allocate(total_size) {
+            Some(alloc) => alloc,
+            None => {
+                warn!(
+                    "SSD prefetch dispatcher: alloc failed for {} bytes ({} blocks)",
+                    total_size,
+                    batch.requests.len()
+                );
+                for req in batch.requests {
+                    handle.complete_prefetch(req.key, None);
+                }
+                continue;
+            }
+        };
 
-        // Process all requests in the batch concurrently
-        let futures: FuturesUnordered<_> = batch
-            .requests
-            .into_iter()
-            .map(|req| {
-                let io = Arc::clone(&io);
-                metrics.ssd_prefetch_inflight.add(1, &[]);
-                execute_prefetch(req, io, capacity)
-            })
-            .collect();
+        // Split into block-level tasks
+        let mut offset: usize = 0;
+        for req in batch.requests {
+            let alloc_offset = offset;
+            offset += req.entry.len as usize;
 
-        let results: Vec<PrefetchResult> = futures.collect().await;
-
-        // Complete all prefetches
-        for (key, begin, result, duration_secs, _block_size) in results {
-            metrics.ssd_prefetch_inflight.add(-1, &[]);
-            metrics
-                .ssd_prefetch_duration_seconds
-                .record(duration_secs, &[]);
-
-            // Validate data wasn't overwritten during read
-            let result = if result.is_some() && !handle.is_offset_valid(begin) {
-                warn!("SSD prefetch: data overwritten during read, discarding");
-                metrics.ssd_prefetch_failures.add(1, &[]);
-                None
-            } else if result.is_some() {
-                metrics.ssd_prefetch_success.add(1, &[]);
-                result
-            } else {
-                metrics.ssd_prefetch_failures.add(1, &[]);
-                None
+            let task = PrefetchTask {
+                key: req.key,
+                entry: req.entry,
+                allocation: allocation.clone(),
+                alloc_offset,
             };
-            handle.complete_prefetch(key, result);
-        }
 
-        // Record batch throughput in bytes/s
-        let duration_secs = batch_start.elapsed().as_secs_f64();
-        if duration_secs > 0.0 && batch_bytes > 0 {
-            let throughput_bytes_per_second = (batch_bytes as f64) / duration_secs;
-            metrics
-                .ssd_prefetch_throughput_bytes_per_second
-                .record(throughput_bytes_per_second, &[]);
+            // Bounded send: blocks when channel full (natural backpressure)
+            if task_tx.send(task).await.is_err() {
+                debug!("SSD prefetch dispatcher: worker channel closed");
+                return;
+            }
         }
+    }
+
+    debug!("SSD prefetch dispatcher exiting");
+}
+
+/// Worker: maintains FuturesUnordered with max_inflight concurrent I/O operations.
+async fn ssd_prefetch_worker(
+    handle: Arc<SsdStorageHandle>,
+    mut task_rx: tokio::sync::mpsc::Receiver<PrefetchTask>,
+    io: Arc<UringIoEngine>,
+    capacity: u64,
+    max_inflight: usize,
+) {
+    use std::future::Future;
+    use std::pin::Pin;
+
+    type PrefetchFuture = Pin<Box<dyn Future<Output = PrefetchResult> + Send>>;
+
+    let metrics = core_metrics();
+    let mut inflight: FuturesUnordered<PrefetchFuture> = FuturesUnordered::new();
+
+    loop {
+        tokio::select! {
+            biased;
+
+            // Complete finished tasks first (priority)
+            Some((key, begin, result, duration_secs, _)) = inflight.next(), if !inflight.is_empty() => {
+                metrics.ssd_prefetch_inflight.add(-1, &[]);
+                metrics.ssd_prefetch_duration_seconds.record(duration_secs, &[]);
+
+                // Validate data wasn't overwritten during read
+                let result = if result.is_some() && !handle.is_offset_valid(begin) {
+                    warn!("SSD prefetch: data overwritten during read, discarding");
+                    metrics.ssd_prefetch_failures.add(1, &[]);
+                    None
+                } else if result.is_some() {
+                    metrics.ssd_prefetch_success.add(1, &[]);
+                    result
+                } else {
+                    metrics.ssd_prefetch_failures.add(1, &[]);
+                    None
+                };
+                handle.complete_prefetch(key, result);
+            }
+
+            // Accept new task if below limit
+            task = task_rx.recv(), if inflight.len() < max_inflight => {
+                match task {
+                    Some(t) => {
+                        metrics.ssd_prefetch_inflight.add(1, &[]);
+                        inflight.push(Box::pin(execute_prefetch(t, io.clone(), capacity)));
+                    }
+                    None => {
+                        // Channel closed, drain remaining
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Drain remaining inflight tasks
+    while let Some((key, begin, result, duration_secs, _)) = inflight.next().await {
+        metrics.ssd_prefetch_inflight.add(-1, &[]);
+        metrics
+            .ssd_prefetch_duration_seconds
+            .record(duration_secs, &[]);
+
+        let result = if result.is_some() && !handle.is_offset_valid(begin) {
+            metrics.ssd_prefetch_failures.add(1, &[]);
+            None
+        } else if result.is_some() {
+            metrics.ssd_prefetch_success.add(1, &[]);
+            result
+        } else {
+            metrics.ssd_prefetch_failures.add(1, &[]);
+            None
+        };
+        handle.complete_prefetch(key, result);
     }
 
     debug!("SSD prefetch worker exiting");
 }
 
-/// Execute a single prefetch operation (async, does not block).
+/// Execute a single prefetch operation.
 async fn execute_prefetch(
-    req: PrefetchRequest,
+    task: PrefetchTask,
     io: Arc<UringIoEngine>,
     capacity: u64,
 ) -> PrefetchResult {
@@ -485,9 +601,9 @@ async fn execute_prefetch(
     let duration_secs = || start.elapsed().as_secs_f64();
     let fail = |key, begin, size| (key, begin, None, duration_secs(), size);
 
-    let key = req.key;
-    let begin = req.entry.begin;
-    let block_size = req.entry.len;
+    let key = task.key;
+    let begin = task.entry.begin;
+    let block_size = task.entry.len;
 
     // Calculate physical offset in SSD file
     let phys_offset = begin % capacity;
@@ -498,14 +614,14 @@ async fn execute_prefetch(
 
     // Build iovecs from slot metadata
     let read_result = {
-        let base_ptr = req.preallocated.allocation.as_ptr() as *mut u8;
-        let mut current_offset = req.preallocated.offset;
-        let iovecs: Vec<_> = req
+        let base_ptr = task.allocation.as_ptr() as *mut u8;
+        let mut current_offset = task.alloc_offset;
+        let iovecs: Vec<_> = task
             .entry
             .slots
             .iter()
             .flat_map(|meta| {
-                // SAFETY: preallocated slice is sized to fit all slots
+                // SAFETY: allocation is sized to fit all slots
                 let iov = unsafe { meta.read_iovecs(base_ptr, current_offset) };
                 current_offset += meta.size as usize;
                 iov
@@ -516,14 +632,14 @@ async fn execute_prefetch(
     };
 
     // Await IO result and rebuild block
-    let expected_len = req.entry.len as usize;
+    let expected_len = task.entry.len as usize;
     match read_result {
         Ok(rx) => match rx.await {
             Ok(Ok(bytes_read)) if bytes_read == expected_len => {
                 match rebuild_sealed_block_at_offset(
-                    req.preallocated.allocation,
-                    req.preallocated.offset,
-                    &req.entry.slots,
+                    task.allocation,
+                    task.alloc_offset,
+                    &task.entry.slots,
                 ) {
                     Ok(sealed) => (
                         key,

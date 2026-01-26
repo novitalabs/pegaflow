@@ -46,6 +46,7 @@ pub(crate) struct CoreMetrics {
     pub ssd_prefetch_success: Counter<u64>,
     pub ssd_prefetch_failures: Counter<u64>,
     pub ssd_prefetch_duration_seconds: Histogram<f64>,
+    #[allow(dead_code)] // TODO: re-enable when adding per-batch throughput tracking
     pub ssd_prefetch_throughput_bytes_per_second: Histogram<f64>,
     pub ssd_prefetch_inflight: UpDownCounter<i64>,
     pub ssd_prefetch_queue_full: Counter<u64>,

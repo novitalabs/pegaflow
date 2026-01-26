@@ -26,8 +26,8 @@ use crate::cache::{CacheInsertOutcome, TinyLfuCache};
 use crate::metrics::core_metrics;
 use crate::pinned_pool::{PinnedAllocation, PinnedMemoryPool};
 use crate::ssd_cache::{
-    ssd_prefetch_loop, ssd_writer_loop, PreallocatedSlice, PrefetchBatch, PrefetchRequest,
-    SsdCacheConfig, SsdIndexEntry, SsdStorageHandle, SsdWriteBatch,
+    ssd_prefetch_loop, ssd_writer_loop, PrefetchBatch, PrefetchRequest, SsdCacheConfig,
+    SsdIndexEntry, SsdStorageHandle, SsdWriteBatch,
 };
 
 // ============================================================================
@@ -39,6 +39,10 @@ const RECLAIM_BATCH_SIZE: usize = 64;
 
 /// SSD I/O alignment requirement (O_DIRECT requires 512-byte aligned I/O)
 pub const SSD_ALIGNMENT: usize = 512;
+
+/// Max blocks allowed in prefetching state (backpressure for SSD prefetch)
+/// ~15GB assuming 10MB per block
+const MAX_PREFETCH_BLOCKS: usize = 1500;
 
 // ============================================================================
 // Metrics helpers (keep insert/evict logic together for easy audit)
@@ -306,12 +310,21 @@ impl StorageEngine {
         let ssd_state = engine.ssd_state.as_ref().expect("ssd_state must exist");
         let io = Arc::clone(&ssd_state.io);
         let capacity = ssd_state.config.capacity_bytes;
+        let write_inflight = ssd_state.config.write_inflight;
+        let prefetch_inflight = ssd_state.config.prefetch_inflight;
 
         // Spawn writer task
         let writer_handle = Arc::clone(&handle);
         let writer_io = Arc::clone(&io);
         tokio::spawn(async move {
-            ssd_writer_loop(writer_handle, writer_rx, writer_io, capacity).await;
+            ssd_writer_loop(
+                writer_handle,
+                writer_rx,
+                writer_io,
+                capacity,
+                write_inflight,
+            )
+            .await;
         });
 
         // Spawn prefetch task
@@ -319,7 +332,14 @@ impl StorageEngine {
         let prefetch_io = Arc::clone(&ssd_state.io);
         let prefetch_capacity = capacity;
         tokio::spawn(async move {
-            ssd_prefetch_loop(prefetch_handle, prefetch_rx, prefetch_io, prefetch_capacity).await;
+            ssd_prefetch_loop(
+                prefetch_handle,
+                prefetch_rx,
+                prefetch_io,
+                prefetch_capacity,
+                prefetch_inflight,
+            )
+            .await;
         });
 
         debug!("SSD workers spawned");
@@ -334,6 +354,7 @@ impl StorageEngine {
         let weak_publish = Weak::clone(&weak);
         let weak_complete = Weak::clone(&weak);
         let weak_valid = Weak::clone(&weak);
+        let weak_alloc = Weak::clone(&weak);
 
         Some(Arc::new(SsdStorageHandle::new(
             move |new_tail| {
@@ -356,6 +377,11 @@ impl StorageEngine {
                     .upgrade()
                     .map(|engine| engine.is_ssd_offset_valid(begin))
                     .unwrap_or(false)
+            },
+            move |size| {
+                weak_alloc
+                    .upgrade()
+                    .and_then(|engine| engine.allocate(NonZeroU64::new(size)?))
             },
         )))
     }
@@ -820,6 +846,12 @@ impl StorageEngine {
                     continue;
                 }
 
+                // Backpressure: stop scheduling if too many blocks are prefetching
+                if inner.prefetching.len() >= MAX_PREFETCH_BLOCKS {
+                    loading += hashes.len() - hit - loading;
+                    break;
+                }
+
                 // Check SSD index
                 if let Some(entry) = inner.ssd_index.get(&key) {
                     if inner.ssd_tail <= entry.begin {
@@ -879,8 +911,7 @@ impl StorageEngine {
     }
 
     /// Mark blocks as prefetching and send batch to prefetch worker.
-    /// Pre-allocates a contiguous memory region for all blocks to ensure
-    /// CPU memory locality for subsequent GPU transfers.
+    /// Memory allocation is handled by the prefetch dispatcher for better pipelining.
     /// If prefetch queue is full, drops the request (treats as cache miss).
     fn trigger_prefetch(&self, keys: Vec<BlockKey>) {
         let ssd_state = match &self.ssd_state {
@@ -888,9 +919,8 @@ impl StorageEngine {
             None => return,
         };
 
-        // Collect valid entries and calculate total size
+        // Collect valid entries
         let mut valid_requests: Vec<(BlockKey, SsdIndexEntry)> = Vec::with_capacity(keys.len());
-        let mut total_size: u64 = 0;
 
         {
             let mut inner = self.inner.lock().unwrap();
@@ -912,7 +942,6 @@ impl StorageEngine {
                     continue;
                 }
 
-                total_size = total_size.saturating_add(entry.len);
                 valid_requests.push((key, entry));
             }
 
@@ -926,44 +955,12 @@ impl StorageEngine {
             return;
         }
 
-        // Allocate contiguous memory for all blocks
-        let Some(alloc_size) = NonZeroU64::new(total_size) else {
-            warn!("SSD prefetch: total size is zero");
-            return;
-        };
-
-        let Some(allocation) = self.allocate(alloc_size) else {
-            warn!(
-                "SSD prefetch: failed to allocate {} for {} blocks",
-                ByteSize(total_size),
-                valid_requests.len()
-            );
-            // Remove from prefetching set on failure
-            let mut inner = self.inner.lock().unwrap();
-            for (key, _) in &valid_requests {
-                inner.prefetching.remove(key);
-            }
-            return;
-        };
-
-        // Build batch with pre-allocated slices
-        let mut requests = Vec::with_capacity(valid_requests.len());
-        let mut offset: usize = 0;
+        // Build batch (memory allocation moved to prefetch dispatcher)
         let keys_for_cleanup: Vec<_> = valid_requests.iter().map(|(k, _)| k.clone()).collect();
-
-        for (key, entry) in valid_requests {
-            let slice = PreallocatedSlice {
-                allocation: Arc::clone(&allocation),
-                offset,
-            };
-            offset += entry.len as usize;
-
-            requests.push(PrefetchRequest {
-                key,
-                entry,
-                preallocated: slice,
-            });
-        }
+        let requests: Vec<_> = valid_requests
+            .into_iter()
+            .map(|(key, entry)| PrefetchRequest { key, entry })
+            .collect();
 
         // Send batch (non-blocking, drop if queue full)
         let batch = PrefetchBatch { requests };

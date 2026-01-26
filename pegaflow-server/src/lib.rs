@@ -99,6 +99,14 @@ pub struct Cli {
     /// SSD prefetch queue depth (max pending prefetch batches). Default: 2
     #[arg(long, default_value_t = pegaflow_core::DEFAULT_SSD_PREFETCH_QUEUE_DEPTH)]
     pub ssd_prefetch_queue_depth: usize,
+
+    /// SSD write inflight (max concurrent block writes). Default: 2
+    #[arg(long, default_value_t = pegaflow_core::DEFAULT_SSD_WRITE_INFLIGHT)]
+    pub ssd_write_inflight: usize,
+
+    /// SSD prefetch inflight (max concurrent block reads). Default: 16
+    #[arg(long, default_value_t = pegaflow_core::DEFAULT_SSD_PREFETCH_INFLIGHT)]
+    pub ssd_prefetch_inflight: usize,
 }
 
 fn format_py_err(err: PyErr) -> String {
@@ -234,17 +242,21 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
     let ssd_cache_config = cli.ssd_cache_path.as_ref().map(|path| {
         info!(
-            "SSD cache enabled: path={}, capacity={:.2} GiB, write_queue={}, prefetch_queue={}",
+            "SSD cache enabled: path={}, capacity={:.2} GiB, write_queue={}, prefetch_queue={}, write_inflight={}, prefetch_inflight={}",
             path,
             cli.ssd_cache_capacity as f64 / (1024.0 * 1024.0 * 1024.0),
             cli.ssd_write_queue_depth,
             cli.ssd_prefetch_queue_depth,
+            cli.ssd_write_inflight,
+            cli.ssd_prefetch_inflight,
         );
         pegaflow_core::SsdCacheConfig {
             cache_path: path.into(),
             capacity_bytes: cli.ssd_cache_capacity as u64,
             write_queue_depth: cli.ssd_write_queue_depth,
             prefetch_queue_depth: cli.ssd_prefetch_queue_depth,
+            write_inflight: cli.ssd_write_inflight,
+            prefetch_inflight: cli.ssd_prefetch_inflight,
         }
     });
 
