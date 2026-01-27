@@ -157,8 +157,9 @@ class PeagflowRadixCache(RadixCache):
 
         self.save_tasks = queue.Queue()
         self._evict_lock = threading.Lock()  # Held during evict to block new saves
+        self._shutdown = threading.Event()
         self.save_thread = threading.Thread(
-            target=self._save_worker, daemon=False, name="PegaSaveWorker"
+            target=self._save_worker, daemon=True, name="PegaSaveWorker"
         )
         self.save_thread.start()
 
@@ -595,10 +596,13 @@ class PeagflowRadixCache(RadixCache):
             self.save_tasks.put(saves)
 
     def _save_worker(self):
-        while True:
+        while not self._shutdown.is_set():
             try:
-                # Get first item
-                saves = self.save_tasks.get()
+                # Get first item with timeout to check shutdown flag
+                try:
+                    saves = self.save_tasks.get(timeout=0.1)
+                except queue.Empty:
+                    continue
                 task_count = 1
 
                 # Drain all pending items from queue
@@ -628,25 +632,37 @@ class PeagflowRadixCache(RadixCache):
             except Exception as e:
                 logger.warning("[PeagflowRadixCache] save worker exception: %s", e)
 
+    def join_save_task(self) -> None:
+        """
+        Wait for all pending save tasks to complete.
+        same as Queue.join()
+        """
+        start = time.monotonic()
+        warned = False
+        while True:
+            with self.save_tasks.all_tasks_done:
+                if self.save_tasks.unfinished_tasks == 0:
+                    break
+                self.save_tasks.all_tasks_done.wait(timeout=0.1)
+            if not warned and (time.monotonic() - start) > 2:
+                logger.warning(
+                    "[PeagflowRadixCache] waiting >2s for save tasks to finish",
+                )
+                warned = True
+
     def evict(self, num_tokens: int) -> None:  # type: ignore[override]
         if self.disable:
             return
         with self._evict_lock:
-            start = time.monotonic()
-            warned = False
-            while True:
-                with self.save_tasks.all_tasks_done:
-                    if self.save_tasks.unfinished_tasks == 0:
-                        break
-                    self.save_tasks.all_tasks_done.wait(timeout=0.1)
-                if not warned and (time.monotonic() - start) > 2:
-                    logger.warning(
-                        "[PeagflowRadixCache] evict waiting >2s for save tasks to finish",
-                    )
-                    warned = True
+            self.join_save_task()
             super().evict(num_tokens)
 
-    def unregister_context(self) -> None:
+    def shutdown(self) -> None:
+        """Gracefully shutdown the save worker and unregister context."""
+        self.join_save_task()
+        self._shutdown.set()
+        if self.save_thread.is_alive():
+            self.save_thread.join(timeout=2.0)
         PeagflowRadixCache._unregister_context(self.instance_id, self.engine_client, self.tp_rank)
 
 
