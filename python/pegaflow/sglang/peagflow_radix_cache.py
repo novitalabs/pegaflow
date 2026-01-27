@@ -200,13 +200,9 @@ class PeagflowRadixCache(RadixCache):
         return resolved_id
 
     def _sync_hit_blocks(self, hit_blocks: int) -> int:
-        """Sync hit_blocks across TP and PP ranks using AllReduce MIN.
+        """Sync hit_blocks across TP ranks using AllReduce MIN.
 
         Different TP ranks may have different cache hits due to timing.
-        Different PP stages have their own PegaFlow servers with different blocks.
-        We take the minimum hit_blocks across all ranks to ensure consistency.
-
-        Sync order: TP first, then PP.
         """
         original_hit_blocks = hit_blocks
 
@@ -218,13 +214,6 @@ class PeagflowRadixCache(RadixCache):
             )
             hit_blocks = int(hit_tensor.item())
 
-        # Step 2: PP AllReduce MIN (across PP stages)
-        if self.pp_size > 1 and self._pp_group is not None:
-            hit_tensor = torch.tensor([hit_blocks], dtype=torch.int64, device="cpu")
-            torch.distributed.all_reduce(
-                hit_tensor, op=torch.distributed.ReduceOp.MIN, group=self._pp_group.cpu_group
-            )
-            hit_blocks = int(hit_tensor.item())
         if hit_blocks != original_hit_blocks:
             logger.debug(
                 f"[PeagflowRadixCache] AllReduce MIN: local={original_hit_blocks} -> min={hit_blocks} "
