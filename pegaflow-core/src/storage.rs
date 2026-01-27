@@ -98,6 +98,9 @@ pub struct StorageConfig {
     pub enable_lfu_admission: bool,
     /// Optional hint for expected value size in bytes (tunes cache + allocator granularity)
     pub hint_value_size_bytes: Option<usize>,
+    /// Max blocks allowed in prefetching state (backpressure for SSD prefetch).
+    /// ~15GB assuming 10MB per block.
+    pub max_prefetch_blocks: usize,
     /// Optional SSD cache for sealed blocks (single-node, FIFO).
     pub ssd_cache_config: Option<SsdCacheConfig>,
 }
@@ -107,6 +110,7 @@ impl Default for StorageConfig {
         Self {
             enable_lfu_admission: true,
             hint_value_size_bytes: None,
+            max_prefetch_blocks: MAX_PREFETCH_BLOCKS,
             ssd_cache_config: None,
         }
     }
@@ -177,6 +181,9 @@ pub struct StorageEngine {
 
     /// SSD cache file handle and io_uring engine (if configured)
     ssd_state: Option<SsdState>,
+
+    /// Max blocks allowed in prefetching state (backpressure for SSD prefetch)
+    max_prefetch_blocks: usize,
 }
 
 impl StorageEngine {
@@ -231,6 +238,7 @@ impl StorageEngine {
             inner,
             seal_notify_tx: Some(seal_notify_tx),
             ssd_state,
+            max_prefetch_blocks: config.max_prefetch_blocks,
         });
 
         // Spawn SSD workers after Arc is created (they need callbacks into storage)
@@ -847,8 +855,8 @@ impl StorageEngine {
                 }
 
                 // Backpressure: stop scheduling if too many blocks are prefetching
-                if inner.prefetching.len() >= MAX_PREFETCH_BLOCKS {
-                    loading += hashes.len() - hit - loading;
+                if inner.prefetching.len() >= self.max_prefetch_blocks {
+                    missing = hashes.len() - hit - loading;
                     break;
                 }
 
