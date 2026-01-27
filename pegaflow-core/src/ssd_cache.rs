@@ -1,4 +1,4 @@
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::stream::{FuturesOrdered, FuturesUnordered, StreamExt};
 use log::{debug, warn};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -100,6 +100,19 @@ struct PrefetchTask {
     allocation: Arc<PinnedAllocation>,
     alloc_offset: usize,
 }
+
+/// Internal: single block write task
+struct WriteTask {
+    key: BlockKey,
+    block: Arc<SealedBlock>,
+    file_offset: u64,
+    slots: Vec<SlotMeta>,
+    entry: SsdIndexEntry,
+    new_head: u64,
+}
+
+/// Result of a single write operation: (key, result, entry, new_head, duration_secs, block_size)
+type WriteResult = (BlockKey, std::io::Result<()>, SsdIndexEntry, u64, f64, u64);
 
 // ============================================================================
 // Storage handle (provided by StorageEngine)
@@ -222,18 +235,13 @@ impl PreparedBatch {
     fn end(&self) -> u64 {
         self.begin + self.total_size
     }
-
-    fn make_entry(&self, w: &PreparedWrite) -> SsdIndexEntry {
-        SsdIndexEntry {
-            begin: self.begin + w.offset_in_batch,
-            end: self.begin + w.offset_in_batch + w.block.memory_footprint(),
-            len: w.block.memory_footprint(),
-            slots: w.slots.clone(),
-        }
-    }
 }
 
 /// SSD writer task: receives batches of sealed blocks and writes them in parallel.
+///
+/// Uses FuturesOrdered to maintain publish order while allowing cross-batch pipelining.
+/// This ensures new_head values are published in monotonically increasing order,
+/// avoiding race conditions where a later batch's writes complete before an earlier batch.
 pub async fn ssd_writer_loop(
     handle: Arc<SsdStorageHandle>,
     mut rx: tokio::sync::mpsc::Receiver<SsdWriteBatch>,
@@ -241,82 +249,125 @@ pub async fn ssd_writer_loop(
     capacity: u64,
     write_inflight: usize,
 ) {
+    use std::collections::VecDeque;
+    use std::future::Future;
+    use std::pin::Pin;
+
+    type WriteFuture = Pin<Box<dyn Future<Output = WriteResult> + Send>>;
+
     let mut ring = RingAllocator::new(capacity);
     let mut seen: HashSet<BlockKey> = HashSet::new();
     let metrics = core_metrics();
-    let write_inflight = write_inflight.max(1);
+    let max_inflight = write_inflight.max(1);
 
-    while let Some(batch) = rx.recv().await {
-        // Dequeue: decrement pending count immediately
-        metrics
-            .ssd_write_queue_pending
-            .add(-(batch.blocks.len() as i64), &[]);
+    let mut pending: VecDeque<WriteTask> = VecDeque::new();
+    let mut inflight: FuturesOrdered<WriteFuture> = FuturesOrdered::new();
 
-        // Phase 1: Prepare - upgrade weak refs with prefix semantics (early break on failure)
-        let prepared = match prepare_batch(&batch, &mut seen, &mut ring, capacity) {
-            Some(p) => p,
-            None => continue,
-        };
+    loop {
+        tokio::select! {
+            biased;
 
-        if prepared.writes.is_empty() {
-            continue;
-        }
-
-        // Phase 2: Prune tail for the entire batch
-        handle.prune_tail(prepared.end().saturating_sub(capacity));
-
-        // Phase 3: Parallel IO (limited by write_inflight)
-        let write_start = Instant::now();
-        let mut total_bytes_written: u64 = 0;
-
-        for chunk in prepared.writes.chunks(write_inflight) {
-            let futures: FuturesUnordered<_> = chunk
-                .iter()
-                .map(|w| {
-                    let io = Arc::clone(&io);
-                    let block = Arc::clone(&w.block);
-                    let offset = prepared.file_offset + w.offset_in_batch;
-                    let slots = w.slots.clone();
-                    async move { write_block_to_ssd(&io, offset, &block, &slots).await }
-                })
-                .collect();
-
-            let results: Vec<_> = futures.collect().await;
-
-            // Phase 4: Publish results
-            for (w, result) in chunk.iter().zip(results) {
-                seen.remove(&w.key);
+            // Priority 1: Complete writes in push order (FuturesOrdered guarantees ordering)
+            Some((key, result, entry, new_head, duration_secs, block_size)) = inflight.next(), if !inflight.is_empty() => {
+                metrics.ssd_write_inflight.add(-1, &[]);
+                seen.remove(&key);
 
                 match result {
                     Ok(()) => {
-                        handle.publish_write(w.key.clone(), prepared.make_entry(w), ring.head());
-                        let block_bytes = w.block.memory_footprint();
-                        metrics.ssd_write_bytes.add(block_bytes, &[]);
-                        total_bytes_written += block_bytes;
+                        handle.publish_write(key, entry, new_head);
+                        metrics.ssd_write_bytes.add(block_size, &[]);
+                        metrics.ssd_write_duration_seconds.record(duration_secs, &[]);
                     }
                     Err(e) => {
-                        warn!("SSD cache write failed for {:?}: {}", w.key, e);
+                        warn!("SSD cache write failed for {:?}: {}", key, e);
                     }
                 }
             }
+
+            // Priority 2: Submit pending writes if inflight has room
+            _ = std::future::ready(()), if inflight.len() < max_inflight && !pending.is_empty() => {
+                let task = pending.pop_front().unwrap();
+                metrics.ssd_write_inflight.add(1, &[]);
+                inflight.push_back(Box::pin(execute_write(task, io.clone())));
+            }
+
+            // Priority 3: Receive new batch (can pipeline with in-flight IO)
+            batch = rx.recv(), if pending.is_empty() => {
+                match batch {
+                    Some(b) => {
+                        // Dequeue: decrement pending count immediately
+                        metrics.ssd_write_queue_pending.add(-(b.blocks.len() as i64), &[]);
+
+                        // Prepare batch
+                        let prepared = match prepare_batch(&b, &mut seen, &mut ring, capacity) {
+                            Some(p) if !p.writes.is_empty() => p,
+                            _ => continue,
+                        };
+
+                        // Prune tail for the entire batch
+                        handle.prune_tail(prepared.end().saturating_sub(capacity));
+
+                        // Convert to WriteTask and add to pending
+                        let new_head = ring.head();
+                        for w in prepared.writes {
+                            let entry = SsdIndexEntry {
+                                begin: prepared.begin + w.offset_in_batch,
+                                end: prepared.begin + w.offset_in_batch + w.block.memory_footprint(),
+                                len: w.block.memory_footprint(),
+                                slots: w.slots.clone(),
+                            };
+                            pending.push_back(WriteTask {
+                                key: w.key,
+                                block: w.block,
+                                file_offset: prepared.file_offset + w.offset_in_batch,
+                                slots: w.slots,
+                                entry,
+                                new_head,
+                            });
+                        }
+                    }
+                    None => break,
+                }
+            }
         }
+    }
 
-        let duration = write_start.elapsed();
-        let duration_secs = duration.as_secs_f64();
-        metrics
-            .ssd_write_duration_seconds
-            .record(duration_secs, &[]);
+    // Drain remaining inflight writes
+    while let Some((key, result, entry, new_head, duration_secs, block_size)) =
+        inflight.next().await
+    {
+        metrics.ssd_write_inflight.add(-1, &[]);
+        seen.remove(&key);
 
-        // Record throughput in bytes/s
-        if duration_secs > 0.0 && total_bytes_written > 0 {
-            let throughput_bytes_per_second = (total_bytes_written as f64) / duration_secs;
-            metrics
-                .ssd_write_throughput_bytes_per_second
-                .record(throughput_bytes_per_second, &[]);
+        match result {
+            Ok(()) => {
+                handle.publish_write(key, entry, new_head);
+                metrics.ssd_write_bytes.add(block_size, &[]);
+                metrics
+                    .ssd_write_duration_seconds
+                    .record(duration_secs, &[]);
+            }
+            Err(e) => {
+                warn!("SSD cache write failed for {:?}: {}", key, e);
+            }
         }
     }
 
     debug!("SSD writer task exiting");
+}
+
+/// Execute a single block write to SSD.
+async fn execute_write(task: WriteTask, io: Arc<UringIoEngine>) -> WriteResult {
+    let start = Instant::now();
+    let key = task.key;
+    let entry = task.entry;
+    let new_head = task.new_head;
+    let block_size = task.block.memory_footprint();
+
+    let result = write_block_to_ssd(&io, task.file_offset, &task.block, &task.slots).await;
+
+    let duration_secs = start.elapsed().as_secs_f64();
+    (key, result, entry, new_head, duration_secs, block_size)
 }
 
 /// Prepare a batch for writing: upgrade weak refs, compute sizes, allocate ring space.

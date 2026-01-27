@@ -39,9 +39,11 @@ pub(crate) struct CoreMetrics {
     // SSD cache
     pub ssd_write_bytes: Counter<u64>,
     pub ssd_write_duration_seconds: Histogram<f64>,
+    #[allow(dead_code)] // TODO: re-enable when adding per-batch throughput tracking
     pub ssd_write_throughput_bytes_per_second: Histogram<f64>,
     pub ssd_write_queue_pending: UpDownCounter<i64>,
     pub ssd_write_queue_full: Counter<u64>,
+    pub ssd_write_inflight: UpDownCounter<i64>,
 
     pub ssd_prefetch_success: Counter<u64>,
     pub ssd_prefetch_failures: Counter<u64>,
@@ -217,6 +219,10 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
             ssd_write_queue_full: meter
                 .u64_counter("pegaflow_ssd_write_queue_full")
                 .with_description("Write requests dropped due to full queue")
+                .build(),
+            ssd_write_inflight: meter
+                .i64_up_down_counter("pegaflow_ssd_write_inflight")
+                .with_description("Current in-flight SSD write operations")
                 .build(),
 
             ssd_prefetch_success: meter
