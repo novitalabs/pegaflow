@@ -193,3 +193,7 @@ See the implementation in [`pegaflow/python/pegaflow/sglang/peagflow_radix_cache
 - `pegaflow-server/src/service.rs`: gRPC service implementation
 - `python/pegaflow/connector/scheduler.py`: vLLM scheduler-side connector
 - `python/pegaflow/connector/worker.py`: vLLM worker-side connector
+
+### Git commit message format
+
+we use commitizen commit message format.

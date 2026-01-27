@@ -148,3 +148,7 @@ cargo test -p pegaflow-server utils::tests::test_parse_memory_size_basic
 - Use `#[pyclass]` and `#[pymethods]` for Python-exposed types.
 - Convert Rust errors to `PyErr` cleanly; avoid panics crossing the FFI.
 - Keep Python-facing APIs thin; delegate core logic to `pegaflow-core`.
+
+### Git commit message format
+
+we use commitizen commit message format.
