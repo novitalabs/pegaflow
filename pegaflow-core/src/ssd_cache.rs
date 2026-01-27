@@ -276,7 +276,8 @@ pub async fn ssd_writer_loop(
                     Ok(()) => {
                         handle.publish_write(key, entry, new_head);
                         metrics.ssd_write_bytes.add(block_size, &[]);
-                        metrics.ssd_write_duration_seconds.record(duration_secs, &[]);
+                        let throughput = block_size as f64 / duration_secs;
+                        metrics.ssd_write_throughput_bytes_per_second.record(throughput, &[]);
                     }
                     Err(e) => {
                         warn!("SSD cache write failed for {:?}: {}", key, e);
@@ -343,9 +344,10 @@ pub async fn ssd_writer_loop(
             Ok(()) => {
                 handle.publish_write(key, entry, new_head);
                 metrics.ssd_write_bytes.add(block_size, &[]);
+                let throughput = block_size as f64 / duration_secs;
                 metrics
-                    .ssd_write_duration_seconds
-                    .record(duration_secs, &[]);
+                    .ssd_write_throughput_bytes_per_second
+                    .record(throughput, &[]);
             }
             Err(e) => {
                 warn!("SSD cache write failed for {:?}: {}", key, e);
@@ -584,9 +586,8 @@ async fn ssd_prefetch_worker(
             biased;
 
             // Complete finished tasks first (priority)
-            Some((key, begin, result, duration_secs, _)) = inflight.next(), if !inflight.is_empty() => {
+            Some((key, begin, result, duration_secs, block_size)) = inflight.next(), if !inflight.is_empty() => {
                 metrics.ssd_prefetch_inflight.add(-1, &[]);
-                metrics.ssd_prefetch_duration_seconds.record(duration_secs, &[]);
 
                 // Validate data wasn't overwritten during read
                 let result = if result.is_some() && !handle.is_offset_valid(begin) {
@@ -595,6 +596,9 @@ async fn ssd_prefetch_worker(
                     None
                 } else if result.is_some() {
                     metrics.ssd_prefetch_success.add(1, &[]);
+                    metrics.ssd_prefetch_bytes.add(block_size, &[]);
+                    let throughput = block_size as f64 / duration_secs;
+                    metrics.ssd_prefetch_throughput_bytes_per_second.record(throughput, &[]);
                     result
                 } else {
                     metrics.ssd_prefetch_failures.add(1, &[]);
@@ -620,17 +624,19 @@ async fn ssd_prefetch_worker(
     }
 
     // Drain remaining inflight tasks
-    while let Some((key, begin, result, duration_secs, _)) = inflight.next().await {
+    while let Some((key, begin, result, duration_secs, block_size)) = inflight.next().await {
         metrics.ssd_prefetch_inflight.add(-1, &[]);
-        metrics
-            .ssd_prefetch_duration_seconds
-            .record(duration_secs, &[]);
 
         let result = if result.is_some() && !handle.is_offset_valid(begin) {
             metrics.ssd_prefetch_failures.add(1, &[]);
             None
         } else if result.is_some() {
             metrics.ssd_prefetch_success.add(1, &[]);
+            metrics.ssd_prefetch_bytes.add(block_size, &[]);
+            let throughput = block_size as f64 / duration_secs;
+            metrics
+                .ssd_prefetch_throughput_bytes_per_second
+                .record(throughput, &[]);
             result
         } else {
             metrics.ssd_prefetch_failures.add(1, &[]);

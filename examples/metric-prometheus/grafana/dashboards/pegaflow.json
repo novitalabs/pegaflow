@@ -567,9 +567,14 @@
           "expr": "rate(pegaflow_ssd_write_bytes_total[1m])",
           "legendFormat": "write",
           "refId": "A"
+        },
+        {
+          "expr": "rate(pegaflow_ssd_prefetch_bytes_total[1m])",
+          "legendFormat": "prefetch",
+          "refId": "B"
         }
       ],
-      "title": "SSD Write Throughput",
+      "title": "SSD Throughput",
       "type": "timeseries"
     },
     {
@@ -689,89 +694,6 @@
     {
       "collapsed": false,
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 62 },
-      "id": 106,
-      "title": "SSD Cache Latency",
-      "type": "row"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": null },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "lineInterpolation": "linear",
-            "lineWidth": 2,
-            "pointSize": 4,
-            "stacking": { "group": "A", "mode": "none" }
-          },
-          "unit": "s"
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 63 },
-      "id": 14,
-      "options": {
-        "legend": { "displayMode": "list", "placement": "bottom" },
-        "tooltip": { "mode": "single" }
-      },
-      "targets": [
-        {
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(pegaflow_ssd_write_duration_seconds_bucket[1m])))",
-          "legendFormat": "write p95",
-          "refId": "A"
-        },
-        {
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(pegaflow_ssd_write_duration_seconds_bucket[1m])))",
-          "legendFormat": "write p99",
-          "refId": "B"
-        }
-      ],
-      "title": "SSD Write Latency",
-      "type": "timeseries"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": null },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "lineInterpolation": "linear",
-            "lineWidth": 2,
-            "pointSize": 4,
-            "stacking": { "group": "A", "mode": "none" }
-          },
-          "unit": "s"
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 63 },
-      "id": 15,
-      "options": {
-        "legend": { "displayMode": "list", "placement": "bottom" },
-        "tooltip": { "mode": "single" }
-      },
-      "targets": [
-        {
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(pegaflow_ssd_prefetch_duration_seconds_bucket[1m])))",
-          "legendFormat": "prefetch p95",
-          "refId": "A"
-        },
-        {
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(pegaflow_ssd_prefetch_duration_seconds_bucket[1m])))",
-          "legendFormat": "prefetch p99",
-          "refId": "B"
-        }
-      ],
-      "title": "SSD Prefetch Latency",
-      "type": "timeseries"
-    },
-    {
-      "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 71 },
       "id": 107,
       "title": "Queue Depth & Backpressure",
       "type": "row"
