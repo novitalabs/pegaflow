@@ -44,9 +44,10 @@ pub struct Cli {
     #[arg(long, default_value = "127.0.0.1:50055")]
     pub addr: SocketAddr,
 
-    /// Default CUDA device to bind for server-managed contexts
-    #[arg(long, default_value_t = 0)]
-    pub device: i32,
+    /// CUDA devices to initialize (comma-separated, e.g., "0,1,2,3").
+    /// If not specified, auto-detects and initializes all available GPUs.
+    #[arg(long, value_delimiter = ',')]
+    pub devices: Vec<i32>,
 
     /// Pinned memory pool size (supports units: kb, mb, gb, tb)
     /// Examples: "10gb", "500mb", "1tb"
@@ -122,12 +123,69 @@ fn init_cuda_driver() -> Result<(), std::io::Error> {
         .map_err(|err| std::io::Error::other(format!("failed to initialize CUDA driver: {err}")))
 }
 
-fn init_python_cuda(device_id: i32) -> Result<(), std::io::Error> {
+fn detect_cuda_devices() -> Result<Vec<i32>, std::io::Error> {
+    Python::attach(|py| -> pyo3::PyResult<Vec<i32>> {
+        let torch = py.import("torch")?;
+        let cuda = torch.getattr("cuda")?;
+        let device_count: i32 = cuda.call_method0("device_count")?.extract()?;
+
+        // Probe each device ID from 0 to device_count-1 to see if it's available
+        let mut available_devices = Vec::new();
+        for device_id in 0..device_count {
+            // Try to get device properties to verify it's accessible
+            match cuda.call_method1("get_device_properties", (device_id,)) {
+                Ok(_) => available_devices.push(device_id),
+                Err(_) => continue, // Skip unavailable devices
+            }
+        }
+        Ok(available_devices)
+    })
+    .map_err(|err| {
+        std::io::Error::other(format!(
+            "failed to detect CUDA devices: {}",
+            format_py_err(err)
+        ))
+    })
+}
+
+fn init_python_cuda(device_ids: &[i32]) -> Result<(), std::io::Error> {
+    if device_ids.is_empty() {
+        return Err(std::io::Error::other("no CUDA devices to initialize"));
+    }
+
     Python::attach(|py| -> pyo3::PyResult<()> {
         let torch = py.import("torch")?;
         let cuda = torch.getattr("cuda")?;
         cuda.call_method0("init")?;
-        cuda.call_method1("set_device", (device_id,))?;
+
+        // Initialize CUDA context for each device by performing a real CUDA operation
+        // PyTorch uses lazy initialization, so we need to actually allocate something
+        // to force context creation on each device
+        for &device_id in device_ids {
+            let start = std::time::Instant::now();
+            cuda.call_method1("set_device", (device_id,))?;
+
+            // Allocate a small tensor to force CUDA context creation on this device
+            // This ensures the CUDA driver creates a context for the device
+            let device_str = format!("cuda:{}", device_id);
+            let empty_args = (vec![1i64],);
+            let kwargs = pyo3::types::PyDict::new(py);
+            kwargs.set_item("device", device_str)?;
+            let _ = torch.call_method("empty", empty_args, Some(&kwargs))?;
+
+            // Synchronize to ensure context is fully initialized
+            cuda.call_method0("synchronize")?;
+
+            let elapsed = start.elapsed();
+            log::info!(
+                "Initialized CUDA context for device {} in {:.2}s",
+                device_id,
+                elapsed.as_secs_f64()
+            );
+        }
+
+        // Set the first device as the default
+        cuda.call_method1("set_device", (device_ids[0],))?;
         Ok(())
     })
     .map_err(|err| {
@@ -221,8 +279,32 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
     // Initialize CUDA in the main thread before starting Tokio runtime
     init_cuda_driver()?;
-    init_python_cuda(cli.device)?;
-    info!("CUDA runtime initialized for device {}", cli.device);
+
+    // Determine which devices to initialize
+    let devices = if cli.devices.is_empty() {
+        // Auto-detect all available devices
+        let detected = detect_cuda_devices()?;
+        info!(
+            "Auto-detected {} CUDA device(s): {:?}",
+            detected.len(),
+            detected
+        );
+        detected
+    } else {
+        info!("Using specified CUDA device(s): {:?}", cli.devices);
+        cli.devices.clone()
+    };
+
+    if devices.is_empty() {
+        return Err("No CUDA devices available".into());
+    }
+
+    init_python_cuda(&devices)?;
+    info!(
+        "CUDA runtime initialized for {} device(s): {:?}",
+        devices.len(),
+        devices
+    );
 
     let registry = CudaTensorRegistry::new().map_err(|err| {
         let msg = format_py_err(err);
