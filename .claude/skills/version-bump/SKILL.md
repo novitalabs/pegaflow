@@ -17,17 +17,26 @@ pip install commitizen
 
 ## Bump PATCH Version
 
-Run from the `python/` directory:
+**Important:** Create a branch first since pre-commit hooks forbid commits to master.
 
 ```bash
-cd python && cz bump --increment PATCH
+git checkout -b release/v<new_version>
+cd python && cz bump --increment PATCH --no-tag
 ```
 
 This will:
 1. Increment version in `pyproject.toml` (e.g., `0.0.10` → `0.0.11`)
 2. Update `[tool.commitizen]` version field
 3. Create a git commit with the version bump
-4. Create a git tag `v0.0.11`
+4. **NOT** create a git tag (tags are managed via GitHub releases)
+
+### Alternative: With Tag
+
+If you want to create a git tag locally:
+
+```bash
+cd python && cz bump --increment PATCH
+```
 
 ## Current Configuration
 
@@ -47,10 +56,20 @@ Check the current version:
 grep -E "^version" python/pyproject.toml
 ```
 
-## After Bumping
+## Workflow
 
-Push the commit and tag:
+1. **Push the release branch:**
 
 ```bash
-git push && git push --tags
+git push -u origin release/v<version>
 ```
+
+2. **Create a pull request:**
+
+```bash
+gh pr create --title "chore: bump version to <version>" --body "Release v<version>"
+```
+
+3. **After PR review and merge to master:**
+
+User will manually create the GitHub release via the web UI or CLI.
