@@ -7,7 +7,14 @@ This package provides:
 
 # Import Rust-based PegaEngine from the compiled extension
 try:
-    from .pegaflow import EngineRpcClient, PegaEngine, PyLoadState
+    from .pegaflow import (
+        EngineRpcClient,
+        PegaEngine,
+        PegaFlowBusinessError,
+        PegaFlowError,
+        PegaFlowServiceError,
+        PyLoadState,
+    )
 except ImportError:
     # Fallback for development when the Rust extension is not built
     EngineRpcClient = None
@@ -18,4 +25,11 @@ except ImportError:
     ) from None
 
 __version__ = "0.0.1"
-__all__ = ["PegaEngine", "EngineRpcClient", "PyLoadState"]
+__all__ = [
+    "EngineRpcClient",
+    "PegaEngine",
+    "PegaFlowBusinessError",
+    "PegaFlowError",
+    "PegaFlowServiceError",
+    "PyLoadState",
+]
