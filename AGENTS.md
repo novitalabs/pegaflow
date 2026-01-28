@@ -118,9 +118,14 @@ cargo test -p pegaflow-server utils::tests::test_parse_memory_size_basic
 ## Key Files
 
 - `pegaflow-core/src/lib.rs`: Main PegaEngine implementation
-- `pegaflow-server/src/lib.rs`: gRPC server wiring and tracing setup
-- `python/src/lib.rs`: PyO3 bindings for PegaEngine + client
-- `python/pegaflow/connector/`: vLLM v1 connector logic
+- `pegaflow-core/src/storage.rs`: Block storage engine
+- `pegaflow-server/src/service.rs`: gRPC service implementation
+- `python/src/lib.rs`: PyO3 bindings (Rust side)
+- `python/pegaflow/pegaflow.pyi`: Type stubs for PyO3 bindings
+- `python/pegaflow/connector/scheduler.py`: vLLM scheduler-side connector
+- `python/pegaflow/connector/worker.py`: vLLM worker-side connector
+- `python/pegaflow/sglang/pegaflow_radix_cache.py`: sglang radix cache class
+
 
 ## Code Style Guidelines
 
@@ -151,4 +156,5 @@ cargo test -p pegaflow-server utils::tests::test_parse_memory_size_basic
 
 ### Git commit message format
 
-we use commitizen commit message format.
+- We use commitizen commit message format.
+- Do not commit directly to the master branch; create a feat/fix/chore/style/refactor/ci/... branch first.

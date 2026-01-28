@@ -195,7 +195,8 @@ See the implementation in [`peagflow_radix_cache.py`](python/pegaflow/sglang/pea
 
 ### Git commit message format
 
-we use commitizen commit message format.
+- We use commitizen commit message format.
+- Do not commit directly to the master branch; create a feat/fix/chore/style/refactor/ci/... branch first.
 
 ## Key Files
 
