@@ -189,6 +189,10 @@ See the implementation in [`peagflow_radix_cache.py`](python/pegaflow/sglang/pea
 - Layer-wise registration for MLA/TP
 - GPU KV allocator evict
 
+### Git commit message format
+
+we use commitizen commit message format.
+
 ## Key Files
 
 - `pegaflow-core/src/lib.rs`: Main PegaEngine implementation
@@ -199,7 +203,3 @@ See the implementation in [`peagflow_radix_cache.py`](python/pegaflow/sglang/pea
 - `python/pegaflow/connector/scheduler.py`: vLLM scheduler-side connector
 - `python/pegaflow/connector/worker.py`: vLLM worker-side connector
 - `python/pegaflow/sglang/pegaflow_radix_cache.py`: sglang radix cache class
-
-### Git commit message format
-
-we use commitizen commit message format.
