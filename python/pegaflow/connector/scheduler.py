@@ -2,6 +2,7 @@
 Scheduler-side connector logic.
 """
 
+import os
 import time
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
@@ -10,6 +11,7 @@ from pegaflow.connector.common import (
     ConnectorContext,
     LoadIntent,
     PegaConnectorMetadata,
+    PegaKVConnectorStats,
     SaveIntent,
     logger,
 )
@@ -22,8 +24,26 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 
+def _parse_env_int(name: str, default: int) -> int:
+    """Parse an integer from environment variable with fallback to default."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning("Invalid %s value '%s', using default %d", name, value, default)
+        return default
+
+
 class SchedulerConnector:
     """Holds scheduler-only state and behaviors."""
+
+    # Recompute bypass thresholds (configurable via environment variables)
+    # When pending loads >= this, consider bypass for short requests
+    BYPASS_PENDING_LOAD_THRESHOLD: int = _parse_env_int("PEGA_BYPASS_PENDING_LOAD_THRESHOLD", 4)
+    # Requests with remaining blocks <= this are considered "short"
+    BYPASS_SHORT_REQUEST_BLOCKS: int = _parse_env_int("PEGA_BYPASS_SHORT_REQUEST_BLOCKS", 8)
 
     def __init__(self, context: ConnectorContext):
         self._ctx = context
@@ -31,6 +51,9 @@ class SchedulerConnector:
         # Load state
         self._pending_load_intents: dict[str, LoadIntent] = {}
         self._prefetch_start_times: dict[str, float] = {}
+
+        # Fallback statistics
+        self._fallback_count: int = 0
 
         # Save state (per-request)
         self._block_hashes: dict[str, tuple[bytes, ...]] = {}
@@ -55,6 +78,26 @@ class SchedulerConnector:
         remaining_hashes = block_hashes[computed_blocks:]
 
         if not remaining_hashes:
+            return (0, False)
+
+        # Recompute fallback: when many requests are waiting for remote KV,
+        # let short requests bypass cache lookup and compute locally to
+        # improve GPU utilization.
+        num_remaining_blocks = len(remaining_hashes)
+        num_pending_loads = len(self._pending_load_intents)
+        if (
+            num_pending_loads >= self.BYPASS_PENDING_LOAD_THRESHOLD
+            and num_remaining_blocks <= self.BYPASS_SHORT_REQUEST_BLOCKS
+        ):
+            self._fallback_count += 1
+            logger.info(
+                "[PegaKVConnector] req=%s recompute_fallback: "
+                "pending_loads=%d remaining_blocks=%d fallback_total=%d",
+                req_id,
+                num_pending_loads,
+                num_remaining_blocks,
+                self._fallback_count,
+            )
             return (0, False)
 
         lookup_start = time.perf_counter()
@@ -130,9 +173,9 @@ class SchedulerConnector:
             num_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
 
             # Verify update_state_after_alloc was called for this request
-            assert (
-                req_id in self._block_hashes
-            ), f"req {req_id} not initialized in update_state_after_alloc"
+            assert req_id in self._block_hashes, (
+                f"req {req_id} not initialized in update_state_after_alloc"
+            )
 
             self._scheduled_tokens[req_id] += num_tokens
 
@@ -306,6 +349,28 @@ class SchedulerConnector:
         # Legacy tuple response format (ok, message, hit_blocks)
         _, _, hit_blocks = result
         return hit_blocks
+
+    def get_stats(self) -> PegaKVConnectorStats | None:
+        """Get current connector stats for metrics exposure."""
+        # Calculate pending load blocks
+        pending_load_blocks = sum(
+            len(intent.block_ids) for intent in self._pending_load_intents.values()
+        )
+
+        stats = PegaKVConnectorStats(
+            data={
+                "pending_load_requests": len(self._pending_load_intents),
+                "pending_load_blocks": pending_load_blocks,
+                "fallback_count": self._fallback_count,
+            }
+        )
+
+        # Reset fallback count after reporting (it's a counter)
+        self._fallback_count = 0
+
+        if stats.is_empty():
+            return None
+        return stats
 
 
 __all__ = ["SchedulerConnector"]

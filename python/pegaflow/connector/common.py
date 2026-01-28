@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 
+from pegaflow.connector.connector_metrics import PegaKVConnectorStats, PegaPromMetrics
 from pegaflow.logging_utils import get_connector_logger
 from pegaflow.pegaflow import EngineRpcClient
 
@@ -128,6 +129,8 @@ __all__ = [
     "ConnectorContext",
     "LoadIntent",
     "PegaConnectorMetadata",
+    "PegaKVConnectorStats",
+    "PegaPromMetrics",
     "SaveIntent",
     "derive_namespace",
     "logger",

@@ -18,6 +18,8 @@ from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from pegaflow.connector.common import (
     ConnectorContext,
     PegaConnectorMetadata,
+    PegaKVConnectorStats,
+    PegaPromMetrics,
     derive_namespace,
     logger,
     resolve_instance_id,
@@ -196,8 +198,36 @@ class PegaKVConnector(KVConnectorBase_V1):
     def get_block_ids_with_load_errors(self) -> set[int]:
         return set()
 
-    def get_kv_connector_stats(self):
-        return None
+    def get_kv_connector_stats(self) -> PegaKVConnectorStats | None:
+        stats: PegaKVConnectorStats | None = None
+
+        # Collect scheduler-side stats
+        if self._scheduler:
+            stats = self._scheduler.get_stats()
+
+        # Collect worker-side stats
+        if self._worker:
+            worker_stats = self._worker.get_stats()
+            if worker_stats is not None:
+                stats = worker_stats if stats is None else stats.aggregate(worker_stats)
+
+        return stats
+
+    @classmethod
+    def build_kv_connector_stats(cls, data: dict | None = None) -> PegaKVConnectorStats | None:
+        if data is None:
+            return None
+        return PegaKVConnectorStats(data=data)
+
+    @classmethod
+    def build_prom_metrics(
+        cls,
+        vllm_config,
+        metric_types,
+        labelnames,
+        per_engine_labelvalues,
+    ) -> PegaPromMetrics:
+        return PegaPromMetrics(vllm_config, metric_types, labelnames, per_engine_labelvalues)
 
     def get_handshake_metadata(self):
         return None
