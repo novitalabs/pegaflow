@@ -32,6 +32,8 @@ maturin develop          # Dev build
 maturin develop --release  # Release build
 ```
 
+**Important:** When modifying `python/src/lib.rs` (PyO3 bindings), update the type stub file `python/pegaflow/pegaflow.pyi` to keep type hints in sync.
+
 ### Running Benchmarks
 
 ```bash
@@ -143,7 +145,7 @@ PegaFlow integrates with SGLang by providing a drop-in replacement for the defau
 
 1. **Import and Instantiate PeagflowRadixCache**
 
-In your SGLang-based project, swap out the usual RadixCache for `PeagflowRadixCache`:
+In your SGLang-based project, in `scheduler.py`, swap out the usual `RadixCache` for `PeagflowRadixCache`:
 
 ```python
 from pegaflow.sglang.peagflow_radix_cache import PeagflowRadixCache
@@ -179,17 +181,21 @@ The class automatically unregisters contexts with the engine on deletion, interp
 
 ### Reference
 
-See the implementation in [`pegaflow/python/pegaflow/sglang/peagflow_radix_cache.py`](python/pegaflow/sglang/peagflow_radix_cache.py) for full details and entry points:
+See the implementation in [`peagflow_radix_cache.py`](python/pegaflow/sglang/peagflow_radix_cache.py) for full details and entry points:
 
 - Custom `match_prefix`
 - Remote block query/load/save
 - Context (un)registration
 - Layer-wise registration for MLA/TP
+- GPU KV allocator evict
 
 ## Key Files
 
 - `pegaflow-core/src/lib.rs`: Main PegaEngine implementation
 - `pegaflow-core/src/storage.rs`: Block storage engine
 - `pegaflow-server/src/service.rs`: gRPC service implementation
+- `python/src/lib.rs`: PyO3 bindings (Rust side)
+- `python/pegaflow/pegaflow.pyi`: Type stubs for PyO3 bindings
 - `python/pegaflow/connector/scheduler.py`: vLLM scheduler-side connector
 - `python/pegaflow/connector/worker.py`: vLLM worker-side connector
+- `python/pegaflow/sglang/pegaflow_radix_cache.py`: sglang radix cache class
