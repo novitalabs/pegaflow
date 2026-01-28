@@ -11,19 +11,14 @@ colored.workspace = true
 offset-allocator.workspace = true
 hashlink.workspace = true
 tokio.workspace = true
-rand.workspace = true
 shared_memory.workspace = true
 uuid.workspace = true
-dashmap.workspace = true
 opentelemetry.workspace = true
 bytesize.workspace = true
-redis.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 libc = "0.2"
-hex = "0.4"
 ahash.workspace = true
-io-uring = "0.6"
+io-uring = "0.7"
 futures = "0.3"
 
 [dev-dependencies]

@@ -37,7 +37,6 @@ opentelemetry-otlp.workspace = true
 opentelemetry-prometheus.workspace = true
 prometheus.workspace = true
 tikv-jemallocator.workspace = true
-redis.workspace = true
 colored.workspace = true
 
 [build-dependencies]
