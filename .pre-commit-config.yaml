@@ -1,4 +1,17 @@
 repos:
+  # Branch protection and file checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: no-commit-to-branch
+        args: ['--branch', 'master', '--branch', 'main']
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-merge-conflict
+      - id: check-symlinks
+      - id: check-toml
+      - id: detect-private-key
+
   # Rust
   - repo: local
     hooks:
