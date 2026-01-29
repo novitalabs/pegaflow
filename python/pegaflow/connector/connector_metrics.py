@@ -16,6 +16,58 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 
+class PrefetchTracker:
+    """Track prefetch queue depth, duration and blocks for metrics.
+
+    This class tracks:
+    - pending prefetch count (for bypass decisions and gauge metric)
+    - prefetch duration history (for histogram metric)
+    - prefetch blocks history (for histogram metric)
+    """
+
+    def __init__(self):
+        self._pending_prefetches: int = 0
+        self._prefetch_durations: list[float] = []  # in milliseconds
+        self._prefetch_blocks: list[int] = []
+
+    def on_prefetch_start(self) -> None:
+        """Called when a request enters prefetch loading state."""
+        self._pending_prefetches += 1
+
+    def on_prefetch_complete(self, duration_ms: float, hit_blocks: int) -> None:
+        """Called when a request's prefetch completes.
+
+        Args:
+            duration_ms: Time spent waiting for prefetch in milliseconds.
+            hit_blocks: Number of blocks that were prefetched.
+        """
+        self._pending_prefetches = max(0, self._pending_prefetches - 1)
+        self._prefetch_durations.append(duration_ms)
+        self._prefetch_blocks.append(hit_blocks)
+
+    @property
+    def pending_prefetches(self) -> int:
+        """Current number of requests waiting for prefetch."""
+        return self._pending_prefetches
+
+    def get_stats(self) -> dict:
+        """Get stats for Prometheus metrics and reset history.
+
+        Returns:
+            Dictionary with pending_prefetches (gauge), prefetch_duration and
+            prefetch_blocks (histogram data).
+        """
+        durations = self._prefetch_durations
+        blocks = self._prefetch_blocks
+        self._prefetch_durations = []  # Reset for next interval
+        self._prefetch_blocks = []
+        return {
+            "pending_prefetches": self._pending_prefetches,
+            "prefetch_duration": durations,
+            "prefetch_blocks": blocks,
+        }
+
+
 @dataclass
 class PegaKVConnectorStats(KVConnectorStats):
     """Stats for PegaFlow KV connector.
@@ -341,6 +393,7 @@ class PegaPromMetrics(KVConnectorPromMetrics):
 
 
 __all__ = [
+    "PrefetchTracker",
     "PegaKVConnectorStats",
     "PegaPromMetrics",
 ]
