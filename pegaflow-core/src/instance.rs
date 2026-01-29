@@ -11,7 +11,7 @@ use std::{
 use cudarc::driver::CudaContext;
 use log::info;
 
-use crate::{gpu_worker::GpuWorkerPool, EngineError};
+use crate::{EngineError, gpu_worker::GpuWorkerPool};
 
 /// Compute greatest common divisor using Euclidean algorithm.
 fn gcd(mut a: usize, mut b: usize) -> usize {

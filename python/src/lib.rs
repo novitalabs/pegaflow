@@ -1,7 +1,7 @@
 use pegaflow_core::{LoadState, PegaEngine as CoreEngine};
 use pegaflow_proto::proto::engine::{
-    engine_client::EngineClient, HealthRequest, LoadRequest, QueryRequest, RegisterContextRequest,
-    ResponseStatus, SaveLayer, SaveRequest, ShutdownRequest, UnpinRequest, UnregisterRequest,
+    HealthRequest, LoadRequest, QueryRequest, RegisterContextRequest, ResponseStatus, SaveLayer,
+    SaveRequest, ShutdownRequest, UnpinRequest, UnregisterRequest, engine_client::EngineClient,
 };
 use pyo3::{
     create_exception,
@@ -15,8 +15,8 @@ use std::{
 };
 use tokio::runtime::{Handle, Runtime};
 use tonic::{
-    transport::{Channel, Endpoint},
     Code, Status as GrpcStatus,
+    transport::{Channel, Endpoint},
 };
 
 // Custom Python exceptions for error classification

@@ -8,7 +8,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::block::LayerBlock;
 use crate::metrics::core_metrics;
 use crate::sync_state::LoadState;
-use crate::{transfer, EngineError, KVCacheRegistration};
+use crate::{EngineError, KVCacheRegistration, transfer};
 
 /// A task to load KV blocks from CPU to GPU for multiple layers
 pub struct LoadTask {

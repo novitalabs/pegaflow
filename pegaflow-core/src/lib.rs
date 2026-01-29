@@ -13,6 +13,7 @@ pub mod gpu_worker;
 pub mod instance;
 pub mod logging;
 mod metrics;
+pub mod numa;
 pub mod pinned_mem;
 pub mod pinned_pool;
 mod seal_offload;
@@ -29,8 +30,8 @@ pub use instance::{GpuContext, InstanceContext, KVCacheRegistration};
 pub use pinned_pool::PinnedAllocation;
 pub use seal_offload::SlotMeta;
 pub use ssd_cache::{
-    SsdCacheConfig, DEFAULT_SSD_PREFETCH_INFLIGHT, DEFAULT_SSD_PREFETCH_QUEUE_DEPTH,
-    DEFAULT_SSD_WRITE_INFLIGHT, DEFAULT_SSD_WRITE_QUEUE_DEPTH,
+    DEFAULT_SSD_PREFETCH_INFLIGHT, DEFAULT_SSD_PREFETCH_QUEUE_DEPTH, DEFAULT_SSD_WRITE_INFLIGHT,
+    DEFAULT_SSD_WRITE_QUEUE_DEPTH, SsdCacheConfig,
 };
 pub use storage::{SealNotification, StorageConfig};
 pub use sync_state::{LoadState, LoadStateError};
@@ -65,7 +66,7 @@ use log::{debug, info};
 
 use crate::gpu_worker::{LayerLoadData, LoadBlock, LoadTask, SaveBlock};
 use crate::metrics::core_metrics;
-use crate::storage::{StorageEngine, SSD_ALIGNMENT};
+use crate::storage::{SSD_ALIGNMENT, StorageEngine};
 
 const DEFAULT_PINNED_POOL_BYTES: usize = 30 * 1024 * 1024 * 1024; // 30GB
 
@@ -259,12 +260,12 @@ impl PegaEngine {
         .map_err(|e| EngineError::InvalidArgument(format!("layer {layer_name}: {e}")))?;
 
         // SSD alignment check
-        if self.storage.is_ssd_enabled() {
-            if let Some(msg) = registration.check_ssd_alignment(SSD_ALIGNMENT) {
-                return Err(EngineError::InvalidArgument(format!(
-                    "layer {layer_name}: {msg}"
-                )));
-            }
+        if self.storage.is_ssd_enabled()
+            && let Some(msg) = registration.check_ssd_alignment(SSD_ALIGNMENT)
+        {
+            return Err(EngineError::InvalidArgument(format!(
+                "layer {layer_name}: {msg}"
+            )));
         }
 
         // Get or create instance, then register new layer on GPU

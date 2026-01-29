@@ -1,7 +1,7 @@
 use std::{ffi::c_void, ptr, sync::Arc};
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use cudarc::driver::{sys, CudaContext};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use cudarc::driver::{CudaContext, sys};
 
 const BYTES_PER_BLOCK: usize = 24 * 1024; // 24 KiB segments
 const SEGMENTS_PER_BLOCK: usize = 2;

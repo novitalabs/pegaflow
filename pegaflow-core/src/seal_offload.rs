@@ -40,9 +40,11 @@ impl SlotMeta {
         let size = self.size as usize;
         if self.is_split {
             let half = size / 2;
-            vec![(base.add(offset), half), (base.add(offset + half), half)]
+            // SAFETY: Caller ensures base + offset + size is within valid allocation
+            unsafe { vec![(base.add(offset), half), (base.add(offset + half), half)] }
         } else {
-            vec![(base.add(offset), size)]
+            // SAFETY: Caller ensures base + offset + size is within valid allocation
+            unsafe { vec![(base.add(offset), size)] }
         }
     }
 }

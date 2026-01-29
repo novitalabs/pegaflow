@@ -1,5 +1,5 @@
 use opentelemetry::metrics::{Counter, Histogram};
-use opentelemetry::{global, KeyValue};
+use opentelemetry::{KeyValue, global};
 use std::sync::LazyLock;
 use std::time::Instant;
 use tonic::Status;

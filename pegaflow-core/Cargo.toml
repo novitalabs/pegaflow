@@ -32,5 +32,9 @@ harness = false
 name = "uds_latency"
 harness = false
 
+[[bin]]
+name = "pegaflow_topo_cli"
+path = "src/bin/pegaflow_topo_cli.rs"
+
 [[example]]
 name = "pinned_alloc"

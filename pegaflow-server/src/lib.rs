@@ -7,7 +7,7 @@ mod utils;
 pub use registry::CudaTensorRegistry;
 pub use service::GrpcEngineService;
 
-use axum::{routing::get, Router};
+use axum::{Router, routing::get};
 use clap::Parser;
 use cudarc::driver::result as cuda_driver;
 use log::{error, info, warn};
@@ -18,7 +18,7 @@ use parking_lot::Mutex;
 use pegaflow_core::PegaEngine;
 use prometheus::{Registry, TextEncoder};
 use proto::engine::engine_server::EngineServer;
-use pyo3::{types::PyAnyMethods, PyErr, Python};
+use pyo3::{PyErr, Python, types::PyAnyMethods};
 use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -473,10 +473,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         }
 
         // Flush metrics before exit
-        if let Some(provider) = metrics_state.meter_provider {
-            if let Err(err) = provider.shutdown() {
-                error!("Failed to shutdown metrics provider: {err}");
-            }
+        if let Some(provider) = metrics_state.meter_provider
+            && let Err(err) = provider.shutdown()
+        {
+            error!("Failed to shutdown metrics provider: {err}");
         }
 
         Ok(())

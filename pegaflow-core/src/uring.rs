@@ -14,7 +14,7 @@
 //
 // Adapted for PegaFlow: simplified to a single-file engine with blocking read/write APIs.
 
-use io_uring::{opcode, types::Fd, IoUring};
+use io_uring::{IoUring, opcode, types::Fd};
 use log::{info, warn};
 use std::io;
 use std::os::unix::io::RawFd;

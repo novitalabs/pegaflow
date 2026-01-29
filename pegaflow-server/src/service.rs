@@ -14,7 +14,7 @@ use pyo3::{PyErr, Python};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Notify;
-use tonic::{async_trait, Request, Response, Status};
+use tonic::{Request, Response, Status, async_trait};
 
 #[derive(Clone)]
 pub struct GrpcEngineService {

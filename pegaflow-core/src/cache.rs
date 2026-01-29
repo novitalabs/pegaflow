@@ -1,8 +1,8 @@
 use ahash::RandomState;
 use hashlink::LruCache;
 use std::hash::Hash;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use crate::block::{BlockKey, SealedBlock};
 
@@ -62,10 +62,10 @@ impl TinyLfuCache<BlockKey, ArcSealedBlock> {
     /// Returns a cloned value and bumps frequency on hit.
     pub fn get(&mut self, key: &BlockKey) -> Option<ArcSealedBlock> {
         let hit = self.lru.get(key).cloned();
-        if hit.is_some() {
-            if let Some(freq) = &self.freq {
-                freq.incr(key);
-            }
+        if hit.is_some()
+            && let Some(freq) = &self.freq
+        {
+            freq.incr(key);
         }
         hit
     }

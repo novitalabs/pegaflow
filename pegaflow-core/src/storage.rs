@@ -14,7 +14,7 @@
 // ============================================================================
 use bytesize::ByteSize;
 use log::{debug, error, info, warn};
-use std::collections::{hash_map::Entry, HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -26,8 +26,8 @@ use crate::cache::{CacheInsertOutcome, TinyLfuCache};
 use crate::metrics::core_metrics;
 use crate::pinned_pool::{PinnedAllocation, PinnedMemoryPool};
 use crate::ssd_cache::{
-    ssd_prefetch_loop, ssd_writer_loop, PrefetchBatch, PrefetchRequest, SsdCacheConfig,
-    SsdIndexEntry, SsdStorageHandle, SsdWriteBatch,
+    PrefetchBatch, PrefetchRequest, SsdCacheConfig, SsdIndexEntry, SsdStorageHandle, SsdWriteBatch,
+    ssd_prefetch_loop, ssd_writer_loop,
 };
 
 // ============================================================================
@@ -456,10 +456,10 @@ impl StorageEngine {
                     return false;
                 }
                 // Skip if slot already exists in inflight
-                if let Some(block) = inner.inflight.get(&key) {
-                    if block.slot_exists(slot_id) {
-                        return false;
-                    }
+                if let Some(block) = inner.inflight.get(&key)
+                    && block.slot_exists(slot_id)
+                {
+                    return false;
                 }
                 true
             })
@@ -867,13 +867,13 @@ impl StorageEngine {
                 }
 
                 // Check SSD index
-                if let Some(entry) = inner.ssd_index.get(&key) {
-                    if inner.ssd_tail <= entry.begin {
-                        // Block is in SSD, schedule prefetch
-                        to_prefetch.push(key);
-                        loading += 1;
-                        continue;
-                    }
+                if let Some(entry) = inner.ssd_index.get(&key)
+                    && inner.ssd_tail <= entry.begin
+                {
+                    // Block is in SSD, schedule prefetch
+                    to_prefetch.push(key);
+                    loading += 1;
+                    continue;
                 }
 
                 // Block not found anywhere - this is a miss

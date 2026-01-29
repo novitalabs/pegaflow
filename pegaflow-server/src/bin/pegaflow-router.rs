@@ -7,23 +7,23 @@
 //! 3. Forward to D node (P response means KV is ready)
 
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicUsize, Ordering},
 };
 use std::time::Instant;
 
 use axum::{
+    Json, Router,
     body::Body,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
-    Json, Router,
 };
 use clap::Parser;
 use log::{error, info};
 use reqwest::Client;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio_stream::StreamExt;
 
