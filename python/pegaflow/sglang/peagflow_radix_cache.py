@@ -351,7 +351,7 @@ class PeagflowRadixCache(RadixCache):
                 f"[PeagflowRadixCache] Registered {layer_name} (num_blocks={num_blocks}, bytes_per_block={bytes_per_block}, page_size={self.page_size})"
             )
         except PegaFlowError as e:
-            raise RuntimeError(f"Failed to register {layer_name}: {e}") from None
+            raise RuntimeError(f"Failed to register {layer_name}: {e}") from e
 
         return layer_name
 
@@ -431,7 +431,7 @@ class PeagflowRadixCache(RadixCache):
 
             token_slots = self.token_to_kv_pool_allocator.alloc(uncached_len)
             if token_slots is None or len(token_slots) == 0:
-                logger.info(f"[PeagflowRadixCache] alloc returned empty (need={uncached_len})")
+                logger.warning(f"[PeagflowRadixCache] alloc returned empty (need={uncached_len})")
                 # Don't return early - still need to sync with hit_blocks=0
                 token_slots = None
             else:
@@ -470,6 +470,8 @@ class PeagflowRadixCache(RadixCache):
             load_block_hashes = block_hashes[:hit_blocks]
 
             load_state = PyLoadState()
+            load_success = False
+
             try:
                 ok, message = self.engine_client.load(
                     self.instance_id,
@@ -483,25 +485,21 @@ class PeagflowRadixCache(RadixCache):
 
                 if not ok:
                     logger.warning(f"[PeagflowRadixCache] load failed: {message}")
-                    # Don't return early - set hit_blocks=0 and proceed to sync
-                    self.token_to_kv_pool_allocator.free(token_slots)
-                    token_slots = None
-                    hit_blocks = 0
                 elif not self._await_load(load_state):
                     logger.warning("[PeagflowRadixCache] load timed out or failed")
-                    # Don't return early - set hit_blocks=0 and proceed to sync
-                    self.token_to_kv_pool_allocator.free(token_slots)
-                    token_slots = None
-                    hit_blocks = 0
                 else:
+                    load_success = True
                     logger.debug(
                         f"[PeagflowRadixCache] loaded blocks={hit_blocks} from local server"
                     )
             except Exception as e:
                 logger.warning(f"[PeagflowRadixCache] load failed: {e}")
-                self.token_to_kv_pool_allocator.free(token_slots)
-                token_slots = None
-                hit_blocks = 0
+            finally:
+                # Unified cleanup on failure
+                if not load_success:
+                    self.token_to_kv_pool_allocator.free(token_slots)
+                    token_slots = None
+                    hit_blocks = 0
 
         # CRITICAL: Sync hit_blocks across TP and PP ranks using AllReduce MIN.
         # TP ranks may have different cache hits; PP stages have different servers.
