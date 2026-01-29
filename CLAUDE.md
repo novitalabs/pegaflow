@@ -56,11 +56,25 @@ uv run python examples/basic_vllm.py
 uv run python examples/bench_kv_cache.py --model /path/to/model --num-prompts 10
 ```
 
-**Server Configuration:**
+**Server Options:**
 
 - `--addr`: Bind address (default: `127.0.0.1:50055`)
-- `--devices`: CUDA device IDs to initialize, comma-separated (default: auto-detect all available GPUs, e.g., `--devices 0,1,2,3`)
+- `--devices`: CUDA device IDs, comma-separated (default: auto-detect all available GPUs, e.g., `--devices 0,1,2,3`)
 - `--pool-size`: Pinned memory pool size (default: `30gb`, supports: `kb`, `mb`, `gb`, `tb`)
+- `--hint-value-size`: Hint for typical value size to tune cache and allocator (optional, supports: `kb`, `mb`, `gb`, `tb`)
+- `--use-hugepages`: Use huge pages for pinned memory (default: `false`, requires pre-configured `/proc/sys/vm/nr_hugepages`)
+- `--disable-lfu-admission`: Disable TinyLFU cache admission, fallback to plain LRU (default: `false`)
+- `--metrics-addr`: Prometheus metrics HTTP endpoint (default: `0.0.0.0:9091`, set to empty to disable)
+- `--metrics-otel-endpoint`: **DEPRECATED** - OTLP metrics export endpoint (optional, leave unset to disable)
+- `--metrics-period-secs`: **DEPRECATED** - Metrics export period in seconds (default: `5`, only used with OTLP)
+- `--log-level`: Log level: `trace`, `debug`, `info`, `warn`, `error` (default: `info`)
+- `--ssd-cache-path`: Enable SSD cache by providing cache file path (optional)
+- `--ssd-cache-capacity`: SSD cache capacity (default: `512gb`, supports: `kb`, `mb`, `gb`, `tb`)
+- `--ssd-write-queue-depth`: SSD write queue depth, max pending write batches (default: `8`)
+- `--ssd-prefetch-queue-depth`: SSD prefetch queue depth, max pending prefetch batches (default: `2`)
+- `--ssd-write-inflight`: SSD write inflight, max concurrent block writes (default: `2`)
+- `--ssd-prefetch-inflight`: SSD prefetch inflight, max concurrent block reads (default: `16`)
+- `--max-prefetch-blocks`: Max blocks allowed in prefetching state, backpressure for SSD prefetch (default: `800`)
 
 ## Architecture
 

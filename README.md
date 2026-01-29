@@ -58,6 +58,9 @@ pegaflow-server
 - `--ssd-cache-capacity`: SSD cache capacity (default: `512gb`, supports: `kb`, `mb`, `gb`, `tb`)
 - `--ssd-write-queue-depth`: SSD write queue depth, max pending write batches (default: `8`)
 - `--ssd-prefetch-queue-depth`: SSD prefetch queue depth, max pending prefetch batches (default: `2`)
+- `--ssd-write-inflight`: SSD write inflight, max concurrent block writes (default: `2`)
+- `--ssd-prefetch-inflight`: SSD prefetch inflight, max concurrent block reads (default: `16`)
+- `--max-prefetch-blocks`: Max blocks allowed in prefetching state, backpressure for SSD prefetch (default: `800`)
 
 ### 3. Connect to Server with client
 
