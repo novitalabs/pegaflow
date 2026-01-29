@@ -223,6 +223,7 @@ cargo test
 | Engine core | `pegaflow-core/src/lib.rs` |
 | Storage engine | `pegaflow-core/src/storage.rs` |
 | Block management | `pegaflow-core/src/block.rs` |
+| NUMA topology | `pegaflow-core/src/numa.rs` |
 | gRPC service | `pegaflow-server/src/service.rs` |
 | PyO3 bindings | `python/src/lib.rs` |
 | vLLM Scheduler | `python/pegaflow/connector/scheduler.py` |

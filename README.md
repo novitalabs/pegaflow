@@ -84,6 +84,14 @@ python3 -m sglang.launch_server --model-loader-extra-config "{\"enable_multithre
 vllm serve Qwen/Qwen3-0.6B --trust-remote-code --kv-transfer-config '{"kv_connector": "PegaKVConnector", "kv_role": "kv_both", "kv_connector_module_path": "pegaflow.connector", "kv_connector_extra_config": {"pegaflow.host": "http://127.0.0.1", "pegaflow.port": 50055}}'
 ```
 
+## NUMA Topology Detection
+
+Basic NUMA support for optimizing GPU-CPU memory transfers. Use the CLI to inspect system topology:
+
+```bash
+cargo run --bin pegaflow_topo_cli
+```
+
 ## Development
 
 ### Build from source
