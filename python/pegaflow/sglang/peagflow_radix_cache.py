@@ -18,7 +18,7 @@ from sglang.srt.mem_cache.hicache_storage import get_hash_str
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 
-from pegaflow import EngineRpcClient, PyLoadState
+from pegaflow import EngineRpcClient, PegaFlowError, PyLoadState
 from pegaflow.ipc_wrapper import CudaIPCWrapper
 
 logger = logging.getLogger(__name__)
@@ -327,28 +327,31 @@ class PeagflowRadixCache(RadixCache):
         num_blocks = slots // self.page_size
         bytes_per_block = stride0_bytes * self.page_size
 
-        ok, message = self.engine_client.register_context(
-            self.instance_id,
-            self.namespace,
-            0 if self.is_mla else self.tp_rank,
-            1 if self.is_mla else self.tp_size,
-            self.world_size,
-            self.device_id,
-            num_layers,
-            layer_name,
-            wrapper_bytes,
-            num_blocks,
-            bytes_per_block,
-            0,  # kv_stride_bytes
-            1,  # segments
-        )
+        try:
+            ok, message = self.engine_client.register_context(
+                self.instance_id,
+                self.namespace,
+                0 if self.is_mla else self.tp_rank,
+                1 if self.is_mla else self.tp_size,
+                self.world_size,
+                self.device_id,
+                num_layers,
+                layer_name,
+                wrapper_bytes,
+                num_blocks,
+                bytes_per_block,
+                0,  # kv_stride_bytes
+                1,  # segments
+            )
 
-        if not ok:
-            raise RuntimeError(f"Register context failed for {layer_name}: {message}")
+            if not ok:
+                raise RuntimeError(f"Register context failed for {layer_name}: {message}")
 
-        logger.info(
-            f"[PeagflowRadixCache] Registered {layer_name} (num_blocks={num_blocks}, bytes_per_block={bytes_per_block}, page_size={self.page_size})"
-        )
+            logger.info(
+                f"[PeagflowRadixCache] Registered {layer_name} (num_blocks={num_blocks}, bytes_per_block={bytes_per_block}, page_size={self.page_size})"
+            )
+        except PegaFlowError as e:
+            raise RuntimeError(f"Failed to register {layer_name}: {e}") from None
 
         return layer_name
 
@@ -467,30 +470,38 @@ class PeagflowRadixCache(RadixCache):
             load_block_hashes = block_hashes[:hit_blocks]
 
             load_state = PyLoadState()
-            ok, message = self.engine_client.load(
-                self.instance_id,
-                0 if self.is_mla else self.tp_rank,
-                self.device_id,
-                load_state.shm_name(),
-                self._layer_names,
-                load_block_ids,
-                load_block_hashes,
-            )
+            try:
+                ok, message = self.engine_client.load(
+                    self.instance_id,
+                    0 if self.is_mla else self.tp_rank,
+                    self.device_id,
+                    load_state.shm_name(),
+                    self._layer_names,
+                    load_block_ids,
+                    load_block_hashes,
+                )
 
-            if not ok:
-                logger.warning(f"[PeagflowRadixCache] load failed: {message}")
-                # Don't return early - set hit_blocks=0 and proceed to sync
+                if not ok:
+                    logger.warning(f"[PeagflowRadixCache] load failed: {message}")
+                    # Don't return early - set hit_blocks=0 and proceed to sync
+                    self.token_to_kv_pool_allocator.free(token_slots)
+                    token_slots = None
+                    hit_blocks = 0
+                elif not self._await_load(load_state):
+                    logger.warning("[PeagflowRadixCache] load timed out or failed")
+                    # Don't return early - set hit_blocks=0 and proceed to sync
+                    self.token_to_kv_pool_allocator.free(token_slots)
+                    token_slots = None
+                    hit_blocks = 0
+                else:
+                    logger.debug(
+                        f"[PeagflowRadixCache] loaded blocks={hit_blocks} from local server"
+                    )
+            except Exception as e:
+                logger.warning(f"[PeagflowRadixCache] load failed: {e}")
                 self.token_to_kv_pool_allocator.free(token_slots)
                 token_slots = None
                 hit_blocks = 0
-            elif not self._await_load(load_state):
-                logger.warning("[PeagflowRadixCache] load timed out or failed")
-                # Don't return early - set hit_blocks=0 and proceed to sync
-                self.token_to_kv_pool_allocator.free(token_slots)
-                token_slots = None
-                hit_blocks = 0
-            else:
-                logger.debug(f"[PeagflowRadixCache] loaded blocks={hit_blocks} from local server")
 
         # CRITICAL: Sync hit_blocks across TP and PP ranks using AllReduce MIN.
         # TP ranks may have different cache hits; PP stages have different servers.
