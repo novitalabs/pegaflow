@@ -277,6 +277,28 @@ impl InstanceContext {
         Some(id)
     }
 
+    /// Get existing layer ID or allocate a new one.
+    ///
+    /// This is idempotent: calling multiple times with the same layer name
+    /// returns the same ID. Used for MLA where multiple TP ranks register
+    /// the same layer name on different devices.
+    pub fn get_or_allocate_layer_id(&self, layer_name: &str) -> usize {
+        let mut map = self
+            .layer_name_to_id
+            .lock()
+            .expect("layer_name_to_id lock poisoned");
+
+        if let Some(&id) = map.get(layer_name) {
+            return id;
+        }
+
+        let mut names = self.layer_names.lock().expect("layer_names lock poisoned");
+        let id = names.len();
+        names.push(layer_name.to_string());
+        map.insert(layer_name.to_string(), id);
+        id
+    }
+
     /// Look up the numeric ID for a layer name.
     ///
     /// Returns `None` if the layer has not been registered.
@@ -374,15 +396,20 @@ impl InstanceContext {
         contexts.get(&device_id).cloned()
     }
 
-    /// Register a new layer on a GPU.
+    /// Register a layer on a GPU.
     ///
     /// This method:
     /// 1. Ensures the GPU context exists (creates if needed)
-    /// 2. Allocates a new layer ID (fails if layer already exists)
+    /// 2. Gets existing layer ID or allocates a new one (idempotent)
     /// 3. Registers the layer's KV cache on the GPU
     ///
+    /// For MLA with TP > 1, multiple ranks may register the same layer name
+    /// on different devices. The layer ID allocation is idempotent, but
+    /// GPU registration will fail if the same layer is registered twice
+    /// on the same device.
+    ///
     /// # Errors
-    /// - `EngineError::InvalidArgument` if layer already exists
+    /// - `EngineError::InvalidArgument` if layer already registered on this GPU
     /// - `EngineError::CudaInit` if GPU context creation fails
     pub fn register_new_gpu_layer(
         &self,
@@ -393,15 +420,10 @@ impl InstanceContext {
         // 1. Ensure GPU context
         let gpu = self.ensure_gpu(device_id)?;
 
-        // 2. Allocate new layer ID (strict, fails if exists)
-        let layer_id = self.allocate_new_layer_id(layer_name).ok_or_else(|| {
-            EngineError::InvalidArgument(format!(
-                "layer {} already registered in instance",
-                layer_name
-            ))
-        })?;
+        // 2. Get or allocate layer ID (idempotent for MLA multi-device registration)
+        let layer_id = self.get_or_allocate_layer_id(layer_name);
 
-        // 3. Register on GPU
+        // 3. Register on GPU (fails if layer already registered on THIS device)
         gpu.register_new_layer(layer_name.to_string(), registration)
             .map_err(EngineError::InvalidArgument)?;
 
@@ -514,11 +536,11 @@ mod tests {
         assert!(instance.verify_topology(64, 8, 8).is_ok());
         assert!(instance.verify_topology(32, 8, 8).is_err()); // wrong layers
 
-        // 4. Verify duplicate layer registration fails
+        // 4. Verify duplicate layer registration on SAME device fails
         let dup_reg = KVCacheRegistration::new(0x2000, 1024 * 1024, 100, 1024, 0, 1).unwrap();
         let err = instance
             .register_new_gpu_layer(0, "layer_0", dup_reg)
-            .expect_err("duplicate should fail");
+            .expect_err("duplicate on same device should fail");
         assert!(err.to_string().contains("already registered"));
 
         // 5. Verify we can get the registered layer back
@@ -526,5 +548,38 @@ mod tests {
         let reg = gpu.get_registration("layer_0").expect("get registration");
         assert_eq!(reg.data_ptr, 0x1000);
         assert_eq!(reg.num_blocks, 100);
+    }
+
+    /// Tests MLA-style registration where the same layer name is used
+    /// by multiple TP ranks. Verifies layer ID allocation is idempotent.
+    #[test]
+    fn mla_layer_id_allocation() {
+        let instance = InstanceContext::new(
+            "mla-instance".to_string(),
+            "mla-ns".to_string(),
+            10, // num_layers
+            1,  // tp_size (MLA uses tp_size=1)
+            8,  // world_size (8 TP ranks, but treated as 1 for storage)
+        )
+        .expect("create instance");
+
+        // Simulate 8 TP ranks calling get_or_allocate_layer_id for the same layer
+        // This is the MLA pattern where all ranks share the same KV data
+        for _ in 0..8 {
+            // All calls should return the same layer_id=0
+            let layer_id = instance.get_or_allocate_layer_id("layer_0");
+            assert_eq!(layer_id, 0, "all calls should get same layer_id");
+        }
+
+        // Verify only one layer was allocated
+        assert_eq!(instance.get_layer_id("layer_0"), Some(0));
+
+        // Allocate another layer
+        let layer_id = instance.get_or_allocate_layer_id("layer_1");
+        assert_eq!(layer_id, 1);
+
+        // Verify both layers exist with correct IDs
+        assert_eq!(instance.get_layer_id("layer_0"), Some(0));
+        assert_eq!(instance.get_layer_id("layer_1"), Some(1));
     }
 }
