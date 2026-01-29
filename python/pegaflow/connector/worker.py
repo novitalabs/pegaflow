@@ -12,7 +12,12 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from pegaflow.connector.common import ConnectorContext, PegaConnectorMetadata, logger
+from pegaflow.connector.common import (
+    ConnectorContext,
+    PegaConnectorMetadata,
+    PegaKVConnectorStats,
+    logger,
+)
 from pegaflow.ipc_wrapper import CudaIPCWrapper
 from pegaflow.pegaflow import PyLoadState
 
@@ -50,6 +55,9 @@ class WorkerConnector:
 
         self._pending_loads: dict[str, PyLoadState] = {}
         self._pending_load_reqs: dict[str, set[str]] = {}
+        self._pending_load_meta: dict[
+            str, tuple[float, int]
+        ] = {}  # shm_name -> (start_time, num_blocks)
         self._load_completion_lock = threading.Lock()
 
         self._registered_layers: list[str] = []
@@ -57,6 +65,10 @@ class WorkerConnector:
         self._torch_device: torch.device | None = None
 
         self._finished_requests: set[str] = set()
+
+        # Stats collection
+        self._stats = PegaKVConnectorStats()
+        self._stats_lock = threading.Lock()
 
     def shutdown(self) -> None:
         self.unregister_context()
@@ -75,9 +87,9 @@ class WorkerConnector:
         self._registered_layers.clear()
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
-        assert (
-            self._ctx.device_id is not None
-        ), "CUDA device id is unknown; cannot register KV caches"
+        assert self._ctx.device_id is not None, (
+            "CUDA device id is unknown; cannot register KV caches"
+        )
 
         self._registered_layers = list(kv_caches.keys())
         self._torch_device = next(iter(kv_caches.values())).device
@@ -88,9 +100,9 @@ class WorkerConnector:
 
         layout = "unknown"
         for layer_name, kv_cache in kv_caches.items():
-            assert (
-                kv_cache.storage_offset() == 0
-            ), f"KV cache for {layer_name} must have zero storage offset"
+            assert kv_cache.storage_offset() == 0, (
+                f"KV cache for {layer_name} must have zero storage offset"
+            )
 
             wrapper = CudaIPCWrapper(kv_cache)
             wrapper_bytes = pickle.dumps(wrapper)
@@ -112,9 +124,9 @@ class WorkerConnector:
                 segments = 1
                 layout = "blocks-first"
 
-            assert (
-                bytes_per_block != 0
-            ), f"Invalid bytes_per_block for {layer_name}: stride={stride}"
+            assert bytes_per_block != 0, (
+                f"Invalid bytes_per_block for {layer_name}: stride={stride}"
+            )
 
             ok, message = self._ctx.engine_client.register_context(
                 self._ctx.instance_id,
@@ -162,6 +174,7 @@ class WorkerConnector:
         with self._load_completion_lock:
             completed_reqs: set[str] = set()
             completed_shms: list[str] = []
+            load_stats_to_record: list[tuple[float, int, bool]] = []
 
             for shm_name, req_ids in self._pending_load_reqs.items():
                 sample_req_id = next(iter(req_ids))
@@ -171,7 +184,8 @@ class WorkerConnector:
 
                 if load_state.is_ready():
                     state = load_state.get_state()
-                    if state < 0:
+                    success = state >= 0
+                    if not success:
                         logger.error(
                             "[PegaKVConnector] async_load_failed: reqs=%s state=%d",
                             req_ids,
@@ -182,16 +196,30 @@ class WorkerConnector:
                             "[PegaKVConnector] async_load_completed: reqs=%s",
                             req_ids,
                         )
+
+                    # Calculate load duration
+                    if shm_name in self._pending_load_meta:
+                        start_time, num_blocks = self._pending_load_meta[shm_name]
+                        duration = time.perf_counter() - start_time
+                        load_stats_to_record.append((duration, num_blocks, success))
+
                     completed_reqs.update(req_ids)
                     completed_shms.append(shm_name)
 
             for shm_name in completed_shms:
                 req_ids = self._pending_load_reqs.pop(shm_name, set())
+                self._pending_load_meta.pop(shm_name, None)
                 for req_id in req_ids:
                     self._pending_loads.pop(req_id, None)
 
             if completed_reqs:
                 finished_recving = completed_reqs
+
+        # Record load stats outside the lock
+        if load_stats_to_record:
+            with self._stats_lock:
+                for duration, num_blocks, success in load_stats_to_record:
+                    self._stats.record_load(duration, num_blocks, success)
 
         if finished_sending:
             logger.info(
@@ -265,6 +293,8 @@ class WorkerConnector:
             for req_id in request_ids:
                 self._pending_loads[req_id] = load_state
             self._pending_load_reqs[shm_name] = set(request_ids)
+            # Record start time and block count for stats
+            self._pending_load_meta[shm_name] = (time.perf_counter(), num_blocks)
 
         logger.debug(
             "[PegaKVConnector] started async load: %d blocks across %d layers for %d reqs, "
@@ -386,6 +416,10 @@ class WorkerConnector:
             torch.cuda.synchronize(self._torch_device)
 
             saves_list = [(name, ids, hashes) for name, (ids, hashes) in saves_by_layer.items()]
+            total_blocks = sum(len(ids) for _, ids, _ in saves_list)
+
+            save_start = time.perf_counter()
+            success = False
 
             try:
                 ok, message = self._ctx.engine_client.save(
@@ -401,16 +435,23 @@ class WorkerConnector:
                         message,
                     )
                 else:
+                    success = True
                     logger.debug(
                         "[PegaKVConnector] Batch saved %d layers, %d total blocks",
                         len(saves_list),
-                        sum(len(ids) for _, ids, _ in saves_list),
+                        total_blocks,
                     )
             except Exception as e:
                 logger.error(
                     "[PegaKVConnector] Save RPC exception: %s (continuing without save)",
                     e,
                 )
+
+            save_duration = time.perf_counter() - save_start
+
+            # Record stats
+            with self._stats_lock:
+                self._stats.record_save(save_duration, total_blocks, success)
 
         # Always decrement layer counter to release blocks, even if save failed
         self._decrement_layer_counter(all_request_ids)
@@ -422,9 +463,9 @@ class WorkerConnector:
             for req_id in request_ids:
                 if req_id in self._req_pending_layers:
                     self._req_pending_layers[req_id] -= 1
-                    assert (
-                        self._req_pending_layers[req_id] >= 0
-                    ), f"Layer count mismatch for request {req_id}: counter went negative"
+                    assert self._req_pending_layers[req_id] >= 0, (
+                        f"Layer count mismatch for request {req_id}: counter went negative"
+                    )
 
                     if self._req_pending_layers[req_id] == 0:
                         self._completed_saves.add(req_id)
@@ -484,6 +525,13 @@ class WorkerConnector:
                 "[PegaKVConnector] preemption: %d requests (no pending saves)",
                 len(preempted_req_ids),
             )
+
+    def get_stats(self) -> PegaKVConnectorStats | None:
+        """Get and reset worker stats for the current interval."""
+        with self._stats_lock:
+            if self._stats.is_empty():
+                return None
+            return self._stats.clone_and_reset()
 
 
 __all__ = ["WorkerConnector"]

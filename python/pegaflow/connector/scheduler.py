@@ -2,6 +2,7 @@
 Scheduler-side connector logic.
 """
 
+import os
 import time
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
@@ -10,9 +11,11 @@ from pegaflow.connector.common import (
     ConnectorContext,
     LoadIntent,
     PegaConnectorMetadata,
+    PegaKVConnectorStats,
     SaveIntent,
     logger,
 )
+from pegaflow.connector.connector_metrics import PrefetchTracker
 from pegaflow.pegaflow import PegaFlowBusinessError, PegaFlowServiceError
 
 if TYPE_CHECKING:
@@ -22,8 +25,24 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 
+def _parse_env_int(name: str, default: int) -> int:
+    """Parse an integer from environment variable with fallback to default."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning("Invalid %s value '%s', using default %d", name, value, default)
+        return default
+
+
 class SchedulerConnector:
     """Holds scheduler-only state and behaviors."""
+
+    # Bypass thresholds (configurable via environment variables)
+    BYPASS_BLOCKS: int = _parse_env_int("PEGA_BYPASS_BLOCKS", 8)
+    LOW_LOAD_QUEUE_DEPTH: int = _parse_env_int("PEGA_LOW_LOAD_QUEUE_DEPTH", 25)
 
     def __init__(self, context: ConnectorContext):
         self._ctx = context
@@ -31,6 +50,12 @@ class SchedulerConnector:
         # Load state
         self._pending_load_intents: dict[str, LoadIntent] = {}
         self._prefetch_start_times: dict[str, float] = {}
+
+        # Prefetch tracking (for metrics and bypass decisions)
+        self._prefetch_tracker = PrefetchTracker()
+
+        # Bypass statistics
+        self._bypass_count: int = 0
 
         # Save state (per-request)
         self._block_hashes: dict[str, tuple[bytes, ...]] = {}
@@ -55,6 +80,22 @@ class SchedulerConnector:
         remaining_hashes = block_hashes[computed_blocks:]
 
         if not remaining_hashes:
+            return (0, False)
+
+        # Check if request should bypass remote cache lookup
+        # Bypass when: queue is idle (pending < threshold) AND request is short (blocks < threshold)
+        num_remaining_blocks = len(remaining_hashes)
+        pending = self._prefetch_tracker.pending_prefetches
+        if num_remaining_blocks < self.BYPASS_BLOCKS and pending < self.LOW_LOAD_QUEUE_DEPTH:
+            self._bypass_count += 1
+            logger.info(
+                "[PegaKVConnector] req=%s bypass: remaining_blocks=%d "
+                "pending_prefetches=%d bypass_count=%d",
+                req_id,
+                num_remaining_blocks,
+                pending,
+                self._bypass_count,
+            )
             return (0, False)
 
         lookup_start = time.perf_counter()
@@ -111,11 +152,13 @@ class SchedulerConnector:
             )
             self._pending_load_intents[req_id] = load_intent
             logger.info(
-                "[PegaKVConnector] req=%s alloc: total_blocks=%d load_blocks=%d load_tokens=%d",
+                "[PegaKVConnector] req=%s alloc: total_blocks=%d load_blocks=%d "
+                "load_tokens=%d pending_loads=%d",
                 req_id,
                 len(block_ids),
                 len(load_intent.block_ids),
                 load_intent.num_tokens,
+                len(self._pending_load_intents),
             )
 
     def build_connector_meta(self, scheduler_output: "SchedulerOutput") -> PegaConnectorMetadata:
@@ -130,9 +173,9 @@ class SchedulerConnector:
             num_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
 
             # Verify update_state_after_alloc was called for this request
-            assert (
-                req_id in self._block_hashes
-            ), f"req {req_id} not initialized in update_state_after_alloc"
+            assert req_id in self._block_hashes, (
+                f"req {req_id} not initialized in update_state_after_alloc"
+            )
 
             self._scheduled_tokens[req_id] += num_tokens
 
@@ -287,6 +330,12 @@ class SchedulerConnector:
                 # Record first time we see loading state
                 if req_id not in self._prefetch_start_times:
                     self._prefetch_start_times[req_id] = time.perf_counter()
+                    self._prefetch_tracker.on_prefetch_start()
+                    logger.info(
+                        "[PegaKVConnector] Prefetch started: req=%s pending_prefetches=%d",
+                        req_id,
+                        self._prefetch_tracker.pending_prefetches,
+                    )
                 return None  # Signal scheduler to retry later
 
             # Prefetch done - log duration if we were tracking
@@ -294,11 +343,15 @@ class SchedulerConnector:
                 prefetch_duration_ms = (
                     time.perf_counter() - self._prefetch_start_times.pop(req_id)
                 ) * 1000
+                self._prefetch_tracker.on_prefetch_complete(prefetch_duration_ms, hit_blocks)
+
                 logger.info(
-                    "[PegaKVConnector] Prefetch completed: req=%s hit_blocks=%d prefetch_duration_ms=%.2f",
+                    "[PegaKVConnector] Prefetch completed: req=%s hit_blocks=%d "
+                    "prefetch_duration_ms=%.2f pending_prefetches=%d",
                     req_id,
                     hit_blocks,
                     prefetch_duration_ms,
+                    self._prefetch_tracker.pending_prefetches,
                 )
 
             return hit_blocks
@@ -306,6 +359,27 @@ class SchedulerConnector:
         # Legacy tuple response format (ok, message, hit_blocks)
         _, _, hit_blocks = result
         return hit_blocks
+
+    def get_stats(self) -> PegaKVConnectorStats | None:
+        """Get current connector stats for metrics exposure."""
+        # Get stats from prefetch tracker
+        prefetch_stats = self._prefetch_tracker.get_stats()
+
+        stats = PegaKVConnectorStats(
+            data={
+                "pending_prefetches": prefetch_stats["pending_prefetches"],
+                "bypass_count": self._bypass_count,
+                "prefetch_duration": prefetch_stats["prefetch_duration"],
+                "prefetch_blocks": prefetch_stats["prefetch_blocks"],
+            }
+        )
+
+        # Reset bypass count after reporting (it's a counter)
+        self._bypass_count = 0
+
+        if stats.is_empty():
+            return None
+        return stats
 
 
 __all__ = ["SchedulerConnector"]
