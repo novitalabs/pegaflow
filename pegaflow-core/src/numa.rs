@@ -75,8 +75,7 @@ pub fn get_current_cpu_numa_node() -> NumaNode {
 /// Uses `nvidia-smi topo --get-numa-id-of-nearby-cpu` to query the NUMA affinity
 /// of the specified GPU. This returns the NUMA node closest to the GPU's PCIe bus.
 ///
-/// If nvidia-smi is not available or fails, returns a heuristic based on the GPU ID
-/// (assuming alternating NUMA nodes for dual-socket systems).
+/// If nvidia-smi is not available or fails, returns `NumaNode::UNKNOWN`.
 ///
 /// # Arguments
 /// * `device_id` - The CUDA device ID (e.g., 0 for GPU 0)
@@ -93,8 +92,7 @@ pub fn get_device_numa_node(device_id: u32) -> NumaNode {
     {
         Ok(out) if out.status.success() => out,
         _ => {
-            // Fallback: use heuristic (alternating NUMA nodes for dual-socket)
-            return NumaNode(device_id % 2);
+            return NumaNode::UNKNOWN;
         }
     };
 
@@ -106,8 +104,7 @@ pub fn get_device_numa_node(device_id: u32) -> NumaNode {
         return NumaNode(node);
     }
 
-    // Fallback on parse error
-    NumaNode(device_id % 2)
+    NumaNode::UNKNOWN
 }
 
 /// Pin the current thread to CPUs on a specific NUMA node
@@ -174,12 +171,26 @@ pub fn get_gpu_numa_affinity() -> Vec<(u32, NumaNode)> {
         .output()
     {
         Ok(out) if out.status.success() => out,
-        _ => return Vec::new(),
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            log::warn!("nvidia-smi failed: {}", stderr);
+            return Vec::new();
+        }
+        Err(e) => {
+            log::warn!("nvidia-smi not found or failed to execute: {}", e);
+            return Vec::new();
+        }
     };
 
-    let count: u32 = match std::str::from_utf8(&output.stdout).map(|s| s.trim().parse::<u32>()) {
-        Ok(Ok(n)) => n,
-        _ => return Vec::new(),
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // nvidia-smi may return multiple lines, take the first non-empty line
+    let count_str = stdout.lines().next().map(|s| s.trim()).unwrap_or("");
+    let count: u32 = match count_str.parse::<u32>() {
+        Ok(n) => n,
+        Err(e) => {
+            log::warn!("Failed to parse GPU count '{}': {}", count_str, e);
+            return Vec::new();
+        }
     };
 
     (0..count)
