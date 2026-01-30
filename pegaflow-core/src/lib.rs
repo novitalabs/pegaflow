@@ -533,37 +533,32 @@ impl PegaEngine {
             .save(registration.clone(), save_blocks)
             .await?;
 
-        // Create sealed blocks and admit to cache
-        let mut sealed_blocks = Vec::new();
-        for (i, (_, block_hash)) in blocks_to_save.iter().enumerate() {
-            let k_ptr = (k_base + i * segment_size) as *mut u8;
-            let v_ptr = (v_base + i * segment_size) as *mut u8;
+        // Batch insert slots and admit to cache (single lock acquisition)
+        let blocks: Vec<(BlockKey, Arc<LayerBlock>)> = blocks_to_save
+            .iter()
+            .enumerate()
+            .map(|(i, (_, block_hash))| {
+                let k_ptr = (k_base + i * segment_size) as *mut u8;
+                let v_ptr = (v_base + i * segment_size) as *mut u8;
+                let key = BlockKey::new(namespace.to_string(), block_hash.clone());
+                let block = Arc::new(LayerBlock::new_split(
+                    k_ptr,
+                    v_ptr,
+                    block_size,
+                    Arc::clone(&k_allocation),
+                    Arc::clone(&v_allocation),
+                ));
+                (key, block)
+            })
+            .collect();
 
-            let block = Arc::new(LayerBlock::new_split(
-                k_ptr,
-                v_ptr,
-                block_size,
-                Arc::clone(&k_allocation),
-                Arc::clone(&v_allocation),
-            ));
+        let sealed_for_ssd = self
+            .storage
+            .insert_slots_batch(&blocks, slot_id, total_slots)
+            .map_err(|e| EngineError::Storage(e.to_string()))?;
 
-            if let Some(sealed) = self
-                .storage
-                .insert_slot(namespace, block_hash.clone(), slot_id, block, total_slots)
-                .map_err(|e| EngineError::Storage(e.to_string()))?
-            {
-                sealed_blocks.push(sealed);
-            }
-        }
-
-        self.storage.send_ssd_batch(&sealed_blocks);
-
-        // Admit to cache (prefix-aware: stop on first rejection)
-        for (key, block) in sealed_blocks {
-            if !self.storage.cache_admit(key, block) {
-                break;
-            }
-        }
+        // Send non-admitted blocks to SSD
+        self.storage.send_ssd_batch(&sealed_for_ssd);
 
         Ok(())
     }
@@ -611,32 +606,29 @@ impl PegaEngine {
             .save(registration.clone(), save_blocks)
             .await?;
 
-        let mut sealed_blocks = Vec::new();
-        for (i, (_, block_hash)) in blocks_to_save.iter().enumerate() {
-            let cpu_ptr = (base_addr + i * block_size) as *mut u8;
+        // Batch insert slots and admit to cache (single lock acquisition)
+        let blocks: Vec<(BlockKey, Arc<LayerBlock>)> = blocks_to_save
+            .iter()
+            .enumerate()
+            .map(|(i, (_, block_hash))| {
+                let cpu_ptr = (base_addr + i * block_size) as *mut u8;
+                let key = BlockKey::new(namespace.to_string(), block_hash.clone());
+                let block = Arc::new(LayerBlock::new_contiguous(
+                    cpu_ptr,
+                    block_size,
+                    Arc::clone(&allocation),
+                ));
+                (key, block)
+            })
+            .collect();
 
-            let block = Arc::new(LayerBlock::new_contiguous(
-                cpu_ptr,
-                block_size,
-                Arc::clone(&allocation),
-            ));
+        let sealed_for_ssd = self
+            .storage
+            .insert_slots_batch(&blocks, slot_id, total_slots)
+            .map_err(|e| EngineError::Storage(e.to_string()))?;
 
-            if let Some(sealed) = self
-                .storage
-                .insert_slot(namespace, block_hash.clone(), slot_id, block, total_slots)
-                .map_err(|e| EngineError::Storage(e.to_string()))?
-            {
-                sealed_blocks.push(sealed);
-            }
-        }
-
-        self.storage.send_ssd_batch(&sealed_blocks);
-
-        for (key, block) in sealed_blocks {
-            if !self.storage.cache_admit(key, block) {
-                break;
-            }
-        }
+        // Send non-admitted blocks to SSD
+        self.storage.send_ssd_batch(&sealed_for_ssd);
 
         Ok(())
     }
