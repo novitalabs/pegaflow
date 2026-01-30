@@ -223,6 +223,7 @@ class PegaKVConnectorStats(KVConnectorStats):
     def is_empty(self) -> bool:
         return (
             self.data.get("pending_prefetches", 0) == 0
+            and self.data.get("pending_save_requests", 0) == 0
             and self.data.get("bypass_count", 0) == 0
             and len(self.data.get("prefetch_duration", [])) == 0
             and len(self.data.get("load_duration", [])) == 0
