@@ -29,13 +29,15 @@ class SchedulerConnector:
     """Holds scheduler-only state and behaviors."""
 
     # Bypass thresholds (configurable via environment variables).
+    # Default 0 means disabled - bypass strategy only activates when explicitly set.
     # NOTE: Read from environment at module import time.
-    BYPASS_BLOCKS: int = parse_env_int("PEGA_BYPASS_BLOCKS", 8)
-    HIGH_LOAD_THRESHOLD: int = parse_env_int("PEGA_HIGH_LOAD_THRESHOLD", 25)
+    BYPASS_BLOCKS: int = parse_env_int("PEGA_BYPASS_BLOCKS", 0)
+    HIGH_LOAD_THRESHOLD: int = parse_env_int("PEGA_HIGH_LOAD_THRESHOLD", 0)
 
     # Maximum number of requests that can have pending saves simultaneously.
-    # When this limit is reached, new save intents will be dropped.
-    MAX_PENDING_SAVE_REQUESTS: int = parse_env_int("PEGA_MAX_PENDING_SAVE_REQUESTS", 10)
+    # Default 0 means unlimited - drop strategy only activates when explicitly set.
+    # When this limit is reached, new save intents will be dropped (shorter first).
+    MAX_PENDING_SAVE_REQUESTS: int = parse_env_int("PEGA_MAX_PENDING_SAVE_REQUESTS", 0)
 
     def __init__(self, context: ConnectorContext):
         self._ctx = context
@@ -198,43 +200,50 @@ class SchedulerConnector:
 
         # Apply save limit: drop new save intents if pending saves exceed limit
         # Priority: longer requests (more blocks) are kept, shorter ones are dropped
+        # When MAX_PENDING_SAVE_REQUESTS <= 0, no limit is applied (all saves allowed)
         save_intents: dict[str, SaveIntent] = {}
-        current_pending = len(self._pending_saves)
-        available_slots = max(0, self.MAX_PENDING_SAVE_REQUESTS - current_pending)
 
-        # Separate continuing saves (already in pending) from new requests
-        continuing_saves: dict[str, SaveIntent] = {}
-        new_saves: list[tuple[str, SaveIntent, int]] = []  # (req_id, intent, block_count)
+        if self.MAX_PENDING_SAVE_REQUESTS <= 0:
+            # No limit configured - save all requests
+            save_intents = potential_saves
+        else:
+            # Apply limit with length-based priority
+            current_pending = len(self._pending_saves)
+            available_slots = max(0, self.MAX_PENDING_SAVE_REQUESTS - current_pending)
 
-        for req_id, intent in potential_saves.items():
-            if req_id in self._pending_saves:
-                # Continuing saves are always allowed
-                continuing_saves[req_id] = intent
-            else:
-                # New request - record its total block count for sorting
-                block_count = len(self._block_hashes.get(req_id, ()))
-                new_saves.append((req_id, intent, block_count))
+            # Separate continuing saves (already in pending) from new requests
+            continuing_saves: dict[str, SaveIntent] = {}
+            new_saves: list[tuple[str, SaveIntent, int]] = []  # (req_id, intent, block_count)
 
-        # Sort new requests by block count (descending) - longer requests first
-        new_saves.sort(key=lambda x: x[2], reverse=True)
+            for req_id, intent in potential_saves.items():
+                if req_id in self._pending_saves:
+                    # Continuing saves are always allowed
+                    continuing_saves[req_id] = intent
+                else:
+                    # New request - record its total block count for sorting
+                    block_count = len(self._block_hashes.get(req_id, ()))
+                    new_saves.append((req_id, intent, block_count))
 
-        # Add all continuing saves
-        save_intents.update(continuing_saves)
+            # Sort new requests by block count (descending) - longer requests first
+            new_saves.sort(key=lambda x: x[2], reverse=True)
 
-        # Add new saves up to available slots, prioritizing longer requests
-        for req_id, intent, block_count in new_saves:
-            if len(save_intents) - len(continuing_saves) < available_slots:
-                save_intents[req_id] = intent
-            else:
-                # Drop this save intent due to limit (shorter requests dropped first)
-                self._save_dropped_count += 1
-                logger.warning(
-                    "[PegaKVConnector] Save limit reached (%d/%d), dropping req=%s (blocks=%d)",
-                    current_pending,
-                    self.MAX_PENDING_SAVE_REQUESTS,
-                    req_id,
-                    block_count,
-                )
+            # Add all continuing saves
+            save_intents.update(continuing_saves)
+
+            # Add new saves up to available slots, prioritizing longer requests
+            for req_id, intent, block_count in new_saves:
+                if len(save_intents) - len(continuing_saves) < available_slots:
+                    save_intents[req_id] = intent
+                else:
+                    # Drop this save intent due to limit (shorter requests dropped first)
+                    self._save_dropped_count += 1
+                    logger.warning(
+                        "[PegaKVConnector] Save limit reached (%d/%d), dropping req=%s (blocks=%d)",
+                        current_pending,
+                        self.MAX_PENDING_SAVE_REQUESTS,
+                        req_id,
+                        block_count,
+                    )
 
         # Track requests with pending saves
         self._pending_saves.update(save_intents.keys())
