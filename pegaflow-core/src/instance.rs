@@ -5,13 +5,28 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex},
 };
 
 use cudarc::driver::CudaContext;
 use log::info;
 
 use crate::{EngineError, gpu_worker::GpuWorkerPool};
+
+/// Layer metadata protected by a single mutex.
+///
+/// This struct consolidates layer name mappings and GPU contexts to avoid
+/// potential deadlocks from acquiring multiple locks in inconsistent order.
+struct LayerMetadata {
+    /// Mapping from layer names to numeric IDs (0..num_layers).
+    name_to_id: HashMap<String, usize>,
+
+    /// Inverse mapping from IDs to layer names.
+    names: Vec<String>,
+
+    /// GPU contexts indexed by CUDA device ID.
+    gpu_contexts: HashMap<i32, Arc<GpuContext>>,
+}
 
 /// Compute greatest common divisor using Euclidean algorithm.
 fn gcd(mut a: usize, mut b: usize) -> usize {
@@ -217,14 +232,11 @@ pub struct InstanceContext {
     /// Total world size (TP × PP × DP).
     world_size: usize,
 
-    /// Mapping from layer names to numeric IDs (0..num_layers).
-    layer_name_to_id: Mutex<HashMap<String, usize>>,
-
-    /// Inverse mapping from IDs to layer names.
-    layer_names: Mutex<Vec<String>>,
-
-    /// GPU contexts indexed by CUDA device ID.
-    gpu_contexts: RwLock<HashMap<i32, Arc<GpuContext>>>,
+    /// Layer metadata and GPU contexts protected by a single mutex.
+    ///
+    /// This consolidates previously separate mutexes to prevent deadlocks
+    /// from inconsistent lock acquisition ordering.
+    metadata: Mutex<LayerMetadata>,
 }
 
 impl InstanceContext {
@@ -249,9 +261,11 @@ impl InstanceContext {
             num_layers,
             tp_size,
             world_size,
-            layer_name_to_id: Mutex::new(HashMap::new()),
-            layer_names: Mutex::new(Vec::new()),
-            gpu_contexts: RwLock::new(HashMap::new()),
+            metadata: Mutex::new(LayerMetadata {
+                name_to_id: HashMap::new(),
+                names: Vec::new(),
+                gpu_contexts: HashMap::new(),
+            }),
         })
     }
 
@@ -261,19 +275,15 @@ impl InstanceContext {
     /// - `Some(id)` if the layer was newly allocated
     /// - `None` if the layer already exists
     pub fn allocate_new_layer_id(&self, layer_name: &str) -> Option<usize> {
-        let mut map = self
-            .layer_name_to_id
-            .lock()
-            .expect("layer_name_to_id lock poisoned");
+        let mut metadata = self.metadata.lock().expect("metadata lock poisoned");
 
-        if map.contains_key(layer_name) {
+        if metadata.name_to_id.contains_key(layer_name) {
             return None;
         }
 
-        let mut names = self.layer_names.lock().expect("layer_names lock poisoned");
-        let id = names.len();
-        names.push(layer_name.to_string());
-        map.insert(layer_name.to_string(), id);
+        let id = metadata.names.len();
+        metadata.names.push(layer_name.to_string());
+        metadata.name_to_id.insert(layer_name.to_string(), id);
         Some(id)
     }
 
@@ -283,19 +293,15 @@ impl InstanceContext {
     /// returns the same ID. Used for MLA where multiple TP ranks register
     /// the same layer name on different devices.
     pub fn get_or_allocate_layer_id(&self, layer_name: &str) -> usize {
-        let mut map = self
-            .layer_name_to_id
-            .lock()
-            .expect("layer_name_to_id lock poisoned");
+        let mut metadata = self.metadata.lock().expect("metadata lock poisoned");
 
-        if let Some(&id) = map.get(layer_name) {
+        if let Some(&id) = metadata.name_to_id.get(layer_name) {
             return id;
         }
 
-        let mut names = self.layer_names.lock().expect("layer_names lock poisoned");
-        let id = names.len();
-        names.push(layer_name.to_string());
-        map.insert(layer_name.to_string(), id);
+        let id = metadata.names.len();
+        metadata.names.push(layer_name.to_string());
+        metadata.name_to_id.insert(layer_name.to_string(), id);
         id
     }
 
@@ -303,11 +309,8 @@ impl InstanceContext {
     ///
     /// Returns `None` if the layer has not been registered.
     pub fn get_layer_id(&self, layer_name: &str) -> Option<usize> {
-        let map = self
-            .layer_name_to_id
-            .lock()
-            .expect("layer_name_to_id lock poisoned");
-        map.get(layer_name).copied()
+        let metadata = self.metadata.lock().expect("metadata lock poisoned");
+        metadata.name_to_id.get(layer_name).copied()
     }
 
     /// Calculate the total number of storage slots.
@@ -355,33 +358,29 @@ impl InstanceContext {
             )));
         }
 
-        // Fast path: read lock
+        // Fast path: check if context exists
         {
-            let contexts = self
-                .gpu_contexts
-                .read()
-                .expect("gpu contexts read lock poisoned");
-            if let Some(ctx) = contexts.get(&device_id) {
+            let metadata = self.metadata.lock().expect("metadata lock poisoned");
+            if let Some(ctx) = metadata.gpu_contexts.get(&device_id) {
                 return Ok(Arc::clone(ctx));
             }
         }
 
-        // Slow path: write lock for initialization
-        let mut contexts = self
-            .gpu_contexts
-            .write()
-            .expect("gpu contexts write lock poisoned");
-
-        // Double-check after acquiring write lock
-        if let Some(ctx) = contexts.get(&device_id) {
-            return Ok(Arc::clone(ctx));
-        }
-
+        // Slow path: create new context
         let cuda_ctx = CudaContext::new(device_id as usize)
             .map_err(|e| EngineError::CudaInit(format!("{e:?}")))?;
 
         let ctx = Arc::new(GpuContext::new(cuda_ctx, device_id)?);
-        contexts.insert(device_id, Arc::clone(&ctx));
+
+        // Insert and return
+        let mut metadata = self.metadata.lock().expect("metadata lock poisoned");
+
+        // Double-check after acquiring lock
+        if let Some(existing) = metadata.gpu_contexts.get(&device_id) {
+            return Ok(Arc::clone(existing));
+        }
+
+        metadata.gpu_contexts.insert(device_id, Arc::clone(&ctx));
 
         info!("Initialized GPU context: device_id={}", device_id);
         Ok(ctx)
@@ -389,11 +388,8 @@ impl InstanceContext {
 
     /// Get an existing GPU context without creating one.
     pub fn get_gpu(&self, device_id: i32) -> Option<Arc<GpuContext>> {
-        let contexts = self
-            .gpu_contexts
-            .read()
-            .expect("gpu contexts read lock poisoned");
-        contexts.get(&device_id).cloned()
+        let metadata = self.metadata.lock().expect("metadata lock poisoned");
+        metadata.gpu_contexts.get(&device_id).cloned()
     }
 
     /// Register a layer on a GPU.
