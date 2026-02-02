@@ -28,6 +28,14 @@ pub struct Cli {
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info")]
     pub log_level: String,
+
+    /// Maximum cache capacity in MB
+    #[arg(long, default_value = "512")]
+    pub max_capacity_mb: u64,
+
+    /// Cache entry TTL in minutes
+    #[arg(long, default_value = "120")]
+    pub ttl_minutes: u64,
 }
 
 /// Initialize logging with the specified log level
@@ -95,9 +103,15 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
 
     info!("Starting PegaFlow MetaServer");
     info!("Binding to address: {}", cli.addr);
+    info!("Max cache capacity: {} MB", cli.max_capacity_mb);
+    info!("Cache entry TTL: {} minutes", cli.ttl_minutes);
 
-    // Create the block hash store
-    let store = Arc::new(BlockHashStore::new());
+    // Create the block hash store with custom capacity and TTL
+    let max_capacity_bytes = cli.max_capacity_mb * 1024 * 1024;
+    let store = Arc::new(BlockHashStore::with_capacity_and_ttl(
+        max_capacity_bytes,
+        cli.ttl_minutes,
+    ));
 
     // Create shutdown notifier
     let shutdown = Arc::new(Notify::new());

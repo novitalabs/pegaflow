@@ -59,7 +59,13 @@ cargo run -p pegaflow-metaserver -- --addr 0.0.0.0:50056
 # With debug logging
 cargo run -p pegaflow-metaserver -- --log-level debug
 
-# All options
+# Custom cache capacity (1GB) and TTL (60 minutes)
+cargo run -p pegaflow-metaserver -- --max-capacity-mb 1024 --ttl-minutes 60
+
+# All options combined
+cargo run -p pegaflow-metaserver -- --addr 0.0.0.0:50056 --max-capacity-mb 2048 --ttl-minutes 180 --log-level info
+
+# Show all options
 cargo run -p pegaflow-metaserver -- --help
 ```
 
@@ -67,6 +73,26 @@ cargo run -p pegaflow-metaserver -- --help
 
 - `--addr <ADDR>`: Bind address (default: `127.0.0.1:50056`)
 - `--log-level <LEVEL>`: Log level: `trace`, `debug`, `info`, `warn`, `error` (default: `info`)
+- `--max-capacity-mb <MB>`: Maximum cache capacity in MB (default: `512`)
+- `--ttl-minutes <MINUTES>`: Cache entry TTL in minutes (default: `120`)
+
+### Cache Configuration
+
+The MetaServer uses an in-memory cache with the following settings:
+
+- **Default Max Capacity**: 512 MB (configurable via `--max-capacity-mb`)
+- **Eviction Policy**: LRU (Least Recently Used)
+- **TTL (Time-To-Live)**: 120 minutes (configurable via `--ttl-minutes`)
+- **Size Calculation**: Automatic based on key allocated capacity (namespace + hash + overhead)
+- **Async Operations**: All cache operations are non-blocking async
+
+The cache automatically evicts least recently used entries when the memory limit is reached, and all entries expire after the configured TTL. This ensures the service operates within memory constraints even under high load while preventing stale entries from accumulating indefinitely.
+
+You can customize the cache behavior using CLI flags:
+```bash
+# Example: 1GB capacity with 60-minute TTL
+cargo run -p pegaflow-metaserver -- --max-capacity-mb 1024 --ttl-minutes 60
+```
 
 ## gRPC APIs
 
@@ -182,11 +208,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Storage Implementation
 
-The MetaServer uses a thread-safe in-memory store based on `DashMap`:
+The MetaServer uses a high-performance async cache based on **Moka**:
 
-- **Storage**: `DashMap<BlockKey, ()>` - essentially a concurrent hash set
+- **Cache**: `moka::future::Cache<BlockKey, ()>` - async concurrent cache with LRU eviction and TTL
 - **BlockKey**: `{ namespace: String, hash: Vec<u8> }` - matches pegaflow-core's BlockKey
-- **Concurrency**: Lock-free concurrent reads and writes via DashMap
+- **Eviction Policy**: LRU (Least Recently Used)
+- **TTL**: 120 minutes - entries automatically expire after 2 hours
+- **Capacity Management**: Size-aware eviction with configurable max capacity (default: 512 MB)
+- **Concurrency**: Fully async with high-performance concurrent operations optimized for high-throughput services
+- **Memory Safety**: Automatic eviction when cache size exceeds max capacity or TTL expires
 - **Persistence**: In-memory only (restart clears state)
 
 ### Future Enhancements
@@ -195,7 +225,7 @@ Potential improvements for production deployments:
 
 - [ ] Persistent storage backend (Redis, RocksDB, etc.)
 - [ ] Replication and high availability
-- [ ] TTL/expiration for stale entries
+- [x] TTL/expiration for stale entries (120 minutes)
 - [ ] Metrics and monitoring (Prometheus)
 - [ ] Authentication and authorization
 - [ ] Batch operations for improved performance
