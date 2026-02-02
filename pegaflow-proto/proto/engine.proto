@@ -122,3 +122,33 @@ service Engine {
   rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
   rpc Health(HealthRequest) returns (HealthResponse);
 }
+
+// MetaServer service for managing block hash keys across multi-node instances
+message InsertBlockHashesRequest {
+  string namespace = 1;
+  repeated bytes block_hashes = 2;
+}
+
+message InsertBlockHashesResponse {
+  ResponseStatus status = 1;
+  uint64 inserted_count = 2;
+}
+
+message QueryBlockHashesRequest {
+  string namespace = 1;
+  repeated bytes block_hashes = 2;
+}
+
+message QueryBlockHashesResponse {
+  ResponseStatus status = 1;
+  repeated bytes existing_hashes = 2;
+  uint64 total_queried = 3;
+  uint64 found_count = 4;
+}
+
+service MetaServer {
+  rpc InsertBlockHashes(InsertBlockHashesRequest) returns (InsertBlockHashesResponse);
+  rpc QueryBlockHashes(QueryBlockHashesRequest) returns (QueryBlockHashesResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+}

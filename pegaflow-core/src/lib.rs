@@ -5,6 +5,7 @@
 //! - Tensor parallelism (TP) across multiple GPUs
 //! - Split-storage layout for efficient K/V batch transfers
 //! - SSD caching tier
+//! - Kubernetes service discovery for inter-node communication
 
 #[macro_use]
 mod trace;
@@ -14,6 +15,7 @@ pub mod block;
 mod cache;
 pub mod gpu_worker;
 pub mod instance;
+pub mod internode;
 pub mod logging;
 mod metrics;
 pub mod numa;
