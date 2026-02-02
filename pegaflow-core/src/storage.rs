@@ -24,7 +24,8 @@ use crate::block::{
 };
 use crate::cache::{CacheInsertOutcome, TinyLfuCache};
 use crate::metrics::core_metrics;
-use crate::pinned_pool::{PinnedAllocation, PinnedMemoryPool};
+use crate::numa::NumaNode;
+use crate::pinned_pool::{PinnedAllocation, PinnedAllocator};
 use crate::ssd_cache::{
     PrefetchBatch, PrefetchRequest, SsdCacheConfig, SsdIndexEntry, SsdStorageHandle, SsdWriteBatch,
     ssd_prefetch_loop, ssd_writer_loop,
@@ -103,6 +104,9 @@ pub struct StorageConfig {
     pub max_prefetch_blocks: usize,
     /// Optional SSD cache for sealed blocks (single-node, FIFO).
     pub ssd_cache_config: Option<SsdCacheConfig>,
+    /// Enable NUMA-aware memory allocation. When true on multi-NUMA systems,
+    /// PegaEngine auto-detects topology and creates per-node pinned pools.
+    pub enable_numa_affinity: bool,
 }
 
 impl Default for StorageConfig {
@@ -112,6 +116,7 @@ impl Default for StorageConfig {
             hint_value_size_bytes: None,
             max_prefetch_blocks: MAX_PREFETCH_BLOCKS,
             ssd_cache_config: None,
+            enable_numa_affinity: true,
         }
     }
 }
@@ -170,8 +175,8 @@ struct StorageInner {
 }
 
 pub struct StorageEngine {
-    /// Pinned memory allocator
-    pinned_pool: Arc<PinnedMemoryPool>,
+    /// Unified pinned memory allocator (handles both global and NUMA modes)
+    allocator: Arc<PinnedAllocator>,
 
     /// All mutable state under one lock
     inner: Mutex<StorageInner>,
@@ -189,18 +194,42 @@ pub struct StorageEngine {
 impl StorageEngine {
     /// Create a new StorageEngine with optional seal notification channel.
     /// Returns (engine, receiver) where receiver gets notified of sealed blocks.
+    ///
+    /// # Arguments
+    /// * `capacity_bytes` - Total pinned memory pool capacity
+    /// * `use_hugepages` - Use 2MB huge pages for allocation
+    /// * `config` - Storage behavior configuration
+    /// * `numa_nodes` - NUMA nodes for per-node pools (empty = single global pool)
     pub fn new_with_config(
         capacity_bytes: usize,
         use_hugepages: bool,
         config: impl Into<StorageConfig>,
+        numa_nodes: &[NumaNode],
     ) -> (Arc<Self>, UnboundedReceiver<SealNotification>) {
         let config = config.into();
         let value_size_hint = config.hint_value_size_bytes.filter(|size| *size > 0);
-        let pinned_pool = Arc::new(PinnedMemoryPool::new(
-            capacity_bytes,
-            use_hugepages,
-            value_size_hint.and_then(|size| NonZeroU64::new(size as u64)),
-        ));
+        let unit_hint = value_size_hint.and_then(|size| NonZeroU64::new(size as u64));
+
+        // Create unified allocator based on NUMA configuration
+        let allocator = if !numa_nodes.is_empty() {
+            info!(
+                "Creating NUMA-aware pinned pools for {} nodes",
+                numa_nodes.len()
+            );
+            Arc::new(PinnedAllocator::new_numa(
+                capacity_bytes,
+                numa_nodes,
+                use_hugepages,
+                unit_hint,
+            ))
+        } else {
+            info!("Creating global pinned pool (NUMA affinity disabled)");
+            Arc::new(PinnedAllocator::new_global(
+                capacity_bytes,
+                use_hugepages,
+                unit_hint,
+            ))
+        };
 
         let cache = TinyLfuCache::new_unbounded(
             capacity_bytes,
@@ -234,7 +263,7 @@ impl StorageEngine {
         };
 
         let engine = Arc::new(Self {
-            pinned_pool,
+            allocator,
             inner,
             seal_notify_tx: Some(seal_notify_tx),
             ssd_state,
@@ -389,7 +418,7 @@ impl StorageEngine {
             move |size| {
                 weak_alloc
                     .upgrade()
-                    .and_then(|engine| engine.allocate(NonZeroU64::new(size)?))
+                    .and_then(|engine| engine.allocate(NonZeroU64::new(size)?, None))
             },
         )))
     }
@@ -399,18 +428,36 @@ impl StorageEngine {
         self.ssd_state.is_some()
     }
 
+    /// Returns true if NUMA-aware allocation is enabled.
+    pub fn is_numa_enabled(&self) -> bool {
+        self.allocator.is_numa()
+    }
+
     // ========================================================================
     // Allocation
     // ========================================================================
 
-    pub fn allocate(&self, size: NonZeroU64) -> Option<Arc<PinnedAllocation>> {
+    /// Allocate pinned memory, optionally from a specific NUMA node's pool.
+    ///
+    /// If `numa_node` is `Some` and NUMA pools are configured, allocates from
+    /// that NUMA node's pool. Otherwise uses the global pool.
+    ///
+    /// Returns `None` if the pool is exhausted after eviction attempts.
+    pub fn allocate(
+        &self,
+        size: NonZeroU64,
+        numa_node: Option<NumaNode>,
+    ) -> Option<Arc<PinnedAllocation>> {
         let requested_bytes = size.get();
+        let node = numa_node.unwrap_or(NumaNode::UNKNOWN);
 
         loop {
-            if let Some(allocation) = self.pinned_pool.allocate(size) {
-                return Some(Arc::new(allocation));
+            // Try to allocate from the unified allocator
+            if let Some(alloc) = self.allocator.allocate(size, node) {
+                return Some(alloc);
             }
 
+            // Allocation failed, try to reclaim memory
             let (freed_blocks, freed_bytes, largest_free) =
                 self.reclaim_until_allocator_can_allocate(requested_bytes);
 
@@ -418,19 +465,31 @@ impl StorageEngine {
                 continue;
             }
 
-            let (used, total) = self.pinned_pool.usage();
+            // Still can't allocate, report error
+            let (used, total) = self.allocator.usage();
             error!(
-                "Pinned memory pool exhausted; cannot satisfy allocation: requested={} used={} total={} largest_free={} freed_blocks={} freed_bytes={}",
+                "Pinned memory pool exhausted; cannot satisfy allocation: requested={} used={} total={} largest_free={} freed_blocks={} freed_bytes={} numa={:?}",
                 ByteSize(requested_bytes),
                 ByteSize(used),
                 ByteSize(total),
                 ByteSize(largest_free),
                 freed_blocks,
-                ByteSize(freed_bytes)
+                ByteSize(freed_bytes),
+                numa_node
             );
             core_metrics().pool_alloc_failures.add(1, &[]);
             return None;
         }
+    }
+
+    /// Get aggregate pool usage: (used_bytes, total_bytes)
+    fn pool_usage(&self) -> (u64, u64) {
+        self.allocator.usage()
+    }
+
+    /// Get largest free allocation across all pools.
+    fn largest_free_allocation(&self) -> u64 {
+        self.allocator.largest_free_allocation()
     }
 
     // ========================================================================
@@ -705,15 +764,15 @@ impl StorageEngine {
 
     fn reclaim_until_allocator_can_allocate(&self, required_bytes: u64) -> (usize, u64, u64) {
         if required_bytes == 0 {
-            return (0, 0, self.pinned_pool.largest_free_allocation());
+            return (0, 0, self.largest_free_allocation());
         }
 
         let mut freed_blocks = 0usize;
         let mut freed_bytes = 0u64;
-        let mut largest_free = self.pinned_pool.largest_free_allocation();
+        let mut largest_free = self.largest_free_allocation();
 
         while largest_free < required_bytes {
-            let used_before = self.pinned_pool.usage().0;
+            let used_before = self.pool_usage().0;
 
             // Collect evicted blocks under lock, then drop outside lock
             let evicted: Vec<_> = {
@@ -748,7 +807,7 @@ impl StorageEngine {
             freed_blocks += evicted.len();
 
             drop(evicted); // allow allocation drops to run before sampling allocator usage
-            let used_after = self.pinned_pool.usage().0;
+            let used_after = self.pool_usage().0;
             let reclaimed = used_before.saturating_sub(used_after);
             if reclaimed > 0 {
                 core_metrics()
@@ -756,7 +815,7 @@ impl StorageEngine {
                     .add(reclaimed, &[]);
             }
 
-            largest_free = self.pinned_pool.largest_free_allocation();
+            largest_free = self.largest_free_allocation();
         }
 
         if freed_blocks > 0 {

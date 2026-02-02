@@ -226,6 +226,7 @@ impl PegaEngine {
     ///     layer_names: List of layer names to load
     ///     block_ids: GPU block IDs to load into (list of ints)
     ///     block_hashes: Content hashes for each block (list of bytes)
+    #[allow(clippy::too_many_arguments)]
     fn batch_load_kv_blocks(
         &self,
         py: Python<'_>,

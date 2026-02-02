@@ -63,9 +63,13 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub use_hugepages: bool,
 
-    /// Disable TinyLFU admission (falls back to plain LRU inserts)
-    #[arg(long, default_value_t = true)]
-    pub disable_lfu_admission: bool,
+    /// Enable TinyLFU admission policy for cache (default: plain LRU)
+    #[arg(long, default_value_t = false)]
+    pub enable_lfu_admission: bool,
+
+    /// Disable NUMA-aware memory allocation (use single pool instead of per-node pools)
+    #[arg(long, default_value_t = false)]
+    pub disable_numa_affinity: bool,
 
     /// Address for Prometheus metrics HTTP endpoint (e.g. 0.0.0.0:9091). Leave empty to disable.
     #[arg(long, default_value = "0.0.0.0:9091")]
@@ -347,14 +351,18 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     });
 
     let storage_config = pegaflow_core::StorageConfig {
-        enable_lfu_admission: !cli.disable_lfu_admission,
+        enable_lfu_admission: cli.enable_lfu_admission,
         hint_value_size_bytes: cli.hint_value_size,
         max_prefetch_blocks: cli.max_prefetch_blocks,
         ssd_cache_config,
+        enable_numa_affinity: !cli.disable_numa_affinity,
     };
 
-    if cli.disable_lfu_admission {
-        info!("TinyLFU cache admission disabled; falling back to plain LRU inserts");
+    if cli.enable_lfu_admission {
+        info!("TinyLFU cache admission enabled");
+    }
+    if cli.disable_numa_affinity {
+        info!("NUMA-aware memory allocation disabled");
     }
 
     // Create Tokio runtime early - needed for OTLP metrics gRPC exporter

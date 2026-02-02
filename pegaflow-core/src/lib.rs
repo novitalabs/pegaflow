@@ -27,6 +27,8 @@ pub use block::{
     BlockHash, BlockInsertError, BlockKey, BlockStatus, LayerBlock, PrefetchStatus, SealedBlock,
 };
 pub use instance::{GpuContext, InstanceContext, KVCacheRegistration};
+pub use numa::NumaNode;
+use numa::NumaTopology;
 pub use pinned_pool::PinnedAllocation;
 pub use seal_offload::SlotMeta;
 pub use ssd_cache::{
@@ -119,6 +121,7 @@ impl From<LoadStateError> for EngineError {
 /// - Manages multiple inference instances
 /// - Coordinates GPU worker pools for async transfers
 /// - Interfaces with the storage engine for block caching
+/// - Tracks GPU-NUMA topology for optimal memory locality
 ///
 /// The engine is thread-safe and can be shared across async tasks.
 pub struct PegaEngine {
@@ -126,6 +129,8 @@ pub struct PegaEngine {
     instances: RwLock<HashMap<String, Arc<InstanceContext>>>,
     /// Storage engine for pinned memory, block cache, and SSD tier.
     storage: Arc<StorageEngine>,
+    /// GPU-NUMA topology for memory allocation decisions.
+    topology: Arc<NumaTopology>,
 }
 
 #[allow(clippy::new_without_default)]
@@ -152,18 +157,39 @@ impl PegaEngine {
     /// Create an engine with full custom configuration.
     ///
     /// Returns the engine and a receiver for seal notifications (used for SSD offload).
+    ///
+    /// If `storage_config.enable_numa_affinity` is true and the system has multiple
+    /// NUMA nodes, per-node pinned memory pools are created for optimal bandwidth.
     pub fn new_with_config(
         pool_size: usize,
         use_hugepages: bool,
         storage_config: impl Into<storage::StorageConfig>,
     ) -> (Self, tokio::sync::mpsc::UnboundedReceiver<SealNotification>) {
+        // Detect GPU-NUMA topology
+        let topology = Arc::new(NumaTopology::detect());
+        topology.log_summary();
+
+        // Resolve NUMA nodes based on config and topology
+        let config = storage_config.into();
+        let numa_nodes: Vec<numa::NumaNode> =
+            if config.enable_numa_affinity && topology.is_multi_numa() {
+                info!(
+                    "Auto-enabling NUMA-aware memory allocation for {} nodes",
+                    topology.num_nodes()
+                );
+                topology.numa_nodes().to_vec()
+            } else {
+                vec![]
+            };
+
         let (storage, seal_notify_rx) =
-            StorageEngine::new_with_config(pool_size, use_hugepages, storage_config);
+            StorageEngine::new_with_config(pool_size, use_hugepages, config, &numa_nodes);
 
         (
             PegaEngine {
                 instances: RwLock::new(HashMap::new()),
                 storage,
+                topology,
             },
             seal_notify_rx,
         )
@@ -272,7 +298,20 @@ impl PegaEngine {
         let instance =
             self.get_or_create_instance(instance_id, namespace, num_layers, tp_size, world_size)?;
 
-        instance.register_new_gpu_layer(device_id, &layer_name, registration)?;
+        // Get NUMA affinity for this GPU
+        let numa_node = self.topology.numa_for_gpu(device_id);
+
+        // Validate NUMA topology if NUMA-aware allocation is enabled
+        if self.storage.is_numa_enabled() && numa_node.is_unknown() {
+            return Err(EngineError::InvalidArgument(format!(
+                "NUMA-aware allocation is enabled, but GPU {} NUMA affinity is unknown. \
+                 Please ensure nvidia-smi is available and GPU NUMA topology is detectable, \
+                 or disable NUMA-aware allocation.",
+                device_id
+            )));
+        }
+
+        instance.register_new_gpu_layer(device_id, numa_node, &layer_name, registration)?;
 
         info!(
             "Registered context: instance={instance_id}, namespace={namespace}, \
@@ -486,7 +525,9 @@ impl PegaEngine {
         let segment_size = registration.bytes_per_block;
         let num_blocks = blocks_to_save.len();
 
-        // Allocate separate regions for K and V
+        // Allocate separate regions for K and V (NUMA-aware if configured)
+        let numa_node = Some(gpu.preferred_numa());
+
         let k_total_size = (segment_size as u64)
             .checked_mul(num_blocks as u64)
             .and_then(NonZeroU64::new)
@@ -494,17 +535,23 @@ impl PegaEngine {
                 EngineError::Storage("allocation size overflow for K segments".to_string())
             })?;
 
-        let mut k_allocation = self.storage.allocate(k_total_size).ok_or_else(|| {
-            EngineError::Storage(
-                "pinned pool exhausted while allocating K segment buffer".to_string(),
-            )
-        })?;
+        let mut k_allocation = self
+            .storage
+            .allocate(k_total_size, numa_node)
+            .ok_or_else(|| {
+                EngineError::Storage(
+                    "pinned pool exhausted while allocating K segment buffer".to_string(),
+                )
+            })?;
 
-        let mut v_allocation = self.storage.allocate(k_total_size).ok_or_else(|| {
-            EngineError::Storage(
-                "pinned pool exhausted while allocating V segment buffer".to_string(),
-            )
-        })?;
+        let mut v_allocation = self
+            .storage
+            .allocate(k_total_size, numa_node)
+            .ok_or_else(|| {
+                EngineError::Storage(
+                    "pinned pool exhausted while allocating V segment buffer".to_string(),
+                )
+            })?;
 
         // Get base pointers
         let (k_base, v_base) = {
@@ -576,17 +623,21 @@ impl PegaEngine {
         gpu: Arc<GpuContext>,
     ) -> Result<(), EngineError> {
         let num_blocks = blocks_to_save.len();
+        let numa_node = Some(gpu.preferred_numa());
 
         let total_size = (block_size as u64)
             .checked_mul(num_blocks as u64)
             .and_then(NonZeroU64::new)
             .ok_or_else(|| EngineError::Storage("allocation size overflow".to_string()))?;
 
-        let mut allocation = self.storage.allocate(total_size).ok_or_else(|| {
-            EngineError::Storage(
-                "pinned pool exhausted while allocating contiguous block buffer".to_string(),
-            )
-        })?;
+        let mut allocation = self
+            .storage
+            .allocate(total_size, numa_node)
+            .ok_or_else(|| {
+                EngineError::Storage(
+                    "pinned pool exhausted while allocating contiguous block buffer".to_string(),
+                )
+            })?;
 
         let base_addr = Arc::get_mut(&mut allocation)
             .ok_or_else(|| EngineError::Storage("allocation shared unexpectedly".to_string()))?

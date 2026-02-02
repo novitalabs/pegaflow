@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
 use cudarc::driver::{CudaContext, CudaStream};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use logforth::diagnostic::ThreadLocalDiagnostic;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::block::LayerBlock;
 use crate::metrics::core_metrics;
+use crate::numa::{NumaNode, pin_thread_to_numa_node};
 use crate::sync_state::LoadState;
 use crate::{EngineError, KVCacheRegistration, transfer};
 
@@ -57,16 +58,27 @@ pub struct GpuWorkerPool {
 }
 
 impl GpuWorkerPool {
-    /// Spawn a new worker pool for the given GPU device
-    pub fn spawn(device_id: i32) -> Result<Self, EngineError> {
+    /// Spawn a new worker pool for the given GPU device.
+    ///
+    /// Worker threads will be pinned to the specified NUMA node for optimal
+    /// memory locality during D2H/H2D transfers. If `numa_node` is unknown
+    /// or pinning fails, the worker will continue without NUMA affinity.
+    pub fn spawn(device_id: i32, numa_node: NumaNode) -> Result<Self, EngineError> {
         let (load_tx, load_rx) = mpsc::unbounded_channel();
         let (save_tx, save_rx) = mpsc::unbounded_channel();
 
         // Spawn load worker thread
         let load_device_id = device_id;
+        let load_numa = numa_node;
         std::thread::Builder::new()
             .name(format!("gpu{}-load", device_id))
             .spawn(move || {
+                // Pin thread to NUMA node before any allocations
+                if load_numa.is_valid()
+                    && let Err(e) = pin_thread_to_numa_node(load_numa)
+                {
+                    warn!("Failed to pin load worker to {}: {}", load_numa, e);
+                }
                 if let Err(e) = load_worker_loop(load_device_id, load_rx) {
                     error!(
                         "Load worker failed: device={} error={:?}",
@@ -78,9 +90,16 @@ impl GpuWorkerPool {
 
         // Spawn save worker thread
         let save_device_id = device_id;
+        let save_numa = numa_node;
         std::thread::Builder::new()
             .name(format!("gpu{}-save", device_id))
             .spawn(move || {
+                // Pin thread to NUMA node before any allocations
+                if save_numa.is_valid()
+                    && let Err(e) = pin_thread_to_numa_node(save_numa)
+                {
+                    warn!("Failed to pin save worker to {}: {}", save_numa, e);
+                }
                 if let Err(e) = save_worker_loop(save_device_id, save_rx) {
                     error!(
                         "Save worker failed: device={} error={:?}",
@@ -90,7 +109,10 @@ impl GpuWorkerPool {
             })
             .map_err(|e| EngineError::CudaInit(format!("Failed to spawn save worker: {e}")))?;
 
-        info!("GPU worker pool started: device={}", device_id);
+        info!(
+            "GPU worker pool started: device={}, numa_node={}",
+            device_id, numa_node
+        );
         Ok(Self {
             device_id,
             load_tx,

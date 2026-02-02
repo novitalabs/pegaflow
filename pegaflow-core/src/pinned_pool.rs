@@ -1,14 +1,16 @@
 use std::{
+    collections::HashMap,
     num::NonZeroU64,
     ptr::NonNull,
     sync::{Arc, Mutex},
 };
 
 use bytesize::ByteSize;
-use log::{error, info};
+use log::{error, info, warn};
 
 use crate::allocator::{Allocation, ScaledOffsetAllocator};
 use crate::metrics::core_metrics;
+use crate::numa::{NumaNode, run_on_numa};
 use crate::pinned_mem::PinnedMemory;
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -51,7 +53,8 @@ impl Drop for PinnedAllocation {
 }
 
 /// Manages a CUDA pinned memory pool and a byte-addressable allocator.
-pub struct PinnedMemoryPool {
+#[derive(Debug)]
+pub(crate) struct PinnedMemoryPool {
     /// Backing pinned memory (handles mmap + cudaHostRegister)
     backing: PinnedMemory,
     allocator: Mutex<ScaledOffsetAllocator>,
@@ -259,3 +262,239 @@ impl Drop for PinnedMemoryPool {
 // `Mutex`. CUDA pinned host memory can be accessed from any host thread.
 unsafe impl Send for PinnedMemoryPool {}
 unsafe impl Sync for PinnedMemoryPool {}
+
+// ============================================================================
+// NUMA-Aware Pool Management
+// ============================================================================
+
+/// Manages multiple pinned memory pools, one per NUMA node.
+///
+/// Each pool is allocated on its respective NUMA node using first-touch policy
+/// (memory is allocated from a thread pinned to that NUMA node).
+///
+/// This enables NUMA-local memory allocation for GPU workers, which is critical
+/// for achieving optimal D2H/H2D transfer bandwidth on multi-socket systems.
+///
+/// # Note
+/// This implementation does NOT provide fallback for unknown NUMA nodes.
+/// If a GPU's NUMA affinity cannot be determined, the system should either:
+/// - Disable NUMA-aware allocation (use global pool)
+/// - Fail early during registration with a clear error
+#[derive(Debug)]
+pub(crate) struct NumaAwarePinnedPools {
+    /// Per-NUMA pools indexed by NUMA node ID
+    pools: HashMap<u32, Arc<PinnedMemoryPool>>,
+}
+
+impl NumaAwarePinnedPools {
+    /// Create NUMA-aware pools, evenly distributing capacity across nodes.
+    ///
+    /// # Arguments
+    /// * `total_capacity` - Total memory to allocate across all NUMA nodes
+    /// * `numa_nodes` - List of NUMA nodes to create pools for
+    /// * `use_hugepages` - Whether to use huge pages for allocation
+    /// * `unit_size_hint` - Optional hint for allocator unit size
+    ///
+    /// # Behavior
+    /// - Each NUMA node gets `total_capacity / num_nodes` bytes
+    /// - Pools are allocated on threads pinned to their respective NUMA nodes
+    ///
+    /// # Panics
+    /// Panics if any NUMA pool allocation fails. This is a fail-fast behavior
+    /// to prevent silent partial failures that would cause mysterious allocation
+    /// errors later when GPUs try to use the missing pool.
+    pub fn new(
+        total_capacity: usize,
+        numa_nodes: &[NumaNode],
+        use_hugepages: bool,
+        unit_size_hint: Option<NonZeroU64>,
+    ) -> Self {
+        let num_nodes = numa_nodes.len();
+        if num_nodes == 0 {
+            warn!("No NUMA nodes provided, creating empty NumaAwarePinnedPools");
+            return Self {
+                pools: HashMap::new(),
+            };
+        }
+
+        let per_node_capacity = total_capacity / num_nodes;
+        info!(
+            "Creating NUMA-aware pools: total={}, nodes={}, per_node={}",
+            ByteSize(total_capacity as u64),
+            num_nodes,
+            ByteSize(per_node_capacity as u64)
+        );
+
+        let mut pools = HashMap::new();
+
+        for node in numa_nodes {
+            if node.is_unknown() {
+                continue;
+            }
+
+            let node_id = node.0;
+            let hint = unit_size_hint;
+
+            // Allocate pool on a thread pinned to this NUMA node
+            let result = run_on_numa(*node, move || {
+                PinnedMemoryPool::new(per_node_capacity, use_hugepages, hint)
+            });
+
+            match result {
+                Ok(pool) => {
+                    info!(
+                        "Created pinned pool on NUMA{}: capacity={}",
+                        node_id,
+                        ByteSize(per_node_capacity as u64)
+                    );
+                    pools.insert(node_id, Arc::new(pool));
+                }
+                Err(e) => {
+                    panic!(
+                        "Failed to create pool on NUMA{}: {}. \
+                         This is a fatal error during initialization. \
+                         Please check system resources or disable NUMA affinity.",
+                        node_id, e
+                    );
+                }
+            }
+        }
+
+        Self { pools }
+    }
+
+    /// Allocate memory from the pool for a specific NUMA node.
+    ///
+    ///
+    /// Returns `None` if:
+    /// - `numa_node` is `UNKNOWN` (should be caught at registration time)
+    /// - The NUMA node has no pool
+    /// - The pool is exhausted
+    pub fn allocate(&self, numa_node: NumaNode, size: NonZeroU64) -> Option<Arc<PinnedAllocation>> {
+        if numa_node.is_unknown() {
+            error!("UNEXPECTED: allocate called with UNKNOWN NUMA node");
+            return None;
+        }
+
+        self.pools.get(&numa_node.0)?.allocate(size).map(Arc::new)
+    }
+
+    /// Get aggregate usage across all pools: (used_bytes, total_bytes)
+    pub(crate) fn total_usage(&self) -> (u64, u64) {
+        let mut used = 0u64;
+        let mut total = 0u64;
+
+        for pool in self.pools.values() {
+            let (u, t) = pool.usage();
+            used += u;
+            total += t;
+        }
+
+        (used, total)
+    }
+}
+
+// ============================================================================
+// Unified Allocator Interface
+// ============================================================================
+
+/// Unified pinned memory allocator that hides NUMA details from callers.
+///
+/// This enum encapsulates both global and NUMA-aware allocation strategies,
+/// providing a single interface for the rest of the system.
+#[derive(Debug)]
+pub(crate) enum PinnedAllocator {
+    /// Global pool (NUMA disabled or single-node systems)
+    Global(Arc<PinnedMemoryPool>),
+    /// NUMA-aware pools (multi-socket systems)
+    Numa(NumaAwarePinnedPools),
+}
+
+impl PinnedAllocator {
+    /// Create a new global allocator.
+    pub(crate) fn new_global(
+        capacity: usize,
+        use_hugepages: bool,
+        unit_hint: Option<NonZeroU64>,
+    ) -> Self {
+        let pool = Arc::new(PinnedMemoryPool::new(capacity, use_hugepages, unit_hint));
+        Self::Global(pool)
+    }
+
+    /// Create a new NUMA-aware allocator.
+    ///
+    /// If `numa_nodes` is empty, falls back to a global allocator.
+    pub(crate) fn new_numa(
+        capacity: usize,
+        numa_nodes: &[NumaNode],
+        use_hugepages: bool,
+        unit_hint: Option<NonZeroU64>,
+    ) -> Self {
+        if numa_nodes.is_empty() {
+            warn!(
+                "NUMA allocator requested but no nodes provided, falling back to global allocator"
+            );
+            return Self::new_global(capacity, use_hugepages, unit_hint);
+        }
+        Self::Numa(NumaAwarePinnedPools::new(
+            capacity,
+            numa_nodes,
+            use_hugepages,
+            unit_hint,
+        ))
+    }
+
+    /// Allocate pinned memory.
+    ///
+    /// For global allocators, `numa_node` is ignored.
+    /// For NUMA allocators, allocates from the specified node's pool.
+    pub(crate) fn allocate(
+        &self,
+        size: NonZeroU64,
+        numa_node: NumaNode,
+    ) -> Option<Arc<PinnedAllocation>> {
+        match self {
+            Self::Global(pool) => pool.allocate(size).map(Arc::new),
+            Self::Numa(pools) => pools.allocate(numa_node, size),
+        }
+    }
+
+    /// Get aggregate usage: (used_bytes, total_bytes)
+    pub(crate) fn usage(&self) -> (u64, u64) {
+        match self {
+            Self::Global(pool) => pool.usage(),
+            Self::Numa(pools) => pools.total_usage(),
+        }
+    }
+
+    /// Get the largest contiguous free region available.
+    ///
+    /// For NUMA allocators, returns the sum of all pools' free space
+    /// (conservative estimate for fragmentation).
+    pub(crate) fn largest_free_allocation(&self) -> u64 {
+        match self {
+            Self::Global(pool) => pool.largest_free_allocation(),
+            Self::Numa(pools) => {
+                // For monitoring purposes, return the minimum largest free region
+                // across all NUMA nodes. This reflects the most constrained node
+                // and is accurate for checking if a contiguous allocation can succeed.
+                pools
+                    .pools
+                    .values()
+                    .map(|p| p.largest_free_allocation())
+                    .min()
+                    .unwrap_or(0)
+            }
+        }
+    }
+
+    /// Check if this is a NUMA allocator.
+    pub(crate) fn is_numa(&self) -> bool {
+        matches!(self, Self::Numa(_))
+    }
+}
+
+// SAFETY: PinnedAllocator owns Arc<PinnedMemoryPool> or NumaAwarePinnedPools,
+// both of which are Send + Sync.
+unsafe impl Send for PinnedAllocator {}
+unsafe impl Sync for PinnedAllocator {}
