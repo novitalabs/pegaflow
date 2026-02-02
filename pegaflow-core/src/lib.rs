@@ -66,7 +66,11 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use log::{debug, info};
+use log::{debug, info, warn};
+use parking_lot::Mutex as ParkingMutex;
+use pegaflow_proto::proto::engine::InsertBlockHashesRequest;
+use pegaflow_proto::proto::engine::meta_server_client::MetaServerClient;
+use tonic::transport::Channel;
 
 use crate::gpu_worker::{LayerLoadData, LoadBlock, LoadTask, SaveBlock};
 use crate::metrics::core_metrics;
@@ -133,6 +137,8 @@ pub struct PegaEngine {
     storage: Arc<StorageEngine>,
     /// GPU-NUMA topology for memory allocation decisions.
     topology: Arc<NumaTopology>,
+    /// Optional MetaServer client for cross-node block hash registry.
+    metaserver_client: ParkingMutex<Option<MetaServerClient<Channel>>>,
 }
 
 #[allow(clippy::new_without_default)]
@@ -192,9 +198,19 @@ impl PegaEngine {
                 instances: RwLock::new(HashMap::new()),
                 storage,
                 topology,
+                metaserver_client: ParkingMutex::new(None),
             },
             seal_notify_rx,
         )
+    }
+
+    /// Set the MetaServer client for cross-node block hash registry.
+    ///
+    /// When set, saved block hashes will be inserted to the metaserver
+    /// for cross-node discovery.
+    pub fn set_metaserver_client(&self, client: MetaServerClient<Channel>) {
+        *self.metaserver_client.lock() = Some(client);
+        info!("MetaServer client configured for block hash registry");
     }
 
     /// Get or create an instance with the specified topology.
@@ -246,6 +262,12 @@ impl PegaEngine {
             .get(instance_id)
             .cloned()
             .ok_or_else(|| EngineError::InstanceMissing(instance_id.to_string()))
+    }
+
+    /// Get the namespace for an instance by ID.
+    pub fn get_instance_namespace(&self, instance_id: &str) -> Result<String, EngineError> {
+        let instance = self.get_instance(instance_id)?;
+        Ok(instance.namespace().to_string())
     }
 
     /// Register a KV cache layer with its memory layout.
@@ -352,7 +374,17 @@ impl PegaEngine {
         let instance = self.get_instance(instance_id)?;
         let namespace = instance.namespace().to_string();
 
+        // Check if metaserver is configured before collecting hashes
+        let metaserver_client = self.metaserver_client.lock().clone();
+        let collect_hashes = metaserver_client.is_some();
+
+        let mut all_block_hashes: Vec<Vec<u8>> = Vec::new();
+
         for (layer_name, block_ids, block_hashes) in saves {
+            if collect_hashes {
+                all_block_hashes.extend(block_hashes.iter().cloned());
+            }
+
             self.save_kv_blocks_from_ipc_inner(
                 instance_id,
                 tp_rank,
@@ -364,6 +396,32 @@ impl PegaEngine {
             )
             .await?;
         }
+
+        // Insert block hashes to metaserver (fire-and-forget)
+        if let Some(mut client) = metaserver_client
+            && !all_block_hashes.is_empty()
+        {
+            let insert_req = InsertBlockHashesRequest {
+                namespace,
+                block_hashes: all_block_hashes,
+            };
+
+            tokio::spawn(async move {
+                match client.insert_block_hashes(insert_req).await {
+                    Ok(response) => {
+                        let inner = response.into_inner();
+                        debug!(
+                            "MetaServer insert: inserted {} block hashes",
+                            inner.inserted_count
+                        );
+                    }
+                    Err(err) => {
+                        warn!("MetaServer insert failed: {}", err);
+                    }
+                }
+            });
+        }
+
         Ok(())
     }
 
