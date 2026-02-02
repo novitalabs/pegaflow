@@ -298,7 +298,11 @@ impl NumaAwarePinnedPools {
     /// # Behavior
     /// - Each NUMA node gets `total_capacity / num_nodes` bytes
     /// - Pools are allocated on threads pinned to their respective NUMA nodes
-    /// - If a NUMA pool allocation fails, that node is skipped (logged as warning)
+    ///
+    /// # Panics
+    /// Panics if any NUMA pool allocation fails. This is a fail-fast behavior
+    /// to prevent silent partial failures that would cause mysterious allocation
+    /// errors later when GPUs try to use the missing pool.
     pub fn new(
         total_capacity: usize,
         numa_nodes: &[NumaNode],
@@ -346,7 +350,12 @@ impl NumaAwarePinnedPools {
                     pools.insert(node_id, Arc::new(pool));
                 }
                 Err(e) => {
-                    warn!("Failed to create pool on NUMA{}: {}", node_id, e);
+                    panic!(
+                        "Failed to create pool on NUMA{}: {}. \
+                         This is a fatal error during initialization. \
+                         Please check system resources or disable NUMA affinity.",
+                        node_id, e
+                    );
                 }
             }
         }
