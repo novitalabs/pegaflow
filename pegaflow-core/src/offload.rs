@@ -10,7 +10,8 @@ use std::collections::HashSet;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use log::{debug, info};
+use log::{debug, info, warn};
+use pegaflow_proto::proto::engine::InsertBlockHashesRequest;
 
 use crate::block::{BlockKey, LayerBlock, LayerSave};
 
@@ -481,12 +482,40 @@ impl PegaEngine {
             })
             .collect();
 
+        // Collect unique hashes for metaserver before namespace is moved
+        let metaserver_hashes: Vec<Vec<u8>> = hashes_to_save.into_iter().collect();
+
         self.storage.send_raw_insert(RawSaveBatch {
-            namespace,
+            namespace: namespace.clone(),
             total_slots,
             numa_node: gpu.preferred_numa(),
             layers: raw_layers,
         });
+
+        // Insert block hashes to metaserver (fire-and-forget)
+        if let Some(mut client) = self.metaserver_client()
+            && !metaserver_hashes.is_empty()
+        {
+            let insert_req = InsertBlockHashesRequest {
+                namespace,
+                block_hashes: metaserver_hashes,
+            };
+
+            tokio::spawn(async move {
+                match client.insert_block_hashes(insert_req).await {
+                    Ok(response) => {
+                        let inner = response.into_inner();
+                        debug!(
+                            "MetaServer insert: inserted {} block hashes",
+                            inner.inserted_count
+                        );
+                    }
+                    Err(err) => {
+                        warn!("MetaServer insert failed: {}", err);
+                    }
+                }
+            });
+        }
 
         Ok(())
     }

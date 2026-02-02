@@ -71,6 +71,9 @@ use std::{
 };
 
 use log::{debug, info};
+use parking_lot::Mutex as ParkingMutex;
+use pegaflow_proto::proto::engine::meta_server_client::MetaServerClient;
+use tonic::transport::Channel;
 
 use crate::gpu_worker::{LayerLoadData, LoadBlock, LoadTask};
 use crate::metrics::core_metrics;
@@ -137,6 +140,8 @@ pub struct PegaEngine {
     storage: Arc<StorageEngine>,
     /// GPU-NUMA topology for memory allocation decisions.
     topology: Arc<NumaTopology>,
+    /// Optional MetaServer client for cross-node block hash registry.
+    metaserver_client: ParkingMutex<Option<MetaServerClient<Channel>>>,
 }
 
 #[allow(clippy::new_without_default)]
@@ -196,9 +201,24 @@ impl PegaEngine {
                 instances: RwLock::new(HashMap::new()),
                 storage,
                 topology,
+                metaserver_client: ParkingMutex::new(None),
             },
             seal_notify_rx,
         )
+    }
+
+    /// Set the MetaServer client for cross-node block hash registry.
+    ///
+    /// When set, saved block hashes will be inserted to the metaserver
+    /// for cross-node discovery.
+    pub fn set_metaserver_client(&self, client: MetaServerClient<Channel>) {
+        *self.metaserver_client.lock() = Some(client);
+        info!("MetaServer client configured for block hash registry");
+    }
+
+    /// Get a clone of the MetaServer client, if configured.
+    pub(crate) fn metaserver_client(&self) -> Option<MetaServerClient<Channel>> {
+        self.metaserver_client.lock().clone()
     }
 
     /// Get or create an instance with the specified topology.
@@ -250,6 +270,12 @@ impl PegaEngine {
             .get(instance_id)
             .cloned()
             .ok_or_else(|| EngineError::InstanceMissing(instance_id.to_string()))
+    }
+
+    /// Get the namespace for an instance by ID.
+    pub fn get_instance_namespace(&self, instance_id: &str) -> Result<String, EngineError> {
+        let instance = self.get_instance(instance_id)?;
+        Ok(instance.namespace().to_string())
     }
 
     /// Register a KV cache layer with its memory layout.
