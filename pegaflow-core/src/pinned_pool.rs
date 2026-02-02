@@ -1,9 +1,5 @@
-use std::{
-    collections::HashMap,
-    num::NonZeroU64,
-    ptr::NonNull,
-    sync::{Arc, Mutex},
-};
+use parking_lot::Mutex;
+use std::{collections::HashMap, num::NonZeroU64, ptr::NonNull, sync::Arc};
 
 use bytesize::ByteSize;
 use log::{error, info, warn};
@@ -12,7 +8,6 @@ use crate::allocator::{Allocation, ScaledOffsetAllocator};
 use crate::metrics::core_metrics;
 use crate::numa::{NumaNode, run_on_numa};
 use crate::pinned_mem::PinnedMemory;
-use std::sync::atomic::{AtomicI64, Ordering};
 
 /// RAII guard for a pinned memory allocation.
 /// Automatically frees the allocation when dropped.
@@ -58,8 +53,6 @@ pub(crate) struct PinnedMemoryPool {
     /// Backing pinned memory (handles mmap + cudaHostRegister)
     backing: PinnedMemory,
     allocator: Mutex<ScaledOffsetAllocator>,
-    // Tracks the last exported "largest free" value so we can drive an UpDownCounter like a gauge.
-    last_largest_free_bytes_i64: AtomicI64,
 }
 
 impl PinnedMemoryPool {
@@ -129,58 +122,32 @@ impl PinnedMemoryPool {
             )
         });
 
-        let pool = Self {
+        Self {
             backing,
             allocator: Mutex::new(allocator),
-            last_largest_free_bytes_i64: AtomicI64::new(0),
-        };
-
-        // Initialize fragmentation signal gauge (largest free == total at startup).
-        pool.update_largest_free_metric(actual_size);
-
-        pool
-    }
-
-    fn update_largest_free_metric(&self, largest_free_bytes: u64) {
-        let Ok(new_i64) = i64::try_from(largest_free_bytes) else {
-            // If the pool is too large to represent in i64, skip this metric.
-            return;
-        };
-
-        let old_i64 = self
-            .last_largest_free_bytes_i64
-            .swap(new_i64, Ordering::Relaxed);
-        let delta = new_i64 - old_i64;
-        if delta != 0 {
-            core_metrics().pool_largest_free_bytes.add(delta, &[]);
         }
     }
 
     /// Allocate pinned memory from the pool. Returns None when the allocation cannot be satisfied.
     /// Returns a RAII guard that automatically frees the allocation when dropped.
     pub fn allocate(self: &Arc<Self>, size: NonZeroU64) -> Option<PinnedAllocation> {
-        let mut allocator = self.allocator.lock().unwrap();
-
-        let allocation = match allocator.allocate(size.get()) {
-            Ok(Some(allocation)) => allocation,
-            Ok(None) => {
-                return None; // Pool exhausted, caller can retry after eviction
-            }
-            Err(err) => {
-                error!(
-                    "Pinned memory allocation error: {} (requested {}): requested_bytes={}",
-                    err,
-                    ByteSize(size.get()),
-                    size.get()
-                );
-                return None;
+        // Allocation is done under lock, metrics and pointer computation outside lock
+        let allocation = {
+            let mut allocator = self.allocator.lock();
+            match allocator.allocate(size.get()) {
+                Ok(Some(allocation)) => allocation,
+                Ok(None) => return None, // Pool exhausted, caller can retry after eviction
+                Err(err) => {
+                    error!(
+                        "Pinned memory allocation error: {} (requested {}): requested_bytes={}",
+                        err,
+                        ByteSize(size.get()),
+                        size.get()
+                    );
+                    return None;
+                }
             }
         };
-
-        // Update fragmentation signal after allocator mutation.
-        self.update_largest_free_metric(allocator.storage_report().largest_free_allocation_bytes);
-
-        let metrics = core_metrics();
 
         let offset: usize = allocation
             .offset_bytes
@@ -191,7 +158,7 @@ impl PinnedMemoryPool {
 
         let size_bytes = allocation.size_bytes.get();
         if let Ok(size_i64) = i64::try_from(size_bytes) {
-            metrics.pool_used_bytes.add(size_i64, &[]);
+            core_metrics().pool_used_bytes.add(size_i64, &[]);
         }
 
         Some(PinnedAllocation {
@@ -205,22 +172,21 @@ impl PinnedMemoryPool {
     /// This is called automatically by PinnedAllocation's Drop implementation.
     /// Users should not call this directly - use PinnedAllocation RAII instead.
     pub(crate) fn free_internal(&self, allocation: &Allocation) {
-        let mut allocator = self.allocator.lock().unwrap();
-        allocator.free(allocation);
+        // Free under lock, metrics update outside lock
+        {
+            let mut allocator = self.allocator.lock();
+            allocator.free(allocation);
+        }
 
-        // Update fragmentation signal after allocator mutation.
-        self.update_largest_free_metric(allocator.storage_report().largest_free_allocation_bytes);
-
-        let metrics = core_metrics();
         let size_bytes = allocation.size_bytes.get();
         if let Ok(size_i64) = i64::try_from(size_bytes) {
-            metrics.pool_used_bytes.add(-size_i64, &[]);
+            core_metrics().pool_used_bytes.add(-size_i64, &[]);
         }
     }
 
     /// Get (used_bytes, total_bytes) for the pool.
     pub fn usage(&self) -> (u64, u64) {
-        let allocator = self.allocator.lock().unwrap();
+        let allocator = self.allocator.lock();
         let report = allocator.storage_report();
         let total = allocator.total_bytes();
         let used = total - report.total_free_bytes;
@@ -229,7 +195,7 @@ impl PinnedMemoryPool {
 
     /// Largest contiguous free region currently available, in bytes.
     pub fn largest_free_allocation(&self) -> u64 {
-        let allocator = self.allocator.lock().unwrap();
+        let allocator = self.allocator.lock();
         allocator.storage_report().largest_free_allocation_bytes
     }
 }
@@ -245,12 +211,6 @@ impl Drop for PinnedMemoryPool {
                 "Pinned pool capacity exceeds i64::MAX; skipping capacity metric cleanup: capacity_bytes={}",
                 capacity_bytes
             );
-        }
-
-        // Best-effort cleanup for gauge-like metric.
-        let last = self.last_largest_free_bytes_i64.load(Ordering::Relaxed);
-        if last != 0 {
-            metrics.pool_largest_free_bytes.add(-last, &[]);
         }
     }
 }

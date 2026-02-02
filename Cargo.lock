@@ -1495,6 +1495,7 @@ dependencies = [
  "logforth",
  "offset-allocator",
  "opentelemetry",
+ "parking_lot",
  "serde",
  "shared_memory",
  "tokio",

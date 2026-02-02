@@ -14,9 +14,10 @@
 // ============================================================================
 use bytesize::ByteSize;
 use log::{debug, error, info, warn};
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::num::NonZeroU64;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::block::{
@@ -509,7 +510,7 @@ impl StorageEngine {
             .map(|hash| BlockKey::new(namespace.to_string(), hash.clone()))
             .collect();
 
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         keys.into_iter()
             .enumerate()
             .filter(|(_, key)| {
@@ -537,7 +538,7 @@ impl StorageEngine {
         slot_id: usize,
         total_slots: usize,
     ) -> Result<Vec<(BlockKey, Arc<SealedBlock>)>, BlockInsertError> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         let mut sealed_blocks: Vec<(BlockKey, Arc<SealedBlock>)> = Vec::new();
 
         for (key, block) in blocks {
@@ -650,7 +651,7 @@ impl StorageEngine {
             .map(|key| (instance_id.to_string(), key.clone()))
             .collect();
 
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         let mut result: Vec<Arc<SealedBlock>> = Vec::with_capacity(keys.len());
 
         for (idx, (key, pin_key)) in keys.into_iter().zip(pin_keys.into_iter()).enumerate() {
@@ -722,7 +723,7 @@ impl StorageEngine {
             .map(|key| (instance_id.to_string(), key.clone()))
             .collect();
 
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         let mut unpinned = 0usize;
 
         for (key, pin_key) in keys.into_iter().zip(pin_keys.into_iter()) {
@@ -776,7 +777,7 @@ impl StorageEngine {
 
             // Collect evicted blocks under lock, then drop outside lock
             let evicted: Vec<_> = {
-                let mut inner = self.inner.lock().unwrap();
+                let mut inner = self.inner.lock();
                 (0..RECLAIM_BATCH_SIZE)
                     .map_while(|_| inner.cache.remove_lru())
                     .collect()
@@ -842,7 +843,7 @@ impl StorageEngine {
     ///
     /// Returns the number of cleaned blocks.
     pub fn gc_stale_inflight(&self, max_age: std::time::Duration) -> usize {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         let before = inner.inflight.len();
 
         inner.inflight.retain(|key, block| {
@@ -900,7 +901,7 @@ impl StorageEngine {
         let mut blocks_to_pin: Vec<(BlockKey, Arc<SealedBlock>, u64)> = Vec::new();
 
         {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock();
 
             for key in &keys {
                 // Then check cache
@@ -990,7 +991,7 @@ impl StorageEngine {
         let mut valid_requests: Vec<(BlockKey, SsdIndexEntry)> = Vec::with_capacity(keys.len());
 
         {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock();
 
             for key in keys {
                 // Skip if already prefetching
@@ -1040,7 +1041,7 @@ impl StorageEngine {
             core_metrics()
                 .ssd_prefetch_queue_full
                 .add(keys_for_cleanup.len() as u64, &[]);
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock();
             for key in keys_for_cleanup {
                 inner.prefetching.remove(&key);
             }
@@ -1051,7 +1052,7 @@ impl StorageEngine {
     pub fn complete_prefetch(&self, key: BlockKey, block: Option<Arc<SealedBlock>>) {
         let footprint_bytes = block.as_ref().map(|b| b.memory_footprint());
 
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         inner.prefetching.remove(&key);
 
         if let Some(block) = block {
@@ -1074,7 +1075,7 @@ impl StorageEngine {
     /// Update SSD tail pointer and evict stale index entries.
     /// Called by SSD writer thread before overwriting the ring buffer.
     pub(crate) fn ssd_prune_tail(&self, new_tail: u64) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         if new_tail <= inner.ssd_tail {
             return;
         }
@@ -1086,13 +1087,13 @@ impl StorageEngine {
 
     /// Check if a logical SSD offset is still valid (not yet overwritten).
     pub(crate) fn is_ssd_offset_valid(&self, begin: u64) -> bool {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         inner.ssd_tail <= begin
     }
 
     /// Publish a completed SSD write by updating the index and head pointer.
     pub(crate) fn ssd_publish_write(&self, key: BlockKey, entry: SsdIndexEntry, new_head: u64) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         inner.ssd_index.insert(key, entry);
 
         if let Some(ref ssd_state) = self.ssd_state {

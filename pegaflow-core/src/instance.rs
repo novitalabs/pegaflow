@@ -3,10 +3,8 @@
 //! This module provides the hierarchical context structure for managing
 //! multi-tenant inference instances and their associated GPU resources.
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use parking_lot::Mutex;
+use std::{collections::HashMap, sync::Arc};
 
 use cudarc::driver::CudaContext;
 use log::info;
@@ -214,7 +212,7 @@ impl GpuContext {
         layer_name: String,
         registration: KVCacheRegistration,
     ) -> Result<(), String> {
-        let mut registrations = self.kv_caches.lock().expect("kv_caches lock poisoned");
+        let mut registrations = self.kv_caches.lock();
 
         if registrations.contains_key(&layer_name) {
             return Err(format!(
@@ -229,7 +227,7 @@ impl GpuContext {
 
     /// Retrieve a layer's registration information.
     pub fn get_registration(&self, layer_name: &str) -> Option<KVCacheRegistration> {
-        let registrations = self.kv_caches.lock().expect("kv_caches lock poisoned");
+        let registrations = self.kv_caches.lock();
         registrations.get(layer_name).cloned()
     }
 
@@ -303,7 +301,7 @@ impl InstanceContext {
     /// - `Some(id)` if the layer was newly allocated
     /// - `None` if the layer already exists
     pub fn allocate_new_layer_id(&self, layer_name: &str) -> Option<usize> {
-        let mut metadata = self.metadata.lock().expect("metadata lock poisoned");
+        let mut metadata = self.metadata.lock();
 
         if metadata.name_to_id.contains_key(layer_name) {
             return None;
@@ -321,7 +319,7 @@ impl InstanceContext {
     /// returns the same ID. Used for MLA where multiple TP ranks register
     /// the same layer name on different devices.
     pub fn get_or_allocate_layer_id(&self, layer_name: &str) -> usize {
-        let mut metadata = self.metadata.lock().expect("metadata lock poisoned");
+        let mut metadata = self.metadata.lock();
 
         if let Some(&id) = metadata.name_to_id.get(layer_name) {
             return id;
@@ -337,7 +335,7 @@ impl InstanceContext {
     ///
     /// Returns `None` if the layer has not been registered.
     pub fn get_layer_id(&self, layer_name: &str) -> Option<usize> {
-        let metadata = self.metadata.lock().expect("metadata lock poisoned");
+        let metadata = self.metadata.lock();
         metadata.name_to_id.get(layer_name).copied()
     }
 
@@ -393,7 +391,7 @@ impl InstanceContext {
 
         // Fast path: check if context exists
         {
-            let metadata = self.metadata.lock().expect("metadata lock poisoned");
+            let metadata = self.metadata.lock();
             if let Some(ctx) = metadata.gpu_contexts.get(&device_id) {
                 return Ok(Arc::clone(ctx));
             }
@@ -406,7 +404,7 @@ impl InstanceContext {
         let ctx = Arc::new(GpuContext::new(cuda_ctx, device_id, numa_node)?);
 
         // Insert and return
-        let mut metadata = self.metadata.lock().expect("metadata lock poisoned");
+        let mut metadata = self.metadata.lock();
 
         // Double-check after acquiring lock
         if let Some(existing) = metadata.gpu_contexts.get(&device_id) {
@@ -424,7 +422,7 @@ impl InstanceContext {
 
     /// Get an existing GPU context without creating one.
     pub fn get_gpu(&self, device_id: i32) -> Option<Arc<GpuContext>> {
-        let metadata = self.metadata.lock().expect("metadata lock poisoned");
+        let metadata = self.metadata.lock();
         metadata.gpu_contexts.get(&device_id).cloned()
     }
 
