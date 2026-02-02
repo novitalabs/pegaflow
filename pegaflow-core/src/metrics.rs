@@ -8,7 +8,6 @@ pub(crate) struct CoreMetrics {
     // Pinned pool (allocator-level)
     pub pool_capacity_bytes: UpDownCounter<i64>,
     pub pool_used_bytes: UpDownCounter<i64>,
-    pub pool_largest_free_bytes: UpDownCounter<i64>,
     pub pool_alloc_failures: Counter<u64>,
 
     // Inflight (write path safety/health)
@@ -97,11 +96,6 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
                 .i64_up_down_counter("pegaflow_pool_used_bytes")
                 .with_unit("bytes")
                 .with_description("Current pinned pool usage in bytes")
-                .build(),
-            pool_largest_free_bytes: meter
-                .i64_up_down_counter("pegaflow_pool_largest_free_bytes")
-                .with_unit("bytes")
-                .with_description("Largest contiguous free region in pinned pool (fragmentation signal)")
                 .build(),
             pool_alloc_failures: meter
                 .u64_counter("pegaflow_pool_alloc_failures")

@@ -1881,6 +1881,7 @@ dependencies = [
  "logforth",
  "offset-allocator",
  "opentelemetry",
+ "parking_lot",
  "pegaflow-proto",
  "rustls",
  "serde",

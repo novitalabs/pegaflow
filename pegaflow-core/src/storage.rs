@@ -14,9 +14,10 @@
 // ============================================================================
 use bytesize::ByteSize;
 use log::{debug, error, info, warn};
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::num::NonZeroU64;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::block::{
@@ -24,7 +25,8 @@ use crate::block::{
 };
 use crate::cache::{CacheInsertOutcome, TinyLfuCache};
 use crate::metrics::core_metrics;
-use crate::pinned_pool::{PinnedAllocation, PinnedMemoryPool};
+use crate::numa::NumaNode;
+use crate::pinned_pool::{PinnedAllocation, PinnedAllocator};
 use crate::ssd_cache::{
     PrefetchBatch, PrefetchRequest, SsdCacheConfig, SsdIndexEntry, SsdStorageHandle, SsdWriteBatch,
     ssd_prefetch_loop, ssd_writer_loop,
@@ -103,6 +105,9 @@ pub struct StorageConfig {
     pub max_prefetch_blocks: usize,
     /// Optional SSD cache for sealed blocks (single-node, FIFO).
     pub ssd_cache_config: Option<SsdCacheConfig>,
+    /// Enable NUMA-aware memory allocation. When true on multi-NUMA systems,
+    /// PegaEngine auto-detects topology and creates per-node pinned pools.
+    pub enable_numa_affinity: bool,
 }
 
 impl Default for StorageConfig {
@@ -112,6 +117,7 @@ impl Default for StorageConfig {
             hint_value_size_bytes: None,
             max_prefetch_blocks: MAX_PREFETCH_BLOCKS,
             ssd_cache_config: None,
+            enable_numa_affinity: true,
         }
     }
 }
@@ -170,8 +176,8 @@ struct StorageInner {
 }
 
 pub struct StorageEngine {
-    /// Pinned memory allocator
-    pinned_pool: Arc<PinnedMemoryPool>,
+    /// Unified pinned memory allocator (handles both global and NUMA modes)
+    allocator: Arc<PinnedAllocator>,
 
     /// All mutable state under one lock
     inner: Mutex<StorageInner>,
@@ -189,18 +195,42 @@ pub struct StorageEngine {
 impl StorageEngine {
     /// Create a new StorageEngine with optional seal notification channel.
     /// Returns (engine, receiver) where receiver gets notified of sealed blocks.
+    ///
+    /// # Arguments
+    /// * `capacity_bytes` - Total pinned memory pool capacity
+    /// * `use_hugepages` - Use 2MB huge pages for allocation
+    /// * `config` - Storage behavior configuration
+    /// * `numa_nodes` - NUMA nodes for per-node pools (empty = single global pool)
     pub fn new_with_config(
         capacity_bytes: usize,
         use_hugepages: bool,
         config: impl Into<StorageConfig>,
+        numa_nodes: &[NumaNode],
     ) -> (Arc<Self>, UnboundedReceiver<SealNotification>) {
         let config = config.into();
         let value_size_hint = config.hint_value_size_bytes.filter(|size| *size > 0);
-        let pinned_pool = Arc::new(PinnedMemoryPool::new(
-            capacity_bytes,
-            use_hugepages,
-            value_size_hint.and_then(|size| NonZeroU64::new(size as u64)),
-        ));
+        let unit_hint = value_size_hint.and_then(|size| NonZeroU64::new(size as u64));
+
+        // Create unified allocator based on NUMA configuration
+        let allocator = if !numa_nodes.is_empty() {
+            info!(
+                "Creating NUMA-aware pinned pools for {} nodes",
+                numa_nodes.len()
+            );
+            Arc::new(PinnedAllocator::new_numa(
+                capacity_bytes,
+                numa_nodes,
+                use_hugepages,
+                unit_hint,
+            ))
+        } else {
+            info!("Creating global pinned pool (NUMA affinity disabled)");
+            Arc::new(PinnedAllocator::new_global(
+                capacity_bytes,
+                use_hugepages,
+                unit_hint,
+            ))
+        };
 
         let cache = TinyLfuCache::new_unbounded(
             capacity_bytes,
@@ -234,7 +264,7 @@ impl StorageEngine {
         };
 
         let engine = Arc::new(Self {
-            pinned_pool,
+            allocator,
             inner,
             seal_notify_tx: Some(seal_notify_tx),
             ssd_state,
@@ -389,7 +419,7 @@ impl StorageEngine {
             move |size| {
                 weak_alloc
                     .upgrade()
-                    .and_then(|engine| engine.allocate(NonZeroU64::new(size)?))
+                    .and_then(|engine| engine.allocate(NonZeroU64::new(size)?, None))
             },
         )))
     }
@@ -399,18 +429,36 @@ impl StorageEngine {
         self.ssd_state.is_some()
     }
 
+    /// Returns true if NUMA-aware allocation is enabled.
+    pub fn is_numa_enabled(&self) -> bool {
+        self.allocator.is_numa()
+    }
+
     // ========================================================================
     // Allocation
     // ========================================================================
 
-    pub fn allocate(&self, size: NonZeroU64) -> Option<Arc<PinnedAllocation>> {
+    /// Allocate pinned memory, optionally from a specific NUMA node's pool.
+    ///
+    /// If `numa_node` is `Some` and NUMA pools are configured, allocates from
+    /// that NUMA node's pool. Otherwise uses the global pool.
+    ///
+    /// Returns `None` if the pool is exhausted after eviction attempts.
+    pub fn allocate(
+        &self,
+        size: NonZeroU64,
+        numa_node: Option<NumaNode>,
+    ) -> Option<Arc<PinnedAllocation>> {
         let requested_bytes = size.get();
+        let node = numa_node.unwrap_or(NumaNode::UNKNOWN);
 
         loop {
-            if let Some(allocation) = self.pinned_pool.allocate(size) {
-                return Some(Arc::new(allocation));
+            // Try to allocate from the unified allocator
+            if let Some(alloc) = self.allocator.allocate(size, node) {
+                return Some(alloc);
             }
 
+            // Allocation failed, try to reclaim memory
             let (freed_blocks, freed_bytes, largest_free) =
                 self.reclaim_until_allocator_can_allocate(requested_bytes);
 
@@ -418,19 +466,31 @@ impl StorageEngine {
                 continue;
             }
 
-            let (used, total) = self.pinned_pool.usage();
+            // Still can't allocate, report error
+            let (used, total) = self.allocator.usage();
             error!(
-                "Pinned memory pool exhausted; cannot satisfy allocation: requested={} used={} total={} largest_free={} freed_blocks={} freed_bytes={}",
+                "Pinned memory pool exhausted; cannot satisfy allocation: requested={} used={} total={} largest_free={} freed_blocks={} freed_bytes={} numa={:?}",
                 ByteSize(requested_bytes),
                 ByteSize(used),
                 ByteSize(total),
                 ByteSize(largest_free),
                 freed_blocks,
-                ByteSize(freed_bytes)
+                ByteSize(freed_bytes),
+                numa_node
             );
             core_metrics().pool_alloc_failures.add(1, &[]);
             return None;
         }
+    }
+
+    /// Get aggregate pool usage: (used_bytes, total_bytes)
+    fn pool_usage(&self) -> (u64, u64) {
+        self.allocator.usage()
+    }
+
+    /// Get largest free allocation across all pools.
+    fn largest_free_allocation(&self) -> u64 {
+        self.allocator.largest_free_allocation()
     }
 
     // ========================================================================
@@ -450,7 +510,7 @@ impl StorageEngine {
             .map(|hash| BlockKey::new(namespace.to_string(), hash.clone()))
             .collect();
 
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         keys.into_iter()
             .enumerate()
             .filter(|(_, key)| {
@@ -478,7 +538,7 @@ impl StorageEngine {
         slot_id: usize,
         total_slots: usize,
     ) -> Result<Vec<(BlockKey, Arc<SealedBlock>)>, BlockInsertError> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         let mut sealed_blocks: Vec<(BlockKey, Arc<SealedBlock>)> = Vec::new();
 
         for (key, block) in blocks {
@@ -591,7 +651,7 @@ impl StorageEngine {
             .map(|key| (instance_id.to_string(), key.clone()))
             .collect();
 
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         let mut result: Vec<Arc<SealedBlock>> = Vec::with_capacity(keys.len());
 
         for (idx, (key, pin_key)) in keys.into_iter().zip(pin_keys.into_iter()).enumerate() {
@@ -663,7 +723,7 @@ impl StorageEngine {
             .map(|key| (instance_id.to_string(), key.clone()))
             .collect();
 
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         let mut unpinned = 0usize;
 
         for (key, pin_key) in keys.into_iter().zip(pin_keys.into_iter()) {
@@ -705,19 +765,19 @@ impl StorageEngine {
 
     fn reclaim_until_allocator_can_allocate(&self, required_bytes: u64) -> (usize, u64, u64) {
         if required_bytes == 0 {
-            return (0, 0, self.pinned_pool.largest_free_allocation());
+            return (0, 0, self.largest_free_allocation());
         }
 
         let mut freed_blocks = 0usize;
         let mut freed_bytes = 0u64;
-        let mut largest_free = self.pinned_pool.largest_free_allocation();
+        let mut largest_free = self.largest_free_allocation();
 
         while largest_free < required_bytes {
-            let used_before = self.pinned_pool.usage().0;
+            let used_before = self.pool_usage().0;
 
             // Collect evicted blocks under lock, then drop outside lock
             let evicted: Vec<_> = {
-                let mut inner = self.inner.lock().unwrap();
+                let mut inner = self.inner.lock();
                 (0..RECLAIM_BATCH_SIZE)
                     .map_while(|_| inner.cache.remove_lru())
                     .collect()
@@ -748,7 +808,7 @@ impl StorageEngine {
             freed_blocks += evicted.len();
 
             drop(evicted); // allow allocation drops to run before sampling allocator usage
-            let used_after = self.pinned_pool.usage().0;
+            let used_after = self.pool_usage().0;
             let reclaimed = used_before.saturating_sub(used_after);
             if reclaimed > 0 {
                 core_metrics()
@@ -756,7 +816,7 @@ impl StorageEngine {
                     .add(reclaimed, &[]);
             }
 
-            largest_free = self.pinned_pool.largest_free_allocation();
+            largest_free = self.largest_free_allocation();
         }
 
         if freed_blocks > 0 {
@@ -783,7 +843,7 @@ impl StorageEngine {
     ///
     /// Returns the number of cleaned blocks.
     pub fn gc_stale_inflight(&self, max_age: std::time::Duration) -> usize {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         let before = inner.inflight.len();
 
         inner.inflight.retain(|key, block| {
@@ -841,7 +901,7 @@ impl StorageEngine {
         let mut blocks_to_pin: Vec<(BlockKey, Arc<SealedBlock>, u64)> = Vec::new();
 
         {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock();
 
             for key in &keys {
                 // Then check cache
@@ -931,7 +991,7 @@ impl StorageEngine {
         let mut valid_requests: Vec<(BlockKey, SsdIndexEntry)> = Vec::with_capacity(keys.len());
 
         {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock();
 
             for key in keys {
                 // Skip if already prefetching
@@ -981,7 +1041,7 @@ impl StorageEngine {
             core_metrics()
                 .ssd_prefetch_queue_full
                 .add(keys_for_cleanup.len() as u64, &[]);
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock();
             for key in keys_for_cleanup {
                 inner.prefetching.remove(&key);
             }
@@ -992,7 +1052,7 @@ impl StorageEngine {
     pub fn complete_prefetch(&self, key: BlockKey, block: Option<Arc<SealedBlock>>) {
         let footprint_bytes = block.as_ref().map(|b| b.memory_footprint());
 
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         inner.prefetching.remove(&key);
 
         if let Some(block) = block {
@@ -1015,7 +1075,7 @@ impl StorageEngine {
     /// Update SSD tail pointer and evict stale index entries.
     /// Called by SSD writer thread before overwriting the ring buffer.
     pub(crate) fn ssd_prune_tail(&self, new_tail: u64) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         if new_tail <= inner.ssd_tail {
             return;
         }
@@ -1027,13 +1087,13 @@ impl StorageEngine {
 
     /// Check if a logical SSD offset is still valid (not yet overwritten).
     pub(crate) fn is_ssd_offset_valid(&self, begin: u64) -> bool {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         inner.ssd_tail <= begin
     }
 
     /// Publish a completed SSD write by updating the index and head pointer.
     pub(crate) fn ssd_publish_write(&self, key: BlockKey, entry: SsdIndexEntry, new_head: u64) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         inner.ssd_index.insert(key, entry);
 
         if let Some(ref ssd_state) = self.ssd_state {
