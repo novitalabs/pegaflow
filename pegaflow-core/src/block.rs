@@ -28,6 +28,14 @@ impl BlockKey {
     pub fn new(namespace: String, hash: Vec<u8>) -> Self {
         Self { namespace, hash }
     }
+
+    /// Estimate the memory size of this BlockKey in bytes
+    /// Used for cache size-aware eviction policies
+    pub fn estimated_size(&self) -> u64 {
+        // Size = namespace string capacity + hash vec capacity + struct overhead (48 bytes)
+        // Using capacity() instead of len() to account for actual heap-allocated memory
+        (self.namespace.capacity() + self.hash.capacity() + 48) as u64
+    }
 }
 
 pub type BlockHash = Vec<u8>;

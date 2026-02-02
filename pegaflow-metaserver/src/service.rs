@@ -61,7 +61,10 @@ impl MetaServer for GrpcMetaService {
         }
 
         // Insert hashes
-        let inserted = self.store.insert_hashes(&req.namespace, &req.block_hashes);
+        let inserted = self
+            .store
+            .insert_hashes(&req.namespace, &req.block_hashes)
+            .await;
 
         let elapsed = start.elapsed();
         info!(
@@ -104,7 +107,10 @@ impl MetaServer for GrpcMetaService {
         }
 
         // Query existing hashes
-        let existing = self.store.query_hashes(&req.namespace, &req.block_hashes);
+        let existing = self
+            .store
+            .query_hashes(&req.namespace, &req.block_hashes)
+            .await;
 
         let total_queried = req.block_hashes.len();
         let found_count = existing.len();
