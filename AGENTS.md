@@ -167,9 +167,10 @@ cargo run -r --bin pegaflow-server -- --addr 0.0.0.0:50055 --devices 0,1,2,3 --p
 - `--use-hugepages`: Use huge pages for pinned memory (default: `false`, requires pre-configured `/proc/sys/vm/nr_hugepages`)
 - `--enable-lfu-admission`: Enable TinyLFU cache admission policy (default: plain LRU)
 - `--disable-numa-affinity`: Disable NUMA-aware memory allocation (default: enabled)
-- `--metrics-addr`: Prometheus metrics HTTP endpoint (default: `0.0.0.0:9091`, set to empty to disable)
-- `--metrics-otel-endpoint`: **DEPRECATED** - OTLP metrics export endpoint (optional, leave unset to disable)
-- `--metrics-period-secs`: **DEPRECATED** - Metrics export period in seconds (default: `5`, only used with OTLP)
+- `--http-addr`: HTTP server address for health check and Prometheus metrics (default: `0.0.0.0:9091`, always enabled)
+- `--enable-prometheus`: Enable Prometheus `/metrics` endpoint (default: `true`)
+- `--metrics-otel-endpoint`: OTLP metrics export endpoint (optional, leave unset to disable)
+- `--metrics-period-secs`: Metrics export period in seconds (default: `5`, only used with OTLP)
 - `--log-level`: Log level: `trace`, `debug`, `info`, `warn`, `error` (default: `info`)
 - `--ssd-cache-path`: Enable SSD cache by providing cache file path (optional)
 - `--ssd-cache-capacity`: SSD cache capacity (default: `512gb`, supports: `kb`, `mb`, `gb`, `tb`)
@@ -239,6 +240,7 @@ cargo test
 - Run `cargo fmt` and keep formatting rustfmt-compatible
 - Keep `use` blocks ordered: std → external crates → local crate
 - Naming: `snake_case` for functions/modules, `CamelCase` for types/traits
+- Visibility: Prefer `fn` (private) > `pub(crate)` > `pub`; use the minimal necessary visibility
 - Prefer explicit error enums + `Display` impls; use `Result<T, E>` and `?`
 - Avoid `unwrap`/`expect` outside tests; bubble errors instead
 - Logging via `tracing` macros (`info!`, `warn!`, `error!`)

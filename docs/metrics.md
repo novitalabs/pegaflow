@@ -140,36 +140,48 @@ PegaFlow exposes the following metrics for monitoring KV cache operations:
 
 **Metrics Parameters:**
 
-- `--metrics-addr`: Address for Prometheus HTTP endpoint (e.g., `0.0.0.0:9091`)
-  - When set, exposes `/metrics` endpoint at the specified address
-  - Leave unset to disable direct Prometheus metrics
+- `--http-addr`: HTTP server address for health check and Prometheus metrics (default: `0.0.0.0:9091`)
+  - Always enabled for health check at `/health`
+  - Use `--enable-prometheus` to also expose `/metrics` endpoint
 
-- `--metrics-otel-endpoint` **(DEPRECATED)**: OTLP gRPC endpoint for metrics export
+- `--enable-prometheus`: Enable Prometheus `/metrics` endpoint (default: `true`)
+  - When enabled, metrics are available at `http://<http-addr>/metrics`
+  - Health check is always available at `http://<http-addr>/health`
+
+- `--metrics-otel-endpoint`: OTLP gRPC endpoint for metrics export (optional)
   - Example: `http://127.0.0.1:4321`
   - Leave unset to disable OTLP export
-  - **Note**: This option is deprecated. Use `--metrics-addr` instead.
 
-- `--metrics-period-secs` **(DEPRECATED)**: Metric export interval in seconds (default: `5`)
+- `--metrics-period-secs`: Metric export interval in seconds (default: `5`)
   - Only used when `--metrics-otel-endpoint` is set
-  - **Note**: This option is deprecated. Use `--metrics-addr` instead.
 
-**Example: Direct Prometheus (Recommended)**
+**Example: Prometheus Metrics**
 ```bash
 cargo run -r -p pegaflow-server -- \
   --addr 0.0.0.0:50055 \
   --device 0 \
   --pool-size 30gb \
-  --metrics-addr 0.0.0.0:9091
+  --http-addr 0.0.0.0:9091 \
+  --enable-prometheus
 ```
 
-**Example: OTLP (Deprecated)**
+**Example: OTLP Export Only**
 ```bash
-# DEPRECATED: Use --metrics-addr instead
 cargo run -r -p pegaflow-server -- \
   --addr 0.0.0.0:50055 \
   --device 0 \
   --pool-size 30gb \
+  --enable-prometheus=false \
   --metrics-otel-endpoint http://127.0.0.1:4321
+```
+
+**Example: Health Check Only (No Metrics)**
+```bash
+cargo run -r -p pegaflow-server -- \
+  --addr 0.0.0.0:50055 \
+  --device 0 \
+  --pool-size 30gb \
+  --enable-prometheus=false
 ```
 
 ### Environment Variables
@@ -188,7 +200,8 @@ cargo run -r -p pegaflow-server -- \
   --addr 0.0.0.0:50055 \
   --device 0 \
   --pool-size 30gb \
-  --metrics-addr 0.0.0.0:9091
+  --http-addr 0.0.0.0:9091 \
+  --enable-prometheus
 ```
 
 ### 2. Start the Monitoring Stack
@@ -216,11 +229,9 @@ This starts two services:
 curl http://localhost:9091/metrics
 ```
 
-## Quick Start: OTLP Method (Deprecated)
+## Quick Start: OTLP Method
 
-> **DEPRECATED**: This method is deprecated. Please use the Direct Prometheus method above.
-
-The `examples/metric/` directory provides a full OTel-based monitoring stack.
+The `examples/metric/` directory provides a full OTel-based monitoring stack using the OTLP exporter.
 
 ### 1. Start the Monitoring Stack
 
@@ -238,7 +249,6 @@ This starts three services:
 ### 2. Start PegaFlow Server
 
 ```bash
-# DEPRECATED: Use --metrics-addr instead
 cargo run -r -p pegaflow-server -- \
   --addr 0.0.0.0:50055 \
   --device 0 \

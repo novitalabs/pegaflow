@@ -1,3 +1,4 @@
+pub mod http_server;
 pub mod metric;
 pub mod proto;
 pub mod registry;
@@ -7,16 +8,15 @@ mod utils;
 pub use registry::CudaTensorRegistry;
 pub use service::GrpcEngineService;
 
-use axum::{Router, routing::get};
 use clap::Parser;
 use cudarc::driver::result as cuda_driver;
-use log::{error, info, warn};
+use log::{error, info};
 use opentelemetry::global;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use parking_lot::Mutex;
 use pegaflow_core::PegaEngine;
-use prometheus::{Registry, TextEncoder};
+use prometheus::Registry;
 use proto::engine::engine_server::EngineServer;
 use pyo3::{PyErr, Python, types::PyAnyMethods};
 use std::error::Error;
@@ -71,18 +71,21 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub disable_numa_affinity: bool,
 
-    /// Address for Prometheus metrics HTTP endpoint (e.g. 0.0.0.0:9091). Leave empty to disable.
+    /// HTTP server address for health check and Prometheus metrics.
+    /// Always enabled for health check endpoint.
     #[arg(long, default_value = "0.0.0.0:9091")]
-    pub metrics_addr: Option<SocketAddr>,
+    pub http_addr: SocketAddr,
 
-    /// **DEPRECATED**: Enable OTLP metrics export over gRPC (e.g. http://127.0.0.1:4317).
-    /// Use `--metrics-addr` for direct Prometheus export instead.
+    /// Enable Prometheus /metrics endpoint on the HTTP server.
+    #[arg(long, default_value_t = true)]
+    pub enable_prometheus: bool,
+
+    /// Enable OTLP metrics export over gRPC (e.g. http://127.0.0.1:4317).
     #[arg(long)]
     pub metrics_otel_endpoint: Option<String>,
 
-    /// **DEPRECATED**: Period (seconds) for exporting OTLP metrics (only used when endpoint is set).
-    /// Use `--metrics-addr` for direct Prometheus export instead.
-    #[arg(long, default_value_t = 5)]
+    /// Period (seconds) for exporting OTLP metrics (only used when endpoint is set).
+    #[arg(long, default_value_t = 10)]
     pub metrics_period_secs: u64,
 
     /// Log level (trace, debug, info, warn, error)
@@ -235,13 +238,8 @@ fn init_metrics(
         info!("Prometheus metrics exporter enabled");
     }
 
-    // Add OTLP exporter if endpoint is configured (DEPRECATED)
+    // Add OTLP exporter if endpoint is configured
     if let Some(endpoint) = otlp_endpoint {
-        warn!(
-            "DEPRECATED: --metrics-otel-endpoint is deprecated and will be removed in a future release. \
-            Use --metrics-addr for direct Prometheus export instead."
-        );
-
         let exporter = opentelemetry_otlp::MetricExporter::builder()
             .with_tonic()
             .with_endpoint(endpoint)
@@ -265,15 +263,6 @@ fn init_metrics(
         meter_provider: Some(meter_provider),
         prometheus_registry,
     })
-}
-
-/// Handler for Prometheus /metrics endpoint
-async fn metrics_handler(axum::extract::State(registry): axum::extract::State<Registry>) -> String {
-    let encoder = TextEncoder::new();
-    let metric_families = registry.gather();
-    encoder
-        .encode_to_string(&metric_families)
-        .unwrap_or_else(|e| format!("# Error encoding metrics: {e}"))
 }
 
 /// Main entry point for pegaflow-server
@@ -372,10 +361,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
     // Initialize OTEL metrics BEFORE creating PegaEngine, so that core metrics
     // (pool, cache, save/load) use the real meter provider instead of noop.
-    let metrics_addr = cli.metrics_addr;
     let metrics_state = runtime.block_on(async {
         init_metrics(
-            metrics_addr.is_some(),
+            cli.enable_prometheus,
             cli.metrics_otel_endpoint.clone(),
             cli.metrics_period_secs,
         )
@@ -422,30 +410,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             info!("Inflight GC task started (interval=5m, max_age=60m)");
         }
 
-        // Start Prometheus HTTP server if configured
-        let metrics_server_handle = if let (Some(metrics_addr), Some(registry)) =
-            (cli.metrics_addr, metrics_state.prometheus_registry.clone())
-        {
-            let app = Router::new()
-                .route("/metrics", get(metrics_handler))
-                .with_state(registry);
-
-            let listener = tokio::net::TcpListener::bind(metrics_addr).await?;
-            info!("Starting Prometheus metrics server on {}", metrics_addr);
-
-            let shutdown = Arc::clone(&shutdown);
-            let handle = tokio::spawn(async move {
-                axum::serve(listener, app)
-                    .with_graceful_shutdown(async move {
-                        shutdown.notified().await;
-                    })
-                    .await
-                    .ok();
-            });
-            Some(handle)
-        } else {
-            None
-        };
+        // Start HTTP server for health check (always enabled)
+        let http_server_handle = http_server::start_http_server(
+            cli.http_addr,
+            cli.enable_prometheus,
+            metrics_state.prometheus_registry.clone(),
+            Arc::clone(&shutdown),
+        )
+        .await?;
 
         let shutdown_signal = {
             let notify = Arc::clone(&shutdown);
@@ -474,11 +446,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
         info!("Server stopped");
 
-        // Stop metrics server if running
-        if let Some(handle) = metrics_server_handle {
-            shutdown.notify_waiters();
-            let _ = handle.await;
-        }
+        // Stop HTTP server
+        shutdown.notify_waiters();
+        let _ = http_server_handle.await;
 
         // Flush metrics before exit
         if let Some(provider) = metrics_state.meter_provider

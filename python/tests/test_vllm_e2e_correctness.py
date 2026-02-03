@@ -9,7 +9,7 @@ It verifies the core contract:
 Usage:
     # Requires pegaflow-server running with metrics enabled:
     cargo run -r --bin pegaflow-server -- \
-        --addr 0.0.0.0:50055 --device 0 --pool-size 30gb --metrics-addr 0.0.0.0:9091
+        --addr 0.0.0.0:50055 --device 0 --pool-size 30gb --http-addr 0.0.0.0:9091
 
     cd python && pytest tests/test_vllm_e2e_correctness.py -v -s
 
@@ -118,7 +118,7 @@ class TestE2ECorrectness:
         if not check_pegaflow_server(pega_metrics_port):
             pytest.skip(
                 f"PegaFlow server not reachable (metrics port {pega_metrics_port}). "
-                "Start with --metrics-addr flag."
+                "Start with --http-addr flag."
             )
 
         results = {"baseline": [], "pegaflow_cold": [], "pegaflow_warm": []}
