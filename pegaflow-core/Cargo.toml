@@ -21,6 +21,12 @@ ahash.workspace = true
 io-uring = "0.7"
 futures = "0.3"
 parking_lot = "0.12"
+kube.workspace = true
+k8s-openapi.workspace = true
+rustls.workspace = true
+tonic.workspace = true
+dashmap.workspace = true
+pegaflow-proto = { path = "../pegaflow-proto" }
 
 [dev-dependencies]
 criterion.workspace = true
