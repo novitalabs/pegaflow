@@ -1,0 +1,3 @@
+[default.extend-words]
+# Rust std library path (std::f64::consts)
+consts = "consts"
