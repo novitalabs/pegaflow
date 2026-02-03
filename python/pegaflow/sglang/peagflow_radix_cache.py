@@ -320,9 +320,9 @@ class PeagflowRadixCache(RadixCache):
         stride0_bytes = stride[0] * element_size
 
         assert self.page_size > 0, "page_size must be > 0 for PegaFlow radix cache"
-        assert (
-            slots % self.page_size == 0
-        ), f"KV slots ({slots}) must be divisible by page_size ({self.page_size})"
+        assert slots % self.page_size == 0, (
+            f"KV slots ({slots}) must be divisible by page_size ({self.page_size})"
+        )
 
         num_blocks = slots // self.page_size
         bytes_per_block = stride0_bytes * self.page_size

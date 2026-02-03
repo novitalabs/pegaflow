@@ -187,9 +187,7 @@ class PegaKVConnectorStats(KVConnectorStats):
         if num_prefetches > 0:
             result["num_prefetches"] = num_prefetches
             # prefetch_duration is in ms, keep as ms for consistency
-            result["avg_prefetch_duration_ms"] = round(
-                sum(prefetch_durations) / num_prefetches, 3
-            )
+            result["avg_prefetch_duration_ms"] = round(sum(prefetch_durations) / num_prefetches, 3)
             result["total_prefetch_blocks"] = sum(prefetch_blocks)
             result["avg_prefetch_blocks"] = round(sum(prefetch_blocks) / num_prefetches, 1)
 

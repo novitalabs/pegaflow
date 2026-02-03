@@ -25,9 +25,9 @@ Usage:
 import argparse
 import json
 import shutil
+import signal
 import subprocess
 import time
-import signal
 from pathlib import Path
 from typing import Optional, Sequence
 

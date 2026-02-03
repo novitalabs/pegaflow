@@ -172,9 +172,9 @@ class SchedulerConnector:
             num_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
 
             # Verify update_state_after_alloc was called for this request
-            assert (
-                req_id in self._block_hashes
-            ), f"req {req_id} not initialized in update_state_after_alloc"
+            assert req_id in self._block_hashes, (
+                f"req {req_id} not initialized in update_state_after_alloc"
+            )
 
             self._scheduled_tokens[req_id] += num_tokens
 

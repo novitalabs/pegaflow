@@ -95,6 +95,9 @@ warn_return_any = true
 warn_unused_ignores = true
 ignore_missing_imports = true
 
+[tool.isort]
+profile = "black"
+
 [tool.commitizen]
 name = "cz_conventional_commits"
 version = "0.0.12"

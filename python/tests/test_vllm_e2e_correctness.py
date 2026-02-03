@@ -167,9 +167,9 @@ class TestE2ECorrectness:
             insertions = metrics_after_cold.get(
                 "pegaflow_cache_block_insertions_total", 0
             ) - metrics_before_cold.get("pegaflow_cache_block_insertions_total", 0)
-            assert (
-                save_bytes > 0 or insertions > 0
-            ), f"Cold cache did not SAVE: save_bytes={save_bytes}, insertions={insertions}"
+            assert save_bytes > 0 or insertions > 0, (
+                f"Cold cache did not SAVE: save_bytes={save_bytes}, insertions={insertions}"
+            )
 
             # Warm cache run
             metrics_before_warm = fetch_pegaflow_metrics(pega_metrics_port)
@@ -188,13 +188,13 @@ class TestE2ECorrectness:
             hits = metrics_after_warm.get(
                 "pegaflow_cache_block_hits_total", 0
             ) - metrics_before_warm.get("pegaflow_cache_block_hits_total", 0)
-            assert (
-                load_bytes > 0 or hits > 0
-            ), f"Warm cache did not LOAD: load_bytes={load_bytes}, hits={hits}"
+            assert load_bytes > 0 or hits > 0, (
+                f"Warm cache did not LOAD: load_bytes={load_bytes}, hits={hits}"
+            )
 
             print(
-                f"[Metrics] SAVE: {save_bytes/1e6:.1f}MB, LOAD: {load_bytes/1e6:.1f}MB, "
-                f"Speedup: {cold_total_time/warm_total_time:.2f}x"
+                f"[Metrics] SAVE: {save_bytes / 1e6:.1f}MB, LOAD: {load_bytes / 1e6:.1f}MB, "
+                f"Speedup: {cold_total_time / warm_total_time:.2f}x"
             )
 
         # Phase 3: Verify correctness
@@ -205,9 +205,7 @@ class TestE2ECorrectness:
             warm = results["pegaflow_warm"][i]["text"]
 
             assert cold == warm, (
-                f"[{prompt_id}] Cold vs Warm mismatch:\n"
-                f"  Cold: {cold[:100]}\n"
-                f"  Warm: {warm[:100]}"
+                f"[{prompt_id}] Cold vs Warm mismatch:\n  Cold: {cold[:100]}\n  Warm: {warm[:100]}"
             )
             assert baseline == cold, (
                 f"[{prompt_id}] Baseline vs PegaFlow mismatch:\n"

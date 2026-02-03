@@ -6,11 +6,11 @@ This example demonstrates:
 2. Second run: Generate same prompt again and load KV cache from CPU
 """
 
-from vllm import LLM, SamplingParams
-from vllm.config import KVTransferConfig
+import random
 import time
 
-import random
+from vllm import LLM, SamplingParams
+from vllm.config import KVTransferConfig
 
 
 def generate_long_prompt(length: int) -> str:

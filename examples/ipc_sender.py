@@ -7,10 +7,11 @@ Usage:
     Terminal 2: python examples/ipc_receiver.py
 """
 
-import torch
-import zmq
 import pickle
 import time
+
+import torch
+import zmq
 
 
 class CudaIPCWrapper:
@@ -109,7 +110,7 @@ def main():
 
         # Check if tensor was modified by receiver
         if not modified and torch.allclose(current_value, expected_modified):
-            print(f"\n  ✓✓✓ DETECTED MODIFICATION at {i+1} seconds! ✓✓✓")
+            print(f"\n  ✓✓✓ DETECTED MODIFICATION at {i + 1} seconds! ✓✓✓")
             print(f"  Modified tensor value: {tensor}")
             print("  ✓ Cross-process memory sharing CONFIRMED!")
             print("  ✓ Receiver's changes are visible in sender's process!")

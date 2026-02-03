@@ -330,10 +330,8 @@ class TestFuzzCorrectness:
             f"  Access types: original={stats['original']}, "
             f"prefix_50pct={stats['prefix_50pct']}, extended={stats['extended']}"
         )
-        print(
-            f"  Cache blocks: hits={hits:.0f}, misses={misses:.0f}, " f"hit_rate={hits / total:.1%}"
-        )
-        print(f"  Data transfer: save={save_bytes / 1e6:.1f}MB, " f"load={load_bytes / 1e6:.1f}MB")
+        print(f"  Cache blocks: hits={hits:.0f}, misses={misses:.0f}, hit_rate={hits / total:.1%}")
+        print(f"  Data transfer: save={save_bytes / 1e6:.1f}MB, load={load_bytes / 1e6:.1f}MB")
         print(f"  Failures: {len(failures)}")
         print(f"{'=' * 60}\n")
 

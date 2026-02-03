@@ -1,4 +1,18 @@
 repos:
+  - repo: https://github.com/pycqa/isort
+    rev: 7.0.0
+    hooks:
+    - id: isort
+      args: [--profile, black, --settings-path, python]
+      additional_dependencies: [toml]
+      files: ^python/
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.2.4
+    hooks:
+    - id: codespell
+      # Use pyproject.toml for codespell configuration
+      additional_dependencies: [tomli]
+      files: ^python/.*\.pyi?$
   # Branch protection and file checks
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
@@ -31,9 +45,9 @@ repos:
 
   # Python
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.8.4
+    rev: v0.14.14
     hooks:
-      - id: ruff
+      - id: ruff-check
         args: [--fix]
       - id: ruff-format
 
