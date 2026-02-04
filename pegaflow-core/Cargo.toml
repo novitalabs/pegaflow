@@ -3,6 +3,10 @@ name = "pegaflow-core"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+tracing = ["fastrace"]
+
 [dependencies]
 cudarc.workspace = true
 log.workspace = true
@@ -21,6 +25,7 @@ ahash.workspace = true
 io-uring = "0.7"
 futures = "0.3"
 parking_lot = "0.12"
+fastrace = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion.workspace = true

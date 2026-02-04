@@ -7,6 +7,8 @@ use crate::proto::engine::{
     UnregisterRequest, UnregisterResponse,
 };
 use crate::registry::{CudaTensorRegistry, TensorMetadata};
+#[cfg(feature = "tracing")]
+use fastrace::prelude::*;
 use log::{debug, info, warn};
 use parking_lot::Mutex;
 use pegaflow_core::{EngineError, PegaEngine, PrefetchStatus};
@@ -308,9 +310,17 @@ impl Engine for GrpcEngineService {
         &self,
         request: Request<QueryRequest>,
     ) -> Result<Response<QueryResponse>, Status> {
+        let req = request.into_inner();
+        #[cfg(feature = "tracing")]
+        let root = Span::root("rpc.query", SpanContext::random()).with_properties(|| {
+            [
+                ("instance_id", req.instance_id.clone()),
+                ("block_hashes", req.block_hashes.len().to_string()),
+            ]
+        });
+
         let start = Instant::now();
-        let result: Result<Response<QueryResponse>, Status> = async {
-            let req = request.into_inner();
+        let fut = async {
             debug!(
                 "RPC [query]: instance_id={} block_hashes={}",
                 req.instance_id,
@@ -342,8 +352,12 @@ impl Engine for GrpcEngineService {
                 loading_blocks,
                 missing_blocks,
             }))
-        }
-        .await;
+        };
+
+        #[cfg(feature = "tracing")]
+        let result: Result<Response<QueryResponse>, Status> = fut.in_span(root).await;
+        #[cfg(not(feature = "tracing"))]
+        let result: Result<Response<QueryResponse>, Status> = fut.await;
 
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         match &result {

@@ -3,6 +3,13 @@ pub mod metric;
 pub mod proto;
 pub mod registry;
 pub mod service;
+#[cfg(feature = "tracing")]
+mod trace;
+#[cfg(not(feature = "tracing"))]
+mod trace {
+    pub fn init() {}
+    pub fn flush() {}
+}
 mod utils;
 
 pub use registry::CudaTensorRegistry;
@@ -269,6 +276,7 @@ fn init_metrics(
 pub fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     pegaflow_core::logging::init_stdout_colored(&cli.log_level);
+    trace::init();
 
     // Initialize CUDA in the main thread before starting Tokio runtime
     init_cuda_driver()?;
@@ -456,6 +464,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         {
             error!("Failed to shutdown metrics provider: {err}");
         }
+
+        trace::flush();
 
         Ok(())
     })

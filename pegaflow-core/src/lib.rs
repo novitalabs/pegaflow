@@ -690,6 +690,7 @@ impl PegaEngine {
     /// - `Done { hit, missing: 0 }`: all blocks in memory cache
     /// - `Loading { hit, loading }`: some blocks being fetched from SSD
     /// - `Done { hit, missing }`: some blocks don't exist
+    #[cfg_attr(feature = "tracing", fastrace::trace)]
     pub fn count_prefix_hit_blocks_with_prefetch(
         &self,
         instance_id: &str,

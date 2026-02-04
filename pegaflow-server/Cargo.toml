@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 default-run = "pegaflow-server"
 
+[features]
+default = []
+tracing = ["fastrace", "pegaflow-core/tracing"]
+
 [lib]
 name = "pegaflow_server"
 path = "src/lib.rs"
@@ -38,6 +42,7 @@ opentelemetry-prometheus.workspace = true
 prometheus.workspace = true
 tikv-jemallocator.workspace = true
 colored.workspace = true
+fastrace = { workspace = true, features = ["enable"], optional = true }
 
 [build-dependencies]
 pyo3-build-config.workspace = true
