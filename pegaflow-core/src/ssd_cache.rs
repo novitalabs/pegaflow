@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use crate::block::{BlockKey, LayerBlock, SealedBlock};
 use crate::metrics::core_metrics;
+use crate::numa::NumaNode;
 use crate::pinned_pool::PinnedAllocation;
 use crate::seal_offload::SlotMeta;
 use crate::uring::UringIoEngine;
@@ -75,6 +76,8 @@ pub(crate) struct SsdIndexEntry {
     pub file_offset: u64,
     /// Per-slot metadata for rebuilding SealedBlock
     pub slots: Vec<SlotMeta>,
+    /// NUMA node affinity for the originating GPU
+    pub numa_node: NumaNode,
 }
 
 /// State of an SSD index entry (two-phase commit)
@@ -232,6 +235,7 @@ impl SsdRingBuffer {
     pub(crate) fn prepare_batch(
         &mut self,
         candidates: Vec<(BlockKey, Arc<SealedBlock>)>,
+        numa_node: NumaNode,
     ) -> PreparedBatch {
         // 1. Filter: skip keys that already exist (Writing or Committed)
         let to_write: Vec<_> = candidates
@@ -268,6 +272,7 @@ impl SsdRingBuffer {
                     len: size,
                     file_offset,
                     slots,
+                    numa_node,
                 };
 
                 // Insert Writing state
@@ -316,6 +321,7 @@ impl PreparedBatch {
 /// Batch of sealed blocks to write to SSD
 pub(crate) struct SsdWriteBatch {
     pub blocks: Vec<(BlockKey, Weak<SealedBlock>)>,
+    pub numa_node: NumaNode,
 }
 
 /// Request to prefetch a block from SSD (metadata only, allocation done in worker)
@@ -353,10 +359,14 @@ type WriteResult = (BlockKey, bool, f64, u64);
 
 /// Type alias for prepare batch callback.
 pub(crate) type PrepareBatchFn =
-    Arc<dyn Fn(Vec<(BlockKey, Arc<SealedBlock>)>) -> PreparedBatch + Send + Sync>;
+    Arc<dyn Fn(Vec<(BlockKey, Arc<SealedBlock>)>, NumaNode) -> PreparedBatch + Send + Sync>;
 
 /// Type alias for commit write callback.
 pub(crate) type CommitWriteFn = Arc<dyn Fn(&BlockKey, bool) + Send + Sync>;
+
+/// Type alias for prefetch allocation callback.
+pub(crate) type AllocatePrefetchFn =
+    Arc<dyn Fn(u64, Option<NumaNode>) -> Option<Arc<PinnedAllocation>> + Send + Sync>;
 
 /// Handle used by SSD workers to interact with storage.
 /// Both writer and prefetcher use callbacks to access StorageInner state.
@@ -366,20 +376,28 @@ pub(crate) struct SsdStorageHandle {
     /// Check if a logical offset is still valid (not yet overwritten)
     is_valid: Arc<dyn Fn(u64) -> bool + Send + Sync>,
     /// Allocate pinned memory for prefetch
-    allocate: Arc<dyn Fn(u64) -> Option<Arc<PinnedAllocation>> + Send + Sync>,
+    allocate: AllocatePrefetchFn,
     /// Prepare batch for SSD write (filter, allocate space, insert Writing)
     prepare: PrepareBatchFn,
     /// Commit write result (success: Writing→Committed, failure: remove)
     commit: CommitWriteFn,
+    is_numa: bool,
 }
 
 impl SsdStorageHandle {
     pub(crate) fn new(
         complete_prefetch: impl Fn(BlockKey, Option<Arc<SealedBlock>>) + Send + Sync + 'static,
         is_valid: impl Fn(u64) -> bool + Send + Sync + 'static,
-        allocate: impl Fn(u64) -> Option<Arc<PinnedAllocation>> + Send + Sync + 'static,
-        prepare: impl Fn(Vec<(BlockKey, Arc<SealedBlock>)>) -> PreparedBatch + Send + Sync + 'static,
+        allocate: impl Fn(u64, Option<NumaNode>) -> Option<Arc<PinnedAllocation>>
+        + Send
+        + Sync
+        + 'static,
+        prepare: impl Fn(Vec<(BlockKey, Arc<SealedBlock>)>, NumaNode) -> PreparedBatch
+        + Send
+        + Sync
+        + 'static,
         commit: impl Fn(&BlockKey, bool) + Send + Sync + 'static,
+        is_numa: bool,
     ) -> Self {
         Self {
             complete_prefetch: Arc::new(complete_prefetch),
@@ -387,6 +405,7 @@ impl SsdStorageHandle {
             allocate: Arc::new(allocate),
             prepare: Arc::new(prepare),
             commit: Arc::new(commit),
+            is_numa,
         }
     }
 
@@ -401,18 +420,31 @@ impl SsdStorageHandle {
     }
 
     #[inline]
-    pub(crate) fn allocate(&self, size: u64) -> Option<Arc<PinnedAllocation>> {
-        (self.allocate)(size)
+    pub(crate) fn allocate(
+        &self,
+        size: u64,
+        numa_node: Option<NumaNode>,
+    ) -> Option<Arc<PinnedAllocation>> {
+        (self.allocate)(size, numa_node)
     }
 
     #[inline]
-    pub(crate) fn prepare(&self, candidates: Vec<(BlockKey, Arc<SealedBlock>)>) -> PreparedBatch {
-        (self.prepare)(candidates)
+    pub(crate) fn prepare(
+        &self,
+        candidates: Vec<(BlockKey, Arc<SealedBlock>)>,
+        numa_node: NumaNode,
+    ) -> PreparedBatch {
+        (self.prepare)(candidates, numa_node)
     }
 
     #[inline]
     pub(crate) fn commit(&self, key: &BlockKey, success: bool) {
         (self.commit)(key, success)
+    }
+
+    #[inline]
+    pub(crate) fn is_numa(&self) -> bool {
+        self.is_numa
     }
 }
 
@@ -487,7 +519,7 @@ pub(crate) async fn ssd_writer_loop(
                         }
 
                         // Prepare batch: filter + allocate + insert Writing (via handle)
-                        let prepared = handle.prepare(candidates);
+                        let prepared = handle.prepare(candidates, b.numa_node);
 
                         if prepared.is_empty() {
                             continue;
@@ -613,45 +645,96 @@ async fn ssd_prefetch_dispatcher(
             continue;
         }
 
-        // Batch-level allocation (preserves memory contiguity for GPU transfers)
-        let total_size: u64 = batch.requests.iter().map(|r| r.entry.len).sum();
-        let allocation = match handle.allocate(total_size) {
-            Some(alloc) => alloc,
-            None => {
-                warn!(
-                    "SSD prefetch dispatcher: alloc failed for {} bytes ({} blocks)",
-                    total_size,
-                    batch.requests.len()
-                );
-                for req in batch.requests {
-                    handle.complete_prefetch(req.key, None);
+        let groups = build_allocation_groups(handle.is_numa(), batch.requests);
+        for group in groups {
+            let total_size = total_request_size(&group.requests);
+            let allocation = match handle.allocate(total_size, group.numa_node) {
+                Some(alloc) => alloc,
+                None => {
+                    warn!(
+                        "SSD prefetch dispatcher: alloc failed for {} bytes ({} blocks) numa={:?}",
+                        total_size,
+                        group.requests.len(),
+                        group.numa_node
+                    );
+                    for req in group.requests {
+                        handle.complete_prefetch(req.key, None);
+                    }
+                    continue;
                 }
-                continue;
-            }
-        };
-
-        // Split into block-level tasks
-        let mut offset: usize = 0;
-        for req in batch.requests {
-            let alloc_offset = offset;
-            offset += req.entry.len as usize;
-
-            let task = PrefetchTask {
-                key: req.key,
-                entry: req.entry,
-                allocation: allocation.clone(),
-                alloc_offset,
             };
 
-            // Bounded send: blocks when channel full (natural backpressure)
-            if task_tx.send(task).await.is_err() {
-                debug!("SSD prefetch dispatcher: worker channel closed");
+            if !enqueue_prefetch_tasks(&task_tx, allocation, group.requests).await {
                 return;
             }
         }
     }
 
     debug!("SSD prefetch dispatcher exiting");
+}
+
+fn total_request_size(requests: &[PrefetchRequest]) -> u64 {
+    requests.iter().map(|r| r.entry.len).sum()
+}
+
+struct AllocationGroup {
+    numa_node: Option<NumaNode>,
+    requests: Vec<PrefetchRequest>,
+}
+
+fn build_allocation_groups(is_numa: bool, requests: Vec<PrefetchRequest>) -> Vec<AllocationGroup> {
+    if !is_numa {
+        return vec![AllocationGroup {
+            numa_node: None,
+            requests,
+        }];
+    }
+
+    let mut groups: HashMap<Option<NumaNode>, Vec<PrefetchRequest>> = HashMap::new();
+    for req in requests {
+        let key = if req.entry.numa_node.is_unknown() {
+            None
+        } else {
+            Some(req.entry.numa_node)
+        };
+        groups.entry(key).or_default().push(req);
+    }
+
+    groups
+        .into_iter()
+        .map(|(numa_node, requests)| AllocationGroup {
+            numa_node,
+            requests,
+        })
+        .collect()
+}
+
+async fn enqueue_prefetch_tasks(
+    task_tx: &tokio::sync::mpsc::Sender<PrefetchTask>,
+    allocation: Arc<PinnedAllocation>,
+    requests: Vec<PrefetchRequest>,
+) -> bool {
+    // Split into block-level tasks
+    let mut offset: usize = 0;
+    for req in requests {
+        let alloc_offset = offset;
+        offset += req.entry.len as usize;
+
+        let task = PrefetchTask {
+            key: req.key,
+            entry: req.entry,
+            allocation: allocation.clone(),
+            alloc_offset,
+        };
+
+        // Bounded send: blocks when channel full (natural backpressure)
+        if task_tx.send(task).await.is_err() {
+            debug!("SSD prefetch dispatcher: worker channel closed");
+            return false;
+        }
+    }
+
+    true
 }
 
 /// Worker: maintains FuturesUnordered with max_inflight concurrent I/O operations.
@@ -874,6 +957,50 @@ mod tests {
         BlockKey::new("test".to_string(), vec![n])
     }
 
+    fn make_request(n: u8, numa_node: NumaNode) -> PrefetchRequest {
+        let key = make_key(n);
+        let entry = SsdIndexEntry {
+            begin: n as u64,
+            len: 8,
+            file_offset: 0,
+            slots: vec![],
+            numa_node,
+        };
+        PrefetchRequest { key, entry }
+    }
+
+    #[test]
+    fn test_build_allocation_groups_non_numa_single_group() {
+        let requests = vec![
+            make_request(1, NumaNode::UNKNOWN),
+            make_request(2, NumaNode::UNKNOWN),
+            make_request(3, NumaNode::UNKNOWN),
+        ];
+
+        let groups = build_allocation_groups(false, requests);
+        assert_eq!(groups.len(), 1);
+        assert!(groups[0].numa_node.is_none());
+        assert_eq!(groups[0].requests.len(), 3);
+    }
+
+    #[test]
+    fn test_build_allocation_groups_numa_split_and_unknown() {
+        let requests = vec![
+            make_request(1, NumaNode(0)),
+            make_request(2, NumaNode(1)),
+            make_request(3, NumaNode(0)),
+        ];
+
+        let groups = build_allocation_groups(true, requests);
+        let mut counts: HashMap<Option<NumaNode>, usize> = HashMap::new();
+        for group in groups {
+            counts.insert(group.numa_node, group.requests.len());
+        }
+
+        assert_eq!(counts.get(&Some(NumaNode(0))), Some(&2));
+        assert_eq!(counts.get(&Some(NumaNode(1))), Some(&1));
+    }
+
     impl SsdRingBuffer {
         /// Insert a Committed entry for testing. Returns the key.
         fn insert_committed(&mut self, n: u8, begin: u64, len: u64) -> BlockKey {
@@ -883,6 +1010,7 @@ mod tests {
                 len,
                 file_offset: begin % self.capacity.max(1),
                 slots: vec![],
+                numa_node: NumaNode::UNKNOWN,
             };
             self.entries
                 .insert(key.clone(), SsdEntryState::Committed(entry));
@@ -898,6 +1026,7 @@ mod tests {
                 len,
                 file_offset: begin % self.capacity.max(1),
                 slots: vec![],
+                numa_node: NumaNode::UNKNOWN,
             };
             self.entries
                 .insert(key.clone(), SsdEntryState::Writing(entry));

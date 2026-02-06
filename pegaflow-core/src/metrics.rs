@@ -48,6 +48,7 @@ pub(crate) struct CoreMetrics {
     pub ssd_prefetch_throughput_bytes_per_second: Histogram<f64>,
     pub ssd_prefetch_inflight: UpDownCounter<i64>,
     pub ssd_prefetch_queue_full: Counter<u64>,
+    pub ssd_prefetch_backpressure_blocks: Counter<u64>,
 }
 
 fn init_meter() -> Meter {
@@ -236,6 +237,10 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
             ssd_prefetch_queue_full: meter
                 .u64_counter("pegaflow_ssd_prefetch_queue_full")
                 .with_description("Prefetch requests dropped due to full queue")
+                .build(),
+            ssd_prefetch_backpressure_blocks: meter
+                .u64_counter("pegaflow_ssd_prefetch_backpressure_blocks")
+                .with_description("Blocks treated as missing due to max prefetch backpressure")
                 .build(),
         }
     })

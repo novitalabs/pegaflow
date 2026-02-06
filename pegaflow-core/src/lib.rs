@@ -605,7 +605,8 @@ impl PegaEngine {
             .map_err(|e| EngineError::Storage(e.to_string()))?;
 
         // Send non-admitted blocks to SSD
-        self.storage.send_ssd_batch(&sealed_for_ssd);
+        self.storage
+            .send_ssd_batch(gpu.preferred_numa(), &sealed_for_ssd);
 
         Ok(())
     }
@@ -679,7 +680,8 @@ impl PegaEngine {
             .map_err(|e| EngineError::Storage(e.to_string()))?;
 
         // Send non-admitted blocks to SSD
-        self.storage.send_ssd_batch(&sealed_for_ssd);
+        self.storage
+            .send_ssd_batch(gpu.preferred_numa(), &sealed_for_ssd);
 
         Ok(())
     }
