@@ -1,26 +1,19 @@
-use std::sync::Arc;
-
 use crate::{
     api::WorkerConfig,
-    backend::RdmaBackend,
     domain_address::DomainAddress,
     error::{Result, TransferError},
     sideway_backend::SidewayBackend,
 };
 
 pub struct MooncakeTransferEngine {
-    backend: Arc<dyn RdmaBackend>,
+    backend: SidewayBackend,
 }
 
 impl MooncakeTransferEngine {
     pub fn new() -> Self {
         Self {
-            backend: Arc::new(SidewayBackend::new()),
+            backend: SidewayBackend::new(),
         }
-    }
-
-    pub fn with_backend(backend: Arc<dyn RdmaBackend>) -> Self {
-        Self { backend }
     }
 
     pub fn initialize(&mut self, nic_name: impl Into<String>, rpc_port: u16) -> Result<()> {
@@ -121,111 +114,27 @@ impl Default for MooncakeTransferEngine {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
-
-    use parking_lot::Mutex;
-
     use super::MooncakeTransferEngine;
-    use crate::{
-        api::WorkerConfig,
-        backend::RdmaBackend,
-        domain_address::DomainAddress,
-        error::{Result, TransferError},
-    };
-
-    #[derive(Default)]
-    struct MockBackend {
-        rpc_port: Mutex<Option<u16>>,
-        session_id: Mutex<Option<DomainAddress>>,
-        memory: Mutex<HashMap<u64, usize>>,
-    }
-
-    impl RdmaBackend for MockBackend {
-        fn initialize(&self, config: WorkerConfig) -> Result<()> {
-            *self.rpc_port.lock() = Some(config.rpc_port);
-            *self.session_id.lock() = Some(DomainAddress::from_parts(
-                [1_u8; 16],
-                config.rpc_port,
-                100,
-                200,
-            ));
-            Ok(())
-        }
-
-        fn rpc_port(&self) -> Result<u16> {
-            self.rpc_port.lock().ok_or(TransferError::NotInitialized)
-        }
-
-        fn session_id(&self) -> DomainAddress {
-            self.session_id
-                .lock()
-                .clone()
-                .expect("mock backend not initialized")
-        }
-
-        fn register_memory(&self, ptr: u64, len: usize) -> Result<()> {
-            self.memory.lock().insert(ptr, len);
-            Ok(())
-        }
-
-        fn unregister_memory(&self, ptr: u64) -> Result<()> {
-            let removed = self.memory.lock().remove(&ptr);
-            if removed.is_none() {
-                return Err(TransferError::MemoryNotRegistered { ptr });
-            }
-            Ok(())
-        }
-
-        fn transfer_sync_write(
-            &self,
-            _session_id: &DomainAddress,
-            local_ptr: u64,
-            _remote_ptr: u64,
-            len: usize,
-        ) -> Result<usize> {
-            let memory = self.memory.lock();
-            let Some(registered) = memory.get(&local_ptr) else {
-                return Err(TransferError::MemoryNotRegistered { ptr: local_ptr });
-            };
-            if len > *registered {
-                return Err(TransferError::InvalidArgument(
-                    "len exceeds registered memory",
-                ));
-            }
-            Ok(len)
-        }
-    }
-
-    #[test]
-    fn mooncake_minimal_path_works() {
-        let mut engine = MooncakeTransferEngine::with_backend(Arc::new(MockBackend::default()));
-        engine
-            .initialize("mlx5_0", 50051)
-            .expect("init should succeed");
-        engine
-            .register_memory(0x1000, 4096)
-            .expect("register should succeed");
-
-        let peer = DomainAddress::from_parts([2_u8; 16], 50052, 101, 201);
-        let written = engine
-            .transfer_sync_write(&peer, 0x1000, 0x2000, 1024)
-            .expect("write should succeed");
-        assert_eq!(written, 1024);
-
-        let session_id = engine.get_session_id();
-        assert_eq!(session_id.lid(), 50051);
-    }
+    use crate::error::TransferError;
 
     #[test]
     fn batch_len_mismatch_fails() {
-        let mut engine = MooncakeTransferEngine::with_backend(Arc::new(MockBackend::default()));
-        engine
-            .initialize("mlx5_0", 50051)
-            .expect("init should succeed");
+        let engine = MooncakeTransferEngine::new();
 
         let err = engine
             .batch_register_memory(&[0x1000, 0x2000], &[4096])
             .expect_err("must fail for mismatch");
-        assert_eq!(err.to_string(), "batch length mismatch: ptrs=2, lens=1");
+        assert_eq!(err, TransferError::BatchLengthMismatch { ptrs: 2, lens: 1 });
+    }
+
+    #[test]
+    fn batch_transfer_len_mismatch_fails() {
+        let engine = MooncakeTransferEngine::new();
+        let session_id = crate::DomainAddress::from_parts([1_u8; 16], 2, 3, 4);
+
+        let err = engine
+            .batch_transfer_sync_write(&session_id, &[0x1000, 0x2000], &[0x3000], &[128])
+            .expect_err("must fail for mismatch");
+        assert_eq!(err, TransferError::BatchLengthMismatch { ptrs: 2, lens: 1 });
     }
 }

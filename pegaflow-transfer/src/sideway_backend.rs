@@ -38,7 +38,6 @@ use sideway::ibverbs::{
 
 use crate::{
     api::WorkerConfig,
-    backend::RdmaBackend,
     domain_address::DomainAddress,
     error::{Result, TransferError},
     logging,
@@ -1243,8 +1242,8 @@ impl SidewayBackend {
     }
 }
 
-impl RdmaBackend for SidewayBackend {
-    fn initialize(&self, config: WorkerConfig) -> Result<()> {
+impl SidewayBackend {
+    pub fn initialize(&self, config: WorkerConfig) -> Result<()> {
         logging::ensure_initialized();
         if config.nic_name.trim().is_empty() {
             return Err(TransferError::InvalidArgument("nic_name is empty"));
@@ -1270,12 +1269,12 @@ impl RdmaBackend for SidewayBackend {
         Ok(())
     }
 
-    fn rpc_port(&self) -> Result<u16> {
+    pub fn rpc_port(&self) -> Result<u16> {
         let state = self.state.lock();
         Ok(Self::ensure_initialized(&state)?.rpc_port)
     }
 
-    fn session_id(&self) -> DomainAddress {
+    pub fn session_id(&self) -> DomainAddress {
         let state = self.state.lock();
         let runtime = state
             .runtime
@@ -1284,7 +1283,7 @@ impl RdmaBackend for SidewayBackend {
         runtime.local_ud.clone()
     }
 
-    fn register_memory(&self, ptr: u64, len: usize) -> Result<()> {
+    pub fn register_memory(&self, ptr: u64, len: usize) -> Result<()> {
         if ptr == 0 {
             return Err(TransferError::InvalidArgument("ptr must be non-zero"));
         }
@@ -1319,7 +1318,7 @@ impl RdmaBackend for SidewayBackend {
         Ok(())
     }
 
-    fn unregister_memory(&self, ptr: u64) -> Result<()> {
+    pub fn unregister_memory(&self, ptr: u64) -> Result<()> {
         if ptr == 0 {
             return Err(TransferError::InvalidArgument("ptr must be non-zero"));
         }
@@ -1333,7 +1332,7 @@ impl RdmaBackend for SidewayBackend {
         Ok(())
     }
 
-    fn transfer_sync_write(
+    pub fn transfer_sync_write(
         &self,
         session_id: &DomainAddress,
         local_ptr: u64,
@@ -1393,7 +1392,7 @@ impl RdmaBackend for SidewayBackend {
 #[cfg(test)]
 mod tests {
     use super::SidewayBackend;
-    use crate::{api::WorkerConfig, backend::RdmaBackend, error::TransferError};
+    use crate::{api::WorkerConfig, error::TransferError};
 
     #[test]
     fn initialize_rejects_invalid_input() {

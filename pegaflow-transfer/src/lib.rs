@@ -1,5 +1,4 @@
 mod api;
-mod backend;
 mod domain_address;
 mod engine;
 mod error;
@@ -7,7 +6,6 @@ mod logging;
 mod sideway_backend;
 
 pub use api::{RegisteredMemory, WorkerConfig};
-pub use backend::RdmaBackend;
 pub use domain_address::DomainAddress;
 pub use engine::MooncakeTransferEngine;
 pub use error::{Result, TransferError};
