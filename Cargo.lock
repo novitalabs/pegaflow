@@ -1697,6 +1697,8 @@ name = "pegaflow-transfer"
 version = "0.1.0"
 dependencies = [
  "cudarc",
+ "log",
+ "logforth",
  "parking_lot",
  "rdma-mummy-sys",
  "sideway",

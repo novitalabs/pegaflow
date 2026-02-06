@@ -6,8 +6,6 @@ pub type Result<T> = std::result::Result<T, TransferError>;
 pub enum TransferError {
     #[error("transfer engine not initialized")]
     NotInitialized,
-    #[error("unsupported protocol: {0}")]
-    UnsupportedProtocol(String),
     #[error("invalid argument: {0}")]
     InvalidArgument(&'static str),
     #[error("batch length mismatch: ptrs={ptrs}, lens={lens}")]

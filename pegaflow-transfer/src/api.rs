@@ -1,6 +1,5 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerConfig {
-    pub bind_addr: String,
     pub nic_name: String,
     pub rpc_port: u16,
 }

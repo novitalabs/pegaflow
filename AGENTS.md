@@ -299,7 +299,7 @@ Build `pegaflow-transfer` as a Mooncake-compatible RDMA transfer crate for
 
 ### Required External API (Phase-1)
 
-1. `initialize(local_addr, protocol=\"rdma\", nic_name)`
+1. `initialize(nic_name, rpc_port)`
 2. `get_rpc_port()` / `get_session_id()`
 3. `register_memory(ptr, len)`
 4. `unregister_memory(ptr)`
@@ -307,3 +307,30 @@ Build `pegaflow-transfer` as a Mooncake-compatible RDMA transfer crate for
 6. `batch_unregister_memory(ptrs)`
 7. `transfer_sync_write(session_id, local_ptr, remote_ptr, len)`
 8. `batch_transfer_sync_write(session_id, local_ptrs, remote_ptrs, lens)`
+
+### Progress Snapshot (2026-02-06)
+
+- Branch: `feat/pegaflow-transfer-sideway-rdma`
+- Pushed commits:
+  - `9924ac2` `feat(transfer): switch to domainaddress ud control plane`
+  - `4249a6e` `fix(transfer): create ud qp with qp_ex for domainaddress control`
+- Implemented:
+  - Removed IP/`host:port` metadata control path from `pegaflow-transfer`.
+  - Switched session identity to hex-encoded `DomainAddress` (UD addr bytes).
+  - Added UD control-plane messages for:
+    - RC connection handshake (`ConnectReq` / `ConnectResp`)
+    - remote MR query (`MrQueryReq` / `MrQueryResp`)
+  - Retained sync RC `RDMA write` data path.
+- Validation status:
+  - Local: `cargo test -p pegaflow-transfer` passed.
+  - RDMA host: `cargo test -p pegaflow-transfer --test rdma_gpu_it -- --ignored --nocapture` passed.
+- Current IT runtime env:
+  - required: `PEGAFLOW_TRANSFER_IT_NIC`
+  - optional: `PEGAFLOW_TRANSFER_IT_BASE_PORT` (default `56050`)
+- API simplification completed:
+  - Removed `protocol` parameter from `pegaflow-transfer` core API.
+  - Removed `local_addr`/worker-name style parameter from `pegaflow-transfer` core API.
+  - Keep compatibility work for protocol/local_addr at pybind layer only.
+- Logging integration completed:
+  - Added `pegaflow-transfer` local logging init (`logforth`) with env filter support.
+  - Added key-path logs for runtime init, control-plane message flow, session setup, MR query, and sync write.

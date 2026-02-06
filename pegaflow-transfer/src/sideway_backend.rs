@@ -11,6 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use log::{debug, info, warn};
 use parking_lot::{Condvar, Mutex};
 use rdma_mummy_sys::{
     ibv_ah, ibv_ah_attr, ibv_create_ah, ibv_destroy_ah, ibv_global_route, ibv_modify_qp,
@@ -39,6 +40,7 @@ use crate::{
     api::WorkerConfig,
     backend::RdmaBackend,
     error::{Result, TransferError},
+    logging,
 };
 
 const UD_QKEY: u32 = 0x1111_1111;
@@ -181,6 +183,15 @@ impl ControlMessage {
             | ControlMessage::ConnectResp { request_id, .. }
             | ControlMessage::MrQueryReq { request_id, .. }
             | ControlMessage::MrQueryResp { request_id, .. } => *request_id,
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            ControlMessage::ConnectReq { .. } => "connect_req",
+            ControlMessage::ConnectResp { .. } => "connect_resp",
+            ControlMessage::MrQueryReq { .. } => "mr_query_req",
+            ControlMessage::MrQueryResp { .. } => "mr_query_resp",
         }
     }
 }
@@ -491,6 +502,10 @@ impl SidewayBackend {
             ));
         }
 
+        warn!(
+            "no active port found on NIC {}; cannot initialize transfer runtime",
+            device_ctx.name()
+        );
         Err(TransferError::Backend(
             "no active port found on selected NIC".to_string(),
         ))
@@ -551,6 +566,10 @@ impl SidewayBackend {
         config: &WorkerConfig,
         state: Arc<Mutex<SidewayState>>,
     ) -> Result<Arc<SidewayRuntime>> {
+        info!(
+            "transfer runtime create start: nic={}, rpc_port={}",
+            config.nic_name, config.rpc_port
+        );
         let device_list =
             DeviceList::new().map_err(|error| TransferError::Backend(error.to_string()))?;
         let device = device_list
@@ -567,6 +586,10 @@ impl SidewayBackend {
 
         let (port_num, gid_index, link_layer, mtu, local_gid, local_lid) =
             Self::choose_port_and_gid(&device_ctx)?;
+        info!(
+            "transfer runtime selected port: nic={}, port={}, gid_index={}, link_layer={:?}, mtu={:?}",
+            config.nic_name, port_num, gid_index, link_layer, mtu
+        );
 
         let mut cq_builder = device_ctx.create_cq_builder();
         cq_builder.setup_cqe(256);
@@ -578,9 +601,7 @@ impl SidewayBackend {
         let mut qp_builder = pd.create_qp_builder();
         qp_builder
             .setup_qp_type(QueuePairType::UnreliableDatagram)
-            .setup_send_ops_flags(
-                SendOperationFlags::Send | SendOperationFlags::SendWithImmediate,
-            )
+            .setup_send_ops_flags(SendOperationFlags::Send | SendOperationFlags::SendWithImmediate)
             .setup_send_cq(ud_cq.clone())
             .setup_recv_cq(ud_cq.clone())
             .setup_max_send_wr(256)
@@ -651,6 +672,11 @@ impl SidewayBackend {
         }
 
         Self::spawn_control_loop(Arc::downgrade(&runtime), Arc::downgrade(&state));
+        info!(
+            "transfer runtime ready: nic={}, session_id={}",
+            config.nic_name,
+            runtime.local_ud.to_hex()
+        );
         Ok(runtime)
     }
 
@@ -658,11 +684,14 @@ impl SidewayBackend {
         let _ = thread::Builder::new()
             .name("pegaflow-sideway-control".to_string())
             .spawn(move || {
+                debug!("transfer control loop started");
                 loop {
                     let Some(runtime) = runtime.upgrade() else {
+                        debug!("transfer control loop stopping: runtime dropped");
                         break;
                     };
                     let Some(state) = state.upgrade() else {
+                        debug!("transfer control loop stopping: state dropped");
                         break;
                     };
 
@@ -680,7 +709,8 @@ impl SidewayBackend {
                         Err(PollCompletionQueueError::CompletionQueueEmpty) => {
                             thread::sleep(Duration::from_micros(100));
                         }
-                        Err(_) => {
+                        Err(error) => {
+                            warn!("transfer control loop cq poll error: {error}");
                             thread::sleep(Duration::from_millis(1));
                         }
                     }
@@ -753,6 +783,12 @@ impl SidewayBackend {
         peer_ud: DomainAddressRaw,
         message: &ControlMessage,
     ) -> Result<()> {
+        debug!(
+            "control send: kind={}, request_id={}, peer={}",
+            message.kind(),
+            message.request_id(),
+            peer_ud.to_hex()
+        );
         let payload = Self::encode_message(message);
         let ah = Self::get_or_create_ah(runtime, peer_ud)?;
 
@@ -799,6 +835,12 @@ impl SidewayBackend {
         wc: &sideway::ibverbs::completion::GenericWorkCompletion,
     ) {
         if wc.status() != WorkCompletionStatus::Success as u32 {
+            warn!(
+                "ud completion failed: status={}, opcode={}, vendor_err={}",
+                wc.status(),
+                wc.opcode(),
+                wc.vendor_err()
+            );
             if wc.opcode() == WorkCompletionOperationType::Receive as u32 {
                 let slot_idx = wc.wr_id() as usize;
                 let _ = Self::post_ud_recv(runtime, slot_idx);
@@ -814,6 +856,12 @@ impl SidewayBackend {
                     if byte_len > UD_GRH_BYTES && byte_len <= slot.bytes.len() {
                         let payload = &slot.bytes[UD_GRH_BYTES..byte_len];
                         if let Some(message) = Self::decode_message(payload) {
+                            debug!(
+                                "control recv: kind={}, request_id={}, bytes={}",
+                                message.kind(),
+                                message.request_id(),
+                                byte_len - UD_GRH_BYTES
+                            );
                             Self::handle_control_message(runtime, state, message);
                         }
                     }
@@ -839,6 +887,11 @@ impl SidewayBackend {
                 src_ud,
                 rc,
             } => {
+                debug!(
+                    "control handle connect_req: request_id={}, peer={}",
+                    request_id,
+                    src_ud.to_hex()
+                );
                 if let Ok(local_rc) = Self::ensure_passive_session(runtime, state, src_ud, rc) {
                     let _ = Self::send_control_message(
                         runtime,
@@ -849,6 +902,12 @@ impl SidewayBackend {
                             rc: local_rc,
                         },
                     );
+                } else {
+                    warn!(
+                        "control handle connect_req failed: request_id={}, peer={}",
+                        request_id,
+                        src_ud.to_hex()
+                    );
                 }
             }
             ControlMessage::MrQueryReq {
@@ -857,6 +916,13 @@ impl SidewayBackend {
                 ptr,
                 len,
             } => {
+                debug!(
+                    "control handle mr_query_req: request_id={}, peer={}, ptr={:#x}, len={}",
+                    request_id,
+                    src_ud.to_hex(),
+                    ptr,
+                    len
+                );
                 let response = {
                     let state = state.lock();
                     let requested_len = usize::try_from(len).ok();
@@ -957,6 +1023,13 @@ impl SidewayBackend {
         session: &ActiveSession,
         remote_rc: RcEndpoint,
     ) -> Result<()> {
+        debug!(
+            "rc connect start: local_qpn={}, remote_qpn={}, remote_lid={}, remote_gid={}",
+            session.local_rc.qp_num,
+            remote_rc.qp_num,
+            remote_rc.lid,
+            bytes_to_hex(&remote_rc.gid)
+        );
         let mut ah_attr = AddressHandleAttribute::new();
         ah_attr
             .setup_dest_lid(remote_rc.lid)
@@ -988,6 +1061,10 @@ impl SidewayBackend {
             .setup_max_read_atomic(1);
         qp.modify(&rts_attr)
             .map_err(|error| TransferError::Backend(error.to_string()))?;
+        debug!(
+            "rc connect ready: local_qpn={}, remote_qpn={}",
+            session.local_rc.qp_num, remote_rc.qp_num
+        );
         Ok(())
     }
 
@@ -999,8 +1076,10 @@ impl SidewayBackend {
     ) -> Result<RcEndpoint> {
         let peer_key = peer_ud.to_hex();
         if let Some(existing) = state.lock().sessions.get(&peer_key).cloned() {
+            debug!("passive session reused: peer={}", peer_key);
             return Ok(existing.local_rc);
         }
+        info!("passive session create: peer={}", peer_key);
 
         let seed = runtime
             .control
@@ -1021,6 +1100,11 @@ impl SidewayBackend {
             .entry(peer_key)
             .or_insert_with(|| Arc::clone(&session))
             .clone();
+        info!(
+            "passive session ready: local_qpn={}, peer={}",
+            retained.local_rc.qp_num,
+            peer_ud.to_hex()
+        );
         Ok(retained.local_rc)
     }
 
@@ -1031,8 +1115,10 @@ impl SidewayBackend {
     ) -> Result<Arc<ActiveSession>> {
         let peer_key = peer_ud.to_hex();
         if let Some(existing) = state.lock().sessions.get(&peer_key).cloned() {
+            debug!("active session reused: peer={peer_key}");
             return Ok(existing);
         }
+        info!("active session create: peer={peer_key}");
 
         let request_id = runtime.control.begin_request();
         let seed = request_id;
@@ -1075,6 +1161,11 @@ impl SidewayBackend {
             .entry(peer_key)
             .or_insert_with(|| Arc::clone(&session))
             .clone();
+        info!(
+            "active session ready: local_qpn={}, peer={}",
+            retained.local_rc.qp_num,
+            peer_ud.to_hex()
+        );
         Ok(retained)
     }
 
@@ -1085,6 +1176,13 @@ impl SidewayBackend {
         len: usize,
     ) -> Result<(u32, usize)> {
         let request_id = runtime.control.begin_request();
+        debug!(
+            "mr query send: request_id={}, peer={}, ptr={:#x}, len={}",
+            request_id,
+            peer_ud.to_hex(),
+            remote_ptr,
+            len
+        );
         Self::send_control_message(
             runtime,
             peer_ud,
@@ -1116,6 +1214,13 @@ impl SidewayBackend {
                 let available_len = usize::try_from(available_len).map_err(|_| {
                     TransferError::Backend("remote memory available length overflow".to_string())
                 })?;
+                debug!(
+                    "mr query ok: request_id={}, peer={}, rkey={}, available_len={}",
+                    request_id,
+                    peer_ud.to_hex(),
+                    rkey,
+                    available_len
+                );
                 Ok((rkey, available_len))
             }
             other => Err(TransferError::Backend(format!(
@@ -1200,19 +1305,28 @@ impl SidewayBackend {
 
 impl RdmaBackend for SidewayBackend {
     fn initialize(&self, config: WorkerConfig) -> Result<()> {
+        logging::ensure_initialized();
         if config.nic_name.trim().is_empty() {
             return Err(TransferError::InvalidArgument("nic_name is empty"));
         }
         if config.rpc_port == 0 {
             return Err(TransferError::InvalidArgument("rpc_port must be non-zero"));
         }
+        info!(
+            "transfer backend initialize: nic={}, rpc_port={}",
+            config.nic_name, config.rpc_port
+        );
 
         let runtime = Self::create_runtime(&config, Arc::clone(&self.state))?;
         let mut state = self.state.lock();
         state.config = Some(config);
-        state.runtime = Some(runtime);
+        state.runtime = Some(Arc::clone(&runtime));
         state.registered.clear();
         state.sessions.clear();
+        info!(
+            "transfer backend initialized: session_id={}",
+            runtime.local_ud.to_hex()
+        );
         Ok(())
     }
 
@@ -1261,6 +1375,7 @@ impl RdmaBackend for SidewayBackend {
                 mr,
             },
         );
+        debug!("memory registered: ptr={:#x}, len={}", ptr, len);
         Ok(())
     }
 
@@ -1274,6 +1389,7 @@ impl RdmaBackend for SidewayBackend {
         if removed.is_none() {
             return Err(TransferError::MemoryNotRegistered { ptr });
         }
+        debug!("memory unregistered: ptr={:#x}", ptr);
         Ok(())
     }
 
@@ -1301,6 +1417,13 @@ impl RdmaBackend for SidewayBackend {
         let peer_ud = DomainAddressRaw::from_hex(session_id).ok_or(
             TransferError::InvalidArgument("session_id is not a valid DomainAddress hex"),
         )?;
+        info!(
+            "transfer_sync_write start: peer={}, local_ptr={:#x}, remote_ptr={:#x}, len={}",
+            peer_ud.to_hex(),
+            local_ptr,
+            remote_ptr,
+            len
+        );
 
         let (runtime, local_mr) = {
             let state = self.state.lock();
@@ -1325,6 +1448,11 @@ impl RdmaBackend for SidewayBackend {
         }
 
         Self::post_write(&session, local_mr, local_ptr, remote_ptr, len, remote_rkey)?;
+        info!(
+            "transfer_sync_write done: peer={}, bytes={}",
+            peer_ud.to_hex(),
+            len
+        );
         Ok(len)
     }
 }
@@ -1339,7 +1467,7 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 }
 
 fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
-    if s.is_empty() || s.len() % 2 != 0 {
+    if s.is_empty() || !s.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(s.len() / 2);
@@ -1377,7 +1505,6 @@ mod tests {
         let backend = SidewayBackend::new();
         let error = backend
             .initialize(WorkerConfig {
-                bind_addr: "".to_string(),
                 nic_name: "".to_string(),
                 rpc_port: 50055,
             })

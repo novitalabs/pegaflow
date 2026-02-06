@@ -22,19 +22,8 @@ impl MooncakeTransferEngine {
         Self { backend }
     }
 
-    pub fn initialize(
-        &mut self,
-        hostname: impl Into<String>,
-        protocol: &str,
-        nic_name: impl Into<String>,
-        rpc_port: u16,
-    ) -> Result<()> {
-        if protocol != "rdma" {
-            return Err(TransferError::UnsupportedProtocol(protocol.to_string()));
-        }
-        let hostname = hostname.into();
+    pub fn initialize(&mut self, nic_name: impl Into<String>, rpc_port: u16) -> Result<()> {
         self.backend.initialize(WorkerConfig {
-            bind_addr: hostname.clone(),
             nic_name: nic_name.into(),
             rpc_port,
         })?;
@@ -204,7 +193,7 @@ mod tests {
     fn mooncake_minimal_path_works() {
         let mut engine = MooncakeTransferEngine::with_backend(Arc::new(MockBackend::default()));
         engine
-            .initialize("127.0.0.1", "rdma", "mlx5_0", 50051)
+            .initialize("mlx5_0", 50051)
             .expect("init should succeed");
         engine
             .register_memory(0x1000, 4096)
@@ -223,7 +212,7 @@ mod tests {
     fn batch_len_mismatch_fails() {
         let mut engine = MooncakeTransferEngine::with_backend(Arc::new(MockBackend::default()));
         engine
-            .initialize("127.0.0.1", "rdma", "mlx5_0", 50051)
+            .initialize("mlx5_0", 50051)
             .expect("init should succeed");
 
         let err = engine
