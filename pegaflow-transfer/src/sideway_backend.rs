@@ -39,6 +39,7 @@ use sideway::ibverbs::{
 use crate::{
     api::WorkerConfig,
     backend::RdmaBackend,
+    domain_address::DomainAddress,
     error::{Result, TransferError},
     logging,
 };
@@ -48,50 +49,6 @@ const UD_RECV_SLOTS: usize = 64;
 const UD_BUFFER_BYTES: usize = 512;
 const UD_GRH_BYTES: usize = 40;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct DomainAddressRaw {
-    gid: [u8; 16],
-    lid: u16,
-    qp_num: u32,
-    qkey: u32,
-}
-
-impl DomainAddressRaw {
-    const BYTES: usize = 26;
-
-    fn to_bytes(self) -> [u8; Self::BYTES] {
-        let mut bytes = [0_u8; Self::BYTES];
-        bytes[..16].copy_from_slice(&self.gid);
-        bytes[16..18].copy_from_slice(&self.lid.to_le_bytes());
-        bytes[18..22].copy_from_slice(&self.qp_num.to_le_bytes());
-        bytes[22..26].copy_from_slice(&self.qkey.to_le_bytes());
-        bytes
-    }
-
-    fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != Self::BYTES {
-            return None;
-        }
-        let mut gid = [0_u8; 16];
-        gid.copy_from_slice(&bytes[..16]);
-        Some(Self {
-            gid,
-            lid: u16::from_le_bytes(bytes[16..18].try_into().ok()?),
-            qp_num: u32::from_le_bytes(bytes[18..22].try_into().ok()?),
-            qkey: u32::from_le_bytes(bytes[22..26].try_into().ok()?),
-        })
-    }
-
-    fn to_hex(self) -> String {
-        bytes_to_hex(&self.to_bytes())
-    }
-
-    fn from_hex(s: &str) -> Option<Self> {
-        let bytes = hex_to_bytes(s)?;
-        Self::from_bytes(&bytes)
-    }
-}
 
 #[derive(Clone, Copy, Debug)]
 struct RcEndpoint {
@@ -153,23 +110,23 @@ impl MessageType {
 enum ControlMessage {
     ConnectReq {
         request_id: u64,
-        src_ud: DomainAddressRaw,
+        src_ud: DomainAddress,
         rc: RcEndpoint,
     },
     ConnectResp {
         request_id: u64,
-        src_ud: DomainAddressRaw,
+        src_ud: DomainAddress,
         rc: RcEndpoint,
     },
     MrQueryReq {
         request_id: u64,
-        src_ud: DomainAddressRaw,
+        src_ud: DomainAddress,
         ptr: u64,
         len: u64,
     },
     MrQueryResp {
         request_id: u64,
-        src_ud: DomainAddressRaw,
+        src_ud: DomainAddress,
         found: bool,
         rkey: u32,
         available_len: u64,
@@ -277,12 +234,12 @@ struct SidewayRuntime {
     mtu: Mtu,
     local_gid: Gid,
     local_lid: u16,
-    local_ud: DomainAddressRaw,
+    local_ud: DomainAddress,
     ud_qp: Arc<Mutex<GenericQueuePair>>,
     ud_cq: GenericCompletionQueue,
     recv_slots: Vec<UdRecvSlot>,
     send_slot: Mutex<UdSendSlot>,
-    ah_cache: Mutex<HashMap<DomainAddressRaw, Arc<AddressHandle>>>,
+    ah_cache: Mutex<HashMap<DomainAddress, Arc<AddressHandle>>>,
     control: Arc<ControlPlane>,
 }
 
@@ -304,7 +261,7 @@ struct SidewayState {
     config: Option<WorkerConfig>,
     runtime: Option<Arc<SidewayRuntime>>,
     registered: HashMap<u64, RegisteredMemoryEntry>,
-    sessions: HashMap<String, Arc<ActiveSession>>,
+    sessions: HashMap<DomainAddress, Arc<ActiveSession>>,
 }
 
 #[derive(Default)]
@@ -347,7 +304,8 @@ impl SidewayBackend {
             } => {
                 bytes.push(MessageType::ConnectReq as u8);
                 bytes.extend_from_slice(&request_id.to_le_bytes());
-                bytes.extend_from_slice(&src_ud.to_bytes());
+                let src_bytes = src_ud.to_bytes();
+                bytes.extend_from_slice(&src_bytes);
                 bytes.extend_from_slice(&rc.to_bytes());
             }
             ControlMessage::ConnectResp {
@@ -357,7 +315,8 @@ impl SidewayBackend {
             } => {
                 bytes.push(MessageType::ConnectResp as u8);
                 bytes.extend_from_slice(&request_id.to_le_bytes());
-                bytes.extend_from_slice(&src_ud.to_bytes());
+                let src_bytes = src_ud.to_bytes();
+                bytes.extend_from_slice(&src_bytes);
                 bytes.extend_from_slice(&rc.to_bytes());
             }
             ControlMessage::MrQueryReq {
@@ -368,7 +327,8 @@ impl SidewayBackend {
             } => {
                 bytes.push(MessageType::MrQueryReq as u8);
                 bytes.extend_from_slice(&request_id.to_le_bytes());
-                bytes.extend_from_slice(&src_ud.to_bytes());
+                let src_bytes = src_ud.to_bytes();
+                bytes.extend_from_slice(&src_bytes);
                 bytes.extend_from_slice(&ptr.to_le_bytes());
                 bytes.extend_from_slice(&len.to_le_bytes());
             }
@@ -381,7 +341,8 @@ impl SidewayBackend {
             } => {
                 bytes.push(MessageType::MrQueryResp as u8);
                 bytes.extend_from_slice(&request_id.to_le_bytes());
-                bytes.extend_from_slice(&src_ud.to_bytes());
+                let src_bytes = src_ud.to_bytes();
+                bytes.extend_from_slice(&src_bytes);
                 bytes.push(u8::from(*found));
                 bytes.extend_from_slice(&rkey.to_le_bytes());
                 bytes.extend_from_slice(&available_len.to_le_bytes());
@@ -391,13 +352,13 @@ impl SidewayBackend {
     }
 
     fn decode_message(bytes: &[u8]) -> Option<ControlMessage> {
-        if bytes.len() < 1 + 8 + DomainAddressRaw::BYTES {
+        if bytes.len() < 1 + 8 + DomainAddress::BYTES {
             return None;
         }
         let kind = MessageType::from_u8(bytes[0])?;
         let request_id = u64::from_le_bytes(bytes[1..9].try_into().ok()?);
-        let src_ud = DomainAddressRaw::from_bytes(&bytes[9..(9 + DomainAddressRaw::BYTES)])?;
-        let payload = &bytes[(9 + DomainAddressRaw::BYTES)..];
+        let src_ud = DomainAddress::from_bytes(&bytes[9..(9 + DomainAddress::BYTES)])?;
+        let payload = &bytes[(9 + DomainAddress::BYTES)..];
 
         match kind {
             MessageType::ConnectReq => Some(ControlMessage::ConnectReq {
@@ -614,12 +575,8 @@ impl SidewayBackend {
             .into();
         Self::setup_ud_qp(&mut ud_qp, port_num)?;
 
-        let local_ud = DomainAddressRaw {
-            gid: local_gid.raw,
-            lid: local_lid,
-            qp_num: ud_qp.qp_number(),
-            qkey: UD_QKEY,
-        };
+        let local_ud =
+            DomainAddress::from_parts(local_gid.raw, local_lid, ud_qp.qp_number(), UD_QKEY);
 
         let mut recv_slots = Vec::with_capacity(UD_RECV_SLOTS);
         for _ in 0..UD_RECV_SLOTS {
@@ -674,8 +631,7 @@ impl SidewayBackend {
         Self::spawn_control_loop(Arc::downgrade(&runtime), Arc::downgrade(&state));
         info!(
             "transfer runtime ready: nic={}, session_id={}",
-            config.nic_name,
-            runtime.local_ud.to_hex()
+            config.nic_name, runtime.local_ud
         );
         Ok(runtime)
     }
@@ -742,20 +698,20 @@ impl SidewayBackend {
 
     fn get_or_create_ah(
         runtime: &SidewayRuntime,
-        peer_ud: DomainAddressRaw,
+        peer_ud: &DomainAddress,
     ) -> Result<Arc<AddressHandle>> {
-        if let Some(existing) = runtime.ah_cache.lock().get(&peer_ud).cloned() {
+        if let Some(existing) = runtime.ah_cache.lock().get(peer_ud).cloned() {
             return Ok(existing);
         }
 
         let mut ah_attr = unsafe { MaybeUninit::<ibv_ah_attr>::zeroed().assume_init() };
         ah_attr.grh = ibv_global_route {
-            dgid: Gid { raw: peer_ud.gid }.into(),
+            dgid: Gid { raw: peer_ud.gid() }.into(),
             sgid_index: runtime.gid_index,
             hop_limit: 64,
             ..unsafe { MaybeUninit::<ibv_global_route>::zeroed().assume_init() }
         };
-        ah_attr.dlid = peer_ud.lid;
+        ah_attr.dlid = peer_ud.lid();
         ah_attr.is_global = if runtime.link_layer == LinkLayer::InfiniBand {
             0
         } else {
@@ -773,21 +729,21 @@ impl SidewayBackend {
         runtime
             .ah_cache
             .lock()
-            .entry(peer_ud)
+            .entry(peer_ud.clone())
             .or_insert_with(|| Arc::clone(&wrapped));
         Ok(wrapped)
     }
 
     fn send_control_message(
         runtime: &SidewayRuntime,
-        peer_ud: DomainAddressRaw,
+        peer_ud: &DomainAddress,
         message: &ControlMessage,
     ) -> Result<()> {
         debug!(
             "control send: kind={}, request_id={}, peer={}",
             message.kind(),
             message.request_id(),
-            peer_ud.to_hex()
+            peer_ud
         );
         let payload = Self::encode_message(message);
         let ah = Self::get_or_create_ah(runtime, peer_ud)?;
@@ -815,8 +771,8 @@ impl SidewayBackend {
         wr.opcode = ibv_wr_opcode::IBV_WR_SEND;
         wr.send_flags = ibv_send_flags::IBV_SEND_SIGNALED.0;
         wr.wr.ud.ah = ah.ah.as_ptr();
-        wr.wr.ud.remote_qpn = peer_ud.qp_num;
-        wr.wr.ud.remote_qkey = peer_ud.qkey;
+        wr.wr.ud.remote_qpn = peer_ud.qp_num();
+        wr.wr.ud.remote_qkey = peer_ud.qkey();
 
         let qp = runtime.ud_qp.lock();
         let ret = unsafe { ibv_post_send(qp.qp().as_ptr(), &raw mut wr, null_mut()) };
@@ -889,24 +845,22 @@ impl SidewayBackend {
             } => {
                 debug!(
                     "control handle connect_req: request_id={}, peer={}",
-                    request_id,
-                    src_ud.to_hex()
+                    request_id, src_ud
                 );
-                if let Ok(local_rc) = Self::ensure_passive_session(runtime, state, src_ud, rc) {
+                if let Ok(local_rc) = Self::ensure_passive_session(runtime, state, &src_ud, rc) {
                     let _ = Self::send_control_message(
                         runtime,
-                        src_ud,
+                        &src_ud,
                         &ControlMessage::ConnectResp {
                             request_id,
-                            src_ud: runtime.local_ud,
+                            src_ud: runtime.local_ud.clone(),
                             rc: local_rc,
                         },
                     );
                 } else {
                     warn!(
                         "control handle connect_req failed: request_id={}, peer={}",
-                        request_id,
-                        src_ud.to_hex()
+                        request_id, src_ud
                     );
                 }
             }
@@ -918,10 +872,7 @@ impl SidewayBackend {
             } => {
                 debug!(
                     "control handle mr_query_req: request_id={}, peer={}, ptr={:#x}, len={}",
-                    request_id,
-                    src_ud.to_hex(),
-                    ptr,
-                    len
+                    request_id, src_ud, ptr, len
                 );
                 let response = {
                     let state = state.lock();
@@ -934,7 +885,7 @@ impl SidewayBackend {
                             let available_len = entry_end.saturating_sub(ptr);
                             ControlMessage::MrQueryResp {
                                 request_id,
-                                src_ud: runtime.local_ud,
+                                src_ud: runtime.local_ud.clone(),
                                 found: true,
                                 rkey: mr.rkey(),
                                 available_len,
@@ -942,7 +893,7 @@ impl SidewayBackend {
                         } else {
                             ControlMessage::MrQueryResp {
                                 request_id,
-                                src_ud: runtime.local_ud,
+                                src_ud: runtime.local_ud.clone(),
                                 found: false,
                                 rkey: 0,
                                 available_len: 0,
@@ -951,14 +902,14 @@ impl SidewayBackend {
                     } else {
                         ControlMessage::MrQueryResp {
                             request_id,
-                            src_ud: runtime.local_ud,
+                            src_ud: runtime.local_ud.clone(),
                             found: false,
                             rkey: 0,
                             available_len: 0,
                         }
                     }
                 };
-                let _ = Self::send_control_message(runtime, src_ud, &response);
+                let _ = Self::send_control_message(runtime, &src_ud, &response);
             }
         }
     }
@@ -1024,11 +975,8 @@ impl SidewayBackend {
         remote_rc: RcEndpoint,
     ) -> Result<()> {
         debug!(
-            "rc connect start: local_qpn={}, remote_qpn={}, remote_lid={}, remote_gid={}",
-            session.local_rc.qp_num,
-            remote_rc.qp_num,
-            remote_rc.lid,
-            bytes_to_hex(&remote_rc.gid)
+            "rc connect start: local_qpn={}, remote_qpn={}, remote_lid={}, remote_gid={:?}",
+            session.local_rc.qp_num, remote_rc.qp_num, remote_rc.lid, remote_rc.gid
         );
         let mut ah_attr = AddressHandleAttribute::new();
         ah_attr
@@ -1071,10 +1019,10 @@ impl SidewayBackend {
     fn ensure_passive_session(
         runtime: &Arc<SidewayRuntime>,
         state: &Arc<Mutex<SidewayState>>,
-        peer_ud: DomainAddressRaw,
+        peer_ud: &DomainAddress,
         remote_rc: RcEndpoint,
     ) -> Result<RcEndpoint> {
-        let peer_key = peer_ud.to_hex();
+        let peer_key = peer_ud.clone();
         if let Some(existing) = state.lock().sessions.get(&peer_key).cloned() {
             debug!("passive session reused: peer={}", peer_key);
             return Ok(existing.local_rc);
@@ -1102,8 +1050,7 @@ impl SidewayBackend {
             .clone();
         info!(
             "passive session ready: local_qpn={}, peer={}",
-            retained.local_rc.qp_num,
-            peer_ud.to_hex()
+            retained.local_rc.qp_num, peer_ud
         );
         Ok(retained.local_rc)
     }
@@ -1111,9 +1058,9 @@ impl SidewayBackend {
     fn ensure_active_session(
         runtime: &Arc<SidewayRuntime>,
         state: &Arc<Mutex<SidewayState>>,
-        peer_ud: DomainAddressRaw,
+        peer_ud: &DomainAddress,
     ) -> Result<Arc<ActiveSession>> {
-        let peer_key = peer_ud.to_hex();
+        let peer_key = peer_ud.clone();
         if let Some(existing) = state.lock().sessions.get(&peer_key).cloned() {
             debug!("active session reused: peer={peer_key}");
             return Ok(existing);
@@ -1135,7 +1082,7 @@ impl SidewayBackend {
             peer_ud,
             &ControlMessage::ConnectReq {
                 request_id,
-                src_ud: runtime.local_ud,
+                src_ud: runtime.local_ud.clone(),
                 rc: local_rc,
             },
         )?;
@@ -1146,7 +1093,7 @@ impl SidewayBackend {
             .ok_or_else(|| TransferError::Backend("connect response timeout".to_string()))?;
 
         let remote_rc = match reply {
-            ControlMessage::ConnectResp { src_ud, rc, .. } if src_ud == peer_ud => rc,
+            ControlMessage::ConnectResp { src_ud, rc, .. } if &src_ud == peer_ud => rc,
             other => {
                 return Err(TransferError::Backend(format!(
                     "unexpected connect response: {other:?}"
@@ -1163,32 +1110,28 @@ impl SidewayBackend {
             .clone();
         info!(
             "active session ready: local_qpn={}, peer={}",
-            retained.local_rc.qp_num,
-            peer_ud.to_hex()
+            retained.local_rc.qp_num, peer_ud
         );
         Ok(retained)
     }
 
     fn query_remote_memory(
         runtime: &SidewayRuntime,
-        peer_ud: DomainAddressRaw,
+        peer_ud: &DomainAddress,
         remote_ptr: u64,
         len: usize,
     ) -> Result<(u32, usize)> {
         let request_id = runtime.control.begin_request();
         debug!(
             "mr query send: request_id={}, peer={}, ptr={:#x}, len={}",
-            request_id,
-            peer_ud.to_hex(),
-            remote_ptr,
-            len
+            request_id, peer_ud, remote_ptr, len
         );
         Self::send_control_message(
             runtime,
             peer_ud,
             &ControlMessage::MrQueryReq {
                 request_id,
-                src_ud: runtime.local_ud,
+                src_ud: runtime.local_ud.clone(),
                 ptr: remote_ptr,
                 len: len as u64,
             },
@@ -1205,7 +1148,7 @@ impl SidewayBackend {
                 rkey,
                 available_len,
                 ..
-            } if src_ud == peer_ud => {
+            } if &src_ud == peer_ud => {
                 if !found {
                     return Err(TransferError::InvalidArgument(
                         "remote memory not registered for target ptr",
@@ -1216,10 +1159,7 @@ impl SidewayBackend {
                 })?;
                 debug!(
                     "mr query ok: request_id={}, peer={}, rkey={}, available_len={}",
-                    request_id,
-                    peer_ud.to_hex(),
-                    rkey,
-                    available_len
+                    request_id, peer_ud, rkey, available_len
                 );
                 Ok((rkey, available_len))
             }
@@ -1325,7 +1265,7 @@ impl RdmaBackend for SidewayBackend {
         state.sessions.clear();
         info!(
             "transfer backend initialized: session_id={}",
-            runtime.local_ud.to_hex()
+            runtime.local_ud
         );
         Ok(())
     }
@@ -1335,13 +1275,13 @@ impl RdmaBackend for SidewayBackend {
         Ok(Self::ensure_initialized(&state)?.rpc_port)
     }
 
-    fn session_id(&self) -> Result<String> {
+    fn session_id(&self) -> DomainAddress {
         let state = self.state.lock();
         let runtime = state
             .runtime
             .as_ref()
-            .ok_or(TransferError::NotInitialized)?;
-        Ok(runtime.local_ud.to_hex())
+            .expect("transfer backend not initialized");
+        runtime.local_ud.clone()
     }
 
     fn register_memory(&self, ptr: u64, len: usize) -> Result<()> {
@@ -1395,13 +1335,15 @@ impl RdmaBackend for SidewayBackend {
 
     fn transfer_sync_write(
         &self,
-        session_id: &str,
+        session_id: &DomainAddress,
         local_ptr: u64,
         remote_ptr: u64,
         len: usize,
     ) -> Result<usize> {
-        if session_id.trim().is_empty() {
-            return Err(TransferError::InvalidArgument("session_id is empty"));
+        if session_id.to_bytes().len() != DomainAddress::BYTES {
+            return Err(TransferError::InvalidArgument(
+                "session_id has invalid DomainAddress bytes",
+            ));
         }
         if local_ptr == 0 {
             return Err(TransferError::InvalidArgument("local_ptr must be non-zero"));
@@ -1414,15 +1356,10 @@ impl RdmaBackend for SidewayBackend {
         if len == 0 {
             return Err(TransferError::InvalidArgument("len must be non-zero"));
         }
-        let peer_ud = DomainAddressRaw::from_hex(session_id).ok_or(
-            TransferError::InvalidArgument("session_id is not a valid DomainAddress hex"),
-        )?;
+        let peer_ud = session_id;
         info!(
             "transfer_sync_write start: peer={}, local_ptr={:#x}, remote_ptr={:#x}, len={}",
-            peer_ud.to_hex(),
-            local_ptr,
-            remote_ptr,
-            len
+            peer_ud, local_ptr, remote_ptr, len
         );
 
         let (runtime, local_mr) = {
@@ -1448,57 +1385,15 @@ impl RdmaBackend for SidewayBackend {
         }
 
         Self::post_write(&session, local_mr, local_ptr, remote_ptr, len, remote_rkey)?;
-        info!(
-            "transfer_sync_write done: peer={}, bytes={}",
-            peer_ud.to_hex(),
-            len
-        );
+        info!("transfer_sync_write done: peer={}, bytes={}", peer_ud, len);
         Ok(len)
     }
 }
 
-fn bytes_to_hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(char::from_digit((byte >> 4) as u32, 16).unwrap());
-        out.push(char::from_digit((byte & 0x0f) as u32, 16).unwrap());
-    }
-    out
-}
-
-fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
-    if s.is_empty() || !s.len().is_multiple_of(2) {
-        return None;
-    }
-    let mut out = Vec::with_capacity(s.len() / 2);
-    let chars = s.as_bytes();
-    let mut idx = 0;
-    while idx < chars.len() {
-        let hi = (chars[idx] as char).to_digit(16)? as u8;
-        let lo = (chars[idx + 1] as char).to_digit(16)? as u8;
-        out.push((hi << 4) | lo);
-        idx += 2;
-    }
-    Some(out)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{DomainAddressRaw, SidewayBackend};
+    use super::SidewayBackend;
     use crate::{api::WorkerConfig, backend::RdmaBackend, error::TransferError};
-
-    #[test]
-    fn domain_address_roundtrip() {
-        let addr = DomainAddressRaw {
-            gid: [7_u8; 16],
-            lid: 123,
-            qp_num: 456,
-            qkey: 789,
-        };
-        let hex = addr.to_hex();
-        let decoded = DomainAddressRaw::from_hex(&hex).expect("hex decode");
-        assert_eq!(decoded, addr);
-    }
 
     #[test]
     fn initialize_rejects_invalid_input() {

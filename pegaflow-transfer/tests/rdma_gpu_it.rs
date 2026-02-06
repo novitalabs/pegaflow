@@ -126,13 +126,12 @@ fn it_rdma_gpu_transfer_sync_write() -> Result<(), Box<dyn std::error::Error>> {
     receiver.initialize(nic_name, base_port + 10)?;
     receiver.register_memory(dst.as_u64(), bytes)?;
 
-    let receiver_session = receiver.get_session_id()?;
+    let receiver_session = receiver.get_session_id();
     let setup_elapsed = setup_start.elapsed();
-    let session_preview = receiver_session.chars().take(16).collect::<String>();
     eprintln!(
-        "[it] setup done: bytes={} session_prefix={}... elapsed_ms={:.3}",
+        "[it] setup done: bytes={} session={} elapsed_ms={:.3}",
         bytes,
-        session_preview,
+        receiver_session,
         setup_elapsed.as_secs_f64() * 1_000.0
     );
 

@@ -1696,6 +1696,7 @@ dependencies = [
 name = "pegaflow-transfer"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "cudarc",
  "log",
  "logforth",

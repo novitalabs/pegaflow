@@ -10,6 +10,7 @@ rdma-mummy-sys = "0.2.2"
 log.workspace = true
 logforth.workspace = true
 thiserror = "2.0"
+bytes = "1"
 
 [dev-dependencies]
 cudarc.workspace = true

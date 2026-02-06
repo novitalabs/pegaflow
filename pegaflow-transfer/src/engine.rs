@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::{
     api::WorkerConfig,
     backend::RdmaBackend,
+    domain_address::DomainAddress,
     error::{Result, TransferError},
     sideway_backend::SidewayBackend,
 };
@@ -60,7 +61,7 @@ impl MooncakeTransferEngine {
 
     pub fn transfer_sync_write(
         &self,
-        session_id: &str,
+        session_id: &DomainAddress,
         local_ptr: u64,
         remote_ptr: u64,
         len: usize,
@@ -71,7 +72,7 @@ impl MooncakeTransferEngine {
 
     pub fn batch_transfer_sync_write(
         &self,
-        session_id: &str,
+        session_id: &DomainAddress,
         local_ptrs: &[u64],
         remote_ptrs: &[u64],
         lens: &[usize],
@@ -107,7 +108,7 @@ impl MooncakeTransferEngine {
         self.backend.rpc_port()
     }
 
-    pub fn get_session_id(&self) -> Result<String> {
+    pub fn get_session_id(&self) -> DomainAddress {
         self.backend.session_id()
     }
 }
@@ -128,20 +129,26 @@ mod tests {
     use crate::{
         api::WorkerConfig,
         backend::RdmaBackend,
+        domain_address::DomainAddress,
         error::{Result, TransferError},
     };
 
     #[derive(Default)]
     struct MockBackend {
         rpc_port: Mutex<Option<u16>>,
-        session_id: Mutex<Option<String>>,
+        session_id: Mutex<Option<DomainAddress>>,
         memory: Mutex<HashMap<u64, usize>>,
     }
 
     impl RdmaBackend for MockBackend {
         fn initialize(&self, config: WorkerConfig) -> Result<()> {
             *self.rpc_port.lock() = Some(config.rpc_port);
-            *self.session_id.lock() = Some(format!("mock:{}", config.rpc_port));
+            *self.session_id.lock() = Some(DomainAddress::from_parts(
+                [1_u8; 16],
+                config.rpc_port,
+                100,
+                200,
+            ));
             Ok(())
         }
 
@@ -149,11 +156,11 @@ mod tests {
             self.rpc_port.lock().ok_or(TransferError::NotInitialized)
         }
 
-        fn session_id(&self) -> Result<String> {
+        fn session_id(&self) -> DomainAddress {
             self.session_id
                 .lock()
                 .clone()
-                .ok_or(TransferError::NotInitialized)
+                .expect("mock backend not initialized")
         }
 
         fn register_memory(&self, ptr: u64, len: usize) -> Result<()> {
@@ -171,7 +178,7 @@ mod tests {
 
         fn transfer_sync_write(
             &self,
-            _session_id: &str,
+            _session_id: &DomainAddress,
             local_ptr: u64,
             _remote_ptr: u64,
             len: usize,
@@ -199,13 +206,14 @@ mod tests {
             .register_memory(0x1000, 4096)
             .expect("register should succeed");
 
+        let peer = DomainAddress::from_parts([2_u8; 16], 50052, 101, 201);
         let written = engine
-            .transfer_sync_write("127.0.0.1:50052", 0x1000, 0x2000, 1024)
+            .transfer_sync_write(&peer, 0x1000, 0x2000, 1024)
             .expect("write should succeed");
         assert_eq!(written, 1024);
 
-        let session_id = engine.get_session_id().expect("session id should exist");
-        assert_eq!(session_id, "mock:50051");
+        let session_id = engine.get_session_id();
+        assert_eq!(session_id.lid(), 50051);
     }
 
     #[test]
