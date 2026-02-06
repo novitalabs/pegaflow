@@ -6,7 +6,11 @@ use pegaflow_transfer::MooncakeTransferEngine;
 const ENV_RDMA_NIC: &str = "PEGAFLOW_TRANSFER_IT_NIC";
 const ENV_BASE_PORT: &str = "PEGAFLOW_TRANSFER_IT_BASE_PORT";
 const ENV_TRANSFER_BYTES: &str = "PEGAFLOW_TRANSFER_IT_BYTES";
+const ENV_TRANSFER_WARMUP: &str = "PEGAFLOW_TRANSFER_IT_WARMUP";
+const ENV_TRANSFER_ITERS: &str = "PEGAFLOW_TRANSFER_IT_ITERS";
 const DEFAULT_TRANSFER_BYTES: usize = 1 << 30;
+const DEFAULT_TRANSFER_WARMUP: usize = 1;
+const DEFAULT_TRANSFER_ITERS: usize = 20;
 
 struct GpuBuffer {
     ptr: sys::CUdeviceptr,
@@ -86,6 +90,12 @@ fn gbps(bytes: usize, elapsed_secs: f64) -> f64 {
     (bytes as f64 * 8.0) / elapsed_secs / 1e9
 }
 
+fn percentile_index(len: usize, p: f64) -> usize {
+    (((len as f64) * p).ceil() as usize)
+        .saturating_sub(1)
+        .min(len.saturating_sub(1))
+}
+
 #[test]
 #[ignore = "requires RDMA + CUDA; set PEGAFLOW_TRANSFER_IT_NIC"]
 fn it_rdma_gpu_transfer_sync_write() -> Result<(), Box<dyn std::error::Error>> {
@@ -102,9 +112,24 @@ fn it_rdma_gpu_transfer_sync_write() -> Result<(), Box<dyn std::error::Error>> {
         .map(|value| value.parse::<usize>())
         .transpose()?
         .unwrap_or(DEFAULT_TRANSFER_BYTES);
+    let warmup = read_env(ENV_TRANSFER_WARMUP)
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(DEFAULT_TRANSFER_WARMUP);
+    let iters = read_env(ENV_TRANSFER_ITERS)
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(DEFAULT_TRANSFER_ITERS);
+    if iters == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{ENV_TRANSFER_ITERS} must be > 0"),
+        )
+        .into());
+    }
     eprintln!(
-        "[it] start: nic={} base_port={} cuda_device=0 bytes={}",
-        nic_name, base_port, bytes
+        "[it] start: nic={} base_port={} cuda_device=0 bytes={} warmup={} iters={}",
+        nic_name, base_port, bytes, warmup, iters
     );
 
     let setup_start = Instant::now();
@@ -140,18 +165,66 @@ fn it_rdma_gpu_transfer_sync_write() -> Result<(), Box<dyn std::error::Error>> {
         setup_elapsed.as_secs_f64() * 1_000.0
     );
 
-    let transfer_start = Instant::now();
-    let written =
-        sender.transfer_sync_write(&receiver_session, src.as_u64(), dst.as_u64(), bytes)?;
-    assert_eq!(written, bytes);
-    let transfer_elapsed = transfer_start.elapsed();
-    let secs = transfer_elapsed.as_secs_f64();
+    let total_iters = warmup + iters;
+    let mut measured_elapsed_secs = Vec::with_capacity(iters);
+    for iter in 0..total_iters {
+        let transfer_start = Instant::now();
+        let written =
+            sender.transfer_sync_write(&receiver_session, src.as_u64(), dst.as_u64(), bytes)?;
+        assert_eq!(written, bytes);
+        let elapsed = transfer_start.elapsed();
+        let elapsed_secs = elapsed.as_secs_f64();
+
+        if iter < warmup {
+            eprintln!(
+                "[it] warmup iter={}/{} elapsed_us={} throughput_gib_s={:.6} throughput_gbps={:.6}",
+                iter + 1,
+                warmup,
+                elapsed.as_micros(),
+                gib_per_sec(written, elapsed_secs),
+                gbps(written, elapsed_secs)
+            );
+            continue;
+        }
+        measured_elapsed_secs.push(elapsed_secs);
+    }
+
+    let sum_elapsed_secs: f64 = measured_elapsed_secs.iter().sum();
+    let total_bytes = bytes * measured_elapsed_secs.len();
+    let avg_gib_s = gib_per_sec(total_bytes, sum_elapsed_secs);
+    let avg_gbps = gbps(total_bytes, sum_elapsed_secs);
+
+    let mut lat_ms: Vec<f64> = measured_elapsed_secs
+        .iter()
+        .map(|sec| sec * 1_000.0)
+        .collect();
+    lat_ms.sort_by(f64::total_cmp);
+    let p50_lat_ms = lat_ms[percentile_index(lat_ms.len(), 0.50)];
+    let p95_lat_ms = lat_ms[percentile_index(lat_ms.len(), 0.95)];
+
+    let mut throughput_gib_s: Vec<f64> = measured_elapsed_secs
+        .iter()
+        .map(|sec| gib_per_sec(bytes, *sec))
+        .collect();
+    throughput_gib_s.sort_by(f64::total_cmp);
+    let p50_gib_s = throughput_gib_s[percentile_index(throughput_gib_s.len(), 0.50)];
+    let p95_gib_s = throughput_gib_s[percentile_index(throughput_gib_s.len(), 0.95)];
+    let p50_gbps = p50_gib_s * 8.0 * 1024.0 * 1024.0 * 1024.0 / 1e9;
+    let p95_gbps = p95_gib_s * 8.0 * 1024.0 * 1024.0 * 1024.0 / 1e9;
+
     eprintln!(
-        "[it] transfer done: bytes={} elapsed_us={} throughput_gib_s={:.6} throughput_gbps={:.6}",
-        written,
-        transfer_elapsed.as_micros(),
-        gib_per_sec(written, secs),
-        gbps(written, secs)
+        "[it] transfer summary: bytes={} warmup={} measured_iters={} avg_gib_s={:.6} avg_gbps={:.6} p50_lat_ms={:.3} p95_lat_ms={:.3} p50_gib_s={:.6} p95_gib_s={:.6} p50_gbps={:.6} p95_gbps={:.6}",
+        bytes,
+        warmup,
+        measured_elapsed_secs.len(),
+        avg_gib_s,
+        avg_gbps,
+        p50_lat_ms,
+        p95_lat_ms,
+        p50_gib_s,
+        p95_gib_s,
+        p50_gbps,
+        p95_gbps
     );
 
     let verify_start = Instant::now();
