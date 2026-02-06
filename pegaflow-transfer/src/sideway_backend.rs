@@ -31,7 +31,7 @@ use sideway::ibverbs::{
     protection_domain::ProtectionDomain,
     queue_pair::{
         GenericQueuePair, PostSendGuard, QueuePair, QueuePairAttribute, QueuePairState,
-        QueuePairType, SetScatterGatherEntry, WorkRequestFlags,
+        QueuePairType, SendOperationFlags, SetScatterGatherEntry, WorkRequestFlags,
     },
 };
 
@@ -578,6 +578,9 @@ impl SidewayBackend {
         let mut qp_builder = pd.create_qp_builder();
         qp_builder
             .setup_qp_type(QueuePairType::UnreliableDatagram)
+            .setup_send_ops_flags(
+                SendOperationFlags::Send | SendOperationFlags::SendWithImmediate,
+            )
             .setup_send_cq(ud_cq.clone())
             .setup_recv_cq(ud_cq.clone())
             .setup_max_send_wr(256)
@@ -585,7 +588,7 @@ impl SidewayBackend {
             .setup_max_send_sge(1)
             .setup_max_recv_sge(1);
         let mut ud_qp: GenericQueuePair = qp_builder
-            .build()
+            .build_ex()
             .map_err(|error| TransferError::Backend(error.to_string()))?
             .into();
         Self::setup_ud_qp(&mut ud_qp, port_num)?;
