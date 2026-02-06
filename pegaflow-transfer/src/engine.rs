@@ -9,22 +9,17 @@ use crate::{
 
 pub struct MooncakeTransferEngine {
     backend: Arc<dyn RdmaBackend>,
-    hostname: Option<String>,
 }
 
 impl MooncakeTransferEngine {
     pub fn new() -> Self {
         Self {
             backend: Arc::new(SidewayBackend::new()),
-            hostname: None,
         }
     }
 
     pub fn with_backend(backend: Arc<dyn RdmaBackend>) -> Self {
-        Self {
-            backend,
-            hostname: None,
-        }
+        Self { backend }
     }
 
     pub fn initialize(
@@ -43,7 +38,6 @@ impl MooncakeTransferEngine {
             nic_name: nic_name.into(),
             rpc_port,
         })?;
-        self.hostname = Some(hostname);
         Ok(())
     }
 
@@ -125,10 +119,7 @@ impl MooncakeTransferEngine {
     }
 
     pub fn get_session_id(&self) -> Result<String> {
-        let Some(hostname) = self.hostname.as_ref() else {
-            return Err(TransferError::NotInitialized);
-        };
-        Ok(format!("{}:{}", hostname, self.get_rpc_port()?))
+        self.backend.session_id()
     }
 }
 
@@ -154,17 +145,26 @@ mod tests {
     #[derive(Default)]
     struct MockBackend {
         rpc_port: Mutex<Option<u16>>,
+        session_id: Mutex<Option<String>>,
         memory: Mutex<HashMap<u64, usize>>,
     }
 
     impl RdmaBackend for MockBackend {
         fn initialize(&self, config: WorkerConfig) -> Result<()> {
             *self.rpc_port.lock() = Some(config.rpc_port);
+            *self.session_id.lock() = Some(format!("mock:{}", config.rpc_port));
             Ok(())
         }
 
         fn rpc_port(&self) -> Result<u16> {
             self.rpc_port.lock().ok_or(TransferError::NotInitialized)
+        }
+
+        fn session_id(&self) -> Result<String> {
+            self.session_id
+                .lock()
+                .clone()
+                .ok_or(TransferError::NotInitialized)
         }
 
         fn register_memory(&self, ptr: u64, len: usize) -> Result<()> {
@@ -216,7 +216,7 @@ mod tests {
         assert_eq!(written, 1024);
 
         let session_id = engine.get_session_id().expect("session id should exist");
-        assert_eq!(session_id, "127.0.0.1:50051");
+        assert_eq!(session_id, "mock:50051");
     }
 
     #[test]

@@ -1,15 +1,8 @@
-use std::{
-    env,
-    ffi::c_void,
-    net::{SocketAddr, ToSocketAddrs},
-    thread,
-    time::{Duration, Instant},
-};
+use std::{env, ffi::c_void};
 
 use cudarc::driver::{CudaContext, sys};
 use pegaflow_transfer::MooncakeTransferEngine;
 
-const ENV_RDMA_ADDR: &str = "PEGAFLOW_TRANSFER_IT_ADDR";
 const ENV_RDMA_NIC: &str = "PEGAFLOW_TRANSFER_IT_NIC";
 const ENV_BASE_PORT: &str = "PEGAFLOW_TRANSFER_IT_BASE_PORT";
 
@@ -77,36 +70,9 @@ fn read_env(name: &str) -> Option<String> {
     })
 }
 
-fn wait_metadata_ready(session_id: &str, timeout: Duration) -> bool {
-    let Ok(mut resolved) = session_id.to_socket_addrs() else {
-        return false;
-    };
-    let Some(data_addr) = resolved.next() else {
-        return false;
-    };
-    let Some(metadata_port) = data_addr.port().checked_add(1) else {
-        return false;
-    };
-    let metadata_addr = SocketAddr::new(data_addr.ip(), metadata_port);
-
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if std::net::TcpStream::connect_timeout(&metadata_addr, Duration::from_millis(100)).is_ok()
-        {
-            return true;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    false
-}
-
 #[test]
-#[ignore = "requires RDMA + CUDA; set PEGAFLOW_TRANSFER_IT_ADDR and PEGAFLOW_TRANSFER_IT_NIC"]
+#[ignore = "requires RDMA + CUDA; set PEGAFLOW_TRANSFER_IT_NIC"]
 fn it_rdma_gpu_transfer_sync_write() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(addr) = read_env(ENV_RDMA_ADDR) else {
-        eprintln!("skip: {ENV_RDMA_ADDR} is not set");
-        return Ok(());
-    };
     let Some(nic_name) = read_env(ENV_RDMA_NIC) else {
         eprintln!("skip: {ENV_RDMA_NIC} is not set");
         return Ok(());
@@ -133,18 +99,14 @@ fn it_rdma_gpu_transfer_sync_write() -> Result<(), Box<dyn std::error::Error>> {
     dst.copy_from_host(&vec![0_u8; bytes]);
 
     let mut sender = MooncakeTransferEngine::new();
-    sender.initialize(addr.clone(), "rdma", nic_name.clone(), base_port)?;
+    sender.initialize("worker-a", "rdma", nic_name.clone(), base_port)?;
     sender.register_memory(src.as_u64(), bytes)?;
 
     let mut receiver = MooncakeTransferEngine::new();
-    receiver.initialize(addr, "rdma", nic_name, base_port + 10)?;
+    receiver.initialize("worker-b", "rdma", nic_name, base_port + 10)?;
     receiver.register_memory(dst.as_u64(), bytes)?;
 
     let receiver_session = receiver.get_session_id()?;
-    assert!(
-        wait_metadata_ready(&receiver_session, Duration::from_secs(3)),
-        "receiver metadata endpoint is not ready"
-    );
 
     let written =
         sender.transfer_sync_write(&receiver_session, src.as_u64(), dst.as_u64(), bytes)?;

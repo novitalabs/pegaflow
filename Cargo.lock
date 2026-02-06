@@ -1698,6 +1698,7 @@ version = "0.1.0"
 dependencies = [
  "cudarc",
  "parking_lot",
+ "rdma-mummy-sys",
  "sideway",
  "thiserror 2.0.17",
 ]

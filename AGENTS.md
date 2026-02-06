@@ -288,11 +288,14 @@ Build `pegaflow-transfer` as a Mooncake-compatible RDMA transfer crate for
 ### Architecture Decisions (Locked)
 
 - Primary RDMA backend is `sideway` in phase-1.
-- Reuse `sideway::rdmacm` for connection/session lifecycle.
 - Reuse `sideway::ibverbs` for MR/QP/CQ and write primitives.
 - Do not duplicate low-level rdma-cm/verbs wrappers inside `pegaflow-transfer`.
 - `pplx-garden` is reference-only for API shape and async/state-machine ideas;
   do not copy/vendor its transfer implementation in phase-1.
+- Control-plane direction is `pplx-garden` style:
+  opaque `DomainAddress` + UD handshake + explicit remote MR descriptor exchange.
+- Do **not** keep or fallback to IP/`host:port` session model in phase-1;
+  remove IP-based mode to control implementation complexity.
 
 ### Required External API (Phase-1)
 

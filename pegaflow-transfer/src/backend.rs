@@ -3,6 +3,7 @@ use crate::{api::WorkerConfig, error::Result};
 pub trait RdmaBackend: Send + Sync {
     fn initialize(&self, config: WorkerConfig) -> Result<()>;
     fn rpc_port(&self) -> Result<u16>;
+    fn session_id(&self) -> Result<String>;
 
     fn register_memory(&self, ptr: u64, len: usize) -> Result<()>;
     fn unregister_memory(&self, ptr: u64) -> Result<()>;

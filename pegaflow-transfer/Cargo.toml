@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 parking_lot.workspace = true
 sideway.workspace = true
+rdma-mummy-sys = "0.2.2"
 thiserror = "2.0"
 
 [dev-dependencies]
