@@ -5,6 +5,8 @@ use pegaflow_transfer::MooncakeTransferEngine;
 
 const ENV_RDMA_NIC: &str = "PEGAFLOW_TRANSFER_IT_NIC";
 const ENV_BASE_PORT: &str = "PEGAFLOW_TRANSFER_IT_BASE_PORT";
+const ENV_TRANSFER_BYTES: &str = "PEGAFLOW_TRANSFER_IT_BYTES";
+const DEFAULT_TRANSFER_BYTES: usize = 1 << 30;
 
 struct GpuBuffer {
     ptr: sys::CUdeviceptr,
@@ -96,9 +98,13 @@ fn it_rdma_gpu_transfer_sync_write() -> Result<(), Box<dyn std::error::Error>> {
         .as_deref()
         .unwrap_or("56050")
         .parse::<u16>()?;
+    let bytes = read_env(ENV_TRANSFER_BYTES)
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(DEFAULT_TRANSFER_BYTES);
     eprintln!(
-        "[it] start: nic={} base_port={} cuda_device=0",
-        nic_name, base_port
+        "[it] start: nic={} base_port={} cuda_device=0 bytes={}",
+        nic_name, base_port, bytes
     );
 
     let setup_start = Instant::now();
@@ -107,7 +113,6 @@ fn it_rdma_gpu_transfer_sync_write() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     };
 
-    let bytes = 4096usize;
     let src = GpuBuffer::alloc(bytes);
     let dst = GpuBuffer::alloc(bytes);
 
