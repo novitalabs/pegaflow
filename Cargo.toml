@@ -1,5 +1,11 @@
 [workspace]
-members = ["pegaflow-core", "pegaflow-proto", "pegaflow-server", "python"]
+members = [
+  "pegaflow-core",
+  "pegaflow-proto",
+  "pegaflow-server",
+  "pegaflow-transfer",
+  "python",
+]
 resolver = "2"
 
 [workspace.package]
@@ -9,6 +15,8 @@ edition = "2024"
 [workspace.dependencies]
 # Workspace members
 pegaflow-core = { path = "pegaflow-core" }
+pegaflow-transfer = { path = "pegaflow-transfer" }
+sideway = { path = "../sideway" }
 
 # Core dependencies
 cudarc = { version = "0.18.0", features = ["cuda-12040"] }
@@ -65,3 +73,6 @@ colored = "3.0"
 criterion = "0.8"
 
 tikv-jemallocator = "0.6.1"
+
+[patch.crates-io]
+sideway = { path = "../sideway" }

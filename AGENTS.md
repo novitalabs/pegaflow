@@ -269,3 +269,38 @@ cargo test
 - We use [Commitizen](https://commitizen-tools.github.io/commitizen/) commit message format
 - Do not commit directly to the master branch; create a `feat/`/`fix/`/`chore/`/`style/`/`refactor/`/`ci/`/... branch first
 - Use `cz c` for interactive commit message creation
+
+## Active Project Context (2026-02-06)
+
+### Initiative
+
+Build `pegaflow-transfer` as a Mooncake-compatible RDMA transfer crate for
+`sglang_mooncake_example.py`.
+
+### Phase-1 Scope (Locked)
+
+- API target: Mooncake minimal sync API only.
+- Topology: no auto-discovery, use explicit GPU->NIC mapping.
+- Process model: 1 GPU process = 1 transfer worker = 1 NIC.
+- Memory scope: GPU memory registration only.
+- Completion model: synchronous blocking transfers only.
+
+### Architecture Decisions (Locked)
+
+- Primary RDMA backend is `sideway` in phase-1.
+- Reuse `sideway::rdmacm` for connection/session lifecycle.
+- Reuse `sideway::ibverbs` for MR/QP/CQ and write primitives.
+- Do not duplicate low-level rdma-cm/verbs wrappers inside `pegaflow-transfer`.
+- `pplx-garden` is reference-only for API shape and async/state-machine ideas;
+  do not copy/vendor its transfer implementation in phase-1.
+
+### Required External API (Phase-1)
+
+1. `initialize(local_addr, protocol=\"rdma\", nic_name)`
+2. `get_rpc_port()` / `get_session_id()`
+3. `register_memory(ptr, len)`
+4. `unregister_memory(ptr)`
+5. `batch_register_memory(ptrs, lens)`
+6. `batch_unregister_memory(ptrs)`
+7. `transfer_sync_write(session_id, local_ptr, remote_ptr, len)`
+8. `batch_transfer_sync_write(session_id, local_ptrs, remote_ptrs, lens)`
