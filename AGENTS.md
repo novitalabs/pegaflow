@@ -296,6 +296,8 @@ Build `pegaflow-transfer` as a Mooncake-compatible RDMA transfer crate for
   opaque `DomainAddress` + UD handshake + explicit remote MR descriptor exchange.
 - Do **not** keep or fallback to IP/`host:port` session model in phase-1;
   remove IP-based mode to control implementation complexity.
+- For SGLang Mooncake compatibility adaptation, also **do not fallback** to
+  `host:rpc_port`; session ID must come from transfer engine `get_session_id()`.
 
 ### Required External API (Phase-1)
 
@@ -331,6 +333,7 @@ Build `pegaflow-transfer` as a Mooncake-compatible RDMA transfer crate for
   - Removed `local_addr`/worker-name style parameter from `pegaflow-transfer` core API.
   - `get_session_id()` now returns `DomainAddress` directly (no `Result`).
   - Keep compatibility work for protocol/local_addr at pybind layer only.
+  - Compatibility rule: no fallback to `host:rpc_port` session format in adapter layers.
 - Logging integration completed:
   - Added `pegaflow-transfer` local logging init (`logforth`) with env filter support.
   - Added key-path logs for runtime init, control-plane flow, session setup, MR query, and sync write.
@@ -346,3 +349,9 @@ Build `pegaflow-transfer` as a Mooncake-compatible RDMA transfer crate for
 - Latest measured steady-state example (single host, 400Gb IB):
   - config: `bytes=1GiB warmup=1 measured_iters=20`
   - result: `avg_gbps=377.3`, `p50_lat_ms=22.740`, `p95_lat_ms=22.842`
+
+### Deferred Optimization Notes
+
+- Keep current sync path unchanged for phase-1.
+- Revisit fragmented-transfer optimization later:
+  use WR-chain batched `ibv_post_send` for multi-WR submissions (similar to pplx-garden pattern), while preserving phase-1 external sync API semantics.
