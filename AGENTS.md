@@ -308,29 +308,41 @@ Build `pegaflow-transfer` as a Mooncake-compatible RDMA transfer crate for
 7. `transfer_sync_write(session_id, local_ptr, remote_ptr, len)`
 8. `batch_transfer_sync_write(session_id, local_ptrs, remote_ptrs, lens)`
 
-### Progress Snapshot (2026-02-06)
+### Progress Snapshot (2026-02-07)
 
 - Branch: `feat/pegaflow-transfer-sideway-rdma`
-- Pushed commits:
-  - `9924ac2` `feat(transfer): switch to domainaddress ud control plane`
+- Pushed commits (latest first):
+  - `b8380af` `test(transfer): add warmup and steady-state throughput stats`
+  - `5656ccc` `test(transfer): scale rdma gpu it to 1g default`
+  - `05dfbc4` `refactor(transfer): remove rdma backend trait indirection`
+  - `d215e11` `refactor(transfer): use typed domain address for sessions`
+  - `8ed854f` `refactor(transfer): simplify init api and add key-path logging`
   - `4249a6e` `fix(transfer): create ud qp with qp_ex for domainaddress control`
+  - `9924ac2` `feat(transfer): switch to domainaddress ud control plane`
+  - `e577b20` `feat(transfer): bootstrap sideway backend and rdma gpu integration test`
 - Implemented:
-  - Removed IP/`host:port` metadata control path from `pegaflow-transfer`.
-  - Switched session identity to hex-encoded `DomainAddress` (UD addr bytes).
-  - Added UD control-plane messages for:
-    - RC connection handshake (`ConnectReq` / `ConnectResp`)
-    - remote MR query (`MrQueryReq` / `MrQueryResp`)
-  - Retained sync RC `RDMA write` data path.
+  - Removed IP/`host:port` control path; phase-1 uses `DomainAddress`-only control plane.
+  - `DomainAddress` moved to typed bytes model with focused APIs (`to_bytes` / `from_bytes`) and clearer `Debug`/`Display`.
+  - Removed `RdmaBackend` trait indirection; `MooncakeTransferEngine` directly uses `SidewayBackend`.
+  - Control-plane messages in UD: `ConnectReq/Resp`, `MrQueryReq/Resp`.
+  - Data-plane remains sync RC `RDMA write`.
+- API simplification completed:
+  - Removed `protocol` parameter from `pegaflow-transfer` core API.
+  - Removed `local_addr`/worker-name style parameter from `pegaflow-transfer` core API.
+  - `get_session_id()` now returns `DomainAddress` directly (no `Result`).
+  - Keep compatibility work for protocol/local_addr at pybind layer only.
+- Logging integration completed:
+  - Added `pegaflow-transfer` local logging init (`logforth`) with env filter support.
+  - Added key-path logs for runtime init, control-plane flow, session setup, MR query, and sync write.
 - Validation status:
   - Local: `cargo test -p pegaflow-transfer` passed.
   - RDMA host: `cargo test -p pegaflow-transfer --test rdma_gpu_it -- --ignored --nocapture` passed.
 - Current IT runtime env:
   - required: `PEGAFLOW_TRANSFER_IT_NIC`
   - optional: `PEGAFLOW_TRANSFER_IT_BASE_PORT` (default `56050`)
-- API simplification completed:
-  - Removed `protocol` parameter from `pegaflow-transfer` core API.
-  - Removed `local_addr`/worker-name style parameter from `pegaflow-transfer` core API.
-  - Keep compatibility work for protocol/local_addr at pybind layer only.
-- Logging integration completed:
-  - Added `pegaflow-transfer` local logging init (`logforth`) with env filter support.
-  - Added key-path logs for runtime init, control-plane message flow, session setup, MR query, and sync write.
+  - optional: `PEGAFLOW_TRANSFER_IT_BYTES` (default `1GiB`)
+  - optional: `PEGAFLOW_TRANSFER_IT_WARMUP` (default `1`)
+  - optional: `PEGAFLOW_TRANSFER_IT_ITERS` (default `20`)
+- Latest measured steady-state example (single host, 400Gb IB):
+  - config: `bytes=1GiB warmup=1 measured_iters=20`
+  - result: `avg_gbps=377.3`, `p50_lat_ms=22.740`, `p95_lat_ms=22.842`
