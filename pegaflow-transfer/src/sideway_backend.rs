@@ -38,6 +38,7 @@ use sideway::ibverbs::{
 
 use crate::{
     api::WorkerConfig,
+    control_protocol::{ControlMessage, RcEndpoint, decode_message, encode_message},
     domain_address::DomainAddress,
     error::{Result, TransferError},
     logging,
@@ -48,109 +49,6 @@ const UD_RECV_SLOTS: usize = 64;
 const UD_BUFFER_BYTES: usize = 512;
 const UD_GRH_BYTES: usize = 40;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
-
-#[derive(Clone, Copy, Debug)]
-struct RcEndpoint {
-    gid: [u8; 16],
-    lid: u16,
-    qp_num: u32,
-    psn: u32,
-}
-
-impl RcEndpoint {
-    const BYTES: usize = 26;
-
-    fn to_bytes(self) -> [u8; Self::BYTES] {
-        let mut bytes = [0_u8; Self::BYTES];
-        bytes[..16].copy_from_slice(&self.gid);
-        bytes[16..18].copy_from_slice(&self.lid.to_le_bytes());
-        bytes[18..22].copy_from_slice(&self.qp_num.to_le_bytes());
-        bytes[22..26].copy_from_slice(&self.psn.to_le_bytes());
-        bytes
-    }
-
-    fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != Self::BYTES {
-            return None;
-        }
-        let mut gid = [0_u8; 16];
-        gid.copy_from_slice(&bytes[..16]);
-        Some(Self {
-            gid,
-            lid: u16::from_le_bytes(bytes[16..18].try_into().ok()?),
-            qp_num: u32::from_le_bytes(bytes[18..22].try_into().ok()?),
-            psn: u32::from_le_bytes(bytes[22..26].try_into().ok()?),
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-enum MessageType {
-    ConnectReq = 1,
-    ConnectResp = 2,
-    MrQueryReq = 3,
-    MrQueryResp = 4,
-}
-
-impl MessageType {
-    fn from_u8(raw: u8) -> Option<Self> {
-        match raw {
-            1 => Some(Self::ConnectReq),
-            2 => Some(Self::ConnectResp),
-            3 => Some(Self::MrQueryReq),
-            4 => Some(Self::MrQueryResp),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-enum ControlMessage {
-    ConnectReq {
-        request_id: u64,
-        src_ud: DomainAddress,
-        rc: RcEndpoint,
-    },
-    ConnectResp {
-        request_id: u64,
-        src_ud: DomainAddress,
-        rc: RcEndpoint,
-    },
-    MrQueryReq {
-        request_id: u64,
-        src_ud: DomainAddress,
-        ptr: u64,
-        len: u64,
-    },
-    MrQueryResp {
-        request_id: u64,
-        src_ud: DomainAddress,
-        found: bool,
-        rkey: u32,
-        available_len: u64,
-    },
-}
-
-impl ControlMessage {
-    fn request_id(&self) -> u64 {
-        match self {
-            ControlMessage::ConnectReq { request_id, .. }
-            | ControlMessage::ConnectResp { request_id, .. }
-            | ControlMessage::MrQueryReq { request_id, .. }
-            | ControlMessage::MrQueryResp { request_id, .. } => *request_id,
-        }
-    }
-
-    fn kind(&self) -> &'static str {
-        match self {
-            ControlMessage::ConnectReq { .. } => "connect_req",
-            ControlMessage::ConnectResp { .. } => "connect_resp",
-            ControlMessage::MrQueryReq { .. } => "mr_query_req",
-            ControlMessage::MrQueryResp { .. } => "mr_query_resp",
-        }
-    }
-}
 
 #[derive(Default)]
 struct ControlPlane {
@@ -291,109 +189,6 @@ impl SidewayBackend {
                 None
             }
         })
-    }
-
-    fn encode_message(message: &ControlMessage) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(96);
-        match message {
-            ControlMessage::ConnectReq {
-                request_id,
-                src_ud,
-                rc,
-            } => {
-                bytes.push(MessageType::ConnectReq as u8);
-                bytes.extend_from_slice(&request_id.to_le_bytes());
-                let src_bytes = src_ud.to_bytes();
-                bytes.extend_from_slice(&src_bytes);
-                bytes.extend_from_slice(&rc.to_bytes());
-            }
-            ControlMessage::ConnectResp {
-                request_id,
-                src_ud,
-                rc,
-            } => {
-                bytes.push(MessageType::ConnectResp as u8);
-                bytes.extend_from_slice(&request_id.to_le_bytes());
-                let src_bytes = src_ud.to_bytes();
-                bytes.extend_from_slice(&src_bytes);
-                bytes.extend_from_slice(&rc.to_bytes());
-            }
-            ControlMessage::MrQueryReq {
-                request_id,
-                src_ud,
-                ptr,
-                len,
-            } => {
-                bytes.push(MessageType::MrQueryReq as u8);
-                bytes.extend_from_slice(&request_id.to_le_bytes());
-                let src_bytes = src_ud.to_bytes();
-                bytes.extend_from_slice(&src_bytes);
-                bytes.extend_from_slice(&ptr.to_le_bytes());
-                bytes.extend_from_slice(&len.to_le_bytes());
-            }
-            ControlMessage::MrQueryResp {
-                request_id,
-                src_ud,
-                found,
-                rkey,
-                available_len,
-            } => {
-                bytes.push(MessageType::MrQueryResp as u8);
-                bytes.extend_from_slice(&request_id.to_le_bytes());
-                let src_bytes = src_ud.to_bytes();
-                bytes.extend_from_slice(&src_bytes);
-                bytes.push(u8::from(*found));
-                bytes.extend_from_slice(&rkey.to_le_bytes());
-                bytes.extend_from_slice(&available_len.to_le_bytes());
-            }
-        }
-        bytes
-    }
-
-    fn decode_message(bytes: &[u8]) -> Option<ControlMessage> {
-        if bytes.len() < 1 + 8 + DomainAddress::BYTES {
-            return None;
-        }
-        let kind = MessageType::from_u8(bytes[0])?;
-        let request_id = u64::from_le_bytes(bytes[1..9].try_into().ok()?);
-        let src_ud = DomainAddress::from_bytes(&bytes[9..(9 + DomainAddress::BYTES)])?;
-        let payload = &bytes[(9 + DomainAddress::BYTES)..];
-
-        match kind {
-            MessageType::ConnectReq => Some(ControlMessage::ConnectReq {
-                request_id,
-                src_ud,
-                rc: RcEndpoint::from_bytes(payload)?,
-            }),
-            MessageType::ConnectResp => Some(ControlMessage::ConnectResp {
-                request_id,
-                src_ud,
-                rc: RcEndpoint::from_bytes(payload)?,
-            }),
-            MessageType::MrQueryReq => {
-                if payload.len() != 16 {
-                    return None;
-                }
-                Some(ControlMessage::MrQueryReq {
-                    request_id,
-                    src_ud,
-                    ptr: u64::from_le_bytes(payload[..8].try_into().ok()?),
-                    len: u64::from_le_bytes(payload[8..16].try_into().ok()?),
-                })
-            }
-            MessageType::MrQueryResp => {
-                if payload.len() != 13 {
-                    return None;
-                }
-                Some(ControlMessage::MrQueryResp {
-                    request_id,
-                    src_ud,
-                    found: payload[0] != 0,
-                    rkey: u32::from_le_bytes(payload[1..5].try_into().ok()?),
-                    available_len: u64::from_le_bytes(payload[5..13].try_into().ok()?),
-                })
-            }
-        }
     }
 
     fn choose_port_and_gid(
@@ -744,7 +539,7 @@ impl SidewayBackend {
             message.request_id(),
             peer_ud
         );
-        let payload = Self::encode_message(message);
+        let payload = encode_message(message);
         let ah = Self::get_or_create_ah(runtime, peer_ud)?;
 
         let mut send_slot = runtime.send_slot.lock();
@@ -810,7 +605,7 @@ impl SidewayBackend {
                     let byte_len = wc.byte_len() as usize;
                     if byte_len > UD_GRH_BYTES && byte_len <= slot.bytes.len() {
                         let payload = &slot.bytes[UD_GRH_BYTES..byte_len];
-                        if let Some(message) = Self::decode_message(payload) {
+                        if let Some(message) = decode_message(payload) {
                             debug!(
                                 "control recv: kind={}, request_id={}, bytes={}",
                                 message.kind(),

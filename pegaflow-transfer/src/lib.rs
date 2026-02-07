@@ -1,4 +1,5 @@
 mod api;
+mod control_protocol;
 mod domain_address;
 mod engine;
 mod error;
