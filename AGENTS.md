@@ -298,6 +298,10 @@ Build `pegaflow-transfer` as a Mooncake-compatible RDMA transfer crate for
   remove IP-based mode to control implementation complexity.
 - For SGLang Mooncake compatibility adaptation, also **do not fallback** to
   `host:rpc_port`; session ID must come from transfer engine `get_session_id()`.
+- Integration boundary decision:
+  keep `transfer_engine.py` public method signatures unchanged while swapping
+  the backend implementation to pegaflow-transfer; this is an API-stability
+  requirement, not Mooncake compatibility work.
 
 ### Required External API (Phase-1)
 
@@ -334,6 +338,12 @@ Build `pegaflow-transfer` as a Mooncake-compatible RDMA transfer crate for
   - `get_session_id()` now returns `DomainAddress` directly (no `Result`).
   - Keep compatibility work for protocol/local_addr at pybind layer only.
   - Compatibility rule: no fallback to `host:rpc_port` session format in adapter layers.
+  - Keep `transfer_engine.py` external API unchanged; only internal backend/session semantics are replaced.
+- Python bridge (in progress, local working copy):
+  - Added PyO3 `TransferEngine` class in `python/src/lib.rs`, backed by `pegaflow-transfer::MooncakeTransferEngine`.
+  - All blocking transfer APIs in pybind run under `py.detach(...)` (release GIL).
+  - Added `python/pegaflow/sglang/transfer_engine.py` adapter that keeps `MooncakeTransferEngine` public methods unchanged.
+  - Adapter session id uses engine `DomainAddress` bytes encoded as URL-safe base64 string (ASCII-safe for existing control-plane message paths).
 - Logging integration completed:
   - Added `pegaflow-transfer` local logging init (`logforth`) with env filter support.
   - Added key-path logs for runtime init, control-plane flow, session setup, MR query, and sync write.

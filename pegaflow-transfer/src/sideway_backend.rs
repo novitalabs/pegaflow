@@ -356,7 +356,7 @@ impl SidewayBackend {
         let mut qp_builder = pd.create_qp_builder();
         qp_builder
             .setup_qp_type(QueuePairType::UnreliableDatagram)
-            .setup_send_ops_flags(SendOperationFlags::Send | SendOperationFlags::SendWithImmediate)
+            .setup_send_ops_flags(SendOperationFlags::Send)
             .setup_send_cq(ud_cq.clone())
             .setup_recv_cq(ud_cq.clone())
             .setup_max_send_wr(256)
