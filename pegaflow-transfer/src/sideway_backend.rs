@@ -230,11 +230,15 @@ impl SidewayBackend {
     ) -> Option<(u32, usize)> {
         let end = remote_ptr.checked_add(len as u64)?;
         let entries = state.remote_memory_cache.get(peer_ud)?;
-        for entry in entries.iter() {
-            if remote_ptr >= entry.base_ptr && end <= entry.end_ptr {
-                let available = usize::try_from(entry.end_ptr - remote_ptr).ok()?;
-                return Some((entry.rkey, available));
-            }
+        let index = match entries.binary_search_by_key(&remote_ptr, |entry| entry.base_ptr) {
+            Ok(index) => index,
+            Err(0) => return None,
+            Err(index) => index - 1,
+        };
+        let entry = &entries[index];
+        if remote_ptr >= entry.base_ptr && end <= entry.end_ptr {
+            let available = usize::try_from(entry.end_ptr - remote_ptr).ok()?;
+            return Some((entry.rkey, available));
         }
         None
     }
@@ -275,6 +279,14 @@ impl SidewayBackend {
                 end_ptr,
                 rkey: entry.rkey,
             });
+        }
+        cached.sort_unstable_by_key(|entry| entry.base_ptr);
+        for pair in cached.windows(2) {
+            if pair[1].base_ptr < pair[0].end_ptr {
+                return Err(TransferError::Backend(
+                    "connect response contains overlapping memory regions".to_string(),
+                ));
+            }
         }
         state.remote_memory_cache.insert(peer_ud.clone(), cached);
         Ok(())
@@ -1399,8 +1411,17 @@ impl SidewayBackend {
 
 #[cfg(test)]
 mod tests {
-    use super::SidewayBackend;
-    use crate::{api::WorkerConfig, error::TransferError};
+    use super::{SidewayBackend, SidewayState};
+    use crate::{
+        api::WorkerConfig,
+        control_protocol::RegisteredMemoryRegion,
+        domain_address::DomainAddress,
+        error::TransferError,
+    };
+
+    fn sample_addr(seed: u8) -> DomainAddress {
+        DomainAddress::from_parts([seed; 16], seed as u16, seed as u32, 0x1111_1111)
+    }
 
     #[test]
     fn initialize_rejects_invalid_input() {
@@ -1412,5 +1433,63 @@ mod tests {
             })
             .expect_err("must fail");
         assert_eq!(error, TransferError::InvalidArgument("nic_name is empty"));
+    }
+
+    #[test]
+    fn cache_remote_snapshot_rejects_overlapping_regions() {
+        let mut state = SidewayState::default();
+        let peer = sample_addr(1);
+        let regions = vec![
+            RegisteredMemoryRegion {
+                base_ptr: 0x1000,
+                len: 0x200,
+                rkey: 1,
+            },
+            RegisteredMemoryRegion {
+                base_ptr: 0x1100,
+                len: 0x100,
+                rkey: 2,
+            },
+        ];
+
+        let error = SidewayBackend::cache_remote_memory_snapshot(&mut state, &peer, &regions)
+            .expect_err("overlap should fail");
+        assert_eq!(
+            error,
+            TransferError::Backend(
+                "connect response contains overlapping memory regions".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn find_cached_remote_memory_uses_sorted_snapshot() {
+        let mut state = SidewayState::default();
+        let peer = sample_addr(2);
+        let regions = vec![
+            RegisteredMemoryRegion {
+                base_ptr: 0x3000,
+                len: 0x100,
+                rkey: 3,
+            },
+            RegisteredMemoryRegion {
+                base_ptr: 0x1000,
+                len: 0x100,
+                rkey: 1,
+            },
+            RegisteredMemoryRegion {
+                base_ptr: 0x2000,
+                len: 0x100,
+                rkey: 2,
+            },
+        ];
+        SidewayBackend::cache_remote_memory_snapshot(&mut state, &peer, &regions)
+            .expect("snapshot cache");
+
+        let hit = SidewayBackend::find_cached_remote_memory(&state, &peer, 0x2080, 0x10);
+        assert_eq!(hit, Some((2, 0x80)));
+
+        let miss = SidewayBackend::find_cached_remote_memory(&state, &peer, 0x2500, 0x10);
+        assert!(miss.is_none());
     }
 }
