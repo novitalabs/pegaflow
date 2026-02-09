@@ -1,6 +1,7 @@
 use crate::domain_address::DomainAddress;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RcEndpoint {
     pub(crate) gid: [u8; 16],
     pub(crate) lid: u16,
@@ -8,55 +9,19 @@ pub(crate) struct RcEndpoint {
     pub(crate) psn: u32,
 }
 
-impl RcEndpoint {
-    const BYTES: usize = 26;
-
-    fn to_bytes(self) -> [u8; Self::BYTES] {
-        let mut bytes = [0_u8; Self::BYTES];
-        bytes[..16].copy_from_slice(&self.gid);
-        bytes[16..18].copy_from_slice(&self.lid.to_le_bytes());
-        bytes[18..22].copy_from_slice(&self.qp_num.to_le_bytes());
-        bytes[22..26].copy_from_slice(&self.psn.to_le_bytes());
-        bytes
-    }
-
-    fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != Self::BYTES {
-            return None;
-        }
-        let mut gid = [0_u8; 16];
-        gid.copy_from_slice(&bytes[..16]);
-        Some(Self {
-            gid,
-            lid: u16::from_le_bytes(bytes[16..18].try_into().ok()?),
-            qp_num: u32::from_le_bytes(bytes[18..22].try_into().ok()?),
-            psn: u32::from_le_bytes(bytes[22..26].try_into().ok()?),
-        })
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RegisteredMemoryRegion {
+    pub(crate) base_ptr: u64,
+    pub(crate) len: u64,
+    pub(crate) rkey: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-enum MessageType {
-    ConnectReq = 1,
-    ConnectResp = 2,
-    MrQueryReq = 3,
-    MrQueryResp = 4,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum ConnectRespError {
+    TooManyRegisteredMemoryRegions,
 }
 
-impl MessageType {
-    fn from_u8(raw: u8) -> Option<Self> {
-        match raw {
-            1 => Some(Self::ConnectReq),
-            2 => Some(Self::ConnectResp),
-            3 => Some(Self::MrQueryReq),
-            4 => Some(Self::MrQueryResp),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ControlMessage {
     ConnectReq {
         request_id: u64,
@@ -67,20 +32,144 @@ pub(crate) enum ControlMessage {
         request_id: u64,
         src_ud: DomainAddress,
         rc: RcEndpoint,
+        remote_memory_regions: Vec<RegisteredMemoryRegion>,
     },
-    MrQueryReq {
+    ConnectRespErr {
         request_id: u64,
         src_ud: DomainAddress,
-        ptr: u64,
-        len: u64,
+        error: ConnectRespError,
     },
-    MrQueryResp {
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct WireRcEndpoint {
+    gid: [u8; 16],
+    lid: u16,
+    qp_num: u32,
+    psn: u32,
+}
+
+impl From<RcEndpoint> for WireRcEndpoint {
+    fn from(value: RcEndpoint) -> Self {
+        Self {
+            gid: value.gid,
+            lid: value.lid,
+            qp_num: value.qp_num,
+            psn: value.psn,
+        }
+    }
+}
+
+impl From<WireRcEndpoint> for RcEndpoint {
+    fn from(value: WireRcEndpoint) -> Self {
+        Self {
+            gid: value.gid,
+            lid: value.lid,
+            qp_num: value.qp_num,
+            psn: value.psn,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum WireControlMessage {
+    ConnectReq {
         request_id: u64,
-        src_ud: DomainAddress,
-        found: bool,
-        rkey: u32,
-        available_len: u64,
+        src_ud: [u8; DomainAddress::BYTES],
+        rc: WireRcEndpoint,
     },
+    ConnectResp {
+        request_id: u64,
+        src_ud: [u8; DomainAddress::BYTES],
+        rc: WireRcEndpoint,
+        remote_memory_regions: Vec<RegisteredMemoryRegion>,
+    },
+    ConnectRespErr {
+        request_id: u64,
+        src_ud: [u8; DomainAddress::BYTES],
+        error: ConnectRespError,
+    },
+}
+
+impl WireControlMessage {
+    fn from_message(message: &ControlMessage) -> Self {
+        match message {
+            ControlMessage::ConnectReq {
+                request_id,
+                src_ud,
+                rc,
+            } => Self::ConnectReq {
+                request_id: *request_id,
+                src_ud: domain_to_wire(src_ud),
+                rc: (*rc).into(),
+            },
+            ControlMessage::ConnectResp {
+                request_id,
+                src_ud,
+                rc,
+                remote_memory_regions,
+            } => Self::ConnectResp {
+                request_id: *request_id,
+                src_ud: domain_to_wire(src_ud),
+                rc: (*rc).into(),
+                remote_memory_regions: remote_memory_regions.clone(),
+            },
+            ControlMessage::ConnectRespErr {
+                request_id,
+                src_ud,
+                error,
+            } => Self::ConnectRespErr {
+                request_id: *request_id,
+                src_ud: domain_to_wire(src_ud),
+                error: *error,
+            },
+        }
+    }
+
+    fn into_message(self) -> Option<ControlMessage> {
+        match self {
+            Self::ConnectReq {
+                request_id,
+                src_ud,
+                rc,
+            } => Some(ControlMessage::ConnectReq {
+                request_id,
+                src_ud: wire_to_domain(src_ud)?,
+                rc: rc.into(),
+            }),
+            Self::ConnectResp {
+                request_id,
+                src_ud,
+                rc,
+                remote_memory_regions,
+            } => Some(ControlMessage::ConnectResp {
+                request_id,
+                src_ud: wire_to_domain(src_ud)?,
+                rc: rc.into(),
+                remote_memory_regions,
+            }),
+            Self::ConnectRespErr {
+                request_id,
+                src_ud,
+                error,
+            } => Some(ControlMessage::ConnectRespErr {
+                request_id,
+                src_ud: wire_to_domain(src_ud)?,
+                error,
+            }),
+        }
+    }
+}
+
+fn domain_to_wire(src_ud: &DomainAddress) -> [u8; DomainAddress::BYTES] {
+    let mut bytes = [0_u8; DomainAddress::BYTES];
+    let src_bytes = src_ud.to_bytes();
+    bytes.copy_from_slice(src_bytes.as_ref());
+    bytes
+}
+
+fn wire_to_domain(bytes: [u8; DomainAddress::BYTES]) -> Option<DomainAddress> {
+    DomainAddress::from_bytes(&bytes)
 }
 
 impl ControlMessage {
@@ -88,8 +177,7 @@ impl ControlMessage {
         match self {
             ControlMessage::ConnectReq { request_id, .. }
             | ControlMessage::ConnectResp { request_id, .. }
-            | ControlMessage::MrQueryReq { request_id, .. }
-            | ControlMessage::MrQueryResp { request_id, .. } => *request_id,
+            | ControlMessage::ConnectRespErr { request_id, .. } => *request_id,
         }
     }
 
@@ -97,118 +185,37 @@ impl ControlMessage {
         match self {
             ControlMessage::ConnectReq { .. } => "connect_req",
             ControlMessage::ConnectResp { .. } => "connect_resp",
-            ControlMessage::MrQueryReq { .. } => "mr_query_req",
-            ControlMessage::MrQueryResp { .. } => "mr_query_resp",
+            ControlMessage::ConnectRespErr { .. } => "connect_resp_err",
         }
     }
 }
 
 pub(crate) fn encode_message(message: &ControlMessage) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(96);
-    match message {
-        ControlMessage::ConnectReq {
-            request_id,
-            src_ud,
-            rc,
-        } => {
-            bytes.push(MessageType::ConnectReq as u8);
-            bytes.extend_from_slice(&request_id.to_le_bytes());
-            let src_bytes = src_ud.to_bytes();
-            bytes.extend_from_slice(&src_bytes);
-            bytes.extend_from_slice(&rc.to_bytes());
-        }
-        ControlMessage::ConnectResp {
-            request_id,
-            src_ud,
-            rc,
-        } => {
-            bytes.push(MessageType::ConnectResp as u8);
-            bytes.extend_from_slice(&request_id.to_le_bytes());
-            let src_bytes = src_ud.to_bytes();
-            bytes.extend_from_slice(&src_bytes);
-            bytes.extend_from_slice(&rc.to_bytes());
-        }
-        ControlMessage::MrQueryReq {
-            request_id,
-            src_ud,
-            ptr,
-            len,
-        } => {
-            bytes.push(MessageType::MrQueryReq as u8);
-            bytes.extend_from_slice(&request_id.to_le_bytes());
-            let src_bytes = src_ud.to_bytes();
-            bytes.extend_from_slice(&src_bytes);
-            bytes.extend_from_slice(&ptr.to_le_bytes());
-            bytes.extend_from_slice(&len.to_le_bytes());
-        }
-        ControlMessage::MrQueryResp {
-            request_id,
-            src_ud,
-            found,
-            rkey,
-            available_len,
-        } => {
-            bytes.push(MessageType::MrQueryResp as u8);
-            bytes.extend_from_slice(&request_id.to_le_bytes());
-            let src_bytes = src_ud.to_bytes();
-            bytes.extend_from_slice(&src_bytes);
-            bytes.push(u8::from(*found));
-            bytes.extend_from_slice(&rkey.to_le_bytes());
-            bytes.extend_from_slice(&available_len.to_le_bytes());
-        }
-    }
-    bytes
+    let wire = WireControlMessage::from_message(message);
+    let serialized = bincode::serde::encode_to_vec(&wire, bincode::config::standard())
+        .expect("control message serialization should not fail");
+    lz4_flex::compress_prepend_size(&serialized)
 }
 
 pub(crate) fn decode_message(bytes: &[u8]) -> Option<ControlMessage> {
-    if bytes.len() < 1 + 8 + DomainAddress::BYTES {
+    let decompressed = lz4_flex::decompress_size_prepended(bytes).ok()?;
+    let (wire, consumed) = bincode::serde::decode_from_slice::<WireControlMessage, _>(
+        &decompressed,
+        bincode::config::standard(),
+    )
+    .ok()?;
+    if consumed != decompressed.len() {
         return None;
     }
-    let kind = MessageType::from_u8(bytes[0])?;
-    let request_id = u64::from_le_bytes(bytes[1..9].try_into().ok()?);
-    let src_ud = DomainAddress::from_bytes(&bytes[9..(9 + DomainAddress::BYTES)])?;
-    let payload = &bytes[(9 + DomainAddress::BYTES)..];
-
-    match kind {
-        MessageType::ConnectReq => Some(ControlMessage::ConnectReq {
-            request_id,
-            src_ud,
-            rc: RcEndpoint::from_bytes(payload)?,
-        }),
-        MessageType::ConnectResp => Some(ControlMessage::ConnectResp {
-            request_id,
-            src_ud,
-            rc: RcEndpoint::from_bytes(payload)?,
-        }),
-        MessageType::MrQueryReq => {
-            if payload.len() != 16 {
-                return None;
-            }
-            Some(ControlMessage::MrQueryReq {
-                request_id,
-                src_ud,
-                ptr: u64::from_le_bytes(payload[..8].try_into().ok()?),
-                len: u64::from_le_bytes(payload[8..16].try_into().ok()?),
-            })
-        }
-        MessageType::MrQueryResp => {
-            if payload.len() != 13 {
-                return None;
-            }
-            Some(ControlMessage::MrQueryResp {
-                request_id,
-                src_ud,
-                found: payload[0] != 0,
-                rkey: u32::from_le_bytes(payload[1..5].try_into().ok()?),
-                available_len: u64::from_le_bytes(payload[5..13].try_into().ok()?),
-            })
-        }
-    }
+    wire.into_message()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ControlMessage, RcEndpoint, decode_message, encode_message};
+    use super::{
+        ConnectRespError, ControlMessage, RcEndpoint, RegisteredMemoryRegion, decode_message,
+        encode_message,
+    };
     use crate::domain_address::DomainAddress;
 
     fn sample_addr(seed: u8) -> DomainAddress {
@@ -229,91 +236,18 @@ mod tests {
         }
     }
 
+    fn sample_region(seed: u8) -> RegisteredMemoryRegion {
+        RegisteredMemoryRegion {
+            base_ptr: 0x1000 * (seed as u64 + 1),
+            len: 0x2000,
+            rkey: 10_000 + seed as u32,
+        }
+    }
+
     fn assert_roundtrip(message: ControlMessage) {
         let encoded = encode_message(&message);
         let decoded = decode_message(&encoded).expect("decode");
-        match (message, decoded) {
-            (
-                ControlMessage::ConnectReq {
-                    request_id: a_id,
-                    src_ud: a_ud,
-                    rc: a_rc,
-                },
-                ControlMessage::ConnectReq {
-                    request_id: b_id,
-                    src_ud: b_ud,
-                    rc: b_rc,
-                },
-            ) => {
-                assert_eq!(a_id, b_id);
-                assert_eq!(a_ud.to_bytes(), b_ud.to_bytes());
-                assert_eq!(a_rc.gid, b_rc.gid);
-                assert_eq!(a_rc.lid, b_rc.lid);
-                assert_eq!(a_rc.qp_num, b_rc.qp_num);
-                assert_eq!(a_rc.psn, b_rc.psn);
-            }
-            (
-                ControlMessage::ConnectResp {
-                    request_id: a_id,
-                    src_ud: a_ud,
-                    rc: a_rc,
-                },
-                ControlMessage::ConnectResp {
-                    request_id: b_id,
-                    src_ud: b_ud,
-                    rc: b_rc,
-                },
-            ) => {
-                assert_eq!(a_id, b_id);
-                assert_eq!(a_ud.to_bytes(), b_ud.to_bytes());
-                assert_eq!(a_rc.gid, b_rc.gid);
-                assert_eq!(a_rc.lid, b_rc.lid);
-                assert_eq!(a_rc.qp_num, b_rc.qp_num);
-                assert_eq!(a_rc.psn, b_rc.psn);
-            }
-            (
-                ControlMessage::MrQueryReq {
-                    request_id: a_id,
-                    src_ud: a_ud,
-                    ptr: a_ptr,
-                    len: a_len,
-                },
-                ControlMessage::MrQueryReq {
-                    request_id: b_id,
-                    src_ud: b_ud,
-                    ptr: b_ptr,
-                    len: b_len,
-                },
-            ) => {
-                assert_eq!(a_id, b_id);
-                assert_eq!(a_ud.to_bytes(), b_ud.to_bytes());
-                assert_eq!(a_ptr, b_ptr);
-                assert_eq!(a_len, b_len);
-            }
-            (
-                ControlMessage::MrQueryResp {
-                    request_id: a_id,
-                    src_ud: a_ud,
-                    found: a_found,
-                    rkey: a_rkey,
-                    available_len: a_len,
-                },
-                ControlMessage::MrQueryResp {
-                    request_id: b_id,
-                    src_ud: b_ud,
-                    found: b_found,
-                    rkey: b_rkey,
-                    available_len: b_len,
-                },
-            ) => {
-                assert_eq!(a_id, b_id);
-                assert_eq!(a_ud.to_bytes(), b_ud.to_bytes());
-                assert_eq!(a_found, b_found);
-                assert_eq!(a_rkey, b_rkey);
-                assert_eq!(a_len, b_len);
-            }
-            _ => panic!("decoded variant mismatch"),
-        }
+        assert_eq!(decoded, message);
     }
 
     #[test]
@@ -331,52 +265,41 @@ mod tests {
             request_id: 2,
             src_ud: sample_addr(2),
             rc: sample_rc(3),
+            remote_memory_regions: vec![sample_region(1), sample_region(2)],
         });
     }
 
     #[test]
-    fn roundtrip_mr_query_req() {
-        assert_roundtrip(ControlMessage::MrQueryReq {
+    fn roundtrip_connect_resp_err() {
+        assert_roundtrip(ControlMessage::ConnectRespErr {
             request_id: 3,
-            src_ud: sample_addr(3),
-            ptr: 0x1234,
-            len: 0x5678,
-        });
-    }
-
-    #[test]
-    fn roundtrip_mr_query_resp() {
-        assert_roundtrip(ControlMessage::MrQueryResp {
-            request_id: 4,
             src_ud: sample_addr(4),
-            found: true,
-            rkey: 999,
-            available_len: 1024,
+            error: ConnectRespError::TooManyRegisteredMemoryRegions,
         });
     }
 
     #[test]
-    fn decode_rejects_unknown_message_type() {
-        let mut bytes = vec![9_u8; 1 + 8 + DomainAddress::BYTES];
-        bytes[0] = 99;
-        assert!(decode_message(&bytes).is_none());
+    fn decode_rejects_invalid_compressed_payload() {
+        assert!(decode_message(&[1_u8, 2, 3, 4]).is_none());
     }
 
     #[test]
-    fn decode_rejects_truncated_header() {
-        assert!(decode_message(&[0_u8; 1 + 8 + DomainAddress::BYTES - 1]).is_none());
+    fn decode_rejects_garbage_after_decompress() {
+        let garbage = lz4_flex::compress_prepend_size(&[1_u8, 2, 3, 4]);
+        assert!(decode_message(&garbage).is_none());
     }
 
     #[test]
-    fn decode_rejects_bad_payload_len() {
-        let message = ControlMessage::MrQueryReq {
+    fn decode_rejects_trailing_payload() {
+        let message = ControlMessage::ConnectRespErr {
             request_id: 5,
             src_ud: sample_addr(5),
-            ptr: 10,
-            len: 20,
+            error: ConnectRespError::TooManyRegisteredMemoryRegions,
         };
-        let mut bytes = encode_message(&message);
-        bytes.pop();
-        assert!(decode_message(&bytes).is_none());
+        let encoded = encode_message(&message);
+        let mut decoded = lz4_flex::decompress_size_prepended(&encoded).expect("decompress");
+        decoded.push(1_u8);
+        let malformed = lz4_flex::compress_prepend_size(&decoded);
+        assert!(decode_message(&malformed).is_none());
     }
 }

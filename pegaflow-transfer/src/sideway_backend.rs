@@ -39,7 +39,10 @@ use sideway::ibverbs::{
 
 use crate::{
     api::WorkerConfig,
-    control_protocol::{ControlMessage, RcEndpoint, decode_message, encode_message},
+    control_protocol::{
+        ConnectRespError, ControlMessage, RcEndpoint, RegisteredMemoryRegion, decode_message,
+        encode_message,
+    },
     domain_address::DomainAddress,
     error::{Result, TransferError},
     logging,
@@ -47,7 +50,7 @@ use crate::{
 
 const UD_QKEY: u32 = 0x1111_1111;
 const UD_RECV_SLOTS: usize = 64;
-const UD_BUFFER_BYTES: usize = 512;
+const UD_BUFFER_BYTES: usize = 4096;
 const UD_GRH_BYTES: usize = 40;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_INFLIGHT_WRITES: usize = 96;
@@ -236,38 +239,45 @@ impl SidewayBackend {
         None
     }
 
-    fn cache_remote_memory(
+    fn snapshot_registered_memory(state: &SidewayState) -> Vec<RegisteredMemoryRegion> {
+        let mut regions: Vec<RegisteredMemoryRegion> = state
+            .registered
+            .values()
+            .map(|entry| RegisteredMemoryRegion {
+                base_ptr: entry.base_ptr,
+                len: entry.len as u64,
+                rkey: entry.mr.rkey(),
+            })
+            .collect();
+        regions.sort_unstable_by_key(|entry| entry.base_ptr);
+        regions
+    }
+
+    fn cache_remote_memory_snapshot(
         state: &mut SidewayState,
         peer_ud: &DomainAddress,
-        remote_ptr: u64,
-        available_len: usize,
-        rkey: u32,
-    ) {
-        let Ok(available_len_u64) = u64::try_from(available_len) else {
-            return;
-        };
-        let Some(end_ptr) = remote_ptr.checked_add(available_len_u64) else {
-            return;
-        };
-        if end_ptr <= remote_ptr {
-            return;
+        remote_memory_regions: &[RegisteredMemoryRegion],
+    ) -> Result<()> {
+        let mut cached = Vec::with_capacity(remote_memory_regions.len());
+        for entry in remote_memory_regions.iter().copied() {
+            if entry.len == 0 {
+                return Err(TransferError::Backend(
+                    "connect response contains zero-length memory region".to_string(),
+                ));
+            }
+            let Some(end_ptr) = entry.base_ptr.checked_add(entry.len) else {
+                return Err(TransferError::Backend(
+                    "connect response contains memory region overflow".to_string(),
+                ));
+            };
+            cached.push(RemoteMemoryEntry {
+                base_ptr: entry.base_ptr,
+                end_ptr,
+                rkey: entry.rkey,
+            });
         }
-
-        let entries = state
-            .remote_memory_cache
-            .entry(peer_ud.clone())
-            .or_default();
-        if entries.iter().any(|entry| {
-            entry.rkey == rkey && remote_ptr >= entry.base_ptr && end_ptr <= entry.end_ptr
-        }) {
-            return;
-        }
-
-        entries.push(RemoteMemoryEntry {
-            base_ptr: remote_ptr,
-            end_ptr,
-            rkey,
-        });
+        state.remote_memory_cache.insert(peer_ud.clone(), cached);
+        Ok(())
     }
 
     fn choose_port_and_gid(
@@ -708,7 +718,8 @@ impl SidewayBackend {
         message: ControlMessage,
     ) {
         match message {
-            msg @ ControlMessage::ConnectResp { .. } | msg @ ControlMessage::MrQueryResp { .. } => {
+            msg @ ControlMessage::ConnectResp { .. }
+            | msg @ ControlMessage::ConnectRespErr { .. } => {
                 runtime.control.deliver_reply(msg);
             }
             ControlMessage::ConnectReq {
@@ -720,69 +731,59 @@ impl SidewayBackend {
                     "control handle connect_req: request_id={}, peer={}",
                     request_id, src_ud
                 );
-                if let Ok(local_rc) = Self::ensure_passive_session(runtime, state, &src_ud, rc) {
+                let local_rc = match Self::ensure_passive_session(runtime, state, &src_ud, rc) {
+                    Ok(local_rc) => local_rc,
+                    Err(error) => {
+                        warn!(
+                            "control handle connect_req failed: request_id={}, peer={}, error={error}",
+                            request_id, src_ud
+                        );
+                        return;
+                    }
+                };
+
+                let remote_memory_regions = {
+                    let state = state.lock();
+                    Self::snapshot_registered_memory(&state)
+                };
+                let response = ControlMessage::ConnectResp {
+                    request_id,
+                    src_ud: runtime.local_ud.clone(),
+                    rc: local_rc,
+                    remote_memory_regions,
+                };
+                if encode_message(&response).len() > UD_BUFFER_BYTES {
+                    warn!(
+                        "connect_resp too large: request_id={}, peer={}, region_count={}, limit={}",
+                        request_id,
+                        src_ud,
+                        match &response {
+                            ControlMessage::ConnectResp {
+                                remote_memory_regions,
+                                ..
+                            } => remote_memory_regions.len(),
+                            _ => 0,
+                        },
+                        UD_BUFFER_BYTES
+                    );
                     let _ = Self::send_control_message(
                         runtime,
                         &src_ud,
-                        &ControlMessage::ConnectResp {
+                        &ControlMessage::ConnectRespErr {
                             request_id,
                             src_ud: runtime.local_ud.clone(),
-                            rc: local_rc,
+                            error: ConnectRespError::TooManyRegisteredMemoryRegions,
                         },
                     );
-                } else {
+                    return;
+                }
+                if let Err(error) = Self::send_control_message(runtime, &src_ud, &response) {
                     warn!(
-                        "control handle connect_req failed: request_id={}, peer={}",
-                        request_id, src_ud
+                        "control handle connect_req send failed: request_id={}, peer={}, error={error}",
+                        request_id,
+                        src_ud
                     );
                 }
-            }
-            ControlMessage::MrQueryReq {
-                request_id,
-                src_ud,
-                ptr,
-                len,
-            } => {
-                debug!(
-                    "control handle mr_query_req: request_id={}, peer={}, ptr={:#x}, len={}",
-                    request_id, src_ud, ptr, len
-                );
-                let response = {
-                    let state = state.lock();
-                    let requested_len = usize::try_from(len).ok();
-                    if let Some(requested_len) = requested_len {
-                        if let Some((base_ptr, entry_len, mr)) =
-                            Self::find_registered_entry(&state, ptr, requested_len)
-                        {
-                            let entry_end = base_ptr.saturating_add(entry_len as u64);
-                            let available_len = entry_end.saturating_sub(ptr);
-                            ControlMessage::MrQueryResp {
-                                request_id,
-                                src_ud: runtime.local_ud.clone(),
-                                found: true,
-                                rkey: mr.rkey(),
-                                available_len,
-                            }
-                        } else {
-                            ControlMessage::MrQueryResp {
-                                request_id,
-                                src_ud: runtime.local_ud.clone(),
-                                found: false,
-                                rkey: 0,
-                                available_len: 0,
-                            }
-                        }
-                    } else {
-                        ControlMessage::MrQueryResp {
-                            request_id,
-                            src_ud: runtime.local_ud.clone(),
-                            found: false,
-                            rkey: 0,
-                            available_len: 0,
-                        }
-                    }
-                };
-                let _ = Self::send_control_message(runtime, &src_ud, &response);
             }
         }
     }
@@ -970,8 +971,18 @@ impl SidewayBackend {
             .complete_request(request_id, CONTROL_TIMEOUT)
             .ok_or_else(|| TransferError::Backend("connect response timeout".to_string()))?;
 
-        let remote_rc = match reply {
-            ControlMessage::ConnectResp { src_ud, rc, .. } if &src_ud == peer_ud => rc,
+        let (remote_rc, remote_memory_regions) = match reply {
+            ControlMessage::ConnectResp {
+                src_ud,
+                rc,
+                remote_memory_regions,
+                ..
+            } if &src_ud == peer_ud => (rc, remote_memory_regions),
+            ControlMessage::ConnectRespErr { src_ud, error, .. } if &src_ud == peer_ud => {
+                return Err(TransferError::Backend(format!(
+                    "peer rejected connect request: {error:?}"
+                )));
+            }
             other => {
                 return Err(TransferError::Backend(format!(
                     "unexpected connect response: {other:?}"
@@ -982,6 +993,7 @@ impl SidewayBackend {
         Self::spawn_session_worker(Arc::clone(&session), cmd_rx);
 
         let mut guard = state.lock();
+        Self::cache_remote_memory_snapshot(&mut guard, peer_ud, &remote_memory_regions)?;
         let retained = guard
             .sessions
             .entry(peer_key)
@@ -992,60 +1004,6 @@ impl SidewayBackend {
             retained.local_rc.qp_num, peer_ud
         );
         Ok(retained)
-    }
-
-    fn query_remote_memory(
-        runtime: &SidewayRuntime,
-        peer_ud: &DomainAddress,
-        remote_ptr: u64,
-        len: usize,
-    ) -> Result<(u32, usize)> {
-        let request_id = runtime.control.begin_request();
-        debug!(
-            "mr query send: request_id={}, peer={}, ptr={:#x}, len={}",
-            request_id, peer_ud, remote_ptr, len
-        );
-        Self::send_control_message(
-            runtime,
-            peer_ud,
-            &ControlMessage::MrQueryReq {
-                request_id,
-                src_ud: runtime.local_ud.clone(),
-                ptr: remote_ptr,
-                len: len as u64,
-            },
-        )?;
-
-        let reply = runtime
-            .control
-            .complete_request(request_id, CONTROL_TIMEOUT)
-            .ok_or_else(|| TransferError::Backend("remote MR query timeout".to_string()))?;
-        match reply {
-            ControlMessage::MrQueryResp {
-                src_ud,
-                found,
-                rkey,
-                available_len,
-                ..
-            } if &src_ud == peer_ud => {
-                if !found {
-                    return Err(TransferError::InvalidArgument(
-                        "remote memory not registered for target ptr",
-                    ));
-                }
-                let available_len = usize::try_from(available_len).map_err(|_| {
-                    TransferError::Backend("remote memory available length overflow".to_string())
-                })?;
-                debug!(
-                    "mr query ok: request_id={}, peer={}, rkey={}, available_len={}",
-                    request_id, peer_ud, rkey, available_len
-                );
-                Ok((rkey, available_len))
-            }
-            other => Err(TransferError::Backend(format!(
-                "unexpected MR query response: {other:?}"
-            ))),
-        }
     }
 
     fn post_write_wr_chain(
@@ -1350,10 +1308,7 @@ impl SidewayBackend {
 
         let peer_ud = session_id;
         let local_lookup_start = Instant::now();
-        let (runtime, mut prepared_ops): (
-            Arc<SidewayRuntime>,
-            Vec<(WriteOp, Option<(u32, usize)>)>,
-        ) = {
+        let (runtime, mut prepared_ops): (Arc<SidewayRuntime>, Vec<WriteOp>) = {
             let state = self.state.lock();
             Self::ensure_initialized(&state)?;
             let runtime = state
@@ -1383,18 +1338,13 @@ impl SidewayBackend {
                 else {
                     return Err(TransferError::MemoryNotRegistered { ptr: local_ptr });
                 };
-                let cached_remote =
-                    Self::find_cached_remote_memory(&state, peer_ud, remote_ptr, len);
-                prepared_ops.push((
-                    WriteOp {
-                        local_mr,
-                        local_ptr,
-                        remote_ptr,
-                        len,
-                        remote_rkey: 0,
-                    },
-                    cached_remote,
-                ));
+                prepared_ops.push(WriteOp {
+                    local_mr,
+                    local_ptr,
+                    remote_ptr,
+                    len,
+                    remote_rkey: 0,
+                });
             }
             (Arc::clone(runtime), prepared_ops)
         };
@@ -1404,52 +1354,42 @@ impl SidewayBackend {
         let session = Self::ensure_active_session(&runtime, &self.state, peer_ud)?;
         let ensure_session_dur = ensure_session_start.elapsed();
 
-        let mr_query_start = Instant::now();
-        let mut mr_cache_hits = 0usize;
-        for (op, cached_remote) in prepared_ops.iter_mut() {
-            let (remote_rkey, remote_available) =
-                if let Some((cached_rkey, cached_available)) = *cached_remote {
-                    mr_cache_hits += 1;
-                    (cached_rkey, cached_available)
-                } else {
-                    let (queried_rkey, queried_available) =
-                        Self::query_remote_memory(&runtime, peer_ud, op.remote_ptr, op.len)?;
-                    {
-                        let mut state = self.state.lock();
-                        Self::cache_remote_memory(
-                            &mut state,
-                            peer_ud,
-                            op.remote_ptr,
-                            queried_available,
-                            queried_rkey,
-                        );
-                    }
-                    (queried_rkey, queried_available)
+        let remote_lookup_start = Instant::now();
+        let mut remote_cache_hits = 0usize;
+        {
+            let state = self.state.lock();
+            for op in prepared_ops.iter_mut() {
+                let Some((remote_rkey, remote_available)) =
+                    Self::find_cached_remote_memory(&state, peer_ud, op.remote_ptr, op.len)
+                else {
+                    return Err(TransferError::InvalidArgument(
+                        "remote memory not found in connect snapshot",
+                    ));
                 };
-            if op.len > remote_available {
-                return Err(TransferError::InvalidArgument(
-                    "len exceeds remote registered memory",
-                ));
+                remote_cache_hits += 1;
+                if op.len > remote_available {
+                    return Err(TransferError::InvalidArgument(
+                        "len exceeds remote registered memory",
+                    ));
+                }
+                op.remote_rkey = remote_rkey;
             }
-            op.remote_rkey = remote_rkey;
         }
-        let mr_query_dur = mr_query_start.elapsed();
-
-        let ops: Vec<WriteOp> = prepared_ops.into_iter().map(|(op, _)| op).collect();
+        let remote_lookup_dur = remote_lookup_start.elapsed();
         let submit_start = Instant::now();
-        let transferred = Self::submit_session_batch(&session, ops)?;
+        let transferred = Self::submit_session_batch(&session, prepared_ops)?;
         let submit_dur = submit_start.elapsed();
 
-        let total_dur = local_lookup_dur + ensure_session_dur + mr_query_dur + submit_dur;
+        let total_dur = local_lookup_dur + ensure_session_dur + remote_lookup_dur + submit_dur;
         info!(
-            "batch_transfer_sync_write profile: peer={}, bytes={}, chunks={}, local_lookup_ms={:.3}, ensure_session_ms={:.3}, mr_query_ms={:.3}, mr_cache_hits={}, submit_wait_ms={:.3}, total_ms={:.3}",
+            "batch_transfer_sync_write profile: peer={}, bytes={}, chunks={}, local_lookup_ms={:.3}, ensure_session_ms={:.3}, remote_lookup_ms={:.3}, remote_cache_hits={}, submit_wait_ms={:.3}, total_ms={:.3}",
             peer_ud,
             transferred,
             lens.len(),
             local_lookup_dur.as_secs_f64() * 1000.0,
             ensure_session_dur.as_secs_f64() * 1000.0,
-            mr_query_dur.as_secs_f64() * 1000.0,
-            mr_cache_hits,
+            remote_lookup_dur.as_secs_f64() * 1000.0,
+            remote_cache_hits,
             submit_dur.as_secs_f64() * 1000.0,
             total_dur.as_secs_f64() * 1000.0
         );
