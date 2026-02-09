@@ -4,6 +4,7 @@ use crate::{
     error::{Result, TransferError},
     sideway_backend::SidewayBackend,
 };
+use std::time::Instant;
 
 pub struct MooncakeTransferEngine {
     backend: SidewayBackend,
@@ -83,6 +84,7 @@ impl MooncakeTransferEngine {
             });
         }
 
+        let started_at = Instant::now();
         let mut transferred = 0usize;
         for ((local_ptr, remote_ptr), len) in local_ptrs
             .iter()
@@ -93,6 +95,20 @@ impl MooncakeTransferEngine {
             transferred += self
                 .backend
                 .transfer_sync_write(session_id, local_ptr, remote_ptr, len)?;
+        }
+        let elapsed = started_at.elapsed();
+        let elapsed_secs = elapsed.as_secs_f64();
+        if elapsed_secs > 0.0 {
+            let gbps = (transferred as f64 * 8.0) / elapsed_secs / 1e9;
+            let gib_per_sec = (transferred as f64) / elapsed_secs / (1024.0 * 1024.0 * 1024.0);
+            log::info!(
+                "batch_transfer_sync_write e2e bandwidth: bytes={}, chunks={}, elapsed_ms={:.3}, bw_gbps={:.3}, bw_gibps={:.3}",
+                transferred,
+                lens.len(),
+                elapsed_secs * 1000.0,
+                gbps,
+                gib_per_sec
+            );
         }
         Ok(transferred)
     }

@@ -146,6 +146,13 @@ struct RegisteredMemoryEntry {
     mr: Arc<MemoryRegion>,
 }
 
+#[derive(Clone, Copy)]
+struct RemoteMemoryEntry {
+    base_ptr: u64,
+    end_ptr: u64,
+    rkey: u32,
+}
+
 struct ActiveSession {
     qp: Mutex<GenericQueuePair>,
     send_cq: GenericCompletionQueue,
@@ -159,6 +166,7 @@ struct SidewayState {
     runtime: Option<Arc<SidewayRuntime>>,
     registered: HashMap<u64, RegisteredMemoryEntry>,
     sessions: HashMap<DomainAddress, Arc<ActiveSession>>,
+    remote_memory_cache: HashMap<DomainAddress, Vec<RemoteMemoryEntry>>,
 }
 
 #[derive(Default)]
@@ -189,6 +197,59 @@ impl SidewayBackend {
                 None
             }
         })
+    }
+
+    fn find_cached_remote_memory(
+        state: &SidewayState,
+        peer_ud: &DomainAddress,
+        remote_ptr: u64,
+        len: usize,
+    ) -> Option<(u32, usize)> {
+        let end = remote_ptr.checked_add(len as u64)?;
+        let entries = state.remote_memory_cache.get(peer_ud)?;
+        for entry in entries.iter() {
+            if remote_ptr >= entry.base_ptr && end <= entry.end_ptr {
+                let available = usize::try_from(entry.end_ptr - remote_ptr).ok()?;
+                return Some((entry.rkey, available));
+            }
+        }
+        None
+    }
+
+    fn cache_remote_memory(
+        state: &mut SidewayState,
+        peer_ud: &DomainAddress,
+        remote_ptr: u64,
+        available_len: usize,
+        rkey: u32,
+    ) {
+        let Ok(available_len_u64) = u64::try_from(available_len) else {
+            return;
+        };
+        let Some(end_ptr) = remote_ptr.checked_add(available_len_u64) else {
+            return;
+        };
+        if end_ptr <= remote_ptr {
+            return;
+        }
+
+        let entries = state
+            .remote_memory_cache
+            .entry(peer_ud.clone())
+            .or_default();
+        if entries.iter().any(|entry| {
+            entry.rkey == rkey
+                && remote_ptr >= entry.base_ptr
+                && end_ptr <= entry.end_ptr
+        }) {
+            return;
+        }
+
+        entries.push(RemoteMemoryEntry {
+            base_ptr: remote_ptr,
+            end_ptr,
+            rkey,
+        });
     }
 
     fn choose_port_and_gid(
@@ -1057,6 +1118,7 @@ impl SidewayBackend {
         state.runtime = Some(Arc::clone(&runtime));
         state.registered.clear();
         state.sessions.clear();
+        state.remote_memory_cache.clear();
         info!(
             "transfer backend initialized: session_id={}",
             runtime.local_ud
@@ -1151,12 +1213,9 @@ impl SidewayBackend {
             return Err(TransferError::InvalidArgument("len must be non-zero"));
         }
         let peer_ud = session_id;
-        info!(
-            "transfer_sync_write start: peer={}, local_ptr={:#x}, remote_ptr={:#x}, len={}",
-            peer_ud, local_ptr, remote_ptr, len
-        );
 
-        let (runtime, local_mr) = {
+        let local_lookup_start = Instant::now();
+        let (runtime, local_mr, cached_remote) = {
             let state = self.state.lock();
             Self::ensure_initialized(&state)?;
             let runtime = state
@@ -1166,20 +1225,58 @@ impl SidewayBackend {
             let Some((_, _, local_mr)) = Self::find_registered_entry(&state, local_ptr, len) else {
                 return Err(TransferError::MemoryNotRegistered { ptr: local_ptr });
             };
-            (Arc::clone(runtime), local_mr)
+            let cached_remote =
+                Self::find_cached_remote_memory(&state, peer_ud, remote_ptr, len);
+            (Arc::clone(runtime), local_mr, cached_remote)
         };
+        let local_lookup_dur = local_lookup_start.elapsed();
 
+        let ensure_session_start = Instant::now();
         let session = Self::ensure_active_session(&runtime, &self.state, peer_ud)?;
-        let (remote_rkey, remote_available) =
-            Self::query_remote_memory(&runtime, peer_ud, remote_ptr, len)?;
+        let ensure_session_dur = ensure_session_start.elapsed();
+
+        let (remote_rkey, remote_available, mr_query_dur, mr_cache_hit) =
+            if let Some((remote_rkey, remote_available)) = cached_remote {
+                (remote_rkey, remote_available, Duration::ZERO, true)
+            } else {
+                let mr_query_start = Instant::now();
+                let (remote_rkey, remote_available) =
+                    Self::query_remote_memory(&runtime, peer_ud, remote_ptr, len)?;
+                let mr_query_dur = mr_query_start.elapsed();
+                {
+                    let mut state = self.state.lock();
+                    Self::cache_remote_memory(
+                        &mut state,
+                        peer_ud,
+                        remote_ptr,
+                        remote_available,
+                        remote_rkey,
+                    );
+                }
+                (remote_rkey, remote_available, mr_query_dur, false)
+            };
         if len > remote_available {
             return Err(TransferError::InvalidArgument(
                 "len exceeds remote registered memory",
             ));
         }
 
+        let write_start = Instant::now();
         Self::post_write(&session, local_mr, local_ptr, remote_ptr, len, remote_rkey)?;
-        info!("transfer_sync_write done: peer={}, bytes={}", peer_ud, len);
+        let write_dur = write_start.elapsed();
+
+        let total_dur = local_lookup_dur + ensure_session_dur + mr_query_dur + write_dur;
+        info!(
+            "transfer_sync_write profile: peer={}, bytes={}, local_lookup_ms={:.3}, ensure_session_ms={:.3}, mr_query_ms={:.3}, mr_cache_hit={}, write_ms={:.3}, total_ms={:.3}",
+            peer_ud,
+            len,
+            local_lookup_dur.as_secs_f64() * 1000.0,
+            ensure_session_dur.as_secs_f64() * 1000.0,
+            mr_query_dur.as_secs_f64() * 1000.0,
+            mr_cache_hit,
+            write_dur.as_secs_f64() * 1000.0,
+            total_dur.as_secs_f64() * 1000.0
+        );
         Ok(len)
     }
 }
