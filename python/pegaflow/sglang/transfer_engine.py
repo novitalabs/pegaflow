@@ -156,16 +156,6 @@ class MooncakeTransferEngine:
             logger.debug("PegaFlow batch memory registration failed.")
         return ret_value
 
-    def batch_deregister(self, ptrs: list[int]) -> int:
-        try:
-            ret_value = self.engine.batch_unregister_memory(ptrs)
-        except Exception:
-            ret_value = -1
-
-        if ret_value != 0:
-            logger.debug("PegaFlow batch memory deregistration failed.")
-        return ret_value
-
     def initialize(
         self,
         hostname: str,

@@ -53,20 +53,21 @@ impl PyTransferEngine {
     ) -> i32 {
         let _ = metadata_server;
         let _ = protocol;
-        let Some(nic_name) = resolve_transfer_nic(device_name) else {
-            log::error!("transfer initialize failed: NIC not configured");
-            return -1;
-        };
-        let Some(rpc_port) = resolve_transfer_rpc_port(local_hostname) else {
-            log::error!(
-                "transfer initialize failed: local_hostname must include a non-zero port, got `{local_hostname}`"
-            );
-            return -1;
-        };
-        let engine = Arc::clone(&self.engine);
 
         py.detach(move || {
-            let mut guard = match engine.lock() {
+            let local_hostname = local_hostname.to_string();
+            let device_name = device_name.to_string();
+            let Some(nic_name) = resolve_transfer_nic(&device_name) else {
+                log::error!("transfer initialize failed: NIC not configured");
+                return -1;
+            };
+            let Some(rpc_port) = resolve_transfer_rpc_port(&local_hostname) else {
+                log::error!(
+                    "transfer initialize failed: local_hostname must include a non-zero port, got `{local_hostname}`"
+                );
+                return -1;
+            };
+            let mut guard = match self.engine.lock() {
                 Ok(guard) => guard,
                 Err(_) => {
                     log::error!("transfer initialize failed: engine mutex poisoned");
@@ -84,9 +85,8 @@ impl PyTransferEngine {
     }
 
     fn get_rpc_port(&self, py: Python<'_>) -> i32 {
-        let engine = Arc::clone(&self.engine);
-        py.detach(move || {
-            let guard = match engine.lock() {
+        py.detach(|| {
+            let guard = match self.engine.lock() {
                 Ok(guard) => guard,
                 Err(_) => {
                     log::error!("get_rpc_port failed: engine mutex poisoned");
@@ -104,9 +104,8 @@ impl PyTransferEngine {
     }
 
     fn get_session_id(&self, py: Python<'_>) -> Vec<u8> {
-        let engine = Arc::clone(&self.engine);
-        py.detach(move || {
-            let guard = match engine.lock() {
+        py.detach(|| {
+            let guard = match self.engine.lock() {
                 Ok(guard) => guard,
                 Err(_) => {
                     log::error!("get_session_id failed: engine mutex poisoned");
@@ -118,9 +117,8 @@ impl PyTransferEngine {
     }
 
     fn register_memory(&self, py: Python<'_>, ptr: u64, len: usize) -> i32 {
-        let engine = Arc::clone(&self.engine);
         py.detach(move || {
-            let guard = match engine.lock() {
+            let guard = match self.engine.lock() {
                 Ok(guard) => guard,
                 Err(_) => {
                     log::error!("register_memory failed: engine mutex poisoned");
@@ -138,9 +136,8 @@ impl PyTransferEngine {
     }
 
     fn unregister_memory(&self, py: Python<'_>, ptr: u64) -> i32 {
-        let engine = Arc::clone(&self.engine);
         py.detach(move || {
-            let guard = match engine.lock() {
+            let guard = match self.engine.lock() {
                 Ok(guard) => guard,
                 Err(_) => {
                     log::error!("unregister_memory failed: engine mutex poisoned");
@@ -158,9 +155,8 @@ impl PyTransferEngine {
     }
 
     fn batch_register_memory(&self, py: Python<'_>, ptrs: Vec<u64>, lens: Vec<usize>) -> i32 {
-        let engine = Arc::clone(&self.engine);
         py.detach(move || {
-            let guard = match engine.lock() {
+            let guard = match self.engine.lock() {
                 Ok(guard) => guard,
                 Err(_) => {
                     log::error!("batch_register_memory failed: engine mutex poisoned");
@@ -182,9 +178,8 @@ impl PyTransferEngine {
     }
 
     fn batch_unregister_memory(&self, py: Python<'_>, ptrs: Vec<u64>) -> i32 {
-        let engine = Arc::clone(&self.engine);
         py.detach(move || {
-            let guard = match engine.lock() {
+            let guard = match self.engine.lock() {
                 Ok(guard) => guard,
                 Err(_) => {
                     log::error!("batch_unregister_memory failed: engine mutex poisoned");
@@ -212,13 +207,12 @@ impl PyTransferEngine {
         remote_ptr: u64,
         len: usize,
     ) -> i64 {
-        let Some(session_id) = DomainAddress::from_bytes(&session_id) else {
-            log::error!("transfer_sync_write failed: invalid session_id length");
-            return -1;
-        };
-        let engine = Arc::clone(&self.engine);
         py.detach(move || {
-            let guard = match engine.lock() {
+            let Some(session_id) = DomainAddress::from_bytes(&session_id) else {
+                log::error!("transfer_sync_write failed: invalid session_id length");
+                return -1;
+            };
+            let guard = match self.engine.lock() {
                 Ok(guard) => guard,
                 Err(_) => {
                     log::error!("transfer_sync_write failed: engine mutex poisoned");
@@ -245,13 +239,12 @@ impl PyTransferEngine {
         remote_ptrs: Vec<u64>,
         lens: Vec<usize>,
     ) -> i64 {
-        let Some(session_id) = DomainAddress::from_bytes(&session_id) else {
-            log::error!("batch_transfer_sync_write failed: invalid session_id length");
-            return -1;
-        };
-        let engine = Arc::clone(&self.engine);
         py.detach(move || {
-            let guard = match engine.lock() {
+            let Some(session_id) = DomainAddress::from_bytes(&session_id) else {
+                log::error!("batch_transfer_sync_write failed: invalid session_id length");
+                return -1;
+            };
+            let guard = match self.engine.lock() {
                 Ok(guard) => guard,
                 Err(_) => {
                     log::error!("batch_transfer_sync_write failed: engine mutex poisoned");
