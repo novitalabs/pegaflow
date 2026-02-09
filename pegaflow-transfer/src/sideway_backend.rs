@@ -55,7 +55,6 @@ const UD_GRH_BYTES: usize = 40;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_INFLIGHT_WRITES: usize = 96;
 const MAX_WR_CHAIN_WRITES: usize = 4;
-const DATA_CQ_POLL_SLEEP: Duration = Duration::from_micros(50);
 
 #[derive(Default)]
 struct ControlPlane {
@@ -792,8 +791,7 @@ impl SidewayBackend {
                 if let Err(error) = Self::send_control_message(runtime, &src_ud, &response) {
                     warn!(
                         "control handle connect_req send failed: request_id={}, peer={}, error={error}",
-                        request_id,
-                        src_ud
+                        request_id, src_ud
                     );
                 }
             }
@@ -1064,9 +1062,7 @@ impl SidewayBackend {
         let mut bad_wr = null_mut();
         {
             let qp = session.qp.lock();
-            let ret = unsafe {
-                ibv_post_send(qp.qp().as_ptr(), wrs.as_mut_ptr(), &raw mut bad_wr)
-            };
+            let ret = unsafe { ibv_post_send(qp.qp().as_ptr(), wrs.as_mut_ptr(), &raw mut bad_wr) };
             if ret != 0 {
                 return Err(TransferError::Backend(format!(
                     "ibv_post_send(RDMA_WRITE chain) failed: {}",
@@ -1127,11 +1123,11 @@ impl SidewayBackend {
                         transferred = transferred.saturating_add(bytes);
                     }
                     if !did_work {
-                        thread::sleep(DATA_CQ_POLL_SLEEP);
+                        std::hint::spin_loop();
                     }
                 }
                 Err(PollCompletionQueueError::CompletionQueueEmpty) => {
-                    thread::sleep(DATA_CQ_POLL_SLEEP);
+                    std::hint::spin_loop();
                 }
                 Err(error) => {
                     return Err(TransferError::Backend(format!(
@@ -1413,9 +1409,7 @@ impl SidewayBackend {
 mod tests {
     use super::{SidewayBackend, SidewayState};
     use crate::{
-        api::WorkerConfig,
-        control_protocol::RegisteredMemoryRegion,
-        domain_address::DomainAddress,
+        api::WorkerConfig, control_protocol::RegisteredMemoryRegion, domain_address::DomainAddress,
         error::TransferError,
     };
 
