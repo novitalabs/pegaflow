@@ -6,11 +6,39 @@ import logging
 import os
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import get_free_port
+from sglang.srt.utils import get_free_port, is_valid_ipv6_address, maybe_wrap_ipv6_address
 
 from pegaflow import TransferEngine
 
 logger = logging.getLogger(__name__)
+
+
+def _has_nonzero_port(hostname: str) -> bool:
+    hostname = hostname.strip()
+    if not hostname:
+        return False
+
+    # [ipv6]:port
+    if hostname.startswith("[") and "]:" in hostname:
+        _, port_str = hostname.rsplit("]:", 1)
+        return port_str.isdigit() and int(port_str) > 0
+
+    # Bare IPv6 should not be treated as host:port.
+    if is_valid_ipv6_address(hostname):
+        return False
+
+    # ipv4:port or hostname:port
+    if ":" in hostname:
+        _, port_str = hostname.rsplit(":", 1)
+        return port_str.isdigit() and int(port_str) > 0
+
+    return False
+
+
+def _ensure_hostname_with_port(hostname: str) -> str:
+    if _has_nonzero_port(hostname):
+        return hostname
+    return f"{maybe_wrap_ipv6_address(hostname)}:{get_free_port()}"
 
 
 def get_ib_devices_for_gpu(ib_device_str: str | None, gpu_id: int) -> str | None:
@@ -66,7 +94,12 @@ def _encode_session_id(raw_session_id: bytes) -> str:
 
 
 def _decode_session_id(session_id: str) -> bytes:
-    return base64.urlsafe_b64decode(session_id.encode("ascii"))
+    # Preferred format: "<base64_raw_session>:<rpc_port>"
+    # Keep backward compatibility with old "<base64_raw_session>" format.
+    encoded = session_id
+    if ":" in session_id:
+        encoded = session_id.rsplit(":", 1)[0]
+    return base64.urlsafe_b64decode(encoded.encode("ascii"))
 
 
 class MooncakeTransferEngine:
@@ -88,7 +121,12 @@ class MooncakeTransferEngine:
         )
         if not raw_session_id:
             raise RuntimeError("PegaFlow Transfer Engine get_session_id failed.")
-        self.session_id = _encode_session_id(bytes(raw_session_id))
+        rpc_port = self.engine.get_rpc_port()
+        if rpc_port <= 0:
+            raise RuntimeError(
+                f"PegaFlow Transfer Engine get_rpc_port failed, got {rpc_port}."
+            )
+        self.session_id = f"{_encode_session_id(bytes(raw_session_id))}:{rpc_port}"
 
     def register(self, ptr, length):
         try:
@@ -146,8 +184,9 @@ class MooncakeTransferEngine:
                 device_name if device_name is not None else "",
             )
         else:
+            rdma_hostname = _ensure_hostname_with_port(hostname)
             ret_value = self.engine.initialize(
-                hostname,
+                rdma_hostname,
                 "P2PHANDSHAKE",
                 "rdma",
                 device_name if device_name is not None else "",
@@ -174,8 +213,11 @@ class MooncakeTransferEngine:
                 session_id,
                 peer_buffer_address,
             )
+            return ret
 
-        return ret
+        # Keep Mooncake ABI semantics for sglang: 0 means success, <0 means failure.
+        # pegaflow-transfer returns bytes on success; map any non-negative value to 0.
+        return 0
 
     def batch_transfer_sync(
         self,
@@ -199,7 +241,11 @@ class MooncakeTransferEngine:
                 session_id,
                 peer_buffer_addresses,
             )
-        return ret
+            return ret
+
+        # Keep Mooncake ABI semantics for sglang: 0 means success, <0 means failure.
+        # pegaflow-transfer returns bytes on success; map any non-negative value to 0.
+        return 0
 
     def get_session_id(self):
         return self.session_id
