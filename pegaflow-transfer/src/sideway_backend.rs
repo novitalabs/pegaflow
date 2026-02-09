@@ -32,8 +32,8 @@ use sideway::ibverbs::{
     memory_region::MemoryRegion,
     protection_domain::ProtectionDomain,
     queue_pair::{
-        GenericQueuePair, PostSendGuard, QueuePair, QueuePairAttribute, QueuePairState,
-        QueuePairType, SendOperationFlags, SetScatterGatherEntry, WorkRequestFlags,
+        GenericQueuePair, QueuePair, QueuePairAttribute, QueuePairState, QueuePairType,
+        SendOperationFlags, SetScatterGatherEntry,
     },
 };
 
@@ -51,6 +51,7 @@ const UD_BUFFER_BYTES: usize = 512;
 const UD_GRH_BYTES: usize = 40;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_INFLIGHT_WRITES: usize = 96;
+const MAX_WR_CHAIN_WRITES: usize = 4;
 const DATA_CQ_POLL_SLEEP: Duration = Duration::from_micros(50);
 
 #[derive(Default)]
@@ -1047,27 +1048,63 @@ impl SidewayBackend {
         }
     }
 
-    fn post_write_wr(session: &ActiveSession, op: &WriteOp, wr_id: u64) -> Result<u64> {
-        if op.len > u32::MAX as usize {
-            return Err(TransferError::InvalidArgument(
-                "len exceeds RDMA SGE length limit",
-            ));
+    fn post_write_wr_chain(
+        session: &ActiveSession,
+        ops: &[WriteOp],
+        first_wr_id: u64,
+    ) -> Result<usize> {
+        if ops.is_empty() {
+            return Ok(0);
         }
 
-        {
-            let mut qp = session.qp.lock();
-            let mut guard = qp.start_post_send();
-            let wr = guard
-                .construct_wr(wr_id, WorkRequestFlags::Signaled)
-                .setup_write(op.remote_rkey, op.remote_ptr);
-            unsafe {
-                wr.setup_sge(op.local_mr.lkey(), op.local_ptr, op.len as u32);
+        let mut sges: Vec<ibv_sge> = (0..ops.len())
+            .map(|_| unsafe { MaybeUninit::<ibv_sge>::zeroed().assume_init() })
+            .collect();
+        let mut wrs: Vec<ibv_send_wr> = (0..ops.len())
+            .map(|_| unsafe { MaybeUninit::<ibv_send_wr>::zeroed().assume_init() })
+            .collect();
+
+        for (idx, op) in ops.iter().enumerate() {
+            if op.len > u32::MAX as usize {
+                return Err(TransferError::InvalidArgument(
+                    "len exceeds RDMA SGE length limit",
+                ));
             }
-            guard
-                .post()
-                .map_err(|error| TransferError::Backend(error.to_string()))?;
+
+            sges[idx] = ibv_sge {
+                addr: op.local_ptr,
+                length: op.len as u32,
+                lkey: op.local_mr.lkey(),
+            };
+
+            wrs[idx].wr_id = first_wr_id.wrapping_add(idx as u64);
+            wrs[idx].sg_list = &raw mut sges[idx];
+            wrs[idx].num_sge = 1;
+            wrs[idx].opcode = ibv_wr_opcode::IBV_WR_RDMA_WRITE;
+            wrs[idx].send_flags = ibv_send_flags::IBV_SEND_SIGNALED.0;
+            wrs[idx].wr.rdma.remote_addr = op.remote_ptr;
+            wrs[idx].wr.rdma.rkey = op.remote_rkey;
+            wrs[idx].next = if idx + 1 < wrs.len() {
+                &raw mut wrs[idx + 1]
+            } else {
+                null_mut()
+            };
         }
-        Ok(wr_id)
+
+        let mut bad_wr = null_mut();
+        {
+            let qp = session.qp.lock();
+            let ret = unsafe {
+                ibv_post_send(qp.qp().as_ptr(), wrs.as_mut_ptr(), &raw mut bad_wr)
+            };
+            if ret != 0 {
+                return Err(TransferError::Backend(format!(
+                    "ibv_post_send(RDMA_WRITE chain) failed: {}",
+                    io::Error::from_raw_os_error(ret)
+                )));
+            }
+        }
+        Ok(ops.len())
     }
 
     fn execute_batch_writes(session: &ActiveSession, ops: Vec<WriteOp>) -> Result<usize> {
@@ -1083,11 +1120,22 @@ impl SidewayBackend {
 
         while next_idx < total_ops || !inflight.is_empty() {
             while next_idx < total_ops && inflight.len() < MAX_INFLIGHT_WRITES {
-                let op = &ops[next_idx];
-                let wr_id = Self::post_write_wr(session, op, next_wr_id)?;
-                inflight.insert(wr_id, op.len);
-                next_wr_id = next_wr_id.wrapping_add(1);
-                next_idx += 1;
+                let available = MAX_INFLIGHT_WRITES - inflight.len();
+                let remaining = total_ops - next_idx;
+                let chain_len = MAX_WR_CHAIN_WRITES.min(available).min(remaining);
+                let posted = Self::post_write_wr_chain(
+                    session,
+                    &ops[next_idx..next_idx + chain_len],
+                    next_wr_id,
+                )?;
+                if posted == 0 {
+                    break;
+                }
+                for op in &ops[next_idx..next_idx + posted] {
+                    inflight.insert(next_wr_id, op.len);
+                    next_wr_id = next_wr_id.wrapping_add(1);
+                }
+                next_idx += posted;
             }
 
             match session.send_cq.start_poll() {
