@@ -5,7 +5,7 @@ use logforth::diagnostic::ThreadLocalDiagnostic;
 
 static INIT: Once = Once::new();
 
-pub fn ensure_initialized() {
+pub(crate) fn ensure_initialized() {
     if log::max_level() != LevelFilter::Off {
         return;
     }

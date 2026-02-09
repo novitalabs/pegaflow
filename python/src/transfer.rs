@@ -177,28 +177,6 @@ impl PyTransferEngine {
         })
     }
 
-    fn batch_unregister_memory(&self, py: Python<'_>, ptrs: Vec<u64>) -> i32 {
-        py.detach(move || {
-            let guard = match self.engine.lock() {
-                Ok(guard) => guard,
-                Err(_) => {
-                    log::error!("batch_unregister_memory failed: engine mutex poisoned");
-                    return -1;
-                }
-            };
-            match guard.batch_unregister_memory(&ptrs) {
-                Ok(()) => 0,
-                Err(error) => {
-                    log::error!(
-                        "batch_unregister_memory failed: ptrs={}, error={error}",
-                        ptrs.len()
-                    );
-                    -1
-                }
-            }
-        })
-    }
-
     fn transfer_sync_write(
         &self,
         py: Python<'_>,

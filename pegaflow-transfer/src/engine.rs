@@ -46,13 +46,6 @@ impl MooncakeTransferEngine {
         Ok(())
     }
 
-    pub fn batch_unregister_memory(&self, ptrs: &[u64]) -> Result<()> {
-        for ptr in ptrs.iter().copied() {
-            self.backend.unregister_memory(ptr)?;
-        }
-        Ok(())
-    }
-
     pub fn transfer_sync_write(
         &self,
         session_id: &DomainAddress,

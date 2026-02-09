@@ -169,10 +169,6 @@ class TransferEngine:
         """Batch register memory regions. Returns 0 on success."""
         ...
 
-    def batch_unregister_memory(self, ptrs: list[int]) -> int:
-        """Batch unregister memory regions. Returns 0 on success."""
-        ...
-
     def transfer_sync_write(
         self,
         session_id: bytes,

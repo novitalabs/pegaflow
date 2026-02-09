@@ -190,12 +190,12 @@ struct SidewayState {
 }
 
 #[derive(Default)]
-pub struct SidewayBackend {
+pub(crate) struct SidewayBackend {
     state: Arc<Mutex<SidewayState>>,
 }
 
 impl SidewayBackend {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
@@ -1220,7 +1220,7 @@ impl SidewayBackend {
 }
 
 impl SidewayBackend {
-    pub fn initialize(&self, config: WorkerConfig) -> Result<()> {
+    pub(crate) fn initialize(&self, config: WorkerConfig) -> Result<()> {
         logging::ensure_initialized();
         if config.nic_name.trim().is_empty() {
             return Err(TransferError::InvalidArgument("nic_name is empty"));
@@ -1247,12 +1247,12 @@ impl SidewayBackend {
         Ok(())
     }
 
-    pub fn rpc_port(&self) -> Result<u16> {
+    pub(crate) fn rpc_port(&self) -> Result<u16> {
         let state = self.state.lock();
         Ok(Self::ensure_initialized(&state)?.rpc_port)
     }
 
-    pub fn session_id(&self) -> DomainAddress {
+    pub(crate) fn session_id(&self) -> DomainAddress {
         let state = self.state.lock();
         let runtime = state
             .runtime
@@ -1261,7 +1261,7 @@ impl SidewayBackend {
         runtime.local_ud.clone()
     }
 
-    pub fn register_memory(&self, ptr: u64, len: usize) -> Result<()> {
+    pub(crate) fn register_memory(&self, ptr: u64, len: usize) -> Result<()> {
         if ptr == 0 {
             return Err(TransferError::InvalidArgument("ptr must be non-zero"));
         }
@@ -1296,7 +1296,7 @@ impl SidewayBackend {
         Ok(())
     }
 
-    pub fn unregister_memory(&self, ptr: u64) -> Result<()> {
+    pub(crate) fn unregister_memory(&self, ptr: u64) -> Result<()> {
         if ptr == 0 {
             return Err(TransferError::InvalidArgument("ptr must be non-zero"));
         }
@@ -1310,7 +1310,7 @@ impl SidewayBackend {
         Ok(())
     }
 
-    pub fn transfer_sync_write(
+    pub(crate) fn transfer_sync_write(
         &self,
         session_id: &DomainAddress,
         local_ptr: u64,
@@ -1320,7 +1320,7 @@ impl SidewayBackend {
         self.batch_transfer_sync_write(session_id, &[local_ptr], &[remote_ptr], &[len])
     }
 
-    pub fn batch_transfer_sync_write(
+    pub(crate) fn batch_transfer_sync_write(
         &self,
         session_id: &DomainAddress,
         local_ptrs: &[u64],
