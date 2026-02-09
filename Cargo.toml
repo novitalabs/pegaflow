@@ -16,7 +16,7 @@ edition = "2024"
 # Workspace members
 pegaflow-core = { path = "pegaflow-core" }
 pegaflow-transfer = { path = "pegaflow-transfer" }
-sideway = { path = "../sideway" }
+sideway = "0.4.0"
 
 # Core dependencies
 cudarc = { version = "0.18.0", features = ["cuda-12040"] }
@@ -73,6 +73,3 @@ colored = "3.0"
 criterion = "0.8"
 
 tikv-jemallocator = "0.6.1"
-
-[patch.crates-io]
-sideway = { path = "../sideway" }

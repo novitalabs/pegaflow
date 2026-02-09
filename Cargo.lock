@@ -2629,6 +2629,8 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 [[package]]
 name = "sideway"
 version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de7868cbfe36185d277a6b0c1e7437cb2f31ab1524aaff08897d1f4b00d005de"
 dependencies = [
  "bitmask-enum",
  "libc",
