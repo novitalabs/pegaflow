@@ -85,17 +85,9 @@ impl MooncakeTransferEngine {
         }
 
         let started_at = Instant::now();
-        let mut transferred = 0usize;
-        for ((local_ptr, remote_ptr), len) in local_ptrs
-            .iter()
-            .copied()
-            .zip(remote_ptrs.iter().copied())
-            .zip(lens.iter().copied())
-        {
-            transferred += self
-                .backend
-                .transfer_sync_write(session_id, local_ptr, remote_ptr, len)?;
-        }
+        let transferred =
+            self.backend
+                .batch_transfer_sync_write(session_id, local_ptrs, remote_ptrs, lens)?;
         let elapsed = started_at.elapsed();
         let elapsed_secs = elapsed.as_secs_f64();
         if elapsed_secs > 0.0 {

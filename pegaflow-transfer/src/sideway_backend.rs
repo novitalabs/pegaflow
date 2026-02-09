@@ -6,6 +6,7 @@ use std::{
     sync::{
         Arc, Weak,
         atomic::{AtomicU64, Ordering},
+        mpsc as std_mpsc,
     },
     thread,
     time::{Duration, Instant},
@@ -49,6 +50,8 @@ const UD_RECV_SLOTS: usize = 64;
 const UD_BUFFER_BYTES: usize = 512;
 const UD_GRH_BYTES: usize = 40;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_INFLIGHT_WRITES: usize = 96;
+const DATA_CQ_POLL_SLEEP: Duration = Duration::from_micros(50);
 
 #[derive(Default)]
 struct ControlPlane {
@@ -158,6 +161,22 @@ struct ActiveSession {
     send_cq: GenericCompletionQueue,
     _recv_cq: GenericCompletionQueue,
     local_rc: RcEndpoint,
+    cmd_tx: std_mpsc::Sender<SessionCommand>,
+}
+
+struct WriteOp {
+    local_mr: Arc<MemoryRegion>,
+    local_ptr: u64,
+    remote_ptr: u64,
+    len: usize,
+    remote_rkey: u32,
+}
+
+enum SessionCommand {
+    SubmitBatch {
+        ops: Vec<WriteOp>,
+        done_tx: std_mpsc::Sender<Result<usize>>,
+    },
 }
 
 #[derive(Default)]
@@ -238,9 +257,7 @@ impl SidewayBackend {
             .entry(peer_ud.clone())
             .or_default();
         if entries.iter().any(|entry| {
-            entry.rkey == rkey
-                && remote_ptr >= entry.base_ptr
-                && end_ptr <= entry.end_ptr
+            entry.rkey == rkey && remote_ptr >= entry.base_ptr && end_ptr <= entry.end_ptr
         }) {
             return;
         }
@@ -889,13 +906,16 @@ impl SidewayBackend {
             .next_request_id
             .fetch_add(1, Ordering::Relaxed);
         let (qp, send_cq, recv_cq, local_rc) = Self::create_rc_qp(runtime, seed)?;
+        let (cmd_tx, cmd_rx) = std_mpsc::channel();
         let session = Arc::new(ActiveSession {
             qp: Mutex::new(qp),
             send_cq,
             _recv_cq: recv_cq,
             local_rc,
+            cmd_tx,
         });
         Self::connect_rc_qp(runtime, &session, remote_rc)?;
+        Self::spawn_session_worker(Arc::clone(&session), cmd_rx);
 
         let mut guard = state.lock();
         let retained = guard
@@ -925,11 +945,13 @@ impl SidewayBackend {
         let request_id = runtime.control.begin_request();
         let seed = request_id;
         let (qp, send_cq, recv_cq, local_rc) = Self::create_rc_qp(runtime, seed)?;
+        let (cmd_tx, cmd_rx) = std_mpsc::channel();
         let session = Arc::new(ActiveSession {
             qp: Mutex::new(qp),
             send_cq,
             _recv_cq: recv_cq,
             local_rc,
+            cmd_tx,
         });
 
         Self::send_control_message(
@@ -956,6 +978,7 @@ impl SidewayBackend {
             }
         };
         Self::connect_rc_qp(runtime, &session, remote_rc)?;
+        Self::spawn_session_worker(Arc::clone(&session), cmd_rx);
 
         let mut guard = state.lock();
         let retained = guard
@@ -1024,19 +1047,57 @@ impl SidewayBackend {
         }
     }
 
-    fn wait_send_completion(
-        send_cq: &GenericCompletionQueue,
-        wr_id: u64,
-        timeout: Duration,
-    ) -> Result<()> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            match send_cq.start_poll() {
+    fn post_write_wr(session: &ActiveSession, op: &WriteOp, wr_id: u64) -> Result<u64> {
+        if op.len > u32::MAX as usize {
+            return Err(TransferError::InvalidArgument(
+                "len exceeds RDMA SGE length limit",
+            ));
+        }
+
+        {
+            let mut qp = session.qp.lock();
+            let mut guard = qp.start_post_send();
+            let wr = guard
+                .construct_wr(wr_id, WorkRequestFlags::Signaled)
+                .setup_write(op.remote_rkey, op.remote_ptr);
+            unsafe {
+                wr.setup_sge(op.local_mr.lkey(), op.local_ptr, op.len as u32);
+            }
+            guard
+                .post()
+                .map_err(|error| TransferError::Backend(error.to_string()))?;
+        }
+        Ok(wr_id)
+    }
+
+    fn execute_batch_writes(session: &ActiveSession, ops: Vec<WriteOp>) -> Result<usize> {
+        let total_ops = ops.len();
+        if total_ops == 0 {
+            return Ok(0);
+        }
+
+        let mut next_idx = 0usize;
+        let mut next_wr_id = 1_u64;
+        let mut inflight: HashMap<u64, usize> = HashMap::new();
+        let mut transferred = 0usize;
+
+        while next_idx < total_ops || !inflight.is_empty() {
+            while next_idx < total_ops && inflight.len() < MAX_INFLIGHT_WRITES {
+                let op = &ops[next_idx];
+                let wr_id = Self::post_write_wr(session, op, next_wr_id)?;
+                inflight.insert(wr_id, op.len);
+                next_wr_id = next_wr_id.wrapping_add(1);
+                next_idx += 1;
+            }
+
+            match session.send_cq.start_poll() {
                 Ok(mut poller) => {
+                    let mut did_work = false;
                     for wc in &mut poller {
-                        if wc.wr_id() != wr_id {
+                        did_work = true;
+                        let Some(bytes) = inflight.remove(&wc.wr_id()) else {
                             continue;
-                        }
+                        };
                         if wc.status() != WorkCompletionStatus::Success as u32 {
                             return Err(TransferError::Backend(format!(
                                 "send completion failed: status={}, opcode={}, vendor_err={}",
@@ -1045,56 +1106,68 @@ impl SidewayBackend {
                                 wc.vendor_err()
                             )));
                         }
-                        return Ok(());
+                        transferred = transferred.saturating_add(bytes);
+                    }
+                    if !did_work {
+                        thread::sleep(DATA_CQ_POLL_SLEEP);
                     }
                 }
-                Err(PollCompletionQueueError::CompletionQueueEmpty) => {}
+                Err(PollCompletionQueueError::CompletionQueueEmpty) => {
+                    thread::sleep(DATA_CQ_POLL_SLEEP);
+                }
                 Err(error) => {
                     return Err(TransferError::Backend(format!(
                         "poll send CQ failed: {error}"
                     )));
                 }
             }
-
-            if Instant::now() >= deadline {
-                return Err(TransferError::Backend(
-                    "send completion timeout".to_string(),
-                ));
-            }
-            thread::sleep(Duration::from_micros(50));
         }
+
+        Ok(transferred)
     }
 
-    fn post_write(
-        session: &ActiveSession,
-        local_mr: Arc<MemoryRegion>,
-        local_ptr: u64,
-        remote_ptr: u64,
-        len: usize,
-        remote_rkey: u32,
-    ) -> Result<()> {
-        if len > u32::MAX as usize {
-            return Err(TransferError::InvalidArgument(
-                "len exceeds RDMA SGE length limit",
-            ));
-        }
+    fn spawn_session_worker(
+        session: Arc<ActiveSession>,
+        cmd_rx: std_mpsc::Receiver<SessionCommand>,
+    ) {
+        let _ = thread::Builder::new()
+            .name("pegaflow-sideway-session".to_string())
+            .spawn(move || {
+                debug!(
+                    "session worker started: local_qpn={}",
+                    session.local_rc.qp_num
+                );
+                while let Ok(command) = cmd_rx.recv() {
+                    match command {
+                        SessionCommand::SubmitBatch { ops, done_tx } => {
+                            let result = Self::execute_batch_writes(&session, ops);
+                            if done_tx.send(result).is_err() {
+                                debug!(
+                                    "session worker reply receiver dropped: local_qpn={}",
+                                    session.local_rc.qp_num
+                                );
+                            }
+                        }
+                    }
+                }
+                debug!(
+                    "session worker stopped: local_qpn={}",
+                    session.local_rc.qp_num
+                );
+            });
+    }
 
-        let wr_id = 1_u64;
-        {
-            let mut qp = session.qp.lock();
-            let mut guard = qp.start_post_send();
-            let wr = guard
-                .construct_wr(wr_id, WorkRequestFlags::Signaled)
-                .setup_write(remote_rkey, remote_ptr);
-            unsafe {
-                wr.setup_sge(local_mr.lkey(), local_ptr, len as u32);
-            }
-            guard
-                .post()
-                .map_err(|error| TransferError::Backend(error.to_string()))?;
-        }
-        Self::wait_send_completion(&session.send_cq, wr_id, Duration::from_secs(2))?;
-        Ok(())
+    fn submit_session_batch(session: &ActiveSession, ops: Vec<WriteOp>) -> Result<usize> {
+        let (done_tx, done_rx) = std_mpsc::channel();
+        session
+            .cmd_tx
+            .send(SessionCommand::SubmitBatch { ops, done_tx })
+            .map_err(|_| {
+                TransferError::Backend("session worker channel disconnected".to_string())
+            })?;
+        done_rx
+            .recv()
+            .map_err(|_| TransferError::Backend("session worker dropped completion".to_string()))?
     }
 }
 
@@ -1196,38 +1269,86 @@ impl SidewayBackend {
         remote_ptr: u64,
         len: usize,
     ) -> Result<usize> {
+        self.batch_transfer_sync_write(session_id, &[local_ptr], &[remote_ptr], &[len])
+    }
+
+    pub fn batch_transfer_sync_write(
+        &self,
+        session_id: &DomainAddress,
+        local_ptrs: &[u64],
+        remote_ptrs: &[u64],
+        lens: &[usize],
+    ) -> Result<usize> {
         if session_id.to_bytes().len() != DomainAddress::BYTES {
             return Err(TransferError::InvalidArgument(
                 "session_id has invalid DomainAddress bytes",
             ));
         }
-        if local_ptr == 0 {
-            return Err(TransferError::InvalidArgument("local_ptr must be non-zero"));
+        if local_ptrs.len() != remote_ptrs.len() {
+            return Err(TransferError::BatchLengthMismatch {
+                ptrs: local_ptrs.len(),
+                lens: remote_ptrs.len(),
+            });
         }
-        if remote_ptr == 0 {
-            return Err(TransferError::InvalidArgument(
-                "remote_ptr must be non-zero",
-            ));
+        if local_ptrs.len() != lens.len() {
+            return Err(TransferError::BatchLengthMismatch {
+                ptrs: local_ptrs.len(),
+                lens: lens.len(),
+            });
         }
-        if len == 0 {
-            return Err(TransferError::InvalidArgument("len must be non-zero"));
+        if lens.is_empty() {
+            return Ok(0);
         }
-        let peer_ud = session_id;
 
+        let peer_ud = session_id;
         let local_lookup_start = Instant::now();
-        let (runtime, local_mr, cached_remote) = {
+        let (runtime, mut prepared_ops): (
+            Arc<SidewayRuntime>,
+            Vec<(WriteOp, Option<(u32, usize)>)>,
+        ) = {
             let state = self.state.lock();
             Self::ensure_initialized(&state)?;
             let runtime = state
                 .runtime
                 .as_ref()
                 .ok_or(TransferError::NotInitialized)?;
-            let Some((_, _, local_mr)) = Self::find_registered_entry(&state, local_ptr, len) else {
-                return Err(TransferError::MemoryNotRegistered { ptr: local_ptr });
-            };
-            let cached_remote =
-                Self::find_cached_remote_memory(&state, peer_ud, remote_ptr, len);
-            (Arc::clone(runtime), local_mr, cached_remote)
+
+            let mut prepared_ops = Vec::with_capacity(lens.len());
+            for ((local_ptr, remote_ptr), len) in local_ptrs
+                .iter()
+                .copied()
+                .zip(remote_ptrs.iter().copied())
+                .zip(lens.iter().copied())
+            {
+                if local_ptr == 0 {
+                    return Err(TransferError::InvalidArgument("local_ptr must be non-zero"));
+                }
+                if remote_ptr == 0 {
+                    return Err(TransferError::InvalidArgument(
+                        "remote_ptr must be non-zero",
+                    ));
+                }
+                if len == 0 {
+                    return Err(TransferError::InvalidArgument("len must be non-zero"));
+                }
+                let Some((_, _, local_mr)) = Self::find_registered_entry(&state, local_ptr, len)
+                else {
+                    return Err(TransferError::MemoryNotRegistered { ptr: local_ptr });
+                };
+                let cached_remote =
+                    Self::find_cached_remote_memory(&state, peer_ud, remote_ptr, len);
+                prepared_ops.push((
+                    WriteOp {
+                        local_mr,
+                        local_ptr,
+                        remote_ptr,
+                        len,
+                        remote_rkey: 0,
+                    },
+                    cached_remote,
+                ));
+            }
+            (Arc::clone(runtime), prepared_ops)
         };
         let local_lookup_dur = local_lookup_start.elapsed();
 
@@ -1235,49 +1356,56 @@ impl SidewayBackend {
         let session = Self::ensure_active_session(&runtime, &self.state, peer_ud)?;
         let ensure_session_dur = ensure_session_start.elapsed();
 
-        let (remote_rkey, remote_available, mr_query_dur, mr_cache_hit) =
-            if let Some((remote_rkey, remote_available)) = cached_remote {
-                (remote_rkey, remote_available, Duration::ZERO, true)
-            } else {
-                let mr_query_start = Instant::now();
-                let (remote_rkey, remote_available) =
-                    Self::query_remote_memory(&runtime, peer_ud, remote_ptr, len)?;
-                let mr_query_dur = mr_query_start.elapsed();
-                {
-                    let mut state = self.state.lock();
-                    Self::cache_remote_memory(
-                        &mut state,
-                        peer_ud,
-                        remote_ptr,
-                        remote_available,
-                        remote_rkey,
-                    );
-                }
-                (remote_rkey, remote_available, mr_query_dur, false)
-            };
-        if len > remote_available {
-            return Err(TransferError::InvalidArgument(
-                "len exceeds remote registered memory",
-            ));
+        let mr_query_start = Instant::now();
+        let mut mr_cache_hits = 0usize;
+        for (op, cached_remote) in prepared_ops.iter_mut() {
+            let (remote_rkey, remote_available) =
+                if let Some((cached_rkey, cached_available)) = *cached_remote {
+                    mr_cache_hits += 1;
+                    (cached_rkey, cached_available)
+                } else {
+                    let (queried_rkey, queried_available) =
+                        Self::query_remote_memory(&runtime, peer_ud, op.remote_ptr, op.len)?;
+                    {
+                        let mut state = self.state.lock();
+                        Self::cache_remote_memory(
+                            &mut state,
+                            peer_ud,
+                            op.remote_ptr,
+                            queried_available,
+                            queried_rkey,
+                        );
+                    }
+                    (queried_rkey, queried_available)
+                };
+            if op.len > remote_available {
+                return Err(TransferError::InvalidArgument(
+                    "len exceeds remote registered memory",
+                ));
+            }
+            op.remote_rkey = remote_rkey;
         }
+        let mr_query_dur = mr_query_start.elapsed();
 
-        let write_start = Instant::now();
-        Self::post_write(&session, local_mr, local_ptr, remote_ptr, len, remote_rkey)?;
-        let write_dur = write_start.elapsed();
+        let ops: Vec<WriteOp> = prepared_ops.into_iter().map(|(op, _)| op).collect();
+        let submit_start = Instant::now();
+        let transferred = Self::submit_session_batch(&session, ops)?;
+        let submit_dur = submit_start.elapsed();
 
-        let total_dur = local_lookup_dur + ensure_session_dur + mr_query_dur + write_dur;
+        let total_dur = local_lookup_dur + ensure_session_dur + mr_query_dur + submit_dur;
         info!(
-            "transfer_sync_write profile: peer={}, bytes={}, local_lookup_ms={:.3}, ensure_session_ms={:.3}, mr_query_ms={:.3}, mr_cache_hit={}, write_ms={:.3}, total_ms={:.3}",
+            "batch_transfer_sync_write profile: peer={}, bytes={}, chunks={}, local_lookup_ms={:.3}, ensure_session_ms={:.3}, mr_query_ms={:.3}, mr_cache_hits={}, submit_wait_ms={:.3}, total_ms={:.3}",
             peer_ud,
-            len,
+            transferred,
+            lens.len(),
             local_lookup_dur.as_secs_f64() * 1000.0,
             ensure_session_dur.as_secs_f64() * 1000.0,
             mr_query_dur.as_secs_f64() * 1000.0,
-            mr_cache_hit,
-            write_dur.as_secs_f64() * 1000.0,
+            mr_cache_hits,
+            submit_dur.as_secs_f64() * 1000.0,
             total_dur.as_secs_f64() * 1000.0
         );
-        Ok(len)
+        Ok(transferred)
     }
 }
 

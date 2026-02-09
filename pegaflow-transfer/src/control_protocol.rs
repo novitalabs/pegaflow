@@ -212,7 +212,12 @@ mod tests {
     use crate::domain_address::DomainAddress;
 
     fn sample_addr(seed: u8) -> DomainAddress {
-        DomainAddress::from_parts([seed; 16], 100 + seed as u16, 200 + seed as u32, 0x1111_1111)
+        DomainAddress::from_parts(
+            [seed; 16],
+            100 + seed as u16,
+            200 + seed as u32,
+            0x1111_1111,
+        )
     }
 
     fn sample_rc(seed: u8) -> RcEndpoint {
