@@ -86,7 +86,7 @@ impl MooncakeTransferEngine {
         if elapsed_secs > 0.0 {
             let gbps = (transferred as f64 * 8.0) / elapsed_secs / 1e9;
             let gib_per_sec = (transferred as f64) / elapsed_secs / (1024.0 * 1024.0 * 1024.0);
-            log::info!(
+            log::debug!(
                 "batch_transfer_sync_write e2e bandwidth: bytes={}, chunks={}, elapsed_ms={:.3}, bw_gbps={:.3}, bw_gibps={:.3}",
                 transferred,
                 lens.len(),

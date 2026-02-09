@@ -1381,7 +1381,7 @@ impl SidewayBackend {
         let submit_dur = submit_start.elapsed();
 
         let total_dur = local_lookup_dur + ensure_session_dur + remote_lookup_dur + submit_dur;
-        info!(
+        debug!(
             "batch_transfer_sync_write profile: peer={}, bytes={}, chunks={}, local_lookup_ms={:.3}, ensure_session_ms={:.3}, remote_lookup_ms={:.3}, remote_cache_hits={}, submit_wait_ms={:.3}, total_ms={:.3}",
             peer_ud,
             transferred,
