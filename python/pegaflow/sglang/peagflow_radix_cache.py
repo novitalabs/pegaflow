@@ -122,12 +122,8 @@ class PeagflowRadixCache(RadixCache):
 
         self.tp_rank = rank
         self.tp_size = tp_size
-        self.pp_rank = params.pp_rank
-        self.pp_size = params.pp_size
         self.world_size = 1  # TODO: hardcode
 
-        # Get PP group for synchronization (None if pp_size <= 1)
-        self._pp_group = self._get_pp_group()
         # Store TP cache group for hit_blocks sync
         self._tp_cache_group = params.tp_cache_group
 
@@ -166,18 +162,6 @@ class PeagflowRadixCache(RadixCache):
     # --------------------------------------------------------------------- #
     # Helpers
     # --------------------------------------------------------------------- #
-    def _get_pp_group(self):
-        """Get the PP group coordinator if pp_size > 1."""
-        if self.pp_size <= 1:
-            return None
-        try:
-            from sglang.srt.distributed import get_pp_group
-
-            return get_pp_group()
-        except (ImportError, AssertionError) as e:
-            logger.debug(f"[PeagflowRadixCache] PP group not available: {e}")
-            return None
-
     def _sync_instance_id(
         self, instance_id: str | None, tp_cache_group: torch.distributed.ProcessGroup | None
     ) -> str:
@@ -213,7 +197,6 @@ class PeagflowRadixCache(RadixCache):
         """
         original_hit_blocks = hit_blocks
 
-        # Step 1: TP AllReduce MIN (within each PP stage)
         if self.tp_size > 1 and self._tp_cache_group is not None:
             hit_tensor = torch.tensor([hit_blocks], dtype=torch.int64, device="cpu")
             torch.distributed.all_reduce(
@@ -224,7 +207,7 @@ class PeagflowRadixCache(RadixCache):
         if hit_blocks != original_hit_blocks:
             logger.debug(
                 f"[PeagflowRadixCache] AllReduce MIN: local={original_hit_blocks} -> min={hit_blocks} "
-                f"(tp_rank={self.tp_rank}, pp_rank={self.pp_rank})"
+                f"(tp_rank={self.tp_rank})"
             )
 
         return hit_blocks
@@ -465,7 +448,7 @@ class PeagflowRadixCache(RadixCache):
                 hit_blocks = min(hit_blocks, len(block_ids))
 
         if hit_blocks > 0 and token_slots is not None:
-            # Load hit_blocks from local PegaFlow server (what this PP stage has)
+            # Load hit_blocks from local PegaFlow server
             load_block_ids = block_ids[:hit_blocks]
             load_block_hashes = block_hashes[:hit_blocks]
 
@@ -501,21 +484,21 @@ class PeagflowRadixCache(RadixCache):
                     token_slots = None
                     hit_blocks = 0
 
-        # CRITICAL: Sync hit_blocks across TP and PP ranks using AllReduce MIN.
-        # TP ranks may have different cache hits; PP stages have different servers.
+        # Sync hit_blocks across TP ranks using AllReduce MIN.
+        # TP ranks may have different cache hits due to timing.
         # Take the minimum to ensure all ranks use the same prefix length.
         real_hit_blocks = self._sync_hit_blocks(hit_blocks)
 
         if real_hit_blocks == 0 or token_slots is None:
-            # No common blocks across PP stages, or local load failed - discard everything
+            # No common blocks across TP ranks, or local load failed - discard everything
             if token_slots is not None:
                 self.token_to_kv_pool_allocator.free(token_slots)
             return base_res
 
-        # Use only real_hit_blocks worth of data (common across all PP stages)
+        # Use only real_hit_blocks worth of data (common across all TP ranks)
         fetched_tokens = real_hit_blocks * block_size
 
-        # Trim unused slots: discard tokens beyond what all PP stages have
+        # Trim unused slots: discard tokens beyond what all TP ranks have
         if fetched_tokens < uncached_len:
             self.token_to_kv_pool_allocator.free(token_slots[fetched_tokens:])
             token_slots = token_slots[:fetched_tokens]
