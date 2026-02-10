@@ -190,8 +190,25 @@ impl Engine for GrpcEngineService {
             req.saves.iter().fold((0usize, 0usize), |(b, h), layer| {
                 (b + layer.block_ids.len(), h + layer.block_hashes.len())
             });
+        let max_blocks_per_layer = req
+            .saves
+            .iter()
+            .map(|layer| layer.block_ids.len())
+            .max()
+            .unwrap_or(0usize);
+        #[cfg(feature = "tracing")]
+        let root = Span::root("rpc.save", SpanContext::random()).with_properties(|| {
+            [
+                ("instance_id", req.instance_id.clone()),
+                ("layers", layer_count.to_string()),
+                ("blocks", total_blocks.to_string()),
+                ("hashes", total_hashes.to_string()),
+                ("max_blocks_per_layer", max_blocks_per_layer.to_string()),
+            ]
+        });
 
-        let result: Result<Response<SaveResponse>, Status> = async {
+        let fut = async {
+            let decode_start = Instant::now();
             let SaveRequest {
                 instance_id,
                 tp_rank,
@@ -205,26 +222,44 @@ impl Engine for GrpcEngineService {
                 .into_iter()
                 .map(|layer| (layer.layer_name, layer.block_ids, layer.block_hashes))
                 .collect();
+            let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
 
-            debug!(
-                "RPC [save]: instance_id={} tp_rank={} device_id={} layers={} blocks={} hashes={}",
-                instance_id, tp_rank, device_id, layer_count, total_blocks, total_hashes
+            warn!(
+                "RPC [save]: instance_id={} tp_rank={} device_id={} layers={} blocks={} hashes={} max_blocks_per_layer={} decode_ms={:.2}",
+                instance_id,
+                tp_rank,
+                device_id,
+                layer_count,
+                total_blocks,
+                total_hashes,
+                max_blocks_per_layer,
+                decode_ms
             );
 
+            let engine_start = Instant::now();
             self.engine
                 .batch_save_kv_blocks_from_ipc(&instance_id, tp_rank, device_id, saves)
                 .await
                 .map_err(Self::map_engine_error)?;
+            let engine_ms = engine_start.elapsed().as_secs_f64() * 1000.0;
+
+            warn!(
+                "RPC [save] engine completed: instance_id={} tp_rank={} layers={} blocks={} hashes={} engine_ms={:.2}",
+                instance_id, tp_rank, layer_count, total_blocks, total_hashes, engine_ms
+            );
 
             Ok(Response::new(SaveResponse {
                 status: Some(Self::build_simple_response()),
             }))
-        }
-        .await;
+        };
+        #[cfg(feature = "tracing")]
+        let result: Result<Response<SaveResponse>, Status> = fut.in_span(root).await;
+        #[cfg(not(feature = "tracing"))]
+        let result: Result<Response<SaveResponse>, Status> = fut.await;
 
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         match &result {
-            Ok(_) => debug!(
+            Ok(_) => warn!(
                 "RPC [save] completed: ok layers={} blocks={} hashes={} elapsed_ms={:.2}",
                 layer_count, total_blocks, total_hashes, elapsed_ms
             ),

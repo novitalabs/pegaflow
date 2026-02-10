@@ -1,3 +1,4 @@
+use log::warn;
 use pegaflow_core::{LoadState, PegaEngine as CoreEngine};
 use pegaflow_proto::proto::engine::{
     HealthRequest, LoadRequest, QueryRequest, RegisterContextRequest, ResponseStatus, SaveLayer,
@@ -384,6 +385,22 @@ impl EngineRpcClient {
         device_id: i32,
         saves: Vec<(String, Vec<i32>, Vec<Vec<u8>>)>,
     ) -> PyResult<(bool, String)> {
+        if let Some((layer_name, block_ids, block_hashes)) = saves.first() {
+            let first_hash_len = block_hashes.first().map(std::vec::Vec::len).unwrap_or(0);
+            let first_tuple_hash_bytes: usize = block_hashes.iter().map(std::vec::Vec::len).sum();
+            warn!(
+                "RPC [save] first_tuple: layer_name_len={} layer_name_cap={} block_ids={} block_hashes={} first_hash_len={} first_tuple_hash_bytes={}",
+                layer_name.len(),
+                layer_name.capacity(),
+                block_ids.len(),
+                block_hashes.len(),
+                first_hash_len,
+                first_tuple_hash_bytes
+            );
+        } else {
+            warn!("RPC [save] first_tuple: saves is empty");
+        }
+
         let saves = saves
             .into_iter()
             .map(|(layer_name, block_ids, block_hashes)| SaveLayer {

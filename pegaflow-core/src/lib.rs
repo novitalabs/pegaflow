@@ -64,7 +64,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use log::{debug, info};
+use log::{debug, info, warn};
 
 use crate::gpu_worker::{LayerLoadData, LoadBlock, LoadTask, SaveBlock};
 use crate::metrics::core_metrics;
@@ -347,21 +347,75 @@ impl PegaEngine {
         device_id: i32,
         saves: Vec<(String, Vec<i32>, Vec<Vec<u8>>)>,
     ) -> Result<(), EngineError> {
+        let batch_start = std::time::Instant::now();
+        let total_layers = saves.len();
+        let (requested_blocks, requested_hashes) =
+            saves.iter().fold((0usize, 0usize), |(b, h), layer| {
+                (b + layer.1.len(), h + layer.2.len())
+            });
+
         let instance = self.get_instance(instance_id)?;
         let namespace = instance.namespace().to_string();
 
-        for (layer_name, block_ids, block_hashes) in saves {
-            self.save_kv_blocks_from_ipc_inner(
-                instance_id,
-                tp_rank,
-                device_id,
-                &namespace,
-                &layer_name,
-                block_ids,
-                block_hashes,
-            )
-            .await?;
+        warn!(
+            "save_batch start: instance_id={} tp_rank={} device_id={} layers={} blocks={} hashes={}",
+            instance_id, tp_rank, device_id, total_layers, requested_blocks, requested_hashes
+        );
+
+        for (idx, (layer_name, block_ids, block_hashes)) in saves.into_iter().enumerate() {
+            let layer_start = std::time::Instant::now();
+            let layer_requested_blocks = block_ids.len();
+            let layer_requested_hashes = block_hashes.len();
+            let save_result = self
+                .save_kv_blocks_from_ipc_inner(
+                    instance_id,
+                    tp_rank,
+                    device_id,
+                    &namespace,
+                    &layer_name,
+                    block_ids,
+                    block_hashes,
+                )
+                .await;
+            let elapsed_ms = layer_start.elapsed().as_secs_f64() * 1000.0;
+            match save_result {
+                Ok(()) => warn!(
+                    "save_batch layer done: instance_id={} tp_rank={} layer_idx={} layer_name={} requested_blocks={} requested_hashes={} elapsed_ms={:.2}",
+                    instance_id,
+                    tp_rank,
+                    idx,
+                    layer_name,
+                    layer_requested_blocks,
+                    layer_requested_hashes,
+                    elapsed_ms
+                ),
+                Err(err) => {
+                    warn!(
+                        "save_batch layer failed: instance_id={} tp_rank={} layer_idx={} layer_name={} requested_blocks={} requested_hashes={} elapsed_ms={:.2} error={}",
+                        instance_id,
+                        tp_rank,
+                        idx,
+                        layer_name,
+                        layer_requested_blocks,
+                        layer_requested_hashes,
+                        elapsed_ms,
+                        err
+                    );
+                    return Err(err);
+                }
+            }
         }
+
+        warn!(
+            "save_batch completed: instance_id={} tp_rank={} device_id={} layers={} blocks={} hashes={} elapsed_ms={:.2}",
+            instance_id,
+            tp_rank,
+            device_id,
+            total_layers,
+            requested_blocks,
+            requested_hashes,
+            batch_start.elapsed().as_secs_f64() * 1000.0
+        );
         Ok(())
     }
 
@@ -410,6 +464,8 @@ impl PegaEngine {
             )));
         }
 
+        let requested_blocks = block_ids.len();
+        let requested_hashes = block_hashes.len();
         let metrics = core_metrics();
         let timer = std::time::Instant::now();
 
@@ -430,6 +486,7 @@ impl PegaEngine {
         let total_slots = instance.total_slots();
 
         // Filter valid blocks
+        let valid_filter_start = std::time::Instant::now();
         let valid_blocks: Vec<(usize, Vec<u8>)> = block_ids
             .iter()
             .zip(block_hashes.iter())
@@ -443,38 +500,64 @@ impl PegaEngine {
                 }
             })
             .collect();
+        let valid_filter_ms = valid_filter_start.elapsed().as_secs_f64() * 1000.0;
 
         if valid_blocks.is_empty() {
+            warn!(
+                "save_layer skipped: instance_id={} tp_rank={} layer={} requested_blocks={} requested_hashes={} valid_blocks=0 valid_filter_ms={:.2}",
+                instance_id,
+                tp_rank,
+                layer_name,
+                requested_blocks,
+                requested_hashes,
+                valid_filter_ms
+            );
             return Ok(());
         }
 
         // Filter out blocks that already exist
+        let cache_filter_start = std::time::Instant::now();
         let valid_hashes: Vec<Vec<u8>> = valid_blocks.iter().map(|(_, h)| h.clone()).collect();
         let indices_to_save = self
             .storage
             .filter_blocks_to_save(namespace, &valid_hashes, slot_id);
+        let cache_filter_ms = cache_filter_start.elapsed().as_secs_f64() * 1000.0;
 
         if indices_to_save.is_empty() {
+            warn!(
+                "save_layer skipped: instance_id={} tp_rank={} layer={} requested_blocks={} valid_blocks={} to_save=0 valid_filter_ms={:.2} cache_filter_ms={:.2}",
+                instance_id,
+                tp_rank,
+                layer_name,
+                requested_blocks,
+                valid_blocks.len(),
+                valid_filter_ms,
+                cache_filter_ms
+            );
             return Ok(());
         }
 
+        let compact_start = std::time::Instant::now();
         let blocks_to_save: Vec<(usize, Vec<u8>)> = indices_to_save
             .into_iter()
             .map(|i| valid_blocks[i].clone())
             .collect();
+        let compact_ms = compact_start.elapsed().as_secs_f64() * 1000.0;
 
-        debug!(
+        warn!(
             "Saving {} blocks for layer {layer_name} on instance {instance_id} rank {tp_rank}",
             blocks_to_save.len()
         );
 
         let block_size = registration.block_size_bytes;
         let num_blocks = blocks_to_save.len();
+        let save_stage_start = std::time::Instant::now();
 
         // Handle split K/V layout
         if registration.segments == 2 && registration.kv_stride_bytes > registration.bytes_per_block
         {
             self.save_split_blocks(
+                layer_name,
                 namespace,
                 &registration,
                 &blocks_to_save,
@@ -487,6 +570,7 @@ impl PegaEngine {
         } else {
             // Contiguous layout
             self.save_contiguous_blocks(
+                layer_name,
                 namespace,
                 &registration,
                 &blocks_to_save,
@@ -497,6 +581,7 @@ impl PegaEngine {
             )
             .await?;
         }
+        let save_stage_ms = save_stage_start.elapsed().as_secs_f64() * 1000.0;
 
         let elapsed = timer.elapsed().as_secs_f64();
         let total_bytes = (block_size as u64)
@@ -507,6 +592,23 @@ impl PegaEngine {
             metrics.save_bytes.add(total_bytes, &[]);
             metrics.save_duration_seconds.record(elapsed, &[]);
         }
+        warn!(
+            "save_layer completed: instance_id={} tp_rank={} layer={} requested_blocks={} requested_hashes={} valid_blocks={} to_save={} block_size={} total_bytes={} valid_filter_ms={:.2} cache_filter_ms={:.2} compact_ms={:.2} save_stage_ms={:.2} total_ms={:.2}",
+            instance_id,
+            tp_rank,
+            layer_name,
+            requested_blocks,
+            requested_hashes,
+            valid_blocks.len(),
+            num_blocks,
+            block_size,
+            total_bytes,
+            valid_filter_ms,
+            cache_filter_ms,
+            compact_ms,
+            save_stage_ms,
+            elapsed * 1000.0
+        );
         Ok(())
     }
 
@@ -514,6 +616,7 @@ impl PegaEngine {
     #[allow(clippy::too_many_arguments)]
     async fn save_split_blocks(
         &self,
+        layer_name: &str,
         namespace: &str,
         registration: &KVCacheRegistration,
         blocks_to_save: &[(usize, Vec<u8>)],
@@ -522,11 +625,13 @@ impl PegaEngine {
         total_slots: usize,
         gpu: Arc<GpuContext>,
     ) -> Result<(), EngineError> {
+        let timer = std::time::Instant::now();
         let segment_size = registration.bytes_per_block;
         let num_blocks = blocks_to_save.len();
 
         // Allocate separate regions for K and V (NUMA-aware if configured)
         let numa_node = Some(gpu.preferred_numa());
+        let alloc_start = std::time::Instant::now();
 
         let k_total_size = (segment_size as u64)
             .checked_mul(num_blocks as u64)
@@ -552,6 +657,7 @@ impl PegaEngine {
                     "pinned pool exhausted while allocating V segment buffer".to_string(),
                 )
             })?;
+        let alloc_ms = alloc_start.elapsed().as_secs_f64() * 1000.0;
 
         // Get base pointers
         let (k_base, v_base) = {
@@ -565,6 +671,7 @@ impl PegaEngine {
         };
 
         // Build save blocks
+        let build_transfers_start = std::time::Instant::now();
         let save_blocks: Vec<SaveBlock> = blocks_to_save
             .iter()
             .enumerate()
@@ -574,13 +681,17 @@ impl PegaEngine {
                 v_dst_ptr: Some((v_base + i * segment_size) as *mut u8),
             })
             .collect();
+        let build_transfers_ms = build_transfers_start.elapsed().as_secs_f64() * 1000.0;
 
         // Execute GPU->CPU copy
+        let copy_start = std::time::Instant::now();
         gpu.worker_pool()
             .save(registration.clone(), save_blocks)
             .await?;
+        let copy_ms = copy_start.elapsed().as_secs_f64() * 1000.0;
 
         // Batch insert slots and admit to cache (single lock acquisition)
+        let build_blocks_start = std::time::Instant::now();
         let blocks: Vec<(BlockKey, Arc<LayerBlock>)> = blocks_to_save
             .iter()
             .enumerate()
@@ -598,15 +709,34 @@ impl PegaEngine {
                 (key, block)
             })
             .collect();
+        let build_blocks_ms = build_blocks_start.elapsed().as_secs_f64() * 1000.0;
 
+        let insert_start = std::time::Instant::now();
         let sealed_for_ssd = self
             .storage
             .insert_slots_batch(&blocks, slot_id, total_slots)
             .map_err(|e| EngineError::Storage(e.to_string()))?;
+        let insert_ms = insert_start.elapsed().as_secs_f64() * 1000.0;
 
         // Send non-admitted blocks to SSD
+        let ssd_start = std::time::Instant::now();
         self.storage
             .send_ssd_batch(gpu.preferred_numa(), &sealed_for_ssd);
+        let ssd_ms = ssd_start.elapsed().as_secs_f64() * 1000.0;
+
+        warn!(
+            "save_split_blocks: layer={} blocks={} block_size={} alloc_ms={:.2} build_transfers_ms={:.2} copy_ms={:.2} build_blocks_ms={:.2} insert_ms={:.2} ssd_ms={:.2} total_ms={:.2}",
+            layer_name,
+            num_blocks,
+            block_size,
+            alloc_ms,
+            build_transfers_ms,
+            copy_ms,
+            build_blocks_ms,
+            insert_ms,
+            ssd_ms,
+            timer.elapsed().as_secs_f64() * 1000.0
+        );
 
         Ok(())
     }
@@ -615,6 +745,7 @@ impl PegaEngine {
     #[allow(clippy::too_many_arguments)]
     async fn save_contiguous_blocks(
         &self,
+        layer_name: &str,
         namespace: &str,
         registration: &KVCacheRegistration,
         blocks_to_save: &[(usize, Vec<u8>)],
@@ -623,8 +754,10 @@ impl PegaEngine {
         total_slots: usize,
         gpu: Arc<GpuContext>,
     ) -> Result<(), EngineError> {
+        let timer = std::time::Instant::now();
         let num_blocks = blocks_to_save.len();
         let numa_node = Some(gpu.preferred_numa());
+        let alloc_start = std::time::Instant::now();
 
         let total_size = (block_size as u64)
             .checked_mul(num_blocks as u64)
@@ -639,11 +772,13 @@ impl PegaEngine {
                     "pinned pool exhausted while allocating contiguous block buffer".to_string(),
                 )
             })?;
+        let alloc_ms = alloc_start.elapsed().as_secs_f64() * 1000.0;
 
         let base_addr = Arc::get_mut(&mut allocation)
             .ok_or_else(|| EngineError::Storage("allocation shared unexpectedly".to_string()))?
             .as_mut_ptr() as usize;
 
+        let build_transfers_start = std::time::Instant::now();
         let save_blocks: Vec<SaveBlock> = blocks_to_save
             .iter()
             .enumerate()
@@ -653,12 +788,16 @@ impl PegaEngine {
                 v_dst_ptr: None,
             })
             .collect();
+        let build_transfers_ms = build_transfers_start.elapsed().as_secs_f64() * 1000.0;
 
+        let copy_start = std::time::Instant::now();
         gpu.worker_pool()
             .save(registration.clone(), save_blocks)
             .await?;
+        let copy_ms = copy_start.elapsed().as_secs_f64() * 1000.0;
 
         // Batch insert slots and admit to cache (single lock acquisition)
+        let build_blocks_start = std::time::Instant::now();
         let blocks: Vec<(BlockKey, Arc<LayerBlock>)> = blocks_to_save
             .iter()
             .enumerate()
@@ -673,15 +812,34 @@ impl PegaEngine {
                 (key, block)
             })
             .collect();
+        let build_blocks_ms = build_blocks_start.elapsed().as_secs_f64() * 1000.0;
 
+        let insert_start = std::time::Instant::now();
         let sealed_for_ssd = self
             .storage
             .insert_slots_batch(&blocks, slot_id, total_slots)
             .map_err(|e| EngineError::Storage(e.to_string()))?;
+        let insert_ms = insert_start.elapsed().as_secs_f64() * 1000.0;
 
         // Send non-admitted blocks to SSD
+        let ssd_start = std::time::Instant::now();
         self.storage
             .send_ssd_batch(gpu.preferred_numa(), &sealed_for_ssd);
+        let ssd_ms = ssd_start.elapsed().as_secs_f64() * 1000.0;
+
+        warn!(
+            "save_contiguous_blocks: layer={} blocks={} block_size={} alloc_ms={:.2} build_transfers_ms={:.2} copy_ms={:.2} build_blocks_ms={:.2} insert_ms={:.2} ssd_ms={:.2} total_ms={:.2}",
+            layer_name,
+            num_blocks,
+            block_size,
+            alloc_ms,
+            build_transfers_ms,
+            copy_ms,
+            build_blocks_ms,
+            insert_ms,
+            ssd_ms,
+            timer.elapsed().as_secs_f64() * 1000.0
+        );
 
         Ok(())
     }
