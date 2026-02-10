@@ -443,21 +443,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
         info!("PegaEngine gRPC server listening on {}", cli.addr);
 
-        // Read gRPC message size limits from env vars, default to 256 MiB.
-        // tonic does not honour the C-core GRPC_MAX_*_MESSAGE_LENGTH vars,
-        // so we read them ourselves for compatibility.
-        let max_recv = std::env::var("GRPC_MAX_RECEIVE_MESSAGE_LENGTH")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(4 * 1024 * 1024);
-        let max_send = std::env::var("GRPC_MAX_SEND_MESSAGE_LENGTH")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(4 * 1024 * 1024);
+        const MAX_GRPC_MESSAGE_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
 
         let grpc_service = EngineServer::new(service)
-            .max_decoding_message_size(max_recv)
-            .max_encoding_message_size(max_send);
+            .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
+            .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE);
 
         if let Err(err) = Server::builder()
             .add_service(grpc_service)

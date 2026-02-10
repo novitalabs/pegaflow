@@ -274,24 +274,14 @@ impl EngineRpcClient {
             .http2_keep_alive_interval(Duration::from_secs(30))
             .keep_alive_while_idle(true);
 
-        // Read gRPC message size limits from env vars, default to 256 MiB.
-        // tonic does not honour the C-core GRPC_MAX_*_MESSAGE_LENGTH vars,
-        // so we read them ourselves for compatibility.
-        let max_recv = std::env::var("GRPC_MAX_RECEIVE_MESSAGE_LENGTH")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(4 * 1024 * 1024);
-        let max_send = std::env::var("GRPC_MAX_SEND_MESSAGE_LENGTH")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(4 * 1024 * 1024);
+        const MAX_GRPC_MESSAGE_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
 
         let channel = rt
             .block_on(endpoint_cfg.connect())
             .map_err(|err| transport_connect_error(&endpoint, err))?;
         let client = EngineClient::new(channel)
-            .max_decoding_message_size(max_recv)
-            .max_encoding_message_size(max_send);
+            .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
+            .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE);
         let rt_handle = rt.handle().clone();
 
         Ok(Self {
