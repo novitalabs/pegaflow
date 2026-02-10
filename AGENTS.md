@@ -272,3 +272,99 @@ cargo test
 - We use [Commitizen](https://commitizen-tools.github.io/commitizen/) commit message format
 - Do not commit directly to the master branch; create a `feat/`/`fix/`/`chore/`/`style/`/`refactor/`/`ci/`/... branch first
 - Use `cz c` for interactive commit message creation
+
+## Active Project Context (2026-02-06)
+
+### Initiative
+
+Build `pegaflow-transfer` as a Mooncake-compatible RDMA transfer crate for
+`sglang_mooncake_example.py`.
+
+### Phase-1 Scope (Locked)
+
+- API target: Mooncake minimal sync API only.
+- Topology: no auto-discovery, use explicit GPU->NIC mapping.
+- Process model: 1 GPU process = 1 transfer worker = 1 NIC.
+- Memory scope: GPU memory registration only.
+- Completion model: synchronous blocking transfers only.
+
+### Architecture Decisions (Locked)
+
+- Primary RDMA backend is `sideway` in phase-1.
+- Reuse `sideway::ibverbs` for MR/QP/CQ and write primitives.
+- Do not duplicate low-level rdma-cm/verbs wrappers inside `pegaflow-transfer`.
+- `pplx-garden` is reference-only for API shape and async/state-machine ideas;
+  do not copy/vendor its transfer implementation in phase-1.
+- Control-plane direction is `pplx-garden` style:
+  opaque `DomainAddress` + UD handshake + explicit remote MR descriptor exchange.
+- Do **not** keep or fallback to IP/`host:port` session model in phase-1;
+  remove IP-based mode to control implementation complexity.
+- For SGLang Mooncake compatibility adaptation, also **do not fallback** to
+  `host:rpc_port`; session ID must come from transfer engine `get_session_id()`.
+- Integration boundary decision:
+  keep `transfer_engine.py` public method signatures unchanged while swapping
+  the backend implementation to pegaflow-transfer; this is an API-stability
+  requirement, not Mooncake compatibility work.
+
+### Required External API (Phase-1)
+
+1. `initialize(nic_name, rpc_port)`
+2. `get_rpc_port()` / `get_session_id()`
+3. `register_memory(ptr, len)`
+4. `unregister_memory(ptr)`
+5. `batch_register_memory(ptrs, lens)`
+6. `batch_unregister_memory(ptrs)`
+7. `transfer_sync_write(session_id, local_ptr, remote_ptr, len)`
+8. `batch_transfer_sync_write(session_id, local_ptrs, remote_ptrs, lens)`
+
+### Progress Snapshot (2026-02-07)
+
+- Branch: `feat/pegaflow-transfer-sideway-rdma`
+- Pushed commits (latest first):
+  - `b8380af` `test(transfer): add warmup and steady-state throughput stats`
+  - `5656ccc` `test(transfer): scale rdma gpu it to 1g default`
+  - `05dfbc4` `refactor(transfer): remove rdma backend trait indirection`
+  - `d215e11` `refactor(transfer): use typed domain address for sessions`
+  - `8ed854f` `refactor(transfer): simplify init api and add key-path logging`
+  - `4249a6e` `fix(transfer): create ud qp with qp_ex for domainaddress control`
+  - `9924ac2` `feat(transfer): switch to domainaddress ud control plane`
+  - `e577b20` `feat(transfer): bootstrap sideway backend and rdma gpu integration test`
+- Implemented:
+  - Removed IP/`host:port` control path; phase-1 uses `DomainAddress`-only control plane.
+  - `DomainAddress` moved to typed bytes model with focused APIs (`to_bytes` / `from_bytes`) and clearer `Debug`/`Display`.
+  - Removed `RdmaBackend` trait indirection; `MooncakeTransferEngine` directly uses `SidewayBackend`.
+  - Control-plane messages in UD: `ConnectReq/Resp`, `MrQueryReq/Resp`.
+  - Data-plane remains sync RC `RDMA write`.
+- API simplification completed:
+  - Removed `protocol` parameter from `pegaflow-transfer` core API.
+  - Removed `local_addr`/worker-name style parameter from `pegaflow-transfer` core API.
+  - `get_session_id()` now returns `DomainAddress` directly (no `Result`).
+  - Keep compatibility work for protocol/local_addr at pybind layer only.
+  - Compatibility rule: no fallback to `host:rpc_port` session format in adapter layers.
+  - Keep `transfer_engine.py` external API unchanged; only internal backend/session semantics are replaced.
+- Python bridge (in progress, local working copy):
+  - Added PyO3 `TransferEngine` class in `python/src/lib.rs`, backed by `pegaflow-transfer::MooncakeTransferEngine`.
+  - All blocking transfer APIs in pybind run under `py.detach(...)` (release GIL).
+  - Added `python/pegaflow/sglang/transfer_engine.py` adapter that keeps `MooncakeTransferEngine` public methods unchanged.
+  - Adapter session id uses engine `DomainAddress` bytes encoded as URL-safe base64 string (ASCII-safe for existing control-plane message paths).
+- Logging integration completed:
+  - Added `pegaflow-transfer` local logging init (`logforth`) with env filter support.
+  - Added key-path logs for runtime init, control-plane flow, session setup, MR query, and sync write.
+- Validation status:
+  - Local: `cargo test -p pegaflow-transfer` passed.
+  - RDMA host: `cargo test -p pegaflow-transfer --test rdma_gpu_it -- --ignored --nocapture` passed.
+- Current IT runtime env:
+  - required: `PEGAFLOW_TRANSFER_IT_NIC`
+  - optional: `PEGAFLOW_TRANSFER_IT_BASE_PORT` (default `56050`)
+  - optional: `PEGAFLOW_TRANSFER_IT_BYTES` (default `1GiB`)
+  - optional: `PEGAFLOW_TRANSFER_IT_WARMUP` (default `1`)
+  - optional: `PEGAFLOW_TRANSFER_IT_ITERS` (default `20`)
+- Latest measured steady-state example (single host, 400Gb IB):
+  - config: `bytes=1GiB warmup=1 measured_iters=20`
+  - result: `avg_gbps=377.3`, `p50_lat_ms=22.740`, `p95_lat_ms=22.842`
+
+### Deferred Optimization Notes
+
+- Keep current sync path unchanged for phase-1.
+- Revisit fragmented-transfer optimization later:
+  use WR-chain batched `ibv_post_send` for multi-WR submissions (similar to pplx-garden pattern), while preserving phase-1 external sync API semantics.

@@ -1,0 +1,19 @@
+[package]
+name = "pegaflow-transfer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+parking_lot.workspace = true
+sideway.workspace = true
+rdma-mummy-sys = "0.2.2"
+log.workspace = true
+logforth.workspace = true
+thiserror = "2.0"
+bytes = "1"
+serde.workspace = true
+bincode = { version = "2.0.1", features = ["serde"] }
+lz4_flex = "0.11"
+
+[dev-dependencies]
+cudarc.workspace = true

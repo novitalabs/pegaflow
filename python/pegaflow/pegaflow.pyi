@@ -125,6 +125,70 @@ class PegaEngine:
         """
         ...
 
+class TransferEngine:
+    """RDMA transfer engine used by SGLang transfer adapter."""
+
+    def __init__(self) -> None:
+        ...
+
+    def initialize(
+        self,
+        local_hostname: str,
+        metadata_server: str,
+        protocol: str,
+        device_name: str,
+    ) -> int:
+        """Initialize transfer runtime.
+
+        Notes:
+            local_hostname must include a non-zero port
+            (for example, "10.0.0.1:56050" or "[::1]:56050").
+
+        Returns:
+            0 on success, -1 on failure.
+        """
+        ...
+
+    def get_rpc_port(self) -> int:
+        """Return local control-plane RPC port, -1 on failure."""
+        ...
+
+    def get_session_id(self) -> bytes:
+        """Return opaque DomainAddress bytes for this worker."""
+        ...
+
+    def register_memory(self, ptr: int, len: int) -> int:
+        """Register one local memory region. Returns 0 on success."""
+        ...
+
+    def unregister_memory(self, ptr: int) -> int:
+        """Unregister one local memory region. Returns 0 on success."""
+        ...
+
+    def batch_register_memory(self, ptrs: list[int], lens: list[int]) -> int:
+        """Batch register memory regions. Returns 0 on success."""
+        ...
+
+    def transfer_sync_write(
+        self,
+        session_id: bytes,
+        local_ptr: int,
+        remote_ptr: int,
+        len: int,
+    ) -> int:
+        """RDMA write to remote memory, returns transferred bytes or -1."""
+        ...
+
+    def batch_transfer_sync_write(
+        self,
+        session_id: bytes,
+        local_ptrs: list[int],
+        remote_ptrs: list[int],
+        lens: list[int],
+    ) -> int:
+        """Batch RDMA write, returns transferred bytes or -1."""
+        ...
+
 class EngineRpcClient:
     """gRPC client for remote PegaEngine server communication.
 
