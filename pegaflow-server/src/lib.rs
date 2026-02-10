@@ -443,8 +443,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
         info!("PegaEngine gRPC server listening on {}", cli.addr);
 
+        const MAX_GRPC_MESSAGE_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
+
+        let grpc_service = EngineServer::new(service)
+            .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
+            .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE);
+
         if let Err(err) = Server::builder()
-            .add_service(EngineServer::new(service))
+            .add_service(grpc_service)
             .serve_with_shutdown(cli.addr, shutdown_signal)
             .await
         {

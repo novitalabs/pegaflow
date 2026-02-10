@@ -274,10 +274,14 @@ impl EngineRpcClient {
             .http2_keep_alive_interval(Duration::from_secs(30))
             .keep_alive_while_idle(true);
 
+        const MAX_GRPC_MESSAGE_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
+
         let channel = rt
             .block_on(endpoint_cfg.connect())
             .map_err(|err| transport_connect_error(&endpoint, err))?;
-        let client = EngineClient::new(channel);
+        let client = EngineClient::new(channel)
+            .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
+            .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE);
         let rt_handle = rt.handle().clone();
 
         Ok(Self {
