@@ -254,30 +254,25 @@ impl InflightBlock {
             .is_some()
     }
 
-    /// Insert a slot. Returns Ok(true) if block is now complete.
-    pub fn insert_slot(
-        &mut self,
-        slot_id: usize,
-        block: Arc<LayerBlock>,
-        total_slots: usize,
-    ) -> Result<bool, BlockInsertError> {
-        if total_slots != self.total_slots {
-            return Err(BlockInsertError::SlotCountMismatch {
-                expected: self.total_slots,
-                got: total_slots,
-            });
-        }
-
-        if slot_id >= self.total_slots {
-            return Err(BlockInsertError::SlotOutOfBounds {
-                slot_id,
-                total_slots: self.total_slots,
-            });
-        }
+    /// Fast path for save hot path.
+    ///
+    /// Preconditions are expected to be validated by caller:
+    /// - `slot_id < self.total_slots`
+    /// - `total_slots` consistency was checked where the inflight block is looked up
+    ///
+    /// Returns:
+    /// - `None` if the slot is already filled (no-op)
+    /// - `Some(completed)` if this call inserted a slot
+    pub fn try_insert_slot_fast(&mut self, slot_id: usize, block: Arc<LayerBlock>) -> Option<bool> {
+        debug_assert!(
+            slot_id < self.total_slots,
+            "slot_id {} must be < total_slots {}",
+            slot_id,
+            self.total_slots
+        );
 
         if self.slots[slot_id].is_some() {
-            // Already filled - this is a no-op, not an error
-            return Ok(false);
+            return None;
         }
 
         self.footprint += block.memory_footprint();
@@ -286,7 +281,7 @@ impl InflightBlock {
             .remaining
             .checked_sub(1)
             .expect("remaining should not underflow");
-        Ok(self.remaining == 0)
+        Some(self.remaining == 0)
     }
 
     /// Seal the block, converting to immutable SealedBlock.
