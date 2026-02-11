@@ -547,7 +547,6 @@ class PeagflowRadixCache(RadixCache):
         )
 
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:  # type: ignore[override]
-        prepare_start = time.perf_counter()
         super().cache_finished_req(req, is_insert=is_insert)
         if not is_insert:
             return
@@ -567,20 +566,14 @@ class PeagflowRadixCache(RadixCache):
 
         block_size = self.page_size
 
-        hash_start = time.perf_counter()
         block_hashes, _ = _hash_pages(token_ids, block_size, extra_key=req.extra_key)
-        hash_ms = (time.perf_counter() - hash_start) * 1000.0
-
-        block_id_start = time.perf_counter()
         block_ids: list[int] = []
         for i in range(0, kv_committed_len, block_size):
             block_ids.append(int(kv_indices[i].item()) // block_size)
-        block_id_ms = (time.perf_counter() - block_id_start) * 1000.0
 
         # Ensure GPU writes are done before save
         # torch.cuda.synchronize()
 
-        build_start = time.perf_counter()
         saves = list(
             zip(
                 self._layer_names,
@@ -589,58 +582,28 @@ class PeagflowRadixCache(RadixCache):
                 strict=True,
             )
         )
-        build_ms = (time.perf_counter() - build_start) * 1000.0
 
-        enqueue_start = time.perf_counter()
-        self._save_async(saves)
-        enqueue_ms = (time.perf_counter() - enqueue_start) * 1000.0
-
-        total_ms = (time.perf_counter() - prepare_start) * 1000.0
-        logger.warning(
-            "[PeagflowRadixCache] save-prepare req=%s kv_tokens=%d blocks=%d layers=%d "
-            "hash_ms=%.2f block_id_ms=%.2f build_ms=%.2f enqueue_ms=%.2f total_ms=%.2f",
-            getattr(req, "request_id", None),
-            kv_committed_len,
-            len(block_ids),
-            len(saves),
-            hash_ms,
-            block_id_ms,
-            build_ms,
-            enqueue_ms,
-            total_ms,
+        logger.debug(
+            f"[PeagflowRadixCache] save req={getattr(req, 'request_id', None)} blocks={len(block_ids)} layers={len(saves)}"
         )
 
-    def _save_async(self, saves):
-        wait_start = time.perf_counter()
-        with self._evict_lock:
-            lock_wait_ms = (time.perf_counter() - wait_start) * 1000.0
-            put_start = time.perf_counter()
-            self.save_tasks.put(saves)
-            put_ms = (time.perf_counter() - put_start) * 1000.0
-            queue_depth = self.save_tasks.qsize()
+        self._save_async(saves)
 
-        if lock_wait_ms > 10.0:
-            logger.warning(
-                "[PeagflowRadixCache] save enqueue contention lock_wait_ms=%.2f put_ms=%.2f queue_depth=%d",
-                lock_wait_ms,
-                put_ms,
-                queue_depth,
-            )
+    def _save_async(self, saves):
+        with self._evict_lock:
+            self.save_tasks.put(saves)
 
     def _save_worker(self):
         while not self._shutdown.is_set():
             try:
                 # Get first item with timeout to check shutdown flag
                 try:
-                    recv_start = time.perf_counter()
                     saves = self.save_tasks.get(timeout=0.1)
                 except queue.Empty:
                     continue
-                first_get_ms = (time.perf_counter() - recv_start) * 1000.0
                 task_count = 1
 
                 # Drain all pending items from queue
-                drain_start = time.perf_counter()
                 while True:
                     try:
                         more_saves = self.save_tasks.get_nowait()
@@ -648,12 +611,6 @@ class PeagflowRadixCache(RadixCache):
                         task_count += 1
                     except queue.Empty:
                         break
-                drain_ms = (time.perf_counter() - drain_start) * 1000.0
-
-                total_layers = len(saves)
-                total_blocks = sum(len(layer_blocks) for _, layer_blocks, _ in saves)
-                total_hashes = sum(len(layer_hashes) for _, _, layer_hashes in saves)
-                rpc_start = time.perf_counter()
 
                 try:
                     ok, message = self.engine_client.save(
@@ -661,19 +618,6 @@ class PeagflowRadixCache(RadixCache):
                         0 if self.is_mla else self.tp_rank,
                         self.device_id,
                         saves,
-                    )
-                    rpc_ms = (time.perf_counter() - rpc_start) * 1000.0
-                    logger.warning(
-                        "[PeagflowRadixCache] save-rpc batch_tasks=%d layers=%d blocks=%d hashes=%d "
-                        "first_get_ms=%.2f drain_ms=%.2f rpc_ms=%.2f queue_depth=%d",
-                        task_count,
-                        total_layers,
-                        total_blocks,
-                        total_hashes,
-                        first_get_ms,
-                        drain_ms,
-                        rpc_ms,
-                        self.save_tasks.qsize(),
                     )
                     if not ok:
                         logger.warning("[PeagflowRadixCache] save failed: %s", message)
