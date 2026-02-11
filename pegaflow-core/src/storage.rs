@@ -508,32 +508,28 @@ impl StorageEngine {
     pub fn filter_blocks_to_save(
         &self,
         namespace: &str,
-        block_hashes: &[Vec<u8>],
+        valid_blocks: &[(usize, Vec<u8>)],
         slot_id: usize,
     ) -> Vec<usize> {
-        let keys: Vec<BlockKey> = block_hashes
-            .iter()
-            .map(|hash| BlockKey::new(namespace.to_string(), hash.clone()))
-            .collect();
-
+        let namespace = namespace.to_string();
         let mut inner = self.inner.lock();
-        keys.into_iter()
-            .enumerate()
-            .filter(|(_, key)| {
-                // Skip if already sealed in cache
-                if inner.cache.get(key).is_some() {
-                    return false;
-                }
-                // Skip if slot already exists in inflight
-                if let Some(block) = inner.inflight.get(key)
-                    && block.slot_exists(slot_id)
-                {
-                    return false;
-                }
-                true
-            })
-            .map(|(i, _)| i)
-            .collect()
+        let mut indices_to_save = Vec::with_capacity(valid_blocks.len());
+
+        for (i, (_, hash)) in valid_blocks.iter().enumerate() {
+            let key = BlockKey::new(namespace.clone(), hash.clone());
+            // Skip if already sealed in cache
+            if inner.cache.get(&key).is_some() {
+                continue;
+            }
+            // Skip if slot already exists in inflight
+            if let Some(block) = inner.inflight.get(&key)
+                && block.slot_exists(slot_id)
+            {
+                continue;
+            }
+            indices_to_save.push(i);
+        }
+        indices_to_save
     }
 
     /// Batch insert slots and admit sealed blocks in a single lock acquisition.
@@ -544,12 +540,22 @@ impl StorageEngine {
         slot_id: usize,
         total_slots: usize,
     ) -> Result<Vec<(BlockKey, Arc<SealedBlock>)>, BlockInsertError> {
+        if slot_id >= total_slots {
+            return Err(BlockInsertError::SlotOutOfBounds {
+                slot_id,
+                total_slots,
+            });
+        }
+
         let mut inner = self.inner.lock();
         let mut sealed_blocks: Vec<(BlockKey, Arc<SealedBlock>)> = Vec::new();
+        let mut inflight_bytes_added: u64 = 0;
+        let mut inflight_bytes_removed: u64 = 0;
+        let mut cache_insertions: u64 = 0;
+        let mut cache_inserted_bytes: u64 = 0;
+        let mut cache_rejections: u64 = 0;
 
         for (key, block) in blocks {
-            let footprint_bytes = block.memory_footprint();
-
             // Skip if already sealed in cache
             if inner.cache.contains_key(key) {
                 continue;
@@ -558,33 +564,42 @@ impl StorageEngine {
             // Get or create inflight block
             let inflight_block = match inner.inflight.entry(key.clone()) {
                 Entry::Vacant(v) => v.insert(InflightBlock::new(total_slots)),
-                Entry::Occupied(o) => o.into_mut(),
+                Entry::Occupied(o) => {
+                    let inflight_block = o.into_mut();
+                    if inflight_block.total_slots() != total_slots {
+                        return Err(BlockInsertError::SlotCountMismatch {
+                            expected: inflight_block.total_slots(),
+                            got: total_slots,
+                        });
+                    }
+                    inflight_block
+                }
             };
 
-            // Skip if slot already exists
-            if inflight_block.slot_exists(slot_id) {
+            // Insert slot (fast path, assumes slot and topology were validated earlier)
+            let Some(completed) = inflight_block.try_insert_slot_fast(slot_id, Arc::clone(block))
+            else {
                 continue;
-            }
-
-            // Insert slot
-            let completed = inflight_block.insert_slot(slot_id, Arc::clone(block), total_slots)?;
-            record_inflight_bytes_added(footprint_bytes);
+            };
+            let footprint_bytes = block.memory_footprint();
+            inflight_bytes_added = inflight_bytes_added.saturating_add(footprint_bytes);
 
             if completed {
                 // Remove from inflight and seal
                 let inflight_block = inner.inflight.remove(key).expect("just checked");
                 let total_footprint = inflight_block.footprint();
-                record_inflight_bytes_removed(total_footprint);
+                inflight_bytes_removed = inflight_bytes_removed.saturating_add(total_footprint);
                 let sealed = Arc::new(inflight_block.seal());
 
                 // Try to admit to cache
                 match inner.cache.insert(key.clone(), Arc::clone(&sealed)) {
                     CacheInsertOutcome::InsertedNew => {
-                        record_cache_insert_new(total_footprint);
+                        cache_insertions = cache_insertions.saturating_add(1);
+                        cache_inserted_bytes = cache_inserted_bytes.saturating_add(total_footprint);
                     }
                     CacheInsertOutcome::AlreadyExists => {}
                     CacheInsertOutcome::Rejected => {
-                        core_metrics().cache_block_admission_rejections.add(1, &[]);
+                        cache_rejections = cache_rejections.saturating_add(1);
                     }
                 }
 
@@ -593,8 +608,175 @@ impl StorageEngine {
         }
 
         drop(inner);
+        if inflight_bytes_added > 0 {
+            record_inflight_bytes_added(inflight_bytes_added);
+        }
+        if inflight_bytes_removed > 0 {
+            record_inflight_bytes_removed(inflight_bytes_removed);
+        }
+        if cache_insertions > 0 || cache_inserted_bytes > 0 {
+            let m = core_metrics();
+            if cache_insertions > 0 {
+                m.cache_block_insertions.add(cache_insertions, &[]);
+            }
+            if let Ok(v) = i64::try_from(cache_inserted_bytes) {
+                m.cache_resident_bytes.add(v, &[]);
+            }
+        }
+        if cache_rejections > 0 {
+            core_metrics()
+                .cache_block_admission_rejections
+                .add(cache_rejections, &[]);
+        }
 
         // Notify all sealed blocks
+        if let Some(tx) = &self.seal_notify_tx {
+            for (key, block) in &sealed_blocks {
+                let _ = tx.send((key.clone(), Arc::downgrade(block)));
+            }
+        }
+
+        Ok(sealed_blocks)
+    }
+
+    /// Filter hashes that are NOT already sealed in cache.
+    ///
+    /// Returns indices of hashes that need saving. Since cache membership is
+    /// hash-based (not layer-specific), this only needs to be called once for
+    /// all layers sharing the same hash set.
+    pub fn filter_hashes_not_in_cache(&self, namespace: &str, hashes: &[Vec<u8>]) -> Vec<usize> {
+        let namespace = namespace.to_string();
+        let mut inner = self.inner.lock();
+        let mut indices = Vec::with_capacity(hashes.len());
+        for (i, hash) in hashes.iter().enumerate() {
+            let key = BlockKey::new(namespace.clone(), hash.clone());
+            if inner.cache.get(&key).is_none() {
+                indices.push(i);
+            }
+        }
+        indices
+    }
+
+    /// Hash-first batch insert: iterate by unique hash (outer), layers (inner).
+    ///
+    /// For N unique hashes and L layers, this does N cache lookups + N inflight
+    /// entries + N×L slot inserts, instead of the N×L of everything that
+    /// layer-first iteration requires.
+    ///
+    /// `keys`: pre-built BlockKeys, one per unique hash (len = num_hashes)
+    /// `layer_slot_ids`: slot_id for each layer (len = num_layers)
+    /// `layer_blocks`: layer_blocks[layer_idx][hash_idx] = Arc<LayerBlock>
+    /// `total_slots`: total slot count for InflightBlock creation
+    pub fn insert_slots_hash_first(
+        &self,
+        keys: &[BlockKey],
+        layer_slot_ids: &[usize],
+        layer_blocks: &[Vec<Arc<LayerBlock>>],
+        total_slots: usize,
+    ) -> Result<Vec<(BlockKey, Arc<SealedBlock>)>, BlockInsertError> {
+        let num_hashes = keys.len();
+        let num_layers = layer_slot_ids.len();
+
+        for &slot_id in layer_slot_ids {
+            if slot_id >= total_slots {
+                return Err(BlockInsertError::SlotOutOfBounds {
+                    slot_id,
+                    total_slots,
+                });
+            }
+        }
+
+        let mut inner = self.inner.lock();
+        let mut sealed_blocks: Vec<(BlockKey, Arc<SealedBlock>)> = Vec::new();
+        let mut inflight_bytes_added: u64 = 0;
+        let mut inflight_bytes_removed: u64 = 0;
+        let mut cache_insertions: u64 = 0;
+        let mut cache_inserted_bytes: u64 = 0;
+        let mut cache_rejections: u64 = 0;
+
+        for hash_idx in 0..num_hashes {
+            let key = &keys[hash_idx];
+
+            // 1 cache lookup per unique hash (not per layer)
+            if inner.cache.contains_key(key) {
+                continue;
+            }
+
+            // 1 inflight entry per unique hash
+            let inflight_block = match inner.inflight.entry(key.clone()) {
+                Entry::Vacant(v) => v.insert(InflightBlock::new(total_slots)),
+                Entry::Occupied(o) => {
+                    let inflight_block = o.into_mut();
+                    if inflight_block.total_slots() != total_slots {
+                        return Err(BlockInsertError::SlotCountMismatch {
+                            expected: inflight_block.total_slots(),
+                            got: total_slots,
+                        });
+                    }
+                    inflight_block
+                }
+            };
+
+            // Insert all layers' slots for this hash
+            for layer_idx in 0..num_layers {
+                let slot_id = layer_slot_ids[layer_idx];
+                let block = &layer_blocks[layer_idx][hash_idx];
+
+                let Some(completed) =
+                    inflight_block.try_insert_slot_fast(slot_id, Arc::clone(block))
+                else {
+                    continue;
+                };
+                let footprint_bytes = block.memory_footprint();
+                inflight_bytes_added = inflight_bytes_added.saturating_add(footprint_bytes);
+
+                if completed {
+                    let inflight_block = inner.inflight.remove(key).expect("just checked");
+                    let total_footprint = inflight_block.footprint();
+                    inflight_bytes_removed = inflight_bytes_removed.saturating_add(total_footprint);
+                    let sealed = Arc::new(inflight_block.seal());
+
+                    match inner.cache.insert(key.clone(), Arc::clone(&sealed)) {
+                        CacheInsertOutcome::InsertedNew => {
+                            cache_insertions = cache_insertions.saturating_add(1);
+                            cache_inserted_bytes =
+                                cache_inserted_bytes.saturating_add(total_footprint);
+                        }
+                        CacheInsertOutcome::AlreadyExists => {}
+                        CacheInsertOutcome::Rejected => {
+                            cache_rejections = cache_rejections.saturating_add(1);
+                        }
+                    }
+
+                    sealed_blocks.push((key.clone(), sealed));
+                    // Block is now sealed, no more slots to insert
+                    break;
+                }
+            }
+        }
+
+        drop(inner);
+        if inflight_bytes_added > 0 {
+            record_inflight_bytes_added(inflight_bytes_added);
+        }
+        if inflight_bytes_removed > 0 {
+            record_inflight_bytes_removed(inflight_bytes_removed);
+        }
+        if cache_insertions > 0 || cache_inserted_bytes > 0 {
+            let m = core_metrics();
+            if cache_insertions > 0 {
+                m.cache_block_insertions.add(cache_insertions, &[]);
+            }
+            if let Ok(v) = i64::try_from(cache_inserted_bytes) {
+                m.cache_resident_bytes.add(v, &[]);
+            }
+        }
+        if cache_rejections > 0 {
+            core_metrics()
+                .cache_block_admission_rejections
+                .add(cache_rejections, &[]);
+        }
+
         if let Some(tx) = &self.seal_notify_tx {
             for (key, block) in &sealed_blocks {
                 let _ = tx.send((key.clone(), Arc::downgrade(block)));
