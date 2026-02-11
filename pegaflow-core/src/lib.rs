@@ -457,50 +457,48 @@ impl PegaEngine {
             return Ok(());
         }
 
-        // ── Phase 1: Filter all layers (single lock acquisition) ──
+        // ── Phase 1: Filter hashes once (all layers share the same hash set) ──
 
         let phase1_start = std::time::Instant::now();
-        let filter_input: Vec<(&[(usize, Vec<u8>)], usize)> = layer_metas
+        // Use the first layer's hashes — they're the same across all layers
+        let all_hashes: Vec<&Vec<u8>> = layer_metas[0]
+            .valid_blocks
             .iter()
-            .map(|m| (m.valid_blocks.as_slice(), m.slot_id))
+            .map(|(_, hash)| hash)
             .collect();
-
-        let all_indices = self
-            .storage
-            .filter_blocks_to_save_multi_layer(&namespace, &filter_input);
+        let indices_to_save = self.storage.filter_hashes_not_in_cache(
+            &namespace,
+            &all_hashes.iter().map(|h| (*h).clone()).collect::<Vec<_>>(),
+        );
         let phase1_ms = phase1_start.elapsed().as_secs_f64() * 1000.0;
 
-        // Build blocks_to_save per layer
-        struct LayerSavePrep {
-            meta_idx: usize,
-            blocks_to_save: Vec<(usize, Vec<u8>)>,
-        }
-
-        let mut layers_to_save: Vec<LayerSavePrep> = Vec::new();
-        let mut total_blocks_to_save = 0usize;
-
-        for (meta_idx, indices) in all_indices.into_iter().enumerate() {
-            if indices.is_empty() {
-                continue;
-            }
-            let meta = &layer_metas[meta_idx];
-            let blocks_to_save: Vec<(usize, Vec<u8>)> = indices
-                .into_iter()
-                .map(|i| meta.valid_blocks[i].clone())
-                .collect();
-            total_blocks_to_save += blocks_to_save.len();
-            layers_to_save.push(LayerSavePrep {
-                meta_idx,
-                blocks_to_save,
-            });
-        }
-
-        if layers_to_save.is_empty() {
+        if indices_to_save.is_empty() {
             warn!(
                 "save_batch skipped (all cached): instance_id={} tp_rank={} device_id={} layers={} phase0_ms={:.2} phase1_ms={:.2}",
                 instance_id, tp_rank, device_id, total_layers, phase0_ms, phase1_ms
             );
             return Ok(());
+        }
+
+        // Build blocks_to_save per layer (same indices for all layers)
+        struct LayerSavePrep {
+            meta_idx: usize,
+            blocks_to_save: Vec<(usize, Vec<u8>)>,
+        }
+
+        let num_blocks_to_save = indices_to_save.len();
+        let total_blocks_to_save = num_blocks_to_save * layer_metas.len();
+        let mut layers_to_save: Vec<LayerSavePrep> = Vec::with_capacity(layer_metas.len());
+
+        for (meta_idx, meta) in layer_metas.iter().enumerate() {
+            let blocks_to_save: Vec<(usize, Vec<u8>)> = indices_to_save
+                .iter()
+                .map(|&i| meta.valid_blocks[i].clone())
+                .collect();
+            layers_to_save.push(LayerSavePrep {
+                meta_idx,
+                blocks_to_save,
+            });
         }
 
         // ── Phase 2: Allocate pinned memory + build SaveBlocks for all layers ──
@@ -637,20 +635,33 @@ impl PegaEngine {
         gpu.worker_pool().batch_save(gpu_save_layers).await?;
         let phase3_ms = phase3_start.elapsed().as_secs_f64() * 1000.0;
 
-        // ── Phase 4: Build LayerBlocks + batch insert (single lock acquisition) ──
+        // ── Phase 4: Build LayerBlocks + hash-first insert (single lock) ──
 
         let phase4_start = std::time::Instant::now();
         let metrics = core_metrics();
 
-        // Build all LayerBlocks
-        let mut insert_layers: Vec<(Vec<(BlockKey, Arc<LayerBlock>)>, usize, usize)> =
+        // Build BlockKeys once per unique hash (1,563 keys, not 287,592)
+        let keys: Vec<BlockKey> = layers_to_save[0]
+            .blocks_to_save
+            .iter()
+            .map(|(_, block_hash)| BlockKey::new(namespace.clone(), block_hash.clone()))
+            .collect();
+
+        // Collect slot_ids for all layers
+        let layer_slot_ids: Vec<usize> = layers_to_save
+            .iter()
+            .map(|prep| layer_metas[prep.meta_idx].slot_id)
+            .collect();
+
+        // Build LayerBlocks per layer: layer_blocks[layer_idx][hash_idx]
+        let mut layer_blocks: Vec<Vec<Arc<LayerBlock>>> =
             Vec::with_capacity(layers_to_save.len());
 
         for (layer_idx, prep) in layers_to_save.iter().enumerate() {
             let meta = &layer_metas[prep.meta_idx];
             let alloc = &layer_allocs[layer_idx];
 
-            let blocks: Vec<(BlockKey, Arc<LayerBlock>)> = match alloc {
+            let blocks: Vec<Arc<LayerBlock>> = match alloc {
                 LayerAlloc::Split {
                     k_allocation,
                     v_allocation,
@@ -661,18 +672,16 @@ impl PegaEngine {
                     .blocks_to_save
                     .iter()
                     .enumerate()
-                    .map(|(i, (_, block_hash))| {
+                    .map(|(i, _)| {
                         let k_ptr = (k_base + i * segment_size) as *mut u8;
                         let v_ptr = (v_base + i * segment_size) as *mut u8;
-                        let key = BlockKey::new(namespace.to_string(), block_hash.clone());
-                        let block = Arc::new(LayerBlock::new_split(
+                        Arc::new(LayerBlock::new_split(
                             k_ptr,
                             v_ptr,
                             meta.block_size,
                             Arc::clone(k_allocation),
                             Arc::clone(v_allocation),
-                        ));
-                        (key, block)
+                        ))
                     })
                     .collect(),
                 LayerAlloc::Contiguous {
@@ -682,33 +691,24 @@ impl PegaEngine {
                     .blocks_to_save
                     .iter()
                     .enumerate()
-                    .map(|(i, (_, block_hash))| {
+                    .map(|(i, _)| {
                         let cpu_ptr = (base_addr + i * meta.block_size) as *mut u8;
-                        let key = BlockKey::new(namespace.to_string(), block_hash.clone());
-                        let block = Arc::new(LayerBlock::new_contiguous(
+                        Arc::new(LayerBlock::new_contiguous(
                             cpu_ptr,
                             meta.block_size,
                             Arc::clone(allocation),
-                        ));
-                        (key, block)
+                        ))
                     })
                     .collect(),
             };
 
-            insert_layers.push((blocks, meta.slot_id, total_slots));
+            layer_blocks.push(blocks);
         }
 
-        // Batch insert across all layers (single lock)
-        let insert_input: Vec<(&[(BlockKey, Arc<LayerBlock>)], usize, usize)> = insert_layers
-            .iter()
-            .map(|(blocks, slot_id, total_slots)| {
-                (blocks.as_slice(), *slot_id, *total_slots)
-            })
-            .collect();
-
+        // Hash-first insert: 1,563 HashMap ops instead of 287,592
         let all_sealed = self
             .storage
-            .insert_slots_batch_multi_layer(&insert_input)
+            .insert_slots_hash_first(&keys, &layer_slot_ids, &layer_blocks, total_slots)
             .map_err(|e| EngineError::Storage(e.to_string()))?;
 
         // SSD offload
