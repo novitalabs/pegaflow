@@ -644,11 +644,7 @@ impl StorageEngine {
     /// Returns indices of hashes that need saving. Since cache membership is
     /// hash-based (not layer-specific), this only needs to be called once for
     /// all layers sharing the same hash set.
-    pub fn filter_hashes_not_in_cache(
-        &self,
-        namespace: &str,
-        hashes: &[Vec<u8>],
-    ) -> Vec<usize> {
+    pub fn filter_hashes_not_in_cache(&self, namespace: &str, hashes: &[Vec<u8>]) -> Vec<usize> {
         let namespace = namespace.to_string();
         let mut inner = self.inner.lock();
         let mut indices = Vec::with_capacity(hashes.len());
@@ -737,8 +733,7 @@ impl StorageEngine {
                 if completed {
                     let inflight_block = inner.inflight.remove(key).expect("just checked");
                     let total_footprint = inflight_block.footprint();
-                    inflight_bytes_removed =
-                        inflight_bytes_removed.saturating_add(total_footprint);
+                    inflight_bytes_removed = inflight_bytes_removed.saturating_add(total_footprint);
                     let sealed = Arc::new(inflight_block.seal());
 
                     match inner.cache.insert(key.clone(), Arc::clone(&sealed)) {

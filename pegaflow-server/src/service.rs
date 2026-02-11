@@ -224,7 +224,7 @@ impl Engine for GrpcEngineService {
                 .collect();
             let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
 
-            warn!(
+            info!(
                 "RPC [save]: instance_id={} tp_rank={} device_id={} layers={} blocks={} hashes={} max_blocks_per_layer={} decode_ms={:.2}",
                 instance_id,
                 tp_rank,
@@ -243,7 +243,7 @@ impl Engine for GrpcEngineService {
                 .map_err(Self::map_engine_error)?;
             let engine_ms = engine_start.elapsed().as_secs_f64() * 1000.0;
 
-            warn!(
+            debug!(
                 "RPC [save] engine completed: instance_id={} tp_rank={} layers={} blocks={} hashes={} engine_ms={:.2}",
                 instance_id, tp_rank, layer_count, total_blocks, total_hashes, engine_ms
             );
@@ -259,7 +259,7 @@ impl Engine for GrpcEngineService {
 
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         match &result {
-            Ok(_) => warn!(
+            Ok(_) => info!(
                 "RPC [save] completed: ok layers={} blocks={} hashes={} elapsed_ms={:.2}",
                 layer_count, total_blocks, total_hashes, elapsed_ms
             ),

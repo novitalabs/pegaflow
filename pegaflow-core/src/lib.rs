@@ -64,7 +64,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use log::{debug, info, warn};
+use log::{debug, info};
 
 use crate::gpu_worker::{LayerLoadData, LoadBlock, LoadTask, SaveBlock, SaveLayerData};
 use crate::metrics::core_metrics;
@@ -360,7 +360,7 @@ impl PegaEngine {
         let namespace = instance.namespace().to_string();
         let total_slots = instance.total_slots();
 
-        warn!(
+        debug!(
             "save_batch start: instance_id={} tp_rank={} device_id={} layers={} blocks={} hashes={}",
             instance_id, tp_rank, device_id, total_layers, requested_blocks, requested_hashes
         );
@@ -399,9 +399,7 @@ impl PegaEngine {
             })?;
 
             let registration = gpu.get_registration(&layer_name).ok_or_else(|| {
-                EngineError::InvalidArgument(format!(
-                    "layer {layer_name} not registered on device"
-                ))
+                EngineError::InvalidArgument(format!("layer {layer_name} not registered on device"))
             })?;
 
             let slot_id = instance.get_slot_index(layer_id, tp_rank)?;
@@ -450,7 +448,7 @@ impl PegaEngine {
         let phase0_ms = phase0_start.elapsed().as_secs_f64() * 1000.0;
 
         if layer_metas.is_empty() {
-            warn!(
+            debug!(
                 "save_batch skipped (no valid blocks): instance_id={} tp_rank={} device_id={} layers={} phase0_ms={:.2}",
                 instance_id, tp_rank, device_id, total_layers, phase0_ms
             );
@@ -473,7 +471,7 @@ impl PegaEngine {
         let phase1_ms = phase1_start.elapsed().as_secs_f64() * 1000.0;
 
         if indices_to_save.is_empty() {
-            warn!(
+            debug!(
                 "save_batch skipped (all cached): instance_id={} tp_rank={} device_id={} layers={} phase0_ms={:.2} phase1_ms={:.2}",
                 instance_id, tp_rank, device_id, total_layers, phase0_ms, phase1_ms
             );
@@ -542,17 +540,23 @@ impl PegaEngine {
                     })?;
 
                 let mut k_allocation =
-                    self.storage.allocate(alloc_size, numa_node).ok_or_else(|| {
-                        EngineError::Storage(
-                            "pinned pool exhausted while allocating K segment buffer".to_string(),
-                        )
-                    })?;
+                    self.storage
+                        .allocate(alloc_size, numa_node)
+                        .ok_or_else(|| {
+                            EngineError::Storage(
+                                "pinned pool exhausted while allocating K segment buffer"
+                                    .to_string(),
+                            )
+                        })?;
                 let mut v_allocation =
-                    self.storage.allocate(alloc_size, numa_node).ok_or_else(|| {
-                        EngineError::Storage(
-                            "pinned pool exhausted while allocating V segment buffer".to_string(),
-                        )
-                    })?;
+                    self.storage
+                        .allocate(alloc_size, numa_node)
+                        .ok_or_else(|| {
+                            EngineError::Storage(
+                                "pinned pool exhausted while allocating V segment buffer"
+                                    .to_string(),
+                            )
+                        })?;
 
                 let k_base = Arc::get_mut(&mut k_allocation)
                     .expect("k_allocation must be uniquely owned")
@@ -588,17 +592,17 @@ impl PegaEngine {
                 let alloc_size = (block_size as u64)
                     .checked_mul(num_blocks as u64)
                     .and_then(NonZeroU64::new)
-                    .ok_or_else(|| {
-                        EngineError::Storage("allocation size overflow".to_string())
-                    })?;
+                    .ok_or_else(|| EngineError::Storage("allocation size overflow".to_string()))?;
 
                 let mut allocation =
-                    self.storage.allocate(alloc_size, numa_node).ok_or_else(|| {
-                        EngineError::Storage(
-                            "pinned pool exhausted while allocating contiguous block buffer"
-                                .to_string(),
-                        )
-                    })?;
+                    self.storage
+                        .allocate(alloc_size, numa_node)
+                        .ok_or_else(|| {
+                            EngineError::Storage(
+                                "pinned pool exhausted while allocating contiguous block buffer"
+                                    .to_string(),
+                            )
+                        })?;
 
                 let base_addr = Arc::get_mut(&mut allocation)
                     .ok_or_else(|| {
@@ -654,8 +658,7 @@ impl PegaEngine {
             .collect();
 
         // Build LayerBlocks per layer: layer_blocks[layer_idx][hash_idx]
-        let mut layer_blocks: Vec<Vec<Arc<LayerBlock>>> =
-            Vec::with_capacity(layers_to_save.len());
+        let mut layer_blocks: Vec<Vec<Arc<LayerBlock>>> = Vec::with_capacity(layers_to_save.len());
 
         for (layer_idx, prep) in layers_to_save.iter().enumerate() {
             let meta = &layer_metas[prep.meta_idx];
@@ -721,7 +724,9 @@ impl PegaEngine {
         for prep in &layers_to_save {
             let meta = &layer_metas[prep.meta_idx];
             let num_blocks = prep.blocks_to_save.len();
-            let bytes = (meta.block_size as u64).checked_mul(num_blocks as u64).unwrap_or(0);
+            let bytes = (meta.block_size as u64)
+                .checked_mul(num_blocks as u64)
+                .unwrap_or(0);
             total_bytes += bytes;
         }
         if total_blocks_to_save > 0 {
@@ -731,7 +736,7 @@ impl PegaEngine {
                 .record(batch_start.elapsed().as_secs_f64(), &[]);
         }
 
-        warn!(
+        debug!(
             "save_batch completed: instance_id={} tp_rank={} device_id={} layers={} layers_saved={} blocks_saved={} bytes={} phase0_ms={:.2} phase1_filter_ms={:.2} phase2_alloc_ms={:.2} phase3_gpu_ms={:.2} phase4_insert_ms={:.2} total_ms={:.2}",
             instance_id,
             tp_rank,
@@ -851,7 +856,7 @@ impl PegaEngine {
         let valid_filter_ms = valid_filter_start.elapsed().as_secs_f64() * 1000.0;
 
         if valid_blocks.is_empty() {
-            warn!(
+            debug!(
                 "save_layer skipped: instance_id={} tp_rank={} layer={} requested_blocks={} requested_hashes={} valid_blocks=0 valid_filter_ms={:.2}",
                 instance_id,
                 tp_rank,
@@ -871,7 +876,7 @@ impl PegaEngine {
         let cache_filter_ms = cache_filter_start.elapsed().as_secs_f64() * 1000.0;
 
         if indices_to_save.is_empty() {
-            warn!(
+            debug!(
                 "save_layer skipped: instance_id={} tp_rank={} layer={} requested_blocks={} valid_blocks={} to_save=0 valid_filter_ms={:.2} cache_filter_ms={:.2}",
                 instance_id,
                 tp_rank,
@@ -891,7 +896,7 @@ impl PegaEngine {
             .collect();
         let compact_ms = compact_start.elapsed().as_secs_f64() * 1000.0;
 
-        warn!(
+        debug!(
             "Saving {} blocks for layer {layer_name} on instance {instance_id} rank {tp_rank}",
             blocks_to_save.len()
         );
@@ -939,7 +944,7 @@ impl PegaEngine {
             metrics.save_bytes.add(total_bytes, &[]);
             metrics.save_duration_seconds.record(elapsed, &[]);
         }
-        warn!(
+        debug!(
             "save_layer completed: instance_id={} tp_rank={} layer={} requested_blocks={} requested_hashes={} valid_blocks={} to_save={} block_size={} total_bytes={} valid_filter_ms={:.2} cache_filter_ms={:.2} compact_ms={:.2} save_stage_ms={:.2} total_ms={:.2}",
             instance_id,
             tp_rank,
@@ -1071,7 +1076,7 @@ impl PegaEngine {
             .send_ssd_batch(gpu.preferred_numa(), &sealed_for_ssd);
         let ssd_ms = ssd_start.elapsed().as_secs_f64() * 1000.0;
 
-        warn!(
+        debug!(
             "save_split_blocks: layer={} blocks={} block_size={} alloc_ms={:.2} build_transfers_ms={:.2} copy_ms={:.2} build_blocks_ms={:.2} insert_ms={:.2} ssd_ms={:.2} total_ms={:.2}",
             layer_name,
             num_blocks,
@@ -1174,7 +1179,7 @@ impl PegaEngine {
             .send_ssd_batch(gpu.preferred_numa(), &sealed_for_ssd);
         let ssd_ms = ssd_start.elapsed().as_secs_f64() * 1000.0;
 
-        warn!(
+        debug!(
             "save_contiguous_blocks: layer={} blocks={} block_size={} alloc_ms={:.2} build_transfers_ms={:.2} copy_ms={:.2} build_blocks_ms={:.2} insert_ms={:.2} ssd_ms={:.2} total_ms={:.2}",
             layer_name,
             num_blocks,
