@@ -34,6 +34,17 @@ class ConnectorContext:
     device_id: int | None
     engine_client: EngineRpcClient
     state_manager: "ServiceStateManager"
+    is_mla: bool = False
+
+    @property
+    def effective_tp_rank(self) -> int:
+        """TP rank for PegaFlow server calls. MLA uses 0 since data is identical across ranks."""
+        return 0 if self.is_mla else (self.tp_rank or 0)
+
+    @property
+    def effective_tp_size(self) -> int:
+        """TP size for PegaFlow server calls. MLA uses 1 since only one copy is needed."""
+        return 1 if self.is_mla else self.tp_size
 
 
 @dataclass(frozen=True)
@@ -149,6 +160,12 @@ def derive_namespace(vllm_config, tp_size: int) -> str:
     return f"{hash_suffix}"
 
 
+def detect_mla(vllm_config) -> bool:
+    """Detect if the model uses Multi-head Latent Attention (e.g. DeepSeek V2/V3)."""
+    hf_config = vllm_config.model_config.hf_text_config
+    return getattr(hf_config, "kv_lora_rank", None) is not None
+
+
 __all__ = [
     "ConnectorContext",
     "LoadIntent",
@@ -157,6 +174,7 @@ __all__ = [
     "PegaPromMetrics",
     "SaveIntent",
     "derive_namespace",
+    "detect_mla",
     "logger",
     "parse_env_int",
     "resolve_instance_id",

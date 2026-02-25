@@ -16,10 +16,10 @@ This script automates the following workflow:
 
 Usage:
     # Default: PegaFlow only (faster for development):
-    python examples/bench_kv_cache.py [--model MODEL] [--num-prompts N] [--input-len L] [--output-len O]
+    python examples/bench_kv_cache.py [--model MODEL] [--num-prompts N] [--input-len L] [--output-len O] [--tp-size TP]
 
     # Full benchmark with LMCache comparison:
-    python examples/bench_kv_cache.py --with-lmcache [--model MODEL] [--num-prompts N] [--input-len L] [--output-len O]
+    python examples/bench_kv_cache.py --with-lmcache [--model MODEL] [--num-prompts N] [--input-len L] [--output-len O] [--tp-size TP]
 """
 
 import argparse
@@ -39,6 +39,7 @@ class VLLMServer:
         self,
         model: str,
         port: int,
+        tp_size: int = 1,
         use_pegaflow: bool = False,
         use_lmcache: bool = False,
         enable_prefix_caching: bool = False,
@@ -50,6 +51,7 @@ class VLLMServer:
     ):
         self.model = model
         self.port = port
+        self.tp_size = tp_size
         self.use_pegaflow = use_pegaflow
         self.use_lmcache = use_lmcache
         self.enable_prefix_caching = enable_prefix_caching
@@ -107,6 +109,8 @@ class VLLMServer:
                 "--trust-remote-code",
                 "--block-size",
                 "64",
+                "--tensor-parallel-size",
+                str(self.tp_size),
             ]
         )
 
@@ -150,7 +154,7 @@ class VLLMServer:
         cache_state = "enabled" if self.enable_prefix_caching else "disabled"
         print(
             f"\n[{server_label}] Starting vLLM server on port {self.port} "
-            f"(prefix caching {cache_state})"
+            f"(prefix caching {cache_state}, tp_size={self.tp_size})"
         )
 
         # Redirect output to log file if provided, otherwise to /dev/null
@@ -404,6 +408,14 @@ def main():
         help="Port for PegaFlow vLLM server (default: 8001)",
     )
     parser.add_argument(
+        "--tp-size",
+        "--tp-szie",
+        dest="tp_size",
+        type=int,
+        default=1,
+        help="Tensor parallel size passed to vllm serve (default: 1).",
+    )
+    parser.add_argument(
         "--output-dir",
         type=str,
         default="examples/bench_results",
@@ -452,6 +464,8 @@ def main():
     )
 
     args = parser.parse_args()
+    if args.tp_size < 1:
+        parser.error("--tp-size must be >= 1")
 
     # Create output directory
     output_dir = Path(args.output_dir)
@@ -474,6 +488,7 @@ def main():
     print(f"Num Prompts:     {args.num_prompts}")
     print(f"Input Length:    {args.input_len} tokens")
     print(f"Output Length:   {args.output_len} tokens")
+    print(f"TP Size:         {args.tp_size}")
     print(f"Request Rate:    {args.request_rate} req/s")
     print(f"Random Seed:     {args.seed}")
     if args.with_lmcache:
@@ -506,6 +521,7 @@ def main():
         with VLLMServer(
             args.model,
             args.pegaflow_port,
+            tp_size=args.tp_size,
             use_pegaflow=False,
             use_lmcache=False,
             enable_prefix_caching=False,
@@ -546,6 +562,7 @@ def main():
         with VLLMServer(
             args.model,
             args.lmcache_port,
+            tp_size=args.tp_size,
             use_lmcache=True,
             enable_prefix_caching=False,
             log_file=lmcache_log,
@@ -607,6 +624,7 @@ def main():
     with VLLMServer(
         args.model,
         args.pegaflow_port,
+        tp_size=args.tp_size,
         use_pegaflow=True,
         enable_prefix_caching=False,
         log_file=pegaflow_log,

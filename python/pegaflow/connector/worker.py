@@ -131,8 +131,8 @@ class WorkerConnector:
             ok, message = self._ctx.engine_client.register_context(
                 self._ctx.instance_id,
                 self._ctx.namespace,
-                self._ctx.tp_rank,
-                self._ctx.tp_size,
+                self._ctx.effective_tp_rank,
+                self._ctx.effective_tp_size,
                 self._ctx.world_size,
                 self._ctx.device_id,
                 self._ctx.num_layers,
@@ -272,7 +272,7 @@ class WorkerConnector:
 
         ok, message = self._ctx.engine_client.load(
             self._ctx.instance_id,
-            self._ctx.tp_rank,
+            self._ctx.effective_tp_rank,
             self._ctx.device_id,
             shm_name,
             target_layers,
@@ -426,7 +426,7 @@ class WorkerConnector:
             try:
                 ok, message = self._ctx.engine_client.save(
                     self._ctx.instance_id,
-                    self._ctx.tp_rank,
+                    self._ctx.effective_tp_rank,
                     self._ctx.device_id,
                     saves_list,
                 )
