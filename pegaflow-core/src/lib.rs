@@ -24,7 +24,8 @@ mod transfer;
 mod uring;
 
 pub use block::{
-    BlockHash, BlockInsertError, BlockKey, BlockStatus, LayerBlock, PrefetchStatus, SealedBlock,
+    BlockHash, BlockInsertError, BlockKey, BlockStatus, LayerBlock, LayerSave, PrefetchStatus,
+    SealedBlock,
 };
 pub use instance::{GpuContext, InstanceContext, KVCacheRegistration};
 pub use numa::NumaNode;
@@ -347,13 +348,13 @@ impl PegaEngine {
         instance_id: &str,
         tp_rank: usize,
         device_id: i32,
-        saves: Vec<(String, Vec<i32>, Vec<Vec<u8>>)>,
+        saves: Vec<LayerSave>,
     ) -> Result<(), EngineError> {
         let batch_start = std::time::Instant::now();
         let total_layers = saves.len();
         let (requested_blocks, requested_hashes) =
             saves.iter().fold((0usize, 0usize), |(b, h), layer| {
-                (b + layer.1.len(), h + layer.2.len())
+                (b + layer.block_ids.len(), h + layer.block_hashes.len())
             });
 
         let instance = self.get_instance(instance_id)?;
@@ -384,7 +385,12 @@ impl PegaEngine {
 
         let mut layer_metas: Vec<LayerMeta> = Vec::with_capacity(saves.len());
 
-        for (layer_name, block_ids, block_hashes) in saves {
+        for LayerSave {
+            layer_name,
+            block_ids,
+            block_hashes,
+        } in saves
+        {
             if block_ids.len() != block_hashes.len() {
                 return Err(EngineError::InvalidArgument(format!(
                     "block_ids length {} does not match block_hashes {} for layer {}",

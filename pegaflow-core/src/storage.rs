@@ -576,11 +576,7 @@ impl StorageEngine {
                 }
             };
 
-            // Insert slot (fast path, assumes slot and topology were validated earlier)
-            let Some(completed) = inflight_block.try_insert_slot_fast(slot_id, Arc::clone(block))
-            else {
-                continue;
-            };
+            let completed = inflight_block.insert_slot(slot_id, Arc::clone(block));
             let footprint_bytes = block.memory_footprint();
             inflight_bytes_added = inflight_bytes_added.saturating_add(footprint_bytes);
 
@@ -722,11 +718,7 @@ impl StorageEngine {
                 let slot_id = layer_slot_ids[layer_idx];
                 let block = &layer_blocks[layer_idx][hash_idx];
 
-                let Some(completed) =
-                    inflight_block.try_insert_slot_fast(slot_id, Arc::clone(block))
-                else {
-                    continue;
-                };
+                let completed = inflight_block.insert_slot(slot_id, Arc::clone(block));
                 let footprint_bytes = block.memory_footprint();
                 inflight_bytes_added = inflight_bytes_added.saturating_add(footprint_bytes);
 

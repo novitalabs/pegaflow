@@ -32,6 +32,13 @@ impl BlockKey {
 
 pub type BlockHash = Vec<u8>;
 
+/// Per-layer save input: layer name + block IDs + content hashes.
+pub struct LayerSave {
+    pub layer_name: String,
+    pub block_ids: Vec<i32>,
+    pub block_hashes: Vec<Vec<u8>>,
+}
+
 // ============================================================================
 // Block Status and Prefetch Status
 // ============================================================================
@@ -254,16 +261,10 @@ impl InflightBlock {
             .is_some()
     }
 
-    /// Fast path for save hot path.
+    /// Insert a slot idempotently. Duplicate inserts are no-ops.
     ///
-    /// Preconditions are expected to be validated by caller:
-    /// - `slot_id < self.total_slots`
-    /// - `total_slots` consistency was checked where the inflight block is looked up
-    ///
-    /// Returns:
-    /// - `None` if the slot is already filled (no-op)
-    /// - `Some(completed)` if this call inserted a slot
-    pub fn try_insert_slot_fast(&mut self, slot_id: usize, block: Arc<LayerBlock>) -> Option<bool> {
+    /// Returns `true` if all slots are now filled (ready to seal).
+    pub fn insert_slot(&mut self, slot_id: usize, block: Arc<LayerBlock>) -> bool {
         debug_assert!(
             slot_id < self.total_slots,
             "slot_id {} must be < total_slots {}",
@@ -271,17 +272,15 @@ impl InflightBlock {
             self.total_slots
         );
 
-        if self.slots[slot_id].is_some() {
-            return None;
+        if self.slots[slot_id].is_none() {
+            self.footprint += block.memory_footprint();
+            self.slots[slot_id] = Some(block);
+            self.remaining = self
+                .remaining
+                .checked_sub(1)
+                .expect("remaining should not underflow");
         }
-
-        self.footprint += block.memory_footprint();
-        self.slots[slot_id] = Some(block);
-        self.remaining = self
-            .remaining
-            .checked_sub(1)
-            .expect("remaining should not underflow");
-        Some(self.remaining == 0)
+        self.remaining == 0
     }
 
     /// Seal the block, converting to immutable SealedBlock.
