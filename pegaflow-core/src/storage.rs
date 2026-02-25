@@ -6,7 +6,9 @@
 // Key invariant: Sealing is a one-way gate. Once sealed, a block is immutable.
 //
 // Architecture:
-// - Mutex<StorageInner>: inflight, prefetching, cache, pinned state
+// - Mutex<StorageInner>: prefetching, cache, pinned state
+// - Insert Worker (dedicated thread): owns inflight HashMap, receives
+//   RawSaveBatch messages via channel, builds LayerBlocks and seals completed blocks
 // - RwLock<SsdRingBuffer>: SSD head/tail/index (shared by writer and readers)
 // - Allocator: PinnedMemoryPool for pinned memory allocation
 // - Prefetch worker: background io_uring reads from SSD
@@ -20,13 +22,13 @@ use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::num::NonZeroU64;
 use std::sync::{Arc, Weak};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::oneshot;
 
-use crate::block::{
-    BlockInsertError, BlockKey, InflightBlock, LayerBlock, PrefetchStatus, SealedBlock,
-};
+use crate::block::{BlockKey, InflightBlock, PrefetchStatus, SealedBlock};
 use crate::cache::{CacheInsertOutcome, TinyLfuCache};
 use crate::metrics::core_metrics;
 use crate::numa::NumaNode;
+use crate::offload::InsertEntries;
 use crate::pinned_pool::{PinnedAllocation, PinnedAllocator};
 use crate::ssd_cache::{
     PrefetchBatch, PrefetchRequest, SsdCacheConfig, SsdIndexEntry, SsdRingBuffer, SsdStorageHandle,
@@ -154,10 +156,23 @@ struct SsdReceivers {
     prefetch_rx: tokio::sync::mpsc::Receiver<PrefetchBatch>,
 }
 
-/// Inner state protected by a single mutex
+// ============================================================================
+// Insert Worker (actor model for inflight block management)
+// ============================================================================
+
+/// Command sent to the insert worker.
+enum InsertWorkerCommand {
+    /// Deferred save: build LayerBlocks + insert into inflight.
+    RawInsert(crate::offload::RawSaveBatch),
+    /// GC stale inflight blocks older than max_age.
+    Gc {
+        max_age: std::time::Duration,
+        reply: oneshot::Sender<usize>,
+    },
+}
+
+/// Inner state protected by a single mutex (no longer contains inflight)
 struct StorageInner {
-    /// Write path: blocks being filled (not yet sealed)
-    inflight: HashMap<BlockKey, InflightBlock>,
     /// Blocks currently being prefetched from SSD
     prefetching: HashSet<BlockKey>,
     /// Read path: sealed blocks available for lookup (TinyLFU admission + LRU eviction)
@@ -176,8 +191,11 @@ pub struct StorageEngine {
     /// Unified pinned memory allocator (handles both global and NUMA modes)
     allocator: Arc<PinnedAllocator>,
 
-    /// All mutable state under one lock (includes ssd_ring)
+    /// Mutable state under one lock (cache, prefetching, pinned_for_load)
     inner: Mutex<StorageInner>,
+
+    /// Channel to the insert worker thread (owns inflight HashMap)
+    insert_tx: UnboundedSender<InsertWorkerCommand>,
 
     /// Channel to notify consumers when blocks are sealed (for SSD offload)
     seal_notify_tx: Option<UnboundedSender<SealNotification>>,
@@ -254,7 +272,6 @@ impl StorageEngine {
         };
 
         let inner = Mutex::new(StorageInner {
-            inflight: HashMap::new(),
             prefetching: HashSet::new(),
             cache,
             pinned_for_load: HashMap::new(),
@@ -265,13 +282,23 @@ impl StorageEngine {
         // Create unbounded channel for seal notifications
         let (seal_notify_tx, seal_notify_rx) = mpsc::unbounded_channel();
 
+        // Create insert worker channel
+        let (insert_tx, insert_rx) = mpsc::unbounded_channel();
+
         let engine = Arc::new(Self {
             allocator,
             inner,
+            insert_tx,
             seal_notify_tx: Some(seal_notify_tx),
             ssd_state,
             max_prefetch_blocks: config.max_prefetch_blocks,
         });
+
+        // Spawn insert worker task (owns inflight HashMap, receives batches)
+        {
+            let weak_engine = Arc::downgrade(&engine);
+            tokio::spawn(insert_worker_loop(insert_rx, weak_engine));
+        }
 
         // Spawn SSD workers after Arc is created (they need callbacks into storage)
         if let Some(receivers) = ssd_receivers {
@@ -503,279 +530,31 @@ impl StorageEngine {
     // Write path (inflight)
     // ========================================================================
 
-    /// Filter blocks that need to be saved (not in cache and slot not in inflight).
-    /// Returns indices of blocks that need saving. Single lock acquisition.
-    pub fn filter_blocks_to_save(
+    /// Fire-and-forget raw insert: send a deferred save batch to the insert worker.
+    ///
+    /// The worker builds `LayerBlock` objects, groups by hash, and inserts
+    /// into inflight. The caller does NOT need to wait — once GPU→CPU copy
+    /// is done the pinned memory is reference-counted.
+    pub(crate) fn send_raw_insert(&self, batch: crate::offload::RawSaveBatch) {
+        let _ = self.insert_tx.send(InsertWorkerCommand::RawInsert(batch));
+    }
+
+    /// In-place filter for hashes that are NOT already sealed in cache.
+    ///
+    /// After return, `hashes` only contains entries that need saving.
+    /// Since cache membership is hash-based (not layer-specific), this only
+    /// needs to be called once for all layers sharing the same namespace.
+    pub(crate) fn filter_hashes_not_in_cache_inplace(
         &self,
         namespace: &str,
-        valid_blocks: &[(usize, Vec<u8>)],
-        slot_id: usize,
-    ) -> Vec<usize> {
+        hashes: &mut HashSet<Vec<u8>>,
+    ) {
         let namespace = namespace.to_string();
-        let mut inner = self.inner.lock();
-        let mut indices_to_save = Vec::with_capacity(valid_blocks.len());
-
-        for (i, (_, hash)) in valid_blocks.iter().enumerate() {
+        let inner = self.inner.lock();
+        hashes.retain(|hash| {
             let key = BlockKey::new(namespace.clone(), hash.clone());
-            // Skip if already sealed in cache
-            if inner.cache.get(&key).is_some() {
-                continue;
-            }
-            // Skip if slot already exists in inflight
-            if let Some(block) = inner.inflight.get(&key)
-                && block.slot_exists(slot_id)
-            {
-                continue;
-            }
-            indices_to_save.push(i);
-        }
-        indices_to_save
-    }
-
-    /// Batch insert slots and admit sealed blocks in a single lock acquisition.
-    /// Returns all sealed blocks (for SSD write-through).
-    pub fn insert_slots_batch(
-        &self,
-        blocks: &[(BlockKey, Arc<LayerBlock>)],
-        slot_id: usize,
-        total_slots: usize,
-    ) -> Result<Vec<(BlockKey, Arc<SealedBlock>)>, BlockInsertError> {
-        if slot_id >= total_slots {
-            return Err(BlockInsertError::SlotOutOfBounds {
-                slot_id,
-                total_slots,
-            });
-        }
-
-        let mut inner = self.inner.lock();
-        let mut sealed_blocks: Vec<(BlockKey, Arc<SealedBlock>)> = Vec::new();
-        let mut inflight_bytes_added: u64 = 0;
-        let mut inflight_bytes_removed: u64 = 0;
-        let mut cache_insertions: u64 = 0;
-        let mut cache_inserted_bytes: u64 = 0;
-        let mut cache_rejections: u64 = 0;
-
-        for (key, block) in blocks {
-            // Skip if already sealed in cache
-            if inner.cache.contains_key(key) {
-                continue;
-            }
-
-            // Get or create inflight block
-            let inflight_block = match inner.inflight.entry(key.clone()) {
-                Entry::Vacant(v) => v.insert(InflightBlock::new(total_slots)),
-                Entry::Occupied(o) => {
-                    let inflight_block = o.into_mut();
-                    if inflight_block.total_slots() != total_slots {
-                        return Err(BlockInsertError::SlotCountMismatch {
-                            expected: inflight_block.total_slots(),
-                            got: total_slots,
-                        });
-                    }
-                    inflight_block
-                }
-            };
-
-            let completed = inflight_block.insert_slot(slot_id, Arc::clone(block));
-            let footprint_bytes = block.memory_footprint();
-            inflight_bytes_added = inflight_bytes_added.saturating_add(footprint_bytes);
-
-            if completed {
-                // Remove from inflight and seal
-                let inflight_block = inner.inflight.remove(key).expect("just checked");
-                let total_footprint = inflight_block.footprint();
-                inflight_bytes_removed = inflight_bytes_removed.saturating_add(total_footprint);
-                let sealed = Arc::new(inflight_block.seal());
-
-                // Try to admit to cache
-                match inner.cache.insert(key.clone(), Arc::clone(&sealed)) {
-                    CacheInsertOutcome::InsertedNew => {
-                        cache_insertions = cache_insertions.saturating_add(1);
-                        cache_inserted_bytes = cache_inserted_bytes.saturating_add(total_footprint);
-                    }
-                    CacheInsertOutcome::AlreadyExists => {}
-                    CacheInsertOutcome::Rejected => {
-                        cache_rejections = cache_rejections.saturating_add(1);
-                    }
-                }
-
-                sealed_blocks.push((key.clone(), sealed));
-            }
-        }
-
-        drop(inner);
-        if inflight_bytes_added > 0 {
-            record_inflight_bytes_added(inflight_bytes_added);
-        }
-        if inflight_bytes_removed > 0 {
-            record_inflight_bytes_removed(inflight_bytes_removed);
-        }
-        if cache_insertions > 0 || cache_inserted_bytes > 0 {
-            let m = core_metrics();
-            if cache_insertions > 0 {
-                m.cache_block_insertions.add(cache_insertions, &[]);
-            }
-            if let Ok(v) = i64::try_from(cache_inserted_bytes) {
-                m.cache_resident_bytes.add(v, &[]);
-            }
-        }
-        if cache_rejections > 0 {
-            core_metrics()
-                .cache_block_admission_rejections
-                .add(cache_rejections, &[]);
-        }
-
-        // Notify all sealed blocks
-        if let Some(tx) = &self.seal_notify_tx {
-            for (key, block) in &sealed_blocks {
-                let _ = tx.send((key.clone(), Arc::downgrade(block)));
-            }
-        }
-
-        Ok(sealed_blocks)
-    }
-
-    /// Filter hashes that are NOT already sealed in cache.
-    ///
-    /// Returns indices of hashes that need saving. Since cache membership is
-    /// hash-based (not layer-specific), this only needs to be called once for
-    /// all layers sharing the same hash set.
-    pub fn filter_hashes_not_in_cache(&self, namespace: &str, hashes: &[Vec<u8>]) -> Vec<usize> {
-        let namespace = namespace.to_string();
-        let mut inner = self.inner.lock();
-        let mut indices = Vec::with_capacity(hashes.len());
-        for (i, hash) in hashes.iter().enumerate() {
-            let key = BlockKey::new(namespace.clone(), hash.clone());
-            if inner.cache.get(&key).is_none() {
-                indices.push(i);
-            }
-        }
-        indices
-    }
-
-    /// Hash-first batch insert: iterate by unique hash (outer), layers (inner).
-    ///
-    /// For N unique hashes and L layers, this does N cache lookups + N inflight
-    /// entries + N×L slot inserts, instead of the N×L of everything that
-    /// layer-first iteration requires.
-    ///
-    /// `keys`: pre-built BlockKeys, one per unique hash (len = num_hashes)
-    /// `layer_slot_ids`: slot_id for each layer (len = num_layers)
-    /// `layer_blocks`: layer_blocks[layer_idx][hash_idx] = Arc<LayerBlock>
-    /// `total_slots`: total slot count for InflightBlock creation
-    pub fn insert_slots_hash_first(
-        &self,
-        keys: &[BlockKey],
-        layer_slot_ids: &[usize],
-        layer_blocks: &[Vec<Arc<LayerBlock>>],
-        total_slots: usize,
-    ) -> Result<Vec<(BlockKey, Arc<SealedBlock>)>, BlockInsertError> {
-        let num_hashes = keys.len();
-        let num_layers = layer_slot_ids.len();
-
-        for &slot_id in layer_slot_ids {
-            if slot_id >= total_slots {
-                return Err(BlockInsertError::SlotOutOfBounds {
-                    slot_id,
-                    total_slots,
-                });
-            }
-        }
-
-        let mut inner = self.inner.lock();
-        let mut sealed_blocks: Vec<(BlockKey, Arc<SealedBlock>)> = Vec::new();
-        let mut inflight_bytes_added: u64 = 0;
-        let mut inflight_bytes_removed: u64 = 0;
-        let mut cache_insertions: u64 = 0;
-        let mut cache_inserted_bytes: u64 = 0;
-        let mut cache_rejections: u64 = 0;
-
-        for hash_idx in 0..num_hashes {
-            let key = &keys[hash_idx];
-
-            // 1 cache lookup per unique hash (not per layer)
-            if inner.cache.contains_key(key) {
-                continue;
-            }
-
-            // 1 inflight entry per unique hash
-            let inflight_block = match inner.inflight.entry(key.clone()) {
-                Entry::Vacant(v) => v.insert(InflightBlock::new(total_slots)),
-                Entry::Occupied(o) => {
-                    let inflight_block = o.into_mut();
-                    if inflight_block.total_slots() != total_slots {
-                        return Err(BlockInsertError::SlotCountMismatch {
-                            expected: inflight_block.total_slots(),
-                            got: total_slots,
-                        });
-                    }
-                    inflight_block
-                }
-            };
-
-            // Insert all layers' slots for this hash
-            for layer_idx in 0..num_layers {
-                let slot_id = layer_slot_ids[layer_idx];
-                let block = &layer_blocks[layer_idx][hash_idx];
-
-                let completed = inflight_block.insert_slot(slot_id, Arc::clone(block));
-                let footprint_bytes = block.memory_footprint();
-                inflight_bytes_added = inflight_bytes_added.saturating_add(footprint_bytes);
-
-                if completed {
-                    let inflight_block = inner.inflight.remove(key).expect("just checked");
-                    let total_footprint = inflight_block.footprint();
-                    inflight_bytes_removed = inflight_bytes_removed.saturating_add(total_footprint);
-                    let sealed = Arc::new(inflight_block.seal());
-
-                    match inner.cache.insert(key.clone(), Arc::clone(&sealed)) {
-                        CacheInsertOutcome::InsertedNew => {
-                            cache_insertions = cache_insertions.saturating_add(1);
-                            cache_inserted_bytes =
-                                cache_inserted_bytes.saturating_add(total_footprint);
-                        }
-                        CacheInsertOutcome::AlreadyExists => {}
-                        CacheInsertOutcome::Rejected => {
-                            cache_rejections = cache_rejections.saturating_add(1);
-                        }
-                    }
-
-                    sealed_blocks.push((key.clone(), sealed));
-                    // Block is now sealed, no more slots to insert
-                    break;
-                }
-            }
-        }
-
-        drop(inner);
-        if inflight_bytes_added > 0 {
-            record_inflight_bytes_added(inflight_bytes_added);
-        }
-        if inflight_bytes_removed > 0 {
-            record_inflight_bytes_removed(inflight_bytes_removed);
-        }
-        if cache_insertions > 0 || cache_inserted_bytes > 0 {
-            let m = core_metrics();
-            if cache_insertions > 0 {
-                m.cache_block_insertions.add(cache_insertions, &[]);
-            }
-            if let Ok(v) = i64::try_from(cache_inserted_bytes) {
-                m.cache_resident_bytes.add(v, &[]);
-            }
-        }
-        if cache_rejections > 0 {
-            core_metrics()
-                .cache_block_admission_rejections
-                .add(cache_rejections, &[]);
-        }
-
-        if let Some(tx) = &self.seal_notify_tx {
-            for (key, block) in &sealed_blocks {
-                let _ = tx.send((key.clone(), Arc::downgrade(block)));
-            }
-        }
-
-        Ok(sealed_blocks)
+            !inner.cache.contains_key(&key)
+        });
     }
 
     /// Send a batch of sealed blocks to SSD writer for async persistence.
@@ -1018,39 +797,23 @@ impl StorageEngine {
 
     /// Remove stale inflight blocks that have been stuck for longer than `max_age`.
     ///
-    /// This is a safety net for rare race conditions where partial blocks can never
-    /// complete (e.g., cache eviction between layer checks). In normal operation,
-    /// this should clean very few or zero blocks.
+    /// Sends a GC command to the insert worker, which owns the inflight HashMap.
+    /// This is async because it waits for the worker's reply.
     ///
     /// Returns the number of cleaned blocks.
-    pub fn gc_stale_inflight(&self, max_age: std::time::Duration) -> usize {
-        let mut inner = self.inner.lock();
-        let before = inner.inflight.len();
-
-        inner.inflight.retain(|key, block| {
-            let age = block.age();
-            if age > max_age {
-                warn!(
-                    "GC: removing stale inflight block: namespace={} hash_len={} filled={} total={} age_secs={}",
-                    key.namespace,
-                    key.hash.len(),
-                    block.filled_count(),
-                    block.total_slots(),
-                    age.as_secs()
-                );
-                record_inflight_bytes_removed(block.footprint());
-                false
-            } else {
-                true
-            }
-        });
-
-        let cleaned = before - inner.inflight.len();
-        if cleaned > 0 {
-            core_metrics().inflight_gc_cleaned.add(cleaned as u64, &[]);
-            info!("GC cleaned stale inflight blocks: cleaned={}", cleaned);
+    pub async fn gc_stale_inflight(&self, max_age: std::time::Duration) -> usize {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .insert_tx
+            .send(InsertWorkerCommand::Gc {
+                max_age,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return 0;
         }
-        cleaned
+        reply_rx.await.unwrap_or(0)
     }
 
     /// Check prefix blocks and trigger prefetch for blocks in SSD.
@@ -1271,5 +1034,225 @@ impl StorageEngine {
             .ssd_ring
             .as_ref()
             .is_some_and(|ring| ring.is_offset_valid(begin))
+    }
+}
+
+// ============================================================================
+// Insert Worker (dedicated thread, owns inflight HashMap)
+// ============================================================================
+
+/// Dedicated insert worker task. Owns the inflight HashMap exclusively,
+/// eliminating lock contention on the hot insert path. Sealed blocks are
+/// admitted to cache via brief `StorageInner` lock acquisitions.
+async fn insert_worker_loop(
+    mut rx: UnboundedReceiver<InsertWorkerCommand>,
+    engine: Weak<StorageEngine>,
+) {
+    let mut inflight: HashMap<BlockKey, InflightBlock> = HashMap::new();
+
+    while let Some(cmd) = rx.recv().await {
+        // Drain additional commands for batching
+        let mut cmds = vec![cmd];
+        while let Ok(more) = rx.try_recv() {
+            cmds.push(more);
+        }
+
+        for cmd in cmds {
+            match cmd {
+                InsertWorkerCommand::RawInsert(batch) => {
+                    process_raw_save_batch(&mut inflight, &engine, batch);
+                }
+                InsertWorkerCommand::Gc { max_age, reply } => {
+                    let cleaned = gc_inflight(&mut inflight, max_age);
+                    let _ = reply.send(cleaned);
+                }
+            }
+        }
+    }
+
+    info!(
+        "Insert worker shutting down, {} inflight blocks remaining",
+        inflight.len()
+    );
+}
+
+/// Process a deferred raw save batch: build LayerBlocks, then delegate to
+/// `process_insert_batch` for inflight/seal/cache logic.
+fn process_raw_save_batch(
+    inflight: &mut HashMap<BlockKey, InflightBlock>,
+    engine: &Weak<StorageEngine>,
+    batch: crate::offload::RawSaveBatch,
+) {
+    let phase4_start = std::time::Instant::now();
+    let numa_node = batch.numa_node;
+    let total_slots = batch.total_slots;
+
+    let (entries, _total_bytes, _total_blocks) = crate::offload::build_insert_entries(&batch);
+
+    process_insert_batch(inflight, engine, entries, total_slots, numa_node);
+
+    debug!(
+        "insert_worker phase4: blocks={} bytes={} ms={:.2}",
+        _total_blocks,
+        _total_bytes,
+        phase4_start.elapsed().as_secs_f64() * 1000.0,
+    );
+}
+
+/// Process a single insert batch (fire-and-forget).
+/// Inflight HashMap is owned exclusively by the worker (no lock needed).
+/// Cache insertion + SSD offload handled internally.
+fn process_insert_batch(
+    inflight: &mut HashMap<BlockKey, InflightBlock>,
+    engine: &Weak<StorageEngine>,
+    entries: InsertEntries,
+    total_slots: usize,
+    numa_node: NumaNode,
+) {
+    let mut sealed_blocks: Vec<(BlockKey, Arc<SealedBlock>)> = Vec::new();
+    let mut inflight_bytes_added: u64 = 0;
+    let mut inflight_bytes_removed: u64 = 0;
+
+    for (key, slots) in entries {
+        // Get or create inflight block (no lock — worker-exclusive HashMap)
+        let inflight_block = match inflight.entry(key.clone()) {
+            Entry::Vacant(v) => v.insert(InflightBlock::new(total_slots)),
+            Entry::Occupied(o) => {
+                let ib = o.into_mut();
+                if ib.total_slots() != total_slots {
+                    error!(
+                        "insert worker: slot count mismatch: key namespace={} expected={} got={}",
+                        key.namespace,
+                        ib.total_slots(),
+                        total_slots
+                    );
+                    continue;
+                }
+                ib
+            }
+        };
+
+        // Insert all slots for this hash
+        let mut completed = false;
+        for (slot_id, block) in slots {
+            let footprint_bytes = block.memory_footprint();
+            completed = inflight_block.insert_slot(slot_id, block);
+            inflight_bytes_added = inflight_bytes_added.saturating_add(footprint_bytes);
+
+            if completed {
+                break;
+            }
+        }
+
+        if completed {
+            let inflight_block = inflight.remove(&key).expect("just inserted");
+            let total_footprint = inflight_block.footprint();
+            inflight_bytes_removed = inflight_bytes_removed.saturating_add(total_footprint);
+            let sealed = Arc::new(inflight_block.seal());
+
+            // Brief lock: admit sealed block to cache
+            if let Some(engine) = engine.upgrade() {
+                let mut inner = engine.inner.lock();
+                match inner.cache.insert(key.clone(), Arc::clone(&sealed)) {
+                    CacheInsertOutcome::InsertedNew => {
+                        record_cache_insert_new(total_footprint);
+                    }
+                    CacheInsertOutcome::AlreadyExists => {}
+                    CacheInsertOutcome::Rejected => {
+                        core_metrics().cache_block_admission_rejections.add(1, &[]);
+                    }
+                }
+                drop(inner);
+
+                // Seal notification (for SSD offload)
+                if let Some(tx) = &engine.seal_notify_tx {
+                    let _ = tx.send((key.clone(), Arc::downgrade(&sealed)));
+                }
+            }
+
+            sealed_blocks.push((key, sealed));
+        }
+    }
+
+    if inflight_bytes_added > 0 {
+        record_inflight_bytes_added(inflight_bytes_added);
+    }
+    if inflight_bytes_removed > 0 {
+        record_inflight_bytes_removed(inflight_bytes_removed);
+    }
+
+    // SSD offload (fire-and-forget internally)
+    if !sealed_blocks.is_empty()
+        && let Some(engine) = engine.upgrade()
+    {
+        engine.send_ssd_batch(numa_node, &sealed_blocks);
+    }
+}
+
+/// GC stale inflight blocks within the insert worker.
+fn gc_inflight(
+    inflight: &mut HashMap<BlockKey, InflightBlock>,
+    max_age: std::time::Duration,
+) -> usize {
+    let before = inflight.len();
+
+    inflight.retain(|key, block| {
+        let age = block.age();
+        if age > max_age {
+            warn!(
+                "GC: removing stale inflight block: namespace={} hash_len={} filled={} total={} age_secs={}",
+                key.namespace,
+                key.hash.len(),
+                block.filled_count(),
+                block.total_slots(),
+                age.as_secs()
+            );
+            record_inflight_bytes_removed(block.footprint());
+            false
+        } else {
+            true
+        }
+    });
+
+    let cleaned = before - inflight.len();
+    if cleaned > 0 {
+        core_metrics().inflight_gc_cleaned.add(cleaned as u64, &[]);
+        info!("GC cleaned stale inflight blocks: cleaned={}", cleaned);
+    }
+    cleaned
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn filter_hashes_not_in_cache_inplace_keeps_only_uncached() {
+        let (storage, _rx) =
+            StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]);
+        let namespace = "ns";
+        let cached_hash = vec![1, 1, 1];
+        let uncached_hash = vec![2, 2, 2];
+
+        storage.complete_prefetch(
+            BlockKey::new(namespace.to_string(), cached_hash.clone()),
+            Some(Arc::new(SealedBlock::from_slots(Vec::new()))),
+        );
+
+        let mut hashes = HashSet::from([cached_hash, uncached_hash.clone()]);
+        storage.filter_hashes_not_in_cache_inplace(namespace, &mut hashes);
+
+        assert_eq!(hashes.len(), 1);
+        assert!(hashes.contains(&uncached_hash));
+    }
+
+    #[tokio::test]
+    async fn filter_hashes_not_in_cache_inplace_handles_empty_input() {
+        let (storage, _rx) =
+            StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]);
+        let mut hashes: HashSet<Vec<u8>> = HashSet::new();
+
+        storage.filter_hashes_not_in_cache_inplace("ns", &mut hashes);
+        assert!(hashes.is_empty());
     }
 }

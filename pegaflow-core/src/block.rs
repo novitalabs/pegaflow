@@ -2,7 +2,6 @@
 // Block types for StorageEngine
 // ============================================================================
 
-use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -181,36 +180,6 @@ impl SealedBlock {
 // ============================================================================
 // Errors
 // ============================================================================
-
-#[derive(Debug)]
-pub enum BlockInsertError {
-    SlotOutOfBounds { slot_id: usize, total_slots: usize },
-    SlotCountMismatch { expected: usize, got: usize },
-}
-
-impl fmt::Display for BlockInsertError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            BlockInsertError::SlotOutOfBounds {
-                slot_id,
-                total_slots,
-            } => {
-                write!(
-                    f,
-                    "slot_id {} out of bounds ({} slots)",
-                    slot_id, total_slots
-                )
-            }
-            BlockInsertError::SlotCountMismatch { expected, got } => {
-                write!(f, "slot count mismatch: expected {}, got {}", expected, got)
-            }
-        }
-    }
-}
-
-impl std::error::Error for BlockInsertError {}
-
-// ============================================================================
 // Inflight Block (write path, mutable)
 // ============================================================================
 
@@ -252,13 +221,6 @@ impl InflightBlock {
     /// Returns the current memory footprint of all inserted slots.
     pub fn footprint(&self) -> u64 {
         self.footprint
-    }
-
-    pub fn slot_exists(&self, slot_id: usize) -> bool {
-        self.slots
-            .get(slot_id)
-            .and_then(|opt| opt.as_ref())
-            .is_some()
     }
 
     /// Insert a slot idempotently. Duplicate inserts are no-ops.
