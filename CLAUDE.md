@@ -81,7 +81,7 @@ uv run python examples/bench_kv_cache.py --model /path/to/model --num-prompts 10
 
 ## Architecture
 
-### Four-Crate Design
+### Five-Crate Design
 
 1. **pegaflow-core** (Rust): Core storage engine
    - `PegaEngine`: Main engine managing GPU workers and KV cache storage
@@ -99,11 +99,17 @@ uv run python examples/bench_kv_cache.py --model /path/to/model --num-prompts 10
    - `registry.rs`: Instance/worker registration
    - `bin/pegaflow-router.rs`: P/D disaggregation router
 
-4. **python/** (Rust/PyO3 + Python): Python package (`pegaflow-llm` on PyPI)
+4. **pegaflow-metaserver** (Rust): Cross-node block hash registry
+   - `service.rs`: gRPC MetaServer service (insert/query block hashes)
+   - `store.rs`: LRU block hash store with configurable capacity and TTL (backed by moka)
+   - Used for multi-node KV cache coordination — each pegaflow-server registers its block hashes here
+
+5. **python/** (Rust/PyO3 + Python): Python package (`pegaflow-llm` on PyPI)
    - `src/lib.rs`: PyO3 bindings exposing `PegaEngine` and gRPC client
    - `pegaflow/connector/`: vLLM v1 KV connector (scheduler + worker split)
    - `pegaflow/sglang/`: SGLang integration
    - `pegaflow/ipc_wrapper.py`: CUDA IPC handle wrapper
+   - CLI binaries: `pegaflow-server`, `pegaflow-metaserver` (installed via pip)
 
 ### Data Flow
 
@@ -222,6 +228,9 @@ See the implementation in [`peagflow_radix_cache.py`](python/pegaflow/sglang/pea
 - `pegaflow-core/src/storage.rs`: Block storage engine
 - `pegaflow-core/src/numa.rs`: NUMA topology detection and GPU affinity queries
 - `pegaflow-server/src/service.rs`: gRPC service implementation
+- `pegaflow-metaserver/src/lib.rs`: MetaServer entry point and CLI
+- `pegaflow-metaserver/src/service.rs`: MetaServer gRPC service
+- `pegaflow-metaserver/src/store.rs`: Block hash store (LRU + TTL)
 - `python/src/lib.rs`: PyO3 bindings (Rust side)
 - `python/pegaflow/pegaflow.pyi`: Type stubs for PyO3 bindings
 - `python/pegaflow/connector/scheduler.py`: vLLM scheduler-side connector

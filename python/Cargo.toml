@@ -12,11 +12,17 @@ crate-type = ["cdylib"]
 name = "pegaflow-server-py"
 path = "src/bin/server.rs"
 
+# Binary for pegaflow-metaserver (will be included in wheel by maturin)
+[[bin]]
+name = "pegaflow-metaserver-py"
+path = "src/bin/metaserver.rs"
+
 [dependencies]
 pyo3 = { workspace = true, features = ["extension-module"] }
 pegaflow-core.workspace = true
 pegaflow-proto = { path = "../pegaflow-proto" }
 pegaflow-server = { path = "../pegaflow-server" }
+pegaflow-metaserver = { path = "../pegaflow-metaserver" }
 tokio.workspace = true
 tonic.workspace = true
 log.workspace = true

@@ -2076,6 +2076,7 @@ dependencies = [
  "log",
  "logforth",
  "pegaflow-core",
+ "pegaflow-metaserver",
  "pegaflow-proto",
  "pegaflow-server",
  "pyo3",
