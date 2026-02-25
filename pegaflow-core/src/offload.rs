@@ -99,9 +99,7 @@ pub(crate) struct RawSaveBatch {
 ///
 /// Returns `(entries, total_bytes, total_blocks)` where entries is grouped
 /// by hash: `Vec<(BlockKey, Vec<(slot_id, Arc<LayerBlock>)>)>`.
-pub(crate) fn build_insert_entries(
-    batch: &RawSaveBatch,
-) -> (InsertEntries, u64, usize) {
+pub(crate) fn build_insert_entries(batch: &RawSaveBatch) -> (InsertEntries, u64, usize) {
     use std::collections::HashMap;
 
     let mut hash_entries: HashMap<Vec<u8>, Vec<(usize, Arc<LayerBlock>)>> = HashMap::new();
