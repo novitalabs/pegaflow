@@ -409,7 +409,6 @@ def main():
     )
     parser.add_argument(
         "--tp-size",
-        "--tp-szie",
         dest="tp_size",
         type=int,
         default=1,
