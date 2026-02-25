@@ -403,7 +403,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 loop {
                     tokio::select! {
                         _ = interval.tick() => {
-                            let cleaned = engine.gc_stale_inflight(GC_MAX_AGE);
+                            let cleaned = engine.gc_stale_inflight(GC_MAX_AGE).await;
                             if cleaned > 0 {
                                 info!("Inflight GC: cleaned {} stale blocks", cleaned);
                             }

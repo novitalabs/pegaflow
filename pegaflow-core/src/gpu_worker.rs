@@ -29,12 +29,18 @@ pub struct LoadBlock {
     pub layer_block: Arc<LayerBlock>,
 }
 
-/// A task to save KV blocks from GPU to CPU
-/// Caller pre-allocates pinned memory, worker does the GPU->CPU copy
+/// A task to save KV blocks from GPU to CPU for multiple layers.
+/// Caller pre-allocates pinned memory, worker does the GPU->CPU copy.
+/// All layers are copied on the same CUDA stream with a single synchronization.
 pub struct SaveTask {
+    pub layers: Vec<SaveLayerData>,
+    pub reply: oneshot::Sender<Result<(), EngineError>>,
+}
+
+/// Data for saving a single layer's blocks from GPU to CPU.
+pub struct SaveLayerData {
     pub registration: KVCacheRegistration,
     pub blocks: Vec<SaveBlock>,
-    pub reply: oneshot::Sender<Result<(), EngineError>>,
 }
 
 pub struct SaveBlock {
@@ -49,6 +55,9 @@ pub struct SaveBlock {
 // by PinnedAllocation. The caller ensures the backing memory stays alive
 // until the task completes.
 unsafe impl Send for SaveBlock {}
+// SAFETY: SaveLayerData contains SaveBlocks which hold raw pointers to pinned
+// memory. Same safety guarantees as SaveBlock apply.
+unsafe impl Send for SaveLayerData {}
 
 /// Per-GPU worker pool with dedicated load and save threads
 pub struct GpuWorkerPool {
@@ -137,10 +146,20 @@ impl GpuWorkerPool {
         registration: KVCacheRegistration,
         blocks: Vec<SaveBlock>,
     ) -> Result<(), EngineError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let task = SaveTask {
+        self.batch_save(vec![SaveLayerData {
             registration,
             blocks,
+        }])
+        .await
+    }
+
+    /// Submit a multi-layer save task (GPU -> CPU) - async, wait for completion.
+    /// All layers are copied on the same CUDA stream with a single synchronization,
+    /// which is significantly faster than submitting individual per-layer tasks.
+    pub async fn batch_save(&self, layers: Vec<SaveLayerData>) -> Result<(), EngineError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let task = SaveTask {
+            layers,
             reply: reply_tx,
         };
 
@@ -364,70 +383,89 @@ fn process_load_task(task: &LoadTask, stream: &CudaStream) -> Result<(), EngineE
 
 /// Process a save task: copy blocks from GPU to CPU pinned memory
 fn process_save_task(task: &SaveTask, stream: &CudaStream) -> Result<(), EngineError> {
-    let registration = &task.registration;
     let start = std::time::Instant::now();
+    let mut total_bytes = 0usize;
+    let mut total_memcpy_calls = 0usize;
+    let mut total_blocks = 0usize;
 
-    let (total_bytes, memcpy_calls) = if registration.segments == 2
-        && registration.kv_stride_bytes > registration.bytes_per_block
-    {
-        // Layer-first layout: K and V segments stored separately
-        let segment_size = registration.bytes_per_block;
+    // Issue all memcpy commands for all layers onto the same stream
+    for layer in &task.layers {
+        let registration = &layer.registration;
 
-        // Build transfer lists for batch copy
-        let mut k_transfers = Vec::with_capacity(task.blocks.len());
-        let mut v_transfers = Vec::with_capacity(task.blocks.len());
-
-        for block in &task.blocks {
-            let k_offset = transfer::segment_offset(registration, block.block_idx, 0)
-                .map_err(EngineError::Storage)?;
-            let v_offset = transfer::segment_offset(registration, block.block_idx, 1)
-                .map_err(EngineError::Storage)?;
-            let v_ptr = block
-                .v_dst_ptr
-                .unwrap_or_else(|| unsafe { block.k_dst_ptr.add(segment_size) });
-
-            k_transfers.push((k_offset, block.k_dst_ptr));
-            v_transfers.push((v_offset, v_ptr));
+        if layer.blocks.is_empty() {
+            continue;
         }
+        total_blocks += layer.blocks.len();
 
-        // Batch copy K segments
-        let k_batches = transfer::batch_copy_segments_from_gpu(
-            &k_transfers,
-            segment_size,
-            registration,
-            stream,
-        )
-        .map_err(|e| EngineError::Storage(format!("K batch copy failed: {e}")))?;
+        let (layer_bytes, layer_memcpy) = if registration.segments == 2
+            && registration.kv_stride_bytes > registration.bytes_per_block
+        {
+            // Layer-first layout: K and V segments stored separately
+            let segment_size = registration.bytes_per_block;
 
-        // Batch copy V segments
-        let v_batches = transfer::batch_copy_segments_from_gpu(
-            &v_transfers,
-            segment_size,
-            registration,
-            stream,
-        )
-        .map_err(|e| EngineError::Storage(format!("V batch copy failed: {e}")))?;
+            // Build transfer lists for batch copy
+            let mut k_transfers = Vec::with_capacity(layer.blocks.len());
+            let mut v_transfers = Vec::with_capacity(layer.blocks.len());
 
-        (task.blocks.len() * segment_size * 2, k_batches + v_batches)
-    } else {
-        // Contiguous or single-segment layout - build transfer list for batch copy
-        let block_size = registration.block_size_bytes;
-        let mut transfers = Vec::with_capacity(task.blocks.len());
+            for block in &layer.blocks {
+                let k_offset = transfer::segment_offset(registration, block.block_idx, 0)
+                    .map_err(EngineError::Storage)?;
+                let v_offset = transfer::segment_offset(registration, block.block_idx, 1)
+                    .map_err(EngineError::Storage)?;
+                let v_ptr = block
+                    .v_dst_ptr
+                    .unwrap_or_else(|| unsafe { block.k_dst_ptr.add(segment_size) });
 
-        for block in &task.blocks {
-            let gpu_offset = transfer::segment_offset(registration, block.block_idx, 0)
-                .map_err(EngineError::Storage)?;
-            transfers.push((gpu_offset, block.k_dst_ptr));
-        }
+                k_transfers.push((k_offset, block.k_dst_ptr));
+                v_transfers.push((v_offset, v_ptr));
+            }
 
-        let memcpy_calls =
-            transfer::batch_copy_segments_from_gpu(&transfers, block_size, registration, stream)
-                .map_err(|e| EngineError::Storage(format!("Batch copy failed: {e}")))?;
+            // Batch copy K segments
+            let k_batches = transfer::batch_copy_segments_from_gpu(
+                &k_transfers,
+                segment_size,
+                registration,
+                stream,
+            )
+            .map_err(|e| EngineError::Storage(format!("K batch copy failed: {e}")))?;
 
-        (task.blocks.len() * block_size, memcpy_calls)
-    };
+            // Batch copy V segments
+            let v_batches = transfer::batch_copy_segments_from_gpu(
+                &v_transfers,
+                segment_size,
+                registration,
+                stream,
+            )
+            .map_err(|e| EngineError::Storage(format!("V batch copy failed: {e}")))?;
 
-    // Synchronize stream to ensure all copies are complete
+            (layer.blocks.len() * segment_size * 2, k_batches + v_batches)
+        } else {
+            // Contiguous or single-segment layout - build transfer list for batch copy
+            let block_size = registration.block_size_bytes;
+            let mut transfers = Vec::with_capacity(layer.blocks.len());
+
+            for block in &layer.blocks {
+                let gpu_offset = transfer::segment_offset(registration, block.block_idx, 0)
+                    .map_err(EngineError::Storage)?;
+                transfers.push((gpu_offset, block.k_dst_ptr));
+            }
+
+            let memcpy_calls = transfer::batch_copy_segments_from_gpu(
+                &transfers,
+                block_size,
+                registration,
+                stream,
+            )
+            .map_err(|e| EngineError::Storage(format!("Batch copy failed: {e}")))?;
+
+            (layer.blocks.len() * block_size, memcpy_calls)
+        };
+
+        total_bytes += layer_bytes;
+        total_memcpy_calls += layer_memcpy;
+    }
+
+    // Single synchronization for all layers
     let event = stream
         .record_event(None)
         .map_err(|e| EngineError::Storage(format!("Failed to record event: {e:?}")))?;
@@ -443,12 +481,13 @@ fn process_save_task(task: &SaveTask, stream: &CudaStream) -> Result<(), EngineE
     };
 
     debug!(
-        "Save task completed: blocks={} bytes={} elapsed_ms={:.2} bandwidth_gbps={:.2} memcpy_calls={}",
-        task.blocks.len(),
+        "Save task completed: layers={} blocks={} bytes={} elapsed_ms={:.2} bandwidth_gbps={:.2} memcpy_calls={}",
+        task.layers.len(),
+        total_blocks,
         total_bytes,
         elapsed.as_secs_f64() * 1000.0,
         bandwidth_gbps,
-        memcpy_calls
+        total_memcpy_calls
     );
 
     Ok(())

@@ -11,7 +11,7 @@ use crate::registry::{CudaTensorRegistry, TensorMetadata};
 use fastrace::prelude::*;
 use log::{debug, info, warn};
 use parking_lot::Mutex;
-use pegaflow_core::{EngineError, PegaEngine, PrefetchStatus};
+use pegaflow_core::{EngineError, LayerSave, PegaEngine, PrefetchStatus};
 use pyo3::{PyErr, Python};
 use std::sync::Arc;
 use std::time::Instant;
@@ -201,9 +201,13 @@ impl Engine for GrpcEngineService {
             } = req;
             let tp_rank = Self::usize_from_u32(tp_rank, "tp_rank")?;
 
-            let saves: Vec<_> = saves
+            let saves: Vec<LayerSave> = saves
                 .into_iter()
-                .map(|layer| (layer.layer_name, layer.block_ids, layer.block_hashes))
+                .map(|layer| LayerSave {
+                    layer_name: layer.layer_name,
+                    block_ids: layer.block_ids,
+                    block_hashes: layer.block_hashes,
+                })
                 .collect();
 
             debug!(

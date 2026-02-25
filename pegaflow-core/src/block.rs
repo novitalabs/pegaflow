@@ -2,7 +2,6 @@
 // Block types for StorageEngine
 // ============================================================================
 
-use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -31,6 +30,13 @@ impl BlockKey {
 }
 
 pub type BlockHash = Vec<u8>;
+
+/// Per-layer save input: layer name + block IDs + content hashes.
+pub struct LayerSave {
+    pub layer_name: String,
+    pub block_ids: Vec<i32>,
+    pub block_hashes: Vec<Vec<u8>>,
+}
 
 // ============================================================================
 // Block Status and Prefetch Status
@@ -174,36 +180,6 @@ impl SealedBlock {
 // ============================================================================
 // Errors
 // ============================================================================
-
-#[derive(Debug)]
-pub enum BlockInsertError {
-    SlotOutOfBounds { slot_id: usize, total_slots: usize },
-    SlotCountMismatch { expected: usize, got: usize },
-}
-
-impl fmt::Display for BlockInsertError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            BlockInsertError::SlotOutOfBounds {
-                slot_id,
-                total_slots,
-            } => {
-                write!(
-                    f,
-                    "slot_id {} out of bounds ({} slots)",
-                    slot_id, total_slots
-                )
-            }
-            BlockInsertError::SlotCountMismatch { expected, got } => {
-                write!(f, "slot count mismatch: expected {}, got {}", expected, got)
-            }
-        }
-    }
-}
-
-impl std::error::Error for BlockInsertError {}
-
-// ============================================================================
 // Inflight Block (write path, mutable)
 // ============================================================================
 
@@ -247,46 +223,26 @@ impl InflightBlock {
         self.footprint
     }
 
-    pub fn slot_exists(&self, slot_id: usize) -> bool {
-        self.slots
-            .get(slot_id)
-            .and_then(|opt| opt.as_ref())
-            .is_some()
-    }
+    /// Insert a slot idempotently. Duplicate inserts are no-ops.
+    ///
+    /// Returns `true` if all slots are now filled (ready to seal).
+    pub fn insert_slot(&mut self, slot_id: usize, block: Arc<LayerBlock>) -> bool {
+        debug_assert!(
+            slot_id < self.total_slots,
+            "slot_id {} must be < total_slots {}",
+            slot_id,
+            self.total_slots
+        );
 
-    /// Insert a slot. Returns Ok(true) if block is now complete.
-    pub fn insert_slot(
-        &mut self,
-        slot_id: usize,
-        block: Arc<LayerBlock>,
-        total_slots: usize,
-    ) -> Result<bool, BlockInsertError> {
-        if total_slots != self.total_slots {
-            return Err(BlockInsertError::SlotCountMismatch {
-                expected: self.total_slots,
-                got: total_slots,
-            });
+        if self.slots[slot_id].is_none() {
+            self.footprint += block.memory_footprint();
+            self.slots[slot_id] = Some(block);
+            self.remaining = self
+                .remaining
+                .checked_sub(1)
+                .expect("remaining should not underflow");
         }
-
-        if slot_id >= self.total_slots {
-            return Err(BlockInsertError::SlotOutOfBounds {
-                slot_id,
-                total_slots: self.total_slots,
-            });
-        }
-
-        if self.slots[slot_id].is_some() {
-            // Already filled - this is a no-op, not an error
-            return Ok(false);
-        }
-
-        self.footprint += block.memory_footprint();
-        self.slots[slot_id] = Some(block);
-        self.remaining = self
-            .remaining
-            .checked_sub(1)
-            .expect("remaining should not underflow");
-        Ok(self.remaining == 0)
+        self.remaining == 0
     }
 
     /// Seal the block, converting to immutable SealedBlock.
