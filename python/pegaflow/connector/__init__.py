@@ -21,6 +21,7 @@ from pegaflow.connector.common import (
     PegaKVConnectorStats,
     PegaPromMetrics,
     derive_namespace,
+    detect_mla,
     logger,
     resolve_instance_id,
 )
@@ -39,7 +40,9 @@ class PegaKVConnector(KVConnectorBase_V1):
         instance_id = resolve_instance_id(vllm_config)
         tp_size = vllm_config.parallel_config.tensor_parallel_size
         world_size = vllm_config.parallel_config.world_size
-        namespace = derive_namespace(vllm_config, tp_size)
+        is_mla = detect_mla(vllm_config)
+        effective_tp_size = 1 if is_mla else tp_size
+        namespace = derive_namespace(vllm_config, effective_tp_size)
         num_layers = getattr(vllm_config.model_config.hf_text_config, "num_hidden_layers", 0)
         block_size = vllm_config.cache_config.block_size
 
@@ -76,6 +79,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             device_id=device_id,
             engine_client=engine_client,
             state_manager=self._state_manager,
+            is_mla=is_mla,
         )
 
         self._scheduler: SchedulerConnector | None = None
@@ -86,7 +90,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             self._worker = WorkerConnector(self._ctx)
 
         logger.info(
-            "[PegaKVConnector] Initialized role=%s instance_id=%s device=%s tp_rank=%s tp_size=%d world_size=%d layers=%d namespace=%s",
+            "[PegaKVConnector] Initialized role=%s instance_id=%s device=%s tp_rank=%s tp_size=%d world_size=%d layers=%d namespace=%s is_mla=%s",
             role.name,
             instance_id,
             device_id if device_id is not None else "cpu",
@@ -95,6 +99,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             world_size,
             num_layers,
             namespace,
+            is_mla,
         )
 
     # ==============================
