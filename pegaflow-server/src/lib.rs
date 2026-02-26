@@ -128,8 +128,16 @@ pub struct Cli {
     pub max_prefetch_blocks: usize,
 
     /// Trace sampling rate (0.0–1.0). E.g. 0.01 = 1%. Default: 1.0 (100%)
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(long, default_value_t = 1.0, value_parser = parse_sample_rate)]
     pub trace_sample_rate: f64,
+}
+
+fn parse_sample_rate(s: &str) -> Result<f64, String> {
+    let v: f64 = s.parse().map_err(|e| format!("{e}"))?;
+    if !(0.0..=1.0).contains(&v) {
+        return Err(format!("sample rate must be between 0.0 and 1.0, got {v}"));
+    }
+    Ok(v)
 }
 
 fn format_py_err(err: PyErr) -> String {

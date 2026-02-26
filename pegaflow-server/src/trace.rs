@@ -24,7 +24,7 @@ impl Reporter for LogReporter {
         }
 
         for (_, mut group) in traces {
-            // Sort: root span (parent_id == 0) last; children by span_id (creation order).
+            // Sort: root span (parent_id == 0) first; children by span_id (creation order).
             group.sort_by_key(|s| (s.parent_id.0 != 0, s.span_id.0));
 
             // Find the root span to lead the line.
