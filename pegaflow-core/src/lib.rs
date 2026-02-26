@@ -401,9 +401,9 @@ impl PegaEngine {
         let namespace = instance.namespace();
         let metrics = core_metrics();
 
-        let query = self.storage.check_prefix(namespace, block_hashes);
-        let hit = query.hit;
-        let missing = query.remaining_keys.len();
+        let (hit, missing) = self
+            .storage
+            .check_prefix_memory_only(namespace, block_hashes);
 
         metrics.cache_block_hits.add(hit as u64, &[]);
         if missing > 0 {
@@ -433,11 +433,12 @@ impl PegaEngine {
         let world_size = instance.world_size();
         let metrics = core_metrics();
 
-        // Phase 1: query — check which blocks are in memory cache
-        let query = self.storage.check_prefix(namespace, block_hashes);
-
-        // Phase 2: prefetch — classify remaining, trigger SSD reads, pin hits
-        let status = self.storage.prefetch_blocks(instance_id, query, world_size);
+        let status = self.storage.check_prefix_and_prefetch(
+            instance_id,
+            namespace,
+            block_hashes,
+            world_size,
+        );
 
         match &status {
             PrefetchStatus::Done { hit, missing } => {
