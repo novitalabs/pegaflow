@@ -203,6 +203,29 @@ struct NicResult {
     latencies_ms: Vec<f64>,
 }
 
+/// Max bytes per single RDMA WR (IB max_msg_size is typically 1 GiB).
+const MAX_RDMA_MSG_BYTES: usize = 1 << 30;
+
+/// Build chunked (local_ptr, remote_ptr, len) vectors for a single buffer pair.
+fn chunk_transfer(
+    local_base: u64,
+    remote_base: u64,
+    total: usize,
+) -> (Vec<u64>, Vec<u64>, Vec<usize>) {
+    let mut local_ptrs = Vec::new();
+    let mut remote_ptrs = Vec::new();
+    let mut lens = Vec::new();
+    let mut offset = 0usize;
+    while offset < total {
+        let chunk = MAX_RDMA_MSG_BYTES.min(total - offset);
+        local_ptrs.push(local_base + offset as u64);
+        remote_ptrs.push(remote_base + offset as u64);
+        lens.push(chunk);
+        offset += chunk;
+    }
+    (local_ptrs, remote_ptrs, lens)
+}
+
 /// Run one direction (READ or WRITE) across all NIC contexts in parallel.
 fn run_bench(
     contexts: &[NicContext],
@@ -223,23 +246,29 @@ fn run_bench(
                     let server_session = ctx.server.get_session_id();
                     let mut latencies_ms = Vec::with_capacity(iters);
 
+                    let (local_ptrs, remote_ptrs, lens) = chunk_transfer(
+                        ctx.client_buf.as_u64(),
+                        ctx.server_buf.as_u64(),
+                        ctx.per_nic_bytes,
+                    );
+
                     for iter in 0..total_iters {
                         // Sync all NICs for each iteration.
                         barrier.wait();
 
                         let start = Instant::now();
                         let result = match mode {
-                            "write" => ctx.client.transfer_sync_write(
+                            "write" => ctx.client.batch_transfer_sync_write(
                                 &server_session,
-                                ctx.client_buf.as_u64(),
-                                ctx.server_buf.as_u64(),
-                                ctx.per_nic_bytes,
+                                &local_ptrs,
+                                &remote_ptrs,
+                                &lens,
                             ),
-                            "read" => ctx.client.transfer_sync_read(
+                            "read" => ctx.client.batch_transfer_sync_read(
                                 &server_session,
-                                ctx.client_buf.as_u64(),
-                                ctx.server_buf.as_u64(),
-                                ctx.per_nic_bytes,
+                                &local_ptrs,
+                                &remote_ptrs,
+                                &lens,
                             ),
                             _ => unreachable!(),
                         };
@@ -442,6 +471,21 @@ fn main() {
                 client_buf,
                 per_nic_bytes,
             });
+        }
+
+        // Pre-establish RC connections sequentially (avoid concurrent UD handshake storms).
+        // Use a small transfer (4 KiB) just to trigger connection setup.
+        for ctx in &contexts {
+            let server_session = ctx.server.get_session_id();
+            ctx.client
+                .transfer_sync_write(
+                    &server_session,
+                    ctx.client_buf.as_u64(),
+                    ctx.server_buf.as_u64(),
+                    4096,
+                )
+                .expect("pre-connect WRITE failed");
+            println!("  {} connected", ctx.nic_name);
         }
 
         // Run WRITE bench.
