@@ -87,7 +87,7 @@ uv run python examples/bench_kv_cache.py --model /path/to/model --num-prompts 10
 
 1. **pegaflow-core** (Rust): Core storage engine
    - `PegaEngine`: Main engine managing GPU workers and KV cache storage
-   - `storage.rs`: Block-based storage with content-addressed blocks (`check_prefix` for memory-only, `prefetch_blocks` for SSD)
+   - `storage.rs`: Block-based storage with content-addressed blocks (`check_prefix_memory_only` for memory-only, `check_prefix_and_prefetch` for SSD)
    - `pinned_pool.rs` / `pinned_mem.rs`: Pinned memory allocator
    - `transfer.rs`: GPU-CPU transfer operations via CUDA
    - `cache.rs`: LRU cache for blocks
