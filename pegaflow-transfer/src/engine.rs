@@ -57,6 +57,58 @@ impl MooncakeTransferEngine {
             .transfer_sync_write(session_id, local_ptr, remote_ptr, len)
     }
 
+    pub fn transfer_sync_read(
+        &self,
+        session_id: &DomainAddress,
+        local_ptr: u64,
+        remote_ptr: u64,
+        len: usize,
+    ) -> Result<usize> {
+        self.backend
+            .transfer_sync_read(session_id, local_ptr, remote_ptr, len)
+    }
+
+    pub fn batch_transfer_sync_read(
+        &self,
+        session_id: &DomainAddress,
+        local_ptrs: &[u64],
+        remote_ptrs: &[u64],
+        lens: &[usize],
+    ) -> Result<usize> {
+        if local_ptrs.len() != remote_ptrs.len() {
+            return Err(TransferError::BatchLengthMismatch {
+                ptrs: local_ptrs.len(),
+                lens: remote_ptrs.len(),
+            });
+        }
+        if local_ptrs.len() != lens.len() {
+            return Err(TransferError::BatchLengthMismatch {
+                ptrs: local_ptrs.len(),
+                lens: lens.len(),
+            });
+        }
+
+        let started_at = Instant::now();
+        let transferred =
+            self.backend
+                .batch_transfer_sync_read(session_id, local_ptrs, remote_ptrs, lens)?;
+        let elapsed = started_at.elapsed();
+        let elapsed_secs = elapsed.as_secs_f64();
+        if elapsed_secs > 0.0 {
+            let gbps = (transferred as f64 * 8.0) / elapsed_secs / 1e9;
+            let gib_per_sec = (transferred as f64) / elapsed_secs / (1024.0 * 1024.0 * 1024.0);
+            log::debug!(
+                "batch_transfer_sync_read e2e bandwidth: bytes={}, chunks={}, elapsed_ms={:.3}, bw_gbps={:.3}, bw_gibps={:.3}",
+                transferred,
+                lens.len(),
+                elapsed_secs * 1000.0,
+                gbps,
+                gib_per_sec
+            );
+        }
+        Ok(transferred)
+    }
+
     pub fn batch_transfer_sync_write(
         &self,
         session_id: &DomainAddress,

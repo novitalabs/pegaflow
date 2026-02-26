@@ -1839,7 +1839,9 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "bytes",
+ "clap",
  "cudarc",
+ "libc",
  "log",
  "logforth",
  "lz4_flex",

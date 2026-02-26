@@ -53,8 +53,8 @@ const UD_RECV_SLOTS: usize = 64;
 const UD_BUFFER_BYTES: usize = 4096;
 const UD_GRH_BYTES: usize = 40;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
-const MAX_INFLIGHT_WRITES: usize = 96;
-const MAX_WR_CHAIN_WRITES: usize = 4;
+const MAX_INFLIGHT_OPS: usize = 96;
+const MAX_WR_CHAIN_OPS: usize = 4;
 
 #[derive(Default)]
 struct ControlPlane {
@@ -167,7 +167,7 @@ struct ActiveSession {
     cmd_tx: std_mpsc::Sender<SessionCommand>,
 }
 
-struct WriteOp {
+struct RdmaOp {
     local_mr: Arc<MemoryRegion>,
     local_ptr: u64,
     remote_ptr: u64,
@@ -177,7 +177,8 @@ struct WriteOp {
 
 enum SessionCommand {
     SubmitBatch {
-        ops: Vec<WriteOp>,
+        ops: Vec<RdmaOp>,
+        opcode: ibv_wr_opcode::Type,
         done_tx: std_mpsc::Sender<Result<usize>>,
     },
 }
@@ -1016,10 +1017,11 @@ impl SidewayBackend {
         Ok(retained)
     }
 
-    fn post_write_wr_chain(
+    fn post_rdma_wr_chain(
         session: &ActiveSession,
-        ops: &[WriteOp],
+        ops: &[RdmaOp],
         first_wr_id: u64,
+        opcode: ibv_wr_opcode::Type,
     ) -> Result<usize> {
         if ops.is_empty() {
             return Ok(0);
@@ -1048,7 +1050,7 @@ impl SidewayBackend {
             wrs[idx].wr_id = first_wr_id.wrapping_add(idx as u64);
             wrs[idx].sg_list = &raw mut sges[idx];
             wrs[idx].num_sge = 1;
-            wrs[idx].opcode = ibv_wr_opcode::IBV_WR_RDMA_WRITE;
+            wrs[idx].opcode = opcode;
             wrs[idx].send_flags = ibv_send_flags::IBV_SEND_SIGNALED.0;
             wrs[idx].wr.rdma.remote_addr = op.remote_ptr;
             wrs[idx].wr.rdma.rkey = op.remote_rkey;
@@ -1064,8 +1066,13 @@ impl SidewayBackend {
             let qp = session.qp.lock();
             let ret = unsafe { ibv_post_send(qp.qp().as_ptr(), wrs.as_mut_ptr(), &raw mut bad_wr) };
             if ret != 0 {
+                let op_name = match opcode {
+                    ibv_wr_opcode::IBV_WR_RDMA_WRITE => "RDMA_WRITE",
+                    ibv_wr_opcode::IBV_WR_RDMA_READ => "RDMA_READ",
+                    _ => "UNKNOWN",
+                };
                 return Err(TransferError::Backend(format!(
-                    "ibv_post_send(RDMA_WRITE chain) failed: {}",
+                    "ibv_post_send({op_name} chain) failed: {}",
                     io::Error::from_raw_os_error(ret)
                 )));
             }
@@ -1073,7 +1080,11 @@ impl SidewayBackend {
         Ok(ops.len())
     }
 
-    fn execute_batch_writes(session: &ActiveSession, ops: Vec<WriteOp>) -> Result<usize> {
+    fn execute_batch_rdma(
+        session: &ActiveSession,
+        ops: Vec<RdmaOp>,
+        opcode: ibv_wr_opcode::Type,
+    ) -> Result<usize> {
         let total_ops = ops.len();
         if total_ops == 0 {
             return Ok(0);
@@ -1085,14 +1096,15 @@ impl SidewayBackend {
         let mut transferred = 0usize;
 
         while next_idx < total_ops || !inflight.is_empty() {
-            while next_idx < total_ops && inflight.len() < MAX_INFLIGHT_WRITES {
-                let available = MAX_INFLIGHT_WRITES - inflight.len();
+            while next_idx < total_ops && inflight.len() < MAX_INFLIGHT_OPS {
+                let available = MAX_INFLIGHT_OPS - inflight.len();
                 let remaining = total_ops - next_idx;
-                let chain_len = MAX_WR_CHAIN_WRITES.min(available).min(remaining);
-                let posted = Self::post_write_wr_chain(
+                let chain_len = MAX_WR_CHAIN_OPS.min(available).min(remaining);
+                let posted = Self::post_rdma_wr_chain(
                     session,
                     &ops[next_idx..next_idx + chain_len],
                     next_wr_id,
+                    opcode,
                 )?;
                 if posted == 0 {
                     break;
@@ -1153,8 +1165,12 @@ impl SidewayBackend {
                 );
                 while let Ok(command) = cmd_rx.recv() {
                     match command {
-                        SessionCommand::SubmitBatch { ops, done_tx } => {
-                            let result = Self::execute_batch_writes(&session, ops);
+                        SessionCommand::SubmitBatch {
+                            ops,
+                            opcode,
+                            done_tx,
+                        } => {
+                            let result = Self::execute_batch_rdma(&session, ops, opcode);
                             if done_tx.send(result).is_err() {
                                 debug!(
                                     "session worker reply receiver dropped: local_qpn={}",
@@ -1171,11 +1187,19 @@ impl SidewayBackend {
             });
     }
 
-    fn submit_session_batch(session: &ActiveSession, ops: Vec<WriteOp>) -> Result<usize> {
+    fn submit_session_batch(
+        session: &ActiveSession,
+        ops: Vec<RdmaOp>,
+        opcode: ibv_wr_opcode::Type,
+    ) -> Result<usize> {
         let (done_tx, done_rx) = std_mpsc::channel();
         session
             .cmd_tx
-            .send(SessionCommand::SubmitBatch { ops, done_tx })
+            .send(SessionCommand::SubmitBatch {
+                ops,
+                opcode,
+                done_tx,
+            })
             .map_err(|_| {
                 TransferError::Backend("session worker channel disconnected".to_string())
             })?;
@@ -1286,8 +1310,51 @@ impl SidewayBackend {
         self.batch_transfer_sync_write(session_id, &[local_ptr], &[remote_ptr], &[len])
     }
 
+    pub(crate) fn transfer_sync_read(
+        &self,
+        session_id: &DomainAddress,
+        local_ptr: u64,
+        remote_ptr: u64,
+        len: usize,
+    ) -> Result<usize> {
+        self.batch_transfer_sync_read(session_id, &[local_ptr], &[remote_ptr], &[len])
+    }
+
     pub(crate) fn batch_transfer_sync_write(
         &self,
+        session_id: &DomainAddress,
+        local_ptrs: &[u64],
+        remote_ptrs: &[u64],
+        lens: &[usize],
+    ) -> Result<usize> {
+        self.batch_transfer_sync(
+            ibv_wr_opcode::IBV_WR_RDMA_WRITE,
+            session_id,
+            local_ptrs,
+            remote_ptrs,
+            lens,
+        )
+    }
+
+    pub(crate) fn batch_transfer_sync_read(
+        &self,
+        session_id: &DomainAddress,
+        local_ptrs: &[u64],
+        remote_ptrs: &[u64],
+        lens: &[usize],
+    ) -> Result<usize> {
+        self.batch_transfer_sync(
+            ibv_wr_opcode::IBV_WR_RDMA_READ,
+            session_id,
+            local_ptrs,
+            remote_ptrs,
+            lens,
+        )
+    }
+
+    fn batch_transfer_sync(
+        &self,
+        opcode: ibv_wr_opcode::Type,
         session_id: &DomainAddress,
         local_ptrs: &[u64],
         remote_ptrs: &[u64],
@@ -1314,9 +1381,15 @@ impl SidewayBackend {
             return Ok(0);
         }
 
+        let op_name = match opcode {
+            ibv_wr_opcode::IBV_WR_RDMA_WRITE => "write",
+            ibv_wr_opcode::IBV_WR_RDMA_READ => "read",
+            _ => "unknown",
+        };
+
         let peer_ud = session_id;
         let local_lookup_start = Instant::now();
-        let (runtime, mut prepared_ops): (Arc<SidewayRuntime>, Vec<WriteOp>) = {
+        let (runtime, mut prepared_ops): (Arc<SidewayRuntime>, Vec<RdmaOp>) = {
             let state = self.state.lock();
             Self::ensure_initialized(&state)?;
             let runtime = state
@@ -1346,7 +1419,7 @@ impl SidewayBackend {
                 else {
                     return Err(TransferError::MemoryNotRegistered { ptr: local_ptr });
                 };
-                prepared_ops.push(WriteOp {
+                prepared_ops.push(RdmaOp {
                     local_mr,
                     local_ptr,
                     remote_ptr,
@@ -1385,12 +1458,13 @@ impl SidewayBackend {
         }
         let remote_lookup_dur = remote_lookup_start.elapsed();
         let submit_start = Instant::now();
-        let transferred = Self::submit_session_batch(&session, prepared_ops)?;
+        let transferred = Self::submit_session_batch(&session, prepared_ops, opcode)?;
         let submit_dur = submit_start.elapsed();
 
         let total_dur = local_lookup_dur + ensure_session_dur + remote_lookup_dur + submit_dur;
         debug!(
-            "batch_transfer_sync_write profile: peer={}, bytes={}, chunks={}, local_lookup_ms={:.3}, ensure_session_ms={:.3}, remote_lookup_ms={:.3}, remote_cache_hits={}, submit_wait_ms={:.3}, total_ms={:.3}",
+            "batch_transfer_sync_{} profile: peer={}, bytes={}, chunks={}, local_lookup_ms={:.3}, ensure_session_ms={:.3}, remote_lookup_ms={:.3}, remote_cache_hits={}, submit_wait_ms={:.3}, total_ms={:.3}",
+            op_name,
             peer_ud,
             transferred,
             lens.len(),
