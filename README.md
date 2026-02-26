@@ -63,6 +63,8 @@ pegaflow-server
 - `--ssd-write-inflight`: SSD write inflight, max concurrent block writes (default: `2`)
 - `--ssd-prefetch-inflight`: SSD prefetch inflight, max concurrent block reads (default: `16`)
 - `--max-prefetch-blocks`: Max blocks allowed in prefetching state, backpressure for SSD prefetch (default: `800`)
+- `--metaserver-addr`: MetaServer gRPC address for cross-node block hash registry (e.g., `http://127.0.0.1:50056`). When set, saved block hashes are inserted to the metaserver for cross-node discovery.
+- `--advertise-addr`: Advertised address (ip:port) reported to the metaserver for cross-node discovery. Other nodes use this address to connect to this server. Fallback order: this flag > `PEGAFLOW_HOST_IP` env + bind port > auto-detected IP + bind port.
 
 ### 2b. (Optional) Start MetaServer for Multi-Node
 

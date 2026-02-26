@@ -1,8 +1,8 @@
 use crate::proto::engine::meta_server_server::MetaServer;
 use crate::proto::engine::{
     HealthRequest, HealthResponse, InsertBlockHashesRequest, InsertBlockHashesResponse,
-    QueryBlockHashesRequest, QueryBlockHashesResponse, ResponseStatus, ShutdownRequest,
-    ShutdownResponse,
+    NodeBlockHashes, QueryBlockHashesRequest, QueryBlockHashesResponse, ResponseStatus,
+    ShutdownRequest, ShutdownResponse,
 };
 use crate::store::BlockHashStore;
 use log::{debug, info};
@@ -44,8 +44,9 @@ impl MetaServer for GrpcMetaService {
         let req = request.into_inner();
 
         debug!(
-            "RPC [insert_block_hashes]: namespace={} hashes_count={}",
+            "RPC [insert_block_hashes]: namespace={} node={} hashes_count={}",
             req.namespace,
+            req.node,
             req.block_hashes.len()
         );
 
@@ -60,16 +61,16 @@ impl MetaServer for GrpcMetaService {
             return Ok(Response::new(response));
         }
 
-        // Insert hashes
+        // Insert hashes with node ownership
         let inserted = self
             .store
-            .insert_hashes(&req.namespace, &req.block_hashes)
+            .insert_hashes(&req.namespace, &req.block_hashes, &req.node)
             .await;
 
         let elapsed = start.elapsed();
         info!(
-            "RPC [insert_block_hashes]: namespace={} inserted={} hashes in {:?}",
-            req.namespace, inserted, elapsed
+            "RPC [insert_block_hashes]: namespace={} node={} inserted={} hashes in {:?}",
+            req.namespace, req.node, inserted, elapsed
         );
 
         let response = InsertBlockHashesResponse {
@@ -102,11 +103,12 @@ impl MetaServer for GrpcMetaService {
                 existing_hashes: vec![],
                 total_queried: 0,
                 found_count: 0,
+                node_blocks: vec![],
             };
             return Ok(Response::new(response));
         }
 
-        // Query existing hashes
+        // Query existing hashes (returns CrossNodeBlock entries)
         let existing = self
             .store
             .query_hashes(&req.namespace, &req.block_hashes)
@@ -121,11 +123,31 @@ impl MetaServer for GrpcMetaService {
             req.namespace, found_count, total_queried, elapsed
         );
 
+        let existing_hashes: Vec<Vec<u8>> = existing.iter().map(|e| e.block_hash.clone()).collect();
+
+        // Group hashes by node
+        let mut node_map: std::collections::HashMap<&str, Vec<Vec<u8>>> =
+            std::collections::HashMap::new();
+        for entry in &existing {
+            node_map
+                .entry(&entry.node)
+                .or_default()
+                .push(entry.block_hash.clone());
+        }
+        let node_blocks: Vec<NodeBlockHashes> = node_map
+            .into_iter()
+            .map(|(node, block_hashes)| NodeBlockHashes {
+                node: node.to_string(),
+                block_hashes,
+            })
+            .collect();
+
         let response = QueryBlockHashesResponse {
             status: Some(Self::ok_status()),
-            existing_hashes: existing,
+            existing_hashes,
             total_queried: total_queried as u64,
             found_count: found_count as u64,
+            node_blocks,
         };
 
         Ok(Response::new(response))

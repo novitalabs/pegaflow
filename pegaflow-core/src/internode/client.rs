@@ -73,10 +73,10 @@ impl PegaflowClient {
         &self.endpoint
     }
 
-    /// Query prefix cache hits on the remote instance.
+    /// Pure memory-only query on the remote instance.
     ///
-    /// This is the main API for P/D disaggregation where a decode instance
-    /// queries a prefill instance for cached KV blocks.
+    /// Checks if prefix blocks are in the remote node's memory cache
+    /// without triggering SSD prefetch.
     ///
     /// # Arguments
     ///
@@ -85,7 +85,7 @@ impl PegaflowClient {
     ///
     /// # Returns
     ///
-    /// `QueryResult` containing hit/miss/loading counts.
+    /// `QueryResult` containing hit/miss counts (no loading state).
     pub async fn query(
         &self,
         instance_id: &str,
@@ -100,6 +100,52 @@ impl PegaflowClient {
             .client
             .clone()
             .query(request)
+            .await
+            .map_err(|e| ClientError::RpcFailed(e.to_string()))?;
+
+        let resp = response.into_inner();
+        let status = resp
+            .status
+            .ok_or_else(|| ClientError::ResponseError("missing status in response".to_string()))?;
+
+        Ok(QueryResult {
+            ok: status.ok,
+            message: status.message,
+            status: QueryPrefetchStatus::Done {
+                hit_blocks: resp.hit_blocks as usize,
+                missing_blocks: resp.missing_blocks as usize,
+            },
+        })
+    }
+
+    /// Query prefix cache hits with SSD prefetch support on the remote instance.
+    ///
+    /// This is the main API for P/D disaggregation where a decode instance
+    /// queries a prefill instance for cached KV blocks, triggering SSD prefetch
+    /// for blocks not in memory.
+    ///
+    /// # Arguments
+    ///
+    /// * `instance_id` - The model instance ID
+    /// * `block_hashes` - List of block hashes to query
+    ///
+    /// # Returns
+    ///
+    /// `QueryResult` containing hit/miss/loading counts.
+    pub async fn query_prefetch(
+        &self,
+        instance_id: &str,
+        block_hashes: Vec<Vec<u8>>,
+    ) -> Result<QueryResult, ClientError> {
+        let request = QueryRequest {
+            instance_id: instance_id.to_string(),
+            block_hashes,
+        };
+
+        let response = self
+            .client
+            .clone()
+            .query_prefetch(request)
             .await
             .map_err(|e| ClientError::RpcFailed(e.to_string()))?;
 
@@ -148,15 +194,18 @@ impl PegaflowClient {
     }
 }
 
-/// Client pool for managing connections to multiple PegaFlow instances.
+/// Connection pool keyed by endpoint URL (e.g. `http://10.0.0.1:50055`).
 ///
-/// Uses service discovery to automatically connect to discovered instances.
+/// Used for targeted queries: the metaserver tells you which node owns a block,
+/// then you call `get_or_connect(endpoint)` to get a reusable gRPC channel.
+/// Stale entries are evicted when the backing registry no longer contains the
+/// endpoint's instance.
 pub struct PegaflowClientPool {
     /// Client configuration.
     config: ClientConfig,
-    /// Instance registry for service discovery.
+    /// Instance registry for health checks.
     registry: Arc<InstanceRegistry>,
-    /// Cached clients by instance name.
+    /// Cached clients keyed by endpoint URL.
     clients: dashmap::DashMap<String, PegaflowClient>,
 }
 
@@ -175,111 +224,58 @@ impl PegaflowClientPool {
         Self::new(registry, ClientConfig::default())
     }
 
-    /// Get or create a client for the given instance name.
-    pub async fn get_client(&self, instance_name: &str) -> Result<PegaflowClient, ClientError> {
-        // Check cache first
-        if let Some(client) = self.clients.get(instance_name) {
-            return Ok(client.clone());
-        }
-
-        // Look up instance in registry
-        let instance = self
-            .registry
-            .get(instance_name)
-            .ok_or_else(|| ClientError::InstanceNotFound(instance_name.to_string()))?;
-
-        if !instance.is_healthy() {
-            return Err(ClientError::InstanceNotFound(format!(
-                "{} is not healthy",
-                instance_name
-            )));
-        }
-
-        // Create new client
-        let client = PegaflowClient::from_instance(&instance, &self.config).await?;
-        self.clients
-            .insert(instance_name.to_string(), client.clone());
-
-        Ok(client)
-    }
-
-    /// Get a client for any healthy instance.
-    pub async fn get_any_client(&self) -> Result<PegaflowClient, ClientError> {
-        let instances = self.registry.healthy_instances();
-        if instances.is_empty() {
-            return Err(ClientError::NoHealthyInstances);
-        }
-
-        // Try to get an existing client first
-        for instance in &instances {
-            if let Some(client) = self.clients.get(&instance.name) {
+    /// Get a cached client or connect to the given endpoint.
+    ///
+    /// The endpoint is typically `http://ip:port` as returned by the metaserver.
+    /// Cached connections whose endpoint is no longer healthy in the registry
+    /// are evicted and reconnected.
+    pub async fn get_or_connect(&self, endpoint: &str) -> Result<PegaflowClient, ClientError> {
+        // Fast path: return cached client if the instance is still healthy.
+        if let Some(client) = self.clients.get(endpoint) {
+            if self.is_endpoint_healthy(endpoint) {
                 return Ok(client.clone());
             }
+            // Instance disappeared or became unhealthy — drop the stale entry.
+            drop(client);
+            self.clients.remove(endpoint);
+            debug!("Evicted stale client for {}", endpoint);
         }
 
-        // Create a new client for the first healthy instance
-        let instance = &instances[0];
-        let client = PegaflowClient::from_instance(instance, &self.config).await?;
-        self.clients.insert(instance.name.clone(), client.clone());
-
+        // Connect and cache.
+        let client = PegaflowClient::connect(endpoint, &self.config).await?;
+        self.clients.insert(endpoint.to_string(), client.clone());
         Ok(client)
     }
 
-    /// Query across all healthy instances in parallel.
-    ///
-    /// Returns results from all instances that responded successfully.
-    pub async fn query_all(
-        &self,
-        instance_id: &str,
-        block_hashes: Vec<Vec<u8>>,
-    ) -> Vec<(String, Result<QueryResult, ClientError>)> {
-        use futures::future::join_all;
-
-        let instances = self.registry.healthy_instances();
-        if instances.is_empty() {
-            return vec![];
+    /// Check whether any healthy registry instance matches this endpoint.
+    fn is_endpoint_healthy(&self, endpoint: &str) -> bool {
+        // If no registry entries exist (e.g. service discovery not used),
+        // assume healthy — the caller knows the endpoint from the metaserver.
+        if self.registry.is_empty() {
+            return true;
         }
-
-        let futures: Vec<_> = instances
-            .into_iter()
-            .map(|instance| {
-                let name = instance.name.clone();
-                let endpoint = instance.grpc_endpoint();
-                let config = self.config.clone();
-                let instance_id = instance_id.to_string();
-                let hashes = block_hashes.clone();
-
-                async move {
-                    let result = async {
-                        let client = PegaflowClient::connect(&endpoint, &config).await?;
-                        client.query(&instance_id, hashes).await
-                    }
-                    .await;
-
-                    (name, result)
-                }
-            })
-            .collect();
-
-        join_all(futures).await
+        self.registry
+            .healthy_instances()
+            .iter()
+            .any(|i| i.grpc_endpoint() == endpoint)
     }
 
-    /// Remove a client from the cache.
-    pub fn remove_client(&self, instance_name: &str) {
-        self.clients.remove(instance_name);
+    /// Remove a client from the cache by endpoint.
+    pub fn remove(&self, endpoint: &str) {
+        self.clients.remove(endpoint);
     }
 
-    /// Clear all cached clients.
+    /// Drop all cached clients.
     pub fn clear(&self) {
         self.clients.clear();
     }
 
-    /// Get the number of cached clients.
+    /// Number of cached connections.
     pub fn len(&self) -> usize {
         self.clients.len()
     }
 
-    /// Check if the cache is empty.
+    /// Whether the pool has no cached connections.
     pub fn is_empty(&self) -> bool {
         self.clients.is_empty()
     }
@@ -290,11 +286,12 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_client_pool_empty_registry() {
+    async fn test_client_pool_connect_unknown_endpoint() {
         let registry = Arc::new(InstanceRegistry::new());
         let pool = PegaflowClientPool::with_registry(registry);
 
-        let result = pool.get_any_client().await;
-        assert!(matches!(result, Err(ClientError::NoHealthyInstances)));
+        // Unreachable endpoint should fail with ConnectionFailed.
+        let result = pool.get_or_connect("http://192.0.2.1:50055").await;
+        assert!(matches!(result, Err(ClientError::ConnectionFailed(_))));
     }
 }

@@ -40,15 +40,11 @@
 //!     let result = client.query("instance-1", vec![vec![1, 2, 3]]).await?;
 //!     println!("Query result: {:?}", result.status);
 //!
-//!     // Option 2: Use client pool with service discovery
+//!     // Option 2: Use client pool (caches connections, evicts stale entries)
 //!     let registry = Arc::new(InstanceRegistry::new());
-//!     let config = ServiceDiscoveryConfig::new()
-//!         .enable()
-//!         .with_namespace("default");
-//!     let _handle = start_service_discovery(config, registry.clone()).await?;
-//!
 //!     let pool = PegaflowClientPool::with_registry(registry);
-//!     let client = pool.get_any_client().await?;
+//!     // Endpoint comes from the metaserver (node that owns the block)
+//!     let client = pool.get_or_connect("http://10.0.0.2:50055").await?;
 //!     let result = client.query("instance-1", vec![vec![1, 2, 3]]).await?;
 //!     println!("Query result: {:?}", result.status);
 //!

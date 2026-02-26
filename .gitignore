@@ -23,3 +23,6 @@ python/pegaflow/pegaflow-server-py
 .idea/
 *.swp
 *.swo
+
+# Claude
+CLAUDE.local.md

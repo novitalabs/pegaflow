@@ -261,7 +261,39 @@ class EngineRpcClient:
         instance_id: str,
         block_hashes: list[bytes],
     ) -> dict[str, Any]:
-        """Query prefix cache hits with prefetch support.
+        """Pure memory-only query: check if prefix blocks are in memory cache.
+
+        Does NOT trigger SSD prefetch or pin blocks. Use ``query_prefetch``
+        if you need SSD prefetch support.
+
+        Args:
+            instance_id: Model instance ID.
+            block_hashes: List of block hashes to check.
+
+        Returns:
+            Dict with keys:
+                - ok (bool): Whether the request succeeded.
+                - message (str): Error message if failed.
+                - hit_blocks (int): Number of blocks ready in memory cache.
+                - prefetch_state (str): Always "done".
+                - loading_blocks (int): Always 0.
+                - missing_blocks (int): Number of blocks not in memory cache.
+
+        Raises:
+            PegaFlowServiceError: If server is unavailable.
+            PegaFlowBusinessError: If request is invalid.
+        """
+        ...
+
+    def query_prefetch(
+        self,
+        instance_id: str,
+        block_hashes: list[bytes],
+    ) -> dict[str, Any]:
+        """Query prefix cache hits with SSD prefetch support.
+
+        Checks memory cache and triggers SSD prefetch for missing blocks.
+        Pins hit blocks for subsequent load operations.
 
         Args:
             instance_id: Model instance ID.
@@ -272,9 +304,9 @@ class EngineRpcClient:
                 - ok (bool): Whether the request succeeded.
                 - message (str): Error message if failed.
                 - hit_blocks (int): Number of blocks ready in cache.
-                - prefetch_state (str): One of "ready", "loading", "done".
-                - loading_blocks (int): Number of blocks being prefetched.
-                - missing_blocks (int): Number of blocks not found.
+                - prefetch_state (str): One of "done", "loading".
+                - loading_blocks (int): Number of blocks being prefetched from SSD.
+                - missing_blocks (int): Number of blocks not found anywhere.
 
         Raises:
             PegaFlowServiceError: If server is unavailable.

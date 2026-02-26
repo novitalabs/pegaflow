@@ -17,7 +17,7 @@ pub use service::GrpcEngineService;
 
 use clap::Parser;
 use cudarc::driver::result as cuda_driver;
-use log::{error, info};
+use log::{error, info, warn};
 use opentelemetry::global;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
@@ -136,6 +136,56 @@ pub struct Cli {
     /// When set, saved block hashes will be inserted to the metaserver for cross-node discovery.
     #[arg(long)]
     pub metaserver_addr: Option<String>,
+
+    /// Advertised address (ip:port) reported to the metaserver for cross-node discovery.
+    /// Other nodes use this address to connect to this server.
+    /// Fallback order: this flag > PEGAFLOW_HOST_IP env + bind port > auto-detected IP + bind port.
+    #[arg(long)]
+    pub advertise_addr: Option<String>,
+}
+
+/// Resolve the advertise address (ip:port) for metaserver registration.
+///
+/// Priority: `--advertise-addr` > `PEGAFLOW_HOST_IP` env + bind port > auto-detect + bind port.
+fn resolve_advertise_addr(cli_advertise: &Option<String>, bind_addr: SocketAddr) -> String {
+    // 1. Explicit CLI flag
+    if let Some(addr) = cli_advertise {
+        return addr.clone();
+    }
+
+    // 2. PEGAFLOW_HOST_IP env var + bind port
+    if let Ok(host_ip) = std::env::var("PEGAFLOW_HOST_IP") {
+        let addr = format!("{}:{}", host_ip.trim(), bind_addr.port());
+        info!("Using PEGAFLOW_HOST_IP for advertise address: {}", addr);
+        return addr;
+    }
+
+    // 3. Auto-detect: open a UDP socket to a remote address (no actual traffic)
+    //    to discover which local IP the OS would use for outbound routing.
+    if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0")
+        && socket.connect("1.1.1.1:80").is_ok()
+        && let Ok(local) = socket.local_addr()
+    {
+        let addr = format!("{}:{}", local.ip(), bind_addr.port());
+        info!("Auto-detected advertise address: {}", addr);
+        return addr;
+    }
+
+    // Last resort: use bind address as-is
+    let addr = bind_addr.to_string();
+    if bind_addr.ip().is_unspecified() {
+        warn!(
+            "Advertise address resolved to {} which is not routable. \
+             Set --advertise-addr or PEGAFLOW_HOST_IP to a reachable IP.",
+            addr
+        );
+    } else {
+        info!(
+            "Could not detect host IP, using bind address as advertise address: {}",
+            addr
+        );
+    }
+    addr
 }
 
 fn parse_sample_rate(s: &str) -> Result<f64, String> {
@@ -144,6 +194,10 @@ fn parse_sample_rate(s: &str) -> Result<f64, String> {
         return Err(format!("sample rate must be between 0.0 and 1.0, got {v}"));
     }
     Ok(v)
+}
+
+fn format_py_err(err: PyErr) -> String {
+    Python::attach(|py| err.value(py).to_string())
 }
 
 fn init_cuda_driver() -> Result<(), std::io::Error> {
@@ -402,9 +456,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
         // Connect to metaserver if configured (optional, continue if connection fails)
         if let Some(ref addr) = cli.metaserver_addr {
+            let node_url = resolve_advertise_addr(&cli.advertise_addr, cli.addr);
             match MetaServerClient::connect(addr.clone()).await {
                 Ok(client) => {
-                    engine.set_metaserver_client(client);
+                    engine.set_metaserver_client(client, node_url);
                 }
                 Err(err) => {
                     info!(

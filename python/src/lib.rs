@@ -443,7 +443,10 @@ impl EngineRpcClient {
         .and_then(|r| status_tuple("load", r.status))
     }
 
-    /// Query prefix cache hits with prefetch support.
+    /// Pure memory-only query: check if prefix blocks are in memory cache.
+    ///
+    /// This does NOT trigger SSD prefetch or pin blocks. Use `query_prefetch`
+    /// if you need SSD prefetch support.
     ///
     /// Args:
     ///     instance_id: Model instance ID
@@ -452,18 +455,16 @@ impl EngineRpcClient {
     /// Returns: dict with keys:
     ///     - ok: bool - whether the request succeeded
     ///     - message: str - error message if failed
-    ///     - hit_blocks: int - number of blocks ready in cache
-    ///     - prefetch_state: str - one of "ready", "loading", "partial_miss"
-    ///     - loading_blocks: int - number of blocks being prefetched
-    ///     - missing_blocks: int - number of blocks not found in DFS
+    ///     - hit_blocks: int - number of blocks ready in memory cache
+    ///     - prefetch_state: str - always "done"
+    ///     - loading_blocks: int - always 0
+    ///     - missing_blocks: int - number of blocks not in memory cache
     fn query(
         &self,
         py: Python<'_>,
         instance_id: String,
         block_hashes: Vec<Vec<u8>>,
     ) -> PyResult<Py<pyo3::types::PyAny>> {
-        use pegaflow_proto::proto::engine::PrefetchState;
-
         self.call(py, |mut c| async move {
             let resp = c
                 .query(QueryRequest {
@@ -475,6 +476,58 @@ impl EngineRpcClient {
         })
         .and_then(|r| {
             let (ok, msg) = status_tuple("query", r.status)?;
+            let hit = u64_to_usize(r.hit_blocks, "hit_blocks")?;
+            let missing = u64_to_usize(r.missing_blocks, "missing_blocks")?;
+
+            Python::attach(|py| {
+                use pyo3::types::PyDict;
+                let dict = PyDict::new(py);
+                dict.set_item("ok", ok)?;
+                dict.set_item("message", msg)?;
+                dict.set_item("hit_blocks", hit)?;
+                dict.set_item("prefetch_state", "done")?;
+                dict.set_item("loading_blocks", 0)?;
+                dict.set_item("missing_blocks", missing)?;
+                Ok(dict.into())
+            })
+        })
+    }
+
+    /// Query prefix cache hits with SSD prefetch support.
+    ///
+    /// Checks memory cache and triggers SSD prefetch for missing blocks.
+    /// Pins hit blocks for subsequent load operations.
+    ///
+    /// Args:
+    ///     instance_id: Model instance ID
+    ///     block_hashes: List of block hashes to check
+    ///
+    /// Returns: dict with keys:
+    ///     - ok: bool - whether the request succeeded
+    ///     - message: str - error message if failed
+    ///     - hit_blocks: int - number of blocks ready in cache
+    ///     - prefetch_state: str - one of "done", "loading"
+    ///     - loading_blocks: int - number of blocks being prefetched
+    ///     - missing_blocks: int - number of blocks not found
+    fn query_prefetch(
+        &self,
+        py: Python<'_>,
+        instance_id: String,
+        block_hashes: Vec<Vec<u8>>,
+    ) -> PyResult<Py<pyo3::types::PyAny>> {
+        use pegaflow_proto::proto::engine::PrefetchState;
+
+        self.call(py, |mut c| async move {
+            let resp = c
+                .query_prefetch(QueryRequest {
+                    instance_id,
+                    block_hashes,
+                })
+                .await?;
+            Ok(resp.into_inner())
+        })
+        .and_then(|r| {
+            let (ok, msg) = status_tuple("query_prefetch", r.status)?;
             let hit = u64_to_usize(r.hit_blocks, "hit_blocks")?;
             let loading = u64_to_usize(r.loading_blocks, "loading_blocks")?;
             let missing = u64_to_usize(r.missing_blocks, "missing_blocks")?;

@@ -107,6 +107,7 @@ Register a list of block hashes. Matches the `BlockKey` structure from pegaflow-
 message InsertBlockHashesRequest {
   string namespace = 1;         // Model namespace (part of BlockKey)
   repeated bytes block_hashes = 2;  // List of block hashes to insert (part of BlockKey)
+  string node = 3;              // The pegaflow-server gRPC address that owns these blocks
 }
 ```
 
@@ -132,11 +133,17 @@ message QueryBlockHashesRequest {
 
 **Response:**
 ```protobuf
+message NodeBlockHashes {
+  string node = 1;                      // Owning pegaflow-server (ip:port)
+  repeated bytes block_hashes = 2;      // Block hashes on this node
+}
+
 message QueryBlockHashesResponse {
-  ResponseStatus status = 1;        // Success/error status
-  repeated bytes existing_hashes = 2;  // Hashes that exist
-  uint64 total_queried = 3;         // Total number queried
-  uint64 found_count = 4;           // Number found
+  ResponseStatus status = 1;            // Success/error status
+  repeated bytes existing_hashes = 2;   // Hashes that exist
+  uint64 total_queried = 3;             // Total number queried
+  uint64 found_count = 4;              // Number found
+  repeated NodeBlockHashes node_blocks = 5;  // Found hashes grouped by node
 }
 ```
 
@@ -177,19 +184,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Connect to metaserver
     let mut client = MetaServerClient::connect("http://127.0.0.1:50056").await?;
 
-    // Insert block hashes (only needs namespace + hashes, matching BlockKey)
+    // Insert block hashes with node ownership
     let request = InsertBlockHashesRequest {
         namespace: "llama3-70b".to_string(),
         block_hashes: vec![
             vec![1, 2, 3, 4, 5, 6, 7, 8],
             vec![9, 10, 11, 12, 13, 14, 15, 16],
         ],
+        node: "10.0.0.1:50055".to_string(),
     };
 
     let response = client.insert_block_hashes(request).await?;
     println!("Inserted: {}", response.into_inner().inserted_count);
 
-    // Query block hashes (only needs namespace + hashes, matching BlockKey)
+    // Query block hashes (returns node ownership info)
     let request = QueryBlockHashesRequest {
         namespace: "llama3-70b".to_string(),
         block_hashes: vec![
@@ -201,6 +209,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let response = client.query_block_hashes(request).await?;
     let inner = response.into_inner();
     println!("Found: {}/{}", inner.found_count, inner.total_queried);
+    for nb in &inner.node_blocks {
+        println!("Node {}: {} blocks", nb.node, nb.block_hashes.len());
+    }
 
     Ok(())
 }
@@ -210,7 +221,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 The MetaServer uses a high-performance async cache based on **Moka**:
 
-- **Cache**: `moka::future::Cache<BlockKey, ()>` - async concurrent cache with LRU eviction and TTL
+- **Cache**: `moka::future::Cache<BlockKey, Arc<str>>` - async concurrent cache mapping block keys to owning node URLs, with LRU eviction and TTL
 - **BlockKey**: `{ namespace: String, hash: Vec<u8> }` - matches pegaflow-core's BlockKey
 - **Eviction Policy**: LRU (Least Recently Used)
 - **TTL**: 120 minutes - entries automatically expire after 2 hours

@@ -31,9 +31,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         vec![17, 18, 19, 20, 21, 22, 23, 24], // Block hash 3
     ];
 
+    let node = "10.0.0.1:50055"; // The pegaflow-server that owns these blocks
     let request = InsertBlockHashesRequest {
         namespace: namespace.to_string(),
         block_hashes: block_hashes.clone(),
+        node: node.to_string(),
     };
 
     let response = client.insert_block_hashes(request).await?;
@@ -53,6 +55,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   Status: {:?}", inner.status);
     println!("   Found: {}/{}", inner.found_count, inner.total_queried);
     println!("   Existing hashes count: {}", inner.existing_hashes.len());
+    for nb in &inner.node_blocks {
+        println!("   Node {}: {} blocks", nb.node, nb.block_hashes.len());
+    }
 
     // 4. Query mix of existing and non-existing hashes
     println!("\n4. Querying mix of existing and non-existing hashes...");

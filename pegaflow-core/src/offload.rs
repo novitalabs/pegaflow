@@ -493,12 +493,13 @@ impl PegaEngine {
         });
 
         // Insert block hashes to metaserver (fire-and-forget)
-        if let Some(mut client) = self.metaserver_client()
+        if let Some((mut client, node_url)) = self.metaserver_client()
             && !metaserver_hashes.is_empty()
         {
             let insert_req = InsertBlockHashesRequest {
                 namespace,
                 block_hashes: metaserver_hashes,
+                node: node_url,
             };
 
             tokio::spawn(async move {

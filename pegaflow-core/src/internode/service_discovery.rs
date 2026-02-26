@@ -6,7 +6,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use futures::{StreamExt, TryStreamExt};
+use futures::TryStreamExt;
 use k8s_openapi::api::core::v1::Pod;
 use kube::{
     Client,
@@ -107,35 +107,17 @@ pub async fn start_service_discovery(
         const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
 
         loop {
-            let watcher_config = Config::default();
+            // Use server-side label filtering to avoid fetching all pods.
+            let watcher_config = Config::default().labels(&label_selector);
             let watcher_stream = watcher(pods.clone(), watcher_config).applied_objects();
 
+            let registry_clone = Arc::clone(&registry);
             let config_clone = Arc::clone(&config_arc);
 
-            let filtered_stream = watcher_stream.filter_map(move |obj_res| {
-                let config_inner = Arc::clone(&config_clone);
-
-                async move {
-                    match obj_res {
-                        Ok(pod) => {
-                            if PegaflowInstance::should_include(&pod, &config_inner) {
-                                Some(Ok(pod))
-                            } else {
-                                None
-                            }
-                        }
-                        Err(e) => Some(Err(e)),
-                    }
-                }
-            });
-
-            let registry_clone = Arc::clone(&registry);
-            let config_clone2 = Arc::clone(&config_arc);
-
-            match filtered_stream
+            match watcher_stream
                 .try_for_each(move |pod| {
                     let registry_inner = Arc::clone(&registry_clone);
-                    let config_inner = Arc::clone(&config_clone2);
+                    let config_inner = Arc::clone(&config_clone);
 
                     async move {
                         if let Some(instance) = PegaflowInstance::from_pod(&pod, &config_inner) {

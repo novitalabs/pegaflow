@@ -50,6 +50,19 @@ pub const SSD_ALIGNMENT: usize = 512;
 const MAX_PREFETCH_BLOCKS: usize = 1500;
 
 // ============================================================================
+// Internal types
+// ============================================================================
+
+/// Result of querying prefix blocks against memory cache.
+pub(crate) struct PrefixQueryResult {
+    pub hit: usize,
+    /// Keys not in cache (from first cache miss onward). Pass to `prefetch_blocks`.
+    pub remaining_keys: Vec<BlockKey>,
+    /// Hit blocks to pin. Consumed by `prefetch_blocks`.
+    hit_blocks: Vec<(BlockKey, Arc<SealedBlock>, u64)>,
+}
+
+// ============================================================================
 // Metrics helpers (keep insert/evict logic together for easy audit)
 // ============================================================================
 
@@ -820,40 +833,74 @@ impl StorageEngine {
         reply_rx.await.unwrap_or(0)
     }
 
-    /// Check prefix blocks and trigger prefetch for blocks in SSD.
-    /// Returns status indicating whether caller should retry.
-    /// Hit blocks are pinned to prevent eviction before load.
+    /// Query which prefix blocks are in memory cache.
     ///
-    /// `num_workers` specifies the number of workers that will consume the pinned blocks
-    /// (typically tp_size). The ref_count is incremented by this amount so each worker
-    /// can call cache_lookup_many once.
-    pub fn check_prefix_and_prefetch(
-        &self,
-        instance_id: &str,
-        namespace: &str,
-        hashes: &[Vec<u8>],
-        num_workers: usize,
-    ) -> PrefetchStatus {
+    /// Scans blocks in prefix order. Counts contiguous cache hits, then collects
+    /// all remaining keys (from the first cache miss onward) for the caller to
+    /// pass to `prefetch_blocks`.
+    pub fn check_prefix(&self, namespace: &str, hashes: &[Vec<u8>]) -> PrefixQueryResult {
         let keys: Vec<BlockKey> = hashes
             .iter()
             .map(|hash| BlockKey::new(namespace.to_string(), hash.clone()))
             .collect();
-        let instance_id_owned = instance_id.to_string();
 
         let mut hit = 0usize;
+        let mut hit_blocks: Vec<(BlockKey, Arc<SealedBlock>, u64)> = Vec::new();
+        let mut remaining_keys: Vec<BlockKey> = Vec::new();
+
+        {
+            let mut inner = self.inner.lock();
+            let mut found_gap = false;
+
+            for key in keys {
+                if !found_gap {
+                    if let Some(block) = inner.cache.get(&key) {
+                        hit += 1;
+                        hit_blocks.push((key, Arc::clone(&block), block.memory_footprint()));
+                        continue;
+                    }
+                    found_gap = true;
+                }
+                remaining_keys.push(key);
+            }
+        }
+
+        PrefixQueryResult {
+            hit,
+            remaining_keys,
+            hit_blocks,
+        }
+    }
+
+    /// Classify remaining blocks, trigger SSD prefetch, and pin cache hits.
+    ///
+    /// For each remaining key (in prefix order):
+    /// - Re-checks cache (a prior prefetch may have completed since `check_prefix`)
+    /// - Checks prefetching set (already loading from SSD)
+    /// - Checks SSD index and schedules prefetch
+    /// - First true miss stops iteration (prefix semantics)
+    ///
+    /// Hit blocks are pinned when no loading is in progress.
+    /// `num_workers` is the ref_count increment (typically tp_size) so each worker
+    /// can call `cache_lookup_many` once.
+    pub fn prefetch_blocks(
+        &self,
+        instance_id: &str,
+        query: PrefixQueryResult,
+        num_workers: usize,
+    ) -> PrefetchStatus {
+        let total = query.hit + query.remaining_keys.len();
+        let mut hit = query.hit;
         let mut loading = 0usize;
         let mut missing = 0usize;
         let mut to_prefetch: Vec<BlockKey> = Vec::new();
-        let mut backpressure_missing = 0usize;
-
-        // Blocks to pin: (key, block, footprint_bytes)
-        let mut blocks_to_pin: Vec<(BlockKey, Arc<SealedBlock>, u64)> = Vec::new();
+        let mut blocks_to_pin = query.hit_blocks;
 
         {
             let mut inner = self.inner.lock();
 
-            for key in &keys {
-                // First check cache
+            for key in &query.remaining_keys {
+                // Re-check cache: block may have completed prefetch since check_prefix
                 if let Some(block) = inner.cache.get(key) {
                     hit += 1;
                     blocks_to_pin.push((key.clone(), Arc::clone(&block), block.memory_footprint()));
@@ -867,33 +914,33 @@ impl StorageEngine {
 
                 // Backpressure: stop scheduling if too many blocks are prefetching
                 if inner.prefetching.len() >= self.max_prefetch_blocks {
-                    backpressure_missing = hashes.len() - hit - loading;
-                    missing = backpressure_missing;
+                    missing = total - hit - loading;
+                    core_metrics()
+                        .ssd_prefetch_backpressure_blocks
+                        .add(missing as u64, &[]);
                     break;
                 }
 
-                // Check SSD index (ssd_ring is now in StorageInner)
                 let in_ssd = inner
                     .ssd_ring
                     .as_ref()
                     .is_some_and(|ring| ring.has_valid_entry(key));
 
                 if in_ssd {
-                    // Block is in SSD, schedule prefetch
                     to_prefetch.push(key.clone());
                     loading += 1;
                     continue;
                 }
 
-                // Block not found anywhere - this is a miss
-                // For prefix matching, first miss means remaining blocks are also missing
-                missing = hashes.len() - hit - loading;
+                // Block not found anywhere — first miss stops iteration (prefix semantics)
+                missing = total - hit - loading;
                 break;
             }
 
-            // Pin hit blocks when returning Done (no loading in progress)
-            // Increment ref_count by num_workers so each worker can consume the pin once
+            // Pin hit blocks when no loading is in progress.
+            // Increment ref_count by num_workers so each worker can consume the pin once.
             if loading == 0 {
+                let instance_id_owned = instance_id.to_string();
                 for (key, block, footprint_bytes) in blocks_to_pin {
                     let pin_key = (instance_id_owned.clone(), key.clone());
 
@@ -919,13 +966,7 @@ impl StorageEngine {
             }
         }
 
-        if backpressure_missing > 0 {
-            core_metrics()
-                .ssd_prefetch_backpressure_blocks
-                .add(backpressure_missing as u64, &[]);
-        }
-
-        // Trigger prefetch for blocks in SSD (outside lock)
+        // Trigger SSD prefetch outside lock
         if !to_prefetch.is_empty() {
             self.trigger_prefetch(to_prefetch);
         }

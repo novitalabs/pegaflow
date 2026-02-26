@@ -9,12 +9,20 @@ pub const DEFAULT_MAX_CAPACITY: u64 = 512 * 1024 * 1024;
 /// Default TTL for cache entries (120 minutes)
 pub const DEFAULT_TTL_MINUTES: u64 = 120;
 
+/// A block hash with the pegaflow-server node that owns it.
+#[derive(Debug, Clone)]
+pub struct CrossNodeBlock {
+    pub block_hash: Vec<u8>,
+    pub node: Arc<str>,
+}
+
 /// Async thread-safe block hash storage using Moka cache
-/// Stores BlockKeys (namespace + hash) with LRU eviction, size-aware capacity management, and TTL
+/// Stores BlockKeys (namespace + hash) mapped to owning node URL,
+/// with LRU eviction, size-aware capacity management, and TTL.
 pub struct BlockHashStore {
-    /// Moka async cache with LRU eviction, size-aware capacity, and 120-minute TTL
-    /// Key: BlockKey, Value: () (unit type, we only care about key existence)
-    cache: Arc<Cache<BlockKey, ()>>,
+    /// Moka async cache with LRU eviction, size-aware capacity, and configurable TTL.
+    /// Key: BlockKey, Value: node URL (the pegaflow-server that owns this block)
+    cache: Arc<Cache<BlockKey, Arc<str>>>,
 }
 
 impl BlockHashStore {
@@ -33,8 +41,10 @@ impl BlockHashStore {
         let cache = Cache::builder()
             // Set max capacity based on estimated memory size
             .max_capacity(max_capacity_bytes)
-            // Use weigher to estimate the size of each entry
-            .weigher(|key: &BlockKey, _value: &()| key.estimated_size() as u32)
+            // Use weigher to estimate the size of each entry (key + node URL)
+            .weigher(|key: &BlockKey, node: &Arc<str>| {
+                (key.estimated_size() + node.len() as u64 + 16) as u32
+            })
             // Set TTL
             .time_to_live(Duration::from_secs(ttl_minutes * 60))
             .build();
@@ -44,28 +54,30 @@ impl BlockHashStore {
         }
     }
 
-    /// Insert a list of block hashes asynchronously
-    /// Returns the number of inserted keys
-    pub async fn insert_hashes(&self, namespace: &str, hashes: &[Vec<u8>]) -> usize {
+    /// Insert a list of block hashes from a given node asynchronously.
+    /// Returns the number of inserted keys.
+    pub async fn insert_hashes(&self, namespace: &str, hashes: &[Vec<u8>], node: &str) -> usize {
+        let node: Arc<str> = Arc::from(node);
         let mut inserted = 0;
         for hash in hashes {
             let key = BlockKey::new(namespace.to_string(), hash.clone());
-            // Insert the key (with unit value) into the async cache
-            self.cache.insert(key, ()).await;
+            self.cache.insert(key, Arc::clone(&node)).await;
             inserted += 1;
         }
         inserted
     }
 
-    /// Query which hashes exist in the store asynchronously
-    /// Returns a vector of hashes that exist
-    pub async fn query_hashes(&self, namespace: &str, hashes: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    /// Query which hashes exist in the store asynchronously.
+    /// Returns a vector of [`CrossNodeBlock`]s for hashes that exist.
+    pub async fn query_hashes(&self, namespace: &str, hashes: &[Vec<u8>]) -> Vec<CrossNodeBlock> {
         let mut existing = Vec::new();
         for hash in hashes {
             let key = BlockKey::new(namespace.to_string(), hash.clone());
-            // Check if the key exists in the cache
-            if self.cache.get(&key).await.is_some() {
-                existing.push(hash.clone());
+            if let Some(node) = self.cache.get(&key).await {
+                existing.push(CrossNodeBlock {
+                    block_hash: hash.clone(),
+                    node,
+                });
             }
         }
         existing
@@ -111,11 +123,12 @@ mod tests {
     async fn test_insert_and_query() {
         let store = BlockHashStore::new();
         let namespace = "model-a";
+        let node = "10.0.0.1:50055";
 
         let hashes = vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8], vec![9, 10, 11, 12]];
 
         // Insert hashes
-        let inserted = store.insert_hashes(namespace, &hashes).await;
+        let inserted = store.insert_hashes(namespace, &hashes, node).await;
         assert_eq!(inserted, 3);
 
         // Run pending tasks to ensure cache is updated
@@ -124,6 +137,10 @@ mod tests {
         // Query existing hashes
         let existing = store.query_hashes(namespace, &hashes).await;
         assert_eq!(existing.len(), 3);
+        // Verify node is returned
+        for entry in &existing {
+            assert_eq!(entry.node.as_ref(), node);
+        }
 
         // Query with mix of existing and non-existing
         let mixed_hashes = vec![
@@ -137,6 +154,31 @@ mod tests {
         // Query with different namespace
         let existing = store.query_hashes("other-namespace", &hashes).await;
         assert_eq!(existing.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_node_overwrite() {
+        let store = BlockHashStore::new();
+        let namespace = "model-a";
+        let hash = vec![1, 2, 3, 4];
+
+        // Insert from node A
+        store
+            .insert_hashes(namespace, &[hash.clone()], "node-a:50055")
+            .await;
+        store.run_pending_tasks().await;
+
+        let existing = store.query_hashes(namespace, &[hash.clone()]).await;
+        assert_eq!(existing[0].node.as_ref(), "node-a:50055");
+
+        // Insert same hash from node B (overwrites)
+        store
+            .insert_hashes(namespace, &[hash.clone()], "node-b:50055")
+            .await;
+        store.run_pending_tasks().await;
+
+        let existing = store.query_hashes(namespace, &[hash]).await;
+        assert_eq!(existing[0].node.as_ref(), "node-b:50055");
     }
 
     #[tokio::test]
@@ -155,6 +197,7 @@ mod tests {
         let store = BlockHashStore::with_capacity(1024);
 
         let namespace = "test-namespace";
+        let node = "10.0.0.1:50055";
 
         // Insert many hashes (should trigger eviction)
         let mut hashes = Vec::new();
@@ -162,7 +205,7 @@ mod tests {
             hashes.push(vec![i as u8; 32]); // 32-byte hash
         }
 
-        let inserted = store.insert_hashes(namespace, &hashes).await;
+        let inserted = store.insert_hashes(namespace, &hashes, node).await;
         assert_eq!(inserted, 100);
 
         // Run pending tasks to trigger eviction
@@ -181,9 +224,10 @@ mod tests {
     async fn test_invalidate_all() {
         let store = BlockHashStore::new();
         let namespace = "model-test";
+        let node = "10.0.0.1:50055";
 
         let hashes = vec![vec![1, 2, 3], vec![4, 5, 6]];
-        store.insert_hashes(namespace, &hashes).await;
+        store.insert_hashes(namespace, &hashes, node).await;
         store.run_pending_tasks().await;
 
         // Verify entries exist

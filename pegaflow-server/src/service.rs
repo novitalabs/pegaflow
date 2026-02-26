@@ -348,7 +348,64 @@ impl Engine for GrpcEngineService {
                 req.block_hashes.len()
             );
 
-            // Use SSD prefetch-aware query
+            // Pure memory-only query (no SSD prefetch)
+            let (hit, missing) = self
+                .engine
+                .count_prefix_hit_blocks(&req.instance_id, &req.block_hashes)
+                .map_err(Self::map_engine_error)?;
+
+            Ok(Response::new(QueryResponse {
+                status: Some(Self::build_simple_response()),
+                hit_blocks: hit as u64,
+                prefetch_state: PrefetchState::PrefetchDone.into(),
+                loading_blocks: 0,
+                missing_blocks: missing as u64,
+            }))
+        };
+
+        let result: Result<Response<QueryResponse>, Status> = trace_in_span!(root, fut).await;
+
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        match &result {
+            Ok(response) => {
+                let resp = response.get_ref();
+                debug!(
+                    "RPC [query] completed: ok hit={} missing={} elapsed_ms={:.2}",
+                    resp.hit_blocks, resp.missing_blocks, elapsed_ms
+                )
+            }
+            Err(status) => warn!(
+                "RPC [query] failed: code={} message={} elapsed_ms={:.2}",
+                status.code(),
+                status.message(),
+                elapsed_ms
+            ),
+        }
+        record_rpc_result("query", &result, start);
+        result
+    }
+
+    async fn query_prefetch(
+        &self,
+        request: Request<QueryRequest>,
+    ) -> Result<Response<QueryResponse>, Status> {
+        let req = request.into_inner();
+        trace_root!("rpc.query_prefetch", root, || {
+            [
+                ("instance_id", req.instance_id.clone()),
+                ("block_hashes", req.block_hashes.len().to_string()),
+            ]
+        });
+
+        let start = Instant::now();
+        let fut = async {
+            debug!(
+                "RPC [query_prefetch]: instance_id={} block_hashes={}",
+                req.instance_id,
+                req.block_hashes.len()
+            );
+
+            // SSD prefetch-aware query
             let status = self
                 .engine
                 .count_prefix_hit_blocks_with_prefetch(&req.instance_id, &req.block_hashes)
@@ -385,18 +442,18 @@ impl Engine for GrpcEngineService {
                     .map(|s| format!("{:?}", s))
                     .unwrap_or_else(|_| format!("Unknown({})", resp.prefetch_state));
                 debug!(
-                    "RPC [query] completed: ok hit={} loading={} missing={} state={} elapsed_ms={:.2}",
+                    "RPC [query_prefetch] completed: ok hit={} loading={} missing={} state={} elapsed_ms={:.2}",
                     resp.hit_blocks, resp.loading_blocks, resp.missing_blocks, state, elapsed_ms
                 )
             }
             Err(status) => warn!(
-                "RPC [query] failed: code={} message={} elapsed_ms={:.2}",
+                "RPC [query_prefetch] failed: code={} message={} elapsed_ms={:.2}",
                 status.code(),
                 status.message(),
                 elapsed_ms
             ),
         }
-        record_rpc_result("query", &result, start);
+        record_rpc_result("query_prefetch", &result, start);
         result
     }
 
