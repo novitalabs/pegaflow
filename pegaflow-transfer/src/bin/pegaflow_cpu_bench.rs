@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! CPU-memory RDMA benchmark: measures RDMA READ vs WRITE throughput across NUMA nodes and NICs.
+//! CPU-memory RDMA benchmark: measures per-task RDMA READ vs WRITE latency across NUMA nodes and NICs.
 //!
-//! Spawns server + client engine pairs per NIC, allocates NUMA-local CPU memory,
-//! and measures single-NIC and aggregate multi-NIC bandwidth.
+//! Models a realistic workload: each "task" transfers N random-sized batches of fixed-size blocks
+//! via RDMA, measuring per-task latency. Runs single-NIC baselines then multi-NIC aggregate.
 
 use std::sync::{Arc, Barrier};
 use std::time::Instant;
@@ -20,31 +20,117 @@ use pegaflow_transfer::{MooncakeTransferEngine, init_logging};
 // ---------------------------------------------------------------------------
 
 #[derive(Parser)]
-#[command(name = "pegaflow_cpu_bench", about = "RDMA CPU memory bandwidth benchmark")]
+#[command(
+    name = "pegaflow_cpu_bench",
+    about = "RDMA CPU memory block-task latency benchmark"
+)]
 struct Cli {
-    /// Total transfer size (e.g. "1gb", "512mb"). Split evenly across NICs.
-    #[arg(long, default_value = "1gb")]
-    size: String,
+    /// Block size (e.g. "4mb", "2mb").
+    #[arg(long, default_value = "4mb")]
+    block_size: String,
 
-    /// Number of measured iterations.
-    #[arg(long, default_value_t = 10)]
-    iters: usize,
+    /// Blocks per task: single number (e.g. "150") or range (e.g. "100-200").
+    /// When a range, each task randomly picks a count (deterministic seed).
+    #[arg(long, default_value = "150")]
+    blocks_per_task: String,
 
-    /// Number of warmup iterations.
-    #[arg(long, default_value_t = 3)]
-    warmup: usize,
+    /// Number of measured tasks.
+    #[arg(long, default_value_t = 50)]
+    tasks: usize,
+
+    /// Number of warmup tasks (not measured).
+    #[arg(long, default_value_t = 5)]
+    warmup_tasks: usize,
+
+    /// Benchmark mode.
+    #[arg(long, default_value = "both", value_parser = ["read", "write", "both"])]
+    mode: String,
 
     /// Base RPC port. Each engine pair gets consecutive ports from here.
     #[arg(long, default_value_t = 56100)]
     base_port: u16,
 
-    /// Restrict to a single NIC (e.g. "mlx5_0"). Default: all NICs per NUMA.
+    /// Restrict to a single NIC (e.g. "mlx5_0").
     #[arg(long)]
     nic: Option<String>,
 
-    /// Restrict to a single NUMA node (e.g. 0). Default: all NUMA nodes.
+    /// Exclude a NIC (e.g. "mlx5_0").
+    #[arg(long)]
+    exclude_nic: Option<String>,
+
+    /// Restrict to a single NUMA node (e.g. 0).
     #[arg(long)]
     numa: Option<u32>,
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic RNG (no external dependency)
+// ---------------------------------------------------------------------------
+
+struct SimpleRng {
+    state: u64,
+}
+
+impl SimpleRng {
+    fn new(seed: u64) -> Self {
+        Self {
+            state: seed.wrapping_add(1),
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        // SplitMix64
+        self.state = self.state.wrapping_add(0x9e3779b97f4a7c15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z ^ (z >> 31)
+    }
+
+    /// Uniform in [lo, hi] inclusive.
+    fn range(&mut self, lo: usize, hi: usize) -> usize {
+        if lo == hi {
+            return lo;
+        }
+        let span = (hi - lo + 1) as u64;
+        (lo as u64 + self.next_u64() % span) as usize
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parse helpers
+// ---------------------------------------------------------------------------
+
+fn parse_size(s: &str) -> usize {
+    let s = s.trim().to_lowercase();
+    let (num_str, multiplier) = if s.ends_with("tb") {
+        (&s[..s.len() - 2], 1usize << 40)
+    } else if s.ends_with("gb") {
+        (&s[..s.len() - 2], 1usize << 30)
+    } else if s.ends_with("mb") {
+        (&s[..s.len() - 2], 1usize << 20)
+    } else if s.ends_with("kb") {
+        (&s[..s.len() - 2], 1usize << 10)
+    } else {
+        (s.as_str(), 1usize)
+    };
+    let num: f64 = num_str.parse().expect("invalid size number");
+    (num * multiplier as f64) as usize
+}
+
+/// Parse "150" or "100-200" into (lo, hi).
+fn parse_block_range(s: &str) -> (usize, usize) {
+    if let Some((lo, hi)) = s.split_once('-') {
+        let lo: usize = lo.trim().parse().expect("invalid blocks-per-task low");
+        let hi: usize = hi.trim().parse().expect("invalid blocks-per-task high");
+        assert!(lo <= hi, "blocks-per-task: low must <= high");
+        assert!(lo > 0, "blocks-per-task: must be > 0");
+        (lo, hi)
+    } else {
+        let n: usize = s.trim().parse().expect("invalid blocks-per-task");
+        assert!(n > 0, "blocks-per-task: must be > 0");
+        (n, n)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -60,7 +146,6 @@ unsafe impl Send for NumaBuffer {}
 unsafe impl Sync for NumaBuffer {}
 
 impl NumaBuffer {
-    /// Allocate `len` bytes on the given NUMA node using thread-affinity + first-touch.
     fn alloc(numa_node: u32, len: usize) -> Self {
         assert!(len > 0);
 
@@ -70,13 +155,11 @@ impl NumaBuffer {
             .get(&numa_node)
             .unwrap_or_else(|| panic!("no CPUs found for NUMA{}", numa_node));
 
-        // Spawn a thread pinned to the target NUMA node, mmap + touch there.
         let cpus = cpus.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         let handle = thread::Builder::new()
             .name(format!("numa{}-alloc", numa_node))
             .spawn(move || {
-                // Pin to NUMA CPUs.
                 unsafe {
                     let mut cpu_set: libc::cpu_set_t = mem::zeroed();
                     for &cpu in &cpus {
@@ -87,10 +170,13 @@ impl NumaBuffer {
                         mem::size_of::<libc::cpu_set_t>(),
                         &cpu_set,
                     );
-                    assert_eq!(ret, 0, "sched_setaffinity failed: {}", std::io::Error::last_os_error());
+                    assert_eq!(
+                        ret, 0,
+                        "sched_setaffinity failed: {}",
+                        std::io::Error::last_os_error()
+                    );
                 }
 
-                // mmap + first-touch so pages land on this NUMA node.
                 let p = unsafe {
                     libc::mmap(
                         ptr::null_mut(),
@@ -136,7 +222,7 @@ impl Drop for NumaBuffer {
 }
 
 // ---------------------------------------------------------------------------
-// Per-NIC context: holds server + client engines and their buffers
+// Per-NIC context
 // ---------------------------------------------------------------------------
 
 struct NicContext {
@@ -145,7 +231,6 @@ struct NicContext {
     client: MooncakeTransferEngine,
     server_buf: NumaBuffer,
     client_buf: NumaBuffer,
-    per_nic_bytes: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -176,113 +261,196 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     sorted[idx]
 }
 
-fn parse_size(s: &str) -> usize {
-    let s = s.trim().to_lowercase();
-    let (num_str, multiplier) = if s.ends_with("tb") {
-        (&s[..s.len() - 2], 1usize << 40)
-    } else if s.ends_with("gb") {
-        (&s[..s.len() - 2], 1usize << 30)
-    } else if s.ends_with("mb") {
-        (&s[..s.len() - 2], 1usize << 20)
-    } else if s.ends_with("kb") {
-        (&s[..s.len() - 2], 1usize << 10)
-    } else {
-        (s.as_str(), 1usize)
-    };
-    let num: f64 = num_str.parse().expect("invalid size number");
-    (num * multiplier as f64) as usize
+// ---------------------------------------------------------------------------
+// Task schedule: pre-generated block counts per task (deterministic)
+// ---------------------------------------------------------------------------
+
+/// Pre-generate block counts for each task. Same sequence used for read and write.
+fn generate_task_schedule(
+    total_tasks: usize,
+    block_range: (usize, usize),
+    seed: u64,
+) -> Vec<usize> {
+    let mut rng = SimpleRng::new(seed);
+    (0..total_tasks)
+        .map(|_| rng.range(block_range.0, block_range.1))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
-// Bench runner
+// Build scatter lists for a task
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
-struct NicResult {
-    nic_name: String,
-    latencies_ms: Vec<f64>,
-}
-
-/// Max bytes per single RDMA WR (IB max_msg_size is typically 1 GiB).
-const MAX_RDMA_MSG_BYTES: usize = 1 << 30;
-
-/// Build chunked (local_ptr, remote_ptr, len) vectors for a single buffer pair.
-fn chunk_transfer(
+/// For a single NIC, build (local_ptrs, remote_ptrs, lens) for `nblocks` blocks of `block_size`.
+/// Blocks are taken from offset 0 of the contiguous buffer.
+fn build_block_scatter(
     local_base: u64,
     remote_base: u64,
-    total: usize,
+    nblocks: usize,
+    block_size: usize,
 ) -> (Vec<u64>, Vec<u64>, Vec<usize>) {
-    let mut local_ptrs = Vec::new();
-    let mut remote_ptrs = Vec::new();
-    let mut lens = Vec::new();
-    let mut offset = 0usize;
-    while offset < total {
-        let chunk = MAX_RDMA_MSG_BYTES.min(total - offset);
-        local_ptrs.push(local_base + offset as u64);
-        remote_ptrs.push(remote_base + offset as u64);
-        lens.push(chunk);
-        offset += chunk;
+    let mut local_ptrs = Vec::with_capacity(nblocks);
+    let mut remote_ptrs = Vec::with_capacity(nblocks);
+    let lens = vec![block_size; nblocks];
+    for i in 0..nblocks {
+        let off = (i * block_size) as u64;
+        local_ptrs.push(local_base + off);
+        remote_ptrs.push(remote_base + off);
     }
     (local_ptrs, remote_ptrs, lens)
 }
 
-/// Run one direction (READ or WRITE) across all NIC contexts in parallel.
-fn run_bench(
+/// For multi-NIC aggregate, distribute `nblocks` round-robin across `nic_count` NICs.
+/// Returns per-NIC block counts.
+fn distribute_blocks(nblocks: usize, nic_count: usize) -> Vec<usize> {
+    let base = nblocks / nic_count;
+    let remainder = nblocks % nic_count;
+    (0..nic_count)
+        .map(|i| base + if i < remainder { 1 } else { 0 })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Result types
+// ---------------------------------------------------------------------------
+
+struct TaskResult {
+    latency_ms: f64,
+    bytes: usize,
+}
+
+struct BenchResult {
+    nic_name: String,
+    tasks: Vec<TaskResult>,
+}
+
+// ---------------------------------------------------------------------------
+// Single-NIC bench: one NIC handles all blocks per task
+// ---------------------------------------------------------------------------
+
+fn run_single_nic_bench(
+    ctx: &NicContext,
+    mode: &str,
+    schedule: &[usize],
+    warmup: usize,
+    block_size: usize,
+) -> BenchResult {
+    let server_session = ctx.server.get_session_id();
+    let mut tasks = Vec::with_capacity(schedule.len().saturating_sub(warmup));
+
+    for (i, &nblocks) in schedule.iter().enumerate() {
+        let (local_ptrs, remote_ptrs, lens) =
+            build_block_scatter(ctx.client_buf.as_u64(), ctx.server_buf.as_u64(), nblocks, block_size);
+
+        let start = Instant::now();
+        let result = match mode {
+            "write" => ctx.client.batch_transfer_sync_write(
+                &server_session,
+                &local_ptrs,
+                &remote_ptrs,
+                &lens,
+            ),
+            "read" => ctx.client.batch_transfer_sync_read(
+                &server_session,
+                &local_ptrs,
+                &remote_ptrs,
+                &lens,
+            ),
+            _ => unreachable!(),
+        };
+        let elapsed = start.elapsed();
+        result.expect("RDMA transfer failed");
+
+        if i >= warmup {
+            tasks.push(TaskResult {
+                latency_ms: elapsed.as_secs_f64() * 1000.0,
+                bytes: nblocks * block_size,
+            });
+        }
+    }
+
+    BenchResult {
+        nic_name: ctx.nic_name.clone(),
+        tasks,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-NIC aggregate bench: distribute blocks across NICs per task
+// ---------------------------------------------------------------------------
+
+fn run_multi_nic_bench(
     contexts: &[NicContext],
     mode: &str,
+    schedule: &[usize],
     warmup: usize,
-    iters: usize,
-) -> Vec<NicResult> {
+    block_size: usize,
+) -> Vec<BenchResult> {
     let n = contexts.len();
+    if n == 1 {
+        return vec![run_single_nic_bench(&contexts[0], mode, schedule, warmup, block_size)];
+    }
+
     let barrier = Arc::new(Barrier::new(n));
-    let total_iters = warmup + iters;
+    let schedule = Arc::new(schedule.to_vec());
 
     thread::scope(|s| {
         let handles: Vec<_> = contexts
             .iter()
-            .map(|ctx| {
+            .enumerate()
+            .map(|(nic_idx, ctx)| {
                 let barrier = Arc::clone(&barrier);
+                let schedule = Arc::clone(&schedule);
                 s.spawn(move || {
                     let server_session = ctx.server.get_session_id();
-                    let mut latencies_ms = Vec::with_capacity(iters);
+                    let mut tasks = Vec::with_capacity(schedule.len().saturating_sub(warmup));
 
-                    let (local_ptrs, remote_ptrs, lens) = chunk_transfer(
-                        ctx.client_buf.as_u64(),
-                        ctx.server_buf.as_u64(),
-                        ctx.per_nic_bytes,
-                    );
+                    for (i, &nblocks) in schedule.iter().enumerate() {
+                        let per_nic = distribute_blocks(nblocks, n);
+                        let my_blocks = per_nic[nic_idx];
 
-                    for iter in 0..total_iters {
-                        // Sync all NICs for each iteration.
+                        let (local_ptrs, remote_ptrs, lens) = build_block_scatter(
+                            ctx.client_buf.as_u64(),
+                            ctx.server_buf.as_u64(),
+                            my_blocks,
+                            block_size,
+                        );
+
+                        // Sync all NICs before each task.
                         barrier.wait();
 
                         let start = Instant::now();
-                        let result = match mode {
-                            "write" => ctx.client.batch_transfer_sync_write(
-                                &server_session,
-                                &local_ptrs,
-                                &remote_ptrs,
-                                &lens,
-                            ),
-                            "read" => ctx.client.batch_transfer_sync_read(
-                                &server_session,
-                                &local_ptrs,
-                                &remote_ptrs,
-                                &lens,
-                            ),
-                            _ => unreachable!(),
-                        };
+                        if my_blocks > 0 {
+                            let result = match mode {
+                                "write" => ctx.client.batch_transfer_sync_write(
+                                    &server_session,
+                                    &local_ptrs,
+                                    &remote_ptrs,
+                                    &lens,
+                                ),
+                                "read" => ctx.client.batch_transfer_sync_read(
+                                    &server_session,
+                                    &local_ptrs,
+                                    &remote_ptrs,
+                                    &lens,
+                                ),
+                                _ => unreachable!(),
+                            };
+                            result.expect("RDMA transfer failed");
+                        }
                         let elapsed = start.elapsed();
-                        result.expect("RDMA transfer failed");
 
-                        if iter >= warmup {
-                            latencies_ms.push(elapsed.as_secs_f64() * 1000.0);
+                        if i >= warmup {
+                            tasks.push(TaskResult {
+                                latency_ms: elapsed.as_secs_f64() * 1000.0,
+                                bytes: my_blocks * block_size,
+                            });
                         }
                     }
 
-                    NicResult {
+                    BenchResult {
                         nic_name: ctx.nic_name.clone(),
-                        latencies_ms,
+                        tasks,
                     }
                 })
             })
@@ -292,53 +460,116 @@ fn run_bench(
     })
 }
 
-fn print_results(results: &[NicResult], mode: &str, per_nic_bytes: usize, numa_node: u32) {
-    let nic_count = results.len();
-    let total_bytes = per_nic_bytes * nic_count;
+// ---------------------------------------------------------------------------
+// Print results
+// ---------------------------------------------------------------------------
+
+fn print_single_nic_result(result: &BenchResult, mode: &str, block_size: usize, numa_node: u32) {
+    let mut latencies: Vec<f64> = result.tasks.iter().map(|t| t.latency_ms).collect();
+    latencies.sort_by(f64::total_cmp);
+
+    let avg_bytes: usize = result.tasks.iter().map(|t| t.bytes).sum::<usize>() / result.tasks.len().max(1);
+    let avg_blocks = avg_bytes / block_size;
+
+    let p50 = percentile(&latencies, 0.50);
+    let p95 = percentile(&latencies, 0.95);
+    let p99 = percentile(&latencies, 0.99);
 
     println!();
     println!(
-        "=== RDMA {} (NUMA{}, {} NIC{}) ===",
+        "=== RDMA {} — {} (NUMA{}, single NIC) ===",
         mode.to_uppercase(),
+        result.nic_name,
         numa_node,
-        nic_count,
-        if nic_count > 1 { "s" } else { "" },
     );
+    println!(
+        "  avg {:.0} blocks x {}  ({:.1} MB/task)",
+        avg_blocks,
+        format_size(block_size),
+        avg_bytes as f64 / (1024.0 * 1024.0),
+    );
+    println!(
+        "  p50={:.2}ms  p95={:.2}ms  p99={:.2}ms",
+        p50, p95, p99,
+    );
+    println!(
+        "  p50 equiv: {:.1} Gbps ({:.2} GiB/s)",
+        gbps(avg_bytes, p50 / 1000.0),
+        gib_per_sec(avg_bytes, p50 / 1000.0),
+    );
+}
 
-    // Per-NIC stats.
-    for r in results {
-        let mut sorted = r.latencies_ms.clone();
-        sorted.sort_by(f64::total_cmp);
-        let p50_ms = percentile(&sorted, 0.50);
-        let p50_bw = gbps(per_nic_bytes, p50_ms / 1000.0);
-        println!(
-            "  {}: p50={:.2}ms ({:.1} Gbps)",
-            r.nic_name, p50_ms, p50_bw,
-        );
+fn print_multi_nic_results(
+    results: &[BenchResult],
+    mode: &str,
+    block_size: usize,
+    schedule: &[usize],
+    warmup: usize,
+    numa_node: u32,
+) {
+    let nic_count = results.len();
+    let measured = &schedule[warmup..];
+    let ntasks = measured.len();
+    if ntasks == 0 {
+        return;
     }
 
-    // Aggregate: for each iteration, sum the max latency across NICs (barrier-synced,
-    // so aggregate time is max across NICs per iter).
-    let iters = results[0].latencies_ms.len();
-    let mut agg_latencies_ms: Vec<f64> = (0..iters)
+    // Aggregate latency = max across NICs per task.
+    let mut agg_latencies: Vec<f64> = (0..ntasks)
         .map(|i| {
             results
                 .iter()
-                .map(|r| r.latencies_ms[i])
+                .map(|r| r.tasks[i].latency_ms)
                 .fold(0.0_f64, f64::max)
         })
         .collect();
-    agg_latencies_ms.sort_by(f64::total_cmp);
+    agg_latencies.sort_by(f64::total_cmp);
 
-    let p50_ms = percentile(&agg_latencies_ms, 0.50);
-    let p95_ms = percentile(&agg_latencies_ms, 0.95);
-    let p50_gib = gib_per_sec(total_bytes, p50_ms / 1000.0);
-    let p50_gbps = gbps(total_bytes, p50_ms / 1000.0);
+    let avg_total_blocks: usize = measured.iter().sum::<usize>() / ntasks;
+    let avg_bytes = avg_total_blocks * block_size;
 
+    let p50 = percentile(&agg_latencies, 0.50);
+    let p95 = percentile(&agg_latencies, 0.95);
+    let p99 = percentile(&agg_latencies, 0.99);
+
+    let nic_names: Vec<&str> = results.iter().map(|r| r.nic_name.as_str()).collect();
+
+    println!();
     println!(
-        "  Aggregate: {:.1} Gbps ({:.2} GiB/s)  p50={:.2}ms p95={:.2}ms",
-        p50_gbps, p50_gib, p50_ms, p95_ms,
+        "=== RDMA {} — NUMA{}, {} NICs aggregate [{}] ===",
+        mode.to_uppercase(),
+        numa_node,
+        nic_count,
+        nic_names.join(", "),
     );
+    println!(
+        "  avg {:.0} blocks x {}  ({:.1} MB/task, split across {} NICs)",
+        avg_total_blocks,
+        format_size(block_size),
+        avg_bytes as f64 / (1024.0 * 1024.0),
+        nic_count,
+    );
+    println!(
+        "  p50={:.2}ms  p95={:.2}ms  p99={:.2}ms",
+        p50, p95, p99,
+    );
+    println!(
+        "  p50 equiv: {:.1} Gbps ({:.2} GiB/s)",
+        gbps(avg_bytes, p50 / 1000.0),
+        gib_per_sec(avg_bytes, p50 / 1000.0),
+    );
+}
+
+fn format_size(bytes: usize) -> String {
+    if bytes >= 1 << 30 {
+        format!("{:.1}GB", bytes as f64 / (1u64 << 30) as f64)
+    } else if bytes >= 1 << 20 {
+        format!("{:.0}MB", bytes as f64 / (1u64 << 20) as f64)
+    } else if bytes >= 1 << 10 {
+        format!("{:.0}KB", bytes as f64 / (1u64 << 10) as f64)
+    } else {
+        format!("{}B", bytes)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -348,24 +579,43 @@ fn print_results(results: &[NicResult], mode: &str, per_nic_bytes: usize, numa_n
 fn main() {
     init_logging();
     let cli = Cli::parse();
-    let total_size = parse_size(&cli.size);
+
+    let block_size = parse_size(&cli.block_size);
+    let block_range = parse_block_range(&cli.blocks_per_task);
+    let total_tasks = cli.warmup_tasks + cli.tasks;
+
+    // Pre-generate deterministic schedule (same for read & write).
+    let schedule = generate_task_schedule(total_tasks, block_range, 0x42);
+    let max_blocks = *schedule.iter().max().unwrap();
 
     println!(
-        "pegaflow_cpu_bench: size={} iters={} warmup={} base_port={}",
-        cli.size, cli.iters, cli.warmup, cli.base_port
+        "pegaflow_cpu_bench: block_size={} blocks_per_task={} tasks={} warmup={} base_port={}",
+        cli.block_size, cli.blocks_per_task, cli.tasks, cli.warmup_tasks, cli.base_port,
     );
+    if block_range.0 != block_range.1 {
+        println!(
+            "  schedule: min={} max={} blocks (pre-generated, deterministic seed)",
+            schedule.iter().min().unwrap(),
+            max_blocks,
+        );
+    }
     if let Some(ref nic) = cli.nic {
         println!("  filter: nic={}", nic);
+    }
+    if let Some(ref nic) = cli.exclude_nic {
+        println!("  exclude: nic={}", nic);
     }
     if let Some(numa) = cli.numa {
         println!("  filter: numa={}", numa);
     }
 
+    // Buffer size per NIC: enough to hold max_blocks.
+    let buf_per_nic = max_blocks * block_size;
+
     // Detect topology.
     let topo = SystemTopology::detect();
     topo.log_summary();
 
-    // Select NUMA groups.
     let groups: Vec<_> = topo
         .groups()
         .iter()
@@ -387,13 +637,19 @@ fn main() {
     let mut port_cursor = cli.base_port;
 
     for group in &groups {
-        // Filter NICs.
         let nics: Vec<_> = group
             .nics
             .iter()
             .filter(|nic| {
                 if let Some(ref filter) = cli.nic {
                     &nic.name == filter
+                } else {
+                    true
+                }
+            })
+            .filter(|nic| {
+                if let Some(ref exclude) = cli.exclude_nic {
+                    &nic.name != exclude
                 } else {
                     true
                 }
@@ -405,25 +661,17 @@ fn main() {
         }
 
         let nic_count = nics.len();
-        let per_nic_bytes = total_size / nic_count;
-        if per_nic_bytes == 0 {
-            eprintln!(
-                "warning: NUMA{} skipped, size too small to split across {} NICs",
-                group.node.0, nic_count
-            );
-            continue;
-        }
 
         println!();
         println!(
-            "--- NUMA{}: {} NIC(s) [{}], {:.2} GiB per NIC ---",
+            "--- NUMA{}: {} NIC(s) [{}], buf={} per NIC ---",
             group.node.0,
             nic_count,
             nics.iter()
                 .map(|n| n.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", "),
-            per_nic_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            format_size(buf_per_nic),
         );
 
         // Build NIC contexts.
@@ -435,10 +683,9 @@ fn main() {
             let client_port = port_cursor;
             port_cursor += 1;
 
-            let server_buf = NumaBuffer::alloc(group.node.0, per_nic_bytes);
-            let client_buf = NumaBuffer::alloc(group.node.0, per_nic_bytes);
+            let server_buf = NumaBuffer::alloc(group.node.0, buf_per_nic);
+            let client_buf = NumaBuffer::alloc(group.node.0, buf_per_nic);
 
-            // Fill server buffer with data (for READ bench), client with different pattern (for WRITE bench).
             server_buf.fill(0xAA);
             client_buf.fill(0xBB);
 
@@ -447,7 +694,7 @@ fn main() {
                 .initialize(nic.name.clone(), server_port)
                 .expect("server init failed");
             server
-                .register_memory(server_buf.as_u64(), per_nic_bytes)
+                .register_memory(server_buf.as_u64(), buf_per_nic)
                 .expect("server register_memory failed");
 
             let mut client = MooncakeTransferEngine::new();
@@ -455,7 +702,7 @@ fn main() {
                 .initialize(nic.name.clone(), client_port)
                 .expect("client init failed");
             client
-                .register_memory(client_buf.as_u64(), per_nic_bytes)
+                .register_memory(client_buf.as_u64(), buf_per_nic)
                 .expect("client register_memory failed");
 
             println!(
@@ -469,12 +716,10 @@ fn main() {
                 client,
                 server_buf,
                 client_buf,
-                per_nic_bytes,
             });
         }
 
-        // Pre-establish RC connections sequentially (avoid concurrent UD handshake storms).
-        // Use a small transfer (4 KiB) just to trigger connection setup.
+        // Pre-establish RC connections.
         for ctx in &contexts {
             let server_session = ctx.server.get_session_id();
             ctx.client
@@ -488,20 +733,48 @@ fn main() {
             println!("  {} connected", ctx.nic_name);
         }
 
-        // Run WRITE bench.
-        let write_results = run_bench(&contexts, "write", cli.warmup, cli.iters);
-        print_results(&write_results, "write", per_nic_bytes, group.node.0);
+        let run_mode = |mode: &str| {
+            // --- Phase 1: single-NIC baselines ---
+            for ctx in &contexts {
+                // Reset buffers.
+                if mode == "read" {
+                    ctx.client_buf.fill(0x00);
+                }
+                let result =
+                    run_single_nic_bench(ctx, mode, &schedule, cli.warmup_tasks, block_size);
+                print_single_nic_result(&result, mode, block_size, group.node.0);
+            }
 
-        // Reset client buffers before READ (clear any stale data).
-        for ctx in &contexts {
-            ctx.client_buf.fill(0x00);
+            // --- Phase 2: multi-NIC aggregate (only if >1 NIC) ---
+            if contexts.len() > 1 {
+                for ctx in &contexts {
+                    if mode == "read" {
+                        ctx.client_buf.fill(0x00);
+                    }
+                }
+                let results =
+                    run_multi_nic_bench(&contexts, mode, &schedule, cli.warmup_tasks, block_size);
+                print_multi_nic_results(
+                    &results,
+                    mode,
+                    block_size,
+                    &schedule,
+                    cli.warmup_tasks,
+                    group.node.0,
+                );
+            }
+        };
+
+        match cli.mode.as_str() {
+            "write" => run_mode("write"),
+            "read" => run_mode("read"),
+            _ => {
+                run_mode("write");
+                run_mode("read");
+            }
         }
 
-        // Run READ bench.
-        let read_results = run_bench(&contexts, "read", cli.warmup, cli.iters);
-        print_results(&read_results, "read", per_nic_bytes, group.node.0);
-
-        // Cleanup: unregister memory.
+        // Cleanup.
         for ctx in &contexts {
             ctx.client
                 .unregister_memory(ctx.client_buf.as_u64())
