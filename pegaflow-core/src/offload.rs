@@ -481,20 +481,12 @@ impl PegaEngine {
             })
             .collect();
 
-        // Collect unique hashes for metaserver before namespace is moved
-        let metaserver_hashes: Vec<Vec<u8>> = hashes_to_save.into_iter().collect();
-
         self.storage.send_raw_insert(RawSaveBatch {
-            namespace: namespace.clone(),
+            namespace,
             total_slots,
             numa_node: gpu.preferred_numa(),
             layers: raw_layers,
         });
-
-        // Send block hashes to metaserver worker (batched, fire-and-forget)
-        if !metaserver_hashes.is_empty() {
-            self.send_metaserver_insert(namespace, metaserver_hashes);
-        }
 
         Ok(())
     }

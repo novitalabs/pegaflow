@@ -205,6 +205,9 @@ pub struct StorageEngine {
 
     /// Max blocks allowed in prefetching state (backpressure for SSD prefetch)
     max_prefetch_blocks: usize,
+
+    /// Channel to the metaserver insert worker (set by `PegaEngine::set_metaserver_client`)
+    metaserver_tx: Mutex<Option<UnboundedSender<crate::MetaserverInsertCmd>>>,
 }
 
 impl StorageEngine {
@@ -292,6 +295,7 @@ impl StorageEngine {
             seal_notify_tx: Some(seal_notify_tx),
             ssd_state,
             max_prefetch_blocks: config.max_prefetch_blocks,
+            metaserver_tx: Mutex::new(None),
         });
 
         // Spawn insert worker task (owns inflight HashMap, receives batches)
@@ -310,6 +314,21 @@ impl StorageEngine {
         }
 
         (engine, seal_notify_rx)
+    }
+
+    /// Set the metaserver insert channel (called by `PegaEngine::set_metaserver_client`).
+    pub(crate) fn set_metaserver_tx(&self, tx: UnboundedSender<crate::MetaserverInsertCmd>) {
+        *self.metaserver_tx.lock() = Some(tx);
+    }
+
+    /// Send block hashes to the metaserver insert worker (fire-and-forget).
+    pub(crate) fn send_metaserver_insert(&self, namespace: String, block_hashes: Vec<Vec<u8>>) {
+        if let Some(tx) = self.metaserver_tx.lock().as_ref() {
+            let _ = tx.send(crate::MetaserverInsertCmd {
+                namespace,
+                block_hashes,
+            });
+        }
     }
 
     /// Initialize SSD cache state (file + io_uring + channels, no workers yet)
@@ -1108,12 +1127,20 @@ fn process_raw_save_batch(
     batch: crate::offload::RawSaveBatch,
 ) {
     let phase4_start = std::time::Instant::now();
+    let namespace = batch.namespace.clone();
     let numa_node = batch.numa_node;
     let total_slots = batch.total_slots;
 
     let (entries, _total_bytes, _total_blocks) = crate::offload::build_insert_entries(&batch);
 
-    process_insert_batch(inflight, engine, entries, total_slots, numa_node);
+    process_insert_batch(
+        inflight,
+        engine,
+        entries,
+        total_slots,
+        numa_node,
+        &namespace,
+    );
 
     debug!(
         "insert_worker phase4: blocks={} bytes={} ms={:.2}",
@@ -1125,13 +1152,14 @@ fn process_raw_save_batch(
 
 /// Process a single insert batch (fire-and-forget).
 /// Inflight HashMap is owned exclusively by the worker (no lock needed).
-/// Cache insertion + SSD offload handled internally.
+/// Cache insertion + metaserver announcement + SSD offload handled internally.
 fn process_insert_batch(
     inflight: &mut HashMap<BlockKey, InflightBlock>,
     engine: &Weak<StorageEngine>,
     entries: InsertEntries,
     total_slots: usize,
     numa_node: NumaNode,
+    namespace: &str,
 ) {
     let mut sealed_blocks: Vec<(BlockKey, Arc<SealedBlock>)> = Vec::new();
     let mut inflight_bytes_added: u64 = 0;
@@ -1146,7 +1174,7 @@ fn process_insert_batch(
                 if ib.total_slots() != total_slots {
                     error!(
                         "insert worker: slot count mismatch: key namespace={} expected={} got={}",
-                        key.namespace,
+                        namespace,
                         ib.total_slots(),
                         total_slots
                     );
@@ -1203,6 +1231,17 @@ fn process_insert_batch(
     }
     if inflight_bytes_removed > 0 {
         record_inflight_bytes_removed(inflight_bytes_removed);
+    }
+
+    // Send block hashes to metaserver worker (batched, fire-and-forget)
+    if !sealed_blocks.is_empty()
+        && let Some(engine) = engine.upgrade()
+    {
+        let metaserver_hashes: Vec<Vec<u8>> = sealed_blocks
+            .iter()
+            .map(|(key, _)| key.hash.clone())
+            .collect();
+        engine.send_metaserver_insert(namespace.to_owned(), metaserver_hashes);
     }
 
     // SSD offload (fire-and-forget internally)

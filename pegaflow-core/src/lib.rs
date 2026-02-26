@@ -71,10 +71,9 @@ use std::{
 };
 
 use log::{debug, info, warn};
-use parking_lot::Mutex as ParkingMutex;
 use pegaflow_proto::proto::engine::InsertBlockHashesRequest;
 use pegaflow_proto::proto::engine::meta_server_client::MetaServerClient;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::UnboundedReceiver;
 use tonic::transport::Channel;
 
 use crate::gpu_worker::{LayerLoadData, LoadBlock, LoadTask};
@@ -148,8 +147,6 @@ pub struct PegaEngine {
     storage: Arc<StorageEngine>,
     /// GPU-NUMA topology for memory allocation decisions.
     topology: Arc<NumaTopology>,
-    /// Channel to the metaserver insert worker (created on `set_metaserver_client`).
-    metaserver_tx: ParkingMutex<Option<UnboundedSender<MetaserverInsertCmd>>>,
 }
 
 #[allow(clippy::new_without_default)]
@@ -209,7 +206,6 @@ impl PegaEngine {
                 instances: RwLock::new(HashMap::new()),
                 storage,
                 topology,
-                metaserver_tx: ParkingMutex::new(None),
             },
             seal_notify_rx,
         )
@@ -223,21 +219,11 @@ impl PegaEngine {
     pub fn set_metaserver_client(&self, client: MetaServerClient<Channel>, node_url: String) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(metaserver_worker_loop(rx, client, node_url.clone()));
-        *self.metaserver_tx.lock() = Some(tx);
+        self.storage.set_metaserver_tx(tx);
         info!(
             "MetaServer client configured for block hash registry (node_url={})",
             node_url
         );
-    }
-
-    /// Send block hashes to the metaserver insert worker (fire-and-forget).
-    pub(crate) fn send_metaserver_insert(&self, namespace: String, block_hashes: Vec<Vec<u8>>) {
-        if let Some(tx) = self.metaserver_tx.lock().as_ref() {
-            let _ = tx.send(MetaserverInsertCmd {
-                namespace,
-                block_hashes,
-            });
-        }
     }
 
     /// Get or create an instance with the specified topology.
