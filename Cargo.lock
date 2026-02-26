@@ -2032,7 +2032,6 @@ dependencies = [
  "parking_lot",
  "pegaflow-proto",
  "rand 0.10.0",
- "rustls",
  "serde",
  "shared_memory",
  "tokio",

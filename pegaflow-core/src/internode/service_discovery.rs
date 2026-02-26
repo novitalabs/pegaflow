@@ -73,9 +73,6 @@ pub async fn start_service_discovery(
         ));
     }
 
-    // Initialize rustls crypto provider
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
     let client = Client::try_default().await?;
 
     let label_selector = config
