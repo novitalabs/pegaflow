@@ -126,6 +126,10 @@ pub struct Cli {
     /// Max blocks allowed in prefetching state (backpressure for SSD prefetch). Default: 1500
     #[arg(long, default_value_t = 800)]
     pub max_prefetch_blocks: usize,
+
+    /// Trace sampling rate (0.0–1.0). E.g. 0.01 = 1%. Default: 1.0 (100%)
+    #[arg(long, default_value_t = 1.0)]
+    pub trace_sample_rate: f64,
 }
 
 fn format_py_err(err: PyErr) -> String {
@@ -277,6 +281,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     pegaflow_core::logging::init_stdout_colored(&cli.log_level);
     trace::init();
+    pegaflow_core::set_trace_sample_rate(cli.trace_sample_rate);
 
     // Initialize CUDA in the main thread before starting Tokio runtime
     init_cuda_driver()?;

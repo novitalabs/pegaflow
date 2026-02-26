@@ -1,3 +1,5 @@
+use pegaflow_core::{trace_in_span, trace_root};
+
 use crate::metric::record_rpc_result;
 use crate::proto::engine::engine_server::Engine;
 use crate::proto::engine::{
@@ -7,8 +9,6 @@ use crate::proto::engine::{
     UnregisterRequest, UnregisterResponse,
 };
 use crate::registry::{CudaTensorRegistry, TensorMetadata};
-#[cfg(feature = "tracing")]
-use fastrace::prelude::*;
 use log::{debug, info, warn};
 use parking_lot::Mutex;
 use pegaflow_core::{EngineError, LayerSave, PegaEngine, PrefetchStatus};
@@ -191,7 +191,15 @@ impl Engine for GrpcEngineService {
                 (b + layer.block_ids.len(), h + layer.block_hashes.len())
             });
 
-        let result: Result<Response<SaveResponse>, Status> = async {
+        trace_root!("rpc.save", root, || {
+            [
+                ("instance_id", req.instance_id.clone()),
+                ("layers", layer_count.to_string()),
+                ("blocks", total_blocks.to_string()),
+            ]
+        });
+
+        let fut = async {
             let SaveRequest {
                 instance_id,
                 tp_rank,
@@ -223,8 +231,9 @@ impl Engine for GrpcEngineService {
             Ok(Response::new(SaveResponse {
                 status: Some(Self::build_simple_response()),
             }))
-        }
-        .await;
+        };
+
+        let result: Result<Response<SaveResponse>, Status> = trace_in_span!(root, fut).await;
 
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         match &result {
@@ -251,7 +260,15 @@ impl Engine for GrpcEngineService {
         let block_count = req.block_ids.len();
         let hash_count = req.block_hashes.len();
 
-        let result: Result<Response<LoadResponse>, Status> = async {
+        trace_root!("rpc.load", root, || {
+            [
+                ("instance_id", req.instance_id.clone()),
+                ("layers", layer_count.to_string()),
+                ("blocks", block_count.to_string()),
+            ]
+        });
+
+        let fut = async {
             let LoadRequest {
                 instance_id,
                 tp_rank,
@@ -290,8 +307,9 @@ impl Engine for GrpcEngineService {
             Ok(Response::new(LoadResponse {
                 status: Some(Self::build_simple_response()),
             }))
-        }
-        .await;
+        };
+
+        let result: Result<Response<LoadResponse>, Status> = trace_in_span!(root, fut).await;
 
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         match &result {
@@ -315,8 +333,7 @@ impl Engine for GrpcEngineService {
         request: Request<QueryRequest>,
     ) -> Result<Response<QueryResponse>, Status> {
         let req = request.into_inner();
-        #[cfg(feature = "tracing")]
-        let root = Span::root("rpc.query", SpanContext::random()).with_properties(|| {
+        trace_root!("rpc.query", root, || {
             [
                 ("instance_id", req.instance_id.clone()),
                 ("block_hashes", req.block_hashes.len().to_string()),
@@ -358,10 +375,7 @@ impl Engine for GrpcEngineService {
             }))
         };
 
-        #[cfg(feature = "tracing")]
-        let result: Result<Response<QueryResponse>, Status> = fut.in_span(root).await;
-        #[cfg(not(feature = "tracing"))]
-        let result: Result<Response<QueryResponse>, Status> = fut.await;
+        let result: Result<Response<QueryResponse>, Status> = trace_in_span!(root, fut).await;
 
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         match &result {
