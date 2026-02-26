@@ -24,6 +24,10 @@ use std::sync::{Arc, Weak};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
+use pegaflow_proto::proto::engine::InsertBlockHashesRequest;
+use pegaflow_proto::proto::engine::meta_server_client::MetaServerClient;
+use tonic::transport::Channel;
+
 use crate::block::{BlockKey, InflightBlock, PrefetchStatus, SealedBlock};
 use crate::cache::{CacheInsertOutcome, TinyLfuCache};
 use crate::metrics::core_metrics;
@@ -316,9 +320,21 @@ impl StorageEngine {
         (engine, seal_notify_rx)
     }
 
-    /// Set the metaserver insert channel (called by `PegaEngine::set_metaserver_client`).
-    pub(crate) fn set_metaserver_tx(&self, tx: UnboundedSender<crate::MetaserverInsertCmd>) {
+    /// Set the MetaServer client for cross-node block hash registry.
+    ///
+    /// Spawns a background worker that batches and sends insert requests.
+    pub(crate) fn set_metaserver_client(
+        &self,
+        client: MetaServerClient<Channel>,
+        node_url: String,
+    ) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(metaserver_worker_loop(rx, client, node_url.clone()));
         *self.metaserver_tx.lock() = Some(tx);
+        info!(
+            "MetaServer client configured for block hash registry (node_url={})",
+            node_url
+        );
     }
 
     /// Send block hashes to the metaserver insert worker (fire-and-forget).
@@ -1283,6 +1299,58 @@ fn gc_inflight(
         info!("GC cleaned stale inflight blocks: cleaned={}", cleaned);
     }
     cleaned
+}
+
+// ============================================================================
+// Metaserver Worker (dedicated task, batches block hash inserts)
+// ============================================================================
+
+/// Background worker that receives block hash insert commands and batches them
+/// into MetaServer gRPC calls, grouped by namespace.
+async fn metaserver_worker_loop(
+    mut rx: UnboundedReceiver<crate::MetaserverInsertCmd>,
+    mut client: MetaServerClient<Channel>,
+    node_url: String,
+) {
+    while let Some(cmd) = rx.recv().await {
+        // Drain additional commands for batching
+        let mut cmds = vec![cmd];
+        while let Ok(more) = rx.try_recv() {
+            cmds.push(more);
+        }
+
+        // Merge hashes by namespace
+        let mut by_namespace: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+        for cmd in cmds {
+            by_namespace
+                .entry(cmd.namespace)
+                .or_default()
+                .extend(cmd.block_hashes);
+        }
+
+        for (namespace, block_hashes) in by_namespace {
+            let count = block_hashes.len();
+            let req = InsertBlockHashesRequest {
+                namespace,
+                block_hashes,
+                node: node_url.clone(),
+            };
+            match client.insert_block_hashes(req).await {
+                Ok(response) => {
+                    debug!(
+                        "MetaServer insert: sent {} hashes, inserted {}",
+                        count,
+                        response.into_inner().inserted_count
+                    );
+                }
+                Err(err) => {
+                    warn!("MetaServer insert failed: {}", err);
+                }
+            }
+        }
+    }
+
+    info!("Metaserver worker shutting down");
 }
 
 #[cfg(test)]
