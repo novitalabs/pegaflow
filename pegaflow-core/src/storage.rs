@@ -596,6 +596,10 @@ impl StorageEngine {
 
     /// Lookup multiple blocks for load operation.
     /// Consumes pinned blocks (removes from pinned_for_load).
+    #[cfg_attr(
+        feature = "tracing",
+        fastrace::trace(name = "storage.cache_lookup_many")
+    )]
     pub fn cache_lookup_many(
         &self,
         instance_id: &str,

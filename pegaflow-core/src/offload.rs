@@ -152,7 +152,7 @@ impl PegaEngine {
         let total_slots = instance.total_slots();
 
         // ── Phase 0: Resolve per-layer metadata and build valid_blocks ──
-        let phase0_start = std::time::Instant::now();
+        trace_scope!("save.resolve_metadata", _s);
         struct LayerMeta {
             registration: KVCacheRegistration,
             slot_id: usize,
@@ -223,12 +223,12 @@ impl PegaEngine {
                 valid_blocks,
             });
         }
-        let phase0_ms = phase0_start.elapsed().as_secs_f64() * 1000.0;
+        trace_drop!(_s);
 
         if layer_metas.is_empty() {
             info!(
-                "save_batch skipped (no valid blocks): instance_id={} tp_rank={} device_id={} layers={} phase0_ms={:.2}",
-                instance_id, tp_rank, device_id, total_layers, phase0_ms
+                "save_batch skipped (no valid blocks): instance_id={} tp_rank={} device_id={} layers={}",
+                instance_id, tp_rank, device_id, total_layers
             );
             return Ok(());
         }
@@ -239,7 +239,7 @@ impl PegaEngine {
         // union of all hashes, filter once against the cache, then per-layer
         // in-memory filter to determine which blocks each layer needs to save.
 
-        let phase1_start = std::time::Instant::now();
+        trace_scope!("save.hash_filter", _s);
 
         // Collect union of all unique hashes across layers
         let mut hashes_to_save: HashSet<Vec<u8>> = HashSet::new();
@@ -252,12 +252,12 @@ impl PegaEngine {
         // Single in-place cache filter for all unique hashes
         self.storage
             .filter_hashes_not_in_cache_inplace(&namespace, &mut hashes_to_save);
-        let phase1_ms = phase1_start.elapsed().as_secs_f64() * 1000.0;
 
         if hashes_to_save.is_empty() {
+            trace_drop!(_s);
             debug!(
-                "save_batch skipped (all cached): instance_id={} tp_rank={} device_id={} layers={} phase0_ms={:.2} phase1_ms={:.2}",
-                instance_id, tp_rank, device_id, total_layers, phase0_ms, phase1_ms
+                "save_batch skipped (all cached): instance_id={} tp_rank={} device_id={} layers={}",
+                instance_id, tp_rank, device_id, total_layers
             );
             return Ok(());
         }
@@ -287,17 +287,24 @@ impl PegaEngine {
             }
         }
 
+        trace_drop!(_s, || {
+            [
+                ("unique_hashes", hashes_to_save.len().to_string()),
+                ("to_save", total_blocks_to_save.to_string()),
+            ]
+        });
+
         if layers_to_save.is_empty() {
             debug!(
-                "save_batch skipped (all filtered): instance_id={} tp_rank={} device_id={} layers={} phase0_ms={:.2} phase1_ms={:.2}",
-                instance_id, tp_rank, device_id, total_layers, phase0_ms, phase1_ms
+                "save_batch skipped (all filtered): instance_id={} tp_rank={} device_id={} layers={}",
+                instance_id, tp_rank, device_id, total_layers
             );
             return Ok(());
         }
 
         // ── Phase 2: Allocate pinned memory + build SaveBlocks for all layers ──
 
-        let phase2_start = std::time::Instant::now();
+        trace_scope!("save.pinned_alloc", _s);
         let numa_node = Some(gpu.preferred_numa());
 
         let mut layer_allocs: Vec<LayerAlloc> = Vec::with_capacity(layers_to_save.len());
@@ -412,13 +419,15 @@ impl PegaEngine {
                 });
             }
         }
-        let phase2_ms = phase2_start.elapsed().as_secs_f64() * 1000.0;
+        trace_drop!(_s);
 
         // ── Phase 3: Submit all GPU copies as one batch task (single sync) ──
 
-        let phase3_start = std::time::Instant::now();
-        gpu.worker_pool().batch_save(gpu_save_layers).await?;
-        let phase3_ms = phase3_start.elapsed().as_secs_f64() * 1000.0;
+        trace_future!(
+            "save.gpu_copy",
+            gpu.worker_pool().batch_save(gpu_save_layers)
+        )
+        .await?;
 
         // ── Phase 4 (deferred): Build LayerBlocks + insert — sent to worker ──
 
@@ -441,7 +450,7 @@ impl PegaEngine {
         }
 
         debug!(
-            "save_batch completed: instance_id={} tp_rank={} device_id={} layers={} layers_saved={} blocks_saved={} bytes={} phase0_ms={:.2} phase1_filter_ms={:.2} phase2_alloc_ms={:.2} phase3_gpu_ms={:.2} total_ms={:.2}",
+            "save_batch completed: instance_id={} tp_rank={} device_id={} layers={} layers_saved={} blocks_saved={} bytes={} total_ms={:.2}",
             instance_id,
             tp_rank,
             device_id,
@@ -449,10 +458,6 @@ impl PegaEngine {
             layers_to_save.len(),
             total_blocks_to_save,
             total_bytes,
-            phase0_ms,
-            phase1_ms,
-            phase2_ms,
-            phase3_ms,
             batch_start.elapsed().as_secs_f64() * 1000.0
         );
 

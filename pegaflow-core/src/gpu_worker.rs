@@ -35,6 +35,8 @@ pub struct LoadBlock {
 pub struct SaveTask {
     pub layers: Vec<SaveLayerData>,
     pub reply: oneshot::Sender<Result<(), EngineError>>,
+    #[cfg(feature = "tracing")]
+    pub trace_ctx: Option<::fastrace::prelude::SpanContext>,
 }
 
 /// Data for saving a single layer's blocks from GPU to CPU.
@@ -161,6 +163,8 @@ impl GpuWorkerPool {
         let task = SaveTask {
             layers,
             reply: reply_tx,
+            #[cfg(feature = "tracing")]
+            trace_ctx: ::fastrace::prelude::SpanContext::current_local_parent(),
         };
 
         self.save_tx.send(task).map_err(|_| {
@@ -256,6 +260,7 @@ fn save_worker_loop(
 
 /// Process a load task: copy blocks from CPU pinned memory to GPU for multiple layers
 fn process_load_task(task: &LoadTask, stream: &CudaStream) -> Result<(), EngineError> {
+    trace_root!("gpu.load_task", _root);
     let start = std::time::Instant::now();
     let mut total_bytes = 0usize;
     let mut memcpy_calls = 0usize;
@@ -383,6 +388,7 @@ fn process_load_task(task: &LoadTask, stream: &CudaStream) -> Result<(), EngineE
 
 /// Process a save task: copy blocks from GPU to CPU pinned memory
 fn process_save_task(task: &SaveTask, stream: &CudaStream) -> Result<(), EngineError> {
+    trace_child!("gpu.save_task", task.trace_ctx);
     let start = std::time::Instant::now();
     let mut total_bytes = 0usize;
     let mut total_memcpy_calls = 0usize;

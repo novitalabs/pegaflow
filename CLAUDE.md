@@ -77,6 +77,7 @@ uv run python examples/bench_kv_cache.py --model /path/to/model --num-prompts 10
 - `--ssd-write-inflight`: SSD write inflight, max concurrent block writes (default: `2`)
 - `--ssd-prefetch-inflight`: SSD prefetch inflight, max concurrent block reads (default: `16`)
 - `--max-prefetch-blocks`: Max blocks allowed in prefetching state, backpressure for SSD prefetch (default: `800`)
+- `--trace-sample-rate`: Trace sampling rate, 0.0–1.0 (default: `1.0` = 100%, e.g. `0.01` = 1%). Requires `--features tracing`.
 
 ## Architecture
 

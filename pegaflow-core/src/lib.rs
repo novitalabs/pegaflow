@@ -6,6 +6,9 @@
 //! - Split-storage layout for efficient K/V batch transfers
 //! - SSD caching tier
 
+#[macro_use]
+mod trace;
+
 pub mod allocator;
 pub mod block;
 mod cache;
@@ -38,6 +41,7 @@ pub use ssd_cache::{
 };
 pub use storage::{SealNotification, StorageConfig};
 pub use sync_state::{LoadState, LoadStateError};
+pub use trace::{set_trace_sample_rate, should_sample};
 
 // ============================================================================
 // KV Cache Layout Notes
@@ -342,7 +346,7 @@ impl PegaEngine {
     /// - `Done { hit, missing: 0 }`: all blocks in memory cache
     /// - `Loading { hit, loading }`: some blocks being fetched from SSD
     /// - `Done { hit, missing }`: some blocks don't exist
-    #[cfg_attr(feature = "tracing", fastrace::trace)]
+    #[cfg_attr(feature = "tracing", fastrace::trace(name = "query.count_prefix_hit"))]
     pub fn count_prefix_hit_blocks_with_prefetch(
         &self,
         instance_id: &str,
@@ -449,12 +453,15 @@ impl PegaEngine {
             .ok_or_else(|| EngineError::WorkerMissing(instance_id.to_string(), device_id))?;
 
         // Lookup all blocks (consumes pinned blocks)
+        trace_scope!("load.cache_lookup", _s);
         let block_cache = self
             .storage
             .cache_lookup_many(instance_id, namespace, block_hashes)
             .map_err(EngineError::Storage)?;
+        trace_drop!(_s);
 
         // Build load tasks for each layer
+        trace_scope!("load.build_tasks");
         let mut layers = Vec::with_capacity(layer_names.len());
 
         for layer_name in layer_names {
