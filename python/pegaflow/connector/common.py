@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 
+from pegaflow.connector.connector_metrics import PegaKVConnectorStats, PegaPromMetrics
 from pegaflow.logging_utils import get_connector_logger
 from pegaflow.pegaflow import EngineRpcClient
 
@@ -33,6 +34,17 @@ class ConnectorContext:
     device_id: int | None
     engine_client: EngineRpcClient
     state_manager: "ServiceStateManager"
+    is_mla: bool = False
+
+    @property
+    def effective_tp_rank(self) -> int:
+        """TP rank for PegaFlow server calls. MLA uses 0 since data is identical across ranks."""
+        return 0 if self.is_mla else (self.tp_rank or 0)
+
+    @property
+    def effective_tp_size(self) -> int:
+        """TP size for PegaFlow server calls. MLA uses 1 since only one copy is needed."""
+        return 1 if self.is_mla else self.tp_size
 
 
 @dataclass(frozen=True)
@@ -69,6 +81,30 @@ class PegaConnectorMetadata(KVConnectorMetadata):
         return (
             f"PegaConnectorMetadata(loads={len(self.load_intents)}, saves={len(self.save_intents)})"
         )
+
+
+def parse_env_int(name: str, default: int) -> int:
+    """Parse an integer from environment variable with fallback to default.
+
+    Note: This function is typically called at module import time for class-level
+    configuration. Changing the environment variable after module import will not
+    affect values that were already read.
+
+    Args:
+        name: Environment variable name.
+        default: Default value if env var is not set or invalid.
+
+    Returns:
+        Parsed integer value or default.
+    """
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning("Invalid %s value '%s', using default %d", name, value, default)
+        return default
 
 
 def resolve_instance_id(vllm_config, dp_rank_suffix: bool = True) -> str:
@@ -124,12 +160,22 @@ def derive_namespace(vllm_config, tp_size: int) -> str:
     return f"{hash_suffix}"
 
 
+def detect_mla(vllm_config) -> bool:
+    """Detect if the model uses Multi-head Latent Attention (e.g. DeepSeek V2/V3)."""
+    hf_config = vllm_config.model_config.hf_text_config
+    return getattr(hf_config, "kv_lora_rank", None) is not None
+
+
 __all__ = [
     "ConnectorContext",
     "LoadIntent",
     "PegaConnectorMetadata",
+    "PegaKVConnectorStats",
+    "PegaPromMetrics",
     "SaveIntent",
     "derive_namespace",
+    "detect_mla",
     "logger",
+    "parse_env_int",
     "resolve_instance_id",
 ]

@@ -18,7 +18,10 @@ from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from pegaflow.connector.common import (
     ConnectorContext,
     PegaConnectorMetadata,
+    PegaKVConnectorStats,
+    PegaPromMetrics,
     derive_namespace,
+    detect_mla,
     logger,
     resolve_instance_id,
 )
@@ -37,7 +40,9 @@ class PegaKVConnector(KVConnectorBase_V1):
         instance_id = resolve_instance_id(vllm_config)
         tp_size = vllm_config.parallel_config.tensor_parallel_size
         world_size = vllm_config.parallel_config.world_size
-        namespace = derive_namespace(vllm_config, tp_size)
+        is_mla = detect_mla(vllm_config)
+        effective_tp_size = 1 if is_mla else tp_size
+        namespace = derive_namespace(vllm_config, effective_tp_size)
         num_layers = getattr(vllm_config.model_config.hf_text_config, "num_hidden_layers", 0)
         block_size = vllm_config.cache_config.block_size
 
@@ -74,6 +79,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             device_id=device_id,
             engine_client=engine_client,
             state_manager=self._state_manager,
+            is_mla=is_mla,
         )
 
         self._scheduler: SchedulerConnector | None = None
@@ -84,7 +90,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             self._worker = WorkerConnector(self._ctx)
 
         logger.info(
-            "[PegaKVConnector] Initialized role=%s instance_id=%s device=%s tp_rank=%s tp_size=%d world_size=%d layers=%d namespace=%s",
+            "[PegaKVConnector] Initialized role=%s instance_id=%s device=%s tp_rank=%s tp_size=%d world_size=%d layers=%d namespace=%s is_mla=%s",
             role.name,
             instance_id,
             device_id if device_id is not None else "cpu",
@@ -93,6 +99,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             world_size,
             num_layers,
             namespace,
+            is_mla,
         )
 
     # ==============================
@@ -196,8 +203,36 @@ class PegaKVConnector(KVConnectorBase_V1):
     def get_block_ids_with_load_errors(self) -> set[int]:
         return set()
 
-    def get_kv_connector_stats(self):
-        return None
+    def get_kv_connector_stats(self) -> PegaKVConnectorStats | None:
+        stats: PegaKVConnectorStats | None = None
+
+        # Collect scheduler-side stats
+        if self._scheduler:
+            stats = self._scheduler.get_stats()
+
+        # Collect worker-side stats
+        if self._worker:
+            worker_stats = self._worker.get_stats()
+            if worker_stats is not None:
+                stats = worker_stats if stats is None else stats.aggregate(worker_stats)
+
+        return stats
+
+    @classmethod
+    def build_kv_connector_stats(cls, data: dict | None = None) -> PegaKVConnectorStats | None:
+        if data is None:
+            return None
+        return PegaKVConnectorStats(data=data)
+
+    @classmethod
+    def build_prom_metrics(
+        cls,
+        vllm_config,
+        metric_types,
+        labelnames,
+        per_engine_labelvalues,
+    ) -> PegaPromMetrics:
+        return PegaPromMetrics(vllm_config, metric_types, labelnames, per_engine_labelvalues)
 
     def get_handshake_metadata(self):
         return None

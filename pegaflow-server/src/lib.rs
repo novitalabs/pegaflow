@@ -1,22 +1,29 @@
+pub mod http_server;
 pub mod metric;
 pub mod proto;
 pub mod registry;
 pub mod service;
+#[cfg(feature = "tracing")]
+mod trace;
+#[cfg(not(feature = "tracing"))]
+mod trace {
+    pub fn init() {}
+    pub fn flush() {}
+}
 mod utils;
 
 pub use registry::CudaTensorRegistry;
 pub use service::GrpcEngineService;
 
-use axum::{Router, routing::get};
 use clap::Parser;
 use cudarc::driver::result as cuda_driver;
-use log::{error, info, warn};
+use log::{error, info};
 use opentelemetry::global;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use parking_lot::Mutex;
 use pegaflow_core::PegaEngine;
-use prometheus::{Registry, TextEncoder};
+use prometheus::Registry;
 use proto::engine::engine_server::EngineServer;
 use pyo3::{PyErr, Python, types::PyAnyMethods};
 use std::error::Error;
@@ -63,22 +70,29 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub use_hugepages: bool,
 
-    /// Disable TinyLFU admission (falls back to plain LRU inserts)
-    #[arg(long, default_value_t = true)]
-    pub disable_lfu_admission: bool,
+    /// Enable TinyLFU admission policy for cache (default: plain LRU)
+    #[arg(long, default_value_t = false)]
+    pub enable_lfu_admission: bool,
 
-    /// Address for Prometheus metrics HTTP endpoint (e.g. 0.0.0.0:9091). Leave empty to disable.
+    /// Disable NUMA-aware memory allocation (use single pool instead of per-node pools)
+    #[arg(long, default_value_t = false)]
+    pub disable_numa_affinity: bool,
+
+    /// HTTP server address for health check and Prometheus metrics.
+    /// Always enabled for health check endpoint.
     #[arg(long, default_value = "0.0.0.0:9091")]
-    pub metrics_addr: Option<SocketAddr>,
+    pub http_addr: SocketAddr,
 
-    /// **DEPRECATED**: Enable OTLP metrics export over gRPC (e.g. http://127.0.0.1:4317).
-    /// Use `--metrics-addr` for direct Prometheus export instead.
+    /// Enable Prometheus /metrics endpoint on the HTTP server.
+    #[arg(long, default_value_t = true)]
+    pub enable_prometheus: bool,
+
+    /// Enable OTLP metrics export over gRPC (e.g. http://127.0.0.1:4317).
     #[arg(long)]
     pub metrics_otel_endpoint: Option<String>,
 
-    /// **DEPRECATED**: Period (seconds) for exporting OTLP metrics (only used when endpoint is set).
-    /// Use `--metrics-addr` for direct Prometheus export instead.
-    #[arg(long, default_value_t = 5)]
+    /// Period (seconds) for exporting OTLP metrics (only used when endpoint is set).
+    #[arg(long, default_value_t = 10)]
     pub metrics_period_secs: u64,
 
     /// Log level (trace, debug, info, warn, error)
@@ -112,6 +126,18 @@ pub struct Cli {
     /// Max blocks allowed in prefetching state (backpressure for SSD prefetch). Default: 1500
     #[arg(long, default_value_t = 800)]
     pub max_prefetch_blocks: usize,
+
+    /// Trace sampling rate (0.0–1.0). E.g. 0.01 = 1%. Default: 1.0 (100%)
+    #[arg(long, default_value_t = 1.0, value_parser = parse_sample_rate)]
+    pub trace_sample_rate: f64,
+}
+
+fn parse_sample_rate(s: &str) -> Result<f64, String> {
+    let v: f64 = s.parse().map_err(|e| format!("{e}"))?;
+    if !(0.0..=1.0).contains(&v) {
+        return Err(format!("sample rate must be between 0.0 and 1.0, got {v}"));
+    }
+    Ok(v)
 }
 
 fn format_py_err(err: PyErr) -> String {
@@ -231,13 +257,8 @@ fn init_metrics(
         info!("Prometheus metrics exporter enabled");
     }
 
-    // Add OTLP exporter if endpoint is configured (DEPRECATED)
+    // Add OTLP exporter if endpoint is configured
     if let Some(endpoint) = otlp_endpoint {
-        warn!(
-            "DEPRECATED: --metrics-otel-endpoint is deprecated and will be removed in a future release. \
-            Use --metrics-addr for direct Prometheus export instead."
-        );
-
         let exporter = opentelemetry_otlp::MetricExporter::builder()
             .with_tonic()
             .with_endpoint(endpoint)
@@ -263,19 +284,12 @@ fn init_metrics(
     })
 }
 
-/// Handler for Prometheus /metrics endpoint
-async fn metrics_handler(axum::extract::State(registry): axum::extract::State<Registry>) -> String {
-    let encoder = TextEncoder::new();
-    let metric_families = registry.gather();
-    encoder
-        .encode_to_string(&metric_families)
-        .unwrap_or_else(|e| format!("# Error encoding metrics: {e}"))
-}
-
 /// Main entry point for pegaflow-server
 pub fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     pegaflow_core::logging::init_stdout_colored(&cli.log_level);
+    trace::init();
+    pegaflow_core::set_trace_sample_rate(cli.trace_sample_rate);
 
     // Initialize CUDA in the main thread before starting Tokio runtime
     init_cuda_driver()?;
@@ -347,14 +361,18 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     });
 
     let storage_config = pegaflow_core::StorageConfig {
-        enable_lfu_admission: !cli.disable_lfu_admission,
+        enable_lfu_admission: cli.enable_lfu_admission,
         hint_value_size_bytes: cli.hint_value_size,
         max_prefetch_blocks: cli.max_prefetch_blocks,
         ssd_cache_config,
+        enable_numa_affinity: !cli.disable_numa_affinity,
     };
 
-    if cli.disable_lfu_admission {
-        info!("TinyLFU cache admission disabled; falling back to plain LRU inserts");
+    if cli.enable_lfu_admission {
+        info!("TinyLFU cache admission enabled");
+    }
+    if cli.disable_numa_affinity {
+        info!("NUMA-aware memory allocation disabled");
     }
 
     // Create Tokio runtime early - needed for OTLP metrics gRPC exporter
@@ -364,10 +382,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
     // Initialize OTEL metrics BEFORE creating PegaEngine, so that core metrics
     // (pool, cache, save/load) use the real meter provider instead of noop.
-    let metrics_addr = cli.metrics_addr;
     let metrics_state = runtime.block_on(async {
         init_metrics(
-            metrics_addr.is_some(),
+            cli.enable_prometheus,
             cli.metrics_otel_endpoint.clone(),
             cli.metrics_period_secs,
         )
@@ -399,7 +416,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 loop {
                     tokio::select! {
                         _ = interval.tick() => {
-                            let cleaned = engine.gc_stale_inflight(GC_MAX_AGE);
+                            let cleaned = engine.gc_stale_inflight(GC_MAX_AGE).await;
                             if cleaned > 0 {
                                 info!("Inflight GC: cleaned {} stale blocks", cleaned);
                             }
@@ -414,30 +431,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             info!("Inflight GC task started (interval=5m, max_age=60m)");
         }
 
-        // Start Prometheus HTTP server if configured
-        let metrics_server_handle = if let (Some(metrics_addr), Some(registry)) =
-            (cli.metrics_addr, metrics_state.prometheus_registry.clone())
-        {
-            let app = Router::new()
-                .route("/metrics", get(metrics_handler))
-                .with_state(registry);
-
-            let listener = tokio::net::TcpListener::bind(metrics_addr).await?;
-            info!("Starting Prometheus metrics server on {}", metrics_addr);
-
-            let shutdown = Arc::clone(&shutdown);
-            let handle = tokio::spawn(async move {
-                axum::serve(listener, app)
-                    .with_graceful_shutdown(async move {
-                        shutdown.notified().await;
-                    })
-                    .await
-                    .ok();
-            });
-            Some(handle)
-        } else {
-            None
-        };
+        // Start HTTP server for health check (always enabled)
+        let http_server_handle = http_server::start_http_server(
+            cli.http_addr,
+            cli.enable_prometheus,
+            metrics_state.prometheus_registry.clone(),
+            Arc::clone(&shutdown),
+        )
+        .await?;
 
         let shutdown_signal = {
             let notify = Arc::clone(&shutdown);
@@ -455,8 +456,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
         info!("PegaEngine gRPC server listening on {}", cli.addr);
 
+        const MAX_GRPC_MESSAGE_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
+
+        let grpc_service = EngineServer::new(service)
+            .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
+            .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE);
+
         if let Err(err) = Server::builder()
-            .add_service(EngineServer::new(service))
+            .add_service(grpc_service)
             .serve_with_shutdown(cli.addr, shutdown_signal)
             .await
         {
@@ -466,11 +473,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
         info!("Server stopped");
 
-        // Stop metrics server if running
-        if let Some(handle) = metrics_server_handle {
-            shutdown.notify_waiters();
-            let _ = handle.await;
-        }
+        // Stop HTTP server
+        shutdown.notify_waiters();
+        let _ = http_server_handle.await;
 
         // Flush metrics before exit
         if let Some(provider) = metrics_state.meter_provider
@@ -478,6 +483,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         {
             error!("Failed to shutdown metrics provider: {err}");
         }
+
+        trace::flush();
 
         Ok(())
     })

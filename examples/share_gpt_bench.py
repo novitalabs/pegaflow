@@ -14,7 +14,6 @@ import time
 import urllib.request
 from pathlib import Path
 
-
 # Default ShareGPT dataset URL
 DEFAULT_DATASET_URL = "https://huggingface.co/datasets/philschmid/sharegpt-raw/resolve/main/sharegpt_20230401_clean_lang_split.json"
 

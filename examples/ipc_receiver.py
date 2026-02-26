@@ -7,10 +7,12 @@ Usage:
     Terminal 2: python examples/ipc_receiver.py
 """
 
+import pickle
+
+import numpy as np
 import torch
 import zmq
-import pickle
-import numpy as np
+
 from pegaflow import GpuMemory
 
 

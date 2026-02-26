@@ -46,15 +46,12 @@ impl Default for UringConfig {
 
 #[derive(Clone, Copy)]
 enum IoType {
-    Read,
-    Write,
     Readv,
     Writev,
 }
 
 struct IoCtx {
     io_type: IoType,
-    ptr: *mut u8,
     len: usize,
     offset: u64,
     complete: oneshot::Sender<io::Result<usize>>,
@@ -105,12 +102,6 @@ impl UringShard {
 
                 let fd = Fd(fd);
                 let sqe = match ctx.io_type {
-                    IoType::Read => opcode::Read::new(fd, ctx.ptr, ctx.len as _)
-                        .offset(ctx.offset)
-                        .build(),
-                    IoType::Write => opcode::Write::new(fd, ctx.ptr, ctx.len as _)
-                        .offset(ctx.offset)
-                        .build(),
                     IoType::Readv => {
                         let iovecs_ptr = ctx
                             .iovecs
@@ -246,54 +237,6 @@ impl UringIoEngine {
         &self.txs[idx]
     }
 
-    pub fn read_at_async(
-        &self,
-        ptr: *mut u8,
-        len: usize,
-        offset: u64,
-    ) -> io::Result<oneshot::Receiver<io::Result<usize>>> {
-        let (tx, rx) = oneshot::channel();
-        let ctx = IoCtx {
-            io_type: IoType::Read,
-            ptr,
-            len,
-            offset,
-            complete: tx,
-            iovecs: None,
-        };
-        self.pick_tx(offset).send(ctx).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                format!("io_uring read send failed: {e}"),
-            )
-        })?;
-        Ok(rx)
-    }
-
-    pub fn write_at_async(
-        &self,
-        ptr: *const u8,
-        len: usize,
-        offset: u64,
-    ) -> io::Result<oneshot::Receiver<io::Result<usize>>> {
-        let (tx, rx) = oneshot::channel();
-        let ctx = IoCtx {
-            io_type: IoType::Write,
-            ptr: ptr as *mut u8,
-            len,
-            offset,
-            complete: tx,
-            iovecs: None,
-        };
-        self.pick_tx(offset).send(ctx).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                format!("io_uring write send failed: {e}"),
-            )
-        })?;
-        Ok(rx)
-    }
-
     /// Vectorized read (readv) - reads into multiple buffers in a single syscall.
     ///
     /// # Arguments
@@ -326,7 +269,6 @@ impl UringIoEngine {
         let (tx, rx) = oneshot::channel();
         let ctx = IoCtx {
             io_type: IoType::Readv,
-            ptr: std::ptr::null_mut(),
             len: iovec_count,
             offset,
             complete: tx,
@@ -375,8 +317,7 @@ impl UringIoEngine {
         let (tx, rx) = oneshot::channel();
         let ctx = IoCtx {
             io_type: IoType::Writev,
-            ptr: std::ptr::null_mut(), // not used for writev
-            len: iovec_count,          // number of iovecs
+            len: iovec_count, // number of iovecs
             offset,
             complete: tx,
             iovecs: Some(iovecs_libc),

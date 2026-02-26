@@ -1,3 +1,5 @@
+use pegaflow_core::{trace_in_span, trace_root};
+
 use crate::metric::record_rpc_result;
 use crate::proto::engine::engine_server::Engine;
 use crate::proto::engine::{
@@ -9,7 +11,7 @@ use crate::proto::engine::{
 use crate::registry::{CudaTensorRegistry, TensorMetadata};
 use log::{debug, info, warn};
 use parking_lot::Mutex;
-use pegaflow_core::{EngineError, PegaEngine, PrefetchStatus};
+use pegaflow_core::{EngineError, LayerSave, PegaEngine, PrefetchStatus};
 use pyo3::{PyErr, Python};
 use std::sync::Arc;
 use std::time::Instant;
@@ -189,7 +191,15 @@ impl Engine for GrpcEngineService {
                 (b + layer.block_ids.len(), h + layer.block_hashes.len())
             });
 
-        let result: Result<Response<SaveResponse>, Status> = async {
+        trace_root!("rpc.save", root, || {
+            [
+                ("instance_id", req.instance_id.clone()),
+                ("layers", layer_count.to_string()),
+                ("blocks", total_blocks.to_string()),
+            ]
+        });
+
+        let fut = async {
             let SaveRequest {
                 instance_id,
                 tp_rank,
@@ -199,9 +209,13 @@ impl Engine for GrpcEngineService {
             } = req;
             let tp_rank = Self::usize_from_u32(tp_rank, "tp_rank")?;
 
-            let saves: Vec<_> = saves
+            let saves: Vec<LayerSave> = saves
                 .into_iter()
-                .map(|layer| (layer.layer_name, layer.block_ids, layer.block_hashes))
+                .map(|layer| LayerSave {
+                    layer_name: layer.layer_name,
+                    block_ids: layer.block_ids,
+                    block_hashes: layer.block_hashes,
+                })
                 .collect();
 
             debug!(
@@ -217,8 +231,9 @@ impl Engine for GrpcEngineService {
             Ok(Response::new(SaveResponse {
                 status: Some(Self::build_simple_response()),
             }))
-        }
-        .await;
+        };
+
+        let result: Result<Response<SaveResponse>, Status> = trace_in_span!(root, fut).await;
 
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         match &result {
@@ -245,7 +260,15 @@ impl Engine for GrpcEngineService {
         let block_count = req.block_ids.len();
         let hash_count = req.block_hashes.len();
 
-        let result: Result<Response<LoadResponse>, Status> = async {
+        trace_root!("rpc.load", root, || {
+            [
+                ("instance_id", req.instance_id.clone()),
+                ("layers", layer_count.to_string()),
+                ("blocks", block_count.to_string()),
+            ]
+        });
+
+        let fut = async {
             let LoadRequest {
                 instance_id,
                 tp_rank,
@@ -284,8 +307,9 @@ impl Engine for GrpcEngineService {
             Ok(Response::new(LoadResponse {
                 status: Some(Self::build_simple_response()),
             }))
-        }
-        .await;
+        };
+
+        let result: Result<Response<LoadResponse>, Status> = trace_in_span!(root, fut).await;
 
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         match &result {
@@ -308,9 +332,16 @@ impl Engine for GrpcEngineService {
         &self,
         request: Request<QueryRequest>,
     ) -> Result<Response<QueryResponse>, Status> {
+        let req = request.into_inner();
+        trace_root!("rpc.query", root, || {
+            [
+                ("instance_id", req.instance_id.clone()),
+                ("block_hashes", req.block_hashes.len().to_string()),
+            ]
+        });
+
         let start = Instant::now();
-        let result: Result<Response<QueryResponse>, Status> = async {
-            let req = request.into_inner();
+        let fut = async {
             debug!(
                 "RPC [query]: instance_id={} block_hashes={}",
                 req.instance_id,
@@ -342,8 +373,9 @@ impl Engine for GrpcEngineService {
                 loading_blocks,
                 missing_blocks,
             }))
-        }
-        .await;
+        };
+
+        let result: Result<Response<QueryResponse>, Status> = trace_in_span!(root, fut).await;
 
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         match &result {

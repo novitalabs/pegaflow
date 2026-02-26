@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "pegaflow-llm"
-version = "0.0.11"
+version = "0.0.14"
 description = "High-performance key-value storage engine with Python bindings"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -21,6 +21,7 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: Implementation :: CPython",
 ]
 
@@ -95,8 +96,11 @@ warn_return_any = true
 warn_unused_ignores = true
 ignore_missing_imports = true
 
+[tool.isort]
+profile = "black"
+
 [tool.commitizen]
 name = "cz_conventional_commits"
-version = "0.0.11"
+version = "0.0.14"
 version_files = ["pyproject.toml:^version"]
 tag_format = "v$version"

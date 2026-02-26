@@ -3,15 +3,29 @@
 //! This module provides the hierarchical context structure for managing
 //! multi-tenant inference instances and their associated GPU resources.
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex, RwLock},
-};
+use parking_lot::Mutex;
+use std::{collections::HashMap, sync::Arc};
 
 use cudarc::driver::CudaContext;
 use log::info;
 
+use crate::numa::NumaNode;
 use crate::{EngineError, gpu_worker::GpuWorkerPool};
+
+/// Layer metadata protected by a single mutex.
+///
+/// This struct consolidates layer name mappings and GPU contexts to avoid
+/// potential deadlocks from acquiring multiple locks in inconsistent order.
+struct LayerMetadata {
+    /// Mapping from layer names to numeric IDs (0..num_layers).
+    name_to_id: HashMap<String, usize>,
+
+    /// Inverse mapping from IDs to layer names.
+    names: Vec<String>,
+
+    /// GPU contexts indexed by CUDA device ID.
+    gpu_contexts: HashMap<i32, Arc<GpuContext>>,
+}
 
 /// Compute greatest common divisor using Euclidean algorithm.
 fn gcd(mut a: usize, mut b: usize) -> usize {
@@ -135,7 +149,14 @@ impl KVCacheRegistration {
 /// - CUDA context lifetime for a specific device
 /// - KV cache registrations for all layers on this GPU
 /// - Asynchronous worker pool for load/save operations
+/// - NUMA affinity for memory allocation optimization
 pub struct GpuContext {
+    /// CUDA device ID.
+    device_id: i32,
+
+    /// Preferred NUMA node for this GPU (for memory allocation).
+    preferred_numa: NumaNode,
+
     /// KV cache layout registrations by layer name.
     kv_caches: Mutex<HashMap<String, KVCacheRegistration>>,
 
@@ -149,17 +170,37 @@ pub struct GpuContext {
 impl GpuContext {
     /// Create a new GPU context for the specified device.
     ///
+    /// The `numa_node` should be obtained from `NumaTopology::numa_for_gpu()`.
+    /// Worker threads will be pinned to the specified NUMA node for optimal
+    /// memory locality during transfers.
+    ///
     /// # Errors
     /// Returns `EngineError::CudaInit` if CUDA context creation or worker
     /// pool initialization fails.
-    pub fn new(cuda_ctx: Arc<CudaContext>, device_id: i32) -> Result<Self, EngineError> {
-        let worker_pool = GpuWorkerPool::spawn(device_id)?;
+    pub fn new(
+        cuda_ctx: Arc<CudaContext>,
+        device_id: i32,
+        numa_node: NumaNode,
+    ) -> Result<Self, EngineError> {
+        let worker_pool = GpuWorkerPool::spawn(device_id, numa_node)?;
 
         Ok(Self {
+            device_id,
+            preferred_numa: numa_node,
             kv_caches: Mutex::new(HashMap::new()),
             _cuda_ctx: cuda_ctx,
             worker_pool,
         })
+    }
+
+    /// Get the preferred NUMA node for this GPU.
+    pub fn preferred_numa(&self) -> NumaNode {
+        self.preferred_numa
+    }
+
+    /// Get the CUDA device ID.
+    pub fn device_id(&self) -> i32 {
+        self.device_id
     }
 
     /// Register a new layer's KV cache layout.
@@ -171,7 +212,7 @@ impl GpuContext {
         layer_name: String,
         registration: KVCacheRegistration,
     ) -> Result<(), String> {
-        let mut registrations = self.kv_caches.lock().expect("kv_caches lock poisoned");
+        let mut registrations = self.kv_caches.lock();
 
         if registrations.contains_key(&layer_name) {
             return Err(format!(
@@ -186,7 +227,7 @@ impl GpuContext {
 
     /// Retrieve a layer's registration information.
     pub fn get_registration(&self, layer_name: &str) -> Option<KVCacheRegistration> {
-        let registrations = self.kv_caches.lock().expect("kv_caches lock poisoned");
+        let registrations = self.kv_caches.lock();
         registrations.get(layer_name).cloned()
     }
 
@@ -217,14 +258,11 @@ pub struct InstanceContext {
     /// Total world size (TP × PP × DP).
     world_size: usize,
 
-    /// Mapping from layer names to numeric IDs (0..num_layers).
-    layer_name_to_id: Mutex<HashMap<String, usize>>,
-
-    /// Inverse mapping from IDs to layer names.
-    layer_names: Mutex<Vec<String>>,
-
-    /// GPU contexts indexed by CUDA device ID.
-    gpu_contexts: RwLock<HashMap<i32, Arc<GpuContext>>>,
+    /// Layer metadata and GPU contexts protected by a single mutex.
+    ///
+    /// This consolidates previously separate mutexes to prevent deadlocks
+    /// from inconsistent lock acquisition ordering.
+    metadata: Mutex<LayerMetadata>,
 }
 
 impl InstanceContext {
@@ -249,9 +287,11 @@ impl InstanceContext {
             num_layers,
             tp_size,
             world_size,
-            layer_name_to_id: Mutex::new(HashMap::new()),
-            layer_names: Mutex::new(Vec::new()),
-            gpu_contexts: RwLock::new(HashMap::new()),
+            metadata: Mutex::new(LayerMetadata {
+                name_to_id: HashMap::new(),
+                names: Vec::new(),
+                gpu_contexts: HashMap::new(),
+            }),
         })
     }
 
@@ -261,31 +301,42 @@ impl InstanceContext {
     /// - `Some(id)` if the layer was newly allocated
     /// - `None` if the layer already exists
     pub fn allocate_new_layer_id(&self, layer_name: &str) -> Option<usize> {
-        let mut map = self
-            .layer_name_to_id
-            .lock()
-            .expect("layer_name_to_id lock poisoned");
+        let mut metadata = self.metadata.lock();
 
-        if map.contains_key(layer_name) {
+        if metadata.name_to_id.contains_key(layer_name) {
             return None;
         }
 
-        let mut names = self.layer_names.lock().expect("layer_names lock poisoned");
-        let id = names.len();
-        names.push(layer_name.to_string());
-        map.insert(layer_name.to_string(), id);
+        let id = metadata.names.len();
+        metadata.names.push(layer_name.to_string());
+        metadata.name_to_id.insert(layer_name.to_string(), id);
         Some(id)
+    }
+
+    /// Get existing layer ID or allocate a new one.
+    ///
+    /// This is idempotent: calling multiple times with the same layer name
+    /// returns the same ID. Used for MLA where multiple TP ranks register
+    /// the same layer name on different devices.
+    pub fn get_or_allocate_layer_id(&self, layer_name: &str) -> usize {
+        let mut metadata = self.metadata.lock();
+
+        if let Some(&id) = metadata.name_to_id.get(layer_name) {
+            return id;
+        }
+
+        let id = metadata.names.len();
+        metadata.names.push(layer_name.to_string());
+        metadata.name_to_id.insert(layer_name.to_string(), id);
+        id
     }
 
     /// Look up the numeric ID for a layer name.
     ///
     /// Returns `None` if the layer has not been registered.
     pub fn get_layer_id(&self, layer_name: &str) -> Option<usize> {
-        let map = self
-            .layer_name_to_id
-            .lock()
-            .expect("layer_name_to_id lock poisoned");
-        map.get(layer_name).copied()
+        let metadata = self.metadata.lock();
+        metadata.name_to_id.get(layer_name).copied()
     }
 
     /// Calculate the total number of storage slots.
@@ -321,11 +372,16 @@ impl InstanceContext {
     /// Get or create a GPU context for the specified device.
     ///
     /// This method lazily initializes CUDA contexts as devices are first accessed.
+    /// The `numa_node` should be obtained from `NumaTopology::numa_for_gpu()`.
     ///
     /// # Errors
     /// Returns `EngineError::InvalidArgument` for negative device IDs,
     /// or `EngineError::CudaInit` if CUDA context creation fails.
-    pub fn ensure_gpu(&self, device_id: i32) -> Result<Arc<GpuContext>, EngineError> {
+    pub fn ensure_gpu(
+        &self,
+        device_id: i32,
+        numa_node: NumaNode,
+    ) -> Result<Arc<GpuContext>, EngineError> {
         if device_id < 0 {
             return Err(EngineError::InvalidArgument(format!(
                 "device_id {} must be >= 0",
@@ -333,75 +389,72 @@ impl InstanceContext {
             )));
         }
 
-        // Fast path: read lock
+        // Fast path: check if context exists
         {
-            let contexts = self
-                .gpu_contexts
-                .read()
-                .expect("gpu contexts read lock poisoned");
-            if let Some(ctx) = contexts.get(&device_id) {
+            let metadata = self.metadata.lock();
+            if let Some(ctx) = metadata.gpu_contexts.get(&device_id) {
                 return Ok(Arc::clone(ctx));
             }
         }
 
-        // Slow path: write lock for initialization
-        let mut contexts = self
-            .gpu_contexts
-            .write()
-            .expect("gpu contexts write lock poisoned");
-
-        // Double-check after acquiring write lock
-        if let Some(ctx) = contexts.get(&device_id) {
-            return Ok(Arc::clone(ctx));
-        }
-
+        // Slow path: create new context
         let cuda_ctx = CudaContext::new(device_id as usize)
             .map_err(|e| EngineError::CudaInit(format!("{e:?}")))?;
 
-        let ctx = Arc::new(GpuContext::new(cuda_ctx, device_id)?);
-        contexts.insert(device_id, Arc::clone(&ctx));
+        let ctx = Arc::new(GpuContext::new(cuda_ctx, device_id, numa_node)?);
 
-        info!("Initialized GPU context: device_id={}", device_id);
+        // Insert and return
+        let mut metadata = self.metadata.lock();
+
+        // Double-check after acquiring lock
+        if let Some(existing) = metadata.gpu_contexts.get(&device_id) {
+            return Ok(Arc::clone(existing));
+        }
+
+        metadata.gpu_contexts.insert(device_id, Arc::clone(&ctx));
+
+        info!(
+            "Initialized GPU context: device_id={}, numa_node={}",
+            device_id, numa_node
+        );
         Ok(ctx)
     }
 
     /// Get an existing GPU context without creating one.
     pub fn get_gpu(&self, device_id: i32) -> Option<Arc<GpuContext>> {
-        let contexts = self
-            .gpu_contexts
-            .read()
-            .expect("gpu contexts read lock poisoned");
-        contexts.get(&device_id).cloned()
+        let metadata = self.metadata.lock();
+        metadata.gpu_contexts.get(&device_id).cloned()
     }
 
-    /// Register a new layer on a GPU.
+    /// Register a layer on a GPU.
     ///
     /// This method:
     /// 1. Ensures the GPU context exists (creates if needed)
-    /// 2. Allocates a new layer ID (fails if layer already exists)
+    /// 2. Gets existing layer ID or allocates a new one (idempotent)
     /// 3. Registers the layer's KV cache on the GPU
     ///
+    /// For MLA with TP > 1, multiple ranks may register the same layer name
+    /// on different devices. The layer ID allocation is idempotent, but
+    /// GPU registration will fail if the same layer is registered twice
+    /// on the same device.
+    ///
     /// # Errors
-    /// - `EngineError::InvalidArgument` if layer already exists
+    /// - `EngineError::InvalidArgument` if layer already registered on this GPU
     /// - `EngineError::CudaInit` if GPU context creation fails
     pub fn register_new_gpu_layer(
         &self,
         device_id: i32,
+        numa_node: NumaNode,
         layer_name: &str,
         registration: KVCacheRegistration,
     ) -> Result<usize, EngineError> {
         // 1. Ensure GPU context
-        let gpu = self.ensure_gpu(device_id)?;
+        let gpu = self.ensure_gpu(device_id, numa_node)?;
 
-        // 2. Allocate new layer ID (strict, fails if exists)
-        let layer_id = self.allocate_new_layer_id(layer_name).ok_or_else(|| {
-            EngineError::InvalidArgument(format!(
-                "layer {} already registered in instance",
-                layer_name
-            ))
-        })?;
+        // 2. Get or allocate layer ID (idempotent for MLA multi-device registration)
+        let layer_id = self.get_or_allocate_layer_id(layer_name);
 
-        // 3. Register on GPU
+        // 3. Register on GPU (fails if layer already registered on THIS device)
         gpu.register_new_layer(layer_name.to_string(), registration)
             .map_err(EngineError::InvalidArgument)?;
 
@@ -491,6 +544,9 @@ mod tests {
         )
         .expect("create instance");
 
+        // Use UNKNOWN NUMA node for tests (no actual GPU/NUMA in CI)
+        let numa = NumaNode::UNKNOWN;
+
         // 2. Register multiple layers on device 0
         for layer_id in 0..4 {
             let layer_name = format!("layer_{}", layer_id);
@@ -505,7 +561,7 @@ mod tests {
             .unwrap();
 
             let id = instance
-                .register_new_gpu_layer(0, &layer_name, reg)
+                .register_new_gpu_layer(0, numa, &layer_name, reg)
                 .expect("register layer");
             assert_eq!(id, layer_id);
         }
@@ -514,11 +570,11 @@ mod tests {
         assert!(instance.verify_topology(64, 8, 8).is_ok());
         assert!(instance.verify_topology(32, 8, 8).is_err()); // wrong layers
 
-        // 4. Verify duplicate layer registration fails
+        // 4. Verify duplicate layer registration on SAME device fails
         let dup_reg = KVCacheRegistration::new(0x2000, 1024 * 1024, 100, 1024, 0, 1).unwrap();
         let err = instance
-            .register_new_gpu_layer(0, "layer_0", dup_reg)
-            .expect_err("duplicate should fail");
+            .register_new_gpu_layer(0, numa, "layer_0", dup_reg)
+            .expect_err("duplicate on same device should fail");
         assert!(err.to_string().contains("already registered"));
 
         // 5. Verify we can get the registered layer back
@@ -526,5 +582,38 @@ mod tests {
         let reg = gpu.get_registration("layer_0").expect("get registration");
         assert_eq!(reg.data_ptr, 0x1000);
         assert_eq!(reg.num_blocks, 100);
+    }
+
+    /// Tests MLA-style registration where the same layer name is used
+    /// by multiple TP ranks. Verifies layer ID allocation is idempotent.
+    #[test]
+    fn mla_layer_id_allocation() {
+        let instance = InstanceContext::new(
+            "mla-instance".to_string(),
+            "mla-ns".to_string(),
+            10, // num_layers
+            1,  // tp_size (MLA uses tp_size=1)
+            8,  // world_size (8 TP ranks, but treated as 1 for storage)
+        )
+        .expect("create instance");
+
+        // Simulate 8 TP ranks calling get_or_allocate_layer_id for the same layer
+        // This is the MLA pattern where all ranks share the same KV data
+        for _ in 0..8 {
+            // All calls should return the same layer_id=0
+            let layer_id = instance.get_or_allocate_layer_id("layer_0");
+            assert_eq!(layer_id, 0, "all calls should get same layer_id");
+        }
+
+        // Verify only one layer was allocated
+        assert_eq!(instance.get_layer_id("layer_0"), Some(0));
+
+        // Allocate another layer
+        let layer_id = instance.get_or_allocate_layer_id("layer_1");
+        assert_eq!(layer_id, 1);
+
+        // Verify both layers exist with correct IDs
+        assert_eq!(instance.get_layer_id("layer_0"), Some(0));
+        assert_eq!(instance.get_layer_id("layer_1"), Some(1));
     }
 }

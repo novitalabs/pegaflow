@@ -18,7 +18,7 @@ from sglang.srt.mem_cache.hicache_storage import get_hash_str
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 
-from pegaflow import EngineRpcClient, PyLoadState
+from pegaflow import EngineRpcClient, PegaFlowError, PyLoadState
 from pegaflow.ipc_wrapper import CudaIPCWrapper
 
 logger = logging.getLogger(__name__)
@@ -122,12 +122,8 @@ class PeagflowRadixCache(RadixCache):
 
         self.tp_rank = rank
         self.tp_size = tp_size
-        self.pp_rank = params.pp_rank
-        self.pp_size = params.pp_size
         self.world_size = 1  # TODO: hardcode
 
-        # Get PP group for synchronization (None if pp_size <= 1)
-        self._pp_group = self._get_pp_group()
         # Store TP cache group for hit_blocks sync
         self._tp_cache_group = params.tp_cache_group
 
@@ -166,18 +162,6 @@ class PeagflowRadixCache(RadixCache):
     # --------------------------------------------------------------------- #
     # Helpers
     # --------------------------------------------------------------------- #
-    def _get_pp_group(self):
-        """Get the PP group coordinator if pp_size > 1."""
-        if self.pp_size <= 1:
-            return None
-        try:
-            from sglang.srt.distributed import get_pp_group
-
-            return get_pp_group()
-        except (ImportError, AssertionError) as e:
-            logger.debug(f"[PeagflowRadixCache] PP group not available: {e}")
-            return None
-
     def _sync_instance_id(
         self, instance_id: str | None, tp_cache_group: torch.distributed.ProcessGroup | None
     ) -> str:
@@ -213,7 +197,6 @@ class PeagflowRadixCache(RadixCache):
         """
         original_hit_blocks = hit_blocks
 
-        # Step 1: TP AllReduce MIN (within each PP stage)
         if self.tp_size > 1 and self._tp_cache_group is not None:
             hit_tensor = torch.tensor([hit_blocks], dtype=torch.int64, device="cpu")
             torch.distributed.all_reduce(
@@ -224,7 +207,7 @@ class PeagflowRadixCache(RadixCache):
         if hit_blocks != original_hit_blocks:
             logger.debug(
                 f"[PeagflowRadixCache] AllReduce MIN: local={original_hit_blocks} -> min={hit_blocks} "
-                f"(tp_rank={self.tp_rank}, pp_rank={self.pp_rank})"
+                f"(tp_rank={self.tp_rank})"
             )
 
         return hit_blocks
@@ -320,35 +303,38 @@ class PeagflowRadixCache(RadixCache):
         stride0_bytes = stride[0] * element_size
 
         assert self.page_size > 0, "page_size must be > 0 for PegaFlow radix cache"
-        assert (
-            slots % self.page_size == 0
-        ), f"KV slots ({slots}) must be divisible by page_size ({self.page_size})"
+        assert slots % self.page_size == 0, (
+            f"KV slots ({slots}) must be divisible by page_size ({self.page_size})"
+        )
 
         num_blocks = slots // self.page_size
         bytes_per_block = stride0_bytes * self.page_size
 
-        ok, message = self.engine_client.register_context(
-            self.instance_id,
-            self.namespace,
-            0 if self.is_mla else self.tp_rank,
-            1 if self.is_mla else self.tp_size,
-            self.world_size,
-            self.device_id,
-            num_layers,
-            layer_name,
-            wrapper_bytes,
-            num_blocks,
-            bytes_per_block,
-            0,  # kv_stride_bytes
-            1,  # segments
-        )
+        try:
+            ok, message = self.engine_client.register_context(
+                self.instance_id,
+                self.namespace,
+                0 if self.is_mla else self.tp_rank,
+                1 if self.is_mla else self.tp_size,
+                self.world_size,
+                self.device_id,
+                num_layers,
+                layer_name,
+                wrapper_bytes,
+                num_blocks,
+                bytes_per_block,
+                0,  # kv_stride_bytes
+                1,  # segments
+            )
 
-        if not ok:
-            raise RuntimeError(f"Register context failed for {layer_name}: {message}")
+            if not ok:
+                raise RuntimeError(f"Register context failed for {layer_name}: {message}")
 
-        logger.info(
-            f"[PeagflowRadixCache] Registered {layer_name} (num_blocks={num_blocks}, bytes_per_block={bytes_per_block}, page_size={self.page_size})"
-        )
+            logger.info(
+                f"[PeagflowRadixCache] Registered {layer_name} (num_blocks={num_blocks}, bytes_per_block={bytes_per_block}, page_size={self.page_size})"
+            )
+        except PegaFlowError as e:
+            raise RuntimeError(f"Failed to register {layer_name}: {e}") from e
 
         return layer_name
 
@@ -428,7 +414,7 @@ class PeagflowRadixCache(RadixCache):
 
             token_slots = self.token_to_kv_pool_allocator.alloc(uncached_len)
             if token_slots is None or len(token_slots) == 0:
-                logger.info(f"[PeagflowRadixCache] alloc returned empty (need={uncached_len})")
+                logger.warning(f"[PeagflowRadixCache] alloc returned empty (need={uncached_len})")
                 # Don't return early - still need to sync with hit_blocks=0
                 token_slots = None
             else:
@@ -462,51 +448,57 @@ class PeagflowRadixCache(RadixCache):
                 hit_blocks = min(hit_blocks, len(block_ids))
 
         if hit_blocks > 0 and token_slots is not None:
-            # Load hit_blocks from local PegaFlow server (what this PP stage has)
+            # Load hit_blocks from local PegaFlow server
             load_block_ids = block_ids[:hit_blocks]
             load_block_hashes = block_hashes[:hit_blocks]
 
             load_state = PyLoadState()
-            ok, message = self.engine_client.load(
-                self.instance_id,
-                0 if self.is_mla else self.tp_rank,
-                self.device_id,
-                load_state.shm_name(),
-                self._layer_names,
-                load_block_ids,
-                load_block_hashes,
-            )
+            load_success = False
 
-            if not ok:
-                logger.warning(f"[PeagflowRadixCache] load failed: {message}")
-                # Don't return early - set hit_blocks=0 and proceed to sync
-                self.token_to_kv_pool_allocator.free(token_slots)
-                token_slots = None
-                hit_blocks = 0
-            elif not self._await_load(load_state):
-                logger.warning("[PeagflowRadixCache] load timed out or failed")
-                # Don't return early - set hit_blocks=0 and proceed to sync
-                self.token_to_kv_pool_allocator.free(token_slots)
-                token_slots = None
-                hit_blocks = 0
-            else:
-                logger.debug(f"[PeagflowRadixCache] loaded blocks={hit_blocks} from local server")
+            try:
+                ok, message = self.engine_client.load(
+                    self.instance_id,
+                    0 if self.is_mla else self.tp_rank,
+                    self.device_id,
+                    load_state.shm_name(),
+                    self._layer_names,
+                    load_block_ids,
+                    load_block_hashes,
+                )
 
-        # CRITICAL: Sync hit_blocks across TP and PP ranks using AllReduce MIN.
-        # TP ranks may have different cache hits; PP stages have different servers.
+                if not ok:
+                    logger.warning(f"[PeagflowRadixCache] load failed: {message}")
+                elif not self._await_load(load_state):
+                    logger.warning("[PeagflowRadixCache] load timed out or failed")
+                else:
+                    load_success = True
+                    logger.debug(
+                        f"[PeagflowRadixCache] loaded blocks={hit_blocks} from local server"
+                    )
+            except Exception as e:
+                logger.warning(f"[PeagflowRadixCache] load failed: {e}")
+            finally:
+                # Unified cleanup on failure
+                if not load_success:
+                    self.token_to_kv_pool_allocator.free(token_slots)
+                    token_slots = None
+                    hit_blocks = 0
+
+        # Sync hit_blocks across TP ranks using AllReduce MIN.
+        # TP ranks may have different cache hits due to timing.
         # Take the minimum to ensure all ranks use the same prefix length.
         real_hit_blocks = self._sync_hit_blocks(hit_blocks)
 
         if real_hit_blocks == 0 or token_slots is None:
-            # No common blocks across PP stages, or local load failed - discard everything
+            # No common blocks across TP ranks, or local load failed - discard everything
             if token_slots is not None:
                 self.token_to_kv_pool_allocator.free(token_slots)
             return base_res
 
-        # Use only real_hit_blocks worth of data (common across all PP stages)
+        # Use only real_hit_blocks worth of data (common across all TP ranks)
         fetched_tokens = real_hit_blocks * block_size
 
-        # Trim unused slots: discard tokens beyond what all PP stages have
+        # Trim unused slots: discard tokens beyond what all TP ranks have
         if fetched_tokens < uncached_len:
             self.token_to_kv_pool_allocator.free(token_slots[fetched_tokens:])
             token_slots = token_slots[:fetched_tokens]

@@ -8,7 +8,6 @@ pub(crate) struct CoreMetrics {
     // Pinned pool (allocator-level)
     pub pool_capacity_bytes: UpDownCounter<i64>,
     pub pool_used_bytes: UpDownCounter<i64>,
-    pub pool_largest_free_bytes: UpDownCounter<i64>,
     pub pool_alloc_failures: Counter<u64>,
 
     // Inflight (write path safety/health)
@@ -49,6 +48,7 @@ pub(crate) struct CoreMetrics {
     pub ssd_prefetch_throughput_bytes_per_second: Histogram<f64>,
     pub ssd_prefetch_inflight: UpDownCounter<i64>,
     pub ssd_prefetch_queue_full: Counter<u64>,
+    pub ssd_prefetch_backpressure_blocks: Counter<u64>,
 }
 
 fn init_meter() -> Meter {
@@ -97,11 +97,6 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
                 .i64_up_down_counter("pegaflow_pool_used_bytes")
                 .with_unit("bytes")
                 .with_description("Current pinned pool usage in bytes")
-                .build(),
-            pool_largest_free_bytes: meter
-                .i64_up_down_counter("pegaflow_pool_largest_free_bytes")
-                .with_unit("bytes")
-                .with_description("Largest contiguous free region in pinned pool (fragmentation signal)")
                 .build(),
             pool_alloc_failures: meter
                 .u64_counter("pegaflow_pool_alloc_failures")
@@ -242,6 +237,10 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
             ssd_prefetch_queue_full: meter
                 .u64_counter("pegaflow_ssd_prefetch_queue_full")
                 .with_description("Prefetch requests dropped due to full queue")
+                .build(),
+            ssd_prefetch_backpressure_blocks: meter
+                .u64_counter("pegaflow_ssd_prefetch_backpressure_blocks")
+                .with_description("Blocks treated as missing due to max prefetch backpressure")
                 .build(),
         }
     })

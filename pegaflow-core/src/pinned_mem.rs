@@ -109,6 +109,16 @@ pub struct PinnedMemory {
     strategy: AllocStrategy,
 }
 
+impl std::fmt::Debug for PinnedMemory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PinnedMemory")
+            .field("ptr", &format!("{:p}", self.ptr.as_ptr()))
+            .field("size", &self.size)
+            .field("strategy", &self.strategy)
+            .finish()
+    }
+}
+
 // SAFETY: PinnedMemory owns a pinned memory region that is:
 // - Fixed in physical memory (pinned by CUDA)
 // - Safe to access from any thread
