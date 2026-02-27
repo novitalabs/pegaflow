@@ -165,13 +165,11 @@ impl NumaBuffer {
                     for &cpu in &cpus {
                         libc::CPU_SET(cpu, &mut cpu_set);
                     }
-                    let ret = libc::sched_setaffinity(
-                        0,
-                        mem::size_of::<libc::cpu_set_t>(),
-                        &cpu_set,
-                    );
+                    let ret =
+                        libc::sched_setaffinity(0, mem::size_of::<libc::cpu_set_t>(), &cpu_set);
                     assert_eq!(
-                        ret, 0,
+                        ret,
+                        0,
                         "sched_setaffinity failed: {}",
                         std::io::Error::last_os_error()
                     );
@@ -339,8 +337,12 @@ fn run_single_nic_bench(
     let mut tasks = Vec::with_capacity(schedule.len().saturating_sub(warmup));
 
     for (i, &nblocks) in schedule.iter().enumerate() {
-        let (local_ptrs, remote_ptrs, lens) =
-            build_block_scatter(ctx.client_buf.as_u64(), ctx.server_buf.as_u64(), nblocks, block_size);
+        let (local_ptrs, remote_ptrs, lens) = build_block_scatter(
+            ctx.client_buf.as_u64(),
+            ctx.server_buf.as_u64(),
+            nblocks,
+            block_size,
+        );
 
         let start = Instant::now();
         let result = match mode {
@@ -388,7 +390,13 @@ fn run_multi_nic_bench(
 ) -> Vec<BenchResult> {
     let n = contexts.len();
     if n == 1 {
-        return vec![run_single_nic_bench(&contexts[0], mode, schedule, warmup, block_size)];
+        return vec![run_single_nic_bench(
+            &contexts[0],
+            mode,
+            schedule,
+            warmup,
+            block_size,
+        )];
     }
 
     let barrier = Arc::new(Barrier::new(n));
@@ -468,7 +476,8 @@ fn print_single_nic_result(result: &BenchResult, mode: &str, block_size: usize, 
     let mut latencies: Vec<f64> = result.tasks.iter().map(|t| t.latency_ms).collect();
     latencies.sort_by(f64::total_cmp);
 
-    let avg_bytes: usize = result.tasks.iter().map(|t| t.bytes).sum::<usize>() / result.tasks.len().max(1);
+    let avg_bytes: usize =
+        result.tasks.iter().map(|t| t.bytes).sum::<usize>() / result.tasks.len().max(1);
     let avg_blocks = avg_bytes / block_size;
 
     let p50 = percentile(&latencies, 0.50);
@@ -488,10 +497,7 @@ fn print_single_nic_result(result: &BenchResult, mode: &str, block_size: usize, 
         format_size(block_size),
         avg_bytes as f64 / (1024.0 * 1024.0),
     );
-    println!(
-        "  p50={:.2}ms  p95={:.2}ms  p99={:.2}ms",
-        p50, p95, p99,
-    );
+    println!("  p50={:.2}ms  p95={:.2}ms  p99={:.2}ms", p50, p95, p99,);
     println!(
         "  p50 equiv: {:.1} Gbps ({:.2} GiB/s)",
         gbps(avg_bytes, p50 / 1000.0),
@@ -549,10 +555,7 @@ fn print_multi_nic_results(
         avg_bytes as f64 / (1024.0 * 1024.0),
         nic_count,
     );
-    println!(
-        "  p50={:.2}ms  p95={:.2}ms  p99={:.2}ms",
-        p50, p95, p99,
-    );
+    println!("  p50={:.2}ms  p95={:.2}ms  p99={:.2}ms", p50, p95, p99,);
     println!(
         "  p50 equiv: {:.1} Gbps ({:.2} GiB/s)",
         gbps(avg_bytes, p50 / 1000.0),
@@ -776,12 +779,8 @@ fn main() {
 
         // Cleanup.
         for ctx in &contexts {
-            ctx.client
-                .unregister_memory(ctx.client_buf.as_u64())
-                .ok();
-            ctx.server
-                .unregister_memory(ctx.server_buf.as_u64())
-                .ok();
+            ctx.client.unregister_memory(ctx.client_buf.as_u64()).ok();
+            ctx.server.unregister_memory(ctx.server_buf.as_u64()).ok();
         }
     }
 

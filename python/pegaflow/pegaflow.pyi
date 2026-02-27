@@ -128,9 +128,7 @@ class PegaEngine:
 class TransferEngine:
     """RDMA transfer engine used by SGLang transfer adapter."""
 
-    def __init__(self) -> None:
-        ...
-
+    def __init__(self) -> None: ...
     def initialize(
         self,
         local_hostname: str,

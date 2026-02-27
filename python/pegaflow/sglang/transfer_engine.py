@@ -50,11 +50,11 @@ def get_ib_devices_for_gpu(ib_device_str: str | None, gpu_id: int) -> str | None
     if is_json_file:
         try:
             if os.path.isfile(ib_device_str):
-                with open(ib_device_str, "r") as f:
+                with open(ib_device_str) as f:
                     ib_device_str = f.read()
             else:
                 raise RuntimeError(f"File {ib_device_str} does not exist.")
-        except (IOError, OSError) as e:
+        except OSError as e:
             raise RuntimeError(f"Failed to read JSON file {ib_device_str}: {e}") from e
 
     try:
@@ -62,11 +62,7 @@ def get_ib_devices_for_gpu(ib_device_str: str | None, gpu_id: int) -> str | None
         if isinstance(parsed_json, dict):
             gpu_mapping: dict[int, str] = {}
             for gpu_key, ib_devices in parsed_json.items():
-                if (
-                    isinstance(gpu_key, str)
-                    and gpu_key.isdigit()
-                    and isinstance(ib_devices, str)
-                ):
+                if isinstance(gpu_key, str) and gpu_key.isdigit() and isinstance(ib_devices, str):
                     gpu_mapping[int(gpu_key)] = ib_devices.strip()
                 elif isinstance(gpu_key, int) and isinstance(ib_devices, str):
                     gpu_mapping[gpu_key] = ib_devices.strip()
@@ -83,9 +79,9 @@ def get_ib_devices_for_gpu(ib_device_str: str | None, gpu_id: int) -> str | None
             raise ValueError(
                 f"No IB devices configured for GPU {gpu_id}. Available GPUs: {list(gpu_mapping.keys())}"
             )
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as err:
         if is_json_file:
-            raise RuntimeError(f"Failed to parse JSON content from file {ib_device_str}")
+            raise RuntimeError(f"Failed to parse JSON content from file {ib_device_str}") from err
         return ib_device_str
 
 
@@ -123,9 +119,7 @@ class MooncakeTransferEngine:
             raise RuntimeError("PegaFlow Transfer Engine get_session_id failed.")
         rpc_port = self.engine.get_rpc_port()
         if rpc_port <= 0:
-            raise RuntimeError(
-                f"PegaFlow Transfer Engine get_rpc_port failed, got {rpc_port}."
-            )
+            raise RuntimeError(f"PegaFlow Transfer Engine get_rpc_port failed, got {rpc_port}.")
         self.session_id = f"{_encode_session_id(bytes(raw_session_id))}:{rpc_port}"
 
     def register(self, ptr, length):
