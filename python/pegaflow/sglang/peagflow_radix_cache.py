@@ -432,7 +432,7 @@ class PeagflowRadixCache(RadixCache):
 
                 # Query availability before issuing load
                 try:
-                    query_res = self.engine_client.query(self.instance_id, block_hashes)
+                    query_res = self.engine_client.query_prefetch(self.instance_id, block_hashes)
                     logger.debug(f"[PeagflowRadixCache] query hash: {block_hashes[0]}")
                     hit_blocks = (
                         query_res.get("hit_blocks", 0) if isinstance(query_res, dict) else 0

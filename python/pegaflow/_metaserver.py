@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Wrapper script to launch pegaflow-server binary."""
+"""Wrapper script to launch pegaflow-metaserver binary."""
 
 import subprocess
 import sys
 
 from pegaflow._bin_utils import find_binary
 
-_BINARY = "pegaflow-server-py"
+_BINARY = "pegaflow-metaserver-py"
 
 
 def main():
@@ -17,7 +17,8 @@ def main():
     except FileNotFoundError:
         print(f"Error: {_BINARY} binary not found at {binary}", file=sys.stderr)
         print(
-            "Run `cargo build -r --bin pegaflow-server-py` or reinstall pegaflow.", file=sys.stderr
+            "Run `cargo build -r --bin pegaflow-metaserver-py` or reinstall pegaflow.",
+            file=sys.stderr,
         )
         sys.exit(1)
     except KeyboardInterrupt:

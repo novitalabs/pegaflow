@@ -27,6 +27,11 @@ io-uring = "0.7"
 futures = "0.3"
 parking_lot = "0.12"
 fastrace = { workspace = true, optional = true }
+kube.workspace = true
+k8s-openapi.workspace = true
+tonic.workspace = true
+dashmap.workspace = true
+pegaflow-proto = { path = "../pegaflow-proto" }
 
 [dev-dependencies]
 criterion.workspace = true

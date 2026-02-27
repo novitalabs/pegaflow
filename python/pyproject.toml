@@ -29,7 +29,7 @@ classifiers = [
 module-name = "pegaflow.pegaflow"
 python-source = "."
 # Automatically include binaries defined in Cargo.toml [[bin]] sections
-include = ["pegaflow/pegaflow-server-py"]
+include = ["pegaflow/pegaflow-server-py", "pegaflow/pegaflow-metaserver-py"]
 
 [project.optional-dependencies]
 test = [
@@ -47,6 +47,7 @@ dev = [
 
 [project.scripts]
 pegaflow-server = "pegaflow._server:main"
+pegaflow-metaserver = "pegaflow._metaserver:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

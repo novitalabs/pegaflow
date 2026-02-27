@@ -36,13 +36,13 @@ uv pip install pegaflow-llm
 
 > Hint for sglang users: If you running in sglang docker, you can create venv with `uv venv --prompt pegaflow --system-site-packages`.
 
-### 2. Start Pegaflow Server
+### 2. Start PegaFlow Server
 
 ```bash
 pegaflow-server
 ```
 
-**All available options:**
+**All available server options:**
 
 - `--addr`: Bind address (default: `127.0.0.1:50055`)
 - `--devices`: CUDA device IDs to initialize, comma-separated (default: auto-detect all available GPUs, e.g., `--devices 0,1,2,3`)
@@ -63,6 +63,29 @@ pegaflow-server
 - `--ssd-write-inflight`: SSD write inflight, max concurrent block writes (default: `2`)
 - `--ssd-prefetch-inflight`: SSD prefetch inflight, max concurrent block reads (default: `16`)
 - `--max-prefetch-blocks`: Max blocks allowed in prefetching state, backpressure for SSD prefetch (default: `800`)
+- `--metaserver-addr`: MetaServer gRPC address for cross-node block hash registry (e.g., `http://127.0.0.1:50056`). When set, saved block hashes are inserted to the metaserver for cross-node discovery.
+- `--advertise-addr`: Advertised address (ip:port) reported to the metaserver for cross-node discovery. Other nodes use this address to connect to this server. Fallback order: this flag > `PEGAFLOW_HOST_IP` env + bind port > auto-detected IP + bind port.
+
+### 2b. (Optional) Start MetaServer for Multi-Node
+
+For multi-node setups, start a MetaServer to coordinate block hashes across nodes. Each pegaflow-server registers its block hashes with the MetaServer, enabling cross-node KV cache discovery.
+
+```bash
+pegaflow-metaserver
+```
+
+Then point each pegaflow-server to the MetaServer:
+
+```bash
+pegaflow-server --metaserver-addr http://<metaserver-host>:50056
+```
+
+**MetaServer options:**
+
+- `--addr`: Bind address (default: `127.0.0.1:50056`)
+- `--log-level`: Log level: `trace`, `debug`, `info`, `warn`, `error` (default: `info`)
+- `--max-capacity-mb`: Maximum cache capacity in MB (default: `512`)
+- `--ttl-minutes`: Cache entry TTL in minutes (default: `120`)
 
 ### 3. Connect to Server with client
 

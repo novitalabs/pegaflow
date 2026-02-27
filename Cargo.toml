@@ -3,6 +3,7 @@ members = [
   "pegaflow-core",
   "pegaflow-proto",
   "pegaflow-server",
+  "pegaflow-metaserver",
   "pegaflow-transfer",
   "python",
 ]
@@ -59,6 +60,9 @@ prost = "0.14"
 tonic = "0.14"
 tonic-prost = "0.14"
 
+# Kubernetes
+kube = { version = "3.0", features = ["client", "runtime", "rustls-tls"] }
+k8s-openapi = { version = "0.27", features = ["v1_33"] }
 
 # Python bindings
 pyo3 = { version = "0.27" }

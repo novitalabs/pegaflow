@@ -5,6 +5,7 @@
 //! - Tensor parallelism (TP) across multiple GPUs
 //! - Split-storage layout for efficient K/V batch transfers
 //! - SSD caching tier
+//! - Kubernetes service discovery for inter-node communication
 
 #[macro_use]
 mod trace;
@@ -14,6 +15,7 @@ pub mod block;
 mod cache;
 pub mod gpu_worker;
 pub mod instance;
+pub mod internode;
 pub mod logging;
 mod metrics;
 pub mod numa;
@@ -69,10 +71,18 @@ use std::{
 };
 
 use log::{debug, info};
+use pegaflow_proto::proto::engine::meta_server_client::MetaServerClient;
+use tonic::transport::Channel;
 
 use crate::gpu_worker::{LayerLoadData, LoadBlock, LoadTask};
 use crate::metrics::core_metrics;
 use crate::storage::{SSD_ALIGNMENT, StorageEngine};
+
+/// Command sent to the metaserver insert worker.
+pub(crate) struct MetaserverInsertCmd {
+    pub namespace: String,
+    pub block_hashes: Vec<Vec<u8>>,
+}
 
 const DEFAULT_PINNED_POOL_BYTES: usize = 30 * 1024 * 1024 * 1024; // 30GB
 
@@ -199,6 +209,15 @@ impl PegaEngine {
         )
     }
 
+    /// Set the MetaServer client for cross-node block hash registry.
+    ///
+    /// `node_url` is this server's advertised address as `ip:port` (e.g., `10.0.0.1:50055`),
+    /// sent to the metaserver so other nodes can discover which server owns a block.
+    /// Spawns a background worker that batches and sends insert requests.
+    pub fn set_metaserver_client(&self, client: MetaServerClient<Channel>, node_url: String) {
+        self.storage.set_metaserver_client(client, node_url);
+    }
+
     /// Get or create an instance with the specified topology.
     ///
     /// If an instance with the same ID exists but different topology,
@@ -248,6 +267,12 @@ impl PegaEngine {
             .get(instance_id)
             .cloned()
             .ok_or_else(|| EngineError::InstanceMissing(instance_id.to_string()))
+    }
+
+    /// Get the namespace for an instance by ID.
+    pub fn get_instance_namespace(&self, instance_id: &str) -> Result<String, EngineError> {
+        let instance = self.get_instance(instance_id)?;
+        Ok(instance.namespace().to_string())
     }
 
     /// Register a KV cache layer with its memory layout.
@@ -340,13 +365,42 @@ impl PegaEngine {
         Ok(())
     }
 
+    /// Pure memory-only prefix query.
+    ///
+    /// Checks which prefix blocks are in the memory cache without triggering
+    /// SSD prefetch or pinning blocks. Returns `(hit, missing)` counts.
+    #[cfg_attr(feature = "tracing", fastrace::trace(name = "query.count_prefix_hit"))]
+    pub fn count_prefix_hit_blocks(
+        &self,
+        instance_id: &str,
+        block_hashes: &[Vec<u8>],
+    ) -> Result<(usize, usize), EngineError> {
+        let instance = self.get_instance(instance_id)?;
+        let namespace = instance.namespace();
+        let metrics = core_metrics();
+
+        let (hit, missing) = self
+            .storage
+            .check_prefix_memory_only(namespace, block_hashes);
+
+        metrics.cache_block_hits.add(hit as u64, &[]);
+        if missing > 0 {
+            metrics.cache_block_misses.add(missing as u64, &[]);
+        }
+
+        Ok((hit, missing))
+    }
+
     /// Count prefix hit blocks with SSD prefetch support.
     ///
     /// Returns:
     /// - `Done { hit, missing: 0 }`: all blocks in memory cache
     /// - `Loading { hit, loading }`: some blocks being fetched from SSD
     /// - `Done { hit, missing }`: some blocks don't exist
-    #[cfg_attr(feature = "tracing", fastrace::trace(name = "query.count_prefix_hit"))]
+    #[cfg_attr(
+        feature = "tracing",
+        fastrace::trace(name = "query_prefetch.count_prefix_hit")
+    )]
     pub fn count_prefix_hit_blocks_with_prefetch(
         &self,
         instance_id: &str,
@@ -371,7 +425,7 @@ impl PegaEngine {
                     metrics.cache_block_misses.add(*missing as u64, &[]);
                 }
             }
-            PrefetchStatus::Loading { hit, .. } => {
+            PrefetchStatus::Loading { hit, loading: _ } => {
                 metrics.cache_block_hits.add(*hit as u64, &[]);
             }
         }
@@ -520,5 +574,293 @@ impl PegaEngine {
     /// Should be called periodically (e.g., every 5 minutes).
     pub async fn gc_stale_inflight(&self, max_age: std::time::Duration) -> usize {
         self.storage.gc_stale_inflight(max_age).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block::{BlockKey, SealedBlock};
+
+    /// Helper: create a PegaEngine with a small pool and register a test instance.
+    fn setup_engine(instance_id: &str, namespace: &str) -> PegaEngine {
+        let config = storage::StorageConfig {
+            enable_lfu_admission: false,
+            hint_value_size_bytes: None,
+            max_prefetch_blocks: 100,
+            ssd_cache_config: None,
+            enable_numa_affinity: false,
+        };
+        let (engine, _rx) = PegaEngine::new_with_config(1 << 20, false, config);
+
+        // Manually insert an InstanceContext (no GPU required)
+        let instance = InstanceContext::new(
+            instance_id.to_string(),
+            namespace.to_string(),
+            2, // num_layers
+            1, // tp_size
+            1, // world_size
+        )
+        .unwrap();
+        engine
+            .instances
+            .write()
+            .unwrap()
+            .insert(instance_id.to_string(), Arc::new(instance));
+
+        engine
+    }
+
+    /// Helper: insert a block into the storage cache via complete_prefetch.
+    fn insert_block(engine: &PegaEngine, namespace: &str, hash: Vec<u8>) {
+        let key = BlockKey::new(namespace.to_string(), hash);
+        let block = Arc::new(SealedBlock::from_slots(Vec::new()));
+        engine.storage.complete_prefetch(key, Some(block));
+    }
+
+    #[tokio::test]
+    async fn all_blocks_cached_returns_done_full_hit() {
+        let engine = setup_engine("inst1", "ns");
+        insert_block(&engine, "ns", vec![1]);
+        insert_block(&engine, "ns", vec![2]);
+        insert_block(&engine, "ns", vec![3]);
+
+        let hashes = vec![vec![1], vec![2], vec![3]];
+        let status = engine
+            .count_prefix_hit_blocks_with_prefetch("inst1", &hashes)
+            .unwrap();
+
+        match status {
+            PrefetchStatus::Done { hit, missing } => {
+                assert_eq!(hit, 3);
+                assert_eq!(missing, 0);
+            }
+            other => panic!("expected Done, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn prefix_hit_then_miss() {
+        let engine = setup_engine("inst1", "ns");
+        insert_block(&engine, "ns", vec![1]);
+        insert_block(&engine, "ns", vec![2]);
+        // vec![3] is NOT cached
+
+        let hashes = vec![vec![1], vec![2], vec![3], vec![4]];
+        let status = engine
+            .count_prefix_hit_blocks_with_prefetch("inst1", &hashes)
+            .unwrap();
+
+        match status {
+            PrefetchStatus::Done { hit, missing } => {
+                assert_eq!(hit, 2);
+                assert_eq!(missing, 2); // [3] and [4]
+            }
+            other => panic!("expected Done, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn all_blocks_missing() {
+        let engine = setup_engine("inst1", "ns");
+
+        let hashes = vec![vec![1], vec![2]];
+        let status = engine
+            .count_prefix_hit_blocks_with_prefetch("inst1", &hashes)
+            .unwrap();
+
+        match status {
+            PrefetchStatus::Done { hit, missing } => {
+                assert_eq!(hit, 0);
+                assert_eq!(missing, 2);
+            }
+            other => panic!("expected Done, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_hashes_returns_done_zero() {
+        let engine = setup_engine("inst1", "ns");
+
+        let hashes: Vec<Vec<u8>> = vec![];
+        let status = engine
+            .count_prefix_hit_blocks_with_prefetch("inst1", &hashes)
+            .unwrap();
+
+        match status {
+            PrefetchStatus::Done { hit, missing } => {
+                assert_eq!(hit, 0);
+                assert_eq!(missing, 0);
+            }
+            other => panic!("expected Done, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn instance_not_found_returns_error() {
+        let engine = setup_engine("inst1", "ns");
+
+        let result = engine.count_prefix_hit_blocks_with_prefetch("nonexistent", &[vec![1]]);
+
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), EngineError::InstanceMissing(id) if id == "nonexistent")
+        );
+    }
+
+    #[tokio::test]
+    async fn first_block_miss_makes_all_missing() {
+        let engine = setup_engine("inst1", "ns");
+        // Only [2] is cached, but [1] is not — prefix breaks at [1]
+        insert_block(&engine, "ns", vec![2]);
+
+        let hashes = vec![vec![1], vec![2], vec![3]];
+        let status = engine
+            .count_prefix_hit_blocks_with_prefetch("inst1", &hashes)
+            .unwrap();
+
+        match status {
+            PrefetchStatus::Done { hit, missing } => {
+                assert_eq!(hit, 0);
+                assert_eq!(missing, 3);
+            }
+            other => panic!("expected Done, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn namespace_isolation() {
+        let engine = setup_engine("inst1", "ns_a");
+        // Block is cached under "ns_a", but query uses "ns_a" namespace
+        insert_block(&engine, "ns_a", vec![1]);
+        // Also insert a block under a different namespace
+        insert_block(&engine, "ns_b", vec![2]);
+
+        // Instance uses "ns_a", so only vec![1] should hit
+        let hashes = vec![vec![1], vec![2]];
+        let status = engine
+            .count_prefix_hit_blocks_with_prefetch("inst1", &hashes)
+            .unwrap();
+
+        match status {
+            PrefetchStatus::Done { hit, missing } => {
+                assert_eq!(hit, 1);
+                assert_eq!(missing, 1); // vec![2] is under "ns_b", miss for "ns_a"
+            }
+            other => panic!("expected Done, got {:?}", other),
+        }
+    }
+
+    // ================================================================
+    // count_prefix_hit_blocks (pure memory-only query)
+    // ================================================================
+
+    #[tokio::test]
+    async fn query_all_blocks_cached() {
+        let engine = setup_engine("inst1", "ns");
+        insert_block(&engine, "ns", vec![1]);
+        insert_block(&engine, "ns", vec![2]);
+        insert_block(&engine, "ns", vec![3]);
+
+        let (hit, missing) = engine
+            .count_prefix_hit_blocks("inst1", &[vec![1], vec![2], vec![3]])
+            .unwrap();
+
+        assert_eq!(hit, 3);
+        assert_eq!(missing, 0);
+    }
+
+    #[tokio::test]
+    async fn query_prefix_hit_then_miss() {
+        let engine = setup_engine("inst1", "ns");
+        insert_block(&engine, "ns", vec![1]);
+        insert_block(&engine, "ns", vec![2]);
+        // vec![3] NOT cached
+
+        let (hit, missing) = engine
+            .count_prefix_hit_blocks("inst1", &[vec![1], vec![2], vec![3], vec![4]])
+            .unwrap();
+
+        assert_eq!(hit, 2);
+        assert_eq!(missing, 2); // [3] and [4]
+    }
+
+    #[tokio::test]
+    async fn query_all_blocks_missing() {
+        let engine = setup_engine("inst1", "ns");
+
+        let (hit, missing) = engine
+            .count_prefix_hit_blocks("inst1", &[vec![1], vec![2]])
+            .unwrap();
+
+        assert_eq!(hit, 0);
+        assert_eq!(missing, 2);
+    }
+
+    #[tokio::test]
+    async fn query_empty_hashes() {
+        let engine = setup_engine("inst1", "ns");
+
+        let (hit, missing) = engine.count_prefix_hit_blocks("inst1", &[]).unwrap();
+
+        assert_eq!(hit, 0);
+        assert_eq!(missing, 0);
+    }
+
+    #[tokio::test]
+    async fn query_instance_not_found() {
+        let engine = setup_engine("inst1", "ns");
+
+        let result = engine.count_prefix_hit_blocks("nonexistent", &[vec![1]]);
+
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), EngineError::InstanceMissing(id) if id == "nonexistent")
+        );
+    }
+
+    #[tokio::test]
+    async fn query_first_block_miss_makes_all_missing() {
+        let engine = setup_engine("inst1", "ns");
+        // Only [2] is cached, but [1] is not — prefix breaks at [1]
+        insert_block(&engine, "ns", vec![2]);
+
+        let (hit, missing) = engine
+            .count_prefix_hit_blocks("inst1", &[vec![1], vec![2], vec![3]])
+            .unwrap();
+
+        assert_eq!(hit, 0);
+        assert_eq!(missing, 3);
+    }
+
+    #[tokio::test]
+    async fn query_namespace_isolation() {
+        let engine = setup_engine("inst1", "ns_a");
+        insert_block(&engine, "ns_a", vec![1]);
+        insert_block(&engine, "ns_b", vec![2]);
+
+        let (hit, missing) = engine
+            .count_prefix_hit_blocks("inst1", &[vec![1], vec![2]])
+            .unwrap();
+
+        assert_eq!(hit, 1);
+        assert_eq!(missing, 1); // vec![2] is under "ns_b", miss for "ns_a"
+    }
+
+    /// Verify that `count_prefix_hit_blocks` is idempotent / side-effect-free:
+    /// calling it multiple times yields the same result (no pinning or state mutation).
+    #[tokio::test]
+    async fn query_is_idempotent() {
+        let engine = setup_engine("inst1", "ns");
+        insert_block(&engine, "ns", vec![1]);
+        insert_block(&engine, "ns", vec![2]);
+
+        for _ in 0..3 {
+            let (hit, missing) = engine
+                .count_prefix_hit_blocks("inst1", &[vec![1], vec![2], vec![3]])
+                .unwrap();
+            assert_eq!(hit, 2);
+            assert_eq!(missing, 1);
+        }
     }
 }

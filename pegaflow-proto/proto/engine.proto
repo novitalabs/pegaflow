@@ -116,9 +116,52 @@ service Engine {
   rpc RegisterContext(RegisterContextRequest) returns (RegisterContextResponse);
   rpc Save(SaveRequest) returns (SaveResponse);
   rpc Load(LoadRequest) returns (LoadResponse);
+  // Pure memory-only query: check if prefix blocks are in memory cache (no SSD prefetch)
   rpc Query(QueryRequest) returns (QueryResponse);
+  // Prefetch-aware query: check memory + trigger SSD prefetch for missing blocks
+  rpc QueryPrefetch(QueryRequest) returns (QueryResponse);
   rpc Unpin(UnpinRequest) returns (UnpinResponse);
   rpc UnregisterContext(UnregisterRequest) returns (UnregisterResponse);
   rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
   rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+// MetaServer service for managing block hash keys across multi-node instances
+message InsertBlockHashesRequest {
+  string namespace = 1;
+  repeated bytes block_hashes = 2;
+  // The pegaflow-server address that owns these blocks, as ip:port (e.g., "10.0.0.1:50055")
+  string node = 3;
+}
+
+message InsertBlockHashesResponse {
+  ResponseStatus status = 1;
+  uint64 inserted_count = 2;
+}
+
+message QueryBlockHashesRequest {
+  string namespace = 1;
+  repeated bytes block_hashes = 2;
+}
+
+// Block hashes grouped by the owning node
+message NodeBlockHashes {
+  string node = 1;
+  repeated bytes block_hashes = 2;
+}
+
+message QueryBlockHashesResponse {
+  ResponseStatus status = 1;
+  repeated bytes existing_hashes = 2;
+  uint64 total_queried = 3;
+  uint64 found_count = 4;
+  // Found hashes grouped by owning node
+  repeated NodeBlockHashes node_blocks = 5;
+}
+
+service MetaServer {
+  rpc InsertBlockHashes(InsertBlockHashesRequest) returns (InsertBlockHashesResponse);
+  rpc QueryBlockHashes(QueryBlockHashesRequest) returns (QueryBlockHashesResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
 }
