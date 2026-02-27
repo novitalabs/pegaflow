@@ -1,8 +1,8 @@
 ---
 name: python-binding
 description: >
-  Use when developing under python/ directory. Covers PyO3 bindings, maturin build,
-  type stub sync, connector and SGLang code conventions.
+  Use when modifying python/src/lib.rs (PyO3 bindings), python/pegaflow/connector/ (vLLM KV connector),
+  python/pegaflow/sglang/ (SGLang radix cache), .pyi type stubs, or building with maturin.
 ---
 
 # Python Development
