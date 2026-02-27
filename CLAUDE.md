@@ -24,62 +24,12 @@ Run all CI checks locally before committing:
 ./scripts/check.sh       # Run fmt, typos, clippy, and cargo check
 ```
 
-### Python Bindings (PyO3 via maturin)
-
-```bash
-cd python
-maturin develop          # Dev build
-maturin develop --release  # Release build
-```
-
-**Important:** When modifying `python/src/lib.rs` (PyO3 bindings), update the type stub file `python/pegaflow/pegaflow.pyi` to keep type hints in sync.
-
 ### Running Benchmarks
 
 ```bash
 cargo bench --bench pinned_copy
 cargo bench --bench uds_latency
 ```
-
-### Running Examples
-
-```bash
-# Start the PegaEngine server first (required)
-# Auto-detect all GPUs (default behavior)
-cargo run -r --bin pegaflow-server -- --addr 0.0.0.0:50055 --pool-size 30gb
-
-# Or specify specific devices (e.g., GPUs 0, 2, 4)
-cargo run -r --bin pegaflow-server -- --addr 0.0.0.0:50055 --devices 0,2,4 --pool-size 30gb
-
-# Then run examples
-uv run python examples/basic_vllm.py
-uv run python examples/bench_kv_cache.py --model /path/to/model --num-prompts 10
-```
-
-**Server Options:**
-
-- `--addr`: Bind address (default: `127.0.0.1:50055`)
-- `--devices`: CUDA device IDs, comma-separated (default: auto-detect all available GPUs, e.g., `--devices 0,1,2,3`)
-- `--pool-size`: Pinned memory pool size (default: `30gb`, supports: `kb`, `mb`, `gb`, `tb`)
-- `--hint-value-size`: Hint for typical value size to tune cache and allocator (optional, supports: `kb`, `mb`, `gb`, `tb`)
-- `--use-hugepages`: Use huge pages for pinned memory (default: `false`, requires pre-configured `/proc/sys/vm/nr_hugepages`)
-- `--enable-lfu-admission`: Enable TinyLFU cache admission policy (default: plain LRU)
-- `--disable-numa-affinity`: Disable NUMA-aware memory allocation (default: enabled)
-- `--http-addr`: HTTP server address for health check and Prometheus metrics (default: `0.0.0.0:9091`, always enabled)
-- `--enable-prometheus`: Enable Prometheus `/metrics` endpoint (default: `true`)
-- `--metrics-otel-endpoint`: OTLP metrics export endpoint (optional, leave unset to disable)
-- `--metrics-period-secs`: Metrics export period in seconds (default: `5`, only used with OTLP)
-- `--log-level`: Log level: `trace`, `debug`, `info`, `warn`, `error` (default: `info`)
-- `--ssd-cache-path`: Enable SSD cache by providing cache file path (optional)
-- `--ssd-cache-capacity`: SSD cache capacity (default: `512gb`, supports: `kb`, `mb`, `gb`, `tb`)
-- `--ssd-write-queue-depth`: SSD write queue depth, max pending write batches (default: `8`)
-- `--ssd-prefetch-queue-depth`: SSD prefetch queue depth, max pending prefetch batches (default: `2`)
-- `--ssd-write-inflight`: SSD write inflight, max concurrent block writes (default: `2`)
-- `--ssd-prefetch-inflight`: SSD prefetch inflight, max concurrent block reads (default: `16`)
-- `--max-prefetch-blocks`: Max blocks allowed in prefetching state, backpressure for SSD prefetch (default: `800`)
-- `--trace-sample-rate`: Trace sampling rate, 0.0–1.0 (default: `1.0` = 100%, e.g. `0.01` = 1%). Requires `--features tracing`.
-- `--metaserver-addr`: MetaServer gRPC address for cross-node block hash registry (e.g., `http://127.0.0.1:50056`). When set, saved block hashes are inserted to the metaserver for cross-node discovery.
-- `--advertise-addr`: Advertised address (ip:port) reported to the metaserver. Fallback order: this flag > `PEGAFLOW_HOST_IP` env + bind port > auto-detected IP + bind port.
 
 ## Architecture
 
@@ -154,72 +104,6 @@ vLLM/SGLang Worker <--gRPC--> PegaEngine Server <--CUDA IPC--> GPU Memory
 - `PEGAFLOW_INSTANCE_ID`: Override instance ID
 - `PEGAFLOW_HOST_IP`: Host IP used for metaserver advertise address (fallback when `--advertise-addr` is not set)
 - `RUST_LOG`: Control Rust logging (e.g., `info,pegaflow_core=debug,pegaflow_server=debug`)
-
-## vLLM Integration
-
-Configure vLLM to use PegaFlow:
-
-```python
-from vllm.distributed.kv_transfer.kv_transfer_agent import KVTransferConfig
-
-kv_transfer_config = KVTransferConfig(
-    kv_connector="PegaKVConnector",
-    kv_role="kv_both",
-    kv_connector_module_path="pegaflow.connector",
-)
-```
-
-## Sglang integration
-
-PegaFlow integrates with SGLang by providing a drop-in replacement for the default `RadixCache` that uses the high-throughput PegaEngine server for distributed KV cache management.
-
-### How to Use
-
-1. **Import and Instantiate PeagflowRadixCache**
-
-In your SGLang-based project, in `scheduler.py`, swap out the usual `RadixCache` for `PeagflowRadixCache`:
-
-```python
-from pegaflow.sglang.peagflow_radix_cache import PeagflowRadixCache
-
-# Example instantiation inside the cache initialization logic:
-kv_cache = PeagflowRadixCache(
-    params=cache_params,       # sglang.srt.mem_cache.cache_init_params.CacheInitParams
-    model_config=model_config, # sglang.srt.configs.model_config.ModelConfig
-    tp_size=tp_size,           # Tensor parallel world size
-    rank=tp_rank,              # Local TP rank
-)
-```
-
-2. **Environment Variables**
-
-- `PEGAFLOW_ENGINE_ENDPOINT`: Override the gRPC endpoint for the PegaEngine server. Defaults to `http://127.0.0.1:50055`.
-- `PEGAFLOW_INSTANCE_ID`: Optional override for instance identification across processes.
-
-3. **Automatic CUDA IPC Handling**
-
-`PeagflowRadixCache` automatically registers all layer KV cache tensors for CUDA IPC with the PegaEngine upon construction, making them available for RDMA/pinned memory transfer.
-
-4. **Behavioral Differences vs. Default RadixCache**
-
-- On prefix miss, it queries the PegaEngine for remote blocks and loads missing blocks directly into local GPU buffers.
-- When a request finishes, changed blocks are saved back and announced to the engine.
-- All KV operations (query/load/save) are batched per block and per layer for efficiency.
-- Integration is non-intrusive: simply swap the class during initialization.
-
-5. **Shutdown and Cleanup**
-
-The class automatically unregisters contexts with the engine on deletion, interpreter shutdown, or Ctrl+C.
-
-### Reference
-
-See the implementation in [`peagflow_radix_cache.py`](python/pegaflow/sglang/peagflow_radix_cache.py) for full details and entry points:
-
-- Custom `match_prefix`
-- Remote block query/load/save
-- Context (un)registration
-- Layer-wise registration for MLA/TP
-- GPU KV allocator evict
 
 ### Git commit message format
 
