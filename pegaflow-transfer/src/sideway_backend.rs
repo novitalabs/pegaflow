@@ -138,6 +138,7 @@ struct SidewayRuntime {
     local_gid: Gid,
     local_lid: u16,
     local_ud: DomainAddress,
+    max_rd_atomic: u8,
     ud_qp: Arc<Mutex<GenericQueuePair>>,
     ud_cq: GenericCompletionQueue,
     recv_slots: Vec<UdRecvSlot>,
@@ -294,7 +295,7 @@ impl SidewayBackend {
 
     fn choose_port_and_gid(
         device_ctx: &Arc<DeviceContext>,
-    ) -> Result<(u8, u8, LinkLayer, Mtu, Gid, u16)> {
+    ) -> Result<(u8, u8, LinkLayer, Mtu, Gid, u16, u8)> {
         let dev_attr = device_ctx
             .query_device()
             .map_err(|error| TransferError::Backend(error.to_string()))?;
@@ -348,6 +349,7 @@ impl SidewayBackend {
                 )));
             }
 
+            let max_rd_atomic = (dev_attr.attr.orig_attr.max_qp_rd_atom as u8).max(1);
             return Ok((
                 port_num,
                 gid_index,
@@ -355,6 +357,7 @@ impl SidewayBackend {
                 port_attr.active_mtu(),
                 gid,
                 raw_port.lid,
+                max_rd_atomic,
             ));
         }
 
@@ -440,11 +443,11 @@ impl SidewayBackend {
             .alloc_pd()
             .map_err(|error| TransferError::Backend(error.to_string()))?;
 
-        let (port_num, gid_index, link_layer, mtu, local_gid, local_lid) =
+        let (port_num, gid_index, link_layer, mtu, local_gid, local_lid, max_rd_atomic) =
             Self::choose_port_and_gid(&device_ctx)?;
         info!(
-            "transfer runtime selected port: nic={}, port={}, gid_index={}, link_layer={:?}, mtu={:?}",
-            config.nic_name, port_num, gid_index, link_layer, mtu
+            "transfer runtime selected port: nic={}, port={}, gid_index={}, link_layer={:?}, mtu={:?}, max_rd_atomic={}",
+            config.nic_name, port_num, gid_index, link_layer, mtu, max_rd_atomic
         );
 
         let mut cq_builder = device_ctx.create_cq_builder();
@@ -507,6 +510,7 @@ impl SidewayBackend {
             local_gid,
             local_lid,
             local_ud,
+            max_rd_atomic,
             ud_qp: Arc::new(Mutex::new(ud_qp)),
             ud_cq,
             recv_slots,
@@ -878,7 +882,7 @@ impl SidewayBackend {
             .setup_path_mtu(runtime.mtu)
             .setup_dest_qp_num(remote_rc.qp_num)
             .setup_rq_psn(remote_rc.psn)
-            .setup_max_dest_read_atomic(1)
+            .setup_max_dest_read_atomic(runtime.max_rd_atomic)
             .setup_min_rnr_timer(12)
             .setup_address_vector(&ah_attr);
         qp.modify(&rtr_attr)
@@ -891,7 +895,7 @@ impl SidewayBackend {
             .setup_timeout(14)
             .setup_retry_cnt(7)
             .setup_rnr_retry(7)
-            .setup_max_read_atomic(1);
+            .setup_max_read_atomic(runtime.max_rd_atomic);
         qp.modify(&rts_attr)
             .map_err(|error| TransferError::Backend(error.to_string()))?;
         debug!(
