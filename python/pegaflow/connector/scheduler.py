@@ -333,19 +333,27 @@ class SchedulerConnector:
             - If service unavailable, returns 0 (no cache hits)
             - Any exception marks service unavailable and returns 0
         """
-        # Check service availability first
         if not self._ctx.state_manager.is_available():
             return 0
 
         block_hash_list = list(block_hashes)
+        clients = self._ctx.engine_clients or (self._ctx.engine_client,)
+
+        if len(clients) == 1:
+            return self._query_single_server(clients[0], block_hash_list, req_id)
+
+        return self._query_multi_server(clients, block_hash_list, req_id)
+
+    def _query_single_server(
+        self, client, block_hash_list: list[bytes], req_id: str
+    ) -> int | None:
+        """Single-server query path (original logic)."""
         try:
-            result = self._ctx.engine_client.query_prefetch(self._ctx.instance_id, block_hash_list)
+            result = client.query_prefetch(self._ctx.instance_id, block_hash_list)
         except PegaFlowServiceError as e:
-            # Service error (network/internal) - mark unavailable
             self._ctx.state_manager.mark_unavailable(str(e))
             return 0
         except PegaFlowBusinessError as e:
-            # Business error (invalid args, etc.) - log details and propagate
             logger.error(
                 "[PegaKVConnector] Query business error: %s, "
                 "req_id=%s, instance_id=%s, num_blocks=%d",
@@ -356,10 +364,8 @@ class SchedulerConnector:
             )
             raise
 
-        # Handle new dict response format
         if isinstance(result, dict):
             if not result.get("ok", False):
-                # Response-level errors are treated as business errors
                 error_msg = result.get("message", "unknown error")
                 logger.error(
                     "[PegaKVConnector] Query failed: %s, req_id=%s, instance_id=%s, num_blocks=%d",
@@ -374,7 +380,6 @@ class SchedulerConnector:
             hit_blocks = result.get("hit_blocks", 0)
 
             if prefetch_state == "loading":
-                # Record first time we see loading state
                 if req_id not in self._prefetch_start_times:
                     self._prefetch_start_times[req_id] = time.perf_counter()
                     self._prefetch_tracker.on_prefetch_start()
@@ -383,15 +388,13 @@ class SchedulerConnector:
                         req_id,
                         self._prefetch_tracker.pending_prefetches,
                     )
-                return None  # Signal scheduler to retry later
+                return None
 
-            # Prefetch done - log duration if we were tracking
             if req_id in self._prefetch_start_times:
                 prefetch_duration_ms = (
                     time.perf_counter() - self._prefetch_start_times.pop(req_id)
                 ) * 1000
                 self._prefetch_tracker.on_prefetch_complete(prefetch_duration_ms, hit_blocks)
-
                 logger.info(
                     "[PegaKVConnector] Prefetch completed: req=%s hit_blocks=%d "
                     "prefetch_duration_ms=%.2f pending_prefetches=%d",
@@ -403,9 +406,125 @@ class SchedulerConnector:
 
             return hit_blocks
 
-        # Legacy tuple response format (ok, message, hit_blocks)
+        # Legacy tuple response format
         _, _, hit_blocks = result
         return hit_blocks
+
+    def _unpin_done_results(
+        self,
+        done_results: list[tuple[object, int]],
+        block_hash_list: list[bytes],
+    ) -> None:
+        """Unpin blocks on servers that already returned done results."""
+        for client, hit_count in done_results:
+            if hit_count > 0:
+                try:
+                    client.unpin(self._ctx.instance_id, block_hash_list[:hit_count])
+                except Exception:
+                    pass
+
+    def _query_multi_server(
+        self, clients: tuple, block_hash_list: list[bytes], req_id: str
+    ) -> int | None:
+        """Multi-server query: query all servers, take min hits, unpin excess.
+
+        Semantics:
+            - Any server loading → unpin already-done servers, return None (retry)
+            - Any server error → unpin done servers, mark unavailable, return 0
+            - All done → take min(hit_blocks), unpin excess on servers with more hits
+
+        Note: ServiceStateManager only health-checks engine_clients[0]. In
+        multi-server topology a single server failure disables all queries
+        until that server recovers. Acceptable for v1 — both servers are
+        expected to be up for cross-node TP to function.
+        """
+        done_results: list[tuple[object, int]] = []  # (client, hit_blocks)
+        any_loading = False
+
+        for client in clients:
+            try:
+                result = client.query_prefetch(self._ctx.instance_id, block_hash_list)
+            except PegaFlowServiceError as e:
+                self._ctx.state_manager.mark_unavailable(str(e))
+                self._unpin_done_results(done_results, block_hash_list)
+                return 0
+            except PegaFlowBusinessError as e:
+                self._unpin_done_results(done_results, block_hash_list)
+                logger.error(
+                    "[PegaKVConnector] Query business error: %s, "
+                    "req_id=%s, instance_id=%s, num_blocks=%d",
+                    e,
+                    req_id,
+                    self._ctx.instance_id,
+                    len(block_hash_list),
+                )
+                raise
+
+            if not isinstance(result, dict) or not result.get("ok", False):
+                self._unpin_done_results(done_results, block_hash_list)
+                error_msg = (
+                    result.get("message", "unknown error")
+                    if isinstance(result, dict)
+                    else str(result)
+                )
+                raise RuntimeError(f"Query failed: {error_msg}")
+
+            prefetch_state = result.get("prefetch_state", "done")
+            hit_blocks = result.get("hit_blocks", 0)
+
+            if prefetch_state == "loading":
+                any_loading = True
+                # Loading state does not pin, nothing to track for this server
+            else:
+                done_results.append((client, hit_blocks))
+
+        if any_loading:
+            # Track prefetch timing
+            if req_id not in self._prefetch_start_times:
+                self._prefetch_start_times[req_id] = time.perf_counter()
+                self._prefetch_tracker.on_prefetch_start()
+                logger.info(
+                    "[PegaKVConnector] Prefetch started (multi-server): "
+                    "req=%s pending_prefetches=%d",
+                    req_id,
+                    self._prefetch_tracker.pending_prefetches,
+                )
+            # Unpin servers that returned done (they pinned their blocks)
+            self._unpin_done_results(done_results, block_hash_list)
+            return None
+
+        # All servers returned done — compute min hits
+        if not done_results:
+            return 0
+
+        hit_counts = [hit for _, hit in done_results]
+        min_hits = min(hit_counts)
+
+        # Track prefetch completion
+        if req_id in self._prefetch_start_times:
+            prefetch_duration_ms = (
+                time.perf_counter() - self._prefetch_start_times.pop(req_id)
+            ) * 1000
+            self._prefetch_tracker.on_prefetch_complete(prefetch_duration_ms, min_hits)
+            logger.info(
+                "[PegaKVConnector] Prefetch completed (multi-server): req=%s "
+                "hit_blocks=%d prefetch_duration_ms=%.2f pending_prefetches=%d",
+                req_id,
+                min_hits,
+                prefetch_duration_ms,
+                self._prefetch_tracker.pending_prefetches,
+            )
+
+        # Unpin excess blocks on servers with more hits than the minimum
+        for client, hit_count in done_results:
+            if hit_count > min_hits:
+                excess_hashes = block_hash_list[min_hits:hit_count]
+                try:
+                    client.unpin(self._ctx.instance_id, excess_hashes)
+                except Exception:
+                    pass  # Unpin failure is non-critical; GC handles pin leaks
+
+        return min_hits
 
     def get_stats(self) -> PegaKVConnectorStats | None:
         """Get current connector stats for metrics exposure."""

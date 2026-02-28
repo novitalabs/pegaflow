@@ -38,33 +38,62 @@ class PegaKVConnector(KVConnectorBase_V1):
         super().__init__(vllm_config, role)
 
         instance_id = resolve_instance_id(vllm_config)
-        tp_size = vllm_config.parallel_config.tensor_parallel_size
-        world_size = vllm_config.parallel_config.world_size
+        global_tp_size = vllm_config.parallel_config.tensor_parallel_size
+        global_world_size = vllm_config.parallel_config.world_size
         is_mla = detect_mla(vllm_config)
-        effective_tp_size = 1 if is_mla else tp_size
+        # Namespace uses global tp_size for consistent hashing across all ranks
+        effective_tp_size = 1 if is_mla else global_tp_size
         namespace = derive_namespace(vllm_config, effective_tp_size)
         num_layers = getattr(vllm_config.model_config.hf_text_config, "num_hidden_layers", 0)
         block_size = vllm_config.cache_config.block_size
 
+        # Resolve server endpoints (supports multi-server for cross-node TP)
+        endpoints = _resolve_endpoints(vllm_config)
+        num_servers = len(endpoints)
+
+        if num_servers > 1:
+            assert global_tp_size % num_servers == 0, (
+                f"tensor_parallel_size ({global_tp_size}) must be divisible by "
+                f"number of servers ({num_servers})"
+            )
+            assert global_world_size % num_servers == 0, (
+                f"world_size ({global_world_size}) must be divisible by "
+                f"number of servers ({num_servers})"
+            )
+
+        # Each server manages a local subset of ranks
+        local_tp_size = global_tp_size // num_servers
+        local_world_size = global_world_size // num_servers
+
         tp_rank: int | None = None
         device_id: int | None = None
+        engine_clients: tuple[EngineRpcClient, ...] = ()
+
         if role == KVConnectorRole.WORKER:
-            tp_rank = get_tensor_model_parallel_rank()
+            global_tp_rank = get_tensor_model_parallel_rank()
+            server_index = global_tp_rank // local_tp_size
+            tp_rank = global_tp_rank % local_tp_size
             if torch.cuda.is_available():
                 device_id = _resolve_device_id()
-
-        assert vllm_config.kv_transfer_config is not None
-        server_host = os.environ.get(
-            "PEGAFLOW_HOST"
-        ) or vllm_config.kv_transfer_config.get_from_extra_config(
-            "pegaflow.host", "http://127.0.0.1"
-        )
-        server_port = os.environ.get(
-            "PEGAFLOW_PORT"
-        ) or vllm_config.kv_transfer_config.get_from_extra_config("pegaflow.port", 50055)
-        self._engine_endpoint = f"{server_host}:{server_port}"
-        engine_client = EngineRpcClient(self._engine_endpoint)
-        logger.info("[PegaKVConnector] Connected to engine server at %s", self._engine_endpoint)
+            engine_client = EngineRpcClient(endpoints[server_index])
+            logger.info(
+                "[PegaKVConnector] Worker connected to server %d/%d at %s "
+                "(global_rank=%d, local_rank=%d)",
+                server_index,
+                num_servers,
+                endpoints[server_index],
+                global_tp_rank,
+                tp_rank,
+            )
+        else:
+            # Scheduler connects to all servers for coordinated queries
+            engine_clients = tuple(EngineRpcClient(ep) for ep in endpoints)
+            engine_client = engine_clients[0]
+            logger.info(
+                "[PegaKVConnector] Scheduler connected to %d server(s): %s",
+                num_servers,
+                endpoints,
+            )
 
         self._state_manager = ServiceStateManager(engine_client)
 
@@ -73,13 +102,14 @@ class PegaKVConnector(KVConnectorBase_V1):
             namespace=namespace,
             block_size=block_size,
             num_layers=num_layers,
-            tp_size=tp_size,
-            world_size=world_size,
+            tp_size=local_tp_size,
+            world_size=local_world_size,
             tp_rank=tp_rank,
             device_id=device_id,
             engine_client=engine_client,
             state_manager=self._state_manager,
             is_mla=is_mla,
+            engine_clients=engine_clients,
         )
 
         self._scheduler: SchedulerConnector | None = None
@@ -90,16 +120,19 @@ class PegaKVConnector(KVConnectorBase_V1):
             self._worker = WorkerConnector(self._ctx)
 
         logger.info(
-            "[PegaKVConnector] Initialized role=%s instance_id=%s device=%s tp_rank=%s tp_size=%d world_size=%d layers=%d namespace=%s is_mla=%s",
+            "[PegaKVConnector] Initialized role=%s instance_id=%s device=%s "
+            "tp_rank=%s tp_size=%d world_size=%d layers=%d namespace=%s "
+            "is_mla=%s num_servers=%d",
             role.name,
             instance_id,
             device_id if device_id is not None else "cpu",
             tp_rank if tp_rank is not None else "N/A",
-            tp_size,
-            world_size,
+            local_tp_size,
+            local_world_size,
             num_layers,
             namespace,
             is_mla,
+            num_servers,
         )
 
     # ==============================
@@ -248,6 +281,49 @@ class PegaKVConnector(KVConnectorBase_V1):
             self._worker.shutdown()
         if self._state_manager:
             self._state_manager.shutdown()
+
+
+def _resolve_endpoints(vllm_config) -> list[str]:
+    """Resolve PegaFlow server endpoints.
+
+    Priority:
+        1. PEGAFLOW_ENDPOINTS env var (comma-separated)
+        2. pegaflow.endpoints in kv_transfer_config.extra_config
+        3. PEGAFLOW_HOST + PEGAFLOW_PORT (single server, backward compatible)
+    """
+    assert vllm_config.kv_transfer_config is not None
+
+    # 1. PEGAFLOW_ENDPOINTS env var
+    endpoints_env = os.environ.get("PEGAFLOW_ENDPOINTS")
+    if endpoints_env:
+        endpoints = [ep.strip() for ep in endpoints_env.split(",") if ep.strip()]
+        if endpoints:
+            return endpoints
+        logger.warning(
+            "[PegaKVConnector] PEGAFLOW_ENDPOINTS is set but contains no valid "
+            "endpoints: %r, falling back to host+port",
+            endpoints_env,
+        )
+
+    # 2. pegaflow.endpoints extra_config
+    endpoints_config = vllm_config.kv_transfer_config.get_from_extra_config(
+        "pegaflow.endpoints", None
+    )
+    if endpoints_config and isinstance(endpoints_config, list):
+        endpoints = [str(ep).strip() for ep in endpoints_config if str(ep).strip()]
+        if endpoints:
+            return endpoints
+
+    # 3. Fallback: single endpoint from host + port
+    server_host = os.environ.get(
+        "PEGAFLOW_HOST"
+    ) or vllm_config.kv_transfer_config.get_from_extra_config(
+        "pegaflow.host", "http://127.0.0.1"
+    )
+    server_port = os.environ.get(
+        "PEGAFLOW_PORT"
+    ) or vllm_config.kv_transfer_config.get_from_extra_config("pegaflow.port", 50055)
+    return [f"{server_host}:{server_port}"]
 
 
 def _resolve_device_id() -> int:

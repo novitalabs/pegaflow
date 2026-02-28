@@ -35,6 +35,7 @@ class ConnectorContext:
     engine_client: EngineRpcClient
     state_manager: "ServiceStateManager"
     is_mla: bool = False
+    engine_clients: tuple[EngineRpcClient, ...] = ()
 
     @property
     def effective_tp_rank(self) -> int:
