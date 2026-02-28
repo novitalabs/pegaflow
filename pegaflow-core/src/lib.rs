@@ -304,7 +304,7 @@ impl PegaEngine {
         }
 
         // Construct and validate registration
-        let registration = KVCacheRegistration::new(
+        let mut registration = KVCacheRegistration::new(
             data_ptr,
             size_bytes,
             num_blocks,
@@ -314,13 +314,15 @@ impl PegaEngine {
         )
         .map_err(|e| EngineError::InvalidArgument(format!("layer {layer_name}: {e}")))?;
 
-        // SSD alignment check
-        if self.storage.is_ssd_enabled()
-            && let Some(msg) = registration.check_ssd_alignment(SSD_ALIGNMENT)
-        {
-            return Err(EngineError::InvalidArgument(format!(
-                "layer {layer_name}: {msg}"
-            )));
+        // Apply SSD alignment padding when SSD cache is enabled
+        if self.storage.is_ssd_enabled() {
+            registration = registration.with_ssd_padding(SSD_ALIGNMENT);
+            if registration.padded_bytes_per_block != registration.bytes_per_block {
+                info!(
+                    "SSD alignment padding: layer={layer_name}, bytes_per_block={} -> padded={}",
+                    registration.bytes_per_block, registration.padded_bytes_per_block
+                );
+            }
         }
 
         // Get or create instance, then register new layer on GPU

@@ -27,16 +27,6 @@ struct LayerMetadata {
     gpu_contexts: HashMap<i32, Arc<GpuContext>>,
 }
 
-/// Compute greatest common divisor using Euclidean algorithm.
-fn gcd(mut a: usize, mut b: usize) -> usize {
-    while b != 0 {
-        let t = b;
-        b = a % b;
-        a = t;
-    }
-    a
-}
-
 /// Registration information for a KV cache layer.
 ///
 /// This struct captures the memory layout of a layer's KV cache,
@@ -52,10 +42,11 @@ pub struct KVCacheRegistration {
     /// Number of blocks in this layer's cache.
     pub num_blocks: usize,
 
-    /// Size of each block's segment in bytes (for one of K or V).
+    /// Actual GPU-side segment size in bytes (one of K or V).
+    /// Used for CUDA memcpy sizes and GPU offset calculations.
     pub bytes_per_block: usize,
 
-    /// Total block size including all segments (`bytes_per_block * segments`).
+    /// Actual GPU-side total block size (`bytes_per_block * segments`).
     pub block_size_bytes: usize,
 
     /// Stride in bytes between K and V segments for split storage layouts.
@@ -64,6 +55,15 @@ pub struct KVCacheRegistration {
 
     /// Number of segments per block (1 for contiguous, 2 for K/V split).
     pub segments: usize,
+
+    /// CPU/SSD-side segment size, rounded up to SSD alignment.
+    /// Controls pinned memory allocation stride and SSD iovec lengths.
+    /// Equals `bytes_per_block` when no SSD padding is needed.
+    pub padded_bytes_per_block: usize,
+
+    /// CPU/SSD-side total block size (`padded_bytes_per_block * segments`).
+    /// Becomes `LayerBlock.size` → `SlotMeta.size` for SSD I/O.
+    pub padded_block_size_bytes: usize,
 }
 
 impl KVCacheRegistration {
@@ -123,23 +123,20 @@ impl KVCacheRegistration {
             block_size_bytes,
             kv_stride_bytes,
             segments,
+            padded_bytes_per_block: bytes_per_block,
+            padded_block_size_bytes: block_size_bytes,
         })
     }
 
-    /// Check SSD alignment requirement.
+    /// Apply SSD alignment padding to segment sizes.
     ///
-    /// Returns `None` if aligned, or `Some(error_message)` with fix hint.
-    pub fn check_ssd_alignment(&self, alignment: usize) -> Option<String> {
-        if self.bytes_per_block.is_multiple_of(alignment) {
-            return None;
-        }
-
-        let factor = alignment / gcd(self.bytes_per_block, alignment);
-        Some(format!(
-            "SSD cache requires bytes_per_block to be aligned to {} bytes, but got {}. \
-             Hint: multiply block_size by {} to achieve alignment.",
-            alignment, self.bytes_per_block, factor
-        ))
+    /// Each segment (`bytes_per_block`) is rounded up to the next multiple of
+    /// `alignment` so that every iovec in split writev is independently aligned.
+    pub fn with_ssd_padding(mut self, alignment: usize) -> Self {
+        let padded = self.bytes_per_block.next_multiple_of(alignment);
+        self.padded_bytes_per_block = padded;
+        self.padded_block_size_bytes = padded * self.segments;
+        self
     }
 }
 
@@ -524,10 +521,27 @@ mod tests {
     }
 
     #[test]
-    fn ssd_alignment_check() {
-        let reg = KVCacheRegistration::new(0x1000, 1024 * 1024, 100, 128, 0, 1).unwrap();
-        assert!(reg.check_ssd_alignment(512).unwrap().contains("4"));
-        assert!(reg.check_ssd_alignment(128).is_none());
+    fn padded_block_size() {
+        // Unaligned: 8848 % 512 = 144, padded to 9216
+        let reg = KVCacheRegistration::new(0x1000, 10_000_000, 100, 8848, 0, 1)
+            .unwrap()
+            .with_ssd_padding(512);
+        assert_eq!(reg.padded_bytes_per_block, 9216);
+        assert_eq!(reg.padded_block_size_bytes, 9216);
+
+        // Already aligned: no change
+        let reg = KVCacheRegistration::new(0x1000, 1024 * 1024, 100, 1024, 0, 1)
+            .unwrap()
+            .with_ssd_padding(512);
+        assert_eq!(reg.padded_bytes_per_block, 1024);
+        assert_eq!(reg.padded_block_size_bytes, 1024);
+
+        // Split layout: padded per segment, total = padded * segments
+        let reg = KVCacheRegistration::new(0x1000, 10_000_000, 100, 8848, 900_000, 2)
+            .unwrap()
+            .with_ssd_padding(512);
+        assert_eq!(reg.padded_bytes_per_block, 9216);
+        assert_eq!(reg.padded_block_size_bytes, 9216 * 2);
     }
 
     /// Simulates the inference-side registration flow (single GPU).

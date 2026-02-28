@@ -28,13 +28,17 @@ use crate::{EngineError, PegaEngine};
 // ============================================================================
 
 /// How a layer's blocks are laid out in pinned memory after GPU copy.
+///
+/// Sizes here are *padded* (SSD-aligned). GPU copies use actual (unpadded)
+/// sizes from `KVCacheRegistration`; the padding tail is unused.
 pub(crate) enum LayerAlloc {
     Split {
         k_allocation: Arc<PinnedAllocation>,
         v_allocation: Arc<PinnedAllocation>,
         k_base: usize,
         v_base: usize,
-        segment_size: usize,
+        /// Per-segment stride in pinned memory (padded for SSD alignment).
+        padded_segment_size: usize,
     },
     Contiguous {
         allocation: Arc<PinnedAllocation>,
@@ -51,10 +55,10 @@ impl LayerAlloc {
                 v_allocation,
                 k_base,
                 v_base,
-                segment_size,
+                padded_segment_size,
             } => {
-                let k_ptr = (k_base + index * segment_size) as *mut u8;
-                let v_ptr = (v_base + index * segment_size) as *mut u8;
+                let k_ptr = (k_base + index * padded_segment_size) as *mut u8;
+                let v_ptr = (v_base + index * padded_segment_size) as *mut u8;
                 Arc::new(LayerBlock::new_split(
                     k_ptr,
                     v_ptr,
@@ -81,7 +85,8 @@ impl LayerAlloc {
 /// Per-layer data for deferred LayerBlock construction.
 pub(crate) struct RawSaveLayer {
     pub slot_id: usize,
-    pub block_size: usize,
+    /// Padded block size (SSD-aligned). Becomes `LayerBlock.size` → `SlotMeta.size`.
+    pub padded_block_size: usize,
     pub alloc: LayerAlloc,
     /// Block hashes in allocation order.
     pub block_hashes: Vec<Vec<u8>>,
@@ -108,7 +113,7 @@ pub(crate) fn build_insert_entries(batch: &RawSaveBatch) -> (InsertEntries, u64,
 
     for layer in &batch.layers {
         for (i, hash) in layer.block_hashes.iter().enumerate() {
-            let block = layer.alloc.make_layer_block(i, layer.block_size);
+            let block = layer.alloc.make_layer_block(i, layer.padded_block_size);
             hash_entries
                 .entry(hash.clone())
                 .or_default()
@@ -116,7 +121,7 @@ pub(crate) fn build_insert_entries(batch: &RawSaveBatch) -> (InsertEntries, u64,
         }
         let layer_blocks = layer.block_hashes.len();
         total_blocks += layer_blocks;
-        total_bytes += (layer.block_size as u64).saturating_mul(layer_blocks as u64);
+        total_bytes += (layer.padded_block_size as u64).saturating_mul(layer_blocks as u64);
     }
 
     let entries: InsertEntries = hash_entries
@@ -156,7 +161,8 @@ impl PegaEngine {
         struct LayerMeta {
             registration: KVCacheRegistration,
             slot_id: usize,
-            block_size: usize,
+            /// Padded total block size (SSD-aligned), used for pinned allocation.
+            padded_block_size: usize,
             valid_blocks: Vec<(usize, Vec<u8>)>,
         }
 
@@ -215,11 +221,11 @@ impl PegaEngine {
                 continue;
             }
 
-            let block_size = registration.block_size_bytes;
+            let padded_block_size = registration.padded_block_size_bytes;
             layer_metas.push(LayerMeta {
                 registration,
                 slot_id,
-                block_size,
+                padded_block_size,
                 valid_blocks,
             });
         }
@@ -319,8 +325,8 @@ impl PegaEngine {
                 && registration.kv_stride_bytes > registration.bytes_per_block;
 
             if is_split {
-                let segment_size = registration.bytes_per_block;
-                let alloc_size = (segment_size as u64)
+                let padded_segment_size = registration.padded_bytes_per_block;
+                let alloc_size = (padded_segment_size as u64)
                     .checked_mul(num_blocks as u64)
                     .and_then(NonZeroU64::new)
                     .ok_or_else(|| {
@@ -359,8 +365,8 @@ impl PegaEngine {
                     .enumerate()
                     .map(|(i, (block_idx, _))| SaveBlock {
                         block_idx: *block_idx,
-                        k_dst_ptr: (k_base + i * segment_size) as *mut u8,
-                        v_dst_ptr: Some((v_base + i * segment_size) as *mut u8),
+                        k_dst_ptr: (k_base + i * padded_segment_size) as *mut u8,
+                        v_dst_ptr: Some((v_base + i * padded_segment_size) as *mut u8),
                     })
                     .collect();
 
@@ -373,11 +379,11 @@ impl PegaEngine {
                     v_allocation,
                     k_base,
                     v_base,
-                    segment_size,
+                    padded_segment_size,
                 });
             } else {
-                let block_size = meta.block_size;
-                let alloc_size = (block_size as u64)
+                let padded_block_size = meta.padded_block_size;
+                let alloc_size = (padded_block_size as u64)
                     .checked_mul(num_blocks as u64)
                     .and_then(NonZeroU64::new)
                     .ok_or_else(|| EngineError::Storage("allocation size overflow".to_string()))?;
@@ -404,7 +410,7 @@ impl PegaEngine {
                     .enumerate()
                     .map(|(i, (block_idx, _))| SaveBlock {
                         block_idx: *block_idx,
-                        k_dst_ptr: (base_addr + i * block_size) as *mut u8,
+                        k_dst_ptr: (base_addr + i * padded_block_size) as *mut u8,
                         v_dst_ptr: None,
                     })
                     .collect();
@@ -437,7 +443,7 @@ impl PegaEngine {
         for prep in &layers_to_save {
             let meta = &layer_metas[prep.meta_idx];
             let num_blocks = prep.blocks_to_save.len();
-            let bytes = (meta.block_size as u64)
+            let bytes = (meta.padded_block_size as u64)
                 .checked_mul(num_blocks as u64)
                 .unwrap_or(0);
             total_bytes += bytes;
@@ -474,7 +480,7 @@ impl PegaEngine {
                     .collect();
                 RawSaveLayer {
                     slot_id: meta.slot_id,
-                    block_size: meta.block_size,
+                    padded_block_size: meta.padded_block_size,
                     alloc,
                     block_hashes,
                 }
