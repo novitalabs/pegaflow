@@ -467,7 +467,7 @@ impl StorageEngine {
                     .upgrade()
                     .and_then(|engine| engine.allocate(NonZeroU64::new(size)?, numa_node))
             },
-            move |candidates, numa_node| {
+            move |candidates| {
                 weak_prepare
                     .upgrade()
                     .map(|engine| {
@@ -475,7 +475,7 @@ impl StorageEngine {
                         inner
                             .ssd_ring
                             .as_mut()
-                            .map(|ring| ring.prepare_batch(candidates, numa_node))
+                            .map(|ring| ring.prepare_batch(candidates))
                             .unwrap_or_else(crate::ssd_cache::PreparedBatch::empty)
                     })
                     .unwrap_or_else(crate::ssd_cache::PreparedBatch::empty)
@@ -595,7 +595,7 @@ impl StorageEngine {
     /// Send a batch of sealed blocks to SSD writer for async persistence.
     /// Called after sealing a batch of blocks from seal_offload.
     /// Drops the batch if write queue is full (backpressure).
-    pub fn send_ssd_batch(&self, numa_node: NumaNode, blocks: &[(BlockKey, Arc<SealedBlock>)]) {
+    pub fn send_ssd_batch(&self, blocks: &[(BlockKey, Arc<SealedBlock>)]) {
         let Some(ref ssd_state) = self.ssd_state else {
             return;
         };
@@ -609,7 +609,6 @@ impl StorageEngine {
                 .iter()
                 .map(|(k, b)| (k.clone(), Arc::downgrade(b)))
                 .collect(),
-            numa_node,
         };
 
         if ssd_state.writer_tx.try_send(batch).is_ok() {
@@ -1204,7 +1203,7 @@ fn process_insert_batch(
         let mut completed = false;
         for (slot_id, block) in slots {
             let footprint_bytes = block.memory_footprint();
-            completed = inflight_block.insert_slot(slot_id, block);
+            completed = inflight_block.insert_slot(slot_id, block, numa_node);
             inflight_bytes_added = inflight_bytes_added.saturating_add(footprint_bytes);
 
             if completed {
@@ -1264,7 +1263,7 @@ fn process_insert_batch(
     if !sealed_blocks.is_empty()
         && let Some(engine) = engine.upgrade()
     {
-        engine.send_ssd_batch(numa_node, &sealed_blocks);
+        engine.send_ssd_batch(&sealed_blocks);
     }
 }
 
