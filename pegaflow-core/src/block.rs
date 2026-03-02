@@ -204,7 +204,20 @@ impl SealedBlock {
 }
 
 // ============================================================================
-// Errors
+// SlotInsertResult
+// ============================================================================
+
+/// Result of inserting a slot into an inflight block.
+pub(crate) enum SlotInsertResult {
+    /// Slot was newly inserted.
+    Inserted {
+        completed: bool,
+        footprint_added: u64,
+    },
+    /// Slot already existed (no-op).
+    Duplicate,
+}
+
 // ============================================================================
 // Inflight Block (write path, mutable)
 // ============================================================================
@@ -254,14 +267,12 @@ impl InflightBlock {
     }
 
     /// Insert a slot idempotently. Duplicate inserts are no-ops.
-    ///
-    /// Returns `true` if all slots are now filled (ready to seal).
     pub fn insert_slot(
         &mut self,
         slot_id: usize,
         block: Arc<LayerBlock>,
         numa_node: NumaNode,
-    ) -> bool {
+    ) -> SlotInsertResult {
         debug_assert!(
             slot_id < self.total_slots,
             "slot_id {} must be < total_slots {}",
@@ -269,16 +280,23 @@ impl InflightBlock {
             self.total_slots
         );
 
-        if self.slots[slot_id].is_none() {
-            self.footprint += block.memory_footprint();
-            self.slots[slot_id] = Some(block);
-            self.slot_numas[slot_id] = numa_node;
-            self.remaining = self
-                .remaining
-                .checked_sub(1)
-                .expect("remaining should not underflow");
+        if self.slots[slot_id].is_some() {
+            return SlotInsertResult::Duplicate;
         }
-        self.remaining == 0
+
+        let footprint_added = block.memory_footprint();
+        self.footprint += footprint_added;
+        self.slots[slot_id] = Some(block);
+        self.slot_numas[slot_id] = numa_node;
+        self.remaining = self
+            .remaining
+            .checked_sub(1)
+            .expect("remaining should not underflow");
+
+        SlotInsertResult::Inserted {
+            completed: self.remaining == 0,
+            footprint_added,
+        }
     }
 
     /// Seal the block, converting to immutable SealedBlock.

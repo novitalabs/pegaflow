@@ -20,6 +20,7 @@ use log::{debug, error, info, warn};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::num::NonZeroU64;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Weak};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
@@ -28,7 +29,7 @@ use pegaflow_proto::proto::engine::InsertBlockHashesRequest;
 use pegaflow_proto::proto::engine::meta_server_client::MetaServerClient;
 use tonic::transport::Channel;
 
-use crate::block::{BlockKey, InflightBlock, PrefetchStatus, SealedBlock};
+use crate::block::{BlockKey, InflightBlock, PrefetchStatus, SealedBlock, SlotInsertResult};
 use crate::cache::{CacheInsertOutcome, TinyLfuCache};
 use crate::metrics::core_metrics;
 use crate::numa::NumaNode;
@@ -199,7 +200,7 @@ pub struct StorageEngine {
     inner: Mutex<StorageInner>,
 
     /// Channel to the insert worker thread (owns inflight HashMap)
-    insert_tx: UnboundedSender<InsertWorkerCommand>,
+    insert_tx: Sender<InsertWorkerCommand>,
 
     /// Channel to notify consumers when blocks are sealed (for SSD offload)
     seal_notify_tx: Option<UnboundedSender<SealNotification>>,
@@ -289,8 +290,8 @@ impl StorageEngine {
         // Create unbounded channel for seal notifications
         let (seal_notify_tx, seal_notify_rx) = mpsc::unbounded_channel();
 
-        // Create insert worker channel
-        let (insert_tx, insert_rx) = mpsc::unbounded_channel();
+        // Create insert worker channel (std::sync::mpsc — worker is a dedicated OS thread)
+        let (insert_tx, insert_rx) = std::sync::mpsc::channel();
 
         let engine = Arc::new(Self {
             allocator,
@@ -302,10 +303,13 @@ impl StorageEngine {
             metaserver_tx: Mutex::new(None),
         });
 
-        // Spawn insert worker task (owns inflight HashMap, receives batches)
+        // Spawn insert worker on a dedicated OS thread (CPU-bound work)
         {
             let weak_engine = Arc::downgrade(&engine);
-            tokio::spawn(insert_worker_loop(insert_rx, weak_engine));
+            std::thread::Builder::new()
+                .name("pegaflow-insert".into())
+                .spawn(move || insert_worker_loop(insert_rx, weak_engine))
+                .expect("failed to spawn insert worker thread");
         }
 
         // Spawn SSD workers after Arc is created (they need callbacks into storage)
@@ -1102,13 +1106,10 @@ impl StorageEngine {
 /// Dedicated insert worker task. Owns the inflight HashMap exclusively,
 /// eliminating lock contention on the hot insert path. Sealed blocks are
 /// admitted to cache via brief `StorageInner` lock acquisitions.
-async fn insert_worker_loop(
-    mut rx: UnboundedReceiver<InsertWorkerCommand>,
-    engine: Weak<StorageEngine>,
-) {
+fn insert_worker_loop(rx: Receiver<InsertWorkerCommand>, engine: Weak<StorageEngine>) {
     let mut inflight: HashMap<BlockKey, InflightBlock> = HashMap::new();
 
-    while let Some(cmd) = rx.recv().await {
+    while let Ok(cmd) = rx.recv() {
         // Drain additional commands for batching
         let mut cmds = vec![cmd];
         while let Ok(more) = rx.try_recv() {
@@ -1202,12 +1203,18 @@ fn process_insert_batch(
         // Insert all slots for this hash
         let mut completed = false;
         for (slot_id, block) in slots {
-            let footprint_bytes = block.memory_footprint();
-            completed = inflight_block.insert_slot(slot_id, block, numa_node);
-            inflight_bytes_added = inflight_bytes_added.saturating_add(footprint_bytes);
-
-            if completed {
-                break;
+            match inflight_block.insert_slot(slot_id, block, numa_node) {
+                SlotInsertResult::Inserted {
+                    completed: c,
+                    footprint_added,
+                } => {
+                    inflight_bytes_added = inflight_bytes_added.saturating_add(footprint_added);
+                    completed = c;
+                    if completed {
+                        break;
+                    }
+                }
+                SlotInsertResult::Duplicate => {}
             }
         }
 
