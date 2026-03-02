@@ -403,7 +403,10 @@ class WorkerConnector:
         for task in batch:
             all_request_ids.extend(task.request_ids)
 
-            if getattr(task.attn_metadata, "block_table", None) is None and getattr(task.attn_metadata, "slot_mapping", None) is None:
+            if (
+                getattr(task.attn_metadata, "block_table", None) is None
+                and getattr(task.attn_metadata, "slot_mapping", None) is None
+            ):
                 continue
 
             for save_intent in task.metadata.save_intents.values():

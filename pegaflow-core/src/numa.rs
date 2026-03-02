@@ -221,7 +221,7 @@ where
 /// Returns a vector of (device_id, numa_node) pairs for all GPUs
 /// that can be detected. If nvidia-smi is not available, returns
 /// an empty vector.
-pub(crate) fn get_gpu_numa_affinity() -> Vec<(u32, NumaNode)> {
+pub fn get_gpu_numa_affinity() -> Vec<(u32, NumaNode)> {
     // First, try to get the number of GPUs
     let output = match Command::new("nvidia-smi")
         .args(["--query-gpu=count", "--format=csv,noheader"])
@@ -319,7 +319,7 @@ pub fn log_numa_summary() {
 /// Format a list of CPUs into a compact range representation
 ///
 /// Example: [0, 1, 2, 3, 8, 9, 10] -> "0-3,8-10"
-fn format_cpu_list(cpus: &[usize]) -> String {
+pub fn format_cpu_list(cpus: &[usize]) -> String {
     if cpus.is_empty() {
         return String::new();
     }
@@ -360,7 +360,7 @@ fn format_cpu_list(cpus: &[usize]) -> String {
 /// Read CPU-to-NUMA mapping from sysfs
 ///
 /// Returns a map of NUMA node ID -> list of CPU IDs.
-fn read_cpu_topology_from_sysfs() -> Result<HashMap<u32, Vec<usize>>, String> {
+pub fn read_cpu_topology_from_sysfs() -> Result<HashMap<u32, Vec<usize>>, String> {
     let mut node_to_cpus: HashMap<u32, Vec<usize>> = HashMap::new();
 
     let node_dir = std::path::Path::new("/sys/devices/system/node");

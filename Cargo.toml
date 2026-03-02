@@ -1,5 +1,12 @@
 [workspace]
-members = ["pegaflow-core", "pegaflow-proto", "pegaflow-server", "pegaflow-metaserver", "python"]
+members = [
+  "pegaflow-core",
+  "pegaflow-proto",
+  "pegaflow-server",
+  "pegaflow-metaserver",
+  "pegaflow-transfer",
+  "python",
+]
 resolver = "2"
 
 [workspace.package]
@@ -9,6 +16,8 @@ edition = "2024"
 [workspace.dependencies]
 # Workspace members
 pegaflow-core = { path = "pegaflow-core" }
+pegaflow-transfer = { path = "pegaflow-transfer" }
+sideway = "0.4.0"
 
 # Core dependencies
 cudarc = { version = "0.18.0", features = ["cuda-12040"] }
@@ -20,6 +29,7 @@ shared_memory = "0.12"
 uuid = { version = "1.0", features = ["v4"] }
 parking_lot = "0.12"
 clap = { version = "4.5", features = ["derive"] }
+libc = "0.2"
 crossbeam = "0.8"
 dashmap = "6.1"
 opentelemetry = { version = "0.31.0", features = ["trace", "metrics"] }

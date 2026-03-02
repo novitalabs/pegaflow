@@ -20,6 +20,7 @@ path = "src/bin/metaserver.rs"
 [dependencies]
 pyo3 = { workspace = true, features = ["extension-module"] }
 pegaflow-core.workspace = true
+pegaflow-transfer.workspace = true
 pegaflow-proto = { path = "../pegaflow-proto" }
 pegaflow-server = { path = "../pegaflow-server" }
 pegaflow-metaserver = { path = "../pegaflow-metaserver" }

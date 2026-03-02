@@ -14,12 +14,14 @@ try:
         PegaFlowError,
         PegaFlowServiceError,
         PyLoadState,
+        TransferEngine,
     )
 except ImportError:
     # Fallback for development when the Rust extension is not built
     EngineRpcClient = None
     PegaEngine = None
     PyLoadState = None
+    TransferEngine = None
     raise ImportError(
         "pegaflow rust extension is not available, check pegaflow-xxx.so file exists"
     ) from None
@@ -32,4 +34,5 @@ __all__ = [
     "PegaFlowError",
     "PegaFlowServiceError",
     "PyLoadState",
+    "TransferEngine",
 ]
