@@ -48,9 +48,5 @@ harness = false
 name = "block_key_copy"
 harness = false
 
-[[bin]]
-name = "pegaflow_topo_cli"
-path = "src/bin/pegaflow_topo_cli.rs"
-
 [[example]]
 name = "pinned_alloc"
