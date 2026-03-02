@@ -98,6 +98,10 @@ class WorkerConnector:
         for layer_id, layer_name in enumerate(kv_caches.keys()):
             self._layer_name_to_id[layer_name] = layer_id
 
+        # Use actual number of registered layers, not model's num_hidden_layers
+        # This is important for models like DSA where indexer layers are separate
+        actual_num_layers = len(kv_caches)
+
         layout = "unknown"
         for layer_name, kv_cache in kv_caches.items():
             assert kv_cache.storage_offset() == 0, (
@@ -135,7 +139,7 @@ class WorkerConnector:
                 self._ctx.effective_tp_size,
                 self._ctx.world_size,
                 self._ctx.device_id,
-                self._ctx.num_layers,
+                actual_num_layers,
                 layer_name,
                 wrapper_bytes,
                 num_blocks,
@@ -490,7 +494,7 @@ class WorkerConnector:
             return
 
         suffix = "" if not reason else f" ({reason})"
-        layer_count = len(self._registered_layers) or self._ctx.num_layers
+        layer_count = len(self._registered_layers)
         for req_id in req_list:
             logger.debug(
                 "[PegaKVConnector] Request %s all %d layers saved%s",

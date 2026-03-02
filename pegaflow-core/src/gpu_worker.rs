@@ -277,7 +277,8 @@ fn process_load_task(task: &LoadTask, stream: &CudaStream) -> Result<(), EngineE
 
         if registration.segments == 2 && registration.kv_stride_bytes > registration.bytes_per_block
         {
-            // Layer-first layout with KV stride: batch K and V separately
+            // Layer-first layout with KV stride: batch K and V separately.
+            // Actual (unpadded) GPU segment size — matches GPU memory layout.
             let segment_size = registration.bytes_per_block;
 
             let mut k_transfers = Vec::with_capacity(layer_data.blocks.len());
@@ -327,7 +328,8 @@ fn process_load_task(task: &LoadTask, stream: &CudaStream) -> Result<(), EngineE
 
             total_bytes += layer_data.blocks.len() * segment_size * 2;
         } else {
-            // Contiguous or single-segment layout - use batch copy for better performance
+            // Contiguous or single-segment layout.
+            // Actual (unpadded) block size — matches GPU memory layout.
             let block_size = registration.block_size_bytes;
             let mut transfers = Vec::with_capacity(layer_data.blocks.len());
 
@@ -406,7 +408,9 @@ fn process_save_task(task: &SaveTask, stream: &CudaStream) -> Result<(), EngineE
         let (layer_bytes, layer_memcpy) = if registration.segments == 2
             && registration.kv_stride_bytes > registration.bytes_per_block
         {
-            // Layer-first layout: K and V segments stored separately
+            // Layer-first layout: K and V segments stored separately.
+            // Actual (unpadded) GPU segment size — pinned memory may use a
+            // larger padded stride, but CUDA copies only the real data.
             let segment_size = registration.bytes_per_block;
 
             // Build transfer lists for batch copy
@@ -446,7 +450,8 @@ fn process_save_task(task: &SaveTask, stream: &CudaStream) -> Result<(), EngineE
 
             (layer.blocks.len() * segment_size * 2, k_batches + v_batches)
         } else {
-            // Contiguous or single-segment layout - build transfer list for batch copy
+            // Contiguous or single-segment layout.
+            // Actual (unpadded) block size — matches GPU memory layout.
             let block_size = registration.block_size_bytes;
             let mut transfers = Vec::with_capacity(layer.blocks.len());
 
