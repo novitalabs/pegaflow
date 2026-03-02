@@ -5,6 +5,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::numa::NumaNode;
 use crate::pinned_pool::PinnedAllocation;
 
 // ============================================================================
@@ -154,6 +155,9 @@ unsafe impl Sync for LayerBlock {}
 pub struct SealedBlock {
     slots: Box<[Arc<LayerBlock>]>,
     footprint: u64,
+    /// Per-slot NUMA affinity, carried from InflightBlock for SSD write path.
+    /// Empty when reconstructed from SSD prefetch (NUMA info lives in SlotMeta).
+    slot_numas: Vec<NumaNode>,
 }
 
 impl SealedBlock {
@@ -170,18 +174,32 @@ impl SealedBlock {
         &self.slots
     }
 
-    /// Create from a vec of slots (for deserialization)
+    /// Per-slot NUMA affinity for SSD write path.
+    pub(crate) fn slot_numas(&self) -> &[NumaNode] {
+        &self.slot_numas
+    }
+
+    /// Create from a vec of slots (for deserialization / prefetch rebuild)
     pub fn from_slots(slots: Vec<Arc<LayerBlock>>) -> Self {
         let footprint = slots.iter().map(|s| s.memory_footprint()).sum();
         Self {
             slots: slots.into_boxed_slice(),
             footprint,
+            slot_numas: Vec::new(),
         }
     }
 
     /// Create from slots with pre-computed footprint (internal use)
-    pub(crate) fn from_slots_with_footprint(slots: Box<[Arc<LayerBlock>]>, footprint: u64) -> Self {
-        Self { slots, footprint }
+    pub(crate) fn from_slots_with_footprint(
+        slots: Box<[Arc<LayerBlock>]>,
+        footprint: u64,
+        slot_numas: Vec<NumaNode>,
+    ) -> Self {
+        Self {
+            slots,
+            footprint,
+            slot_numas,
+        }
     }
 }
 
@@ -198,6 +216,9 @@ pub(crate) struct InflightBlock {
     total_slots: usize,
     footprint: u64,
     created_at: Instant,
+    /// Per-slot NUMA node affinity, tracked during insertion for deterministic
+    /// per-block NUMA assignment when the block is sealed.
+    slot_numas: Vec<NumaNode>,
 }
 
 impl InflightBlock {
@@ -208,6 +229,7 @@ impl InflightBlock {
             total_slots,
             footprint: 0,
             created_at: Instant::now(),
+            slot_numas: vec![NumaNode::UNKNOWN; total_slots],
         }
     }
 
@@ -234,7 +256,12 @@ impl InflightBlock {
     /// Insert a slot idempotently. Duplicate inserts are no-ops.
     ///
     /// Returns `true` if all slots are now filled (ready to seal).
-    pub fn insert_slot(&mut self, slot_id: usize, block: Arc<LayerBlock>) -> bool {
+    pub fn insert_slot(
+        &mut self,
+        slot_id: usize,
+        block: Arc<LayerBlock>,
+        numa_node: NumaNode,
+    ) -> bool {
         debug_assert!(
             slot_id < self.total_slots,
             "slot_id {} must be < total_slots {}",
@@ -245,6 +272,7 @@ impl InflightBlock {
         if self.slots[slot_id].is_none() {
             self.footprint += block.memory_footprint();
             self.slots[slot_id] = Some(block);
+            self.slot_numas[slot_id] = numa_node;
             self.remaining = self
                 .remaining
                 .checked_sub(1)
@@ -261,6 +289,10 @@ impl InflightBlock {
             .into_iter()
             .map(|opt| opt.expect("all slots must be filled before sealing"))
             .collect();
-        SealedBlock::from_slots_with_footprint(slots.into_boxed_slice(), self.footprint)
+        SealedBlock::from_slots_with_footprint(
+            slots.into_boxed_slice(),
+            self.footprint,
+            self.slot_numas,
+        )
     }
 }

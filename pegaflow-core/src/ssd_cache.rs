@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
-use crate::block::{BlockKey, LayerBlock, SealedBlock};
+use crate::block::{BlockKey, SealedBlock};
 use crate::metrics::core_metrics;
 use crate::numa::NumaNode;
 use crate::pinned_pool::PinnedAllocation;
@@ -76,8 +76,6 @@ pub(crate) struct SsdIndexEntry {
     pub file_offset: u64,
     /// Per-slot metadata for rebuilding SealedBlock
     pub slots: Vec<SlotMeta>,
-    /// NUMA node affinity for the originating GPU
-    pub numa_node: NumaNode,
 }
 
 /// State of an SSD index entry (two-phase commit)
@@ -235,7 +233,6 @@ impl SsdRingBuffer {
     pub(crate) fn prepare_batch(
         &mut self,
         candidates: Vec<(BlockKey, Arc<SealedBlock>)>,
-        numa_node: NumaNode,
     ) -> PreparedBatch {
         // 1. Filter: skip keys that already exist (Writing or Committed)
         let to_write: Vec<_> = candidates
@@ -257,12 +254,21 @@ impl SsdRingBuffer {
             .into_iter()
             .map(|(key, block)| {
                 let size = block.memory_footprint();
+                let slot_numas = block.slot_numas();
+                debug_assert!(
+                    slot_numas.is_empty() || slot_numas.len() == block.slots().len(),
+                    "slot_numas length mismatch: {} vs {}",
+                    slot_numas.len(),
+                    block.slots().len(),
+                );
                 let slots: Vec<SlotMeta> = block
                     .slots()
                     .iter()
-                    .map(|s| SlotMeta {
+                    .enumerate()
+                    .map(|(i, s)| SlotMeta {
                         is_split: s.v_ptr().is_some(),
                         size: s.size() as u64,
+                        numa_node: slot_numas.get(i).copied().unwrap_or(NumaNode::UNKNOWN),
                     })
                     .collect();
 
@@ -272,7 +278,6 @@ impl SsdRingBuffer {
                     len: size,
                     file_offset,
                     slots,
-                    numa_node,
                 };
 
                 // Insert Writing state
@@ -321,7 +326,6 @@ impl PreparedBatch {
 /// Batch of sealed blocks to write to SSD
 pub(crate) struct SsdWriteBatch {
     pub blocks: Vec<(BlockKey, Weak<SealedBlock>)>,
-    pub numa_node: NumaNode,
 }
 
 /// Request to prefetch a block from SSD (metadata only, allocation done in worker)
@@ -335,12 +339,18 @@ pub(crate) struct PrefetchBatch {
     pub requests: Vec<PrefetchRequest>,
 }
 
-/// Internal: single block prefetch task with allocated memory
+/// Per-slot allocation reference: which allocation and offset within it.
+struct SlotAlloc {
+    allocation: Arc<PinnedAllocation>,
+    offset: usize,
+}
+
+/// Internal: single block prefetch task with per-slot allocated memory.
 struct PrefetchTask {
     key: BlockKey,
     entry: SsdIndexEntry,
-    allocation: Arc<PinnedAllocation>,
-    alloc_offset: usize,
+    /// One per slot (parallel to `entry.slots`), each from the correct NUMA pool.
+    slot_allocs: Vec<SlotAlloc>,
 }
 
 /// Internal: single block write task
@@ -359,7 +369,7 @@ type WriteResult = (BlockKey, bool, f64, u64);
 
 /// Type alias for prepare batch callback.
 pub(crate) type PrepareBatchFn =
-    Arc<dyn Fn(Vec<(BlockKey, Arc<SealedBlock>)>, NumaNode) -> PreparedBatch + Send + Sync>;
+    Arc<dyn Fn(Vec<(BlockKey, Arc<SealedBlock>)>) -> PreparedBatch + Send + Sync>;
 
 /// Type alias for commit write callback.
 pub(crate) type CommitWriteFn = Arc<dyn Fn(&BlockKey, bool) + Send + Sync>;
@@ -392,10 +402,7 @@ impl SsdStorageHandle {
         + Send
         + Sync
         + 'static,
-        prepare: impl Fn(Vec<(BlockKey, Arc<SealedBlock>)>, NumaNode) -> PreparedBatch
-        + Send
-        + Sync
-        + 'static,
+        prepare: impl Fn(Vec<(BlockKey, Arc<SealedBlock>)>) -> PreparedBatch + Send + Sync + 'static,
         commit: impl Fn(&BlockKey, bool) + Send + Sync + 'static,
         is_numa: bool,
     ) -> Self {
@@ -429,12 +436,8 @@ impl SsdStorageHandle {
     }
 
     #[inline]
-    pub(crate) fn prepare(
-        &self,
-        candidates: Vec<(BlockKey, Arc<SealedBlock>)>,
-        numa_node: NumaNode,
-    ) -> PreparedBatch {
-        (self.prepare)(candidates, numa_node)
+    pub(crate) fn prepare(&self, candidates: Vec<(BlockKey, Arc<SealedBlock>)>) -> PreparedBatch {
+        (self.prepare)(candidates)
     }
 
     #[inline]
@@ -519,7 +522,7 @@ pub(crate) async fn ssd_writer_loop(
                         }
 
                         // Prepare batch: filter + allocate + insert Writing (via handle)
-                        let prepared = handle.prepare(candidates, b.numa_node);
+                        let prepared = handle.prepare(candidates);
 
                         if prepared.is_empty() {
                             continue;
@@ -634,7 +637,8 @@ pub(crate) async fn ssd_prefetch_loop(
     debug!("SSD prefetch pipeline exiting");
 }
 
-/// Dispatcher: receives batches, allocates memory, splits into block-level tasks.
+/// Dispatcher: receives batches, allocates per-slot memory grouped by NUMA,
+/// then splits into block-level tasks.
 async fn ssd_prefetch_dispatcher(
     handle: Arc<SsdStorageHandle>,
     mut batch_rx: tokio::sync::mpsc::Receiver<PrefetchBatch>,
@@ -645,89 +649,107 @@ async fn ssd_prefetch_dispatcher(
             continue;
         }
 
-        let groups = build_allocation_groups(handle.is_numa(), batch.requests);
-        for group in groups {
-            let total_size = total_request_size(&group.requests);
-            let allocation = match handle.allocate(total_size, group.numa_node) {
-                Some(alloc) => alloc,
-                None => {
-                    warn!(
-                        "SSD prefetch dispatcher: alloc failed for {} bytes ({} blocks) numa={:?}",
-                        total_size,
-                        group.requests.len(),
-                        group.numa_node
-                    );
-                    for req in group.requests {
-                        handle.complete_prefetch(req.key, None);
-                    }
-                    continue;
-                }
-            };
-
-            if !enqueue_prefetch_tasks(&task_tx, allocation, group.requests).await {
-                return;
-            }
+        if !dispatch_prefetch_batch(&handle, &task_tx, batch.requests).await {
+            return;
         }
     }
 
     debug!("SSD prefetch dispatcher exiting");
 }
 
-fn total_request_size(requests: &[PrefetchRequest]) -> u64 {
-    requests.iter().map(|r| r.entry.len).sum()
+/// Slot reference for NUMA grouping during allocation.
+struct SlotRef {
+    block_idx: usize,
+    slot_idx: usize,
+    size: u64,
 }
 
-struct AllocationGroup {
-    numa_node: Option<NumaNode>,
-    requests: Vec<PrefetchRequest>,
-}
-
-fn build_allocation_groups(is_numa: bool, requests: Vec<PrefetchRequest>) -> Vec<AllocationGroup> {
-    if !is_numa {
-        return vec![AllocationGroup {
-            numa_node: None,
-            requests,
-        }];
+/// Group all slots across all blocks by NUMA node.
+///
+/// Returns a map from NUMA key (None = global/unknown) to the list of slot
+/// references that should share a single contiguous allocation.
+fn group_slots_by_numa(
+    is_numa: bool,
+    requests: &[PrefetchRequest],
+) -> HashMap<Option<NumaNode>, Vec<SlotRef>> {
+    let mut groups: HashMap<Option<NumaNode>, Vec<SlotRef>> = HashMap::new();
+    for (block_idx, req) in requests.iter().enumerate() {
+        for (slot_idx, meta) in req.entry.slots.iter().enumerate() {
+            let numa_key = if is_numa {
+                let numa = meta.numa_node;
+                if numa.is_unknown() { None } else { Some(numa) }
+            } else {
+                None
+            };
+            groups.entry(numa_key).or_default().push(SlotRef {
+                block_idx,
+                slot_idx,
+                size: meta.size,
+            });
+        }
     }
-
-    let mut groups: HashMap<Option<NumaNode>, Vec<PrefetchRequest>> = HashMap::new();
-    for req in requests {
-        let key = if req.entry.numa_node.is_unknown() {
-            None
-        } else {
-            Some(req.entry.numa_node)
-        };
-        groups.entry(key).or_default().push(req);
-    }
-
     groups
-        .into_iter()
-        .map(|(numa_node, requests)| AllocationGroup {
-            numa_node,
-            requests,
-        })
-        .collect()
 }
 
-async fn enqueue_prefetch_tasks(
+/// Allocate per-slot memory grouped by NUMA, build PrefetchTasks, and enqueue.
+/// Returns false if the task channel is closed (should exit).
+async fn dispatch_prefetch_batch(
+    handle: &SsdStorageHandle,
     task_tx: &tokio::sync::mpsc::Sender<PrefetchTask>,
-    allocation: Arc<PinnedAllocation>,
     requests: Vec<PrefetchRequest>,
 ) -> bool {
-    // Split into block-level tasks
-    let mut offset: usize = 0;
-    for req in requests {
-        let alloc_offset = offset;
-        offset += req.entry.len as usize;
+    // 1. Group all slots across all blocks by NUMA node
+    let numa_groups = group_slots_by_numa(handle.is_numa(), &requests);
+
+    // 2. Allocate per NUMA group, assign per-slot (allocation, offset).
+    //    All blocks in a batch share the same slot layout, so a single NUMA
+    //    group failure means every block is missing slots → fail the whole batch.
+    let mut slot_allocs: Vec<Vec<Option<SlotAlloc>>> = requests
+        .iter()
+        .map(|r| (0..r.entry.slots.len()).map(|_| None).collect())
+        .collect();
+
+    for (numa_node, refs) in &numa_groups {
+        let total_size: u64 = refs.iter().map(|r| r.size).sum();
+        let allocation = match handle.allocate(total_size, *numa_node) {
+            Some(alloc) => alloc,
+            None => {
+                warn!(
+                    "SSD prefetch dispatcher: alloc failed for {} bytes ({} slots) numa={:?}, failing entire batch",
+                    total_size,
+                    refs.len(),
+                    numa_node
+                );
+                for req in requests {
+                    handle.complete_prefetch(req.key, None);
+                }
+                return true;
+            }
+        };
+
+        let mut offset = 0usize;
+        for r in refs {
+            slot_allocs[r.block_idx][r.slot_idx] = Some(SlotAlloc {
+                allocation: allocation.clone(),
+                offset,
+            });
+            offset += r.size as usize;
+        }
+    }
+
+    // 3. Build PrefetchTasks and enqueue
+    for (block_idx, req) in requests.into_iter().enumerate() {
+        let allocs: Vec<SlotAlloc> = slot_allocs[block_idx]
+            .drain(..)
+            .map(|opt| opt.expect("all slots must have allocations"))
+            .collect();
 
         let task = PrefetchTask {
             key: req.key,
             entry: req.entry,
-            allocation: allocation.clone(),
-            alloc_offset,
+            slot_allocs: allocs,
         };
 
-        // Bounded send: blocks when channel full (natural backpressure)
         if task_tx.send(task).await.is_err() {
             debug!("SSD prefetch dispatcher: worker channel closed");
             return false;
@@ -841,19 +863,17 @@ async fn execute_prefetch(
         return fail(key, begin, block_size);
     }
 
-    // Build iovecs from slot metadata
+    // Build iovecs from per-slot allocations
     let read_result = {
-        let base_ptr = task.allocation.as_ptr() as *mut u8;
-        let mut current_offset = task.alloc_offset;
         let iovecs: Vec<_> = task
             .entry
             .slots
             .iter()
-            .flat_map(|meta| {
-                // SAFETY: allocation is sized to fit all slots
-                let iov = unsafe { meta.read_iovecs(base_ptr, current_offset) };
-                current_offset += meta.size as usize;
-                iov
+            .zip(&task.slot_allocs)
+            .flat_map(|(meta, alloc)| {
+                let base_ptr = alloc.allocation.as_ptr() as *mut u8;
+                // SAFETY: each allocation is sized to fit its NUMA group's slots
+                unsafe { meta.read_iovecs(base_ptr, alloc.offset) }
             })
             .collect();
 
@@ -865,11 +885,7 @@ async fn execute_prefetch(
     match read_result {
         Ok(rx) => match rx.await {
             Ok(Ok(bytes_read)) if bytes_read == expected_len => {
-                match rebuild_sealed_block_at_offset(
-                    task.allocation,
-                    task.alloc_offset,
-                    &task.entry.slots,
-                ) {
+                match rebuild_sealed_block_per_slot(task.slot_allocs, &task.entry.slots) {
                     Ok(sealed) => (
                         key,
                         begin,
@@ -907,44 +923,19 @@ async fn execute_prefetch(
 // Block Rebuilding
 // ============================================================================
 
-/// Rebuild a SealedBlock from a shared allocation at a given offset.
-/// Used for batched prefetch where multiple blocks share one contiguous allocation.
-pub(crate) fn rebuild_sealed_block_at_offset(
-    allocation: Arc<PinnedAllocation>,
-    base_offset: usize,
+/// Rebuild a SealedBlock from per-slot allocations (consumed).
+///
+/// Each slot may reside in a different NUMA-local allocation. Takes ownership
+/// of `SlotAlloc`s to move (not clone) the `Arc<PinnedAllocation>` references.
+fn rebuild_sealed_block_per_slot(
+    slot_allocs: Vec<SlotAlloc>,
     slot_metas: &[SlotMeta],
 ) -> Result<SealedBlock, String> {
-    let mut layer_blocks = Vec::with_capacity(slot_metas.len());
-    let base_ptr = allocation.as_ptr() as *mut u8;
-    let mut current_offset = base_offset;
-
-    for slot_meta in slot_metas {
-        let slot_size = slot_meta.size as usize;
-
-        let layer_block = if slot_meta.is_split {
-            let half = slot_size / 2;
-            let k_ptr = unsafe { base_ptr.add(current_offset) };
-            let v_ptr = unsafe { base_ptr.add(current_offset + half) };
-
-            Arc::new(LayerBlock::new_split(
-                k_ptr,
-                v_ptr,
-                slot_size,
-                Arc::clone(&allocation),
-                Arc::clone(&allocation),
-            ))
-        } else {
-            let ptr = unsafe { base_ptr.add(current_offset) };
-            Arc::new(LayerBlock::new_contiguous(
-                ptr,
-                slot_size,
-                Arc::clone(&allocation),
-            ))
-        };
-
-        layer_blocks.push(layer_block);
-        current_offset += slot_size;
-    }
+    let layer_blocks: Vec<_> = slot_metas
+        .iter()
+        .zip(slot_allocs)
+        .map(|(meta, alloc)| unsafe { meta.make_layer_block(alloc.allocation, alloc.offset) })
+        .collect();
 
     Ok(SealedBlock::from_slots(layer_blocks))
 }
@@ -957,50 +948,6 @@ mod tests {
         BlockKey::new("test".to_string(), vec![n])
     }
 
-    fn make_request(n: u8, numa_node: NumaNode) -> PrefetchRequest {
-        let key = make_key(n);
-        let entry = SsdIndexEntry {
-            begin: n as u64,
-            len: 8,
-            file_offset: 0,
-            slots: vec![],
-            numa_node,
-        };
-        PrefetchRequest { key, entry }
-    }
-
-    #[test]
-    fn test_build_allocation_groups_non_numa_single_group() {
-        let requests = vec![
-            make_request(1, NumaNode::UNKNOWN),
-            make_request(2, NumaNode::UNKNOWN),
-            make_request(3, NumaNode::UNKNOWN),
-        ];
-
-        let groups = build_allocation_groups(false, requests);
-        assert_eq!(groups.len(), 1);
-        assert!(groups[0].numa_node.is_none());
-        assert_eq!(groups[0].requests.len(), 3);
-    }
-
-    #[test]
-    fn test_build_allocation_groups_numa_split_and_unknown() {
-        let requests = vec![
-            make_request(1, NumaNode(0)),
-            make_request(2, NumaNode(1)),
-            make_request(3, NumaNode(0)),
-        ];
-
-        let groups = build_allocation_groups(true, requests);
-        let mut counts: HashMap<Option<NumaNode>, usize> = HashMap::new();
-        for group in groups {
-            counts.insert(group.numa_node, group.requests.len());
-        }
-
-        assert_eq!(counts.get(&Some(NumaNode(0))), Some(&2));
-        assert_eq!(counts.get(&Some(NumaNode(1))), Some(&1));
-    }
-
     impl SsdRingBuffer {
         /// Insert a Committed entry for testing. Returns the key.
         fn insert_committed(&mut self, n: u8, begin: u64, len: u64) -> BlockKey {
@@ -1010,7 +957,6 @@ mod tests {
                 len,
                 file_offset: begin % self.capacity.max(1),
                 slots: vec![],
-                numa_node: NumaNode::UNKNOWN,
             };
             self.entries
                 .insert(key.clone(), SsdEntryState::Committed(entry));
@@ -1026,7 +972,6 @@ mod tests {
                 len,
                 file_offset: begin % self.capacity.max(1),
                 slots: vec![],
-                numa_node: NumaNode::UNKNOWN,
             };
             self.entries
                 .insert(key.clone(), SsdEntryState::Writing(entry));
@@ -1216,5 +1161,104 @@ mod tests {
             .collect();
 
         assert!(filtered.is_empty());
+    }
+
+    // ========================================================================
+    // group_slots_by_numa tests
+    // ========================================================================
+
+    fn make_slot(numa_node: NumaNode, size: u64) -> SlotMeta {
+        SlotMeta {
+            is_split: false,
+            size,
+            numa_node,
+        }
+    }
+
+    fn make_prefetch_request(n: u8, slots: Vec<SlotMeta>) -> PrefetchRequest {
+        let total_size: u64 = slots.iter().map(|s| s.size).sum();
+        PrefetchRequest {
+            key: make_key(n),
+            entry: SsdIndexEntry {
+                begin: 0,
+                len: total_size,
+                file_offset: 0,
+                slots,
+            },
+        }
+    }
+
+    #[test]
+    fn test_group_slots_non_numa_single_group() {
+        // When !is_numa, all slots collapse into None regardless of numa_node
+        let requests = vec![
+            make_prefetch_request(
+                1,
+                vec![make_slot(NumaNode(0), 100), make_slot(NumaNode(1), 100)],
+            ),
+            make_prefetch_request(2, vec![make_slot(NumaNode(0), 200)]),
+        ];
+
+        let groups = group_slots_by_numa(false, &requests);
+        assert_eq!(groups.len(), 1);
+        assert!(groups.contains_key(&None));
+        assert_eq!(groups[&None].len(), 3); // all 3 slots in one group
+    }
+
+    #[test]
+    fn test_group_slots_numa_tp8_split() {
+        // TP8: 4 slots on NUMA0, 4 on NUMA1, 2 blocks
+        let slots = |n0, n1| {
+            vec![
+                make_slot(NumaNode(0), 64),
+                make_slot(NumaNode(0), 64),
+                make_slot(NumaNode(0), 64),
+                make_slot(NumaNode(0), 64),
+                make_slot(NumaNode(n0), 64),
+                make_slot(NumaNode(n0), 64),
+                make_slot(NumaNode(n1), 64),
+                make_slot(NumaNode(n1), 64),
+            ]
+        };
+        let requests = vec![
+            make_prefetch_request(1, slots(1, 1)),
+            make_prefetch_request(2, slots(1, 1)),
+        ];
+
+        let groups = group_slots_by_numa(true, &requests);
+        assert_eq!(groups.len(), 2); // NUMA0 and NUMA1
+
+        let numa0 = &groups[&Some(NumaNode(0))];
+        let numa1 = &groups[&Some(NumaNode(1))];
+
+        // 4 slots/block * 2 blocks = 8 per NUMA
+        assert_eq!(numa0.len(), 8);
+        assert_eq!(numa1.len(), 8);
+
+        // Total size: 8 * 64 = 512 per group
+        let total_0: u64 = numa0.iter().map(|r| r.size).sum();
+        let total_1: u64 = numa1.iter().map(|r| r.size).sum();
+        assert_eq!(total_0, 512);
+        assert_eq!(total_1, 512);
+
+        // Verify slots reference correct slot indices
+        assert!(numa0.iter().all(|r| r.slot_idx < 4));
+        assert!(numa1.iter().all(|r| r.slot_idx >= 4));
+    }
+
+    #[test]
+    fn test_group_slots_unknown_maps_to_none() {
+        let requests = vec![make_prefetch_request(
+            1,
+            vec![
+                make_slot(NumaNode(0), 100),
+                make_slot(NumaNode::UNKNOWN, 100),
+            ],
+        )];
+
+        let groups = group_slots_by_numa(true, &requests);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[&Some(NumaNode(0))].len(), 1);
+        assert_eq!(groups[&None].len(), 1); // UNKNOWN → None
     }
 }
