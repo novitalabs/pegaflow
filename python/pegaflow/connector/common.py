@@ -35,16 +35,43 @@ class ConnectorContext:
     engine_client: EngineRpcClient
     state_manager: "ServiceStateManager"
     is_mla: bool = False
+    dcp_world_size: int = 1
+    pcp_world_size: int = 1
+    dcp_rank: int = 0
+
+    @property
+    def virtual_block_size(self) -> int:
+        """Block size as seen by the scheduler.
+
+        vLLM computes scheduler_block_size = block_size * dcp * pcp.
+        request.block_hashes has one hash per scheduler_block_size tokens,
+        so all scheduler-side arithmetic must use this value.
+        """
+        return self.block_size * self.dcp_world_size * self.pcp_world_size
 
     @property
     def effective_tp_rank(self) -> int:
-        """TP rank for PegaFlow server calls. MLA uses 0 since data is identical across ranks."""
-        return 0 if self.is_mla else (self.tp_rank or 0)
+        """TP rank for PegaFlow server calls.
+
+        - MLA without DCP: 0 (data identical across TP ranks).
+        - MLA with DCP: dcp_rank (each DCP rank stores different interleaved tokens).
+        - Non-MLA: tp_rank (each TP rank has different KV heads, already unique).
+        """
+        if self.is_mla:
+            return self.dcp_rank
+        return self.tp_rank or 0
 
     @property
     def effective_tp_size(self) -> int:
-        """TP size for PegaFlow server calls. MLA uses 1 since only one copy is needed."""
-        return 1 if self.is_mla else self.tp_size
+        """TP size for PegaFlow server calls.
+
+        - MLA without DCP: 1.
+        - MLA with DCP: dcp_world_size.
+        - Non-MLA: tp_size (unique per TP rank regardless of DCP).
+        """
+        if self.is_mla:
+            return max(1, self.dcp_world_size)
+        return self.tp_size
 
 
 @dataclass(frozen=True)
@@ -138,9 +165,17 @@ def resolve_instance_id(vllm_config, dp_rank_suffix: bool = True) -> str:
     return instance_id
 
 
-def derive_namespace(vllm_config, tp_size: int) -> str:
+def derive_namespace(
+    vllm_config,
+    tp_size: int,
+    dcp_world_size: int = 1,
+    pcp_world_size: int = 1,
+) -> str:
     """
     Derive namespace for storage isolation.
+
+    Different DCP/PCP configurations produce incompatible KV data, so both
+    are included as factors to prevent cross-contamination.
     """
     model_config = vllm_config.model_config
     cache_config = vllm_config.cache_config
@@ -153,6 +188,8 @@ def derive_namespace(vllm_config, tp_size: int) -> str:
         "head_size": model_config.get_head_size(),
         "num_hidden_layers": model_config.get_total_num_hidden_layers(),
         "cache_dtype": str(cache_config.cache_dtype),
+        "dcp_world_size": dcp_world_size,
+        "pcp_world_size": pcp_world_size,
     }
 
     factor_str = str(sorted(factors.items()))

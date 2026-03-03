@@ -41,15 +41,38 @@ class PegaKVConnector(KVConnectorBase_V1):
         tp_size = vllm_config.parallel_config.tensor_parallel_size
         world_size = vllm_config.parallel_config.world_size
         is_mla = detect_mla(vllm_config)
-        effective_tp_size = 1 if is_mla else tp_size
-        namespace = derive_namespace(vllm_config, effective_tp_size)
+        dcp_world_size = (
+            getattr(vllm_config.parallel_config, "decode_context_parallel_size", 1) or 1
+        )
+        pcp_world_size = (
+            getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1) or 1
+        )
+        effective_tp_size = max(1, dcp_world_size) if is_mla else tp_size
+
+        if dcp_world_size > 1 and not is_mla:
+            logger.warning(
+                "[PegaKVConnector] DCP with non-MLA model detected "
+                "(dcp_world_size=%d). effective_tp_rank will use tp_rank only; "
+                "KV data may collide across DCP ranks if workers share "
+                "the same tp_rank.",
+                dcp_world_size,
+            )
+
+        namespace = derive_namespace(vllm_config, effective_tp_size, dcp_world_size, pcp_world_size)
         num_layers = getattr(vllm_config.model_config.hf_text_config, "num_hidden_layers", 0)
         block_size = vllm_config.cache_config.block_size
 
         tp_rank: int | None = None
         device_id: int | None = None
+        dcp_rank: int = 0
         if role == KVConnectorRole.WORKER:
             tp_rank = get_tensor_model_parallel_rank()
+            if dcp_world_size > 1:
+                from vllm.distributed.parallel_state import (
+                    get_decode_context_model_parallel_rank,
+                )
+
+                dcp_rank = get_decode_context_model_parallel_rank()
             if torch.cuda.is_available():
                 device_id = _resolve_device_id()
 
@@ -80,6 +103,9 @@ class PegaKVConnector(KVConnectorBase_V1):
             engine_client=engine_client,
             state_manager=self._state_manager,
             is_mla=is_mla,
+            dcp_world_size=dcp_world_size,
+            pcp_world_size=pcp_world_size,
+            dcp_rank=dcp_rank,
         )
 
         self._scheduler: SchedulerConnector | None = None
@@ -90,7 +116,9 @@ class PegaKVConnector(KVConnectorBase_V1):
             self._worker = WorkerConnector(self._ctx)
 
         logger.info(
-            "[PegaKVConnector] Initialized role=%s instance_id=%s device=%s tp_rank=%s tp_size=%d world_size=%d layers=%d namespace=%s is_mla=%s",
+            "[PegaKVConnector] Initialized role=%s instance_id=%s device=%s "
+            "tp_rank=%s tp_size=%d world_size=%d layers=%d namespace=%s "
+            "is_mla=%s dcp_world_size=%d pcp_world_size=%d dcp_rank=%d",
             role.name,
             instance_id,
             device_id if device_id is not None else "cpu",
@@ -100,6 +128,9 @@ class PegaKVConnector(KVConnectorBase_V1):
             num_layers,
             namespace,
             is_mla,
+            dcp_world_size,
+            pcp_world_size,
+            dcp_rank,
         )
 
     # ==============================

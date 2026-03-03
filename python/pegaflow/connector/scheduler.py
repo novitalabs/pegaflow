@@ -58,6 +58,10 @@ class SchedulerConnector:
         self._scheduled_tokens: dict[str, int] = {}
         self._stored_blocks: dict[str, int] = {}
 
+        # Live Request references – used to refresh block_hashes during decode
+        # so that newly completed blocks can be saved, not just prefill blocks.
+        self._requests: dict[str, Request] = {}
+
         # Completion tracking
         self._pending_saves: set[str] = set()
         self._held_requests: set[str] = set()
@@ -74,7 +78,10 @@ class SchedulerConnector:
         num_tokens = request.num_tokens
         block_hashes = request.block_hashes
 
-        computed_blocks = num_computed_tokens // self._ctx.block_size
+        # request.block_hashes are already at virtual_block_size granularity
+        # (vLLM hashes every scheduler_block_size = block_size * dcp tokens).
+        # Skip blocks that are already computed locally.
+        computed_blocks = num_computed_tokens // self._ctx.virtual_block_size
         remaining_hashes = block_hashes[computed_blocks:]
 
         if not remaining_hashes:
@@ -105,18 +112,24 @@ class SchedulerConnector:
         if hit_blocks is None:
             return (None, False)
 
-        # hit_blocks now represents hits in remaining (non-computed) blocks only
-        num_hit_tokens = hit_blocks * self._ctx.block_size
+        # Each hit block = 1 virtual block = virtual_block_size global tokens.
+        num_hit_tokens = hit_blocks * self._ctx.virtual_block_size
 
+        # --- Hash diagnostic: log first 3 query hashes ---
+        _remaining_list = list(remaining_hashes)
+        _query_hash_preview = [h.hex()[:16] for h in _remaining_list[:3]]
         logger.info(
             "[PegaKVConnector] req=%s cache_lookup: hit_blocks=%d computed_blocks=%d "
-            "hit_tokens=%d num_tokens=%d lookup_us=%.0f",
+            "hit_tokens=%d num_tokens=%d lookup_us=%.0f "
+            "total_query_hashes=%d first_hashes=%s",
             req_id,
             hit_blocks,
             computed_blocks,
             num_hit_tokens,
             num_tokens,
             elapsed_us,
+            len(_remaining_list),
+            _query_hash_preview,
         )
 
         if num_hit_tokens <= 0:
@@ -133,19 +146,27 @@ class SchedulerConnector:
         req_id = request.request_id
         block_ids = list(blocks.get_block_ids()[0]) if blocks else []
 
-        # Reset state for this request (handles preemption correctly)
+        # Keep a live reference so we can refresh block_hashes during decode
+        # (Request.block_hashes grows as new full blocks are completed).
+        self._requests[req_id] = request
+
+        # request.block_hashes are already at virtual_block_size granularity
+        # (1 hash per scheduler block = block_size * dcp_world_size tokens).
+        # They are 1-to-1 with block_ids from the scheduler.
         self._block_hashes[req_id] = tuple(request.block_hashes)
         self._allocated_blocks[req_id] = block_ids
         self._scheduled_tokens[req_id] = 0
         self._stored_blocks[req_id] = 0
 
         if num_external_tokens > 0:
-            num_load_blocks = num_external_tokens // self._ctx.block_size
+            # num_external_tokens is in global token space; divide by
+            # virtual_block_size to get the number of pool blocks to load.
+            num_load_blocks = num_external_tokens // self._ctx.virtual_block_size
             start = len(block_ids) - num_load_blocks
 
             load_intent = LoadIntent(
                 block_ids=tuple(block_ids[start:]),
-                block_hashes=tuple(request.block_hashes[start : start + num_load_blocks]),
+                block_hashes=tuple(self._block_hashes[req_id][start : start + num_load_blocks]),
                 num_tokens=num_external_tokens,
             )
             self._pending_load_intents[req_id] = load_intent
@@ -186,6 +207,12 @@ class SchedulerConnector:
         for idx, req_id in enumerate(cached_reqs.req_ids):
             if req_id not in self._block_hashes:
                 continue
+
+            # Refresh block hashes from the live Request object so that
+            # newly completed blocks during decode are also saved.
+            req = self._requests.get(req_id)
+            if req is not None:
+                self._block_hashes[req_id] = tuple(req.block_hashes)
 
             num_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
             self._scheduled_tokens[req_id] += num_tokens
@@ -262,6 +289,7 @@ class SchedulerConnector:
 
     def _consume_save_intent(self, req_id: str) -> SaveIntent | None:
         """Calculate and return SaveIntent for new blocks that need saving."""
+        # block_hashes are at virtual_block_size granularity, 1-to-1 with block_ids.
         block_hashes = self._block_hashes.get(req_id)
         if block_hashes is None:
             return None
@@ -270,16 +298,36 @@ class SchedulerConnector:
         scheduled = self._scheduled_tokens.get(req_id, 0)
         stored = self._stored_blocks.get(req_id, 0)
 
-        saveable = min(len(block_hashes), len(allocated), scheduled // self._ctx.block_size)
+        # Use virtual_block_size because block_hashes and allocated are both
+        # at the virtual block level (1 entry per pool block).
+        saveable = min(
+            len(block_hashes),
+            len(allocated),
+            scheduled // self._ctx.virtual_block_size,
+        )
         new_blocks = saveable - stored
         if new_blocks <= 0:
             return None
 
         start = stored
         self._stored_blocks[req_id] = stored + new_blocks
+        save_hashes = block_hashes[start : start + new_blocks]
+
+        # --- Hash diagnostic: log first 3 save hashes ---
+        _save_hash_preview = [h.hex()[:16] for h in save_hashes[:3]]
+        logger.info(
+            "[PegaKVConnector] req=%s save_intent: start=%d new_blocks=%d "
+            "total_hashes=%d first_hashes=%s",
+            req_id,
+            start,
+            new_blocks,
+            len(block_hashes),
+            _save_hash_preview,
+        )
+
         return SaveIntent(
             block_ids=tuple(allocated[start : start + new_blocks]),
-            block_hashes=block_hashes[start : start + new_blocks],
+            block_hashes=save_hashes,
         )
 
     def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
@@ -314,6 +362,7 @@ class SchedulerConnector:
 
     def _cleanup_request(self, req_id: str) -> None:
         """Clean up all state for a completed request."""
+        self._requests.pop(req_id, None)
         self._block_hashes.pop(req_id, None)
         self._allocated_blocks.pop(req_id, None)
         self._scheduled_tokens.pop(req_id, None)
