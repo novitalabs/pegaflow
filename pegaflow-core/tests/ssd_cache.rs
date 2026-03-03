@@ -13,7 +13,6 @@ use pegaflow_core::*;
 /// SSD smoke test: initialize cache file in temp dir, save at least one block,
 /// verify SSD file receives non-zero bytes, then complete normal roundtrip.
 #[tokio::test]
-#[ignore]
 async fn ssd_smoke_roundtrip_with_temp_dir() {
     const NUM_BLOCKS: usize = 4;
     const BLOCK_SIZE: usize = 1024;

@@ -10,7 +10,6 @@ use common::*;
 
 /// vLLM worker must not load before scheduler query_prefetch pins blocks.
 #[tokio::test]
-#[ignore]
 async fn load_requires_query_prefetch() {
     const NUM_BLOCKS: usize = 4;
     const BLOCK_SIZE: usize = 1024;
@@ -37,7 +36,6 @@ async fn load_requires_query_prefetch() {
 
 /// One scheduler query pins each block with ref_count=world_size; each worker consumes once.
 #[tokio::test]
-#[ignore]
 async fn query_prefetch_pin_budget_tracks_world_size() {
     const NUM_BLOCKS: usize = 4;
     const BLOCK_SIZE: usize = 1024;
@@ -71,7 +69,6 @@ async fn query_prefetch_pin_budget_tracks_world_size() {
 
 /// If request is cancelled after query_prefetch, unpin must release load reservations.
 #[tokio::test]
-#[ignore]
 async fn unpin_releases_pinned_blocks() {
     const NUM_BLOCKS: usize = 3;
     const BLOCK_SIZE: usize = 1024;

@@ -9,7 +9,6 @@ use pegaflow_core::EngineError;
 
 /// Save request must validate per-layer block_ids/block_hashes shape before copy.
 #[tokio::test]
-#[ignore]
 async fn save_rejects_mismatched_block_id_and_hash_lengths() {
     let harness = RoundtripHarness::new(HarnessConfig::new("test-save-args", "test-ns", 2, 1024));
 

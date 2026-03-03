@@ -23,7 +23,6 @@ use pegaflow_core::StorageConfig;
 /// 8. Wait for load completion
 /// 9. Verify GPU data matches original
 #[tokio::test]
-#[ignore] // requires CUDA GPU
 async fn save_query_load_roundtrip() {
     const NUM_BLOCKS: usize = 4;
     const BLOCK_SIZE: usize = 1024;
@@ -44,7 +43,6 @@ async fn save_query_load_roundtrip() {
 
 /// Round-trip should work when NUMA-aware allocation is enabled.
 #[tokio::test]
-#[ignore] // requires CUDA GPU
 async fn save_query_load_roundtrip_with_numa_affinity_enabled() {
     const NUM_BLOCKS: usize = 4;
     const BLOCK_SIZE: usize = 1024;
@@ -69,7 +67,6 @@ async fn save_query_load_roundtrip_with_numa_affinity_enabled() {
 
 /// Save path skips blocks already in cache (dedup).
 #[tokio::test]
-#[ignore]
 async fn save_deduplicates_cached_blocks() {
     const NUM_BLOCKS: usize = 4;
     const BLOCK_SIZE: usize = 1024;
@@ -91,7 +88,6 @@ async fn save_deduplicates_cached_blocks() {
 
 /// Multi-layer completeness: a hash should become hittable only after all layers are saved.
 #[tokio::test]
-#[ignore]
 async fn multi_layer_blocks_hit_only_after_all_layers_saved() {
     const DEVICE_ID: i32 = 0;
     const NUM_BLOCKS: usize = 4;
@@ -206,7 +202,6 @@ async fn multi_layer_blocks_hit_only_after_all_layers_saved() {
 
 /// Namespace isolation: blocks saved under one namespace are invisible to another.
 #[tokio::test]
-#[ignore]
 async fn namespace_isolation_roundtrip() {
     const DEVICE_ID: i32 = 0;
     const BLOCK_SIZE: usize = 1024;
