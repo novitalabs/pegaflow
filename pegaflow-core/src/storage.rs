@@ -1069,7 +1069,7 @@ impl StorageEngine {
     }
 
     /// Called by prefetch worker when a block is loaded from SSD.
-    fn complete_prefetch(&self, key: BlockKey, block: Option<Arc<SealedBlock>>) {
+    pub(crate) fn complete_prefetch(&self, key: BlockKey, block: Option<Arc<SealedBlock>>) {
         let footprint_bytes = block.as_ref().map(|b| b.memory_footprint());
 
         let mut inner = self.inner.lock();

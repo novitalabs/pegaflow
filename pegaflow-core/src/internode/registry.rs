@@ -19,7 +19,7 @@ pub struct InstanceRegistry {
 
 impl InstanceRegistry {
     /// Create a new empty registry.
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             instances: DashMap::new(),
         }

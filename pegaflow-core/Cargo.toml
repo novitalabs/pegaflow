@@ -35,6 +35,9 @@ pegaflow-proto = { path = "../pegaflow-proto" }
 
 [dev-dependencies]
 criterion.workspace = true
+cudarc.workspace = true
+tokio.workspace = true
+tempfile = "3"
 
 [[bench]]
 name = "pinned_copy"
