@@ -159,15 +159,6 @@ impl PegaEngine {
         engine
     }
 
-    /// Create an engine with a custom pinned memory pool size.
-    ///
-    /// Set `use_hugepages` to true for 2MB huge pages (requires system configuration).
-    pub fn new_with_pool_size(pool_size: usize, use_hugepages: bool) -> Self {
-        let (engine, _rx) =
-            Self::new_with_config(pool_size, use_hugepages, storage::StorageConfig::default());
-        engine
-    }
-
     /// Create an engine with full custom configuration.
     ///
     /// Returns the engine and a receiver for seal notifications (used for SSD offload).
@@ -267,12 +258,6 @@ impl PegaEngine {
             .get(instance_id)
             .cloned()
             .ok_or_else(|| EngineError::InstanceMissing(instance_id.to_string()))
-    }
-
-    /// Get the namespace for an instance by ID.
-    pub fn get_instance_namespace(&self, instance_id: &str) -> Result<String, EngineError> {
-        let instance = self.get_instance(instance_id)?;
-        Ok(instance.namespace().to_string())
     }
 
     /// Register a KV cache layer with its memory layout.

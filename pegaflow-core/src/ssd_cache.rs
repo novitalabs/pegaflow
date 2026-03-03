@@ -314,11 +314,11 @@ pub(crate) struct PreparedBatch {
 }
 
 impl PreparedBatch {
-    pub fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self { writes: Vec::new() }
     }
 
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.writes.is_empty()
     }
 }
@@ -417,36 +417,32 @@ impl SsdStorageHandle {
     }
 
     #[inline]
-    pub(crate) fn complete_prefetch(&self, key: BlockKey, block: Option<Arc<SealedBlock>>) {
+    fn complete_prefetch(&self, key: BlockKey, block: Option<Arc<SealedBlock>>) {
         (self.complete_prefetch)(key, block);
     }
 
     #[inline]
-    pub(crate) fn is_valid(&self, begin: u64) -> bool {
+    fn is_valid(&self, begin: u64) -> bool {
         (self.is_valid)(begin)
     }
 
     #[inline]
-    pub(crate) fn allocate(
-        &self,
-        size: u64,
-        numa_node: Option<NumaNode>,
-    ) -> Option<Arc<PinnedAllocation>> {
+    fn allocate(&self, size: u64, numa_node: Option<NumaNode>) -> Option<Arc<PinnedAllocation>> {
         (self.allocate)(size, numa_node)
     }
 
     #[inline]
-    pub(crate) fn prepare(&self, candidates: Vec<(BlockKey, Arc<SealedBlock>)>) -> PreparedBatch {
+    fn prepare(&self, candidates: Vec<(BlockKey, Arc<SealedBlock>)>) -> PreparedBatch {
         (self.prepare)(candidates)
     }
 
     #[inline]
-    pub(crate) fn commit(&self, key: &BlockKey, success: bool) {
+    fn commit(&self, key: &BlockKey, success: bool) {
         (self.commit)(key, success)
     }
 
     #[inline]
-    pub(crate) fn is_numa(&self) -> bool {
+    fn is_numa(&self) -> bool {
         self.is_numa
     }
 }

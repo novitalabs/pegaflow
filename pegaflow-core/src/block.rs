@@ -95,7 +95,11 @@ pub struct LayerBlock {
 }
 
 impl LayerBlock {
-    pub fn new_contiguous(ptr: *mut u8, size: usize, allocation: Arc<PinnedAllocation>) -> Self {
+    pub(crate) fn new_contiguous(
+        ptr: *mut u8,
+        size: usize,
+        allocation: Arc<PinnedAllocation>,
+    ) -> Self {
         let k_ptr =
             std::ptr::NonNull::new(ptr).expect("contiguous block K pointer must be non-null");
         Self {
@@ -107,7 +111,7 @@ impl LayerBlock {
         }
     }
 
-    pub fn new_split(
+    pub(crate) fn new_split(
         k_ptr: *mut u8,
         v_ptr: *mut u8,
         size: usize,
@@ -125,20 +129,20 @@ impl LayerBlock {
         }
     }
 
-    pub fn k_ptr(&self) -> *const u8 {
+    pub(crate) fn k_ptr(&self) -> *const u8 {
         self.k_ptr.as_ptr()
     }
 
-    pub fn v_ptr(&self) -> Option<*const u8> {
+    pub(crate) fn v_ptr(&self) -> Option<*const u8> {
         self.v_ptr.map(|ptr| ptr.as_ptr() as *const u8)
     }
 
-    pub fn size(&self) -> usize {
+    pub(crate) fn size(&self) -> usize {
         self.size
     }
 
     /// Total pinned memory occupied by this layer block.
-    pub fn memory_footprint(&self) -> u64 {
+    fn memory_footprint(&self) -> u64 {
         self.size as u64
     }
 }
@@ -161,16 +165,16 @@ pub struct SealedBlock {
 }
 
 impl SealedBlock {
-    pub fn get_slot(&self, slot_id: usize) -> Option<&Arc<LayerBlock>> {
+    pub(crate) fn get_slot(&self, slot_id: usize) -> Option<&Arc<LayerBlock>> {
         self.slots.get(slot_id)
     }
 
-    pub fn memory_footprint(&self) -> u64 {
+    pub(crate) fn memory_footprint(&self) -> u64 {
         self.footprint
     }
 
     /// Get all slots (for serialization)
-    pub fn slots(&self) -> &[Arc<LayerBlock>] {
+    pub(crate) fn slots(&self) -> &[Arc<LayerBlock>] {
         &self.slots
     }
 
@@ -180,7 +184,7 @@ impl SealedBlock {
     }
 
     /// Create from a vec of slots (for deserialization / prefetch rebuild)
-    pub fn from_slots(slots: Vec<Arc<LayerBlock>>) -> Self {
+    pub(crate) fn from_slots(slots: Vec<Arc<LayerBlock>>) -> Self {
         let footprint = slots.iter().map(|s| s.memory_footprint()).sum();
         Self {
             slots: slots.into_boxed_slice(),
@@ -190,7 +194,7 @@ impl SealedBlock {
     }
 
     /// Create from slots with pre-computed footprint (internal use)
-    pub(crate) fn from_slots_with_footprint(
+    fn from_slots_with_footprint(
         slots: Box<[Arc<LayerBlock>]>,
         footprint: u64,
         slot_numas: Vec<NumaNode>,
@@ -235,7 +239,7 @@ pub(crate) struct InflightBlock {
 }
 
 impl InflightBlock {
-    pub fn new(total_slots: usize) -> Self {
+    pub(crate) fn new(total_slots: usize) -> Self {
         Self {
             slots: vec![None; total_slots],
             remaining: total_slots,
@@ -247,27 +251,27 @@ impl InflightBlock {
     }
 
     /// Returns the age of this inflight block.
-    pub fn age(&self) -> std::time::Duration {
+    pub(crate) fn age(&self) -> std::time::Duration {
         self.created_at.elapsed()
     }
 
     /// Returns the number of filled slots.
-    pub fn filled_count(&self) -> usize {
+    pub(crate) fn filled_count(&self) -> usize {
         self.total_slots - self.remaining
     }
 
     /// Returns the total number of slots.
-    pub fn total_slots(&self) -> usize {
+    pub(crate) fn total_slots(&self) -> usize {
         self.total_slots
     }
 
     /// Returns the current memory footprint of all inserted slots.
-    pub fn footprint(&self) -> u64 {
+    pub(crate) fn footprint(&self) -> u64 {
         self.footprint
     }
 
     /// Insert a slot idempotently. Duplicate inserts are no-ops.
-    pub fn insert_slot(
+    pub(crate) fn insert_slot(
         &mut self,
         slot_id: usize,
         block: Arc<LayerBlock>,
@@ -301,7 +305,7 @@ impl InflightBlock {
 
     /// Seal the block, converting to immutable SealedBlock.
     /// Panics if not all slots are filled.
-    pub fn seal(self) -> SealedBlock {
+    pub(crate) fn seal(self) -> SealedBlock {
         let slots: Vec<Arc<LayerBlock>> = self
             .slots
             .into_iter()

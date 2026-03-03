@@ -44,7 +44,7 @@ pub(crate) fn segment_offset(
 }
 
 /// Copy data from GPU to CPU asynchronously on the provided stream
-pub(crate) fn copy_gpu_to_cpu_async(
+fn copy_gpu_to_cpu_async(
     gpu_base_ptr: u64,
     offset: usize,
     dst_ptr: *mut u8,
@@ -71,7 +71,7 @@ pub(crate) fn copy_gpu_to_cpu_async(
 }
 
 /// Copy data from CPU to GPU asynchronously on the provided stream
-pub(crate) fn copy_cpu_to_gpu_async(
+fn copy_cpu_to_gpu_async(
     gpu_base_ptr: u64,
     offset: usize,
     cpu_buffer: &[u8],

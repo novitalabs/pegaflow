@@ -25,18 +25,13 @@ unsafe impl Sync for PinnedAllocation {}
 
 impl PinnedAllocation {
     /// Get a const pointer to the allocated memory
-    pub fn as_ptr(&self) -> *const u8 {
+    pub(crate) fn as_ptr(&self) -> *const u8 {
         self.ptr.as_ptr()
     }
 
     /// Get a mutable pointer to the allocated memory
-    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut u8 {
         self.ptr.as_ptr()
-    }
-
-    /// Get the size of the allocation in bytes
-    pub fn size(&self) -> NonZeroU64 {
-        self.allocation.size_bytes
     }
 }
 
@@ -74,7 +69,7 @@ impl PinnedMemoryPool {
     ///
     /// If `use_hugepages` is true, uses huge pages (requires system config).
     /// If `unit_size_hint` is provided, the allocator rounds allocations up to this size.
-    pub fn new(pool_size: usize, use_hugepages: bool, unit_size_hint: Option<NonZeroU64>) -> Self {
+    fn new(pool_size: usize, use_hugepages: bool, unit_size_hint: Option<NonZeroU64>) -> Self {
         if pool_size == 0 {
             panic!("Pinned memory pool size must be greater than zero");
         }
@@ -130,7 +125,7 @@ impl PinnedMemoryPool {
 
     /// Allocate pinned memory from the pool. Returns None when the allocation cannot be satisfied.
     /// Returns a RAII guard that automatically frees the allocation when dropped.
-    pub fn allocate(self: &Arc<Self>, size: NonZeroU64) -> Option<PinnedAllocation> {
+    fn allocate(self: &Arc<Self>, size: NonZeroU64) -> Option<PinnedAllocation> {
         // Allocation is done under lock, metrics and pointer computation outside lock
         let allocation = {
             let mut allocator = self.allocator.lock();
@@ -171,7 +166,7 @@ impl PinnedMemoryPool {
     /// Internal method to free a pinned memory allocation.
     /// This is called automatically by PinnedAllocation's Drop implementation.
     /// Users should not call this directly - use PinnedAllocation RAII instead.
-    pub(crate) fn free_internal(&self, allocation: &Allocation) {
+    fn free_internal(&self, allocation: &Allocation) {
         // Free under lock, metrics update outside lock
         {
             let mut allocator = self.allocator.lock();
@@ -185,7 +180,7 @@ impl PinnedMemoryPool {
     }
 
     /// Get (used_bytes, total_bytes) for the pool.
-    pub fn usage(&self) -> (u64, u64) {
+    fn usage(&self) -> (u64, u64) {
         let allocator = self.allocator.lock();
         let report = allocator.storage_report();
         let total = allocator.total_bytes();
@@ -194,7 +189,7 @@ impl PinnedMemoryPool {
     }
 
     /// Largest contiguous free region currently available, in bytes.
-    pub fn largest_free_allocation(&self) -> u64 {
+    fn largest_free_allocation(&self) -> u64 {
         let allocator = self.allocator.lock();
         allocator.storage_report().largest_free_allocation_bytes
     }
@@ -263,7 +258,7 @@ impl NumaAwarePinnedPools {
     /// Panics if any NUMA pool allocation fails. This is a fail-fast behavior
     /// to prevent silent partial failures that would cause mysterious allocation
     /// errors later when GPUs try to use the missing pool.
-    pub fn new(
+    fn new(
         total_capacity: usize,
         numa_nodes: &[NumaNode],
         use_hugepages: bool,
@@ -330,7 +325,7 @@ impl NumaAwarePinnedPools {
     /// - `numa_node` is `UNKNOWN` (should be caught at registration time)
     /// - The NUMA node has no pool
     /// - The pool is exhausted
-    pub fn allocate(&self, numa_node: NumaNode, size: NonZeroU64) -> Option<Arc<PinnedAllocation>> {
+    fn allocate(&self, numa_node: NumaNode, size: NonZeroU64) -> Option<Arc<PinnedAllocation>> {
         if numa_node.is_unknown() {
             error!("UNEXPECTED: allocate called with UNKNOWN NUMA node");
             return None;
@@ -340,7 +335,7 @@ impl NumaAwarePinnedPools {
     }
 
     /// Get aggregate usage across all pools: (used_bytes, total_bytes)
-    pub(crate) fn total_usage(&self) -> (u64, u64) {
+    fn total_usage(&self) -> (u64, u64) {
         let mut used = 0u64;
         let mut total = 0u64;
 

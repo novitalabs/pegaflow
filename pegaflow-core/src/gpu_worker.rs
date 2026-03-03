@@ -74,7 +74,7 @@ impl GpuWorkerPool {
     /// Worker threads will be pinned to the specified NUMA node for optimal
     /// memory locality during D2H/H2D transfers. If `numa_node` is unknown
     /// or pinning fails, the worker will continue without NUMA affinity.
-    pub fn spawn(device_id: i32, numa_node: NumaNode) -> Result<Self, EngineError> {
+    pub(crate) fn spawn(device_id: i32, numa_node: NumaNode) -> Result<Self, EngineError> {
         let (load_tx, load_rx) = mpsc::unbounded_channel();
         let (save_tx, save_rx) = mpsc::unbounded_channel();
 
@@ -132,7 +132,7 @@ impl GpuWorkerPool {
     }
 
     /// Submit a load task (CPU -> GPU) - fire and forget
-    pub fn submit_load(&self, task: LoadTask) -> Result<(), EngineError> {
+    pub(crate) fn submit_load(&self, task: LoadTask) -> Result<(), EngineError> {
         self.load_tx.send(task).map_err(|_| {
             EngineError::Storage(format!(
                 "Load worker channel closed for device {}",
@@ -141,24 +141,10 @@ impl GpuWorkerPool {
         })
     }
 
-    /// Submit a save task (GPU -> CPU) - async, wait for completion
-    /// TODO: make sure the source of the blocks is valid until the task is completed
-    pub async fn save(
-        &self,
-        registration: KVCacheRegistration,
-        blocks: Vec<SaveBlock>,
-    ) -> Result<(), EngineError> {
-        self.batch_save(vec![SaveLayerData {
-            registration,
-            blocks,
-        }])
-        .await
-    }
-
     /// Submit a multi-layer save task (GPU -> CPU) - async, wait for completion.
     /// All layers are copied on the same CUDA stream with a single synchronization,
     /// which is significantly faster than submitting individual per-layer tasks.
-    pub async fn batch_save(&self, layers: Vec<SaveLayerData>) -> Result<(), EngineError> {
+    pub(crate) async fn batch_save(&self, layers: Vec<SaveLayerData>) -> Result<(), EngineError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let task = SaveTask {
             layers,
@@ -181,10 +167,6 @@ impl GpuWorkerPool {
                 self.device_id
             ))
         })?
-    }
-
-    pub fn device_id(&self) -> i32 {
-        self.device_id
     }
 }
 

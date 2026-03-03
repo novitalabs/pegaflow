@@ -31,7 +31,7 @@ impl PegaflowClient {
     ///
     /// * `endpoint` - The gRPC endpoint URL (e.g., "http://10.0.0.1:50055")
     /// * `config` - Client configuration
-    pub async fn connect(endpoint: &str, config: &ClientConfig) -> Result<Self, ClientError> {
+    async fn connect(endpoint: &str, config: &ClientConfig) -> Result<Self, ClientError> {
         let endpoint_cfg = Endpoint::from_shared(endpoint.to_string())
             .map_err(|e| ClientError::ConnectionFailed(e.to_string()))?
             .connect_timeout(config.connect_timeout)
@@ -56,12 +56,12 @@ impl PegaflowClient {
     }
 
     /// Connect to a PegaFlow instance with default configuration.
-    pub async fn connect_default(endpoint: &str) -> Result<Self, ClientError> {
+    async fn connect_default(endpoint: &str) -> Result<Self, ClientError> {
         Self::connect(endpoint, &ClientConfig::default()).await
     }
 
     /// Connect to a discovered PegaFlow instance.
-    pub async fn from_instance(
+    async fn from_instance(
         instance: &PegaflowInstance,
         config: &ClientConfig,
     ) -> Result<Self, ClientError> {
@@ -69,7 +69,7 @@ impl PegaflowClient {
     }
 
     /// Get the endpoint URL.
-    pub fn endpoint(&self) -> &str {
+    fn endpoint(&self) -> &str {
         &self.endpoint
     }
 
@@ -86,7 +86,7 @@ impl PegaflowClient {
     /// # Returns
     ///
     /// `QueryResult` containing hit/miss counts (no loading state).
-    pub async fn query(
+    async fn query(
         &self,
         instance_id: &str,
         block_hashes: Vec<Vec<u8>>,
@@ -132,7 +132,7 @@ impl PegaflowClient {
     /// # Returns
     ///
     /// `QueryResult` containing hit/miss/loading counts.
-    pub async fn query_prefetch(
+    async fn query_prefetch(
         &self,
         instance_id: &str,
         block_hashes: Vec<Vec<u8>>,
@@ -179,7 +179,7 @@ impl PegaflowClient {
     }
 
     /// Check if the remote instance is healthy.
-    pub async fn health(&self) -> Result<bool, ClientError> {
+    async fn health(&self) -> Result<bool, ClientError> {
         use pegaflow_proto::proto::engine::HealthRequest;
 
         let response = self
@@ -211,7 +211,7 @@ pub struct PegaflowClientPool {
 
 impl PegaflowClientPool {
     /// Create a new client pool with the given registry.
-    pub fn new(registry: Arc<InstanceRegistry>, config: ClientConfig) -> Self {
+    fn new(registry: Arc<InstanceRegistry>, config: ClientConfig) -> Self {
         Self {
             config,
             registry,
@@ -220,7 +220,7 @@ impl PegaflowClientPool {
     }
 
     /// Create a new client pool with default configuration.
-    pub fn with_registry(registry: Arc<InstanceRegistry>) -> Self {
+    fn with_registry(registry: Arc<InstanceRegistry>) -> Self {
         Self::new(registry, ClientConfig::default())
     }
 
@@ -229,7 +229,7 @@ impl PegaflowClientPool {
     /// The endpoint is typically `http://ip:port` as returned by the metaserver.
     /// Cached connections whose endpoint is no longer healthy in the registry
     /// are evicted and reconnected.
-    pub async fn get_or_connect(&self, endpoint: &str) -> Result<PegaflowClient, ClientError> {
+    async fn get_or_connect(&self, endpoint: &str) -> Result<PegaflowClient, ClientError> {
         // Fast path: return cached client if the instance is still healthy.
         if let Some(client) = self.clients.get(endpoint) {
             if self.is_endpoint_healthy(endpoint) {
@@ -261,22 +261,22 @@ impl PegaflowClientPool {
     }
 
     /// Remove a client from the cache by endpoint.
-    pub fn remove(&self, endpoint: &str) {
+    fn remove(&self, endpoint: &str) {
         self.clients.remove(endpoint);
     }
 
     /// Drop all cached clients.
-    pub fn clear(&self) {
+    fn clear(&self) {
         self.clients.clear();
     }
 
     /// Number of cached connections.
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.clients.len()
     }
 
     /// Whether the pool has no cached connections.
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.clients.is_empty()
     }
 }

@@ -51,14 +51,6 @@ fn read_hugepage_size_from_proc() -> Option<usize> {
     None
 }
 
-/// Get the system's default huge page size in bytes.
-///
-/// Reads from `/proc/meminfo` on first call, then caches the result.
-/// Returns `None` if the system doesn't support huge pages or `/proc/meminfo` is unavailable.
-pub fn huge_page_size() -> Option<usize> {
-    get_huge_page_size()
-}
-
 /// Error type for pinned memory allocation.
 #[derive(Debug)]
 pub enum PinnedMemError {
@@ -135,7 +127,7 @@ impl PinnedMemory {
     /// # Errors
     ///
     /// Returns error if cudaHostAlloc fails.
-    pub fn allocate(size: usize) -> Result<Self, PinnedMemError> {
+    pub(crate) fn allocate(size: usize) -> Result<Self, PinnedMemError> {
         Self::allocate_internal(size, AllocStrategy::WriteCombined)
     }
 
@@ -152,7 +144,7 @@ impl PinnedMemory {
     /// # Errors
     ///
     /// Returns `MmapFailed` if huge pages are not configured or insufficient.
-    pub fn allocate_hugepages(size: usize) -> Result<Self, PinnedMemError> {
+    pub(crate) fn allocate_hugepages(size: usize) -> Result<Self, PinnedMemError> {
         Self::allocate_internal(size, AllocStrategy::HugePages)
     }
 
@@ -219,13 +211,7 @@ impl PinnedMemory {
 
     /// Get a raw pointer to the allocated memory.
     #[inline]
-    pub fn as_ptr(&self) -> *const u8 {
-        self.ptr.as_ptr()
-    }
-
-    /// Get a mutable raw pointer to the allocated memory.
-    #[inline]
-    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+    pub(crate) fn as_ptr(&self) -> *const u8 {
         self.ptr.as_ptr()
     }
 
@@ -233,14 +219,8 @@ impl PinnedMemory {
     ///
     /// This is the aligned size, which may be larger than the requested size.
     #[inline]
-    pub fn size(&self) -> usize {
+    pub(crate) fn size(&self) -> usize {
         self.size
-    }
-
-    /// Get the allocation strategy used.
-    #[inline]
-    pub fn strategy(&self) -> AllocStrategy {
-        self.strategy
     }
 }
 
@@ -288,7 +268,6 @@ mod tests {
 
         let mem = PinnedMemory::allocate(4096).unwrap();
         assert!(mem.size() >= 4096);
-        assert_eq!(mem.strategy(), AllocStrategy::WriteCombined);
     }
 
     #[test]

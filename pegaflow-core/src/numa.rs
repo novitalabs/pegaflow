@@ -23,7 +23,7 @@ impl NumaNode {
     pub const UNKNOWN: NumaNode = NumaNode(u32::MAX);
 
     /// Check if this is the unknown node
-    pub fn is_unknown(&self) -> bool {
+    pub(crate) fn is_unknown(&self) -> bool {
         self.0 == u32::MAX
     }
 
@@ -43,31 +43,6 @@ impl std::fmt::Display for NumaNode {
     }
 }
 
-/// Get the current CPU's NUMA node using the `getcpu` syscall
-///
-/// Returns `NumaNode::UNKNOWN` if the syscall fails (e.g., on non-Linux systems
-/// or in restricted containers).
-pub(crate) fn get_current_cpu_numa_node() -> NumaNode {
-    unsafe {
-        let mut cpu: libc::c_uint = 0;
-        let mut node: libc::c_uint = 0;
-
-        // getcpu syscall: int getcpu(unsigned *cpu, unsigned *node, struct getcpu_cache *tcache);
-        let result = libc::syscall(
-            libc::SYS_getcpu,
-            &mut cpu,
-            &mut node,
-            std::ptr::null_mut::<libc::c_void>(),
-        );
-
-        if result == 0 {
-            NumaNode(node)
-        } else {
-            NumaNode::UNKNOWN
-        }
-    }
-}
-
 /// Get the NUMA node for a GPU device
 ///
 /// Uses `nvidia-smi topo --get-numa-id-of-nearby-cpu` to query the NUMA affinity
@@ -77,7 +52,7 @@ pub(crate) fn get_current_cpu_numa_node() -> NumaNode {
 ///
 /// # Arguments
 /// * `device_id` - The CUDA device ID (e.g., 0 for GPU 0)
-pub(crate) fn get_device_numa_node(device_id: u32) -> NumaNode {
+fn get_device_numa_node(device_id: u32) -> NumaNode {
     // Use nvidia-smi topo to get NUMA ID of nearest CPU
     let output = match Command::new("nvidia-smi")
         .args([
@@ -221,7 +196,7 @@ where
 /// Returns a vector of (device_id, numa_node) pairs for all GPUs
 /// that can be detected. If nvidia-smi is not available, returns
 /// an empty vector.
-pub fn get_gpu_numa_affinity() -> Vec<(u32, NumaNode)> {
+fn get_gpu_numa_affinity() -> Vec<(u32, NumaNode)> {
     // First, try to get the number of GPUs
     let output = match Command::new("nvidia-smi")
         .args(["--query-gpu=count", "--format=csv,noheader"])
@@ -253,67 +228,6 @@ pub fn get_gpu_numa_affinity() -> Vec<(u32, NumaNode)> {
     (0..count)
         .map(|device_id| (device_id, get_device_numa_node(device_id)))
         .collect()
-}
-
-/// Log a summary of the system NUMA topology
-///
-/// This is useful for debugging and diagnostics. Uses `log::info!` and `log::warn!`
-/// for output. Make sure to initialize logging before calling this function.
-///
-/// # Example
-/// ```
-/// use pegaflow_core::logging;
-/// use pegaflow_core::numa::log_numa_summary;
-///
-/// logging::init_stdout_colored("info");
-/// log_numa_summary();
-/// ```
-pub fn log_numa_summary() {
-    log::info!("=== PegaFlow NUMA Topology ===");
-
-    // Current process NUMA node
-    let current_node = get_current_cpu_numa_node();
-    log::info!("Current Process: {}", current_node);
-
-    // System NUMA topology
-    match read_cpu_topology_from_sysfs() {
-        Ok(node_to_cpus) => {
-            let total_cpus: usize = node_to_cpus.values().map(|v| v.len()).sum();
-            let mut node_ids: Vec<_> = node_to_cpus.keys().copied().collect();
-            node_ids.sort_unstable();
-
-            log::info!("System NUMA Topology:");
-            log::info!("  Total NUMA nodes: {}", node_ids.len());
-            log::info!("  Total CPUs: {}", total_cpus);
-
-            for node_id in node_ids {
-                if let Some(cpus) = node_to_cpus.get(&node_id) {
-                    let cpu_list = format_cpu_list(cpus);
-                    log::info!(
-                        "  {}: {} CPUs ({})",
-                        NumaNode(node_id),
-                        cpus.len(),
-                        cpu_list
-                    );
-                }
-            }
-        }
-        Err(e) => {
-            log::warn!("Failed to detect NUMA topology: {}", e);
-            log::warn!("  (This is normal for single-node systems or containers)");
-        }
-    }
-
-    // GPU NUMA affinity
-    let gpu_affinity = get_gpu_numa_affinity();
-    if !gpu_affinity.is_empty() {
-        log::info!("GPU NUMA Affinity:");
-        for (device_id, node) in gpu_affinity {
-            log::info!("  GPU {} -> {}", device_id, node);
-        }
-    } else {
-        log::warn!("GPU NUMA Affinity: Not available (nvidia-smi not found)");
-    }
 }
 
 /// Format a list of CPUs into a compact range representation
@@ -558,17 +472,6 @@ mod tests {
         assert_eq!(format!("{}", NumaNode(0)), "NUMA0");
         assert_eq!(format!("{}", NumaNode(7)), "NUMA7");
         assert_eq!(format!("{}", NumaNode::UNKNOWN), "UNKNOWN");
-    }
-
-    #[test]
-    fn test_get_current_cpu_numa_node() {
-        // Should either return a valid node or UNKNOWN
-        let node = get_current_cpu_numa_node();
-
-        // If not unknown, should be a reasonable NUMA node number
-        if !node.is_unknown() {
-            assert!(node.0 < 16, "NUMA node {} seems unreasonably high", node.0);
-        }
     }
 
     #[test]

@@ -195,7 +195,7 @@ pub struct UringIoEngine {
 }
 
 impl UringIoEngine {
-    pub fn new(fd: RawFd, cfg: UringConfig) -> io::Result<Self> {
+    pub(crate) fn new(fd: RawFd, cfg: UringConfig) -> io::Result<Self> {
         if cfg.threads == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -245,7 +245,7 @@ impl UringIoEngine {
     ///
     /// # Safety
     /// Caller must ensure all buffer pointers remain valid until the returned receiver completes.
-    pub fn readv_at_async(
+    pub(crate) fn readv_at_async(
         &self,
         iovecs: Vec<(*mut u8, usize)>,
         offset: u64,
@@ -292,7 +292,7 @@ impl UringIoEngine {
     ///
     /// # Safety
     /// Caller must ensure all buffer pointers remain valid until the returned receiver completes.
-    pub fn writev_at_async(
+    pub(crate) fn writev_at_async(
         &self,
         iovecs: Vec<(*const u8, usize)>,
         offset: u64,
