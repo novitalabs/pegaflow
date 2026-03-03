@@ -40,7 +40,7 @@ pub(crate) enum CacheInsertOutcome {
 }
 
 impl TinyLfuCache<BlockKey, ArcSealedBlock> {
-    pub fn new_unbounded(
+    pub(crate) fn new_unbounded(
         capacity_bytes: usize,
         enable_lfu_admission: bool,
         bytes_per_value_hint: Option<usize>,
@@ -56,7 +56,7 @@ impl TinyLfuCache<BlockKey, ArcSealedBlock> {
     }
 
     /// Returns a cloned value and bumps frequency on hit.
-    pub fn get(&mut self, key: &BlockKey) -> Option<ArcSealedBlock> {
+    pub(crate) fn get(&mut self, key: &BlockKey) -> Option<ArcSealedBlock> {
         let hit = self.lru.get(key).cloned();
         if hit.is_some()
             && let Some(freq) = &self.freq
@@ -67,13 +67,13 @@ impl TinyLfuCache<BlockKey, ArcSealedBlock> {
     }
 
     /// Checks membership without updating TinyLFU frequency.
-    pub fn contains_key(&self, key: &BlockKey) -> bool {
+    pub(crate) fn contains_key(&self, key: &BlockKey) -> bool {
         self.lru.contains_key(key)
     }
 
     /// Insert with TinyLFU admission. If the candidate is colder than the
     /// current LRU victim it is dropped.
-    pub fn insert(&mut self, key: BlockKey, value: ArcSealedBlock) -> CacheInsertOutcome {
+    pub(crate) fn insert(&mut self, key: BlockKey, value: ArcSealedBlock) -> CacheInsertOutcome {
         // Always record the access so future attempts have a chance.
         if let Some(freq) = &self.freq {
             freq.incr(&key);
@@ -98,7 +98,7 @@ impl TinyLfuCache<BlockKey, ArcSealedBlock> {
         CacheInsertOutcome::InsertedNew
     }
 
-    pub fn remove_lru(&mut self) -> Option<(BlockKey, ArcSealedBlock)> {
+    pub(crate) fn remove_lru(&mut self) -> Option<(BlockKey, ArcSealedBlock)> {
         self.lru.remove_lru()
     }
 }
@@ -219,11 +219,11 @@ pub(crate) struct TinyLfu {
 }
 
 impl TinyLfu {
-    pub fn get<T: Hash>(&self, key: T) -> u8 {
+    fn get<T: Hash>(&self, key: T) -> u8 {
         self.estimator.get(key)
     }
 
-    pub fn incr<T: Hash>(&self, key: T) -> u8 {
+    fn incr<T: Hash>(&self, key: T) -> u8 {
         let window_size = self.window_counter.fetch_add(1, Ordering::Relaxed);
         if window_size == self.window_limit || window_size > self.window_limit * 2 {
             self.window_counter.store(0, Ordering::Relaxed);
@@ -233,7 +233,7 @@ impl TinyLfu {
     }
 
     // Because we use 8-bit counters, window size can be 256 * the cache size.
-    pub fn new(cache_size: usize) -> Self {
+    fn new(cache_size: usize) -> Self {
         Self {
             estimator: Estimator::optimal(cache_size),
             window_counter: Default::default(),
@@ -242,7 +242,7 @@ impl TinyLfu {
     }
 
     #[allow(dead_code)]
-    pub fn new_compact(cache_size: usize) -> Self {
+    fn new_compact(cache_size: usize) -> Self {
         Self {
             estimator: Estimator::compact(cache_size),
             window_counter: Default::default(),

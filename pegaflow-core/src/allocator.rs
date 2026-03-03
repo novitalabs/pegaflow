@@ -70,39 +70,8 @@ pub struct ScaledOffsetAllocator {
 }
 
 impl ScaledOffsetAllocator {
-    /// Create a new allocator that automatically chooses the smallest unit size that
-    /// keeps the backing allocator within its u32 capacity.
-    ///
-    /// For example, 64 GiB will scale to 16-byte units to fit under the ~4 GiB u32 ceiling.
-    pub fn new(total_bytes: u64) -> Result<Self, AllocatorError> {
-        let max_units = u32::MAX as u64;
-        let unit_size = if total_bytes > max_units {
-            total_bytes.div_ceil(max_units)
-        } else {
-            1
-        };
-        // Preserve the offset-allocator default cap of ~128k allocations.
-        Self::new_with_unit_size_and_max_allocs(total_bytes, unit_size, 128 * 1024)
-    }
-
-    /// Same as `new` but allows the caller to control the maximum number of allocations.
-    pub fn new_with_max_allocs(total_bytes: u64, max_allocs: u32) -> Result<Self, AllocatorError> {
-        let max_units = u32::MAX as u64;
-        let unit_size = if total_bytes > max_units {
-            total_bytes.div_ceil(max_units)
-        } else {
-            1
-        };
-        Self::new_with_unit_size_and_max_allocs(total_bytes, unit_size, max_allocs)
-    }
-
-    /// Create a new allocator that manages `total_bytes`, rounding up to multiples of `unit_size`.
-    pub fn new_with_unit_size(total_bytes: u64, unit_size: u64) -> Result<Self, AllocatorError> {
-        Self::new_with_unit_size_and_max_allocs(total_bytes, unit_size, 128 * 1024)
-    }
-
     /// Create a new allocator with explicit `unit_size` and `max_allocs`.
-    pub fn new_with_unit_size_and_max_allocs(
+    pub(crate) fn new_with_unit_size_and_max_allocs(
         total_bytes: u64,
         unit_size: u64,
         max_allocs: u32,
@@ -124,7 +93,7 @@ impl ScaledOffsetAllocator {
     }
 
     /// Allocate `size_bytes`, rounded up to the allocator's unit size.
-    pub fn allocate(&mut self, size_bytes: u64) -> Result<Option<Allocation>, AllocatorError> {
+    pub(crate) fn allocate(&mut self, size_bytes: u64) -> Result<Option<Allocation>, AllocatorError> {
         if size_bytes == 0 {
             return Ok(None);
         }
@@ -150,17 +119,17 @@ impl ScaledOffsetAllocator {
     }
 
     /// Free a previously allocated region.
-    pub fn free(&mut self, allocation: &Allocation) {
+    pub(crate) fn free(&mut self, allocation: &Allocation) {
         self.inner.free(allocation.raw);
     }
 
     /// Return the total managed capacity in bytes (rounded up to `unit_size`).
-    pub fn total_bytes(&self) -> u64 {
+    pub(crate) fn total_bytes(&self) -> u64 {
         self.unit_size.get() * self.total_units as u64
     }
 
     /// Return a storage report converted to bytes.
-    pub fn storage_report(&self) -> StorageReportBytes {
+    pub(crate) fn storage_report(&self) -> StorageReportBytes {
         let report = self.inner.storage_report();
         StorageReportBytes {
             total_free_bytes: report.total_free_space as u64 * self.unit_size.get(),
@@ -183,7 +152,7 @@ mod tests {
     #[test]
     fn creates_allocator_with_scaled_capacity() {
         let allocator =
-            ScaledOffsetAllocator::new_with_unit_size(10 * 1024 * 1024 * 1024, 64).unwrap();
+            ScaledOffsetAllocator::new_with_unit_size_and_max_allocs(10 * 1024 * 1024 * 1024, 64, 128 * 1024).unwrap();
         assert_eq!(allocator.unit_size.get(), 64);
         assert_eq!(
             allocator.total_units,
@@ -193,7 +162,7 @@ mod tests {
 
     #[test]
     fn allocate_rounds_up_to_unit_size() {
-        let mut allocator = ScaledOffsetAllocator::new_with_unit_size(1024, 64).unwrap();
+        let mut allocator = ScaledOffsetAllocator::new_with_unit_size_and_max_allocs(1024, 64, 128 * 1024).unwrap();
         let allocation = allocator.allocate(1).unwrap().unwrap();
         assert_eq!(allocation.offset_bytes, 0);
         assert_eq!(allocation.size_bytes.get(), 64);
@@ -205,7 +174,7 @@ mod tests {
 
     #[test]
     fn reuse_after_free_merges_neighboring_regions() {
-        let mut allocator = ScaledOffsetAllocator::new_with_unit_size(256, 64).unwrap();
+        let mut allocator = ScaledOffsetAllocator::new_with_unit_size_and_max_allocs(256, 64, 128 * 1024).unwrap();
         let a = allocator.allocate(64).unwrap().unwrap();
         let b = allocator.allocate(64).unwrap().unwrap();
 
@@ -219,7 +188,7 @@ mod tests {
 
     #[test]
     fn rejects_unreasonably_large_requests() {
-        let mut allocator = ScaledOffsetAllocator::new_with_unit_size(1024 * 1024, 1).unwrap();
+        let mut allocator = ScaledOffsetAllocator::new_with_unit_size_and_max_allocs(1024 * 1024, 1, 128 * 1024).unwrap();
         let too_large = u64::from(u32::MAX) * 2;
         let err = allocator.allocate(too_large).unwrap_err();
         assert_eq!(
@@ -233,7 +202,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_unit_size() {
-        let err = ScaledOffsetAllocator::new_with_unit_size(1024, 0).unwrap_err();
+        let err = ScaledOffsetAllocator::new_with_unit_size_and_max_allocs(1024, 0, 128 * 1024).unwrap_err();
         assert_eq!(err, AllocatorError::InvalidUnitSize);
     }
 }

@@ -41,7 +41,7 @@ impl Default for LoggingConfig {
 
 impl LoggingConfig {
     /// Create a new config with the given log level.
-    pub fn new(level: impl Into<String>) -> Self {
+    fn new(level: impl Into<String>) -> Self {
         Self {
             level: level.into(),
             ..Default::default()
@@ -49,19 +49,19 @@ impl LoggingConfig {
     }
 
     /// Set output to stdout.
-    pub fn stdout(mut self) -> Self {
+    fn stdout(mut self) -> Self {
         self.output = LogOutput::Stdout;
         self
     }
 
     /// Set output to stderr.
-    pub fn stderr(mut self) -> Self {
+    fn stderr(mut self) -> Self {
         self.output = LogOutput::Stderr;
         self
     }
 
     /// Enable colored output.
-    pub fn colored(mut self) -> Self {
+    fn colored(mut self) -> Self {
         self.colored = true;
         self
     }
@@ -101,7 +101,7 @@ fn apply_default_module_levels(mut filter: String) -> String {
 /// The RUST_LOG environment variable takes precedence over the configured level.
 /// When RUST_LOG is not set, noisy dependency modules default to warn/info to
 /// keep debug output focused on PegaFlow components.
-pub fn init(config: LoggingConfig) {
+fn init(config: LoggingConfig) {
     INIT.call_once(|| {
         let LoggingConfig {
             level,

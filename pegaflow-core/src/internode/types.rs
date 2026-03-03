@@ -64,30 +64,30 @@ impl Default for ServiceDiscoveryConfig {
 
 impl ServiceDiscoveryConfig {
     /// Create a new config with the default PegaFlow label selector.
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self::default()
     }
 
     /// Enable service discovery.
-    pub fn enable(mut self) -> Self {
+    fn enable(mut self) -> Self {
         self.enabled = true;
         self
     }
 
     /// Set the gRPC port.
-    pub fn with_grpc_port(mut self, port: u16) -> Self {
+    fn with_grpc_port(mut self, port: u16) -> Self {
         self.grpc_port = port;
         self
     }
 
     /// Set the namespace to watch.
-    pub fn with_namespace(mut self, namespace: impl Into<String>) -> Self {
+    fn with_namespace(mut self, namespace: impl Into<String>) -> Self {
         self.namespace = Some(namespace.into());
         self
     }
 
     /// Add a label selector.
-    pub fn with_selector(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+    fn with_selector(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.selector.insert(key.into(), value.into());
         self
     }
@@ -114,22 +114,22 @@ pub struct PegaflowInstance {
 
 impl PegaflowInstance {
     /// Get the gRPC endpoint URL for this instance.
-    pub fn grpc_endpoint(&self) -> String {
+    pub(crate) fn grpc_endpoint(&self) -> String {
         format!("http://{}:{}", self.ip, self.grpc_port)
     }
 
     /// Get the gRPC address (ip:port) for this instance.
-    pub fn grpc_address(&self) -> String {
+    fn grpc_address(&self) -> String {
         format!("{}:{}", self.ip, self.grpc_port)
     }
 
     /// Check if this instance is healthy (ready and running).
-    pub fn is_healthy(&self) -> bool {
+    pub(crate) fn is_healthy(&self) -> bool {
         self.is_ready && self.status == "Running"
     }
 
     /// Check if a pod matches the given label selector.
-    pub(crate) fn matches_selector(pod: &Pod, selector: &HashMap<String, String>) -> bool {
+    fn matches_selector(pod: &Pod, selector: &HashMap<String, String>) -> bool {
         if selector.is_empty() {
             return false;
         }
@@ -141,7 +141,7 @@ impl PegaflowInstance {
     }
 
     /// Create a PegaflowInstance from a Kubernetes Pod.
-    pub fn from_pod(pod: &Pod, config: &ServiceDiscoveryConfig) -> Option<Self> {
+    pub(crate) fn from_pod(pod: &Pod, config: &ServiceDiscoveryConfig) -> Option<Self> {
         let name = pod.metadata.name.clone()?;
         let namespace = pod.metadata.namespace.clone().unwrap_or_default();
         let status = pod.status.clone()?;
@@ -187,7 +187,7 @@ impl PegaflowInstance {
     }
 
     /// Check if a pod should be included based on the selector.
-    pub fn should_include(pod: &Pod, config: &ServiceDiscoveryConfig) -> bool {
+    fn should_include(pod: &Pod, config: &ServiceDiscoveryConfig) -> bool {
         if config.selector.is_empty() {
             warn!("Service discovery selector is empty, no pods will be discovered");
             return false;

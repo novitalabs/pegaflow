@@ -142,7 +142,7 @@ impl LoadState {
     }
 
     /// Attach to an existing LoadState by shared memory name.
-    pub fn attach(shm_name: &str) -> Result<Self, LoadStateError> {
+    pub(crate) fn attach(shm_name: &str) -> Result<Self, LoadStateError> {
         let shmem = ShmemConf::new()
             .os_id(shm_name)
             .open()
@@ -165,14 +165,14 @@ impl LoadState {
     }
 
     /// Set state to SUCCESS (1). Called by server when all transfers complete.
-    pub fn set_completed(&self) {
+    pub(crate) fn set_completed(&self) {
         self.mem()
             .state
             .store(LOAD_STATE_SUCCESS, Ordering::Release);
     }
 
     /// Set state to ERROR (-1). Called by server on transfer failure.
-    pub fn set_error(&self) {
+    pub(crate) fn set_error(&self) {
         self.mem().state.store(LOAD_STATE_ERROR, Ordering::Release);
     }
 

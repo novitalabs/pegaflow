@@ -19,35 +19,35 @@ pub struct InstanceRegistry {
 
 impl InstanceRegistry {
     /// Create a new empty registry.
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             instances: DashMap::new(),
         }
     }
 
     /// Get the global instance registry.
-    pub fn global() -> &'static Self {
+    fn global() -> &'static Self {
         static REGISTRY: std::sync::OnceLock<InstanceRegistry> = std::sync::OnceLock::new();
         REGISTRY.get_or_init(InstanceRegistry::new)
     }
 
     /// Insert or update an instance.
-    pub fn upsert(&self, instance: PegaflowInstance) {
+    pub(crate) fn upsert(&self, instance: PegaflowInstance) {
         self.instances.insert(instance.name.clone(), instance);
     }
 
     /// Remove an instance by name.
-    pub fn remove(&self, name: &str) -> Option<PegaflowInstance> {
+    pub(crate) fn remove(&self, name: &str) -> Option<PegaflowInstance> {
         self.instances.remove(name).map(|(_, v)| v)
     }
 
     /// Get an instance by name.
-    pub fn get(&self, name: &str) -> Option<PegaflowInstance> {
+    pub(crate) fn get(&self, name: &str) -> Option<PegaflowInstance> {
         self.instances.get(name).map(|r| r.clone())
     }
 
     /// Get all healthy instances.
-    pub fn healthy_instances(&self) -> Vec<PegaflowInstance> {
+    pub(crate) fn healthy_instances(&self) -> Vec<PegaflowInstance> {
         self.instances
             .iter()
             .filter(|r| r.is_healthy())
@@ -56,22 +56,22 @@ impl InstanceRegistry {
     }
 
     /// Get all instances.
-    pub fn all_instances(&self) -> Vec<PegaflowInstance> {
+    fn all_instances(&self) -> Vec<PegaflowInstance> {
         self.instances.iter().map(|r| r.clone()).collect()
     }
 
     /// Get the number of registered instances.
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.instances.len()
     }
 
     /// Check if the registry is empty.
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.instances.is_empty()
     }
 
     /// Clear all instances.
-    pub fn clear(&self) {
+    fn clear(&self) {
         self.instances.clear();
     }
 }

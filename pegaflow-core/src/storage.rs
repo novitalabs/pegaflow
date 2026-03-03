@@ -224,7 +224,7 @@ impl StorageEngine {
     /// * `use_hugepages` - Use 2MB huge pages for allocation
     /// * `config` - Storage behavior configuration
     /// * `numa_nodes` - NUMA nodes for per-node pools (empty = single global pool)
-    pub fn new_with_config(
+    pub(crate) fn new_with_config(
         capacity_bytes: usize,
         use_hugepages: bool,
         config: impl Into<StorageConfig>,
@@ -342,7 +342,7 @@ impl StorageEngine {
     }
 
     /// Send block hashes to the metaserver insert worker (fire-and-forget).
-    pub(crate) fn send_metaserver_insert(&self, namespace: String, block_hashes: Vec<Vec<u8>>) {
+    fn send_metaserver_insert(&self, namespace: String, block_hashes: Vec<Vec<u8>>) {
         if let Some(tx) = self.metaserver_tx.lock().as_ref() {
             let _ = tx.send(crate::MetaserverInsertCmd {
                 namespace,
@@ -497,12 +497,12 @@ impl StorageEngine {
     }
 
     /// Returns true if SSD cache is enabled.
-    pub fn is_ssd_enabled(&self) -> bool {
+    pub(crate) fn is_ssd_enabled(&self) -> bool {
         self.ssd_state.is_some()
     }
 
     /// Returns true if NUMA-aware allocation is enabled.
-    pub fn is_numa_enabled(&self) -> bool {
+    pub(crate) fn is_numa_enabled(&self) -> bool {
         self.allocator.is_numa()
     }
 
@@ -516,7 +516,7 @@ impl StorageEngine {
     /// that NUMA node's pool. Otherwise uses the global pool.
     ///
     /// Returns `None` if the pool is exhausted after eviction attempts.
-    pub fn allocate(
+    pub(crate) fn allocate(
         &self,
         size: NonZeroU64,
         numa_node: Option<NumaNode>,
@@ -599,7 +599,7 @@ impl StorageEngine {
     /// Send a batch of sealed blocks to SSD writer for async persistence.
     /// Called after sealing a batch of blocks from seal_offload.
     /// Drops the batch if write queue is full (backpressure).
-    pub fn send_ssd_batch(&self, blocks: &[(BlockKey, Arc<SealedBlock>)]) {
+    fn send_ssd_batch(&self, blocks: &[(BlockKey, Arc<SealedBlock>)]) {
         let Some(ref ssd_state) = self.ssd_state else {
             return;
         };
@@ -638,7 +638,7 @@ impl StorageEngine {
         feature = "tracing",
         fastrace::trace(name = "storage.cache_lookup_many")
     )]
-    pub fn cache_lookup_many(
+    pub(crate) fn cache_lookup_many(
         &self,
         instance_id: &str,
         namespace: &str,
@@ -710,7 +710,7 @@ impl StorageEngine {
     /// Unpin blocks that were pinned during query.
     /// This decrements the ref_count and removes the entry when it reaches 0.
     /// Returns the number of blocks that were successfully unpinned.
-    pub fn unpin_blocks(
+    pub(crate) fn unpin_blocks(
         &self,
         instance_id: &str,
         namespace: &str,
@@ -843,7 +843,7 @@ impl StorageEngine {
     /// This is async because it waits for the worker's reply.
     ///
     /// Returns the number of cleaned blocks.
-    pub async fn gc_stale_inflight(&self, max_age: std::time::Duration) -> usize {
+    pub(crate) async fn gc_stale_inflight(&self, max_age: std::time::Duration) -> usize {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
             .insert_tx
@@ -861,7 +861,7 @@ impl StorageEngine {
     /// Pure memory-only prefix check. Returns `(hit, missing)` counts.
     ///
     /// No SSD prefetch, no pinning — suitable for lightweight query RPCs.
-    pub fn check_prefix_memory_only(&self, namespace: &str, hashes: &[Vec<u8>]) -> (usize, usize) {
+    pub(crate) fn check_prefix_memory_only(&self, namespace: &str, hashes: &[Vec<u8>]) -> (usize, usize) {
         let mut hit = 0usize;
 
         {
@@ -885,7 +885,7 @@ impl StorageEngine {
     ///
     /// Scans blocks in prefix order, checking cache, prefetching set, and SSD index.
     /// Pin hit blocks when returning Done (no loading in progress).
-    pub fn check_prefix_and_prefetch(
+    pub(crate) fn check_prefix_and_prefetch(
         &self,
         instance_id: &str,
         namespace: &str,
@@ -1065,7 +1065,7 @@ impl StorageEngine {
     }
 
     /// Called by prefetch worker when a block is loaded from SSD.
-    pub fn complete_prefetch(&self, key: BlockKey, block: Option<Arc<SealedBlock>>) {
+    fn complete_prefetch(&self, key: BlockKey, block: Option<Arc<SealedBlock>>) {
         let footprint_bytes = block.as_ref().map(|b| b.memory_footprint());
 
         let mut inner = self.inner.lock();
@@ -1090,7 +1090,7 @@ impl StorageEngine {
 
     /// Check if a logical SSD offset is still valid (not yet overwritten).
     /// Used by prefetch worker to validate reads.
-    pub(crate) fn is_ssd_offset_valid(&self, begin: u64) -> bool {
+    fn is_ssd_offset_valid(&self, begin: u64) -> bool {
         let inner = self.inner.lock();
         inner
             .ssd_ring

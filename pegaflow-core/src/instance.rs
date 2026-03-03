@@ -71,7 +71,7 @@ impl KVCacheRegistration {
     ///
     /// # Errors
     /// Returns a simple error message string if validation fails.
-    pub fn new(
+    pub(crate) fn new(
         data_ptr: u64,
         size_bytes: usize,
         num_blocks: usize,
@@ -132,7 +132,7 @@ impl KVCacheRegistration {
     ///
     /// Each segment (`bytes_per_block`) is rounded up to the next multiple of
     /// `alignment` so that every iovec in split writev is independently aligned.
-    pub fn with_ssd_padding(mut self, alignment: usize) -> Self {
+    pub(crate) fn with_ssd_padding(mut self, alignment: usize) -> Self {
         let padded = self.bytes_per_block.next_multiple_of(alignment);
         self.padded_bytes_per_block = padded;
         self.padded_block_size_bytes = padded * self.segments;
@@ -148,9 +148,6 @@ impl KVCacheRegistration {
 /// - Asynchronous worker pool for load/save operations
 /// - NUMA affinity for memory allocation optimization
 pub struct GpuContext {
-    /// CUDA device ID.
-    device_id: i32,
-
     /// Preferred NUMA node for this GPU (for memory allocation).
     preferred_numa: NumaNode,
 
@@ -174,7 +171,7 @@ impl GpuContext {
     /// # Errors
     /// Returns `EngineError::CudaInit` if CUDA context creation or worker
     /// pool initialization fails.
-    pub fn new(
+    fn new(
         cuda_ctx: Arc<CudaContext>,
         device_id: i32,
         numa_node: NumaNode,
@@ -182,7 +179,6 @@ impl GpuContext {
         let worker_pool = GpuWorkerPool::spawn(device_id, numa_node)?;
 
         Ok(Self {
-            device_id,
             preferred_numa: numa_node,
             kv_caches: Mutex::new(HashMap::new()),
             _cuda_ctx: cuda_ctx,
@@ -191,20 +187,15 @@ impl GpuContext {
     }
 
     /// Get the preferred NUMA node for this GPU.
-    pub fn preferred_numa(&self) -> NumaNode {
+    pub(crate) fn preferred_numa(&self) -> NumaNode {
         self.preferred_numa
-    }
-
-    /// Get the CUDA device ID.
-    pub fn device_id(&self) -> i32 {
-        self.device_id
     }
 
     /// Register a new layer's KV cache layout.
     ///
     /// # Errors
     /// Returns an error if the layer is already registered on this GPU.
-    pub fn register_new_layer(
+    fn register_new_layer(
         &self,
         layer_name: String,
         registration: KVCacheRegistration,
@@ -223,13 +214,13 @@ impl GpuContext {
     }
 
     /// Retrieve a layer's registration information.
-    pub fn get_registration(&self, layer_name: &str) -> Option<KVCacheRegistration> {
+    pub(crate) fn get_registration(&self, layer_name: &str) -> Option<KVCacheRegistration> {
         let registrations = self.kv_caches.lock();
         registrations.get(layer_name).cloned()
     }
 
     /// Access the worker pool for submitting GPU operations.
-    pub fn worker_pool(&self) -> &GpuWorkerPool {
+    pub(crate) fn worker_pool(&self) -> &GpuWorkerPool {
         &self.worker_pool
     }
 }
@@ -267,7 +258,7 @@ impl InstanceContext {
     ///
     /// # Errors
     /// Returns an error string if topology parameters are invalid.
-    pub fn new(
+    pub(crate) fn new(
         id: String,
         namespace: String,
         num_layers: usize,
@@ -292,30 +283,12 @@ impl InstanceContext {
         })
     }
 
-    /// Allocate a new numeric ID for a layer name.
-    ///
-    /// # Returns
-    /// - `Some(id)` if the layer was newly allocated
-    /// - `None` if the layer already exists
-    pub fn allocate_new_layer_id(&self, layer_name: &str) -> Option<usize> {
-        let mut metadata = self.metadata.lock();
-
-        if metadata.name_to_id.contains_key(layer_name) {
-            return None;
-        }
-
-        let id = metadata.names.len();
-        metadata.names.push(layer_name.to_string());
-        metadata.name_to_id.insert(layer_name.to_string(), id);
-        Some(id)
-    }
-
     /// Get existing layer ID or allocate a new one.
     ///
     /// This is idempotent: calling multiple times with the same layer name
     /// returns the same ID. Used for MLA where multiple TP ranks register
     /// the same layer name on different devices.
-    pub fn get_or_allocate_layer_id(&self, layer_name: &str) -> usize {
+    fn get_or_allocate_layer_id(&self, layer_name: &str) -> usize {
         let mut metadata = self.metadata.lock();
 
         if let Some(&id) = metadata.name_to_id.get(layer_name) {
@@ -331,7 +304,7 @@ impl InstanceContext {
     /// Look up the numeric ID for a layer name.
     ///
     /// Returns `None` if the layer has not been registered.
-    pub fn get_layer_id(&self, layer_name: &str) -> Option<usize> {
+    pub(crate) fn get_layer_id(&self, layer_name: &str) -> Option<usize> {
         let metadata = self.metadata.lock();
         metadata.name_to_id.get(layer_name).copied()
     }
@@ -339,7 +312,7 @@ impl InstanceContext {
     /// Calculate the total number of storage slots.
     ///
     /// Slots are organized as a flattened 2D array: `[layer][tp_rank]`.
-    pub fn total_slots(&self) -> usize {
+    pub(crate) fn total_slots(&self) -> usize {
         self.num_layers * self.tp_size
     }
 
@@ -350,7 +323,7 @@ impl InstanceContext {
     /// # Errors
     /// Returns `EngineError::InvalidArgument` if `layer_id` or `tp_rank`
     /// are out of bounds.
-    pub fn get_slot_index(&self, layer_id: usize, tp_rank: usize) -> Result<usize, EngineError> {
+    pub(crate) fn get_slot_index(&self, layer_id: usize, tp_rank: usize) -> Result<usize, EngineError> {
         if layer_id >= self.num_layers {
             return Err(EngineError::InvalidArgument(format!(
                 "layer_id {} out of range ({} layers)",
@@ -374,7 +347,7 @@ impl InstanceContext {
     /// # Errors
     /// Returns `EngineError::InvalidArgument` for negative device IDs,
     /// or `EngineError::CudaInit` if CUDA context creation fails.
-    pub fn ensure_gpu(
+    fn ensure_gpu(
         &self,
         device_id: i32,
         numa_node: NumaNode,
@@ -418,7 +391,7 @@ impl InstanceContext {
     }
 
     /// Get an existing GPU context without creating one.
-    pub fn get_gpu(&self, device_id: i32) -> Option<Arc<GpuContext>> {
+    pub(crate) fn get_gpu(&self, device_id: i32) -> Option<Arc<GpuContext>> {
         let metadata = self.metadata.lock();
         metadata.gpu_contexts.get(&device_id).cloned()
     }
@@ -438,7 +411,7 @@ impl InstanceContext {
     /// # Errors
     /// - `EngineError::InvalidArgument` if layer already registered on this GPU
     /// - `EngineError::CudaInit` if GPU context creation fails
-    pub fn register_new_gpu_layer(
+    pub(crate) fn register_new_gpu_layer(
         &self,
         device_id: i32,
         numa_node: NumaNode,
@@ -459,29 +432,19 @@ impl InstanceContext {
     }
 
     /// Access the instance namespace.
-    pub fn namespace(&self) -> &str {
+    pub(crate) fn namespace(&self) -> &str {
         &self.namespace
     }
 
-    /// Access the number of layers.
-    pub fn num_layers(&self) -> usize {
-        self.num_layers
-    }
-
-    /// Access the tensor parallelism size.
-    pub fn tp_size(&self) -> usize {
-        self.tp_size
-    }
-
     /// Access the world size.
-    pub fn world_size(&self) -> usize {
+    pub(crate) fn world_size(&self) -> usize {
         self.world_size
     }
 
     /// Verify that the topology matches expected values.
     ///
     /// Returns `Ok(())` if matches, or an error message describing the mismatch.
-    pub fn verify_topology(
+    pub(crate) fn verify_topology(
         &self,
         num_layers: usize,
         tp_size: usize,
