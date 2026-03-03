@@ -168,7 +168,6 @@ impl GpuWorkerPool {
             ))
         })?
     }
-
 }
 
 /// Load worker thread main loop

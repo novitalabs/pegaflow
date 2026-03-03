@@ -95,7 +95,11 @@ pub struct LayerBlock {
 }
 
 impl LayerBlock {
-    pub(crate) fn new_contiguous(ptr: *mut u8, size: usize, allocation: Arc<PinnedAllocation>) -> Self {
+    pub(crate) fn new_contiguous(
+        ptr: *mut u8,
+        size: usize,
+        allocation: Arc<PinnedAllocation>,
+    ) -> Self {
         let k_ptr =
             std::ptr::NonNull::new(ptr).expect("contiguous block K pointer must be non-null");
         Self {

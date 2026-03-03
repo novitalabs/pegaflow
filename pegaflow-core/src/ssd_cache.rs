@@ -427,11 +427,7 @@ impl SsdStorageHandle {
     }
 
     #[inline]
-    fn allocate(
-        &self,
-        size: u64,
-        numa_node: Option<NumaNode>,
-    ) -> Option<Arc<PinnedAllocation>> {
+    fn allocate(&self, size: u64, numa_node: Option<NumaNode>) -> Option<Arc<PinnedAllocation>> {
         (self.allocate)(size, numa_node)
     }
 

@@ -93,7 +93,10 @@ impl ScaledOffsetAllocator {
     }
 
     /// Allocate `size_bytes`, rounded up to the allocator's unit size.
-    pub(crate) fn allocate(&mut self, size_bytes: u64) -> Result<Option<Allocation>, AllocatorError> {
+    pub(crate) fn allocate(
+        &mut self,
+        size_bytes: u64,
+    ) -> Result<Option<Allocation>, AllocatorError> {
         if size_bytes == 0 {
             return Ok(None);
         }
@@ -151,8 +154,12 @@ mod tests {
 
     #[test]
     fn creates_allocator_with_scaled_capacity() {
-        let allocator =
-            ScaledOffsetAllocator::new_with_unit_size_and_max_allocs(10 * 1024 * 1024 * 1024, 64, 128 * 1024).unwrap();
+        let allocator = ScaledOffsetAllocator::new_with_unit_size_and_max_allocs(
+            10 * 1024 * 1024 * 1024,
+            64,
+            128 * 1024,
+        )
+        .unwrap();
         assert_eq!(allocator.unit_size.get(), 64);
         assert_eq!(
             allocator.total_units,
@@ -162,7 +169,8 @@ mod tests {
 
     #[test]
     fn allocate_rounds_up_to_unit_size() {
-        let mut allocator = ScaledOffsetAllocator::new_with_unit_size_and_max_allocs(1024, 64, 128 * 1024).unwrap();
+        let mut allocator =
+            ScaledOffsetAllocator::new_with_unit_size_and_max_allocs(1024, 64, 128 * 1024).unwrap();
         let allocation = allocator.allocate(1).unwrap().unwrap();
         assert_eq!(allocation.offset_bytes, 0);
         assert_eq!(allocation.size_bytes.get(), 64);
@@ -174,7 +182,8 @@ mod tests {
 
     #[test]
     fn reuse_after_free_merges_neighboring_regions() {
-        let mut allocator = ScaledOffsetAllocator::new_with_unit_size_and_max_allocs(256, 64, 128 * 1024).unwrap();
+        let mut allocator =
+            ScaledOffsetAllocator::new_with_unit_size_and_max_allocs(256, 64, 128 * 1024).unwrap();
         let a = allocator.allocate(64).unwrap().unwrap();
         let b = allocator.allocate(64).unwrap().unwrap();
 
@@ -188,7 +197,9 @@ mod tests {
 
     #[test]
     fn rejects_unreasonably_large_requests() {
-        let mut allocator = ScaledOffsetAllocator::new_with_unit_size_and_max_allocs(1024 * 1024, 1, 128 * 1024).unwrap();
+        let mut allocator =
+            ScaledOffsetAllocator::new_with_unit_size_and_max_allocs(1024 * 1024, 1, 128 * 1024)
+                .unwrap();
         let too_large = u64::from(u32::MAX) * 2;
         let err = allocator.allocate(too_large).unwrap_err();
         assert_eq!(
@@ -202,7 +213,8 @@ mod tests {
 
     #[test]
     fn rejects_invalid_unit_size() {
-        let err = ScaledOffsetAllocator::new_with_unit_size_and_max_allocs(1024, 0, 128 * 1024).unwrap_err();
+        let err = ScaledOffsetAllocator::new_with_unit_size_and_max_allocs(1024, 0, 128 * 1024)
+            .unwrap_err();
         assert_eq!(err, AllocatorError::InvalidUnitSize);
     }
 }

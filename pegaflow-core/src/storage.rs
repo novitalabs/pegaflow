@@ -861,7 +861,11 @@ impl StorageEngine {
     /// Pure memory-only prefix check. Returns `(hit, missing)` counts.
     ///
     /// No SSD prefetch, no pinning — suitable for lightweight query RPCs.
-    pub(crate) fn check_prefix_memory_only(&self, namespace: &str, hashes: &[Vec<u8>]) -> (usize, usize) {
+    pub(crate) fn check_prefix_memory_only(
+        &self,
+        namespace: &str,
+        hashes: &[Vec<u8>],
+    ) -> (usize, usize) {
         let mut hit = 0usize;
 
         {

@@ -323,7 +323,11 @@ impl InstanceContext {
     /// # Errors
     /// Returns `EngineError::InvalidArgument` if `layer_id` or `tp_rank`
     /// are out of bounds.
-    pub(crate) fn get_slot_index(&self, layer_id: usize, tp_rank: usize) -> Result<usize, EngineError> {
+    pub(crate) fn get_slot_index(
+        &self,
+        layer_id: usize,
+        tp_rank: usize,
+    ) -> Result<usize, EngineError> {
         if layer_id >= self.num_layers {
             return Err(EngineError::InvalidArgument(format!(
                 "layer_id {} out of range ({} layers)",
