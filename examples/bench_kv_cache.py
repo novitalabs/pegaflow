@@ -48,6 +48,7 @@ class VLLMServer:
         profile_output: Optional[Path] = None,
         torch_profile_output: Optional[Path] = None,
         max_model_len: Optional[int] = None,
+        cross_layer_blocks: bool = False,
     ):
         self.model = model
         self.port = port
@@ -56,6 +57,7 @@ class VLLMServer:
         self.use_lmcache = use_lmcache
         self.enable_prefix_caching = enable_prefix_caching
         self.max_model_len = max_model_len
+        self.cross_layer_blocks = cross_layer_blocks
         self.log_file = log_file
         self.health_endpoints = (
             list(health_endpoints)
@@ -82,6 +84,9 @@ class VLLMServer:
             env["LMCACHE_CHUNK_SIZE"] = "256"
             env["LMCACHE_LOCAL_CPU"] = "True"
             env["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "32.0"
+
+        if self.cross_layer_blocks:
+            env["PEGAFLOW_CROSS_LAYER_BLOCKS"] = "1"
 
         if self.torch_profile_output:
             env["VLLM_TORCH_PROFILER_DIR"] = str(self.torch_profile_output)
@@ -461,6 +466,13 @@ def main():
         default=None,
         help="Maximum model context length. If not specified, uses the model's default.",
     )
+    parser.add_argument(
+        "--cross-layer-blocks",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable cross-layer block layout for PegaFlow (default: enabled). "
+        "Use --no-cross-layer-blocks to disable.",
+    )
 
     args = parser.parse_args()
     if args.tp_size < 1:
@@ -493,6 +505,7 @@ def main():
     if args.with_lmcache:
         print(f"LMCache Port:    {args.lmcache_port}")
     print(f"PegaFlow Port:   {args.pegaflow_port}")
+    print(f"Cross-Layer:     {'Enabled' if args.cross_layer_blocks else 'Disabled'}")
     if args.max_model_len:
         print(f"Max Model Len:   {args.max_model_len}")
     print(f"Results Dir:     {run_dir}")
@@ -630,6 +643,7 @@ def main():
         profile_output=profile_path,
         torch_profile_output=torch_profile_base,
         max_model_len=args.max_model_len,
+        cross_layer_blocks=args.cross_layer_blocks,
     ):
         # Cold cache run
         if args.torch_profile:
