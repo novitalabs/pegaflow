@@ -268,6 +268,15 @@ class PegaKVConnector(KVConnectorBase_V1):
     def get_handshake_metadata(self):
         return None
 
+    @property
+    def prefer_cross_layer_blocks(self) -> bool:
+        return os.environ.get("PEGAFLOW_CROSS_LAYER_BLOCKS", "0") == "1"
+
+    def register_cross_layers_kv_cache(self, kv_cache, attn_backend):
+        if not self._worker:
+            return
+        self._worker.register_cross_layers_kv_cache(kv_cache, attn_backend)
+
     def set_host_xfer_buffer_ops(self, copy_operation):
         return
 
