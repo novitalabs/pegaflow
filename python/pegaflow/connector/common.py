@@ -170,12 +170,14 @@ def derive_namespace(
     tp_size: int,
     dcp_world_size: int = 1,
     pcp_world_size: int = 1,
+    cross_layer_blocks: bool = False,
 ) -> str:
     """
     Derive namespace for storage isolation.
 
-    Different DCP/PCP configurations produce incompatible KV data, so both
-    are included as factors to prevent cross-contamination.
+    Different DCP/PCP configurations or cross-layer vs per-layer layouts
+    produce incompatible KV data, so all are included as factors to prevent
+    cross-contamination.
     """
     model_config = vllm_config.model_config
     cache_config = vllm_config.cache_config
@@ -190,6 +192,7 @@ def derive_namespace(
         "cache_dtype": str(cache_config.cache_dtype),
         "dcp_world_size": dcp_world_size,
         "pcp_world_size": pcp_world_size,
+        "cross_layer_blocks": cross_layer_blocks,
     }
 
     factor_str = str(sorted(factors.items()))
