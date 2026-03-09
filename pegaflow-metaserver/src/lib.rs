@@ -1,3 +1,4 @@
+pub mod build_info;
 pub mod proto;
 pub mod service;
 pub mod store;
@@ -15,9 +16,13 @@ use tokio::signal;
 use tokio::sync::Notify;
 use tonic::transport::Server;
 
+use build_info::{BUILD_TIMESTAMP, GIT_SHA, LONG_VERSION, VERSION};
+
 #[derive(Parser, Debug)]
 #[command(
     name = "pegaflow-metaserver",
+    version = VERSION,
+    long_version = LONG_VERSION,
     about = "PegaFlow MetaServer - manages block hash keys across multi-node instances"
 )]
 pub struct Cli {
@@ -101,7 +106,10 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     init_logging(&cli.log_level);
 
-    info!("Starting PegaFlow MetaServer");
+    info!(
+        "Starting pegaflow-metaserver version={} git_sha={} built={}",
+        VERSION, GIT_SHA, BUILD_TIMESTAMP
+    );
     info!("Binding to address: {}", cli.addr);
     info!("Max cache capacity: {} MB", cli.max_capacity_mb);
     info!("Cache entry TTL: {} minutes", cli.ttl_minutes);

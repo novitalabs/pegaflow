@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 
 from pegaflow import EngineRpcClient, PegaFlowError, PyLoadState
+from pegaflow.compat import query_prefetch_with_fallback
 from pegaflow.ipc_wrapper import CudaIPCWrapper
 
 logger = logging.getLogger(__name__)
@@ -432,7 +433,12 @@ class PeagflowRadixCache(RadixCache):
 
                 # Query availability before issuing load
                 try:
-                    query_res = self.engine_client.query_prefetch(self.instance_id, block_hashes)
+                    query_res = query_prefetch_with_fallback(
+                        self.engine_client,
+                        self.instance_id,
+                        block_hashes,
+                        logger,
+                    )
                     logger.debug(f"[PeagflowRadixCache] query hash: {block_hashes[0]}")
                     hit_blocks = (
                         query_res.get("hit_blocks", 0) if isinstance(query_res, dict) else 0

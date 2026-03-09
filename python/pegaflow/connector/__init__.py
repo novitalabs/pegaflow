@@ -28,6 +28,7 @@ from pegaflow.connector.common import (
 from pegaflow.connector.scheduler import SchedulerConnector
 from pegaflow.connector.state_manager import ServiceStateManager
 from pegaflow.connector.worker import WorkerConnector
+from pegaflow import __version__ as PEGAFLOW_VERSION
 from pegaflow.pegaflow import EngineRpcClient
 
 
@@ -91,7 +92,12 @@ class PegaKVConnector(KVConnectorBase_V1):
         ) or vllm_config.kv_transfer_config.get_from_extra_config("pegaflow.port", 50055)
         self._engine_endpoint = f"{server_host}:{server_port}"
         engine_client = EngineRpcClient(self._engine_endpoint)
-        logger.info("[PegaKVConnector] Connected to engine server at %s", self._engine_endpoint)
+        logger.info(
+            "[PegaKVConnector] Connected to engine server at %s "
+            "(connector_version=%s)",
+            self._engine_endpoint,
+            PEGAFLOW_VERSION,
+        )
 
         self._state_manager = ServiceStateManager(engine_client)
 

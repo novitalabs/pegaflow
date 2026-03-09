@@ -5,6 +5,17 @@ This package provides:
 2. PegaKVConnector: vLLM KV connector for distributed inference
 """
 
+from importlib.metadata import PackageNotFoundError, version as package_version
+
+
+def _detect_version() -> str:
+    for dist_name in ("pegaflow-llm", "pegaflow"):
+        try:
+            return package_version(dist_name)
+        except PackageNotFoundError:
+            continue
+    return "unknown"
+
 # Import Rust-based PegaEngine from the compiled extension
 try:
     from .pegaflow import (
@@ -26,7 +37,7 @@ except ImportError:
         "pegaflow rust extension is not available, check pegaflow-xxx.so file exists"
     ) from None
 
-__version__ = "0.0.1"
+__version__ = _detect_version()
 __all__ = [
     "EngineRpcClient",
     "PegaEngine",

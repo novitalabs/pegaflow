@@ -1,3 +1,4 @@
+pub mod build_info;
 pub mod http_server;
 pub mod metric;
 pub mod proto;
@@ -35,6 +36,8 @@ use tokio::sync::Notify;
 use tonic::transport::Server;
 use utils::parse_memory_size;
 
+use build_info::{BUILD_TIMESTAMP, GIT_SHA, LONG_VERSION, VERSION};
+
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
 
@@ -44,7 +47,9 @@ static GLOBAL: Jemalloc = Jemalloc;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "pega-engine-server",
+    name = "pegaflow-server",
+    version = VERSION,
+    long_version = LONG_VERSION,
     about = "PegaEngine gRPC server with CUDA IPC registry"
 )]
 pub struct Cli {
@@ -346,6 +351,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     pegaflow_core::logging::init_stdout_colored(&cli.log_level);
     trace::init();
     pegaflow_core::set_trace_sample_rate(cli.trace_sample_rate);
+    info!(
+        "Starting pegaflow-server version={} git_sha={} built={}",
+        VERSION, GIT_SHA, BUILD_TIMESTAMP
+    );
 
     // Initialize CUDA in the main thread before starting Tokio runtime
     init_cuda_driver()?;

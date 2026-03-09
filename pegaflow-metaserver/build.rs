@@ -15,20 +15,9 @@ fn command_output(program: &str, args: &[&str]) -> Option<String> {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("cargo:rerun-if-env-changed=PYO3_PYTHON");
-    println!("cargo:rerun-if-env-changed=PYTHON_SYS_EXECUTABLE");
-    println!("cargo:rerun-if-env-changed=VIRTUAL_ENV");
+fn main() {
     println!("cargo:rerun-if-env-changed=PEGAFLOW_BUILD_GIT_SHA");
     println!("cargo:rerun-if-env-changed=PEGAFLOW_BUILD_TIMESTAMP");
-
-    let config = pyo3_build_config::get();
-    if let Some(lib_dir) = &config.lib_dir {
-        println!("cargo:rustc-link-search=native={lib_dir}");
-    }
-    if let Some(lib_name) = &config.lib_name {
-        println!("cargo:rustc-link-lib={lib_name}");
-    }
 
     let git_sha = std::env::var("PEGAFLOW_BUILD_GIT_SHA")
         .ok()
@@ -43,6 +32,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .or_else(|| command_output("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"]))
         .unwrap_or_else(|| "unknown".to_owned());
     println!("cargo:rustc-env=PEGAFLOW_BUILD_TIMESTAMP={build_timestamp}");
-
-    Ok(())
 }
