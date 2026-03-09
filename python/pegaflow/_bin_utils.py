@@ -13,23 +13,23 @@ def find_binary(name: str) -> str:
     """Locate a pegaflow binary by name.
 
     Search order:
-    1. Installed package directory (pip install from wheel)
-    2. Cargo target/release/ (dev mode / editable install)
-    3. Cargo target/debug/
+    1. Cargo target/release/ (dev mode — always freshest build)
+    2. Cargo target/debug/
+    3. Installed package directory (pip install from wheel)
     4. PATH fallback
     """
-    # 1. Wheel install: binary next to this module
-    path = _MODULE_DIR / name
-    if path.is_file():
-        return str(path)
-
-    # 2. Dev mode: cargo target/release/
+    # 1. Dev mode: cargo target/release/
     path = _REPO_ROOT / "target" / "release" / name
     if path.is_file():
         return str(path)
 
-    # 3. Dev mode: cargo target/debug/
+    # 2. Dev mode: cargo target/debug/
     path = _REPO_ROOT / "target" / "debug" / name
+    if path.is_file():
+        return str(path)
+
+    # 3. Wheel install: binary next to this module
+    path = _MODULE_DIR / name
     if path.is_file():
         return str(path)
 
