@@ -2174,7 +2174,7 @@ checksum = "19b17cddbe7ec3f8bc800887bab5e717348c95ea2ca0b1bf0837fb964dc67099"
 
 [[package]]
 name = "pegaflow-core"
-version = "0.1.0"
+version = "0.0.16"
 dependencies = [
  "ahash",
  "bytesize",
@@ -2206,7 +2206,7 @@ dependencies = [
 
 [[package]]
 name = "pegaflow-metaserver"
-version = "0.1.0"
+version = "0.0.16"
 dependencies = [
  "clap",
  "colored",
@@ -2225,7 +2225,7 @@ dependencies = [
 
 [[package]]
 name = "pegaflow-proto"
-version = "0.1.0"
+version = "0.0.16"
 dependencies = [
  "prost",
  "tonic",
@@ -2235,7 +2235,7 @@ dependencies = [
 
 [[package]]
 name = "pegaflow-py"
-version = "0.0.1"
+version = "0.0.16"
 dependencies = [
  "log",
  "logforth",
@@ -2251,7 +2251,7 @@ dependencies = [
 
 [[package]]
 name = "pegaflow-server"
-version = "0.1.0"
+version = "0.0.16"
 dependencies = [
  "axum",
  "clap",
@@ -2284,7 +2284,7 @@ dependencies = [
 
 [[package]]
 name = "pegaflow-transfer"
-version = "0.1.0"
+version = "0.0.16"
 dependencies = [
  "bincode",
  "bytes",

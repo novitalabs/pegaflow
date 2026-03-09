@@ -15,6 +15,7 @@ try:
         PegaFlowServiceError,
         PyLoadState,
         TransferEngine,
+        __version__ as _rust_version,
     )
 except ImportError:
     # Fallback for development when the Rust extension is not built
@@ -26,8 +27,10 @@ except ImportError:
         "pegaflow rust extension is not available, check pegaflow-xxx.so file exists"
     ) from None
 
-__version__ = "0.0.1"
+__version__ = _rust_version
+
 __all__ = [
+    "__version__",
     "EngineRpcClient",
     "PegaEngine",
     "PegaFlowBusinessError",

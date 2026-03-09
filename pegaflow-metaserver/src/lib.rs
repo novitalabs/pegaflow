@@ -18,6 +18,7 @@ use tonic::transport::Server;
 #[derive(Parser, Debug)]
 #[command(
     name = "pegaflow-metaserver",
+    version,
     about = "PegaFlow MetaServer - manages block hash keys across multi-node instances"
 )]
 pub struct Cli {

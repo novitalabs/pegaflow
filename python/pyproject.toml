@@ -103,5 +103,5 @@ profile = "black"
 [tool.commitizen]
 name = "cz_conventional_commits"
 version = "0.0.16"
-version_files = ["pyproject.toml:^version"]
+version_files = ["pyproject.toml:^version", "../Cargo.toml:^version"]
 tag_format = "v$version"

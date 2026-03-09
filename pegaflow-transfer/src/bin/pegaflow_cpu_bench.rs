@@ -22,6 +22,7 @@ use pegaflow_transfer::{MooncakeTransferEngine, init_logging};
 #[derive(Parser)]
 #[command(
     name = "pegaflow_cpu_bench",
+    version,
     about = "RDMA CPU memory block-task latency benchmark"
 )]
 struct Cli {

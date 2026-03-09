@@ -368,6 +368,7 @@ async fn completions(state: State<RouterState>, headers: HeaderMap, body: Json<V
 
 #[derive(Parser)]
 #[command(name = "pegaflow-router")]
+#[command(version)]
 #[command(about = "PegaFlow P/D Disaggregation Router")]
 struct Args {
     /// Host to bind

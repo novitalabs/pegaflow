@@ -45,6 +45,7 @@ static GLOBAL: Jemalloc = Jemalloc;
 #[derive(Parser, Debug)]
 #[command(
     name = "pega-engine-server",
+    version,
     about = "PegaEngine gRPC server with CUDA IPC registry"
 )]
 pub struct Cli {

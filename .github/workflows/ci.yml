@@ -34,6 +34,56 @@ jobs:
       - name: Check last commit message
         run: cz check --rev-range HEAD~1..HEAD
 
+  version-consistency-check:
+    name: version consistency check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check Rust and Python package versions stay in sync
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import re
+
+          repo = pathlib.Path.cwd()
+          cargo_toml = (repo / "Cargo.toml").read_text(encoding="utf-8")
+          pyproject_toml = (repo / "python" / "pyproject.toml").read_text(encoding="utf-8")
+
+          def find_section_version(text: str, section: str) -> str:
+              match = re.search(
+                  rf"(?ms)^\[{re.escape(section)}\]\n(.*?)(?:^\[|\Z)",
+                  text,
+              )
+              if match is None:
+                  raise SystemExit(f"missing section [{section}]")
+
+              version_match = re.search(
+                  r'^version = "([^"]+)"$',
+                  match.group(1),
+                  re.MULTILINE,
+              )
+              if version_match is None:
+                  raise SystemExit(f"missing version in [{section}]")
+              return version_match.group(1)
+
+          rust_version = find_section_version(cargo_toml, "workspace.package")
+          python_version = find_section_version(pyproject_toml, "project")
+          commitizen_version = find_section_version(pyproject_toml, "tool.commitizen")
+
+          if rust_version != python_version or python_version != commitizen_version:
+              raise SystemExit(
+                  "version mismatch: "
+                  f"Cargo.toml={rust_version}, "
+                  f"python/pyproject.toml project={python_version}, "
+                  f"tool.commitizen={commitizen_version}"
+              )
+
+          print(f"version check passed: {rust_version}")
+          PY
+
   typos-check:
     name: typos check
     runs-on: ubuntu-latest
