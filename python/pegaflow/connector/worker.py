@@ -26,6 +26,9 @@ if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
 
 
+_CROSS_LAYER_KEY = "ALL_LAYERS"
+
+
 @dataclass
 class SaveTask:
     layer_name: str
@@ -63,6 +66,9 @@ class WorkerConnector:
         self._registered_layers: list[str] = []
         self._layer_name_to_id: dict[str, int] = {}
         self._torch_device: torch.device | None = None
+
+        self._cross_layer_mode = False
+        self._cross_layer_pending_save: SaveTask | None = None
 
         self._finished_requests: set[str] = set()
 
@@ -157,6 +163,10 @@ class WorkerConnector:
             layout,
             self._ctx.instance_id,
         )
+
+    def register_cross_layers_kv_cache(self, kv_cache, attn_backend) -> None:
+        self._cross_layer_mode = True
+        self.register_kv_caches({_CROSS_LAYER_KEY: kv_cache})
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str] | None, set[str] | None]:
         finished_sending: set[str] | None = None
@@ -263,10 +273,13 @@ class WorkerConnector:
         if not all_block_ids:
             return
 
-        target_layers: list[str] = []
-        for layer_name, layer in forward_context.no_compile_layers.items():
-            if hasattr(layer, "kv_cache"):
-                target_layers.append(layer_name)
+        if self._cross_layer_mode:
+            target_layers = [_CROSS_LAYER_KEY]
+        else:
+            target_layers = []
+            for layer_name, layer in forward_context.no_compile_layers.items():
+                if hasattr(layer, "kv_cache"):
+                    target_layers.append(layer_name)
 
         if not target_layers:
             return
@@ -321,6 +334,20 @@ class WorkerConnector:
         attn_metadata: "AttentionMetadata",
         **kwargs: Any,
     ) -> None:
+        if self._cross_layer_mode:
+            # Defer actual save to wait_for_save when all layers are computed.
+            # Only capture metadata on the first layer call per forward pass.
+            if self._cross_layer_pending_save is None:
+                request_ids = list(metadata.save_intents.keys())
+                if request_ids:
+                    self._cross_layer_pending_save = SaveTask(
+                        layer_name=_CROSS_LAYER_KEY,
+                        attn_metadata=attn_metadata,
+                        metadata=metadata,
+                        request_ids=request_ids,
+                    )
+            return
+
         request_ids = list(metadata.save_intents.keys())
         if not request_ids:
             return
@@ -342,6 +369,19 @@ class WorkerConnector:
         )
 
     def wait_for_save(self) -> None:
+        if self._cross_layer_mode:
+            task = self._cross_layer_pending_save
+            self._cross_layer_pending_save = None
+            if task:
+                with self._save_completion_lock:
+                    for req_id in task.request_ids:
+                        if req_id not in self._req_pending_layers:
+                            self._req_pending_layers[req_id] = 1
+                            self._save_completion_events[req_id] = threading.Event()
+                self._save_queue.put(task)
+            self._current_save_intents = set()
+            return
+
         skipped_requests: set[str] = set()
 
         with self._save_completion_lock:
