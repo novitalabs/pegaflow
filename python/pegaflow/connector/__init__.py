@@ -58,7 +58,11 @@ class PegaKVConnector(KVConnectorBase_V1):
                 dcp_world_size,
             )
 
-        namespace = derive_namespace(vllm_config, effective_tp_size, dcp_world_size, pcp_world_size)
+        cross_layer_blocks = os.environ.get("PEGAFLOW_CROSS_LAYER_BLOCKS", "1") == "1"
+        namespace = derive_namespace(
+            vllm_config, effective_tp_size, dcp_world_size, pcp_world_size,
+            cross_layer_blocks=cross_layer_blocks,
+        )
         num_layers = getattr(vllm_config.model_config.hf_text_config, "num_hidden_layers", 0)
         block_size = vllm_config.cache_config.block_size
 
@@ -270,7 +274,7 @@ class PegaKVConnector(KVConnectorBase_V1):
 
     @property
     def prefer_cross_layer_blocks(self) -> bool:
-        return os.environ.get("PEGAFLOW_CROSS_LAYER_BLOCKS", "0") == "1"
+        return os.environ.get("PEGAFLOW_CROSS_LAYER_BLOCKS", "1") == "1"
 
     def register_cross_layers_kv_cache(self, kv_cache, attn_backend):
         if not self._worker:
