@@ -15,6 +15,8 @@ try:
         PegaFlowServiceError,
         PyLoadState,
         TransferEngine,
+    )
+    from .pegaflow import (
         __version__ as _rust_version,
     )
 except ImportError:

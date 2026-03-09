@@ -345,6 +345,7 @@ fn init_metrics(
 pub fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     pegaflow_core::logging::init_stdout_colored(&cli.log_level);
+    info!("Starting pega-engine-server v{}", env!("CARGO_PKG_VERSION"));
     trace::init();
     pegaflow_core::set_trace_sample_rate(cli.trace_sample_rate);
 

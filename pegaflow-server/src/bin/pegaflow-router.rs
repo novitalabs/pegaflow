@@ -391,6 +391,7 @@ struct Args {
 #[tokio::main]
 async fn main() {
     pegaflow_core::logging::init_stderr("info");
+    info!("Starting pegaflow-router v{}", env!("CARGO_PKG_VERSION"));
 
     let args = Args::parse();
 
