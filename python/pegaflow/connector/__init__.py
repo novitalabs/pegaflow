@@ -34,8 +34,8 @@ from pegaflow.pegaflow import EngineRpcClient
 class PegaKVConnector(KVConnectorBase_V1):
     """v1 KV connector for PegaFlow with separated scheduler/worker logic."""
 
-    def __init__(self, vllm_config, role: KVConnectorRole):
-        super().__init__(vllm_config, role)
+    def __init__(self, vllm_config, role: KVConnectorRole, kv_cache_config=None):
+        super().__init__(vllm_config, role, kv_cache_config)
 
         instance_id = resolve_instance_id(vllm_config)
         tp_size = vllm_config.parallel_config.tensor_parallel_size
