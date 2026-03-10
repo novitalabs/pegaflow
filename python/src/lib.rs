@@ -665,6 +665,7 @@ impl PyLoadState {
 #[pymodule]
 fn pegaflow(m: &Bound<'_, PyModule>) -> PyResult<()> {
     pegaflow_core::logging::init_stderr("info,pegaflow_core=info");
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<PegaEngine>()?;
     m.add_class::<EngineRpcClient>()?;
     m.add_class::<PyLoadState>()?;

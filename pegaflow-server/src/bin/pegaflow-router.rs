@@ -368,6 +368,7 @@ async fn completions(state: State<RouterState>, headers: HeaderMap, body: Json<V
 
 #[derive(Parser)]
 #[command(name = "pegaflow-router")]
+#[command(version)]
 #[command(about = "PegaFlow P/D Disaggregation Router")]
 struct Args {
     /// Host to bind
@@ -390,6 +391,7 @@ struct Args {
 #[tokio::main]
 async fn main() {
     pegaflow_core::logging::init_stderr("info");
+    info!("Starting pegaflow-router v{}", env!("CARGO_PKG_VERSION"));
 
     let args = Args::parse();
 

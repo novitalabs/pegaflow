@@ -6,6 +6,8 @@ for distributed LLM inference with vLLM and SGLang.
 
 from typing import Any
 
+__version__: str
+
 # Custom exceptions for error classification
 
 class PegaFlowError(Exception):

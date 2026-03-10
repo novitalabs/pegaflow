@@ -18,6 +18,7 @@ use tonic::transport::Server;
 #[derive(Parser, Debug)]
 #[command(
     name = "pegaflow-metaserver",
+    version,
     about = "PegaFlow MetaServer - manages block hash keys across multi-node instances"
 )]
 pub struct Cli {
@@ -100,6 +101,10 @@ async fn shutdown_signal(notify: Arc<Notify>) {
 pub async fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     init_logging(&cli.log_level);
+    info!(
+        "Starting pegaflow-metaserver v{}",
+        env!("CARGO_PKG_VERSION")
+    );
 
     info!("Starting PegaFlow MetaServer");
     info!("Binding to address: {}", cli.addr);
