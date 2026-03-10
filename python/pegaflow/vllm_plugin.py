@@ -11,17 +11,17 @@ The sole purpose is to register ``PegaKVConnector`` in the
 looked up — so this module adds negligible overhead.
 """
 
+import contextlib
+
 
 def register() -> None:
     from vllm.distributed.kv_transfer.kv_connector.factory import (
         KVConnectorFactory,
     )
 
-    try:
+    with contextlib.suppress(ValueError):
         KVConnectorFactory.register_connector(
             "PegaKVConnector",
             "pegaflow.connector",
             "PegaKVConnector",
         )
-    except ValueError:
-        pass  # Already registered (e.g. module was imported before plugin ran)
