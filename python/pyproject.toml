@@ -49,6 +49,9 @@ dev = [
 pegaflow-server = "pegaflow._server:main"
 pegaflow-metaserver = "pegaflow._metaserver:main"
 
+[project.entry-points."vllm.general_plugins"]
+pegaflow = "pegaflow.vllm_plugin:register"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
