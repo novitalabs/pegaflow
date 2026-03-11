@@ -408,7 +408,11 @@ impl Engine for GrpcEngineService {
             // SSD prefetch-aware query
             let status = self
                 .engine
-                .count_prefix_hit_blocks_with_prefetch(&req.instance_id, &req.block_hashes)
+                .count_prefix_hit_blocks_with_prefetch(
+                    &req.instance_id,
+                    &req.req_id,
+                    &req.block_hashes,
+                )
                 .map_err(Self::map_engine_error)?;
 
             let (prefetch_state, hit_blocks, loading_blocks, missing_blocks) = match status {
