@@ -6,20 +6,19 @@
 // Key invariant: Sealing is a one-way gate. Once sealed, a block is immutable.
 //
 // Architecture:
-// - Mutex<StorageInner>: prefetching, cache, pinned state
+// - Mutex<StorageInner>: pending_from_backing, cache, pinned state
 // - Insert Worker (dedicated thread): owns inflight HashMap, receives
 //   RawSaveBatch messages via channel, builds LayerBlocks and seals completed blocks
-// - RwLock<SsdRingBuffer>: SSD head/tail/index (shared by writer and readers)
 // - Allocator: PinnedMemoryPool for pinned memory allocation
-// - Prefetch worker: background io_uring reads from SSD
-//
-// Eviction only targets the cache; inflight blocks are never evicted.
+// - Backing store (optional): secondary SSD tier, owned by Arc<dyn BackingStore>
 // ============================================================================
 use bytesize::ByteSize;
+use dashmap::DashMap;
 use log::{debug, error, info, warn};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Weak};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -29,16 +28,13 @@ use pegaflow_proto::proto::engine::InsertBlockHashesRequest;
 use pegaflow_proto::proto::engine::meta_server_client::MetaServerClient;
 use tonic::transport::Channel;
 
+use crate::backing::{BackingStore, DEFAULT_MAX_PREFETCH_BLOCKS, PrefetchResult, SsdCacheConfig};
 use crate::block::{BlockKey, InflightBlock, PrefetchStatus, SealedBlock, SlotInsertResult};
 use crate::cache::{CacheInsertOutcome, TinyLfuCache};
 use crate::metrics::core_metrics;
 use crate::numa::NumaNode;
 use crate::offload::InsertEntries;
 use crate::pinned_pool::{PinnedAllocation, PinnedAllocator};
-use crate::ssd_cache::{
-    PrefetchBatch, PrefetchRequest, SsdCacheConfig, SsdIndexEntry, SsdRingBuffer, SsdStorageHandle,
-    SsdWriteBatch, ssd_prefetch_loop, ssd_writer_loop,
-};
 
 // ============================================================================
 // Constants
@@ -47,12 +43,26 @@ use crate::ssd_cache::{
 /// Number of LRU blocks to evict per iteration when reclaiming memory
 const RECLAIM_BATCH_SIZE: usize = 64;
 
-/// SSD I/O alignment requirement (O_DIRECT requires 512-byte aligned I/O)
-pub const SSD_ALIGNMENT: usize = 512;
+// ============================================================================
+// Per-request prefetch state machine
+// ============================================================================
 
-/// Max blocks allowed in prefetching state (backpressure for SSD prefetch)
-/// ~15GB assuming 10MB per block
-const MAX_PREFETCH_BLOCKS: usize = 1500;
+/// Per-request prefetch tracking.
+///
+/// ```text
+///   query(req_id)        all pending done         consumed / cancelled
+///   ┌───────┐  backing  ┌─────────┐  re-scan  ┌──────┐
+///   │ (new) │ ────────→ │ Loading │ ────────→ │ Done │ → remove from map
+///   └───────┘           └─────────┘           └──────┘
+///       │ all in cache       ↑ try_recv: fires when coordinator task completes
+///       └──→ pin & return    └──────────────────────────
+/// ```
+struct PrefetchEntry {
+    /// Delivers batch of successfully-read blocks when all backing I/O finishes.
+    blocks_rx: oneshot::Receiver<PrefetchResult>,
+    /// Number of blocks submitted to the backing store (for backpressure accounting).
+    loading_count: usize,
+}
 
 // ============================================================================
 // Metrics helpers (keep insert/evict logic together for easy audit)
@@ -123,7 +133,7 @@ impl Default for StorageConfig {
         Self {
             enable_lfu_admission: true,
             hint_value_size_bytes: None,
-            max_prefetch_blocks: MAX_PREFETCH_BLOCKS,
+            max_prefetch_blocks: DEFAULT_MAX_PREFETCH_BLOCKS,
             ssd_cache_config: None,
             enable_numa_affinity: true,
         }
@@ -142,25 +152,6 @@ impl Default for StorageConfig {
 /// Notification sent when a block is sealed (for SSD offload, etc.)
 pub type SealNotification = (BlockKey, Weak<SealedBlock>);
 
-/// SSD cache runtime state (file + io_uring + channels)
-struct SsdState {
-    config: SsdCacheConfig,
-    /// RAII guard: keeps the file descriptor alive for io_uring operations.
-    /// UringIoEngine only holds the raw fd, so dropping this would invalidate all IO.
-    _file: Arc<std::fs::File>,
-    io: Arc<crate::uring::UringIoEngine>,
-    /// Channel to SSD writer task (bounded to limit queue depth)
-    writer_tx: tokio::sync::mpsc::Sender<SsdWriteBatch>,
-    /// Channel to prefetch worker (bounded to limit queue depth)
-    prefetch_tx: tokio::sync::mpsc::Sender<PrefetchBatch>,
-}
-
-/// Receivers for SSD workers (separated so they can be moved to workers)
-struct SsdReceivers {
-    writer_rx: tokio::sync::mpsc::Receiver<SsdWriteBatch>,
-    prefetch_rx: tokio::sync::mpsc::Receiver<PrefetchBatch>,
-}
-
 // ============================================================================
 // Insert Worker (actor model for inflight block management)
 // ============================================================================
@@ -178,8 +169,6 @@ enum InsertWorkerCommand {
 
 /// Inner state protected by a single mutex (no longer contains inflight)
 struct StorageInner {
-    /// Blocks currently being prefetched from SSD
-    prefetching: HashSet<BlockKey>,
     /// Read path: sealed blocks available for lookup (TinyLFU admission + LRU eviction)
     cache: TinyLfuCache<BlockKey, Arc<SealedBlock>>,
     /// Pinned blocks between query and load (prevents eviction race)
@@ -188,16 +177,23 @@ struct StorageInner {
     /// Aggregated pinned_for_load refcounts by block key (for attribution metrics).
     /// Value: (footprint_bytes, total_refcount)
     pinned_for_load_by_key: HashMap<BlockKey, (u64, usize)>,
-    /// SSD ring buffer: unified head/tail/index (managed via SsdStorageHandle callbacks)
-    ssd_ring: Option<SsdRingBuffer>,
 }
 
 pub struct StorageEngine {
     /// Unified pinned memory allocator (handles both global and NUMA modes)
     allocator: Arc<PinnedAllocator>,
 
-    /// Mutable state under one lock (cache, prefetching, pinned_for_load)
+    /// Mutable state under one lock (cache, pending_from_backing, pinned_for_load)
     inner: Mutex<StorageInner>,
+
+    /// In-flight SSD prefetch receivers, keyed by req_id.
+    /// Populated on first query; polled on retries until the batch arrives.
+    ///
+    /// TODO: entries are only cleaned up when the same req_id is polled again.
+    /// If a client abandons a request (network drop, cancellation), the entry
+    /// and its `loading_count` contribution to `inflight_prefetch` leak.
+    /// Consider a periodic sweep or RAII guard if this proves problematic.
+    active_prefetches: DashMap<String, PrefetchEntry>,
 
     /// Channel to the insert worker thread (owns inflight HashMap)
     insert_tx: Sender<InsertWorkerCommand>,
@@ -205,11 +201,14 @@ pub struct StorageEngine {
     /// Channel to notify consumers when blocks are sealed (for SSD offload)
     seal_notify_tx: Option<UnboundedSender<SealNotification>>,
 
-    /// SSD cache file handle and io_uring engine (if configured)
-    ssd_state: Option<SsdState>,
+    /// Optional secondary backing store (SSD tier).
+    backing: Option<Arc<dyn BackingStore>>,
 
-    /// Max blocks allowed in prefetching state (backpressure for SSD prefetch)
+    /// Max blocks allowed in prefetching state (backpressure for backing reads)
     max_prefetch_blocks: usize,
+
+    /// Count of blocks currently being read from backing store (for backpressure).
+    inflight_prefetch: AtomicUsize,
 
     /// Channel to the metaserver insert worker (set by `PegaEngine::set_metaserver_client`)
     metaserver_tx: Mutex<Option<UnboundedSender<crate::MetaserverInsertCmd>>>,
@@ -233,6 +232,8 @@ impl StorageEngine {
         let config = config.into();
         let value_size_hint = config.hint_value_size_bytes.filter(|size| *size > 0);
         let unit_hint = value_size_hint.and_then(|size| NonZeroU64::new(size as u64));
+        let max_prefetch_blocks = config.max_prefetch_blocks;
+        let ssd_cache_config = config.ssd_cache_config;
 
         // Create unified allocator based on NUMA configuration
         let allocator = if !numa_nodes.is_empty() {
@@ -261,30 +262,10 @@ impl StorageEngine {
             value_size_hint,
         );
 
-        // Initialize SSD cache if configured (file + io_uring + channels)
-        let (ssd_state, ssd_receivers, ssd_ring) = match config.ssd_cache_config {
-            Some(ssd_cfg) => {
-                let capacity = ssd_cfg.capacity_bytes;
-                match Self::init_ssd_state(ssd_cfg) {
-                    Ok((state, receivers)) => {
-                        let ring = SsdRingBuffer::new(capacity);
-                        (Some(state), Some(receivers), Some(ring))
-                    }
-                    Err(e) => {
-                        error!("Failed to initialize SSD cache: {}", e);
-                        (None, None, None)
-                    }
-                }
-            }
-            None => (None, None, None),
-        };
-
         let inner = Mutex::new(StorageInner {
-            prefetching: HashSet::new(),
             cache,
             pinned_for_load: HashMap::new(),
             pinned_for_load_by_key: HashMap::new(),
-            ssd_ring,
         });
 
         // Create unbounded channel for seal notifications
@@ -293,14 +274,32 @@ impl StorageEngine {
         // Create insert worker channel (std::sync::mpsc — worker is a dedicated OS thread)
         let (insert_tx, insert_rx) = std::sync::mpsc::channel();
 
-        let engine = Arc::new(Self {
-            allocator,
-            inner,
-            insert_tx,
-            seal_notify_tx: Some(seal_notify_tx),
-            ssd_state,
-            max_prefetch_blocks: config.max_prefetch_blocks,
-            metaserver_tx: Mutex::new(None),
+        let is_numa = allocator.is_numa();
+        let engine = Arc::new_cyclic(move |weak_engine: &Weak<Self>| {
+            let backing = ssd_cache_config.and_then(|ssd_cfg| {
+                let weak_engine = weak_engine.clone();
+                crate::backing::new_ssd(
+                    ssd_cfg,
+                    move |size, numa_node| {
+                        weak_engine
+                            .upgrade()
+                            .and_then(|engine| engine.allocate(NonZeroU64::new(size)?, numa_node))
+                    },
+                    is_numa,
+                )
+            });
+
+            Self {
+                allocator,
+                inner,
+                active_prefetches: DashMap::new(),
+                insert_tx,
+                seal_notify_tx: Some(seal_notify_tx),
+                backing,
+                max_prefetch_blocks,
+                inflight_prefetch: AtomicUsize::new(0),
+                metaserver_tx: Mutex::new(None),
+            }
         });
 
         // Spawn insert worker on a dedicated OS thread (CPU-bound work)
@@ -310,15 +309,6 @@ impl StorageEngine {
                 .name("pegaflow-insert".into())
                 .spawn(move || insert_worker_loop(insert_rx, weak_engine))
                 .expect("failed to spawn insert worker thread");
-        }
-
-        // Spawn SSD workers after Arc is created (they need callbacks into storage)
-        if let Some(receivers) = ssd_receivers {
-            if let Some(handle) = Self::make_ssd_handle(&engine) {
-                Self::spawn_ssd_workers(&engine, handle, receivers);
-            } else {
-                warn!("SSD cache configured but ssd_state missing; skipping workers");
-            }
         }
 
         (engine, seal_notify_rx)
@@ -351,154 +341,9 @@ impl StorageEngine {
         }
     }
 
-    /// Initialize SSD cache state (file + io_uring + channels, no workers yet)
-    fn init_ssd_state(config: SsdCacheConfig) -> std::io::Result<(SsdState, SsdReceivers)> {
-        use std::fs::{self, OpenOptions};
-        use std::os::unix::fs::OpenOptionsExt;
-        use std::os::unix::io::AsRawFd;
-
-        if let Some(parent) = config.cache_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_DIRECT)
-            .open(&config.cache_path)?;
-        file.set_len(config.capacity_bytes)?;
-
-        let io = Arc::new(crate::uring::UringIoEngine::new(
-            file.as_raw_fd(),
-            crate::uring::UringConfig::default(),
-        )?);
-
-        let (writer_tx, writer_rx) = tokio::sync::mpsc::channel(config.write_queue_depth);
-        let (prefetch_tx, prefetch_rx) = tokio::sync::mpsc::channel(config.prefetch_queue_depth);
-
-        info!(
-            "SSD cache initialized at {} (capacity {})",
-            config.cache_path.display(),
-            ByteSize(config.capacity_bytes)
-        );
-
-        let state = SsdState {
-            config,
-            _file: Arc::new(file),
-            io,
-            writer_tx,
-            prefetch_tx,
-        };
-
-        let receivers = SsdReceivers {
-            writer_rx,
-            prefetch_rx,
-        };
-
-        Ok((state, receivers))
-    }
-
-    /// Spawn SSD writer thread and prefetch worker (requires Arc<Self>)
-    fn spawn_ssd_workers(
-        engine: &Arc<Self>,
-        handle: Arc<SsdStorageHandle>,
-        receivers: SsdReceivers,
-    ) {
-        let SsdReceivers {
-            writer_rx,
-            prefetch_rx,
-        } = receivers;
-
-        // Get references to SSD state
-        let ssd_state = engine.ssd_state.as_ref().expect("ssd_state must exist");
-        let io = Arc::clone(&ssd_state.io);
-        let capacity = ssd_state.config.capacity_bytes;
-        let write_inflight = ssd_state.config.write_inflight;
-        let prefetch_inflight = ssd_state.config.prefetch_inflight;
-
-        // Spawn writer task
-        let writer_handle = Arc::clone(&handle);
-        let writer_io = Arc::clone(&io);
-        tokio::spawn(async move {
-            ssd_writer_loop(writer_handle, writer_rx, writer_io, write_inflight).await;
-        });
-
-        // Spawn prefetch task
-        let prefetch_handle = Arc::clone(&handle);
-        let prefetch_io = Arc::clone(&ssd_state.io);
-        let prefetch_capacity = capacity;
-        tokio::spawn(async move {
-            ssd_prefetch_loop(
-                prefetch_handle,
-                prefetch_rx,
-                prefetch_io,
-                prefetch_capacity,
-                prefetch_inflight,
-            )
-            .await;
-        });
-
-        debug!("SSD workers spawned");
-    }
-
-    /// Build the SSD storage handle capturing a weak pointer to StorageEngine.
-    /// Used by both writer (prepare, commit) and prefetch worker.
-    fn make_ssd_handle(engine: &Arc<Self>) -> Option<Arc<SsdStorageHandle>> {
-        engine.ssd_state.as_ref()?;
-
-        let weak_complete = Arc::downgrade(engine);
-        let weak_valid = Arc::downgrade(engine);
-        let weak_alloc = Arc::downgrade(engine);
-        let weak_prepare = Arc::downgrade(engine);
-        let weak_commit = Arc::downgrade(engine);
-
-        Some(Arc::new(SsdStorageHandle::new(
-            move |key, block| {
-                if let Some(engine) = weak_complete.upgrade() {
-                    engine.complete_prefetch(key, block);
-                }
-            },
-            move |begin| {
-                weak_valid
-                    .upgrade()
-                    .map(|engine| engine.is_ssd_offset_valid(begin))
-                    .unwrap_or(false)
-            },
-            move |size, numa_node| {
-                weak_alloc
-                    .upgrade()
-                    .and_then(|engine| engine.allocate(NonZeroU64::new(size)?, numa_node))
-            },
-            move |candidates| {
-                weak_prepare
-                    .upgrade()
-                    .map(|engine| {
-                        let mut inner = engine.inner.lock();
-                        inner
-                            .ssd_ring
-                            .as_mut()
-                            .map(|ring| ring.prepare_batch(candidates))
-                            .unwrap_or_else(crate::ssd_cache::PreparedBatch::empty)
-                    })
-                    .unwrap_or_else(crate::ssd_cache::PreparedBatch::empty)
-            },
-            move |key, success| {
-                if let Some(engine) = weak_commit.upgrade() {
-                    let mut inner = engine.inner.lock();
-                    if let Some(ring) = inner.ssd_ring.as_mut() {
-                        ring.commit(key, success);
-                    }
-                }
-            },
-            engine.is_numa_enabled(),
-        )))
-    }
-
-    /// Returns true if SSD cache is enabled.
+    /// Returns true if a secondary backing store (SSD) is enabled.
     pub(crate) fn is_ssd_enabled(&self) -> bool {
-        self.ssd_state.is_some()
+        self.backing.is_some()
     }
 
     /// Returns true if NUMA-aware allocation is enabled.
@@ -596,36 +441,22 @@ impl StorageEngine {
         });
     }
 
-    /// Send a batch of sealed blocks to SSD writer for async persistence.
-    /// Called after sealing a batch of blocks from seal_offload.
-    /// Drops the batch if write queue is full (backpressure).
+    /// Forward sealed blocks to the backing store for async persistence.
+    ///
+    /// Converts `Arc<SealedBlock>` to `Weak` so the backing store cannot
+    /// prevent cache eviction. Silently no-ops when no backing store is set.
     fn send_ssd_batch(&self, blocks: &[(BlockKey, Arc<SealedBlock>)]) {
-        let Some(ref ssd_state) = self.ssd_state else {
+        let Some(backing) = self.backing.as_ref() else {
             return;
         };
-
         if blocks.is_empty() {
             return;
         }
-
-        let batch = SsdWriteBatch {
-            blocks: blocks
-                .iter()
-                .map(|(k, b)| (k.clone(), Arc::downgrade(b)))
-                .collect(),
-        };
-
-        if ssd_state.writer_tx.try_send(batch).is_ok() {
-            core_metrics()
-                .ssd_write_queue_pending
-                .add(blocks.len() as i64, &[]);
-        } else {
-            // Queue full - drop the batch (backpressure)
-            warn!("SSD write queue full, dropping {} blocks", blocks.len());
-            core_metrics()
-                .ssd_write_queue_full
-                .add(blocks.len() as u64, &[]);
-        }
+        let weak_blocks: Vec<(BlockKey, Weak<SealedBlock>)> = blocks
+            .iter()
+            .map(|(k, b)| (k.clone(), Arc::downgrade(b)))
+            .collect();
+        backing.ingest_batch(weak_blocks);
     }
 
     // ========================================================================
@@ -860,7 +691,7 @@ impl StorageEngine {
 
     /// Pure memory-only prefix check. Returns `(hit, missing)` counts.
     ///
-    /// No SSD prefetch, no pinning — suitable for lightweight query RPCs.
+    /// No backing-store prefetch, no pinning — suitable for lightweight query RPCs.
     pub(crate) fn check_prefix_memory_only(
         &self,
         namespace: &str,
@@ -885,13 +716,61 @@ impl StorageEngine {
         (hit, missing)
     }
 
-    /// Check prefix blocks and prefetch from SSD if needed.
+    /// Check prefix blocks and schedule backing-store reads if needed.
     ///
-    /// Scans blocks in prefix order, checking cache, prefetching set, and SSD index.
-    /// Pin hit blocks when returning Done (no loading in progress).
+    /// Uses per-request state machine: first call does full scan + dispatches
+    /// backing reads; retries poll a oneshot receiver (lock-free fast path).
+    /// Pins hit blocks when returning Done.
     pub(crate) fn check_prefix_and_prefetch(
         &self,
         instance_id: &str,
+        req_id: &str,
+        namespace: &str,
+        hashes: &[Vec<u8>],
+        num_workers: usize,
+    ) -> PrefetchStatus {
+        // This request has been seen before and backing reads are still in flight.
+        if let Some(mut entry) = self.active_prefetches.get_mut(req_id) {
+            match entry.blocks_rx.try_recv() {
+                Err(oneshot::error::TryRecvError::Empty) => {
+                    return PrefetchStatus::Loading { hit: 0, loading: 1 };
+                }
+                Ok(ssd_blocks) => {
+                    let loading_count = entry.loading_count;
+                    drop(entry);
+                    self.active_prefetches.remove(req_id);
+                    self.inflight_prefetch
+                        .fetch_sub(loading_count, Ordering::Relaxed);
+                    self.batch_insert_cache(ssd_blocks);
+                    // Fall through to full_prefix_scan below.
+                }
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    warn!(
+                        "SSD prefetch sender dropped for req_id={}, falling back to re-scan",
+                        req_id
+                    );
+                    let loading_count = entry.loading_count;
+                    drop(entry);
+                    self.active_prefetches.remove(req_id);
+                    self.inflight_prefetch
+                        .fetch_sub(loading_count, Ordering::Relaxed);
+                }
+            }
+        }
+
+        // Full scan: cache → backing store → prefix break.
+        self.full_prefix_scan(instance_id, req_id, namespace, hashes, num_workers)
+    }
+
+    /// Full prefix scan: cache → SSD → pin.
+    ///
+    /// Phase 1: scan cache prefix (first lock).
+    /// Phase 2: pass remaining keys to SSD `read_prefix` (no engine lock held).
+    /// Phase 3: if all hits, re-acquire lock and pin blocks.
+    fn full_prefix_scan(
+        &self,
+        instance_id: &str,
+        req_id: &str,
         namespace: &str,
         hashes: &[Vec<u8>],
         num_workers: usize,
@@ -900,191 +779,87 @@ impl StorageEngine {
             .iter()
             .map(|hash| BlockKey::new(namespace.to_string(), hash.clone()))
             .collect();
-        let instance_id_owned = instance_id.to_string();
 
+        // Phase 1: cpu cache prefix scan
         let mut hit = 0usize;
-        let mut loading = 0usize;
-        let mut missing = 0usize;
-        let mut to_prefetch: Vec<BlockKey> = Vec::new();
-        let mut backpressure_missing = 0usize;
-
-        // Blocks to pin: (key, block, footprint_bytes)
-        let mut blocks_to_pin: Vec<(BlockKey, Arc<SealedBlock>, u64)> = Vec::new();
-
+        let mut blocks_to_pin: Vec<(BlockKey, Arc<SealedBlock>)> = Vec::new();
         {
             let mut inner = self.inner.lock();
-
             for key in &keys {
-                // First check cache
                 if let Some(block) = inner.cache.get(key) {
                     hit += 1;
-                    blocks_to_pin.push((key.clone(), Arc::clone(&block), block.memory_footprint()));
-                    continue;
-                }
-
-                if inner.prefetching.contains(key) {
-                    loading += 1;
-                    continue;
-                }
-
-                // Backpressure: stop scheduling if too many blocks are prefetching
-                if inner.prefetching.len() >= self.max_prefetch_blocks {
-                    backpressure_missing = hashes.len() - hit - loading;
-                    missing = backpressure_missing;
+                    blocks_to_pin.push((key.clone(), Arc::clone(&block)));
+                } else {
                     break;
                 }
-
-                // Check SSD index (ssd_ring is now in StorageInner)
-                let in_ssd = inner
-                    .ssd_ring
-                    .as_ref()
-                    .is_some_and(|ring| ring.has_valid_entry(key));
-
-                if in_ssd {
-                    // Block is in SSD, schedule prefetch
-                    to_prefetch.push(key.clone());
-                    loading += 1;
-                    continue;
-                }
-
-                // Block not found anywhere - this is a miss
-                // For prefix matching, first miss means remaining blocks are also missing
-                missing = hashes.len() - hit - loading;
-                break;
-            }
-
-            // Pin hit blocks when returning Done (no loading in progress)
-            // Increment ref_count by num_workers so each worker can consume the pin once
-            if loading == 0 {
-                for (key, block, footprint_bytes) in blocks_to_pin {
-                    let pin_key = (instance_id_owned.clone(), key.clone());
-
-                    match inner.pinned_for_load.entry(pin_key) {
-                        Entry::Occupied(mut o) => {
-                            o.get_mut().1 += num_workers;
-                        }
-                        Entry::Vacant(v) => {
-                            v.insert((block, num_workers));
-                        }
-                    }
-
-                    match inner.pinned_for_load_by_key.entry(key) {
-                        Entry::Occupied(mut o) => {
-                            o.get_mut().1 += num_workers;
-                        }
-                        Entry::Vacant(v) => {
-                            v.insert((footprint_bytes, num_workers));
-                            record_pin_unique_added(footprint_bytes);
-                        }
-                    }
-                }
             }
         }
 
-        if backpressure_missing > 0 {
-            core_metrics()
-                .ssd_prefetch_backpressure_blocks
-                .add(backpressure_missing as u64, &[]);
+        // Phase 2: SSD prefix scan for remaining keys
+        let remaining = &keys[hit..];
+        let mut loading = 0usize;
+        let mut blocks_rx: Option<oneshot::Receiver<PrefetchResult>> = None;
+
+        if !remaining.is_empty() {
+            let inflight = self.inflight_prefetch.load(Ordering::Relaxed);
+            let available = self.max_prefetch_blocks.saturating_sub(inflight);
+
+            if available > 0 {
+                if let Some(backing) = self.backing.as_ref() {
+                    let check_limit = remaining.len().min(available);
+                    let check_keys = remaining[..check_limit].to_vec();
+
+                    let (found, rx) = backing.read_prefix(check_keys);
+
+                    if found > 0 {
+                        self.inflight_prefetch.fetch_add(found, Ordering::Relaxed);
+                        loading = found;
+                        blocks_rx = Some(rx);
+                    }
+
+                    let backpressure_skipped = remaining.len() - check_limit;
+                    if backpressure_skipped > 0 {
+                        core_metrics()
+                            .ssd_prefetch_backpressure_blocks
+                            .add(backpressure_skipped as u64, &[]);
+                    }
+                }
+            } else {
+                core_metrics()
+                    .ssd_prefetch_backpressure_blocks
+                    .add(remaining.len() as u64, &[]);
+            }
         }
 
-        // Trigger prefetch for blocks in SSD (outside lock)
-        if !to_prefetch.is_empty() {
-            self.trigger_prefetch(to_prefetch);
-        }
+        let missing = keys.len() - hit - loading;
 
+        // Phase 3: pin or return
         if loading > 0 {
+            if let Some(blocks_rx) = blocks_rx {
+                self.active_prefetches.insert(
+                    req_id.to_string(),
+                    PrefetchEntry {
+                        blocks_rx,
+                        loading_count: loading,
+                    },
+                );
+            }
             PrefetchStatus::Loading { hit, loading }
         } else {
+            // All cache hits — re-acquire lock and pin.
+            self.pin_blocks_inner(instance_id, num_workers, &blocks_to_pin);
             PrefetchStatus::Done { hit, missing }
         }
     }
 
-    /// Mark blocks as prefetching and send batch to prefetch worker.
-    /// Memory allocation is handled by the prefetch dispatcher for better pipelining.
-    /// If prefetch queue is full, drops the request (treats as cache miss).
-    fn trigger_prefetch(&self, keys: Vec<BlockKey>) {
-        let ssd_state = match &self.ssd_state {
-            Some(state) => state,
-            None => return,
-        };
-
-        // Collect valid entries (ssd_ring is now in StorageInner)
-        let mut valid_requests: Vec<(BlockKey, SsdIndexEntry)> = Vec::with_capacity(keys.len());
-
-        {
-            let mut inner = self.inner.lock();
-            let ring = match inner.ssd_ring.as_ref() {
-                Some(r) => r,
-                None => return,
-            };
-
-            for key in keys {
-                // Skip if already prefetching
-                if inner.prefetching.contains(&key) {
-                    continue;
-                }
-
-                // Get SSD index entry (includes validity check)
-                let entry = match ring.get(&key) {
-                    Some(e) => e.clone(),
-                    None => continue,
-                };
-
-                valid_requests.push((key, entry));
-            }
-
-            // Mark all as prefetching before releasing lock
-            for (key, _) in &valid_requests {
-                inner.prefetching.insert(key.clone());
-            }
-        }
-
-        if valid_requests.is_empty() {
-            return;
-        }
-
-        // Build batch (memory allocation moved to prefetch dispatcher)
-        let keys_for_cleanup: Vec<_> = valid_requests.iter().map(|(k, _)| k.clone()).collect();
-        let requests: Vec<_> = valid_requests
-            .into_iter()
-            .map(|(key, entry)| PrefetchRequest { key, entry })
-            .collect();
-
-        // Send batch (non-blocking, drop if queue full)
-        let batch = PrefetchBatch { requests };
-        if ssd_state.prefetch_tx.try_send(batch).is_err() {
-            // Queue full - treat as cache miss, clean up prefetching set
-            warn!(
-                "SSD prefetch queue full, dropping {} blocks",
-                keys_for_cleanup.len()
-            );
-            core_metrics()
-                .ssd_prefetch_queue_full
-                .add(keys_for_cleanup.len() as u64, &[]);
-            let mut inner = self.inner.lock();
-            for key in keys_for_cleanup {
-                inner.prefetching.remove(&key);
-            }
-        }
-    }
-
-    /// Called by prefetch worker when a block is loaded from SSD.
-    pub(crate) fn complete_prefetch(&self, key: BlockKey, block: Option<Arc<SealedBlock>>) {
-        let footprint_bytes = block.as_ref().map(|b| b.memory_footprint());
-
+    /// Batch-insert SSD-read blocks into the in-memory cache.
+    fn batch_insert_cache(&self, blocks: PrefetchResult) {
         let mut inner = self.inner.lock();
-        inner.prefetching.remove(&key);
-
-        if let Some(block) = block {
+        for (key, block) in blocks {
+            let footprint_bytes = block.memory_footprint();
             match inner.cache.insert(key, block) {
-                CacheInsertOutcome::InsertedNew => {
-                    if let Some(bytes) = footprint_bytes {
-                        record_cache_insert_new(bytes);
-                    }
-                }
-                CacheInsertOutcome::AlreadyExists => {
-                    // No overwrite, no-op for metrics.
-                }
+                CacheInsertOutcome::InsertedNew => record_cache_insert_new(footprint_bytes),
+                CacheInsertOutcome::AlreadyExists => {}
                 CacheInsertOutcome::Rejected => {
                     core_metrics().cache_block_admission_rejections.add(1, &[]);
                 }
@@ -1092,14 +867,38 @@ impl StorageEngine {
         }
     }
 
-    /// Check if a logical SSD offset is still valid (not yet overwritten).
-    /// Used by prefetch worker to validate reads.
-    fn is_ssd_offset_valid(&self, begin: u64) -> bool {
-        let inner = self.inner.lock();
-        inner
-            .ssd_ring
-            .as_ref()
-            .is_some_and(|ring| ring.is_offset_valid(begin))
+    /// Pin blocks under a single lock acquisition.
+    fn pin_blocks_inner(
+        &self,
+        instance_id: &str,
+        num_workers: usize,
+        blocks: &[(BlockKey, Arc<SealedBlock>)],
+    ) {
+        let mut inner = self.inner.lock();
+        let instance_id_owned = instance_id.to_string();
+        for (key, block) in blocks {
+            let pin_key = (instance_id_owned.clone(), key.clone());
+            let footprint = block.memory_footprint();
+
+            match inner.pinned_for_load.entry(pin_key) {
+                Entry::Occupied(mut o) => {
+                    o.get_mut().1 += num_workers;
+                }
+                Entry::Vacant(v) => {
+                    v.insert((Arc::clone(block), num_workers));
+                }
+            }
+
+            match inner.pinned_for_load_by_key.entry(key.clone()) {
+                Entry::Occupied(mut o) => {
+                    o.get_mut().1 += num_workers;
+                }
+                Entry::Vacant(v) => {
+                    v.insert((footprint, num_workers));
+                    record_pin_unique_added(footprint);
+                }
+            }
+        }
     }
 }
 
@@ -1364,28 +1163,17 @@ async fn metaserver_worker_loop(
 }
 
 #[cfg(test)]
+impl StorageEngine {
+    /// Insert a single block directly into the in-memory cache (test only).
+    pub(crate) fn test_insert_cache(&self, key: BlockKey, block: Arc<SealedBlock>) {
+        let mut inner = self.inner.lock();
+        inner.cache.insert(key, block);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn filter_hashes_not_in_cache_inplace_keeps_only_uncached() {
-        let (storage, _rx) =
-            StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]);
-        let namespace = "ns";
-        let cached_hash = vec![1, 1, 1];
-        let uncached_hash = vec![2, 2, 2];
-
-        storage.complete_prefetch(
-            BlockKey::new(namespace.to_string(), cached_hash.clone()),
-            Some(Arc::new(SealedBlock::from_slots(Vec::new()))),
-        );
-
-        let mut hashes = HashSet::from([cached_hash, uncached_hash.clone()]);
-        storage.filter_hashes_not_in_cache_inplace(namespace, &mut hashes);
-
-        assert_eq!(hashes.len(), 1);
-        assert!(hashes.contains(&uncached_hash));
-    }
 
     #[tokio::test]
     async fn filter_hashes_not_in_cache_inplace_handles_empty_input() {

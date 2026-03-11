@@ -1,16 +1,27 @@
 use futures::stream::{FuturesOrdered, FuturesUnordered, StreamExt};
 use log::{debug, warn};
+use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
+use tokio::sync::oneshot;
 
+use super::ssd::SsdBackingStore;
+use super::uring::UringIoEngine;
 use crate::block::{BlockKey, SealedBlock};
 use crate::metrics::core_metrics;
 use crate::numa::NumaNode;
 use crate::pinned_pool::PinnedAllocation;
 use crate::seal_offload::SlotMeta;
-use crate::uring::UringIoEngine;
+
+/// SSD I/O alignment requirement (O_DIRECT requires 512-byte aligned I/O)
+pub const SSD_ALIGNMENT: usize = 512;
+
+/// Default max blocks allowed in prefetching state (backpressure for SSD prefetch).
+/// ~15GB assuming 10MB per block.
+pub const DEFAULT_MAX_PREFETCH_BLOCKS: usize = 1500;
 
 /// Default write queue depth for SSD writer thread (blocks dropped if full)
 pub const DEFAULT_SSD_WRITE_QUEUE_DEPTH: usize = 8;
@@ -24,8 +35,15 @@ pub const DEFAULT_SSD_WRITE_INFLIGHT: usize = 2;
 /// Default max concurrent prefetches
 pub const DEFAULT_SSD_PREFETCH_INFLIGHT: usize = 16;
 
-/// Result of a single prefetch operation: (key, begin_offset, block, duration_secs, block_size)
-type PrefetchResult = (BlockKey, u64, Option<Arc<SealedBlock>>, f64, u64);
+/// Result of a single prefetch I/O: (key, begin_offset, block, duration_secs, block_size, ctx)
+type SinglePrefetchResult = (
+    BlockKey,
+    u64,
+    Option<Arc<SealedBlock>>,
+    f64,
+    u64,
+    Arc<BatchContext>,
+);
 
 // ============================================================================
 // Configuration
@@ -67,7 +85,7 @@ impl Default for SsdCacheConfig {
 
 /// Metadata for a block stored in SSD cache
 #[derive(Clone)]
-pub(crate) struct SsdIndexEntry {
+pub(super) struct SsdIndexEntry {
     /// Logical offset in the ring buffer (monotonically increasing)
     pub begin: u64,
     /// Block size in bytes
@@ -80,7 +98,7 @@ pub(crate) struct SsdIndexEntry {
 
 /// State of an SSD index entry (two-phase commit)
 #[derive(Clone)]
-pub(crate) enum SsdEntryState {
+pub(super) enum SsdEntryState {
     /// IO in progress, not yet readable
     Writing(SsdIndexEntry),
     /// IO completed, readable
@@ -103,7 +121,7 @@ impl SsdEntryState {
 ///
 /// Two-phase commit: prepare_batch inserts Writing state, commit transitions
 /// to Committed (or removes on failure). Only Committed entries are readable.
-pub(crate) struct SsdRingBuffer {
+pub(super) struct SsdRingBuffer {
     /// Ring buffer capacity in bytes
     capacity: u64,
     /// Next write position (logical, monotonically increasing)
@@ -118,7 +136,7 @@ pub(crate) struct SsdRingBuffer {
 
 impl SsdRingBuffer {
     /// Create a new ring buffer with given capacity.
-    pub(crate) fn new(capacity: u64) -> Self {
+    pub(super) fn new(capacity: u64) -> Self {
         Self {
             capacity,
             head: 0,
@@ -129,8 +147,8 @@ impl SsdRingBuffer {
     }
 
     /// Check if key has a valid Committed entry (not yet overwritten).
-    #[inline]
-    pub(crate) fn has_valid_entry(&self, key: &BlockKey) -> bool {
+    #[cfg(test)]
+    pub(super) fn has_valid_entry(&self, key: &BlockKey) -> bool {
         match self.entries.get(key) {
             Some(SsdEntryState::Committed(e)) => e.begin >= self.tail,
             _ => false,
@@ -138,7 +156,7 @@ impl SsdRingBuffer {
     }
 
     /// Lookup a Committed entry by key, returning None if Writing or expired.
-    pub(crate) fn get(&self, key: &BlockKey) -> Option<&SsdIndexEntry> {
+    pub(super) fn get(&self, key: &BlockKey) -> Option<&SsdIndexEntry> {
         match self.entries.get(key) {
             Some(SsdEntryState::Committed(e)) if e.begin >= self.tail => Some(e),
             _ => None,
@@ -147,7 +165,7 @@ impl SsdRingBuffer {
 
     /// Check if a logical offset is still valid (not yet overwritten).
     #[inline]
-    pub(crate) fn is_offset_valid(&self, begin: u64) -> bool {
+    pub(super) fn is_offset_valid(&self, begin: u64) -> bool {
         begin >= self.tail
     }
 
@@ -193,7 +211,7 @@ impl SsdRingBuffer {
 
     /// Commit a write: success=true transitions Writing→Committed, success=false removes.
     /// Returns false if entry was already expired or missing.
-    pub(crate) fn commit(&mut self, key: &BlockKey, success: bool) -> bool {
+    pub(super) fn commit(&mut self, key: &BlockKey, success: bool) -> bool {
         let Some(state) = self.entries.get(key) else {
             // Already removed by advance_tail or previous abort
             return false;
@@ -230,7 +248,7 @@ impl SsdRingBuffer {
 
     /// Prepare a batch for writing: filter, allocate space, advance tail, insert Writing.
     /// Returns list of blocks to write with their allocated offsets.
-    pub(crate) fn prepare_batch(
+    pub(super) fn prepare_batch(
         &mut self,
         candidates: Vec<(BlockKey, Arc<SealedBlock>)>,
     ) -> PreparedBatch {
@@ -302,19 +320,19 @@ impl Default for SsdRingBuffer {
 }
 
 /// Info for a single block write within a batch.
-pub(crate) struct WriteInfo {
+pub(super) struct WriteInfo {
     pub key: BlockKey,
     pub block: Arc<SealedBlock>,
     pub entry: SsdIndexEntry,
 }
 
 /// Prepared batch ready for IO.
-pub(crate) struct PreparedBatch {
+pub(super) struct PreparedBatch {
     pub writes: Vec<WriteInfo>,
 }
 
 impl PreparedBatch {
-    pub(crate) fn empty() -> Self {
+    pub(super) fn empty() -> Self {
         Self { writes: Vec::new() }
     }
 
@@ -324,19 +342,50 @@ impl PreparedBatch {
 }
 
 /// Batch of sealed blocks to write to SSD
-pub(crate) struct SsdWriteBatch {
+pub(super) struct SsdWriteBatch {
     pub blocks: Vec<(BlockKey, Weak<SealedBlock>)>,
 }
 
 /// Request to prefetch a block from SSD (metadata only, allocation done in worker)
-pub(crate) struct PrefetchRequest {
+pub(super) struct PrefetchRequest {
     pub key: BlockKey,
     pub entry: SsdIndexEntry,
 }
 
 /// Batch of prefetch requests (sent as a unit to limit queue depth)
-pub(crate) struct PrefetchBatch {
+pub(super) struct PrefetchBatch {
     pub requests: Vec<PrefetchRequest>,
+    pub done_tx: oneshot::Sender<super::PrefetchResult>,
+}
+
+/// Shared context for a batch of prefetch operations.
+/// Collects successful blocks and delivers them as a batch when all reads finish.
+pub(super) struct BatchContext {
+    results: Mutex<super::PrefetchResult>,
+    remaining: AtomicUsize,
+    done_tx: Mutex<Option<oneshot::Sender<super::PrefetchResult>>>,
+}
+
+impl BatchContext {
+    fn new(count: usize, done_tx: oneshot::Sender<super::PrefetchResult>) -> Self {
+        Self {
+            results: Mutex::new(Vec::with_capacity(count)),
+            remaining: AtomicUsize::new(count),
+            done_tx: Mutex::new(Some(done_tx)),
+        }
+    }
+
+    fn complete_one(&self, key: BlockKey, block: Option<Arc<SealedBlock>>) {
+        if let Some(block) = block {
+            self.results.lock().push((key, block));
+        }
+        if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1
+            && let Some(tx) = self.done_tx.lock().take()
+        {
+            let results = std::mem::take(&mut *self.results.lock());
+            let _ = tx.send(results);
+        }
+    }
 }
 
 /// Per-slot allocation reference: which allocation and offset within it.
@@ -351,6 +400,8 @@ struct PrefetchTask {
     entry: SsdIndexEntry,
     /// One per slot (parallel to `entry.slots`), each from the correct NUMA pool.
     slot_allocs: Vec<SlotAlloc>,
+    /// Shared batch context: per-block callback + completion counter.
+    ctx: Arc<BatchContext>,
 }
 
 /// Internal: single block write task
@@ -364,99 +415,12 @@ struct WriteTask {
 type WriteResult = (BlockKey, bool, f64, u64);
 
 // ============================================================================
-// Storage handle (provided by StorageEngine, used by prefetch worker)
-// ============================================================================
-
-/// Type alias for prepare batch callback.
-pub(crate) type PrepareBatchFn =
-    Arc<dyn Fn(Vec<(BlockKey, Arc<SealedBlock>)>) -> PreparedBatch + Send + Sync>;
-
-/// Type alias for commit write callback.
-pub(crate) type CommitWriteFn = Arc<dyn Fn(&BlockKey, bool) + Send + Sync>;
-
-/// Type alias for prefetch allocation callback.
-pub(crate) type AllocatePrefetchFn =
-    Arc<dyn Fn(u64, Option<NumaNode>) -> Option<Arc<PinnedAllocation>> + Send + Sync>;
-
-/// Handle used by SSD workers to interact with storage.
-/// Both writer and prefetcher use callbacks to access StorageInner state.
-pub(crate) struct SsdStorageHandle {
-    /// Complete prefetch operation (insert into cache)
-    complete_prefetch: Arc<dyn Fn(BlockKey, Option<Arc<SealedBlock>>) + Send + Sync>,
-    /// Check if a logical offset is still valid (not yet overwritten)
-    is_valid: Arc<dyn Fn(u64) -> bool + Send + Sync>,
-    /// Allocate pinned memory for prefetch
-    allocate: AllocatePrefetchFn,
-    /// Prepare batch for SSD write (filter, allocate space, insert Writing)
-    prepare: PrepareBatchFn,
-    /// Commit write result (success: Writing→Committed, failure: remove)
-    commit: CommitWriteFn,
-    is_numa: bool,
-}
-
-impl SsdStorageHandle {
-    pub(crate) fn new(
-        complete_prefetch: impl Fn(BlockKey, Option<Arc<SealedBlock>>) + Send + Sync + 'static,
-        is_valid: impl Fn(u64) -> bool + Send + Sync + 'static,
-        allocate: impl Fn(u64, Option<NumaNode>) -> Option<Arc<PinnedAllocation>>
-        + Send
-        + Sync
-        + 'static,
-        prepare: impl Fn(Vec<(BlockKey, Arc<SealedBlock>)>) -> PreparedBatch + Send + Sync + 'static,
-        commit: impl Fn(&BlockKey, bool) + Send + Sync + 'static,
-        is_numa: bool,
-    ) -> Self {
-        Self {
-            complete_prefetch: Arc::new(complete_prefetch),
-            is_valid: Arc::new(is_valid),
-            allocate: Arc::new(allocate),
-            prepare: Arc::new(prepare),
-            commit: Arc::new(commit),
-            is_numa,
-        }
-    }
-
-    #[inline]
-    fn complete_prefetch(&self, key: BlockKey, block: Option<Arc<SealedBlock>>) {
-        (self.complete_prefetch)(key, block);
-    }
-
-    #[inline]
-    fn is_valid(&self, begin: u64) -> bool {
-        (self.is_valid)(begin)
-    }
-
-    #[inline]
-    fn allocate(&self, size: u64, numa_node: Option<NumaNode>) -> Option<Arc<PinnedAllocation>> {
-        (self.allocate)(size, numa_node)
-    }
-
-    #[inline]
-    fn prepare(&self, candidates: Vec<(BlockKey, Arc<SealedBlock>)>) -> PreparedBatch {
-        (self.prepare)(candidates)
-    }
-
-    #[inline]
-    fn commit(&self, key: &BlockKey, success: bool) {
-        (self.commit)(key, success)
-    }
-
-    #[inline]
-    fn is_numa(&self) -> bool {
-        self.is_numa
-    }
-}
-
-// ============================================================================
 // SSD Writer Loop
 // ============================================================================
 
 /// SSD writer task: receives batches of sealed blocks and writes them.
-///
-/// Uses `SsdStorageHandle` to interact with storage state. All ring buffer
-/// operations go through callbacks that acquire StorageInner lock.
-pub(crate) async fn ssd_writer_loop(
-    handle: Arc<SsdStorageHandle>,
+pub(super) async fn ssd_writer_loop(
+    store: Weak<SsdBackingStore>,
     mut rx: tokio::sync::mpsc::Receiver<SsdWriteBatch>,
     io: Arc<UringIoEngine>,
     write_inflight: usize,
@@ -482,7 +446,9 @@ pub(crate) async fn ssd_writer_loop(
                 metrics.ssd_write_inflight.add(-1, &[]);
 
                 // Commit result to ring buffer (Writing→Committed or remove)
-                handle.commit(&key, success);
+                if let Some(s) = store.upgrade() {
+                    s.commit_write(&key, success);
+                }
 
                 if success {
                     metrics.ssd_write_bytes.add(block_size, &[]);
@@ -517,8 +483,9 @@ pub(crate) async fn ssd_writer_loop(
                             continue;
                         }
 
-                        // Prepare batch: filter + allocate + insert Writing (via handle)
-                        let prepared = handle.prepare(candidates);
+                        // Prepare batch: filter + allocate + insert Writing
+                        let Some(s) = store.upgrade() else { continue };
+                        let prepared = s.prepare_batch(candidates);
 
                         if prepared.is_empty() {
                             continue;
@@ -543,7 +510,9 @@ pub(crate) async fn ssd_writer_loop(
     while let Some((key, success, duration_secs, block_size)) = inflight.next().await {
         metrics.ssd_write_inflight.add(-1, &[]);
 
-        handle.commit(&key, success);
+        if let Some(s) = store.upgrade() {
+            s.commit_write(&key, success);
+        }
 
         if success {
             metrics.ssd_write_bytes.add(block_size, &[]);
@@ -604,8 +573,8 @@ async fn write_block_to_ssd(
 // ============================================================================
 
 /// SSD prefetch entry point. Spawns dispatcher + worker pipeline internally.
-pub(crate) async fn ssd_prefetch_loop(
-    handle: Arc<SsdStorageHandle>,
+pub(super) async fn ssd_prefetch_loop(
+    store: Weak<SsdBackingStore>,
     rx: tokio::sync::mpsc::Receiver<PrefetchBatch>,
     io: Arc<UringIoEngine>,
     capacity: u64,
@@ -617,9 +586,9 @@ pub(crate) async fn ssd_prefetch_loop(
     let (task_tx, task_rx) = tokio::sync::mpsc::channel(prefetch_inflight);
 
     // Spawn dispatcher and worker
-    let dispatcher = tokio::spawn(ssd_prefetch_dispatcher(handle.clone(), rx, task_tx));
+    let dispatcher = tokio::spawn(ssd_prefetch_dispatcher(store.clone(), rx, task_tx));
     let worker = tokio::spawn(ssd_prefetch_worker(
-        handle,
+        store,
         task_rx,
         io,
         capacity,
@@ -636,16 +605,18 @@ pub(crate) async fn ssd_prefetch_loop(
 /// Dispatcher: receives batches, allocates per-slot memory grouped by NUMA,
 /// then splits into block-level tasks.
 async fn ssd_prefetch_dispatcher(
-    handle: Arc<SsdStorageHandle>,
+    store: Weak<SsdBackingStore>,
     mut batch_rx: tokio::sync::mpsc::Receiver<PrefetchBatch>,
     task_tx: tokio::sync::mpsc::Sender<PrefetchTask>,
 ) {
     while let Some(batch) = batch_rx.recv().await {
         if batch.requests.is_empty() {
+            let _ = batch.done_tx.send(Vec::new());
             continue;
         }
 
-        if !dispatch_prefetch_batch(&handle, &task_tx, batch.requests).await {
+        let Some(s) = store.upgrade() else { break };
+        if !dispatch_prefetch_batch(&s, &task_tx, batch).await {
             return;
         }
     }
@@ -690,12 +661,14 @@ fn group_slots_by_numa(
 /// Allocate per-slot memory grouped by NUMA, build PrefetchTasks, and enqueue.
 /// Returns false if the task channel is closed (should exit).
 async fn dispatch_prefetch_batch(
-    handle: &SsdStorageHandle,
+    store: &SsdBackingStore,
     task_tx: &tokio::sync::mpsc::Sender<PrefetchTask>,
-    requests: Vec<PrefetchRequest>,
+    batch: PrefetchBatch,
 ) -> bool {
+    let PrefetchBatch { requests, done_tx } = batch;
+
     // 1. Group all slots across all blocks by NUMA node
-    let numa_groups = group_slots_by_numa(handle.is_numa(), &requests);
+    let numa_groups = group_slots_by_numa(store.is_numa(), &requests);
 
     // 2. Allocate per NUMA group, assign per-slot (allocation, offset).
     //    All blocks in a batch share the same slot layout, so a single NUMA
@@ -707,7 +680,7 @@ async fn dispatch_prefetch_batch(
 
     for (numa_node, refs) in &numa_groups {
         let total_size: u64 = refs.iter().map(|r| r.size).sum();
-        let allocation = match handle.allocate(total_size, *numa_node) {
+        let allocation = match store.allocate_prefetch(total_size, *numa_node) {
             Some(alloc) => alloc,
             None => {
                 warn!(
@@ -716,9 +689,7 @@ async fn dispatch_prefetch_batch(
                     refs.len(),
                     numa_node
                 );
-                for req in requests {
-                    handle.complete_prefetch(req.key, None);
-                }
+                let _ = done_tx.send(Vec::new());
                 return true;
             }
         };
@@ -733,7 +704,9 @@ async fn dispatch_prefetch_batch(
         }
     }
 
-    // 3. Build PrefetchTasks and enqueue
+    // 3. Build BatchContext + PrefetchTasks and enqueue
+    let ctx = Arc::new(BatchContext::new(requests.len(), done_tx));
+
     for (block_idx, req) in requests.into_iter().enumerate() {
         let allocs: Vec<SlotAlloc> = slot_allocs[block_idx]
             .drain(..)
@@ -744,6 +717,7 @@ async fn dispatch_prefetch_batch(
             key: req.key,
             entry: req.entry,
             slot_allocs: allocs,
+            ctx: Arc::clone(&ctx),
         };
 
         if task_tx.send(task).await.is_err() {
@@ -757,7 +731,7 @@ async fn dispatch_prefetch_batch(
 
 /// Worker: maintains FuturesUnordered with max_inflight concurrent I/O operations.
 async fn ssd_prefetch_worker(
-    handle: Arc<SsdStorageHandle>,
+    store: Weak<SsdBackingStore>,
     mut task_rx: tokio::sync::mpsc::Receiver<PrefetchTask>,
     io: Arc<UringIoEngine>,
     capacity: u64,
@@ -766,7 +740,7 @@ async fn ssd_prefetch_worker(
     use std::future::Future;
     use std::pin::Pin;
 
-    type PrefetchFuture = Pin<Box<dyn Future<Output = PrefetchResult> + Send>>;
+    type PrefetchFuture = Pin<Box<dyn Future<Output = SinglePrefetchResult> + Send>>;
 
     let metrics = core_metrics();
     let mut inflight: FuturesUnordered<PrefetchFuture> = FuturesUnordered::new();
@@ -776,11 +750,12 @@ async fn ssd_prefetch_worker(
             biased;
 
             // Complete finished tasks first (priority)
-            Some((key, begin, result, duration_secs, block_size)) = inflight.next(), if !inflight.is_empty() => {
+            Some((key, begin, result, duration_secs, block_size, ctx)) = inflight.next(), if !inflight.is_empty() => {
                 metrics.ssd_prefetch_inflight.add(-1, &[]);
 
                 // Validate data wasn't overwritten during read
-                let result = if result.is_some() && !handle.is_valid(begin) {
+                let valid = store.upgrade().is_some_and(|s| s.is_offset_valid(begin));
+                let result = if result.is_some() && !valid {
                     warn!("SSD prefetch: data overwritten during read, discarding");
                     metrics.ssd_prefetch_failures.add(1, &[]);
                     None
@@ -794,7 +769,7 @@ async fn ssd_prefetch_worker(
                     metrics.ssd_prefetch_failures.add(1, &[]);
                     None
                 };
-                handle.complete_prefetch(key, result);
+                ctx.complete_one(key, result);
             }
 
             // Accept new task if below limit
@@ -814,10 +789,11 @@ async fn ssd_prefetch_worker(
     }
 
     // Drain remaining inflight tasks
-    while let Some((key, begin, result, duration_secs, block_size)) = inflight.next().await {
+    while let Some((key, begin, result, duration_secs, block_size, ctx)) = inflight.next().await {
         metrics.ssd_prefetch_inflight.add(-1, &[]);
 
-        let result = if result.is_some() && !handle.is_valid(begin) {
+        let valid = store.upgrade().is_some_and(|s| s.is_offset_valid(begin));
+        let result = if result.is_some() && !valid {
             metrics.ssd_prefetch_failures.add(1, &[]);
             None
         } else if result.is_some() {
@@ -832,7 +808,7 @@ async fn ssd_prefetch_worker(
             metrics.ssd_prefetch_failures.add(1, &[]);
             None
         };
-        handle.complete_prefetch(key, result);
+        ctx.complete_one(key, result);
     }
 
     debug!("SSD prefetch worker exiting");
@@ -843,20 +819,20 @@ async fn execute_prefetch(
     task: PrefetchTask,
     io: Arc<UringIoEngine>,
     capacity: u64,
-) -> PrefetchResult {
+) -> SinglePrefetchResult {
     let start = Instant::now();
     let duration_secs = || start.elapsed().as_secs_f64();
-    let fail = |key, begin, size| (key, begin, None, duration_secs(), size);
 
     let key = task.key;
     let begin = task.entry.begin;
     let block_size = task.entry.len;
+    let ctx = task.ctx;
 
     // Calculate physical offset in SSD file
     let phys_offset = begin % capacity;
     if phys_offset + block_size > capacity {
         warn!("SSD prefetch: block wraps around ring buffer");
-        return fail(key, begin, block_size);
+        return (key, begin, None, duration_secs(), block_size, ctx);
     }
 
     // Build iovecs from per-slot allocations
@@ -878,41 +854,37 @@ async fn execute_prefetch(
 
     // Await IO result and rebuild block
     let expected_len = task.entry.len as usize;
-    match read_result {
+    let block = match read_result {
         Ok(rx) => match rx.await {
             Ok(Ok(bytes_read)) if bytes_read == expected_len => {
                 match rebuild_sealed_block_per_slot(task.slot_allocs, &task.entry.slots) {
-                    Ok(sealed) => (
-                        key,
-                        begin,
-                        Some(Arc::new(sealed)),
-                        duration_secs(),
-                        block_size,
-                    ),
+                    Ok(sealed) => Some(Arc::new(sealed)),
                     Err(e) => {
                         warn!("SSD prefetch: failed to rebuild block: {}", e);
-                        fail(key, begin, block_size)
+                        None
                     }
                 }
             }
             Ok(Ok(n)) => {
                 warn!("SSD prefetch: short read {} of {} bytes", n, expected_len);
-                fail(key, begin, block_size)
+                None
             }
             Ok(Err(e)) => {
                 warn!("SSD prefetch: read error: {}", e);
-                fail(key, begin, block_size)
+                None
             }
             Err(_) => {
                 warn!("SSD prefetch: read channel closed");
-                fail(key, begin, block_size)
+                None
             }
         },
         Err(e) => {
             warn!("SSD prefetch: failed to submit read: {}", e);
-            fail(key, begin, block_size)
+            None
         }
-    }
+    };
+
+    (key, begin, block, duration_secs(), block_size, ctx)
 }
 
 // ============================================================================

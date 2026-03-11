@@ -388,7 +388,11 @@ class SchedulerConnector:
 
         block_hash_list = list(block_hashes)
         try:
-            result = self._ctx.engine_client.query_prefetch(self._ctx.instance_id, block_hash_list)
+            result = self._ctx.engine_client.query_prefetch(
+                self._ctx.instance_id,
+                block_hash_list,
+                req_id=req_id,
+            )
         except PegaFlowServiceError as e:
             # Service error (network/internal) - mark unavailable
             self._ctx.state_manager.mark_unavailable(str(e))

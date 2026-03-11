@@ -62,6 +62,7 @@ message LoadResponse {
 message QueryRequest {
   string instance_id = 1;
   repeated bytes block_hashes = 2;
+  string req_id = 3;
 }
 
 // Prefetch status enum

@@ -11,6 +11,7 @@
 mod trace;
 
 pub mod allocator;
+pub mod backing;
 pub mod block;
 mod cache;
 pub mod gpu_worker;
@@ -24,12 +25,14 @@ mod offload;
 pub mod pinned_mem;
 pub mod pinned_pool;
 mod seal_offload;
-pub mod ssd_cache;
 mod storage;
 pub mod sync_state;
 mod transfer;
-mod uring;
 
+pub use backing::{
+    DEFAULT_SSD_PREFETCH_INFLIGHT, DEFAULT_SSD_PREFETCH_QUEUE_DEPTH, DEFAULT_SSD_WRITE_INFLIGHT,
+    DEFAULT_SSD_WRITE_QUEUE_DEPTH, SsdCacheConfig,
+};
 pub use block::{
     BlockHash, BlockKey, BlockStatus, LayerBlock, LayerSave, PrefetchStatus, SealedBlock,
 };
@@ -38,10 +41,6 @@ pub use numa::NumaNode;
 use numa::NumaTopology;
 pub use pinned_pool::PinnedAllocation;
 pub use seal_offload::SlotMeta;
-pub use ssd_cache::{
-    DEFAULT_SSD_PREFETCH_INFLIGHT, DEFAULT_SSD_PREFETCH_QUEUE_DEPTH, DEFAULT_SSD_WRITE_INFLIGHT,
-    DEFAULT_SSD_WRITE_QUEUE_DEPTH, SsdCacheConfig,
-};
 pub use storage::{SealNotification, StorageConfig};
 pub use sync_state::{LoadState, LoadStateError};
 pub use trace::{set_trace_sample_rate, should_sample};
@@ -71,13 +70,14 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use log::{debug, info};
+use log::{debug, info, warn};
 use pegaflow_proto::proto::engine::meta_server_client::MetaServerClient;
 use tonic::transport::Channel;
 
+use crate::backing::SSD_ALIGNMENT;
 use crate::gpu_worker::{LayerLoadData, LoadBlock, LoadTask};
 use crate::metrics::core_metrics;
-use crate::storage::{SSD_ALIGNMENT, StorageEngine};
+use crate::storage::StorageEngine;
 
 /// Command sent to the metaserver insert worker.
 pub(crate) struct MetaserverInsertCmd {
@@ -424,8 +424,17 @@ impl PegaEngine {
     pub fn count_prefix_hit_blocks_with_prefetch(
         &self,
         instance_id: &str,
+        req_id: &str,
         block_hashes: &[Vec<u8>],
     ) -> Result<PrefetchStatus, EngineError> {
+        if req_id.is_empty() {
+            warn!("count_prefix_hit_blocks_with_prefetch: empty req_id, returning 0 hits");
+            return Ok(PrefetchStatus::Done {
+                hit: 0,
+                missing: block_hashes.len(),
+            });
+        }
+
         let instance = self.get_instance(instance_id)?;
         let namespace = instance.namespace();
         let world_size = instance.world_size();
@@ -433,6 +442,7 @@ impl PegaEngine {
 
         let status = self.storage.check_prefix_and_prefetch(
             instance_id,
+            req_id,
             namespace,
             block_hashes,
             world_size,
@@ -631,11 +641,11 @@ mod tests {
         engine
     }
 
-    /// Helper: insert a block into the storage cache via complete_prefetch.
+    /// Helper: insert a block directly into the storage cache.
     fn insert_block(engine: &PegaEngine, namespace: &str, hash: Vec<u8>) {
         let key = BlockKey::new(namespace.to_string(), hash);
         let block = Arc::new(SealedBlock::from_slots(Vec::new()));
-        engine.storage.complete_prefetch(key, Some(block));
+        engine.storage.test_insert_cache(key, block);
     }
 
     #[tokio::test]
@@ -647,7 +657,7 @@ mod tests {
 
         let hashes = vec![vec![1], vec![2], vec![3]];
         let status = engine
-            .count_prefix_hit_blocks_with_prefetch("inst1", &hashes)
+            .count_prefix_hit_blocks_with_prefetch("inst1", "test-req", &hashes)
             .unwrap();
 
         match status {
@@ -668,7 +678,7 @@ mod tests {
 
         let hashes = vec![vec![1], vec![2], vec![3], vec![4]];
         let status = engine
-            .count_prefix_hit_blocks_with_prefetch("inst1", &hashes)
+            .count_prefix_hit_blocks_with_prefetch("inst1", "test-req", &hashes)
             .unwrap();
 
         match status {
@@ -686,7 +696,7 @@ mod tests {
 
         let hashes = vec![vec![1], vec![2]];
         let status = engine
-            .count_prefix_hit_blocks_with_prefetch("inst1", &hashes)
+            .count_prefix_hit_blocks_with_prefetch("inst1", "test-req", &hashes)
             .unwrap();
 
         match status {
@@ -704,7 +714,7 @@ mod tests {
 
         let hashes: Vec<Vec<u8>> = vec![];
         let status = engine
-            .count_prefix_hit_blocks_with_prefetch("inst1", &hashes)
+            .count_prefix_hit_blocks_with_prefetch("inst1", "test-req", &hashes)
             .unwrap();
 
         match status {
@@ -720,7 +730,8 @@ mod tests {
     async fn instance_not_found_returns_error() {
         let engine = setup_engine("inst1", "ns");
 
-        let result = engine.count_prefix_hit_blocks_with_prefetch("nonexistent", &[vec![1]]);
+        let result =
+            engine.count_prefix_hit_blocks_with_prefetch("nonexistent", "test-req", &[vec![1]]);
 
         assert!(result.is_err());
         assert!(
@@ -736,7 +747,7 @@ mod tests {
 
         let hashes = vec![vec![1], vec![2], vec![3]];
         let status = engine
-            .count_prefix_hit_blocks_with_prefetch("inst1", &hashes)
+            .count_prefix_hit_blocks_with_prefetch("inst1", "test-req", &hashes)
             .unwrap();
 
         match status {
@@ -759,7 +770,7 @@ mod tests {
         // Instance uses "ns_a", so only vec![1] should hit
         let hashes = vec![vec![1], vec![2]];
         let status = engine
-            .count_prefix_hit_blocks_with_prefetch("inst1", &hashes)
+            .count_prefix_hit_blocks_with_prefetch("inst1", "test-req", &hashes)
             .unwrap();
 
         match status {
