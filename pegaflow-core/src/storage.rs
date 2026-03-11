@@ -235,6 +235,8 @@ impl StorageEngine {
         let max_prefetch_blocks = config.max_prefetch_blocks;
         let ssd_cache_config = config.ssd_cache_config;
 
+        let ssd_enabled = ssd_cache_config.is_some();
+
         // Create unified allocator based on NUMA configuration
         let allocator = if !numa_nodes.is_empty() {
             info!(
@@ -245,6 +247,7 @@ impl StorageEngine {
                 capacity_bytes,
                 numa_nodes,
                 use_hugepages,
+                ssd_enabled,
                 unit_hint,
             ))
         } else {
@@ -252,6 +255,7 @@ impl StorageEngine {
             Arc::new(PinnedAllocator::new_global(
                 capacity_bytes,
                 use_hugepages,
+                ssd_enabled,
                 unit_hint,
             ))
         };

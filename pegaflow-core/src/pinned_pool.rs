@@ -68,8 +68,15 @@ impl PinnedMemoryPool {
     /// Allocate a new pinned memory pool of `pool_size` bytes.
     ///
     /// If `use_hugepages` is true, uses huge pages (requires system config).
+    /// If `ssd_enabled` is true, uses regular pinned memory instead of write-combined,
+    /// because SSD reads back data into CPU memory and write-combined has extremely slow CPU reads.
     /// If `unit_size_hint` is provided, the allocator rounds allocations up to this size.
-    fn new(pool_size: usize, use_hugepages: bool, unit_size_hint: Option<NonZeroU64>) -> Self {
+    fn new(
+        pool_size: usize,
+        use_hugepages: bool,
+        ssd_enabled: bool,
+        unit_size_hint: Option<NonZeroU64>,
+    ) -> Self {
         if pool_size == 0 {
             panic!("Pinned memory pool size must be greater than zero");
         }
@@ -78,8 +85,12 @@ impl PinnedMemoryPool {
             info!("Allocating pinned memory pool with huge pages");
             PinnedMemory::allocate_hugepages(pool_size)
                 .expect("Failed to allocate pinned memory pool with huge pages")
+        } else if ssd_enabled {
+            info!("Allocating pinned memory pool with regular pages (SSD enabled)");
+            PinnedMemory::allocate_regular(pool_size)
+                .expect("Failed to allocate regular pinned memory pool")
         } else {
-            info!("Allocating pinned memory pool with regular pages");
+            info!("Allocating pinned memory pool with write-combined pages");
             PinnedMemory::allocate(pool_size).expect("Failed to allocate pinned memory pool")
         };
 
@@ -262,6 +273,7 @@ impl NumaAwarePinnedPools {
         total_capacity: usize,
         numa_nodes: &[NumaNode],
         use_hugepages: bool,
+        ssd_enabled: bool,
         unit_size_hint: Option<NonZeroU64>,
     ) -> Self {
         let num_nodes = numa_nodes.len();
@@ -292,7 +304,7 @@ impl NumaAwarePinnedPools {
 
             // Allocate pool on a thread pinned to this NUMA node
             let result = run_on_numa(*node, move || {
-                PinnedMemoryPool::new(per_node_capacity, use_hugepages, hint)
+                PinnedMemoryPool::new(per_node_capacity, use_hugepages, ssd_enabled, hint)
             });
 
             match result {
@@ -370,9 +382,15 @@ impl PinnedAllocator {
     pub(crate) fn new_global(
         capacity: usize,
         use_hugepages: bool,
+        ssd_enabled: bool,
         unit_hint: Option<NonZeroU64>,
     ) -> Self {
-        let pool = Arc::new(PinnedMemoryPool::new(capacity, use_hugepages, unit_hint));
+        let pool = Arc::new(PinnedMemoryPool::new(
+            capacity,
+            use_hugepages,
+            ssd_enabled,
+            unit_hint,
+        ));
         Self::Global(pool)
     }
 
@@ -383,18 +401,20 @@ impl PinnedAllocator {
         capacity: usize,
         numa_nodes: &[NumaNode],
         use_hugepages: bool,
+        ssd_enabled: bool,
         unit_hint: Option<NonZeroU64>,
     ) -> Self {
         if numa_nodes.is_empty() {
             warn!(
                 "NUMA allocator requested but no nodes provided, falling back to global allocator"
             );
-            return Self::new_global(capacity, use_hugepages, unit_hint);
+            return Self::new_global(capacity, use_hugepages, ssd_enabled, unit_hint);
         }
         Self::Numa(NumaAwarePinnedPools::new(
             capacity,
             numa_nodes,
             use_hugepages,
+            ssd_enabled,
             unit_hint,
         ))
     }
