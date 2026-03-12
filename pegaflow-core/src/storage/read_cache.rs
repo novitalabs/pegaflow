@@ -62,9 +62,10 @@ impl ReadCache {
     // Query
     // ====================================================================
 
-    /// Check if a key exists in the cache (no promotion).
-    pub fn contains_key(&self, key: &BlockKey) -> bool {
-        self.state.inner.lock().cache.contains_key(key)
+    /// Batch check: returns a `Vec<bool>` parallel to `keys`, `true` if present.
+    pub fn contains_keys(&self, keys: &[BlockKey]) -> Vec<bool> {
+        let inner = self.state.inner.lock();
+        keys.iter().map(|k| inner.cache.contains_key(k)).collect()
     }
 
     /// Pure memory-only prefix check. Returns `(hit, missing)`.
@@ -111,12 +112,7 @@ impl ReadCache {
     // Insert
     // ====================================================================
 
-    /// Insert a sealed block. Returns the admission outcome.
-    pub fn insert(&self, key: BlockKey, block: Arc<SealedBlock>) -> CacheInsertOutcome {
-        self.state.inner.lock().cache.insert(key, block)
-    }
-
-    /// Batch-insert blocks (typically from SSD prefetch).
+    /// Batch-insert blocks. Emits per-block admission metrics.
     pub fn batch_insert(&self, blocks: Vec<(BlockKey, Arc<SealedBlock>)>) {
         let mut inner = self.state.inner.lock();
         for (key, block) in blocks {
@@ -326,11 +322,6 @@ impl ReadCache {
     // ====================================================================
     // Test helpers
     // ====================================================================
-
-    #[cfg(test)]
-    pub fn test_insert(&self, key: BlockKey, block: Arc<SealedBlock>) {
-        self.state.inner.lock().cache.insert(key, block);
-    }
 
     #[cfg(test)]
     pub fn pin_count(&self, instance_id: &str, key: &BlockKey) -> usize {
