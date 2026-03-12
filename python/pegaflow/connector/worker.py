@@ -153,7 +153,7 @@ class WorkerConnector:
             layer_kv_stride_bytes.append(kv_stride_bytes)
             layer_segments.append(segments)
 
-        ok, message = self._ctx.engine_client.register_context(
+        ok, message = self._ctx.engine_client.register_context_batch(
             self._ctx.instance_id,
             self._ctx.namespace,
             self._ctx.effective_tp_rank,

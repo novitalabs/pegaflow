@@ -223,7 +223,7 @@ class EngineRpcClient:
         """
         ...
 
-    def register_context(
+    def register_context_batch(
         self,
         instance_id: str,
         namespace: str,

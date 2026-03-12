@@ -92,7 +92,7 @@ impl GrpcEngineService {
 
 #[async_trait]
 impl Engine for GrpcEngineService {
-    async fn register_context(
+    async fn register_context_batch(
         &self,
         request: Request<RegisterContextRequest>,
     ) -> Result<Response<RegisterContextResponse>, Status> {
@@ -100,7 +100,7 @@ impl Engine for GrpcEngineService {
         let result: Result<Response<RegisterContextResponse>, Status> = async {
             let req = request.into_inner();
             debug!(
-                "RPC [register_context]: instance_id={} namespace={} device_id={} tp_rank={} tp_size={} world_size={} num_layers={} num_blocks={:?} bytes_per_block={:?} kv_stride_bytes={:?} segments={:?} wrapper_bytes_lens={:?}",
+                "RPC [register_context_batch]: instance_id={} namespace={} device_id={} tp_rank={} tp_size={} world_size={} num_layers={} num_blocks={:?} bytes_per_block={:?} kv_stride_bytes={:?} segments={:?} wrapper_bytes_lens={:?}",
                 req.instance_id,
                 req.namespace,
                 req.device_id,
@@ -199,17 +199,17 @@ impl Engine for GrpcEngineService {
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         match &result {
             Ok(_) => debug!(
-                "RPC [register_context] completed: ok elapsed_ms={:.2}",
+                "RPC [register_context_batch] completed: ok elapsed_ms={:.2}",
                 elapsed_ms
             ),
             Err(status) => warn!(
-                "RPC [register_context] failed: code={} message={} elapsed_ms={:.2}",
+                "RPC [register_context_batch] failed: code={} message={} elapsed_ms={:.2}",
                 status.code(),
                 status.message(),
                 elapsed_ms
             ),
         }
-        record_rpc_result("register_context", &result, start);
+        record_rpc_result("register_context_batch", &result, start);
         result
     }
 

@@ -329,7 +329,7 @@ impl EngineRpcClient {
     /// Returns: (ok: bool, message: str)
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (instance_id, namespace, tp_rank, tp_size, world_size, device_id, num_layers, layer_names, wrapper_bytes_list, num_blocks_list, bytes_per_block_list, kv_stride_bytes_list, segments_list))]
-    fn register_context(
+    fn register_context_batch(
         &self,
         py: Python<'_>,
         instance_id: String,
@@ -348,7 +348,7 @@ impl EngineRpcClient {
     ) -> PyResult<(bool, String)> {
         self.call(py, |mut c| async move {
             let resp = c
-                .register_context(RegisterContextRequest {
+                .register_context_batch(RegisterContextRequest {
                     instance_id,
                     namespace,
                     tp_rank,
@@ -366,7 +366,7 @@ impl EngineRpcClient {
                 .await?;
             Ok(resp.into_inner())
         })
-        .and_then(|r| status_tuple("register_context", r.status))
+        .and_then(|r| status_tuple("register_context_batch", r.status))
     }
 
     /// Save KV blocks to the engine.

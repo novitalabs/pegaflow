@@ -296,7 +296,7 @@ class PeagflowRadixCache(RadixCache):
 
         # Register all layers in one batch call
         try:
-            ok, message = self.engine_client.register_context(
+            ok, message = self.engine_client.register_context_batch(
                 self.instance_id,
                 self.namespace,
                 0 if self.is_mla else self.tp_rank,

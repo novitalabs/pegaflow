@@ -114,7 +114,7 @@ message HealthResponse {
 }
 
 service Engine {
-  rpc RegisterContext(RegisterContextRequest) returns (RegisterContextResponse);
+  rpc RegisterContextBatch(RegisterContextRequest) returns (RegisterContextResponse);
   rpc Save(SaveRequest) returns (SaveResponse);
   rpc Load(LoadRequest) returns (LoadResponse);
   // Pure memory-only query: check if prefix blocks are in memory cache (no SSD prefetch)
