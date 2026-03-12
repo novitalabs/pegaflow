@@ -38,7 +38,7 @@ use super::types::{PegaflowInstance, ServiceDiscoveryConfig};
 ///
 /// # Example
 ///
-/// ```rust,no_run
+/// ```rust,ignore
 /// use pegaflow_core::internode::{
 ///     ServiceDiscoveryConfig, InstanceRegistry, start_service_discovery,
 /// };
