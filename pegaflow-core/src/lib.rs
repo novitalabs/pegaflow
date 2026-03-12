@@ -16,8 +16,6 @@ pub mod block;
 mod cache;
 pub mod gpu_worker;
 pub mod instance;
-#[allow(dead_code)]
-pub mod internode;
 pub mod logging;
 mod metrics;
 pub mod numa;
