@@ -3,11 +3,11 @@
 //
 // Owns the TinyLFU cache and the pinned_for_load bookkeeping. All pin
 // state is encapsulated here; callers interact through `pin_blocks`,
-// `consume_pinned` (returns PinTokens), and `unpin_blocks`.
+// `consume_pinned_blocks` (transfers Arc ownership), and `unpin_blocks`.
 // ============================================================================
 
 use std::collections::{HashMap, hash_map::Entry};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use log::error;
 use parking_lot::Mutex;
@@ -15,68 +15,6 @@ use parking_lot::Mutex;
 use crate::block::{BlockKey, SealedBlock};
 use crate::cache::{CacheInsertOutcome, TinyLfuCache};
 use crate::metrics::core_metrics;
-
-// ============================================================================
-// PinToken — RAII guard for pinned blocks
-// ============================================================================
-
-/// RAII token returned by [`ReadCache::consume_pinned`].
-///
-/// Holds a strong reference to the sealed block. Dropping the token
-/// automatically decrements the pin refcount in the cache; when the
-/// last token for an (instance, block) pair is dropped the pin entry
-/// is removed entirely.
-pub struct PinToken {
-    block: Arc<SealedBlock>,
-    _guard: PinDropGuard,
-}
-
-impl PinToken {
-    /// Borrow the underlying sealed block.
-    pub fn block(&self) -> &Arc<SealedBlock> {
-        &self.block
-    }
-}
-
-/// Drop guard that releases one unit of pin refcount.
-struct PinDropGuard {
-    pin_key: (String, BlockKey),
-    block_key: BlockKey,
-    state: Weak<ReadCacheState>,
-}
-
-impl Drop for PinDropGuard {
-    fn drop(&mut self) {
-        let Some(state) = self.state.upgrade() else {
-            return;
-        };
-        let mut inner = state.inner.lock();
-
-        // Decrement per-(instance, block) refcount
-        if let Entry::Occupied(mut entry) = inner.pinned_for_load.entry(self.pin_key.clone()) {
-            let (_, count) = entry.get_mut();
-            *count -= 1;
-            if *count == 0 {
-                entry.remove();
-            }
-        }
-
-        // Decrement per-block unique refcount
-        let mut should_remove = false;
-        if let Some((bytes, total)) = inner.pinned_for_load_by_key.get_mut(&self.block_key) {
-            *total -= 1;
-            if *total == 0 {
-                should_remove = true;
-                core_metrics()
-                    .pinned_for_load_unique_bytes
-                    .add(-(*bytes as i64), &[]);
-            }
-        }
-        if should_remove {
-            inner.pinned_for_load_by_key.remove(&self.block_key);
-        }
-    }
-}
 
 // ============================================================================
 // ReadCache
@@ -204,7 +142,7 @@ impl ReadCache {
     /// Pin blocks under a single lock acquisition.
     ///
     /// `num_workers` is the number of consumers that will each call
-    /// `consume_pinned` once. The pin refcount is set accordingly.
+    /// `consume_pinned_blocks` once. The pin refcount is set accordingly.
     pub fn pin_blocks(
         &self,
         instance_id: &str,
@@ -240,52 +178,83 @@ impl ReadCache {
         }
     }
 
-    /// Consume pinned blocks, returning [`PinToken`]s.
+    /// Consume pinned blocks, returning owned [`Arc<SealedBlock>`] handles.
     ///
-    /// Each token auto-releases one unit of pin refcount when dropped.
-    /// This replaces the old `cache_lookup_many` + manual `unpin_blocks`
-    /// pattern for the normal (non-cancelled) path.
-    #[cfg_attr(feature = "tracing", fastrace::trace(name = "storage.consume_pinned"))]
-    pub fn consume_pinned(
+    /// Consuming a block decrements exactly one pin refcount for the
+    /// `(instance_id, block_key)` pair under the same lock that clones the Arc.
+    /// This keeps reservation accounting atomic while avoiding per-block
+    /// drop-time locking.
+    #[cfg_attr(
+        feature = "tracing",
+        fastrace::trace(name = "storage.consume_pinned_blocks")
+    )]
+    pub fn consume_pinned_blocks(
         &self,
         instance_id: &str,
         namespace: &str,
         block_hashes: &[Vec<u8>],
-    ) -> Result<Vec<PinToken>, String> {
+    ) -> Result<Vec<Arc<SealedBlock>>, String> {
         let keys: Vec<BlockKey> = block_hashes
             .iter()
             .map(|hash| BlockKey::new(namespace.to_string(), hash.clone()))
             .collect();
 
-        let inner = self.state.inner.lock();
+        let pin_keys: Vec<(String, BlockKey)> = keys
+            .iter()
+            .cloned()
+            .map(|key| (instance_id.to_string(), key))
+            .collect();
         let mut result = Vec::with_capacity(keys.len());
 
-        for (idx, key) in keys.into_iter().enumerate() {
-            let pin_key = (instance_id.to_string(), key.clone());
+        let mut inner = self.state.inner.lock();
 
-            if let Some((block, _count)) = inner.pinned_for_load.get(&pin_key) {
-                result.push(PinToken {
-                    block: Arc::clone(block),
-                    _guard: PinDropGuard {
-                        pin_key,
-                        block_key: key,
-                        state: Arc::downgrade(&self.state),
-                    },
-                });
+        for (idx, (key, pin_key)) in keys.iter().zip(pin_keys.iter()).enumerate() {
+            if let Some((block, _count)) = inner.pinned_for_load.get(pin_key) {
+                result.push(Arc::clone(block));
             } else {
                 return Err(format!(
                     "missing pinned KV block at index {} (namespace={}, hash_len={})",
                     idx,
-                    key.namespace,
+                    key.namespace.as_str(),
                     key.hash.len()
                 ));
+            }
+        }
+
+        for (key, pin_key) in keys.into_iter().zip(pin_keys.into_iter()) {
+            if let Some((_, count)) = inner.pinned_for_load.get_mut(&pin_key) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    inner.pinned_for_load.remove(&pin_key);
+                }
+            }
+
+            let mut unique_bytes_to_remove: Option<u64> = None;
+            if let Some((bytes, total)) = inner.pinned_for_load_by_key.get_mut(&key) {
+                *total = total.saturating_sub(1);
+                if *total == 0 {
+                    unique_bytes_to_remove = Some(*bytes);
+                }
+            } else {
+                error!(
+                    "BUG: pinned_for_load_by_key missing key during consume: namespace={} hash_len={}",
+                    key.namespace,
+                    key.hash.len()
+                );
+            }
+
+            if let Some(bytes) = unique_bytes_to_remove {
+                inner.pinned_for_load_by_key.remove(&key);
+                core_metrics()
+                    .pinned_for_load_unique_bytes
+                    .add(-(bytes as i64), &[]);
             }
         }
 
         Ok(result)
     }
 
-    /// Unpin blocks (cancellation path, before `consume_pinned`).
+    /// Unpin blocks (cancellation path, before `consume_pinned_blocks`).
     ///
     /// Decrements the refcount by 1 per hash. Returns count of
     /// entries that were successfully unpinned.
