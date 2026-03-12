@@ -25,7 +25,6 @@ use pegaflow_proto::proto::engine::meta_server_client::MetaServerClient;
 
 use crate::backing::BackingStore;
 use crate::block::{BlockKey, InflightBlock, SealedBlock, SlotInsertResult};
-use crate::cache::CacheInsertOutcome;
 use crate::metrics::core_metrics;
 use crate::numa::NumaNode;
 use crate::offload::InsertEntries;
@@ -259,18 +258,8 @@ fn process_insert_batch(
 
             // Brief lock: admit sealed block to cache + notify
             if let Some(deps) = deps.upgrade() {
-                let outcome = deps.read_cache.insert(key.clone(), Arc::clone(&sealed));
-                match outcome {
-                    CacheInsertOutcome::InsertedNew => {
-                        let m = core_metrics();
-                        m.cache_block_insertions.add(1, &[]);
-                        m.cache_resident_bytes.add(total_footprint as i64, &[]);
-                    }
-                    CacheInsertOutcome::AlreadyExists => {}
-                    CacheInsertOutcome::Rejected => {
-                        core_metrics().cache_block_admission_rejections.add(1, &[]);
-                    }
-                }
+                deps.read_cache
+                    .batch_insert(vec![(key.clone(), Arc::clone(&sealed))]);
 
                 // Seal notification (for SSD offload)
                 deps.write_pipeline.send_seal_notification(&key, &sealed);
@@ -467,7 +456,7 @@ mod tests {
 
         // Block should be in the cache
         assert!(
-            engine.read_cache.contains_key(&key),
+            engine.read_cache.contains_keys(std::slice::from_ref(&key))[0],
             "sealed block should be in cache"
         );
     }
@@ -494,7 +483,7 @@ mod tests {
             "ns",
         );
         assert_eq!(inflight.len(), 1, "block should still be inflight");
-        assert!(!engine.read_cache.contains_key(&key));
+        assert!(!engine.read_cache.contains_keys(std::slice::from_ref(&key))[0]);
 
         // Insert slot 1
         let block1 = make_layer_block(&engine, 64);
@@ -524,7 +513,7 @@ mod tests {
             inflight.is_empty(),
             "block should be sealed after 3/3 slots"
         );
-        assert!(engine.read_cache.contains_key(&key));
+        assert!(engine.read_cache.contains_keys(std::slice::from_ref(&key))[0]);
     }
 
     #[tokio::test]

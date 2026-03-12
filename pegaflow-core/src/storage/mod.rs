@@ -281,10 +281,17 @@ impl StorageEngine {
         hashes: &mut HashSet<Vec<u8>>,
     ) {
         let namespace = namespace.to_string();
-        hashes.retain(|hash| {
-            let key = BlockKey::new(namespace.clone(), hash.clone());
-            !self.read_cache.contains_key(&key)
-        });
+        let hash_vec: Vec<Vec<u8>> = hashes.iter().cloned().collect();
+        let keys: Vec<BlockKey> = hash_vec
+            .iter()
+            .map(|hash| BlockKey::new(namespace.clone(), hash.clone()))
+            .collect();
+        let present = self.read_cache.contains_keys(&keys);
+        for (hash, is_present) in hash_vec.into_iter().zip(present) {
+            if is_present {
+                hashes.remove(&hash);
+            }
+        }
     }
 
     // ====================================================================
@@ -426,9 +433,9 @@ impl StorageEngine {
 
 #[cfg(test)]
 impl StorageEngine {
-    /// Insert a single block directly into the in-memory cache (test only).
+    /// Insert a block directly into the in-memory cache (test only).
     pub(crate) fn test_insert_cache(&self, key: BlockKey, block: Arc<SealedBlock>) {
-        self.read_cache.test_insert(key, block);
+        self.read_cache.batch_insert(vec![(key, block)]);
     }
 
     /// Get the pin refcount for a (instance, block) pair (test only).
