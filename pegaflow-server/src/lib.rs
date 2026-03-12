@@ -509,6 +509,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         // Start HTTP server for health check (always enabled)
         let http_server_handle = http_server::start_http_server(
             cli.http_addr,
+            Arc::clone(&engine),
+            Arc::clone(&registry),
             cli.enable_prometheus,
             metrics_state.prometheus_registry.clone(),
             Arc::clone(&shutdown),

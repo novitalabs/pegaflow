@@ -353,6 +353,30 @@ impl PegaEngine {
         Ok(())
     }
 
+    /// Unregister all instances, returning the IDs that were removed.
+    pub fn unregister_all_instances(&self) -> Vec<String> {
+        let mut instances = self
+            .instances
+            .write()
+            .expect("instances write lock poisoned");
+        let ids: Vec<String> = instances.keys().cloned().collect();
+        instances.clear();
+        if !ids.is_empty() {
+            info!("Unregistered all instances: {:?}", ids);
+        }
+        ids
+    }
+
+    /// List all registered instance IDs.
+    pub fn list_instance_ids(&self) -> Vec<String> {
+        self.instances
+            .read()
+            .expect("instances read lock poisoned")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
     /// Pure memory-only prefix query.
     ///
     /// Checks which prefix blocks are in the memory cache without triggering

@@ -127,6 +127,13 @@ impl CudaTensorRegistry {
     }
 
     pub fn clear(&mut self) {
+        self.clear_and_count();
+    }
+
+    /// Clear all contexts and return the total number of tensors removed.
+    pub fn clear_and_count(&mut self) -> usize {
+        let tensor_count: usize = self.contexts.values().map(|ctx| ctx.tensors.len()).sum();
+
         // Clear all contexts under GIL to ensure proper Python object cleanup
         Python::attach(|py| {
             self.contexts.clear();
@@ -139,6 +146,8 @@ impl CudaTensorRegistry {
             let cuda = torch.getattr("cuda").expect("torch.cuda");
             let _ = cuda.call_method0("empty_cache");
         });
+
+        tensor_count
     }
 
     fn materialize_tensor(device_id: i32, wrapper_bytes: &[u8]) -> PyResult<LayerTensor> {
