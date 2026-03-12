@@ -114,30 +114,27 @@ async fn multi_layer_blocks_hit_only_after_all_layers_saved() {
     gpu_l1.copy_from_host(&data_l1);
 
     let engine = test_engine();
-    register_single_layer(
+    // Register both layers on the same GPU in one batch call
+    register_layers(
         &engine,
         INSTANCE_ID,
         NAMESPACE,
-        DEFAULT_LAYER,
-        gpu_l0.as_u64(),
-        TOTAL_SIZE,
-        NUM_BLOCKS,
-        BLOCK_SIZE,
-        DEVICE_ID,
-        0,
-        1,
-        1,
-        NUM_LAYERS,
-    );
-    register_single_layer(
-        &engine,
-        INSTANCE_ID,
-        NAMESPACE,
-        LAYER_1,
-        gpu_l1.as_u64(),
-        TOTAL_SIZE,
-        NUM_BLOCKS,
-        BLOCK_SIZE,
+        &[
+            LayerInfo {
+                name: DEFAULT_LAYER.to_string(),
+                gpu_ptr: gpu_l0.as_u64(),
+                total_size: TOTAL_SIZE,
+                num_blocks: NUM_BLOCKS,
+                block_size: BLOCK_SIZE,
+            },
+            LayerInfo {
+                name: LAYER_1.to_string(),
+                gpu_ptr: gpu_l1.as_u64(),
+                total_size: TOTAL_SIZE,
+                num_blocks: NUM_BLOCKS,
+                block_size: BLOCK_SIZE,
+            },
+        ],
         DEVICE_ID,
         0,
         1,

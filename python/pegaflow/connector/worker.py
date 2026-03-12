@@ -109,6 +109,14 @@ class WorkerConnector:
         actual_num_layers = len(kv_caches)
 
         layout = "unknown"
+
+        layer_names = []
+        ipc_wrappers = []
+        layer_num_blocks = []
+        layer_bytes_per_block = []
+        layer_kv_stride_bytes = []
+        layer_segments = []
+
         for layer_name, kv_cache in kv_caches.items():
             assert kv_cache.storage_offset() == 0, (
                 f"KV cache for {layer_name} must have zero storage offset"
@@ -138,24 +146,31 @@ class WorkerConnector:
                 f"Invalid bytes_per_block for {layer_name}: stride={stride}"
             )
 
-            ok, message = self._ctx.engine_client.register_context(
-                self._ctx.instance_id,
-                self._ctx.namespace,
-                self._ctx.effective_tp_rank,
-                self._ctx.effective_tp_size,
-                self._ctx.world_size,
-                self._ctx.device_id,
-                actual_num_layers,
-                layer_name,
-                wrapper_bytes,
-                num_blocks,
-                bytes_per_block,
-                kv_stride_bytes,
-                segments,
-            )
+            layer_names.append(layer_name)
+            ipc_wrappers.append(wrapper_bytes)
+            layer_num_blocks.append(num_blocks)
+            layer_bytes_per_block.append(bytes_per_block)
+            layer_kv_stride_bytes.append(kv_stride_bytes)
+            layer_segments.append(segments)
 
-            if not ok:
-                raise RuntimeError(f"Register context failed for {layer_name}: {message}")
+        ok, message = self._ctx.engine_client.register_context(
+            self._ctx.instance_id,
+            self._ctx.namespace,
+            self._ctx.effective_tp_rank,
+            self._ctx.effective_tp_size,
+            self._ctx.world_size,
+            self._ctx.device_id,
+            actual_num_layers,
+            layer_names,
+            ipc_wrappers,
+            layer_num_blocks,
+            layer_bytes_per_block,
+            layer_kv_stride_bytes,
+            layer_segments,
+        )
+
+        if not ok:
+            raise RuntimeError(f"Register context failed for {layer_name}: {message}")
 
         logger.info(
             "[PegaKVConnector] Registered %d KV cache layers (%s layout) instance=%s",

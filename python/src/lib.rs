@@ -187,21 +187,21 @@ impl PegaEngine {
         num_layers: usize,
     ) -> PyResult<()> {
         self.engine
-            .register_context_layer(
+            .register_context_layer_batch(
                 instance_id,
                 namespace,
                 device_id,
-                layer_name,
-                data_ptr,
-                size_bytes,
-                num_blocks,
-                bytes_per_block,
-                kv_stride_bytes,
-                segments,
                 tp_rank,
                 tp_size,
                 world_size,
                 num_layers,
+                &[layer_name],
+                &[data_ptr],
+                &[size_bytes],
+                &[num_blocks],
+                &[bytes_per_block],
+                &[kv_stride_bytes],
+                &[segments],
             )
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
@@ -309,26 +309,26 @@ impl EngineRpcClient {
         .and_then(|r| status_tuple("health", r.status))
     }
 
-    /// Register a context layer for KV cache operations.
+    /// Register all KV cache layers on a GPU with a single RPC call.
     ///
     /// Args:
     ///     instance_id: Model instance ID
-    ///     namespace: Namespace for model isolation
-    ///     tp_rank: Tensor parallel rank
-    ///     tp_size: Total tensor parallel size
+    ///     namespace: Namespace for block hash isolation
+    ///     tp_rank: Tensor parallel rank of the worker
+    ///     tp_size: Total Tensor Parallel size
     ///     world_size: Total worker count (TP * PP * PCP)
-    ///     device_id: CUDA device ID
-    ///     num_layers: Number of model layers
-    ///     layer_name: Name of this layer
-    ///     wrapper_bytes: Serialized CUDA tensor wrapper
-    ///     num_blocks: Number of KV blocks
-    ///     bytes_per_block: Size of each block in bytes
-    ///     kv_stride_bytes: Stride between K and V
-    ///     segments: Number of segments per block
+    ///     device_id: CUDA device ID of the worker
+    ///     num_layers: Total number of layers in the model
+    ///     layer_names: List of layer names
+    ///     wrapper_bytes_list: List of serialized CUDA tensor wrappers
+    ///     num_blocks_list: List of block counts per layer
+    ///     bytes_per_block_list: List of block sizes per layer
+    ///     kv_stride_bytes_list: List of K/V strides per layer
+    ///     segments_list: List of segment counts per layer
     ///
     /// Returns: (ok: bool, message: str)
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (instance_id, namespace, tp_rank, tp_size, world_size, device_id, num_layers, layer_name, wrapper_bytes, num_blocks, bytes_per_block, kv_stride_bytes, segments))]
+    #[pyo3(signature = (instance_id, namespace, tp_rank, tp_size, world_size, device_id, num_layers, layer_names, wrapper_bytes_list, num_blocks_list, bytes_per_block_list, kv_stride_bytes_list, segments_list))]
     fn register_context(
         &self,
         py: Python<'_>,
@@ -339,29 +339,29 @@ impl EngineRpcClient {
         world_size: u32,
         device_id: i32,
         num_layers: u32,
-        layer_name: String,
-        wrapper_bytes: Vec<u8>,
-        num_blocks: u64,
-        bytes_per_block: u64,
-        kv_stride_bytes: u64,
-        segments: u32,
+        layer_names: Vec<String>,
+        wrapper_bytes_list: Vec<Vec<u8>>,
+        num_blocks_list: Vec<u64>,
+        bytes_per_block_list: Vec<u64>,
+        kv_stride_bytes_list: Vec<u64>,
+        segments_list: Vec<u32>,
     ) -> PyResult<(bool, String)> {
         self.call(py, |mut c| async move {
             let resp = c
                 .register_context(RegisterContextRequest {
                     instance_id,
+                    namespace,
                     tp_rank,
                     tp_size,
                     world_size,
                     device_id,
                     num_layers,
-                    layer_name,
-                    wrapper_bytes,
-                    num_blocks,
-                    bytes_per_block,
-                    kv_stride_bytes,
-                    segments,
-                    namespace,
+                    layer_names,
+                    wrapper_bytes: wrapper_bytes_list,
+                    num_blocks: num_blocks_list,
+                    bytes_per_block: bytes_per_block_list,
+                    kv_stride_bytes: kv_stride_bytes_list,
+                    segments: segments_list,
                 })
                 .await?;
             Ok(resp.into_inner())

@@ -232,14 +232,14 @@ class EngineRpcClient:
         world_size: int,
         device_id: int,
         num_layers: int,
-        layer_name: str,
-        wrapper_bytes: bytes,
-        num_blocks: int,
-        bytes_per_block: int,
-        kv_stride_bytes: int,
-        segments: int,
+        layer_names: list[str],
+        wrapper_bytes_list: list[bytes],
+        num_blocks_list: list[int],
+        bytes_per_block_list: list[int],
+        kv_stride_bytes_list: list[int],
+        segments_list: list[int],
     ) -> tuple[bool, str]:
-        """Register a context layer for KV cache operations.
+        """Register all KV cache layers on a GPU with a single RPC call.
 
         Args:
             instance_id: Model instance ID.
@@ -249,12 +249,12 @@ class EngineRpcClient:
             world_size: Total worker count (TP * PP * PCP).
             device_id: CUDA device ID.
             num_layers: Number of model layers.
-            layer_name: Name of this layer.
-            wrapper_bytes: Serialized CUDA IPC tensor wrapper (pickle bytes).
-            num_blocks: Number of KV blocks.
-            bytes_per_block: Size of each block in bytes.
-            kv_stride_bytes: Stride between K and V segments.
-            segments: Number of segments per block.
+            layer_names: List of layer names.
+            wrapper_bytes_list: List of serialized CUDA IPC tensor wrappers.
+            num_blocks_list: List of block counts per layer.
+            bytes_per_block_list: List of block sizes per layer.
+            kv_stride_bytes_list: List of K/V strides per layer.
+            segments_list: List of segment counts per layer.
 
         Returns:
             Tuple of (ok, message) indicating success/failure.
