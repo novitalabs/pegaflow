@@ -1,19 +1,18 @@
-use axum::extract::{Path, State};
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::{Json, Router, routing::delete, routing::get, routing::post};
+use axum::{Json, Router, routing::get, routing::post};
 use log::{info, warn};
 use parking_lot::Mutex;
 use pegaflow_core::PegaEngine;
 use prometheus::{Registry, TextEncoder};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 
 use crate::registry::CudaTensorRegistry;
 
-/// Shared state for HTTP handlers that need engine access.
 #[derive(Clone)]
 struct AppState {
     engine: Arc<PegaEngine>,
@@ -21,12 +20,10 @@ struct AppState {
     prometheus_registry: Option<Registry>,
 }
 
-/// Handler for health check endpoint
 async fn health_handler() -> &'static str {
     "ok"
 }
 
-/// Handler for Prometheus /metrics endpoint
 async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     let Some(ref registry) = state.prometheus_registry else {
         return (StatusCode::NOT_FOUND, "metrics not enabled".to_string());
@@ -46,10 +43,14 @@ struct InstancesResponse {
     instances: Vec<String>,
 }
 
-/// Handler for listing all registered instances.
 async fn list_instances_handler(State(state): State<AppState>) -> Json<InstancesResponse> {
     let instances = state.engine.list_instance_ids();
     Json(InstancesResponse { instances })
+}
+
+#[derive(Deserialize)]
+struct CleanupQuery {
+    id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -58,83 +59,78 @@ struct CleanupResponse {
     removed_tensors: usize,
 }
 
-/// Handler for cleaning up all instances and their CUDA tensors.
-async fn cleanup_instances_handler(State(state): State<AppState>) -> Json<CleanupResponse> {
-    // 1. Drop all CUDA IPC tensors first (requires GIL, gc.collect, empty_cache)
-    let removed_tensors = {
-        let mut registry = state.registry.lock();
-        registry.clear_and_count()
-    };
-
-    // 2. Remove all instances from the engine
-    let removed_instances = state.engine.unregister_all_instances();
-
-    if !removed_instances.is_empty() || removed_tensors > 0 {
-        warn!(
-            "Cleanup: removed {} instance(s) {:?}, {} CUDA tensor(s)",
-            removed_instances.len(),
-            removed_instances,
-            removed_tensors
-        );
-    } else {
-        info!("Cleanup: nothing to clean");
-    }
-
-    Json(CleanupResponse {
-        removed_instances,
-        removed_tensors,
-    })
-}
-
-#[derive(Serialize)]
-struct DeleteInstanceResponse {
-    instance_id: String,
-    removed_tensors: usize,
-}
-
-/// Handler for deleting a specific instance and its CUDA tensors.
-async fn delete_instance_handler(
+/// POST /instances/cleanup[?id=<instance_id>]
+///
+/// Without `id`: remove all instances and release all CUDA IPC tensors.
+/// With `id`:    remove only the specified instance.
+async fn cleanup_handler(
     State(state): State<AppState>,
-    Path(instance_id): Path<String>,
+    Query(query): Query<CleanupQuery>,
 ) -> impl IntoResponse {
-    // 1. Drop CUDA IPC tensors for this instance
-    let removed_tensors = {
-        let mut registry = state.registry.lock();
-        registry.drop_instance(&instance_id)
-    };
+    match query.id {
+        None => {
+            let removed_tensors = {
+                let mut registry = state.registry.lock();
+                registry.clear_and_count()
+            };
+            let removed_instances = state.engine.unregister_all_instances();
 
-    // 2. Remove instance from the engine
-    match state.engine.unregister_instance(&instance_id) {
-        Ok(()) => {
-            warn!(
-                "Deleted instance {}, {} CUDA tensor(s) released",
-                instance_id, removed_tensors
-            );
+            if !removed_instances.is_empty() || removed_tensors > 0 {
+                warn!(
+                    "Cleanup all: removed {:?}, {} CUDA tensor(s) released",
+                    removed_instances, removed_tensors
+                );
+            } else {
+                info!("Cleanup all: nothing to remove");
+            }
+
             (
                 StatusCode::OK,
-                Json(DeleteInstanceResponse {
-                    instance_id,
+                Json(CleanupResponse {
+                    removed_instances,
                     removed_tensors,
                 })
                 .into_response(),
             )
         }
-        Err(_) if removed_tensors > 0 => {
-            // Tensors were cleaned but instance was already gone from engine
-            warn!(
-                "Instance {} not in engine but cleaned {} CUDA tensor(s)",
-                instance_id, removed_tensors
-            );
-            (
-                StatusCode::OK,
-                Json(DeleteInstanceResponse {
-                    instance_id,
-                    removed_tensors,
-                })
-                .into_response(),
-            )
+        Some(instance_id) => {
+            let removed_tensors = {
+                let mut registry = state.registry.lock();
+                registry.drop_instance(&instance_id)
+            };
+
+            match state.engine.unregister_instance(&instance_id) {
+                Ok(()) => {
+                    warn!(
+                        "Cleanup instance {}: {} CUDA tensor(s) released",
+                        instance_id, removed_tensors
+                    );
+                    (
+                        StatusCode::OK,
+                        Json(CleanupResponse {
+                            removed_instances: vec![instance_id],
+                            removed_tensors,
+                        })
+                        .into_response(),
+                    )
+                }
+                Err(_) if removed_tensors > 0 => {
+                    warn!(
+                        "Instance {} not in engine but cleaned {} CUDA tensor(s)",
+                        instance_id, removed_tensors
+                    );
+                    (
+                        StatusCode::OK,
+                        Json(CleanupResponse {
+                            removed_instances: vec![instance_id],
+                            removed_tensors,
+                        })
+                        .into_response(),
+                    )
+                }
+                Err(e) => (StatusCode::NOT_FOUND, format!("{e}").into_response()),
+            }
         }
-        Err(e) => (StatusCode::NOT_FOUND, format!("{e}").into_response()),
     }
 }
 
@@ -162,18 +158,17 @@ pub async fn start_http_server(
     let mut app = Router::new()
         .route("/health", get(health_handler))
         .route("/instances", get(list_instances_handler))
-        .route("/instances/cleanup", post(cleanup_instances_handler))
-        .route("/instances/{instance_id}", delete(delete_instance_handler));
+        .route("/instances/cleanup", post(cleanup_handler));
 
     if enable_prometheus {
         app = app.route("/metrics", get(metrics_handler));
         info!(
-            "Starting HTTP server on {} (/health, /metrics, /instances, /instances/cleanup, /instances/:id)",
+            "Starting HTTP server on {} (/health, /metrics, /instances, /instances/cleanup)",
             addr
         );
     } else {
         info!(
-            "Starting HTTP server on {} (/health, /instances, /instances/cleanup, /instances/:id)",
+            "Starting HTTP server on {} (/health, /instances, /instances/cleanup)",
             addr
         );
     }
