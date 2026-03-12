@@ -204,6 +204,15 @@ impl PinnedMemoryPool {
         let allocator = self.allocator.lock();
         allocator.storage_report().largest_free_allocation_bytes
     }
+
+    /// Return the base address and size of the backing memory region.
+    ///
+    /// Used for RDMA memory registration: the entire pool must be registered
+    /// with the transfer engine so that any allocation within it can be
+    /// accessed via one-sided RDMA reads.
+    fn memory_region(&self) -> (u64, usize) {
+        (self.backing.as_ptr() as u64, self.backing.size())
+    }
 }
 
 impl Drop for PinnedMemoryPool {
@@ -466,6 +475,19 @@ impl PinnedAllocator {
     /// Check if this is a NUMA allocator.
     pub(crate) fn is_numa(&self) -> bool {
         matches!(self, Self::Numa(_))
+    }
+
+    /// Return `(base_ptr, size)` for every backing memory region.
+    ///
+    /// Global allocator: one region. NUMA allocator: one per node.
+    /// The caller (e.g. RdmaManager) registers each region with the
+    /// transfer engine so that any pinned allocation can be reached
+    /// via one-sided RDMA reads.
+    pub(crate) fn memory_regions(&self) -> Vec<(u64, usize)> {
+        match self {
+            Self::Global(pool) => vec![pool.memory_region()],
+            Self::Numa(pools) => pools.pools.values().map(|p| p.memory_region()).collect(),
+        }
     }
 }
 

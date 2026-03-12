@@ -22,6 +22,7 @@ pub(crate) enum ConnectRespError {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum ControlMessage {
     ConnectReq {
         request_id: u64,
@@ -72,6 +73,7 @@ impl From<WireRcEndpoint> for RcEndpoint {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[allow(clippy::enum_variant_names)]
 enum WireControlMessage {
     ConnectReq {
         request_id: u64,

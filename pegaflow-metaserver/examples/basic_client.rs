@@ -36,6 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         namespace: namespace.to_string(),
         block_hashes: block_hashes.clone(),
         node: node.to_string(),
+        domain_addresses: vec![],
     };
 
     let response = client.insert_block_hashes(request).await?;

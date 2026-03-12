@@ -198,6 +198,7 @@ async fn insert_actor(
                 namespace: namespace.clone(),
                 block_hashes,
                 node: node_addr.clone(),
+                domain_addresses: vec![],
             };
             let t = std::time::Instant::now();
             match c.insert_block_hashes(req).await {

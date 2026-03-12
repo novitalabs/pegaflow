@@ -16,6 +16,7 @@ pub mod block;
 mod cache;
 pub mod gpu_worker;
 pub mod instance;
+pub mod lease;
 pub mod logging;
 pub mod metaserver;
 mod metrics;
@@ -33,9 +34,11 @@ pub use backing::{
     DEFAULT_SSD_WRITE_INFLIGHT, DEFAULT_SSD_WRITE_QUEUE_DEPTH, SsdCacheConfig,
 };
 pub use block::{
-    BlockHash, BlockKey, BlockStatus, LayerBlock, LayerSave, PrefetchStatus, SealedBlock,
+    BlockHash, BlockKey, BlockLookupResult, BlockStatus, LayerBlock, LayerSave, PrefetchStatus,
+    SealedBlock,
 };
 pub use instance::{GpuContext, InstanceContext, KVCacheRegistration};
+pub use lease::{LeaseConfig, LeaseError, LeaseGrant, LeaseManager};
 pub use numa::NumaNode;
 use numa::NumaTopology;
 pub use pinned_pool::PinnedAllocation;
@@ -70,6 +73,7 @@ use std::{
 };
 
 use log::{debug, info, warn};
+use uuid::Uuid;
 
 use crate::backing::SSD_ALIGNMENT;
 use crate::gpu_worker::{LayerLoadData, LoadBlock, LoadTask};
@@ -137,6 +141,10 @@ pub struct PegaEngine {
     storage: Arc<StorageEngine>,
     /// GPU-NUMA topology for memory allocation decisions.
     topology: Arc<NumaTopology>,
+    /// Stable node identity for RDMA lease tracking.
+    node_id: Uuid,
+    /// Lease manager for RDMA P2P block transfer.
+    lease_manager: Arc<LeaseManager>,
 }
 
 #[allow(clippy::new_without_default)]
@@ -178,10 +186,16 @@ impl PegaEngine {
 
         let storage = StorageEngine::new_with_config(pool_size, use_hugepages, config, &numa_nodes);
 
+        let node_id = Uuid::new_v4();
+        let lease_manager = Arc::new(LeaseManager::new(LeaseConfig::default()));
+        info!("PegaEngine node_id={node_id}");
+
         PegaEngine {
             instances: RwLock::new(HashMap::new()),
             storage,
             topology,
+            node_id,
+            lease_manager,
         }
     }
 
@@ -540,6 +554,74 @@ impl PegaEngine {
             layers,
             load_state_shm: load_state_shm.to_string(),
         })
+    }
+
+    /// Look up sealed blocks by hash for RDMA lease acquisition.
+    ///
+    /// Returns (found_blocks, missing_hashes). Does not stop at first miss.
+    pub fn get_blocks_for_lease(
+        &self,
+        namespace: &str,
+        block_hashes: &[Vec<u8>],
+    ) -> BlockLookupResult {
+        self.storage.get_blocks_for_lease(namespace, block_hashes)
+    }
+
+    /// Return `(base_ptr, size)` for every pinned memory region.
+    ///
+    /// Used for RDMA memory registration: each region must be registered
+    /// with `MooncakeTransferEngine::register_memory` so that one-sided
+    /// RDMA reads can reach any sealed block in the pool.
+    pub fn pinned_pool_regions(&self) -> Vec<(u64, usize)> {
+        self.storage.pinned_pool_regions()
+    }
+
+    /// Stable node identity for RDMA lease tracking.
+    pub fn node_id(&self) -> Uuid {
+        self.node_id
+    }
+
+    /// Acquire a lease on sealed blocks for RDMA transfer.
+    pub fn acquire_lease(
+        &self,
+        requester_node_id: &str,
+        namespace: &str,
+        found_blocks: Vec<(BlockKey, Arc<SealedBlock>)>,
+        missing_hashes: Vec<Vec<u8>>,
+        requested_duration_secs: u32,
+    ) -> Result<LeaseGrant, LeaseError> {
+        self.lease_manager.acquire(
+            requester_node_id,
+            namespace,
+            found_blocks,
+            missing_hashes,
+            requested_duration_secs,
+        )
+    }
+
+    /// Extend an existing lease.
+    pub fn renew_lease(
+        &self,
+        lease_id: lease::LeaseId,
+        requester_node_id: &str,
+        extend_duration_secs: u32,
+    ) -> Result<u64, LeaseError> {
+        self.lease_manager
+            .renew(lease_id, requester_node_id, extend_duration_secs)
+    }
+
+    /// Release a lease, dropping Arc references so blocks become evictable.
+    pub fn release_lease(
+        &self,
+        lease_id: lease::LeaseId,
+        requester_node_id: &str,
+    ) -> Result<(), LeaseError> {
+        self.lease_manager.release(lease_id, requester_node_id)
+    }
+
+    /// Sweep expired leases. Call periodically from a background task.
+    pub fn sweep_expired_leases(&self) -> usize {
+        self.lease_manager.sweep_expired()
     }
 
     /// Remove stale inflight blocks (background GC).

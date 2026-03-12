@@ -8,6 +8,9 @@ use std::time::Instant;
 use crate::numa::NumaNode;
 use crate::pinned_pool::PinnedAllocation;
 
+/// Result of a block lookup: (found blocks with keys, missing hashes).
+pub type BlockLookupResult = (Vec<(BlockKey, Arc<SealedBlock>)>, Vec<Vec<u8>>);
+
 // ============================================================================
 // BlockKey
 // ============================================================================
@@ -141,6 +144,22 @@ impl LayerBlock {
         self.size
     }
 
+    /// Returns `(k_addr, k_size, v_addr, v_size)` for RDMA read descriptor building.
+    ///
+    /// For split-storage blocks (K and V in separate allocations), both sizes
+    /// equal `self.size`. For contiguous blocks (K+V packed), each is half.
+    pub(crate) fn rdma_kv_addrs(&self) -> (u64, u64, u64, u64) {
+        let k_addr = self.k_ptr.as_ptr() as u64;
+        let k_size = self.size as u64;
+        match self.v_ptr {
+            Some(v) => (k_addr, k_size, v.as_ptr() as u64, k_size),
+            None => {
+                let half = k_size / 2;
+                (k_addr, half, k_addr + half, half)
+            }
+        }
+    }
+
     /// Total pinned memory occupied by this layer block.
     fn memory_footprint(&self) -> u64 {
         self.size as u64
@@ -173,9 +192,14 @@ impl SealedBlock {
         self.footprint
     }
 
-    /// Get all slots (for serialization)
+    /// Get all slots (for serialization).
     pub(crate) fn slots(&self) -> &[Arc<LayerBlock>] {
         &self.slots
+    }
+
+    /// Return per-slot `(k_addr, k_size, v_addr, v_size)` for RDMA descriptor building.
+    pub fn rdma_slot_addrs(&self) -> Vec<(u64, u64, u64, u64)> {
+        self.slots.iter().map(|s| s.rdma_kv_addrs()).collect()
     }
 
     /// Per-slot NUMA affinity for SSD write path.
@@ -188,6 +212,16 @@ impl SealedBlock {
         let footprint = slots.iter().map(|s| s.memory_footprint()).sum();
         Self {
             slots: slots.into_boxed_slice(),
+            footprint,
+            slot_numas: Vec::new(),
+        }
+    }
+
+    /// Create with explicit footprint (test only).
+    #[cfg(test)]
+    pub(crate) fn with_footprint(footprint: u64) -> Self {
+        Self {
+            slots: Vec::new().into_boxed_slice(),
             footprint,
             slot_numas: Vec::new(),
         }

@@ -42,5 +42,10 @@ prometheus.workspace = true
 tikv-jemallocator.workspace = true
 fastrace = { workspace = true, features = ["enable"], optional = true }
 
+[dev-dependencies]
+pegaflow-transfer.workspace = true
+cudarc.workspace = true
+libc.workspace = true
+
 [build-dependencies]
 pyo3-build-config.workspace = true

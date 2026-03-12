@@ -133,6 +133,9 @@ message InsertBlockHashesRequest {
   repeated bytes block_hashes = 2;
   // The pegaflow-server address that owns these blocks, as ip:port (e.g., "10.0.0.1:50055")
   string node = 3;
+  // Per-NUMA RDMA DomainAddress endpoints (26 bytes each).
+  // Enables requestors to pre-establish RDMA sessions before AcquireLease.
+  repeated bytes domain_addresses = 4;
 }
 
 message InsertBlockHashesResponse {
@@ -149,6 +152,8 @@ message QueryBlockHashesRequest {
 message NodeBlockHashes {
   string node = 1;
   repeated bytes block_hashes = 2;
+  // Per-NUMA RDMA DomainAddress endpoints of the owning node.
+  repeated bytes domain_addresses = 3;
 }
 
 message QueryBlockHashesResponse {
@@ -158,6 +163,68 @@ message QueryBlockHashesResponse {
   uint64 found_count = 4;
   // Found hashes grouped by owning node
   repeated NodeBlockHashes node_blocks = 5;
+}
+
+// ============================================================================
+// RdmaTransfer: Lease-based RDMA P2P block transfer service
+// ============================================================================
+
+// Per-slot memory location for RDMA read (one per TP rank within a block).
+message SlotMemory {
+  uint64 k_addr = 1;   // Remote virtual address of K segment
+  uint64 k_size = 2;
+  uint64 v_addr = 3;   // Remote virtual address of V segment
+  uint64 v_size = 4;
+}
+
+// Describes a single block's remote memory layout for RDMA read.
+message RemoteBlockDescriptor {
+  bytes block_hash = 1;
+  repeated SlotMemory slots = 2;
+}
+
+message AcquireLeaseRequest {
+  string requester_node_id = 1;  // UUID of requesting node
+  string namespace = 2;
+  repeated bytes block_hashes = 3;
+  uint32 lease_duration_secs = 4; // Requested duration; server may cap
+}
+
+message AcquireLeaseResponse {
+  string lease_id = 1;
+  repeated RemoteBlockDescriptor blocks = 2;
+  repeated bytes missing_hashes = 3;
+  uint64 expires_at_unix_ms = 4;
+  // DomainAddress (26 bytes) of the owner's RDMA transfer engine
+  // on the NUMA node where the majority of leased blocks reside.
+  bytes owner_domain_address = 5;
+}
+
+message RenewLeaseRequest {
+  string lease_id = 1;
+  string requester_node_id = 2;
+  uint32 extend_duration_secs = 3;
+}
+
+message RenewLeaseResponse {
+  uint64 new_expires_at_unix_ms = 1;
+}
+
+message ReleaseLeaseRequest {
+  string lease_id = 1;
+  string requester_node_id = 2;
+}
+
+message ReleaseLeaseResponse {}
+
+service RdmaTransfer {
+  // Acquire a time-bounded lease on remote blocks. Pins blocks in memory
+  // and returns their virtual addresses for RDMA READ.
+  rpc AcquireLease(AcquireLeaseRequest) returns (AcquireLeaseResponse);
+  // Extend an existing lease before it expires.
+  rpc RenewLease(RenewLeaseRequest) returns (RenewLeaseResponse);
+  // Release a lease after RDMA reads complete. Unpins blocks.
+  rpc ReleaseLease(ReleaseLeaseRequest) returns (ReleaseLeaseResponse);
 }
 
 service MetaServer {

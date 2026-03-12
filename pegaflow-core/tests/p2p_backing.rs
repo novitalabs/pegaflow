@@ -117,6 +117,7 @@ async fn metaserver_grpc_query_returns_inserted_hashes() {
             namespace: namespace.to_string(),
             node: node.to_string(),
             block_hashes: hashes.clone(),
+            domain_addresses: vec![],
         })
         .await
         .expect("insert rpc")
@@ -176,6 +177,7 @@ async fn metaserver_grpc_empty_hashes_returns_error() {
             namespace: "ns".to_string(),
             node: "node".to_string(),
             block_hashes: vec![],
+            domain_addresses: vec![],
         })
         .await
         .expect("insert rpc")

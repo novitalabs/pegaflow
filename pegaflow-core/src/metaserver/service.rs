@@ -138,6 +138,7 @@ impl MetaServer for GrpcMetaService {
             .map(|(node, block_hashes)| NodeBlockHashes {
                 node: node.to_string(),
                 block_hashes,
+                domain_addresses: vec![],
             })
             .collect();
 

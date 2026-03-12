@@ -24,6 +24,7 @@ use std::sync::{Arc, Weak};
 use crate::backing::{
     BackingStore, BackingStoreKind, BakingStoreConfig, DEFAULT_MAX_PREFETCH_BLOCKS, SsdCacheConfig,
 };
+use crate::block::BlockLookupResult;
 use crate::block::{BlockKey, PrefetchStatus, SealedBlock};
 use crate::metrics::core_metrics;
 use crate::numa::NumaNode;
@@ -313,6 +314,25 @@ impl StorageEngine {
     ) -> usize {
         self.read_cache
             .unpin_blocks(instance_id, namespace, block_hashes)
+    }
+
+    /// Non-prefix batch get: returns found sealed blocks and missing hashes.
+    ///
+    /// Used by the RDMA lease manager to look up arbitrary blocks.
+    pub(crate) fn get_blocks_for_lease(
+        &self,
+        namespace: &str,
+        block_hashes: &[Vec<u8>],
+    ) -> BlockLookupResult {
+        self.read_cache
+            .get_blocks_for_lease(namespace, block_hashes)
+    }
+
+    /// Return `(base_ptr, size)` for every pinned memory region.
+    ///
+    /// Used for RDMA memory registration at server startup.
+    pub(crate) fn pinned_pool_regions(&self) -> Vec<(u64, usize)> {
+        self.allocator.memory_regions()
     }
 
     /// Pure memory-only prefix check. Returns `(hit, missing)`.

@@ -1,6 +1,7 @@
 pub mod http_server;
 pub mod metric;
 pub mod proto;
+pub mod rdma_service;
 pub mod registry;
 pub mod service;
 #[cfg(feature = "tracing")]
@@ -12,6 +13,7 @@ mod trace {
 }
 mod utils;
 
+pub use rdma_service::GrpcRdmaTransferService;
 pub use registry::CudaTensorRegistry;
 pub use service::GrpcEngineService;
 
@@ -25,6 +27,7 @@ use parking_lot::Mutex;
 use pegaflow_core::PegaEngine;
 use prometheus::Registry;
 use proto::engine::engine_server::EngineServer;
+use proto::engine::rdma_transfer_server::RdmaTransferServer;
 use pyo3::{PyErr, Python, types::PyAnyMethods};
 use std::error::Error;
 use std::net::SocketAddr;
@@ -497,6 +500,33 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             info!("Inflight GC task started (interval=5m, max_age=60m)");
         }
 
+        // Spawn background lease sweep task for expired leases
+        {
+            let engine = Arc::clone(&engine);
+            let shutdown = Arc::clone(&shutdown);
+            tokio::spawn(async move {
+                const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+                let mut interval = tokio::time::interval(SWEEP_INTERVAL);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            let swept = engine.sweep_expired_leases();
+                            if swept > 0 {
+                                info!("Lease sweep: released {} expired leases", swept);
+                            }
+                        }
+                        _ = shutdown.notified() => {
+                            info!("Lease sweep task shutting down");
+                            break;
+                        }
+                    }
+                }
+            });
+            info!("Lease sweep task started (interval=30s)");
+        }
+
         // Start HTTP server for health check (always enabled)
         let http_server_handle = http_server::start_http_server(
             cli.http_addr,
@@ -528,8 +558,12 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
             .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE);
 
+        let rdma_service = GrpcRdmaTransferService::new(Arc::clone(&engine));
+        let rdma_grpc_service = RdmaTransferServer::new(rdma_service);
+
         if let Err(err) = Server::builder()
             .add_service(grpc_service)
+            .add_service(rdma_grpc_service)
             .serve_with_shutdown(cli.addr, shutdown_signal)
             .await
         {

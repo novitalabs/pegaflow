@@ -12,7 +12,7 @@ use std::sync::Arc;
 use log::error;
 use parking_lot::Mutex;
 
-use crate::block::{BlockKey, SealedBlock};
+use crate::block::{BlockKey, BlockLookupResult, SealedBlock};
 use crate::cache::{CacheInsertOutcome, TinyLfuCache};
 use crate::metrics::core_metrics;
 
@@ -106,6 +106,31 @@ impl ReadCache {
             }
         }
         (hit, blocks)
+    }
+
+    /// Non-prefix batch get: returns found blocks and missing hashes.
+    ///
+    /// Does not stop at first miss. Used by the RDMA lease manager.
+    pub fn get_blocks_for_lease(
+        &self,
+        namespace: &str,
+        block_hashes: &[Vec<u8>],
+    ) -> BlockLookupResult {
+        let ns = namespace.to_string();
+        let mut found = Vec::new();
+        let mut missing = Vec::new();
+        {
+            let mut inner = self.state.inner.lock();
+            for hash in block_hashes {
+                let key = BlockKey::new(ns.clone(), hash.clone());
+                if let Some(block) = inner.cache.get(&key) {
+                    found.push((key, Arc::clone(&block)));
+                } else {
+                    missing.push(hash.clone());
+                }
+            }
+        }
+        (found, missing)
     }
 
     // ====================================================================
