@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "pegaflow-numa",
   "pegaflow-core",
   "pegaflow-proto",
   "pegaflow-server",
@@ -15,6 +16,7 @@ edition = "2024"
 
 [workspace.dependencies]
 # Workspace members
+pegaflow-numa = { path = "pegaflow-numa" }
 pegaflow-core = { path = "pegaflow-core" }
 pegaflow-transfer = { path = "pegaflow-transfer" }
 sideway = "0.4.1"
