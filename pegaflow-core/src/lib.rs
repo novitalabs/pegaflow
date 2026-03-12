@@ -41,7 +41,7 @@ pub use numa::NumaNode;
 use numa::NumaTopology;
 pub use pinned_pool::PinnedAllocation;
 pub use seal_offload::SlotMeta;
-pub use storage::{SealNotification, StorageConfig};
+pub use storage::{PinToken, SealNotification, StorageConfig};
 pub use sync_state::{LoadState, LoadStateError};
 pub use trace::{set_trace_sample_rate, should_sample};
 
@@ -568,7 +568,7 @@ impl PegaEngine {
                 .zip(block_cache.iter())
                 .filter_map(|(block_id, block_entry)| {
                     let block_idx = usize::try_from(*block_id).ok()?;
-                    let layer_block = block_entry.get_slot(slot_id)?.clone();
+                    let layer_block = block_entry.block().get_slot(slot_id)?.clone();
                     Some(LoadBlock {
                         block_idx,
                         layer_block,

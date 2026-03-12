@@ -27,7 +27,6 @@ tonic-prost.workspace = true
 tokio.workspace = true
 clap.workspace = true
 log.workspace = true
-logforth.workspace = true
 parking_lot.workspace = true
 axum.workspace = true
 reqwest.workspace = true
@@ -41,7 +40,6 @@ opentelemetry-otlp.workspace = true
 opentelemetry-prometheus.workspace = true
 prometheus.workspace = true
 tikv-jemallocator.workspace = true
-colored.workspace = true
 fastrace = { workspace = true, features = ["enable"], optional = true }
 
 [build-dependencies]

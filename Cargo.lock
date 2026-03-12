@@ -2210,16 +2210,13 @@ name = "pegaflow-metaserver"
 version = "0.0.16"
 dependencies = [
  "clap",
- "colored",
  "log",
  "logforth",
  "moka",
- "parking_lot",
  "pegaflow-core",
  "pegaflow-proto",
  "prost",
  "serde",
- "serde_json",
  "tokio",
  "tonic",
 ]
@@ -2239,7 +2236,6 @@ name = "pegaflow-py"
 version = "0.0.16"
 dependencies = [
  "log",
- "logforth",
  "pegaflow-core",
  "pegaflow-metaserver",
  "pegaflow-proto",
@@ -2256,11 +2252,9 @@ version = "0.0.16"
 dependencies = [
  "axum",
  "clap",
- "colored",
  "cudarc",
  "fastrace",
  "log",
- "logforth",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-prometheus",

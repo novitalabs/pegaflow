@@ -176,7 +176,7 @@ impl BackingStore for SsdBackingStore {
         }
     }
 
-    fn read_prefix(
+    fn submit_prefix(
         &self,
         keys: Vec<BlockKey>,
     ) -> (usize, oneshot::Receiver<super::PrefetchResult>) {

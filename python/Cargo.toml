@@ -27,4 +27,3 @@ pegaflow-metaserver = { path = "../pegaflow-metaserver" }
 tokio.workspace = true
 tonic.workspace = true
 log.workspace = true
-logforth.workspace = true
