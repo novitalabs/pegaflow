@@ -1,7 +1,7 @@
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::{Json, Router, routing::get, routing::post};
+use axum::{Json, Router, routing::delete, routing::get, routing::post};
 use log::{info, warn};
 use parking_lot::Mutex;
 use pegaflow_core::PegaEngine;
@@ -86,6 +86,58 @@ async fn cleanup_instances_handler(State(state): State<AppState>) -> Json<Cleanu
     })
 }
 
+#[derive(Serialize)]
+struct DeleteInstanceResponse {
+    instance_id: String,
+    removed_tensors: usize,
+}
+
+/// Handler for deleting a specific instance and its CUDA tensors.
+async fn delete_instance_handler(
+    State(state): State<AppState>,
+    Path(instance_id): Path<String>,
+) -> impl IntoResponse {
+    // 1. Drop CUDA IPC tensors for this instance
+    let removed_tensors = {
+        let mut registry = state.registry.lock();
+        registry.drop_instance(&instance_id)
+    };
+
+    // 2. Remove instance from the engine
+    match state.engine.unregister_instance(&instance_id) {
+        Ok(()) => {
+            warn!(
+                "Deleted instance {}, {} CUDA tensor(s) released",
+                instance_id, removed_tensors
+            );
+            (
+                StatusCode::OK,
+                Json(DeleteInstanceResponse {
+                    instance_id,
+                    removed_tensors,
+                })
+                .into_response(),
+            )
+        }
+        Err(_) if removed_tensors > 0 => {
+            // Tensors were cleaned but instance was already gone from engine
+            warn!(
+                "Instance {} not in engine but cleaned {} CUDA tensor(s)",
+                instance_id, removed_tensors
+            );
+            (
+                StatusCode::OK,
+                Json(DeleteInstanceResponse {
+                    instance_id,
+                    removed_tensors,
+                })
+                .into_response(),
+            )
+        }
+        Err(e) => (StatusCode::NOT_FOUND, format!("{e}").into_response()),
+    }
+}
+
 /// Start HTTP server for health check, optional Prometheus metrics, and instance management.
 pub async fn start_http_server(
     addr: std::net::SocketAddr,
@@ -110,17 +162,18 @@ pub async fn start_http_server(
     let mut app = Router::new()
         .route("/health", get(health_handler))
         .route("/instances", get(list_instances_handler))
-        .route("/instances/cleanup", post(cleanup_instances_handler));
+        .route("/instances/cleanup", post(cleanup_instances_handler))
+        .route("/instances/{instance_id}", delete(delete_instance_handler));
 
     if enable_prometheus {
         app = app.route("/metrics", get(metrics_handler));
         info!(
-            "Starting HTTP server on {} (/health, /metrics, /instances, /instances/cleanup)",
+            "Starting HTTP server on {} (/health, /metrics, /instances, /instances/cleanup, /instances/:id)",
             addr
         );
     } else {
         info!(
-            "Starting HTTP server on {} (/health, /instances, /instances/cleanup)",
+            "Starting HTTP server on {} (/health, /instances, /instances/cleanup, /instances/:id)",
             addr
         );
     }
