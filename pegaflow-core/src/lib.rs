@@ -41,7 +41,7 @@ pub use numa::NumaNode;
 use numa::NumaTopology;
 pub use pinned_pool::PinnedAllocation;
 pub use seal_offload::SlotMeta;
-pub use storage::{PinToken, SealNotification, StorageConfig};
+pub use storage::{SealNotification, StorageConfig};
 pub use sync_state::{LoadState, LoadStateError};
 pub use trace::{set_trace_sample_rate, should_sample};
 
@@ -536,11 +536,11 @@ impl PegaEngine {
             .get_gpu(device_id)
             .ok_or_else(|| EngineError::WorkerMissing(instance_id.to_string(), device_id))?;
 
-        // Lookup all blocks (consumes pinned blocks)
+        // Consume all pinned blocks reserved for this load.
         trace_scope!("load.cache_lookup", _s);
         let block_cache = self
             .storage
-            .cache_lookup_many(instance_id, namespace, block_hashes)
+            .consume_pinned_blocks(instance_id, namespace, block_hashes)
             .map_err(EngineError::Storage)?;
         trace_drop!(_s);
 
@@ -568,7 +568,7 @@ impl PegaEngine {
                 .zip(block_cache.iter())
                 .filter_map(|(block_id, block_entry)| {
                     let block_idx = usize::try_from(*block_id).ok()?;
-                    let layer_block = block_entry.block().get_slot(slot_id)?.clone();
+                    let layer_block = block_entry.get_slot(slot_id)?.clone();
                     Some(LoadBlock {
                         block_idx,
                         layer_block,
