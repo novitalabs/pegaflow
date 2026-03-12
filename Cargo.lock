@@ -2195,6 +2195,7 @@ dependencies = [
  "offset-allocator",
  "opentelemetry",
  "parking_lot",
+ "pegaflow-numa",
  "pegaflow-proto",
  "rand 0.10.0",
  "serde",
@@ -2222,6 +2223,13 @@ dependencies = [
  "serde_json",
  "tokio",
  "tonic",
+]
+
+[[package]]
+name = "pegaflow-numa"
+version = "0.0.16"
+dependencies = [
+ "log",
 ]
 
 [[package]]
@@ -2296,7 +2304,7 @@ dependencies = [
  "logforth",
  "lz4_flex",
  "parking_lot",
- "pegaflow-core",
+ "pegaflow-numa",
  "rdma-mummy-sys",
  "serde",
  "sideway",

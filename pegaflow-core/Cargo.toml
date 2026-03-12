@@ -20,6 +20,7 @@ uuid.workspace = true
 opentelemetry.workspace = true
 bytesize.workspace = true
 serde.workspace = true
+pegaflow-numa.workspace = true
 libc = "0.2"
 rand.workspace = true
 ahash.workspace = true

@@ -8,10 +8,10 @@
 //! Usage:
 //!   cargo run --bin pegaflow_topo_cli
 
-use pegaflow_core::logging;
+use pegaflow_transfer::init_logging;
 use pegaflow_transfer::rdma_topo::SystemTopology;
 
 fn main() {
-    logging::init_stdout_colored("info");
+    init_logging();
     SystemTopology::detect().log_summary();
 }

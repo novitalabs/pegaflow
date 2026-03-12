@@ -11,7 +11,7 @@ use std::time::Instant;
 use std::{mem, ptr, thread};
 
 use clap::Parser;
-use pegaflow_core::numa::read_cpu_topology_from_sysfs;
+use pegaflow_numa::read_cpu_topology_from_sysfs;
 use pegaflow_transfer::rdma_topo::SystemTopology;
 use pegaflow_transfer::{MooncakeTransferEngine, init_logging};
 
