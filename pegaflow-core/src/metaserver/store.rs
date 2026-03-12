@@ -1,7 +1,8 @@
 use moka::future::Cache;
-use pegaflow_core::BlockKey;
 use std::sync::Arc;
 use std::time::Duration;
+
+use crate::BlockKey;
 
 /// Default max capacity for the cache (512 MB)
 pub const DEFAULT_MAX_CAPACITY: u64 = 512 * 1024 * 1024;
@@ -16,13 +17,15 @@ pub struct CrossNodeBlock {
     pub node: Arc<str>,
 }
 
-/// Async thread-safe block hash storage using Moka cache
+/// Async thread-safe block hash storage using Moka cache.
+///
 /// Stores BlockKeys (namespace + hash) mapped to owning node URL,
 /// with LRU eviction, size-aware capacity management, and TTL.
+///
+/// `Clone` is cheap — moka's `Cache` is internally reference-counted.
+#[derive(Clone)]
 pub struct BlockHashStore {
-    /// Moka async cache with LRU eviction, size-aware capacity, and configurable TTL.
-    /// Key: BlockKey, Value: node URL (the pegaflow-server that owns this block)
-    cache: Arc<Cache<BlockKey, Arc<str>>>,
+    cache: Cache<BlockKey, Arc<str>>,
 }
 
 impl BlockHashStore {
@@ -39,38 +42,31 @@ impl BlockHashStore {
     /// Create a new block hash store with specified max capacity in bytes and TTL in minutes
     pub fn with_capacity_and_ttl(max_capacity_bytes: u64, ttl_minutes: u64) -> Self {
         let cache = Cache::builder()
-            // Set max capacity based on estimated memory size
             .max_capacity(max_capacity_bytes)
-            // Use weigher to estimate the size of each entry (key + node URL)
             .weigher(|key: &BlockKey, node: &Arc<str>| {
                 (key.estimated_size() + node.len() as u64 + 16) as u32
             })
-            // Set TTL
             .time_to_live(Duration::from_secs(ttl_minutes * 60))
             .build();
 
-        Self {
-            cache: Arc::new(cache),
-        }
+        Self { cache }
     }
 
     /// Insert a list of block hashes from a given node asynchronously.
-    /// Returns the number of inserted keys.
+    /// Returns the number of inserted keys (always equals `hashes.len()`).
     pub async fn insert_hashes(&self, namespace: &str, hashes: &[Vec<u8>], node: &str) -> usize {
         let node: Arc<str> = Arc::from(node);
-        let mut inserted = 0;
         for hash in hashes {
             let key = BlockKey::new(namespace.to_string(), hash.clone());
             self.cache.insert(key, Arc::clone(&node)).await;
-            inserted += 1;
         }
-        inserted
+        hashes.len()
     }
 
     /// Query which hashes exist in the store asynchronously.
     /// Returns a vector of [`CrossNodeBlock`]s for hashes that exist.
     pub async fn query_hashes(&self, namespace: &str, hashes: &[Vec<u8>]) -> Vec<CrossNodeBlock> {
-        let mut existing = Vec::new();
+        let mut existing = Vec::with_capacity(hashes.len());
         for hash in hashes {
             let key = BlockKey::new(namespace.to_string(), hash.clone());
             if let Some(node) = self.cache.get(&key).await {
@@ -101,7 +97,6 @@ impl BlockHashStore {
     }
 
     /// Clear all entries (for testing or maintenance)
-    #[allow(dead_code)]
     pub async fn invalidate_all(&self) {
         self.cache.invalidate_all();
         // Wait for invalidation to complete
@@ -164,16 +159,18 @@ mod tests {
 
         // Insert from node A
         store
-            .insert_hashes(namespace, &[hash.clone()], "node-a:50055")
+            .insert_hashes(namespace, std::slice::from_ref(&hash), "node-a:50055")
             .await;
         store.run_pending_tasks().await;
 
-        let existing = store.query_hashes(namespace, &[hash.clone()]).await;
+        let existing = store
+            .query_hashes(namespace, std::slice::from_ref(&hash))
+            .await;
         assert_eq!(existing[0].node.as_ref(), "node-a:50055");
 
         // Insert same hash from node B (overwrites)
         store
-            .insert_hashes(namespace, &[hash.clone()], "node-b:50055")
+            .insert_hashes(namespace, std::slice::from_ref(&hash), "node-b:50055")
             .await;
         store.run_pending_tasks().await;
 

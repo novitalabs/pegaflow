@@ -24,6 +24,7 @@ libc = "0.2"
 rand.workspace = true
 ahash.workspace = true
 io-uring = "0.7"
+moka = { version = "0.12", features = ["future"] }
 futures = "0.3"
 parking_lot = "0.12"
 fastrace = { workspace = true, optional = true }
@@ -38,6 +39,7 @@ criterion.workspace = true
 cudarc.workspace = true
 tokio.workspace = true
 tempfile = "3"
+tokio-stream.workspace = true
 
 [[bench]]
 name = "pinned_copy"

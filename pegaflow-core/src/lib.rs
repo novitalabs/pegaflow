@@ -17,6 +17,7 @@ mod cache;
 pub mod gpu_worker;
 pub mod instance;
 pub mod logging;
+pub mod metaserver;
 mod metrics;
 pub mod numa;
 mod offload;

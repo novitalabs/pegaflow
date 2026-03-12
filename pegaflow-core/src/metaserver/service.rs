@@ -1,15 +1,19 @@
-use crate::proto::engine::meta_server_server::MetaServer;
-use crate::proto::engine::{
+use pegaflow_proto::proto::engine::meta_server_server::MetaServer;
+use pegaflow_proto::proto::engine::{
     HealthRequest, HealthResponse, InsertBlockHashesRequest, InsertBlockHashesResponse,
     NodeBlockHashes, QueryBlockHashesRequest, QueryBlockHashesResponse, ResponseStatus,
     ShutdownRequest, ShutdownResponse,
 };
-use crate::store::BlockHashStore;
+
+use super::store::BlockHashStore;
 use log::{debug, info};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Notify;
 use tonic::{Request, Response, Status, async_trait};
+
+const EMPTY_HASHES_MSG: &str = "block_hashes cannot be empty";
 
 #[derive(Clone)]
 pub struct GrpcMetaService {
@@ -53,9 +57,7 @@ impl MetaServer for GrpcMetaService {
         // Validate request
         if req.block_hashes.is_empty() {
             let response = InsertBlockHashesResponse {
-                status: Some(Self::error_status(
-                    "block_hashes cannot be empty".to_string(),
-                )),
+                status: Some(Self::error_status(EMPTY_HASHES_MSG.to_string())),
                 inserted_count: 0,
             };
             return Ok(Response::new(response));
@@ -97,9 +99,7 @@ impl MetaServer for GrpcMetaService {
         // Validate request
         if req.block_hashes.is_empty() {
             let response = QueryBlockHashesResponse {
-                status: Some(Self::error_status(
-                    "block_hashes cannot be empty".to_string(),
-                )),
+                status: Some(Self::error_status(EMPTY_HASHES_MSG.to_string())),
                 existing_hashes: vec![],
                 total_queried: 0,
                 found_count: 0,
@@ -123,12 +123,11 @@ impl MetaServer for GrpcMetaService {
             req.namespace, found_count, total_queried, elapsed
         );
 
-        let existing_hashes: Vec<Vec<u8>> = existing.iter().map(|e| e.block_hash.clone()).collect();
-
-        // Group hashes by node
-        let mut node_map: std::collections::HashMap<&str, Vec<Vec<u8>>> =
-            std::collections::HashMap::new();
+        // Build existing_hashes and node_blocks in a single pass.
+        let mut node_map: HashMap<&str, Vec<Vec<u8>>> = HashMap::new();
+        let mut existing_hashes = Vec::with_capacity(found_count);
         for entry in &existing {
+            existing_hashes.push(entry.block_hash.clone());
             node_map
                 .entry(&entry.node)
                 .or_default()
