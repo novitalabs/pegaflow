@@ -1,9 +1,4 @@
-pub mod proto;
-pub mod service;
-pub mod store;
-
-pub use service::GrpcMetaService;
-pub use store::BlockHashStore;
+pub use pegaflow_core::metaserver::{BlockHashStore, CrossNodeBlock, GrpcMetaService};
 
 use clap::Parser;
 use log::{error, info};
