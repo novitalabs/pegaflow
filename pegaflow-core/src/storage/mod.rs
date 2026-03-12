@@ -8,7 +8,7 @@
 // Sub-components:
 // - ReadCache: sealed-block cache, pin/unpin semantics, consume-on-load
 // - PrefetchScheduler: backing-store prefetch, unified Mutex concurrency
-// - WritePipeline: insert worker channel, metaserver, seal notifications
+// - WritePipeline: insert worker channel and seal notifications
 // ============================================================================
 
 mod prefetch;
@@ -20,12 +20,10 @@ use log::{debug, info};
 use std::collections::HashSet;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Weak};
-use tokio::sync::mpsc::{self, UnboundedReceiver};
 
-use pegaflow_proto::proto::engine::meta_server_client::MetaServerClient;
-use tonic::transport::Channel;
-
-use crate::backing::{BackingStore, DEFAULT_MAX_PREFETCH_BLOCKS, SsdCacheConfig};
+use crate::backing::{
+    BackingStore, BackingStoreKind, BakingStoreConfig, DEFAULT_MAX_PREFETCH_BLOCKS, SsdCacheConfig,
+};
 use crate::block::{BlockKey, PrefetchStatus, SealedBlock};
 use crate::metrics::core_metrics;
 use crate::numa::NumaNode;
@@ -47,9 +45,6 @@ const RECLAIM_BATCH_SIZE: usize = 64;
 // Public types
 // ============================================================================
 
-/// Notification sent when a block is sealed (for SSD offload, etc.)
-pub type SealNotification = (BlockKey, Weak<SealedBlock>);
-
 /// Configuration for cache + storage behavior.
 #[derive(Debug, Clone)]
 pub struct StorageConfig {
@@ -58,6 +53,8 @@ pub struct StorageConfig {
     pub hint_value_size_bytes: Option<usize>,
     /// Max blocks allowed in prefetching state (backpressure for SSD prefetch).
     pub max_prefetch_blocks: usize,
+    /// Optional P2P baking store for inter-node ownership announcements.
+    pub baking_store_config: Option<BakingStoreConfig>,
     /// Optional SSD cache for sealed blocks (single-node, FIFO).
     pub ssd_cache_config: Option<SsdCacheConfig>,
     /// Enable NUMA-aware memory allocation.
@@ -70,6 +67,7 @@ impl Default for StorageConfig {
             enable_lfu_admission: true,
             hint_value_size_bytes: None,
             max_prefetch_blocks: DEFAULT_MAX_PREFETCH_BLOCKS,
+            baking_store_config: None,
             ssd_cache_config: None,
             enable_numa_affinity: true,
         }
@@ -93,11 +91,11 @@ pub struct StorageEngine {
     /// Backing-store prefetch scheduler.
     prefetch: PrefetchScheduler,
 
-    /// Write pipeline: insert worker, seal notifications, metaserver.
+    /// Write pipeline: insert worker channel.
     write_pipeline: Arc<WritePipeline>,
 
-    /// Optional secondary backing store (SSD tier), shared with prefetch.
-    backing: Option<Arc<dyn BackingStore>>,
+    /// Secondary backing stores ordered by priority.
+    backing_stores: Vec<Arc<dyn BackingStore>>,
 }
 
 impl StorageEngine {
@@ -109,11 +107,12 @@ impl StorageEngine {
         use_hugepages: bool,
         config: impl Into<StorageConfig>,
         numa_nodes: &[NumaNode],
-    ) -> (Arc<Self>, UnboundedReceiver<SealNotification>) {
+    ) -> Arc<Self> {
         let config = config.into();
         let value_size_hint = config.hint_value_size_bytes.filter(|size| *size > 0);
         let unit_hint = value_size_hint.and_then(|size| NonZeroU64::new(size as u64));
         let max_prefetch_blocks = config.max_prefetch_blocks;
+        let baking_store_config = config.baking_store_config.clone();
         let ssd_cache_config = config.ssd_cache_config;
 
         let ssd_enabled = ssd_cache_config.is_some();
@@ -148,15 +147,22 @@ impl StorageEngine {
             value_size_hint,
         ));
 
-        let (seal_notify_tx, seal_notify_rx) = mpsc::unbounded_channel();
-        let (write_pipeline, insert_rx) = WritePipeline::new(seal_notify_tx);
+        let (write_pipeline, insert_rx) = WritePipeline::new();
         let write_pipeline = Arc::new(write_pipeline);
 
         let is_numa = allocator.is_numa();
         let engine = Arc::new_cyclic(move |weak_engine: &Weak<Self>| {
-            let backing: Option<Arc<dyn BackingStore>> = ssd_cache_config.and_then(|ssd_cfg| {
+            let mut backing_stores = Vec::new();
+
+            if let Some(baking_cfg) = baking_store_config.clone()
+                && let Some(store) = crate::backing::new_p2p(baking_cfg)
+            {
+                backing_stores.push(store);
+            }
+
+            if let Some(ssd_cfg) = ssd_cache_config {
                 let weak_engine = weak_engine.clone();
-                crate::backing::new_ssd(
+                if let Some(store) = crate::backing::new_ssd(
                     ssd_cfg,
                     move |size, numa_node| {
                         weak_engine
@@ -164,17 +170,19 @@ impl StorageEngine {
                             .and_then(|engine| engine.allocate(NonZeroU64::new(size)?, numa_node))
                     },
                     is_numa,
-                )
-            });
+                ) {
+                    backing_stores.push(store);
+                }
+            }
 
-            let prefetch = PrefetchScheduler::new(backing.clone(), max_prefetch_blocks);
+            let prefetch = PrefetchScheduler::new(backing_stores.clone(), max_prefetch_blocks);
 
             Self {
                 allocator,
                 read_cache: read_cache.clone(),
                 prefetch,
                 write_pipeline: write_pipeline.clone(),
-                backing: backing.clone(),
+                backing_stores,
             }
         });
 
@@ -182,8 +190,7 @@ impl StorageEngine {
         {
             let deps = Arc::new(InsertDeps {
                 read_cache: engine.read_cache.clone(),
-                write_pipeline: engine.write_pipeline.clone(),
-                backing: engine.backing.clone(),
+                backing_stores: engine.backing_stores.clone(),
             });
             let weak_deps = Arc::downgrade(&deps);
             // Keep deps alive by leaking it into the thread. The worker holds
@@ -198,27 +205,13 @@ impl StorageEngine {
                 .expect("failed to spawn insert worker thread");
         }
 
-        (engine, seal_notify_rx)
+        engine
     }
-
-    // ====================================================================
-    // Delegation: MetaServer
-    // ====================================================================
-
-    pub(crate) fn set_metaserver_client(
-        &self,
-        client: MetaServerClient<Channel>,
-        node_url: String,
-    ) {
-        self.write_pipeline.set_metaserver_client(client, node_url);
-    }
-
-    // ====================================================================
-    // Delegation: Query flags
-    // ====================================================================
 
     pub(crate) fn is_ssd_enabled(&self) -> bool {
-        self.backing.is_some()
+        self.backing_stores
+            .iter()
+            .any(|store| store.kind() == BackingStoreKind::Ssd)
     }
 
     pub(crate) fn is_numa_enabled(&self) -> bool {
@@ -448,13 +441,13 @@ impl StorageEngine {
 mod tests {
     use super::*;
 
-    fn make_engine() -> (Arc<StorageEngine>, UnboundedReceiver<SealNotification>) {
+    fn make_engine() -> Arc<StorageEngine> {
         StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[])
     }
 
     #[tokio::test]
     async fn filter_hashes_not_in_cache_inplace_handles_empty_input() {
-        let (storage, _rx) = make_engine();
+        let storage = make_engine();
         let mut hashes: HashSet<Vec<u8>> = HashSet::new();
 
         storage.filter_hashes_not_in_cache_inplace("ns", &mut hashes);
@@ -463,7 +456,7 @@ mod tests {
 
     #[tokio::test]
     async fn pin_consume_releases_immediately() {
-        let (storage, _rx) = make_engine();
+        let storage = make_engine();
         let key = BlockKey::new("ns".into(), vec![1]);
         let block = Arc::new(SealedBlock::from_slots(Vec::new()));
 
@@ -487,7 +480,7 @@ mod tests {
 
     #[tokio::test]
     async fn unpin_blocks_cancellation_path() {
-        let (storage, _rx) = make_engine();
+        let storage = make_engine();
         let key = BlockKey::new("ns".into(), vec![1]);
         let block = Arc::new(SealedBlock::from_slots(Vec::new()));
 
@@ -513,8 +506,7 @@ mod tests {
     async fn allocate_bounded_reclaim_terminates() {
         // With a tiny pool, allocation of a huge block should fail fast
         // (not loop forever) thanks to MAX_RECLAIM_ROUNDS.
-        let (storage, _rx) =
-            StorageEngine::new_with_config(4096, false, StorageConfig::default(), &[]);
+        let storage = StorageEngine::new_with_config(4096, false, StorageConfig::default(), &[]);
 
         // Try to allocate more than the entire pool
         let result = storage.allocate(NonZeroU64::new(1 << 30).unwrap(), None);
@@ -523,7 +515,7 @@ mod tests {
 
     #[tokio::test]
     async fn gc_stale_inflight_returns_zero_when_empty() {
-        let (storage, _rx) = make_engine();
+        let storage = make_engine();
         let cleaned = storage
             .gc_stale_inflight(std::time::Duration::from_secs(60))
             .await;
@@ -532,7 +524,7 @@ mod tests {
 
     #[tokio::test]
     async fn multi_worker_consume_decrements_one_reservation_per_call() {
-        let (storage, _rx) = make_engine();
+        let storage = make_engine();
         let key = BlockKey::new("ns".into(), vec![1]);
         let block = Arc::new(SealedBlock::from_slots(Vec::new()));
 
@@ -568,7 +560,7 @@ mod tests {
 
     #[tokio::test]
     async fn filter_hashes_not_in_cache_removes_cached() {
-        let (storage, _rx) = make_engine();
+        let storage = make_engine();
         let key1 = BlockKey::new("ns".into(), vec![1]);
         let key2 = BlockKey::new("ns".into(), vec![2]);
         let block = Arc::new(SealedBlock::from_slots(Vec::new()));
@@ -586,7 +578,7 @@ mod tests {
 
     #[tokio::test]
     async fn consume_missing_pin_returns_error() {
-        let (storage, _rx) = make_engine();
+        let storage = make_engine();
         // No pins exist — consume should fail
         let result = storage.consume_pinned_blocks("inst1", "ns", &[vec![1]]);
         assert!(result.is_err());
@@ -594,7 +586,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_prefix_memory_only_basic() {
-        let (storage, _rx) = make_engine();
+        let storage = make_engine();
         let block = Arc::new(SealedBlock::from_slots(Vec::new()));
 
         storage.test_insert_cache(BlockKey::new("ns".into(), vec![1]), block.clone());

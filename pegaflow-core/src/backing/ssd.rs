@@ -10,13 +10,13 @@ use crate::metrics::core_metrics;
 use crate::numa::NumaNode;
 use crate::pinned_pool::PinnedAllocation;
 
-use super::BackingStore;
 use super::SsdCacheConfig;
 use super::ssd_cache::{
     PrefetchBatch, PrefetchRequest, PreparedBatch, SsdRingBuffer, SsdWriteBatch, ssd_prefetch_loop,
     ssd_writer_loop,
 };
 use super::uring::{UringConfig, UringIoEngine};
+use super::{BackingStore, BackingStoreKind};
 
 pub(super) type AllocateFn =
     Arc<dyn Fn(u64, Option<NumaNode>) -> Option<Arc<PinnedAllocation>> + Send + Sync>;
@@ -162,6 +162,10 @@ impl SsdBackingStore {
 }
 
 impl BackingStore for SsdBackingStore {
+    fn kind(&self) -> BackingStoreKind {
+        BackingStoreKind::Ssd
+    }
+
     fn ingest_batch(&self, blocks: Vec<(BlockKey, Weak<SealedBlock>)>) {
         if blocks.is_empty() {
             return;

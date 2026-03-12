@@ -30,8 +30,8 @@ pub mod sync_state;
 mod transfer;
 
 pub use backing::{
-    DEFAULT_SSD_PREFETCH_INFLIGHT, DEFAULT_SSD_PREFETCH_QUEUE_DEPTH, DEFAULT_SSD_WRITE_INFLIGHT,
-    DEFAULT_SSD_WRITE_QUEUE_DEPTH, SsdCacheConfig,
+    BakingStoreConfig, DEFAULT_SSD_PREFETCH_INFLIGHT, DEFAULT_SSD_PREFETCH_QUEUE_DEPTH,
+    DEFAULT_SSD_WRITE_INFLIGHT, DEFAULT_SSD_WRITE_QUEUE_DEPTH, SsdCacheConfig,
 };
 pub use block::{
     BlockHash, BlockKey, BlockStatus, LayerBlock, LayerSave, PrefetchStatus, SealedBlock,
@@ -41,7 +41,7 @@ pub use numa::NumaNode;
 use numa::NumaTopology;
 pub use pinned_pool::PinnedAllocation;
 pub use seal_offload::SlotMeta;
-pub use storage::{SealNotification, StorageConfig};
+pub use storage::StorageConfig;
 pub use sync_state::{LoadState, LoadStateError};
 pub use trace::{set_trace_sample_rate, should_sample};
 
@@ -71,19 +71,11 @@ use std::{
 };
 
 use log::{debug, info, warn};
-use pegaflow_proto::proto::engine::meta_server_client::MetaServerClient;
-use tonic::transport::Channel;
 
 use crate::backing::SSD_ALIGNMENT;
 use crate::gpu_worker::{LayerLoadData, LoadBlock, LoadTask};
 use crate::metrics::core_metrics;
 use crate::storage::StorageEngine;
-
-/// Command sent to the metaserver insert worker.
-pub(crate) struct MetaserverInsertCmd {
-    pub namespace: String,
-    pub block_hashes: Vec<Vec<u8>>,
-}
 
 const DEFAULT_PINNED_POOL_BYTES: usize = 30 * 1024 * 1024 * 1024; // 30GB
 
@@ -152,17 +144,14 @@ pub struct PegaEngine {
 impl PegaEngine {
     /// Create a new engine with default 30GB pinned memory pool.
     pub fn new() -> Self {
-        let (engine, _rx) = Self::new_with_config(
+        Self::new_with_config(
             DEFAULT_PINNED_POOL_BYTES,
             false,
             storage::StorageConfig::default(),
-        );
-        engine
+        )
     }
 
     /// Create an engine with full custom configuration.
-    ///
-    /// Returns the engine and a receiver for seal notifications (used for SSD offload).
     ///
     /// If `storage_config.enable_numa_affinity` is true and the system has multiple
     /// NUMA nodes, per-node pinned memory pools are created for optimal bandwidth.
@@ -170,7 +159,7 @@ impl PegaEngine {
         pool_size: usize,
         use_hugepages: bool,
         storage_config: impl Into<storage::StorageConfig>,
-    ) -> (Self, tokio::sync::mpsc::UnboundedReceiver<SealNotification>) {
+    ) -> Self {
         // Detect GPU-NUMA topology
         let topology = Arc::new(NumaTopology::detect());
         topology.log_summary();
@@ -188,26 +177,13 @@ impl PegaEngine {
                 vec![]
             };
 
-        let (storage, seal_notify_rx) =
-            StorageEngine::new_with_config(pool_size, use_hugepages, config, &numa_nodes);
+        let storage = StorageEngine::new_with_config(pool_size, use_hugepages, config, &numa_nodes);
 
-        (
-            PegaEngine {
-                instances: RwLock::new(HashMap::new()),
-                storage,
-                topology,
-            },
-            seal_notify_rx,
-        )
-    }
-
-    /// Set the MetaServer client for cross-node block hash registry.
-    ///
-    /// `node_url` is this server's advertised address as `ip:port` (e.g., `10.0.0.1:50055`),
-    /// sent to the metaserver so other nodes can discover which server owns a block.
-    /// Spawns a background worker that batches and sends insert requests.
-    pub fn set_metaserver_client(&self, client: MetaServerClient<Channel>, node_url: String) {
-        self.storage.set_metaserver_client(client, node_url);
+        PegaEngine {
+            instances: RwLock::new(HashMap::new()),
+            storage,
+            topology,
+        }
     }
 
     /// Get or create an instance with the specified topology.
@@ -586,10 +562,11 @@ mod tests {
             enable_lfu_admission: false,
             hint_value_size_bytes: None,
             max_prefetch_blocks: 100,
+            baking_store_config: None,
             ssd_cache_config: None,
             enable_numa_affinity: false,
         };
-        let (engine, _rx) = PegaEngine::new_with_config(1 << 20, false, config);
+        let engine = PegaEngine::new_with_config(1 << 20, false, config);
 
         // Manually insert an InstanceContext (no GPU required)
         let instance = InstanceContext::new(

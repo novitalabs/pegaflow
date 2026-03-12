@@ -63,18 +63,18 @@ impl PrefetchState {
 
 pub(crate) struct PrefetchScheduler {
     state: Mutex<PrefetchState>,
-    backing: Option<Arc<dyn BackingStore>>,
+    backing_stores: Vec<Arc<dyn BackingStore>>,
     max_prefetch_blocks: usize,
 }
 
 impl PrefetchScheduler {
-    pub fn new(backing: Option<Arc<dyn BackingStore>>, max_prefetch_blocks: usize) -> Self {
+    pub fn new(backing_stores: Vec<Arc<dyn BackingStore>>, max_prefetch_blocks: usize) -> Self {
         Self {
             state: Mutex::new(PrefetchState {
                 active: HashMap::new(),
                 inflight_count: 0,
             }),
-            backing,
+            backing_stores,
             max_prefetch_blocks,
         }
     }
@@ -166,9 +166,7 @@ impl PrefetchScheduler {
         let mut loading = 0usize;
         let mut blocks_rx: Option<oneshot::Receiver<PrefetchResult>> = None;
 
-        if !remaining.is_empty()
-            && let Some(backing) = self.backing.as_ref()
-        {
+        if !remaining.is_empty() && !self.backing_stores.is_empty() {
             let state = self.state.lock();
             let available = self
                 .max_prefetch_blocks
@@ -179,13 +177,15 @@ impl PrefetchScheduler {
                 let check_keys = remaining[..check_limit].to_vec();
                 drop(state);
 
-                let (found, rx) = backing.submit_prefix(check_keys);
-
-                if found > 0 {
-                    let mut state = self.state.lock();
-                    state.inflight_count += found;
-                    loading = found;
-                    blocks_rx = Some(rx);
+                for backing in &self.backing_stores {
+                    let (found, rx) = backing.submit_prefix(check_keys.clone());
+                    if found > 0 {
+                        let mut state = self.state.lock();
+                        state.inflight_count += found;
+                        loading = found;
+                        blocks_rx = Some(rx);
+                        break;
+                    }
                 }
 
                 let backpressure_skipped = remaining.len() - check_limit;

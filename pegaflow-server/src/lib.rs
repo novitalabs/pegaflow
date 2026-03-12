@@ -25,7 +25,6 @@ use parking_lot::Mutex;
 use pegaflow_core::PegaEngine;
 use prometheus::Registry;
 use proto::engine::engine_server::EngineServer;
-use proto::engine::meta_server_client::MetaServerClient;
 use pyo3::{PyErr, Python, types::PyAnyMethods};
 use std::error::Error;
 use std::net::SocketAddr;
@@ -133,31 +132,31 @@ pub struct Cli {
     #[arg(long, default_value_t = 1.0, value_parser = parse_sample_rate)]
     pub trace_sample_rate: f64,
 
-    /// MetaServer gRPC address for cross-node block hash registry (e.g., http://127.0.0.1:50056).
-    /// When set, saved block hashes will be inserted to the metaserver for cross-node discovery.
+    /// P2P coordinator gRPC address for cross-node block ownership announcements
+    /// (e.g., http://127.0.0.1:50056).
     #[arg(long)]
-    pub metaserver_addr: Option<String>,
+    pub p2p_coordinator_addr: Option<String>,
 
-    /// Advertised address (ip:port) reported to the metaserver for cross-node discovery.
+    /// This node's advertised P2P address (ip:port) reported to the coordinator.
     /// Other nodes use this address to connect to this server.
     /// Fallback order: this flag > PEGAFLOW_HOST_IP env + bind port > auto-detected IP + bind port.
     #[arg(long)]
-    pub advertise_addr: Option<String>,
+    pub p2p_node_addr: Option<String>,
 }
 
-/// Resolve the advertise address (ip:port) for metaserver registration.
+/// Resolve this node's advertised P2P address (ip:port) for coordinator registration.
 ///
-/// Priority: `--advertise-addr` > `PEGAFLOW_HOST_IP` env + bind port > auto-detect + bind port.
-fn resolve_advertise_addr(cli_advertise: &Option<String>, bind_addr: SocketAddr) -> String {
+/// Priority: `--p2p-node-addr` > `PEGAFLOW_HOST_IP` env + bind port > auto-detect + bind port.
+fn resolve_p2p_node_addr(cli_node_addr: &Option<String>, bind_addr: SocketAddr) -> String {
     // 1. Explicit CLI flag
-    if let Some(addr) = cli_advertise {
+    if let Some(addr) = cli_node_addr {
         return addr.clone();
     }
 
     // 2. PEGAFLOW_HOST_IP env var + bind port
     if let Ok(host_ip) = std::env::var("PEGAFLOW_HOST_IP") {
         let addr = format!("{}:{}", host_ip.trim(), bind_addr.port());
-        info!("Using PEGAFLOW_HOST_IP for advertise address: {}", addr);
+        info!("Using PEGAFLOW_HOST_IP for P2P node address: {}", addr);
         return addr;
     }
 
@@ -168,7 +167,7 @@ fn resolve_advertise_addr(cli_advertise: &Option<String>, bind_addr: SocketAddr)
         && let Ok(local) = socket.local_addr()
     {
         let addr = format!("{}:{}", local.ip(), bind_addr.port());
-        info!("Auto-detected advertise address: {}", addr);
+        info!("Auto-detected P2P node address: {}", addr);
         return addr;
     }
 
@@ -176,13 +175,13 @@ fn resolve_advertise_addr(cli_advertise: &Option<String>, bind_addr: SocketAddr)
     let addr = bind_addr.to_string();
     if bind_addr.ip().is_unspecified() {
         warn!(
-            "Advertise address resolved to {} which is not routable. \
-             Set --advertise-addr or PEGAFLOW_HOST_IP to a reachable IP.",
+            "P2P node address resolved to {} which is not routable. \
+             Set --p2p-node-addr or PEGAFLOW_HOST_IP to a reachable IP.",
             addr
         );
     } else {
         info!(
-            "Could not detect host IP, using bind address as advertise address: {}",
+            "Could not detect host IP, using bind address as P2P node address: {}",
             addr
         );
     }
@@ -422,6 +421,12 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         enable_lfu_admission: cli.enable_lfu_admission,
         hint_value_size_bytes: cli.hint_value_size,
         max_prefetch_blocks: cli.max_prefetch_blocks,
+        baking_store_config: cli.p2p_coordinator_addr.as_ref().map(|addr| {
+            pegaflow_core::BakingStoreConfig {
+                p2p_coordinator_addr: addr.clone(),
+                p2p_node_addr: resolve_p2p_node_addr(&cli.p2p_node_addr, cli.addr),
+            }
+        }),
         ssd_cache_config,
         enable_numa_affinity: !cli.disable_numa_affinity,
     };
@@ -452,25 +457,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
     runtime.block_on(async move {
         // Create PegaEngine inside tokio runtime context (needed for SSD cache tokio::spawn)
-        let (engine, _seal_notify_rx) =
-            PegaEngine::new_with_config(cli.pool_size, cli.use_hugepages, storage_config);
-        let engine = Arc::new(engine);
-
-        // Connect to metaserver if configured (optional, continue if connection fails)
-        if let Some(ref addr) = cli.metaserver_addr {
-            let node_url = resolve_advertise_addr(&cli.advertise_addr, cli.addr);
-            match MetaServerClient::connect(addr.clone()).await {
-                Ok(client) => {
-                    engine.set_metaserver_client(client, node_url);
-                }
-                Err(err) => {
-                    info!(
-                        "Failed to connect to MetaServer at {}: {} (continuing without metaserver)",
-                        addr, err
-                    );
-                }
-            }
-        }
+        let engine = Arc::new(PegaEngine::new_with_config(
+            cli.pool_size,
+            cli.use_hugepages,
+            storage_config,
+        ));
 
         let service = GrpcEngineService::new(
             Arc::clone(&engine),

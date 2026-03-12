@@ -1,10 +1,8 @@
 // ============================================================================
-// WritePipeline: insert worker, seal pipeline, metaserver announcements.
+// WritePipeline: insert worker channel.
 //
 // Owns:
 // - insert_tx: channel to the dedicated insert-worker OS thread
-// - seal_notify_tx: channel for SSD offload notifications
-// - metaserver_tx: channel for cross-node block hash announcements
 //
 // The insert worker thread owns the inflight HashMap exclusively,
 // eliminating lock contention on the hot insert path.
@@ -14,14 +12,8 @@ use std::collections::{HashMap, hash_map::Entry};
 use std::sync::{Arc, Weak};
 
 use log::{debug, error, info, warn};
-use parking_lot::Mutex;
 use std::sync::mpsc::{Receiver, Sender};
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
-use tonic::transport::Channel;
-
-use pegaflow_proto::proto::engine::InsertBlockHashesRequest;
-use pegaflow_proto::proto::engine::meta_server_client::MetaServerClient;
 
 use crate::backing::BackingStore;
 use crate::block::{BlockKey, InflightBlock, SealedBlock, SlotInsertResult};
@@ -29,7 +21,6 @@ use crate::metrics::core_metrics;
 use crate::numa::NumaNode;
 use crate::offload::InsertEntries;
 
-use super::SealNotification;
 use super::read_cache::ReadCache;
 
 // ============================================================================
@@ -57,10 +48,6 @@ pub(super) enum InsertWorkerCommand {
 pub(crate) struct WritePipeline {
     /// Channel to the insert worker thread.
     insert_tx: Sender<InsertWorkerCommand>,
-    /// Channel for seal notifications (SSD offload).
-    seal_notify_tx: Option<UnboundedSender<SealNotification>>,
-    /// Channel to the metaserver insert worker.
-    metaserver_tx: Mutex<Option<UnboundedSender<crate::MetaserverInsertCmd>>>,
 }
 
 impl WritePipeline {
@@ -68,16 +55,9 @@ impl WritePipeline {
     ///
     /// Returns (coordinator, insert_rx) where insert_rx is consumed by
     /// the insert worker thread.
-    pub fn new(
-        seal_notify_tx: UnboundedSender<SealNotification>,
-    ) -> (Self, Receiver<InsertWorkerCommand>) {
+    pub fn new() -> (Self, Receiver<InsertWorkerCommand>) {
         let (insert_tx, insert_rx) = std::sync::mpsc::channel();
-        let coordinator = Self {
-            insert_tx,
-            seal_notify_tx: Some(seal_notify_tx),
-            metaserver_tx: Mutex::new(None),
-        };
-        (coordinator, insert_rx)
+        (Self { insert_tx }, insert_rx)
     }
 
     /// Fire-and-forget raw insert: send a deferred save batch to the insert worker.
@@ -100,34 +80,6 @@ impl WritePipeline {
         }
         reply_rx.await.unwrap_or(0)
     }
-
-    /// Set the MetaServer client for cross-node block hash registry.
-    pub fn set_metaserver_client(&self, client: MetaServerClient<Channel>, node_url: String) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(metaserver_worker_loop(rx, client, node_url.clone()));
-        *self.metaserver_tx.lock() = Some(tx);
-        info!(
-            "MetaServer client configured for block hash registry (node_url={})",
-            node_url
-        );
-    }
-
-    /// Send block hashes to the metaserver insert worker (fire-and-forget).
-    fn send_metaserver_insert(&self, namespace: String, block_hashes: Vec<Vec<u8>>) {
-        if let Some(tx) = self.metaserver_tx.lock().as_ref() {
-            let _ = tx.send(crate::MetaserverInsertCmd {
-                namespace,
-                block_hashes,
-            });
-        }
-    }
-
-    /// Send seal notification (for SSD offload).
-    fn send_seal_notification(&self, key: &BlockKey, block: &Arc<SealedBlock>) {
-        if let Some(tx) = &self.seal_notify_tx {
-            let _ = tx.send((key.clone(), Arc::downgrade(block)));
-        }
-    }
 }
 
 // ============================================================================
@@ -138,8 +90,7 @@ impl WritePipeline {
 /// StorageEngine, keeping the dependency surface minimal.
 pub(super) struct InsertDeps {
     pub read_cache: Arc<ReadCache>,
-    pub write_pipeline: Arc<WritePipeline>,
-    pub backing: Option<Arc<dyn BackingStore>>,
+    pub backing_stores: Vec<Arc<dyn BackingStore>>,
 }
 
 // ============================================================================
@@ -256,13 +207,9 @@ fn process_insert_batch(
             inflight_bytes_removed = inflight_bytes_removed.saturating_add(total_footprint);
             let sealed = Arc::new(inflight_block.seal());
 
-            // Brief lock: admit sealed block to cache + notify
             if let Some(deps) = deps.upgrade() {
                 deps.read_cache
                     .batch_insert(vec![(key.clone(), Arc::clone(&sealed))]);
-
-                // Seal notification (for SSD offload)
-                deps.write_pipeline.send_seal_notification(&key, &sealed);
             }
 
             sealed_blocks.push((key, sealed));
@@ -280,39 +227,29 @@ fn process_insert_batch(
             .add(-(inflight_bytes_removed as i64), &[]);
     }
 
-    // Post-seal: metaserver + SSD offload
+    // Post-seal: fire-and-forget backing store fanout in priority order.
     if !sealed_blocks.is_empty()
         && let Some(deps) = deps.upgrade()
     {
-        // Send block hashes to metaserver
-        let metaserver_hashes: Vec<Vec<u8>> = sealed_blocks
-            .iter()
-            .map(|(key, _)| key.hash.clone())
-            .collect();
-        deps.write_pipeline
-            .send_metaserver_insert(namespace.to_owned(), metaserver_hashes);
-
-        // SSD offload (fire-and-forget)
-        send_ssd_batch(&deps.backing, &sealed_blocks);
+        send_backing_batches(&deps.backing_stores, &sealed_blocks);
     }
 }
 
-/// Forward sealed blocks to the backing store for async persistence.
-fn send_ssd_batch(
-    backing: &Option<Arc<dyn BackingStore>>,
+/// Forward sealed blocks to all configured backing stores for async persistence.
+fn send_backing_batches(
+    backing_stores: &[Arc<dyn BackingStore>],
     blocks: &[(BlockKey, Arc<SealedBlock>)],
 ) {
-    let Some(backing) = backing.as_ref() else {
-        return;
-    };
-    if blocks.is_empty() {
+    if blocks.is_empty() || backing_stores.is_empty() {
         return;
     }
     let weak_blocks: Vec<(BlockKey, Weak<SealedBlock>)> = blocks
         .iter()
         .map(|(k, b)| (k.clone(), Arc::downgrade(b)))
         .collect();
-    backing.ingest_batch(weak_blocks);
+    for backing in backing_stores {
+        backing.ingest_batch(weak_blocks.clone());
+    }
 }
 
 /// GC stale inflight blocks within the insert worker.
@@ -347,64 +284,13 @@ fn gc_inflight(
     }
     cleaned
 }
-
-// ============================================================================
-// Metaserver Worker (dedicated async task)
-// ============================================================================
-
-/// Background worker that batches block hash insert commands into MetaServer
-/// gRPC calls, grouped by namespace.
-pub(super) async fn metaserver_worker_loop(
-    mut rx: UnboundedReceiver<crate::MetaserverInsertCmd>,
-    mut client: MetaServerClient<Channel>,
-    node_url: String,
-) {
-    while let Some(cmd) = rx.recv().await {
-        // Drain additional commands for batching
-        let mut cmds = vec![cmd];
-        while let Ok(more) = rx.try_recv() {
-            cmds.push(more);
-        }
-
-        // Merge hashes by namespace
-        let mut by_namespace: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
-        for cmd in cmds {
-            by_namespace
-                .entry(cmd.namespace)
-                .or_default()
-                .extend(cmd.block_hashes);
-        }
-
-        for (namespace, block_hashes) in by_namespace {
-            let count = block_hashes.len();
-            let req = InsertBlockHashesRequest {
-                namespace,
-                block_hashes,
-                node: node_url.clone(),
-            };
-            match client.insert_block_hashes(req).await {
-                Ok(response) => {
-                    debug!(
-                        "MetaServer insert: sent {} hashes, inserted {}",
-                        count,
-                        response.into_inner().inserted_count
-                    );
-                }
-                Err(err) => {
-                    warn!("MetaServer insert failed: {}", err);
-                }
-            }
-        }
-    }
-
-    info!("Metaserver worker shutting down");
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::num::NonZeroU64;
+    use std::sync::Mutex;
 
+    use crate::backing::{BackingStoreKind, PrefetchResult};
     use crate::block::LayerBlock;
     use crate::storage::{StorageConfig, StorageEngine};
 
@@ -420,19 +306,41 @@ mod tests {
     /// Create a minimal InsertDeps for testing.
     fn make_deps(engine: &StorageEngine) -> Arc<InsertDeps> {
         let read_cache = engine.read_cache.clone();
-        let write_pipeline = engine.write_pipeline.clone();
-        let backing = engine.backing.clone();
+        let backing_stores = engine.backing_stores.clone();
         Arc::new(InsertDeps {
             read_cache,
-            write_pipeline,
-            backing,
+            backing_stores,
         })
+    }
+
+    struct RecordingStore {
+        kind: BackingStoreKind,
+        label: &'static str,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl BackingStore for RecordingStore {
+        fn kind(&self) -> BackingStoreKind {
+            self.kind
+        }
+
+        fn ingest_batch(&self, _blocks: Vec<(BlockKey, Weak<SealedBlock>)>) {
+            self.calls.lock().unwrap().push(self.label);
+        }
+
+        fn submit_prefix(
+            &self,
+            _keys: Vec<BlockKey>,
+        ) -> (usize, oneshot::Receiver<PrefetchResult>) {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(Vec::new());
+            (0, rx)
+        }
     }
 
     #[tokio::test]
     async fn single_slot_seals_immediately() {
-        let (engine, _rx) =
-            StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]);
+        let engine = StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]);
         let deps = make_deps(&engine);
         let weak_deps = Arc::downgrade(&deps);
 
@@ -463,8 +371,7 @@ mod tests {
 
     #[tokio::test]
     async fn multi_slot_partial_then_complete() {
-        let (engine, _rx) =
-            StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]);
+        let engine = StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]);
         let deps = make_deps(&engine);
         let weak_deps = Arc::downgrade(&deps);
 
@@ -518,8 +425,7 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_slot_is_idempotent() {
-        let (engine, _rx) =
-            StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]);
+        let engine = StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]);
         let deps = make_deps(&engine);
         let weak_deps = Arc::downgrade(&deps);
 
@@ -548,8 +454,7 @@ mod tests {
 
     #[tokio::test]
     async fn slot_count_mismatch_skips_key() {
-        let (engine, _rx) =
-            StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]);
+        let engine = StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]);
         let deps = make_deps(&engine);
         let weak_deps = Arc::downgrade(&deps);
 
@@ -604,15 +509,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seal_notification_fires() {
-        let (engine, mut rx) =
-            StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]);
-        let deps = make_deps(&engine);
+    async fn backing_stores_fan_out_in_vec_order() {
+        let engine = StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let deps = Arc::new(InsertDeps {
+            read_cache: engine.read_cache.clone(),
+            backing_stores: vec![
+                Arc::new(RecordingStore {
+                    kind: BackingStoreKind::P2p,
+                    label: "p2p",
+                    calls: Arc::clone(&calls),
+                }) as Arc<dyn BackingStore>,
+                Arc::new(RecordingStore {
+                    kind: BackingStoreKind::Ssd,
+                    label: "ssd",
+                    calls: Arc::clone(&calls),
+                }) as Arc<dyn BackingStore>,
+            ],
+        });
         let weak_deps = Arc::downgrade(&deps);
 
-        let key = BlockKey::new("ns".into(), vec![42]);
+        let key = BlockKey::new("ns".into(), vec![7]);
         let block = make_layer_block(&engine, 64);
-        let entries: InsertEntries = vec![(key.clone(), vec![(0, block)])];
+        let entries: InsertEntries = vec![(key, vec![(0, block)])];
         let mut inflight: HashMap<BlockKey, InflightBlock> = HashMap::new();
 
         process_insert_batch(
@@ -624,8 +543,6 @@ mod tests {
             "ns",
         );
 
-        // Seal notification should have been sent
-        let notification = rx.try_recv().expect("should receive seal notification");
-        assert_eq!(notification.0.hash, vec![42]);
+        assert_eq!(calls.lock().unwrap().as_slice(), ["p2p", "ssd"]);
     }
 }

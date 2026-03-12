@@ -52,6 +52,7 @@ async fn save_query_load_roundtrip_with_numa_affinity_enabled() {
                 enable_lfu_admission: false,
                 hint_value_size_bytes: None,
                 max_prefetch_blocks: 100,
+                baking_store_config: None,
                 ssd_cache_config: None,
                 enable_numa_affinity: true,
             }),

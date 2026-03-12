@@ -28,6 +28,7 @@ async fn ssd_smoke_roundtrip_with_temp_dir() {
                 enable_lfu_admission: false,
                 hint_value_size_bytes: None,
                 max_prefetch_blocks: 100,
+                baking_store_config: None,
                 ssd_cache_config: Some(SsdCacheConfig {
                     cache_path: cache_path.clone(),
                     capacity_bytes: SSD_CAPACITY,

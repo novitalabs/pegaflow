@@ -15,6 +15,7 @@ pub fn test_engine() -> PegaEngine {
         enable_lfu_admission: false,
         hint_value_size_bytes: None,
         max_prefetch_blocks: 100,
+        baking_store_config: None,
         ssd_cache_config: None,
         enable_numa_affinity: false,
     })
@@ -22,8 +23,7 @@ pub fn test_engine() -> PegaEngine {
 
 pub fn test_engine_with_storage_config(config: StorageConfig) -> PegaEngine {
     // 16 MB pool — enough for test blocks, small enough to be fast.
-    let (engine, _rx) = PegaEngine::new_with_config(16 << 20, false, config);
-    engine
+    PegaEngine::new_with_config(16 << 20, false, config)
 }
 
 #[allow(clippy::too_many_arguments)]

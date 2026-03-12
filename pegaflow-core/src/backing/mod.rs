@@ -4,6 +4,7 @@
 //! to write and read blocks from a secondary tier.  All implementation
 //! details (ring buffer, io_uring, SSD workers) stay inside this module.
 
+pub(super) mod p2p;
 pub(super) mod ssd;
 pub(super) mod ssd_cache;
 pub(super) mod uring;
@@ -24,6 +25,22 @@ use crate::pinned_pool::PinnedAllocation;
 /// Batch of successfully-read blocks from the backing store.
 pub(crate) type PrefetchResult = Vec<(BlockKey, Arc<SealedBlock>)>;
 
+/// Configuration for the P2P baking store.
+#[derive(Debug, Clone)]
+pub struct BakingStoreConfig {
+    /// gRPC endpoint of the coordinator that tracks block ownership.
+    pub p2p_coordinator_addr: String,
+    /// Advertised node address reported as the block owner.
+    pub p2p_node_addr: String,
+}
+
+/// Runtime kind of a backing store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackingStoreKind {
+    P2p,
+    Ssd,
+}
+
 // ============================================================================
 // Public interface
 // ============================================================================
@@ -33,6 +50,9 @@ pub(crate) type PrefetchResult = Vec<(BlockKey, Arc<SealedBlock>)>;
 /// Implementations must be `Send + Sync + 'static` so they can be wrapped in
 /// `Arc<dyn BackingStore>` and shared across async tasks and threads.
 pub(crate) trait BackingStore: Send + Sync + 'static {
+    /// Store kind, used for wiring decisions such as alignment requirements.
+    fn kind(&self) -> BackingStoreKind;
+
     /// Fire-and-forget write.
     ///
     /// `blocks` holds `Weak` references so the backing store cannot prevent
@@ -48,6 +68,11 @@ pub(crate) trait BackingStore: Send + Sync + 'static {
 // ============================================================================
 // Factory
 // ============================================================================
+
+/// Create a P2P baking-backed [`BackingStore`].
+pub(crate) fn new_p2p(config: BakingStoreConfig) -> Option<Arc<dyn BackingStore>> {
+    p2p::new_p2p(config)
+}
 
 /// Create an SSD-backed [`BackingStore`].
 ///
