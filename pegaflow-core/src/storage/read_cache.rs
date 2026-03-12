@@ -1,0 +1,376 @@
+// ============================================================================
+// ReadCache: sealed-block cache with pin/unpin semantics.
+//
+// Owns the TinyLFU cache and the pinned_for_load bookkeeping. All pin
+// state is encapsulated here; callers interact through `pin_blocks`,
+// `consume_pinned` (returns PinTokens), and `unpin_blocks`.
+// ============================================================================
+
+use std::collections::{HashMap, hash_map::Entry};
+use std::sync::{Arc, Weak};
+
+use log::error;
+use parking_lot::Mutex;
+
+use crate::block::{BlockKey, SealedBlock};
+use crate::cache::{CacheInsertOutcome, TinyLfuCache};
+use crate::metrics::core_metrics;
+
+// ============================================================================
+// PinToken — RAII guard for pinned blocks
+// ============================================================================
+
+/// RAII token returned by [`ReadCache::consume_pinned`].
+///
+/// Holds a strong reference to the sealed block. Dropping the token
+/// automatically decrements the pin refcount in the cache; when the
+/// last token for an (instance, block) pair is dropped the pin entry
+/// is removed entirely.
+pub struct PinToken {
+    block: Arc<SealedBlock>,
+    _guard: PinDropGuard,
+}
+
+impl PinToken {
+    /// Borrow the underlying sealed block.
+    pub fn block(&self) -> &Arc<SealedBlock> {
+        &self.block
+    }
+}
+
+/// Drop guard that releases one unit of pin refcount.
+struct PinDropGuard {
+    pin_key: (String, BlockKey),
+    block_key: BlockKey,
+    state: Weak<ReadCacheState>,
+}
+
+impl Drop for PinDropGuard {
+    fn drop(&mut self) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        let mut inner = state.inner.lock();
+
+        // Decrement per-(instance, block) refcount
+        if let Entry::Occupied(mut entry) = inner.pinned_for_load.entry(self.pin_key.clone()) {
+            let (_, count) = entry.get_mut();
+            *count -= 1;
+            if *count == 0 {
+                entry.remove();
+            }
+        }
+
+        // Decrement per-block unique refcount
+        let mut should_remove = false;
+        if let Some((bytes, total)) = inner.pinned_for_load_by_key.get_mut(&self.block_key) {
+            *total -= 1;
+            if *total == 0 {
+                should_remove = true;
+                core_metrics()
+                    .pinned_for_load_unique_bytes
+                    .add(-(*bytes as i64), &[]);
+            }
+        }
+        if should_remove {
+            inner.pinned_for_load_by_key.remove(&self.block_key);
+        }
+    }
+}
+
+// ============================================================================
+// ReadCache
+// ============================================================================
+
+pub(crate) struct ReadCache {
+    state: Arc<ReadCacheState>,
+}
+
+struct ReadCacheState {
+    inner: Mutex<ReadCacheInner>,
+}
+
+struct ReadCacheInner {
+    /// Sealed blocks available for lookup (TinyLFU admission + LRU eviction).
+    cache: TinyLfuCache<BlockKey, Arc<SealedBlock>>,
+    /// Pinned blocks between query and load (prevents eviction race).
+    /// Key: (instance_id, block_key), Value: (block, ref_count)
+    pinned_for_load: HashMap<(String, BlockKey), (Arc<SealedBlock>, usize)>,
+    /// Aggregated refcounts by block key (for attribution metrics).
+    /// Value: (footprint_bytes, total_refcount)
+    pinned_for_load_by_key: HashMap<BlockKey, (u64, usize)>,
+}
+
+impl ReadCache {
+    pub fn new(
+        capacity_bytes: usize,
+        enable_lfu_admission: bool,
+        value_size_hint: Option<usize>,
+    ) -> Self {
+        let cache =
+            TinyLfuCache::new_unbounded(capacity_bytes, enable_lfu_admission, value_size_hint);
+        Self {
+            state: Arc::new(ReadCacheState {
+                inner: Mutex::new(ReadCacheInner {
+                    cache,
+                    pinned_for_load: HashMap::new(),
+                    pinned_for_load_by_key: HashMap::new(),
+                }),
+            }),
+        }
+    }
+
+    // ====================================================================
+    // Query
+    // ====================================================================
+
+    /// Check if a key exists in the cache (no promotion).
+    pub fn contains_key(&self, key: &BlockKey) -> bool {
+        self.state.inner.lock().cache.contains_key(key)
+    }
+
+    /// Pure memory-only prefix check. Returns `(hit, missing)`.
+    pub fn check_prefix_memory_only(&self, namespace: &str, hashes: &[Vec<u8>]) -> (usize, usize) {
+        let mut hit = 0usize;
+        {
+            let mut inner = self.state.inner.lock();
+            for hash in hashes {
+                let key = BlockKey::new(namespace.to_string(), hash.clone());
+                if inner.cache.get(&key).is_some() {
+                    hit += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        (hit, hashes.len() - hit)
+    }
+
+    /// Scan cache for a prefix of `keys`. Returns (hit_count, blocks_found).
+    ///
+    /// Stops at the first miss. Blocks are cloned (Arc) for pinning.
+    pub fn get_prefix_blocks(
+        &self,
+        keys: &[BlockKey],
+    ) -> (usize, Vec<(BlockKey, Arc<SealedBlock>)>) {
+        let mut hit = 0usize;
+        let mut blocks = Vec::new();
+        {
+            let mut inner = self.state.inner.lock();
+            for key in keys {
+                if let Some(block) = inner.cache.get(key) {
+                    hit += 1;
+                    blocks.push((key.clone(), Arc::clone(&block)));
+                } else {
+                    break;
+                }
+            }
+        }
+        (hit, blocks)
+    }
+
+    // ====================================================================
+    // Insert
+    // ====================================================================
+
+    /// Insert a sealed block. Returns the admission outcome.
+    pub fn insert(&self, key: BlockKey, block: Arc<SealedBlock>) -> CacheInsertOutcome {
+        self.state.inner.lock().cache.insert(key, block)
+    }
+
+    /// Batch-insert blocks (typically from SSD prefetch).
+    pub fn batch_insert(&self, blocks: Vec<(BlockKey, Arc<SealedBlock>)>) {
+        let mut inner = self.state.inner.lock();
+        for (key, block) in blocks {
+            let footprint_bytes = block.memory_footprint();
+            match inner.cache.insert(key, block) {
+                CacheInsertOutcome::InsertedNew => {
+                    let m = core_metrics();
+                    m.cache_block_insertions.add(1, &[]);
+                    m.cache_resident_bytes.add(footprint_bytes as i64, &[]);
+                }
+                CacheInsertOutcome::AlreadyExists => {}
+                CacheInsertOutcome::Rejected => {
+                    core_metrics().cache_block_admission_rejections.add(1, &[]);
+                }
+            }
+        }
+    }
+
+    // ====================================================================
+    // Pin / Unpin
+    // ====================================================================
+
+    /// Pin blocks under a single lock acquisition.
+    ///
+    /// `num_workers` is the number of consumers that will each call
+    /// `consume_pinned` once. The pin refcount is set accordingly.
+    pub fn pin_blocks(
+        &self,
+        instance_id: &str,
+        num_workers: usize,
+        blocks: &[(BlockKey, Arc<SealedBlock>)],
+    ) {
+        let mut inner = self.state.inner.lock();
+        let instance_id_owned = instance_id.to_string();
+        for (key, block) in blocks {
+            let pin_key = (instance_id_owned.clone(), key.clone());
+            let footprint = block.memory_footprint();
+
+            match inner.pinned_for_load.entry(pin_key) {
+                Entry::Occupied(mut o) => {
+                    o.get_mut().1 += num_workers;
+                }
+                Entry::Vacant(v) => {
+                    v.insert((Arc::clone(block), num_workers));
+                }
+            }
+
+            match inner.pinned_for_load_by_key.entry(key.clone()) {
+                Entry::Occupied(mut o) => {
+                    o.get_mut().1 += num_workers;
+                }
+                Entry::Vacant(v) => {
+                    v.insert((footprint, num_workers));
+                    core_metrics()
+                        .pinned_for_load_unique_bytes
+                        .add(footprint as i64, &[]);
+                }
+            }
+        }
+    }
+
+    /// Consume pinned blocks, returning [`PinToken`]s.
+    ///
+    /// Each token auto-releases one unit of pin refcount when dropped.
+    /// This replaces the old `cache_lookup_many` + manual `unpin_blocks`
+    /// pattern for the normal (non-cancelled) path.
+    #[cfg_attr(feature = "tracing", fastrace::trace(name = "storage.consume_pinned"))]
+    pub fn consume_pinned(
+        &self,
+        instance_id: &str,
+        namespace: &str,
+        block_hashes: &[Vec<u8>],
+    ) -> Result<Vec<PinToken>, String> {
+        let keys: Vec<BlockKey> = block_hashes
+            .iter()
+            .map(|hash| BlockKey::new(namespace.to_string(), hash.clone()))
+            .collect();
+
+        let inner = self.state.inner.lock();
+        let mut result = Vec::with_capacity(keys.len());
+
+        for (idx, key) in keys.into_iter().enumerate() {
+            let pin_key = (instance_id.to_string(), key.clone());
+
+            if let Some((block, _count)) = inner.pinned_for_load.get(&pin_key) {
+                result.push(PinToken {
+                    block: Arc::clone(block),
+                    _guard: PinDropGuard {
+                        pin_key,
+                        block_key: key,
+                        state: Arc::downgrade(&self.state),
+                    },
+                });
+            } else {
+                return Err(format!(
+                    "missing pinned KV block at index {} (namespace={}, hash_len={})",
+                    idx,
+                    key.namespace,
+                    key.hash.len()
+                ));
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Unpin blocks (cancellation path, before `consume_pinned`).
+    ///
+    /// Decrements the refcount by 1 per hash. Returns count of
+    /// entries that were successfully unpinned.
+    pub fn unpin_blocks(
+        &self,
+        instance_id: &str,
+        namespace: &str,
+        block_hashes: &[Vec<u8>],
+    ) -> usize {
+        let keys: Vec<BlockKey> = block_hashes
+            .iter()
+            .map(|hash| BlockKey::new(namespace.to_string(), hash.clone()))
+            .collect();
+        let pin_keys: Vec<(String, BlockKey)> = keys
+            .iter()
+            .map(|key| (instance_id.to_string(), key.clone()))
+            .collect();
+
+        let mut inner = self.state.inner.lock();
+        let mut unpinned = 0usize;
+
+        for (key, pin_key) in keys.into_iter().zip(pin_keys.into_iter()) {
+            if let Some((_, count)) = inner.pinned_for_load.get_mut(&pin_key) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    inner.pinned_for_load.remove(&pin_key);
+                }
+                unpinned += 1;
+
+                // Track unique block removal
+                let mut unique_bytes_to_remove: Option<u64> = None;
+                if let Some((bytes, total)) = inner.pinned_for_load_by_key.get_mut(&key) {
+                    *total = total.saturating_sub(1);
+                    if *total == 0 {
+                        unique_bytes_to_remove = Some(*bytes);
+                    }
+                } else {
+                    error!(
+                        "BUG: pinned_for_load_by_key missing key during unpin: namespace={} hash_len={}",
+                        key.namespace,
+                        key.hash.len()
+                    );
+                }
+
+                if let Some(bytes) = unique_bytes_to_remove {
+                    inner.pinned_for_load_by_key.remove(&key);
+                    core_metrics()
+                        .pinned_for_load_unique_bytes
+                        .add(-(bytes as i64), &[]);
+                }
+            }
+        }
+
+        unpinned
+    }
+
+    // ====================================================================
+    // Eviction
+    // ====================================================================
+
+    /// Remove up to `batch_size` LRU entries. Returns evicted blocks.
+    pub fn remove_lru_batch(&self, batch_size: usize) -> Vec<(BlockKey, Arc<SealedBlock>)> {
+        let mut inner = self.state.inner.lock();
+        (0..batch_size)
+            .map_while(|_| inner.cache.remove_lru())
+            .collect()
+    }
+
+    // ====================================================================
+    // Test helpers
+    // ====================================================================
+
+    #[cfg(test)]
+    pub fn test_insert(&self, key: BlockKey, block: Arc<SealedBlock>) {
+        self.state.inner.lock().cache.insert(key, block);
+    }
+
+    #[cfg(test)]
+    pub fn pin_count(&self, instance_id: &str, key: &BlockKey) -> usize {
+        let pin_key = (instance_id.to_string(), key.clone());
+        self.state
+            .inner
+            .lock()
+            .pinned_for_load
+            .get(&pin_key)
+            .map_or(0, |(_, count)| *count)
+    }
+}

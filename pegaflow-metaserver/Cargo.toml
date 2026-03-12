@@ -21,8 +21,5 @@ tokio.workspace = true
 clap.workspace = true
 log.workspace = true
 logforth.workspace = true
-parking_lot.workspace = true
 moka = { version = "0.12", features = ["future"] }
 serde.workspace = true
-serde_json.workspace = true
-colored.workspace = true

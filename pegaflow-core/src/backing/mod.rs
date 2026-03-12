@@ -39,11 +39,10 @@ pub(crate) trait BackingStore: Send + Sync + 'static {
     /// cache eviction from freeing the pinned memory before the write completes.
     fn ingest_batch(&self, blocks: Vec<(BlockKey, Weak<SealedBlock>)>);
 
-    /// Prefix-scan `keys` in order, schedule reads for those found, stop at first miss.
+    /// Submit prefix reads: scan `keys` in order, submit reads for consecutive hits, stop at first miss.
     ///
-    /// Returns `(found_count, done_rx)` where `done_rx` delivers the batch of
-    /// successfully-read blocks once all I/O finishes.
-    fn read_prefix(&self, keys: Vec<BlockKey>) -> (usize, oneshot::Receiver<PrefetchResult>);
+    /// Returns `(submitted, done_rx)` where `done_rx` delivers completed blocks.
+    fn submit_prefix(&self, keys: Vec<BlockKey>) -> (usize, oneshot::Receiver<PrefetchResult>);
 }
 
 // ============================================================================
