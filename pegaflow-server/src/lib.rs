@@ -25,6 +25,7 @@ use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use parking_lot::Mutex;
 use pegaflow_core::PegaEngine;
+use pegaflow_transfer::MooncakeTransferEngine;
 use prometheus::Registry;
 use proto::engine::engine_server::EngineServer;
 use proto::engine::rdma_transfer_server::RdmaTransferServer;
@@ -145,6 +146,14 @@ pub struct Cli {
     /// Fallback order: this flag > PEGAFLOW_HOST_IP env + bind port > auto-detected IP + bind port.
     #[arg(long)]
     pub p2p_node_addr: Option<String>,
+
+    /// RDMA NIC device name (e.g. mlx5_0). Enables RDMA transfer engine when set.
+    #[arg(long)]
+    pub rdma_nic: Option<String>,
+
+    /// RDMA UDP port for the transfer engine (only used when --rdma-nic is set).
+    #[arg(long, default_value_t = 56070)]
+    pub rdma_port: u16,
 }
 
 /// Resolve this node's advertised P2P address (ip:port) for coordinator registration.
@@ -420,6 +429,22 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         }
     });
 
+    // Initialize RDMA transfer engine if --rdma-nic is provided.
+    let rdma_engine: Option<Arc<MooncakeTransferEngine>> = if let Some(ref nic) = cli.rdma_nic {
+        info!(
+            "Initializing RDMA transfer engine on {}:{}",
+            nic, cli.rdma_port
+        );
+        let mut engine = MooncakeTransferEngine::new();
+        engine.initialize(nic, cli.rdma_port).map_err(|e| {
+            std::io::Error::other(format!("RDMA initialize on {nic}:{}: {e}", cli.rdma_port))
+        })?;
+        info!("RDMA transfer engine initialized");
+        Some(Arc::new(engine))
+    } else {
+        None
+    };
+
     let storage_config = pegaflow_core::StorageConfig {
         enable_lfu_admission: cli.enable_lfu_admission,
         hint_value_size_bytes: cli.hint_value_size,
@@ -433,7 +458,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         }),
         ssd_cache_config,
         enable_numa_affinity: !cli.disable_numa_affinity,
-        transfer_engine: None,
+        transfer_engine: rdma_engine.clone(),
     };
 
     if cli.enable_lfu_admission {
@@ -467,6 +492,21 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             cli.use_hugepages,
             storage_config,
         ));
+
+        // Register pinned pool memory regions with RDMA engine.
+        if let Some(ref rdma) = rdma_engine {
+            for (ptr, size) in engine.pinned_pool_regions() {
+                rdma.register_memory(ptr, size).map_err(|e| {
+                    std::io::Error::other(format!(
+                        "RDMA register_memory ptr={ptr:#x} size={size}: {e}"
+                    ))
+                })?;
+                info!(
+                    "RDMA registered pool region ptr={ptr:#x} size={:.2} MiB",
+                    size as f64 / (1024.0 * 1024.0)
+                );
+            }
+        }
 
         let service = GrpcEngineService::new(
             Arc::clone(&engine),
@@ -560,7 +600,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
             .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE);
 
-        let rdma_service = GrpcRdmaTransferService::new(Arc::clone(&engine));
+        let rdma_service = match rdma_engine.clone() {
+            Some(rdma) => GrpcRdmaTransferService::new_with_rdma(Arc::clone(&engine), rdma),
+            None => GrpcRdmaTransferService::new(Arc::clone(&engine)),
+        };
         let rdma_grpc_service = RdmaTransferServer::new(rdma_service);
 
         if let Err(err) = Server::builder()
@@ -574,6 +617,16 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         }
 
         info!("Server stopped");
+
+        // Unregister RDMA memory regions before dropping the engine.
+        if let Some(ref rdma) = rdma_engine {
+            for (ptr, _) in engine.pinned_pool_regions() {
+                if let Err(e) = rdma.unregister_memory(ptr) {
+                    warn!("RDMA unregister_memory ptr={ptr:#x}: {e}");
+                }
+            }
+            info!("RDMA pool regions unregistered");
+        }
 
         // Stop HTTP server
         shutdown.notify_waiters();
