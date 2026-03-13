@@ -261,27 +261,27 @@ impl PegaEngine {
             .ok_or_else(|| EngineError::InstanceMissing(instance_id.to_string()))
     }
 
-    /// Register a KV cache layer with its memory layout.
+    /// Batch register multiple KV cache layers for a single GPU.
     ///
-    /// This validates the layout parameters, initializes the instance/GPU context
-    /// if needed, and stores the registration for subsequent load/save operations.
+    /// This reduces gRPC round-trips from N to 1 and allows the engine to
+    /// construct the GPU context with all layer registrations at once.
     #[allow(clippy::too_many_arguments)]
-    pub fn register_context_layer(
+    pub fn register_context_layer_batch(
         &self,
         instance_id: &str,
         namespace: &str,
         device_id: i32,
-        layer_name: String,
-        data_ptr: u64,
-        size_bytes: usize,
-        num_blocks: usize,
-        bytes_per_block: usize,
-        kv_stride_bytes: usize,
-        segments: usize,
         tp_rank: usize,
         tp_size: usize,
         world_size: usize,
         num_layers: usize,
+        layer_names: &[String],
+        data_ptrs: &[u64],
+        size_bytes_list: &[usize],
+        num_blocks_list: &[usize],
+        bytes_per_block_list: &[usize],
+        kv_stride_bytes_list: &[usize],
+        segments_list: &[usize],
     ) -> Result<(), EngineError> {
         if device_id < 0 {
             return Err(EngineError::InvalidArgument(
@@ -289,29 +289,37 @@ impl PegaEngine {
             ));
         }
 
-        // Construct and validate registration
-        let mut registration = KVCacheRegistration::new(
-            data_ptr,
-            size_bytes,
-            num_blocks,
-            bytes_per_block,
-            kv_stride_bytes,
-            segments,
-        )
-        .map_err(|e| EngineError::InvalidArgument(format!("layer {layer_name}: {e}")))?;
+        // Build all registrations
+        let ssd_enabled = self.storage.is_ssd_enabled();
+        let batch_size = layer_names.len();
+        let mut kv_caches = HashMap::with_capacity(batch_size);
 
-        // Apply SSD alignment padding when SSD cache is enabled
-        if self.storage.is_ssd_enabled() {
-            registration = registration.with_ssd_padding(SSD_ALIGNMENT);
-            if registration.padded_bytes_per_block != registration.bytes_per_block {
-                info!(
-                    "SSD alignment padding: layer={layer_name}, bytes_per_block={} -> padded={}",
-                    registration.bytes_per_block, registration.padded_bytes_per_block
-                );
+        for i in 0..batch_size {
+            let layer_name = &layer_names[i];
+            let mut registration = KVCacheRegistration::new(
+                data_ptrs[i],
+                size_bytes_list[i],
+                num_blocks_list[i],
+                bytes_per_block_list[i],
+                kv_stride_bytes_list[i],
+                segments_list[i],
+            )
+            .map_err(|e| EngineError::InvalidArgument(format!("layer {layer_name}: {e}")))?;
+
+            if ssd_enabled {
+                registration = registration.with_ssd_padding(SSD_ALIGNMENT);
+                if registration.padded_bytes_per_block != registration.bytes_per_block {
+                    info!(
+                        "SSD alignment padding: layer={layer_name}, bytes_per_block={} -> padded={}",
+                        registration.bytes_per_block, registration.padded_bytes_per_block
+                    );
+                }
             }
+
+            kv_caches.insert(layer_name.clone(), registration);
         }
 
-        // Get or create instance, then register new layer on GPU
+        // Get or create instance
         let instance =
             self.get_or_create_instance(instance_id, namespace, num_layers, tp_size, world_size)?;
 
@@ -328,12 +336,12 @@ impl PegaEngine {
             )));
         }
 
-        instance.register_new_gpu_layer(device_id, numa_node, &layer_name, registration)?;
+        // Register GPU with all layers
+        instance.register_new_gpu(device_id, numa_node, kv_caches)?;
 
         info!(
-            "Registered context: instance={instance_id}, namespace={namespace}, \
-             device={device_id}, layer={layer_name}, num_blocks={num_blocks}, \
-             bytes_per_block={bytes_per_block}, segments={segments}, tp_rank={tp_rank}/{tp_size}"
+            "Registered context batch: instance={instance_id}, namespace={namespace}, \
+             device={device_id}, num_layers={num_layers}, tp_rank={tp_rank}/{tp_size}"
         );
         Ok(())
     }

@@ -8,7 +8,7 @@ use crate::proto::engine::{
     SaveResponse, ShutdownRequest, ShutdownResponse, UnpinRequest, UnpinResponse,
     UnregisterRequest, UnregisterResponse,
 };
-use crate::registry::{CudaTensorRegistry, TensorMetadata};
+use crate::registry::CudaTensorRegistry;
 use log::{debug, info, warn};
 use parking_lot::Mutex;
 use pegaflow_core::{EngineError, LayerSave, PegaEngine, PrefetchStatus};
@@ -88,26 +88,11 @@ impl GrpcEngineService {
     fn build_simple_response() -> ResponseStatus {
         Self::ok_status()
     }
-
-    fn handle_tensor_registration(
-        &self,
-        req: &RegisterContextRequest,
-    ) -> Result<TensorMetadata, Status> {
-        let mut registry = self.registry.lock();
-        registry
-            .register_layer(
-                &Self::context_key(&req.instance_id, req.tp_rank, req.device_id),
-                &req.layer_name,
-                req.device_id,
-                &req.wrapper_bytes,
-            )
-            .map_err(|err| Self::map_py_error("register tensor", err))
-    }
 }
 
 #[async_trait]
 impl Engine for GrpcEngineService {
-    async fn register_context(
+    async fn register_context_batch(
         &self,
         request: Request<RegisterContextRequest>,
     ) -> Result<Response<RegisterContextResponse>, Status> {
@@ -115,48 +100,96 @@ impl Engine for GrpcEngineService {
         let result: Result<Response<RegisterContextResponse>, Status> = async {
             let req = request.into_inner();
             debug!(
-                "RPC [register_context]: instance_id={} namespace={} layer_name={} device_id={} tp_rank={} tp_size={} world_size={} num_layers={} num_blocks={} bytes_per_block={} kv_stride_bytes={} segments={} wrapper_bytes={}",
+                "RPC [register_context_batch]: instance_id={} namespace={} device_id={} tp_rank={} tp_size={} world_size={} num_layers={} layer_names={:?} num_blocks={:?} bytes_per_block={:?} kv_stride_bytes={:?} segments={:?} wrapper_bytes_lens={:?}",
                 req.instance_id,
                 req.namespace,
-                req.layer_name,
                 req.device_id,
                 req.tp_rank,
                 req.tp_size,
                 req.world_size,
                 req.num_layers,
+                req.layer_names,
                 req.num_blocks,
                 req.bytes_per_block,
                 req.kv_stride_bytes,
                 req.segments,
-                req.wrapper_bytes.len()
+                req.wrapper_bytes.iter().map(|b| b.len()).collect::<Vec<_>>()
             );
-            let metadata = self.handle_tensor_registration(&req)?;
 
-            let num_blocks = Self::usize_from_u64(req.num_blocks, "num_blocks")?;
-            let bytes_per_block = Self::usize_from_u64(req.bytes_per_block, "bytes_per_block")?;
-            let kv_stride_bytes = Self::usize_from_u64(req.kv_stride_bytes, "kv_stride_bytes")?;
-            let segments = Self::usize_from_u32(req.segments, "segments")?;
+            let num_layers = Self::usize_from_u32(req.num_layers, "num_layers")?;
+
+            // Validate array lengths match num_layers
+            if req.layer_names.len() != num_layers
+                || req.wrapper_bytes.len() != num_layers
+                || req.num_blocks.len() != num_layers
+                || req.bytes_per_block.len() != num_layers
+                || req.kv_stride_bytes.len() != num_layers
+                || req.segments.len() != num_layers
+            {
+                return Err(Status::invalid_argument(format!(
+                    "all layer arrays must have length {num_layers}"
+                )));
+            }
+
+            // Materialize tensors and collect data_ptr/size_bytes
+            let context_key = Self::context_key(&req.instance_id, req.tp_rank, req.device_id);
+            let mut data_ptrs = Vec::with_capacity(num_layers);
+            let mut size_bytes_list = Vec::with_capacity(num_layers);
+            {
+                let mut registry = self.registry.lock();
+                for (layer_name, wrapper_bytes) in
+                    req.layer_names.iter().zip(req.wrapper_bytes.iter())
+                {
+                    let metadata = registry
+                        .register_layer(&context_key, layer_name, req.device_id, wrapper_bytes)
+                        .map_err(|err| Self::map_py_error("register tensor", err))?;
+                    data_ptrs.push(metadata.data_ptr);
+                    size_bytes_list.push(metadata.size_bytes);
+                }
+            }
+
+            let num_blocks_list: Vec<usize> = req
+                .num_blocks
+                .into_iter()
+                .map(|v| Self::usize_from_u64(v, "num_blocks"))
+                .collect::<Result<_, _>>()?;
+            let bytes_per_block_list: Vec<usize> = req
+                .bytes_per_block
+                .into_iter()
+                .map(|v| Self::usize_from_u64(v, "bytes_per_block"))
+                .collect::<Result<_, _>>()?;
+            let kv_stride_bytes_list: Vec<usize> = req
+                .kv_stride_bytes
+                .into_iter()
+                .map(|v| Self::usize_from_u64(v, "kv_stride_bytes"))
+                .collect::<Result<_, _>>()?;
+            let segments_list: Vec<usize> = req
+                .segments
+                .into_iter()
+                .map(|v| Self::usize_from_u32(v, "segments"))
+                .collect::<Result<_, _>>()?;
+
             let tp_rank = Self::usize_from_u32(req.tp_rank, "tp_rank")?;
             let tp_size = Self::usize_from_u32(req.tp_size, "tp_size")?;
             let world_size = Self::usize_from_u32(req.world_size, "world_size")?;
-            let num_layers = Self::usize_from_u32(req.num_layers, "num_layers")?;
 
+            // Call engine batch registration
             self.engine
-                .register_context_layer(
+                .register_context_layer_batch(
                     &req.instance_id,
                     &req.namespace,
-                    metadata.device_id,
-                    req.layer_name.clone(),
-                    metadata.data_ptr,
-                    metadata.size_bytes,
-                    num_blocks,
-                    bytes_per_block,
-                    kv_stride_bytes,
-                    segments,
+                    req.device_id,
                     tp_rank,
                     tp_size,
                     world_size,
                     num_layers,
+                    &req.layer_names,
+                    &data_ptrs,
+                    &size_bytes_list,
+                    &num_blocks_list,
+                    &bytes_per_block_list,
+                    &kv_stride_bytes_list,
+                    &segments_list,
                 )
                 .map_err(Self::map_engine_error)?;
 
@@ -167,17 +200,17 @@ impl Engine for GrpcEngineService {
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         match &result {
             Ok(_) => debug!(
-                "RPC [register_context] completed: ok elapsed_ms={:.2}",
+                "RPC [register_context_batch] completed: ok elapsed_ms={:.2}",
                 elapsed_ms
             ),
             Err(status) => warn!(
-                "RPC [register_context] failed: code={} message={} elapsed_ms={:.2}",
+                "RPC [register_context_batch] failed: code={} message={} elapsed_ms={:.2}",
                 status.code(),
                 status.message(),
                 elapsed_ms
             ),
         }
-        record_rpc_result("register_context", &result, start);
+        record_rpc_result("register_context_batch", &result, start);
         result
     }
 

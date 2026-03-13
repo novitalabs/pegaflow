@@ -152,7 +152,7 @@ pub struct GpuContext {
     preferred_numa: NumaNode,
 
     /// KV cache layout registrations by layer name.
-    kv_caches: Mutex<HashMap<String, KVCacheRegistration>>,
+    kv_caches: HashMap<String, KVCacheRegistration>,
 
     /// CUDA context handle (kept alive for the lifetime of this context).
     _cuda_ctx: Arc<CudaContext>,
@@ -175,12 +175,13 @@ impl GpuContext {
         cuda_ctx: Arc<CudaContext>,
         device_id: i32,
         numa_node: NumaNode,
+        kv_caches: HashMap<String, KVCacheRegistration>,
     ) -> Result<Self, EngineError> {
         let worker_pool = GpuWorkerPool::spawn(device_id, numa_node)?;
 
         Ok(Self {
             preferred_numa: numa_node,
-            kv_caches: Mutex::new(HashMap::new()),
+            kv_caches,
             _cuda_ctx: cuda_ctx,
             worker_pool,
         })
@@ -191,32 +192,9 @@ impl GpuContext {
         self.preferred_numa
     }
 
-    /// Register a new layer's KV cache layout.
-    ///
-    /// # Errors
-    /// Returns an error if the layer is already registered on this GPU.
-    fn register_new_layer(
-        &self,
-        layer_name: String,
-        registration: KVCacheRegistration,
-    ) -> Result<(), String> {
-        let mut registrations = self.kv_caches.lock();
-
-        if registrations.contains_key(&layer_name) {
-            return Err(format!(
-                "layer {} already registered on this GPU",
-                layer_name
-            ));
-        }
-
-        registrations.insert(layer_name, registration);
-        Ok(())
-    }
-
     /// Retrieve a layer's registration information.
     pub(crate) fn get_registration(&self, layer_name: &str) -> Option<KVCacheRegistration> {
-        let registrations = self.kv_caches.lock();
-        registrations.get(layer_name).cloned()
+        self.kv_caches.get(layer_name).cloned()
     }
 
     /// Access the worker pool for submitting GPU operations.
@@ -351,10 +329,11 @@ impl InstanceContext {
     /// # Errors
     /// Returns `EngineError::InvalidArgument` for negative device IDs,
     /// or `EngineError::CudaInit` if CUDA context creation fails.
-    fn ensure_gpu(
+    fn create_gpu(
         &self,
         device_id: i32,
         numa_node: NumaNode,
+        kv_caches: HashMap<String, KVCacheRegistration>,
     ) -> Result<Arc<GpuContext>, EngineError> {
         if device_id < 0 {
             return Err(EngineError::InvalidArgument(format!(
@@ -363,26 +342,32 @@ impl InstanceContext {
             )));
         }
 
-        // Fast path: check if context exists
+        // Check if context already exists
         {
             let metadata = self.metadata.lock();
-            if let Some(ctx) = metadata.gpu_contexts.get(&device_id) {
-                return Ok(Arc::clone(ctx));
+            if metadata.gpu_contexts.contains_key(&device_id) {
+                return Err(EngineError::InvalidArgument(format!(
+                    "GPU context for device {} already exists",
+                    device_id
+                )));
             }
         }
 
-        // Slow path: create new context
+        // Create new context
         let cuda_ctx = CudaContext::new(device_id as usize)
             .map_err(|e| EngineError::CudaInit(format!("{e:?}")))?;
 
-        let ctx = Arc::new(GpuContext::new(cuda_ctx, device_id, numa_node)?);
+        let ctx = Arc::new(GpuContext::new(cuda_ctx, device_id, numa_node, kv_caches)?);
 
         // Insert and return
         let mut metadata = self.metadata.lock();
 
         // Double-check after acquiring lock
-        if let Some(existing) = metadata.gpu_contexts.get(&device_id) {
-            return Ok(Arc::clone(existing));
+        if metadata.gpu_contexts.contains_key(&device_id) {
+            return Err(EngineError::InvalidArgument(format!(
+                "GPU context for device {} already exists",
+                device_id
+            )));
         }
 
         metadata.gpu_contexts.insert(device_id, Arc::clone(&ctx));
@@ -400,39 +385,22 @@ impl InstanceContext {
         metadata.gpu_contexts.get(&device_id).cloned()
     }
 
-    /// Register a layer on a GPU.
-    ///
-    /// This method:
-    /// 1. Ensures the GPU context exists (creates if needed)
-    /// 2. Gets existing layer ID or allocates a new one (idempotent)
-    /// 3. Registers the layer's KV cache on the GPU
-    ///
-    /// For MLA with TP > 1, multiple ranks may register the same layer name
-    /// on different devices. The layer ID allocation is idempotent, but
-    /// GPU registration will fail if the same layer is registered twice
-    /// on the same device.
+    /// Register a new GPU with all its KV cache layers.
     ///
     /// # Errors
-    /// - `EngineError::InvalidArgument` if layer already registered on this GPU
+    /// - `EngineError::InvalidArgument` if GPU already registered
     /// - `EngineError::CudaInit` if GPU context creation fails
-    pub(crate) fn register_new_gpu_layer(
+    pub(crate) fn register_new_gpu(
         &self,
         device_id: i32,
         numa_node: NumaNode,
-        layer_name: &str,
-        registration: KVCacheRegistration,
-    ) -> Result<usize, EngineError> {
-        // 1. Ensure GPU context
-        let gpu = self.ensure_gpu(device_id, numa_node)?;
-
-        // 2. Get or allocate layer ID (idempotent for MLA multi-device registration)
-        let layer_id = self.get_or_allocate_layer_id(layer_name);
-
-        // 3. Register on GPU (fails if layer already registered on THIS device)
-        gpu.register_new_layer(layer_name.to_string(), registration)
-            .map_err(EngineError::InvalidArgument)?;
-
-        Ok(layer_id)
+        kv_caches: HashMap<String, KVCacheRegistration>,
+    ) -> Result<(), EngineError> {
+        for layer_name in kv_caches.keys() {
+            self.get_or_allocate_layer_id(layer_name);
+        }
+        self.create_gpu(device_id, numa_node, kv_caches)?;
+        Ok(())
     }
 
     /// Access the instance namespace.
@@ -512,7 +480,7 @@ mod tests {
     }
 
     /// Simulates the inference-side registration flow (single GPU).
-    /// Covers: instance creation -> GPU context creation -> layer registration.
+    /// Covers: instance creation -> GPU context creation -> batch layer registration.
     #[test]
     fn inference_registration_flow() {
         // 1. Create instance (like get_or_create_instance)
@@ -528,7 +496,8 @@ mod tests {
         // Use UNKNOWN NUMA node for tests (no actual GPU/NUMA in CI)
         let numa = NumaNode::UNKNOWN;
 
-        // 2. Register multiple layers on device 0
+        // 2. Build all layer registrations for device 0
+        let mut kv_caches = HashMap::new();
         for layer_id in 0..4 {
             let layer_name = format!("layer_{}", layer_id);
             let reg = KVCacheRegistration::new(
@@ -540,25 +509,29 @@ mod tests {
                 1,
             )
             .unwrap();
-
-            let id = instance
-                .register_new_gpu_layer(0, numa, &layer_name, reg)
-                .expect("register layer");
-            assert_eq!(id, layer_id);
+            kv_caches.insert(layer_name, reg);
         }
 
-        // 3. Verify topology checking
+        // 3. Register all layers at once
+        instance
+            .register_new_gpu(0, numa, kv_caches)
+            .expect("register gpu with layers");
+
+        // 4. Verify topology checking
         assert!(instance.verify_topology(64, 8, 8).is_ok());
         assert!(instance.verify_topology(32, 8, 8).is_err()); // wrong layers
 
-        // 4. Verify duplicate layer registration on SAME device fails
-        let dup_reg = KVCacheRegistration::new(0x2000, 1024 * 1024, 100, 1024, 0, 1).unwrap();
+        // 5. Verify duplicate GPU registration fails
+        let dup_caches = HashMap::from([(
+            "layer_0".to_string(),
+            KVCacheRegistration::new(0x2000, 1024 * 1024, 100, 1024, 0, 1).unwrap(),
+        )]);
         let err = instance
-            .register_new_gpu_layer(0, numa, "layer_0", dup_reg)
-            .expect_err("duplicate on same device should fail");
-        assert!(err.to_string().contains("already registered"));
+            .register_new_gpu(0, numa, dup_caches)
+            .expect_err("duplicate GPU registration should fail");
+        assert!(err.to_string().contains("already exists"));
 
-        // 5. Verify we can get the registered layer back
+        // 6. Verify we can get the registered layer back
         let gpu = instance.get_gpu(0).expect("get gpu context");
         let reg = gpu.get_registration("layer_0").expect("get registration");
         assert_eq!(reg.data_ptr, 0x1000);

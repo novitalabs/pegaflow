@@ -7,20 +7,21 @@ message ResponseStatus {
   string message = 2;
 }
 
+// Batch registration request for all layers on a GPU (reduces N RPCs to 1)
 message RegisterContextRequest {
   string instance_id = 1;
-  int32 device_id = 2;
-  string layer_name = 3;
-  bytes wrapper_bytes = 4;
-  uint64 num_blocks = 5;
-  uint64 bytes_per_block = 6;
-  uint64 kv_stride_bytes = 7;
-  uint32 segments = 8;
-  uint32 tp_rank = 9;
-  uint32 tp_size = 10;
-  uint32 num_layers = 11;
-  string namespace = 12;
-  uint32 world_size = 13;
+  string namespace = 2;
+  uint32 tp_rank = 3;
+  uint32 tp_size = 4;
+  uint32 world_size = 5;
+  int32 device_id = 6;
+  uint32 num_layers = 7;
+  repeated string layer_names = 8;
+  repeated bytes wrapper_bytes = 9;
+  repeated uint64 num_blocks = 10;
+  repeated uint64 bytes_per_block = 11;
+  repeated uint64 kv_stride_bytes = 12;
+  repeated uint32 segments = 13;
 }
 
 message RegisterContextResponse {
@@ -113,7 +114,7 @@ message HealthResponse {
 }
 
 service Engine {
-  rpc RegisterContext(RegisterContextRequest) returns (RegisterContextResponse);
+  rpc RegisterContextBatch(RegisterContextRequest) returns (RegisterContextResponse);
   rpc Save(SaveRequest) returns (SaveResponse);
   rpc Load(LoadRequest) returns (LoadResponse);
   // Pure memory-only query: check if prefix blocks are in memory cache (no SSD prefetch)
