@@ -53,7 +53,7 @@ const UD_RECV_SLOTS: usize = 64;
 const UD_BUFFER_BYTES: usize = 4096;
 const UD_GRH_BYTES: usize = 40;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
-const MAX_INFLIGHT_OPS: usize = 512;
+const MAX_INFLIGHT_OPS: usize = 64;
 const MAX_WR_CHAIN_OPS: usize = 32;
 
 #[derive(Default)]
@@ -828,7 +828,7 @@ impl SidewayBackend {
             .setup_qp_type(QueuePairType::ReliableConnection)
             .setup_send_cq(send_cq.clone())
             .setup_recv_cq(recv_cq.clone())
-            .setup_max_send_wr(512)
+            .setup_max_send_wr(64)
             .setup_max_recv_wr(16)
             .setup_max_send_sge(1)
             .setup_max_recv_sge(1);
