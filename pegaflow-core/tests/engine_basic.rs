@@ -55,6 +55,7 @@ async fn save_query_load_roundtrip_with_numa_affinity_enabled() {
                 baking_store_config: None,
                 ssd_cache_config: None,
                 enable_numa_affinity: true,
+                transfer_engine: None,
             }),
     );
 

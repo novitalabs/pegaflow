@@ -35,6 +35,7 @@ async fn ssd_smoke_roundtrip_with_temp_dir() {
                     ..SsdCacheConfig::default()
                 }),
                 enable_numa_affinity: false,
+                transfer_engine: None,
             }),
     );
 

@@ -22,7 +22,8 @@ use std::num::NonZeroU64;
 use std::sync::{Arc, Weak};
 
 use crate::backing::{
-    BackingStore, BackingStoreKind, BakingStoreConfig, DEFAULT_MAX_PREFETCH_BLOCKS, SsdCacheConfig,
+    AllocateFn, BackingStore, BackingStoreKind, BakingStoreConfig, DEFAULT_MAX_PREFETCH_BLOCKS,
+    SsdCacheConfig,
 };
 use crate::block::BlockLookupResult;
 use crate::block::{BlockKey, PrefetchStatus, SealedBlock};
@@ -47,7 +48,7 @@ const RECLAIM_BATCH_SIZE: usize = 64;
 // ============================================================================
 
 /// Configuration for cache + storage behavior.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct StorageConfig {
     pub enable_lfu_admission: bool,
     /// Optional hint for expected value size in bytes (tunes cache + allocator granularity).
@@ -60,6 +61,8 @@ pub struct StorageConfig {
     pub ssd_cache_config: Option<SsdCacheConfig>,
     /// Enable NUMA-aware memory allocation.
     pub enable_numa_affinity: bool,
+    /// Optional RDMA transfer engine for P2P block reads.
+    pub transfer_engine: Option<Arc<pegaflow_transfer::MooncakeTransferEngine>>,
 }
 
 impl Default for StorageConfig {
@@ -71,6 +74,7 @@ impl Default for StorageConfig {
             baking_store_config: None,
             ssd_cache_config: None,
             enable_numa_affinity: true,
+            transfer_engine: None,
         }
     }
 }
@@ -115,6 +119,7 @@ impl StorageEngine {
         let max_prefetch_blocks = config.max_prefetch_blocks;
         let baking_store_config = config.baking_store_config.clone();
         let ssd_cache_config = config.ssd_cache_config;
+        let transfer_engine = config.transfer_engine;
 
         let ssd_enabled = ssd_cache_config.is_some();
 
@@ -155,25 +160,26 @@ impl StorageEngine {
         let engine = Arc::new_cyclic(move |weak_engine: &Weak<Self>| {
             let mut backing_stores = Vec::new();
 
+            // Build shared allocate_fn for both P2P and SSD backing stores.
+            let p2p_weak = weak_engine.clone();
+            let allocate_fn: AllocateFn = Arc::new(move |size, numa_node| {
+                p2p_weak
+                    .upgrade()
+                    .and_then(|engine| engine.allocate(NonZeroU64::new(size)?, numa_node))
+            });
+
             if let Some(baking_cfg) = baking_store_config.clone()
-                && let Some(store) = crate::backing::new_p2p(baking_cfg)
+                && let Some(engine) = transfer_engine.clone()
+                && let Some(store) =
+                    crate::backing::new_p2p(baking_cfg, allocate_fn.clone(), engine)
             {
                 backing_stores.push(store);
             }
 
-            if let Some(ssd_cfg) = ssd_cache_config {
-                let weak_engine = weak_engine.clone();
-                if let Some(store) = crate::backing::new_ssd(
-                    ssd_cfg,
-                    move |size, numa_node| {
-                        weak_engine
-                            .upgrade()
-                            .and_then(|engine| engine.allocate(NonZeroU64::new(size)?, numa_node))
-                    },
-                    is_numa,
-                ) {
-                    backing_stores.push(store);
-                }
+            if let Some(ssd_cfg) = ssd_cache_config
+                && let Some(store) = crate::backing::new_ssd(ssd_cfg, allocate_fn.clone(), is_numa)
+            {
+                backing_stores.push(store);
             }
 
             let prefetch = PrefetchScheduler::new(backing_stores.clone(), max_prefetch_blocks);

@@ -34,6 +34,7 @@ k8s-openapi.workspace = true
 tonic.workspace = true
 dashmap.workspace = true
 pegaflow-proto = { path = "../pegaflow-proto" }
+pegaflow-transfer = { path = "../pegaflow-transfer" }
 
 [dev-dependencies]
 criterion.workspace = true

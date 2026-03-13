@@ -1,5 +1,6 @@
 use log::debug;
 use pegaflow_core::{BlockKey, LeaseError, PegaEngine, SealedBlock};
+use pegaflow_transfer::MooncakeTransferEngine;
 use std::sync::Arc;
 use tonic::{Request, Response, Status, async_trait};
 use uuid::Uuid;
@@ -12,11 +13,33 @@ use crate::proto::engine::{
 
 pub struct GrpcRdmaTransferService {
     engine: Arc<PegaEngine>,
+    /// Owner's RDMA transfer engine. When present, `owner_domain_address` is
+    /// populated in `AcquireLeaseResponse` so the requester can target the
+    /// correct RDMA session for READ operations.
+    transfer_engine: Option<Arc<MooncakeTransferEngine>>,
 }
 
 impl GrpcRdmaTransferService {
     pub fn new(engine: Arc<PegaEngine>) -> Self {
-        Self { engine }
+        Self {
+            engine,
+            transfer_engine: None,
+        }
+    }
+
+    /// Create service with an associated RDMA engine.
+    ///
+    /// The engine's session ID is returned as `owner_domain_address` in every
+    /// `AcquireLeaseResponse`, allowing requester nodes to issue RDMA READs
+    /// directly into the owner's registered memory.
+    pub fn new_with_rdma(
+        engine: Arc<PegaEngine>,
+        transfer_engine: Arc<MooncakeTransferEngine>,
+    ) -> Self {
+        Self {
+            engine,
+            transfer_engine: Some(transfer_engine),
+        }
     }
 
     fn map_lease_error(err: LeaseError) -> Status {
@@ -84,13 +107,18 @@ impl RdmaTransfer for GrpcRdmaTransferService {
             missing_hashes.len(),
         );
 
+        let owner_domain_address = self
+            .transfer_engine
+            .as_ref()
+            .map(|e| e.get_session_id().to_bytes().to_vec())
+            .unwrap_or_default();
+
         Ok(Response::new(AcquireLeaseResponse {
             lease_id: grant.lease_id.to_string(),
             blocks,
             missing_hashes,
             expires_at_unix_ms: grant.expires_at_unix_ms,
-            // TODO: populate owner_domain_address once RdmaManager is integrated
-            owner_domain_address: Vec::new(),
+            owner_domain_address,
         }))
     }
 

@@ -18,6 +18,7 @@ pub fn test_engine() -> PegaEngine {
         baking_store_config: None,
         ssd_cache_config: None,
         enable_numa_affinity: false,
+        transfer_engine: None,
     })
 }
 

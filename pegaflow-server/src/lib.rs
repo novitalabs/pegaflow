@@ -428,10 +428,12 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             pegaflow_core::BakingStoreConfig {
                 p2p_coordinator_addr: addr.clone(),
                 p2p_node_addr: resolve_p2p_node_addr(&cli.p2p_node_addr, cli.addr),
+                node_id: String::new(), // Populated by PegaEngine after creation
             }
         }),
         ssd_cache_config,
         enable_numa_affinity: !cli.disable_numa_affinity,
+        transfer_engine: None,
     };
 
     if cli.enable_lfu_admission {

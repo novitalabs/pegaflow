@@ -16,10 +16,7 @@ use super::ssd_cache::{
     ssd_writer_loop,
 };
 use super::uring::{UringConfig, UringIoEngine};
-use super::{BackingStore, BackingStoreKind};
-
-pub(super) type AllocateFn =
-    Arc<dyn Fn(u64, Option<NumaNode>) -> Option<Arc<PinnedAllocation>> + Send + Sync>;
+use super::{AllocateFn, BackingStore, BackingStoreKind};
 
 struct SsdInner {
     ring: SsdRingBuffer,
@@ -225,10 +222,9 @@ impl BackingStore for SsdBackingStore {
 /// Returns `None` if the SSD cache cannot be initialised (logs the error).
 pub(super) fn new_ssd(
     config: SsdCacheConfig,
-    allocate_fn: impl Fn(u64, Option<NumaNode>) -> Option<Arc<PinnedAllocation>> + Send + Sync + 'static,
+    allocate_fn: AllocateFn,
     is_numa: bool,
 ) -> Option<Arc<dyn BackingStore>> {
-    let allocate_fn: AllocateFn = Arc::new(allocate_fn);
     match SsdBackingStore::new(config, allocate_fn, is_numa) {
         Ok(b) => Some(b as Arc<dyn BackingStore>),
         Err(e) => {

@@ -172,7 +172,7 @@ impl PegaEngine {
         topology.log_summary();
 
         // Resolve NUMA nodes based on config and topology
-        let config = storage_config.into();
+        let mut config = storage_config.into();
         let numa_nodes: Vec<numa::NumaNode> =
             if config.enable_numa_affinity && topology.is_multi_numa() {
                 info!(
@@ -184,9 +184,14 @@ impl PegaEngine {
                 vec![]
             };
 
-        let storage = StorageEngine::new_with_config(pool_size, use_hugepages, config, &numa_nodes);
-
         let node_id = Uuid::new_v4();
+
+        // Populate node_id into P2P config so the backing store can identify itself in lease RPCs.
+        if let Some(ref mut baking_cfg) = config.baking_store_config {
+            baking_cfg.node_id = node_id.to_string();
+        }
+
+        let storage = StorageEngine::new_with_config(pool_size, use_hugepages, config, &numa_nodes);
         let lease_manager = Arc::new(LeaseManager::new(LeaseConfig::default()));
         info!("PegaEngine node_id={node_id}");
 
@@ -646,6 +651,7 @@ mod tests {
             baking_store_config: None,
             ssd_cache_config: None,
             enable_numa_affinity: false,
+            transfer_engine: None,
         };
         let engine = PegaEngine::new_with_config(1 << 20, false, config);
 

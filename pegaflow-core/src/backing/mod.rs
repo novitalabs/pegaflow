@@ -25,6 +25,10 @@ use crate::pinned_pool::PinnedAllocation;
 /// Batch of successfully-read blocks from the backing store.
 pub(crate) type PrefetchResult = Vec<(BlockKey, Arc<SealedBlock>)>;
 
+/// Allocator closure for pinned memory (shared by SSD and P2P backing stores).
+pub(crate) type AllocateFn =
+    Arc<dyn Fn(u64, Option<NumaNode>) -> Option<Arc<PinnedAllocation>> + Send + Sync>;
+
 /// Configuration for the P2P baking store.
 #[derive(Debug, Clone)]
 pub struct BakingStoreConfig {
@@ -32,6 +36,8 @@ pub struct BakingStoreConfig {
     pub p2p_coordinator_addr: String,
     /// Advertised node address reported as the block owner.
     pub p2p_node_addr: String,
+    /// This node's UUID, used as requester identity in lease RPCs.
+    pub node_id: String,
 }
 
 /// Runtime kind of a backing store.
@@ -70,8 +76,15 @@ pub(crate) trait BackingStore: Send + Sync + 'static {
 // ============================================================================
 
 /// Create a P2P baking-backed [`BackingStore`].
-pub(crate) fn new_p2p(config: BakingStoreConfig) -> Option<Arc<dyn BackingStore>> {
-    p2p::new_p2p(config)
+///
+/// `allocate_fn` provides NUMA-aware pinned memory for RDMA read buffers.
+/// `transfer_engine` is an already-initialized RDMA transfer engine.
+pub(crate) fn new_p2p(
+    config: BakingStoreConfig,
+    allocate_fn: AllocateFn,
+    transfer_engine: Arc<pegaflow_transfer::MooncakeTransferEngine>,
+) -> Option<Arc<dyn BackingStore>> {
+    p2p::new_p2p(config, allocate_fn, transfer_engine)
 }
 
 /// Create an SSD-backed [`BackingStore`].
@@ -80,7 +93,7 @@ pub(crate) fn new_p2p(config: BakingStoreConfig) -> Option<Arc<dyn BackingStore>
 /// Returns `None` and logs an error if the SSD cache cannot be initialised.
 pub(crate) fn new_ssd(
     config: SsdCacheConfig,
-    allocate_fn: impl Fn(u64, Option<NumaNode>) -> Option<Arc<PinnedAllocation>> + Send + Sync + 'static,
+    allocate_fn: AllocateFn,
     is_numa: bool,
 ) -> Option<Arc<dyn BackingStore>> {
     ssd::new_ssd(config, allocate_fn, is_numa)
