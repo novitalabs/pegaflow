@@ -100,7 +100,7 @@ impl Engine for GrpcEngineService {
         let result: Result<Response<RegisterContextResponse>, Status> = async {
             let req = request.into_inner();
             debug!(
-                "RPC [register_context_batch]: instance_id={} namespace={} device_id={} tp_rank={} tp_size={} world_size={} num_layers={} num_blocks={:?} bytes_per_block={:?} kv_stride_bytes={:?} segments={:?} wrapper_bytes_lens={:?}",
+                "RPC [register_context_batch]: instance_id={} namespace={} device_id={} tp_rank={} tp_size={} world_size={} num_layers={} layer_names={:?} num_blocks={:?} bytes_per_block={:?} kv_stride_bytes={:?} segments={:?} wrapper_bytes_lens={:?}",
                 req.instance_id,
                 req.namespace,
                 req.device_id,
@@ -108,6 +108,7 @@ impl Engine for GrpcEngineService {
                 req.tp_size,
                 req.world_size,
                 req.num_layers,
+                req.layer_names,
                 req.num_blocks,
                 req.bytes_per_block,
                 req.kv_stride_bytes,
