@@ -514,18 +514,29 @@ fn rdma_read_blocks(
             let slot_size = slot.k_size + slot.v_size;
             let is_split = slot.v_addr != 0 && slot.v_size > 0;
 
-            // K segment
-            all_local_ptrs.push(base_ptr + offset);
-            all_remote_ptrs.push(slot.k_addr);
-            all_lens.push(slot.k_size as usize);
-            offset += slot.k_size;
+            // If K and V are contiguous in the remote address space, merge
+            // them into a single RDMA READ to halve the number of operations.
+            let kv_contiguous = is_split && slot.v_addr == slot.k_addr + slot.k_size;
 
-            // V segment (if split storage)
-            if is_split {
+            if kv_contiguous {
                 all_local_ptrs.push(base_ptr + offset);
-                all_remote_ptrs.push(slot.v_addr);
-                all_lens.push(slot.v_size as usize);
-                offset += slot.v_size;
+                all_remote_ptrs.push(slot.k_addr);
+                all_lens.push(slot_size as usize);
+                offset += slot_size;
+            } else {
+                // K segment
+                all_local_ptrs.push(base_ptr + offset);
+                all_remote_ptrs.push(slot.k_addr);
+                all_lens.push(slot.k_size as usize);
+                offset += slot.k_size;
+
+                // V segment (if split storage)
+                if is_split {
+                    all_local_ptrs.push(base_ptr + offset);
+                    all_remote_ptrs.push(slot.v_addr);
+                    all_lens.push(slot.v_size as usize);
+                    offset += slot.v_size;
+                }
             }
 
             slot_metas.push(SlotMeta {
