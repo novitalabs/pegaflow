@@ -516,6 +516,44 @@ async fn run_bench(
     );
     register_pool_regions(&req_rdma, &req_engine, "requester");
 
+    // ---- Warmup: establish RDMA session before timing ----
+    {
+        eprintln!("\n[warmup] establishing RDMA session...");
+        req_engine
+            .register_context_layer(
+                INSTANCE_ID,
+                NAMESPACE,
+                DEVICE_ID,
+                LAYER_NAME.to_string(),
+                req_gpu_ptr,
+                total_bytes,
+                num_blocks,
+                args.block_size,
+                0,
+                1,
+                0,
+                1,
+                1,
+                1,
+            )
+            .expect("register_context_layer warmup");
+
+        let warmup_hashes = &hashes[..1];
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match req_engine
+                .count_prefix_hit_blocks_with_prefetch(INSTANCE_ID, "warmup", warmup_hashes)
+                .expect("warmup prefetch")
+            {
+                PrefetchStatus::Done { hit, .. } if hit >= 1 => break,
+                _ => {}
+            }
+            assert!(Instant::now() < deadline, "warmup RDMA session timeout");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        eprintln!("[warmup] RDMA session ready");
+    }
+
     // ---- Read phase ----
     eprintln!("\n[read]  fetching {} blocks via P2P RDMA...", num_blocks);
     let (rdma_elapsed, load_elapsed) = read_phase(
