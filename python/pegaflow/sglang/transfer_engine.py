@@ -102,7 +102,7 @@ def _decode_session_id(session_id: str) -> bytes:
     return base64.urlsafe_b64decode(encoded.encode("ascii"))
 
 
-class MooncakeTransferEngine:
+class PegaTransferEngine:
     def __init__(self, hostname: str, gpu_id: int, ib_device: str | None = None):
         self.engine = TransferEngine()
         self.hostname = hostname
@@ -203,7 +203,7 @@ class MooncakeTransferEngine:
             )
             return ret
 
-        # Keep Mooncake ABI semantics for sglang: 0 means success, <0 means failure.
+        # Keep legacy ABI semantics for sglang: 0 means success, <0 means failure.
         # pegaflow-transfer returns bytes on success; map any non-negative value to 0.
         return 0
 
@@ -231,7 +231,7 @@ class MooncakeTransferEngine:
             )
             return ret
 
-        # Keep Mooncake ABI semantics for sglang: 0 means success, <0 means failure.
+        # Keep legacy ABI semantics for sglang: 0 means success, <0 means failure.
         # pegaflow-transfer returns bytes on success; map any non-negative value to 0.
         return 0
 

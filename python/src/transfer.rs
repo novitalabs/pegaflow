@@ -1,10 +1,10 @@
-use pegaflow_transfer::{DomainAddress, MooncakeTransferEngine};
+use pegaflow_transfer::{DomainAddress, TransferEngine};
 use pyo3::prelude::*;
 use std::sync::{Arc, Mutex};
 
 #[pyclass(name = "TransferEngine")]
 pub(crate) struct PyTransferEngine {
-    engine: Arc<Mutex<MooncakeTransferEngine>>,
+    engine: Arc<Mutex<TransferEngine>>,
 }
 
 fn parse_local_hostname_port(local_hostname: &str) -> Option<u16> {
@@ -38,7 +38,7 @@ impl PyTransferEngine {
     fn new() -> Self {
         pegaflow_transfer::init_logging();
         Self {
-            engine: Arc::new(Mutex::new(MooncakeTransferEngine::new())),
+            engine: Arc::new(Mutex::new(TransferEngine::new())),
         }
     }
 

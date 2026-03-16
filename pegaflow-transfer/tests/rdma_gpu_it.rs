@@ -1,7 +1,7 @@
 use std::{env, ffi::c_void, time::Instant};
 
 use cudarc::driver::{CudaContext, sys};
-use pegaflow_transfer::MooncakeTransferEngine;
+use pegaflow_transfer::TransferEngine;
 
 const ENV_RDMA_NIC: &str = "PEGAFLOW_TRANSFER_IT_NIC";
 const ENV_BASE_PORT: &str = "PEGAFLOW_TRANSFER_IT_BASE_PORT";
@@ -148,11 +148,11 @@ fn it_rdma_gpu_transfer_sync_write() -> Result<(), Box<dyn std::error::Error>> {
     src.copy_from_host(&payload);
     dst.copy_from_host(&vec![0_u8; bytes]);
 
-    let mut sender = MooncakeTransferEngine::new();
+    let mut sender = TransferEngine::new();
     sender.initialize(nic_name.clone(), base_port)?;
     sender.register_memory(src.as_u64(), bytes)?;
 
-    let mut receiver = MooncakeTransferEngine::new();
+    let mut receiver = TransferEngine::new();
     receiver.initialize(nic_name, base_port + 10)?;
     receiver.register_memory(dst.as_u64(), bytes)?;
 

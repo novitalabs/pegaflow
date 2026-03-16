@@ -2,7 +2,7 @@
 //!
 //! Exercises the full flow:
 //!   1. Save KV blocks via PegaEngine (GPU → pinned pool)
-//!   2. Register pinned pool with owner's MooncakeTransferEngine
+//!   2. Register pinned pool with owner's TransferEngine
 //!   3. Start gRPC server with RdmaTransfer service
 //!   4. Client: AcquireLease → RDMA read each slot → verify data → ReleaseLease
 //!
@@ -24,7 +24,7 @@ use pegaflow_server::proto::engine::rdma_transfer_server::RdmaTransferServer;
 use pegaflow_server::proto::engine::{
     AcquireLeaseRequest, ReleaseLeaseRequest, rdma_transfer_client::RdmaTransferClient,
 };
-use pegaflow_transfer::MooncakeTransferEngine;
+use pegaflow_transfer::TransferEngine;
 use tonic::transport::Server;
 
 const NIC: &str = "mlx5_0";
@@ -215,7 +215,7 @@ async fn rdma_lease_acquire_read_release() {
     eprintln!("[e2e] blocks cached: {NUM_BLOCKS}");
 
     // 2. Register pinned pool with owner RDMA engine
-    let mut owner_rdma = MooncakeTransferEngine::new();
+    let mut owner_rdma = TransferEngine::new();
     owner_rdma
         .initialize(NIC, OWNER_RDMA_PORT)
         .expect("owner RDMA init");
@@ -248,7 +248,7 @@ async fn rdma_lease_acquire_read_release() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // 4. Create requester RDMA engine + receive buffer
-    let mut requester_rdma = MooncakeTransferEngine::new();
+    let mut requester_rdma = TransferEngine::new();
     requester_rdma
         .initialize(NIC, REQUESTER_RDMA_PORT)
         .expect("requester RDMA init");

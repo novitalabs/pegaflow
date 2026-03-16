@@ -13,7 +13,7 @@ use std::{mem, ptr, thread};
 use clap::Parser;
 use pegaflow_numa::read_cpu_topology_from_sysfs;
 use pegaflow_transfer::rdma_topo::SystemTopology;
-use pegaflow_transfer::{MooncakeTransferEngine, init_logging};
+use pegaflow_transfer::{TransferEngine, init_logging};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -226,8 +226,8 @@ impl Drop for NumaBuffer {
 
 struct NicContext {
     nic_name: String,
-    server: MooncakeTransferEngine,
-    client: MooncakeTransferEngine,
+    server: TransferEngine,
+    client: TransferEngine,
     server_buf: NumaBuffer,
     client_buf: NumaBuffer,
 }
@@ -693,7 +693,7 @@ fn main() {
             server_buf.fill(0xAA);
             client_buf.fill(0xBB);
 
-            let mut server = MooncakeTransferEngine::new();
+            let mut server = TransferEngine::new();
             server
                 .initialize(nic.name.clone(), server_port)
                 .expect("server init failed");
@@ -701,7 +701,7 @@ fn main() {
                 .register_memory(server_buf.as_u64(), buf_per_nic)
                 .expect("server register_memory failed");
 
-            let mut client = MooncakeTransferEngine::new();
+            let mut client = TransferEngine::new();
             client
                 .initialize(nic.name.clone(), client_port)
                 .expect("client init failed");

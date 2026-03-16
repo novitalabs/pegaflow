@@ -16,7 +16,7 @@ use pegaflow_proto::proto::engine::meta_server_server::MetaServerServer;
 use pegaflow_proto::proto::engine::{
     HealthRequest, InsertBlockHashesRequest, QueryBlockHashesRequest,
 };
-use pegaflow_transfer::MooncakeTransferEngine;
+use pegaflow_transfer::TransferEngine;
 use tokio::sync::Notify;
 use tonic::transport::Server;
 
@@ -88,7 +88,7 @@ async fn p2p_smoke_roundtrip() {
                 enable_numa_affinity: false,
                 // Uninitialized engine: insert path doesn't use RDMA,
                 // but the P2P store requires a non-None engine to be created.
-                transfer_engine: Some(Arc::new(MooncakeTransferEngine::new())),
+                transfer_engine: Some(Arc::new(TransferEngine::new())),
             }),
     );
 

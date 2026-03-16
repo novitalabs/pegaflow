@@ -607,7 +607,7 @@ impl PegaEngine {
     /// Return `(base_ptr, size)` for every pinned memory region.
     ///
     /// Used for RDMA memory registration: each region must be registered
-    /// with `MooncakeTransferEngine::register_memory` so that one-sided
+    /// with `TransferEngine::register_memory` so that one-sided
     /// RDMA reads can reach any sealed block in the pool.
     pub fn pinned_pool_regions(&self) -> Vec<(u64, usize)> {
         self.storage.pinned_pool_regions()

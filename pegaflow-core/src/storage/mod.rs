@@ -62,7 +62,7 @@ pub struct StorageConfig {
     /// Enable NUMA-aware memory allocation.
     pub enable_numa_affinity: bool,
     /// Optional RDMA transfer engine for P2P block reads.
-    pub transfer_engine: Option<Arc<pegaflow_transfer::MooncakeTransferEngine>>,
+    pub transfer_engine: Option<Arc<pegaflow_transfer::TransferEngine>>,
 }
 
 impl Default for StorageConfig {

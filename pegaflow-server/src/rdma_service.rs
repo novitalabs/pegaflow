@@ -1,6 +1,6 @@
 use log::debug;
 use pegaflow_core::{BlockKey, LeaseError, PegaEngine, SealedBlock};
-use pegaflow_transfer::MooncakeTransferEngine;
+use pegaflow_transfer::TransferEngine;
 use std::sync::Arc;
 use tonic::{Request, Response, Status, async_trait};
 use uuid::Uuid;
@@ -16,7 +16,7 @@ pub struct GrpcRdmaTransferService {
     /// Owner's RDMA transfer engine. When present, `owner_domain_address` is
     /// populated in `AcquireLeaseResponse` so the requester can target the
     /// correct RDMA session for READ operations.
-    transfer_engine: Option<Arc<MooncakeTransferEngine>>,
+    transfer_engine: Option<Arc<TransferEngine>>,
 }
 
 impl GrpcRdmaTransferService {
@@ -32,10 +32,7 @@ impl GrpcRdmaTransferService {
     /// The engine's session ID is returned as `owner_domain_address` in every
     /// `AcquireLeaseResponse`, allowing requester nodes to issue RDMA READs
     /// directly into the owner's registered memory.
-    pub fn new_with_rdma(
-        engine: Arc<PegaEngine>,
-        transfer_engine: Arc<MooncakeTransferEngine>,
-    ) -> Self {
+    pub fn new_with_rdma(engine: Arc<PegaEngine>, transfer_engine: Arc<TransferEngine>) -> Self {
         Self {
             engine,
             transfer_engine: Some(transfer_engine),

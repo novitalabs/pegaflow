@@ -21,7 +21,7 @@ use pegaflow_proto::proto::engine::rdma_transfer_client::RdmaTransferClient;
 use pegaflow_proto::proto::engine::{
     AcquireLeaseRequest, InsertBlockHashesRequest, QueryBlockHashesRequest, ReleaseLeaseRequest,
 };
-use pegaflow_transfer::MooncakeTransferEngine;
+use pegaflow_transfer::TransferEngine;
 
 use crate::block::{BlockKey, SealedBlock};
 use crate::numa::NumaNode;
@@ -34,10 +34,10 @@ use super::{AllocateFn, BackingStore, BackingStoreKind, BakingStoreConfig, Prefe
 const QUERY_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Timeout for AcquireLease/ReleaseLease RPCs.
-const LEASE_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+const LEASE_RPC_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Default lease duration requested (seconds).
-const DEFAULT_LEASE_DURATION_SECS: u32 = 60;
+const DEFAULT_LEASE_DURATION_SECS: u32 = 300;
 
 // ============================================================================
 // Insert actor command
@@ -71,7 +71,7 @@ pub(crate) struct P2pBakingStore {
     /// gRPC client for MetaServer queries. Channel connects lazily on first RPC.
     query_client: MetaServerClient<Channel>,
     /// RDMA transfer engine for cross-node block reads.
-    transfer_engine: Arc<MooncakeTransferEngine>,
+    transfer_engine: Arc<TransferEngine>,
     /// Allocator for local pinned memory (RDMA read destination buffers).
     allocate_fn: AllocateFn,
     /// This node's UUID string for lease requester identity.
@@ -82,7 +82,7 @@ impl P2pBakingStore {
     fn create(
         config: BakingStoreConfig,
         allocate_fn: AllocateFn,
-        transfer_engine: Arc<MooncakeTransferEngine>,
+        transfer_engine: Arc<TransferEngine>,
     ) -> Option<Arc<dyn BackingStore>> {
         let handle = match Handle::try_current() {
             Ok(handle) => handle,
@@ -306,7 +306,7 @@ impl P2pBakingStore {
 
 /// Execute RDMA reads for all node batches, returning successfully transferred blocks.
 async fn rdma_transfer_task(
-    engine: Arc<MooncakeTransferEngine>,
+    engine: Arc<TransferEngine>,
     allocate_fn: AllocateFn,
     node_id: String,
     namespace: String,
@@ -333,7 +333,7 @@ async fn rdma_transfer_task(
 /// Flow: connect to remote → AcquireLease → allocate local memory →
 ///       RDMA READ → ReleaseLease → rebuild SealedBlocks
 async fn rdma_transfer_one_node(
-    engine: &MooncakeTransferEngine,
+    engine: &TransferEngine,
     allocate_fn: &AllocateFn,
     node_id: &str,
     namespace: &str,
@@ -442,7 +442,7 @@ async fn rdma_transfer_one_node(
 
 /// Perform RDMA READs for leased blocks and rebuild SealedBlocks from local memory.
 fn rdma_read_blocks(
-    engine: &MooncakeTransferEngine,
+    engine: &TransferEngine,
     allocate_fn: &AllocateFn,
     acquire_resp: &pegaflow_proto::proto::engine::AcquireLeaseResponse,
     batch: &NodeTransferBatch,
@@ -692,7 +692,7 @@ async fn connect_client(addr: &str) -> Option<MetaServerClient<Channel>> {
 pub(super) fn new_p2p(
     config: BakingStoreConfig,
     allocate_fn: AllocateFn,
-    transfer_engine: Arc<MooncakeTransferEngine>,
+    transfer_engine: Arc<TransferEngine>,
 ) -> Option<Arc<dyn BackingStore>> {
     P2pBakingStore::create(config, allocate_fn, transfer_engine)
 }
@@ -790,7 +790,7 @@ mod tests {
         let rt = tokio::runtime::Handle::current();
         let _ = rt; // ensure we're in a Tokio runtime
 
-        let engine = Arc::new(MooncakeTransferEngine::new());
+        let engine = Arc::new(TransferEngine::new());
         let allocator = make_allocator();
         let allocate_fn: AllocateFn = Arc::new(move |size, node| {
             allocator.allocate(NonZeroU64::new(size)?, node.unwrap_or(NumaNode::UNKNOWN))

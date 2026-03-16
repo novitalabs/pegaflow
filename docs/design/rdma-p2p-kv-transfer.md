@@ -24,7 +24,7 @@ Goal: Add RDMA read-based P2P KV cache transfer to PegaFlow, enabling nodes to d
                     ① gRPC: AcquireLease(blocks)
                     ② A pins blocks, returns {addr, len} per block
                               │
-                    ③ B→A: MooncakeTransferEngine::batch_transfer_sync_read
+                    ③ B→A: TransferEngine::batch_transfer_sync_read
                        (UD handshake on first contact, then RC RDMA READ)
                               │
                     ④ gRPC: ReleaseLease
@@ -38,7 +38,7 @@ We already have a complete RDMA transport in `pegaflow-transfer`:
 
 | Component | What it does |
 |-----------|-------------|
-| `MooncakeTransferEngine` | Public facade — init, register memory, sync read/write |
+| `TransferEngine` | Public facade — init, register memory, sync read/write |
 | UD control plane | `ConnectReq` / `ConnectResp` handshake over Unreliable Datagram QP |
 | RC data plane | Per-session Reliable Connection QP, up to 96 inflight ops, WR chaining (4 ops/chain) |
 | `DomainAddress` | 26-byte endpoint ID: GID + LID + QPN + Qkey |
@@ -46,7 +46,7 @@ We already have a complete RDMA transport in `pegaflow-transfer`:
 | Session worker | Dedicated thread per RC session, NUMA-pinned CQ polling |
 
 **We do NOT need to build any raw RDMA code.** The design focuses on:
-1. Initializing `MooncakeTransferEngine` per NUMA with the right NIC
+1. Initializing `TransferEngine` per NUMA with the right NIC
 2. Registering pinned pools as memory regions
 3. Lease RPCs (gRPC) to coordinate pin/unpin + provide remote addresses
 4. Calling `batch_transfer_sync_read()` with the addresses from the lease
@@ -55,7 +55,7 @@ We already have a complete RDMA transport in `pegaflow-transfer`:
 
 ## 3. Topology: Per-NUMA Transfer Engine
 
-Each NUMA node has a co-located RDMA NIC. We run one `MooncakeTransferEngine` per NUMA node.
+Each NUMA node has a co-located RDMA NIC. We run one `TransferEngine` per NUMA node.
 
 ```
 ┌─────────────────────── Node ────────────────────────┐
@@ -82,7 +82,7 @@ struct PegaEngine {
 
 struct RdmaManager {
     /// Per-NUMA transfer engine. Key = NumaNode.
-    engines: HashMap<NumaNode, MooncakeTransferEngine>,
+    engines: HashMap<NumaNode, TransferEngine>,
     /// This node's stable identity for lease tracking.
     node_id: Uuid,
     /// Lease manager for incoming AcquireLease requests (owner side).
@@ -98,7 +98,7 @@ for numa in topology.numa_nodes_with_gpus() {
     let nic = topology.rdma_device_for_numa(numa);  // e.g. "mlx5_0"
     let port = allocate_rpc_port();                  // UD listen port
 
-    let engine = MooncakeTransferEngine::new();
+    let engine = TransferEngine::new();
     engine.initialize(&nic, port)?;
 
     // Register the NUMA-local pinned pool as a memory region
@@ -194,7 +194,7 @@ message AcquireLeaseResponse {
   uint64 expires_at_unix_ms = 4;
   // UD endpoint of the owner's transfer engine (for the NUMA node
   // where these blocks reside). Requestor uses this as the
-  // DomainAddress target for MooncakeTransferEngine session setup.
+  // DomainAddress target for TransferEngine session setup.
   bytes owner_domain_address = 5;      // 26-byte DomainAddress
 }
 
@@ -217,7 +217,7 @@ message ReleaseLeaseResponse {}
 ```
 
 **Key points:**
-- `owner_domain_address` is the 26-byte `DomainAddress` of the owner's per-NUMA `MooncakeTransferEngine`. The requestor calls `engine.ensure_active_session(domain_addr)` to establish the RC QP if not already connected.
+- `owner_domain_address` is the 26-byte `DomainAddress` of the owner's per-NUMA `TransferEngine`. The requestor calls `engine.ensure_active_session(domain_addr)` to establish the RC QP if not already connected.
 - `rkey` is **not** in the response — it's exchanged during `ConnectResp` (pegaflow-transfer handshake) as part of the remote memory snapshot. The requestor only needs `(remote_addr, size)` to issue RDMA READ.
 - `SlotMemory` is per-TP-rank. A block with TP=4 has 4 slots, each with separate K/V addresses.
 
@@ -344,7 +344,7 @@ flowchart TD
     RESP -.->|UD| RC_SETUP
 ```
 
-**Key interactions with `MooncakeTransferEngine`:**
+**Key interactions with `TransferEngine`:**
 
 | Step | API call | Notes |
 |------|----------|-------|
@@ -472,7 +472,7 @@ flowchart LR
     L2 -->|miss| META[MetaServer query]
     META --> REMOTE{Remote node<br/>owns blocks?}
     REMOTE -->|yes| LEASE[gRPC AcquireLease]
-    LEASE --> RDMA[RDMA READ via<br/>MooncakeTransferEngine]
+    LEASE --> RDMA[RDMA READ via<br/>TransferEngine]
     RDMA --> RELEASE[gRPC ReleaseLease]
     RELEASE --> INSERT[Insert into local ReadCache]
     INSERT --> DONE

@@ -82,7 +82,7 @@ pub(crate) trait BackingStore: Send + Sync + 'static {
 pub(crate) fn new_p2p(
     config: BakingStoreConfig,
     allocate_fn: AllocateFn,
-    transfer_engine: Arc<pegaflow_transfer::MooncakeTransferEngine>,
+    transfer_engine: Arc<pegaflow_transfer::TransferEngine>,
 ) -> Option<Arc<dyn BackingStore>> {
     p2p::new_p2p(config, allocate_fn, transfer_engine)
 }

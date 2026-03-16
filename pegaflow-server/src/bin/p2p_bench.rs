@@ -32,7 +32,7 @@ use pegaflow_core::{
 use pegaflow_server::GrpcRdmaTransferService;
 use pegaflow_server::proto::engine::meta_server_server::MetaServerServer;
 use pegaflow_server::proto::engine::rdma_transfer_server::RdmaTransferServer;
-use pegaflow_transfer::MooncakeTransferEngine;
+use pegaflow_transfer::TransferEngine;
 use tokio::sync::Notify;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
@@ -190,9 +190,9 @@ async fn start_metaserver() -> (String, Arc<BlockHashStore>) {
     (url, store)
 }
 
-fn init_rdma(nic: &str, port: u16, label: &str) -> Arc<MooncakeTransferEngine> {
+fn init_rdma(nic: &str, port: u16, label: &str) -> Arc<TransferEngine> {
     info!("[{label}] initializing RDMA engine on {nic}:{port}");
-    let mut eng = MooncakeTransferEngine::new();
+    let mut eng = TransferEngine::new();
     eng.initialize(nic, port)
         .unwrap_or_else(|e| panic!("[{label}] RDMA initialize: {e}"));
     Arc::new(eng)
@@ -204,7 +204,7 @@ fn create_engine(
     p2p_node_addr: &str,
     block_size: usize,
     max_prefetch_blocks: usize,
-    rdma: Arc<MooncakeTransferEngine>,
+    rdma: Arc<TransferEngine>,
 ) -> Arc<PegaEngine> {
     Arc::new(PegaEngine::new_with_config(
         pool_bytes,
@@ -225,7 +225,7 @@ fn create_engine(
     ))
 }
 
-fn register_pool_regions(rdma: &MooncakeTransferEngine, engine: &PegaEngine, label: &str) {
+fn register_pool_regions(rdma: &TransferEngine, engine: &PegaEngine, label: &str) {
     for (ptr, size) in engine.pinned_pool_regions() {
         rdma.register_memory(ptr, size)
             .unwrap_or_else(|e| panic!("[{label}] register pool region {ptr:#x}: {e}"));
@@ -236,7 +236,7 @@ fn register_pool_regions(rdma: &MooncakeTransferEngine, engine: &PegaEngine, lab
     }
 }
 
-fn unregister_pool_regions(rdma: &MooncakeTransferEngine, engine: &PegaEngine) {
+fn unregister_pool_regions(rdma: &TransferEngine, engine: &PegaEngine) {
     for (ptr, _) in engine.pinned_pool_regions() {
         rdma.unregister_memory(ptr)
             .unwrap_or_else(|e| warn!("unregister_memory {ptr:#x}: {e}"));

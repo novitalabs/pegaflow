@@ -25,7 +25,7 @@ use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use parking_lot::Mutex;
 use pegaflow_core::PegaEngine;
-use pegaflow_transfer::MooncakeTransferEngine;
+use pegaflow_transfer::TransferEngine;
 use prometheus::Registry;
 use proto::engine::engine_server::EngineServer;
 use proto::engine::rdma_transfer_server::RdmaTransferServer;
@@ -430,12 +430,12 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     });
 
     // Initialize RDMA transfer engine if --rdma-nic is provided.
-    let rdma_engine: Option<Arc<MooncakeTransferEngine>> = if let Some(ref nic) = cli.rdma_nic {
+    let rdma_engine: Option<Arc<TransferEngine>> = if let Some(ref nic) = cli.rdma_nic {
         info!(
             "Initializing RDMA transfer engine on {}:{}",
             nic, cli.rdma_port
         );
-        let mut engine = MooncakeTransferEngine::new();
+        let mut engine = TransferEngine::new();
         engine.initialize(nic, cli.rdma_port).map_err(|e| {
             std::io::Error::other(format!("RDMA initialize on {nic}:{}: {e}", cli.rdma_port))
         })?;

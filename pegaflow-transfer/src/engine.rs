@@ -6,11 +6,11 @@ use crate::{
 };
 use std::time::Instant;
 
-pub struct MooncakeTransferEngine {
+pub struct TransferEngine {
     backend: SidewayBackend,
 }
 
-impl MooncakeTransferEngine {
+impl TransferEngine {
     pub fn new() -> Self {
         Self {
             backend: SidewayBackend::new(),
@@ -159,7 +159,7 @@ impl MooncakeTransferEngine {
     }
 }
 
-impl Default for MooncakeTransferEngine {
+impl Default for TransferEngine {
     fn default() -> Self {
         Self::new()
     }
@@ -167,12 +167,12 @@ impl Default for MooncakeTransferEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::MooncakeTransferEngine;
+    use super::TransferEngine;
     use crate::error::TransferError;
 
     #[test]
     fn batch_len_mismatch_fails() {
-        let engine = MooncakeTransferEngine::new();
+        let engine = TransferEngine::new();
 
         let err = engine
             .batch_register_memory(&[0x1000, 0x2000], &[4096])
@@ -182,7 +182,7 @@ mod tests {
 
     #[test]
     fn batch_transfer_len_mismatch_fails() {
-        let engine = MooncakeTransferEngine::new();
+        let engine = TransferEngine::new();
         let session_id = crate::DomainAddress::from_parts([1_u8; 16], 2, 3, 4);
 
         let err = engine
