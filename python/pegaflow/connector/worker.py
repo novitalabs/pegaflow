@@ -384,6 +384,8 @@ class WorkerConnector:
         )
 
     def wait_for_save(self) -> None:
+        skipped_requests: set[str] = set()
+
         if self._cross_layer_mode:
             task = self._cross_layer_pending_save
             self._cross_layer_pending_save = None
@@ -394,10 +396,21 @@ class WorkerConnector:
                             self._req_pending_layers[req_id] = 1
                             self._save_completion_events[req_id] = threading.Event()
                 self._save_queue.put(task)
+            else:
+                with self._save_completion_lock:
+                    pending_layers = set(self._req_pending_layers.keys())
+                    skipped_requests = self._current_save_intents - pending_layers
+                    if skipped_requests:
+                        self._completed_saves.update(skipped_requests)
             self._current_save_intents = set()
+            if skipped_requests:
+                logger.debug(
+                    "[PegaKVConnector] Detected %d skipped cross-layer saves (CUDA graph): %s",
+                    len(skipped_requests),
+                    skipped_requests,
+                )
+                self._handle_save_completion(skipped_requests, reason="CUDA graph skip")
             return
-
-        skipped_requests: set[str] = set()
 
         with self._save_completion_lock:
             pending_layers = set(self._req_pending_layers.keys())
