@@ -33,31 +33,51 @@ cargo bench --bench uds_latency
 
 ## Architecture
 
-### Five-Crate Design
+### Seven-Crate Design
 
-1. **pegaflow-core** (Rust): Core storage engine
+1. **pegaflow-common** (Rust): Shared lightweight utilities
+   - `logging.rs`: Unified log initialization (logforth-based)
+   - `numa.rs`: NUMA topology detection and CPU affinity utilities
+   - Depended on by all other crates to avoid heavy transitive dependencies
+
+2. **pegaflow-core** (Rust): Core storage engine
    - `PegaEngine`: Main engine managing GPU workers and KV cache storage
-   - `storage.rs`: Block-based storage with content-addressed blocks (`check_prefix_memory_only` for memory-only, `check_prefix_and_prefetch` for SSD)
-   - `pinned_pool.rs` / `pinned_mem.rs`: Pinned memory allocator
+   - `storage/`: Modular block storage engine
+     - `mod.rs`: `StorageEngine` — aggregates allocator, read cache, prefetch, write pipeline, SSD store
+     - `read_cache.rs`: Pin/unpin/consume operations on sealed blocks
+     - `prefetch.rs`: Per-request SSD prefetch state machine
+     - `write_path.rs`: Async insert worker thread for batched writes
+   - `backing/`: SSD backing store
+     - `ssd.rs`: `SsdBackingStore` coordinator
+     - `ssd_cache.rs`: SSD-backed block storage
+     - `uring.rs`: io_uring async I/O
+   - `pinned_pool.rs` / `pinned_mem.rs`: NUMA-aware pinned memory allocator
    - `transfer.rs`: GPU-CPU transfer operations via CUDA
    - `cache.rs`: LRU cache for blocks
    - `gpu_worker.rs`: Per-GPU worker handling async operations
    - `internode/`: Cross-node communication — `PegaflowClient` for querying remote nodes, service discovery via metaserver
 
-2. **pegaflow-proto** (Rust): Protobuf definitions
+3. **pegaflow-proto** (Rust): Protobuf definitions
    - gRPC service definitions built with prost/tonic
 
-3. **pegaflow-server** (Rust): gRPC server
+4. **pegaflow-server** (Rust): gRPC server
    - `service.rs`: Tonic gRPC service implementation
    - `registry.rs`: Instance/worker registration
+   - `http_server.rs`: HTTP health check and Prometheus metrics endpoint
    - `bin/pegaflow-router.rs`: P/D disaggregation router
 
-4. **pegaflow-metaserver** (Rust): Cross-node block hash registry
+5. **pegaflow-metaserver** (Rust): Cross-node block hash registry
    - `service.rs`: gRPC MetaServer service (insert/query block hashes)
    - `store.rs`: LRU block hash store with configurable capacity and TTL (backed by moka)
    - Used for multi-node KV cache coordination — each pegaflow-server registers its block hashes here
 
-5. **python/** (Rust/PyO3 + Python): Python package (`pegaflow-llm` on PyPI)
+6. **pegaflow-transfer** (Rust): RDMA-based inter-node memory transfer engine
+   - `engine.rs`: `MooncakeTransferEngine` — Mooncake-compatible API for one-sided RDMA READ/WRITE
+   - `sideway_backend.rs`: UD control plane + RC data plane with per-peer sessions
+   - `rdma_topo.rs`: NUMA-aware topology detection (GPUs, RDMA NICs, CPUs)
+   - CLI tools: `pegaflow_topo_cli` (topology display), `pegaflow_cpu_bench` (RDMA benchmark)
+
+7. **python/** (Rust/PyO3 + Python): Python package (`pegaflow-llm` on PyPI)
    - `src/lib.rs`: PyO3 bindings exposing `PegaEngine` and gRPC client
    - `pegaflow/connector/`: vLLM v1 KV connector (scheduler + worker split)
    - `pegaflow/sglang/`: SGLang integration
@@ -70,6 +90,8 @@ cargo bench --bench uds_latency
 vLLM/SGLang Worker <--gRPC--> PegaEngine Server <--CUDA IPC--> GPU Memory
                                     |
                              Pinned CPU Memory (KV cache storage)
+                                    |
+                             SSD Cache (optional, io_uring)
 ```
 
 ### Key Concepts
@@ -112,14 +134,20 @@ vLLM/SGLang Worker <--gRPC--> PegaEngine Server <--CUDA IPC--> GPU Memory
 
 ## Key Files
 
+- `pegaflow-common/src/logging.rs`: Unified log initialization
+- `pegaflow-common/src/numa.rs`: NUMA topology detection and CPU affinity
 - `pegaflow-core/src/lib.rs`: Main PegaEngine implementation
-- `pegaflow-core/src/storage.rs`: Block storage engine
+- `pegaflow-core/src/storage/mod.rs`: StorageEngine (allocator, read cache, prefetch, write pipeline)
+- `pegaflow-core/src/storage/read_cache.rs`: Pin/unpin/consume operations
+- `pegaflow-core/src/storage/prefetch.rs`: SSD prefetch state machine
+- `pegaflow-core/src/storage/write_path.rs`: Async insert worker thread
+- `pegaflow-core/src/backing/ssd.rs`: SSD backing store coordinator
 - `pegaflow-core/src/internode/`: Cross-node client and service discovery
-- `pegaflow-core/src/numa.rs`: NUMA topology detection and GPU affinity queries
 - `pegaflow-server/src/service.rs`: gRPC service implementation
 - `pegaflow-metaserver/src/lib.rs`: MetaServer entry point and CLI
 - `pegaflow-metaserver/src/service.rs`: MetaServer gRPC service
 - `pegaflow-metaserver/src/store.rs`: Block hash store (LRU + TTL)
+- `pegaflow-transfer/src/engine.rs`: RDMA transfer engine (MooncakeTransferEngine)
 - `python/src/lib.rs`: PyO3 bindings (Rust side)
 - `python/pegaflow/pegaflow.pyi`: Type stubs for PyO3 bindings
 - `python/pegaflow/connector/scheduler.py`: vLLM scheduler-side connector

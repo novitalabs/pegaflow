@@ -131,6 +131,16 @@ pub struct Cli {
     /// Trace sampling rate (0.0–1.0). E.g. 0.01 = 1%. Default: 1.0 (100%)
     #[arg(long, default_value_t = 1.0, value_parser = parse_sample_rate)]
     pub trace_sample_rate: f64,
+
+    /// MetaServer address for cross-node block hash registration (e.g. http://127.0.0.1:50056).
+    /// When set, sealed block hashes are automatically registered with the MetaServer.
+    #[arg(long)]
+    pub metaserver_addr: Option<String>,
+
+    /// Advertise address for this node in MetaServer registrations (e.g. 10.0.0.1:50055).
+    /// Defaults to PEGAFLOW_HOST_IP env + bind port, or the bind address.
+    #[arg(long)]
+    pub advertise_addr: Option<String>,
 }
 
 fn parse_sample_rate(s: &str) -> Result<f64, String> {
@@ -285,6 +295,27 @@ fn init_metrics(
     })
 }
 
+fn resolve_advertise_addr(explicit: Option<&str>, bind_addr: &SocketAddr) -> String {
+    if let Some(addr) = explicit {
+        return addr.to_string();
+    }
+
+    if let Ok(host_ip) = std::env::var("PEGAFLOW_HOST_IP") {
+        let addr = format!("{}:{}", host_ip, bind_addr.port());
+        info!("Using PEGAFLOW_HOST_IP for advertise address: {}", addr);
+        return addr;
+    }
+
+    if bind_addr.ip().is_unspecified() {
+        log::warn!(
+            "Advertise address defaults to bind address {}, \
+             which is 0.0.0.0. Consider setting --advertise-addr or PEGAFLOW_HOST_IP.",
+            bind_addr
+        );
+    }
+    bind_addr.to_string()
+}
+
 /// Main entry point for pegaflow-server
 pub fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
@@ -395,11 +426,24 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let shutdown = Arc::new(Notify::new());
 
     runtime.block_on(async move {
+        // Create MetaServer registrar if --metaserver-addr is set
+        let metaserver_registrar = cli.metaserver_addr.as_ref().map(|addr| {
+            let advertise = resolve_advertise_addr(cli.advertise_addr.as_deref(), &cli.addr);
+            info!(
+                "MetaServer registration enabled: metaserver={}, advertise={}",
+                addr, advertise
+            );
+            Arc::new(pegaflow_core::MetaServerRegistrar::new(
+                pegaflow_core::MetaServerRegistrarConfig::new(addr.clone(), advertise),
+            ))
+        });
+
         // Create PegaEngine inside tokio runtime context (needed for SSD cache tokio::spawn)
         let engine = Arc::new(PegaEngine::new_with_config(
             cli.pool_size,
             cli.use_hugepages,
             storage_config,
+            metaserver_registrar,
         ));
 
         let service = GrpcEngineService::new(

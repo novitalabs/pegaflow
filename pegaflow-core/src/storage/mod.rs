@@ -10,6 +10,7 @@ use std::sync::{Arc, Weak};
 
 use crate::backing::{AllocateFn, DEFAULT_MAX_PREFETCH_BLOCKS, SsdBackingStore, SsdCacheConfig};
 use crate::block::{BlockKey, PrefetchStatus, SealedBlock};
+use crate::internode::registrar::MetaServerRegistrar;
 use crate::metrics::core_metrics;
 use crate::pinned_pool::{PinnedAllocation, PinnedAllocator};
 use pegaflow_common::NumaNode;
@@ -51,6 +52,7 @@ pub(crate) struct StorageEngine {
     prefetch: PrefetchScheduler,
     write_pipeline: Arc<WritePipeline>,
     ssd_store: Option<Arc<SsdBackingStore>>,
+    metaserver_registrar: Option<Arc<MetaServerRegistrar>>,
 }
 
 impl StorageEngine {
@@ -59,6 +61,7 @@ impl StorageEngine {
         use_hugepages: bool,
         config: StorageConfig,
         numa_nodes: &[NumaNode],
+        metaserver_registrar: Option<Arc<MetaServerRegistrar>>,
     ) -> Arc<Self> {
         let value_size_hint = config.hint_value_size_bytes.filter(|size| *size > 0);
         let unit_hint = value_size_hint.and_then(|size| NonZeroU64::new(size as u64));
@@ -101,6 +104,7 @@ impl StorageEngine {
         let write_pipeline = Arc::new(write_pipeline);
 
         let is_numa = allocator.is_numa();
+        let registrar = metaserver_registrar;
         let engine = Arc::new_cyclic(move |weak_engine: &Weak<Self>| {
             // Build shared allocate_fn for backing stores.
             let alloc_weak = weak_engine.clone();
@@ -121,6 +125,7 @@ impl StorageEngine {
                 prefetch,
                 write_pipeline: write_pipeline.clone(),
                 ssd_store,
+                metaserver_registrar: registrar,
             }
         });
 
@@ -129,6 +134,7 @@ impl StorageEngine {
             let deps = Arc::new(InsertDeps {
                 read_cache: engine.read_cache.clone(),
                 ssd_store: engine.ssd_store.clone(),
+                metaserver_registrar: engine.metaserver_registrar.clone(),
             });
             let weak_deps = Arc::downgrade(&deps);
             // Keep deps alive by leaking it into the thread. The worker holds
@@ -355,7 +361,7 @@ mod tests {
     use super::*;
 
     fn make_engine() -> Arc<StorageEngine> {
-        StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[])
+        StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[], None)
     }
 
     #[tokio::test]
@@ -419,7 +425,8 @@ mod tests {
     async fn allocate_bounded_reclaim_terminates() {
         // With a tiny pool, allocation of a huge block should fail fast
         // (not loop forever) thanks to MAX_RECLAIM_ROUNDS.
-        let storage = StorageEngine::new_with_config(4096, false, StorageConfig::default(), &[]);
+        let storage =
+            StorageEngine::new_with_config(4096, false, StorageConfig::default(), &[], None);
 
         // Try to allocate more than the entire pool
         let result = storage.allocate(NonZeroU64::new(1 << 30).unwrap(), None);

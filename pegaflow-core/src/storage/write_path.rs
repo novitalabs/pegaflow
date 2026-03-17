@@ -7,6 +7,7 @@ use tokio::sync::oneshot;
 
 use crate::backing::SsdBackingStore;
 use crate::block::{BlockKey, InflightBlock, SealedBlock, SlotInsertResult};
+use crate::internode::registrar::MetaServerRegistrar;
 use crate::metrics::core_metrics;
 use crate::offload::InsertEntries;
 use pegaflow_common::NumaNode;
@@ -54,6 +55,7 @@ impl WritePipeline {
 pub(super) struct InsertDeps {
     pub(super) read_cache: Arc<ReadCache>,
     pub(super) ssd_store: Option<Arc<SsdBackingStore>>,
+    pub(super) metaserver_registrar: Option<Arc<MetaServerRegistrar>>,
 }
 
 pub(super) fn insert_worker_loop(rx: Receiver<InsertWorkerCommand>, deps: Weak<InsertDeps>) {
@@ -197,6 +199,22 @@ fn send_backing_batches(deps: &InsertDeps, blocks: &[(BlockKey, Arc<SealedBlock>
     if let Some(ssd) = &deps.ssd_store {
         ssd.ingest_batch(weak_blocks);
     }
+    if let Some(registrar) = &deps.metaserver_registrar {
+        register_block_hashes(registrar, blocks);
+    }
+}
+
+fn register_block_hashes(registrar: &MetaServerRegistrar, blocks: &[(BlockKey, Arc<SealedBlock>)]) {
+    let mut grouped: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+    for (key, _) in blocks {
+        grouped
+            .entry(key.namespace.clone())
+            .or_default()
+            .push(key.hash.clone());
+    }
+    for (namespace, hashes) in grouped {
+        registrar.try_register(namespace, hashes);
+    }
 }
 
 fn gc_inflight(
@@ -251,12 +269,14 @@ mod tests {
         Arc::new(InsertDeps {
             read_cache: engine.read_cache.clone(),
             ssd_store: engine.ssd_store.clone(),
+            metaserver_registrar: None,
         })
     }
 
     #[tokio::test]
     async fn single_slot_seals_immediately() {
-        let engine = StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]);
+        let engine =
+            StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[], None);
         let deps = make_deps(&engine);
         let weak_deps = Arc::downgrade(&deps);
 
@@ -284,7 +304,8 @@ mod tests {
 
     #[tokio::test]
     async fn multi_slot_partial_then_complete() {
-        let engine = StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]);
+        let engine =
+            StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[], None);
         let deps = make_deps(&engine);
         let weak_deps = Arc::downgrade(&deps);
 
@@ -335,7 +356,8 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_slot_is_idempotent() {
-        let engine = StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]);
+        let engine =
+            StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[], None);
         let deps = make_deps(&engine);
         let weak_deps = Arc::downgrade(&deps);
 
@@ -362,7 +384,8 @@ mod tests {
 
     #[tokio::test]
     async fn slot_count_mismatch_skips_key() {
-        let engine = StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]);
+        let engine =
+            StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[], None);
         let deps = make_deps(&engine);
         let weak_deps = Arc::downgrade(&deps);
 
@@ -413,7 +436,8 @@ mod tests {
 
     #[tokio::test]
     async fn send_backing_batches_no_stores_is_noop() {
-        let engine = StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]);
+        let engine =
+            StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[], None);
         let deps = make_deps(&engine);
         let weak_deps = Arc::downgrade(&deps);
 

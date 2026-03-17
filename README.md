@@ -114,8 +114,12 @@ vllm serve Qwen/Qwen3-0.6B --trust-remote-code --kv-transfer-config '{"kv_connec
 Basic NUMA support for optimizing GPU-CPU memory transfers. Use the CLI to inspect system topology:
 
 ```bash
-cargo run --bin pegaflow_topo_cli
+cargo run -p pegaflow-transfer --bin pegaflow_topo_cli
 ```
+
+### Inter-Node RDMA Transfer
+
+PegaFlow Transfer provides RDMA-based inter-node memory transfers for P/D disaggregation with one-sided RDMA READ/WRITE, automatic session management, and NUMA-aware NIC selection. See [pegaflow-transfer/README.md](./pegaflow-transfer/README.md) for architecture, API, CLI tools, and benchmarks.
 
 ## Development
 
