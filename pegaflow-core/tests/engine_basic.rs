@@ -36,7 +36,7 @@ async fn save_query_load_roundtrip() {
     harness.save_all().await;
     harness.assert_cache_eventually_all().await;
     harness.zero_gpu_and_assert();
-    harness.expect_query_prefetch_done_all();
+    harness.expect_query_prefetch_done_all().await;
     harness.load_all_and_wait().await.expect("batch_load");
     harness.assert_gpu_matches_host();
 }
@@ -60,7 +60,7 @@ async fn save_query_load_roundtrip_with_numa_affinity_enabled() {
     harness.save_all().await;
     harness.assert_cache_eventually_all().await;
     harness.zero_gpu_and_assert();
-    harness.expect_query_prefetch_done_all();
+    harness.expect_query_prefetch_done_all().await;
     harness.load_all_and_wait().await.expect("batch_load");
     harness.assert_gpu_matches_host();
 }

@@ -22,8 +22,7 @@ pub fn test_engine() -> PegaEngine {
 
 pub fn test_engine_with_storage_config(config: StorageConfig) -> PegaEngine {
     // 16 MB pool — enough for test blocks, small enough to be fast.
-    let (engine, _rx) = PegaEngine::new_with_config(16 << 20, false, config);
-    engine
+    PegaEngine::new_with_config(16 << 20, false, config)
 }
 
 /// Layer registration info for batch registration.
