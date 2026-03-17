@@ -43,10 +43,7 @@ pub(super) struct PrefetchScheduler {
 }
 
 impl PrefetchScheduler {
-    pub(super) fn new(
-        ssd_store: Option<Arc<SsdBackingStore>>,
-        max_prefetch_blocks: usize,
-    ) -> Self {
+    pub(super) fn new(ssd_store: Option<Arc<SsdBackingStore>>, max_prefetch_blocks: usize) -> Self {
         Self {
             state: Mutex::new(PrefetchState {
                 active: HashMap::new(),

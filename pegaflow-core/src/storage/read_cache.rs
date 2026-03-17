@@ -255,10 +255,7 @@ impl ReadCache {
         unpinned
     }
 
-    pub(super) fn remove_lru_batch(
-        &self,
-        batch_size: usize,
-    ) -> Vec<(BlockKey, Arc<SealedBlock>)> {
+    pub(super) fn remove_lru_batch(&self, batch_size: usize) -> Vec<(BlockKey, Arc<SealedBlock>)> {
         let mut inner = self.inner.lock();
         (0..batch_size)
             .map_while(|_| inner.cache.remove_lru())

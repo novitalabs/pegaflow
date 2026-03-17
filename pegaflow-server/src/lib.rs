@@ -131,7 +131,6 @@ pub struct Cli {
     /// Trace sampling rate (0.0–1.0). E.g. 0.01 = 1%. Default: 1.0 (100%)
     #[arg(long, default_value_t = 1.0, value_parser = parse_sample_rate)]
     pub trace_sample_rate: f64,
-
 }
 
 fn parse_sample_rate(s: &str) -> Result<f64, String> {

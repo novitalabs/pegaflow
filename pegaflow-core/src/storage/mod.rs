@@ -8,16 +8,14 @@ use std::collections::HashSet;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Weak};
 
-use crate::backing::{
-    AllocateFn, DEFAULT_MAX_PREFETCH_BLOCKS, SsdBackingStore, SsdCacheConfig,
-};
+use crate::backing::{AllocateFn, DEFAULT_MAX_PREFETCH_BLOCKS, SsdBackingStore, SsdCacheConfig};
 use crate::block::{BlockKey, PrefetchStatus, SealedBlock};
 use crate::metrics::core_metrics;
 use crate::numa::NumaNode;
 use crate::pinned_pool::{PinnedAllocation, PinnedAllocator};
 
-use read_cache::ReadCache;
 use prefetch::PrefetchScheduler;
+use read_cache::ReadCache;
 use write_path::{InsertDeps, WritePipeline};
 
 const RECLAIM_BATCH_SIZE: usize = 64;
