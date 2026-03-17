@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "pegaflow-common",
   "pegaflow-core",
   "pegaflow-proto",
   "pegaflow-server",
@@ -15,6 +16,7 @@ edition = "2024"
 
 [workspace.dependencies]
 # Workspace members
+pegaflow-common = { path = "pegaflow-common" }
 pegaflow-core = { path = "pegaflow-core" }
 pegaflow-transfer = { path = "pegaflow-transfer" }
 sideway = "0.4.1"
@@ -47,6 +49,7 @@ opentelemetry-prometheus = "0.31"
 prometheus = "0.14"
 bytesize = "2.3.1"
 ahash = "0.8"
+futures = "0.3"
 
 # HTTP/Web
 axum = "0.8"

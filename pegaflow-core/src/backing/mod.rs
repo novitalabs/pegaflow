@@ -10,8 +10,8 @@ pub use ssd_cache::{
 };
 
 use crate::block::{BlockKey, SealedBlock};
-use crate::numa::NumaNode;
 use crate::pinned_pool::PinnedAllocation;
+use pegaflow_common::NumaNode;
 
 pub(crate) use ssd::SsdBackingStore;
 pub(crate) use ssd::new_ssd;

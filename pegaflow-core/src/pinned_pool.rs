@@ -6,8 +6,8 @@ use log::{error, info, warn};
 
 use crate::allocator::{Allocation, ScaledOffsetAllocator};
 use crate::metrics::core_metrics;
-use crate::numa::{NumaNode, run_on_numa};
 use crate::pinned_mem::PinnedMemory;
+use pegaflow_common::{NumaNode, run_on_numa};
 
 /// RAII guard for a pinned memory allocation.
 /// Automatically frees the allocation when dropped.

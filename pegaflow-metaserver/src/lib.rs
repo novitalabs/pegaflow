@@ -39,32 +39,6 @@ pub struct Cli {
     pub ttl_minutes: u64,
 }
 
-/// Initialize logging with the specified log level
-fn init_logging(level: &str) {
-    use logforth::append;
-    use logforth::filter::EnvFilter;
-    use logforth::layout::TextLayout;
-
-    let filter = match level.to_lowercase().as_str() {
-        "trace" => "trace",
-        "debug" => "debug",
-        "info" => "info",
-        "warn" => "warn",
-        "error" => "error",
-        _ => {
-            eprintln!("Invalid log level: {}, defaulting to info", level);
-            "info"
-        }
-    };
-
-    logforth::starter_log::builder()
-        .dispatch(|d| {
-            d.filter(EnvFilter::from(filter))
-                .append(append::Stderr::default().with_layout(TextLayout::default().no_color()))
-        })
-        .apply();
-}
-
 /// Graceful shutdown signal handler
 async fn shutdown_signal(notify: Arc<Notify>) {
     let ctrl_c = async {
@@ -100,7 +74,7 @@ async fn shutdown_signal(notify: Arc<Notify>) {
 /// Run the MetaServer gRPC service
 pub async fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
-    init_logging(&cli.log_level);
+    pegaflow_common::logging::init_stderr(&cli.log_level);
     info!(
         "Starting pegaflow-metaserver v{}",
         env!("CARGO_PKG_VERSION")

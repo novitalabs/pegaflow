@@ -7,9 +7,9 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::block::LayerBlock;
 use crate::metrics::core_metrics;
-use crate::numa::{NumaNode, pin_thread_to_numa_node};
 use crate::sync_state::LoadState;
 use crate::{EngineError, KVCacheRegistration, transfer};
+use pegaflow_common::{NumaNode, pin_thread_to_numa_node};
 
 /// A task to load KV blocks from CPU to GPU for multiple layers
 pub struct LoadTask {

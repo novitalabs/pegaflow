@@ -12,9 +12,9 @@ use super::ssd::SsdBackingStore;
 use super::uring::UringIoEngine;
 use crate::block::{BlockKey, SealedBlock};
 use crate::metrics::core_metrics;
-use crate::numa::NumaNode;
 use crate::pinned_pool::PinnedAllocation;
 use crate::seal_offload::SlotMeta;
+use pegaflow_common::NumaNode;
 
 /// SSD I/O alignment requirement (O_DIRECT requires 512-byte aligned I/O)
 pub const SSD_ALIGNMENT: usize = 512;

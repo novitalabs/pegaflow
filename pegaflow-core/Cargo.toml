@@ -8,10 +8,10 @@ default = []
 tracing = ["fastrace"]
 
 [dependencies]
+pegaflow-common.workspace = true
 cudarc.workspace = true
 log.workspace = true
 logforth.workspace = true
-colored.workspace = true
 offset-allocator.workspace = true
 hashlink.workspace = true
 tokio.workspace = true
@@ -20,12 +20,12 @@ uuid.workspace = true
 opentelemetry.workspace = true
 bytesize.workspace = true
 serde.workspace = true
-libc = "0.2"
+libc.workspace = true
 rand.workspace = true
 ahash.workspace = true
 io-uring = "0.7"
-futures = "0.3"
-parking_lot = "0.12"
+futures.workspace = true
+parking_lot.workspace = true
 fastrace = { workspace = true, optional = true }
 kube.workspace = true
 k8s-openapi.workspace = true

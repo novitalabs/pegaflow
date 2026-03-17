@@ -3,7 +3,6 @@ mod control_protocol;
 mod domain_address;
 mod engine;
 mod error;
-mod logging;
 pub mod rdma_topo;
 mod sideway_backend;
 
@@ -12,5 +11,5 @@ pub use engine::MooncakeTransferEngine;
 pub use error::{Result, TransferError};
 
 pub fn init_logging() {
-    logging::ensure_initialized();
+    pegaflow_common::logging::init_stderr("info,pegaflow_transfer=debug");
 }

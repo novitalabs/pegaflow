@@ -14,8 +14,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use pegaflow_core::NumaNode;
-use pegaflow_core::numa::{format_cpu_list, read_cpu_topology_from_sysfs};
+use pegaflow_common::{NumaNode, format_cpu_list, read_cpu_topology_from_sysfs};
 
 /// GPU device information.
 #[derive(Debug, Clone)]

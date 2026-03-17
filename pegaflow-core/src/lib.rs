@@ -18,9 +18,8 @@ pub mod gpu_worker;
 pub mod instance;
 #[allow(dead_code)]
 pub mod internode;
-pub mod logging;
+pub use pegaflow_common::logging;
 mod metrics;
-pub mod numa;
 mod offload;
 pub mod pinned_mem;
 pub mod pinned_pool;
@@ -37,8 +36,8 @@ pub use block::{
     BlockHash, BlockKey, BlockStatus, LayerBlock, LayerSave, PrefetchStatus, SealedBlock,
 };
 pub use instance::{GpuContext, InstanceContext, KVCacheRegistration};
-pub use numa::NumaNode;
-use numa::NumaTopology;
+pub use pegaflow_common::NumaNode;
+use pegaflow_common::NumaTopology;
 pub use pinned_pool::PinnedAllocation;
 pub use seal_offload::SlotMeta;
 pub use storage::StorageConfig;
@@ -164,16 +163,15 @@ impl PegaEngine {
         topology.log_summary();
 
         let config = storage_config;
-        let numa_nodes: Vec<numa::NumaNode> =
-            if config.enable_numa_affinity && topology.is_multi_numa() {
-                info!(
-                    "Auto-enabling NUMA-aware memory allocation for {} nodes",
-                    topology.num_nodes()
-                );
-                topology.numa_nodes().to_vec()
-            } else {
-                vec![]
-            };
+        let numa_nodes: Vec<NumaNode> = if config.enable_numa_affinity && topology.is_multi_numa() {
+            info!(
+                "Auto-enabling NUMA-aware memory allocation for {} nodes",
+                topology.num_nodes()
+            );
+            topology.numa_nodes().to_vec()
+        } else {
+            vec![]
+        };
 
         let storage = StorageEngine::new_with_config(pool_size, use_hugepages, config, &numa_nodes);
 

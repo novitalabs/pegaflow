@@ -11,8 +11,8 @@ use std::sync::{Arc, Weak};
 use crate::backing::{AllocateFn, DEFAULT_MAX_PREFETCH_BLOCKS, SsdBackingStore, SsdCacheConfig};
 use crate::block::{BlockKey, PrefetchStatus, SealedBlock};
 use crate::metrics::core_metrics;
-use crate::numa::NumaNode;
 use crate::pinned_pool::{PinnedAllocation, PinnedAllocator};
+use pegaflow_common::NumaNode;
 
 use prefetch::PrefetchScheduler;
 use read_cache::ReadCache;
