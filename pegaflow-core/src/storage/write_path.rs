@@ -15,7 +15,7 @@ use log::{debug, error, info, warn};
 use std::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot;
 
-use crate::backing::BackingStore;
+use crate::backing::{P2pBackingStore, SsdBackingStore};
 use crate::block::{BlockKey, InflightBlock, SealedBlock, SlotInsertResult};
 use crate::metrics::core_metrics;
 use crate::numa::NumaNode;
@@ -90,7 +90,8 @@ impl WritePipeline {
 /// StorageEngine, keeping the dependency surface minimal.
 pub(super) struct InsertDeps {
     pub read_cache: Arc<ReadCache>,
-    pub backing_stores: Vec<Arc<dyn BackingStore>>,
+    pub ssd_store: Option<Arc<SsdBackingStore>>,
+    pub p2p_store: Option<Arc<P2pBackingStore>>,
 }
 
 // ============================================================================
@@ -227,28 +228,28 @@ fn process_insert_batch(
             .add(-(inflight_bytes_removed as i64), &[]);
     }
 
-    // Post-seal: fire-and-forget backing store fanout in priority order.
+    // Post-seal: fire-and-forget backing store fanout.
     if !sealed_blocks.is_empty()
         && let Some(deps) = deps.upgrade()
     {
-        send_backing_batches(&deps.backing_stores, &sealed_blocks);
+        send_backing_batches(&deps, &sealed_blocks);
     }
 }
 
 /// Forward sealed blocks to all configured backing stores for async persistence.
-fn send_backing_batches(
-    backing_stores: &[Arc<dyn BackingStore>],
-    blocks: &[(BlockKey, Arc<SealedBlock>)],
-) {
-    if blocks.is_empty() || backing_stores.is_empty() {
+fn send_backing_batches(deps: &InsertDeps, blocks: &[(BlockKey, Arc<SealedBlock>)]) {
+    if blocks.is_empty() {
         return;
     }
     let weak_blocks: Vec<(BlockKey, Weak<SealedBlock>)> = blocks
         .iter()
         .map(|(k, b)| (k.clone(), Arc::downgrade(b)))
         .collect();
-    for backing in backing_stores {
-        backing.ingest_batch(weak_blocks.clone());
+    if let Some(p2p) = &deps.p2p_store {
+        p2p.ingest_batch(weak_blocks.clone());
+    }
+    if let Some(ssd) = &deps.ssd_store {
+        ssd.ingest_batch(weak_blocks);
     }
 }
 
@@ -288,9 +289,7 @@ fn gc_inflight(
 mod tests {
     use super::*;
     use std::num::NonZeroU64;
-    use std::sync::Mutex;
 
-    use crate::backing::{BackingStoreKind, PrefetchResult};
     use crate::block::LayerBlock;
     use crate::storage::{StorageConfig, StorageEngine};
 
@@ -305,37 +304,11 @@ mod tests {
 
     /// Create a minimal InsertDeps for testing.
     fn make_deps(engine: &StorageEngine) -> Arc<InsertDeps> {
-        let read_cache = engine.read_cache.clone();
-        let backing_stores = engine.backing_stores.clone();
         Arc::new(InsertDeps {
-            read_cache,
-            backing_stores,
+            read_cache: engine.read_cache.clone(),
+            ssd_store: engine.ssd_store.clone(),
+            p2p_store: engine.p2p_store.clone(),
         })
-    }
-
-    struct RecordingStore {
-        kind: BackingStoreKind,
-        label: &'static str,
-        calls: Arc<Mutex<Vec<&'static str>>>,
-    }
-
-    impl BackingStore for RecordingStore {
-        fn kind(&self) -> BackingStoreKind {
-            self.kind
-        }
-
-        fn ingest_batch(&self, _blocks: Vec<(BlockKey, Weak<SealedBlock>)>) {
-            self.calls.lock().unwrap().push(self.label);
-        }
-
-        fn submit_prefix(
-            &self,
-            _keys: Vec<BlockKey>,
-        ) -> (usize, oneshot::Receiver<PrefetchResult>) {
-            let (tx, rx) = oneshot::channel();
-            let _ = tx.send(Vec::new());
-            (0, rx)
-        }
     }
 
     #[tokio::test]
@@ -508,30 +481,17 @@ mod tests {
         assert!(inflight.is_empty());
     }
 
+    /// Verify that `send_backing_batches` with no stores is a no-op
+    /// and doesn't panic.
     #[tokio::test]
-    async fn backing_stores_fan_out_in_vec_order() {
+    async fn send_backing_batches_no_stores_is_noop() {
         let engine = StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]);
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let deps = Arc::new(InsertDeps {
-            read_cache: engine.read_cache.clone(),
-            backing_stores: vec![
-                Arc::new(RecordingStore {
-                    kind: BackingStoreKind::P2p,
-                    label: "p2p",
-                    calls: Arc::clone(&calls),
-                }) as Arc<dyn BackingStore>,
-                Arc::new(RecordingStore {
-                    kind: BackingStoreKind::Ssd,
-                    label: "ssd",
-                    calls: Arc::clone(&calls),
-                }) as Arc<dyn BackingStore>,
-            ],
-        });
+        let deps = make_deps(&engine);
         let weak_deps = Arc::downgrade(&deps);
 
         let key = BlockKey::new("ns".into(), vec![7]);
         let block = make_layer_block(&engine, 64);
-        let entries: InsertEntries = vec![(key, vec![(0, block)])];
+        let entries: InsertEntries = vec![(key.clone(), vec![(0, block)])];
         let mut inflight: HashMap<BlockKey, InflightBlock> = HashMap::new();
 
         process_insert_batch(
@@ -543,6 +503,8 @@ mod tests {
             "ns",
         );
 
-        assert_eq!(calls.lock().unwrap().as_slice(), ["p2p", "ssd"]);
+        // Block should be sealed and in cache even with no backing stores.
+        assert!(inflight.is_empty());
+        assert!(engine.read_cache.contains_keys(std::slice::from_ref(&key))[0]);
     }
 }

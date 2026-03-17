@@ -1,7 +1,7 @@
 // ============================================================================
 // P2P Backing Store with RDMA Read Path
 //
-// Implements BackingStore for cross-node block transfer:
+// Cross-node block transfer:
 // - ingest_batch: fire-and-forget hash registration to MetaServer
 // - submit_prefix: MetaServer query → AcquireLease → RDMA READ → ReleaseLease
 // ============================================================================
@@ -28,7 +28,7 @@ use crate::numa::NumaNode;
 use crate::pinned_pool::PinnedAllocation;
 use crate::seal_offload::SlotMeta;
 
-use super::{AllocateFn, BackingStore, BackingStoreKind, BakingStoreConfig, PrefetchResult};
+use super::{AllocateFn, P2pConfig, PrefetchResult};
 
 /// Timeout for a single MetaServer query RPC.
 const QUERY_TIMEOUT: Duration = Duration::from_millis(500);
@@ -63,10 +63,10 @@ struct NodeTransferBatch {
 }
 
 // ============================================================================
-// P2pBakingStore
+// P2pBackingStore
 // ============================================================================
 
-pub(crate) struct P2pBakingStore {
+pub(crate) struct P2pBackingStore {
     insert_tx: UnboundedSender<InsertCmd>,
     /// gRPC client for MetaServer queries. Channel connects lazily on first RPC.
     query_client: MetaServerClient<Channel>,
@@ -78,17 +78,17 @@ pub(crate) struct P2pBakingStore {
     node_id: String,
 }
 
-impl P2pBakingStore {
+impl P2pBackingStore {
     fn create(
-        config: BakingStoreConfig,
+        config: P2pConfig,
         allocate_fn: AllocateFn,
         transfer_engine: Arc<TransferEngine>,
-    ) -> Option<Arc<dyn BackingStore>> {
+    ) -> Option<Arc<Self>> {
         let handle = match Handle::try_current() {
             Ok(handle) => handle,
             Err(err) => {
                 error!(
-                    "Failed to initialize P2P baking store: no Tokio runtime available: {}",
+                    "Failed to initialize P2P backing store: no Tokio runtime available: {}",
                     err
                 );
                 return None;
@@ -108,7 +108,7 @@ impl P2pBakingStore {
         let query_client = MetaServerClient::new(channel);
 
         info!(
-            "P2P baking store configured (coordinator={}, node={})",
+            "P2P backing store configured (coordinator={}, node={})",
             config.p2p_coordinator_addr, config.p2p_node_addr
         );
 
@@ -120,14 +120,9 @@ impl P2pBakingStore {
             node_id: config.node_id,
         }))
     }
-}
 
-impl BackingStore for P2pBakingStore {
-    fn kind(&self) -> BackingStoreKind {
-        BackingStoreKind::P2p
-    }
-
-    fn ingest_batch(&self, blocks: Vec<(BlockKey, Weak<SealedBlock>)>) {
+    /// Fire-and-forget write: register block hashes with the MetaServer.
+    pub(crate) fn ingest_batch(&self, blocks: Vec<(BlockKey, Weak<SealedBlock>)>) {
         if blocks.is_empty() {
             return;
         }
@@ -143,7 +138,13 @@ impl BackingStore for P2pBakingStore {
         }
     }
 
-    fn submit_prefix(&self, keys: Vec<BlockKey>) -> (usize, oneshot::Receiver<PrefetchResult>) {
+    /// Submit prefix reads: query MetaServer, then RDMA READ from remote nodes.
+    ///
+    /// Returns `(submitted, done_rx)` where `done_rx` delivers completed blocks.
+    pub(crate) async fn submit_prefix(
+        &self,
+        keys: Vec<BlockKey>,
+    ) -> (usize, oneshot::Receiver<PrefetchResult>) {
         let (done_tx, done_rx) = oneshot::channel();
 
         if keys.is_empty() {
@@ -156,7 +157,7 @@ impl BackingStore for P2pBakingStore {
         let block_hashes: Vec<Vec<u8>> = keys.iter().map(|k| k.hash.clone()).collect();
 
         // Query MetaServer to discover which remote nodes own these blocks.
-        let node_batches = match self.query_metaserver_prefix(&namespace, &block_hashes, &keys) {
+        let node_batches = match self.do_prefix_query(&namespace, &block_hashes, &keys).await {
             Some(batches) if !batches.is_empty() => batches,
             _ => {
                 // No remote blocks found or query failed.
@@ -184,25 +185,10 @@ impl BackingStore for P2pBakingStore {
 }
 
 // ============================================================================
-// MetaServer prefix query (synchronous, called from submit_prefix)
+// MetaServer prefix query (async)
 // ============================================================================
 
-impl P2pBakingStore {
-    /// Query MetaServer for block ownership, returning batches grouped by owning node.
-    ///
-    /// Preserves prefix order: stops at the first hash NOT found on any remote node.
-    fn query_metaserver_prefix(
-        &self,
-        namespace: &str,
-        block_hashes: &[Vec<u8>],
-        keys: &[BlockKey],
-    ) -> Option<Vec<NodeTransferBatch>> {
-        tokio::task::block_in_place(|| {
-            Handle::current()
-                .block_on(async { self.do_prefix_query(namespace, block_hashes, keys).await })
-        })
-    }
-
+impl P2pBackingStore {
     async fn do_prefix_query(
         &self,
         namespace: &str,
@@ -690,11 +676,11 @@ async fn connect_client(addr: &str) -> Option<MetaServerClient<Channel>> {
 }
 
 pub(super) fn new_p2p(
-    config: BakingStoreConfig,
+    config: P2pConfig,
     allocate_fn: AllocateFn,
     transfer_engine: Arc<TransferEngine>,
-) -> Option<Arc<dyn BackingStore>> {
-    P2pBakingStore::create(config, allocate_fn, transfer_engine)
+) -> Option<Arc<P2pBackingStore>> {
+    P2pBackingStore::create(config, allocate_fn, transfer_engine)
 }
 
 // ============================================================================
@@ -796,8 +782,8 @@ mod tests {
             allocator.allocate(NonZeroU64::new(size)?, node.unwrap_or(NumaNode::UNKNOWN))
         });
 
-        let store = P2pBakingStore::create(
-            BakingStoreConfig {
+        let store = P2pBackingStore::create(
+            P2pConfig {
                 p2p_coordinator_addr: "http://127.0.0.1:1".to_string(),
                 p2p_node_addr: "127.0.0.1:50055".to_string(),
                 node_id: "test".to_string(),
@@ -807,7 +793,7 @@ mod tests {
         )
         .expect("create p2p store");
 
-        let (found, rx) = store.submit_prefix(vec![]);
+        let (found, rx) = store.submit_prefix(vec![]).await;
         assert_eq!(found, 0);
         let result = rx.await.expect("receiver");
         assert!(result.is_empty());

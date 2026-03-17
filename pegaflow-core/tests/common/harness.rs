@@ -172,7 +172,7 @@ impl RoundtripHarness {
             .expect("count_prefix_hit_blocks")
     }
 
-    pub fn expect_query_prefetch_done_all(&self) {
+    pub async fn expect_query_prefetch_done_all(&self) {
         match self
             .engine
             .count_prefix_hit_blocks_with_prefetch(
@@ -180,6 +180,7 @@ impl RoundtripHarness {
                 "harness-req",
                 self.block_hashes(),
             )
+            .await
             .expect("query_prefetch")
         {
             PrefetchStatus::Done { hit, missing } => {

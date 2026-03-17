@@ -26,9 +26,7 @@ use cudarc::driver::{CudaContext, sys};
 use log::{info, warn};
 use pegaflow_core::metaserver::{BlockHashStore, GrpcMetaService};
 use pegaflow_core::sync_state::LOAD_STATE_SUCCESS;
-use pegaflow_core::{
-    BakingStoreConfig, LayerSave, LoadState, PegaEngine, PrefetchStatus, StorageConfig,
-};
+use pegaflow_core::{LayerSave, LoadState, P2pConfig, PegaEngine, PrefetchStatus, StorageConfig};
 use pegaflow_server::GrpcRdmaTransferService;
 use pegaflow_server::proto::engine::meta_server_server::MetaServerServer;
 use pegaflow_server::proto::engine::rdma_transfer_server::RdmaTransferServer;
@@ -213,7 +211,7 @@ fn create_engine(
             enable_lfu_admission: false,
             hint_value_size_bytes: Some(block_size),
             max_prefetch_blocks,
-            baking_store_config: Some(BakingStoreConfig {
+            p2p_config: Some(P2pConfig {
                 p2p_coordinator_addr: meta_addr.to_string(),
                 p2p_node_addr: p2p_node_addr.to_string(),
                 node_id: String::new(),
@@ -356,6 +354,7 @@ async fn read_phase(
     loop {
         match engine
             .count_prefix_hit_blocks_with_prefetch(INSTANCE_ID, REQ_ID, hashes)
+            .await
             .expect("count_prefix_hit_blocks_with_prefetch")
         {
             PrefetchStatus::Done { hit, missing } => {
@@ -543,6 +542,7 @@ async fn run_bench(
         loop {
             match req_engine
                 .count_prefix_hit_blocks_with_prefetch(INSTANCE_ID, "warmup", warmup_hashes)
+                .await
                 .expect("warmup prefetch")
             {
                 PrefetchStatus::Done { hit, .. } if hit >= 1 => break,
@@ -625,7 +625,7 @@ fn main() {
     let req_ptr = req_gpu.as_u64();
 
     // Multi-thread runtime: required because P2P backing store uses
-    // `tokio::task::block_in_place` in the MetaServer query path.
+    // `tokio::task::block_in_place` for RDMA READ operations.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()

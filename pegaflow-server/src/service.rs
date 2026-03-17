@@ -446,6 +446,7 @@ impl Engine for GrpcEngineService {
                     &req.req_id,
                     &req.block_hashes,
                 )
+                .await
                 .map_err(Self::map_engine_error)?;
 
             let (prefetch_state, hit_blocks, loading_blocks, missing_blocks) = match status {

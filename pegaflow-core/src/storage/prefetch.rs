@@ -15,7 +15,7 @@ use log::warn;
 use parking_lot::Mutex;
 use tokio::sync::oneshot;
 
-use crate::backing::{BackingStore, PrefetchResult};
+use crate::backing::{P2pBackingStore, PrefetchResult, SsdBackingStore};
 use crate::block::{BlockKey, PrefetchStatus};
 use crate::metrics::core_metrics;
 
@@ -63,18 +63,24 @@ impl PrefetchState {
 
 pub(crate) struct PrefetchScheduler {
     state: Mutex<PrefetchState>,
-    backing_stores: Vec<Arc<dyn BackingStore>>,
+    ssd_store: Option<Arc<SsdBackingStore>>,
+    p2p_store: Option<Arc<P2pBackingStore>>,
     max_prefetch_blocks: usize,
 }
 
 impl PrefetchScheduler {
-    pub fn new(backing_stores: Vec<Arc<dyn BackingStore>>, max_prefetch_blocks: usize) -> Self {
+    pub fn new(
+        ssd_store: Option<Arc<SsdBackingStore>>,
+        p2p_store: Option<Arc<P2pBackingStore>>,
+        max_prefetch_blocks: usize,
+    ) -> Self {
         Self {
             state: Mutex::new(PrefetchState {
                 active: HashMap::new(),
                 inflight_count: 0,
             }),
-            backing_stores,
+            ssd_store,
+            p2p_store,
             max_prefetch_blocks,
         }
     }
@@ -83,7 +89,7 @@ impl PrefetchScheduler {
     ///
     /// Uses per-request state machine: first call does full scan + dispatches
     /// backing reads; retries poll a oneshot receiver. Pins hit blocks on Done.
-    pub fn check_and_prefetch(
+    pub async fn check_and_prefetch(
         &self,
         read_cache: &ReadCache,
         instance_id: &str,
@@ -113,6 +119,7 @@ impl PrefetchScheduler {
             hashes,
             num_workers,
         )
+        .await
     }
 
     // ====================================================================
@@ -134,7 +141,7 @@ impl PrefetchScheduler {
             }
             Err(oneshot::error::TryRecvError::Closed) => {
                 warn!(
-                    "SSD prefetch sender dropped for req_id={}, falling back to re-scan",
+                    "Backing prefetch sender dropped for req_id={}, falling back to re-scan",
                     req_id
                 );
                 state.remove_entry(req_id);
@@ -143,8 +150,8 @@ impl PrefetchScheduler {
         }
     }
 
-    /// Full prefix scan: cache → SSD → pin.
-    fn full_prefix_scan(
+    /// Full prefix scan: cache → backing stores → pin.
+    async fn full_prefix_scan(
         &self,
         read_cache: &ReadCache,
         instance_id: &str,
@@ -161,44 +168,64 @@ impl PrefetchScheduler {
         // Phase 1: cache prefix scan
         let (hit, blocks_to_pin) = read_cache.get_prefix_blocks(&keys);
 
-        // Phase 2: SSD prefix scan for remaining keys
+        // Phase 2: backing store prefix scan for remaining keys
         let remaining = &keys[hit..];
         let mut loading = 0usize;
         let mut blocks_rx: Option<oneshot::Receiver<PrefetchResult>> = None;
 
-        if !remaining.is_empty() && !self.backing_stores.is_empty() {
-            let state = self.state.lock();
-            let available = self
-                .max_prefetch_blocks
-                .saturating_sub(state.inflight_count);
+        let has_backing = self.p2p_store.is_some() || self.ssd_store.is_some();
 
+        // Compute check_keys under the lock, then release it before any async work.
+        let check_keys = if !remaining.is_empty() && has_backing {
+            let available = {
+                let state = self.state.lock();
+                self.max_prefetch_blocks
+                    .saturating_sub(state.inflight_count)
+            };
             if available > 0 {
                 let check_limit = remaining.len().min(available);
-                let check_keys = remaining[..check_limit].to_vec();
-                drop(state);
-
-                for backing in &self.backing_stores {
-                    let (found, rx) = backing.submit_prefix(check_keys.clone());
-                    if found > 0 {
-                        let mut state = self.state.lock();
-                        state.inflight_count += found;
-                        loading = found;
-                        blocks_rx = Some(rx);
-                        break;
-                    }
-                }
-
                 let backpressure_skipped = remaining.len() - check_limit;
                 if backpressure_skipped > 0 {
                     core_metrics()
                         .ssd_prefetch_backpressure_blocks
                         .add(backpressure_skipped as u64, &[]);
                 }
+                Some(remaining[..check_limit].to_vec())
             } else {
-                drop(state);
                 core_metrics()
                     .ssd_prefetch_backpressure_blocks
                     .add(remaining.len() as u64, &[]);
+                None
+            }
+        } else {
+            None
+        };
+
+        // Submit to backing stores (no lock held across await).
+        if let Some(check_keys) = check_keys {
+            // TODO: make backing store priority configurable
+            // Try P2P first (remote RDMA, highest bandwidth)
+            if loading == 0
+                && let Some(p2p) = &self.p2p_store
+            {
+                let (found, rx) = p2p.submit_prefix(check_keys.clone()).await;
+                if found > 0 {
+                    self.state.lock().inflight_count += found;
+                    loading = found;
+                    blocks_rx = Some(rx);
+                }
+            }
+
+            // Then SSD (local disk)
+            if loading == 0
+                && let Some(ssd) = &self.ssd_store
+            {
+                let (found, rx) = ssd.submit_prefix(check_keys);
+                if found > 0 {
+                    self.state.lock().inflight_count += found;
+                    loading = found;
+                    blocks_rx = Some(rx);
+                }
             }
         }
 

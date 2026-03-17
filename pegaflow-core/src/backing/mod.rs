@@ -1,17 +1,18 @@
-//! Backing store abstraction for sealed blocks.
+//! Backing store implementations for sealed blocks.
 //!
-//! Exposes a single [`BackingStore`] trait that the storage engine uses
-//! to write and read blocks from a secondary tier.  All implementation
-//! details (ring buffer, io_uring, SSD workers) stay inside this module.
+//! Two concrete backing stores:
+//! - [`SsdBackingStore`]: local SSD cache via io_uring
+//! - [`P2pBackingStore`]: cross-node RDMA transfer via MetaServer
+//!
+//! No shared trait — SSD and P2P have fundamentally different characteristics
+//! (sync local disk vs async remote RDMA) and are used through concrete types.
 
 pub(super) mod p2p;
 pub(super) mod ssd;
 pub(super) mod ssd_cache;
 pub(super) mod uring;
 
-use std::sync::{Arc, Weak};
-
-use tokio::sync::oneshot;
+use std::sync::Arc;
 
 pub use ssd_cache::{
     DEFAULT_MAX_PREFETCH_BLOCKS, DEFAULT_SSD_PREFETCH_INFLIGHT, DEFAULT_SSD_PREFETCH_QUEUE_DEPTH,
@@ -22,6 +23,9 @@ use crate::block::{BlockKey, SealedBlock};
 use crate::numa::NumaNode;
 use crate::pinned_pool::PinnedAllocation;
 
+pub(crate) use p2p::P2pBackingStore;
+pub(crate) use ssd::SsdBackingStore;
+
 /// Batch of successfully-read blocks from the backing store.
 pub(crate) type PrefetchResult = Vec<(BlockKey, Arc<SealedBlock>)>;
 
@@ -29,9 +33,9 @@ pub(crate) type PrefetchResult = Vec<(BlockKey, Arc<SealedBlock>)>;
 pub(crate) type AllocateFn =
     Arc<dyn Fn(u64, Option<NumaNode>) -> Option<Arc<PinnedAllocation>> + Send + Sync>;
 
-/// Configuration for the P2P baking store.
+/// Configuration for the P2P backing store.
 #[derive(Debug, Clone)]
-pub struct BakingStoreConfig {
+pub struct P2pConfig {
     /// gRPC endpoint of the coordinator that tracks block ownership.
     pub p2p_coordinator_addr: String,
     /// Advertised node address reported as the block owner.
@@ -40,54 +44,23 @@ pub struct BakingStoreConfig {
     pub node_id: String,
 }
 
-/// Runtime kind of a backing store.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BackingStoreKind {
-    P2p,
-    Ssd,
-}
-
-// ============================================================================
-// Public interface
-// ============================================================================
-
-/// Secondary storage tier for sealed blocks.
-///
-/// Implementations must be `Send + Sync + 'static` so they can be wrapped in
-/// `Arc<dyn BackingStore>` and shared across async tasks and threads.
-pub(crate) trait BackingStore: Send + Sync + 'static {
-    /// Store kind, used for wiring decisions such as alignment requirements.
-    fn kind(&self) -> BackingStoreKind;
-
-    /// Fire-and-forget write.
-    ///
-    /// `blocks` holds `Weak` references so the backing store cannot prevent
-    /// cache eviction from freeing the pinned memory before the write completes.
-    fn ingest_batch(&self, blocks: Vec<(BlockKey, Weak<SealedBlock>)>);
-
-    /// Submit prefix reads: scan `keys` in order, submit reads for consecutive hits, stop at first miss.
-    ///
-    /// Returns `(submitted, done_rx)` where `done_rx` delivers completed blocks.
-    fn submit_prefix(&self, keys: Vec<BlockKey>) -> (usize, oneshot::Receiver<PrefetchResult>);
-}
-
 // ============================================================================
 // Factory
 // ============================================================================
 
-/// Create a P2P baking-backed [`BackingStore`].
+/// Create a P2P backing store.
 ///
 /// `allocate_fn` provides NUMA-aware pinned memory for RDMA read buffers.
 /// `transfer_engine` is an already-initialized RDMA transfer engine.
 pub(crate) fn new_p2p(
-    config: BakingStoreConfig,
+    config: P2pConfig,
     allocate_fn: AllocateFn,
     transfer_engine: Arc<pegaflow_transfer::TransferEngine>,
-) -> Option<Arc<dyn BackingStore>> {
+) -> Option<Arc<P2pBackingStore>> {
     p2p::new_p2p(config, allocate_fn, transfer_engine)
 }
 
-/// Create an SSD-backed [`BackingStore`].
+/// Create an SSD backing store.
 ///
 /// `allocate_fn` must provide NUMA-aware pinned memory (with cache eviction).
 /// Returns `None` and logs an error if the SSD cache cannot be initialised.
@@ -95,6 +68,6 @@ pub(crate) fn new_ssd(
     config: SsdCacheConfig,
     allocate_fn: AllocateFn,
     is_numa: bool,
-) -> Option<Arc<dyn BackingStore>> {
+) -> Option<Arc<SsdBackingStore>> {
     ssd::new_ssd(config, allocate_fn, is_numa)
 }

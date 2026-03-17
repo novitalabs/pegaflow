@@ -15,7 +15,7 @@ pub fn test_engine() -> PegaEngine {
         enable_lfu_admission: false,
         hint_value_size_bytes: None,
         max_prefetch_blocks: 100,
-        baking_store_config: None,
+        p2p_config: None,
         ssd_cache_config: None,
         enable_numa_affinity: false,
         transfer_engine: None,

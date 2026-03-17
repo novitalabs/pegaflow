@@ -79,7 +79,7 @@ async fn p2p_smoke_roundtrip() {
                 enable_lfu_admission: false,
                 hint_value_size_bytes: None,
                 max_prefetch_blocks: 100,
-                baking_store_config: Some(BakingStoreConfig {
+                p2p_config: Some(P2pConfig {
                     p2p_coordinator_addr: metaserver_addr,
                     p2p_node_addr: "127.0.0.1:50055".to_string(),
                     node_id: "test-node".to_string(),
@@ -101,7 +101,7 @@ async fn p2p_smoke_roundtrip() {
 
     // Normal roundtrip: zero GPU → pin → load → verify
     harness.zero_gpu_and_assert();
-    harness.expect_query_prefetch_done_all();
+    harness.expect_query_prefetch_done_all().await;
     harness.load_all_and_wait().await.expect("batch_load");
     harness.assert_gpu_matches_host();
 }

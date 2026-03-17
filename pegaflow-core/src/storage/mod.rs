@@ -22,7 +22,7 @@ use std::num::NonZeroU64;
 use std::sync::{Arc, Weak};
 
 use crate::backing::{
-    AllocateFn, BackingStore, BackingStoreKind, BakingStoreConfig, DEFAULT_MAX_PREFETCH_BLOCKS,
+    AllocateFn, DEFAULT_MAX_PREFETCH_BLOCKS, P2pBackingStore, P2pConfig, SsdBackingStore,
     SsdCacheConfig,
 };
 use crate::block::BlockLookupResult;
@@ -55,8 +55,8 @@ pub struct StorageConfig {
     pub hint_value_size_bytes: Option<usize>,
     /// Max blocks allowed in prefetching state (backpressure for SSD prefetch).
     pub max_prefetch_blocks: usize,
-    /// Optional P2P baking store for inter-node ownership announcements.
-    pub baking_store_config: Option<BakingStoreConfig>,
+    /// Optional P2P backing store for inter-node ownership announcements.
+    pub p2p_config: Option<P2pConfig>,
     /// Optional SSD cache for sealed blocks (single-node, FIFO).
     pub ssd_cache_config: Option<SsdCacheConfig>,
     /// Enable NUMA-aware memory allocation.
@@ -71,7 +71,7 @@ impl Default for StorageConfig {
             enable_lfu_admission: true,
             hint_value_size_bytes: None,
             max_prefetch_blocks: DEFAULT_MAX_PREFETCH_BLOCKS,
-            baking_store_config: None,
+            p2p_config: None,
             ssd_cache_config: None,
             enable_numa_affinity: true,
             transfer_engine: None,
@@ -99,8 +99,11 @@ pub struct StorageEngine {
     /// Write pipeline: insert worker channel.
     write_pipeline: Arc<WritePipeline>,
 
-    /// Secondary backing stores ordered by priority.
-    backing_stores: Vec<Arc<dyn BackingStore>>,
+    /// SSD backing store (local disk cache).
+    ssd_store: Option<Arc<SsdBackingStore>>,
+
+    /// P2P backing store (cross-node RDMA transfer).
+    p2p_store: Option<Arc<P2pBackingStore>>,
 }
 
 impl StorageEngine {
@@ -117,7 +120,7 @@ impl StorageEngine {
         let value_size_hint = config.hint_value_size_bytes.filter(|size| *size > 0);
         let unit_hint = value_size_hint.and_then(|size| NonZeroU64::new(size as u64));
         let max_prefetch_blocks = config.max_prefetch_blocks;
-        let baking_store_config = config.baking_store_config.clone();
+        let p2p_config = config.p2p_config.clone();
         let ssd_cache_config = config.ssd_cache_config;
         let transfer_engine = config.transfer_engine;
 
@@ -158,38 +161,32 @@ impl StorageEngine {
 
         let is_numa = allocator.is_numa();
         let engine = Arc::new_cyclic(move |weak_engine: &Weak<Self>| {
-            let mut backing_stores = Vec::new();
-
             // Build shared allocate_fn for both P2P and SSD backing stores.
-            let p2p_weak = weak_engine.clone();
+            let alloc_weak = weak_engine.clone();
             let allocate_fn: AllocateFn = Arc::new(move |size, numa_node| {
-                p2p_weak
+                alloc_weak
                     .upgrade()
                     .and_then(|engine| engine.allocate(NonZeroU64::new(size)?, numa_node))
             });
 
-            if let Some(baking_cfg) = baking_store_config.clone()
-                && let Some(engine) = transfer_engine.clone()
-                && let Some(store) =
-                    crate::backing::new_p2p(baking_cfg, allocate_fn.clone(), engine)
-            {
-                backing_stores.push(store);
-            }
+            let p2p_store = p2p_config
+                .clone()
+                .zip(transfer_engine.clone())
+                .and_then(|(cfg, eng)| crate::backing::new_p2p(cfg, allocate_fn.clone(), eng));
 
-            if let Some(ssd_cfg) = ssd_cache_config
-                && let Some(store) = crate::backing::new_ssd(ssd_cfg, allocate_fn.clone(), is_numa)
-            {
-                backing_stores.push(store);
-            }
+            let ssd_store = ssd_cache_config
+                .and_then(|cfg| crate::backing::new_ssd(cfg, allocate_fn.clone(), is_numa));
 
-            let prefetch = PrefetchScheduler::new(backing_stores.clone(), max_prefetch_blocks);
+            let prefetch =
+                PrefetchScheduler::new(ssd_store.clone(), p2p_store.clone(), max_prefetch_blocks);
 
             Self {
                 allocator,
                 read_cache: read_cache.clone(),
                 prefetch,
                 write_pipeline: write_pipeline.clone(),
-                backing_stores,
+                ssd_store,
+                p2p_store,
             }
         });
 
@@ -197,7 +194,8 @@ impl StorageEngine {
         {
             let deps = Arc::new(InsertDeps {
                 read_cache: engine.read_cache.clone(),
-                backing_stores: engine.backing_stores.clone(),
+                ssd_store: engine.ssd_store.clone(),
+                p2p_store: engine.p2p_store.clone(),
             });
             let weak_deps = Arc::downgrade(&deps);
             // Keep deps alive by leaking it into the thread. The worker holds
@@ -216,9 +214,7 @@ impl StorageEngine {
     }
 
     pub(crate) fn is_ssd_enabled(&self) -> bool {
-        self.backing_stores
-            .iter()
-            .any(|store| store.kind() == BackingStoreKind::Ssd)
+        self.ssd_store.is_some()
     }
 
     pub(crate) fn is_numa_enabled(&self) -> bool {
@@ -351,7 +347,7 @@ impl StorageEngine {
     }
 
     /// Check prefix blocks and schedule backing-store reads if needed.
-    pub(crate) fn check_prefix_and_prefetch(
+    pub(crate) async fn check_prefix_and_prefetch(
         &self,
         instance_id: &str,
         req_id: &str,
@@ -359,14 +355,16 @@ impl StorageEngine {
         hashes: &[Vec<u8>],
         num_workers: usize,
     ) -> PrefetchStatus {
-        self.prefetch.check_and_prefetch(
-            &self.read_cache,
-            instance_id,
-            req_id,
-            namespace,
-            hashes,
-            num_workers,
-        )
+        self.prefetch
+            .check_and_prefetch(
+                &self.read_cache,
+                instance_id,
+                req_id,
+                namespace,
+                hashes,
+                num_workers,
+            )
+            .await
     }
 
     // ====================================================================

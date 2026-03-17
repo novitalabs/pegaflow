@@ -16,7 +16,7 @@ use super::ssd_cache::{
     ssd_writer_loop,
 };
 use super::uring::{UringConfig, UringIoEngine};
-use super::{AllocateFn, BackingStore, BackingStoreKind};
+use super::{AllocateFn, PrefetchResult};
 
 struct SsdInner {
     ring: SsdRingBuffer,
@@ -156,14 +156,12 @@ impl SsdBackingStore {
 
         debug!("SSD backing store workers spawned");
     }
-}
 
-impl BackingStore for SsdBackingStore {
-    fn kind(&self) -> BackingStoreKind {
-        BackingStoreKind::Ssd
-    }
-
-    fn ingest_batch(&self, blocks: Vec<(BlockKey, Weak<SealedBlock>)>) {
+    /// Fire-and-forget write.
+    ///
+    /// `blocks` holds `Weak` references so the backing store cannot prevent
+    /// cache eviction from freeing the pinned memory before the write completes.
+    pub(crate) fn ingest_batch(&self, blocks: Vec<(BlockKey, Weak<SealedBlock>)>) {
         if blocks.is_empty() {
             return;
         }
@@ -177,10 +175,13 @@ impl BackingStore for SsdBackingStore {
         }
     }
 
-    fn submit_prefix(
+    /// Submit prefix reads: scan `keys` in order, submit reads for consecutive hits, stop at first miss.
+    ///
+    /// Returns `(submitted, done_rx)` where `done_rx` delivers completed blocks.
+    pub(crate) fn submit_prefix(
         &self,
         keys: Vec<BlockKey>,
-    ) -> (usize, oneshot::Receiver<super::PrefetchResult>) {
+    ) -> (usize, oneshot::Receiver<PrefetchResult>) {
         let (done_tx, done_rx) = oneshot::channel();
 
         // Prefix-scan the ring buffer: stop at first miss.
@@ -216,7 +217,7 @@ impl BackingStore for SsdBackingStore {
     }
 }
 
-/// Factory: initialise an SSD-backed `BackingStore`.
+/// Factory: initialise an SSD backing store.
 ///
 /// `allocate_fn` provides NUMA-aware pinned memory allocation (with eviction).
 /// Returns `None` if the SSD cache cannot be initialised (logs the error).
@@ -224,9 +225,9 @@ pub(super) fn new_ssd(
     config: SsdCacheConfig,
     allocate_fn: AllocateFn,
     is_numa: bool,
-) -> Option<Arc<dyn BackingStore>> {
+) -> Option<Arc<SsdBackingStore>> {
     match SsdBackingStore::new(config, allocate_fn, is_numa) {
-        Ok(b) => Some(b as Arc<dyn BackingStore>),
+        Ok(b) => Some(b),
         Err(e) => {
             error!("Failed to initialise SSD backing store: {}", e);
             None

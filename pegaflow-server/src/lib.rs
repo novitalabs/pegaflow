@@ -449,8 +449,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         enable_lfu_admission: cli.enable_lfu_admission,
         hint_value_size_bytes: cli.hint_value_size,
         max_prefetch_blocks: cli.max_prefetch_blocks,
-        baking_store_config: cli.p2p_coordinator_addr.as_ref().map(|addr| {
-            pegaflow_core::BakingStoreConfig {
+        p2p_config: cli.p2p_coordinator_addr.as_ref().map(|addr| {
+            pegaflow_core::P2pConfig {
                 p2p_coordinator_addr: addr.clone(),
                 p2p_node_addr: resolve_p2p_node_addr(&cli.p2p_node_addr, cli.addr),
                 node_id: String::new(), // Populated by PegaEngine after creation
