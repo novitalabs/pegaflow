@@ -141,6 +141,10 @@ pub struct Cli {
     /// Defaults to PEGAFLOW_HOST_IP env + bind port, or the bind address.
     #[arg(long)]
     pub advertise_addr: Option<String>,
+
+    /// MetaServer registration queue depth (max pending registration batches).
+    #[arg(long, default_value_t = pegaflow_core::DEFAULT_METASERVER_QUEUE_DEPTH)]
+    pub metaserver_queue_depth: usize,
 }
 
 fn parse_sample_rate(s: &str) -> Result<f64, String> {
@@ -430,12 +434,12 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         let metaserver_registrar = cli.metaserver_addr.as_ref().map(|addr| {
             let advertise = resolve_advertise_addr(cli.advertise_addr.as_deref(), &cli.addr);
             info!(
-                "MetaServer registration enabled: metaserver={}, advertise={}",
-                addr, advertise
+                "MetaServer registration enabled: metaserver={}, advertise={}, queue_depth={}",
+                addr, advertise, cli.metaserver_queue_depth
             );
-            Arc::new(pegaflow_core::MetaServerRegistrar::new(
-                pegaflow_core::MetaServerRegistrarConfig::new(addr.clone(), advertise),
-            ))
+            let config = pegaflow_core::MetaServerRegistrarConfig::new(addr.clone(), advertise)
+                .with_queue_depth(cli.metaserver_queue_depth);
+            Arc::new(pegaflow_core::MetaServerRegistrar::new(config))
         });
 
         // Create PegaEngine inside tokio runtime context (needed for SSD cache tokio::spawn)

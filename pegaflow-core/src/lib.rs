@@ -36,7 +36,9 @@ pub use block::{
     BlockHash, BlockKey, BlockStatus, LayerBlock, LayerSave, PrefetchStatus, SealedBlock,
 };
 pub use instance::{GpuContext, InstanceContext, KVCacheRegistration};
-pub use internode::{MetaServerRegistrar, MetaServerRegistrarConfig};
+pub use internode::{
+    DEFAULT_METASERVER_QUEUE_DEPTH, MetaServerRegistrar, MetaServerRegistrarConfig,
+};
 pub use pegaflow_common::NumaNode;
 use pegaflow_common::NumaTopology;
 pub use pinned_pool::PinnedAllocation;
