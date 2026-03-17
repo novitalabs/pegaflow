@@ -155,14 +155,14 @@ impl PrefetchScheduler {
             None
         };
 
-        if let Some(check_keys) = check_keys {
-            if let Some(ssd) = &self.ssd_store {
-                let (found, rx) = ssd.submit_prefix(check_keys);
-                if found > 0 {
-                    self.state.lock().inflight_count += found;
-                    loading = found;
-                    blocks_rx = Some(rx);
-                }
+        if let Some(check_keys) = check_keys
+            && let Some(ssd) = &self.ssd_store
+        {
+            let (found, rx) = ssd.submit_prefix(check_keys);
+            if found > 0 {
+                self.state.lock().inflight_count += found;
+                loading = found;
+                blocks_rx = Some(rx);
             }
         }
 
