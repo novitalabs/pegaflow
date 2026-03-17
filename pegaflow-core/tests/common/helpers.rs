@@ -27,6 +27,55 @@ pub fn test_engine_with_storage_config(config: StorageConfig) -> PegaEngine {
     PegaEngine::new_with_config(16 << 20, false, config)
 }
 
+/// Layer registration info for batch registration.
+pub struct LayerInfo {
+    pub name: String,
+    pub gpu_ptr: u64,
+    pub total_size: usize,
+    pub num_blocks: usize,
+    pub block_size: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn register_layers(
+    engine: &PegaEngine,
+    instance_id: &str,
+    namespace: &str,
+    layers: &[LayerInfo],
+    device_id: i32,
+    tp_rank: usize,
+    tp_size: usize,
+    world_size: usize,
+    num_layers: usize,
+) {
+    let layer_names: Vec<String> = layers.iter().map(|l| l.name.clone()).collect();
+    let gpu_ptrs: Vec<u64> = layers.iter().map(|l| l.gpu_ptr).collect();
+    let total_sizes: Vec<usize> = layers.iter().map(|l| l.total_size).collect();
+    let num_blocks_list: Vec<usize> = layers.iter().map(|l| l.num_blocks).collect();
+    let block_sizes: Vec<usize> = layers.iter().map(|l| l.block_size).collect();
+    let kv_strides: Vec<usize> = vec![0; layers.len()];
+    let segments: Vec<usize> = vec![1; layers.len()];
+
+    engine
+        .register_context_layer_batch(
+            instance_id,
+            namespace,
+            device_id,
+            tp_rank,
+            tp_size,
+            world_size,
+            num_layers,
+            &layer_names,
+            &gpu_ptrs,
+            &total_sizes,
+            &num_blocks_list,
+            &block_sizes,
+            &kv_strides,
+            &segments,
+        )
+        .expect("register_context_layer_batch");
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn register_single_layer(
     engine: &PegaEngine,
@@ -43,24 +92,23 @@ pub fn register_single_layer(
     world_size: usize,
     num_layers: usize,
 ) {
-    engine
-        .register_context_layer(
-            instance_id,
-            namespace,
-            device_id,
-            layer_name.to_string(),
+    register_layers(
+        engine,
+        instance_id,
+        namespace,
+        &[LayerInfo {
+            name: layer_name.to_string(),
             gpu_ptr,
             total_size,
             num_blocks,
             block_size,
-            0, // kv_stride_bytes (contiguous)
-            1, // segments
-            tp_rank,
-            tp_size,
-            world_size,
-            num_layers,
-        )
-        .expect("register_context_layer");
+        }],
+        device_id,
+        tp_rank,
+        tp_size,
+        world_size,
+        num_layers,
+    );
 }
 
 pub async fn save_single_layer(

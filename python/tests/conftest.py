@@ -227,7 +227,7 @@ class ClientContext:
                 kv_stride_bytes = 0
                 segments = 1
 
-            ok, message = self.engine_client.register_context(
+            ok, message = self.engine_client.register_context_batch(
                 self.instance_id,
                 self.namespace,
                 0,  # tp_rank

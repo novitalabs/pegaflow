@@ -254,64 +254,49 @@ class PeagflowRadixCache(RadixCache):
         if not self.is_mla:
             num_layers *= 2
 
+        # Collect all layer registration info
         registered_layer_names: list[str] = []
+        layer_wrapper_bytes: list[bytes] = []
+        layer_num_blocks: list[int] = []
+        layer_bytes_per_block: list[int] = []
+
+        def collect_layer_info(tensor: torch.Tensor, name: str) -> None:
+            wrapper = CudaIPCWrapper(tensor)
+            wrapper_bytes = pickle.dumps(wrapper)
+
+            shape = tuple(tensor.shape)
+            stride = tuple(tensor.stride())
+            element_size = tensor.element_size()
+
+            slots = shape[0]
+            stride0_bytes = stride[0] * element_size
+
+            assert self.page_size > 0, "page_size must be > 0 for PegaFlow radix cache"
+            assert slots % self.page_size == 0, (
+                f"KV slots ({slots}) must be divisible by page_size ({self.page_size})"
+            )
+
+            num_blocks = slots // self.page_size
+            bytes_per_block = stride0_bytes * self.page_size
+
+            registered_layer_names.append(name)
+            layer_wrapper_bytes.append(wrapper_bytes)
+            layer_num_blocks.append(num_blocks)
+            layer_bytes_per_block.append(bytes_per_block)
 
         if self.is_mla:
             for layer_name, k_tensor in zip(layer_names, k_pool, strict=True):
-                self._register_single_layer(
-                    tensor=k_tensor,
-                    layer_name=layer_name,
-                    num_layers=num_layers,
-                )
-                registered_layer_names.append(layer_name)
-
+                collect_layer_info(k_tensor, layer_name)
         else:
             for layer_name, (k_tensor, v_tensor) in zip(
                 layer_names, zip(k_pool, v_pool, strict=True), strict=True
             ):
-                k_name = f"{layer_name}_k"
-                v_name = f"{layer_name}_v"
-                self._register_single_layer(
-                    tensor=k_tensor,
-                    layer_name=k_name,
-                    num_layers=num_layers,
-                )
-                self._register_single_layer(
-                    tensor=v_tensor,
-                    layer_name=v_name,
-                    num_layers=num_layers,
-                )
-                registered_layer_names.append(k_name)
-                registered_layer_names.append(v_name)
+                collect_layer_info(k_tensor, f"{layer_name}_k")
+                collect_layer_info(v_tensor, f"{layer_name}_v")
 
-        self._layer_names = registered_layer_names
-
-    def _register_single_layer(
-        self,
-        tensor: torch.Tensor,
-        layer_name: str,
-        num_layers: int,
-    ) -> str:
-        wrapper = CudaIPCWrapper(tensor)
-        wrapper_bytes = pickle.dumps(wrapper)
-
-        shape = tuple(tensor.shape)
-        stride = tuple(tensor.stride())
-        element_size = tensor.element_size()
-
-        slots = shape[0]
-        stride0_bytes = stride[0] * element_size
-
-        assert self.page_size > 0, "page_size must be > 0 for PegaFlow radix cache"
-        assert slots % self.page_size == 0, (
-            f"KV slots ({slots}) must be divisible by page_size ({self.page_size})"
-        )
-
-        num_blocks = slots // self.page_size
-        bytes_per_block = stride0_bytes * self.page_size
-
+        # Register all layers in one batch call
         try:
-            ok, message = self.engine_client.register_context(
+            ok, message = self.engine_client.register_context_batch(
                 self.instance_id,
                 self.namespace,
                 0 if self.is_mla else self.tp_rank,
@@ -319,24 +304,26 @@ class PeagflowRadixCache(RadixCache):
                 self.world_size,
                 self.device_id,
                 num_layers,
-                layer_name,
-                wrapper_bytes,
-                num_blocks,
-                bytes_per_block,
-                0,  # kv_stride_bytes
-                1,  # segments
+                registered_layer_names,
+                layer_wrapper_bytes,
+                layer_num_blocks,
+                layer_bytes_per_block,
+                [0] * len(registered_layer_names),  # kv_stride_bytes
+                [1] * len(registered_layer_names),  # segments
             )
 
             if not ok:
-                raise RuntimeError(f"Register context failed for {layer_name}: {message}")
+                raise RuntimeError(f"Register context failed: {message}")
 
             logger.info(
-                f"[PeagflowRadixCache] Registered {layer_name} (num_blocks={num_blocks}, bytes_per_block={bytes_per_block}, page_size={self.page_size})"
+                "[PeagflowRadixCache] Registered %d KV cache layers instance=%s",
+                len(registered_layer_names),
+                self.instance_id,
             )
         except PegaFlowError as e:
-            raise RuntimeError(f"Failed to register {layer_name}: {e}") from e
+            raise RuntimeError(f"Failed to register layers: {e}") from e
 
-        return layer_name
+        self._layer_names = registered_layer_names
 
     def _unpin_blocks(self, block_hashes: list[bytes]) -> None:
         """Unpin blocks that were pinned during query but not consumed by load."""
