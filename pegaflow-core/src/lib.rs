@@ -11,6 +11,7 @@
 mod trace;
 
 pub mod allocator;
+mod backing;
 pub mod block;
 mod cache;
 pub mod gpu_worker;
@@ -24,12 +25,14 @@ mod offload;
 pub mod pinned_mem;
 pub mod pinned_pool;
 mod seal_offload;
-pub mod ssd_cache;
 mod storage;
 pub mod sync_state;
 mod transfer;
-mod uring;
 
+pub use backing::{
+    DEFAULT_SSD_PREFETCH_INFLIGHT, DEFAULT_SSD_PREFETCH_QUEUE_DEPTH, DEFAULT_SSD_WRITE_INFLIGHT,
+    DEFAULT_SSD_WRITE_QUEUE_DEPTH, SsdCacheConfig,
+};
 pub use block::{
     BlockHash, BlockKey, BlockStatus, LayerBlock, LayerSave, PrefetchStatus, SealedBlock,
 };
@@ -38,11 +41,7 @@ pub use numa::NumaNode;
 use numa::NumaTopology;
 pub use pinned_pool::PinnedAllocation;
 pub use seal_offload::SlotMeta;
-pub use ssd_cache::{
-    DEFAULT_SSD_PREFETCH_INFLIGHT, DEFAULT_SSD_PREFETCH_QUEUE_DEPTH, DEFAULT_SSD_WRITE_INFLIGHT,
-    DEFAULT_SSD_WRITE_QUEUE_DEPTH, SsdCacheConfig,
-};
-pub use storage::{SealNotification, StorageConfig};
+pub use storage::StorageConfig;
 pub use sync_state::{LoadState, LoadStateError};
 pub use trace::{set_trace_sample_rate, should_sample};
 
@@ -71,19 +70,12 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use log::{debug, info};
-use pegaflow_proto::proto::engine::meta_server_client::MetaServerClient;
-use tonic::transport::Channel;
+use log::{debug, info, warn};
 
+use crate::backing::SSD_ALIGNMENT;
 use crate::gpu_worker::{LayerLoadData, LoadBlock, LoadTask};
 use crate::metrics::core_metrics;
-use crate::storage::{SSD_ALIGNMENT, StorageEngine};
-
-/// Command sent to the metaserver insert worker.
-pub(crate) struct MetaserverInsertCmd {
-    pub namespace: String,
-    pub block_hashes: Vec<Vec<u8>>,
-}
+use crate::storage::StorageEngine;
 
 const DEFAULT_PINNED_POOL_BYTES: usize = 30 * 1024 * 1024 * 1024; // 30GB
 
@@ -152,31 +144,26 @@ pub struct PegaEngine {
 impl PegaEngine {
     /// Create a new engine with default 30GB pinned memory pool.
     pub fn new() -> Self {
-        let (engine, _rx) = Self::new_with_config(
+        Self::new_with_config(
             DEFAULT_PINNED_POOL_BYTES,
             false,
             storage::StorageConfig::default(),
-        );
-        engine
+        )
     }
 
     /// Create an engine with full custom configuration.
-    ///
-    /// Returns the engine and a receiver for seal notifications (used for SSD offload).
     ///
     /// If `storage_config.enable_numa_affinity` is true and the system has multiple
     /// NUMA nodes, per-node pinned memory pools are created for optimal bandwidth.
     pub fn new_with_config(
         pool_size: usize,
         use_hugepages: bool,
-        storage_config: impl Into<storage::StorageConfig>,
-    ) -> (Self, tokio::sync::mpsc::UnboundedReceiver<SealNotification>) {
-        // Detect GPU-NUMA topology
+        storage_config: storage::StorageConfig,
+    ) -> Self {
         let topology = Arc::new(NumaTopology::detect());
         topology.log_summary();
 
-        // Resolve NUMA nodes based on config and topology
-        let config = storage_config.into();
+        let config = storage_config;
         let numa_nodes: Vec<numa::NumaNode> =
             if config.enable_numa_affinity && topology.is_multi_numa() {
                 info!(
@@ -188,26 +175,13 @@ impl PegaEngine {
                 vec![]
             };
 
-        let (storage, seal_notify_rx) =
-            StorageEngine::new_with_config(pool_size, use_hugepages, config, &numa_nodes);
+        let storage = StorageEngine::new_with_config(pool_size, use_hugepages, config, &numa_nodes);
 
-        (
-            PegaEngine {
-                instances: RwLock::new(HashMap::new()),
-                storage,
-                topology,
-            },
-            seal_notify_rx,
-        )
-    }
-
-    /// Set the MetaServer client for cross-node block hash registry.
-    ///
-    /// `node_url` is this server's advertised address as `ip:port` (e.g., `10.0.0.1:50055`),
-    /// sent to the metaserver so other nodes can discover which server owns a block.
-    /// Spawns a background worker that batches and sends insert requests.
-    pub fn set_metaserver_client(&self, client: MetaServerClient<Channel>, node_url: String) {
-        self.storage.set_metaserver_client(client, node_url);
+        PegaEngine {
+            instances: RwLock::new(HashMap::new()),
+            storage,
+            topology,
+        }
     }
 
     /// Get or create an instance with the specified topology.
@@ -421,22 +395,29 @@ impl PegaEngine {
         feature = "tracing",
         fastrace::trace(name = "query_prefetch.count_prefix_hit")
     )]
-    pub fn count_prefix_hit_blocks_with_prefetch(
+    pub async fn count_prefix_hit_blocks_with_prefetch(
         &self,
         instance_id: &str,
+        req_id: &str,
         block_hashes: &[Vec<u8>],
     ) -> Result<PrefetchStatus, EngineError> {
+        if req_id.is_empty() {
+            warn!("count_prefix_hit_blocks_with_prefetch: empty req_id, returning 0 hits");
+            return Ok(PrefetchStatus::Done {
+                hit: 0,
+                missing: block_hashes.len(),
+            });
+        }
+
         let instance = self.get_instance(instance_id)?;
         let namespace = instance.namespace();
         let world_size = instance.world_size();
         let metrics = core_metrics();
 
-        let status = self.storage.check_prefix_and_prefetch(
-            instance_id,
-            namespace,
-            block_hashes,
-            world_size,
-        );
+        let status = self
+            .storage
+            .check_prefix_and_prefetch(instance_id, req_id, namespace, block_hashes, world_size)
+            .await;
 
         match &status {
             PrefetchStatus::Done { hit, missing } => {
@@ -526,11 +507,11 @@ impl PegaEngine {
             .get_gpu(device_id)
             .ok_or_else(|| EngineError::WorkerMissing(instance_id.to_string(), device_id))?;
 
-        // Lookup all blocks (consumes pinned blocks)
+        // Consume all pinned blocks reserved for this load.
         trace_scope!("load.cache_lookup", _s);
         let block_cache = self
             .storage
-            .cache_lookup_many(instance_id, namespace, block_hashes)
+            .consume_pinned_blocks(instance_id, namespace, block_hashes)
             .map_err(EngineError::Storage)?;
         trace_drop!(_s);
 
@@ -611,7 +592,7 @@ mod tests {
             ssd_cache_config: None,
             enable_numa_affinity: false,
         };
-        let (engine, _rx) = PegaEngine::new_with_config(1 << 20, false, config);
+        let engine = PegaEngine::new_with_config(1 << 20, false, config);
 
         // Manually insert an InstanceContext (no GPU required)
         let instance = InstanceContext::new(
@@ -631,11 +612,11 @@ mod tests {
         engine
     }
 
-    /// Helper: insert a block into the storage cache via complete_prefetch.
+    /// Helper: insert a block directly into the storage cache.
     fn insert_block(engine: &PegaEngine, namespace: &str, hash: Vec<u8>) {
         let key = BlockKey::new(namespace.to_string(), hash);
         let block = Arc::new(SealedBlock::from_slots(Vec::new()));
-        engine.storage.complete_prefetch(key, Some(block));
+        engine.storage.test_insert_cache(key, block);
     }
 
     #[tokio::test]
@@ -647,7 +628,8 @@ mod tests {
 
         let hashes = vec![vec![1], vec![2], vec![3]];
         let status = engine
-            .count_prefix_hit_blocks_with_prefetch("inst1", &hashes)
+            .count_prefix_hit_blocks_with_prefetch("inst1", "test-req", &hashes)
+            .await
             .unwrap();
 
         match status {
@@ -668,7 +650,8 @@ mod tests {
 
         let hashes = vec![vec![1], vec![2], vec![3], vec![4]];
         let status = engine
-            .count_prefix_hit_blocks_with_prefetch("inst1", &hashes)
+            .count_prefix_hit_blocks_with_prefetch("inst1", "test-req", &hashes)
+            .await
             .unwrap();
 
         match status {
@@ -686,7 +669,8 @@ mod tests {
 
         let hashes = vec![vec![1], vec![2]];
         let status = engine
-            .count_prefix_hit_blocks_with_prefetch("inst1", &hashes)
+            .count_prefix_hit_blocks_with_prefetch("inst1", "test-req", &hashes)
+            .await
             .unwrap();
 
         match status {
@@ -704,7 +688,8 @@ mod tests {
 
         let hashes: Vec<Vec<u8>> = vec![];
         let status = engine
-            .count_prefix_hit_blocks_with_prefetch("inst1", &hashes)
+            .count_prefix_hit_blocks_with_prefetch("inst1", "test-req", &hashes)
+            .await
             .unwrap();
 
         match status {
@@ -720,7 +705,9 @@ mod tests {
     async fn instance_not_found_returns_error() {
         let engine = setup_engine("inst1", "ns");
 
-        let result = engine.count_prefix_hit_blocks_with_prefetch("nonexistent", &[vec![1]]);
+        let result = engine
+            .count_prefix_hit_blocks_with_prefetch("nonexistent", "test-req", &[vec![1]])
+            .await;
 
         assert!(result.is_err());
         assert!(
@@ -736,7 +723,8 @@ mod tests {
 
         let hashes = vec![vec![1], vec![2], vec![3]];
         let status = engine
-            .count_prefix_hit_blocks_with_prefetch("inst1", &hashes)
+            .count_prefix_hit_blocks_with_prefetch("inst1", "test-req", &hashes)
+            .await
             .unwrap();
 
         match status {
@@ -759,7 +747,8 @@ mod tests {
         // Instance uses "ns_a", so only vec![1] should hit
         let hashes = vec![vec![1], vec![2]];
         let status = engine
-            .count_prefix_hit_blocks_with_prefetch("inst1", &hashes)
+            .count_prefix_hit_blocks_with_prefetch("inst1", "test-req", &hashes)
+            .await
             .unwrap();
 
         match status {

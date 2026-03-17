@@ -2,7 +2,7 @@
 //!
 //! This module provides two allocation strategies:
 //!
-//! 1. **Write-combined** (`PinnedMemory::allocate`): Uses `cudaHostAlloc` with write-combined flag.
+//! 1. **Write-combined** (`PinnedMemory::allocate_write_combined`): Uses `cudaHostAlloc` with write-combined flag.
 //!    Optimized for CPU-to-GPU transfers with better write performance.
 //!
 //! 2. **Huge pages** (`PinnedMemory::allocate_hugepages`): Uses `mmap(MAP_HUGETLB)` + `cudaHostRegister`.
@@ -86,7 +86,11 @@ impl std::error::Error for PinnedMemError {}
 /// Allocation strategy for pinned memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AllocStrategy {
-    /// Write-combined via cudaHostAlloc
+    /// Regular pinned memory via cudaHostAlloc (flags=0).
+    /// Safe for both CPU reads and writes; use when SSD offload is enabled.
+    Regular,
+    /// Write-combined via cudaHostAlloc.
+    /// Fast for CPU→GPU (write-only) workloads, but CPU reads are extremely slow.
     WriteCombined,
     /// Huge pages (size from /proc/meminfo, requires system configuration)
     HugePages,
@@ -119,15 +123,20 @@ unsafe impl Send for PinnedMemory {}
 unsafe impl Sync for PinnedMemory {}
 
 impl PinnedMemory {
+    /// Allocate regular pinned memory (flags=0).
+    ///
+    /// Safe for both CPU reads and writes. Use when SSD offload is enabled,
+    /// since write-combined memory has extremely slow CPU reads.
+    pub(crate) fn allocate_regular(size: usize) -> Result<Self, PinnedMemError> {
+        Self::allocate_internal(size, AllocStrategy::Regular)
+    }
+
     /// Allocate pinned memory using write-combined mode.
     ///
     /// Uses `cudaHostAlloc` with `cudaHostAllocWriteCombined` flag.
-    /// Optimized for CPU-to-GPU transfers.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if cudaHostAlloc fails.
-    pub(crate) fn allocate(size: usize) -> Result<Self, PinnedMemError> {
+    /// Fast for CPU→GPU transfers but CPU reads are extremely slow.
+    /// Do NOT use when SSD offload is enabled.
+    pub(crate) fn allocate_write_combined(size: usize) -> Result<Self, PinnedMemError> {
         Self::allocate_internal(size, AllocStrategy::WriteCombined)
     }
 
@@ -154,8 +163,15 @@ impl PinnedMemory {
         }
 
         let (ptr, aligned_size) = match strategy {
+            AllocStrategy::Regular => {
+                let mut ptr: *mut libc::c_void = std::ptr::null_mut();
+                let result = unsafe { rt::cudaHostAlloc(&mut ptr, size, 0) };
+                if result != rt::cudaError::cudaSuccess {
+                    return Err(PinnedMemError::CudaAllocFailed(result));
+                }
+                (ptr, size)
+            }
             AllocStrategy::WriteCombined => {
-                // Use cudaHostAlloc with write-combined flag
                 let mut ptr: *mut libc::c_void = std::ptr::null_mut();
                 let result =
                     unsafe { rt::cudaHostAlloc(&mut ptr, size, rt::cudaHostAllocWriteCombined) };
@@ -227,7 +243,7 @@ impl PinnedMemory {
 impl Drop for PinnedMemory {
     fn drop(&mut self) {
         match self.strategy {
-            AllocStrategy::WriteCombined => {
+            AllocStrategy::Regular | AllocStrategy::WriteCombined => {
                 // SAFETY: ptr was allocated with cudaHostAlloc
                 let result = unsafe { rt::cudaFreeHost(self.ptr.as_ptr() as *mut libc::c_void) };
                 if result != rt::cudaError::cudaSuccess {
@@ -266,13 +282,13 @@ mod tests {
             return;
         }
 
-        let mem = PinnedMemory::allocate(4096).unwrap();
+        let mem = PinnedMemory::allocate_write_combined(4096).unwrap();
         assert!(mem.size() >= 4096);
     }
 
     #[test]
     fn test_zero_size_fails() {
-        let result = PinnedMemory::allocate(0);
+        let result = PinnedMemory::allocate_write_combined(0);
         assert!(matches!(result, Err(PinnedMemError::ZeroSize)));
     }
 
