@@ -49,6 +49,11 @@ pub(crate) struct CoreMetrics {
     pub ssd_prefetch_inflight: UpDownCounter<i64>,
     pub ssd_prefetch_queue_full: Counter<u64>,
     pub ssd_prefetch_backpressure_blocks: Counter<u64>,
+
+    // MetaServer registration
+    pub metaserver_registration_blocks: Counter<u64>,
+    pub metaserver_registration_failures: Counter<u64>,
+    pub metaserver_registration_queue_full: Counter<u64>,
 }
 
 fn init_meter() -> Meter {
@@ -241,6 +246,20 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
             ssd_prefetch_backpressure_blocks: meter
                 .u64_counter("pegaflow_ssd_prefetch_backpressure_blocks")
                 .with_description("Blocks treated as missing due to max prefetch backpressure")
+                .build(),
+
+            // MetaServer registration
+            metaserver_registration_blocks: meter
+                .u64_counter("pegaflow_metaserver_registration_blocks")
+                .with_description("Block hashes sent to MetaServer for registration")
+                .build(),
+            metaserver_registration_failures: meter
+                .u64_counter("pegaflow_metaserver_registration_failures")
+                .with_description("MetaServer registration RPC failures")
+                .build(),
+            metaserver_registration_queue_full: meter
+                .u64_counter("pegaflow_metaserver_registration_queue_full")
+                .with_description("Registration batches dropped due to full queue")
                 .build(),
         }
     })

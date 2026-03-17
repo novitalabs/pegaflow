@@ -36,6 +36,7 @@ pub use block::{
     BlockHash, BlockKey, BlockStatus, LayerBlock, LayerSave, PrefetchStatus, SealedBlock,
 };
 pub use instance::{GpuContext, InstanceContext, KVCacheRegistration};
+pub use internode::{MetaServerRegistrar, MetaServerRegistrarConfig};
 pub use pegaflow_common::NumaNode;
 use pegaflow_common::NumaTopology;
 pub use pinned_pool::PinnedAllocation;
@@ -147,6 +148,7 @@ impl PegaEngine {
             DEFAULT_PINNED_POOL_BYTES,
             false,
             storage::StorageConfig::default(),
+            None,
         )
     }
 
@@ -154,10 +156,14 @@ impl PegaEngine {
     ///
     /// If `storage_config.enable_numa_affinity` is true and the system has multiple
     /// NUMA nodes, per-node pinned memory pools are created for optimal bandwidth.
+    ///
+    /// `metaserver_registrar` enables automatic block hash registration with the
+    /// centralized MetaServer when blocks are sealed.
     pub fn new_with_config(
         pool_size: usize,
         use_hugepages: bool,
         storage_config: storage::StorageConfig,
+        metaserver_registrar: Option<Arc<MetaServerRegistrar>>,
     ) -> Self {
         let topology = Arc::new(NumaTopology::detect());
         topology.log_summary();
@@ -173,7 +179,13 @@ impl PegaEngine {
             vec![]
         };
 
-        let storage = StorageEngine::new_with_config(pool_size, use_hugepages, config, &numa_nodes);
+        let storage = StorageEngine::new_with_config(
+            pool_size,
+            use_hugepages,
+            config,
+            &numa_nodes,
+            metaserver_registrar,
+        );
 
         PegaEngine {
             instances: RwLock::new(HashMap::new()),
@@ -590,7 +602,7 @@ mod tests {
             ssd_cache_config: None,
             enable_numa_affinity: false,
         };
-        let engine = PegaEngine::new_with_config(1 << 20, false, config);
+        let engine = PegaEngine::new_with_config(1 << 20, false, config, None);
 
         // Manually insert an InstanceContext (no GPU required)
         let instance = InstanceContext::new(
