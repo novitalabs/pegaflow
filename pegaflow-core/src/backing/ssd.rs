@@ -7,8 +7,8 @@ use tokio::sync::oneshot;
 
 use crate::block::{BlockKey, SealedBlock};
 use crate::metrics::core_metrics;
-use crate::numa::NumaNode;
 use crate::pinned_pool::PinnedAllocation;
+use pegaflow_common::NumaNode;
 
 use super::SsdCacheConfig;
 use super::ssd_cache::{

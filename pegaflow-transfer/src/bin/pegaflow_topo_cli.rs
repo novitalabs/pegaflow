@@ -8,7 +8,7 @@
 //! Usage:
 //!   cargo run --bin pegaflow_topo_cli
 
-use pegaflow_core::logging;
+use pegaflow_common::logging;
 use pegaflow_transfer::rdma_topo::SystemTopology;
 
 fn main() {

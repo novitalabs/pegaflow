@@ -45,7 +45,6 @@ use crate::{
     },
     domain_address::DomainAddress,
     error::{Result, TransferError},
-    logging,
 };
 
 const UD_QKEY: u32 = 0x1111_1111;
@@ -1215,7 +1214,7 @@ impl SidewayBackend {
 
 impl SidewayBackend {
     pub(crate) fn initialize(&self, config: WorkerConfig) -> Result<()> {
-        logging::ensure_initialized();
+        crate::init_logging();
         if config.nic_name.trim().is_empty() {
             return Err(TransferError::InvalidArgument("nic_name is empty"));
         }

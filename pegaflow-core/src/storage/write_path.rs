@@ -8,8 +8,8 @@ use tokio::sync::oneshot;
 use crate::backing::SsdBackingStore;
 use crate::block::{BlockKey, InflightBlock, SealedBlock, SlotInsertResult};
 use crate::metrics::core_metrics;
-use crate::numa::NumaNode;
 use crate::offload::InsertEntries;
+use pegaflow_common::NumaNode;
 
 use super::read_cache::ReadCache;
 

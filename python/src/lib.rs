@@ -144,7 +144,7 @@ impl PegaEngine {
     /// Create a new PegaEngine instance
     #[new]
     fn new() -> Self {
-        pegaflow_core::logging::init_stderr("info,pegaflow_core=info");
+        pegaflow_common::logging::init_stderr("info,pegaflow_core=info");
         PegaEngine {
             engine: CoreEngine::new(),
         }
@@ -668,7 +668,7 @@ impl PyLoadState {
 /// This module is named "pegaflow" and will be imported as: from pegaflow import PegaEngine
 #[pymodule]
 fn pegaflow(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    pegaflow_core::logging::init_stderr("info,pegaflow_core=info");
+    pegaflow_common::logging::init_stderr("info,pegaflow_core=info");
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<PegaEngine>()?;
     m.add_class::<EngineRpcClient>()?;

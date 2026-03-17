@@ -4,7 +4,7 @@
 // Shared types for sealed block metadata, used by SSD cache.
 // ============================================================================
 
-use crate::numa::NumaNode;
+use pegaflow_common::NumaNode;
 
 /// Per-slot metadata (one slot = one layer's KV cache)
 #[derive(Debug, Clone)]

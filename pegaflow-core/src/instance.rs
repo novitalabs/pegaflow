@@ -9,8 +9,8 @@ use std::{collections::HashMap, sync::Arc};
 use cudarc::driver::CudaContext;
 use log::info;
 
-use crate::numa::NumaNode;
 use crate::{EngineError, gpu_worker::GpuWorkerPool};
+use pegaflow_common::NumaNode;
 
 /// Layer metadata protected by a single mutex.
 ///

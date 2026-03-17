@@ -5,8 +5,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::numa::NumaNode;
 use crate::pinned_pool::PinnedAllocation;
+use pegaflow_common::NumaNode;
 
 // ============================================================================
 // BlockKey

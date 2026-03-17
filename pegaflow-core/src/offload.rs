@@ -19,9 +19,9 @@ pub(crate) type InsertEntries = Vec<(BlockKey, Vec<(usize, Arc<LayerBlock>)>)>;
 use crate::gpu_worker::{SaveBlock, SaveLayerData};
 use crate::instance::KVCacheRegistration;
 use crate::metrics::core_metrics;
-use crate::numa::NumaNode;
 use crate::pinned_pool::PinnedAllocation;
 use crate::{EngineError, PegaEngine};
+use pegaflow_common::NumaNode;
 
 // ============================================================================
 // Types sent to the insert worker (deferred Phase 4)
