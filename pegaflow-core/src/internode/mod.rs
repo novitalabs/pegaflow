@@ -24,33 +24,6 @@
 //! PegaFlow instances, particularly useful for P/D disaggregation scenarios where
 //! a decode instance needs to query a prefill instance for cached KV blocks.
 //!
-//! # Quick Start
-//!
-//! ```rust,no_run
-//! use pegaflow_core::internode::{
-//!     ServiceDiscoveryConfig, InstanceRegistry, start_service_discovery,
-//!     PegaflowClient, PegaflowClientPool, ClientConfig,
-//! };
-//! use std::sync::Arc;
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     // Option 1: Direct client connection
-//!     let client = PegaflowClient::connect_default("http://10.0.0.1:50055").await?;
-//!     let result = client.query("instance-1", vec![vec![1, 2, 3]]).await?;
-//!     println!("Query result: {:?}", result.status);
-//!
-//!     // Option 2: Use client pool (caches connections, evicts stale entries)
-//!     let registry = Arc::new(InstanceRegistry::new());
-//!     let pool = PegaflowClientPool::with_registry(registry);
-//!     // Endpoint comes from the metaserver (node that owns the block)
-//!     let client = pool.get_or_connect("http://10.0.0.2:50055").await?;
-//!     let result = client.query("instance-1", vec![vec![1, 2, 3]]).await?;
-//!     println!("Query result: {:?}", result.status);
-//!
-//!     Ok(())
-//! }
-//! ```
 
 pub mod client;
 pub(crate) mod registrar;

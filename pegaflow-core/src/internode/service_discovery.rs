@@ -36,31 +36,6 @@ use super::types::{PegaflowInstance, ServiceDiscoveryConfig};
 ///
 /// A `JoinHandle` for the background task, or an error if initialization fails.
 ///
-/// # Example
-///
-/// ```rust,no_run
-/// use pegaflow_core::internode::{
-///     ServiceDiscoveryConfig, InstanceRegistry, start_service_discovery,
-/// };
-/// use std::sync::Arc;
-///
-/// #[tokio::main]
-/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-///     let registry = Arc::new(InstanceRegistry::new());
-///     let config = ServiceDiscoveryConfig::new()
-///         .enable()
-///         .with_namespace("default");
-///
-///     let handle = start_service_discovery(config, registry.clone()).await?;
-///
-///     // Get all healthy instances
-///     for instance in registry.healthy_instances() {
-///         println!("Found PegaFlow at: {}", instance.grpc_endpoint());
-///     }
-///
-///     Ok(())
-/// }
-/// ```
 pub async fn start_service_discovery(
     config: ServiceDiscoveryConfig,
     registry: Arc<InstanceRegistry>,
