@@ -470,12 +470,14 @@ impl EngineRpcClient {
         py: Python<'_>,
         instance_id: String,
         block_hashes: Vec<Vec<u8>>,
+        req_id: String,
     ) -> PyResult<Py<pyo3::types::PyAny>> {
         self.call(py, |mut c| async move {
             let resp = c
                 .query(QueryRequest {
                     instance_id,
                     block_hashes,
+                    req_id,
                 })
                 .await?;
             Ok(resp.into_inner())
@@ -520,6 +522,7 @@ impl EngineRpcClient {
         py: Python<'_>,
         instance_id: String,
         block_hashes: Vec<Vec<u8>>,
+        req_id: String,
     ) -> PyResult<Py<pyo3::types::PyAny>> {
         use pegaflow_proto::proto::engine::PrefetchState;
 
@@ -528,6 +531,7 @@ impl EngineRpcClient {
                 .query_prefetch(QueryRequest {
                     instance_id,
                     block_hashes,
+                    req_id,
                 })
                 .await?;
             Ok(resp.into_inner())

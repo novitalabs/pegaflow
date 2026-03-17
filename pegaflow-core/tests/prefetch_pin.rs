@@ -47,7 +47,7 @@ async fn query_prefetch_pin_budget_tracks_world_size() {
 
     harness.save_all().await;
     harness.assert_cache_eventually_all().await;
-    harness.expect_query_prefetch_done_all();
+    harness.expect_query_prefetch_done_all().await;
 
     // First worker load (consumes one pin reference per block).
     harness.zero_gpu_and_assert();
@@ -78,7 +78,7 @@ async fn unpin_releases_pinned_blocks() {
 
     harness.save_all().await;
     harness.assert_cache_eventually_all().await;
-    harness.expect_query_prefetch_done_all();
+    harness.expect_query_prefetch_done_all().await;
 
     let unpinned = harness.unpin(harness.block_hashes());
     assert_eq!(unpinned, NUM_BLOCKS, "first unpin should release all pins");

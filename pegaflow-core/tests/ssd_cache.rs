@@ -49,7 +49,7 @@ async fn ssd_smoke_roundtrip_with_temp_dir() {
     wait_for_ssd_nonzero(&cache_path, CACHE_WAIT_TIMEOUT).await;
 
     harness.zero_gpu_and_assert();
-    harness.expect_query_prefetch_done_all();
+    harness.expect_query_prefetch_done_all().await;
     harness.load_all_and_wait().await.expect("batch_load");
     harness.assert_gpu_matches_host();
 }

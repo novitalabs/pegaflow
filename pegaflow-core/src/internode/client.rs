@@ -94,6 +94,7 @@ impl PegaflowClient {
         let request = QueryRequest {
             instance_id: instance_id.to_string(),
             block_hashes,
+            req_id: String::new(),
         };
 
         let response = self
@@ -140,6 +141,7 @@ impl PegaflowClient {
         let request = QueryRequest {
             instance_id: instance_id.to_string(),
             block_hashes,
+            req_id: String::new(),
         };
 
         let response = self
