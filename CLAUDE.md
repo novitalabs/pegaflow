@@ -43,9 +43,11 @@ cargo bench --bench uds_latency
 2. **pegaflow-core** (Rust): Core storage engine
    - `PegaEngine`: Main engine managing GPU workers and KV cache storage
    - `storage/`: Modular block storage engine
-     - `mod.rs`: `StorageEngine` — aggregates allocator, read cache, prefetch, write pipeline, SSD store
+     - `mod.rs`: `StorageEngine` — aggregates allocator, read cache, prefetch, write pipeline, SSD store, remote fetch
      - `read_cache.rs`: Pin/unpin/consume operations on sealed blocks
      - `prefetch.rs`: Per-request SSD prefetch state machine
+     - `remote_fetch.rs`: Per-request cross-node remote fetch state machine (oneshot + backpressure)
+     - `transfer_lock.rs`: Transfer lock manager — prevents LRU eviction during RDMA transfer
      - `write_path.rs`: Async insert worker thread for batched writes
    - `backing/`: SSD backing store
      - `ssd.rs`: `SsdBackingStore` coordinator
@@ -55,7 +57,12 @@ cargo bench --bench uds_latency
    - `transfer.rs`: GPU-CPU transfer operations via CUDA
    - `cache.rs`: LRU cache for blocks
    - `gpu_worker.rs`: Per-GPU worker handling async operations
-   - `internode/`: Cross-node communication — `PegaflowClient` for querying remote nodes, service discovery via metaserver
+   - `internode/`: Cross-node communication
+     - `client.rs`: `PegaflowClient` / `PegaflowClientPool` for querying remote nodes
+     - `metaserver_query.rs`: MetaServer query client for block location discovery
+     - `remote_fetch_worker.rs`: Async RDMA fetch worker (MetaServer → gRPC → RDMA READ → SealedBlock)
+     - `registrar.rs`: Fire-and-forget block hash registration with MetaServer
+     - `service_discovery.rs`: Kubernetes pod watcher for PegaFlow instance discovery
 
 3. **pegaflow-proto** (Rust): Protobuf definitions
    - gRPC service definitions built with prost/tonic
@@ -64,7 +71,7 @@ cargo bench --bench uds_latency
    - `service.rs`: Tonic gRPC service implementation
    - `registry.rs`: Instance/worker registration
    - `http_server.rs`: HTTP health check and Prometheus metrics endpoint
-   - `bin/pegaflow-router.rs`: P/D disaggregation router
+   - `bin/pegaflow-router.rs`: P/D request router (coordinates P/D nodes; PegaFlow itself is a KV store)
 
 5. **pegaflow-metaserver** (Rust): Cross-node block hash registry
    - `service.rs`: gRPC MetaServer service (insert/query block hashes)
@@ -90,8 +97,10 @@ cargo bench --bench uds_latency
 vLLM/SGLang Worker <--gRPC--> PegaEngine Server <--CUDA IPC--> GPU Memory
                                     |
                              Pinned CPU Memory (KV cache storage)
-                                    |
-                             SSD Cache (optional, io_uring)
+                                   / \
+                   SSD Cache (io_uring)  Remote Node (RDMA READ)
+                                              |
+                                        MetaServer (block discovery)
 ```
 
 ### Key Concepts
@@ -137,12 +146,16 @@ vLLM/SGLang Worker <--gRPC--> PegaEngine Server <--CUDA IPC--> GPU Memory
 - `pegaflow-common/src/logging.rs`: Unified log initialization
 - `pegaflow-common/src/numa.rs`: NUMA topology detection and CPU affinity
 - `pegaflow-core/src/lib.rs`: Main PegaEngine implementation
-- `pegaflow-core/src/storage/mod.rs`: StorageEngine (allocator, read cache, prefetch, write pipeline)
+- `pegaflow-core/src/storage/mod.rs`: StorageEngine (allocator, read cache, prefetch, write pipeline, remote fetch)
 - `pegaflow-core/src/storage/read_cache.rs`: Pin/unpin/consume operations
 - `pegaflow-core/src/storage/prefetch.rs`: SSD prefetch state machine
+- `pegaflow-core/src/storage/remote_fetch.rs`: Cross-node remote fetch state machine
+- `pegaflow-core/src/storage/transfer_lock.rs`: Transfer lock manager for RDMA transfers
 - `pegaflow-core/src/storage/write_path.rs`: Async insert worker thread
 - `pegaflow-core/src/backing/ssd.rs`: SSD backing store coordinator
-- `pegaflow-core/src/internode/`: Cross-node client and service discovery
+- `pegaflow-core/src/internode/client.rs`: PegaflowClient/PegaflowClientPool for remote nodes
+- `pegaflow-core/src/internode/metaserver_query.rs`: MetaServer query client
+- `pegaflow-core/src/internode/remote_fetch_worker.rs`: Async RDMA fetch worker
 - `pegaflow-server/src/service.rs`: gRPC service implementation
 - `pegaflow-metaserver/src/lib.rs`: MetaServer entry point and CLI
 - `pegaflow-metaserver/src/service.rs`: MetaServer gRPC service

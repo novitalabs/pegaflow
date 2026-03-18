@@ -191,6 +191,9 @@ pub fn pin_thread_to_numa_node(node: NumaNode) -> Result<(), String> {
         return Err(format!("CPU list is empty for NUMA node {}", node.0));
     }
 
+    // SAFETY: cpu_set_t is a plain C struct safe to zero-initialize. CPU_SET
+    // writes to valid indices. sched_setaffinity(0, ...) targets the calling
+    // thread; the cpu_set is correctly sized.
     unsafe {
         let mut cpu_set: libc::cpu_set_t = mem::zeroed();
 

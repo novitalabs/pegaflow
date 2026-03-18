@@ -273,6 +273,8 @@ fn process_load_task(task: &LoadTask, stream: &CudaStream) -> Result<(), EngineE
                     .map_err(EngineError::Storage)?;
 
                 let k_cpu_ptr = block.layer_block.k_ptr();
+                // SAFETY: For contiguous layout (v_ptr is None), the allocation is
+                // 2 * segment_size bytes, so k_ptr + segment_size is within bounds.
                 let v_cpu_ptr = block
                     .layer_block
                     .v_ptr()
@@ -404,6 +406,8 @@ fn process_save_task(task: &SaveTask, stream: &CudaStream) -> Result<(), EngineE
                     .map_err(EngineError::Storage)?;
                 let v_offset = transfer::segment_offset(registration, block.block_idx, 1)
                     .map_err(EngineError::Storage)?;
+                // SAFETY: For contiguous layout (v_ptr is None), the allocation is
+                // 2 * segment_size bytes, so k_ptr + segment_size is within bounds.
                 let v_ptr = block
                     .v_dst_ptr
                     .unwrap_or_else(|| unsafe { block.k_dst_ptr.add(segment_size) });

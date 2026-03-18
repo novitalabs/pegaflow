@@ -58,8 +58,10 @@ struct IoCtx {
     iovecs: Option<Box<[libc::iovec]>>,
 }
 
+// SAFETY: IoCtx is created on one thread and sent to the io_uring shard thread
+// via mpsc channel. The raw pointers in iovecs reference pinned memory that
+// outlives the I/O operation (guaranteed by the caller).
 unsafe impl Send for IoCtx {}
-unsafe impl Sync for IoCtx {}
 
 struct UringShard {
     rx: mpsc::Receiver<IoCtx>,
@@ -127,13 +129,19 @@ impl UringShard {
 
                 let data = Box::into_raw(Box::new(ctx)) as u64;
                 let sqe = sqe.user_data(data);
-                // Safety: we keep ctx boxed and rely on user_data to free it in completion.
-                unsafe {
-                    self.uring
-                        .submission()
-                        .push(&sqe)
-                        .expect("submission queue full")
-                };
+                // SAFETY: The Box<IoCtx> is leaked via into_raw and recovered in the
+                // completion path via Box::from_raw. The iovec pointers within IoCtx
+                // reference pinned memory guaranteed by the caller to remain valid
+                // until the oneshot completes.
+                let push_result = unsafe { self.uring.submission().push(&sqe) };
+                if push_result.is_err() {
+                    // Recover the leaked IoCtx to avoid memory leak.
+                    let ctx = unsafe { Box::from_raw(data as *mut IoCtx) };
+                    let _ = ctx
+                        .complete
+                        .send(Err(io::Error::other("submission queue full")));
+                    continue;
+                }
                 inflight += 1;
             }
 

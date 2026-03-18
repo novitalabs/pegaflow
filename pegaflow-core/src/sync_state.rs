@@ -227,6 +227,9 @@ fn init_new_mapping(shmem: &Shmem) -> Result<NonNull<LoadStateMem>, LoadStateErr
     }
 
     // Record the offset so attach() can find the aligned region.
+    // SAFETY: The mapping has at least LOAD_STATE_META_SIZE (8) bytes.
+    // write_unaligned is used because the base pointer has no usize alignment
+    // guarantee. No other references to this memory exist (freshly created).
     unsafe {
         (shmem.as_ptr() as *mut usize).write_unaligned(offset);
     }
@@ -251,6 +254,9 @@ fn attach_mapping(shmem: &Shmem) -> Result<NonNull<LoadStateMem>, LoadStateError
     }
 
     let base = shmem.as_ptr() as usize;
+    // SAFETY: The mapping has at least LOAD_STATE_META_SIZE bytes (checked above).
+    // read_unaligned is used because base pointer alignment is not guaranteed.
+    // The returned offset is validated below before use.
     let offset = unsafe { (shmem.as_ptr() as *const usize).read_unaligned() };
 
     if offset < LOAD_STATE_META_SIZE {

@@ -5,7 +5,7 @@
   <p><em>Named after Pegasus, the winged horse of ancient myth — a creature born to cross impossible distances with effortless grace.</em></p>
 </div>
 
-PegaFlow is a **high-performance KV cache offloading solution** for LLM inference engines on single-node multi-GPU setups.
+PegaFlow is a **high-performance KV cache offloading solution** for LLM inference engines, supporting single-node GPU-to-CPU offloading and cross-node sharing via RDMA.
 
 ## What is PegaFlow?
 
@@ -14,7 +14,7 @@ PegaFlow enables efficient KV cache transfer and sharing for LLM inference workl
 - **Single-node KV cache offloading** — offload KV cache to host memory and restore it back to GPU with minimal latency
 - **Full parallelism support** — works with Pipeline Parallel (PP), Tensor Parallel (TP), and Data Parallel (DP)
 - **Layer-wise transfer** — fine-grained, layer-by-layer KV cache operations for optimal memory utilization
-- **P/D disaggregation** — separate prefill and decode phases across GPUs for better resource utilization
+- **Cross-node KV cache sharing** — share cached blocks across nodes via RDMA to avoid recomputation
 - **~9x TTFT improvement** — warm-start requests achieve dramatically lower time-to-first-token compared to cold-start
 
 ## Framework Integration
@@ -65,6 +65,11 @@ pegaflow-server
 - `--max-prefetch-blocks`: Max blocks allowed in prefetching state, backpressure for SSD prefetch (default: `800`)
 - `--metaserver-addr`: MetaServer gRPC address for cross-node block hash registry (e.g., `http://127.0.0.1:50056`). When set, saved block hashes are inserted to the metaserver for cross-node discovery.
 - `--advertise-addr`: Advertised address (ip:port) reported to the metaserver for cross-node discovery. Other nodes use this address to connect to this server. Fallback order: this flag > `PEGAFLOW_HOST_IP` env + bind port > auto-detected IP + bind port.
+- `--enable-remote-fetch`: Enable cross-node remote fetch via RDMA on cache miss (default: `false`). Requires `--metaserver-addr` and `--rdma-nic`.
+- `--rdma-nic`: RDMA NIC name for the transfer engine (e.g., `mlx5_0`). Required when `--enable-remote-fetch` is set.
+- `--rdma-port`: RDMA transfer engine RPC port for session establishment (default: `50057`)
+- `--transfer-lock-timeout-secs`: Transfer lock timeout in seconds for cross-node RDMA transfers (default: `30`)
+- `--max-remote-fetch-blocks`: Max blocks in remote fetch in-flight, backpressure limit (default: `200`)
 
 ### 2b. (Optional) Start MetaServer for Multi-Node
 
@@ -119,7 +124,7 @@ cargo run -p pegaflow-transfer --bin pegaflow_topo_cli
 
 ### Inter-Node RDMA Transfer
 
-PegaFlow Transfer provides RDMA-based inter-node memory transfers for P/D disaggregation with one-sided RDMA READ/WRITE, automatic session management, and NUMA-aware NIC selection. See [pegaflow-transfer/README.md](./pegaflow-transfer/README.md) for architecture, API, CLI tools, and benchmarks.
+PegaFlow Transfer provides RDMA-based inter-node memory transfers for cross-node KV cache sharing with one-sided RDMA READ/WRITE, automatic session management, and NUMA-aware NIC selection. See [pegaflow-transfer/README.md](./pegaflow-transfer/README.md) for architecture, API, CLI tools, and benchmarks.
 
 ## Development
 
@@ -238,9 +243,9 @@ def append_n(self, blocks: list[KVCacheBlock]) -> None:
 
 This simple change can noticeably reduce transfer latency by enabling more efficient memory access patterns during KV cache operations.
 
-## P/D Disaggregation
+## P/D Router
 
-PegaFlow supports Prefill/Decode (P/D) disaggregation, where prefill and decode phases run on separate GPU nodes. A lightweight router coordinates the flow: requests first go to P nodes for prefill (KV cache generation), then to D nodes for decode (token generation).
+PegaFlow includes a lightweight P/D router (`pegaflow-router`) that coordinates Prefill/Decode disaggregation. P and D nodes each run an independent pegaflow-server as a local KV cache store. The router directs requests to P nodes for prefill, then to D nodes for decode — PegaFlow handles KV cache storage on each node, not the inter-node KV transfer.
 
 ### Architecture
 
@@ -269,13 +274,13 @@ Client Request
 | P/D (1P+1D)    | 573.78         | 15.68          | 15.89         | 21.71        |
 | Baseline (DP2) | 438.24         | 22.67          | 24.32         | 142.70       |
 
-P/D disaggregation trades higher TTFT for **significantly more stable decode latency** — TPOT p99 drops from 24.32ms to 15.89ms, and ITL p99 improves dramatically from 142.70ms to 21.71ms.
+The P/D setup trades higher TTFT for **significantly more stable decode latency** — TPOT p99 drops from 24.32ms to 15.89ms, and ITL p99 improves dramatically from 142.70ms to 21.71ms.
 
 ## Goals
 
 1. **A Data Path Purpose-Built for LLM Inference**
 
-   Focus exclusively on the typical data flows in large model inference: data movement between prefill and decode phases, between different compute roles, and high-throughput transport of weights and KV/activations. We only solve this specific class of problems—high-bandwidth, predictable, structured data paths.
+   Focus exclusively on the typical data flows in large model inference: data movement between GPU and CPU, between compute nodes, and high-throughput transport of KV cache blocks. We only solve this specific class of problems—high-bandwidth, predictable, structured data paths.
 
 2. **RDMA-First, High-Performance Implementation**
 

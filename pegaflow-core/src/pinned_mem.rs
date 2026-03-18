@@ -119,6 +119,8 @@ impl std::fmt::Debug for PinnedMemory {
 // - Fixed in physical memory (pinned by CUDA)
 // - Safe to access from any thread
 // The pointer is valid for the lifetime of this struct.
+// Sync is safe because PinnedMemory exposes only an immutable pointer via
+// as_ptr() and has no interior mutability.
 unsafe impl Send for PinnedMemory {}
 unsafe impl Sync for PinnedMemory {}
 
@@ -165,6 +167,7 @@ impl PinnedMemory {
         let (ptr, aligned_size) = match strategy {
             AllocStrategy::Regular => {
                 let mut ptr: *mut libc::c_void = std::ptr::null_mut();
+                // SAFETY: ptr is a valid stack pointer; size is validated non-zero above.
                 let result = unsafe { rt::cudaHostAlloc(&mut ptr, size, 0) };
                 if result != rt::cudaError::cudaSuccess {
                     return Err(PinnedMemError::CudaAllocFailed(result));
@@ -173,6 +176,7 @@ impl PinnedMemory {
             }
             AllocStrategy::WriteCombined => {
                 let mut ptr: *mut libc::c_void = std::ptr::null_mut();
+                // SAFETY: ptr is a valid stack pointer; size is validated non-zero above.
                 let result =
                     unsafe { rt::cudaHostAlloc(&mut ptr, size, rt::cudaHostAllocWriteCombined) };
                 if result != rt::cudaError::cudaSuccess {
@@ -186,7 +190,9 @@ impl PinnedMemory {
                 let aligned = (size + huge_page_size - 1) & !(huge_page_size - 1);
                 let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_HUGETLB;
 
-                // SAFETY: mmap with MAP_ANONYMOUS creates a new anonymous mapping.
+                // SAFETY: All parameters are valid: null hint, aligned non-zero size,
+                // valid protection flags, MAP_ANONYMOUS with fd=-1. Return is checked
+                // against MAP_FAILED before use.
                 let ptr = unsafe {
                     libc::mmap(
                         std::ptr::null_mut(),
@@ -203,6 +209,7 @@ impl PinnedMemory {
                 }
 
                 // Register with CUDA for DMA
+                // SAFETY: ptr is a valid mmap'd region of `aligned` bytes (checked above).
                 let result =
                     unsafe { rt::cudaHostRegister(ptr, aligned, rt::cudaHostRegisterDefault) };
 
