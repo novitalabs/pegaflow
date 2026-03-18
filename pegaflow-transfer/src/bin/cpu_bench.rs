@@ -632,18 +632,12 @@ fn main() {
             server_buf.fill(0xAA);
             client_buf.fill(0xBB);
 
-            let mut server = TransferEngine::new();
-            server
-                .initialize(nic.name.clone())
-                .expect("server init failed");
+            let server = TransferEngine::new(nic.name.clone()).expect("server init failed");
             server
                 .register_memory(&[server_buf.as_u64()], &[buf_per_nic])
                 .expect("server register_memory failed");
 
-            let mut client = TransferEngine::new();
-            client
-                .initialize(nic.name.clone())
-                .expect("client init failed");
+            let client = TransferEngine::new(nic.name.clone()).expect("client init failed");
             client
                 .register_memory(&[client_buf.as_u64()], &[buf_per_nic])
                 .expect("client register_memory failed");

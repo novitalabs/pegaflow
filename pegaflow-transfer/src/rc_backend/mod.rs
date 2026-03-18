@@ -31,7 +31,6 @@ struct RemoteMemoryEntry {
 
 #[derive(Default)]
 struct RcBackendState {
-    runtime: Option<Arc<RcRuntime>>,
     registered: HashMap<u64, RegisteredMemoryEntry>,
     /// Pre-connect sessions in FIFO order (first prepared, first connected).
     pending: VecDeque<Arc<RcSession>>,
@@ -42,40 +41,25 @@ struct RcBackendState {
 }
 
 pub(crate) struct RcBackend {
+    runtime: Arc<RcRuntime>,
     state: Arc<Mutex<RcBackendState>>,
     psn_counter: AtomicU64,
 }
 
-impl Default for RcBackend {
-    fn default() -> Self {
-        Self {
-            state: Arc::new(Mutex::new(RcBackendState::default())),
-            psn_counter: AtomicU64::new(1),
-        }
-    }
-}
-
 impl RcBackend {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    pub(crate) fn initialize(&self, nic_name: &str) -> Result<()> {
+    pub(crate) fn new(nic_name: &str) -> Result<Self> {
         crate::init_logging();
         if nic_name.trim().is_empty() {
             return Err(TransferError::InvalidArgument("nic_name is empty"));
         }
         log::info!("rc backend initialize: nic={}", nic_name);
-
         let runtime = RcRuntime::open(nic_name)?;
-        let mut state = self.state.lock();
-        state.runtime = Some(runtime);
-        state.registered.clear();
-        state.pending.clear();
-        state.sessions.clear();
-        state.remote_memory.clear();
         log::info!("rc backend initialized: nic={}", nic_name);
-        Ok(())
+        Ok(Self {
+            runtime,
+            state: Arc::new(Mutex::new(RcBackendState::default())),
+            psn_counter: AtomicU64::new(1),
+        })
     }
 
     pub(crate) fn register_memory(&self, ptr: u64, len: usize) -> Result<()> {
@@ -86,13 +70,8 @@ impl RcBackend {
             return Err(TransferError::InvalidArgument("len must be non-zero"));
         }
 
-        let mut state = self.state.lock();
-        let runtime = state
-            .runtime
-            .as_ref()
-            .ok_or(TransferError::NotInitialized)?;
         let mr = unsafe {
-            runtime.pd.reg_mr(
+            self.runtime.pd.reg_mr(
                 ptr as usize,
                 len,
                 AccessFlags::LocalWrite | AccessFlags::RemoteWrite | AccessFlags::RemoteRead,
@@ -100,6 +79,7 @@ impl RcBackend {
         }
         .map_err(|error| TransferError::Backend(error.to_string()))?;
 
+        let mut state = self.state.lock();
         state.registered.insert(
             ptr,
             RegisteredMemoryEntry {
@@ -117,10 +97,6 @@ impl RcBackend {
             return Err(TransferError::InvalidArgument("ptr must be non-zero"));
         }
         let mut state = self.state.lock();
-        let _ = state
-            .runtime
-            .as_ref()
-            .ok_or(TransferError::NotInitialized)?;
         let removed = state.registered.remove(&ptr);
         if removed.is_none() {
             return Err(TransferError::MemoryNotRegistered { ptr });
@@ -146,16 +122,9 @@ impl RcBackend {
 
     /// Create an RC QP in INIT state, push it to the pending queue, and return its endpoint.
     pub(crate) fn prepare_handshake(&self) -> Result<RcEndpoint> {
-        let state = self.state.lock();
-        let runtime = state
-            .runtime
-            .as_ref()
-            .ok_or(TransferError::NotInitialized)?;
         let psn_seed = self.psn_counter.fetch_add(1, Ordering::Relaxed);
-        let session = RcSession::create(runtime, psn_seed)?;
+        let session = RcSession::create(&self.runtime, psn_seed)?;
         let endpoint = session.local_endpoint;
-        drop(state);
-
         self.state.lock().pending.push_back(session);
         Ok(endpoint)
     }
@@ -176,14 +145,7 @@ impl RcBackend {
                 "no pending session to accept".to_string(),
             ))?;
 
-        {
-            let state = self.state.lock();
-            let runtime = state
-                .runtime
-                .as_ref()
-                .ok_or(TransferError::NotInitialized)?;
-            session.connect(runtime, remote)?;
-        }
+        session.connect(&self.runtime, remote)?;
 
         let mut state = self.state.lock();
         Self::cache_remote_memory(&mut state, remote.qp_num, remote_memory_regions)?;
@@ -313,14 +275,7 @@ impl RcBackend {
                 "no pending session for lazy connect".to_string(),
             ))?;
 
-        {
-            let state = self.state.lock();
-            let runtime = state
-                .runtime
-                .as_ref()
-                .ok_or(TransferError::NotInitialized)?;
-            session.connect(runtime, remote)?;
-        }
+        session.connect(&self.runtime, remote)?;
 
         let mut state = self.state.lock();
         Self::cache_remote_memory(&mut state, remote.qp_num, remote_memory_regions)?;

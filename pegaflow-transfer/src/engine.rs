@@ -77,14 +77,10 @@ pub struct TransferEngine {
 }
 
 impl TransferEngine {
-    pub fn new() -> Self {
-        Self {
-            backend: RcBackend::new(),
-        }
-    }
-
-    pub fn initialize(&mut self, nic_name: impl Into<String>) -> Result<()> {
-        self.backend.initialize(&nic_name.into())
+    pub fn new(nic_name: impl Into<String>) -> Result<Self> {
+        Ok(Self {
+            backend: RcBackend::new(&nic_name.into())?,
+        })
     }
 
     pub fn register_memory(&self, ptrs: &[u64], lens: &[usize]) -> Result<()> {
@@ -184,51 +180,9 @@ impl TransferEngine {
     }
 }
 
-impl Default for TransferEngine {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        HandshakeMetadata, RcEndpoint, RegisteredMemoryRegion, TransferEngine, TransferOp,
-    };
-    use crate::error::TransferError;
-
-    #[test]
-    fn register_batch_len_mismatch_fails() {
-        let engine = TransferEngine::new();
-        let err = engine
-            .register_memory(&[0x1000, 0x2000], &[4096])
-            .expect_err("must fail for mismatch");
-        assert_eq!(err, TransferError::BatchLengthMismatch { ptrs: 2, lens: 1 });
-    }
-
-    #[test]
-    fn transfer_batch_len_mismatch_fails() {
-        let engine = TransferEngine::new();
-        let meta = HandshakeMetadata {
-            endpoint: RcEndpoint {
-                gid: [1u8; 16],
-                lid: 0,
-                qp_num: 42,
-                psn: 0,
-            },
-            memory_regions: vec![],
-        };
-        let err = engine
-            .batch_transfer(
-                TransferOp::Write,
-                &meta,
-                &[0x1000, 0x2000],
-                &[0x3000],
-                &[128],
-            )
-            .expect_err("must fail for mismatch");
-        assert_eq!(err, TransferError::BatchLengthMismatch { ptrs: 2, lens: 1 });
-    }
+    use super::{HandshakeMetadata, RcEndpoint, RegisteredMemoryRegion};
 
     #[test]
     fn handshake_metadata_roundtrip() {

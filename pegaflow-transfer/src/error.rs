@@ -4,8 +4,6 @@ pub type Result<T> = std::result::Result<T, TransferError>;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TransferError {
-    #[error("transfer engine not initialized")]
-    NotInitialized,
     #[error("invalid argument: {0}")]
     InvalidArgument(&'static str),
     #[error("batch length mismatch: ptrs={ptrs}, lens={lens}")]
