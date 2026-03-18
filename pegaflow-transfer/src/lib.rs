@@ -1,12 +1,11 @@
-mod api;
-mod control_protocol;
-pub(crate) mod domain_address;
 mod engine;
 mod error;
+mod rc_backend;
 pub mod rdma_topo;
-mod sideway_backend;
 
-pub use engine::{HandshakeMetadata, TransferEngine, TransferOp};
+pub use engine::{
+    HandshakeMetadata, RcEndpoint, RegisteredMemoryRegion, TransferEngine, TransferOp,
+};
 pub use error::{Result, TransferError};
 
 pub fn init_logging() {

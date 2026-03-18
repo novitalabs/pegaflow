@@ -1,12 +1,8 @@
-use crate::{
-    api::WorkerConfig,
-    control_protocol::RegisteredMemoryRegion,
-    domain_address::DomainAddress,
-    error::{Result, TransferError},
-    sideway_backend::SidewayBackend,
-};
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
+
+use crate::error::{Result, TransferError};
+use crate::rc_backend::RcBackend;
 
 /// RDMA operation type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15,33 +11,43 @@ pub enum TransferOp {
     Write,
 }
 
+/// RC queue pair endpoint info exchanged during handshake.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RcEndpoint {
+    pub gid: [u8; 16],
+    pub lid: u16,
+    pub qp_num: u32,
+    pub psn: u32,
+}
+
+/// A registered memory region descriptor (base pointer, length, remote key).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisteredMemoryRegion {
+    pub base_ptr: u64,
+    pub len: u64,
+    pub rkey: u32,
+}
+
 /// Opaque handshake metadata exchanged between peers via gRPC.
 ///
-/// Contains everything needed to establish an RDMA connection and perform
-/// transfers: the peer's UD address and its registered memory regions.
-///
-/// Call [`TransferEngine::handshake_metadata`] after registering memory,
-/// serialize with [`to_bytes`](Self::to_bytes), and send to the remote peer.
+/// Contains the RC endpoint and registered memory regions needed to
+/// establish an RDMA connection and perform transfers.
 #[derive(Clone, Debug)]
 pub struct HandshakeMetadata {
-    pub(crate) ud_address: DomainAddress,
+    pub(crate) endpoint: RcEndpoint,
     pub(crate) memory_regions: Vec<RegisteredMemoryRegion>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct WireHandshakeMetadata {
-    ud_address: [u8; DomainAddress::BYTES],
+    endpoint: RcEndpoint,
     memory_regions: Vec<RegisteredMemoryRegion>,
 }
 
 impl HandshakeMetadata {
     pub fn to_bytes(&self) -> Vec<u8> {
         let wire = WireHandshakeMetadata {
-            ud_address: {
-                let mut buf = [0u8; DomainAddress::BYTES];
-                buf.copy_from_slice(&self.ud_address.to_bytes());
-                buf
-            },
+            endpoint: self.endpoint,
             memory_regions: self.memory_regions.clone(),
         };
         bincode::serde::encode_to_vec(&wire, bincode::config::standard())
@@ -59,31 +65,26 @@ impl HandshakeMetadata {
                 "trailing bytes in handshake metadata",
             ));
         }
-        let ud_address = DomainAddress::from_bytes(&wire.ud_address).ok_or(
-            TransferError::InvalidArgument("invalid UD address in handshake metadata"),
-        )?;
         Ok(Self {
-            ud_address,
+            endpoint: wire.endpoint,
             memory_regions: wire.memory_regions,
         })
     }
 }
 
 pub struct TransferEngine {
-    backend: SidewayBackend,
+    backend: RcBackend,
 }
 
 impl TransferEngine {
     pub fn new() -> Self {
         Self {
-            backend: SidewayBackend::new(),
+            backend: RcBackend::new(),
         }
     }
 
     pub fn initialize(&mut self, nic_name: impl Into<String>) -> Result<()> {
-        self.backend.initialize(WorkerConfig {
-            nic_name: nic_name.into(),
-        })
+        self.backend.initialize(&nic_name.into())
     }
 
     pub fn register_memory(&self, ptrs: &[u64], lens: &[usize]) -> Result<()> {
@@ -106,17 +107,34 @@ impl TransferEngine {
         Ok(())
     }
 
-    /// Generate handshake metadata containing this engine's UD address and
-    /// a snapshot of all registered memory regions. Call after `register_memory`.
-    pub fn handshake_metadata(&self) -> HandshakeMetadata {
-        let ud_address = self.backend.session_id();
-        let memory_regions = self.backend.registered_memory_regions();
-        HandshakeMetadata {
-            ud_address,
+    /// Create an RC QP (INIT state) and return handshake metadata containing
+    /// the local endpoint and a snapshot of all registered memory regions.
+    ///
+    /// Call after `register_memory`, serialize with [`HandshakeMetadata::to_bytes`],
+    /// and send to the remote peer.
+    pub fn prepare_handshake(&self) -> Result<HandshakeMetadata> {
+        let endpoint = self.backend.prepare_handshake()?;
+        let memory_regions = self.backend.snapshot_registered_memory();
+        Ok(HandshakeMetadata {
+            endpoint,
             memory_regions,
-        }
+        })
     }
 
+    /// Connect the most recently prepared QP to the remote peer (RTR→RTS).
+    ///
+    /// Called by the **responder** after receiving the initiator's metadata.
+    /// The responder should call [`prepare_handshake`](Self::prepare_handshake) first
+    /// to create its own QP, then `accept_handshake` to immediately connect it.
+    pub fn accept_handshake(&self, remote: &HandshakeMetadata) -> Result<()> {
+        self.backend
+            .accept_handshake(&remote.endpoint, &remote.memory_regions)
+    }
+
+    /// Perform a batch of RDMA READ or WRITE operations against a peer.
+    ///
+    /// On the **initiator** side, the first call lazily connects the QP to the
+    /// peer. Subsequent calls reuse the existing long-lived connection.
     pub fn batch_transfer(
         &self,
         op: TransferOp,
@@ -139,29 +157,27 @@ impl TransferEngine {
         }
 
         let started_at = Instant::now();
-        let transferred = match op {
-            TransferOp::Read => self.backend.batch_transfer_sync_read(
-                &peer.ud_address,
-                local_ptrs,
-                remote_ptrs,
-                lens,
-            )?,
-            TransferOp::Write => self.backend.batch_transfer_sync_write(
-                &peer.ud_address,
-                local_ptrs,
-                remote_ptrs,
-                lens,
-            )?,
-        };
+        let transferred = self.backend.batch_transfer(
+            op,
+            &peer.endpoint,
+            &peer.memory_regions,
+            local_ptrs,
+            remote_ptrs,
+            lens,
+        )?;
         let elapsed = started_at.elapsed();
         let elapsed_secs = elapsed.as_secs_f64();
         if elapsed_secs > 0.0 {
             let gbps = (transferred as f64 * 8.0) / elapsed_secs / 1e9;
-            let gib_per_sec =
-                (transferred as f64) / elapsed_secs / (1024.0 * 1024.0 * 1024.0);
+            let gib_per_sec = (transferred as f64) / elapsed_secs / (1024.0 * 1024.0 * 1024.0);
             log::debug!(
                 "batch_transfer {:?} e2e: bytes={}, chunks={}, elapsed_ms={:.3}, bw_gbps={:.3}, bw_gibps={:.3}",
-                op, transferred, lens.len(), elapsed_secs * 1000.0, gbps, gib_per_sec
+                op,
+                transferred,
+                lens.len(),
+                elapsed_secs * 1000.0,
+                gbps,
+                gib_per_sec
             );
         }
         Ok(transferred)
@@ -176,9 +192,9 @@ impl Default for TransferEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{HandshakeMetadata, TransferEngine, TransferOp};
-    use crate::control_protocol::RegisteredMemoryRegion;
-    use crate::domain_address::DomainAddress;
+    use super::{
+        HandshakeMetadata, RcEndpoint, RegisteredMemoryRegion, TransferEngine, TransferOp,
+    };
     use crate::error::TransferError;
 
     #[test]
@@ -194,7 +210,12 @@ mod tests {
     fn transfer_batch_len_mismatch_fails() {
         let engine = TransferEngine::new();
         let meta = HandshakeMetadata {
-            ud_address: DomainAddress::from_parts([1u8; 16], 2, 3, 4),
+            endpoint: RcEndpoint {
+                gid: [1u8; 16],
+                lid: 0,
+                qp_num: 42,
+                psn: 0,
+            },
             memory_regions: vec![],
         };
         let err = engine
@@ -212,7 +233,12 @@ mod tests {
     #[test]
     fn handshake_metadata_roundtrip() {
         let meta = HandshakeMetadata {
-            ud_address: DomainAddress::from_parts([7u8; 16], 100, 200, 0x1111_1111),
+            endpoint: RcEndpoint {
+                gid: [7u8; 16],
+                lid: 0,
+                qp_num: 200,
+                psn: 0x1111,
+            },
             memory_regions: vec![RegisteredMemoryRegion {
                 base_ptr: 0x1000,
                 len: 0x2000,
@@ -221,7 +247,7 @@ mod tests {
         };
         let bytes = meta.to_bytes();
         let decoded = HandshakeMetadata::from_bytes(&bytes).expect("decode");
-        assert_eq!(decoded.ud_address, meta.ud_address);
+        assert_eq!(decoded.endpoint, meta.endpoint);
         assert_eq!(decoded.memory_regions, meta.memory_regions);
     }
 
