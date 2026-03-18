@@ -2286,6 +2286,7 @@ name = "pegaflow-transfer"
 version = "0.0.16"
 dependencies = [
  "bincode",
+ "clap",
  "libc",
  "log",
  "parking_lot",
