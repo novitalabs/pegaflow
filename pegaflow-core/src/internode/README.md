@@ -138,16 +138,10 @@ The state machine mirrors `prefetch.rs` (SSD prefetch):
 ## Configuration
 
 ```bash
-# Phase 1: Block registration only (write path)
-pegaflow-server \
-  --metaserver-addr http://127.0.0.1:50056 \
-  --advertise-addr 10.0.0.1:50055
-
-# Phase 2: Block registration + cross-node fetch (write + read paths)
+# Block registration + cross-node fetch + RDMA transfer
 pegaflow-server \
   --metaserver-addr http://127.0.0.1:50056 \
   --advertise-addr 10.0.0.1:50055 \
-  --enable-remote-fetch \
   --rdma-nic mlx5_0 \
   --rdma-port 50057 \
   --transfer-lock-timeout-secs 30 \
@@ -155,4 +149,4 @@ pegaflow-server \
 ```
 
 When `--metaserver-addr` is not set, both registration and remote fetch are disabled (`None`)
-with zero overhead. When `--enable-remote-fetch` is not set, only registration is active.
+with zero overhead. When set, `--advertise-addr` and `--rdma-nic` are required.

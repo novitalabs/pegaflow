@@ -143,12 +143,13 @@ pub struct Cli {
     pub nics: Option<Vec<String>>,
 
     /// MetaServer address for cross-node block hash registration (e.g. http://127.0.0.1:50056).
-    /// When set, sealed block hashes are automatically registered with the MetaServer.
-    #[arg(long)]
+    /// When set, enables block registration, cross-node remote fetch, and RDMA transfer.
+    /// Requires --advertise-addr and --rdma-nic to also be set.
+    #[arg(long, requires_all = ["advertise_addr", "rdma_nic"])]
     pub metaserver_addr: Option<String>,
 
     /// Advertise address for this node in MetaServer registrations (e.g. 10.0.0.1:50055).
-    /// Defaults to PEGAFLOW_HOST_IP env + bind port, or the bind address.
+    /// Required when --metaserver-addr is set.
     #[arg(long)]
     pub advertise_addr: Option<String>,
 
@@ -156,13 +157,8 @@ pub struct Cli {
     #[arg(long, default_value_t = pegaflow_core::DEFAULT_METASERVER_QUEUE_DEPTH)]
     pub metaserver_queue_depth: usize,
 
-    /// Enable cross-node remote fetch via RDMA on cache miss.
-    /// Requires --metaserver-addr and --rdma-nic to be set.
-    #[arg(long, default_value_t = false)]
-    pub enable_remote_fetch: bool,
-
     /// RDMA NIC name for the transfer engine (e.g. "mlx5_0").
-    /// Required when --enable-remote-fetch is set.
+    /// Required when --metaserver-addr is set.
     #[arg(long)]
     pub rdma_nic: Option<String>,
 
@@ -332,27 +328,6 @@ fn init_metrics(
     })
 }
 
-fn resolve_advertise_addr(explicit: Option<&str>, bind_addr: &SocketAddr) -> String {
-    if let Some(addr) = explicit {
-        return addr.to_string();
-    }
-
-    if let Ok(host_ip) = std::env::var("PEGAFLOW_HOST_IP") {
-        let addr = format!("{}:{}", host_ip, bind_addr.port());
-        info!("Using PEGAFLOW_HOST_IP for advertise address: {}", addr);
-        return addr;
-    }
-
-    if bind_addr.ip().is_unspecified() {
-        log::warn!(
-            "Advertise address defaults to bind address {}, \
-             which is 0.0.0.0. Consider setting --advertise-addr or PEGAFLOW_HOST_IP.",
-            bind_addr
-        );
-    }
-    bind_addr.to_string()
-}
-
 /// Main entry point for pegaflow-server
 pub fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
@@ -430,6 +405,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         }
     });
 
+    let remote_fetch_enabled = cli.metaserver_addr.is_some();
+
     let storage_config = pegaflow_core::StorageConfig {
         enable_lfu_admission: cli.enable_lfu_admission,
         hint_value_size_bytes: cli.hint_value_size,
@@ -438,12 +415,12 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         rdma_nic_names: cli.nics.clone(),
         enable_numa_affinity: !cli.disable_numa_affinity,
         blockwise_alloc: cli.blockwise_alloc,
-        transfer_lock_timeout: if cli.enable_remote_fetch {
+        transfer_lock_timeout: if remote_fetch_enabled {
             Some(Duration::from_secs(cli.transfer_lock_timeout_secs))
         } else {
             None
         },
-        max_remote_fetch_blocks: if cli.enable_remote_fetch {
+        max_remote_fetch_blocks: if remote_fetch_enabled {
             Some(cli.max_remote_fetch_blocks)
         } else {
             None
@@ -477,7 +454,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     runtime.block_on(async move {
         // Create MetaServer registrar if --metaserver-addr is set
         let metaserver_registrar = cli.metaserver_addr.as_ref().map(|addr| {
-            let advertise = resolve_advertise_addr(cli.advertise_addr.as_deref(), &cli.addr);
+            // Safe to unwrap: clap `requires_all` guarantees advertise_addr is set
+            let advertise = cli.advertise_addr.clone().unwrap();
             info!(
                 "MetaServer registration enabled: metaserver={}, advertise={}, queue_depth={}",
                 addr, advertise, cli.metaserver_queue_depth
@@ -530,7 +508,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         }
 
         // Spawn transfer lock GC task if remote fetch is enabled
-        if cli.enable_remote_fetch {
+        if remote_fetch_enabled {
             let engine = Arc::clone(&engine);
             let shutdown = Arc::clone(&shutdown);
             let lock_timeout_secs = cli.transfer_lock_timeout_secs;

@@ -306,8 +306,7 @@ pub enum RemoteFetchStatus {
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--metaserver-addr` | (none) | MetaServer endpoint. Enables cross-node block registration when set. |
-| `--remote-fetch` | `false` | Enable cross-node block fetching on cache miss |
+| `--metaserver-addr` | (none) | MetaServer endpoint. Enables block registration, cross-node fetch, and RDMA transfer. Requires `--advertise-addr` and `--rdma-nic`. |
 | `--transfer-lock-timeout-secs` | `30` | Auto-release lock timeout for remote block transfers |
 | `--max-remote-fetch-blocks` | `200` | Backpressure limit on concurrent remote fetch blocks |
 
@@ -351,13 +350,13 @@ New metrics for cross-node operations:
 
 ### Phase 2: Cross-Node Fetch (RDMA)
 
-- [ ] `QueryBlocksForTransfer` gRPC endpoint on PegaFlow server
-- [ ] Block locking mechanism with timeout-based auto-release
-- [ ] `ReleaseTransferLock` gRPC endpoint
-- [ ] Remote fetch integration in `StorageEngine` (async state machine, inspired by SSD prefetch pattern)
-- [ ] Local pinned memory allocation for incoming remote blocks
-- [ ] RDMA READ via `pegaflow-transfer` batch API
-- [ ] Insert fetched blocks into `ReadCache`
+- [x] `QueryBlocksForTransfer` gRPC endpoint on PegaFlow server
+- [x] Block locking mechanism with timeout-based auto-release
+- [x] `ReleaseTransferLock` gRPC endpoint
+- [x] Remote fetch integration in `StorageEngine` (async state machine, inspired by SSD prefetch pattern)
+- [x] Local pinned memory allocation for incoming remote blocks
+- [x] RDMA READ via `pegaflow-transfer` batch API
+- [x] Insert fetched blocks into `ReadCache`
 
 ### Phase 3: Production Hardening
 

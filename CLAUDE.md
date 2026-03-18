@@ -133,7 +133,6 @@ vLLM/SGLang Worker <--gRPC--> PegaEngine Server <--CUDA IPC--> GPU Memory
 
 - `PEGAFLOW_ENGINE_ENDPOINT`: gRPC endpoint (default: `127.0.0.1:50055`)
 - `PEGAFLOW_INSTANCE_ID`: Override instance ID
-- `PEGAFLOW_HOST_IP`: Host IP used for metaserver advertise address (fallback when `--advertise-addr` is not set)
 - `RUST_LOG`: Control Rust logging (e.g., `info,pegaflow_core=debug,pegaflow_server=debug`)
 
 ### Git commit message format

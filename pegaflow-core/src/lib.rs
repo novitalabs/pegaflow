@@ -188,7 +188,7 @@ impl PegaEngine {
             config,
             &numa_nodes,
             metaserver_registrar,
-            None, // remote_fetch_fn: wired by server when --enable-remote-fetch is set
+            None, // remote_fetch_fn: wired by server when --metaserver-addr is set
         );
 
         PegaEngine {
