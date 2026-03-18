@@ -1,5 +1,7 @@
 mod prefetch;
 mod read_cache;
+pub(crate) mod remote_fetch;
+pub(crate) mod transfer_lock;
 mod write_path;
 
 use bytesize::ByteSize;
@@ -7,6 +9,7 @@ use log::{debug, info};
 use std::collections::HashSet;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use crate::backing::{
     AllocateFn, DEFAULT_MAX_PREFETCH_BLOCKS, RdmaTransport, SsdBackingStore, SsdCacheConfig,
@@ -39,6 +42,10 @@ pub struct StorageConfig {
     /// Allocate each block separately instead of contiguous batch allocation.
     /// Reduces fragmentation when blocks are freed in different order.
     pub blockwise_alloc: bool,
+    /// Transfer lock timeout for cross-node RDMA transfers (None = disabled).
+    pub transfer_lock_timeout: Option<Duration>,
+    /// Max blocks allowed in remote fetch state (backpressure). None = disabled.
+    pub max_remote_fetch_blocks: Option<usize>,
 }
 
 impl Default for StorageConfig {
@@ -51,6 +58,8 @@ impl Default for StorageConfig {
             rdma_nic_names: None,
             enable_numa_affinity: true,
             blockwise_alloc: false,
+            transfer_lock_timeout: None,
+            max_remote_fetch_blocks: None,
         }
     }
 }
@@ -65,6 +74,8 @@ pub(crate) struct StorageEngine {
     _rdma_transport: Option<Arc<RdmaTransport>>,
     blockwise_alloc: bool,
     metaserver_registrar: Option<Arc<MetaServerRegistrar>>,
+    transfer_lock: Option<Arc<transfer_lock::TransferLockManager>>,
+    remote_fetch: Option<remote_fetch::RemoteFetchScheduler>,
 }
 
 impl StorageEngine {
@@ -74,6 +85,7 @@ impl StorageEngine {
         config: StorageConfig,
         numa_nodes: &[NumaNode],
         metaserver_registrar: Option<Arc<MetaServerRegistrar>>,
+        remote_fetch_fn: Option<remote_fetch::RemoteFetchFn>,
     ) -> Arc<Self> {
         let value_size_hint = config.hint_value_size_bytes.filter(|size| *size > 0);
         let unit_hint = value_size_hint.and_then(|size| NonZeroU64::new(size as u64));
@@ -81,6 +93,8 @@ impl StorageEngine {
         let ssd_cache_config = config.ssd_cache_config;
         let rdma_nic_names = config.rdma_nic_names;
         let blockwise_alloc = config.blockwise_alloc;
+        let transfer_lock_timeout = config.transfer_lock_timeout;
+        let max_remote_fetch_blocks = config.max_remote_fetch_blocks;
 
         if blockwise_alloc {
             info!("Blockwise allocation enabled for batch_save");
@@ -143,6 +157,16 @@ impl StorageEngine {
 
             let prefetch = PrefetchScheduler::new(ssd_store.clone(), max_prefetch_blocks);
 
+            let transfer_lock =
+                transfer_lock_timeout.map(|t| Arc::new(transfer_lock::TransferLockManager::new(t)));
+
+            let remote_fetch =
+                remote_fetch_fn
+                    .zip(max_remote_fetch_blocks)
+                    .map(|(fetch_fn, max_blocks)| {
+                        remote_fetch::RemoteFetchScheduler::new(max_blocks, fetch_fn)
+                    });
+
             Self {
                 allocator,
                 read_cache: read_cache.clone(),
@@ -152,6 +176,8 @@ impl StorageEngine {
                 _rdma_transport: rdma_transport,
                 blockwise_alloc,
                 metaserver_registrar,
+                transfer_lock,
+                remote_fetch,
             }
         });
 
@@ -372,6 +398,85 @@ impl StorageEngine {
     pub(crate) async fn gc_stale_inflight(&self, max_age: std::time::Duration) -> usize {
         self.write_pipeline.gc_stale_inflight(max_age).await
     }
+
+    // ---- Cross-node transfer: serving side ----
+
+    /// Look up specific blocks by key (non-prefix). For cross-node transfer.
+    pub(crate) fn get_blocks_for_transfer(
+        &self,
+        keys: &[BlockKey],
+    ) -> Vec<(BlockKey, Arc<SealedBlock>)> {
+        self.read_cache.get_blocks(keys)
+    }
+
+    /// Lock blocks for a transfer session, returning the session ID.
+    /// Returns an empty string if transfer locks are disabled.
+    pub(crate) fn lock_blocks_for_transfer(
+        &self,
+        requester_id: &str,
+        blocks: Vec<(BlockKey, Arc<SealedBlock>)>,
+    ) -> String {
+        if let Some(lock_mgr) = &self.transfer_lock {
+            lock_mgr.lock_blocks(requester_id, blocks)
+        } else {
+            String::new()
+        }
+    }
+
+    /// Release a transfer lock session. Returns the number of blocks released.
+    pub(crate) fn release_transfer_lock(&self, session_id: &str) -> usize {
+        if let Some(lock_mgr) = &self.transfer_lock {
+            lock_mgr.release(session_id)
+        } else {
+            0
+        }
+    }
+
+    /// GC expired transfer lock sessions. Returns the number of sessions expired.
+    pub(crate) fn gc_expired_transfer_locks(&self) -> usize {
+        if let Some(lock_mgr) = &self.transfer_lock {
+            lock_mgr.gc_expired()
+        } else {
+            0
+        }
+    }
+
+    /// Return `(base_ptr, size)` for each contiguous pinned memory region.
+    /// Used for RDMA memory registration.
+    pub(crate) fn pinned_memory_regions(&self) -> Vec<(u64, usize)> {
+        self.allocator
+            .memory_regions()
+            .into_iter()
+            .map(|(ptr, len)| (ptr.as_ptr() as u64, len))
+            .collect()
+    }
+
+    // ---- Cross-node transfer: requesting side ----
+
+    /// Check prefix and initiate remote fetch for missing blocks.
+    /// Falls back to memory-only check if remote fetch is disabled.
+    pub(crate) fn check_prefix_and_remote_fetch(
+        &self,
+        instance_id: &str,
+        req_id: &str,
+        namespace: &str,
+        hashes: &[Vec<u8>],
+        num_workers: usize,
+    ) -> remote_fetch::RemoteFetchStatus {
+        let Some(remote_fetch) = &self.remote_fetch else {
+            let (hit, missing) = self.check_prefix_memory_only(namespace, hashes);
+            return remote_fetch::RemoteFetchStatus::Done { hit, missing };
+        };
+
+        remote_fetch.check_and_fetch(
+            &self.read_cache,
+            instance_id,
+            req_id,
+            namespace,
+            hashes,
+            num_workers,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -392,7 +497,7 @@ mod tests {
     use super::*;
 
     fn make_engine() -> Arc<StorageEngine> {
-        StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[], None)
+        StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[], None, None)
     }
 
     #[tokio::test]
@@ -457,7 +562,7 @@ mod tests {
         // With a tiny pool, allocation of a huge block should fail fast
         // (not loop forever) thanks to MAX_RECLAIM_ROUNDS.
         let storage =
-            StorageEngine::new_with_config(4096, false, StorageConfig::default(), &[], None);
+            StorageEngine::new_with_config(4096, false, StorageConfig::default(), &[], None, None);
 
         // Try to allocate more than the entire pool
         let result = storage.allocate(NonZeroU64::new(1 << 30).unwrap(), None);
@@ -557,5 +662,117 @@ mod tests {
         let (hit, miss) = storage.check_prefix_memory_only("ns", &[vec![3], vec![1]]);
         assert_eq!(hit, 0);
         assert_eq!(miss, 2);
+    }
+
+    // ---- Cross-node transfer serving-side tests ----
+
+    #[tokio::test]
+    async fn get_blocks_for_transfer_returns_correct_blocks() {
+        let storage = make_engine();
+        let key1 = BlockKey::new("ns".into(), vec![1]);
+        let key2 = BlockKey::new("ns".into(), vec![2]);
+        let key3 = BlockKey::new("ns".into(), vec![3]);
+        let block = Arc::new(SealedBlock::from_slots(Vec::new()));
+
+        storage.test_insert_cache(key1.clone(), block.clone());
+        storage.test_insert_cache(key3.clone(), block.clone());
+
+        // Request keys 1, 2, 3 — only 1 and 3 are present (non-prefix semantics)
+        let result = storage.get_blocks_for_transfer(&[key1.clone(), key2, key3.clone()]);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0, key1);
+        assert_eq!(result[1].0, key3);
+    }
+
+    #[tokio::test]
+    async fn get_blocks_for_transfer_empty_keys() {
+        let storage = make_engine();
+        let result = storage.get_blocks_for_transfer(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lock_blocks_for_transfer_returns_empty_when_disabled() {
+        // Default config has transfer_lock_timeout = None (disabled)
+        let storage = make_engine();
+        let key = BlockKey::new("ns".into(), vec![1]);
+        let block = Arc::new(SealedBlock::from_slots(Vec::new()));
+
+        let session_id = storage.lock_blocks_for_transfer("node-a", vec![(key, block)]);
+        assert!(
+            session_id.is_empty(),
+            "lock_blocks_for_transfer should return empty string when disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_transfer_lock_returns_zero_when_disabled() {
+        let storage = make_engine();
+        let released = storage.release_transfer_lock("some-session-id");
+        assert_eq!(released, 0);
+    }
+
+    #[tokio::test]
+    async fn gc_expired_transfer_locks_returns_zero_when_disabled() {
+        let storage = make_engine();
+        let expired = storage.gc_expired_transfer_locks();
+        assert_eq!(expired, 0);
+    }
+
+    #[tokio::test]
+    async fn pinned_memory_regions_returns_non_empty() {
+        let storage = make_engine();
+        let regions = storage.pinned_memory_regions();
+        // With a 1 MiB pool, there should be at least one region
+        assert!(
+            !regions.is_empty(),
+            "pinned_memory_regions should return at least one region"
+        );
+        // Each region should have a non-zero size
+        for (_ptr, size) in &regions {
+            assert!(*size > 0, "region size should be non-zero");
+        }
+    }
+
+    fn make_engine_with_transfer_lock() -> Arc<StorageEngine> {
+        let config = StorageConfig {
+            transfer_lock_timeout: Some(Duration::from_secs(30)),
+            ..StorageConfig::default()
+        };
+        StorageEngine::new_with_config(1 << 20, false, config, &[], None, None)
+    }
+
+    #[tokio::test]
+    async fn lock_and_release_transfer_when_enabled() {
+        let storage = make_engine_with_transfer_lock();
+        let key = BlockKey::new("ns".into(), vec![1]);
+        let block = Arc::new(SealedBlock::from_slots(Vec::new()));
+
+        storage.test_insert_cache(key.clone(), block.clone());
+
+        let session_id = storage.lock_blocks_for_transfer("node-a", vec![(key, block)]);
+        assert!(
+            !session_id.is_empty(),
+            "lock_blocks_for_transfer should return a UUID when enabled"
+        );
+
+        let released = storage.release_transfer_lock(&session_id);
+        assert_eq!(released, 1);
+    }
+
+    #[tokio::test]
+    async fn check_prefix_and_remote_fetch_falls_back_when_disabled() {
+        // Default config has remote_fetch disabled (max_remote_fetch_blocks = None)
+        let storage = make_engine();
+        let block = Arc::new(SealedBlock::from_slots(Vec::new()));
+        storage.test_insert_cache(BlockKey::new("ns".into(), vec![1]), block);
+
+        let status =
+            storage.check_prefix_and_remote_fetch("inst", "req1", "ns", &[vec![1], vec![2]], 1);
+        // Prefix scan: hit=1 (block [1]), miss=1 (block [2])
+        assert!(matches!(
+            status,
+            remote_fetch::RemoteFetchStatus::Done { hit: 1, missing: 1 }
+        ));
     }
 }

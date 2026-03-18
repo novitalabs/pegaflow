@@ -56,6 +56,8 @@ async fn save_query_load_roundtrip_with_numa_affinity_enabled() {
                 rdma_nic_names: None,
                 enable_numa_affinity: true,
                 blockwise_alloc: false,
+                transfer_lock_timeout: None,
+                max_remote_fetch_blocks: None,
             }),
     );
 

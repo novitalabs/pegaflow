@@ -155,6 +155,29 @@ pub struct Cli {
     /// MetaServer registration queue depth (max pending registration batches).
     #[arg(long, default_value_t = pegaflow_core::DEFAULT_METASERVER_QUEUE_DEPTH)]
     pub metaserver_queue_depth: usize,
+
+    /// Enable cross-node remote fetch via RDMA on cache miss.
+    /// Requires --metaserver-addr and --rdma-nic to be set.
+    #[arg(long, default_value_t = false)]
+    pub enable_remote_fetch: bool,
+
+    /// RDMA NIC name for the transfer engine (e.g. "mlx5_0").
+    /// Required when --enable-remote-fetch is set.
+    #[arg(long)]
+    pub rdma_nic: Option<String>,
+
+    /// RDMA transfer engine RPC port for session establishment.
+    #[arg(long, default_value_t = 50057)]
+    pub rdma_port: u16,
+
+    /// Transfer lock timeout in seconds. Blocks locked for RDMA transfer
+    /// are auto-released after this duration.
+    #[arg(long, default_value_t = 30)]
+    pub transfer_lock_timeout_secs: u64,
+
+    /// Max blocks in remote fetch in-flight (backpressure limit).
+    #[arg(long, default_value_t = 200)]
+    pub max_remote_fetch_blocks: usize,
 }
 
 fn parse_sample_rate(s: &str) -> Result<f64, String> {
@@ -415,6 +438,16 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         rdma_nic_names: cli.nics.clone(),
         enable_numa_affinity: !cli.disable_numa_affinity,
         blockwise_alloc: cli.blockwise_alloc,
+        transfer_lock_timeout: if cli.enable_remote_fetch {
+            Some(Duration::from_secs(cli.transfer_lock_timeout_secs))
+        } else {
+            None
+        },
+        max_remote_fetch_blocks: if cli.enable_remote_fetch {
+            Some(cli.max_remote_fetch_blocks)
+        } else {
+            None
+        },
     };
 
     if cli.enable_lfu_admission {
@@ -494,6 +527,39 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 }
             });
             info!("Inflight GC task started (interval=5m, max_age=60m)");
+        }
+
+        // Spawn transfer lock GC task if remote fetch is enabled
+        if cli.enable_remote_fetch {
+            let engine = Arc::clone(&engine);
+            let shutdown = Arc::clone(&shutdown);
+            let lock_timeout_secs = cli.transfer_lock_timeout_secs;
+            tokio::spawn(async move {
+                // GC interval is half the lock timeout (check frequently enough to expire promptly)
+                let gc_interval = Duration::from_secs((lock_timeout_secs / 2).max(5));
+                let mut interval = tokio::time::interval(gc_interval);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            let expired = engine.gc_expired_transfer_locks();
+                            if expired > 0 {
+                                info!("Transfer lock GC: expired {} sessions", expired);
+                            }
+                        }
+                        _ = shutdown.notified() => {
+                            info!("Transfer lock GC task shutting down");
+                            break;
+                        }
+                    }
+                }
+            });
+            info!(
+                "Transfer lock GC task started (interval={}s, timeout={}s)",
+                (lock_timeout_secs / 2).max(5),
+                lock_timeout_secs
+            );
         }
 
         // Start HTTP server for health check (always enabled)

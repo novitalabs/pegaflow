@@ -54,6 +54,22 @@ pub(crate) struct CoreMetrics {
     pub metaserver_registration_blocks: Counter<u64>,
     pub metaserver_registration_failures: Counter<u64>,
     pub metaserver_registration_queue_full: Counter<u64>,
+
+    // Cross-node remote fetch (requesting side)
+    pub remote_fetch_requests_total: Counter<u64>,
+    pub remote_fetch_blocks_hit: Counter<u64>,
+    pub remote_fetch_blocks_missed: Counter<u64>,
+    pub remote_fetch_latency_seconds: Histogram<f64>,
+    pub remote_fetch_rdma_bytes: Counter<u64>,
+    pub remote_fetch_backpressure_blocks: Counter<u64>,
+
+    // Cross-node transfer lock (serving side)
+    pub transfer_lock_active: UpDownCounter<i64>,
+    pub transfer_lock_timeouts_total: Counter<u64>,
+
+    // MetaServer query (requesting side)
+    pub metaserver_query_latency_seconds: Histogram<f64>,
+    pub metaserver_query_failures: Counter<u64>,
 }
 
 fn init_meter() -> Meter {
@@ -260,6 +276,57 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
             metaserver_registration_queue_full: meter
                 .u64_counter("pegaflow_metaserver_registration_queue_full")
                 .with_description("Block hashes dropped due to full registration queue")
+                .build(),
+
+            // Cross-node remote fetch
+            remote_fetch_requests_total: meter
+                .u64_counter("pegaflow_remote_fetch_requests_total")
+                .with_description("Total cross-node remote fetch attempts")
+                .build(),
+            remote_fetch_blocks_hit: meter
+                .u64_counter("pegaflow_remote_fetch_blocks_hit")
+                .with_description("Blocks successfully fetched from remote nodes via RDMA")
+                .build(),
+            remote_fetch_blocks_missed: meter
+                .u64_counter("pegaflow_remote_fetch_blocks_missed")
+                .with_description("Blocks not found on remote nodes (stale MetaServer entry)")
+                .build(),
+            remote_fetch_latency_seconds: meter
+                .f64_histogram("pegaflow_remote_fetch_latency")
+                .with_unit("s")
+                .with_description("End-to-end latency of cross-node fetch (MetaServer query + RDMA)")
+                .with_boundaries(duration_seconds_boundaries())
+                .build(),
+            remote_fetch_rdma_bytes: meter
+                .u64_counter("pegaflow_remote_fetch_rdma_bytes")
+                .with_unit("bytes")
+                .with_description("Bytes transferred via RDMA READ from remote nodes")
+                .build(),
+            remote_fetch_backpressure_blocks: meter
+                .u64_counter("pegaflow_remote_fetch_backpressure_blocks")
+                .with_description("Blocks skipped due to remote fetch backpressure limit")
+                .build(),
+
+            // Transfer lock
+            transfer_lock_active: meter
+                .i64_up_down_counter("pegaflow_transfer_lock_active")
+                .with_description("Currently locked blocks for cross-node RDMA transfer")
+                .build(),
+            transfer_lock_timeouts_total: meter
+                .u64_counter("pegaflow_transfer_lock_timeouts_total")
+                .with_description("Transfer lock sessions expired by timeout (potential issue)")
+                .build(),
+
+            // MetaServer query
+            metaserver_query_latency_seconds: meter
+                .f64_histogram("pegaflow_metaserver_query_latency")
+                .with_unit("s")
+                .with_description("MetaServer block hash query latency")
+                .with_boundaries(duration_seconds_boundaries())
+                .build(),
+            metaserver_query_failures: meter
+                .u64_counter("pegaflow_metaserver_query_failures")
+                .with_description("MetaServer query RPC failures")
                 .build(),
         }
     })

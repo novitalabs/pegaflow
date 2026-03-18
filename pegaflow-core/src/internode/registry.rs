@@ -28,7 +28,7 @@ impl InstanceRegistry {
     /// Get the global instance registry.
     fn global() -> &'static Self {
         static REGISTRY: std::sync::OnceLock<InstanceRegistry> = std::sync::OnceLock::new();
-        REGISTRY.get_or_init(InstanceRegistry::new)
+        REGISTRY.get_or_init(Self::new)
     }
 
     /// Insert or update an instance.

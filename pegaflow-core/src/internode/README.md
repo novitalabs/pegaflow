@@ -6,12 +6,14 @@ This module handles all inter-node communication for PegaFlow's multi-node KV ca
 
 ```
 internode/
-├── mod.rs               Module root + re-exports
-├── types.rs             Shared types: configs, errors, PegaflowInstance
-├── registry.rs          InstanceRegistry — thread-safe store of discovered nodes
-├── service_discovery.rs K8s pod watcher (label: novita.ai/pegaflow=app)
-├── client.rs            gRPC client → remote pegaflow-server (Engine service)
-└── registrar.rs         Fire-and-forget registrar → pegaflow-metaserver (Meta service)
+├── mod.rs                 Module root + re-exports
+├── types.rs               Shared types: configs, errors, PegaflowInstance
+├── registry.rs            InstanceRegistry — thread-safe store of discovered nodes
+├── service_discovery.rs   K8s pod watcher (label: novita.ai/pegaflow=app)
+├── client.rs              gRPC client → remote pegaflow-server (Engine service)
+├── registrar.rs           Fire-and-forget registrar → pegaflow-metaserver (Meta service)
+├── metaserver_query.rs    gRPC query client → pegaflow-metaserver (block location discovery)
+└── remote_fetch_worker.rs Async RDMA fetch worker (MetaServer → gRPC → RDMA READ → SealedBlock)
 ```
 
 ## Data Flow
@@ -21,31 +23,80 @@ internode/
   service_discovery ──► │   registry   │  K8s watches pods, populates registry
                         └──────┬───────┘
                                │
-           ┌───────────────────┴───────────────────┐
-           ▼                                       ▼
-    ┌─────────────┐                        ┌──────────────┐
-    │  client.rs  │  READ path             │ registrar.rs │  WRITE path
-    │             │  "do you have          │              │  "I just sealed
-    │  Query /    │   these blocks?"       │  Insert      │   these blocks"
-    │  Health     │                        │  BlockHashes │
-    └──────┬──────┘                        └──────┬───────┘
-           │                                      │
-           ▼                                      ▼
-    Remote pegaflow-server              Central pegaflow-metaserver
-    (per-node Engine gRPC)              (shared Meta gRPC)
+       ┌───────────────────────┼───────────────────────┐
+       ▼                       ▼                        ▼
+┌─────────────┐    ┌───────────────────┐       ┌──────────────┐
+│  client.rs  │    │ remote_fetch_     │       │ registrar.rs │  WRITE path
+│             │    │ worker.rs         │       │              │  "I just sealed
+│  Query /    │    │                   │       │  Insert      │   these blocks"
+│  Transfer / │    │  Cross-node RDMA  │       │  BlockHashes │
+│  Health     │    │  fetch pipeline   │       └──────┬───────┘
+└──────┬──────┘    └────────┬──────────┘              │
+       │                    │                         ▼
+       │           ┌────────┼────────┐     Central pegaflow-metaserver
+       │           ▼        ▼        ▼     (shared Meta gRPC)
+       │    MetaServer   gRPC     RDMA
+       │    query        lock     READ
+       ▼
+Remote pegaflow-server
+(per-node Engine gRPC)
 ```
 
-## client.rs vs registrar.rs
+## Module Responsibilities
 
-|                  | client.rs                          | registrar.rs                        |
-|------------------|------------------------------------|-------------------------------------|
-| Talks to         | Remote **pegaflow-server**         | Central **pegaflow-metaserver**     |
-| RPC service      | `Engine` (Query, Health)           | `MetaServer` (InsertBlockHashes)    |
-| Direction        | Read path — query remote cache     | Write path — register sealed blocks |
-| Call pattern     | Request-response (caller awaits)   | Fire-and-forget (`try_send`)        |
-| Connection mgmt  | Pool of connections (multi-node)   | Single lazy connection              |
-| Failure mode     | Returns error to caller            | Log + metric, drop on queue full    |
-| Used by          | P/D router, cross-node queries     | Write pipeline (after block seal)   |
+### client.rs — Remote Engine Client
+
+|                  | Details |
+|------------------|---------|
+| Talks to         | Remote **pegaflow-server** |
+| RPC service      | `Engine` (Query, QueryBlocksForTransfer, ReleaseTransferLock, Health) |
+| Direction        | Read path — query remote cache, transfer block RDMA metadata |
+| Call pattern     | Request-response (caller awaits) |
+| Connection mgmt  | `PegaflowClientPool` — DashMap cache keyed by endpoint URL |
+| Failure mode     | Returns error to caller |
+| Used by          | Cross-node queries, remote fetch worker |
+
+### registrar.rs — Block Hash Registration (Write Path)
+
+|                  | Details |
+|------------------|---------|
+| Talks to         | Central **pegaflow-metaserver** |
+| RPC service      | `MetaServer` (InsertBlockHashes) |
+| Direction        | Write path — register sealed blocks for cross-node discovery |
+| Call pattern     | Fire-and-forget (`try_send` to mpsc channel) |
+| Connection mgmt  | Single lazy gRPC connection with auto-reconnect |
+| Failure mode     | Log + metric, drop on queue full |
+| Used by          | Write pipeline (after block seal) |
+
+### metaserver_query.rs — Block Location Discovery (Read Path)
+
+|                  | Details |
+|------------------|---------|
+| Talks to         | Central **pegaflow-metaserver** |
+| RPC service      | `MetaServer` (QueryBlockHashes) |
+| Direction        | Read path — discover which node holds specific blocks |
+| Call pattern     | Request-response (caller awaits) |
+| Connection mgmt  | Single gRPC connection created at startup |
+| Failure mode     | Returns error, caller skips remote fetch |
+| Used by          | `remote_fetch_worker.rs` |
+
+### remote_fetch_worker.rs — Async RDMA Fetch Worker
+
+Orchestrates the full cross-node block fetch pipeline as a tokio task:
+
+```
+1. Query MetaServer → which nodes hold the missing blocks
+2. For each remote node:
+   a. gRPC: QueryBlocksForTransfer → lock blocks + get RDMA metadata
+   b. Allocate local pinned memory
+   c. RDMA READ: pull block data from remote pinned memory
+   d. Build SealedBlock from received data
+   e. gRPC: ReleaseTransferLock
+3. Send result via oneshot channel → ReadCache batch_insert
+```
+
+Uses closure-based RDMA abstraction (`RdmaBatchReadFn`, `RdmaRegisterMemoryFn`) to decouple
+`pegaflow-core` from `pegaflow-transfer`.
 
 ## How registrar.rs Integrates
 
@@ -62,17 +113,46 @@ insert_worker_loop (sync thread)
 Both use the same pattern: `tokio::sync::mpsc::try_send()` from the sync insert thread,
 with an async tokio task draining the channel on the other end.
 
-## Configuration
+## How remote_fetch_worker.rs Integrates
 
-The registrar is enabled via CLI flags on `pegaflow-server`:
+The remote fetch plugs into the **read path** via `RemoteFetchScheduler`:
 
-```bash
-pegaflow-server \
-  --addr 0.0.0.0:50055 \
-  --pool-size 30gb \
-  --metaserver-addr http://127.0.0.1:50056 \
-  --advertise-addr 10.0.0.1:50055
+```
+StorageEngine::check_prefix_and_remote_fetch()
+  └─► RemoteFetchScheduler::check_and_fetch()
+        ├─► Poll existing fetch (oneshot try_recv)
+        ├─► Prefix scan ReadCache
+        └─► Dispatch: RemoteFetchFn(missing_keys, oneshot_tx)
+              └─► tokio::spawn(execute_remote_fetch(...))
+                    ├─► MetaServerQueryClient::query_block_hashes()
+                    ├─► PegaflowClient::query_blocks_for_transfer()
+                    ├─► RDMA READ via RdmaBatchReadFn
+                    └─► oneshot_tx.send(fetched_blocks)
 ```
 
-When `--metaserver-addr` is not set, registration is disabled (`None`) and the write path
-skips the registration step with zero overhead.
+The state machine mirrors `prefetch.rs` (SSD prefetch):
+- Per-request tracking via `HashMap<req_id, RemoteFetchEntry>`
+- Non-blocking polling with `oneshot::try_recv()`
+- Backpressure via `max_remote_fetch_blocks` config
+
+## Configuration
+
+```bash
+# Phase 1: Block registration only (write path)
+pegaflow-server \
+  --metaserver-addr http://127.0.0.1:50056 \
+  --advertise-addr 10.0.0.1:50055
+
+# Phase 2: Block registration + cross-node fetch (write + read paths)
+pegaflow-server \
+  --metaserver-addr http://127.0.0.1:50056 \
+  --advertise-addr 10.0.0.1:50055 \
+  --enable-remote-fetch \
+  --rdma-nic mlx5_0 \
+  --rdma-port 50057 \
+  --transfer-lock-timeout-secs 30 \
+  --max-remote-fetch-blocks 200
+```
+
+When `--metaserver-addr` is not set, both registration and remote fetch are disabled (`None`)
+with zero overhead. When `--enable-remote-fetch` is not set, only registration is active.

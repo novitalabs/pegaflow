@@ -487,7 +487,12 @@ impl PinnedAllocator {
     }
 }
 
-// SAFETY: PinnedAllocator owns Arc<PinnedMemoryPool> or NumaAwarePinnedPools,
-// both of which are Send + Sync.
-unsafe impl Send for PinnedAllocator {}
-unsafe impl Sync for PinnedAllocator {}
+// PinnedAllocator is Send + Sync because all variants contain Arc<PinnedMemoryPool>
+// which is Send + Sync. Using a static assertion instead of manual unsafe impls
+// so the compiler catches regressions if non-Send fields are added.
+const _: () = {
+    fn _assert_send_sync<T: Send + Sync>() {}
+    fn _check() {
+        _assert_send_sync::<PinnedAllocator>();
+    }
+};

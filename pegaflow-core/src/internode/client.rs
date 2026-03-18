@@ -7,7 +7,10 @@
 use std::sync::Arc;
 
 use log::debug;
-use pegaflow_proto::proto::engine::{QueryRequest, engine_client::EngineClient};
+use pegaflow_proto::proto::engine::{
+    QueryBlocksForTransferRequest, QueryBlocksForTransferResponse, QueryRequest,
+    ReleaseTransferLockRequest, engine_client::EngineClient,
+};
 use tonic::transport::{Channel, Endpoint};
 
 use super::registry::InstanceRegistry;
@@ -47,7 +50,7 @@ impl PegaflowClient {
 
         let client = EngineClient::new(channel);
 
-        debug!("Connected to PegaFlow instance at {}", endpoint);
+        debug!("Connected to PegaFlow instance at {endpoint}");
 
         Ok(Self {
             endpoint: endpoint.to_string(),
@@ -157,16 +160,12 @@ impl PegaflowClient {
             .ok_or_else(|| ClientError::ResponseError("missing status in response".to_string()))?;
 
         let prefetch_status = match resp.prefetch_state {
-            // PrefetchDone = 0
-            0 => QueryPrefetchStatus::Done {
-                hit_blocks: resp.hit_blocks as usize,
-                missing_blocks: resp.missing_blocks as usize,
-            },
             // PrefetchLoading = 1
             1 => QueryPrefetchStatus::Loading {
                 hit_blocks: resp.hit_blocks as usize,
                 loading_blocks: resp.loading_blocks as usize,
             },
+            // PrefetchDone = 0, and any unknown state
             _ => QueryPrefetchStatus::Done {
                 hit_blocks: resp.hit_blocks as usize,
                 missing_blocks: resp.missing_blocks as usize,
@@ -178,6 +177,47 @@ impl PegaflowClient {
             message: status.message,
             status: prefetch_status,
         })
+    }
+
+    /// Query block RDMA metadata for cross-node transfer.
+    pub(crate) async fn query_blocks_for_transfer(
+        &self,
+        namespace: &str,
+        block_hashes: &[Vec<u8>],
+        requester_id: &str,
+    ) -> Result<QueryBlocksForTransferResponse, ClientError> {
+        let request = QueryBlocksForTransferRequest {
+            namespace: namespace.to_string(),
+            block_hashes: block_hashes.to_vec(),
+            requester_id: requester_id.to_string(),
+        };
+
+        let response = self
+            .client
+            .clone()
+            .query_blocks_for_transfer(request)
+            .await
+            .map_err(|e| ClientError::RpcFailed(e.to_string()))?;
+
+        Ok(response.into_inner())
+    }
+
+    /// Release transfer locks on a remote node.
+    pub(crate) async fn release_transfer_lock(
+        &self,
+        transfer_session_id: &str,
+    ) -> Result<(), ClientError> {
+        let request = ReleaseTransferLockRequest {
+            transfer_session_id: transfer_session_id.to_string(),
+        };
+
+        self.client
+            .clone()
+            .release_transfer_lock(request)
+            .await
+            .map_err(|e| ClientError::RpcFailed(e.to_string()))?;
+
+        Ok(())
     }
 
     /// Check if the remote instance is healthy.
@@ -192,7 +232,7 @@ impl PegaflowClient {
             .map_err(|e| ClientError::RpcFailed(e.to_string()))?;
 
         let resp = response.into_inner();
-        Ok(resp.status.map(|s| s.ok).unwrap_or(false))
+        Ok(resp.status.is_some_and(|s| s.ok))
     }
 }
 
@@ -231,7 +271,10 @@ impl PegaflowClientPool {
     /// The endpoint is typically `http://ip:port` as returned by the metaserver.
     /// Cached connections whose endpoint is no longer healthy in the registry
     /// are evicted and reconnected.
-    async fn get_or_connect(&self, endpoint: &str) -> Result<PegaflowClient, ClientError> {
+    pub(crate) async fn get_or_connect(
+        &self,
+        endpoint: &str,
+    ) -> Result<PegaflowClient, ClientError> {
         // Fast path: return cached client if the instance is still healthy.
         if let Some(client) = self.clients.get(endpoint) {
             if self.is_endpoint_healthy(endpoint) {
@@ -240,7 +283,7 @@ impl PegaflowClientPool {
             // Instance disappeared or became unhealthy — drop the stale entry.
             drop(client);
             self.clients.remove(endpoint);
-            debug!("Evicted stale client for {}", endpoint);
+            debug!("Evicted stale client for {endpoint}");
         }
 
         // Connect and cache.
@@ -284,7 +327,161 @@ impl PegaflowClientPool {
 }
 
 #[cfg(test)]
+impl PegaflowClient {
+    pub(crate) fn from_channel(endpoint: &str, channel: Channel) -> Self {
+        Self {
+            endpoint: endpoint.to_string(),
+            client: EngineClient::new(channel),
+        }
+    }
+}
+
+#[cfg(test)]
+impl PegaflowClientPool {
+    pub(crate) fn new_for_test() -> Self {
+        Self::with_registry(Arc::new(InstanceRegistry::new()))
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_utils {
+    use pegaflow_proto::proto::engine::engine_server::{Engine as EngineService, EngineServer};
+    use pegaflow_proto::proto::engine::{
+        HealthRequest, HealthResponse, LoadRequest, LoadResponse, QueryBlocksForTransferRequest,
+        QueryBlocksForTransferResponse, QueryRequest, QueryResponse, RegisterContextRequest,
+        RegisterContextResponse, ReleaseTransferLockRequest, ReleaseTransferLockResponse,
+        ResponseStatus, SaveRequest, SaveResponse, ShutdownRequest, ShutdownResponse, UnpinRequest,
+        UnpinResponse, UnregisterRequest, UnregisterResponse,
+    };
+    use tonic::{Request, Response, Status};
+
+    /// Mock Engine gRPC server for unit tests.
+    pub(crate) struct MockEngine {
+        pub transfer_response: QueryBlocksForTransferResponse,
+    }
+
+    impl MockEngine {
+        pub(crate) fn new() -> Self {
+            Self {
+                transfer_response: QueryBlocksForTransferResponse {
+                    status: Some(ResponseStatus {
+                        ok: true,
+                        message: String::new(),
+                    }),
+                    blocks: Vec::new(),
+                    transfer_session_id: String::new(),
+                    rdma_session_id: Vec::new(),
+                },
+            }
+        }
+    }
+
+    #[tonic::async_trait]
+    impl EngineService for MockEngine {
+        async fn register_context_batch(
+            &self,
+            _: Request<RegisterContextRequest>,
+        ) -> Result<Response<RegisterContextResponse>, Status> {
+            Err(Status::unimplemented("not used in test"))
+        }
+        async fn save(&self, _: Request<SaveRequest>) -> Result<Response<SaveResponse>, Status> {
+            Err(Status::unimplemented("not used in test"))
+        }
+        async fn load(&self, _: Request<LoadRequest>) -> Result<Response<LoadResponse>, Status> {
+            Err(Status::unimplemented("not used in test"))
+        }
+        async fn query(&self, _: Request<QueryRequest>) -> Result<Response<QueryResponse>, Status> {
+            Err(Status::unimplemented("not used in test"))
+        }
+        async fn query_prefetch(
+            &self,
+            _: Request<QueryRequest>,
+        ) -> Result<Response<QueryResponse>, Status> {
+            Err(Status::unimplemented("not used in test"))
+        }
+        async fn query_remote_fetch(
+            &self,
+            _: Request<QueryRequest>,
+        ) -> Result<Response<QueryResponse>, Status> {
+            Err(Status::unimplemented("not used in test"))
+        }
+        async fn unpin(&self, _: Request<UnpinRequest>) -> Result<Response<UnpinResponse>, Status> {
+            Err(Status::unimplemented("not used in test"))
+        }
+        async fn unregister_context(
+            &self,
+            _: Request<UnregisterRequest>,
+        ) -> Result<Response<UnregisterResponse>, Status> {
+            Err(Status::unimplemented("not used in test"))
+        }
+        async fn query_blocks_for_transfer(
+            &self,
+            _: Request<QueryBlocksForTransferRequest>,
+        ) -> Result<Response<QueryBlocksForTransferResponse>, Status> {
+            Ok(Response::new(self.transfer_response.clone()))
+        }
+        async fn release_transfer_lock(
+            &self,
+            _: Request<ReleaseTransferLockRequest>,
+        ) -> Result<Response<ReleaseTransferLockResponse>, Status> {
+            Ok(Response::new(ReleaseTransferLockResponse {
+                status: Some(ResponseStatus {
+                    ok: true,
+                    message: String::new(),
+                }),
+                released_blocks: 0,
+            }))
+        }
+        async fn shutdown(
+            &self,
+            _: Request<ShutdownRequest>,
+        ) -> Result<Response<ShutdownResponse>, Status> {
+            Err(Status::unimplemented("not used in test"))
+        }
+        async fn health(
+            &self,
+            _: Request<HealthRequest>,
+        ) -> Result<Response<HealthResponse>, Status> {
+            Ok(Response::new(HealthResponse {
+                status: Some(ResponseStatus {
+                    ok: true,
+                    message: String::new(),
+                }),
+            }))
+        }
+    }
+
+    /// Start a mock Engine gRPC server on a random port.
+    /// Returns (address, join_handle).
+    pub(crate) async fn start_mock_engine(
+        mock: MockEngine,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let handle = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(EngineServer::new(mock))
+                .serve(addr)
+                .await
+                .unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (addr, handle)
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use pegaflow_proto::proto::engine::{
+        QueryBlocksForTransferResponse, ResponseStatus, TransferBlockInfo, TransferSlotInfo,
+    };
+
+    use super::test_utils::*;
     use super::*;
 
     #[tokio::test]
@@ -295,5 +492,122 @@ mod tests {
         // Unreachable endpoint should fail with ConnectionFailed.
         let result = pool.get_or_connect("http://192.0.2.1:50055").await;
         assert!(matches!(result, Err(ClientError::ConnectionFailed(_))));
+    }
+
+    #[tokio::test]
+    async fn client_pool_caches_connections() {
+        let (addr, _) = start_mock_engine(MockEngine::new()).await;
+        let endpoint = format!("http://127.0.0.1:{}", addr.port());
+        let pool = PegaflowClientPool::with_registry(Arc::new(InstanceRegistry::new()));
+
+        pool.get_or_connect(&endpoint).await.unwrap();
+        pool.get_or_connect(&endpoint).await.unwrap();
+
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn client_pool_empty_registry_healthy() {
+        let (addr, _) = start_mock_engine(MockEngine::new()).await;
+        let endpoint = format!("http://127.0.0.1:{}", addr.port());
+        let pool = PegaflowClientPool::with_registry(Arc::new(InstanceRegistry::new()));
+
+        let c1 = pool.get_or_connect(&endpoint).await.unwrap();
+        let c2 = pool.get_or_connect(&endpoint).await.unwrap();
+
+        assert_eq!(pool.len(), 1);
+        assert_eq!(c1.endpoint(), c2.endpoint());
+    }
+
+    #[tokio::test]
+    async fn client_pool_evicts_unhealthy() {
+        let (addr, server_handle) = start_mock_engine(MockEngine::new()).await;
+        let endpoint = format!("http://127.0.0.1:{}", addr.port());
+
+        let registry = Arc::new(InstanceRegistry::new());
+        registry.upsert(PegaflowInstance {
+            name: "pega-1".into(),
+            ip: "127.0.0.1".into(),
+            namespace: "default".into(),
+            grpc_port: addr.port(),
+            status: "Running".into(),
+            is_ready: true,
+            labels: HashMap::new(),
+        });
+        // Dummy instance to keep registry non-empty after removing pega-1
+        registry.upsert(PegaflowInstance {
+            name: "pega-dummy".into(),
+            ip: "192.168.99.1".into(),
+            namespace: "default".into(),
+            grpc_port: 50055,
+            status: "Running".into(),
+            is_ready: true,
+            labels: HashMap::new(),
+        });
+
+        let pool = PegaflowClientPool::with_registry(registry.clone());
+        pool.get_or_connect(&endpoint).await.unwrap();
+        assert_eq!(pool.len(), 1);
+
+        // Mark endpoint unhealthy + stop server
+        registry.remove("pega-1");
+        server_handle.abort();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Should evict stale client → reconnect fails (server down)
+        let result = pool.get_or_connect(&endpoint).await;
+        assert!(result.is_err());
+        assert_eq!(pool.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn query_blocks_for_transfer_roundtrip() {
+        let expected = vec![TransferBlockInfo {
+            block_hash: vec![1, 2, 3],
+            slots: vec![
+                TransferSlotInfo {
+                    k_ptr: 0x1000,
+                    k_size: 512,
+                    v_ptr: 0x2000,
+                    v_size: 512,
+                },
+                TransferSlotInfo {
+                    k_ptr: 0x3000,
+                    k_size: 256,
+                    v_ptr: 0,
+                    v_size: 0,
+                },
+            ],
+            rkey: 42,
+        }];
+
+        let mock = MockEngine {
+            transfer_response: QueryBlocksForTransferResponse {
+                status: Some(ResponseStatus {
+                    ok: true,
+                    message: String::new(),
+                }),
+                blocks: expected,
+                transfer_session_id: "sess-123".to_string(),
+                rdma_session_id: vec![0u8; 26],
+            },
+        };
+        let (addr, _) = start_mock_engine(mock).await;
+        let endpoint = format!("http://127.0.0.1:{}", addr.port());
+
+        let client = PegaflowClient::connect_default(&endpoint).await.unwrap();
+        let resp = client
+            .query_blocks_for_transfer("ns", &[vec![1, 2, 3]], "test")
+            .await
+            .unwrap();
+
+        assert_eq!(resp.blocks.len(), 1);
+        assert_eq!(resp.blocks[0].block_hash, vec![1, 2, 3]);
+        assert_eq!(resp.blocks[0].slots.len(), 2);
+        assert_eq!(resp.blocks[0].slots[0].k_ptr, 0x1000);
+        assert_eq!(resp.blocks[0].slots[0].v_ptr, 0x2000);
+        assert_eq!(resp.blocks[0].slots[1].v_ptr, 0);
+        assert_eq!(resp.transfer_session_id, "sess-123");
+        assert_eq!(resp.rdma_session_id.len(), 26);
     }
 }

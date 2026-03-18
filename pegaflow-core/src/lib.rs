@@ -33,7 +33,8 @@ pub use backing::{
     DEFAULT_SSD_WRITE_QUEUE_DEPTH, SsdCacheConfig,
 };
 pub use block::{
-    BlockHash, BlockKey, BlockStatus, LayerBlock, LayerSave, PrefetchStatus, RawBlock, SealedBlock,
+    BlockHash, BlockKey, BlockStatus, LayerBlock, LayerSave, PrefetchStatus, RawBlock,
+    RemoteFetchStatus, SealedBlock,
 };
 pub use instance::{GpuContext, InstanceContext, KVCacheRegistration};
 pub use internode::{
@@ -187,6 +188,7 @@ impl PegaEngine {
             config,
             &numa_nodes,
             metaserver_registrar,
+            None, // remote_fetch_fn: wired by server when --enable-remote-fetch is set
         );
 
         PegaEngine {
@@ -466,6 +468,109 @@ impl PegaEngine {
         Ok(unpinned)
     }
 
+    // =========================================================================
+    // Cross-node transfer: requesting side
+    // =========================================================================
+
+    /// Count prefix hit blocks with cross-node remote fetch support.
+    ///
+    /// Returns:
+    /// - `Done { hit, missing: 0 }`: all blocks in memory cache
+    /// - `Loading { hit, loading }`: some blocks being fetched from remote nodes via RDMA
+    /// - `Done { hit, missing }`: some blocks don't exist anywhere
+    #[cfg_attr(
+        feature = "tracing",
+        fastrace::trace(name = "query_remote_fetch.count_prefix_hit")
+    )]
+    pub fn count_prefix_hit_blocks_with_remote_fetch(
+        &self,
+        instance_id: &str,
+        req_id: &str,
+        block_hashes: &[Vec<u8>],
+    ) -> Result<RemoteFetchStatus, EngineError> {
+        if req_id.is_empty() {
+            warn!("count_prefix_hit_blocks_with_remote_fetch: empty req_id, returning 0 hits");
+            return Ok(RemoteFetchStatus::Done {
+                hit: 0,
+                missing: block_hashes.len(),
+            });
+        }
+
+        let instance = self.get_instance(instance_id)?;
+        let namespace = instance.namespace();
+        let world_size = instance.world_size();
+        let metrics = core_metrics();
+
+        let status = self.storage.check_prefix_and_remote_fetch(
+            instance_id,
+            req_id,
+            namespace,
+            block_hashes,
+            world_size,
+        );
+
+        match &status {
+            RemoteFetchStatus::Done { hit, missing } => {
+                metrics.cache_block_hits.add(*hit as u64, &[]);
+                if *missing > 0 {
+                    metrics.cache_block_misses.add(*missing as u64, &[]);
+                }
+            }
+            RemoteFetchStatus::Loading { hit, loading: _ } => {
+                metrics.cache_block_hits.add(*hit as u64, &[]);
+            }
+        }
+
+        Ok(status)
+    }
+
+    // =========================================================================
+    // Cross-node transfer: serving side
+    // =========================================================================
+
+    /// Look up blocks and lock them for RDMA transfer. Returns metadata
+    /// for each found block plus a session ID for later unlock.
+    pub fn query_blocks_for_transfer(
+        &self,
+        namespace: &str,
+        block_hashes: &[Vec<u8>],
+        requester_id: &str,
+    ) -> (String, Vec<(BlockKey, Arc<SealedBlock>)>) {
+        let keys: Vec<BlockKey> = block_hashes
+            .iter()
+            .map(|h| BlockKey::new(namespace.to_string(), h.clone()))
+            .collect();
+
+        let found = self.storage.get_blocks_for_transfer(&keys);
+        let session_id = self
+            .storage
+            .lock_blocks_for_transfer(requester_id, found.clone());
+
+        debug!(
+            "query_blocks_for_transfer: namespace={namespace} requested={} found={} session={session_id}",
+            block_hashes.len(),
+            found.len(),
+        );
+
+        (session_id, found)
+    }
+
+    /// Release a transfer lock session. Returns the number of blocks released.
+    pub fn release_transfer_lock(&self, session_id: &str) -> usize {
+        self.storage.release_transfer_lock(session_id)
+    }
+
+    /// GC expired transfer lock sessions.
+    pub fn gc_expired_transfer_locks(&self) -> usize {
+        self.storage.gc_expired_transfer_locks()
+    }
+
+    /// Return `(base_ptr, size)` for each contiguous pinned memory region.
+    /// Used for RDMA memory registration.
+    pub fn pinned_memory_regions(&self) -> Vec<(u64, usize)> {
+        self.storage.pinned_memory_regions()
+    }
+
     /// Batch load KV blocks for multiple layers asynchronously.
     ///
     /// Returns immediately after submitting the task to the GPU worker pool.
@@ -602,6 +707,8 @@ mod tests {
             rdma_nic_names: None,
             enable_numa_affinity: false,
             blockwise_alloc: false,
+            transfer_lock_timeout: None,
+            max_remote_fetch_blocks: None,
         };
         let engine = PegaEngine::new_with_config(1 << 20, false, config, None);
 

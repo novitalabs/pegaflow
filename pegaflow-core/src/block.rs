@@ -67,7 +67,7 @@ pub enum BlockStatus {
     Miss,
 }
 
-/// Result of checking prefix hits with prefetch support
+/// Result of checking prefix hits with SSD prefetch support
 #[derive(Debug, Clone)]
 pub enum PrefetchStatus {
     /// Blocks are being prefetched - caller should retry
@@ -75,6 +75,9 @@ pub enum PrefetchStatus {
     /// Terminal state: hit/missing counts final (missing=0 means full hit)
     Done { hit: usize, missing: usize },
 }
+
+/// Result of checking prefix hits with cross-node remote fetch support
+pub use crate::storage::remote_fetch::RemoteFetchStatus;
 
 // ============================================================================
 // Segment + RawBlock (storage-level, layout-agnostic)
@@ -195,6 +198,7 @@ impl LayerBlock {
     }
 }
 
+
 // ============================================================================
 // Sealed Block (read path, immutable)
 // ============================================================================
@@ -217,8 +221,8 @@ impl SealedBlock {
         self.footprint
     }
 
-    /// Get all slots (for serialization)
-    pub(crate) fn slots(&self) -> &[Arc<RawBlock>] {
+    /// Get all slots (for serialization / cross-node transfer)
+    pub fn slots(&self) -> &[Arc<RawBlock>] {
         &self.slots
     }
 

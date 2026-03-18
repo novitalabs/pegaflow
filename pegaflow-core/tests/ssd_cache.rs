@@ -36,6 +36,8 @@ async fn ssd_smoke_roundtrip_with_temp_dir() {
                 rdma_nic_names: None,
                 enable_numa_affinity: false,
                 blockwise_alloc: false,
+                transfer_lock_timeout: None,
+                max_remote_fetch_blocks: None,
             }),
     );
 

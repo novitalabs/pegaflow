@@ -53,7 +53,7 @@ pub async fn start_service_discovery(
     let label_selector = config
         .selector
         .iter()
-        .map(|(k, v)| format!("{}={}", k, v))
+        .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join(",");
 
@@ -104,11 +104,11 @@ pub async fn start_service_discovery(
                 })
                 .await
             {
-                Ok(_) => {
+                Ok(()) => {
                     retry_delay = Duration::from_secs(1);
                 }
                 Err(err) => {
-                    error!("Error in PegaFlow service discovery watcher: {}", err);
+                    error!("Error in PegaFlow service discovery watcher: {err}");
                     warn!(
                         "Retrying in {} seconds with exponential backoff",
                         retry_delay.as_secs()

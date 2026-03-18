@@ -3,15 +3,17 @@ use pegaflow_core::{trace_in_span, trace_root};
 use crate::metric::record_rpc_result;
 use crate::proto::engine::engine_server::Engine;
 use crate::proto::engine::{
-    HealthRequest, HealthResponse, LoadRequest, LoadResponse, PrefetchState, QueryRequest,
-    QueryResponse, RegisterContextRequest, RegisterContextResponse, ResponseStatus, SaveRequest,
-    SaveResponse, ShutdownRequest, ShutdownResponse, UnpinRequest, UnpinResponse,
+    HealthRequest, HealthResponse, LoadRequest, LoadResponse, PrefetchState,
+    QueryBlocksForTransferRequest, QueryBlocksForTransferResponse, QueryRequest, QueryResponse,
+    RegisterContextRequest, RegisterContextResponse, ReleaseTransferLockRequest,
+    ReleaseTransferLockResponse, ResponseStatus, SaveRequest, SaveResponse, ShutdownRequest,
+    ShutdownResponse, TransferBlockInfo, TransferSlotInfo, UnpinRequest, UnpinResponse,
     UnregisterRequest, UnregisterResponse,
 };
 use crate::registry::CudaTensorRegistry;
 use log::{debug, info, warn};
 use parking_lot::Mutex;
-use pegaflow_core::{EngineError, LayerSave, PegaEngine, PrefetchStatus};
+use pegaflow_core::{EngineError, LayerSave, PegaEngine, PrefetchStatus, RemoteFetchStatus};
 use pyo3::{PyErr, Python};
 use std::sync::Arc;
 use std::time::Instant;
@@ -579,6 +581,181 @@ impl Engine for GrpcEngineService {
             ),
         }
         record_rpc_result("unregister_context", &result, start);
+        result
+    }
+
+    async fn query_remote_fetch(
+        &self,
+        request: Request<QueryRequest>,
+    ) -> Result<Response<QueryResponse>, Status> {
+        let req = request.into_inner();
+        trace_root!("rpc.query_remote_fetch", root, || {
+            [
+                ("instance_id", req.instance_id.clone()),
+                ("block_hashes", req.block_hashes.len().to_string()),
+            ]
+        });
+
+        let start = Instant::now();
+        let fut = async {
+            debug!(
+                "RPC [query_remote_fetch]: instance_id={} block_hashes={}",
+                req.instance_id,
+                req.block_hashes.len()
+            );
+
+            let status = self
+                .engine
+                .count_prefix_hit_blocks_with_remote_fetch(
+                    &req.instance_id,
+                    &req.req_id,
+                    &req.block_hashes,
+                )
+                .map_err(Self::map_engine_error)?;
+
+            let (prefetch_state, hit_blocks, loading_blocks, missing_blocks) = match status {
+                RemoteFetchStatus::Done { hit, missing } => {
+                    (PrefetchState::PrefetchDone, hit as u64, 0, missing as u64)
+                }
+                RemoteFetchStatus::Loading { hit, loading } => (
+                    PrefetchState::PrefetchLoading,
+                    hit as u64,
+                    loading as u64,
+                    0,
+                ),
+            };
+
+            Ok(Response::new(QueryResponse {
+                status: Some(Self::build_simple_response()),
+                hit_blocks,
+                prefetch_state: prefetch_state.into(),
+                loading_blocks,
+                missing_blocks,
+            }))
+        };
+
+        let result: Result<Response<QueryResponse>, Status> = trace_in_span!(root, fut).await;
+
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        match &result {
+            Ok(response) => {
+                let resp = response.get_ref();
+                debug!(
+                    "RPC [query_remote_fetch] completed: ok hit={} loading={} missing={} elapsed_ms={:.2}",
+                    resp.hit_blocks, resp.loading_blocks, resp.missing_blocks, elapsed_ms
+                )
+            }
+            Err(status) => warn!(
+                "RPC [query_remote_fetch] failed: code={} message={} elapsed_ms={:.2}",
+                status.code(),
+                status.message(),
+                elapsed_ms
+            ),
+        }
+        record_rpc_result("query_remote_fetch", &result, start);
+        result
+    }
+
+    async fn query_blocks_for_transfer(
+        &self,
+        request: Request<QueryBlocksForTransferRequest>,
+    ) -> Result<Response<QueryBlocksForTransferResponse>, Status> {
+        let start = Instant::now();
+        let req = request.into_inner();
+        let hash_count = req.block_hashes.len();
+
+        debug!(
+            "RPC [query_blocks_for_transfer]: namespace={} hashes={} requester={}",
+            req.namespace, hash_count, req.requester_id
+        );
+
+        let result: Result<Response<QueryBlocksForTransferResponse>, Status> = async {
+            let (session_id, found_blocks) = self.engine.query_blocks_for_transfer(
+                &req.namespace,
+                &req.block_hashes,
+                &req.requester_id,
+            );
+
+            let blocks: Vec<TransferBlockInfo> = found_blocks
+                .iter()
+                .map(|(key, block)| {
+                    let slots: Vec<TransferSlotInfo> = block
+                        .slots()
+                        .iter()
+                        .map(
+                            |layer_block: &Arc<pegaflow_core::LayerBlock>| TransferSlotInfo {
+                                k_ptr: layer_block.k_ptr() as u64,
+                                k_size: layer_block.size() as u64,
+                                v_ptr: layer_block.v_ptr().map(|p| p as u64).unwrap_or(0),
+                                v_size: if layer_block.v_ptr().is_some() {
+                                    layer_block.size() as u64
+                                } else {
+                                    0
+                                },
+                            },
+                        )
+                        .collect();
+                    TransferBlockInfo {
+                        block_hash: key.hash.clone(),
+                        slots,
+                        rkey: 0, // TODO: set from RDMA engine when wired
+                    }
+                })
+                .collect();
+
+            Ok(Response::new(QueryBlocksForTransferResponse {
+                status: Some(Self::build_simple_response()),
+                blocks,
+                transfer_session_id: session_id,
+                rdma_session_id: Vec::new(), // TODO: set from RDMA engine when wired
+            }))
+        }
+        .await;
+
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        match &result {
+            Ok(response) => debug!(
+                "RPC [query_blocks_for_transfer] completed: ok found={} session={} elapsed_ms={:.2}",
+                response.get_ref().blocks.len(),
+                response.get_ref().transfer_session_id,
+                elapsed_ms
+            ),
+            Err(status) => warn!(
+                "RPC [query_blocks_for_transfer] failed: code={} message={} elapsed_ms={:.2}",
+                status.code(),
+                status.message(),
+                elapsed_ms
+            ),
+        }
+        record_rpc_result("query_blocks_for_transfer", &result, start);
+        result
+    }
+
+    async fn release_transfer_lock(
+        &self,
+        request: Request<ReleaseTransferLockRequest>,
+    ) -> Result<Response<ReleaseTransferLockResponse>, Status> {
+        let start = Instant::now();
+        let req = request.into_inner();
+
+        debug!(
+            "RPC [release_transfer_lock]: session={}",
+            req.transfer_session_id
+        );
+
+        let released = self.engine.release_transfer_lock(&req.transfer_session_id);
+
+        let result = Ok(Response::new(ReleaseTransferLockResponse {
+            status: Some(Self::build_simple_response()),
+            released_blocks: released as u64,
+        }));
+
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        debug!(
+            "RPC [release_transfer_lock] completed: ok released={} elapsed_ms={:.2}",
+            released, elapsed_ms
+        );
+        record_rpc_result("release_transfer_lock", &result, start);
         result
     }
 

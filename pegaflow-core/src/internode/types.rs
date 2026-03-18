@@ -51,7 +51,7 @@ impl Default for ServiceDiscoveryConfig {
             DEFAULT_PEGAFLOW_LABEL_VALUE.to_string(),
         );
 
-        ServiceDiscoveryConfig {
+        Self {
             enabled: false,
             selector,
             check_interval: Duration::from_secs(60),
@@ -69,13 +69,13 @@ impl ServiceDiscoveryConfig {
     }
 
     /// Enable service discovery.
-    fn enable(mut self) -> Self {
+    const fn enable(mut self) -> Self {
         self.enabled = true;
         self
     }
 
     /// Set the gRPC port.
-    fn with_grpc_port(mut self, port: u16) -> Self {
+    const fn with_grpc_port(mut self, port: u16) -> Self {
         self.grpc_port = port;
         self
     }
@@ -175,7 +175,7 @@ impl PegaflowInstance {
             .into_iter()
             .collect();
 
-        Some(PegaflowInstance {
+        Some(Self {
             name,
             ip: pod_ip,
             namespace,
@@ -215,7 +215,7 @@ pub struct ClientConfig {
 
 impl Default for ClientConfig {
     fn default() -> Self {
-        ClientConfig {
+        Self {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             tcp_nodelay: true,
@@ -242,11 +242,11 @@ pub enum ClientError {
 impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ClientError::ConnectionFailed(msg) => write!(f, "connection failed: {msg}"),
-            ClientError::RpcFailed(msg) => write!(f, "RPC failed: {msg}"),
-            ClientError::NoHealthyInstances => write!(f, "no healthy PegaFlow instances available"),
-            ClientError::InstanceNotFound(name) => write!(f, "instance not found: {name}"),
-            ClientError::ResponseError(msg) => write!(f, "response error: {msg}"),
+            Self::ConnectionFailed(msg) => write!(f, "connection failed: {msg}"),
+            Self::RpcFailed(msg) => write!(f, "RPC failed: {msg}"),
+            Self::NoHealthyInstances => write!(f, "no healthy PegaFlow instances available"),
+            Self::InstanceNotFound(name) => write!(f, "instance not found: {name}"),
+            Self::ResponseError(msg) => write!(f, "response error: {msg}"),
         }
     }
 }

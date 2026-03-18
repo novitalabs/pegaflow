@@ -20,7 +20,7 @@ pub struct MetaServerRegistrarConfig {
 }
 
 impl MetaServerRegistrarConfig {
-    pub fn new(metaserver_addr: String, advertise_addr: String) -> Self {
+    pub const fn new(metaserver_addr: String, advertise_addr: String) -> Self {
         Self {
             metaserver_addr,
             advertise_addr,
@@ -28,7 +28,7 @@ impl MetaServerRegistrarConfig {
         }
     }
 
-    pub fn with_queue_depth(mut self, depth: usize) -> Self {
+    pub const fn with_queue_depth(mut self, depth: usize) -> Self {
         self.queue_depth = depth;
         self
     }
@@ -82,19 +82,13 @@ impl MetaServerRegistrar {
                     .add(count as u64, &[]);
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
-                warn!(
-                    "MetaServer registration queue full, dropping {} hashes",
-                    count
-                );
+                warn!("MetaServer registration queue full, dropping {count} hashes");
                 core_metrics()
                     .metaserver_registration_queue_full
                     .add(count as u64, &[]);
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                error!(
-                    "MetaServer registration loop has exited, dropping {} hashes",
-                    count
-                );
+                error!("MetaServer registration loop has exited, dropping {count} hashes");
                 core_metrics()
                     .metaserver_registration_queue_full
                     .add(count as u64, &[]);
@@ -128,13 +122,13 @@ async fn registration_loop(
         if client.is_none() {
             match MetaServerClient::connect(metaserver_addr.clone()).await {
                 Ok(c) => {
-                    info!("Connected to MetaServer at {}", metaserver_addr);
+                    info!("Connected to MetaServer at {metaserver_addr}");
                     client = Some(c);
                     backoff_ms = INITIAL_BACKOFF_MS;
                 }
                 Err(e) => {
                     error!("Failed to connect to MetaServer: {e}");
-                    let total: usize = grouped.values().map(|v| v.len()).sum();
+                    let total: usize = grouped.values().map(Vec::len).sum();
                     core_metrics()
                         .metaserver_registration_failures
                         .add(total as u64, &[]);
@@ -163,14 +157,13 @@ async fn registration_loop(
                 Ok(resp) => {
                     let inner = resp.into_inner();
                     debug!(
-                        "Registered {} block hashes with MetaServer (namespace={}, inserted={})",
-                        count, namespace, inner.inserted_count
+                        "Registered {count} block hashes with MetaServer (namespace={namespace}, inserted={})",
+                        inner.inserted_count
                     );
                 }
                 Err(e) => {
                     error!(
-                        "MetaServer insert_block_hashes failed (namespace={}, count={}): {e}",
-                        namespace, count
+                        "MetaServer insert_block_hashes failed (namespace={namespace}, count={count}): {e}"
                     );
                     failed_at = Some(i);
                     break;
