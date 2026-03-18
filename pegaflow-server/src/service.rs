@@ -110,7 +110,7 @@ impl GrpcEngineService {
     ) -> Result<TransferSlotInfo, Status> {
         let total_size = layer_block.size() as u64;
         if layer_block.v_ptr().is_some() {
-            if total_size % 2 != 0 {
+            if !total_size.is_multiple_of(2) {
                 return Err(Status::internal(format!(
                     "split block size must be even, got {}",
                     total_size
