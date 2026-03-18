@@ -7,7 +7,7 @@ use tokio::sync::oneshot;
 
 use crate::backing::SsdBackingStore;
 use crate::block::{BlockKey, InflightBlock, SealedBlock, SlotInsertResult};
-use crate::internode::registrar::MetaServerRegistrar;
+use crate::internode::MetaServerRegistrar;
 use crate::metrics::core_metrics;
 use crate::offload::InsertEntries;
 use pegaflow_common::NumaNode;
@@ -205,16 +205,11 @@ fn send_backing_batches(deps: &InsertDeps, blocks: &[(BlockKey, Arc<SealedBlock>
 }
 
 fn register_block_hashes(registrar: &MetaServerRegistrar, blocks: &[(BlockKey, Arc<SealedBlock>)]) {
-    let mut grouped: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
-    for (key, _) in blocks {
-        grouped
-            .entry(key.namespace.clone())
-            .or_default()
-            .push(key.hash.clone());
-    }
-    for (namespace, hashes) in grouped {
-        registrar.try_register(namespace, hashes);
-    }
+    let entries: Vec<(String, Vec<u8>)> = blocks
+        .iter()
+        .map(|(key, _)| (key.namespace.clone(), key.hash.clone()))
+        .collect();
+    registrar.try_register(entries);
 }
 
 fn gc_inflight(

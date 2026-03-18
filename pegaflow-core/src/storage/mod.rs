@@ -10,7 +10,7 @@ use std::sync::{Arc, Weak};
 
 use crate::backing::{AllocateFn, DEFAULT_MAX_PREFETCH_BLOCKS, SsdBackingStore, SsdCacheConfig};
 use crate::block::{BlockKey, PrefetchStatus, SealedBlock};
-use crate::internode::registrar::MetaServerRegistrar;
+use crate::internode::MetaServerRegistrar;
 use crate::metrics::core_metrics;
 use crate::pinned_pool::{PinnedAllocation, PinnedAllocator};
 use pegaflow_common::NumaNode;
@@ -104,7 +104,6 @@ impl StorageEngine {
         let write_pipeline = Arc::new(write_pipeline);
 
         let is_numa = allocator.is_numa();
-        let registrar = metaserver_registrar;
         let engine = Arc::new_cyclic(move |weak_engine: &Weak<Self>| {
             // Build shared allocate_fn for backing stores.
             let alloc_weak = weak_engine.clone();
@@ -125,7 +124,7 @@ impl StorageEngine {
                 prefetch,
                 write_pipeline: write_pipeline.clone(),
                 ssd_store,
-                metaserver_registrar: registrar,
+                metaserver_registrar,
             }
         });
 

@@ -259,7 +259,7 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
                 .build(),
             metaserver_registration_queue_full: meter
                 .u64_counter("pegaflow_metaserver_registration_queue_full")
-                .with_description("Registration batches dropped due to full queue")
+                .with_description("Block hashes dropped due to full registration queue")
                 .build(),
         }
     })

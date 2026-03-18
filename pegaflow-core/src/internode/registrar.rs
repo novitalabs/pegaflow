@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use log::{debug, error, info, warn};
 use pegaflow_proto::proto::engine::InsertBlockHashesRequest;
 use pegaflow_proto::proto::engine::meta_server_client::MetaServerClient;
@@ -6,12 +8,15 @@ use tonic::transport::Channel;
 
 use crate::metrics::core_metrics;
 
-const DEFAULT_QUEUE_DEPTH: usize = 16;
+pub const DEFAULT_METASERVER_QUEUE_DEPTH: usize = 256;
+
+const INITIAL_BACKOFF_MS: u64 = 100;
+const MAX_BACKOFF_MS: u64 = 30_000;
 
 pub struct MetaServerRegistrarConfig {
-    pub metaserver_addr: String,
-    pub advertise_addr: String,
-    pub queue_depth: usize,
+    metaserver_addr: String,
+    advertise_addr: String,
+    queue_depth: usize,
 }
 
 impl MetaServerRegistrarConfig {
@@ -19,14 +24,20 @@ impl MetaServerRegistrarConfig {
         Self {
             metaserver_addr,
             advertise_addr,
-            queue_depth: DEFAULT_QUEUE_DEPTH,
+            queue_depth: DEFAULT_METASERVER_QUEUE_DEPTH,
         }
+    }
+
+    pub fn with_queue_depth(mut self, depth: usize) -> Self {
+        self.queue_depth = depth;
+        self
     }
 }
 
+/// A batch of (namespace, block_hash) pairs to register with MetaServer.
+/// Sent as a single channel message to avoid consuming multiple queue slots.
 struct RegistrationBatch {
-    namespace: String,
-    block_hashes: Vec<Vec<u8>>,
+    entries: Vec<(String, Vec<u8>)>,
 }
 
 pub struct MetaServerRegistrar {
@@ -34,6 +45,9 @@ pub struct MetaServerRegistrar {
 }
 
 impl MetaServerRegistrar {
+    /// Create a new registrar and spawn the background registration loop.
+    ///
+    /// Must be called from within a tokio runtime context.
     pub fn new(config: MetaServerRegistrarConfig) -> Self {
         let (tx, rx) = mpsc::channel(config.queue_depth);
 
@@ -52,27 +66,39 @@ impl MetaServerRegistrar {
     }
 
     /// Fire-and-forget registration. Mirrors `SsdBackingStore::ingest_batch()`.
-    pub(crate) fn try_register(&self, namespace: String, block_hashes: Vec<Vec<u8>>) {
-        if block_hashes.is_empty() {
+    ///
+    /// Accepts a flat list of (namespace, block_hash) pairs. The background loop
+    /// groups by namespace before issuing gRPC calls.
+    pub(crate) fn try_register(&self, entries: Vec<(String, Vec<u8>)>) {
+        if entries.is_empty() {
             return;
         }
-        let count = block_hashes.len();
-        let batch = RegistrationBatch {
-            namespace,
-            block_hashes,
-        };
-        if self.tx.try_send(batch).is_ok() {
-            core_metrics()
-                .metaserver_registration_blocks
-                .add(count as u64, &[]);
-        } else {
-            warn!(
-                "MetaServer registration queue full, dropping {} hashes",
-                count
-            );
-            core_metrics()
-                .metaserver_registration_queue_full
-                .add(count as u64, &[]);
+        let count = entries.len();
+        let batch = RegistrationBatch { entries };
+        match self.tx.try_send(batch) {
+            Ok(()) => {
+                core_metrics()
+                    .metaserver_registration_blocks
+                    .add(count as u64, &[]);
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!(
+                    "MetaServer registration queue full, dropping {} hashes",
+                    count
+                );
+                core_metrics()
+                    .metaserver_registration_queue_full
+                    .add(count as u64, &[]);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                error!(
+                    "MetaServer registration loop has exited, dropping {} hashes",
+                    count
+                );
+                core_metrics()
+                    .metaserver_registration_queue_full
+                    .add(count as u64, &[]);
+            }
         }
     }
 }
@@ -83,30 +109,28 @@ async fn registration_loop(
     advertise_addr: String,
 ) {
     let mut client: Option<MetaServerClient<Channel>> = None;
+    let mut backoff_ms: u64 = INITIAL_BACKOFF_MS;
 
     while let Some(batch) = rx.recv().await {
-        // Drain all pending batches for batching
-        let mut batches = vec![batch];
+        // Drain all pending batches for coalescing
+        let mut all_entries = batch.entries;
         while let Ok(more) = rx.try_recv() {
-            batches.push(more);
+            all_entries.extend(more.entries);
         }
 
         // Group by namespace
-        let mut grouped: std::collections::HashMap<String, Vec<Vec<u8>>> =
-            std::collections::HashMap::new();
-        for b in batches {
-            grouped
-                .entry(b.namespace)
-                .or_default()
-                .extend(b.block_hashes);
+        let mut grouped: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+        for (namespace, hash) in all_entries {
+            grouped.entry(namespace).or_default().push(hash);
         }
 
-        // Lazy-connect
+        // Lazy-connect with exponential backoff
         if client.is_none() {
             match MetaServerClient::connect(metaserver_addr.clone()).await {
                 Ok(c) => {
                     info!("Connected to MetaServer at {}", metaserver_addr);
                     client = Some(c);
+                    backoff_ms = INITIAL_BACKOFF_MS;
                 }
                 Err(e) => {
                     error!("Failed to connect to MetaServer: {e}");
@@ -114,18 +138,24 @@ async fn registration_loop(
                     core_metrics()
                         .metaserver_registration_failures
                         .add(total as u64, &[]);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                    backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
                     continue;
                 }
             }
         }
 
-        let c = client.as_mut().unwrap();
+        let c = client.as_mut().expect("client is Some after lazy-connect");
 
-        for (namespace, hashes) in grouped {
+        // Collect into Vec for indexed iteration so we can count remaining on failure
+        let namespaces: Vec<(String, Vec<Vec<u8>>)> = grouped.into_iter().collect();
+        let mut failed_at = None;
+
+        for (i, (namespace, hashes)) in namespaces.iter().enumerate() {
             let count = hashes.len();
             let request = InsertBlockHashesRequest {
                 namespace: namespace.clone(),
-                block_hashes: hashes,
+                block_hashes: hashes.clone(),
                 node: advertise_addr.clone(),
             };
 
@@ -142,14 +172,19 @@ async fn registration_loop(
                         "MetaServer insert_block_hashes failed (namespace={}, count={}): {e}",
                         namespace, count
                     );
-                    core_metrics()
-                        .metaserver_registration_failures
-                        .add(count as u64, &[]);
-                    // Reset client to force reconnect on next batch
-                    client = None;
+                    failed_at = Some(i);
                     break;
                 }
             }
+        }
+
+        if let Some(idx) = failed_at {
+            // Count all hashes from the failed namespace onward as failures
+            let dropped: usize = namespaces[idx..].iter().map(|(_, h)| h.len()).sum();
+            core_metrics()
+                .metaserver_registration_failures
+                .add(dropped as u64, &[]);
+            client = None;
         }
     }
 
