@@ -132,6 +132,11 @@ pub struct Cli {
     #[arg(long, default_value_t = 1.0, value_parser = parse_sample_rate)]
     pub trace_sample_rate: f64,
 
+    /// Allocate each block separately instead of contiguous batch allocation.
+    /// Reduces memory fragmentation when blocks are freed in different order.
+    #[arg(long, default_value_t = false)]
+    pub blockwise_alloc: bool,
+
     /// MetaServer address for cross-node block hash registration (e.g. http://127.0.0.1:50056).
     /// When set, sealed block hashes are automatically registered with the MetaServer.
     #[arg(long)]
@@ -403,6 +408,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         max_prefetch_blocks: cli.max_prefetch_blocks,
         ssd_cache_config,
         enable_numa_affinity: !cli.disable_numa_affinity,
+        blockwise_alloc: cli.blockwise_alloc,
     };
 
     if cli.enable_lfu_admission {

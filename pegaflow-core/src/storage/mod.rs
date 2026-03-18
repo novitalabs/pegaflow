@@ -32,6 +32,9 @@ pub struct StorageConfig {
     pub ssd_cache_config: Option<SsdCacheConfig>,
     /// Enable NUMA-aware memory allocation.
     pub enable_numa_affinity: bool,
+    /// Allocate each block separately instead of contiguous batch allocation.
+    /// Reduces fragmentation when blocks are freed in different order.
+    pub blockwise_alloc: bool,
 }
 
 impl Default for StorageConfig {
@@ -42,6 +45,7 @@ impl Default for StorageConfig {
             max_prefetch_blocks: DEFAULT_MAX_PREFETCH_BLOCKS,
             ssd_cache_config: None,
             enable_numa_affinity: true,
+            blockwise_alloc: false,
         }
     }
 }
@@ -52,6 +56,7 @@ pub(crate) struct StorageEngine {
     prefetch: PrefetchScheduler,
     write_pipeline: Arc<WritePipeline>,
     ssd_store: Option<Arc<SsdBackingStore>>,
+    blockwise_alloc: bool,
     metaserver_registrar: Option<Arc<MetaServerRegistrar>>,
 }
 
@@ -67,6 +72,11 @@ impl StorageEngine {
         let unit_hint = value_size_hint.and_then(|size| NonZeroU64::new(size as u64));
         let max_prefetch_blocks = config.max_prefetch_blocks;
         let ssd_cache_config = config.ssd_cache_config;
+        let blockwise_alloc = config.blockwise_alloc;
+
+        if blockwise_alloc {
+            info!("Blockwise allocation enabled for batch_save");
+        }
 
         let ssd_enabled = ssd_cache_config.is_some();
 
@@ -124,6 +134,7 @@ impl StorageEngine {
                 prefetch,
                 write_pipeline: write_pipeline.clone(),
                 ssd_store,
+                blockwise_alloc,
                 metaserver_registrar,
             }
         });
@@ -157,6 +168,11 @@ impl StorageEngine {
 
     pub(crate) fn is_numa_enabled(&self) -> bool {
         self.allocator.is_numa()
+    }
+
+    /// Returns true if blockwise allocation is enabled.
+    pub(crate) fn blockwise_alloc(&self) -> bool {
+        self.blockwise_alloc
     }
 
     /// Allocate pinned memory, returning `None` if the pool is exhausted after eviction.
