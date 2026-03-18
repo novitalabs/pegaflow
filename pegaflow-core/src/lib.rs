@@ -603,6 +603,7 @@ mod tests {
             max_prefetch_blocks: 100,
             ssd_cache_config: None,
             enable_numa_affinity: false,
+            blockwise_alloc: false,
         };
         let engine = PegaEngine::new_with_config(1 << 20, false, config, None);
 

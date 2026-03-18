@@ -17,6 +17,7 @@ pub fn test_engine() -> PegaEngine {
         max_prefetch_blocks: 100,
         ssd_cache_config: None,
         enable_numa_affinity: false,
+        blockwise_alloc: false,
     })
 }
 
