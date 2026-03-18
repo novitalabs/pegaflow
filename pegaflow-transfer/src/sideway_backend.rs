@@ -424,10 +424,7 @@ impl SidewayBackend {
         config: &WorkerConfig,
         state: Arc<Mutex<SidewayState>>,
     ) -> Result<Arc<SidewayRuntime>> {
-        info!(
-            "transfer runtime create start: nic={}, rpc_port={}",
-            config.nic_name, config.rpc_port
-        );
+        info!("transfer runtime create start: nic={}", config.nic_name);
         let device_list =
             DeviceList::new().map_err(|error| TransferError::Backend(error.to_string()))?;
         let device = device_list
@@ -1218,13 +1215,7 @@ impl SidewayBackend {
         if config.nic_name.trim().is_empty() {
             return Err(TransferError::InvalidArgument("nic_name is empty"));
         }
-        if config.rpc_port == 0 {
-            return Err(TransferError::InvalidArgument("rpc_port must be non-zero"));
-        }
-        info!(
-            "transfer backend initialize: nic={}, rpc_port={}",
-            config.nic_name, config.rpc_port
-        );
+        info!("transfer backend initialize: nic={}", config.nic_name);
 
         let runtime = Self::create_runtime(&config, Arc::clone(&self.state))?;
         let mut state = self.state.lock();
@@ -1238,11 +1229,6 @@ impl SidewayBackend {
             runtime.local_ud
         );
         Ok(())
-    }
-
-    pub(crate) fn rpc_port(&self) -> Result<u16> {
-        let state = self.state.lock();
-        Ok(Self::ensure_initialized(&state)?.rpc_port)
     }
 
     pub(crate) fn session_id(&self) -> DomainAddress {
@@ -1303,24 +1289,17 @@ impl SidewayBackend {
         Ok(())
     }
 
-    pub(crate) fn transfer_sync_write(
-        &self,
-        session_id: &DomainAddress,
-        local_ptr: u64,
-        remote_ptr: u64,
-        len: usize,
-    ) -> Result<usize> {
-        self.batch_transfer_sync_write(session_id, &[local_ptr], &[remote_ptr], &[len])
-    }
-
-    pub(crate) fn transfer_sync_read(
-        &self,
-        session_id: &DomainAddress,
-        local_ptr: u64,
-        remote_ptr: u64,
-        len: usize,
-    ) -> Result<usize> {
-        self.batch_transfer_sync_read(session_id, &[local_ptr], &[remote_ptr], &[len])
+    pub(crate) fn registered_memory_regions(&self) -> Vec<RegisteredMemoryRegion> {
+        let state = self.state.lock();
+        state
+            .registered
+            .values()
+            .map(|entry| RegisteredMemoryRegion {
+                base_ptr: entry.base_ptr,
+                len: entry.len as u64,
+                rkey: entry.mr.rkey(),
+            })
+            .collect()
     }
 
     pub(crate) fn batch_transfer_sync_write(
@@ -1500,7 +1479,6 @@ mod tests {
         let error = backend
             .initialize(WorkerConfig {
                 nic_name: "".to_string(),
-                rpc_port: 50055,
             })
             .expect_err("must fail");
         assert_eq!(error, TransferError::InvalidArgument("nic_name is empty"));

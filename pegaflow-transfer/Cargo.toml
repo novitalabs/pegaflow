@@ -14,16 +14,4 @@ bytes = "1"
 serde.workspace = true
 bincode = { version = "2.0.1", features = ["serde"] }
 lz4_flex = "0.12"
-clap.workspace = true
 libc.workspace = true
-
-[dev-dependencies]
-cudarc.workspace = true
-
-[[bin]]
-name = "pegaflow_topo_cli"
-path = "src/bin/pegaflow_topo_cli.rs"
-
-[[bin]]
-name = "pegaflow_cpu_bench"
-path = "src/bin/pegaflow_cpu_bench.rs"

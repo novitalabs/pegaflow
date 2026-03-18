@@ -19,8 +19,6 @@ use tonic::{
     transport::{Channel, Endpoint},
 };
 
-mod transfer;
-
 // Custom Python exceptions for error classification
 create_exception!(pegaflow, PegaFlowError, PyException);
 create_exception!(pegaflow, PegaFlowServiceError, PegaFlowError);
@@ -673,8 +671,6 @@ fn pegaflow(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PegaEngine>()?;
     m.add_class::<EngineRpcClient>()?;
     m.add_class::<PyLoadState>()?;
-    transfer::register_py_module(m)?;
-
     // Register custom exceptions for error classification
     m.add("PegaFlowError", m.py().get_type::<PegaFlowError>())?;
     m.add(
