@@ -2268,6 +2268,7 @@ dependencies = [
  "pegaflow-common",
  "pegaflow-core",
  "pegaflow-proto",
+ "pegaflow-transfer",
  "prometheus",
  "prost",
  "pyo3",

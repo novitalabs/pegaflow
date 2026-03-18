@@ -19,6 +19,7 @@ path = "src/main.rs"
 [dependencies]
 pegaflow-common.workspace = true
 pegaflow-core.workspace = true
+pegaflow-transfer.workspace = true
 pegaflow-proto = { path = "../pegaflow-proto" }
 prost.workspace = true
 pyo3 = { workspace = true, features = ["auto-initialize"] }

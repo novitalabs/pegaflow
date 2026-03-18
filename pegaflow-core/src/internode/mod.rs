@@ -26,10 +26,10 @@
 //!
 
 pub mod client;
-pub(crate) mod metaserver_query;
+pub mod metaserver_query;
 pub(crate) mod registrar;
 pub mod registry;
-pub(crate) mod remote_fetch_worker;
+pub mod remote_fetch_worker;
 pub mod service_discovery;
 pub mod types;
 

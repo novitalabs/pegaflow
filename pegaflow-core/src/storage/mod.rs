@@ -445,6 +445,10 @@ impl StorageEngine {
             .map(|(ptr, len)| (ptr.as_ptr() as u64, len))
             .collect()
     }
+
+    pub(crate) fn allocator(&self) -> Arc<PinnedAllocator> {
+        Arc::clone(&self.allocator)
+    }
 }
 
 #[cfg(test)]

@@ -125,7 +125,8 @@ impl MetaServer for GrpcMetaService {
 
         let existing_hashes: Vec<Vec<u8>> = existing.iter().map(|e| e.block_hash.clone()).collect();
 
-        // Group hashes by node, then select only the best node (max matching blocks)
+        // Group hashes by node. Each hash currently maps to a single owner in the store,
+        // but the response preserves all participating nodes for distributed prefixes.
         let mut node_map: std::collections::HashMap<&str, Vec<Vec<u8>>> =
             std::collections::HashMap::new();
         for entry in &existing {
@@ -140,8 +141,6 @@ impl MetaServer for GrpcMetaService {
                 node: node.to_string(),
                 block_hashes,
             })
-            .max_by_key(|nb| nb.block_hashes.len())
-            .into_iter()
             .collect();
 
         let response = QueryBlockHashesResponse {
@@ -176,5 +175,31 @@ impl MetaServer for GrpcMetaService {
             status: Some(Self::ok_status()),
         };
         Ok(Response::new(response))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn query_block_hashes_returns_all_matching_nodes() {
+        let store = Arc::new(BlockHashStore::new());
+        store.insert_hashes("ns", &[vec![1]], "node-a:50055").await;
+        store.insert_hashes("ns", &[vec![2]], "node-b:50055").await;
+        store.run_pending_tasks().await;
+
+        let service = GrpcMetaService::new(store, Arc::new(Notify::new()));
+        let response = service
+            .query_block_hashes(Request::new(QueryBlockHashesRequest {
+                namespace: "ns".to_string(),
+                block_hashes: vec![vec![1], vec![2]],
+            }))
+            .await
+            .expect("query should succeed")
+            .into_inner();
+
+        assert_eq!(response.found_count, 2);
+        assert_eq!(response.node_blocks.len(), 2);
     }
 }

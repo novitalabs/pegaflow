@@ -25,6 +25,7 @@ pub struct GrpcEngineService {
     engine: Arc<PegaEngine>,
     registry: Arc<Mutex<CudaTensorRegistry>>,
     shutdown: Arc<Notify>,
+    rdma_session_id: Option<Vec<u8>>,
 }
 
 impl GrpcEngineService {
@@ -32,11 +33,13 @@ impl GrpcEngineService {
         engine: Arc<PegaEngine>,
         registry: Arc<Mutex<CudaTensorRegistry>>,
         shutdown: Arc<Notify>,
+        rdma_session_id: Option<Vec<u8>>,
     ) -> Self {
         Self {
             engine,
             registry,
             shutdown,
+            rdma_session_id,
         }
     }
 
@@ -89,6 +92,45 @@ impl GrpcEngineService {
 
     fn build_simple_response() -> ResponseStatus {
         Self::ok_status()
+    }
+
+    fn validate_load_request(block_ids: &[i32], block_hashes: &[Vec<u8>]) -> Result<(), Status> {
+        if block_ids.len() != block_hashes.len() {
+            return Err(Status::invalid_argument(format!(
+                "block_ids and block_hashes must have the same length (got {} and {})",
+                block_ids.len(),
+                block_hashes.len()
+            )));
+        }
+        Ok(())
+    }
+
+    fn build_transfer_slot_info(
+        layer_block: &Arc<pegaflow_core::LayerBlock>,
+    ) -> Result<TransferSlotInfo, Status> {
+        let total_size = layer_block.size() as u64;
+        if layer_block.v_ptr().is_some() {
+            if total_size % 2 != 0 {
+                return Err(Status::internal(format!(
+                    "split block size must be even, got {}",
+                    total_size
+                )));
+            }
+            let segment_size = total_size / 2;
+            Ok(TransferSlotInfo {
+                k_ptr: layer_block.k_ptr() as u64,
+                k_size: segment_size,
+                v_ptr: layer_block.v_ptr().map(|p| p as u64).unwrap_or(0),
+                v_size: segment_size,
+            })
+        } else {
+            Ok(TransferSlotInfo {
+                k_ptr: layer_block.k_ptr() as u64,
+                k_size: total_size,
+                v_ptr: 0,
+                v_size: 0,
+            })
+        }
     }
 }
 
@@ -325,6 +367,7 @@ impl Engine for GrpcEngineService {
                 hash_count,
                 load_state_shm.len()
             );
+            Self::validate_load_request(&block_ids, &block_hashes)?;
             let layer_refs: Vec<&str> = layer_names.iter().map(|s| s.as_str()).collect();
 
             self.engine
@@ -598,6 +641,9 @@ impl Engine for GrpcEngineService {
         );
 
         let result: Result<Response<QueryBlocksForTransferResponse>, Status> = async {
+            let rdma_session_id = self.rdma_session_id.clone().ok_or_else(|| {
+                Status::failed_precondition("RDMA transfer engine is not configured")
+            })?;
             let (session_id, found_blocks) = self.engine.query_blocks_for_transfer(
                 &req.namespace,
                 &req.block_hashes,
@@ -606,36 +652,25 @@ impl Engine for GrpcEngineService {
 
             let blocks: Vec<TransferBlockInfo> = found_blocks
                 .iter()
-                .map(|(key, block)| {
+                .map(|(key, block)| -> Result<TransferBlockInfo, Status> {
                     let slots: Vec<TransferSlotInfo> = block
                         .slots()
                         .iter()
-                        .map(
-                            |layer_block: &Arc<pegaflow_core::LayerBlock>| TransferSlotInfo {
-                                k_ptr: layer_block.k_ptr() as u64,
-                                k_size: layer_block.size() as u64,
-                                v_ptr: layer_block.v_ptr().map(|p| p as u64).unwrap_or(0),
-                                v_size: if layer_block.v_ptr().is_some() {
-                                    layer_block.size() as u64
-                                } else {
-                                    0
-                                },
-                            },
-                        )
-                        .collect();
-                    TransferBlockInfo {
+                        .map(Self::build_transfer_slot_info)
+                        .collect::<Result<_, _>>()?;
+                    Ok(TransferBlockInfo {
                         block_hash: key.hash.clone(),
                         slots,
                         rkey: 0, // TODO: set from RDMA engine when wired
-                    }
+                    })
                 })
-                .collect();
+                .collect::<Result<_, _>>()?;
 
             Ok(Response::new(QueryBlocksForTransferResponse {
                 status: Some(Self::build_simple_response()),
                 blocks,
                 transfer_session_id: session_id,
-                rdma_session_id: Vec::new(), // TODO: set from RDMA engine when wired
+                rdma_session_id,
             }))
         }
         .await;
@@ -746,5 +781,20 @@ impl Engine for GrpcEngineService {
         }
         record_rpc_result("health", &result, start);
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tonic::Code;
+
+    #[tokio::test]
+    async fn load_rejects_mismatched_block_ids_and_hashes() {
+        let status = GrpcEngineService::validate_load_request(&[1, 2], &[vec![1]])
+            .expect_err("mismatched load request should fail");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(status.message().contains("block_ids"));
+        assert!(status.message().contains("block_hashes"));
     }
 }

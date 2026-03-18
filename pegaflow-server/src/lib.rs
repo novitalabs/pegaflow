@@ -22,13 +22,19 @@ use opentelemetry::global;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use parking_lot::Mutex;
-use pegaflow_core::PegaEngine;
+use pegaflow_core::internode::PegaflowClientPool;
+use pegaflow_core::internode::metaserver_query::MetaServerQueryClient;
+use pegaflow_core::internode::remote_fetch_worker::{
+    RdmaBatchReadFn, RdmaRegisterMemoryFn, RemoteFetchWorkerConfig, execute_remote_fetch,
+};
+use pegaflow_core::{PegaEngine, RemoteFetchFn};
+use pegaflow_transfer::{DomainAddress, MooncakeTransferEngine};
 use prometheus::Registry;
 use proto::engine::engine_server::EngineServer;
 use pyo3::{PyErr, Python, types::PyAnyMethods};
 use std::error::Error;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::Notify;
 use tonic::transport::Server;
@@ -328,6 +334,13 @@ fn init_metrics(
     })
 }
 
+struct RemoteFetchRuntime {
+    remote_fetch_fn: RemoteFetchFn,
+    engine_cell: Arc<OnceLock<Arc<PegaEngine>>>,
+    rdma_engine: Arc<Mutex<MooncakeTransferEngine>>,
+    rdma_session_id: Vec<u8>,
+}
+
 /// Main entry point for pegaflow-server
 pub fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
@@ -465,18 +478,121 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             Arc::new(pegaflow_core::MetaServerRegistrar::new(config))
         });
 
+        let remote_fetch_runtime = if let Some(addr) = cli.metaserver_addr.as_ref() {
+            let rdma_nic = cli
+                .rdma_nic
+                .clone()
+                .expect("clap requires rdma_nic when metaserver_addr is set");
+            info!(
+                "Remote RDMA fetch enabled: metaserver={} rdma_nic={} rdma_port={}",
+                addr, rdma_nic, cli.rdma_port
+            );
+
+            let metaserver_client = Arc::new(MetaServerQueryClient::connect(addr).await?);
+            let client_pool = Arc::new(PegaflowClientPool::without_registry());
+
+            let mut transfer_engine = MooncakeTransferEngine::new();
+            transfer_engine
+                .initialize(rdma_nic, cli.rdma_port)
+                .map_err(|err| {
+                    std::io::Error::other(format!(
+                        "failed to initialize RDMA transfer engine: {err}"
+                    ))
+                })?;
+
+            let rdma_session_id = transfer_engine.get_session_id().to_bytes().to_vec();
+            let rdma_engine = Arc::new(Mutex::new(transfer_engine));
+            let engine_cell: Arc<OnceLock<Arc<PegaEngine>>> = Arc::new(OnceLock::new());
+
+            let rdma_read_fn: RdmaBatchReadFn = {
+                let rdma_engine = Arc::clone(&rdma_engine);
+                Arc::new(move |session_id, local_ptrs, remote_ptrs, sizes| {
+                    let session = DomainAddress::from_bytes(session_id)
+                        .ok_or_else(|| "invalid RDMA session id bytes".to_string())?;
+                    rdma_engine
+                        .lock()
+                        .batch_transfer_sync_read(&session, local_ptrs, remote_ptrs, sizes)
+                        .map_err(|err| err.to_string())
+                })
+            };
+            let rdma_register_fn: RdmaRegisterMemoryFn = {
+                let rdma_engine = Arc::clone(&rdma_engine);
+                Arc::new(move |ptr, size| {
+                    rdma_engine
+                        .lock()
+                        .register_memory(ptr, size)
+                        .map_err(|err| err.to_string())
+                })
+            };
+            let remote_fetch_fn: RemoteFetchFn = {
+                let metaserver_client = Arc::clone(&metaserver_client);
+                let client_pool = Arc::clone(&client_pool);
+                let engine_cell = Arc::clone(&engine_cell);
+                let rdma_read_fn = Arc::clone(&rdma_read_fn);
+                let rdma_register_fn = Arc::clone(&rdma_register_fn);
+                Arc::new(move |keys, done_tx| {
+                    let Some(engine) = engine_cell.get().cloned() else {
+                        let _ = done_tx.send(Vec::new());
+                        return;
+                    };
+                    let config = Arc::new(RemoteFetchWorkerConfig::new_from_engine(
+                        Arc::clone(&metaserver_client),
+                        Arc::clone(&client_pool),
+                        engine,
+                        Arc::clone(&rdma_read_fn),
+                        Arc::clone(&rdma_register_fn),
+                    ));
+                    tokio::spawn(execute_remote_fetch(config, keys, done_tx));
+                })
+            };
+
+            Some(RemoteFetchRuntime {
+                remote_fetch_fn,
+                engine_cell,
+                rdma_engine,
+                rdma_session_id,
+            })
+        } else {
+            None
+        };
+
         // Create PegaEngine inside tokio runtime context (needed for SSD cache tokio::spawn)
-        let engine = Arc::new(PegaEngine::new_with_config(
+        let engine = Arc::new(PegaEngine::new_with_remote_fetch(
             cli.pool_size,
             cli.use_hugepages,
             storage_config,
             metaserver_registrar,
+            remote_fetch_runtime
+                .as_ref()
+                .map(|runtime| Arc::clone(&runtime.remote_fetch_fn)),
         ));
+
+        if let Some(runtime) = &remote_fetch_runtime {
+            runtime
+                .engine_cell
+                .set(Arc::clone(&engine))
+                .map_err(|_| std::io::Error::other("remote fetch engine already initialized"))?;
+
+            let regions = engine.pinned_memory_regions();
+            let (ptrs, lens): (Vec<u64>, Vec<usize>) = regions.into_iter().unzip();
+            runtime
+                .rdma_engine
+                .lock()
+                .batch_register_memory(&ptrs, &lens)
+                .map_err(|err| {
+                    std::io::Error::other(format!(
+                        "failed to register pinned memory with RDMA engine: {err}"
+                    ))
+                })?;
+        }
 
         let service = GrpcEngineService::new(
             Arc::clone(&engine),
             Arc::clone(&registry),
             Arc::clone(&shutdown),
+            remote_fetch_runtime
+                .as_ref()
+                .map(|runtime| runtime.rdma_session_id.clone()),
         );
 
         // Spawn background GC task for stale inflight blocks

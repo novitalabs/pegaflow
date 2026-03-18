@@ -19,6 +19,7 @@ use super::read_cache::ReadCache;
 
 struct PrefetchEntry {
     blocks_rx: oneshot::Receiver<PrefetchResult>,
+    hit_count: usize,
     loading_count: usize,
     /// True when this entry was dispatched via remote RDMA fetch (for metrics).
     is_remote: bool,
@@ -80,8 +81,8 @@ impl PrefetchScheduler {
     ) -> PrefetchStatus {
         if let Some(status) = self.poll_existing(read_cache, req_id) {
             match status {
-                PollResult::StillLoading => {
-                    return PrefetchStatus::Loading { hit: 0, loading: 1 };
+                PollResult::StillLoading { hit, loading } => {
+                    return PrefetchStatus::Loading { hit, loading };
                 }
                 PollResult::Completed => {
                     // Fall through to full scan
@@ -105,7 +106,10 @@ impl PrefetchScheduler {
         let entry = state.active.get_mut(req_id)?;
 
         match entry.blocks_rx.try_recv() {
-            Err(oneshot::error::TryRecvError::Empty) => Some(PollResult::StillLoading),
+            Err(oneshot::error::TryRecvError::Empty) => Some(PollResult::StillLoading {
+                hit: entry.hit_count,
+                loading: entry.loading_count,
+            }),
             Ok(blocks) => {
                 let is_remote = entry.is_remote;
                 state.remove_entry(req_id);
@@ -232,6 +236,7 @@ impl PrefetchScheduler {
                     req_id.to_string(),
                     PrefetchEntry {
                         blocks_rx: rx,
+                        hit_count: hit,
                         loading_count: loading,
                         is_remote: is_remote_entry,
                     },
@@ -246,7 +251,7 @@ impl PrefetchScheduler {
 }
 
 enum PollResult {
-    StillLoading,
+    StillLoading { hit: usize, loading: usize },
     Completed,
 }
 
@@ -262,6 +267,15 @@ mod tests {
     fn noop_remote_fetch_fn() -> RemoteFetchFn {
         Arc::new(|_keys, _tx| {
             // Don't send anything — simulates a fetch that never completes
+        })
+    }
+
+    fn hanging_remote_fetch_fn() -> RemoteFetchFn {
+        Arc::new(|_keys, tx| {
+            tokio::spawn(async move {
+                let _tx = tx;
+                std::future::pending::<()>().await;
+            });
         })
     }
 
@@ -402,6 +416,46 @@ mod tests {
         assert!(matches!(
             status,
             PrefetchStatus::Loading { hit: 1, loading: 1 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_fetch_repoll_preserves_original_counts() {
+        let cache = make_read_cache();
+        let scheduler = PrefetchScheduler::new(None, 100, Some((hanging_remote_fetch_fn(), 100)));
+
+        let key = BlockKey::new("ns".into(), vec![1]);
+        let block = Arc::new(SealedBlock::from_slots(Vec::new()));
+        cache.batch_insert(vec![(key, block)]);
+
+        let status = scheduler
+            .check_and_prefetch(
+                &cache,
+                "inst",
+                "req1",
+                "ns",
+                &[vec![1], vec![2], vec![3]],
+                1,
+            )
+            .await;
+        assert!(matches!(
+            status,
+            PrefetchStatus::Loading { hit: 1, loading: 2 }
+        ));
+
+        let status = scheduler
+            .check_and_prefetch(
+                &cache,
+                "inst",
+                "req1",
+                "ns",
+                &[vec![1], vec![2], vec![3]],
+                1,
+            )
+            .await;
+        assert!(matches!(
+            status,
+            PrefetchStatus::Loading { hit: 1, loading: 2 }
         ));
     }
 

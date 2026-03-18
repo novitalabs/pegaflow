@@ -10,6 +10,7 @@ use std::time::Instant;
 use log::{debug, info, warn};
 use tokio::sync::oneshot;
 
+use crate::PegaEngine;
 use crate::block::{BlockKey, LayerBlock, SealedBlock};
 use crate::internode::client::{PegaflowClient, PegaflowClientPool};
 use crate::internode::metaserver_query::MetaServerQueryClient;
@@ -23,7 +24,7 @@ use pegaflow_common::NumaNode;
 ///
 /// Arguments: (remote_session_id_bytes, local_ptrs, remote_ptrs, sizes)
 /// Returns: total bytes transferred, or error message.
-pub(crate) type RdmaBatchReadFn = Arc<
+pub type RdmaBatchReadFn = Arc<
     dyn Fn(
             &[u8],    // remote_session_id (26-byte DomainAddress)
             &[u64],   // local_ptrs
@@ -35,21 +36,39 @@ pub(crate) type RdmaBatchReadFn = Arc<
 >;
 
 /// Abstraction for registering local memory with RDMA.
-pub(crate) type RdmaRegisterMemoryFn = Arc<dyn Fn(u64, usize) -> Result<(), String> + Send + Sync>;
+pub type RdmaRegisterMemoryFn = Arc<dyn Fn(u64, usize) -> Result<(), String> + Send + Sync>;
 
 /// Configuration for the remote fetch worker.
-pub(crate) struct RemoteFetchWorkerConfig {
-    pub metaserver_client: Arc<MetaServerQueryClient>,
-    pub client_pool: Arc<PegaflowClientPool>,
-    pub allocator: Arc<PinnedAllocator>,
-    pub rdma_read_fn: RdmaBatchReadFn,
-    pub rdma_register_fn: RdmaRegisterMemoryFn,
+pub struct RemoteFetchWorkerConfig {
+    metaserver_client: Arc<MetaServerQueryClient>,
+    client_pool: Arc<PegaflowClientPool>,
+    allocator: Arc<PinnedAllocator>,
+    rdma_read_fn: RdmaBatchReadFn,
+    rdma_register_fn: RdmaRegisterMemoryFn,
+}
+
+impl RemoteFetchWorkerConfig {
+    pub fn new_from_engine(
+        metaserver_client: Arc<MetaServerQueryClient>,
+        client_pool: Arc<PegaflowClientPool>,
+        engine: Arc<PegaEngine>,
+        rdma_read_fn: RdmaBatchReadFn,
+        rdma_register_fn: RdmaRegisterMemoryFn,
+    ) -> Self {
+        Self {
+            metaserver_client,
+            client_pool,
+            allocator: engine.pinned_allocator(),
+            rdma_read_fn,
+            rdma_register_fn,
+        }
+    }
 }
 
 /// Execute a remote fetch for the given missing blocks.
 ///
 /// This is spawned as a tokio task by the `RemoteFetchFn` closure.
-pub(crate) async fn execute_remote_fetch(
+pub async fn execute_remote_fetch(
     config: Arc<RemoteFetchWorkerConfig>,
     missing_keys: Vec<BlockKey>,
     done_tx: oneshot::Sender<RemoteFetchResult>,
@@ -125,69 +144,65 @@ async fn execute_remote_fetch_inner(
         return Ok(Vec::new());
     }
 
-    // MetaServer returns at most one node (the best match).
-    let node_blocks = &meta_resp.node_blocks[0];
     let mut fetched_blocks: Vec<(BlockKey, Arc<SealedBlock>)> = Vec::new();
 
-    let endpoint = format!("http://{}", node_blocks.node);
+    for node_blocks in &meta_resp.node_blocks {
+        let endpoint = format!("http://{}", node_blocks.node);
 
-    let client: PegaflowClient =
-        config
-            .client_pool
-            .get_or_connect(&endpoint)
+        let client: PegaflowClient =
+            config
+                .client_pool
+                .get_or_connect(&endpoint)
+                .await
+                .map_err(|e| {
+                    core_metrics()
+                        .remote_fetch_blocks_missed
+                        .add(node_blocks.block_hashes.len() as u64, &[]);
+                    format!("Failed to connect to remote node {endpoint}: {e}")
+                })?;
+
+        let transfer_resp = client
+            .query_blocks_for_transfer(namespace, &node_blocks.block_hashes, "remote-fetch")
             .await
             .map_err(|e| {
                 core_metrics()
                     .remote_fetch_blocks_missed
                     .add(node_blocks.block_hashes.len() as u64, &[]);
-                format!("Failed to connect to remote node {endpoint}: {e}")
+                format!("QueryBlocksForTransfer failed for {endpoint}: {e}")
             })?;
 
-    // Query remote node for RDMA metadata + lock blocks
-    let transfer_resp = client
-        .query_blocks_for_transfer(namespace, &node_blocks.block_hashes, "remote-fetch")
-        .await
-        .map_err(|e| {
+        if transfer_resp.rdma_session_id.is_empty() {
+            warn!("Remote node {endpoint} returned empty RDMA session ID");
             core_metrics()
                 .remote_fetch_blocks_missed
                 .add(node_blocks.block_hashes.len() as u64, &[]);
-            format!("QueryBlocksForTransfer failed for {endpoint}: {e}")
-        })?;
+            let _ = client
+                .release_transfer_lock(&transfer_resp.transfer_session_id)
+                .await;
+            continue;
+        }
 
-    if transfer_resp.rdma_session_id.is_empty() {
-        warn!("Remote node {endpoint} returned empty RDMA session ID");
-        core_metrics()
-            .remote_fetch_blocks_missed
-            .add(node_blocks.block_hashes.len() as u64, &[]);
-        // Release lock since we can't do RDMA
-        let _ = client
-            .release_transfer_lock(&transfer_resp.transfer_session_id)
-            .await;
-        return Ok(Vec::new());
-    }
-
-    // RDMA fetch for each block
-    for block_info in &transfer_resp.blocks {
-        match fetch_single_block(
-            config,
-            block_info,
-            &transfer_resp.rdma_session_id,
-            namespace,
-        ) {
-            Ok(result) => fetched_blocks.push(result),
-            Err(e) => {
-                warn!("Failed to fetch block via RDMA: {e}");
-                core_metrics().remote_fetch_blocks_missed.add(1, &[]);
+        for block_info in &transfer_resp.blocks {
+            match fetch_single_block(
+                config,
+                block_info,
+                &transfer_resp.rdma_session_id,
+                namespace,
+            ) {
+                Ok(result) => fetched_blocks.push(result),
+                Err(e) => {
+                    warn!("Failed to fetch block via RDMA: {e}");
+                    core_metrics().remote_fetch_blocks_missed.add(1, &[]);
+                }
             }
         }
-    }
 
-    // Release remote locks
-    if let Err(e) = client
-        .release_transfer_lock(&transfer_resp.transfer_session_id)
-        .await
-    {
-        warn!("Failed to release transfer lock on {endpoint}: {e} (will auto-expire)");
+        if let Err(e) = client
+            .release_transfer_lock(&transfer_resp.transfer_session_id)
+            .await
+        {
+            warn!("Failed to release transfer lock on {endpoint}: {e} (will auto-expire)");
+        }
     }
 
     Ok(fetched_blocks)
@@ -264,7 +279,7 @@ fn fetch_single_block(
             LayerBlock::new_split(
                 k_alloc.as_ptr().cast_mut(),
                 v_alloc.as_ptr().cast_mut(),
-                slot_info.k_size as usize,
+                (slot_info.k_size + slot_info.v_size) as usize,
                 Arc::clone(k_alloc),
                 Arc::clone(v_alloc),
             )
@@ -413,6 +428,7 @@ mod tests {
         assert_eq!(key.hash, vec![4, 5, 6]);
         assert_eq!(sealed.slots().len(), 1);
         assert!(sealed.slots()[0].v_ptr().is_some());
+        assert_eq!(sealed.slots()[0].size(), 1024);
 
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
@@ -647,6 +663,105 @@ mod tests {
         let calls = rdma_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].2[0], 512);
+    }
+
+    #[tokio::test]
+    async fn full_pipeline_fetches_blocks_from_multiple_nodes() {
+        if !has_cuda() {
+            return;
+        }
+
+        use crate::internode::client::test_utils::{MockEngine, start_mock_engine};
+        use crate::internode::metaserver_query::test_utils::{
+            MockMetaServer, start_mock_metaserver,
+        };
+        use pegaflow_proto::proto::engine::{QueryBlocksForTransferResponse, ResponseStatus};
+
+        let allocator = make_allocator(1 << 20);
+
+        let engine_a = MockEngine {
+            transfer_response: QueryBlocksForTransferResponse {
+                status: Some(ResponseStatus {
+                    ok: true,
+                    message: String::new(),
+                }),
+                blocks: vec![TransferBlockInfo {
+                    block_hash: vec![1],
+                    slots: vec![TransferSlotInfo {
+                        k_ptr: 0x1000,
+                        k_size: 512,
+                        v_ptr: 0,
+                        v_size: 0,
+                    }],
+                    rkey: 0,
+                }],
+                transfer_session_id: "session-a".to_string(),
+                rdma_session_id: vec![1u8; 26],
+            },
+        };
+        let (engine_a_addr, _) = start_mock_engine(engine_a).await;
+
+        let engine_b = MockEngine {
+            transfer_response: QueryBlocksForTransferResponse {
+                status: Some(ResponseStatus {
+                    ok: true,
+                    message: String::new(),
+                }),
+                blocks: vec![TransferBlockInfo {
+                    block_hash: vec![2],
+                    slots: vec![TransferSlotInfo {
+                        k_ptr: 0x2000,
+                        k_size: 512,
+                        v_ptr: 0,
+                        v_size: 0,
+                    }],
+                    rkey: 0,
+                }],
+                transfer_session_id: "session-b".to_string(),
+                rdma_session_id: vec![2u8; 26],
+            },
+        };
+        let (engine_b_addr, _) = start_mock_engine(engine_b).await;
+
+        let meta_mock = MockMetaServer::new();
+        meta_mock.insert(
+            "ns",
+            vec![1],
+            &format!("127.0.0.1:{}", engine_a_addr.port()),
+        );
+        meta_mock.insert(
+            "ns",
+            vec![2],
+            &format!("127.0.0.1:{}", engine_b_addr.port()),
+        );
+        let meta_addr = start_mock_metaserver(meta_mock).await;
+
+        let metaserver_client = Arc::new(
+            MetaServerQueryClient::connect(&format!("127.0.0.1:{}", meta_addr.port()))
+                .await
+                .unwrap(),
+        );
+        let (rdma_read_fn, rdma_calls) = recording_rdma_read_fn();
+        let config = Arc::new(RemoteFetchWorkerConfig {
+            metaserver_client,
+            client_pool: Arc::new(PegaflowClientPool::new_for_test()),
+            allocator,
+            rdma_read_fn,
+            rdma_register_fn: noop_rdma_register_fn(),
+        });
+
+        let missing_keys = vec![
+            BlockKey::new("ns".to_string(), vec![1]),
+            BlockKey::new("ns".to_string(), vec![2]),
+        ];
+        let result = execute_remote_fetch_inner(&config, &missing_keys)
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 2);
+
+        let calls = rdma_calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
     }
 
     #[tokio::test]

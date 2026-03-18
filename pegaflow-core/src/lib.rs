@@ -44,6 +44,7 @@ use pegaflow_common::NumaTopology;
 pub use pinned_pool::PinnedAllocation;
 pub use seal_offload::SlotMeta;
 pub use storage::StorageConfig;
+pub use storage::remote_fetch::RemoteFetchFn;
 pub use sync_state::{LoadState, LoadStateError};
 pub use trace::{set_trace_sample_rate, should_sample};
 
@@ -167,6 +168,22 @@ impl PegaEngine {
         storage_config: storage::StorageConfig,
         metaserver_registrar: Option<Arc<MetaServerRegistrar>>,
     ) -> Self {
+        Self::new_with_remote_fetch(
+            pool_size,
+            use_hugepages,
+            storage_config,
+            metaserver_registrar,
+            None,
+        )
+    }
+
+    pub fn new_with_remote_fetch(
+        pool_size: usize,
+        use_hugepages: bool,
+        storage_config: storage::StorageConfig,
+        metaserver_registrar: Option<Arc<MetaServerRegistrar>>,
+        remote_fetch_fn: Option<RemoteFetchFn>,
+    ) -> Self {
         let topology = Arc::new(NumaTopology::detect());
         topology.log_summary();
 
@@ -187,7 +204,7 @@ impl PegaEngine {
             config,
             &numa_nodes,
             metaserver_registrar,
-            None, // remote_fetch_fn: wired by server when --metaserver-addr is set
+            remote_fetch_fn,
         );
 
         PegaEngine {
@@ -512,6 +529,10 @@ impl PegaEngine {
     /// Used for RDMA memory registration.
     pub fn pinned_memory_regions(&self) -> Vec<(u64, usize)> {
         self.storage.pinned_memory_regions()
+    }
+
+    pub(crate) fn pinned_allocator(&self) -> Arc<pinned_pool::PinnedAllocator> {
+        self.storage.allocator()
     }
 
     /// Batch load KV blocks for multiple layers asynchronously.

@@ -266,6 +266,11 @@ impl PegaflowClientPool {
         Self::new(registry, ClientConfig::default())
     }
 
+    /// Create a client pool without service-discovery health tracking.
+    pub fn without_registry() -> Self {
+        Self::with_registry(Arc::new(InstanceRegistry::new()))
+    }
+
     /// Get a cached client or connect to the given endpoint.
     ///
     /// The endpoint is typically `http://ip:port` as returned by the metaserver.
@@ -339,7 +344,7 @@ impl PegaflowClient {
 #[cfg(test)]
 impl PegaflowClientPool {
     pub(crate) fn new_for_test() -> Self {
-        Self::with_registry(Arc::new(InstanceRegistry::new()))
+        Self::without_registry()
     }
 }
 

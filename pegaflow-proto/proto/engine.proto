@@ -117,9 +117,9 @@ message HealthResponse {
 // Cross-node transfer: per-slot RDMA metadata
 message TransferSlotInfo {
   uint64 k_ptr = 1;      // Remote pinned memory address for K segment
-  uint64 k_size = 2;     // Size of K segment in bytes
+  uint64 k_size = 2;     // Size of the K segment in bytes (per-segment, not total slot size)
   uint64 v_ptr = 3;      // Remote pinned memory address for V segment (0 if contiguous)
-  uint64 v_size = 4;     // Size of V segment in bytes (0 if contiguous)
+  uint64 v_size = 4;     // Size of the V segment in bytes (0 if contiguous)
 }
 
 // Cross-node transfer: per-block RDMA metadata

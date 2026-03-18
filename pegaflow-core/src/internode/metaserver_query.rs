@@ -12,13 +12,13 @@ use tonic::transport::{Channel, Endpoint};
 use super::types::ClientError;
 
 /// gRPC client for querying block hash locations from the MetaServer.
-pub(crate) struct MetaServerQueryClient {
+pub struct MetaServerQueryClient {
     client: MetaServerClient<Channel>,
 }
 
 impl MetaServerQueryClient {
     /// Connect to the MetaServer at the given address.
-    pub(crate) async fn connect(addr: &str) -> Result<Self, ClientError> {
+    pub async fn connect(addr: &str) -> Result<Self, ClientError> {
         let endpoint = if addr.starts_with("http://") || addr.starts_with("https://") {
             addr.to_string()
         } else {
@@ -44,7 +44,7 @@ impl MetaServerQueryClient {
     /// Query which remote nodes hold the given block hashes.
     ///
     /// Returns `QueryBlockHashesResponse` with `node_blocks` grouping hashes by owning node.
-    pub(crate) async fn query_block_hashes(
+    pub async fn query_block_hashes(
         &self,
         namespace: &str,
         block_hashes: &[Vec<u8>],
