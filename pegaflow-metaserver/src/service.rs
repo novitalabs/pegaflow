@@ -125,7 +125,7 @@ impl MetaServer for GrpcMetaService {
 
         let existing_hashes: Vec<Vec<u8>> = existing.iter().map(|e| e.block_hash.clone()).collect();
 
-        // Group hashes by node
+        // Group hashes by node, then select only the best node (max matching blocks)
         let mut node_map: std::collections::HashMap<&str, Vec<Vec<u8>>> =
             std::collections::HashMap::new();
         for entry in &existing {
@@ -140,6 +140,8 @@ impl MetaServer for GrpcMetaService {
                 node: node.to_string(),
                 block_hashes,
             })
+            .max_by_key(|nb| nb.block_hashes.len())
+            .into_iter()
             .collect();
 
         let response = QueryBlockHashesResponse {

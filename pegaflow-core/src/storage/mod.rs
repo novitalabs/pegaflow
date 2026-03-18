@@ -75,7 +75,6 @@ pub(crate) struct StorageEngine {
     blockwise_alloc: bool,
     metaserver_registrar: Option<Arc<MetaServerRegistrar>>,
     transfer_lock: Option<Arc<transfer_lock::TransferLockManager>>,
-    remote_fetch: Option<remote_fetch::RemoteFetchScheduler>,
 }
 
 impl StorageEngine {
@@ -155,17 +154,14 @@ impl StorageEngine {
             let ssd_store = ssd_cache_config
                 .and_then(|cfg| crate::backing::new_ssd(cfg, allocate_fn.clone(), is_numa));
 
-            let prefetch = PrefetchScheduler::new(ssd_store.clone(), max_prefetch_blocks);
+            let prefetch = PrefetchScheduler::new(
+                ssd_store.clone(),
+                max_prefetch_blocks,
+                remote_fetch_fn.zip(max_remote_fetch_blocks),
+            );
 
             let transfer_lock =
                 transfer_lock_timeout.map(|t| Arc::new(transfer_lock::TransferLockManager::new(t)));
-
-            let remote_fetch =
-                remote_fetch_fn
-                    .zip(max_remote_fetch_blocks)
-                    .map(|(fetch_fn, max_blocks)| {
-                        remote_fetch::RemoteFetchScheduler::new(max_blocks, fetch_fn)
-                    });
 
             Self {
                 allocator,
@@ -177,7 +173,6 @@ impl StorageEngine {
                 blockwise_alloc,
                 metaserver_registrar,
                 transfer_lock,
-                remote_fetch,
             }
         });
 
@@ -449,33 +444,6 @@ impl StorageEngine {
             .into_iter()
             .map(|(ptr, len)| (ptr.as_ptr() as u64, len))
             .collect()
-    }
-
-    // ---- Cross-node transfer: requesting side ----
-
-    /// Check prefix and initiate remote fetch for missing blocks.
-    /// Falls back to memory-only check if remote fetch is disabled.
-    pub(crate) fn check_prefix_and_remote_fetch(
-        &self,
-        instance_id: &str,
-        req_id: &str,
-        namespace: &str,
-        hashes: &[Vec<u8>],
-        num_workers: usize,
-    ) -> remote_fetch::RemoteFetchStatus {
-        let Some(remote_fetch) = &self.remote_fetch else {
-            let (hit, missing) = self.check_prefix_memory_only(namespace, hashes);
-            return remote_fetch::RemoteFetchStatus::Done { hit, missing };
-        };
-
-        remote_fetch.check_and_fetch(
-            &self.read_cache,
-            instance_id,
-            req_id,
-            namespace,
-            hashes,
-            num_workers,
-        )
     }
 }
 
@@ -761,18 +729,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_prefix_and_remote_fetch_falls_back_when_disabled() {
-        // Default config has remote_fetch disabled (max_remote_fetch_blocks = None)
-        let storage = make_engine();
+    async fn unified_prefetch_with_remote_fetch_fn() {
+        use crate::storage::remote_fetch::RemoteFetchFn;
+
+        // Create engine with remote fetch enabled (no SSD)
+        let fetch_fn: RemoteFetchFn = Arc::new(|keys, tx| {
+            // Immediate return with empty blocks
+            let blocks: Vec<(BlockKey, Arc<SealedBlock>)> = keys
+                .into_iter()
+                .map(|key| (key, Arc::new(SealedBlock::from_slots(Vec::new()))))
+                .collect();
+            let _ = tx.send(blocks);
+        });
+        let config = StorageConfig {
+            enable_lfu_admission: false,
+            max_remote_fetch_blocks: Some(100),
+            ..StorageConfig::default()
+        };
+        let storage =
+            StorageEngine::new_with_config(1 << 20, false, config, &[], None, Some(fetch_fn));
+
         let block = Arc::new(SealedBlock::from_slots(Vec::new()));
         storage.test_insert_cache(BlockKey::new("ns".into(), vec![1]), block);
 
-        let status =
-            storage.check_prefix_and_remote_fetch("inst", "req1", "ns", &[vec![1], vec![2]], 1);
-        // Prefix scan: hit=1 (block [1]), miss=1 (block [2])
+        // First call: hit=1, loading=1 (remote fetch dispatched for vec![2])
+        let status = storage
+            .check_prefix_and_prefetch("inst", "req1", "ns", &[vec![1], vec![2]], 1)
+            .await;
         assert!(matches!(
             status,
-            remote_fetch::RemoteFetchStatus::Done { hit: 1, missing: 1 }
+            PrefetchStatus::Loading { hit: 1, loading: 1 }
+        ));
+
+        // Second call: poll completed fetch -> all hit
+        let status = storage
+            .check_prefix_and_prefetch("inst", "req1", "ns", &[vec![1], vec![2]], 1)
+            .await;
+        assert!(matches!(
+            status,
+            PrefetchStatus::Done { hit: 2, missing: 0 }
         ));
     }
 }

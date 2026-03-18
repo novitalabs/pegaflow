@@ -157,15 +157,13 @@ service Engine {
   rpc Load(LoadRequest) returns (LoadResponse);
   // Pure memory-only query: check if prefix blocks are in memory cache (no SSD prefetch)
   rpc Query(QueryRequest) returns (QueryResponse);
-  // Prefetch-aware query: check memory + trigger SSD prefetch for missing blocks
+  // Unified prefetch query: check memory + trigger SSD prefetch or cross-node RDMA fetch for missing blocks
   rpc QueryPrefetch(QueryRequest) returns (QueryResponse);
-  // Remote-fetch-aware query: check memory + trigger cross-node RDMA fetch for missing blocks
-  rpc QueryRemoteFetch(QueryRequest) returns (QueryResponse);
   rpc Unpin(UnpinRequest) returns (UnpinResponse);
   rpc UnregisterContext(UnregisterRequest) returns (UnregisterResponse);
   // Cross-node transfer: get RDMA metadata for specific blocks (serving side)
   rpc QueryBlocksForTransfer(QueryBlocksForTransferRequest) returns (QueryBlocksForTransferResponse);
-  // Cross-node transfer: release block locks after RDMA transfer completes
+  // Cross-node transfer1: release block locks after RDMA transfer completes
   rpc ReleaseTransferLock(ReleaseTransferLockRequest) returns (ReleaseTransferLockResponse);
   rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
   rpc Health(HealthRequest) returns (HealthResponse);

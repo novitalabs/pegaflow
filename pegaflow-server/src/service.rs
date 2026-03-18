@@ -13,7 +13,7 @@ use crate::proto::engine::{
 use crate::registry::CudaTensorRegistry;
 use log::{debug, info, warn};
 use parking_lot::Mutex;
-use pegaflow_core::{EngineError, LayerSave, PegaEngine, PrefetchStatus, RemoteFetchStatus};
+use pegaflow_core::{EngineError, LayerSave, PegaEngine, PrefetchStatus};
 use pyo3::{PyErr, Python};
 use std::sync::Arc;
 use std::time::Instant;
@@ -581,78 +581,6 @@ impl Engine for GrpcEngineService {
             ),
         }
         record_rpc_result("unregister_context", &result, start);
-        result
-    }
-
-    async fn query_remote_fetch(
-        &self,
-        request: Request<QueryRequest>,
-    ) -> Result<Response<QueryResponse>, Status> {
-        let req = request.into_inner();
-        trace_root!("rpc.query_remote_fetch", root, || {
-            [
-                ("instance_id", req.instance_id.clone()),
-                ("block_hashes", req.block_hashes.len().to_string()),
-            ]
-        });
-
-        let start = Instant::now();
-        let fut = async {
-            debug!(
-                "RPC [query_remote_fetch]: instance_id={} block_hashes={}",
-                req.instance_id,
-                req.block_hashes.len()
-            );
-
-            let status = self
-                .engine
-                .count_prefix_hit_blocks_with_remote_fetch(
-                    &req.instance_id,
-                    &req.req_id,
-                    &req.block_hashes,
-                )
-                .map_err(Self::map_engine_error)?;
-
-            let (prefetch_state, hit_blocks, loading_blocks, missing_blocks) = match status {
-                RemoteFetchStatus::Done { hit, missing } => {
-                    (PrefetchState::PrefetchDone, hit as u64, 0, missing as u64)
-                }
-                RemoteFetchStatus::Loading { hit, loading } => (
-                    PrefetchState::PrefetchLoading,
-                    hit as u64,
-                    loading as u64,
-                    0,
-                ),
-            };
-
-            Ok(Response::new(QueryResponse {
-                status: Some(Self::build_simple_response()),
-                hit_blocks,
-                prefetch_state: prefetch_state.into(),
-                loading_blocks,
-                missing_blocks,
-            }))
-        };
-
-        let result: Result<Response<QueryResponse>, Status> = trace_in_span!(root, fut).await;
-
-        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-        match &result {
-            Ok(response) => {
-                let resp = response.get_ref();
-                debug!(
-                    "RPC [query_remote_fetch] completed: ok hit={} loading={} missing={} elapsed_ms={:.2}",
-                    resp.hit_blocks, resp.loading_blocks, resp.missing_blocks, elapsed_ms
-                )
-            }
-            Err(status) => warn!(
-                "RPC [query_remote_fetch] failed: code={} message={} elapsed_ms={:.2}",
-                status.code(),
-                status.message(),
-                elapsed_ms
-            ),
-        }
-        record_rpc_result("query_remote_fetch", &result, start);
         result
     }
 

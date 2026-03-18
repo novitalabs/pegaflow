@@ -125,73 +125,69 @@ async fn execute_remote_fetch_inner(
         return Ok(Vec::new());
     }
 
+    // MetaServer returns at most one node (the best match).
+    let node_blocks = &meta_resp.node_blocks[0];
     let mut fetched_blocks: Vec<(BlockKey, Arc<SealedBlock>)> = Vec::new();
 
-    // Step 2: For each remote node with matching blocks
-    for node_blocks in &meta_resp.node_blocks {
-        let endpoint = format!("http://{}", node_blocks.node);
+    let endpoint = format!("http://{}", node_blocks.node);
 
-        let client: PegaflowClient = match config.client_pool.get_or_connect(&endpoint).await {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("Failed to connect to remote node {endpoint}: {e}");
-                core_metrics()
-                    .remote_fetch_blocks_missed
-                    .add(node_blocks.block_hashes.len() as u64, &[]);
-                continue;
-            }
-        };
-
-        // Step 3: Query remote node for RDMA metadata + lock blocks
-        let transfer_resp = match client
-            .query_blocks_for_transfer(namespace, &node_blocks.block_hashes, "remote-fetch")
+    let client: PegaflowClient =
+        config
+            .client_pool
+            .get_or_connect(&endpoint)
             .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("QueryBlocksForTransfer failed for {endpoint}: {e}");
+            .map_err(|e| {
                 core_metrics()
                     .remote_fetch_blocks_missed
                     .add(node_blocks.block_hashes.len() as u64, &[]);
-                continue;
-            }
-        };
+                format!("Failed to connect to remote node {endpoint}: {e}")
+            })?;
 
-        if transfer_resp.rdma_session_id.is_empty() {
-            warn!("Remote node {endpoint} returned empty RDMA session ID");
+    // Query remote node for RDMA metadata + lock blocks
+    let transfer_resp = client
+        .query_blocks_for_transfer(namespace, &node_blocks.block_hashes, "remote-fetch")
+        .await
+        .map_err(|e| {
             core_metrics()
                 .remote_fetch_blocks_missed
                 .add(node_blocks.block_hashes.len() as u64, &[]);
-            // Release lock since we can't do RDMA
-            let _ = client
-                .release_transfer_lock(&transfer_resp.transfer_session_id)
-                .await;
-            continue;
-        }
+            format!("QueryBlocksForTransfer failed for {endpoint}: {e}")
+        })?;
 
-        // Step 4: RDMA fetch for each block
-        for block_info in &transfer_resp.blocks {
-            match fetch_single_block(
-                config,
-                block_info,
-                &transfer_resp.rdma_session_id,
-                namespace,
-            ) {
-                Ok(result) => fetched_blocks.push(result),
-                Err(e) => {
-                    warn!("Failed to fetch block via RDMA: {e}");
-                    core_metrics().remote_fetch_blocks_missed.add(1, &[]);
-                }
+    if transfer_resp.rdma_session_id.is_empty() {
+        warn!("Remote node {endpoint} returned empty RDMA session ID");
+        core_metrics()
+            .remote_fetch_blocks_missed
+            .add(node_blocks.block_hashes.len() as u64, &[]);
+        // Release lock since we can't do RDMA
+        let _ = client
+            .release_transfer_lock(&transfer_resp.transfer_session_id)
+            .await;
+        return Ok(Vec::new());
+    }
+
+    // RDMA fetch for each block
+    for block_info in &transfer_resp.blocks {
+        match fetch_single_block(
+            config,
+            block_info,
+            &transfer_resp.rdma_session_id,
+            namespace,
+        ) {
+            Ok(result) => fetched_blocks.push(result),
+            Err(e) => {
+                warn!("Failed to fetch block via RDMA: {e}");
+                core_metrics().remote_fetch_blocks_missed.add(1, &[]);
             }
         }
+    }
 
-        // Step 5: Release remote locks
-        if let Err(e) = client
-            .release_transfer_lock(&transfer_resp.transfer_session_id)
-            .await
-        {
-            warn!("Failed to release transfer lock on {endpoint}: {e} (will auto-expire)");
-        }
+    // Release remote locks
+    if let Err(e) = client
+        .release_transfer_lock(&transfer_resp.transfer_session_id)
+        .await
+    {
+        warn!("Failed to release transfer lock on {endpoint}: {e} (will auto-expire)");
     }
 
     Ok(fetched_blocks)

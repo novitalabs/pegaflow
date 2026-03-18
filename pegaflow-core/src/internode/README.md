@@ -115,25 +115,28 @@ with an async tokio task draining the channel on the other end.
 
 ## How remote_fetch_worker.rs Integrates
 
-The remote fetch plugs into the **read path** via `RemoteFetchScheduler`:
+The remote fetch plugs into the **read path** via `PrefetchScheduler` (unified with SSD prefetch):
 
 ```
-StorageEngine::check_prefix_and_remote_fetch()
-  └─► RemoteFetchScheduler::check_and_fetch()
+StorageEngine::check_prefix_and_prefetch()
+  └─► PrefetchScheduler::check_and_prefetch()
         ├─► Poll existing fetch (oneshot try_recv)
         ├─► Prefix scan ReadCache
-        └─► Dispatch: RemoteFetchFn(missing_keys, oneshot_tx)
+        └─► Dispatch (if remote configured): RemoteFetchFn(missing_keys, oneshot_tx)
               └─► tokio::spawn(execute_remote_fetch(...))
                     ├─► MetaServerQueryClient::query_block_hashes()
+                    │     → MetaServer returns single best-match node
                     ├─► PegaflowClient::query_blocks_for_transfer()
                     ├─► RDMA READ via RdmaBatchReadFn
                     └─► oneshot_tx.send(fetched_blocks)
 ```
 
-The state machine mirrors `prefetch.rs` (SSD prefetch):
-- Per-request tracking via `HashMap<req_id, RemoteFetchEntry>`
+The `PrefetchScheduler` handles both SSD and remote fetch (mutually exclusive):
+- Per-request tracking via `HashMap<req_id, PrefetchEntry>`
 - Non-blocking polling with `oneshot::try_recv()`
-- Backpressure via `max_remote_fetch_blocks` config
+- Backpressure via `max_prefetch_blocks` (SSD) or `max_remote_fetch_blocks` (remote)
+
+The client uses a single `QueryPrefetch` RPC for all cases.
 
 ## Configuration
 

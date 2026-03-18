@@ -33,8 +33,7 @@ pub use backing::{
     DEFAULT_SSD_WRITE_QUEUE_DEPTH, SsdCacheConfig,
 };
 pub use block::{
-    BlockHash, BlockKey, BlockStatus, LayerBlock, LayerSave, PrefetchStatus, RawBlock,
-    RemoteFetchStatus, SealedBlock,
+    BlockHash, BlockKey, BlockStatus, LayerBlock, LayerSave, PrefetchStatus, RawBlock, SealedBlock,
 };
 pub use instance::{GpuContext, InstanceContext, KVCacheRegistration};
 pub use internode::{
@@ -466,62 +465,6 @@ impl PegaEngine {
             block_hashes.len()
         );
         Ok(unpinned)
-    }
-
-    // =========================================================================
-    // Cross-node transfer: requesting side
-    // =========================================================================
-
-    /// Count prefix hit blocks with cross-node remote fetch support.
-    ///
-    /// Returns:
-    /// - `Done { hit, missing: 0 }`: all blocks in memory cache
-    /// - `Loading { hit, loading }`: some blocks being fetched from remote nodes via RDMA
-    /// - `Done { hit, missing }`: some blocks don't exist anywhere
-    #[cfg_attr(
-        feature = "tracing",
-        fastrace::trace(name = "query_remote_fetch.count_prefix_hit")
-    )]
-    pub fn count_prefix_hit_blocks_with_remote_fetch(
-        &self,
-        instance_id: &str,
-        req_id: &str,
-        block_hashes: &[Vec<u8>],
-    ) -> Result<RemoteFetchStatus, EngineError> {
-        if req_id.is_empty() {
-            warn!("count_prefix_hit_blocks_with_remote_fetch: empty req_id, returning 0 hits");
-            return Ok(RemoteFetchStatus::Done {
-                hit: 0,
-                missing: block_hashes.len(),
-            });
-        }
-
-        let instance = self.get_instance(instance_id)?;
-        let namespace = instance.namespace();
-        let world_size = instance.world_size();
-        let metrics = core_metrics();
-
-        let status = self.storage.check_prefix_and_remote_fetch(
-            instance_id,
-            req_id,
-            namespace,
-            block_hashes,
-            world_size,
-        );
-
-        match &status {
-            RemoteFetchStatus::Done { hit, missing } => {
-                metrics.cache_block_hits.add(*hit as u64, &[]);
-                if *missing > 0 {
-                    metrics.cache_block_misses.add(*missing as u64, &[]);
-                }
-            }
-            RemoteFetchStatus::Loading { hit, loading: _ } => {
-                metrics.cache_block_hits.add(*hit as u64, &[]);
-            }
-        }
-
-        Ok(status)
     }
 
     // =========================================================================

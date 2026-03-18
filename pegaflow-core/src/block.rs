@@ -76,9 +76,6 @@ pub enum PrefetchStatus {
     Done { hit: usize, missing: usize },
 }
 
-/// Result of checking prefix hits with cross-node remote fetch support
-pub use crate::storage::remote_fetch::RemoteFetchStatus;
-
 // ============================================================================
 // Segment + RawBlock (storage-level, layout-agnostic)
 // ============================================================================

@@ -399,12 +399,6 @@ pub(crate) mod test_utils {
         ) -> Result<Response<QueryResponse>, Status> {
             Err(Status::unimplemented("not used in test"))
         }
-        async fn query_remote_fetch(
-            &self,
-            _: Request<QueryRequest>,
-        ) -> Result<Response<QueryResponse>, Status> {
-            Err(Status::unimplemented("not used in test"))
-        }
         async fn unpin(&self, _: Request<UnpinRequest>) -> Result<Response<UnpinResponse>, Status> {
             Err(Status::unimplemented("not used in test"))
         }

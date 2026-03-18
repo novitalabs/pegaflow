@@ -1,5 +1,7 @@
 // Per-request prefetch state machine. A single Mutex is sufficient because
 // prefetch operations are per-query (low frequency, never a bottleneck).
+//
+// Handles both SSD prefetch and cross-node remote fetch (mutually exclusive).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,12 +13,15 @@ use tokio::sync::oneshot;
 use crate::backing::{PrefetchResult, SsdBackingStore};
 use crate::block::{BlockKey, PrefetchStatus};
 use crate::metrics::core_metrics;
+use crate::storage::remote_fetch::RemoteFetchFn;
 
 use super::read_cache::ReadCache;
 
 struct PrefetchEntry {
     blocks_rx: oneshot::Receiver<PrefetchResult>,
     loading_count: usize,
+    /// True when this entry was dispatched via remote RDMA fetch (for metrics).
+    is_remote: bool,
 }
 
 struct PrefetchState {
@@ -40,10 +45,18 @@ pub(super) struct PrefetchScheduler {
     state: Mutex<PrefetchState>,
     ssd_store: Option<Arc<SsdBackingStore>>,
     max_prefetch_blocks: usize,
+    remote_fetch_fn: Option<RemoteFetchFn>,
+    max_remote_fetch_blocks: usize,
 }
 
 impl PrefetchScheduler {
-    pub(super) fn new(ssd_store: Option<Arc<SsdBackingStore>>, max_prefetch_blocks: usize) -> Self {
+    pub(super) fn new(
+        ssd_store: Option<Arc<SsdBackingStore>>,
+        max_prefetch_blocks: usize,
+        remote_fetch: Option<(RemoteFetchFn, usize)>,
+    ) -> Self {
+        let (remote_fetch_fn, max_remote_fetch_blocks) =
+            remote_fetch.map(|(f, m)| (Some(f), m)).unwrap_or((None, 0));
         Self {
             state: Mutex::new(PrefetchState {
                 active: HashMap::new(),
@@ -51,6 +64,8 @@ impl PrefetchScheduler {
             }),
             ssd_store,
             max_prefetch_blocks,
+            remote_fetch_fn,
+            max_remote_fetch_blocks,
         }
     }
 
@@ -91,16 +106,27 @@ impl PrefetchScheduler {
 
         match entry.blocks_rx.try_recv() {
             Err(oneshot::error::TryRecvError::Empty) => Some(PollResult::StillLoading),
-            Ok(ssd_blocks) => {
+            Ok(blocks) => {
+                let is_remote = entry.is_remote;
                 state.remove_entry(req_id);
                 drop(state);
-                read_cache.batch_insert(ssd_blocks);
+                if is_remote && !blocks.is_empty() {
+                    core_metrics()
+                        .remote_fetch_blocks_hit
+                        .add(blocks.len() as u64, &[]);
+                }
+                read_cache.batch_insert(blocks);
                 Some(PollResult::Completed)
             }
             Err(oneshot::error::TryRecvError::Closed) => {
+                let source = if entry.is_remote {
+                    "Remote fetch"
+                } else {
+                    "Backing prefetch"
+                };
                 warn!(
-                    "Backing prefetch sender dropped for req_id={}, falling back to re-scan",
-                    req_id
+                    "{} sender dropped for req_id={}, falling back to re-scan",
+                    source, req_id
                 );
                 state.remove_entry(req_id);
                 Some(PollResult::Completed)
@@ -127,43 +153,74 @@ impl PrefetchScheduler {
         let remaining = &keys[hit..];
         let mut loading = 0usize;
         let mut blocks_rx: Option<oneshot::Receiver<PrefetchResult>> = None;
+        let mut is_remote_entry = false;
 
-        let has_backing = self.ssd_store.is_some();
+        let is_remote = self.remote_fetch_fn.is_some();
+        let has_backing = self.ssd_store.is_some() || is_remote;
+        let max_blocks = if is_remote {
+            self.max_remote_fetch_blocks
+        } else {
+            self.max_prefetch_blocks
+        };
 
         let check_keys = if !remaining.is_empty() && has_backing {
             let available = {
                 let state = self.state.lock();
-                self.max_prefetch_blocks
-                    .saturating_sub(state.inflight_count)
+                max_blocks.saturating_sub(state.inflight_count)
             };
             if available > 0 {
                 let check_limit = remaining.len().min(available);
                 let backpressure_skipped = remaining.len() - check_limit;
                 if backpressure_skipped > 0 {
-                    core_metrics()
-                        .ssd_prefetch_backpressure_blocks
-                        .add(backpressure_skipped as u64, &[]);
+                    if is_remote {
+                        core_metrics()
+                            .remote_fetch_backpressure_blocks
+                            .add(backpressure_skipped as u64, &[]);
+                    } else {
+                        core_metrics()
+                            .ssd_prefetch_backpressure_blocks
+                            .add(backpressure_skipped as u64, &[]);
+                    }
                 }
                 Some(remaining[..check_limit].to_vec())
             } else {
-                core_metrics()
-                    .ssd_prefetch_backpressure_blocks
-                    .add(remaining.len() as u64, &[]);
+                if is_remote {
+                    core_metrics()
+                        .remote_fetch_backpressure_blocks
+                        .add(remaining.len() as u64, &[]);
+                } else {
+                    core_metrics()
+                        .ssd_prefetch_backpressure_blocks
+                        .add(remaining.len() as u64, &[]);
+                }
                 None
             }
         } else {
             None
         };
 
-        if let Some(check_keys) = check_keys
+        // SSD prefetch path
+        if let Some(check_keys) = &check_keys
             && let Some(ssd) = &self.ssd_store
         {
-            let (found, rx) = ssd.submit_prefix(check_keys);
+            let (found, rx) = ssd.submit_prefix(check_keys.clone());
             if found > 0 {
                 self.state.lock().inflight_count += found;
                 loading = found;
                 blocks_rx = Some(rx);
             }
+        }
+        // Remote fetch path (mutually exclusive with SSD)
+        else if let Some(check_keys) = &check_keys
+            && let Some(ref fetch_fn) = self.remote_fetch_fn
+        {
+            let (tx, rx) = oneshot::channel();
+            (fetch_fn)(check_keys.clone(), tx);
+            loading = check_keys.len();
+            blocks_rx = Some(rx);
+            self.state.lock().inflight_count += loading;
+            core_metrics().remote_fetch_requests_total.add(1, &[]);
+            is_remote_entry = true;
         }
 
         let missing = keys.len() - hit - loading;
@@ -176,6 +233,7 @@ impl PrefetchScheduler {
                     PrefetchEntry {
                         blocks_rx: rx,
                         loading_count: loading,
+                        is_remote: is_remote_entry,
                     },
                 );
             }
@@ -190,4 +248,232 @@ impl PrefetchScheduler {
 enum PollResult {
     StillLoading,
     Completed,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block::SealedBlock;
+
+    fn make_read_cache() -> Arc<ReadCache> {
+        Arc::new(ReadCache::new(1 << 20, false, None))
+    }
+
+    fn noop_remote_fetch_fn() -> RemoteFetchFn {
+        Arc::new(|_keys, _tx| {
+            // Don't send anything — simulates a fetch that never completes
+        })
+    }
+
+    fn immediate_remote_fetch_fn() -> RemoteFetchFn {
+        Arc::new(|keys, tx| {
+            let blocks: Vec<(BlockKey, Arc<SealedBlock>)> = keys
+                .into_iter()
+                .map(|key| (key, Arc::new(SealedBlock::from_slots(Vec::new()))))
+                .collect();
+            let _ = tx.send(blocks);
+        })
+    }
+
+    // ---- SSD-less, remote-less tests ----
+
+    #[tokio::test]
+    async fn all_hit_no_backing() {
+        let cache = make_read_cache();
+        let scheduler = PrefetchScheduler::new(None, 100, None);
+
+        let key = BlockKey::new("ns".into(), vec![1]);
+        let block = Arc::new(SealedBlock::from_slots(Vec::new()));
+        cache.batch_insert(vec![(key, block)]);
+
+        let status = scheduler
+            .check_and_prefetch(&cache, "inst", "req1", "ns", &[vec![1]], 1)
+            .await;
+        assert!(matches!(
+            status,
+            PrefetchStatus::Done { hit: 1, missing: 0 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn all_miss_no_backing() {
+        let cache = make_read_cache();
+        let scheduler = PrefetchScheduler::new(None, 100, None);
+
+        let status = scheduler
+            .check_and_prefetch(&cache, "inst", "req1", "ns", &[vec![1]], 1)
+            .await;
+        assert!(matches!(
+            status,
+            PrefetchStatus::Done { hit: 0, missing: 1 }
+        ));
+    }
+
+    // ---- Remote fetch tests ----
+
+    #[tokio::test]
+    async fn remote_fetch_dispatched_when_configured() {
+        let cache = make_read_cache();
+        let scheduler = PrefetchScheduler::new(None, 100, Some((noop_remote_fetch_fn(), 100)));
+
+        let status = scheduler
+            .check_and_prefetch(&cache, "inst", "req1", "ns", &[vec![1]], 1)
+            .await;
+        assert!(matches!(
+            status,
+            PrefetchStatus::Loading { hit: 0, loading: 1 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_fetch_all_hit_returns_done() {
+        let cache = make_read_cache();
+        let scheduler = PrefetchScheduler::new(None, 100, Some((noop_remote_fetch_fn(), 100)));
+
+        // Insert block into cache
+        let key = BlockKey::new("ns".into(), vec![1]);
+        let block = Arc::new(SealedBlock::from_slots(Vec::new()));
+        cache.batch_insert(vec![(key, block)]);
+
+        let status = scheduler
+            .check_and_prefetch(&cache, "inst", "req1", "ns", &[vec![1]], 1)
+            .await;
+        assert!(matches!(
+            status,
+            PrefetchStatus::Done { hit: 1, missing: 0 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_fetch_immediate_completes_on_second_call() {
+        let cache = make_read_cache();
+        let scheduler = PrefetchScheduler::new(None, 100, Some((immediate_remote_fetch_fn(), 100)));
+
+        // First call triggers fetch
+        let status = scheduler
+            .check_and_prefetch(&cache, "inst", "req1", "ns", &[vec![1]], 1)
+            .await;
+        assert!(matches!(status, PrefetchStatus::Loading { .. }));
+
+        // Second call polls completed fetch, inserts into cache, re-scans -> all hit
+        let status = scheduler
+            .check_and_prefetch(&cache, "inst", "req1", "ns", &[vec![1]], 1)
+            .await;
+        assert!(matches!(
+            status,
+            PrefetchStatus::Done { hit: 1, missing: 0 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_fetch_backpressure_limits_fetch() {
+        let cache = make_read_cache();
+        let scheduler = PrefetchScheduler::new(None, 100, Some((noop_remote_fetch_fn(), 1)));
+
+        // First fetch uses up all capacity
+        let status = scheduler
+            .check_and_prefetch(&cache, "inst", "req1", "ns", &[vec![1]], 1)
+            .await;
+        assert!(matches!(status, PrefetchStatus::Loading { .. }));
+
+        // Second fetch for different req_id — backpressure
+        let status = scheduler
+            .check_and_prefetch(&cache, "inst", "req2", "ns", &[vec![2]], 1)
+            .await;
+        assert!(matches!(
+            status,
+            PrefetchStatus::Done { hit: 0, missing: 1 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_fetch_mixed_prefix_some_hit_some_remote() {
+        let cache = make_read_cache();
+        let scheduler = PrefetchScheduler::new(None, 100, Some((noop_remote_fetch_fn(), 100)));
+
+        // Insert first block; second is missing
+        let key1 = BlockKey::new("ns".into(), vec![1]);
+        let block1 = Arc::new(SealedBlock::from_slots(Vec::new()));
+        cache.batch_insert(vec![(key1, block1)]);
+
+        let status = scheduler
+            .check_and_prefetch(&cache, "inst", "req1", "ns", &[vec![1], vec![2]], 1)
+            .await;
+        assert!(matches!(
+            status,
+            PrefetchStatus::Loading { hit: 1, loading: 1 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_fetch_partial_backpressure() {
+        let cache = make_read_cache();
+        // Capacity for exactly 2 blocks
+        let scheduler = PrefetchScheduler::new(None, 100, Some((noop_remote_fetch_fn(), 2)));
+
+        let status = scheduler
+            .check_and_prefetch(
+                &cache,
+                "inst",
+                "req1",
+                "ns",
+                &[vec![1], vec![2], vec![3]],
+                1,
+            )
+            .await;
+        // All 3 are missing, but loading is capped at 2
+        assert!(matches!(
+            status,
+            PrefetchStatus::Loading { hit: 0, loading: 2 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_fetch_sender_dropped_rescans() {
+        let cache = make_read_cache();
+        // noop drops the sender immediately
+        let scheduler = PrefetchScheduler::new(None, 100, Some((noop_remote_fetch_fn(), 100)));
+
+        // First call dispatches; sender is already dropped
+        let status = scheduler
+            .check_and_prefetch(&cache, "inst", "req1", "ns", &[vec![1]], 1)
+            .await;
+        assert!(matches!(status, PrefetchStatus::Loading { .. }));
+
+        // Second call: poll sees Closed -> Completed -> re-scan -> still missing -> new fetch
+        let status = scheduler
+            .check_and_prefetch(&cache, "inst", "req1", "ns", &[vec![1]], 1)
+            .await;
+        assert!(matches!(status, PrefetchStatus::Loading { .. }));
+    }
+
+    #[tokio::test]
+    async fn remote_fetch_different_req_ids_independent() {
+        let cache = make_read_cache();
+        let scheduler = PrefetchScheduler::new(None, 100, Some((noop_remote_fetch_fn(), 100)));
+
+        let status = scheduler
+            .check_and_prefetch(&cache, "inst", "req1", "ns", &[vec![1]], 1)
+            .await;
+        assert!(matches!(status, PrefetchStatus::Loading { .. }));
+
+        let status = scheduler
+            .check_and_prefetch(&cache, "inst", "req2", "ns", &[vec![2]], 1)
+            .await;
+        assert!(matches!(status, PrefetchStatus::Loading { .. }));
+    }
+
+    #[tokio::test]
+    async fn remote_fetch_empty_hashes() {
+        let cache = make_read_cache();
+        let scheduler = PrefetchScheduler::new(None, 100, Some((noop_remote_fetch_fn(), 100)));
+
+        let status = scheduler
+            .check_and_prefetch(&cache, "inst", "req1", "ns", &[], 1)
+            .await;
+        assert!(matches!(
+            status,
+            PrefetchStatus::Done { hit: 0, missing: 0 }
+        ));
+    }
 }
