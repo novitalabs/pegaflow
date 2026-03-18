@@ -7,7 +7,7 @@ A comprehensive guide for LLM agents working with the PegaFlow repository. PegaF
 PegaFlow enables efficient KV cache offloading and sharing for LLM inference workloads:
 
 - **Single-node KV cache offloading** — offload KV cache to host memory and restore it back to GPU with minimal latency
-- **P/D disaggregation** — separate prefill and decode phases across GPUs for better resource utilization
+- **Cross-node KV cache sharing** — share cached blocks across nodes via RDMA to avoid recomputation
 - **Prefix Caching** — reuse computed KV cache across requests
 - **High-performance transport** — based on CUDA IPC and zero-copy techniques
 - **~9x TTFT improvement** — warm-start requests achieve dramatically lower time-to-first-token
@@ -18,7 +18,7 @@ PegaFlow enables efficient KV cache offloading and sharing for LLM inference wor
 pegaflow/
 ├── pegaflow-core/          # Core Rust engine (storage/transfer/allocator)
 ├── pegaflow-proto/         # Protobuf/gRPC definitions
-├── pegaflow-server/        # gRPC server + P/D Router
+├── pegaflow-server/        # gRPC server + request router
 ├── python/                 # PyO3 bindings + Python connector
 │   ├── src/lib.rs          # PyO3 bindings entry point
 │   ├── pegaflow/connector/ # vLLM v1 connector (scheduler/worker)
@@ -69,7 +69,7 @@ Proto files define service interfaces including instance registration, KV operat
 | `main.rs` | Server binary entry point |
 | `service.rs` | Tonic gRPC service implementation |
 | `registry.rs` | Instance/worker registry |
-| `bin/pegaflow-router.rs` | P/D disaggregation router |
+| `bin/pegaflow-router.rs` | P/D request router |
 | `utils.rs` | Utility functions (e.g., memory size parsing) |
 | `metric.rs` | Server metrics and monitoring |
 

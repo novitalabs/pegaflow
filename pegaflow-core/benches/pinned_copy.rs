@@ -28,11 +28,18 @@ impl TransferFixture {
 
         let block_bytes = bytes_per_block * segments;
         let mut host_ptr: *mut c_void = ptr::null_mut();
+        // SAFETY: host_ptr is a valid stack pointer, block_bytes > 0 (asserted above).
         check_cuda(
             unsafe { sys::cuMemAllocHost_v2(&mut host_ptr, block_bytes) },
             "cuMemAllocHost_v2",
         );
+        assert!(
+            !host_ptr.is_null(),
+            "cuMemAllocHost_v2 returned null pointer"
+        );
         let host_ptr = host_ptr as *mut u8;
+        // SAFETY: host_ptr is non-null (asserted) and valid for block_bytes
+        // from cuMemAllocHost_v2.
         unsafe {
             let slice = std::slice::from_raw_parts_mut(host_ptr, block_bytes);
             for (idx, byte) in slice.iter_mut().enumerate() {
@@ -42,6 +49,7 @@ impl TransferFixture {
 
         let mut device_ptr: sys::CUdeviceptr = 0;
         let device_bytes = kv_stride * (segments - 1) + bytes_per_block;
+        // SAFETY: device_ptr is a valid stack pointer, device_bytes > 0.
         check_cuda(
             unsafe { sys::cuMemAlloc_v2(&mut device_ptr, device_bytes) },
             "cuMemAlloc_v2",
@@ -69,6 +77,7 @@ impl TransferFixture {
 
     fn copy_single(&self) {
         self.ensure_context();
+        // SAFETY: device_ptr and host_ptr are valid; block_bytes fits both allocations.
         check_cuda(
             unsafe {
                 sys::cuMemcpyHtoD_v2(
@@ -84,8 +93,10 @@ impl TransferFixture {
     fn copy_segments(&self) {
         self.ensure_context();
         for segment in 0..self.segments {
+            // SAFETY: host_ptr + segment*bytes_per_block is within the block_bytes allocation.
             let src = unsafe { self.host_ptr.add(segment * self.bytes_per_block) };
             let dst = self.device_ptr + (segment * self.kv_stride) as u64;
+            // SAFETY: src and dst are valid pointers within their respective allocations.
             check_cuda(
                 unsafe { sys::cuMemcpyHtoD_v2(dst, src as *const c_void, self.bytes_per_block) },
                 "cuMemcpyHtoD_v2(segment)",
@@ -114,6 +125,7 @@ impl TransferFixture {
             Height: self.segments,
         };
 
+        // SAFETY: request fields reference valid host/device memory with correct pitches.
         check_cuda(unsafe { sys::cuMemcpy2D_v2(&request) }, "cuMemcpy2D_v2");
     }
 }
@@ -122,10 +134,18 @@ impl Drop for TransferFixture {
     fn drop(&mut self) {
         unsafe {
             if self.device_ptr != 0 {
-                sys::cuMemFree_v2(self.device_ptr);
+                // SAFETY: self.device_ptr was allocated by cuMemAlloc_v2 and has not been freed.
+                let r = sys::cuMemFree_v2(self.device_ptr);
+                if r != sys::CUresult::CUDA_SUCCESS {
+                    eprintln!("cuMemFree_v2 failed in Drop: {r:?}");
+                }
             }
             if !self.host_ptr.is_null() {
-                sys::cuMemFreeHost(self.host_ptr as *mut c_void);
+                // SAFETY: self.host_ptr was allocated by cuMemAllocHost_v2 and has not been freed.
+                let r = sys::cuMemFreeHost(self.host_ptr as *mut c_void);
+                if r != sys::CUresult::CUDA_SUCCESS {
+                    eprintln!("cuMemFreeHost failed in Drop: {r:?}");
+                }
             }
         }
     }

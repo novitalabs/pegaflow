@@ -55,6 +55,8 @@ fn copy_gpu_to_cpu_async(
 
     let src_ptr = gpu_base_ptr + offset as u64;
 
+    // SAFETY: src_ptr is gpu_base_ptr + offset, within a valid GPU allocation.
+    // dst_ptr points to pinned CPU memory of sufficient size. The stream is valid.
     unsafe {
         let result = sys::cuMemcpyDtoHAsync_v2(
             dst_ptr as *mut std::ffi::c_void,
@@ -91,6 +93,8 @@ fn copy_cpu_to_gpu_async(
     let dst_ptr = gpu_base_ptr + offset as u64;
     let src_ptr = cpu_buffer.as_ptr();
 
+    // SAFETY: dst_ptr is gpu_base_ptr + offset, within a valid GPU allocation.
+    // src_ptr is validated to have at least `size` bytes above. The stream is valid.
     unsafe {
         let result = sys::cuMemcpyHtoDAsync_v2(
             dst_ptr,
@@ -130,6 +134,8 @@ pub(crate) fn batch_copy_segments_to_gpu(
             let (next_gpu_offset, next_cpu_ptr) = transfers[i + count];
 
             let expected_gpu_offset = start_gpu_offset + count * segment_size;
+            // SAFETY: All cpu_ptr values in `transfers` point into the same contiguous
+            // allocation. This arithmetic is used only for contiguity comparison.
             let expected_cpu_ptr = unsafe { start_cpu_ptr.add(count * segment_size) };
 
             let gpu_contiguous = next_gpu_offset == expected_gpu_offset;
@@ -146,6 +152,9 @@ pub(crate) fn batch_copy_segments_to_gpu(
             .checked_mul(count)
             .ok_or_else(|| "batch_copy_segments_to_gpu: total_size overflow".to_string())?;
 
+        // SAFETY: start_cpu_ptr points to valid, initialized pinned memory of at least
+        // total_size bytes. The contiguity check above confirms the segments form a
+        // single contiguous range. total_size is checked via checked_mul.
         let buffer = unsafe { std::slice::from_raw_parts(start_cpu_ptr, total_size) };
         copy_cpu_to_gpu_async(
             registration.data_ptr,
@@ -186,6 +195,8 @@ pub(crate) fn batch_copy_segments_from_gpu(
             let (next_gpu_offset, next_cpu_ptr) = transfers[i + count];
 
             let expected_gpu_offset = start_gpu_offset + count * segment_size;
+            // SAFETY: All cpu_ptr values in `transfers` point into the same contiguous
+            // allocation. This arithmetic is used only for contiguity comparison.
             let expected_cpu_ptr = unsafe { start_cpu_ptr.add(count * segment_size) };
 
             let gpu_contiguous = next_gpu_offset == expected_gpu_offset;

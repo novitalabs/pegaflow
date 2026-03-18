@@ -54,7 +54,7 @@ uv run python examples/bench_kv_cache.py --model /path/to/model --num-prompts 10
 ## Key Files
 
 - `pegaflow-server/src/service.rs`: gRPC service implementation
-- `pegaflow-server/src/bin/pegaflow-router.rs`: P/D disaggregation router
+- `pegaflow-server/src/bin/pegaflow-router.rs`: P/D request router
 - `pegaflow-metaserver/src/lib.rs`: MetaServer entry point and CLI
 - `pegaflow-metaserver/src/service.rs`: MetaServer gRPC service
 - `pegaflow-metaserver/src/store.rs`: Block hash store (LRU + TTL, backed by moka)
