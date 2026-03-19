@@ -13,7 +13,9 @@ use sideway::ibverbs::AccessFlags;
 use self::runtime::RcRuntime;
 use self::session::{RcSession, RdmaOp};
 use self::state::{RcBackendState, RegisteredMemoryEntry};
-use crate::engine::{NicHandshake, RegisteredMemoryRegion, TransferOp};
+use std::ptr::NonNull;
+
+use crate::engine::{NicHandshake, RegisteredMemoryRegion, TransferDesc, TransferOp};
 use crate::error::{Result, TransferError};
 
 pub(crate) struct RcBackend {
@@ -52,20 +54,18 @@ impl RcBackend {
         self.runtimes.len()
     }
 
-    pub(crate) fn register_memory(&self, ptr: u64, len: usize) -> Result<()> {
-        if ptr == 0 {
-            return Err(TransferError::InvalidArgument("ptr must be non-zero"));
-        }
+    pub(crate) fn register_memory(&self, ptr: NonNull<u8>, len: usize) -> Result<()> {
         if len == 0 {
             return Err(TransferError::InvalidArgument("len must be non-zero"));
         }
+        let raw = ptr.as_ptr() as u64;
 
         // Register on every NIC's PD.
         let mut mrs = Vec::with_capacity(self.nic_count());
         for runtime in &self.runtimes {
             let mr = unsafe {
                 runtime.pd.reg_mr(
-                    ptr as usize,
+                    raw as usize,
                     len,
                     AccessFlags::LocalWrite | AccessFlags::RemoteWrite | AccessFlags::RemoteRead,
                 )
@@ -73,36 +73,33 @@ impl RcBackend {
             .map_err(|error| TransferError::Backend(error.to_string()))?;
             mrs.push(mr);
         }
-        // If we reach here, all NIC registrations succeeded.
 
         let mut state = self.state.lock();
         state.registered.insert(
-            ptr,
+            raw,
             RegisteredMemoryEntry {
-                base_ptr: ptr,
+                base_ptr: raw,
                 len,
                 mrs,
             },
         );
         debug!(
             "memory registered: ptr={:#x}, len={}, nics={}",
-            ptr,
+            raw,
             len,
             self.nic_count()
         );
         Ok(())
     }
 
-    pub(crate) fn unregister_memory(&self, ptr: u64) -> Result<()> {
-        if ptr == 0 {
-            return Err(TransferError::InvalidArgument("ptr must be non-zero"));
-        }
+    pub(crate) fn unregister_memory(&self, ptr: NonNull<u8>) -> Result<()> {
+        let raw = ptr.as_ptr() as u64;
         let mut state = self.state.lock();
-        let removed = state.registered.remove(&ptr);
+        let removed = state.registered.remove(&raw);
         if removed.is_none() {
-            return Err(TransferError::MemoryNotRegistered { ptr });
+            return Err(TransferError::MemoryNotRegistered { ptr: raw });
         }
-        debug!("memory unregistered: ptr={:#x}", ptr);
+        debug!("memory unregistered: ptr={:#x}", raw);
         Ok(())
     }
 
@@ -199,9 +196,7 @@ impl RcBackend {
         &self,
         op: TransferOp,
         remote_nics: &[NicHandshake],
-        local_ptrs: &[u64],
-        remote_ptrs: &[u64],
-        lens: &[usize],
+        descs: &[TransferDesc],
     ) -> Result<std::sync::mpsc::Receiver<Result<usize>>> {
         let nic_count = self.nic_count();
         if remote_nics.len() != nic_count {
@@ -210,33 +205,19 @@ impl RcBackend {
             ));
         }
 
-        if lens.is_empty() {
+        if descs.is_empty() {
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
             let _ = tx.send(Ok(0));
             return Ok(rx);
         }
 
         // Round-robin assignment.
-        let rr_base = self.rr_counter.fetch_add(lens.len(), Ordering::Relaxed);
+        let rr_base = self.rr_counter.fetch_add(descs.len(), Ordering::Relaxed);
 
         // Group ops by NIC index.
-        struct NicOpsBuilder {
-            local_ptrs: Vec<u64>,
-            remote_ptrs: Vec<u64>,
-            lens: Vec<usize>,
-        }
-        let mut per_nic: Vec<NicOpsBuilder> = (0..nic_count)
-            .map(|_| NicOpsBuilder {
-                local_ptrs: Vec::new(),
-                remote_ptrs: Vec::new(),
-                lens: Vec::new(),
-            })
-            .collect();
-        for i in 0..lens.len() {
-            let nic_idx = (rr_base + i) % nic_count;
-            per_nic[nic_idx].local_ptrs.push(local_ptrs[i]);
-            per_nic[nic_idx].remote_ptrs.push(remote_ptrs[i]);
-            per_nic[nic_idx].lens.push(lens[i]);
+        let mut per_nic: Vec<Vec<TransferDesc>> = (0..nic_count).map(|_| Vec::new()).collect();
+        for (i, &desc) in descs.iter().enumerate() {
+            per_nic[(rr_base + i) % nic_count].push(desc);
         }
 
         // --- Lock: lazy connect + prepare ops ---
@@ -282,8 +263,8 @@ impl RcBackend {
 
             // Prepare ops for each NIC that has work.
             for nic_idx in 0..nic_count {
-                let builder = &per_nic[nic_idx];
-                if builder.lens.is_empty() {
+                let nic_descs = &per_nic[nic_idx];
+                if nic_descs.is_empty() {
                     continue;
                 }
 
@@ -295,20 +276,12 @@ impl RcBackend {
                         .expect("session must exist after lazy connect"),
                 );
 
-                let mut prepared = Vec::with_capacity(builder.lens.len());
-                for j in 0..builder.lens.len() {
-                    let local_ptr = builder.local_ptrs[j];
-                    let remote_ptr = builder.remote_ptrs[j];
-                    let len = builder.lens[j];
+                let mut prepared = Vec::with_capacity(nic_descs.len());
+                for desc in nic_descs {
+                    let local_ptr = desc.local_ptr.as_ptr() as u64;
+                    let remote_ptr = desc.remote_ptr.as_ptr() as u64;
+                    let len = desc.len;
 
-                    if local_ptr == 0 {
-                        return Err(TransferError::InvalidArgument("local_ptr must be non-zero"));
-                    }
-                    if remote_ptr == 0 {
-                        return Err(TransferError::InvalidArgument(
-                            "remote_ptr must be non-zero",
-                        ));
-                    }
                     if len == 0 {
                         return Err(TransferError::InvalidArgument("len must be non-zero"));
                     }
@@ -341,7 +314,7 @@ impl RcBackend {
             op,
             nic_work.len(),
             nic_count,
-            lens.len(),
+            descs.len(),
             lookup_dur.as_secs_f64() * 1000.0,
         );
 

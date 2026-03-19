@@ -6,13 +6,16 @@
 //! Models a realistic workload: each "task" transfers N random-sized batches of fixed-size blocks
 //! via RDMA, measuring per-task latency. Runs single-NIC baselines then multi-NIC aggregate.
 
+use std::ptr::NonNull;
 use std::time::Instant;
 use std::{mem, ptr, thread};
 
 use clap::Parser;
 use pegaflow_common::read_cpu_topology_from_sysfs;
 use pegaflow_transfer::rdma_topo::SystemTopology;
-use pegaflow_transfer::{HandshakeMetadata, TransferEngine, TransferOp, init_logging};
+use pegaflow_transfer::{
+    HandshakeMetadata, MemoryRegion, TransferDesc, TransferEngine, TransferOp, init_logging,
+};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -133,7 +136,7 @@ fn parse_block_range(s: &str) -> (usize, usize) {
 // ---------------------------------------------------------------------------
 
 struct NumaBuffer {
-    ptr: *mut u8,
+    ptr: NonNull<u8>,
     len: usize,
 }
 
@@ -189,28 +192,22 @@ impl NumaBuffer {
             })
             .expect("failed to spawn NUMA alloc thread");
         handle.join().expect("NUMA alloc thread panicked");
-        let raw = rx.recv().unwrap() as *mut u8;
+        let ptr = NonNull::new(rx.recv().unwrap() as *mut u8).expect("mmap returned null");
 
-        Self { ptr: raw, len }
-    }
-
-    fn as_u64(&self) -> u64 {
-        self.ptr as u64
+        Self { ptr, len }
     }
 
     fn fill(&self, pattern: u8) {
         unsafe {
-            ptr::write_bytes(self.ptr, pattern, self.len);
+            ptr::write_bytes(self.ptr.as_ptr(), pattern, self.len);
         }
     }
 }
 
 impl Drop for NumaBuffer {
     fn drop(&mut self) {
-        if !self.ptr.is_null() {
-            unsafe {
-                libc::munmap(self.ptr as *mut libc::c_void, self.len);
-            }
+        unsafe {
+            libc::munmap(self.ptr.as_ptr() as *mut libc::c_void, self.len);
         }
     }
 }
@@ -276,20 +273,21 @@ fn generate_task_schedule(
 // ---------------------------------------------------------------------------
 
 fn build_block_scatter(
-    local_base: u64,
-    remote_base: u64,
+    local_base: NonNull<u8>,
+    remote_base: NonNull<u8>,
     nblocks: usize,
     block_size: usize,
-) -> (Vec<u64>, Vec<u64>, Vec<usize>) {
-    let mut local_ptrs = Vec::with_capacity(nblocks);
-    let mut remote_ptrs = Vec::with_capacity(nblocks);
-    let lens = vec![block_size; nblocks];
-    for i in 0..nblocks {
-        let off = (i * block_size) as u64;
-        local_ptrs.push(local_base + off);
-        remote_ptrs.push(remote_base + off);
-    }
-    (local_ptrs, remote_ptrs, lens)
+) -> Vec<TransferDesc> {
+    (0..nblocks)
+        .map(|i| {
+            let off = i * block_size;
+            TransferDesc {
+                local_ptr: unsafe { NonNull::new_unchecked(local_base.as_ptr().add(off)) },
+                remote_ptr: unsafe { NonNull::new_unchecked(remote_base.as_ptr().add(off)) },
+                len: block_size,
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -320,17 +318,13 @@ fn run_bench(
     let mut tasks = Vec::with_capacity(schedule.len().saturating_sub(warmup));
 
     for (i, &nblocks) in schedule.iter().enumerate() {
-        let (local_ptrs, remote_ptrs, lens) = build_block_scatter(
-            ctx.client_buf.as_u64(),
-            ctx.server_buf.as_u64(),
-            nblocks,
-            block_size,
-        );
+        let descs =
+            build_block_scatter(ctx.client_buf.ptr, ctx.server_buf.ptr, nblocks, block_size);
 
         let start = Instant::now();
         let rx = ctx
             .client
-            .batch_transfer_async(op, &ctx.server_hs, &local_ptrs, &remote_ptrs, &lens)
+            .batch_transfer_async(op, &ctx.server_hs, &descs)
             .expect("RDMA submit failed");
         rx.recv()
             .expect("completion channel dropped")
@@ -437,12 +431,18 @@ fn create_engine_context(
 
     let server = TransferEngine::new(nic_names).expect("server init failed");
     server
-        .register_memory(&[server_buf.as_u64()], &[buf_size])
+        .register_memory(&[MemoryRegion {
+            ptr: server_buf.ptr,
+            len: buf_size,
+        }])
         .expect("server register_memory failed");
 
     let client = TransferEngine::new(nic_names).expect("client init failed");
     client
-        .register_memory(&[client_buf.as_u64()], &[buf_size])
+        .register_memory(&[MemoryRegion {
+            ptr: client_buf.ptr,
+            len: buf_size,
+        }])
         .expect("client register_memory failed");
 
     // Handshake: both sides prepare, then accept each other.
@@ -609,20 +609,12 @@ fn main() {
 
         // Cleanup.
         for ctx in &single_contexts {
-            ctx.client
-                .unregister_memory(&[ctx.client_buf.as_u64()])
-                .ok();
-            ctx.server
-                .unregister_memory(&[ctx.server_buf.as_u64()])
-                .ok();
+            ctx.client.unregister_memory(&[ctx.client_buf.ptr]).ok();
+            ctx.server.unregister_memory(&[ctx.server_buf.ptr]).ok();
         }
         if let Some(ref ctx) = multi_context {
-            ctx.client
-                .unregister_memory(&[ctx.client_buf.as_u64()])
-                .ok();
-            ctx.server
-                .unregister_memory(&[ctx.server_buf.as_u64()])
-                .ok();
+            ctx.client.unregister_memory(&[ctx.client_buf.ptr]).ok();
+            ctx.server.unregister_memory(&[ctx.server_buf.ptr]).ok();
         }
     }
 

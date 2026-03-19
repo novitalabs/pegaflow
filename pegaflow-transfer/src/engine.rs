@@ -1,3 +1,5 @@
+use std::ptr::NonNull;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, TransferError};
@@ -10,28 +12,43 @@ pub enum TransferOp {
     Write,
 }
 
+/// A memory region to register for RDMA access.
+#[derive(Clone, Copy, Debug)]
+pub struct MemoryRegion {
+    pub ptr: NonNull<u8>,
+    pub len: usize,
+}
+
+/// A single RDMA transfer descriptor.
+#[derive(Clone, Copy, Debug)]
+pub struct TransferDesc {
+    pub local_ptr: NonNull<u8>,
+    pub remote_ptr: NonNull<u8>,
+    pub len: usize,
+}
+
 /// RC queue pair endpoint info exchanged during handshake.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RcEndpoint {
-    pub gid: [u8; 16],
-    pub lid: u16,
-    pub qp_num: u32,
-    pub psn: u32,
+pub(crate) struct RcEndpoint {
+    pub(crate) gid: [u8; 16],
+    pub(crate) lid: u16,
+    pub(crate) qp_num: u32,
+    pub(crate) psn: u32,
 }
 
 /// A registered memory region descriptor (base pointer, length, remote key).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RegisteredMemoryRegion {
-    pub base_ptr: u64,
-    pub len: u64,
-    pub rkey: u32,
+pub(crate) struct RegisteredMemoryRegion {
+    pub(crate) base_ptr: u64,
+    pub(crate) len: u64,
+    pub(crate) rkey: u32,
 }
 
 /// Per-NIC handshake data: endpoint + memory region snapshot.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct NicHandshake {
-    pub endpoint: RcEndpoint,
-    pub memory_regions: Vec<RegisteredMemoryRegion>,
+pub(crate) struct NicHandshake {
+    pub(crate) endpoint: RcEndpoint,
+    pub(crate) memory_regions: Vec<RegisteredMemoryRegion>,
 }
 
 /// Opaque handshake metadata exchanged between peers via gRPC.
@@ -83,20 +100,14 @@ impl TransferEngine {
         })
     }
 
-    pub fn register_memory(&self, ptrs: &[u64], lens: &[usize]) -> Result<()> {
-        if ptrs.len() != lens.len() {
-            return Err(TransferError::BatchLengthMismatch {
-                ptrs: ptrs.len(),
-                lens: lens.len(),
-            });
-        }
-        for (&ptr, &len) in ptrs.iter().zip(lens.iter()) {
-            self.backend.register_memory(ptr, len)?;
+    pub fn register_memory(&self, regions: &[MemoryRegion]) -> Result<()> {
+        for region in regions {
+            self.backend.register_memory(region.ptr, region.len)?;
         }
         Ok(())
     }
 
-    pub fn unregister_memory(&self, ptrs: &[u64]) -> Result<()> {
+    pub fn unregister_memory(&self, ptrs: &[NonNull<u8>]) -> Result<()> {
         for &ptr in ptrs {
             self.backend.unregister_memory(ptr)?;
         }
@@ -134,25 +145,9 @@ impl TransferEngine {
         &self,
         op: TransferOp,
         peer: &HandshakeMetadata,
-        local_ptrs: &[u64],
-        remote_ptrs: &[u64],
-        lens: &[usize],
+        descs: &[TransferDesc],
     ) -> Result<std::sync::mpsc::Receiver<Result<usize>>> {
-        if local_ptrs.len() != remote_ptrs.len() {
-            return Err(TransferError::BatchLengthMismatch {
-                ptrs: local_ptrs.len(),
-                lens: remote_ptrs.len(),
-            });
-        }
-        if local_ptrs.len() != lens.len() {
-            return Err(TransferError::BatchLengthMismatch {
-                ptrs: local_ptrs.len(),
-                lens: lens.len(),
-            });
-        }
-
-        self.backend
-            .batch_transfer_async(op, &peer.nics, local_ptrs, remote_ptrs, lens)
+        self.backend.batch_transfer_async(op, &peer.nics, descs)
     }
 }
 
