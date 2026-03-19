@@ -407,6 +407,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         hint_value_size_bytes: cli.hint_value_size,
         max_prefetch_blocks: cli.max_prefetch_blocks,
         ssd_cache_config,
+        rdma_nic_names: None,
         enable_numa_affinity: !cli.disable_numa_affinity,
         blockwise_alloc: cli.blockwise_alloc,
     };

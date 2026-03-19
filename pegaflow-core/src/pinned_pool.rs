@@ -205,6 +205,13 @@ impl PinnedMemoryPool {
         let allocator = self.allocator.lock();
         allocator.storage_report().largest_free_allocation_bytes
     }
+
+    /// Return the base pointer and length of the backing pinned memory.
+    fn memory_region(&self) -> (NonNull<u8>, usize) {
+        let ptr = NonNull::new(self.backing.as_ptr() as *mut u8)
+            .expect("PinnedMemoryPool backing pointer is null");
+        (ptr, self.backing.size())
+    }
 }
 
 impl Drop for PinnedMemoryPool {
@@ -467,6 +474,16 @@ impl PinnedAllocator {
     /// Check if this is a NUMA allocator.
     pub(crate) fn is_numa(&self) -> bool {
         matches!(self, Self::Numa(_))
+    }
+
+    /// Return all backing memory regions as `(ptr, len)` pairs.
+    ///
+    /// For a global allocator this is a single region; for NUMA it is one per node.
+    pub(crate) fn memory_regions(&self) -> Vec<(NonNull<u8>, usize)> {
+        match self {
+            Self::Global(pool) => vec![pool.memory_region()],
+            Self::Numa(pools) => pools.pools.values().map(|p| p.memory_region()).collect(),
+        }
     }
 }
 

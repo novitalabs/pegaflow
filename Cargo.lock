@@ -2197,6 +2197,7 @@ dependencies = [
  "parking_lot",
  "pegaflow-common",
  "pegaflow-proto",
+ "pegaflow-transfer",
  "rand 0.10.0",
  "serde",
  "shared_memory",

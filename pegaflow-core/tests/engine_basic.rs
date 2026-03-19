@@ -53,6 +53,7 @@ async fn save_query_load_roundtrip_with_numa_affinity_enabled() {
                 hint_value_size_bytes: None,
                 max_prefetch_blocks: 100,
                 ssd_cache_config: None,
+                rdma_nic_names: None,
                 enable_numa_affinity: true,
                 blockwise_alloc: false,
             }),

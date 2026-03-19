@@ -33,6 +33,7 @@ async fn ssd_smoke_roundtrip_with_temp_dir() {
                     capacity_bytes: SSD_CAPACITY,
                     ..SsdCacheConfig::default()
                 }),
+                rdma_nic_names: None,
                 enable_numa_affinity: false,
                 blockwise_alloc: false,
             }),

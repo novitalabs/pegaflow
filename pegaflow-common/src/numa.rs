@@ -450,12 +450,12 @@ pub fn query_pages_numa(addrs: &[*const u8]) -> Vec<NumaNode> {
     let ret = unsafe {
         libc::syscall(
             libc::SYS_move_pages,
-            0_i32,                                        // pid: current process
-            count,                                        // count
-            pages.as_ptr(),                                // pages
-            std::ptr::null::<libc::c_int>(),              // nodes: NULL = query only
-            status.as_mut_ptr(),                          // status: output
-            0_i32,                                        // flags
+            0_i32,                           // pid: current process
+            count,                           // count
+            pages.as_ptr(),                  // pages
+            std::ptr::null::<libc::c_int>(), // nodes: NULL = query only
+            status.as_mut_ptr(),             // status: output
+            0_i32,                           // flags
         )
     };
 

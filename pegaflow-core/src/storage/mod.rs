@@ -8,7 +8,9 @@ use std::collections::HashSet;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Weak};
 
-use crate::backing::{AllocateFn, DEFAULT_MAX_PREFETCH_BLOCKS, SsdBackingStore, SsdCacheConfig};
+use crate::backing::{
+    AllocateFn, DEFAULT_MAX_PREFETCH_BLOCKS, RdmaTransport, SsdBackingStore, SsdCacheConfig,
+};
 use crate::block::{BlockKey, PrefetchStatus, SealedBlock};
 use crate::internode::MetaServerRegistrar;
 use crate::metrics::core_metrics;
@@ -30,6 +32,8 @@ pub struct StorageConfig {
     pub max_prefetch_blocks: usize,
     /// Optional SSD cache for sealed blocks (single-node, FIFO).
     pub ssd_cache_config: Option<SsdCacheConfig>,
+    /// Optional RDMA NIC names for inter-node transfer (e.g. `["mlx5_0", "mlx5_1"]`).
+    pub rdma_nic_names: Option<Vec<String>>,
     /// Enable NUMA-aware memory allocation.
     pub enable_numa_affinity: bool,
     /// Allocate each block separately instead of contiguous batch allocation.
@@ -44,6 +48,7 @@ impl Default for StorageConfig {
             hint_value_size_bytes: None,
             max_prefetch_blocks: DEFAULT_MAX_PREFETCH_BLOCKS,
             ssd_cache_config: None,
+            rdma_nic_names: None,
             enable_numa_affinity: true,
             blockwise_alloc: false,
         }
@@ -56,6 +61,8 @@ pub(crate) struct StorageEngine {
     prefetch: PrefetchScheduler,
     write_pipeline: Arc<WritePipeline>,
     ssd_store: Option<Arc<SsdBackingStore>>,
+    /// Held for RAII: Drop unregisters RDMA memory regions.
+    _rdma_transport: Option<Arc<RdmaTransport>>,
     blockwise_alloc: bool,
     metaserver_registrar: Option<Arc<MetaServerRegistrar>>,
 }
@@ -72,6 +79,7 @@ impl StorageEngine {
         let unit_hint = value_size_hint.and_then(|size| NonZeroU64::new(size as u64));
         let max_prefetch_blocks = config.max_prefetch_blocks;
         let ssd_cache_config = config.ssd_cache_config;
+        let rdma_nic_names = config.rdma_nic_names;
         let blockwise_alloc = config.blockwise_alloc;
 
         if blockwise_alloc {
@@ -113,6 +121,13 @@ impl StorageEngine {
         let (write_pipeline, insert_rx) = WritePipeline::new();
         let write_pipeline = Arc::new(write_pipeline);
 
+        // RDMA transport must be created after the allocator so it can
+        // register the pinned memory regions with the RDMA NICs.
+        let rdma_transport = rdma_nic_names
+            .as_deref()
+            .filter(|nics| !nics.is_empty())
+            .and_then(|nics| crate::backing::new_rdma(nics, &allocator));
+
         let is_numa = allocator.is_numa();
         let engine = Arc::new_cyclic(move |weak_engine: &Weak<Self>| {
             // Build shared allocate_fn for backing stores.
@@ -134,6 +149,7 @@ impl StorageEngine {
                 prefetch,
                 write_pipeline: write_pipeline.clone(),
                 ssd_store,
+                _rdma_transport: rdma_transport,
                 blockwise_alloc,
                 metaserver_registrar,
             }
