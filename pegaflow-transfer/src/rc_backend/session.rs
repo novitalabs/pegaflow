@@ -20,8 +20,14 @@ use super::runtime::RcRuntime;
 use crate::engine::{RcEndpoint, TransferOp};
 use crate::error::{Result, TransferError};
 
-const MAX_INFLIGHT_OPS: usize = 96;
 const MAX_WR_CHAIN_OPS: usize = 4;
+const MAX_SEND_WR: u32 = 128;
+// One QP per CQ; all WRs are signaled, so CQ depth = SQ depth suffices.
+const SEND_CQ_SIZE: u32 = MAX_SEND_WR;
+// Recv queue unused (one-sided RDMA only), keep minimal for driver compatibility.
+const RECV_CQ_SIZE: u32 = 2;
+const MAX_RECV_WR: u32 = 1;
+const PSN_MASK: u32 = 0x00ff_ffff;
 
 pub(crate) struct RdmaOp {
     pub(crate) local_mr: Arc<MemoryRegion>,
@@ -51,11 +57,12 @@ impl RcSession {
     /// Create an RC QP in INIT state and return the session (not yet connected).
     pub(crate) fn create(runtime: &RcRuntime, psn_seed: u64) -> Result<Arc<Self>> {
         let mut cq_builder = runtime.device_ctx.create_cq_builder();
-        cq_builder.setup_cqe(128);
+        cq_builder.setup_cqe(SEND_CQ_SIZE);
         let send_cq: GenericCompletionQueue = cq_builder
             .build()
             .map_err(|error| TransferError::Backend(error.to_string()))?
             .into();
+        cq_builder.setup_cqe(RECV_CQ_SIZE);
         let recv_cq: GenericCompletionQueue = cq_builder
             .build()
             .map_err(|error| TransferError::Backend(error.to_string()))?
@@ -66,10 +73,10 @@ impl RcSession {
             .setup_qp_type(QueuePairType::ReliableConnection)
             .setup_send_cq(send_cq.clone())
             .setup_recv_cq(recv_cq.clone())
-            .setup_max_send_wr(128)
-            .setup_max_recv_wr(16)
+            .setup_max_send_wr(MAX_SEND_WR)
+            .setup_max_recv_wr(MAX_RECV_WR)
             .setup_max_send_sge(1)
-            .setup_max_recv_sge(1);
+            .setup_max_recv_sge(0);
         let mut qp: GenericQueuePair = qp_builder
             .build()
             .map_err(|error| TransferError::Backend(error.to_string()))?
@@ -86,7 +93,7 @@ impl RcSession {
         qp.modify(&init_attr)
             .map_err(|error| TransferError::Backend(error.to_string()))?;
 
-        let local_psn = (psn_seed as u32) & 0x00ff_ffff;
+        let local_psn = (psn_seed as u32) & PSN_MASK;
         let local_endpoint = RcEndpoint {
             gid: runtime.local_gid.raw,
             lid: 0, // RoCE v2 doesn't use LID
@@ -244,8 +251,8 @@ impl RcSession {
         let mut transferred = 0usize;
 
         while next_idx < total_ops || !inflight.is_empty() {
-            while next_idx < total_ops && inflight.len() < MAX_INFLIGHT_OPS {
-                let available = MAX_INFLIGHT_OPS - inflight.len();
+            while next_idx < total_ops && inflight.len() < MAX_SEND_WR as usize {
+                let available = MAX_SEND_WR as usize - inflight.len();
                 let remaining = total_ops - next_idx;
                 let chain_len = MAX_WR_CHAIN_OPS.min(available).min(remaining);
                 let mut qp = session.qp.lock();
