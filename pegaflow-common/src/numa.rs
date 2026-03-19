@@ -415,6 +415,67 @@ impl Default for NumaTopology {
     }
 }
 
+// ============================================================================
+// move_pages(2) NUMA query
+// ============================================================================
+
+/// Query the NUMA node of each address via `move_pages(2)`.
+///
+/// Each address is page-aligned internally; only one page per address is
+/// queried (suitable for contiguous regions where the first page determines
+/// placement). Returns `NumaNode::UNKNOWN` for any address that yields an
+/// error status.
+pub fn query_pages_numa(addrs: &[*const u8]) -> Vec<NumaNode> {
+    if addrs.is_empty() {
+        return Vec::new();
+    }
+
+    let count = addrs.len();
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+
+    // Page-align each address.
+    let pages: Vec<*const libc::c_void> = addrs
+        .iter()
+        .map(|&addr| {
+            let aligned = (addr as usize) & !(page_size - 1);
+            aligned as *const libc::c_void
+        })
+        .collect();
+
+    let mut status: Vec<libc::c_int> = vec![0; count];
+
+    // SAFETY: move_pages with nodes=NULL is a query-only operation. We pass
+    // page-aligned addresses, correct count, and a properly sized status
+    // buffer. pid=0 targets the calling process.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_move_pages,
+            0_i32,                                        // pid: current process
+            count,                                        // count
+            pages.as_ptr(),                                // pages
+            std::ptr::null::<libc::c_int>(),              // nodes: NULL = query only
+            status.as_mut_ptr(),                          // status: output
+            0_i32,                                        // flags
+        )
+    };
+
+    if ret != 0 {
+        // Syscall itself failed; return all UNKNOWN.
+        return vec![NumaNode::UNKNOWN; count];
+    }
+
+    status
+        .iter()
+        .map(|&s| {
+            if s >= 0 {
+                NumaNode(s as u32)
+            } else {
+                NumaNode::UNKNOWN
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,5 +542,36 @@ mod tests {
     fn test_parse_cpulist_single_cpu() {
         let cpus = parse_cpulist("5").unwrap();
         assert_eq!(cpus, vec![5]);
+    }
+
+    #[test]
+    fn test_query_pages_numa_empty() {
+        let result = query_pages_numa(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_query_pages_numa_stack_memory() {
+        // Stack memory should reside on a valid NUMA node.
+        let buf = [0u8; 4096];
+        let addrs = [buf.as_ptr()];
+        let nodes = query_pages_numa(&addrs);
+        assert_eq!(nodes.len(), 1);
+        // After touching the memory, it should be on a valid node.
+        assert!(
+            nodes[0].is_valid(),
+            "stack memory should be on a valid NUMA node"
+        );
+    }
+
+    #[test]
+    fn test_query_pages_numa_heap_memory() {
+        let buf = vec![0u8; 8192];
+        let addrs = [buf.as_ptr(), unsafe { buf.as_ptr().add(4096) }];
+        let nodes = query_pages_numa(&addrs);
+        assert_eq!(nodes.len(), 2);
+        for node in &nodes {
+            assert!(node.is_valid());
+        }
     }
 }
