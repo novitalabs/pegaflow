@@ -137,6 +137,11 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub blockwise_alloc: bool,
 
+    /// RDMA NIC names for inter-node transfer (e.g. --nics mlx5_0 mlx5_1).
+    /// When set, pinned memory is registered for RDMA access on these NICs.
+    #[arg(long, num_args = 1..)]
+    pub nics: Option<Vec<String>>,
+
     /// MetaServer address for cross-node block hash registration (e.g. http://127.0.0.1:50056).
     /// When set, sealed block hashes are automatically registered with the MetaServer.
     #[arg(long)]
@@ -407,7 +412,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         hint_value_size_bytes: cli.hint_value_size,
         max_prefetch_blocks: cli.max_prefetch_blocks,
         ssd_cache_config,
-        rdma_nic_names: None,
+        rdma_nic_names: cli.nics.clone(),
         enable_numa_affinity: !cli.disable_numa_affinity,
         blockwise_alloc: cli.blockwise_alloc,
     };
