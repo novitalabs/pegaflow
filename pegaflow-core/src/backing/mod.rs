@@ -1,3 +1,4 @@
+pub(super) mod rdma;
 pub(super) mod ssd;
 pub(super) mod ssd_cache;
 pub(super) mod uring;
@@ -13,6 +14,7 @@ use crate::block::{BlockKey, SealedBlock};
 use crate::pinned_pool::PinnedAllocation;
 use pegaflow_common::NumaNode;
 
+pub(crate) use rdma::{RdmaTransport, new_rdma};
 pub(crate) use ssd::SsdBackingStore;
 pub(crate) use ssd::new_ssd;
 

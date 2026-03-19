@@ -2,6 +2,7 @@ mod runtime;
 mod session;
 mod state;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -17,12 +18,83 @@ use std::ptr::NonNull;
 
 use crate::engine::{NicHandshake, RegisteredMemoryRegion, TransferDesc, TransferOp};
 use crate::error::{Result, TransferError};
+use pegaflow_common::NumaNode;
+
+struct NicGroup {
+    nic_indices: Vec<usize>,
+    rr_counter: AtomicUsize,
+}
+
+impl NicGroup {
+    fn next(&self) -> usize {
+        let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed);
+        self.nic_indices[idx % self.nic_indices.len()]
+    }
+}
+
+struct NumaRoundRobin {
+    /// NUMA node → NIC group on that node.
+    groups: HashMap<NumaNode, NicGroup>,
+    /// Fallback for unknown NUMA or unmatched nodes (all NICs).
+    fallback: NicGroup,
+    /// True when all NICs are on a single NUMA node (skip move_pages).
+    single_numa: bool,
+}
+
+impl NumaRoundRobin {
+    fn from_runtimes(runtimes: &[Arc<RcRuntime>]) -> Self {
+        let all_indices: Vec<usize> = (0..runtimes.len()).collect();
+
+        // Group NIC indices by NUMA node.
+        let mut map: HashMap<NumaNode, Vec<usize>> = HashMap::new();
+        for (i, rt) in runtimes.iter().enumerate() {
+            if rt.numa_node.is_valid() {
+                map.entry(rt.numa_node).or_default().push(i);
+            }
+        }
+
+        let single_numa = map.len() <= 1;
+
+        let groups: HashMap<NumaNode, NicGroup> = map
+            .into_iter()
+            .map(|(node, indices)| {
+                (
+                    node,
+                    NicGroup {
+                        nic_indices: indices,
+                        rr_counter: AtomicUsize::new(0),
+                    },
+                )
+            })
+            .collect();
+
+        let fallback = NicGroup {
+            nic_indices: all_indices,
+            rr_counter: AtomicUsize::new(0),
+        };
+
+        Self {
+            groups,
+            fallback,
+            single_numa,
+        }
+    }
+
+    fn pick(&self, numa: NumaNode) -> usize {
+        if numa.is_valid()
+            && let Some(group) = self.groups.get(&numa)
+        {
+            return group.next();
+        }
+        self.fallback.next()
+    }
+}
 
 pub(crate) struct RcBackend {
     runtimes: Vec<Arc<RcRuntime>>,
     state: Arc<Mutex<RcBackendState>>,
     psn_counter: AtomicU64,
-    rr_counter: AtomicUsize,
+    numa_rr: NumaRoundRobin,
 }
 
 impl RcBackend {
@@ -42,11 +114,12 @@ impl RcBackend {
             runtimes.push(runtime);
         }
         let nic_count = runtimes.len();
+        let numa_rr = NumaRoundRobin::from_runtimes(&runtimes);
         Ok(Self {
             runtimes,
             state: Arc::new(Mutex::new(RcBackendState::new(nic_count))),
             psn_counter: AtomicU64::new(1),
-            rr_counter: AtomicUsize::new(0),
+            numa_rr,
         })
     }
 
@@ -211,13 +284,25 @@ impl RcBackend {
             return Ok(rx);
         }
 
-        // Round-robin assignment.
-        let rr_base = self.rr_counter.fetch_add(descs.len(), Ordering::Relaxed);
-
-        // Group ops by NIC index.
+        // NUMA-aware NIC assignment: query the NUMA node of each descriptor's
+        // first page and route to a NIC on the same NUMA node.
         let mut per_nic: Vec<Vec<TransferDesc>> = (0..nic_count).map(|_| Vec::new()).collect();
-        for (i, &desc) in descs.iter().enumerate() {
-            per_nic[(rr_base + i) % nic_count].push(desc);
+        if self.numa_rr.single_numa {
+            // All NICs on one NUMA node — skip move_pages, plain round-robin.
+            for &desc in descs {
+                let nic_idx = self.numa_rr.fallback.next();
+                per_nic[nic_idx].push(desc);
+            }
+        } else {
+            let addrs: Vec<*const u8> = descs
+                .iter()
+                .map(|d| d.local_ptr.as_ptr() as *const u8)
+                .collect();
+            let numa_nodes = pegaflow_common::query_pages_numa(&addrs);
+            for (i, &desc) in descs.iter().enumerate() {
+                let nic_idx = self.numa_rr.pick(numa_nodes[i]);
+                per_nic[nic_idx].push(desc);
+            }
         }
 
         // --- Lock: lazy connect + prepare ops ---

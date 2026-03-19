@@ -599,6 +599,7 @@ mod tests {
             hint_value_size_bytes: None,
             max_prefetch_blocks: 100,
             ssd_cache_config: None,
+            rdma_nic_names: None,
             enable_numa_affinity: false,
             blockwise_alloc: false,
         };

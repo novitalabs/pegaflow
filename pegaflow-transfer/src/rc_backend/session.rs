@@ -183,10 +183,10 @@ impl RcSession {
         let _ = thread::Builder::new()
             .name("pegaflow-rc-session".to_string())
             .spawn(move || {
-                if numa_node.is_valid() {
-                    if let Err(e) = pegaflow_common::pin_thread_to_numa_node(numa_node) {
-                        warn!("Failed to pin rc session worker to {}: {}", numa_node, e);
-                    }
+                if numa_node.is_valid()
+                    && let Err(e) = pegaflow_common::pin_thread_to_numa_node(numa_node)
+                {
+                    warn!("Failed to pin rc session worker to {}: {}", numa_node, e);
                 }
                 debug!(
                     "session worker started: local_qpn={}, numa={}",

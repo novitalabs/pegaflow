@@ -33,6 +33,7 @@ tonic.workspace = true
 dashmap.workspace = true
 smallvec = "1"
 pegaflow-proto = { path = "../pegaflow-proto" }
+pegaflow-transfer = { path = "../pegaflow-transfer" }
 
 [dev-dependencies]
 criterion.workspace = true
