@@ -249,15 +249,17 @@ mod tests {
     use super::*;
     use std::num::NonZeroU64;
 
-    use crate::block::LayerBlock;
+    use crate::block::RawBlock;
     use crate::storage::{StorageConfig, StorageEngine};
 
-    fn make_layer_block(engine: &StorageEngine, size: u64) -> Arc<LayerBlock> {
+    fn make_raw_block(engine: &StorageEngine, size: u64) -> Arc<RawBlock> {
+        use crate::block::Segment;
         let mut alloc = engine
             .allocate(NonZeroU64::new(size).unwrap(), None)
             .expect("test pool should have space");
         let ptr = Arc::get_mut(&mut alloc).unwrap().as_mut_ptr();
-        Arc::new(LayerBlock::new_contiguous(ptr, size as usize, alloc))
+        let ptr = std::ptr::NonNull::new(ptr).expect("test alloc pointer must be non-null");
+        Arc::new(RawBlock::new(vec![Segment::new(ptr, size as usize, alloc)]))
     }
 
     fn make_deps(engine: &StorageEngine) -> Arc<InsertDeps> {
@@ -276,7 +278,7 @@ mod tests {
         let weak_deps = Arc::downgrade(&deps);
 
         let key = BlockKey::new("ns".into(), vec![1, 2, 3]);
-        let block = make_layer_block(&engine, 64);
+        let block = make_raw_block(&engine, 64);
 
         let entries: InsertEntries = vec![(key.clone(), vec![(0, block)])];
         let mut inflight: HashMap<BlockKey, InflightBlock> = HashMap::new();
@@ -307,7 +309,7 @@ mod tests {
         let key = BlockKey::new("ns".into(), vec![1]);
         let mut inflight: HashMap<BlockKey, InflightBlock> = HashMap::new();
 
-        let block0 = make_layer_block(&engine, 64);
+        let block0 = make_raw_block(&engine, 64);
         let entries: InsertEntries = vec![(key.clone(), vec![(0, block0)])];
         process_insert_batch(
             &mut inflight,
@@ -320,7 +322,7 @@ mod tests {
         assert_eq!(inflight.len(), 1, "block should still be inflight");
         assert!(!engine.read_cache.contains_keys(std::slice::from_ref(&key))[0]);
 
-        let block1 = make_layer_block(&engine, 64);
+        let block1 = make_raw_block(&engine, 64);
         let entries: InsertEntries = vec![(key.clone(), vec![(1, block1)])];
         process_insert_batch(
             &mut inflight,
@@ -332,7 +334,7 @@ mod tests {
         );
         assert_eq!(inflight.len(), 1, "still inflight after 2/3 slots");
 
-        let block2 = make_layer_block(&engine, 64);
+        let block2 = make_raw_block(&engine, 64);
         let entries: InsertEntries = vec![(key.clone(), vec![(2, block2)])];
         process_insert_batch(
             &mut inflight,
@@ -359,8 +361,8 @@ mod tests {
         let key = BlockKey::new("ns".into(), vec![1]);
         let mut inflight: HashMap<BlockKey, InflightBlock> = HashMap::new();
 
-        let block_a = make_layer_block(&engine, 64);
-        let block_b = make_layer_block(&engine, 64);
+        let block_a = make_raw_block(&engine, 64);
+        let block_b = make_raw_block(&engine, 64);
         let entries: InsertEntries = vec![(key.clone(), vec![(0, block_a), (0, block_b)])];
 
         process_insert_batch(
@@ -387,7 +389,7 @@ mod tests {
         let key = BlockKey::new("ns".into(), vec![1]);
         let mut inflight: HashMap<BlockKey, InflightBlock> = HashMap::new();
 
-        let block0 = make_layer_block(&engine, 64);
+        let block0 = make_raw_block(&engine, 64);
         let entries: InsertEntries = vec![(key.clone(), vec![(0, block0)])];
         process_insert_batch(
             &mut inflight,
@@ -399,7 +401,7 @@ mod tests {
         );
         assert_eq!(inflight.len(), 1);
 
-        let block1 = make_layer_block(&engine, 64);
+        let block1 = make_raw_block(&engine, 64);
         let entries: InsertEntries = vec![(key.clone(), vec![(1, block1)])];
         process_insert_batch(
             &mut inflight,
@@ -437,7 +439,7 @@ mod tests {
         let weak_deps = Arc::downgrade(&deps);
 
         let key = BlockKey::new("ns".into(), vec![7]);
-        let block = make_layer_block(&engine, 64);
+        let block = make_raw_block(&engine, 64);
         let entries: InsertEntries = vec![(key.clone(), vec![(0, block)])];
         let mut inflight: HashMap<BlockKey, InflightBlock> = HashMap::new();
 

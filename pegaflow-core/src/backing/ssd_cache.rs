@@ -13,8 +13,9 @@ use super::uring::UringIoEngine;
 use crate::block::{BlockKey, SealedBlock};
 use crate::metrics::core_metrics;
 use crate::pinned_pool::PinnedAllocation;
-use crate::seal_offload::SlotMeta;
+use crate::seal_offload::{self, SlotMeta};
 use pegaflow_common::NumaNode;
+use smallvec::SmallVec;
 
 /// SSD I/O alignment requirement (O_DIRECT requires 512-byte aligned I/O)
 pub const SSD_ALIGNMENT: usize = 512;
@@ -283,10 +284,14 @@ impl SsdRingBuffer {
                     .slots()
                     .iter()
                     .enumerate()
-                    .map(|(i, s)| SlotMeta {
-                        is_split: s.v_ptr().is_some(),
-                        size: s.size() as u64,
-                        numa_node: slot_numas.get(i).copied().unwrap_or(NumaNode::UNKNOWN),
+                    .map(|(i, s)| {
+                        let segment_sizes: SmallVec<[u64; 2]> = (0..s.num_segments())
+                            .map(|idx| s.segment_size(idx).unwrap() as u64)
+                            .collect();
+                        SlotMeta::new(
+                            segment_sizes,
+                            slot_numas.get(i).copied().unwrap_or(NumaNode::UNKNOWN),
+                        )
                     })
                     .collect();
 
@@ -534,8 +539,7 @@ async fn execute_write(task: WriteTask, io: Arc<UringIoEngine>) -> WriteResult {
     let key = task.key;
     let block_size = task.block.memory_footprint();
 
-    let result =
-        write_block_to_ssd(&io, task.entry.file_offset, &task.block, &task.entry.slots).await;
+    let result = write_block_to_ssd(&io, task.entry.file_offset, &task.block).await;
 
     let duration_secs = start.elapsed().as_secs_f64();
     (key, result.is_ok(), duration_secs, block_size)
@@ -549,14 +553,13 @@ async fn write_block_to_ssd(
     io: &UringIoEngine,
     offset: u64,
     block: &SealedBlock,
-    slots_meta: &[SlotMeta],
 ) -> std::io::Result<()> {
-    // Build iovecs from slot metadata
+    // Build iovecs from RawBlock segments (layout-agnostic)
     let rx = {
-        let iovecs: Vec<_> = slots_meta
+        let iovecs: Vec<_> = block
+            .slots()
             .iter()
-            .zip(block.slots())
-            .flat_map(|(meta, slot)| meta.write_iovecs(slot))
+            .flat_map(|slot| seal_offload::write_iovecs(slot))
             .collect();
 
         io.writev_at_async(iovecs, offset)?
@@ -651,7 +654,7 @@ fn group_slots_by_numa(
             groups.entry(numa_key).or_default().push(SlotRef {
                 block_idx,
                 slot_idx,
-                size: meta.size,
+                size: meta.total_size(),
             });
         }
     }
@@ -845,7 +848,7 @@ async fn execute_prefetch(
             .flat_map(|(meta, alloc)| {
                 let base_ptr = alloc.allocation.as_ptr() as *mut u8;
                 // SAFETY: each allocation is sized to fit its NUMA group's slots
-                unsafe { meta.read_iovecs(base_ptr, alloc.offset) }
+                unsafe { seal_offload::read_iovecs(meta, base_ptr, alloc.offset) }
             })
             .collect();
 
@@ -899,18 +902,21 @@ fn rebuild_sealed_block_per_slot(
     slot_allocs: Vec<SlotAlloc>,
     slot_metas: &[SlotMeta],
 ) -> Result<SealedBlock, String> {
-    let layer_blocks: Vec<_> = slot_metas
+    let raw_blocks: Vec<_> = slot_metas
         .iter()
         .zip(slot_allocs)
-        .map(|(meta, alloc)| unsafe { meta.make_layer_block(alloc.allocation, alloc.offset) })
+        .map(|(meta, alloc)| unsafe {
+            seal_offload::reconstruct_raw_block(meta, alloc.allocation, alloc.offset)
+        })
         .collect();
 
-    Ok(SealedBlock::from_slots(layer_blocks))
+    Ok(SealedBlock::from_slots(raw_blocks))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use smallvec::smallvec;
 
     fn make_key(n: u8) -> BlockKey {
         BlockKey::new("test".to_string(), vec![n])
@@ -1136,15 +1142,11 @@ mod tests {
     // ========================================================================
 
     fn make_slot(numa_node: NumaNode, size: u64) -> SlotMeta {
-        SlotMeta {
-            is_split: false,
-            size,
-            numa_node,
-        }
+        SlotMeta::new(smallvec![size], numa_node)
     }
 
     fn make_prefetch_request(n: u8, slots: Vec<SlotMeta>) -> PrefetchRequest {
-        let total_size: u64 = slots.iter().map(|s| s.size).sum();
+        let total_size: u64 = slots.iter().map(|s| s.total_size()).sum();
         PrefetchRequest {
             key: make_key(n),
             entry: SsdIndexEntry {

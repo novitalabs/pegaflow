@@ -5,7 +5,7 @@ use log::{debug, error, info, warn};
 use logforth::diagnostic::ThreadLocalDiagnostic;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::block::LayerBlock;
+use crate::block::RawBlock;
 use crate::metrics::core_metrics;
 use crate::sync_state::LoadState;
 use crate::{EngineError, KVCacheRegistration, transfer};
@@ -26,7 +26,7 @@ pub struct LayerLoadData {
 
 pub struct LoadBlock {
     pub block_idx: usize,
-    pub layer_block: Arc<LayerBlock>,
+    pub block: Arc<RawBlock>,
 }
 
 /// A task to save KV blocks from GPU to CPU for multiple layers.
@@ -272,12 +272,13 @@ fn process_load_task(task: &LoadTask, stream: &CudaStream) -> Result<(), EngineE
                 let v_gpu_offset = transfer::segment_offset(registration, block.block_idx, 1)
                     .map_err(EngineError::Storage)?;
 
-                let k_cpu_ptr = block.layer_block.k_ptr();
-                // SAFETY: For contiguous layout (v_ptr is None), the allocation is
-                // 2 * segment_size bytes, so k_ptr + segment_size is within bounds.
+                let k_cpu_ptr = block.block.segment_ptr(0).unwrap().as_ptr() as *const u8;
+                // SAFETY: For contiguous layout (segment 1 absent), the allocation is
+                // 2 * segment_size bytes, so k_cpu_ptr + segment_size is within bounds.
                 let v_cpu_ptr = block
-                    .layer_block
-                    .v_ptr()
+                    .block
+                    .segment_ptr(1)
+                    .map(|p| p.as_ptr() as *const u8)
                     .unwrap_or_else(|| unsafe { k_cpu_ptr.add(segment_size) });
 
                 k_transfers.push((k_gpu_offset, k_cpu_ptr));
@@ -320,7 +321,7 @@ fn process_load_task(task: &LoadTask, stream: &CudaStream) -> Result<(), EngineE
             for block in &layer_data.blocks {
                 let gpu_offset = transfer::segment_offset(registration, block.block_idx, 0)
                     .map_err(EngineError::Storage)?;
-                let cpu_ptr = block.layer_block.k_ptr();
+                let cpu_ptr = block.block.segment_ptr(0).unwrap().as_ptr() as *const u8;
                 transfers.push((gpu_offset, cpu_ptr));
             }
 

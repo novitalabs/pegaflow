@@ -2200,6 +2200,7 @@ dependencies = [
  "rand 0.10.0",
  "serde",
  "shared_memory",
+ "smallvec",
  "tempfile",
  "tokio",
  "tonic",

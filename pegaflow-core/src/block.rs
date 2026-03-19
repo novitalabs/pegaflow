@@ -2,6 +2,7 @@
 // Block types for StorageEngine
 // ============================================================================
 
+use std::ptr::NonNull;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -76,80 +77,123 @@ pub enum PrefetchStatus {
 }
 
 // ============================================================================
-// LayerBlock (pinned memory holder)
+// Segment + RawBlock (storage-level, layout-agnostic)
 // ============================================================================
 
-/// CPU block data stored in pinned memory for a single layer/TP slot.
-pub struct LayerBlock {
-    /// Pointer to K segment (or combined data if contiguous)
-    k_ptr: std::ptr::NonNull<u8>,
-    /// Pointer to V segment (if stored separately)
-    v_ptr: Option<std::ptr::NonNull<u8>>,
+/// A single contiguous memory segment in pinned memory.
+pub(crate) struct Segment {
+    ptr: NonNull<u8>,
     size: usize,
-    /// Shared RAII allocation handle for K memory (automatically freed when last reference drops)
-    #[allow(dead_code)]
-    k_allocation: Arc<PinnedAllocation>,
-    /// Shared RAII allocation handle for V memory (if separate from K)
-    #[allow(dead_code)]
-    v_allocation: Option<Arc<PinnedAllocation>>,
+    /// Held for RAII drop semantics -- memory freed when last Arc drops.
+    _allocation: Arc<PinnedAllocation>,
+}
+
+impl Segment {
+    pub(crate) fn new(ptr: NonNull<u8>, size: usize, allocation: Arc<PinnedAllocation>) -> Self {
+        Self {
+            ptr,
+            size,
+            _allocation: allocation,
+        }
+    }
+}
+
+// Safety: Segment holds NonNull<u8> pointing to pinned memory whose lifetime
+// is managed by Arc<PinnedAllocation>. PinnedAllocation itself is Send+Sync.
+unsafe impl Send for Segment {}
+unsafe impl Sync for Segment {}
+
+/// Storage-level block: an ordered list of opaque memory segments.
+/// No awareness of K/V layout -- that's the caller's concern.
+///
+/// RawBlock automatically derives Send+Sync from Segment.
+pub struct RawBlock {
+    segments: Box<[Segment]>,
+    /// Total size across all segments (for footprint tracking).
+    total_size: usize,
+}
+
+impl RawBlock {
+    /// Create from an arbitrary list of segments.
+    /// Caller decides the segment layout; RawBlock is layout-agnostic.
+    pub(crate) fn new(segments: Vec<Segment>) -> Self {
+        debug_assert!(!segments.is_empty(), "RawBlock requires at least 1 segment");
+        let total_size = segments.iter().map(|s| s.size).sum();
+        Self {
+            segments: segments.into_boxed_slice(),
+            total_size,
+        }
+    }
+
+    /// Number of segments.
+    pub(crate) fn num_segments(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// Get segment pointer by index.
+    pub(crate) fn segment_ptr(&self, index: usize) -> Option<NonNull<u8>> {
+        self.segments.get(index).map(|s| s.ptr)
+    }
+
+    /// Get segment size by index.
+    pub(crate) fn segment_size(&self, index: usize) -> Option<usize> {
+        self.segments.get(index).map(|s| s.size)
+    }
+
+    /// Iterator over (NonNull<u8>, size) pairs -- used for SSD I/O.
+    pub(crate) fn segment_iovecs(&self) -> impl Iterator<Item = (NonNull<u8>, usize)> + '_ {
+        self.segments.iter().map(|s| (s.ptr, s.size))
+    }
+
+    /// Total memory footprint.
+    pub(crate) fn memory_footprint(&self) -> u64 {
+        self.total_size as u64
+    }
+}
+
+// ============================================================================
+// LayerBlock (thin KV wrapper, service/GPU layer only)
+// ============================================================================
+
+/// Layer-aware view: interprets RawBlock segments as K/V cache data.
+/// Lives in the service/GPU layer, NOT in storage.
+///
+/// Invariant: inner RawBlock has >= 1 segment.
+pub struct LayerBlock {
+    raw: Arc<RawBlock>,
 }
 
 impl LayerBlock {
-    pub(crate) fn new_contiguous(
-        ptr: *mut u8,
-        size: usize,
-        allocation: Arc<PinnedAllocation>,
-    ) -> Self {
-        let k_ptr =
-            std::ptr::NonNull::new(ptr).expect("contiguous block K pointer must be non-null");
-        Self {
-            k_ptr,
-            v_ptr: None,
-            size,
-            k_allocation: allocation,
-            v_allocation: None,
-        }
+    /// Wrap a RawBlock as a KV layer block.
+    /// Panics if the block has zero segments (violated invariant from construction).
+    pub fn new(raw: Arc<RawBlock>) -> Self {
+        debug_assert!(
+            raw.num_segments() > 0,
+            "LayerBlock requires at least 1 segment"
+        );
+        Self { raw }
     }
 
-    pub(crate) fn new_split(
-        k_ptr: *mut u8,
-        v_ptr: *mut u8,
-        size: usize,
-        k_allocation: Arc<PinnedAllocation>,
-        v_allocation: Arc<PinnedAllocation>,
-    ) -> Self {
-        let k_ptr = std::ptr::NonNull::new(k_ptr).expect("split block K pointer must be non-null");
-        let v_ptr = std::ptr::NonNull::new(v_ptr).expect("split block V pointer must be non-null");
-        Self {
-            k_ptr,
-            v_ptr: Some(v_ptr),
-            size,
-            k_allocation,
-            v_allocation: Some(v_allocation),
-        }
+    /// K segment pointer (always segment 0).
+    pub fn k_ptr(&self) -> *const u8 {
+        self.raw.segment_ptr(0).unwrap().as_ptr()
     }
 
-    pub(crate) fn k_ptr(&self) -> *const u8 {
-        self.k_ptr.as_ptr()
+    /// K segment size.
+    pub fn k_size(&self) -> usize {
+        self.raw.segment_size(0).unwrap()
     }
 
-    pub(crate) fn v_ptr(&self) -> Option<*const u8> {
-        self.v_ptr.map(|ptr| ptr.as_ptr() as *const u8)
+    /// V segment pointer (segment 1 if split, None if contiguous).
+    pub fn v_ptr(&self) -> Option<*const u8> {
+        self.raw.segment_ptr(1).map(|p| p.as_ptr() as *const u8)
     }
 
-    pub(crate) fn size(&self) -> usize {
-        self.size
-    }
-
-    /// Total pinned memory occupied by this layer block.
-    fn memory_footprint(&self) -> u64 {
-        self.size as u64
+    /// V segment size (None if contiguous).
+    pub fn v_size(&self) -> Option<usize> {
+        self.raw.segment_size(1)
     }
 }
-
-// Safety: pinned memory ownership is tracked by Arc counters on the allocations.
-unsafe impl Send for LayerBlock {}
-unsafe impl Sync for LayerBlock {}
 
 // ============================================================================
 // Sealed Block (read path, immutable)
@@ -157,7 +201,7 @@ unsafe impl Sync for LayerBlock {}
 
 /// Immutable block after all slots are filled. Exposed to callers.
 pub struct SealedBlock {
-    slots: Box<[Arc<LayerBlock>]>,
+    slots: Box<[Arc<RawBlock>]>,
     footprint: u64,
     /// Per-slot NUMA affinity, carried from InflightBlock for SSD write path.
     /// Empty when reconstructed from SSD prefetch (NUMA info lives in SlotMeta).
@@ -165,7 +209,7 @@ pub struct SealedBlock {
 }
 
 impl SealedBlock {
-    pub(crate) fn get_slot(&self, slot_id: usize) -> Option<&Arc<LayerBlock>> {
+    pub(crate) fn get_slot(&self, slot_id: usize) -> Option<&Arc<RawBlock>> {
         self.slots.get(slot_id)
     }
 
@@ -174,7 +218,7 @@ impl SealedBlock {
     }
 
     /// Get all slots (for serialization)
-    pub(crate) fn slots(&self) -> &[Arc<LayerBlock>] {
+    pub(crate) fn slots(&self) -> &[Arc<RawBlock>] {
         &self.slots
     }
 
@@ -184,7 +228,7 @@ impl SealedBlock {
     }
 
     /// Create from a vec of slots (for deserialization / prefetch rebuild)
-    pub(crate) fn from_slots(slots: Vec<Arc<LayerBlock>>) -> Self {
+    pub(crate) fn from_slots(slots: Vec<Arc<RawBlock>>) -> Self {
         let footprint = slots.iter().map(|s| s.memory_footprint()).sum();
         Self {
             slots: slots.into_boxed_slice(),
@@ -195,7 +239,7 @@ impl SealedBlock {
 
     /// Create from slots with pre-computed footprint (internal use)
     fn from_slots_with_footprint(
-        slots: Box<[Arc<LayerBlock>]>,
+        slots: Box<[Arc<RawBlock>]>,
         footprint: u64,
         slot_numas: Vec<NumaNode>,
     ) -> Self {
@@ -228,7 +272,7 @@ pub(crate) enum SlotInsertResult {
 
 /// Block that is still being written. Internal to StorageEngine.
 pub(crate) struct InflightBlock {
-    slots: Vec<Option<Arc<LayerBlock>>>,
+    slots: Vec<Option<Arc<RawBlock>>>,
     remaining: usize,
     total_slots: usize,
     footprint: u64,
@@ -274,7 +318,7 @@ impl InflightBlock {
     pub(crate) fn insert_slot(
         &mut self,
         slot_id: usize,
-        block: Arc<LayerBlock>,
+        block: Arc<RawBlock>,
         numa_node: NumaNode,
     ) -> SlotInsertResult {
         debug_assert!(
@@ -306,7 +350,7 @@ impl InflightBlock {
     /// Seal the block, converting to immutable SealedBlock.
     /// Panics if not all slots are filled.
     pub(crate) fn seal(self) -> SealedBlock {
-        let slots: Vec<Arc<LayerBlock>> = self
+        let slots: Vec<Arc<RawBlock>> = self
             .slots
             .into_iter()
             .map(|opt| opt.expect("all slots must be filled before sealing"))
