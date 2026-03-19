@@ -3,8 +3,9 @@ use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 
-use log::debug;
+use log::{debug, warn};
 use parking_lot::Mutex;
+use pegaflow_common::NumaNode;
 use sideway::ibverbs::AccessFlags;
 use sideway::ibverbs::address::{AddressHandleAttribute, Gid};
 use sideway::ibverbs::completion::{
@@ -27,6 +28,7 @@ const SEND_CQ_SIZE: u32 = MAX_SEND_WR;
 // Recv queue unused (one-sided RDMA only), keep minimal for driver compatibility.
 const RECV_CQ_SIZE: u32 = 2;
 const MAX_RECV_WR: u32 = 1;
+const MAX_RD_ATOMIC: u8 = 1;
 const PSN_MASK: u32 = 0x00ff_ffff;
 
 pub(crate) struct RdmaOp {
@@ -110,7 +112,7 @@ impl RcSession {
             cmd_tx,
         });
 
-        Self::spawn_worker(Arc::clone(&session), cmd_rx);
+        Self::spawn_worker(Arc::clone(&session), cmd_rx, runtime.numa_node);
         Ok(session)
     }
 
@@ -135,7 +137,7 @@ impl RcSession {
             .setup_path_mtu(runtime.mtu)
             .setup_dest_qp_num(remote.qp_num)
             .setup_rq_psn(remote.psn)
-            .setup_max_dest_read_atomic(runtime.max_rd_atomic)
+            .setup_max_dest_read_atomic(MAX_RD_ATOMIC)
             .setup_min_rnr_timer(12)
             .setup_address_vector(&ah_attr);
         qp.modify(&rtr_attr)
@@ -148,7 +150,7 @@ impl RcSession {
             .setup_timeout(14)
             .setup_retry_cnt(7)
             .setup_rnr_retry(7)
-            .setup_max_read_atomic(runtime.max_rd_atomic);
+            .setup_max_read_atomic(MAX_RD_ATOMIC);
         qp.modify(&rts_attr)
             .map_err(|error| TransferError::Backend(error.to_string()))?;
         debug!(
@@ -173,13 +175,22 @@ impl RcSession {
         Ok(done_rx)
     }
 
-    fn spawn_worker(session: Arc<Self>, cmd_rx: std_mpsc::Receiver<SessionCommand>) {
+    fn spawn_worker(
+        session: Arc<Self>,
+        cmd_rx: std_mpsc::Receiver<SessionCommand>,
+        numa_node: NumaNode,
+    ) {
         let _ = thread::Builder::new()
             .name("pegaflow-rc-session".to_string())
             .spawn(move || {
+                if numa_node.is_valid() {
+                    if let Err(e) = pegaflow_common::pin_thread_to_numa_node(numa_node) {
+                        warn!("Failed to pin rc session worker to {}: {}", numa_node, e);
+                    }
+                }
                 debug!(
-                    "session worker started: local_qpn={}",
-                    session.local_endpoint.qp_num
+                    "session worker started: local_qpn={}, numa={}",
+                    session.local_endpoint.qp_num, numa_node
                 );
                 while let Ok(command) = cmd_rx.recv() {
                     match command {

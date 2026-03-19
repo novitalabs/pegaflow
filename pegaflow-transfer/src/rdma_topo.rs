@@ -346,6 +346,23 @@ pub fn get_pcie_path(pci_addr: &str) -> Vec<String> {
         .collect()
 }
 
+/// Resolve the NUMA node for an RDMA NIC by name (e.g. "mlx5_0").
+pub(crate) fn nic_numa_node(nic_name: &str) -> NumaNode {
+    let device_link = format!("/sys/class/infiniband/{}/device", nic_name);
+    let pci_addr = match fs::read_link(&device_link) {
+        Ok(target) => target
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("")
+            .to_string(),
+        Err(_) => return NumaNode::UNKNOWN,
+    };
+    if pci_addr.is_empty() {
+        return NumaNode::UNKNOWN;
+    }
+    read_numa_node_sysfs(&pci_addr)
+}
+
 /// Read NUMA node for a PCI device from sysfs.
 fn read_numa_node_sysfs(pci_addr: &str) -> NumaNode {
     let numa_path = format!("/sys/bus/pci/devices/{}/numa_node", pci_addr);

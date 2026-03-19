@@ -1,12 +1,14 @@
 use std::sync::Arc;
 
 use log::warn;
+use pegaflow_common::NumaNode;
 use sideway::ibverbs::address::Gid;
 use sideway::ibverbs::device::{DeviceInfo, DeviceList};
 use sideway::ibverbs::device_context::{DeviceContext, Mtu, PortState};
 use sideway::ibverbs::protection_domain::ProtectionDomain;
 
 use crate::error::{Result, TransferError};
+use crate::rdma_topo::nic_numa_node;
 
 pub(crate) struct RcRuntime {
     pub(crate) device_ctx: Arc<DeviceContext>,
@@ -15,7 +17,7 @@ pub(crate) struct RcRuntime {
     pub(crate) gid_index: u8,
     pub(crate) mtu: Mtu,
     pub(crate) local_gid: Gid,
-    pub(crate) max_rd_atomic: u8,
+    pub(crate) numa_node: NumaNode,
 }
 
 impl RcRuntime {
@@ -35,16 +37,17 @@ impl RcRuntime {
             .alloc_pd()
             .map_err(|error| TransferError::Backend(error.to_string()))?;
 
-        let (port_num, gid_index, mtu, local_gid, max_rd_atomic) =
-            Self::choose_port_and_gid(&device_ctx)?;
+        let (port_num, gid_index, mtu, local_gid) = Self::choose_port_and_gid(&device_ctx)?;
         log::info!(
-            "rc runtime ready: nic={}, port={}, gid_index={}, mtu={:?}, max_rd_atomic={}",
+            "rc runtime ready: nic={}, port={}, gid_index={}, mtu={:?}",
             nic_name,
             port_num,
             gid_index,
             mtu,
-            max_rd_atomic
         );
+
+        let numa_node = nic_numa_node(nic_name);
+        log::info!("rc runtime numa: nic={}, numa_node={}", nic_name, numa_node);
 
         Ok(Arc::new(Self {
             device_ctx,
@@ -53,11 +56,11 @@ impl RcRuntime {
             gid_index,
             mtu,
             local_gid,
-            max_rd_atomic,
+            numa_node,
         }))
     }
 
-    fn choose_port_and_gid(device_ctx: &Arc<DeviceContext>) -> Result<(u8, u8, Mtu, Gid, u8)> {
+    fn choose_port_and_gid(device_ctx: &Arc<DeviceContext>) -> Result<(u8, u8, Mtu, Gid)> {
         let dev_attr = device_ctx
             .query_device()
             .map_err(|error| TransferError::Backend(error.to_string()))?;
@@ -100,15 +103,7 @@ impl RcRuntime {
                 (0, gid)
             };
 
-            // Public field through sideway's DeviceAttr (no direct rdma-mummy-sys dep needed).
-            let max_rd_atomic = (dev_attr.attr.orig_attr.max_qp_rd_atom as u8).max(1);
-            return Ok((
-                port_num,
-                gid_index,
-                port_attr.active_mtu(),
-                gid,
-                max_rd_atomic,
-            ));
+            return Ok((port_num, gid_index, port_attr.active_mtu(), gid));
         }
 
         warn!(
