@@ -151,17 +151,19 @@ impl RcSession {
         Ok(())
     }
 
-    /// Send a batch of RDMA ops to the session worker and block until completion.
-    pub(crate) fn transfer_batch(&self, ops: Vec<RdmaOp>, op: TransferOp) -> Result<usize> {
+    /// Submit a batch of RDMA ops to the session worker and return a receiver for the result.
+    pub(crate) fn transfer_batch_async(
+        &self,
+        ops: Vec<RdmaOp>,
+        op: TransferOp,
+    ) -> Result<std_mpsc::Receiver<Result<usize>>> {
         let (done_tx, done_rx) = std_mpsc::sync_channel(0);
         self.cmd_tx
             .send(SessionCommand::Transfer { ops, op, done_tx })
             .map_err(|_| {
                 TransferError::Backend("session worker channel disconnected".to_string())
             })?;
-        done_rx
-            .recv()
-            .map_err(|_| TransferError::Backend("session worker dropped completion".to_string()))?
+        Ok(done_rx)
     }
 
     fn spawn_worker(session: Arc<Self>, cmd_rx: std_mpsc::Receiver<SessionCommand>) {

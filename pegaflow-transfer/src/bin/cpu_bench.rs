@@ -338,8 +338,12 @@ fn run_single_nic_bench(
         );
 
         let start = Instant::now();
-        ctx.client
-            .batch_transfer(op, &ctx.server_hs, &local_ptrs, &remote_ptrs, &lens)
+        let rx = ctx
+            .client
+            .batch_transfer_async(op, &ctx.server_hs, &local_ptrs, &remote_ptrs, &lens)
+            .expect("RDMA submit failed");
+        rx.recv()
+            .expect("completion channel dropped")
             .expect("RDMA transfer failed");
         let elapsed = start.elapsed();
 
@@ -407,14 +411,18 @@ fn run_multi_nic_bench(
 
                         let start = Instant::now();
                         if my_blocks > 0 {
-                            ctx.client
-                                .batch_transfer(
+                            let rx = ctx
+                                .client
+                                .batch_transfer_async(
                                     op,
                                     &ctx.server_hs,
                                     &local_ptrs,
                                     &remote_ptrs,
                                     &lens,
                                 )
+                                .expect("RDMA submit failed");
+                            rx.recv()
+                                .expect("completion channel dropped")
                                 .expect("RDMA transfer failed");
                         }
                         let elapsed = start.elapsed();

@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::time::Instant;
 
 use crate::error::{Result, TransferError};
 use crate::rc_backend::RcBackend;
@@ -127,18 +126,21 @@ impl TransferEngine {
             .accept_handshake(&remote.endpoint, &remote.memory_regions)
     }
 
-    /// Perform a batch of RDMA READ or WRITE operations against a peer.
+    /// Submit a batch of RDMA READ or WRITE operations against a peer.
+    ///
+    /// Returns a `Receiver` that yields the total bytes transferred once
+    /// the RDMA operations complete. The caller decides when to block on `.recv()`.
     ///
     /// On the **initiator** side, the first call lazily connects the QP to the
     /// peer. Subsequent calls reuse the existing long-lived connection.
-    pub fn batch_transfer(
+    pub fn batch_transfer_async(
         &self,
         op: TransferOp,
         peer: &HandshakeMetadata,
         local_ptrs: &[u64],
         remote_ptrs: &[u64],
         lens: &[usize],
-    ) -> Result<usize> {
+    ) -> Result<std::sync::mpsc::Receiver<Result<usize>>> {
         if local_ptrs.len() != remote_ptrs.len() {
             return Err(TransferError::BatchLengthMismatch {
                 ptrs: local_ptrs.len(),
@@ -152,31 +154,14 @@ impl TransferEngine {
             });
         }
 
-        let started_at = Instant::now();
-        let transferred = self.backend.batch_transfer(
+        self.backend.batch_transfer_async(
             op,
             &peer.endpoint,
             &peer.memory_regions,
             local_ptrs,
             remote_ptrs,
             lens,
-        )?;
-        let elapsed = started_at.elapsed();
-        let elapsed_secs = elapsed.as_secs_f64();
-        if elapsed_secs > 0.0 {
-            let gbps = (transferred as f64 * 8.0) / elapsed_secs / 1e9;
-            let gib_per_sec = (transferred as f64) / elapsed_secs / (1024.0 * 1024.0 * 1024.0);
-            log::debug!(
-                "batch_transfer {:?} e2e: bytes={}, chunks={}, elapsed_ms={:.3}, bw_gbps={:.3}, bw_gibps={:.3}",
-                op,
-                transferred,
-                lens.len(),
-                elapsed_secs * 1000.0,
-                gbps,
-                gib_per_sec
-            );
-        }
-        Ok(transferred)
+        )
     }
 }
 

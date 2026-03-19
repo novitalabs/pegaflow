@@ -129,7 +129,7 @@ impl RcBackend {
         Ok(())
     }
 
-    pub(crate) fn batch_transfer(
+    pub(crate) fn batch_transfer_async(
         &self,
         op: TransferOp,
         remote: &RcEndpoint,
@@ -137,9 +137,11 @@ impl RcBackend {
         local_ptrs: &[u64],
         remote_ptrs: &[u64],
         lens: &[usize],
-    ) -> Result<usize> {
+    ) -> Result<std::sync::mpsc::Receiver<Result<usize>>> {
         if lens.is_empty() {
-            return Ok(0);
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let _ = tx.send(Ok(0));
+            return Ok(rx);
         }
 
         let remote_qpn = remote.qp_num;
@@ -213,21 +215,15 @@ impl RcBackend {
         };
         let lookup_dur = lookup_start.elapsed();
 
-        // --- Submit outside lock ---
-        let submit_start = Instant::now();
-        let transferred = session.transfer_batch(prepared_ops, op)?;
-        let submit_dur = submit_start.elapsed();
-
         debug!(
-            "batch_transfer_{:?}: remote_qpn={}, bytes={}, chunks={}, lookup_ms={:.3}, submit_ms={:.3}, total_ms={:.3}",
+            "batch_transfer_async_{:?}: remote_qpn={}, chunks={}, lookup_ms={:.3}",
             op,
             remote_qpn,
-            transferred,
             lens.len(),
             lookup_dur.as_secs_f64() * 1000.0,
-            submit_dur.as_secs_f64() * 1000.0,
-            (lookup_dur + submit_dur).as_secs_f64() * 1000.0,
         );
-        Ok(transferred)
+
+        // --- Submit outside lock ---
+        session.transfer_batch_async(prepared_ops, op)
     }
 }
