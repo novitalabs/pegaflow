@@ -1,7 +1,7 @@
 mod runtime;
 mod session;
+mod state;
 
-use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -9,36 +9,12 @@ use std::time::Instant;
 use log::debug;
 use parking_lot::Mutex;
 use sideway::ibverbs::AccessFlags;
-use sideway::ibverbs::memory_region::MemoryRegion;
 
 use self::runtime::RcRuntime;
 use self::session::{RcSession, RdmaOp};
+use self::state::{RcBackendState, RegisteredMemoryEntry};
 use crate::engine::{RcEndpoint, RegisteredMemoryRegion, TransferOp};
 use crate::error::{Result, TransferError};
-
-struct RegisteredMemoryEntry {
-    base_ptr: u64,
-    len: usize,
-    mr: Arc<MemoryRegion>,
-}
-
-#[derive(Clone, Copy)]
-struct RemoteMemoryEntry {
-    base_ptr: u64,
-    end_ptr: u64,
-    rkey: u32,
-}
-
-#[derive(Default)]
-struct RcBackendState {
-    registered: HashMap<u64, RegisteredMemoryEntry>,
-    /// Pre-connect sessions in FIFO order (first prepared, first connected).
-    pending: VecDeque<Arc<RcSession>>,
-    /// Connected sessions keyed by remote QP number.
-    sessions: HashMap<u32, Arc<RcSession>>,
-    /// Remote memory cache keyed by remote QP number.
-    remote_memory: HashMap<u32, Vec<RemoteMemoryEntry>>,
-}
 
 pub(crate) struct RcBackend {
     runtime: Arc<RcRuntime>,
@@ -148,7 +124,7 @@ impl RcBackend {
         session.connect(&self.runtime, remote)?;
 
         let mut state = self.state.lock();
-        Self::cache_remote_memory(&mut state, remote.qp_num, remote_memory_regions)?;
+        state.cache_remote_memory(remote.qp_num, remote_memory_regions)?;
         state.sessions.insert(remote.qp_num, session);
         Ok(())
     }
@@ -167,20 +143,36 @@ impl RcBackend {
         }
 
         let remote_qpn = remote.qp_num;
-        self.ensure_connected(remote, remote_memory_regions)?;
 
-        let local_lookup_start = Instant::now();
-        let (session, mut prepared_ops): (Arc<RcSession>, Vec<RdmaOp>) = {
-            let state = self.state.lock();
-            let session =
+        // --- Lazy connect + lookup in one lock acquisition (hot path) ---
+        let lookup_start = Instant::now();
+        let (session, prepared_ops) = {
+            let mut state = self.state.lock();
+
+            // Lazy connect: if no session yet, pop a pending QP.
+            // Check + pop under one lock to avoid TOCTOU.
+            if !state.sessions.contains_key(&remote_qpn) {
+                let pending_session = state.pending.pop_front().ok_or(TransferError::Backend(
+                    "no pending session for lazy connect".to_string(),
+                ))?;
+                // Must drop lock before blocking connect().
+                drop(state);
+
+                pending_session.connect(&self.runtime, remote)?;
+
+                state = self.state.lock();
+                if !state.sessions.contains_key(&remote_qpn) {
+                    state.cache_remote_memory(remote_qpn, remote_memory_regions)?;
+                    state.sessions.insert(remote_qpn, pending_session);
+                }
+            }
+
+            let session = Arc::clone(
                 state
                     .sessions
                     .get(&remote_qpn)
-                    .cloned()
-                    .ok_or(TransferError::Backend(format!(
-                        "no connected session for remote_qpn={}",
-                        remote_qpn
-                    )))?;
+                    .expect("session must exist after ensure_connected"),
+            );
 
             let mut prepared = Vec::with_capacity(lens.len());
             for ((local_ptr, remote_ptr), len) in local_ptrs
@@ -200,219 +192,42 @@ impl RcBackend {
                 if len == 0 {
                     return Err(TransferError::InvalidArgument("len must be non-zero"));
                 }
-                let (_, _, local_mr) = Self::find_registered_entry(&state, local_ptr, len)
+
+                let local_mr = state
+                    .find_local_mr(local_ptr, len)
                     .ok_or(TransferError::MemoryNotRegistered { ptr: local_ptr })?;
+
+                let remote_rkey = state.find_remote_rkey(remote_qpn, remote_ptr, len).ok_or(
+                    TransferError::InvalidArgument("remote memory not found in handshake snapshot"),
+                )?;
+
                 prepared.push(RdmaOp {
                     local_mr,
                     local_ptr,
                     remote_ptr,
                     len,
-                    remote_rkey: 0,
+                    remote_rkey,
                 });
             }
             (session, prepared)
         };
-        let local_lookup_dur = local_lookup_start.elapsed();
+        let lookup_dur = lookup_start.elapsed();
 
-        let remote_lookup_start = Instant::now();
-        {
-            let state = self.state.lock();
-            for rdma_op in prepared_ops.iter_mut() {
-                let (remote_rkey, remote_available) = Self::find_cached_remote_memory(
-                    &state,
-                    remote_qpn,
-                    rdma_op.remote_ptr,
-                    rdma_op.len,
-                )
-                .ok_or(TransferError::InvalidArgument(
-                    "remote memory not found in handshake snapshot",
-                ))?;
-                if rdma_op.len > remote_available {
-                    return Err(TransferError::InvalidArgument(
-                        "len exceeds remote registered memory",
-                    ));
-                }
-                rdma_op.remote_rkey = remote_rkey;
-            }
-        }
-        let remote_lookup_dur = remote_lookup_start.elapsed();
-
+        // --- Submit outside lock ---
         let submit_start = Instant::now();
-        let transferred = session.submit_batch(prepared_ops, op)?;
+        let transferred = session.transfer_batch(prepared_ops, op)?;
         let submit_dur = submit_start.elapsed();
 
-        let total_dur = local_lookup_dur + remote_lookup_dur + submit_dur;
         debug!(
-            "batch_transfer_{:?} profile: remote_qpn={}, bytes={}, chunks={}, local_lookup_ms={:.3}, remote_lookup_ms={:.3}, submit_wait_ms={:.3}, total_ms={:.3}",
+            "batch_transfer_{:?}: remote_qpn={}, bytes={}, chunks={}, lookup_ms={:.3}, submit_ms={:.3}, total_ms={:.3}",
             op,
             remote_qpn,
             transferred,
             lens.len(),
-            local_lookup_dur.as_secs_f64() * 1000.0,
-            remote_lookup_dur.as_secs_f64() * 1000.0,
+            lookup_dur.as_secs_f64() * 1000.0,
             submit_dur.as_secs_f64() * 1000.0,
-            total_dur.as_secs_f64() * 1000.0
+            (lookup_dur + submit_dur).as_secs_f64() * 1000.0,
         );
         Ok(transferred)
-    }
-
-    /// Lazy connect: if no session exists for the remote peer, pop a pending QP and connect it.
-    fn ensure_connected(
-        &self,
-        remote: &RcEndpoint,
-        remote_memory_regions: &[RegisteredMemoryRegion],
-    ) -> Result<()> {
-        if self.state.lock().sessions.contains_key(&remote.qp_num) {
-            return Ok(());
-        }
-
-        let session = self
-            .state
-            .lock()
-            .pending
-            .pop_front()
-            .ok_or(TransferError::Backend(
-                "no pending session for lazy connect".to_string(),
-            ))?;
-
-        session.connect(&self.runtime, remote)?;
-
-        let mut state = self.state.lock();
-        Self::cache_remote_memory(&mut state, remote.qp_num, remote_memory_regions)?;
-        state.sessions.insert(remote.qp_num, session);
-        Ok(())
-    }
-
-    fn find_registered_entry(
-        state: &RcBackendState,
-        ptr: u64,
-        len: usize,
-    ) -> Option<(u64, usize, Arc<MemoryRegion>)> {
-        let end = ptr.checked_add(len as u64)?;
-        state.registered.values().find_map(|entry| {
-            let entry_end = entry.base_ptr.checked_add(entry.len as u64)?;
-            if ptr >= entry.base_ptr && end <= entry_end {
-                Some((entry.base_ptr, entry.len, Arc::clone(&entry.mr)))
-            } else {
-                None
-            }
-        })
-    }
-
-    fn find_cached_remote_memory(
-        state: &RcBackendState,
-        remote_qpn: u32,
-        remote_ptr: u64,
-        len: usize,
-    ) -> Option<(u32, usize)> {
-        let end = remote_ptr.checked_add(len as u64)?;
-        let entries = state.remote_memory.get(&remote_qpn)?;
-        let index = match entries.binary_search_by_key(&remote_ptr, |entry| entry.base_ptr) {
-            Ok(index) => index,
-            Err(0) => return None,
-            Err(index) => index - 1,
-        };
-        let entry = &entries[index];
-        if remote_ptr >= entry.base_ptr && end <= entry.end_ptr {
-            let available = usize::try_from(entry.end_ptr - remote_ptr).ok()?;
-            return Some((entry.rkey, available));
-        }
-        None
-    }
-
-    fn cache_remote_memory(
-        state: &mut RcBackendState,
-        remote_qpn: u32,
-        remote_memory_regions: &[RegisteredMemoryRegion],
-    ) -> Result<()> {
-        let mut cached = Vec::with_capacity(remote_memory_regions.len());
-        for entry in remote_memory_regions.iter().copied() {
-            if entry.len == 0 {
-                return Err(TransferError::Backend(
-                    "handshake response contains zero-length memory region".to_string(),
-                ));
-            }
-            let Some(end_ptr) = entry.base_ptr.checked_add(entry.len) else {
-                return Err(TransferError::Backend(
-                    "handshake response contains memory region overflow".to_string(),
-                ));
-            };
-            cached.push(RemoteMemoryEntry {
-                base_ptr: entry.base_ptr,
-                end_ptr,
-                rkey: entry.rkey,
-            });
-        }
-        cached.sort_unstable_by_key(|entry| entry.base_ptr);
-        for pair in cached.windows(2) {
-            if pair[1].base_ptr < pair[0].end_ptr {
-                return Err(TransferError::Backend(
-                    "handshake response contains overlapping memory regions".to_string(),
-                ));
-            }
-        }
-        state.remote_memory.insert(remote_qpn, cached);
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cache_remote_memory_rejects_overlapping_regions() {
-        let mut state = RcBackendState::default();
-        let regions = vec![
-            RegisteredMemoryRegion {
-                base_ptr: 0x1000,
-                len: 0x200,
-                rkey: 1,
-            },
-            RegisteredMemoryRegion {
-                base_ptr: 0x1100,
-                len: 0x100,
-                rkey: 2,
-            },
-        ];
-
-        let error = RcBackend::cache_remote_memory(&mut state, 1, &regions)
-            .expect_err("overlap should fail");
-        assert_eq!(
-            error,
-            TransferError::Backend(
-                "handshake response contains overlapping memory regions".to_string()
-            )
-        );
-    }
-
-    #[test]
-    fn find_cached_remote_memory_uses_sorted_snapshot() {
-        let mut state = RcBackendState::default();
-        let remote_qpn = 42;
-        let regions = vec![
-            RegisteredMemoryRegion {
-                base_ptr: 0x3000,
-                len: 0x100,
-                rkey: 3,
-            },
-            RegisteredMemoryRegion {
-                base_ptr: 0x1000,
-                len: 0x100,
-                rkey: 1,
-            },
-            RegisteredMemoryRegion {
-                base_ptr: 0x2000,
-                len: 0x100,
-                rkey: 2,
-            },
-        ];
-        RcBackend::cache_remote_memory(&mut state, remote_qpn, &regions).expect("snapshot cache");
-
-        let hit = RcBackend::find_cached_remote_memory(&state, remote_qpn, 0x2080, 0x10);
-        assert_eq!(hit, Some((2, 0x80)));
-
-        let miss = RcBackend::find_cached_remote_memory(&state, remote_qpn, 0x2500, 0x10);
-        assert!(miss.is_none());
     }
 }

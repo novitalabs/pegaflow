@@ -32,10 +32,10 @@ pub(crate) struct RdmaOp {
 }
 
 enum SessionCommand {
-    SubmitBatch {
+    Transfer {
         ops: Vec<RdmaOp>,
         op: TransferOp,
-        done_tx: std_mpsc::Sender<Result<usize>>,
+        done_tx: std_mpsc::SyncSender<Result<usize>>,
     },
 }
 
@@ -151,11 +151,11 @@ impl RcSession {
         Ok(())
     }
 
-    /// Submit a batch of RDMA operations to the session worker thread.
-    pub(crate) fn submit_batch(&self, ops: Vec<RdmaOp>, op: TransferOp) -> Result<usize> {
-        let (done_tx, done_rx) = std_mpsc::channel();
+    /// Send a batch of RDMA ops to the session worker and block until completion.
+    pub(crate) fn transfer_batch(&self, ops: Vec<RdmaOp>, op: TransferOp) -> Result<usize> {
+        let (done_tx, done_rx) = std_mpsc::sync_channel(0);
         self.cmd_tx
-            .send(SessionCommand::SubmitBatch { ops, op, done_tx })
+            .send(SessionCommand::Transfer { ops, op, done_tx })
             .map_err(|_| {
                 TransferError::Backend("session worker channel disconnected".to_string())
             })?;
@@ -174,7 +174,7 @@ impl RcSession {
                 );
                 while let Ok(command) = cmd_rx.recv() {
                     match command {
-                        SessionCommand::SubmitBatch { ops, op, done_tx } => {
+                        SessionCommand::Transfer { ops, op, done_tx } => {
                             let result = Self::execute_batch(&session, ops, op);
                             if done_tx.send(result).is_err() {
                                 debug!(

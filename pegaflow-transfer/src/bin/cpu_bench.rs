@@ -588,7 +588,7 @@ fn main() {
     let groups: Vec<_> = topo
         .groups()
         .iter()
-        .filter(|g| cli.numa.map_or(true, |n| g.node.0 == n))
+        .filter(|g| cli.numa.is_none_or(|n| g.node.0 == n))
         .filter(|g| !g.nics.is_empty())
         .collect();
 
@@ -601,8 +601,8 @@ fn main() {
         let nics: Vec<_> = group
             .nics
             .iter()
-            .filter(|nic| cli.nic.as_ref().map_or(true, |f| &nic.name == f))
-            .filter(|nic| cli.exclude_nic.as_ref().map_or(true, |e| &nic.name != e))
+            .filter(|nic| cli.nic.as_ref().is_none_or(|f| &nic.name == f))
+            .filter(|nic| cli.exclude_nic.as_ref() != Some(&nic.name))
             .collect();
 
         if nics.is_empty() {
