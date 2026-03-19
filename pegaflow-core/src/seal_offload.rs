@@ -18,17 +18,29 @@ use pegaflow_common::NumaNode;
 /// Layout-agnostic: uses per-segment sizes instead of `is_split` boolean.
 #[derive(Debug, Clone)]
 pub struct SlotMeta {
-    /// Per-segment sizes. SmallVec inlines up to 4 elements on the stack
-    /// (covers K-only MLA, K+V, and future multi-segment layouts).
-    pub segment_sizes: SmallVec<[u64; 4]>,
+    /// Per-segment sizes. SmallVec inlines up to 2 elements on the stack
+    /// (covers K-only MLA and K+V layouts; spills to heap for 3+ segments).
+    pub segment_sizes: SmallVec<[u64; 2]>,
+    /// Pre-computed total size across all segments (cached for consistency with RawBlock).
+    pub total_size: u64,
     /// NUMA node affinity for this slot's GPU.
     pub numa_node: NumaNode,
 }
 
 impl SlotMeta {
+    /// Create a new SlotMeta, caching total_size from segment_sizes.
+    pub fn new(segment_sizes: SmallVec<[u64; 2]>, numa_node: NumaNode) -> Self {
+        let total_size = segment_sizes.iter().sum();
+        Self {
+            segment_sizes,
+            total_size,
+            numa_node,
+        }
+    }
+
     /// Total size across all segments.
     pub fn total_size(&self) -> u64 {
-        self.segment_sizes.iter().sum()
+        self.total_size
     }
 
     /// Number of segments.

@@ -285,13 +285,13 @@ impl SsdRingBuffer {
                     .iter()
                     .enumerate()
                     .map(|(i, s)| {
-                        let segment_sizes: SmallVec<[u64; 4]> = (0..s.num_segments())
+                        let segment_sizes: SmallVec<[u64; 2]> = (0..s.num_segments())
                             .map(|idx| s.segment_size(idx).unwrap() as u64)
                             .collect();
-                        SlotMeta {
+                        SlotMeta::new(
                             segment_sizes,
-                            numa_node: slot_numas.get(i).copied().unwrap_or(NumaNode::UNKNOWN),
-                        }
+                            slot_numas.get(i).copied().unwrap_or(NumaNode::UNKNOWN),
+                        )
                     })
                     .collect();
 
@@ -1142,10 +1142,7 @@ mod tests {
     // ========================================================================
 
     fn make_slot(numa_node: NumaNode, size: u64) -> SlotMeta {
-        SlotMeta {
-            segment_sizes: smallvec![size],
-            numa_node,
-        }
+        SlotMeta::new(smallvec![size], numa_node)
     }
 
     fn make_prefetch_request(n: u8, slots: Vec<SlotMeta>) -> PrefetchRequest {
