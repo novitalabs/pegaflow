@@ -27,27 +27,31 @@ pub struct RegisteredMemoryRegion {
     pub rkey: u32,
 }
 
+/// Per-NIC handshake data: endpoint + memory region snapshot.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NicHandshake {
+    pub endpoint: RcEndpoint,
+    pub memory_regions: Vec<RegisteredMemoryRegion>,
+}
+
 /// Opaque handshake metadata exchanged between peers via gRPC.
 ///
-/// Contains the RC endpoint and registered memory regions needed to
-/// establish an RDMA connection and perform transfers.
+/// Contains one [`NicHandshake`] per NIC. NICs are 1:1 mapped by index
+/// between two machines (mlx5_0↔mlx5_0, etc.).
 #[derive(Clone, Debug)]
 pub struct HandshakeMetadata {
-    pub(crate) endpoint: RcEndpoint,
-    pub(crate) memory_regions: Vec<RegisteredMemoryRegion>,
+    pub(crate) nics: Vec<NicHandshake>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct WireHandshakeMetadata {
-    endpoint: RcEndpoint,
-    memory_regions: Vec<RegisteredMemoryRegion>,
+    nics: Vec<NicHandshake>,
 }
 
 impl HandshakeMetadata {
     pub fn to_bytes(&self) -> Vec<u8> {
         let wire = WireHandshakeMetadata {
-            endpoint: self.endpoint,
-            memory_regions: self.memory_regions.clone(),
+            nics: self.nics.clone(),
         };
         bincode::serde::encode_to_vec(&wire, bincode::config::standard())
             .expect("handshake metadata serialization should not fail")
@@ -64,10 +68,7 @@ impl HandshakeMetadata {
                 "trailing bytes in handshake metadata",
             ));
         }
-        Ok(Self {
-            endpoint: wire.endpoint,
-            memory_regions: wire.memory_regions,
-        })
+        Ok(Self { nics: wire.nics })
     }
 }
 
@@ -76,9 +77,9 @@ pub struct TransferEngine {
 }
 
 impl TransferEngine {
-    pub fn new(nic_name: impl Into<String>) -> Result<Self> {
+    pub fn new(nic_names: &[String]) -> Result<Self> {
         Ok(Self {
-            backend: RcBackend::new(&nic_name.into())?,
+            backend: RcBackend::new(nic_names)?,
         })
     }
 
@@ -102,37 +103,33 @@ impl TransferEngine {
         Ok(())
     }
 
-    /// Create an RC QP (INIT state) and return handshake metadata containing
-    /// the local endpoint and a snapshot of all registered memory regions.
+    /// Create one RC QP per NIC (INIT state) and return handshake metadata
+    /// containing per-NIC endpoints and snapshots of all registered memory.
     ///
     /// Call after `register_memory`, serialize with [`HandshakeMetadata::to_bytes`],
     /// and send to the remote peer.
     pub fn prepare_handshake(&self) -> Result<HandshakeMetadata> {
-        let endpoint = self.backend.prepare_handshake()?;
-        let memory_regions = self.backend.snapshot_registered_memory();
-        Ok(HandshakeMetadata {
-            endpoint,
-            memory_regions,
-        })
+        let nics = self.backend.prepare_handshake()?;
+        Ok(HandshakeMetadata { nics })
     }
 
-    /// Connect the most recently prepared QP to the remote peer (RTR→RTS).
+    /// Connect all prepared QPs to the remote peer (RTR→RTS).
     ///
     /// Called by the **responder** after receiving the initiator's metadata.
     /// The responder should call [`prepare_handshake`](Self::prepare_handshake) first
-    /// to create its own QP, then `accept_handshake` to immediately connect it.
+    /// to create its own QPs, then `accept_handshake` to immediately connect them.
     pub fn accept_handshake(&self, remote: &HandshakeMetadata) -> Result<()> {
-        self.backend
-            .accept_handshake(&remote.endpoint, &remote.memory_regions)
+        self.backend.accept_handshake(&remote.nics)
     }
 
     /// Submit a batch of RDMA READ or WRITE operations against a peer.
     ///
-    /// Returns a `Receiver` that yields the total bytes transferred once
-    /// the RDMA operations complete. The caller decides when to block on `.recv()`.
+    /// Ops are round-robin distributed across NICs. Returns a `Receiver`
+    /// that yields the total bytes transferred once all RDMA operations complete.
+    /// The caller decides when to block on `.recv()`.
     ///
-    /// On the **initiator** side, the first call lazily connects the QP to the
-    /// peer. Subsequent calls reuse the existing long-lived connection.
+    /// On the **initiator** side, the first call lazily connects QPs to the
+    /// peer. Subsequent calls reuse the existing long-lived connections.
     pub fn batch_transfer_async(
         &self,
         op: TransferOp,
@@ -154,40 +151,78 @@ impl TransferEngine {
             });
         }
 
-        self.backend.batch_transfer_async(
-            op,
-            &peer.endpoint,
-            &peer.memory_regions,
-            local_ptrs,
-            remote_ptrs,
-            lens,
-        )
+        self.backend
+            .batch_transfer_async(op, &peer.nics, local_ptrs, remote_ptrs, lens)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{HandshakeMetadata, RcEndpoint, RegisteredMemoryRegion};
+    use super::{HandshakeMetadata, NicHandshake, RcEndpoint, RegisteredMemoryRegion};
 
     #[test]
     fn handshake_metadata_roundtrip() {
         let meta = HandshakeMetadata {
-            endpoint: RcEndpoint {
-                gid: [7u8; 16],
-                lid: 0,
-                qp_num: 200,
-                psn: 0x1111,
-            },
-            memory_regions: vec![RegisteredMemoryRegion {
-                base_ptr: 0x1000,
-                len: 0x2000,
-                rkey: 42,
+            nics: vec![NicHandshake {
+                endpoint: RcEndpoint {
+                    gid: [7u8; 16],
+                    lid: 0,
+                    qp_num: 200,
+                    psn: 0x1111,
+                },
+                memory_regions: vec![RegisteredMemoryRegion {
+                    base_ptr: 0x1000,
+                    len: 0x2000,
+                    rkey: 42,
+                }],
             }],
         };
         let bytes = meta.to_bytes();
         let decoded = HandshakeMetadata::from_bytes(&bytes).expect("decode");
-        assert_eq!(decoded.endpoint, meta.endpoint);
-        assert_eq!(decoded.memory_regions, meta.memory_regions);
+        assert_eq!(decoded.nics.len(), 1);
+        assert_eq!(decoded.nics[0].endpoint, meta.nics[0].endpoint);
+        assert_eq!(decoded.nics[0].memory_regions, meta.nics[0].memory_regions);
+    }
+
+    #[test]
+    fn handshake_metadata_multi_nic_roundtrip() {
+        let meta = HandshakeMetadata {
+            nics: vec![
+                NicHandshake {
+                    endpoint: RcEndpoint {
+                        gid: [1u8; 16],
+                        lid: 0,
+                        qp_num: 100,
+                        psn: 0x1000,
+                    },
+                    memory_regions: vec![RegisteredMemoryRegion {
+                        base_ptr: 0x1000,
+                        len: 0x2000,
+                        rkey: 10,
+                    }],
+                },
+                NicHandshake {
+                    endpoint: RcEndpoint {
+                        gid: [2u8; 16],
+                        lid: 0,
+                        qp_num: 200,
+                        psn: 0x2000,
+                    },
+                    memory_regions: vec![RegisteredMemoryRegion {
+                        base_ptr: 0x1000,
+                        len: 0x2000,
+                        rkey: 20,
+                    }],
+                },
+            ],
+        };
+        let bytes = meta.to_bytes();
+        let decoded = HandshakeMetadata::from_bytes(&bytes).expect("decode");
+        assert_eq!(decoded.nics.len(), 2);
+        assert_eq!(decoded.nics[0].endpoint.qp_num, 100);
+        assert_eq!(decoded.nics[0].memory_regions[0].rkey, 10);
+        assert_eq!(decoded.nics[1].endpoint.qp_num, 200);
+        assert_eq!(decoded.nics[1].memory_regions[0].rkey, 20);
     }
 
     #[test]

@@ -3,7 +3,7 @@ mod session;
 mod state;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use log::debug;
@@ -13,29 +13,43 @@ use sideway::ibverbs::AccessFlags;
 use self::runtime::RcRuntime;
 use self::session::{RcSession, RdmaOp};
 use self::state::{RcBackendState, RegisteredMemoryEntry};
-use crate::engine::{RcEndpoint, RegisteredMemoryRegion, TransferOp};
+use crate::engine::{NicHandshake, RegisteredMemoryRegion, TransferOp};
 use crate::error::{Result, TransferError};
 
 pub(crate) struct RcBackend {
-    runtime: Arc<RcRuntime>,
+    runtimes: Vec<Arc<RcRuntime>>,
     state: Arc<Mutex<RcBackendState>>,
     psn_counter: AtomicU64,
+    rr_counter: AtomicUsize,
 }
 
 impl RcBackend {
-    pub(crate) fn new(nic_name: &str) -> Result<Self> {
+    pub(crate) fn new(nic_names: &[String]) -> Result<Self> {
         crate::init_logging();
-        if nic_name.trim().is_empty() {
-            return Err(TransferError::InvalidArgument("nic_name is empty"));
+        if nic_names.is_empty() {
+            return Err(TransferError::InvalidArgument("nic_names is empty"));
         }
-        log::info!("rc backend initialize: nic={}", nic_name);
-        let runtime = RcRuntime::open(nic_name)?;
-        log::info!("rc backend initialized: nic={}", nic_name);
+        let mut runtimes = Vec::with_capacity(nic_names.len());
+        for name in nic_names {
+            if name.trim().is_empty() {
+                return Err(TransferError::InvalidArgument("nic_name is empty"));
+            }
+            log::info!("rc backend initialize: nic={}", name);
+            let runtime = RcRuntime::open(name)?;
+            log::info!("rc backend initialized: nic={}", name);
+            runtimes.push(runtime);
+        }
+        let nic_count = runtimes.len();
         Ok(Self {
-            runtime,
-            state: Arc::new(Mutex::new(RcBackendState::default())),
+            runtimes,
+            state: Arc::new(Mutex::new(RcBackendState::new(nic_count))),
             psn_counter: AtomicU64::new(1),
+            rr_counter: AtomicUsize::new(0),
         })
+    }
+
+    fn nic_count(&self) -> usize {
+        self.runtimes.len()
     }
 
     pub(crate) fn register_memory(&self, ptr: u64, len: usize) -> Result<()> {
@@ -46,14 +60,20 @@ impl RcBackend {
             return Err(TransferError::InvalidArgument("len must be non-zero"));
         }
 
-        let mr = unsafe {
-            self.runtime.pd.reg_mr(
-                ptr as usize,
-                len,
-                AccessFlags::LocalWrite | AccessFlags::RemoteWrite | AccessFlags::RemoteRead,
-            )
+        // Register on every NIC's PD.
+        let mut mrs = Vec::with_capacity(self.nic_count());
+        for runtime in &self.runtimes {
+            let mr = unsafe {
+                runtime.pd.reg_mr(
+                    ptr as usize,
+                    len,
+                    AccessFlags::LocalWrite | AccessFlags::RemoteWrite | AccessFlags::RemoteRead,
+                )
+            }
+            .map_err(|error| TransferError::Backend(error.to_string()))?;
+            mrs.push(mr);
         }
-        .map_err(|error| TransferError::Backend(error.to_string()))?;
+        // If we reach here, all NIC registrations succeeded.
 
         let mut state = self.state.lock();
         state.registered.insert(
@@ -61,10 +81,15 @@ impl RcBackend {
             RegisteredMemoryEntry {
                 base_ptr: ptr,
                 len,
-                mr,
+                mrs,
             },
         );
-        debug!("memory registered: ptr={:#x}, len={}", ptr, len);
+        debug!(
+            "memory registered: ptr={:#x}, len={}, nics={}",
+            ptr,
+            len,
+            self.nic_count()
+        );
         Ok(())
     }
 
@@ -81,149 +106,283 @@ impl RcBackend {
         Ok(())
     }
 
-    pub(crate) fn snapshot_registered_memory(&self) -> Vec<RegisteredMemoryRegion> {
+    /// Snapshot registered memory for each NIC. Outer vec indexed by nic_idx.
+    fn snapshot_registered_memory(&self) -> Vec<Vec<RegisteredMemoryRegion>> {
         let state = self.state.lock();
-        let mut regions: Vec<RegisteredMemoryRegion> = state
-            .registered
-            .values()
-            .map(|entry| RegisteredMemoryRegion {
-                base_ptr: entry.base_ptr,
-                len: entry.len as u64,
-                rkey: entry.mr.rkey(),
+        (0..self.nic_count())
+            .map(|nic_idx| {
+                let mut regions: Vec<RegisteredMemoryRegion> = state
+                    .registered
+                    .values()
+                    .map(|entry| RegisteredMemoryRegion {
+                        base_ptr: entry.base_ptr,
+                        len: entry.len as u64,
+                        rkey: entry.mrs[nic_idx].rkey(),
+                    })
+                    .collect();
+                regions.sort_unstable_by_key(|entry| entry.base_ptr);
+                regions
             })
-            .collect();
-        regions.sort_unstable_by_key(|entry| entry.base_ptr);
-        regions
+            .collect()
     }
 
-    /// Create an RC QP in INIT state, push it to the pending queue, and return its endpoint.
-    pub(crate) fn prepare_handshake(&self) -> Result<RcEndpoint> {
-        let psn_seed = self.psn_counter.fetch_add(1, Ordering::Relaxed);
-        let session = RcSession::create(&self.runtime, psn_seed)?;
-        let endpoint = session.local_endpoint;
-        self.state.lock().pending.push_back(session);
-        Ok(endpoint)
-    }
+    /// Create one RC QP per NIC in INIT state, push to per-NIC pending queues,
+    /// return per-NIC handshake data.
+    pub(crate) fn prepare_handshake(&self) -> Result<Vec<NicHandshake>> {
+        let snapshots = self.snapshot_registered_memory();
+        let mut nic_handshakes = Vec::with_capacity(self.nic_count());
 
-    /// Pop the oldest pending QP, connect it to the remote peer (RTR→RTS),
-    /// and cache the remote memory regions. Called by the responder.
-    pub(crate) fn accept_handshake(
-        &self,
-        remote: &RcEndpoint,
-        remote_memory_regions: &[RegisteredMemoryRegion],
-    ) -> Result<()> {
-        let session = self
-            .state
-            .lock()
-            .pending
-            .pop_front()
-            .ok_or(TransferError::Backend(
-                "no pending session to accept".to_string(),
-            ))?;
-
-        session.connect(&self.runtime, remote)?;
+        // Create all QPs before locking state.
+        let mut sessions = Vec::with_capacity(self.nic_count());
+        for runtime in &self.runtimes {
+            let psn_seed = self.psn_counter.fetch_add(1, Ordering::Relaxed);
+            let session = RcSession::create(runtime, psn_seed)?;
+            sessions.push(session);
+        }
 
         let mut state = self.state.lock();
-        state.cache_remote_memory(remote.qp_num, remote_memory_regions)?;
-        state.sessions.insert(remote.qp_num, session);
+        for (nic_idx, session) in sessions.into_iter().enumerate() {
+            let endpoint = session.local_endpoint;
+            state.nics[nic_idx].pending.push_back(session);
+            nic_handshakes.push(NicHandshake {
+                endpoint,
+                memory_regions: snapshots[nic_idx].clone(),
+            });
+        }
+
+        Ok(nic_handshakes)
+    }
+
+    /// Connect all pending QPs to the remote peer (responder path).
+    pub(crate) fn accept_handshake(&self, remote_nics: &[NicHandshake]) -> Result<()> {
+        let nic_count = self.nic_count();
+        if remote_nics.len() != nic_count {
+            return Err(TransferError::InvalidArgument(
+                "remote NIC count mismatch in handshake",
+            ));
+        }
+
+        // Pop all pending sessions under one lock.
+        let pending_sessions: Vec<Arc<RcSession>> = {
+            let mut state = self.state.lock();
+            let mut sessions = Vec::with_capacity(nic_count);
+            for nic_idx in 0..nic_count {
+                let session =
+                    state.nics[nic_idx]
+                        .pending
+                        .pop_front()
+                        .ok_or(TransferError::Backend(
+                            "no pending session to accept".to_string(),
+                        ))?;
+                sessions.push(session);
+            }
+            sessions
+        };
+
+        // Connect all outside lock.
+        for (nic_idx, session) in pending_sessions.iter().enumerate() {
+            session.connect(&self.runtimes[nic_idx], &remote_nics[nic_idx].endpoint)?;
+        }
+
+        // Re-lock and insert all sessions + cache remote memory.
+        let mut state = self.state.lock();
+        for (nic_idx, session) in pending_sessions.into_iter().enumerate() {
+            let remote = &remote_nics[nic_idx];
+            let remote_qpn = remote.endpoint.qp_num;
+            state.nics[nic_idx].cache_remote_memory(remote_qpn, &remote.memory_regions)?;
+            state.nics[nic_idx].sessions.insert(remote_qpn, session);
+        }
         Ok(())
     }
 
     pub(crate) fn batch_transfer_async(
         &self,
         op: TransferOp,
-        remote: &RcEndpoint,
-        remote_memory_regions: &[RegisteredMemoryRegion],
+        remote_nics: &[NicHandshake],
         local_ptrs: &[u64],
         remote_ptrs: &[u64],
         lens: &[usize],
     ) -> Result<std::sync::mpsc::Receiver<Result<usize>>> {
+        let nic_count = self.nic_count();
+        if remote_nics.len() != nic_count {
+            return Err(TransferError::InvalidArgument(
+                "remote NIC count mismatch in transfer",
+            ));
+        }
+
         if lens.is_empty() {
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
             let _ = tx.send(Ok(0));
             return Ok(rx);
         }
 
-        let remote_qpn = remote.qp_num;
+        // Round-robin assignment.
+        let rr_base = self.rr_counter.fetch_add(lens.len(), Ordering::Relaxed);
 
-        // --- Lazy connect + lookup in one lock acquisition (hot path) ---
+        // Group ops by NIC index.
+        struct NicOpsBuilder {
+            local_ptrs: Vec<u64>,
+            remote_ptrs: Vec<u64>,
+            lens: Vec<usize>,
+        }
+        let mut per_nic: Vec<NicOpsBuilder> = (0..nic_count)
+            .map(|_| NicOpsBuilder {
+                local_ptrs: Vec::new(),
+                remote_ptrs: Vec::new(),
+                lens: Vec::new(),
+            })
+            .collect();
+        for i in 0..lens.len() {
+            let nic_idx = (rr_base + i) % nic_count;
+            per_nic[nic_idx].local_ptrs.push(local_ptrs[i]);
+            per_nic[nic_idx].remote_ptrs.push(remote_ptrs[i]);
+            per_nic[nic_idx].lens.push(lens[i]);
+        }
+
+        // --- Lock: lazy connect + prepare ops ---
         let lookup_start = Instant::now();
-        let (session, prepared_ops) = {
+        let mut nic_work: Vec<(Arc<RcSession>, Vec<RdmaOp>)> = Vec::new();
+        {
             let mut state = self.state.lock();
 
-            // Lazy connect: if no session yet, pop a pending QP.
-            // Check + pop under one lock to avoid TOCTOU.
-            if !state.sessions.contains_key(&remote_qpn) {
-                let pending_session = state.pending.pop_front().ok_or(TransferError::Backend(
-                    "no pending session for lazy connect".to_string(),
-                ))?;
-                // Must drop lock before blocking connect().
+            // Lazy connect: if NIC 0 has no session for the remote peer, connect all NICs.
+            let nic0_remote_qpn = remote_nics[0].endpoint.qp_num;
+            if !state.nics[0].sessions.contains_key(&nic0_remote_qpn) {
+                // Pop pending from all NICs.
+                let mut pending_sessions = Vec::with_capacity(nic_count);
+                for nic_idx in 0..nic_count {
+                    let session =
+                        state.nics[nic_idx]
+                            .pending
+                            .pop_front()
+                            .ok_or(TransferError::Backend(
+                                "no pending session for lazy connect".to_string(),
+                            ))?;
+                    pending_sessions.push(session);
+                }
                 drop(state);
 
-                pending_session.connect(&self.runtime, remote)?;
+                // Connect all outside lock.
+                for (nic_idx, session) in pending_sessions.iter().enumerate() {
+                    session.connect(&self.runtimes[nic_idx], &remote_nics[nic_idx].endpoint)?;
+                }
 
                 state = self.state.lock();
-                if !state.sessions.contains_key(&remote_qpn) {
-                    state.cache_remote_memory(remote_qpn, remote_memory_regions)?;
-                    state.sessions.insert(remote_qpn, pending_session);
+                for (nic_idx, session) in pending_sessions.into_iter().enumerate() {
+                    let remote_qpn = remote_nics[nic_idx].endpoint.qp_num;
+                    if !state.nics[nic_idx].sessions.contains_key(&remote_qpn) {
+                        state.nics[nic_idx].cache_remote_memory(
+                            remote_qpn,
+                            &remote_nics[nic_idx].memory_regions,
+                        )?;
+                        state.nics[nic_idx].sessions.insert(remote_qpn, session);
+                    }
                 }
             }
 
-            let session = Arc::clone(
-                state
-                    .sessions
-                    .get(&remote_qpn)
-                    .expect("session must exist after ensure_connected"),
-            );
-
-            let mut prepared = Vec::with_capacity(lens.len());
-            for ((local_ptr, remote_ptr), len) in local_ptrs
-                .iter()
-                .copied()
-                .zip(remote_ptrs.iter().copied())
-                .zip(lens.iter().copied())
-            {
-                if local_ptr == 0 {
-                    return Err(TransferError::InvalidArgument("local_ptr must be non-zero"));
-                }
-                if remote_ptr == 0 {
-                    return Err(TransferError::InvalidArgument(
-                        "remote_ptr must be non-zero",
-                    ));
-                }
-                if len == 0 {
-                    return Err(TransferError::InvalidArgument("len must be non-zero"));
+            // Prepare ops for each NIC that has work.
+            for nic_idx in 0..nic_count {
+                let builder = &per_nic[nic_idx];
+                if builder.lens.is_empty() {
+                    continue;
                 }
 
-                let local_mr = state
-                    .find_local_mr(local_ptr, len)
-                    .ok_or(TransferError::MemoryNotRegistered { ptr: local_ptr })?;
+                let remote_qpn = remote_nics[nic_idx].endpoint.qp_num;
+                let session = Arc::clone(
+                    state.nics[nic_idx]
+                        .sessions
+                        .get(&remote_qpn)
+                        .expect("session must exist after lazy connect"),
+                );
 
-                let remote_rkey = state.find_remote_rkey(remote_qpn, remote_ptr, len).ok_or(
-                    TransferError::InvalidArgument("remote memory not found in handshake snapshot"),
-                )?;
+                let mut prepared = Vec::with_capacity(builder.lens.len());
+                for j in 0..builder.lens.len() {
+                    let local_ptr = builder.local_ptrs[j];
+                    let remote_ptr = builder.remote_ptrs[j];
+                    let len = builder.lens[j];
 
-                prepared.push(RdmaOp {
-                    local_mr,
-                    local_ptr,
-                    remote_ptr,
-                    len,
-                    remote_rkey,
-                });
+                    if local_ptr == 0 {
+                        return Err(TransferError::InvalidArgument("local_ptr must be non-zero"));
+                    }
+                    if remote_ptr == 0 {
+                        return Err(TransferError::InvalidArgument(
+                            "remote_ptr must be non-zero",
+                        ));
+                    }
+                    if len == 0 {
+                        return Err(TransferError::InvalidArgument("len must be non-zero"));
+                    }
+
+                    let local_mr = state
+                        .find_local_mr(nic_idx, local_ptr, len)
+                        .ok_or(TransferError::MemoryNotRegistered { ptr: local_ptr })?;
+
+                    let remote_rkey = state.nics[nic_idx]
+                        .find_remote_rkey(remote_qpn, remote_ptr, len)
+                        .ok_or(TransferError::InvalidArgument(
+                            "remote memory not found in handshake snapshot",
+                        ))?;
+
+                    prepared.push(RdmaOp {
+                        local_mr,
+                        local_ptr,
+                        remote_ptr,
+                        len,
+                        remote_rkey,
+                    });
+                }
+                nic_work.push((session, prepared));
             }
-            (session, prepared)
-        };
+        }
         let lookup_dur = lookup_start.elapsed();
 
         debug!(
-            "batch_transfer_async_{:?}: remote_qpn={}, chunks={}, lookup_ms={:.3}",
+            "batch_transfer_async_{:?}: nics_active={}/{}, chunks={}, lookup_ms={:.3}",
             op,
-            remote_qpn,
+            nic_work.len(),
+            nic_count,
             lens.len(),
             lookup_dur.as_secs_f64() * 1000.0,
         );
 
         // --- Submit outside lock ---
-        session.transfer_batch_async(prepared_ops, op)
+        if nic_work.len() == 1 {
+            // Single NIC path: return its receiver directly.
+            let (session, prepared) = nic_work.into_iter().next().unwrap();
+            return session.transfer_batch_async(prepared, op);
+        }
+
+        // Multi-NIC path: submit to all NICs and aggregate results.
+        let mut receivers = Vec::with_capacity(nic_work.len());
+        for (session, prepared) in nic_work {
+            let rx = session.transfer_batch_async(prepared, op)?;
+            receivers.push(rx);
+        }
+
+        let (agg_tx, agg_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("pegaflow-transfer-agg".to_string())
+            .spawn(move || {
+                let mut total_bytes = 0usize;
+                for rx in receivers {
+                    match rx.recv() {
+                        Ok(Ok(bytes)) => total_bytes += bytes,
+                        Ok(Err(e)) => {
+                            let _ = agg_tx.send(Err(e));
+                            return;
+                        }
+                        Err(_) => {
+                            let _ = agg_tx.send(Err(TransferError::Backend(
+                                "session worker channel dropped during aggregation".to_string(),
+                            )));
+                            return;
+                        }
+                    }
+                }
+                let _ = agg_tx.send(Ok(total_bytes));
+            })
+            .map_err(|e| TransferError::Backend(format!("failed to spawn aggregator: {e}")))?;
+
+        Ok(agg_rx)
     }
 }

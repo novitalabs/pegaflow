@@ -6,7 +6,6 @@
 //! Models a realistic workload: each "task" transfers N random-sized batches of fixed-size blocks
 //! via RDMA, measuring per-task latency. Runs single-NIC baselines then multi-NIC aggregate.
 
-use std::sync::{Arc, Barrier};
 use std::time::Instant;
 use std::{mem, ptr, thread};
 
@@ -217,11 +216,11 @@ impl Drop for NumaBuffer {
 }
 
 // ---------------------------------------------------------------------------
-// Per-NIC context: a server/client engine pair with handshake metadata
+// Engine context: a server/client engine pair with handshake metadata
 // ---------------------------------------------------------------------------
 
-struct NicContext {
-    nic_name: String,
+struct EngineContext {
+    label: String,
     server: TransferEngine,
     client: TransferEngine,
     server_hs: HandshakeMetadata,
@@ -293,15 +292,6 @@ fn build_block_scatter(
     (local_ptrs, remote_ptrs, lens)
 }
 
-/// Distribute `nblocks` round-robin across `nic_count` NICs.
-fn distribute_blocks(nblocks: usize, nic_count: usize) -> Vec<usize> {
-    let base = nblocks / nic_count;
-    let remainder = nblocks % nic_count;
-    (0..nic_count)
-        .map(|i| base + if i < remainder { 1 } else { 0 })
-        .collect()
-}
-
 // ---------------------------------------------------------------------------
 // Result types
 // ---------------------------------------------------------------------------
@@ -312,16 +302,16 @@ struct TaskResult {
 }
 
 struct BenchResult {
-    nic_name: String,
+    label: String,
     tasks: Vec<TaskResult>,
 }
 
 // ---------------------------------------------------------------------------
-// Single-NIC bench
+// Bench runner (works for both single-NIC and multi-NIC engines)
 // ---------------------------------------------------------------------------
 
-fn run_single_nic_bench(
-    ctx: &NicContext,
+fn run_bench(
+    ctx: &EngineContext,
     op: TransferOp,
     schedule: &[usize],
     warmup: usize,
@@ -356,102 +346,22 @@ fn run_single_nic_bench(
     }
 
     BenchResult {
-        nic_name: ctx.nic_name.clone(),
+        label: ctx.label.clone(),
         tasks,
     }
-}
-
-// ---------------------------------------------------------------------------
-// Multi-NIC aggregate bench
-// ---------------------------------------------------------------------------
-
-fn run_multi_nic_bench(
-    contexts: &[NicContext],
-    op: TransferOp,
-    schedule: &[usize],
-    warmup: usize,
-    block_size: usize,
-) -> Vec<BenchResult> {
-    let n = contexts.len();
-    if n == 1 {
-        return vec![run_single_nic_bench(
-            &contexts[0],
-            op,
-            schedule,
-            warmup,
-            block_size,
-        )];
-    }
-
-    let barrier = Arc::new(Barrier::new(n));
-    let schedule = Arc::new(schedule.to_vec());
-
-    thread::scope(|s| {
-        let handles: Vec<_> = contexts
-            .iter()
-            .enumerate()
-            .map(|(nic_idx, ctx)| {
-                let barrier = Arc::clone(&barrier);
-                let schedule = Arc::clone(&schedule);
-                s.spawn(move || {
-                    let mut tasks = Vec::with_capacity(schedule.len().saturating_sub(warmup));
-
-                    for (i, &nblocks) in schedule.iter().enumerate() {
-                        let per_nic = distribute_blocks(nblocks, n);
-                        let my_blocks = per_nic[nic_idx];
-
-                        let (local_ptrs, remote_ptrs, lens) = build_block_scatter(
-                            ctx.client_buf.as_u64(),
-                            ctx.server_buf.as_u64(),
-                            my_blocks,
-                            block_size,
-                        );
-
-                        barrier.wait();
-
-                        let start = Instant::now();
-                        if my_blocks > 0 {
-                            let rx = ctx
-                                .client
-                                .batch_transfer_async(
-                                    op,
-                                    &ctx.server_hs,
-                                    &local_ptrs,
-                                    &remote_ptrs,
-                                    &lens,
-                                )
-                                .expect("RDMA submit failed");
-                            rx.recv()
-                                .expect("completion channel dropped")
-                                .expect("RDMA transfer failed");
-                        }
-                        let elapsed = start.elapsed();
-
-                        if i >= warmup {
-                            tasks.push(TaskResult {
-                                latency_ms: elapsed.as_secs_f64() * 1000.0,
-                                bytes: my_blocks * block_size,
-                            });
-                        }
-                    }
-
-                    BenchResult {
-                        nic_name: ctx.nic_name.clone(),
-                        tasks,
-                    }
-                })
-            })
-            .collect();
-
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    })
 }
 
 // ---------------------------------------------------------------------------
 // Print results
 // ---------------------------------------------------------------------------
 
-fn print_single_nic_result(result: &BenchResult, op: TransferOp, block_size: usize, numa: u32) {
+fn print_bench_result(
+    result: &BenchResult,
+    op: TransferOp,
+    block_size: usize,
+    numa: u32,
+    nic_count: usize,
+) {
     let mut latencies: Vec<f64> = result.tasks.iter().map(|t| t.latency_ms).collect();
     latencies.sort_by(f64::total_cmp);
 
@@ -463,74 +373,33 @@ fn print_single_nic_result(result: &BenchResult, op: TransferOp, block_size: usi
     let p99 = percentile(&latencies, 0.99);
 
     println!();
-    println!(
-        "=== RDMA {:?} — {} (NUMA{}, single NIC) ===",
-        op, result.nic_name, numa,
-    );
-    println!(
-        "  avg {} blocks x {}  ({:.1} MB/task)",
-        avg_blocks,
-        format_size(block_size),
-        avg_bytes as f64 / (1024.0 * 1024.0),
-    );
-    println!("  p50={:.2}ms  p95={:.2}ms  p99={:.2}ms", p50, p95, p99);
-    println!(
-        "  p50 equiv: {:.1} Gbps ({:.2} GiB/s)",
-        gbps(avg_bytes, p50 / 1000.0),
-        gib_per_sec(avg_bytes, p50 / 1000.0),
-    );
-}
-
-fn print_multi_nic_results(
-    results: &[BenchResult],
-    op: TransferOp,
-    block_size: usize,
-    schedule: &[usize],
-    warmup: usize,
-    numa: u32,
-) {
-    let nic_count = results.len();
-    let measured = &schedule[warmup..];
-    let ntasks = measured.len();
-    if ntasks == 0 {
-        return;
+    if nic_count == 1 {
+        println!(
+            "=== RDMA {:?} — {} (NUMA{}, single NIC) ===",
+            op, result.label, numa,
+        );
+    } else {
+        println!(
+            "=== RDMA {:?} — NUMA{}, {} NICs aggregate [{}] ===",
+            op, numa, nic_count, result.label,
+        );
     }
-
-    // Aggregate latency = max across NICs per task.
-    let mut agg_latencies: Vec<f64> = (0..ntasks)
-        .map(|i| {
-            results
-                .iter()
-                .map(|r| r.tasks[i].latency_ms)
-                .fold(0.0_f64, f64::max)
-        })
-        .collect();
-    agg_latencies.sort_by(f64::total_cmp);
-
-    let avg_total_blocks = measured.iter().sum::<usize>() / ntasks;
-    let avg_bytes = avg_total_blocks * block_size;
-
-    let p50 = percentile(&agg_latencies, 0.50);
-    let p95 = percentile(&agg_latencies, 0.95);
-    let p99 = percentile(&agg_latencies, 0.99);
-
-    let nic_names: Vec<&str> = results.iter().map(|r| r.nic_name.as_str()).collect();
-
-    println!();
-    println!(
-        "=== RDMA {:?} — NUMA{}, {} NICs aggregate [{}] ===",
-        op,
-        numa,
-        nic_count,
-        nic_names.join(", "),
-    );
-    println!(
-        "  avg {} blocks x {}  ({:.1} MB/task, split across {} NICs)",
-        avg_total_blocks,
-        format_size(block_size),
-        avg_bytes as f64 / (1024.0 * 1024.0),
-        nic_count,
-    );
+    if nic_count > 1 {
+        println!(
+            "  avg {} blocks x {}  ({:.1} MB/task, split across {} NICs)",
+            avg_blocks,
+            format_size(block_size),
+            avg_bytes as f64 / (1024.0 * 1024.0),
+            nic_count,
+        );
+    } else {
+        println!(
+            "  avg {} blocks x {}  ({:.1} MB/task)",
+            avg_blocks,
+            format_size(block_size),
+            avg_bytes as f64 / (1024.0 * 1024.0),
+        );
+    }
     println!("  p50={:.2}ms  p95={:.2}ms  p99={:.2}ms", p50, p95, p99);
     println!(
         "  p50 equiv: {:.1} Gbps ({:.2} GiB/s)",
@@ -548,6 +417,55 @@ fn format_size(bytes: usize) -> String {
         format!("{:.0}KB", bytes as f64 / (1u64 << 10) as f64)
     } else {
         format!("{}B", bytes)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: create an EngineContext for a set of NIC names
+// ---------------------------------------------------------------------------
+
+fn create_engine_context(
+    label: String,
+    nic_names: &[String],
+    numa_node: u32,
+    buf_size: usize,
+) -> EngineContext {
+    let server_buf = NumaBuffer::alloc(numa_node, buf_size);
+    let client_buf = NumaBuffer::alloc(numa_node, buf_size);
+    server_buf.fill(0xAA);
+    client_buf.fill(0xBB);
+
+    let server = TransferEngine::new(nic_names).expect("server init failed");
+    server
+        .register_memory(&[server_buf.as_u64()], &[buf_size])
+        .expect("server register_memory failed");
+
+    let client = TransferEngine::new(nic_names).expect("client init failed");
+    client
+        .register_memory(&[client_buf.as_u64()], &[buf_size])
+        .expect("client register_memory failed");
+
+    // Handshake: both sides prepare, then accept each other.
+    let server_hs = server
+        .prepare_handshake()
+        .expect("server prepare_handshake failed");
+    let client_hs = client
+        .prepare_handshake()
+        .expect("client prepare_handshake failed");
+    server
+        .accept_handshake(&client_hs)
+        .expect("server accept_handshake failed");
+    client
+        .accept_handshake(&server_hs)
+        .expect("client accept_handshake failed");
+
+    EngineContext {
+        label,
+        server,
+        client,
+        server_hs,
+        server_buf,
+        client_buf,
     }
 }
 
@@ -587,7 +505,7 @@ fn main() {
         println!("  filter: numa={}", numa);
     }
 
-    let buf_per_nic = max_blocks * block_size;
+    let buf_size = max_blocks * block_size;
 
     // Detect topology.
     let topo = SystemTopology::detect();
@@ -621,88 +539,62 @@ fn main() {
 
         println!();
         println!(
-            "--- NUMA{}: {} NIC(s) [{}], buf={} per NIC ---",
+            "--- NUMA{}: {} NIC(s) [{}], buf={} ---",
             group.node.0,
             nic_count,
             nics.iter()
                 .map(|n| n.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", "),
-            format_size(buf_per_nic),
+            format_size(buf_size),
         );
 
-        // Build NIC contexts with handshake-based connection.
-        let mut contexts: Vec<NicContext> = Vec::with_capacity(nic_count);
+        // Build single-NIC contexts for baselines.
+        let single_contexts: Vec<EngineContext> = nics
+            .iter()
+            .map(|nic| {
+                let ctx = create_engine_context(
+                    nic.name.clone(),
+                    std::slice::from_ref(&nic.name),
+                    group.node.0,
+                    buf_size,
+                );
+                println!("  {} ready (handshake complete)", nic.name);
+                ctx
+            })
+            .collect();
 
-        for nic in &nics {
-            let server_buf = NumaBuffer::alloc(group.node.0, buf_per_nic);
-            let client_buf = NumaBuffer::alloc(group.node.0, buf_per_nic);
-            server_buf.fill(0xAA);
-            client_buf.fill(0xBB);
-
-            let server = TransferEngine::new(nic.name.clone()).expect("server init failed");
-            server
-                .register_memory(&[server_buf.as_u64()], &[buf_per_nic])
-                .expect("server register_memory failed");
-
-            let client = TransferEngine::new(nic.name.clone()).expect("client init failed");
-            client
-                .register_memory(&[client_buf.as_u64()], &[buf_per_nic])
-                .expect("client register_memory failed");
-
-            // Handshake: both sides prepare, then accept each other.
-            let server_hs = server
-                .prepare_handshake()
-                .expect("server prepare_handshake failed");
-            let client_hs = client
-                .prepare_handshake()
-                .expect("client prepare_handshake failed");
-            server
-                .accept_handshake(&client_hs)
-                .expect("server accept_handshake failed");
-            client
-                .accept_handshake(&server_hs)
-                .expect("client accept_handshake failed");
-
-            println!("  {} ready (handshake complete)", nic.name);
-
-            contexts.push(NicContext {
-                nic_name: nic.name.clone(),
-                server,
-                client,
-                server_hs,
-                server_buf,
-                client_buf,
-            });
-        }
+        // Build multi-NIC context (if >1 NIC).
+        let multi_context = if nic_count > 1 {
+            let nic_names: Vec<String> = nics.iter().map(|n| n.name.clone()).collect();
+            let label = nic_names.join(", ");
+            let ctx = create_engine_context(label, &nic_names, group.node.0, buf_size);
+            println!(
+                "  multi-NIC engine ready ({} NICs, handshake complete)",
+                nic_count
+            );
+            Some(ctx)
+        } else {
+            None
+        };
 
         let run_mode = |op: TransferOp| {
             // Phase 1: single-NIC baselines.
-            for ctx in &contexts {
+            for ctx in &single_contexts {
                 if op == TransferOp::Read {
                     ctx.client_buf.fill(0x00);
                 }
-                let result = run_single_nic_bench(ctx, op, &schedule, cli.warmup_tasks, block_size);
-                print_single_nic_result(&result, op, block_size, group.node.0);
+                let result = run_bench(ctx, op, &schedule, cli.warmup_tasks, block_size);
+                print_bench_result(&result, op, block_size, group.node.0, 1);
             }
 
             // Phase 2: multi-NIC aggregate (only if >1 NIC).
-            if contexts.len() > 1 {
-                for ctx in &contexts {
-                    if op == TransferOp::Read {
-                        ctx.client_buf.fill(0x00);
-                    }
+            if let Some(ref ctx) = multi_context {
+                if op == TransferOp::Read {
+                    ctx.client_buf.fill(0x00);
                 }
-                let results =
-                    run_multi_nic_bench(&contexts, op, &schedule, cli.warmup_tasks, block_size);
-                print_multi_nic_results(
-                    &results,
-                    op,
-                    block_size,
-                    &schedule,
-                    cli.warmup_tasks,
-                    group.node.0,
-                );
+                let result = run_bench(ctx, op, &schedule, cli.warmup_tasks, block_size);
+                print_bench_result(&result, op, block_size, group.node.0, nic_count);
             }
         };
 
@@ -716,7 +608,15 @@ fn main() {
         }
 
         // Cleanup.
-        for ctx in &contexts {
+        for ctx in &single_contexts {
+            ctx.client
+                .unregister_memory(&[ctx.client_buf.as_u64()])
+                .ok();
+            ctx.server
+                .unregister_memory(&[ctx.server_buf.as_u64()])
+                .ok();
+        }
+        if let Some(ref ctx) = multi_context {
             ctx.client
                 .unregister_memory(&[ctx.client_buf.as_u64()])
                 .ok();

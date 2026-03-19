@@ -10,7 +10,8 @@ use crate::error::{Result, TransferError};
 pub(super) struct RegisteredMemoryEntry {
     pub(super) base_ptr: u64,
     pub(super) len: usize,
-    pub(super) mr: Arc<MemoryRegion>,
+    /// One MR per NIC (different PDs → different rkeys).
+    pub(super) mrs: Vec<Arc<MemoryRegion>>,
 }
 
 #[derive(Clone, Copy)]
@@ -20,9 +21,9 @@ struct RemoteMemoryEntry {
     rkey: u32,
 }
 
+/// Per-NIC state: pending/connected sessions and remote memory cache.
 #[derive(Default)]
-pub(super) struct RcBackendState {
-    pub(super) registered: HashMap<u64, RegisteredMemoryEntry>,
+pub(super) struct PerNicState {
     /// Pre-connect sessions in FIFO order (first prepared, first connected).
     pub(super) pending: VecDeque<Arc<RcSession>>,
     /// Connected sessions keyed by remote QP number.
@@ -31,20 +32,7 @@ pub(super) struct RcBackendState {
     remote_memory: HashMap<u32, Vec<RemoteMemoryEntry>>,
 }
 
-impl RcBackendState {
-    /// Find a registered local MR that fully covers `[ptr, ptr+len)`.
-    pub(super) fn find_local_mr(&self, ptr: u64, len: usize) -> Option<Arc<MemoryRegion>> {
-        let end = ptr.checked_add(len as u64)?;
-        self.registered.values().find_map(|entry| {
-            let entry_end = entry.base_ptr.checked_add(entry.len as u64)?;
-            if ptr >= entry.base_ptr && end <= entry_end {
-                Some(Arc::clone(&entry.mr))
-            } else {
-                None
-            }
-        })
-    }
-
+impl PerNicState {
     /// Look up the remote rkey for `[remote_ptr, remote_ptr+len)` from the
     /// handshake snapshot cached for `remote_qpn`.
     pub(super) fn find_remote_rkey(
@@ -105,13 +93,46 @@ impl RcBackendState {
     }
 }
 
+pub(super) struct RcBackendState {
+    pub(super) registered: HashMap<u64, RegisteredMemoryEntry>,
+    pub(super) nics: Vec<PerNicState>,
+}
+
+impl RcBackendState {
+    pub(super) fn new(nic_count: usize) -> Self {
+        Self {
+            registered: HashMap::new(),
+            nics: (0..nic_count).map(|_| PerNicState::default()).collect(),
+        }
+    }
+
+    /// Find a registered local MR that fully covers `[ptr, ptr+len)`,
+    /// returning the MR for the given NIC index.
+    pub(super) fn find_local_mr(
+        &self,
+        nic_idx: usize,
+        ptr: u64,
+        len: usize,
+    ) -> Option<Arc<MemoryRegion>> {
+        let end = ptr.checked_add(len as u64)?;
+        self.registered.values().find_map(|entry| {
+            let entry_end = entry.base_ptr.checked_add(entry.len as u64)?;
+            if ptr >= entry.base_ptr && end <= entry_end {
+                Some(Arc::clone(&entry.mrs[nic_idx]))
+            } else {
+                None
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn cache_remote_memory_rejects_overlapping_regions() {
-        let mut state = RcBackendState::default();
+        let mut nic = PerNicState::default();
         let regions = vec![
             RegisteredMemoryRegion {
                 base_ptr: 0x1000,
@@ -125,7 +146,7 @@ mod tests {
             },
         ];
 
-        let error = state
+        let error = nic
             .cache_remote_memory(1, &regions)
             .expect_err("overlap should fail");
         assert_eq!(
@@ -138,7 +159,7 @@ mod tests {
 
     #[test]
     fn find_remote_rkey_uses_sorted_snapshot() {
-        let mut state = RcBackendState::default();
+        let mut nic = PerNicState::default();
         let remote_qpn = 42;
         let regions = vec![
             RegisteredMemoryRegion {
@@ -157,14 +178,13 @@ mod tests {
                 rkey: 2,
             },
         ];
-        state
-            .cache_remote_memory(remote_qpn, &regions)
+        nic.cache_remote_memory(remote_qpn, &regions)
             .expect("snapshot cache");
 
-        let hit = state.find_remote_rkey(remote_qpn, 0x2080, 0x10);
+        let hit = nic.find_remote_rkey(remote_qpn, 0x2080, 0x10);
         assert_eq!(hit, Some(2));
 
-        let miss = state.find_remote_rkey(remote_qpn, 0x2500, 0x10);
+        let miss = nic.find_remote_rkey(remote_qpn, 0x2500, 0x10);
         assert!(miss.is_none());
     }
 }

@@ -4,7 +4,7 @@ mod rc_backend;
 pub mod rdma_topo;
 
 pub use engine::{
-    HandshakeMetadata, RcEndpoint, RegisteredMemoryRegion, TransferEngine, TransferOp,
+    HandshakeMetadata, NicHandshake, RcEndpoint, RegisteredMemoryRegion, TransferEngine, TransferOp,
 };
 pub use error::{Result, TransferError};
 
