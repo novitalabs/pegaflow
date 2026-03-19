@@ -31,6 +31,7 @@ kube.workspace = true
 k8s-openapi.workspace = true
 tonic.workspace = true
 dashmap.workspace = true
+smallvec = "1"
 pegaflow-proto = { path = "../pegaflow-proto" }
 
 [dev-dependencies]

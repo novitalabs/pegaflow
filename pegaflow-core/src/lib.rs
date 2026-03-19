@@ -33,7 +33,7 @@ pub use backing::{
     DEFAULT_SSD_WRITE_QUEUE_DEPTH, SsdCacheConfig,
 };
 pub use block::{
-    BlockHash, BlockKey, BlockStatus, LayerBlock, LayerSave, PrefetchStatus, SealedBlock,
+    BlockHash, BlockKey, BlockStatus, LayerBlock, LayerSave, PrefetchStatus, RawBlock, SealedBlock,
 };
 pub use instance::{GpuContext, InstanceContext, KVCacheRegistration};
 pub use internode::{
@@ -551,11 +551,8 @@ impl PegaEngine {
                 .zip(block_cache.iter())
                 .filter_map(|(block_id, block_entry)| {
                     let block_idx = usize::try_from(*block_id).ok()?;
-                    let layer_block = block_entry.get_slot(slot_id)?.clone();
-                    Some(LoadBlock {
-                        block_idx,
-                        layer_block,
-                    })
+                    let block = block_entry.get_slot(slot_id)?.clone();
+                    Some(LoadBlock { block_idx, block })
                 })
                 .collect();
 

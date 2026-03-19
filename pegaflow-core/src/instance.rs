@@ -62,7 +62,7 @@ pub struct KVCacheRegistration {
     pub padded_bytes_per_block: usize,
 
     /// CPU/SSD-side total block size (`padded_bytes_per_block * segments`).
-    /// Becomes `LayerBlock.size` → `SlotMeta.size` for SSD I/O.
+    /// Becomes `RawBlock.total_size` → `SlotMeta.total_size()` for SSD I/O.
     pub padded_block_size_bytes: usize,
 }
 

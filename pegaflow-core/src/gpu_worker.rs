@@ -5,7 +5,7 @@ use log::{debug, error, info, warn};
 use logforth::diagnostic::ThreadLocalDiagnostic;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::block::LayerBlock;
+use crate::block::{LayerBlock, RawBlock};
 use crate::metrics::core_metrics;
 use crate::sync_state::LoadState;
 use crate::{EngineError, KVCacheRegistration, transfer};
@@ -26,7 +26,7 @@ pub struct LayerLoadData {
 
 pub struct LoadBlock {
     pub block_idx: usize,
-    pub layer_block: Arc<LayerBlock>,
+    pub block: Arc<RawBlock>,
 }
 
 /// A task to save KV blocks from GPU to CPU for multiple layers.
@@ -267,16 +267,16 @@ fn process_load_task(task: &LoadTask, stream: &CudaStream) -> Result<(), EngineE
             let mut v_transfers = Vec::with_capacity(layer_data.blocks.len());
 
             for block in &layer_data.blocks {
+                let layer_block = LayerBlock::new(Arc::clone(&block.block));
                 let k_gpu_offset = transfer::segment_offset(registration, block.block_idx, 0)
                     .map_err(EngineError::Storage)?;
                 let v_gpu_offset = transfer::segment_offset(registration, block.block_idx, 1)
                     .map_err(EngineError::Storage)?;
 
-                let k_cpu_ptr = block.layer_block.k_ptr();
+                let k_cpu_ptr = layer_block.k_ptr();
                 // SAFETY: For contiguous layout (v_ptr is None), the allocation is
                 // 2 * segment_size bytes, so k_ptr + segment_size is within bounds.
-                let v_cpu_ptr = block
-                    .layer_block
+                let v_cpu_ptr = layer_block
                     .v_ptr()
                     .unwrap_or_else(|| unsafe { k_cpu_ptr.add(segment_size) });
 
@@ -318,9 +318,10 @@ fn process_load_task(task: &LoadTask, stream: &CudaStream) -> Result<(), EngineE
             let mut transfers = Vec::with_capacity(layer_data.blocks.len());
 
             for block in &layer_data.blocks {
+                let layer_block = LayerBlock::new(Arc::clone(&block.block));
                 let gpu_offset = transfer::segment_offset(registration, block.block_idx, 0)
                     .map_err(EngineError::Storage)?;
-                let cpu_ptr = block.layer_block.k_ptr();
+                let cpu_ptr = layer_block.k_ptr();
                 transfers.push((gpu_offset, cpu_ptr));
             }
 

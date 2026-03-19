@@ -2,7 +2,7 @@
 // Offload: GPU→CPU save path for KV cache blocks.
 //
 // Phases 0-3 (validation, hash filter, pinned allocation, GPU copy) run on the
-// RPC path. Phase 4 (build LayerBlocks, group by hash, insert into inflight)
+// RPC path. Phase 4 (build RawBlocks, group by hash, insert into inflight)
 // is deferred to the storage insert worker via `RawSaveBatch`.
 // ============================================================================
 
@@ -12,10 +12,10 @@ use std::sync::Arc;
 
 use log::{debug, info};
 
-use crate::block::{BlockKey, LayerBlock, LayerSave};
+use crate::block::{BlockKey, LayerSave, RawBlock, Segment};
 
-/// Grouped insert entries: each hash maps to its per-slot `LayerBlock`s.
-pub(crate) type InsertEntries = Vec<(BlockKey, Vec<(usize, Arc<LayerBlock>)>)>;
+/// Grouped insert entries: each hash maps to its per-slot `RawBlock`s.
+pub(crate) type InsertEntries = Vec<(BlockKey, Vec<(usize, Arc<RawBlock>)>)>;
 use crate::gpu_worker::{SaveBlock, SaveLayerData};
 use crate::instance::KVCacheRegistration;
 use crate::metrics::core_metrics;
@@ -47,8 +47,8 @@ pub(crate) enum LayerAlloc {
 }
 
 impl LayerAlloc {
-    /// Construct a `LayerBlock` for the i-th block in this allocation.
-    fn make_layer_block(&self, index: usize, block_size: usize) -> Arc<LayerBlock> {
+    /// Construct a `RawBlock` for the i-th block in this allocation.
+    fn make_raw_block(&self, index: usize, block_size: usize) -> Arc<RawBlock> {
         match self {
             LayerAlloc::Split {
                 k_allocation,
@@ -57,35 +57,41 @@ impl LayerAlloc {
                 v_base,
                 padded_segment_size,
             } => {
+                let half = block_size / 2;
                 let k_ptr = (k_base + index * padded_segment_size) as *mut u8;
                 let v_ptr = (v_base + index * padded_segment_size) as *mut u8;
-                Arc::new(LayerBlock::new_split(
-                    k_ptr,
-                    v_ptr,
-                    block_size,
-                    Arc::clone(k_allocation),
-                    Arc::clone(v_allocation),
-                ))
+                // Safety: pointers are within pinned allocations, validated during allocation.
+                let k_ptr =
+                    std::ptr::NonNull::new(k_ptr).expect("split block K pointer must be non-null");
+                let v_ptr =
+                    std::ptr::NonNull::new(v_ptr).expect("split block V pointer must be non-null");
+                Arc::new(RawBlock::new(vec![
+                    Segment::new(k_ptr, half, Arc::clone(k_allocation)),
+                    Segment::new(v_ptr, half, Arc::clone(v_allocation)),
+                ]))
             }
             LayerAlloc::Contiguous {
                 allocation,
                 base_addr,
             } => {
                 let ptr = (base_addr + index * block_size) as *mut u8;
-                Arc::new(LayerBlock::new_contiguous(
+                // Safety: pointer is within pinned allocation, validated during allocation.
+                let ptr =
+                    std::ptr::NonNull::new(ptr).expect("contiguous block pointer must be non-null");
+                Arc::new(RawBlock::new(vec![Segment::new(
                     ptr,
                     block_size,
                     Arc::clone(allocation),
-                ))
+                )]))
             }
         }
     }
 }
 
-/// Per-layer data for deferred LayerBlock construction.
+/// Per-layer data for deferred RawBlock construction.
 pub(crate) struct RawSaveLayer {
     pub slot_id: usize,
-    /// Padded block size (SSD-aligned). Becomes `LayerBlock.size` → `SlotMeta.size`.
+    /// Padded block size (SSD-aligned). Becomes `RawBlock.total_size` → `SlotMeta.total_size()`.
     pub padded_block_size: usize,
     /// Allocations for this layer. Vec length is 1 (batch) or num_blocks (blockwise).
     pub allocs: Vec<LayerAlloc>,
@@ -104,11 +110,11 @@ pub(crate) struct RawSaveBatch {
 /// Build insert entries from a raw batch (called by the insert worker).
 ///
 /// Returns `(entries, total_bytes, total_blocks)` where entries is grouped
-/// by hash: `Vec<(BlockKey, Vec<(slot_id, Arc<LayerBlock>)>)>`.
+/// by hash: `Vec<(BlockKey, Vec<(slot_id, Arc<RawBlock>)>)>`.
 pub(crate) fn build_insert_entries(batch: &RawSaveBatch) -> (InsertEntries, u64, usize) {
     use std::collections::HashMap;
 
-    let mut hash_entries: HashMap<Vec<u8>, Vec<(usize, Arc<LayerBlock>)>> = HashMap::new();
+    let mut hash_entries: HashMap<Vec<u8>, Vec<(usize, Arc<RawBlock>)>> = HashMap::new();
     let mut total_bytes: u64 = 0;
     let mut total_blocks: usize = 0;
 
@@ -121,7 +127,7 @@ pub(crate) fn build_insert_entries(batch: &RawSaveBatch) -> (InsertEntries, u64,
                 (0, i) // All blocks in one allocation
             };
             let block =
-                layer.allocs[alloc_idx].make_layer_block(offset_in_alloc, layer.padded_block_size);
+                layer.allocs[alloc_idx].make_raw_block(offset_in_alloc, layer.padded_block_size);
             hash_entries
                 .entry(hash.clone())
                 .or_default()
@@ -469,7 +475,7 @@ impl PegaEngine {
         )
         .await?;
 
-        // ── Phase 4 (deferred): Build LayerBlocks + insert — sent to worker ──
+        // ── Phase 4 (deferred): Build RawBlocks + insert — sent to worker ──
 
         // Record metrics on the RPC path (cheap, measures RPC-visible latency)
         let metrics = core_metrics();
