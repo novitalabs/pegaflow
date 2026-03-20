@@ -585,6 +585,56 @@ impl PegaEngine {
     pub async fn gc_stale_inflight(&self, max_age: std::time::Duration) -> usize {
         self.storage.gc_stale_inflight(max_age).await
     }
+
+    // =========================================================================
+    // Cross-node transfer: serving side
+    // =========================================================================
+
+    /// Look up blocks and lock them for RDMA transfer. Returns metadata
+    /// for each found block plus a session ID for later unlock.
+    pub fn query_blocks_for_transfer(
+        &self,
+        namespace: &str,
+        block_hashes: &[Vec<u8>],
+        requester_id: &str,
+    ) -> (String, Vec<(BlockKey, Arc<SealedBlock>)>) {
+        let keys: Vec<BlockKey> = block_hashes
+            .iter()
+            .map(|h| BlockKey::new(namespace.to_string(), h.clone()))
+            .collect();
+
+        let found = self.storage.get_blocks_for_transfer(&keys);
+        let session_id = self.storage.lock_blocks_for_transfer(requester_id, &found);
+
+        debug!(
+            "query_blocks_for_transfer: namespace={namespace} requested={} found={} session={session_id}",
+            block_hashes.len(),
+            found.len(),
+        );
+
+        (session_id, found)
+    }
+
+    /// Release a transfer lock session. Returns the number of blocks released.
+    pub fn release_transfer_lock(&self, session_id: &str) -> usize {
+        self.storage.release_transfer_lock(session_id)
+    }
+
+    /// GC expired transfer lock sessions.
+    pub fn gc_expired_transfer_locks(&self) -> usize {
+        self.storage.gc_expired_transfer_locks()
+    }
+
+    /// Return `(base_ptr, size)` for each contiguous pinned memory region.
+    /// Used for RDMA memory registration.
+    pub fn pinned_memory_regions(&self) -> Vec<(u64, usize)> {
+        self.storage.pinned_memory_regions()
+    }
+
+    #[allow(dead_code)] // used when RDMA transfer engine is wired
+    pub(crate) fn pinned_allocator(&self) -> Arc<pinned_pool::PinnedAllocator> {
+        self.storage.allocator()
+    }
 }
 
 #[cfg(test)]
@@ -602,6 +652,7 @@ mod tests {
             rdma_nic_names: None,
             enable_numa_affinity: false,
             blockwise_alloc: false,
+            transfer_lock_timeout: None,
         };
         let engine = PegaEngine::new_with_config(1 << 20, false, config, None);
 

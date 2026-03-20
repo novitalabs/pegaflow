@@ -105,17 +105,15 @@ Step 2: MetaServer Query
 ────────────────────────
 PegaflowClient → MetaServer.QueryBlockHashes(namespace, missing_hashes)
   │
-  └── Response: {
+  └── Response (single best-match node):
         node_blocks: [
-          { node: "10.0.0.2:50055", block_hashes: [h1, h2, ..., h25] },
-          { node: "10.0.0.3:50055", block_hashes: [h26, h27, ..., h30] }
+          { node: "10.0.0.2:50055", block_hashes: [h1, h2, ..., h25] }
         ]
-      }
 
 
 Step 3: Remote Block Fetch (RDMA)
 ─────────────────────────────────
-For each remote node with matching blocks:
+For the single best-match remote node:
   │
   ├── 3a. gRPC: Query remote node for block metadata
   │         → get RDMA memory region info (rkey, remote_ptr, size)
@@ -136,6 +134,8 @@ For each remote node with matching blocks:
 
 ### 3.3 Lookup Order
 
+SSD cache and remote fetch are mutually exclusive — never both configured at the same time.
+
 ```
 Request arrives with prefix block_hashes[0..N]
   │
@@ -148,9 +148,14 @@ Request arrives with prefix block_hashes[0..N]
               │ missing blocks
               ▼
 ┌─────────────────────────────┐
-│ 2. Remote Node (RDMA)       │  ◄── Fast: ~low ms
-│    MetaServer lookup        │
-│    + RDMA READ from peer    │
+│ 2a. Remote Node (RDMA)      │  ◄── Fast: ~low ms
+│     MetaServer lookup       │      (if --metaserver-addr configured)
+│     + RDMA READ from peer   │
+│                             │
+│ OR                          │
+│                             │
+│ 2b. SSD Cache (io_uring)    │  ◄── Fast: ~sub-ms
+│     (if SSD configured)     │
 └─────────────┬───────────────┘
               │ truly missing
               ▼
@@ -258,12 +263,12 @@ engine.batch_transfer_sync_read(
 
 ### 4.4 Integration with StorageEngine
 
-The cross-node fetch follows the same async prefetch pattern as the existing SSD tier (state machine + `oneshot` completion channel + backpressure), but is implemented as an independent fetch source in `StorageEngine`.
+The cross-node fetch is unified with SSD prefetch in a single `PrefetchScheduler`. Since SSD and remote are mutually exclusive, the scheduler delegates to whichever backing is configured. Both use the same async pattern (state machine + `oneshot` completion channel + backpressure).
 
 ```
-StorageEngine.query_with_remote_fetch()
+StorageEngine.check_prefix_and_prefetch() → PrefetchScheduler
   │
-  ├── Poll existing remote fetch (if any)
+  ├── Poll existing fetch (if any)
   │     StillLoading → return Loading status
   │     Completed → insert blocks into ReadCache, continue
   │
@@ -271,26 +276,20 @@ StorageEngine.query_with_remote_fetch()
         │
         ├── ReadCache.get_prefix_blocks() → hit N blocks
         │
-        ├── remaining blocks:
-        │     └── submit_remote_fetch() → loading K blocks
-        │           ├── MetaServer.QueryBlockHashes()
+        ├── remaining blocks (SSD path — if SSD configured):
+        │     └── ssd.submit_prefix() → loading K blocks
+        │
+        ├── remaining blocks (remote path — if remote configured):
+        │     └── RemoteFetchFn(missing_keys, oneshot_tx)
+        │           ├── MetaServer.QueryBlockHashes() → single best node
         │           ├── Remote.QueryBlocksForTransfer()
         │           ├── RDMA READ (async, via oneshot channel)
         │           └── on completion → batch_insert into ReadCache
         │
-        └── Return RemoteFetchStatus { hit: N, loading: K, missing: rest }
+        └── Return PrefetchStatus { hit: N, loading: K, missing: rest }
 ```
 
-The remote fetch status tracks the async lifecycle:
-
-```rust
-pub enum RemoteFetchStatus {
-    /// All blocks resolved — either hit locally or confirmed missing everywhere.
-    Done { hit: usize, missing: usize },
-    /// Some blocks are being fetched from a remote node via RDMA.
-    Loading { hit: usize, loading: usize },
-}
-```
+The client uses a single `QueryPrefetch` RPC for all cases — the lookup tier (memory vs SSD vs remote) is an internal decision.
 
 ## 5. Configuration
 
@@ -306,8 +305,7 @@ pub enum RemoteFetchStatus {
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--metaserver-addr` | (none) | MetaServer endpoint. Enables cross-node block registration when set. |
-| `--remote-fetch` | `false` | Enable cross-node block fetching on cache miss |
+| `--metaserver-addr` | (none) | MetaServer endpoint. Enables block registration, cross-node fetch, and RDMA transfer. Requires `--advertise-addr` and `--rdma-nic`. |
 | `--transfer-lock-timeout-secs` | `30` | Auto-release lock timeout for remote block transfers |
 | `--max-remote-fetch-blocks` | `200` | Backpressure limit on concurrent remote fetch blocks |
 
@@ -351,13 +349,13 @@ New metrics for cross-node operations:
 
 ### Phase 2: Cross-Node Fetch (RDMA)
 
-- [ ] `QueryBlocksForTransfer` gRPC endpoint on PegaFlow server
-- [ ] Block locking mechanism with timeout-based auto-release
-- [ ] `ReleaseTransferLock` gRPC endpoint
-- [ ] Remote fetch integration in `StorageEngine` (async state machine, inspired by SSD prefetch pattern)
-- [ ] Local pinned memory allocation for incoming remote blocks
-- [ ] RDMA READ via `pegaflow-transfer` batch API
-- [ ] Insert fetched blocks into `ReadCache`
+- [x] `QueryBlocksForTransfer` gRPC endpoint on PegaFlow server
+- [x] Block locking mechanism with timeout-based auto-release
+- [x] `ReleaseTransferLock` gRPC endpoint
+- [x] Remote fetch integration in `StorageEngine` (async state machine, inspired by SSD prefetch pattern)
+- [x] Local pinned memory allocation for incoming remote blocks
+- [x] RDMA READ via `pegaflow-transfer` batch API
+- [x] Insert fetched blocks into `ReadCache`
 
 ### Phase 3: Production Hardening
 

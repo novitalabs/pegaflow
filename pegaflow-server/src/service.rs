@@ -3,9 +3,11 @@ use pegaflow_core::{trace_in_span, trace_root};
 use crate::metric::record_rpc_result;
 use crate::proto::engine::engine_server::Engine;
 use crate::proto::engine::{
-    HealthRequest, HealthResponse, LoadRequest, LoadResponse, PrefetchState, QueryRequest,
-    QueryResponse, RegisterContextRequest, RegisterContextResponse, ResponseStatus, SaveRequest,
-    SaveResponse, ShutdownRequest, ShutdownResponse, UnpinRequest, UnpinResponse,
+    HealthRequest, HealthResponse, LoadRequest, LoadResponse, PrefetchState,
+    QueryBlocksForTransferRequest, QueryBlocksForTransferResponse, QueryRequest, QueryResponse,
+    RegisterContextRequest, RegisterContextResponse, ReleaseTransferLockRequest,
+    ReleaseTransferLockResponse, ResponseStatus, SaveRequest, SaveResponse, ShutdownRequest,
+    ShutdownResponse, TransferBlockInfo, TransferSlotInfo, UnpinRequest, UnpinResponse,
     UnregisterRequest, UnregisterResponse,
 };
 use crate::registry::CudaTensorRegistry;
@@ -23,6 +25,7 @@ pub struct GrpcEngineService {
     engine: Arc<PegaEngine>,
     registry: Arc<Mutex<CudaTensorRegistry>>,
     shutdown: Arc<Notify>,
+    rdma_session_id: Option<Vec<u8>>,
 }
 
 impl GrpcEngineService {
@@ -30,11 +33,13 @@ impl GrpcEngineService {
         engine: Arc<PegaEngine>,
         registry: Arc<Mutex<CudaTensorRegistry>>,
         shutdown: Arc<Notify>,
+        rdma_session_id: Option<Vec<u8>>,
     ) -> Self {
         Self {
             engine,
             registry,
             shutdown,
+            rdma_session_id,
         }
     }
 
@@ -87,6 +92,38 @@ impl GrpcEngineService {
 
     fn build_simple_response() -> ResponseStatus {
         Self::ok_status()
+    }
+
+    fn validate_load_request(block_ids: &[i32], block_hashes: &[Vec<u8>]) -> Result<(), Status> {
+        if block_ids.len() != block_hashes.len() {
+            return Err(Status::invalid_argument(format!(
+                "block_ids and block_hashes must have the same length (got {} and {})",
+                block_ids.len(),
+                block_hashes.len()
+            )));
+        }
+        Ok(())
+    }
+
+    fn build_transfer_slot_info(
+        raw_block: &Arc<pegaflow_core::RawBlock>,
+    ) -> Result<TransferSlotInfo, Status> {
+        let layer_block = pegaflow_core::LayerBlock::new(Arc::clone(raw_block));
+        if let Some(v_ptr) = layer_block.v_ptr() {
+            Ok(TransferSlotInfo {
+                k_ptr: layer_block.k_ptr() as u64,
+                k_size: layer_block.k_size() as u64,
+                v_ptr: v_ptr as u64,
+                v_size: layer_block.v_size().unwrap_or(0) as u64,
+            })
+        } else {
+            Ok(TransferSlotInfo {
+                k_ptr: layer_block.k_ptr() as u64,
+                k_size: layer_block.k_size() as u64,
+                v_ptr: 0,
+                v_size: 0,
+            })
+        }
     }
 }
 
@@ -323,6 +360,7 @@ impl Engine for GrpcEngineService {
                 hash_count,
                 load_state_shm.len()
             );
+            Self::validate_load_request(&block_ids, &block_hashes)?;
             let layer_refs: Vec<&str> = layer_names.iter().map(|s| s.as_str()).collect();
 
             self.engine
@@ -582,6 +620,110 @@ impl Engine for GrpcEngineService {
         result
     }
 
+    async fn query_blocks_for_transfer(
+        &self,
+        request: Request<QueryBlocksForTransferRequest>,
+    ) -> Result<Response<QueryBlocksForTransferResponse>, Status> {
+        let start = Instant::now();
+        let req = request.into_inner();
+        let hash_count = req.block_hashes.len();
+
+        debug!(
+            "RPC [query_blocks_for_transfer]: namespace={} hashes={} requester={}",
+            req.namespace, hash_count, req.requester_id
+        );
+
+        const MAX_TRANSFER_BLOCK_HASHES: usize = 1024;
+        if hash_count > MAX_TRANSFER_BLOCK_HASHES {
+            return Err(Status::invalid_argument(format!(
+                "block_hashes count {hash_count} exceeds maximum {MAX_TRANSFER_BLOCK_HASHES}"
+            )));
+        }
+
+        let rdma_session_id = self
+            .rdma_session_id
+            .clone()
+            .ok_or_else(|| Status::failed_precondition("RDMA transfer engine is not configured"))?;
+
+        let result: Result<Response<QueryBlocksForTransferResponse>, Status> = async {
+            let (session_id, found_blocks) = self.engine.query_blocks_for_transfer(
+                &req.namespace,
+                &req.block_hashes,
+                &req.requester_id,
+            );
+
+            let blocks: Vec<TransferBlockInfo> = found_blocks
+                .iter()
+                .map(|(key, block)| -> Result<TransferBlockInfo, Status> {
+                    let slots: Vec<TransferSlotInfo> = block
+                        .slots()
+                        .iter()
+                        .map(Self::build_transfer_slot_info)
+                        .collect::<Result<_, _>>()?;
+                    Ok(TransferBlockInfo {
+                        block_hash: key.hash.clone(),
+                        slots,
+                        rkey: 0, // TODO: set from RDMA engine when wired
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+
+            Ok(Response::new(QueryBlocksForTransferResponse {
+                status: Some(Self::build_simple_response()),
+                blocks,
+                transfer_session_id: session_id,
+                rdma_session_id,
+            }))
+        }
+        .await;
+
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        match &result {
+            Ok(response) => debug!(
+                "RPC [query_blocks_for_transfer] completed: ok found={} session={} elapsed_ms={:.2}",
+                response.get_ref().blocks.len(),
+                response.get_ref().transfer_session_id,
+                elapsed_ms
+            ),
+            Err(status) => warn!(
+                "RPC [query_blocks_for_transfer] failed: code={} message={} elapsed_ms={:.2}",
+                status.code(),
+                status.message(),
+                elapsed_ms
+            ),
+        }
+        record_rpc_result("query_blocks_for_transfer", &result, start);
+        result
+    }
+
+    async fn release_transfer_lock(
+        &self,
+        request: Request<ReleaseTransferLockRequest>,
+    ) -> Result<Response<ReleaseTransferLockResponse>, Status> {
+        let start = Instant::now();
+        let req = request.into_inner();
+
+        debug!(
+            "RPC [release_transfer_lock]: session={}",
+            req.transfer_session_id
+        );
+
+        let released = self.engine.release_transfer_lock(&req.transfer_session_id);
+
+        let result = Ok(Response::new(ReleaseTransferLockResponse {
+            status: Some(Self::build_simple_response()),
+            released_blocks: released as u64,
+        }));
+
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        debug!(
+            "RPC [release_transfer_lock] completed: ok released={} elapsed_ms={:.2}",
+            released, elapsed_ms
+        );
+        record_rpc_result("release_transfer_lock", &result, start);
+        result
+    }
+
     async fn shutdown(
         &self,
         _request: Request<ShutdownRequest>,
@@ -641,5 +783,20 @@ impl Engine for GrpcEngineService {
         }
         record_rpc_result("health", &result, start);
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tonic::Code;
+
+    #[tokio::test]
+    async fn load_rejects_mismatched_block_ids_and_hashes() {
+        let status = GrpcEngineService::validate_load_request(&[1, 2], &[vec![1]])
+            .expect_err("mismatched load request should fail");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(status.message().contains("block_ids"));
+        assert!(status.message().contains("block_hashes"));
     }
 }

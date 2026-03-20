@@ -54,6 +54,10 @@ pub(crate) struct CoreMetrics {
     pub metaserver_registration_blocks: Counter<u64>,
     pub metaserver_registration_failures: Counter<u64>,
     pub metaserver_registration_queue_full: Counter<u64>,
+
+    // Cross-node transfer lock (serving side)
+    pub transfer_lock_active: UpDownCounter<i64>,
+    pub transfer_lock_timeouts_total: Counter<u64>,
 }
 
 fn init_meter() -> Meter {
@@ -260,6 +264,16 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
             metaserver_registration_queue_full: meter
                 .u64_counter("pegaflow_metaserver_registration_queue_full")
                 .with_description("Block hashes dropped due to full registration queue")
+                .build(),
+
+            // Transfer lock
+            transfer_lock_active: meter
+                .i64_up_down_counter("pegaflow_transfer_lock_active")
+                .with_description("Currently locked blocks for cross-node RDMA transfer")
+                .build(),
+            transfer_lock_timeouts_total: meter
+                .u64_counter("pegaflow_transfer_lock_timeouts_total")
+                .with_description("Transfer lock sessions expired by timeout (potential issue)")
                 .build(),
         }
     })
