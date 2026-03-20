@@ -501,7 +501,12 @@ impl PegaEngine {
             .collect();
 
         let found = self.storage.get_blocks_for_transfer(&keys);
-        let session_id = self.storage.lock_blocks_for_transfer(requester_id, &found);
+        // Skip lock creation when no blocks found (avoids empty sessions accumulating)
+        let session_id = if found.is_empty() {
+            String::new()
+        } else {
+            self.storage.lock_blocks_for_transfer(requester_id, &found)
+        };
 
         debug!(
             "query_blocks_for_transfer: namespace={namespace} requested={} found={} session={session_id}",

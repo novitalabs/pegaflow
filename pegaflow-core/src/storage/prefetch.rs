@@ -203,28 +203,28 @@ impl PrefetchScheduler {
             None
         };
 
-        // SSD prefetch path
-        if let Some(check_keys) = &check_keys
-            && let Some(ssd) = &self.ssd_store
-        {
-            let (found, rx) = ssd.submit_prefix(check_keys.clone());
-            if found > 0 {
-                self.state.lock().inflight_count += found;
-                loading = found;
+        // SSD prefetch and remote fetch are mutually exclusive.
+        // Consume owned check_keys to avoid unnecessary clones.
+        if let Some(check_keys) = check_keys {
+            if let Some(ssd) = &self.ssd_store {
+                let (found, rx) = ssd.submit_prefix(check_keys);
+                if found > 0 {
+                    self.state.lock().inflight_count += found;
+                    loading = found;
+                    blocks_rx = Some(rx);
+                }
+            } else if let Some(ref fetch_fn) = self.remote_fetch_fn {
+                let (tx, rx) = oneshot::channel();
+                // `loading` is an optimistic upper bound: the remote fetch may only
+                // find a subset of these blocks. The actual count is resolved when
+                // the fetch completes and the caller polls again.
+                loading = check_keys.len();
+                (fetch_fn)(check_keys, tx);
                 blocks_rx = Some(rx);
+                self.state.lock().inflight_count += loading;
+                core_metrics().remote_fetch_requests_total.add(1, &[]);
+                is_remote_entry = true;
             }
-        }
-        // Remote fetch path (mutually exclusive with SSD)
-        else if let Some(check_keys) = &check_keys
-            && let Some(ref fetch_fn) = self.remote_fetch_fn
-        {
-            let (tx, rx) = oneshot::channel();
-            (fetch_fn)(check_keys.clone(), tx);
-            loading = check_keys.len();
-            blocks_rx = Some(rx);
-            self.state.lock().inflight_count += loading;
-            core_metrics().remote_fetch_requests_total.add(1, &[]);
-            is_remote_entry = true;
         }
 
         let missing = keys.len() - hit - loading;
@@ -232,6 +232,17 @@ impl PrefetchScheduler {
         if loading > 0 {
             if let Some(rx) = blocks_rx {
                 let mut state = self.state.lock();
+                // Guard: if the same req_id already has an active entry, remove it
+                // first to keep inflight_count consistent. This should not happen in
+                // normal operation (callers should poll before re-scanning), but
+                // protects the invariant if it does.
+                if state.active.contains_key(req_id) {
+                    warn!(
+                        "Prefetch: overwriting active entry for req_id={} (possible duplicate dispatch)",
+                        req_id
+                    );
+                    state.remove_entry(req_id);
+                }
                 state.active.insert(
                     req_id.to_string(),
                     PrefetchEntry {

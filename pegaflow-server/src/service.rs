@@ -640,17 +640,23 @@ impl Engine for GrpcEngineService {
             )));
         }
 
+        if req.namespace.is_empty() {
+            return Err(Status::invalid_argument("namespace must not be empty"));
+        }
+
+        let rdma_session_id = self
+            .rdma_session_id
+            .clone()
+            .ok_or_else(|| Status::failed_precondition("RDMA transfer engine is not configured"))?;
+
         let result: Result<Response<QueryBlocksForTransferResponse>, Status> = async {
-            let rdma_session_id = self.rdma_session_id.clone().ok_or_else(|| {
-                Status::failed_precondition("RDMA transfer engine is not configured")
-            })?;
             let (session_id, found_blocks) = self.engine.query_blocks_for_transfer(
                 &req.namespace,
                 &req.block_hashes,
                 &req.requester_id,
             );
 
-            let blocks: Vec<TransferBlockInfo> = found_blocks
+            let blocks: Result<Vec<TransferBlockInfo>, Status> = found_blocks
                 .iter()
                 .map(|(key, block)| -> Result<TransferBlockInfo, Status> {
                     let slots: Vec<TransferSlotInfo> = block
@@ -661,10 +667,19 @@ impl Engine for GrpcEngineService {
                     Ok(TransferBlockInfo {
                         block_hash: key.hash.clone(),
                         slots,
-                        rkey: 0, // TODO: set from RDMA engine when wired
+                        rkey: 0, // Not used: Mooncake transfer engine manages rkey internally via sessions
                     })
                 })
-                .collect::<Result<_, _>>()?;
+                .collect();
+
+            // Release transfer lock on serialization error to prevent leak
+            let blocks = match blocks {
+                Ok(b) => b,
+                Err(e) => {
+                    self.engine.release_transfer_lock(&session_id);
+                    return Err(e);
+                }
+            };
 
             Ok(Response::new(QueryBlocksForTransferResponse {
                 status: Some(Self::build_simple_response()),

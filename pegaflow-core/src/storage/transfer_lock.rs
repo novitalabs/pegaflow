@@ -19,9 +19,13 @@ struct TransferSession {
     requester_id: String,
 }
 
+/// Default max concurrent transfer sessions (DoS protection).
+const DEFAULT_MAX_SESSIONS: usize = 512;
+
 pub(crate) struct TransferLockManager {
     inner: Mutex<HashMap<String, TransferSession>>,
     lock_timeout: Duration,
+    max_sessions: usize,
 }
 
 impl TransferLockManager {
@@ -29,10 +33,12 @@ impl TransferLockManager {
         Self {
             inner: Mutex::new(HashMap::new()),
             lock_timeout,
+            max_sessions: DEFAULT_MAX_SESSIONS,
         }
     }
 
-    /// Lock blocks for a transfer session. Returns the session ID.
+    /// Lock blocks for a transfer session. Returns the session ID,
+    /// or an empty string if the session limit is reached.
     ///
     /// The caller must later call `release()` to free the locks. If the caller
     /// crashes, `gc_expired()` will auto-release after `lock_timeout`.
@@ -45,6 +51,13 @@ impl TransferLockManager {
         let block_count = blocks.len();
 
         let mut inner = self.inner.lock();
+        if inner.len() >= self.max_sessions {
+            warn!(
+                "Transfer lock rejected: session limit {} reached (requester={})",
+                self.max_sessions, requester_id
+            );
+            return String::new();
+        }
         inner.insert(
             session_id.clone(),
             TransferSession {
@@ -96,18 +109,10 @@ impl TransferLockManager {
         let now = Instant::now();
         let timeout = self.lock_timeout;
 
-        let expired: Vec<String> = inner
-            .iter()
-            .filter(|(_, session)| now.duration_since(session.created_at) > timeout)
-            .map(|(id, _)| id.clone())
-            .collect();
-
-        let mut expired_count = 0;
+        let mut expired_count = 0usize;
         let mut expired_blocks = 0usize;
-        for id in &expired {
-            if let Some(session) = inner.remove(id) {
-                expired_blocks += session.blocks.len();
-                expired_count += 1;
+        inner.retain(|id, session| {
+            if now.duration_since(session.created_at) > timeout {
                 warn!(
                     "Transfer lock expired: session={} requester={} blocks={} age={:?}",
                     id,
@@ -115,8 +120,13 @@ impl TransferLockManager {
                     session.blocks.len(),
                     now.duration_since(session.created_at),
                 );
+                expired_blocks += session.blocks.len();
+                expired_count += 1;
+                false
+            } else {
+                true
             }
-        }
+        });
 
         if expired_count > 0 {
             core_metrics()

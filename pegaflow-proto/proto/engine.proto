@@ -163,7 +163,7 @@ service Engine {
   rpc UnregisterContext(UnregisterRequest) returns (UnregisterResponse);
   // Cross-node transfer: get RDMA metadata for specific blocks (serving side)
   rpc QueryBlocksForTransfer(QueryBlocksForTransferRequest) returns (QueryBlocksForTransferResponse);
-  // Cross-node transfer1: release block locks after RDMA transfer completes
+  // Cross-node transfer: release block locks after RDMA transfer completes
   rpc ReleaseTransferLock(ReleaseTransferLockRequest) returns (ReleaseTransferLockResponse);
   rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
   rpc Health(HealthRequest) returns (HealthResponse);

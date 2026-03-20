@@ -36,16 +36,12 @@ pub type RdmaBatchReadFn = Arc<
         + Sync,
 >;
 
-/// Abstraction for registering local memory with RDMA.
-pub type RdmaRegisterMemoryFn = Arc<dyn Fn(u64, usize) -> Result<(), String> + Send + Sync>;
-
 /// Configuration for the remote fetch worker.
 pub struct RemoteFetchWorkerConfig {
     metaserver_client: Arc<MetaServerQueryClient>,
     client_pool: Arc<PegaflowClientPool>,
     allocator: Arc<PinnedAllocator>,
     rdma_read_fn: RdmaBatchReadFn,
-    rdma_register_fn: RdmaRegisterMemoryFn,
 }
 
 impl RemoteFetchWorkerConfig {
@@ -54,14 +50,12 @@ impl RemoteFetchWorkerConfig {
         client_pool: Arc<PegaflowClientPool>,
         engine: Arc<PegaEngine>,
         rdma_read_fn: RdmaBatchReadFn,
-        rdma_register_fn: RdmaRegisterMemoryFn,
     ) -> Self {
         Self {
             metaserver_client,
             client_pool,
             allocator: engine.pinned_allocator(),
             rdma_read_fn,
-            rdma_register_fn,
         }
     }
 }
@@ -186,25 +180,35 @@ async fn execute_remote_fetch_inner(
             continue;
         }
 
-        for block_info in &transfer_resp.blocks {
-            let config = Arc::clone(&config);
-            let block_info = block_info.clone();
-            let rdma_session_id = transfer_resp.rdma_session_id.clone();
-            let ns = namespace.to_string();
-            match tokio::task::spawn_blocking(move || {
-                fetch_single_block(&config, &block_info, &rdma_session_id, &ns)
-            })
-            .await
-            {
-                Ok(Ok(result)) => fetched_blocks.push(result),
-                Ok(Err(e)) => {
-                    warn!("Failed to fetch block via RDMA: {e}");
-                    core_metrics().remote_fetch_blocks_missed.add(1, &[]);
-                }
-                Err(e) => {
-                    warn!("RDMA fetch task panicked: {e}");
-                    core_metrics().remote_fetch_blocks_missed.add(1, &[]);
-                }
+        // Batch all blocks from this node into a single spawn_blocking call
+        // to avoid per-block thread-pool round-trips and redundant clones.
+        let blocks_for_node = transfer_resp.blocks.clone();
+        let rdma_session_id = transfer_resp.rdma_session_id.clone();
+        let ns = namespace.to_string();
+        let config_clone = Arc::clone(&config);
+        match tokio::task::spawn_blocking(move || {
+            blocks_for_node
+                .iter()
+                .filter_map(|block_info| {
+                    match fetch_single_block(&config_clone, block_info, &rdma_session_id, &ns) {
+                        Ok(result) => Some(result),
+                        Err(e) => {
+                            warn!("Failed to fetch block via RDMA: {e}");
+                            core_metrics().remote_fetch_blocks_missed.add(1, &[]);
+                            None
+                        }
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        {
+            Ok(results) => fetched_blocks.extend(results),
+            Err(e) => {
+                warn!("RDMA fetch task panicked: {e}");
+                core_metrics()
+                    .remote_fetch_blocks_missed
+                    .add(transfer_resp.blocks.len() as u64, &[]);
             }
         }
 
@@ -217,6 +221,39 @@ async fn execute_remote_fetch_inner(
     }
 
     Ok(fetched_blocks)
+}
+
+/// Max size for a single K or V segment received from a remote node (256 MiB).
+/// Rejects absurdly large values that could exhaust the pinned memory pool.
+const MAX_SEGMENT_SIZE: u64 = 256 * 1024 * 1024;
+
+fn validate_slot_info(
+    slot_info: &pegaflow_proto::proto::engine::TransferSlotInfo,
+) -> Result<(), String> {
+    if slot_info.k_ptr == 0 {
+        return Err("remote k_ptr is null".into());
+    }
+    if slot_info.k_size == 0 {
+        return Err("zero k_size".into());
+    }
+    if slot_info.k_size > MAX_SEGMENT_SIZE {
+        return Err(format!(
+            "k_size {} exceeds max {}",
+            slot_info.k_size, MAX_SEGMENT_SIZE
+        ));
+    }
+    if slot_info.v_ptr != 0 {
+        if slot_info.v_size == 0 {
+            return Err("zero v_size with non-zero v_ptr".into());
+        }
+        if slot_info.v_size > MAX_SEGMENT_SIZE {
+            return Err(format!(
+                "v_size {} exceeds max {}",
+                slot_info.v_size, MAX_SEGMENT_SIZE
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn fetch_single_block(
@@ -235,6 +272,9 @@ fn fetch_single_block(
 
     // Allocate local pinned memory and prepare RDMA scatter list
     for slot_info in &block_info.slots {
+        // Validate remote-supplied slot metadata
+        validate_slot_info(slot_info)?;
+
         // Allocate for K segment
         let k_size = NonZeroU64::new(slot_info.k_size).ok_or("zero k_size")?;
         let k_alloc = config
@@ -243,9 +283,8 @@ fn fetch_single_block(
             .ok_or("pinned memory exhausted for K segment")?;
         let k_local_ptr = k_alloc.as_ptr() as u64;
 
-        // Register local memory with RDMA engine
-        (config.rdma_register_fn)(k_local_ptr, slot_info.k_size as usize)
-            .map_err(|e| format!("RDMA register K failed: {e}"))?;
+        // Note: per-block RDMA registration is skipped because the entire pinned
+        // memory pool is registered at startup (see pegaflow-server/src/lib.rs).
 
         local_ptrs.push(k_local_ptr);
         remote_ptrs.push(slot_info.k_ptr);
@@ -259,9 +298,6 @@ fn fetch_single_block(
                 .allocate(v_size, NumaNode::UNKNOWN)
                 .ok_or("pinned memory exhausted for V segment")?;
             let v_local_ptr = v_alloc.as_ptr() as u64;
-
-            (config.rdma_register_fn)(v_local_ptr, slot_info.v_size as usize)
-                .map_err(|e| format!("RDMA register V failed: {e}"))?;
 
             local_ptrs.push(v_local_ptr);
             remote_ptrs.push(slot_info.v_ptr);
@@ -309,11 +345,7 @@ fn fetch_single_block(
 
 #[cfg(test)]
 impl RemoteFetchWorkerConfig {
-    fn new_for_test(
-        allocator: Arc<PinnedAllocator>,
-        rdma_read_fn: RdmaBatchReadFn,
-        rdma_register_fn: RdmaRegisterMemoryFn,
-    ) -> Arc<Self> {
+    fn new_for_test(allocator: Arc<PinnedAllocator>, rdma_read_fn: RdmaBatchReadFn) -> Arc<Self> {
         use tonic::transport::Endpoint;
         let channel = Endpoint::from_static("http://[::]:1").connect_lazy();
         Arc::new(Self {
@@ -321,7 +353,6 @@ impl RemoteFetchWorkerConfig {
             client_pool: Arc::new(PegaflowClientPool::new_for_test()),
             allocator,
             rdma_read_fn,
-            rdma_register_fn,
         })
     }
 }
@@ -337,10 +368,6 @@ mod tests {
     // ---- Mock helpers ----
 
     type RdmaCallLog = Arc<Mutex<Vec<(Vec<u64>, Vec<u64>, Vec<usize>)>>>;
-
-    fn noop_rdma_register_fn() -> RdmaRegisterMemoryFn {
-        Arc::new(|_ptr, _size| Ok(()))
-    }
 
     fn recording_rdma_read_fn() -> (RdmaBatchReadFn, RdmaCallLog) {
         let calls: RdmaCallLog = Arc::new(Mutex::new(Vec::new()));
@@ -361,11 +388,6 @@ mod tests {
         Arc::new(move |_, _, _, _| Err(msg.clone()))
     }
 
-    fn failing_rdma_register_fn(msg: &str) -> RdmaRegisterMemoryFn {
-        let msg = msg.to_string();
-        Arc::new(move |_, _| Err(msg.clone()))
-    }
-
     fn has_cuda() -> bool {
         cudarc::driver::CudaContext::new(0).is_ok()
     }
@@ -383,8 +405,7 @@ mod tests {
         }
         let allocator = make_allocator(1 << 20);
         let (rdma_read_fn, calls) = recording_rdma_read_fn();
-        let config =
-            RemoteFetchWorkerConfig::new_for_test(allocator, rdma_read_fn, noop_rdma_register_fn());
+        let config = RemoteFetchWorkerConfig::new_for_test(allocator, rdma_read_fn);
 
         let block_info = TransferBlockInfo {
             block_hash: vec![1, 2, 3],
@@ -417,8 +438,7 @@ mod tests {
         }
         let allocator = make_allocator(1 << 20);
         let (rdma_read_fn, calls) = recording_rdma_read_fn();
-        let config =
-            RemoteFetchWorkerConfig::new_for_test(allocator, rdma_read_fn, noop_rdma_register_fn());
+        let config = RemoteFetchWorkerConfig::new_for_test(allocator, rdma_read_fn);
 
         let block_info = TransferBlockInfo {
             block_hash: vec![4, 5, 6],
@@ -452,8 +472,7 @@ mod tests {
         }
         let allocator = make_allocator(1 << 20);
         let (rdma_read_fn, _) = recording_rdma_read_fn();
-        let config =
-            RemoteFetchWorkerConfig::new_for_test(allocator, rdma_read_fn, noop_rdma_register_fn());
+        let config = RemoteFetchWorkerConfig::new_for_test(allocator, rdma_read_fn);
 
         let block_info = TransferBlockInfo {
             block_hash: vec![7],
@@ -492,8 +511,7 @@ mod tests {
         }
         let allocator = make_allocator(1 << 20);
         let (rdma_read_fn, _) = recording_rdma_read_fn();
-        let config =
-            RemoteFetchWorkerConfig::new_for_test(allocator, rdma_read_fn, noop_rdma_register_fn());
+        let config = RemoteFetchWorkerConfig::new_for_test(allocator, rdma_read_fn);
 
         let block_info = TransferBlockInfo {
             block_hash: vec![8],
@@ -512,34 +530,60 @@ mod tests {
         assert!(err.contains("zero k_size"));
     }
 
-    #[tokio::test]
-    async fn fetch_single_block_rdma_register_failure() {
-        if !has_cuda() {
-            return;
-        }
-        let allocator = make_allocator(1 << 20);
-        let (rdma_read_fn, _) = recording_rdma_read_fn();
-        let config = RemoteFetchWorkerConfig::new_for_test(
-            allocator,
-            rdma_read_fn,
-            failing_rdma_register_fn("register boom"),
-        );
-
-        let block_info = TransferBlockInfo {
-            block_hash: vec![9],
-            slots: vec![TransferSlotInfo {
-                k_ptr: 0x1000,
-                k_size: 512,
-                v_ptr: 0,
-                v_size: 0,
-            }],
-            rkey: 0,
+    #[test]
+    fn validate_slot_info_rejects_null_k_ptr() {
+        let slot = TransferSlotInfo {
+            k_ptr: 0,
+            k_size: 512,
+            v_ptr: 0,
+            v_size: 0,
         };
+        assert!(
+            validate_slot_info(&slot)
+                .unwrap_err()
+                .contains("k_ptr is null")
+        );
+    }
 
-        let err = fetch_single_block(&config, &block_info, &[0u8; 26], "ns")
-            .err()
-            .expect("expected error");
-        assert!(err.contains("register boom"));
+    #[test]
+    fn validate_slot_info_rejects_oversized_k() {
+        let slot = TransferSlotInfo {
+            k_ptr: 0x1000,
+            k_size: MAX_SEGMENT_SIZE + 1,
+            v_ptr: 0,
+            v_size: 0,
+        };
+        assert!(
+            validate_slot_info(&slot)
+                .unwrap_err()
+                .contains("exceeds max")
+        );
+    }
+
+    #[test]
+    fn validate_slot_info_rejects_oversized_v() {
+        let slot = TransferSlotInfo {
+            k_ptr: 0x1000,
+            k_size: 512,
+            v_ptr: 0x2000,
+            v_size: MAX_SEGMENT_SIZE + 1,
+        };
+        assert!(
+            validate_slot_info(&slot)
+                .unwrap_err()
+                .contains("exceeds max")
+        );
+    }
+
+    #[test]
+    fn validate_slot_info_accepts_valid_slot() {
+        let slot = TransferSlotInfo {
+            k_ptr: 0x1000,
+            k_size: 512,
+            v_ptr: 0x2000,
+            v_size: 512,
+        };
+        assert!(validate_slot_info(&slot).is_ok());
     }
 
     #[tokio::test]
@@ -548,11 +592,8 @@ mod tests {
             return;
         }
         let allocator = make_allocator(1 << 20);
-        let config = RemoteFetchWorkerConfig::new_for_test(
-            allocator,
-            failing_rdma_read_fn("network error"),
-            noop_rdma_register_fn(),
-        );
+        let config =
+            RemoteFetchWorkerConfig::new_for_test(allocator, failing_rdma_read_fn("network error"));
 
         let block_info = TransferBlockInfo {
             block_hash: vec![10],
@@ -579,8 +620,7 @@ mod tests {
         // 512-byte allocator can't fit a 1024-byte K segment
         let allocator = make_allocator(512);
         let (rdma_read_fn, _) = recording_rdma_read_fn();
-        let config =
-            RemoteFetchWorkerConfig::new_for_test(allocator, rdma_read_fn, noop_rdma_register_fn());
+        let config = RemoteFetchWorkerConfig::new_for_test(allocator, rdma_read_fn);
 
         let block_info = TransferBlockInfo {
             block_hash: vec![11],
@@ -656,7 +696,6 @@ mod tests {
             client_pool: Arc::new(PegaflowClientPool::new_for_test()),
             allocator,
             rdma_read_fn,
-            rdma_register_fn: noop_rdma_register_fn(),
         });
 
         let missing_keys = vec![BlockKey::new("ns".to_string(), vec![1, 2, 3])];
@@ -755,7 +794,6 @@ mod tests {
             client_pool: Arc::new(PegaflowClientPool::new_for_test()),
             allocator,
             rdma_read_fn,
-            rdma_register_fn: noop_rdma_register_fn(),
         });
 
         let missing_keys = vec![
@@ -779,8 +817,7 @@ mod tests {
         }
         let allocator = make_allocator(1 << 20);
         let (rdma_read_fn, _) = recording_rdma_read_fn();
-        let config =
-            RemoteFetchWorkerConfig::new_for_test(allocator, rdma_read_fn, noop_rdma_register_fn());
+        let config = RemoteFetchWorkerConfig::new_for_test(allocator, rdma_read_fn);
 
         let result = execute_remote_fetch_inner(config, &[]).await;
         assert!(result.unwrap().is_empty());

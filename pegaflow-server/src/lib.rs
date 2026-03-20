@@ -25,7 +25,7 @@ use parking_lot::Mutex;
 use pegaflow_core::internode::PegaflowClientPool;
 use pegaflow_core::internode::metaserver_query::MetaServerQueryClient;
 use pegaflow_core::internode::remote_fetch_worker::{
-    RdmaBatchReadFn, RdmaRegisterMemoryFn, RemoteFetchWorkerConfig, execute_remote_fetch,
+    RdmaBatchReadFn, RemoteFetchWorkerConfig, execute_remote_fetch,
 };
 use pegaflow_core::{PegaEngine, RemoteFetchFn};
 use pegaflow_transfer::{
@@ -513,12 +513,22 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         .iter()
                         .zip(remote_ptrs.iter())
                         .zip(sizes.iter())
-                        .map(|((&local, &remote), &len)| TransferDesc {
-                            local_ptr: std::ptr::NonNull::new(local as *mut u8).unwrap(),
-                            remote_ptr: std::ptr::NonNull::new(remote as *mut u8).unwrap(),
-                            len,
-                        })
-                        .collect();
+                        .map(
+                            |((&local, &remote), &len)| -> Result<TransferDesc, String> {
+                                Ok(TransferDesc {
+                                    local_ptr: std::ptr::NonNull::new(local as *mut u8)
+                                        .ok_or_else(|| {
+                                            "null local_ptr in RDMA descriptor".to_string()
+                                        })?,
+                                    remote_ptr: std::ptr::NonNull::new(remote as *mut u8)
+                                        .ok_or_else(|| {
+                                            "null remote_ptr in RDMA descriptor".to_string()
+                                        })?,
+                                    len,
+                                })
+                            },
+                        )
+                        .collect::<Result<Vec<_>, _>>()?;
                     let rx = rdma_engine
                         .batch_transfer_async(TransferOp::Read, &peer, &descs)
                         .map_err(|e| e.to_string())?;
@@ -527,24 +537,13 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         .map_err(|e| e.to_string())
                 })
             };
-            let rdma_register_fn: RdmaRegisterMemoryFn = {
-                let rdma_engine = Arc::clone(&rdma_engine);
-                Arc::new(move |ptr, size| {
-                    let region = MemoryRegion {
-                        ptr: std::ptr::NonNull::new(ptr as *mut u8).unwrap(),
-                        len: size,
-                    };
-                    rdma_engine
-                        .register_memory(&[region])
-                        .map_err(|e| e.to_string())
-                })
-            };
+            // Note: per-block RDMA memory registration removed — the entire pinned
+            // pool is registered once at startup (see below).
             let remote_fetch_fn: RemoteFetchFn = {
                 let metaserver_client = Arc::clone(&metaserver_client);
                 let client_pool = Arc::clone(&client_pool);
                 let engine_cell = Arc::clone(&engine_cell);
                 let rdma_read_fn = Arc::clone(&rdma_read_fn);
-                let rdma_register_fn = Arc::clone(&rdma_register_fn);
                 let cached_config: Arc<OnceLock<Arc<RemoteFetchWorkerConfig>>> =
                     Arc::new(OnceLock::new());
                 Arc::new(move |keys, done_tx| {
@@ -558,7 +557,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                             Arc::clone(&client_pool),
                             engine,
                             Arc::clone(&rdma_read_fn),
-                            Arc::clone(&rdma_register_fn),
                         ))
                     }));
                     tokio::spawn(execute_remote_fetch(config, keys, done_tx));
