@@ -114,6 +114,15 @@ class PegaPDRouter:
             self._pending_requests[req_id].set()
 ```
 
+## Benchmark Results (H800, Qwen3-8B, 5K input tokens)
+
+| Configuration  | TTFT mean (ms) | TPOT mean (ms) | TPOT p99 (ms) | ITL p99 (ms) |
+| -------------- | -------------- | -------------- | ------------- | ------------ |
+| P/D (1P+1D)    | 573.78         | 15.68          | 15.89         | 21.71        |
+| Baseline (DP2) | 438.24         | 22.67          | 24.32         | 142.70       |
+
+The P/D setup trades higher TTFT for **significantly more stable decode latency** — TPOT p99 drops from 24.32ms to 15.89ms, and ITL p99 improves dramatically from 142.70ms to 21.71ms.
+
 ## TODO
 
 - [ ] Implement `_notify_router()` in connector
