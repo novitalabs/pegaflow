@@ -475,11 +475,6 @@ impl StorageEngine {
             .collect()
     }
 
-    #[allow(dead_code)] // used when RDMA transfer engine is wired
-    pub(crate) fn allocator(&self) -> Arc<PinnedAllocator> {
-        Arc::clone(&self.allocator)
-    }
-
     pub(crate) fn rdma_transport(&self) -> Option<&Arc<RdmaTransport>> {
         self.rdma_transport.as_ref()
     }

@@ -16,7 +16,6 @@ pub mod block;
 mod cache;
 pub mod gpu_worker;
 pub mod instance;
-#[allow(dead_code)]
 pub mod internode;
 pub use pegaflow_common::logging;
 mod metrics;
@@ -617,11 +616,6 @@ impl PegaEngine {
     /// Used for RDMA memory registration.
     pub fn pinned_memory_regions(&self) -> Vec<(u64, usize)> {
         self.storage.pinned_memory_regions()
-    }
-
-    #[allow(dead_code)] // used when RDMA transfer engine is wired
-    pub(crate) fn pinned_allocator(&self) -> Arc<pinned_pool::PinnedAllocator> {
-        self.storage.allocator()
     }
 
     /// Returns true if RDMA transport is available.

@@ -8,10 +8,25 @@ use pegaflow_proto::proto::engine::{
 use tokio::sync::mpsc;
 use tonic::transport::{Channel, Endpoint};
 
-use crate::internode::types::ClientError;
 use crate::metrics::core_metrics;
 
 pub const DEFAULT_METASERVER_QUEUE_DEPTH: usize = 256;
+
+/// Error type for MetaServer client operations.
+#[derive(Debug)]
+pub(crate) enum ClientError {
+    RpcFailed(String),
+    ResponseError(String),
+}
+
+impl std::fmt::Display for ClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClientError::RpcFailed(msg) => write!(f, "RPC failed: {msg}"),
+            ClientError::ResponseError(msg) => write!(f, "response error: {msg}"),
+        }
+    }
+}
 
 const INITIAL_BACKOFF_MS: u64 = 100;
 const MAX_BACKOFF_MS: u64 = 30_000;
