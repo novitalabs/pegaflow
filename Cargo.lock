@@ -2267,6 +2267,7 @@ dependencies = [
  "parking_lot",
  "pegaflow-common",
  "pegaflow-core",
+ "pegaflow-metaserver",
  "pegaflow-proto",
  "prometheus",
  "prost",
