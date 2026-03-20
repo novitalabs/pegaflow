@@ -197,6 +197,15 @@ class SchedulerConnector:
                 f"req {req_id} not initialized in update_state_after_alloc"
             )
 
+            # In MultiConnector mode, update_state_after_alloc only passes
+            # real blocks to the "chosen" connector (the one that returned
+            # matched tokens). Non-chosen connectors receive empty blocks,
+            # which leaves allocated_blocks incomplete for save intents.
+            # Fix: read the full block IDs from scheduler_output directly,
+            # which always contains the complete allocation.
+            if req.block_ids:
+                self._allocated_blocks[req_id] = list(req.block_ids[0])
+
             self._scheduled_tokens[req_id] += num_tokens
 
             if save_intent := self._consume_save_intent(req_id):
