@@ -407,9 +407,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         }
     });
 
-    let advertise_addr = cli.metaserver_addr.as_ref().map(|_| {
-        resolve_advertise_addr(cli.advertise_addr.as_deref(), &cli.addr)
-    });
+    let advertise_addr = cli
+        .metaserver_addr
+        .as_ref()
+        .map(|_| resolve_advertise_addr(cli.advertise_addr.as_deref(), &cli.addr));
 
     let storage_config = pegaflow_core::StorageConfig {
         enable_lfu_admission: cli.enable_lfu_admission,
@@ -461,7 +462,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             Arc::clone(&engine),
             Arc::clone(&registry),
             Arc::clone(&shutdown),
-            None, // rdma_session_id: wired in cross-node fetch PR
         );
 
         // Spawn background GC task for stale inflight blocks

@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
 use log::{debug, error, info, warn};
+use pegaflow_proto::proto::engine::meta_server_client::MetaServerClient as MetaServerGrpcClient;
 use pegaflow_proto::proto::engine::{
     InsertBlockHashesRequest, NodeBlockHashes, QueryBlockHashesRequest,
 };
-use pegaflow_proto::proto::engine::meta_server_client::MetaServerClient as MetaServerGrpcClient;
 use tokio::sync::mpsc;
 use tonic::transport::{Channel, Endpoint};
 
@@ -136,13 +136,13 @@ impl MetaServerClient {
             .map_err(|e| ClientError::RpcFailed(format!("MetaServer query failed: {e}")))?;
 
         let resp = response.into_inner();
-        if let Some(status) = &resp.status {
-            if !status.ok {
-                return Err(ClientError::ResponseError(format!(
-                    "MetaServer query error: {}",
-                    status.message
-                )));
-            }
+        if let Some(status) = &resp.status
+            && !status.ok
+        {
+            return Err(ClientError::ResponseError(format!(
+                "MetaServer query error: {}",
+                status.message
+            )));
         }
 
         debug!(

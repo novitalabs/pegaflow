@@ -25,7 +25,6 @@ pub struct GrpcEngineService {
     engine: Arc<PegaEngine>,
     registry: Arc<Mutex<CudaTensorRegistry>>,
     shutdown: Arc<Notify>,
-    rdma_session_id: Option<Vec<u8>>,
 }
 
 impl GrpcEngineService {
@@ -33,13 +32,11 @@ impl GrpcEngineService {
         engine: Arc<PegaEngine>,
         registry: Arc<Mutex<CudaTensorRegistry>>,
         shutdown: Arc<Notify>,
-        rdma_session_id: Option<Vec<u8>>,
     ) -> Self {
         Self {
             engine,
             registry,
             shutdown,
-            rdma_session_id,
         }
     }
 
@@ -629,8 +626,11 @@ impl Engine for GrpcEngineService {
         let hash_count = req.block_hashes.len();
 
         debug!(
-            "RPC [query_blocks_for_transfer]: namespace={} hashes={} requester={}",
-            req.namespace, hash_count, req.requester_id
+            "RPC [query_blocks_for_transfer]: namespace={} hashes={} requester={} has_rdma_handshake={}",
+            req.namespace,
+            hash_count,
+            req.requester_id,
+            !req.rdma_handshake.is_empty()
         );
 
         const MAX_TRANSFER_BLOCK_HASHES: usize = 1024;
@@ -640,10 +640,11 @@ impl Engine for GrpcEngineService {
             )));
         }
 
-        let rdma_session_id = self
-            .rdma_session_id
-            .clone()
-            .ok_or_else(|| Status::failed_precondition("RDMA transfer engine is not configured"))?;
+        if !self.engine.has_rdma_transport() {
+            return Err(Status::failed_precondition(
+                "RDMA transfer engine is not configured",
+            ));
+        }
 
         let result: Result<Response<QueryBlocksForTransferResponse>, Status> = async {
             let (session_id, found_blocks) = self.engine.query_blocks_for_transfer(
@@ -651,6 +652,15 @@ impl Engine for GrpcEngineService {
                 &req.block_hashes,
                 &req.requester_id,
             );
+
+            // Perform RDMA handshake if client provided its metadata
+            let rdma_session_id = if !req.rdma_handshake.is_empty() {
+                self.engine
+                    .rdma_accept_handshake(&req.rdma_handshake)
+                    .map_err(|e| Status::internal(format!("RDMA handshake failed: {e}")))?
+            } else {
+                Vec::new()
+            };
 
             let blocks: Vec<TransferBlockInfo> = found_blocks
                 .iter()

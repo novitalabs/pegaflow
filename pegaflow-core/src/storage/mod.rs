@@ -11,7 +11,8 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use crate::backing::{
-    AllocateFn, DEFAULT_MAX_PREFETCH_BLOCKS, RdmaTransport, SsdBackingStore, SsdCacheConfig,
+    AllocateFn, DEFAULT_MAX_PREFETCH_BLOCKS, RdmaFetchStore, RdmaTransport, SsdBackingStore,
+    SsdCacheConfig,
 };
 use crate::block::{BlockKey, PrefetchStatus, SealedBlock};
 use crate::internode::MetaServerClient;
@@ -171,7 +172,22 @@ impl StorageEngine {
             let ssd_store = ssd_cache_config
                 .and_then(|cfg| crate::backing::new_ssd(cfg, allocate_fn.clone(), is_numa));
 
-            let prefetch = PrefetchScheduler::new(ssd_store.clone(), max_prefetch_blocks);
+            let rdma_fetch = rdma_transport.as_ref().and_then(|rdma| {
+                let ms = metaserver_client.as_ref()?;
+                let advertise = config
+                    .advertise_addr
+                    .clone()
+                    .unwrap_or_else(|| "127.0.0.1:50055".to_string());
+                Some(Arc::new(RdmaFetchStore::new(
+                    Arc::clone(ms),
+                    Arc::clone(rdma),
+                    allocate_fn.clone(),
+                    advertise,
+                )))
+            });
+
+            let prefetch =
+                PrefetchScheduler::new(ssd_store.clone(), rdma_fetch, max_prefetch_blocks);
 
             let transfer_lock =
                 transfer_lock_timeout.map(|t| Arc::new(transfer_lock::TransferLockManager::new(t)));
@@ -551,8 +567,7 @@ mod tests {
     async fn allocate_bounded_reclaim_terminates() {
         // With a tiny pool, allocation of a huge block should fail fast
         // (not loop forever) thanks to MAX_RECLAIM_ROUNDS.
-        let storage =
-            StorageEngine::new_with_config(4096, false, StorageConfig::default(), &[]);
+        let storage = StorageEngine::new_with_config(4096, false, StorageConfig::default(), &[]);
 
         // Try to allocate more than the entire pool
         let result = storage.allocate(NonZeroU64::new(1 << 30).unwrap(), None);

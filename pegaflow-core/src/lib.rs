@@ -36,9 +36,7 @@ pub use block::{
     BlockHash, BlockKey, BlockStatus, LayerBlock, LayerSave, PrefetchStatus, RawBlock, SealedBlock,
 };
 pub use instance::{GpuContext, InstanceContext, KVCacheRegistration};
-pub use internode::{
-    DEFAULT_METASERVER_QUEUE_DEPTH, MetaServerClient, MetaServerClientConfig,
-};
+pub use internode::{DEFAULT_METASERVER_QUEUE_DEPTH, MetaServerClient, MetaServerClientConfig};
 pub use pegaflow_common::NumaNode;
 use pegaflow_common::NumaTopology;
 pub use pinned_pool::PinnedAllocation;
@@ -177,12 +175,7 @@ impl PegaEngine {
             vec![]
         };
 
-        let storage = StorageEngine::new_with_config(
-            pool_size,
-            use_hugepages,
-            config,
-            &numa_nodes,
-        );
+        let storage = StorageEngine::new_with_config(pool_size, use_hugepages, config, &numa_nodes);
 
         PegaEngine {
             instances: RwLock::new(HashMap::new()),
@@ -631,9 +624,35 @@ impl PegaEngine {
         self.storage.allocator()
     }
 
-    /// Access the RDMA transport (if configured).
-    pub(crate) fn rdma_transport(&self) -> Option<&Arc<backing::RdmaTransport>> {
-        self.storage.rdma_transport()
+    /// Returns true if RDMA transport is available.
+    pub fn has_rdma_transport(&self) -> bool {
+        self.storage.rdma_transport().is_some()
+    }
+
+    /// Perform server-side RDMA handshake: prepare local QPs, accept the
+    /// client's handshake, and return our handshake metadata.
+    ///
+    /// Returns `None` if RDMA is not configured.
+    /// Returns `Err` if the handshake fails (bad client metadata, QP creation, etc.).
+    pub fn rdma_accept_handshake(&self, client_handshake_bytes: &[u8]) -> Result<Vec<u8>, String> {
+        let rdma = self
+            .storage
+            .rdma_transport()
+            .ok_or_else(|| "RDMA transport not configured".to_string())?;
+
+        let client_meta = pegaflow_transfer::HandshakeMetadata::from_bytes(client_handshake_bytes)
+            .map_err(|e| format!("invalid client handshake metadata: {e}"))?;
+
+        let server_meta = rdma
+            .engine()
+            .prepare_handshake()
+            .map_err(|e| format!("prepare_handshake failed: {e}"))?;
+
+        rdma.engine()
+            .accept_handshake(&client_meta)
+            .map_err(|e| format!("accept_handshake failed: {e}"))?;
+
+        Ok(server_meta.to_bytes())
     }
 }
 
