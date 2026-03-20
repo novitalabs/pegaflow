@@ -133,6 +133,7 @@ message QueryBlocksForTransferRequest {
   string namespace = 1;
   repeated bytes block_hashes = 2;
   string requester_id = 3;             // For lock tracking / logging
+  bytes rdma_handshake = 4;            // Initiator's RDMA HandshakeMetadata (bincode-serialized)
 }
 
 message QueryBlocksForTransferResponse {

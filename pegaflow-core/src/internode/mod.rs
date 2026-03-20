@@ -26,16 +26,14 @@
 //!
 
 pub mod client;
-pub(crate) mod registrar;
+pub(crate) mod metaserver_client;
 pub mod registry;
 pub mod service_discovery;
 pub mod types;
 
 // Re-export commonly used types for convenience
 pub use client::{PegaflowClient, PegaflowClientPool};
-pub use registrar::{
-    DEFAULT_METASERVER_QUEUE_DEPTH, MetaServerRegistrar, MetaServerRegistrarConfig,
-};
+pub use metaserver_client::{DEFAULT_METASERVER_QUEUE_DEPTH, MetaServerClient, MetaServerClientConfig};
 pub use registry::InstanceRegistry;
 pub use service_discovery::start_service_discovery;
 pub use types::{

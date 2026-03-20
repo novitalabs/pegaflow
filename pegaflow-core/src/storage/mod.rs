@@ -14,7 +14,8 @@ use crate::backing::{
     AllocateFn, DEFAULT_MAX_PREFETCH_BLOCKS, RdmaTransport, SsdBackingStore, SsdCacheConfig,
 };
 use crate::block::{BlockKey, PrefetchStatus, SealedBlock};
-use crate::internode::MetaServerRegistrar;
+use crate::internode::MetaServerClient;
+use crate::internode::metaserver_client::MetaServerClientConfig;
 use crate::metrics::core_metrics;
 use crate::pinned_pool::{PinnedAllocation, PinnedAllocator};
 use pegaflow_common::NumaNode;
@@ -43,6 +44,12 @@ pub struct StorageConfig {
     pub blockwise_alloc: bool,
     /// Transfer lock timeout for cross-node RDMA transfers (None = disabled).
     pub transfer_lock_timeout: Option<Duration>,
+    /// MetaServer address for p2p block discovery + registration (None = disabled).
+    pub metaserver_addr: Option<String>,
+    /// This node's advertise address for MetaServer registration + transfer lock requester_id.
+    pub advertise_addr: Option<String>,
+    /// MetaServer registration queue depth.
+    pub metaserver_queue_depth: usize,
 }
 
 impl Default for StorageConfig {
@@ -56,6 +63,9 @@ impl Default for StorageConfig {
             enable_numa_affinity: true,
             blockwise_alloc: false,
             transfer_lock_timeout: None,
+            metaserver_addr: None,
+            advertise_addr: None,
+            metaserver_queue_depth: crate::internode::DEFAULT_METASERVER_QUEUE_DEPTH,
         }
     }
 }
@@ -66,10 +76,9 @@ pub(crate) struct StorageEngine {
     prefetch: PrefetchScheduler,
     write_pipeline: Arc<WritePipeline>,
     ssd_store: Option<Arc<SsdBackingStore>>,
-    /// Held for RAII: Drop unregisters RDMA memory regions.
-    _rdma_transport: Option<Arc<RdmaTransport>>,
+    rdma_transport: Option<Arc<RdmaTransport>>,
     blockwise_alloc: bool,
-    metaserver_registrar: Option<Arc<MetaServerRegistrar>>,
+    metaserver_client: Option<Arc<MetaServerClient>>,
     transfer_lock: Option<Arc<transfer_lock::TransferLockManager>>,
 }
 
@@ -79,7 +88,6 @@ impl StorageEngine {
         use_hugepages: bool,
         config: StorageConfig,
         numa_nodes: &[NumaNode],
-        metaserver_registrar: Option<Arc<MetaServerRegistrar>>,
     ) -> Arc<Self> {
         let value_size_hint = config.hint_value_size_bytes.filter(|size| *size > 0);
         let unit_hint = value_size_hint.and_then(|size| NonZeroU64::new(size as u64));
@@ -88,6 +96,21 @@ impl StorageEngine {
         let rdma_nic_names = config.rdma_nic_names;
         let blockwise_alloc = config.blockwise_alloc;
         let transfer_lock_timeout = config.transfer_lock_timeout;
+
+        // Create MetaServer client if configured
+        let metaserver_client = config.metaserver_addr.as_ref().map(|addr| {
+            let advertise = config
+                .advertise_addr
+                .clone()
+                .unwrap_or_else(|| "127.0.0.1:50055".to_string());
+            info!(
+                "MetaServer client enabled: metaserver={}, advertise={}, queue_depth={}",
+                addr, advertise, config.metaserver_queue_depth
+            );
+            let ms_config = MetaServerClientConfig::new(addr.clone(), advertise)
+                .with_queue_depth(config.metaserver_queue_depth);
+            Arc::new(MetaServerClient::new(ms_config))
+        });
 
         if blockwise_alloc {
             info!("Blockwise allocation enabled for batch_save");
@@ -159,9 +182,9 @@ impl StorageEngine {
                 prefetch,
                 write_pipeline: write_pipeline.clone(),
                 ssd_store,
-                _rdma_transport: rdma_transport,
+                rdma_transport,
                 blockwise_alloc,
-                metaserver_registrar,
+                metaserver_client,
                 transfer_lock,
             }
         });
@@ -171,7 +194,7 @@ impl StorageEngine {
             let deps = Arc::new(InsertDeps {
                 read_cache: engine.read_cache.clone(),
                 ssd_store: engine.ssd_store.clone(),
-                metaserver_registrar: engine.metaserver_registrar.clone(),
+                metaserver_client: engine.metaserver_client.clone(),
             });
             let weak_deps = Arc::downgrade(&deps);
             // Keep deps alive by leaking it into the thread. The worker holds
@@ -440,6 +463,10 @@ impl StorageEngine {
     pub(crate) fn allocator(&self) -> Arc<PinnedAllocator> {
         Arc::clone(&self.allocator)
     }
+
+    pub(crate) fn rdma_transport(&self) -> Option<&Arc<RdmaTransport>> {
+        self.rdma_transport.as_ref()
+    }
 }
 
 #[cfg(test)]
@@ -460,7 +487,7 @@ mod tests {
     use super::*;
 
     fn make_engine() -> Arc<StorageEngine> {
-        StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[], None)
+        StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[])
     }
 
     #[tokio::test]
@@ -525,7 +552,7 @@ mod tests {
         // With a tiny pool, allocation of a huge block should fail fast
         // (not loop forever) thanks to MAX_RECLAIM_ROUNDS.
         let storage =
-            StorageEngine::new_with_config(4096, false, StorageConfig::default(), &[], None);
+            StorageEngine::new_with_config(4096, false, StorageConfig::default(), &[]);
 
         // Try to allocate more than the entire pool
         let result = storage.allocate(NonZeroU64::new(1 << 30).unwrap(), None);
@@ -702,7 +729,7 @@ mod tests {
             transfer_lock_timeout: Some(Duration::from_secs(30)),
             ..StorageConfig::default()
         };
-        StorageEngine::new_with_config(1 << 20, false, config, &[], None)
+        StorageEngine::new_with_config(1 << 20, false, config, &[])
     }
 
     #[tokio::test]

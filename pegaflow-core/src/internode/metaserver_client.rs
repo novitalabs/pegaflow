@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 
 use log::{debug, error, info, warn};
-use pegaflow_proto::proto::engine::InsertBlockHashesRequest;
-use pegaflow_proto::proto::engine::meta_server_client::MetaServerClient;
+use pegaflow_proto::proto::engine::{
+    InsertBlockHashesRequest, NodeBlockHashes, QueryBlockHashesRequest,
+};
+use pegaflow_proto::proto::engine::meta_server_client::MetaServerClient as MetaServerGrpcClient;
 use tokio::sync::mpsc;
-use tonic::transport::Channel;
+use tonic::transport::{Channel, Endpoint};
 
+use crate::internode::types::ClientError;
 use crate::metrics::core_metrics;
 
 pub const DEFAULT_METASERVER_QUEUE_DEPTH: usize = 256;
@@ -13,13 +16,13 @@ pub const DEFAULT_METASERVER_QUEUE_DEPTH: usize = 256;
 const INITIAL_BACKOFF_MS: u64 = 100;
 const MAX_BACKOFF_MS: u64 = 30_000;
 
-pub struct MetaServerRegistrarConfig {
-    metaserver_addr: String,
-    advertise_addr: String,
-    queue_depth: usize,
+pub struct MetaServerClientConfig {
+    pub metaserver_addr: String,
+    pub advertise_addr: String,
+    pub queue_depth: usize,
 }
 
-impl MetaServerRegistrarConfig {
+impl MetaServerClientConfig {
     pub fn new(metaserver_addr: String, advertise_addr: String) -> Self {
         Self {
             metaserver_addr,
@@ -35,37 +38,49 @@ impl MetaServerRegistrarConfig {
 }
 
 /// A batch of (namespace, block_hash) pairs to register with MetaServer.
-/// Sent as a single channel message to avoid consuming multiple queue slots.
 struct RegistrationBatch {
     entries: Vec<(String, Vec<u8>)>,
 }
 
-pub struct MetaServerRegistrar {
-    tx: mpsc::Sender<RegistrationBatch>,
+/// Unified MetaServer client handling both insert (fire-and-forget) and query (direct RPC).
+pub struct MetaServerClient {
+    /// Fire-and-forget insert channel (same pattern as old registrar)
+    insert_tx: mpsc::Sender<RegistrationBatch>,
+    /// Lazy-connect query client
+    query_client: MetaServerGrpcClient<Channel>,
 }
 
-impl MetaServerRegistrar {
-    /// Create a new registrar and spawn the background registration loop.
+impl MetaServerClient {
+    /// Create a new client and spawn the background registration loop.
     ///
     /// Must be called from within a tokio runtime context.
-    pub fn new(config: MetaServerRegistrarConfig) -> Self {
-        let (tx, rx) = mpsc::channel(config.queue_depth);
+    pub fn new(config: MetaServerClientConfig) -> Self {
+        let (insert_tx, rx) = mpsc::channel(config.queue_depth);
 
         tokio::spawn(registration_loop(
             rx,
-            config.metaserver_addr,
+            config.metaserver_addr.clone(),
             config.advertise_addr,
         ));
 
+        // Lazy-connect query client: connects on first RPC, not here
+        let channel = Endpoint::from_shared(config.metaserver_addr.clone())
+            .expect("valid metaserver_addr URI")
+            .connect_lazy();
+        let query_client = MetaServerGrpcClient::new(channel);
+
         info!(
-            "MetaServer registrar started (queue_depth={})",
-            config.queue_depth
+            "MetaServer client started (queue_depth={}, addr={})",
+            config.queue_depth, config.metaserver_addr
         );
 
-        Self { tx }
+        Self {
+            insert_tx,
+            query_client,
+        }
     }
 
-    /// Fire-and-forget registration. Mirrors `SsdBackingStore::ingest_batch()`.
+    /// Fire-and-forget registration of block hashes.
     ///
     /// Accepts a flat list of (namespace, block_hash) pairs. The background loop
     /// groups by namespace before issuing gRPC calls.
@@ -75,7 +90,7 @@ impl MetaServerRegistrar {
         }
         let count = entries.len();
         let batch = RegistrationBatch { entries };
-        match self.tx.try_send(batch) {
+        match self.insert_tx.try_send(batch) {
             Ok(()) => {
                 core_metrics()
                     .metaserver_registration_blocks
@@ -101,6 +116,42 @@ impl MetaServerRegistrar {
             }
         }
     }
+
+    /// Query MetaServer for block locations. Returns node-grouped results.
+    pub(crate) async fn query(
+        &self,
+        namespace: &str,
+        hashes: &[Vec<u8>],
+    ) -> Result<Vec<NodeBlockHashes>, ClientError> {
+        let request = QueryBlockHashesRequest {
+            namespace: namespace.to_string(),
+            block_hashes: hashes.to_vec(),
+        };
+
+        let response = self
+            .query_client
+            .clone()
+            .query_block_hashes(request)
+            .await
+            .map_err(|e| ClientError::RpcFailed(format!("MetaServer query failed: {e}")))?;
+
+        let resp = response.into_inner();
+        if let Some(status) = &resp.status {
+            if !status.ok {
+                return Err(ClientError::ResponseError(format!(
+                    "MetaServer query error: {}",
+                    status.message
+                )));
+            }
+        }
+
+        debug!(
+            "MetaServer query: namespace={} queried={} found={}",
+            namespace, resp.total_queried, resp.found_count
+        );
+
+        Ok(resp.node_blocks)
+    }
 }
 
 async fn registration_loop(
@@ -108,7 +159,7 @@ async fn registration_loop(
     metaserver_addr: String,
     advertise_addr: String,
 ) {
-    let mut client: Option<MetaServerClient<Channel>> = None;
+    let mut client: Option<MetaServerGrpcClient<Channel>> = None;
     let mut backoff_ms: u64 = INITIAL_BACKOFF_MS;
 
     while let Some(batch) = rx.recv().await {
@@ -126,7 +177,7 @@ async fn registration_loop(
 
         // Lazy-connect with exponential backoff
         if client.is_none() {
-            match MetaServerClient::connect(metaserver_addr.clone()).await {
+            match MetaServerGrpcClient::connect(metaserver_addr.clone()).await {
                 Ok(c) => {
                     info!("Connected to MetaServer at {}", metaserver_addr);
                     client = Some(c);
@@ -147,7 +198,6 @@ async fn registration_loop(
 
         let c = client.as_mut().expect("client is Some after lazy-connect");
 
-        // Collect into Vec for indexed iteration so we can count remaining on failure
         let namespaces: Vec<(String, Vec<Vec<u8>>)> = grouped.into_iter().collect();
         let mut failed_at = None;
 
@@ -179,7 +229,6 @@ async fn registration_loop(
         }
 
         if let Some(idx) = failed_at {
-            // Count all hashes from the failed namespace onward as failures
             let dropped: usize = namespaces[idx..].iter().map(|(_, h)| h.len()).sum();
             core_metrics()
                 .metaserver_registration_failures

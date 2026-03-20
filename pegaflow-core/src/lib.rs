@@ -37,7 +37,7 @@ pub use block::{
 };
 pub use instance::{GpuContext, InstanceContext, KVCacheRegistration};
 pub use internode::{
-    DEFAULT_METASERVER_QUEUE_DEPTH, MetaServerRegistrar, MetaServerRegistrarConfig,
+    DEFAULT_METASERVER_QUEUE_DEPTH, MetaServerClient, MetaServerClientConfig,
 };
 pub use pegaflow_common::NumaNode;
 use pegaflow_common::NumaTopology;
@@ -150,7 +150,6 @@ impl PegaEngine {
             DEFAULT_PINNED_POOL_BYTES,
             false,
             storage::StorageConfig::default(),
-            None,
         )
     }
 
@@ -159,13 +158,10 @@ impl PegaEngine {
     /// If `storage_config.enable_numa_affinity` is true and the system has multiple
     /// NUMA nodes, per-node pinned memory pools are created for optimal bandwidth.
     ///
-    /// `metaserver_registrar` enables automatic block hash registration with the
-    /// centralized MetaServer when blocks are sealed.
     pub fn new_with_config(
         pool_size: usize,
         use_hugepages: bool,
         storage_config: storage::StorageConfig,
-        metaserver_registrar: Option<Arc<MetaServerRegistrar>>,
     ) -> Self {
         let topology = Arc::new(NumaTopology::detect());
         topology.log_summary();
@@ -186,7 +182,6 @@ impl PegaEngine {
             use_hugepages,
             config,
             &numa_nodes,
-            metaserver_registrar,
         );
 
         PegaEngine {
@@ -635,6 +630,11 @@ impl PegaEngine {
     pub(crate) fn pinned_allocator(&self) -> Arc<pinned_pool::PinnedAllocator> {
         self.storage.allocator()
     }
+
+    /// Access the RDMA transport (if configured).
+    pub(crate) fn rdma_transport(&self) -> Option<&Arc<backing::RdmaTransport>> {
+        self.storage.rdma_transport()
+    }
 }
 
 #[cfg(test)]
@@ -653,8 +653,11 @@ mod tests {
             enable_numa_affinity: false,
             blockwise_alloc: false,
             transfer_lock_timeout: None,
+            metaserver_addr: None,
+            advertise_addr: None,
+            metaserver_queue_depth: 256,
         };
-        let engine = PegaEngine::new_with_config(1 << 20, false, config, None);
+        let engine = PegaEngine::new_with_config(1 << 20, false, config);
 
         // Manually insert an InstanceContext (no GPU required)
         let instance = InstanceContext::new(
