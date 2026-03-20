@@ -67,7 +67,7 @@ pub enum BlockStatus {
     Miss,
 }
 
-/// Result of checking prefix hits with prefetch support
+/// Result of checking prefix hits with SSD prefetch support
 #[derive(Debug, Clone)]
 pub enum PrefetchStatus {
     /// Blocks are being prefetched - caller should retry
@@ -193,6 +193,11 @@ impl LayerBlock {
     pub fn v_size(&self) -> Option<usize> {
         self.raw.segment_size(1)
     }
+
+    /// Total size across all segments (K + V if split).
+    pub fn size(&self) -> usize {
+        self.raw.memory_footprint() as usize
+    }
 }
 
 // ============================================================================
@@ -217,8 +222,8 @@ impl SealedBlock {
         self.footprint
     }
 
-    /// Get all slots (for serialization)
-    pub(crate) fn slots(&self) -> &[Arc<RawBlock>] {
+    /// Get all slots (for serialization / cross-node transfer)
+    pub fn slots(&self) -> &[Arc<RawBlock>] {
         &self.slots
     }
 

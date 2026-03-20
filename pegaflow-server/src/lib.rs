@@ -415,6 +415,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         rdma_nic_names: cli.nics.clone(),
         enable_numa_affinity: !cli.disable_numa_affinity,
         blockwise_alloc: cli.blockwise_alloc,
+        transfer_lock_timeout: None, // configured when RDMA transfer engine is wired
     };
 
     if cli.enable_lfu_admission {
@@ -466,6 +467,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             Arc::clone(&engine),
             Arc::clone(&registry),
             Arc::clone(&shutdown),
+            None, // rdma_session_id: wired in cross-node fetch PR
         );
 
         // Spawn background GC task for stale inflight blocks

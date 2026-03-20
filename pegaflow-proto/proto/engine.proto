@@ -114,16 +114,57 @@ message HealthResponse {
   ResponseStatus status = 1;
 }
 
+// Cross-node transfer: per-slot RDMA metadata
+message TransferSlotInfo {
+  uint64 k_ptr = 1;      // Remote pinned memory address for K segment
+  uint64 k_size = 2;     // Size of the K segment in bytes (per-segment, not total slot size)
+  uint64 v_ptr = 3;      // Remote pinned memory address for V segment (0 if contiguous)
+  uint64 v_size = 4;     // Size of the V segment in bytes (0 if contiguous)
+}
+
+// Cross-node transfer: per-block RDMA metadata
+message TransferBlockInfo {
+  bytes block_hash = 1;
+  repeated TransferSlotInfo slots = 2;  // One per TP slot
+  uint32 rkey = 3;                      // RDMA remote key for this memory region
+}
+
+message QueryBlocksForTransferRequest {
+  string namespace = 1;
+  repeated bytes block_hashes = 2;
+  string requester_id = 3;             // For lock tracking / logging
+}
+
+message QueryBlocksForTransferResponse {
+  ResponseStatus status = 1;
+  repeated TransferBlockInfo blocks = 2;
+  string transfer_session_id = 3;       // Opaque session ID for ReleaseTransferLock
+  bytes rdma_session_id = 4;            // 26-byte DomainAddress for RDMA session establishment
+}
+
+message ReleaseTransferLockRequest {
+  string transfer_session_id = 1;
+}
+
+message ReleaseTransferLockResponse {
+  ResponseStatus status = 1;
+  uint64 released_blocks = 2;
+}
+
 service Engine {
   rpc RegisterContextBatch(RegisterContextRequest) returns (RegisterContextResponse);
   rpc Save(SaveRequest) returns (SaveResponse);
   rpc Load(LoadRequest) returns (LoadResponse);
   // Pure memory-only query: check if prefix blocks are in memory cache (no SSD prefetch)
   rpc Query(QueryRequest) returns (QueryResponse);
-  // Prefetch-aware query: check memory + trigger SSD prefetch for missing blocks
+  // Unified prefetch query: check memory + trigger SSD prefetch or cross-node RDMA fetch for missing blocks
   rpc QueryPrefetch(QueryRequest) returns (QueryResponse);
   rpc Unpin(UnpinRequest) returns (UnpinResponse);
   rpc UnregisterContext(UnregisterRequest) returns (UnregisterResponse);
+  // Cross-node transfer: get RDMA metadata for specific blocks (serving side)
+  rpc QueryBlocksForTransfer(QueryBlocksForTransferRequest) returns (QueryBlocksForTransferResponse);
+  // Cross-node transfer: release block locks after RDMA transfer completes
+  rpc ReleaseTransferLock(ReleaseTransferLockRequest) returns (ReleaseTransferLockResponse);
   rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
   rpc Health(HealthRequest) returns (HealthResponse);
 }
