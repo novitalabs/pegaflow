@@ -272,8 +272,7 @@ mod tests {
 
     #[tokio::test]
     async fn single_slot_seals_immediately() {
-        let engine =
-            StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]);
+        let engine = StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]);
         let deps = make_deps(&engine);
         let weak_deps = Arc::downgrade(&deps);
 
@@ -301,8 +300,7 @@ mod tests {
 
     #[tokio::test]
     async fn multi_slot_partial_then_complete() {
-        let engine =
-            StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]);
+        let engine = StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]);
         let deps = make_deps(&engine);
         let weak_deps = Arc::downgrade(&deps);
 
@@ -353,8 +351,7 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_slot_is_idempotent() {
-        let engine =
-            StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]);
+        let engine = StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]);
         let deps = make_deps(&engine);
         let weak_deps = Arc::downgrade(&deps);
 
@@ -381,8 +378,7 @@ mod tests {
 
     #[tokio::test]
     async fn slot_count_mismatch_skips_key() {
-        let engine =
-            StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]);
+        let engine = StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]);
         let deps = make_deps(&engine);
         let weak_deps = Arc::downgrade(&deps);
 
@@ -433,8 +429,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_backing_batches_no_stores_is_noop() {
-        let engine =
-            StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]);
+        let engine = StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]);
         let deps = make_deps(&engine);
         let weak_deps = Arc::downgrade(&deps);
 

@@ -33,7 +33,9 @@ pub mod types;
 
 // Re-export commonly used types for convenience
 pub use client::{PegaflowClient, PegaflowClientPool};
-pub use metaserver_client::{DEFAULT_METASERVER_QUEUE_DEPTH, MetaServerClient, MetaServerClientConfig};
+pub use metaserver_client::{
+    DEFAULT_METASERVER_QUEUE_DEPTH, MetaServerClient, MetaServerClientConfig,
+};
 pub use registry::InstanceRegistry;
 pub use service_discovery::start_service_discovery;
 pub use types::{
