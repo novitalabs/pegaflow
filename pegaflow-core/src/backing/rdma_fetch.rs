@@ -11,7 +11,7 @@ use pegaflow_proto::proto::engine::engine_client::EngineClient;
 use pegaflow_proto::proto::engine::{
     QueryBlocksForTransferRequest, ReleaseTransferLockRequest, TransferBlockInfo,
 };
-use pegaflow_transfer::{HandshakeMetadata, TransferDesc, TransferOp};
+use pegaflow_transfer::{ConnectionStatus, HandshakeMetadata, TransferDesc, TransferOp};
 use tokio::sync::oneshot;
 use tonic::transport::{Channel, Endpoint};
 
@@ -121,11 +121,12 @@ impl RdmaFetchStore {
 /// Execute RDMA fetch against a single remote node.
 ///
 /// 1. gRPC connect to remote node
-/// 2. Prepare RDMA handshake (local QPs)
-/// 3. QueryBlocksForTransfer RPC (exchanges handshake metadata)
-/// 4. RDMA READ all block segments
-/// 5. Build SealedBlocks from fetched memory
-/// 6. ReleaseTransferLock (fire-and-forget)
+/// 2. Check/prepare RDMA connection (reuse if already established)
+/// 3. QueryBlocksForTransfer RPC (exchanges handshake metadata + transfer lock)
+/// 4. Complete RDMA handshake if new connection
+/// 5. RDMA READ all block segments
+/// 6. Build SealedBlocks from fetched memory
+/// 7. ReleaseTransferLock (fire-and-forget)
 async fn rdma_fetch_task(
     rdma: &RdmaTransport,
     allocate_fn: &AllocateFn,
@@ -134,7 +135,7 @@ async fn rdma_fetch_task(
     namespace: &str,
     block_hashes: &[Vec<u8>],
 ) -> PrefetchResult {
-    // 1. Connect to remote node
+    // 1. Connect to remote gRPC
     let mut client = match connect_remote(remote_addr).await {
         Ok(c) => c,
         Err(e) => {
@@ -143,27 +144,34 @@ async fn rdma_fetch_task(
         }
     };
 
-    // 2. Prepare local RDMA handshake
-    let local_meta = match rdma.engine().prepare_handshake() {
-        Ok(m) => m,
+    // 2. Check/prepare RDMA connection
+    let local_meta = match rdma.engine().get_or_prepare(remote_addr) {
+        Ok(ConnectionStatus::Existing) => None,
+        Ok(ConnectionStatus::Prepared(m)) => Some(m),
         Err(e) => {
-            error!("RDMA fetch: prepare_handshake failed: {e}");
+            error!("RDMA fetch: get_or_prepare failed: {e}");
             return Vec::new();
         }
     };
 
-    // 3. QueryBlocksForTransfer RPC
+    // 3. QueryBlocksForTransfer RPC (always needed for block ptrs + transfer lock)
     let request = QueryBlocksForTransferRequest {
         namespace: namespace.to_string(),
         block_hashes: block_hashes.to_vec(),
         requester_id: advertise_addr.to_string(),
-        rdma_handshake: local_meta.to_bytes(),
+        rdma_handshake: local_meta
+            .as_ref()
+            .map(|m| m.to_bytes())
+            .unwrap_or_default(),
     };
 
     let response = match client.query_blocks_for_transfer(request).await {
         Ok(r) => r.into_inner(),
         Err(e) => {
             error!("RDMA fetch: QueryBlocksForTransfer RPC failed: {e}");
+            if let Some(m) = &local_meta {
+                rdma.engine().abort_handshake(m);
+            }
             return Vec::new();
         }
     };
@@ -172,42 +180,55 @@ async fn rdma_fetch_task(
         && !st.ok
     {
         error!("RDMA fetch: remote returned error: {}", st.message);
+        if let Some(m) = &local_meta {
+            rdma.engine().abort_handshake(m);
+        }
         return Vec::new();
     }
 
     let transfer_session_id = response.transfer_session_id.clone();
 
-    // Parse remote RDMA handshake
-    let remote_meta = if response.rdma_session_id.is_empty() {
-        error!("RDMA fetch: remote did not return RDMA handshake metadata");
-        fire_and_forget_release(&mut client, &transfer_session_id).await;
-        return Vec::new();
-    } else {
-        match HandshakeMetadata::from_bytes(&response.rdma_session_id) {
-            Ok(m) => m,
-            Err(e) => {
-                error!("RDMA fetch: invalid remote handshake metadata: {e}");
-                fire_and_forget_release(&mut client, &transfer_session_id).await;
-                return Vec::new();
-            }
-        }
-    };
-
-    // Connect local QPs to remote peer (initiator side: lazy connect on first transfer)
-    // The TransferEngine handles this internally on batch_transfer_async.
-
-    // 4. RDMA READ all blocks
-    let blocks = response.blocks;
-    let result = match fetch_blocks_via_rdma(rdma, allocate_fn, namespace, &remote_meta, &blocks) {
-        Ok(r) => r,
-        Err(e) => {
-            error!("RDMA fetch: block transfer failed: {e}");
+    // 4. Complete RDMA handshake if we prepared a new connection
+    if let Some(local_meta) = &local_meta {
+        if response.rdma_session_id.is_empty() {
+            warn!("RDMA fetch: server returned empty rdma_session_id; aborting handshake");
+            rdma.engine().abort_handshake(local_meta);
             fire_and_forget_release(&mut client, &transfer_session_id).await;
             return Vec::new();
         }
-    };
+        let remote_meta = match HandshakeMetadata::from_bytes(&response.rdma_session_id) {
+            Ok(m) => m,
+            Err(e) => {
+                error!("RDMA fetch: invalid remote handshake metadata: {e}");
+                rdma.engine().abort_handshake(local_meta);
+                fire_and_forget_release(&mut client, &transfer_session_id).await;
+                return Vec::new();
+            }
+        };
+        if let Err(e) = rdma
+            .engine()
+            .complete_handshake(remote_addr, local_meta, &remote_meta)
+        {
+            error!("RDMA fetch: complete_handshake failed: {e}");
+            fire_and_forget_release(&mut client, &transfer_session_id).await;
+            return Vec::new();
+        }
+    }
 
-    // 6. Release transfer lock
+    // 5. RDMA READ all blocks using addr-based connection
+    let blocks = response.blocks;
+    let result =
+        match fetch_blocks_via_rdma(rdma, allocate_fn, namespace, remote_addr, &blocks).await {
+            Ok(r) => r,
+            Err(e) => {
+                error!("RDMA fetch: block transfer failed: {e}");
+                rdma.engine().invalidate_connection(remote_addr);
+                fire_and_forget_release(&mut client, &transfer_session_id).await;
+                return Vec::new();
+            }
+        };
+
+    // 7. Release transfer lock
     fire_and_forget_release(&mut client, &transfer_session_id).await;
 
     debug!(
@@ -219,92 +240,95 @@ async fn rdma_fetch_task(
 }
 
 /// Allocate local memory, build TransferDescs, execute RDMA READ, build SealedBlocks.
-fn fetch_blocks_via_rdma(
+async fn fetch_blocks_via_rdma(
     rdma: &RdmaTransport,
     allocate_fn: &AllocateFn,
     namespace: &str,
-    remote_meta: &HandshakeMetadata,
+    remote_addr: &str,
     blocks: &[TransferBlockInfo],
 ) -> Result<PrefetchResult, String> {
     if blocks.is_empty() {
         return Ok(Vec::new());
     }
 
-    // For each block, allocate local memory and build transfer descriptors.
-    // Each TransferBlockInfo has slots (one per TP rank), each slot has K (and optionally V).
-    let mut all_descs: Vec<TransferDesc> = Vec::new();
     // (block_hash, Vec<(slot_segments)>) — for building SealedBlock afterwards
     let mut block_allocs: Vec<(Vec<u8>, Vec<Vec<SegmentAlloc>>)> = Vec::new();
 
-    for block_info in blocks {
-        let mut slot_allocs = Vec::with_capacity(block_info.slots.len());
+    // Build TransferDescs and submit RDMA READ inside a sync block so that
+    // all_descs (which contains NonNull<u8>, !Send) is dropped before any .await.
+    let rx = {
+        let mut all_descs: Vec<TransferDesc> = Vec::new();
 
-        for slot in &block_info.slots {
-            let mut segments = Vec::new();
+        for block_info in blocks {
+            let mut slot_allocs = Vec::with_capacity(block_info.slots.len());
 
-            // K segment
-            if slot.k_size > 0 {
-                let alloc = allocate_fn(slot.k_size, None).ok_or_else(|| {
-                    format!(
-                        "RDMA fetch: failed to allocate {} bytes for K segment",
-                        slot.k_size
-                    )
-                })?;
-                let local_ptr = alloc.as_non_null();
-                let remote_ptr = NonNull::new(slot.k_ptr as *mut u8)
-                    .ok_or_else(|| "RDMA fetch: remote K ptr is null".to_string())?;
-                all_descs.push(TransferDesc {
-                    local_ptr,
-                    remote_ptr,
-                    len: slot.k_size as usize,
-                });
-                segments.push(SegmentAlloc {
-                    alloc,
-                    size: slot.k_size as usize,
-                });
+            for slot in &block_info.slots {
+                let mut segments = Vec::new();
+
+                // K segment
+                if slot.k_size > 0 {
+                    let alloc = allocate_fn(slot.k_size, None).ok_or_else(|| {
+                        format!(
+                            "RDMA fetch: failed to allocate {} bytes for K segment",
+                            slot.k_size
+                        )
+                    })?;
+                    let local_ptr = alloc.as_non_null();
+                    let remote_ptr = NonNull::new(slot.k_ptr as *mut u8)
+                        .ok_or_else(|| "RDMA fetch: remote K ptr is null".to_string())?;
+                    all_descs.push(TransferDesc {
+                        local_ptr,
+                        remote_ptr,
+                        len: slot.k_size as usize,
+                    });
+                    segments.push(SegmentAlloc {
+                        alloc,
+                        size: slot.k_size as usize,
+                    });
+                }
+
+                // V segment (split KV)
+                if slot.v_size > 0 && slot.v_ptr != 0 {
+                    let alloc = allocate_fn(slot.v_size, None).ok_or_else(|| {
+                        format!(
+                            "RDMA fetch: failed to allocate {} bytes for V segment",
+                            slot.v_size
+                        )
+                    })?;
+                    let local_ptr = alloc.as_non_null();
+                    let remote_ptr = NonNull::new(slot.v_ptr as *mut u8)
+                        .ok_or_else(|| "RDMA fetch: remote V ptr is null".to_string())?;
+                    all_descs.push(TransferDesc {
+                        local_ptr,
+                        remote_ptr,
+                        len: slot.v_size as usize,
+                    });
+                    segments.push(SegmentAlloc {
+                        alloc,
+                        size: slot.v_size as usize,
+                    });
+                }
+
+                slot_allocs.push(segments);
             }
 
-            // V segment (split KV)
-            if slot.v_size > 0 && slot.v_ptr != 0 {
-                let alloc = allocate_fn(slot.v_size, None).ok_or_else(|| {
-                    format!(
-                        "RDMA fetch: failed to allocate {} bytes for V segment",
-                        slot.v_size
-                    )
-                })?;
-                let local_ptr = alloc.as_non_null();
-                let remote_ptr = NonNull::new(slot.v_ptr as *mut u8)
-                    .ok_or_else(|| "RDMA fetch: remote V ptr is null".to_string())?;
-                all_descs.push(TransferDesc {
-                    local_ptr,
-                    remote_ptr,
-                    len: slot.v_size as usize,
-                });
-                segments.push(SegmentAlloc {
-                    alloc,
-                    size: slot.v_size as usize,
-                });
-            }
-
-            slot_allocs.push(segments);
+            block_allocs.push((block_info.block_hash.clone(), slot_allocs));
         }
 
-        block_allocs.push((block_info.block_hash.clone(), slot_allocs));
-    }
+        if all_descs.is_empty() {
+            return Ok(Vec::new());
+        }
 
-    if all_descs.is_empty() {
-        return Ok(Vec::new());
-    }
+        // Submit RDMA READ; all_descs is dropped at the end of this block.
+        rdma.engine()
+            .batch_transfer_async(TransferOp::Read, remote_addr, &all_descs)
+            .map_err(|e| format!("RDMA batch_transfer_async failed: {e}"))?
+    };
 
-    // Execute RDMA READ
-    let rx = rdma
-        .engine()
-        .batch_transfer_async(TransferOp::Read, remote_meta, &all_descs)
-        .map_err(|e| format!("RDMA batch_transfer_async failed: {e}"))?;
-
-    // Wait for completion (blocking on std::sync::mpsc::Receiver)
-    let _bytes = rx
-        .recv()
+    // Offload blocking recv() to a dedicated thread to avoid blocking the async runtime.
+    let _bytes = tokio::task::spawn_blocking(move || rx.recv())
+        .await
+        .map_err(|e| format!("RDMA transfer task panicked: {e}"))?
         .map_err(|_| "RDMA transfer channel closed unexpectedly".to_string())?
         .map_err(|e| format!("RDMA transfer failed: {e}"))?;
 
@@ -335,7 +359,12 @@ struct SegmentAlloc {
 }
 
 async fn connect_remote(addr: &str) -> Result<EngineClient<Channel>, String> {
-    let endpoint = Endpoint::from_shared(addr.to_string())
+    let url = if addr.starts_with("http") {
+        addr.to_string()
+    } else {
+        format!("http://{addr}")
+    };
+    let endpoint = Endpoint::from_shared(url)
         .map_err(|e| format!("invalid remote address: {e}"))?
         .connect_timeout(std::time::Duration::from_secs(5));
 

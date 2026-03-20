@@ -623,29 +623,52 @@ impl PegaEngine {
         self.storage.rdma_transport().is_some()
     }
 
-    /// Perform server-side RDMA handshake: prepare local QPs, accept the
-    /// client's handshake, and return our handshake metadata.
+    /// Perform server-side RDMA handshake with connection reuse.
     ///
-    /// Returns `None` if RDMA is not configured.
+    /// If `client_handshake_bytes` is empty, the client believes it is already
+    /// connected -- return our cached local metadata (or empty if not found).
+    /// Otherwise, establish (or re-establish) a connection to the client.
+    ///
     /// Returns `Err` if the handshake fails (bad client metadata, QP creation, etc.).
-    pub fn rdma_accept_handshake(&self, client_handshake_bytes: &[u8]) -> Result<Vec<u8>, String> {
+    pub fn rdma_accept_handshake(
+        &self,
+        client_addr: &str,
+        client_handshake_bytes: &[u8],
+    ) -> Result<Vec<u8>, String> {
         let rdma = self
             .storage
             .rdma_transport()
             .ok_or_else(|| "RDMA transport not configured".to_string())?;
 
+        if client_handshake_bytes.is_empty() {
+            // Client thinks it's already connected -- return our cached meta if we have it
+            return Ok(rdma
+                .engine()
+                .local_meta_for(client_addr)
+                .map(|m| m.to_bytes())
+                .unwrap_or_default());
+        }
+
         let client_meta = pegaflow_transfer::HandshakeMetadata::from_bytes(client_handshake_bytes)
             .map_err(|e| format!("invalid client handshake metadata: {e}"))?;
 
-        let server_meta = rdma
+        // Client sent handshake bytes → it has no connection. If we have a stale
+        // one (e.g. client restarted), tear it down so get_or_prepare creates fresh QPs.
+        rdma.engine().invalidate_connection(client_addr);
+
+        let server_meta = match rdma
             .engine()
-            .prepare_handshake()
-            .map_err(|e| format!("prepare_handshake failed: {e}"))?;
-
+            .get_or_prepare(client_addr)
+            .map_err(|e| format!("get_or_prepare failed: {e}"))?
+        {
+            pegaflow_transfer::ConnectionStatus::Prepared(m) => m,
+            pegaflow_transfer::ConnectionStatus::Existing => {
+                unreachable!("just invalidated connection for {client_addr}")
+            }
+        };
         rdma.engine()
-            .accept_handshake(&client_meta)
-            .map_err(|e| format!("accept_handshake failed: {e}"))?;
-
+            .complete_handshake(client_addr, &server_meta, &client_meta)
+            .map_err(|e| format!("complete_handshake failed: {e}"))?;
         Ok(server_meta.to_bytes())
     }
 }
@@ -665,7 +688,7 @@ mod tests {
             rdma_nic_names: None,
             enable_numa_affinity: false,
             blockwise_alloc: false,
-            transfer_lock_timeout: None,
+            transfer_lock_timeout: std::time::Duration::from_secs(300),
             metaserver_addr: None,
             advertise_addr: None,
             metaserver_queue_depth: 256,

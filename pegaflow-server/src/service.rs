@@ -653,14 +653,11 @@ impl Engine for GrpcEngineService {
                 &req.requester_id,
             );
 
-            // Perform RDMA handshake if client provided its metadata
-            let rdma_session_id = if !req.rdma_handshake.is_empty() {
-                self.engine
-                    .rdma_accept_handshake(&req.rdma_handshake)
-                    .map_err(|e| Status::internal(format!("RDMA handshake failed: {e}")))?
-            } else {
-                Vec::new()
-            };
+            // Perform RDMA handshake (handles both new and reused connections)
+            let rdma_session_id = self
+                .engine
+                .rdma_accept_handshake(&req.requester_id, &req.rdma_handshake)
+                .map_err(|e| Status::internal(format!("RDMA handshake failed: {e}")))?;
 
             let blocks: Vec<TransferBlockInfo> = found_blocks
                 .iter()
@@ -673,7 +670,6 @@ impl Engine for GrpcEngineService {
                     Ok(TransferBlockInfo {
                         block_hash: key.hash.clone(),
                         slots,
-                        rkey: 0, // TODO: set from RDMA engine when wired
                     })
                 })
                 .collect::<Result<_, _>>()?;

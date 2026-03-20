@@ -4,7 +4,7 @@ use std::sync::Arc;
 use sideway::ibverbs::memory_region::MemoryRegion;
 
 use super::session::RcSession;
-use crate::engine::RegisteredMemoryRegion;
+use crate::engine::{NicHandshake, RegisteredMemoryRegion};
 use crate::error::{Result, TransferError};
 
 pub(super) struct RegisteredMemoryEntry {
@@ -56,6 +56,20 @@ impl PerNicState {
         }
     }
 
+    /// Remove a pending session by its local QPN. Returns the session if found.
+    pub(super) fn remove_pending_by_qpn(&mut self, qpn: u32) -> Option<Arc<RcSession>> {
+        let pos = self
+            .pending
+            .iter()
+            .position(|s| s.local_endpoint.qp_num == qpn)?;
+        self.pending.remove(pos)
+    }
+
+    pub(super) fn cleanup_connection(&mut self, remote_qpn: u32) {
+        self.sessions.remove(&remote_qpn);
+        self.remote_memory.remove(&remote_qpn);
+    }
+
     /// Validate and cache the remote memory regions received during handshake.
     pub(super) fn cache_remote_memory(
         &mut self,
@@ -93,9 +107,16 @@ impl PerNicState {
     }
 }
 
+pub(super) struct AddrConnection {
+    pub(super) remote_qpns: Vec<u32>,
+    pub(super) local_nics: Vec<NicHandshake>,
+}
+
 pub(super) struct RcBackendState {
     pub(super) registered: HashMap<u64, RegisteredMemoryEntry>,
     pub(super) nics: Vec<PerNicState>,
+    /// addr -> established connection info
+    pub(super) addr_connections: HashMap<String, AddrConnection>,
 }
 
 impl RcBackendState {
@@ -103,6 +124,7 @@ impl RcBackendState {
         Self {
             registered: HashMap::new(),
             nics: (0..nic_count).map(|_| PerNicState::default()).collect(),
+            addr_connections: HashMap::new(),
         }
     }
 

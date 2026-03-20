@@ -19,7 +19,7 @@ pub fn test_engine() -> PegaEngine {
         rdma_nic_names: None,
         enable_numa_affinity: false,
         blockwise_alloc: false,
-        transfer_lock_timeout: None,
+        transfer_lock_timeout: Duration::from_secs(300),
         metaserver_addr: None,
         advertise_addr: None,
         metaserver_queue_depth: 256,

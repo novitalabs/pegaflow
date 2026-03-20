@@ -43,8 +43,8 @@ pub struct StorageConfig {
     /// Allocate each block separately instead of contiguous batch allocation.
     /// Reduces fragmentation when blocks are freed in different order.
     pub blockwise_alloc: bool,
-    /// Transfer lock timeout for cross-node RDMA transfers (None = disabled).
-    pub transfer_lock_timeout: Option<Duration>,
+    /// Transfer lock timeout for cross-node RDMA transfers.
+    pub transfer_lock_timeout: Duration,
     /// MetaServer address for p2p block discovery + registration (None = disabled).
     pub metaserver_addr: Option<String>,
     /// This node's advertise address for MetaServer registration + transfer lock requester_id.
@@ -63,7 +63,7 @@ impl Default for StorageConfig {
             rdma_nic_names: None,
             enable_numa_affinity: true,
             blockwise_alloc: false,
-            transfer_lock_timeout: None,
+            transfer_lock_timeout: Duration::from_secs(300),
             metaserver_addr: None,
             advertise_addr: None,
             metaserver_queue_depth: crate::internode::DEFAULT_METASERVER_QUEUE_DEPTH,
@@ -80,7 +80,7 @@ pub(crate) struct StorageEngine {
     rdma_transport: Option<Arc<RdmaTransport>>,
     blockwise_alloc: bool,
     metaserver_client: Option<Arc<MetaServerClient>>,
-    transfer_lock: Option<Arc<transfer_lock::TransferLockManager>>,
+    transfer_lock: Arc<transfer_lock::TransferLockManager>,
 }
 
 impl StorageEngine {
@@ -189,8 +189,9 @@ impl StorageEngine {
             let prefetch =
                 PrefetchScheduler::new(ssd_store.clone(), rdma_fetch, max_prefetch_blocks);
 
-            let transfer_lock =
-                transfer_lock_timeout.map(|t| Arc::new(transfer_lock::TransferLockManager::new(t)));
+            let transfer_lock = Arc::new(transfer_lock::TransferLockManager::new(
+                transfer_lock_timeout,
+            ));
 
             Self {
                 allocator,
@@ -434,35 +435,23 @@ impl StorageEngine {
     }
 
     /// Lock blocks for a transfer session, returning the session ID.
-    /// Returns an empty string if transfer locks are disabled.
     pub(crate) fn lock_blocks_for_transfer(
         &self,
         requester_id: &str,
         blocks: &[(BlockKey, Arc<SealedBlock>)],
     ) -> String {
-        if let Some(lock_mgr) = &self.transfer_lock {
-            lock_mgr.lock_blocks(requester_id, blocks.to_vec())
-        } else {
-            String::new()
-        }
+        self.transfer_lock
+            .lock_blocks(requester_id, blocks.to_vec())
     }
 
     /// Release a transfer lock session. Returns the number of blocks released.
     pub(crate) fn release_transfer_lock(&self, session_id: &str) -> usize {
-        if let Some(lock_mgr) = &self.transfer_lock {
-            lock_mgr.release(session_id)
-        } else {
-            0
-        }
+        self.transfer_lock.release(session_id)
     }
 
     /// GC expired transfer lock sessions. Returns the number of sessions expired.
     pub(crate) fn gc_expired_transfer_locks(&self) -> usize {
-        if let Some(lock_mgr) = &self.transfer_lock {
-            lock_mgr.gc_expired()
-        } else {
-            0
-        }
+        self.transfer_lock.gc_expired()
     }
 
     /// Return `(base_ptr, size)` for each contiguous pinned memory region.
@@ -692,34 +681,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lock_blocks_for_transfer_returns_empty_when_disabled() {
-        // Default config has transfer_lock_timeout = None (disabled)
-        let storage = make_engine();
-        let key = BlockKey::new("ns".into(), vec![1]);
-        let block = Arc::new(SealedBlock::from_slots(Vec::new()));
-
-        let session_id = storage.lock_blocks_for_transfer("node-a", &[(key, block)]);
-        assert!(
-            session_id.is_empty(),
-            "lock_blocks_for_transfer should return empty string when disabled"
-        );
-    }
-
-    #[tokio::test]
-    async fn release_transfer_lock_returns_zero_when_disabled() {
-        let storage = make_engine();
-        let released = storage.release_transfer_lock("some-session-id");
-        assert_eq!(released, 0);
-    }
-
-    #[tokio::test]
-    async fn gc_expired_transfer_locks_returns_zero_when_disabled() {
-        let storage = make_engine();
-        let expired = storage.gc_expired_transfer_locks();
-        assert_eq!(expired, 0);
-    }
-
-    #[tokio::test]
     async fn pinned_memory_regions_returns_non_empty() {
         let storage = make_engine();
         let regions = storage.pinned_memory_regions();
@@ -734,17 +695,9 @@ mod tests {
         }
     }
 
-    fn make_engine_with_transfer_lock() -> Arc<StorageEngine> {
-        let config = StorageConfig {
-            transfer_lock_timeout: Some(Duration::from_secs(30)),
-            ..StorageConfig::default()
-        };
-        StorageEngine::new_with_config(1 << 20, false, config, &[])
-    }
-
     #[tokio::test]
     async fn lock_and_release_transfer_when_enabled() {
-        let storage = make_engine_with_transfer_lock();
+        let storage = make_engine();
         let key = BlockKey::new("ns".into(), vec![1]);
         let block = Arc::new(SealedBlock::from_slots(Vec::new()));
 

@@ -126,7 +126,6 @@ message TransferSlotInfo {
 message TransferBlockInfo {
   bytes block_hash = 1;
   repeated TransferSlotInfo slots = 2;  // One per TP slot
-  uint32 rkey = 3;                      // RDMA remote key for this memory region
 }
 
 message QueryBlocksForTransferRequest {

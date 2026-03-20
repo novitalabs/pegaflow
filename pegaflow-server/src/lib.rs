@@ -155,6 +155,11 @@ pub struct Cli {
     /// MetaServer registration queue depth (max pending registration batches).
     #[arg(long, default_value_t = pegaflow_core::DEFAULT_METASERVER_QUEUE_DEPTH)]
     pub metaserver_queue_depth: usize,
+
+    /// Transfer lock timeout in seconds. Blocks held for cross-node RDMA transfer are
+    /// locked for at most this duration before being force-released (crash recovery).
+    #[arg(long, default_value_t = 300)]
+    pub transfer_lock_timeout_secs: u64,
 }
 
 fn parse_sample_rate(s: &str) -> Result<f64, String> {
@@ -420,7 +425,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         rdma_nic_names: cli.nics.clone(),
         enable_numa_affinity: !cli.disable_numa_affinity,
         blockwise_alloc: cli.blockwise_alloc,
-        transfer_lock_timeout: None, // configured when RDMA transfer engine is wired
+        transfer_lock_timeout: Duration::from_secs(cli.transfer_lock_timeout_secs),
         metaserver_addr: cli.metaserver_addr.clone(),
         advertise_addr,
         metaserver_queue_depth: cli.metaserver_queue_depth,
