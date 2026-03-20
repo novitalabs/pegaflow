@@ -14,7 +14,6 @@ try:
         PegaFlowError,
         PegaFlowServiceError,
         PyLoadState,
-        TransferEngine,
     )
     from .pegaflow import (
         __version__ as _rust_version,
@@ -24,7 +23,6 @@ except ImportError:
     EngineRpcClient = None
     PegaEngine = None
     PyLoadState = None
-    TransferEngine = None
     raise ImportError(
         "pegaflow rust extension is not available, check pegaflow-xxx.so file exists"
     ) from None
@@ -39,5 +37,4 @@ __all__ = [
     "PegaFlowError",
     "PegaFlowServiceError",
     "PyLoadState",
-    "TransferEngine",
 ]
