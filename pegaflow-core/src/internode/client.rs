@@ -22,11 +22,13 @@ use super::types::{ClientConfig, ClientError, PegaflowInstance, QueryPrefetchSta
 #[derive(Clone)]
 pub struct PegaflowClient {
     /// The endpoint URL.
+    #[allow(dead_code)]
     endpoint: String,
     /// The underlying gRPC client.
     client: EngineClient<Channel>,
 }
 
+#[allow(dead_code)]
 impl PegaflowClient {
     /// Connect to a PegaFlow instance at the given endpoint.
     ///
@@ -199,7 +201,16 @@ impl PegaflowClient {
             .await
             .map_err(|e| ClientError::RpcFailed(e.to_string()))?;
 
-        Ok(response.into_inner())
+        let resp = response.into_inner();
+        if let Some(status) = &resp.status
+            && !status.ok
+        {
+            return Err(ClientError::RpcFailed(format!(
+                "query_blocks_for_transfer failed: {}",
+                status.message
+            )));
+        }
+        Ok(resp)
     }
 
     /// Release transfer locks on a remote node.
@@ -249,8 +260,11 @@ pub struct PegaflowClientPool {
     registry: Arc<InstanceRegistry>,
     /// Cached clients keyed by endpoint URL.
     clients: dashmap::DashMap<String, PegaflowClient>,
+    /// Maximum number of cached connections before eviction.
+    max_connections: usize,
 }
 
+#[allow(dead_code)]
 impl PegaflowClientPool {
     /// Create a new client pool with the given registry.
     fn new(registry: Arc<InstanceRegistry>, config: ClientConfig) -> Self {
@@ -258,6 +272,7 @@ impl PegaflowClientPool {
             config,
             registry,
             clients: dashmap::DashMap::new(),
+            max_connections: 64,
         }
     }
 
@@ -294,6 +309,22 @@ impl PegaflowClientPool {
         // Connect and cache.
         let client = PegaflowClient::connect(endpoint, &self.config).await?;
         self.clients.insert(endpoint.to_string(), client.clone());
+
+        // Evict if over capacity
+        while self.clients.len() > self.max_connections {
+            if let Some(entry) = self.clients.iter().next() {
+                let key = entry.key().clone();
+                drop(entry);
+                if key != endpoint {
+                    self.clients.remove(&key);
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
         Ok(client)
     }
 
@@ -328,16 +359,6 @@ impl PegaflowClientPool {
     /// Whether the pool has no cached connections.
     fn is_empty(&self) -> bool {
         self.clients.is_empty()
-    }
-}
-
-#[cfg(test)]
-impl PegaflowClient {
-    pub(crate) fn from_channel(endpoint: &str, channel: Channel) -> Self {
-        Self {
-            endpoint: endpoint.to_string(),
-            client: EngineClient::new(channel),
-        }
     }
 }
 

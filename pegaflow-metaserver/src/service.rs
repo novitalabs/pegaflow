@@ -61,6 +61,23 @@ impl MetaServer for GrpcMetaService {
             return Ok(Response::new(response));
         }
 
+        if req.namespace.is_empty() {
+            return Ok(Response::new(InsertBlockHashesResponse {
+                status: Some(Self::error_status("namespace cannot be empty".to_string())),
+                inserted_count: 0,
+            }));
+        }
+
+        if req.node.parse::<std::net::SocketAddr>().is_err() {
+            return Ok(Response::new(InsertBlockHashesResponse {
+                status: Some(Self::error_status(format!(
+                    "node must be a valid socket address, got: {}",
+                    req.node
+                ))),
+                inserted_count: 0,
+            }));
+        }
+
         // Insert hashes with node ownership
         let inserted = self
             .store

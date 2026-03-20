@@ -17,6 +17,7 @@ pub struct InstanceRegistry {
     instances: DashMap<String, PegaflowInstance>,
 }
 
+#[allow(dead_code)]
 impl InstanceRegistry {
     /// Create a new empty registry.
     pub(crate) fn new() -> Self {

@@ -16,7 +16,6 @@ pub mod block;
 mod cache;
 pub mod gpu_worker;
 pub mod instance;
-#[allow(dead_code)]
 pub mod internode;
 pub use pegaflow_common::logging;
 mod metrics;
@@ -502,9 +501,7 @@ impl PegaEngine {
             .collect();
 
         let found = self.storage.get_blocks_for_transfer(&keys);
-        let session_id = self
-            .storage
-            .lock_blocks_for_transfer(requester_id, found.clone());
+        let session_id = self.storage.lock_blocks_for_transfer(requester_id, &found);
 
         debug!(
             "query_blocks_for_transfer: namespace={namespace} requested={} found={} session={session_id}",

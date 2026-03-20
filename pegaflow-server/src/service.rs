@@ -106,27 +106,20 @@ impl GrpcEngineService {
     }
 
     fn build_transfer_slot_info(
-        layer_block: &Arc<pegaflow_core::LayerBlock>,
+        raw_block: &Arc<pegaflow_core::RawBlock>,
     ) -> Result<TransferSlotInfo, Status> {
-        let total_size = layer_block.size() as u64;
-        if layer_block.v_ptr().is_some() {
-            if !total_size.is_multiple_of(2) {
-                return Err(Status::internal(format!(
-                    "split block size must be even, got {}",
-                    total_size
-                )));
-            }
-            let segment_size = total_size / 2;
+        let layer_block = pegaflow_core::LayerBlock::new(Arc::clone(raw_block));
+        if let Some(v_ptr) = layer_block.v_ptr() {
             Ok(TransferSlotInfo {
                 k_ptr: layer_block.k_ptr() as u64,
-                k_size: segment_size,
-                v_ptr: layer_block.v_ptr().map(|p| p as u64).unwrap_or(0),
-                v_size: segment_size,
+                k_size: layer_block.k_size() as u64,
+                v_ptr: v_ptr as u64,
+                v_size: layer_block.v_size().unwrap_or(0) as u64,
             })
         } else {
             Ok(TransferSlotInfo {
                 k_ptr: layer_block.k_ptr() as u64,
-                k_size: total_size,
+                k_size: layer_block.k_size() as u64,
                 v_ptr: 0,
                 v_size: 0,
             })
@@ -639,6 +632,13 @@ impl Engine for GrpcEngineService {
             "RPC [query_blocks_for_transfer]: namespace={} hashes={} requester={}",
             req.namespace, hash_count, req.requester_id
         );
+
+        const MAX_TRANSFER_BLOCK_HASHES: usize = 1024;
+        if hash_count > MAX_TRANSFER_BLOCK_HASHES {
+            return Err(Status::invalid_argument(format!(
+                "block_hashes count {hash_count} exceeds maximum {MAX_TRANSFER_BLOCK_HASHES}"
+            )));
+        }
 
         let result: Result<Response<QueryBlocksForTransferResponse>, Status> = async {
             let rdma_session_id = self.rdma_session_id.clone().ok_or_else(|| {

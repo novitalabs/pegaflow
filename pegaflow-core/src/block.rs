@@ -193,8 +193,12 @@ impl LayerBlock {
     pub fn v_size(&self) -> Option<usize> {
         self.raw.segment_size(1)
     }
-}
 
+    /// Total size across all segments (K + V if split).
+    pub fn size(&self) -> usize {
+        self.raw.memory_footprint() as usize
+    }
+}
 
 // ============================================================================
 // Sealed Block (read path, immutable)

@@ -28,7 +28,9 @@ use pegaflow_core::internode::remote_fetch_worker::{
     RdmaBatchReadFn, RdmaRegisterMemoryFn, RemoteFetchWorkerConfig, execute_remote_fetch,
 };
 use pegaflow_core::{PegaEngine, RemoteFetchFn};
-use pegaflow_transfer::{DomainAddress, MooncakeTransferEngine};
+use pegaflow_transfer::{
+    HandshakeMetadata, MemoryRegion, TransferDesc, TransferEngine, TransferOp,
+};
 use prometheus::Registry;
 use proto::engine::engine_server::EngineServer;
 use pyo3::{PyErr, Python, types::PyAnyMethods};
@@ -337,7 +339,7 @@ fn init_metrics(
 struct RemoteFetchRuntime {
     remote_fetch_fn: RemoteFetchFn,
     engine_cell: Arc<OnceLock<Arc<PegaEngine>>>,
-    rdma_engine: Arc<Mutex<MooncakeTransferEngine>>,
+    rdma_engine: Arc<TransferEngine>,
     rdma_session_id: Vec<u8>,
 }
 
@@ -491,37 +493,50 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             let metaserver_client = Arc::new(MetaServerQueryClient::connect(addr).await?);
             let client_pool = Arc::new(PegaflowClientPool::without_registry());
 
-            let mut transfer_engine = MooncakeTransferEngine::new();
-            transfer_engine
-                .initialize(rdma_nic, cli.rdma_port)
-                .map_err(|err| {
-                    std::io::Error::other(format!(
-                        "failed to initialize RDMA transfer engine: {err}"
-                    ))
-                })?;
+            let transfer_engine = TransferEngine::new(&[rdma_nic]).map_err(|err| {
+                std::io::Error::other(format!("failed to initialize RDMA transfer engine: {err}"))
+            })?;
 
-            let rdma_session_id = transfer_engine.get_session_id().to_bytes().to_vec();
-            let rdma_engine = Arc::new(Mutex::new(transfer_engine));
+            let local_handshake = transfer_engine.prepare_handshake().map_err(|err| {
+                std::io::Error::other(format!("failed to prepare RDMA handshake: {err}"))
+            })?;
+            let rdma_session_id = local_handshake.to_bytes();
+            let rdma_engine = Arc::new(transfer_engine);
             let engine_cell: Arc<OnceLock<Arc<PegaEngine>>> = Arc::new(OnceLock::new());
 
             let rdma_read_fn: RdmaBatchReadFn = {
                 let rdma_engine = Arc::clone(&rdma_engine);
                 Arc::new(move |session_id, local_ptrs, remote_ptrs, sizes| {
-                    let session = DomainAddress::from_bytes(session_id)
-                        .ok_or_else(|| "invalid RDMA session id bytes".to_string())?;
-                    rdma_engine
-                        .lock()
-                        .batch_transfer_sync_read(&session, local_ptrs, remote_ptrs, sizes)
-                        .map_err(|err| err.to_string())
+                    let peer = HandshakeMetadata::from_bytes(session_id)
+                        .map_err(|e| format!("invalid RDMA handshake metadata: {e}"))?;
+                    let descs: Vec<TransferDesc> = local_ptrs
+                        .iter()
+                        .zip(remote_ptrs.iter())
+                        .zip(sizes.iter())
+                        .map(|((&local, &remote), &len)| TransferDesc {
+                            local_ptr: std::ptr::NonNull::new(local as *mut u8).unwrap(),
+                            remote_ptr: std::ptr::NonNull::new(remote as *mut u8).unwrap(),
+                            len,
+                        })
+                        .collect();
+                    let rx = rdma_engine
+                        .batch_transfer_async(TransferOp::Read, &peer, &descs)
+                        .map_err(|e| e.to_string())?;
+                    rx.recv()
+                        .map_err(|e| format!("RDMA transfer channel error: {e}"))?
+                        .map_err(|e| e.to_string())
                 })
             };
             let rdma_register_fn: RdmaRegisterMemoryFn = {
                 let rdma_engine = Arc::clone(&rdma_engine);
                 Arc::new(move |ptr, size| {
+                    let region = MemoryRegion {
+                        ptr: std::ptr::NonNull::new(ptr as *mut u8).unwrap(),
+                        len: size,
+                    };
                     rdma_engine
-                        .lock()
-                        .register_memory(ptr, size)
-                        .map_err(|err| err.to_string())
+                        .register_memory(&[region])
+                        .map_err(|e| e.to_string())
                 })
             };
             let remote_fetch_fn: RemoteFetchFn = {
@@ -530,18 +545,22 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 let engine_cell = Arc::clone(&engine_cell);
                 let rdma_read_fn = Arc::clone(&rdma_read_fn);
                 let rdma_register_fn = Arc::clone(&rdma_register_fn);
+                let cached_config: Arc<OnceLock<Arc<RemoteFetchWorkerConfig>>> =
+                    Arc::new(OnceLock::new());
                 Arc::new(move |keys, done_tx| {
                     let Some(engine) = engine_cell.get().cloned() else {
                         let _ = done_tx.send(Vec::new());
                         return;
                     };
-                    let config = Arc::new(RemoteFetchWorkerConfig::new_from_engine(
-                        Arc::clone(&metaserver_client),
-                        Arc::clone(&client_pool),
-                        engine,
-                        Arc::clone(&rdma_read_fn),
-                        Arc::clone(&rdma_register_fn),
-                    ));
+                    let config = Arc::clone(cached_config.get_or_init(|| {
+                        Arc::new(RemoteFetchWorkerConfig::new_from_engine(
+                            Arc::clone(&metaserver_client),
+                            Arc::clone(&client_pool),
+                            engine,
+                            Arc::clone(&rdma_read_fn),
+                            Arc::clone(&rdma_register_fn),
+                        ))
+                    }));
                     tokio::spawn(execute_remote_fetch(config, keys, done_tx));
                 })
             };
@@ -573,12 +592,17 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 .set(Arc::clone(&engine))
                 .map_err(|_| std::io::Error::other("remote fetch engine already initialized"))?;
 
-            let regions = engine.pinned_memory_regions();
-            let (ptrs, lens): (Vec<u64>, Vec<usize>) = regions.into_iter().unzip();
+            let pinned_regions = engine.pinned_memory_regions();
+            let memory_regions: Vec<MemoryRegion> = pinned_regions
+                .into_iter()
+                .map(|(ptr, len)| MemoryRegion {
+                    ptr: std::ptr::NonNull::new(ptr as *mut u8).unwrap(),
+                    len,
+                })
+                .collect();
             runtime
                 .rdma_engine
-                .lock()
-                .batch_register_memory(&ptrs, &lens)
+                .register_memory(&memory_regions)
                 .map_err(|err| {
                     std::io::Error::other(format!(
                         "failed to register pinned memory with RDMA engine: {err}"

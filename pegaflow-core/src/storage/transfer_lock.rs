@@ -66,6 +66,12 @@ impl TransferLockManager {
     }
 
     /// Release a transfer session's locks. Returns the number of blocks released.
+    ///
+    /// # Security model
+    ///
+    /// Any caller with the session ID can release the lock. This relies on:
+    /// 1. Session IDs are UUIDv4 (cryptographically random, unguessable)
+    /// 2. The gRPC port is network-isolated (internal cluster only)
     pub(crate) fn release(&self, session_id: &str) -> usize {
         let mut inner = self.inner.lock();
         if let Some(session) = inner.remove(session_id) {

@@ -4,6 +4,7 @@
 //! → build SealedBlock → send result via oneshot channel.
 
 use std::num::NonZeroU64;
+use std::ptr::NonNull;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -11,8 +12,8 @@ use log::{debug, info, warn};
 use tokio::sync::oneshot;
 
 use crate::PegaEngine;
-use crate::block::{BlockKey, LayerBlock, SealedBlock};
-use crate::internode::client::{PegaflowClient, PegaflowClientPool};
+use crate::block::{BlockKey, RawBlock, SealedBlock, Segment};
+use crate::internode::client::PegaflowClientPool;
 use crate::internode::metaserver_query::MetaServerQueryClient;
 use crate::metrics::core_metrics;
 use crate::pinned_pool::PinnedAllocator;
@@ -74,7 +75,7 @@ pub async fn execute_remote_fetch(
     done_tx: oneshot::Sender<RemoteFetchResult>,
 ) {
     let started_at = Instant::now();
-    let result = execute_remote_fetch_inner(&config, &missing_keys).await;
+    let result = execute_remote_fetch_inner(Arc::clone(&config), &missing_keys).await;
 
     match &result {
         Ok(blocks) => {
@@ -102,7 +103,7 @@ pub async fn execute_remote_fetch(
 }
 
 async fn execute_remote_fetch_inner(
-    config: &RemoteFetchWorkerConfig,
+    config: Arc<RemoteFetchWorkerConfig>,
     missing_keys: &[BlockKey],
 ) -> Result<RemoteFetchResult, String> {
     if missing_keys.is_empty() {
@@ -149,27 +150,30 @@ async fn execute_remote_fetch_inner(
     for node_blocks in &meta_resp.node_blocks {
         let endpoint = format!("http://{}", node_blocks.node);
 
-        let client: PegaflowClient =
-            config
-                .client_pool
-                .get_or_connect(&endpoint)
-                .await
-                .map_err(|e| {
-                    core_metrics()
-                        .remote_fetch_blocks_missed
-                        .add(node_blocks.block_hashes.len() as u64, &[]);
-                    format!("Failed to connect to remote node {endpoint}: {e}")
-                })?;
-
-        let transfer_resp = client
-            .query_blocks_for_transfer(namespace, &node_blocks.block_hashes, "remote-fetch")
-            .await
-            .map_err(|e| {
+        let client = match config.client_pool.get_or_connect(&endpoint).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Skipping unreachable node {endpoint}: {e}");
                 core_metrics()
                     .remote_fetch_blocks_missed
                     .add(node_blocks.block_hashes.len() as u64, &[]);
-                format!("QueryBlocksForTransfer failed for {endpoint}: {e}")
-            })?;
+                continue;
+            }
+        };
+
+        let transfer_resp = match client
+            .query_blocks_for_transfer(namespace, &node_blocks.block_hashes, "remote-fetch")
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("QueryBlocksForTransfer failed for {endpoint}: {e}");
+                core_metrics()
+                    .remote_fetch_blocks_missed
+                    .add(node_blocks.block_hashes.len() as u64, &[]);
+                continue;
+            }
+        };
 
         if transfer_resp.rdma_session_id.is_empty() {
             warn!("Remote node {endpoint} returned empty RDMA session ID");
@@ -183,15 +187,22 @@ async fn execute_remote_fetch_inner(
         }
 
         for block_info in &transfer_resp.blocks {
-            match fetch_single_block(
-                config,
-                block_info,
-                &transfer_resp.rdma_session_id,
-                namespace,
-            ) {
-                Ok(result) => fetched_blocks.push(result),
-                Err(e) => {
+            let config = Arc::clone(&config);
+            let block_info = block_info.clone();
+            let rdma_session_id = transfer_resp.rdma_session_id.clone();
+            let ns = namespace.to_string();
+            match tokio::task::spawn_blocking(move || {
+                fetch_single_block(&config, &block_info, &rdma_session_id, &ns)
+            })
+            .await
+            {
+                Ok(Ok(result)) => fetched_blocks.push(result),
+                Ok(Err(e)) => {
                     warn!("Failed to fetch block via RDMA: {e}");
+                    core_metrics().remote_fetch_blocks_missed.add(1, &[]);
+                }
+                Err(e) => {
+                    warn!("RDMA fetch task panicked: {e}");
                     core_metrics().remote_fetch_blocks_missed.add(1, &[]);
                 }
             }
@@ -272,28 +283,25 @@ fn fetch_single_block(
         .add(bytes_transferred as u64, &[]);
 
     // Build SealedBlock from received data
-    let mut layer_blocks = Vec::with_capacity(block_info.slots.len());
+    let mut raw_blocks = Vec::with_capacity(block_info.slots.len());
     for (i, slot_info) in block_info.slots.iter().enumerate() {
         let (ref k_alloc, ref v_alloc) = allocations[i];
-        let layer_block = if let Some(v_alloc) = v_alloc {
-            LayerBlock::new_split(
-                k_alloc.as_ptr().cast_mut(),
-                v_alloc.as_ptr().cast_mut(),
-                (slot_info.k_size + slot_info.v_size) as usize,
-                Arc::clone(k_alloc),
+        let mut segments = vec![Segment::new(
+            NonNull::new(k_alloc.as_ptr().cast_mut()).unwrap(),
+            slot_info.k_size as usize,
+            Arc::clone(k_alloc),
+        )];
+        if let Some(v_alloc) = v_alloc {
+            segments.push(Segment::new(
+                NonNull::new(v_alloc.as_ptr().cast_mut()).unwrap(),
+                slot_info.v_size as usize,
                 Arc::clone(v_alloc),
-            )
-        } else {
-            LayerBlock::new_contiguous(
-                k_alloc.as_ptr().cast_mut(),
-                slot_info.k_size as usize,
-                Arc::clone(k_alloc),
-            )
-        };
-        layer_blocks.push(Arc::new(layer_block));
+            ));
+        }
+        raw_blocks.push(Arc::new(RawBlock::new(segments)));
     }
 
-    let sealed = SealedBlock::from_slots(layer_blocks);
+    let sealed = SealedBlock::from_slots(raw_blocks);
     let key = BlockKey::new(namespace.to_string(), block_info.block_hash.clone());
 
     Ok((key, Arc::new(sealed)))
@@ -394,7 +402,7 @@ mod tests {
         assert_eq!(key.namespace, "ns");
         assert_eq!(key.hash, vec![1, 2, 3]);
         assert_eq!(sealed.slots().len(), 1);
-        assert!(sealed.slots()[0].v_ptr().is_none());
+        assert_eq!(sealed.slots()[0].num_segments(), 1);
 
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
@@ -427,8 +435,8 @@ mod tests {
 
         assert_eq!(key.hash, vec![4, 5, 6]);
         assert_eq!(sealed.slots().len(), 1);
-        assert!(sealed.slots()[0].v_ptr().is_some());
-        assert_eq!(sealed.slots()[0].size(), 1024);
+        assert!(sealed.slots()[0].num_segments() >= 2);
+        assert_eq!(sealed.slots()[0].memory_footprint(), 1024);
 
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
@@ -652,7 +660,7 @@ mod tests {
         });
 
         let missing_keys = vec![BlockKey::new("ns".to_string(), vec![1, 2, 3])];
-        let result = execute_remote_fetch_inner(&config, &missing_keys).await;
+        let result = execute_remote_fetch_inner(config, &missing_keys).await;
 
         let blocks = result.unwrap();
         assert_eq!(blocks.len(), 1);
@@ -754,7 +762,7 @@ mod tests {
             BlockKey::new("ns".to_string(), vec![1]),
             BlockKey::new("ns".to_string(), vec![2]),
         ];
-        let result = execute_remote_fetch_inner(&config, &missing_keys)
+        let result = execute_remote_fetch_inner(config, &missing_keys)
             .await
             .unwrap();
 
@@ -774,7 +782,7 @@ mod tests {
         let config =
             RemoteFetchWorkerConfig::new_for_test(allocator, rdma_read_fn, noop_rdma_register_fn());
 
-        let result = execute_remote_fetch_inner(&config, &[]).await;
+        let result = execute_remote_fetch_inner(config, &[]).await;
         assert!(result.unwrap().is_empty());
     }
 }

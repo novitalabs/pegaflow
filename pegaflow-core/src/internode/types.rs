@@ -62,6 +62,7 @@ impl Default for ServiceDiscoveryConfig {
     }
 }
 
+#[allow(dead_code)]
 impl ServiceDiscoveryConfig {
     /// Create a new config with the default PegaFlow label selector.
     fn new() -> Self {
@@ -112,6 +113,7 @@ pub struct PegaflowInstance {
     pub labels: HashMap<String, String>,
 }
 
+#[allow(dead_code)]
 impl PegaflowInstance {
     /// Get the gRPC endpoint URL for this instance.
     pub(crate) fn grpc_endpoint(&self) -> String {

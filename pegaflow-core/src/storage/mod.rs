@@ -409,10 +409,10 @@ impl StorageEngine {
     pub(crate) fn lock_blocks_for_transfer(
         &self,
         requester_id: &str,
-        blocks: Vec<(BlockKey, Arc<SealedBlock>)>,
+        blocks: &[(BlockKey, Arc<SealedBlock>)],
     ) -> String {
         if let Some(lock_mgr) = &self.transfer_lock {
-            lock_mgr.lock_blocks(requester_id, blocks)
+            lock_mgr.lock_blocks(requester_id, blocks.to_vec())
         } else {
             String::new()
         }
@@ -670,7 +670,7 @@ mod tests {
         let key = BlockKey::new("ns".into(), vec![1]);
         let block = Arc::new(SealedBlock::from_slots(Vec::new()));
 
-        let session_id = storage.lock_blocks_for_transfer("node-a", vec![(key, block)]);
+        let session_id = storage.lock_blocks_for_transfer("node-a", &[(key, block)]);
         assert!(
             session_id.is_empty(),
             "lock_blocks_for_transfer should return empty string when disabled"
@@ -722,7 +722,7 @@ mod tests {
 
         storage.test_insert_cache(key.clone(), block.clone());
 
-        let session_id = storage.lock_blocks_for_transfer("node-a", vec![(key, block)]);
+        let session_id = storage.lock_blocks_for_transfer("node-a", &[(key, block)]);
         assert!(
             !session_id.is_empty(),
             "lock_blocks_for_transfer should return a UUID when enabled"
