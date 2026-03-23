@@ -9,9 +9,6 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-/// Minimum hash length in bytes. The first 3 bytes are used for bucket
-/// indexing (up to 18 bits) and byte 4 starts the leading-zero scan.
-const MIN_HASH_BYTES: usize = 4;
 
 /// Allowed range for `bucket_bits` (register index width).
 pub const MIN_BUCKET_BITS: u8 = 4;
@@ -52,20 +49,15 @@ impl HyperLogLog {
         }
     }
 
-    /// Insert a block hash (at least [`MIN_HASH_BYTES`] bytes).
+    /// Insert a block hash.
     ///
     /// Treats the hash as a big-endian bit stream:
     /// - Top `bucket_bits` bits → register index
     /// - Remaining bits → count leading zeros (ρ)
     ///
-    /// # Panics
-    /// Panics if `hash.len() < MIN_HASH_BYTES`.
+    /// Shorter hashes are implicitly zero-padded; longer hashes give
+    /// more leading-zero headroom and better accuracy.
     pub fn insert(&mut self, hash: &[u8]) {
-        assert!(
-            hash.len() >= MIN_HASH_BYTES,
-            "hash must be at least {MIN_HASH_BYTES} bytes, got {}",
-            hash.len()
-        );
         let index = bucket_index(hash, self.bucket_bits);
         let rho = count_leading_zeros(hash, self.bucket_bits, self.lz_mask) + 1;
 
@@ -108,21 +100,31 @@ impl HyperLogLog {
 // Free helpers
 // ============================================================================
 
+/// Read byte at `index`, returning 0 for out-of-bounds positions.
+fn byte_or_zero(hash: &[u8], index: usize) -> u8 {
+    hash.get(index).copied().unwrap_or(0)
+}
+
 /// Top `bucket_bits` bits of the hash as a register index (bucket_bits ≤ 18 → 3 bytes suffice).
 fn bucket_index(hash: &[u8], bucket_bits: u8) -> usize {
-    let val = u32::from_be_bytes([0, hash[0], hash[1], hash[2]]);
+    let val = u32::from_be_bytes([0, byte_or_zero(hash, 0), byte_or_zero(hash, 1), byte_or_zero(hash, 2)]);
     (val >> (24 - bucket_bits as u32)) as usize
 }
 
 /// Leading zeros in the remaining bits after the bucket index.
 fn count_leading_zeros(hash: &[u8], bucket_bits: u8, lz_mask: u32) -> u8 {
-    let head = u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]);
+    let head = u32::from_be_bytes([
+        byte_or_zero(hash, 0),
+        byte_or_zero(hash, 1),
+        byte_or_zero(hash, 2),
+        byte_or_zero(hash, 3),
+    ]);
     let masked = head & lz_mask;
     if masked != 0 {
         return masked.leading_zeros() as u8 - bucket_bits;
     }
     let mut count = 32 - bucket_bits;
-    for &byte in &hash[4..] {
+    for &byte in hash.get(4..).unwrap_or(&[]) {
         if byte != 0 {
             return count + byte.leading_zeros() as u8;
         }
@@ -294,13 +296,9 @@ impl HllTracker {
     }
 
     /// Record a batch of block hashes from a gRPC request.
-    ///
-    /// Hashes shorter than [`MIN_HASH_BYTES`] bytes are silently skipped.
     pub fn record_hashes(&mut self, hashes: &[Vec<u8>]) {
         for hash in hashes {
-            if hash.len() >= MIN_HASH_BYTES {
-                self.record(hash);
-            }
+            self.record(hash);
         }
     }
 
