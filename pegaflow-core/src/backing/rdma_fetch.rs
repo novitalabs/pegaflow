@@ -18,6 +18,8 @@ use pegaflow_transfer::{ConnectionStatus, HandshakeMetadata, TransferDesc, Trans
 use tokio::sync::oneshot;
 use tonic::transport::{Channel, Endpoint};
 
+use pegaflow_common::NumaNode;
+
 use super::{AllocateFn, PrefetchResult, RdmaTransport};
 use crate::block::{BlockKey, RawBlock, SealedBlock, Segment};
 use crate::internode::MetaServerClient;
@@ -239,10 +241,11 @@ async fn fetch_blocks_via_rdma(
 
             for slot in &block_info.slots {
                 let mut segments = Vec::new();
+                let numa = NumaNode(slot.numa_node);
 
                 // K segment
                 if slot.k_size > 0 {
-                    let alloc = allocate_fn(slot.k_size, None).ok_or_else(|| {
+                    let alloc = allocate_fn(slot.k_size, Some(numa)).ok_or_else(|| {
                         format!("failed to allocate {} bytes for K segment", slot.k_size)
                     })?;
                     let local_ptr = alloc.as_non_null();
@@ -261,7 +264,7 @@ async fn fetch_blocks_via_rdma(
 
                 // V segment (split KV)
                 if slot.v_size > 0 && slot.v_ptr != 0 {
-                    let alloc = allocate_fn(slot.v_size, None).ok_or_else(|| {
+                    let alloc = allocate_fn(slot.v_size, Some(numa)).ok_or_else(|| {
                         format!("failed to allocate {} bytes for V segment", slot.v_size)
                     })?;
                     let local_ptr = alloc.as_non_null();

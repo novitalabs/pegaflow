@@ -104,6 +104,7 @@ impl GrpcEngineService {
 
     fn build_transfer_slot_info(
         raw_block: &Arc<pegaflow_core::RawBlock>,
+        numa_node: pegaflow_common::NumaNode,
     ) -> Result<TransferSlotInfo, Status> {
         let layer_block = pegaflow_core::LayerBlock::new(Arc::clone(raw_block));
         if let Some(v_ptr) = layer_block.v_ptr() {
@@ -112,6 +113,7 @@ impl GrpcEngineService {
                 k_size: layer_block.k_size() as u64,
                 v_ptr: v_ptr as u64,
                 v_size: layer_block.v_size().unwrap_or(0) as u64,
+                numa_node: numa_node.0,
             })
         } else {
             Ok(TransferSlotInfo {
@@ -119,6 +121,7 @@ impl GrpcEngineService {
                 k_size: layer_block.k_size() as u64,
                 v_ptr: 0,
                 v_size: 0,
+                numa_node: numa_node.0,
             })
         }
     }
@@ -665,7 +668,8 @@ impl Engine for GrpcEngineService {
                     let slots: Vec<TransferSlotInfo> = block
                         .slots()
                         .iter()
-                        .map(Self::build_transfer_slot_info)
+                        .zip(block.slot_numas())
+                        .map(|(raw, &numa)| Self::build_transfer_slot_info(raw, numa))
                         .collect::<Result<_, _>>()?;
                     Ok(TransferBlockInfo {
                         block_hash: key.hash.clone(),

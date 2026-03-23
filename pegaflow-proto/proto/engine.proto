@@ -120,6 +120,7 @@ message TransferSlotInfo {
   uint64 k_size = 2;     // Size of the K segment in bytes (per-segment, not total slot size)
   uint64 v_ptr = 3;      // Remote pinned memory address for V segment (0 if contiguous)
   uint64 v_size = 4;     // Size of the V segment in bytes (0 if contiguous)
+  uint32 numa_node = 5;  // NUMA node where this slot's memory resides (for RDMA NIC affinity)
 }
 
 // Cross-node transfer: per-block RDMA metadata
