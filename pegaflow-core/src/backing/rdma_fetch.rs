@@ -5,10 +5,10 @@
 
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use log::{debug, error, info, warn};
+use log::{debug, info, warn};
 use pegaflow_proto::proto::engine::engine_client::EngineClient;
 use pegaflow_proto::proto::engine::{
     QueryBlocksForTransferRequest, QueryBlocksForTransferResponse, ReleaseTransferLockRequest,
@@ -20,9 +20,12 @@ use tonic::transport::{Channel, Endpoint};
 
 use pegaflow_common::NumaNode;
 
+use opentelemetry::KeyValue;
+
 use super::{AllocateFn, PrefetchResult, RdmaTransport};
 use crate::block::{BlockKey, RawBlock, SealedBlock, Segment};
 use crate::internode::MetaServerClient;
+use crate::metrics::core_metrics;
 
 /// Minimum usable transfer timeout. If the server's lock timeout minus the
 /// safety margin falls below this, we use this floor to avoid instant timeouts.
@@ -153,12 +156,17 @@ async fn rdma_fetch_task(
     namespace: &str,
     block_hashes: &[Vec<u8>],
 ) -> PrefetchResult {
+    let t0 = Instant::now();
+
     // 1. Check/prepare RDMA connection (local operation — fail fast before gRPC)
     let local_meta = match rdma.engine().get_or_prepare(remote_addr) {
         Ok(ConnectionStatus::Existing) => None,
         Ok(ConnectionStatus::Prepared(m)) => Some(m),
         Err(e) => {
-            error!("RDMA prepare connection to {remote_addr} failed: {e}");
+            warn!("RDMA prepare connection to {remote_addr} failed: {e}");
+            core_metrics()
+                .rdma_fetch_total
+                .add(1, &[KeyValue::new("status", "error")]);
             return Vec::new();
         }
     };
@@ -176,10 +184,13 @@ async fn rdma_fetch_task(
     {
         Ok(cr) => cr,
         Err(e) => {
-            error!("Remote query to {remote_addr} failed: {e}");
+            warn!("Remote query to {remote_addr} failed: {e}");
             if let Some(m) = &local_meta {
                 rdma.engine().abort_handshake(m);
             }
+            core_metrics()
+                .rdma_fetch_total
+                .add(1, &[KeyValue::new("status", "error")]);
             return Vec::new();
         }
     };
@@ -189,9 +200,12 @@ async fn rdma_fetch_task(
     // 3. Complete RDMA handshake if we prepared a new connection
     if let Some(local_meta) = &local_meta {
         if let Err(e) = finish_handshake(rdma, remote_addr, local_meta, &response.rdma_session_id) {
-            error!("RDMA handshake to {remote_addr} failed: {e}");
+            warn!("RDMA handshake to {remote_addr} failed: {e}");
             rdma.engine().abort_handshake(local_meta);
             spawn_release_lock(client.clone(), transfer_session_id.clone());
+            core_metrics()
+                .rdma_fetch_total
+                .add(1, &[KeyValue::new("status", "error")]);
             return Vec::new();
         }
     }
@@ -199,6 +213,11 @@ async fn rdma_fetch_task(
     // 4. RDMA READ all blocks + build SealedBlocks
     let transfer_timeout = transfer_timeout_from_server(response.lock_timeout_secs);
     let blocks = response.blocks;
+    let total_bytes: u64 = blocks
+        .iter()
+        .flat_map(|b| &b.slots)
+        .map(|s| s.k_size + s.v_size)
+        .sum();
     let result = match fetch_blocks_via_rdma(
         rdma,
         allocate_fn,
@@ -211,9 +230,12 @@ async fn rdma_fetch_task(
     {
         Ok(r) => r,
         Err(e) => {
-            error!("RDMA transfer from {remote_addr} failed: {e}");
+            warn!("RDMA transfer from {remote_addr} failed: {e}");
             rdma.engine().invalidate_connection(remote_addr);
             spawn_release_lock(client, transfer_session_id);
+            core_metrics()
+                .rdma_fetch_total
+                .add(1, &[KeyValue::new("status", "error")]);
             return Vec::new();
         }
     };
@@ -221,10 +243,24 @@ async fn rdma_fetch_task(
     // 5. Release transfer lock (fire-and-forget: spawns a detached task)
     spawn_release_lock(client, transfer_session_id);
 
-    debug!(
-        "RDMA transfer from {remote_addr} completed: {} blocks",
+    let elapsed = t0.elapsed();
+    let mb = total_bytes as f64 / (1024.0 * 1024.0);
+    info!(
+        "RDMA fetch from {remote_addr}: {}/{} blocks, {mb:.1} MiB in {elapsed:.1?} ({:.0} MiB/s)",
         result.len(),
+        block_hashes.len(),
+        if elapsed.as_secs_f64() > 0.0 {
+            mb / elapsed.as_secs_f64()
+        } else {
+            0.0
+        },
     );
+    let m = core_metrics();
+    let ok = &[KeyValue::new("status", "ok")];
+    m.rdma_fetch_total.add(1, ok);
+    m.rdma_fetch_duration_seconds
+        .record(elapsed.as_secs_f64(), ok);
+    m.rdma_fetch_bytes.add(total_bytes, ok);
     result
 }
 
