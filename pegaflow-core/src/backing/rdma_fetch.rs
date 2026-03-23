@@ -198,16 +198,16 @@ async fn rdma_fetch_task(
     let transfer_session_id = response.transfer_session_id.clone();
 
     // 3. Complete RDMA handshake if we prepared a new connection
-    if let Some(local_meta) = &local_meta {
-        if let Err(e) = finish_handshake(rdma, remote_addr, local_meta, &response.rdma_session_id) {
-            warn!("RDMA handshake to {remote_addr} failed: {e}");
-            rdma.engine().abort_handshake(local_meta);
-            spawn_release_lock(client.clone(), transfer_session_id.clone());
-            core_metrics()
-                .rdma_fetch_total
-                .add(1, &[KeyValue::new("status", "error")]);
-            return Vec::new();
-        }
+    if let Some(local_meta) = &local_meta
+        && let Err(e) = finish_handshake(rdma, remote_addr, local_meta, &response.rdma_session_id)
+    {
+        warn!("RDMA handshake to {remote_addr} failed: {e}");
+        rdma.engine().abort_handshake(local_meta);
+        spawn_release_lock(client.clone(), transfer_session_id.clone());
+        core_metrics()
+            .rdma_fetch_total
+            .add(1, &[KeyValue::new("status", "error")]);
+        return Vec::new();
     }
 
     // 4. RDMA READ all blocks + build SealedBlocks
