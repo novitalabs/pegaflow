@@ -201,7 +201,8 @@ class SchedulerConnector:
 
             # Populate block IDs from scheduler_output — single source of
             # truth for the save path (consistent with offloading connector).
-            self._allocated_blocks[req_id] = list(req.block_ids[0])
+            if req.block_ids:
+                self._allocated_blocks[req_id] = list(req.block_ids[0])
 
             self._scheduled_tokens[req_id] += num_tokens
 
