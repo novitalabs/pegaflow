@@ -133,15 +133,26 @@ message QueryBlocksForTransferRequest {
   string namespace = 1;
   repeated bytes block_hashes = 2;
   string requester_id = 3;             // For lock tracking / logging
-  bytes rdma_handshake = 4;            // Initiator's RDMA HandshakeMetadata (bincode-serialized)
 }
 
 message QueryBlocksForTransferResponse {
   ResponseStatus status = 1;
   repeated TransferBlockInfo blocks = 2;
   string transfer_session_id = 3;       // Opaque session ID for ReleaseTransferLock
-  bytes rdma_session_id = 4;            // 26-byte DomainAddress for RDMA session establishment
-  uint32 lock_timeout_secs = 5;         // Server's transfer lock timeout — client must finish before this
+  uint32 lock_timeout_secs = 4;         // Server's transfer lock timeout — client must finish before this
+}
+
+// RDMA handshake: establish a new RDMA connection between two peers.
+// Caller MUST ensure its own side is not-yet-connected and calls are serialized.
+// Server invalidates any stale connection for this requester before creating fresh QPs.
+message RdmaHandshakeRequest {
+  string requester_id = 1;              // Client's advertise address
+  bytes handshake_metadata = 2;         // Client's HandshakeMetadata (bincode-serialized)
+}
+
+message RdmaHandshakeResponse {
+  ResponseStatus status = 1;
+  bytes handshake_metadata = 2;         // Server's HandshakeMetadata (bincode-serialized)
 }
 
 message ReleaseTransferLockRequest {
@@ -167,6 +178,8 @@ service Engine {
   rpc QueryBlocksForTransfer(QueryBlocksForTransferRequest) returns (QueryBlocksForTransferResponse);
   // Cross-node transfer: release block locks after RDMA transfer completes
   rpc ReleaseTransferLock(ReleaseTransferLockRequest) returns (ReleaseTransferLockResponse);
+  // RDMA handshake: establish a new peer-to-peer RDMA connection
+  rpc RdmaHandshake(RdmaHandshakeRequest) returns (RdmaHandshakeResponse);
   rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
   rpc Health(HealthRequest) returns (HealthResponse);
 }

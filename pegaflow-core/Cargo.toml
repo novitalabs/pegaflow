@@ -34,6 +34,7 @@ dashmap.workspace = true
 smallvec = "1"
 pegaflow-proto = { path = "../pegaflow-proto" }
 pegaflow-transfer = { path = "../pegaflow-transfer" }
+mea = "0.6.3"
 
 [dev-dependencies]
 criterion.workspace = true

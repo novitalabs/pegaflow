@@ -5,10 +5,10 @@ use crate::proto::engine::engine_server::Engine;
 use crate::proto::engine::{
     HealthRequest, HealthResponse, LoadRequest, LoadResponse, PrefetchState,
     QueryBlocksForTransferRequest, QueryBlocksForTransferResponse, QueryRequest, QueryResponse,
-    RegisterContextRequest, RegisterContextResponse, ReleaseTransferLockRequest,
-    ReleaseTransferLockResponse, ResponseStatus, SaveRequest, SaveResponse, ShutdownRequest,
-    ShutdownResponse, TransferBlockInfo, TransferSlotInfo, UnpinRequest, UnpinResponse,
-    UnregisterRequest, UnregisterResponse,
+    RdmaHandshakeRequest, RdmaHandshakeResponse, RegisterContextRequest, RegisterContextResponse,
+    ReleaseTransferLockRequest, ReleaseTransferLockResponse, ResponseStatus, SaveRequest,
+    SaveResponse, ShutdownRequest, ShutdownResponse, TransferBlockInfo, TransferSlotInfo,
+    UnpinRequest, UnpinResponse, UnregisterRequest, UnregisterResponse,
 };
 use crate::registry::CudaTensorRegistry;
 use log::{debug, info, warn};
@@ -629,11 +629,8 @@ impl Engine for GrpcEngineService {
         let hash_count = req.block_hashes.len();
 
         debug!(
-            "RPC [query_blocks_for_transfer]: namespace={} hashes={} requester={} has_rdma_handshake={}",
-            req.namespace,
-            hash_count,
-            req.requester_id,
-            !req.rdma_handshake.is_empty()
+            "RPC [query_blocks_for_transfer]: namespace={} hashes={} requester={}",
+            req.namespace, hash_count, req.requester_id,
         );
 
         const MAX_TRANSFER_BLOCK_HASHES: usize = 1024;
@@ -656,12 +653,6 @@ impl Engine for GrpcEngineService {
                 &req.requester_id,
             );
 
-            // Perform RDMA handshake (handles both new and reused connections)
-            let rdma_session_id = self
-                .engine
-                .rdma_accept_handshake(&req.requester_id, &req.rdma_handshake)
-                .map_err(|e| Status::internal(format!("RDMA handshake failed: {e}")))?;
-
             let blocks: Vec<TransferBlockInfo> = found_blocks
                 .iter()
                 .map(|(key, block)| -> Result<TransferBlockInfo, Status> {
@@ -682,7 +673,6 @@ impl Engine for GrpcEngineService {
                 status: Some(Self::build_simple_response()),
                 blocks,
                 transfer_session_id: session_id,
-                rdma_session_id,
                 lock_timeout_secs: self.engine.transfer_lock_timeout().as_secs() as u32,
             }))
         }
@@ -732,6 +722,51 @@ impl Engine for GrpcEngineService {
             released, elapsed_ms
         );
         record_rpc_result("release_transfer_lock", &result, start);
+        result
+    }
+
+    async fn rdma_handshake(
+        &self,
+        request: Request<RdmaHandshakeRequest>,
+    ) -> Result<Response<RdmaHandshakeResponse>, Status> {
+        let start = Instant::now();
+        let req = request.into_inner();
+
+        debug!("RPC [rdma_handshake]: requester={}", req.requester_id,);
+
+        if !self.engine.has_rdma_transport() {
+            return Err(Status::failed_precondition(
+                "RDMA transfer engine is not configured",
+            ));
+        }
+
+        let result: Result<Response<RdmaHandshakeResponse>, Status> = async {
+            let server_meta = self
+                .engine
+                .rdma_accept_handshake(&req.requester_id, &req.handshake_metadata)
+                .map_err(|e| Status::internal(format!("RDMA handshake failed: {e}")))?;
+
+            Ok(Response::new(RdmaHandshakeResponse {
+                status: Some(Self::build_simple_response()),
+                handshake_metadata: server_meta,
+            }))
+        }
+        .await;
+
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        match &result {
+            Ok(_) => debug!(
+                "RPC [rdma_handshake] completed: ok requester={} elapsed_ms={:.2}",
+                req.requester_id, elapsed_ms
+            ),
+            Err(status) => warn!(
+                "RPC [rdma_handshake] failed: code={} message={} elapsed_ms={:.2}",
+                status.code(),
+                status.message(),
+                elapsed_ms
+            ),
+        }
+        record_rpc_result("rdma_handshake", &result, start);
         result
     }
 

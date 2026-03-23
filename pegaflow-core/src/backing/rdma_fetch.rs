@@ -9,10 +9,11 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use log::{debug, info, warn};
+use mea::singleflight::Group;
 use pegaflow_proto::proto::engine::engine_client::EngineClient;
 use pegaflow_proto::proto::engine::{
-    QueryBlocksForTransferRequest, QueryBlocksForTransferResponse, ReleaseTransferLockRequest,
-    TransferBlockInfo,
+    QueryBlocksForTransferRequest, QueryBlocksForTransferResponse, RdmaHandshakeRequest,
+    ReleaseTransferLockRequest, TransferBlockInfo,
 };
 use pegaflow_transfer::{ConnectionStatus, HandshakeMetadata, TransferDesc, TransferOp};
 use tokio::sync::oneshot;
@@ -47,6 +48,11 @@ pub(crate) struct RdmaFetchStore {
     /// Lazy gRPC channel cache keyed by remote address. Tonic channels multiplex
     /// requests over a single HTTP/2 connection; cloning is cheap.
     grpc_channels: Arc<DashMap<String, EngineClient<Channel>>>,
+    /// Singleflight group to deduplicate concurrent RDMA handshakes to the
+    /// same remote address. Without this, N concurrent fetches to the same
+    /// peer would each create QPs and race on the server, causing all but
+    /// the last handshake's QPs to be invalidated.
+    connect_group: Arc<Group<String, ()>>,
 }
 
 impl RdmaFetchStore {
@@ -63,6 +69,7 @@ impl RdmaFetchStore {
             allocate_fn,
             advertise_addr,
             grpc_channels: Arc::new(DashMap::new()),
+            connect_group: Arc::new(Group::new()),
         }
     }
 
@@ -119,6 +126,7 @@ impl RdmaFetchStore {
         let rdma = Arc::clone(&self.rdma_transport);
         let alloc_fn = Arc::clone(&self.allocate_fn);
         let channels = Arc::clone(&self.grpc_channels);
+        let connect_group = Arc::clone(&self.connect_group);
         let advertise = self.advertise_addr.clone();
         let ns = namespace.to_string();
 
@@ -127,6 +135,7 @@ impl RdmaFetchStore {
                 &rdma,
                 &alloc_fn,
                 &channels,
+                &connect_group,
                 &remote_addr,
                 &advertise,
                 &ns,
@@ -142,15 +151,16 @@ impl RdmaFetchStore {
 
 /// Execute RDMA fetch against a single remote node.
 ///
-/// 1. Check/prepare RDMA connection (local, fail fast)
-/// 2. gRPC channel + QueryBlocksForTransfer RPC
-/// 3. Complete RDMA handshake if new connection
-/// 4. RDMA READ all block segments + build SealedBlocks
-/// 5. ReleaseTransferLock (fire-and-forget, non-blocking)
+/// 1. Ensure RDMA connection (singleflight per remote_addr)
+/// 2. gRPC QueryBlocksForTransfer RPC (connection reuse, no handshake)
+/// 3. RDMA READ all block segments + build SealedBlocks
+/// 4. ReleaseTransferLock (fire-and-forget, non-blocking)
+#[allow(clippy::too_many_arguments)]
 async fn rdma_fetch_task(
     rdma: &RdmaTransport,
     allocate_fn: &AllocateFn,
     grpc_channels: &DashMap<String, EngineClient<Channel>>,
+    connect_group: &Group<String, ()>,
     remote_addr: &str,
     advertise_addr: &str,
     namespace: &str,
@@ -158,36 +168,36 @@ async fn rdma_fetch_task(
 ) -> PrefetchResult {
     let t0 = Instant::now();
 
-    // 1. Check/prepare RDMA connection (local operation — fail fast before gRPC)
-    let local_meta = match rdma.engine().get_or_prepare(remote_addr) {
-        Ok(ConnectionStatus::Existing) => None,
-        Ok(ConnectionStatus::Prepared(m)) => Some(m),
-        Err(e) => {
-            warn!("RDMA prepare connection to {remote_addr} failed: {e}");
-            core_metrics()
-                .rdma_fetch_total
-                .add(1, &[KeyValue::new("status", "error")]);
-            return Vec::new();
-        }
-    };
+    // 1. Ensure RDMA connection (singleflight: at most one handshake per remote_addr)
+    if let Err(e) = ensure_connected(
+        connect_group,
+        rdma,
+        grpc_channels,
+        remote_addr,
+        advertise_addr,
+    )
+    .await
+    {
+        warn!("RDMA connect to {remote_addr} failed: {e}");
+        core_metrics()
+            .rdma_fetch_total
+            .add(1, &[KeyValue::new("status", "error")]);
+        return Vec::new();
+    }
 
-    // 2. gRPC channel + QueryBlocksForTransfer RPC
+    // 2. gRPC QueryBlocksForTransfer (connection already established)
     let (client, response) = match query_remote_blocks(
         grpc_channels,
         remote_addr,
         namespace,
         block_hashes,
         advertise_addr,
-        &local_meta,
     )
     .await
     {
         Ok(cr) => cr,
         Err(e) => {
             warn!("Remote query to {remote_addr} failed: {e}");
-            if let Some(m) = &local_meta {
-                rdma.engine().abort_handshake(m);
-            }
             core_metrics()
                 .rdma_fetch_total
                 .add(1, &[KeyValue::new("status", "error")]);
@@ -197,20 +207,7 @@ async fn rdma_fetch_task(
 
     let transfer_session_id = response.transfer_session_id.clone();
 
-    // 3. Complete RDMA handshake if we prepared a new connection
-    if let Some(local_meta) = &local_meta
-        && let Err(e) = finish_handshake(rdma, remote_addr, local_meta, &response.rdma_session_id)
-    {
-        warn!("RDMA handshake to {remote_addr} failed: {e}");
-        rdma.engine().abort_handshake(local_meta);
-        spawn_release_lock(client.clone(), transfer_session_id.clone());
-        core_metrics()
-            .rdma_fetch_total
-            .add(1, &[KeyValue::new("status", "error")]);
-        return Vec::new();
-    }
-
-    // 4. RDMA READ all blocks + build SealedBlocks
+    // 3. RDMA READ all blocks + build SealedBlocks
     let transfer_timeout = transfer_timeout_from_server(response.lock_timeout_secs);
     let blocks = response.blocks;
     let total_bytes: u64 = blocks
@@ -240,7 +237,7 @@ async fn rdma_fetch_task(
         }
     };
 
-    // 5. Release transfer lock (fire-and-forget: spawns a detached task)
+    // 4. Release transfer lock (fire-and-forget: spawns a detached task)
     spawn_release_lock(client, transfer_session_id);
 
     let elapsed = t0.elapsed();
@@ -262,6 +259,54 @@ async fn rdma_fetch_task(
         .record(elapsed.as_secs_f64(), ok);
     m.rdma_fetch_bytes.add(total_bytes, ok);
     result
+}
+
+/// Ensure an RDMA connection to `remote_addr` exists, using singleflight to
+/// deduplicate concurrent handshakes to the same peer.
+///
+/// On the first call for a given remote, one task performs the full handshake
+/// (prepare QPs → gRPC metadata exchange → complete connection). Concurrent
+/// callers wait for that handshake to finish and then reuse the connection.
+/// If the handshake fails, the error is returned to the leader and waiting
+/// callers retry independently (mea try_work semantics).
+async fn ensure_connected(
+    connect_group: &Group<String, ()>,
+    rdma: &RdmaTransport,
+    grpc_channels: &DashMap<String, EngineClient<Channel>>,
+    remote_addr: &str,
+    advertise_addr: &str,
+) -> Result<(), String> {
+    connect_group
+        .try_work(remote_addr.to_string(), async || {
+            // Fast path: already connected
+            let local_meta = match rdma.engine().get_or_prepare(remote_addr) {
+                Ok(ConnectionStatus::Existing) => return Ok(()),
+                Ok(ConnectionStatus::Prepared(m)) => m,
+                Err(e) => return Err(format!("RDMA prepare: {e}")),
+            };
+
+            // Exchange handshake metadata via the dedicated RdmaHandshake RPC.
+            let mut client = get_or_create_channel(grpc_channels, remote_addr)
+                .inspect_err(|_| rdma.engine().abort_handshake(&local_meta))?;
+
+            let request = RdmaHandshakeRequest {
+                requester_id: advertise_addr.to_string(),
+                handshake_metadata: local_meta.to_bytes(),
+            };
+            let response = client
+                .rdma_handshake(request)
+                .await
+                .map_err(|e| format!("RdmaHandshake RPC failed: {e}"))
+                .inspect_err(|_| rdma.engine().abort_handshake(&local_meta))?
+                .into_inner();
+
+            // Complete the RDMA connection with the server's QP info.
+            finish_handshake(rdma, remote_addr, &local_meta, &response.handshake_metadata)
+                .inspect_err(|_| rdma.engine().abort_handshake(&local_meta))?;
+
+            Ok(())
+        })
+        .await
 }
 
 /// Allocate local memory, build TransferDescs, execute RDMA READ, build SealedBlocks.
@@ -407,7 +452,6 @@ async fn query_remote_blocks(
     namespace: &str,
     block_hashes: &[Vec<u8>],
     advertise_addr: &str,
-    local_meta: &Option<HandshakeMetadata>,
 ) -> Result<(EngineClient<Channel>, QueryBlocksForTransferResponse), String> {
     let mut client = get_or_create_channel(grpc_channels, remote_addr)?;
 
@@ -415,10 +459,6 @@ async fn query_remote_blocks(
         namespace: namespace.to_string(),
         block_hashes: block_hashes.to_vec(),
         requester_id: advertise_addr.to_string(),
-        rdma_handshake: local_meta
-            .as_ref()
-            .map(|m| m.to_bytes())
-            .unwrap_or_default(),
     };
 
     let response = client
@@ -444,7 +484,7 @@ fn finish_handshake(
     remote_bytes: &[u8],
 ) -> Result<(), String> {
     if remote_bytes.is_empty() {
-        return Err("server returned empty rdma_session_id".into());
+        return Err("server returned empty handshake_metadata".into());
     }
     let remote_meta = HandshakeMetadata::from_bytes(remote_bytes)
         .map_err(|e| format!("invalid metadata: {e}"))?;
