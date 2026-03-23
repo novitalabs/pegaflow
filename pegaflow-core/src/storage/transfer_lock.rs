@@ -32,6 +32,10 @@ impl TransferLockManager {
         }
     }
 
+    pub(crate) fn lock_timeout(&self) -> Duration {
+        self.lock_timeout
+    }
+
     /// Lock blocks for a transfer session. Returns the session ID.
     ///
     /// The caller must later call `release()` to free the locks. If the caller

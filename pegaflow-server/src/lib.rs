@@ -158,7 +158,7 @@ pub struct Cli {
 
     /// Transfer lock timeout in seconds. Blocks held for cross-node RDMA transfer are
     /// locked for at most this duration before being force-released (crash recovery).
-    #[arg(long, default_value_t = 300)]
+    #[arg(long, default_value_t = 120)]
     pub transfer_lock_timeout_secs: u64,
 }
 

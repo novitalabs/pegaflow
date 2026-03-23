@@ -602,6 +602,10 @@ impl PegaEngine {
         (session_id, found)
     }
 
+    pub fn transfer_lock_timeout(&self) -> std::time::Duration {
+        self.storage.transfer_lock_timeout()
+    }
+
     /// Release a transfer lock session. Returns the number of blocks released.
     pub fn release_transfer_lock(&self, session_id: &str) -> usize {
         self.storage.release_transfer_lock(session_id)
@@ -688,7 +692,7 @@ mod tests {
             rdma_nic_names: None,
             enable_numa_affinity: false,
             blockwise_alloc: false,
-            transfer_lock_timeout: std::time::Duration::from_secs(300),
+            transfer_lock_timeout: std::time::Duration::from_secs(120),
             metaserver_addr: None,
             advertise_addr: None,
             metaserver_queue_depth: 256,

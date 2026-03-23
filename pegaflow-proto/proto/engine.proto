@@ -141,6 +141,7 @@ message QueryBlocksForTransferResponse {
   repeated TransferBlockInfo blocks = 2;
   string transfer_session_id = 3;       // Opaque session ID for ReleaseTransferLock
   bytes rdma_session_id = 4;            // 26-byte DomainAddress for RDMA session establishment
+  uint32 lock_timeout_secs = 5;         // Server's transfer lock timeout — client must finish before this
 }
 
 message ReleaseTransferLockRequest {

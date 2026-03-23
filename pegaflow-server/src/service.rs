@@ -683,6 +683,7 @@ impl Engine for GrpcEngineService {
                 blocks,
                 transfer_session_id: session_id,
                 rdma_session_id,
+                lock_timeout_secs: self.engine.transfer_lock_timeout().as_secs() as u32,
             }))
         }
         .await;

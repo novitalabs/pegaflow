@@ -63,7 +63,7 @@ impl Default for StorageConfig {
             rdma_nic_names: None,
             enable_numa_affinity: true,
             blockwise_alloc: false,
-            transfer_lock_timeout: Duration::from_secs(300),
+            transfer_lock_timeout: Duration::from_secs(120),
             metaserver_addr: None,
             advertise_addr: None,
             metaserver_queue_depth: crate::internode::DEFAULT_METASERVER_QUEUE_DEPTH,
@@ -442,6 +442,10 @@ impl StorageEngine {
     ) -> String {
         self.transfer_lock
             .lock_blocks(requester_id, blocks.to_vec())
+    }
+
+    pub(crate) fn transfer_lock_timeout(&self) -> Duration {
+        self.transfer_lock.lock_timeout()
     }
 
     /// Release a transfer lock session. Returns the number of blocks released.

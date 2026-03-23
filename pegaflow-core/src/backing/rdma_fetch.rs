@@ -24,10 +24,13 @@ use super::{AllocateFn, PrefetchResult, RdmaTransport};
 use crate::block::{BlockKey, RawBlock, SealedBlock, Segment};
 use crate::internode::MetaServerClient;
 
-/// Timeout for a single RDMA batch transfer. If the NIC hangs or a remote peer
-/// disappears mid-transfer, we give up after this duration instead of blocking
-/// a `spawn_blocking` thread forever.
-const RDMA_TRANSFER_TIMEOUT: Duration = Duration::from_secs(30);
+/// Minimum usable transfer timeout. If the server's lock timeout minus the
+/// safety margin falls below this, we use this floor to avoid instant timeouts.
+const MIN_TRANSFER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Safety margin subtracted from the server's lock timeout. The client must
+/// finish the RDMA transfer before the server releases the lock.
+const LOCK_TIMEOUT_MARGIN: Duration = Duration::from_secs(60);
 
 /// RDMA remote block fetch backing store.
 ///
@@ -194,17 +197,26 @@ async fn rdma_fetch_task(
     }
 
     // 4. RDMA READ all blocks + build SealedBlocks
+    let transfer_timeout = transfer_timeout_from_server(response.lock_timeout_secs);
     let blocks = response.blocks;
-    let result =
-        match fetch_blocks_via_rdma(rdma, allocate_fn, namespace, remote_addr, &blocks).await {
-            Ok(r) => r,
-            Err(e) => {
-                error!("RDMA transfer from {remote_addr} failed: {e}");
-                rdma.engine().invalidate_connection(remote_addr);
-                spawn_release_lock(client, transfer_session_id);
-                return Vec::new();
-            }
-        };
+    let result = match fetch_blocks_via_rdma(
+        rdma,
+        allocate_fn,
+        namespace,
+        remote_addr,
+        &blocks,
+        transfer_timeout,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            error!("RDMA transfer from {remote_addr} failed: {e}");
+            rdma.engine().invalidate_connection(remote_addr);
+            spawn_release_lock(client, transfer_session_id);
+            return Vec::new();
+        }
+    };
 
     // 5. Release transfer lock (fire-and-forget: spawns a detached task)
     spawn_release_lock(client, transfer_session_id);
@@ -223,6 +235,7 @@ async fn fetch_blocks_via_rdma(
     namespace: &str,
     remote_addr: &str,
     blocks: &[TransferBlockInfo],
+    transfer_timeout: Duration,
 ) -> Result<PrefetchResult, String> {
     if blocks.is_empty() {
         return Ok(Vec::new());
@@ -298,7 +311,7 @@ async fn fetch_blocks_via_rdma(
     };
 
     // Offload blocking recv() to a dedicated thread to avoid blocking the async runtime.
-    let _bytes = tokio::task::spawn_blocking(move || rx.recv_timeout(RDMA_TRANSFER_TIMEOUT))
+    let _bytes = tokio::task::spawn_blocking(move || rx.recv_timeout(transfer_timeout))
         .await
         .map_err(|e| format!("RDMA transfer task panicked: {e}"))?
         .map_err(|e| format!("RDMA transfer timed out or channel closed: {e}"))?
@@ -402,6 +415,16 @@ fn finish_handshake(
     rdma.engine()
         .complete_handshake(remote_addr, local_meta, &remote_meta)
         .map_err(|e| format!("{e}"))
+}
+
+/// Compute client-side transfer timeout from server's lock timeout.
+/// Returns `max(server_timeout - 60s, 10s)` so the client always finishes
+/// before the server force-releases the lock.
+fn transfer_timeout_from_server(lock_timeout_secs: u32) -> Duration {
+    let server = Duration::from_secs(lock_timeout_secs as u64);
+    server
+        .saturating_sub(LOCK_TIMEOUT_MARGIN)
+        .max(MIN_TRANSFER_TIMEOUT)
 }
 
 /// Release a transfer lock in a detached task. Does not block the caller.
