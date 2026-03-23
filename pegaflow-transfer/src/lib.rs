@@ -3,7 +3,9 @@ mod error;
 mod rc_backend;
 pub mod rdma_topo;
 
-pub use engine::{HandshakeMetadata, MemoryRegion, TransferDesc, TransferEngine, TransferOp};
+pub use engine::{
+    ConnectionStatus, HandshakeMetadata, MemoryRegion, TransferDesc, TransferEngine, TransferOp,
+};
 pub use error::{Result, TransferError};
 
 pub fn init_logging() {

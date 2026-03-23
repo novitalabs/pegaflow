@@ -13,9 +13,7 @@ use std::{mem, ptr, thread};
 use clap::Parser;
 use pegaflow_common::read_cpu_topology_from_sysfs;
 use pegaflow_transfer::rdma_topo::SystemTopology;
-use pegaflow_transfer::{
-    HandshakeMetadata, MemoryRegion, TransferDesc, TransferEngine, TransferOp, init_logging,
-};
+use pegaflow_transfer::{MemoryRegion, TransferDesc, TransferEngine, TransferOp, init_logging};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -218,9 +216,9 @@ impl Drop for NumaBuffer {
 
 struct EngineContext {
     label: String,
+    #[allow(dead_code)]
     server: TransferEngine,
     client: TransferEngine,
-    server_hs: HandshakeMetadata,
     server_buf: NumaBuffer,
     client_buf: NumaBuffer,
 }
@@ -324,7 +322,7 @@ fn run_bench(
         let start = Instant::now();
         let rx = ctx
             .client
-            .batch_transfer_async(op, &ctx.server_hs, &descs)
+            .batch_transfer_async(op, "bench-server", &descs)
             .expect("RDMA submit failed");
         rx.recv()
             .expect("completion channel dropped")
@@ -445,25 +443,36 @@ fn create_engine_context(
         }])
         .expect("client register_memory failed");
 
-    // Handshake: both sides prepare, then accept each other.
-    let server_hs = server
-        .prepare_handshake()
-        .expect("server prepare_handshake failed");
-    let client_hs = client
-        .prepare_handshake()
-        .expect("client prepare_handshake failed");
+    // Handshake: both sides prepare, then complete handshake to each other.
+    let server_meta = match server
+        .get_or_prepare("bench-client")
+        .expect("server get_or_prepare failed")
+    {
+        pegaflow_transfer::ConnectionStatus::Prepared(m) => m,
+        pegaflow_transfer::ConnectionStatus::Existing => {
+            panic!("unexpected existing connection on fresh engine")
+        }
+    };
+    let client_meta = match client
+        .get_or_prepare("bench-server")
+        .expect("client get_or_prepare failed")
+    {
+        pegaflow_transfer::ConnectionStatus::Prepared(m) => m,
+        pegaflow_transfer::ConnectionStatus::Existing => {
+            panic!("unexpected existing connection on fresh engine")
+        }
+    };
     server
-        .accept_handshake(&client_hs)
-        .expect("server accept_handshake failed");
+        .complete_handshake("bench-client", &server_meta, &client_meta)
+        .expect("server complete_handshake failed");
     client
-        .accept_handshake(&server_hs)
-        .expect("client accept_handshake failed");
+        .complete_handshake("bench-server", &client_meta, &server_meta)
+        .expect("client complete_handshake failed");
 
     EngineContext {
         label,
         server,
         client,
-        server_hs,
         server_buf,
         client_buf,
     }

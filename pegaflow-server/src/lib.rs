@@ -155,6 +155,11 @@ pub struct Cli {
     /// MetaServer registration queue depth (max pending registration batches).
     #[arg(long, default_value_t = pegaflow_core::DEFAULT_METASERVER_QUEUE_DEPTH)]
     pub metaserver_queue_depth: usize,
+
+    /// Transfer lock timeout in seconds. Blocks held for cross-node RDMA transfer are
+    /// locked for at most this duration before being force-released (crash recovery).
+    #[arg(long, default_value_t = 120)]
+    pub transfer_lock_timeout_secs: u64,
 }
 
 fn parse_sample_rate(s: &str) -> Result<f64, String> {
@@ -407,6 +412,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         }
     });
 
+    let advertise_addr = cli
+        .metaserver_addr
+        .as_ref()
+        .map(|_| resolve_advertise_addr(cli.advertise_addr.as_deref(), &cli.addr));
+
     let storage_config = pegaflow_core::StorageConfig {
         enable_lfu_admission: cli.enable_lfu_admission,
         hint_value_size_bytes: cli.hint_value_size,
@@ -415,7 +425,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         rdma_nic_names: cli.nics.clone(),
         enable_numa_affinity: !cli.disable_numa_affinity,
         blockwise_alloc: cli.blockwise_alloc,
-        transfer_lock_timeout: None, // configured when RDMA transfer engine is wired
+        transfer_lock_timeout: Duration::from_secs(cli.transfer_lock_timeout_secs),
+        metaserver_addr: cli.metaserver_addr.clone(),
+        advertise_addr,
+        metaserver_queue_depth: cli.metaserver_queue_depth,
     };
 
     if cli.enable_lfu_admission {
@@ -443,31 +456,17 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let shutdown = Arc::new(Notify::new());
 
     runtime.block_on(async move {
-        // Create MetaServer registrar if --metaserver-addr is set
-        let metaserver_registrar = cli.metaserver_addr.as_ref().map(|addr| {
-            let advertise = resolve_advertise_addr(cli.advertise_addr.as_deref(), &cli.addr);
-            info!(
-                "MetaServer registration enabled: metaserver={}, advertise={}, queue_depth={}",
-                addr, advertise, cli.metaserver_queue_depth
-            );
-            let config = pegaflow_core::MetaServerRegistrarConfig::new(addr.clone(), advertise)
-                .with_queue_depth(cli.metaserver_queue_depth);
-            Arc::new(pegaflow_core::MetaServerRegistrar::new(config))
-        });
-
         // Create PegaEngine inside tokio runtime context (needed for SSD cache tokio::spawn)
         let engine = Arc::new(PegaEngine::new_with_config(
             cli.pool_size,
             cli.use_hugepages,
             storage_config,
-            metaserver_registrar,
         ));
 
         let service = GrpcEngineService::new(
             Arc::clone(&engine),
             Arc::clone(&registry),
             Arc::clone(&shutdown),
-            None, // rdma_session_id: wired in cross-node fetch PR
         );
 
         // Spawn background GC task for stale inflight blocks

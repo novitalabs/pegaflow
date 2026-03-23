@@ -13,7 +13,7 @@ use sideway::ibverbs::AccessFlags;
 
 use self::runtime::RcRuntime;
 use self::session::{RcSession, RdmaOp};
-use self::state::{RcBackendState, RegisteredMemoryEntry};
+use self::state::{AddrConnection, RcBackendState, RegisteredMemoryEntry};
 use std::ptr::NonNull;
 
 use crate::engine::{NicHandshake, RegisteredMemoryRegion, TransferDesc, TransferOp};
@@ -88,6 +88,11 @@ impl NumaRoundRobin {
         }
         self.fallback.next()
     }
+}
+
+pub(crate) enum GetOrPrepareResult {
+    Existing,
+    NeedHandshake(Vec<NicHandshake>),
 }
 
 pub(crate) struct RcBackend {
@@ -198,7 +203,7 @@ impl RcBackend {
 
     /// Create one RC QP per NIC in INIT state, push to per-NIC pending queues,
     /// return per-NIC handshake data.
-    pub(crate) fn prepare_handshake(&self) -> Result<Vec<NicHandshake>> {
+    fn prepare_handshake(&self) -> Result<Vec<NicHandshake>> {
         let snapshots = self.snapshot_registered_memory();
         let mut nic_handshakes = Vec::with_capacity(self.nic_count());
 
@@ -223,8 +228,25 @@ impl RcBackend {
         Ok(nic_handshakes)
     }
 
-    /// Connect all pending QPs to the remote peer (responder path).
-    pub(crate) fn accept_handshake(&self, remote_nics: &[NicHandshake]) -> Result<()> {
+    /// Check if connected to remote_addr; if not, prepare local QPs.
+    pub(crate) fn get_or_prepare(&self, remote_addr: &str) -> Result<GetOrPrepareResult> {
+        {
+            let state = self.state.lock();
+            if state.addr_connections.contains_key(remote_addr) {
+                return Ok(GetOrPrepareResult::Existing);
+            }
+        }
+        let nics = self.prepare_handshake()?;
+        Ok(GetOrPrepareResult::NeedHandshake(nics))
+    }
+
+    /// Complete a connection after handshake exchange.
+    pub(crate) fn complete_handshake_for(
+        &self,
+        remote_addr: &str,
+        local_nics: Vec<NicHandshake>,
+        remote_nics: &[NicHandshake],
+    ) -> Result<()> {
         let nic_count = self.nic_count();
         if remote_nics.len() != nic_count {
             return Err(TransferError::InvalidArgument(
@@ -232,57 +254,95 @@ impl RcBackend {
             ));
         }
 
-        // Pop all pending sessions under one lock.
-        let pending_sessions: Vec<Arc<RcSession>> = {
+        // Pop pending sessions by matching QPN from local_nics (not blind FIFO).
+        // Concurrent prepare/complete for different remote addrs could reorder the
+        // queue, so we must find our own sessions by QPN.
+        let pending: Vec<Arc<RcSession>> = {
             let mut state = self.state.lock();
+            // If already connected (concurrent request beat us), remove our pending sessions
+            if state.addr_connections.contains_key(remote_addr) {
+                for (nic_idx, nic) in local_nics.iter().enumerate() {
+                    state.nics[nic_idx].remove_pending_by_qpn(nic.endpoint.qp_num);
+                }
+                return Ok(());
+            }
             let mut sessions = Vec::with_capacity(nic_count);
-            for nic_idx in 0..nic_count {
-                let session =
-                    state.nics[nic_idx]
-                        .pending
-                        .pop_front()
-                        .ok_or(TransferError::Backend(
-                            "no pending session to accept".to_string(),
-                        ))?;
+            for (nic_idx, nic) in local_nics.iter().enumerate() {
+                let session = state.nics[nic_idx]
+                    .remove_pending_by_qpn(nic.endpoint.qp_num)
+                    .ok_or(TransferError::Backend(
+                        "no pending session to complete".to_string(),
+                    ))?;
                 sessions.push(session);
             }
             sessions
         };
 
-        // Connect all outside lock.
-        for (nic_idx, session) in pending_sessions.iter().enumerate() {
+        // Connect outside lock
+        for (nic_idx, session) in pending.iter().enumerate() {
             session.connect(&self.runtimes[nic_idx], &remote_nics[nic_idx].endpoint)?;
         }
 
-        // Re-lock and insert all sessions + cache remote memory.
+        // Store sessions + addr_connections
         let mut state = self.state.lock();
-        for (nic_idx, session) in pending_sessions.into_iter().enumerate() {
+        let mut remote_qpns = Vec::with_capacity(nic_count);
+        for (nic_idx, session) in pending.into_iter().enumerate() {
             let remote = &remote_nics[nic_idx];
             let remote_qpn = remote.endpoint.qp_num;
             state.nics[nic_idx].cache_remote_memory(remote_qpn, &remote.memory_regions)?;
             state.nics[nic_idx].sessions.insert(remote_qpn, session);
+            remote_qpns.push(remote_qpn);
         }
+        state.addr_connections.insert(
+            remote_addr.to_string(),
+            AddrConnection {
+                remote_qpns,
+                local_nics,
+            },
+        );
         Ok(())
+    }
+
+    /// Drop pending sessions created by get_or_prepare when handshake failed.
+    pub(crate) fn abort_handshake(&self, local_nics: &[NicHandshake]) {
+        let mut state = self.state.lock();
+        for (nic_idx, nic) in local_nics.iter().enumerate() {
+            state.nics[nic_idx].remove_pending_by_qpn(nic.endpoint.qp_num);
+        }
+    }
+
+    /// Get local NicHandshake metadata for an established connection.
+    pub(crate) fn local_meta_for_addr(&self, remote_addr: &str) -> Option<Vec<NicHandshake>> {
+        let state = self.state.lock();
+        state
+            .addr_connections
+            .get(remote_addr)
+            .map(|c| c.local_nics.clone())
+    }
+
+    /// Remove connection state on transfer failure.
+    pub(crate) fn invalidate_connection(&self, remote_addr: &str) {
+        let mut state = self.state.lock();
+        if let Some(conn) = state.addr_connections.remove(remote_addr) {
+            for (nic_idx, &remote_qpn) in conn.remote_qpns.iter().enumerate() {
+                state.nics[nic_idx].cleanup_connection(remote_qpn);
+            }
+        }
     }
 
     pub(crate) fn batch_transfer_async(
         &self,
         op: TransferOp,
-        remote_nics: &[NicHandshake],
+        remote_addr: &str,
         descs: &[TransferDesc],
     ) -> Result<std::sync::mpsc::Receiver<Result<usize>>> {
-        let nic_count = self.nic_count();
-        if remote_nics.len() != nic_count {
-            return Err(TransferError::InvalidArgument(
-                "remote NIC count mismatch in transfer",
-            ));
-        }
-
         if descs.is_empty() {
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
             let _ = tx.send(Ok(0));
             return Ok(rx);
         }
+
+        let nic_count = self.nic_count();
 
         // NUMA-aware NIC assignment: query the NUMA node of each descriptor's
         // first page and route to a NIC on the same NUMA node.
@@ -305,46 +365,19 @@ impl RcBackend {
             }
         }
 
-        // --- Lock: lazy connect + prepare ops ---
+        // --- Lock: look up connection + prepare ops ---
         let lookup_start = Instant::now();
         let mut nic_work: Vec<(Arc<RcSession>, Vec<RdmaOp>)> = Vec::new();
         {
-            let mut state = self.state.lock();
+            let state = self.state.lock();
 
-            // Lazy connect: if NIC 0 has no session for the remote peer, connect all NICs.
-            let nic0_remote_qpn = remote_nics[0].endpoint.qp_num;
-            if !state.nics[0].sessions.contains_key(&nic0_remote_qpn) {
-                // Pop pending from all NICs.
-                let mut pending_sessions = Vec::with_capacity(nic_count);
-                for nic_idx in 0..nic_count {
-                    let session =
-                        state.nics[nic_idx]
-                            .pending
-                            .pop_front()
-                            .ok_or(TransferError::Backend(
-                                "no pending session for lazy connect".to_string(),
-                            ))?;
-                    pending_sessions.push(session);
-                }
-                drop(state);
-
-                // Connect all outside lock.
-                for (nic_idx, session) in pending_sessions.iter().enumerate() {
-                    session.connect(&self.runtimes[nic_idx], &remote_nics[nic_idx].endpoint)?;
-                }
-
-                state = self.state.lock();
-                for (nic_idx, session) in pending_sessions.into_iter().enumerate() {
-                    let remote_qpn = remote_nics[nic_idx].endpoint.qp_num;
-                    if !state.nics[nic_idx].sessions.contains_key(&remote_qpn) {
-                        state.nics[nic_idx].cache_remote_memory(
-                            remote_qpn,
-                            &remote_nics[nic_idx].memory_regions,
-                        )?;
-                        state.nics[nic_idx].sessions.insert(remote_qpn, session);
-                    }
-                }
-            }
+            let conn = state
+                .addr_connections
+                .get(remote_addr)
+                .ok_or(TransferError::Backend(format!(
+                    "no connection for remote addr {remote_addr}"
+                )))?;
+            let remote_qpns = &conn.remote_qpns;
 
             // Prepare ops for each NIC that has work.
             for nic_idx in 0..nic_count {
@@ -353,12 +386,12 @@ impl RcBackend {
                     continue;
                 }
 
-                let remote_qpn = remote_nics[nic_idx].endpoint.qp_num;
+                let remote_qpn = remote_qpns[nic_idx];
                 let session = Arc::clone(
                     state.nics[nic_idx]
                         .sessions
                         .get(&remote_qpn)
-                        .expect("session must exist after lazy connect"),
+                        .expect("session must exist for established connection"),
                 );
 
                 let mut prepared = Vec::with_capacity(nic_descs.len());

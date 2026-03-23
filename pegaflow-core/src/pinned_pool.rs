@@ -33,6 +33,11 @@ impl PinnedAllocation {
     pub(crate) fn as_mut_ptr(&mut self) -> *mut u8 {
         self.ptr.as_ptr()
     }
+
+    /// Get the underlying NonNull pointer.
+    pub(crate) fn as_non_null(&self) -> NonNull<u8> {
+        self.ptr
+    }
 }
 
 impl Drop for PinnedAllocation {

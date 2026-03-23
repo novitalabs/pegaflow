@@ -22,6 +22,11 @@ unsafe impl Send for RdmaTransport {}
 unsafe impl Sync for RdmaTransport {}
 
 impl RdmaTransport {
+    /// Access the underlying transfer engine for active RDMA operations.
+    pub(crate) fn engine(&self) -> &TransferEngine {
+        &self.engine
+    }
+
     /// Create a new RDMA transport and register all pinned memory regions.
     fn new(nic_names: &[String], allocator: &PinnedAllocator) -> Result<Self, String> {
         let t0 = Instant::now();

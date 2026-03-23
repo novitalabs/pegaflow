@@ -120,13 +120,13 @@ message TransferSlotInfo {
   uint64 k_size = 2;     // Size of the K segment in bytes (per-segment, not total slot size)
   uint64 v_ptr = 3;      // Remote pinned memory address for V segment (0 if contiguous)
   uint64 v_size = 4;     // Size of the V segment in bytes (0 if contiguous)
+  uint32 numa_node = 5;  // NUMA node where this slot's memory resides (for RDMA NIC affinity)
 }
 
 // Cross-node transfer: per-block RDMA metadata
 message TransferBlockInfo {
   bytes block_hash = 1;
   repeated TransferSlotInfo slots = 2;  // One per TP slot
-  uint32 rkey = 3;                      // RDMA remote key for this memory region
 }
 
 message QueryBlocksForTransferRequest {
@@ -139,7 +139,20 @@ message QueryBlocksForTransferResponse {
   ResponseStatus status = 1;
   repeated TransferBlockInfo blocks = 2;
   string transfer_session_id = 3;       // Opaque session ID for ReleaseTransferLock
-  bytes rdma_session_id = 4;            // 26-byte DomainAddress for RDMA session establishment
+  uint32 lock_timeout_secs = 4;         // Server's transfer lock timeout — client must finish before this
+}
+
+// RDMA handshake: establish a new RDMA connection between two peers.
+// Caller MUST ensure its own side is not-yet-connected and calls are serialized.
+// Server invalidates any stale connection for this requester before creating fresh QPs.
+message RdmaHandshakeRequest {
+  string requester_id = 1;              // Client's advertise address
+  bytes handshake_metadata = 2;         // Client's HandshakeMetadata (bincode-serialized)
+}
+
+message RdmaHandshakeResponse {
+  ResponseStatus status = 1;
+  bytes handshake_metadata = 2;         // Server's HandshakeMetadata (bincode-serialized)
 }
 
 message ReleaseTransferLockRequest {
@@ -165,6 +178,8 @@ service Engine {
   rpc QueryBlocksForTransfer(QueryBlocksForTransferRequest) returns (QueryBlocksForTransferResponse);
   // Cross-node transfer: release block locks after RDMA transfer completes
   rpc ReleaseTransferLock(ReleaseTransferLockRequest) returns (ReleaseTransferLockResponse);
+  // RDMA handshake: establish a new peer-to-peer RDMA connection
+  rpc RdmaHandshake(RdmaHandshakeRequest) returns (RdmaHandshakeResponse);
   rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
   rpc Health(HealthRequest) returns (HealthResponse);
 }

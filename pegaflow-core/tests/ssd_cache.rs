@@ -25,18 +25,12 @@ async fn ssd_smoke_roundtrip_with_temp_dir() {
         HarnessConfig::new("test-ssd-smoke", "test-ns-ssd", NUM_BLOCKS, BLOCK_SIZE)
             .with_hash_salt(44)
             .with_storage_config(StorageConfig {
-                enable_lfu_admission: false,
-                hint_value_size_bytes: None,
-                max_prefetch_blocks: 100,
                 ssd_cache_config: Some(SsdCacheConfig {
                     cache_path: cache_path.clone(),
                     capacity_bytes: SSD_CAPACITY,
                     ..SsdCacheConfig::default()
                 }),
-                rdma_nic_names: None,
-                enable_numa_affinity: false,
-                blockwise_alloc: false,
-                transfer_lock_timeout: None,
+                ..StorageConfig::default()
             }),
     );
 
