@@ -463,12 +463,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         )
     })?;
 
-    crate::metric::init_hll_tracker(
-        cli.metric_hll_slot_secs,
-        cli.metric_hll_window_secs,
-        cli.metric_hll_bucket_bits,
-    );
-    crate::metric::register_hll_gauges();
+    let hll_tracker = Arc::new(std::sync::Mutex::new(
+        pegaflow_common::hll::HllTracker::new(
+            Duration::from_secs(cli.metric_hll_slot_secs),
+            Duration::from_secs(cli.metric_hll_window_secs),
+            cli.metric_hll_bucket_bits,
+        ),
+    ));
+    crate::metric::register_hll_gauges(&hll_tracker);
 
     let shutdown = Arc::new(Notify::new());
 
@@ -498,6 +500,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             Arc::clone(&registry),
             Arc::clone(&shutdown),
             None, // rdma_session_id: wired in cross-node fetch PR
+            Arc::clone(&hll_tracker),
         );
 
         // Spawn background GC task for stale inflight blocks

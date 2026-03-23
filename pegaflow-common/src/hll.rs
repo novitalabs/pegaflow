@@ -3,13 +3,15 @@
 //! Provides a minimal HyperLogLog implementation and a sliding-window tracker
 //! for estimating the theoretical maximum cache hit rate over a time window.
 //!
-//! Hash inputs are fixed-size SHA-256 (32 bytes / 256 bits).
+//! Hash inputs must be at least 4 bytes and should have good uniformity
+//! (e.g. SHA-256, xxHash). Longer hashes give more leading-zero headroom.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-/// Block hashes are SHA-256: 32 bytes, 256 bits.
-const HASH_BYTES: usize = 32;
+/// Minimum hash length in bytes. The first 3 bytes are used for bucket
+/// indexing (up to 18 bits) and byte 4 starts the leading-zero scan.
+const MIN_HASH_BYTES: usize = 4;
 
 /// Allowed range for `bucket_bits` (register index width).
 pub const MIN_BUCKET_BITS: u8 = 4;
@@ -50,12 +52,20 @@ impl HyperLogLog {
         }
     }
 
-    /// Insert a SHA-256 block hash (exactly [`HASH_BYTES`] bytes).
+    /// Insert a block hash (at least [`MIN_HASH_BYTES`] bytes).
     ///
     /// Treats the hash as a big-endian bit stream:
     /// - Top `bucket_bits` bits → register index
-    /// - Remaining 256 − `bucket_bits` bits → count leading zeros (ρ)
-    pub fn insert(&mut self, hash: &[u8; HASH_BYTES]) {
+    /// - Remaining bits → count leading zeros (ρ)
+    ///
+    /// # Panics
+    /// Panics if `hash.len() < MIN_HASH_BYTES`.
+    pub fn insert(&mut self, hash: &[u8]) {
+        assert!(
+            hash.len() >= MIN_HASH_BYTES,
+            "hash must be at least {MIN_HASH_BYTES} bytes, got {}",
+            hash.len()
+        );
         let index = bucket_index(hash, self.bucket_bits);
         let rho = count_leading_zeros(hash, self.bucket_bits, self.lz_mask) + 1;
 
@@ -99,13 +109,13 @@ impl HyperLogLog {
 // ============================================================================
 
 /// Top `bucket_bits` bits of the hash as a register index (bucket_bits ≤ 18 → 3 bytes suffice).
-fn bucket_index(hash: &[u8; HASH_BYTES], bucket_bits: u8) -> usize {
+fn bucket_index(hash: &[u8], bucket_bits: u8) -> usize {
     let val = u32::from_be_bytes([0, hash[0], hash[1], hash[2]]);
     (val >> (24 - bucket_bits as u32)) as usize
 }
 
 /// Leading zeros in the remaining bits after the bucket index.
-fn count_leading_zeros(hash: &[u8; HASH_BYTES], bucket_bits: u8, lz_mask: u32) -> u8 {
+fn count_leading_zeros(hash: &[u8], bucket_bits: u8, lz_mask: u32) -> u8 {
     let head = u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]);
     let masked = head & lz_mask;
     if masked != 0 {
@@ -245,13 +255,13 @@ impl HllTracker {
         }
     }
 
-    /// Record a block hash request (SHA-256 hash).
+    /// Record a block hash request.
     ///
     /// Lazily creates/rotates slots. Slot boundaries are aligned to multiples of
     /// `slot_duration` from the first slot, so gaps without requests don't cause
     /// time drift. For example with 1h slots: if the first slot starts at 0:00
     /// and the next request arrives at 1:30, the new slot starts at 1:00 (not 1:30).
-    pub fn record(&mut self, hash: &[u8; HASH_BYTES]) {
+    pub fn record(&mut self, hash: &[u8]) {
         let now = Instant::now();
 
         let need_new_slot = match self.slots.back() {
@@ -281,6 +291,17 @@ impl HllTracker {
         let slot = self.slots.back_mut().unwrap();
         slot.hll.insert(hash);
         slot.request_count += 1;
+    }
+
+    /// Record a batch of block hashes from a gRPC request.
+    ///
+    /// Hashes shorter than [`MIN_HASH_BYTES`] bytes are silently skipped.
+    pub fn record_hashes(&mut self, hashes: &[Vec<u8>]) {
+        for hash in hashes {
+            if hash.len() >= MIN_HASH_BYTES {
+                self.record(hash);
+            }
+        }
     }
 
     /// Compute and return the current metric snapshot.
@@ -446,8 +467,8 @@ mod tests {
 
     // ---- Bit-level helper tests ----
 
-    fn make_hash(first3: [u8; 3]) -> [u8; HASH_BYTES] {
-        let mut h = [0u8; HASH_BYTES];
+    fn make_hash(first3: [u8; 3]) -> [u8; 32] {
+        let mut h = [0u8; 32];
         h[0] = first3[0];
         h[1] = first3[1];
         h[2] = first3[2];
@@ -465,38 +486,38 @@ mod tests {
         );
     }
 
-    fn lz(hash: &[u8; HASH_BYTES], bits: u8) -> u8 {
+    fn lz(hash: &[u8], bits: u8) -> u8 {
         count_leading_zeros(hash, bits, (1u32 << (32 - bits)) - 1)
     }
 
     #[test]
     fn count_leading_zeros_all_ones() {
-        assert_eq!(lz(&[0xFF; HASH_BYTES], 4), 0);
+        assert_eq!(lz(&[0xFF; 32], 4), 0);
     }
 
     #[test]
     fn count_leading_zeros_all_zero() {
         // 32-14=18 from head, then 28 zero bytes → 18 + 224 = 242
-        assert_eq!(lz(&[0u8; HASH_BYTES], 14), 242);
+        assert_eq!(lz(&[0u8; 32], 14), 242);
     }
 
     #[test]
     fn count_leading_zeros_hit_in_head() {
-        let mut h = [0u8; HASH_BYTES];
+        let mut h = [0u8; 32];
         h[1] = 0x01; // head=0x00010000, masked lz=15 - 14 = 1
         assert_eq!(lz(&h, 14), 1);
     }
 
     #[test]
     fn count_leading_zeros_hit_in_tail() {
-        let mut h = [0u8; HASH_BYTES];
+        let mut h = [0u8; 32];
         h[5] = 0x80; // 18 from head + (5-4)*8 + 0 = 26
         assert_eq!(lz(&h, 14), 26);
     }
 
     #[test]
     fn count_leading_zeros_byte_aligned() {
-        let mut h = [0u8; HASH_BYTES];
+        let mut h = [0u8; 32];
         h[1] = 0x01; // head masked lz=15 - 8 = 7
         assert_eq!(lz(&h, 8), 7);
     }
@@ -663,8 +684,8 @@ mod tests {
     }
 
     /// Generate a pseudo-SHA256 hash from an integer for testing.
-    fn sha256_like(n: u32) -> [u8; HASH_BYTES] {
-        let mut hash = [0u8; HASH_BYTES];
+    fn sha256_like(n: u32) -> [u8; 32] {
+        let mut hash = [0u8; 32];
         let m0 = splitmix64(n as u64);
         hash[..8].copy_from_slice(&m0.to_le_bytes());
         let m1 = splitmix64(m0);

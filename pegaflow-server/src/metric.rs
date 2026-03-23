@@ -1,29 +1,9 @@
 use opentelemetry::metrics::{Counter, Histogram, ObservableGauge};
 use opentelemetry::{KeyValue, global};
 use pegaflow_common::hll::HllTracker;
-use std::sync::{LazyLock, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::time::Instant;
 use tonic::Status;
-
-static HLL_TRACKER: OnceLock<Mutex<HllTracker>> = OnceLock::new();
-
-/// Initialize the global HLL tracker. Must be called once at startup.
-pub fn init_hll_tracker(slot_secs: u64, window_secs: u64, bucket_bits: u8) {
-    HLL_TRACKER.get_or_init(|| {
-        Mutex::new(HllTracker::new(
-            Duration::from_secs(slot_secs),
-            Duration::from_secs(window_secs),
-            bucket_bits,
-        ))
-    });
-}
-
-/// Access the global HLL tracker.
-pub fn hll_tracker() -> &'static Mutex<HllTracker> {
-    HLL_TRACKER
-        .get()
-        .expect("HLL tracker not initialized; call init_hll_tracker() first")
-}
 
 struct HllGaugeHandles {
     _hit_rate: ObservableGauge<f64>,
@@ -33,16 +13,20 @@ struct HllGaugeHandles {
 
 static HLL_GAUGES: OnceLock<HllGaugeHandles> = OnceLock::new();
 
-/// Register HLL observable gauges. Must be called after `init_hll_tracker`.
-pub fn register_hll_gauges() {
+/// Register HLL observable gauges backed by the given tracker.
+pub fn register_hll_gauges(tracker: &Arc<Mutex<HllTracker>>) {
+    let t1 = Arc::clone(tracker);
+    let t2 = Arc::clone(tracker);
+    let t3 = Arc::clone(tracker);
+
     HLL_GAUGES.get_or_init(|| {
         let meter = global::meter("pegaflow-core");
 
         let hit_rate = meter
             .f64_observable_gauge("pegaflow_hll_estimated_hit_rate")
             .with_description("Estimated cache hit rate assuming infinite cache [0.0, 1.0]")
-            .with_callback(|observer| {
-                if let Ok(mut t) = hll_tracker().lock() {
+            .with_callback(move |observer| {
+                if let Ok(mut t) = t1.lock() {
                     observer.observe(t.metric().estimated_hit_rate, &[]);
                 }
             })
@@ -51,8 +35,8 @@ pub fn register_hll_gauges() {
         let cardinality = meter
             .f64_observable_gauge("pegaflow_hll_cardinality")
             .with_description("Estimated distinct blocks seen in the sliding window")
-            .with_callback(|observer| {
-                if let Ok(mut t) = hll_tracker().lock() {
+            .with_callback(move |observer| {
+                if let Ok(mut t) = t2.lock() {
                     observer.observe(t.metric().cardinality, &[]);
                 }
             })
@@ -61,8 +45,8 @@ pub fn register_hll_gauges() {
         let total_requests = meter
             .u64_observable_gauge("pegaflow_hll_total_requests")
             .with_description("Total block requests in the sliding window")
-            .with_callback(|observer| {
-                if let Ok(mut t) = hll_tracker().lock() {
+            .with_callback(move |observer| {
+                if let Ok(mut t) = t3.lock() {
                     observer.observe(t.metric().total_requests, &[]);
                 }
             })
@@ -74,17 +58,6 @@ pub fn register_hll_gauges() {
             _total_requests: total_requests,
         }
     });
-}
-
-/// Record block hashes into the HLL tracker for hit rate estimation.
-pub fn record_hll_hashes(block_hashes: &[Vec<u8>]) {
-    if let Ok(mut tracker) = hll_tracker().lock() {
-        for hash in block_hashes {
-            if let Ok(h) = <&[u8; 32]>::try_from(hash.as_slice()) {
-                tracker.record(h);
-            }
-        }
-    }
 }
 
 struct RpcMetrics {
