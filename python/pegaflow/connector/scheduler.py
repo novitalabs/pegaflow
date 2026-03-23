@@ -144,7 +144,6 @@ class SchedulerConnector:
         num_external_tokens: int,
     ) -> None:
         req_id = request.request_id
-        block_ids = list(blocks.get_block_ids()[0]) if blocks else []
 
         # Keep a live reference so we can refresh block_hashes during decode
         # (Request.block_hashes grows as new full blocks are completed).
@@ -154,11 +153,14 @@ class SchedulerConnector:
         # (1 hash per scheduler block = block_size * dcp_world_size tokens).
         # They are 1-to-1 with block_ids from the scheduler.
         self._block_hashes[req_id] = tuple(request.block_hashes)
-        self._allocated_blocks[req_id] = block_ids
+        # Save-path block IDs populated by build_connector_meta from
+        # scheduler_output (single source of truth, like offloading connector).
+        self._allocated_blocks[req_id] = []
         self._scheduled_tokens[req_id] = 0
         self._stored_blocks[req_id] = 0
 
         if num_external_tokens > 0:
+            block_ids = list(blocks.get_block_ids()[0]) if blocks else []
             # num_external_tokens is in global token space; divide by
             # virtual_block_size to get the number of pool blocks to load.
             num_load_blocks = num_external_tokens // self._ctx.virtual_block_size
@@ -197,14 +199,9 @@ class SchedulerConnector:
                 f"req {req_id} not initialized in update_state_after_alloc"
             )
 
-            # In MultiConnector mode, update_state_after_alloc only passes
-            # real blocks to the "chosen" connector (the one that returned
-            # matched tokens). Non-chosen connectors receive empty blocks,
-            # which leaves allocated_blocks incomplete for save intents.
-            # Fix: read the full block IDs from scheduler_output directly,
-            # which always contains the complete allocation.
-            if req.block_ids:
-                self._allocated_blocks[req_id] = list(req.block_ids[0])
+            # Populate block IDs from scheduler_output — single source of
+            # truth for the save path (consistent with offloading connector).
+            self._allocated_blocks[req_id] = list(req.block_ids[0])
 
             self._scheduled_tokens[req_id] += num_tokens
 
