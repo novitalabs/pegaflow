@@ -101,14 +101,14 @@ class CudaIPCWrapper:
         """Create IPC wrapper from a CUDA tensor.
 
         Args:
-            tensor: PyTorch CUDA tensor to wrap. Must be contiguous and
-                   have zero storage offset.
+            tensor: PyTorch CUDA tensor to wrap. Must have zero storage offset.
+                   The tensor does not need to be contiguous — IPC operates on
+                   the underlying storage, which is always contiguous.
 
         Raises:
-            AssertionError: If tensor is not contiguous or has non-zero offset.
+            AssertionError: If tensor has non-zero storage offset.
         """
         assert tensor.storage_offset() == 0, "Tensor must have zero storage offset"
-        assert tensor.is_contiguous(), "Tensor must be contiguous"
 
         # Get the underlying storage and create IPC handle
         storage = tensor.untyped_storage()
