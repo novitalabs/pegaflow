@@ -51,6 +51,8 @@ pub struct StorageConfig {
     pub advertise_addr: Option<String>,
     /// MetaServer registration queue depth.
     pub metaserver_queue_depth: usize,
+    /// Number of shards for the pinned memory pool (reduces allocator lock contention).
+    pub pool_shards: usize,
 }
 
 impl Default for StorageConfig {
@@ -67,6 +69,7 @@ impl Default for StorageConfig {
             metaserver_addr: None,
             advertise_addr: None,
             metaserver_queue_depth: crate::internode::DEFAULT_METASERVER_QUEUE_DEPTH,
+            pool_shards: 1,
         }
     }
 }
@@ -118,6 +121,7 @@ impl StorageEngine {
         }
 
         let ssd_enabled = ssd_cache_config.is_some();
+        let pool_shards = config.pool_shards;
 
         // Create unified allocator based on NUMA configuration
         let allocator = if !numa_nodes.is_empty() {
@@ -128,6 +132,7 @@ impl StorageEngine {
             Arc::new(PinnedAllocator::new_numa(
                 capacity_bytes,
                 numa_nodes,
+                pool_shards,
                 use_hugepages,
                 ssd_enabled,
                 unit_hint,
@@ -136,6 +141,7 @@ impl StorageEngine {
             info!("Creating global pinned pool (NUMA affinity disabled)");
             Arc::new(PinnedAllocator::new_global(
                 capacity_bytes,
+                pool_shards,
                 use_hugepages,
                 ssd_enabled,
                 unit_hint,

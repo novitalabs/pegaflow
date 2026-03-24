@@ -132,6 +132,11 @@ pub struct Cli {
     #[arg(long, default_value_t = 1.0, value_parser = parse_sample_rate)]
     pub trace_sample_rate: f64,
 
+    /// Number of shards for the pinned memory pool (reduces allocator lock contention).
+    /// The pool is split into this many independent sub-pools with round-robin allocation.
+    #[arg(long, default_value_t = 1)]
+    pub pool_shards: usize,
+
     /// Allocate each block separately instead of contiguous batch allocation.
     /// Reduces memory fragmentation when blocks are freed in different order.
     #[arg(long, default_value_t = false)]
@@ -452,8 +457,15 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         metaserver_addr: cli.metaserver_addr.clone(),
         advertise_addr,
         metaserver_queue_depth: cli.metaserver_queue_depth,
+        pool_shards: cli.pool_shards,
     };
 
+    if cli.pool_shards > 1 {
+        info!(
+            "Pinned memory pool sharding enabled: {} shards",
+            cli.pool_shards
+        );
+    }
     if cli.enable_lfu_admission {
         info!("TinyLFU cache admission enabled");
     }
