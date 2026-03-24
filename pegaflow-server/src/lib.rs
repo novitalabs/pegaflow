@@ -499,7 +499,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             Arc::clone(&engine),
             Arc::clone(&registry),
             Arc::clone(&shutdown),
-            None, // rdma_session_id: wired in cross-node fetch PR
             Arc::clone(&hll_tracker),
         );
 

@@ -9,7 +9,6 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-
 /// Allowed range for `bucket_bits` (register index width).
 pub const MIN_BUCKET_BITS: u8 = 4;
 pub const MAX_BUCKET_BITS: u8 = 18;
@@ -107,7 +106,12 @@ fn byte_or_zero(hash: &[u8], index: usize) -> u8 {
 
 /// Top `bucket_bits` bits of the hash as a register index (bucket_bits ≤ 18 → 3 bytes suffice).
 fn bucket_index(hash: &[u8], bucket_bits: u8) -> usize {
-    let val = u32::from_be_bytes([0, byte_or_zero(hash, 0), byte_or_zero(hash, 1), byte_or_zero(hash, 2)]);
+    let val = u32::from_be_bytes([
+        0,
+        byte_or_zero(hash, 0),
+        byte_or_zero(hash, 1),
+        byte_or_zero(hash, 2),
+    ]);
     (val >> (24 - bucket_bits as u32)) as usize
 }
 
