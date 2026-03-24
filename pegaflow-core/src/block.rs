@@ -227,8 +227,8 @@ impl SealedBlock {
         &self.slots
     }
 
-    /// Per-slot NUMA affinity for SSD write path.
-    pub(crate) fn slot_numas(&self) -> &[NumaNode] {
+    /// Per-slot NUMA affinity (used by SSD write path and cross-node transfer).
+    pub fn slot_numas(&self) -> &[NumaNode] {
         &self.slot_numas
     }
 

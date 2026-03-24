@@ -8,7 +8,7 @@ use log::warn;
 use parking_lot::Mutex;
 use tokio::sync::oneshot;
 
-use crate::backing::{PrefetchResult, SsdBackingStore};
+use crate::backing::{PrefetchResult, RdmaFetchStore, SsdBackingStore};
 use crate::block::{BlockKey, PrefetchStatus};
 use crate::metrics::core_metrics;
 
@@ -39,17 +39,23 @@ impl PrefetchState {
 pub(super) struct PrefetchScheduler {
     state: Mutex<PrefetchState>,
     ssd_store: Option<Arc<SsdBackingStore>>,
+    rdma_fetch: Option<Arc<RdmaFetchStore>>,
     max_prefetch_blocks: usize,
 }
 
 impl PrefetchScheduler {
-    pub(super) fn new(ssd_store: Option<Arc<SsdBackingStore>>, max_prefetch_blocks: usize) -> Self {
+    pub(super) fn new(
+        ssd_store: Option<Arc<SsdBackingStore>>,
+        rdma_fetch: Option<Arc<RdmaFetchStore>>,
+        max_prefetch_blocks: usize,
+    ) -> Self {
         Self {
             state: Mutex::new(PrefetchState {
                 active: HashMap::new(),
                 inflight_count: 0,
             }),
             ssd_store,
+            rdma_fetch,
             max_prefetch_blocks,
         }
     }
@@ -159,6 +165,23 @@ impl PrefetchScheduler {
             && let Some(ssd) = &self.ssd_store
         {
             let (found, rx) = ssd.submit_prefix(check_keys);
+            if found > 0 {
+                self.state.lock().inflight_count += found;
+                loading = found;
+                blocks_rx = Some(rx);
+            }
+        }
+
+        // If nothing is loading from SSD and there are no local hits at all,
+        // try RDMA remote fetch from another node.
+        if loading == 0
+            && hit == 0
+            && !remaining.is_empty()
+            && let Some(rdma_fetch) = &self.rdma_fetch
+        {
+            let (found, rx) = rdma_fetch
+                .submit_remote_fetch(namespace, remaining.to_vec())
+                .await;
             if found > 0 {
                 self.state.lock().inflight_count += found;
                 loading = found;

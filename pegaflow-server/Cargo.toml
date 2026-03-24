@@ -43,5 +43,8 @@ prometheus.workspace = true
 tikv-jemallocator.workspace = true
 fastrace = { workspace = true, features = ["enable"], optional = true }
 
+[dev-dependencies]
+pegaflow-metaserver = { path = "../pegaflow-metaserver" }
+
 [build-dependencies]
 pyo3-build-config.workspace = true

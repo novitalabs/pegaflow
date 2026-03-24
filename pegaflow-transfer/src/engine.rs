@@ -3,7 +3,7 @@ use std::ptr::NonNull;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, TransferError};
-use crate::rc_backend::RcBackend;
+use crate::rc_backend::{GetOrPrepareResult, RcBackend};
 
 /// RDMA operation type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,6 +89,15 @@ impl HandshakeMetadata {
     }
 }
 
+/// Connection status for a remote peer.
+pub enum ConnectionStatus {
+    /// Already connected; call batch_transfer_async directly.
+    Existing,
+    /// Not connected. Exchange this local metadata with remote peer via gRPC,
+    /// then call complete_handshake. On failure, call abort_handshake.
+    Prepared(HandshakeMetadata),
+}
+
 pub struct TransferEngine {
     backend: RcBackend,
 }
@@ -114,40 +123,60 @@ impl TransferEngine {
         Ok(())
     }
 
-    /// Create one RC QP per NIC (INIT state) and return handshake metadata
-    /// containing per-NIC endpoints and snapshots of all registered memory.
-    ///
-    /// Call after `register_memory`, serialize with [`HandshakeMetadata::to_bytes`],
-    /// and send to the remote peer.
-    pub fn prepare_handshake(&self) -> Result<HandshakeMetadata> {
-        let nics = self.backend.prepare_handshake()?;
-        Ok(HandshakeMetadata { nics })
+    /// Check if already connected to the remote peer; if not, prepare local
+    /// QPs and return the handshake metadata that must be exchanged via gRPC.
+    pub fn get_or_prepare(&self, remote_addr: &str) -> Result<ConnectionStatus> {
+        match self.backend.get_or_prepare(remote_addr)? {
+            GetOrPrepareResult::Existing => Ok(ConnectionStatus::Existing),
+            GetOrPrepareResult::NeedHandshake(nics) => {
+                Ok(ConnectionStatus::Prepared(HandshakeMetadata { nics }))
+            }
+        }
     }
 
-    /// Connect all prepared QPs to the remote peer (RTR→RTS).
-    ///
-    /// Called by the **responder** after receiving the initiator's metadata.
-    /// The responder should call [`prepare_handshake`](Self::prepare_handshake) first
-    /// to create its own QPs, then `accept_handshake` to immediately connect them.
-    pub fn accept_handshake(&self, remote: &HandshakeMetadata) -> Result<()> {
-        self.backend.accept_handshake(&remote.nics)
+    /// Complete a connection after exchanging handshake metadata with the peer.
+    pub fn complete_handshake(
+        &self,
+        remote_addr: &str,
+        local_meta: &HandshakeMetadata,
+        remote_meta: &HandshakeMetadata,
+    ) -> Result<()> {
+        self.backend
+            .complete_handshake_for(remote_addr, local_meta.nics.clone(), &remote_meta.nics)
     }
 
-    /// Submit a batch of RDMA READ or WRITE operations against a peer.
+    /// Drop pending sessions created by get_or_prepare when handshake failed.
+    pub fn abort_handshake(&self, local_meta: &HandshakeMetadata) {
+        self.backend.abort_handshake(&local_meta.nics);
+    }
+
+    /// Return cached local handshake metadata for an established connection.
+    pub fn local_meta_for(&self, remote_addr: &str) -> Option<HandshakeMetadata> {
+        self.backend
+            .local_meta_for_addr(remote_addr)
+            .map(|nics| HandshakeMetadata { nics })
+    }
+
+    /// Remove cached connection state on transfer failure.
+    pub fn invalidate_connection(&self, remote_addr: &str) {
+        self.backend.invalidate_connection(remote_addr);
+    }
+
+    /// Submit a batch of RDMA READ or WRITE operations against a connected peer.
     ///
-    /// Ops are round-robin distributed across NICs. Returns a `Receiver`
+    /// Ops are NUMA-aware distributed across NICs. Returns a `Receiver`
     /// that yields the total bytes transferred once all RDMA operations complete.
     /// The caller decides when to block on `.recv()`.
     ///
-    /// On the **initiator** side, the first call lazily connects QPs to the
-    /// peer. Subsequent calls reuse the existing long-lived connections.
+    /// The connection must be established via `get_or_prepare` +
+    /// `complete_handshake` before calling this method.
     pub fn batch_transfer_async(
         &self,
         op: TransferOp,
-        peer: &HandshakeMetadata,
+        remote_addr: &str,
         descs: &[TransferDesc],
     ) -> Result<std::sync::mpsc::Receiver<Result<usize>>> {
-        self.backend.batch_transfer_async(op, &peer.nics, descs)
+        self.backend.batch_transfer_async(op, remote_addr, descs)
     }
 }
 

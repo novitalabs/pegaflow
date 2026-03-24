@@ -11,10 +11,12 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use crate::backing::{
-    AllocateFn, DEFAULT_MAX_PREFETCH_BLOCKS, RdmaTransport, SsdBackingStore, SsdCacheConfig,
+    AllocateFn, DEFAULT_MAX_PREFETCH_BLOCKS, RdmaFetchStore, RdmaTransport, SsdBackingStore,
+    SsdCacheConfig,
 };
 use crate::block::{BlockKey, PrefetchStatus, SealedBlock};
-use crate::internode::MetaServerRegistrar;
+use crate::internode::MetaServerClient;
+use crate::internode::metaserver_client::MetaServerClientConfig;
 use crate::metrics::core_metrics;
 use crate::pinned_pool::{PinnedAllocation, PinnedAllocator};
 use pegaflow_common::NumaNode;
@@ -41,8 +43,14 @@ pub struct StorageConfig {
     /// Allocate each block separately instead of contiguous batch allocation.
     /// Reduces fragmentation when blocks are freed in different order.
     pub blockwise_alloc: bool,
-    /// Transfer lock timeout for cross-node RDMA transfers (None = disabled).
-    pub transfer_lock_timeout: Option<Duration>,
+    /// Transfer lock timeout for cross-node RDMA transfers.
+    pub transfer_lock_timeout: Duration,
+    /// MetaServer address for p2p block discovery + registration (None = disabled).
+    pub metaserver_addr: Option<String>,
+    /// This node's advertise address for MetaServer registration + transfer lock requester_id.
+    pub advertise_addr: Option<String>,
+    /// MetaServer registration queue depth.
+    pub metaserver_queue_depth: usize,
 }
 
 impl Default for StorageConfig {
@@ -55,7 +63,10 @@ impl Default for StorageConfig {
             rdma_nic_names: None,
             enable_numa_affinity: true,
             blockwise_alloc: false,
-            transfer_lock_timeout: None,
+            transfer_lock_timeout: Duration::from_secs(120),
+            metaserver_addr: None,
+            advertise_addr: None,
+            metaserver_queue_depth: crate::internode::DEFAULT_METASERVER_QUEUE_DEPTH,
         }
     }
 }
@@ -66,11 +77,10 @@ pub(crate) struct StorageEngine {
     prefetch: PrefetchScheduler,
     write_pipeline: Arc<WritePipeline>,
     ssd_store: Option<Arc<SsdBackingStore>>,
-    /// Held for RAII: Drop unregisters RDMA memory regions.
-    _rdma_transport: Option<Arc<RdmaTransport>>,
+    rdma_transport: Option<Arc<RdmaTransport>>,
     blockwise_alloc: bool,
-    metaserver_registrar: Option<Arc<MetaServerRegistrar>>,
-    transfer_lock: Option<Arc<transfer_lock::TransferLockManager>>,
+    metaserver_client: Option<Arc<MetaServerClient>>,
+    transfer_lock: Arc<transfer_lock::TransferLockManager>,
 }
 
 impl StorageEngine {
@@ -79,7 +89,6 @@ impl StorageEngine {
         use_hugepages: bool,
         config: StorageConfig,
         numa_nodes: &[NumaNode],
-        metaserver_registrar: Option<Arc<MetaServerRegistrar>>,
     ) -> Arc<Self> {
         let value_size_hint = config.hint_value_size_bytes.filter(|size| *size > 0);
         let unit_hint = value_size_hint.and_then(|size| NonZeroU64::new(size as u64));
@@ -88,6 +97,21 @@ impl StorageEngine {
         let rdma_nic_names = config.rdma_nic_names;
         let blockwise_alloc = config.blockwise_alloc;
         let transfer_lock_timeout = config.transfer_lock_timeout;
+
+        // Create MetaServer client if configured
+        let metaserver_client = config.metaserver_addr.as_ref().map(|addr| {
+            let advertise = config
+                .advertise_addr
+                .clone()
+                .unwrap_or_else(|| "127.0.0.1:50055".to_string());
+            info!(
+                "MetaServer client enabled: metaserver={}, advertise={}, queue_depth={}",
+                addr, advertise, config.metaserver_queue_depth
+            );
+            let ms_config = MetaServerClientConfig::new(addr.clone(), advertise)
+                .with_queue_depth(config.metaserver_queue_depth);
+            Arc::new(MetaServerClient::new(ms_config))
+        });
 
         if blockwise_alloc {
             info!("Blockwise allocation enabled for batch_save");
@@ -148,10 +172,26 @@ impl StorageEngine {
             let ssd_store = ssd_cache_config
                 .and_then(|cfg| crate::backing::new_ssd(cfg, allocate_fn.clone(), is_numa));
 
-            let prefetch = PrefetchScheduler::new(ssd_store.clone(), max_prefetch_blocks);
+            let rdma_fetch = rdma_transport.as_ref().and_then(|rdma| {
+                let ms = metaserver_client.as_ref()?;
+                let advertise = config
+                    .advertise_addr
+                    .clone()
+                    .unwrap_or_else(|| "127.0.0.1:50055".to_string());
+                Some(Arc::new(RdmaFetchStore::new(
+                    Arc::clone(ms),
+                    Arc::clone(rdma),
+                    allocate_fn.clone(),
+                    advertise,
+                )))
+            });
 
-            let transfer_lock =
-                transfer_lock_timeout.map(|t| Arc::new(transfer_lock::TransferLockManager::new(t)));
+            let prefetch =
+                PrefetchScheduler::new(ssd_store.clone(), rdma_fetch, max_prefetch_blocks);
+
+            let transfer_lock = Arc::new(transfer_lock::TransferLockManager::new(
+                transfer_lock_timeout,
+            ));
 
             Self {
                 allocator,
@@ -159,9 +199,9 @@ impl StorageEngine {
                 prefetch,
                 write_pipeline: write_pipeline.clone(),
                 ssd_store,
-                _rdma_transport: rdma_transport,
+                rdma_transport,
                 blockwise_alloc,
-                metaserver_registrar,
+                metaserver_client,
                 transfer_lock,
             }
         });
@@ -171,7 +211,7 @@ impl StorageEngine {
             let deps = Arc::new(InsertDeps {
                 read_cache: engine.read_cache.clone(),
                 ssd_store: engine.ssd_store.clone(),
-                metaserver_registrar: engine.metaserver_registrar.clone(),
+                metaserver_client: engine.metaserver_client.clone(),
             });
             let weak_deps = Arc::downgrade(&deps);
             // Keep deps alive by leaking it into the thread. The worker holds
@@ -395,35 +435,27 @@ impl StorageEngine {
     }
 
     /// Lock blocks for a transfer session, returning the session ID.
-    /// Returns an empty string if transfer locks are disabled.
     pub(crate) fn lock_blocks_for_transfer(
         &self,
         requester_id: &str,
         blocks: &[(BlockKey, Arc<SealedBlock>)],
     ) -> String {
-        if let Some(lock_mgr) = &self.transfer_lock {
-            lock_mgr.lock_blocks(requester_id, blocks.to_vec())
-        } else {
-            String::new()
-        }
+        self.transfer_lock
+            .lock_blocks(requester_id, blocks.to_vec())
+    }
+
+    pub(crate) fn transfer_lock_timeout(&self) -> Duration {
+        self.transfer_lock.lock_timeout()
     }
 
     /// Release a transfer lock session. Returns the number of blocks released.
     pub(crate) fn release_transfer_lock(&self, session_id: &str) -> usize {
-        if let Some(lock_mgr) = &self.transfer_lock {
-            lock_mgr.release(session_id)
-        } else {
-            0
-        }
+        self.transfer_lock.release(session_id)
     }
 
     /// GC expired transfer lock sessions. Returns the number of sessions expired.
     pub(crate) fn gc_expired_transfer_locks(&self) -> usize {
-        if let Some(lock_mgr) = &self.transfer_lock {
-            lock_mgr.gc_expired()
-        } else {
-            0
-        }
+        self.transfer_lock.gc_expired()
     }
 
     /// Return `(base_ptr, size)` for each contiguous pinned memory region.
@@ -436,9 +468,8 @@ impl StorageEngine {
             .collect()
     }
 
-    #[allow(dead_code)] // used when RDMA transfer engine is wired
-    pub(crate) fn allocator(&self) -> Arc<PinnedAllocator> {
-        Arc::clone(&self.allocator)
+    pub(crate) fn rdma_transport(&self) -> Option<&Arc<RdmaTransport>> {
+        self.rdma_transport.as_ref()
     }
 }
 
@@ -460,7 +491,7 @@ mod tests {
     use super::*;
 
     fn make_engine() -> Arc<StorageEngine> {
-        StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[], None)
+        StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[])
     }
 
     #[tokio::test]
@@ -524,8 +555,7 @@ mod tests {
     async fn allocate_bounded_reclaim_terminates() {
         // With a tiny pool, allocation of a huge block should fail fast
         // (not loop forever) thanks to MAX_RECLAIM_ROUNDS.
-        let storage =
-            StorageEngine::new_with_config(4096, false, StorageConfig::default(), &[], None);
+        let storage = StorageEngine::new_with_config(4096, false, StorageConfig::default(), &[]);
 
         // Try to allocate more than the entire pool
         let result = storage.allocate(NonZeroU64::new(1 << 30).unwrap(), None);
@@ -655,34 +685,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lock_blocks_for_transfer_returns_empty_when_disabled() {
-        // Default config has transfer_lock_timeout = None (disabled)
-        let storage = make_engine();
-        let key = BlockKey::new("ns".into(), vec![1]);
-        let block = Arc::new(SealedBlock::from_slots(Vec::new()));
-
-        let session_id = storage.lock_blocks_for_transfer("node-a", &[(key, block)]);
-        assert!(
-            session_id.is_empty(),
-            "lock_blocks_for_transfer should return empty string when disabled"
-        );
-    }
-
-    #[tokio::test]
-    async fn release_transfer_lock_returns_zero_when_disabled() {
-        let storage = make_engine();
-        let released = storage.release_transfer_lock("some-session-id");
-        assert_eq!(released, 0);
-    }
-
-    #[tokio::test]
-    async fn gc_expired_transfer_locks_returns_zero_when_disabled() {
-        let storage = make_engine();
-        let expired = storage.gc_expired_transfer_locks();
-        assert_eq!(expired, 0);
-    }
-
-    #[tokio::test]
     async fn pinned_memory_regions_returns_non_empty() {
         let storage = make_engine();
         let regions = storage.pinned_memory_regions();
@@ -697,17 +699,9 @@ mod tests {
         }
     }
 
-    fn make_engine_with_transfer_lock() -> Arc<StorageEngine> {
-        let config = StorageConfig {
-            transfer_lock_timeout: Some(Duration::from_secs(30)),
-            ..StorageConfig::default()
-        };
-        StorageEngine::new_with_config(1 << 20, false, config, &[], None)
-    }
-
     #[tokio::test]
     async fn lock_and_release_transfer_when_enabled() {
-        let storage = make_engine_with_transfer_lock();
+        let storage = make_engine();
         let key = BlockKey::new("ns".into(), vec![1]);
         let block = Arc::new(SealedBlock::from_slots(Vec::new()));
 

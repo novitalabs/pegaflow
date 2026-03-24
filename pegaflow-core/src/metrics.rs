@@ -58,6 +58,11 @@ pub(crate) struct CoreMetrics {
     // Cross-node transfer lock (serving side)
     pub transfer_lock_active: UpDownCounter<i64>,
     pub transfer_lock_timeouts_total: Counter<u64>,
+
+    // RDMA remote fetch (client side)
+    pub rdma_fetch_total: Counter<u64>,
+    pub rdma_fetch_duration_seconds: Histogram<f64>,
+    pub rdma_fetch_bytes: Counter<u64>,
 }
 
 fn init_meter() -> Meter {
@@ -68,6 +73,20 @@ fn init_meter() -> Meter {
 fn ssd_throughput_boundaries() -> Vec<f64> {
     // 1.0e9, 2.0e9, 3.0e9, ..., 40.0e9 (40 buckets in bytes/s)
     (1..=40).map(|i| i as f64 * 1.0e9).collect()
+}
+
+/// Histogram boundaries for RDMA remote fetch (gRPC + handshake + RDMA READ).
+fn rdma_fetch_duration_boundaries() -> Vec<f64> {
+    vec![
+        0.01, // 10ms
+        0.02, // 20ms
+        0.05, // 50ms
+        0.1,  // 100ms
+        0.2,  // 200ms
+        0.5,  // 500ms
+        1.0,  // 1s
+        2.0,  // 2s
+    ]
 }
 
 /// Custom histogram boundaries for duration in seconds (1ms to 5s)
@@ -274,6 +293,23 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
             transfer_lock_timeouts_total: meter
                 .u64_counter("pegaflow_transfer_lock_timeouts_total")
                 .with_description("Transfer lock sessions expired by timeout (potential issue)")
+                .build(),
+
+            // RDMA remote fetch (client side)
+            rdma_fetch_total: meter
+                .u64_counter("pegaflow_rdma_fetch_total")
+                .with_description("RDMA remote fetch attempts (status=ok|error)")
+                .build(),
+            rdma_fetch_duration_seconds: meter
+                .f64_histogram("pegaflow_rdma_fetch_duration")
+                .with_unit("s")
+                .with_description("End-to-end RDMA fetch latency (gRPC + handshake + RDMA READ)")
+                .with_boundaries(rdma_fetch_duration_boundaries())
+                .build(),
+            rdma_fetch_bytes: meter
+                .u64_counter("pegaflow_rdma_fetch_bytes")
+                .with_unit("bytes")
+                .with_description("Total bytes fetched via RDMA from remote nodes")
                 .build(),
         }
     })

@@ -16,7 +16,6 @@ pub mod block;
 mod cache;
 pub mod gpu_worker;
 pub mod instance;
-#[allow(dead_code)]
 pub mod internode;
 pub use pegaflow_common::logging;
 mod metrics;
@@ -36,9 +35,7 @@ pub use block::{
     BlockHash, BlockKey, BlockStatus, LayerBlock, LayerSave, PrefetchStatus, RawBlock, SealedBlock,
 };
 pub use instance::{GpuContext, InstanceContext, KVCacheRegistration};
-pub use internode::{
-    DEFAULT_METASERVER_QUEUE_DEPTH, MetaServerRegistrar, MetaServerRegistrarConfig,
-};
+pub use internode::{DEFAULT_METASERVER_QUEUE_DEPTH, MetaServerClient, MetaServerClientConfig};
 pub use pegaflow_common::NumaNode;
 use pegaflow_common::NumaTopology;
 pub use pinned_pool::PinnedAllocation;
@@ -150,7 +147,6 @@ impl PegaEngine {
             DEFAULT_PINNED_POOL_BYTES,
             false,
             storage::StorageConfig::default(),
-            None,
         )
     }
 
@@ -159,13 +155,10 @@ impl PegaEngine {
     /// If `storage_config.enable_numa_affinity` is true and the system has multiple
     /// NUMA nodes, per-node pinned memory pools are created for optimal bandwidth.
     ///
-    /// `metaserver_registrar` enables automatic block hash registration with the
-    /// centralized MetaServer when blocks are sealed.
     pub fn new_with_config(
         pool_size: usize,
         use_hugepages: bool,
         storage_config: storage::StorageConfig,
-        metaserver_registrar: Option<Arc<MetaServerRegistrar>>,
     ) -> Self {
         let topology = Arc::new(NumaTopology::detect());
         topology.log_summary();
@@ -181,13 +174,7 @@ impl PegaEngine {
             vec![]
         };
 
-        let storage = StorageEngine::new_with_config(
-            pool_size,
-            use_hugepages,
-            config,
-            &numa_nodes,
-            metaserver_registrar,
-        );
+        let storage = StorageEngine::new_with_config(pool_size, use_hugepages, config, &numa_nodes);
 
         PegaEngine {
             instances: RwLock::new(HashMap::new()),
@@ -615,6 +602,10 @@ impl PegaEngine {
         (session_id, found)
     }
 
+    pub fn transfer_lock_timeout(&self) -> std::time::Duration {
+        self.storage.transfer_lock_timeout()
+    }
+
     /// Release a transfer lock session. Returns the number of blocks released.
     pub fn release_transfer_lock(&self, session_id: &str) -> usize {
         self.storage.release_transfer_lock(session_id)
@@ -631,9 +622,58 @@ impl PegaEngine {
         self.storage.pinned_memory_regions()
     }
 
-    #[allow(dead_code)] // used when RDMA transfer engine is wired
-    pub(crate) fn pinned_allocator(&self) -> Arc<pinned_pool::PinnedAllocator> {
-        self.storage.allocator()
+    /// Returns true if RDMA transport is available.
+    pub fn has_rdma_transport(&self) -> bool {
+        self.storage.rdma_transport().is_some()
+    }
+
+    /// Perform server-side RDMA handshake with connection reuse.
+    ///
+    /// If `client_handshake_bytes` is empty, the client believes it is already
+    /// connected -- return our cached local metadata (or empty if not found).
+    /// Otherwise, establish (or re-establish) a connection to the client.
+    ///
+    /// Returns `Err` if the handshake fails (bad client metadata, QP creation, etc.).
+    pub fn rdma_accept_handshake(
+        &self,
+        client_addr: &str,
+        client_handshake_bytes: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let rdma = self
+            .storage
+            .rdma_transport()
+            .ok_or_else(|| "RDMA transport not configured".to_string())?;
+
+        if client_handshake_bytes.is_empty() {
+            // Client thinks it's already connected -- return our cached meta if we have it
+            return Ok(rdma
+                .engine()
+                .local_meta_for(client_addr)
+                .map(|m| m.to_bytes())
+                .unwrap_or_default());
+        }
+
+        let client_meta = pegaflow_transfer::HandshakeMetadata::from_bytes(client_handshake_bytes)
+            .map_err(|e| format!("invalid client handshake metadata: {e}"))?;
+
+        // Client sent handshake bytes → it has no connection. If we have a stale
+        // one (e.g. client restarted), tear it down so get_or_prepare creates fresh QPs.
+        rdma.engine().invalidate_connection(client_addr);
+
+        let server_meta = match rdma
+            .engine()
+            .get_or_prepare(client_addr)
+            .map_err(|e| format!("get_or_prepare failed: {e}"))?
+        {
+            pegaflow_transfer::ConnectionStatus::Prepared(m) => m,
+            pegaflow_transfer::ConnectionStatus::Existing => {
+                unreachable!("just invalidated connection for {client_addr}")
+            }
+        };
+        rdma.engine()
+            .complete_handshake(client_addr, &server_meta, &client_meta)
+            .map_err(|e| format!("complete_handshake failed: {e}"))?;
+        Ok(server_meta.to_bytes())
     }
 }
 
@@ -652,9 +692,12 @@ mod tests {
             rdma_nic_names: None,
             enable_numa_affinity: false,
             blockwise_alloc: false,
-            transfer_lock_timeout: None,
+            transfer_lock_timeout: std::time::Duration::from_secs(120),
+            metaserver_addr: None,
+            advertise_addr: None,
+            metaserver_queue_depth: 256,
         };
-        let engine = PegaEngine::new_with_config(1 << 20, false, config, None);
+        let engine = PegaEngine::new_with_config(1 << 20, false, config);
 
         // Manually insert an InstanceContext (no GPU required)
         let instance = InstanceContext::new(

@@ -19,13 +19,16 @@ pub fn test_engine() -> PegaEngine {
         rdma_nic_names: None,
         enable_numa_affinity: false,
         blockwise_alloc: false,
-        transfer_lock_timeout: None,
+        transfer_lock_timeout: Duration::from_secs(120),
+        metaserver_addr: None,
+        advertise_addr: None,
+        metaserver_queue_depth: 256,
     })
 }
 
 pub fn test_engine_with_storage_config(config: StorageConfig) -> PegaEngine {
     // 16 MB pool — enough for test blocks, small enough to be fast.
-    PegaEngine::new_with_config(16 << 20, false, config, None)
+    PegaEngine::new_with_config(16 << 20, false, config)
 }
 
 /// Layer registration info for batch registration.
