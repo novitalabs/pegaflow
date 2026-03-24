@@ -696,6 +696,7 @@ mod tests {
             metaserver_addr: None,
             advertise_addr: None,
             metaserver_queue_depth: 256,
+            pool_shards: 1,
         };
         let engine = PegaEngine::new_with_config(1 << 20, false, config);
 
