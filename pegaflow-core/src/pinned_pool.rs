@@ -4,8 +4,8 @@ use std::{
     num::NonZeroU64,
     ptr::NonNull,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
 };
 
@@ -15,7 +15,7 @@ use log::{error, info, warn};
 use crate::allocator::{Allocation, ScaledOffsetAllocator};
 use crate::metrics::core_metrics;
 use crate::pinned_mem::PinnedMemory;
-use pegaflow_common::{run_on_numa, NumaNode};
+use pegaflow_common::{NumaNode, run_on_numa};
 
 /// RAII guard for a pinned memory allocation.
 /// Automatically frees the allocation when dropped.
