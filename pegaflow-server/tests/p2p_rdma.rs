@@ -157,7 +157,14 @@ async fn spawn_engine_server(engine: Arc<PegaEngine>, port: u16) {
     let registry = CudaTensorRegistry::new().expect("CudaTensorRegistry::new");
     let registry = Arc::new(Mutex::new(registry));
     let shutdown = Arc::new(Notify::new());
-    let service = GrpcEngineService::new(engine, registry, shutdown);
+    let hll_tracker = Arc::new(std::sync::Mutex::new(
+        pegaflow_common::hll::HllTracker::new(
+            Duration::from_secs(3600),
+            Duration::from_secs(86400),
+            14,
+        ),
+    ));
+    let service = GrpcEngineService::new(engine, registry, shutdown, hll_tracker);
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
     tokio::spawn(async move {
         Server::builder()

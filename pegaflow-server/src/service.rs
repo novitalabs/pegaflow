@@ -25,6 +25,7 @@ pub struct GrpcEngineService {
     engine: Arc<PegaEngine>,
     registry: Arc<Mutex<CudaTensorRegistry>>,
     shutdown: Arc<Notify>,
+    hll_tracker: Arc<std::sync::Mutex<pegaflow_common::hll::HllTracker>>,
 }
 
 impl GrpcEngineService {
@@ -32,11 +33,13 @@ impl GrpcEngineService {
         engine: Arc<PegaEngine>,
         registry: Arc<Mutex<CudaTensorRegistry>>,
         shutdown: Arc<Notify>,
+        hll_tracker: Arc<std::sync::Mutex<pegaflow_common::hll::HllTracker>>,
     ) -> Self {
         Self {
             engine,
             registry,
             shutdown,
+            hll_tracker,
         }
     }
 
@@ -419,6 +422,10 @@ impl Engine for GrpcEngineService {
                 req.block_hashes.len()
             );
 
+            if let Ok(mut t) = self.hll_tracker.lock() {
+                t.record_hashes(&req.block_hashes);
+            }
+
             // Pure memory-only query (no SSD prefetch)
             let (hit, missing) = self
                 .engine
@@ -489,6 +496,9 @@ impl Engine for GrpcEngineService {
 
             let (prefetch_state, hit_blocks, loading_blocks, missing_blocks) = match status {
                 PrefetchStatus::Done { hit, missing } => {
+                    if let Ok(mut t) = self.hll_tracker.lock() {
+                        t.record_hashes(&req.block_hashes);
+                    }
                     (PrefetchState::PrefetchDone, hit as u64, 0, missing as u64)
                 }
                 PrefetchStatus::Loading { hit, loading } => (

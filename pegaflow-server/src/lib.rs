@@ -156,10 +156,33 @@ pub struct Cli {
     #[arg(long, default_value_t = pegaflow_core::DEFAULT_METASERVER_QUEUE_DEPTH)]
     pub metaserver_queue_depth: usize,
 
+    /// HLL time-slot rotation interval in seconds (default: 3600 = 1 hour)
+    #[arg(long, default_value_t = 3600)]
+    pub metric_hll_slot_secs: u64,
+
+    /// HLL sliding window duration in seconds (default: 86400 = 24 hours)
+    #[arg(long, default_value_t = 86400)]
+    pub metric_hll_window_secs: u64,
+
+    /// HLL bucket index bits 4–18 (default: 14 → 16384 buckets, ~0.8% error)
+    #[arg(long, default_value_t = 14, value_parser = parse_hll_bucket_bits)]
+    pub metric_hll_bucket_bits: u8,
+
     /// Transfer lock timeout in seconds. Blocks held for cross-node RDMA transfer are
     /// locked for at most this duration before being force-released (crash recovery).
     #[arg(long, default_value_t = 120)]
     pub transfer_lock_timeout_secs: u64,
+}
+
+fn parse_hll_bucket_bits(s: &str) -> Result<u8, String> {
+    use pegaflow_common::hll::{MAX_BUCKET_BITS, MIN_BUCKET_BITS};
+    let v: u8 = s.parse().map_err(|e| format!("{e}"))?;
+    if !(MIN_BUCKET_BITS..=MAX_BUCKET_BITS).contains(&v) {
+        return Err(format!(
+            "HLL bucket_bits must be in {MIN_BUCKET_BITS}..={MAX_BUCKET_BITS}, got {v}"
+        ));
+    }
+    Ok(v)
 }
 
 fn parse_sample_rate(s: &str) -> Result<f64, String> {
@@ -453,6 +476,15 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         )
     })?;
 
+    let hll_tracker = Arc::new(std::sync::Mutex::new(
+        pegaflow_common::hll::HllTracker::new(
+            Duration::from_secs(cli.metric_hll_slot_secs),
+            Duration::from_secs(cli.metric_hll_window_secs),
+            cli.metric_hll_bucket_bits,
+        ),
+    ));
+    crate::metric::register_hll_gauges(&hll_tracker);
+
     let shutdown = Arc::new(Notify::new());
 
     runtime.block_on(async move {
@@ -467,6 +499,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             Arc::clone(&engine),
             Arc::clone(&registry),
             Arc::clone(&shutdown),
+            Arc::clone(&hll_tracker),
         );
 
         // Spawn background GC task for stale inflight blocks

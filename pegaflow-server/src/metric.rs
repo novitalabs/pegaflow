@@ -1,8 +1,64 @@
-use opentelemetry::metrics::{Counter, Histogram};
+use opentelemetry::metrics::{Counter, Histogram, ObservableGauge};
 use opentelemetry::{KeyValue, global};
-use std::sync::LazyLock;
+use pegaflow_common::hll::HllTracker;
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Instant;
 use tonic::Status;
+
+struct HllGaugeHandles {
+    _hit_rate: ObservableGauge<f64>,
+    _cardinality: ObservableGauge<f64>,
+    _total_requests: ObservableGauge<u64>,
+}
+
+static HLL_GAUGES: OnceLock<HllGaugeHandles> = OnceLock::new();
+
+/// Register HLL observable gauges backed by the given tracker.
+pub fn register_hll_gauges(tracker: &Arc<Mutex<HllTracker>>) {
+    let t1 = Arc::clone(tracker);
+    let t2 = Arc::clone(tracker);
+    let t3 = Arc::clone(tracker);
+
+    HLL_GAUGES.get_or_init(|| {
+        let meter = global::meter("pegaflow-core");
+
+        let hit_rate = meter
+            .f64_observable_gauge("pegaflow_hll_estimated_hit_rate")
+            .with_description("Estimated cache hit rate assuming infinite cache [0.0, 1.0]")
+            .with_callback(move |observer| {
+                if let Ok(mut t) = t1.lock() {
+                    observer.observe(t.metric().estimated_hit_rate, &[]);
+                }
+            })
+            .build();
+
+        let cardinality = meter
+            .f64_observable_gauge("pegaflow_hll_cardinality")
+            .with_description("Estimated distinct blocks seen in the sliding window")
+            .with_callback(move |observer| {
+                if let Ok(mut t) = t2.lock() {
+                    observer.observe(t.metric().cardinality, &[]);
+                }
+            })
+            .build();
+
+        let total_requests = meter
+            .u64_observable_gauge("pegaflow_hll_total_requests")
+            .with_description("Total block requests in the sliding window")
+            .with_callback(move |observer| {
+                if let Ok(mut t) = t3.lock() {
+                    observer.observe(t.metric().total_requests, &[]);
+                }
+            })
+            .build();
+
+        HllGaugeHandles {
+            _hit_rate: hit_rate,
+            _cardinality: cardinality,
+            _total_requests: total_requests,
+        }
+    });
+}
 
 struct RpcMetrics {
     request_count: Counter<u64>,
