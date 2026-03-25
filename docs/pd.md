@@ -1,5 +1,7 @@
 # PegaFlow P/D Disaggregation Design
 
+> **⚠️ Experimental** — This feature is functional but not recommended for production deployments.
+
 ## Overview
 
 Prefill/Decode disaggregation separates the prefill (P) and decode (D) phases to different vLLM instances, improving resource utilization.
@@ -56,63 +58,22 @@ PEGAFLOW_ROUTER_ENDPOINT=http://router:8080
 # D node (no special config needed)
 ```
 
-### Connector Changes (connector.py)
+### Connector Changes (planned, not yet implemented)
 
-```python
-class PegaKVConnector:
-    def __init__(self, ...):
-        self._router_endpoint = os.environ.get("PEGAFLOW_ROUTER_ENDPOINT")
-
-    def _decrement_layer_counter(self, request_ids: list[str]) -> None:
-        with self._save_completion_lock:
-            for req_id in request_ids:
-                if req_id in self._req_pending_layers:
-                    self._req_pending_layers[req_id] -= 1
-
-                    if self._req_pending_layers[req_id] == 0:
-                        self._completed_saves.add(req_id)
-                        del self._req_pending_layers[req_id]
-
-                        # Callback to router
-                        if self._router_endpoint:
-                            self._notify_router(req_id)
-
-    def _notify_router(self, req_id: str):
-        url = f"{self._router_endpoint}/kv_ready"
-        try:
-            requests.post(url, json={"request_id": req_id}, timeout=1.0)
-        except Exception as e:
-            logger.warning(f"Failed to notify router: {e}")
-```
+The async callback path (`_notify_router` → `/kv_ready`) is not yet implemented in the connector.
+The current Router uses a synchronous flow: it waits for P's HTTP response before forwarding to D.
 
 ### Router Implementation
 
-```python
-class PegaPDRouter:
-    def __init__(self, prefill_endpoints: list[str], decode_endpoints: list[str]):
-        self._pending_requests: dict[str, asyncio.Event] = {}
+The Rust router lives at `pegaflow-server/src/bin/pegaflow-router.rs`. It is a standalone binary (not part of the default build) that can be run with:
 
-    async def handle_chat_completion(self, request: dict):
-        req_id = str(uuid.uuid4())
-        done_event = asyncio.Event()
-        self._pending_requests[req_id] = done_event
-
-        # 1. Send to P (max_tokens=1)
-        p_request = {**request, "max_tokens": 1}
-        p_response = await self.send_to_p(p_request)
-
-        # 2. Wait for callback
-        await done_event.wait()
-        del self._pending_requests[req_id]
-
-        # 3. Send to D
-        return await self.send_to_d(request)
-
-    # Callback endpoint: POST /kv_ready
-    async def on_kv_ready(self, req_id: str):
-        if req_id in self._pending_requests:
-            self._pending_requests[req_id].set()
+```bash
+cargo run --release --bin pegaflow-router -- \
+    --prefill http://p-node:8000 \
+    --decode http://d-node:8001
 ```
+
+See `examples/run_vllm_pd_with_pega.py` for a complete multi-GPU launch script.
 
 ## Benchmark Results (H800, Qwen3-8B, 5K input tokens)
 
@@ -123,9 +84,8 @@ class PegaPDRouter:
 
 The P/D setup trades higher TTFT for **significantly more stable decode latency** — TPOT p99 drops from 24.32ms to 15.89ms, and ITL p99 improves dramatically from 142.70ms to 21.71ms.
 
-## TODO
+## Limitations
 
-- [ ] Implement `_notify_router()` in connector
-- [ ] Implement Router service
-- [ ] Handle timeout/error cases
-- [ ] Add metrics for P/D latency breakdown
+- Router uses synchronous P→D handoff (no async KV-ready callback yet)
+- No built-in timeout/retry for P or D node failures
+- No Prometheus metrics for P/D latency breakdown
