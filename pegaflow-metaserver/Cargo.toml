@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 default-run = "pegaflow-metaserver"
 
+[lints]
+workspace = true
+
 [lib]
 name = "pegaflow_metaserver"
 path = "src/lib.rs"

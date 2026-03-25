@@ -545,7 +545,7 @@ impl PegaEngine {
 
             if !blocks.is_empty() {
                 layers.push(LayerLoadData {
-                    layer_name: layer_name.to_string(),
+                    layer_name: (*layer_name).to_string(),
                     registration,
                     blocks,
                 });

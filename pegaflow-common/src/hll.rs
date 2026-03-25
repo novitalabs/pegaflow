@@ -484,7 +484,7 @@ mod tests {
         assert_eq!(bucket_index(&make_hash([0xAB, 0xCD, 0]), 12), 0xABC);
         assert_eq!(
             bucket_index(&make_hash([0xAB, 0xCD, 0xEF]), 14),
-            0b10101011_110011
+            0b10_1010_1111_0011
         );
     }
 

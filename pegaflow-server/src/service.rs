@@ -108,24 +108,24 @@ impl GrpcEngineService {
     fn build_transfer_slot_info(
         raw_block: &Arc<pegaflow_core::RawBlock>,
         numa_node: pegaflow_common::NumaNode,
-    ) -> Result<TransferSlotInfo, Status> {
+    ) -> TransferSlotInfo {
         let layer_block = pegaflow_core::LayerBlock::new(Arc::clone(raw_block));
         if let Some(v_ptr) = layer_block.v_ptr() {
-            Ok(TransferSlotInfo {
+            TransferSlotInfo {
                 k_ptr: layer_block.k_ptr() as u64,
                 k_size: layer_block.k_size() as u64,
                 v_ptr: v_ptr as u64,
                 v_size: layer_block.v_size().unwrap_or(0) as u64,
                 numa_node: numa_node.0,
-            })
+            }
         } else {
-            Ok(TransferSlotInfo {
+            TransferSlotInfo {
                 k_ptr: layer_block.k_ptr() as u64,
                 k_size: layer_block.k_size() as u64,
                 v_ptr: 0,
                 v_size: 0,
                 numa_node: numa_node.0,
-            })
+            }
         }
     }
 }
@@ -450,7 +450,7 @@ impl Engine for GrpcEngineService {
                 debug!(
                     "RPC [query] completed: ok hit={} missing={} elapsed_ms={:.2}",
                     resp.hit_blocks, resp.missing_blocks, elapsed_ms
-                )
+                );
             }
             Err(status) => warn!(
                 "RPC [query] failed: code={} message={} elapsed_ms={:.2}",
@@ -530,7 +530,7 @@ impl Engine for GrpcEngineService {
                 debug!(
                     "RPC [query_prefetch] completed: ok hit={} loading={} missing={} state={} elapsed_ms={:.2}",
                     resp.hit_blocks, resp.loading_blocks, resp.missing_blocks, state, elapsed_ms
-                )
+                );
             }
             Err(status) => warn!(
                 "RPC [query_prefetch] failed: code={} message={} elapsed_ms={:.2}",
@@ -665,19 +665,19 @@ impl Engine for GrpcEngineService {
 
             let blocks: Vec<TransferBlockInfo> = found_blocks
                 .iter()
-                .map(|(key, block)| -> Result<TransferBlockInfo, Status> {
+                .map(|(key, block)| {
                     let slots: Vec<TransferSlotInfo> = block
                         .slots()
                         .iter()
                         .zip(block.slot_numas())
                         .map(|(raw, &numa)| Self::build_transfer_slot_info(raw, numa))
-                        .collect::<Result<_, _>>()?;
-                    Ok(TransferBlockInfo {
+                        .collect();
+                    TransferBlockInfo {
                         block_hash: key.hash.clone(),
                         slots,
-                    })
+                    }
                 })
-                .collect::<Result<_, _>>()?;
+                .collect();
 
             Ok(Response::new(QueryBlocksForTransferResponse {
                 status: Some(Self::build_simple_response()),

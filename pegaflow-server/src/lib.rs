@@ -7,8 +7,8 @@ pub mod service;
 mod trace;
 #[cfg(not(feature = "tracing"))]
 mod trace {
-    pub fn init() {}
-    pub fn flush() {}
+    pub(crate) fn init() {}
+    pub(crate) fn flush() {}
 }
 mod utils;
 

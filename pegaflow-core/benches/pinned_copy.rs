@@ -189,9 +189,10 @@ fn strided_benchmarks(c: &mut Criterion) {
 }
 
 fn check_cuda(result: sys::CUresult, op: &str) {
-    if result != sys::CUresult::CUDA_SUCCESS {
-        panic!("{op} failed with {result:?}");
-    }
+    assert!(
+        result == sys::CUresult::CUDA_SUCCESS,
+        "{op} failed with {result:?}"
+    );
 }
 
 criterion_group!(benches, contiguous_benchmarks, strided_benchmarks);

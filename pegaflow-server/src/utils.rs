@@ -1,6 +1,6 @@
 /// Parse memory size with optional unit suffix (kb, mb, gb, tb)
 /// Examples: "10gb", "500MB", "1TB", "512kb", "1073741824"
-pub fn parse_memory_size(s: &str) -> Result<usize, String> {
+pub(crate) fn parse_memory_size(s: &str) -> Result<usize, String> {
     let s = s.trim();
 
     // Find the boundary between number and unit

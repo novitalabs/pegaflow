@@ -164,20 +164,24 @@ mod tests {
 
         // Insert from node A
         store
-            .insert_hashes(namespace, &[hash.clone()], "node-a:50055")
+            .insert_hashes(namespace, std::slice::from_ref(&hash), "node-a:50055")
             .await;
         store.run_pending_tasks().await;
 
-        let existing = store.query_hashes(namespace, &[hash.clone()]).await;
+        let existing = store
+            .query_hashes(namespace, std::slice::from_ref(&hash))
+            .await;
         assert_eq!(existing[0].node.as_ref(), "node-a:50055");
 
         // Insert same hash from node B (overwrites)
         store
-            .insert_hashes(namespace, &[hash.clone()], "node-b:50055")
+            .insert_hashes(namespace, std::slice::from_ref(&hash), "node-b:50055")
             .await;
         store.run_pending_tasks().await;
 
-        let existing = store.query_hashes(namespace, &[hash]).await;
+        let existing = store
+            .query_hashes(namespace, std::slice::from_ref(&hash))
+            .await;
         assert_eq!(existing[0].node.as_ref(), "node-b:50055");
     }
 

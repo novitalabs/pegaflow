@@ -3,6 +3,9 @@ name = "pegaflow-common"
 version.workspace = true
 edition.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 log.workspace = true
 logforth.workspace = true

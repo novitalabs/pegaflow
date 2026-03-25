@@ -83,3 +83,27 @@ fastrace = "0.7.17"
 criterion = "0.8"
 
 tikv-jemallocator = "0.6.1"
+
+[workspace.lints.clippy]
+checked_conversions = "warn"
+cloned_instead_of_copied = "warn"
+dbg_macro = "warn"
+explicit_into_iter_loop = "warn"
+explicit_iter_loop = "warn"
+filter_map_next = "warn"
+flat_map_option = "warn"
+inefficient_to_string = "warn"
+let_unit_value = "warn"
+manual_assert = "warn"
+manual_ok_or = "warn"
+semicolon_if_nothing_returned = "warn"
+todo = "warn"
+unnecessary_wraps = "warn"
+useless_transmute = "warn"
+
+[workspace.lints.rust]
+elided_lifetimes_in_paths = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unused_lifetimes = "warn"
+unreachable_pub = "warn"
+unsafe_op_in_unsafe_fn = "warn"

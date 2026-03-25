@@ -18,11 +18,11 @@ use pegaflow_common::NumaNode;
 use smallvec::SmallVec;
 
 /// SSD I/O alignment requirement (O_DIRECT requires 512-byte aligned I/O)
-pub const SSD_ALIGNMENT: usize = 512;
+pub(crate) const SSD_ALIGNMENT: usize = 512;
 
 /// Default max blocks allowed in prefetching state (backpressure for SSD prefetch).
 /// ~15GB assuming 10MB per block.
-pub const DEFAULT_MAX_PREFETCH_BLOCKS: usize = 1500;
+pub(crate) const DEFAULT_MAX_PREFETCH_BLOCKS: usize = 1500;
 
 /// Default write queue depth for SSD writer thread (blocks dropped if full)
 pub const DEFAULT_SSD_WRITE_QUEUE_DEPTH: usize = 8;
@@ -859,15 +859,9 @@ async fn execute_prefetch(
     let expected_len = task.entry.len as usize;
     let block = match read_result {
         Ok(rx) => match rx.await {
-            Ok(Ok(bytes_read)) if bytes_read == expected_len => {
-                match rebuild_sealed_block_per_slot(task.slot_allocs, &task.entry.slots) {
-                    Ok(sealed) => Some(Arc::new(sealed)),
-                    Err(e) => {
-                        warn!("SSD prefetch: failed to rebuild block: {}", e);
-                        None
-                    }
-                }
-            }
+            Ok(Ok(bytes_read)) if bytes_read == expected_len => Some(Arc::new(
+                rebuild_sealed_block_per_slot(task.slot_allocs, &task.entry.slots),
+            )),
             Ok(Ok(n)) => {
                 warn!("SSD prefetch: short read {} of {} bytes", n, expected_len);
                 None
@@ -901,7 +895,7 @@ async fn execute_prefetch(
 fn rebuild_sealed_block_per_slot(
     slot_allocs: Vec<SlotAlloc>,
     slot_metas: &[SlotMeta],
-) -> Result<SealedBlock, String> {
+) -> SealedBlock {
     let raw_blocks: Vec<_> = slot_metas
         .iter()
         .zip(slot_allocs)
@@ -910,7 +904,7 @@ fn rebuild_sealed_block_per_slot(
         })
         .collect();
 
-    Ok(SealedBlock::from_slots(raw_blocks))
+    SealedBlock::from_slots(raw_blocks)
 }
 
 #[cfg(test)]

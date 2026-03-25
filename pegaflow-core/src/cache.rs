@@ -159,7 +159,7 @@ impl Estimator {
 
     fn incr<T: Hash>(&self, key: T) -> u8 {
         let mut min = u8::MAX;
-        for (slot, hasher) in self.estimator.iter() {
+        for (slot, hasher) in &self.estimator {
             let hash = hasher.hash_one(&key) as usize;
             let counter = &slot[hash % slot.len()];
             let (_current, new) = incr_no_overflow(counter);
@@ -171,7 +171,7 @@ impl Estimator {
     /// Get the estimated frequency of `key`.
     fn get<T: Hash>(&self, key: T) -> u8 {
         let mut min = u8::MAX;
-        for (slot, hasher) in self.estimator.iter() {
+        for (slot, hasher) in &self.estimator {
             let hash = hasher.hash_one(&key) as usize;
             let counter = &slot[hash % slot.len()];
             let current = counter.load(Ordering::Relaxed);
@@ -182,8 +182,8 @@ impl Estimator {
 
     /// right shift all values inside this `Estimator`.
     fn age(&self, shift: u8) {
-        for (slot, _) in self.estimator.iter() {
-            for counter in slot.iter() {
+        for (slot, _) in &self.estimator {
+            for counter in slot {
                 let c = counter.load(Ordering::Relaxed);
                 counter.store(c >> shift, Ordering::Relaxed);
             }

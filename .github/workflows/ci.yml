@@ -131,13 +131,9 @@ jobs:
           components: clippy
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
-      - name: Run rust clippy check (core)
+      - name: Run rust clippy check
         run: |
-          cargo clippy -p pegaflow-core --all-targets -- -D warnings
-      - name: Run rust clippy check (server)
-        run: |
-          cargo clippy -p pegaflow-server --all-targets -- -D warnings
-      # Skip python package clippy for now (requires CUDA)
+          cargo clippy --workspace --exclude pegaflow-py --all-targets -- -D warnings
 
   ruff-check:
     name: ruff check
