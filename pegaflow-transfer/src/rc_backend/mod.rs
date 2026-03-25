@@ -314,10 +314,11 @@ impl RcBackend {
         state.addr_connections.insert(
             remote_addr.to_string(),
             AddrConnection {
-                remote_qpns,
+                remote_qpns: remote_qpns.clone(),
                 local_nics,
             },
         );
+        info!("RDMA connection established: remote={remote_addr}, remote_qpns={remote_qpns:?}");
         Ok(())
     }
 
