@@ -40,7 +40,7 @@ impl RcRuntime {
         let (port_num, gid_index, mtu, local_gid) = Self::choose_port_and_gid(&device_ctx)?;
         let numa_node = nic_numa_node(nic_name);
         log::info!(
-            "rc runtime ready: nic={}, port={}, gid_index={}, mtu={:?}, numa={}",
+            "RDMA NIC ready: nic={}, port={}, gid_index={}, mtu={:?}, numa={}",
             nic_name,
             port_num,
             gid_index,
