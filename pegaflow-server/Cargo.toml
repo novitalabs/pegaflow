@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 default-run = "pegaflow-server"
 
+[lints]
+workspace = true
+
 [features]
 default = []
 tracing = ["fastrace", "pegaflow-core/tracing"]

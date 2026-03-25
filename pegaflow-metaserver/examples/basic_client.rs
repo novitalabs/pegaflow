@@ -83,7 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n5. Querying with different namespace...");
     let request = QueryBlockHashesRequest {
         namespace: "different-model".to_string(),
-        block_hashes: block_hashes,
+        block_hashes,
     };
 
     let response = client.query_block_hashes(request).await?;

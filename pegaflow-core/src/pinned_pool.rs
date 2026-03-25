@@ -82,9 +82,10 @@ impl PinnedMemoryPool {
         ssd_enabled: bool,
         unit_size_hint: Option<NonZeroU64>,
     ) -> Self {
-        if pool_size == 0 {
-            panic!("Pinned memory pool size must be greater than zero");
-        }
+        assert!(
+            pool_size != 0,
+            "Pinned memory pool size must be greater than zero"
+        );
 
         let backing = if use_hugepages {
             info!("Allocating pinned memory pool with huge pages");

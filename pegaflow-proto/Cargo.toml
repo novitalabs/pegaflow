@@ -3,6 +3,9 @@ name = "pegaflow-proto"
 version.workspace = true
 edition.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 prost.workspace = true
 tonic.workspace = true

@@ -372,7 +372,7 @@ impl StorageEngine {
 
             let mut batch_bytes = 0u64;
             let mut still_referenced = 0u64;
-            for (_key, block) in evicted.iter() {
+            for (_key, block) in &evicted {
                 let b = block.memory_footprint();
                 batch_bytes = batch_bytes.saturating_add(b);
                 if Arc::strong_count(block) > 1 {

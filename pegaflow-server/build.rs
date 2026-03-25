@@ -1,4 +1,4 @@
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
     println!("cargo:rerun-if-env-changed=PYO3_PYTHON");
     println!("cargo:rerun-if-env-changed=PYTHON_SYS_EXECUTABLE");
     println!("cargo:rerun-if-env-changed=VIRTUAL_ENV");
@@ -10,6 +10,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(lib_name) = &config.lib_name {
         println!("cargo:rustc-link-lib={lib_name}");
     }
-
-    Ok(())
 }

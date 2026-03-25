@@ -3,6 +3,9 @@ name = "pegaflow-py"
 version.workspace = true
 edition.workspace = true
 
+[lints]
+workspace = true
+
 [lib]
 name = "pegaflow"
 crate-type = ["cdylib"]

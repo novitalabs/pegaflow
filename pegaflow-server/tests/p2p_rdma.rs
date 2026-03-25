@@ -240,12 +240,11 @@ async fn wait_for_prefetch_done(
         match status {
             PrefetchStatus::Done { hit, .. } if hit >= expected_hit => return,
             PrefetchStatus::Done { hit, missing } => {
-                if Instant::now() >= deadline {
-                    panic!(
-                        "prefetch done but hit={hit} missing={missing}, \
-                         expected hit>={expected_hit}"
-                    );
-                }
+                assert!(
+                    Instant::now() < deadline,
+                    "prefetch done but hit={hit} missing={missing}, \
+                     expected hit>={expected_hit}"
+                );
             }
             PrefetchStatus::Loading { .. } => {}
         }
