@@ -115,7 +115,6 @@ impl RcBackend {
                 return Err(TransferError::InvalidArgument("nic_name is empty"));
             }
             let runtime = RcRuntime::open(name)?;
-            log::info!("rc backend initialized: nic={}", name);
             runtimes.push(runtime);
         }
         let nic_count = runtimes.len();
