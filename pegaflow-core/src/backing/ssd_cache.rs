@@ -18,11 +18,11 @@ use pegaflow_common::NumaNode;
 use smallvec::SmallVec;
 
 /// SSD I/O alignment requirement (O_DIRECT requires 512-byte aligned I/O)
-pub const SSD_ALIGNMENT: usize = 512;
+pub(crate) const SSD_ALIGNMENT: usize = 512;
 
 /// Default max blocks allowed in prefetching state (backpressure for SSD prefetch).
 /// ~15GB assuming 10MB per block.
-pub const DEFAULT_MAX_PREFETCH_BLOCKS: usize = 1500;
+pub(crate) const DEFAULT_MAX_PREFETCH_BLOCKS: usize = 1500;
 
 /// Default write queue depth for SSD writer thread (blocks dropped if full)
 pub const DEFAULT_SSD_WRITE_QUEUE_DEPTH: usize = 8;
