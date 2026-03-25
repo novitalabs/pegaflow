@@ -76,9 +76,9 @@ class PegaPdConnector(MultiConnector):
 
     def __init__(
         self,
-        vllm_config: "VllmConfig",
+        vllm_config: VllmConfig,
         role: KVConnectorRole,
-        kv_cache_config: "KVCacheConfig",
+        kv_cache_config: KVCacheConfig,
     ):
         super().__init__(
             vllm_config=vllm_config, role=role, kv_cache_config=kv_cache_config
@@ -142,7 +142,7 @@ class PegaPdConnector(MultiConnector):
         KVConnectorBase_V1.bind_connector_metadata(self, connector_metadata)
         if connector_metadata.extra_async_saves:
             self._extra_async_saves.update(connector_metadata.extra_async_saves)
-        for c, cm in zip(self._connectors, connector_metadata.metadata):
+        for c, cm in zip(self._connectors, connector_metadata.metadata, strict=True):
             c.bind_connector_metadata(cm)
 
     # ==============================
@@ -151,7 +151,7 @@ class PegaPdConnector(MultiConnector):
 
     def get_num_new_matched_tokens(
         self,
-        request: "Request",
+        request: Request,
         num_computed_tokens: int,
     ) -> tuple[int | None, bool]:
         """Get prefix match from PegaKVConnector only.
@@ -164,8 +164,8 @@ class PegaPdConnector(MultiConnector):
 
     def update_state_after_alloc(
         self,
-        request: "Request",
-        blocks: "KVCacheBlocks",
+        request: Request,
+        blocks: KVCacheBlocks,
         num_external_tokens: int,
     ) -> None:
         """PegaKVConnector gets real blocks, NixlConnector gets empty blocks."""
