@@ -311,14 +311,17 @@ impl RcBackend {
         }
         let removed = state.connecting.remove(remote_addr);
         debug_assert!(removed, "connecting set should contain {remote_addr}");
+        let local_qpns: Vec<u32> = local_nics.iter().map(|n| n.endpoint.qp_num).collect();
+        info!(
+            "RDMA connection established: remote={remote_addr}, local_qpns={local_qpns:?}, remote_qpns={remote_qpns:?}"
+        );
         state.addr_connections.insert(
             remote_addr.to_string(),
             AddrConnection {
-                remote_qpns: remote_qpns.clone(),
+                remote_qpns,
                 local_nics,
             },
         );
-        info!("RDMA connection established: remote={remote_addr}, remote_qpns={remote_qpns:?}");
         Ok(())
     }
 
