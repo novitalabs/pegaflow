@@ -93,6 +93,8 @@ impl HandshakeMetadata {
 pub enum ConnectionStatus {
     /// Already connected; call batch_transfer_async directly.
     Existing,
+    /// A handshake to this peer is already in progress.
+    Connecting,
     /// Not connected. Exchange this local metadata with remote peer via gRPC,
     /// then call complete_handshake. On failure, call abort_handshake.
     Prepared(HandshakeMetadata),
@@ -128,6 +130,7 @@ impl TransferEngine {
     pub fn get_or_prepare(&self, remote_addr: &str) -> Result<ConnectionStatus> {
         match self.backend.get_or_prepare(remote_addr)? {
             GetOrPrepareResult::Existing => Ok(ConnectionStatus::Existing),
+            GetOrPrepareResult::AlreadyConnecting => Ok(ConnectionStatus::Connecting),
             GetOrPrepareResult::NeedHandshake(nics) => {
                 Ok(ConnectionStatus::Prepared(HandshakeMetadata { nics }))
             }
@@ -146,8 +149,8 @@ impl TransferEngine {
     }
 
     /// Drop pending sessions created by get_or_prepare when handshake failed.
-    pub fn abort_handshake(&self, local_meta: &HandshakeMetadata) {
-        self.backend.abort_handshake(&local_meta.nics);
+    pub fn abort_handshake(&self, remote_addr: &str, local_meta: &HandshakeMetadata) {
+        self.backend.abort_handshake(remote_addr, &local_meta.nics);
     }
 
     /// Return cached local handshake metadata for an established connection.

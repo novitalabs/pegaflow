@@ -92,6 +92,7 @@ impl NumaRoundRobin {
 
 pub(crate) enum GetOrPrepareResult {
     Existing,
+    AlreadyConnecting,
     NeedHandshake(Vec<NicHandshake>),
 }
 
@@ -231,13 +232,23 @@ impl RcBackend {
     /// Check if connected to remote_addr; if not, prepare local QPs.
     pub(crate) fn get_or_prepare(&self, remote_addr: &str) -> Result<GetOrPrepareResult> {
         {
-            let state = self.state.lock();
+            let mut state = self.state.lock();
             if state.addr_connections.contains_key(remote_addr) {
                 return Ok(GetOrPrepareResult::Existing);
             }
+            if state.connecting.contains(remote_addr) {
+                return Ok(GetOrPrepareResult::AlreadyConnecting);
+            }
+            state.connecting.insert(remote_addr.to_string());
         }
-        let nics = self.prepare_handshake()?;
-        Ok(GetOrPrepareResult::NeedHandshake(nics))
+        match self.prepare_handshake() {
+            Ok(nics) => Ok(GetOrPrepareResult::NeedHandshake(nics)),
+            Err(e) => {
+                let removed = self.state.lock().connecting.remove(remote_addr);
+                debug_assert!(removed, "connecting set should contain {remote_addr}");
+                Err(e)
+            }
+        }
     }
 
     /// Complete a connection after handshake exchange.
@@ -264,6 +275,7 @@ impl RcBackend {
                 for (nic_idx, nic) in local_nics.iter().enumerate() {
                     state.nics[nic_idx].remove_pending_by_qpn(nic.endpoint.qp_num);
                 }
+                state.connecting.remove(remote_addr);
                 return Ok(());
             }
             let mut sessions = Vec::with_capacity(nic_count);
@@ -293,6 +305,8 @@ impl RcBackend {
             state.nics[nic_idx].sessions.insert(remote_qpn, session);
             remote_qpns.push(remote_qpn);
         }
+        let removed = state.connecting.remove(remote_addr);
+        debug_assert!(removed, "connecting set should contain {remote_addr}");
         state.addr_connections.insert(
             remote_addr.to_string(),
             AddrConnection {
@@ -304,8 +318,10 @@ impl RcBackend {
     }
 
     /// Drop pending sessions created by get_or_prepare when handshake failed.
-    pub(crate) fn abort_handshake(&self, local_nics: &[NicHandshake]) {
+    pub(crate) fn abort_handshake(&self, remote_addr: &str, local_nics: &[NicHandshake]) {
         let mut state = self.state.lock();
+        let removed = state.connecting.remove(remote_addr);
+        debug_assert!(removed, "connecting set should contain {remote_addr}");
         for (nic_idx, nic) in local_nics.iter().enumerate() {
             state.nics[nic_idx].remove_pending_by_qpn(nic.endpoint.qp_num);
         }

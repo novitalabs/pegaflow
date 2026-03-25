@@ -449,8 +449,9 @@ fn create_engine_context(
         .expect("server get_or_prepare failed")
     {
         pegaflow_transfer::ConnectionStatus::Prepared(m) => m,
-        pegaflow_transfer::ConnectionStatus::Existing => {
-            panic!("unexpected existing connection on fresh engine")
+        pegaflow_transfer::ConnectionStatus::Existing
+        | pegaflow_transfer::ConnectionStatus::Connecting => {
+            panic!("unexpected state on fresh engine")
         }
     };
     let client_meta = match client
@@ -458,8 +459,9 @@ fn create_engine_context(
         .expect("client get_or_prepare failed")
     {
         pegaflow_transfer::ConnectionStatus::Prepared(m) => m,
-        pegaflow_transfer::ConnectionStatus::Existing => {
-            panic!("unexpected existing connection on fresh engine")
+        pegaflow_transfer::ConnectionStatus::Existing
+        | pegaflow_transfer::ConnectionStatus::Connecting => {
+            panic!("unexpected state on fresh engine")
         }
     };
     server
