@@ -294,7 +294,8 @@ impl RcSession {
                         };
                         if wc.status() != WorkCompletionStatus::Success as u32 {
                             return Err(TransferError::Backend(format!(
-                                "send completion failed: status={}, opcode={}, vendor_err={}",
+                                "send completion failed: local_qpn={}, status={}, opcode={}, vendor_err={}",
+                                session.local_endpoint.qp_num,
                                 wc.status(),
                                 wc.opcode(),
                                 wc.vendor_err()
@@ -311,7 +312,8 @@ impl RcSession {
                 }
                 Err(error) => {
                     return Err(TransferError::Backend(format!(
-                        "poll send CQ failed: {error}"
+                        "poll send CQ failed: local_qpn={}, {error}",
+                        session.local_endpoint.qp_num
                     )));
                 }
             }

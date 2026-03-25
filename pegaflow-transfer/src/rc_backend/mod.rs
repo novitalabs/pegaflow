@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
-use log::debug;
+use log::{debug, info, warn};
 use parking_lot::Mutex;
 use sideway::ibverbs::AccessFlags;
 
@@ -114,7 +114,6 @@ impl RcBackend {
             if name.trim().is_empty() {
                 return Err(TransferError::InvalidArgument("nic_name is empty"));
             }
-            log::info!("rc backend initialize: nic={}", name);
             let runtime = RcRuntime::open(name)?;
             log::info!("rc backend initialized: nic={}", name);
             runtimes.push(runtime);
@@ -212,7 +211,12 @@ impl RcBackend {
         let mut sessions = Vec::with_capacity(self.nic_count());
         for runtime in &self.runtimes {
             let psn_seed = self.psn_counter.fetch_add(1, Ordering::Relaxed);
-            let session = RcSession::create(runtime, psn_seed)?;
+            let session = RcSession::create(runtime, psn_seed).map_err(|e| {
+                TransferError::Backend(format!(
+                    "QP creation failed on nic={}: {e}",
+                    runtime.nic_name
+                ))
+            })?;
             sessions.push(session);
         }
 
@@ -276,6 +280,7 @@ impl RcBackend {
                     state.nics[nic_idx].remove_pending_by_qpn(nic.endpoint.qp_num);
                 }
                 state.connecting.remove(remote_addr);
+                info!("handshake won by concurrent path: remote={remote_addr}");
                 return Ok(());
             }
             let mut sessions = Vec::with_capacity(nic_count);
@@ -325,6 +330,7 @@ impl RcBackend {
         for (nic_idx, nic) in local_nics.iter().enumerate() {
             state.nics[nic_idx].remove_pending_by_qpn(nic.endpoint.qp_num);
         }
+        warn!("handshake aborted: remote={remote_addr}");
     }
 
     /// Get local NicHandshake metadata for an established connection.
@@ -343,6 +349,7 @@ impl RcBackend {
             for (nic_idx, &remote_qpn) in conn.remote_qpns.iter().enumerate() {
                 state.nics[nic_idx].cleanup_connection(remote_qpn);
             }
+            info!("connection invalidated: remote={remote_addr}");
         }
     }
 

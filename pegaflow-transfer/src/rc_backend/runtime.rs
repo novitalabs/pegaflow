@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use log::warn;
+use log::error;
 use pegaflow_common::NumaNode;
 use sideway::ibverbs::address::Gid;
 use sideway::ibverbs::device::{DeviceInfo, DeviceList};
@@ -18,11 +18,11 @@ pub(crate) struct RcRuntime {
     pub(crate) mtu: Mtu,
     pub(crate) local_gid: Gid,
     pub(crate) numa_node: NumaNode,
+    pub(crate) nic_name: String,
 }
 
 impl RcRuntime {
     pub(crate) fn open(nic_name: &str) -> Result<Arc<Self>> {
-        log::info!("rc runtime open: nic={}", nic_name);
         let device_list =
             DeviceList::new().map_err(|error| TransferError::Backend(error.to_string()))?;
         let device = device_list
@@ -38,16 +38,15 @@ impl RcRuntime {
             .map_err(|error| TransferError::Backend(error.to_string()))?;
 
         let (port_num, gid_index, mtu, local_gid) = Self::choose_port_and_gid(&device_ctx)?;
+        let numa_node = nic_numa_node(nic_name);
         log::info!(
-            "rc runtime ready: nic={}, port={}, gid_index={}, mtu={:?}",
+            "rc runtime ready: nic={}, port={}, gid_index={}, mtu={:?}, numa={}",
             nic_name,
             port_num,
             gid_index,
             mtu,
+            numa_node,
         );
-
-        let numa_node = nic_numa_node(nic_name);
-        log::info!("rc runtime numa: nic={}, numa_node={}", nic_name, numa_node);
 
         Ok(Arc::new(Self {
             device_ctx,
@@ -57,6 +56,7 @@ impl RcRuntime {
             mtu,
             local_gid,
             numa_node,
+            nic_name: nic_name.to_owned(),
         }))
     }
 
@@ -106,7 +106,7 @@ impl RcRuntime {
             return Ok((port_num, gid_index, port_attr.active_mtu(), gid));
         }
 
-        warn!(
+        error!(
             "no active port found on NIC {}; cannot initialize transfer runtime",
             device_ctx.name()
         );
