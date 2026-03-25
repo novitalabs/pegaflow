@@ -471,6 +471,20 @@ fn create_engine_context(
         .complete_handshake("bench-server", &client_meta, &server_meta)
         .expect("client complete_handshake failed");
 
+    let nic_count = nic_names.len();
+    assert_eq!(
+        server.num_qps(),
+        nic_count,
+        "server should have {nic_count} QP(s) after handshake, got {}",
+        server.num_qps()
+    );
+    assert_eq!(
+        client.num_qps(),
+        nic_count,
+        "client should have {nic_count} QP(s) after handshake, got {}",
+        client.num_qps()
+    );
+
     EngineContext {
         label,
         server,

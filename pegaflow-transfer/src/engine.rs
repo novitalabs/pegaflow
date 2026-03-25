@@ -181,6 +181,11 @@ impl TransferEngine {
     ) -> Result<std::sync::mpsc::Receiver<Result<usize>>> {
         self.backend.batch_transfer_async(op, remote_addr, descs)
     }
+
+    /// Number of active RC queue pairs across all NICs.
+    pub fn num_qps(&self) -> usize {
+        self.backend.num_qps()
+    }
 }
 
 #[cfg(test)]

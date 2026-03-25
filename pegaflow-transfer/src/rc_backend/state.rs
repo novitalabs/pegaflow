@@ -123,6 +123,10 @@ pub(super) struct RcBackendState {
 }
 
 impl RcBackendState {
+    pub(super) fn num_qps(&self) -> usize {
+        self.nics.iter().map(|n| n.sessions.len()).sum()
+    }
+
     pub(super) fn new(nic_count: usize) -> Self {
         Self {
             registered: HashMap::new(),

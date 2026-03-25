@@ -356,6 +356,10 @@ impl RcBackend {
         }
     }
 
+    pub(crate) fn num_qps(&self) -> usize {
+        self.state.lock().num_qps()
+    }
+
     pub(crate) fn batch_transfer_async(
         &self,
         op: TransferOp,

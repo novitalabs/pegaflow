@@ -159,6 +159,10 @@ impl StorageEngine {
             .filter(|nics| !nics.is_empty())
             .and_then(|nics| crate::backing::new_rdma(nics, &allocator));
 
+        if let Some(ref rdma) = rdma_transport {
+            crate::metrics::register_rdma_gauges(rdma);
+        }
+
         let is_numa = allocator.is_numa();
         let engine = Arc::new_cyclic(move |weak_engine: &Weak<Self>| {
             // Build shared allocate_fn for backing stores.
