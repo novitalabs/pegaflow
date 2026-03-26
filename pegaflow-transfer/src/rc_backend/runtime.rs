@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use log::error;
 use pegaflow_common::NumaNode;
-use sideway::ibverbs::address::Gid;
+use sideway::ibverbs::address::{Gid, GidType};
 use sideway::ibverbs::device::{DeviceInfo, DeviceList};
 use sideway::ibverbs::device_context::{DeviceContext, Mtu, PortState};
 use sideway::ibverbs::protection_domain::ProtectionDomain;
@@ -76,23 +76,27 @@ impl RcRuntime {
                 continue;
             }
 
-            let mut picked: Option<(u8, Gid)> = None;
-            for entry in gid_entries
+            // Pick the best GID: RoCEv2 + IPv4-mapped > IB > any non-link-local.
+            // RoCEv1 cannot be routed across L3 — only RoCEv2 works cross-machine.
+            let port_entries: Vec<_> = gid_entries
                 .iter()
-                .filter(|entry| entry.port_num() == port_num as u32)
-            {
-                let gid = entry.gid();
-                if gid.is_zero() {
-                    continue;
-                }
-                if !gid.is_unicast_link_local() {
-                    picked = Some((entry.gid_index() as u8, gid));
-                    break;
-                }
-                if picked.is_none() {
-                    picked = Some((entry.gid_index() as u8, gid));
-                }
-            }
+                .filter(|e| e.port_num() == port_num as u32 && !e.gid().is_zero())
+                .collect();
+
+            let picked = port_entries
+                .iter()
+                .find(|e| e.gid_type() == GidType::RoceV2 && !e.gid().is_unicast_link_local())
+                .or_else(|| {
+                    port_entries
+                        .iter()
+                        .find(|e| e.gid_type() == GidType::InfiniBand)
+                })
+                .or_else(|| {
+                    port_entries
+                        .iter()
+                        .find(|e| !e.gid().is_unicast_link_local())
+                })
+                .map(|e| (e.gid_index() as u8, e.gid()));
 
             let (gid_index, gid) = if let Some(picked) = picked {
                 picked
