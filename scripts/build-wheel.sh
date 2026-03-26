@@ -17,13 +17,15 @@ if [[ "$1" == "--release" ]]; then
     shift
 fi
 
-echo "==> Building pegaflow-server-py binary ($PROFILE mode)..."
+echo "==> Building binaries ($PROFILE mode)..."
 cd "$PROJECT_ROOT"
-cargo build $RELEASE_FLAG -p pegaflow-py --bin pegaflow-server-py
+cargo build $RELEASE_FLAG -p pegaflow-py --bin pegaflow-server-py --bin pegaflow-metaserver-py
 
-echo "==> Copying binary to Python package..."
-cp "$PROJECT_ROOT/target/$PROFILE/pegaflow-server-py" "$PYTHON_DIR/pegaflow/pegaflow-server-py"
-chmod +x "$PYTHON_DIR/pegaflow/pegaflow-server-py"
+echo "==> Copying binaries to Python package..."
+for bin in pegaflow-server-py pegaflow-metaserver-py; do
+    cp "$PROJECT_ROOT/target/$PROFILE/$bin" "$PYTHON_DIR/pegaflow/$bin"
+    chmod +x "$PYTHON_DIR/pegaflow/$bin"
+done
 
 echo "==> Building Python wheel with maturin..."
 cd "$PYTHON_DIR"
