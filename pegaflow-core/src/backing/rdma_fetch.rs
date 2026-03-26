@@ -107,11 +107,17 @@ impl RdmaFetchStore {
             return (0, done_rx);
         }
 
-        // Pick the node with the most blocks
+        // Pick the node with the most blocks, excluding self.
         let best = node_blocks
             .iter()
-            .max_by_key(|nb| nb.block_hashes.len())
-            .unwrap();
+            .filter(|nb| nb.node != self.advertise_addr)
+            .max_by_key(|nb| nb.block_hashes.len());
+
+        let Some(best) = best else {
+            debug!("MetaServer returned only self-node hits for namespace={namespace}, skipping RDMA fetch");
+            let _ = done_tx.send(Vec::new());
+            return (0, done_rx);
+        };
 
         let remote_addr = best.node.clone();
         let remote_hashes: Vec<Vec<u8>> = best.block_hashes.clone();
