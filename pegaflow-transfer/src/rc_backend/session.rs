@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
+
+use mea::oneshot;
 use std::thread;
 
 use log::{debug, warn};
@@ -43,7 +45,7 @@ enum SessionCommand {
     Transfer {
         ops: Vec<RdmaOp>,
         op: TransferOp,
-        done_tx: std_mpsc::SyncSender<Result<usize>>,
+        done_tx: oneshot::Sender<Result<usize>>,
     },
 }
 
@@ -165,8 +167,8 @@ impl RcSession {
         &self,
         ops: Vec<RdmaOp>,
         op: TransferOp,
-    ) -> Result<std_mpsc::Receiver<Result<usize>>> {
-        let (done_tx, done_rx) = std_mpsc::sync_channel(0);
+    ) -> Result<oneshot::Receiver<Result<usize>>> {
+        let (done_tx, done_rx) = oneshot::channel();
         self.cmd_tx
             .send(SessionCommand::Transfer { ops, op, done_tx })
             .map_err(|_| {

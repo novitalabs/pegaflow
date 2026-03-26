@@ -2302,6 +2302,7 @@ dependencies = [
  "clap",
  "libc",
  "log",
+ "mea",
  "parking_lot",
  "pegaflow-common",
  "serde",

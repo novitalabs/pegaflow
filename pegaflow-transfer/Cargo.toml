@@ -16,6 +16,7 @@ serde.workspace = true
 bincode = { version = "2.0.1", features = ["serde"] }
 libc.workspace = true
 clap.workspace = true
+mea = "0.6.3"
 
 [[bin]]
 name = "pegaflow-cpu-bench"

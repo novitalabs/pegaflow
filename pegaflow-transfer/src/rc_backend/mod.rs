@@ -16,6 +16,8 @@ use self::session::{RcSession, RdmaOp};
 use self::state::{AddrConnection, RcBackendState, RegisteredMemoryEntry};
 use std::ptr::NonNull;
 
+use mea::oneshot;
+
 use crate::engine::{NicHandshake, RegisteredMemoryRegion, TransferDesc, TransferOp};
 use crate::error::{Result, TransferError};
 use pegaflow_common::NumaNode;
@@ -360,16 +362,15 @@ impl RcBackend {
         self.state.lock().num_qps()
     }
 
+    /// One receiver per NIC that had work; each yields bytes transferred on that NIC.
     pub(crate) fn batch_transfer_async(
         &self,
         op: TransferOp,
         remote_addr: &str,
         descs: &[TransferDesc],
-    ) -> Result<std::sync::mpsc::Receiver<Result<usize>>> {
+    ) -> Result<Vec<oneshot::Receiver<Result<usize>>>> {
         if descs.is_empty() {
-            let (tx, rx) = std::sync::mpsc::sync_channel(1);
-            let _ = tx.send(Ok(0));
-            return Ok(rx);
+            return Ok(Vec::new());
         }
 
         let nic_count = self.nic_count();
@@ -467,43 +468,10 @@ impl RcBackend {
         );
 
         // --- Submit outside lock ---
-        if nic_work.len() == 1 {
-            // Single NIC path: return its receiver directly.
-            let (session, prepared) = nic_work.into_iter().next().unwrap();
-            return session.transfer_batch_async(prepared, op);
-        }
-
-        // Multi-NIC path: submit to all NICs and aggregate results.
         let mut receivers = Vec::with_capacity(nic_work.len());
         for (session, prepared) in nic_work {
-            let rx = session.transfer_batch_async(prepared, op)?;
-            receivers.push(rx);
+            receivers.push(session.transfer_batch_async(prepared, op)?);
         }
-
-        let (agg_tx, agg_rx) = std::sync::mpsc::sync_channel(1);
-        std::thread::Builder::new()
-            .name("pegaflow-transfer-agg".to_string())
-            .spawn(move || {
-                let mut total_bytes = 0usize;
-                for rx in receivers {
-                    match rx.recv() {
-                        Ok(Ok(bytes)) => total_bytes += bytes,
-                        Ok(Err(e)) => {
-                            let _ = agg_tx.send(Err(e));
-                            return;
-                        }
-                        Err(_) => {
-                            let _ = agg_tx.send(Err(TransferError::Backend(
-                                "session worker channel dropped during aggregation".to_string(),
-                            )));
-                            return;
-                        }
-                    }
-                }
-                let _ = agg_tx.send(Ok(total_bytes));
-            })
-            .map_err(|e| TransferError::Backend(format!("failed to spawn aggregator: {e}")))?;
-
-        Ok(agg_rx)
+        Ok(receivers)
     }
 }

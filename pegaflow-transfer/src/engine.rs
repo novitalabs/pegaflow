@@ -167,9 +167,8 @@ impl TransferEngine {
 
     /// Submit a batch of RDMA READ or WRITE operations against a connected peer.
     ///
-    /// Ops are NUMA-aware distributed across NICs. Returns a `Receiver`
-    /// that yields the total bytes transferred once all RDMA operations complete.
-    /// The caller decides when to block on `.recv()`.
+    /// Ops are NUMA-aware distributed across NICs. Returns one receiver per
+    /// active NIC; each yields the bytes transferred on that NIC.
     ///
     /// The connection must be established via `get_or_prepare` +
     /// `complete_handshake` before calling this method.
@@ -178,7 +177,7 @@ impl TransferEngine {
         op: TransferOp,
         remote_addr: &str,
         descs: &[TransferDesc],
-    ) -> Result<std::sync::mpsc::Receiver<Result<usize>>> {
+    ) -> Result<Vec<mea::oneshot::Receiver<Result<usize>>>> {
         self.backend.batch_transfer_async(op, remote_addr, descs)
     }
 

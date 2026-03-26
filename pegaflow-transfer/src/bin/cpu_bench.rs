@@ -320,13 +320,15 @@ fn run_bench(
             build_block_scatter(ctx.client_buf.ptr, ctx.server_buf.ptr, nblocks, block_size);
 
         let start = Instant::now();
-        let rx = ctx
+        let receivers = ctx
             .client
             .batch_transfer_async(op, "bench-server", &descs)
             .expect("RDMA submit failed");
-        rx.recv()
-            .expect("completion channel dropped")
-            .expect("RDMA transfer failed");
+        for rx in receivers {
+            block_recv(rx)
+                .expect("completion channel dropped")
+                .expect("RDMA transfer failed");
+        }
         let elapsed = start.elapsed();
 
         if i >= warmup {
@@ -645,4 +647,29 @@ fn main() {
 
     println!();
     println!("bench complete.");
+}
+
+fn block_recv<T>(rx: mea::oneshot::Receiver<T>) -> Result<T, mea::oneshot::RecvError> {
+    use std::future::IntoFuture;
+    use std::pin::pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake};
+
+    struct ThreadWaker(thread::Thread);
+    impl Wake for ThreadWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    let waker = Arc::new(ThreadWaker(thread::current())).into();
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = pin!(rx.into_future());
+
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(result) => return result,
+            Poll::Pending => thread::park(),
+        }
+    }
 }

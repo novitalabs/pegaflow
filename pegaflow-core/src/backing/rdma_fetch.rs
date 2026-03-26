@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use log::{debug, info, warn};
+use mea::oneshot;
 use mea::singleflight::Group;
 use pegaflow_proto::proto::engine::engine_client::EngineClient;
 use pegaflow_proto::proto::engine::{
@@ -16,7 +17,6 @@ use pegaflow_proto::proto::engine::{
     ReleaseTransferLockRequest, TransferBlockInfo,
 };
 use pegaflow_transfer::{ConnectionStatus, HandshakeMetadata, TransferDesc, TransferOp};
-use tokio::sync::oneshot;
 use tonic::transport::{Channel, Endpoint};
 
 use pegaflow_common::NumaNode;
@@ -330,7 +330,7 @@ async fn fetch_blocks_via_rdma(
 
     // Build TransferDescs and submit RDMA READ inside a sync block so that
     // all_descs (which contains NonNull<u8>, !Send) is dropped before any .await.
-    let rx = {
+    let receivers = {
         let mut all_descs: Vec<TransferDesc> = Vec::new();
 
         for block_info in blocks {
@@ -394,12 +394,16 @@ async fn fetch_blocks_via_rdma(
             .map_err(|e| format!("RDMA batch_transfer_async failed: {e}"))?
     };
 
-    // Offload blocking recv() to a dedicated thread to avoid blocking the async runtime.
-    let _bytes = tokio::task::spawn_blocking(move || rx.recv_timeout(transfer_timeout))
-        .await
-        .map_err(|e| format!("RDMA transfer task panicked: {e}"))?
-        .map_err(|e| format!("RDMA transfer timed out or channel closed: {e}"))?
-        .map_err(|e| format!("RDMA transfer failed: {e}"))?;
+    tokio::time::timeout(transfer_timeout, async {
+        for rx in receivers {
+            rx.await
+                .map_err(|_| "RDMA transfer channel closed".to_string())?
+                .map_err(|e| format!("RDMA transfer failed: {e}"))?;
+        }
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|_| "RDMA transfer timed out".to_string())??;
 
     // Build SealedBlocks from allocated memory
     let mut result: PrefetchResult = Vec::with_capacity(block_allocs.len());
