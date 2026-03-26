@@ -122,7 +122,7 @@ impl EngineRpcClient {
     /// - clone channel
     /// - create client
     /// - block_on the async closure
-    fn call<F, Fut, T>(&self, py: Python<'_>, f: F) -> PyResult<T>
+    fn call<F, Fut, T>(&self, py: Python<'_>, method: &'static str, f: F) -> PyResult<T>
     where
         F: FnOnce(EngineClient<Channel>) -> Fut + Send,
         Fut: Future<Output = Result<T, GrpcStatus>> + Send,
@@ -132,7 +132,7 @@ impl EngineRpcClient {
         let client = self.client.clone();
         py.detach(move || {
             rt_handle
-                .block_on(async move { f(client).await.map_err(|e| rpc_status_error("rpc", e)) })
+                .block_on(async move { f(client).await.map_err(|e| rpc_status_error(method, e)) })
         })
     }
 }
@@ -300,7 +300,7 @@ impl EngineRpcClient {
     ///
     /// Returns: (ok: bool, message: str)
     fn health(&self, py: Python<'_>) -> PyResult<(bool, String)> {
-        self.call(py, |mut c| async move {
+        self.call(py, "health", |mut c| async move {
             let resp = c.health(HealthRequest {}).await?;
             Ok(resp.into_inner())
         })
@@ -344,7 +344,7 @@ impl EngineRpcClient {
         kv_stride_bytes_list: Vec<u64>,
         segments_list: Vec<u32>,
     ) -> PyResult<(bool, String)> {
-        self.call(py, |mut c| async move {
+        self.call(py, "register_context_batch", |mut c| async move {
             let resp = c
                 .register_context_batch(RegisterContextRequest {
                     instance_id,
@@ -392,7 +392,7 @@ impl EngineRpcClient {
                 block_hashes,
             })
             .collect();
-        self.call(py, |mut c| async move {
+        self.call(py, "save", |mut c| async move {
             let resp = c
                 .save(SaveRequest {
                     instance_id,
@@ -430,7 +430,7 @@ impl EngineRpcClient {
         block_ids: Vec<i32>,
         block_hashes: Vec<Vec<u8>>,
     ) -> PyResult<(bool, String)> {
-        self.call(py, |mut c| async move {
+        self.call(py, "load", |mut c| async move {
             let resp = c
                 .load(LoadRequest {
                     instance_id,
@@ -470,7 +470,7 @@ impl EngineRpcClient {
         block_hashes: Vec<Vec<u8>>,
         req_id: String,
     ) -> PyResult<Py<pyo3::types::PyAny>> {
-        self.call(py, |mut c| async move {
+        self.call(py, "query", |mut c| async move {
             let resp = c
                 .query(QueryRequest {
                     instance_id,
@@ -524,7 +524,7 @@ impl EngineRpcClient {
     ) -> PyResult<Py<pyo3::types::PyAny>> {
         use pegaflow_proto::proto::engine::PrefetchState;
 
-        self.call(py, |mut c| async move {
+        self.call(py, "query_prefetch", |mut c| async move {
             let resp = c
                 .query_prefetch(QueryRequest {
                     instance_id,
@@ -576,7 +576,7 @@ impl EngineRpcClient {
         instance_id: String,
         block_hashes: Vec<Vec<u8>>,
     ) -> PyResult<(bool, String)> {
-        self.call(py, |mut c| async move {
+        self.call(py, "unpin", |mut c| async move {
             let resp = c
                 .unpin(UnpinRequest {
                     instance_id,
@@ -595,7 +595,7 @@ impl EngineRpcClient {
     ///
     /// Returns: (ok: bool, message: str)
     fn unregister_context(&self, py: Python<'_>, instance_id: String) -> PyResult<(bool, String)> {
-        self.call(py, |mut c| async move {
+        self.call(py, "unregister_context", |mut c| async move {
             let resp = c
                 .unregister_context(UnregisterRequest { instance_id })
                 .await?;
@@ -608,7 +608,7 @@ impl EngineRpcClient {
     ///
     /// Returns: (ok: bool, message: str)
     fn shutdown(&self, py: Python<'_>) -> PyResult<(bool, String)> {
-        self.call(py, |mut c| async move {
+        self.call(py, "shutdown", |mut c| async move {
             let resp = c.shutdown(ShutdownRequest {}).await?;
             Ok(resp.into_inner())
         })
