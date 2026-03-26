@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use log::warn;
 use mea::oneshot;
@@ -23,6 +24,9 @@ struct PrefetchState {
     active: HashMap<String, PrefetchEntry>,
     /// Invariant: `inflight_count == active.values().map(|e| e.loading_count).sum()`
     inflight_count: usize,
+    /// req_ids where RDMA remote fetch returned zero blocks (remote evicted).
+    /// Prevents re-triggering RDMA on every subsequent poll for the same request.
+    failed_remote: HashMap<String, Instant>,
 }
 
 impl PrefetchState {
@@ -53,6 +57,7 @@ impl PrefetchScheduler {
             state: Mutex::new(PrefetchState {
                 active: HashMap::new(),
                 inflight_count: 0,
+                failed_remote: HashMap::new(),
             }),
             ssd_store,
             rdma_fetch,
@@ -173,11 +178,13 @@ impl PrefetchScheduler {
         }
 
         // If nothing is loading from SSD and there are no local hits at all,
-        // try RDMA remote fetch from another node.
+        // try RDMA remote fetch from another node — but skip if a previous
+        // attempt for this req_id already came back empty (remote evicted).
         if loading == 0
             && hit == 0
             && !remaining.is_empty()
             && let Some(rdma_fetch) = &self.rdma_fetch
+            && !self.state.lock().failed_remote.contains_key(req_id)
         {
             let (found, rx) = rdma_fetch
                 .submit_remote_fetch(namespace, remaining.to_vec())
@@ -186,6 +193,8 @@ impl PrefetchScheduler {
                 self.state.lock().inflight_count += found;
                 loading = found;
                 blocks_rx = Some(rx);
+            } else {
+                self.state.lock().failed_remote.insert(req_id.to_string(), Instant::now());
             }
         }
 
@@ -207,6 +216,13 @@ impl PrefetchScheduler {
             read_cache.pin_blocks(instance_id, num_workers, &blocks_to_pin);
             PrefetchStatus::Done { hit, missing }
         }
+    }
+
+    pub(super) fn gc_failed_remote(&self, max_age: std::time::Duration) -> usize {
+        let mut state = self.state.lock();
+        let before = state.failed_remote.len();
+        state.failed_remote.retain(|_, ts| ts.elapsed() < max_age);
+        before - state.failed_remote.len()
     }
 }
 

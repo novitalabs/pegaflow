@@ -431,7 +431,12 @@ impl StorageEngine {
 
     /// Remove stale inflight blocks older than `max_age`.
     pub(crate) async fn gc_stale_inflight(&self, max_age: std::time::Duration) -> usize {
-        self.write_pipeline.gc_stale_inflight(max_age).await
+        let cleaned = self.write_pipeline.gc_stale_inflight(max_age).await;
+        let failed = self.prefetch.gc_failed_remote(max_age);
+        if failed > 0 {
+            log::debug!("gc: cleared {failed} stale failed_remote entries");
+        }
+        cleaned + failed
     }
 
     // ---- Cross-node transfer: serving side ----
