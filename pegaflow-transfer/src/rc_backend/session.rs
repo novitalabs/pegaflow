@@ -112,7 +112,7 @@ impl RcSession {
             cmd_tx,
         });
 
-        Self::spawn_worker(Arc::clone(&session), cmd_rx, runtime.numa_node);
+        Self::spawn_worker(Arc::clone(&session), cmd_rx, runtime.numa_node)?;
         Ok(session)
     }
 
@@ -179,8 +179,8 @@ impl RcSession {
         session: Arc<Self>,
         cmd_rx: std_mpsc::Receiver<SessionCommand>,
         numa_node: NumaNode,
-    ) {
-        let _ = thread::Builder::new()
+    ) -> Result<()> {
+        thread::Builder::new()
             .name("pegaflow-rc-session".to_string())
             .spawn(move || {
                 if numa_node.is_valid()
@@ -209,7 +209,9 @@ impl RcSession {
                     "session worker stopped: local_qpn={}",
                     session.local_endpoint.qp_num
                 );
-            });
+            })
+            .map_err(|e| TransferError::Backend(format!("failed to spawn session worker: {e}")))?;
+        Ok(())
     }
 
     fn post_rdma_wr_chain(
