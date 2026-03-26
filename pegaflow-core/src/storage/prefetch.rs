@@ -103,7 +103,13 @@ impl PrefetchScheduler {
         match entry.blocks_rx.try_recv() {
             Err(oneshot::TryRecvError::Empty) => Some(PollResult::StillLoading),
             Ok(ssd_blocks) => {
+                let expected = entry.loading_count;
                 state.remove_entry(req_id);
+                // Remote node returned fewer blocks than MetaServer promised
+                // (likely evicted). Don't re-trigger RDMA on subsequent scans.
+                if ssd_blocks.is_empty() && expected > 0 {
+                    state.failed_remote.insert(req_id.to_string(), Instant::now());
+                }
                 drop(state);
                 read_cache.batch_insert(ssd_blocks);
                 Some(PollResult::Completed)
