@@ -23,6 +23,7 @@ pub fn test_engine() -> PegaEngine {
         metaserver_addr: None,
         advertise_addr: None,
         metaserver_queue_depth: 256,
+        pool_shards: 1,
     })
 }
 

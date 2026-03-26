@@ -1,5 +1,13 @@
 use parking_lot::Mutex;
-use std::{collections::HashMap, num::NonZeroU64, ptr::NonNull, sync::Arc};
+use std::{
+    collections::HashMap,
+    num::NonZeroU64,
+    ptr::NonNull,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use bytesize::ByteSize;
 use log::{error, info, warn};
@@ -244,6 +252,108 @@ unsafe impl Send for PinnedMemoryPool {}
 unsafe impl Sync for PinnedMemoryPool {}
 
 // ============================================================================
+// Sharded Pool Wrapper
+// ============================================================================
+
+/// Wrapper that distributes allocations across multiple `PinnedMemoryPool` shards
+/// using round-robin. Each shard has its own backing memory and allocator, reducing
+/// lock contention under concurrent save workloads.
+///
+/// `PinnedAllocation` returned by `allocate` holds an `Arc` to the specific shard
+/// it was allocated from, so `Drop` automatically frees back to the correct shard.
+#[derive(Debug)]
+pub(crate) struct ShardedPinnedPool {
+    shards: Vec<Arc<PinnedMemoryPool>>,
+    cursor: AtomicUsize,
+}
+
+impl ShardedPinnedPool {
+    /// Create a sharded pool by splitting `total_capacity` evenly across `num_shards` pools.
+    ///
+    /// When `num_shards <= 1`, a single pool is created (equivalent to the old behavior).
+    fn new(
+        total_capacity: usize,
+        num_shards: usize,
+        use_hugepages: bool,
+        ssd_enabled: bool,
+        unit_size_hint: Option<NonZeroU64>,
+    ) -> Self {
+        let num_shards = num_shards.max(1);
+        let per_shard = total_capacity / num_shards;
+
+        if num_shards > 1 {
+            info!(
+                "Creating sharded pinned pool: total={}, shards={}, per_shard={}",
+                ByteSize(total_capacity as u64),
+                num_shards,
+                ByteSize(per_shard as u64)
+            );
+        }
+
+        let shards: Vec<Arc<PinnedMemoryPool>> = (0..num_shards)
+            .map(|_| {
+                Arc::new(PinnedMemoryPool::new(
+                    per_shard,
+                    use_hugepages,
+                    ssd_enabled,
+                    unit_size_hint,
+                ))
+            })
+            .collect();
+
+        Self {
+            shards,
+            cursor: AtomicUsize::new(0),
+        }
+    }
+
+    /// Allocate from shards using round-robin with fallback to all shards.
+    fn allocate(&self, size: NonZeroU64) -> Option<PinnedAllocation> {
+        let n = self.shards.len();
+        let start = self.cursor.fetch_add(1, Ordering::Relaxed) % n;
+
+        for i in 0..n {
+            let idx = (start + i) % n;
+            if let Some(alloc) = self.shards[idx].allocate(size) {
+                return Some(alloc);
+            }
+        }
+        None
+    }
+
+    /// Aggregate usage across all shards.
+    fn usage(&self) -> (u64, u64) {
+        let mut used = 0u64;
+        let mut total = 0u64;
+        for shard in &self.shards {
+            let (u, t) = shard.usage();
+            used += u;
+            total += t;
+        }
+        (used, total)
+    }
+
+    /// Largest contiguous free region across all shards.
+    fn largest_free_allocation(&self) -> u64 {
+        self.shards
+            .iter()
+            .map(|s| s.largest_free_allocation())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Return all backing memory regions (one per shard).
+    fn memory_regions(&self) -> Vec<(NonNull<u8>, usize)> {
+        self.shards.iter().map(|s| s.memory_region()).collect()
+    }
+}
+
+// SAFETY: ShardedPinnedPool owns Arc<PinnedMemoryPool> which are Send + Sync.
+// The AtomicUsize cursor is inherently thread-safe.
+unsafe impl Send for ShardedPinnedPool {}
+unsafe impl Sync for ShardedPinnedPool {}
+
+// ============================================================================
 // NUMA-Aware Pool Management
 // ============================================================================
 
@@ -262,8 +372,8 @@ unsafe impl Sync for PinnedMemoryPool {}
 /// - Fail early during registration with a clear error
 #[derive(Debug)]
 pub(crate) struct NumaAwarePinnedPools {
-    /// Per-NUMA pools indexed by NUMA node ID
-    pools: HashMap<u32, Arc<PinnedMemoryPool>>,
+    /// Per-NUMA sharded pools indexed by NUMA node ID
+    pools: HashMap<u32, ShardedPinnedPool>,
 }
 
 impl NumaAwarePinnedPools {
@@ -286,6 +396,7 @@ impl NumaAwarePinnedPools {
     fn new(
         total_capacity: usize,
         numa_nodes: &[NumaNode],
+        num_shards: usize,
         use_hugepages: bool,
         ssd_enabled: bool,
         unit_size_hint: Option<NonZeroU64>,
@@ -300,10 +411,11 @@ impl NumaAwarePinnedPools {
 
         let per_node_capacity = total_capacity / num_nodes;
         info!(
-            "Creating NUMA-aware pools: total={}, nodes={}, per_node={}",
+            "Creating NUMA-aware pools: total={}, nodes={}, per_node={}, shards_per_node={}",
             ByteSize(total_capacity as u64),
             num_nodes,
-            ByteSize(per_node_capacity as u64)
+            ByteSize(per_node_capacity as u64),
+            num_shards
         );
 
         let mut pools = HashMap::new();
@@ -316,9 +428,15 @@ impl NumaAwarePinnedPools {
             let node_id = node.0;
             let hint = unit_size_hint;
 
-            // Allocate pool on a thread pinned to this NUMA node
+            // Allocate sharded pool on a thread pinned to this NUMA node
             let result = run_on_numa(*node, move || {
-                PinnedMemoryPool::new(per_node_capacity, use_hugepages, ssd_enabled, hint)
+                ShardedPinnedPool::new(
+                    per_node_capacity,
+                    num_shards,
+                    use_hugepages,
+                    ssd_enabled,
+                    hint,
+                )
             });
 
             match result {
@@ -328,7 +446,7 @@ impl NumaAwarePinnedPools {
                         node_id,
                         ByteSize(per_node_capacity as u64)
                     );
-                    pools.insert(node_id, Arc::new(pool));
+                    pools.insert(node_id, pool);
                 }
                 Err(e) => {
                     panic!(
@@ -360,6 +478,14 @@ impl NumaAwarePinnedPools {
         self.pools.get(&numa_node.0)?.allocate(size).map(Arc::new)
     }
 
+    /// Return all backing memory regions across all NUMA nodes and shards.
+    fn memory_regions(&self) -> Vec<(NonNull<u8>, usize)> {
+        self.pools
+            .values()
+            .flat_map(|p| p.memory_regions())
+            .collect()
+    }
+
     /// Get aggregate usage across all pools: (used_bytes, total_bytes)
     fn total_usage(&self) -> (u64, u64) {
         let mut used = 0u64;
@@ -386,7 +512,7 @@ impl NumaAwarePinnedPools {
 #[derive(Debug)]
 pub(crate) enum PinnedAllocator {
     /// Global pool (NUMA disabled or single-node systems)
-    Global(Arc<PinnedMemoryPool>),
+    Global(ShardedPinnedPool),
     /// NUMA-aware pools (multi-socket systems)
     Numa(NumaAwarePinnedPools),
 }
@@ -395,17 +521,18 @@ impl PinnedAllocator {
     /// Create a new global allocator.
     pub(crate) fn new_global(
         capacity: usize,
+        num_shards: usize,
         use_hugepages: bool,
         ssd_enabled: bool,
         unit_hint: Option<NonZeroU64>,
     ) -> Self {
-        let pool = Arc::new(PinnedMemoryPool::new(
+        Self::Global(ShardedPinnedPool::new(
             capacity,
+            num_shards,
             use_hugepages,
             ssd_enabled,
             unit_hint,
-        ));
-        Self::Global(pool)
+        ))
     }
 
     /// Create a new NUMA-aware allocator.
@@ -414,6 +541,7 @@ impl PinnedAllocator {
     pub(crate) fn new_numa(
         capacity: usize,
         numa_nodes: &[NumaNode],
+        num_shards: usize,
         use_hugepages: bool,
         ssd_enabled: bool,
         unit_hint: Option<NonZeroU64>,
@@ -422,11 +550,12 @@ impl PinnedAllocator {
             warn!(
                 "NUMA allocator requested but no nodes provided, falling back to global allocator"
             );
-            return Self::new_global(capacity, use_hugepages, ssd_enabled, unit_hint);
+            return Self::new_global(capacity, num_shards, use_hugepages, ssd_enabled, unit_hint);
         }
         Self::Numa(NumaAwarePinnedPools::new(
             capacity,
             numa_nodes,
+            num_shards,
             use_hugepages,
             ssd_enabled,
             unit_hint,
@@ -458,22 +587,16 @@ impl PinnedAllocator {
 
     /// Get the largest contiguous free region available.
     ///
-    /// For NUMA allocators, returns the sum of all pools' free space
-    /// (conservative estimate for fragmentation).
+    /// For NUMA allocators, returns the minimum largest free region across all nodes.
     pub(crate) fn largest_free_allocation(&self) -> u64 {
         match self {
             Self::Global(pool) => pool.largest_free_allocation(),
-            Self::Numa(pools) => {
-                // For monitoring purposes, return the minimum largest free region
-                // across all NUMA nodes. This reflects the most constrained node
-                // and is accurate for checking if a contiguous allocation can succeed.
-                pools
-                    .pools
-                    .values()
-                    .map(|p| p.largest_free_allocation())
-                    .min()
-                    .unwrap_or(0)
-            }
+            Self::Numa(pools) => pools
+                .pools
+                .values()
+                .map(|p| p.largest_free_allocation())
+                .min()
+                .unwrap_or(0),
         }
     }
 
@@ -483,17 +606,15 @@ impl PinnedAllocator {
     }
 
     /// Return all backing memory regions as `(ptr, len)` pairs.
-    ///
-    /// For a global allocator this is a single region; for NUMA it is one per node.
     pub(crate) fn memory_regions(&self) -> Vec<(NonNull<u8>, usize)> {
         match self {
-            Self::Global(pool) => vec![pool.memory_region()],
-            Self::Numa(pools) => pools.pools.values().map(|p| p.memory_region()).collect(),
+            Self::Global(pool) => pool.memory_regions(),
+            Self::Numa(pools) => pools.memory_regions(),
         }
     }
 }
 
-// SAFETY: PinnedAllocator owns Arc<PinnedMemoryPool> or NumaAwarePinnedPools,
+// SAFETY: PinnedAllocator owns ShardedPinnedPool or NumaAwarePinnedPools,
 // both of which are Send + Sync.
 unsafe impl Send for PinnedAllocator {}
 unsafe impl Sync for PinnedAllocator {}
