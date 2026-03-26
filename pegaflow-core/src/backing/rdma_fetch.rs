@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use log::{debug, info, warn};
+use mea::oneshot;
 use mea::singleflight::Group;
 use pegaflow_proto::proto::engine::engine_client::EngineClient;
 use pegaflow_proto::proto::engine::{
@@ -16,7 +17,6 @@ use pegaflow_proto::proto::engine::{
     ReleaseTransferLockRequest, TransferBlockInfo,
 };
 use pegaflow_transfer::{ConnectionStatus, HandshakeMetadata, TransferDesc, TransferOp};
-use tokio::sync::oneshot;
 use tonic::transport::{Channel, Endpoint};
 
 use pegaflow_common::NumaNode;
@@ -281,13 +281,16 @@ async fn ensure_connected(
             // Fast path: already connected
             let local_meta = match rdma.engine().get_or_prepare(remote_addr) {
                 Ok(ConnectionStatus::Existing) => return Ok(()),
+                Ok(ConnectionStatus::Connecting) => {
+                    return Err("handshake to this peer already in progress".into());
+                }
                 Ok(ConnectionStatus::Prepared(m)) => m,
                 Err(e) => return Err(format!("RDMA prepare: {e}")),
             };
 
             // Exchange handshake metadata via the dedicated RdmaHandshake RPC.
             let mut client = get_or_create_channel(grpc_channels, remote_addr)
-                .inspect_err(|_| rdma.engine().abort_handshake(&local_meta))?;
+                .inspect_err(|_| rdma.engine().abort_handshake(remote_addr, &local_meta))?;
 
             let request = RdmaHandshakeRequest {
                 requester_id: advertise_addr.to_string(),
@@ -297,12 +300,12 @@ async fn ensure_connected(
                 .rdma_handshake(request)
                 .await
                 .map_err(|e| format!("RdmaHandshake RPC failed: {e}"))
-                .inspect_err(|_| rdma.engine().abort_handshake(&local_meta))?
+                .inspect_err(|_| rdma.engine().abort_handshake(remote_addr, &local_meta))?
                 .into_inner();
 
             // Complete the RDMA connection with the server's QP info.
             finish_handshake(rdma, remote_addr, &local_meta, &response.handshake_metadata)
-                .inspect_err(|_| rdma.engine().abort_handshake(&local_meta))?;
+                .inspect_err(|_| rdma.engine().abort_handshake(remote_addr, &local_meta))?;
 
             Ok(())
         })
@@ -327,7 +330,7 @@ async fn fetch_blocks_via_rdma(
 
     // Build TransferDescs and submit RDMA READ inside a sync block so that
     // all_descs (which contains NonNull<u8>, !Send) is dropped before any .await.
-    let rx = {
+    let receivers = {
         let mut all_descs: Vec<TransferDesc> = Vec::new();
 
         for block_info in blocks {
@@ -391,12 +394,16 @@ async fn fetch_blocks_via_rdma(
             .map_err(|e| format!("RDMA batch_transfer_async failed: {e}"))?
     };
 
-    // Offload blocking recv() to a dedicated thread to avoid blocking the async runtime.
-    let _bytes = tokio::task::spawn_blocking(move || rx.recv_timeout(transfer_timeout))
-        .await
-        .map_err(|e| format!("RDMA transfer task panicked: {e}"))?
-        .map_err(|e| format!("RDMA transfer timed out or channel closed: {e}"))?
-        .map_err(|e| format!("RDMA transfer failed: {e}"))?;
+    tokio::time::timeout(transfer_timeout, async {
+        for rx in receivers {
+            rx.await
+                .map_err(|_| "RDMA transfer channel closed".to_string())?
+                .map_err(|e| format!("RDMA transfer failed: {e}"))?;
+        }
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|_| "RDMA transfer timed out".to_string())??;
 
     // Build SealedBlocks from allocated memory
     let mut result: PrefetchResult = Vec::with_capacity(block_allocs.len());

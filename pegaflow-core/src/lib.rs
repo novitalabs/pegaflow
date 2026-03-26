@@ -669,10 +669,14 @@ impl PegaEngine {
             pegaflow_transfer::ConnectionStatus::Existing => {
                 unreachable!("just invalidated connection for {client_addr}")
             }
+            pegaflow_transfer::ConnectionStatus::Connecting => {
+                return Err(format!("handshake to {client_addr} already in progress"));
+            }
         };
         rdma.engine()
             .complete_handshake(client_addr, &server_meta, &client_meta)
             .map_err(|e| format!("complete_handshake failed: {e}"))?;
+        info!("RDMA handshake accepted: client={client_addr}");
         Ok(server_meta.to_bytes())
     }
 }

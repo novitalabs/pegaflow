@@ -74,7 +74,7 @@ pub(crate) fn new_rdma(
     match RdmaTransport::new(nic_names, allocator) {
         Ok(t) => Some(Arc::new(t)),
         Err(e) => {
-            error!("Failed to initialise RDMA transport: {e}");
+            error!("Failed to initialise RDMA transport (nics={nic_names:?}): {e}");
             None
         }
     }

@@ -93,6 +93,8 @@ impl HandshakeMetadata {
 pub enum ConnectionStatus {
     /// Already connected; call batch_transfer_async directly.
     Existing,
+    /// A handshake to this peer is already in progress.
+    Connecting,
     /// Not connected. Exchange this local metadata with remote peer via gRPC,
     /// then call complete_handshake. On failure, call abort_handshake.
     Prepared(HandshakeMetadata),
@@ -128,6 +130,7 @@ impl TransferEngine {
     pub fn get_or_prepare(&self, remote_addr: &str) -> Result<ConnectionStatus> {
         match self.backend.get_or_prepare(remote_addr)? {
             GetOrPrepareResult::Existing => Ok(ConnectionStatus::Existing),
+            GetOrPrepareResult::AlreadyConnecting => Ok(ConnectionStatus::Connecting),
             GetOrPrepareResult::NeedHandshake(nics) => {
                 Ok(ConnectionStatus::Prepared(HandshakeMetadata { nics }))
             }
@@ -146,8 +149,8 @@ impl TransferEngine {
     }
 
     /// Drop pending sessions created by get_or_prepare when handshake failed.
-    pub fn abort_handshake(&self, local_meta: &HandshakeMetadata) {
-        self.backend.abort_handshake(&local_meta.nics);
+    pub fn abort_handshake(&self, remote_addr: &str, local_meta: &HandshakeMetadata) {
+        self.backend.abort_handshake(remote_addr, &local_meta.nics);
     }
 
     /// Return cached local handshake metadata for an established connection.
@@ -164,9 +167,8 @@ impl TransferEngine {
 
     /// Submit a batch of RDMA READ or WRITE operations against a connected peer.
     ///
-    /// Ops are NUMA-aware distributed across NICs. Returns a `Receiver`
-    /// that yields the total bytes transferred once all RDMA operations complete.
-    /// The caller decides when to block on `.recv()`.
+    /// Ops are NUMA-aware distributed across NICs. Returns one receiver per
+    /// active NIC; each yields the bytes transferred on that NIC.
     ///
     /// The connection must be established via `get_or_prepare` +
     /// `complete_handshake` before calling this method.
@@ -175,8 +177,13 @@ impl TransferEngine {
         op: TransferOp,
         remote_addr: &str,
         descs: &[TransferDesc],
-    ) -> Result<std::sync::mpsc::Receiver<Result<usize>>> {
+    ) -> Result<Vec<mea::oneshot::Receiver<Result<usize>>>> {
         self.backend.batch_transfer_async(op, remote_addr, descs)
+    }
+
+    /// Number of active RC queue pairs across all NICs.
+    pub fn num_qps(&self) -> usize {
+        self.backend.num_qps()
     }
 }
 

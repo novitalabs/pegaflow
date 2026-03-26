@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
+
+use mea::oneshot;
 use std::thread;
 
 use log::{debug, warn};
@@ -43,7 +45,7 @@ enum SessionCommand {
     Transfer {
         ops: Vec<RdmaOp>,
         op: TransferOp,
-        done_tx: std_mpsc::SyncSender<Result<usize>>,
+        done_tx: oneshot::Sender<Result<usize>>,
     },
 }
 
@@ -112,7 +114,7 @@ impl RcSession {
             cmd_tx,
         });
 
-        Self::spawn_worker(Arc::clone(&session), cmd_rx, runtime.numa_node);
+        Self::spawn_worker(Arc::clone(&session), cmd_rx, runtime.numa_node)?;
         Ok(session)
     }
 
@@ -165,8 +167,8 @@ impl RcSession {
         &self,
         ops: Vec<RdmaOp>,
         op: TransferOp,
-    ) -> Result<std_mpsc::Receiver<Result<usize>>> {
-        let (done_tx, done_rx) = std_mpsc::sync_channel(0);
+    ) -> Result<oneshot::Receiver<Result<usize>>> {
+        let (done_tx, done_rx) = oneshot::channel();
         self.cmd_tx
             .send(SessionCommand::Transfer { ops, op, done_tx })
             .map_err(|_| {
@@ -179,8 +181,8 @@ impl RcSession {
         session: Arc<Self>,
         cmd_rx: std_mpsc::Receiver<SessionCommand>,
         numa_node: NumaNode,
-    ) {
-        let _ = thread::Builder::new()
+    ) -> Result<()> {
+        thread::Builder::new()
             .name("pegaflow-rc-session".to_string())
             .spawn(move || {
                 if numa_node.is_valid()
@@ -209,7 +211,9 @@ impl RcSession {
                     "session worker stopped: local_qpn={}",
                     session.local_endpoint.qp_num
                 );
-            });
+            })
+            .map_err(|e| TransferError::Backend(format!("failed to spawn session worker: {e}")))?;
+        Ok(())
     }
 
     fn post_rdma_wr_chain(
@@ -294,7 +298,8 @@ impl RcSession {
                         };
                         if wc.status() != WorkCompletionStatus::Success as u32 {
                             return Err(TransferError::Backend(format!(
-                                "send completion failed: status={}, opcode={}, vendor_err={}",
+                                "send completion failed: local_qpn={}, status={}, opcode={}, vendor_err={}",
+                                session.local_endpoint.qp_num,
                                 wc.status(),
                                 wc.opcode(),
                                 wc.vendor_err()
@@ -311,7 +316,8 @@ impl RcSession {
                 }
                 Err(error) => {
                     return Err(TransferError::Backend(format!(
-                        "poll send CQ failed: {error}"
+                        "poll send CQ failed: local_qpn={}, {error}",
+                        session.local_endpoint.qp_num
                     )));
                 }
             }

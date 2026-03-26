@@ -1,8 +1,10 @@
 use opentelemetry::{
     global,
-    metrics::{Counter, Histogram, Meter, UpDownCounter},
+    metrics::{Counter, Histogram, Meter, ObservableGauge, UpDownCounter},
 };
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
+
+use crate::backing::RdmaTransport;
 
 pub(crate) struct CoreMetrics {
     // Pinned pool (allocator-level)
@@ -107,6 +109,29 @@ fn duration_seconds_boundaries() -> Vec<f64> {
         2.0,   // 2s
         5.0,   // 5s
     ]
+}
+
+struct RdmaGaugeHandles {
+    _qps: ObservableGauge<u64>,
+}
+
+static RDMA_GAUGES: OnceLock<RdmaGaugeHandles> = OnceLock::new();
+
+/// Register RDMA observable gauges backed by the given transport.
+/// Must be called after [`RdmaTransport`] is created; safe to call multiple times (no-op after first).
+pub(crate) fn register_rdma_gauges(transport: &Arc<RdmaTransport>) {
+    let t = Arc::clone(transport);
+    RDMA_GAUGES.get_or_init(|| {
+        let meter = init_meter();
+        let qps = meter
+            .u64_observable_gauge("pegaflow_rdma_qps")
+            .with_description("Active RC queue pairs across all RDMA NICs")
+            .with_callback(move |observer| {
+                observer.observe(t.engine().num_qps() as u64, &[]);
+            })
+            .build();
+        RdmaGaugeHandles { _qps: qps }
+    });
 }
 
 pub(crate) fn core_metrics() -> &'static CoreMetrics {

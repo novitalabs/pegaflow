@@ -2,8 +2,8 @@ use std::sync::{Arc, Weak};
 
 use bytesize::ByteSize;
 use log::{debug, error, info, warn};
+use mea::oneshot;
 use parking_lot::Mutex;
-use tokio::sync::oneshot;
 
 use crate::block::{BlockKey, SealedBlock};
 use crate::metrics::core_metrics;

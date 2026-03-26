@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use sideway::ibverbs::memory_region::MemoryRegion;
@@ -117,14 +117,22 @@ pub(super) struct RcBackendState {
     pub(super) nics: Vec<PerNicState>,
     /// addr -> established connection info
     pub(super) addr_connections: HashMap<String, AddrConnection>,
+    /// Addresses with a handshake in progress. Prevents concurrent
+    /// `get_or_prepare` calls from creating duplicate QPs for the same peer.
+    pub(super) connecting: HashSet<String>,
 }
 
 impl RcBackendState {
+    pub(super) fn num_qps(&self) -> usize {
+        self.nics.iter().map(|n| n.sessions.len()).sum()
+    }
+
     pub(super) fn new(nic_count: usize) -> Self {
         Self {
             registered: HashMap::new(),
             nics: (0..nic_count).map(|_| PerNicState::default()).collect(),
             addr_connections: HashMap::new(),
+            connecting: HashSet::new(),
         }
     }
 

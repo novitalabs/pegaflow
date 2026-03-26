@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use log::warn;
+use mea::oneshot;
 use parking_lot::Mutex;
-use tokio::sync::oneshot;
 
 use crate::backing::{PrefetchResult, RdmaFetchStore, SsdBackingStore};
 use crate::block::{BlockKey, PrefetchStatus};
@@ -96,14 +96,14 @@ impl PrefetchScheduler {
         let entry = state.active.get_mut(req_id)?;
 
         match entry.blocks_rx.try_recv() {
-            Err(oneshot::error::TryRecvError::Empty) => Some(PollResult::StillLoading),
+            Err(oneshot::TryRecvError::Empty) => Some(PollResult::StillLoading),
             Ok(ssd_blocks) => {
                 state.remove_entry(req_id);
                 drop(state);
                 read_cache.batch_insert(ssd_blocks);
                 Some(PollResult::Completed)
             }
-            Err(oneshot::error::TryRecvError::Closed) => {
+            Err(oneshot::TryRecvError::Disconnected) => {
                 warn!(
                     "Backing prefetch sender dropped for req_id={}, falling back to re-scan",
                     req_id

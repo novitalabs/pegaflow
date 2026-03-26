@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
-use log::debug;
+use log::{debug, info, warn};
 use parking_lot::Mutex;
 use sideway::ibverbs::AccessFlags;
 
@@ -15,6 +15,8 @@ use self::runtime::RcRuntime;
 use self::session::{RcSession, RdmaOp};
 use self::state::{AddrConnection, RcBackendState, RegisteredMemoryEntry};
 use std::ptr::NonNull;
+
+use mea::oneshot;
 
 use crate::engine::{NicHandshake, RegisteredMemoryRegion, TransferDesc, TransferOp};
 use crate::error::{Result, TransferError};
@@ -92,6 +94,7 @@ impl NumaRoundRobin {
 
 pub(crate) enum GetOrPrepareResult {
     Existing,
+    AlreadyConnecting,
     NeedHandshake(Vec<NicHandshake>),
 }
 
@@ -113,9 +116,7 @@ impl RcBackend {
             if name.trim().is_empty() {
                 return Err(TransferError::InvalidArgument("nic_name is empty"));
             }
-            log::info!("rc backend initialize: nic={}", name);
             let runtime = RcRuntime::open(name)?;
-            log::info!("rc backend initialized: nic={}", name);
             runtimes.push(runtime);
         }
         let nic_count = runtimes.len();
@@ -211,7 +212,12 @@ impl RcBackend {
         let mut sessions = Vec::with_capacity(self.nic_count());
         for runtime in &self.runtimes {
             let psn_seed = self.psn_counter.fetch_add(1, Ordering::Relaxed);
-            let session = RcSession::create(runtime, psn_seed)?;
+            let session = RcSession::create(runtime, psn_seed).map_err(|e| {
+                TransferError::Backend(format!(
+                    "QP creation failed on nic={}: {e}",
+                    runtime.nic_name
+                ))
+            })?;
             sessions.push(session);
         }
 
@@ -231,13 +237,23 @@ impl RcBackend {
     /// Check if connected to remote_addr; if not, prepare local QPs.
     pub(crate) fn get_or_prepare(&self, remote_addr: &str) -> Result<GetOrPrepareResult> {
         {
-            let state = self.state.lock();
+            let mut state = self.state.lock();
             if state.addr_connections.contains_key(remote_addr) {
                 return Ok(GetOrPrepareResult::Existing);
             }
+            if state.connecting.contains(remote_addr) {
+                return Ok(GetOrPrepareResult::AlreadyConnecting);
+            }
+            state.connecting.insert(remote_addr.to_string());
         }
-        let nics = self.prepare_handshake()?;
-        Ok(GetOrPrepareResult::NeedHandshake(nics))
+        match self.prepare_handshake() {
+            Ok(nics) => Ok(GetOrPrepareResult::NeedHandshake(nics)),
+            Err(e) => {
+                let removed = self.state.lock().connecting.remove(remote_addr);
+                debug_assert!(removed, "connecting set should contain {remote_addr}");
+                Err(e)
+            }
+        }
     }
 
     /// Complete a connection after handshake exchange.
@@ -264,6 +280,8 @@ impl RcBackend {
                 for (nic_idx, nic) in local_nics.iter().enumerate() {
                     state.nics[nic_idx].remove_pending_by_qpn(nic.endpoint.qp_num);
                 }
+                state.connecting.remove(remote_addr);
+                info!("handshake won by concurrent path: remote={remote_addr}");
                 return Ok(());
             }
             let mut sessions = Vec::with_capacity(nic_count);
@@ -293,6 +311,12 @@ impl RcBackend {
             state.nics[nic_idx].sessions.insert(remote_qpn, session);
             remote_qpns.push(remote_qpn);
         }
+        let removed = state.connecting.remove(remote_addr);
+        debug_assert!(removed, "connecting set should contain {remote_addr}");
+        let local_qpns: Vec<u32> = local_nics.iter().map(|n| n.endpoint.qp_num).collect();
+        info!(
+            "RDMA connection established: remote={remote_addr}, local_qpns={local_qpns:?}, remote_qpns={remote_qpns:?}"
+        );
         state.addr_connections.insert(
             remote_addr.to_string(),
             AddrConnection {
@@ -304,11 +328,14 @@ impl RcBackend {
     }
 
     /// Drop pending sessions created by get_or_prepare when handshake failed.
-    pub(crate) fn abort_handshake(&self, local_nics: &[NicHandshake]) {
+    pub(crate) fn abort_handshake(&self, remote_addr: &str, local_nics: &[NicHandshake]) {
         let mut state = self.state.lock();
+        let removed = state.connecting.remove(remote_addr);
+        debug_assert!(removed, "connecting set should contain {remote_addr}");
         for (nic_idx, nic) in local_nics.iter().enumerate() {
             state.nics[nic_idx].remove_pending_by_qpn(nic.endpoint.qp_num);
         }
+        warn!("handshake aborted: remote={remote_addr}");
     }
 
     /// Get local NicHandshake metadata for an established connection.
@@ -327,19 +354,23 @@ impl RcBackend {
             for (nic_idx, &remote_qpn) in conn.remote_qpns.iter().enumerate() {
                 state.nics[nic_idx].cleanup_connection(remote_qpn);
             }
+            info!("connection invalidated: remote={remote_addr}");
         }
     }
 
+    pub(crate) fn num_qps(&self) -> usize {
+        self.state.lock().num_qps()
+    }
+
+    /// One receiver per NIC that had work; each yields bytes transferred on that NIC.
     pub(crate) fn batch_transfer_async(
         &self,
         op: TransferOp,
         remote_addr: &str,
         descs: &[TransferDesc],
-    ) -> Result<std::sync::mpsc::Receiver<Result<usize>>> {
+    ) -> Result<Vec<oneshot::Receiver<Result<usize>>>> {
         if descs.is_empty() {
-            let (tx, rx) = std::sync::mpsc::sync_channel(1);
-            let _ = tx.send(Ok(0));
-            return Ok(rx);
+            return Ok(Vec::new());
         }
 
         let nic_count = self.nic_count();
@@ -437,43 +468,10 @@ impl RcBackend {
         );
 
         // --- Submit outside lock ---
-        if nic_work.len() == 1 {
-            // Single NIC path: return its receiver directly.
-            let (session, prepared) = nic_work.into_iter().next().unwrap();
-            return session.transfer_batch_async(prepared, op);
-        }
-
-        // Multi-NIC path: submit to all NICs and aggregate results.
         let mut receivers = Vec::with_capacity(nic_work.len());
         for (session, prepared) in nic_work {
-            let rx = session.transfer_batch_async(prepared, op)?;
-            receivers.push(rx);
+            receivers.push(session.transfer_batch_async(prepared, op)?);
         }
-
-        let (agg_tx, agg_rx) = std::sync::mpsc::sync_channel(1);
-        std::thread::Builder::new()
-            .name("pegaflow-transfer-agg".to_string())
-            .spawn(move || {
-                let mut total_bytes = 0usize;
-                for rx in receivers {
-                    match rx.recv() {
-                        Ok(Ok(bytes)) => total_bytes += bytes,
-                        Ok(Err(e)) => {
-                            let _ = agg_tx.send(Err(e));
-                            return;
-                        }
-                        Err(_) => {
-                            let _ = agg_tx.send(Err(TransferError::Backend(
-                                "session worker channel dropped during aggregation".to_string(),
-                            )));
-                            return;
-                        }
-                    }
-                }
-                let _ = agg_tx.send(Ok(total_bytes));
-            })
-            .map_err(|e| TransferError::Backend(format!("failed to spawn aggregator: {e}")))?;
-
-        Ok(agg_rx)
+        Ok(receivers)
     }
 }

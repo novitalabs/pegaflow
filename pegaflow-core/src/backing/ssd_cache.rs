@@ -1,12 +1,12 @@
 use futures::stream::{FuturesOrdered, FuturesUnordered, StreamExt};
 use log::{debug, warn};
+use mea::oneshot;
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
-use tokio::sync::oneshot;
 
 use super::ssd::SsdBackingStore;
 use super::uring::UringIoEngine;
