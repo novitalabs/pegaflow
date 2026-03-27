@@ -48,7 +48,7 @@ for each NUMA group:
 - 实现完成，`cargo check --bin pegaflow-cpu-bench` 通过
 - 新增 `build_numa_scatter` 函数：按 NUMA node round-robin 交错分配 block 到对应 buffer
 - all-NIC phase 在 per-NUMA bench 后执行，条件：未指定 `--nic`/`--numa` 且网卡跨 >1 NUMA group
-- H200 机器实测通过（4×400Gbps RoCE, 2 NUMA, `--exclude-nic mlx5_0`）
+- H20 机器实测通过（4×400Gbps RoCE, 2 NUMA, `--exclude-nic mlx5_0`）
   - 拓扑：NUMA0 mlx5_1/mlx5_2, NUMA1 mlx5_3/mlx5_4
   - 单卡：Write ~361 Gbps, Read ~304 Gbps
   - 同 NUMA 2卡：Write ~717 Gbps, Read ~584-606 Gbps
