@@ -184,6 +184,36 @@ pub fn build_block_scatter(
         .collect()
 }
 
+pub fn build_segmented_block_scatter(
+    local_base: NonNull<u8>,
+    remote_base: NonNull<u8>,
+    nblocks: usize,
+    block_size: usize,
+    descs_per_block: usize,
+) -> Vec<TransferDesc> {
+    assert!(descs_per_block > 0, "descs_per_block must be > 0");
+    assert_eq!(
+        block_size % descs_per_block,
+        0,
+        "block_size must be divisible by descs_per_block"
+    );
+
+    let seg_size = block_size / descs_per_block;
+    let mut descs = Vec::with_capacity(nblocks * descs_per_block);
+    for block_idx in 0..nblocks {
+        let block_off = block_idx * block_size;
+        for seg_idx in 0..descs_per_block {
+            let seg_off = block_off + seg_idx * seg_size;
+            descs.push(TransferDesc {
+                local_ptr: unsafe { NonNull::new_unchecked(local_base.as_ptr().add(seg_off)) },
+                remote_ptr: unsafe { NonNull::new_unchecked(remote_base.as_ptr().add(seg_off)) },
+                len: seg_size,
+            });
+        }
+    }
+    descs
+}
+
 pub fn build_numa_scatter(
     client_bufs: &[NumaBuffer],
     server_bufs: &[NumaBuffer],

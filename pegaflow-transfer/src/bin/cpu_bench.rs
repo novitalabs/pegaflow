@@ -10,8 +10,9 @@ use std::time::Instant;
 
 use clap::Parser;
 use pegaflow_transfer::bench_support::{
-    NumaBuffer, block_recv, build_block_scatter, build_numa_scatter, format_size, gbps,
-    generate_task_schedule, gib_per_sec, parse_block_range, parse_size, percentile,
+    NumaBuffer, block_recv, build_segmented_block_scatter, build_segmented_numa_scatter,
+    format_size, gbps, generate_task_schedule, gib_per_sec, parse_block_range, parse_size,
+    percentile,
 };
 use pegaflow_transfer::rdma_topo::SystemTopology;
 use pegaflow_transfer::{MemoryRegion, TransferEngine, TransferOp, init_logging};
@@ -59,6 +60,10 @@ struct Cli {
     /// Restrict to a single NUMA node (e.g. 0).
     #[arg(long)]
     numa: Option<u32>,
+
+    /// Split each logical block into multiple RDMA descriptors.
+    #[arg(long, default_value_t = 1)]
+    descs_per_block: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -81,6 +86,7 @@ struct EngineContext {
 struct TaskResult {
     latency_ms: f64,
     bytes: usize,
+    descs: usize,
 }
 
 struct BenchResult {
@@ -98,12 +104,18 @@ fn run_bench(
     schedule: &[usize],
     warmup: usize,
     block_size: usize,
+    descs_per_block: usize,
 ) -> BenchResult {
     let mut tasks = Vec::with_capacity(schedule.len().saturating_sub(warmup));
 
     for (i, &nblocks) in schedule.iter().enumerate() {
-        let descs =
-            build_block_scatter(ctx.client_buf.ptr, ctx.server_buf.ptr, nblocks, block_size);
+        let descs = build_segmented_block_scatter(
+            ctx.client_buf.ptr,
+            ctx.server_buf.ptr,
+            nblocks,
+            block_size,
+            descs_per_block,
+        );
 
         let start = Instant::now();
         let receivers = ctx
@@ -121,6 +133,7 @@ fn run_bench(
             tasks.push(TaskResult {
                 latency_ms: elapsed.as_secs_f64() * 1000.0,
                 bytes: nblocks * block_size,
+                descs: descs.len(),
             });
         }
     }
@@ -141,12 +154,14 @@ fn print_bench_result(
     block_size: usize,
     numa: u32,
     nic_count: usize,
+    descs_per_block: usize,
 ) {
     let mut latencies: Vec<f64> = result.tasks.iter().map(|t| t.latency_ms).collect();
     latencies.sort_by(f64::total_cmp);
 
     let avg_bytes = result.tasks.iter().map(|t| t.bytes).sum::<usize>() / result.tasks.len().max(1);
     let avg_blocks = avg_bytes / block_size;
+    let avg_descs = result.tasks.iter().map(|t| t.descs).sum::<usize>() / result.tasks.len().max(1);
 
     let p50 = percentile(&latencies, 0.50);
     let p95 = percentile(&latencies, 0.95);
@@ -166,18 +181,29 @@ fn print_bench_result(
     }
     if nic_count > 1 {
         println!(
-            "  avg {} blocks x {}  ({:.1} MB/task, split across {} NICs)",
+            "  avg {} blocks x {}  ({:.1} MB/task, split across {} NICs, {} descs/task, {} per desc)",
             avg_blocks,
             format_size(block_size),
             avg_bytes as f64 / (1024.0 * 1024.0),
             nic_count,
+            avg_descs,
+            format_size(avg_bytes / avg_descs.max(1)),
         );
     } else {
         println!(
-            "  avg {} blocks x {}  ({:.1} MB/task)",
+            "  avg {} blocks x {}  ({:.1} MB/task, {} descs/task, {} per desc)",
             avg_blocks,
             format_size(block_size),
             avg_bytes as f64 / (1024.0 * 1024.0),
+            avg_descs,
+            format_size(avg_bytes / avg_descs.max(1)),
+        );
+    }
+    if descs_per_block > 1 {
+        println!(
+            "  profile: {} descs/block ({})",
+            descs_per_block,
+            format_size(block_size / descs_per_block),
         );
     }
     println!("  p50={:.2}ms  p95={:.2}ms  p99={:.2}ms", p50, p95, p99);
@@ -281,13 +307,19 @@ fn main() {
     let block_size = parse_size(&cli.block_size);
     let block_range = parse_block_range(&cli.blocks_per_task);
     let total_tasks = cli.warmup_tasks + cli.tasks;
+    assert!(cli.descs_per_block > 0, "--descs-per-block must be > 0");
+    assert_eq!(
+        block_size % cli.descs_per_block,
+        0,
+        "block_size must be divisible by descs_per_block"
+    );
 
     let schedule = generate_task_schedule(total_tasks, block_range, 0x42);
     let max_blocks = *schedule.iter().max().unwrap();
 
     println!(
-        "pegaflow-cpu-bench: block_size={} blocks_per_task={} tasks={} warmup={}",
-        cli.block_size, cli.blocks_per_task, cli.tasks, cli.warmup_tasks,
+        "pegaflow-cpu-bench: block_size={} blocks_per_task={} descs_per_block={} tasks={} warmup={}",
+        cli.block_size, cli.blocks_per_task, cli.descs_per_block, cli.tasks, cli.warmup_tasks,
     );
     if block_range.0 != block_range.1 {
         println!(
@@ -385,8 +417,22 @@ fn main() {
                 if op == TransferOp::Read {
                     ctx.client_buf.fill(0x00);
                 }
-                let result = run_bench(ctx, op, &schedule, cli.warmup_tasks, block_size);
-                print_bench_result(&result, op, block_size, group.node.0, 1);
+                let result = run_bench(
+                    ctx,
+                    op,
+                    &schedule,
+                    cli.warmup_tasks,
+                    block_size,
+                    cli.descs_per_block,
+                );
+                print_bench_result(
+                    &result,
+                    op,
+                    block_size,
+                    group.node.0,
+                    1,
+                    cli.descs_per_block,
+                );
             }
 
             // Phase 2: multi-NIC aggregate (only if >1 NIC).
@@ -394,8 +440,22 @@ fn main() {
                 if op == TransferOp::Read {
                     ctx.client_buf.fill(0x00);
                 }
-                let result = run_bench(ctx, op, &schedule, cli.warmup_tasks, block_size);
-                print_bench_result(&result, op, block_size, group.node.0, nic_count);
+                let result = run_bench(
+                    ctx,
+                    op,
+                    &schedule,
+                    cli.warmup_tasks,
+                    block_size,
+                    cli.descs_per_block,
+                );
+                print_bench_result(
+                    &result,
+                    op,
+                    block_size,
+                    group.node.0,
+                    nic_count,
+                    cli.descs_per_block,
+                );
             }
         };
 
@@ -531,7 +591,24 @@ fn main() {
 
                 let mut tasks = Vec::with_capacity(schedule.len().saturating_sub(cli.warmup_tasks));
                 for (i, &nblocks) in schedule.iter().enumerate() {
-                    let descs = build_numa_scatter(&client_bufs, &server_bufs, nblocks, block_size);
+                    let remote_specs = server_bufs
+                        .iter()
+                        .zip(&numa_nodes_used)
+                        .map(
+                            |(buf, &node)| pegaflow_transfer::bench_support::BufferSpec {
+                                numa_node: node,
+                                base_ptr: buf.ptr.as_ptr() as u64,
+                                len: buf.len,
+                            },
+                        )
+                        .collect::<Vec<_>>();
+                    let descs = build_segmented_numa_scatter(
+                        &client_bufs,
+                        &remote_specs,
+                        nblocks,
+                        block_size,
+                        cli.descs_per_block,
+                    );
 
                     let start = Instant::now();
                     let receivers = client
@@ -548,6 +625,7 @@ fn main() {
                         tasks.push(TaskResult {
                             latency_ms: elapsed.as_secs_f64() * 1000.0,
                             bytes: nblocks * block_size,
+                            descs: descs.len(),
                         });
                     }
                 }
@@ -556,6 +634,7 @@ fn main() {
                 latencies.sort_by(f64::total_cmp);
                 let avg_bytes = tasks.iter().map(|t| t.bytes).sum::<usize>() / tasks.len().max(1);
                 let avg_blocks = avg_bytes / block_size;
+                let avg_descs = tasks.iter().map(|t| t.descs).sum::<usize>() / tasks.len().max(1);
                 let p50 = percentile(&latencies, 0.50);
                 let p95 = percentile(&latencies, 0.95);
                 let p99 = percentile(&latencies, 0.99);
@@ -566,12 +645,21 @@ fn main() {
                     op, numas_label, total_nics, nic_label,
                 );
                 println!(
-                    "  avg {} blocks x {}  ({:.1} MB/task, NUMA-interleaved across {} nodes)",
+                    "  avg {} blocks x {}  ({:.1} MB/task, NUMA-interleaved across {} nodes, {} descs/task, {} per desc)",
                     avg_blocks,
                     format_size(block_size),
                     avg_bytes as f64 / (1024.0 * 1024.0),
                     num_nodes,
+                    avg_descs,
+                    format_size(avg_bytes / avg_descs.max(1)),
                 );
+                if cli.descs_per_block > 1 {
+                    println!(
+                        "  profile: {} descs/block ({})",
+                        cli.descs_per_block,
+                        format_size(block_size / cli.descs_per_block),
+                    );
+                }
                 println!("  p50={:.2}ms  p95={:.2}ms  p99={:.2}ms", p50, p95, p99);
                 println!(
                     "  p50 equiv: {:.1} Gbps ({:.2} GiB/s)",
