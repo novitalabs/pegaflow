@@ -289,6 +289,36 @@ fn build_block_scatter(
 }
 
 // ---------------------------------------------------------------------------
+// Build NUMA-interleaved scatter lists (for all-NIC cross-NUMA bench)
+// ---------------------------------------------------------------------------
+
+fn build_numa_scatter(
+    client_bufs: &[NumaBuffer],
+    server_bufs: &[NumaBuffer],
+    nblocks: usize,
+    block_size: usize,
+) -> Vec<TransferDesc> {
+    let num_nodes = client_bufs.len();
+    let mut offsets = vec![0usize; num_nodes];
+    (0..nblocks)
+        .map(|i| {
+            let node_idx = i % num_nodes;
+            let off = offsets[node_idx];
+            offsets[node_idx] += block_size;
+            TransferDesc {
+                local_ptr: unsafe {
+                    NonNull::new_unchecked(client_bufs[node_idx].ptr.as_ptr().add(off))
+                },
+                remote_ptr: unsafe {
+                    NonNull::new_unchecked(server_bufs[node_idx].ptr.as_ptr().add(off))
+                },
+                len: block_size,
+            }
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Result types
 // ---------------------------------------------------------------------------
 
@@ -642,6 +672,185 @@ fn main() {
         if let Some(ref ctx) = multi_context {
             ctx.client.unregister_memory(&[ctx.client_buf.ptr]).ok();
             ctx.server.unregister_memory(&[ctx.server_buf.ptr]).ok();
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Phase: All-NIC aggregate (cross-NUMA)
+    // -----------------------------------------------------------------
+    if cli.nic.is_none() && cli.numa.is_none() {
+        let mut all_nic_names: Vec<String> = Vec::new();
+        let mut numa_nodes_used: Vec<u32> = Vec::new();
+        for group in &groups {
+            let nics: Vec<_> = group
+                .nics
+                .iter()
+                .filter(|nic| cli.exclude_nic.as_ref() != Some(&nic.name))
+                .collect();
+            if !nics.is_empty() {
+                for nic in &nics {
+                    all_nic_names.push(nic.name.clone());
+                }
+                numa_nodes_used.push(group.node.0);
+            }
+        }
+
+        if all_nic_names.len() > 1 && numa_nodes_used.len() > 1 {
+            let total_nics = all_nic_names.len();
+            let num_nodes = numa_nodes_used.len();
+            let blocks_per_node = max_blocks.div_ceil(num_nodes);
+            let per_node_buf_size = blocks_per_node * block_size;
+
+            println!();
+            println!(
+                "--- ALL NICs: {} NIC(s) across {} NUMA nodes [{}] ---",
+                total_nics,
+                num_nodes,
+                all_nic_names.join(", "),
+            );
+
+            let server_bufs: Vec<NumaBuffer> = numa_nodes_used
+                .iter()
+                .map(|&node| {
+                    let buf = NumaBuffer::alloc(node, per_node_buf_size);
+                    buf.fill(0xAA);
+                    buf
+                })
+                .collect();
+            let client_bufs: Vec<NumaBuffer> = numa_nodes_used
+                .iter()
+                .map(|&node| {
+                    let buf = NumaBuffer::alloc(node, per_node_buf_size);
+                    buf.fill(0xBB);
+                    buf
+                })
+                .collect();
+
+            let server = TransferEngine::new(&all_nic_names).expect("all-NIC server init failed");
+            let client = TransferEngine::new(&all_nic_names).expect("all-NIC client init failed");
+
+            for buf in &server_bufs {
+                server
+                    .register_memory(&[MemoryRegion {
+                        ptr: buf.ptr,
+                        len: per_node_buf_size,
+                    }])
+                    .expect("all-NIC server register_memory failed");
+            }
+            for buf in &client_bufs {
+                client
+                    .register_memory(&[MemoryRegion {
+                        ptr: buf.ptr,
+                        len: per_node_buf_size,
+                    }])
+                    .expect("all-NIC client register_memory failed");
+            }
+
+            let server_meta = match server
+                .get_or_prepare("bench-client")
+                .expect("all-NIC server get_or_prepare failed")
+            {
+                pegaflow_transfer::ConnectionStatus::Prepared(m) => m,
+                _ => panic!("unexpected state on fresh engine"),
+            };
+            let client_meta = match client
+                .get_or_prepare("bench-server")
+                .expect("all-NIC client get_or_prepare failed")
+            {
+                pegaflow_transfer::ConnectionStatus::Prepared(m) => m,
+                _ => panic!("unexpected state on fresh engine"),
+            };
+            server
+                .complete_handshake("bench-client", &server_meta, &client_meta)
+                .expect("all-NIC server complete_handshake failed");
+            client
+                .complete_handshake("bench-server", &client_meta, &server_meta)
+                .expect("all-NIC client complete_handshake failed");
+
+            assert_eq!(server.num_qps(), total_nics);
+            assert_eq!(client.num_qps(), total_nics);
+            println!("  all-NIC engine ready (handshake complete)");
+
+            let numas_label = numa_nodes_used
+                .iter()
+                .map(|n| format!("NUMA{n}"))
+                .collect::<Vec<_>>()
+                .join("+");
+            let nic_label = all_nic_names.join(", ");
+
+            let run_all_nic = |op: TransferOp| {
+                if op == TransferOp::Read {
+                    for buf in &client_bufs {
+                        buf.fill(0x00);
+                    }
+                }
+
+                let mut tasks = Vec::with_capacity(schedule.len().saturating_sub(cli.warmup_tasks));
+                for (i, &nblocks) in schedule.iter().enumerate() {
+                    let descs = build_numa_scatter(&client_bufs, &server_bufs, nblocks, block_size);
+
+                    let start = Instant::now();
+                    let receivers = client
+                        .batch_transfer_async(op, "bench-server", &descs)
+                        .expect("RDMA submit failed");
+                    for rx in receivers {
+                        block_recv(rx)
+                            .expect("completion channel dropped")
+                            .expect("RDMA transfer failed");
+                    }
+                    let elapsed = start.elapsed();
+
+                    if i >= cli.warmup_tasks {
+                        tasks.push(TaskResult {
+                            latency_ms: elapsed.as_secs_f64() * 1000.0,
+                            bytes: nblocks * block_size,
+                        });
+                    }
+                }
+
+                let mut latencies: Vec<f64> = tasks.iter().map(|t| t.latency_ms).collect();
+                latencies.sort_by(f64::total_cmp);
+                let avg_bytes = tasks.iter().map(|t| t.bytes).sum::<usize>() / tasks.len().max(1);
+                let avg_blocks = avg_bytes / block_size;
+                let p50 = percentile(&latencies, 0.50);
+                let p95 = percentile(&latencies, 0.95);
+                let p99 = percentile(&latencies, 0.99);
+
+                println!();
+                println!(
+                    "=== RDMA {:?} — ALL NICs ({}, {} NICs) [{}] ===",
+                    op, numas_label, total_nics, nic_label,
+                );
+                println!(
+                    "  avg {} blocks x {}  ({:.1} MB/task, NUMA-interleaved across {} nodes)",
+                    avg_blocks,
+                    format_size(block_size),
+                    avg_bytes as f64 / (1024.0 * 1024.0),
+                    num_nodes,
+                );
+                println!("  p50={:.2}ms  p95={:.2}ms  p99={:.2}ms", p50, p95, p99);
+                println!(
+                    "  p50 equiv: {:.1} Gbps ({:.2} GiB/s)",
+                    gbps(avg_bytes, p50 / 1000.0),
+                    gib_per_sec(avg_bytes, p50 / 1000.0),
+                );
+            };
+
+            match cli.mode.as_str() {
+                "write" => run_all_nic(TransferOp::Write),
+                "read" => run_all_nic(TransferOp::Read),
+                _ => {
+                    run_all_nic(TransferOp::Write);
+                    run_all_nic(TransferOp::Read);
+                }
+            }
+
+            for buf in &client_bufs {
+                client.unregister_memory(&[buf.ptr]).ok();
+            }
+            for buf in &server_bufs {
+                server.unregister_memory(&[buf.ptr]).ok();
+            }
         }
     }
 
