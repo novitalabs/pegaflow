@@ -3,6 +3,7 @@
 // Follows the same submit/oneshot pattern as SsdBackingStore::submit_prefix so that
 // PrefetchScheduler can treat remote fetch the same way it treats SSD prefetch.
 
+use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -227,6 +228,31 @@ async fn rdma_fetch_task(
         .flat_map(|b| &b.slots)
         .map(|s| s.k_size + s.v_size)
         .sum();
+    let slot_count: usize = blocks.iter().map(|b| b.slots.len()).sum();
+    let mut k_segments = 0usize;
+    let mut v_segments = 0usize;
+    let mut slot_numa_counts: HashMap<NumaNode, usize> = HashMap::new();
+    for block in &blocks {
+        for slot in &block.slots {
+            if slot.k_size > 0 {
+                k_segments += 1;
+            }
+            if slot.v_size > 0 && slot.v_ptr != 0 {
+                v_segments += 1;
+            }
+            *slot_numa_counts
+                .entry(NumaNode(slot.numa_node))
+                .or_default() += 1;
+        }
+    }
+    let mut slot_numa_items: Vec<_> = slot_numa_counts.into_iter().collect();
+    slot_numa_items.sort_unstable_by_key(|(node, _)| *node);
+    let slot_numa_summary = slot_numa_items
+        .into_iter()
+        .map(|(node, count)| format!("{node}:{count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let total_segments = k_segments + v_segments;
     let fetch = match fetch_blocks_via_rdma(
         rdma,
         allocate_fn,
@@ -263,7 +289,8 @@ async fn rdma_fetch_task(
     let mb = total_bytes as f64 / (1024.0 * 1024.0);
     info!(
         "RDMA fetch from {remote_addr}: {}/{} blocks, {mb:.1} MiB in {elapsed:.1?} ({:.0} MiB/s) \
-         [connect={connect_elapsed:.1?} query={query_elapsed:.1?} prepare={:.1?} rdma_wait={:.1?} rebuild={:.1?} other={other_elapsed:.1?} descs={}]",
+         [connect={connect_elapsed:.1?} query={query_elapsed:.1?} prepare={:.1?} rdma_wait={:.1?} rebuild={:.1?} other={other_elapsed:.1?} \
+         descs={} slots={} segs={} (k={},v={}) avg_desc={} avg_slot_segs={:.1} slot_numa={}]",
         result.len(),
         block_hashes.len(),
         if elapsed.as_secs_f64() > 0.0 {
@@ -275,6 +302,24 @@ async fn rdma_fetch_task(
         fetch.rdma_wait_elapsed,
         fetch.rebuild_elapsed,
         fetch.desc_count,
+        slot_count,
+        total_segments,
+        k_segments,
+        v_segments,
+        if fetch.desc_count > 0 {
+            format!(
+                "{:.1} KiB",
+                total_bytes as f64 / fetch.desc_count as f64 / 1024.0
+            )
+        } else {
+            "0.0 KiB".to_string()
+        },
+        if slot_count > 0 {
+            total_segments as f64 / slot_count as f64
+        } else {
+            0.0
+        },
+        slot_numa_summary,
     );
     let m = core_metrics();
     let ok = &[KeyValue::new("status", "ok")];

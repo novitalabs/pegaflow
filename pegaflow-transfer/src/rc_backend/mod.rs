@@ -2,7 +2,7 @@ mod runtime;
 mod session;
 mod state;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -21,6 +21,65 @@ use mea::oneshot;
 use crate::engine::{NicHandshake, RegisteredMemoryRegion, TransferDesc, TransferOp};
 use crate::error::{Result, TransferError};
 use pegaflow_common::NumaNode;
+
+struct NicOpLayoutSummary {
+    unique_local_mrs: usize,
+    unique_remote_rkeys: usize,
+    runs: usize,
+    avg_run_len: f64,
+    max_run_len: usize,
+    mergeable_pairs: usize,
+}
+
+fn summarize_ops_layout(ops: &[RdmaOp]) -> NicOpLayoutSummary {
+    let mut local_mrs = HashSet::new();
+    let mut remote_rkeys = HashSet::new();
+    let mut runs = 0usize;
+    let mut current_run = 0usize;
+    let mut max_run_len = 0usize;
+    let mut mergeable_pairs = 0usize;
+    let mut prev: Option<&RdmaOp> = None;
+
+    for op in ops {
+        local_mrs.insert(op.local_mr.lkey());
+        remote_rkeys.insert(op.remote_rkey);
+
+        let mergeable = prev.is_some_and(|p| {
+            p.local_mr.lkey() == op.local_mr.lkey()
+                && p.remote_rkey == op.remote_rkey
+                && p.local_ptr + p.len as u64 == op.local_ptr
+                && p.remote_ptr + p.len as u64 == op.remote_ptr
+        });
+
+        if mergeable {
+            mergeable_pairs += 1;
+            current_run += 1;
+        } else {
+            if current_run > 0 {
+                max_run_len = max_run_len.max(current_run);
+            }
+            runs += 1;
+            current_run = 1;
+        }
+        prev = Some(op);
+    }
+
+    max_run_len = max_run_len.max(current_run);
+    let avg_run_len = if runs > 0 {
+        ops.len() as f64 / runs as f64
+    } else {
+        0.0
+    };
+
+    NicOpLayoutSummary {
+        unique_local_mrs: local_mrs.len(),
+        unique_remote_rkeys: remote_rkeys.len(),
+        runs,
+        avg_run_len,
+        max_run_len,
+        mergeable_pairs,
+    }
+}
 
 struct NicGroup {
     nic_indices: Vec<usize>,
@@ -458,6 +517,7 @@ impl RcBackend {
         // --- Lock: look up connection + prepare ops ---
         let lookup_start = Instant::now();
         let mut nic_work: Vec<(Arc<RcSession>, Vec<RdmaOp>)> = Vec::new();
+        let mut per_nic_layout_summary = Vec::new();
         {
             let state = self.state.lock();
 
@@ -512,13 +572,25 @@ impl RcBackend {
                         remote_rkey,
                     });
                 }
+                let layout = summarize_ops_layout(&prepared);
+                per_nic_layout_summary.push(format!(
+                    "{}@{}:local_mrs={},remote_rkeys={},runs={},avg_run={:.1},max_run={},mergeable_pairs={}",
+                    self.runtimes[nic_idx].nic_name,
+                    self.runtimes[nic_idx].numa_node,
+                    layout.unique_local_mrs,
+                    layout.unique_remote_rkeys,
+                    layout.runs,
+                    layout.avg_run_len,
+                    layout.max_run_len,
+                    layout.mergeable_pairs,
+                ));
                 nic_work.push((session, prepared));
             }
         }
         let lookup_dur = lookup_start.elapsed();
 
         info!(
-            "batch_transfer_async_{:?}: remote={} descs={} nics_active={}/{} routing={} per_nic=[{}] lookup_ms={:.3}",
+            "batch_transfer_async_{:?}: remote={} descs={} nics_active={}/{} routing={} per_nic=[{}] layout=[{}] lookup_ms={:.3}",
             op,
             remote_addr,
             descs.len(),
@@ -526,6 +598,7 @@ impl RcBackend {
             nic_count,
             routing_summary,
             per_nic_summary,
+            per_nic_layout_summary.join("; "),
             lookup_dur.as_secs_f64() * 1000.0,
         );
 
