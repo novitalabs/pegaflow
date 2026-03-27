@@ -5,7 +5,7 @@ use std::sync::mpsc as std_mpsc;
 use mea::oneshot;
 use std::thread;
 
-use log::{debug, warn};
+use log::{debug, info, warn};
 use parking_lot::Mutex;
 use pegaflow_common::NumaNode;
 use sideway::ibverbs::AccessFlags;
@@ -30,7 +30,7 @@ const SEND_CQ_SIZE: u32 = MAX_SEND_WR;
 // Recv queue unused (one-sided RDMA only), keep minimal for driver compatibility.
 const RECV_CQ_SIZE: u32 = 2;
 const MAX_RECV_WR: u32 = 1;
-const MAX_RD_ATOMIC: u8 = 1;
+const MAX_RD_ATOMIC: u8 = 16;
 const PSN_MASK: u32 = 0x00ff_ffff;
 
 pub(crate) struct RdmaOp {
@@ -155,9 +155,9 @@ impl RcSession {
             .setup_max_read_atomic(MAX_RD_ATOMIC);
         qp.modify(&rts_attr)
             .map_err(|error| TransferError::Backend(error.to_string()))?;
-        debug!(
-            "rc connect ready: local_qpn={}, remote_qpn={}",
-            self.local_endpoint.qp_num, remote.qp_num
+        info!(
+            "rc connect ready: local_qpn={}, remote_qpn={}, max_rd_atomic={}",
+            self.local_endpoint.qp_num, remote.qp_num, MAX_RD_ATOMIC
         );
         Ok(())
     }

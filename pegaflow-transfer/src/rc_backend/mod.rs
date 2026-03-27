@@ -121,6 +121,32 @@ impl RcBackend {
         }
         let nic_count = runtimes.len();
         let numa_rr = NumaRoundRobin::from_runtimes(&runtimes);
+        let mut group_items: Vec<_> = numa_rr.groups.iter().collect();
+        group_items.sort_unstable_by_key(|(node, _)| **node);
+        let group_summary = group_items
+            .into_iter()
+            .map(|(node, group)| {
+                let names = group
+                    .nic_indices
+                    .iter()
+                    .map(|&idx| runtimes[idx].nic_name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("{node}=[{names}]")
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let fallback_summary = numa_rr
+            .fallback
+            .nic_indices
+            .iter()
+            .map(|&idx| runtimes[idx].nic_name.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        info!(
+            "RC backend NUMA routing ready: nics={} single_numa={} groups={} fallback=[{}]",
+            nic_count, numa_rr.single_numa, group_summary, fallback_summary
+        );
         Ok(Self {
             runtimes,
             state: Arc::new(Mutex::new(RcBackendState::new(nic_count))),
@@ -374,6 +400,7 @@ impl RcBackend {
         }
 
         let nic_count = self.nic_count();
+        let mut routing_summary = "single_numa(round_robin)".to_string();
 
         // NUMA-aware NIC assignment: query the NUMA node of each descriptor's
         // first page and route to a NIC on the same NUMA node.
@@ -390,11 +417,43 @@ impl RcBackend {
                 .map(|d| d.local_ptr.as_ptr() as *const u8)
                 .collect();
             let numa_nodes = pegaflow_common::query_pages_numa(&addrs);
+            let mut numa_counts: HashMap<NumaNode, usize> = HashMap::new();
+            for &node in &numa_nodes {
+                *numa_counts.entry(node).or_default() += 1;
+            }
+            let mut numa_items: Vec<_> = numa_counts.into_iter().collect();
+            numa_items.sort_unstable_by_key(|(node, _)| *node);
+            routing_summary = format!(
+                "move_pages({})",
+                numa_items
+                    .into_iter()
+                    .map(|(node, count)| format!("{node}:{count}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
             for (i, &desc) in descs.iter().enumerate() {
                 let nic_idx = self.numa_rr.pick(numa_nodes[i]);
                 per_nic[nic_idx].push(desc);
             }
         }
+
+        let per_nic_summary = per_nic
+            .iter()
+            .enumerate()
+            .filter(|(_, nic_descs)| !nic_descs.is_empty())
+            .map(|(nic_idx, nic_descs)| {
+                let bytes = nic_descs.iter().map(|d| d.len).sum::<usize>();
+                let runtime = &self.runtimes[nic_idx];
+                format!(
+                    "{}@{}:descs={},bytes={}",
+                    runtime.nic_name,
+                    runtime.numa_node,
+                    nic_descs.len(),
+                    bytes
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
 
         // --- Lock: look up connection + prepare ops ---
         let lookup_start = Instant::now();
@@ -458,12 +517,15 @@ impl RcBackend {
         }
         let lookup_dur = lookup_start.elapsed();
 
-        debug!(
-            "batch_transfer_async_{:?}: nics_active={}/{}, chunks={}, lookup_ms={:.3}",
+        info!(
+            "batch_transfer_async_{:?}: remote={} descs={} nics_active={}/{} routing={} per_nic=[{}] lookup_ms={:.3}",
             op,
+            remote_addr,
+            descs.len(),
             nic_work.len(),
             nic_count,
-            descs.len(),
+            routing_summary,
+            per_nic_summary,
             lookup_dur.as_secs_f64() * 1000.0,
         );
 
