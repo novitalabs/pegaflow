@@ -104,9 +104,11 @@ impl PinnedMemoryPool {
             PinnedMemory::allocate_regular(pool_size)
                 .expect("Failed to allocate regular pinned memory pool")
         } else {
-            info!("Allocating pinned memory pool with write-combined pages");
-            PinnedMemory::allocate_write_combined(pool_size)
-                .expect("Failed to allocate pinned memory pool")
+            info!(
+                "Allocating pinned memory pool with regular pages (hardcoded for RDMA READ investigation)"
+            );
+            PinnedMemory::allocate_regular(pool_size)
+                .expect("Failed to allocate regular pinned memory pool")
         };
 
         let actual_size = backing.size() as u64;

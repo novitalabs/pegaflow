@@ -138,6 +138,7 @@ impl PinnedMemory {
     /// Uses `cudaHostAlloc` with `cudaHostAllocWriteCombined` flag.
     /// Fast for CPU→GPU transfers but CPU reads are extremely slow.
     /// Do NOT use when SSD offload is enabled.
+    #[allow(dead_code)]
     pub(crate) fn allocate_write_combined(size: usize) -> Result<Self, PinnedMemError> {
         Self::allocate_internal(size, AllocStrategy::WriteCombined)
     }
