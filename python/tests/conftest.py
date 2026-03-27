@@ -270,7 +270,7 @@ class ClientContext:
         Returns:
             Query result (dict or tuple format)
         """
-        return self.engine_client.query(self.instance_id, block_hashes)
+        return self.engine_client.query(self.instance_id, block_hashes, "")
 
     def get_kv_cache(self, layer: int = 0) -> torch.Tensor:
         """Get KV cache tensor for a specific layer."""

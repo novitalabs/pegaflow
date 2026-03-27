@@ -31,7 +31,7 @@ class TestEngineClientQuery:
 
     def test_query_empty_hashes(self, engine_client, registered_instance: str):
         """Query with empty hashes should succeed."""
-        result = engine_client.query(registered_instance, [])
+        result = engine_client.query(registered_instance, [], "")
 
         if isinstance(result, dict):
             assert "hit_blocks" in result or "ok" in result
@@ -42,7 +42,7 @@ class TestEngineClientQuery:
         self, engine_client, registered_instance: str, block_hashes: list[bytes]
     ):
         """Query for unknown hashes should return zero hits (miss)."""
-        result = engine_client.query(registered_instance, block_hashes[:5])
+        result = engine_client.query(registered_instance, block_hashes[:5], "")
 
         if isinstance(result, dict):
             hit_blocks = result.get("hit_blocks", 0)
@@ -55,5 +55,5 @@ class TestEngineClientQuery:
         self, engine_client, registered_instance: str, block_hashes: list[bytes]
     ):
         """Query with a single hash."""
-        result = engine_client.query(registered_instance, block_hashes[:1])
+        result = engine_client.query(registered_instance, block_hashes[:1], "")
         assert result is not None

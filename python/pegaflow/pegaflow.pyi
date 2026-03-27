@@ -262,6 +262,7 @@ class EngineRpcClient:
         self,
         instance_id: str,
         block_hashes: list[bytes],
+        req_id: str,
     ) -> dict[str, Any]:
         """Pure memory-only query: check if prefix blocks are in memory cache.
 
@@ -271,6 +272,7 @@ class EngineRpcClient:
         Args:
             instance_id: Model instance ID.
             block_hashes: List of block hashes to check.
+            req_id: Request ID for tracking.
 
         Returns:
             Dict with keys:
@@ -291,6 +293,7 @@ class EngineRpcClient:
         self,
         instance_id: str,
         block_hashes: list[bytes],
+        req_id: str,
     ) -> dict[str, Any]:
         """Query prefix cache hits with SSD prefetch support.
 
@@ -300,6 +303,7 @@ class EngineRpcClient:
         Args:
             instance_id: Model instance ID.
             block_hashes: List of block hashes to check.
+            req_id: Request ID for tracking and prefetch correlation.
 
         Returns:
             Dict with keys:
