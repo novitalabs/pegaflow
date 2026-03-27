@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use log::warn;
+use log::{info, warn};
 use mea::oneshot;
 use parking_lot::Mutex;
 
@@ -15,9 +15,16 @@ use crate::metrics::core_metrics;
 
 use super::read_cache::ReadCache;
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum PrefetchSource {
+    Ssd,
+    Rdma,
+}
+
 struct PrefetchEntry {
     blocks_rx: oneshot::Receiver<PrefetchResult>,
     loading_count: usize,
+    source: PrefetchSource,
 }
 
 struct PrefetchState {
@@ -102,16 +109,28 @@ impl PrefetchScheduler {
 
         match entry.blocks_rx.try_recv() {
             Err(oneshot::TryRecvError::Empty) => Some(PollResult::StillLoading),
-            Ok(ssd_blocks) => {
+            Ok(prefetched_blocks) => {
                 let expected = entry.loading_count;
+                let source = entry.source;
                 state.remove_entry(req_id);
-                // Remote node returned fewer blocks than MetaServer promised
+                // RDMA remote node can return fewer blocks than MetaServer promised
                 // (likely evicted). Don't re-trigger RDMA on subsequent scans.
-                if ssd_blocks.is_empty() && expected > 0 {
-                    state.failed_remote.insert(req_id.to_string(), Instant::now());
+                if source == PrefetchSource::Rdma
+                    && prefetched_blocks.len() < expected
+                    && expected > 0
+                {
+                    state
+                        .failed_remote
+                        .insert(req_id.to_string(), Instant::now());
+                    info!(
+                        "RDMA prefetch returned fewer blocks than expected: req_id={} returned={} expected={}",
+                        req_id,
+                        prefetched_blocks.len(),
+                        expected
+                    );
                 }
                 drop(state);
-                read_cache.batch_insert(ssd_blocks);
+                read_cache.batch_insert(prefetched_blocks);
                 Some(PollResult::Completed)
             }
             Err(oneshot::TryRecvError::Disconnected) => {
@@ -144,6 +163,7 @@ impl PrefetchScheduler {
         let remaining = &keys[hit..];
         let mut loading = 0usize;
         let mut blocks_rx: Option<oneshot::Receiver<PrefetchResult>> = None;
+        let mut entry_source: Option<PrefetchSource> = None;
 
         let has_backing = self.ssd_store.is_some();
 
@@ -180,6 +200,7 @@ impl PrefetchScheduler {
                 self.state.lock().inflight_count += found;
                 loading = found;
                 blocks_rx = Some(rx);
+                entry_source = Some(PrefetchSource::Ssd);
             }
         }
 
@@ -199,8 +220,12 @@ impl PrefetchScheduler {
                 self.state.lock().inflight_count += found;
                 loading = found;
                 blocks_rx = Some(rx);
+                entry_source = Some(PrefetchSource::Rdma);
             } else {
-                self.state.lock().failed_remote.insert(req_id.to_string(), Instant::now());
+                self.state
+                    .lock()
+                    .failed_remote
+                    .insert(req_id.to_string(), Instant::now());
             }
         }
 
@@ -214,6 +239,7 @@ impl PrefetchScheduler {
                     PrefetchEntry {
                         blocks_rx: rx,
                         loading_count: loading,
+                        source: entry_source.unwrap_or(PrefetchSource::Ssd),
                     },
                 );
             }

@@ -114,7 +114,9 @@ impl RdmaFetchStore {
             .max_by_key(|nb| nb.block_hashes.len());
 
         let Some(best) = best else {
-            debug!("MetaServer returned only self-node hits for namespace={namespace}, skipping RDMA fetch");
+            debug!(
+                "MetaServer returned only self-node hits for namespace={namespace}, skipping RDMA fetch"
+            );
             let _ = done_tx.send(Vec::new());
             return (0, done_rx);
         };
