@@ -21,3 +21,7 @@ mea = "0.6.3"
 [[bin]]
 name = "pegaflow-cpu-bench"
 path = "src/bin/cpu_bench.rs"
+
+[[bin]]
+name = "pegaflow-cross-host-bench"
+path = "src/bin/cross_host_bench.rs"
