@@ -172,10 +172,9 @@ impl PrefetchScheduler {
             }
         }
 
-        // If nothing is loading from SSD and there are no local hits at all,
-        // try RDMA remote fetch from another node.
+        // If nothing is loading from SSD and there are still missing blocks,
+        // try RDMA remote fetch from another node (even with partial local hits).
         if loading == 0
-            && hit == 0
             && !remaining.is_empty()
             && let Some(rdma_fetch) = &self.rdma_fetch
         {
