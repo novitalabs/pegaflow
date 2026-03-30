@@ -152,7 +152,6 @@ pub struct Cli {
     #[arg(long)]
     pub metaserver_addr: Option<String>,
 
-
     /// MetaServer registration queue depth (max pending registration batches).
     #[arg(long, default_value_t = pegaflow_core::DEFAULT_METASERVER_QUEUE_DEPTH)]
     pub metaserver_queue_depth: usize,
@@ -338,7 +337,6 @@ fn init_metrics(
     })
 }
 
-
 /// Main entry point for pegaflow-server
 pub fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
@@ -420,16 +418,17 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let has_nics = cli.nics.as_ref().is_some_and(|n| !n.is_empty());
 
     if has_metaserver != has_nics {
-        panic!(
-            "--metaserver-addr and --nics must be set together (got metaserver={}, nics={})",
-            has_metaserver, has_nics,
+        log::warn!(
+            "--metaserver-addr and --nics should be set together (got metaserver={}, nics={})",
+            has_metaserver,
+            has_nics,
         );
     }
 
     let advertise_addr = if has_metaserver {
         if cli.addr.ip().is_unspecified() || cli.addr.ip().is_loopback() {
-            panic!(
-                "P2P requires --addr to be a routable IP, not {}",
+            log::warn!(
+                "P2P: --addr is {}, other nodes may not be able to reach this server",
                 cli.addr.ip()
             );
         }
