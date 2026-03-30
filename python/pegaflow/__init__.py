@@ -15,14 +15,8 @@ try:
         PegaFlowServiceError,
         PyLoadState,
     )
-    from .pegaflow import (
-        __version__ as _rust_version,
-    )
+    from .pegaflow import __version__ as _rust_version
 except ImportError:
-    # Fallback for development when the Rust extension is not built
-    EngineRpcClient = None
-    PegaEngine = None
-    PyLoadState = None
     raise ImportError(
         "pegaflow rust extension is not available, check pegaflow-xxx.so file exists"
     ) from None
