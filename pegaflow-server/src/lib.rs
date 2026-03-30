@@ -152,10 +152,6 @@ pub struct Cli {
     #[arg(long)]
     pub metaserver_addr: Option<String>,
 
-    /// Advertise address for this node in MetaServer registrations (e.g. 10.0.0.1:50055).
-    /// Defaults to PEGAFLOW_HOST_IP env + bind port, or the bind address.
-    #[arg(long)]
-    pub advertise_addr: Option<String>,
 
     /// MetaServer registration queue depth (max pending registration batches).
     #[arg(long, default_value_t = pegaflow_core::DEFAULT_METASERVER_QUEUE_DEPTH)]
@@ -342,26 +338,6 @@ fn init_metrics(
     })
 }
 
-fn resolve_advertise_addr(explicit: Option<&str>, bind_addr: &SocketAddr) -> String {
-    if let Some(addr) = explicit {
-        return addr.to_string();
-    }
-
-    if let Ok(host_ip) = std::env::var("PEGAFLOW_HOST_IP") {
-        let addr = format!("{}:{}", host_ip, bind_addr.port());
-        info!("Using PEGAFLOW_HOST_IP for advertise address: {}", addr);
-        return addr;
-    }
-
-    if bind_addr.ip().is_unspecified() {
-        log::warn!(
-            "Advertise address defaults to bind address {}, \
-             which is 0.0.0.0. Consider setting --advertise-addr or PEGAFLOW_HOST_IP.",
-            bind_addr
-        );
-    }
-    bind_addr.to_string()
-}
 
 /// Main entry point for pegaflow-server
 pub fn run() -> Result<(), Box<dyn Error>> {
@@ -440,10 +416,27 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         }
     });
 
-    let advertise_addr = cli
-        .metaserver_addr
-        .as_ref()
-        .map(|_| resolve_advertise_addr(cli.advertise_addr.as_deref(), &cli.addr));
+    let has_metaserver = cli.metaserver_addr.is_some();
+    let has_nics = cli.nics.as_ref().is_some_and(|n| !n.is_empty());
+
+    if has_metaserver != has_nics {
+        panic!(
+            "--metaserver-addr and --nics must be set together (got metaserver={}, nics={})",
+            has_metaserver, has_nics,
+        );
+    }
+
+    let advertise_addr = if has_metaserver {
+        if cli.addr.ip().is_unspecified() || cli.addr.ip().is_loopback() {
+            panic!(
+                "P2P requires --addr to be a routable IP, not {}",
+                cli.addr.ip()
+            );
+        }
+        Some(cli.addr.to_string())
+    } else {
+        None
+    };
 
     let storage_config = pegaflow_core::StorageConfig {
         enable_lfu_admission: cli.enable_lfu_admission,

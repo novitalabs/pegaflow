@@ -47,7 +47,8 @@ pub struct StorageConfig {
     pub transfer_lock_timeout: Duration,
     /// MetaServer address for p2p block discovery + registration (None = disabled).
     pub metaserver_addr: Option<String>,
-    /// This node's advertise address for MetaServer registration + transfer lock requester_id.
+    /// This node's routable address (from --addr) used for MetaServer registration and as
+    /// requester_id in transfer locks. Must be set when metaserver_addr is set.
     pub advertise_addr: Option<String>,
     /// MetaServer registration queue depth.
     pub metaserver_queue_depth: usize,

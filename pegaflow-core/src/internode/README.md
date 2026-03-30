@@ -68,10 +68,9 @@ The registrar is enabled via CLI flags on `pegaflow-server`:
 
 ```bash
 pegaflow-server \
-  --addr 0.0.0.0:50055 \
+  --addr 10.0.0.1:50055 \
   --pool-size 30gb \
-  --metaserver-addr http://127.0.0.1:50056 \
-  --advertise-addr 10.0.0.1:50055
+  --metaserver-addr http://127.0.0.1:50056
 ```
 
 When `--metaserver-addr` is not set, registration is disabled (`None`) and the write path
