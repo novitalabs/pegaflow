@@ -48,8 +48,7 @@ uv run python examples/bench_kv_cache.py --model /path/to/model --num-prompts 10
 | `--ssd-prefetch-inflight` | `16` | Max concurrent block reads |
 | `--max-prefetch-blocks` | `800` | Backpressure for SSD prefetch |
 | `--trace-sample-rate` | `1.0` | Sampling rate 0.0–1.0 (requires `--features tracing`) |
-| `--metaserver-addr` | — | MetaServer gRPC address for cross-node discovery |
-| `--advertise-addr` | — | Advertised addr for metaserver (fallback: `PEGAFLOW_HOST_IP` > auto-detect) |
+| `--metaserver-addr` | — | MetaServer gRPC address for cross-node discovery (requires `--addr` to be routable) |
 
 ## Key Files
 
@@ -62,5 +61,4 @@ uv run python examples/bench_kv_cache.py --model /path/to/model --num-prompts 10
 ## Environment Variables
 
 - `PEGAFLOW_ENGINE_ENDPOINT`: gRPC endpoint (default: `127.0.0.1:50055`)
-- `PEGAFLOW_HOST_IP`: Host IP for metaserver advertise address
 - `RUST_LOG`: Rust logging (e.g., `info,pegaflow_core=debug,pegaflow_server=debug`)

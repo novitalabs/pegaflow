@@ -88,6 +88,7 @@ The warm-start path achieves **~9x faster TTFT** compared to cold-start, demonst
 ## Documentation
 
 - [Server Configuration](./docs/server.md) — full CLI options, SSD cache, multi-node setup
+- [P2P KV Cache Sharing](./docs/p2p.md) — cross-node RDMA setup, tuning, and troubleshooting
 - [P/D Router](./docs/pd.md) — prefill/decode disaggregation
 - [vLLM I/O Patch](./docs/vllm-patch.md) — optional patch for better transfer throughput
 - [Metrics](./docs/metrics.md) — Prometheus and OTLP metrics reference

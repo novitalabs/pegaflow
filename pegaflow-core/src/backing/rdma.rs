@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use log::{error, info};
+use pegaflow_transfer::rdma_topo::SystemTopology;
 use pegaflow_transfer::{MemoryRegion, TransferEngine};
 
 use crate::pinned_pool::PinnedAllocator;
@@ -43,6 +44,8 @@ impl RdmaTransport {
             .map_err(|e| e.to_string())?;
 
         let registered_ptrs: Vec<NonNull<u8>> = regions.iter().map(|&(ptr, _)| ptr).collect();
+
+        SystemTopology::detect().log_summary();
 
         info!(
             "RDMA transport initialised: nics={}, registered {} memory region(s), elapsed={:?}",
