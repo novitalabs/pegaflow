@@ -67,9 +67,9 @@ impl BlockHashStore {
         inserted
     }
 
-    /// Query which hashes exist in the store asynchronously.
-    /// Returns a vector of [`CrossNodeBlock`]s for hashes that exist.
-    pub async fn query_hashes(&self, namespace: &str, hashes: &[Vec<u8>]) -> Vec<CrossNodeBlock> {
+    /// Query the longest prefix of `hashes` that exists in the store.
+    /// Stops at the first hash not found on any node.
+    pub async fn query_prefix(&self, namespace: &str, hashes: &[Vec<u8>]) -> Vec<CrossNodeBlock> {
         let mut existing = Vec::new();
         for hash in hashes {
             let key = BlockKey::new(namespace.to_string(), hash.clone());
@@ -78,6 +78,8 @@ impl BlockHashStore {
                     block_hash: hash.clone(),
                     node,
                 });
+            } else {
+                break;
             }
         }
         existing
@@ -135,24 +137,24 @@ mod tests {
         store.run_pending_tasks().await;
 
         // Query existing hashes
-        let existing = store.query_hashes(namespace, &hashes).await;
+        let existing = store.query_prefix(namespace, &hashes).await;
         assert_eq!(existing.len(), 3);
         // Verify node is returned
         for entry in &existing {
             assert_eq!(entry.node.as_ref(), node);
         }
 
-        // Query with mix of existing and non-existing
+        // Query with gap — prefix stops at first miss
         let mixed_hashes = vec![
             vec![1, 2, 3, 4],     // exists
-            vec![99, 99, 99, 99], // doesn't exist
-            vec![5, 6, 7, 8],     // exists
+            vec![99, 99, 99, 99], // doesn't exist — prefix stops here
+            vec![5, 6, 7, 8],     // exists but unreachable
         ];
-        let existing = store.query_hashes(namespace, &mixed_hashes).await;
-        assert_eq!(existing.len(), 2);
+        let existing = store.query_prefix(namespace, &mixed_hashes).await;
+        assert_eq!(existing.len(), 1);
 
         // Query with different namespace
-        let existing = store.query_hashes("other-namespace", &hashes).await;
+        let existing = store.query_prefix("other-namespace", &hashes).await;
         assert_eq!(existing.len(), 0);
     }
 
@@ -169,7 +171,7 @@ mod tests {
         store.run_pending_tasks().await;
 
         let existing = store
-            .query_hashes(namespace, std::slice::from_ref(&hash))
+            .query_prefix(namespace, std::slice::from_ref(&hash))
             .await;
         assert_eq!(existing[0].node.as_ref(), "node-a:50055");
 
@@ -180,7 +182,7 @@ mod tests {
         store.run_pending_tasks().await;
 
         let existing = store
-            .query_hashes(namespace, std::slice::from_ref(&hash))
+            .query_prefix(namespace, std::slice::from_ref(&hash))
             .await;
         assert_eq!(existing[0].node.as_ref(), "node-b:50055");
     }
@@ -191,7 +193,7 @@ mod tests {
         assert_eq!(store.entry_count(), 0);
 
         let hashes = vec![vec![1, 2, 3]];
-        let existing = store.query_hashes("any-namespace", &hashes).await;
+        let existing = store.query_prefix("any-namespace", &hashes).await;
         assert_eq!(existing.len(), 0);
     }
 
@@ -220,7 +222,7 @@ mod tests {
         assert!(store.weighted_size() <= 1024);
 
         // Some entries should have been evicted (LRU)
-        let existing = store.query_hashes(namespace, &hashes).await;
+        let existing = store.query_prefix(namespace, &hashes).await;
         assert!(existing.len() < 100, "Expected some entries to be evicted");
     }
 
@@ -235,14 +237,14 @@ mod tests {
         store.run_pending_tasks().await;
 
         // Verify entries exist
-        let existing = store.query_hashes(namespace, &hashes).await;
+        let existing = store.query_prefix(namespace, &hashes).await;
         assert_eq!(existing.len(), 2);
 
         // Clear all
         store.invalidate_all().await;
 
         // Verify entries are gone
-        let existing = store.query_hashes(namespace, &hashes).await;
+        let existing = store.query_prefix(namespace, &hashes).await;
         assert_eq!(existing.len(), 0);
         assert_eq!(store.entry_count(), 0);
     }

@@ -73,69 +73,64 @@ impl RdmaFetchStore {
         }
     }
 
-    /// Submit a remote fetch for the given block keys.
-    ///
-    /// Returns `(found_count, done_rx)` where `done_rx` delivers fetched blocks.
-    /// Returns `(0, done_rx)` immediately if MetaServer has no hits.
-    pub(crate) async fn submit_remote_fetch(
+    /// Query MetaServer for the best remote node that holds a prefix of `hashes`.
+    /// Returns `(node_addr, prefix_len)`, or `None` if no remote node has any.
+    pub(crate) async fn query_prefix(
         &self,
         namespace: &str,
-        keys: Vec<BlockKey>,
-    ) -> (usize, oneshot::Receiver<PrefetchResult>) {
-        let (done_tx, done_rx) = oneshot::channel();
-
-        if keys.is_empty() {
-            let _ = done_tx.send(Vec::new());
-            return (0, done_rx);
+        hashes: &[Vec<u8>],
+    ) -> Option<(String, usize)> {
+        if hashes.is_empty() {
+            return None;
         }
 
-        let hashes: Vec<Vec<u8>> = keys.iter().map(|k| k.hash.clone()).collect();
-
-        // Query MetaServer for block locations
-        let node_blocks = match self.metaserver_client.query(namespace, &hashes).await {
-            Ok(nb) => nb,
+        let nodes = match self
+            .metaserver_client
+            .query_prefix(namespace, hashes)
+            .await
+        {
+            Ok(n) => n,
             Err(e) => {
                 warn!("MetaServer query failed for remote fetch: {e}");
-                let _ = done_tx.send(Vec::new());
-                return (0, done_rx);
+                return None;
             }
         };
 
-        if node_blocks.is_empty() {
-            debug!("MetaServer returned no remote hits for namespace={namespace}");
-            let _ = done_tx.send(Vec::new());
-            return (0, done_rx);
+        let best = nodes
+            .iter()
+            .filter(|n| n.node != self.advertise_addr)
+            .max_by_key(|n| n.prefix_len)?;
+
+        let prefix_len = best.prefix_len as usize;
+        if prefix_len == 0 {
+            return None;
         }
 
-        // Pick the node with the most blocks, excluding self.
-        let best = node_blocks
-            .iter()
-            .filter(|nb| nb.node != self.advertise_addr)
-            .max_by_key(|nb| nb.block_hashes.len());
-
-        let Some(best) = best else {
-            debug!(
-                "MetaServer returned only self-node hits for namespace={namespace}, skipping RDMA fetch"
-            );
-            let _ = done_tx.send(Vec::new());
-            return (0, done_rx);
-        };
-
-        let remote_addr = best.node.clone();
-        let remote_hashes: Vec<Vec<u8>> = best.block_hashes.clone();
-        let found = remote_hashes.len();
-
         debug!(
-            "Remote fetch: namespace={namespace} best_node={remote_addr} blocks={found}/{}",
+            "Remote prefix query: namespace={namespace} best_node={} prefix={prefix_len}/{}",
+            best.node,
             hashes.len()
         );
 
-        // Spawn the async RDMA fetch task
+        Some((best.node.clone(), prefix_len))
+    }
+
+    /// Start an RDMA fetch of `hashes` from `remote_addr`.
+    /// Returns a receiver that delivers the fetched blocks.
+    pub(crate) fn fetch_blocks(
+        &self,
+        remote_addr: &str,
+        namespace: &str,
+        hashes: Vec<Vec<u8>>,
+    ) -> oneshot::Receiver<PrefetchResult> {
+        let (done_tx, done_rx) = oneshot::channel();
+
         let rdma = Arc::clone(&self.rdma_transport);
         let alloc_fn = Arc::clone(&self.allocate_fn);
         let channels = Arc::clone(&self.grpc_channels);
         let connect_group = Arc::clone(&self.connect_group);
         let advertise = self.advertise_addr.clone();
+        let remote = remote_addr.to_string();
         let ns = namespace.to_string();
 
         tokio::spawn(async move {
@@ -144,16 +139,16 @@ impl RdmaFetchStore {
                 &alloc_fn,
                 &channels,
                 &connect_group,
-                &remote_addr,
+                &remote,
                 &advertise,
                 &ns,
-                &remote_hashes,
+                &hashes,
             )
             .await;
             let _ = done_tx.send(result);
         });
 
-        (found, done_rx)
+        done_rx
     }
 }
 

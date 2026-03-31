@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use log::{debug, error, info, warn};
 use pegaflow_proto::proto::engine::meta_server_client::MetaServerClient as MetaServerGrpcClient;
 use pegaflow_proto::proto::engine::{
-    InsertBlockHashesRequest, NodeBlockHashes, QueryBlockHashesRequest,
+    InsertBlockHashesRequest, NodePrefixResult, QueryPrefixBlocksRequest,
 };
 use tokio::sync::mpsc;
 use tonic::transport::{Channel, Endpoint};
@@ -16,14 +16,12 @@ pub const DEFAULT_METASERVER_QUEUE_DEPTH: usize = 256;
 #[derive(Debug)]
 pub(crate) enum ClientError {
     RpcFailed(String),
-    ResponseError(String),
 }
 
 impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ClientError::RpcFailed(msg) => write!(f, "RPC failed: {msg}"),
-            ClientError::ResponseError(msg) => write!(f, "response error: {msg}"),
         }
     }
 }
@@ -132,13 +130,14 @@ impl MetaServerClient {
         }
     }
 
-    /// Query MetaServer for block locations. Returns node-grouped results.
-    pub(crate) async fn query(
+    /// Query MetaServer for the longest prefix of blocks that exist remotely.
+    /// Returns per-node prefix lengths.
+    pub(crate) async fn query_prefix(
         &self,
         namespace: &str,
         hashes: &[Vec<u8>],
-    ) -> Result<Vec<NodeBlockHashes>, ClientError> {
-        let request = QueryBlockHashesRequest {
+    ) -> Result<Vec<NodePrefixResult>, ClientError> {
+        let request = QueryPrefixBlocksRequest {
             namespace: namespace.to_string(),
             block_hashes: hashes.to_vec(),
         };
@@ -146,26 +145,19 @@ impl MetaServerClient {
         let response = self
             .query_client
             .clone()
-            .query_block_hashes(request)
+            .query_prefix_blocks(request)
             .await
             .map_err(|e| ClientError::RpcFailed(format!("MetaServer query failed: {e}")))?;
 
         let resp = response.into_inner();
-        if let Some(status) = &resp.status
-            && !status.ok
-        {
-            return Err(ClientError::ResponseError(format!(
-                "MetaServer query error: {}",
-                status.message
-            )));
-        }
 
         debug!(
-            "MetaServer query: namespace={} queried={} found={}",
-            namespace, resp.total_queried, resp.found_count
+            "MetaServer query_prefix: namespace={} nodes={}",
+            namespace,
+            resp.nodes.len()
         );
 
-        Ok(resp.node_blocks)
+        Ok(resp.nodes)
     }
 }
 
