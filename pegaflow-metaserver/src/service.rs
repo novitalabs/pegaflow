@@ -43,11 +43,23 @@ impl MetaServer for GrpcMetaService {
         let start = Instant::now();
         let req = request.into_inner();
 
+        let sample: Vec<String> = req
+            .block_hashes
+            .iter()
+            .take(3)
+            .map(|h| {
+                h.iter()
+                    .take(8)
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<String>()
+            })
+            .collect();
         debug!(
-            "RPC [insert_block_hashes]: namespace={} node={} hashes_count={}",
+            "RPC [insert_block_hashes]: namespace={} node={} hashes_count={} first_hashes={:?}",
             req.namespace,
             req.node,
-            req.block_hashes.len()
+            req.block_hashes.len(),
+            sample
         );
 
         // Validate request
@@ -69,8 +81,8 @@ impl MetaServer for GrpcMetaService {
 
         let elapsed = start.elapsed();
         info!(
-            "RPC [insert_block_hashes]: namespace={} node={} inserted={} hashes in {:?}",
-            req.namespace, req.node, inserted, elapsed
+            "RPC [insert_block_hashes]: namespace={} node={} inserted={} hashes in {:?} (store_entries={})",
+            req.namespace, req.node, inserted, elapsed, self.store.entry_count()
         );
 
         let response = InsertBlockHashesResponse {
@@ -91,10 +103,22 @@ impl MetaServer for GrpcMetaService {
         let start = Instant::now();
         let req = request.into_inner();
 
+        let sample: Vec<String> = req
+            .block_hashes
+            .iter()
+            .take(3)
+            .map(|h| {
+                h.iter()
+                    .take(8)
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<String>()
+            })
+            .collect();
         debug!(
-            "RPC [query_prefix_blocks]: namespace={} hashes_count={}",
+            "RPC [query_prefix_blocks]: namespace={} hashes_count={} first_hashes={:?}",
             req.namespace,
-            req.block_hashes.len()
+            req.block_hashes.len(),
+            sample
         );
 
         if req.block_hashes.is_empty() {
