@@ -333,15 +333,6 @@ impl StorageEngine {
             .unpin_blocks(instance_id, namespace, block_hashes)
     }
 
-    /// Pure memory-only prefix check. Returns `(hit, missing)`.
-    pub(crate) fn check_prefix_memory_only(
-        &self,
-        namespace: &str,
-        hashes: &[Vec<u8>],
-    ) -> (usize, usize) {
-        self.read_cache.check_prefix_memory_only(namespace, hashes)
-    }
-
     /// Check prefix blocks and schedule backing-store reads if needed.
     pub(crate) async fn check_prefix_and_prefetch(
         &self,
@@ -647,30 +638,6 @@ mod tests {
         // No pins exist — consume should fail
         let result = storage.consume_pinned_blocks("inst1", "ns", &[vec![1]]);
         assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn check_prefix_memory_only_basic() {
-        let storage = make_engine();
-        let block = Arc::new(SealedBlock::from_slots(Vec::new()));
-
-        storage.test_insert_cache(BlockKey::new("ns".into(), vec![1]), block.clone());
-        storage.test_insert_cache(BlockKey::new("ns".into(), vec![2]), block);
-
-        // Full prefix hit
-        let (hit, miss) = storage.check_prefix_memory_only("ns", &[vec![1], vec![2]]);
-        assert_eq!(hit, 2);
-        assert_eq!(miss, 0);
-
-        // Prefix break at [3]
-        let (hit, miss) = storage.check_prefix_memory_only("ns", &[vec![1], vec![2], vec![3]]);
-        assert_eq!(hit, 2);
-        assert_eq!(miss, 1);
-
-        // First miss breaks entire prefix
-        let (hit, miss) = storage.check_prefix_memory_only("ns", &[vec![3], vec![1]]);
-        assert_eq!(hit, 0);
-        assert_eq!(miss, 2);
     }
 
     // ---- Cross-node transfer: serving side tests ----

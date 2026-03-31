@@ -168,9 +168,7 @@ service Engine {
   rpc RegisterContextBatch(RegisterContextRequest) returns (RegisterContextResponse);
   rpc Save(SaveRequest) returns (SaveResponse);
   rpc Load(LoadRequest) returns (LoadResponse);
-  // Pure memory-only query: check if prefix blocks are in memory cache (no SSD prefetch)
-  rpc Query(QueryRequest) returns (QueryResponse);
-  // Unified prefetch query: check memory + trigger SSD prefetch or cross-node RDMA fetch for missing blocks
+  // Prefetch query: check memory + trigger SSD prefetch or cross-node RDMA fetch for missing blocks
   rpc QueryPrefetch(QueryRequest) returns (QueryResponse);
   rpc Unpin(UnpinRequest) returns (UnpinResponse);
   rpc UnregisterContext(UnregisterRequest) returns (UnregisterResponse);

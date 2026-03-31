@@ -31,29 +31,28 @@ class TestEngineClientQuery:
 
     def test_query_empty_hashes(self, engine_client, registered_instance: str):
         """Query with empty hashes should succeed."""
-        result = engine_client.query(registered_instance, [], "")
+        result = engine_client.query_prefetch(registered_instance, [], req_id="test")
 
-        if isinstance(result, dict):
-            assert "hit_blocks" in result or "ok" in result
-        else:
-            assert len(result) == 3
+        assert isinstance(result, dict)
+        assert "hit_blocks" in result or "ok" in result
 
     def test_query_unknown_hashes(
         self, engine_client, registered_instance: str, block_hashes: list[bytes]
     ):
         """Query for unknown hashes should return zero hits (miss)."""
-        result = engine_client.query(registered_instance, block_hashes[:5], "")
+        result = engine_client.query_prefetch(
+            registered_instance, block_hashes[:5], req_id="test"
+        )
 
-        if isinstance(result, dict):
-            hit_blocks = result.get("hit_blocks", 0)
-        else:
-            _, _, hit_blocks = result
-
+        assert isinstance(result, dict)
+        hit_blocks = result.get("hit_blocks", 0)
         assert hit_blocks == 0, "Unknown hashes should have zero hits"
 
     def test_query_single_hash(
         self, engine_client, registered_instance: str, block_hashes: list[bytes]
     ):
         """Query with a single hash."""
-        result = engine_client.query(registered_instance, block_hashes[:1], "")
+        result = engine_client.query_prefetch(
+            registered_instance, block_hashes[:1], req_id="test"
+        )
         assert result is not None

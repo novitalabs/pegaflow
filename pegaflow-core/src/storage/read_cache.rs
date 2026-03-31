@@ -77,26 +77,6 @@ impl ReadCache {
         keys.iter().map(|k| inner.cache.contains_key(k)).collect()
     }
 
-    pub(super) fn check_prefix_memory_only(
-        &self,
-        namespace: &str,
-        hashes: &[Vec<u8>],
-    ) -> (usize, usize) {
-        let mut hit = 0usize;
-        {
-            let mut inner = self.inner.lock();
-            for hash in hashes {
-                let key = BlockKey::new(namespace.to_string(), hash.clone());
-                if inner.cache.get(&key).is_some() {
-                    hit += 1;
-                } else {
-                    break;
-                }
-            }
-        }
-        (hit, hashes.len() - hit)
-    }
-
     /// Scan cache for a prefix of `keys`, stopping at the first miss.
     pub(super) fn get_prefix_blocks(
         &self,

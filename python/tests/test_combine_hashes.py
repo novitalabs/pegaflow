@@ -20,7 +20,6 @@ _EXT_NAME = "pegaflow.pegaflow"
 if _EXT_NAME not in sys.modules:
     _ext_stub = types.ModuleType(_EXT_NAME)
     _ext_stub.EngineRpcClient = MagicMock  # type: ignore[attr-defined]
-    _ext_stub.PegaEngine = MagicMock  # type: ignore[attr-defined]
     _ext_stub.PegaFlowBusinessError = type("PegaFlowBusinessError", (Exception,), {})  # type: ignore[attr-defined]
     _ext_stub.PegaFlowError = type("PegaFlowError", (Exception,), {})  # type: ignore[attr-defined]
     _ext_stub.PegaFlowServiceError = type("PegaFlowServiceError", (Exception,), {})  # type: ignore[attr-defined]

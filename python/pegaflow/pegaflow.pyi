@@ -33,100 +33,6 @@ class PegaFlowBusinessError(PegaFlowError):
 
     ...
 
-class PegaEngine:
-    """Local in-process KV cache storage engine.
-
-    Manages GPU workers and KV cache storage with pinned memory.
-    Use this for single-process deployments without gRPC overhead.
-    """
-
-    def __init__(self) -> None:
-        """Create a new PegaEngine instance.
-
-        Initializes the Rust logger and creates the core engine.
-        """
-        ...
-
-    def register_context_layer(
-        self,
-        instance_id: str,
-        namespace: str,
-        device_id: int,
-        layer_name: str,
-        data_ptr: int,
-        size_bytes: int,
-        num_blocks: int,
-        bytes_per_block: int,
-        kv_stride_bytes: int,
-        segments: int,
-        tp_rank: int,
-        tp_size: int,
-        world_size: int,
-        num_layers: int,
-    ) -> None:
-        """Register a context layer buffer with layout metadata.
-
-        Args:
-            instance_id: ID of the model instance.
-            namespace: Namespace for model isolation.
-            device_id: CUDA device ID.
-            layer_name: Name of the layer (e.g., "layer_0").
-            data_ptr: GPU data pointer as integer.
-            size_bytes: Total size of the tensor in bytes.
-            num_blocks: Total number of paged blocks for this layer.
-            bytes_per_block: Size of each paged block in bytes.
-            kv_stride_bytes: Byte stride between K and V (KV-first layout).
-            segments: Number of segments per block (1=blocks-first, 2=KV-first).
-            tp_rank: Tensor Parallel rank of the worker.
-            tp_size: Total Tensor Parallel size.
-            world_size: Total worker count (TP * PP * PCP).
-            num_layers: Total number of layers in the model.
-
-        Raises:
-            RuntimeError: If registration fails.
-        """
-        ...
-
-    def unregister_instance(self, instance_id: str) -> None:
-        """Unregister the active inference context/instance.
-
-        Args:
-            instance_id: ID of the model instance to unregister.
-
-        Raises:
-            RuntimeError: If unregistration fails.
-        """
-        ...
-
-    def batch_load_kv_blocks(
-        self,
-        instance_id: str,
-        tp_rank: int,
-        device_id: int,
-        load_state_shm: str,
-        layer_names: list[str],
-        block_ids: list[int],
-        block_hashes: list[bytes],
-    ) -> None:
-        """Batch load KV blocks for multiple layers.
-
-        More efficient than individual loads as it avoids Python overhead
-        and reduces hash table lookups from O(layers × blocks) to O(blocks).
-
-        Args:
-            instance_id: ID of the model instance.
-            tp_rank: Tensor Parallel rank of the worker.
-            device_id: CUDA device ID.
-            load_state_shm: Shared memory name from PyLoadState.shm_name().
-            layer_names: List of layer names to load.
-            block_ids: GPU block IDs to load into.
-            block_hashes: Content hashes for each block.
-
-        Raises:
-            RuntimeError: If loading fails.
-        """
-        ...
-
 class EngineRpcClient:
     """gRPC client for remote PegaEngine server communication.
 
@@ -251,37 +157,6 @@ class EngineRpcClient:
 
         Returns:
             Tuple of (ok, message) indicating success/failure.
-
-        Raises:
-            PegaFlowServiceError: If server is unavailable.
-            PegaFlowBusinessError: If request is invalid.
-        """
-        ...
-
-    def query(
-        self,
-        instance_id: str,
-        block_hashes: list[bytes],
-        req_id: str,
-    ) -> dict[str, Any]:
-        """Pure memory-only query: check if prefix blocks are in memory cache.
-
-        Does NOT trigger SSD prefetch or pin blocks. Use ``query_prefetch``
-        if you need SSD prefetch support.
-
-        Args:
-            instance_id: Model instance ID.
-            block_hashes: List of block hashes to check.
-            req_id: Request ID for tracking.
-
-        Returns:
-            Dict with keys:
-                - ok (bool): Whether the request succeeded.
-                - message (str): Error message if failed.
-                - hit_blocks (int): Number of blocks ready in memory cache.
-                - prefetch_state (str): Always "done".
-                - loading_blocks (int): Always 0.
-                - missing_blocks (int): Number of blocks not in memory cache.
 
         Raises:
             PegaFlowServiceError: If server is unavailable.

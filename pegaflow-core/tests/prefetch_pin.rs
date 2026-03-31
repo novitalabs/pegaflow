@@ -23,7 +23,7 @@ async fn load_requires_query_prefetch() {
     harness.save_all().await;
     harness.assert_cache_eventually_all().await;
 
-    let (hit, missing) = harness.query_hits(harness.block_hashes());
+    let (hit, missing) = harness.query_hits(harness.block_hashes()).await;
     assert_eq!(hit, NUM_BLOCKS, "blocks should already be cached");
     assert_eq!(missing, 0);
 

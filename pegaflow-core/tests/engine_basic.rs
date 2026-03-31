@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use common::*;
 use cudarc::driver::CudaContext;
-use pegaflow_core::StorageConfig;
+use pegaflow_core::{PrefetchStatus, StorageConfig};
 
 /// Full save → query → load round-trip with data integrity check.
 ///
@@ -78,7 +78,7 @@ async fn save_deduplicates_cached_blocks() {
     harness.assert_cache_eventually_all().await;
     harness.save_all().await;
 
-    let (hit, missing) = harness.query_hits(harness.block_hashes());
+    let (hit, missing) = harness.query_hits(harness.block_hashes()).await;
     assert_eq!(hit, NUM_BLOCKS);
     assert_eq!(missing, 0);
 }
@@ -157,14 +157,20 @@ async fn multi_layer_blocks_hit_only_after_all_layers_saved() {
     // Save insertion into cache is async; give insert worker a chance to process partial data.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let (hit, missing) = engine
-        .count_prefix_hit_blocks(INSTANCE_ID, &block_hashes)
+    let status = engine
+        .count_prefix_hit_blocks_with_prefetch(INSTANCE_ID, "test-partial", &block_hashes)
+        .await
         .expect("query after layer_0 save");
-    assert_eq!(
-        hit, 0,
-        "partial layer save must not expose hash as cache hit"
-    );
-    assert_eq!(missing, NUM_BLOCKS);
+    match status {
+        PrefetchStatus::Done { hit, missing } => {
+            assert_eq!(
+                hit, 0,
+                "partial layer save must not expose hash as cache hit"
+            );
+            assert_eq!(missing, NUM_BLOCKS);
+        }
+        other => panic!("expected Done, got {:?}", other),
+    }
 
     save_single_layer(
         &engine,
@@ -187,11 +193,17 @@ async fn multi_layer_blocks_hit_only_after_all_layers_saved() {
     )
     .await;
 
-    let (hit, missing) = engine
-        .count_prefix_hit_blocks(INSTANCE_ID, &block_hashes)
+    let status = engine
+        .count_prefix_hit_blocks_with_prefetch(INSTANCE_ID, "test-all-saved", &block_hashes)
+        .await
         .expect("query after all layers saved");
-    assert_eq!(hit, NUM_BLOCKS);
-    assert_eq!(missing, 0);
+    match status {
+        PrefetchStatus::Done { hit, missing } => {
+            assert_eq!(hit, NUM_BLOCKS);
+            assert_eq!(missing, 0);
+        }
+        other => panic!("expected Done, got {:?}", other),
+    }
 }
 
 /// Namespace isolation: blocks saved under one namespace are invisible to another.
@@ -249,9 +261,15 @@ async fn namespace_isolation_roundtrip() {
     wait_for_cache(&engine, "inst-a", &hashes, NUM_BLOCKS, CACHE_WAIT_TIMEOUT).await;
 
     // inst-b should see zero hits (different namespace)
-    let (hit, missing) = engine
-        .count_prefix_hit_blocks("inst-b", &hashes)
+    let status = engine
+        .count_prefix_hit_blocks_with_prefetch("inst-b", "test-ns-isolation", &hashes)
+        .await
         .expect("query inst-b");
-    assert_eq!(hit, 0, "namespace isolation violated");
-    assert_eq!(missing, NUM_BLOCKS);
+    match status {
+        PrefetchStatus::Done { hit, missing } => {
+            assert_eq!(hit, 0, "namespace isolation violated");
+            assert_eq!(missing, NUM_BLOCKS);
+        }
+        other => panic!("expected Done, got {:?}", other),
+    }
 }

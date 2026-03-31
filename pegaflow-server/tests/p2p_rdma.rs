@@ -185,9 +185,14 @@ async fn wait_for_cache(
 ) {
     let deadline = Instant::now() + timeout;
     loop {
-        let (hit, _) = engine
-            .count_prefix_hit_blocks(instance_id, block_hashes)
-            .expect("count_prefix_hit_blocks");
+        let status = engine
+            .count_prefix_hit_blocks_with_prefetch(instance_id, "wait-for-cache", block_hashes)
+            .await
+            .expect("count_prefix_hit_blocks_with_prefetch");
+        let hit = match status {
+            PrefetchStatus::Done { hit, .. } => hit,
+            PrefetchStatus::Loading { hit, .. } => hit,
+        };
         if hit >= expected_hit {
             return;
         }

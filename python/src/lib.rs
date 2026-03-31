@@ -1,4 +1,4 @@
-use pegaflow_core::{LoadState, PegaEngine as CoreEngine};
+use pegaflow_core::LoadState;
 use pegaflow_proto::proto::engine::{
     HealthRequest, LoadRequest, QueryRequest, RegisterContextRequest, ResponseStatus, SaveLayer,
     SaveRequest, ShutdownRequest, UnpinRequest, UnregisterRequest, engine_client::EngineClient,
@@ -103,12 +103,6 @@ fn u64_to_usize(value: u64, field: &str) -> PyResult<usize> {
         .map_err(|_| PyRuntimeError::new_err(format!("{field}={value} exceeds usize range")))
 }
 
-/// Python wrapper for PegaEngine
-#[pyclass]
-struct PegaEngine {
-    engine: CoreEngine,
-}
-
 #[pyclass]
 struct EngineRpcClient {
     endpoint: String,
@@ -134,127 +128,6 @@ impl EngineRpcClient {
             rt_handle
                 .block_on(async move { f(client).await.map_err(|e| rpc_status_error(method, e)) })
         })
-    }
-}
-
-#[pymethods]
-impl PegaEngine {
-    /// Create a new PegaEngine instance
-    #[new]
-    fn new() -> Self {
-        pegaflow_common::logging::init_stderr("info,pegaflow_core=info");
-        PegaEngine {
-            engine: CoreEngine::new(),
-        }
-    }
-
-    /// Register a context layer buffer along with its layout metadata.
-    ///
-    /// Args:
-    ///     instance_id: ID of the model instance
-    ///     namespace: Namespace for model isolation
-    ///     device_id: CUDA device ID
-    ///     layer_name: Name of the layer
-    ///     data_ptr: GPU data pointer (as u64)
-    ///     size_bytes: Total size of the tensor in bytes
-    ///     num_blocks: Total number of paged blocks for this layer
-    ///     bytes_per_block: Size of each paged block in bytes
-    ///     kv_stride_bytes: Byte stride between K and V when KV-first layout is used
-    ///     segments: Number of segments per block (1 for blocks-first, 2 for KV-first)
-    ///     tp_rank: Tensor Parallel rank of the worker
-    ///     device_id: CUDA device ID of the worker
-    ///     tp_size: Total Tensor Parallel size
-    ///     world_size: Total worker count (TP * PP * PCP)
-    ///     num_layers: Total number of layers in the model
-    #[allow(clippy::too_many_arguments)]
-    fn register_context_layer(
-        &mut self,
-        instance_id: &str,
-        namespace: &str,
-        device_id: i32,
-        layer_name: String,
-        data_ptr: u64,
-        size_bytes: usize,
-        num_blocks: usize,
-        bytes_per_block: usize,
-        kv_stride_bytes: usize,
-        segments: usize,
-        tp_rank: usize,
-        tp_size: usize,
-        world_size: usize,
-        num_layers: usize,
-    ) -> PyResult<()> {
-        self.engine
-            .register_context_layer_batch(
-                instance_id,
-                namespace,
-                device_id,
-                tp_rank,
-                tp_size,
-                world_size,
-                num_layers,
-                &[layer_name],
-                &[data_ptr],
-                &[size_bytes],
-                &[num_blocks],
-                &[bytes_per_block],
-                &[kv_stride_bytes],
-                &[segments],
-            )
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-    }
-
-    /// Unregister the active inference context/instance
-    fn unregister_instance(&mut self, instance_id: &str) -> PyResult<()> {
-        self.engine
-            .unregister_instance(instance_id)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-    }
-
-    /// Batch load KV blocks for multiple layers using the same block mapping.
-    ///
-    /// This is much more efficient than calling load_kv_blocks_to_ipc in a loop
-    /// from Python, as it avoids Python overhead, data copying, and redundant hash lookups.
-    ///
-    /// The optimization reduces hash table lookups from O(layers × blocks) to O(blocks)
-    /// by performing all lookups once and then extracting blocks for each layer.
-    ///
-    /// Args:
-    ///     instance_id: ID of the model instance
-    ///     tp_rank: Tensor Parallel rank of the worker
-    ///     load_state_shm: Shared memory name from PyLoadState.shm_name() for sync
-    ///     layer_names: List of layer names to load
-    ///     block_ids: GPU block IDs to load into (list of ints)
-    ///     block_hashes: Content hashes for each block (list of bytes)
-    #[allow(clippy::too_many_arguments)]
-    fn batch_load_kv_blocks(
-        &self,
-        py: Python<'_>,
-        instance_id: &str,
-        tp_rank: usize,
-        device_id: i32,
-        load_state_shm: &str,
-        layer_names: Vec<String>,
-        block_ids: Vec<i32>,
-        block_hashes: Vec<Vec<u8>>,
-    ) -> PyResult<()> {
-        let instance_id_owned = instance_id.to_string();
-        let load_state_shm_owned = load_state_shm.to_string();
-        let engine = &self.engine;
-        py.detach(move || {
-            let layer_name_refs: Vec<&str> = layer_names.iter().map(|s| s.as_str()).collect();
-
-            engine.batch_load_kv_blocks_multi_layer(
-                &instance_id_owned,
-                tp_rank,
-                device_id,
-                &load_state_shm_owned,
-                &layer_name_refs,
-                &block_ids,
-                &block_hashes,
-            )
-        })
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 }
 
@@ -447,58 +320,6 @@ impl EngineRpcClient {
         .and_then(|r| status_tuple("load", r.status))
     }
 
-    /// Pure memory-only query: check if prefix blocks are in memory cache.
-    ///
-    /// This does NOT trigger SSD prefetch or pin blocks. Use `query_prefetch`
-    /// if you need SSD prefetch support.
-    ///
-    /// Args:
-    ///     instance_id: Model instance ID
-    ///     block_hashes: List of block hashes to check
-    ///
-    /// Returns: dict with keys:
-    ///     - ok: bool - whether the request succeeded
-    ///     - message: str - error message if failed
-    ///     - hit_blocks: int - number of blocks ready in memory cache
-    ///     - prefetch_state: str - always "done"
-    ///     - loading_blocks: int - always 0
-    ///     - missing_blocks: int - number of blocks not in memory cache
-    fn query(
-        &self,
-        py: Python<'_>,
-        instance_id: String,
-        block_hashes: Vec<Vec<u8>>,
-        req_id: String,
-    ) -> PyResult<Py<pyo3::types::PyAny>> {
-        self.call(py, "query", |mut c| async move {
-            let resp = c
-                .query(QueryRequest {
-                    instance_id,
-                    block_hashes,
-                    req_id,
-                })
-                .await?;
-            Ok(resp.into_inner())
-        })
-        .and_then(|r| {
-            let (ok, msg) = status_tuple("query", r.status)?;
-            let hit = u64_to_usize(r.hit_blocks, "hit_blocks")?;
-            let missing = u64_to_usize(r.missing_blocks, "missing_blocks")?;
-
-            Python::attach(|py| {
-                use pyo3::types::PyDict;
-                let dict = PyDict::new(py);
-                dict.set_item("ok", ok)?;
-                dict.set_item("message", msg)?;
-                dict.set_item("hit_blocks", hit)?;
-                dict.set_item("prefetch_state", "done")?;
-                dict.set_item("loading_blocks", 0)?;
-                dict.set_item("missing_blocks", missing)?;
-                Ok(dict.into())
-            })
-        })
-    }
-
     /// Query prefix cache hits with SSD prefetch support.
     ///
     /// Checks memory cache and triggers SSD prefetch for missing blocks.
@@ -663,12 +484,10 @@ impl PyLoadState {
 }
 
 /// A Python module implemented in Rust.
-/// This module is named "pegaflow" and will be imported as: from pegaflow import PegaEngine
 #[pymodule]
 fn pegaflow(m: &Bound<'_, PyModule>) -> PyResult<()> {
     pegaflow_common::logging::init_stderr("info,pegaflow_core=info");
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
-    m.add_class::<PegaEngine>()?;
     m.add_class::<EngineRpcClient>()?;
     m.add_class::<PyLoadState>()?;
     // Register custom exceptions for error classification
