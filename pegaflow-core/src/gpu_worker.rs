@@ -12,19 +12,19 @@ use crate::{EngineError, KVCacheRegistration, transfer};
 use pegaflow_common::{NumaNode, pin_thread_to_numa_node};
 
 /// A task to load KV blocks from CPU to GPU for multiple layers
-pub struct LoadTask {
+pub(crate) struct LoadTask {
     pub layers: Vec<LayerLoadData>,
     pub load_state_shm: String,
 }
 
 /// Data for loading a single layer
-pub struct LayerLoadData {
+pub(crate) struct LayerLoadData {
     pub layer_name: String,
     pub registration: KVCacheRegistration,
     pub blocks: Vec<LoadBlock>,
 }
 
-pub struct LoadBlock {
+pub(crate) struct LoadBlock {
     pub block_idx: usize,
     pub block: Arc<RawBlock>,
 }
@@ -32,7 +32,7 @@ pub struct LoadBlock {
 /// A task to save KV blocks from GPU to CPU for multiple layers.
 /// Caller pre-allocates pinned memory, worker does the GPU->CPU copy.
 /// All layers are copied on the same CUDA stream with a single synchronization.
-pub struct SaveTask {
+pub(crate) struct SaveTask {
     pub layers: Vec<SaveLayerData>,
     pub reply: oneshot::Sender<Result<(), EngineError>>,
     #[cfg(feature = "tracing")]
@@ -40,12 +40,12 @@ pub struct SaveTask {
 }
 
 /// Data for saving a single layer's blocks from GPU to CPU.
-pub struct SaveLayerData {
+pub(crate) struct SaveLayerData {
     pub registration: KVCacheRegistration,
     pub blocks: Vec<SaveBlock>,
 }
 
-pub struct SaveBlock {
+pub(crate) struct SaveBlock {
     pub block_idx: usize,
     /// Pre-allocated K segment destination pointer (pinned memory)
     pub k_dst_ptr: *mut u8,
@@ -62,7 +62,7 @@ unsafe impl Send for SaveBlock {}
 unsafe impl Send for SaveLayerData {}
 
 /// Per-GPU worker pool with dedicated load and save threads
-pub struct GpuWorkerPool {
+pub(crate) struct GpuWorkerPool {
     device_id: i32,
     load_tx: mpsc::UnboundedSender<LoadTask>,
     save_tx: mpsc::UnboundedSender<SaveTask>,

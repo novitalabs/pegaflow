@@ -10,18 +10,18 @@
 #[macro_use]
 mod trace;
 
-pub mod allocator;
+mod allocator;
 mod backing;
-pub mod block;
+mod block;
 mod cache;
-pub mod gpu_worker;
-pub mod instance;
-pub mod internode;
+mod gpu_worker;
+mod instance;
+mod internode;
 pub use pegaflow_common::logging;
 mod metrics;
 mod offload;
-pub mod pinned_mem;
-pub mod pinned_pool;
+mod pinned_mem;
+mod pinned_pool;
 mod seal_offload;
 mod storage;
 pub mod sync_state;

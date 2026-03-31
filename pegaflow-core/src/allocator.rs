@@ -6,7 +6,7 @@ use std::{
 
 /// Error variants returned by the scaled allocator wrapper.
 #[derive(Debug, PartialEq, Eq)]
-pub enum AllocatorError {
+pub(crate) enum AllocatorError {
     /// The configured unit size must be greater than zero.
     InvalidUnitSize,
     /// The requested capacity cannot be represented with the underlying u32 allocator.
@@ -43,7 +43,7 @@ impl Display for AllocatorError {
 }
 
 /// Represents an allocated region in bytes.
-pub struct Allocation {
+pub(crate) struct Allocation {
     /// Offset from the start of the managed region, in bytes.
     pub offset_bytes: u64,
     /// Actual size of the allocation in bytes (rounded up to `unit_size`).
@@ -63,7 +63,7 @@ impl std::fmt::Debug for Allocation {
 /// A thin scaling wrapper around `offset-allocator` that allows byte-level APIs
 /// while the underlying allocator works with u32-sized units.
 #[derive(Debug)]
-pub struct ScaledOffsetAllocator {
+pub(crate) struct ScaledOffsetAllocator {
     unit_size: NonZeroU64,
     total_units: u32,
     inner: RawAllocator,
@@ -143,7 +143,7 @@ impl ScaledOffsetAllocator {
 
 /// Storage report expressed in bytes.
 #[derive(Debug, PartialEq, Eq)]
-pub struct StorageReportBytes {
+pub(crate) struct StorageReportBytes {
     pub total_free_bytes: u64,
     pub largest_free_allocation_bytes: u64,
 }
