@@ -204,11 +204,10 @@ impl PrefetchScheduler {
             }
         }
 
-        // If nothing is loading from SSD and there are no local hits at all,
-        // try RDMA remote fetch from another node — but skip if a previous
-        // attempt for this req_id already came back empty (remote evicted).
+        // If nothing is loading from SSD, try RDMA remote fetch from another
+        // node for the remaining blocks — but skip if a previous attempt for
+        // this req_id already came back empty (remote evicted).
         if loading == 0
-            && hit == 0
             && !remaining.is_empty()
             && let Some(rdma_fetch) = &self.rdma_fetch
             && !self.state.lock().failed_remote.contains_key(req_id)
