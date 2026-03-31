@@ -53,9 +53,5 @@ harness = false
 name = "uds_latency"
 harness = false
 
-[[bench]]
-name = "block_key_copy"
-harness = false
-
 [[example]]
 name = "pinned_alloc"

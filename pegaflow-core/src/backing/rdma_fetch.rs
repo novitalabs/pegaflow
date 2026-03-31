@@ -84,11 +84,7 @@ impl RdmaFetchStore {
             return None;
         }
 
-        let nodes = match self
-            .metaserver_client
-            .query_prefix(namespace, hashes)
-            .await
-        {
+        let nodes = match self.metaserver_client.query_prefix(namespace, hashes).await {
             Ok(n) => n,
             Err(e) => {
                 warn!("MetaServer query failed for remote fetch: {e}");
