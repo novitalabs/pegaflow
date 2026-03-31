@@ -1,15 +1,13 @@
 """PegaFlow - High-performance key-value storage engine with Python bindings.
 
 This package provides:
-1. PegaEngine: Rust-based high-performance KV storage (via PyO3)
+1. EngineRpcClient: gRPC client for remote PegaFlow server communication
 2. PegaKVConnector: vLLM KV connector for distributed inference
 """
 
-# Import Rust-based PegaEngine from the compiled extension
 try:
     from .pegaflow import (
         EngineRpcClient,
-        PegaEngine,
         PegaFlowBusinessError,
         PegaFlowError,
         PegaFlowServiceError,
@@ -26,7 +24,6 @@ __version__ = _rust_version
 __all__ = [
     "__version__",
     "EngineRpcClient",
-    "PegaEngine",
     "PegaFlowBusinessError",
     "PegaFlowError",
     "PegaFlowServiceError",

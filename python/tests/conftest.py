@@ -261,16 +261,18 @@ class ClientContext:
 
         self._registered = False
 
-    def query(self, block_hashes: list[bytes]) -> dict | tuple:
+    def query(self, block_hashes: list[bytes]) -> dict:
         """Query available blocks (like SchedulerConnector._count_available_block_prefix).
 
         Args:
             block_hashes: List of block hashes to query
 
         Returns:
-            Query result (dict or tuple format)
+            Query result dict
         """
-        return self.engine_client.query(self.instance_id, block_hashes, "")
+        return self.engine_client.query_prefetch(
+            self.instance_id, block_hashes, req_id="test"
+        )
 
     def get_kv_cache(self, layer: int = 0) -> torch.Tensor:
         """Get KV cache tensor for a specific layer."""

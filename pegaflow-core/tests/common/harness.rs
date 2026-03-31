@@ -166,10 +166,16 @@ impl RoundtripHarness {
         .await;
     }
 
-    pub fn query_hits(&self, block_hashes: &[Vec<u8>]) -> (usize, usize) {
-        self.engine
-            .count_prefix_hit_blocks(&self.instance_id, block_hashes)
-            .expect("count_prefix_hit_blocks")
+    pub async fn query_hits(&self, block_hashes: &[Vec<u8>]) -> (usize, usize) {
+        match self
+            .engine
+            .count_prefix_hit_blocks_with_prefetch(&self.instance_id, "harness-query", block_hashes)
+            .await
+            .expect("count_prefix_hit_blocks_with_prefetch")
+        {
+            PrefetchStatus::Done { hit, missing } => (hit, missing),
+            PrefetchStatus::Loading { hit, loading } => (hit, loading),
+        }
     }
 
     pub async fn expect_query_prefetch_done_all(&self) {
