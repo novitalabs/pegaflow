@@ -15,7 +15,7 @@ Usage:
 
 Arguments:
     --model         Model path (required)
-    --base-len      Base prompt length in tokens (default: 10000)
+    --base-len      Base prompt length in tokens (default: model-dependent, 10000 for Qwen3, 4000 for Qwen3.5)
     --append-len    Additional tokens appended for test request (default: 128)
     --output-len    Output tokens to generate (default: 1)
     --port          vLLM server port (default: 8001)
@@ -396,8 +396,8 @@ def main():
     parser.add_argument(
         "--base-len",
         type=int,
-        default=10000,
-        help="Base prompt length in tokens (default: 10000)",
+        default=None,
+        help="Base prompt length in tokens (default: model-dependent, 10000 for Qwen3, 4000 for Qwen3.5)",
     )
     parser.add_argument(
         "--append-len",
@@ -422,6 +422,14 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.base_len is None:
+        model_lower = args.model.lower()
+        if "qwen3.5" in model_lower or "qwen35" in model_lower:
+            args.base_len = 4000
+        else:
+            args.base_len = 10000
+
     run_benchmark(args)
 
 
