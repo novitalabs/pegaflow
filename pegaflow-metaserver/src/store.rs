@@ -1,4 +1,5 @@
 use moka::future::Cache;
+use moka::policy::EvictionPolicy;
 use pegaflow_core::BlockKey;
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,6 +40,7 @@ impl BlockHashStore {
     /// Create a new block hash store with specified max capacity in bytes and TTL in minutes
     pub fn with_capacity_and_ttl(max_capacity_bytes: u64, ttl_minutes: u64) -> Self {
         let cache = Cache::builder()
+            .eviction_policy(EvictionPolicy::lru())
             // Set max capacity based on estimated memory size
             .max_capacity(max_capacity_bytes)
             // Use weigher to estimate the size of each entry (key + node URL)
