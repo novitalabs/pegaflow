@@ -214,7 +214,7 @@ async fn wait_for_metaserver_registration(
     let deadline = Instant::now() + timeout;
     loop {
         store.run_pending_tasks().await;
-        let found = store.query_hashes(namespace, hashes).await;
+        let found = store.query_prefix(namespace, hashes).await;
         if found.len() >= expected {
             return;
         }

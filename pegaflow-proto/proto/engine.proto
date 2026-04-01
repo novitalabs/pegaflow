@@ -195,29 +195,23 @@ message InsertBlockHashesResponse {
   uint64 inserted_count = 2;
 }
 
-message QueryBlockHashesRequest {
+message QueryPrefixBlocksRequest {
   string namespace = 1;
-  repeated bytes block_hashes = 2;
+  repeated bytes block_hashes = 2;  // ordered by prefix position
 }
 
-// Block hashes grouped by the owning node
-message NodeBlockHashes {
+message NodePrefixResult {
   string node = 1;
-  repeated bytes block_hashes = 2;
+  uint32 prefix_len = 2;
 }
 
-message QueryBlockHashesResponse {
-  ResponseStatus status = 1;
-  repeated bytes existing_hashes = 2;
-  uint64 total_queried = 3;
-  uint64 found_count = 4;
-  // Found hashes grouped by owning node
-  repeated NodeBlockHashes node_blocks = 5;
+message QueryPrefixBlocksResponse {
+  repeated NodePrefixResult nodes = 1;
 }
 
 service MetaServer {
   rpc InsertBlockHashes(InsertBlockHashesRequest) returns (InsertBlockHashesResponse);
-  rpc QueryBlockHashes(QueryBlockHashesRequest) returns (QueryBlockHashesResponse);
+  rpc QueryPrefixBlocks(QueryPrefixBlocksRequest) returns (QueryPrefixBlocksResponse);
   rpc Health(HealthRequest) returns (HealthResponse);
   rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
 }

@@ -53,7 +53,7 @@ fn read_hugepage_size_from_proc() -> Option<usize> {
 
 /// Error type for pinned memory allocation.
 #[derive(Debug)]
-pub enum PinnedMemError {
+pub(crate) enum PinnedMemError {
     /// mmap failed
     MmapFailed(io::Error),
     /// cudaHostAlloc failed
@@ -85,7 +85,7 @@ impl std::error::Error for PinnedMemError {}
 
 /// Allocation strategy for pinned memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AllocStrategy {
+pub(crate) enum AllocStrategy {
     /// Regular pinned memory via cudaHostAlloc (flags=0).
     /// Safe for both CPU reads and writes; use when SSD offload is enabled.
     Regular,
@@ -99,7 +99,7 @@ pub enum AllocStrategy {
 /// RAII wrapper for CUDA pinned memory.
 ///
 /// Memory is automatically freed/unmapped and unregistered when dropped.
-pub struct PinnedMemory {
+pub(crate) struct PinnedMemory {
     ptr: NonNull<u8>,
     size: usize,
     strategy: AllocStrategy,

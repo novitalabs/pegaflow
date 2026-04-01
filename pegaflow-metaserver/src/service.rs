@@ -1,7 +1,7 @@
 use crate::proto::engine::meta_server_server::MetaServer;
 use crate::proto::engine::{
     HealthRequest, HealthResponse, InsertBlockHashesRequest, InsertBlockHashesResponse,
-    NodeBlockHashes, QueryBlockHashesRequest, QueryBlockHashesResponse, ResponseStatus,
+    NodePrefixResult, QueryPrefixBlocksRequest, QueryPrefixBlocksResponse, ResponseStatus,
     ShutdownRequest, ShutdownResponse,
 };
 use crate::store::BlockHashStore;
@@ -81,74 +81,62 @@ impl MetaServer for GrpcMetaService {
         Ok(Response::new(response))
     }
 
-    async fn query_block_hashes(
+    /// Given an ordered list of block hashes, find the longest contiguous prefix
+    /// that exists in the store (stop at the first hash no node owns), then for
+    /// each node return how many consecutive hashes from h0 it holds.
+    async fn query_prefix_blocks(
         &self,
-        request: Request<QueryBlockHashesRequest>,
-    ) -> Result<Response<QueryBlockHashesResponse>, Status> {
+        request: Request<QueryPrefixBlocksRequest>,
+    ) -> Result<Response<QueryPrefixBlocksResponse>, Status> {
         let start = Instant::now();
         let req = request.into_inner();
 
         debug!(
-            "RPC [query_block_hashes]: namespace={} hashes_count={}",
+            "RPC [query_prefix_blocks]: namespace={} hashes_count={}",
             req.namespace,
             req.block_hashes.len()
         );
 
-        // Validate request
         if req.block_hashes.is_empty() {
-            let response = QueryBlockHashesResponse {
-                status: Some(Self::error_status(
-                    "block_hashes cannot be empty".to_string(),
-                )),
-                existing_hashes: vec![],
-                total_queried: 0,
-                found_count: 0,
-                node_blocks: vec![],
-            };
-            return Ok(Response::new(response));
+            return Err(Status::invalid_argument("block_hashes cannot be empty"));
         }
 
-        // Query existing hashes (returns CrossNodeBlock entries)
+        // Returns entries up to the first globally-missing hash.
         let existing = self
             .store
-            .query_hashes(&req.namespace, &req.block_hashes)
+            .query_prefix(&req.namespace, &req.block_hashes)
             .await;
 
         let total_queried = req.block_hashes.len();
-        let found_count = existing.len();
+        let prefix_len = existing.len();
 
         let elapsed = start.elapsed();
         info!(
-            "RPC [query_block_hashes]: namespace={} found={}/{} hashes in {:?}",
-            req.namespace, found_count, total_queried, elapsed
+            "RPC [query_prefix_blocks]: namespace={} prefix={}/{} in {:?}",
+            req.namespace, prefix_len, total_queried, elapsed
         );
 
-        let existing_hashes: Vec<Vec<u8>> = existing.iter().map(|e| e.block_hash.clone()).collect();
-
-        // Group hashes by node
-        let mut node_map: std::collections::HashMap<&str, Vec<Vec<u8>>> =
+        // Per-node prefix: `existing[i]` maps to `block_hashes[i]`.
+        // A node's prefix = count of consecutive hashes from h0 it owns.
+        let mut node_prefix: std::collections::HashMap<&str, u32> =
             std::collections::HashMap::new();
-        for entry in &existing {
-            node_map
-                .entry(&entry.node)
-                .or_default()
-                .push(entry.block_hash.clone());
+        for (i, entry) in existing.iter().enumerate() {
+            let count = node_prefix.entry(&entry.node).or_insert(0);
+            // Only extend if every previous hash (0..i) was also on this node
+            if *count == i as u32 {
+                *count += 1;
+            }
         }
-        let node_blocks: Vec<NodeBlockHashes> = node_map
+        let nodes: Vec<NodePrefixResult> = node_prefix
             .into_iter()
-            .map(|(node, block_hashes)| NodeBlockHashes {
+            .filter(|(_, count)| *count > 0)
+            .map(|(node, count)| NodePrefixResult {
                 node: node.to_string(),
-                block_hashes,
+                prefix_len: count,
             })
             .collect();
 
-        let response = QueryBlockHashesResponse {
-            status: Some(Self::ok_status()),
-            existing_hashes,
-            total_queried: total_queried as u64,
-            found_count: found_count as u64,
-            node_blocks,
-        };
+        let response = QueryPrefixBlocksResponse { nodes };
 
         Ok(Response::new(response))
     }
