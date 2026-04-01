@@ -43,9 +43,10 @@ impl MetaServer for GrpcMetaService {
         let start = Instant::now();
         let req = request.into_inner();
 
-        let all_hashes: Vec<String> = req
+        let sample: Vec<String> = req
             .block_hashes
             .iter()
+            .take(3)
             .map(|h| {
                 h.iter()
                     .take(8)
@@ -54,11 +55,11 @@ impl MetaServer for GrpcMetaService {
             })
             .collect();
         debug!(
-            "RPC [insert_block_hashes]: namespace={} node={} hashes_count={} hashes={:?}",
+            "RPC [insert_block_hashes]: namespace={} node={} hashes_count={} first_hashes={:?}",
             req.namespace,
             req.node,
             req.block_hashes.len(),
-            all_hashes
+            sample
         );
 
         // Validate request
@@ -102,9 +103,10 @@ impl MetaServer for GrpcMetaService {
         let start = Instant::now();
         let req = request.into_inner();
 
-        let all_hashes: Vec<String> = req
+        let sample: Vec<String> = req
             .block_hashes
             .iter()
+            .take(3)
             .map(|h| {
                 h.iter()
                     .take(8)
@@ -113,10 +115,10 @@ impl MetaServer for GrpcMetaService {
             })
             .collect();
         debug!(
-            "RPC [query_prefix_blocks]: namespace={} hashes_count={} hashes={:?}",
+            "RPC [query_prefix_blocks]: namespace={} hashes_count={} first_hashes={:?}",
             req.namespace,
             req.block_hashes.len(),
-            all_hashes
+            sample
         );
 
         if req.block_hashes.is_empty() {
