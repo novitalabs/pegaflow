@@ -6,264 +6,315 @@ use pegaflow_core::*;
 use super::gpu_buffer::GpuBuffer;
 use super::helpers::*;
 
-#[derive(Clone)]
-pub struct HarnessConfig<'a> {
-    pub instance_id: &'a str,
-    pub namespace: &'a str,
-    pub device_id: i32,
-    pub tp_rank: usize,
-    pub tp_size: usize,
-    pub world_size: usize,
-    pub num_layers: usize,
-    pub num_blocks: usize,
+// ---------------------------------------------------------------------------
+// TestGpuData: GPU buffer + expected content
+// ---------------------------------------------------------------------------
+
+pub struct TestGpuData {
+    gpu: GpuBuffer,
+    expected: Vec<u8>,
     pub block_size: usize,
-    pub hash_salt: u8,
-    pub storage_config: Option<StorageConfig>,
 }
 
-impl<'a> HarnessConfig<'a> {
-    pub fn new(
-        instance_id: &'a str,
-        namespace: &'a str,
-        num_blocks: usize,
-        block_size: usize,
-    ) -> Self {
+impl TestGpuData {
+    pub fn new(num_blocks: usize, block_size: usize) -> Self {
+        let total = num_blocks * block_size;
+        let gpu = GpuBuffer::alloc(total);
+        let mut expected = vec![0u8; total];
+        fill_test_pattern(&mut expected, block_size);
+        gpu.copy_from_host(&expected);
+        Self {
+            gpu,
+            expected,
+            block_size,
+        }
+    }
+
+    pub fn overwrite(&mut self, modifier: u8) {
+        for b in &mut self.expected {
+            *b = b.wrapping_add(modifier);
+        }
+        self.gpu.copy_from_host(&self.expected);
+    }
+
+    pub fn zero_gpu(&self) {
+        self.gpu.zero();
+    }
+
+    pub fn assert_gpu_matches_expected(&self) {
+        assert_eq!(self.gpu.copy_to_host(), self.expected, "GPU data mismatch");
+    }
+
+    pub fn ptr(&self) -> u64 {
+        self.gpu.as_u64()
+    }
+
+    pub fn total_size(&self) -> usize {
+        self.expected.len()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestEnv: engine + registered layers
+// ---------------------------------------------------------------------------
+
+pub struct RegisteredLayer {
+    pub name: String,
+    pub data: TestGpuData,
+    pub num_blocks: usize,
+}
+
+pub struct TestEnv {
+    pub _ctx: Arc<CudaContext>,
+    pub engine: PegaEngine,
+    pub instance_id: String,
+    pub layers: Vec<RegisteredLayer>,
+    pub world_size: usize,
+}
+
+pub struct TestEnvBuilder {
+    instance_id: &'static str,
+    namespace: &'static str,
+    pool_size: usize,
+    world_size: usize,
+    storage_config: Option<StorageConfig>,
+    layers: Vec<(&'static str, usize, usize)>,
+}
+
+impl TestEnvBuilder {
+    pub fn new(instance_id: &'static str, namespace: &'static str) -> Self {
         Self {
             instance_id,
             namespace,
-            device_id: 0,
-            tp_rank: 0,
-            tp_size: 1,
+            pool_size: 16 << 20,
             world_size: 1,
-            num_layers: 1,
-            num_blocks,
-            block_size,
-            hash_salt: 0,
             storage_config: None,
+            layers: vec![],
         }
     }
 
-    pub fn with_world_size(mut self, world_size: usize) -> Self {
-        self.world_size = world_size;
+    pub fn layer(mut self, name: &'static str, num_blocks: usize, block_size: usize) -> Self {
+        self.layers.push((name, num_blocks, block_size));
         self
     }
 
-    pub fn with_hash_salt(mut self, hash_salt: u8) -> Self {
-        self.hash_salt = hash_salt;
+    pub fn pool_size(mut self, size: usize) -> Self {
+        self.pool_size = size;
         self
     }
 
-    pub fn with_storage_config(mut self, config: StorageConfig) -> Self {
+    pub fn world_size(mut self, ws: usize) -> Self {
+        self.world_size = ws;
+        self
+    }
+
+    pub fn storage(mut self, config: StorageConfig) -> Self {
         self.storage_config = Some(config);
         self
     }
-}
 
-pub struct RoundtripHarness {
-    pub _cuda_ctx: Arc<CudaContext>,
-    pub engine: PegaEngine,
-    pub gpu_buf: GpuBuffer,
-    pub host_data: Vec<u8>,
-    pub block_ids: Vec<i32>,
-    pub block_hashes: Vec<Vec<u8>>,
-    pub instance_id: String,
-    pub layer_name: String,
-    pub device_id: i32,
-    pub tp_rank: usize,
-    pub world_size: usize,
-}
+    pub fn build(self) -> TestEnv {
+        let ctx = CudaContext::new(0).expect("CUDA init");
+        let sc = self.storage_config.unwrap_or(StorageConfig {
+            enable_lfu_admission: false,
+            ..StorageConfig::default()
+        });
+        let engine = test_engine_with_pool(self.pool_size, sc);
 
-impl RoundtripHarness {
-    pub fn new(config: HarnessConfig<'_>) -> Self {
-        let cuda_device =
-            usize::try_from(config.device_id).expect("device_id must be non-negative");
-        let cuda_ctx =
-            CudaContext::new(cuda_device).expect("CUDA init failed — is a GPU available?");
+        let layers: Vec<RegisteredLayer> = self
+            .layers
+            .iter()
+            .map(|&(name, nb, bs)| RegisteredLayer {
+                name: name.to_string(),
+                data: TestGpuData::new(nb, bs),
+                num_blocks: nb,
+            })
+            .collect();
 
-        let total_size = config.num_blocks * config.block_size;
-        let gpu_buf = GpuBuffer::alloc(total_size);
+        let layer_infos: Vec<LayerInfo> = layers
+            .iter()
+            .map(|l| LayerInfo {
+                name: l.name.clone(),
+                gpu_ptr: l.data.ptr(),
+                total_size: l.data.total_size(),
+                num_blocks: l.num_blocks,
+                block_size: l.data.block_size,
+            })
+            .collect();
 
-        let mut host_data = vec![0u8; total_size];
-        fill_test_pattern(&mut host_data, config.block_size);
-        gpu_buf.copy_from_host(&host_data);
-
-        let engine = match config.storage_config {
-            Some(sc) => test_engine_with_storage_config(sc),
-            None => test_engine(),
-        };
-        register_single_layer(
+        register_layers(
             &engine,
-            config.instance_id,
-            config.namespace,
-            DEFAULT_LAYER,
-            gpu_buf.as_u64(),
-            total_size,
-            config.num_blocks,
-            config.block_size,
-            config.device_id,
-            config.tp_rank,
-            config.tp_size,
-            config.world_size,
-            config.num_layers,
+            self.instance_id,
+            self.namespace,
+            &layer_infos,
+            0,
+            0,
+            1,
+            self.world_size,
+            layers.len(),
         );
 
-        Self {
-            _cuda_ctx: cuda_ctx,
+        TestEnv {
+            _ctx: ctx,
             engine,
-            gpu_buf,
-            host_data,
-            block_ids: make_block_ids(config.num_blocks),
-            block_hashes: make_block_hashes(config.num_blocks, config.hash_salt),
-            instance_id: config.instance_id.to_string(),
-            layer_name: DEFAULT_LAYER.to_string(),
-            device_id: config.device_id,
-            tp_rank: config.tp_rank,
-            world_size: config.world_size,
+            instance_id: self.instance_id.to_string(),
+            layers,
+            world_size: self.world_size,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestEnv operations — mirror pub API, names spell out side effects
+// ---------------------------------------------------------------------------
+
+impl TestEnv {
+    /// Shortcut for single-layer envs.
+    pub fn data(&self) -> &TestGpuData {
+        assert_eq!(self.layers.len(), 1, "data() requires exactly one layer");
+        &self.layers[0].data
+    }
+
+    pub fn data_mut(&mut self) -> &mut TestGpuData {
+        assert_eq!(
+            self.layers.len(),
+            1,
+            "data_mut() requires exactly one layer"
+        );
+        &mut self.layers[0].data
     }
 
     pub fn num_blocks(&self) -> usize {
-        self.block_hashes.len()
+        assert_eq!(
+            self.layers.len(),
+            1,
+            "num_blocks() requires exactly one layer"
+        );
+        self.layers[0].num_blocks
     }
 
-    pub fn block_ids(&self) -> &[i32] {
-        &self.block_ids
+    /// Generate hashes using this env's block count + a salt.
+    pub fn hashes(&self, salt: u8) -> Vec<Vec<u8>> {
+        make_block_hashes(self.num_blocks(), salt)
     }
 
-    pub fn block_hashes(&self) -> &[Vec<u8>] {
-        &self.block_hashes
-    }
+    // -- Core API wrappers --
 
-    pub async fn save_all(&self) {
-        self.save_layer(self.block_ids.clone(), self.block_hashes.clone())
+    /// Save one layer's blocks to cache.
+    pub async fn save_layer(&self, layer_index: usize, hashes: &[Vec<u8>]) {
+        let layer = &self.layers[layer_index];
+        let block_ids: Vec<i32> = (0..hashes.len() as i32).collect();
+        self.engine
+            .batch_save_kv_blocks_from_ipc(
+                &self.instance_id,
+                0,
+                0,
+                vec![LayerSave {
+                    layer_name: layer.name.clone(),
+                    block_ids,
+                    block_hashes: hashes.to_vec(),
+                }],
+            )
             .await
-            .expect("save all blocks");
+            .expect("save");
     }
 
-    pub async fn save_layer(
-        &self,
-        block_ids: Vec<i32>,
-        block_hashes: Vec<Vec<u8>>,
-    ) -> Result<(), EngineError> {
-        save_single_layer(
-            &self.engine,
-            &self.instance_id,
-            self.tp_rank,
-            self.device_id,
-            &self.layer_name,
-            block_ids,
-            block_hashes,
-        )
-        .await
-    }
-
-    pub async fn assert_cache_eventually_all(&self) {
+    /// Save all layers, wait until all blocks appear in cache.
+    pub async fn save_and_wait(&self, hashes: &[Vec<u8>]) {
+        for i in 0..self.layers.len() {
+            self.save_layer(i, hashes).await;
+        }
         wait_for_cache(
             &self.engine,
             &self.instance_id,
-            self.block_hashes(),
-            self.num_blocks(),
+            hashes,
+            hashes.len(),
             self.world_size,
             CACHE_WAIT_TIMEOUT,
         )
         .await;
     }
 
-    pub async fn query_hits(&self, block_hashes: &[Vec<u8>]) -> (usize, usize) {
-        let (hit, tail) = match self
-            .engine
-            .count_prefix_hit_blocks_with_prefetch(&self.instance_id, "harness-query", block_hashes)
+    /// Query prefix hits. Returns raw PrefetchStatus. Leaves blocks pinned on hit.
+    pub async fn query(&self, hashes: &[Vec<u8>]) -> PrefetchStatus {
+        self.engine
+            .count_prefix_hit_blocks_with_prefetch(&self.instance_id, "test", hashes)
             .await
-            .expect("count_prefix_hit_blocks_with_prefetch")
-        {
-            PrefetchStatus::Done { hit, missing } => (hit, missing),
-            PrefetchStatus::Loading { hit, loading } => (hit, loading),
-        };
-        if hit > 0 {
-            let hit_hashes = &block_hashes[..hit];
-            for _ in 0..self.world_size.max(1) {
-                self.engine
-                    .unpin_blocks(&self.instance_id, hit_hashes)
-                    .expect("unpin_blocks after query_hits");
-            }
-        }
-        (hit, tail)
+            .expect("query")
     }
 
-    pub async fn expect_query_prefetch_done_all(&self) {
-        match self
-            .engine
-            .count_prefix_hit_blocks_with_prefetch(
-                &self.instance_id,
-                "harness-req",
-                self.block_hashes(),
-            )
-            .await
-            .expect("query_prefetch")
-        {
+    /// Query, assert all hit, leave pinned (scheduler step before load).
+    pub async fn assert_all_hit_and_pin(&self, hashes: &[Vec<u8>]) {
+        match self.query(hashes).await {
             PrefetchStatus::Done { hit, missing } => {
-                assert_eq!(hit, self.num_blocks());
+                assert_eq!(hit, hashes.len(), "expected all blocks hit");
                 assert_eq!(missing, 0);
             }
             other => panic!("expected Done, got {:?}", other),
         }
     }
 
-    pub async fn load_all_and_wait(&self) -> Result<(), EngineError> {
-        self.load_and_wait(self.block_ids(), self.block_hashes())
-            .await
+    pub fn unpin(&self, hashes: &[Vec<u8>]) {
+        for _ in 0..self.world_size.max(1) {
+            self.engine
+                .unpin_blocks(&self.instance_id, hashes)
+                .expect("unpin");
+        }
     }
 
-    pub async fn load_and_wait(
-        &self,
-        block_ids: &[i32],
-        block_hashes: &[Vec<u8>],
-    ) -> Result<(), EngineError> {
+    /// Count cache hits, then unpin (for probing without consuming).
+    pub async fn count_hits_then_unpin(&self, hashes: &[Vec<u8>]) -> usize {
+        let hit = match self.query(hashes).await {
+            PrefetchStatus::Done { hit, .. } => hit,
+            PrefetchStatus::Loading { hit, .. } => hit,
+        };
+        if hit > 0 {
+            self.unpin(&hashes[..hit]);
+        }
+        hit
+    }
+
+    /// Load blocks from cache to GPU (pin must already be held).
+    pub async fn load_to_gpu(&self, hashes: &[Vec<u8>]) {
+        let block_ids: Vec<i32> = (0..hashes.len() as i32).collect();
+        let layer_names: Vec<&str> = self.layers.iter().map(|l| l.name.as_str()).collect();
         let load_state = LoadState::new().expect("create LoadState");
         let shm_name = load_state.shm_name().to_string();
-        let layers = [self.layer_name.as_str()];
-
-        self.engine.batch_load_kv_blocks_multi_layer(
-            &self.instance_id,
-            self.tp_rank,
-            self.device_id,
-            &shm_name,
-            &layers,
-            block_ids,
-            block_hashes,
-        )?;
-
+        self.engine
+            .batch_load_kv_blocks_multi_layer(
+                &self.instance_id,
+                0,
+                0,
+                &shm_name,
+                &layer_names,
+                &block_ids,
+                hashes,
+            )
+            .expect("submit load");
         wait_for_load(&load_state, LOAD_WAIT_TIMEOUT).await;
-        Ok(())
     }
 
-    pub fn expect_load_submit_error(
-        &self,
-        block_ids: &[i32],
-        block_hashes: &[Vec<u8>],
-        expected_msg: &str,
-    ) {
+    /// Submit load and assert it fails synchronously with `expected_msg`.
+    pub fn expect_load_error(&self, hashes: &[Vec<u8>], expected_msg: &str) {
+        let block_ids: Vec<i32> = (0..hashes.len() as i32).collect();
+        let layer_names: Vec<&str> = self.layers.iter().map(|l| l.name.as_str()).collect();
         let load_state = LoadState::new().expect("create LoadState");
         let shm_name = load_state.shm_name().to_string();
-        let layers = [self.layer_name.as_str()];
-
         let err = self
             .engine
             .batch_load_kv_blocks_multi_layer(
                 &self.instance_id,
-                self.tp_rank,
-                self.device_id,
+                0,
+                0,
                 &shm_name,
-                &layers,
-                block_ids,
-                block_hashes,
+                &layer_names,
+                &block_ids,
+                hashes,
             )
-            .expect_err("load submission should fail");
-
+            .expect_err("load should fail");
         assert!(
             err.to_string().contains(expected_msg),
-            "unexpected error: {}",
-            err
+            "unexpected error: {err}"
         );
         assert!(
             load_state.get() < 0,
@@ -271,25 +322,16 @@ impl RoundtripHarness {
         );
     }
 
-    pub fn unpin(&self, block_hashes: &[Vec<u8>]) -> usize {
-        self.engine
-            .unpin_blocks(&self.instance_id, block_hashes)
-            .expect("unpin_blocks")
-    }
-
-    pub fn zero_gpu_and_assert(&self) {
-        self.gpu_buf.zero();
-        assert!(
-            self.gpu_buf.copy_to_host().iter().all(|&b| b == 0),
-            "GPU memory should be zeroed"
-        );
-    }
-
-    pub fn assert_gpu_matches_host(&self) {
-        assert_eq!(
-            self.gpu_buf.copy_to_host(),
-            self.host_data,
-            "GPU round-trip data mismatch"
-        );
+    /// Wait until hashes appear in cache (without saving).
+    pub async fn wait_cached(&self, hashes: &[Vec<u8>]) {
+        wait_for_cache(
+            &self.engine,
+            &self.instance_id,
+            hashes,
+            hashes.len(),
+            self.world_size,
+            CACHE_WAIT_TIMEOUT,
+        )
+        .await;
     }
 }

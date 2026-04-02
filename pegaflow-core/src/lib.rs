@@ -109,9 +109,10 @@ impl From<LoadStateError> for EngineError {
 /// - Tracks GPU-NUMA topology for optimal memory locality
 ///
 /// The engine is thread-safe and can be shared across async tasks.
+#[derive(Clone)]
 pub struct PegaEngine {
     /// Active inference instances indexed by instance ID.
-    instances: RwLock<HashMap<String, Arc<InstanceContext>>>,
+    instances: Arc<RwLock<HashMap<String, Arc<InstanceContext>>>>,
     /// Storage engine for pinned memory, block cache, and SSD tier.
     storage: Arc<StorageEngine>,
     /// GPU-NUMA topology for memory allocation decisions.
@@ -145,7 +146,7 @@ impl PegaEngine {
         let storage = StorageEngine::new_with_config(pool_size, use_hugepages, config, &numa_nodes);
 
         PegaEngine {
-            instances: RwLock::new(HashMap::new()),
+            instances: Arc::new(RwLock::new(HashMap::new())),
             storage,
             topology,
         }
