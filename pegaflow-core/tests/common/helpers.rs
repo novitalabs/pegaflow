@@ -1,12 +1,8 @@
-use std::fs::File;
-use std::io::Read;
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use pegaflow_core::sync_state::{LOAD_STATE_ERROR, LOAD_STATE_SUCCESS};
 use pegaflow_core::*;
 
-pub const CACHE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const LOAD_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Default test pool size: 16 MB — enough for test blocks, small enough to be fast.
@@ -99,28 +95,6 @@ pub async fn wait_for_load(load_state: &LoadState, timeout: Duration) {
         }
         assert!(state != LOAD_STATE_ERROR, "load reported ERROR");
         assert!(Instant::now() < deadline, "timed out waiting for load");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
-
-pub async fn wait_for_ssd_nonzero(cache_path: &Path, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Ok(mut f) = File::open(cache_path) {
-            let mut buf = vec![0u8; 4096];
-            if let Ok(n) = f.read(&mut buf)
-                && n > 0
-                && buf[..n].iter().any(|&b| b != 0)
-            {
-                return;
-            }
-        }
-
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for non-zero SSD data at {}",
-            cache_path.display()
-        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }

@@ -302,6 +302,13 @@ impl StorageEngine {
         }
     }
 
+    /// Flush the SSD writer: waits until all enqueued writes are committed.
+    pub(crate) async fn flush_ssd(&self) {
+        if let Some(ssd) = &self.ssd_store {
+            ssd.flush().await;
+        }
+    }
+
     pub(crate) fn filter_hashes_not_in_cache_inplace(
         &self,
         namespace: &str,

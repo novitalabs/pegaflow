@@ -519,6 +519,15 @@ impl PegaEngine {
         self.storage.flush_write_pipeline().await;
     }
 
+    /// Flush write pipeline and SSD writer.
+    ///
+    /// Guarantees that all saves submitted before this call are both
+    /// cache-visible and persisted to SSD (if SSD is enabled).
+    pub async fn flush_all(&self) {
+        self.storage.flush_write_pipeline().await;
+        self.storage.flush_ssd().await;
+    }
+
     /// Remove stale inflight blocks (background GC).
     ///
     /// Should be called periodically (e.g., every 5 minutes).
