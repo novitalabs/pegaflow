@@ -445,8 +445,10 @@ fn gts_to_pcie_gen(speed: &str) -> &'static str {
 /// unreadable — never panics.
 fn read_pcie_link_info(pci_addr: &str) -> Option<String> {
     let base = format!("/sys/bus/pci/devices/{}", pci_addr);
-    let speed_raw = fs::read_to_string(format!("{}/current_link_speed", base)).ok()?;
-    let width_raw = fs::read_to_string(format!("{}/current_link_width", base)).ok()?;
+    // Use max_link_speed/max_link_width: current_* reflects power-managed state
+    // and reports PCIe 1.0 for idle GPUs, which is misleading.
+    let speed_raw = fs::read_to_string(format!("{}/max_link_speed", base)).ok()?;
+    let width_raw = fs::read_to_string(format!("{}/max_link_width", base)).ok()?;
 
     let pcie_gen = gts_to_pcie_gen(speed_raw.trim());
     let width = width_raw.trim();
