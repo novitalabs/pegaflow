@@ -1,0 +1,46 @@
+[[repos]]
+repo = "builtin"
+hooks = [
+  { id = "no-commit-to-branch", args = ["--branch", "master", "--branch", "main"] },
+  { id = "trailing-whitespace" },
+  { id = "end-of-file-fixer" },
+  { id = "check-added-large-files", args = ["--maxkb", "500"] },
+  { id = "check-merge-conflict" },
+  { id = "check-symlinks" },
+  { id = "check-toml" },
+  { id = "detect-private-key" },
+  { id = "mixed-line-ending", args = ["--fix", "lf"] },
+]
+
+[[repos]]
+repo = "https://github.com/pycqa/isort"
+rev = "7.0.0"
+hooks = [{ id = "isort", args = ["--profile", "black", "--settings-path", "python"], additional_dependencies = ["toml"], files = "^python/" }]
+
+[[repos]]
+repo = "https://github.com/codespell-project/codespell"
+rev = "v2.2.4"
+hooks = [{ id = "codespell", additional_dependencies = ["tomli"], files = '^python/.*\.pyi?$' }]
+
+[[repos]]
+repo = "local"
+hooks = [
+  { id = "cargo-fmt", name = "cargo fmt", language = "system", entry = "cargo fmt --all -- --check", files = { glob = ["Cargo.toml", "**/Cargo.toml", "**/*.rs"] }, pass_filenames = false, require_serial = true },
+  { id = "cargo-clippy", name = "cargo clippy", language = "system", entry = "cargo clippy --workspace --all-targets -- -D warnings", files = { glob = ["Cargo.toml", "**/Cargo.toml", "**/*.rs"] }, pass_filenames = false, require_serial = true },
+  { id = "cargo-test-release", name = "cargo test --release", language = "system", entry = "cargo test --release", pass_filenames = false, always_run = true, require_serial = true },
+]
+
+[[repos]]
+repo = "https://github.com/astral-sh/ruff-pre-commit"
+rev = "v0.14.14"
+hooks = [{ id = "ruff-check", args = ["--fix"] }, { id = "ruff-format" }]
+
+[[repos]]
+repo = "https://github.com/crate-ci/typos"
+rev = "v1.28.4"
+hooks = [{ id = "typos" }]
+
+[[repos]]
+repo = "https://github.com/commitizen-tools/commitizen"
+rev = "v4.12.1"
+hooks = [{ id = "commitizen", stages = ["commit-msg"] }]

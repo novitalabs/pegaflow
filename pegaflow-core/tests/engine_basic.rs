@@ -189,6 +189,7 @@ async fn multi_layer_blocks_hit_only_after_all_layers_saved() {
         INSTANCE_ID,
         &block_hashes,
         NUM_BLOCKS,
+        1,
         CACHE_WAIT_TIMEOUT,
     )
     .await;
@@ -258,7 +259,15 @@ async fn namespace_isolation_roundtrip() {
     .await
     .expect("save inst-a");
 
-    wait_for_cache(&engine, "inst-a", &hashes, NUM_BLOCKS, CACHE_WAIT_TIMEOUT).await;
+    wait_for_cache(
+        &engine,
+        "inst-a",
+        &hashes,
+        NUM_BLOCKS,
+        1,
+        CACHE_WAIT_TIMEOUT,
+    )
+    .await;
 
     // inst-b should see zero hits (different namespace)
     let status = engine

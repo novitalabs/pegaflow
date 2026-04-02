@@ -70,6 +70,7 @@ pub struct RoundtripHarness {
     pub layer_name: String,
     pub device_id: i32,
     pub tp_rank: usize,
+    pub world_size: usize,
 }
 
 impl RoundtripHarness {
@@ -117,6 +118,7 @@ impl RoundtripHarness {
             layer_name: DEFAULT_LAYER.to_string(),
             device_id: config.device_id,
             tp_rank: config.tp_rank,
+            world_size: config.world_size,
         }
     }
 
@@ -161,13 +163,14 @@ impl RoundtripHarness {
             &self.instance_id,
             self.block_hashes(),
             self.num_blocks(),
+            self.world_size,
             CACHE_WAIT_TIMEOUT,
         )
         .await;
     }
 
     pub async fn query_hits(&self, block_hashes: &[Vec<u8>]) -> (usize, usize) {
-        match self
+        let (hit, tail) = match self
             .engine
             .count_prefix_hit_blocks_with_prefetch(&self.instance_id, "harness-query", block_hashes)
             .await
@@ -175,7 +178,16 @@ impl RoundtripHarness {
         {
             PrefetchStatus::Done { hit, missing } => (hit, missing),
             PrefetchStatus::Loading { hit, loading } => (hit, loading),
+        };
+        if hit > 0 {
+            let hit_hashes = &block_hashes[..hit];
+            for _ in 0..self.world_size.max(1) {
+                self.engine
+                    .unpin_blocks(&self.instance_id, hit_hashes)
+                    .expect("unpin_blocks after query_hits");
+            }
         }
+        (hit, tail)
     }
 
     pub async fn expect_query_prefetch_done_all(&self) {

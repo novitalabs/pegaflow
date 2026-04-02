@@ -170,11 +170,16 @@ pub fn make_block_hashes(num_blocks: usize, salt: u8) -> Vec<Vec<u8>> {
 }
 
 /// Poll `count_prefix_hit_blocks_with_prefetch` until `expected_hit` blocks are cached, or timeout.
+///
+/// This helper is intentionally state-neutral for the caller: every probe query
+/// drains the pin reservations it just created so tests can wait for cache
+/// visibility without also performing the scheduler pin step.
 pub async fn wait_for_cache(
     engine: &PegaEngine,
     instance_id: &str,
     block_hashes: &[Vec<u8>],
     expected_hit: usize,
+    world_size: usize,
     timeout: Duration,
 ) {
     let deadline = Instant::now() + timeout;
@@ -187,6 +192,14 @@ pub async fn wait_for_cache(
             PrefetchStatus::Done { hit, .. } => hit,
             PrefetchStatus::Loading { hit, .. } => hit,
         };
+        if hit > 0 {
+            let hit_hashes = &block_hashes[..hit];
+            for _ in 0..world_size.max(1) {
+                engine
+                    .unpin_blocks(instance_id, hit_hashes)
+                    .expect("unpin_blocks after cache probe");
+            }
+        }
         if hit >= expected_hit {
             return;
         }

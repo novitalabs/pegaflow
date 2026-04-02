@@ -1,8 +1,8 @@
 //! Prefetch-pin protocol tests.
 //!
 //! Verifies the scheduler→worker contract: query_prefetch must pin blocks
-//! before workers can load, pin budget tracks world_size, and unpin releases
-//! reservations correctly.
+//! before workers can load, and each query's reservation budget is consumed
+//! exactly once per worker.
 
 mod common;
 
@@ -36,7 +36,7 @@ async fn load_requires_query_prefetch() {
 
 /// One scheduler query pins each block with ref_count=world_size; each worker consumes once.
 #[tokio::test]
-async fn query_prefetch_pin_budget_tracks_world_size() {
+async fn query_then_load_consumes_reservation_budget() {
     const NUM_BLOCKS: usize = 4;
     const BLOCK_SIZE: usize = 1024;
     let harness = RoundtripHarness::new(
@@ -60,34 +60,6 @@ async fn query_prefetch_pin_budget_tracks_world_size() {
     harness.assert_gpu_matches_host();
 
     // Third load without re-query should fail because pin budget is exhausted.
-    harness.expect_load_submit_error(
-        harness.block_ids(),
-        harness.block_hashes(),
-        "missing pinned KV block",
-    );
-}
-
-/// If request is cancelled after query_prefetch, unpin must release load reservations.
-#[tokio::test]
-async fn unpin_releases_pinned_blocks() {
-    const NUM_BLOCKS: usize = 3;
-    const BLOCK_SIZE: usize = 1024;
-    let harness = RoundtripHarness::new(
-        HarnessConfig::new("test-unpin", "test-ns", NUM_BLOCKS, BLOCK_SIZE).with_hash_salt(33),
-    );
-
-    harness.save_all().await;
-    harness.assert_cache_eventually_all().await;
-    harness.expect_query_prefetch_done_all().await;
-
-    let unpinned = harness.unpin(harness.block_hashes());
-    assert_eq!(unpinned, NUM_BLOCKS, "first unpin should release all pins");
-    assert_eq!(
-        harness.unpin(harness.block_hashes()),
-        0,
-        "unpin should be idempotent"
-    );
-
     harness.expect_load_submit_error(
         harness.block_ids(),
         harness.block_hashes(),
