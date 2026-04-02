@@ -19,6 +19,8 @@ pub struct LayerInfo {
     pub total_size: usize,
     pub num_blocks: usize,
     pub block_size: usize,
+    pub kv_stride: usize,
+    pub segments: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -38,8 +40,8 @@ pub fn register_layers(
     let total_sizes: Vec<usize> = layers.iter().map(|l| l.total_size).collect();
     let num_blocks_list: Vec<usize> = layers.iter().map(|l| l.num_blocks).collect();
     let block_sizes: Vec<usize> = layers.iter().map(|l| l.block_size).collect();
-    let kv_strides: Vec<usize> = vec![0; layers.len()];
-    let segments: Vec<usize> = vec![1; layers.len()];
+    let kv_strides: Vec<usize> = layers.iter().map(|l| l.kv_stride).collect();
+    let segments: Vec<usize> = layers.iter().map(|l| l.segments).collect();
 
     engine
         .register_context_layer_batch(

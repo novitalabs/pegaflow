@@ -30,6 +30,35 @@ impl TestGpuData {
         }
     }
 
+    /// Create a GPU buffer for split-storage layout (K/V separated).
+    ///
+    /// `segment_size` is the size of one K or V segment.
+    /// The GPU layout has K blocks at `[0..num_blocks*segment_size]` and
+    /// V blocks at `[kv_stride..kv_stride+num_blocks*segment_size]`.
+    pub fn new_split(num_blocks: usize, segment_size: usize, kv_stride: usize) -> Self {
+        let alloc_size = (num_blocks - 1) * segment_size + kv_stride + segment_size;
+        let gpu = GpuBuffer::alloc(alloc_size);
+        let mut expected = vec![0u8; alloc_size];
+
+        // Fill K region and V region with the same block pattern.
+        // Block i gets byte (i+1) in both its K and V segments.
+        let block_size = segment_size * 2;
+        for i in 0..num_blocks {
+            let fill = ((i % 251) + 1) as u8;
+            let k_start = i * segment_size;
+            expected[k_start..k_start + segment_size].fill(fill);
+            let v_start = kv_stride + i * segment_size;
+            expected[v_start..v_start + segment_size].fill(fill);
+        }
+
+        gpu.copy_from_host(&expected);
+        Self {
+            gpu,
+            expected,
+            block_size,
+        }
+    }
+
     pub fn overwrite(&mut self, modifier: u8) {
         for b in &mut self.expected {
             *b = b.wrapping_add(modifier);
@@ -72,13 +101,21 @@ pub struct TestEnv {
     pub world_size: usize,
 }
 
+struct LayerSpec {
+    name: &'static str,
+    num_blocks: usize,
+    block_size: usize,
+    kv_stride: usize,
+    segments: usize,
+}
+
 pub struct TestEnvBuilder {
     instance_id: &'static str,
     namespace: &'static str,
     pool_size: usize,
     world_size: usize,
     storage_config: Option<StorageConfig>,
-    layers: Vec<(&'static str, usize, usize)>,
+    layers: Vec<LayerSpec>,
 }
 
 impl TestEnvBuilder {
@@ -93,8 +130,41 @@ impl TestEnvBuilder {
         }
     }
 
+    /// Add a contiguous (single-segment) layer.
     pub fn layer(mut self, name: &'static str, num_blocks: usize, block_size: usize) -> Self {
-        self.layers.push((name, num_blocks, block_size));
+        self.layers.push(LayerSpec {
+            name,
+            num_blocks,
+            block_size,
+            kv_stride: 0,
+            segments: 1,
+        });
+        self
+    }
+
+    /// Add a split-storage (K/V separated) layer.
+    ///
+    /// `segment_size` is the size of one K or V segment per block.
+    /// `kv_stride` is the byte offset from K base to V base on the GPU —
+    /// must be > `segment_size` to trigger the split path.
+    pub fn split_layer(
+        mut self,
+        name: &'static str,
+        num_blocks: usize,
+        segment_size: usize,
+        kv_stride: usize,
+    ) -> Self {
+        assert!(
+            kv_stride > segment_size,
+            "kv_stride must exceed segment_size for split layout"
+        );
+        self.layers.push(LayerSpec {
+            name,
+            num_blocks,
+            block_size: segment_size,
+            kv_stride,
+            segments: 2,
+        });
         self
     }
 
@@ -124,21 +194,31 @@ impl TestEnvBuilder {
         let layers: Vec<RegisteredLayer> = self
             .layers
             .iter()
-            .map(|&(name, nb, bs)| RegisteredLayer {
-                name: name.to_string(),
-                data: TestGpuData::new(nb, bs),
-                num_blocks: nb,
+            .map(|spec| {
+                let data = if spec.segments > 1 {
+                    TestGpuData::new_split(spec.num_blocks, spec.block_size, spec.kv_stride)
+                } else {
+                    TestGpuData::new(spec.num_blocks, spec.block_size)
+                };
+                RegisteredLayer {
+                    name: spec.name.to_string(),
+                    data,
+                    num_blocks: spec.num_blocks,
+                }
             })
             .collect();
 
         let layer_infos: Vec<LayerInfo> = layers
             .iter()
-            .map(|l| LayerInfo {
+            .zip(self.layers.iter())
+            .map(|(l, spec)| LayerInfo {
                 name: l.name.clone(),
                 gpu_ptr: l.data.ptr(),
                 total_size: l.data.total_size(),
                 num_blocks: l.num_blocks,
-                block_size: l.data.block_size,
+                block_size: spec.block_size,
+                kv_stride: spec.kv_stride,
+                segments: spec.segments,
             })
             .collect();
 
