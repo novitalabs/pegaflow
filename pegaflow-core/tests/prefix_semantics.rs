@@ -19,16 +19,7 @@ async fn partial_prefix_reports_contiguous_hit_count() {
     let save_hashes = make_block_hashes(3, 10);
     let query_hashes = make_block_hashes(5, 10); // first 3 match save_hashes
 
-    env.save_layer(0, &save_hashes).await;
-    wait_for_cache(
-        &env.engine,
-        &env.instance_id,
-        &save_hashes,
-        3,
-        env.world_size,
-        CACHE_WAIT_TIMEOUT,
-    )
-    .await;
+    env.save_layer_and_flush(0, &save_hashes).await;
 
     match env.query(&query_hashes).await {
         PrefetchStatus::Done { hit, missing } => {
@@ -56,16 +47,7 @@ async fn gap_in_cached_blocks_breaks_prefix() {
         all_hashes[3].clone(),
     ];
 
-    env.save_layer(0, &save_hashes).await;
-    wait_for_cache(
-        &env.engine,
-        &env.instance_id,
-        &save_hashes,
-        3,
-        env.world_size,
-        CACHE_WAIT_TIMEOUT,
-    )
-    .await;
+    env.save_layer_and_flush(0, &save_hashes).await;
 
     match env.query(&all_hashes).await {
         PrefetchStatus::Done { hit, missing } => {
@@ -91,16 +73,7 @@ async fn first_block_missing_yields_zero_prefix_hit() {
         all_hashes[3].clone(),
     ];
 
-    env.save_layer(0, &save_hashes).await;
-    wait_for_cache(
-        &env.engine,
-        &env.instance_id,
-        &save_hashes,
-        3,
-        env.world_size,
-        CACHE_WAIT_TIMEOUT,
-    )
-    .await;
+    env.save_layer_and_flush(0, &save_hashes).await;
 
     match env.query(&all_hashes).await {
         PrefetchStatus::Done { hit, missing } => {

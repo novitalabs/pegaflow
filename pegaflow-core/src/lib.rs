@@ -509,6 +509,16 @@ impl PegaEngine {
         })
     }
 
+    /// Wait until all previously submitted save batches have been processed
+    /// by the insert worker.
+    ///
+    /// This is a flush barrier: it guarantees that every `batch_save_kv_blocks_from_ipc`
+    /// call that returned before this call will have its blocks inserted into the
+    /// read cache (or inflight map) by the time this future resolves.
+    pub async fn flush_saves(&self) {
+        self.storage.flush_write_pipeline().await;
+    }
+
     /// Remove stale inflight blocks (background GC).
     ///
     /// Should be called periodically (e.g., every 5 minutes).

@@ -5,8 +5,6 @@
 
 mod common;
 
-use std::time::Duration;
-
 use common::*;
 use pegaflow_core::StorageConfig;
 
@@ -69,7 +67,7 @@ async fn multi_layer_partial_save_no_hit() {
 
     // Only layer 0 saved — should be 0 hits.
     env.save_layer(0, &hashes).await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    env.wait_cached().await;
     assert_eq!(
         env.count_hits_then_unpin(&hashes).await,
         0,
@@ -78,7 +76,7 @@ async fn multi_layer_partial_save_no_hit() {
 
     // Save layer 1 — now all hit.
     env.save_layer(1, &hashes).await;
-    env.wait_cached(&hashes).await;
+    env.wait_cached().await;
     assert_eq!(env.count_hits_then_unpin(&hashes).await, 4);
 }
 

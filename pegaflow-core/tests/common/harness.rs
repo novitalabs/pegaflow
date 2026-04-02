@@ -219,20 +219,18 @@ impl TestEnv {
             .expect("save");
     }
 
-    /// Save all layers, wait until all blocks appear in cache.
+    /// Save one layer and flush the write pipeline.
+    pub async fn save_layer_and_flush(&self, layer_index: usize, hashes: &[Vec<u8>]) {
+        self.save_layer(layer_index, hashes).await;
+        self.engine.flush_saves().await;
+    }
+
+    /// Save all layers and flush the write pipeline so blocks are cache-visible.
     pub async fn save_and_wait(&self, hashes: &[Vec<u8>]) {
         for i in 0..self.layers.len() {
             self.save_layer(i, hashes).await;
         }
-        wait_for_cache(
-            &self.engine,
-            &self.instance_id,
-            hashes,
-            hashes.len(),
-            self.world_size,
-            CACHE_WAIT_TIMEOUT,
-        )
-        .await;
+        self.engine.flush_saves().await;
     }
 
     /// Query prefix hits. Returns raw PrefetchStatus. Leaves blocks pinned on hit.
@@ -322,16 +320,8 @@ impl TestEnv {
         );
     }
 
-    /// Wait until hashes appear in cache (without saving).
-    pub async fn wait_cached(&self, hashes: &[Vec<u8>]) {
-        wait_for_cache(
-            &self.engine,
-            &self.instance_id,
-            hashes,
-            hashes.len(),
-            self.world_size,
-            CACHE_WAIT_TIMEOUT,
-        )
-        .await;
+    /// Flush the write pipeline so any in-flight saves become cache-visible.
+    pub async fn wait_cached(&self) {
+        self.engine.flush_saves().await;
     }
 }
