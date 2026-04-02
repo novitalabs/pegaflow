@@ -178,10 +178,11 @@ impl SystemTopology {
             }
             let path = get_pcie_path(&gpu.pci_addr);
             let root = path.first().cloned().unwrap_or_else(|| "?".into());
+            let label = format!("GPU {}", gpu.device_id);
             by_root
                 .entry(root)
                 .or_default()
-                .push(format!("GPU {} ({})", gpu.device_id, gpu.pci_addr));
+                .push(format_pci_device(&label, &gpu.pci_addr));
         }
 
         for nic in &group.nics {
@@ -190,7 +191,7 @@ impl SystemTopology {
             by_root
                 .entry(root)
                 .or_default()
-                .push(format!("{} ({})", nic.name, nic.pci_addr));
+                .push(format_pci_device(&nic.name, &nic.pci_addr));
         }
 
         if !by_root.is_empty() {
@@ -403,6 +404,63 @@ fn normalize_pci_addr(addr: &str) -> String {
     }
 }
 
+/// Format a PCI device label with address and optional PCIe link info.
+///
+/// Returns `"name (addr, PCIe X.0 xN)"` when link info is available,
+/// or `"name (addr)"` otherwise.
+fn format_pci_device(name: &str, pci_addr: &str) -> String {
+    match read_pcie_link_info(pci_addr) {
+        Some(link) => format!("{} ({}, {})", name, pci_addr, link),
+        None => format!("{} ({})", name, pci_addr),
+    }
+}
+
+/// GT/s prefix to PCIe generation mapping.
+///
+/// sysfs `current_link_speed` reports values like "16.0 GT/s PCIe".
+/// We match the leading numeric token as a string — no floating-point needed.
+const PCIE_GEN_TABLE: &[(&str, &str)] = &[
+    ("2.5", "1.0"),
+    ("5.0", "2.0"),
+    ("8.0", "3.0"),
+    ("16.0", "4.0"),
+    ("32.0", "5.0"),
+    ("64.0", "6.0"),
+];
+
+/// Map a sysfs `current_link_speed` string (e.g. "16.0 GT/s PCIe") to a PCIe
+/// generation string (e.g. "4.0"). Returns "?" for unrecognised values.
+fn gts_to_pcie_gen(speed: &str) -> &'static str {
+    let token = speed.split_whitespace().next().unwrap_or("");
+    for &(gts, pcie_gen) in PCIE_GEN_TABLE {
+        if token == gts {
+            return pcie_gen;
+        }
+    }
+    "?"
+}
+
+/// Read PCIe link speed and width from sysfs, returning a formatted string
+/// like "PCIe 4.0 x16". Returns `None` if sysfs files are missing or
+/// unreadable — never panics.
+fn read_pcie_link_info(pci_addr: &str) -> Option<String> {
+    let base = format!("/sys/bus/pci/devices/{}", pci_addr);
+    // Use max_link_speed/max_link_width: current_* reflects power-managed state
+    // and reports PCIe 1.0 for idle GPUs, which is misleading.
+    let speed_raw = fs::read_to_string(format!("{}/max_link_speed", base)).ok()?;
+    let width_raw = fs::read_to_string(format!("{}/max_link_width", base)).ok()?;
+
+    let pcie_gen = gts_to_pcie_gen(speed_raw.trim());
+    let width = width_raw.trim();
+
+    // Skip if generation is unrecognised or width is empty
+    if pcie_gen == "?" || width.is_empty() {
+        return None;
+    }
+
+    Some(format!("PCIe {} x{}", pcie_gen, width))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,5 +500,27 @@ mod tests {
     #[test]
     fn normalize_whitespace() {
         assert_eq!(normalize_pci_addr("  00000000:19:00.0 "), "0000:19:00.0");
+    }
+
+    #[test]
+    fn gts_to_pcie_gen_known_speeds() {
+        assert_eq!(gts_to_pcie_gen("2.5 GT/s PCIe"), "1.0");
+        assert_eq!(gts_to_pcie_gen("5.0 GT/s PCIe"), "2.0");
+        assert_eq!(gts_to_pcie_gen("8.0 GT/s PCIe"), "3.0");
+        assert_eq!(gts_to_pcie_gen("16.0 GT/s PCIe"), "4.0");
+        assert_eq!(gts_to_pcie_gen("32.0 GT/s PCIe"), "5.0");
+        assert_eq!(gts_to_pcie_gen("64.0 GT/s PCIe"), "6.0");
+    }
+
+    #[test]
+    fn gts_to_pcie_gen_unknown_speed() {
+        assert_eq!(gts_to_pcie_gen("unknown"), "?");
+        assert_eq!(gts_to_pcie_gen(""), "?");
+    }
+
+    #[test]
+    fn read_pcie_link_info_nonexistent_device() {
+        // Non-existent PCI address should return None, not panic
+        assert!(read_pcie_link_info("ffff:ff:ff.f").is_none());
     }
 }
