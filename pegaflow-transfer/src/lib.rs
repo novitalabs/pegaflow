@@ -1,3 +1,4 @@
+pub mod bench_support;
 mod engine;
 mod error;
 mod rc_backend;
