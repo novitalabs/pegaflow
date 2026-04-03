@@ -292,6 +292,23 @@ impl StorageEngine {
         self.write_pipeline.send_raw_insert(batch);
     }
 
+    /// Flush the write pipeline.
+    ///
+    /// Returns a receiver that resolves once all batches enqueued before this
+    /// call have been processed by the insert worker.
+    pub(crate) async fn flush_write_pipeline(&self) {
+        if let Some(rx) = self.write_pipeline.flush() {
+            let _ = rx.await;
+        }
+    }
+
+    /// Flush the SSD writer: waits until all enqueued writes are committed.
+    pub(crate) async fn flush_ssd(&self) {
+        if let Some(ssd) = &self.ssd_store {
+            ssd.flush().await;
+        }
+    }
+
     pub(crate) fn filter_hashes_not_in_cache_inplace(
         &self,
         namespace: &str,

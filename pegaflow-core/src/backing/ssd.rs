@@ -12,8 +12,8 @@ use pegaflow_common::NumaNode;
 
 use super::SsdCacheConfig;
 use super::ssd_cache::{
-    PrefetchBatch, PrefetchRequest, PreparedBatch, SsdRingBuffer, SsdWriteBatch, ssd_prefetch_loop,
-    ssd_writer_loop,
+    PrefetchBatch, PrefetchRequest, PreparedBatch, SsdRingBuffer, SsdWriteBatch, SsdWriteCommand,
+    ssd_prefetch_loop, ssd_writer_loop,
 };
 use super::uring::{UringConfig, UringIoEngine};
 use super::{AllocateFn, PrefetchResult};
@@ -26,7 +26,7 @@ pub(crate) struct SsdBackingStore {
     /// Keeps the file descriptor alive for io_uring operations.
     _file: std::fs::File,
     io: Arc<UringIoEngine>,
-    write_tx: tokio::sync::mpsc::Sender<SsdWriteBatch>,
+    write_tx: tokio::sync::mpsc::Sender<SsdWriteCommand>,
     prefetch_tx: tokio::sync::mpsc::Sender<PrefetchBatch>,
     inner: Mutex<SsdInner>,
     allocate_fn: AllocateFn,
@@ -127,7 +127,7 @@ impl SsdBackingStore {
 
     fn spawn_workers(
         store: &Arc<Self>,
-        write_rx: tokio::sync::mpsc::Receiver<SsdWriteBatch>,
+        write_rx: tokio::sync::mpsc::Receiver<SsdWriteCommand>,
         prefetch_rx: tokio::sync::mpsc::Receiver<PrefetchBatch>,
         capacity: u64,
         write_inflight: usize,
@@ -167,11 +167,23 @@ impl SsdBackingStore {
         }
         let len = blocks.len();
         let batch = SsdWriteBatch { blocks };
-        if self.write_tx.try_send(batch).is_ok() {
+        if self
+            .write_tx
+            .try_send(SsdWriteCommand::Write(batch))
+            .is_ok()
+        {
             core_metrics().ssd_write_queue_pending.add(len as i64, &[]);
         } else {
             warn!("SSD write queue full, dropping {} blocks", len);
             core_metrics().ssd_write_queue_full.add(len as u64, &[]);
+        }
+    }
+
+    /// Flush the SSD writer: waits until all enqueued writes complete.
+    pub(crate) async fn flush(&self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.write_tx.send(SsdWriteCommand::Flush(tx)).await.is_ok() {
+            let _ = rx.await;
         }
     }
 

@@ -16,6 +16,7 @@ use super::read_cache::ReadCache;
 
 pub(super) enum InsertWorkerCommand {
     RawInsert(crate::offload::RawSaveBatch),
+    Flush(oneshot::Sender<()>),
     Gc {
         max_age: std::time::Duration,
         reply: oneshot::Sender<usize>,
@@ -34,6 +35,18 @@ impl WritePipeline {
 
     pub(super) fn send_raw_insert(&self, batch: crate::offload::RawSaveBatch) {
         let _ = self.insert_tx.send(InsertWorkerCommand::RawInsert(batch));
+    }
+
+    /// Send a flush barrier through the insert channel.
+    ///
+    /// The returned receiver resolves once the worker has processed all commands
+    /// that were enqueued before this flush.
+    pub(super) fn flush(&self) -> Option<oneshot::Receiver<()>> {
+        let (tx, rx) = oneshot::channel();
+        self.insert_tx
+            .send(InsertWorkerCommand::Flush(tx))
+            .ok()
+            .map(|()| rx)
     }
 
     pub(super) async fn gc_stale_inflight(&self, max_age: std::time::Duration) -> usize {
@@ -71,6 +84,9 @@ pub(super) fn insert_worker_loop(rx: Receiver<InsertWorkerCommand>, deps: Weak<I
             match cmd {
                 InsertWorkerCommand::RawInsert(batch) => {
                     process_raw_save_batch(&mut inflight, &deps, batch);
+                }
+                InsertWorkerCommand::Flush(tx) => {
+                    let _ = tx.send(());
                 }
                 InsertWorkerCommand::Gc { max_age, reply } => {
                     let cleaned = gc_inflight(&mut inflight, max_age);
