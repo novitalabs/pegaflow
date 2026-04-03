@@ -15,6 +15,27 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
+try:
+    from vllm.v1.metrics.utils import create_metric_per_engine
+except ImportError:
+    create_metric_per_engine = None
+
+
+def _bind_metric_per_engine(
+    prom_metrics: KVConnectorPromMetrics,
+    metric: PromMetric,
+) -> dict[int, PromMetric]:
+    bind_method = getattr(prom_metrics, "make_per_engine", None)
+    if callable(bind_method):
+        return bind_method(metric)
+    if create_metric_per_engine is None:
+        raise RuntimeError(
+            "Incompatible vLLM metrics API: missing both "
+            "KVConnectorPromMetrics.make_per_engine and "
+            "vllm.v1.metrics.utils.create_metric_per_engine"
+        )
+    return create_metric_per_engine(metric, prom_metrics.per_engine_labelvalues)
+
 
 class PrefetchTracker:
     """Track prefetch queue depth, duration and blocks for metrics.
@@ -260,7 +281,9 @@ class PegaPromMetrics(KVConnectorPromMetrics):
             documentation="Number of requests waiting for SSD prefetch to complete.",
             labelnames=labelnames,
         )
-        self.gauge_pending_prefetches = self.make_per_engine(gauge_pending_prefetches)
+        self.gauge_pending_prefetches = _bind_metric_per_engine(
+            self, gauge_pending_prefetches
+        )
 
         # Gauge metrics for worker-side state
         gauge_pending_save_requests = self._gauge_cls(
@@ -268,7 +291,9 @@ class PegaPromMetrics(KVConnectorPromMetrics):
             documentation="Number of requests with pending save operations.",
             labelnames=labelnames,
         )
-        self.gauge_pending_save_requests = self.make_per_engine(gauge_pending_save_requests)
+        self.gauge_pending_save_requests = _bind_metric_per_engine(
+            self, gauge_pending_save_requests
+        )
 
         # Counter for bypass events (scheduler-side)
         counter_bypass = self._counter_cls(
@@ -276,7 +301,7 @@ class PegaPromMetrics(KVConnectorPromMetrics):
             documentation="Number of requests that bypassed cache lookup due to short request.",
             labelnames=labelnames,
         )
-        self.counter_bypass = self.make_per_engine(counter_bypass)
+        self.counter_bypass = _bind_metric_per_engine(self, counter_bypass)
 
         # Histogram for prefetch operations (scheduler-side)
         # Optimized for fast SSD: typical range 10-500ms
@@ -288,7 +313,9 @@ class PegaPromMetrics(KVConnectorPromMetrics):
             buckets=prefetch_buckets,
             labelnames=labelnames,
         )
-        self.histogram_prefetch_duration = self.make_per_engine(histogram_prefetch_duration)
+        self.histogram_prefetch_duration = _bind_metric_per_engine(
+            self, histogram_prefetch_duration
+        )
 
         blocks_buckets = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
         histogram_prefetch_blocks = self._histogram_cls(
@@ -297,7 +324,9 @@ class PegaPromMetrics(KVConnectorPromMetrics):
             buckets=blocks_buckets,
             labelnames=labelnames,
         )
-        self.histogram_prefetch_blocks = self.make_per_engine(histogram_prefetch_blocks)
+        self.histogram_prefetch_blocks = _bind_metric_per_engine(
+            self, histogram_prefetch_blocks
+        )
 
         # Histogram for load operations (worker-side)
         # Optimized for fast SSD: typical range 1-50ms
@@ -309,7 +338,9 @@ class PegaPromMetrics(KVConnectorPromMetrics):
             buckets=duration_buckets,
             labelnames=labelnames,
         )
-        self.histogram_load_duration = self.make_per_engine(histogram_load_duration)
+        self.histogram_load_duration = _bind_metric_per_engine(
+            self, histogram_load_duration
+        )
 
         histogram_load_blocks = self._histogram_cls(
             name="vllm:pega_load_blocks",
@@ -317,21 +348,27 @@ class PegaPromMetrics(KVConnectorPromMetrics):
             buckets=blocks_buckets,
             labelnames=labelnames,
         )
-        self.histogram_load_blocks = self.make_per_engine(histogram_load_blocks)
+        self.histogram_load_blocks = _bind_metric_per_engine(
+            self, histogram_load_blocks
+        )
 
         counter_load_success = self._counter_cls(
             name="vllm:pega_load_success_total",
             documentation="Number of successful KV cache load operations.",
             labelnames=labelnames,
         )
-        self.counter_load_success = self.make_per_engine(counter_load_success)
+        self.counter_load_success = _bind_metric_per_engine(
+            self, counter_load_success
+        )
 
         counter_load_failure = self._counter_cls(
             name="vllm:pega_load_failure_total",
             documentation="Number of failed KV cache load operations.",
             labelnames=labelnames,
         )
-        self.counter_load_failure = self.make_per_engine(counter_load_failure)
+        self.counter_load_failure = _bind_metric_per_engine(
+            self, counter_load_failure
+        )
 
         # Histogram for save operations
         histogram_save_duration = self._histogram_cls(
@@ -340,7 +377,9 @@ class PegaPromMetrics(KVConnectorPromMetrics):
             buckets=duration_buckets,
             labelnames=labelnames,
         )
-        self.histogram_save_duration = self.make_per_engine(histogram_save_duration)
+        self.histogram_save_duration = _bind_metric_per_engine(
+            self, histogram_save_duration
+        )
 
         histogram_save_blocks = self._histogram_cls(
             name="vllm:pega_save_blocks",
@@ -348,28 +387,36 @@ class PegaPromMetrics(KVConnectorPromMetrics):
             buckets=blocks_buckets,
             labelnames=labelnames,
         )
-        self.histogram_save_blocks = self.make_per_engine(histogram_save_blocks)
+        self.histogram_save_blocks = _bind_metric_per_engine(
+            self, histogram_save_blocks
+        )
 
         counter_save_success = self._counter_cls(
             name="vllm:pega_save_success_total",
             documentation="Number of successful KV cache save operations.",
             labelnames=labelnames,
         )
-        self.counter_save_success = self.make_per_engine(counter_save_success)
+        self.counter_save_success = _bind_metric_per_engine(
+            self, counter_save_success
+        )
 
         counter_save_failure = self._counter_cls(
             name="vllm:pega_save_failure_total",
             documentation="Number of failed KV cache save operations.",
             labelnames=labelnames,
         )
-        self.counter_save_failure = self.make_per_engine(counter_save_failure)
+        self.counter_save_failure = _bind_metric_per_engine(
+            self, counter_save_failure
+        )
 
         counter_save_dropped = self._counter_cls(
             name="vllm:pega_save_dropped_total",
             documentation="Number of save operations dropped due to queue limit.",
             labelnames=labelnames,
         )
-        self.counter_save_dropped = self.make_per_engine(counter_save_dropped)
+        self.counter_save_dropped = _bind_metric_per_engine(
+            self, counter_save_dropped
+        )
 
     def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0):
         """Record stats to Prometheus metrics."""
