@@ -292,6 +292,7 @@ class SchedulerConnector:
         return PegaConnectorMetadata(
             load_intents=load_intents,
             save_intents=save_intents,
+            preempted_req_ids=scheduler_output.preempted_req_ids or None,
         )
 
     def _consume_save_intent(self, req_id: str) -> SaveIntent | None:

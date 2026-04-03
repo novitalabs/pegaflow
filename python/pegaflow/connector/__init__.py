@@ -186,9 +186,15 @@ class PegaKVConnector(KVConnectorBase_V1):
         if self._worker:
             self._worker.unregister_context()
 
-    def handle_preemptions(self, preempted_req_ids: set[str]) -> None:
-        if self._worker:
-            self._worker.handle_preemptions(preempted_req_ids)
+    def handle_preemptions(self, preempted) -> None:
+        if not self._worker:
+            return
+        # Compat: old vLLM passes set[str], new vLLM passes KVConnectorMetadata
+        if isinstance(preempted, set):
+            preempted_req_ids = preempted
+        else:
+            preempted_req_ids = getattr(preempted, "preempted_req_ids", None) or set()
+        self._worker.handle_preemptions(preempted_req_ids)
 
     # ==============================
     # Scheduler-side methods

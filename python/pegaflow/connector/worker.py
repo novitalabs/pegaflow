@@ -571,7 +571,7 @@ class WorkerConnector:
                 suffix,
             )
 
-    def handle_preemptions(self, preempted_req_ids: set[str]) -> None:
+    def handle_preemptions(self, preempted_req_ids: set[str] | None) -> None:
         """Wait for preempted requests' saves to complete before blocks are reused.
 
         Called by vLLM BEFORE preempted blocks are overwritten. This prevents
