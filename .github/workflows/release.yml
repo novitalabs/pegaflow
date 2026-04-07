@@ -51,16 +51,16 @@ jobs:
       - name: Install maturin
         run: pip install maturin
 
-      - name: Patch for CUDA variant
+      - name: Patch package name for cu13
         if: matrix.cuda-variant == 'cu13'
         run: |
-          sed -i 's/cuda-12040/cuda-13000/' Cargo.toml
           sed -i 's/^name = "pegaflow-llm"$/name = "pegaflow-llm-cu13"/' python/pyproject.toml
           sed -i 's/"pegaflow-llm\[/"pegaflow-llm-cu13\[/g' python/pyproject.toml
 
       - name: Build wheel
         run: |
-          ./scripts/build-wheel.sh --release
+          CUDA_FEATURES="${{ matrix.cuda-variant == 'cu13' && '--no-default-features --features cuda-13' || '' }}"
+          ./scripts/build-wheel.sh --release $CUDA_FEATURES
           mkdir -p dist
           cp target/wheels/*.whl dist/
         env:

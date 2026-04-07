@@ -11,15 +11,19 @@ PYTHON_DIR="$PROJECT_ROOT/python"
 # Parse arguments
 RELEASE_FLAG=""
 PROFILE="debug"
+CARGO_FEATURES=""
 if [[ "$1" == "--release" ]]; then
     RELEASE_FLAG="--release"
     PROFILE="release"
     shift
 fi
 
+# Remaining args are feature flags (e.g. --no-default-features --features cuda-13)
+EXTRA_ARGS=("$@")
+
 echo "==> Building binaries ($PROFILE mode)..."
 cd "$PROJECT_ROOT"
-cargo build $RELEASE_FLAG -p pegaflow-py --bin pegaflow-server-py --bin pegaflow-metaserver-py
+cargo build $RELEASE_FLAG "${EXTRA_ARGS[@]}" -p pegaflow-py --bin pegaflow-server-py --bin pegaflow-metaserver-py
 
 echo "==> Copying binaries to Python package..."
 for bin in pegaflow-server-py pegaflow-metaserver-py; do
@@ -29,7 +33,7 @@ done
 
 echo "==> Building Python wheel with maturin..."
 cd "$PYTHON_DIR"
-maturin build $RELEASE_FLAG "$@"
+maturin build $RELEASE_FLAG "${EXTRA_ARGS[@]}"
 
 echo ""
 echo "==> Done! Wheel built at:"
