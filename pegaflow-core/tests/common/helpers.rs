@@ -1,35 +1,15 @@
-use std::fs::File;
-use std::io::Read;
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use pegaflow_core::sync_state::{LOAD_STATE_ERROR, LOAD_STATE_SUCCESS};
 use pegaflow_core::*;
 
-pub const CACHE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const LOAD_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
-pub const DEFAULT_LAYER: &str = "layer_0";
 
-pub fn test_engine() -> PegaEngine {
-    test_engine_with_storage_config(StorageConfig {
-        enable_lfu_admission: false,
-        hint_value_size_bytes: None,
-        max_prefetch_blocks: 100,
-        ssd_cache_config: None,
-        rdma_nic_names: None,
-        enable_numa_affinity: false,
-        blockwise_alloc: false,
-        transfer_lock_timeout: Duration::from_secs(120),
-        metaserver_addr: None,
-        advertise_addr: None,
-        metaserver_queue_depth: 256,
-        pool_shards: 1,
-    })
-}
+/// Default test pool size: 16 MB — enough for test blocks, small enough to be fast.
+const DEFAULT_TEST_POOL_SIZE: usize = 16 << 20;
 
-pub fn test_engine_with_storage_config(config: StorageConfig) -> PegaEngine {
-    // 16 MB pool — enough for test blocks, small enough to be fast.
-    PegaEngine::new_with_config(16 << 20, false, config)
+pub fn test_engine_with_pool(pool_size: usize, config: StorageConfig) -> PegaEngine {
+    PegaEngine::new_with_config(pool_size, false, config)
 }
 
 /// Layer registration info for batch registration.
@@ -39,6 +19,8 @@ pub struct LayerInfo {
     pub total_size: usize,
     pub num_blocks: usize,
     pub block_size: usize,
+    pub kv_stride: usize,
+    pub segments: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -58,8 +40,8 @@ pub fn register_layers(
     let total_sizes: Vec<usize> = layers.iter().map(|l| l.total_size).collect();
     let num_blocks_list: Vec<usize> = layers.iter().map(|l| l.num_blocks).collect();
     let block_sizes: Vec<usize> = layers.iter().map(|l| l.block_size).collect();
-    let kv_strides: Vec<usize> = vec![0; layers.len()];
-    let segments: Vec<usize> = vec![1; layers.len()];
+    let kv_strides: Vec<usize> = layers.iter().map(|l| l.kv_stride).collect();
+    let segments: Vec<usize> = layers.iter().map(|l| l.segments).collect();
 
     engine
         .register_context_layer_batch(
@@ -81,64 +63,6 @@ pub fn register_layers(
         .expect("register_context_layer_batch");
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn register_single_layer(
-    engine: &PegaEngine,
-    instance_id: &str,
-    namespace: &str,
-    layer_name: &str,
-    gpu_ptr: u64,
-    total_size: usize,
-    num_blocks: usize,
-    block_size: usize,
-    device_id: i32,
-    tp_rank: usize,
-    tp_size: usize,
-    world_size: usize,
-    num_layers: usize,
-) {
-    register_layers(
-        engine,
-        instance_id,
-        namespace,
-        &[LayerInfo {
-            name: layer_name.to_string(),
-            gpu_ptr,
-            total_size,
-            num_blocks,
-            block_size,
-        }],
-        device_id,
-        tp_rank,
-        tp_size,
-        world_size,
-        num_layers,
-    );
-}
-
-pub async fn save_single_layer(
-    engine: &PegaEngine,
-    instance_id: &str,
-    tp_rank: usize,
-    device_id: i32,
-    layer_name: &str,
-    block_ids: Vec<i32>,
-    block_hashes: Vec<Vec<u8>>,
-) -> Result<(), EngineError> {
-    engine
-        .batch_save_kv_blocks_from_ipc(
-            instance_id,
-            tp_rank,
-            device_id,
-            vec![LayerSave {
-                layer_name: layer_name.to_string(),
-                block_ids,
-                block_hashes,
-            }],
-        )
-        .await
-}
-
 /// Fill `host_data` with a deterministic pattern: block i = byte (i+1) repeated.
 pub fn fill_test_pattern(host_data: &mut [u8], block_size: usize) {
     assert_eq!(
@@ -152,12 +76,6 @@ pub fn fill_test_pattern(host_data: &mut [u8], block_size: usize) {
     }
 }
 
-pub fn make_block_ids(num_blocks: usize) -> Vec<i32> {
-    (0..num_blocks)
-        .map(|idx| i32::try_from(idx).expect("num_blocks exceeds i32 range"))
-        .collect()
-}
-
 pub fn make_block_hashes(num_blocks: usize, salt: u8) -> Vec<Vec<u8>> {
     (0..num_blocks)
         .map(|idx| {
@@ -167,35 +85,6 @@ pub fn make_block_hashes(num_blocks: usize, salt: u8) -> Vec<Vec<u8>> {
             hash
         })
         .collect()
-}
-
-/// Poll `count_prefix_hit_blocks_with_prefetch` until `expected_hit` blocks are cached, or timeout.
-pub async fn wait_for_cache(
-    engine: &PegaEngine,
-    instance_id: &str,
-    block_hashes: &[Vec<u8>],
-    expected_hit: usize,
-    timeout: Duration,
-) {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let status = engine
-            .count_prefix_hit_blocks_with_prefetch(instance_id, "wait-for-cache", block_hashes)
-            .await
-            .expect("count_prefix_hit_blocks_with_prefetch");
-        let hit = match status {
-            PrefetchStatus::Done { hit, .. } => hit,
-            PrefetchStatus::Loading { hit, .. } => hit,
-        };
-        if hit >= expected_hit {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for {expected_hit} cached blocks (got {hit})"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
 }
 
 /// Poll `LoadState::get()` until success or timeout.
@@ -208,28 +97,6 @@ pub async fn wait_for_load(load_state: &LoadState, timeout: Duration) {
         }
         assert!(state != LOAD_STATE_ERROR, "load reported ERROR");
         assert!(Instant::now() < deadline, "timed out waiting for load");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
-
-pub async fn wait_for_ssd_nonzero(cache_path: &Path, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Ok(mut f) = File::open(cache_path) {
-            let mut buf = vec![0u8; 4096];
-            if let Ok(n) = f.read(&mut buf)
-                && n > 0
-                && buf[..n].iter().any(|&b| b != 0)
-            {
-                return;
-            }
-        }
-
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for non-zero SSD data at {}",
-            cache_path.display()
-        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }

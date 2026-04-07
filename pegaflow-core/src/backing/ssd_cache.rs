@@ -351,6 +351,12 @@ pub(super) struct SsdWriteBatch {
     pub blocks: Vec<(BlockKey, Weak<SealedBlock>)>,
 }
 
+/// Commands sent to the SSD writer task.
+pub(super) enum SsdWriteCommand {
+    Write(SsdWriteBatch),
+    Flush(tokio::sync::oneshot::Sender<()>),
+}
+
 /// Request to prefetch a block from SSD (metadata only, allocation done in worker)
 pub(super) struct PrefetchRequest {
     pub key: BlockKey,
@@ -426,7 +432,7 @@ type WriteResult = (BlockKey, bool, f64, u64);
 /// SSD writer task: receives batches of sealed blocks and writes them.
 pub(super) async fn ssd_writer_loop(
     store: Weak<SsdBackingStore>,
-    mut rx: tokio::sync::mpsc::Receiver<SsdWriteBatch>,
+    mut rx: tokio::sync::mpsc::Receiver<SsdWriteCommand>,
     io: Arc<UringIoEngine>,
     write_inflight: usize,
 ) {
@@ -441,8 +447,16 @@ pub(super) async fn ssd_writer_loop(
 
     let mut pending: VecDeque<WriteTask> = VecDeque::new();
     let mut inflight: FuturesOrdered<WriteFuture> = FuturesOrdered::new();
+    let mut flush_waiters: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
 
     loop {
+        // If a flush is pending and all work is drained, fire it.
+        if !flush_waiters.is_empty() && pending.is_empty() && inflight.is_empty() {
+            for tx in flush_waiters.drain(..) {
+                let _ = tx.send(());
+            }
+        }
+
         tokio::select! {
             biased;
 
@@ -471,10 +485,10 @@ pub(super) async fn ssd_writer_loop(
                 inflight.push_back(Box::pin(execute_write(task, io.clone())));
             }
 
-            // Priority 3: Receive new batch
-            batch = rx.recv(), if pending.is_empty() => {
-                match batch {
-                    Some(b) => {
+            // Priority 3: Receive new command
+            cmd = rx.recv(), if pending.is_empty() && flush_waiters.is_empty() => {
+                match cmd {
+                    Some(SsdWriteCommand::Write(b)) => {
                         // Dequeue metric
                         metrics.ssd_write_queue_pending.add(-(b.blocks.len() as i64), &[]);
 
@@ -505,6 +519,9 @@ pub(super) async fn ssd_writer_loop(
                             });
                         }
                     }
+                    Some(SsdWriteCommand::Flush(tx)) => {
+                        flush_waiters.push(tx);
+                    }
                     None => break,
                 }
             }
@@ -512,6 +529,23 @@ pub(super) async fn ssd_writer_loop(
     }
 
     // Drain remaining inflight writes
+    drain_inflight(&store, metrics, &mut inflight).await;
+
+    // Fire any remaining flush waiters
+    for tx in flush_waiters.drain(..) {
+        let _ = tx.send(());
+    }
+
+    debug!("SSD writer task exiting");
+}
+
+async fn drain_inflight(
+    store: &Weak<SsdBackingStore>,
+    metrics: &crate::metrics::CoreMetrics,
+    inflight: &mut FuturesOrdered<
+        std::pin::Pin<Box<dyn std::future::Future<Output = WriteResult> + Send>>,
+    >,
+) {
     while let Some((key, success, duration_secs, block_size)) = inflight.next().await {
         metrics.ssd_write_inflight.add(-1, &[]);
 
@@ -529,8 +563,6 @@ pub(super) async fn ssd_writer_loop(
             warn!("SSD cache write failed for {:?}", key);
         }
     }
-
-    debug!("SSD writer task exiting");
 }
 
 /// Execute a single block write to SSD.

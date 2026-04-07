@@ -109,9 +109,10 @@ impl From<LoadStateError> for EngineError {
 /// - Tracks GPU-NUMA topology for optimal memory locality
 ///
 /// The engine is thread-safe and can be shared across async tasks.
+#[derive(Clone)]
 pub struct PegaEngine {
     /// Active inference instances indexed by instance ID.
-    instances: RwLock<HashMap<String, Arc<InstanceContext>>>,
+    instances: Arc<RwLock<HashMap<String, Arc<InstanceContext>>>>,
     /// Storage engine for pinned memory, block cache, and SSD tier.
     storage: Arc<StorageEngine>,
     /// GPU-NUMA topology for memory allocation decisions.
@@ -145,7 +146,7 @@ impl PegaEngine {
         let storage = StorageEngine::new_with_config(pool_size, use_hugepages, config, &numa_nodes);
 
         PegaEngine {
-            instances: RwLock::new(HashMap::new()),
+            instances: Arc::new(RwLock::new(HashMap::new())),
             storage,
             topology,
         }
@@ -506,6 +507,25 @@ impl PegaEngine {
             layers,
             load_state_shm: load_state_shm.to_string(),
         })
+    }
+
+    /// Wait until all previously submitted save batches have been processed
+    /// by the insert worker.
+    ///
+    /// This is a flush barrier: it guarantees that every `batch_save_kv_blocks_from_ipc`
+    /// call that returned before this call will have its blocks inserted into the
+    /// read cache (or inflight map) by the time this future resolves.
+    pub async fn flush_saves(&self) {
+        self.storage.flush_write_pipeline().await;
+    }
+
+    /// Flush write pipeline and SSD writer.
+    ///
+    /// Guarantees that all saves submitted before this call are both
+    /// cache-visible and persisted to SSD (if SSD is enabled).
+    pub async fn flush_all(&self) {
+        self.storage.flush_write_pipeline().await;
+        self.storage.flush_ssd().await;
     }
 
     /// Remove stale inflight blocks (background GC).
