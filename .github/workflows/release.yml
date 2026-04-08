@@ -5,9 +5,6 @@ on:
     tags:
       - 'v*'
 
-env:
-  CUDA_VERSION: '12.8.1'
-
 jobs:
   build:
     runs-on: ubuntu-22.04
@@ -17,6 +14,13 @@ jobs:
       matrix:
         python-version: ['3.10', '3.11', '3.12', '3.13']
         cuda-variant: ['cu12', 'cu13']
+        include:
+          - cuda-variant: cu12
+            cuda-version: '12.8.1'
+            cargo-features: ""
+          - cuda-variant: cu13
+            cuda-version: '13.0.2'
+            cargo-features: "--no-default-features --features cuda-13"
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -35,7 +39,7 @@ jobs:
       - name: Install CUDA Toolkit
         uses: Jimver/cuda-toolkit@v0.2.24
         with:
-          cuda: ${{ env.CUDA_VERSION }}
+          cuda: ${{ matrix.cuda-version }}
           linux-local-args: '["--toolkit"]'
           method: 'network'
           sub-packages: '["nvcc", "nvrtc-dev", "cudart-dev"]'
@@ -59,8 +63,7 @@ jobs:
 
       - name: Build wheel
         run: |
-          CUDA_FEATURES="${{ matrix.cuda-variant == 'cu13' && '--no-default-features --features cuda-13' || '' }}"
-          ./scripts/build-wheel.sh --release $CUDA_FEATURES
+          ./scripts/build-wheel.sh --release ${{ matrix.cargo-features }}
           mkdir -p dist
           cp target/wheels/*.whl dist/
         env:

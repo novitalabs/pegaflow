@@ -147,13 +147,29 @@ jobs:
         uses: astral-sh/ruff-action@v3
 
   cargo-check:
-    name: cargo check
+    name: cargo check (${{ matrix.cuda-variant }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - cuda-variant: cu12
+            cuda-version: '12.8.1'
+            cargo-features: ""
+          - cuda-variant: cu13
+            cuda-version: '13.0.2'
+            cargo-features: "--no-default-features --features cuda-13"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.24
+        with:
+          cuda: ${{ matrix.cuda-version }}
+          linux-local-args: '["--toolkit"]'
+          method: 'network'
+          sub-packages: '["nvcc", "nvrtc-dev", "cudart-dev"]'
       - name: Install protobuf compiler
         run: |
           sudo apt-get update
@@ -164,19 +180,25 @@ jobs:
           toolchain: stable
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
-      - name: Run cargo check (core)
+      - name: Run cargo check
         run: |
-          cargo check -p pegaflow-core
-      - name: Run cargo check (server)
-        run: |
-          cargo check -p pegaflow-server
+          cargo check -p pegaflow-core ${{ matrix.cargo-features }}
+          cargo check -p pegaflow-server ${{ matrix.cargo-features }} --all-targets
+        env:
+          CUDA_PATH: /usr/local/cuda
 
   build-wheel:
     name: build Python wheel (${{ matrix.cuda-variant }})
     runs-on: ubuntu-22.04
     strategy:
       matrix:
-        cuda-variant: ['cu12', 'cu13']
+        include:
+          - cuda-variant: cu12
+            cuda-version: '12.8.1'
+            cargo-features: ""
+          - cuda-variant: cu13
+            cuda-version: '13.0.2'
+            cargo-features: "--no-default-features --features cuda-13"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -197,7 +219,7 @@ jobs:
       - name: Install CUDA Toolkit
         uses: Jimver/cuda-toolkit@v0.2.24
         with:
-          cuda: '12.8.1'
+          cuda: ${{ matrix.cuda-version }}
           linux-local-args: '["--toolkit"]'
           method: 'network'
           sub-packages: '["nvcc", "nvrtc-dev", "cudart-dev"]'
@@ -224,8 +246,7 @@ jobs:
 
       - name: Build wheel
         run: |
-          CUDA_FEATURES="${{ matrix.cuda-variant == 'cu13' && '--no-default-features --features cuda-13' || '' }}"
-          ./scripts/build-wheel.sh --release $CUDA_FEATURES
+          ./scripts/build-wheel.sh --release ${{ matrix.cargo-features }}
         env:
           CUDA_PATH: /usr/local/cuda
 

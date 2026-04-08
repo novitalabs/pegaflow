@@ -9,9 +9,9 @@ workspace = true
 
 [features]
 default = ["cuda-12"]
-cuda-12 = ["pegaflow-core/cuda-12"]
-cuda-128 = ["pegaflow-core/cuda-128"]
-cuda-13 = ["pegaflow-core/cuda-13"]
+cuda-12 = ["pegaflow-core/cuda-12", "pegaflow-metaserver/cuda-12"]
+cuda-128 = ["pegaflow-core/cuda-128", "pegaflow-metaserver/cuda-128"]
+cuda-13 = ["pegaflow-core/cuda-13", "pegaflow-metaserver/cuda-13"]
 tracing = ["fastrace", "pegaflow-core/tracing"]
 
 [lib]
@@ -50,7 +50,7 @@ tikv-jemallocator.workspace = true
 fastrace = { workspace = true, features = ["enable"], optional = true }
 
 [dev-dependencies]
-pegaflow-metaserver = { path = "../pegaflow-metaserver" }
+pegaflow-metaserver = { path = "../pegaflow-metaserver", default-features = false }
 
 [build-dependencies]
 pyo3-build-config.workspace = true
