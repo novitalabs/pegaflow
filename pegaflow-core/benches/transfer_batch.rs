@@ -8,7 +8,7 @@
 //! Matrix (4 benchmarks):
 //!   batch_count: 64, 1024
 //!   fragmentation: contiguous, fully scattered
-//!   segment_size: 24 KiB (fixed, typical KV segment)
+//!   segment_size: 240 KiB (10x enlarged for comparison)
 //!   direction: H2D only (D2H path is symmetric)
 
 use std::ffi::c_void;
@@ -136,7 +136,7 @@ fn check_cuda(result: sys::CUresult, op: &str) {
 // Parameters
 // ---------------------------------------------------------------------------
 
-const SEGMENT_SIZE: usize = 24 * 1024; // 24 KiB typical KV segment
+const SEGMENT_SIZE: usize = 240 * 1024; // 240 KiB, 10x enlarged for comparison
 const BATCH_COUNTS: &[usize] = &[64, 1024];
 
 // ---------------------------------------------------------------------------
@@ -146,7 +146,7 @@ const BATCH_COUNTS: &[usize] = &[64, 1024];
 fn h2d_benchmarks(c: &mut Criterion) {
     for &count in BATCH_COUNTS {
         let total_bytes = SEGMENT_SIZE * count;
-        let group_name = format!("h2d/24KiB/n{count}");
+        let group_name = format!("h2d/240KiB/n{count}");
         let mut group = c.benchmark_group(&group_name);
         group.throughput(Throughput::Bytes(total_bytes as u64));
 
