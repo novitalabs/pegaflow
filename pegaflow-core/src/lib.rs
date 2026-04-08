@@ -25,7 +25,7 @@ mod pinned_pool;
 mod seal_offload;
 mod storage;
 pub mod sync_state;
-mod transfer;
+pub mod transfer;
 
 pub use backing::{
     DEFAULT_SSD_PREFETCH_INFLIGHT, DEFAULT_SSD_PREFETCH_QUEUE_DEPTH, DEFAULT_SSD_WRITE_INFLIGHT,

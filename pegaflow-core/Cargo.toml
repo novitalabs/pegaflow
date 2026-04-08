@@ -48,6 +48,10 @@ tokio.workspace = true
 tempfile = "3"
 
 [[bench]]
+name = "transfer_batch"
+harness = false
+
+[[bench]]
 name = "pinned_copy"
 harness = false
 
