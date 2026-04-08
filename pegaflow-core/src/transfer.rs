@@ -2,10 +2,14 @@ use cudarc::driver::CudaStream;
 
 use crate::KVCacheRegistration;
 
-#[cfg(all(feature = "cuda-12", feature = "cuda-13"))]
+#[cfg(any(
+    all(feature = "cuda-12", feature = "cuda-128"),
+    all(feature = "cuda-12", feature = "cuda-13"),
+    all(feature = "cuda-128", feature = "cuda-13"),
+))]
 compile_error!(
-    "Features `cuda-12` and `cuda-13` are mutually exclusive. \
-     Use `--no-default-features --features cuda-13` for CUDA 13 support."
+    "Features `cuda-12`, `cuda-128`, and `cuda-13` are mutually exclusive. \
+     Use exactly one CUDA feature, for example `--no-default-features --features cuda-128`."
 );
 
 // ============================================================================
@@ -56,7 +60,7 @@ pub fn segment_offset(
     Ok(offset)
 }
 
-#[cfg(not(feature = "cuda-13"))]
+#[cfg(not(any(feature = "cuda-128", feature = "cuda-13")))]
 /// Copy data from GPU to CPU asynchronously on the provided stream
 fn copy_gpu_to_cpu_async(
     gpu_base_ptr: u64,
@@ -86,7 +90,7 @@ fn copy_gpu_to_cpu_async(
     Ok(())
 }
 
-#[cfg(feature = "cuda-13")]
+#[cfg(any(feature = "cuda-128", feature = "cuda-13"))]
 fn copy_gpu_to_cpu_batch_async(
     transfers: &[(usize, *mut u8)],
     segment_size: usize,
@@ -127,7 +131,7 @@ fn copy_gpu_to_cpu_batch_async(
     // and remain valid until the caller synchronizes the stream. All copies are
     // independent, so the batch API's lack of intra-batch ordering is acceptable.
     unsafe {
-        let result = sys::cuMemcpyBatchAsync_v2(
+        let result = submit_batch_memcpy(
             dsts.as_mut_ptr(),
             srcs.as_mut_ptr(),
             sizes.as_mut_ptr(),
@@ -145,7 +149,51 @@ fn copy_gpu_to_cpu_batch_async(
     Ok(())
 }
 
-#[cfg(not(feature = "cuda-13"))]
+#[cfg(feature = "cuda-128")]
+unsafe fn submit_batch_memcpy(
+    dsts: *mut cudarc::driver::sys::CUdeviceptr,
+    srcs: *mut cudarc::driver::sys::CUdeviceptr,
+    sizes: *mut usize,
+    count: usize,
+    attrs: *mut cudarc::driver::sys::CUmemcpyAttributes,
+    attrs_idxs: *mut usize,
+    num_attrs: usize,
+    stream: cudarc::driver::sys::CUstream,
+) -> cudarc::driver::sys::CUresult {
+    unsafe {
+        cudarc::driver::sys::cuMemcpyBatchAsync(
+            dsts,
+            srcs,
+            sizes,
+            count,
+            attrs,
+            attrs_idxs,
+            num_attrs,
+            std::ptr::null_mut(),
+            stream,
+        )
+    }
+}
+
+#[cfg(feature = "cuda-13")]
+unsafe fn submit_batch_memcpy(
+    dsts: *mut cudarc::driver::sys::CUdeviceptr,
+    srcs: *mut cudarc::driver::sys::CUdeviceptr,
+    sizes: *mut usize,
+    count: usize,
+    attrs: *mut cudarc::driver::sys::CUmemcpyAttributes,
+    attrs_idxs: *mut usize,
+    num_attrs: usize,
+    stream: cudarc::driver::sys::CUstream,
+) -> cudarc::driver::sys::CUresult {
+    unsafe {
+        cudarc::driver::sys::cuMemcpyBatchAsync_v2(
+            dsts, srcs, sizes, count, attrs, attrs_idxs, num_attrs, stream,
+        )
+    }
+}
+
+#[cfg(not(any(feature = "cuda-128", feature = "cuda-13")))]
 /// Copy data from CPU to GPU asynchronously on the provided stream
 fn copy_cpu_to_gpu_async(
     gpu_base_ptr: u64,
@@ -184,7 +232,7 @@ fn copy_cpu_to_gpu_async(
     Ok(())
 }
 
-#[cfg(feature = "cuda-13")]
+#[cfg(any(feature = "cuda-128", feature = "cuda-13"))]
 fn copy_cpu_to_gpu_batch_async(
     transfers: &[MergedCpuToGpuTransfer],
     registration: &KVCacheRegistration,
@@ -229,7 +277,7 @@ fn copy_cpu_to_gpu_batch_async(
     // stay valid until the caller synchronizes the stream. Each transfer copies a disjoint
     // segment, so batch execution order does not matter.
     unsafe {
-        let result = sys::cuMemcpyBatchAsync_v2(
+        let result = submit_batch_memcpy(
             dsts.as_mut_ptr(),
             srcs.as_mut_ptr(),
             sizes.as_mut_ptr(),
@@ -302,13 +350,13 @@ pub fn batch_copy_segments_to_gpu(
 
     let merged_transfers = merge_cpu_to_gpu_transfers(transfers, segment_size)?;
 
-    #[cfg(feature = "cuda-13")]
+    #[cfg(any(feature = "cuda-128", feature = "cuda-13"))]
     {
         copy_cpu_to_gpu_batch_async(&merged_transfers, registration, stream)?;
         return Ok(merged_transfers.len());
     }
 
-    #[cfg(not(feature = "cuda-13"))]
+    #[cfg(not(any(feature = "cuda-128", feature = "cuda-13")))]
     {
         for transfer in &merged_transfers {
             // SAFETY: merge_cpu_to_gpu_transfers only builds ranges from valid source
@@ -340,7 +388,7 @@ pub fn batch_copy_segments_from_gpu(
         return Ok(0);
     }
 
-    #[cfg(feature = "cuda-13")]
+    #[cfg(any(feature = "cuda-128", feature = "cuda-13"))]
     {
         if transfers.iter().any(|(offset, _)| {
             registration
@@ -356,7 +404,7 @@ pub fn batch_copy_segments_from_gpu(
         return Ok(1);
     }
 
-    #[cfg(not(feature = "cuda-13"))]
+    #[cfg(not(any(feature = "cuda-128", feature = "cuda-13")))]
     {
         let mut batch_count = 0;
         let mut i = 0;
