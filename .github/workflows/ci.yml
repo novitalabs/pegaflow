@@ -15,7 +15,6 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  RUST_TOOLCHAIN_NIGHTLY: nightly-2025-02-20
   CARGO_TERM_COLOR: always
   SCCACHE_GHA_ENABLED: "true"
   RUSTC_WRAPPER: sccache
@@ -164,7 +163,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install CUDA Toolkit
-        uses: Jimver/cuda-toolkit@v0.2.24
+        uses: Jimver/cuda-toolkit@v0.2.35
         with:
           cuda: ${{ matrix.cuda-version }}
           linux-local-args: '["--toolkit"]'
@@ -217,7 +216,7 @@ jobs:
           sudo rm -rf /opt/hostedtoolcache/CodeQL
 
       - name: Install CUDA Toolkit
-        uses: Jimver/cuda-toolkit@v0.2.24
+        uses: Jimver/cuda-toolkit@v0.2.35
         with:
           cuda: ${{ matrix.cuda-version }}
           linux-local-args: '["--toolkit"]'
