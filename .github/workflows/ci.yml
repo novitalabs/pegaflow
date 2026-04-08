@@ -15,7 +15,6 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  RUST_TOOLCHAIN_NIGHTLY: nightly-2025-02-20
   CARGO_TERM_COLOR: always
   SCCACHE_GHA_ENABLED: "true"
   RUSTC_WRAPPER: sccache
@@ -146,14 +145,30 @@ jobs:
       - name: Run ruff check
         uses: astral-sh/ruff-action@v3
 
-  cargo-check:
-    name: cargo check
+  cargo-check-variant:
+    name: cargo check (${{ matrix.cuda-variant }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - cuda-variant: cu12
+            cuda-version: '12.8.1'
+            cargo-features: ""
+          - cuda-variant: cu13
+            cuda-version: '13.0.2'
+            cargo-features: "--no-default-features --features cuda-13"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: ${{ matrix.cuda-version }}
+          linux-local-args: '["--toolkit"]'
+          method: 'network'
+          sub-packages: '["nvcc", "nvrtc-dev", "cudart-dev"]'
       - name: Install protobuf compiler
         run: |
           sudo apt-get update
@@ -164,19 +179,38 @@ jobs:
           toolchain: stable
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
-      - name: Run cargo check (core)
+      - name: Run cargo check
         run: |
-          cargo check -p pegaflow-core
-      - name: Run cargo check (server)
+          cargo check -p pegaflow-core ${{ matrix.cargo-features }}
+          cargo check -p pegaflow-server ${{ matrix.cargo-features }} --all-targets
+        env:
+          CUDA_PATH: /usr/local/cuda
+
+  cargo-check:
+    name: cargo check
+    if: always()
+    needs: cargo-check-variant
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check results
         run: |
-          cargo check -p pegaflow-server
+          if [[ "${{ needs.cargo-check-variant.result }}" != "success" ]]; then
+            echo "cargo check variants failed"
+            exit 1
+          fi
 
   build-wheel:
     name: build Python wheel (${{ matrix.cuda-variant }})
     runs-on: ubuntu-22.04
     strategy:
       matrix:
-        cuda-variant: ['cu12', 'cu13']
+        include:
+          - cuda-variant: cu12
+            cuda-version: '12.8.1'
+            cargo-features: ""
+          - cuda-variant: cu13
+            cuda-version: '13.0.2'
+            cargo-features: "--no-default-features --features cuda-13"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -195,9 +229,9 @@ jobs:
           sudo rm -rf /opt/hostedtoolcache/CodeQL
 
       - name: Install CUDA Toolkit
-        uses: Jimver/cuda-toolkit@v0.2.24
+        uses: Jimver/cuda-toolkit@v0.2.35
         with:
-          cuda: '12.8.1'
+          cuda: ${{ matrix.cuda-version }}
           linux-local-args: '["--toolkit"]'
           method: 'network'
           sub-packages: '["nvcc", "nvrtc-dev", "cudart-dev"]'
@@ -216,16 +250,15 @@ jobs:
       - name: Install maturin
         run: pip install maturin
 
-      - name: Patch for CUDA variant
+      - name: Patch package name for cu13
         if: matrix.cuda-variant == 'cu13'
         run: |
-          sed -i 's/cuda-12040/cuda-13000/' Cargo.toml
           sed -i 's/^name = "pegaflow-llm"$/name = "pegaflow-llm-cu13"/' python/pyproject.toml
           sed -i 's/"pegaflow-llm\[/"pegaflow-llm-cu13\[/g' python/pyproject.toml
 
       - name: Build wheel
         run: |
-          ./scripts/build-wheel.sh --release
+          ./scripts/build-wheel.sh --release ${{ matrix.cargo-features }}
         env:
           CUDA_PATH: /usr/local/cuda
 

@@ -7,7 +7,10 @@ edition.workspace = true
 workspace = true
 
 [features]
-default = []
+default = ["cuda-12"]
+cuda-12 = ["cudarc/cuda-12040"]
+cuda-128 = ["cudarc/cuda-12080"]
+cuda-13 = ["cudarc/cuda-13000"]
 tracing = ["fastrace"]
 
 [dependencies]
@@ -44,6 +47,10 @@ criterion.workspace = true
 cudarc.workspace = true
 tokio.workspace = true
 tempfile = "3"
+
+[[bench]]
+name = "transfer_batch"
+harness = false
 
 [[bench]]
 name = "pinned_copy"

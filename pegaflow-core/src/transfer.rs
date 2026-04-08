@@ -2,6 +2,16 @@ use cudarc::driver::CudaStream;
 
 use crate::KVCacheRegistration;
 
+#[cfg(any(
+    all(feature = "cuda-12", feature = "cuda-128"),
+    all(feature = "cuda-12", feature = "cuda-13"),
+    all(feature = "cuda-128", feature = "cuda-13"),
+))]
+compile_error!(
+    "Features `cuda-12`, `cuda-128`, and `cuda-13` are mutually exclusive. \
+     Use exactly one CUDA feature, for example `--no-default-features --features cuda-128`."
+);
+
 // ============================================================================
 // Transfer Functions Module
 //
@@ -11,8 +21,23 @@ use crate::KVCacheRegistration;
 // - Helper functions for offset/size calculations
 // ============================================================================
 
+#[derive(Clone)]
+struct MergedCpuToGpuTransfer {
+    gpu_offset: usize,
+    cpu_ptr: *const u8,
+    size: usize,
+}
+
+#[cfg(any(feature = "cuda-128", feature = "cuda-13"))]
+#[derive(Clone)]
+struct MergedGpuToCpuTransfer {
+    gpu_offset: usize,
+    cpu_ptr: *mut u8,
+    size: usize,
+}
+
 /// Calculate the byte offset for a given block/segment combination.
-pub(crate) fn segment_offset(
+pub fn segment_offset(
     registration: &KVCacheRegistration,
     block_idx: usize,
     segment_idx: usize,
@@ -43,6 +68,7 @@ pub(crate) fn segment_offset(
     Ok(offset)
 }
 
+#[cfg(not(any(feature = "cuda-128", feature = "cuda-13")))]
 /// Copy data from GPU to CPU asynchronously on the provided stream
 fn copy_gpu_to_cpu_async(
     gpu_base_ptr: u64,
@@ -72,6 +98,114 @@ fn copy_gpu_to_cpu_async(
     Ok(())
 }
 
+#[cfg(any(feature = "cuda-128", feature = "cuda-13"))]
+fn copy_gpu_to_cpu_batch_async(
+    transfers: &[MergedGpuToCpuTransfer],
+    registration: &KVCacheRegistration,
+    stream: &CudaStream,
+) -> Result<(), String> {
+    use cudarc::driver::sys;
+
+    let mut dsts = Vec::with_capacity(transfers.len());
+    let mut srcs = Vec::with_capacity(transfers.len());
+    let mut sizes = Vec::with_capacity(transfers.len());
+    let mut attrs = [sys::CUmemcpyAttributes {
+        srcAccessOrder: sys::CUmemcpySrcAccessOrder_enum::CU_MEMCPY_SRC_ACCESS_ORDER_STREAM,
+        srcLocHint: sys::CUmemLocation {
+            type_: sys::CUmemLocationType_enum::CU_MEM_LOCATION_TYPE_INVALID,
+            id: 0,
+        },
+        dstLocHint: sys::CUmemLocation {
+            type_: sys::CUmemLocationType_enum::CU_MEM_LOCATION_TYPE_INVALID,
+            id: 0,
+        },
+        flags: 0,
+    }];
+    let mut attrs_idxs = [0usize];
+
+    for transfer in transfers {
+        let src_ptr = registration
+            .data_ptr
+            .checked_add(transfer.gpu_offset as u64)
+            .ok_or_else(|| {
+                format!(
+                    "GPU source pointer overflow for offset {}",
+                    transfer.gpu_offset
+                )
+            })?;
+        dsts.push(transfer.cpu_ptr as usize as sys::CUdeviceptr);
+        srcs.push(src_ptr);
+        sizes.push(transfer.size);
+    }
+
+    // SAFETY: The source GPU addresses are derived from a live registration and checked
+    // for overflow. Destination pointers refer to pinned host memory owned by the caller
+    // and remain valid until the caller synchronizes the stream. Contiguous ranges have
+    // been merged, so each entry is an independent non-overlapping copy.
+    unsafe {
+        let result = submit_batch_memcpy(
+            dsts.as_mut_ptr(),
+            srcs.as_mut_ptr(),
+            sizes.as_mut_ptr(),
+            transfers.len(),
+            attrs.as_mut_ptr(),
+            attrs_idxs.as_mut_ptr(),
+            attrs.len(),
+            stream.cu_stream(),
+        );
+        if result != sys::cudaError_enum::CUDA_SUCCESS {
+            return Err(format!("cuMemcpyBatchAsync_v2 DtoH failed: {:?}", result));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "cuda-128")]
+unsafe fn submit_batch_memcpy(
+    dsts: *mut cudarc::driver::sys::CUdeviceptr,
+    srcs: *mut cudarc::driver::sys::CUdeviceptr,
+    sizes: *mut usize,
+    count: usize,
+    attrs: *mut cudarc::driver::sys::CUmemcpyAttributes,
+    attrs_idxs: *mut usize,
+    num_attrs: usize,
+    stream: cudarc::driver::sys::CUstream,
+) -> cudarc::driver::sys::CUresult {
+    unsafe {
+        cudarc::driver::sys::cuMemcpyBatchAsync(
+            dsts,
+            srcs,
+            sizes,
+            count,
+            attrs,
+            attrs_idxs,
+            num_attrs,
+            std::ptr::null_mut(),
+            stream,
+        )
+    }
+}
+
+#[cfg(feature = "cuda-13")]
+unsafe fn submit_batch_memcpy(
+    dsts: *mut cudarc::driver::sys::CUdeviceptr,
+    srcs: *mut cudarc::driver::sys::CUdeviceptr,
+    sizes: *mut usize,
+    count: usize,
+    attrs: *mut cudarc::driver::sys::CUmemcpyAttributes,
+    attrs_idxs: *mut usize,
+    num_attrs: usize,
+    stream: cudarc::driver::sys::CUstream,
+) -> cudarc::driver::sys::CUresult {
+    unsafe {
+        cudarc::driver::sys::cuMemcpyBatchAsync_v2(
+            dsts, srcs, sizes, count, attrs, attrs_idxs, num_attrs, stream,
+        )
+    }
+}
+
+#[cfg(not(any(feature = "cuda-128", feature = "cuda-13")))]
 /// Copy data from CPU to GPU asynchronously on the provided stream
 fn copy_cpu_to_gpu_async(
     gpu_base_ptr: u64,
@@ -110,9 +244,153 @@ fn copy_cpu_to_gpu_async(
     Ok(())
 }
 
+#[cfg(any(feature = "cuda-128", feature = "cuda-13"))]
+fn copy_cpu_to_gpu_batch_async(
+    transfers: &[MergedCpuToGpuTransfer],
+    registration: &KVCacheRegistration,
+    stream: &CudaStream,
+) -> Result<(), String> {
+    use cudarc::driver::sys;
+
+    let mut dsts = Vec::with_capacity(transfers.len());
+    let mut srcs = Vec::with_capacity(transfers.len());
+    let mut sizes = Vec::with_capacity(transfers.len());
+    let mut attrs = [sys::CUmemcpyAttributes {
+        srcAccessOrder: sys::CUmemcpySrcAccessOrder_enum::CU_MEMCPY_SRC_ACCESS_ORDER_STREAM,
+        srcLocHint: sys::CUmemLocation {
+            type_: sys::CUmemLocationType_enum::CU_MEM_LOCATION_TYPE_INVALID,
+            id: 0,
+        },
+        dstLocHint: sys::CUmemLocation {
+            type_: sys::CUmemLocationType_enum::CU_MEM_LOCATION_TYPE_INVALID,
+            id: 0,
+        },
+        flags: 0,
+    }];
+    let mut attrs_idxs = [0usize];
+
+    for transfer in transfers {
+        let dst_ptr = registration
+            .data_ptr
+            .checked_add(transfer.gpu_offset as u64)
+            .ok_or_else(|| {
+                format!(
+                    "GPU destination pointer overflow for offset {}",
+                    transfer.gpu_offset
+                )
+            })?;
+        dsts.push(dst_ptr);
+        srcs.push(transfer.cpu_ptr as usize as sys::CUdeviceptr);
+        sizes.push(transfer.size);
+    }
+
+    // SAFETY: Destination GPU addresses are derived from a live registration and checked
+    // for overflow. Source pointers refer to pinned host memory owned by the caller and
+    // stay valid until the caller synchronizes the stream. Each transfer copies a disjoint
+    // segment, so batch execution order does not matter.
+    unsafe {
+        let result = submit_batch_memcpy(
+            dsts.as_mut_ptr(),
+            srcs.as_mut_ptr(),
+            sizes.as_mut_ptr(),
+            transfers.len(),
+            attrs.as_mut_ptr(),
+            attrs_idxs.as_mut_ptr(),
+            attrs.len(),
+            stream.cu_stream(),
+        );
+        if result != sys::cudaError_enum::CUDA_SUCCESS {
+            return Err(format!("cuMemcpyBatchAsync_v2 HtoD failed: {:?}", result));
+        }
+    }
+
+    Ok(())
+}
+
+fn merge_cpu_to_gpu_transfers(
+    transfers: &[(usize, *const u8)],
+    segment_size: usize,
+) -> Result<Vec<MergedCpuToGpuTransfer>, String> {
+    let mut merged = Vec::with_capacity(transfers.len());
+    let mut i = 0;
+
+    while i < transfers.len() {
+        let (start_gpu_offset, start_cpu_ptr) = transfers[i];
+        let mut count = 1usize;
+
+        while i + count < transfers.len() {
+            let (next_gpu_offset, next_cpu_ptr) = transfers[i + count];
+            let expected_gpu_offset = start_gpu_offset + count * segment_size;
+            // SAFETY: All cpu_ptr values in `transfers` point into the same contiguous
+            // allocation. This arithmetic is used only for contiguity comparison.
+            let expected_cpu_ptr = unsafe { start_cpu_ptr.add(count * segment_size) };
+
+            if next_gpu_offset == expected_gpu_offset && next_cpu_ptr == expected_cpu_ptr {
+                count += 1;
+            } else {
+                break;
+            }
+        }
+
+        let size = segment_size
+            .checked_mul(count)
+            .ok_or_else(|| "merge_cpu_to_gpu_transfers: total_size overflow".to_string())?;
+
+        merged.push(MergedCpuToGpuTransfer {
+            gpu_offset: start_gpu_offset,
+            cpu_ptr: start_cpu_ptr,
+            size,
+        });
+        i += count;
+    }
+
+    Ok(merged)
+}
+
+#[cfg(any(feature = "cuda-128", feature = "cuda-13"))]
+fn merge_gpu_to_cpu_transfers(
+    transfers: &[(usize, *mut u8)],
+    segment_size: usize,
+) -> Result<Vec<MergedGpuToCpuTransfer>, String> {
+    let mut merged = Vec::with_capacity(transfers.len());
+    let mut i = 0;
+
+    while i < transfers.len() {
+        let (start_gpu_offset, start_cpu_ptr) = transfers[i];
+        let mut count = 1usize;
+
+        while i + count < transfers.len() {
+            let (next_gpu_offset, next_cpu_ptr) = transfers[i + count];
+            let expected_gpu_offset = start_gpu_offset + count * segment_size;
+            // SAFETY: All cpu_ptr values in `transfers` point into the same contiguous
+            // allocation. This arithmetic is used only for contiguity comparison.
+            let expected_cpu_ptr = unsafe { start_cpu_ptr.add(count * segment_size) };
+
+            if next_gpu_offset == expected_gpu_offset && next_cpu_ptr == expected_cpu_ptr {
+                count += 1;
+            } else {
+                break;
+            }
+        }
+
+        let size = segment_size
+            .checked_mul(count)
+            .ok_or_else(|| "merge_gpu_to_cpu_transfers: total_size overflow".to_string())?;
+
+        merged.push(MergedGpuToCpuTransfer {
+            gpu_offset: start_gpu_offset,
+            cpu_ptr: start_cpu_ptr,
+            size,
+        });
+        i += count;
+    }
+
+    Ok(merged)
+}
+
 /// Batch copy segments from CPU to GPU by finding and merging contiguous ranges.
-/// Returns the number of CUDA memcpy calls issued.
-pub(crate) fn batch_copy_segments_to_gpu(
+/// Returns the number of merged contiguous transfer ranges submitted.
+pub fn batch_copy_segments_to_gpu(
     transfers: &[(usize, *const u8)],
     segment_size: usize,
     registration: &KVCacheRegistration,
@@ -123,57 +401,36 @@ pub(crate) fn batch_copy_segments_to_gpu(
         return Ok(0);
     }
 
-    let mut batch_count = 0;
-    let mut i = 0;
+    let merged_transfers = merge_cpu_to_gpu_transfers(transfers, segment_size)?;
 
-    while i < total_segments {
-        let (start_gpu_offset, start_cpu_ptr) = transfers[i];
-        let mut count = 1;
-
-        while i + count < total_segments {
-            let (next_gpu_offset, next_cpu_ptr) = transfers[i + count];
-
-            let expected_gpu_offset = start_gpu_offset + count * segment_size;
-            // SAFETY: All cpu_ptr values in `transfers` point into the same contiguous
-            // allocation. This arithmetic is used only for contiguity comparison.
-            let expected_cpu_ptr = unsafe { start_cpu_ptr.add(count * segment_size) };
-
-            let gpu_contiguous = next_gpu_offset == expected_gpu_offset;
-            let cpu_contiguous = next_cpu_ptr == expected_cpu_ptr;
-
-            if gpu_contiguous && cpu_contiguous {
-                count += 1;
-            } else {
-                break;
-            }
-        }
-
-        let total_size = segment_size
-            .checked_mul(count)
-            .ok_or_else(|| "batch_copy_segments_to_gpu: total_size overflow".to_string())?;
-
-        // SAFETY: start_cpu_ptr points to valid, initialized pinned memory of at least
-        // total_size bytes. The contiguity check above confirms the segments form a
-        // single contiguous range. total_size is checked via checked_mul.
-        let buffer = unsafe { std::slice::from_raw_parts(start_cpu_ptr, total_size) };
-        copy_cpu_to_gpu_async(
-            registration.data_ptr,
-            start_gpu_offset,
-            buffer,
-            total_size,
-            stream,
-        )?;
-
-        batch_count += 1;
-        i += count;
+    #[cfg(any(feature = "cuda-128", feature = "cuda-13"))]
+    {
+        copy_cpu_to_gpu_batch_async(&merged_transfers, registration, stream)?;
+        return Ok(merged_transfers.len());
     }
 
-    Ok(batch_count)
+    #[cfg(not(any(feature = "cuda-128", feature = "cuda-13")))]
+    {
+        for transfer in &merged_transfers {
+            // SAFETY: merge_cpu_to_gpu_transfers only builds ranges from valid source
+            // pointers and checked sizes.
+            let buffer = unsafe { std::slice::from_raw_parts(transfer.cpu_ptr, transfer.size) };
+            copy_cpu_to_gpu_async(
+                registration.data_ptr,
+                transfer.gpu_offset,
+                buffer,
+                transfer.size,
+                stream,
+            )?;
+        }
+
+        Ok(merged_transfers.len())
+    }
 }
 
 /// Batch copy segments from GPU to CPU by finding and merging contiguous ranges.
-/// Returns the number of CUDA memcpy calls issued.
-pub(crate) fn batch_copy_segments_from_gpu(
+/// Returns the number of merged contiguous transfer ranges submitted.
+pub fn batch_copy_segments_from_gpu(
     transfers: &[(usize, *mut u8)], // (gpu_offset, cpu_dst_ptr)
     segment_size: usize,
     registration: &KVCacheRegistration,
@@ -184,46 +441,66 @@ pub(crate) fn batch_copy_segments_from_gpu(
         return Ok(0);
     }
 
-    let mut batch_count = 0;
-    let mut i = 0;
-
-    while i < total_segments {
-        let (start_gpu_offset, start_cpu_ptr) = transfers[i];
-        let mut count = 1;
-
-        while i + count < total_segments {
-            let (next_gpu_offset, next_cpu_ptr) = transfers[i + count];
-
-            let expected_gpu_offset = start_gpu_offset + count * segment_size;
-            // SAFETY: All cpu_ptr values in `transfers` point into the same contiguous
-            // allocation. This arithmetic is used only for contiguity comparison.
-            let expected_cpu_ptr = unsafe { start_cpu_ptr.add(count * segment_size) };
-
-            let gpu_contiguous = next_gpu_offset == expected_gpu_offset;
-            let cpu_contiguous = next_cpu_ptr == expected_cpu_ptr;
-
-            if gpu_contiguous && cpu_contiguous {
-                count += 1;
-            } else {
-                break;
-            }
+    #[cfg(any(feature = "cuda-128", feature = "cuda-13"))]
+    {
+        if transfers.iter().any(|(offset, _)| {
+            registration
+                .size_bytes
+                .checked_sub(segment_size)
+                .is_none_or(|max_offset| *offset > max_offset)
+        }) {
+            return Err(
+                "batch_copy_segments_from_gpu: transfer exceeds registered memory".to_string(),
+            );
         }
-
-        let total_size = segment_size
-            .checked_mul(count)
-            .ok_or_else(|| "batch_copy_segments_from_gpu: total_size overflow".to_string())?;
-
-        copy_gpu_to_cpu_async(
-            registration.data_ptr,
-            start_gpu_offset,
-            start_cpu_ptr,
-            total_size,
-            stream,
-        )?;
-
-        batch_count += 1;
-        i += count;
+        let merged_transfers = merge_gpu_to_cpu_transfers(transfers, segment_size)?;
+        copy_gpu_to_cpu_batch_async(&merged_transfers, registration, stream)?;
+        return Ok(merged_transfers.len());
     }
 
-    Ok(batch_count)
+    #[cfg(not(any(feature = "cuda-128", feature = "cuda-13")))]
+    {
+        let mut batch_count = 0;
+        let mut i = 0;
+
+        while i < total_segments {
+            let (start_gpu_offset, start_cpu_ptr) = transfers[i];
+            let mut count = 1;
+
+            while i + count < total_segments {
+                let (next_gpu_offset, next_cpu_ptr) = transfers[i + count];
+
+                let expected_gpu_offset = start_gpu_offset + count * segment_size;
+                // SAFETY: All cpu_ptr values in `transfers` point into the same contiguous
+                // allocation. This arithmetic is used only for contiguity comparison.
+                let expected_cpu_ptr = unsafe { start_cpu_ptr.add(count * segment_size) };
+
+                let gpu_contiguous = next_gpu_offset == expected_gpu_offset;
+                let cpu_contiguous = next_cpu_ptr == expected_cpu_ptr;
+
+                if gpu_contiguous && cpu_contiguous {
+                    count += 1;
+                } else {
+                    break;
+                }
+            }
+
+            let total_size = segment_size
+                .checked_mul(count)
+                .ok_or_else(|| "batch_copy_segments_from_gpu: total_size overflow".to_string())?;
+
+            copy_gpu_to_cpu_async(
+                registration.data_ptr,
+                start_gpu_offset,
+                start_cpu_ptr,
+                total_size,
+                stream,
+            )?;
+
+            batch_count += 1;
+            i += count;
+        }
+
+        Ok(batch_count)
+    }
 }

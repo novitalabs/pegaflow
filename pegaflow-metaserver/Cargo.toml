@@ -15,9 +15,15 @@ path = "src/lib.rs"
 name = "pegaflow-metaserver"
 path = "src/main.rs"
 
+[features]
+default = ["cuda-12"]
+cuda-12 = ["pegaflow-core/cuda-12"]
+cuda-128 = ["pegaflow-core/cuda-128"]
+cuda-13 = ["pegaflow-core/cuda-13"]
+
 [dependencies]
 pegaflow-common.workspace = true
-pegaflow-core.workspace = true
+pegaflow-core = { workspace = true, default-features = false }
 pegaflow-proto = { path = "../pegaflow-proto" }
 prost.workspace = true
 tonic.workspace = true
