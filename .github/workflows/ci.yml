@@ -145,7 +145,7 @@ jobs:
       - name: Run ruff check
         uses: astral-sh/ruff-action@v3
 
-  cargo-check:
+  cargo-check-variant:
     name: cargo check (${{ matrix.cuda-variant }})
     runs-on: ubuntu-latest
     strategy:
@@ -185,6 +185,19 @@ jobs:
           cargo check -p pegaflow-server ${{ matrix.cargo-features }} --all-targets
         env:
           CUDA_PATH: /usr/local/cuda
+
+  cargo-check:
+    name: cargo check
+    if: always()
+    needs: cargo-check-variant
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check results
+        run: |
+          if [[ "${{ needs.cargo-check-variant.result }}" != "success" ]]; then
+            echo "cargo check variants failed"
+            exit 1
+          fi
 
   build-wheel:
     name: build Python wheel (${{ matrix.cuda-variant }})
