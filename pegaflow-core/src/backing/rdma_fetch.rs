@@ -3,6 +3,7 @@
 // Follows the same submit/oneshot pattern as SsdBackingStore::submit_prefix so that
 // PrefetchScheduler can treat remote fetch the same way it treats SSD prefetch.
 
+use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -168,6 +169,7 @@ async fn rdma_fetch_task(
     let t0 = Instant::now();
 
     // 1. Ensure RDMA connection (singleflight: at most one handshake per remote_addr)
+    let connect_start = Instant::now();
     if let Err(e) = ensure_connected(
         connect_group,
         rdma,
@@ -183,8 +185,10 @@ async fn rdma_fetch_task(
             .add(1, &[KeyValue::new("status", "error")]);
         return Vec::new();
     }
+    let connect_elapsed = connect_start.elapsed();
 
     // 2. gRPC QueryBlocksForTransfer (connection already established)
+    let query_start = Instant::now();
     let (client, response) = match query_remote_blocks(
         grpc_channels,
         remote_addr,
@@ -203,6 +207,7 @@ async fn rdma_fetch_task(
             return Vec::new();
         }
     };
+    let query_elapsed = query_start.elapsed();
 
     let transfer_session_id = response.transfer_session_id.clone();
 
@@ -214,7 +219,32 @@ async fn rdma_fetch_task(
         .flat_map(|b| &b.slots)
         .map(|s| s.k_size + s.v_size)
         .sum();
-    let result = match fetch_blocks_via_rdma(
+    let slot_count: usize = blocks.iter().map(|b| b.slots.len()).sum();
+    let mut k_segments = 0usize;
+    let mut v_segments = 0usize;
+    let mut slot_numa_counts: HashMap<NumaNode, usize> = HashMap::new();
+    for block in &blocks {
+        for slot in &block.slots {
+            if slot.k_size > 0 {
+                k_segments += 1;
+            }
+            if slot.v_size > 0 && slot.v_ptr != 0 {
+                v_segments += 1;
+            }
+            *slot_numa_counts
+                .entry(NumaNode(slot.numa_node))
+                .or_default() += 1;
+        }
+    }
+    let mut slot_numa_items: Vec<_> = slot_numa_counts.into_iter().collect();
+    slot_numa_items.sort_unstable_by_key(|(node, _)| *node);
+    let slot_numa_summary = slot_numa_items
+        .into_iter()
+        .map(|(node, count)| format!("{node}:{count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let total_segments = k_segments + v_segments;
+    let fetch = match fetch_blocks_via_rdma(
         rdma,
         allocate_fn,
         namespace,
@@ -235,14 +265,23 @@ async fn rdma_fetch_task(
             return Vec::new();
         }
     };
+    let result = fetch.result;
 
     // 4. Release transfer lock (fire-and-forget: spawns a detached task)
     spawn_release_lock(client, transfer_session_id);
 
     let elapsed = t0.elapsed();
+    let accounted = connect_elapsed
+        + query_elapsed
+        + fetch.prepare_elapsed
+        + fetch.rdma_wait_elapsed
+        + fetch.rebuild_elapsed;
+    let other_elapsed = elapsed.saturating_sub(accounted);
     let mb = total_bytes as f64 / (1024.0 * 1024.0);
-    info!(
-        "RDMA fetch from {remote_addr}: {}/{} blocks, {mb:.1} MiB in {elapsed:.1?} ({:.0} MiB/s)",
+    debug!(
+        "RDMA fetch from {remote_addr}: {}/{} blocks, {mb:.1} MiB in {elapsed:.1?} ({:.0} MiB/s) \
+         [connect={connect_elapsed:.1?} query={query_elapsed:.1?} prepare={:.1?} rdma_wait={:.1?} rebuild={:.1?} other={other_elapsed:.1?} \
+         descs={} slots={} segs={} (k={},v={}) avg_desc={} avg_slot_segs={:.1} slot_numa={}]",
         result.len(),
         block_hashes.len(),
         if elapsed.as_secs_f64() > 0.0 {
@@ -250,6 +289,28 @@ async fn rdma_fetch_task(
         } else {
             0.0
         },
+        fetch.prepare_elapsed,
+        fetch.rdma_wait_elapsed,
+        fetch.rebuild_elapsed,
+        fetch.desc_count,
+        slot_count,
+        total_segments,
+        k_segments,
+        v_segments,
+        if fetch.desc_count > 0 {
+            format!(
+                "{:.1} KiB",
+                total_bytes as f64 / fetch.desc_count as f64 / 1024.0
+            )
+        } else {
+            "0.0 KiB".to_string()
+        },
+        if slot_count > 0 {
+            total_segments as f64 / slot_count as f64
+        } else {
+            0.0
+        },
+        slot_numa_summary,
     );
     let m = core_metrics();
     let ok = &[KeyValue::new("status", "ok")];
@@ -319,17 +380,19 @@ async fn fetch_blocks_via_rdma(
     remote_addr: &str,
     blocks: &[TransferBlockInfo],
     transfer_timeout: Duration,
-) -> Result<PrefetchResult, String> {
+) -> Result<FetchBlocksViaRdmaResult, String> {
     if blocks.is_empty() {
-        return Ok(Vec::new());
+        return Ok(FetchBlocksViaRdmaResult::default());
     }
+
+    let prepare_start = Instant::now();
 
     // (block_hash, Vec<(slot_segments)>) — for building SealedBlock afterwards
     let mut block_allocs: Vec<(Vec<u8>, Vec<Vec<SegmentAlloc>>)> = Vec::new();
 
     // Build TransferDescs and submit RDMA READ inside a sync block so that
     // all_descs (which contains NonNull<u8>, !Send) is dropped before any .await.
-    let receivers = {
+    let (receivers, desc_count) = {
         let mut all_descs: Vec<TransferDesc> = Vec::new();
 
         for block_info in blocks {
@@ -384,15 +447,20 @@ async fn fetch_blocks_via_rdma(
         }
 
         if all_descs.is_empty() {
-            return Ok(Vec::new());
+            return Ok(FetchBlocksViaRdmaResult::default());
         }
 
         // Submit RDMA READ; all_descs is dropped at the end of this block.
-        rdma.engine()
+        let desc_count = all_descs.len();
+        let receivers = rdma
+            .engine()
             .batch_transfer_async(TransferOp::Read, remote_addr, &all_descs)
-            .map_err(|e| format!("RDMA batch_transfer_async failed: {e}"))?
+            .map_err(|e| format!("RDMA batch_transfer_async failed: {e}"))?;
+        (receivers, desc_count)
     };
+    let prepare_elapsed = prepare_start.elapsed();
 
+    let rdma_wait_start = Instant::now();
     tokio::time::timeout(transfer_timeout, async {
         for rx in receivers {
             rx.await
@@ -403,8 +471,10 @@ async fn fetch_blocks_via_rdma(
     })
     .await
     .map_err(|_| "RDMA transfer timed out".to_string())??;
+    let rdma_wait_elapsed = rdma_wait_start.elapsed();
 
     // Build SealedBlocks from allocated memory
+    let rebuild_start = Instant::now();
     let mut result: PrefetchResult = Vec::with_capacity(block_allocs.len());
     for (hash, slot_allocs) in block_allocs {
         let key = BlockKey::new(namespace.to_string(), hash);
@@ -421,8 +491,24 @@ async fn fetch_blocks_via_rdma(
         let sealed = Arc::new(SealedBlock::from_slots(slots));
         result.push((key, sealed));
     }
+    let rebuild_elapsed = rebuild_start.elapsed();
 
-    Ok(result)
+    Ok(FetchBlocksViaRdmaResult {
+        result,
+        prepare_elapsed,
+        rdma_wait_elapsed,
+        rebuild_elapsed,
+        desc_count,
+    })
+}
+
+#[derive(Default)]
+struct FetchBlocksViaRdmaResult {
+    result: PrefetchResult,
+    prepare_elapsed: Duration,
+    rdma_wait_elapsed: Duration,
+    rebuild_elapsed: Duration,
+    desc_count: usize,
 }
 
 struct SegmentAlloc {
