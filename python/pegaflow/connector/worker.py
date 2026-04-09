@@ -346,8 +346,8 @@ class WorkerConnector:
             layers_by_group = {
                 0: [
                     ln
-                    for ln, l in forward_context.no_compile_layers.items()
-                    if hasattr(l, "kv_cache")
+                    for ln, layer in forward_context.no_compile_layers.items()
+                    if hasattr(layer, "kv_cache")
                 ]
             }
 
