@@ -56,8 +56,11 @@ class WorkerConnector:
 
         self._current_save_intents: set[str] = set()
 
-        self._pending_loads: dict[str, PyLoadState] = {}
-        self._pending_load_reqs: dict[str, set[str]] = {}
+        # _pending_loads[req_id] = list of PyLoadState objects, one per kv_cache_group.
+        # A request is done loading only when ALL group states are ready.
+        self._pending_loads: dict[str, list[PyLoadState]] = {}
+        self._shm_to_load_state: dict[str, PyLoadState] = {}  # shm_name -> load_state
+        self._pending_load_reqs: dict[str, set[str]] = {}  # shm_name -> req_ids
         self._pending_load_meta: dict[
             str, tuple[float, int]
         ] = {}  # shm_name -> (start_time, num_blocks)
@@ -205,41 +208,52 @@ class WorkerConnector:
             completed_shms: list[str] = []
             load_stats_to_record: list[tuple[float, int, bool]] = []
 
-            for shm_name, req_ids in self._pending_load_reqs.items():
-                sample_req_id = next(iter(req_ids))
-                load_state = self._pending_loads.get(sample_req_id)
+            for shm_name, req_ids in list(self._pending_load_reqs.items()):
+                load_state = self._shm_to_load_state.get(shm_name)
                 if load_state is None:
+                    completed_shms.append(shm_name)
                     continue
 
-                if load_state.is_ready():
-                    state = load_state.get_state()
-                    success = state >= 0
-                    if not success:
-                        logger.error(
-                            "[PegaKVConnector] async_load_failed: reqs=%s state=%d",
-                            req_ids,
-                            state,
-                        )
-                    else:
-                        logger.info(
-                            "[PegaKVConnector] async_load_completed: reqs=%s",
-                            req_ids,
-                        )
+                if not load_state.is_ready():
+                    continue
 
-                    # Calculate load duration
-                    if shm_name in self._pending_load_meta:
-                        start_time, num_blocks = self._pending_load_meta[shm_name]
-                        duration = time.perf_counter() - start_time
-                        load_stats_to_record.append((duration, num_blocks, success))
+                state = load_state.get_state()
+                success = state >= 0
+                if not success:
+                    logger.error(
+                        "[PegaKVConnector] async_load_failed: reqs=%s state=%d",
+                        req_ids,
+                        state,
+                    )
+                else:
+                    logger.info(
+                        "[PegaKVConnector] async_load_group_completed: reqs=%s shm=%s",
+                        req_ids,
+                        shm_name,
+                    )
 
-                    completed_reqs.update(req_ids)
-                    completed_shms.append(shm_name)
+                # Calculate load duration
+                if shm_name in self._pending_load_meta:
+                    start_time, num_blocks = self._pending_load_meta[shm_name]
+                    duration = time.perf_counter() - start_time
+                    load_stats_to_record.append((duration, num_blocks, success))
+
+                completed_shms.append(shm_name)
+
+                # Remove this group's load_state from each req's pending list.
+                # A request is fully done when its pending list becomes empty.
+                for req_id in req_ids:
+                    states = self._pending_loads.get(req_id)
+                    if states is not None:
+                        self._pending_loads[req_id] = [ls for ls in states if ls is not load_state]
+                        if not self._pending_loads[req_id]:
+                            del self._pending_loads[req_id]
+                            completed_reqs.add(req_id)
 
             for shm_name in completed_shms:
-                req_ids = self._pending_load_reqs.pop(shm_name, set())
+                self._pending_load_reqs.pop(shm_name, None)
+                self._shm_to_load_state.pop(shm_name, None)
                 self._pending_load_meta.pop(shm_name, None)
-                for req_id in req_ids:
-                    self._pending_loads.pop(req_id, None)
 
             if completed_reqs:
                 finished_recving = completed_reqs
@@ -275,67 +289,134 @@ class WorkerConnector:
 
         total_requests = len(metadata.load_intents)
         load_start = time.perf_counter()
-
-        all_block_ids: list[int] = []
-        all_block_hashes: list[bytes] = []
-        request_ids: list[str] = []
-
-        for req_id, load_intent in metadata.load_intents.items():
-            all_block_ids.extend(load_intent.block_ids)
-            all_block_hashes.extend(load_intent.block_hashes)
-            request_ids.append(req_id)
-
-        if not all_block_ids:
-            return
+        request_ids = list(metadata.load_intents.keys())
 
         if self._cross_layer_mode:
-            target_layers = [_CROSS_LAYER_KEY]
-        else:
-            target_layers = []
-            for layer_name, layer in forward_context.no_compile_layers.items():
-                if hasattr(layer, "kv_cache"):
-                    target_layers.append(layer_name)
+            # Cross-layer: single fused KV tensor, use group 0 block_ids.
+            all_block_ids: list[int] = []
+            all_block_hashes: list[bytes] = []
+            for load_intent in metadata.load_intents.values():
+                g0 = load_intent.group_block_ids[0] if load_intent.group_block_ids else ()
+                all_block_ids.extend(g0)
+                all_block_hashes.extend(load_intent.block_hashes)
 
-        if not target_layers:
+            if not all_block_ids:
+                return
+
+            load_state = PyLoadState()
+            shm_name = load_state.shm_name()
+            ok, message = self._ctx.engine_client.load(
+                self._ctx.instance_id,
+                self._ctx.effective_tp_rank,
+                self._ctx.device_id,
+                shm_name,
+                [_CROSS_LAYER_KEY],
+                all_block_ids,
+                all_block_hashes,
+            )
+            if not ok:
+                raise RuntimeError(f"Load request failed: {message}")
+
+            with self._load_completion_lock:
+                for req_id in request_ids:
+                    self._pending_loads[req_id] = [load_state]
+                self._pending_load_reqs[shm_name] = set(request_ids)
+                self._shm_to_load_state[shm_name] = load_state
+                self._pending_load_meta[shm_name] = (time.perf_counter(), len(all_block_ids))
+
+            logger.debug(
+                "[PegaKVConnector] started async cross-layer load: %d blocks for %d reqs, shm=%s",
+                len(all_block_ids),
+                total_requests,
+                shm_name,
+            )
             return
 
-        load_state = PyLoadState()
-        shm_name = load_state.shm_name()
+        # Determine which KV layers belong to each group.
+        layer_to_group = metadata.layer_to_group
+        if layer_to_group:
+            # HMA mode: split layers by kv_cache_group index.
+            layers_by_group: dict[int, list[str]] = {}
+            for layer_name in forward_context.no_compile_layers:
+                if layer_name in self._layer_name_to_id:
+                    g_idx = layer_to_group.get(layer_name, 0)
+                    layers_by_group.setdefault(g_idx, []).append(layer_name)
+        else:
+            # Non-HMA: all KV-bearing layers map to group 0.
+            layers_by_group = {
+                0: [
+                    ln
+                    for ln in forward_context.no_compile_layers
+                    if ln in self._layer_name_to_id
+                ]
+            }
 
-        ok, message = self._ctx.engine_client.load(
-            self._ctx.instance_id,
-            self._ctx.effective_tp_rank,
-            self._ctx.device_id,
-            shm_name,
-            target_layers,
-            all_block_ids,
-            all_block_hashes,
+        if not any(layers_by_group.values()):
+            return
+
+        num_groups = max(
+            (len(li.group_block_ids) for li in metadata.load_intents.values()),
+            default=1,
         )
+        if not layer_to_group:
+            num_groups = 1
 
-        if not ok:
-            raise RuntimeError(f"Load request failed: {message}")
+        groups_launched = 0
+        for g_idx in range(num_groups):
+            target_layers = layers_by_group.get(g_idx, [])
+            if not target_layers:
+                continue
 
-        num_layers = len(target_layers)
-        num_blocks = len(all_block_ids)
+            group_block_ids_all: list[int] = []
+            group_block_hashes_all: list[bytes] = []
+            for load_intent in metadata.load_intents.values():
+                if g_idx < len(load_intent.group_block_ids):
+                    g_block_ids = load_intent.group_block_ids[g_idx]
+                elif load_intent.group_block_ids:
+                    g_block_ids = load_intent.group_block_ids[0]
+                else:
+                    g_block_ids = ()
+                group_block_ids_all.extend(g_block_ids)
+                # Sliding attention groups keep only the most recent n blocks,
+                # so their physical blocks map to the LAST n virtual block hashes.
+                n = len(g_block_ids)
+                if n > 0:
+                    group_block_hashes_all.extend(load_intent.block_hashes[-n:])
 
-        schedule_end = time.perf_counter()
-        schedule_time_us = (schedule_end - load_start) * 1e6
+            if not group_block_ids_all:
+                continue
 
-        with self._load_completion_lock:
-            for req_id in request_ids:
-                self._pending_loads[req_id] = load_state
-            self._pending_load_reqs[shm_name] = set(request_ids)
-            # Record start time and block count for stats
-            self._pending_load_meta[shm_name] = (time.perf_counter(), num_blocks)
+            load_state = PyLoadState()
+            shm_name = load_state.shm_name()
+            num_blocks = len(group_block_ids_all)
 
+            ok, message = self._ctx.engine_client.load(
+                self._ctx.instance_id,
+                self._ctx.effective_tp_rank,
+                self._ctx.device_id,
+                shm_name,
+                target_layers,
+                group_block_ids_all,
+                group_block_hashes_all,
+            )
+            if not ok:
+                raise RuntimeError(f"Load request failed: {message}")
+
+            with self._load_completion_lock:
+                for req_id in request_ids:
+                    self._pending_loads.setdefault(req_id, []).append(load_state)
+                self._pending_load_reqs[shm_name] = set(request_ids)
+                self._shm_to_load_state[shm_name] = load_state
+                self._pending_load_meta[shm_name] = (time.perf_counter(), num_blocks)
+
+            groups_launched += 1
+
+        schedule_time_us = (time.perf_counter() - load_start) * 1e6
         logger.debug(
-            "[PegaKVConnector] started async load: %d blocks across %d layers for %d reqs, "
-            "schedule %.0f us, shm=%s",
-            num_blocks,
-            num_layers,
+            "[PegaKVConnector] started async load: %d groups for %d reqs, schedule %.0f us",
+            groups_launched,
             total_requests,
             schedule_time_us,
-            shm_name,
         )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -477,14 +558,39 @@ class WorkerConnector:
             ):
                 continue
 
+            # Determine which kv_cache_group this layer belongs to.
+            layer_to_group = task.metadata.layer_to_group
+            g_idx = layer_to_group.get(task.layer_name, 0) if layer_to_group else 0
+
             for save_intent in task.metadata.save_intents.values():
-                if not save_intent.block_ids:
+                if not save_intent.group_block_ids:
+                    continue
+
+                # Pick block_ids for this layer's group; fall back to group 0.
+                if g_idx < len(save_intent.group_block_ids):
+                    block_ids = save_intent.group_block_ids[g_idx]
+                else:
+                    block_ids = save_intent.group_block_ids[0]
+
+                if not block_ids:
                     continue
 
                 if task.layer_name not in saves_by_layer:
                     saves_by_layer[task.layer_name] = ([], [])
 
-                saves_by_layer[task.layer_name][0].extend(save_intent.block_ids)
+                if len(block_ids) != len(save_intent.block_hashes):
+                    logger.warning(
+                        "[PegaKVConnector] save_intent mismatch layer=%s group=%d "
+                        "block_count=%d hash_count=%d reqs=%s",
+                        task.layer_name,
+                        g_idx,
+                        len(block_ids),
+                        len(save_intent.block_hashes),
+                        task.request_ids,
+                    )
+                    continue
+
+                saves_by_layer[task.layer_name][0].extend(block_ids)
                 saves_by_layer[task.layer_name][1].extend(save_intent.block_hashes)
 
         if saves_by_layer:

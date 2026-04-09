@@ -39,8 +39,28 @@ class SchedulerConnector:
     # When this limit is reached, new save intents will be dropped (shorter first).
     MAX_PENDING_SAVE_REQUESTS: int = parse_env_int("PEGA_MAX_PENDING_SAVE_REQUESTS", 0)
 
-    def __init__(self, context: ConnectorContext):
+    def __init__(self, context: ConnectorContext, kv_cache_config=None):
         self._ctx = context
+
+        # Group layout from KVCacheConfig (populated on scheduler role only)
+        self._group_layer_names: list[list[str]] = []
+        self._layer_to_group: dict[str, int] = {}
+        self._num_groups: int = 1
+
+        if kv_cache_config is not None:
+            groups = getattr(kv_cache_config, "kv_cache_groups", None) or []
+            if groups:
+                self._num_groups = len(groups)
+                self._group_layer_names = [list(g.layer_names) for g in groups]
+                for g_idx, g in enumerate(groups):
+                    for ln in g.layer_names:
+                        self._layer_to_group[ln] = g_idx
+                logger.info(
+                    "[PegaKVConnector] KV cache groups: %d groups, layer_counts=%s, groups=%s",
+                    self._num_groups,
+                    [len(g.layer_names) for g in groups],
+                    [list(g.layer_names) for g in groups],
+                )
 
         # Load state
         self._pending_load_intents: dict[str, LoadIntent] = {}
@@ -53,8 +73,9 @@ class SchedulerConnector:
         self._bypass_count: int = 0
 
         # Save state (per-request)
+        # _allocated_blocks[req_id][g] = list of block IDs for kv_cache_group g
         self._block_hashes: dict[str, tuple[bytes, ...]] = {}
-        self._allocated_blocks: dict[str, list[int]] = {}
+        self._allocated_blocks: dict[str, list[list[int]]] = {}
         self._scheduled_tokens: dict[str, int] = {}
         self._stored_blocks: dict[str, int] = {}
 
@@ -160,26 +181,36 @@ class SchedulerConnector:
         self._stored_blocks[req_id] = 0
 
         if num_external_tokens > 0:
-            block_ids = list(blocks.get_block_ids()[0]) if blocks else []
-            # num_external_tokens is in global token space; divide by
-            # virtual_block_size to get the number of pool blocks to load.
+            # Use unhashed blocks: these are the ext_comp blocks (not yet
+            # computed locally), laid out before the new-compute blocks.
+            unhashed_groups = blocks.get_unhashed_block_ids_all_groups() if blocks else []
             num_load_blocks = num_external_tokens // self._ctx.virtual_block_size
-            start = len(block_ids) - num_load_blocks
+
+            group_block_ids: list[tuple[int, ...]] = [
+                tuple(g[:num_load_blocks]) for g in unhashed_groups
+            ]
+
+            # Block hashes start after locally-computed blocks.
+            computed_blocks = request.num_computed_tokens // self._ctx.virtual_block_size
+            load_hashes = tuple(
+                self._block_hashes[req_id][computed_blocks : computed_blocks + num_load_blocks]
+            )
 
             load_intent = LoadIntent(
-                block_ids=tuple(block_ids[start:]),
-                block_hashes=tuple(self._block_hashes[req_id][start : start + num_load_blocks]),
+                group_block_ids=tuple(group_block_ids),
+                block_hashes=load_hashes,
                 num_tokens=num_external_tokens,
             )
             self._pending_load_intents[req_id] = load_intent
             logger.info(
-                "[PegaKVConnector] req=%s alloc: total_blocks=%d load_blocks=%d "
-                "load_tokens=%d pending_loads=%d",
+                "[PegaKVConnector] req=%s alloc: computed_blocks=%d load_blocks=%d "
+                "load_tokens=%d pending_loads=%d num_groups=%d",
                 req_id,
-                len(block_ids),
-                len(load_intent.block_ids),
+                computed_blocks,
+                num_load_blocks,
                 load_intent.num_tokens,
                 len(self._pending_load_intents),
+                len(group_block_ids),
             )
 
     def build_connector_meta(self, scheduler_output: "SchedulerOutput") -> PegaConnectorMetadata:
@@ -201,8 +232,9 @@ class SchedulerConnector:
 
             # Populate block IDs from scheduler_output — single source of
             # truth for the save path (consistent with offloading connector).
+            # req.block_ids is tuple[list[int], ...]: one list per kv_cache_group.
             if req.block_ids:
-                self._allocated_blocks[req_id] = list(req.block_ids[0])
+                self._allocated_blocks[req_id] = [list(g) for g in req.block_ids]
 
             self._scheduled_tokens[req_id] += num_tokens
 
@@ -224,10 +256,14 @@ class SchedulerConnector:
             num_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
             self._scheduled_tokens[req_id] += num_tokens
 
-            # Append newly allocated blocks
+            # Append newly allocated blocks (new_block_ids: tuple[list[int], ...])
             new_block_ids = cached_reqs.new_block_ids[idx]
             if new_block_ids:
-                self._allocated_blocks[req_id].extend(new_block_ids[0])
+                for g_idx, g_ids in enumerate(new_block_ids):
+                    if g_idx < len(self._allocated_blocks[req_id]):
+                        self._allocated_blocks[req_id][g_idx].extend(g_ids)
+                    else:
+                        self._allocated_blocks[req_id].append(list(g_ids))
 
             if save_intent := self._consume_save_intent(req_id):
                 potential_saves[req_id] = save_intent
@@ -293,6 +329,8 @@ class SchedulerConnector:
             load_intents=load_intents,
             save_intents=save_intents,
             preempted_req_ids=scheduler_output.preempted_req_ids or None,
+            layer_to_group=self._layer_to_group if self._layer_to_group else None,
+            group_layer_names=self._group_layer_names if self._group_layer_names else None,
         )
 
     def _consume_save_intent(self, req_id: str) -> SaveIntent | None:
@@ -302,15 +340,24 @@ class SchedulerConnector:
         if block_hashes is None:
             return None
 
+        # allocated is list[list[int]]: one list per kv_cache_group
         allocated = self._allocated_blocks.get(req_id, [])
         scheduled = self._scheduled_tokens.get(req_id, 0)
         stored = self._stored_blocks.get(req_id, 0)
+
+        if not allocated:
+            return None
+
+        # Hybrid/SWA save semantics require a full block hash to be writable by
+        # every KV cache group. Restrict saving to the common suffix that all
+        # groups can still represent, instead of the longest group's history.
+        common_blocks_in_groups = min((len(g) for g in allocated), default=0)
 
         # Use virtual_block_size because block_hashes and allocated are both
         # at the virtual block level (1 entry per pool block).
         saveable = min(
             len(block_hashes),
-            len(allocated),
+            common_blocks_in_groups,
             scheduled // self._ctx.virtual_block_size,
         )
         new_blocks = saveable - stored
@@ -325,16 +372,20 @@ class SchedulerConnector:
         _save_hash_preview = [h.hex()[:16] for h in save_hashes[:3]]
         logger.info(
             "[PegaKVConnector] req=%s save_intent: start=%d new_blocks=%d "
-            "total_hashes=%d first_hashes=%s",
+            "total_hashes=%d first_hashes=%s num_groups=%d",
             req_id,
             start,
             new_blocks,
             len(block_hashes),
             _save_hash_preview,
+            len(allocated),
         )
 
+        group_block_ids = tuple(
+            tuple(g[start : start + new_blocks]) for g in allocated
+        )
         return SaveIntent(
-            block_ids=tuple(allocated[start : start + new_blocks]),
+            group_block_ids=group_block_ids,
             block_hashes=save_hashes,
         )
 
