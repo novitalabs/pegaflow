@@ -337,8 +337,8 @@ class WorkerConnector:
         if layer_to_group:
             # HMA mode: split layers by kv_cache_group index.
             layers_by_group: dict[int, list[str]] = {}
-            for layer_name, layer in forward_context.no_compile_layers.items():
-                if hasattr(layer, "kv_cache"):
+            for layer_name in forward_context.no_compile_layers:
+                if layer_name in self._layer_name_to_id:
                     g_idx = layer_to_group.get(layer_name, 0)
                     layers_by_group.setdefault(g_idx, []).append(layer_name)
         else:
@@ -346,8 +346,8 @@ class WorkerConnector:
             layers_by_group = {
                 0: [
                     ln
-                    for ln, layer in forward_context.no_compile_layers.items()
-                    if hasattr(layer, "kv_cache")
+                    for ln in forward_context.no_compile_layers
+                    if ln in self._layer_name_to_id
                 ]
             }
 
