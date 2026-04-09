@@ -76,18 +76,26 @@ class ConnectorContext:
 
 @dataclass(frozen=True)
 class LoadIntent:
-    """Intent for a KV load operation."""
+    """Intent for a KV load operation.
 
-    block_ids: tuple[int, ...]
+    group_block_ids[i] holds the pool slot indices for kv_cache_group i.
+    block_hashes is shared across all groups (content-based, same token range).
+    """
+
+    group_block_ids: tuple[tuple[int, ...], ...]
     block_hashes: tuple[bytes, ...]
     num_tokens: int
 
 
 @dataclass(frozen=True)
 class SaveIntent:
-    """Intent for a KV save operation."""
+    """Intent for a KV save operation.
 
-    block_ids: tuple[int, ...]
+    group_block_ids[i] holds the pool slot indices for kv_cache_group i.
+    block_hashes is shared across all groups (content-based, same token range).
+    """
+
+    group_block_ids: tuple[tuple[int, ...], ...]
     block_hashes: tuple[bytes, ...]
 
 
@@ -99,12 +107,18 @@ class PegaConnectorMetadata(KVConnectorMetadata):
         load_intents: dict[str, LoadIntent] | None = None,
         save_intents: dict[str, SaveIntent] | None = None,
         preempted_req_ids: set[str] | None = None,
+        layer_to_group: dict[str, int] | None = None,
+        group_layer_names: list[list[str]] | None = None,
     ):
         super().__init__()
         # Maps request_id -> intent
         self.load_intents: dict[str, LoadIntent] = load_intents or {}
         self.save_intents: dict[str, SaveIntent] = save_intents or {}
         self.preempted_req_ids: set[str] = preempted_req_ids or set()
+        # Maps layer_name -> kv_cache_group index (built from KVCacheConfig)
+        self.layer_to_group: dict[str, int] = layer_to_group or {}
+        # group_layer_names[i] = list of layer names in kv_cache_group i
+        self.group_layer_names: list[list[str]] = group_layer_names or []
 
     def __repr__(self) -> str:
         return (
