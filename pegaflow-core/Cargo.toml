@@ -47,6 +47,8 @@ criterion.workspace = true
 cudarc.workspace = true
 tokio.workspace = true
 tempfile = "3"
+clap.workspace = true
+hdrhistogram = "7.5.4"
 
 [[bench]]
 name = "transfer_batch"
@@ -58,6 +60,10 @@ harness = false
 
 [[bench]]
 name = "uds_latency"
+harness = false
+
+[[bench]]
+name = "uring_bench"
 harness = false
 
 [[example]]
