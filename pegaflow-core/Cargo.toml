@@ -41,14 +41,14 @@ smallvec = "1"
 pegaflow-proto = { path = "../pegaflow-proto" }
 pegaflow-transfer = { path = "../pegaflow-transfer" }
 mea = "0.6.3"
-clap.workspace = true
-hdrhistogram = "7.5.4"
 
 [dev-dependencies]
 criterion.workspace = true
 cudarc.workspace = true
 tokio.workspace = true
 tempfile = "3"
+clap.workspace = true
+hdrhistogram = "7.5.4"
 
 [[bench]]
 name = "transfer_batch"
