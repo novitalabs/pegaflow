@@ -54,9 +54,11 @@ class SchedulerConnector:
 
         # Save state (per-request)
         self._block_hashes: dict[str, tuple[bytes, ...]] = {}
+        self._external_matched_blocks: dict[str, int] = {}
+        self._block_index_offsets: dict[str, int] = {}
         self._allocated_blocks: dict[str, list[int]] = {}
         self._scheduled_tokens: dict[str, int] = {}
-        self._stored_blocks: dict[str, int] = {}
+        self._next_stored_block_idx: dict[str, int] = {}
 
         # Live Request references – used to refresh block_hashes during decode
         # so that newly completed blocks can be saved, not just prefill blocks.
@@ -85,6 +87,7 @@ class SchedulerConnector:
         remaining_hashes = block_hashes[computed_blocks:]
 
         if not remaining_hashes:
+            self._external_matched_blocks[req_id] = computed_blocks
             return (0, False)
 
         # Check if request should bypass remote cache lookup
@@ -92,6 +95,7 @@ class SchedulerConnector:
         num_remaining_blocks = len(remaining_hashes)
         pending = self._prefetch_tracker.pending_prefetches
         if num_remaining_blocks < self.BYPASS_BLOCKS and pending >= self.HIGH_LOAD_THRESHOLD:
+            self._external_matched_blocks[req_id] = computed_blocks
             self._bypass_count += 1
             logger.info(
                 "[PegaKVConnector] req=%s bypass: remaining_blocks=%d "
@@ -112,24 +116,21 @@ class SchedulerConnector:
         if hit_blocks is None:
             return (None, False)
 
+        self._external_matched_blocks[req_id] = computed_blocks + hit_blocks
+
         # Each hit block = 1 virtual block = virtual_block_size global tokens.
         num_hit_tokens = hit_blocks * self._ctx.virtual_block_size
 
-        # --- Hash diagnostic: log first 3 query hashes ---
-        _remaining_list = list(remaining_hashes)
-        _query_hash_preview = [h.hex()[:16] for h in _remaining_list[:3]]
         logger.info(
             "[PegaKVConnector] req=%s cache_lookup: hit_blocks=%d computed_blocks=%d "
-            "hit_tokens=%d num_tokens=%d lookup_us=%.0f "
-            "total_query_hashes=%d first_hashes=%s",
+            "hit_tokens=%d num_tokens=%d lookup_us=%.0f total_query_hashes=%d",
             req_id,
             hit_blocks,
             computed_blocks,
             num_hit_tokens,
             num_tokens,
             elapsed_us,
-            len(_remaining_list),
-            _query_hash_preview,
+            len(remaining_hashes),
         )
 
         if num_hit_tokens <= 0:
@@ -153,31 +154,44 @@ class SchedulerConnector:
         # (1 hash per scheduler block = block_size * dcp_world_size tokens).
         # They are 1-to-1 with block_ids from the scheduler.
         self._block_hashes[req_id] = tuple(request.block_hashes)
-        # Save-path block IDs populated by build_connector_meta from
-        # scheduler_output (single source of truth, like offloading connector).
-        self._allocated_blocks[req_id] = []
-        self._scheduled_tokens[req_id] = 0
-        self._stored_blocks[req_id] = 0
+        if req_id not in self._allocated_blocks:
+            # The first locally allocated block may be after an external-hit
+            # prefix. Track that global block index explicitly.
+            base_block_idx = self._external_matched_blocks.get(req_id, 0)
+            self._block_index_offsets[req_id] = base_block_idx
+            self._allocated_blocks[req_id] = []
+            self._scheduled_tokens[req_id] = 0
+            self._next_stored_block_idx[req_id] = base_block_idx
 
         if num_external_tokens > 0:
             block_ids = list(blocks.get_block_ids()[0]) if blocks else []
-            # num_external_tokens is in global token space; divide by
-            # virtual_block_size to get the number of pool blocks to load.
+            num_computed_blocks = (
+                sum(block.block_hash is not None for block in blocks.blocks[0]) if blocks else 0
+            )
+            start_block_idx = num_computed_blocks
             num_load_blocks = num_external_tokens // self._ctx.virtual_block_size
-            start = len(block_ids) - num_load_blocks
+            expected_load_blocks = len(block_ids) - num_computed_blocks
+            assert num_load_blocks == expected_load_blocks, (
+                f"req {req_id} load block mismatch: external={num_load_blocks} "
+                f"expected={expected_load_blocks}"
+            )
 
             load_intent = LoadIntent(
-                block_ids=tuple(block_ids[start:]),
-                block_hashes=tuple(self._block_hashes[req_id][start : start + num_load_blocks]),
+                block_ids=tuple(block_ids[start_block_idx:]),
+                block_hashes=tuple(
+                    self._block_hashes[req_id][start_block_idx : start_block_idx + num_load_blocks]
+                ),
                 num_tokens=num_external_tokens,
             )
             self._pending_load_intents[req_id] = load_intent
             logger.info(
-                "[PegaKVConnector] req=%s alloc: total_blocks=%d load_blocks=%d "
-                "load_tokens=%d pending_loads=%d",
+                "[PegaKVConnector] req=%s alloc: total_blocks=%d computed_blocks=%d "
+                "load_blocks=%d start_block_idx=%d load_tokens=%d pending_loads=%d",
                 req_id,
                 len(block_ids),
+                num_computed_blocks,
                 len(load_intent.block_ids),
+                start_block_idx,
                 load_intent.num_tokens,
                 len(self._pending_load_intents),
             )
@@ -304,37 +318,40 @@ class SchedulerConnector:
 
         allocated = self._allocated_blocks.get(req_id, [])
         scheduled = self._scheduled_tokens.get(req_id, 0)
-        stored = self._stored_blocks.get(req_id, 0)
+        base_block_idx = self._block_index_offsets.get(req_id, 0)
+        start_block_idx = self._next_stored_block_idx.get(req_id, base_block_idx)
 
-        # Use virtual_block_size because block_hashes and allocated are both
-        # at the virtual block level (1 entry per pool block).
-        saveable = min(
-            len(block_hashes),
+        # allocated only contains local blocks, but block_hashes are indexed
+        # against the full request. Convert local progress to a global block idx.
+        local_saveable = min(
             len(allocated),
             scheduled // self._ctx.virtual_block_size,
         )
-        new_blocks = saveable - stored
+        saveable_block_idx = min(len(block_hashes), base_block_idx + local_saveable)
+        new_blocks = saveable_block_idx - start_block_idx
         if new_blocks <= 0:
             return None
 
-        start = stored
-        self._stored_blocks[req_id] = stored + new_blocks
-        save_hashes = block_hashes[start : start + new_blocks]
+        self._next_stored_block_idx[req_id] = saveable_block_idx
+        local_start = start_block_idx - base_block_idx
+        hash_start = start_block_idx
+        save_hashes = block_hashes[hash_start : hash_start + new_blocks]
+        save_block_ids = allocated[local_start : local_start + new_blocks]
 
-        # --- Hash diagnostic: log first 3 save hashes ---
-        _save_hash_preview = [h.hex()[:16] for h in save_hashes[:3]]
         logger.info(
-            "[PegaKVConnector] req=%s save_intent: start=%d new_blocks=%d "
-            "total_hashes=%d first_hashes=%s",
+            "[PegaKVConnector] req=%s save_intent: start=%d hash_start=%d "
+            "base_block_idx=%d saveable_block_idx=%d new_blocks=%d total_hashes=%d",
             req_id,
-            start,
+            local_start,
+            hash_start,
+            base_block_idx,
+            saveable_block_idx,
             new_blocks,
             len(block_hashes),
-            _save_hash_preview,
         )
 
         return SaveIntent(
-            block_ids=tuple(allocated[start : start + new_blocks]),
+            block_ids=tuple(save_block_ids),
             block_hashes=save_hashes,
         )
 
@@ -372,9 +389,11 @@ class SchedulerConnector:
         """Clean up all state for a completed request."""
         self._requests.pop(req_id, None)
         self._block_hashes.pop(req_id, None)
+        self._external_matched_blocks.pop(req_id, None)
+        self._block_index_offsets.pop(req_id, None)
         self._allocated_blocks.pop(req_id, None)
         self._scheduled_tokens.pop(req_id, None)
-        self._stored_blocks.pop(req_id, None)
+        self._next_stored_block_idx.pop(req_id, None)
         self._pending_saves.discard(req_id)
 
     def _count_available_block_prefix(
