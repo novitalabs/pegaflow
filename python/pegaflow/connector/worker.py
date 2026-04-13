@@ -65,6 +65,7 @@ class WorkerConnector:
         self._torch_device: torch.device | None = None
 
         self._cross_layer_mode = False
+        self._cross_layer_key = _CROSS_LAYER_KEY
 
         self._finished_requests: set[str] = set()
 
@@ -100,8 +101,10 @@ class WorkerConnector:
         for layer_id, layer_name in enumerate(kv_caches.keys()):
             self._layer_name_to_id[layer_name] = layer_id
 
-        # Use actual number of registered layers, not model's num_hidden_layers
-        # This is important for models like DSA where indexer layers are separate
+        # Use actual number of registered layers, not model's num_hidden_layers.
+        # This is important for models like DSA where indexer layers are separate.
+        # With PP>1 each rank registers only its local layers; the Rust engine
+        # grows the instance-wide total dynamically via verify_topology.
         actual_num_layers = len(kv_caches)
 
         layout = "unknown"
@@ -177,7 +180,11 @@ class WorkerConnector:
 
     def register_cross_layers_kv_cache(self, kv_cache, attn_backend) -> None:
         self._cross_layer_mode = True
-        self.register_kv_caches({_CROSS_LAYER_KEY: kv_cache})
+        if self._ctx.pp_size > 1:
+            self._cross_layer_key = f"{_CROSS_LAYER_KEY}_pp{self._ctx.pp_rank}"
+        else:
+            self._cross_layer_key = _CROSS_LAYER_KEY
+        self.register_kv_caches({self._cross_layer_key: kv_cache})
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str] | None, set[str] | None]:
         finished_sending: set[str] | None = None
@@ -285,7 +292,7 @@ class WorkerConnector:
             return
 
         if self._cross_layer_mode:
-            target_layers = [_CROSS_LAYER_KEY]
+            target_layers = [self._cross_layer_key]
         else:
             target_layers = []
             for layer_name, layer in forward_context.no_compile_layers.items():
@@ -418,7 +425,7 @@ class WorkerConnector:
                     continue
 
                 if self._cross_layer_mode:
-                    target_layers = (_CROSS_LAYER_KEY,)
+                    target_layers = (self._cross_layer_key,)
                 else:
                     assert self._registered_layers, (
                         "KV caches must be registered before submitting save intents"

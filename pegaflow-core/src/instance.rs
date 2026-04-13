@@ -4,7 +4,13 @@
 //! multi-tenant inference instances and their associated GPU resources.
 
 use parking_lot::Mutex;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use cudarc::driver::CudaContext;
 use log::info;
@@ -216,7 +222,8 @@ pub struct InstanceContext {
     namespace: String,
 
     /// Number of transformer layers in the model.
-    num_layers: usize,
+    /// Grows via `expand_num_layers` when PP ranks register additional layers.
+    num_layers: AtomicUsize,
 
     /// Tensor parallelism degree (number of GPUs per instance).
     tp_size: usize,
@@ -250,7 +257,7 @@ impl InstanceContext {
         Ok(Self {
             _id: id,
             namespace,
-            num_layers,
+            num_layers: AtomicUsize::new(num_layers),
             tp_size,
             world_size,
             metadata: Mutex::new(LayerMetadata {
@@ -291,7 +298,7 @@ impl InstanceContext {
     ///
     /// Slots are organized as a flattened 2D array: `[layer][tp_rank]`.
     pub(crate) fn total_slots(&self) -> usize {
-        self.num_layers * self.tp_size
+        self.num_layers.load(Ordering::Relaxed) * self.tp_size
     }
 
     /// Compute the slot index for a specific layer and TP rank.
@@ -306,10 +313,11 @@ impl InstanceContext {
         layer_id: usize,
         tp_rank: usize,
     ) -> Result<usize, EngineError> {
-        if layer_id >= self.num_layers {
+        let num_layers = self.num_layers.load(Ordering::Relaxed);
+        if layer_id >= num_layers {
             return Err(EngineError::InvalidArgument(format!(
                 "layer_id {} out of range ({} layers)",
-                layer_id, self.num_layers
+                layer_id, num_layers
             )));
         }
         if tp_rank >= self.tp_size {
@@ -422,14 +430,15 @@ impl InstanceContext {
         tp_size: usize,
         world_size: usize,
     ) -> Result<(), String> {
-        if self.num_layers != num_layers || self.tp_size != tp_size || self.world_size != world_size
-        {
+        if self.tp_size != tp_size || self.world_size != world_size {
             return Err(format!(
-                "exists with layers={}, tp={}, world={}; \
-                 requested layers={}, tp={}, world={}",
-                self.num_layers, self.tp_size, self.world_size, num_layers, tp_size, world_size
+                "exists with tp={}, world={}; \
+                 requested tp={}, world={}",
+                self.tp_size, self.world_size, tp_size, world_size
             ));
         }
+        // Grow num_layers to accommodate PP ranks registering additional layers.
+        self.num_layers.fetch_max(num_layers, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -519,7 +528,11 @@ mod tests {
 
         // 4. Verify topology checking
         assert!(instance.verify_topology(64, 8, 8).is_ok());
-        assert!(instance.verify_topology(32, 8, 8).is_err()); // wrong layers
+        // num_layers can grow (PP ranks register incrementally), so smaller is ok
+        assert!(instance.verify_topology(32, 8, 8).is_ok());
+        // tp_size / world_size mismatch is still rejected
+        assert!(instance.verify_topology(64, 4, 8).is_err());
+        assert!(instance.verify_topology(64, 8, 4).is_err());
 
         // 5. Verify duplicate GPU registration fails
         let dup_caches = HashMap::from([(

@@ -38,6 +38,8 @@ class ConnectorContext:
     dcp_world_size: int = 1
     pcp_world_size: int = 1
     dcp_rank: int = 0
+    pp_rank: int = 0
+    pp_size: int = 1
 
     @property
     def virtual_block_size(self) -> int:
