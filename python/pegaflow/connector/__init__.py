@@ -13,7 +13,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorRole,
 )
-from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
+from vllm.distributed.parallel_state import get_pp_group, get_tensor_model_parallel_rank
 
 from pegaflow.connector.common import (
     ConnectorContext,
@@ -72,8 +72,12 @@ class PegaKVConnector(KVConnectorBase_V1):
         tp_rank: int | None = None
         device_id: int | None = None
         dcp_rank: int = 0
+        pp_rank: int = 0
+        pp_size: int = getattr(vllm_config.parallel_config, "pipeline_parallel_size", 1) or 1
         if role == KVConnectorRole.WORKER:
             tp_rank = get_tensor_model_parallel_rank()
+            pp_group = get_pp_group()
+            pp_rank = pp_group.rank_in_group
             if dcp_world_size > 1:
                 from vllm.distributed.parallel_state import (
                     get_decode_context_model_parallel_rank,
@@ -113,6 +117,8 @@ class PegaKVConnector(KVConnectorBase_V1):
             dcp_world_size=dcp_world_size,
             pcp_world_size=pcp_world_size,
             dcp_rank=dcp_rank,
+            pp_rank=pp_rank,
+            pp_size=pp_size,
         )
 
         self._scheduler: SchedulerConnector | None = None
@@ -124,13 +130,15 @@ class PegaKVConnector(KVConnectorBase_V1):
 
         logger.info(
             "[PegaKVConnector] Initialized role=%s instance_id=%s device=%s "
-            "tp_rank=%s tp_size=%d world_size=%d layers=%d namespace=%s "
+            "tp_rank=%s tp_size=%d pp_rank=%d pp_size=%d world_size=%d layers=%d namespace=%s "
             "is_mla=%s dcp_world_size=%d pcp_world_size=%d dcp_rank=%d",
             role.name,
             instance_id,
             device_id if device_id is not None else "cpu",
             tp_rank if tp_rank is not None else "N/A",
             tp_size,
+            pp_rank,
+            pp_size,
             world_size,
             num_layers,
             namespace,
