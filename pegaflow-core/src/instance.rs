@@ -429,7 +429,7 @@ impl InstanceContext {
     /// Returns `Ok(())` if matches, or an error message describing the mismatch.
     pub(crate) fn verify_topology(
         &self,
-        num_layers: usize,
+        _num_layers: usize,
         tp_size: usize,
         world_size: usize,
     ) -> Result<(), String> {
