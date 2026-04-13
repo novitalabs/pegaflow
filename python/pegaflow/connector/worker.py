@@ -101,13 +101,11 @@ class WorkerConnector:
         for layer_id, layer_name in enumerate(kv_caches.keys()):
             self._layer_name_to_id[layer_name] = layer_id
 
-        # Instance-wide layer count that all PP ranks must agree on.
-        # Cross-layer: each PP rank registers one synthetic layer → pp_size.
-        # Per-layer: use the model's total hidden layers regardless of PP split.
-        if self._cross_layer_mode:
-            actual_num_layers = self._ctx.pp_size
-        else:
-            actual_num_layers = self._ctx.num_layers
+        # Use actual number of registered layers, not model's num_hidden_layers.
+        # This is important for models like DSA where indexer layers are separate.
+        # With PP>1 each rank registers only its local layers; the Rust engine
+        # grows the instance-wide total dynamically via verify_topology.
+        actual_num_layers = len(kv_caches)
 
         layout = "unknown"
 

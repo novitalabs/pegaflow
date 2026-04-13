@@ -158,16 +158,25 @@ impl Engine for GrpcEngineService {
 
             let num_layers = Self::usize_from_u32(req.num_layers, "num_layers")?;
 
-            // Validate array lengths match num_layers
-            if req.layer_names.len() != num_layers
-                || req.wrapper_bytes.len() != num_layers
-                || req.num_blocks.len() != num_layers
-                || req.bytes_per_block.len() != num_layers
-                || req.kv_stride_bytes.len() != num_layers
-                || req.segments.len() != num_layers
+            // Validate array lengths are consistent with each other.
+            // Note: num_layers is the *instance-wide* total (used for topology),
+            // which may exceed the local batch size when pipeline parallelism
+            // splits layers across ranks.
+            let batch_len = req.layer_names.len();
+            if batch_len == 0
+                || req.wrapper_bytes.len() != batch_len
+                || req.num_blocks.len() != batch_len
+                || req.bytes_per_block.len() != batch_len
+                || req.kv_stride_bytes.len() != batch_len
+                || req.segments.len() != batch_len
             {
                 return Err(Status::invalid_argument(format!(
-                    "all layer arrays must have length {num_layers}"
+                    "all layer arrays must have the same non-zero length (got layer_names={batch_len})"
+                )));
+            }
+            if batch_len > num_layers {
+                return Err(Status::invalid_argument(format!(
+                    "layer batch size {batch_len} exceeds instance num_layers {num_layers}"
                 )));
             }
 
