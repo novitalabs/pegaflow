@@ -364,22 +364,19 @@ class WorkerConnector:
                 self._ctx.tp_rank,
                 request_ids,
             )
+            with self._save_completion_lock:
+                for req_id in request_ids:
+                    self._req_pending_saves.add(req_id)
             self._complete_save_requests(request_ids)
             return
 
         with self._save_completion_lock:
-            wait_events: list[threading.Event] = []
             for req_id in request_ids:
                 if req_id not in self._req_pending_saves:
                     self._req_pending_saves.add(req_id)
                     self._save_completion_events[req_id] = threading.Event()
-                event = self._save_completion_events.get(req_id)
-                if event is not None:
-                    wait_events.append(event)
 
         self._save_queue.put(SaveTask(metadata=metadata, request_ids=request_ids))
-        for event in wait_events:
-            event.wait()
 
     def _save_worker(self) -> None:
         logger.info("[PegaKVConnector] Save worker thread started")
