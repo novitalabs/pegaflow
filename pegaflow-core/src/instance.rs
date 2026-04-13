@@ -283,6 +283,9 @@ impl InstanceContext {
         let id = metadata.names.len();
         metadata.names.push(layer_name.to_string());
         metadata.name_to_id.insert(layer_name.to_string(), id);
+        // Grow num_layers to cover the newly allocated layer ID so that
+        // total_slots() and get_slot_index() stay in bounds.
+        self.num_layers.fetch_max(id + 1, Ordering::Relaxed);
         id
     }
 
@@ -437,8 +440,8 @@ impl InstanceContext {
                 self.tp_size, self.world_size, tp_size, world_size
             ));
         }
-        // Grow num_layers to accommodate PP ranks registering additional layers.
-        self.num_layers.fetch_max(num_layers, Ordering::Relaxed);
+        // num_layers grows automatically in get_or_allocate_layer_id
+        // when PP ranks register new layers, so no check needed here.
         Ok(())
     }
 }
