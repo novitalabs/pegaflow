@@ -31,8 +31,6 @@ _CROSS_LAYER_KEY = "ALL_LAYERS"
 
 @dataclass
 class SaveTask:
-    layer_name: str
-    attn_metadata: "AttentionMetadata"
     metadata: PegaConnectorMetadata
     request_ids: list[str]
 
@@ -49,12 +47,11 @@ class WorkerConnector:
         )
         self._save_thread.start()
 
-        self._req_pending_layers: dict[str, int] = {}
+        self._req_pending_saves: set[str] = set()
         self._completed_saves: set[str] = set()
         self._save_completion_lock = threading.Lock()
         self._save_completion_events: dict[str, threading.Event] = {}
-
-        self._current_save_intents: set[str] = set()
+        self._current_metadata: PegaConnectorMetadata | None = None
 
         self._pending_loads: dict[str, PyLoadState] = {}
         self._pending_load_reqs: dict[str, set[str]] = {}
@@ -68,7 +65,6 @@ class WorkerConnector:
         self._torch_device: torch.device | None = None
 
         self._cross_layer_mode = False
-        self._cross_layer_pending_save: SaveTask | None = None
 
         self._finished_requests: set[str] = set()
 
@@ -189,7 +185,7 @@ class WorkerConnector:
 
         with self._save_completion_lock:
             # 1. Add newly finished requests (if they have pending saves) to tracking
-            self._finished_requests.update(finished_req_ids & self._req_pending_layers.keys())
+            self._finished_requests.update(finished_req_ids & self._req_pending_saves)
             # 2. Identify requests whose saves have completed
             done_saves = self._completed_saves & self._finished_requests
             done_saves.update(self._completed_saves & finished_req_ids)
@@ -268,7 +264,7 @@ class WorkerConnector:
         forward_context: "ForwardContext",
         **kwargs: Any,
     ) -> None:
-        self._current_save_intents = set(metadata.save_intents.keys())
+        self._current_metadata = metadata
 
         if not metadata.load_intents:
             return
@@ -349,92 +345,41 @@ class WorkerConnector:
         attn_metadata: "AttentionMetadata",
         **kwargs: Any,
     ) -> None:
-        if self._cross_layer_mode:
-            # Defer actual save to wait_for_save when all layers are computed.
-            # Only capture metadata on the first layer call per forward pass.
-            if self._cross_layer_pending_save is None:
-                request_ids = list(metadata.save_intents.keys())
-                if request_ids:
-                    self._cross_layer_pending_save = SaveTask(
-                        layer_name=_CROSS_LAYER_KEY,
-                        attn_metadata=attn_metadata,
-                        metadata=metadata,
-                        request_ids=request_ids,
-                    )
+        # Save is metadata-driven and submitted from wait_for_save() outside
+        # layer callbacks so CUDA graph replay cannot suppress it.
+        pass
+
+    def wait_for_save(self) -> None:
+        metadata = self._current_metadata
+        self._current_metadata = None
+        if metadata is None or not metadata.save_intents:
             return
 
         request_ids = list(metadata.save_intents.keys())
-        if not request_ids:
-            return
 
-        with self._save_completion_lock:
-            for req_id in request_ids:
-                if req_id not in self._req_pending_layers:
-                    # Initialize tracking for new request
-                    self._req_pending_layers[req_id] = len(self._registered_layers)
-                    self._save_completion_events[req_id] = threading.Event()
-
-        self._save_queue.put(
-            SaveTask(
-                layer_name=layer_name,
-                attn_metadata=attn_metadata,
-                metadata=metadata,
-                request_ids=request_ids,
-            )
-        )
-
-    def wait_for_save(self) -> None:
-        skipped_requests: set[str] = set()
-
-        if self._cross_layer_mode:
-            task = self._cross_layer_pending_save
-            self._cross_layer_pending_save = None
-            if task:
-                with self._save_completion_lock:
-                    for req_id in task.request_ids:
-                        if req_id not in self._req_pending_layers:
-                            self._req_pending_layers[req_id] = 1
-                            self._save_completion_events[req_id] = threading.Event()
-                self._save_queue.put(task)
-            else:
-                with self._save_completion_lock:
-                    pending_layers = set(self._req_pending_layers.keys())
-                    skipped_requests = self._current_save_intents - pending_layers
-                    if skipped_requests:
-                        self._completed_saves.update(skipped_requests)
-            self._current_save_intents = set()
-            if skipped_requests:
-                logger.debug(
-                    "[PegaKVConnector] Detected %d skipped cross-layer saves (CUDA graph): %s",
-                    len(skipped_requests),
-                    skipped_requests,
-                )
-                self._handle_save_completion(skipped_requests, reason="CUDA graph skip")
-            return
-
-        with self._save_completion_lock:
-            pending_layers = set(self._req_pending_layers.keys())
-            skipped_requests = self._current_save_intents - pending_layers
-
-            if skipped_requests:
-                self._completed_saves.update(skipped_requests)
-
-            self._current_save_intents = set()
-
-            pending_reqs = len(self._req_pending_layers)
-            if pending_reqs > 0:
-                logger.debug(
-                    "[PegaKVConnector] %d requests still have pending layer saves",
-                    pending_reqs,
-                )
-
-        if skipped_requests:
+        if self._should_skip_save_submission():
             logger.debug(
-                "[PegaKVConnector] Detected %d skipped saves (CUDA graph): %s",
-                len(skipped_requests),
-                skipped_requests,
+                "[PegaKVConnector] Skipping save submission on non-zero TP rank for MLA "
+                "without DCP: tp_rank=%s reqs=%s",
+                self._ctx.tp_rank,
+                request_ids,
             )
-            self._handle_save_completion(skipped_requests, reason="CUDA graph skip")
+            self._complete_save_requests(request_ids)
+            return
+
+        with self._save_completion_lock:
+            wait_events: list[threading.Event] = []
+            for req_id in request_ids:
+                if req_id not in self._req_pending_saves:
+                    self._req_pending_saves.add(req_id)
+                    self._save_completion_events[req_id] = threading.Event()
+                event = self._save_completion_events.get(req_id)
+                if event is not None:
+                    wait_events.append(event)
+
+        self._save_queue.put(SaveTask(metadata=metadata, request_ids=request_ids))
+        for event in wait_events:
+            event.wait()
 
     def _save_worker(self) -> None:
         logger.info("[PegaKVConnector] Save worker thread started")
@@ -471,21 +416,24 @@ class WorkerConnector:
         for task in batch:
             all_request_ids.extend(task.request_ids)
 
-            if (
-                getattr(task.attn_metadata, "block_table", None) is None
-                and getattr(task.attn_metadata, "slot_mapping", None) is None
-            ):
-                continue
-
             for save_intent in task.metadata.save_intents.values():
                 if not save_intent.block_ids:
                     continue
 
-                if task.layer_name not in saves_by_layer:
-                    saves_by_layer[task.layer_name] = ([], [])
+                if self._cross_layer_mode:
+                    target_layers = (_CROSS_LAYER_KEY,)
+                else:
+                    assert self._registered_layers, (
+                        "KV caches must be registered before submitting save intents"
+                    )
+                    target_layers = tuple(self._registered_layers)
 
-                saves_by_layer[task.layer_name][0].extend(save_intent.block_ids)
-                saves_by_layer[task.layer_name][1].extend(save_intent.block_hashes)
+                for layer_name in target_layers:
+                    if layer_name not in saves_by_layer:
+                        saves_by_layer[layer_name] = ([], [])
+
+                    saves_by_layer[layer_name][0].extend(save_intent.block_ids)
+                    saves_by_layer[layer_name][1].extend(save_intent.block_hashes)
 
         if saves_by_layer:
             # Ensure all GPU kernels have completed before reading KV cache
@@ -530,27 +478,21 @@ class WorkerConnector:
             with self._stats_lock:
                 self._stats.record_save(save_duration, total_blocks, success)
 
-        # Always decrement layer counter to release blocks, even if save failed
-        self._decrement_layer_counter(all_request_ids)
+        # Always complete the request save lifecycle, even if save failed.
+        self._complete_save_requests(all_request_ids)
 
-    def _decrement_layer_counter(self, request_ids: list[str]) -> None:
+    def _complete_save_requests(self, request_ids: list[str]) -> None:
         completed_reqs: list[str] = []
 
         with self._save_completion_lock:
             for req_id in request_ids:
-                if req_id in self._req_pending_layers:
-                    self._req_pending_layers[req_id] -= 1
-                    assert self._req_pending_layers[req_id] >= 0, (
-                        f"Layer count mismatch for request {req_id}: counter went negative"
-                    )
-
-                    if self._req_pending_layers[req_id] == 0:
-                        self._completed_saves.add(req_id)
-                        del self._req_pending_layers[req_id]
-                        completed_reqs.append(req_id)
-                        event = self._save_completion_events.pop(req_id, None)
-                        if event:
-                            event.set()
+                if req_id in self._req_pending_saves:
+                    self._req_pending_saves.discard(req_id)
+                    self._completed_saves.add(req_id)
+                    completed_reqs.append(req_id)
+                    event = self._save_completion_events.pop(req_id, None)
+                    if event:
+                        event.set()
 
         self._handle_save_completion(completed_reqs)
 
@@ -562,14 +504,15 @@ class WorkerConnector:
             return
 
         suffix = "" if not reason else f" ({reason})"
-        layer_count = len(self._registered_layers)
         for req_id in req_list:
             logger.debug(
-                "[PegaKVConnector] Request %s all %d layers saved%s",
+                "[PegaKVConnector] Request %s save completed%s",
                 req_id,
-                layer_count,
                 suffix,
             )
+
+    def _should_skip_save_submission(self) -> bool:
+        return self._ctx.is_mla and self._ctx.dcp_world_size == 1 and (self._ctx.tp_rank or 0) != 0
 
     def handle_preemptions(self, preempted_req_ids: set[str] | None) -> None:
         """Wait for preempted requests' saves to complete before blocks are reused.
@@ -608,7 +551,7 @@ class WorkerConnector:
         with self._stats_lock:
             # Add current queue depth as gauge
             with self._save_completion_lock:
-                self._stats.data["pending_save_requests"] = len(self._req_pending_layers)
+                self._stats.data["pending_save_requests"] = len(self._req_pending_saves)
 
             if self._stats.is_empty():
                 return None

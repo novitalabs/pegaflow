@@ -163,12 +163,10 @@ class PegaKVConnector(KVConnectorBase_V1):
         attn_metadata,
         **kwargs: Any,
     ) -> None:
-        if not self._worker:
-            return
-        metadata = self._get_connector_metadata()
-        if metadata is None:
-            return
-        self._worker.save_kv_layer(metadata, layer_name, kv_layer, attn_metadata, **kwargs)
+        # Save is submitted from wait_for_save() using scheduler metadata.
+        # Layer callbacks are intentionally ignored so CUDA graph replay
+        # cannot suppress save submission.
+        pass
 
     def wait_for_save(self) -> None:
         if not self._worker:
