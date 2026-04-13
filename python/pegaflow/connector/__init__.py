@@ -58,6 +58,7 @@ class PegaKVConnector(KVConnectorBase_V1):
                 dcp_world_size,
             )
 
+        pp_size: int = getattr(vllm_config.parallel_config, "pipeline_parallel_size", 1) or 1
         cross_layer_blocks = os.environ.get("PEGAFLOW_CROSS_LAYER_BLOCKS", "1") == "1"
         namespace = derive_namespace(
             vllm_config,
@@ -65,6 +66,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             dcp_world_size,
             pcp_world_size,
             cross_layer_blocks=cross_layer_blocks,
+            pp_size=pp_size,
         )
         num_layers = getattr(vllm_config.model_config.hf_text_config, "num_hidden_layers", 0)
         block_size = vllm_config.cache_config.block_size
@@ -73,7 +75,6 @@ class PegaKVConnector(KVConnectorBase_V1):
         device_id: int | None = None
         dcp_rank: int = 0
         pp_rank: int = 0
-        pp_size: int = getattr(vllm_config.parallel_config, "pipeline_parallel_size", 1) or 1
         if role == KVConnectorRole.WORKER:
             tp_rank = get_tensor_model_parallel_rank()
             pp_group = get_pp_group()

@@ -175,6 +175,7 @@ def derive_namespace(
     dcp_world_size: int = 1,
     pcp_world_size: int = 1,
     cross_layer_blocks: bool = False,
+    pp_size: int = 1,
 ) -> str:
     """
     Derive namespace for storage isolation.
@@ -197,6 +198,7 @@ def derive_namespace(
         "dcp_world_size": dcp_world_size,
         "pcp_world_size": pcp_world_size,
         "cross_layer_blocks": cross_layer_blocks,
+        "pp_size": pp_size,
     }
 
     factor_str = str(sorted(factors.items()))

@@ -82,7 +82,7 @@ class WorkerConnector:
         if not self._registered_layers:
             return
 
-        if self._ctx.tp_rank == 0:
+        if self._ctx.tp_rank == 0 and self._ctx.pp_rank == 0:
             ok, message = self._ctx.engine_client.unregister_context(self._ctx.instance_id)
             if not ok:
                 logger.warning("[PegaKVConnector] Unregister context failed: %s", message)
