@@ -321,8 +321,10 @@ class SchedulerConnector:
         base_block_idx = self._block_index_offsets.get(req_id, 0)
         start_block_idx = self._next_stored_block_idx.get(req_id, base_block_idx)
 
-        # allocated only contains local blocks, but block_hashes are indexed
-        # against the full request. Convert local progress to a global block idx.
+        # _allocated_blocks tracks request block IDs in global request order.
+        # In external-hit cases, the prefix-loaded block IDs are still present at
+        # the front, so save intents must slice by global block index rather than
+        # rebasing to a local-only view.
         local_saveable = min(
             len(allocated),
             scheduled // self._ctx.virtual_block_size,
@@ -333,16 +335,15 @@ class SchedulerConnector:
             return None
 
         self._next_stored_block_idx[req_id] = saveable_block_idx
-        local_start = start_block_idx - base_block_idx
         hash_start = start_block_idx
         save_hashes = block_hashes[hash_start : hash_start + new_blocks]
-        save_block_ids = allocated[local_start : local_start + new_blocks]
+        save_block_ids = allocated[hash_start : hash_start + new_blocks]
 
         logger.info(
             "[PegaKVConnector] req=%s save_intent: start=%d hash_start=%d "
             "base_block_idx=%d saveable_block_idx=%d new_blocks=%d total_hashes=%d",
             req_id,
-            local_start,
+            hash_start,
             hash_start,
             base_block_idx,
             saveable_block_idx,

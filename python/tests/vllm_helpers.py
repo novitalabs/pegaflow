@@ -53,6 +53,12 @@ class VLLMServer:
         env = os.environ.copy()
         env["VLLM_BATCH_INVARIANT"] = "1"
 
+        # Resolve vllm binary from the current Python environment's bin dir
+        import sys
+
+        venv_bin = str(Path(sys.executable).parent)
+        env["PATH"] = venv_bin + ":" + env.get("PATH", "")
+
         cmd = [
             "vllm",
             "serve",
@@ -93,6 +99,7 @@ class VLLMServer:
                 stdout=self.log_handle,
                 stderr=subprocess.STDOUT,
                 env=env,
+                preexec_fn=os.setsid,
             )
         else:
             self.process = subprocess.Popen(
@@ -100,23 +107,24 @@ class VLLMServer:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 env=env,
+                preexec_fn=os.setsid,
             )
 
         self._wait_for_ready()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Stop the vLLM server."""
+        """Stop the vLLM server and all child processes."""
         if self.process:
             server_label = "PegaFlow" if self.use_pegaflow else "Baseline"
             print(f"\n[{server_label}] Stopping vLLM server...")
-            self.process.send_signal(signal.SIGTERM)
             try:
+                os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
                 self.process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                print("Server didn't stop gracefully, forcing...")
-                self.process.kill()
-                self.process.wait()
+            except (subprocess.TimeoutExpired, ProcessLookupError, OSError):
+                if self.process:
+                    os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
+                    self.process.wait(timeout=5)
             print("Server stopped.\n")
 
         if self.log_handle:
