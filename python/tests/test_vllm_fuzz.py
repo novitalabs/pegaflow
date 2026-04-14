@@ -123,36 +123,6 @@ def generate_access_sequence(
     return sequence
 
 
-@pytest.fixture(scope="module")
-def model(request) -> str:
-    """Get model from command line or use default."""
-    return request.config.getoption("--model")
-
-
-@pytest.fixture(scope="module")
-def base_port(request) -> int:
-    """Get base port from command line."""
-    return request.config.getoption("--e2e-port")
-
-
-@pytest.fixture(scope="module")
-def pega_metrics_port(request) -> int:
-    """Get PegaFlow metrics port from command line."""
-    return request.config.getoption("--pega-metrics-port")
-
-
-@pytest.fixture(scope="module")
-def tensor_parallel_size(request) -> int:
-    """Get tensor parallel size from command line."""
-    return request.config.getoption("--tensor-parallel-size")
-
-
-@pytest.fixture(scope="module")
-def pipeline_parallel_size(request) -> int:
-    """Get pipeline parallel size from command line."""
-    return request.config.getoption("--pipeline-parallel-size")
-
-
 @pytest.mark.fuzz
 class TestFuzzCorrectness:
     """Fuzz tests for PegaFlow using Zipf-distributed ShareGPT prompts."""
