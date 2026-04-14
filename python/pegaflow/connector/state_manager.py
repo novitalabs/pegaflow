@@ -1,8 +1,9 @@
 """
 Simple service state management for PegaFlow connector fault tolerance.
 
-When Query fails, marks service unavailable and starts health check.
-All operations bypass connector until service recovers.
+Current implementation scope:
+- scheduler query path can bypass remote lookup while service is unavailable
+- worker load/save paths do not consult this state
 """
 
 import threading
@@ -22,7 +23,7 @@ class ServiceStateManager:
     Simple service state manager with health checking.
 
     When service becomes unavailable:
-    - Query bypass the connector
+    - Scheduler query bypasses remote lookup
     - Background thread checks health periodically
     - Service recovers when health check passes
     """

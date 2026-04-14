@@ -14,11 +14,9 @@ Covers all critical KV cache paths in one deterministic test:
 - Cache metrics (directional assertions)
 
 Usage:
-    # Requires pegaflow-server running with metrics enabled:
-    cargo run -r --bin pegaflow-server -- \
-        --addr 0.0.0.0:50055 --device 0 --pool-size 30gb --http-addr 0.0.0.0:9091
+    pytest python/tests/test_vllm_e2e_correctness.py -v -s
 
-    cd python && pytest tests/test_vllm_e2e_correctness.py -v -s
+    pegaflow-server is auto-started (via cargo run -r) and stopped by the test.
 """
 
 from __future__ import annotations
@@ -28,9 +26,9 @@ from pathlib import Path
 import pytest
 
 from .vllm_helpers import (
+    PegaFlowServer,
     VLLMServer,
     call_openai_api,
-    check_pegaflow_server,
     fetch_pegaflow_metrics,
 )
 
@@ -224,6 +222,12 @@ class TestE2ECorrectness:
         return tmp_path_factory.mktemp("e2e_logs")
 
     @pytest.fixture(scope="class")
+    def pegaflow_server(self, log_dir: Path):
+        """Auto-start pegaflow-server with prometheus metrics."""
+        with PegaFlowServer(log_file=log_dir / "pegaflow-server.log") as server:
+            yield server
+
+    @pytest.fixture(scope="class")
     def baseline_outputs(
         self,
         model: str,
@@ -259,19 +263,13 @@ class TestE2ECorrectness:
         self,
         model: str,
         base_port: int,
-        pega_metrics_port: int,
+        pegaflow_server: PegaFlowServer,
         log_dir: Path,
         tensor_parallel_size: int,
         pipeline_parallel_size: int,
         max_model_len: int | None,
     ) -> dict:
         """Phase 2: run execution plan through PegaFlow vLLM."""
-        if not check_pegaflow_server(pega_metrics_port):
-            pytest.skip(
-                f"PegaFlow server not reachable (metrics port {pega_metrics_port}). "
-                "Start with --http-addr flag."
-            )
-
         print("[Phase 2] PegaFlow vLLM — executing cache plan")
         pega_port = base_port + 1
         outputs: dict[str, str] = {}
@@ -280,19 +278,21 @@ class TestE2ECorrectness:
             model,
             pega_port,
             use_pegaflow=True,
+            pegaflow_port=pegaflow_server.grpc_port,
             log_file=log_dir / "pegaflow.log",
             tensor_parallel_size=tensor_parallel_size,
             pipeline_parallel_size=pipeline_parallel_size,
             max_model_len=max_model_len,
         ):
-            metrics_start = fetch_pegaflow_metrics(pega_metrics_port)
+            metrics_port = pegaflow_server.metrics_port
+            metrics_start = fetch_pegaflow_metrics(metrics_port)
 
             for label, prompt, expectation in EXECUTION_PLAN:
                 result = call_openai_api(pega_port, model, prompt)
                 outputs[label] = result["text"]
                 print(f"  [{label}] ({expectation}) {len(result['text'])} chars")
 
-            metrics_end = fetch_pegaflow_metrics(pega_metrics_port)
+            metrics_end = fetch_pegaflow_metrics(metrics_port)
 
         print("[Phase 2] Done\n")
         return {
@@ -370,11 +370,8 @@ class TestE2ECorrectness:
         """Multi-round decode R3 — extends R2 context, deeper partial hit."""
         self._assert_match(baseline_outputs, pegaflow_results, "multi_r3")
 
-    def test_cache_metrics(self, pegaflow_results, pega_metrics_port):
+    def test_cache_metrics(self, pegaflow_results):
         """Directional cache metrics — saves happened on cold, hits on warm/partial."""
-        if not check_pegaflow_server(pega_metrics_port):
-            pytest.skip("PegaFlow metrics not available")
-
         m_start = pegaflow_results["metrics_start"]
         m_end = pegaflow_results["metrics_end"]
 

@@ -24,6 +24,15 @@ Run all CI checks locally before committing:
 ./scripts/check.sh       # Run fmt, typos, clippy, and cargo check
 ```
 
+### E2E Correctness Test
+
+```bash
+pytest python/tests/test_vllm_e2e_correctness.py -v -s
+pytest python/tests/test_vllm_e2e_correctness.py -v -s --model /path/to/model --max-model-len 4096
+```
+
+pegaflow-server is auto-started via `cargo run -r` and stopped by the test. No manual setup needed.
+
 ### Running Benchmarks
 
 ```bash

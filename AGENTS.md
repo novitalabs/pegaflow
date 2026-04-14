@@ -85,6 +85,15 @@ Notes:
 - `prek` is the local check entrypoint.
 - `prek run` will fail on `master` or `main` because of the `no-commit-to-branch` hook in `prek.toml`.
 
+### E2E Correctness Test
+
+```bash
+pytest python/tests/test_vllm_e2e_correctness.py -v -s
+pytest python/tests/test_vllm_e2e_correctness.py -v -s --model /path/to/model --max-model-len 4096
+```
+
+pegaflow-server is auto-started via `cargo run -r` and stopped by the test. No manual setup needed.
+
 ### Benchmarks and Examples
 
 ```bash

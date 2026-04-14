@@ -81,7 +81,8 @@ class SchedulerConnector:
         block_hashes = request.block_hashes
 
         # request.block_hashes are already at virtual_block_size granularity
-        # (vLLM hashes every scheduler_block_size = block_size * dcp tokens).
+        # (vLLM hashes every scheduler_block_size =
+        # block_size * dcp_world_size * pcp_world_size).
         # Skip blocks that are already computed locally.
         computed_blocks = num_computed_tokens // self._ctx.virtual_block_size
         remaining_hashes = block_hashes[computed_blocks:]
@@ -151,7 +152,8 @@ class SchedulerConnector:
         self._requests[req_id] = request
 
         # request.block_hashes are already at virtual_block_size granularity
-        # (1 hash per scheduler block = block_size * dcp_world_size tokens).
+        # (1 hash per scheduler block =
+        # block_size * dcp_world_size * pcp_world_size tokens).
         # They are 1-to-1 with block_ids from the scheduler.
         self._block_hashes[req_id] = tuple(request.block_hashes)
         if req_id not in self._allocated_blocks:
