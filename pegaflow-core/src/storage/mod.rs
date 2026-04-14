@@ -389,6 +389,15 @@ impl StorageEngine {
                 break;
             }
 
+            // Notify MetaServer that evicted blocks are no longer available for RDMA fetch.
+            if let Some(client) = &self.metaserver_client {
+                let entries: Vec<(String, Vec<u8>)> = evicted
+                    .iter()
+                    .map(|(key, _)| (key.namespace.clone(), key.hash.clone()))
+                    .collect();
+                client.try_unregister(entries);
+            }
+
             let mut batch_bytes = 0u64;
             let mut still_referenced = 0u64;
             for (_key, block) in &evicted {

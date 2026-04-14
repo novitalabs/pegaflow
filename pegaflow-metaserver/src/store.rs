@@ -69,6 +69,39 @@ impl BlockHashStore {
         inserted
     }
 
+    /// Remove hashes owned by the given node (conditional delete).
+    /// Only removes an entry if its current owner matches `node`, preventing
+    /// races where node A evicts but node B has since re-registered the same block.
+    /// Returns the number of removed entries.
+    pub async fn remove_hashes(&self, namespace: &str, hashes: &[Vec<u8>], node: &str) -> usize {
+        use moka::ops::compute::Op;
+        let node: Arc<str> = Arc::from(node);
+        let mut removed = 0;
+        for hash in hashes {
+            let key = BlockKey::new(namespace.to_string(), hash.clone());
+            let node_clone = Arc::clone(&node);
+            let result = self
+                .cache
+                .entry(key)
+                .and_compute_with(|maybe_entry| {
+                    let node_clone = Arc::clone(&node_clone);
+                    async move {
+                        match maybe_entry {
+                            Some(entry) if entry.value().as_ref() == node_clone.as_ref() => {
+                                Op::Remove
+                            }
+                            _ => Op::Nop,
+                        }
+                    }
+                })
+                .await;
+            if matches!(result, moka::ops::compute::CompResult::Removed(_)) {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
     /// Query the longest prefix of `hashes` that exists in the store.
     /// Stops at the first hash not found on any node.
     pub async fn query_prefix(&self, namespace: &str, hashes: &[Vec<u8>]) -> Vec<CrossNodeBlock> {
@@ -226,6 +259,87 @@ mod tests {
         // Some entries should have been evicted (LRU)
         let existing = store.query_prefix(namespace, &hashes).await;
         assert!(existing.len() < 100, "Expected some entries to be evicted");
+    }
+
+    #[tokio::test]
+    async fn test_remove_own_blocks() {
+        let store = BlockHashStore::new();
+        let namespace = "model-a";
+        let hash = vec![1, 2, 3, 4];
+
+        store.insert_hashes(namespace, &[hash.clone()], "node-a").await;
+        store.run_pending_tasks().await;
+
+        // owner matches → should remove
+        let removed = store.remove_hashes(namespace, &[hash.clone()], "node-a").await;
+        assert_eq!(removed, 1);
+        store.run_pending_tasks().await;
+        assert_eq!(store.query_prefix(namespace, &[hash]).await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_remove_other_nodes_block_is_noop() {
+        let store = BlockHashStore::new();
+        let namespace = "model-a";
+        let hash = vec![1, 2, 3, 4];
+
+        store.insert_hashes(namespace, &[hash.clone()], "node-b").await;
+        store.run_pending_tasks().await;
+
+        // owner does not match → should not remove
+        let removed = store.remove_hashes(namespace, &[hash.clone()], "node-a").await;
+        assert_eq!(removed, 0);
+        store.run_pending_tasks().await;
+        assert_eq!(store.query_prefix(namespace, &[hash]).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_remove_nonexistent_is_noop() {
+        let store = BlockHashStore::new();
+
+        let removed = store
+            .remove_hashes("ns", &[vec![9, 9, 9]], "node-a")
+            .await;
+        assert_eq!(removed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_insert_and_remove() {
+        let store = Arc::new(BlockHashStore::new());
+        let hash = vec![1, 2, 3, 4];
+
+        for _ in 0..100 {
+            // Reset: node-a owns the block
+            store.insert_hashes("ns", &[hash.clone()], "node-a").await;
+            store.run_pending_tasks().await;
+
+            let store_a = Arc::clone(&store);
+            let store_b = Arc::clone(&store);
+            let hash_a = hash.clone();
+            let hash_b = hash.clone();
+
+            tokio::join!(
+                async move {
+                    store_a.remove_hashes("ns", &[hash_a], "node-a").await;
+                },
+                async move {
+                    store_b.insert_hashes("ns", &[hash_b], "node-b").await;
+                },
+            );
+
+            store.run_pending_tasks().await;
+
+            // Both operations completed. insert always runs to completion, so:
+            // 1. remove first → node-b inserts after → key exists, owner=node-b
+            // 2. insert first → remove sees owner=node-b, skips → key exists, owner=node-b
+            let existing = store.query_prefix("ns", &[hash.clone()]).await;
+            assert_eq!(existing.len(), 1, "key must exist after concurrent insert+remove");
+            assert_eq!(
+                existing[0].node.as_ref(),
+                "node-b",
+                "owner must be node-b"
+            );
+        }
     }
 
     #[tokio::test]

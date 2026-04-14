@@ -195,6 +195,19 @@ message InsertBlockHashesResponse {
   uint64 inserted_count = 2;
 }
 
+message RemoveBlockHashesRequest {
+  string namespace = 1;
+  repeated bytes block_hashes = 2;
+  // Only remove entries whose current owner matches this node address.
+  // Prevents races where node A evicts but node B has since re-registered.
+  string node = 3;
+}
+
+message RemoveBlockHashesResponse {
+  ResponseStatus status = 1;
+  uint64 removed_count = 2;
+}
+
 message QueryPrefixBlocksRequest {
   string namespace = 1;
   repeated bytes block_hashes = 2;  // ordered by prefix position
@@ -211,6 +224,7 @@ message QueryPrefixBlocksResponse {
 
 service MetaServer {
   rpc InsertBlockHashes(InsertBlockHashesRequest) returns (InsertBlockHashesResponse);
+  rpc RemoveBlockHashes(RemoveBlockHashesRequest) returns (RemoveBlockHashesResponse);
   rpc QueryPrefixBlocks(QueryPrefixBlocksRequest) returns (QueryPrefixBlocksResponse);
   rpc Health(HealthRequest) returns (HealthResponse);
   rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
