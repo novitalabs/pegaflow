@@ -7,6 +7,7 @@ import json
 import os
 import re
 import signal
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -24,6 +25,7 @@ class VLLMServer:
         model: str,
         port: int,
         use_pegaflow: bool = False,
+        pegaflow_port: int | None = None,
         log_file: Path | None = None,
         max_model_len: int | None = None,
         tensor_parallel_size: int = 1,
@@ -32,6 +34,7 @@ class VLLMServer:
         self.model = model
         self.port = port
         self.use_pegaflow = use_pegaflow
+        self.pegaflow_port = pegaflow_port
         self.log_file = log_file
         self.max_model_len = max_model_len
         self.tensor_parallel_size = tensor_parallel_size
@@ -52,6 +55,9 @@ class VLLMServer:
 
         env = os.environ.copy()
         env["VLLM_BATCH_INVARIANT"] = "1"
+
+        if self.use_pegaflow and self.pegaflow_port is not None:
+            env["PEGAFLOW_PORT"] = str(self.pegaflow_port)
 
         # Resolve vllm binary from the current Python environment's bin dir
         import sys
@@ -184,6 +190,124 @@ def check_pegaflow_server(metrics_port: int) -> bool:
         return True
     except requests.exceptions.RequestException:
         return False
+
+
+def find_available_port() -> int:
+    """Find an available TCP port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        return s.getsockname()[1]
+
+
+class PegaFlowServer:
+    """Context manager for pegaflow-server lifecycle.
+
+    Auto-starts pegaflow-server with prometheus metrics enabled.
+    Picks random available ports for gRPC and HTTP endpoints.
+    """
+
+    def __init__(self, log_file: Path | None = None, pool_size: str = "30gb"):
+        self.grpc_port = find_available_port()
+        self.http_port = find_available_port()
+        self.pool_size = pool_size
+        self.log_file = log_file
+        self.process: subprocess.Popen | None = None
+        self.log_handle = None
+
+    @property
+    def metrics_port(self) -> int:
+        return self.http_port
+
+    def __enter__(self):
+        project_root = Path(__file__).parent.parent.parent
+
+        cmd = [
+            "cargo",
+            "run",
+            "-r",
+            "--bin",
+            "pegaflow-server",
+            "--",
+            "--addr",
+            f"127.0.0.1:{self.grpc_port}",
+            "--http-addr",
+            f"0.0.0.0:{self.http_port}",
+            "--pool-size",
+            self.pool_size,
+            "--enable-prometheus",
+        ]
+
+        # pegaflow-server embeds Python via PyO3 (for CUDA device detection via torch)
+        import sys
+        import sysconfig
+
+        env = os.environ.copy()
+        env["PYO3_PYTHON"] = sys.executable
+        env["PYTHONHOME"] = sys.base_prefix
+        if libdir := sysconfig.get_config_var("LIBDIR"):
+            env["LD_LIBRARY_PATH"] = f"{libdir}:{env.get('LD_LIBRARY_PATH', '')}"
+        python_dir = str(Path(__file__).parent.parent)
+        site_packages = next((p for p in sys.path if "site-packages" in p), None)
+        env["PYTHONPATH"] = f"{python_dir}" + (f":{site_packages}" if site_packages else "")
+
+        print(f"\n[PegaFlow Server] cargo run -r on gRPC={self.grpc_port}, HTTP={self.http_port}")
+
+        if self.log_file:
+            print(f"[PegaFlow Server] Logging to: {self.log_file}")
+            self.log_handle = open(self.log_file, "w")
+            self.process = subprocess.Popen(
+                cmd,
+                cwd=project_root,
+                env=env,
+                stdout=self.log_handle,
+                stderr=subprocess.STDOUT,
+                preexec_fn=os.setsid,
+            )
+        else:
+            self.process = subprocess.Popen(
+                cmd,
+                cwd=project_root,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                preexec_fn=os.setsid,
+            )
+
+        self._wait_for_ready()
+        return self
+
+    def _wait_for_ready(self, timeout: int = 300):
+        """Wait for pegaflow-server HTTP health endpoint."""
+        start = time.time()
+        print("Waiting for pegaflow-server to be ready...")
+        while time.time() - start < timeout:
+            if self.process.poll() is not None:
+                raise RuntimeError(f"pegaflow-server exited with code {self.process.returncode}")
+            try:
+                resp = requests.get(f"http://localhost:{self.http_port}/health", timeout=1)
+                if resp.status_code == 200:
+                    print("pegaflow-server is ready!\n")
+                    return
+            except requests.exceptions.RequestException:
+                pass
+            time.sleep(2)
+
+        raise TimeoutError(f"pegaflow-server did not become ready within {timeout}s")
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.process:
+            print("\n[PegaFlow Server] Stopping...")
+            try:
+                os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+                self.process.wait(timeout=10)
+            except (subprocess.TimeoutExpired, ProcessLookupError, OSError):
+                if self.process:
+                    os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
+                    self.process.wait(timeout=5)
+            print("pegaflow-server stopped.\n")
+        if self.log_handle:
+            self.log_handle.close()
 
 
 def call_openai_api(
