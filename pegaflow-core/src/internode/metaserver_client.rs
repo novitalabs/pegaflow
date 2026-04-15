@@ -216,15 +216,10 @@ async fn registration_loop(
 
     while let Some(cmd) = rx.recv().await {
         // Drain all pending commands for coalescing, separating inserts from removes.
-        let mut all_cmds = vec![cmd];
-        while let Ok(more) = rx.try_recv() {
-            all_cmds.push(more);
-        }
-
         let mut inserts: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
         let mut removes: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
 
-        for cmd in all_cmds {
+        for cmd in std::iter::once(cmd).chain(std::iter::from_fn(|| rx.try_recv().ok())) {
             match cmd {
                 MetaServerCommand::Insert(batch) => {
                     for (ns, hash) in batch.entries {
@@ -249,11 +244,14 @@ async fn registration_loop(
                 }
                 Err(e) => {
                     error!("Failed to connect to MetaServer: {e}");
-                    let total: usize = inserts.values().map(|v| v.len()).sum::<usize>()
-                        + removes.values().map(|v| v.len()).sum::<usize>();
+                    let insert_total: usize = inserts.values().map(|v| v.len()).sum();
+                    let remove_total: usize = removes.values().map(|v| v.len()).sum();
                     core_metrics()
                         .metaserver_registration_failures
-                        .add(total as u64, &[]);
+                        .add(insert_total as u64, &[]);
+                    core_metrics()
+                        .metaserver_removal_failures
+                        .add(remove_total as u64, &[]);
                     tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
                     backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
                     continue;
@@ -304,12 +302,15 @@ async fn registration_loop(
             continue;
         }
 
-        // Process removes (independent of inserts — failures don't reset the client)
-        for (namespace, hashes) in removes {
+        // Process removes
+        let remove_namespaces: Vec<(String, Vec<Vec<u8>>)> = removes.into_iter().collect();
+        let mut remove_failed_at = None;
+
+        for (i, (namespace, hashes)) in remove_namespaces.iter().enumerate() {
             let count = hashes.len();
             let request = RemoveBlockHashesRequest {
                 namespace: namespace.clone(),
-                block_hashes: hashes,
+                block_hashes: hashes.clone(),
                 node: advertise_addr.clone(),
             };
 
@@ -326,11 +327,18 @@ async fn registration_loop(
                         "MetaServer remove_block_hashes failed (namespace={}, count={}): {e}",
                         namespace, count
                     );
-                    core_metrics()
-                        .metaserver_removal_failures
-                        .add(count as u64, &[]);
+                    remove_failed_at = Some(i);
+                    break;
                 }
             }
+        }
+
+        if let Some(idx) = remove_failed_at {
+            let dropped: usize = remove_namespaces[idx..].iter().map(|(_, h)| h.len()).sum();
+            core_metrics()
+                .metaserver_removal_failures
+                .add(dropped as u64, &[]);
+            client = None;
         }
     }
 

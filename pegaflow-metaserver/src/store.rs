@@ -83,15 +83,10 @@ impl BlockHashStore {
             let result = self
                 .cache
                 .entry(key)
-                .and_compute_with(|maybe_entry| {
-                    let node_clone = Arc::clone(&node_clone);
-                    async move {
-                        match maybe_entry {
-                            Some(entry) if entry.value().as_ref() == node_clone.as_ref() => {
-                                Op::Remove
-                            }
-                            _ => Op::Nop,
-                        }
+                .and_compute_with(move |maybe_entry| async move {
+                    match maybe_entry {
+                        Some(entry) if entry.value().as_ref() == node_clone.as_ref() => Op::Remove,
+                        _ => Op::Nop,
                     }
                 })
                 .await;
