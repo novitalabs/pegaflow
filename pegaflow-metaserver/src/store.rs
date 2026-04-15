@@ -263,13 +263,13 @@ mod tests {
         let hash = vec![1, 2, 3, 4];
 
         store
-            .insert_hashes(namespace, &[hash.clone()], "node-a")
+            .insert_hashes(namespace, std::slice::from_ref(&hash), "node-a")
             .await;
         store.run_pending_tasks().await;
 
         // owner matches → should remove
         let removed = store
-            .remove_hashes(namespace, &[hash.clone()], "node-a")
+            .remove_hashes(namespace, std::slice::from_ref(&hash), "node-a")
             .await;
         assert_eq!(removed, 1);
         store.run_pending_tasks().await;
@@ -283,13 +283,13 @@ mod tests {
         let hash = vec![1, 2, 3, 4];
 
         store
-            .insert_hashes(namespace, &[hash.clone()], "node-b")
+            .insert_hashes(namespace, std::slice::from_ref(&hash), "node-b")
             .await;
         store.run_pending_tasks().await;
 
         // owner does not match → should not remove
         let removed = store
-            .remove_hashes(namespace, &[hash.clone()], "node-a")
+            .remove_hashes(namespace, std::slice::from_ref(&hash), "node-a")
             .await;
         assert_eq!(removed, 0);
         store.run_pending_tasks().await;
@@ -311,7 +311,9 @@ mod tests {
 
         for _ in 0..100 {
             // Reset: node-a owns the block
-            store.insert_hashes("ns", &[hash.clone()], "node-a").await;
+            store
+                .insert_hashes("ns", std::slice::from_ref(&hash), "node-a")
+                .await;
             store.run_pending_tasks().await;
 
             let store_a = Arc::clone(&store);
@@ -333,7 +335,7 @@ mod tests {
             // Both operations completed. insert always runs to completion, so:
             // 1. remove first → node-b inserts after → key exists, owner=node-b
             // 2. insert first → remove sees owner=node-b, skips → key exists, owner=node-b
-            let existing = store.query_prefix("ns", &[hash.clone()]).await;
+            let existing = store.query_prefix("ns", std::slice::from_ref(&hash)).await;
             assert_eq!(
                 existing.len(),
                 1,

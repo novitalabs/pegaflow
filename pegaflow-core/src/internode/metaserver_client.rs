@@ -305,8 +305,13 @@ async fn registration_loop(
             core_metrics()
                 .metaserver_registration_failures
                 .add(dropped as u64, &[]);
+            let remove_total: usize = removes.values().map(|v| v.len()).sum();
+            if remove_total > 0 {
+                core_metrics()
+                    .metaserver_removal_failures
+                    .add(remove_total as u64, &[]);
+            }
             client = None;
-            // Re-borrow after setting client = None would fail, skip removes this round.
             continue;
         }
 
