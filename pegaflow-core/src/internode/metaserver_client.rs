@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use log::{debug, error, info, warn};
 use pegaflow_proto::proto::engine::meta_server_client::MetaServerClient as MetaServerGrpcClient;
 use pegaflow_proto::proto::engine::{
-    InsertBlockHashesRequest, NodePrefixResult, QueryPrefixBlocksRequest,
+    InsertBlockHashesRequest, NodePrefixResult, QueryPrefixBlocksRequest, RemoveBlockHashesRequest,
 };
 use tokio::sync::mpsc;
 use tonic::transport::{Channel, Endpoint};
@@ -50,15 +50,21 @@ impl MetaServerClientConfig {
     }
 }
 
-/// A batch of (namespace, block_hash) pairs to register with MetaServer.
-struct RegistrationBatch {
+/// A batch of (namespace, block_hash) pairs for MetaServer operations.
+struct BlockHashBatch {
     entries: Vec<(String, Vec<u8>)>,
+}
+
+/// Command sent to the background MetaServer loop.
+enum MetaServerCommand {
+    Insert(BlockHashBatch),
+    Remove(BlockHashBatch),
 }
 
 /// Unified MetaServer client handling both insert (fire-and-forget) and query (direct RPC).
 pub struct MetaServerClient {
-    /// Fire-and-forget insert channel (same pattern as old registrar)
-    insert_tx: mpsc::Sender<RegistrationBatch>,
+    /// Fire-and-forget command channel for insert/remove operations.
+    command_tx: mpsc::Sender<MetaServerCommand>,
     /// Lazy-connect query client
     query_client: MetaServerGrpcClient<Channel>,
 }
@@ -68,7 +74,7 @@ impl MetaServerClient {
     ///
     /// Must be called from within a tokio runtime context.
     pub fn new(config: MetaServerClientConfig) -> Self {
-        let (insert_tx, rx) = mpsc::channel(config.queue_depth);
+        let (command_tx, rx) = mpsc::channel(config.queue_depth);
 
         tokio::spawn(registration_loop(
             rx,
@@ -88,7 +94,7 @@ impl MetaServerClient {
         );
 
         Self {
-            insert_tx,
+            command_tx,
             query_client,
         }
     }
@@ -102,8 +108,8 @@ impl MetaServerClient {
             return;
         }
         let count = entries.len();
-        let batch = RegistrationBatch { entries };
-        match self.insert_tx.try_send(batch) {
+        let batch = BlockHashBatch { entries };
+        match self.command_tx.try_send(MetaServerCommand::Insert(batch)) {
             Ok(()) => {
                 core_metrics()
                     .metaserver_registration_blocks
@@ -125,6 +131,41 @@ impl MetaServerClient {
                 );
                 core_metrics()
                     .metaserver_registration_queue_full
+                    .add(count as u64, &[]);
+            }
+        }
+    }
+
+    /// Fire-and-forget removal of block hashes.
+    ///
+    /// Called after LRU eviction to notify MetaServer that this node no longer
+    /// holds these blocks. Losing an occasional remove message is acceptable —
+    /// TTL still serves as the ultimate fallback for node failures.
+    pub(crate) fn try_unregister(&self, entries: Vec<(String, Vec<u8>)>) {
+        if entries.is_empty() {
+            return;
+        }
+        let count = entries.len();
+        let batch = BlockHashBatch { entries };
+        match self.command_tx.try_send(MetaServerCommand::Remove(batch)) {
+            Ok(()) => {
+                core_metrics()
+                    .metaserver_removal_blocks
+                    .add(count as u64, &[]);
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!("MetaServer removal queue full, dropping {} hashes", count);
+                core_metrics()
+                    .metaserver_removal_queue_full
+                    .add(count as u64, &[]);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                error!(
+                    "MetaServer removal loop has exited, dropping {} hashes",
+                    count
+                );
+                core_metrics()
+                    .metaserver_removal_queue_full
                     .add(count as u64, &[]);
             }
         }
@@ -162,24 +203,43 @@ impl MetaServerClient {
 }
 
 async fn registration_loop(
-    mut rx: mpsc::Receiver<RegistrationBatch>,
+    mut rx: mpsc::Receiver<MetaServerCommand>,
     metaserver_addr: String,
     advertise_addr: String,
 ) {
     let mut client: Option<MetaServerGrpcClient<Channel>> = None;
     let mut backoff_ms: u64 = INITIAL_BACKOFF_MS;
 
-    while let Some(batch) = rx.recv().await {
-        // Drain all pending batches for coalescing
-        let mut all_entries = batch.entries;
-        while let Ok(more) = rx.try_recv() {
-            all_entries.extend(more.entries);
+    while let Some(cmd) = rx.recv().await {
+        // Drain all pending commands. For each (namespace, hash), keep only the last
+        // operation (last-write-wins), so [Remove(X), Insert(X)] correctly resolves
+        // to Insert(X) rather than being reversed by separate-bucket processing.
+        let mut net: HashMap<(String, Vec<u8>), bool> = HashMap::new(); // true=insert, false=remove
+
+        for cmd in std::iter::once(cmd).chain(std::iter::from_fn(|| rx.try_recv().ok())) {
+            match cmd {
+                MetaServerCommand::Insert(batch) => {
+                    for (ns, hash) in batch.entries {
+                        net.insert((ns, hash), true);
+                    }
+                }
+                MetaServerCommand::Remove(batch) => {
+                    for (ns, hash) in batch.entries {
+                        net.insert((ns, hash), false);
+                    }
+                }
+            }
         }
 
-        // Group by namespace
-        let mut grouped: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
-        for (namespace, hash) in all_entries {
-            grouped.entry(namespace).or_default().push(hash);
+        let mut inserts: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+        let mut removes: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+
+        for ((ns, hash), is_insert) in net {
+            if is_insert {
+                inserts.entry(ns).or_default().push(hash);
+            } else {
+                removes.entry(ns).or_default().push(hash);
+            }
         }
 
         // Lazy-connect with exponential backoff
@@ -192,10 +252,14 @@ async fn registration_loop(
                 }
                 Err(e) => {
                     error!("Failed to connect to MetaServer: {e}");
-                    let total: usize = grouped.values().map(|v| v.len()).sum();
+                    let insert_total: usize = inserts.values().map(|v| v.len()).sum();
+                    let remove_total: usize = removes.values().map(|v| v.len()).sum();
                     core_metrics()
                         .metaserver_registration_failures
-                        .add(total as u64, &[]);
+                        .add(insert_total as u64, &[]);
+                    core_metrics()
+                        .metaserver_removal_failures
+                        .add(remove_total as u64, &[]);
                     tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
                     backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
                     continue;
@@ -205,10 +269,11 @@ async fn registration_loop(
 
         let c = client.as_mut().expect("client is Some after lazy-connect");
 
-        let namespaces: Vec<(String, Vec<Vec<u8>>)> = grouped.into_iter().collect();
-        let mut failed_at = None;
+        // Process inserts
+        let insert_namespaces: Vec<(String, Vec<Vec<u8>>)> = inserts.into_iter().collect();
+        let mut insert_failed_at = None;
 
-        for (i, (namespace, hashes)) in namespaces.iter().enumerate() {
+        for (i, (namespace, hashes)) in insert_namespaces.iter().enumerate() {
             let count = hashes.len();
             let request = InsertBlockHashesRequest {
                 namespace: namespace.clone(),
@@ -229,16 +294,62 @@ async fn registration_loop(
                         "MetaServer insert_block_hashes failed (namespace={}, count={}): {e}",
                         namespace, count
                     );
-                    failed_at = Some(i);
+                    insert_failed_at = Some(i);
                     break;
                 }
             }
         }
 
-        if let Some(idx) = failed_at {
-            let dropped: usize = namespaces[idx..].iter().map(|(_, h)| h.len()).sum();
+        if let Some(idx) = insert_failed_at {
+            let dropped: usize = insert_namespaces[idx..].iter().map(|(_, h)| h.len()).sum();
             core_metrics()
                 .metaserver_registration_failures
+                .add(dropped as u64, &[]);
+            let remove_total: usize = removes.values().map(|v| v.len()).sum();
+            if remove_total > 0 {
+                core_metrics()
+                    .metaserver_removal_failures
+                    .add(remove_total as u64, &[]);
+            }
+            client = None;
+            continue;
+        }
+
+        // Process removes
+        let remove_namespaces: Vec<(String, Vec<Vec<u8>>)> = removes.into_iter().collect();
+        let mut remove_failed_at = None;
+
+        for (i, (namespace, hashes)) in remove_namespaces.iter().enumerate() {
+            let count = hashes.len();
+            let request = RemoveBlockHashesRequest {
+                namespace: namespace.clone(),
+                block_hashes: hashes.clone(),
+                node: advertise_addr.clone(),
+            };
+
+            match c.remove_block_hashes(request).await {
+                Ok(resp) => {
+                    let inner = resp.into_inner();
+                    debug!(
+                        "Removed {} block hashes from MetaServer (namespace={}, removed={})",
+                        count, namespace, inner.removed_count
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        "MetaServer remove_block_hashes failed (namespace={}, count={}): {e}",
+                        namespace, count
+                    );
+                    remove_failed_at = Some(i);
+                    break;
+                }
+            }
+        }
+
+        if let Some(idx) = remove_failed_at {
+            let dropped: usize = remove_namespaces[idx..].iter().map(|(_, h)| h.len()).sum();
+            core_metrics()
+                .metaserver_removal_failures
                 .add(dropped as u64, &[]);
             client = None;
         }

@@ -57,6 +57,11 @@ pub(crate) struct CoreMetrics {
     pub metaserver_registration_failures: Counter<u64>,
     pub metaserver_registration_queue_full: Counter<u64>,
 
+    // MetaServer removal
+    pub metaserver_removal_blocks: Counter<u64>,
+    pub metaserver_removal_failures: Counter<u64>,
+    pub metaserver_removal_queue_full: Counter<u64>,
+
     // Cross-node transfer lock (serving side)
     pub transfer_lock_active: UpDownCounter<i64>,
     pub transfer_lock_timeouts_total: Counter<u64>,
@@ -308,6 +313,20 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
             metaserver_registration_queue_full: meter
                 .u64_counter("pegaflow_metaserver_registration_queue_full")
                 .with_description("Block hashes dropped due to full registration queue")
+                .build(),
+
+            // MetaServer removal
+            metaserver_removal_blocks: meter
+                .u64_counter("pegaflow_metaserver_removal_blocks")
+                .with_description("Block hashes sent to MetaServer for removal")
+                .build(),
+            metaserver_removal_failures: meter
+                .u64_counter("pegaflow_metaserver_removal_failures")
+                .with_description("MetaServer removal RPC failures")
+                .build(),
+            metaserver_removal_queue_full: meter
+                .u64_counter("pegaflow_metaserver_removal_queue_full")
+                .with_description("Block hashes dropped due to full removal queue")
                 .build(),
 
             // Transfer lock

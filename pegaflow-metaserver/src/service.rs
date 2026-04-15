@@ -1,8 +1,9 @@
 use crate::proto::engine::meta_server_server::MetaServer;
 use crate::proto::engine::{
     HealthRequest, HealthResponse, InsertBlockHashesRequest, InsertBlockHashesResponse,
-    NodePrefixResult, QueryPrefixBlocksRequest, QueryPrefixBlocksResponse, ResponseStatus,
-    ShutdownRequest, ShutdownResponse,
+    NodePrefixResult, QueryPrefixBlocksRequest, QueryPrefixBlocksResponse,
+    RemoveBlockHashesRequest, RemoveBlockHashesResponse, ResponseStatus, ShutdownRequest,
+    ShutdownResponse,
 };
 use crate::store::BlockHashStore;
 use log::{debug, info};
@@ -79,6 +80,46 @@ impl MetaServer for GrpcMetaService {
         };
 
         Ok(Response::new(response))
+    }
+
+    async fn remove_block_hashes(
+        &self,
+        request: Request<RemoveBlockHashesRequest>,
+    ) -> Result<Response<RemoveBlockHashesResponse>, Status> {
+        let start = Instant::now();
+        let req = request.into_inner();
+
+        debug!(
+            "RPC [remove_block_hashes]: namespace={} node={} hashes_count={}",
+            req.namespace,
+            req.node,
+            req.block_hashes.len()
+        );
+
+        if req.block_hashes.is_empty() {
+            return Ok(Response::new(RemoveBlockHashesResponse {
+                status: Some(Self::error_status(
+                    "block_hashes cannot be empty".to_string(),
+                )),
+                removed_count: 0,
+            }));
+        }
+
+        let removed = self
+            .store
+            .remove_hashes(&req.namespace, &req.block_hashes, &req.node)
+            .await;
+
+        let elapsed = start.elapsed();
+        info!(
+            "RPC [remove_block_hashes]: namespace={} node={} removed={} hashes in {:?}",
+            req.namespace, req.node, removed, elapsed
+        );
+
+        Ok(Response::new(RemoveBlockHashesResponse {
+            status: Some(Self::ok_status()),
+            removed_count: removed as u64,
+        }))
     }
 
     /// Given an ordered list of block hashes, find the longest contiguous prefix
@@ -162,5 +203,110 @@ impl MetaServer for GrpcMetaService {
             status: Some(Self::ok_status()),
         };
         Ok(Response::new(response))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::BlockHashStore;
+
+    fn make_service() -> GrpcMetaService {
+        GrpcMetaService::new(Arc::new(BlockHashStore::new()), Arc::new(Notify::new()))
+    }
+
+    #[tokio::test]
+    async fn test_remove_block_hashes_own_blocks() {
+        let svc = make_service();
+
+        // Insert
+        svc.insert_block_hashes(Request::new(InsertBlockHashesRequest {
+            namespace: "ns".into(),
+            block_hashes: vec![vec![1, 2, 3]],
+            node: "node-a".into(),
+        }))
+        .await
+        .unwrap();
+
+        // Remove with matching owner
+        let resp = svc
+            .remove_block_hashes(Request::new(RemoveBlockHashesRequest {
+                namespace: "ns".into(),
+                block_hashes: vec![vec![1, 2, 3]],
+                node: "node-a".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(resp.status.unwrap().ok);
+        assert_eq!(resp.removed_count, 1);
+
+        // Verify gone
+        let query_resp = svc
+            .query_prefix_blocks(Request::new(QueryPrefixBlocksRequest {
+                namespace: "ns".into(),
+                block_hashes: vec![vec![1, 2, 3]],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(query_resp.nodes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_remove_block_hashes_wrong_owner_is_noop() {
+        let svc = make_service();
+
+        svc.insert_block_hashes(Request::new(InsertBlockHashesRequest {
+            namespace: "ns".into(),
+            block_hashes: vec![vec![1, 2, 3]],
+            node: "node-b".into(),
+        }))
+        .await
+        .unwrap();
+
+        // Remove with non-matching owner
+        let resp = svc
+            .remove_block_hashes(Request::new(RemoveBlockHashesRequest {
+                namespace: "ns".into(),
+                block_hashes: vec![vec![1, 2, 3]],
+                node: "node-a".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(resp.status.unwrap().ok);
+        assert_eq!(resp.removed_count, 0);
+
+        // Verify still present
+        let query_resp = svc
+            .query_prefix_blocks(Request::new(QueryPrefixBlocksRequest {
+                namespace: "ns".into(),
+                block_hashes: vec![vec![1, 2, 3]],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(query_resp.nodes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_remove_block_hashes_empty_request_returns_error() {
+        let svc = make_service();
+
+        let resp = svc
+            .remove_block_hashes(Request::new(RemoveBlockHashesRequest {
+                namespace: "ns".into(),
+                block_hashes: vec![],
+                node: "node-a".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(!resp.status.unwrap().ok);
+        assert_eq!(resp.removed_count, 0);
     }
 }
