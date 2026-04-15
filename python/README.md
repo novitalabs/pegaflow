@@ -31,27 +31,7 @@ pip install pegaflow
 
 ## Usage
 
-### Basic KV Storage
-
-```python
-from pegaflow import PegaEngine
-
-# Create a new engine
-engine = PegaEngine()
-
-# Store key-value pairs
-engine.put("name", "PegaFlow")
-engine.put("version", "0.1.0")
-
-# Retrieve values
-name = engine.get("name")  # Returns "PegaFlow"
-missing = engine.get("nonexistent")  # Returns None
-
-# Remove keys
-removed = engine.remove("name")  # Returns "PegaFlow"
-```
-
-#### Sglang Examples:
+### Sglang Examples:
 
 example 1:
 
