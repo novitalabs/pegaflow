@@ -65,8 +65,7 @@ impl MetaServer for GrpcMetaService {
         // Insert hashes with node ownership
         let inserted = self
             .store
-            .insert_hashes(&req.namespace, &req.block_hashes, &req.node)
-            .await;
+            .insert_hashes(&req.namespace, &req.block_hashes, &req.node);
 
         let elapsed = start.elapsed();
         info!(
@@ -107,8 +106,7 @@ impl MetaServer for GrpcMetaService {
 
         let removed = self
             .store
-            .remove_hashes(&req.namespace, &req.block_hashes, &req.node)
-            .await;
+            .remove_hashes(&req.namespace, &req.block_hashes, &req.node);
 
         let elapsed = start.elapsed();
         info!(
@@ -143,10 +141,7 @@ impl MetaServer for GrpcMetaService {
         }
 
         // Returns entries up to the first globally-missing hash.
-        let existing = self
-            .store
-            .query_prefix(&req.namespace, &req.block_hashes)
-            .await;
+        let existing = self.store.query_prefix(&req.namespace, &req.block_hashes);
 
         let total_queried = req.block_hashes.len();
         let prefix_len = existing.len();
@@ -162,10 +157,12 @@ impl MetaServer for GrpcMetaService {
         let mut node_prefix: std::collections::HashMap<&str, u32> =
             std::collections::HashMap::new();
         for (i, entry) in existing.iter().enumerate() {
-            let count = node_prefix.entry(&entry.node).or_insert(0);
-            // Only extend if every previous hash (0..i) was also on this node
-            if *count == i as u32 {
-                *count += 1;
+            for node in &entry.nodes {
+                let count = node_prefix.entry(node.as_ref()).or_insert(0);
+                // Only extend if every previous hash (0..i) was also on this node
+                if *count == i as u32 {
+                    *count += 1;
+                }
             }
         }
         let nodes: Vec<NodePrefixResult> = node_prefix
@@ -308,5 +305,58 @@ mod tests {
 
         assert!(!resp.status.unwrap().ok);
         assert_eq!(resp.removed_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_query_prefix_blocks_shared_prefix_multi_owner() {
+        let svc = make_service();
+        let namespace = "model-a";
+
+        let h1 = vec![1];
+        let h2 = vec![2];
+        let h3 = vec![3];
+        let h4 = vec![4];
+        let h5 = vec![5];
+
+        let node_a = "node-a:50055";
+        let node_b = "node-b:50055";
+
+        svc.insert_block_hashes(Request::new(InsertBlockHashesRequest {
+            namespace: namespace.into(),
+            block_hashes: vec![h1.clone(), h2.clone(), h3.clone(), h4.clone()],
+            node: node_a.into(),
+        }))
+        .await
+        .unwrap();
+
+        svc.insert_block_hashes(Request::new(InsertBlockHashesRequest {
+            namespace: namespace.into(),
+            block_hashes: vec![h1.clone(), h2.clone(), h3.clone(), h5],
+            node: node_b.into(),
+        }))
+        .await
+        .unwrap();
+
+        let response = svc
+            .query_prefix_blocks(Request::new(QueryPrefixBlocksRequest {
+                namespace: namespace.into(),
+                block_hashes: vec![h1, h2, h3, h4],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let mut nodes: Vec<(String, u32)> = response
+            .nodes
+            .into_iter()
+            .map(|entry| (entry.node, entry.prefix_len))
+            .collect();
+        nodes.sort();
+
+        // node-a owns h1..h4 (prefix 4), node-b owns h1..h3 (prefix 3)
+        assert_eq!(
+            nodes,
+            vec![(node_a.to_string(), 4), (node_b.to_string(), 3),]
+        );
     }
 }

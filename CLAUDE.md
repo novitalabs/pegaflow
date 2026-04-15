@@ -84,7 +84,7 @@ cargo bench --bench uds_latency
 
 5. **pegaflow-metaserver** (Rust): Cross-node block hash registry
    - `service.rs`: gRPC MetaServer service (insert/query block hashes)
-   - `store.rs`: LRU block hash store with configurable capacity and TTL (backed by moka)
+   - `store.rs`: Multi-owner block hash store with TTL sweep (backed by DashMap)
    - Used for multi-node KV cache coordination — each pegaflow-server registers its block hashes here
 
 6. **pegaflow-transfer** (Rust): RDMA-based inter-node memory transfer engine

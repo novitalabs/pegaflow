@@ -30,10 +30,6 @@ pub struct Cli {
     #[arg(long, default_value = "info")]
     pub log_level: String,
 
-    /// Maximum cache capacity in MB
-    #[arg(long, default_value = "512")]
-    pub max_capacity_mb: u64,
-
     /// Cache entry TTL in minutes
     #[arg(long, default_value = "120")]
     pub ttl_minutes: u64,
@@ -82,15 +78,29 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
 
     info!("Starting PegaFlow MetaServer");
     info!("Binding to address: {}", cli.addr);
-    info!("Max cache capacity: {} MB", cli.max_capacity_mb);
     info!("Cache entry TTL: {} minutes", cli.ttl_minutes);
 
-    // Create the block hash store with custom capacity and TTL
-    let max_capacity_bytes = cli.max_capacity_mb * 1024 * 1024;
-    let store = Arc::new(BlockHashStore::with_capacity_and_ttl(
-        max_capacity_bytes,
-        cli.ttl_minutes,
-    ));
+    // Create the block hash store with TTL
+    let store = Arc::new(BlockHashStore::with_ttl(cli.ttl_minutes));
+
+    // Spawn background TTL sweep task (every 10 minutes)
+    {
+        let store = Arc::clone(&store);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10 * 60));
+            loop {
+                interval.tick().await;
+                let removed = store.sweep_expired();
+                if removed > 0 {
+                    info!(
+                        "TTL sweep: removed {} stale block keys, {} remaining",
+                        removed,
+                        store.entry_count()
+                    );
+                }
+            }
+        });
+    }
 
     // Create shutdown notifier
     let shutdown = Arc::new(Notify::new());
