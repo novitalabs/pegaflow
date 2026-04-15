@@ -447,14 +447,21 @@ impl StorageEngine {
         (freed_blocks, freed_bytes, largest_free)
     }
 
-    /// Remove stale inflight blocks older than `max_age`.
-    pub(crate) async fn gc_stale_inflight(&self, max_age: std::time::Duration) -> usize {
-        let cleaned = self.write_pipeline.gc_stale_inflight(max_age).await;
-        let failed = self.prefetch.gc_failed_remote(max_age);
+    /// Remove stale inflight blocks and failed_remote entries.
+    pub(crate) async fn gc_stale_inflight(
+        &self,
+        inflight_max_age: std::time::Duration,
+        failed_remote_max_age: std::time::Duration,
+    ) -> (usize, usize) {
+        let cleaned = self
+            .write_pipeline
+            .gc_stale_inflight(inflight_max_age)
+            .await;
+        let failed = self.prefetch.gc_failed_remote(failed_remote_max_age);
         if failed > 0 {
             log::debug!("gc: cleared {failed} stale failed_remote entries");
         }
-        cleaned + failed
+        (cleaned, failed)
     }
 
     // ---- Cross-node transfer: serving side ----
@@ -598,10 +605,14 @@ mod tests {
     #[tokio::test]
     async fn gc_stale_inflight_returns_zero_when_empty() {
         let storage = make_engine();
-        let cleaned = storage
-            .gc_stale_inflight(std::time::Duration::from_secs(60))
+        let (cleaned, failed) = storage
+            .gc_stale_inflight(
+                std::time::Duration::from_secs(60),
+                std::time::Duration::from_secs(60),
+            )
             .await;
         assert_eq!(cleaned, 0);
+        assert_eq!(failed, 0);
     }
 
     #[tokio::test]

@@ -528,11 +528,17 @@ impl PegaEngine {
         self.storage.flush_ssd().await;
     }
 
-    /// Remove stale inflight blocks (background GC).
+    /// Remove stale inflight blocks and failed_remote entries (background GC).
     ///
-    /// Should be called periodically (e.g., every 5 minutes).
-    pub async fn gc_stale_inflight(&self, max_age: std::time::Duration) -> usize {
-        self.storage.gc_stale_inflight(max_age).await
+    /// Should be called periodically (e.g., every 30 seconds).
+    pub async fn gc_stale_inflight(
+        &self,
+        inflight_max_age: std::time::Duration,
+        failed_remote_max_age: std::time::Duration,
+    ) -> (usize, usize) {
+        self.storage
+            .gc_stale_inflight(inflight_max_age, failed_remote_max_age)
+            .await
     }
 
     // =========================================================================
