@@ -215,22 +215,34 @@ async fn registration_loop(
     let mut backoff_ms: u64 = INITIAL_BACKOFF_MS;
 
     while let Some(cmd) = rx.recv().await {
-        // Drain all pending commands for coalescing, separating inserts from removes.
-        let mut inserts: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
-        let mut removes: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+        // Drain all pending commands. For each (namespace, hash), keep only the last
+        // operation (last-write-wins), so [Remove(X), Insert(X)] correctly resolves
+        // to Insert(X) rather than being reversed by separate-bucket processing.
+        let mut net: HashMap<(String, Vec<u8>), bool> = HashMap::new(); // true=insert, false=remove
 
         for cmd in std::iter::once(cmd).chain(std::iter::from_fn(|| rx.try_recv().ok())) {
             match cmd {
                 MetaServerCommand::Insert(batch) => {
                     for (ns, hash) in batch.entries {
-                        inserts.entry(ns).or_default().push(hash);
+                        net.insert((ns, hash), true);
                     }
                 }
                 MetaServerCommand::Remove(batch) => {
                     for (ns, hash) in batch.entries {
-                        removes.entry(ns).or_default().push(hash);
+                        net.insert((ns, hash), false);
                     }
                 }
+            }
+        }
+
+        let mut inserts: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+        let mut removes: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+
+        for ((ns, hash), is_insert) in net {
+            if is_insert {
+                inserts.entry(ns).or_default().push(hash);
+            } else {
+                removes.entry(ns).or_default().push(hash);
             }
         }
 
