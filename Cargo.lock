@@ -2182,12 +2182,17 @@ dependencies = [
 name = "pegaflow-metaserver"
 version = "0.19.1"
 dependencies = [
+ "axum",
  "clap",
  "dashmap",
  "log",
+ "opentelemetry",
+ "opentelemetry-prometheus",
+ "opentelemetry_sdk",
  "parking_lot",
  "pegaflow-common",
  "pegaflow-proto",
+ "prometheus",
  "prost",
  "serde",
  "serde_json",

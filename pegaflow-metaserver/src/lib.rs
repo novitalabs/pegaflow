@@ -1,3 +1,5 @@
+pub mod http_server;
+pub mod metric;
 pub mod proto;
 pub mod service;
 pub mod store;
@@ -7,7 +9,10 @@ pub use store::BlockHashStore;
 
 use clap::Parser;
 use log::{error, info};
+use opentelemetry::global;
+use opentelemetry_sdk::metrics::SdkMeterProvider;
 use pegaflow_proto::proto::engine::meta_server_server::MetaServerServer;
+use prometheus::Registry;
 use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -26,6 +31,14 @@ pub struct Cli {
     #[arg(long, default_value = "127.0.0.1:50056")]
     pub addr: SocketAddr,
 
+    /// HTTP server address for health check and Prometheus metrics.
+    #[arg(long, default_value = "0.0.0.0:9092")]
+    pub http_addr: SocketAddr,
+
+    /// Enable Prometheus /metrics endpoint on the HTTP server.
+    #[arg(long, default_value_t = true)]
+    pub enable_prometheus: bool,
+
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info")]
     pub log_level: String,
@@ -35,7 +48,24 @@ pub struct Cli {
     pub ttl_minutes: u64,
 }
 
-/// Graceful shutdown signal handler
+fn init_metrics(enabled: bool) -> Result<Option<(SdkMeterProvider, Registry)>, Box<dyn Error>> {
+    if !enabled {
+        info!("Prometheus metrics disabled");
+        return Ok(None);
+    }
+
+    let registry = Registry::new();
+    let exporter = opentelemetry_prometheus::exporter()
+        .with_registry(registry.clone())
+        .build()?;
+    let meter_provider = SdkMeterProvider::builder().with_reader(exporter).build();
+    global::set_meter_provider(meter_provider.clone());
+    info!("Prometheus metrics exporter enabled");
+
+    Ok(Some((meter_provider, registry)))
+}
+
+/// Wait for OS termination signal (Ctrl+C or SIGTERM), then notify dependents.
 async fn shutdown_signal(notify: Arc<Notify>) {
     let ctrl_c = async {
         signal::ctrl_c()
@@ -61,10 +91,9 @@ async fn shutdown_signal(notify: Arc<Notify>) {
         _ = terminate => {
             info!("Received SIGTERM, initiating shutdown");
         }
-        _ = notify.notified() => {
-            info!("Received shutdown notification from RPC");
-        }
     }
+
+    notify.notify_waiters();
 }
 
 /// Run the MetaServer gRPC service
@@ -80,8 +109,14 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     info!("Binding to address: {}", cli.addr);
     info!("Cache entry TTL: {} minutes", cli.ttl_minutes);
 
+    // Initialize metrics
+    let metrics_state = init_metrics(cli.enable_prometheus)?;
+
     // Create the block hash store with TTL
     let store = Arc::new(BlockHashStore::with_ttl(cli.ttl_minutes));
+
+    // Register store observable gauges
+    metric::register_store_gauges(&store);
 
     // Spawn background TTL sweep task (every 10 minutes)
     {
@@ -92,6 +127,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
                 interval.tick().await;
                 let removed = store.sweep_expired();
                 if removed > 0 {
+                    metric::record_ttl_sweep(removed as u64);
                     info!(
                         "TTL sweep: removed {} stale block keys, {} remaining",
                         removed,
@@ -105,8 +141,22 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     // Create shutdown notifier
     let shutdown = Arc::new(Notify::new());
 
+    // Start HTTP server for health check and metrics
+    let _http_handle = if let Some((_, ref prometheus_registry)) = metrics_state {
+        Some(
+            http_server::start_http_server(
+                cli.http_addr,
+                prometheus_registry.clone(),
+                Arc::clone(&shutdown),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
     // Create the gRPC service
-    let service = GrpcMetaService::new(store.clone(), shutdown.clone());
+    let service = GrpcMetaService::new(store.clone());
 
     info!("MetaServer initialized successfully");
     info!("Listening on {}", cli.addr);
@@ -119,6 +169,13 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     if let Err(e) = server_future.await {
         error!("Server error: {}", e);
         return Err(Box::new(e));
+    }
+
+    // Flush metrics before exit
+    if let Some((provider, _)) = metrics_state {
+        if let Err(err) = provider.shutdown() {
+            error!("Failed to shutdown metrics provider: {err}");
+        }
     }
 
     info!("MetaServer shut down gracefully");
