@@ -262,11 +262,15 @@ mod tests {
         let namespace = "model-a";
         let hash = vec![1, 2, 3, 4];
 
-        store.insert_hashes(namespace, &[hash.clone()], "node-a").await;
+        store
+            .insert_hashes(namespace, &[hash.clone()], "node-a")
+            .await;
         store.run_pending_tasks().await;
 
         // owner matches → should remove
-        let removed = store.remove_hashes(namespace, &[hash.clone()], "node-a").await;
+        let removed = store
+            .remove_hashes(namespace, &[hash.clone()], "node-a")
+            .await;
         assert_eq!(removed, 1);
         store.run_pending_tasks().await;
         assert_eq!(store.query_prefix(namespace, &[hash]).await.len(), 0);
@@ -278,11 +282,15 @@ mod tests {
         let namespace = "model-a";
         let hash = vec![1, 2, 3, 4];
 
-        store.insert_hashes(namespace, &[hash.clone()], "node-b").await;
+        store
+            .insert_hashes(namespace, &[hash.clone()], "node-b")
+            .await;
         store.run_pending_tasks().await;
 
         // owner does not match → should not remove
-        let removed = store.remove_hashes(namespace, &[hash.clone()], "node-a").await;
+        let removed = store
+            .remove_hashes(namespace, &[hash.clone()], "node-a")
+            .await;
         assert_eq!(removed, 0);
         store.run_pending_tasks().await;
         assert_eq!(store.query_prefix(namespace, &[hash]).await.len(), 1);
@@ -292,9 +300,7 @@ mod tests {
     async fn test_remove_nonexistent_is_noop() {
         let store = BlockHashStore::new();
 
-        let removed = store
-            .remove_hashes("ns", &[vec![9, 9, 9]], "node-a")
-            .await;
+        let removed = store.remove_hashes("ns", &[vec![9, 9, 9]], "node-a").await;
         assert_eq!(removed, 0);
     }
 
@@ -328,12 +334,12 @@ mod tests {
             // 1. remove first → node-b inserts after → key exists, owner=node-b
             // 2. insert first → remove sees owner=node-b, skips → key exists, owner=node-b
             let existing = store.query_prefix("ns", &[hash.clone()]).await;
-            assert_eq!(existing.len(), 1, "key must exist after concurrent insert+remove");
             assert_eq!(
-                existing[0].node.as_ref(),
-                "node-b",
-                "owner must be node-b"
+                existing.len(),
+                1,
+                "key must exist after concurrent insert+remove"
             );
+            assert_eq!(existing[0].node.as_ref(), "node-b", "owner must be node-b");
         }
     }
 

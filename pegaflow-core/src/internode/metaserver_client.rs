@@ -3,8 +3,7 @@ use std::collections::HashMap;
 use log::{debug, error, info, warn};
 use pegaflow_proto::proto::engine::meta_server_client::MetaServerClient as MetaServerGrpcClient;
 use pegaflow_proto::proto::engine::{
-    InsertBlockHashesRequest, NodePrefixResult, QueryPrefixBlocksRequest,
-    RemoveBlockHashesRequest,
+    InsertBlockHashesRequest, NodePrefixResult, QueryPrefixBlocksRequest, RemoveBlockHashesRequest,
 };
 use tokio::sync::mpsc;
 use tonic::transport::{Channel, Endpoint};
@@ -155,10 +154,7 @@ impl MetaServerClient {
                     .add(count as u64, &[]);
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
-                warn!(
-                    "MetaServer removal queue full, dropping {} hashes",
-                    count
-                );
+                warn!("MetaServer removal queue full, dropping {} hashes", count);
                 core_metrics()
                     .metaserver_removal_queue_full
                     .add(count as u64, &[]);
