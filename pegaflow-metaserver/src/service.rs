@@ -1,26 +1,24 @@
+use crate::metric::record_rpc_result;
 use crate::proto::engine::meta_server_server::MetaServer;
 use crate::proto::engine::{
-    HealthRequest, HealthResponse, InsertBlockHashesRequest, InsertBlockHashesResponse,
-    NodePrefixResult, QueryPrefixBlocksRequest, QueryPrefixBlocksResponse,
-    RemoveBlockHashesRequest, RemoveBlockHashesResponse, ResponseStatus, ShutdownRequest,
-    ShutdownResponse,
+    InsertBlockHashesRequest, InsertBlockHashesResponse, NodePrefixResult,
+    QueryPrefixBlocksRequest, QueryPrefixBlocksResponse, RemoveBlockHashesRequest,
+    RemoveBlockHashesResponse, ResponseStatus,
 };
 use crate::store::BlockHashStore;
 use log::{debug, info};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::Notify;
 use tonic::{Request, Response, Status, async_trait};
 
 #[derive(Clone)]
 pub struct GrpcMetaService {
     store: Arc<BlockHashStore>,
-    shutdown: Arc<Notify>,
 }
 
 impl GrpcMetaService {
-    pub fn new(store: Arc<BlockHashStore>, shutdown: Arc<Notify>) -> Self {
-        Self { store, shutdown }
+    pub fn new(store: Arc<BlockHashStore>) -> Self {
+        Self { store }
     }
 
     fn ok_status() -> ResponseStatus {
@@ -53,20 +51,20 @@ impl MetaServer for GrpcMetaService {
 
         // Validate request
         if req.block_hashes.is_empty() {
-            let response = InsertBlockHashesResponse {
+            let result = Ok(Response::new(InsertBlockHashesResponse {
                 status: Some(Self::error_status(
                     "block_hashes cannot be empty".to_string(),
                 )),
                 inserted_count: 0,
-            };
-            return Ok(Response::new(response));
+            }));
+            record_rpc_result("insert_block_hashes", &result, start);
+            return result;
         }
 
         // Insert hashes with node ownership
         let inserted = self
             .store
-            .insert_hashes(&req.namespace, &req.block_hashes, &req.node)
-            .await;
+            .insert_hashes(&req.namespace, &req.block_hashes, &req.node);
 
         let elapsed = start.elapsed();
         info!(
@@ -74,12 +72,12 @@ impl MetaServer for GrpcMetaService {
             req.namespace, req.node, inserted, elapsed
         );
 
-        let response = InsertBlockHashesResponse {
+        let result = Ok(Response::new(InsertBlockHashesResponse {
             status: Some(Self::ok_status()),
             inserted_count: inserted as u64,
-        };
-
-        Ok(Response::new(response))
+        }));
+        record_rpc_result("insert_block_hashes", &result, start);
+        result
     }
 
     async fn remove_block_hashes(
@@ -97,18 +95,19 @@ impl MetaServer for GrpcMetaService {
         );
 
         if req.block_hashes.is_empty() {
-            return Ok(Response::new(RemoveBlockHashesResponse {
+            let result = Ok(Response::new(RemoveBlockHashesResponse {
                 status: Some(Self::error_status(
                     "block_hashes cannot be empty".to_string(),
                 )),
                 removed_count: 0,
             }));
+            record_rpc_result("remove_block_hashes", &result, start);
+            return result;
         }
 
         let removed = self
             .store
-            .remove_hashes(&req.namespace, &req.block_hashes, &req.node)
-            .await;
+            .remove_hashes(&req.namespace, &req.block_hashes, &req.node);
 
         let elapsed = start.elapsed();
         info!(
@@ -116,10 +115,12 @@ impl MetaServer for GrpcMetaService {
             req.namespace, req.node, removed, elapsed
         );
 
-        Ok(Response::new(RemoveBlockHashesResponse {
+        let result = Ok(Response::new(RemoveBlockHashesResponse {
             status: Some(Self::ok_status()),
             removed_count: removed as u64,
-        }))
+        }));
+        record_rpc_result("remove_block_hashes", &result, start);
+        result
     }
 
     /// Given an ordered list of block hashes, find the longest contiguous prefix
@@ -139,14 +140,14 @@ impl MetaServer for GrpcMetaService {
         );
 
         if req.block_hashes.is_empty() {
-            return Err(Status::invalid_argument("block_hashes cannot be empty"));
+            let result: Result<Response<QueryPrefixBlocksResponse>, Status> =
+                Err(Status::invalid_argument("block_hashes cannot be empty"));
+            record_rpc_result("query_prefix_blocks", &result, start);
+            return result;
         }
 
         // Returns entries up to the first globally-missing hash.
-        let existing = self
-            .store
-            .query_prefix(&req.namespace, &req.block_hashes)
-            .await;
+        let existing = self.store.query_prefix(&req.namespace, &req.block_hashes);
 
         let total_queried = req.block_hashes.len();
         let prefix_len = existing.len();
@@ -162,10 +163,12 @@ impl MetaServer for GrpcMetaService {
         let mut node_prefix: std::collections::HashMap<&str, u32> =
             std::collections::HashMap::new();
         for (i, entry) in existing.iter().enumerate() {
-            let count = node_prefix.entry(&entry.node).or_insert(0);
-            // Only extend if every previous hash (0..i) was also on this node
-            if *count == i as u32 {
-                *count += 1;
+            for node in &entry.nodes {
+                let count = node_prefix.entry(node.as_ref()).or_insert(0);
+                // Only extend if every previous hash (0..i) was also on this node
+                if *count == i as u32 {
+                    *count += 1;
+                }
             }
         }
         let nodes: Vec<NodePrefixResult> = node_prefix
@@ -177,32 +180,9 @@ impl MetaServer for GrpcMetaService {
             })
             .collect();
 
-        let response = QueryPrefixBlocksResponse { nodes };
-
-        Ok(Response::new(response))
-    }
-
-    async fn health(
-        &self,
-        _request: Request<HealthRequest>,
-    ) -> Result<Response<HealthResponse>, Status> {
-        let response = HealthResponse {
-            status: Some(Self::ok_status()),
-        };
-        Ok(Response::new(response))
-    }
-
-    async fn shutdown(
-        &self,
-        _request: Request<ShutdownRequest>,
-    ) -> Result<Response<ShutdownResponse>, Status> {
-        info!("RPC [shutdown]: received shutdown request");
-        self.shutdown.notify_one();
-
-        let response = ShutdownResponse {
-            status: Some(Self::ok_status()),
-        };
-        Ok(Response::new(response))
+        let result = Ok(Response::new(QueryPrefixBlocksResponse { nodes }));
+        record_rpc_result("query_prefix_blocks", &result, start);
+        result
     }
 }
 
@@ -212,7 +192,7 @@ mod tests {
     use crate::store::BlockHashStore;
 
     fn make_service() -> GrpcMetaService {
-        GrpcMetaService::new(Arc::new(BlockHashStore::new()), Arc::new(Notify::new()))
+        GrpcMetaService::new(Arc::new(BlockHashStore::new()))
     }
 
     #[tokio::test]
@@ -308,5 +288,58 @@ mod tests {
 
         assert!(!resp.status.unwrap().ok);
         assert_eq!(resp.removed_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_query_prefix_blocks_shared_prefix_multi_owner() {
+        let svc = make_service();
+        let namespace = "model-a";
+
+        let h1 = vec![1];
+        let h2 = vec![2];
+        let h3 = vec![3];
+        let h4 = vec![4];
+        let h5 = vec![5];
+
+        let node_a = "node-a:50055";
+        let node_b = "node-b:50055";
+
+        svc.insert_block_hashes(Request::new(InsertBlockHashesRequest {
+            namespace: namespace.into(),
+            block_hashes: vec![h1.clone(), h2.clone(), h3.clone(), h4.clone()],
+            node: node_a.into(),
+        }))
+        .await
+        .unwrap();
+
+        svc.insert_block_hashes(Request::new(InsertBlockHashesRequest {
+            namespace: namespace.into(),
+            block_hashes: vec![h1.clone(), h2.clone(), h3.clone(), h5],
+            node: node_b.into(),
+        }))
+        .await
+        .unwrap();
+
+        let response = svc
+            .query_prefix_blocks(Request::new(QueryPrefixBlocksRequest {
+                namespace: namespace.into(),
+                block_hashes: vec![h1, h2, h3, h4],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let mut nodes: Vec<(String, u32)> = response
+            .nodes
+            .into_iter()
+            .map(|entry| (entry.node, entry.prefix_len))
+            .collect();
+        nodes.sort();
+
+        // node-a owns h1..h4 (prefix 4), node-b owns h1..h3 (prefix 3)
+        assert_eq!(
+            nodes,
+            vec![(node_a.to_string(), 4), (node_b.to_string(), 3),]
+        );
     }
 }

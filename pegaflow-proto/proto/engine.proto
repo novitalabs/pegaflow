@@ -226,6 +226,4 @@ service MetaServer {
   rpc InsertBlockHashes(InsertBlockHashesRequest) returns (InsertBlockHashesResponse);
   rpc RemoveBlockHashes(RemoveBlockHashesRequest) returns (RemoveBlockHashesResponse);
   rpc QueryPrefixBlocks(QueryPrefixBlocksRequest) returns (QueryPrefixBlocksResponse);
-  rpc Health(HealthRequest) returns (HealthResponse);
-  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
 }

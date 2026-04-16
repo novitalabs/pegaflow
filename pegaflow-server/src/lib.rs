@@ -17,7 +17,7 @@ pub use service::GrpcEngineService;
 
 use clap::Parser;
 use cudarc::driver::result as cuda_driver;
-use log::{error, info};
+use log::{error, info, warn};
 use opentelemetry::global;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
@@ -506,32 +506,43 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             Arc::clone(&hll_tracker),
         );
 
-        // Spawn background GC task for stale inflight blocks
+        // Spawn background GC task for stale inflight blocks and expired transfer locks
         {
             let engine = Arc::clone(&engine);
             let shutdown = Arc::clone(&shutdown);
             tokio::spawn(async move {
-                const GC_INTERVAL: Duration = Duration::from_secs(300); // 5 minutes
-                const GC_MAX_AGE: Duration = Duration::from_secs(3600); // 60 minutes
+                const GC_INTERVAL: Duration = Duration::from_secs(60);
+                const INFLIGHT_MAX_AGE: Duration = Duration::from_secs(300); // 5 min
+                const FAILED_REMOTE_MAX_AGE: Duration = Duration::from_secs(300); // 5 min
                 let mut interval = tokio::time::interval(GC_INTERVAL);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
                 loop {
                     tokio::select! {
                         _ = interval.tick() => {
-                            let cleaned = engine.gc_stale_inflight(GC_MAX_AGE).await;
+                            let (cleaned, failed) = engine
+                                .gc_stale_inflight(INFLIGHT_MAX_AGE, FAILED_REMOTE_MAX_AGE)
+                                .await;
                             if cleaned > 0 {
                                 info!("Inflight GC: cleaned {} stale blocks", cleaned);
                             }
+                            if failed > 0 {
+                                info!("Inflight GC: cleared {} stale failed_remote entries", failed);
+                            }
+
+                            let expired_locks = engine.gc_expired_transfer_locks();
+                            if expired_locks > 0 {
+                                warn!("Transfer lock GC: expired {} stale sessions", expired_locks);
+                            }
                         }
                         _ = shutdown.notified() => {
-                            info!("Inflight GC task shutting down");
+                            info!("Background GC task shutting down");
                             break;
                         }
                     }
                 }
             });
-            info!("Inflight GC task started (interval=5m, max_age=60m)");
+            info!("Background GC task started (interval=60s, inflight_max_age=5m, failed_remote_max_age=5m)");
         }
 
         // Start HTTP server for health check (always enabled)

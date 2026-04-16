@@ -139,8 +139,7 @@ async fn wait_for_grpc_ready(port: u16) {
 
 async fn spawn_metaserver(port: u16) -> Arc<BlockHashStore> {
     let store = Arc::new(BlockHashStore::new());
-    let shutdown = Arc::new(Notify::new());
-    let service = GrpcMetaService::new(Arc::clone(&store), shutdown);
+    let service = GrpcMetaService::new(Arc::clone(&store));
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
     tokio::spawn(async move {
         Server::builder()
@@ -213,8 +212,7 @@ async fn wait_for_metaserver_registration(
 ) {
     let deadline = Instant::now() + timeout;
     loop {
-        store.run_pending_tasks().await;
-        let found = store.query_prefix(namespace, hashes).await;
+        let found = store.query_prefix(namespace, hashes);
         if found.len() >= expected {
             return;
         }

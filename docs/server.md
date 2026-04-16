@@ -60,5 +60,4 @@ pegaflow-server --metaserver-addr http://<metaserver-host>:50056
 
 - `--addr`: Bind address (default: `127.0.0.1:50056`)
 - `--log-level`: Log level: `trace`, `debug`, `info`, `warn`, `error` (default: `info`)
-- `--max-capacity-mb`: Maximum cache capacity in MB (default: `512`)
 - `--ttl-minutes`: Cache entry TTL in minutes (default: `120`)

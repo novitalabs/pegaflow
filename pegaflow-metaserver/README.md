@@ -7,7 +7,8 @@ A gRPC server for managing block hash keys across multi-node PegaFlow instances.
 The MetaServer acts as a coordination service for distributed PegaFlow deployments. It maintains a global registry of block hash keys, allowing PegaFlow instances to:
 
 - **Insert block hashes**: Register blocks that have been saved locally
-- **Query block hashes**: Check which blocks exist in the distributed system
+- **Remove block hashes**: Deregister blocks on cache eviction (owner-conditional)
+- **Query block hashes**: Check which blocks exist and on which nodes (multi-owner aware)
 - **Namespace isolation**: Separate blocks by model/namespace
 
 ## Architecture
@@ -59,11 +60,11 @@ cargo run -p pegaflow-metaserver -- --addr 0.0.0.0:50056
 # With debug logging
 cargo run -p pegaflow-metaserver -- --log-level debug
 
-# Custom cache capacity (1GB) and TTL (60 minutes)
-cargo run -p pegaflow-metaserver -- --max-capacity-mb 1024 --ttl-minutes 60
+# Custom TTL (60 minutes)
+cargo run -p pegaflow-metaserver -- --ttl-minutes 60
 
 # All options combined
-cargo run -p pegaflow-metaserver -- --addr 0.0.0.0:50056 --max-capacity-mb 2048 --ttl-minutes 180 --log-level info
+cargo run -p pegaflow-metaserver -- --addr 0.0.0.0:50056 --ttl-minutes 180 --log-level info
 
 # Show all options
 cargo run -p pegaflow-metaserver -- --help
@@ -73,26 +74,16 @@ cargo run -p pegaflow-metaserver -- --help
 
 - `--addr <ADDR>`: Bind address (default: `127.0.0.1:50056`)
 - `--log-level <LEVEL>`: Log level: `trace`, `debug`, `info`, `warn`, `error` (default: `info`)
-- `--max-capacity-mb <MB>`: Maximum cache capacity in MB (default: `512`)
 - `--ttl-minutes <MINUTES>`: Cache entry TTL in minutes (default: `120`)
 
-### Cache Configuration
+### Storage Configuration
 
-The MetaServer uses an in-memory cache with the following settings:
+The MetaServer uses a DashMap-based in-memory store with the following characteristics:
 
-- **Default Max Capacity**: 512 MB (configurable via `--max-capacity-mb`)
-- **Eviction Policy**: LRU (Least Recently Used)
-- **TTL (Time-To-Live)**: 120 minutes (configurable via `--ttl-minutes`)
-- **Size Calculation**: Automatic based on key allocated capacity (namespace + hash + overhead)
-- **Async Operations**: All cache operations are non-blocking async
-
-The cache automatically evicts least recently used entries when the memory limit is reached, and all entries expire after the configured TTL. This ensures the service operates within memory constraints even under high load while preventing stale entries from accumulating indefinitely.
-
-You can customize the cache behavior using CLI flags:
-```bash
-# Example: 1GB capacity with 60-minute TTL
-cargo run -p pegaflow-metaserver -- --max-capacity-mb 1024 --ttl-minutes 60
-```
+- **Multi-owner**: A block hash can be registered by multiple nodes simultaneously
+- **TTL (Time-To-Live)**: 120 minutes default (configurable via `--ttl-minutes`). A background task sweeps expired entries every 10 minutes to prevent leaks from crashed nodes.
+- **Conditional removal**: `RemoveBlockHashes` only removes the requesting node's ownership; other nodes' entries are untouched.
+- **Memory**: Scales with unique blocks across all nodes. No hard capacity cap — memory is naturally bounded by the total number of blocks in the cluster.
 
 ## gRPC APIs
 
@@ -100,7 +91,7 @@ The MetaServer provides the following gRPC endpoints:
 
 ### 1. InsertBlockHashes
 
-Register a list of block hashes. Matches the `BlockKey` structure from pegaflow-core.
+Register a list of block hashes. Re-inserting refreshes the TTL timestamp.
 
 **Request:**
 ```protobuf
@@ -119,138 +110,80 @@ message InsertBlockHashesResponse {
 }
 ```
 
-### 2. QueryBlockHashes
+### 2. RemoveBlockHashes
 
-Query which block hashes exist in the system. Matches the `BlockKey` structure from pegaflow-core.
+Remove block hashes owned by a specific node (conditional delete).
 
 **Request:**
 ```protobuf
-message QueryBlockHashesRequest {
-  string namespace = 1;         // Model namespace (part of BlockKey)
-  repeated bytes block_hashes = 2;  // List of hashes to query (part of BlockKey)
+message RemoveBlockHashesRequest {
+  string namespace = 1;
+  repeated bytes block_hashes = 2;
+  string node = 3;              // Only this node's ownership is removed
 }
 ```
 
 **Response:**
 ```protobuf
-message NodeBlockHashes {
-  string node = 1;                      // Owning pegaflow-server (ip:port)
-  repeated bytes block_hashes = 2;      // Block hashes on this node
-}
-
-message QueryBlockHashesResponse {
-  ResponseStatus status = 1;            // Success/error status
-  repeated bytes existing_hashes = 2;   // Hashes that exist
-  uint64 total_queried = 3;             // Total number queried
-  uint64 found_count = 4;              // Number found
-  repeated NodeBlockHashes node_blocks = 5;  // Found hashes grouped by node
+message RemoveBlockHashesResponse {
+  ResponseStatus status = 1;
+  uint64 removed_count = 2;
 }
 ```
 
-### 3. Health
+### 3. QueryPrefixBlocks
+
+Query the longest contiguous prefix of block hashes that exist, with per-node prefix lengths.
+
+**Request:**
+```protobuf
+message QueryPrefixBlocksRequest {
+  string namespace = 1;
+  repeated bytes block_hashes = 2;  // Ordered list of block hashes
+}
+```
+
+**Response:**
+```protobuf
+message NodePrefixResult {
+  string node = 1;
+  uint32 prefix_len = 2;       // Consecutive hashes from h0 this node owns
+}
+
+message QueryPrefixBlocksResponse {
+  repeated NodePrefixResult nodes = 1;
+}
+```
+
+### 4. Health
 
 Health check endpoint.
 
 **Request:** `HealthRequest {}`
 **Response:** `HealthResponse { status }`
 
-### 4. Shutdown
+### 5. Shutdown
 
 Graceful shutdown trigger.
 
 **Request:** `ShutdownRequest {}`
 **Response:** `ShutdownResponse { status }`
 
-## Example Usage
-
-See [examples/basic_client.rs](examples/basic_client.rs) for a complete example.
-
-```bash
-# Terminal 1: Start the server
-cargo run -p pegaflow-metaserver
-
-# Terminal 2: Run the example client
-cargo run -p pegaflow-metaserver --example basic_client
-```
-
-### Quick Example
-
-```rust
-use pegaflow_proto::proto::engine::meta_server_client::MetaServerClient;
-use pegaflow_proto::proto::engine::{InsertBlockHashesRequest, QueryBlockHashesRequest};
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Connect to metaserver
-    let mut client = MetaServerClient::connect("http://127.0.0.1:50056").await?;
-
-    // Insert block hashes with node ownership
-    let request = InsertBlockHashesRequest {
-        namespace: "llama3-70b".to_string(),
-        block_hashes: vec![
-            vec![1, 2, 3, 4, 5, 6, 7, 8],
-            vec![9, 10, 11, 12, 13, 14, 15, 16],
-        ],
-        node: "10.0.0.1:50055".to_string(),
-    };
-
-    let response = client.insert_block_hashes(request).await?;
-    println!("Inserted: {}", response.into_inner().inserted_count);
-
-    // Query block hashes (returns node ownership info)
-    let request = QueryBlockHashesRequest {
-        namespace: "llama3-70b".to_string(),
-        block_hashes: vec![
-            vec![1, 2, 3, 4, 5, 6, 7, 8],
-            vec![99, 99, 99, 99, 99, 99, 99, 99],  // doesn't exist
-        ],
-    };
-
-    let response = client.query_block_hashes(request).await?;
-    let inner = response.into_inner();
-    println!("Found: {}/{}", inner.found_count, inner.total_queried);
-    for nb in &inner.node_blocks {
-        println!("Node {}: {} blocks", nb.node, nb.block_hashes.len());
-    }
-
-    Ok(())
-}
-```
-
 ## Storage Implementation
 
-The MetaServer uses a high-performance async cache based on **Moka**:
-
-- **Cache**: `moka::future::Cache<BlockKey, Arc<str>>` - async concurrent cache mapping block keys to owning node URLs, with LRU eviction and TTL
-- **BlockKey**: `{ namespace: String, hash: Vec<u8> }` - matches pegaflow-core's BlockKey
-- **Eviction Policy**: LRU (Least Recently Used)
-- **TTL**: 120 minutes - entries automatically expire after 2 hours
-- **Capacity Management**: Size-aware eviction with configurable max capacity (default: 512 MB)
-- **Concurrency**: Fully async with high-performance concurrent operations optimized for high-throughput services
-- **Memory Safety**: Automatic eviction when cache size exceeds max capacity or TTL expires
+- **Data structure**: `DashMap<BlockKey, HashMap<Arc<str>, Instant>>` — each block key maps to a set of owning nodes with their registration timestamps
+- **BlockKey**: `{ namespace: String, hash: Vec<u8> }` — matches pegaflow-core's BlockKey
+- **Multi-owner**: Multiple nodes can register the same block hash (e.g., after replication or shared prefill)
+- **TTL sweep**: Background task runs every 10 minutes, removing per-node registrations older than the configured TTL
+- **Concurrency**: DashMap uses shard-level locking for high-throughput concurrent access
 - **Persistence**: In-memory only (restart clears state)
-
-### Future Enhancements
-
-Potential improvements for production deployments:
-
-- [ ] Persistent storage backend (Redis, RocksDB, etc.)
-- [ ] Replication and high availability
-- [x] TTL/expiration for stale entries (120 minutes)
-- [ ] Metrics and monitoring (Prometheus)
-- [ ] Authentication and authorization
-- [ ] Batch operations for improved performance
-- [ ] Compression for network efficiency
 
 ## Integration with PegaFlow Core
 
-To integrate the MetaServer with PegaFlow instances:
-
 1. **On block save**: Call `InsertBlockHashes` to register new blocks
-2. **On block query**: Call `QueryBlockHashes` to check remote availability
-3. **On block load**: Query metaserver, then fetch from remote instance if found
-
-The metaserver enables cross-node block discovery without peer-to-peer coordination.
+2. **On cache eviction**: Call `RemoveBlockHashes` to deregister evicted blocks
+3. **On block query**: Call `QueryPrefixBlocks` to discover which nodes hold a prefix
+4. **On block load**: Query metaserver, then fetch from the best remote node via RDMA
 
 ## Environment Variables
 

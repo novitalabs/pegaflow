@@ -123,8 +123,8 @@ PegaFlow automatically detects GPU–NIC NUMA affinity at startup. For best perf
 
 | Cluster size | Recommendation |
 |---|---|
-| 2–8 nodes | Defaults are fine (`512 MB`, `120 min` TTL) |
-| 8+ nodes | Increase `--max-capacity-mb` proportionally. Monitor MetaServer memory. |
+| 2–8 nodes | Defaults are fine (`120 min` TTL) |
+| 8+ nodes | Memory scales with unique blocks across all nodes; no capacity cap needed. Monitor MetaServer memory. |
 
 ### Metrics
 

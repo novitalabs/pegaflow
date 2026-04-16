@@ -591,13 +591,6 @@ impl Engine for GrpcEngineService {
             req.namespace, hash_count, req.requester_id,
         );
 
-        const MAX_TRANSFER_BLOCK_HASHES: usize = 1024;
-        if hash_count > MAX_TRANSFER_BLOCK_HASHES {
-            return Err(Status::invalid_argument(format!(
-                "block_hashes count {hash_count} exceeds maximum {MAX_TRANSFER_BLOCK_HASHES}"
-            )));
-        }
-
         if !self.engine.has_rdma_transport() {
             return Err(Status::failed_precondition(
                 "RDMA transfer engine is not configured",
