@@ -35,10 +35,6 @@ pub struct Cli {
     #[arg(long, default_value = "0.0.0.0:9092")]
     pub http_addr: SocketAddr,
 
-    /// Enable Prometheus /metrics endpoint on the HTTP server.
-    #[arg(long, default_value_t = true)]
-    pub enable_prometheus: bool,
-
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info")]
     pub log_level: String,
@@ -48,12 +44,7 @@ pub struct Cli {
     pub ttl_minutes: u64,
 }
 
-fn init_metrics(enabled: bool) -> Result<Option<(SdkMeterProvider, Registry)>, Box<dyn Error>> {
-    if !enabled {
-        info!("Prometheus metrics disabled");
-        return Ok(None);
-    }
-
+fn init_metrics() -> Result<(SdkMeterProvider, Registry), Box<dyn Error>> {
     let registry = Registry::new();
     let exporter = opentelemetry_prometheus::exporter()
         .with_registry(registry.clone())
@@ -62,7 +53,7 @@ fn init_metrics(enabled: bool) -> Result<Option<(SdkMeterProvider, Registry)>, B
     global::set_meter_provider(meter_provider.clone());
     info!("Prometheus metrics exporter enabled");
 
-    Ok(Some((meter_provider, registry)))
+    Ok((meter_provider, registry))
 }
 
 /// Wait for OS termination signal (Ctrl+C or SIGTERM), then notify dependents.
@@ -110,7 +101,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     info!("Cache entry TTL: {} minutes", cli.ttl_minutes);
 
     // Initialize metrics
-    let metrics_state = init_metrics(cli.enable_prometheus)?;
+    let (meter_provider, prometheus_registry) = init_metrics()?;
 
     // Create the block hash store with TTL
     let store = Arc::new(BlockHashStore::with_ttl(cli.ttl_minutes));
@@ -142,18 +133,9 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     let shutdown = Arc::new(Notify::new());
 
     // Start HTTP server for health check and metrics
-    let _http_handle = if let Some((_, ref prometheus_registry)) = metrics_state {
-        Some(
-            http_server::start_http_server(
-                cli.http_addr,
-                prometheus_registry.clone(),
-                Arc::clone(&shutdown),
-            )
-            .await?,
-        )
-    } else {
-        None
-    };
+    let _http_handle =
+        http_server::start_http_server(cli.http_addr, prometheus_registry, Arc::clone(&shutdown))
+            .await?;
 
     // Create the gRPC service
     let service = GrpcMetaService::new(store.clone());
@@ -172,10 +154,8 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     }
 
     // Flush metrics before exit
-    if let Some((provider, _)) = metrics_state {
-        if let Err(err) = provider.shutdown() {
-            error!("Failed to shutdown metrics provider: {err}");
-        }
+    if let Err(err) = meter_provider.shutdown() {
+        error!("Failed to shutdown metrics provider: {err}");
     }
 
     info!("MetaServer shut down gracefully");
