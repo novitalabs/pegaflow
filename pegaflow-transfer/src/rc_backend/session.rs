@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
+use std::time::Instant;
 
 use mea::oneshot;
 use std::thread;
@@ -30,7 +31,7 @@ const SEND_CQ_SIZE: u32 = MAX_SEND_WR;
 // Recv queue unused (one-sided RDMA only), keep minimal for driver compatibility.
 const RECV_CQ_SIZE: u32 = 2;
 const MAX_RECV_WR: u32 = 1;
-const MAX_RD_ATOMIC: u8 = 1;
+const MAX_RD_ATOMIC: u8 = 16;
 const PSN_MASK: u32 = 0x00ff_ffff;
 
 pub(crate) struct RdmaOp {
@@ -260,6 +261,7 @@ impl RcSession {
             return Ok(0);
         }
 
+        let start = Instant::now();
         let mut next_idx = 0usize;
         let mut next_wr_id = 1_u64;
         let mut inflight: HashMap<u64, usize> = HashMap::new();
@@ -323,6 +325,19 @@ impl RcSession {
             }
         }
 
+        let elapsed = start.elapsed();
+        let mib = transferred as f64 / (1024.0 * 1024.0);
+        let mib_per_sec = if elapsed.as_secs_f64() > 0.0 {
+            mib / elapsed.as_secs_f64()
+        } else {
+            0.0
+        };
+        debug!(
+            "session batch complete: local_qpn={}, op={op:?}, ops={}, bytes_mib={mib:.1}, elapsed_ms={:.3}, throughput_mib_s={mib_per_sec:.0}",
+            session.local_endpoint.qp_num,
+            total_ops,
+            elapsed.as_secs_f64() * 1000.0,
+        );
         Ok(transferred)
     }
 }

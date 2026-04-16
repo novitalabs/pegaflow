@@ -168,6 +168,7 @@ async fn rdma_fetch_task(
     let t0 = Instant::now();
 
     // 1. Ensure RDMA connection (singleflight: at most one handshake per remote_addr)
+    let connect_start = Instant::now();
     if let Err(e) = ensure_connected(
         connect_group,
         rdma,
@@ -183,8 +184,10 @@ async fn rdma_fetch_task(
             .add(1, &[KeyValue::new("status", "error")]);
         return Vec::new();
     }
+    let connect_elapsed = connect_start.elapsed();
 
     // 2. gRPC QueryBlocksForTransfer (connection already established)
+    let query_start = Instant::now();
     let (client, response) = match query_remote_blocks(
         grpc_channels,
         remote_addr,
@@ -203,6 +206,7 @@ async fn rdma_fetch_task(
             return Vec::new();
         }
     };
+    let query_elapsed = query_start.elapsed();
 
     let transfer_session_id = response.transfer_session_id.clone();
 
@@ -214,6 +218,7 @@ async fn rdma_fetch_task(
         .flat_map(|b| &b.slots)
         .map(|s| s.k_size + s.v_size)
         .sum();
+    let transfer_start = Instant::now();
     let result = match fetch_blocks_via_rdma(
         rdma,
         allocate_fn,
@@ -235,12 +240,22 @@ async fn rdma_fetch_task(
             return Vec::new();
         }
     };
+    let transfer_elapsed = transfer_start.elapsed();
 
     // 4. Release transfer lock (fire-and-forget: spawns a detached task)
     spawn_release_lock(client, transfer_session_id);
 
     let elapsed = t0.elapsed();
     let mb = total_bytes as f64 / (1024.0 * 1024.0);
+    debug!(
+        "RDMA fetch detail: remote={remote_addr}, blocks={}/{}, bytes_mib={mb:.1}, connect_ms={:.3}, query_ms={:.3}, transfer_ms={:.3}, total_ms={:.3}",
+        result.len(),
+        block_hashes.len(),
+        connect_elapsed.as_secs_f64() * 1000.0,
+        query_elapsed.as_secs_f64() * 1000.0,
+        transfer_elapsed.as_secs_f64() * 1000.0,
+        elapsed.as_secs_f64() * 1000.0,
+    );
     info!(
         "RDMA fetch from {remote_addr}: {}/{} blocks, {mb:.1} MiB in {elapsed:.1?} ({:.0} MiB/s)",
         result.len(),
@@ -324,12 +339,13 @@ async fn fetch_blocks_via_rdma(
         return Ok(Vec::new());
     }
 
+    let desc_build_start = Instant::now();
     // (block_hash, Vec<(slot_segments)>) — for building SealedBlock afterwards
     let mut block_allocs: Vec<(Vec<u8>, Vec<Vec<SegmentAlloc>>)> = Vec::new();
 
     // Build TransferDescs and submit RDMA READ inside a sync block so that
     // all_descs (which contains NonNull<u8>, !Send) is dropped before any .await.
-    let receivers = {
+    let (receivers, total_descs) = {
         let mut all_descs: Vec<TransferDesc> = Vec::new();
 
         for block_info in blocks {
@@ -388,23 +404,34 @@ async fn fetch_blocks_via_rdma(
         }
 
         // Submit RDMA READ; all_descs is dropped at the end of this block.
-        rdma.engine()
+        let total_descs = all_descs.len();
+        let receivers = rdma
+            .engine()
             .batch_transfer_async(TransferOp::Read, remote_addr, &all_descs)
-            .map_err(|e| format!("RDMA batch_transfer_async failed: {e}"))?
+            .map_err(|e| format!("RDMA batch_transfer_async failed: {e}"))?;
+        (receivers, total_descs)
     };
+    let desc_build_elapsed = desc_build_start.elapsed();
 
+    let active_sessions = receivers.len();
+    let wait_start = Instant::now();
+    let mut transferred_bytes = 0usize;
     tokio::time::timeout(transfer_timeout, async {
         for rx in receivers {
-            rx.await
-                .map_err(|_| "RDMA transfer channel closed".to_string())?
-                .map_err(|e| format!("RDMA transfer failed: {e}"))?;
+            transferred_bytes = transferred_bytes.saturating_add(
+                rx.await
+                    .map_err(|_| "RDMA transfer channel closed".to_string())?
+                    .map_err(|e| format!("RDMA transfer failed: {e}"))?,
+            );
         }
         Ok::<(), String>(())
     })
     .await
     .map_err(|_| "RDMA transfer timed out".to_string())??;
+    let wait_elapsed = wait_start.elapsed();
 
     // Build SealedBlocks from allocated memory
+    let seal_build_start = Instant::now();
     let mut result: PrefetchResult = Vec::with_capacity(block_allocs.len());
     for (hash, slot_allocs) in block_allocs {
         let key = BlockKey::new(namespace.to_string(), hash);
@@ -421,6 +448,18 @@ async fn fetch_blocks_via_rdma(
         let sealed = Arc::new(SealedBlock::from_slots(slots));
         result.push((key, sealed));
     }
+    let seal_build_elapsed = seal_build_start.elapsed();
+
+    debug!(
+        "RDMA read batch detail: remote={remote_addr}, blocks={}, descs={}, sessions={}, bytes_mib={:.1}, desc_build_ms={:.3}, wait_ms={:.3}, seal_build_ms={:.3}",
+        blocks.len(),
+        total_descs,
+        active_sessions,
+        transferred_bytes as f64 / (1024.0 * 1024.0),
+        desc_build_elapsed.as_secs_f64() * 1000.0,
+        wait_elapsed.as_secs_f64() * 1000.0,
+        seal_build_elapsed.as_secs_f64() * 1000.0,
+    );
 
     Ok(result)
 }

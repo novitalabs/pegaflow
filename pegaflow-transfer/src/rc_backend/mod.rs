@@ -3,6 +3,7 @@ mod session;
 mod state;
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -398,7 +399,8 @@ impl RcBackend {
 
         // --- Lock: look up connection + prepare ops ---
         let lookup_start = Instant::now();
-        let mut nic_work: Vec<(Arc<RcSession>, Vec<RdmaOp>)> = Vec::new();
+        let mut nic_work: Vec<(usize, Arc<RcSession>, Vec<RdmaOp>)> = Vec::new();
+        let mut nic_debug = String::new();
         {
             let state = self.state.lock();
 
@@ -426,6 +428,7 @@ impl RcBackend {
                 );
 
                 let mut prepared = Vec::with_capacity(nic_descs.len());
+                let mut nic_bytes = 0usize;
                 for desc in nic_descs {
                     let local_ptr = desc.local_ptr.as_ptr() as u64;
                     let remote_ptr = desc.remote_ptr.as_ptr() as u64;
@@ -445,6 +448,7 @@ impl RcBackend {
                             "remote memory not found in handshake snapshot",
                         ))?;
 
+                    nic_bytes = nic_bytes.saturating_add(len);
                     prepared.push(RdmaOp {
                         local_mr,
                         local_ptr,
@@ -453,23 +457,33 @@ impl RcBackend {
                         remote_rkey,
                     });
                 }
-                nic_work.push((session, prepared));
+                if !nic_debug.is_empty() {
+                    nic_debug.push_str(", ");
+                }
+                let _ = write!(
+                    nic_debug,
+                    "nic{nic_idx}: {} ops/{:.1} MiB",
+                    prepared.len(),
+                    nic_bytes as f64 / (1024.0 * 1024.0)
+                );
+                nic_work.push((nic_idx, session, prepared));
             }
         }
         let lookup_dur = lookup_start.elapsed();
 
         debug!(
-            "batch_transfer_async_{:?}: nics_active={}/{}, chunks={}, lookup_ms={:.3}",
+            "batch_transfer_async_{:?}: nics_active={}/{}, chunks={}, lookup_ms={:.3}, per_nic=[{}]",
             op,
             nic_work.len(),
             nic_count,
             descs.len(),
             lookup_dur.as_secs_f64() * 1000.0,
+            nic_debug,
         );
 
         // --- Submit outside lock ---
         let mut receivers = Vec::with_capacity(nic_work.len());
-        for (session, prepared) in nic_work {
+        for (_nic_idx, session, prepared) in nic_work {
             receivers.push(session.transfer_batch_async(prepared, op)?);
         }
         Ok(receivers)
