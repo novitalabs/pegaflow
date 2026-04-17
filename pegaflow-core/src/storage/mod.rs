@@ -268,9 +268,13 @@ impl StorageEngine {
             }
 
             let (freed_blocks, _freed_bytes, largest_free) =
-                self.reclaim_until_allocator_can_allocate(requested_bytes);
+                self.reclaim_until_allocator_can_allocate(requested_bytes, node);
 
-            if freed_blocks == 0 || largest_free < requested_bytes {
+            if freed_blocks == 0 && largest_free < requested_bytes {
+                // Final retry: absorb concurrent frees that may have raced with reclaim probing.
+                if let Some(alloc) = self.allocator.allocate(size, node) {
+                    return Some(alloc);
+                }
                 break;
             }
         }
@@ -371,14 +375,22 @@ impl StorageEngine {
             .await
     }
 
-    fn reclaim_until_allocator_can_allocate(&self, required_bytes: u64) -> (usize, u64, u64) {
+    fn reclaim_until_allocator_can_allocate(
+        &self,
+        required_bytes: u64,
+        target_node: NumaNode,
+    ) -> (usize, u64, u64) {
         if required_bytes == 0 {
-            return (0, 0, self.allocator.largest_free_allocation());
+            return (
+                0,
+                0,
+                self.allocator.largest_free_allocation_for_node(target_node),
+            );
         }
 
         let mut freed_blocks = 0usize;
         let mut freed_bytes = 0u64;
-        let mut largest_free = self.allocator.largest_free_allocation();
+        let mut largest_free = self.allocator.largest_free_allocation_for_node(target_node);
 
         while largest_free < required_bytes {
             let used_before = self.allocator.usage().0;
@@ -427,7 +439,7 @@ impl StorageEngine {
                     .add(reclaimed, &[]);
             }
 
-            largest_free = self.allocator.largest_free_allocation();
+            largest_free = self.allocator.largest_free_allocation_for_node(target_node);
         }
 
         if freed_blocks > 0 {
