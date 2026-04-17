@@ -42,6 +42,14 @@ pub struct Cli {
     /// Cache entry TTL in minutes
     #[arg(long, default_value = "120")]
     pub ttl_minutes: u64,
+
+    /// Heartbeat suspect threshold in seconds (node marked suspect after this)
+    #[arg(long, default_value = "30")]
+    pub suspect_secs: u64,
+
+    /// Heartbeat hard-delete threshold in seconds (node purged after this)
+    #[arg(long, default_value = "90")]
+    pub hard_delete_secs: u64,
 }
 
 fn init_metrics() -> Result<(SdkMeterProvider, Registry), Box<dyn Error>> {
@@ -103,8 +111,17 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     // Initialize metrics
     let (meter_provider, prometheus_registry) = init_metrics()?;
 
-    // Create the block hash store with TTL
-    let store = Arc::new(BlockHashStore::with_ttl(cli.ttl_minutes));
+    info!(
+        "Liveness config: suspect={}s, hard_delete={}s",
+        cli.suspect_secs, cli.hard_delete_secs
+    );
+
+    // Create the block hash store with TTL and liveness config
+    let store = Arc::new(BlockHashStore::with_liveness_config(
+        cli.ttl_minutes,
+        cli.suspect_secs,
+        cli.hard_delete_secs,
+    ));
 
     // Register store observable gauges
     metric::register_store_gauges(&store);
@@ -127,6 +144,22 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
                 }
             }
         });
+    }
+
+    // Spawn liveness sweep task (every 5s)
+    {
+        let store = Arc::clone(&store);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                let (suspect, purged) = store.sweep_liveness();
+                if suspect > 0 || purged > 0 {
+                    metric::record_liveness_sweep(suspect as u64, purged as u64);
+                }
+            }
+        });
+        info!("Liveness sweep task started (interval=5s)");
     }
 
     // Create shutdown notifier

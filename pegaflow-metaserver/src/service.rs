@@ -1,9 +1,9 @@
 use crate::metric::record_rpc_result;
 use crate::proto::engine::meta_server_server::MetaServer;
 use crate::proto::engine::{
-    InsertBlockHashesRequest, InsertBlockHashesResponse, NodePrefixResult,
-    QueryPrefixBlocksRequest, QueryPrefixBlocksResponse, RemoveBlockHashesRequest,
-    RemoveBlockHashesResponse, ResponseStatus,
+    ByeRequest, ByeResponse, HeartbeatRequest, HeartbeatResponse, InsertBlockHashesRequest,
+    InsertBlockHashesResponse, NodePrefixResult, QueryPrefixBlocksRequest,
+    QueryPrefixBlocksResponse, RemoveBlockHashesRequest, RemoveBlockHashesResponse, ResponseStatus,
 };
 use crate::store::BlockHashStore;
 use log::{debug, info};
@@ -30,6 +30,14 @@ impl GrpcMetaService {
 
     fn error_status(message: String) -> ResponseStatus {
         ResponseStatus { ok: false, message }
+    }
+
+    fn validate_node_epoch(node: &str, epoch: &str) -> Result<(), Status> {
+        if node.is_empty() || epoch.is_empty() {
+            Err(Status::invalid_argument("node and epoch are required"))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -184,6 +192,48 @@ impl MetaServer for GrpcMetaService {
         record_rpc_result("query_prefix_blocks", &result, start);
         result
     }
+
+    async fn heartbeat(
+        &self,
+        request: Request<HeartbeatRequest>,
+    ) -> Result<Response<HeartbeatResponse>, Status> {
+        let start = Instant::now();
+        let req = request.into_inner();
+
+        debug!("RPC [heartbeat]: node={} epoch={}", req.node, req.epoch);
+
+        if let Err(e) = Self::validate_node_epoch(&req.node, &req.epoch) {
+            let result: Result<Response<HeartbeatResponse>, Status> = Err(e);
+            record_rpc_result("heartbeat", &result, start);
+            return result;
+        }
+
+        self.store.heartbeat(&req.node, &req.epoch);
+
+        let result = Ok(Response::new(HeartbeatResponse {}));
+        record_rpc_result("heartbeat", &result, start);
+        result
+    }
+
+    async fn bye(&self, request: Request<ByeRequest>) -> Result<Response<ByeResponse>, Status> {
+        let start = Instant::now();
+        let req = request.into_inner();
+
+        info!("RPC [bye]: node={} epoch={}", req.node, req.epoch);
+
+        if let Err(e) = Self::validate_node_epoch(&req.node, &req.epoch) {
+            let result: Result<Response<ByeResponse>, Status> = Err(e);
+            record_rpc_result("bye", &result, start);
+            return result;
+        }
+
+        let purged = self.store.bye(&req.node, &req.epoch);
+        info!("RPC [bye]: node={} purged={} entries", req.node, purged);
+
+        let result = Ok(Response::new(ByeResponse {}));
+        record_rpc_result("bye", &result, start);
+        result
+    }
 }
 
 #[cfg(test)]
@@ -193,6 +243,14 @@ mod tests {
 
     fn make_service() -> GrpcMetaService {
         GrpcMetaService::new(Arc::new(BlockHashStore::new()))
+    }
+
+    fn make_service_with_liveness(suspect_secs: u64, hard_delete_secs: u64) -> GrpcMetaService {
+        GrpcMetaService::new(Arc::new(BlockHashStore::with_liveness_config(
+            120,
+            suspect_secs,
+            hard_delete_secs,
+        )))
     }
 
     #[tokio::test]
@@ -341,5 +399,107 @@ mod tests {
             nodes,
             vec![(node_a.to_string(), 4), (node_b.to_string(), 3),]
         );
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_rpc() {
+        let svc = make_service();
+
+        let resp = svc
+            .heartbeat(Request::new(HeartbeatRequest {
+                node: "node-a".into(),
+                epoch: "epoch-1".into(),
+            }))
+            .await;
+        assert!(resp.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_rpc_empty_fields_rejected() {
+        let svc = make_service();
+
+        let resp = svc
+            .heartbeat(Request::new(HeartbeatRequest {
+                node: "".into(),
+                epoch: "epoch-1".into(),
+            }))
+            .await;
+        assert!(resp.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_bye_rpc_purges_entries() {
+        let svc = make_service();
+
+        // Register heartbeat + insert blocks
+        svc.heartbeat(Request::new(HeartbeatRequest {
+            node: "node-a".into(),
+            epoch: "epoch-1".into(),
+        }))
+        .await
+        .unwrap();
+
+        svc.insert_block_hashes(Request::new(InsertBlockHashesRequest {
+            namespace: "ns".into(),
+            block_hashes: vec![vec![1], vec![2]],
+            node: "node-a".into(),
+        }))
+        .await
+        .unwrap();
+
+        // Bye → purge
+        let resp = svc
+            .bye(Request::new(ByeRequest {
+                node: "node-a".into(),
+                epoch: "epoch-1".into(),
+            }))
+            .await;
+        assert!(resp.is_ok());
+
+        // Query should return empty
+        let query_resp = svc
+            .query_prefix_blocks(Request::new(QueryPrefixBlocksRequest {
+                namespace: "ns".into(),
+                block_hashes: vec![vec![1], vec![2]],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(query_resp.nodes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_query_excludes_suspect_after_sweep() {
+        // suspect_threshold=0 → immediately suspect
+        let svc = make_service_with_liveness(0, 3600);
+
+        svc.heartbeat(Request::new(HeartbeatRequest {
+            node: "node-a".into(),
+            epoch: "epoch-1".into(),
+        }))
+        .await
+        .unwrap();
+
+        svc.insert_block_hashes(Request::new(InsertBlockHashesRequest {
+            namespace: "ns".into(),
+            block_hashes: vec![vec![1]],
+            node: "node-a".into(),
+        }))
+        .await
+        .unwrap();
+
+        // Trigger sweep → node-a becomes suspect
+        svc.store.sweep_liveness();
+
+        // Query should filter out suspect node
+        let query_resp = svc
+            .query_prefix_blocks(Request::new(QueryPrefixBlocksRequest {
+                namespace: "ns".into(),
+                block_hashes: vec![vec![1]],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(query_resp.nodes.is_empty());
     }
 }

@@ -1,12 +1,16 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 
 use log::{debug, error, info, warn};
 use pegaflow_proto::proto::engine::meta_server_client::MetaServerClient as MetaServerGrpcClient;
 use pegaflow_proto::proto::engine::{
-    InsertBlockHashesRequest, NodePrefixResult, QueryPrefixBlocksRequest, RemoveBlockHashesRequest,
+    ByeRequest, HeartbeatRequest, InsertBlockHashesRequest, NodePrefixResult,
+    QueryPrefixBlocksRequest, RemoveBlockHashesRequest,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tonic::transport::{Channel, Endpoint};
+use uuid::Uuid;
 
 use crate::metrics::core_metrics;
 
@@ -28,6 +32,7 @@ impl std::fmt::Display for ClientError {
 
 const INITIAL_BACKOFF_MS: u64 = 100;
 const MAX_BACKOFF_MS: u64 = 30_000;
+const HEARTBEAT_INTERVAL_SECS: u64 = 10;
 
 pub struct MetaServerClientConfig {
     pub metaserver_addr: String,
@@ -67,19 +72,31 @@ pub struct MetaServerClient {
     command_tx: mpsc::Sender<MetaServerCommand>,
     /// Lazy-connect query client
     query_client: MetaServerGrpcClient<Channel>,
+    /// Unique epoch per process start
+    epoch: String,
+    /// Advertise address for this server
+    advertise_addr: String,
 }
 
 impl MetaServerClient {
-    /// Create a new client and spawn the background registration loop.
+    /// Create a new client and spawn the background registration loop and heartbeat loop.
     ///
     /// Must be called from within a tokio runtime context.
-    pub fn new(config: MetaServerClientConfig) -> Self {
+    pub fn new(config: MetaServerClientConfig, shutdown: Arc<Notify>) -> Self {
         let (command_tx, rx) = mpsc::channel(config.queue_depth);
+        let epoch = Uuid::new_v4().to_string();
 
         tokio::spawn(registration_loop(
             rx,
             config.metaserver_addr.clone(),
-            config.advertise_addr,
+            config.advertise_addr.clone(),
+        ));
+
+        tokio::spawn(heartbeat_loop(
+            config.metaserver_addr.clone(),
+            config.advertise_addr.clone(),
+            epoch.clone(),
+            shutdown,
         ));
 
         // Lazy-connect query client: connects on first RPC, not here
@@ -89,13 +106,15 @@ impl MetaServerClient {
         let query_client = MetaServerGrpcClient::new(channel);
 
         info!(
-            "MetaServer client started (queue_depth={}, addr={})",
-            config.queue_depth, config.metaserver_addr
+            "MetaServer client started (queue_depth={}, addr={}, epoch={})",
+            config.queue_depth, config.metaserver_addr, epoch
         );
 
         Self {
             command_tx,
             query_client,
+            epoch,
+            advertise_addr: config.advertise_addr,
         }
     }
 
@@ -199,6 +218,58 @@ impl MetaServerClient {
         );
 
         Ok(resp.nodes)
+    }
+
+    /// Send a Bye RPC to MetaServer for graceful shutdown.
+    /// This triggers immediate purge of all block entries for this node.
+    pub async fn bye(&self) {
+        let req = ByeRequest {
+            node: self.advertise_addr.clone(),
+            epoch: self.epoch.clone(),
+        };
+        match self.query_client.clone().bye(req).await {
+            Ok(_) => info!(
+                "Sent Bye to MetaServer (node={}, epoch={})",
+                self.advertise_addr, self.epoch
+            ),
+            Err(e) => warn!("Failed to send Bye to MetaServer: {e}"),
+        }
+    }
+}
+
+async fn heartbeat_loop(
+    metaserver_addr: String,
+    node: String,
+    epoch: String,
+    shutdown: Arc<Notify>,
+) {
+    let channel = Endpoint::from_shared(metaserver_addr)
+        .expect("valid metaserver_addr URI")
+        .connect_lazy();
+    let mut client = MetaServerGrpcClient::new(channel);
+    let mut interval = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
+
+    info!(
+        "Heartbeat loop started (node={}, epoch={}, interval={}s)",
+        node, epoch, HEARTBEAT_INTERVAL_SECS
+    );
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let req = HeartbeatRequest {
+                    node: node.clone(),
+                    epoch: epoch.clone(),
+                };
+                if let Err(e) = client.heartbeat(req).await {
+                    warn!("Heartbeat to MetaServer failed: {e}");
+                }
+            }
+            _ = shutdown.notified() => {
+                info!("Heartbeat loop shutting down");
+                break;
+            }
+        }
     }
 }
 

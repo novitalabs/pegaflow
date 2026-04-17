@@ -54,6 +54,8 @@ pub struct StorageConfig {
     pub metaserver_queue_depth: usize,
     /// Number of shards for the pinned memory pool (reduces allocator lock contention).
     pub pool_shards: usize,
+    /// Shutdown notifier for background tasks (heartbeat loop, etc.).
+    pub shutdown: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl Default for StorageConfig {
@@ -71,6 +73,7 @@ impl Default for StorageConfig {
             advertise_addr: None,
             metaserver_queue_depth: crate::internode::DEFAULT_METASERVER_QUEUE_DEPTH,
             pool_shards: 1,
+            shutdown: None,
         }
     }
 }
@@ -103,6 +106,7 @@ impl StorageEngine {
         let transfer_lock_timeout = config.transfer_lock_timeout;
 
         // Create MetaServer client if configured
+        let shutdown = config.shutdown.clone();
         let metaserver_client = config.metaserver_addr.as_ref().map(|addr| {
             let advertise = config
                 .advertise_addr
@@ -114,7 +118,10 @@ impl StorageEngine {
             );
             let ms_config = MetaServerClientConfig::new(addr.clone(), advertise)
                 .with_queue_depth(config.metaserver_queue_depth);
-            Arc::new(MetaServerClient::new(ms_config))
+            let shutdown_notify = shutdown
+                .clone()
+                .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new()));
+            Arc::new(MetaServerClient::new(ms_config, shutdown_notify))
         });
 
         if blockwise_alloc {
@@ -522,6 +529,13 @@ impl StorageEngine {
 
     pub(crate) fn rdma_transport(&self) -> Option<&Arc<RdmaTransport>> {
         self.rdma_transport.as_ref()
+    }
+
+    /// Send Bye to MetaServer for graceful shutdown.
+    pub(crate) async fn metaserver_bye(&self) {
+        if let Some(client) = &self.metaserver_client {
+            client.bye().await;
+        }
     }
 }
 

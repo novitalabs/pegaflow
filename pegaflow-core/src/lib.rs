@@ -647,4 +647,9 @@ impl PegaEngine {
         info!("RDMA handshake accepted: client={client_addr}");
         Ok(server_meta.to_bytes())
     }
+
+    /// Send Bye to MetaServer for graceful shutdown.
+    pub async fn metaserver_bye(&self) {
+        self.storage.metaserver_bye().await;
+    }
 }
