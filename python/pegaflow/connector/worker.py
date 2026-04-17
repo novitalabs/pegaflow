@@ -171,7 +171,7 @@ class WorkerConnector:
         if not ok:
             raise RuntimeError(f"Register context failed for {layer_name}: {message}")
 
-        logger.info(
+        logger.debug(
             "[PegaKVConnector] Registered %d KV cache layers (%s layout) instance=%s",
             len(kv_caches),
             layout,
@@ -224,7 +224,7 @@ class WorkerConnector:
                             state,
                         )
                     else:
-                        logger.info(
+                        logger.debug(
                             "[PegaKVConnector] async_load_completed: reqs=%s",
                             req_ids,
                         )
@@ -254,7 +254,7 @@ class WorkerConnector:
                     self._stats.record_load(duration, num_blocks, success)
 
         if finished_sending:
-            logger.info(
+            logger.debug(
                 "[PegaKVConnector] async_save_completed: reqs=%s",
                 finished_sending,
             )
@@ -386,7 +386,7 @@ class WorkerConnector:
         self._save_queue.put(SaveTask(metadata=metadata, request_ids=request_ids))
 
     def _save_worker(self) -> None:
-        logger.info("[PegaKVConnector] Save worker thread started")
+        logger.debug("[PegaKVConnector] Save worker thread started")
 
         while True:
             task = self._save_queue.get()
@@ -401,7 +401,7 @@ class WorkerConnector:
                     if t is None:
                         self._process_save_batch(batch)
                         self._save_queue.task_done()
-                        logger.info("[PegaKVConnector] Save worker thread stopped")
+                        logger.debug("[PegaKVConnector] Save worker thread stopped")
                         return
                     batch.append(t)
                 except queue.Empty:
@@ -411,7 +411,7 @@ class WorkerConnector:
             for _ in batch:
                 self._save_queue.task_done()
 
-        logger.info("[PegaKVConnector] Save worker thread stopped")
+        logger.debug("[PegaKVConnector] Save worker thread stopped")
 
     def _process_save_batch(self, batch: list[SaveTask]) -> None:
         saves_by_layer: dict[str, tuple[list[int], list[bytes]]] = {}
@@ -536,16 +536,16 @@ class WorkerConnector:
                     events_to_wait.append((req_id, event))
 
         if events_to_wait:
-            logger.info(
+            logger.debug(
                 "[PegaKVConnector] preemption: waiting for %d requests' saves: %s",
                 len(events_to_wait),
                 [req_id for req_id, _ in events_to_wait],
             )
             for req_id, event in events_to_wait:
                 event.wait()
-                logger.info("[PegaKVConnector] preemption: req=%s save completed", req_id)
+                logger.debug("[PegaKVConnector] preemption: req=%s save completed", req_id)
         else:
-            logger.info(
+            logger.debug(
                 "[PegaKVConnector] preemption: %d requests (no pending saves)",
                 len(preempted_req_ids),
             )
