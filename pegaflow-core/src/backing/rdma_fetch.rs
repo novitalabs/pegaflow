@@ -3,6 +3,7 @@
 // Follows the same submit/oneshot pattern as SsdBackingStore::submit_prefix so that
 // PrefetchScheduler can treat remote fetch the same way it treats SSD prefetch.
 
+use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -256,11 +257,12 @@ async fn rdma_fetch_task(
         0.0
     };
     info!(
-        "RDMA fetch summary: req_id={req_id} remote={remote_addr} blocks={}/{} slots={} descs={} bytes_mib={mb:.1} total_ms={elapsed_ms:.2} tp_mib_s={throughput_mib_s:.0}",
+        "RDMA fetch summary: req_id={req_id} remote={remote_addr} blocks={}/{} slots={} descs={} slabs={} bytes_mib={mb:.1} total_ms={elapsed_ms:.2} tp_mib_s={throughput_mib_s:.0}",
         result.len(),
         block_hashes.len(),
         transfer_timing.slot_count,
         transfer_timing.transfer_desc_count,
+        transfer_timing.numa_slab_count,
     );
     info!(
         "RDMA fetch stages: req_id={req_id} remote={remote_addr} connect_ms={:.2} query_ms={:.2} build_transfer_tasks_ms={:.2} submit_transfer_ms={:.2} rdma_wait_ms={:.2} rebuild_ms={:.2}",
@@ -344,6 +346,9 @@ async fn fetch_blocks_via_rdma(
         return Ok((Vec::new(), TransferTiming::default()));
     }
 
+    let bytes_per_numa = sum_segment_bytes_by_numa(blocks)?;
+    let mut numa_slabs = allocate_numa_slabs(allocate_fn, bytes_per_numa)?;
+
     // (block_hash, Vec<(slot_segments)>) — for building SealedBlock afterwards
     let mut block_allocs: Vec<(Vec<u8>, Vec<Vec<SegmentAlloc>>)> = Vec::new();
     let mut slot_count = 0usize;
@@ -364,39 +369,41 @@ async fn fetch_blocks_via_rdma(
 
                 // K segment
                 if slot.k_size > 0 {
-                    let alloc = allocate_fn(slot.k_size, Some(numa)).ok_or_else(|| {
-                        format!("failed to allocate {} bytes for K segment", slot.k_size)
-                    })?;
-                    let local_ptr = alloc.as_non_null();
+                    let len = usize::try_from(slot.k_size)
+                        .map_err(|_| format!("K size exceeds usize: {}", slot.k_size))?;
+                    let (local_ptr, alloc) =
+                        alloc_segment_from_slab(&mut numa_slabs, numa, len, "K")?;
                     let remote_ptr = NonNull::new(slot.k_ptr as *mut u8)
                         .ok_or_else(|| "remote K ptr is null".to_string())?;
                     all_descs.push(TransferDesc {
                         local_ptr,
                         remote_ptr,
-                        len: slot.k_size as usize,
+                        len,
                     });
                     segments.push(SegmentAlloc {
+                        ptr_addr: local_ptr.as_ptr() as u64,
                         alloc,
-                        size: slot.k_size as usize,
+                        size: len,
                     });
                 }
 
                 // V segment (split KV)
                 if slot.v_size > 0 && slot.v_ptr != 0 {
-                    let alloc = allocate_fn(slot.v_size, Some(numa)).ok_or_else(|| {
-                        format!("failed to allocate {} bytes for V segment", slot.v_size)
-                    })?;
-                    let local_ptr = alloc.as_non_null();
+                    let len = usize::try_from(slot.v_size)
+                        .map_err(|_| format!("V size exceeds usize: {}", slot.v_size))?;
+                    let (local_ptr, alloc) =
+                        alloc_segment_from_slab(&mut numa_slabs, numa, len, "V")?;
                     let remote_ptr = NonNull::new(slot.v_ptr as *mut u8)
                         .ok_or_else(|| "remote V ptr is null".to_string())?;
                     all_descs.push(TransferDesc {
                         local_ptr,
                         remote_ptr,
-                        len: slot.v_size as usize,
+                        len,
                     });
                     segments.push(SegmentAlloc {
+                        ptr_addr: local_ptr.as_ptr() as u64,
                         alloc,
-                        size: slot.v_size as usize,
+                        size: len,
                     });
                 }
 
@@ -410,6 +417,7 @@ async fn fetch_blocks_via_rdma(
             let timing = TransferTiming {
                 build_transfer_tasks: build_start.elapsed(),
                 slot_count,
+                numa_slab_count: numa_slabs.len(),
                 ..TransferTiming::default()
             };
             return Ok((Vec::new(), timing));
@@ -430,6 +438,7 @@ async fn fetch_blocks_via_rdma(
             submit_transfer,
             transfer_desc_count,
             slot_count,
+            numa_slab_count: numa_slabs.len(),
             ..TransferTiming::default()
         };
         (receivers, timing)
@@ -458,7 +467,11 @@ async fn fetch_blocks_via_rdma(
             .map(|segs| {
                 let segments: Vec<Segment> = segs
                     .into_iter()
-                    .map(|sa| Segment::new(sa.alloc.as_non_null(), sa.size, sa.alloc))
+                    .map(|sa| {
+                        let ptr = NonNull::new(sa.ptr_addr as *mut u8)
+                            .expect("slab segment pointer must be non-null");
+                        Segment::new(ptr, sa.size, sa.alloc)
+                    })
                     .collect();
                 Arc::new(RawBlock::new(segments))
             })
@@ -471,7 +484,101 @@ async fn fetch_blocks_via_rdma(
     Ok((result, timing))
 }
 
+fn sum_segment_bytes_by_numa(
+    blocks: &[TransferBlockInfo],
+) -> Result<HashMap<NumaNode, u64>, String> {
+    let mut bytes_per_numa: HashMap<NumaNode, u64> = HashMap::new();
+    for block_info in blocks {
+        for slot in &block_info.slots {
+            let numa = NumaNode(slot.numa_node);
+            if slot.k_size > 0 {
+                let total = bytes_per_numa.entry(numa).or_insert(0);
+                *total = total.checked_add(slot.k_size).ok_or_else(|| {
+                    format!("numa bytes overflow while summing K segments on {numa}")
+                })?;
+            }
+            if slot.v_size > 0 && slot.v_ptr != 0 {
+                let total = bytes_per_numa.entry(numa).or_insert(0);
+                *total = total.checked_add(slot.v_size).ok_or_else(|| {
+                    format!("numa bytes overflow while summing V segments on {numa}")
+                })?;
+            }
+        }
+    }
+    Ok(bytes_per_numa)
+}
+
+fn allocate_numa_slabs(
+    allocate_fn: &AllocateFn,
+    bytes_per_numa: HashMap<NumaNode, u64>,
+) -> Result<HashMap<NumaNode, NumaSlab>, String> {
+    let mut numa_slabs: HashMap<NumaNode, NumaSlab> = HashMap::new();
+    for (numa, total_bytes) in bytes_per_numa {
+        if total_bytes == 0 {
+            continue;
+        }
+        let allocation = allocate_fn(total_bytes, Some(numa))
+            .ok_or_else(|| format!("failed to allocate slab ({total_bytes} bytes) for {numa}"))?;
+        let capacity = usize::try_from(total_bytes)
+            .map_err(|_| format!("slab size exceeds usize for {numa}: {total_bytes}"))?;
+        numa_slabs.insert(
+            numa,
+            NumaSlab {
+                allocation,
+                next_offset: 0,
+                capacity,
+            },
+        );
+    }
+    Ok(numa_slabs)
+}
+
+fn alloc_segment_from_slab(
+    slabs: &mut HashMap<NumaNode, NumaSlab>,
+    numa: NumaNode,
+    len: usize,
+    segment_kind: &str,
+) -> Result<(NonNull<u8>, Arc<crate::pinned_pool::PinnedAllocation>), String> {
+    let slab = slabs
+        .get_mut(&numa)
+        .ok_or_else(|| format!("missing slab for {numa} while allocating {segment_kind}"))?;
+    slab.allocate(len, segment_kind)
+}
+
+struct NumaSlab {
+    allocation: Arc<crate::pinned_pool::PinnedAllocation>,
+    next_offset: usize,
+    capacity: usize,
+}
+
+impl NumaSlab {
+    fn allocate(
+        &mut self,
+        len: usize,
+        segment_kind: &str,
+    ) -> Result<(NonNull<u8>, Arc<crate::pinned_pool::PinnedAllocation>), String> {
+        let end = self.next_offset.checked_add(len).ok_or_else(|| {
+            format!(
+                "slab offset overflow while allocating {segment_kind}: offset={} len={len} capacity={}",
+                self.next_offset, self.capacity
+            )
+        })?;
+        if end > self.capacity {
+            return Err(format!(
+                "slab exhausted while allocating {segment_kind}: offset={} len={len} capacity={}",
+                self.next_offset, self.capacity
+            ));
+        }
+
+        let ptr = unsafe { self.allocation.as_non_null().as_ptr().add(self.next_offset) };
+        self.next_offset = end;
+        let ptr = NonNull::new(ptr).ok_or_else(|| "slab pointer is null".to_string())?;
+        Ok((ptr, Arc::clone(&self.allocation)))
+    }
+}
+
 struct SegmentAlloc {
+    ptr_addr: u64,
     alloc: Arc<crate::pinned_pool::PinnedAllocation>,
     size: usize,
 }
@@ -484,6 +591,7 @@ struct TransferTiming {
     rebuild: Duration,
     transfer_desc_count: usize,
     slot_count: usize,
+    numa_slab_count: usize,
 }
 
 fn get_or_create_channel(
@@ -578,4 +686,91 @@ fn spawn_release_lock(mut client: EngineClient<Channel>, transfer_session_id: St
             warn!("ReleaseTransferLock failed for session {transfer_session_id}: {e}");
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::num::NonZeroU64;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use pegaflow_proto::proto::engine::TransferSlotInfo;
+
+    fn slot(k_size: u64, v_ptr: u64, v_size: u64, numa: u32) -> TransferSlotInfo {
+        TransferSlotInfo {
+            k_ptr: 0x1000,
+            k_size,
+            v_ptr,
+            v_size,
+            numa_node: numa,
+        }
+    }
+
+    fn test_allocate_fn(calls: Arc<AtomicUsize>) -> AllocateFn {
+        let allocator = Arc::new(crate::pinned_pool::PinnedAllocator::new_global(
+            32 * 1024 * 1024,
+            1,
+            false,
+            false,
+            None,
+        ));
+        Arc::new(move |size, _numa| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            allocator.allocate(NonZeroU64::new(size)?, NumaNode::UNKNOWN)
+        })
+    }
+
+    #[test]
+    fn sum_segment_bytes_by_numa_aggregates_k_and_v() {
+        let blocks = vec![
+            TransferBlockInfo {
+                block_hash: vec![1],
+                slots: vec![
+                    slot(100, 0, 0, 0),        // contiguous
+                    slot(200, 0x2000, 300, 0), // split KV
+                ],
+            },
+            TransferBlockInfo {
+                block_hash: vec![2],
+                slots: vec![slot(400, 0x3000, 500, 1)],
+            },
+        ];
+
+        let totals = sum_segment_bytes_by_numa(&blocks).expect("sum bytes");
+        assert_eq!(totals.get(&NumaNode(0)), Some(&600)); // 100 + (200 + 300)
+        assert_eq!(totals.get(&NumaNode(1)), Some(&900)); // 400 + 500
+    }
+
+    #[test]
+    fn allocate_numa_slabs_calls_allocator_once_per_numa() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let allocate_fn = test_allocate_fn(Arc::clone(&calls));
+
+        let bytes_per_numa = HashMap::from([(NumaNode(0), 1024_u64), (NumaNode(1), 2048_u64)]);
+        let slabs = allocate_numa_slabs(&allocate_fn, bytes_per_numa).expect("allocate slabs");
+
+        assert_eq!(slabs.len(), 2);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn slab_allocation_is_contiguous_and_bounded() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let allocate_fn = test_allocate_fn(Arc::clone(&calls));
+
+        let mut slabs = allocate_numa_slabs(&allocate_fn, HashMap::from([(NumaNode(0), 1024_u64)]))
+            .expect("allocate slabs");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        let (p1, _a1) =
+            alloc_segment_from_slab(&mut slabs, NumaNode(0), 256, "K").expect("alloc p1");
+        let (p2, _a2) =
+            alloc_segment_from_slab(&mut slabs, NumaNode(0), 128, "V").expect("alloc p2");
+        assert_eq!(p2.as_ptr() as usize - p1.as_ptr() as usize, 256);
+
+        let overflow = alloc_segment_from_slab(&mut slabs, NumaNode(0), 1024, "K");
+        assert!(overflow.is_err());
+    }
 }
