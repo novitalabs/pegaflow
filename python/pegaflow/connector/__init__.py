@@ -98,7 +98,7 @@ class PegaKVConnector(KVConnectorBase_V1):
         ) or vllm_config.kv_transfer_config.get_from_extra_config("pegaflow.port", 50055)
         self._engine_endpoint = f"{server_host}:{server_port}"
         engine_client = EngineRpcClient(self._engine_endpoint)
-        logger.info("[PegaKVConnector] Connected to engine server at %s", self._engine_endpoint)
+        logger.debug("[PegaKVConnector] Connected to engine server at %s", self._engine_endpoint)
 
         self._state_manager = ServiceStateManager(engine_client)
 
@@ -128,7 +128,7 @@ class PegaKVConnector(KVConnectorBase_V1):
         else:
             self._worker = WorkerConnector(self._ctx)
 
-        logger.info(
+        logger.debug(
             "[PegaKVConnector] Initialized role=%s instance_id=%s device=%s "
             "tp_rank=%s tp_size=%d pp_rank=%d pp_size=%d world_size=%d layers=%d namespace=%s "
             "is_mla=%s dcp_world_size=%d pcp_world_size=%d dcp_rank=%d",

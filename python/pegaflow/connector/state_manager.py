@@ -69,7 +69,7 @@ class ServiceStateManager:
             name="PegaHealthCheck",
         )
         self._thread.start()
-        logger.info(
+        logger.debug(
             "[PegaKVConnector] Started health check (interval=%.1fs)",
             self._interval,
         )
@@ -87,7 +87,7 @@ class ServiceStateManager:
                 if ok:
                     with self._lock:
                         self._available = True
-                    logger.info("[PegaKVConnector] Service recovered")
+                    logger.debug("[PegaKVConnector] Service recovered")
                     return
             except Exception as e:
                 logger.debug("[PegaKVConnector] Health check failed: %s", e)

@@ -142,13 +142,13 @@ def resolve_instance_id(vllm_config, dp_rank_suffix: bool = True) -> str:
     """Resolve or generate connector instance_id with optional DP rank suffix."""
     instance_id = vllm_config.kv_transfer_config.engine_id
     if instance_id:
-        logger.info("[PegaKVConnector] Using kv_transfer_config.engine_id: %s", instance_id)
+        logger.debug("[PegaKVConnector] Using kv_transfer_config.engine_id: %s", instance_id)
         return instance_id
 
     instance_id = vllm_config.instance_id or os.environ.get("PEGAFLOW_INSTANCE_ID", "")
     if not instance_id:
         instance_id = uuid.uuid4().hex
-        logger.info(
+        logger.debug(
             "[PegaKVConnector] No instance_id from vLLM; generated fallback %s",
             instance_id,
         )
@@ -159,7 +159,7 @@ def resolve_instance_id(vllm_config, dp_rank_suffix: bool = True) -> str:
             local_dp_rank = parallel_config.data_parallel_rank_local
             if local_dp_rank is not None:
                 instance_id = f"{instance_id}_dp{local_dp_rank}"
-                logger.info(
+                logger.debug(
                     "[PegaKVConnector] Appended DP rank to instance_id: %s (dp_size=%d, local_dp_rank=%d)",
                     instance_id,
                     parallel_config.data_parallel_size,

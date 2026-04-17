@@ -98,7 +98,7 @@ class SchedulerConnector:
         if num_remaining_blocks < self.BYPASS_BLOCKS and pending >= self.HIGH_LOAD_THRESHOLD:
             self._external_matched_blocks[req_id] = computed_blocks
             self._bypass_count += 1
-            logger.info(
+            logger.debug(
                 "[PegaKVConnector] req=%s bypass: remaining_blocks=%d "
                 "pending_prefetches=%d bypass_count=%d",
                 req_id,
@@ -122,7 +122,7 @@ class SchedulerConnector:
         # Each hit block = 1 virtual block = virtual_block_size global tokens.
         num_hit_tokens = hit_blocks * self._ctx.virtual_block_size
 
-        logger.info(
+        logger.debug(
             "[PegaKVConnector] req=%s cache_lookup: hit_blocks=%d computed_blocks=%d "
             "hit_tokens=%d num_tokens=%d lookup_us=%.0f total_query_hashes=%d",
             req_id,
@@ -186,7 +186,7 @@ class SchedulerConnector:
                 num_tokens=num_external_tokens,
             )
             self._pending_load_intents[req_id] = load_intent
-            logger.info(
+            logger.debug(
                 "[PegaKVConnector] req=%s alloc: total_blocks=%d computed_blocks=%d "
                 "load_blocks=%d start_block_idx=%d load_tokens=%d pending_loads=%d",
                 req_id,
@@ -341,7 +341,7 @@ class SchedulerConnector:
         save_hashes = block_hashes[hash_start : hash_start + new_blocks]
         save_block_ids = allocated[hash_start : hash_start + new_blocks]
 
-        logger.info(
+        logger.debug(
             "[PegaKVConnector] req=%s save_intent: start=%d hash_start=%d "
             "base_block_idx=%d saveable_block_idx=%d new_blocks=%d total_hashes=%d",
             req_id,
@@ -461,7 +461,7 @@ class SchedulerConnector:
                 if req_id not in self._prefetch_start_times:
                     self._prefetch_start_times[req_id] = time.perf_counter()
                     self._prefetch_tracker.on_prefetch_start()
-                    logger.info(
+                    logger.debug(
                         "[PegaKVConnector] Prefetch started: req=%s pending_prefetches=%d",
                         req_id,
                         self._prefetch_tracker.pending_prefetches,
@@ -475,7 +475,7 @@ class SchedulerConnector:
                 ) * 1000
                 self._prefetch_tracker.on_prefetch_complete(prefetch_duration_ms, hit_blocks)
 
-                logger.info(
+                logger.debug(
                     "[PegaKVConnector] Prefetch completed: req=%s hit_blocks=%d "
                     "prefetch_duration_ms=%.2f pending_prefetches=%d",
                     req_id,
