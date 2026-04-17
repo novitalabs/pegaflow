@@ -30,7 +30,7 @@ const SEND_CQ_SIZE: u32 = MAX_SEND_WR;
 // Recv queue unused (one-sided RDMA only), keep minimal for driver compatibility.
 const RECV_CQ_SIZE: u32 = 2;
 const MAX_RECV_WR: u32 = 1;
-const MAX_RD_ATOMIC: u8 = 1;
+const MAX_RD_ATOMIC: u8 = 16;
 const PSN_MASK: u32 = 0x00ff_ffff;
 
 pub(crate) struct RdmaOp {
