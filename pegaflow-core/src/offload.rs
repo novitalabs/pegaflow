@@ -225,7 +225,7 @@ impl PegaEngine {
 
             let blocks_to_save: Vec<(usize, Vec<u8>)> = block_ids
                 .into_iter()
-                .zip(block_hashes.into_iter())
+                .zip(block_hashes)
                 .filter(|(id, _)| *id >= 0)
                 .filter_map(|(id, hash)| {
                     let idx = id as usize;
