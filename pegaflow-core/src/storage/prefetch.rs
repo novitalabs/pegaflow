@@ -21,6 +21,15 @@ enum PrefetchSource {
     Rdma,
 }
 
+impl PrefetchSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ssd => "ssd",
+            Self::Rdma => "rdma",
+        }
+    }
+}
+
 struct PrefetchEntry {
     blocks_rx: oneshot::Receiver<PrefetchResult>,
     loading_count: usize,
@@ -160,23 +169,63 @@ impl PrefetchScheduler {
         hashes: &[Vec<u8>],
         num_workers: usize,
     ) -> PrefetchStatus {
+        let total_start = Instant::now();
+
+        let key_build_start = Instant::now();
         let keys: Vec<BlockKey> = hashes
             .iter()
             .map(|hash| BlockKey::new(namespace.to_string(), hash.clone()))
             .collect();
+        let key_build = key_build_start.elapsed();
 
+        let cache_scan_start = Instant::now();
         let (hit, blocks_to_pin) = read_cache.get_prefix_blocks(&keys);
+        let cache_scan = cache_scan_start.elapsed();
         let remaining = &keys[hit..];
 
+        let load_select_start = Instant::now();
         let load = self.try_load(req_id, namespace, remaining).await;
+        let load_select = load_select_start.elapsed();
         let loading = load.as_ref().map_or(0, |l| l.found);
         let missing = keys.len() - hit - loading;
 
         if let Some(load) = load {
+            let source = load.source;
+            let register_start = Instant::now();
             self.register_inflight(req_id, load);
+            let register = register_start.elapsed();
+
+            info!(
+                "Prefetch scheduling timing: req_id={} source={} total_keys={} hit={} loading={} missing={} key_build={:?} cache_scan={:?} load_select={:?} register_inflight={:?} total={:?}",
+                req_id,
+                source.as_str(),
+                keys.len(),
+                hit,
+                loading,
+                missing,
+                key_build,
+                cache_scan,
+                load_select,
+                register,
+                total_start.elapsed()
+            );
             PrefetchStatus::Loading { hit, loading }
         } else {
+            let pin_start = Instant::now();
             read_cache.pin_blocks(instance_id, num_workers, &blocks_to_pin);
+            let pin = pin_start.elapsed();
+            info!(
+                "Prefetch local-hit timing: req_id={} total_keys={} hit={} missing={} key_build={:?} cache_scan={:?} load_select={:?} pin={:?} total={:?}",
+                req_id,
+                keys.len(),
+                hit,
+                missing,
+                key_build,
+                cache_scan,
+                load_select,
+                pin,
+                total_start.elapsed()
+            );
             PrefetchStatus::Done { hit, missing }
         }
     }
@@ -230,7 +279,7 @@ impl PrefetchScheduler {
         let hashes: Vec<Vec<u8>> = remaining.iter().map(|k| k.hash.clone()).collect();
         let (node, found) = rdma.query_prefix(namespace, &hashes).await?;
 
-        let rx = rdma.fetch_blocks(&node, namespace, hashes[..found].to_vec());
+        let rx = rdma.fetch_blocks(&node, req_id, namespace, hashes[..found].to_vec());
 
         Some(LoadResult {
             found,
