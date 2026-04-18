@@ -11,7 +11,7 @@
 mod trace;
 
 mod allocator;
-mod backing;
+pub mod backing;
 mod block;
 mod cache;
 mod gpu_worker;
