@@ -129,40 +129,27 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     // Create shutdown notifier (before spawning background tasks)
     let shutdown = Arc::new(Notify::new());
 
-    // Spawn background TTL sweep task (every 10 minutes)
+    // Spawn background sweep task (TTL expiry + dead node purge, every 10 minutes)
     {
         let store = Arc::clone(&store);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(10 * 60));
             loop {
                 interval.tick().await;
-                let removed = store.sweep_expired();
-                if removed > 0 {
-                    metric::record_ttl_sweep(removed as u64);
+                let (expired, purged_nodes) = store.sweep_expired();
+                if expired > 0 {
+                    metric::record_ttl_sweep(expired as u64);
                     info!(
                         "TTL sweep: removed {} stale block keys, {} remaining",
-                        removed,
+                        expired,
                         store.entry_count()
                     );
                 }
-            }
-        });
-    }
-
-    // Spawn liveness sweep task (every 5s)
-    {
-        let store = Arc::clone(&store);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
-            loop {
-                interval.tick().await;
-                let (suspect, purged) = store.sweep_liveness();
-                if suspect > 0 || purged > 0 {
-                    metric::record_liveness_sweep(suspect as u64, purged as u64);
+                if purged_nodes > 0 {
+                    metric::record_node_purge(purged_nodes as u64);
                 }
             }
         });
-        info!("Liveness sweep task started (interval=5s)");
     }
 
     // Start HTTP server for health check and metrics

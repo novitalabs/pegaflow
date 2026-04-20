@@ -1,4 +1,4 @@
-use crate::metric::{record_liveness_sweep, record_rpc_result};
+use crate::metric::{record_node_purge, record_rpc_result};
 use crate::proto::engine::meta_server_server::MetaServer;
 use crate::proto::engine::{
     ByeRequest, ByeResponse, HeartbeatRequest, HeartbeatResponse, InsertBlockHashesRequest,
@@ -231,7 +231,7 @@ impl MetaServer for GrpcMetaService {
         info!("RPC [bye]: node={} purged={} entries", req.node, purged);
 
         if purged > 0 {
-            record_liveness_sweep(0, 1);
+            record_node_purge(1);
         }
 
         let result = Ok(Response::new(ByeResponse {}));
@@ -473,8 +473,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_query_excludes_suspect_after_sweep() {
-        // suspect_threshold=0 → immediately suspect
+    async fn test_query_excludes_stale_node() {
+        // suspect_threshold=0 → stale immediately after heartbeat
         let svc = make_service_with_liveness(0, 3600);
 
         svc.heartbeat(Request::new(HeartbeatRequest {
@@ -492,10 +492,7 @@ mod tests {
         .await
         .unwrap();
 
-        // Trigger sweep → node-a becomes suspect
-        svc.store.sweep_liveness();
-
-        // Query should filter out suspect node
+        // No sweep needed — query_prefix checks last_seen inline
         let query_resp = svc
             .query_prefix_blocks(Request::new(QueryPrefixBlocksRequest {
                 namespace: "ns".into(),

@@ -67,34 +67,20 @@ pub fn record_ttl_sweep(removed: u64) {
 }
 
 // ---------------------------------------------------------------------------
-// Liveness sweep metrics
+// Node purge counter
 // ---------------------------------------------------------------------------
 
-struct LivenessMetrics {
-    suspect: Counter<u64>,
-    purged: Counter<u64>,
-}
-
-static LIVENESS_METRICS: LazyLock<LivenessMetrics> = LazyLock::new(|| {
+static NODE_PURGED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     let meter = global::meter("pegaflow_metaserver");
-    LivenessMetrics {
-        suspect: meter
-            .u64_counter("pegaflow_metaserver_node_suspect_total")
-            .with_description("Total times a node entered suspect state")
-            .build(),
-        purged: meter
-            .u64_counter("pegaflow_metaserver_node_purged_total")
-            .with_description("Total nodes hard-deleted (timeout or bye)")
-            .build(),
-    }
+    meter
+        .u64_counter("pegaflow_metaserver_node_purged_total")
+        .with_description("Total nodes purged (timeout or bye)")
+        .build()
 });
 
-pub fn record_liveness_sweep(suspect: u64, purged: u64) {
-    if suspect > 0 {
-        LIVENESS_METRICS.suspect.add(suspect, &[]);
-    }
-    if purged > 0 {
-        LIVENESS_METRICS.purged.add(purged, &[]);
+pub fn record_node_purge(count: u64) {
+    if count > 0 {
+        NODE_PURGED.add(count, &[]);
     }
 }
 
