@@ -73,8 +73,11 @@ cargo run -p pegaflow-metaserver -- --help
 ### Server Options
 
 - `--addr <ADDR>`: Bind address (default: `127.0.0.1:50056`)
+- `--http-addr <ADDR>`: HTTP server address for health check and Prometheus metrics (default: `0.0.0.0:9092`)
 - `--log-level <LEVEL>`: Log level: `trace`, `debug`, `info`, `warn`, `error` (default: `info`)
 - `--ttl-minutes <MINUTES>`: Cache entry TTL in minutes (default: `120`)
+- `--suspect-secs <SECONDS>`: Heartbeat suspect threshold — nodes that haven't sent a heartbeat within this period are excluded from query results (default: `30`)
+- `--hard-delete-secs <SECONDS>`: Heartbeat hard-delete threshold — nodes silent for this long are purged along with all their block entries during the periodic sweep (default: `90`)
 
 ### Storage Configuration
 
@@ -82,6 +85,8 @@ The MetaServer uses a DashMap-based in-memory store with the following character
 
 - **Multi-owner**: A block hash can be registered by multiple nodes simultaneously
 - **TTL (Time-To-Live)**: 120 minutes default (configurable via `--ttl-minutes`). A background task sweeps expired entries every 10 minutes to prevent leaks from crashed nodes.
+- **Node liveness**: Nodes must send periodic `Heartbeat` RPCs. Nodes silent beyond `--suspect-secs` are excluded from query results; nodes silent beyond `--hard-delete-secs` are purged (liveness + block entries) during the sweep.
+- **Graceful shutdown**: Nodes send a `Bye` RPC on shutdown to immediately purge their entries (epoch-guarded to prevent stale Bye from old processes).
 - **Conditional removal**: `RemoveBlockHashes` only removes the requesting node's ownership; other nodes' entries are untouched.
 - **Memory**: Scales with unique blocks across all nodes. No hard capacity cap — memory is naturally bounded by the total number of blocks in the cluster.
 
@@ -155,14 +160,47 @@ message QueryPrefixBlocksResponse {
 }
 ```
 
-### 4. Health
+### 4. Heartbeat
+
+Periodic liveness signal from a node. Must be sent at intervals shorter than `--suspect-secs`.
+
+**Request:**
+```protobuf
+message HeartbeatRequest {
+  string node = 1;   // Node gRPC address
+  string epoch = 2;  // Process epoch (UUID, changes on restart)
+}
+```
+
+**Response:** `HeartbeatResponse {}`
+
+**Behavior:**
+- New node: registers liveness
+- Same epoch: refreshes `last_seen`
+- Different epoch: purges old entries, re-registers
+
+### 5. Bye
+
+Graceful shutdown notification. Immediately purges all block entries for the node.
+
+**Request:**
+```protobuf
+message ByeRequest {
+  string node = 1;
+  string epoch = 2;  // Must match current epoch (prevents stale Bye)
+}
+```
+
+**Response:** `ByeResponse {}`
+
+### 6. Health
 
 Health check endpoint.
 
 **Request:** `HealthRequest {}`
 **Response:** `HealthResponse { status }`
 
-### 5. Shutdown
+### 7. Shutdown
 
 Graceful shutdown trigger.
 
@@ -174,7 +212,8 @@ Graceful shutdown trigger.
 - **Data structure**: `DashMap<BlockKey, HashMap<Arc<str>, Instant>>` — each block key maps to a set of owning nodes with their registration timestamps
 - **BlockKey**: `{ namespace: String, hash: Vec<u8> }` — matches pegaflow-core's BlockKey
 - **Multi-owner**: Multiple nodes can register the same block hash (e.g., after replication or shared prefill)
-- **TTL sweep**: Background task runs every 10 minutes, removing per-node registrations older than the configured TTL
+- **TTL sweep**: Background task runs every 10 minutes, removing per-node registrations older than the configured TTL and purging dead nodes past the hard-delete threshold
+- **Liveness**: `DashMap<Arc<str>, NodeLiveness>` — tracks epoch and last heartbeat time per node
 - **Concurrency**: DashMap uses shard-level locking for high-throughput concurrent access
 - **Persistence**: In-memory only (restart clears state)
 

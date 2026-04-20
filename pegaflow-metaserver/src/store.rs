@@ -97,6 +97,7 @@ impl BlockHashStore {
                 false
             };
             if should_remove_key {
+                // Only remove if still empty (another thread may have inserted)
                 self.map.remove_if(&key, |_, nodes| nodes.is_empty());
             }
         }
@@ -199,8 +200,10 @@ impl BlockHashStore {
     }
 
     /// Sweep expired entries and dead nodes.
+    ///
     /// 1. Removes per-node block registrations older than TTL.
     /// 2. Purges nodes past `hard_delete_threshold` and removes their block entries.
+    ///
     /// Returns (expired_keys_removed, dead_nodes_purged).
     pub fn sweep_expired(&self) -> (usize, usize) {
         let now = Instant::now();
@@ -214,7 +217,7 @@ impl BlockHashStore {
 
         // Purge dead nodes (past hard_delete_threshold)
         let mut purged_nodes: Vec<Arc<str>> = Vec::new();
-        for entry in self.nodes.iter() {
+        for entry in &self.nodes {
             if entry.last_seen.elapsed() >= self.hard_delete_threshold {
                 purged_nodes.push(entry.key().clone());
             }
@@ -267,7 +270,7 @@ impl BlockHashStore {
     fn is_node_healthy(&self, node: &Arc<str>) -> bool {
         match self.nodes.get(node) {
             Some(entry) => entry.last_seen.elapsed() < self.suspect_threshold,
-            None => true,
+            None => false,
         }
     }
 
