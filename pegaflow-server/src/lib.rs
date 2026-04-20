@@ -452,7 +452,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         advertise_addr,
         metaserver_queue_depth: cli.metaserver_queue_depth,
         pool_shards: cli.pool_shards,
-        shutdown: Some(Arc::clone(&shutdown)),
     };
 
     if cli.pool_shards > 1 {

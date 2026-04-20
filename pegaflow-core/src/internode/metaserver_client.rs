@@ -76,15 +76,18 @@ pub struct MetaServerClient {
     epoch: String,
     /// Advertise address for this server
     advertise_addr: String,
+    /// Dedicated shutdown signal for the heartbeat loop.
+    heartbeat_shutdown: Arc<Notify>,
 }
 
 impl MetaServerClient {
     /// Create a new client and spawn the background registration loop and heartbeat loop.
     ///
     /// Must be called from within a tokio runtime context.
-    pub fn new(config: MetaServerClientConfig, shutdown: Arc<Notify>) -> Self {
+    pub fn new(config: MetaServerClientConfig) -> Self {
         let (command_tx, rx) = mpsc::channel(config.queue_depth);
         let epoch = Uuid::new_v4().to_string();
+        let heartbeat_shutdown = Arc::new(Notify::new());
 
         tokio::spawn(registration_loop(
             rx,
@@ -96,7 +99,7 @@ impl MetaServerClient {
             config.metaserver_addr.clone(),
             config.advertise_addr.clone(),
             epoch.clone(),
-            shutdown,
+            Arc::clone(&heartbeat_shutdown),
         ));
 
         // Lazy-connect query client: connects on first RPC, not here
@@ -115,6 +118,7 @@ impl MetaServerClient {
             query_client,
             epoch,
             advertise_addr: config.advertise_addr,
+            heartbeat_shutdown,
         }
     }
 
@@ -221,8 +225,9 @@ impl MetaServerClient {
     }
 
     /// Send a Bye RPC to MetaServer for graceful shutdown.
-    /// This triggers immediate purge of all block entries for this node.
+    /// Stops the heartbeat loop first to prevent heartbeats after Bye.
     pub async fn bye(&self) {
+        self.heartbeat_shutdown.notify_waiters();
         let req = ByeRequest {
             node: self.advertise_addr.clone(),
             epoch: self.epoch.clone(),
@@ -254,6 +259,9 @@ async fn heartbeat_loop(
         node, epoch, HEARTBEAT_INTERVAL_SECS
     );
 
+    let shutdown_fut = shutdown.notified();
+    tokio::pin!(shutdown_fut);
+
     loop {
         tokio::select! {
             _ = interval.tick() => {
@@ -265,7 +273,7 @@ async fn heartbeat_loop(
                     warn!("Heartbeat to MetaServer failed: {e}");
                 }
             }
-            _ = shutdown.notified() => {
+            _ = &mut shutdown_fut => {
                 info!("Heartbeat loop shutting down");
                 break;
             }

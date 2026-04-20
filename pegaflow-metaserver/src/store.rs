@@ -223,13 +223,13 @@ impl BlockHashStore {
 
         let now = Instant::now();
         let mut suspect_count = 0;
-        let mut purged_nodes: Vec<Arc<str>> = Vec::new();
+        let mut candidates: Vec<Arc<str>> = Vec::new();
 
         for mut entry in self.nodes.iter_mut() {
             let elapsed = now.duration_since(entry.last_seen);
 
             if elapsed >= self.hard_delete_threshold {
-                purged_nodes.push(entry.key().clone());
+                candidates.push(entry.key().clone());
             } else if elapsed >= self.suspect_threshold && entry.state == NodeState::Healthy {
                 entry.state = NodeState::Suspect;
                 suspect_count += 1;
@@ -238,6 +238,26 @@ impl BlockHashStore {
                     entry.key(),
                     elapsed
                 );
+            }
+        }
+
+        if candidates.is_empty() {
+            return (suspect_count, 0);
+        }
+
+        // Re-validate staleness with remove_if to avoid purging a node that
+        // received a heartbeat between the scan above and now.
+        let mut purged_nodes: Vec<Arc<str>> = Vec::new();
+        for node_key in &candidates {
+            if self
+                .nodes
+                .remove_if(node_key, |_, liveness| {
+                    now.duration_since(liveness.last_seen) >= self.hard_delete_threshold
+                })
+                .is_some()
+            {
+                purged_nodes.push(node_key.clone());
+                info!("Hard-deleted node {}", node_key);
             }
         }
 
@@ -258,10 +278,6 @@ impl BlockHashStore {
         });
 
         let purged_count = purged_nodes.len();
-        for node_key in &purged_nodes {
-            self.nodes.remove(node_key);
-            info!("Hard-deleted node {}", node_key);
-        }
         if total_purged_entries > 0 {
             info!(
                 "Liveness sweep: purged {} nodes, {} block entries",
