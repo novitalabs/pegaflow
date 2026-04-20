@@ -213,7 +213,7 @@ impl BlockHashStore {
             nodes.retain(|_, registered_at| now.duration_since(*registered_at) < ttl);
             !nodes.is_empty()
         });
-        let expired_keys = before.saturating_sub(self.map.len());
+        let mut expired_keys = before.saturating_sub(self.map.len());
 
         // Purge dead nodes (past hard_delete_threshold)
         let mut purged_nodes: Vec<Arc<str>> = Vec::new();
@@ -233,23 +233,23 @@ impl BlockHashStore {
         });
 
         if !purged_nodes.is_empty() {
-            let mut total_purged_entries = 0;
+            let before_purge = self.map.len();
             self.map.retain(|_, owners| {
                 for node in &purged_nodes {
-                    if owners.remove(node.as_ref()).is_some() {
-                        total_purged_entries += 1;
-                    }
+                    owners.remove(node.as_ref());
                 }
                 !owners.is_empty()
             });
+            let purge_removed = before_purge.saturating_sub(self.map.len());
+            expired_keys += purge_removed;
             for node_key in &purged_nodes {
                 info!("Hard-deleted node {}", node_key);
             }
-            if total_purged_entries > 0 {
+            if purge_removed > 0 {
                 info!(
                     "Sweep: purged {} dead nodes, {} block entries",
                     purged_nodes.len(),
-                    total_purged_entries
+                    purge_removed
                 );
             }
         }
