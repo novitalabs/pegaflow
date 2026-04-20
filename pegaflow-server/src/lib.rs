@@ -3,6 +3,7 @@ pub mod metric;
 pub mod proto;
 pub mod registry;
 pub mod service;
+pub mod session;
 #[cfg(feature = "tracing")]
 mod trace;
 #[cfg(not(feature = "tracing"))]

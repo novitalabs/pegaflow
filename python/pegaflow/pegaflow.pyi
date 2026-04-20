@@ -244,6 +244,32 @@ class EngineRpcClient:
         """
         ...
 
+    def start_session_watcher(
+        self,
+        instance_id: str,
+        namespace: str,
+        tp_size: int,
+        world_size: int,
+    ) -> None:
+        """Open a liveness Session stream to the engine server.
+
+        The client holds a server-streaming RPC open for the lifetime of
+        this process. When the process dies, the kernel closes the TCP
+        socket; the server observes disconnect and auto-releases the
+        instance's CUDA IPC mappings. No polling on the Python side — the
+        hyper connection driver keeps the underlying HTTP/2 connection
+        alive on its own.
+
+        Call once, typically from the scheduler role. Calling again
+        replaces the previous stream; the server supersedes the prior
+        session and the old one becomes a no-op on close.
+
+        Raises:
+            PegaFlowServiceError: If the server is unavailable.
+            PegaFlowBusinessError: If the request is rejected.
+        """
+        ...
+
 class PyLoadState:
     """Batch-level synchronization for async KV cache loading via shared memory.
 
