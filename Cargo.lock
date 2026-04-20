@@ -2232,6 +2232,7 @@ dependencies = [
  "axum",
  "clap",
  "cudarc",
+ "dashmap",
  "fastrace",
  "log",
  "opentelemetry",

@@ -1,7 +1,8 @@
 use pegaflow_core::LoadState;
 use pegaflow_proto::proto::engine::{
     HealthRequest, LoadRequest, QueryRequest, RegisterContextRequest, ResponseStatus, SaveLayer,
-    SaveRequest, ShutdownRequest, UnpinRequest, UnregisterRequest, engine_client::EngineClient,
+    SaveRequest, SessionEvent, SessionRequest, ShutdownRequest, UnpinRequest, UnregisterRequest,
+    engine_client::EngineClient,
 };
 use pyo3::{
     create_exception,
@@ -10,12 +11,12 @@ use pyo3::{
 };
 use std::{
     future::Future,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 use tokio::runtime::{Handle, Runtime};
 use tonic::{
-    Code, Status as GrpcStatus,
+    Code, Status as GrpcStatus, Streaming,
     transport::{Channel, Endpoint},
 };
 
@@ -108,6 +109,13 @@ struct EngineRpcClient {
     endpoint: String,
     client: EngineClient<Channel>,
     rt_handle: Handle,
+    /// Holds the server-streaming Session response if `start_session_watcher`
+    /// was called. We never poll it — the hyper connection driver keeps the
+    /// underlying HTTP/2 connection alive on its own. Keeping the Streaming
+    /// alive here (instead of dropping it) is what keeps the stream open on
+    /// the wire, so server-side disconnect detection only fires when this
+    /// process actually dies.
+    session_stream: Mutex<Option<Streaming<SessionEvent>>>,
 }
 
 impl EngineRpcClient {
@@ -161,6 +169,7 @@ impl EngineRpcClient {
             endpoint,
             client,
             rt_handle,
+            session_stream: Mutex::new(None),
         })
     }
 
@@ -434,6 +443,44 @@ impl EngineRpcClient {
             Ok(resp.into_inner())
         })
         .and_then(|r| status_tuple("shutdown", r.status))
+    }
+
+    /// Open a liveness session with the engine server.
+    ///
+    /// Sends one `Session` RPC and retains the resulting server-streaming
+    /// response. No polling — the hyper connection driver keeps the HTTP/2
+    /// connection alive. When this process dies, the kernel closes the TCP
+    /// socket; the server observes disconnect and auto-releases CUDA IPC
+    /// mappings for `instance_id`.
+    ///
+    /// Call once per client, typically from the scheduler role. Calling
+    /// again replaces the previous stream (the old Streaming drops and the
+    /// server's old session is superseded by the new one).
+    #[pyo3(signature = (instance_id, namespace, tp_size, world_size))]
+    fn start_session_watcher(
+        &self,
+        py: Python<'_>,
+        instance_id: String,
+        namespace: String,
+        tp_size: u32,
+        world_size: u32,
+    ) -> PyResult<()> {
+        let mut client = self.client.clone();
+        let req = SessionRequest {
+            instance_id,
+            namespace,
+            tp_size,
+            world_size,
+        };
+        let stream = self.call(py, "session", move |_| async move {
+            let resp = client.session(req).await?;
+            Ok(resp.into_inner())
+        })?;
+        *self
+            .session_stream
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("session_stream mutex poisoned"))? = Some(stream);
+        Ok(())
     }
 }
 
