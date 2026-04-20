@@ -7,17 +7,20 @@ use crate::proto::engine::{
     QueryBlocksForTransferRequest, QueryBlocksForTransferResponse, QueryRequest, QueryResponse,
     RdmaHandshakeRequest, RdmaHandshakeResponse, RegisterContextRequest, RegisterContextResponse,
     ReleaseTransferLockRequest, ReleaseTransferLockResponse, ResponseStatus, SaveRequest,
-    SaveResponse, ShutdownRequest, ShutdownResponse, TransferBlockInfo, TransferSlotInfo,
-    UnpinRequest, UnpinResponse, UnregisterRequest, UnregisterResponse,
+    SaveResponse, SessionEvent, SessionRequest, ShutdownRequest, ShutdownResponse,
+    TransferBlockInfo, TransferSlotInfo, UnpinRequest, UnpinResponse, UnregisterRequest,
+    UnregisterResponse,
 };
 use crate::registry::CudaTensorRegistry;
+use crate::session::SessionRegistry;
 use log::{debug, info, warn};
 use parking_lot::Mutex;
 use pegaflow_core::{EngineError, LayerSave, PegaEngine, PrefetchStatus};
 use pyo3::{PyErr, Python};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, mpsc};
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, async_trait};
 
 #[derive(Clone)]
@@ -26,6 +29,7 @@ pub struct GrpcEngineService {
     registry: Arc<Mutex<CudaTensorRegistry>>,
     shutdown: Arc<Notify>,
     hll_tracker: Arc<std::sync::Mutex<pegaflow_common::hll::HllTracker>>,
+    session_registry: Arc<SessionRegistry>,
 }
 
 impl GrpcEngineService {
@@ -40,6 +44,35 @@ impl GrpcEngineService {
             registry,
             shutdown,
             hll_tracker,
+            session_registry: SessionRegistry::new(),
+        }
+    }
+
+    /// Drop CUDA IPC tensors and engine-side instance state for `instance_id`.
+    /// Idempotent — safe to call after the instance is already gone.
+    fn cleanup_instance(
+        engine: &PegaEngine,
+        registry: &Mutex<CudaTensorRegistry>,
+        instance_id: &str,
+        reason: &'static str,
+    ) {
+        let removed = {
+            let mut registry = registry.lock();
+            registry.drop_instance(instance_id)
+        };
+        if removed > 0 {
+            info!(
+                "Session cleanup ({}): dropped {} CUDA tensors for instance {}",
+                reason, removed, instance_id
+            );
+        }
+        if let Err(err) = engine.unregister_instance(instance_id) {
+            // `InstanceMissing` is normal if the instance was never registered
+            // (vllm died before any register_context_batch). Log at debug.
+            debug!(
+                "Session cleanup ({}): engine.unregister_instance({}) returned {}",
+                reason, instance_id, err
+            );
         }
     }
 
@@ -780,6 +813,59 @@ impl Engine for GrpcEngineService {
         }
         record_rpc_result("health", &result, start);
         result
+    }
+
+    type SessionStream = ReceiverStream<Result<SessionEvent, Status>>;
+
+    async fn session(
+        &self,
+        request: Request<SessionRequest>,
+    ) -> Result<Response<Self::SessionStream>, Status> {
+        let req = request.into_inner();
+        let instance_id = req.instance_id;
+        if instance_id.is_empty() {
+            return Err(Status::invalid_argument("instance_id must not be empty"));
+        }
+
+        let token = self.session_registry.install(instance_id.clone());
+        info!(
+            "Session opened: instance_id={} namespace={} tp_size={} world_size={} token={}",
+            instance_id, req.namespace, req.tp_size, req.world_size, token
+        );
+
+        // Channel capacity is 1: we don't emit events yet, and a tight capacity
+        // makes backpressure explicit if we ever do.
+        let (tx, rx) = mpsc::channel::<Result<SessionEvent, Status>>(1);
+
+        // Hand a clone to the watcher; it observes `closed()` when the tonic
+        // runtime drops the receiver side after client disconnect. We keep the
+        // original `tx` alive until this function returns `Response`; once the
+        // handler future is dropped by tonic on client cancel, both `tx` and
+        // `rx` are dropped → `cleanup_tx.closed()` resolves.
+        let cleanup_tx = tx.clone();
+
+        let session_registry = Arc::clone(&self.session_registry);
+        let engine = Arc::clone(&self.engine);
+        let cuda_registry = Arc::clone(&self.registry);
+        let id_for_watcher = instance_id.clone();
+
+        tokio::spawn(async move {
+            cleanup_tx.closed().await;
+            if session_registry.take(&id_for_watcher, token) {
+                info!(
+                    "Session closed: instance_id={} token={} — running cleanup",
+                    id_for_watcher, token
+                );
+                Self::cleanup_instance(&engine, &cuda_registry, &id_for_watcher, "stream closed");
+            } else {
+                debug!(
+                    "Session closed: instance_id={} token={} superseded — skip cleanup",
+                    id_for_watcher, token
+                );
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 }
 
