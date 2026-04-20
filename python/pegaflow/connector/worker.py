@@ -17,6 +17,7 @@ from pegaflow.connector.common import (
     PegaConnectorMetadata,
     PegaKVConnectorStats,
     logger,
+    parse_env_int,
 )
 from pegaflow.ipc_wrapper import CudaIPCWrapper
 from pegaflow.pegaflow import PyLoadState
@@ -28,6 +29,17 @@ if TYPE_CHECKING:
 
 _CROSS_LAYER_KEY = "ALL_LAYERS"
 
+_LOAD_TIMEOUT_FLOOR_SECONDS = 30
+_LOAD_TIMEOUT_RAW = parse_env_int("PEGA_LOAD_TIMEOUT_SECONDS", 120)
+if _LOAD_TIMEOUT_RAW < _LOAD_TIMEOUT_FLOOR_SECONDS:
+    logger.warning(
+        "[PegaKVConnector] PEGA_LOAD_TIMEOUT_SECONDS=%d clamped to %d "
+        "(minimum guard against load-path deadlock)",
+        _LOAD_TIMEOUT_RAW,
+        _LOAD_TIMEOUT_FLOOR_SECONDS,
+    )
+    _LOAD_TIMEOUT_RAW = _LOAD_TIMEOUT_FLOOR_SECONDS
+
 
 @dataclass
 class SaveTask:
@@ -37,6 +49,13 @@ class SaveTask:
 
 class WorkerConnector:
     """Holds worker-only state and behaviors."""
+
+    # Maximum time to wait for an in-flight load to reach terminal state before
+    # giving up and reporting it as a load error to vLLM. Load is pure H2D once
+    # prefetch has completed, so 120s is generous. Overridable via env var, but
+    # values below _LOAD_TIMEOUT_FLOOR_SECONDS are clamped at module import time
+    # to prevent production misconfiguration from dropping every in-flight load.
+    LOAD_TIMEOUT_SECONDS: int = _LOAD_TIMEOUT_RAW
 
     def __init__(self, context: ConnectorContext):
         self._ctx = context
@@ -56,9 +75,16 @@ class WorkerConnector:
         self._pending_loads: dict[str, PyLoadState] = {}
         self._pending_load_reqs: dict[str, set[str]] = {}
         self._pending_load_meta: dict[
-            str, tuple[float, int]
-        ] = {}  # shm_name -> (start_time, num_blocks)
+            str, tuple[float, int, list[int]]
+        ] = {}  # shm_name -> (start_time, num_blocks, block_ids)
         self._load_completion_lock = threading.Lock()
+
+        # Failure surface for vLLM's get_block_ids_with_load_errors / get_finished.
+        # Populated when start_load_kv fails synchronously or when an in-flight
+        # load times out waiting for the server. Drained once per get_finished
+        # and get_block_ids_with_load_errors call.
+        self._failed_load_block_ids: set[int] = set()
+        self._failed_load_reqs: set[str] = set()
 
         self._registered_layers: list[str] = []
         self._layer_name_to_id: dict[str, int] = {}
@@ -203,10 +229,12 @@ class WorkerConnector:
                 self._finished_requests -= done_saves
                 finished_sending = done_saves
 
+        timeout_triggered = False
         with self._load_completion_lock:
             completed_reqs: set[str] = set()
             completed_shms: list[str] = []
             load_stats_to_record: list[tuple[float, int, bool]] = []
+            now = time.perf_counter()
 
             for shm_name, req_ids in self._pending_load_reqs.items():
                 sample_req_id = next(iter(req_ids))
@@ -214,7 +242,13 @@ class WorkerConnector:
                 if load_state is None:
                     continue
 
-                if load_state.is_ready():
+                meta = self._pending_load_meta.get(shm_name)
+                ready = load_state.is_ready()
+                timed_out = (
+                    not ready and meta is not None and (now - meta[0]) > self.LOAD_TIMEOUT_SECONDS
+                )
+
+                if ready:
                     state = load_state.get_state()
                     success = state >= 0
                     if not success:
@@ -223,29 +257,56 @@ class WorkerConnector:
                             req_ids,
                             state,
                         )
+                        if meta is not None:
+                            self._failed_load_block_ids.update(meta[2])
                     else:
                         logger.debug(
                             "[PegaKVConnector] async_load_completed: reqs=%s",
                             req_ids,
                         )
 
-                    # Calculate load duration
-                    if shm_name in self._pending_load_meta:
-                        start_time, num_blocks = self._pending_load_meta[shm_name]
-                        duration = time.perf_counter() - start_time
+                    if meta is not None:
+                        start_time, num_blocks, _ = meta
+                        duration = now - start_time
                         load_stats_to_record.append((duration, num_blocks, success))
 
                     completed_reqs.update(req_ids)
                     completed_shms.append(shm_name)
+                elif timed_out:
+                    assert meta is not None
+                    start_time, num_blocks, block_ids = meta
+                    duration = now - start_time
+                    logger.error(
+                        "[PegaKVConnector] load_timeout: reqs=%s shm=%s elapsed=%.1fs "
+                        "blocks=%d (reporting as load errors)",
+                        req_ids,
+                        shm_name,
+                        duration,
+                        num_blocks,
+                    )
+                    self._failed_load_block_ids.update(block_ids)
+                    load_stats_to_record.append((duration, num_blocks, False))
+                    completed_reqs.update(req_ids)
+                    completed_shms.append(shm_name)
+                    timeout_triggered = True
 
             for shm_name in completed_shms:
-                req_ids = self._pending_load_reqs.pop(shm_name, set())
+                shm_req_ids = self._pending_load_reqs.pop(shm_name, set())
                 self._pending_load_meta.pop(shm_name, None)
-                for req_id in req_ids:
+                for req_id in shm_req_ids:
                     self._pending_loads.pop(req_id, None)
+
+            # Drain sync-failure reqs recorded by start_load_kv so they also
+            # reach vLLM as finished_recving in this pass.
+            if self._failed_load_reqs:
+                completed_reqs.update(self._failed_load_reqs)
+                self._failed_load_reqs = set()
 
             if completed_reqs:
                 finished_recving = completed_reqs
+
+        if timeout_triggered:
+            self._ctx.state_manager.mark_unavailable("load timeout")
 
         # Record load stats outside the lock
         if load_stats_to_record:
@@ -305,18 +366,39 @@ class WorkerConnector:
         load_state = PyLoadState()
         shm_name = load_state.shm_name()
 
-        ok, message = self._ctx.engine_client.load(
-            self._ctx.instance_id,
-            self._ctx.effective_tp_rank,
-            self._ctx.device_id,
-            shm_name,
-            target_layers,
-            all_block_ids,
-            all_block_hashes,
-        )
+        try:
+            ok, message = self._ctx.engine_client.load(
+                self._ctx.instance_id,
+                self._ctx.effective_tp_rank,
+                self._ctx.device_id,
+                shm_name,
+                target_layers,
+                all_block_ids,
+                all_block_hashes,
+            )
+        except Exception as e:
+            logger.error(
+                "[PegaKVConnector] Load RPC exception: %s (reqs=%s blocks=%d, "
+                "marking blocks as load errors)",
+                e,
+                request_ids,
+                len(all_block_ids),
+            )
+            self._record_load_failure(request_ids, all_block_ids, load_start)
+            self._ctx.state_manager.mark_unavailable(f"load rpc exception: {e}")
+            return
 
         if not ok:
-            raise RuntimeError(f"Load request failed: {message}")
+            logger.error(
+                "[PegaKVConnector] Load RPC failed: %s (reqs=%s blocks=%d, "
+                "marking blocks as load errors)",
+                message,
+                request_ids,
+                len(all_block_ids),
+            )
+            self._record_load_failure(request_ids, all_block_ids, load_start)
+            self._ctx.state_manager.mark_unavailable(f"load rpc failed: {message}")
+            return
 
         num_layers = len(target_layers)
         num_blocks = len(all_block_ids)
@@ -328,8 +410,15 @@ class WorkerConnector:
             for req_id in request_ids:
                 self._pending_loads[req_id] = load_state
             self._pending_load_reqs[shm_name] = set(request_ids)
-            # Record start time and block count for stats
-            self._pending_load_meta[shm_name] = (time.perf_counter(), num_blocks)
+            # Keep load_start as the shared baseline so timeout and stats duration
+            # are comparable to the sync-failure path (which also uses load_start).
+            # all_block_ids is not mutated after this point; keep the reference
+            # instead of an extra defensive copy.
+            self._pending_load_meta[shm_name] = (
+                load_start,
+                num_blocks,
+                all_block_ids,
+            )
 
         logger.debug(
             "[PegaKVConnector] started async load: %d blocks across %d layers for %d reqs, "
@@ -343,6 +432,32 @@ class WorkerConnector:
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         pass
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        """Return block IDs whose load failed since the last call, then clear.
+
+        vLLM calls this each forward pass and re-schedules reported blocks for
+        local recomputation. Failures may come from synchronous RPC errors in
+        start_load_kv or from in-flight load timeouts detected in get_finished.
+        """
+        with self._load_completion_lock:
+            failed = self._failed_load_block_ids
+            self._failed_load_block_ids = set()
+        return failed
+
+    def _record_load_failure(
+        self,
+        request_ids: list[str],
+        block_ids: list[int],
+        start_time: float,
+    ) -> None:
+        """Record a synchronous load RPC failure for later reporting to vLLM."""
+        duration = time.perf_counter() - start_time
+        with self._load_completion_lock:
+            self._failed_load_reqs.update(request_ids)
+            self._failed_load_block_ids.update(block_ids)
+        with self._stats_lock:
+            self._stats.record_load(duration, len(block_ids), success=False)
 
     def save_kv_layer(
         self,

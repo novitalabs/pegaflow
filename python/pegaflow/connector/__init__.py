@@ -251,7 +251,9 @@ class PegaKVConnector(KVConnectorBase_V1):
     # Defaults and shutdown
     # ==============================
     def get_block_ids_with_load_errors(self) -> set[int]:
-        return set()
+        if not self._worker:
+            return set()
+        return self._worker.get_block_ids_with_load_errors()
 
     def get_kv_connector_stats(self) -> PegaKVConnectorStats | None:
         stats: PegaKVConnectorStats | None = None
