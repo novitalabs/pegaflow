@@ -1,4 +1,4 @@
-use crate::metric::{record_node_purge, record_rpc_result};
+use crate::metric::{record_node_purge, record_purge_sweep, record_rpc_result};
 use crate::proto::engine::meta_server_server::MetaServer;
 use crate::proto::engine::{
     ByeRequest, ByeResponse, HeartbeatRequest, HeartbeatResponse, InsertBlockHashesRequest,
@@ -230,9 +230,8 @@ impl MetaServer for GrpcMetaService {
         let purged = self.store.bye(&req.node, &req.epoch);
         info!("RPC [bye]: node={} purged={} entries", req.node, purged);
 
-        if purged > 0 {
-            record_node_purge(1);
-        }
+        record_node_purge(1);
+        record_purge_sweep(purged as u64);
 
         let result = Ok(Response::new(ByeResponse {}));
         record_rpc_result("bye", &result, start);

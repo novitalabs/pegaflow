@@ -67,6 +67,24 @@ pub fn record_ttl_sweep(removed: u64) {
 }
 
 // ---------------------------------------------------------------------------
+// Purge sweep counter (block keys removed due to dead-node hard-delete)
+// ---------------------------------------------------------------------------
+
+static PURGE_SWEEP_REMOVED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    let meter = global::meter("pegaflow_metaserver");
+    meter
+        .u64_counter("pegaflow_metaserver_purge_sweep_removed")
+        .with_description("Total block keys removed by dead-node purge sweep")
+        .build()
+});
+
+pub fn record_purge_sweep(removed: u64) {
+    if removed > 0 {
+        PURGE_SWEEP_REMOVED.add(removed, &[]);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Node purge counter
 // ---------------------------------------------------------------------------
 
