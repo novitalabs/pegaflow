@@ -31,8 +31,8 @@ pub fn register_store_gauges(store: &Arc<BlockHashStore>) {
             })
             .build();
         let active_nodes = meter
-            .u64_observable_gauge("pegaflow_metaserver_active_nodes")
-            .with_description("Number of currently tracked nodes (healthy + suspect)")
+            .u64_observable_gauge("pegaflow_metaserver_healthy_nodes")
+            .with_description("Number of currently healthy nodes")
             .with_callback(move |observer| {
                 observer.observe(s2.node_count() as u64, &[]);
             })
@@ -63,7 +63,9 @@ static SWEEP_METRICS: LazyLock<SweepMetrics> = LazyLock::new(|| {
 });
 
 pub fn record_ttl_sweep(removed: u64) {
-    SWEEP_METRICS.removed.add(removed, &[]);
+    if removed > 0 {
+        SWEEP_METRICS.removed.add(removed, &[]);
+    }
 }
 
 // ---------------------------------------------------------------------------

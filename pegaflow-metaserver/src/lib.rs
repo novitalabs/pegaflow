@@ -136,24 +136,24 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(10 * 60));
             loop {
                 interval.tick().await;
-                let (ttl_expired, purge_removed, purged_nodes) = store.sweep_expired();
-                if ttl_expired > 0 {
-                    metric::record_ttl_sweep(ttl_expired as u64);
+                let result = store.sweep_expired();
+                if result.ttl_expired > 0 {
+                    metric::record_ttl_sweep(result.ttl_expired as u64);
                     info!(
                         "TTL sweep: removed {} expired block keys, {} remaining",
-                        ttl_expired,
+                        result.ttl_expired,
                         store.entry_count()
                     );
                 }
-                if purge_removed > 0 {
-                    metric::record_purge_sweep(purge_removed as u64);
+                if result.purge_removed > 0 {
+                    metric::record_purge_sweep(result.purge_removed as u64);
                     info!(
                         "TTL sweep: purged {} dead nodes, {} block entries",
-                        purged_nodes, purge_removed
+                        result.purged_nodes, result.purge_removed
                     );
                 }
-                if purged_nodes > 0 {
-                    metric::record_node_purge(purged_nodes as u64);
+                if result.purged_nodes > 0 {
+                    metric::record_node_purge(result.purged_nodes as u64);
                 }
             }
         });
