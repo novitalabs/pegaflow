@@ -132,25 +132,18 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     // Spawn background TTL sweep task (every 10 minutes)
     {
         let store = Arc::clone(&store);
-        let shutdown = Arc::clone(&shutdown);
         tokio::spawn(async move {
-            let shutdown_fut = shutdown.notified();
-            tokio::pin!(shutdown_fut);
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(10 * 60));
             loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        let removed = store.sweep_expired();
-                        if removed > 0 {
-                            metric::record_ttl_sweep(removed as u64);
-                            info!(
-                                "TTL sweep: removed {} stale block keys, {} remaining",
-                                removed,
-                                store.entry_count()
-                            );
-                        }
-                    }
-                    _ = &mut shutdown_fut => break,
+                interval.tick().await;
+                let removed = store.sweep_expired();
+                if removed > 0 {
+                    metric::record_ttl_sweep(removed as u64);
+                    info!(
+                        "TTL sweep: removed {} stale block keys, {} remaining",
+                        removed,
+                        store.entry_count()
+                    );
                 }
             }
         });
@@ -159,20 +152,13 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     // Spawn liveness sweep task (every 5s)
     {
         let store = Arc::clone(&store);
-        let shutdown = Arc::clone(&shutdown);
         tokio::spawn(async move {
-            let shutdown_fut = shutdown.notified();
-            tokio::pin!(shutdown_fut);
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        let (suspect, purged) = store.sweep_liveness();
-                        if suspect > 0 || purged > 0 {
-                            metric::record_liveness_sweep(suspect as u64, purged as u64);
-                        }
-                    }
-                    _ = &mut shutdown_fut => break,
+                interval.tick().await;
+                let (suspect, purged) = store.sweep_liveness();
+                if suspect > 0 || purged > 0 {
+                    metric::record_liveness_sweep(suspect as u64, purged as u64);
                 }
             }
         });
