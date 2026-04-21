@@ -1,7 +1,7 @@
 //! Benchmark for batch GPU<>CPU transfer functions.
 //!
-//! Compares `batch_copy_segments_to_gpu` performance under cuda-12 (merge-contiguous
-//! loop) vs cuda-12.8+/13 (`cuMemcpyBatchAsync_v2`).
+//! Measures `batch_copy_segments_to_gpu` performance using `cuMemcpyBatchAsync`
+//! (CUDA 12.8+) / `cuMemcpyBatchAsync_v2` (CUDA 13).
 //!
 //! Key question: how much does the batch API help when segments are scattered?
 //!
