@@ -8,10 +8,8 @@ default-run = "pegaflow-server"
 workspace = true
 
 [features]
-default = ["cuda-12"]
-cuda-12 = ["pegaflow-core/cuda-12", "pegaflow-metaserver/cuda-12"]
-cuda-128 = ["pegaflow-core/cuda-128", "pegaflow-metaserver/cuda-128"]
-cuda-13 = ["pegaflow-core/cuda-13", "pegaflow-metaserver/cuda-13"]
+default = ["pegaflow-core/default"]
+cuda-13 = ["pegaflow-core/cuda-13"]
 tracing = ["fastrace", "pegaflow-core/tracing"]
 
 [lib]

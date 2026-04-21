@@ -21,10 +21,8 @@ name = "pegaflow-metaserver-py"
 path = "src/bin/metaserver.rs"
 
 [features]
-default = ["cuda-12"]
-cuda-12 = ["pegaflow-core/cuda-12", "pegaflow-server/cuda-12", "pegaflow-metaserver/cuda-12"]
-cuda-128 = ["pegaflow-core/cuda-128", "pegaflow-server/cuda-128", "pegaflow-metaserver/cuda-128"]
-cuda-13 = ["pegaflow-core/cuda-13", "pegaflow-server/cuda-13", "pegaflow-metaserver/cuda-13"]
+default = ["pegaflow-core/default", "pegaflow-server/default"]
+cuda-13 = ["pegaflow-core/cuda-13", "pegaflow-server/cuda-13"]
 
 [dependencies]
 pyo3 = { workspace = true, features = ["extension-module"] }

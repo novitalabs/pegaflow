@@ -7,9 +7,7 @@ edition.workspace = true
 workspace = true
 
 [features]
-default = ["cuda-12"]
-cuda-12 = ["cudarc/cuda-12040"]
-cuda-128 = ["cudarc/cuda-12080"]
+default = ["cudarc/cuda-12080"]
 cuda-13 = ["cudarc/cuda-13000"]
 tracing = ["fastrace"]
 
