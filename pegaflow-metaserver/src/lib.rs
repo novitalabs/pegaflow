@@ -42,6 +42,14 @@ pub struct Cli {
     /// Cache entry TTL in minutes
     #[arg(long, default_value = "120")]
     pub ttl_minutes: u64,
+
+    /// Heartbeat suspect threshold in seconds (node marked suspect after this)
+    #[arg(long, default_value = "30")]
+    pub suspect_secs: u64,
+
+    /// Heartbeat hard-delete threshold in seconds (node purged after this)
+    #[arg(long, default_value = "90")]
+    pub hard_delete_secs: u64,
 }
 
 fn init_metrics() -> Result<(SdkMeterProvider, Registry), Box<dyn Error>> {
@@ -103,34 +111,53 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     // Initialize metrics
     let (meter_provider, prometheus_registry) = init_metrics()?;
 
-    // Create the block hash store with TTL
-    let store = Arc::new(BlockHashStore::with_ttl(cli.ttl_minutes));
+    info!(
+        "Liveness config: suspect={}s, hard_delete={}s",
+        cli.suspect_secs, cli.hard_delete_secs
+    );
+
+    // Create the block hash store with TTL and liveness config
+    let store = Arc::new(BlockHashStore::with_liveness_config(
+        cli.ttl_minutes,
+        cli.suspect_secs,
+        cli.hard_delete_secs,
+    ));
 
     // Register store observable gauges
     metric::register_store_gauges(&store);
 
-    // Spawn background TTL sweep task (every 10 minutes)
+    // Create shutdown notifier (before spawning background tasks)
+    let shutdown = Arc::new(Notify::new());
+
+    // Spawn background sweep task (TTL expiry + dead node purge, every 10 minutes)
     {
         let store = Arc::clone(&store);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(10 * 60));
             loop {
                 interval.tick().await;
-                let removed = store.sweep_expired();
-                if removed > 0 {
-                    metric::record_ttl_sweep(removed as u64);
+                let result = store.sweep_expired();
+                if result.ttl_expired > 0 {
+                    metric::record_ttl_sweep(result.ttl_expired as u64);
                     info!(
-                        "TTL sweep: removed {} stale block keys, {} remaining",
-                        removed,
+                        "TTL sweep: removed {} expired block keys, {} remaining",
+                        result.ttl_expired,
                         store.entry_count()
                     );
+                }
+                if result.purge_removed > 0 {
+                    metric::record_purge_sweep(result.purge_removed as u64);
+                    info!(
+                        "TTL sweep: purged {} dead nodes, {} block entries",
+                        result.purged_nodes, result.purge_removed
+                    );
+                }
+                if result.purged_nodes > 0 {
+                    metric::record_node_purge(result.purged_nodes as u64);
                 }
             }
         });
     }
-
-    // Create shutdown notifier
-    let shutdown = Arc::new(Notify::new());
 
     // Start HTTP server for health check and metrics
     let _http_handle =

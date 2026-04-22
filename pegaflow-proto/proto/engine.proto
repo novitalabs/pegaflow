@@ -239,8 +239,24 @@ message QueryPrefixBlocksResponse {
   repeated NodePrefixResult nodes = 1;
 }
 
+message HeartbeatRequest {
+  string node = 1;
+  string epoch = 2;
+}
+
+message HeartbeatResponse {}
+
+message ByeRequest {
+  string node = 1;
+  string epoch = 2;
+}
+
+message ByeResponse {}
+
 service MetaServer {
   rpc InsertBlockHashes(InsertBlockHashesRequest) returns (InsertBlockHashesResponse);
   rpc RemoveBlockHashes(RemoveBlockHashesRequest) returns (RemoveBlockHashesResponse);
   rpc QueryPrefixBlocks(QueryPrefixBlocksRequest) returns (QueryPrefixBlocksResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc Bye(ByeRequest) returns (ByeResponse);
 }

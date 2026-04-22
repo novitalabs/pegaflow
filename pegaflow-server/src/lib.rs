@@ -438,6 +438,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         None
     };
 
+    let shutdown = Arc::new(Notify::new());
+
     let storage_config = pegaflow_core::StorageConfig {
         enable_lfu_admission: cli.enable_lfu_admission,
         hint_value_size_bytes: cli.hint_value_size,
@@ -489,8 +491,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         ),
     ));
     crate::metric::register_hll_gauges(&hll_tracker);
-
-    let shutdown = Arc::new(Notify::new());
 
     runtime.block_on(async move {
         // Create PegaEngine inside tokio runtime context (needed for SSD cache tokio::spawn)
@@ -589,6 +589,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         }
 
         info!("Server stopped");
+
+        // Send Bye to MetaServer before full shutdown
+        engine.metaserver_bye().await;
 
         // Stop HTTP server
         shutdown.notify_waiters();

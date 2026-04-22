@@ -12,23 +12,35 @@ use crate::store::BlockHashStore;
 
 struct StoreGaugeHandles {
     _entries: ObservableGauge<u64>,
+    _active_nodes: ObservableGauge<u64>,
 }
 
 static STORE_GAUGES: OnceLock<StoreGaugeHandles> = OnceLock::new();
 
 /// Register observable gauges backed by the given store.
 pub fn register_store_gauges(store: &Arc<BlockHashStore>) {
-    let s = Arc::clone(store);
+    let s1 = Arc::clone(store);
+    let s2 = Arc::clone(store);
     STORE_GAUGES.get_or_init(|| {
         let meter = global::meter("pegaflow_metaserver");
         let entries = meter
             .u64_observable_gauge("pegaflow_metaserver_store_entries")
             .with_description("Number of unique block keys in the store")
             .with_callback(move |observer| {
-                observer.observe(s.entry_count(), &[]);
+                observer.observe(s1.entry_count(), &[]);
             })
             .build();
-        StoreGaugeHandles { _entries: entries }
+        let active_nodes = meter
+            .u64_observable_gauge("pegaflow_metaserver_healthy_nodes")
+            .with_description("Number of currently healthy nodes")
+            .with_callback(move |observer| {
+                observer.observe(s2.node_count() as u64, &[]);
+            })
+            .build();
+        StoreGaugeHandles {
+            _entries: entries,
+            _active_nodes: active_nodes,
+        }
     });
 }
 
@@ -51,7 +63,45 @@ static SWEEP_METRICS: LazyLock<SweepMetrics> = LazyLock::new(|| {
 });
 
 pub fn record_ttl_sweep(removed: u64) {
-    SWEEP_METRICS.removed.add(removed, &[]);
+    if removed > 0 {
+        SWEEP_METRICS.removed.add(removed, &[]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Purge sweep counter (block keys removed due to dead-node hard-delete)
+// ---------------------------------------------------------------------------
+
+static PURGE_SWEEP_REMOVED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    let meter = global::meter("pegaflow_metaserver");
+    meter
+        .u64_counter("pegaflow_metaserver_purge_sweep_removed")
+        .with_description("Total block keys removed by dead-node purge sweep")
+        .build()
+});
+
+pub fn record_purge_sweep(removed: u64) {
+    if removed > 0 {
+        PURGE_SWEEP_REMOVED.add(removed, &[]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Node purge counter
+// ---------------------------------------------------------------------------
+
+static NODE_PURGED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    let meter = global::meter("pegaflow_metaserver");
+    meter
+        .u64_counter("pegaflow_metaserver_node_purged_total")
+        .with_description("Total nodes purged (timeout or bye)")
+        .build()
+});
+
+pub fn record_node_purge(count: u64) {
+    if count > 0 {
+        NODE_PURGED.add(count, &[]);
+    }
 }
 
 // ---------------------------------------------------------------------------

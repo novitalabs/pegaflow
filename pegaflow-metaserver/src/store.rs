@@ -1,4 +1,5 @@
 use dashmap::DashMap;
+use log::info;
 use pegaflow_common::BlockKey;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -6,12 +7,25 @@ use std::time::{Duration, Instant};
 
 /// Default TTL for cache entries (120 minutes)
 pub const DEFAULT_TTL_MINUTES: u64 = 120;
+pub const DEFAULT_SUSPECT_SECS: u64 = 30;
+pub const DEFAULT_HARD_DELETE_SECS: u64 = 90;
 
 /// A prefix query result: one block hash and all nodes that own it.
 #[derive(Debug, Clone)]
 pub struct PrefixEntry {
     pub block_hash: Vec<u8>,
     pub nodes: Vec<Arc<str>>,
+}
+
+pub struct NodeLiveness {
+    pub epoch: String,
+    pub last_seen: Instant,
+}
+
+pub struct SweepResult {
+    pub ttl_expired: usize,
+    pub purge_removed: usize,
+    pub purged_nodes: usize,
 }
 
 /// Async thread-safe block hash storage using DashMap.
@@ -21,19 +35,39 @@ pub struct BlockHashStore {
     /// Key: BlockKey, Value: { node_url → registration_time }
     map: DashMap<BlockKey, HashMap<Arc<str>, Instant>>,
     ttl: Duration,
+    /// Per-node liveness tracking
+    nodes: DashMap<Arc<str>, NodeLiveness>,
+    suspect_threshold: Duration,
+    hard_delete_threshold: Duration,
 }
 
 impl BlockHashStore {
     /// Create a new block hash store with default TTL (120 minutes)
     pub fn new() -> Self {
-        Self::with_ttl(DEFAULT_TTL_MINUTES)
+        Self::with_liveness_config(
+            DEFAULT_TTL_MINUTES,
+            DEFAULT_SUSPECT_SECS,
+            DEFAULT_HARD_DELETE_SECS,
+        )
     }
 
     /// Create a new block hash store with specified TTL in minutes
     pub fn with_ttl(ttl_minutes: u64) -> Self {
+        Self::with_liveness_config(ttl_minutes, DEFAULT_SUSPECT_SECS, DEFAULT_HARD_DELETE_SECS)
+    }
+
+    /// Create a new block hash store with full configuration
+    pub fn with_liveness_config(
+        ttl_minutes: u64,
+        suspect_secs: u64,
+        hard_delete_secs: u64,
+    ) -> Self {
         Self {
             map: DashMap::new(),
             ttl: Duration::from_secs(ttl_minutes * 60),
+            nodes: DashMap::new(),
+            suspect_threshold: Duration::from_secs(suspect_secs),
+            hard_delete_threshold: Duration::from_secs(hard_delete_secs),
         }
     }
 
@@ -77,18 +111,24 @@ impl BlockHashStore {
     }
 
     /// Query the longest prefix of `hashes` that exists in the store.
-    /// Stops at the first hash not found on any node.
+    /// Stops at the first hash not found on any healthy node.
+    /// Suspect nodes are filtered out of results.
     pub fn query_prefix(&self, namespace: &str, hashes: &[Vec<u8>]) -> Vec<PrefixEntry> {
         let mut result = Vec::new();
         for hash in hashes {
             let key = BlockKey::new(namespace.to_string(), hash.clone());
-            if let Some(nodes) = self.map.get(&key) {
-                if nodes.is_empty() {
+            if let Some(owners) = self.map.get(&key) {
+                let healthy_nodes: Vec<Arc<str>> = owners
+                    .keys()
+                    .filter(|n| self.is_node_healthy(n))
+                    .cloned()
+                    .collect();
+                if healthy_nodes.is_empty() {
                     break;
                 }
                 result.push(PrefixEntry {
                     block_hash: hash.clone(),
-                    nodes: nodes.keys().cloned().collect(),
+                    nodes: healthy_nodes,
                 });
             } else {
                 break;
@@ -97,11 +137,83 @@ impl BlockHashStore {
         result
     }
 
-    /// Sweep expired entries. Removes per-node registrations older than TTL,
-    /// then drops block keys with no remaining owners.
-    /// Called periodically from a background task.
-    /// Returns the number of block keys fully removed.
-    pub fn sweep_expired(&self) -> usize {
+    /// Process a heartbeat from a node.
+    /// - New node: register with current timestamp
+    /// - Same epoch: refresh last_seen
+    /// - Different epoch: purge old entries, re-register
+    pub fn heartbeat(&self, node: &str, epoch: &str) {
+        let node_key: Arc<str> = Arc::from(node);
+        let now = Instant::now();
+
+        if let Some(mut entry) = self.nodes.get_mut(&node_key) {
+            if entry.epoch == epoch {
+                entry.last_seen = now;
+            } else {
+                let old_epoch = entry.epoch.clone();
+                drop(entry);
+                let purged = self.purge_node_before(node, now);
+                info!(
+                    "Node {} epoch changed ({} -> {}), purged {} entries",
+                    node, old_epoch, epoch, purged
+                );
+                self.nodes.insert(
+                    node_key,
+                    NodeLiveness {
+                        epoch: epoch.to_string(),
+                        last_seen: now,
+                    },
+                );
+            }
+        } else {
+            info!("Detected node {}", node);
+            self.nodes.insert(
+                node_key,
+                NodeLiveness {
+                    epoch: epoch.to_string(),
+                    last_seen: now,
+                },
+            );
+        }
+    }
+
+    /// Process a Bye from a node. Purges all entries and removes liveness tracking.
+    /// Only acts if the epoch matches (prevents stale Bye from old process).
+    pub fn bye(&self, node: &str, epoch: &str) -> usize {
+        let node_key: Arc<str> = Arc::from(node);
+        let cutoff = Instant::now();
+        let removed = self
+            .nodes
+            .remove_if(&node_key, |_, liveness| liveness.epoch == epoch);
+        if removed.is_some() {
+            self.purge_node_before(node, cutoff)
+        } else {
+            0
+        }
+    }
+
+    /// Remove block entries owned by `node` that were registered at or before
+    /// `cutoff`. Entries inserted after `cutoff` (e.g. by a re-registered node)
+    /// are preserved, preventing the race where purge deletes freshly-inserted
+    /// entries.
+    fn purge_node_before(&self, node: &str, cutoff: Instant) -> usize {
+        let mut purged = 0;
+        self.map.retain(|_, owners| {
+            if let Some(registered_at) = owners.get(node)
+                && *registered_at <= cutoff
+            {
+                owners.remove(node);
+                purged += 1;
+            }
+            !owners.is_empty()
+        });
+        purged
+    }
+
+    /// Sweep expired entries and dead nodes.
+    ///
+    /// 1. Removes per-node block registrations older than TTL.
+    /// 2. Purges nodes past `hard_delete_threshold` and removes their block entries.
+    pub fn sweep_expired(&self) -> SweepResult {
         let now = Instant::now();
         let ttl = self.ttl;
         let before = self.map.len();
@@ -109,7 +221,44 @@ impl BlockHashStore {
             nodes.retain(|_, registered_at| now.duration_since(*registered_at) < ttl);
             !nodes.is_empty()
         });
-        before.saturating_sub(self.map.len())
+        let expired_keys = before.saturating_sub(self.map.len());
+        let mut purge_removed_keys = 0;
+
+        // Purge dead nodes (past hard_delete_threshold).
+        // retain holds the shard write-lock so check + removal is atomic per entry.
+        let mut purged_nodes: Vec<Arc<str>> = Vec::new();
+        self.nodes.retain(|node_key, liveness| {
+            if liveness.last_seen.elapsed() >= self.hard_delete_threshold {
+                purged_nodes.push(node_key.clone());
+                false
+            } else {
+                true
+            }
+        });
+
+        if !purged_nodes.is_empty() {
+            let before_purge = self.map.len();
+            self.map.retain(|_, owners| {
+                for node in &purged_nodes {
+                    if let Some(registered_at) = owners.get(node.as_ref())
+                        && *registered_at <= now
+                    {
+                        owners.remove(node.as_ref());
+                    }
+                }
+                !owners.is_empty()
+            });
+            purge_removed_keys = before_purge.saturating_sub(self.map.len());
+            for node_key in &purged_nodes {
+                info!("Hard-deleted node {}", node_key);
+            }
+        }
+
+        SweepResult {
+            ttl_expired: expired_keys,
+            purge_removed: purge_removed_keys,
+            purged_nodes: purged_nodes.len(),
+        }
     }
 
     /// Get the number of unique block keys
@@ -117,10 +266,31 @@ impl BlockHashStore {
         self.map.len() as u64
     }
 
+    /// Get the number of healthy (non-suspect) nodes.
+    pub fn node_count(&self) -> usize {
+        self.nodes
+            .iter()
+            .filter(|entry| entry.last_seen.elapsed() < self.suspect_threshold)
+            .count()
+    }
+
+    fn is_node_healthy(&self, node: &Arc<str>) -> bool {
+        match self.nodes.get(node) {
+            Some(entry) => entry.last_seen.elapsed() < self.suspect_threshold,
+            // Backward compatibility: nodes may own blocks in `self.map`
+            // without ever being registered in `self.nodes` via heartbeat.
+            // Treat those untracked nodes as healthy so prefix queries keep
+            // returning existing owners unless/until explicit liveness data
+            // marks them suspect or they are removed by normal TTL cleanup.
+            None => true,
+        }
+    }
+
     /// Clear all entries (for testing or maintenance)
     #[allow(dead_code)]
     pub fn invalidate_all(&self) {
         self.map.clear();
+        self.nodes.clear();
     }
 }
 
@@ -256,8 +426,8 @@ mod tests {
         assert_eq!(store.entry_count(), 2);
 
         // Instant::now() is already past the zero-TTL deadline
-        let removed = store.sweep_expired();
-        assert_eq!(removed, 2);
+        let result = store.sweep_expired();
+        assert_eq!(result.ttl_expired, 2);
         assert_eq!(store.entry_count(), 0);
     }
 
@@ -266,8 +436,8 @@ mod tests {
         let store = BlockHashStore::with_ttl(120); // 120 min TTL
         store.insert_hashes("ns", &[vec![1], vec![2]], "node-a");
 
-        let removed = store.sweep_expired();
-        assert_eq!(removed, 0);
+        let result = store.sweep_expired();
+        assert_eq!(result.ttl_expired, 0);
         assert_eq!(store.entry_count(), 2);
     }
 
@@ -331,5 +501,249 @@ mod tests {
         let existing = store.query_prefix(namespace, &hashes);
         assert_eq!(existing.len(), 0);
         assert_eq!(store.entry_count(), 0);
+    }
+
+    // --- Heartbeat tests ---
+
+    #[test]
+    fn test_heartbeat_new_node() {
+        let store = BlockHashStore::new();
+        assert_eq!(store.node_count(), 0);
+
+        store.heartbeat("node-a", "epoch-1");
+        assert_eq!(store.node_count(), 1);
+
+        let entry = store.nodes.get(&Arc::<str>::from("node-a")).unwrap();
+        assert_eq!(entry.epoch, "epoch-1");
+    }
+
+    #[test]
+    fn test_heartbeat_refresh() {
+        let store = BlockHashStore::new();
+        store.heartbeat("node-a", "epoch-1");
+
+        let first_seen = store
+            .nodes
+            .get(&Arc::<str>::from("node-a"))
+            .unwrap()
+            .last_seen;
+
+        std::thread::sleep(Duration::from_millis(10));
+        store.heartbeat("node-a", "epoch-1");
+
+        let second_seen = store
+            .nodes
+            .get(&Arc::<str>::from("node-a"))
+            .unwrap()
+            .last_seen;
+        assert!(second_seen > first_seen);
+    }
+
+    #[test]
+    fn test_heartbeat_recovers_stale_node() {
+        let store = BlockHashStore {
+            suspect_threshold: Duration::from_millis(50),
+            ..BlockHashStore::with_liveness_config(120, 1, 3600)
+        };
+        store.heartbeat("node-a", "epoch-1");
+        store.insert_hashes("ns", &[vec![1]], "node-a");
+
+        // Wait until node-a becomes stale
+        std::thread::sleep(Duration::from_millis(60));
+        let result = store.query_prefix("ns", &[vec![1]]);
+        assert_eq!(result.len(), 0);
+
+        // Heartbeat refreshes last_seen → node visible again
+        store.heartbeat("node-a", "epoch-1");
+        let result = store.query_prefix("ns", &[vec![1]]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].nodes[0].as_ref(), "node-a");
+    }
+
+    #[test]
+    fn test_heartbeat_new_epoch_purges() {
+        let store = BlockHashStore::new();
+        store.heartbeat("node-a", "epoch-1");
+        store.insert_hashes("ns", &[vec![1], vec![2]], "node-a");
+        assert_eq!(store.entry_count(), 2);
+
+        // Heartbeat with new epoch purges old entries
+        store.heartbeat("node-a", "epoch-2");
+        assert_eq!(store.entry_count(), 0);
+        assert_eq!(store.node_count(), 1);
+
+        let entry = store.nodes.get(&Arc::<str>::from("node-a")).unwrap();
+        assert_eq!(entry.epoch, "epoch-2");
+    }
+
+    // --- Bye tests ---
+
+    #[test]
+    fn test_bye_matching_epoch() {
+        let store = BlockHashStore::new();
+        store.heartbeat("node-a", "epoch-1");
+        store.insert_hashes("ns", &[vec![1], vec![2]], "node-a");
+
+        let purged = store.bye("node-a", "epoch-1");
+        assert_eq!(purged, 2);
+        assert_eq!(store.entry_count(), 0);
+        assert_eq!(store.node_count(), 0);
+    }
+
+    #[test]
+    fn test_bye_mismatched_epoch_is_noop() {
+        let store = BlockHashStore::new();
+        store.heartbeat("node-a", "epoch-1");
+        store.insert_hashes("ns", &[vec![1]], "node-a");
+
+        let purged = store.bye("node-a", "epoch-wrong");
+        assert_eq!(purged, 0);
+        assert_eq!(store.entry_count(), 1);
+        assert_eq!(store.node_count(), 1);
+    }
+
+    #[test]
+    fn test_bye_unknown_node_is_noop() {
+        let store = BlockHashStore::new();
+        let purged = store.bye("node-unknown", "epoch-1");
+        assert_eq!(purged, 0);
+    }
+
+    // --- Sweep + dead node purge tests ---
+
+    #[test]
+    fn test_sweep_expired_purges_dead_nodes() {
+        // hard_delete=0 → immediately dead
+        let store = BlockHashStore::with_liveness_config(120, 30, 0);
+        store.heartbeat("node-a", "epoch-1");
+        store.insert_hashes("ns", &[vec![1], vec![2]], "node-a");
+
+        let result = store.sweep_expired();
+        assert_eq!(result.purged_nodes, 1);
+        assert_eq!(result.purge_removed, 2);
+        assert_eq!(store.node_count(), 0);
+        assert_eq!(store.entry_count(), 0);
+    }
+
+    #[test]
+    fn test_sweep_expired_keeps_fresh_nodes() {
+        // hard_delete=3600 → node survives
+        let store = BlockHashStore::with_liveness_config(120, 30, 3600);
+        store.heartbeat("node-a", "epoch-1");
+        store.insert_hashes("ns", &[vec![1]], "node-a");
+
+        let result = store.sweep_expired();
+        assert_eq!(result.purged_nodes, 0);
+        assert_eq!(store.node_count(), 1);
+        assert_eq!(store.entry_count(), 1);
+    }
+
+    // --- Query filtering tests ---
+
+    #[test]
+    fn test_query_filters_stale_nodes() {
+        let store = BlockHashStore {
+            suspect_threshold: Duration::from_millis(50),
+            ..BlockHashStore::with_liveness_config(120, 1, 3600)
+        };
+        store.heartbeat("node-a", "epoch-a");
+        store.heartbeat("node-b", "epoch-b");
+        store.insert_hashes("ns", &[vec![1]], "node-a");
+        store.insert_hashes("ns", &[vec![1]], "node-b");
+
+        // Wait until both are stale, then refresh only node-b
+        std::thread::sleep(Duration::from_millis(60));
+        store.heartbeat("node-b", "epoch-b");
+
+        let result = store.query_prefix("ns", &[vec![1]]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].nodes.len(), 1);
+        assert_eq!(result[0].nodes[0].as_ref(), "node-b");
+    }
+
+    #[test]
+    fn test_query_stale_only_owner_breaks_prefix() {
+        // suspect_threshold=0 → stale immediately
+        let store = BlockHashStore::with_liveness_config(120, 0, 3600);
+        store.heartbeat("node-a", "epoch-a");
+        store.insert_hashes("ns", &[vec![1], vec![2]], "node-a");
+
+        // node-a is stale → prefix is empty
+        let result = store.query_prefix("ns", &[vec![1], vec![2]]);
+        assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn test_query_mixed_healthy_stale() {
+        let store = BlockHashStore {
+            suspect_threshold: Duration::from_millis(50),
+            ..BlockHashStore::with_liveness_config(120, 1, 3600)
+        };
+
+        store.heartbeat("node-a", "epoch-a");
+        store.heartbeat("node-b", "epoch-b");
+
+        // h1 owned by both, h2 owned only by node-a
+        store.insert_hashes("ns", &[vec![1], vec![2]], "node-a");
+        store.insert_hashes("ns", &[vec![1]], "node-b");
+
+        // Wait until both stale, then refresh only node-b
+        std::thread::sleep(Duration::from_millis(60));
+        store.heartbeat("node-b", "epoch-b");
+
+        // h1: node-a(stale) + node-b(fresh) → node-b visible
+        // h2: node-a(stale) only → prefix stops
+        let result = store.query_prefix("ns", &[vec![1], vec![2]]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].nodes.len(), 1);
+        assert_eq!(result[0].nodes[0].as_ref(), "node-b");
+    }
+
+    // --- purge_node tests ---
+
+    #[test]
+    fn test_purge_removes_from_all_blocks() {
+        let store = BlockHashStore::new();
+        store.insert_hashes("ns", &[vec![1], vec![2], vec![3]], "node-a");
+
+        let purged = store.purge_node_before("node-a", Instant::now());
+        assert_eq!(purged, 3);
+    }
+
+    #[test]
+    fn test_purge_drops_empty_keys() {
+        let store = BlockHashStore::new();
+        store.insert_hashes("ns", &[vec![1]], "node-a");
+
+        store.purge_node_before("node-a", Instant::now());
+        assert_eq!(store.entry_count(), 0);
+    }
+
+    #[test]
+    fn test_purge_keeps_other_owners() {
+        let store = BlockHashStore::new();
+        store.insert_hashes("ns", &[vec![1]], "node-a");
+        store.insert_hashes("ns", &[vec![1]], "node-b");
+
+        store.purge_node_before("node-a", Instant::now());
+        assert_eq!(store.entry_count(), 1);
+
+        let result = store.query_prefix("ns", &[vec![1]]);
+        assert_eq!(result[0].nodes.len(), 1);
+        assert_eq!(result[0].nodes[0].as_ref(), "node-b");
+    }
+
+    #[test]
+    fn test_purge_preserves_entries_after_cutoff() {
+        let store = BlockHashStore::new();
+        let cutoff = Instant::now();
+
+        // Insert after cutoff — should NOT be purged
+        std::thread::sleep(Duration::from_millis(1));
+        store.insert_hashes("ns", &[vec![1]], "node-a");
+
+        let purged = store.purge_node_before("node-a", cutoff);
+        assert_eq!(purged, 0);
+        assert_eq!(store.entry_count(), 1);
     }
 }
