@@ -13,12 +13,15 @@ use sideway::ibverbs::AccessFlags;
 
 use self::runtime::RcRuntime;
 use self::session::{RcSession, RdmaOp};
-use self::state::{AddrConnection, RcBackendState, RegisteredMemoryEntry};
+use self::state::{AddrConnection, RcBackendState, RegisteredMemoryEntry, SignalMemoryEntry};
 use std::ptr::NonNull;
 
 use mea::oneshot;
 
-use crate::engine::{NicHandshake, RegisteredMemoryRegion, TransferDesc, TransferOp};
+use crate::engine::{
+    ImmCompletion, ImmCompletionReceiver, NicHandshake, RegisteredMemoryRegion, TransferDesc,
+    TransferOp,
+};
 use crate::error::{Result, TransferError};
 use pegaflow_common::NumaNode;
 
@@ -101,9 +104,14 @@ pub(crate) enum GetOrPrepareResult {
 pub(crate) struct RcBackend {
     runtimes: Vec<Arc<RcRuntime>>,
     state: Arc<Mutex<RcBackendState>>,
+    imm_tx: mea::mpsc::UnboundedSender<ImmCompletion>,
+    imm_rx: Mutex<Option<ImmCompletionReceiver>>,
+    signal_regions: Vec<SignalMemoryEntry>,
     psn_counter: AtomicU64,
     numa_rr: NumaRoundRobin,
 }
+
+const SIGNAL_REGION_LEN: usize = 8;
 
 impl RcBackend {
     pub(crate) fn new(nic_names: &[String]) -> Result<Self> {
@@ -119,11 +127,35 @@ impl RcBackend {
             let runtime = RcRuntime::open(name)?;
             runtimes.push(runtime);
         }
+        let mut signal_regions = Vec::with_capacity(runtimes.len());
+        for runtime in &runtimes {
+            let mut storage = vec![0_u8; SIGNAL_REGION_LEN].into_boxed_slice();
+            let ptr = storage.as_mut_ptr() as u64;
+            let mr = unsafe {
+                runtime.pd.reg_mr(
+                    ptr as usize,
+                    SIGNAL_REGION_LEN,
+                    AccessFlags::LocalWrite | AccessFlags::RemoteWrite,
+                )
+            }
+            .map_err(|error| TransferError::Backend(error.to_string()))?;
+            signal_regions.push(SignalMemoryEntry {
+                base_ptr: ptr,
+                len: SIGNAL_REGION_LEN,
+                mr,
+                _storage: storage,
+            });
+        }
+
         let nic_count = runtimes.len();
         let numa_rr = NumaRoundRobin::from_runtimes(&runtimes);
+        let (imm_tx, imm_rx) = mea::mpsc::unbounded();
         Ok(Self {
             runtimes,
             state: Arc::new(Mutex::new(RcBackendState::new(nic_count))),
+            imm_tx,
+            imm_rx: Mutex::new(Some(imm_rx)),
+            signal_regions,
             psn_counter: AtomicU64::new(1),
             numa_rr,
         })
@@ -210,14 +242,15 @@ impl RcBackend {
 
         // Create all QPs before locking state.
         let mut sessions = Vec::with_capacity(self.nic_count());
-        for runtime in &self.runtimes {
+        for (nic_idx, runtime) in self.runtimes.iter().enumerate() {
             let psn_seed = self.psn_counter.fetch_add(1, Ordering::Relaxed);
-            let session = RcSession::create(runtime, psn_seed).map_err(|e| {
-                TransferError::Backend(format!(
-                    "QP creation failed on nic={}: {e}",
-                    runtime.nic_name
-                ))
-            })?;
+            let session = RcSession::create(runtime, psn_seed, nic_idx, self.imm_tx.clone())
+                .map_err(|e| {
+                    TransferError::Backend(format!(
+                        "QP creation failed on nic={}: {e}",
+                        runtime.nic_name
+                    ))
+                })?;
             sessions.push(session);
         }
 
@@ -228,6 +261,7 @@ impl RcBackend {
             nic_handshakes.push(NicHandshake {
                 endpoint,
                 memory_regions: snapshots[nic_idx].clone(),
+                signal_region: self.signal_regions[nic_idx].region(),
             });
         }
 
@@ -322,6 +356,7 @@ impl RcBackend {
             AddrConnection {
                 remote_qpns,
                 local_nics,
+                remote_signal_regions: remote_nics.iter().map(|nic| nic.signal_region).collect(),
             },
         );
         Ok(())
@@ -360,6 +395,10 @@ impl RcBackend {
 
     pub(crate) fn num_qps(&self) -> usize {
         self.state.lock().num_qps()
+    }
+
+    pub(crate) fn take_imm_receiver(&self) -> Option<ImmCompletionReceiver> {
+        self.imm_rx.lock().take()
     }
 
     /// One receiver per NIC that had work; each yields bytes transferred on that NIC.
@@ -471,6 +510,47 @@ impl RcBackend {
         let mut receivers = Vec::with_capacity(nic_work.len());
         for (session, prepared) in nic_work {
             receivers.push(session.transfer_batch_async(prepared, op)?);
+        }
+        Ok(receivers)
+    }
+
+    /// One receiver per NIC/QP; each yields 0 bytes after the send-side signal completes.
+    pub(crate) fn write_imm_async(
+        &self,
+        remote_addr: &str,
+        imm_data: u32,
+    ) -> Result<Vec<oneshot::Receiver<Result<usize>>>> {
+        let nic_work: Vec<(Arc<RcSession>, RegisteredMemoryRegion)> = {
+            let state = self.state.lock();
+            let conn = state
+                .addr_connections
+                .get(remote_addr)
+                .ok_or(TransferError::Backend(format!(
+                    "no connection for remote addr {remote_addr}"
+                )))?;
+
+            conn.remote_qpns
+                .iter()
+                .enumerate()
+                .map(|(nic_idx, &remote_qpn)| {
+                    let session = Arc::clone(
+                        state.nics[nic_idx]
+                            .sessions
+                            .get(&remote_qpn)
+                            .expect("session must exist for established connection"),
+                    );
+                    (session, conn.remote_signal_regions[nic_idx])
+                })
+                .collect()
+        };
+
+        let mut receivers = Vec::with_capacity(nic_work.len());
+        for (session, signal_region) in nic_work {
+            receivers.push(session.write_imm_async(
+                signal_region.base_ptr,
+                signal_region.rkey,
+                imm_data,
+            )?);
         }
         Ok(receivers)
     }
