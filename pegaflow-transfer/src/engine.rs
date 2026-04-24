@@ -27,6 +27,16 @@ pub struct TransferDesc {
     pub len: usize,
 }
 
+/// Receiver-side RDMA WRITE-with-immediate completion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImmCompletion {
+    pub nic_idx: usize,
+    pub local_qpn: u32,
+    pub imm_data: u32,
+}
+
+pub type ImmCompletionReceiver = mea::mpsc::UnboundedReceiver<ImmCompletion>;
+
 /// RC queue pair endpoint info exchanged during handshake.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RcEndpoint {
@@ -49,6 +59,7 @@ pub(crate) struct RegisteredMemoryRegion {
 pub(crate) struct NicHandshake {
     pub(crate) endpoint: RcEndpoint,
     pub(crate) memory_regions: Vec<RegisteredMemoryRegion>,
+    pub(crate) signal_region: RegisteredMemoryRegion,
 }
 
 /// Opaque handshake metadata exchanged between peers via gRPC.
@@ -181,6 +192,24 @@ impl TransferEngine {
         self.backend.batch_transfer_async(op, remote_addr, descs)
     }
 
+    /// Submit a final RDMA WRITE-with-immediate signal against every QP for a
+    /// connected peer. Returns send-side completions.
+    pub fn write_imm_async(
+        &self,
+        remote_addr: &str,
+        imm_data: u32,
+    ) -> Result<Vec<mea::oneshot::Receiver<Result<usize>>>> {
+        self.backend.write_imm_async(remote_addr, imm_data)
+    }
+
+    /// Take the single receiver for RDMA WRITE-with-immediate completions.
+    ///
+    /// The transfer layer does not interpret immediate data. Higher layers own
+    /// demuxing `imm_data` into leases, fan-in counters, and request lifecycle.
+    pub fn take_imm_receiver(&self) -> Option<ImmCompletionReceiver> {
+        self.backend.take_imm_receiver()
+    }
+
     /// Number of active RC queue pairs across all NICs.
     pub fn num_qps(&self) -> usize {
         self.backend.num_qps()
@@ -206,6 +235,11 @@ mod tests {
                     len: 0x2000,
                     rkey: 42,
                 }],
+                signal_region: RegisteredMemoryRegion {
+                    base_ptr: 0x3000,
+                    len: 8,
+                    rkey: 43,
+                },
             }],
         };
         let bytes = meta.to_bytes();
@@ -231,6 +265,11 @@ mod tests {
                         len: 0x2000,
                         rkey: 10,
                     }],
+                    signal_region: RegisteredMemoryRegion {
+                        base_ptr: 0x3000,
+                        len: 8,
+                        rkey: 11,
+                    },
                 },
                 NicHandshake {
                     endpoint: RcEndpoint {
@@ -244,6 +283,11 @@ mod tests {
                         len: 0x2000,
                         rkey: 20,
                     }],
+                    signal_region: RegisteredMemoryRegion {
+                        base_ptr: 0x4000,
+                        len: 8,
+                        rkey: 21,
+                    },
                 },
             ],
         };

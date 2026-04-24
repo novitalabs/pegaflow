@@ -4,7 +4,8 @@ mod rc_backend;
 pub mod rdma_topo;
 
 pub use engine::{
-    ConnectionStatus, HandshakeMetadata, MemoryRegion, TransferDesc, TransferEngine, TransferOp,
+    ConnectionStatus, HandshakeMetadata, ImmCompletion, ImmCompletionReceiver, MemoryRegion,
+    TransferDesc, TransferEngine, TransferOp,
 };
 pub use error::{Result, TransferError};
 
