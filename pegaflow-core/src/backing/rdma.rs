@@ -28,6 +28,10 @@ impl RdmaTransport {
         &self.engine
     }
 
+    pub(crate) fn nic_count(&self) -> usize {
+        self.engine.nic_count()
+    }
+
     /// Create a new RDMA transport and register all pinned memory regions.
     fn new(nic_names: &[String], allocator: &PinnedAllocator) -> Result<Self, String> {
         let t0 = Instant::now();

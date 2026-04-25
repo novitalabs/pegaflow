@@ -59,6 +59,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             )
 
         cross_layer_blocks = os.environ.get("PEGAFLOW_CROSS_LAYER_BLOCKS", "1") == "1"
+        pp_size: int = getattr(vllm_config.parallel_config, "pipeline_parallel_size", 1) or 1
         namespace = derive_namespace(
             vllm_config,
             effective_tp_size,
@@ -73,7 +74,6 @@ class PegaKVConnector(KVConnectorBase_V1):
         device_id: int | None = None
         dcp_rank: int = 0
         pp_rank: int = 0
-        pp_size: int = getattr(vllm_config.parallel_config, "pipeline_parallel_size", 1) or 1
         if role == KVConnectorRole.WORKER:
             tp_rank = get_tensor_model_parallel_rank()
             pp_group = get_pp_group()
@@ -86,6 +86,13 @@ class PegaKVConnector(KVConnectorBase_V1):
                 dcp_rank = get_decode_context_model_parallel_rank()
             if torch.cuda.is_available():
                 device_id = _resolve_device_id()
+
+        layer_names = _resolve_registered_layer_names(
+            kv_cache_config,
+            cross_layer_blocks=cross_layer_blocks,
+            pp_rank=pp_rank,
+            pp_size=pp_size,
+        )
 
         assert vllm_config.kv_transfer_config is not None
         server_host = os.environ.get(
@@ -105,6 +112,7 @@ class PegaKVConnector(KVConnectorBase_V1):
         self._ctx = ConnectorContext(
             instance_id=instance_id,
             namespace=namespace,
+            layer_names=layer_names,
             block_size=block_size,
             num_layers=num_layers,
             tp_size=tp_size,
@@ -339,6 +347,31 @@ def _resolve_device_id() -> int:
         return int(mapped)
     except ValueError:
         return local_id
+
+
+def _resolve_registered_layer_names(
+    kv_cache_config,
+    *,
+    cross_layer_blocks: bool,
+    pp_rank: int,
+    pp_size: int,
+) -> tuple[str, ...]:
+    override = os.environ.get("PEGAFLOW_PD_LAYER_NAMES")
+    if override:
+        return tuple(name.strip() for name in override.split(",") if name.strip())
+
+    if cross_layer_blocks:
+        if pp_size > 1:
+            return (f"ALL_LAYERS_pp{pp_rank}",)
+        return ("ALL_LAYERS",)
+
+    if kv_cache_config is None:
+        return ()
+
+    names: list[str] = []
+    for group in getattr(kv_cache_config, "kv_cache_groups", []) or []:
+        names.extend(getattr(group, "layer_names", []) or [])
+    return tuple(names)
 
 
 __all__ = ["PegaKVConnector", "KVConnectorRole"]

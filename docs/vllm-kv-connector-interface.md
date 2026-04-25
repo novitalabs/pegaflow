@@ -169,10 +169,11 @@ itself is.
   through the existing `QueryPrefetch` path from `get_num_new_matched_tokens()`
   and return `(None, False)` until the write-with-imm completion marks the
   staging lease ready.
-- First-cut control plane adds `PreparePdReceive` and `PushPdBlocks`; it should
-  not add separate `Complete` or hot-path `Release` RPCs. Ready is driven by
-  RDMA WRITE with immediate, and cleanup is handled by D-side TTL/GC or internal
-  consume transitions.
+- First-cut control plane adds idempotent `PreparePdReceive`,
+  `GetPdReceiveDescriptor`, and a D-side receive-state query. It should not add
+  separate `Complete` or hot-path `Release` RPCs. Ready is driven by RDMA WRITE
+  with immediate, and cleanup is handled by D-side TTL/GC or internal consume
+  transitions.
 - `request_finished...()` is the key hook for P-side block lifetime extension.
   `finished_sending` is the corresponding release signal.
 - `get_num_new_matched_tokens()` must be conservative: it should only return

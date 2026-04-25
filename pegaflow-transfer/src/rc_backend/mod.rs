@@ -161,7 +161,7 @@ impl RcBackend {
         })
     }
 
-    fn nic_count(&self) -> usize {
+    pub(crate) fn nic_count(&self) -> usize {
         self.runtimes.len()
     }
 

@@ -1,546 +1,384 @@
 # PegaFlow P/D CPU-Staging Push Design
 
-This document focuses only on push-based P/D transfer paths. The goal is to
-understand how PegaFlow can own P/D RDMA traffic instead of letting P/D transfer
-compete independently with ordinary KV cache traffic.
+This document records the selected push-based P/D path and the vLLM connector
+entry points it must fit. It intentionally stays at the design level; transport
+details live in `rdma-write-with-imm.md`, and receive-manager internals live in
+`pd-receive-manager.md`.
 
 ## Decision
 
-The first implementation will use **CPU-staging push**:
+The initial P/D implementation uses **CPU-staging push**:
 
 ```text
-P RDMA WRITEs KV into PegaFlow-managed CPU/pinned memory on the D side.
-D then installs the staged KV into vLLM GPU KV cache with an H2D copy.
+P writes prompt KV into PegaFlow-managed CPU/pinned memory near D.
+D later copies the staged KV into vLLM GPU KV cache blocks.
 ```
 
-Direct GPU push is intentionally deferred. It remains a future fast path, but it
-should not be the default path until GPU memory lifetime, RDMA-to-GPU ordering,
-and D-side KV block pinning are validated under production load.
+Direct GPU push is deferred. We validated that same-process `cudaMalloc` memory
+can be RDMA registered, but CUDA IPC imported GPU pointers fail `ibv_reg_mr`
+with `EFAULT`. A direct GPU path therefore needs registration in the vLLM
+allocation-owning process plus explicit RDMA-to-GPU ordering validation.
 
-## Problem Statement
-
-In P/D disaggregation, P produces prompt KV and D consumes it before decode. A
-pull-based design lets D fetch KV after P publishes it. A push-based design
-instead prepares receive resources on D first, then lets P write KV into those
-resources.
-
-The push-based design has two materially different receive targets, but only one
-is selected for the initial path:
-
-- **CPU staging target, selected**: P writes into PegaFlow-managed CPU/pinned
-  memory near D, then D copies H2D into vLLM KV cache blocks.
-- **Direct GPU target, future**: P writes into D vLLM KV cache blocks.
-
-These are not small variants. They have different lifetime, scheduling, memory
-pressure, and TTFT trade-offs.
-
-## Common Push-Based Shape
+The most important design point is:
 
 ```text
-Router selects D
-D/PegaFlow-D prepares CPU/pinned receive resources
-Router or PegaFlow control plane gives P a receive handle
-P/PegaFlow-P pushes KV to D-side staging target by RDMA WRITE
-D/PegaFlow-D observes completion, ideally via write-with-imm
-D connector installs staged KV into vLLM GPU KV blocks
-D connector reports finished_recving
-D vLLM resumes decode
-P connector reports finished_sending and releases P-side blocks
+D scheduler connector get_num_new_matched_tokens() is the root of the
+CPU-staging receive state machine.
 ```
 
-The router should carry a short-lived transfer handle, not long-lived RDMA
-capabilities. PegaFlow-P and PegaFlow-D can exchange real address/rkey/QP details
-through PegaFlow-controlled RPC.
+It is the only vLLM hook that can keep a request pending **before** D GPU KV
+blocks are allocated.
 
-## First-Cut Request Behavior
+## vLLM Connector Contract
 
-The initial request path is:
+Relevant scheduler-side sequence:
 
-1. Router receives the user request and selects one `(P, D)` pair.
-2. Router sends `PreparePdReceive` to the D-side PegaFlow endpoint.
-   The endpoint is logically part of the D vLLM deployment. Since the external
-   endpoint is vLLM, this likely requires a small background Rust server or
-   embedded PegaFlow control server started with the vLLM process.
-3. D-side PegaFlow allocates registered CPU/pinned staging memory for the
-   expected KV blocks and returns a short-lived receive descriptor.
-4. Router embeds that descriptor into the requests sent to both P and D, for
-   example under `kv_transfer_params.pegaflow_pd`.
-5. D-side vLLM may receive the request before P has pushed KV. In that state the
-   D connector polls PegaFlow-D, sees the staging lease is not ready, and returns
-   `None` from `get_num_new_matched_tokens()`. vLLM keeps the request waiting and
-   does not allocate D GPU KV blocks yet.
-6. P-side connector sees the receive descriptor. After P computes prompt KV, it
-   asks PegaFlow-P to push the relevant KV blocks to D-side staging memory with
-   RDMA WRITE with immediate.
-7. P continues its normal async save path. The P/D push traffic and P's own
-   offloading/save traffic must both be admitted by PegaFlow's RDMA scheduler so
-   they do not collide on NIC/PCIe bandwidth.
-8. D-side PegaFlow observes the immediate value on the receive CQ and marks the
-   staging lease ready.
-9. On a later scheduler poll, D connector sees the staging lease is ready and
-   returns `(N, True)` from `get_num_new_matched_tokens()`. Only then does vLLM
-   allocate D GPU KV blocks and enter `WAITING_FOR_REMOTE_KVS`.
-10. D worker `start_load_kv()` copies the staged KV into the newly allocated D
-   vLLM GPU KV blocks and then reports `finished_recving`.
-11. P-side connector reports `finished_sending` after PegaFlow marks the push
-   transaction completed, failed, or expired.
+1. `get_num_new_matched_tokens(request, num_local_cached_tokens)` is called
+   before D allocates GPU KV blocks.
+2. Returning `(None, False)` skips the request for this scheduler step. D GPU KV
+   blocks are not allocated.
+3. Returning `(N, True)` tells vLLM that `N` external tokens are available and
+   should be loaded asynchronously.
+4. vLLM then allocates D GPU KV blocks for those external tokens and moves the
+   request to `WAITING_FOR_REMOTE_KVS`.
+5. `update_state_after_alloc(request, blocks, N)` is called after GPU block
+   allocation; this is the first hook that sees destination block IDs.
+6. `build_connector_meta()` sends per-step load metadata to workers.
+7. D worker `start_load_kv()` performs CPU staging -> GPU KV H2D.
+8. D worker `get_finished()` reports `finished_recving`; scheduler then resumes
+   the request.
+
+The base connector contract says `get_num_new_matched_tokens()` may be called
+multiple times and should be side-effect free. For PegaFlow, this should be
+implemented as an idempotent, non-blocking state machine:
+
+```text
+ensure_receive_prepare_started(pd_request_id)
+read_receive_state(pd_request_id)
+return based on state
+```
+
+The method may kick off async prepare once, but repeated calls must not allocate
+duplicate staging memory or block the scheduler thread.
+
+## D-Side State Machine
+
+```text
+Absent
+  -> PreparingCpuStaging
+  -> WaitingForPWriteImm
+  -> CpuStagedReady
+  -> GpuAllocated
+  -> H2DLoading
+  -> Done
+```
+
+Behavior in `get_num_new_matched_tokens()`:
+
+- `Absent`: start an idempotent D PegaFlow receive prepare; return
+  `(None, False)`.
+- `PreparingCpuStaging` / `WaitingForPWriteImm`: return `(None, False)`.
+- `CpuStagedReady`: return `(N, True)`.
+- `Failed` / `Expired`: return zero/partial hit or fail according to the final
+  failure policy.
+
+`GpuAllocated` begins only after vLLM has accepted `(N, True)`. `H2DLoading`
+belongs to the D worker-side connector, not the scheduler hook.
+
+## End-to-End Flow
 
 ```d2
 direction: right
 
-user: User
 router: Router
-
 p_vllm: "P vLLM"
-p_pf: "P PegaFlow"
-d_vllm: "D vLLM"
+p_worker: "P vLLM worker\nPegaFlow in-process runtime"
+d_sched: "D vLLM scheduler connector"
+d_worker: "D vLLM worker connector"
 d_pf: "D PegaFlow"
 
-user -> router: request
-router -> router: select (P, D)
+router -> d_sched: "decode request\npd_request_id + rendezvous"
+router -> p_vllm: "prefill request\nsame pd_request_id"
 
-router -> d_pf: "PreparePdReceive(prompt/KV shape)"
-d_pf -> d_pf: "alloc CPU pinned staging\nregister RDMA memory"
-d_pf -> router: "receive descriptor\n(handle, slots, ptr/size/numa, imm)"
+d_sched -> d_sched: "get_num_new_matched_tokens()"
+d_sched -> d_pf: "PreparePdReceive\nidempotent, async"
+d_sched -> d_sched: "return (None, False)\nwhile not ready"
 
-router -> p_vllm: "prefill request\n+ kv_transfer_params.pegaflow_pd"
-router -> d_vllm: "decode request\n+ same receive handle"
-d_vllm -> d_pf: "poll staging state"
-d_pf -> d_vllm: "pending\n(no GPU KV allocation)"
+p_vllm -> p_worker: "source KV ready\nmetadata-driven save path"
+p_worker -> d_pf: "GetPdReceiveDescriptor\npd_request_id + receive_rank"
+d_pf -> p_worker: "CPU staging descriptor\nslabs + layouts + imm"
+p_worker -> d_pf: "RDMA WRITE KV\nthen WRITE_WITH_IMM"
 
-p_vllm -> p_pf: "publish source KV blocks\nwith receive descriptor"
+d_pf -> d_pf: "IMM complete\nall expected slices ready"
+d_sched -> d_pf: "poll/query receive state"
+d_pf -> d_sched: "CpuStagedReady"
+d_sched -> d_sched: "return (N, True)"
 
-p_pf -> d_pf: "RDMA WRITE with imm\nP KV -> D CPU staging"
-p_pf -> p_pf: "normal async save/offload\nthrough same RDMA scheduler"
-
-d_pf -> d_pf: "CQE imm received\nmark staging ready"
-d_vllm -> d_pf: "poll staging state"
-d_pf -> d_vllm: "ready"
-d_vllm -> d_vllm: "allocate GPU KV blocks\nenter async load"
-d_vllm -> d_pf: "acquire staged KV"
-d_pf -> d_vllm: "H2D install into D KV blocks"
-d_vllm -> router: "decode output"
-
-p_pf -> p_vllm: finished_sending
-d_pf -> d_vllm: finished_recving
+d_sched -> d_sched: "vLLM allocates D GPU KV blocks"
+d_sched -> d_worker: "connector metadata\nstaging handle + D block ids"
+d_worker -> d_pf: "Load staged KV"
+d_pf -> d_worker: "H2D into vLLM KV blocks"
+d_worker -> d_sched: "finished_recving"
 ```
 
-The receive descriptor format should follow the same spirit as existing P2P
-RDMA metadata: per-slot pointer, length, NUMA/NIC affinity, and enough identity
-to validate the request. In the current transfer engine, rkeys are exchanged in
-the RDMA handshake's registered-memory snapshot rather than carried per slot.
-Because this descriptor is a write capability, it must be scoped to one
-transfer, short-lived, and revocable. A later version can replace raw pointer
-exposure in the router payload with an opaque handle that PegaFlow-P resolves
-directly from PegaFlow-D.
+## Router Responsibility
 
-## vLLM Interface Fit
-
-D still needs to enter vLLM's async external-KV path:
-
-1. D request arrives with `kv_transfer_params`.
-2. D connector `get_num_new_matched_tokens()` polls PegaFlow-D for the staging
-   lease state.
-3. If the lease is not ready, the connector returns `(None, False)`. vLLM skips
-   the request for this scheduler step and does not allocate D GPU KV blocks.
-4. After RDMA WRITE with immediate completes and PegaFlow-D marks the lease
-   ready, the connector returns `(N, True)`.
-5. vLLM allocates destination KV blocks and marks the request
-   `WAITING_FOR_REMOTE_KVS`.
-6. D connector `update_state_after_alloc()` sees the destination block IDs.
-7. D worker `start_load_kv()` installs staged KV into the destination blocks
-   with H2D.
-8. D worker `get_finished()` returns `finished_recving` when the blocks are safe
-   for decode.
-
-P uses the delayed-release path:
-
-1. P connector `request_finished...()` returns `True` so vLLM keeps source KV
-   blocks alive.
-2. P connector returns `kv_transfer_params` or a PegaFlow publish handle.
-3. PegaFlow-P pushes the source KV into the D receive target.
-4. P worker returns `finished_sending` only after the D-side transaction has
-   completed, failed, or timed out.
-
-## Selected Path: Push Into PegaFlow CPU Staging Near D
+The router must stay out of tokenizer and block-manager semantics. It should
+only choose the `(P, D)` pair and pass a short-lived rendezvous identity:
 
 ```text
-PegaFlow-D allocates registered CPU/pinned receive buffers
-PegaFlow-P RDMA WRITEs KV into those buffers
-D connector polls until staging is ready
-D vLLM allocates KV blocks for the external tokens
-D connector copies staged KV into D GPU KV blocks
-D reports finished_recving
+pd_request_id
+d_pegaflow_addr
+p_pegaflow_addr
+d_instance_id
+p_instance_id
+role hints
 ```
 
-### Why This Is First
+The router should not pass raw pointers, rkeys, token counts, block IDs, or
+receive descriptors. It should also not pass vLLM CUDA device IDs, TP ranks, or
+layer names. Those are owned by the P/D vLLM processes and their registered
+PegaFlow instance topology.
 
-- PegaFlow owns the receive resource, so admission, timeout, quota, and release
-  do not depend on vLLM GPU block lifetime.
-- D decode GPU memory is not pinned while the network transfer is still in
-  flight.
-- It aligns with the main PegaFlow objective: P/D RDMA and ordinary KV-cache
-  RDMA should enter the same managed traffic plane.
-- It gives a natural place for heterogeneous TP, block size, KV layout, or
-  future conversion/compression.
-- Failure handling is cleaner: PegaFlow can discard a staging lease without
-  corrupting or stranding vLLM GPU KV blocks.
+## D Prepare Responsibility
 
-### Costs
-
-- Requires an extra D-side H2D copy before decode.
-- Consumes D-side PegaFlow CPU/pinned pool capacity.
-- Adds one more local bandwidth domain to schedule: NIC->CPU followed by
-  CPU->GPU.
-- TTFT can be worse when H2D is on the critical path and D GPU memory would have
-  been safe to reserve directly.
-
-### When It Should Be Used
-
-This is the default for the initial P/D implementation. It should be used for:
-
-- long prompts,
-- heterogeneous or not-yet-validated P/D layouts,
-- production traffic where RDMA traffic isolation matters,
-- cases where D decode concurrency is more important than best-case TTFT.
-
-## Deferred Fast Path: Push Directly Into D vLLM GPU KV
+D scheduler connector has the request after tokenization and local prefix-cache
+lookup. It can compute the external KV span conservatively:
 
 ```text
-D vLLM allocates KV blocks
-PegaFlow-D maps block IDs to GPU KV addresses
-PegaFlow-D exports a receive handle for those exact GPU pages
-PegaFlow-P RDMA WRITEs KV into D GPU memory
-D observes completion and reports finished_recving
+external_tokens = prompt_tokens_to_load_from_P - local_cached_tokens
+num_blocks = ceil(external_tokens / vLLM_block_size)
 ```
 
-### Benefits
+It calls local D PegaFlow `PreparePdReceive` with:
 
-- Lowest copy count: no D-side CPU staging and no extra H2D.
-- Best theoretical TTFT once the push starts, because data lands where decode
-  will read it.
-- Avoids consuming D-side CPU pool for large prompt KV.
-- Matches the ideal "P produces, D receives" direction.
+- `pd_request_id`;
+- D instance / model identity;
+- external token or block count;
+- optional block hashes for the staged span;
+- optional expected IMM count override;
+- TTL and admission metadata.
 
-### Costs
+D PegaFlow uses registered KV layout and instance topology to expand the single
+request-level prepare into receive ranks. In the first supported deployment,
+homogeneous TP4 P/D maps P worker TP rank `r` to D receive rank `r`, for
+`r = 0..3`. D PegaFlow does not tokenize and does not allocate vLLM GPU KV
+blocks.
 
-- Pins D vLLM GPU KV blocks for the whole transfer window. Long prompts can
-  occupy decode GPU memory for seconds before D can run decode.
-- D scheduler must allocate KV blocks before P can push. This couples router,
-  D scheduler admission, and P transfer start.
-- GPU memory registration/rkey lifetime must track vLLM KV cache lifetime
-  exactly.
-- Local validation showed same-process `cudaMalloc` GPU memory can be
-  `ibv_reg_mr`-registered, but a CUDA IPC imported GPU pointer fails
-  registration with `EFAULT`; direct GPU push therefore needs RDMA registration
-  in the vLLM allocation-owning process, not a sidecar that only imports CUDA
-  IPC memory.
-- Correctness depends on RDMA-to-GPU memory ordering. A CQE or write-with-imm
-  must imply the target KV is visible to later GPU kernels, or D must insert the
-  right synchronization.
-- Failed or slow P pushes strand D KV blocks until timeout/recovery.
-- Heterogeneous TP/block-size/layout conversion is harder because the target is
-  already D's final physical layout.
+## P Push Responsibility
 
-### Conditions Before Enabling
+P-side data movement happens inside the P vLLM worker process. There is no
+hot-path RPC from the P connector to a local PegaFlow server for this transfer:
+the worker process already owns the source CUDA tensors, so the in-process
+PegaFlow runtime registers the source GPU memory and owns RDMA WRITE plus
+WRITE-with-immediate to D CPU staging.
 
-- Homogeneous or explicitly compatible P/D layouts.
-- Strict admission that bounds the GPU block pinning window.
-- Validated GPUDirect RDMA registration and memory-ordering behavior.
-- Clear CUDA synchronization before D reports `finished_recving`.
-- Recovery path for slow or failed P pushes that does not strand D KV blocks.
+The P worker connector initializes a PyO3 `KvEgressRuntime` when outbound P/D
+push is enabled. The runtime owns:
 
-## Trade-Off Summary
+- a `pegaflow-transfer::TransferEngine`;
+- RDMA connection state to D PegaFlow peers;
+- P-side GPU memory registration for vLLM KV tensors;
+- descriptor polling against D PegaFlow;
+- the async push task lifecycle.
 
-| Dimension | CPU Staging Push | Direct GPU Push |
-|---|---|---|
-| Status | Initial/default path | Future fast path |
-| Copy count | RDMA to CPU + H2D | RDMA directly to final KV |
-| D GPU memory pressure | Low until install | High during transfer |
-| TTFT best case | Worse by H2D cost | Better |
-| Failure isolation | Easier | Harder |
-| Heterogeneous support | Easier | Harder |
-| RDMA scheduling ownership | Strongest | Good, but tied to vLLM blocks |
-| Implementation risk | Lower | Higher |
-
-## Admission Policy Implication
-
-CPU staging push reserves PegaFlow pool memory first, not vLLM GPU KV memory.
-Initial admission should therefore focus on:
-
-- estimated bytes and transfer time,
-- D-side CPU/pinned staging pool capacity,
-- NIC and PCIe topology,
-- current PegaFlow RDMA queue occupancy,
-- D-side H2D install budget,
-- request priority and timeout.
-
-GPU direct push, when added later, should require a stricter second policy that
-also accounts for D GPU KV free blocks, decode queue depth, and expected GPU
-pinning time.
-
-## Completion Semantics
-
-RDMA WRITE with immediate is attractive for push-based transfer because it can
-signal D-side completion without a separate notification RPC. PegaFlow should
-still define completion at the transaction level:
-
-- network write completed,
-- all expected blocks received,
-- data is visible to the next consumer,
-- target lease can transition to `ready`.
-
-For CPU staging, this is mostly a CPU memory visibility problem. For direct GPU
-push, PegaFlow must validate the required GPU synchronization before reporting
-`finished_recving` to vLLM.
-
-## Initial Transaction
-
-The initial CPU-staging transaction is:
+P scheduler/worker metadata should describe intent, not raw transport state:
 
 ```text
-PreparePdReceive(target=cpu_staging)
-Push(handle, source_blocks)
-QueryPrefetch(handle)  # D polls; ready only after write-with-imm
-Install(handle)        # H2D into D vLLM KV blocks
-TTL/GC or internal consume release
+pd_request_id
+d_pegaflow_addr
+dst_instance_id
+source block_ids
+source block_hashes
+optional handle
 ```
 
-GPU direct can later reuse the same high-level transaction with
-`target=gpu_kv`, where `Install(handle)` becomes a synchronization/no-op step.
+It should not carry D raw pointers, rkeys, CUDA device IDs, TP ranks, layer
+names, or per-NIC transfer details. P workers use their own
+`effective_tp_rank` as the D `receive_rank` when fetching descriptors.
 
-## Implementation Notes
-
-- `PreparePdReceive` should allocate D-side PegaFlow staging buffers and return a
-  short-lived receive handle.
-- The router should carry the receive descriptor initially, but the long-term
-  target is to carry only an opaque handle.
-- PegaFlow-P should resolve the handle with PegaFlow-D and perform RDMA WRITE.
-- D connector should return `(N, True)` only after the transaction is accepted
-  and the D-side staging lease is ready. It should return `(None, False)` while
-  waiting for P's RDMA WRITE with immediate, so vLLM does not allocate D GPU KV
-  blocks early.
-- D worker `start_load_kv()` should copy already-staged KV into allocated vLLM
-  KV blocks and only then report `finished_recving`.
-- P worker should report `finished_sending` after PegaFlow marks the transaction
-  completed, failed, or expired.
-
-## Engineering Roadmap
-
-This roadmap is based on the current code structure:
-
-- `python/pegaflow/connector/` already has the scheduler/worker split needed for
-  vLLM lifecycle integration.
-- `pegaflow-proto/proto/engine.proto` has save/load/query and P2P transfer RPCs,
-  but no P/D receive transaction RPCs yet.
-- `pegaflow-transfer` supports RDMA READ and WRITE, but does not expose
-  RDMA WRITE with immediate yet. The receive CQ is effectively unused today.
-- `pegaflow-core` already has a pinned allocator and GPU H2D/D2H worker pool.
-  CPU-staging receive buffers should be allocated from this existing pinned
-  pool so they are covered by RDMA memory registration.
-- Existing `Load` requires a prior pin reservation in `ReadCache`. Therefore a
-  ready P/D receive must either insert-and-pin staged blocks or otherwise expose
-  them through the same consume path before D calls `Load`.
-
-### Phase 1: P/D Control Plane RPCs
-
-Goal: add real receive transaction state to PegaFlow server.
-
-The initial design should add only two new RPCs and reuse the existing
-`QueryPrefetch` polling path.
-
-New RPCs:
+The first P implementation can conservatively report `finished_sending` only
+after RDMA WRITE, final IMM send, and any normal local save work from the same
+save task complete. The target behavior is stricter lifetime splitting:
 
 ```text
-PreparePdReceive(instance_id, namespace, req_id, block_hashes, shape/bytes)
-  -> handle, slots, imm, expires_at
+RDMA + IMM done:
+  D receive manager can observe readiness
 
-PushPdBlocks(source_instance_id, namespace, req_id, dst_instance_id, handle,
-             receive_descriptor, block_hashes, imm)
-  -> ok, accepted_blocks
+local D2H save done:
+  PegaFlow local/offload copy has a stable CPU copy
+
+both done:
+  P GPU KV blocks can be released/reused by vLLM
 ```
 
-Existing RPC to extend:
+The save worker therefore treats one vLLM `wait_for_save()` as a fan-out point:
+run P/D egress first, then run the normal local save path.
+
+```d2
+direction: right
+
+p_worker: "P worker connector"
+runtime: "KvEgressRuntime\nin vLLM worker process"
+d_pf: "D PegaFlow"
+local_save: "normal PegaFlow save\nD2H/offload"
+
+p_worker -> runtime: "enqueue PdPushIntent\nsource block ids + rendezvous"
+runtime -> d_pf: "poll GetPdReceiveDescriptor"
+d_pf -> runtime: "PENDING or READY descriptor"
+runtime -> d_pf: "RDMA WRITE\nP GPU KV -> D CPU staging"
+runtime -> d_pf: "WRITE_WITH_IMM"
+p_worker -> local_save: "then normal save\nsame block ids"
+```
+
+The P/D push path and local offload save share scheduling and completion
+lifetime, but not the first data movement. A single source GPU block batch may
+have multiple sinks:
 
 ```text
-QueryPrefetch(instance_id, req_id, block_hashes, pd_receive_handle?)
-  -> PREFETCH_LOADING | PREFETCH_DONE
+source P GPU KV blocks
+  -> RDMA WRITE sink to D CPU staging
+  -> local D2H/offload save sink
 ```
 
-Proposed wire shape:
+This avoids an extra P-side CPU staging bounce for P/D transfer and keeps the
+normal local save behavior independent.
 
-```proto
-message PreparePdReceiveRequest {
-  string instance_id = 1;      // D-side vLLM/PegaFlow instance.
-  string request_id = 2;       // Router/vLLM request id.
-  string namespace = 3;        // Model/cache namespace.
-  repeated bytes block_hashes = 4;
-  KvShape shape = 5;           // dtype, layers, block size, heads, head dim.
-  uint64 expire_after_ms = 6;
-}
+## TP4 Receive Mapping
 
-message PreparePdReceiveResponse {
-  bool ok = 1;
-  string handle = 2;
-  repeated PdReceiveSlot slots = 3;
-  uint32 imm_data = 4;
-  uint64 expires_at_ms = 5;
-  string error = 6;
-}
+The first version is explicitly TP4 P/D, not a TP1 fallback:
 
-message PdReceiveSlot {
-  bytes block_hash = 1;
-  uint64 k_ptr = 2;
-  uint64 k_size = 3;
-  uint64 v_ptr = 4;
-  uint64 v_size = 5;
-  int32 numa_node = 6;
-}
-
-message PushPdBlocksRequest {
-  string source_instance_id = 1;  // P-side instance.
-  string request_id = 2;
-  string namespace = 3;
-  string dst_instance_id = 4;
-  string pd_receive_handle = 5;
-  repeated PdReceiveSlot dst_slots = 6;
-  repeated bytes block_hashes = 7;
-  uint32 imm_data = 8;
-}
-
-message PushPdBlocksResponse {
-  bool ok = 1;
-  uint32 accepted_blocks = 2;
-  string error = 3;
-}
+```text
+P instance TP4:
+  worker tp_rank 0 -> D receive_rank 0
+  worker tp_rank 1 -> D receive_rank 1
+  worker tp_rank 2 -> D receive_rank 2
+  worker tp_rank 3 -> D receive_rank 3
 ```
 
-`PdReceiveSlot` intentionally does not carry `rkey` in the first version. P2P
-already synchronizes registered-memory metadata through the RDMA handshake, so
-the transfer layer should resolve `ptr -> rkey` from that snapshot instead of
-duplicating registration lifetime in the business-level RPC.
+D scheduler calls `PreparePdReceive(instance_id, pd_request_id, num_blocks, ...)`
+once. D PegaFlow snapshots registered D workers and allocates staging for every
+registered receive rank. P workers call
+`GetPdReceiveDescriptor(dst_instance_id, pd_request_id, receive_rank=<local tp>)`
+to get only their rank's descriptor.
 
-`PreparePdReceive` is called by the router against D-side PegaFlow after it
-selects a `(P, D)` pair. It creates a D-side receive lease, allocates registered
-CPU staging memory, and returns a descriptor that the router places in the P and
-D requests. It must not allocate D vLLM GPU KV blocks.
+Default readiness accounts for WRITE_WITH_IMM fanout:
 
-`PushPdBlocks` is a P-local submission RPC. It tells PegaFlow-P to accept a push
-job and, once the source KV blocks are available from the normal async save
-path, RDMA WRITE them into D's receive slots. The response means accepted, not
-completed; D readiness is driven only by RDMA WRITE with immediate.
+```text
+expected_imm_count = receive_rank_count * D_local_rdma_nic_count
+```
 
-`QueryPrefetch` is already the scheduler-side polling mechanism for external KV
-availability. P/D CPU staging should use the same contract:
+This matches the current transfer primitive, which sends one immediate signal
+per connected NIC/QP. The value can still be overridden by the caller for later
+TP mismatch or grouped-rank policies.
 
-- `PREPARED` / `WRITING` receive lease -> `PREFETCH_LOADING`
-- `READY` receive lease -> pin staged blocks and return `PREFETCH_DONE(hit=N)`
-- `FAILED` / `EXPIRED` receive lease -> return zero/partial hit or an error,
-  depending on the final failure policy
+## CPU Staging Layout
 
-When `QueryPrefetch` observes a ready P/D receive, it must provide the same
-safety as the current cache path: the blocks D will load must be pinned for that
-D instance before `Load` consumes them. There are two viable implementations:
+The current implementation allocates one NUMA-aware staging slab per D receive
+rank per request. This avoids per-layer allocation and keeps the first TP4 path
+simple enough to validate:
 
-- insert staged blocks into `ReadCache` and pin them in `QueryPrefetch`, or
-- add a dedicated staged-block consume path used by `Load`.
+```text
+TP4:
+  receive_rank 0 -> one CPU slab on rank 0 preferred NUMA
+  receive_rank 1 -> one CPU slab on rank 1 preferred NUMA
+  receive_rank 2 -> one CPU slab on rank 2 preferred NUMA
+  receive_rank 3 -> one CPU slab on rank 3 preferred NUMA
+```
 
-The first option reuses the current `Load` implementation and should be the
-initial target.
+The descriptor is coarse:
 
-`CompletePdReceive` is intentionally not part of the first-cut API. RDMA WRITE
-with immediate is the only D-side ready signal; adding an explicit completion
-RPC would create two competing completion sources. Hot-path `ReleasePdReceive`
-is also not part of the first-cut API. The D-side receive lease manager should
-free staging memory through `CONSUMED`, TTL/GC, or failure transitions. A later
-non-hot-path cancel RPC can be added if abandoned staging pressure becomes a
-real problem.
+- slab base, size, NUMA node;
+- receive rank, D device, D TP rank, slab index, NUMA node;
+- per-layer offset and stride within the rank slice;
+- `imm_data` or equivalent opaque completion token.
 
-### Phase 2: D-Side Staging Allocator
+P computes addresses from `base + layer_offset + block * stride`.
+We should avoid `layer * block` descriptor growth.
 
-Goal: allocate and track D-side CPU staging leases.
+The descriptor shape can later support coalescing several receive ranks into one
+NUMA slab without changing router/proxy request parameters.
 
-- Add a receive lease manager in `pegaflow-core` or `pegaflow-server`.
-- Allocate staging buffers from `StorageEngine::allocate(...)`, preserving NUMA
-  affinity for the selected D GPU/NIC.
-- Represent staged KV as the same `RawBlock`/`SealedBlock` shape used by the
-  existing cache path once the transfer is complete.
-- Add TTL/GC so abandoned P/D transfers release pinned memory.
-- Track states: `prepared`, `writing`, `ready`, `consumed`, `failed`, `expired`.
+Phase-one implementation may allocate one slab per rank if it is simpler, but
+the API should remain compatible with per-NUMA slabs.
 
-### Phase 3: RDMA WRITE Path
+RDMA registration creates one important constraint: descriptor pointers must be
+inside memory that is already visible in the RDMA handshake snapshot. Returning
+a freshly allocated per-request pointer is not sufficient unless the peers
+rehshake or dynamically exchange MR metadata. The preferred D-side allocation
+model is therefore:
 
-Goal: make PegaFlow-P write P's saved CPU KV into D staging.
+```text
+D startup / registration:
+  allocate and RDMA-register per-NUMA P/D staging arenas
 
-Product behavior should use RDMA WRITE with immediate. Engineering-wise this
-requires extending `pegaflow-transfer`:
+PreparePdReceive:
+  sub-allocate request slices inside those arenas
+  return descriptor offsets/pointers inside registered arenas
+```
 
-- add a transfer op or flag for immediate data,
-- configure receive WQ/CQ for imm completions,
-- post receive WQEs,
-- expose a D-side completion stream or callback that marks the lease ready.
+## TP And Fan-In
 
-P-side source should initially come from PegaFlow's normal async save output:
-P saves GPU KV into its local PegaFlow pinned cache, then PegaFlow-P locks those
-source blocks and writes them to D. Later we can optimize by piggybacking on the
-fresh save allocations before insertion.
+Readiness is per receive lease and means all expected P writes for the D slice
+have completed.
 
-### Phase 4: D-Side Install
+- `P_TP == D_TP`: each D rank waits for one P rank.
+- `P_TP > D_TP`: one D rank may wait for multiple P rank slices.
+- `P_TP < D_TP`: one P rank may write multiple D rank slices.
 
-Goal: reuse the existing `Load` path for staged KV.
+The transport layer treats immediate data as opaque. The P/D receive manager
+maps it to lease state and expected contributor counts.
 
-- After `QueryPrefetch` reports ready and pins staged blocks, D connector returns
-  `(N, True)`.
-- vLLM allocates D GPU KV blocks and calls `update_state_after_alloc()`.
-- D worker `start_load_kv()` calls existing `EngineRpcClient.load(...)` with the
-  staged block hashes and D block IDs.
-- Existing GPU load worker performs H2D and signals `PyLoadState`.
-- Worker reports `finished_recving` through the existing path.
+## Minimal Control Plane
 
-### Phase 5: Router Integration
+Initial RPC/control operations:
 
-Goal: complete 1P1D request flow.
+```text
+PreparePdReceive        D scheduler connector -> local D PegaFlow
+GetPdReceiveDescriptor  P in-process runtime -> D PegaFlow
+GetPdReceiveDescriptor  D scheduler connector -> local D PegaFlow (data_ready poll)
+```
 
-- Router selects `(P, D)`.
-- Router calls D-side `PreparePdReceive`.
-- Router sends the receive descriptor to both:
-  - P request, so P can push,
-  - D request, so D can poll without allocating GPU KV.
-- D request may be sent before P finishes; pending polling should be cheap and
-  should not reserve D GPU KV.
-- P request release is delayed until normal save and P/D push complete.
+No hot-path `CompletePdReceive` is needed; RDMA WRITE with immediate is the
+completion signal. No hot-path `ReleasePdReceive` is needed; D-side TTL/GC and
+consume transitions own cleanup.
 
-### Phase 6: Unified Traffic Scheduling
+## Why CPU Staging First
 
-Goal: prevent P/D push from colliding with P's normal async save/offload and
-other PegaFlow RDMA traffic.
+- D GPU KV blocks are not pinned while P is still writing.
+- PegaFlow owns admission, TTL, NUMA placement, and RDMA scheduling.
+- P/D push traffic and normal KV/offload traffic can share one PegaFlow traffic
+  manager.
+- Heterogeneous TP/layout/block-size support is easier before data enters final
+  D GPU KV layout.
+- Failure cleanup can discard CPU staging without corrupting vLLM KV blocks.
 
-- Introduce a transfer scheduler above `TransferEngine::batch_transfer_async`.
-- Classify traffic:
-  - P/D push,
-  - remote cache/P2P fetch,
-  - background save/offload-related traffic.
-- Add per-NIC concurrency and byte budgets.
-- Give P/D push priority without starving cache traffic.
-- Export metrics for queue time, RDMA time, H2D time, P held-block duration, and
-  staging pool pressure.
+Costs:
 
-### Phase 7: Compatibility and Optimizations
-
-Deferred until the basic CPU-staging path is correct:
-
-- delta transfer when D already owns a prefix,
-- heterogeneous TP/block-size/layout conversion,
-- cross-layer blocks,
-- MLA/HMA matrix,
-- direct GPU push fast path.
+- one extra D-side H2D copy;
+- D CPU/pinned pool pressure;
+- extra local bandwidth scheduling for NIC->CPU and CPU->GPU.
 
 ## Open Questions
 
-- **Delta transfer**: D may already have a prefix of the requested KV in its
-  local cache or via PegaFlow remote-cache/P2P discovery. In that case P only
-  needs to push the missing delta blocks. The initial implementation should not
-  optimize this path; it can conservatively push the full external KV span.
-  Later, D-side PegaFlow could include already-present block hashes in
-  `PreparePdReceive`, so PegaFlow-P only writes missing blocks. This likely fits
-  better once P2P/cache discovery can cover the shared-prefix case.
+- Delta transfer: if D already has a prefix, P should eventually push only
+  missing blocks. Defer until P2P/cache discovery can cover it cleanly.
+- Failure policy: recompute, fail, or retry from another P.
+- Exact per-NUMA slab allocator and descriptor schema.
+- Direct GPU push admission and synchronization requirements.
+
+## Roadmap
+
+1. Implement D scheduler-connector state machine around
+   `get_num_new_matched_tokens()`.
+2. Add idempotent D `PreparePdReceive` and descriptor query backed by a
+   D-side receive manager.
+3. Add P worker in-process `KvEgressRuntime` PyClass and initialize its
+   `TransferEngine` from the connector worker.
+4. Wire descriptor polling and RDMA handshake from P runtime to D PegaFlow.
+5. Add P GPU RDMA WRITE to D CPU staging + final WRITE-with-IMM.
+6. Reuse existing D load/H2D path in worker `start_load_kv()`.
+7. Add TP fan-in accounting, TTL cleanup, and metrics.
+8. Add unified RDMA admission for P/D push, P save/offload, and remote cache
+   traffic.
+9. Revisit delta transfer and direct GPU push.

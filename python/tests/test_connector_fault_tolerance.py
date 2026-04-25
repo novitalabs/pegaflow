@@ -65,6 +65,7 @@ def _make_worker() -> tuple[WorkerConnector, FakeEngineClient, MagicMock]:
     ctx = ConnectorContext(
         instance_id="test_instance",
         namespace="ns",
+        layer_names=("ALL_LAYERS",),
         block_size=16,
         num_layers=1,
         tp_size=1,

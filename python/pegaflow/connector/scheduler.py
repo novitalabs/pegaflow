@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from pegaflow.connector.common import (
     ConnectorContext,
+    KvEgressIntent,
     LoadIntent,
     PegaConnectorMetadata,
     PegaKVConnectorStats,
@@ -45,6 +46,8 @@ class SchedulerConnector:
         # Load state
         self._pending_load_intents: dict[str, LoadIntent] = {}
         self._prefetch_start_times: dict[str, float] = {}
+        self._pd_receive_prepares: dict[tuple[str, str], dict] = {}
+        self._pd_receive_prepare_keys_by_req: dict[str, set[tuple[str, str]]] = {}
 
         # Prefetch tracking (for metrics and bypass decisions)
         self._prefetch_tracker = PrefetchTracker()
@@ -79,6 +82,10 @@ class SchedulerConnector:
         req_id = request.request_id
         num_tokens = request.num_tokens
         block_hashes = request.block_hashes
+
+        pd_params = self._pd_push_params(request)
+        if pd_params is not None:
+            return self._prepare_pd_receive(request, num_computed_tokens, pd_params)
 
         # request.block_hashes are already at virtual_block_size granularity
         # (vLLM hashes every scheduler_block_size =
@@ -297,17 +304,21 @@ class SchedulerConnector:
 
         # Track requests with pending saves
         self._pending_saves.update(save_intents.keys())
+        egress_intents = self._build_egress_intents(save_intents)
 
         logger.debug(
-            "[PegaKVConnector] build_connector_meta: %d loads, %d saves (dropped %d)",
+            "[PegaKVConnector] build_connector_meta: %d loads, %d saves, %d egress "
+            "(dropped %d)",
             len(load_intents),
             len(save_intents),
+            len(egress_intents),
             len(potential_saves) - len(save_intents),
         )
 
         return PegaConnectorMetadata(
             load_intents=load_intents,
             save_intents=save_intents,
+            egress_intents=egress_intents,
             preempted_req_ids=scheduler_output.preempted_req_ids or None,
         )
 
@@ -398,6 +409,283 @@ class SchedulerConnector:
         self._scheduled_tokens.pop(req_id, None)
         self._next_stored_block_idx.pop(req_id, None)
         self._pending_saves.discard(req_id)
+        for key in self._pd_receive_prepare_keys_by_req.pop(req_id, set()):
+            self._pd_receive_prepares.pop(key, None)
+
+    def _pd_push_params(self, request: "Request") -> dict | None:
+        params = getattr(request, "kv_transfer_params", None)
+        if not isinstance(params, dict):
+            return None
+        if _is_source_role(params):
+            return None
+
+        nested = params.get("pegaflow_pd")
+        if isinstance(nested, dict):
+            enabled = nested.get("enabled", True)
+            mode = nested.get("mode")
+            if not enabled or _is_source_role(nested):
+                return None
+            if mode in (None, "push", "cpu_staging_push") or nested.get("pd_push"):
+                merged = dict(params)
+                merged.update(nested)
+                return merged
+
+        if params.get("pegaflow_pd_push") or params.get("pd_push"):
+            return params
+        return None
+
+    def _kv_egress_params(self, request: "Request") -> dict | None:
+        params = getattr(request, "kv_transfer_params", None)
+        if not isinstance(params, dict):
+            return None
+
+        egress = params.get("pegaflow_kv_egress")
+        if isinstance(egress, dict):
+            if not egress.get("enabled", True):
+                return None
+            merged = dict(params)
+            merged.update(egress)
+            return merged
+        if egress:
+            return params
+
+        nested = params.get("pegaflow_pd")
+        if isinstance(nested, dict):
+            if not nested.get("enabled", True):
+                return None
+            if (
+                _is_source_role(params)
+                or _is_source_role(nested)
+                or nested.get("egress")
+                or nested.get("source")
+            ):
+                merged = dict(params)
+                merged.update(nested)
+                return merged
+
+        if _is_source_role(params) and (params.get("pegaflow_pd_push") or params.get("pd_push")):
+            return params
+
+        return None
+
+    def _build_egress_intents(
+        self,
+        save_intents: dict[str, SaveIntent],
+    ) -> dict[str, KvEgressIntent]:
+        egress_intents: dict[str, KvEgressIntent] = {}
+        for req_id, save_intent in save_intents.items():
+            request = self._requests.get(req_id)
+            if request is None:
+                continue
+
+            params = self._kv_egress_params(request)
+            if params is None:
+                continue
+
+            d_pegaflow_addr = _param_str(
+                params,
+                ("d_pegaflow_addr", "dst_pegaflow_addr", "remote_addr"),
+            )
+            if not d_pegaflow_addr:
+                logger.warning(
+                    "[PegaKVConnector] req=%s P/D egress ignored: missing d_pegaflow_addr",
+                    req_id,
+                )
+                continue
+
+            dst_instance_id = _param_str(
+                params,
+                ("dst_instance_id", "d_instance_id", "instance_id"),
+            )
+            if not dst_instance_id:
+                logger.warning(
+                    "[PegaKVConnector] req=%s P/D egress ignored: missing dst_instance_id",
+                    req_id,
+                )
+                continue
+
+            pd_request_id = str(
+                params.get("pd_request_id") or params.get("request_id") or req_id
+            )
+            handle = _param_str(params, ("handle", "pd_handle"))
+
+            egress_intents[req_id] = KvEgressIntent(
+                pd_request_id=pd_request_id,
+                d_pegaflow_addr=d_pegaflow_addr,
+                dst_instance_id=dst_instance_id,
+                block_ids=save_intent.block_ids,
+                block_hashes=save_intent.block_hashes,
+                handle=handle or None,
+            )
+
+        return egress_intents
+
+    def _prepare_pd_receive(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+        params: dict,
+    ) -> tuple[int | None, bool]:
+        req_id = request.request_id
+        remaining_tokens = max(0, request.num_tokens - num_computed_tokens)
+        if remaining_tokens == 0:
+            return (0, False)
+
+        num_blocks = _ceil_div(remaining_tokens, self._ctx.virtual_block_size)
+        if num_blocks == 0:
+            return (0, False)
+
+        pd_request_id = str(
+            params.get("pd_request_id") or params.get("request_id") or req_id
+        )
+        dst_instance_id = str(
+            params.get("dst_instance_id")
+            or params.get("d_instance_id")
+            or params.get("instance_id")
+            or self._ctx.instance_id
+        )
+        expected_imm_count = _param_int(
+            params,
+            ("expected_imm_count", "expected_contributors"),
+            0,
+        )
+        expire_after_ms = _param_int(params, ("expire_after_ms", "ttl_ms"), 0)
+
+        prepare_key = (dst_instance_id, pd_request_id)
+        if prepare_key in self._pd_receive_prepares:
+            return self._poll_pd_receive_ready(
+                req_id,
+                pd_request_id,
+                dst_instance_id,
+                num_blocks,
+                self._pd_receive_prepares[prepare_key],
+            )
+
+        computed_blocks = num_computed_tokens // self._ctx.virtual_block_size
+        remaining_hashes = list(
+            request.block_hashes[computed_blocks : computed_blocks + num_blocks]
+        )
+        block_hashes = (
+            [bytes(h) for h in remaining_hashes]
+            if len(remaining_hashes) == num_blocks
+            else []
+        )
+
+        try:
+            response = self._ctx.engine_client.prepare_pd_receive(
+                dst_instance_id,
+                pd_request_id,
+                block_hashes,
+                num_blocks,
+                expected_imm_count,
+                expire_after_ms,
+            )
+        except PegaFlowServiceError as e:
+            self._ctx.state_manager.mark_unavailable(str(e))
+            logger.warning(
+                "[PegaKVConnector] req=%s pd_receive_prepare service error: %s",
+                req_id,
+                e,
+            )
+            return (None, False)
+        except PegaFlowBusinessError as e:
+            logger.error(
+                "[PegaKVConnector] req=%s pd_receive_prepare rejected: %s",
+                req_id,
+                e,
+            )
+            raise
+
+        if not response.get("ok", False):
+            raise RuntimeError(
+                "PreparePdReceive failed: "
+                f"{response.get('message', 'unknown error')}"
+            )
+
+        self._pd_receive_prepares[prepare_key] = response
+        self._pd_receive_prepare_keys_by_req.setdefault(req_id, set()).add(prepare_key)
+        logger.info(
+            "[PegaKVConnector] req=%s pd_receive_prepare accepted: pd_request_id=%s "
+            "instance=%s blocks=%d expected_imm_count=%d handle=%s imm=%s",
+            req_id,
+            pd_request_id,
+            dst_instance_id,
+            num_blocks,
+            expected_imm_count,
+            response.get("handle"),
+            response.get("imm_data"),
+        )
+
+        # First prepare creates the CPU staging lease. Later scheduler polls
+        # return (N, True) only after D observes WRITE_WITH_IMM.
+        return (None, False)
+
+    def _poll_pd_receive_ready(
+        self,
+        req_id: str,
+        pd_request_id: str,
+        dst_instance_id: str,
+        num_blocks: int,
+        prepare_response: dict,
+    ) -> tuple[int | None, bool]:
+        try:
+            descriptor = self._ctx.engine_client.get_pd_receive_descriptor(
+                dst_instance_id,
+                pd_request_id,
+                -1,
+                prepare_response.get("handle"),
+            )
+        except PegaFlowServiceError as e:
+            self._ctx.state_manager.mark_unavailable(str(e))
+            logger.warning(
+                "[PegaKVConnector] req=%s pd_receive_status service error: %s",
+                req_id,
+                e,
+            )
+            return (None, False)
+        except PegaFlowBusinessError as e:
+            logger.error(
+                "[PegaKVConnector] req=%s pd_receive_status rejected: %s",
+                req_id,
+                e,
+            )
+            raise
+
+        if not descriptor.get("ok", False):
+            raise RuntimeError(
+                "GetPdReceiveDescriptor failed: "
+                f"{descriptor.get('message', 'unknown error')}"
+            )
+
+        state = descriptor.get("state", "pending")
+        if state in {"failed", "expired"}:
+            raise RuntimeError(
+                f"P/D receive lease is not usable: request_id={pd_request_id} state={state}"
+            )
+
+        if state == "ready" and descriptor.get("data_ready", False):
+            ready_tokens = num_blocks * self._ctx.virtual_block_size
+            logger.info(
+                "[PegaKVConnector] req=%s pd_receive ready: pd_request_id=%s "
+                "instance=%s blocks=%d tokens=%d ranks=%d",
+                req_id,
+                pd_request_id,
+                dst_instance_id,
+                num_blocks,
+                ready_tokens,
+                len(descriptor.get("ranks") or ()),
+            )
+            return (ready_tokens, True)
+
+        logger.debug(
+            "[PegaKVConnector] req=%s pd_receive pending: pd_request_id=%s "
+            "state=%s data_ready=%s",
+            req_id,
+            pd_request_id,
+            state,
+            descriptor.get("data_ready", False),
+        )
+        return (None, False)
 
     def _count_available_block_prefix(
         self, block_hashes: Iterable[bytes], req_id: str
@@ -514,6 +802,36 @@ class SchedulerConnector:
         if stats.is_empty():
             return None
         return stats
+
+
+def _ceil_div(value: int, divisor: int) -> int:
+    return (value + divisor - 1) // divisor
+
+
+def _param_int(params: dict, keys: tuple[str, ...], default: int) -> int:
+    for key in keys:
+        if key in params and params[key] is not None:
+            return int(params[key])
+    return int(default)
+
+
+def _param_str(params: dict, keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = params.get(key)
+        if value is not None and value != "":
+            return str(value)
+    return ""
+
+
+def _is_source_role(params: dict) -> bool:
+    for key in ("role", "pd_role", "side", "phase"):
+        value = params.get(key)
+        if value is None:
+            continue
+        normalized = str(value).strip().lower()
+        if normalized in {"p", "prefill", "producer", "source", "egress", "sender"}:
+            return True
+    return False
 
 
 __all__ = ["SchedulerConnector"]

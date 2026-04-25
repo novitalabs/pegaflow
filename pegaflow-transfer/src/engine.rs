@@ -214,6 +214,11 @@ impl TransferEngine {
     pub fn num_qps(&self) -> usize {
         self.backend.num_qps()
     }
+
+    /// Number of local RDMA NICs configured for this endpoint.
+    pub fn nic_count(&self) -> usize {
+        self.backend.nic_count()
+    }
 }
 
 #[cfg(test)]

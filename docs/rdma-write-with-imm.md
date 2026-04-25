@@ -168,11 +168,11 @@ P/D waiting state belongs above the transfer layer:
 
 ```text
 PreparePdReceive -> lease state PREPARED
-PushPdBlocks accepted -> optional lease state WRITING
+first matching ImmCompletion -> optional lease state WRITING
 ImmCompletion { imm_data } -> P/D receive manager looks up lease/fan-in state
 expected imm count reached -> P/D receive manager marks lease READY
-QueryPrefetch(handle) while PREPARED/WRITING -> PREFETCH_LOADING
-QueryPrefetch(handle) while READY -> PREFETCH_DONE
+GetPdReceiveDescriptor(handle) while PREPARED/WRITING -> state READY, data_ready false
+GetPdReceiveDescriptor(handle) after expected IMM -> state READY, data_ready true
 ```
 
 This keeps the transport generic and lets P/D own TTL, failure policy, retries,
@@ -285,21 +285,21 @@ Once WRITE-with-imm is validated, P/D should use it like this:
 
 ```text
 PreparePdReceive:
-  allocate D CPU staging and return handle + slots + imm_data
+  allocate D CPU staging and return handle + imm_data
 
-PushPdBlocks:
+P worker in-process egress:
+  fetch rank descriptor from D PegaFlow
   P schedules normal RDMA WRITEs for KV bytes
   P schedules final WRITE_WITH_IMM carrying imm_data
-  RPC returns accepted only after the push job is queued
 
 D recv CQ completion:
   publish opaque imm_data to P/D receive manager
   P/D receive manager updates lease/fan-in state
   mark lease READY
 
-QueryPrefetch(pd_receive_handle):
-  PREPARED/WRITING -> PREFETCH_LOADING
-  READY -> insert/pin staged blocks and return PREFETCH_DONE
+GetPdReceiveDescriptor(pd_receive_handle):
+  PREPARED/WRITING -> data_ready false
+  READY -> data_ready true
 ```
 
 `CompletePdReceive` remains unnecessary if this path works.

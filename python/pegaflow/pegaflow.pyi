@@ -195,6 +195,50 @@ class EngineRpcClient:
         """
         ...
 
+    def prepare_pd_receive(
+        self,
+        instance_id: str,
+        request_id: str,
+        block_hashes: list[bytes],
+        num_blocks: int,
+        expected_imm_count: int = 0,
+        expire_after_ms: int = 0,
+    ) -> dict[str, Any]:
+        """Prepare a D-side CPU-staging lease for P/D push.
+
+        Args:
+            instance_id: D-side model instance ID.
+            request_id: Stable P/D rendezvous request ID.
+            block_hashes: Optional block hashes for the external KV span.
+            num_blocks: Number of blocks to stage.
+            expected_imm_count: Number of expected WRITE_WITH_IMM completions;
+                0 lets D derive receive-rank count times local NIC fanout.
+            expire_after_ms: Lease TTL override; 0 uses server default.
+
+        Returns:
+            Dict with keys ok, message, handle, imm_data, expires_at_ms.
+
+        Raises:
+            PegaFlowServiceError: If server is unavailable.
+            PegaFlowBusinessError: If request is invalid.
+        """
+        ...
+
+    def get_pd_receive_descriptor(
+        self,
+        dst_instance_id: str,
+        request_id: str,
+        receive_rank: int = -1,
+        handle: str | None = None,
+    ) -> dict[str, Any]:
+        """Fetch a D-side P/D receive descriptor.
+
+        Returns a dict with state, slabs, layers, block_hashes, imm_data,
+        expires_at_ms, and data_ready. State is one of "pending", "ready",
+        "failed", "expired"; data_ready flips after WRITE_WITH_IMM completion.
+        """
+        ...
+
     def unpin(
         self,
         instance_id: str,
@@ -314,4 +358,12 @@ class PyLoadState:
         Returns:
             True if state is non-zero (completed or error).
         """
+        ...
+
+
+class KvEgressRuntime:
+    """In-process P-side runtime for outbound KV transfer."""
+
+    def __init__(self, nic_names: list[str]) -> None:
+        """Create a runtime with selected RDMA NIC names."""
         ...
