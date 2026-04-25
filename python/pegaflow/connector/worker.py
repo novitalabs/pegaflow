@@ -358,21 +358,6 @@ class WorkerConnector:
         if not metadata.load_intents:
             return
 
-        total_requests = len(metadata.load_intents)
-        load_start = time.perf_counter()
-
-        all_block_ids: list[int] = []
-        all_block_hashes: list[bytes] = []
-        request_ids: list[str] = []
-
-        for req_id, load_intent in metadata.load_intents.items():
-            all_block_ids.extend(load_intent.block_ids)
-            all_block_hashes.extend(load_intent.block_hashes)
-            request_ids.append(req_id)
-
-        if not all_block_ids:
-            return
-
         if self._cross_layer_mode:
             target_layers = [self._cross_layer_key]
         else:
@@ -384,6 +369,40 @@ class WorkerConnector:
         if not target_layers:
             return
 
+        normal_request_ids: list[str] = []
+        normal_block_ids: list[int] = []
+        normal_block_hashes: list[bytes] = []
+        pd_items: list[tuple[str, Any]] = []
+
+        for req_id, load_intent in metadata.load_intents.items():
+            if not load_intent.block_ids:
+                continue
+            if load_intent.pd_request_id:
+                pd_items.append((req_id, load_intent))
+            else:
+                normal_request_ids.append(req_id)
+                normal_block_ids.extend(load_intent.block_ids)
+                normal_block_hashes.extend(load_intent.block_hashes)
+
+        if normal_block_ids:
+            self._submit_cache_load(
+                normal_request_ids,
+                normal_block_ids,
+                normal_block_hashes,
+                target_layers,
+            )
+
+        for req_id, load_intent in pd_items:
+            self._submit_pd_receive_load(req_id, load_intent, target_layers)
+
+    def _submit_cache_load(
+        self,
+        request_ids: list[str],
+        block_ids: list[int],
+        block_hashes: list[bytes],
+        target_layers: list[str],
+    ) -> None:
+        load_start = time.perf_counter()
         load_state = PyLoadState()
         shm_name = load_state.shm_name()
 
@@ -394,8 +413,8 @@ class WorkerConnector:
                 self._ctx.device_id,
                 shm_name,
                 target_layers,
-                all_block_ids,
-                all_block_hashes,
+                block_ids,
+                block_hashes,
             )
         except Exception as e:
             logger.error(
@@ -403,9 +422,9 @@ class WorkerConnector:
                 "marking blocks as load errors)",
                 e,
                 request_ids,
-                len(all_block_ids),
+                len(block_ids),
             )
-            self._record_load_failure(request_ids, all_block_ids, load_start)
+            self._record_load_failure(request_ids, block_ids, load_start)
             self._ctx.state_manager.mark_unavailable(f"load rpc exception: {e}")
             return
 
@@ -415,14 +434,14 @@ class WorkerConnector:
                 "marking blocks as load errors)",
                 message,
                 request_ids,
-                len(all_block_ids),
+                len(block_ids),
             )
-            self._record_load_failure(request_ids, all_block_ids, load_start)
+            self._record_load_failure(request_ids, block_ids, load_start)
             self._ctx.state_manager.mark_unavailable(f"load rpc failed: {message}")
             return
 
         num_layers = len(target_layers)
-        num_blocks = len(all_block_ids)
+        num_blocks = len(block_ids)
 
         schedule_end = time.perf_counter()
         schedule_time_us = (schedule_end - load_start) * 1e6
@@ -438,7 +457,7 @@ class WorkerConnector:
             self._pending_load_meta[shm_name] = (
                 load_start,
                 num_blocks,
-                all_block_ids,
+                block_ids,
             )
 
         logger.debug(
@@ -446,7 +465,81 @@ class WorkerConnector:
             "schedule %.0f us, shm=%s",
             num_blocks,
             num_layers,
-            total_requests,
+            len(request_ids),
+            schedule_time_us,
+            shm_name,
+        )
+
+    def _submit_pd_receive_load(
+        self,
+        req_id: str,
+        load_intent: Any,
+        target_layers: list[str],
+    ) -> None:
+        load_start = time.perf_counter()
+        block_ids = list(load_intent.block_ids)
+        block_hashes = list(load_intent.block_hashes)
+        load_state = PyLoadState()
+        shm_name = load_state.shm_name()
+
+        try:
+            ok, message = self._ctx.engine_client.load_pd_receive(
+                self._ctx.instance_id,
+                self._ctx.effective_tp_rank,
+                self._ctx.device_id,
+                shm_name,
+                target_layers,
+                block_ids,
+                block_hashes,
+                load_intent.pd_request_id,
+                load_intent.pd_handle,
+                self._ctx.effective_tp_rank,
+            )
+        except Exception as e:
+            logger.error(
+                "[PegaKVConnector] LoadPdReceive RPC exception: %s "
+                "(req=%s pd_request_id=%s blocks=%d, marking blocks as load errors)",
+                e,
+                req_id,
+                load_intent.pd_request_id,
+                len(block_ids),
+            )
+            self._record_load_failure([req_id], block_ids, load_start)
+            self._ctx.state_manager.mark_unavailable(f"load_pd_receive rpc exception: {e}")
+            return
+
+        if not ok:
+            logger.error(
+                "[PegaKVConnector] LoadPdReceive RPC failed: %s "
+                "(req=%s pd_request_id=%s blocks=%d, marking blocks as load errors)",
+                message,
+                req_id,
+                load_intent.pd_request_id,
+                len(block_ids),
+            )
+            self._record_load_failure([req_id], block_ids, load_start)
+            self._ctx.state_manager.mark_unavailable(f"load_pd_receive rpc failed: {message}")
+            return
+
+        schedule_end = time.perf_counter()
+        schedule_time_us = (schedule_end - load_start) * 1e6
+        with self._load_completion_lock:
+            self._pending_loads[req_id] = load_state
+            self._pending_load_reqs[shm_name] = {req_id}
+            self._pending_load_meta[shm_name] = (
+                load_start,
+                len(block_ids),
+                block_ids,
+            )
+
+        logger.info(
+            "[PegaKVConnector] started P/D receive load: req=%s pd_request_id=%s "
+            "receive_rank=%d blocks=%d layers=%d schedule %.0f us shm=%s",
+            req_id,
+            load_intent.pd_request_id,
+            self._ctx.effective_tp_rank,
+            len(block_ids),
+            len(target_layers),
             schedule_time_us,
             shm_name,
         )

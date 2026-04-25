@@ -72,6 +72,17 @@ pub struct PdReceiveDescriptor {
     pub block_hashes: Vec<Vec<u8>>,
 }
 
+pub(crate) struct PdReceiveLoadPlan {
+    pub layers: Vec<PdReceiveLoadLayer>,
+    pub block_hashes: Vec<Vec<u8>>,
+}
+
+pub(crate) struct PdReceiveLoadLayer {
+    pub layout: PdReceiveLayerLayout,
+    pub slab: PdReceiveSlabDesc,
+    pub allocation: Arc<PinnedAllocation>,
+}
+
 #[derive(Debug, Clone)]
 pub enum PdReceiveDescriptorLookup {
     Pending,
@@ -334,6 +345,110 @@ impl PdReceiveManager {
                 None => PdReceiveDescriptorLookup::Failed,
             },
         }
+    }
+
+    pub(crate) fn begin_load(
+        &self,
+        dst_instance_id: &str,
+        request_id: &str,
+        receive_rank: usize,
+        handle: Option<&str>,
+    ) -> Result<PdReceiveLoadPlan, EngineError> {
+        let now = Instant::now();
+        let mut state = self.state.lock();
+        Self::gc_expired_locked(&mut state, now);
+
+        let lease_handle = if let Some(handle) = handle.filter(|h| !h.is_empty()) {
+            handle.to_string()
+        } else {
+            state
+                .by_request
+                .get(&request_key(dst_instance_id, request_id))
+                .cloned()
+                .ok_or_else(|| {
+                    EngineError::InvalidArgument(format!(
+                        "P/D receive lease not found: instance={dst_instance_id} request={request_id}"
+                    ))
+                })?
+        };
+
+        let expired = {
+            let Some(lease) = state.by_handle.get(&lease_handle) else {
+                return Err(EngineError::InvalidArgument(format!(
+                    "P/D receive lease handle not found: {lease_handle}"
+                )));
+            };
+            if lease.instance_id != dst_instance_id || lease.request_id != request_id {
+                return Err(EngineError::InvalidArgument(format!(
+                    "P/D receive lease identity mismatch: handle={lease_handle}"
+                )));
+            }
+            lease.expires_at <= now
+        };
+        if expired {
+            Self::remove_locked(&mut state, &lease_handle);
+            return Err(EngineError::InvalidArgument(format!(
+                "P/D receive lease expired: instance={dst_instance_id} request={request_id}"
+            )));
+        }
+
+        let lease = state
+            .by_handle
+            .get_mut(&lease_handle)
+            .expect("lease checked above");
+        match lease.state {
+            PdReceiveLeaseState::Prepared | PdReceiveLeaseState::Writing => {
+                return Err(EngineError::InvalidArgument(format!(
+                    "P/D receive lease is not data-ready: instance={dst_instance_id} request={request_id} state={:?}",
+                    lease.state
+                )));
+            }
+            PdReceiveLeaseState::Failed => {
+                return Err(EngineError::InvalidArgument(format!(
+                    "P/D receive lease failed: instance={dst_instance_id} request={request_id}"
+                )));
+            }
+            PdReceiveLeaseState::Ready
+            | PdReceiveLeaseState::Loading
+            | PdReceiveLeaseState::Done => {}
+        }
+
+        let rank = lease
+            .ranks
+            .iter()
+            .find(|rank| rank.receive_rank == receive_rank)
+            .ok_or_else(|| {
+                EngineError::InvalidArgument(format!(
+                    "P/D receive rank {receive_rank} not found: instance={dst_instance_id} request={request_id}"
+                ))
+            })?;
+        let slab = lease.slabs.get(rank.slab_index).ok_or_else(|| {
+            EngineError::InvalidArgument(format!(
+                "P/D receive rank {receive_rank} references missing slab {}",
+                rank.slab_index
+            ))
+        })?;
+        let layers: Vec<PdReceiveLoadLayer> = lease
+            .layers
+            .iter()
+            .filter(|layer| layer.receive_rank == receive_rank)
+            .map(|layout| PdReceiveLoadLayer {
+                layout: layout.clone(),
+                slab: slab.desc.clone(),
+                allocation: Arc::clone(&slab._allocation),
+            })
+            .collect();
+        if layers.is_empty() {
+            return Err(EngineError::InvalidArgument(format!(
+                "P/D receive rank {receive_rank} has no layer layouts"
+            )));
+        }
+        lease.state = PdReceiveLeaseState::Loading;
+
+        Ok(PdReceiveLoadPlan {
+            layers,
+            block_hashes: lease.block_hashes.clone(),
+        })
     }
 
     #[allow(dead_code)]

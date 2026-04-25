@@ -59,6 +59,23 @@ message LoadResponse {
   ResponseStatus status = 1;
 }
 
+message LoadPdReceiveRequest {
+  string instance_id = 1;
+  uint32 tp_rank = 2;
+  int32 device_id = 3;
+  string load_state_shm = 4;
+  repeated string layer_names = 5;
+  repeated int32 block_ids = 6;
+  repeated bytes block_hashes = 7;
+  string request_id = 8;
+  string handle = 9;
+  int32 receive_rank = 10;         // -1 means use tp_rank.
+}
+
+message LoadPdReceiveResponse {
+  ResponseStatus status = 1;
+}
+
 message QueryRequest {
   string instance_id = 1;
   repeated bytes block_hashes = 2;
@@ -260,6 +277,7 @@ service Engine {
   rpc RegisterContextBatch(RegisterContextRequest) returns (RegisterContextResponse);
   rpc Save(SaveRequest) returns (SaveResponse);
   rpc Load(LoadRequest) returns (LoadResponse);
+  rpc LoadPdReceive(LoadPdReceiveRequest) returns (LoadPdReceiveResponse);
   // Prefetch query: check memory + trigger SSD prefetch or cross-node RDMA fetch for missing blocks
   rpc QueryPrefetch(QueryRequest) returns (QueryResponse);
   rpc Unpin(UnpinRequest) returns (UnpinResponse);

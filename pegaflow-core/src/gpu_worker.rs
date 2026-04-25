@@ -1,3 +1,4 @@
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 use cudarc::driver::{CudaContext, CudaStream};
@@ -22,12 +23,33 @@ pub(crate) struct LayerLoadData {
     pub layer_name: String,
     pub registration: KVCacheRegistration,
     pub blocks: Vec<LoadBlock>,
+    pub _staging_keepalives: Vec<Arc<crate::PinnedAllocation>>,
 }
 
 pub(crate) struct LoadBlock {
     pub block_idx: usize,
-    pub block: Arc<RawBlock>,
+    pub source: LoadBlockSource,
 }
+
+pub(crate) enum LoadBlockSource {
+    Cached(Arc<RawBlock>),
+    Staged { segment_ptrs: Vec<NonNull<u8>> },
+}
+
+impl LoadBlockSource {
+    fn segment_ptr(&self, segment_idx: usize) -> Option<NonNull<u8>> {
+        match self {
+            Self::Cached(block) => block.segment_ptr(segment_idx),
+            Self::Staged { segment_ptrs } => segment_ptrs.get(segment_idx).copied(),
+        }
+    }
+}
+
+// SAFETY: Staged pointers point into pinned CPU allocations kept alive by
+// LayerLoadData::_staging_keepalives until the load task completes.
+unsafe impl Send for LoadBlockSource {}
+// SAFETY: See LoadBlockSource.
+unsafe impl Send for LoadBlock {}
 
 /// A task to save KV blocks from GPU to CPU for multiple layers.
 /// Caller pre-allocates pinned memory, worker does the GPU->CPU copy.
@@ -272,11 +294,11 @@ fn process_load_task(task: &LoadTask, stream: &CudaStream) -> Result<(), EngineE
                 let v_gpu_offset = transfer::segment_offset(registration, block.block_idx, 1)
                     .map_err(EngineError::Storage)?;
 
-                let k_cpu_ptr = block.block.segment_ptr(0).unwrap().as_ptr() as *const u8;
+                let k_cpu_ptr = block.source.segment_ptr(0).unwrap().as_ptr() as *const u8;
                 // SAFETY: For contiguous layout (segment 1 absent), the allocation is
                 // 2 * segment_size bytes, so k_cpu_ptr + segment_size is within bounds.
                 let v_cpu_ptr = block
-                    .block
+                    .source
                     .segment_ptr(1)
                     .map(|p| p.as_ptr() as *const u8)
                     .unwrap_or_else(|| unsafe { k_cpu_ptr.add(segment_size) });
@@ -321,7 +343,7 @@ fn process_load_task(task: &LoadTask, stream: &CudaStream) -> Result<(), EngineE
             for block in &layer_data.blocks {
                 let gpu_offset = transfer::segment_offset(registration, block.block_idx, 0)
                     .map_err(EngineError::Storage)?;
-                let cpu_ptr = block.block.segment_ptr(0).unwrap().as_ptr() as *const u8;
+                let cpu_ptr = block.source.segment_ptr(0).unwrap().as_ptr() as *const u8;
                 transfers.push((gpu_offset, cpu_ptr));
             }
 

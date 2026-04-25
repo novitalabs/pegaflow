@@ -1,9 +1,9 @@
 use pegaflow_core::LoadState;
 use pegaflow_proto::proto::engine::{
-    GetPdReceiveDescriptorRequest, HealthRequest, LoadRequest, PdReceiveDescriptorState,
-    PreparePdReceiveRequest, QueryRequest, RdmaHandshakeRequest, RegisterContextRequest,
-    ResponseStatus, SaveLayer, SaveRequest, SessionEvent, SessionRequest, ShutdownRequest,
-    UnpinRequest, UnregisterRequest, engine_client::EngineClient,
+    GetPdReceiveDescriptorRequest, HealthRequest, LoadPdReceiveRequest, LoadRequest,
+    PdReceiveDescriptorState, PreparePdReceiveRequest, QueryRequest, RdmaHandshakeRequest,
+    RegisterContextRequest, ResponseStatus, SaveLayer, SaveRequest, SessionEvent, SessionRequest,
+    ShutdownRequest, UnpinRequest, UnregisterRequest, engine_client::EngineClient,
 };
 use pegaflow_transfer::{
     ConnectionStatus, HandshakeMetadata, MemoryRegion, TransferDesc, TransferEngine, TransferOp,
@@ -340,6 +340,45 @@ impl EngineRpcClient {
             Ok(resp.into_inner())
         })
         .and_then(|r| status_tuple("load", r.status))
+    }
+
+    /// Load KV blocks from a D-side P/D CPU-staging receive lease.
+    ///
+    /// Args are the normal load destination plus P/D rendezvous identity.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (instance_id, tp_rank, device_id, load_state_shm, layer_names, block_ids, block_hashes, request_id, handle = None, receive_rank = -1))]
+    fn load_pd_receive(
+        &self,
+        py: Python<'_>,
+        instance_id: String,
+        tp_rank: u32,
+        device_id: i32,
+        load_state_shm: String,
+        layer_names: Vec<String>,
+        block_ids: Vec<i32>,
+        block_hashes: Vec<Vec<u8>>,
+        request_id: String,
+        handle: Option<String>,
+        receive_rank: i32,
+    ) -> PyResult<(bool, String)> {
+        self.call(py, "load_pd_receive", |mut c| async move {
+            let resp = c
+                .load_pd_receive(LoadPdReceiveRequest {
+                    instance_id,
+                    tp_rank,
+                    device_id,
+                    load_state_shm,
+                    layer_names,
+                    block_ids,
+                    block_hashes,
+                    request_id,
+                    handle: handle.unwrap_or_default(),
+                    receive_rank,
+                })
+                .await?;
+            Ok(resp.into_inner())
+        })
+        .and_then(|r| status_tuple("load_pd_receive", r.status))
     }
 
     /// Query prefix cache hits with SSD prefetch support.

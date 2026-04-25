@@ -84,6 +84,8 @@ class LoadIntent:
     block_ids: tuple[int, ...]
     block_hashes: tuple[bytes, ...]
     num_tokens: int
+    pd_request_id: str | None = None
+    pd_handle: str | None = None
 
 
 @dataclass(frozen=True)
@@ -157,12 +159,17 @@ def parse_env_int(name: str, default: int) -> int:
 
 def resolve_instance_id(vllm_config, dp_rank_suffix: bool = True) -> str:
     """Resolve or generate connector instance_id with optional DP rank suffix."""
+    instance_id = os.environ.get("PEGAFLOW_INSTANCE_ID", "")
+    if instance_id:
+        logger.debug("[PegaKVConnector] Using PEGAFLOW_INSTANCE_ID: %s", instance_id)
+        return instance_id
+
     instance_id = vllm_config.kv_transfer_config.engine_id
     if instance_id:
         logger.debug("[PegaKVConnector] Using kv_transfer_config.engine_id: %s", instance_id)
         return instance_id
 
-    instance_id = vllm_config.instance_id or os.environ.get("PEGAFLOW_INSTANCE_ID", "")
+    instance_id = vllm_config.instance_id
     if not instance_id:
         instance_id = uuid.uuid4().hex
         logger.debug(

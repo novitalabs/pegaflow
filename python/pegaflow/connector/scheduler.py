@@ -173,6 +173,7 @@ class SchedulerConnector:
             self._next_stored_block_idx[req_id] = base_block_idx
 
         if num_external_tokens > 0:
+            pd_request_id, pd_handle = self._pd_receive_load_ref(request)
             block_ids = list(blocks.get_block_ids()[0]) if blocks else []
             num_computed_blocks = (
                 sum(block.block_hash is not None for block in blocks.blocks[0]) if blocks else 0
@@ -191,6 +192,8 @@ class SchedulerConnector:
                     self._block_hashes[req_id][start_block_idx : start_block_idx + num_load_blocks]
                 ),
                 num_tokens=num_external_tokens,
+                pd_request_id=pd_request_id,
+                pd_handle=pd_handle,
             )
             self._pending_load_intents[req_id] = load_intent
             logger.debug(
@@ -434,6 +437,25 @@ class SchedulerConnector:
             return params
         return None
 
+    def _pd_receive_load_ref(self, request: "Request") -> tuple[str | None, str | None]:
+        params = self._pd_push_params(request)
+        if params is None:
+            return (None, None)
+
+        req_id = request.request_id
+        pd_request_id = str(
+            params.get("pd_request_id") or params.get("request_id") or req_id
+        )
+        dst_instance_id = str(
+            params.get("dst_instance_id")
+            or params.get("d_instance_id")
+            or params.get("instance_id")
+            or self._ctx.instance_id
+        )
+        response = self._pd_receive_prepares.get((dst_instance_id, pd_request_id), {})
+        handle = _param_str(params, ("handle", "pd_handle")) or response.get("handle")
+        return (pd_request_id, str(handle) if handle else None)
+
     def _kv_egress_params(self, request: "Request") -> dict | None:
         params = getattr(request, "kv_transfer_params", None)
         if not isinstance(params, dict):
@@ -527,12 +549,10 @@ class SchedulerConnector:
         params: dict,
     ) -> tuple[int | None, bool]:
         req_id = request.request_id
-        remaining_tokens = max(0, request.num_tokens - num_computed_tokens)
-        if remaining_tokens == 0:
-            return (0, False)
-
-        num_blocks = _ceil_div(remaining_tokens, self._ctx.virtual_block_size)
+        computed_blocks = num_computed_tokens // self._ctx.virtual_block_size
+        num_blocks = max(0, len(request.block_hashes) - computed_blocks)
         if num_blocks == 0:
+            self._external_matched_blocks[req_id] = computed_blocks
             return (0, False)
 
         pd_request_id = str(
@@ -561,15 +581,10 @@ class SchedulerConnector:
                 self._pd_receive_prepares[prepare_key],
             )
 
-        computed_blocks = num_computed_tokens // self._ctx.virtual_block_size
         remaining_hashes = list(
             request.block_hashes[computed_blocks : computed_blocks + num_blocks]
         )
-        block_hashes = (
-            [bytes(h) for h in remaining_hashes]
-            if len(remaining_hashes) == num_blocks
-            else []
-        )
+        block_hashes = [bytes(h) for h in remaining_hashes]
 
         try:
             response = self._ctx.engine_client.prepare_pd_receive(
@@ -802,10 +817,6 @@ class SchedulerConnector:
         if stats.is_empty():
             return None
         return stats
-
-
-def _ceil_div(value: int, divisor: int) -> int:
-    return (value + divisor - 1) // divisor
 
 
 def _param_int(params: dict, keys: tuple[str, ...], default: int) -> int:

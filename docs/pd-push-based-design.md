@@ -146,16 +146,19 @@ D scheduler connector has the request after tokenization and local prefix-cache
 lookup. It can compute the external KV span conservatively:
 
 ```text
-external_tokens = prompt_tokens_to_load_from_P - local_cached_tokens
-num_blocks = ceil(external_tokens / vLLM_block_size)
+computed_blocks = num_computed_tokens / vLLM_block_size
+num_blocks = len(request.block_hashes) - computed_blocks
+external_tokens = num_blocks * vLLM_block_size
 ```
+
+Only complete block hashes are eligible for P/D receive. Partial prompt tails
+are recomputed by D; otherwise D can wait for a block P will never save.
 
 It calls local D PegaFlow `PreparePdReceive` with:
 
 - `pd_request_id`;
 - D instance / model identity;
-- external token or block count;
-- optional block hashes for the staged span;
+- complete block count and block hashes for the staged span;
 - optional expected IMM count override;
 - TTL and admission metadata.
 
@@ -337,11 +340,26 @@ Initial RPC/control operations:
 PreparePdReceive        D scheduler connector -> local D PegaFlow
 GetPdReceiveDescriptor  P in-process runtime -> D PegaFlow
 GetPdReceiveDescriptor  D scheduler connector -> local D PegaFlow (data_ready poll)
+LoadPdReceive           D worker connector -> local D PegaFlow
 ```
 
 No hot-path `CompletePdReceive` is needed; RDMA WRITE with immediate is the
 completion signal. No hot-path `ReleasePdReceive` is needed; D-side TTL/GC and
 consume transitions own cleanup.
+
+## Validation
+
+`examples/run_pd_push_tp4.py` launches a single-host TP4 P/D smoke stack:
+
+```text
+GPUs 0-3: P vLLM TP4 + PegaFlow server
+GPUs 4-7: D vLLM TP4 + PegaFlow server
+NICs: mlx5_1..mlx5_4
+```
+
+The validation prompt is intentionally long enough to produce complete
+`request.block_hashes`; short prompts may correctly bypass P/D receive and let D
+compute the whole prompt locally.
 
 ## Why CPU Staging First
 
@@ -369,16 +387,9 @@ Costs:
 
 ## Roadmap
 
-1. Implement D scheduler-connector state machine around
-   `get_num_new_matched_tokens()`.
-2. Add idempotent D `PreparePdReceive` and descriptor query backed by a
-   D-side receive manager.
-3. Add P worker in-process `KvEgressRuntime` PyClass and initialize its
-   `TransferEngine` from the connector worker.
-4. Wire descriptor polling and RDMA handshake from P runtime to D PegaFlow.
-5. Add P GPU RDMA WRITE to D CPU staging + final WRITE-with-IMM.
-6. Reuse existing D load/H2D path in worker `start_load_kv()`.
-7. Add TP fan-in accounting, TTL cleanup, and metrics.
-8. Add unified RDMA admission for P/D push, P save/offload, and remote cache
+1. Current validation path: TP4 P/D, CPU staging receive, P GPU RDMA WRITE into
+   D CPU staging, final WRITE-with-IMM, D `LoadPdReceive` H2D.
+2. Add TP fan-in accounting, TTL cleanup hardening, and metrics.
+3. Add unified RDMA admission for P/D push, P save/offload, and remote cache
    traffic.
-9. Revisit delta transfer and direct GPU push.
+4. Revisit delta transfer and direct GPU push.
