@@ -178,6 +178,84 @@ message ReleaseTransferLockResponse {
   uint64 released_blocks = 2;
 }
 
+// P/D CPU-staging receive: D scheduler connector prepares a receive lease from
+// get_num_new_matched_tokens(), before vLLM allocates D GPU KV blocks. Router
+// never sends this RPC directly because it should not own tokenizer/cache logic.
+message PreparePdReceiveRequest {
+  string instance_id = 1;          // D-side vLLM/PegaFlow instance.
+  string request_id = 2;           // Stable router/vLLM request id.
+  repeated bytes block_hashes = 3; // Optional; carried once, not per rank/layer.
+  uint64 num_blocks = 4;           // Required if block_hashes is empty.
+  uint32 expected_imm_count = 5;   // 0 means D defaults from receive ranks * NIC fanout.
+  uint64 expire_after_ms = 6;      // Defaults to server policy when unset.
+}
+
+message PreparePdReceiveResponse {
+  ResponseStatus status = 1;
+  string handle = 2;
+  uint32 imm_data = 3;
+  uint64 expires_at_ms = 4;
+}
+
+// P/PegaFlow fetches this descriptor from D/PegaFlow via the rendezvous
+// reference carried by the router. The router does not carry device/rank
+// topology. P workers request the D receive rank matching their local TP rank.
+message GetPdReceiveDescriptorRequest {
+  string dst_instance_id = 1;
+  string request_id = 2;
+  string handle = 3;               // Optional; request_id is enough in phase one.
+  int32 receive_rank = 4;          // -1 returns request-level status; >=0 returns that rank.
+}
+
+enum PdReceiveDescriptorState {
+  PD_DESCRIPTOR_PENDING = 0;
+  PD_DESCRIPTOR_READY = 1;
+  PD_DESCRIPTOR_FAILED = 2;
+  PD_DESCRIPTOR_EXPIRED = 3;
+}
+
+// Coarse receive slab. Initial implementation allocates one NUMA-aware slab per
+// receive rank, then describes per-layer layout inside the slab.
+message PdReceiveSlab {
+  uint64 base_ptr = 1;
+  uint64 size = 2;
+  uint32 numa_node = 3;
+}
+
+message PdReceiveRank {
+  uint32 receive_rank = 1;         // D receive rank, equal to TP rank for homogeneous TP P/D.
+  int32 device_id = 2;             // D local CUDA device selected by D registration.
+  uint32 tp_rank = 3;              // D effective TP rank.
+  uint32 slab_index = 4;           // Slab used by this receive rank in this response.
+  uint32 numa_node = 5;
+}
+
+message PdReceiveLayerLayout {
+  string layer_name = 1;
+  uint32 slab_index = 2;
+  uint64 layer_offset = 3;
+  uint64 block_stride = 4;
+  uint32 segment_count = 5;
+  uint64 segment_size = 6;
+  uint64 padded_segment_stride = 7;
+  uint64 num_blocks = 8;
+  uint32 slot_id = 9;
+  uint32 receive_rank = 10;
+}
+
+message GetPdReceiveDescriptorResponse {
+  ResponseStatus status = 1;
+  PdReceiveDescriptorState state = 2;
+  string handle = 3;
+  repeated PdReceiveSlab slabs = 4;
+  repeated PdReceiveLayerLayout layers = 5;
+  repeated bytes block_hashes = 6;
+  uint32 imm_data = 7;
+  uint64 expires_at_ms = 8;
+  bool data_ready = 9;             // True after all expected WRITE_WITH_IMM completions.
+  repeated PdReceiveRank ranks = 10;
+}
+
 service Engine {
   rpc RegisterContextBatch(RegisterContextRequest) returns (RegisterContextResponse);
   rpc Save(SaveRequest) returns (SaveResponse);
@@ -190,6 +268,9 @@ service Engine {
   rpc QueryBlocksForTransfer(QueryBlocksForTransferRequest) returns (QueryBlocksForTransferResponse);
   // Cross-node transfer: release block locks after RDMA transfer completes
   rpc ReleaseTransferLock(ReleaseTransferLockRequest) returns (ReleaseTransferLockResponse);
+  // P/D CPU-staging receive control plane
+  rpc PreparePdReceive(PreparePdReceiveRequest) returns (PreparePdReceiveResponse);
+  rpc GetPdReceiveDescriptor(GetPdReceiveDescriptorRequest) returns (GetPdReceiveDescriptorResponse);
   // RDMA handshake: establish a new peer-to-peer RDMA connection
   rpc RdmaHandshake(RdmaHandshakeRequest) returns (RdmaHandshakeResponse);
   rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);

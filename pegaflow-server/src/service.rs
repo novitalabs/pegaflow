@@ -3,9 +3,12 @@ use pegaflow_core::{trace_in_span, trace_root};
 use crate::metric::record_rpc_result;
 use crate::proto::engine::engine_server::Engine;
 use crate::proto::engine::{
-    HealthRequest, HealthResponse, LoadRequest, LoadResponse, PrefetchState,
-    QueryBlocksForTransferRequest, QueryBlocksForTransferResponse, QueryRequest, QueryResponse,
-    RdmaHandshakeRequest, RdmaHandshakeResponse, RegisterContextRequest, RegisterContextResponse,
+    GetPdReceiveDescriptorRequest, GetPdReceiveDescriptorResponse, HealthRequest, HealthResponse,
+    LoadRequest, LoadResponse, PdReceiveDescriptorState,
+    PdReceiveLayerLayout as ProtoPdReceiveLayerLayout, PdReceiveRank, PdReceiveSlab, PrefetchState,
+    PreparePdReceiveRequest, PreparePdReceiveResponse, QueryBlocksForTransferRequest,
+    QueryBlocksForTransferResponse, QueryRequest, QueryResponse, RdmaHandshakeRequest,
+    RdmaHandshakeResponse, RegisterContextRequest, RegisterContextResponse,
     ReleaseTransferLockRequest, ReleaseTransferLockResponse, ResponseStatus, SaveRequest,
     SaveResponse, SessionEvent, SessionRequest, ShutdownRequest, ShutdownResponse,
     TransferBlockInfo, TransferSlotInfo, UnpinRequest, UnpinResponse, UnregisterRequest,
@@ -15,10 +18,13 @@ use crate::registry::CudaTensorRegistry;
 use crate::session::SessionRegistry;
 use log::{debug, info, warn};
 use parking_lot::Mutex;
-use pegaflow_core::{EngineError, LayerSave, PegaEngine, PrefetchStatus};
+use pegaflow_core::{
+    EngineError, LayerSave, PdReceiveDescriptorLookup,
+    PdReceivePrepareRequest as CorePdReceivePrepareRequest, PegaEngine, PrefetchStatus,
+};
 use pyo3::{PyErr, Python};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, async_trait};
@@ -115,6 +121,11 @@ impl GrpcEngineService {
         usize::try_from(value).map_err(|_| {
             Status::invalid_argument(format!("{field}={value} does not fit into usize"))
         })
+    }
+
+    fn u32_from_usize(value: usize, field: &str) -> Result<u32, Status> {
+        u32::try_from(value)
+            .map_err(|_| Status::internal(format!("{field}={value} does not fit into u32")))
     }
 
     fn build_register_context_response() -> RegisterContextResponse {
@@ -706,6 +717,221 @@ impl Engine for GrpcEngineService {
             released, elapsed_ms
         );
         record_rpc_result("release_transfer_lock", &result, start);
+        result
+    }
+
+    async fn prepare_pd_receive(
+        &self,
+        request: Request<PreparePdReceiveRequest>,
+    ) -> Result<Response<PreparePdReceiveResponse>, Status> {
+        let start = Instant::now();
+        let req = request.into_inner();
+        let hash_count = req.block_hashes.len();
+
+        debug!(
+            "RPC [prepare_pd_receive]: instance_id={} request_id={} hashes={} num_blocks={} expected_imm_count={} ttl_ms={}",
+            req.instance_id,
+            req.request_id,
+            hash_count,
+            req.num_blocks,
+            req.expected_imm_count,
+            req.expire_after_ms
+        );
+
+        let result: Result<Response<PreparePdReceiveResponse>, Status> = async {
+            let num_blocks = Self::usize_from_u64(req.num_blocks, "num_blocks")?;
+            let expected_imm_count =
+                Self::usize_from_u32(req.expected_imm_count, "expected_imm_count")?;
+            let expire_after = if req.expire_after_ms == 0 {
+                None
+            } else {
+                Some(Duration::from_millis(req.expire_after_ms))
+            };
+
+            let response = self
+                .engine
+                .prepare_pd_receive(CorePdReceivePrepareRequest {
+                    instance_id: req.instance_id,
+                    request_id: req.request_id,
+                    block_hashes: req.block_hashes,
+                    num_blocks,
+                    expected_imm_count,
+                    expire_after,
+                })
+                .map_err(Self::map_engine_error)?;
+
+            Ok(Response::new(PreparePdReceiveResponse {
+                status: Some(Self::build_simple_response()),
+                handle: response.handle,
+                imm_data: response.imm_data,
+                expires_at_ms: response.expires_at_ms,
+            }))
+        }
+        .await;
+
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        match &result {
+            Ok(response) => debug!(
+                "RPC [prepare_pd_receive] completed: ok handle={} imm={} elapsed_ms={:.2}",
+                response.get_ref().handle,
+                response.get_ref().imm_data,
+                elapsed_ms
+            ),
+            Err(status) => warn!(
+                "RPC [prepare_pd_receive] failed: code={} message={} elapsed_ms={:.2}",
+                status.code(),
+                status.message(),
+                elapsed_ms
+            ),
+        }
+        record_rpc_result("prepare_pd_receive", &result, start);
+        result
+    }
+
+    async fn get_pd_receive_descriptor(
+        &self,
+        request: Request<GetPdReceiveDescriptorRequest>,
+    ) -> Result<Response<GetPdReceiveDescriptorResponse>, Status> {
+        let start = Instant::now();
+        let req = request.into_inner();
+
+        debug!(
+            "RPC [get_pd_receive_descriptor]: dst_instance_id={} request_id={} receive_rank={} handle={}",
+            req.dst_instance_id, req.request_id, req.receive_rank, req.handle
+        );
+
+        let result: Result<Response<GetPdReceiveDescriptorResponse>, Status> = async {
+            if req.dst_instance_id.is_empty() {
+                return Err(Status::invalid_argument(
+                    "dst_instance_id must not be empty",
+                ));
+            }
+            if req.request_id.is_empty() {
+                return Err(Status::invalid_argument("request_id must not be empty"));
+            }
+            let receive_rank = if req.receive_rank < 0 {
+                None
+            } else {
+                Some(usize::try_from(req.receive_rank).map_err(|_| {
+                    Status::invalid_argument("receive_rank does not fit into usize")
+                })?)
+            };
+
+            let lookup = self.engine.get_pd_receive_descriptor(
+                &req.dst_instance_id,
+                &req.request_id,
+                receive_rank,
+                Some(req.handle.as_str()),
+            );
+
+            let mut response = GetPdReceiveDescriptorResponse {
+                status: Some(Self::build_simple_response()),
+                state: PdReceiveDescriptorState::PdDescriptorPending.into(),
+                handle: String::new(),
+                slabs: Vec::new(),
+                layers: Vec::new(),
+                block_hashes: Vec::new(),
+                imm_data: 0,
+                expires_at_ms: 0,
+                data_ready: false,
+                ranks: Vec::new(),
+            };
+
+            match lookup {
+                PdReceiveDescriptorLookup::Pending => {}
+                PdReceiveDescriptorLookup::Failed => {
+                    response.state = PdReceiveDescriptorState::PdDescriptorFailed.into();
+                }
+                PdReceiveDescriptorLookup::Expired => {
+                    response.state = PdReceiveDescriptorState::PdDescriptorExpired.into();
+                }
+                PdReceiveDescriptorLookup::Ready(descriptor) => {
+                    response.state = PdReceiveDescriptorState::PdDescriptorReady.into();
+                    response.handle = descriptor.handle;
+                    response.imm_data = descriptor.imm_data;
+                    response.expires_at_ms = descriptor.expires_at_ms;
+                    response.data_ready = descriptor.data_ready;
+                    response.block_hashes = descriptor.block_hashes;
+                    response.ranks = descriptor
+                        .ranks
+                        .into_iter()
+                        .map(|rank| {
+                            Ok(PdReceiveRank {
+                                receive_rank: Self::u32_from_usize(
+                                    rank.receive_rank,
+                                    "receive_rank",
+                                )?,
+                                device_id: rank.device_id,
+                                tp_rank: Self::u32_from_usize(rank.tp_rank, "tp_rank")?,
+                                slab_index: Self::u32_from_usize(rank.slab_index, "slab_index")?,
+                                numa_node: rank.numa_node.0,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, Status>>()?;
+                    response.slabs = descriptor
+                        .slabs
+                        .into_iter()
+                        .map(|slab| PdReceiveSlab {
+                            base_ptr: slab.base_ptr,
+                            size: slab.size,
+                            numa_node: slab.numa_node.0,
+                        })
+                        .collect();
+                    response.layers = descriptor
+                        .layers
+                        .into_iter()
+                        .map(|layer| {
+                            Ok(ProtoPdReceiveLayerLayout {
+                                layer_name: layer.layer_name,
+                                slab_index: Self::u32_from_usize(layer.slab_index, "slab_index")?,
+                                layer_offset: layer.layer_offset,
+                                block_stride: layer.block_stride,
+                                segment_count: Self::u32_from_usize(
+                                    layer.segment_count,
+                                    "segment_count",
+                                )?,
+                                segment_size: layer.segment_size,
+                                padded_segment_stride: layer.padded_segment_stride,
+                                num_blocks: layer.num_blocks as u64,
+                                slot_id: Self::u32_from_usize(layer.slot_id, "slot_id")?,
+                                receive_rank: Self::u32_from_usize(
+                                    layer.receive_rank,
+                                    "receive_rank",
+                                )?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, Status>>()?;
+                }
+            }
+
+            Ok(Response::new(response))
+        }
+        .await;
+
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        match &result {
+            Ok(response) => {
+                let resp = response.get_ref();
+                let state = PdReceiveDescriptorState::try_from(resp.state)
+                    .map(|s| format!("{:?}", s))
+                    .unwrap_or_else(|_| format!("Unknown({})", resp.state));
+                debug!(
+                    "RPC [get_pd_receive_descriptor] completed: ok state={} ranks={} slabs={} layers={} elapsed_ms={:.2}",
+                    state,
+                    resp.ranks.len(),
+                    resp.slabs.len(),
+                    resp.layers.len(),
+                    elapsed_ms
+                );
+            }
+            Err(status) => warn!(
+                "RPC [get_pd_receive_descriptor] failed: code={} message={} elapsed_ms={:.2}",
+                status.code(),
+                status.message(),
+                elapsed_ms
+            ),
+        }
+        record_rpc_result("get_pd_receive_descriptor", &result, start);
         result
     }
 

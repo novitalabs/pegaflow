@@ -154,6 +154,12 @@ impl KVCacheRegistration {
 /// - Asynchronous worker pool for load/save operations
 /// - NUMA affinity for memory allocation optimization
 pub struct GpuContext {
+    /// CUDA device ID for this registered shard.
+    device_id: i32,
+
+    /// Effective TP rank represented by this GPU context.
+    tp_rank: usize,
+
     /// Preferred NUMA node for this GPU (for memory allocation).
     preferred_numa: NumaNode,
 
@@ -180,12 +186,15 @@ impl GpuContext {
     fn new(
         cuda_ctx: Arc<CudaContext>,
         device_id: i32,
+        tp_rank: usize,
         numa_node: NumaNode,
         kv_caches: HashMap<String, KVCacheRegistration>,
     ) -> Result<Self, EngineError> {
         let worker_pool = GpuWorkerPool::spawn(device_id, numa_node)?;
 
         Ok(Self {
+            device_id,
+            tp_rank,
             preferred_numa: numa_node,
             kv_caches,
             _cuda_ctx: cuda_ctx,
@@ -198,9 +207,27 @@ impl GpuContext {
         self.preferred_numa
     }
 
+    /// CUDA device ID represented by this shard.
+    pub(crate) fn device_id(&self) -> i32 {
+        self.device_id
+    }
+
+    /// Effective TP rank represented by this shard.
+    pub(crate) fn tp_rank(&self) -> usize {
+        self.tp_rank
+    }
+
     /// Retrieve a layer's registration information.
     pub(crate) fn get_registration(&self, layer_name: &str) -> Option<KVCacheRegistration> {
         self.kv_caches.get(layer_name).cloned()
+    }
+
+    /// Snapshot all layer registrations for topology-owned planning.
+    pub(crate) fn layer_registrations(&self) -> Vec<(String, KVCacheRegistration)> {
+        self.kv_caches
+            .iter()
+            .map(|(name, registration)| (name.clone(), registration.clone()))
+            .collect()
     }
 
     /// Access the worker pool for submitting GPU operations.
@@ -236,6 +263,22 @@ pub struct InstanceContext {
     /// This consolidates previously separate mutexes to prevent deadlocks
     /// from inconsistent lock acquisition ordering.
     metadata: Mutex<LayerMetadata>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct InstanceLayerRegistration {
+    pub layer_name: String,
+    pub layer_id: usize,
+    pub registration: KVCacheRegistration,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct InstanceShardTopology {
+    pub shard_index: usize,
+    pub device_id: i32,
+    pub tp_rank: usize,
+    pub preferred_numa: NumaNode,
+    pub layers: Vec<InstanceLayerRegistration>,
 }
 
 impl InstanceContext {
@@ -343,6 +386,7 @@ impl InstanceContext {
     fn create_gpu(
         &self,
         device_id: i32,
+        tp_rank: usize,
         numa_node: NumaNode,
         kv_caches: HashMap<String, KVCacheRegistration>,
     ) -> Result<Arc<GpuContext>, EngineError> {
@@ -368,7 +412,9 @@ impl InstanceContext {
         let cuda_ctx = CudaContext::new(device_id as usize)
             .map_err(|e| EngineError::CudaInit(format!("{e:?}")))?;
 
-        let ctx = Arc::new(GpuContext::new(cuda_ctx, device_id, numa_node, kv_caches)?);
+        let ctx = Arc::new(GpuContext::new(
+            cuda_ctx, device_id, tp_rank, numa_node, kv_caches,
+        )?);
 
         // Insert and return
         let mut metadata = self.metadata.lock();
@@ -404,14 +450,57 @@ impl InstanceContext {
     pub(crate) fn register_new_gpu(
         &self,
         device_id: i32,
+        tp_rank: usize,
         numa_node: NumaNode,
         kv_caches: HashMap<String, KVCacheRegistration>,
     ) -> Result<(), EngineError> {
+        if tp_rank >= self.tp_size {
+            return Err(EngineError::InvalidArgument(format!(
+                "tp_rank {} out of range (tp_size {})",
+                tp_rank, self.tp_size
+            )));
+        }
         for layer_name in kv_caches.keys() {
             self.get_or_allocate_layer_id(layer_name);
         }
-        self.create_gpu(device_id, numa_node, kv_caches)?;
+        self.create_gpu(device_id, tp_rank, numa_node, kv_caches)?;
         Ok(())
+    }
+
+    /// Snapshot registered device/tp/layer topology for instance-level planning.
+    pub(crate) fn registered_shards(&self) -> Vec<InstanceShardTopology> {
+        let metadata = self.metadata.lock();
+        let mut shards: Vec<InstanceShardTopology> = metadata
+            .gpu_contexts
+            .values()
+            .map(|gpu| {
+                let mut layers: Vec<InstanceLayerRegistration> = gpu
+                    .layer_registrations()
+                    .into_iter()
+                    .filter_map(|(layer_name, registration)| {
+                        let layer_id = metadata.name_to_id.get(&layer_name).copied()?;
+                        Some(InstanceLayerRegistration {
+                            layer_name,
+                            layer_id,
+                            registration,
+                        })
+                    })
+                    .collect();
+                layers.sort_by_key(|layer| layer.layer_id);
+                InstanceShardTopology {
+                    shard_index: 0,
+                    device_id: gpu.device_id(),
+                    tp_rank: gpu.tp_rank(),
+                    preferred_numa: gpu.preferred_numa(),
+                    layers,
+                }
+            })
+            .collect();
+        shards.sort_by_key(|shard| (shard.tp_rank, shard.device_id));
+        for (idx, shard) in shards.iter_mut().enumerate() {
+            shard.shard_index = idx;
+        }
+        shards
     }
 
     /// Access the instance namespace.
@@ -526,7 +615,7 @@ mod tests {
 
         // 3. Register all layers at once
         instance
-            .register_new_gpu(0, numa, kv_caches)
+            .register_new_gpu(0, 0, numa, kv_caches)
             .expect("register gpu with layers");
 
         // 4. Verify topology checking
@@ -543,7 +632,7 @@ mod tests {
             KVCacheRegistration::new(0x2000, 1024 * 1024, 100, 1024, 0, 1).unwrap(),
         )]);
         let err = instance
-            .register_new_gpu(0, numa, dup_caches)
+            .register_new_gpu(0, 0, numa, dup_caches)
             .expect_err("duplicate GPU registration should fail");
         assert!(err.to_string().contains("already exists"));
 

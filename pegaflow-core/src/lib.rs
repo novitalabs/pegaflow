@@ -20,6 +20,7 @@ mod internode;
 pub use pegaflow_common::logging;
 mod metrics;
 mod offload;
+mod pd_receive;
 mod pinned_mem;
 mod pinned_pool;
 mod seal_offload;
@@ -36,6 +37,10 @@ pub use block::{
 };
 pub use instance::{GpuContext, InstanceContext, KVCacheRegistration};
 pub use internode::{DEFAULT_METASERVER_QUEUE_DEPTH, MetaServerClient, MetaServerClientConfig};
+pub use pd_receive::{
+    PdReceiveDescriptor, PdReceiveDescriptorLookup, PdReceiveLayerLayout, PdReceiveLeaseState,
+    PdReceivePrepareRequest, PdReceivePrepareResponse, PdReceiveRankDesc, PdReceiveSlabDesc,
+};
 pub use pegaflow_common::NumaNode;
 use pegaflow_common::NumaTopology;
 pub use pinned_pool::PinnedAllocation;
@@ -117,6 +122,8 @@ pub struct PegaEngine {
     storage: Arc<StorageEngine>,
     /// GPU-NUMA topology for memory allocation decisions.
     topology: Arc<NumaTopology>,
+    /// D-side P/D CPU-staging receive leases.
+    pd_receive: Arc<pd_receive::PdReceiveManager>,
 }
 
 impl PegaEngine {
@@ -149,6 +156,7 @@ impl PegaEngine {
             instances: Arc::new(RwLock::new(HashMap::new())),
             storage,
             topology,
+            pd_receive: Arc::new(pd_receive::PdReceiveManager::new()),
         }
     }
 
@@ -279,7 +287,7 @@ impl PegaEngine {
         }
 
         // Register GPU with all layers
-        instance.register_new_gpu(device_id, numa_node, kv_caches)?;
+        instance.register_new_gpu(device_id, tp_rank, numa_node, kv_caches)?;
 
         info!(
             "Registered context batch: instance={instance_id}, namespace={namespace}, \
@@ -593,6 +601,23 @@ impl PegaEngine {
     /// Returns true if RDMA transport is available.
     pub fn has_rdma_transport(&self) -> bool {
         self.storage.rdma_transport().is_some()
+    }
+
+    /// Take the receiver-side WRITE_WITH_IMM completion stream for P/D receive.
+    ///
+    /// The transfer layer exposes a single consumer. The server owns that
+    /// consumer and forwards opaque immediate values to the P/D receive manager.
+    pub fn take_pd_receive_imm_receiver(&self) -> Option<pegaflow_transfer::ImmCompletionReceiver> {
+        self.storage
+            .rdma_transport()
+            .and_then(|rdma| rdma.engine().take_imm_receiver())
+    }
+
+    /// Observe one opaque P/D WRITE_WITH_IMM value.
+    ///
+    /// Returns true when the immediate value matched a live receive lease.
+    pub fn observe_pd_receive_imm(&self, imm_data: u32) -> bool {
+        self.pd_receive.observe_imm(imm_data)
     }
 
     /// Perform server-side RDMA handshake with connection reuse.

@@ -26,6 +26,7 @@ class ConnectorContext:
 
     instance_id: str
     namespace: str
+    layer_names: tuple[str, ...]
     block_size: int
     num_layers: int
     tp_size: int
@@ -93,6 +94,18 @@ class SaveIntent:
     block_hashes: tuple[bytes, ...]
 
 
+@dataclass(frozen=True)
+class KvEgressIntent:
+    """Intent for outbound P/D KV transfer from local GPU KV to D staging."""
+
+    pd_request_id: str
+    d_pegaflow_addr: str
+    dst_instance_id: str
+    block_ids: tuple[int, ...]
+    block_hashes: tuple[bytes, ...]
+    handle: str | None = None
+
+
 class PegaConnectorMetadata(KVConnectorMetadata):
     """Metadata passed from scheduler to worker for KV cache operations."""
 
@@ -100,17 +113,21 @@ class PegaConnectorMetadata(KVConnectorMetadata):
         self,
         load_intents: dict[str, LoadIntent] | None = None,
         save_intents: dict[str, SaveIntent] | None = None,
+        egress_intents: dict[str, KvEgressIntent] | None = None,
         preempted_req_ids: set[str] | None = None,
     ):
         super().__init__()
         # Maps request_id -> intent
         self.load_intents: dict[str, LoadIntent] = load_intents or {}
         self.save_intents: dict[str, SaveIntent] = save_intents or {}
+        self.egress_intents: dict[str, KvEgressIntent] = egress_intents or {}
         self.preempted_req_ids: set[str] = preempted_req_ids or set()
 
     def __repr__(self) -> str:
         return (
-            f"PegaConnectorMetadata(loads={len(self.load_intents)}, saves={len(self.save_intents)})"
+            "PegaConnectorMetadata("
+            f"loads={len(self.load_intents)}, saves={len(self.save_intents)}, "
+            f"egress={len(self.egress_intents)})"
         )
 
 
@@ -212,6 +229,7 @@ def detect_mla(vllm_config) -> bool:
 
 __all__ = [
     "ConnectorContext",
+    "KvEgressIntent",
     "LoadIntent",
     "PegaConnectorMetadata",
     "PegaKVConnectorStats",

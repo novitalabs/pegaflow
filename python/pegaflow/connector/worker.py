@@ -14,10 +14,16 @@ import torch
 
 from pegaflow.connector.common import (
     ConnectorContext,
+    KvEgressIntent,
     PegaConnectorMetadata,
     PegaKVConnectorStats,
     logger,
     parse_env_int,
+)
+from pegaflow.connector.egress import (
+    EgressLayerRegistration,
+    create_kv_egress_runtime,
+    execute_kv_egress,
 )
 from pegaflow.ipc_wrapper import CudaIPCWrapper
 from pegaflow.pegaflow import PyLoadState
@@ -92,6 +98,8 @@ class WorkerConnector:
 
         self._cross_layer_mode = False
         self._cross_layer_key = _CROSS_LAYER_KEY
+        self._kv_egress = create_kv_egress_runtime()
+        self._egress_layers: dict[str, EgressLayerRegistration] = {}
 
         self._finished_requests: set[str] = set()
 
@@ -105,10 +113,12 @@ class WorkerConnector:
         self._save_thread.join()
 
     def unregister_context(self) -> None:
-        if not self._registered_layers:
+        if not self._registered_layers and not self._egress_layers:
             return
 
-        if self._ctx.tp_rank == 0:
+        self._unregister_egress_layers()
+
+        if self._registered_layers and self._ctx.tp_rank == 0:
             ok, message = self._ctx.engine_client.unregister_context(self._ctx.instance_id)
             if not ok:
                 logger.warning("[PegaKVConnector] Unregister context failed: %s", message)
@@ -141,6 +151,7 @@ class WorkerConnector:
         layer_bytes_per_block = []
         layer_kv_stride_bytes = []
         layer_segments = []
+        egress_layers: dict[str, EgressLayerRegistration] = {}
 
         for layer_name, kv_cache in kv_caches.items():
             assert kv_cache.storage_offset() == 0, (
@@ -177,6 +188,14 @@ class WorkerConnector:
             layer_bytes_per_block.append(bytes_per_block)
             layer_kv_stride_bytes.append(kv_stride_bytes)
             layer_segments.append(segments)
+            egress_layers[layer_name] = EgressLayerRegistration(
+                base_ptr=int(kv_cache.data_ptr()),
+                size_bytes=_tensor_storage_nbytes(kv_cache),
+                num_blocks=int(num_blocks),
+                bytes_per_block=int(bytes_per_block),
+                kv_stride_bytes=int(kv_stride_bytes),
+                segments=int(segments),
+            )
 
         ok, message = self._ctx.engine_client.register_context_batch(
             self._ctx.instance_id,
@@ -196,6 +215,8 @@ class WorkerConnector:
 
         if not ok:
             raise RuntimeError(f"Register context failed for {layer_name}: {message}")
+
+        self._register_egress_layers(egress_layers)
 
         logger.debug(
             "[PegaKVConnector] Registered %d KV cache layers (%s layout) instance=%s",
@@ -474,10 +495,14 @@ class WorkerConnector:
     def wait_for_save(self) -> None:
         metadata = self._current_metadata
         self._current_metadata = None
-        if metadata is None or not metadata.save_intents:
+        if metadata is None or (not metadata.save_intents and not metadata.egress_intents):
             return
 
-        request_ids = list(metadata.save_intents.keys())
+        request_ids = list(
+            dict.fromkeys(
+                [*metadata.egress_intents.keys(), *metadata.save_intents.keys()]
+            )
+        )
 
         if self._should_skip_save_submission():
             logger.debug(
@@ -530,10 +555,12 @@ class WorkerConnector:
 
     def _process_save_batch(self, batch: list[SaveTask]) -> None:
         saves_by_layer: dict[str, tuple[list[int], list[bytes]]] = {}
+        egress_items: list[tuple[str, KvEgressIntent]] = []
         all_request_ids: list[str] = []
 
         for task in batch:
             all_request_ids.extend(task.request_ids)
+            egress_items.extend(task.metadata.egress_intents.items())
 
             for save_intent in task.metadata.save_intents.values():
                 if not save_intent.block_ids:
@@ -554,11 +581,16 @@ class WorkerConnector:
                     saves_by_layer[layer_name][0].extend(save_intent.block_ids)
                     saves_by_layer[layer_name][1].extend(save_intent.block_hashes)
 
-        if saves_by_layer:
+        if saves_by_layer or egress_items:
             # Ensure all GPU kernels have completed before reading KV cache
             # Otherwise we may copy uninitialized memory (attention kernel is async)
-            torch.cuda.synchronize(self._torch_device)
+            if self._torch_device is not None:
+                torch.cuda.synchronize(self._torch_device)
 
+        if egress_items:
+            self._process_egress_batch(egress_items)
+
+        if saves_by_layer:
             saves_list = [(name, ids, hashes) for name, (ids, hashes) in saves_by_layer.items()]
             total_blocks = sum(len(ids) for _, ids, _ in saves_list)
 
@@ -600,6 +632,60 @@ class WorkerConnector:
         # Always complete the request save lifecycle, even if save failed.
         self._complete_save_requests(all_request_ids)
 
+    def _process_egress_batch(self, egress_items: list[tuple[str, KvEgressIntent]]) -> None:
+        if self._kv_egress is None:
+            logger.error(
+                "[PegaKVConnector] P/D egress requested but PEGAFLOW_KV_EGRESS is disabled "
+                "(reqs=%s)",
+                [req_id for req_id, _ in egress_items],
+            )
+            return
+        if not self._egress_layers:
+            logger.error(
+                "[PegaKVConnector] P/D egress requested before KV caches were registered "
+                "(reqs=%s)",
+                [req_id for req_id, _ in egress_items],
+            )
+            return
+
+        requester_id = self._egress_requester_id()
+        for req_id, intent in egress_items:
+            if not intent.block_ids:
+                continue
+            start = time.perf_counter()
+            try:
+                bytes_written = execute_kv_egress(
+                    self._kv_egress,
+                    intent,
+                    self._egress_layers,
+                    requester_id,
+                    self._ctx.effective_tp_rank,
+                )
+            except Exception as e:
+                logger.error(
+                    "[PegaKVConnector] P/D egress failed: req=%s pd_request_id=%s "
+                    "dst=%s blocks=%d error=%s",
+                    req_id,
+                    intent.pd_request_id,
+                    intent.d_pegaflow_addr,
+                    len(intent.block_ids),
+                    e,
+                )
+                continue
+
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            logger.info(
+                "[PegaKVConnector] P/D egress completed: req=%s pd_request_id=%s "
+                "dst=%s layers=%d blocks=%d bytes=%d elapsed_ms=%.2f",
+                req_id,
+                intent.pd_request_id,
+                intent.d_pegaflow_addr,
+                len(self._egress_layers),
+                len(intent.block_ids),
+                bytes_written,
+                elapsed_ms,
+            )
+
     def _complete_save_requests(self, request_ids: list[str]) -> None:
         completed_reqs: list[str] = []
 
@@ -632,6 +718,70 @@ class WorkerConnector:
 
     def _should_skip_save_submission(self) -> bool:
         return self._ctx.is_mla and self._ctx.dcp_world_size == 1 and (self._ctx.tp_rank or 0) != 0
+
+    def _register_egress_layers(
+        self,
+        layers: dict[str, EgressLayerRegistration],
+    ) -> None:
+        if self._kv_egress is None:
+            self._egress_layers.clear()
+            return
+
+        self._unregister_egress_layers()
+
+        registered_ptrs: set[int] = set()
+        try:
+            for registration in layers.values():
+                if registration.base_ptr in registered_ptrs:
+                    continue
+                self._kv_egress._register_memory(
+                    registration.base_ptr,
+                    registration.size_bytes,
+                )
+                registered_ptrs.add(registration.base_ptr)
+        except Exception:
+            for ptr in registered_ptrs:
+                try:
+                    self._kv_egress._unregister_memory(ptr)
+                except Exception as cleanup_error:
+                    logger.warning(
+                        "[PegaKVConnector] Failed to unregister partial egress MR "
+                        "ptr=%#x: %s",
+                        ptr,
+                        cleanup_error,
+                    )
+            raise
+
+        self._egress_layers = layers
+        logger.info(
+            "[PegaKVConnector] Registered %d KV cache layer(s) for P/D egress "
+            "(unique_mrs=%d)",
+            len(layers),
+            len(registered_ptrs),
+        )
+
+    def _unregister_egress_layers(self) -> None:
+        if self._kv_egress is None or not self._egress_layers:
+            self._egress_layers.clear()
+            return
+
+        ptrs = {registration.base_ptr for registration in self._egress_layers.values()}
+        for ptr in ptrs:
+            try:
+                self._kv_egress._unregister_memory(ptr)
+            except Exception as e:
+                logger.warning(
+                    "[PegaKVConnector] Failed to unregister P/D egress MR ptr=%#x: %s",
+                    ptr,
+                    e,
+                )
+        self._egress_layers.clear()
+
+    def _egress_requester_id(self) -> str:
+        return (
+            f"{self._ctx.instance_id}:device{self._ctx.device_id}:"
+            f"tp{self._ctx.effective_tp_rank}"
+        )
 
     def handle_preemptions(self, preempted_req_ids: set[str] | None) -> None:
         """Wait for preempted requests' saves to complete before blocks are reused.
@@ -675,6 +825,11 @@ class WorkerConnector:
             if self._stats.is_empty():
                 return None
             return self._stats.clone_and_reset()
+
+
+def _tensor_storage_nbytes(tensor: torch.Tensor) -> int:
+    storage = tensor.untyped_storage()
+    return int(storage.nbytes())
 
 
 __all__ = ["WorkerConnector"]
