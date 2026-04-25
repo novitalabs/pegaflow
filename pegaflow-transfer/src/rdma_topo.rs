@@ -121,6 +121,45 @@ impl SystemTopology {
         &[]
     }
 
+    /// Pick the closest allowed NIC for a GPU.
+    ///
+    /// Prefer a NIC under the same PCIe root as the GPU, then fall back to a
+    /// NIC on the same NUMA node. `allowed_names` is the runtime NIC list, so
+    /// the returned name is always usable by the caller.
+    pub fn closest_allowed_nic_for_gpu(
+        &self,
+        device_id: u32,
+        allowed_names: &[String],
+    ) -> Option<String> {
+        let allowed: BTreeSet<&str> = allowed_names.iter().map(String::as_str).collect();
+        let gpu = self
+            .groups
+            .iter()
+            .flat_map(|group| group.gpus.iter())
+            .find(|gpu| gpu.device_id == device_id)?;
+
+        let gpu_root = get_pcie_path(&gpu.pci_addr).first().cloned();
+        if let Some(gpu_root) = gpu_root {
+            for group in &self.groups {
+                for nic in &group.nics {
+                    if !allowed.contains(nic.name.as_str()) {
+                        continue;
+                    }
+                    if get_pcie_path(&nic.pci_addr).first() == Some(&gpu_root) {
+                        return Some(nic.name.clone());
+                    }
+                }
+            }
+        }
+
+        for nic in self.nics_for_gpu(device_id) {
+            if allowed.contains(nic.name.as_str()) {
+                return Some(nic.name.clone());
+            }
+        }
+        None
+    }
+
     /// Get all NUMA groups.
     pub fn groups(&self) -> &[NumaGroup] {
         &self.groups

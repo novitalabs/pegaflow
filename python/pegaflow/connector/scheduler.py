@@ -48,6 +48,7 @@ class SchedulerConnector:
         self._prefetch_start_times: dict[str, float] = {}
         self._pd_receive_prepares: dict[tuple[str, str], dict] = {}
         self._pd_receive_prepare_keys_by_req: dict[str, set[tuple[str, str]]] = {}
+        self._pd_egress_submitted: set[str] = set()
 
         # Prefetch tracking (for metrics and bypass decisions)
         self._prefetch_tracker = PrefetchTracker()
@@ -306,8 +307,9 @@ class SchedulerConnector:
                     )
 
         # Track requests with pending saves
+        egress_intents = self._build_egress_intents()
         self._pending_saves.update(save_intents.keys())
-        egress_intents = self._build_egress_intents(save_intents)
+        self._pending_saves.update(egress_intents.keys())
 
         logger.debug(
             "[PegaKVConnector] build_connector_meta: %d loads, %d saves, %d egress "
@@ -412,6 +414,7 @@ class SchedulerConnector:
         self._scheduled_tokens.pop(req_id, None)
         self._next_stored_block_idx.pop(req_id, None)
         self._pending_saves.discard(req_id)
+        self._pd_egress_submitted.discard(req_id)
         for key in self._pd_receive_prepare_keys_by_req.pop(req_id, set()):
             self._pd_receive_prepares.pop(key, None)
 
@@ -490,12 +493,22 @@ class SchedulerConnector:
 
         return None
 
-    def _build_egress_intents(
-        self,
-        save_intents: dict[str, SaveIntent],
-    ) -> dict[str, KvEgressIntent]:
+    def _build_egress_intents(self) -> dict[str, KvEgressIntent]:
         egress_intents: dict[str, KvEgressIntent] = {}
-        for req_id, save_intent in save_intents.items():
+        for req_id, request in list(self._requests.items()):
+            if req_id in self._pd_egress_submitted:
+                continue
+
+            block_hashes = self._block_hashes.get(req_id)
+            if not block_hashes:
+                continue
+
+            allocated = self._allocated_blocks.get(req_id, [])
+            ready_blocks = self._pd_egress_ready_blocks(req_id, len(block_hashes))
+            expected_blocks = len(block_hashes)
+            if ready_blocks < expected_blocks or len(allocated) < expected_blocks:
+                continue
+
             request = self._requests.get(req_id)
             if request is None:
                 continue
@@ -535,12 +548,33 @@ class SchedulerConnector:
                 pd_request_id=pd_request_id,
                 d_pegaflow_addr=d_pegaflow_addr,
                 dst_instance_id=dst_instance_id,
-                block_ids=save_intent.block_ids,
-                block_hashes=save_intent.block_hashes,
+                block_ids=tuple(allocated[:expected_blocks]),
+                block_hashes=tuple(block_hashes[:expected_blocks]),
                 handle=handle or None,
+            )
+            self._pd_egress_submitted.add(req_id)
+            logger.info(
+                "[PegaKVConnector] req=%s P/D egress intent ready: "
+                "pd_request_id=%s blocks=%d ready_blocks=%d",
+                req_id,
+                pd_request_id,
+                expected_blocks,
+                ready_blocks,
             )
 
         return egress_intents
+
+    def _pd_egress_ready_blocks(self, req_id: str, total_blocks: int) -> int:
+        external_blocks = self._external_matched_blocks.get(req_id, 0)
+        allocated = self._allocated_blocks.get(req_id, [])
+        scheduled = self._scheduled_tokens.get(req_id, 0)
+        base_block_idx = self._block_index_offsets.get(req_id, 0)
+        local_ready = min(
+            len(allocated),
+            scheduled // self._ctx.virtual_block_size,
+        )
+        ready = max(external_blocks, base_block_idx + local_ready)
+        return min(total_blocks, ready)
 
     def _prepare_pd_receive(
         self,

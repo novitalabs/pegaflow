@@ -176,6 +176,11 @@ impl TransferEngine {
         self.backend.invalidate_connection(remote_addr);
     }
 
+    /// Return the runtime NIC index closest to a CUDA GPU, if topology is known.
+    pub fn preferred_nic_index_for_gpu(&self, device_id: u32) -> Option<usize> {
+        self.backend.preferred_nic_index_for_gpu(device_id)
+    }
+
     /// Submit a batch of RDMA READ or WRITE operations against a connected peer.
     ///
     /// Ops are NUMA-aware distributed across NICs. Returns one receiver per
@@ -190,6 +195,29 @@ impl TransferEngine {
         descs: &[TransferDesc],
     ) -> Result<Vec<mea::oneshot::Receiver<Result<usize>>>> {
         self.backend.batch_transfer_async(op, remote_addr, descs)
+    }
+
+    /// Submit a batch and keep the NIC index attached to each completion.
+    pub fn batch_transfer_async_with_nic(
+        &self,
+        op: TransferOp,
+        remote_addr: &str,
+        descs: &[TransferDesc],
+    ) -> Result<Vec<(usize, mea::oneshot::Receiver<Result<usize>>)>> {
+        self.backend
+            .batch_transfer_async_with_nic(op, remote_addr, descs)
+    }
+
+    /// Submit a batch on one explicit runtime NIC index.
+    pub fn batch_transfer_async_on_nic(
+        &self,
+        op: TransferOp,
+        remote_addr: &str,
+        descs: &[TransferDesc],
+        nic_idx: usize,
+    ) -> Result<mea::oneshot::Receiver<Result<usize>>> {
+        self.backend
+            .batch_transfer_async_on_nic(op, remote_addr, descs, nic_idx)
     }
 
     /// Submit a final RDMA WRITE-with-immediate signal against every QP for a

@@ -22,6 +22,7 @@ import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -33,15 +34,49 @@ from pathlib import Path
 DEFAULT_SMOKE_PROMPT = " ".join(["PegaFlow validation prompt with repeated cache blocks."] * 180)
 
 
+def _default_host() -> str:
+    env_host = os.environ.get("PEGAFLOW_PD_HOST")
+    if env_host:
+        return env_host
+
+    candidates: list[str] = []
+    try:
+        infos = socket.getaddrinfo(socket.gethostname(), None, family=socket.AF_INET)
+        candidates.extend(info[4][0] for info in infos)
+    except OSError:
+        pass
+
+    try:
+        output = subprocess.check_output(["hostname", "-I"], text=True, timeout=2)
+        candidates.extend(output.split())
+    except Exception:
+        pass
+
+    seen: set[str] = set()
+    filtered = []
+    for candidate in candidates:
+        if candidate in seen or candidate.startswith("127."):
+            continue
+        seen.add(candidate)
+        filtered.append(candidate)
+
+    for candidate in filtered:
+        if candidate.startswith("10."):
+            return candidate
+    if filtered:
+        return filtered[0]
+    return "127.0.0.1"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="/data/models/Qwen/Qwen3-8b")
     parser.add_argument("--served-model-name", default="pd-test")
     parser.add_argument("--tp", type=int, default=4)
-    parser.add_argument("--p-gpus", default="0,1,2,3")
-    parser.add_argument("--d-gpus", default="4,5,6,7")
+    parser.add_argument("--p-gpus", default="0,2,4,6")
+    parser.add_argument("--d-gpus", default="1,3,5,7")
     parser.add_argument("--nics", default="mlx5_1,mlx5_2,mlx5_3,mlx5_4")
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--host", default=_default_host())
     parser.add_argument("--router-port", type=int, default=8000)
     parser.add_argument("--p-vllm-port", type=int, default=8100)
     parser.add_argument("--d-vllm-port", type=int, default=8200)
@@ -57,8 +92,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-dir", default="examples/pd_push_logs")
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--no-smoke", action="store_true")
+    parser.add_argument("--exit-after-smoke", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--prompt", default=DEFAULT_SMOKE_PROMPT)
+    parser.add_argument("--smoke-count", type=int, default=1)
     parser.add_argument("--max-tokens", type=int, default=64)
     return parser.parse_args()
 
@@ -354,9 +391,13 @@ def main() -> int:
                 "temperature": 0,
                 "stream": False,
             }
-            print(f"smoke request -> {router_url}/v1/completions")
-            result = post_json(f"{router_url}/v1/completions", payload)
-            print(json.dumps(result, ensure_ascii=False, indent=2)[:4000])
+            for idx in range(args.smoke_count):
+                print(f"smoke request {idx + 1}/{args.smoke_count} -> {router_url}/v1/completions")
+                result = post_json(f"{router_url}/v1/completions", payload)
+                print(json.dumps(result, ensure_ascii=False, indent=2)[:4000])
+            if args.exit_after_smoke:
+                cleanup()
+                return 0
 
         print(f"running; logs: {log_dir}")
         while True:

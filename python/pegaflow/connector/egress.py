@@ -35,6 +35,28 @@ class EgressLayerRegistration:
     segments: int
 
 
+@dataclass(frozen=True)
+class KvEgressStats:
+    bytes_written: int
+    write_descs: int
+    coalesced_write_descs: int
+    descriptor_ms: float
+    connect_ms: float
+    build_desc_ms: float
+    rdma_write_ms: float
+    imm_ms: float
+    total_ms: float
+    write_nics_active: int
+    imm_nics_active: int
+    preferred_nic_idx: int | None
+
+    @property
+    def rdma_write_gbps(self) -> float:
+        if self.rdma_write_ms <= 0:
+            return 0.0
+        return (self.bytes_written * 8) / (self.rdma_write_ms / 1000.0) / 1e9
+
+
 def resolve_kv_egress_config() -> KvEgressConfig:
     enabled = _truthy_env("PEGAFLOW_KV_EGRESS")
     nic_names = (
@@ -76,16 +98,55 @@ def execute_kv_egress(
     layers: dict[str, EgressLayerRegistration],
     requester_id: str,
     receive_rank: int,
-) -> int:
+    preferred_nic_idx: int | None,
+) -> KvEgressStats:
+    total_start = time.perf_counter()
     client = _engine_client(intent.d_pegaflow_addr)
+    descriptor_start = time.perf_counter()
     descriptor = _wait_for_descriptor(intent, client, receive_rank)
+    descriptor_ms = _elapsed_ms(descriptor_start)
     remote_addr = _transfer_peer_key(intent.d_pegaflow_addr)
 
+    connect_start = time.perf_counter()
     runtime._ensure_connected(remote_addr, requester_id, client)
+    connect_ms = _elapsed_ms(connect_start)
+
+    build_start = time.perf_counter()
     descs = _build_write_descs(intent, descriptor, layers, receive_rank)
-    bytes_written = runtime._write_registered(remote_addr, descs)
-    runtime._write_imm(remote_addr, int(descriptor["imm_data"]))
-    return int(bytes_written)
+    write_descs = len(descs)
+    descs = _coalesce_adjacent_descs(descs)
+    coalesced_write_descs = len(descs)
+    build_desc_ms = _elapsed_ms(build_start)
+
+    write_start = time.perf_counter()
+    if preferred_nic_idx is None:
+        bytes_written, write_nics_active = runtime._write_registered(remote_addr, descs)
+    else:
+        bytes_written, write_nics_active = runtime._write_registered_on_nic(
+            remote_addr, descs, int(preferred_nic_idx)
+        )
+    rdma_write_ms = _elapsed_ms(write_start)
+
+    imm_start = time.perf_counter()
+    _, imm_nics_active = runtime._write_imm(remote_addr, int(descriptor["imm_data"]))
+    imm_ms = _elapsed_ms(imm_start)
+
+    return KvEgressStats(
+        bytes_written=int(bytes_written),
+        write_descs=write_descs,
+        coalesced_write_descs=coalesced_write_descs,
+        descriptor_ms=descriptor_ms,
+        connect_ms=connect_ms,
+        build_desc_ms=build_desc_ms,
+        rdma_write_ms=rdma_write_ms,
+        imm_ms=imm_ms,
+        total_ms=_elapsed_ms(total_start),
+        write_nics_active=int(write_nics_active),
+        imm_nics_active=int(imm_nics_active),
+        preferred_nic_idx=(
+            int(preferred_nic_idx) if preferred_nic_idx is not None else None
+        ),
+    )
 
 
 def _wait_for_descriptor(intent: KvEgressIntent, client, receive_rank: int) -> dict:
@@ -207,6 +268,27 @@ def _build_write_descs(
     return descs
 
 
+def _coalesce_adjacent_descs(descs: list[tuple[int, int, int]]) -> list[tuple[int, int, int]]:
+    if len(descs) <= 1:
+        return descs
+
+    max_len = (1 << 32) - 1
+    merged: list[tuple[int, int, int]] = []
+    cur_local, cur_remote, cur_len = descs[0]
+    for local_ptr, remote_ptr, length in descs[1:]:
+        if (
+            cur_len + length <= max_len
+            and cur_local + cur_len == local_ptr
+            and cur_remote + cur_len == remote_ptr
+        ):
+            cur_len += length
+            continue
+        merged.append((cur_local, cur_remote, cur_len))
+        cur_local, cur_remote, cur_len = local_ptr, remote_ptr, length
+    merged.append((cur_local, cur_remote, cur_len))
+    return merged
+
+
 def _local_segment_ptr(
     layer: EgressLayerRegistration,
     block_id: int,
@@ -247,6 +329,10 @@ def _env_float(name: str, default: float) -> float:
     return max(0.001, parsed)
 
 
+def _elapsed_ms(start: float) -> float:
+    return (time.perf_counter() - start) * 1000.0
+
+
 def _parse_env_list(name: str) -> tuple[str, ...]:
     value = os.environ.get(name, "")
     return tuple(part.strip() for part in value.split(",") if part.strip())
@@ -259,6 +345,7 @@ def _truthy_env(*names: str) -> bool:
 __all__ = [
     "EgressLayerRegistration",
     "KvEgressConfig",
+    "KvEgressStats",
     "create_kv_egress_runtime",
     "execute_kv_egress",
     "resolve_kv_egress_config",
