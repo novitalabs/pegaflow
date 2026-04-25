@@ -99,6 +99,7 @@ class WorkerConnector:
         self._cross_layer_mode = False
         self._cross_layer_key = _CROSS_LAYER_KEY
         self._kv_egress = create_kv_egress_runtime()
+        self._egress_preferred_nic_idx = self._resolve_preferred_egress_nic()
         self._egress_layers: dict[str, EgressLayerRegistration] = {}
 
         self._finished_requests: set[str] = set()
@@ -681,6 +682,7 @@ class WorkerConnector:
                 torch.cuda.synchronize(self._torch_device)
 
         if egress_items:
+            self._wait_for_egress_source_loads([req_id for req_id, _ in egress_items])
             self._process_egress_batch(egress_items)
 
         if saves_by_layer:
@@ -747,12 +749,13 @@ class WorkerConnector:
                 continue
             start = time.perf_counter()
             try:
-                bytes_written = execute_kv_egress(
+                egress_stats = execute_kv_egress(
                     self._kv_egress,
                     intent,
                     self._egress_layers,
                     requester_id,
                     self._ctx.effective_tp_rank,
+                    self._egress_preferred_nic_idx,
                 )
             except Exception as e:
                 logger.error(
@@ -769,15 +772,82 @@ class WorkerConnector:
             elapsed_ms = (time.perf_counter() - start) * 1000
             logger.info(
                 "[PegaKVConnector] P/D egress completed: req=%s pd_request_id=%s "
-                "dst=%s layers=%d blocks=%d bytes=%d elapsed_ms=%.2f",
+                "dst=%s layers=%d blocks=%d bytes=%d elapsed_ms=%.2f "
+                "descs=%d coalesced_descs=%d descriptor_ms=%.2f "
+                "connect_ms=%.2f build_desc_ms=%.2f "
+                "rdma_write_ms=%.2f rdma_write_gbps=%.2f write_nics=%d "
+                "preferred_nic_idx=%s imm_ms=%.2f imm_nics=%d total_inner_ms=%.2f",
                 req_id,
                 intent.pd_request_id,
                 intent.d_pegaflow_addr,
                 len(self._egress_layers),
                 len(intent.block_ids),
-                bytes_written,
+                egress_stats.bytes_written,
                 elapsed_ms,
+                egress_stats.write_descs,
+                egress_stats.coalesced_write_descs,
+                egress_stats.descriptor_ms,
+                egress_stats.connect_ms,
+                egress_stats.build_desc_ms,
+                egress_stats.rdma_write_ms,
+                egress_stats.rdma_write_gbps,
+                egress_stats.write_nics_active,
+                (
+                    egress_stats.preferred_nic_idx
+                    if egress_stats.preferred_nic_idx is not None
+                    else "auto-fallback"
+                ),
+                egress_stats.imm_ms,
+                egress_stats.imm_nics_active,
+                egress_stats.total_ms,
             )
+
+    def _resolve_preferred_egress_nic(self) -> int | None:
+        if self._kv_egress is None:
+            return None
+        if self._ctx.device_id is None or self._ctx.device_id < 0:
+            return None
+        try:
+            preferred = self._kv_egress._preferred_nic_for_gpu(int(self._ctx.device_id))
+        except Exception as e:
+            logger.warning(
+                "[PegaKVConnector] Failed to resolve preferred P/D egress NIC for "
+                "device=%s: %s",
+                self._ctx.device_id,
+                e,
+            )
+            return None
+        logger.info(
+            "[PegaKVConnector] Preferred P/D egress NIC: device=%s nic_idx=%s",
+            self._ctx.device_id,
+            preferred if preferred is not None else "auto-fallback",
+        )
+        return int(preferred) if preferred is not None else None
+
+    def _wait_for_egress_source_loads(self, request_ids: list[str]) -> None:
+        deadline = time.perf_counter() + self.LOAD_TIMEOUT_SECONDS
+        pending = set(request_ids)
+        while pending:
+            with self._load_completion_lock:
+                states = {
+                    req_id: self._pending_loads.get(req_id)
+                    for req_id in pending
+                }
+            waiting = {
+                req_id
+                for req_id, state in states.items()
+                if state is not None and not state.is_ready()
+            }
+            if not waiting:
+                return
+            if time.perf_counter() >= deadline:
+                logger.error(
+                    "[PegaKVConnector] timed out waiting for source loads before P/D egress: "
+                    "reqs=%s",
+                    sorted(waiting),
+                )
+                return
+            time.sleep(0.001)
 
     def _complete_save_requests(self, request_ids: list[str]) -> None:
         completed_reqs: list[str] = []

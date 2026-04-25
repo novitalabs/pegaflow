@@ -871,9 +871,9 @@ impl KvEgressRuntime {
         py: Python<'_>,
         remote_addr: String,
         descs: Vec<(usize, usize, usize)>,
-    ) -> PyResult<usize> {
+    ) -> PyResult<(usize, usize)> {
         if descs.is_empty() {
-            return Ok(0);
+            return Ok((0, 0));
         }
         for (_, _, len) in &descs {
             if *len == 0 {
@@ -896,6 +896,7 @@ impl KvEgressRuntime {
             let receivers = transfer
                 .batch_transfer_async(TransferOp::Write, &remote_addr, &transfer_descs)
                 .map_err(|err| PyRuntimeError::new_err(format!("RDMA write submit: {err}")))?;
+            let nics_active = receivers.len();
             rt_handle.block_on(async move {
                 let mut total = 0usize;
                 for rx in receivers {
@@ -909,20 +910,76 @@ impl KvEgressRuntime {
                         })?;
                     total = total.saturating_add(bytes);
                 }
-                Ok(total)
+                Ok((total, nics_active))
+            })
+        })
+    }
+
+    fn _preferred_nic_for_gpu(&self, device_id: u32) -> Option<usize> {
+        self.transfer.preferred_nic_index_for_gpu(device_id)
+    }
+
+    fn _write_registered_on_nic(
+        &self,
+        py: Python<'_>,
+        remote_addr: String,
+        descs: Vec<(usize, usize, usize)>,
+        nic_idx: usize,
+    ) -> PyResult<(usize, usize)> {
+        if descs.is_empty() {
+            return Ok((0, 0));
+        }
+        for (_, _, len) in &descs {
+            if *len == 0 {
+                return Err(PyRuntimeError::new_err("transfer len must be non-zero"));
+            }
+        }
+
+        let transfer = Arc::clone(&self.transfer);
+        let rt_handle = self.rt_handle.clone();
+        py.detach(move || {
+            let mut transfer_descs = Vec::with_capacity(descs.len());
+            for (local_ptr, remote_ptr, len) in descs {
+                transfer_descs.push(TransferDesc {
+                    local_ptr: non_null_from_usize(local_ptr, "local_ptr")?,
+                    remote_ptr: non_null_from_usize(remote_ptr, "remote_ptr")?,
+                    len,
+                });
+            }
+
+            let rx = transfer
+                .batch_transfer_async_on_nic(
+                    TransferOp::Write,
+                    &remote_addr,
+                    &transfer_descs,
+                    nic_idx,
+                )
+                .map_err(|err| PyRuntimeError::new_err(format!("RDMA write submit: {err}")))?;
+            rt_handle.block_on(async move {
+                let bytes = rx
+                    .await
+                    .map_err(|err| PyRuntimeError::new_err(format!("RDMA write dropped: {err}")))?
+                    .map_err(|err| PyRuntimeError::new_err(format!("RDMA write failed: {err}")))?;
+                Ok((bytes, 1))
             })
         })
     }
 
     /// Send the final RDMA WRITE-with-immediate readiness signal and wait for
     /// local send completions.
-    fn _write_imm(&self, py: Python<'_>, remote_addr: String, imm_data: u32) -> PyResult<usize> {
+    fn _write_imm(
+        &self,
+        py: Python<'_>,
+        remote_addr: String,
+        imm_data: u32,
+    ) -> PyResult<(usize, usize)> {
         let transfer = Arc::clone(&self.transfer);
         let rt_handle = self.rt_handle.clone();
         py.detach(move || {
             let receivers = transfer
                 .write_imm_async(&remote_addr, imm_data)
                 .map_err(|err| PyRuntimeError::new_err(format!("WRITE_WITH_IMM submit: {err}")))?;
+            let nics_active = receivers.len();
             rt_handle.block_on(async move {
                 let mut total = 0usize;
                 for rx in receivers {
@@ -936,7 +993,7 @@ impl KvEgressRuntime {
                         })?;
                     total = total.saturating_add(bytes);
                 }
-                Ok(total)
+                Ok((total, nics_active))
             })
         })
     }
