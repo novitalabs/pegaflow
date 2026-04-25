@@ -4,11 +4,11 @@ use crate::metric::record_rpc_result;
 use crate::proto::engine::engine_server::Engine;
 use crate::proto::engine::{
     GetPdReceiveDescriptorRequest, GetPdReceiveDescriptorResponse, HealthRequest, HealthResponse,
-    LoadRequest, LoadResponse, PdReceiveDescriptorState,
-    PdReceiveLayerLayout as ProtoPdReceiveLayerLayout, PdReceiveRank, PdReceiveSlab, PrefetchState,
-    PreparePdReceiveRequest, PreparePdReceiveResponse, QueryBlocksForTransferRequest,
-    QueryBlocksForTransferResponse, QueryRequest, QueryResponse, RdmaHandshakeRequest,
-    RdmaHandshakeResponse, RegisterContextRequest, RegisterContextResponse,
+    LoadPdReceiveRequest, LoadPdReceiveResponse, LoadRequest, LoadResponse,
+    PdReceiveDescriptorState, PdReceiveLayerLayout as ProtoPdReceiveLayerLayout, PdReceiveRank,
+    PdReceiveSlab, PrefetchState, PreparePdReceiveRequest, PreparePdReceiveResponse,
+    QueryBlocksForTransferRequest, QueryBlocksForTransferResponse, QueryRequest, QueryResponse,
+    RdmaHandshakeRequest, RdmaHandshakeResponse, RegisterContextRequest, RegisterContextResponse,
     ReleaseTransferLockRequest, ReleaseTransferLockResponse, ResponseStatus, SaveRequest,
     SaveResponse, SessionEvent, SessionRequest, ShutdownRequest, ShutdownResponse,
     TransferBlockInfo, TransferSlotInfo, UnpinRequest, UnpinResponse, UnregisterRequest,
@@ -452,6 +452,107 @@ impl Engine for GrpcEngineService {
             ),
         }
         record_rpc_result("load", &result, start);
+        result
+    }
+
+    async fn load_pd_receive(
+        &self,
+        request: Request<LoadPdReceiveRequest>,
+    ) -> Result<Response<LoadPdReceiveResponse>, Status> {
+        let start = Instant::now();
+
+        let req = request.into_inner();
+        let layer_count = req.layer_names.len();
+        let block_count = req.block_ids.len();
+        let hash_count = req.block_hashes.len();
+
+        trace_root!("rpc.load_pd_receive", root, || {
+            [
+                ("instance_id", req.instance_id.clone()),
+                ("request_id", req.request_id.clone()),
+                ("layers", layer_count.to_string()),
+                ("blocks", block_count.to_string()),
+            ]
+        });
+
+        let fut = async {
+            let LoadPdReceiveRequest {
+                instance_id,
+                tp_rank,
+                device_id,
+                layer_names,
+                block_ids,
+                block_hashes,
+                load_state_shm,
+                request_id,
+                handle,
+                receive_rank,
+                ..
+            } = req;
+            let tp_rank = Self::usize_from_u32(tp_rank, "tp_rank")?;
+            let receive_rank = if receive_rank < 0 {
+                None
+            } else {
+                Some(usize::try_from(receive_rank).map_err(|_| {
+                    Status::invalid_argument("receive_rank does not fit into usize")
+                })?)
+            };
+            debug!(
+                "RPC [load_pd_receive]: instance_id={} pd_request_id={} tp_rank={} device_id={} receive_rank={:?} layers={} block_ids={} block_hashes={} load_state_shm_len={} handle={}",
+                instance_id,
+                request_id,
+                tp_rank,
+                device_id,
+                receive_rank,
+                layer_count,
+                block_count,
+                hash_count,
+                load_state_shm.len(),
+                handle,
+            );
+            if request_id.is_empty() {
+                return Err(Status::invalid_argument("request_id must not be empty"));
+            }
+            Self::validate_load_request(&block_ids, &block_hashes)?;
+            let layer_refs: Vec<&str> = layer_names.iter().map(|s| s.as_str()).collect();
+
+            self.engine
+                .load_pd_receive_kv_blocks_multi_layer(
+                    &instance_id,
+                    tp_rank,
+                    device_id,
+                    &load_state_shm,
+                    &request_id,
+                    Some(handle.as_str()),
+                    receive_rank,
+                    &layer_refs,
+                    &block_ids,
+                    &block_hashes,
+                )
+                .map_err(Self::map_engine_error)?;
+
+            Ok(Response::new(LoadPdReceiveResponse {
+                status: Some(Self::build_simple_response()),
+            }))
+        };
+
+        let result: Result<Response<LoadPdReceiveResponse>, Status> =
+            trace_in_span!(root, fut).await;
+
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        match &result {
+            Ok(_) => debug!(
+                "RPC [load_pd_receive] completed: ok layers={} blocks={} hashes={} elapsed_ms={:.2}",
+                layer_count, block_count, hash_count, elapsed_ms
+            ),
+            Err(status) => warn!(
+                "RPC [load_pd_receive] failed: code={} message={} elapsed_ms={:.2}",
+                status.code(),
+                status.message(),
+                elapsed_ms
+            ),
+        }
+        record_rpc_result("load_pd_receive", &result, start);
         result
     }
 

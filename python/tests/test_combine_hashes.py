@@ -409,7 +409,7 @@ class TestPdReceivePrepare:
             "h1",
         )
 
-    def test_pd_push_can_allocate_without_full_block_hashes(self):
+    def test_pd_push_prepares_only_complete_hashed_blocks(self):
         ctx = _make_ctx(block_size=16, layer_names=("ALL_LAYERS",))
         ctx.engine_client.prepare_pd_receive.return_value = {
             "ok": True,
@@ -425,11 +425,21 @@ class TestPdReceivePrepare:
 
         assert sc.get_num_new_matched_tokens(req, 0) == (None, False)
 
-        # 24 tokens need two vLLM blocks, but only one full-block hash exists.
-        # D prepare still allocates by count and omits partial hash metadata.
+        # 24 tokens include one complete vLLM block plus a partial tail. Only
+        # the complete block can be pushed; D recomputes the partial tail.
         args = ctx.engine_client.prepare_pd_receive.call_args.args
-        assert args[2] == []
-        assert args[3] == 2
+        assert args[2] == [_hash(0)]
+        assert args[3] == 1
+
+    def test_pd_push_without_complete_block_hashes_bypasses_receive(self):
+        ctx = _make_ctx(block_size=16, layer_names=("ALL_LAYERS",))
+        sc = SchedulerConnector(ctx)
+        req = _make_fake_request("r1", [])
+        req.num_tokens = 15
+        req.kv_transfer_params = {"pegaflow_pd_push": True}
+
+        assert sc.get_num_new_matched_tokens(req, 0) == (0, False)
+        ctx.engine_client.prepare_pd_receive.assert_not_called()
 
     def test_pd_push_returns_external_tokens_after_imm_ready(self):
         ctx = _make_ctx(block_size=16, layer_names=("ALL_LAYERS",))

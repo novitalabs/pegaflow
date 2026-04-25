@@ -164,6 +164,22 @@ class EngineRpcClient:
         """
         ...
 
+    def load_pd_receive(
+        self,
+        instance_id: str,
+        tp_rank: int,
+        device_id: int,
+        load_state_shm: str,
+        layer_names: list[str],
+        block_ids: list[int],
+        block_hashes: list[bytes],
+        request_id: str,
+        handle: str | None = None,
+        receive_rank: int = -1,
+    ) -> tuple[bool, str]:
+        """Load KV blocks from a D-side P/D CPU-staging receive lease."""
+        ...
+
     def query_prefetch(
         self,
         instance_id: str,

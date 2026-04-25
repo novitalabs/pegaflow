@@ -52,13 +52,14 @@ pub use trace::{set_trace_sample_rate, should_sample};
 use std::{
     collections::HashMap,
     fmt,
+    ptr::NonNull,
     sync::{Arc, RwLock},
 };
 
 use log::{debug, info, warn};
 
 use crate::backing::SSD_ALIGNMENT;
-use crate::gpu_worker::{LayerLoadData, LoadBlock, LoadTask};
+use crate::gpu_worker::{LayerLoadData, LoadBlock, LoadBlockSource, LoadTask};
 use crate::metrics::core_metrics;
 use crate::storage::StorageEngine;
 
@@ -95,6 +96,72 @@ impl fmt::Display for EngineError {
             EngineError::TopologyMismatch(msg) => write!(f, "topology mismatch: {msg}"),
         }
     }
+}
+
+fn pd_receive_segment_ptr(
+    slab: &PdReceiveSlabDesc,
+    layout: &PdReceiveLayerLayout,
+    staged_block_idx: usize,
+    segment_idx: usize,
+) -> Result<NonNull<u8>, EngineError> {
+    let block_offset = layout
+        .block_stride
+        .checked_mul(staged_block_idx as u64)
+        .ok_or_else(|| {
+            EngineError::InvalidArgument(format!(
+                "P/D receive block offset overflow for layer {}",
+                layout.layer_name
+            ))
+        })?;
+    let segment_offset = layout
+        .padded_segment_stride
+        .checked_mul(segment_idx as u64)
+        .ok_or_else(|| {
+            EngineError::InvalidArgument(format!(
+                "P/D receive segment offset overflow for layer {}",
+                layout.layer_name
+            ))
+        })?;
+    let offset = layout
+        .layer_offset
+        .checked_add(block_offset)
+        .and_then(|value| value.checked_add(segment_offset))
+        .ok_or_else(|| {
+            EngineError::InvalidArgument(format!(
+                "P/D receive offset overflow for layer {}",
+                layout.layer_name
+            ))
+        })?;
+    let end = offset.checked_add(layout.segment_size).ok_or_else(|| {
+        EngineError::InvalidArgument(format!(
+            "P/D receive segment end overflow for layer {}",
+            layout.layer_name
+        ))
+    })?;
+    if end > slab.size {
+        return Err(EngineError::InvalidArgument(format!(
+            "P/D receive segment out of slab bounds for layer {}: end={} slab_size={}",
+            layout.layer_name, end, slab.size
+        )));
+    }
+    let addr = slab.base_ptr.checked_add(offset).ok_or_else(|| {
+        EngineError::InvalidArgument(format!(
+            "P/D receive pointer overflow for layer {}",
+            layout.layer_name
+        ))
+    })?;
+    let addr = usize::try_from(addr).map_err(|_| {
+        EngineError::InvalidArgument(format!(
+            "P/D receive pointer does not fit usize for layer {}",
+            layout.layer_name
+        ))
+    })?;
+    NonNull::new(addr as *mut u8).ok_or_else(|| {
+        EngineError::InvalidArgument(format!(
+            "P/D receive pointer is null for layer {}",
+            layout.layer_name
+        ))
+    })
 }
 
 impl std::error::Error for EngineError {}
@@ -490,7 +557,10 @@ impl PegaEngine {
                 .filter_map(|(block_id, block_entry)| {
                     let block_idx = usize::try_from(*block_id).ok()?;
                     let block = block_entry.get_slot(slot_id)?.clone();
-                    Some(LoadBlock { block_idx, block })
+                    Some(LoadBlock {
+                        block_idx,
+                        source: LoadBlockSource::Cached(block),
+                    })
                 })
                 .collect();
 
@@ -499,6 +569,7 @@ impl PegaEngine {
                     layer_name: (*layer_name).to_string(),
                     registration,
                     blocks,
+                    _staging_keepalives: Vec::new(),
                 });
             }
         }
@@ -511,6 +582,188 @@ impl PegaEngine {
         }
 
         // Submit to worker pool (fire and forget)
+        gpu.worker_pool().submit_load(LoadTask {
+            layers,
+            load_state_shm: load_state_shm.to_string(),
+        })
+    }
+
+    /// Load KV blocks directly from a P/D CPU-staging receive lease.
+    ///
+    /// This is the D worker-side consume path after the scheduler has observed
+    /// `data_ready=true` and vLLM has allocated destination GPU KV blocks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_pd_receive_kv_blocks_multi_layer(
+        &self,
+        instance_id: &str,
+        tp_rank: usize,
+        device_id: i32,
+        load_state_shm: &str,
+        pd_request_id: &str,
+        handle: Option<&str>,
+        receive_rank: Option<usize>,
+        layer_names: &[&str],
+        block_ids: &[i32],
+        block_hashes: &[Vec<u8>],
+    ) -> Result<(), EngineError> {
+        let load_state = LoadState::attach(load_state_shm)?;
+
+        let result = self.load_pd_receive_kv_blocks_multi_layer_inner(
+            instance_id,
+            tp_rank,
+            device_id,
+            load_state_shm,
+            pd_request_id,
+            handle,
+            receive_rank,
+            layer_names,
+            block_ids,
+            block_hashes,
+        );
+
+        if let Err(ref e) = result {
+            log::error!("load_pd_receive_kv_blocks_multi_layer pre-submit error: {e:?}");
+            load_state.set_error();
+        }
+
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn load_pd_receive_kv_blocks_multi_layer_inner(
+        &self,
+        instance_id: &str,
+        tp_rank: usize,
+        device_id: i32,
+        load_state_shm: &str,
+        pd_request_id: &str,
+        handle: Option<&str>,
+        receive_rank: Option<usize>,
+        layer_names: &[&str],
+        block_ids: &[i32],
+        block_hashes: &[Vec<u8>],
+    ) -> Result<(), EngineError> {
+        if block_ids.is_empty() {
+            LoadState::attach(load_state_shm)?.set_completed();
+            return Ok(());
+        }
+        if !block_hashes.is_empty() && block_hashes.len() != block_ids.len() {
+            return Err(EngineError::InvalidArgument(format!(
+                "block_hashes length {} must match block_ids length {}",
+                block_hashes.len(),
+                block_ids.len()
+            )));
+        }
+
+        let receive_rank = receive_rank.unwrap_or(tp_rank);
+        let instance = self.get_instance(instance_id)?;
+        let gpu = instance
+            .get_gpu(device_id)
+            .ok_or_else(|| EngineError::WorkerMissing(instance_id.to_string(), device_id))?;
+        let load_plan =
+            self.pd_receive
+                .begin_load(instance_id, pd_request_id, receive_rank, handle)?;
+
+        if !load_plan.block_hashes.is_empty()
+            && !block_hashes.is_empty()
+            && load_plan
+                .block_hashes
+                .iter()
+                .take(block_hashes.len())
+                .ne(block_hashes.iter())
+        {
+            return Err(EngineError::InvalidArgument(format!(
+                "P/D receive block hashes do not match load request: instance={instance_id} request={pd_request_id}"
+            )));
+        }
+
+        let layers_by_name: HashMap<&str, &pd_receive::PdReceiveLoadLayer> = load_plan
+            .layers
+            .iter()
+            .map(|layer| (layer.layout.layer_name.as_str(), layer))
+            .collect();
+        let mut layers = Vec::with_capacity(layer_names.len());
+
+        for layer_name in layer_names {
+            let receive_layer = layers_by_name.get(layer_name).ok_or_else(|| {
+                EngineError::InvalidArgument(format!(
+                    "P/D receive layer {layer_name} not found: instance={instance_id} request={pd_request_id} receive_rank={receive_rank}"
+                ))
+            })?;
+            let layer_id = instance.get_layer_id(layer_name).ok_or_else(|| {
+                EngineError::InvalidArgument(format!(
+                    "layer {layer_name} unknown for instance {instance_id}"
+                ))
+            })?;
+            let registration = gpu.get_registration(layer_name).ok_or_else(|| {
+                EngineError::InvalidArgument(format!(
+                    "layer {layer_name} not registered on device {device_id}"
+                ))
+            })?;
+            let expected_slot_id = instance.get_slot_index(layer_id, tp_rank)?;
+            let layout = &receive_layer.layout;
+            if layout.slot_id != expected_slot_id {
+                return Err(EngineError::InvalidArgument(format!(
+                    "P/D receive slot mismatch for layer {layer_name}: layout={} expected={expected_slot_id}",
+                    layout.slot_id
+                )));
+            }
+            if layout.segment_count != registration.segments {
+                return Err(EngineError::InvalidArgument(format!(
+                    "P/D receive segment count mismatch for layer {layer_name}: layout={} registration={}",
+                    layout.segment_count, registration.segments
+                )));
+            }
+            if layout.segment_size != registration.bytes_per_block as u64 {
+                return Err(EngineError::InvalidArgument(format!(
+                    "P/D receive segment size mismatch for layer {layer_name}: layout={} registration={}",
+                    layout.segment_size, registration.bytes_per_block
+                )));
+            }
+            if block_ids.len() > layout.num_blocks {
+                return Err(EngineError::InvalidArgument(format!(
+                    "P/D receive layer {layer_name} has {} staged blocks, load requested {}",
+                    layout.num_blocks,
+                    block_ids.len()
+                )));
+            }
+
+            let mut blocks = Vec::with_capacity(block_ids.len());
+            for (staged_block_idx, block_id) in block_ids.iter().enumerate() {
+                let block_idx = usize::try_from(*block_id).map_err(|_| {
+                    EngineError::InvalidArgument(format!(
+                        "block_id {block_id} must be non-negative for P/D receive load"
+                    ))
+                })?;
+                let mut segment_ptrs = Vec::with_capacity(layout.segment_count);
+                for segment_idx in 0..layout.segment_count {
+                    segment_ptrs.push(pd_receive_segment_ptr(
+                        &receive_layer.slab,
+                        layout,
+                        staged_block_idx,
+                        segment_idx,
+                    )?);
+                }
+                blocks.push(LoadBlock {
+                    block_idx,
+                    source: LoadBlockSource::Staged { segment_ptrs },
+                });
+            }
+
+            layers.push(LayerLoadData {
+                layer_name: (*layer_name).to_string(),
+                registration,
+                blocks,
+                _staging_keepalives: vec![Arc::clone(&receive_layer.allocation)],
+            });
+        }
+
+        if layers.is_empty() {
+            debug!("No P/D receive blocks to load, completing immediately");
+            LoadState::attach(load_state_shm)?.set_completed();
+            return Ok(());
+        }
+
         gpu.worker_pool().submit_load(LoadTask {
             layers,
             load_state_shm: load_state_shm.to_string(),
