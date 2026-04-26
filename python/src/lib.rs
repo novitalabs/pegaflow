@@ -1,9 +1,10 @@
 use pegaflow_core::LoadState;
 use pegaflow_proto::proto::engine::{
-    GetPdReceiveDescriptorRequest, HealthRequest, LoadPdReceiveRequest, LoadRequest,
-    PdReceiveDescriptorState, PreparePdReceiveRequest, QueryRequest, RdmaHandshakeRequest,
-    RegisterContextRequest, ResponseStatus, SaveLayer, SaveRequest, SessionEvent, SessionRequest,
-    ShutdownRequest, UnpinRequest, UnregisterRequest, engine_client::EngineClient,
+    GetPdReceiveDescriptorRequest, HealthRequest, LoadPdReceiveItem, LoadPdReceiveRequest,
+    LoadRequest, PdReceiveDescriptorState, PreparePdReceiveRequest, QueryRequest,
+    RdmaHandshakeRequest, RegisterContextRequest, ResponseStatus, SaveLayer, SaveRequest,
+    SessionEvent, SessionRequest, ShutdownRequest, UnpinRequest, UnregisterRequest,
+    engine_client::EngineClient,
 };
 use pegaflow_transfer::{
     ConnectionStatus, HandshakeMetadata, MemoryRegion, TransferDesc, TransferEngine, TransferOp,
@@ -114,7 +115,262 @@ fn non_null_from_usize(ptr: usize, field: &str) -> PyResult<NonNull<u8>> {
         .ok_or_else(|| PyRuntimeError::new_err(format!("{field} must not be null")))
 }
 
-#[pyclass]
+struct NativeLoadPlan {
+    request_id: String,
+    source: &'static str,
+    num_tokens: u64,
+    num_blocks: usize,
+    block_hashes: Vec<Vec<u8>>,
+    token: Option<String>,
+}
+
+enum NativePrepareLoadResult {
+    Preparing,
+    Done(Option<NativeLoadPlan>),
+    BusinessError(String),
+    RuntimeError(String),
+}
+
+fn prepare_status_error(
+    operation: &str,
+    status: Option<ResponseStatus>,
+) -> Option<NativePrepareLoadResult> {
+    let Some(status) = status else {
+        return Some(NativePrepareLoadResult::RuntimeError(format!(
+            "{operation} response missing status"
+        )));
+    };
+    if !status.ok {
+        return Some(NativePrepareLoadResult::BusinessError(format!(
+            "{operation} failed: {}",
+            status.message
+        )));
+    }
+    None
+}
+
+fn u64_to_usize_prepare(value: u64, field: &str) -> Result<usize, NativePrepareLoadResult> {
+    usize::try_from(value).map_err(|_| {
+        NativePrepareLoadResult::RuntimeError(format!("{field}={value} exceeds usize range"))
+    })
+}
+
+fn checked_prepare_tokens(
+    blocks: usize,
+    virtual_block_size: u64,
+) -> Result<u64, NativePrepareLoadResult> {
+    let blocks = u64::try_from(blocks).map_err(|_| {
+        NativePrepareLoadResult::RuntimeError(format!("{blocks} blocks exceeds u64 range"))
+    })?;
+    blocks.checked_mul(virtual_block_size).ok_or_else(|| {
+        NativePrepareLoadResult::RuntimeError(format!(
+            "load token count overflows: blocks={blocks} virtual_block_size={virtual_block_size}"
+        ))
+    })
+}
+
+fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
+    if value == 0 {
+        0
+    } else {
+        ((value - 1) / divisor) + 1
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_load_inner(
+    client: &mut EngineClient<Channel>,
+    instance_id: String,
+    request_id: String,
+    block_hashes: Vec<Vec<u8>>,
+    num_prompt_tokens: u64,
+    num_computed_tokens: u64,
+    virtual_block_size: u64,
+    decode_request_id: Option<String>,
+    decode_expected_writes: u32,
+) -> Result<NativePrepareLoadResult, GrpcStatus> {
+    use pegaflow_proto::proto::engine::PrefetchState;
+
+    if virtual_block_size == 0 {
+        return Ok(NativePrepareLoadResult::RuntimeError(
+            "virtual_block_size must be greater than zero".to_string(),
+        ));
+    }
+
+    let computed_blocks =
+        match u64_to_usize_prepare(num_computed_tokens / virtual_block_size, "computed_blocks") {
+            Ok(value) => value,
+            Err(result) => return Ok(result),
+        };
+
+    let decode_request_id = decode_request_id.filter(|value| !value.is_empty());
+    if let Some(decode_request_id) = decode_request_id {
+        let num_external_tokens =
+            num_prompt_tokens.saturating_sub(num_computed_tokens.saturating_add(1));
+        let num_blocks_u64 = ceil_div_u64(num_external_tokens, virtual_block_size);
+        if num_external_tokens == 0 || num_blocks_u64 == 0 {
+            return Ok(NativePrepareLoadResult::Done(None));
+        }
+
+        let num_blocks = match u64_to_usize_prepare(num_blocks_u64, "num_blocks") {
+            Ok(value) => value,
+            Err(result) => return Ok(result),
+        };
+        let hash_start = computed_blocks.min(block_hashes.len());
+        let hash_end = hash_start
+            .saturating_add(num_blocks)
+            .min(block_hashes.len());
+        let staged_hashes = block_hashes[hash_start..hash_end].to_vec();
+
+        let prepare = client
+            .prepare_pd_receive(PreparePdReceiveRequest {
+                instance_id: instance_id.clone(),
+                request_id: decode_request_id.clone(),
+                block_hashes: staged_hashes.clone(),
+                num_blocks: num_blocks_u64,
+                expected_imm_count: decode_expected_writes,
+                expire_after_ms: 0,
+            })
+            .await?
+            .into_inner();
+        if let Some(error) = prepare_status_error("prepare_load", prepare.status) {
+            return Ok(error);
+        }
+
+        let descriptor = client
+            .get_pd_receive_descriptor(GetPdReceiveDescriptorRequest {
+                dst_instance_id: instance_id,
+                request_id: decode_request_id.clone(),
+                receive_rank: -1,
+                handle: prepare.handle.clone(),
+            })
+            .await?
+            .into_inner();
+        if let Some(error) = prepare_status_error("prepare_load", descriptor.status) {
+            return Ok(error);
+        }
+
+        let state = PdReceiveDescriptorState::try_from(descriptor.state)
+            .unwrap_or(PdReceiveDescriptorState::PdDescriptorPending);
+        return match state {
+            PdReceiveDescriptorState::PdDescriptorReady if descriptor.data_ready => {
+                Ok(NativePrepareLoadResult::Done(Some(NativeLoadPlan {
+                    request_id: decode_request_id,
+                    source: "staged",
+                    num_tokens: num_external_tokens,
+                    num_blocks,
+                    block_hashes: staged_hashes,
+                    token: Some(if descriptor.handle.is_empty() {
+                        prepare.handle
+                    } else {
+                        descriptor.handle
+                    }),
+                })))
+            }
+            PdReceiveDescriptorState::PdDescriptorFailed
+            | PdReceiveDescriptorState::PdDescriptorExpired => {
+                Ok(NativePrepareLoadResult::Done(None))
+            }
+            _ => Ok(NativePrepareLoadResult::Preparing),
+        };
+    }
+
+    let remaining_hashes = if computed_blocks >= block_hashes.len() {
+        Vec::new()
+    } else {
+        block_hashes[computed_blocks..].to_vec()
+    };
+    if remaining_hashes.is_empty() {
+        return Ok(NativePrepareLoadResult::Done(None));
+    }
+
+    let query = client
+        .query_prefetch(QueryRequest {
+            instance_id,
+            block_hashes: remaining_hashes.clone(),
+            req_id: request_id.clone(),
+        })
+        .await?
+        .into_inner();
+    if let Some(error) = prepare_status_error("prepare_load", query.status) {
+        return Ok(error);
+    }
+
+    let state =
+        PrefetchState::try_from(query.prefetch_state).unwrap_or(PrefetchState::PrefetchDone);
+    if state == PrefetchState::PrefetchLoading {
+        return Ok(NativePrepareLoadResult::Preparing);
+    }
+
+    let hit_blocks = match u64_to_usize_prepare(query.hit_blocks, "hit_blocks") {
+        Ok(value) => value.min(remaining_hashes.len()),
+        Err(result) => return Ok(result),
+    };
+    if hit_blocks == 0 {
+        return Ok(NativePrepareLoadResult::Done(None));
+    }
+
+    let num_tokens = match checked_prepare_tokens(hit_blocks, virtual_block_size) {
+        Ok(value) => value,
+        Err(result) => return Ok(result),
+    };
+
+    Ok(NativePrepareLoadResult::Done(Some(NativeLoadPlan {
+        request_id,
+        source: "cache",
+        num_tokens,
+        num_blocks: hit_blocks,
+        block_hashes: remaining_hashes.into_iter().take(hit_blocks).collect(),
+        token: None,
+    })))
+}
+
+fn prepare_load_result_to_py(result: NativePrepareLoadResult) -> PyResult<Py<pyo3::types::PyAny>> {
+    match result {
+        NativePrepareLoadResult::BusinessError(message) => {
+            Err(PegaFlowBusinessError::new_err(message))
+        }
+        NativePrepareLoadResult::RuntimeError(message) => Err(PyRuntimeError::new_err(message)),
+        NativePrepareLoadResult::Preparing => Python::attach(|py| {
+            use pyo3::types::PyDict;
+
+            let dict = PyDict::new(py);
+            dict.set_item("preparing", true)?;
+            dict.set_item("plan", py.None())?;
+            Ok(dict.into())
+        }),
+        NativePrepareLoadResult::Done(plan) => Python::attach(|py| {
+            use pyo3::types::{PyBytes, PyDict, PyList};
+
+            let dict = PyDict::new(py);
+            dict.set_item("preparing", false)?;
+            if let Some(plan) = plan {
+                let plan_dict = PyDict::new(py);
+                plan_dict.set_item("request_id", plan.request_id)?;
+                plan_dict.set_item("source", plan.source)?;
+                plan_dict.set_item("num_tokens", plan.num_tokens)?;
+                plan_dict.set_item("num_blocks", plan.num_blocks)?;
+                if let Some(token) = plan.token {
+                    plan_dict.set_item("token", token)?;
+                } else {
+                    plan_dict.set_item("token", py.None())?;
+                }
+
+                let hashes = PyList::empty(py);
+                for hash in plan.block_hashes {
+                    hashes.append(PyBytes::new(py, &hash))?;
+                }
+                plan_dict.set_item("block_hashes", hashes)?;
+                dict.set_item("plan", plan_dict)?;
+            } else {
+                dict.set_item("plan", py.None())?;
+            }
+            Ok(dict.into())
+        }),
+    }
+}
+
+#[pyclass(name = "_NativeEngineClient")]
 struct EngineRpcClient {
     endpoint: String,
     client: EngineClient<Channel>,
@@ -342,11 +598,9 @@ impl EngineRpcClient {
         .and_then(|r| status_tuple("load", r.status))
     }
 
-    /// Load KV blocks from a D-side P/D CPU-staging receive lease.
-    ///
-    /// Args are the normal load destination plus P/D rendezvous identity.
+    /// Load KV blocks from D-side P/D CPU-staging receive leases.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (instance_id, tp_rank, device_id, load_state_shm, layer_names, block_ids, block_hashes, request_id, handle = None, receive_rank = -1))]
+    #[pyo3(signature = (instance_id, tp_rank, device_id, load_state_shm, layer_names, items, receive_rank = -1))]
     fn load_pd_receive(
         &self,
         py: Python<'_>,
@@ -355,12 +609,17 @@ impl EngineRpcClient {
         device_id: i32,
         load_state_shm: String,
         layer_names: Vec<String>,
-        block_ids: Vec<i32>,
-        block_hashes: Vec<Vec<u8>>,
-        request_id: String,
-        handle: Option<String>,
+        items: Vec<(String, String, Vec<i32>)>,
         receive_rank: i32,
     ) -> PyResult<(bool, String)> {
+        let items = items
+            .into_iter()
+            .map(|(request_id, handle, block_ids)| LoadPdReceiveItem {
+                request_id,
+                handle,
+                block_ids,
+            })
+            .collect();
         self.call(py, "load_pd_receive", |mut c| async move {
             let resp = c
                 .load_pd_receive(LoadPdReceiveRequest {
@@ -369,11 +628,8 @@ impl EngineRpcClient {
                     device_id,
                     load_state_shm,
                     layer_names,
-                    block_ids,
-                    block_hashes,
-                    request_id,
-                    handle: handle.unwrap_or_default(),
                     receive_rank,
+                    items,
                 })
                 .await?;
             Ok(resp.into_inner())
@@ -440,6 +696,42 @@ impl EngineRpcClient {
                 Ok(dict.into())
             })
         })
+    }
+
+    /// Prepare scheduler-side external KV loading.
+    ///
+    /// Returns a dict with:
+    ///     - preparing: bool
+    ///     - plan: None or a terminal load plan dict
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (instance_id, request_id, block_hashes, num_prompt_tokens, num_computed_tokens, virtual_block_size, decode_request_id = None, decode_expected_writes = 0))]
+    fn prepare_load(
+        &self,
+        py: Python<'_>,
+        instance_id: String,
+        request_id: String,
+        block_hashes: Vec<Vec<u8>>,
+        num_prompt_tokens: u64,
+        num_computed_tokens: u64,
+        virtual_block_size: u64,
+        decode_request_id: Option<String>,
+        decode_expected_writes: u32,
+    ) -> PyResult<Py<pyo3::types::PyAny>> {
+        self.call(py, "prepare_load", |mut c| async move {
+            prepare_load_inner(
+                &mut c,
+                instance_id,
+                request_id,
+                block_hashes,
+                num_prompt_tokens,
+                num_computed_tokens,
+                virtual_block_size,
+                decode_request_id,
+                decode_expected_writes,
+            )
+            .await
+        })
+        .and_then(prepare_load_result_to_py)
     }
 
     /// Prepare a D-side CPU-staging lease for P/D push.
@@ -699,7 +991,7 @@ impl EngineRpcClient {
 /// - 0: pending (load in progress)
 /// - 1: success (all transfers complete)
 /// - <0: error (transfer failed)
-#[pyclass]
+#[pyclass(name = "_NativeLoadState")]
 struct PyLoadState {
     inner: Arc<LoadState>,
 }

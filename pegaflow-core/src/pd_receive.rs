@@ -74,7 +74,13 @@ pub struct PdReceiveDescriptor {
 
 pub(crate) struct PdReceiveLoadPlan {
     pub layers: Vec<PdReceiveLoadLayer>,
-    pub block_hashes: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PdReceiveLoadItem {
+    pub request_id: String,
+    pub handle: Option<String>,
+    pub block_ids: Vec<i32>,
 }
 
 pub(crate) struct PdReceiveLoadLayer {
@@ -113,7 +119,7 @@ pub(crate) struct PdReceiveLayerPlan {
 
 struct PdReceiveSlab {
     desc: PdReceiveSlabDesc,
-    _allocation: Arc<PinnedAllocation>,
+    allocation: Option<Arc<PinnedAllocation>>,
 }
 
 #[allow(dead_code)]
@@ -156,7 +162,9 @@ impl PdReceiveLease {
                 .ranks
                 .iter()
                 .find(|rank| rank.receive_rank == receive_rank)?;
-            let slab = self.slabs.get(rank.slab_index)?.desc.clone();
+            let slab = self.slabs.get(rank.slab_index)?;
+            slab.allocation.as_ref()?;
+            let slab = slab.desc.clone();
             let mut rank = rank.clone();
             rank.slab_index = 0;
             let layers = self
@@ -281,7 +289,7 @@ impl PdReceiveManager {
                 .into_iter()
                 .map(|(desc, allocation)| PdReceiveSlab {
                     desc,
-                    _allocation: allocation,
+                    allocation: Some(allocation),
                 })
                 .collect(),
             layers: input.layers,
@@ -428,6 +436,11 @@ impl PdReceiveManager {
                 rank.slab_index
             ))
         })?;
+        let allocation = slab.allocation.as_ref().ok_or_else(|| {
+            EngineError::InvalidArgument(format!(
+                "P/D receive rank {receive_rank} staging slab has already been consumed: instance={dst_instance_id} request={request_id}"
+            ))
+        })?;
         let layers: Vec<PdReceiveLoadLayer> = lease
             .layers
             .iter()
@@ -435,7 +448,7 @@ impl PdReceiveManager {
             .map(|layout| PdReceiveLoadLayer {
                 layout: layout.clone(),
                 slab: slab.desc.clone(),
-                allocation: Arc::clone(&slab._allocation),
+                allocation: Arc::clone(allocation),
             })
             .collect();
         if layers.is_empty() {
@@ -445,10 +458,77 @@ impl PdReceiveManager {
         }
         lease.state = PdReceiveLeaseState::Loading;
 
-        Ok(PdReceiveLoadPlan {
-            layers,
-            block_hashes: lease.block_hashes.clone(),
-        })
+        Ok(PdReceiveLoadPlan { layers })
+    }
+
+    pub(crate) fn release_loaded_rank(
+        &self,
+        dst_instance_id: &str,
+        request_id: &str,
+        receive_rank: usize,
+        handle: Option<&str>,
+    ) -> Result<(), EngineError> {
+        let now = Instant::now();
+        let mut state = self.state.lock();
+        Self::gc_expired_locked(&mut state, now);
+
+        let lease_handle = if let Some(handle) = handle.filter(|h| !h.is_empty()) {
+            handle.to_string()
+        } else {
+            state
+                .by_request
+                .get(&request_key(dst_instance_id, request_id))
+                .cloned()
+                .ok_or_else(|| {
+                    EngineError::InvalidArgument(format!(
+                        "P/D receive lease not found for release: instance={dst_instance_id} request={request_id}"
+                    ))
+                })?
+        };
+
+        let remove_lease = {
+            let Some(lease) = state.by_handle.get_mut(&lease_handle) else {
+                return Err(EngineError::InvalidArgument(format!(
+                    "P/D receive lease handle not found for release: {lease_handle}"
+                )));
+            };
+            if lease.instance_id != dst_instance_id || lease.request_id != request_id {
+                return Err(EngineError::InvalidArgument(format!(
+                    "P/D receive lease identity mismatch for release: handle={lease_handle}"
+                )));
+            }
+            if lease.expires_at <= now {
+                true
+            } else {
+                let slab_index = lease
+                    .ranks
+                    .iter()
+                    .find(|rank| rank.receive_rank == receive_rank)
+                    .map(|rank| rank.slab_index)
+                    .ok_or_else(|| {
+                        EngineError::InvalidArgument(format!(
+                            "P/D receive rank {receive_rank} not found for release: instance={dst_instance_id} request={request_id}"
+                        ))
+                    })?;
+                let slab = lease.slabs.get_mut(slab_index).ok_or_else(|| {
+                    EngineError::InvalidArgument(format!(
+                        "P/D receive rank {receive_rank} references missing slab {slab_index} for release"
+                    ))
+                })?;
+                slab.allocation.take();
+                let all_rank_slabs_released =
+                    lease.slabs.iter().all(|slab| slab.allocation.is_none());
+                if all_rank_slabs_released {
+                    lease.state = PdReceiveLeaseState::Done;
+                }
+                all_rank_slabs_released
+            }
+        };
+
+        if remove_lease {
+            Self::remove_locked(&mut state, &lease_handle);
+        }
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -673,13 +753,13 @@ fn validate_prepare_request(request: &PdReceivePrepareRequest) -> Result<(), Eng
 fn resolved_num_blocks(request: &PdReceivePrepareRequest) -> Result<usize, EngineError> {
     let hash_blocks = request.block_hashes.len();
     if hash_blocks > 0 {
-        if request.num_blocks > 0 && request.num_blocks != hash_blocks {
+        if request.num_blocks > 0 && hash_blocks > request.num_blocks {
             return Err(EngineError::InvalidArgument(format!(
-                "num_blocks {} does not match block_hashes length {}",
+                "num_blocks {} is smaller than block_hashes length {}",
                 request.num_blocks, hash_blocks
             )));
         }
-        return Ok(hash_blocks);
+        return Ok(request.num_blocks.max(hash_blocks));
     }
     if request.num_blocks == 0 {
         return Err(EngineError::InvalidArgument(
@@ -779,7 +859,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_num_blocks_rejects_mismatched_hash_count() {
+    fn resolved_num_blocks_allows_partial_hash_metadata() {
         let request = PdReceivePrepareRequest {
             instance_id: "i".to_string(),
             request_id: "r".to_string(),
@@ -789,7 +869,21 @@ mod tests {
             expire_after: None,
         };
 
+        assert_eq!(resolved_num_blocks(&request).unwrap(), 3);
+    }
+
+    #[test]
+    fn resolved_num_blocks_rejects_hash_count_above_num_blocks() {
+        let request = PdReceivePrepareRequest {
+            instance_id: "i".to_string(),
+            request_id: "r".to_string(),
+            block_hashes: vec![vec![1], vec![2], vec![3]],
+            num_blocks: 2,
+            expected_imm_count: 1,
+            expire_after: None,
+        };
+
         let err = resolved_num_blocks(&request).unwrap_err();
-        assert!(err.to_string().contains("does not match"));
+        assert!(err.to_string().contains("smaller than block_hashes"));
     }
 }

@@ -23,6 +23,14 @@ from pegaflow.connector.common import (
     PegaConnectorMetadata,
 )
 from pegaflow.connector.worker import WorkerConnector
+from pegaflow import LoadPlan, LoadRequest, LoadSourceKind
+
+
+class FakeLoadHandle:
+    def __init__(self, shm_name: str) -> None:
+        self.shm_name = shm_name
+        self.state = 0
+        self.done = False
 
 
 class FakeEngineClient:
@@ -36,23 +44,42 @@ class FakeEngineClient:
         self.fail_load_with_ok_false = False
         self.fail_load_with_exception: Exception | None = None
         self.load_calls: list[tuple] = []
+        self.pd_load_calls: list[tuple] = []
+        self._next_shm = 0
 
-    def load(
-        self,
-        instance_id: str,
-        tp_rank: int,
-        device_id: int,
-        load_state_shm: str,
-        layer_names,
-        block_ids,
-        block_hashes,
-    ) -> tuple[bool, str]:
-        self.load_calls.append((instance_id, tp_rank, device_id, load_state_shm, list(block_ids)))
+    def load(self, request: LoadRequest) -> FakeLoadHandle:
+        block_ids = [int(block_id) for item in request.items for block_id in item.block_ids]
+        if request.receive_rank is None:
+            self.load_calls.append(
+                (
+                    request.instance_id,
+                    request.tp_rank,
+                    request.device_id,
+                    list(request.layer_names),
+                    block_ids,
+                )
+            )
+        else:
+            items = [
+                (item.plan.request_id, item.plan.token or "", list(item.block_ids))
+                for item in request.items
+            ]
+            self.pd_load_calls.append(
+                (
+                    request.instance_id,
+                    request.tp_rank,
+                    request.device_id,
+                    list(request.layer_names),
+                    items,
+                    request.receive_rank,
+                )
+            )
         if self.fail_load_with_exception is not None:
             raise self.fail_load_with_exception
         if self.fail_load_with_ok_false:
-            return (False, "simulated load failure")
-        return (True, "ok")
+            raise RuntimeError("simulated load failure")
+        self._next_shm += 1
+        return FakeLoadHandle(f"fake-shm-{self._next_shm}")
 
     def health(self) -> tuple[bool, str]:
         return (True, "ok")
@@ -90,13 +117,49 @@ def _stub_forward_context() -> MagicMock:
 
 
 def _load_metadata(req_id: str, block_ids: tuple[int, ...]) -> PegaConnectorMetadata:
+    block_hashes = tuple(f"h{b}".encode() for b in block_ids)
     return PegaConnectorMetadata(
         load_intents={
             req_id: LoadIntent(
                 block_ids=block_ids,
-                block_hashes=tuple(f"h{b}".encode() for b in block_ids),
+                plan=LoadPlan(
+                    request_id=req_id,
+                    source=LoadSourceKind.CACHE,
+                    num_tokens=len(block_ids) * 16,
+                    num_blocks=len(block_ids),
+                    block_hashes=block_hashes,
+                ),
                 num_tokens=len(block_ids) * 16,
             )
+        }
+    )
+
+
+def _pd_load_metadata() -> PegaConnectorMetadata:
+    return PegaConnectorMetadata(
+        load_intents={
+            "local-a": LoadIntent(
+                block_ids=(10, 11),
+                plan=LoadPlan(
+                    request_id="pd-a",
+                    source=LoadSourceKind.STAGED,
+                    num_tokens=32,
+                    num_blocks=2,
+                    token="h-a",
+                ),
+                num_tokens=32,
+            ),
+            "local-b": LoadIntent(
+                block_ids=(20,),
+                plan=LoadPlan(
+                    request_id="pd-b",
+                    source=LoadSourceKind.STAGED,
+                    num_tokens=16,
+                    num_blocks=1,
+                    token="h-b",
+                ),
+                num_tokens=16,
+            ),
         }
     )
 
@@ -129,6 +192,22 @@ def test_load_rpc_ok_false_reports_failures_without_raise():
     assert worker._pending_loads == {}
     assert worker._pending_load_reqs == {}
     assert worker._pending_load_meta == {}
+
+    worker.shutdown()
+
+
+def test_pd_load_uses_one_batch_rpc_for_multiple_requests():
+    worker, client, _state_mgr = _make_worker()
+
+    worker.start_load_kv(_pd_load_metadata(), _stub_forward_context())
+
+    assert len(client.pd_load_calls) == 1
+    _instance, _tp_rank, _device, _layers, items, receive_rank = client.pd_load_calls[0]
+    assert receive_rank == 0
+    assert items == [
+        ("pd-a", "h-a", [10, 11]),
+        ("pd-b", "h-b", [20]),
+    ]
 
     worker.shutdown()
 

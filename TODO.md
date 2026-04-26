@@ -59,6 +59,35 @@ Status: fixed in the current branch.
 - Verify metaserver advertise paths, router endpoint paths, and D descriptor
   polling all work through the private IP.
 
+## P0: Short Prompt P/D Receive
+
+Status: fixed in the current branch and validated on h20.
+
+Root cause: the first P/D receive path sized D staging from
+`len(request.block_hashes)`. vLLM only creates hashes for complete scheduler
+blocks, so short prompts and partial tail blocks can have fewer hashes than the
+KV blocks that still need to be transferred.
+
+Fix:
+
+- Size P/D receive from token count, matching vLLM P2P remote-prefill behavior:
+  transfer `prompt_tokens - 1 - local_hit_tokens`.
+- Allocate `ceil(tokens_to_transfer / virtual_block_size)` D staging blocks.
+- Treat `block_hashes` as optional prefix metadata; allow the final partial
+  receive block to have no hash.
+- Return the exact external token count to vLLM after IMM is ready, not
+  `num_blocks * block_size`.
+
+Validation:
+
+- Direct TP4 P/D smoke with `hello` completed without crashing. The Qwen3
+  tokenizer maps that prompt to one prompt token, so no external KV transfer is
+  required.
+- Direct TP4 P/D smoke with a 17-token short prompt transferred one receive
+  block and completed normally.
+- Concurrent TP4 P/D smoke hit the new batch load path:
+  `reqs=3 items=3 blocks=213` per D worker rank.
+
 ## P1: Failure And Cleanup
 
 - P writes partial data and dies before IMM.
@@ -90,12 +119,6 @@ First validated path is TP4 == TP4. Later support should cover:
 If D already has part of the prompt KV, P should eventually push only the
 missing block delta. Leave this behind P2P/cache discovery so the router does
 not become a tokenizer or block-manager proxy.
-
-## P3: Ultra-Short Prefill
-
-Short prompts without complete `request.block_hashes` should bypass P/D receive
-and let D compute locally. This is recorded behavior, not something to optimize
-in the first performance pass.
 
 ## P3: Direct GPU Push
 

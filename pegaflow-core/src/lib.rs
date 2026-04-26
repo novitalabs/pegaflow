@@ -39,7 +39,8 @@ pub use instance::{GpuContext, InstanceContext, KVCacheRegistration};
 pub use internode::{DEFAULT_METASERVER_QUEUE_DEPTH, MetaServerClient, MetaServerClientConfig};
 pub use pd_receive::{
     PdReceiveDescriptor, PdReceiveDescriptorLookup, PdReceiveLayerLayout, PdReceiveLeaseState,
-    PdReceivePrepareRequest, PdReceivePrepareResponse, PdReceiveRankDesc, PdReceiveSlabDesc,
+    PdReceiveLoadItem, PdReceivePrepareRequest, PdReceivePrepareResponse, PdReceiveRankDesc,
+    PdReceiveSlabDesc,
 };
 pub use pegaflow_common::NumaNode;
 use pegaflow_common::NumaTopology;
@@ -588,10 +589,11 @@ impl PegaEngine {
         })
     }
 
-    /// Load KV blocks directly from a P/D CPU-staging receive lease.
+    /// Load KV blocks from D-side P/D CPU-staging receive leases.
     ///
-    /// This is the D worker-side consume path after the scheduler has observed
-    /// `data_ready=true` and vLLM has allocated destination GPU KV blocks.
+    /// The scheduler resolves P/D readiness per request, then vLLM allocates
+    /// destination GPU blocks. This worker-side RPC consumes those resolved
+    /// receive handles and submits one H2D task for the whole batch.
     #[allow(clippy::too_many_arguments)]
     pub fn load_pd_receive_kv_blocks_multi_layer(
         &self,
@@ -599,12 +601,9 @@ impl PegaEngine {
         tp_rank: usize,
         device_id: i32,
         load_state_shm: &str,
-        pd_request_id: &str,
-        handle: Option<&str>,
         receive_rank: Option<usize>,
         layer_names: &[&str],
-        block_ids: &[i32],
-        block_hashes: &[Vec<u8>],
+        items: &[PdReceiveLoadItem],
     ) -> Result<(), EngineError> {
         let load_state = LoadState::attach(load_state_shm)?;
 
@@ -613,12 +612,9 @@ impl PegaEngine {
             tp_rank,
             device_id,
             load_state_shm,
-            pd_request_id,
-            handle,
             receive_rank,
             layer_names,
-            block_ids,
-            block_hashes,
+            items,
         );
 
         if let Err(ref e) = result {
@@ -636,23 +632,17 @@ impl PegaEngine {
         tp_rank: usize,
         device_id: i32,
         load_state_shm: &str,
-        pd_request_id: &str,
-        handle: Option<&str>,
         receive_rank: Option<usize>,
         layer_names: &[&str],
-        block_ids: &[i32],
-        block_hashes: &[Vec<u8>],
+        items: &[PdReceiveLoadItem],
     ) -> Result<(), EngineError> {
-        if block_ids.is_empty() {
+        let non_empty_items: Vec<&PdReceiveLoadItem> = items
+            .iter()
+            .filter(|item| !item.block_ids.is_empty())
+            .collect();
+        if non_empty_items.is_empty() {
             LoadState::attach(load_state_shm)?.set_completed();
             return Ok(());
-        }
-        if !block_hashes.is_empty() && block_hashes.len() != block_ids.len() {
-            return Err(EngineError::InvalidArgument(format!(
-                "block_hashes length {} must match block_ids length {}",
-                block_hashes.len(),
-                block_ids.len()
-            )));
         }
 
         let receive_rank = receive_rank.unwrap_or(tp_rank);
@@ -660,36 +650,10 @@ impl PegaEngine {
         let gpu = instance
             .get_gpu(device_id)
             .ok_or_else(|| EngineError::WorkerMissing(instance_id.to_string(), device_id))?;
-        let load_plan =
-            self.pd_receive
-                .begin_load(instance_id, pd_request_id, receive_rank, handle)?;
 
-        if !load_plan.block_hashes.is_empty()
-            && !block_hashes.is_empty()
-            && load_plan
-                .block_hashes
-                .iter()
-                .take(block_hashes.len())
-                .ne(block_hashes.iter())
-        {
-            return Err(EngineError::InvalidArgument(format!(
-                "P/D receive block hashes do not match load request: instance={instance_id} request={pd_request_id}"
-            )));
-        }
-
-        let layers_by_name: HashMap<&str, &pd_receive::PdReceiveLoadLayer> = load_plan
-            .layers
-            .iter()
-            .map(|layer| (layer.layout.layer_name.as_str(), layer))
-            .collect();
         let mut layers = Vec::with_capacity(layer_names.len());
-
+        let mut layer_indices: HashMap<&str, usize> = HashMap::with_capacity(layer_names.len());
         for layer_name in layer_names {
-            let receive_layer = layers_by_name.get(layer_name).ok_or_else(|| {
-                EngineError::InvalidArgument(format!(
-                    "P/D receive layer {layer_name} not found: instance={instance_id} request={pd_request_id} receive_rank={receive_rank}"
-                ))
-            })?;
             let layer_id = instance.get_layer_id(layer_name).ok_or_else(|| {
                 EngineError::InvalidArgument(format!(
                     "layer {layer_name} unknown for instance {instance_id}"
@@ -700,64 +664,116 @@ impl PegaEngine {
                     "layer {layer_name} not registered on device {device_id}"
                 ))
             })?;
-            let expected_slot_id = instance.get_slot_index(layer_id, tp_rank)?;
-            let layout = &receive_layer.layout;
-            if layout.slot_id != expected_slot_id {
-                return Err(EngineError::InvalidArgument(format!(
-                    "P/D receive slot mismatch for layer {layer_name}: layout={} expected={expected_slot_id}",
-                    layout.slot_id
-                )));
-            }
-            if layout.segment_count != registration.segments {
-                return Err(EngineError::InvalidArgument(format!(
-                    "P/D receive segment count mismatch for layer {layer_name}: layout={} registration={}",
-                    layout.segment_count, registration.segments
-                )));
-            }
-            if layout.segment_size != registration.bytes_per_block as u64 {
-                return Err(EngineError::InvalidArgument(format!(
-                    "P/D receive segment size mismatch for layer {layer_name}: layout={} registration={}",
-                    layout.segment_size, registration.bytes_per_block
-                )));
-            }
-            if block_ids.len() > layout.num_blocks {
-                return Err(EngineError::InvalidArgument(format!(
-                    "P/D receive layer {layer_name} has {} staged blocks, load requested {}",
-                    layout.num_blocks,
-                    block_ids.len()
-                )));
-            }
-
-            let mut blocks = Vec::with_capacity(block_ids.len());
-            for (staged_block_idx, block_id) in block_ids.iter().enumerate() {
-                let block_idx = usize::try_from(*block_id).map_err(|_| {
-                    EngineError::InvalidArgument(format!(
-                        "block_id {block_id} must be non-negative for P/D receive load"
-                    ))
-                })?;
-                let mut segment_ptrs = Vec::with_capacity(layout.segment_count);
-                for segment_idx in 0..layout.segment_count {
-                    segment_ptrs.push(pd_receive_segment_ptr(
-                        &receive_layer.slab,
-                        layout,
-                        staged_block_idx,
-                        segment_idx,
-                    )?);
-                }
-                blocks.push(LoadBlock {
-                    block_idx,
-                    source: LoadBlockSource::Staged { segment_ptrs },
-                });
-            }
-
+            let index = layers.len();
             layers.push(LayerLoadData {
                 layer_name: (*layer_name).to_string(),
                 registration,
-                blocks,
-                _staging_keepalives: vec![Arc::clone(&receive_layer.allocation)],
+                blocks: Vec::new(),
+                _staging_keepalives: Vec::new(),
             });
+            layer_indices.insert(*layer_name, index);
+
+            // Validate the layer id lookup before any receive lease is touched.
+            instance.get_slot_index(layer_id, tp_rank)?;
         }
 
+        let mut release_items: Vec<(&str, Option<&str>)> =
+            Vec::with_capacity(non_empty_items.len());
+
+        for item in non_empty_items {
+            if item.request_id.is_empty() {
+                return Err(EngineError::InvalidArgument(
+                    "P/D receive item request_id must not be empty".to_string(),
+                ));
+            }
+            let load_plan = self.pd_receive.begin_load(
+                instance_id,
+                &item.request_id,
+                receive_rank,
+                item.handle.as_deref(),
+            )?;
+            let layers_by_name: HashMap<&str, &pd_receive::PdReceiveLoadLayer> = load_plan
+                .layers
+                .iter()
+                .map(|layer| (layer.layout.layer_name.as_str(), layer))
+                .collect();
+
+            for layer_name in layer_names {
+                let receive_layer = layers_by_name.get(layer_name).ok_or_else(|| {
+                    EngineError::InvalidArgument(format!(
+                        "P/D receive layer {layer_name} not found: instance={instance_id} request={} receive_rank={receive_rank}",
+                        item.request_id
+                    ))
+                })?;
+                let layer_id = instance.get_layer_id(layer_name).ok_or_else(|| {
+                    EngineError::InvalidArgument(format!(
+                        "layer {layer_name} unknown for instance {instance_id}"
+                    ))
+                })?;
+                let expected_slot_id = instance.get_slot_index(layer_id, tp_rank)?;
+                let layout = &receive_layer.layout;
+                let layer_index = *layer_indices.get(*layer_name).ok_or_else(|| {
+                    EngineError::InvalidArgument(format!(
+                        "layer {layer_name} missing from P/D receive batch builder"
+                    ))
+                })?;
+                let layer_data = &mut layers[layer_index];
+
+                if layout.slot_id != expected_slot_id {
+                    return Err(EngineError::InvalidArgument(format!(
+                        "P/D receive slot mismatch for layer {layer_name}: layout={} expected={expected_slot_id}",
+                        layout.slot_id
+                    )));
+                }
+                if layout.segment_count != layer_data.registration.segments {
+                    return Err(EngineError::InvalidArgument(format!(
+                        "P/D receive segment count mismatch for layer {layer_name}: layout={} registration={}",
+                        layout.segment_count, layer_data.registration.segments
+                    )));
+                }
+                if layout.segment_size != layer_data.registration.bytes_per_block as u64 {
+                    return Err(EngineError::InvalidArgument(format!(
+                        "P/D receive segment size mismatch for layer {layer_name}: layout={} registration={}",
+                        layout.segment_size, layer_data.registration.bytes_per_block
+                    )));
+                }
+                if item.block_ids.len() > layout.num_blocks {
+                    return Err(EngineError::InvalidArgument(format!(
+                        "P/D receive layer {layer_name} has {} staged blocks, load requested {}",
+                        layout.num_blocks,
+                        item.block_ids.len()
+                    )));
+                }
+
+                for (staged_block_idx, block_id) in item.block_ids.iter().enumerate() {
+                    let block_idx = usize::try_from(*block_id).map_err(|_| {
+                        EngineError::InvalidArgument(format!(
+                            "block_id {block_id} must be non-negative for P/D receive load"
+                        ))
+                    })?;
+                    let mut segment_ptrs = Vec::with_capacity(layout.segment_count);
+                    for segment_idx in 0..layout.segment_count {
+                        segment_ptrs.push(pd_receive_segment_ptr(
+                            &receive_layer.slab,
+                            layout,
+                            staged_block_idx,
+                            segment_idx,
+                        )?);
+                    }
+                    layer_data.blocks.push(LoadBlock {
+                        block_idx,
+                        source: LoadBlockSource::Staged { segment_ptrs },
+                    });
+                }
+                layer_data
+                    ._staging_keepalives
+                    .push(Arc::clone(&receive_layer.allocation));
+            }
+
+            release_items.push((&item.request_id, item.handle.as_deref()));
+        }
+
+        layers.retain(|layer| !layer.blocks.is_empty());
         if layers.is_empty() {
             debug!("No P/D receive blocks to load, completing immediately");
             LoadState::attach(load_state_shm)?.set_completed();
@@ -767,7 +783,19 @@ impl PegaEngine {
         gpu.worker_pool().submit_load(LoadTask {
             layers,
             load_state_shm: load_state_shm.to_string(),
-        })
+        })?;
+        for (request_id, handle) in release_items {
+            if let Err(err) =
+                self.pd_receive
+                    .release_loaded_rank(instance_id, request_id, receive_rank, handle)
+            {
+                warn!(
+                    "failed to release P/D receive staging after batch load submit: instance={} request={} receive_rank={} error={}",
+                    instance_id, request_id, receive_rank, err
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Wait until all previously submitted save batches have been processed

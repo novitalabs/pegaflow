@@ -26,7 +26,16 @@ from pegaflow.connector.egress import (
     execute_kv_egress,
 )
 from pegaflow.ipc_wrapper import CudaIPCWrapper
-from pegaflow.pegaflow import PyLoadState
+from pegaflow import (
+    KvCacheLayer,
+    KvCacheRegistration,
+    LayerSave,
+    LoadHandle,
+    LoadItem,
+    LoadSourceKind,
+    LoadRequest,
+    SaveRequest,
+)
 
 if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionMetadata
@@ -78,7 +87,7 @@ class WorkerConnector:
         self._save_completion_events: dict[str, threading.Event] = {}
         self._current_metadata: PegaConnectorMetadata | None = None
 
-        self._pending_loads: dict[str, PyLoadState] = {}
+        self._pending_loads: dict[str, LoadHandle] = {}
         self._pending_load_reqs: dict[str, set[str]] = {}
         self._pending_load_meta: dict[
             str, tuple[float, int, list[int]]
@@ -120,9 +129,10 @@ class WorkerConnector:
         self._unregister_egress_layers()
 
         if self._registered_layers and self._ctx.tp_rank == 0:
-            ok, message = self._ctx.engine_client.unregister_context(self._ctx.instance_id)
-            if not ok:
-                logger.warning("[PegaKVConnector] Unregister context failed: %s", message)
+            try:
+                self._ctx.engine_client._unregister_context(self._ctx.instance_id)
+            except Exception as e:
+                logger.warning("[PegaKVConnector] Unregister context failed: %s", e)
 
         self._registered_layers.clear()
 
@@ -198,24 +208,36 @@ class WorkerConnector:
                 segments=int(segments),
             )
 
-        ok, message = self._ctx.engine_client.register_context_batch(
-            self._ctx.instance_id,
-            self._ctx.namespace,
-            self._ctx.effective_tp_rank,
-            self._ctx.effective_tp_size,
-            self._ctx.world_size,
-            self._ctx.device_id,
-            actual_num_layers,
-            layer_names,
-            ipc_wrappers,
-            layer_num_blocks,
-            layer_bytes_per_block,
-            layer_kv_stride_bytes,
-            layer_segments,
+        self._ctx.engine_client.register_kv_cache(
+            KvCacheRegistration(
+                instance_id=self._ctx.instance_id,
+                namespace=self._ctx.namespace,
+                tp_rank=self._ctx.effective_tp_rank,
+                tp_size=self._ctx.effective_tp_size,
+                world_size=self._ctx.world_size,
+                device_id=self._ctx.device_id,
+                num_layers=actual_num_layers,
+                layers=tuple(
+                    KvCacheLayer(
+                        name=name,
+                        wrapper_bytes=wrapper,
+                        num_blocks=num_blocks,
+                        bytes_per_block=bytes_per_block,
+                        kv_stride_bytes=kv_stride_bytes,
+                        segments=segments,
+                    )
+                    for name, wrapper, num_blocks, bytes_per_block, kv_stride_bytes, segments in zip(
+                        layer_names,
+                        ipc_wrappers,
+                        layer_num_blocks,
+                        layer_bytes_per_block,
+                        layer_kv_stride_bytes,
+                        layer_segments,
+                        strict=True,
+                    )
+                ),
+            )
         )
-
-        if not ok:
-            raise RuntimeError(f"Register context failed for {layer_name}: {message}")
 
         self._register_egress_layers(egress_layers)
 
@@ -265,13 +287,13 @@ class WorkerConnector:
                     continue
 
                 meta = self._pending_load_meta.get(shm_name)
-                ready = load_state.is_ready()
+                ready = load_state.done
                 timed_out = (
                     not ready and meta is not None and (now - meta[0]) > self.LOAD_TIMEOUT_SECONDS
                 )
 
                 if ready:
-                    state = load_state.get_state()
+                    state = load_state.state
                     success = state >= 0
                     if not success:
                         logger.error(
@@ -370,52 +392,51 @@ class WorkerConnector:
         if not target_layers:
             return
 
-        normal_request_ids: list[str] = []
-        normal_block_ids: list[int] = []
-        normal_block_hashes: list[bytes] = []
-        pd_items: list[tuple[str, Any]] = []
+        normal_items: list[tuple[str, LoadItem]] = []
+        pd_items: list[tuple[str, LoadItem]] = []
 
         for req_id, load_intent in metadata.load_intents.items():
             if not load_intent.block_ids:
                 continue
-            if load_intent.pd_request_id:
-                pd_items.append((req_id, load_intent))
-            else:
-                normal_request_ids.append(req_id)
-                normal_block_ids.extend(load_intent.block_ids)
-                normal_block_hashes.extend(load_intent.block_hashes)
-
-        if normal_block_ids:
-            self._submit_cache_load(
-                normal_request_ids,
-                normal_block_ids,
-                normal_block_hashes,
-                target_layers,
+            item = LoadItem(
+                plan=load_intent.plan,
+                block_ids=tuple(load_intent.block_ids),
             )
+            if load_intent.plan.source is LoadSourceKind.STAGED:
+                pd_items.append((req_id, item))
+            else:
+                normal_items.append((req_id, item))
 
-        for req_id, load_intent in pd_items:
-            self._submit_pd_receive_load(req_id, load_intent, target_layers)
+        if normal_items:
+            self._submit_load(normal_items, target_layers, receive_rank=None)
 
-    def _submit_cache_load(
+        if pd_items:
+            self._submit_load(pd_items, target_layers, receive_rank=self._ctx.effective_tp_rank)
+
+    def _submit_load(
         self,
-        request_ids: list[str],
-        block_ids: list[int],
-        block_hashes: list[bytes],
+        items: list[tuple[str, LoadItem]],
         target_layers: list[str],
+        receive_rank: int | None,
     ) -> None:
         load_start = time.perf_counter()
-        load_state = PyLoadState()
-        shm_name = load_state.shm_name()
+        request_ids = [req_id for req_id, _ in items]
+        all_block_ids = [
+            int(block_id)
+            for _, item in items
+            for block_id in item.block_ids
+        ]
 
         try:
-            ok, message = self._ctx.engine_client.load(
-                self._ctx.instance_id,
-                self._ctx.effective_tp_rank,
-                self._ctx.device_id,
-                shm_name,
-                target_layers,
-                block_ids,
-                block_hashes,
+            load_state = self._ctx.engine_client.load(
+                LoadRequest(
+                    instance_id=self._ctx.instance_id,
+                    tp_rank=self._ctx.effective_tp_rank,
+                    device_id=self._ctx.device_id,
+                    layer_names=tuple(target_layers),
+                    items=tuple(item for _, item in items),
+                    receive_rank=receive_rank,
+                )
             )
         except Exception as e:
             logger.error(
@@ -423,26 +444,15 @@ class WorkerConnector:
                 "marking blocks as load errors)",
                 e,
                 request_ids,
-                len(block_ids),
+                len(all_block_ids),
             )
-            self._record_load_failure(request_ids, block_ids, load_start)
+            self._record_load_failure(request_ids, all_block_ids, load_start)
             self._ctx.state_manager.mark_unavailable(f"load rpc exception: {e}")
             return
 
-        if not ok:
-            logger.error(
-                "[PegaKVConnector] Load RPC failed: %s (reqs=%s blocks=%d, "
-                "marking blocks as load errors)",
-                message,
-                request_ids,
-                len(block_ids),
-            )
-            self._record_load_failure(request_ids, block_ids, load_start)
-            self._ctx.state_manager.mark_unavailable(f"load rpc failed: {message}")
-            return
-
         num_layers = len(target_layers)
-        num_blocks = len(block_ids)
+        num_blocks = len(all_block_ids)
+        shm_name = load_state.shm_name
 
         schedule_end = time.perf_counter()
         schedule_time_us = (schedule_end - load_start) * 1e6
@@ -458,7 +468,7 @@ class WorkerConnector:
             self._pending_load_meta[shm_name] = (
                 load_start,
                 num_blocks,
-                block_ids,
+                all_block_ids,
             )
 
         logger.debug(
@@ -467,80 +477,6 @@ class WorkerConnector:
             num_blocks,
             num_layers,
             len(request_ids),
-            schedule_time_us,
-            shm_name,
-        )
-
-    def _submit_pd_receive_load(
-        self,
-        req_id: str,
-        load_intent: Any,
-        target_layers: list[str],
-    ) -> None:
-        load_start = time.perf_counter()
-        block_ids = list(load_intent.block_ids)
-        block_hashes = list(load_intent.block_hashes)
-        load_state = PyLoadState()
-        shm_name = load_state.shm_name()
-
-        try:
-            ok, message = self._ctx.engine_client.load_pd_receive(
-                self._ctx.instance_id,
-                self._ctx.effective_tp_rank,
-                self._ctx.device_id,
-                shm_name,
-                target_layers,
-                block_ids,
-                block_hashes,
-                load_intent.pd_request_id,
-                load_intent.pd_handle,
-                self._ctx.effective_tp_rank,
-            )
-        except Exception as e:
-            logger.error(
-                "[PegaKVConnector] LoadPdReceive RPC exception: %s "
-                "(req=%s pd_request_id=%s blocks=%d, marking blocks as load errors)",
-                e,
-                req_id,
-                load_intent.pd_request_id,
-                len(block_ids),
-            )
-            self._record_load_failure([req_id], block_ids, load_start)
-            self._ctx.state_manager.mark_unavailable(f"load_pd_receive rpc exception: {e}")
-            return
-
-        if not ok:
-            logger.error(
-                "[PegaKVConnector] LoadPdReceive RPC failed: %s "
-                "(req=%s pd_request_id=%s blocks=%d, marking blocks as load errors)",
-                message,
-                req_id,
-                load_intent.pd_request_id,
-                len(block_ids),
-            )
-            self._record_load_failure([req_id], block_ids, load_start)
-            self._ctx.state_manager.mark_unavailable(f"load_pd_receive rpc failed: {message}")
-            return
-
-        schedule_end = time.perf_counter()
-        schedule_time_us = (schedule_end - load_start) * 1e6
-        with self._load_completion_lock:
-            self._pending_loads[req_id] = load_state
-            self._pending_load_reqs[shm_name] = {req_id}
-            self._pending_load_meta[shm_name] = (
-                load_start,
-                len(block_ids),
-                block_ids,
-            )
-
-        logger.info(
-            "[PegaKVConnector] started P/D receive load: req=%s pd_request_id=%s "
-            "receive_rank=%d blocks=%d layers=%d schedule %.0f us shm=%s",
-            req_id,
-            load_intent.pd_request_id,
-            self._ctx.effective_tp_rank,
-            len(block_ids),
-            len(target_layers),
             schedule_time_us,
             shm_name,
         )
@@ -686,32 +622,34 @@ class WorkerConnector:
             self._process_egress_batch(egress_items)
 
         if saves_by_layer:
-            saves_list = [(name, ids, hashes) for name, (ids, hashes) in saves_by_layer.items()]
-            total_blocks = sum(len(ids) for _, ids, _ in saves_list)
+            saves_list = [
+                LayerSave(
+                    layer_name=name,
+                    block_ids=tuple(ids),
+                    block_hashes=tuple(hashes),
+                )
+                for name, (ids, hashes) in saves_by_layer.items()
+            ]
+            total_blocks = sum(len(layer.block_ids) for layer in saves_list)
 
             save_start = time.perf_counter()
             success = False
 
             try:
-                ok, message = self._ctx.engine_client.save(
-                    self._ctx.instance_id,
-                    self._ctx.effective_tp_rank,
-                    self._ctx.device_id,
-                    saves_list,
+                self._ctx.engine_client.save(
+                    SaveRequest(
+                        instance_id=self._ctx.instance_id,
+                        tp_rank=self._ctx.effective_tp_rank,
+                        device_id=self._ctx.device_id,
+                        layers=tuple(saves_list),
+                    )
                 )
-
-                if not ok:
-                    logger.error(
-                        "[PegaKVConnector] Save batch failed: %s (continuing without save)",
-                        message,
-                    )
-                else:
-                    success = True
-                    logger.debug(
-                        "[PegaKVConnector] Batch saved %d layers, %d total blocks",
-                        len(saves_list),
-                        total_blocks,
-                    )
+                success = True
+                logger.debug(
+                    "[PegaKVConnector] Batch saved %d layers, %d total blocks",
+                    len(saves_list),
+                    total_blocks,
+                )
             except Exception as e:
                 logger.error(
                     "[PegaKVConnector] Save RPC exception: %s (continuing without save)",
@@ -730,14 +668,14 @@ class WorkerConnector:
     def _process_egress_batch(self, egress_items: list[tuple[str, KvEgressIntent]]) -> None:
         if self._kv_egress is None:
             logger.error(
-                "[PegaKVConnector] P/D egress requested but PEGAFLOW_KV_EGRESS is disabled "
+                "[PegaKVConnector] KV egress requested but PEGAFLOW_KV_EGRESS is disabled "
                 "(reqs=%s)",
                 [req_id for req_id, _ in egress_items],
             )
             return
         if not self._egress_layers:
             logger.error(
-                "[PegaKVConnector] P/D egress requested before KV caches were registered "
+                "[PegaKVConnector] KV egress requested before KV caches were registered "
                 "(reqs=%s)",
                 [req_id for req_id, _ in egress_items],
             )
@@ -759,11 +697,11 @@ class WorkerConnector:
                 )
             except Exception as e:
                 logger.error(
-                    "[PegaKVConnector] P/D egress failed: req=%s pd_request_id=%s "
+                    "[PegaKVConnector] KV egress failed: req=%s transfer_request_id=%s "
                     "dst=%s blocks=%d error=%s",
                     req_id,
-                    intent.pd_request_id,
-                    intent.d_pegaflow_addr,
+                    intent.request_id,
+                    intent.remote_endpoint,
                     len(intent.block_ids),
                     e,
                 )
@@ -771,15 +709,15 @@ class WorkerConnector:
 
             elapsed_ms = (time.perf_counter() - start) * 1000
             logger.info(
-                "[PegaKVConnector] P/D egress completed: req=%s pd_request_id=%s "
+                "[PegaKVConnector] KV egress completed: req=%s transfer_request_id=%s "
                 "dst=%s layers=%d blocks=%d bytes=%d elapsed_ms=%.2f "
                 "descs=%d coalesced_descs=%d descriptor_ms=%.2f "
                 "connect_ms=%.2f build_desc_ms=%.2f "
                 "rdma_write_ms=%.2f rdma_write_gbps=%.2f write_nics=%d "
                 "preferred_nic_idx=%s imm_ms=%.2f imm_nics=%d total_inner_ms=%.2f",
                 req_id,
-                intent.pd_request_id,
-                intent.d_pegaflow_addr,
+                intent.request_id,
+                intent.remote_endpoint,
                 len(self._egress_layers),
                 len(intent.block_ids),
                 egress_stats.bytes_written,
@@ -811,14 +749,14 @@ class WorkerConnector:
             preferred = self._kv_egress._preferred_nic_for_gpu(int(self._ctx.device_id))
         except Exception as e:
             logger.warning(
-                "[PegaKVConnector] Failed to resolve preferred P/D egress NIC for "
+                "[PegaKVConnector] Failed to resolve preferred KV egress NIC for "
                 "device=%s: %s",
                 self._ctx.device_id,
                 e,
             )
             return None
         logger.info(
-            "[PegaKVConnector] Preferred P/D egress NIC: device=%s nic_idx=%s",
+            "[PegaKVConnector] Preferred KV egress NIC: device=%s nic_idx=%s",
             self._ctx.device_id,
             preferred if preferred is not None else "auto-fallback",
         )
@@ -836,13 +774,13 @@ class WorkerConnector:
             waiting = {
                 req_id
                 for req_id, state in states.items()
-                if state is not None and not state.is_ready()
+                if state is not None and not state.done
             }
             if not waiting:
                 return
             if time.perf_counter() >= deadline:
                 logger.error(
-                    "[PegaKVConnector] timed out waiting for source loads before P/D egress: "
+                    "[PegaKVConnector] timed out waiting for source loads before KV egress: "
                     "reqs=%s",
                     sorted(waiting),
                 )
@@ -917,7 +855,7 @@ class WorkerConnector:
 
         self._egress_layers = layers
         logger.info(
-            "[PegaKVConnector] Registered %d KV cache layer(s) for P/D egress "
+            "[PegaKVConnector] Registered %d KV cache layer(s) for KV egress "
             "(unique_mrs=%d)",
             len(layers),
             len(registered_ptrs),
@@ -934,7 +872,7 @@ class WorkerConnector:
                 self._kv_egress._unregister_memory(ptr)
             except Exception as e:
                 logger.warning(
-                    "[PegaKVConnector] Failed to unregister P/D egress MR ptr=%#x: %s",
+                    "[PegaKVConnector] Failed to unregister KV egress MR ptr=%#x: %s",
                     ptr,
                     e,
                 )

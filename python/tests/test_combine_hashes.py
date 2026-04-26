@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import sys
 import types
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 # ---------------------------------------------------------------------------
@@ -20,6 +21,8 @@ _EXT_NAME = "pegaflow.pegaflow"
 if _EXT_NAME not in sys.modules:
     _ext_stub = types.ModuleType(_EXT_NAME)
     _ext_stub.EngineRpcClient = MagicMock  # type: ignore[attr-defined]
+    _ext_stub._NativeEngineClient = MagicMock  # type: ignore[attr-defined]
+    _ext_stub._NativeLoadState = MagicMock  # type: ignore[attr-defined]
     _ext_stub.KvEgressRuntime = MagicMock  # type: ignore[attr-defined]
     _ext_stub.PegaFlowBusinessError = type("PegaFlowBusinessError", (Exception,), {})  # type: ignore[attr-defined]
     _ext_stub.PegaFlowError = type("PegaFlowError", (Exception,), {})  # type: ignore[attr-defined]
@@ -30,6 +33,7 @@ if _EXT_NAME not in sys.modules:
 
 from pegaflow.connector.common import ConnectorContext  # noqa: E402
 from pegaflow.connector.scheduler import SchedulerConnector  # noqa: E402
+from pegaflow import LoadPlan, LoadSourceKind, PrepareLoadResult  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -200,14 +204,26 @@ def _make_fake_request(req_id: str, block_hashes: list[bytes]):
     req = MagicMock()
     req.request_id = req_id
     req.num_tokens = len(block_hashes) * 32  # arbitrary
+    req.num_prompt_tokens = req.num_tokens
+    req.prompt_token_ids = None
     req.block_hashes = block_hashes  # mutable list, like the real Request
     return req
 
 
-def _make_fake_blocks(block_ids: list[int]):
+def _make_fake_blocks(block_ids: list[int], computed: int = 0):
     """Minimal object that quacks like KVCacheBlocks."""
     blocks = MagicMock()
     blocks.get_block_ids.return_value = (block_ids,)
+    blocks.blocks = (
+        tuple(
+            SimpleNamespace(
+                block_id=block_id,
+                block_hash=_hash(i) if i < computed else None,
+                is_null=False,
+            )
+            for i, block_id in enumerate(block_ids)
+        ),
+    )
     return blocks
 
 
@@ -312,54 +328,80 @@ class TestDecodeHashRefresh:
         assert intent.block_hashes == block_hashes[6:9]
         assert intent.block_ids == (200, 201, 202)
 
-    def test_source_pd_request_builds_egress_intent_from_save_intent(self):
-        """P/source requests push the same blocks selected by normal save."""
+    def test_source_pd_request_builds_egress_intent_from_prefill_tokens(self):
+        """P/source requests push blocks selected by remote-prefill token count."""
         sc = self._make_connector(dcp_world_size=1)
         req = _make_fake_request("r1", [_hash(i) for i in range(2)])
+        req.num_tokens = 33
+        req.num_prompt_tokens = 33
         req.kv_transfer_params = {
-            "pegaflow_pd_push": True,
-            "role": "source",
-            "pd_request_id": "pd-r1",
-            "d_pegaflow_addr": "http://10.0.0.2:50055",
-            "dst_instance_id": "decode-0",
+            "pegaflow": {
+                "type": "prefill_push",
+                "request_id": "pd-r1",
+                "decode_endpoint": "http://10.0.0.2:50055",
+                "decode_instance_id": "decode-0",
+            }
         }
         blocks = _make_fake_blocks([10, 11])
 
         sc.update_state_after_alloc(req, blocks, num_external_tokens=0)
         sc._allocated_blocks["r1"] = [10, 11]
         sc._scheduled_tokens["r1"] = 32
-        save_intent = sc._consume_save_intent("r1")
 
-        assert save_intent is not None
-        egress = sc._build_egress_intents({"r1": save_intent})
+        egress = sc._build_egress_intents()
 
         intent = egress["r1"]
-        assert intent.pd_request_id == "pd-r1"
-        assert intent.d_pegaflow_addr == "http://10.0.0.2:50055"
-        assert intent.dst_instance_id == "decode-0"
-        assert intent.block_ids == save_intent.block_ids
-        assert intent.block_hashes == save_intent.block_hashes
+        assert intent.request_id == "pd-r1"
+        assert intent.remote_endpoint == "http://10.0.0.2:50055"
+        assert intent.remote_instance_id == "decode-0"
+        assert intent.block_ids == (10, 11)
+        assert intent.block_hashes == (_hash(0), _hash(1))
+
+    def test_source_pd_short_request_builds_egress_without_hashes(self):
+        sc = self._make_connector(dcp_world_size=1)
+        req = _make_fake_request("r1", [])
+        req.num_tokens = 15
+        req.num_prompt_tokens = 15
+        req.kv_transfer_params = {
+            "pegaflow": {
+                "type": "prefill_push",
+                "request_id": "pd-r1",
+                "decode_endpoint": "http://10.0.0.2:50055",
+                "decode_instance_id": "decode-0",
+            }
+        }
+        blocks = _make_fake_blocks([10])
+
+        sc.update_state_after_alloc(req, blocks, num_external_tokens=0)
+        sc._allocated_blocks["r1"] = [10]
+        sc._scheduled_tokens["r1"] = 14
+
+        egress = sc._build_egress_intents()
+
+        intent = egress["r1"]
+        assert intent.block_ids == (10,)
+        assert intent.block_hashes == ()
 
     def test_source_pd_request_does_not_prepare_d_receive(self):
         """The same pegaflow_pd_push flag is interpreted by role."""
         ctx = _make_ctx(block_size=16, layer_names=("ALL_LAYERS",))
         ctx.state_manager.is_available.return_value = True
-        ctx.engine_client.query_prefetch.return_value = {
-            "ok": True,
-            "message": "",
-            "hit_blocks": 0,
-            "prefetch_state": "done",
-        }
+        ctx.engine_client.prepare_load.return_value = PrepareLoadResult.done(None)
         sc = SchedulerConnector(ctx)
         req = _make_fake_request("r1", [_hash(i) for i in range(2)])
         req.num_tokens = 32
         req.kv_transfer_params = {
-            "role": "source",
-            "pegaflow_pd": {"enabled": True, "mode": "cpu_staging_push"},
+            "pegaflow": {
+                "type": "prefill_push",
+                "request_id": "pd-r1",
+                "decode_endpoint": "http://10.0.0.2:50055",
+                "decode_instance_id": "decode-0",
+            }
         }
 
         assert sc.get_num_new_matched_tokens(req, 0) == (0, False)
-        ctx.engine_client.prepare_pd_receive.assert_not_called()
+        prepare_request = ctx.engine_client.prepare_load.call_args.args[0]
+        assert prepare_request.decode_request_id is None
 
 
 class TestPdReceivePrepare:
@@ -367,124 +409,125 @@ class TestPdReceivePrepare:
 
     def test_pd_push_request_prepares_receive_and_blocks_gpu_alloc(self):
         ctx = _make_ctx(block_size=16, layer_names=("ALL_LAYERS",))
-        ctx.engine_client.prepare_pd_receive.return_value = {
-            "ok": True,
-            "message": "",
-            "handle": "h1",
-            "imm_data": 7,
-            "expires_at_ms": 123,
-        }
-        ctx.engine_client.get_pd_receive_descriptor.return_value = {
-            "ok": True,
-            "message": "",
-            "state": "ready",
-            "data_ready": False,
-        }
+        ctx.engine_client.prepare_load.return_value = PrepareLoadResult.in_progress()
         sc = SchedulerConnector(ctx)
         req = _make_fake_request("r1", [_hash(i) for i in range(4)])
         req.num_tokens = 64
+        req.num_prompt_tokens = 64
         req.kv_transfer_params = {
-            "pegaflow_pd_push": True,
-            "pd_request_id": "pd1",
+            "pegaflow": {
+                "type": "decode_load",
+                "request_id": "pd1",
+            }
         }
 
         assert sc.get_num_new_matched_tokens(req, 0) == (None, False)
 
-        ctx.engine_client.prepare_pd_receive.assert_called_once_with(
-            "test",
-            "pd1",
-            [_hash(i) for i in range(4)],
-            4,
-            0,
-            0,
-        )
+        prepare_request = ctx.engine_client.prepare_load.call_args.args[0]
+        assert prepare_request.request_id == "r1"
+        assert prepare_request.decode_request_id == "pd1"
+        assert prepare_request.block_hashes == tuple(_hash(i) for i in range(4))
+        assert prepare_request.virtual_block_size == 16
 
-        # Idempotent scheduler polling must not allocate again.
+        # The scheduler only sees the high-level preparing state.
         assert sc.get_num_new_matched_tokens(req, 0) == (None, False)
-        ctx.engine_client.prepare_pd_receive.assert_called_once()
-        ctx.engine_client.get_pd_receive_descriptor.assert_called_once_with(
-            "test",
-            "pd1",
-            -1,
-            "h1",
-        )
+        assert ctx.engine_client.prepare_load.call_count == 2
 
     def test_pd_push_prepares_only_complete_hashed_blocks(self):
         ctx = _make_ctx(block_size=16, layer_names=("ALL_LAYERS",))
-        ctx.engine_client.prepare_pd_receive.return_value = {
-            "ok": True,
-            "message": "",
-            "handle": "h1",
-            "imm_data": 7,
-            "expires_at_ms": 123,
-        }
+        ctx.engine_client.prepare_load.return_value = PrepareLoadResult.in_progress()
         sc = SchedulerConnector(ctx)
         req = _make_fake_request("r1", [_hash(0)])
         req.num_tokens = 24
-        req.kv_transfer_params = {"pegaflow_pd_push": True}
+        req.num_prompt_tokens = 24
+        req.kv_transfer_params = {"pegaflow": {"type": "decode_load"}}
 
         assert sc.get_num_new_matched_tokens(req, 0) == (None, False)
 
-        # 24 tokens include one complete vLLM block plus a partial tail. Only
-        # the complete block can be pushed; D recomputes the partial tail.
-        args = ctx.engine_client.prepare_pd_receive.call_args.args
-        assert args[2] == [_hash(0)]
-        assert args[3] == 1
+        prepare_request = ctx.engine_client.prepare_load.call_args.args[0]
+        assert prepare_request.block_hashes == (_hash(0),)
+        assert prepare_request.num_prompt_tokens == 24
+        assert prepare_request.virtual_block_size == 16
 
-    def test_pd_push_without_complete_block_hashes_bypasses_receive(self):
+    def test_pd_push_without_complete_block_hashes_prepares_receive(self):
+        ctx = _make_ctx(block_size=16, layer_names=("ALL_LAYERS",))
+        ctx.engine_client.prepare_load.return_value = PrepareLoadResult.in_progress()
+        sc = SchedulerConnector(ctx)
+        req = _make_fake_request("r1", [])
+        req.num_tokens = 15
+        req.num_prompt_tokens = 15
+        req.kv_transfer_params = {"pegaflow": {"type": "decode_load"}}
+
+        assert sc.get_num_new_matched_tokens(req, 0) == (None, False)
+        prepare_request = ctx.engine_client.prepare_load.call_args.args[0]
+        assert prepare_request.block_hashes == ()
+        assert prepare_request.decode_request_id == "r1"
+
+    def test_pd_receive_partial_block_alloc_builds_hashless_load_intent(self):
         ctx = _make_ctx(block_size=16, layer_names=("ALL_LAYERS",))
         sc = SchedulerConnector(ctx)
         req = _make_fake_request("r1", [])
         req.num_tokens = 15
-        req.kv_transfer_params = {"pegaflow_pd_push": True}
+        req.num_prompt_tokens = 15
+        req.kv_transfer_params = {"pegaflow": {"type": "decode_load"}}
+        blocks = _make_fake_blocks([10])
+        sc._load_plans["r1"] = LoadPlan(
+            request_id="r1",
+            source=LoadSourceKind.STAGED,
+            num_tokens=14,
+            num_blocks=1,
+        )
 
-        assert sc.get_num_new_matched_tokens(req, 0) == (0, False)
-        ctx.engine_client.prepare_pd_receive.assert_not_called()
+        sc.update_state_after_alloc(req, blocks, num_external_tokens=14)
+
+        intent = sc._pending_load_intents["r1"]
+        assert intent.block_ids == (10,)
+        assert intent.plan.block_hashes == ()
+        assert intent.num_tokens == 14
 
     def test_pd_push_returns_external_tokens_after_imm_ready(self):
         ctx = _make_ctx(block_size=16, layer_names=("ALL_LAYERS",))
-        ctx.engine_client.prepare_pd_receive.return_value = {
-            "ok": True,
-            "message": "",
-            "handle": "h1",
-            "imm_data": 7,
-            "expires_at_ms": 123,
-        }
-        ctx.engine_client.get_pd_receive_descriptor.return_value = {
-            "ok": True,
-            "message": "",
-            "state": "ready",
-            "data_ready": True,
-        }
+        ctx.engine_client.prepare_load.side_effect = [
+            PrepareLoadResult.in_progress(),
+            PrepareLoadResult.done(
+                LoadPlan(
+                    request_id="r1",
+                    source=LoadSourceKind.STAGED,
+                    num_tokens=63,
+                    num_blocks=4,
+                    block_hashes=tuple(_hash(i) for i in range(4)),
+                    token="h1",
+                )
+            ),
+        ]
         sc = SchedulerConnector(ctx)
         req = _make_fake_request("r1", [_hash(i) for i in range(4)])
         req.num_tokens = 64
-        req.kv_transfer_params = {"pegaflow_pd_push": True}
+        req.num_prompt_tokens = 64
+        req.kv_transfer_params = {"pegaflow": {"type": "decode_load"}}
 
         assert sc.get_num_new_matched_tokens(req, 0) == (None, False)
-        assert sc.get_num_new_matched_tokens(req, 0) == (64, True)
+        assert sc.get_num_new_matched_tokens(req, 0) == (63, True)
 
     def test_pd_prepare_cleanup_uses_vllm_request_id(self):
         ctx = _make_ctx(block_size=16, layer_names=("ALL_LAYERS",))
-        ctx.engine_client.prepare_pd_receive.return_value = {
-            "ok": True,
-            "message": "",
-            "handle": "h1",
-            "imm_data": 7,
-            "expires_at_ms": 123,
-        }
+        ctx.engine_client.prepare_load.return_value = PrepareLoadResult.in_progress()
         sc = SchedulerConnector(ctx)
         req = _make_fake_request("vllm-r1", [_hash(i) for i in range(2)])
         req.num_tokens = 32
+        req.num_prompt_tokens = 32
         req.kv_transfer_params = {
-            "pegaflow_pd_push": True,
-            "pd_request_id": "router-pd-r1",
+            "pegaflow": {
+                "type": "decode_load",
+                "request_id": "router-pd-r1",
+            }
         }
 
         assert sc.get_num_new_matched_tokens(req, 0) == (None, False)
-        assert len(sc._pd_receive_prepares) == 1
+        prepare_request = ctx.engine_client.prepare_load.call_args.args[0]
+        assert prepare_request.request_id == "vllm-r1"
+        assert prepare_request.decode_request_id == "router-pd-r1"
 
         sc._cleanup_request("vllm-r1")
 
-        assert sc._pd_receive_prepares == {}
-        assert sc._pd_receive_prepare_keys_by_req == {}
+        assert sc._load_plans == {}

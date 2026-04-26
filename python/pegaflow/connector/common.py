@@ -12,7 +12,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadat
 
 from pegaflow.connector.connector_metrics import PegaKVConnectorStats, PegaPromMetrics
 from pegaflow.logging_utils import get_connector_logger
-from pegaflow.pegaflow import EngineRpcClient
+from pegaflow import LoadPlan, PegaClient
 
 if TYPE_CHECKING:
     from pegaflow.connector.state_manager import ServiceStateManager
@@ -33,7 +33,7 @@ class ConnectorContext:
     world_size: int
     tp_rank: int | None
     device_id: int | None
-    engine_client: EngineRpcClient
+    engine_client: PegaClient
     state_manager: "ServiceStateManager"
     is_mla: bool = False
     dcp_world_size: int = 1
@@ -82,10 +82,8 @@ class LoadIntent:
     """Intent for a KV load operation."""
 
     block_ids: tuple[int, ...]
-    block_hashes: tuple[bytes, ...]
+    plan: LoadPlan
     num_tokens: int
-    pd_request_id: str | None = None
-    pd_handle: str | None = None
 
 
 @dataclass(frozen=True)
@@ -98,11 +96,11 @@ class SaveIntent:
 
 @dataclass(frozen=True)
 class KvEgressIntent:
-    """Intent for outbound P/D KV transfer from local GPU KV to D staging."""
+    """Intent for outbound KV transfer from local GPU KV to remote staging."""
 
-    pd_request_id: str
-    d_pegaflow_addr: str
-    dst_instance_id: str
+    request_id: str
+    remote_endpoint: str
+    remote_instance_id: str
     block_ids: tuple[int, ...]
     block_hashes: tuple[bytes, ...]
     handle: str | None = None
