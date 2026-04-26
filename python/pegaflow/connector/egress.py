@@ -101,14 +101,14 @@ def execute_kv_egress(
     preferred_nic_idx: int | None,
 ) -> KvEgressStats:
     total_start = time.perf_counter()
-    client = _engine_client(intent.d_pegaflow_addr)
+    client = _engine_client(intent.remote_endpoint)
     descriptor_start = time.perf_counter()
     descriptor = _wait_for_descriptor(intent, client, receive_rank)
     descriptor_ms = _elapsed_ms(descriptor_start)
-    remote_addr = _transfer_peer_key(intent.d_pegaflow_addr)
+    remote_addr = _transfer_peer_key(intent.remote_endpoint)
 
     connect_start = time.perf_counter()
-    runtime._ensure_connected(remote_addr, requester_id, client)
+    runtime._ensure_connected(remote_addr, requester_id, client._native)
     connect_ms = _elapsed_ms(connect_start)
 
     build_start = time.perf_counter()
@@ -155,9 +155,9 @@ def _wait_for_descriptor(intent: KvEgressIntent, client, receive_rank: int) -> d
     deadline = time.monotonic() + timeout_s
 
     while True:
-        descriptor = client.get_pd_receive_descriptor(
-            intent.dst_instance_id,
-            intent.pd_request_id,
+        descriptor = client._get_staged_load_descriptor(
+            intent.remote_instance_id,
+            intent.request_id,
             int(receive_rank),
             intent.handle,
         )
@@ -172,13 +172,13 @@ def _wait_for_descriptor(intent: KvEgressIntent, client, receive_rank: int) -> d
             return descriptor
         if state in {"failed", "expired"}:
             raise RuntimeError(
-                "P/D receive descriptor is not usable: "
-                f"state={state} request_id={intent.pd_request_id}"
+                "staged load descriptor is not usable: "
+                f"state={state} request_id={intent.request_id}"
             )
         if time.monotonic() >= deadline:
             raise TimeoutError(
-                "Timed out waiting for P/D receive descriptor: "
-                f"request_id={intent.pd_request_id} dst={intent.dst_instance_id} "
+                "Timed out waiting for staged load descriptor: "
+                f"request_id={intent.request_id} dst={intent.remote_instance_id} "
                 f"state={state}"
             )
         time.sleep(interval_s)
@@ -192,18 +192,18 @@ def _build_write_descs(
 ) -> list[tuple[int, int, int]]:
     slabs = list(descriptor.get("slabs") or [])
     if not slabs:
-        raise RuntimeError(f"P/D descriptor has no slabs: request_id={intent.pd_request_id}")
+        raise RuntimeError(f"staged load descriptor has no slabs: request_id={intent.request_id}")
 
     ranks = list(descriptor.get("ranks") or [])
     if ranks:
         if len(ranks) != 1:
             raise RuntimeError(
-                f"P/D rank descriptor must contain exactly one receive rank, got {len(ranks)}"
+                f"staged load rank descriptor must contain exactly one receive rank, got {len(ranks)}"
             )
         actual_rank = int(ranks[0].get("receive_rank", -1))
         if actual_rank != receive_rank:
             raise RuntimeError(
-                f"P/D descriptor receive_rank mismatch: expected={receive_rank} got={actual_rank}"
+                f"staged load descriptor receive_rank mismatch: expected={receive_rank} got={actual_rank}"
             )
 
     descs: list[tuple[int, int, int]] = []
@@ -214,18 +214,18 @@ def _build_write_descs(
 
         local = layers.get(layer_name)
         if local is None:
-            raise RuntimeError(f"P/D egress layer is not registered locally: {layer_name}")
+            raise RuntimeError(f"KV egress layer is not registered locally: {layer_name}")
 
         slab_index = int(remote_layer["slab_index"])
         if slab_index < 0 or slab_index >= len(slabs):
-            raise RuntimeError(f"P/D descriptor references invalid slab_index={slab_index}")
+            raise RuntimeError(f"staged load descriptor references invalid slab_index={slab_index}")
         slab = slabs[slab_index]
 
         block_count = len(intent.block_ids)
         remote_num_blocks = int(remote_layer["num_blocks"])
         if block_count > remote_num_blocks:
             raise RuntimeError(
-                f"P/D descriptor has {remote_num_blocks} blocks for {layer_name}, "
+                f"staged load descriptor has {remote_num_blocks} blocks for {layer_name}, "
                 f"but intent needs {block_count}"
             )
 
@@ -238,12 +238,12 @@ def _build_write_descs(
 
         if segment_count != local.segments:
             raise RuntimeError(
-                f"P/D segment count mismatch for {layer_name}: "
+                f"KV egress segment count mismatch for {layer_name}: "
                 f"local={local.segments} remote={segment_count}"
             )
         if segment_size != local.bytes_per_block:
             raise RuntimeError(
-                f"P/D segment size mismatch for {layer_name}: "
+                f"KV egress segment size mismatch for {layer_name}: "
                 f"local={local.bytes_per_block} remote={segment_size}"
             )
 
@@ -251,7 +251,7 @@ def _build_write_descs(
             local_block = int(local_block_id)
             if local_block < 0 or local_block >= local.num_blocks:
                 raise RuntimeError(
-                    f"P/D local block id out of range for {layer_name}: "
+                    f"KV egress local block id out of range for {layer_name}: "
                     f"block_id={local_block} capacity={local.num_blocks}"
                 )
             for segment_idx in range(segment_count):
@@ -264,7 +264,7 @@ def _build_write_descs(
                 descs.append((local_ptr, remote_ptr, segment_size))
 
     if not descs:
-        raise RuntimeError(f"P/D egress has no write descriptors: request_id={intent.pd_request_id}")
+        raise RuntimeError(f"KV egress has no write descriptors: request_id={intent.request_id}")
     return descs
 
 
@@ -304,9 +304,9 @@ def _local_segment_ptr(
 
 
 def _engine_client(addr: str):
-    from pegaflow.pegaflow import EngineRpcClient
+    from pegaflow import PegaClient
 
-    return EngineRpcClient(_grpc_endpoint(addr))
+    return PegaClient(_grpc_endpoint(addr))
 
 
 def _grpc_endpoint(addr: str) -> str:

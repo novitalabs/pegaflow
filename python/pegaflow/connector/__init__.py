@@ -28,7 +28,7 @@ from pegaflow.connector.common import (
 from pegaflow.connector.scheduler import SchedulerConnector
 from pegaflow.connector.state_manager import ServiceStateManager
 from pegaflow.connector.worker import WorkerConnector
-from pegaflow.pegaflow import EngineRpcClient
+from pegaflow import PegaClient
 
 
 class PegaKVConnector(KVConnectorBase_V1):
@@ -104,7 +104,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             "PEGAFLOW_PORT"
         ) or vllm_config.kv_transfer_config.get_from_extra_config("pegaflow.port", 50055)
         self._engine_endpoint = f"{server_host}:{server_port}"
-        engine_client = EngineRpcClient(self._engine_endpoint)
+        engine_client = PegaClient(self._engine_endpoint)
         logger.debug("[PegaKVConnector] Connected to engine server at %s", self._engine_endpoint)
 
         self._state_manager = ServiceStateManager(engine_client)
@@ -137,7 +137,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             # stream per vllm replica is enough — if any tp worker crashes,
             # the scheduler dies too, closing this stream and triggering
             # server-side cleanup of the instance's CUDA IPC mappings.
-            engine_client.start_session_watcher(instance_id, namespace, tp_size, world_size)
+            engine_client._start_session_watcher(instance_id, namespace, tp_size, world_size)
         else:
             self._worker = WorkerConnector(self._ctx)
 
@@ -211,11 +211,7 @@ class PegaKVConnector(KVConnectorBase_V1):
     def handle_preemptions(self, preempted) -> None:
         if not self._worker:
             return
-        # Compat: old vLLM passes set[str], new vLLM passes KVConnectorMetadata
-        if isinstance(preempted, set):
-            preempted_req_ids = preempted
-        else:
-            preempted_req_ids = getattr(preempted, "preempted_req_ids", None) or set()
+        preempted_req_ids = getattr(preempted, "preempted_req_ids", preempted) or set()
         self._worker.handle_preemptions(preempted_req_ids)
 
     # ==============================

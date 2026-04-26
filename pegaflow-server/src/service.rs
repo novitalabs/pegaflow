@@ -19,7 +19,7 @@ use crate::session::SessionRegistry;
 use log::{debug, info, warn};
 use parking_lot::Mutex;
 use pegaflow_core::{
-    EngineError, LayerSave, PdReceiveDescriptorLookup,
+    EngineError, LayerSave, PdReceiveDescriptorLookup, PdReceiveLoadItem,
     PdReceivePrepareRequest as CorePdReceivePrepareRequest, PegaEngine, PrefetchStatus,
 };
 use pyo3::{PyErr, Python};
@@ -145,6 +145,17 @@ impl GrpcEngineService {
                 block_ids.len(),
                 block_hashes.len()
             )));
+        }
+        Ok(())
+    }
+
+    fn validate_pd_load_items(items: &[PdReceiveLoadItem]) -> Result<(), Status> {
+        for (index, item) in items.iter().enumerate() {
+            if item.request_id.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "items[{index}].request_id must not be empty"
+                )));
+            }
         }
         Ok(())
     }
@@ -463,14 +474,14 @@ impl Engine for GrpcEngineService {
 
         let req = request.into_inner();
         let layer_count = req.layer_names.len();
-        let block_count = req.block_ids.len();
-        let hash_count = req.block_hashes.len();
+        let item_count = req.items.len();
+        let block_count: usize = req.items.iter().map(|item| item.block_ids.len()).sum();
 
         trace_root!("rpc.load_pd_receive", root, || {
             [
                 ("instance_id", req.instance_id.clone()),
-                ("request_id", req.request_id.clone()),
                 ("layers", layer_count.to_string()),
+                ("items", item_count.to_string()),
                 ("blocks", block_count.to_string()),
             ]
         });
@@ -480,14 +491,10 @@ impl Engine for GrpcEngineService {
                 instance_id,
                 tp_rank,
                 device_id,
-                layer_names,
-                block_ids,
-                block_hashes,
                 load_state_shm,
-                request_id,
-                handle,
+                layer_names,
                 receive_rank,
-                ..
+                items,
             } = req;
             let tp_rank = Self::usize_from_u32(tp_rank, "tp_rank")?;
             let receive_rank = if receive_rank < 0 {
@@ -497,23 +504,30 @@ impl Engine for GrpcEngineService {
                     Status::invalid_argument("receive_rank does not fit into usize")
                 })?)
             };
+            let items: Vec<PdReceiveLoadItem> = items
+                .into_iter()
+                .map(|item| PdReceiveLoadItem {
+                    request_id: item.request_id,
+                    handle: if item.handle.is_empty() {
+                        None
+                    } else {
+                        Some(item.handle)
+                    },
+                    block_ids: item.block_ids,
+                })
+                .collect();
+            Self::validate_pd_load_items(&items)?;
             debug!(
-                "RPC [load_pd_receive]: instance_id={} pd_request_id={} tp_rank={} device_id={} receive_rank={:?} layers={} block_ids={} block_hashes={} load_state_shm_len={} handle={}",
+                "RPC [load_pd_receive]: instance_id={} tp_rank={} device_id={} receive_rank={:?} layers={} items={} blocks={} load_state_shm_len={}",
                 instance_id,
-                request_id,
                 tp_rank,
                 device_id,
                 receive_rank,
                 layer_count,
+                item_count,
                 block_count,
-                hash_count,
                 load_state_shm.len(),
-                handle,
             );
-            if request_id.is_empty() {
-                return Err(Status::invalid_argument("request_id must not be empty"));
-            }
-            Self::validate_load_request(&block_ids, &block_hashes)?;
             let layer_refs: Vec<&str> = layer_names.iter().map(|s| s.as_str()).collect();
 
             self.engine
@@ -522,12 +536,9 @@ impl Engine for GrpcEngineService {
                     tp_rank,
                     device_id,
                     &load_state_shm,
-                    &request_id,
-                    Some(handle.as_str()),
                     receive_rank,
                     &layer_refs,
-                    &block_ids,
-                    &block_hashes,
+                    &items,
                 )
                 .map_err(Self::map_engine_error)?;
 
@@ -542,8 +553,8 @@ impl Engine for GrpcEngineService {
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         match &result {
             Ok(_) => debug!(
-                "RPC [load_pd_receive] completed: ok layers={} blocks={} hashes={} elapsed_ms={:.2}",
-                layer_count, block_count, hash_count, elapsed_ms
+                "RPC [load_pd_receive] completed: ok layers={} items={} blocks={} elapsed_ms={:.2}",
+                layer_count, item_count, block_count, elapsed_ms
             ),
             Err(status) => warn!(
                 "RPC [load_pd_receive] failed: code={} message={} elapsed_ms={:.2}",

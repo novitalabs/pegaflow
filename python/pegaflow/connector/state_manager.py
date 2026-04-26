@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 from pegaflow.logging_utils import get_connector_logger
 
 if TYPE_CHECKING:
-    from pegaflow.pegaflow import EngineRpcClient
+    from pegaflow import PegaClient
 
 logger = get_connector_logger()
 
@@ -30,7 +30,7 @@ class ServiceStateManager:
 
     def __init__(
         self,
-        engine_client: "EngineRpcClient",
+        engine_client: "PegaClient",
         health_check_interval: float = 10.0,
     ):
         self._client = engine_client
@@ -83,8 +83,7 @@ class ServiceStateManager:
                 break
 
             try:
-                ok, _ = self._client.health()
-                if ok:
+                if self._client._health():
                     with self._lock:
                         self._available = True
                     logger.debug("[PegaKVConnector] Service recovered")

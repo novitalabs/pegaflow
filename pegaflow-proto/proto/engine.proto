@@ -59,17 +59,20 @@ message LoadResponse {
   ResponseStatus status = 1;
 }
 
+message LoadPdReceiveItem {
+  string request_id = 1;
+  string handle = 2;
+  repeated int32 block_ids = 3;
+}
+
 message LoadPdReceiveRequest {
   string instance_id = 1;
   uint32 tp_rank = 2;
   int32 device_id = 3;
   string load_state_shm = 4;
   repeated string layer_names = 5;
-  repeated int32 block_ids = 6;
-  repeated bytes block_hashes = 7;
-  string request_id = 8;
-  string handle = 9;
-  int32 receive_rank = 10;         // -1 means use tp_rank.
+  int32 receive_rank = 6;          // -1 means use tp_rank.
+  repeated LoadPdReceiveItem items = 7;
 }
 
 message LoadPdReceiveResponse {
@@ -201,8 +204,8 @@ message ReleaseTransferLockResponse {
 message PreparePdReceiveRequest {
   string instance_id = 1;          // D-side vLLM/PegaFlow instance.
   string request_id = 2;           // Stable router/vLLM request id.
-  repeated bytes block_hashes = 3; // Optional; carried once, not per rank/layer.
-  uint64 num_blocks = 4;           // Required if block_hashes is empty.
+  repeated bytes block_hashes = 3; // Optional prefix metadata; may be shorter than num_blocks.
+  uint64 num_blocks = 4;           // Receive allocation size; required if block_hashes is empty.
   uint32 expected_imm_count = 5;   // 0 means D defaults from receive ranks * NIC fanout.
   uint64 expire_after_ms = 6;      // Defaults to server policy when unset.
 }
