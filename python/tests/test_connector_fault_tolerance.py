@@ -17,13 +17,13 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+from pegaflow import LoadPlan, LoadRequest, LoadSourceKind
 from pegaflow.connector.common import (
     ConnectorContext,
     LoadIntent,
     PegaConnectorMetadata,
 )
 from pegaflow.connector.worker import WorkerConnector
-from pegaflow import LoadPlan, LoadRequest, LoadSourceKind
 
 
 class FakeLoadHandle:

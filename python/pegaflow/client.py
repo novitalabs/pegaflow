@@ -78,11 +78,11 @@ class PrepareLoadResult:
     plan: LoadPlan | None = None
 
     @classmethod
-    def in_progress(cls) -> "PrepareLoadResult":
+    def in_progress(cls) -> PrepareLoadResult:
         return cls(preparing=True)
 
     @classmethod
-    def done(cls, plan: LoadPlan | None = None) -> "PrepareLoadResult":
+    def done(cls, plan: LoadPlan | None = None) -> PrepareLoadResult:
         return cls(preparing=False, plan=plan)
 
 

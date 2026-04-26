@@ -5,6 +5,10 @@ Scheduler-side connector logic.
 import time
 from typing import TYPE_CHECKING
 
+from pegaflow import (
+    LoadPlan,
+    PrepareLoadResult,
+)
 from pegaflow.connector.common import (
     ConnectorContext,
     KvEgressIntent,
@@ -14,22 +18,19 @@ from pegaflow.connector.common import (
     SaveIntent,
     logger,
 )
-from pegaflow import (
-    LoadPlan,
-    PrepareLoadResult,
-)
 from pegaflow.kv_transfer import (
-    prepare_load_request_from_request,
     prefill_push_from_request,
+    prepare_load_request_from_request,
 )
 from pegaflow.pegaflow import PegaFlowBusinessError, PegaFlowServiceError
 
 if TYPE_CHECKING:
-    from pegaflow import PrepareLoadRequest
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.outputs import KVConnectorOutput
     from vllm.v1.request import Request
+
+    from pegaflow import PrepareLoadRequest
 
 
 class SchedulerConnector:

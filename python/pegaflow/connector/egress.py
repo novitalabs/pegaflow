@@ -9,8 +9,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from pegaflow.connector.common import KvEgressIntent
-from pegaflow.connector.common import logger
+from pegaflow.connector.common import KvEgressIntent, logger
 
 if TYPE_CHECKING:
     from pegaflow.pegaflow import KvEgressRuntime
@@ -59,16 +58,13 @@ class KvEgressStats:
 
 def resolve_kv_egress_config() -> KvEgressConfig:
     enabled = _truthy_env("PEGAFLOW_KV_EGRESS")
-    nic_names = (
-        _parse_env_list("PEGAFLOW_KV_EGRESS_NICS")
-        or _parse_env_list("PEGAFLOW_RDMA_NICS")
-    )
+    nic_names = _parse_env_list("PEGAFLOW_KV_EGRESS_NICS") or _parse_env_list("PEGAFLOW_RDMA_NICS")
     if enabled and not nic_names:
         nic_names = ("mlx5_0",)
     return KvEgressConfig(enabled=enabled, nic_names=nic_names)
 
 
-def create_kv_egress_runtime() -> "KvEgressRuntime | None":
+def create_kv_egress_runtime() -> KvEgressRuntime | None:
     config = resolve_kv_egress_config()
     if not config.enabled:
         return None
@@ -93,7 +89,7 @@ def create_kv_egress_runtime() -> "KvEgressRuntime | None":
 
 
 def execute_kv_egress(
-    runtime: "KvEgressRuntime",
+    runtime: KvEgressRuntime,
     intent: KvEgressIntent,
     layers: dict[str, EgressLayerRegistration],
     requester_id: str,
@@ -143,9 +139,7 @@ def execute_kv_egress(
         total_ms=_elapsed_ms(total_start),
         write_nics_active=int(write_nics_active),
         imm_nics_active=int(imm_nics_active),
-        preferred_nic_idx=(
-            int(preferred_nic_idx) if preferred_nic_idx is not None else None
-        ),
+        preferred_nic_idx=(int(preferred_nic_idx) if preferred_nic_idx is not None else None),
     )
 
 
@@ -163,8 +157,7 @@ def _wait_for_descriptor(intent: KvEgressIntent, client, receive_rank: int) -> d
         )
         if not descriptor.get("ok", False):
             raise RuntimeError(
-                "GetPdReceiveDescriptor failed: "
-                f"{descriptor.get('message', 'unknown error')}"
+                f"GetPdReceiveDescriptor failed: {descriptor.get('message', 'unknown error')}"
             )
 
         state = descriptor.get("state")
