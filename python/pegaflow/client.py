@@ -128,8 +128,10 @@ class SaveRequest:
 class LoadHandle:
     """Completion handle for an asynchronous load submitted by PegaFlow."""
 
-    def __init__(self, native: object | None = None) -> None:
-        self._native = native if native is not None else _native._NativeLoadState()
+    def __init__(self, native: _native._NativeLoadState | None = None) -> None:
+        self._native: _native._NativeLoadState = (
+            native if native is not None else _native._NativeLoadState()
+        )
 
     @property
     def shm_name(self) -> str:
