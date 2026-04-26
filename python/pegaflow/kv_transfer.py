@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeAlias
 
 from pegaflow.client import PrepareLoadRequest
 
@@ -16,7 +16,8 @@ _TYPE_KEY = "type"
 _DECODE_LOAD = "decode_load"
 _PREFILL_PUSH = "prefill_push"
 
-TransferParams = Mapping[str, object]
+TransferParam: TypeAlias = str | int | None
+TransferParams: TypeAlias = dict[str, TransferParam]
 
 
 @dataclass(frozen=True)
@@ -37,9 +38,10 @@ def decode_load_from_request(request: Request) -> DecodeLoad | None:
     params = _transfer_params(request)
     if params is None or params.get(_TYPE_KEY) != _DECODE_LOAD:
         return None
+    expected_writes = _optional_int_param(params, "expected_writes")
     return DecodeLoad(
         request_id=_request_id(params, request.request_id),
-        expected_writes=_int_param(params, "expected_writes"),
+        expected_writes=0 if expected_writes is None else expected_writes,
     )
 
 
@@ -48,9 +50,9 @@ def prefill_push_from_request(request: Request) -> PrefillPush | None:
     if params is None or params.get(_TYPE_KEY) != _PREFILL_PUSH:
         return None
 
-    decode_endpoint = _str_param(params, "decode_endpoint")
-    decode_instance_id = _str_param(params, "decode_instance_id")
-    if not decode_endpoint or not decode_instance_id:
+    decode_endpoint = _optional_str_param(params, "decode_endpoint")
+    decode_instance_id = _optional_str_param(params, "decode_instance_id")
+    if decode_endpoint is None or decode_instance_id is None:
         return None
 
     return PrefillPush(
@@ -84,38 +86,42 @@ def _transfer_params(request: Request) -> TransferParams | None:
     params = request.kv_transfer_params
     if not isinstance(params, Mapping):
         return None
-    pegaflow_params = params.get(_ROOT_KEY)
-    if not isinstance(pegaflow_params, Mapping):
+    raw_params = params.get(_ROOT_KEY)
+    if not isinstance(raw_params, Mapping):
         return None
-    return pegaflow_params
+
+    typed_params: TransferParams = {}
+    for key, value in raw_params.items():
+        if not isinstance(key, str):
+            continue
+        if value is None or isinstance(value, str):
+            typed_params[key] = value
+            continue
+        if isinstance(value, int) and not isinstance(value, bool):
+            typed_params[key] = value
+    return typed_params
 
 
 def _request_id(params: TransferParams, fallback: str) -> str:
     value = params.get("request_id")
-    if value in (None, ""):
+    if not isinstance(value, str) or not value:
         return fallback
-    return str(value)
+    return value
 
 
 def _optional_str_param(params: TransferParams, key: str) -> str | None:
     value = params.get(key)
-    if value is None:
+    if not isinstance(value, str):
         return None
-    string_value = str(value)
-    return string_value or None
+    return value or None
 
 
-def _str_param(params: TransferParams, key: str) -> str:
-    value = _optional_str_param(params, key)
-    if value is None:
-        return ""
-    return value
-
-
-def _int_param(params: TransferParams, key: str) -> int:
+def _optional_int_param(params: TransferParams, key: str) -> int | None:
     value = params.get(key)
     if value is None:
-        return 0
+        return None
+    if isinstance(value, int):
+        return value
     return int(value)
 
 

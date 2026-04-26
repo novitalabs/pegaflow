@@ -35,20 +35,16 @@ if TYPE_CHECKING:
 @dataclass
 class _RequestState:
     request: "Request"
+    handled_num_preemptions: int = 0
     external_matched_blocks: int = 0
     allocated_blocks: list[int] = field(default_factory=list)
-    computed_blocks: int = 0
     scheduled_tokens: int = 0
-    next_stored_block_idx: int = 0
+    next_stored_block_idx: int | None = None
     load_plan: LoadPlan | None = None
     pending_load_intent: LoadIntent | None = None
     prefill_push_submitted: bool = False
     pending_save: bool = False
     hold_after_save: bool = False
-
-    @property
-    def block_hashes(self) -> tuple[bytes, ...]:
-        return tuple(self.request.block_hashes)
 
 
 class SchedulerConnector:
@@ -95,26 +91,30 @@ class SchedulerConnector:
         num_external_tokens: int,
     ) -> None:
         req_id = request.request_id
-        state = self._get_or_create_state(request)
+        state = self._require_state(req_id)
+        assert state.request is request, f"req {req_id} request object unexpectedly replaced"
 
-        state.computed_blocks = max(state.computed_blocks, _count_computed_blocks(blocks))
-        if not state.allocated_blocks:
+        if state.next_stored_block_idx is None:
+            assert not state.allocated_blocks, (
+                f"req {req_id} save cursor initialized before block ids were tracked"
+            )
+            assert state.scheduled_tokens == 0, (
+                f"req {req_id} save cursor initialized after scheduling started"
+            )
             # The first locally allocated block may be after an external-hit
             # prefix. Track that global block index explicitly.
-            state.scheduled_tokens = 0
             state.next_stored_block_idx = state.external_matched_blocks
 
         if num_external_tokens > 0:
             plan = state.load_plan
             assert plan is not None, f"req {req_id} missing ready load plan"
             block_ids = blocks.get_block_ids()[0]
-            start_block_idx = state.computed_blocks
             num_load_blocks = _ceil_div(num_external_tokens, self._ctx.virtual_block_size)
-            expected_load_blocks = len(block_ids) - state.computed_blocks
-            assert num_load_blocks == expected_load_blocks, (
-                f"req {req_id} load block mismatch: external={num_load_blocks} "
-                f"expected={expected_load_blocks}"
+            assert num_load_blocks <= len(block_ids), (
+                f"req {req_id} load blocks exceed allocation: "
+                f"load={num_load_blocks} total={len(block_ids)}"
             )
+            start_block_idx = len(block_ids) - num_load_blocks
 
             state.pending_load_intent = LoadIntent(
                 block_ids=tuple(block_ids[start_block_idx:]),
@@ -123,11 +123,11 @@ class SchedulerConnector:
             )
             state.load_plan = None
             logger.debug(
-                "[PegaKVConnector] req=%s alloc: total_blocks=%d computed_blocks=%d "
+                "[PegaKVConnector] req=%s alloc: total_blocks=%d local_prefix_blocks=%d "
                 "load_blocks=%d start_block_idx=%d load_tokens=%d pending_loads=%d",
                 req_id,
                 len(block_ids),
-                state.computed_blocks,
+                start_block_idx,
                 len(state.pending_load_intent.block_ids),
                 start_block_idx,
                 state.pending_load_intent.num_tokens,
@@ -136,6 +136,9 @@ class SchedulerConnector:
 
     def build_connector_meta(self, scheduler_output: "SchedulerOutput") -> PegaConnectorMetadata:
         save_intents: dict[str, SaveIntent] = {}
+        for req_id in scheduler_output.preempted_req_ids or ():
+            state = self._require_state(req_id)
+            self._sync_preemption_state(state)
         load_intents = self._drain_pending_load_intents()
 
         # Process new requests
@@ -195,12 +198,12 @@ class SchedulerConnector:
 
     def _consume_save_intent(self, req_id: str, state: _RequestState) -> SaveIntent | None:
         """Calculate and return SaveIntent for new blocks that need saving."""
-        if not state.block_hashes:
+        block_hashes = tuple(state.request.block_hashes)
+        if not block_hashes:
             return None
-
-        block_hashes = state.block_hashes
         allocated = state.allocated_blocks
         start_block_idx = state.next_stored_block_idx
+        assert start_block_idx is not None, f"req {req_id} save cursor used before initialization"
 
         # _allocated_blocks tracks request block IDs in global request order.
         # In external-hit cases, the prefix-loaded block IDs are still present at
@@ -210,7 +213,10 @@ class SchedulerConnector:
             len(allocated),
             state.scheduled_tokens // self._ctx.virtual_block_size,
         )
-        saveable_block_idx = min(len(block_hashes), state.external_matched_blocks + local_saveable)
+        saveable_block_idx = min(
+            len(block_hashes),
+            state.external_matched_blocks + local_saveable,
+        )
         new_blocks = saveable_block_idx - start_block_idx
         if new_blocks <= 0:
             return None
@@ -297,14 +303,15 @@ class SchedulerConnector:
             if transfer is None:
                 continue
 
-            hash_count = min(len(state.block_hashes), expected_blocks)
+            block_hashes = tuple(request.block_hashes)
+            hash_count = min(len(block_hashes), expected_blocks)
 
             egress_intents[req_id] = KvEgressIntent(
                 request_id=transfer.request_id,
                 remote_endpoint=transfer.decode_endpoint,
                 remote_instance_id=transfer.decode_instance_id,
                 block_ids=tuple(state.allocated_blocks[:expected_blocks]),
-                block_hashes=tuple(state.block_hashes[:hash_count]),
+                block_hashes=block_hashes[:hash_count],
                 handle=transfer.handle,
             )
             state.prefill_push_submitted = True
@@ -337,10 +344,7 @@ class SchedulerConnector:
             len(state.allocated_blocks),
             token_ready_blocks,
         )
-        ready = max(
-            state.computed_blocks,
-            state.external_matched_blocks + local_ready,
-        )
+        ready = state.external_matched_blocks + local_ready
         return min(total_blocks, ready)
 
     def _prepare_load(
@@ -401,17 +405,48 @@ class SchedulerConnector:
     def _get_or_create_state(self, request: "Request") -> _RequestState:
         state = self._request_states.get(request.request_id)
         if state is None:
-            state = _RequestState(request=request)
+            state = _RequestState(
+                request=request,
+                handled_num_preemptions=request.num_preemptions,
+            )
             self._request_states[request.request_id] = state
         else:
-            state.request = request
+            assert state.request is request, (
+                f"req {request.request_id} request object unexpectedly replaced"
+            )
+            self._sync_preemption_state(state)
         return state
 
     def _require_state(self, req_id: str) -> _RequestState:
         state = self._request_states.get(req_id)
         if state is None:
-            raise RuntimeError(f"req {req_id} not initialized in update_state_after_alloc")
+            raise RuntimeError(f"req {req_id} missing scheduler connector state")
         return state
+
+    def _sync_preemption_state(self, state: _RequestState) -> None:
+        current_num_preemptions = state.request.num_preemptions
+        handled_num_preemptions = state.handled_num_preemptions
+        assert current_num_preemptions >= handled_num_preemptions, (
+            f"req {state.request.request_id} preemption counter went backwards: "
+            f"{current_num_preemptions} < {handled_num_preemptions}"
+        )
+        if current_num_preemptions == handled_num_preemptions:
+            return
+
+        req_id = state.request.request_id
+        logger.info(
+            "[PegaKVConnector] req=%s resetting scheduling state after preemption: %d -> %d",
+            req_id,
+            handled_num_preemptions,
+            current_num_preemptions,
+        )
+        state.handled_num_preemptions = current_num_preemptions
+        state.external_matched_blocks = 0
+        state.allocated_blocks.clear()
+        state.scheduled_tokens = 0
+        state.next_stored_block_idx = None
+        state.load_plan = None
+        state.pending_load_intent = None
 
     def _drain_pending_load_intents(self) -> dict[str, LoadIntent]:
         load_intents: dict[str, LoadIntent] = {}
@@ -437,10 +472,6 @@ def _transferable_prompt_tokens(request: "Request", num_computed_tokens: int) ->
     # before the final prompt token, then recomputes the final prompt token to
     # produce logits locally.
     return max(0, request.num_prompt_tokens - 1 - int(num_computed_tokens))
-
-
-def _count_computed_blocks(blocks: "KVCacheBlocks") -> int:
-    return sum(block.block_hash is not None for block in blocks.blocks[0])
 
 
 __all__ = ["SchedulerConnector"]
