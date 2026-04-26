@@ -31,7 +31,7 @@ class PrefillPush:
     handle: str | None = None
 
 
-def decode_load_from_request(request: "Request") -> DecodeLoad | None:
+def decode_load_from_request(request: Request) -> DecodeLoad | None:
     params = _transfer_params(request)
     if _value(params, _TYPE_KEY) != _DECODE_LOAD:
         return None
@@ -42,7 +42,7 @@ def decode_load_from_request(request: "Request") -> DecodeLoad | None:
     )
 
 
-def prefill_push_from_request(request: "Request") -> PrefillPush | None:
+def prefill_push_from_request(request: Request) -> PrefillPush | None:
     params = _transfer_params(request)
     if _value(params, _TYPE_KEY) != _PREFILL_PUSH:
         return None
@@ -63,7 +63,7 @@ def prefill_push_from_request(request: "Request") -> PrefillPush | None:
 
 
 def prepare_load_request_from_request(
-    request: "Request",
+    request: Request,
     instance_id: str,
     num_computed_tokens: int,
     virtual_block_size: int,
@@ -81,7 +81,7 @@ def prepare_load_request_from_request(
     )
 
 
-def _prompt_token_count(request: "Request") -> int:
+def _prompt_token_count(request: Request) -> int:
     prompt_token_ids = getattr(request, "prompt_token_ids", None)
     try:
         return len(prompt_token_ids)
@@ -95,9 +95,9 @@ def _prompt_token_count(request: "Request") -> int:
     return int(getattr(request, "num_tokens", 0) or 0)
 
 
-def _transfer_params(request: "Request") -> Any:
+def _transfer_params(request: Request) -> Any:
     try:
-        return getattr(request, "kv_transfer_params")[_ROOT_KEY]
+        return request.kv_transfer_params[_ROOT_KEY]
     except (AttributeError, KeyError, TypeError):
         return _EMPTY_PARAMS
 

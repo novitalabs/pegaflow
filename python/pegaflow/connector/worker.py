@@ -12,6 +12,16 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from pegaflow import (
+    KvCacheLayer,
+    KvCacheRegistration,
+    LayerSave,
+    LoadHandle,
+    LoadItem,
+    LoadRequest,
+    LoadSourceKind,
+    SaveRequest,
+)
 from pegaflow.connector.common import (
     ConnectorContext,
     KvEgressIntent,
@@ -26,16 +36,6 @@ from pegaflow.connector.egress import (
     execute_kv_egress,
 )
 from pegaflow.ipc_wrapper import CudaIPCWrapper
-from pegaflow import (
-    KvCacheLayer,
-    KvCacheRegistration,
-    LayerSave,
-    LoadHandle,
-    LoadItem,
-    LoadSourceKind,
-    LoadRequest,
-    SaveRequest,
-)
 
 if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionMetadata
@@ -421,11 +421,7 @@ class WorkerConnector:
     ) -> None:
         load_start = time.perf_counter()
         request_ids = [req_id for req_id, _ in items]
-        all_block_ids = [
-            int(block_id)
-            for _, item in items
-            for block_id in item.block_ids
-        ]
+        all_block_ids = [int(block_id) for _, item in items for block_id in item.block_ids]
 
         try:
             load_state = self._ctx.engine_client.load(
@@ -529,9 +525,7 @@ class WorkerConnector:
             return
 
         request_ids = list(
-            dict.fromkeys(
-                [*metadata.egress_intents.keys(), *metadata.save_intents.keys()]
-            )
+            dict.fromkeys([*metadata.egress_intents.keys(), *metadata.save_intents.keys()])
         )
 
         if self._should_skip_save_submission():
@@ -611,11 +605,10 @@ class WorkerConnector:
                     saves_by_layer[layer_name][0].extend(save_intent.block_ids)
                     saves_by_layer[layer_name][1].extend(save_intent.block_hashes)
 
-        if saves_by_layer or egress_items:
+        if (saves_by_layer or egress_items) and self._torch_device is not None:
             # Ensure all GPU kernels have completed before reading KV cache
             # Otherwise we may copy uninitialized memory (attention kernel is async)
-            if self._torch_device is not None:
-                torch.cuda.synchronize(self._torch_device)
+            torch.cuda.synchronize(self._torch_device)
 
         if egress_items:
             self._wait_for_egress_source_loads([req_id for req_id, _ in egress_items])
@@ -675,8 +668,7 @@ class WorkerConnector:
             return
         if not self._egress_layers:
             logger.error(
-                "[PegaKVConnector] KV egress requested before KV caches were registered "
-                "(reqs=%s)",
+                "[PegaKVConnector] KV egress requested before KV caches were registered (reqs=%s)",
                 [req_id for req_id, _ in egress_items],
             )
             return
@@ -749,8 +741,7 @@ class WorkerConnector:
             preferred = self._kv_egress._preferred_nic_for_gpu(int(self._ctx.device_id))
         except Exception as e:
             logger.warning(
-                "[PegaKVConnector] Failed to resolve preferred KV egress NIC for "
-                "device=%s: %s",
+                "[PegaKVConnector] Failed to resolve preferred KV egress NIC for device=%s: %s",
                 self._ctx.device_id,
                 e,
             )
@@ -767,14 +758,9 @@ class WorkerConnector:
         pending = set(request_ids)
         while pending:
             with self._load_completion_lock:
-                states = {
-                    req_id: self._pending_loads.get(req_id)
-                    for req_id in pending
-                }
+                states = {req_id: self._pending_loads.get(req_id) for req_id in pending}
             waiting = {
-                req_id
-                for req_id, state in states.items()
-                if state is not None and not state.done
+                req_id for req_id, state in states.items() if state is not None and not state.done
             }
             if not waiting:
                 return
@@ -846,8 +832,7 @@ class WorkerConnector:
                     self._kv_egress._unregister_memory(ptr)
                 except Exception as cleanup_error:
                     logger.warning(
-                        "[PegaKVConnector] Failed to unregister partial egress MR "
-                        "ptr=%#x: %s",
+                        "[PegaKVConnector] Failed to unregister partial egress MR ptr=%#x: %s",
                         ptr,
                         cleanup_error,
                     )
@@ -855,8 +840,7 @@ class WorkerConnector:
 
         self._egress_layers = layers
         logger.info(
-            "[PegaKVConnector] Registered %d KV cache layer(s) for KV egress "
-            "(unique_mrs=%d)",
+            "[PegaKVConnector] Registered %d KV cache layer(s) for KV egress (unique_mrs=%d)",
             len(layers),
             len(registered_ptrs),
         )
@@ -880,8 +864,7 @@ class WorkerConnector:
 
     def _egress_requester_id(self) -> str:
         return (
-            f"{self._ctx.instance_id}:device{self._ctx.device_id}:"
-            f"tp{self._ctx.effective_tp_rank}"
+            f"{self._ctx.instance_id}:device{self._ctx.device_id}:tp{self._ctx.effective_tp_rank}"
         )
 
     def handle_preemptions(self, preempted_req_ids: set[str] | None) -> None:

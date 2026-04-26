@@ -10,9 +10,9 @@ from typing import TYPE_CHECKING
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 
+from pegaflow import LoadPlan, PegaClient
 from pegaflow.connector.connector_metrics import PegaKVConnectorStats, PegaPromMetrics
 from pegaflow.logging_utils import get_connector_logger
-from pegaflow import LoadPlan, PegaClient
 
 if TYPE_CHECKING:
     from pegaflow.connector.state_manager import ServiceStateManager

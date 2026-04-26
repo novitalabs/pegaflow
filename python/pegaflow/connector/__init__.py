@@ -15,6 +15,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.distributed.parallel_state import get_pp_group, get_tensor_model_parallel_rank
 
+from pegaflow import PegaClient
 from pegaflow.connector.common import (
     ConnectorContext,
     PegaConnectorMetadata,
@@ -28,7 +29,6 @@ from pegaflow.connector.common import (
 from pegaflow.connector.scheduler import SchedulerConnector
 from pegaflow.connector.state_manager import ServiceStateManager
 from pegaflow.connector.worker import WorkerConnector
-from pegaflow import PegaClient
 
 
 class PegaKVConnector(KVConnectorBase_V1):

@@ -31,9 +31,9 @@ if _EXT_NAME not in sys.modules:
     _ext_stub.__version__ = "0.0.0-test"  # type: ignore[attr-defined]
     sys.modules[_EXT_NAME] = _ext_stub
 
+from pegaflow import LoadPlan, LoadSourceKind, PrepareLoadResult  # noqa: E402
 from pegaflow.connector.common import ConnectorContext  # noqa: E402
 from pegaflow.connector.scheduler import SchedulerConnector  # noqa: E402
-from pegaflow import LoadPlan, LoadSourceKind, PrepareLoadResult  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Helpers
