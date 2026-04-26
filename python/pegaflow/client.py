@@ -343,9 +343,12 @@ def _parse_prepare_load_result(result: dict) -> PrepareLoadResult:
     if result.get("preparing", False):
         return PrepareLoadResult.in_progress()
 
-    plan = result.get("plan")
+    return PrepareLoadResult.done(_parse_prepare_load_plan(result.get("plan")))
+
+
+def _parse_prepare_load_plan(plan: object) -> LoadPlan | None:
     if plan is None:
-        return PrepareLoadResult.done(None)
+        return None
     if not isinstance(plan, dict):
         raise TypeError(f"prepare_load returned invalid plan: {type(plan)!r}")
 
@@ -353,16 +356,20 @@ def _parse_prepare_load_result(result: dict) -> PrepareLoadResult:
         source = LoadSourceKind(str(plan["source"]))
     except KeyError as e:
         raise TypeError("prepare_load plan missing source") from e
+    except ValueError as e:
+        raise TypeError(f"prepare_load plan has invalid source: {plan['source']!r}") from e
 
     load_plan = LoadPlan(
         request_id=str(plan.get("request_id") or ""),
         source=source,
         num_tokens=int(plan.get("num_tokens") or 0),
         num_blocks=int(plan.get("num_blocks") or 0),
-        block_hashes=tuple(bytes(h) for h in plan.get("block_hashes") or ()),
+        block_hashes=tuple(bytes(block_hash) for block_hash in plan.get("block_hashes") or ()),
         token=str(plan["token"]) if plan.get("token") is not None else None,
     )
-    return PrepareLoadResult.done(load_plan)
+    if load_plan.num_tokens <= 0:
+        return None
+    return load_plan
 
 
 def _expect_ok(operation: str, ok: bool, message: str) -> None:
