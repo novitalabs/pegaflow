@@ -13,6 +13,7 @@ use sideway::ibverbs::address::{AddressHandleAttribute, Gid};
 use sideway::ibverbs::completion::{
     GenericCompletionQueue, PollCompletionQueueError, WorkCompletionStatus,
 };
+use sideway::ibverbs::device_context::LinkLayer;
 use sideway::ibverbs::memory_region::MemoryRegion;
 use sideway::ibverbs::queue_pair::{
     GenericQueuePair, PostSendGuard, QueuePair, QueuePairAttribute, QueuePairState, QueuePairType,
@@ -100,7 +101,7 @@ impl RcSession {
         let local_psn = (psn_seed as u32) & PSN_MASK;
         let local_endpoint = RcEndpoint {
             gid: runtime.local_gid.raw,
-            lid: 0, // RoCE v2 doesn't use LID
+            lid: runtime.local_lid,
             qp_num: qp.qp_number(),
             psn: local_psn,
         };
@@ -121,16 +122,42 @@ impl RcSession {
     /// Connect this QP to the remote peer (INIT → RTR → RTS).
     pub(crate) fn connect(&self, runtime: &RcRuntime, remote: &RcEndpoint) -> Result<()> {
         debug!(
-            "rc connect start: local_qpn={}, remote_qpn={}, remote_gid={:?}",
-            self.local_endpoint.qp_num, remote.qp_num, remote.gid
+            "rc connect start: link_layer={:?}, local_qpn={}, local_lid={}, remote_qpn={}, remote_lid={}, remote_gid={:?}",
+            runtime.link_layer,
+            self.local_endpoint.qp_num,
+            self.local_endpoint.lid,
+            remote.qp_num,
+            remote.lid,
+            remote.gid
         );
         let mut ah_attr = AddressHandleAttribute::new();
-        ah_attr
-            .setup_dest_lid(remote.lid)
-            .setup_port(runtime.port_num)
-            .setup_grh_dest_gid(&Gid { raw: remote.gid })
-            .setup_grh_src_gid_index(runtime.gid_index)
-            .setup_grh_hop_limit(64);
+        match runtime.link_layer {
+            LinkLayer::InfiniBand => {
+                if remote.lid == 0 {
+                    return Err(TransferError::InvalidArgument(
+                        "remote LID is zero for InfiniBand connection",
+                    ));
+                }
+                ah_attr
+                    .setup_dest_lid(remote.lid)
+                    .setup_service_level(0)
+                    .setup_port(runtime.port_num);
+            }
+            LinkLayer::Ethernet => {
+                ah_attr
+                    .setup_dest_lid(0)
+                    .setup_port(runtime.port_num)
+                    .setup_grh_dest_gid(&Gid { raw: remote.gid })
+                    .setup_grh_src_gid_index(runtime.gid_index)
+                    .setup_grh_hop_limit(64);
+            }
+            LinkLayer::Unspecified => {
+                return Err(TransferError::Backend(format!(
+                    "unsupported link layer for RC connection: {:?}",
+                    runtime.link_layer
+                )));
+            }
+        }
 
         let mut qp = self.qp.lock();
         let mut rtr_attr = QueuePairAttribute::new();
@@ -156,8 +183,8 @@ impl RcSession {
         qp.modify(&rts_attr)
             .map_err(|error| TransferError::Backend(error.to_string()))?;
         debug!(
-            "rc connect ready: local_qpn={}, remote_qpn={}",
-            self.local_endpoint.qp_num, remote.qp_num
+            "rc connect ready: link_layer={:?}, local_qpn={}, remote_qpn={}, remote_lid={}",
+            runtime.link_layer, self.local_endpoint.qp_num, remote.qp_num, remote.lid
         );
         Ok(())
     }
