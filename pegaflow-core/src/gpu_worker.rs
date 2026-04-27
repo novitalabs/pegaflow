@@ -5,6 +5,7 @@ use log::{debug, error, info, warn};
 use logforth::diagnostic::ThreadLocalDiagnostic;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::RequestTrace;
 use crate::block::RawBlock;
 use crate::metrics::core_metrics;
 use crate::sync_state::LoadState;
@@ -15,6 +16,7 @@ use pegaflow_common::{NumaNode, pin_thread_to_numa_node};
 pub(crate) struct LoadTask {
     pub layers: Vec<LayerLoadData>,
     pub load_state_shm: String,
+    pub traces: Vec<RequestTrace>,
 }
 
 /// Data for loading a single layer
@@ -199,6 +201,7 @@ fn load_worker_loop(
             Ok(load_state) => match result {
                 Ok(()) => load_state.set_completed(),
                 Err(ref e) => {
+                    RequestTrace::record_load_error_all(&task.traces);
                     error!("Load task failed: device={} error={:?}", device_id, e);
                     core_metrics().load_failures.add(1, &[]);
                     load_state.set_error();
@@ -246,8 +249,10 @@ fn save_worker_loop(
 
 /// Process a load task: copy blocks from CPU pinned memory to GPU for multiple layers
 fn process_load_task(task: &LoadTask, stream: &CudaStream) -> Result<(), EngineError> {
-    trace_root!("gpu.load_task", _root);
+    #[cfg(feature = "tracing")]
+    let _standalone_root = RequestTrace::standalone_load_root_if_empty(&task.traces);
     let start = std::time::Instant::now();
+    RequestTrace::record_load_queue_wait_all(&task.traces);
     let mut total_bytes = 0usize;
     let mut memcpy_calls = 0usize;
     // Use the first layer's block count as the physical block count (all layers have the same)
@@ -363,6 +368,8 @@ fn process_load_task(task: &LoadTask, stream: &CudaStream) -> Result<(), EngineE
             .load_duration_seconds
             .record(elapsed.as_secs_f64(), &[]);
     }
+
+    RequestTrace::record_load_success_all(&task.traces, elapsed, total_bytes, memcpy_calls);
 
     info!(
         "Load task completed: layers={} blocks={} bytes={} elapsed_ms={:.2} bandwidth_gbps={:.2} memcpy_calls={}",

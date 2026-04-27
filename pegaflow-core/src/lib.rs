@@ -53,7 +53,7 @@ pub use sync_state::{
     PREPARE_LOAD_STATE_NO_PLAN, PREPARE_LOAD_STATE_PENDING, PREPARE_LOAD_STATE_PLAN,
     PrepareLoadState, PrepareLoadStateError,
 };
-pub use trace::{set_trace_sample_rate, should_sample};
+pub use trace::{RequestTrace, set_trace_sample_rate, should_sample};
 
 use std::{
     collections::HashMap,
@@ -128,6 +128,7 @@ struct PreparedLoadEntry {
     request_id: String,
     plan: PreparedLoadPlan,
     remaining_loads: usize,
+    trace: Option<RequestTrace>,
 }
 
 /// Main engine for managing KV cache offloading.
@@ -451,6 +452,16 @@ impl PegaEngine {
         &self,
         request: &PrepareLoadRequest,
     ) -> Result<PrepareLoadOutcome, EngineError> {
+        self.prepare_load_step_with_trace(request, None).await
+    }
+
+    /// Same prepare-load state-machine step, optionally attached to a
+    /// request-lifecycle trace that will be carried into the later load.
+    pub async fn prepare_load_step_with_trace(
+        &self,
+        request: &PrepareLoadRequest,
+        trace: Option<RequestTrace>,
+    ) -> Result<PrepareLoadOutcome, EngineError> {
         assert!(
             !self.has_prepared_load_for_request(&request.instance_id, &request.request_id),
             "prepared load plan already exists before prepare_load_step: instance_id={} request_id={}",
@@ -474,17 +485,19 @@ impl PegaEngine {
             .filter(|request_id| !request_id.is_empty())
         {
             return self
-                .prepare_staged_load_step(request, decode_req_id, computed_blocks)
+                .prepare_staged_load_step(request, decode_req_id, computed_blocks, trace)
                 .await;
         }
 
-        self.prepare_cache_load_step(request, computed_blocks).await
+        self.prepare_cache_load_step(request, computed_blocks, trace)
+            .await
     }
 
     async fn prepare_cache_load_step(
         &self,
         request: &PrepareLoadRequest,
         computed_blocks: usize,
+        trace: Option<RequestTrace>,
     ) -> Result<PrepareLoadOutcome, EngineError> {
         let remaining_hashes = if computed_blocks >= request.block_hashes.len() {
             Vec::new()
@@ -530,11 +543,14 @@ impl PegaEngine {
         let remaining_loads = instance.registered_shards().len().max(1);
         Ok(self.insert_prepared_load(
             self.new_prepared_load_id(),
-            request.instance_id.clone(),
-            request.request_id.clone(),
             num_tokens,
-            plan,
-            remaining_loads,
+            PreparedLoadEntry {
+                instance_id: request.instance_id.clone(),
+                request_id: request.request_id.clone(),
+                plan,
+                remaining_loads,
+                trace,
+            },
         ))
     }
 
@@ -543,6 +559,7 @@ impl PegaEngine {
         request: &PrepareLoadRequest,
         decode_req_id: &str,
         computed_blocks: usize,
+        trace: Option<RequestTrace>,
     ) -> Result<PrepareLoadOutcome, EngineError> {
         let num_external_tokens = request
             .num_prompt_tokens
@@ -587,45 +604,44 @@ impl PegaEngine {
         let remaining_loads = instance.registered_shards().len().max(1);
         Ok(self.insert_prepared_load(
             self.new_prepared_load_id(),
-            request.instance_id.clone(),
-            request.request_id.clone(),
             num_external_tokens,
-            plan,
-            remaining_loads,
+            PreparedLoadEntry {
+                instance_id: request.instance_id.clone(),
+                request_id: request.request_id.clone(),
+                plan,
+                remaining_loads,
+                trace,
+            },
         ))
     }
 
     fn insert_prepared_load(
         &self,
         plan_id: u64,
-        instance_id: String,
-        request_id: String,
         num_tokens: u64,
-        plan: PreparedLoadPlan,
-        remaining_loads: usize,
+        entry: PreparedLoadEntry,
     ) -> PrepareLoadOutcome {
         let outcome = PrepareLoadOutcome::Plan {
             plan_id,
             num_tokens,
         };
-        let mut prepared = self.prepared_loads.lock();
-        prepared.insert(
-            plan_id,
-            PreparedLoadEntry {
-                instance_id,
-                request_id,
-                plan,
-                remaining_loads,
-            },
+        RequestTrace::add_optional_property(&entry.trace, "result", "plan");
+        RequestTrace::add_optional_property(&entry.trace, "plan_id", plan_id.to_string());
+        RequestTrace::add_optional_property(
+            &entry.trace,
+            "external_tokens",
+            num_tokens.to_string(),
         );
+        let mut prepared = self.prepared_loads.lock();
+        prepared.insert(plan_id, entry);
         outcome
     }
 
-    fn get_prepared_load_plan(
+    fn get_prepared_load_entry(
         &self,
         instance_id: &str,
         plan_id: u64,
-    ) -> Result<PreparedLoadPlan, EngineError> {
+    ) -> Result<(PreparedLoadPlan, Option<RequestTrace>), EngineError> {
         let prepared = self.prepared_loads.lock();
         let entry = prepared.get(&plan_id).ok_or_else(|| {
             EngineError::InvalidArgument(format!("prepared load plan not found: {plan_id}"))
@@ -636,7 +652,7 @@ impl PegaEngine {
                 entry.instance_id
             )));
         }
-        Ok(entry.plan.clone())
+        Ok((entry.plan.clone(), entry.trace.clone()))
     }
 
     fn has_prepared_load_for_request(&self, instance_id: &str, request_id: &str) -> bool {
@@ -790,6 +806,7 @@ impl PegaEngine {
         gpu.worker_pool().submit_load(LoadTask {
             layers,
             load_state_shm: load_state_shm.to_string(),
+            traces: Vec::new(),
         })
     }
 
@@ -870,6 +887,7 @@ impl PegaEngine {
         }
 
         let mut consumed_plan_ids: Vec<u64> = Vec::with_capacity(items.len());
+        let mut traces: Vec<RequestTrace> = Vec::with_capacity(items.len());
 
         for item in items {
             if item.plan_id == 0 {
@@ -882,7 +900,8 @@ impl PegaEngine {
                     "prepared load item block_ids must not be empty".to_string(),
                 ));
             }
-            let plan = self.get_prepared_load_plan(instance_id, item.plan_id)?;
+            let (plan, trace) = self.get_prepared_load_entry(instance_id, item.plan_id)?;
+            RequestTrace::push_load_plan(&mut traces, trace, item.plan_id, item.block_ids.len());
             let plan_blocks = plan.block_count();
             if item.block_ids.len() != plan_blocks {
                 return Err(EngineError::InvalidArgument(format!(
@@ -944,9 +963,21 @@ impl PegaEngine {
             return Ok(());
         }
 
+        let batch_blocks = items.iter().map(|item| item.block_ids.len()).sum();
+        let layer_count = layers.len();
+        let item_count = items.len();
+        let traces = RequestTrace::begin_load_wait_done_batch(
+            traces,
+            batch_blocks,
+            layer_count,
+            item_count,
+            std::time::Instant::now(),
+        );
+
         gpu.worker_pool().submit_load(LoadTask {
             layers,
             load_state_shm: load_state_shm.to_string(),
+            traces,
         })?;
 
         for plan_id in consumed_plan_ids {

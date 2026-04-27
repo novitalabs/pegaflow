@@ -498,20 +498,18 @@ async fn main() {
     let args = Args::parse();
 
     if args.pd_push {
-        if args.decode_pegaflow.len() != args.decode.len() {
-            panic!(
-                "--decode-pegaflow count ({}) must match --decode count ({})",
-                args.decode_pegaflow.len(),
-                args.decode.len()
-            );
-        }
-        if args.decode_instance.len() != args.decode.len() {
-            panic!(
-                "--decode-instance count ({}) must match --decode count ({})",
-                args.decode_instance.len(),
-                args.decode.len()
-            );
-        }
+        assert!(
+            args.decode_pegaflow.len() == args.decode.len(),
+            "--decode-pegaflow count ({}) must match --decode count ({})",
+            args.decode_pegaflow.len(),
+            args.decode.len()
+        );
+        assert!(
+            args.decode_instance.len() == args.decode.len(),
+            "--decode-instance count ({}) must match --decode count ({})",
+            args.decode_instance.len(),
+            args.decode.len()
+        );
     }
 
     let state = RouterState::new(

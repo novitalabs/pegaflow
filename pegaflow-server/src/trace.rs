@@ -1,15 +1,14 @@
 use fastrace::collector::{Config, Reporter, SpanRecord};
 
-pub fn init() {
+pub(crate) fn init() {
     // Full collection by default; reporting interval controls batching cadence.
-    fastrace::set_reporter(LogReporter::default(), Config::default());
+    fastrace::set_reporter(LogReporter, Config::default());
 }
 
-pub fn flush() {
+pub(crate) fn flush() {
     fastrace::flush();
 }
 
-#[derive(Default)]
 struct LogReporter;
 
 impl Reporter for LogReporter {

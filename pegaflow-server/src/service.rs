@@ -20,7 +20,7 @@ use parking_lot::Mutex;
 use pegaflow_core::{
     EngineError, LayerSave, PdReceiveDescriptorLookup, PegaEngine, PrepareLoadOutcome,
     PrepareLoadRequest as CorePrepareLoadRequest, PrepareLoadState,
-    PreparedLoadItem as CorePreparedLoadItem,
+    PreparedLoadItem as CorePreparedLoadItem, RequestTrace,
 };
 use pyo3::{PyErr, Python};
 use std::sync::Arc;
@@ -488,16 +488,18 @@ impl Engine for GrpcEngineService {
         request: Request<PrepareLoadRequest>,
     ) -> Result<Response<PrepareLoadResponse>, Status> {
         let req = request.into_inner();
-        trace_root!("rpc.prepare_load", root, || {
-            [
-                ("instance_id", req.instance_id.clone()),
-                ("block_hashes", req.block_hashes.len().to_string()),
-            ]
-        });
+        let lifecycle_trace = RequestTrace::load_lifecycle(
+            &req.instance_id,
+            &req.request_id,
+            req.block_hashes.len(),
+            req.num_prompt_tokens,
+            req.num_computed_tokens,
+        );
 
         let start = Instant::now();
         let engine = Arc::clone(&self.engine);
         let hll_tracker = Arc::clone(&self.hll_tracker);
+        let prepare_task_trace = lifecycle_trace.clone();
         let fut = async {
             Self::validate_prepare_load_request(&req)?;
             let state = PrepareLoadState::attach(&req.prepare_state_shm)
@@ -532,12 +534,26 @@ impl Engine for GrpcEngineService {
             );
 
             tokio::spawn(async move {
+                let mut prepare_steps = 0u64;
                 loop {
-                    match engine.prepare_load_step(&core_request).await {
+                    prepare_steps += 1;
+                    match prepare_task_trace
+                        .in_span(
+                            "prepare_load.step",
+                            engine.prepare_load_step_with_trace(
+                                &core_request,
+                                Some(prepare_task_trace.clone()),
+                            ),
+                        )
+                        .await
+                    {
                         Ok(PrepareLoadOutcome::Pending) => {
                             tokio::time::sleep(Duration::from_millis(2)).await;
                         }
                         Ok(PrepareLoadOutcome::NoPlan) => {
+                            prepare_task_trace.add_property("result", "no_plan");
+                            prepare_task_trace
+                                .add_property("prepare_steps", prepare_steps.to_string());
                             if let Ok(mut tracker) = hll_tracker.lock() {
                                 tracker.record_hashes(&core_request.block_hashes);
                             }
@@ -548,6 +564,8 @@ impl Engine for GrpcEngineService {
                             plan_id,
                             num_tokens,
                         }) => {
+                            prepare_task_trace
+                                .add_property("prepare_steps", prepare_steps.to_string());
                             if let Ok(mut tracker) = hll_tracker.lock() {
                                 tracker.record_hashes(&core_request.block_hashes);
                             }
@@ -555,6 +573,9 @@ impl Engine for GrpcEngineService {
                             break;
                         }
                         Err(err) => {
+                            prepare_task_trace.add_property("result", "error");
+                            prepare_task_trace
+                                .add_property("prepare_steps", prepare_steps.to_string());
                             warn!(
                                 "prepare_load task failed: instance={} request={} error={}",
                                 core_request.instance_id, core_request.request_id, err
@@ -571,7 +592,9 @@ impl Engine for GrpcEngineService {
             }))
         };
 
-        let result: Result<Response<PrepareLoadResponse>, Status> = trace_in_span!(root, fut).await;
+        let result: Result<Response<PrepareLoadResponse>, Status> = lifecycle_trace
+            .in_span("prepare_load.rpc_accept", fut)
+            .await;
 
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         match &result {
