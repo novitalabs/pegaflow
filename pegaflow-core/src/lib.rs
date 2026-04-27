@@ -49,7 +49,10 @@ pub use pinned_pool::PinnedAllocation;
 pub use seal_offload::SlotMeta;
 pub use storage::StorageConfig;
 pub use sync_state::{LoadState, LoadStateError};
-pub use sync_state::{PrepareLoadState, PrepareLoadStateError};
+pub use sync_state::{
+    PREPARE_LOAD_STATE_NO_PLAN, PREPARE_LOAD_STATE_PENDING, PREPARE_LOAD_STATE_PLAN,
+    PrepareLoadState, PrepareLoadStateError,
+};
 pub use trace::{set_trace_sample_rate, should_sample};
 
 use std::{
