@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Literal
 
@@ -46,7 +46,7 @@ class PrepareLoadRequest:
 
     instance_id: str
     request_id: str
-    block_hashes: tuple[bytes, ...] = ()
+    block_hashes: list[bytes] = field(default_factory=list)
     num_prompt_tokens: int = 0
     num_computed_tokens: int = 0
     virtual_block_size: int = 0
@@ -195,12 +195,12 @@ class PegaClient:
         native_result = self._native.prepare_load(
             request.instance_id,
             request.request_id,
-            [bytes(block_hash) for block_hash in request.block_hashes],
-            int(request.num_prompt_tokens),
-            int(request.num_computed_tokens),
-            int(request.virtual_block_size),
+            request.block_hashes,
+            request.num_prompt_tokens,
+            request.num_computed_tokens,
+            request.virtual_block_size,
             request.decode_request_id,
-            int(request.decode_expected_writes),
+            request.decode_expected_writes,
         )
         return _parse_prepare_load_result(native_result)
 

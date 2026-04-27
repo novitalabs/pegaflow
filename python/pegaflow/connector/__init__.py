@@ -104,10 +104,10 @@ class PegaKVConnector(KVConnectorBase_V1):
             "PEGAFLOW_PORT"
         ) or vllm_config.kv_transfer_config.get_from_extra_config("pegaflow.port", 50055)
         self._engine_endpoint = f"{server_host}:{server_port}"
-        engine_client = PegaClient(self._engine_endpoint)
+        client = PegaClient(self._engine_endpoint)
         logger.debug("[PegaKVConnector] Connected to engine server at %s", self._engine_endpoint)
 
-        self._state_manager = ServiceStateManager(engine_client)
+        self._state_manager = ServiceStateManager(client)
 
         self._ctx = ConnectorContext(
             instance_id=instance_id,
@@ -119,7 +119,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             world_size=world_size,
             tp_rank=tp_rank,
             device_id=device_id,
-            engine_client=engine_client,
+            client=client,
             state_manager=self._state_manager,
             is_mla=is_mla,
             dcp_world_size=dcp_world_size,
@@ -137,7 +137,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             # stream per vllm replica is enough — if any tp worker crashes,
             # the scheduler dies too, closing this stream and triggering
             # server-side cleanup of the instance's CUDA IPC mappings.
-            engine_client._start_session_watcher(instance_id, namespace, tp_size, world_size)
+            client._start_session_watcher(instance_id, namespace, tp_size, world_size)
         else:
             self._worker = WorkerConnector(self._ctx)
 

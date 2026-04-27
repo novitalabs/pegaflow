@@ -61,7 +61,7 @@ def _make_ctx(
         "world_size": 1,
         "tp_rank": 0,
         "device_id": 0,
-        "engine_client": MagicMock(),
+        "client": MagicMock(),
         "state_manager": MagicMock(),
         "is_mla": False,
         "dcp_world_size": dcp_world_size,
@@ -386,7 +386,7 @@ class TestDecodeHashRefresh:
         """The same pegaflow_pd_push flag is interpreted by role."""
         ctx = _make_ctx(block_size=16, layer_names=("ALL_LAYERS",))
         ctx.state_manager.is_available.return_value = True
-        ctx.engine_client.prepare_load.return_value = PrepareLoadResult.done(None)
+        ctx.client.prepare_load.return_value = PrepareLoadResult.done(None)
         sc = SchedulerConnector(ctx)
         req = _make_fake_request("r1", [_hash(i) for i in range(2)])
         req.num_tokens = 32
@@ -400,7 +400,7 @@ class TestDecodeHashRefresh:
         }
 
         assert sc.get_num_new_matched_tokens(req, 0) == (0, False)
-        prepare_request = ctx.engine_client.prepare_load.call_args.args[0]
+        prepare_request = ctx.client.prepare_load.call_args.args[0]
         assert prepare_request.decode_request_id is None
 
 
@@ -409,7 +409,7 @@ class TestPdReceivePrepare:
 
     def test_pd_push_request_prepares_receive_and_blocks_gpu_alloc(self):
         ctx = _make_ctx(block_size=16, layer_names=("ALL_LAYERS",))
-        ctx.engine_client.prepare_load.return_value = PrepareLoadResult.in_progress()
+        ctx.client.prepare_load.return_value = PrepareLoadResult.in_progress()
         sc = SchedulerConnector(ctx)
         req = _make_fake_request("r1", [_hash(i) for i in range(4)])
         req.num_tokens = 64
@@ -423,19 +423,19 @@ class TestPdReceivePrepare:
 
         assert sc.get_num_new_matched_tokens(req, 0) == (None, False)
 
-        prepare_request = ctx.engine_client.prepare_load.call_args.args[0]
+        prepare_request = ctx.client.prepare_load.call_args.args[0]
         assert prepare_request.request_id == "r1"
         assert prepare_request.decode_request_id == "pd1"
-        assert prepare_request.block_hashes == tuple(_hash(i) for i in range(4))
+        assert prepare_request.block_hashes == [_hash(i) for i in range(4)]
         assert prepare_request.virtual_block_size == 16
 
         # The scheduler only sees the high-level preparing state.
         assert sc.get_num_new_matched_tokens(req, 0) == (None, False)
-        assert ctx.engine_client.prepare_load.call_count == 2
+        assert ctx.client.prepare_load.call_count == 2
 
     def test_pd_push_prepares_only_complete_hashed_blocks(self):
         ctx = _make_ctx(block_size=16, layer_names=("ALL_LAYERS",))
-        ctx.engine_client.prepare_load.return_value = PrepareLoadResult.in_progress()
+        ctx.client.prepare_load.return_value = PrepareLoadResult.in_progress()
         sc = SchedulerConnector(ctx)
         req = _make_fake_request("r1", [_hash(0)])
         req.num_tokens = 24
@@ -444,14 +444,14 @@ class TestPdReceivePrepare:
 
         assert sc.get_num_new_matched_tokens(req, 0) == (None, False)
 
-        prepare_request = ctx.engine_client.prepare_load.call_args.args[0]
-        assert prepare_request.block_hashes == (_hash(0),)
+        prepare_request = ctx.client.prepare_load.call_args.args[0]
+        assert prepare_request.block_hashes == [_hash(0)]
         assert prepare_request.num_prompt_tokens == 24
         assert prepare_request.virtual_block_size == 16
 
     def test_pd_push_without_complete_block_hashes_prepares_receive(self):
         ctx = _make_ctx(block_size=16, layer_names=("ALL_LAYERS",))
-        ctx.engine_client.prepare_load.return_value = PrepareLoadResult.in_progress()
+        ctx.client.prepare_load.return_value = PrepareLoadResult.in_progress()
         sc = SchedulerConnector(ctx)
         req = _make_fake_request("r1", [])
         req.num_tokens = 15
@@ -459,8 +459,8 @@ class TestPdReceivePrepare:
         req.kv_transfer_params = {"pegaflow": {"type": "decode_load"}}
 
         assert sc.get_num_new_matched_tokens(req, 0) == (None, False)
-        prepare_request = ctx.engine_client.prepare_load.call_args.args[0]
-        assert prepare_request.block_hashes == ()
+        prepare_request = ctx.client.prepare_load.call_args.args[0]
+        assert prepare_request.block_hashes == []
         assert prepare_request.decode_request_id == "r1"
 
     def test_pd_receive_partial_block_alloc_builds_hashless_load_intent(self):
@@ -487,7 +487,7 @@ class TestPdReceivePrepare:
 
     def test_pd_push_returns_external_tokens_after_imm_ready(self):
         ctx = _make_ctx(block_size=16, layer_names=("ALL_LAYERS",))
-        ctx.engine_client.prepare_load.side_effect = [
+        ctx.client.prepare_load.side_effect = [
             PrepareLoadResult.in_progress(),
             PrepareLoadResult.done(
                 LoadPlan(
@@ -511,7 +511,7 @@ class TestPdReceivePrepare:
 
     def test_pd_prepare_cleanup_uses_vllm_request_id(self):
         ctx = _make_ctx(block_size=16, layer_names=("ALL_LAYERS",))
-        ctx.engine_client.prepare_load.return_value = PrepareLoadResult.in_progress()
+        ctx.client.prepare_load.return_value = PrepareLoadResult.in_progress()
         sc = SchedulerConnector(ctx)
         req = _make_fake_request("vllm-r1", [_hash(i) for i in range(2)])
         req.num_tokens = 32
@@ -524,7 +524,7 @@ class TestPdReceivePrepare:
         }
 
         assert sc.get_num_new_matched_tokens(req, 0) == (None, False)
-        prepare_request = ctx.engine_client.prepare_load.call_args.args[0]
+        prepare_request = ctx.client.prepare_load.call_args.args[0]
         assert prepare_request.request_id == "vllm-r1"
         assert prepare_request.decode_request_id == "router-pd-r1"
 

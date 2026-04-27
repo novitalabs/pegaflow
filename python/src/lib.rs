@@ -149,19 +149,11 @@ fn prepare_status_error(
     None
 }
 
-fn u64_to_usize_prepare(value: u64, field: &str) -> Result<usize, NativePrepareLoadResult> {
-    usize::try_from(value).map_err(|_| {
-        NativePrepareLoadResult::RuntimeError(format!("{field}={value} exceeds usize range"))
-    })
-}
-
 fn checked_prepare_tokens(
     blocks: usize,
     virtual_block_size: u64,
 ) -> Result<u64, NativePrepareLoadResult> {
-    let blocks = u64::try_from(blocks).map_err(|_| {
-        NativePrepareLoadResult::RuntimeError(format!("{blocks} blocks exceeds u64 range"))
-    })?;
+    let blocks = blocks as u64;
     blocks.checked_mul(virtual_block_size).ok_or_else(|| {
         NativePrepareLoadResult::RuntimeError(format!(
             "load token count overflows: blocks={blocks} virtual_block_size={virtual_block_size}"
@@ -197,14 +189,12 @@ async fn prepare_load_inner(
         ));
     }
 
-    let computed_blocks =
-        match u64_to_usize_prepare(num_computed_tokens / virtual_block_size, "computed_blocks") {
-            Ok(value) => value,
-            Err(result) => return Ok(result),
-        };
+    let computed_blocks = (num_computed_tokens / virtual_block_size) as usize;
 
-    let decode_request_id = decode_request_id.filter(|value| !value.is_empty());
-    if let Some(decode_request_id) = decode_request_id {
+    // P/D path: prepare a D-side lease, then poll until IMM fan-in marks data_ready.
+    if let Some(decode_req_id) = decode_request_id
+        && !decode_req_id.is_empty()
+    {
         let num_external_tokens =
             num_prompt_tokens.saturating_sub(num_computed_tokens.saturating_add(1));
         let num_blocks_u64 = ceil_div_u64(num_external_tokens, virtual_block_size);
@@ -212,10 +202,7 @@ async fn prepare_load_inner(
             return Ok(NativePrepareLoadResult::Done(None));
         }
 
-        let num_blocks = match u64_to_usize_prepare(num_blocks_u64, "num_blocks") {
-            Ok(value) => value,
-            Err(result) => return Ok(result),
-        };
+        let num_blocks = num_blocks_u64 as usize;
         let hash_start = computed_blocks.min(block_hashes.len());
         let hash_end = hash_start
             .saturating_add(num_blocks)
@@ -225,7 +212,7 @@ async fn prepare_load_inner(
         let prepare = client
             .prepare_pd_receive(PreparePdReceiveRequest {
                 instance_id: instance_id.clone(),
-                request_id: decode_request_id.clone(),
+                request_id: decode_req_id.clone(),
                 block_hashes: staged_hashes.clone(),
                 num_blocks: num_blocks_u64,
                 expected_imm_count: decode_expected_writes,
@@ -240,7 +227,7 @@ async fn prepare_load_inner(
         let descriptor = client
             .get_pd_receive_descriptor(GetPdReceiveDescriptorRequest {
                 dst_instance_id: instance_id,
-                request_id: decode_request_id.clone(),
+                request_id: decode_req_id.clone(),
                 receive_rank: -1,
                 handle: prepare.handle.clone(),
             })
@@ -255,7 +242,7 @@ async fn prepare_load_inner(
         return match state {
             PdReceiveDescriptorState::PdDescriptorReady if descriptor.data_ready => {
                 Ok(NativePrepareLoadResult::Done(Some(NativeLoadPlan {
-                    request_id: decode_request_id,
+                    request_id: decode_req_id,
                     source: "staged",
                     num_tokens: num_external_tokens,
                     num_blocks,
@@ -275,6 +262,7 @@ async fn prepare_load_inner(
         };
     }
 
+    // Cache path: only query the suffix that vLLM has not computed locally.
     let remaining_hashes = if computed_blocks >= block_hashes.len() {
         Vec::new()
     } else {
@@ -302,10 +290,7 @@ async fn prepare_load_inner(
         return Ok(NativePrepareLoadResult::Preparing);
     }
 
-    let hit_blocks = match u64_to_usize_prepare(query.hit_blocks, "hit_blocks") {
-        Ok(value) => value.min(remaining_hashes.len()),
-        Err(result) => return Ok(result),
-    };
+    let hit_blocks = (query.hit_blocks as usize).min(remaining_hashes.len());
     if hit_blocks == 0 {
         return Ok(NativePrepareLoadResult::Done(None));
     }

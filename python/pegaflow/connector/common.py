@@ -33,7 +33,7 @@ class ConnectorContext:
     world_size: int
     tp_rank: int | None
     device_id: int | None
-    engine_client: PegaClient
+    client: PegaClient
     state_manager: "ServiceStateManager"
     is_mla: bool = False
     dcp_world_size: int = 1

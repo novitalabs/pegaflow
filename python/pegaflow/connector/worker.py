@@ -32,8 +32,7 @@ from pegaflow.connector.common import (
 )
 from pegaflow.connector.egress import (
     EgressLayerRegistration,
-    create_kv_egress_runtime,
-    execute_kv_egress,
+    KvEgressManager,
 )
 from pegaflow.ipc_wrapper import CudaIPCWrapper
 
@@ -201,9 +200,11 @@ class WorkerConnector:
 
         self._cross_layer_mode = False
         self._cross_layer_key = _CROSS_LAYER_KEY
-        self._kv_egress = create_kv_egress_runtime()
-        self._egress_preferred_nic_idx = self._resolve_preferred_egress_nic()
-        self._egress_layers: dict[str, EgressLayerRegistration] = {}
+        self._egress = KvEgressManager(
+            instance_id=self._ctx.instance_id,
+            device_id=self._ctx.device_id,
+            receive_rank=self._ctx.effective_tp_rank,
+        )
 
         self._finished_requests: set[str] = set()
 
@@ -217,14 +218,14 @@ class WorkerConnector:
         self._save_thread.join()
 
     def unregister_context(self) -> None:
-        if not self._registered_layers and not self._egress_layers:
+        if not self._registered_layers and not self._egress.has_layers:
             return
 
-        self._unregister_egress_layers()
+        self._egress.unregister_layers()
 
         if self._registered_layers and self._ctx.tp_rank == 0:
             try:
-                self._ctx.engine_client._unregister_context(self._ctx.instance_id)
+                self._ctx.client._unregister_context(self._ctx.instance_id)
             except Exception as e:
                 logger.warning("[PegaKVConnector] Unregister context failed: %s", e)
 
@@ -248,7 +249,7 @@ class WorkerConnector:
             for layer_name, kv_cache in kv_caches.items()
         ]
 
-        self._ctx.engine_client.register_kv_cache(
+        self._ctx.client.register_kv_cache(
             KvCacheRegistration(
                 instance_id=self._ctx.instance_id,
                 namespace=self._ctx.namespace,
@@ -261,7 +262,7 @@ class WorkerConnector:
             )
         )
 
-        self._register_egress_layers(
+        self._egress.register_layers(
             {
                 registration.cache_layer.name: registration.egress_layer
                 for registration in registrations
@@ -473,7 +474,7 @@ class WorkerConnector:
         device_id = self._require_device_id()
 
         try:
-            load_state = self._ctx.engine_client.load(
+            load_state = self._ctx.client.load(
                 LoadRequest(
                     instance_id=self._ctx.instance_id,
                     tp_rank=self._ctx.effective_tp_rank,
@@ -640,7 +641,7 @@ class WorkerConnector:
             torch.cuda.synchronize(self._torch_device)
 
         if work.egress_items:
-            self._process_egress_batch(work.egress_items)
+            self._egress.execute_batch(work.egress_items)
 
         if work.layer_saves:
             self._submit_layer_saves(work.layer_saves)
@@ -693,7 +694,7 @@ class WorkerConnector:
         success = False
 
         try:
-            self._ctx.engine_client.save(
+            self._ctx.client.save(
                 SaveRequest(
                     instance_id=self._ctx.instance_id,
                     tp_rank=self._ctx.effective_tp_rank,
@@ -716,101 +717,6 @@ class WorkerConnector:
         save_duration = time.perf_counter() - save_start
         with self._stats_lock:
             self._stats.record_save(save_duration, total_blocks, success)
-
-    def _process_egress_batch(self, egress_items: list[tuple[str, KvEgressIntent]]) -> None:
-        if self._kv_egress is None:
-            logger.error(
-                "[PegaKVConnector] KV egress requested but PEGAFLOW_KV_EGRESS is disabled "
-                "(reqs=%s)",
-                [req_id for req_id, _ in egress_items],
-            )
-            return
-        if not self._egress_layers:
-            logger.error(
-                "[PegaKVConnector] KV egress requested before KV caches were registered (reqs=%s)",
-                [req_id for req_id, _ in egress_items],
-            )
-            return
-
-        requester_id = self._egress_requester_id()
-        for req_id, intent in egress_items:
-            if not intent.block_ids:
-                continue
-            start = time.perf_counter()
-            try:
-                egress_stats = execute_kv_egress(
-                    self._kv_egress,
-                    intent,
-                    self._egress_layers,
-                    requester_id,
-                    self._ctx.effective_tp_rank,
-                    self._egress_preferred_nic_idx,
-                )
-            except Exception as e:
-                logger.error(
-                    "[PegaKVConnector] KV egress failed: req=%s transfer_request_id=%s "
-                    "dst=%s blocks=%d error=%s",
-                    req_id,
-                    intent.request_id,
-                    intent.remote_endpoint,
-                    len(intent.block_ids),
-                    e,
-                )
-                continue
-
-            elapsed_ms = (time.perf_counter() - start) * 1000
-            logger.info(
-                "[PegaKVConnector] KV egress completed: req=%s transfer_request_id=%s "
-                "dst=%s layers=%d blocks=%d bytes=%d elapsed_ms=%.2f "
-                "descs=%d coalesced_descs=%d descriptor_ms=%.2f "
-                "connect_ms=%.2f build_desc_ms=%.2f "
-                "rdma_write_ms=%.2f rdma_write_gbps=%.2f write_nics=%d "
-                "preferred_nic_idx=%s imm_ms=%.2f imm_nics=%d total_inner_ms=%.2f",
-                req_id,
-                intent.request_id,
-                intent.remote_endpoint,
-                len(self._egress_layers),
-                len(intent.block_ids),
-                egress_stats.bytes_written,
-                elapsed_ms,
-                egress_stats.write_descs,
-                egress_stats.coalesced_write_descs,
-                egress_stats.descriptor_ms,
-                egress_stats.connect_ms,
-                egress_stats.build_desc_ms,
-                egress_stats.rdma_write_ms,
-                egress_stats.rdma_write_gbps,
-                egress_stats.write_nics_active,
-                (
-                    egress_stats.preferred_nic_idx
-                    if egress_stats.preferred_nic_idx is not None
-                    else "auto-fallback"
-                ),
-                egress_stats.imm_ms,
-                egress_stats.imm_nics_active,
-                egress_stats.total_ms,
-            )
-
-    def _resolve_preferred_egress_nic(self) -> int | None:
-        if self._kv_egress is None:
-            return None
-        if self._ctx.device_id is None or self._ctx.device_id < 0:
-            return None
-        try:
-            preferred = self._kv_egress._preferred_nic_for_gpu(int(self._ctx.device_id))
-        except Exception as e:
-            logger.warning(
-                "[PegaKVConnector] Failed to resolve preferred KV egress NIC for device=%s: %s",
-                self._ctx.device_id,
-                e,
-            )
-            return None
-        logger.info(
-            "[PegaKVConnector] Preferred KV egress NIC: device=%s nic_idx=%s",
-            self._ctx.device_id,
-            preferred if preferred is not None else "auto-fallback",
-        )
-        return int(preferred) if preferred is not None else None
 
     def _complete_save_requests(self, request_ids: list[str]) -> None:
         completed_reqs: list[str] = []
@@ -849,67 +755,6 @@ class WorkerConnector:
         assert self._ctx.device_id is not None, "CUDA device id is required"
         return self._ctx.device_id
 
-    def _register_egress_layers(
-        self,
-        layers: dict[str, EgressLayerRegistration],
-    ) -> None:
-        if self._kv_egress is None:
-            self._egress_layers.clear()
-            return
-
-        self._unregister_egress_layers()
-
-        registered_ptrs: set[int] = set()
-        try:
-            for registration in layers.values():
-                if registration.base_ptr in registered_ptrs:
-                    continue
-                self._kv_egress._register_memory(
-                    registration.base_ptr,
-                    registration.size_bytes,
-                )
-                registered_ptrs.add(registration.base_ptr)
-        except Exception:
-            for ptr in registered_ptrs:
-                try:
-                    self._kv_egress._unregister_memory(ptr)
-                except Exception as cleanup_error:
-                    logger.warning(
-                        "[PegaKVConnector] Failed to unregister partial egress MR ptr=%#x: %s",
-                        ptr,
-                        cleanup_error,
-                    )
-            raise
-
-        self._egress_layers = layers
-        logger.info(
-            "[PegaKVConnector] Registered %d KV cache layer(s) for KV egress (unique_mrs=%d)",
-            len(layers),
-            len(registered_ptrs),
-        )
-
-    def _unregister_egress_layers(self) -> None:
-        if self._kv_egress is None or not self._egress_layers:
-            self._egress_layers.clear()
-            return
-
-        ptrs = {registration.base_ptr for registration in self._egress_layers.values()}
-        for ptr in ptrs:
-            try:
-                self._kv_egress._unregister_memory(ptr)
-            except Exception as e:
-                logger.warning(
-                    "[PegaKVConnector] Failed to unregister KV egress MR ptr=%#x: %s",
-                    ptr,
-                    e,
-                )
-        self._egress_layers.clear()
-
-    def _egress_requester_id(self) -> str:
-        return (
-            f"{self._ctx.instance_id}:device{self._ctx.device_id}:tp{self._ctx.effective_tp_rank}"
-        )
-
     def handle_preemptions(self, preempted_req_ids: set[str] | None) -> None:
         """Wait for preempted requests' saves to complete before blocks are reused.
 
@@ -928,16 +773,16 @@ class WorkerConnector:
                     events_to_wait.append((req_id, event))
 
         if events_to_wait:
-            logger.debug(
+            logger.info(
                 "[PegaKVConnector] preemption: waiting for %d requests' saves: %s",
                 len(events_to_wait),
                 [req_id for req_id, _ in events_to_wait],
             )
             for req_id, event in events_to_wait:
                 event.wait()
-                logger.debug("[PegaKVConnector] preemption: req=%s save completed", req_id)
+                logger.info("[PegaKVConnector] preemption: req=%s save completed", req_id)
         else:
-            logger.debug(
+            logger.info(
                 "[PegaKVConnector] preemption: %d requests (no pending saves)",
                 len(preempted_req_ids),
             )

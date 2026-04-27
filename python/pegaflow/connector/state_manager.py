@@ -30,10 +30,10 @@ class ServiceStateManager:
 
     def __init__(
         self,
-        engine_client: "PegaClient",
+        client: "PegaClient",
         health_check_interval: float = 10.0,
     ):
-        self._client = engine_client
+        self._client = client
         self._interval = health_check_interval
         self._available = True
         self._lock = threading.Lock()

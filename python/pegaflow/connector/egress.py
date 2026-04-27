@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -56,6 +57,172 @@ class KvEgressStats:
         return (self.bytes_written * 8) / (self.rdma_write_ms / 1000.0) / 1e9
 
 
+class KvEgressManager:
+    def __init__(
+        self,
+        instance_id: str,
+        device_id: int | None,
+        receive_rank: int,
+    ) -> None:
+        self._runtime = create_kv_egress_runtime()
+        self._device_id = device_id
+        self._receive_rank = receive_rank
+        self._requester_id = f"{instance_id}:device{device_id}:tp{receive_rank}"
+        self._preferred_nic_idx = self._resolve_preferred_nic()
+        self._layers: dict[str, EgressLayerRegistration] = {}
+
+    @property
+    def has_layers(self) -> bool:
+        return bool(self._layers)
+
+    def register_layers(self, layers: Mapping[str, EgressLayerRegistration]) -> None:
+        if self._runtime is None:
+            self._layers.clear()
+            return
+
+        self.unregister_layers()
+
+        registered_ptrs: set[int] = set()
+        try:
+            for registration in layers.values():
+                if registration.base_ptr in registered_ptrs:
+                    continue
+                self._runtime._register_memory(
+                    registration.base_ptr,
+                    registration.size_bytes,
+                )
+                registered_ptrs.add(registration.base_ptr)
+        except Exception:
+            for ptr in registered_ptrs:
+                try:
+                    self._runtime._unregister_memory(ptr)
+                except Exception as cleanup_error:
+                    logger.warning(
+                        "[PegaKVConnector] Failed to unregister partial egress MR ptr=%#x: %s",
+                        ptr,
+                        cleanup_error,
+                    )
+            raise
+
+        self._layers = dict(layers)
+        logger.info(
+            "[PegaKVConnector] Registered %d KV cache layer(s) for KV egress (unique_mrs=%d)",
+            len(layers),
+            len(registered_ptrs),
+        )
+
+    def unregister_layers(self) -> None:
+        if self._runtime is None or not self._layers:
+            self._layers.clear()
+            return
+
+        ptrs = {registration.base_ptr for registration in self._layers.values()}
+        for ptr in ptrs:
+            try:
+                self._runtime._unregister_memory(ptr)
+            except Exception as e:
+                logger.warning(
+                    "[PegaKVConnector] Failed to unregister KV egress MR ptr=%#x: %s",
+                    ptr,
+                    e,
+                )
+        self._layers.clear()
+
+    def execute_batch(self, egress_items: list[tuple[str, KvEgressIntent]]) -> None:
+        if self._runtime is None:
+            logger.error(
+                "[PegaKVConnector] KV egress requested but PEGAFLOW_KV_EGRESS is disabled "
+                "(reqs=%s)",
+                [req_id for req_id, _ in egress_items],
+            )
+            return
+        if not self._layers:
+            logger.error(
+                "[PegaKVConnector] KV egress requested before KV caches were registered (reqs=%s)",
+                [req_id for req_id, _ in egress_items],
+            )
+            return
+
+        for req_id, intent in egress_items:
+            if not intent.block_ids:
+                continue
+            start = time.perf_counter()
+            try:
+                egress_stats = execute_kv_egress(
+                    self._runtime,
+                    intent,
+                    self._layers,
+                    self._requester_id,
+                    self._receive_rank,
+                    self._preferred_nic_idx,
+                )
+            except Exception as e:
+                logger.error(
+                    "[PegaKVConnector] KV egress failed: req=%s transfer_request_id=%s "
+                    "dst=%s blocks=%d error=%s",
+                    req_id,
+                    intent.request_id,
+                    intent.remote_endpoint,
+                    len(intent.block_ids),
+                    e,
+                )
+                continue
+
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            logger.info(
+                "[PegaKVConnector] KV egress completed: req=%s transfer_request_id=%s "
+                "dst=%s layers=%d blocks=%d bytes=%d elapsed_ms=%.2f "
+                "descs=%d coalesced_descs=%d descriptor_ms=%.2f "
+                "connect_ms=%.2f build_desc_ms=%.2f "
+                "rdma_write_ms=%.2f rdma_write_gbps=%.2f write_nics=%d "
+                "preferred_nic_idx=%s imm_ms=%.2f imm_nics=%d total_inner_ms=%.2f",
+                req_id,
+                intent.request_id,
+                intent.remote_endpoint,
+                len(self._layers),
+                len(intent.block_ids),
+                egress_stats.bytes_written,
+                elapsed_ms,
+                egress_stats.write_descs,
+                egress_stats.coalesced_write_descs,
+                egress_stats.descriptor_ms,
+                egress_stats.connect_ms,
+                egress_stats.build_desc_ms,
+                egress_stats.rdma_write_ms,
+                egress_stats.rdma_write_gbps,
+                egress_stats.write_nics_active,
+                (
+                    egress_stats.preferred_nic_idx
+                    if egress_stats.preferred_nic_idx is not None
+                    else "auto-fallback"
+                ),
+                egress_stats.imm_ms,
+                egress_stats.imm_nics_active,
+                egress_stats.total_ms,
+            )
+
+    def _resolve_preferred_nic(self) -> int | None:
+        if self._runtime is None:
+            return None
+        if self._device_id is None or self._device_id < 0:
+            return None
+        try:
+            preferred = self._runtime._preferred_nic_for_gpu(int(self._device_id))
+        except Exception as e:
+            logger.warning(
+                "[PegaKVConnector] Failed to resolve preferred KV egress NIC for device=%s: %s",
+                self._device_id,
+                e,
+            )
+            return None
+        logger.info(
+            "[PegaKVConnector] Preferred KV egress NIC: device=%s nic_idx=%s",
+            self._device_id,
+            preferred if preferred is not None else "auto-fallback",
+        )
+        return int(preferred) if preferred is not None else None
+
+
 def resolve_kv_egress_config() -> KvEgressConfig:
     enabled = _truthy_env("PEGAFLOW_KV_EGRESS")
     nic_names = _parse_env_list("PEGAFLOW_KV_EGRESS_NICS") or _parse_env_list("PEGAFLOW_RDMA_NICS")
@@ -97,7 +264,7 @@ def execute_kv_egress(
     preferred_nic_idx: int | None,
 ) -> KvEgressStats:
     total_start = time.perf_counter()
-    client = _engine_client(intent.remote_endpoint)
+    client = _remote_client(intent.remote_endpoint)
     descriptor_start = time.perf_counter()
     descriptor = _wait_for_descriptor(intent, client, receive_rank)
     descriptor_ms = _elapsed_ms(descriptor_start)
@@ -296,7 +463,7 @@ def _local_segment_ptr(
     return layer.base_ptr + block_id * layer.bytes_per_block + segment_idx * layer.kv_stride_bytes
 
 
-def _engine_client(addr: str):
+def _remote_client(addr: str):
     from pegaflow import PegaClient
 
     return PegaClient(_grpc_endpoint(addr))
@@ -338,6 +505,7 @@ def _truthy_env(*names: str) -> bool:
 __all__ = [
     "EgressLayerRegistration",
     "KvEgressConfig",
+    "KvEgressManager",
     "KvEgressStats",
     "create_kv_egress_runtime",
     "execute_kv_egress",
