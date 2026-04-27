@@ -1,10 +1,11 @@
+use std::fs;
 use std::sync::Arc;
 
 use log::error;
 use pegaflow_common::NumaNode;
 use sideway::ibverbs::address::{Gid, GidType};
 use sideway::ibverbs::device::{DeviceInfo, DeviceList};
-use sideway::ibverbs::device_context::{DeviceContext, Mtu, PortState};
+use sideway::ibverbs::device_context::{DeviceContext, LinkLayer, Mtu, PortState};
 use sideway::ibverbs::protection_domain::ProtectionDomain;
 
 use crate::error::{Result, TransferError};
@@ -14,6 +15,8 @@ pub(crate) struct RcRuntime {
     pub(crate) device_ctx: Arc<DeviceContext>,
     pub(crate) pd: Arc<ProtectionDomain>,
     pub(crate) port_num: u8,
+    pub(crate) link_layer: LinkLayer,
+    pub(crate) local_lid: u16,
     pub(crate) gid_index: u8,
     pub(crate) mtu: Mtu,
     pub(crate) local_gid: Gid,
@@ -37,12 +40,24 @@ impl RcRuntime {
             .alloc_pd()
             .map_err(|error| TransferError::Backend(error.to_string()))?;
 
-        let (port_num, gid_index, mtu, local_gid) = Self::choose_port_and_gid(&device_ctx)?;
+        let (port_num, link_layer, gid_index, mtu, local_gid) =
+            Self::choose_port_and_gid(&device_ctx)?;
+        let local_lid = match link_layer {
+            LinkLayer::InfiniBand => Self::read_port_lid(nic_name, port_num)?,
+            LinkLayer::Ethernet => 0,
+            LinkLayer::Unspecified => {
+                return Err(TransferError::Backend(format!(
+                    "unsupported link layer on nic={nic_name}, port={port_num}: {link_layer:?}"
+                )));
+            }
+        };
         let numa_node = nic_numa_node(nic_name);
         log::info!(
-            "RDMA NIC ready: nic={}, port={}, gid_index={}, mtu={:?}, numa={}",
+            "RDMA NIC ready: nic={}, port={}, link_layer={:?}, local_lid={}, gid_index={}, mtu={:?}, numa={}",
             nic_name,
             port_num,
+            link_layer,
+            local_lid,
             gid_index,
             mtu,
             numa_node,
@@ -52,6 +67,8 @@ impl RcRuntime {
             device_ctx,
             pd,
             port_num,
+            link_layer,
+            local_lid,
             gid_index,
             mtu,
             local_gid,
@@ -60,7 +77,9 @@ impl RcRuntime {
         }))
     }
 
-    fn choose_port_and_gid(device_ctx: &Arc<DeviceContext>) -> Result<(u8, u8, Mtu, Gid)> {
+    fn choose_port_and_gid(
+        device_ctx: &Arc<DeviceContext>,
+    ) -> Result<(u8, LinkLayer, u8, Mtu, Gid)> {
         let dev_attr = device_ctx
             .query_device()
             .map_err(|error| TransferError::Backend(error.to_string()))?;
@@ -75,6 +94,7 @@ impl RcRuntime {
             if port_attr.port_state() != PortState::Active {
                 continue;
             }
+            let link_layer = port_attr.link_layer();
 
             // Pick the best GID: RoCEv2 + IPv4-mapped > IB > any non-link-local.
             // RoCEv1 cannot be routed across L3 — only RoCEv2 works cross-machine.
@@ -107,7 +127,7 @@ impl RcRuntime {
                 (0, gid)
             };
 
-            return Ok((port_num, gid_index, port_attr.active_mtu(), gid));
+            return Ok((port_num, link_layer, gid_index, port_attr.active_mtu(), gid));
         }
 
         error!(
@@ -117,5 +137,24 @@ impl RcRuntime {
         Err(TransferError::Backend(
             "no active port found on selected NIC".to_string(),
         ))
+    }
+
+    fn read_port_lid(nic_name: &str, port_num: u8) -> Result<u16> {
+        let path = format!("/sys/class/infiniband/{nic_name}/ports/{port_num}/lid");
+        let raw = fs::read_to_string(&path)
+            .map_err(|error| TransferError::Backend(format!("failed to read {path}: {error}")))?;
+        let text = raw.trim();
+        let lid = if let Some(hex) = text.strip_prefix("0x") {
+            u16::from_str_radix(hex, 16)
+        } else {
+            text.parse()
+        }
+        .map_err(|error| TransferError::Backend(format!("invalid LID in {path}: {error}")))?;
+        if lid == 0 {
+            return Err(TransferError::Backend(format!(
+                "invalid zero LID for InfiniBand nic={nic_name}, port={port_num}"
+            )));
+        }
+        Ok(lid)
     }
 }
