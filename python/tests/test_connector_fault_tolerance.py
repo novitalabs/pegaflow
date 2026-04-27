@@ -99,7 +99,7 @@ def _make_worker() -> tuple[WorkerConnector, FakeEngineClient, MagicMock]:
         world_size=1,
         tp_rank=0,
         device_id=0,
-        engine_client=client,
+        client=client,
         state_manager=state_manager,
     )
     worker = WorkerConnector(ctx)
@@ -173,7 +173,7 @@ def _pd_load_metadata() -> PegaConnectorMetadata:
 
 
 def test_load_rpc_ok_false_reports_failures_without_raise():
-    """B.1: engine_client.load returns ok=False -> no raise, failure surface populated."""
+    """B.1: client.load returns ok=False -> no raise, failure surface populated."""
     worker, client, state_mgr = _make_worker()
     client.fail_load_with_ok_false = True
 
@@ -219,7 +219,7 @@ def test_pd_load_uses_one_batch_rpc_for_multiple_requests():
 
 
 def test_load_rpc_exception_reports_failures_without_raise():
-    """B.1: engine_client.load raises -> same failure-reporting path as ok=False."""
+    """B.1: client.load raises -> same failure-reporting path as ok=False."""
     worker, client, state_mgr = _make_worker()
     client.fail_load_with_exception = ConnectionError("server gone")
 

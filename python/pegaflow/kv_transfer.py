@@ -73,7 +73,7 @@ def prepare_load_request_from_request(
     return PrepareLoadRequest(
         instance_id=instance_id,
         request_id=request.request_id,
-        block_hashes=tuple(bytes(block_hash) for block_hash in request.block_hashes),
+        block_hashes=request.block_hashes,
         num_prompt_tokens=request.num_prompt_tokens,
         num_computed_tokens=int(num_computed_tokens),
         virtual_block_size=int(virtual_block_size),

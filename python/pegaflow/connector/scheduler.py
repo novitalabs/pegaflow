@@ -371,7 +371,7 @@ class SchedulerConnector:
             self._ctx.virtual_block_size,
         )
         try:
-            result = self._ctx.engine_client.prepare_load(prepare_request)
+            result = self._ctx.client.prepare_load(prepare_request)
         except PegaFlowServiceError as e:
             self._ctx.state_manager.mark_unavailable(str(e))
             logger.warning(
