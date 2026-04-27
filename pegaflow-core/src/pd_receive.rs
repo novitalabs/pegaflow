@@ -389,7 +389,7 @@ impl PdReceiveManager {
             PdReceiveLeaseState::Ready => {}
         }
 
-        let load_plans = Self::load_plans_from_lease(&lease, dst_instance_id, request_id)?;
+        let load_plans = Self::load_plans_from_lease(lease, dst_instance_id, request_id)?;
         Self::remove_locked(&mut state, &lease_handle);
         Ok(PdReceiveCheckoutStatus::Ready(load_plans))
     }
