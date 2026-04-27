@@ -116,6 +116,14 @@ def _stub_forward_context() -> MagicMock:
     return ctx
 
 
+def _pending_load_reqs(worker: WorkerConnector) -> set[str]:
+    return {
+        req_id
+        for pending in worker._pending_loads_by_shm.values()
+        for req_id in pending.request_ids
+    }
+
+
 def _load_metadata(req_id: str, block_ids: tuple[int, ...]) -> PegaConnectorMetadata:
     block_hashes = tuple(f"h{b}".encode() for b in block_ids)
     return PegaConnectorMetadata(
@@ -189,9 +197,7 @@ def test_load_rpc_ok_false_reports_failures_without_raise():
     assert state_mgr.mark_unavailable.called
 
     # No PyLoadState registered: no permanent leak.
-    assert worker._pending_loads == {}
-    assert worker._pending_load_reqs == {}
-    assert worker._pending_load_meta == {}
+    assert worker._pending_loads_by_shm == {}
 
     worker.shutdown()
 
@@ -228,8 +234,7 @@ def test_load_rpc_exception_reports_failures_without_raise():
 
     assert state_mgr.mark_unavailable.called
 
-    assert worker._pending_loads == {}
-    assert worker._pending_load_meta == {}
+    assert worker._pending_loads_by_shm == {}
 
     worker.shutdown()
 
@@ -255,13 +260,13 @@ def test_in_flight_load_timeout_respects_configured_boundary(monkeypatch):
 
     metadata = _load_metadata("req_boundary", (5, 6, 7, 8))
     worker.start_load_kv(metadata, _stub_forward_context())
-    assert "req_boundary" in worker._pending_loads
+    assert _pending_load_reqs(worker) == {"req_boundary"}
 
     # Just before the deadline: must NOT time out.
     clock["now"] = t0 + (timeout - 1)
     _, finished_recving = worker.get_finished(set())
     assert finished_recving is None, "load flagged as timed out before the deadline"
-    assert "req_boundary" in worker._pending_loads
+    assert _pending_load_reqs(worker) == {"req_boundary"}
     assert worker.get_block_ids_with_load_errors() == set()
     assert not state_mgr.mark_unavailable.called
 
@@ -273,9 +278,7 @@ def test_in_flight_load_timeout_respects_configured_boundary(monkeypatch):
     assert state_mgr.mark_unavailable.called
 
     # In-flight state cleaned up — no permanent leak.
-    assert worker._pending_loads == {}
-    assert worker._pending_load_reqs == {}
-    assert worker._pending_load_meta == {}
+    assert worker._pending_loads_by_shm == {}
 
     worker.shutdown()
 
