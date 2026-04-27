@@ -42,25 +42,8 @@ class _NativeEngineClient:
         device_id: int,
         load_state_shm: str,
         layer_names: list[str],
-        block_ids: list[int],
-        block_hashes: list[bytes],
+        items: list[tuple[int, list[int]]],
     ) -> tuple[bool, str]: ...
-    def load_pd_receive(
-        self,
-        instance_id: str,
-        tp_rank: int,
-        device_id: int,
-        load_state_shm: str,
-        layer_names: list[str],
-        items: list[tuple[str, str, list[int]]],
-        receive_rank: int = -1,
-    ) -> tuple[bool, str]: ...
-    def query_prefetch(
-        self,
-        instance_id: str,
-        block_hashes: list[bytes],
-        req_id: str,
-    ) -> dict[str, Any]: ...
     def prepare_load(
         self,
         instance_id: str,
@@ -69,18 +52,10 @@ class _NativeEngineClient:
         num_prompt_tokens: int,
         num_computed_tokens: int,
         virtual_block_size: int,
+        prepare_state_shm: str,
         decode_request_id: str | None = None,
         decode_expected_writes: int = 0,
-    ) -> dict[str, Any]: ...
-    def prepare_pd_receive(
-        self,
-        instance_id: str,
-        request_id: str,
-        block_hashes: list[bytes],
-        num_blocks: int,
-        expected_imm_count: int = 0,
-        expire_after_ms: int = 0,
-    ) -> dict[str, Any]: ...
+    ) -> tuple[bool, str]: ...
     def get_pd_receive_descriptor(
         self,
         dst_instance_id: str,
@@ -103,6 +78,11 @@ class _NativeLoadState:
     def shm_name(self) -> str: ...
     def get_state(self) -> int: ...
     def is_ready(self) -> bool: ...
+
+class _NativePrepareLoadState:
+    def __init__(self) -> None: ...
+    def shm_name(self) -> str: ...
+    def snapshot(self) -> dict[str, Any]: ...
 
 class KvEgressRuntime:
     def __init__(self, nic_names: list[str]) -> None: ...

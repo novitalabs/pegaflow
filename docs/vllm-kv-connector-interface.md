@@ -166,11 +166,11 @@ itself is.
   vLLM GPU KV blocks during `start_load_kv()`.
 - In that path, D should not allocate vLLM GPU KV blocks while the P->D RDMA
   WRITE is still in flight. D connector should poll the PegaFlow staging lease
-  through the existing `QueryPrefetch` path from `get_num_new_matched_tokens()`
-  and return `(None, False)` until the write-with-imm completion marks the
+  through `PrepareLoad` from `get_num_new_matched_tokens()` and read the
+  prepare shared-memory state until the write-with-imm completion marks the
   staging lease ready.
-- First-cut control plane adds idempotent `PreparePdReceive`,
-  `GetPdReceiveDescriptor`, and a D-side receive-state query. It should not add
+- The current control plane uses idempotent `PrepareLoad`,
+  `GetPdReceiveDescriptor`, and prepared `Load` consumption. It should not add
   separate `Complete` or hot-path `Release` RPCs. Ready is driven by RDMA WRITE
   with immediate, and cleanup is handled by D-side TTL/GC or internal consume
   transitions.
@@ -204,8 +204,8 @@ itself is.
 - For heterogeneous TP/block-size/layout support, which conversions belong in
   vLLM connector code and which belong below the PegaFlow server API?
 - Delta transfer: if D already has a prefix of the KV locally or through P2P
-  cache discovery, can `PreparePdReceive` communicate those hits so P only
-  pushes missing blocks? This is deferred; initial CPU-staging push can transfer
-  the full external KV span.
+  cache discovery, can `PrepareLoad` communicate those hits so P only pushes
+  missing blocks? This is deferred; initial CPU-staging push can transfer the
+  full external KV span.
 - What is the desired failure policy for D load failure: immediate request
   failure, local recompute, or retry through another P replica?

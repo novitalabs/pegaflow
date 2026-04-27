@@ -85,6 +85,10 @@ class LoadIntent:
     plan: LoadPlan
     num_tokens: int
 
+    def __post_init__(self) -> None:
+        if not self.block_ids:
+            raise ValueError("load intent must include at least one block_id")
+
 
 @dataclass(frozen=True)
 class SaveIntent:

@@ -19,7 +19,6 @@ from pegaflow import (
     LoadHandle,
     LoadItem,
     LoadRequest,
-    LoadSourceKind,
     SaveRequest,
 )
 from pegaflow.connector.common import (
@@ -74,21 +73,18 @@ class _LoadBatch:
     items: tuple[LoadItem, ...]
     block_ids: tuple[int, ...]
     target_layers: tuple[str, ...]
-    receive_rank: int | None
 
     @classmethod
     def from_items(
         cls,
         items: Sequence[tuple[str, LoadItem]],
         target_layers: Sequence[str],
-        receive_rank: int | None,
     ) -> "_LoadBatch":
         return cls(
             request_ids=tuple(req_id for req_id, _ in items),
             items=tuple(item for _, item in items),
             block_ids=tuple(int(block_id) for _, item in items for block_id in item.block_ids),
             target_layers=tuple(target_layers),
-            receive_rank=receive_rank,
         )
 
     @property
@@ -426,36 +422,26 @@ class WorkerConnector:
         if not target_layers:
             return
 
-        normal_items: list[tuple[str, LoadItem]] = []
-        staged_items: list[tuple[str, LoadItem]] = []
+        items: list[tuple[str, LoadItem]] = []
 
         for req_id, load_intent in metadata.load_intents.items():
             if not load_intent.block_ids:
-                continue
-            item = LoadItem(
-                plan=load_intent.plan,
-                block_ids=tuple(load_intent.block_ids),
-            )
-            if load_intent.plan.source is LoadSourceKind.STAGED:
-                staged_items.append((req_id, item))
-            else:
-                normal_items.append((req_id, item))
-
-        if normal_items:
-            self._submit_load(
-                _LoadBatch.from_items(
-                    normal_items,
-                    target_layers,
-                    receive_rank=None,
+                raise ValueError(f"load intent for req {req_id} has no block_ids")
+            items.append(
+                (
+                    req_id,
+                    LoadItem(
+                        plan=load_intent.plan,
+                        block_ids=tuple(load_intent.block_ids),
+                    ),
                 )
             )
 
-        if staged_items:
+        if items:
             self._submit_load(
                 _LoadBatch.from_items(
-                    staged_items,
+                    items,
                     target_layers,
-                    receive_rank=self._ctx.effective_tp_rank,
                 )
             )
 
@@ -481,7 +467,6 @@ class WorkerConnector:
                     device_id=device_id,
                     layer_names=batch.target_layers,
                     items=batch.items,
-                    receive_rank=batch.receive_rank,
                 )
             )
         except Exception as e:

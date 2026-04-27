@@ -45,64 +45,40 @@ message SaveResponse {
   ResponseStatus status = 1;
 }
 
+message LoadPreparedItem {
+  uint64 plan_id = 1;
+  repeated int32 block_ids = 2;
+}
+
 message LoadRequest {
+  reserved 6;
+
   string instance_id = 1;
   uint32 tp_rank = 2;
   int32 device_id = 3;
   string load_state_shm = 4;
   repeated string layer_names = 5;
-  repeated int32 block_ids = 6;
-  repeated bytes block_hashes = 7;
+  repeated LoadPreparedItem items = 7;
 }
 
 message LoadResponse {
   ResponseStatus status = 1;
 }
 
-message LoadPdReceiveItem {
-  string request_id = 1;
-  string handle = 2;
-  repeated int32 block_ids = 3;
-}
-
-message LoadPdReceiveRequest {
+message PrepareLoadRequest {
   string instance_id = 1;
-  uint32 tp_rank = 2;
-  int32 device_id = 3;
-  string load_state_shm = 4;
-  repeated string layer_names = 5;
-  int32 receive_rank = 6;          // -1 means use tp_rank.
-  repeated LoadPdReceiveItem items = 7;
+  string request_id = 2;
+  repeated bytes block_hashes = 3;
+  uint64 num_prompt_tokens = 4;
+  uint64 num_computed_tokens = 5;
+  uint64 virtual_block_size = 6;
+  string prepare_state_shm = 7;
+  string decode_request_id = 8;
+  uint32 decode_expected_writes = 9;
 }
 
-message LoadPdReceiveResponse {
+message PrepareLoadResponse {
   ResponseStatus status = 1;
-}
-
-message QueryRequest {
-  string instance_id = 1;
-  repeated bytes block_hashes = 2;
-  string req_id = 3;
-}
-
-// Prefetch status enum
-enum PrefetchState {
-  // Terminal: all available blocks ready, proceed with hit_blocks
-  PREFETCH_DONE = 0;
-  // Transient: blocks being prefetched from DFS, caller should retry
-  PREFETCH_LOADING = 1;
-}
-
-message QueryResponse {
-  ResponseStatus status = 1;
-  // Number of blocks ready in cache (for backwards compatibility)
-  uint64 hit_blocks = 2;
-  // Prefetch state for async prefetch support
-  PrefetchState prefetch_state = 3;
-  // Number of blocks currently being loaded from DFS
-  uint64 loading_blocks = 4;
-  // Number of blocks not found in DFS
-  uint64 missing_blocks = 5;
 }
 
 message UnpinRequest {
@@ -198,25 +174,6 @@ message ReleaseTransferLockResponse {
   uint64 released_blocks = 2;
 }
 
-// P/D CPU-staging receive: D scheduler connector prepares a receive lease from
-// get_num_new_matched_tokens(), before vLLM allocates D GPU KV blocks. Router
-// never sends this RPC directly because it should not own tokenizer/cache logic.
-message PreparePdReceiveRequest {
-  string instance_id = 1;          // D-side vLLM/PegaFlow instance.
-  string request_id = 2;           // Stable router/vLLM request id.
-  repeated bytes block_hashes = 3; // Optional prefix metadata; may be shorter than num_blocks.
-  uint64 num_blocks = 4;           // Receive allocation size; required if block_hashes is empty.
-  uint32 expected_imm_count = 5;   // 0 means D defaults from receive ranks * NIC fanout.
-  uint64 expire_after_ms = 6;      // Defaults to server policy when unset.
-}
-
-message PreparePdReceiveResponse {
-  ResponseStatus status = 1;
-  string handle = 2;
-  uint32 imm_data = 3;
-  uint64 expires_at_ms = 4;
-}
-
 // P/PegaFlow fetches this descriptor from D/PegaFlow via the rendezvous
 // reference carried by the router. The router does not carry device/rank
 // topology. P workers request the D receive rank matching their local TP rank.
@@ -280,17 +237,14 @@ service Engine {
   rpc RegisterContextBatch(RegisterContextRequest) returns (RegisterContextResponse);
   rpc Save(SaveRequest) returns (SaveResponse);
   rpc Load(LoadRequest) returns (LoadResponse);
-  rpc LoadPdReceive(LoadPdReceiveRequest) returns (LoadPdReceiveResponse);
-  // Prefetch query: check memory + trigger SSD prefetch or cross-node RDMA fetch for missing blocks
-  rpc QueryPrefetch(QueryRequest) returns (QueryResponse);
+  rpc PrepareLoad(PrepareLoadRequest) returns (PrepareLoadResponse);
   rpc Unpin(UnpinRequest) returns (UnpinResponse);
   rpc UnregisterContext(UnregisterRequest) returns (UnregisterResponse);
   // Cross-node transfer: get RDMA metadata for specific blocks (serving side)
   rpc QueryBlocksForTransfer(QueryBlocksForTransferRequest) returns (QueryBlocksForTransferResponse);
   // Cross-node transfer: release block locks after RDMA transfer completes
   rpc ReleaseTransferLock(ReleaseTransferLockRequest) returns (ReleaseTransferLockResponse);
-  // P/D CPU-staging receive control plane
-  rpc PreparePdReceive(PreparePdReceiveRequest) returns (PreparePdReceiveResponse);
+  // P/D CPU-staging descriptor lookup for P-side writers.
   rpc GetPdReceiveDescriptor(GetPdReceiveDescriptorRequest) returns (GetPdReceiveDescriptorResponse);
   // RDMA handshake: establish a new peer-to-peer RDMA connection
   rpc RdmaHandshake(RdmaHandshakeRequest) returns (RdmaHandshakeResponse);

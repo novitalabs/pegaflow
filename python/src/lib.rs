@@ -1,10 +1,12 @@
-use pegaflow_core::LoadState;
+use pegaflow_core::{
+    LoadState, PREPARE_LOAD_STATE_NO_PLAN, PREPARE_LOAD_STATE_PENDING, PREPARE_LOAD_STATE_PLAN,
+    PrepareLoadState,
+};
 use pegaflow_proto::proto::engine::{
-    GetPdReceiveDescriptorRequest, HealthRequest, LoadPdReceiveItem, LoadPdReceiveRequest,
-    LoadRequest, PdReceiveDescriptorState, PreparePdReceiveRequest, QueryRequest,
-    RdmaHandshakeRequest, RegisterContextRequest, ResponseStatus, SaveLayer, SaveRequest,
-    SessionEvent, SessionRequest, ShutdownRequest, UnpinRequest, UnregisterRequest,
-    engine_client::EngineClient,
+    GetPdReceiveDescriptorRequest, HealthRequest, LoadPreparedItem, LoadRequest,
+    PdReceiveDescriptorState, PrepareLoadRequest, RdmaHandshakeRequest, RegisterContextRequest,
+    ResponseStatus, SaveLayer, SaveRequest, SessionEvent, SessionRequest, ShutdownRequest,
+    UnpinRequest, UnregisterRequest, engine_client::EngineClient,
 };
 use pegaflow_transfer::{
     ConnectionStatus, HandshakeMetadata, MemoryRegion, TransferDesc, TransferEngine, TransferOp,
@@ -105,254 +107,9 @@ fn status_tuple(method: &str, status: Option<ResponseStatus>) -> PyResult<(bool,
     Ok((status.ok, status.message))
 }
 
-fn u64_to_usize(value: u64, field: &str) -> PyResult<usize> {
-    usize::try_from(value)
-        .map_err(|_| PyRuntimeError::new_err(format!("{field}={value} exceeds usize range")))
-}
-
 fn non_null_from_usize(ptr: usize, field: &str) -> PyResult<NonNull<u8>> {
     NonNull::new(ptr as *mut u8)
         .ok_or_else(|| PyRuntimeError::new_err(format!("{field} must not be null")))
-}
-
-struct NativeLoadPlan {
-    request_id: String,
-    source: &'static str,
-    num_tokens: u64,
-    num_blocks: usize,
-    block_hashes: Vec<Vec<u8>>,
-    token: Option<String>,
-}
-
-enum NativePrepareLoadResult {
-    Preparing,
-    Done(Option<NativeLoadPlan>),
-    BusinessError(String),
-    RuntimeError(String),
-}
-
-fn prepare_status_error(
-    operation: &str,
-    status: Option<ResponseStatus>,
-) -> Option<NativePrepareLoadResult> {
-    let Some(status) = status else {
-        return Some(NativePrepareLoadResult::RuntimeError(format!(
-            "{operation} response missing status"
-        )));
-    };
-    if !status.ok {
-        return Some(NativePrepareLoadResult::BusinessError(format!(
-            "{operation} failed: {}",
-            status.message
-        )));
-    }
-    None
-}
-
-fn checked_prepare_tokens(
-    blocks: usize,
-    virtual_block_size: u64,
-) -> Result<u64, NativePrepareLoadResult> {
-    let blocks = blocks as u64;
-    blocks.checked_mul(virtual_block_size).ok_or_else(|| {
-        NativePrepareLoadResult::RuntimeError(format!(
-            "load token count overflows: blocks={blocks} virtual_block_size={virtual_block_size}"
-        ))
-    })
-}
-
-fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
-    if value == 0 {
-        0
-    } else {
-        ((value - 1) / divisor) + 1
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn prepare_load_inner(
-    client: &mut EngineClient<Channel>,
-    instance_id: String,
-    request_id: String,
-    block_hashes: Vec<Vec<u8>>,
-    num_prompt_tokens: u64,
-    num_computed_tokens: u64,
-    virtual_block_size: u64,
-    decode_request_id: Option<String>,
-    decode_expected_writes: u32,
-) -> Result<NativePrepareLoadResult, GrpcStatus> {
-    use pegaflow_proto::proto::engine::PrefetchState;
-
-    if virtual_block_size == 0 {
-        return Ok(NativePrepareLoadResult::RuntimeError(
-            "virtual_block_size must be greater than zero".to_string(),
-        ));
-    }
-
-    let computed_blocks = (num_computed_tokens / virtual_block_size) as usize;
-
-    // P/D path: prepare a D-side lease, then poll until IMM fan-in marks data_ready.
-    if let Some(decode_req_id) = decode_request_id
-        && !decode_req_id.is_empty()
-    {
-        let num_external_tokens =
-            num_prompt_tokens.saturating_sub(num_computed_tokens.saturating_add(1));
-        let num_blocks_u64 = ceil_div_u64(num_external_tokens, virtual_block_size);
-        if num_external_tokens == 0 || num_blocks_u64 == 0 {
-            return Ok(NativePrepareLoadResult::Done(None));
-        }
-
-        let num_blocks = num_blocks_u64 as usize;
-        let hash_start = computed_blocks.min(block_hashes.len());
-        let hash_end = hash_start
-            .saturating_add(num_blocks)
-            .min(block_hashes.len());
-        let staged_hashes = block_hashes[hash_start..hash_end].to_vec();
-
-        let prepare = client
-            .prepare_pd_receive(PreparePdReceiveRequest {
-                instance_id: instance_id.clone(),
-                request_id: decode_req_id.clone(),
-                block_hashes: staged_hashes.clone(),
-                num_blocks: num_blocks_u64,
-                expected_imm_count: decode_expected_writes,
-                expire_after_ms: 0,
-            })
-            .await?
-            .into_inner();
-        if let Some(error) = prepare_status_error("prepare_load", prepare.status) {
-            return Ok(error);
-        }
-
-        let descriptor = client
-            .get_pd_receive_descriptor(GetPdReceiveDescriptorRequest {
-                dst_instance_id: instance_id,
-                request_id: decode_req_id.clone(),
-                receive_rank: -1,
-                handle: prepare.handle.clone(),
-            })
-            .await?
-            .into_inner();
-        if let Some(error) = prepare_status_error("prepare_load", descriptor.status) {
-            return Ok(error);
-        }
-
-        let state = PdReceiveDescriptorState::try_from(descriptor.state)
-            .unwrap_or(PdReceiveDescriptorState::PdDescriptorPending);
-        return match state {
-            PdReceiveDescriptorState::PdDescriptorReady if descriptor.data_ready => {
-                Ok(NativePrepareLoadResult::Done(Some(NativeLoadPlan {
-                    request_id: decode_req_id,
-                    source: "staged",
-                    num_tokens: num_external_tokens,
-                    num_blocks,
-                    block_hashes: staged_hashes,
-                    token: Some(if descriptor.handle.is_empty() {
-                        prepare.handle
-                    } else {
-                        descriptor.handle
-                    }),
-                })))
-            }
-            PdReceiveDescriptorState::PdDescriptorFailed
-            | PdReceiveDescriptorState::PdDescriptorExpired => {
-                Ok(NativePrepareLoadResult::Done(None))
-            }
-            _ => Ok(NativePrepareLoadResult::Preparing),
-        };
-    }
-
-    // Cache path: only query the suffix that vLLM has not computed locally.
-    let remaining_hashes = if computed_blocks >= block_hashes.len() {
-        Vec::new()
-    } else {
-        block_hashes[computed_blocks..].to_vec()
-    };
-    if remaining_hashes.is_empty() {
-        return Ok(NativePrepareLoadResult::Done(None));
-    }
-
-    let query = client
-        .query_prefetch(QueryRequest {
-            instance_id,
-            block_hashes: remaining_hashes.clone(),
-            req_id: request_id.clone(),
-        })
-        .await?
-        .into_inner();
-    if let Some(error) = prepare_status_error("prepare_load", query.status) {
-        return Ok(error);
-    }
-
-    let state =
-        PrefetchState::try_from(query.prefetch_state).unwrap_or(PrefetchState::PrefetchDone);
-    if state == PrefetchState::PrefetchLoading {
-        return Ok(NativePrepareLoadResult::Preparing);
-    }
-
-    let hit_blocks = (query.hit_blocks as usize).min(remaining_hashes.len());
-    if hit_blocks == 0 {
-        return Ok(NativePrepareLoadResult::Done(None));
-    }
-
-    let num_tokens = match checked_prepare_tokens(hit_blocks, virtual_block_size) {
-        Ok(value) => value,
-        Err(result) => return Ok(result),
-    };
-
-    Ok(NativePrepareLoadResult::Done(Some(NativeLoadPlan {
-        request_id,
-        source: "cache",
-        num_tokens,
-        num_blocks: hit_blocks,
-        block_hashes: remaining_hashes.into_iter().take(hit_blocks).collect(),
-        token: None,
-    })))
-}
-
-fn prepare_load_result_to_py(result: NativePrepareLoadResult) -> PyResult<Py<pyo3::types::PyAny>> {
-    match result {
-        NativePrepareLoadResult::BusinessError(message) => {
-            Err(PegaFlowBusinessError::new_err(message))
-        }
-        NativePrepareLoadResult::RuntimeError(message) => Err(PyRuntimeError::new_err(message)),
-        NativePrepareLoadResult::Preparing => Python::attach(|py| {
-            use pyo3::types::PyDict;
-
-            let dict = PyDict::new(py);
-            dict.set_item("preparing", true)?;
-            dict.set_item("plan", py.None())?;
-            Ok(dict.into())
-        }),
-        NativePrepareLoadResult::Done(plan) => Python::attach(|py| {
-            use pyo3::types::{PyBytes, PyDict, PyList};
-
-            let dict = PyDict::new(py);
-            dict.set_item("preparing", false)?;
-            if let Some(plan) = plan {
-                let plan_dict = PyDict::new(py);
-                plan_dict.set_item("request_id", plan.request_id)?;
-                plan_dict.set_item("source", plan.source)?;
-                plan_dict.set_item("num_tokens", plan.num_tokens)?;
-                plan_dict.set_item("num_blocks", plan.num_blocks)?;
-                if let Some(token) = plan.token {
-                    plan_dict.set_item("token", token)?;
-                } else {
-                    plan_dict.set_item("token", py.None())?;
-                }
-
-                let hashes = PyList::empty(py);
-                for hash in plan.block_hashes {
-                    hashes.append(PyBytes::new(py, &hash))?;
-                }
-                plan_dict.set_item("block_hashes", hashes)?;
-                dict.set_item("plan", plan_dict)?;
-            } else {
-                dict.set_item("plan", py.None())?;
-            }
-            Ok(dict.into())
-        }),
-    }
 }
 
 #[pyclass(name = "_NativeEngineClient")]
@@ -542,19 +299,9 @@ impl EngineRpcClient {
         .and_then(|r| status_tuple("save", r.status))
     }
 
-    /// Load KV blocks from the engine.
-    ///
-    /// Args:
-    ///     instance_id: Model instance ID
-    ///     tp_rank: Tensor parallel rank
-    ///     device_id: CUDA device ID
-    ///     load_state_shm: Shared memory name for load state sync
-    ///     layer_names: List of layer names to load
-    ///     block_ids: GPU block IDs to load into
-    ///     block_hashes: Content hashes for blocks
-    ///
-    /// Returns: (ok: bool, message: str)
+    /// Load prepared KV blocks from the engine.
     #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (instance_id, tp_rank, device_id, load_state_shm, layer_names, items))]
     fn load(
         &self,
         py: Python<'_>,
@@ -563,9 +310,12 @@ impl EngineRpcClient {
         device_id: i32,
         load_state_shm: String,
         layer_names: Vec<String>,
-        block_ids: Vec<i32>,
-        block_hashes: Vec<Vec<u8>>,
+        items: Vec<(u64, Vec<i32>)>,
     ) -> PyResult<(bool, String)> {
+        let items = items
+            .into_iter()
+            .map(|(plan_id, block_ids)| LoadPreparedItem { plan_id, block_ids })
+            .collect();
         self.call(py, "load", |mut c| async move {
             let resp = c
                 .load(LoadRequest {
@@ -574,8 +324,7 @@ impl EngineRpcClient {
                     device_id,
                     load_state_shm,
                     layer_names,
-                    block_ids,
-                    block_hashes,
+                    items,
                 })
                 .await?;
             Ok(resp.into_inner())
@@ -583,113 +332,9 @@ impl EngineRpcClient {
         .and_then(|r| status_tuple("load", r.status))
     }
 
-    /// Load KV blocks from D-side P/D CPU-staging receive leases.
+    /// Begin scheduler-side external KV preparation.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (instance_id, tp_rank, device_id, load_state_shm, layer_names, items, receive_rank = -1))]
-    fn load_pd_receive(
-        &self,
-        py: Python<'_>,
-        instance_id: String,
-        tp_rank: u32,
-        device_id: i32,
-        load_state_shm: String,
-        layer_names: Vec<String>,
-        items: Vec<(String, String, Vec<i32>)>,
-        receive_rank: i32,
-    ) -> PyResult<(bool, String)> {
-        let items = items
-            .into_iter()
-            .map(|(request_id, handle, block_ids)| LoadPdReceiveItem {
-                request_id,
-                handle,
-                block_ids,
-            })
-            .collect();
-        self.call(py, "load_pd_receive", |mut c| async move {
-            let resp = c
-                .load_pd_receive(LoadPdReceiveRequest {
-                    instance_id,
-                    tp_rank,
-                    device_id,
-                    load_state_shm,
-                    layer_names,
-                    receive_rank,
-                    items,
-                })
-                .await?;
-            Ok(resp.into_inner())
-        })
-        .and_then(|r| status_tuple("load_pd_receive", r.status))
-    }
-
-    /// Query prefix cache hits with SSD prefetch support.
-    ///
-    /// Checks memory cache and triggers SSD prefetch for missing blocks.
-    /// Pins hit blocks for subsequent load operations.
-    ///
-    /// Args:
-    ///     instance_id: Model instance ID
-    ///     block_hashes: List of block hashes to check
-    ///
-    /// Returns: dict with keys:
-    ///     - ok: bool - whether the request succeeded
-    ///     - message: str - error message if failed
-    ///     - hit_blocks: int - number of blocks ready in cache
-    ///     - prefetch_state: str - one of "done", "loading"
-    ///     - loading_blocks: int - number of blocks being prefetched
-    ///     - missing_blocks: int - number of blocks not found
-    fn query_prefetch(
-        &self,
-        py: Python<'_>,
-        instance_id: String,
-        block_hashes: Vec<Vec<u8>>,
-        req_id: String,
-    ) -> PyResult<Py<pyo3::types::PyAny>> {
-        use pegaflow_proto::proto::engine::PrefetchState;
-
-        self.call(py, "query_prefetch", |mut c| async move {
-            let resp = c
-                .query_prefetch(QueryRequest {
-                    instance_id,
-                    block_hashes,
-                    req_id,
-                })
-                .await?;
-            Ok(resp.into_inner())
-        })
-        .and_then(|r| {
-            let (ok, msg) = status_tuple("query_prefetch", r.status)?;
-            let hit = u64_to_usize(r.hit_blocks, "hit_blocks")?;
-            let loading = u64_to_usize(r.loading_blocks, "loading_blocks")?;
-            let missing = u64_to_usize(r.missing_blocks, "missing_blocks")?;
-
-            let prefetch_state = match PrefetchState::try_from(r.prefetch_state) {
-                Ok(PrefetchState::PrefetchDone) => "done",
-                Ok(PrefetchState::PrefetchLoading) => "loading",
-                _ => "done", // Default to done for unknown states
-            };
-
-            Python::attach(|py| {
-                use pyo3::types::PyDict;
-                let dict = PyDict::new(py);
-                dict.set_item("ok", ok)?;
-                dict.set_item("message", msg)?;
-                dict.set_item("hit_blocks", hit)?;
-                dict.set_item("prefetch_state", prefetch_state)?;
-                dict.set_item("loading_blocks", loading)?;
-                dict.set_item("missing_blocks", missing)?;
-                Ok(dict.into())
-            })
-        })
-    }
-
-    /// Prepare scheduler-side external KV loading.
-    ///
-    /// Returns a dict with:
-    ///     - preparing: bool
-    ///     - plan: None or a terminal load plan dict
-    #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (instance_id, request_id, block_hashes, num_prompt_tokens, num_computed_tokens, virtual_block_size, decode_request_id = None, decode_expected_writes = 0))]
+    #[pyo3(signature = (instance_id, request_id, block_hashes, num_prompt_tokens, num_computed_tokens, virtual_block_size, prepare_state_shm, decode_request_id = None, decode_expected_writes = 0))]
     fn prepare_load(
         &self,
         py: Python<'_>,
@@ -699,72 +344,27 @@ impl EngineRpcClient {
         num_prompt_tokens: u64,
         num_computed_tokens: u64,
         virtual_block_size: u64,
+        prepare_state_shm: String,
         decode_request_id: Option<String>,
         decode_expected_writes: u32,
-    ) -> PyResult<Py<pyo3::types::PyAny>> {
+    ) -> PyResult<(bool, String)> {
         self.call(py, "prepare_load", |mut c| async move {
-            prepare_load_inner(
-                &mut c,
-                instance_id,
-                request_id,
-                block_hashes,
-                num_prompt_tokens,
-                num_computed_tokens,
-                virtual_block_size,
-                decode_request_id,
-                decode_expected_writes,
-            )
-            .await
-        })
-        .and_then(prepare_load_result_to_py)
-    }
-
-    /// Prepare a D-side CPU-staging lease for P/D push.
-    ///
-    /// Returns: dict with keys:
-    ///     - ok: bool
-    ///     - message: str
-    ///     - handle: str
-    ///     - imm_data: int
-    ///     - expires_at_ms: int
-    #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (instance_id, request_id, block_hashes, num_blocks, expected_imm_count = 0, expire_after_ms = 0))]
-    fn prepare_pd_receive(
-        &self,
-        py: Python<'_>,
-        instance_id: String,
-        request_id: String,
-        block_hashes: Vec<Vec<u8>>,
-        num_blocks: u64,
-        expected_imm_count: u32,
-        expire_after_ms: u64,
-    ) -> PyResult<Py<pyo3::types::PyAny>> {
-        self.call(py, "prepare_pd_receive", |mut c| async move {
             let resp = c
-                .prepare_pd_receive(PreparePdReceiveRequest {
+                .prepare_load(PrepareLoadRequest {
                     instance_id,
                     request_id,
                     block_hashes,
-                    num_blocks,
-                    expected_imm_count,
-                    expire_after_ms,
+                    num_prompt_tokens,
+                    num_computed_tokens,
+                    virtual_block_size,
+                    prepare_state_shm,
+                    decode_request_id: decode_request_id.unwrap_or_default(),
+                    decode_expected_writes,
                 })
                 .await?;
             Ok(resp.into_inner())
         })
-        .and_then(|r| {
-            let (ok, msg) = status_tuple("prepare_pd_receive", r.status)?;
-            Python::attach(|py| {
-                use pyo3::types::PyDict;
-                let dict = PyDict::new(py);
-                dict.set_item("ok", ok)?;
-                dict.set_item("message", msg)?;
-                dict.set_item("handle", r.handle)?;
-                dict.set_item("imm_data", r.imm_data)?;
-                dict.set_item("expires_at_ms", r.expires_at_ms)?;
-                Ok(dict.into())
-            })
-        })
+        .and_then(|r| status_tuple("prepare_load", r.status))
     }
 
     /// Fetch a D-side P/D receive descriptor.
@@ -1010,6 +610,47 @@ impl PyLoadState {
     /// Returns True if state is non-zero (completed or error).
     fn is_ready(&self) -> bool {
         self.inner.get() != 0
+    }
+}
+
+/// Python wrapper for PrepareLoadState.
+#[pyclass(name = "_NativePrepareLoadState")]
+struct PyPrepareLoadState {
+    inner: Arc<PrepareLoadState>,
+}
+
+#[pymethods]
+impl PyPrepareLoadState {
+    #[new]
+    fn new() -> PyResult<Self> {
+        let inner = PrepareLoadState::new().map_err(|e| {
+            PyRuntimeError::new_err(format!("failed to create PrepareLoadState: {e}"))
+        })?;
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
+    }
+
+    fn shm_name(&self) -> String {
+        self.inner.shm_name().to_string()
+    }
+
+    fn snapshot(&self) -> PyResult<Py<pyo3::types::PyAny>> {
+        Python::attach(|py| {
+            use pyo3::types::PyDict;
+            let snapshot = self.inner.snapshot();
+            let dict = PyDict::new(py);
+            dict.set_item("state", snapshot.state)?;
+            dict.set_item("num_tokens", snapshot.num_tokens)?;
+            dict.set_item("plan_id", snapshot.plan_id)?;
+            dict.set_item("preparing", snapshot.state == PREPARE_LOAD_STATE_PENDING)?;
+            dict.set_item(
+                "ready_no_plan",
+                snapshot.state == PREPARE_LOAD_STATE_NO_PLAN,
+            )?;
+            dict.set_item("ready_plan", snapshot.state == PREPARE_LOAD_STATE_PLAN)?;
+            Ok(dict.into())
+        })
     }
 }
 
@@ -1283,6 +924,7 @@ fn pegaflow(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<EngineRpcClient>()?;
     m.add_class::<PyLoadState>()?;
+    m.add_class::<PyPrepareLoadState>()?;
     m.add_class::<KvEgressRuntime>()?;
     // Register custom exceptions for error classification
     m.add("PegaFlowError", m.py().get_type::<PegaFlowError>())?;

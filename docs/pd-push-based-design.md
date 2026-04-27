@@ -101,7 +101,7 @@ router -> d_sched: "decode request\npd_request_id + rendezvous"
 router -> p_vllm: "prefill request\nsame pd_request_id"
 
 d_sched -> d_sched: "get_num_new_matched_tokens()"
-d_sched -> d_pf: "PreparePdReceive\nidempotent, async"
+d_sched -> d_pf: "PrepareLoad\nidempotent, async"
 d_sched -> d_sched: "return (None, False)\nwhile not ready"
 
 p_vllm -> p_worker: "source KV ready\nmetadata-driven save path"
@@ -154,7 +154,7 @@ external_tokens = num_blocks * vLLM_block_size
 Only complete block hashes are eligible for P/D receive. Partial prompt tails
 are recomputed by D; otherwise D can wait for a block P will never save.
 
-It calls local D PegaFlow `PreparePdReceive` with:
+It calls local D PegaFlow `PrepareLoad` with:
 
 - `pd_request_id`;
 - D instance / model identity;
@@ -259,7 +259,7 @@ P instance TP4:
   worker tp_rank 3 -> D receive_rank 3
 ```
 
-D scheduler calls `PreparePdReceive(instance_id, pd_request_id, num_blocks, ...)`
+D scheduler calls `PrepareLoad(instance_id, request_id, ..., prepare_state_shm, decode_request_id)`
 once. D PegaFlow snapshots registered D workers and allocates staging for every
 registered receive rank. P workers call
 `GetPdReceiveDescriptor(dst_instance_id, pd_request_id, receive_rank=<local tp>)`
@@ -315,9 +315,9 @@ model is therefore:
 D startup / registration:
   allocate and RDMA-register per-NUMA P/D staging arenas
 
-PreparePdReceive:
+PrepareLoad:
   sub-allocate request slices inside those arenas
-  return descriptor offsets/pointers inside registered arenas
+  publish a prepared plan id through shared memory when ready
 ```
 
 ## TP And Fan-In
@@ -337,10 +337,10 @@ maps it to lease state and expected contributor counts.
 Initial RPC/control operations:
 
 ```text
-PreparePdReceive        D scheduler connector -> local D PegaFlow
+PrepareLoad             D scheduler connector -> local D PegaFlow
 GetPdReceiveDescriptor  P in-process runtime -> D PegaFlow
-GetPdReceiveDescriptor  D scheduler connector -> local D PegaFlow (data_ready poll)
-LoadPdReceive           D worker connector -> local D PegaFlow
+prepare shm             D scheduler connector <- local D PegaFlow (data_ready result)
+Load                    D worker connector -> local D PegaFlow (plan_id consume)
 ```
 
 No hot-path `CompletePdReceive` is needed; RDMA WRITE with immediate is the
@@ -388,7 +388,7 @@ Costs:
 ## Roadmap
 
 1. Current validation path: TP4 P/D, CPU staging receive, P GPU RDMA WRITE into
-   D CPU staging, final WRITE-with-IMM, D `LoadPdReceive` H2D.
+   D CPU staging, final WRITE-with-IMM, D prepared `Load` H2D.
 2. Add TP fan-in accounting, TTL cleanup hardening, and metrics.
 3. Add unified RDMA admission for P/D push, P save/offload, and remote cache
    traffic.

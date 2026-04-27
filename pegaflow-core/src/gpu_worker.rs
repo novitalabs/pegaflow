@@ -1,4 +1,3 @@
-use std::ptr::NonNull;
 use std::sync::Arc;
 
 use cudarc::driver::{CudaContext, CudaStream};
@@ -23,32 +22,15 @@ pub(crate) struct LayerLoadData {
     pub layer_name: String,
     pub registration: KVCacheRegistration,
     pub blocks: Vec<LoadBlock>,
-    pub _staging_keepalives: Vec<Arc<crate::PinnedAllocation>>,
 }
 
 pub(crate) struct LoadBlock {
     pub block_idx: usize,
-    pub source: LoadBlockSource,
+    pub source: Arc<RawBlock>,
 }
 
-pub(crate) enum LoadBlockSource {
-    Cached(Arc<RawBlock>),
-    Staged { segment_ptrs: Vec<NonNull<u8>> },
-}
-
-impl LoadBlockSource {
-    fn segment_ptr(&self, segment_idx: usize) -> Option<NonNull<u8>> {
-        match self {
-            Self::Cached(block) => block.segment_ptr(segment_idx),
-            Self::Staged { segment_ptrs } => segment_ptrs.get(segment_idx).copied(),
-        }
-    }
-}
-
-// SAFETY: Staged pointers point into pinned CPU allocations kept alive by
-// LayerLoadData::_staging_keepalives until the load task completes.
-unsafe impl Send for LoadBlockSource {}
-// SAFETY: See LoadBlockSource.
+// SAFETY: LoadBlock holds Arc<RawBlock>, whose pinned memory lifetime is owned
+// by its segments.
 unsafe impl Send for LoadBlock {}
 
 /// A task to save KV blocks from GPU to CPU for multiple layers.

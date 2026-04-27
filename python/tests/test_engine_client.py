@@ -12,6 +12,32 @@ Run with:
     cd python && pytest tests/ -v
 """
 
+import importlib
+import time
+
+
+def _prepare_snapshot(engine_client, instance_id: str, block_hashes: list[bytes]) -> dict:
+    pegaflow_module = importlib.import_module("pegaflow.pegaflow")
+    state = pegaflow_module._NativePrepareLoadState()
+    ok, message = engine_client.prepare_load(
+        instance_id,
+        "test",
+        block_hashes,
+        len(block_hashes) * 16,
+        0,
+        16,
+        state.shm_name(),
+        None,
+        0,
+    )
+    assert ok, message
+    for _ in range(100):
+        snapshot = state.snapshot()
+        if not snapshot.get("preparing", False):
+            return snapshot
+        time.sleep(0.01)
+    return state.snapshot()
+
 
 class TestEngineClientFixtures:
     """Test basic fixtures and server connectivity."""
@@ -26,29 +52,28 @@ class TestEngineClientFixtures:
         assert pega_server.endpoint.startswith("http://")
 
 
-class TestEngineClientQuery:
-    """Test query operations with various inputs."""
+class TestEngineClientPrepareLoad:
+    """Test prepare-load operations with various inputs."""
 
-    def test_query_empty_hashes(self, engine_client, registered_instance: str):
-        """Query with empty hashes should succeed."""
-        result = engine_client.query_prefetch(registered_instance, [], req_id="test")
-
-        assert isinstance(result, dict)
-        assert "hit_blocks" in result or "ok" in result
-
-    def test_query_unknown_hashes(
-        self, engine_client, registered_instance: str, block_hashes: list[bytes]
-    ):
-        """Query for unknown hashes should return zero hits (miss)."""
-        result = engine_client.query_prefetch(registered_instance, block_hashes[:5], req_id="test")
+    def test_prepare_empty_hashes(self, engine_client, registered_instance: str):
+        """Prepare with empty hashes should return no load plan."""
+        result = _prepare_snapshot(engine_client, registered_instance, [])
 
         assert isinstance(result, dict)
-        hit_blocks = result.get("hit_blocks", 0)
-        assert hit_blocks == 0, "Unknown hashes should have zero hits"
+        assert result.get("ready_no_plan") is True
 
-    def test_query_single_hash(
+    def test_prepare_unknown_hashes(
         self, engine_client, registered_instance: str, block_hashes: list[bytes]
     ):
-        """Query with a single hash."""
-        result = engine_client.query_prefetch(registered_instance, block_hashes[:1], req_id="test")
+        """Prepare for unknown hashes should return no load plan."""
+        result = _prepare_snapshot(engine_client, registered_instance, block_hashes[:5])
+
+        assert isinstance(result, dict)
+        assert result.get("ready_no_plan") is True
+
+    def test_prepare_single_hash(
+        self, engine_client, registered_instance: str, block_hashes: list[bytes]
+    ):
+        """Prepare with a single hash."""
+        result = _prepare_snapshot(engine_client, registered_instance, block_hashes[:1])
         assert result is not None
