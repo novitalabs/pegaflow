@@ -167,7 +167,7 @@ Semantics:
 P/D waiting state belongs above the transfer layer:
 
 ```text
-PreparePdReceive -> lease state PREPARED
+PrepareLoad -> internal staging lease state PREPARED
 first matching ImmCompletion -> optional lease state WRITING
 ImmCompletion { imm_data } -> P/D receive manager looks up lease/fan-in state
 expected imm count reached -> P/D receive manager marks lease READY
@@ -284,8 +284,8 @@ before the final immediate.
 Once WRITE-with-imm is validated, P/D should use it like this:
 
 ```text
-PreparePdReceive:
-  allocate D CPU staging and return handle + imm_data
+PrepareLoad:
+  allocate D CPU staging and publish a prepared plan id when data is ready
 
 P worker in-process egress:
   fetch rank descriptor from D PegaFlow

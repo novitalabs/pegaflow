@@ -18,6 +18,7 @@ mod gpu_worker;
 mod instance;
 mod internode;
 pub use pegaflow_common::logging;
+mod load_plan;
 mod metrics;
 mod offload;
 mod pd_receive;
@@ -37,10 +38,10 @@ pub use block::{
 };
 pub use instance::{GpuContext, InstanceContext, KVCacheRegistration};
 pub use internode::{DEFAULT_METASERVER_QUEUE_DEPTH, MetaServerClient, MetaServerClientConfig};
+pub use load_plan::{PrepareLoadOutcome, PrepareLoadRequest, PreparedLoadItem};
 pub use pd_receive::{
-    PdReceiveDescriptor, PdReceiveDescriptorLookup, PdReceiveLayerLayout, PdReceiveLeaseState,
-    PdReceiveLoadItem, PdReceivePrepareRequest, PdReceivePrepareResponse, PdReceiveRankDesc,
-    PdReceiveSlabDesc,
+    PdReceiveDescriptor, PdReceiveDescriptorLookup, PdReceiveLayerLayout, PdReceivePrepareRequest,
+    PdReceivePrepareResponse, PdReceiveRankDesc, PdReceiveSlabDesc,
 };
 pub use pegaflow_common::NumaNode;
 use pegaflow_common::NumaTopology;
@@ -48,20 +49,26 @@ pub use pinned_pool::PinnedAllocation;
 pub use seal_offload::SlotMeta;
 pub use storage::StorageConfig;
 pub use sync_state::{LoadState, LoadStateError};
+pub use sync_state::{PrepareLoadState, PrepareLoadStateError};
 pub use trace::{set_trace_sample_rate, should_sample};
 
 use std::{
     collections::HashMap,
     fmt,
-    ptr::NonNull,
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use log::{debug, info, warn};
+use parking_lot::Mutex;
 
 use crate::backing::SSD_ALIGNMENT;
-use crate::gpu_worker::{LayerLoadData, LoadBlock, LoadBlockSource, LoadTask};
+use crate::gpu_worker::{LayerLoadData, LoadBlock, LoadTask};
+use crate::load_plan::PreparedLoadPlan;
 use crate::metrics::core_metrics;
+use crate::pd_receive::PdReceiveCheckoutStatus;
 use crate::storage::StorageEngine;
 
 /// Errors that can occur during engine operations.
@@ -99,78 +106,26 @@ impl fmt::Display for EngineError {
     }
 }
 
-fn pd_receive_segment_ptr(
-    slab: &PdReceiveSlabDesc,
-    layout: &PdReceiveLayerLayout,
-    staged_block_idx: usize,
-    segment_idx: usize,
-) -> Result<NonNull<u8>, EngineError> {
-    let block_offset = layout
-        .block_stride
-        .checked_mul(staged_block_idx as u64)
-        .ok_or_else(|| {
-            EngineError::InvalidArgument(format!(
-                "P/D receive block offset overflow for layer {}",
-                layout.layer_name
-            ))
-        })?;
-    let segment_offset = layout
-        .padded_segment_stride
-        .checked_mul(segment_idx as u64)
-        .ok_or_else(|| {
-            EngineError::InvalidArgument(format!(
-                "P/D receive segment offset overflow for layer {}",
-                layout.layer_name
-            ))
-        })?;
-    let offset = layout
-        .layer_offset
-        .checked_add(block_offset)
-        .and_then(|value| value.checked_add(segment_offset))
-        .ok_or_else(|| {
-            EngineError::InvalidArgument(format!(
-                "P/D receive offset overflow for layer {}",
-                layout.layer_name
-            ))
-        })?;
-    let end = offset.checked_add(layout.segment_size).ok_or_else(|| {
-        EngineError::InvalidArgument(format!(
-            "P/D receive segment end overflow for layer {}",
-            layout.layer_name
-        ))
-    })?;
-    if end > slab.size {
-        return Err(EngineError::InvalidArgument(format!(
-            "P/D receive segment out of slab bounds for layer {}: end={} slab_size={}",
-            layout.layer_name, end, slab.size
-        )));
-    }
-    let addr = slab.base_ptr.checked_add(offset).ok_or_else(|| {
-        EngineError::InvalidArgument(format!(
-            "P/D receive pointer overflow for layer {}",
-            layout.layer_name
-        ))
-    })?;
-    let addr = usize::try_from(addr).map_err(|_| {
-        EngineError::InvalidArgument(format!(
-            "P/D receive pointer does not fit usize for layer {}",
-            layout.layer_name
-        ))
-    })?;
-    NonNull::new(addr as *mut u8).ok_or_else(|| {
-        EngineError::InvalidArgument(format!(
-            "P/D receive pointer is null for layer {}",
-            layout.layer_name
-        ))
-    })
-}
-
 impl std::error::Error for EngineError {}
 
 impl From<LoadStateError> for EngineError {
     fn from(err: LoadStateError) -> Self {
         EngineError::Storage(format!("LoadState: {err}"))
     }
+}
+
+impl From<PrepareLoadStateError> for EngineError {
+    fn from(err: PrepareLoadStateError) -> Self {
+        EngineError::Storage(format!("PrepareLoadState: {err}"))
+    }
+}
+
+struct PreparedLoadEntry {
+    instance_id: String,
+    request_id: String,
+    num_tokens: u64,
+    plan: PreparedLoadPlan,
+    remaining_loads: usize,
 }
 
 /// Main engine for managing KV cache offloading.
@@ -192,6 +147,11 @@ pub struct PegaEngine {
     topology: Arc<NumaTopology>,
     /// D-side P/D CPU-staging receive leases.
     pd_receive: Arc<pd_receive::PdReceiveManager>,
+    /// Prepared load plans keyed by opaque plan id.
+    prepared_loads: Arc<Mutex<HashMap<u64, PreparedLoadEntry>>>,
+    /// Monotonic source for prepared-load plan handles. Zero is reserved for
+    /// "no plan" in shared memory.
+    next_prepared_load_id: Arc<AtomicU64>,
 }
 
 impl PegaEngine {
@@ -225,6 +185,17 @@ impl PegaEngine {
             storage,
             topology,
             pd_receive: Arc::new(pd_receive::PdReceiveManager::new()),
+            prepared_loads: Arc::new(Mutex::new(HashMap::new())),
+            next_prepared_load_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    fn new_prepared_load_id(&self) -> u64 {
+        loop {
+            let plan_id = self.next_prepared_load_id.fetch_add(1, Ordering::Relaxed);
+            if plan_id != 0 {
+                return plan_id;
+            }
         }
     }
 
@@ -411,13 +382,31 @@ impl PegaEngine {
     /// - `Done { hit, missing }`: some blocks don't exist
     #[cfg_attr(
         feature = "tracing",
-        fastrace::trace(name = "query_prefetch.count_prefix_hit")
+        fastrace::trace(name = "prepare_load.count_prefix_hit")
     )]
     pub async fn count_prefix_hit_blocks_with_prefetch(
         &self,
         instance_id: &str,
         req_id: &str,
         block_hashes: &[Vec<u8>],
+    ) -> Result<PrefetchStatus, EngineError> {
+        let instance = self.get_instance(instance_id)?;
+        let num_workers = instance.world_size();
+        self.count_prefix_hit_blocks_with_prefetch_for_workers(
+            instance_id,
+            req_id,
+            block_hashes,
+            num_workers,
+        )
+        .await
+    }
+
+    async fn count_prefix_hit_blocks_with_prefetch_for_workers(
+        &self,
+        instance_id: &str,
+        req_id: &str,
+        block_hashes: &[Vec<u8>],
+        num_workers: usize,
     ) -> Result<PrefetchStatus, EngineError> {
         if req_id.is_empty() {
             warn!("count_prefix_hit_blocks_with_prefetch: empty req_id, returning 0 hits");
@@ -429,12 +418,11 @@ impl PegaEngine {
 
         let instance = self.get_instance(instance_id)?;
         let namespace = instance.namespace();
-        let world_size = instance.world_size();
         let metrics = core_metrics();
 
         let status = self
             .storage
-            .check_prefix_and_prefetch(instance_id, req_id, namespace, block_hashes, world_size)
+            .check_prefix_and_prefetch(instance_id, req_id, namespace, block_hashes, num_workers)
             .await;
 
         match &status {
@@ -450,6 +438,222 @@ impl PegaEngine {
         }
 
         Ok(status)
+    }
+
+    /// Advance one server-owned prepare-load state-machine step.
+    ///
+    /// The caller may invoke this repeatedly from an async task until the
+    /// outcome is terminal. Terminal plan outcomes are registered under an
+    /// opaque plan id that the later load call consumes.
+    pub async fn prepare_load_step(
+        &self,
+        request: &PrepareLoadRequest,
+    ) -> Result<PrepareLoadOutcome, EngineError> {
+        assert!(
+            !self.has_prepared_load_for_request(&request.instance_id, &request.request_id),
+            "prepared load plan already exists before prepare_load_step: instance_id={} request_id={}",
+            request.instance_id,
+            request.request_id
+        );
+
+        let computed_blocks = usize::try_from(
+            request.num_computed_tokens / request.virtual_block_size,
+        )
+        .map_err(|_| {
+            EngineError::InvalidArgument(format!(
+                "num_computed_tokens={} / virtual_block_size={} does not fit usize",
+                request.num_computed_tokens, request.virtual_block_size
+            ))
+        })?;
+
+        if let Some(decode_req_id) = request
+            .decode_request_id
+            .as_ref()
+            .filter(|request_id| !request_id.is_empty())
+        {
+            return self
+                .prepare_staged_load_step(request, decode_req_id, computed_blocks)
+                .await;
+        }
+
+        self.prepare_cache_load_step(request, computed_blocks).await
+    }
+
+    async fn prepare_cache_load_step(
+        &self,
+        request: &PrepareLoadRequest,
+        computed_blocks: usize,
+    ) -> Result<PrepareLoadOutcome, EngineError> {
+        let remaining_hashes = if computed_blocks >= request.block_hashes.len() {
+            Vec::new()
+        } else {
+            request.block_hashes[computed_blocks..].to_vec()
+        };
+        if remaining_hashes.is_empty() {
+            return Ok(PrepareLoadOutcome::NoPlan);
+        }
+
+        let status = self
+            .count_prefix_hit_blocks_with_prefetch_for_workers(
+                &request.instance_id,
+                &request.request_id,
+                &remaining_hashes,
+                1,
+            )
+            .await?;
+
+        let hit_blocks = match status {
+            PrefetchStatus::Loading { .. } => return Ok(PrepareLoadOutcome::Pending),
+            PrefetchStatus::Done { hit, .. } => hit.min(remaining_hashes.len()),
+        };
+        if hit_blocks == 0 {
+            return Ok(PrepareLoadOutcome::NoPlan);
+        }
+
+        let num_tokens = (hit_blocks as u64)
+            .checked_mul(request.virtual_block_size)
+            .ok_or_else(|| {
+                EngineError::InvalidArgument(format!(
+                    "prepared load token count overflows: blocks={} virtual_block_size={}",
+                    hit_blocks, request.virtual_block_size
+                ))
+            })?;
+        let block_hashes: Vec<Vec<u8>> = remaining_hashes.into_iter().take(hit_blocks).collect();
+        let instance = self.get_instance(&request.instance_id)?;
+        let block_entries = self
+            .storage
+            .consume_pinned_blocks(&request.instance_id, instance.namespace(), &block_hashes)
+            .map_err(EngineError::Storage)?;
+        let plan = PreparedLoadPlan::from_cache_blocks(&instance, &block_entries)?;
+        let remaining_loads = instance.registered_shards().len().max(1);
+        Ok(self.insert_prepared_load(
+            self.new_prepared_load_id(),
+            request.instance_id.clone(),
+            request.request_id.clone(),
+            num_tokens,
+            plan,
+            remaining_loads,
+        ))
+    }
+
+    async fn prepare_staged_load_step(
+        &self,
+        request: &PrepareLoadRequest,
+        decode_req_id: &str,
+        computed_blocks: usize,
+    ) -> Result<PrepareLoadOutcome, EngineError> {
+        let num_external_tokens = request
+            .num_prompt_tokens
+            .saturating_sub(request.num_computed_tokens.saturating_add(1));
+        let num_blocks_u64 = num_external_tokens.div_ceil(request.virtual_block_size);
+        if num_external_tokens == 0 || num_blocks_u64 == 0 {
+            return Ok(PrepareLoadOutcome::NoPlan);
+        }
+        let num_blocks = usize::try_from(num_blocks_u64).map_err(|_| {
+            EngineError::InvalidArgument(format!(
+                "prepared staged block count does not fit usize: {num_blocks_u64}"
+            ))
+        })?;
+
+        let hash_start = computed_blocks.min(request.block_hashes.len());
+        let hash_end = hash_start
+            .saturating_add(num_blocks)
+            .min(request.block_hashes.len());
+        let staged_hashes = request.block_hashes[hash_start..hash_end].to_vec();
+
+        let prepare = self.prepare_staging_receive(PdReceivePrepareRequest {
+            instance_id: request.instance_id.clone(),
+            request_id: decode_req_id.to_string(),
+            block_hashes: staged_hashes,
+            num_blocks,
+            expected_imm_count: request.decode_expected_writes,
+            expire_after: None,
+        })?;
+
+        let load_plans = match self.pd_receive.try_checkout_ready(
+            &request.instance_id,
+            decode_req_id,
+            prepare.handle.as_str(),
+        )? {
+            PdReceiveCheckoutStatus::Pending => return Ok(PrepareLoadOutcome::Pending),
+            PdReceiveCheckoutStatus::Expired => return Ok(PrepareLoadOutcome::NoPlan),
+            PdReceiveCheckoutStatus::Ready(load_plans) => load_plans,
+        };
+
+        let plan = PreparedLoadPlan::from_staged_load_plans(&load_plans, num_blocks)?;
+        let instance = self.get_instance(&request.instance_id)?;
+        let remaining_loads = instance.registered_shards().len().max(1);
+        Ok(self.insert_prepared_load(
+            self.new_prepared_load_id(),
+            request.instance_id.clone(),
+            request.request_id.clone(),
+            num_external_tokens,
+            plan,
+            remaining_loads,
+        ))
+    }
+
+    fn insert_prepared_load(
+        &self,
+        plan_id: u64,
+        instance_id: String,
+        request_id: String,
+        num_tokens: u64,
+        plan: PreparedLoadPlan,
+        remaining_loads: usize,
+    ) -> PrepareLoadOutcome {
+        let outcome = PrepareLoadOutcome::Plan {
+            plan_id,
+            num_tokens,
+        };
+        let mut prepared = self.prepared_loads.lock();
+        prepared.insert(
+            plan_id,
+            PreparedLoadEntry {
+                instance_id,
+                request_id,
+                num_tokens,
+                plan,
+                remaining_loads,
+            },
+        );
+        outcome
+    }
+
+    fn get_prepared_load_plan(
+        &self,
+        instance_id: &str,
+        plan_id: u64,
+    ) -> Result<PreparedLoadPlan, EngineError> {
+        let prepared = self.prepared_loads.lock();
+        let entry = prepared.get(&plan_id).ok_or_else(|| {
+            EngineError::InvalidArgument(format!("prepared load plan not found: {plan_id}"))
+        })?;
+        if entry.instance_id != instance_id {
+            return Err(EngineError::InvalidArgument(format!(
+                "prepared load plan {plan_id} belongs to instance {}, not {instance_id}",
+                entry.instance_id
+            )));
+        }
+        Ok(entry.plan.clone())
+    }
+
+    fn has_prepared_load_for_request(&self, instance_id: &str, request_id: &str) -> bool {
+        let prepared = self.prepared_loads.lock();
+        prepared
+            .values()
+            .any(|entry| entry.instance_id == instance_id && entry.request_id == request_id)
+    }
+
+    fn mark_prepared_load_consumed(&self, plan_id: u64) {
+        let mut prepared = self.prepared_loads.lock();
+        let Some(entry) = prepared.get_mut(&plan_id) else {
+            return;
+        };
+        entry.remaining_loads = entry.remaining_loads.saturating_sub(1);
+        if entry.remaining_loads == 0 {
+            prepared.remove(&plan_id);
+        }
     }
 
     /// Unpin blocks that were pinned during query.
@@ -560,7 +764,7 @@ impl PegaEngine {
                     let block = block_entry.get_slot(slot_id)?.clone();
                     Some(LoadBlock {
                         block_idx,
-                        source: LoadBlockSource::Cached(block),
+                        source: block,
                     })
                 })
                 .collect();
@@ -570,7 +774,6 @@ impl PegaEngine {
                     layer_name: (*layer_name).to_string(),
                     registration,
                     blocks,
-                    _staging_keepalives: Vec::new(),
                 });
             }
         }
@@ -589,36 +792,33 @@ impl PegaEngine {
         })
     }
 
-    /// Load KV blocks from D-side P/D CPU-staging receive leases.
+    /// Load KV blocks from prepared load plans.
     ///
-    /// The scheduler resolves P/D readiness per request, then vLLM allocates
-    /// destination GPU blocks. This worker-side RPC consumes those resolved
-    /// receive handles and submits one H2D task for the whole batch.
+    /// The scheduler-facing prepare path returns opaque plan ids. Worker-side
+    /// load supplies those ids plus destination block ids after vLLM allocation.
     #[allow(clippy::too_many_arguments)]
-    pub fn load_pd_receive_kv_blocks_multi_layer(
+    pub fn load_prepared_kv_blocks_multi_layer(
         &self,
         instance_id: &str,
         tp_rank: usize,
         device_id: i32,
         load_state_shm: &str,
-        receive_rank: Option<usize>,
         layer_names: &[&str],
-        items: &[PdReceiveLoadItem],
+        items: &[PreparedLoadItem],
     ) -> Result<(), EngineError> {
         let load_state = LoadState::attach(load_state_shm)?;
 
-        let result = self.load_pd_receive_kv_blocks_multi_layer_inner(
+        let result = self.load_prepared_kv_blocks_multi_layer_inner(
             instance_id,
             tp_rank,
             device_id,
             load_state_shm,
-            receive_rank,
             layer_names,
             items,
         );
 
         if let Err(ref e) = result {
-            log::error!("load_pd_receive_kv_blocks_multi_layer pre-submit error: {e:?}");
+            log::error!("load_prepared_kv_blocks_multi_layer pre-submit error: {e:?}");
             load_state.set_error();
         }
 
@@ -626,26 +826,20 @@ impl PegaEngine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn load_pd_receive_kv_blocks_multi_layer_inner(
+    fn load_prepared_kv_blocks_multi_layer_inner(
         &self,
         instance_id: &str,
         tp_rank: usize,
         device_id: i32,
         load_state_shm: &str,
-        receive_rank: Option<usize>,
         layer_names: &[&str],
-        items: &[PdReceiveLoadItem],
+        items: &[PreparedLoadItem],
     ) -> Result<(), EngineError> {
-        let non_empty_items: Vec<&PdReceiveLoadItem> = items
-            .iter()
-            .filter(|item| !item.block_ids.is_empty())
-            .collect();
-        if non_empty_items.is_empty() {
+        if items.is_empty() {
             LoadState::attach(load_state_shm)?.set_completed();
             return Ok(());
         }
 
-        let receive_rank = receive_rank.unwrap_or(tp_rank);
         let instance = self.get_instance(instance_id)?;
         let gpu = instance
             .get_gpu(device_id)
@@ -669,113 +863,82 @@ impl PegaEngine {
                 layer_name: (*layer_name).to_string(),
                 registration,
                 blocks: Vec::new(),
-                _staging_keepalives: Vec::new(),
             });
             layer_indices.insert(*layer_name, index);
-
-            // Validate the layer id lookup before any receive lease is touched.
             instance.get_slot_index(layer_id, tp_rank)?;
         }
 
-        let mut release_items: Vec<(&str, Option<&str>)> =
-            Vec::with_capacity(non_empty_items.len());
+        let mut consumed_plan_ids: Vec<u64> = Vec::with_capacity(items.len());
 
-        for item in non_empty_items {
-            if item.request_id.is_empty() {
+        for item in items {
+            if item.plan_id == 0 {
                 return Err(EngineError::InvalidArgument(
-                    "P/D receive item request_id must not be empty".to_string(),
+                    "prepared load item plan_id must be non-zero".to_string(),
                 ));
             }
-            let load_plan = self.pd_receive.begin_load(
-                instance_id,
-                &item.request_id,
-                receive_rank,
-                item.handle.as_deref(),
-            )?;
-            let layers_by_name: HashMap<&str, &pd_receive::PdReceiveLoadLayer> = load_plan
-                .layers
-                .iter()
-                .map(|layer| (layer.layout.layer_name.as_str(), layer))
-                .collect();
+            if item.block_ids.is_empty() {
+                return Err(EngineError::InvalidArgument(
+                    "prepared load item block_ids must not be empty".to_string(),
+                ));
+            }
+            let plan = self.get_prepared_load_plan(instance_id, item.plan_id)?;
+            let plan_blocks = plan.block_count();
+            if item.block_ids.len() != plan_blocks {
+                return Err(EngineError::InvalidArgument(format!(
+                    "prepared load plan {} has {} blocks, load requested {}",
+                    item.plan_id,
+                    plan_blocks,
+                    item.block_ids.len()
+                )));
+            }
 
             for layer_name in layer_names {
-                let receive_layer = layers_by_name.get(layer_name).ok_or_else(|| {
-                    EngineError::InvalidArgument(format!(
-                        "P/D receive layer {layer_name} not found: instance={instance_id} request={} receive_rank={receive_rank}",
-                        item.request_id
-                    ))
-                })?;
                 let layer_id = instance.get_layer_id(layer_name).ok_or_else(|| {
                     EngineError::InvalidArgument(format!(
                         "layer {layer_name} unknown for instance {instance_id}"
                     ))
                 })?;
-                let expected_slot_id = instance.get_slot_index(layer_id, tp_rank)?;
-                let layout = &receive_layer.layout;
-                let layer_index = *layer_indices.get(*layer_name).ok_or_else(|| {
+                let slot_id = instance.get_slot_index(layer_id, tp_rank)?;
+                let source_blocks = plan.blocks_for_slot(slot_id).ok_or_else(|| {
                     EngineError::InvalidArgument(format!(
-                        "layer {layer_name} missing from P/D receive batch builder"
+                        "prepared load plan {} missing slot {} for layer {} tp_rank {}",
+                        item.plan_id, slot_id, layer_name, tp_rank
                     ))
                 })?;
-                let layer_data = &mut layers[layer_index];
-
-                if layout.slot_id != expected_slot_id {
+                if source_blocks.len() != item.block_ids.len() {
                     return Err(EngineError::InvalidArgument(format!(
-                        "P/D receive slot mismatch for layer {layer_name}: layout={} expected={expected_slot_id}",
-                        layout.slot_id
-                    )));
-                }
-                if layout.segment_count != layer_data.registration.segments {
-                    return Err(EngineError::InvalidArgument(format!(
-                        "P/D receive segment count mismatch for layer {layer_name}: layout={} registration={}",
-                        layout.segment_count, layer_data.registration.segments
-                    )));
-                }
-                if layout.segment_size != layer_data.registration.bytes_per_block as u64 {
-                    return Err(EngineError::InvalidArgument(format!(
-                        "P/D receive segment size mismatch for layer {layer_name}: layout={} registration={}",
-                        layout.segment_size, layer_data.registration.bytes_per_block
-                    )));
-                }
-                if item.block_ids.len() > layout.num_blocks {
-                    return Err(EngineError::InvalidArgument(format!(
-                        "P/D receive layer {layer_name} has {} staged blocks, load requested {}",
-                        layout.num_blocks,
+                        "prepared load plan {} slot {} has {} blocks, load requested {}",
+                        item.plan_id,
+                        slot_id,
+                        source_blocks.len(),
                         item.block_ids.len()
                     )));
                 }
-
-                for (staged_block_idx, block_id) in item.block_ids.iter().enumerate() {
+                let layer_index = *layer_indices.get(*layer_name).ok_or_else(|| {
+                    EngineError::InvalidArgument(format!(
+                        "layer {layer_name} missing from prepared load batch builder"
+                    ))
+                })?;
+                let layer_data = &mut layers[layer_index];
+                for (block_id, source) in item.block_ids.iter().zip(source_blocks.iter()) {
                     let block_idx = usize::try_from(*block_id).map_err(|_| {
                         EngineError::InvalidArgument(format!(
-                            "block_id {block_id} must be non-negative for P/D receive load"
+                            "block_id {block_id} must be non-negative for prepared load"
                         ))
                     })?;
-                    let mut segment_ptrs = Vec::with_capacity(layout.segment_count);
-                    for segment_idx in 0..layout.segment_count {
-                        segment_ptrs.push(pd_receive_segment_ptr(
-                            &receive_layer.slab,
-                            layout,
-                            staged_block_idx,
-                            segment_idx,
-                        )?);
-                    }
                     layer_data.blocks.push(LoadBlock {
                         block_idx,
-                        source: LoadBlockSource::Staged { segment_ptrs },
+                        source: Arc::clone(source),
                     });
                 }
-                layer_data
-                    ._staging_keepalives
-                    .push(Arc::clone(&receive_layer.allocation));
             }
 
-            release_items.push((&item.request_id, item.handle.as_deref()));
+            consumed_plan_ids.push(item.plan_id);
         }
 
         layers.retain(|layer| !layer.blocks.is_empty());
         if layers.is_empty() {
-            debug!("No P/D receive blocks to load, completing immediately");
+            debug!("No prepared blocks to load, completing immediately");
             LoadState::attach(load_state_shm)?.set_completed();
             return Ok(());
         }
@@ -784,16 +947,9 @@ impl PegaEngine {
             layers,
             load_state_shm: load_state_shm.to_string(),
         })?;
-        for (request_id, handle) in release_items {
-            if let Err(err) =
-                self.pd_receive
-                    .release_loaded_rank(instance_id, request_id, receive_rank, handle)
-            {
-                warn!(
-                    "failed to release P/D receive staging after batch load submit: instance={} request={} receive_rank={} error={}",
-                    instance_id, request_id, receive_rank, err
-                );
-            }
+
+        for plan_id in consumed_plan_ids {
+            self.mark_prepared_load_consumed(plan_id);
         }
         Ok(())
     }

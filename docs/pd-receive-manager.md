@@ -137,8 +137,8 @@ D PegaFlow to allocate CPU staging. Exact destination GPU block IDs are not
 known until `update_state_after_alloc()`.
 
 ```text
-PreparePdReceive(instance_id, request_id, external_tokens/num_blocks,
-                 expected_imm_count?):
+PrepareLoad(instance_id, request_id, external_tokens/num_blocks,
+            prepare_state_shm, expected_imm_count?):
   resolve instance_id to registered D topology
   expand every registered D TP rank into a receive rank
   validate layer registrations for each receive rank
@@ -151,16 +151,18 @@ PreparePdReceive(instance_id, request_id, external_tokens/num_blocks,
   imm_data = encode(slot, generation)
   expected_imm_count = override or receive_rank_count * local_nic_count
   state = Prepared
-  return handle
+  publish plan_id through prepare shared memory when ready
 ```
 
 Response shape:
 
 ```rust
-struct PreparePdReceiveResponse {
-    handle: PdReceiveHandle,
-    imm_data: u32,
-    expires_at_ms: u64,
+struct PrepareLoadStateSnapshot {
+    state: PrepareLoadState,
+    source: LoadSource,
+    num_tokens: u64,
+    num_blocks: u64,
+    plan_id: String,
 }
 ```
 
@@ -335,9 +337,9 @@ Minimum metrics:
 1. Add D-side `PdReceiveManager` with lease allocation, `imm_data` allocator,
    and TTL cleanup.
 2. Wire manager to `TransferEngine::take_imm_receiver()` in the server runtime.
-3. Expose descriptor/data-ready query methods matching the existing prefetch
-   connector states.
-4. Add `PreparePdReceive` for D connector and `GetPdReceiveDescriptor` for
+3. Expose descriptor/data-ready query methods through server-owned
+   `PrepareLoad` state.
+4. Add `PrepareLoad` for D connector and `GetPdReceiveDescriptor` for
    PegaFlow-P rendezvous.
 5. Add P-side push method that writes slab/layout destinations and calls
    `write_imm_async`.

@@ -3,15 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Literal
 
 from . import pegaflow as _native
-
-
-class LoadSourceKind(Enum):
-    CACHE = "cache"
-    STAGED = "staged"
 
 
 @dataclass(frozen=True)
@@ -59,19 +53,15 @@ class LoadPlan:
     """Terminal load plan returned by ``prepare_load``."""
 
     request_id: str
-    source: LoadSourceKind
+    plan_id: int
     num_tokens: int
-    num_blocks: int = 0
-    block_hashes: tuple[bytes, ...] = ()
-    token: str | None = None
 
 
 @dataclass(frozen=True)
 class PrepareLoadResult:
     """Scheduler-facing prepare state.
 
-    ``preparing`` means retry later. ``plan is None`` in a terminal result
-    means the scheduler should fall back to local computation.
+    ``preparing`` means retry later. ``plan is None`` means no load plan.
     """
 
     preparing: bool
@@ -103,7 +93,6 @@ class LoadRequest:
     device_id: int
     layer_names: tuple[str, ...]
     items: tuple[LoadItem, ...]
-    receive_rank: int | None = None
 
 
 @dataclass(frozen=True)
@@ -148,6 +137,21 @@ class LoadHandle:
         return self.done and self.state >= 0
 
 
+class PrepareLoadHandle:
+    """Shared-memory handle for an asynchronous prepare-load transaction."""
+
+    def __init__(self, request_id: str) -> None:
+        self.request_id = request_id
+        self._native: _native._NativePrepareLoadState = _native._NativePrepareLoadState()
+
+    @property
+    def shm_name(self) -> str:
+        return self._native.shm_name()
+
+    def result(self) -> PrepareLoadResult:
+        return _parse_prepare_load_snapshot(self._native.snapshot(), self.request_id)
+
+
 class PegaClient:
     """Long-lived synchronous client for PegaFlow."""
 
@@ -190,19 +194,26 @@ class PegaClient:
         )
         _expect_ok("register_kv_cache", ok, message)
 
-    def prepare_load(self, request: PrepareLoadRequest) -> PrepareLoadResult:
+    def begin_prepare_load(self, request: PrepareLoadRequest) -> PrepareLoadHandle:
         self._ensure_open()
-        native_result = self._native.prepare_load(
+        handle = PrepareLoadHandle(request.request_id)
+        ok, message = self._native.prepare_load(
             request.instance_id,
             request.request_id,
             request.block_hashes,
             request.num_prompt_tokens,
             request.num_computed_tokens,
             request.virtual_block_size,
+            handle.shm_name,
             request.decode_request_id,
             request.decode_expected_writes,
         )
-        return _parse_prepare_load_result(native_result)
+        _expect_ok("prepare_load", ok, message)
+        return handle
+
+    def prepare_load(self, request: PrepareLoadRequest) -> PrepareLoadResult:
+        """Begin a prepare-load transaction and return its current shm snapshot."""
+        return self.begin_prepare_load(request).result()
 
     def load(self, request: LoadRequest) -> LoadHandle:
         self._ensure_open()
@@ -211,16 +222,8 @@ class PegaClient:
         if not request.layer_names:
             raise ValueError("load request must include at least one layer")
 
-        sources = {item.plan.source for item in request.items}
-        if len(sources) != 1:
-            raise ValueError("one load request cannot mix source kinds")
-        source = next(iter(sources))
-
         handle = LoadHandle()
-        {
-            LoadSourceKind.CACHE: self._load_cache,
-            LoadSourceKind.STAGED: self._load_staged,
-        }[source](request, handle)
+        self._load_prepared(request, handle)
         return handle
 
     def save(self, request: SaveRequest) -> None:
@@ -244,48 +247,21 @@ class PegaClient:
         )
         _expect_ok("save", ok, message)
 
-    def _load_cache(self, request: LoadRequest, handle: LoadHandle) -> None:
-        block_ids: list[int] = []
-        block_hashes: list[bytes] = []
+    def _load_prepared(self, request: LoadRequest, handle: LoadHandle) -> None:
+        items: list[tuple[int, list[int]]] = []
         for item in request.items:
             _check_ready(item.plan)
-            block_ids.extend(int(block_id) for block_id in item.block_ids)
-            block_hashes.extend(bytes(block_hash) for block_hash in item.plan.block_hashes)
-        if len(block_ids) != len(block_hashes):
-            raise ValueError(
-                "cache load block id/hash length mismatch "
-                f"({len(block_ids)} != {len(block_hashes)})"
-            )
+            block_ids = [int(block_id) for block_id in item.block_ids]
+            if not block_ids:
+                raise ValueError("load item has no block_ids")
+            items.append((int(item.plan.plan_id), block_ids))
         ok, message = self._native.load(
             request.instance_id,
             int(request.tp_rank),
             int(request.device_id),
             handle.shm_name,
             list(request.layer_names),
-            block_ids,
-            block_hashes,
-        )
-        _expect_ok("load", ok, message)
-
-    def _load_staged(self, request: LoadRequest, handle: LoadHandle) -> None:
-        items: list[tuple[str, str, list[int]]] = []
-        for item in request.items:
-            _check_ready(item.plan)
-            items.append(
-                (
-                    item.plan.request_id,
-                    item.plan.token or "",
-                    [int(block_id) for block_id in item.block_ids],
-                )
-            )
-        ok, message = self._native.load_pd_receive(
-            request.instance_id,
-            int(request.tp_rank),
-            int(request.device_id),
-            handle.shm_name,
-            list(request.layer_names),
             items,
-            int(request.receive_rank if request.receive_rank is not None else -1),
         )
         _expect_ok("load", ok, message)
 
@@ -335,41 +311,32 @@ class PegaClient:
 
 
 def _check_ready(plan: LoadPlan) -> None:
-    if plan.num_blocks <= 0:
-        raise ValueError("load plan has no blocks")
+    if plan.plan_id <= 0:
+        raise ValueError("load plan has no plan_id")
+    if plan.num_tokens <= 0:
+        raise ValueError("load plan has no tokens")
 
 
-def _parse_prepare_load_result(result: dict) -> PrepareLoadResult:
-    if result.get("preparing", False):
+def _parse_prepare_load_snapshot(snapshot: dict, request_id: str) -> PrepareLoadResult:
+    if snapshot.get("preparing", False):
         return PrepareLoadResult.in_progress()
+    if snapshot.get("ready_no_plan", False):
+        return PrepareLoadResult.done(None)
+    if not snapshot.get("ready_plan", False):
+        return PrepareLoadResult.done(None)
 
-    return PrepareLoadResult.done(_parse_prepare_load_plan(result.get("plan")))
-
-
-def _parse_prepare_load_plan(plan: object) -> LoadPlan | None:
-    if plan is None:
-        return None
-    if not isinstance(plan, dict):
-        raise TypeError(f"prepare_load returned invalid plan: {type(plan)!r}")
-
-    try:
-        source = LoadSourceKind(str(plan["source"]))
-    except KeyError as e:
-        raise TypeError("prepare_load plan missing source") from e
-    except ValueError as e:
-        raise TypeError(f"prepare_load plan has invalid source: {plan['source']!r}") from e
+    plan_id = int(snapshot.get("plan_id") or 0)
+    if plan_id <= 0:
+        return PrepareLoadResult.done(None)
 
     load_plan = LoadPlan(
-        request_id=str(plan.get("request_id") or ""),
-        source=source,
-        num_tokens=int(plan.get("num_tokens") or 0),
-        num_blocks=int(plan.get("num_blocks") or 0),
-        block_hashes=tuple(bytes(block_hash) for block_hash in plan.get("block_hashes") or ()),
-        token=str(plan["token"]) if plan.get("token") is not None else None,
+        request_id=request_id,
+        plan_id=plan_id,
+        num_tokens=int(snapshot.get("num_tokens") or 0),
     )
     if load_plan.num_tokens <= 0:
-        return None
-    return load_plan
+        return PrepareLoadResult.done(None)
+    return PrepareLoadResult.done(load_plan)
 
 
 def _expect_ok(operation: str, ok: bool, message: str) -> None:
@@ -389,8 +356,8 @@ __all__ = [
     "LoadItem",
     "LoadPlan",
     "LoadRequest",
-    "LoadSourceKind",
     "PegaClient",
+    "PrepareLoadHandle",
     "PrepareLoadResult",
     "PrepareLoadRequest",
     "SaveRequest",

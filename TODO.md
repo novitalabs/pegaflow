@@ -93,7 +93,7 @@ Validation:
 - P writes partial data and dies before IMM.
 - D observes IMM but H2D load fails.
 - Lease expires before P writes.
-- Worker tries `LoadPdReceive` after lease expiry.
+- Worker tries prepared `Load` after lease expiry.
 - Multiple in-flight leases with independent `imm_data`.
 - P/D process shutdown while CUDA IPC and staging allocations are still live.
 

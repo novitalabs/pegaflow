@@ -23,6 +23,7 @@ if _EXT_NAME not in sys.modules:
     _ext_stub.EngineRpcClient = MagicMock  # type: ignore[attr-defined]
     _ext_stub._NativeEngineClient = MagicMock  # type: ignore[attr-defined]
     _ext_stub._NativeLoadState = MagicMock  # type: ignore[attr-defined]
+    _ext_stub._NativePrepareLoadState = MagicMock  # type: ignore[attr-defined]
     _ext_stub.KvEgressRuntime = MagicMock  # type: ignore[attr-defined]
     _ext_stub.PegaFlowBusinessError = type("PegaFlowBusinessError", (Exception,), {})  # type: ignore[attr-defined]
     _ext_stub.PegaFlowError = type("PegaFlowError", (Exception,), {})  # type: ignore[attr-defined]
@@ -31,7 +32,7 @@ if _EXT_NAME not in sys.modules:
     _ext_stub.__version__ = "0.0.0-test"  # type: ignore[attr-defined]
     sys.modules[_EXT_NAME] = _ext_stub
 
-from pegaflow import LoadPlan, LoadSourceKind, PrepareLoadResult  # noqa: E402
+from pegaflow import LoadPlan, PrepareLoadResult  # noqa: E402
 from pegaflow.connector.common import ConnectorContext  # noqa: E402
 from pegaflow.connector.scheduler import SchedulerConnector  # noqa: E402
 
@@ -69,6 +70,16 @@ def _make_ctx(
     }
     defaults.update(kwargs)
     return ConnectorContext(**defaults)  # type: ignore[arg-type]
+
+
+class _FakePrepareHandle:
+    def __init__(self, *results: PrepareLoadResult):
+        self.results = list(results) or [PrepareLoadResult.done(None)]
+
+    def result(self) -> PrepareLoadResult:
+        if len(self.results) > 1:
+            return self.results.pop(0)
+        return self.results[0]
 
 
 # ---------------------------------------------------------------------------
@@ -386,7 +397,9 @@ class TestDecodeHashRefresh:
         """The same pegaflow_pd_push flag is interpreted by role."""
         ctx = _make_ctx(block_size=16, layer_names=("ALL_LAYERS",))
         ctx.state_manager.is_available.return_value = True
-        ctx.client.prepare_load.return_value = PrepareLoadResult.done(None)
+        ctx.client.begin_prepare_load.return_value = _FakePrepareHandle(
+            PrepareLoadResult.done(None)
+        )
         sc = SchedulerConnector(ctx)
         req = _make_fake_request("r1", [_hash(i) for i in range(2)])
         req.num_tokens = 32
@@ -400,7 +413,7 @@ class TestDecodeHashRefresh:
         }
 
         assert sc.get_num_new_matched_tokens(req, 0) == (0, False)
-        prepare_request = ctx.client.prepare_load.call_args.args[0]
+        prepare_request = ctx.client.begin_prepare_load.call_args.args[0]
         assert prepare_request.decode_request_id is None
 
 
@@ -409,7 +422,9 @@ class TestPdReceivePrepare:
 
     def test_pd_push_request_prepares_receive_and_blocks_gpu_alloc(self):
         ctx = _make_ctx(block_size=16, layer_names=("ALL_LAYERS",))
-        ctx.client.prepare_load.return_value = PrepareLoadResult.in_progress()
+        ctx.client.begin_prepare_load.return_value = _FakePrepareHandle(
+            PrepareLoadResult.in_progress()
+        )
         sc = SchedulerConnector(ctx)
         req = _make_fake_request("r1", [_hash(i) for i in range(4)])
         req.num_tokens = 64
@@ -423,7 +438,7 @@ class TestPdReceivePrepare:
 
         assert sc.get_num_new_matched_tokens(req, 0) == (None, False)
 
-        prepare_request = ctx.client.prepare_load.call_args.args[0]
+        prepare_request = ctx.client.begin_prepare_load.call_args.args[0]
         assert prepare_request.request_id == "r1"
         assert prepare_request.decode_request_id == "pd1"
         assert prepare_request.block_hashes == [_hash(i) for i in range(4)]
@@ -431,11 +446,13 @@ class TestPdReceivePrepare:
 
         # The scheduler only sees the high-level preparing state.
         assert sc.get_num_new_matched_tokens(req, 0) == (None, False)
-        assert ctx.client.prepare_load.call_count == 2
+        assert ctx.client.begin_prepare_load.call_count == 1
 
     def test_pd_push_prepares_only_complete_hashed_blocks(self):
         ctx = _make_ctx(block_size=16, layer_names=("ALL_LAYERS",))
-        ctx.client.prepare_load.return_value = PrepareLoadResult.in_progress()
+        ctx.client.begin_prepare_load.return_value = _FakePrepareHandle(
+            PrepareLoadResult.in_progress()
+        )
         sc = SchedulerConnector(ctx)
         req = _make_fake_request("r1", [_hash(0)])
         req.num_tokens = 24
@@ -444,14 +461,16 @@ class TestPdReceivePrepare:
 
         assert sc.get_num_new_matched_tokens(req, 0) == (None, False)
 
-        prepare_request = ctx.client.prepare_load.call_args.args[0]
+        prepare_request = ctx.client.begin_prepare_load.call_args.args[0]
         assert prepare_request.block_hashes == [_hash(0)]
         assert prepare_request.num_prompt_tokens == 24
         assert prepare_request.virtual_block_size == 16
 
     def test_pd_push_without_complete_block_hashes_prepares_receive(self):
         ctx = _make_ctx(block_size=16, layer_names=("ALL_LAYERS",))
-        ctx.client.prepare_load.return_value = PrepareLoadResult.in_progress()
+        ctx.client.begin_prepare_load.return_value = _FakePrepareHandle(
+            PrepareLoadResult.in_progress()
+        )
         sc = SchedulerConnector(ctx)
         req = _make_fake_request("r1", [])
         req.num_tokens = 15
@@ -459,7 +478,7 @@ class TestPdReceivePrepare:
         req.kv_transfer_params = {"pegaflow": {"type": "decode_load"}}
 
         assert sc.get_num_new_matched_tokens(req, 0) == (None, False)
-        prepare_request = ctx.client.prepare_load.call_args.args[0]
+        prepare_request = ctx.client.begin_prepare_load.call_args.args[0]
         assert prepare_request.block_hashes == []
         assert prepare_request.decode_request_id == "r1"
 
@@ -471,35 +490,32 @@ class TestPdReceivePrepare:
         req.num_prompt_tokens = 15
         req.kv_transfer_params = {"pegaflow": {"type": "decode_load"}}
         blocks = _make_fake_blocks([10])
-        sc._load_plans["r1"] = LoadPlan(
+        state = sc._get_or_create_state(req)
+        state.load_plan = LoadPlan(
             request_id="r1",
-            source=LoadSourceKind.STAGED,
+            plan_id=1,
             num_tokens=14,
-            num_blocks=1,
         )
 
         sc.update_state_after_alloc(req, blocks, num_external_tokens=14)
 
-        intent = sc._pending_load_intents["r1"]
+        intent = state.pending_load_intent
+        assert intent is not None
         assert intent.block_ids == (10,)
-        assert intent.plan.block_hashes == ()
         assert intent.num_tokens == 14
 
     def test_pd_push_returns_external_tokens_after_imm_ready(self):
         ctx = _make_ctx(block_size=16, layer_names=("ALL_LAYERS",))
-        ctx.client.prepare_load.side_effect = [
+        ctx.client.begin_prepare_load.return_value = _FakePrepareHandle(
             PrepareLoadResult.in_progress(),
             PrepareLoadResult.done(
                 LoadPlan(
                     request_id="r1",
-                    source=LoadSourceKind.STAGED,
+                    plan_id=1,
                     num_tokens=63,
-                    num_blocks=4,
-                    block_hashes=tuple(_hash(i) for i in range(4)),
-                    token="h1",
                 )
             ),
-        ]
+        )
         sc = SchedulerConnector(ctx)
         req = _make_fake_request("r1", [_hash(i) for i in range(4)])
         req.num_tokens = 64
@@ -511,7 +527,9 @@ class TestPdReceivePrepare:
 
     def test_pd_prepare_cleanup_uses_vllm_request_id(self):
         ctx = _make_ctx(block_size=16, layer_names=("ALL_LAYERS",))
-        ctx.client.prepare_load.return_value = PrepareLoadResult.in_progress()
+        ctx.client.begin_prepare_load.return_value = _FakePrepareHandle(
+            PrepareLoadResult.in_progress()
+        )
         sc = SchedulerConnector(ctx)
         req = _make_fake_request("vllm-r1", [_hash(i) for i in range(2)])
         req.num_tokens = 32
@@ -524,10 +542,10 @@ class TestPdReceivePrepare:
         }
 
         assert sc.get_num_new_matched_tokens(req, 0) == (None, False)
-        prepare_request = ctx.client.prepare_load.call_args.args[0]
+        prepare_request = ctx.client.begin_prepare_load.call_args.args[0]
         assert prepare_request.request_id == "vllm-r1"
         assert prepare_request.decode_request_id == "router-pd-r1"
 
         sc._cleanup_request("vllm-r1")
 
-        assert sc._load_plans == {}
+        assert "vllm-r1" not in sc._request_states

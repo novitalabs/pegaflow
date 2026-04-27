@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 from pegaflow import (
     LoadPlan,
+    PrepareLoadHandle,
     PrepareLoadResult,
 )
 from pegaflow.connector.common import (
@@ -42,6 +43,7 @@ class _RequestState:
     scheduled_tokens: int = 0
     next_stored_block_idx: int | None = None
     load_plan: LoadPlan | None = None
+    prepare_handle: PrepareLoadHandle | None = None
     pending_load_intent: LoadIntent | None = None
     prefill_push_submitted: bool = False
     pending_save: bool = False
@@ -69,7 +71,7 @@ class SchedulerConnector:
         # matching and P/D polling are handled by prepare_load.
         computed_blocks = num_computed_tokens // self._ctx.virtual_block_size
 
-        result = self._prepare_load(request, num_computed_tokens)
+        result = self._prepare_load(state, request, num_computed_tokens)
 
         if result.preparing:
             return (None, False)
@@ -81,7 +83,8 @@ class SchedulerConnector:
             return (0, False)
 
         state.load_plan = plan
-        state.external_matched_blocks = computed_blocks + plan.num_blocks
+        prepared_blocks = _ceil_div(plan.num_tokens, self._ctx.virtual_block_size)
+        state.external_matched_blocks = computed_blocks + prepared_blocks
 
         return (plan.num_tokens, True)
 
@@ -116,9 +119,12 @@ class SchedulerConnector:
                 f"load={num_load_blocks} total={len(block_ids)}"
             )
             start_block_idx = len(block_ids) - num_load_blocks
+            load_block_ids = tuple(block_ids[start_block_idx:])
+            if not load_block_ids:
+                raise RuntimeError(f"req {req_id} prepared load has no allocated block ids")
 
             state.pending_load_intent = LoadIntent(
-                block_ids=tuple(block_ids[start_block_idx:]),
+                block_ids=load_block_ids,
                 plan=plan,
                 num_tokens=num_external_tokens,
             )
@@ -356,51 +362,64 @@ class SchedulerConnector:
 
     def _prepare_load(
         self,
+        state: _RequestState,
         request: "Request",
         num_computed_tokens: int,
     ) -> PrepareLoadResult:
         prepare_start = time.perf_counter()
         req_id = request.request_id
         if not self._ctx.state_manager.is_available():
+            state.prepare_handle = None
             return PrepareLoadResult.done(None)
 
-        prepare_request = prepare_load_request_from_request(
-            request,
-            self._ctx.instance_id,
-            num_computed_tokens,
-            self._ctx.virtual_block_size,
-        )
-        try:
-            result = self._ctx.client.prepare_load(prepare_request)
-        except PegaFlowServiceError as e:
-            self._ctx.state_manager.mark_unavailable(str(e))
-            logger.warning(
-                "[PegaKVConnector] req=%s prepare_load service error: %s",
-                req_id,
-                e,
-            )
-            return PrepareLoadResult.done(None)
-        except PegaFlowBusinessError as e:
-            logger.error(
-                "[PegaKVConnector] prepare_load business error: %s, "
-                "req_id=%s instance_id=%s blocks=%d",
-                e,
-                req_id,
+        if state.prepare_handle is None:
+            prepare_request = prepare_load_request_from_request(
+                request,
                 self._ctx.instance_id,
-                len(prepare_request.block_hashes),
+                num_computed_tokens,
+                self._ctx.virtual_block_size,
             )
-            raise
+            try:
+                state.prepare_handle = self._ctx.client.begin_prepare_load(prepare_request)
+            except PegaFlowServiceError as e:
+                self._ctx.state_manager.mark_unavailable(str(e))
+                logger.warning(
+                    "[PegaKVConnector] req=%s prepare_load service error: %s",
+                    req_id,
+                    e,
+                )
+                return PrepareLoadResult.done(None)
+            except PegaFlowBusinessError as e:
+                logger.error(
+                    "[PegaKVConnector] prepare_load business error: %s, "
+                    "req_id=%s instance_id=%s blocks=%d",
+                    e,
+                    req_id,
+                    self._ctx.instance_id,
+                    len(prepare_request.block_hashes),
+                )
+                raise
+
+        # TODO: add a prepare-handle timeout. If pegaflow-server dies after
+        # accepting PrepareLoad, this shm can stay pending forever; the
+        # scheduler should eventually fall back locally and mark service
+        # unavailable.
+        result = state.prepare_handle.result()
 
         if not result.preparing:
             plan = result.plan
+            state.prepare_handle = None
             elapsed_us = (time.perf_counter() - prepare_start) * 1e6
+            prepared_blocks = (
+                _ceil_div(plan.num_tokens, self._ctx.virtual_block_size) if plan is not None else 0
+            )
             logger.info(
-                "[PegaKVConnector] req=%s prepare_load ready: source=%s "
+                "[PegaKVConnector] req=%s prepare_load ready: result=%s "
                 "external_tokens=%d external_blocks=%d prepare_us=%.0f",
                 req_id,
-                plan.source.value if plan is not None else "local",
+                "prepared" if plan is not None else "no_plan",
                 plan.num_tokens if plan is not None else 0,
-                plan.num_blocks if plan is not None else 0,
+                prepared_blocks,
                 elapsed_us,
             )
 
