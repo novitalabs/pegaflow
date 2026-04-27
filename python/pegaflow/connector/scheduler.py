@@ -3,6 +3,7 @@ Scheduler-side connector logic.
 """
 
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -140,10 +141,12 @@ class SchedulerConnector:
             state = self._require_state(req_id)
             self._sync_preemption_state(state)
         load_intents = self._drain_pending_load_intents()
+        scheduled_req_ids: set[str] = set()
 
         # Process new requests
         for req in scheduler_output.scheduled_new_reqs:
             req_id = req.req_id
+            scheduled_req_ids.add(req_id)
             state = self._require_state(req_id)
             num_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
 
@@ -160,6 +163,7 @@ class SchedulerConnector:
         # Process cached (running) requests
         cached_reqs = scheduler_output.scheduled_cached_reqs
         for idx, req_id in enumerate(cached_reqs.req_ids):
+            scheduled_req_ids.add(req_id)
             state = self._request_states.get(req_id)
             if state is None:
                 continue
@@ -176,7 +180,7 @@ class SchedulerConnector:
                 save_intents[req_id] = save_intent
 
         # Track requests with pending saves
-        egress_intents = self._build_egress_intents()
+        egress_intents = self._build_egress_intents(scheduled_req_ids.difference(load_intents))
         for req_id in [*save_intents.keys(), *egress_intents.keys()]:
             state = self._request_states.get(req_id)
             if state is not None:
@@ -278,9 +282,12 @@ class SchedulerConnector:
         """Clean up all state for a completed request."""
         self._request_states.pop(req_id, None)
 
-    def _build_egress_intents(self) -> dict[str, KvEgressIntent]:
+    def _build_egress_intents(self, candidate_req_ids: Iterable[str]) -> dict[str, KvEgressIntent]:
         egress_intents: dict[str, KvEgressIntent] = {}
-        for req_id, state in list(self._request_states.items()):
+        for req_id in candidate_req_ids:
+            state = self._request_states.get(req_id)
+            if state is None:
+                continue
             if state.prefill_push_submitted:
                 continue
 

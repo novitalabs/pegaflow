@@ -6,8 +6,8 @@ import pickle
 import queue
 import threading
 import time
-from collections.abc import Iterable
-from dataclasses import dataclass
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -38,8 +38,8 @@ from pegaflow.connector.egress import (
 from pegaflow.ipc_wrapper import CudaIPCWrapper
 
 if TYPE_CHECKING:
-    from vllm.attention.backends.abstract import AttentionMetadata
     from vllm.forward_context import ForwardContext
+    from vllm.v1.attention.backend import AttentionMetadata
 
 
 _CROSS_LAYER_KEY = "ALL_LAYERS"
@@ -56,10 +56,109 @@ if _LOAD_TIMEOUT_RAW < _LOAD_TIMEOUT_FLOOR_SECONDS:
     _LOAD_TIMEOUT_RAW = _LOAD_TIMEOUT_FLOOR_SECONDS
 
 
-@dataclass
-class SaveTask:
+@dataclass(frozen=True, slots=True)
+class _SaveTask:
     metadata: PegaConnectorMetadata
     request_ids: list[str]
+
+
+@dataclass(frozen=True, slots=True)
+class _RegisteredLayer:
+    cache_layer: KvCacheLayer
+    egress_layer: EgressLayerRegistration
+    layout: str
+
+
+@dataclass(frozen=True, slots=True)
+class _LoadBatch:
+    request_ids: tuple[str, ...]
+    items: tuple[LoadItem, ...]
+    block_ids: tuple[int, ...]
+    target_layers: tuple[str, ...]
+    receive_rank: int | None
+
+    @classmethod
+    def from_items(
+        cls,
+        items: Sequence[tuple[str, LoadItem]],
+        target_layers: Sequence[str],
+        receive_rank: int | None,
+    ) -> "_LoadBatch":
+        return cls(
+            request_ids=tuple(req_id for req_id, _ in items),
+            items=tuple(item for _, item in items),
+            block_ids=tuple(int(block_id) for _, item in items for block_id in item.block_ids),
+            target_layers=tuple(target_layers),
+            receive_rank=receive_rank,
+        )
+
+    @property
+    def num_blocks(self) -> int:
+        return len(self.block_ids)
+
+
+@dataclass(slots=True)
+class _PendingLoad:
+    handle: LoadHandle
+    request_ids: set[str]
+    block_ids: tuple[int, ...]
+    started_at: float
+
+    @property
+    def shm_name(self) -> str:
+        return self.handle.shm_name
+
+    @property
+    def num_blocks(self) -> int:
+        return len(self.block_ids)
+
+    def elapsed(self, now: float) -> float:
+        return now - self.started_at
+
+    def timed_out(self, now: float, timeout_seconds: int) -> bool:
+        return not self.handle.done and self.elapsed(now) > timeout_seconds
+
+
+@dataclass(frozen=True, slots=True)
+class _TransferStat:
+    duration: float
+    num_blocks: int
+    success: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _LoadPollResult:
+    request_ids: set[str] = field(default_factory=set)
+    stats: list[_TransferStat] = field(default_factory=list)
+    timed_out: bool = False
+
+
+@dataclass(slots=True)
+class _LayerSaveAccumulator:
+    block_ids: list[int] = field(default_factory=list)
+    block_hashes: list[bytes] = field(default_factory=list)
+
+    def extend(self, block_ids: Iterable[int], block_hashes: Iterable[bytes]) -> None:
+        self.block_ids.extend(block_ids)
+        self.block_hashes.extend(block_hashes)
+
+    def to_layer_save(self, layer_name: str) -> LayerSave:
+        return LayerSave(
+            layer_name=layer_name,
+            block_ids=tuple(self.block_ids),
+            block_hashes=tuple(self.block_hashes),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _SaveWork:
+    request_ids: list[str]
+    layer_saves: list[LayerSave]
+    egress_items: list[tuple[str, KvEgressIntent]]
+
+    @property
+    def needs_cuda_sync(self) -> bool:
+        return bool(self.layer_saves or self.egress_items)
 
 
 class WorkerConnector:
@@ -75,7 +174,7 @@ class WorkerConnector:
     def __init__(self, context: ConnectorContext):
         self._ctx = context
 
-        self._save_queue = queue.Queue()
+        self._save_queue: queue.Queue[_SaveTask | None] = queue.Queue()
         self._save_thread = threading.Thread(
             target=self._save_worker, daemon=True, name="PegaSaveWorker"
         )
@@ -87,11 +186,7 @@ class WorkerConnector:
         self._save_completion_events: dict[str, threading.Event] = {}
         self._current_metadata: PegaConnectorMetadata | None = None
 
-        self._pending_loads: dict[str, LoadHandle] = {}
-        self._pending_load_reqs: dict[str, set[str]] = {}
-        self._pending_load_meta: dict[
-            str, tuple[float, int, list[int]]
-        ] = {}  # shm_name -> (start_time, num_blocks, block_ids)
+        self._pending_loads_by_shm: dict[str, _PendingLoad] = {}
         self._load_completion_lock = threading.Lock()
 
         # Failure surface for vLLM's get_block_ids_with_load_errors / get_finished.
@@ -102,7 +197,6 @@ class WorkerConnector:
         self._failed_load_reqs: set[str] = set()
 
         self._registered_layers: list[str] = []
-        self._layer_name_to_id: dict[str, int] = {}
         self._torch_device: torch.device | None = None
 
         self._cross_layer_mode = False
@@ -140,73 +234,19 @@ class WorkerConnector:
         assert self._ctx.device_id is not None, (
             "CUDA device id is unknown; cannot register KV caches"
         )
+        assert kv_caches, "KV cache registration requires at least one layer"
 
         self._registered_layers = list(kv_caches.keys())
         self._torch_device = next(iter(kv_caches.values())).device
-
-        self._layer_name_to_id.clear()
-        for layer_id, layer_name in enumerate(kv_caches.keys()):
-            self._layer_name_to_id[layer_name] = layer_id
 
         # Use actual number of registered layers, not model's num_hidden_layers.
         # This is important for models like DSA where indexer layers are separate.
         # With PP>1 each rank registers only its local layers; the Rust engine
         # grows the instance-wide total dynamically via verify_topology.
-        actual_num_layers = len(kv_caches)
-
-        layout = "unknown"
-
-        layer_names = []
-        ipc_wrappers = []
-        layer_num_blocks = []
-        layer_bytes_per_block = []
-        layer_kv_stride_bytes = []
-        layer_segments = []
-        egress_layers: dict[str, EgressLayerRegistration] = {}
-
-        for layer_name, kv_cache in kv_caches.items():
-            assert kv_cache.storage_offset() == 0, (
-                f"KV cache for {layer_name} must have zero storage offset"
-            )
-
-            wrapper = CudaIPCWrapper(kv_cache)
-            wrapper_bytes = pickle.dumps(wrapper)
-
-            shape = tuple(kv_cache.shape)
-            stride = tuple(kv_cache.stride())
-            element_size = kv_cache.element_size()
-
-            if len(shape) >= 2 and shape[0] == 2:
-                num_blocks = shape[1]
-                bytes_per_block = stride[1] * element_size
-                kv_stride_bytes = stride[0] * element_size
-                segments = 2
-                layout = "KV-first"
-            else:
-                num_blocks = shape[0]
-                bytes_per_block = stride[0] * element_size
-                kv_stride_bytes = 0
-                segments = 1
-                layout = "blocks-first"
-
-            assert bytes_per_block != 0, (
-                f"Invalid bytes_per_block for {layer_name}: stride={stride}"
-            )
-
-            layer_names.append(layer_name)
-            ipc_wrappers.append(wrapper_bytes)
-            layer_num_blocks.append(num_blocks)
-            layer_bytes_per_block.append(bytes_per_block)
-            layer_kv_stride_bytes.append(kv_stride_bytes)
-            layer_segments.append(segments)
-            egress_layers[layer_name] = EgressLayerRegistration(
-                base_ptr=int(kv_cache.data_ptr()),
-                size_bytes=_tensor_storage_nbytes(kv_cache),
-                num_blocks=int(num_blocks),
-                bytes_per_block=int(bytes_per_block),
-                kv_stride_bytes=int(kv_stride_bytes),
-                segments=int(segments),
-            )
+        registrations = [
+            _build_layer_registration(layer_name, kv_cache)
+            for layer_name, kv_cache in kv_caches.items()
+        ]
 
         self._ctx.engine_client.register_kv_cache(
             KvCacheRegistration(
@@ -216,35 +256,22 @@ class WorkerConnector:
                 tp_size=self._ctx.effective_tp_size,
                 world_size=self._ctx.world_size,
                 device_id=self._ctx.device_id,
-                num_layers=actual_num_layers,
-                layers=tuple(
-                    KvCacheLayer(
-                        name=name,
-                        wrapper_bytes=wrapper,
-                        num_blocks=num_blocks,
-                        bytes_per_block=bytes_per_block,
-                        kv_stride_bytes=kv_stride_bytes,
-                        segments=segments,
-                    )
-                    for name, wrapper, num_blocks, bytes_per_block, kv_stride_bytes, segments in zip(
-                        layer_names,
-                        ipc_wrappers,
-                        layer_num_blocks,
-                        layer_bytes_per_block,
-                        layer_kv_stride_bytes,
-                        layer_segments,
-                        strict=True,
-                    )
-                ),
+                num_layers=len(registrations),
+                layers=tuple(registration.cache_layer for registration in registrations),
             )
         )
 
-        self._register_egress_layers(egress_layers)
+        self._register_egress_layers(
+            {
+                registration.cache_layer.name: registration.egress_layer
+                for registration in registrations
+            }
+        )
 
         logger.debug(
             "[PegaKVConnector] Registered %d KV cache layers (%s layout) instance=%s",
             len(kv_caches),
-            layout,
+            _summarize_layout(registration.layout for registration in registrations),
             self._ctx.instance_id,
         )
 
@@ -257,106 +284,17 @@ class WorkerConnector:
         self.register_kv_caches({self._cross_layer_key: kv_cache})
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str] | None, set[str] | None]:
-        finished_sending: set[str] | None = None
-        finished_recving: set[str] | None = None
+        finished_sending = self._collect_finished_saves(finished_req_ids)
+        load_result = self._collect_finished_loads()
+        finished_recving = load_result.request_ids or None
 
-        with self._save_completion_lock:
-            # 1. Add newly finished requests (if they have pending saves) to tracking
-            self._finished_requests.update(finished_req_ids & self._req_pending_saves)
-            # 2. Identify requests whose saves have completed
-            done_saves = self._completed_saves & self._finished_requests
-            done_saves.update(self._completed_saves & finished_req_ids)
-
-            if done_saves:
-                # 3. Clean up completed requests
-                self._completed_saves -= done_saves
-                self._finished_requests -= done_saves
-                finished_sending = done_saves
-
-        timeout_triggered = False
-        with self._load_completion_lock:
-            completed_reqs: set[str] = set()
-            completed_shms: list[str] = []
-            load_stats_to_record: list[tuple[float, int, bool]] = []
-            now = time.perf_counter()
-
-            for shm_name, req_ids in self._pending_load_reqs.items():
-                sample_req_id = next(iter(req_ids))
-                load_state = self._pending_loads.get(sample_req_id)
-                if load_state is None:
-                    continue
-
-                meta = self._pending_load_meta.get(shm_name)
-                ready = load_state.done
-                timed_out = (
-                    not ready and meta is not None and (now - meta[0]) > self.LOAD_TIMEOUT_SECONDS
-                )
-
-                if ready:
-                    state = load_state.state
-                    success = state >= 0
-                    if not success:
-                        logger.error(
-                            "[PegaKVConnector] async_load_failed: reqs=%s state=%d",
-                            req_ids,
-                            state,
-                        )
-                        if meta is not None:
-                            self._failed_load_block_ids.update(meta[2])
-                    else:
-                        logger.debug(
-                            "[PegaKVConnector] async_load_completed: reqs=%s",
-                            req_ids,
-                        )
-
-                    if meta is not None:
-                        start_time, num_blocks, _ = meta
-                        duration = now - start_time
-                        load_stats_to_record.append((duration, num_blocks, success))
-
-                    completed_reqs.update(req_ids)
-                    completed_shms.append(shm_name)
-                elif timed_out:
-                    assert meta is not None
-                    start_time, num_blocks, block_ids = meta
-                    duration = now - start_time
-                    logger.error(
-                        "[PegaKVConnector] load_timeout: reqs=%s shm=%s elapsed=%.1fs "
-                        "blocks=%d (reporting as load errors)",
-                        req_ids,
-                        shm_name,
-                        duration,
-                        num_blocks,
-                    )
-                    self._failed_load_block_ids.update(block_ids)
-                    load_stats_to_record.append((duration, num_blocks, False))
-                    completed_reqs.update(req_ids)
-                    completed_shms.append(shm_name)
-                    timeout_triggered = True
-
-            for shm_name in completed_shms:
-                shm_req_ids = self._pending_load_reqs.pop(shm_name, set())
-                self._pending_load_meta.pop(shm_name, None)
-                for req_id in shm_req_ids:
-                    self._pending_loads.pop(req_id, None)
-
-            # Drain sync-failure reqs recorded by start_load_kv so they also
-            # reach vLLM as finished_recving in this pass.
-            if self._failed_load_reqs:
-                completed_reqs.update(self._failed_load_reqs)
-                self._failed_load_reqs = set()
-
-            if completed_reqs:
-                finished_recving = completed_reqs
-
-        if timeout_triggered:
+        if load_result.timed_out:
             self._ctx.state_manager.mark_unavailable("load timeout")
 
-        # Record load stats outside the lock
-        if load_stats_to_record:
+        if load_result.stats:
             with self._stats_lock:
-                for duration, num_blocks, success in load_stats_to_record:
-                    self._stats.record_load(duration, num_blocks, success)
+                for stat in load_result.stats:
+                    self._stats.record_load(stat.duration, stat.num_blocks, stat.success)
 
         if finished_sending:
             logger.debug(
@@ -370,6 +308,108 @@ class WorkerConnector:
             )
         return (finished_sending, finished_recving)
 
+    def _collect_finished_saves(self, finished_req_ids: set[str]) -> set[str] | None:
+        with self._save_completion_lock:
+            self._finished_requests.update(finished_req_ids & self._req_pending_saves)
+            done_saves = (self._completed_saves & self._finished_requests) | (
+                self._completed_saves & finished_req_ids
+            )
+            if not done_saves:
+                return None
+
+            self._completed_saves -= done_saves
+            self._finished_requests -= done_saves
+            return done_saves
+
+    def _collect_finished_loads(self) -> _LoadPollResult:
+        with self._load_completion_lock:
+            completed_reqs: set[str] = set()
+            completed_shms: list[str] = []
+            stats: list[_TransferStat] = []
+            timeout_triggered = False
+            now = time.perf_counter()
+
+            for shm_name, pending in self._pending_loads_by_shm.items():
+                if pending.handle.done:
+                    success = pending.handle.state >= 0
+                    self._record_async_load_done(pending, now, stats, success)
+                    completed_reqs.update(pending.request_ids)
+                    completed_shms.append(shm_name)
+                    continue
+
+                if pending.timed_out(now, self.LOAD_TIMEOUT_SECONDS):
+                    self._record_async_load_timeout(pending, now, stats)
+                    completed_reqs.update(pending.request_ids)
+                    completed_shms.append(shm_name)
+                    timeout_triggered = True
+
+            for shm_name in completed_shms:
+                self._drop_pending_load(shm_name)
+
+            # Drain sync-failure reqs recorded by start_load_kv so they also
+            # reach vLLM as finished_recving in this pass.
+            if self._failed_load_reqs:
+                completed_reqs.update(self._failed_load_reqs)
+                self._failed_load_reqs.clear()
+
+        return _LoadPollResult(
+            request_ids=completed_reqs,
+            stats=stats,
+            timed_out=timeout_triggered,
+        )
+
+    def _record_async_load_done(
+        self,
+        pending: _PendingLoad,
+        now: float,
+        stats: list[_TransferStat],
+        success: bool,
+    ) -> None:
+        if success:
+            logger.debug(
+                "[PegaKVConnector] async_load_completed: reqs=%s",
+                pending.request_ids,
+            )
+        else:
+            logger.error(
+                "[PegaKVConnector] async_load_failed: reqs=%s state=%d",
+                pending.request_ids,
+                pending.handle.state,
+            )
+            self._failed_load_block_ids.update(pending.block_ids)
+
+        stats.append(
+            _TransferStat(
+                duration=pending.elapsed(now),
+                num_blocks=pending.num_blocks,
+                success=success,
+            )
+        )
+
+    def _record_async_load_timeout(
+        self,
+        pending: _PendingLoad,
+        now: float,
+        stats: list[_TransferStat],
+    ) -> None:
+        duration = pending.elapsed(now)
+        logger.error(
+            "[PegaKVConnector] load_timeout: reqs=%s shm=%s elapsed=%.1fs "
+            "blocks=%d (reporting as load errors)",
+            pending.request_ids,
+            pending.shm_name,
+            duration,
+            pending.num_blocks,
+        )
+        self._failed_load_block_ids.update(pending.block_ids)
+        stats.append(
+            _TransferStat(
+                duration=duration,
+                num_blocks=pending.num_blocks,
+                success=False,
+            )
+        )
+
     def start_load_kv(
         self,
         metadata: PegaConnectorMetadata,
@@ -381,19 +421,12 @@ class WorkerConnector:
         if not metadata.load_intents:
             return
 
-        if self._cross_layer_mode:
-            target_layers = [self._cross_layer_key]
-        else:
-            target_layers = []
-            for layer_name, layer in forward_context.no_compile_layers.items():
-                if hasattr(layer, "kv_cache"):
-                    target_layers.append(layer_name)
-
+        target_layers = self._load_target_layers(forward_context)
         if not target_layers:
             return
 
         normal_items: list[tuple[str, LoadItem]] = []
-        pd_items: list[tuple[str, LoadItem]] = []
+        staged_items: list[tuple[str, LoadItem]] = []
 
         for req_id, load_intent in metadata.load_intents.items():
             if not load_intent.block_ids:
@@ -403,35 +436,51 @@ class WorkerConnector:
                 block_ids=tuple(load_intent.block_ids),
             )
             if load_intent.plan.source is LoadSourceKind.STAGED:
-                pd_items.append((req_id, item))
+                staged_items.append((req_id, item))
             else:
                 normal_items.append((req_id, item))
 
         if normal_items:
-            self._submit_load(normal_items, target_layers, receive_rank=None)
+            self._submit_load(
+                _LoadBatch.from_items(
+                    normal_items,
+                    target_layers,
+                    receive_rank=None,
+                )
+            )
 
-        if pd_items:
-            self._submit_load(pd_items, target_layers, receive_rank=self._ctx.effective_tp_rank)
+        if staged_items:
+            self._submit_load(
+                _LoadBatch.from_items(
+                    staged_items,
+                    target_layers,
+                    receive_rank=self._ctx.effective_tp_rank,
+                )
+            )
 
-    def _submit_load(
-        self,
-        items: list[tuple[str, LoadItem]],
-        target_layers: list[str],
-        receive_rank: int | None,
-    ) -> None:
+    def _load_target_layers(self, forward_context: "ForwardContext") -> tuple[str, ...]:
+        if self._cross_layer_mode:
+            return (self._cross_layer_key,)
+
+        return tuple(
+            layer_name
+            for layer_name, layer in forward_context.no_compile_layers.items()
+            if hasattr(layer, "kv_cache")
+        )
+
+    def _submit_load(self, batch: _LoadBatch) -> None:
         load_start = time.perf_counter()
-        request_ids = [req_id for req_id, _ in items]
-        all_block_ids = [int(block_id) for _, item in items for block_id in item.block_ids]
+        device_id = self._require_device_id()
 
         try:
             load_state = self._ctx.engine_client.load(
                 LoadRequest(
                     instance_id=self._ctx.instance_id,
                     tp_rank=self._ctx.effective_tp_rank,
-                    device_id=self._ctx.device_id,
-                    layer_names=tuple(target_layers),
-                    items=tuple(item for _, item in items),
-                    receive_rank=receive_rank,
+                    device_id=device_id,
+                    layer_names=batch.target_layers,
+                    items=batch.items,
+                    receive_rank=batch.receive_rank,
                 )
             )
         except Exception as e:
@@ -439,43 +488,40 @@ class WorkerConnector:
                 "[PegaKVConnector] Load RPC exception: %s (reqs=%s blocks=%d, "
                 "marking blocks as load errors)",
                 e,
-                request_ids,
-                len(all_block_ids),
+                list(batch.request_ids),
+                batch.num_blocks,
             )
-            self._record_load_failure(request_ids, all_block_ids, load_start)
+            self._record_load_failure(batch.request_ids, batch.block_ids, load_start)
             self._ctx.state_manager.mark_unavailable(f"load rpc exception: {e}")
             return
 
-        num_layers = len(target_layers)
-        num_blocks = len(all_block_ids)
-        shm_name = load_state.shm_name
-
         schedule_end = time.perf_counter()
         schedule_time_us = (schedule_end - load_start) * 1e6
+        pending = _PendingLoad(
+            handle=load_state,
+            request_ids=set(batch.request_ids),
+            block_ids=batch.block_ids,
+            started_at=load_start,
+        )
 
         with self._load_completion_lock:
-            for req_id in request_ids:
-                self._pending_loads[req_id] = load_state
-            self._pending_load_reqs[shm_name] = set(request_ids)
-            # Keep load_start as the shared baseline so timeout and stats duration
-            # are comparable to the sync-failure path (which also uses load_start).
-            # all_block_ids is not mutated after this point; keep the reference
-            # instead of an extra defensive copy.
-            self._pending_load_meta[shm_name] = (
-                load_start,
-                num_blocks,
-                all_block_ids,
-            )
+            self._track_pending_load(pending)
 
         logger.debug(
             "[PegaKVConnector] started async load: %d blocks across %d layers for %d reqs, "
             "schedule %.0f us, shm=%s",
-            num_blocks,
-            num_layers,
-            len(request_ids),
+            batch.num_blocks,
+            len(batch.target_layers),
+            len(batch.request_ids),
             schedule_time_us,
-            shm_name,
+            pending.shm_name,
         )
+
+    def _track_pending_load(self, pending: _PendingLoad) -> None:
+        self._pending_loads_by_shm[pending.shm_name] = pending
+
+    def _drop_pending_load(self, shm_name: str) -> None:
+        self._pending_loads_by_shm.pop(shm_name, None)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         pass
@@ -494,8 +540,8 @@ class WorkerConnector:
 
     def _record_load_failure(
         self,
-        request_ids: list[str],
-        block_ids: list[int],
+        request_ids: Iterable[str],
+        block_ids: Sequence[int],
         start_time: float,
     ) -> None:
         """Record a synchronous load RPC failure for later reporting to vLLM."""
@@ -547,7 +593,7 @@ class WorkerConnector:
                     self._req_pending_saves.add(req_id)
                     self._save_completion_events[req_id] = threading.Event()
 
-        self._save_queue.put(SaveTask(metadata=metadata, request_ids=request_ids))
+        self._save_queue.put(_SaveTask(metadata=metadata, request_ids=request_ids))
 
     def _save_worker(self) -> None:
         logger.debug("[PegaKVConnector] Save worker thread started")
@@ -558,27 +604,52 @@ class WorkerConnector:
                 self._save_queue.task_done()
                 break
 
-            batch: list[SaveTask] = [task]
-            while True:
-                try:
-                    t = self._save_queue.get_nowait()
-                    if t is None:
-                        self._process_save_batch(batch)
-                        self._save_queue.task_done()
-                        logger.debug("[PegaKVConnector] Save worker thread stopped")
-                        return
-                    batch.append(t)
-                except queue.Empty:
-                    break
-
+            batch, stop_after_batch = self._drain_save_batch(task)
             self._process_save_batch(batch)
             for _ in batch:
                 self._save_queue.task_done()
+            if stop_after_batch:
+                break
 
         logger.debug("[PegaKVConnector] Save worker thread stopped")
 
-    def _process_save_batch(self, batch: list[SaveTask]) -> None:
-        saves_by_layer: dict[str, tuple[list[int], list[bytes]]] = {}
+    def _drain_save_batch(self, first_task: _SaveTask) -> tuple[list[_SaveTask], bool]:
+        batch = [first_task]
+        stop_after_batch = False
+
+        while True:
+            try:
+                task = self._save_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            if task is None:
+                self._save_queue.task_done()
+                stop_after_batch = True
+                break
+            batch.append(task)
+
+        return batch, stop_after_batch
+
+    def _process_save_batch(self, batch: list[_SaveTask]) -> None:
+        work = self._collect_save_work(batch)
+
+        if work.needs_cuda_sync and self._torch_device is not None:
+            # Ensure all GPU kernels have completed before reading KV cache.
+            # Otherwise we may copy uninitialized memory (attention kernel is async).
+            torch.cuda.synchronize(self._torch_device)
+
+        if work.egress_items:
+            self._process_egress_batch(work.egress_items)
+
+        if work.layer_saves:
+            self._submit_layer_saves(work.layer_saves)
+
+        # Always complete the request save lifecycle, even if save failed.
+        self._complete_save_requests(work.request_ids)
+
+    def _collect_save_work(self, batch: list[_SaveTask]) -> _SaveWork:
+        saves_by_layer: dict[str, _LayerSaveAccumulator] = {}
         egress_items: list[tuple[str, KvEgressIntent]] = []
         all_request_ids: list[str] = []
 
@@ -590,73 +661,61 @@ class WorkerConnector:
                 if not save_intent.block_ids:
                     continue
 
-                if self._cross_layer_mode:
-                    target_layers = (self._cross_layer_key,)
-                else:
-                    assert self._registered_layers, (
-                        "KV caches must be registered before submitting save intents"
+                for layer_name in self._save_target_layers():
+                    accumulator = saves_by_layer.setdefault(
+                        layer_name,
+                        _LayerSaveAccumulator(),
                     )
-                    target_layers = tuple(self._registered_layers)
+                    accumulator.extend(save_intent.block_ids, save_intent.block_hashes)
 
-                for layer_name in target_layers:
-                    if layer_name not in saves_by_layer:
-                        saves_by_layer[layer_name] = ([], [])
+        return _SaveWork(
+            request_ids=all_request_ids,
+            layer_saves=[
+                accumulator.to_layer_save(layer_name)
+                for layer_name, accumulator in saves_by_layer.items()
+            ],
+            egress_items=egress_items,
+        )
 
-                    saves_by_layer[layer_name][0].extend(save_intent.block_ids)
-                    saves_by_layer[layer_name][1].extend(save_intent.block_hashes)
+    def _save_target_layers(self) -> tuple[str, ...]:
+        if self._cross_layer_mode:
+            return (self._cross_layer_key,)
 
-        if (saves_by_layer or egress_items) and self._torch_device is not None:
-            # Ensure all GPU kernels have completed before reading KV cache
-            # Otherwise we may copy uninitialized memory (attention kernel is async)
-            torch.cuda.synchronize(self._torch_device)
+        assert self._registered_layers, (
+            "KV caches must be registered before submitting save intents"
+        )
+        return tuple(self._registered_layers)
 
-        if egress_items:
-            self._wait_for_egress_source_loads([req_id for req_id, _ in egress_items])
-            self._process_egress_batch(egress_items)
+    def _submit_layer_saves(self, layer_saves: list[LayerSave]) -> None:
+        total_blocks = sum(len(layer.block_ids) for layer in layer_saves)
+        save_start = time.perf_counter()
+        device_id = self._require_device_id()
+        success = False
 
-        if saves_by_layer:
-            saves_list = [
-                LayerSave(
-                    layer_name=name,
-                    block_ids=tuple(ids),
-                    block_hashes=tuple(hashes),
+        try:
+            self._ctx.engine_client.save(
+                SaveRequest(
+                    instance_id=self._ctx.instance_id,
+                    tp_rank=self._ctx.effective_tp_rank,
+                    device_id=device_id,
+                    layers=tuple(layer_saves),
                 )
-                for name, (ids, hashes) in saves_by_layer.items()
-            ]
-            total_blocks = sum(len(layer.block_ids) for layer in saves_list)
+            )
+            success = True
+            logger.debug(
+                "[PegaKVConnector] Batch saved %d layers, %d total blocks",
+                len(layer_saves),
+                total_blocks,
+            )
+        except Exception as e:
+            logger.error(
+                "[PegaKVConnector] Save RPC exception: %s (continuing without save)",
+                e,
+            )
 
-            save_start = time.perf_counter()
-            success = False
-
-            try:
-                self._ctx.engine_client.save(
-                    SaveRequest(
-                        instance_id=self._ctx.instance_id,
-                        tp_rank=self._ctx.effective_tp_rank,
-                        device_id=self._ctx.device_id,
-                        layers=tuple(saves_list),
-                    )
-                )
-                success = True
-                logger.debug(
-                    "[PegaKVConnector] Batch saved %d layers, %d total blocks",
-                    len(saves_list),
-                    total_blocks,
-                )
-            except Exception as e:
-                logger.error(
-                    "[PegaKVConnector] Save RPC exception: %s (continuing without save)",
-                    e,
-                )
-
-            save_duration = time.perf_counter() - save_start
-
-            # Record stats
-            with self._stats_lock:
-                self._stats.record_save(save_duration, total_blocks, success)
-
-        # Always complete the request save lifecycle, even if save failed.
-        self._complete_save_requests(all_request_ids)
+        save_duration = time.perf_counter() - save_start
+        with self._stats_lock:
+            self._stats.record_save(save_duration, total_blocks, success)
 
     def _process_egress_batch(self, egress_items: list[tuple[str, KvEgressIntent]]) -> None:
         if self._kv_egress is None:
@@ -753,26 +812,6 @@ class WorkerConnector:
         )
         return int(preferred) if preferred is not None else None
 
-    def _wait_for_egress_source_loads(self, request_ids: list[str]) -> None:
-        deadline = time.perf_counter() + self.LOAD_TIMEOUT_SECONDS
-        pending = set(request_ids)
-        while pending:
-            with self._load_completion_lock:
-                states = {req_id: self._pending_loads.get(req_id) for req_id in pending}
-            waiting = {
-                req_id for req_id, state in states.items() if state is not None and not state.done
-            }
-            if not waiting:
-                return
-            if time.perf_counter() >= deadline:
-                logger.error(
-                    "[PegaKVConnector] timed out waiting for source loads before KV egress: "
-                    "reqs=%s",
-                    sorted(waiting),
-                )
-                return
-            time.sleep(0.001)
-
     def _complete_save_requests(self, request_ids: list[str]) -> None:
         completed_reqs: list[str] = []
 
@@ -805,6 +844,10 @@ class WorkerConnector:
 
     def _should_skip_save_submission(self) -> bool:
         return self._ctx.is_mla and self._ctx.dcp_world_size == 1 and (self._ctx.tp_rank or 0) != 0
+
+    def _require_device_id(self) -> int:
+        assert self._ctx.device_id is not None, "CUDA device id is required"
+        return self._ctx.device_id
 
     def _register_egress_layers(
         self,
@@ -914,6 +957,58 @@ class WorkerConnector:
 def _tensor_storage_nbytes(tensor: torch.Tensor) -> int:
     storage = tensor.untyped_storage()
     return int(storage.nbytes())
+
+
+def _build_layer_registration(layer_name: str, kv_cache: torch.Tensor) -> _RegisteredLayer:
+    assert kv_cache.storage_offset() == 0, (
+        f"KV cache for {layer_name} must have zero storage offset"
+    )
+
+    shape = tuple(kv_cache.shape)
+    stride = tuple(kv_cache.stride())
+    element_size = kv_cache.element_size()
+
+    if len(shape) >= 2 and shape[0] == 2:
+        num_blocks = shape[1]
+        bytes_per_block = stride[1] * element_size
+        kv_stride_bytes = stride[0] * element_size
+        segments = 2
+        layout = "KV-first"
+    else:
+        num_blocks = shape[0]
+        bytes_per_block = stride[0] * element_size
+        kv_stride_bytes = 0
+        segments = 1
+        layout = "blocks-first"
+
+    assert bytes_per_block != 0, f"Invalid bytes_per_block for {layer_name}: stride={stride}"
+
+    return _RegisteredLayer(
+        cache_layer=KvCacheLayer(
+            name=layer_name,
+            wrapper_bytes=pickle.dumps(CudaIPCWrapper(kv_cache)),
+            num_blocks=int(num_blocks),
+            bytes_per_block=int(bytes_per_block),
+            kv_stride_bytes=int(kv_stride_bytes),
+            segments=int(segments),
+        ),
+        egress_layer=EgressLayerRegistration(
+            base_ptr=int(kv_cache.data_ptr()),
+            size_bytes=_tensor_storage_nbytes(kv_cache),
+            num_blocks=int(num_blocks),
+            bytes_per_block=int(bytes_per_block),
+            kv_stride_bytes=int(kv_stride_bytes),
+            segments=int(segments),
+        ),
+        layout=layout,
+    )
+
+
+def _summarize_layout(layouts: Iterable[str]) -> str:
+    unique_layouts = tuple(dict.fromkeys(layouts))
+    if len(unique_layouts) == 1:
+        return unique_layouts[0]
+    return "mixed:" + ",".join(unique_layouts)
 
 
 __all__ = ["WorkerConnector"]
