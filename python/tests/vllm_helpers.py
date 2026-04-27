@@ -17,6 +17,18 @@ import requests
 DEFAULT_VLLM_SEED = 42
 
 
+def _numeric_cuda_visible_devices() -> str | None:
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if not visible:
+        return None
+
+    devices = [device.strip() for device in visible.split(",") if device.strip()]
+    if not devices or not all(device.isdigit() for device in devices):
+        return None
+
+    return ",".join(devices)
+
+
 class VLLMServer:
     """Context manager for vLLM server lifecycle."""
 
@@ -237,12 +249,17 @@ class PegaFlowServer:
             self.pool_size,
             "--enable-prometheus",
         ]
+        server_devices = _numeric_cuda_visible_devices()
+        if server_devices:
+            cmd.extend(["--devices", server_devices])
 
         # pegaflow-server embeds Python via PyO3 (for CUDA device detection via torch)
         import sys
         import sysconfig
 
         env = os.environ.copy()
+        if server_devices:
+            env.pop("CUDA_VISIBLE_DEVICES", None)
         env["PYO3_PYTHON"] = sys.executable
         env["PYTHONHOME"] = sys.base_prefix
         if libdir := sysconfig.get_config_var("LIBDIR"):
