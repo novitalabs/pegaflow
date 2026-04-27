@@ -78,7 +78,7 @@ impl ScaledOffsetAllocator {
     ) -> Result<Self, AllocatorError> {
         let unit_size = NonZeroU64::new(unit_size).ok_or(AllocatorError::InvalidUnitSize)?;
 
-        let total_units = total_bytes.div_ceil(unit_size.get());
+        let total_units = total_bytes / unit_size.get();
         let total_units_u32 =
             u32::try_from(total_units).map_err(|_| AllocatorError::CapacityTooLarge {
                 total_bytes,
@@ -126,7 +126,7 @@ impl ScaledOffsetAllocator {
         self.inner.free(allocation.raw);
     }
 
-    /// Return the total managed capacity in bytes (rounded up to `unit_size`).
+    /// Return the total managed capacity in bytes (rounded down to `unit_size`).
     pub(crate) fn total_bytes(&self) -> u64 {
         self.unit_size.get() * self.total_units as u64
     }
@@ -178,6 +178,49 @@ mod tests {
         let storage = allocator.storage_report();
         assert_eq!(storage.total_free_bytes, 960);
         assert_eq!(storage.largest_free_allocation_bytes, 960);
+    }
+
+    #[test]
+    fn capacity_is_rounded_down_to_unit_size() {
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * MIB;
+        const UNIT_SIZE: u64 = 256 * MIB;
+        let total_bytes = GIB + 123 * MIB;
+
+        let allocator = ScaledOffsetAllocator::new_with_unit_size_and_max_allocs(
+            total_bytes,
+            UNIT_SIZE,
+            128 * 1024,
+        )
+        .unwrap();
+        assert_eq!(allocator.total_units, 4);
+        assert_eq!(allocator.total_bytes(), GIB);
+
+        let storage = allocator.storage_report();
+        assert_eq!(storage.total_free_bytes, GIB);
+        assert_eq!(storage.largest_free_allocation_bytes, GIB);
+    }
+
+    #[test]
+    fn does_not_allocate_past_unaligned_capacity() {
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * MIB;
+        const UNIT_SIZE: u64 = 256 * MIB;
+        let total_bytes = GIB + 123 * MIB;
+
+        let mut allocator = ScaledOffsetAllocator::new_with_unit_size_and_max_allocs(
+            total_bytes,
+            UNIT_SIZE,
+            128 * 1024,
+        )
+        .unwrap();
+
+        for idx in 0..4 {
+            let allocation = allocator.allocate(UNIT_SIZE).unwrap().unwrap();
+            assert_eq!(allocation.offset_bytes, idx * UNIT_SIZE);
+            assert_eq!(allocation.size_bytes.get(), UNIT_SIZE);
+        }
+        assert!(allocator.allocate(1).unwrap().is_none());
     }
 
     #[test]
