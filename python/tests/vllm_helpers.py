@@ -16,6 +16,25 @@ import requests
 
 DEFAULT_VLLM_SEED = 42
 
+_KV_CONNECTOR_CONFIGS = {
+    "noop": {
+        "kv_connector": "NoOpKVConnector",
+        "kv_role": "kv_both",
+        "kv_connector_module_path": "tests.noop_kv_connector",
+    },
+    "pegaflow": {
+        "kv_connector": "PegaKVConnector",
+        "kv_role": "kv_both",
+        "kv_connector_module_path": "pegaflow.connector",
+    },
+}
+
+_KV_CONNECTOR_LABELS = {
+    None: "Baseline",
+    "noop": "NoOpKV",
+    "pegaflow": "PegaFlow",
+}
+
 
 def _numeric_cuda_visible_devices() -> str | None:
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -42,10 +61,19 @@ class VLLMServer:
         max_model_len: int | None = None,
         tensor_parallel_size: int = 1,
         pipeline_parallel_size: int = 1,
+        kv_connector: str | None = None,
     ):
+        if use_pegaflow:
+            if kv_connector not in (None, "pegaflow"):
+                raise ValueError("use_pegaflow=True cannot be combined with another connector")
+            kv_connector = "pegaflow"
+        if kv_connector not in _KV_CONNECTOR_CONFIGS and kv_connector is not None:
+            raise ValueError(f"Unknown KV connector: {kv_connector}")
+
         self.model = model
         self.port = port
-        self.use_pegaflow = use_pegaflow
+        self.kv_connector = kv_connector
+        self.use_pegaflow = kv_connector == "pegaflow"
         self.pegaflow_port = pegaflow_port
         self.log_file = log_file
         self.max_model_len = max_model_len
@@ -76,6 +104,9 @@ class VLLMServer:
 
         venv_bin = str(Path(sys.executable).parent)
         env["PATH"] = venv_bin + ":" + env.get("PATH", "")
+        if self.kv_connector == "noop":
+            python_root = str(Path(__file__).parent.parent)
+            env["PYTHONPATH"] = python_root + ":" + env.get("PYTHONPATH", "")
 
         cmd = [
             "vllm",
@@ -98,15 +129,11 @@ class VLLMServer:
         if self.max_model_len is not None:
             cmd.extend(["--max-model-len", str(self.max_model_len)])
 
-        if self.use_pegaflow:
-            kv_config = {
-                "kv_connector": "PegaKVConnector",
-                "kv_role": "kv_both",
-                "kv_connector_module_path": "pegaflow.connector",
-            }
+        if self.kv_connector is not None:
+            kv_config = _KV_CONNECTOR_CONFIGS[self.kv_connector]
             cmd.extend(["--kv-transfer-config", json.dumps(kv_config)])
 
-        server_label = "PegaFlow" if self.use_pegaflow else "Baseline"
+        server_label = _KV_CONNECTOR_LABELS[self.kv_connector]
         print(f"\n[{server_label}] Starting vLLM server on port {self.port}")
 
         if self.log_file:
@@ -134,7 +161,7 @@ class VLLMServer:
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Stop the vLLM server and all child processes."""
         if self.process:
-            server_label = "PegaFlow" if self.use_pegaflow else "Baseline"
+            server_label = _KV_CONNECTOR_LABELS[self.kv_connector]
             print(f"\n[{server_label}] Stopping vLLM server...")
             try:
                 os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)

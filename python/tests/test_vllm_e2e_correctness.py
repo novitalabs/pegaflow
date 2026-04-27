@@ -1,9 +1,9 @@
-"""E2E correctness test: verify PegaFlow produces identical outputs to baseline vLLM.
+"""E2E correctness test: verify PegaFlow produces identical outputs to a no-op KV baseline.
 
 The single most important test for PegaFlow. Verifies the core contract:
 
-    Given the same prompt + model + greedy sampling,
-    output must be identical with or without PegaFlow.
+    Given the same prompt + model + greedy sampling + vLLM KV-transfer path,
+    output must be identical with no-op KV transfer and PegaFlow KV transfer.
 
 Covers all critical KV cache paths in one deterministic test:
 - Cold save + warm load (basic round-trip)
@@ -209,10 +209,10 @@ _LABEL_TO_BASELINE: dict[str, str] = {
 
 @pytest.mark.e2e
 class TestE2ECorrectness:
-    """E2E correctness: baseline vLLM vs PegaFlow-enabled vLLM.
+    """E2E correctness: no-op KV vLLM vs PegaFlow-enabled vLLM.
 
     Two-phase structure:
-      Phase 1 — run all unique prompts through baseline vLLM, collect golden outputs.
+      Phase 1 — run all unique prompts through no-op KV vLLM, collect golden outputs.
       Phase 2 — run execution plan through PegaFlow vLLM, collect outputs + metrics.
     Each test method asserts one cache path independently.
     """
@@ -237,14 +237,14 @@ class TestE2ECorrectness:
         pipeline_parallel_size: int,
         max_model_len: int | None,
     ) -> dict[str, str]:
-        """Phase 1: collect golden outputs from baseline vLLM (no PegaFlow)."""
-        print("\n[Phase 1] Baseline vLLM — collecting golden outputs")
+        """Phase 1: collect golden outputs from vLLM with a no-op KV connector."""
+        print("\n[Phase 1] No-op KV vLLM — collecting golden outputs")
         outputs: dict[str, str] = {}
 
         with VLLMServer(
             model,
             base_port,
-            use_pegaflow=False,
+            kv_connector="noop",
             log_file=log_dir / "baseline.log",
             tensor_parallel_size=tensor_parallel_size,
             pipeline_parallel_size=pipeline_parallel_size,
