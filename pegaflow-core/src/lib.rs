@@ -126,7 +126,6 @@ impl From<PrepareLoadStateError> for EngineError {
 struct PreparedLoadEntry {
     instance_id: String,
     request_id: String,
-    num_tokens: u64,
     plan: PreparedLoadPlan,
     remaining_loads: usize,
 }
@@ -615,7 +614,6 @@ impl PegaEngine {
             PreparedLoadEntry {
                 instance_id,
                 request_id,
-                num_tokens,
                 plan,
                 remaining_loads,
             },
