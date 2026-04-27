@@ -158,7 +158,7 @@ class TestFuzzCorrectness:
         """Verify PegaFlow produces identical outputs under Zipf workload.
 
         This test:
-        1. Runs baseline vLLM and saves all outputs
+        1. Runs vLLM with a no-op KV connector and saves all outputs
         2. Runs PegaFlow-enabled vLLM and compares outputs
         3. Reports cache statistics
         """
@@ -175,12 +175,12 @@ class TestFuzzCorrectness:
         baseline_log = log_dir / "baseline_fuzz.log"
         pegaflow_log = log_dir / "pegaflow_fuzz.log"
 
-        # Phase 1: Run baseline and save results
-        print("\n[Fuzz] Phase 1: Running baseline vLLM")
+        # Phase 1: Run no-op KV baseline and save results
+        print("\n[Fuzz] Phase 1: Running no-op KV vLLM")
         with VLLMServer(
             model,
             base_port,
-            use_pegaflow=False,
+            kv_connector="noop",
             log_file=baseline_log,
             tensor_parallel_size=tensor_parallel_size,
             pipeline_parallel_size=pipeline_parallel_size,
