@@ -7,7 +7,6 @@
 mod common;
 
 use common::*;
-use pegaflow_core::PrefetchStatus;
 
 /// Save first 3 of 5 blocks; prefix scan should stop at block 3.
 #[tokio::test]
@@ -21,13 +20,9 @@ async fn partial_prefix_reports_contiguous_hit_count() {
 
     env.save_layer_and_flush(0, &save_hashes).await;
 
-    match env.query(&query_hashes).await {
-        PrefetchStatus::Done { hit, missing } => {
-            assert_eq!(hit, 3);
-            assert_eq!(missing, 2);
-        }
-        other => panic!("expected Done, got {other:?}"),
-    }
+    let hit_blocks = env.query(&query_hashes).await;
+    assert_eq!(hit_blocks, 3);
+    assert_eq!(query_hashes.len() - hit_blocks, 2);
     env.unpin(&query_hashes[..3]);
 }
 
@@ -49,13 +44,9 @@ async fn gap_in_cached_blocks_breaks_prefix() {
 
     env.save_layer_and_flush(0, &save_hashes).await;
 
-    match env.query(&all_hashes).await {
-        PrefetchStatus::Done { hit, missing } => {
-            assert_eq!(hit, 1, "prefix should stop at first gap");
-            assert_eq!(missing, 3);
-        }
-        other => panic!("expected Done, got {other:?}"),
-    }
+    let hit_blocks = env.query(&all_hashes).await;
+    assert_eq!(hit_blocks, 1, "prefix should stop at first gap");
+    assert_eq!(all_hashes.len() - hit_blocks, 3);
     env.unpin(&all_hashes[..1]);
 }
 
@@ -75,14 +66,10 @@ async fn first_block_missing_yields_zero_prefix_hit() {
 
     env.save_layer_and_flush(0, &save_hashes).await;
 
-    match env.query(&all_hashes).await {
-        PrefetchStatus::Done { hit, missing } => {
-            assert_eq!(hit, 0);
-            assert_eq!(missing, 4);
-        }
-        other => panic!("expected Done, got {other:?}"),
-    }
-    // hit=0, nothing pinned
+    let hit_blocks = env.query(&all_hashes).await;
+    assert_eq!(hit_blocks, 0);
+    assert_eq!(all_hashes.len() - hit_blocks, 4);
+    // hit_blocks=0, nothing pinned
 }
 
 /// Empty hash list → zero hits, zero missing.
@@ -92,11 +79,6 @@ async fn empty_query_returns_zero() {
         .layer("layer_0", 1, 1024)
         .build();
 
-    match env.query(&[]).await {
-        PrefetchStatus::Done { hit, missing } => {
-            assert_eq!(hit, 0);
-            assert_eq!(missing, 0);
-        }
-        other => panic!("expected Done, got {other:?}"),
-    }
+    let hit_blocks = env.query(&[]).await;
+    assert_eq!(hit_blocks, 0);
 }

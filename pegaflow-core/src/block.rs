@@ -25,7 +25,7 @@ pub struct LayerSave {
 }
 
 // ============================================================================
-// Block Status and Prefetch Status
+// Block Status
 // ============================================================================
 
 /// Status of a block in the storage hierarchy
@@ -41,15 +41,6 @@ pub enum BlockStatus {
     InSsd,
     /// Block not found anywhere
     Miss,
-}
-
-/// Result of checking prefix hits with SSD prefetch support
-#[derive(Debug, Clone)]
-pub enum PrefetchStatus {
-    /// Blocks are being prefetched - caller should retry
-    Loading { hit: usize, loading: usize },
-    /// Terminal state: hit/missing counts final (missing=0 means full hit)
-    Done { hit: usize, missing: usize },
 }
 
 // ============================================================================

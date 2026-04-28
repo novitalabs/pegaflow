@@ -33,9 +33,7 @@ pub use backing::{
     DEFAULT_SSD_PREFETCH_INFLIGHT, DEFAULT_SSD_PREFETCH_QUEUE_DEPTH, DEFAULT_SSD_WRITE_INFLIGHT,
     DEFAULT_SSD_WRITE_QUEUE_DEPTH, SsdCacheConfig,
 };
-pub use block::{
-    BlockHash, BlockKey, BlockStatus, LayerBlock, LayerSave, PrefetchStatus, RawBlock, SealedBlock,
-};
+pub use block::{BlockHash, BlockKey, BlockStatus, LayerBlock, LayerSave, RawBlock, SealedBlock};
 pub use instance::{GpuContext, InstanceContext, KVCacheRegistration};
 pub use internode::{DEFAULT_METASERVER_QUEUE_DEPTH, MetaServerClient, MetaServerClientConfig};
 pub use load_plan::{PrepareLoadOutcome, PrepareLoadRequest, PreparedLoadItem};
@@ -377,12 +375,7 @@ impl PegaEngine {
             .collect()
     }
 
-    /// Count prefix hit blocks with SSD prefetch support.
-    ///
-    /// Returns:
-    /// - `Done { hit, missing: 0 }`: all blocks in memory cache
-    /// - `Loading { hit, loading }`: some blocks being fetched from SSD
-    /// - `Done { hit, missing }`: some blocks don't exist
+    /// Count prefix hit blocks, awaiting backing-store prefetch if needed.
     #[cfg_attr(
         feature = "tracing",
         fastrace::trace(name = "prepare_load.count_prefix_hit")
@@ -392,7 +385,7 @@ impl PegaEngine {
         instance_id: &str,
         req_id: &str,
         block_hashes: &[Vec<u8>],
-    ) -> Result<PrefetchStatus, EngineError> {
+    ) -> Result<usize, EngineError> {
         let instance = self.get_instance(instance_id)?;
         let num_workers = instance.world_size();
         self.count_prefix_hit_blocks_with_prefetch_for_workers(
@@ -410,61 +403,49 @@ impl PegaEngine {
         req_id: &str,
         block_hashes: &[Vec<u8>],
         num_workers: usize,
-    ) -> Result<PrefetchStatus, EngineError> {
+    ) -> Result<usize, EngineError> {
         if req_id.is_empty() {
             warn!("count_prefix_hit_blocks_with_prefetch: empty req_id, returning 0 hits");
-            return Ok(PrefetchStatus::Done {
-                hit: 0,
-                missing: block_hashes.len(),
-            });
+            return Ok(0);
         }
 
         let instance = self.get_instance(instance_id)?;
         let namespace = instance.namespace();
         let metrics = core_metrics();
 
-        let status = self
+        let hit_blocks = self
             .storage
-            .check_prefix_and_prefetch(instance_id, req_id, namespace, block_hashes, num_workers)
-            .await;
+            .load_prefix_with_prefetch(instance_id, req_id, namespace, block_hashes, num_workers)
+            .await
+            .min(block_hashes.len());
 
-        match &status {
-            PrefetchStatus::Done { hit, missing } => {
-                metrics.cache_block_hits.add(*hit as u64, &[]);
-                if *missing > 0 {
-                    metrics.cache_block_misses.add(*missing as u64, &[]);
-                }
-            }
-            PrefetchStatus::Loading { hit, loading: _ } => {
-                metrics.cache_block_hits.add(*hit as u64, &[]);
-            }
+        let missing_blocks = block_hashes.len() - hit_blocks;
+        metrics.cache_block_hits.add(hit_blocks as u64, &[]);
+        if missing_blocks > 0 {
+            metrics.cache_block_misses.add(missing_blocks as u64, &[]);
         }
 
-        Ok(status)
+        Ok(hit_blocks)
     }
 
-    /// Advance one server-owned prepare-load state-machine step.
-    ///
-    /// The caller may invoke this repeatedly from an async task until the
-    /// outcome is terminal. Terminal plan outcomes are registered under an
-    /// opaque plan id that the later load call consumes.
-    pub async fn prepare_load_step(
+    /// Prepare a load plan, awaiting backing-store or P/D staging completion.
+    pub async fn prepare_load(
         &self,
         request: &PrepareLoadRequest,
     ) -> Result<PrepareLoadOutcome, EngineError> {
-        self.prepare_load_step_with_trace(request, None).await
+        self.prepare_load_with_trace(request, None).await
     }
 
-    /// Same prepare-load state-machine step, optionally attached to a
+    /// Same prepare-load operation, optionally attached to a
     /// request-lifecycle trace that will be carried into the later load.
-    pub async fn prepare_load_step_with_trace(
+    pub async fn prepare_load_with_trace(
         &self,
         request: &PrepareLoadRequest,
         trace: Option<RequestTrace>,
     ) -> Result<PrepareLoadOutcome, EngineError> {
         assert!(
             !self.has_prepared_load_for_request(&request.instance_id, &request.request_id),
-            "prepared load plan already exists before prepare_load_step: instance_id={} request_id={}",
+            "prepared load plan already exists before prepare_load: instance_id={} request_id={}",
             request.instance_id,
             request.request_id
         );
@@ -485,15 +466,15 @@ impl PegaEngine {
             .filter(|request_id| !request_id.is_empty())
         {
             return self
-                .prepare_staged_load_step(request, decode_req_id, computed_blocks, trace)
+                .prepare_staged_load(request, decode_req_id, computed_blocks, trace)
                 .await;
         }
 
-        self.prepare_cache_load_step(request, computed_blocks, trace)
+        self.prepare_cache_load(request, computed_blocks, trace)
             .await
     }
 
-    async fn prepare_cache_load_step(
+    async fn prepare_cache_load(
         &self,
         request: &PrepareLoadRequest,
         computed_blocks: usize,
@@ -508,7 +489,7 @@ impl PegaEngine {
             return Ok(PrepareLoadOutcome::NoPlan);
         }
 
-        let status = self
+        let hit_blocks = self
             .count_prefix_hit_blocks_with_prefetch_for_workers(
                 &request.instance_id,
                 &request.request_id,
@@ -516,11 +497,7 @@ impl PegaEngine {
                 1,
             )
             .await?;
-
-        let hit_blocks = match status {
-            PrefetchStatus::Loading { .. } => return Ok(PrepareLoadOutcome::Pending),
-            PrefetchStatus::Done { hit, .. } => hit.min(remaining_hashes.len()),
-        };
+        let hit_blocks = hit_blocks.min(remaining_hashes.len());
         if hit_blocks == 0 {
             return Ok(PrepareLoadOutcome::NoPlan);
         }
@@ -554,7 +531,7 @@ impl PegaEngine {
         ))
     }
 
-    async fn prepare_staged_load_step(
+    async fn prepare_staged_load(
         &self,
         request: &PrepareLoadRequest,
         decode_req_id: &str,
@@ -589,12 +566,11 @@ impl PegaEngine {
             expire_after: None,
         })?;
 
-        let load_plans = match self.pd_receive.try_checkout_ready(
-            &request.instance_id,
-            decode_req_id,
-            prepare.handle.as_str(),
-        )? {
-            PdReceiveCheckoutStatus::Pending => return Ok(PrepareLoadOutcome::Pending),
+        let load_plans = match self
+            .pd_receive
+            .checkout_ready(&request.instance_id, decode_req_id, prepare.handle.as_str())
+            .await?
+        {
             PdReceiveCheckoutStatus::Expired => return Ok(PrepareLoadOutcome::NoPlan),
             PdReceiveCheckoutStatus::Ready(load_plans) => load_plans,
         };

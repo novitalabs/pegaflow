@@ -68,7 +68,7 @@ class SchedulerConnector:
         # (vLLM hashes every scheduler_block_size =
         # block_size * dcp_world_size * pcp_world_size).
         # Only the scheduler-visible index is needed here; source-specific
-        # matching and P/D polling are handled by prepare_load.
+        # matching and P/D waiting are handled by prepare_load.
         computed_blocks = num_computed_tokens // self._ctx.virtual_block_size
 
         result = self._prepare_load(state, request, num_computed_tokens)

@@ -24,7 +24,7 @@ use pegaflow_core::{
 };
 use pyo3::{PyErr, Python};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::sync::{Notify, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, async_trait};
@@ -534,55 +534,39 @@ impl Engine for GrpcEngineService {
             );
 
             tokio::spawn(async move {
-                let mut prepare_steps = 0u64;
-                loop {
-                    prepare_steps += 1;
-                    match prepare_task_trace
-                        .in_span(
-                            "prepare_load.step",
-                            engine.prepare_load_step_with_trace(
-                                &core_request,
-                                Some(prepare_task_trace.clone()),
-                            ),
-                        )
-                        .await
-                    {
-                        Ok(PrepareLoadOutcome::Pending) => {
-                            tokio::time::sleep(Duration::from_millis(2)).await;
+                match prepare_task_trace
+                    .in_span(
+                        "prepare_load",
+                        engine.prepare_load_with_trace(
+                            &core_request,
+                            Some(prepare_task_trace.clone()),
+                        ),
+                    )
+                    .await
+                {
+                    Ok(PrepareLoadOutcome::NoPlan) => {
+                        prepare_task_trace.add_property("result", "no_plan");
+                        if let Ok(mut tracker) = hll_tracker.lock() {
+                            tracker.record_hashes(&core_request.block_hashes);
                         }
-                        Ok(PrepareLoadOutcome::NoPlan) => {
-                            prepare_task_trace.add_property("result", "no_plan");
-                            prepare_task_trace
-                                .add_property("prepare_steps", prepare_steps.to_string());
-                            if let Ok(mut tracker) = hll_tracker.lock() {
-                                tracker.record_hashes(&core_request.block_hashes);
-                            }
-                            state.set_ready_no_plan();
-                            break;
+                        state.set_ready_no_plan();
+                    }
+                    Ok(PrepareLoadOutcome::Plan {
+                        plan_id,
+                        num_tokens,
+                    }) => {
+                        if let Ok(mut tracker) = hll_tracker.lock() {
+                            tracker.record_hashes(&core_request.block_hashes);
                         }
-                        Ok(PrepareLoadOutcome::Plan {
-                            plan_id,
-                            num_tokens,
-                        }) => {
-                            prepare_task_trace
-                                .add_property("prepare_steps", prepare_steps.to_string());
-                            if let Ok(mut tracker) = hll_tracker.lock() {
-                                tracker.record_hashes(&core_request.block_hashes);
-                            }
-                            state.set_ready_plan(num_tokens, plan_id);
-                            break;
-                        }
-                        Err(err) => {
-                            prepare_task_trace.add_property("result", "error");
-                            prepare_task_trace
-                                .add_property("prepare_steps", prepare_steps.to_string());
-                            warn!(
-                                "prepare_load task failed: instance={} request={} error={}",
-                                core_request.instance_id, core_request.request_id, err
-                            );
-                            state.set_error();
-                            break;
-                        }
+                        state.set_ready_plan(num_tokens, plan_id);
+                    }
+                    Err(err) => {
+                        prepare_task_trace.add_property("result", "error");
+                        warn!(
+                            "prepare_load task failed: instance={} request={} error={}",
+                            core_request.instance_id, core_request.request_id, err
+                        );
+                        state.set_error();
                     }
                 }
             });

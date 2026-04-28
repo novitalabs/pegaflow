@@ -179,25 +179,21 @@ async fn wait_for_cache(
     engine: &PegaEngine,
     instance_id: &str,
     block_hashes: &[Vec<u8>],
-    expected_hit: usize,
+    expected_hit_blocks: usize,
     timeout: Duration,
 ) {
     let deadline = Instant::now() + timeout;
     loop {
-        let status = engine
+        let hit_blocks = engine
             .count_prefix_hit_blocks_with_prefetch(instance_id, "wait-for-cache", block_hashes)
             .await
             .expect("count_prefix_hit_blocks_with_prefetch");
-        let hit = match status {
-            PrefetchStatus::Done { hit, .. } => hit,
-            PrefetchStatus::Loading { hit, .. } => hit,
-        };
-        if hit >= expected_hit {
+        if hit_blocks >= expected_hit_blocks {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for {expected_hit} cached blocks (got {hit})"
+            "timed out waiting for {expected_hit_blocks} cached blocks (got {hit_blocks})"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -231,29 +227,22 @@ async fn wait_for_prefetch_done(
     instance_id: &str,
     req_id: &str,
     block_hashes: &[Vec<u8>],
-    expected_hit: usize,
+    expected_hit_blocks: usize,
     timeout: Duration,
 ) {
     let deadline = Instant::now() + timeout;
     loop {
-        let status = engine
+        let hit_blocks = engine
             .count_prefix_hit_blocks_with_prefetch(instance_id, req_id, block_hashes)
             .await
             .expect("count_prefix_hit_blocks_with_prefetch");
-        match status {
-            PrefetchStatus::Done { hit, .. } if hit >= expected_hit => return,
-            PrefetchStatus::Done { hit, missing } => {
-                assert!(
-                    Instant::now() < deadline,
-                    "prefetch done but hit={hit} missing={missing}, \
-                     expected hit>={expected_hit}"
-                );
-            }
-            PrefetchStatus::Loading { .. } => {}
+        if hit_blocks >= expected_hit_blocks {
+            return;
         }
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for prefetch done"
+            "prefetch done but hit_blocks={hit_blocks} missing_blocks={}, expected hit_blocks>={expected_hit_blocks}",
+            block_hashes.len().saturating_sub(hit_blocks)
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

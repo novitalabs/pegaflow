@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::pinned_pool::PinnedAllocation;
@@ -83,9 +84,17 @@ pub(crate) struct PdReceiveLoadLayer {
 }
 
 pub(crate) enum PdReceiveCheckoutStatus {
-    Pending,
     Ready(Vec<PdReceiveLoadPlan>),
     Expired,
+}
+
+enum PdReceiveCheckoutAction {
+    Ready(Vec<PdReceiveLoadPlan>),
+    Expired,
+    Wait {
+        notify: Arc<Notify>,
+        expires_at: Instant,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +136,7 @@ struct PdReceiveLease {
     state: PdReceiveLeaseState,
     expected_imm_count: usize,
     observed_imm_count: usize,
+    ready_notify: Arc<Notify>,
     created_at: Instant,
     expires_at: Instant,
     expires_at_ms: u64,
@@ -273,6 +283,7 @@ impl PdReceiveManager {
             state: PdReceiveLeaseState::Prepared,
             expected_imm_count: input.expected_imm_count.max(1),
             observed_imm_count: 0,
+            ready_notify: Arc::new(Notify::new()),
             created_at: now,
             expires_at: input.expires_at,
             expires_at_ms: input.expires_at_ms,
@@ -345,15 +356,37 @@ impl PdReceiveManager {
         }
     }
 
-    pub(crate) fn try_checkout_ready(
+    pub(crate) async fn checkout_ready(
         &self,
         dst_instance_id: &str,
         request_id: &str,
         handle: &str,
     ) -> Result<PdReceiveCheckoutStatus, EngineError> {
+        let lease_handle = handle.to_string();
+        loop {
+            match self.checkout_ready_action(dst_instance_id, request_id, &lease_handle)? {
+                PdReceiveCheckoutAction::Ready(load_plans) => {
+                    return Ok(PdReceiveCheckoutStatus::Ready(load_plans));
+                }
+                PdReceiveCheckoutAction::Expired => return Ok(PdReceiveCheckoutStatus::Expired),
+                PdReceiveCheckoutAction::Wait { notify, expires_at } => {
+                    tokio::select! {
+                        _ = notify.notified() => {}
+                        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(expires_at)) => {}
+                    }
+                }
+            }
+        }
+    }
+
+    fn checkout_ready_action(
+        &self,
+        dst_instance_id: &str,
+        request_id: &str,
+        handle: &str,
+    ) -> Result<PdReceiveCheckoutAction, EngineError> {
         let now = Instant::now();
         let mut state = self.state.lock();
-
         let lease_handle = if !handle.is_empty() {
             handle.to_string()
         } else {
@@ -380,18 +413,21 @@ impl PdReceiveManager {
         }
         if lease.expires_at <= now {
             Self::remove_locked(&mut state, &lease_handle);
-            return Ok(PdReceiveCheckoutStatus::Expired);
+            return Ok(PdReceiveCheckoutAction::Expired);
         }
         match lease.state {
-            PdReceiveLeaseState::Prepared | PdReceiveLeaseState::Writing => {
-                return Ok(PdReceiveCheckoutStatus::Pending);
+            PdReceiveLeaseState::Ready => {
+                let load_plans = Self::load_plans_from_lease(lease, dst_instance_id, request_id)?;
+                Self::remove_locked(&mut state, &lease_handle);
+                Ok(PdReceiveCheckoutAction::Ready(load_plans))
             }
-            PdReceiveLeaseState::Ready => {}
+            PdReceiveLeaseState::Prepared | PdReceiveLeaseState::Writing => {
+                Ok(PdReceiveCheckoutAction::Wait {
+                    notify: Arc::clone(&lease.ready_notify),
+                    expires_at: lease.expires_at,
+                })
+            }
         }
-
-        let load_plans = Self::load_plans_from_lease(lease, dst_instance_id, request_id)?;
-        Self::remove_locked(&mut state, &lease_handle);
-        Ok(PdReceiveCheckoutStatus::Ready(load_plans))
     }
 
     fn load_plans_from_lease(
@@ -454,8 +490,16 @@ impl PdReceiveManager {
             lease.state = PdReceiveLeaseState::Writing;
         }
         lease.observed_imm_count = lease.observed_imm_count.saturating_add(1);
-        if lease.observed_imm_count >= lease.expected_imm_count {
+        let ready = lease.observed_imm_count >= lease.expected_imm_count;
+        let notify = if ready {
             lease.state = PdReceiveLeaseState::Ready;
+            Some(Arc::clone(&lease.ready_notify))
+        } else {
+            None
+        };
+        drop(state);
+        if let Some(notify) = notify {
+            notify.notify_waiters();
         }
         true
     }

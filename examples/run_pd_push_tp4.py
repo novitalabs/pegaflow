@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--d-gpus", default="1,3,5,7")
     parser.add_argument("--nics", default="mlx5_1,mlx5_2,mlx5_3,mlx5_4")
     parser.add_argument("--host", default=_default_host())
-    parser.add_argument("--router-port", type=int, default=8000)
+    parser.add_argument("--router-port", type=int, default=9000)
     parser.add_argument("--p-vllm-port", type=int, default=8100)
     parser.add_argument("--d-vllm-port", type=int, default=8200)
     parser.add_argument("--metaserver-port", type=int, default=50056)
@@ -88,7 +88,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--d-engine-http-port", type=int, default=19093)
     parser.add_argument("--pool-size", default="16gb")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
-    parser.add_argument("--max-model-len", type=int, default=4096)
+    parser.add_argument("--max-model-len", type=int, default=None)
     parser.add_argument("--log-dir", default="examples/pd_push_logs")
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--no-smoke", action="store_true")
@@ -282,7 +282,7 @@ def main() -> int:
     }
 
     def vllm_cmd(port: int) -> list[str]:
-        return [
+        cmd = [
             vllm_bin,
             "serve",
             args.model,
@@ -296,13 +296,14 @@ def main() -> int:
             str(args.tp),
             "--gpu-memory-utilization",
             str(args.gpu_memory_utilization),
-            "--max-model-len",
-            str(args.max_model_len),
             "--trust-remote-code",
             "--no-enable-prefix-caching",
             "--kv-transfer-config",
             json.dumps(kv_config),
         ]
+        if args.max_model_len is not None:
+            cmd.extend(["--max-model-len", str(args.max_model_len)])
+        return cmd
 
     p_env = common_env.copy()
     p_env.update(

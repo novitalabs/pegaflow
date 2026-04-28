@@ -161,16 +161,20 @@ fn inject_pd_params(
         .cloned()
         .unwrap_or_default();
 
-    let mut pd = serde_json::Map::new();
-    pd.insert("enabled".to_string(), json!(true));
-    pd.insert("mode".to_string(), json!("cpu_staging_push"));
-    pd.insert("role".to_string(), json!(role));
-    pd.insert("pd_request_id".to_string(), json!(pd_request_id));
-    pd.insert("dst_instance_id".to_string(), json!(dst_instance_id));
-    if role == "source" {
-        pd.insert("d_pegaflow_addr".to_string(), json!(d_pegaflow_addr));
+    let mut pegaflow = serde_json::Map::new();
+    pegaflow.insert("request_id".to_string(), json!(pd_request_id));
+    match role {
+        "source" => {
+            pegaflow.insert("type".to_string(), json!("prefill_push"));
+            pegaflow.insert("decode_endpoint".to_string(), json!(d_pegaflow_addr));
+            pegaflow.insert("decode_instance_id".to_string(), json!(dst_instance_id));
+        }
+        "target" => {
+            pegaflow.insert("type".to_string(), json!("decode_load"));
+        }
+        _ => {}
     }
-    params.insert("pegaflow_pd".to_string(), Value::Object(pd));
+    params.insert("pegaflow".to_string(), Value::Object(pegaflow));
     body["kv_transfer_params"] = Value::Object(params);
 }
 

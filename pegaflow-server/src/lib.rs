@@ -621,8 +621,6 @@ fn spawn_pd_receive_imm_watcher(engine: Arc<PegaEngine>, shutdown: Arc<Notify>) 
     };
 
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_micros(50));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         info!("P/D receive IMM watcher started");
 
         loop {
@@ -631,29 +629,26 @@ fn spawn_pd_receive_imm_watcher(engine: Arc<PegaEngine>, shutdown: Arc<Notify>) 
                     info!("P/D receive IMM watcher shutting down");
                     break;
                 }
-                _ = interval.tick() => {
-                    let mut drained = 0usize;
-                    while let Ok(completion) = imm_rx.try_recv() {
-                        drained += 1;
-                        let matched = engine.observe_pd_receive_imm(completion.imm_data);
-                        if matched {
-                            debug!(
-                                "P/D receive IMM observed: imm={} nic_idx={} local_qpn={}",
-                                completion.imm_data,
-                                completion.nic_idx,
-                                completion.local_qpn,
-                            );
-                        } else {
-                            warn!(
-                                "P/D receive IMM did not match a live lease: imm={} nic_idx={} local_qpn={}",
-                                completion.imm_data,
-                                completion.nic_idx,
-                                completion.local_qpn,
-                            );
-                        }
-                    }
-                    if drained > 1 {
-                        debug!("P/D receive IMM watcher drained {} completions", drained);
+                completion = imm_rx.recv() => {
+                    let Ok(completion) = completion else {
+                        info!("P/D receive IMM watcher receiver closed");
+                        break;
+                    };
+                    let matched = engine.observe_pd_receive_imm(completion.imm_data);
+                    if matched {
+                        debug!(
+                            "P/D receive IMM observed: imm={} nic_idx={} local_qpn={}",
+                            completion.imm_data,
+                            completion.nic_idx,
+                            completion.local_qpn,
+                        );
+                    } else {
+                        warn!(
+                            "P/D receive IMM did not match a live lease: imm={} nic_idx={} local_qpn={}",
+                            completion.imm_data,
+                            completion.nic_idx,
+                            completion.local_qpn,
+                        );
                     }
                 }
             }

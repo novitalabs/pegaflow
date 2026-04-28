@@ -25,7 +25,6 @@ pub struct PreparedLoadItem {
 
 #[derive(Debug, Clone)]
 pub enum PrepareLoadOutcome {
-    Pending,
     NoPlan,
     Plan { plan_id: u64, num_tokens: u64 },
 }
