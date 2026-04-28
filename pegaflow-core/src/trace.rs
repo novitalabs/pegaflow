@@ -19,7 +19,7 @@ use fastrace::prelude::{Span, SpanContext};
 use parking_lot::Mutex;
 
 /// Sample rate in permille (0–1000). 1000 = 100%, 10 = 1%, 0 = off.
-static SAMPLE_RATE_PERMILLE: AtomicU32 = AtomicU32::new(1000);
+static SAMPLE_RATE_PERMILLE: AtomicU32 = AtomicU32::new(10);
 
 /// Set the trace sampling rate.
 ///

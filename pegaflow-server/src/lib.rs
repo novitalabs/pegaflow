@@ -129,8 +129,8 @@ pub struct Cli {
     #[arg(long, default_value_t = 800)]
     pub max_prefetch_blocks: usize,
 
-    /// Trace sampling rate (0.0-1.0). E.g. 0.01 = 1%. Default: 1.0 (100%)
-    #[arg(long, default_value_t = 1.0, value_parser = parse_sample_rate)]
+    /// Trace sampling rate (0.0-1.0). E.g. 0.01 = 1%. Default: 0.01 (1%)
+    #[arg(long, default_value_t = 0.01, value_parser = parse_sample_rate)]
     pub trace_sample_rate: f64,
 
     /// Number of shards for the pinned memory pool (reduces allocator lock contention).
