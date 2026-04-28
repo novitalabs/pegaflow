@@ -78,24 +78,19 @@ impl ReadCache {
     }
 
     /// Scan cache for a prefix of `keys`, stopping at the first miss.
-    pub(super) fn get_prefix_blocks(
-        &self,
-        keys: &[BlockKey],
-    ) -> (usize, Vec<(BlockKey, Arc<SealedBlock>)>) {
-        let mut hit = 0usize;
+    pub(super) fn get_prefix_blocks(&self, keys: &[BlockKey]) -> Vec<(BlockKey, Arc<SealedBlock>)> {
         let mut blocks = Vec::new();
         {
             let mut inner = self.inner.lock();
             for key in keys {
                 if let Some(block) = inner.cache.get(key) {
-                    hit += 1;
                     blocks.push((key.clone(), Arc::clone(&block)));
                 } else {
                     break;
                 }
             }
         }
-        (hit, blocks)
+        blocks
     }
 
     pub(super) fn batch_insert(&self, blocks: Vec<(BlockKey, Arc<SealedBlock>)>) {
@@ -349,7 +344,7 @@ mod tests {
         assert_eq!(result.len(), 3);
 
         // get_prefix_blocks: stops at key 1 (first miss), returns only key 0
-        let (prefix_hit, _) = cache.get_prefix_blocks(&keys);
+        let prefix_hit = cache.get_prefix_blocks(&keys).len();
         assert_eq!(prefix_hit, 1);
     }
 }

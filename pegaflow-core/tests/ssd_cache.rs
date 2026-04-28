@@ -64,7 +64,7 @@ async fn ssd_write_persists_to_file() {
 /// query (triggers SSD prefetch) → load → verify data integrity.
 #[tokio::test]
 async fn ssd_prefetch_roundtrip_after_eviction() {
-    let (env, _cache_path) = ssd_env("test-ssd-prefetch");
+    let env = ssd_env("test-ssd-prefetch").0;
 
     // Phase 1: Save target blocks and ensure they're persisted to SSD.
     let target = env.hashes(1);

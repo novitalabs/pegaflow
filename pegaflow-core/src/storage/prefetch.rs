@@ -86,14 +86,14 @@ impl PrefetchScheduler {
         namespace: &str,
         hashes: &[Vec<u8>],
         num_workers: usize,
-    ) -> (usize, usize) {
+    ) -> usize {
         loop {
             let scan = self
                 .full_prefix_scan(read_cache, req_id, namespace, hashes)
                 .await;
             let Some(load) = scan.load else {
                 read_cache.pin_blocks(instance_id, num_workers, &scan.blocks_to_pin);
-                return (scan.hit_blocks, scan.missing_blocks);
+                return scan.blocks_to_pin.len();
             };
 
             let expected = load.found;
@@ -132,14 +132,15 @@ impl PrefetchScheduler {
         namespace: &str,
         hashes: &[Vec<u8>],
         num_workers: usize,
-    ) -> (usize, usize) {
+    ) -> usize {
         let keys: Vec<BlockKey> = hashes
             .iter()
             .map(|hash| BlockKey::new(namespace.to_string(), hash.clone()))
             .collect();
-        let (hit_blocks, blocks_to_pin) = read_cache.get_prefix_blocks(&keys);
+        let blocks_to_pin = read_cache.get_prefix_blocks(&keys);
+        let hit_blocks = blocks_to_pin.len();
         read_cache.pin_blocks(instance_id, num_workers, &blocks_to_pin);
-        (hit_blocks, keys.len() - hit_blocks)
+        hit_blocks
     }
 
     async fn await_load(&self, req_id: &str, load: LoadResult) -> PrefetchResult {
@@ -182,7 +183,8 @@ impl PrefetchScheduler {
         let key_build = key_build_start.elapsed();
 
         let cache_scan_start = Instant::now();
-        let (hit_blocks, blocks_to_pin) = read_cache.get_prefix_blocks(&keys);
+        let blocks_to_pin = read_cache.get_prefix_blocks(&keys);
+        let hit_blocks = blocks_to_pin.len();
         let cache_scan = cache_scan_start.elapsed();
         let remaining = &keys[hit_blocks..];
 
@@ -224,8 +226,6 @@ impl PrefetchScheduler {
         }
 
         PrefixScan {
-            hit_blocks,
-            missing_blocks,
             blocks_to_pin,
             load,
         }
@@ -324,8 +324,6 @@ impl PrefetchScheduler {
 }
 
 struct PrefixScan {
-    hit_blocks: usize,
-    missing_blocks: usize,
     blocks_to_pin: Vec<(BlockKey, Arc<SealedBlock>)>,
     load: Option<LoadResult>,
 }

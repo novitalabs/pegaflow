@@ -764,10 +764,12 @@ mod tests {
             .expect("allocate slabs");
         assert_eq!(calls.load(Ordering::Relaxed), 1);
 
-        let (p1, _a1) =
-            alloc_segment_from_slab(&mut slabs, NumaNode(0), 256, "K").expect("alloc p1");
-        let (p2, _a2) =
-            alloc_segment_from_slab(&mut slabs, NumaNode(0), 128, "V").expect("alloc p2");
+        let p1 = alloc_segment_from_slab(&mut slabs, NumaNode(0), 256, "K")
+            .expect("alloc p1")
+            .0;
+        let p2 = alloc_segment_from_slab(&mut slabs, NumaNode(0), 128, "V")
+            .expect("alloc p2")
+            .0;
         assert_eq!(p2.as_ptr() as usize - p1.as_ptr() as usize, 256);
 
         let overflow = alloc_segment_from_slab(&mut slabs, NumaNode(0), 1024, "K");

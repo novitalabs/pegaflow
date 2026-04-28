@@ -363,8 +363,7 @@ impl StorageEngine {
         hashes: &[Vec<u8>],
         num_workers: usize,
     ) -> usize {
-        let (hit_blocks, _) = self
-            .prefetch
+        self.prefetch
             .load_prefix(
                 &self.read_cache,
                 instance_id,
@@ -373,8 +372,7 @@ impl StorageEngine {
                 hashes,
                 num_workers,
             )
-            .await;
-        hit_blocks
+            .await
     }
 
     fn reclaim_until_allocator_can_allocate(
