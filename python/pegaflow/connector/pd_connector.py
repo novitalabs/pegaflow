@@ -40,7 +40,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiConnector,
     MultiKVConnectorMetadata,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector import (
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlConnector,
     NixlHandshakePayload,
 )
