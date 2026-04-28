@@ -371,7 +371,7 @@ fn process_load_task(task: &LoadTask, stream: &CudaStream) -> Result<(), EngineE
 
     RequestTrace::record_load_success_all(&task.traces, elapsed, total_bytes, memcpy_calls);
 
-    info!(
+    debug!(
         "Load task completed: layers={} blocks={} bytes={} elapsed_ms={:.2} bandwidth_gbps={:.2} memcpy_calls={}",
         task.layers.len(),
         total_blocks,

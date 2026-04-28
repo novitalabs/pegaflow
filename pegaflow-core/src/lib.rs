@@ -489,14 +489,21 @@ impl PegaEngine {
             return Ok(PrepareLoadOutcome::NoPlan);
         }
 
-        let hit_blocks = self
-            .count_prefix_hit_blocks_with_prefetch_for_workers(
-                &request.instance_id,
-                &request.request_id,
-                &remaining_hashes,
-                1,
-            )
-            .await?;
+        RequestTrace::add_optional_property(&trace, "prepare_source", "cache");
+        let count_prefix = self.count_prefix_hit_blocks_with_prefetch_for_workers(
+            &request.instance_id,
+            &request.request_id,
+            &remaining_hashes,
+            1,
+        );
+        let hit_blocks = match &trace {
+            Some(trace) => {
+                trace
+                    .in_span("prepare.cache_count_prefix", count_prefix)
+                    .await?
+            }
+            None => count_prefix.await?,
+        };
         let hit_blocks = hit_blocks.min(remaining_hashes.len());
         if hit_blocks == 0 {
             return Ok(PrepareLoadOutcome::NoPlan);
@@ -511,13 +518,24 @@ impl PegaEngine {
                 ))
             })?;
         let block_hashes: Vec<Vec<u8>> = remaining_hashes.into_iter().take(hit_blocks).collect();
-        let instance = self.get_instance(&request.instance_id)?;
-        let block_entries = self
-            .storage
-            .consume_pinned_blocks(&request.instance_id, instance.namespace(), &block_hashes)
-            .map_err(EngineError::Storage)?;
-        let plan = PreparedLoadPlan::from_cache_blocks(&instance, &block_entries)?;
-        let remaining_loads = instance.registered_shards().len().max(1);
+        let build_plan = async {
+            let instance = self.get_instance(&request.instance_id)?;
+            let block_entries = self
+                .storage
+                .consume_pinned_blocks(&request.instance_id, instance.namespace(), &block_hashes)
+                .map_err(EngineError::Storage)?;
+            let plan = PreparedLoadPlan::from_cache_blocks(&instance, &block_entries)?;
+            let remaining_loads = instance.registered_shards().len().max(1);
+            Ok::<_, EngineError>((plan, remaining_loads))
+        };
+        let (plan, remaining_loads) = match &trace {
+            Some(trace) => {
+                trace
+                    .in_span("prepare.cache_build_plan", build_plan)
+                    .await?
+            }
+            None => build_plan.await?,
+        };
         Ok(self.insert_prepared_load(
             self.new_prepared_load_id(),
             num_tokens,
@@ -557,27 +575,50 @@ impl PegaEngine {
             .min(request.block_hashes.len());
         let staged_hashes = request.block_hashes[hash_start..hash_end].to_vec();
 
-        let prepare = self.prepare_staging_receive(PdReceivePrepareRequest {
+        RequestTrace::add_optional_property(&trace, "prepare_source", "pd_staged");
+        RequestTrace::add_optional_property(&trace, "external_blocks", num_blocks.to_string());
+        let pd_prepare = PdReceivePrepareRequest {
             instance_id: request.instance_id.clone(),
             request_id: decode_req_id.to_string(),
             block_hashes: staged_hashes,
             num_blocks,
             expected_imm_count: request.decode_expected_writes,
             expire_after: None,
-        })?;
+        };
+        let prepare_receive = async { self.prepare_staging_receive(pd_prepare) };
+        let prepare = match &trace {
+            Some(trace) => {
+                trace
+                    .in_span("prepare.pd_prepare_receive", prepare_receive)
+                    .await?
+            }
+            None => prepare_receive.await?,
+        };
 
-        let load_plans = match self
-            .pd_receive
-            .checkout_ready(&request.instance_id, decode_req_id, prepare.handle.as_str())
-            .await?
-        {
+        let checkout = self.pd_receive.checkout_ready(
+            &request.instance_id,
+            decode_req_id,
+            prepare.handle.as_str(),
+        );
+        let checkout_status = match &trace {
+            Some(trace) => trace.in_span("prepare.pd_wait_ready", checkout).await?,
+            None => checkout.await?,
+        };
+        let load_plans = match checkout_status {
             PdReceiveCheckoutStatus::Expired => return Ok(PrepareLoadOutcome::NoPlan),
             PdReceiveCheckoutStatus::Ready(load_plans) => load_plans,
         };
 
-        let plan = PreparedLoadPlan::from_staged_load_plans(&load_plans, num_blocks)?;
-        let instance = self.get_instance(&request.instance_id)?;
-        let remaining_loads = instance.registered_shards().len().max(1);
+        let build_plan = async {
+            let plan = PreparedLoadPlan::from_staged_load_plans(&load_plans, num_blocks)?;
+            let instance = self.get_instance(&request.instance_id)?;
+            let remaining_loads = instance.registered_shards().len().max(1);
+            Ok::<_, EngineError>((plan, remaining_loads))
+        };
+        let (plan, remaining_loads) = match &trace {
+            Some(trace) => trace.in_span("prepare.pd_build_plan", build_plan).await?,
+            None => build_plan.await?,
+        };
         Ok(self.insert_prepared_load(
             self.new_prepared_load_id(),
             num_external_tokens,
@@ -947,6 +988,7 @@ impl PegaEngine {
             batch_blocks,
             layer_count,
             item_count,
+            device_id,
             std::time::Instant::now(),
         );
 

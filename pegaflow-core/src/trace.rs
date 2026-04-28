@@ -46,8 +46,6 @@ pub struct RequestTrace {
     #[cfg(feature = "tracing")]
     root: Arc<Mutex<Span>>,
     #[cfg(feature = "tracing")]
-    request_id: Arc<str>,
-    #[cfg(feature = "tracing")]
     load_plan_id: Option<u64>,
     #[cfg(feature = "tracing")]
     load_request_blocks: Option<usize>,
@@ -82,7 +80,6 @@ impl RequestTrace {
             };
             Self {
                 root: Arc::new(Mutex::new(root)),
-                request_id: Arc::from(request_id),
                 load_plan_id: None,
                 load_request_blocks: None,
                 load_submitted_at: None,
@@ -160,12 +157,19 @@ impl RequestTrace {
         batch_blocks: usize,
         layer_count: usize,
         item_count: usize,
+        device_id: i32,
         submitted_at: std::time::Instant,
     ) -> Vec<Self> {
         traces
             .into_iter()
             .map(|trace| {
-                trace.begin_load_wait_done(batch_blocks, layer_count, item_count, submitted_at)
+                trace.begin_load_wait_done(
+                    batch_blocks,
+                    layer_count,
+                    item_count,
+                    device_id,
+                    submitted_at,
+                )
             })
             .collect()
     }
@@ -227,21 +231,21 @@ impl RequestTrace {
         batch_blocks: usize,
         layer_count: usize,
         item_count: usize,
+        device_id: i32,
         submitted_at: std::time::Instant,
     ) -> Self {
         #[cfg(feature = "tracing")]
         {
-            let request_id = self.request_id.to_string();
             let plan_id = self.load_plan_id.unwrap_or(0);
             let request_blocks = self.load_request_blocks.unwrap_or(0);
             let span = self.child_span("load.wait_done").with_properties(|| {
                 [
-                    ("request_id", request_id),
                     ("plan_id", plan_id.to_string()),
                     ("request_blocks", request_blocks.to_string()),
                     ("batch_blocks", batch_blocks.to_string()),
                     ("layers", layer_count.to_string()),
                     ("batch_items", item_count.to_string()),
+                    ("device_id", device_id.to_string()),
                 ]
             });
             Self {
@@ -253,7 +257,13 @@ impl RequestTrace {
 
         #[cfg(not(feature = "tracing"))]
         {
-            let _ = (batch_blocks, layer_count, item_count, submitted_at);
+            let _ = (
+                batch_blocks,
+                layer_count,
+                item_count,
+                device_id,
+                submitted_at,
+            );
             self
         }
     }
