@@ -56,7 +56,7 @@ is not shown here.
 ```mermaid
 sequenceDiagram
     autonumber
-    participant R as Router / proxy
+    participant R as Router
     participant P as P vLLM worker
     participant D as D vLLM worker
     participant DE as D PegaFlow server

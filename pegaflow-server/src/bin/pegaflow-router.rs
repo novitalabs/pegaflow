@@ -27,6 +27,8 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio_stream::StreamExt;
 
+const PREFILL_MAX_TOKENS: u64 = 1;
+
 #[derive(Clone)]
 struct RouterState {
     prefill_clients: Arc<Vec<Client>>,
@@ -38,7 +40,6 @@ struct RouterState {
     pd_push: bool,
     d_pegaflow_addrs: Arc<Vec<String>>,
     decode_instance_ids: Arc<Vec<String>>,
-    prefill_max_tokens: u64,
     // Track in-flight requests per node
     p_inflight: Arc<Vec<AtomicUsize>>,
     d_inflight: Arc<Vec<AtomicUsize>>,
@@ -51,7 +52,6 @@ impl RouterState {
         d_pegaflow_addrs: Vec<String>,
         decode_instance_ids: Vec<String>,
         pd_push: bool,
-        prefill_max_tokens: u64,
     ) -> Self {
         let prefill_clients = prefill_endpoints
             .iter()
@@ -90,7 +90,6 @@ impl RouterState {
             pd_push,
             d_pegaflow_addrs: Arc::new(d_pegaflow_addrs),
             decode_instance_ids: Arc::new(decode_instance_ids),
-            prefill_max_tokens,
             p_inflight: Arc::new(p_inflight),
             d_inflight: Arc::new(d_inflight),
         }
@@ -276,7 +275,7 @@ async fn handle_completion(
     // Prepare P request (short generation, non-streaming). It runs concurrently
     // with the D request; D waits in get_num_new_matched_tokens() until IMM.
     let mut p_body = body.clone();
-    p_body["max_tokens"] = json!(state.prefill_max_tokens);
+    p_body["max_tokens"] = json!(PREFILL_MAX_TOKENS);
     p_body["stream"] = json!(false);
     p_body["request_id"] = json!(req_id.clone());
     if state.pd_push {
@@ -296,7 +295,7 @@ async fn handle_completion(
 
     // Ensure min_tokens <= max_tokens to avoid 400 from P node
     if let Some(min_tokens) = p_body.get("min_tokens").and_then(|v| v.as_i64()) {
-        p_body["min_tokens"] = json!(min_tokens.min(state.prefill_max_tokens as i64));
+        p_body["min_tokens"] = json!(min_tokens.min(PREFILL_MAX_TOKENS as i64));
     } else {
         p_body["min_tokens"] = json!(0);
     }
@@ -484,10 +483,6 @@ struct Args {
     /// D-side PegaFlow/vLLM instance IDs, aligned with --decode.
     #[arg(long, num_args = 1..)]
     decode_instance: Vec<String>,
-
-    /// P request max_tokens used to force prefill and trigger source-side save.
-    #[arg(long, default_value_t = 1)]
-    prefill_max_tokens: u64,
 }
 
 #[tokio::main]
@@ -518,7 +513,6 @@ async fn main() {
         args.decode_pegaflow.clone(),
         args.decode_instance.clone(),
         args.pd_push,
-        args.prefill_max_tokens,
     );
 
     let app = Router::new()
@@ -531,8 +525,8 @@ async fn main() {
     info!("Prefill nodes: {:?}", args.prefill);
     info!("Decode nodes: {:?}", args.decode);
     info!(
-        "P/D push: enabled={} decode_pegaflow={:?} decode_instance={:?} prefill_max_tokens={}",
-        args.pd_push, args.decode_pegaflow, args.decode_instance, args.prefill_max_tokens
+        "P/D push: enabled={} decode_pegaflow={:?} decode_instance={:?}",
+        args.pd_push, args.decode_pegaflow, args.decode_instance
     );
 
     let listener = TcpListener::bind(&addr).await.unwrap();
