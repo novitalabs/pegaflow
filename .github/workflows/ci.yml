@@ -200,7 +200,7 @@ jobs:
           fi
 
   build-wheel:
-    name: build Python wheel (${{ matrix.cuda-variant }})
+    name: build Python 3.14 wheel (${{ matrix.cuda-variant }})
     runs-on: ubuntu-22.04
     strategy:
       matrix:
@@ -217,10 +217,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Python 3.12
+      - name: Set up Python 3.14
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.14'
 
       - name: Free up disk space
         run: |
