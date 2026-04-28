@@ -15,6 +15,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.distributed.parallel_state import get_pp_group, get_tensor_model_parallel_rank
 
+from pegaflow import PegaClient
 from pegaflow.connector.common import (
     ConnectorContext,
     PegaConnectorMetadata,
@@ -28,7 +29,6 @@ from pegaflow.connector.common import (
 from pegaflow.connector.scheduler import SchedulerConnector
 from pegaflow.connector.state_manager import ServiceStateManager
 from pegaflow.connector.worker import WorkerConnector
-from pegaflow.pegaflow import EngineRpcClient
 
 
 class PegaKVConnector(KVConnectorBase_V1):
@@ -59,6 +59,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             )
 
         cross_layer_blocks = os.environ.get("PEGAFLOW_CROSS_LAYER_BLOCKS", "1") == "1"
+        pp_size: int = getattr(vllm_config.parallel_config, "pipeline_parallel_size", 1) or 1
         namespace = derive_namespace(
             vllm_config,
             effective_tp_size,
@@ -73,7 +74,6 @@ class PegaKVConnector(KVConnectorBase_V1):
         device_id: int | None = None
         dcp_rank: int = 0
         pp_rank: int = 0
-        pp_size: int = getattr(vllm_config.parallel_config, "pipeline_parallel_size", 1) or 1
         if role == KVConnectorRole.WORKER:
             tp_rank = get_tensor_model_parallel_rank()
             pp_group = get_pp_group()
@@ -87,6 +87,13 @@ class PegaKVConnector(KVConnectorBase_V1):
             if torch.cuda.is_available():
                 device_id = _resolve_device_id()
 
+        layer_names = _resolve_registered_layer_names(
+            kv_cache_config,
+            cross_layer_blocks=cross_layer_blocks,
+            pp_rank=pp_rank,
+            pp_size=pp_size,
+        )
+
         assert vllm_config.kv_transfer_config is not None
         server_host = os.environ.get(
             "PEGAFLOW_HOST"
@@ -97,21 +104,22 @@ class PegaKVConnector(KVConnectorBase_V1):
             "PEGAFLOW_PORT"
         ) or vllm_config.kv_transfer_config.get_from_extra_config("pegaflow.port", 50055)
         self._engine_endpoint = f"{server_host}:{server_port}"
-        engine_client = EngineRpcClient(self._engine_endpoint)
+        client = PegaClient(self._engine_endpoint)
         logger.debug("[PegaKVConnector] Connected to engine server at %s", self._engine_endpoint)
 
-        self._state_manager = ServiceStateManager(engine_client)
+        self._state_manager = ServiceStateManager(client)
 
         self._ctx = ConnectorContext(
             instance_id=instance_id,
             namespace=namespace,
+            layer_names=layer_names,
             block_size=block_size,
             num_layers=num_layers,
             tp_size=tp_size,
             world_size=world_size,
             tp_rank=tp_rank,
             device_id=device_id,
-            engine_client=engine_client,
+            client=client,
             state_manager=self._state_manager,
             is_mla=is_mla,
             dcp_world_size=dcp_world_size,
@@ -129,7 +137,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             # stream per vllm replica is enough — if any tp worker crashes,
             # the scheduler dies too, closing this stream and triggering
             # server-side cleanup of the instance's CUDA IPC mappings.
-            engine_client.start_session_watcher(instance_id, namespace, tp_size, world_size)
+            client._start_session_watcher(instance_id, namespace, tp_size, world_size)
         else:
             self._worker = WorkerConnector(self._ctx)
 
@@ -203,11 +211,7 @@ class PegaKVConnector(KVConnectorBase_V1):
     def handle_preemptions(self, preempted) -> None:
         if not self._worker:
             return
-        # Compat: old vLLM passes set[str], new vLLM passes KVConnectorMetadata
-        if isinstance(preempted, set):
-            preempted_req_ids = preempted
-        else:
-            preempted_req_ids = getattr(preempted, "preempted_req_ids", None) or set()
+        preempted_req_ids = getattr(preempted, "preempted_req_ids", preempted) or set()
         self._worker.handle_preemptions(preempted_req_ids)
 
     # ==============================
@@ -339,6 +343,31 @@ def _resolve_device_id() -> int:
         return int(mapped)
     except ValueError:
         return local_id
+
+
+def _resolve_registered_layer_names(
+    kv_cache_config,
+    *,
+    cross_layer_blocks: bool,
+    pp_rank: int,
+    pp_size: int,
+) -> tuple[str, ...]:
+    override = os.environ.get("PEGAFLOW_PD_LAYER_NAMES")
+    if override:
+        return tuple(name.strip() for name in override.split(",") if name.strip())
+
+    if cross_layer_blocks:
+        if pp_size > 1:
+            return (f"ALL_LAYERS_pp{pp_rank}",)
+        return ("ALL_LAYERS",)
+
+    if kv_cache_config is None:
+        return ()
+
+    names: list[str] = []
+    for group in getattr(kv_cache_config, "kv_cache_groups", []) or []:
+        names.extend(getattr(group, "layer_names", []) or [])
+    return tuple(names)
 
 
 __all__ = ["PegaKVConnector", "KVConnectorRole"]

@@ -2220,6 +2220,7 @@ dependencies = [
  "pegaflow-metaserver",
  "pegaflow-proto",
  "pegaflow-server",
+ "pegaflow-transfer",
  "pyo3",
  "tokio",
  "tonic",

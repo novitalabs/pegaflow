@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
+use std::time::Duration;
 
 use mea::oneshot;
 use std::thread;
@@ -11,7 +12,8 @@ use pegaflow_common::NumaNode;
 use sideway::ibverbs::AccessFlags;
 use sideway::ibverbs::address::{AddressHandleAttribute, Gid};
 use sideway::ibverbs::completion::{
-    GenericCompletionQueue, PollCompletionQueueError, WorkCompletionStatus,
+    GenericCompletionQueue, PollCompletionQueueError, WorkCompletionOperationType,
+    WorkCompletionStatus,
 };
 use sideway::ibverbs::device_context::LinkLayer;
 use sideway::ibverbs::memory_region::MemoryRegion;
@@ -21,16 +23,15 @@ use sideway::ibverbs::queue_pair::{
 };
 
 use super::runtime::RcRuntime;
-use crate::engine::{RcEndpoint, TransferOp};
+use crate::engine::{ImmCompletion, RcEndpoint, TransferOp};
 use crate::error::{Result, TransferError};
 
 const MAX_WR_CHAIN_OPS: usize = 4;
 const MAX_SEND_WR: u32 = 128;
 // One QP per CQ; all WRs are signaled, so CQ depth = SQ depth suffices.
 const SEND_CQ_SIZE: u32 = MAX_SEND_WR;
-// Recv queue unused (one-sided RDMA only), keep minimal for driver compatibility.
-const RECV_CQ_SIZE: u32 = 2;
-const MAX_RECV_WR: u32 = 1;
+const MAX_RECV_WR: u32 = 128;
+const RECV_CQ_SIZE: u32 = MAX_RECV_WR;
 const MAX_RD_ATOMIC: u8 = 16;
 const PSN_MASK: u32 = 0x00ff_ffff;
 
@@ -48,19 +49,32 @@ enum SessionCommand {
         op: TransferOp,
         done_tx: oneshot::Sender<Result<usize>>,
     },
+    WriteImm {
+        remote_ptr: u64,
+        remote_rkey: u32,
+        imm_data: u32,
+        done_tx: oneshot::Sender<Result<usize>>,
+    },
 }
 
 pub(crate) struct RcSession {
     qp: Mutex<GenericQueuePair>,
     send_cq: GenericCompletionQueue,
-    _recv_cq: GenericCompletionQueue,
+    recv_cq: GenericCompletionQueue,
     pub(crate) local_endpoint: RcEndpoint,
+    nic_idx: usize,
+    imm_tx: mea::mpsc::UnboundedSender<ImmCompletion>,
     cmd_tx: std_mpsc::Sender<SessionCommand>,
 }
 
 impl RcSession {
     /// Create an RC QP in INIT state and return the session (not yet connected).
-    pub(crate) fn create(runtime: &RcRuntime, psn_seed: u64) -> Result<Arc<Self>> {
+    pub(crate) fn create(
+        runtime: &RcRuntime,
+        psn_seed: u64,
+        nic_idx: usize,
+        imm_tx: mea::mpsc::UnboundedSender<ImmCompletion>,
+    ) -> Result<Arc<Self>> {
         let mut cq_builder = runtime.device_ctx.create_cq_builder();
         cq_builder.setup_cqe(SEND_CQ_SIZE);
         let send_cq: GenericCompletionQueue = cq_builder
@@ -110,12 +124,15 @@ impl RcSession {
         let session = Arc::new(Self {
             qp: Mutex::new(qp),
             send_cq,
-            _recv_cq: recv_cq,
+            recv_cq,
             local_endpoint,
+            nic_idx,
+            imm_tx,
             cmd_tx,
         });
 
         Self::spawn_worker(Arc::clone(&session), cmd_rx, runtime.numa_node)?;
+        Self::spawn_recv_poller(Arc::clone(&session), runtime.numa_node)?;
         Ok(session)
     }
 
@@ -182,6 +199,9 @@ impl RcSession {
             .setup_max_read_atomic(MAX_RD_ATOMIC);
         qp.modify(&rts_attr)
             .map_err(|error| TransferError::Backend(error.to_string()))?;
+        drop(qp);
+
+        self.post_recv_wrs(MAX_RECV_WR)?;
         debug!(
             "rc connect ready: link_layer={:?}, local_qpn={}, remote_qpn={}, remote_lid={}",
             runtime.link_layer, self.local_endpoint.qp_num, remote.qp_num, remote.lid
@@ -198,6 +218,26 @@ impl RcSession {
         let (done_tx, done_rx) = oneshot::channel();
         self.cmd_tx
             .send(SessionCommand::Transfer { ops, op, done_tx })
+            .map_err(|_| {
+                TransferError::Backend("session worker channel disconnected".to_string())
+            })?;
+        Ok(done_rx)
+    }
+
+    pub(crate) fn write_imm_async(
+        &self,
+        remote_ptr: u64,
+        remote_rkey: u32,
+        imm_data: u32,
+    ) -> Result<oneshot::Receiver<Result<usize>>> {
+        let (done_tx, done_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SessionCommand::WriteImm {
+                remote_ptr,
+                remote_rkey,
+                imm_data,
+                done_tx,
+            })
             .map_err(|_| {
                 TransferError::Backend("session worker channel disconnected".to_string())
             })?;
@@ -232,6 +272,25 @@ impl RcSession {
                                 );
                             }
                         }
+                        SessionCommand::WriteImm {
+                            remote_ptr,
+                            remote_rkey,
+                            imm_data,
+                            done_tx,
+                        } => {
+                            let result = Self::execute_write_imm(
+                                &session,
+                                remote_ptr,
+                                remote_rkey,
+                                imm_data,
+                            );
+                            if done_tx.send(result).is_err() {
+                                debug!(
+                                    "session worker write_imm receiver dropped: local_qpn={}",
+                                    session.local_endpoint.qp_num
+                                );
+                            }
+                        }
                     }
                 }
                 debug!(
@@ -241,6 +300,101 @@ impl RcSession {
             })
             .map_err(|e| TransferError::Backend(format!("failed to spawn session worker: {e}")))?;
         Ok(())
+    }
+
+    fn spawn_recv_poller(session: Arc<Self>, numa_node: NumaNode) -> Result<()> {
+        thread::Builder::new()
+            .name("pegaflow-rc-recv".to_string())
+            .spawn(move || {
+                if numa_node.is_valid()
+                    && let Err(e) = pegaflow_common::pin_thread_to_numa_node(numa_node)
+                {
+                    warn!("Failed to pin rc recv poller to {}: {}", numa_node, e);
+                }
+                debug!(
+                    "recv poller started: local_qpn={}, numa={}",
+                    session.local_endpoint.qp_num, numa_node
+                );
+                loop {
+                    match session.recv_cq.start_poll() {
+                        Ok(mut poller) => {
+                            let mut did_work = false;
+                            for wc in &mut poller {
+                                did_work = true;
+                                if wc.status() != WorkCompletionStatus::Success as u32 {
+                                    warn!(
+                                        "recv completion failed: local_qpn={}, status={}, opcode={}, vendor_err={}",
+                                        session.local_endpoint.qp_num,
+                                        wc.status(),
+                                        wc.opcode(),
+                                        wc.vendor_err()
+                                    );
+                                    continue;
+                                }
+
+                                if wc.opcode()
+                                    == WorkCompletionOperationType::ReceiveWithImmediate as u32
+                                {
+                                    let completion = ImmCompletion {
+                                        nic_idx: session.nic_idx,
+                                        local_qpn: session.local_endpoint.qp_num,
+                                        imm_data: wc.imm_data(),
+                                    };
+                                    if let Err(error) = session.imm_tx.send(completion) {
+                                        warn!(
+                                            "failed to publish imm completion: local_qpn={}, imm_data={}, error={}",
+                                            session.local_endpoint.qp_num,
+                                            error.as_inner().imm_data,
+                                            error
+                                        );
+                                    }
+                                    if let Err(error) = session.post_recv_wrs(1) {
+                                        warn!(
+                                            "failed to repost imm recv: local_qpn={}, error={}",
+                                            session.local_endpoint.qp_num, error
+                                        );
+                                    }
+                                } else {
+                                    warn!(
+                                        "unexpected recv completion opcode: local_qpn={}, opcode={}",
+                                        session.local_endpoint.qp_num,
+                                        wc.opcode()
+                                    );
+                                }
+                            }
+                            if !did_work {
+                                thread::sleep(Duration::from_micros(50));
+                            }
+                        }
+                        Err(PollCompletionQueueError::CompletionQueueEmpty) => {
+                            thread::sleep(Duration::from_micros(50));
+                        }
+                        Err(error) => {
+                            warn!(
+                                "poll recv CQ failed: local_qpn={}, error={}",
+                                session.local_endpoint.qp_num, error
+                            );
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                }
+            })
+            .map_err(|e| TransferError::Backend(format!("failed to spawn recv poller: {e}")))?;
+        Ok(())
+    }
+
+    fn post_recv_wrs(&self, count: u32) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        let mut qp = self.qp.lock();
+        let mut guard = qp.start_post_recv();
+        for idx in 0..count {
+            guard.construct_wr(idx as u64);
+        }
+        guard
+            .post()
+            .map_err(|e| TransferError::Backend(e.to_string()))
     }
 
     fn post_rdma_wr_chain(
@@ -279,6 +433,21 @@ impl RcSession {
             .post()
             .map_err(|e| TransferError::Backend(e.to_string()))?;
         Ok(ops.len())
+    }
+
+    fn post_write_imm_wr(
+        qp: &mut GenericQueuePair,
+        remote_ptr: u64,
+        remote_rkey: u32,
+        imm_data: u32,
+        wr_id: u64,
+    ) -> Result<()> {
+        let mut guard = qp.start_post_send();
+        let wr = guard.construct_wr(wr_id, WorkRequestFlags::Signaled);
+        wr.setup_write_imm(remote_rkey, remote_ptr, imm_data);
+        guard
+            .post()
+            .map_err(|e| TransferError::Backend(e.to_string()))
     }
 
     fn execute_batch(session: &Self, ops: Vec<RdmaOp>, op: TransferOp) -> Result<usize> {
@@ -351,5 +520,54 @@ impl RcSession {
         }
 
         Ok(transferred)
+    }
+
+    fn execute_write_imm(
+        session: &Self,
+        remote_ptr: u64,
+        remote_rkey: u32,
+        imm_data: u32,
+    ) -> Result<usize> {
+        let wr_id = 1_u64;
+        {
+            let mut qp = session.qp.lock();
+            Self::post_write_imm_wr(&mut qp, remote_ptr, remote_rkey, imm_data, wr_id)?;
+        }
+
+        loop {
+            match session.send_cq.start_poll() {
+                Ok(mut poller) => {
+                    let mut did_work = false;
+                    for wc in &mut poller {
+                        did_work = true;
+                        if wc.wr_id() != wr_id {
+                            continue;
+                        }
+                        if wc.status() != WorkCompletionStatus::Success as u32 {
+                            return Err(TransferError::Backend(format!(
+                                "write_imm send completion failed: local_qpn={}, status={}, opcode={}, vendor_err={}",
+                                session.local_endpoint.qp_num,
+                                wc.status(),
+                                wc.opcode(),
+                                wc.vendor_err()
+                            )));
+                        }
+                        return Ok(0);
+                    }
+                    if !did_work {
+                        std::hint::spin_loop();
+                    }
+                }
+                Err(PollCompletionQueueError::CompletionQueueEmpty) => {
+                    std::hint::spin_loop();
+                }
+                Err(error) => {
+                    return Err(TransferError::Backend(format!(
+                        "poll send CQ failed for write_imm: local_qpn={}, {error}",
+                        session.local_endpoint.qp_num
+                    )));
+                }
+            }
+        }
     }
 }

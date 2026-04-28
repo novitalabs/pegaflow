@@ -38,7 +38,7 @@ async fn eviction_reclaims_old_blocks_for_new() {
     env.data().assert_gpu_matches_expected();
 }
 
-/// Pinned blocks survive memory pressure: query_prefetch pins prevent LRU eviction.
+/// Pinned blocks survive memory pressure: prepare-load pins prevent LRU eviction.
 #[tokio::test]
 async fn pinned_blocks_survive_eviction_pressure() {
     let env = TestEnvBuilder::new("inst-pin", "ns-pin")

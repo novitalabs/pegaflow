@@ -14,7 +14,7 @@ use crate::backing::{
     AllocateFn, DEFAULT_MAX_PREFETCH_BLOCKS, RdmaFetchStore, RdmaTransport, SsdBackingStore,
     SsdCacheConfig,
 };
-use crate::block::{BlockKey, PrefetchStatus, SealedBlock};
+use crate::block::{BlockKey, SealedBlock};
 use crate::internode::MetaServerClient;
 use crate::internode::metaserver_client::MetaServerClientConfig;
 use crate::metrics::core_metrics;
@@ -354,17 +354,17 @@ impl StorageEngine {
             .unpin_blocks(instance_id, namespace, block_hashes)
     }
 
-    /// Check prefix blocks and schedule backing-store reads if needed.
-    pub(crate) async fn check_prefix_and_prefetch(
+    /// Resolve prefix blocks, awaiting backing-store reads if needed.
+    pub(crate) async fn load_prefix_with_prefetch(
         &self,
         instance_id: &str,
         req_id: &str,
         namespace: &str,
         hashes: &[Vec<u8>],
         num_workers: usize,
-    ) -> PrefetchStatus {
+    ) -> usize {
         self.prefetch
-            .check_and_prefetch(
+            .load_prefix(
                 &self.read_cache,
                 instance_id,
                 req_id,

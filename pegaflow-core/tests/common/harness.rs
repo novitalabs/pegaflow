@@ -313,8 +313,8 @@ impl TestEnv {
         self.engine.flush_saves().await;
     }
 
-    /// Query prefix hits. Returns raw PrefetchStatus. Leaves blocks pinned on hit.
-    pub async fn query(&self, hashes: &[Vec<u8>]) -> PrefetchStatus {
+    /// Query prefix hits. Leaves blocks pinned on hit.
+    pub async fn query(&self, hashes: &[Vec<u8>]) -> usize {
         self.engine
             .count_prefix_hit_blocks_with_prefetch(&self.instance_id, "test", hashes)
             .await
@@ -323,13 +323,8 @@ impl TestEnv {
 
     /// Query, assert all hit, leave pinned (scheduler step before load).
     pub async fn assert_all_hit_and_pin(&self, hashes: &[Vec<u8>]) {
-        match self.query(hashes).await {
-            PrefetchStatus::Done { hit, missing } => {
-                assert_eq!(hit, hashes.len(), "expected all blocks hit");
-                assert_eq!(missing, 0);
-            }
-            other => panic!("expected Done, got {:?}", other),
-        }
+        let hit_blocks = self.query(hashes).await;
+        assert_eq!(hit_blocks, hashes.len(), "expected all blocks hit");
     }
 
     pub fn unpin(&self, hashes: &[Vec<u8>]) {
@@ -342,14 +337,11 @@ impl TestEnv {
 
     /// Count cache hits, then unpin (for probing without consuming).
     pub async fn count_hits_then_unpin(&self, hashes: &[Vec<u8>]) -> usize {
-        let hit = match self.query(hashes).await {
-            PrefetchStatus::Done { hit, .. } => hit,
-            PrefetchStatus::Loading { hit, .. } => hit,
-        };
-        if hit > 0 {
-            self.unpin(&hashes[..hit]);
+        let hit_blocks = self.query(hashes).await;
+        if hit_blocks > 0 {
+            self.unpin(&hashes[..hit_blocks]);
         }
-        hit
+        hit_blocks
     }
 
     /// Load blocks from cache to GPU (pin must already be held).

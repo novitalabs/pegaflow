@@ -5,6 +5,7 @@ use log::{debug, error, info, warn};
 use logforth::diagnostic::ThreadLocalDiagnostic;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::RequestTrace;
 use crate::block::RawBlock;
 use crate::metrics::core_metrics;
 use crate::sync_state::LoadState;
@@ -15,6 +16,7 @@ use pegaflow_common::{NumaNode, pin_thread_to_numa_node};
 pub(crate) struct LoadTask {
     pub layers: Vec<LayerLoadData>,
     pub load_state_shm: String,
+    pub traces: Vec<RequestTrace>,
 }
 
 /// Data for loading a single layer
@@ -26,8 +28,12 @@ pub(crate) struct LayerLoadData {
 
 pub(crate) struct LoadBlock {
     pub block_idx: usize,
-    pub block: Arc<RawBlock>,
+    pub source: Arc<RawBlock>,
 }
+
+// SAFETY: LoadBlock holds Arc<RawBlock>, whose pinned memory lifetime is owned
+// by its segments.
+unsafe impl Send for LoadBlock {}
 
 /// A task to save KV blocks from GPU to CPU for multiple layers.
 /// Caller pre-allocates pinned memory, worker does the GPU->CPU copy.
@@ -195,6 +201,7 @@ fn load_worker_loop(
             Ok(load_state) => match result {
                 Ok(()) => load_state.set_completed(),
                 Err(ref e) => {
+                    RequestTrace::record_load_error_all(&task.traces);
                     error!("Load task failed: device={} error={:?}", device_id, e);
                     core_metrics().load_failures.add(1, &[]);
                     load_state.set_error();
@@ -242,8 +249,10 @@ fn save_worker_loop(
 
 /// Process a load task: copy blocks from CPU pinned memory to GPU for multiple layers
 fn process_load_task(task: &LoadTask, stream: &CudaStream) -> Result<(), EngineError> {
-    trace_root!("gpu.load_task", _root);
+    #[cfg(feature = "tracing")]
+    let _standalone_root = RequestTrace::standalone_load_root_if_empty(&task.traces);
     let start = std::time::Instant::now();
+    RequestTrace::record_load_queue_wait_all(&task.traces);
     let mut total_bytes = 0usize;
     let mut memcpy_calls = 0usize;
     // Use the first layer's block count as the physical block count (all layers have the same)
@@ -272,11 +281,11 @@ fn process_load_task(task: &LoadTask, stream: &CudaStream) -> Result<(), EngineE
                 let v_gpu_offset = transfer::segment_offset(registration, block.block_idx, 1)
                     .map_err(EngineError::Storage)?;
 
-                let k_cpu_ptr = block.block.segment_ptr(0).unwrap().as_ptr() as *const u8;
+                let k_cpu_ptr = block.source.segment_ptr(0).unwrap().as_ptr() as *const u8;
                 // SAFETY: For contiguous layout (segment 1 absent), the allocation is
                 // 2 * segment_size bytes, so k_cpu_ptr + segment_size is within bounds.
                 let v_cpu_ptr = block
-                    .block
+                    .source
                     .segment_ptr(1)
                     .map(|p| p.as_ptr() as *const u8)
                     .unwrap_or_else(|| unsafe { k_cpu_ptr.add(segment_size) });
@@ -321,7 +330,7 @@ fn process_load_task(task: &LoadTask, stream: &CudaStream) -> Result<(), EngineE
             for block in &layer_data.blocks {
                 let gpu_offset = transfer::segment_offset(registration, block.block_idx, 0)
                     .map_err(EngineError::Storage)?;
-                let cpu_ptr = block.block.segment_ptr(0).unwrap().as_ptr() as *const u8;
+                let cpu_ptr = block.source.segment_ptr(0).unwrap().as_ptr() as *const u8;
                 transfers.push((gpu_offset, cpu_ptr));
             }
 
@@ -360,7 +369,9 @@ fn process_load_task(task: &LoadTask, stream: &CudaStream) -> Result<(), EngineE
             .record(elapsed.as_secs_f64(), &[]);
     }
 
-    info!(
+    RequestTrace::record_load_success_all(&task.traces, elapsed, total_bytes, memcpy_calls);
+
+    debug!(
         "Load task completed: layers={} blocks={} bytes={} elapsed_ms={:.2} bandwidth_gbps={:.2} memcpy_calls={}",
         task.layers.len(),
         total_blocks,

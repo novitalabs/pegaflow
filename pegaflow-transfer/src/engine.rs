@@ -27,6 +27,16 @@ pub struct TransferDesc {
     pub len: usize,
 }
 
+/// Receiver-side RDMA WRITE-with-immediate completion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImmCompletion {
+    pub nic_idx: usize,
+    pub local_qpn: u32,
+    pub imm_data: u32,
+}
+
+pub type ImmCompletionReceiver = mea::mpsc::UnboundedReceiver<ImmCompletion>;
+
 /// RC queue pair endpoint info exchanged during handshake.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RcEndpoint {
@@ -49,6 +59,7 @@ pub(crate) struct RegisteredMemoryRegion {
 pub(crate) struct NicHandshake {
     pub(crate) endpoint: RcEndpoint,
     pub(crate) memory_regions: Vec<RegisteredMemoryRegion>,
+    pub(crate) signal_region: RegisteredMemoryRegion,
 }
 
 /// Opaque handshake metadata exchanged between peers via gRPC.
@@ -165,6 +176,11 @@ impl TransferEngine {
         self.backend.invalidate_connection(remote_addr);
     }
 
+    /// Return the runtime NIC index closest to a CUDA GPU, if topology is known.
+    pub fn preferred_nic_index_for_gpu(&self, device_id: u32) -> Option<usize> {
+        self.backend.preferred_nic_index_for_gpu(device_id)
+    }
+
     /// Submit a batch of RDMA READ or WRITE operations against a connected peer.
     ///
     /// Ops are NUMA-aware distributed across NICs. Returns one receiver per
@@ -181,9 +197,55 @@ impl TransferEngine {
         self.backend.batch_transfer_async(op, remote_addr, descs)
     }
 
+    /// Submit a batch and keep the NIC index attached to each completion.
+    pub fn batch_transfer_async_with_nic(
+        &self,
+        op: TransferOp,
+        remote_addr: &str,
+        descs: &[TransferDesc],
+    ) -> Result<Vec<(usize, mea::oneshot::Receiver<Result<usize>>)>> {
+        self.backend
+            .batch_transfer_async_with_nic(op, remote_addr, descs)
+    }
+
+    /// Submit a batch on one explicit runtime NIC index.
+    pub fn batch_transfer_async_on_nic(
+        &self,
+        op: TransferOp,
+        remote_addr: &str,
+        descs: &[TransferDesc],
+        nic_idx: usize,
+    ) -> Result<mea::oneshot::Receiver<Result<usize>>> {
+        self.backend
+            .batch_transfer_async_on_nic(op, remote_addr, descs, nic_idx)
+    }
+
+    /// Submit a final RDMA WRITE-with-immediate signal against every QP for a
+    /// connected peer. Returns send-side completions.
+    pub fn write_imm_async(
+        &self,
+        remote_addr: &str,
+        imm_data: u32,
+    ) -> Result<Vec<mea::oneshot::Receiver<Result<usize>>>> {
+        self.backend.write_imm_async(remote_addr, imm_data)
+    }
+
+    /// Take the single receiver for RDMA WRITE-with-immediate completions.
+    ///
+    /// The transfer layer does not interpret immediate data. Higher layers own
+    /// demuxing `imm_data` into leases, fan-in counters, and request lifecycle.
+    pub fn take_imm_receiver(&self) -> Option<ImmCompletionReceiver> {
+        self.backend.take_imm_receiver()
+    }
+
     /// Number of active RC queue pairs across all NICs.
     pub fn num_qps(&self) -> usize {
         self.backend.num_qps()
+    }
+
+    /// Number of local RDMA NICs configured for this endpoint.
+    pub fn nic_count(&self) -> usize {
+        self.backend.nic_count()
     }
 }
 
@@ -206,6 +268,11 @@ mod tests {
                     len: 0x2000,
                     rkey: 42,
                 }],
+                signal_region: RegisteredMemoryRegion {
+                    base_ptr: 0x3000,
+                    len: 8,
+                    rkey: 43,
+                },
             }],
         };
         let bytes = meta.to_bytes();
@@ -231,6 +298,11 @@ mod tests {
                         len: 0x2000,
                         rkey: 10,
                     }],
+                    signal_region: RegisteredMemoryRegion {
+                        base_ptr: 0x3000,
+                        len: 8,
+                        rkey: 11,
+                    },
                 },
                 NicHandshake {
                     endpoint: RcEndpoint {
@@ -244,6 +316,11 @@ mod tests {
                         len: 0x2000,
                         rkey: 20,
                     }],
+                    signal_region: RegisteredMemoryRegion {
+                        base_ptr: 0x4000,
+                        len: 8,
+                        rkey: 21,
+                    },
                 },
             ],
         };

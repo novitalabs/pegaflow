@@ -10,9 +10,9 @@ from typing import TYPE_CHECKING
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 
+from pegaflow import LoadPlan, PegaClient
 from pegaflow.connector.connector_metrics import PegaKVConnectorStats, PegaPromMetrics
 from pegaflow.logging_utils import get_connector_logger
-from pegaflow.pegaflow import EngineRpcClient
 
 if TYPE_CHECKING:
     from pegaflow.connector.state_manager import ServiceStateManager
@@ -26,13 +26,14 @@ class ConnectorContext:
 
     instance_id: str
     namespace: str
+    layer_names: tuple[str, ...]
     block_size: int
     num_layers: int
     tp_size: int
     world_size: int
     tp_rank: int | None
     device_id: int | None
-    engine_client: EngineRpcClient
+    client: PegaClient
     state_manager: "ServiceStateManager"
     is_mla: bool = False
     dcp_world_size: int = 1
@@ -81,8 +82,12 @@ class LoadIntent:
     """Intent for a KV load operation."""
 
     block_ids: tuple[int, ...]
-    block_hashes: tuple[bytes, ...]
+    plan: LoadPlan
     num_tokens: int
+
+    def __post_init__(self) -> None:
+        if not self.block_ids:
+            raise ValueError("load intent must include at least one block_id")
 
 
 @dataclass(frozen=True)
@@ -93,6 +98,18 @@ class SaveIntent:
     block_hashes: tuple[bytes, ...]
 
 
+@dataclass(frozen=True)
+class KvEgressIntent:
+    """Intent for outbound KV transfer from local GPU KV to remote staging."""
+
+    request_id: str
+    remote_endpoint: str
+    remote_instance_id: str
+    block_ids: tuple[int, ...]
+    block_hashes: tuple[bytes, ...]
+    handle: str | None = None
+
+
 class PegaConnectorMetadata(KVConnectorMetadata):
     """Metadata passed from scheduler to worker for KV cache operations."""
 
@@ -100,17 +117,21 @@ class PegaConnectorMetadata(KVConnectorMetadata):
         self,
         load_intents: dict[str, LoadIntent] | None = None,
         save_intents: dict[str, SaveIntent] | None = None,
+        egress_intents: dict[str, KvEgressIntent] | None = None,
         preempted_req_ids: set[str] | None = None,
     ):
         super().__init__()
         # Maps request_id -> intent
         self.load_intents: dict[str, LoadIntent] = load_intents or {}
         self.save_intents: dict[str, SaveIntent] = save_intents or {}
+        self.egress_intents: dict[str, KvEgressIntent] = egress_intents or {}
         self.preempted_req_ids: set[str] = preempted_req_ids or set()
 
     def __repr__(self) -> str:
         return (
-            f"PegaConnectorMetadata(loads={len(self.load_intents)}, saves={len(self.save_intents)})"
+            "PegaConnectorMetadata("
+            f"loads={len(self.load_intents)}, saves={len(self.save_intents)}, "
+            f"egress={len(self.egress_intents)})"
         )
 
 
@@ -140,12 +161,17 @@ def parse_env_int(name: str, default: int) -> int:
 
 def resolve_instance_id(vllm_config, dp_rank_suffix: bool = True) -> str:
     """Resolve or generate connector instance_id with optional DP rank suffix."""
+    instance_id = os.environ.get("PEGAFLOW_INSTANCE_ID", "")
+    if instance_id:
+        logger.debug("[PegaKVConnector] Using PEGAFLOW_INSTANCE_ID: %s", instance_id)
+        return instance_id
+
     instance_id = vllm_config.kv_transfer_config.engine_id
     if instance_id:
         logger.debug("[PegaKVConnector] Using kv_transfer_config.engine_id: %s", instance_id)
         return instance_id
 
-    instance_id = vllm_config.instance_id or os.environ.get("PEGAFLOW_INSTANCE_ID", "")
+    instance_id = vllm_config.instance_id
     if not instance_id:
         instance_id = uuid.uuid4().hex
         logger.debug(
@@ -212,6 +238,7 @@ def detect_mla(vllm_config) -> bool:
 
 __all__ = [
     "ConnectorContext",
+    "KvEgressIntent",
     "LoadIntent",
     "PegaConnectorMetadata",
     "PegaKVConnectorStats",

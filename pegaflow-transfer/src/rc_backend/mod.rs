@@ -13,13 +13,17 @@ use sideway::ibverbs::AccessFlags;
 
 use self::runtime::RcRuntime;
 use self::session::{RcSession, RdmaOp};
-use self::state::{AddrConnection, RcBackendState, RegisteredMemoryEntry};
+use self::state::{AddrConnection, RcBackendState, RegisteredMemoryEntry, SignalMemoryEntry};
 use std::ptr::NonNull;
 
 use mea::oneshot;
 
-use crate::engine::{NicHandshake, RegisteredMemoryRegion, TransferDesc, TransferOp};
+use crate::engine::{
+    ImmCompletion, ImmCompletionReceiver, NicHandshake, RegisteredMemoryRegion, TransferDesc,
+    TransferOp,
+};
 use crate::error::{Result, TransferError};
+use crate::rdma_topo::SystemTopology;
 use pegaflow_common::NumaNode;
 
 struct NicGroup {
@@ -101,9 +105,14 @@ pub(crate) enum GetOrPrepareResult {
 pub(crate) struct RcBackend {
     runtimes: Vec<Arc<RcRuntime>>,
     state: Arc<Mutex<RcBackendState>>,
+    imm_tx: mea::mpsc::UnboundedSender<ImmCompletion>,
+    imm_rx: Mutex<Option<ImmCompletionReceiver>>,
+    signal_regions: Vec<SignalMemoryEntry>,
     psn_counter: AtomicU64,
     numa_rr: NumaRoundRobin,
 }
+
+const SIGNAL_REGION_LEN: usize = 8;
 
 impl RcBackend {
     pub(crate) fn new(nic_names: &[String]) -> Result<Self> {
@@ -119,17 +128,41 @@ impl RcBackend {
             let runtime = RcRuntime::open(name)?;
             runtimes.push(runtime);
         }
+        let mut signal_regions = Vec::with_capacity(runtimes.len());
+        for runtime in &runtimes {
+            let mut storage = vec![0_u8; SIGNAL_REGION_LEN].into_boxed_slice();
+            let ptr = storage.as_mut_ptr() as u64;
+            let mr = unsafe {
+                runtime.pd.reg_mr(
+                    ptr as usize,
+                    SIGNAL_REGION_LEN,
+                    AccessFlags::LocalWrite | AccessFlags::RemoteWrite,
+                )
+            }
+            .map_err(|error| TransferError::Backend(error.to_string()))?;
+            signal_regions.push(SignalMemoryEntry {
+                base_ptr: ptr,
+                len: SIGNAL_REGION_LEN,
+                mr,
+                _storage: storage,
+            });
+        }
+
         let nic_count = runtimes.len();
         let numa_rr = NumaRoundRobin::from_runtimes(&runtimes);
+        let (imm_tx, imm_rx) = mea::mpsc::unbounded();
         Ok(Self {
             runtimes,
             state: Arc::new(Mutex::new(RcBackendState::new(nic_count))),
+            imm_tx,
+            imm_rx: Mutex::new(Some(imm_rx)),
+            signal_regions,
             psn_counter: AtomicU64::new(1),
             numa_rr,
         })
     }
 
-    fn nic_count(&self) -> usize {
+    pub(crate) fn nic_count(&self) -> usize {
         self.runtimes.len()
     }
 
@@ -210,14 +243,15 @@ impl RcBackend {
 
         // Create all QPs before locking state.
         let mut sessions = Vec::with_capacity(self.nic_count());
-        for runtime in &self.runtimes {
+        for (nic_idx, runtime) in self.runtimes.iter().enumerate() {
             let psn_seed = self.psn_counter.fetch_add(1, Ordering::Relaxed);
-            let session = RcSession::create(runtime, psn_seed).map_err(|e| {
-                TransferError::Backend(format!(
-                    "QP creation failed on nic={}: {e}",
-                    runtime.nic_name
-                ))
-            })?;
+            let session = RcSession::create(runtime, psn_seed, nic_idx, self.imm_tx.clone())
+                .map_err(|e| {
+                    TransferError::Backend(format!(
+                        "QP creation failed on nic={}: {e}",
+                        runtime.nic_name
+                    ))
+                })?;
             sessions.push(session);
         }
 
@@ -228,6 +262,7 @@ impl RcBackend {
             nic_handshakes.push(NicHandshake {
                 endpoint,
                 memory_regions: snapshots[nic_idx].clone(),
+                signal_region: self.signal_regions[nic_idx].region(),
             });
         }
 
@@ -322,6 +357,7 @@ impl RcBackend {
             AddrConnection {
                 remote_qpns,
                 local_nics,
+                remote_signal_regions: remote_nics.iter().map(|nic| nic.signal_region).collect(),
             },
         );
         Ok(())
@@ -362,6 +398,23 @@ impl RcBackend {
         self.state.lock().num_qps()
     }
 
+    pub(crate) fn nic_names(&self) -> Vec<String> {
+        self.runtimes
+            .iter()
+            .map(|runtime| runtime.nic_name.clone())
+            .collect()
+    }
+
+    pub(crate) fn preferred_nic_index_for_gpu(&self, device_id: u32) -> Option<usize> {
+        let names = self.nic_names();
+        let nic = SystemTopology::detect().closest_allowed_nic_for_gpu(device_id, &names)?;
+        names.iter().position(|name| name == &nic)
+    }
+
+    pub(crate) fn take_imm_receiver(&self) -> Option<ImmCompletionReceiver> {
+        self.imm_rx.lock().take()
+    }
+
     /// One receiver per NIC that had work; each yields bytes transferred on that NIC.
     pub(crate) fn batch_transfer_async(
         &self,
@@ -369,6 +422,16 @@ impl RcBackend {
         remote_addr: &str,
         descs: &[TransferDesc],
     ) -> Result<Vec<oneshot::Receiver<Result<usize>>>> {
+        self.batch_transfer_async_with_nic(op, remote_addr, descs)
+            .map(|items| items.into_iter().map(|(_, rx)| rx).collect())
+    }
+
+    pub(crate) fn batch_transfer_async_with_nic(
+        &self,
+        op: TransferOp,
+        remote_addr: &str,
+        descs: &[TransferDesc],
+    ) -> Result<Vec<(usize, oneshot::Receiver<Result<usize>>)>> {
         if descs.is_empty() {
             return Ok(Vec::new());
         }
@@ -398,7 +461,7 @@ impl RcBackend {
 
         // --- Lock: look up connection + prepare ops ---
         let lookup_start = Instant::now();
-        let mut nic_work: Vec<(Arc<RcSession>, Vec<RdmaOp>)> = Vec::new();
+        let mut nic_work: Vec<(usize, Arc<RcSession>, Vec<RdmaOp>)> = Vec::new();
         {
             let state = self.state.lock();
 
@@ -453,7 +516,7 @@ impl RcBackend {
                         remote_rkey,
                     });
                 }
-                nic_work.push((session, prepared));
+                nic_work.push((nic_idx, session, prepared));
             }
         }
         let lookup_dur = lookup_start.elapsed();
@@ -469,8 +532,111 @@ impl RcBackend {
 
         // --- Submit outside lock ---
         let mut receivers = Vec::with_capacity(nic_work.len());
-        for (session, prepared) in nic_work {
-            receivers.push(session.transfer_batch_async(prepared, op)?);
+        for (nic_idx, session, prepared) in nic_work {
+            receivers.push((nic_idx, session.transfer_batch_async(prepared, op)?));
+        }
+        Ok(receivers)
+    }
+
+    pub(crate) fn batch_transfer_async_on_nic(
+        &self,
+        op: TransferOp,
+        remote_addr: &str,
+        descs: &[TransferDesc],
+        nic_idx: usize,
+    ) -> Result<oneshot::Receiver<Result<usize>>> {
+        if descs.is_empty() {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(Ok(0));
+            return Ok(rx);
+        }
+        if nic_idx >= self.nic_count() {
+            return Err(TransferError::InvalidArgument("nic_idx out of range"));
+        }
+
+        let (session, prepared) = {
+            let state = self.state.lock();
+            let conn = state
+                .addr_connections
+                .get(remote_addr)
+                .ok_or(TransferError::Backend(format!(
+                    "no connection for remote addr {remote_addr}"
+                )))?;
+            let remote_qpn = conn.remote_qpns[nic_idx];
+            let session = Arc::clone(
+                state.nics[nic_idx]
+                    .sessions
+                    .get(&remote_qpn)
+                    .expect("session must exist for established connection"),
+            );
+
+            let mut prepared = Vec::with_capacity(descs.len());
+            for desc in descs {
+                let local_ptr = desc.local_ptr.as_ptr() as u64;
+                let remote_ptr = desc.remote_ptr.as_ptr() as u64;
+                let len = desc.len;
+                if len == 0 {
+                    return Err(TransferError::InvalidArgument("len must be non-zero"));
+                }
+                let local_mr = state
+                    .find_local_mr(nic_idx, local_ptr, len)
+                    .ok_or(TransferError::MemoryNotRegistered { ptr: local_ptr })?;
+                let remote_rkey = state.nics[nic_idx]
+                    .find_remote_rkey(remote_qpn, remote_ptr, len)
+                    .ok_or(TransferError::InvalidArgument(
+                        "remote memory not found in handshake snapshot",
+                    ))?;
+                prepared.push(RdmaOp {
+                    local_mr,
+                    local_ptr,
+                    remote_ptr,
+                    len,
+                    remote_rkey,
+                });
+            }
+            (session, prepared)
+        };
+
+        session.transfer_batch_async(prepared, op)
+    }
+
+    /// One receiver per NIC/QP; each yields 0 bytes after the send-side signal completes.
+    pub(crate) fn write_imm_async(
+        &self,
+        remote_addr: &str,
+        imm_data: u32,
+    ) -> Result<Vec<oneshot::Receiver<Result<usize>>>> {
+        let nic_work: Vec<(Arc<RcSession>, RegisteredMemoryRegion)> = {
+            let state = self.state.lock();
+            let conn = state
+                .addr_connections
+                .get(remote_addr)
+                .ok_or(TransferError::Backend(format!(
+                    "no connection for remote addr {remote_addr}"
+                )))?;
+
+            conn.remote_qpns
+                .iter()
+                .enumerate()
+                .map(|(nic_idx, &remote_qpn)| {
+                    let session = Arc::clone(
+                        state.nics[nic_idx]
+                            .sessions
+                            .get(&remote_qpn)
+                            .expect("session must exist for established connection"),
+                    );
+                    (session, conn.remote_signal_regions[nic_idx])
+                })
+                .collect()
+        };
+
+        let mut receivers = Vec::with_capacity(nic_work.len());
+        for (session, signal_region) in nic_work {
+            receivers.push(session.write_imm_async(
+                signal_region.base_ptr,
+                signal_region.rkey,
+                imm_data,
+            )?);
         }
         Ok(receivers)
     }

@@ -31,38 +31,12 @@ pip install pegaflow
 
 ## Usage
 
-### Basic KV Storage
+### PegaClient
 
 ```python
-from pegaflow import PegaEngine
+from pegaflow import PegaClient
 
-# Create a new engine
-engine = PegaEngine()
-
-# Store key-value pairs
-engine.put("name", "PegaFlow")
-engine.put("version", "0.1.0")
-
-# Retrieve values
-name = engine.get("name")  # Returns "PegaFlow"
-missing = engine.get("nonexistent")  # Returns None
-
-# Remove keys
-removed = engine.remove("name")  # Returns "PegaFlow"
-```
-
-#### Sglang Examples:
-
-example 1:
-
-```bash
-python3 -m sglang.launch_server --model-path Qwen/Qwen3-0.6B --served-model-name Qwen/Qwen3-0.6B --trust-remote-code --enable-cache-report --page-size 256 --host "0.0.0.0" --port 8000 --mem-fraction-static 0.8 --max-running-requests 32 --enable-pegaflow
-```
-
-example 2:
-
-```bash
-python3 -m sglang.launch_server --model-loader-extra-config "{\"enable_multithread_load\": true, \"num_threads\": 64}"  --model-path deepseek-ai/DeepSeek-V3.2 --served-model-name deepseek-ai/DeepSeek-V3.2 --trust-remote-code --page-size "64" --reasoning-parser deepseek-v3 --tool-call-parser deepseekv32 --enable-cache-report --host "0.0.0.0" --port 8031 --mem-fraction-static 0.83 --max-running-requests 64 --tp-size "8" --enable-pegaflow
+client = PegaClient("http://127.0.0.1:50051")
 ```
 
 ### vLLM KV Connector

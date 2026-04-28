@@ -3,19 +3,25 @@ use pegaflow_core::{trace_in_span, trace_root};
 use crate::metric::record_rpc_result;
 use crate::proto::engine::engine_server::Engine;
 use crate::proto::engine::{
-    HealthRequest, HealthResponse, LoadRequest, LoadResponse, PrefetchState,
-    QueryBlocksForTransferRequest, QueryBlocksForTransferResponse, QueryRequest, QueryResponse,
-    RdmaHandshakeRequest, RdmaHandshakeResponse, RegisterContextRequest, RegisterContextResponse,
-    ReleaseTransferLockRequest, ReleaseTransferLockResponse, ResponseStatus, SaveRequest,
-    SaveResponse, SessionEvent, SessionRequest, ShutdownRequest, ShutdownResponse,
-    TransferBlockInfo, TransferSlotInfo, UnpinRequest, UnpinResponse, UnregisterRequest,
-    UnregisterResponse,
+    GetPdReceiveDescriptorRequest, GetPdReceiveDescriptorResponse, HealthRequest, HealthResponse,
+    LoadRequest, LoadResponse, PdReceiveDescriptorState,
+    PdReceiveLayerLayout as ProtoPdReceiveLayerLayout, PdReceiveRank, PdReceiveSlab,
+    PrepareLoadRequest, PrepareLoadResponse, QueryBlocksForTransferRequest,
+    QueryBlocksForTransferResponse, RdmaHandshakeRequest, RdmaHandshakeResponse,
+    RegisterContextRequest, RegisterContextResponse, ReleaseTransferLockRequest,
+    ReleaseTransferLockResponse, ResponseStatus, SaveRequest, SaveResponse, SessionEvent,
+    SessionRequest, ShutdownRequest, ShutdownResponse, TransferBlockInfo, TransferSlotInfo,
+    UnpinRequest, UnpinResponse, UnregisterRequest, UnregisterResponse,
 };
 use crate::registry::CudaTensorRegistry;
 use crate::session::SessionRegistry;
 use log::{debug, info, warn};
 use parking_lot::Mutex;
-use pegaflow_core::{EngineError, LayerSave, PegaEngine, PrefetchStatus};
+use pegaflow_core::{
+    EngineError, LayerSave, PdReceiveDescriptorLookup, PegaEngine, PrepareLoadOutcome,
+    PrepareLoadRequest as CorePrepareLoadRequest, PrepareLoadState,
+    PreparedLoadItem as CorePreparedLoadItem, RequestTrace,
+};
 use pyo3::{PyErr, Python};
 use std::sync::Arc;
 use std::time::Instant;
@@ -117,6 +123,11 @@ impl GrpcEngineService {
         })
     }
 
+    fn u32_from_usize(value: usize, field: &str) -> Result<u32, Status> {
+        u32::try_from(value)
+            .map_err(|_| Status::internal(format!("{field}={value} does not fit into u32")))
+    }
+
     fn build_register_context_response() -> RegisterContextResponse {
         RegisterContextResponse {
             status: Some(Self::ok_status()),
@@ -127,13 +138,35 @@ impl GrpcEngineService {
         Self::ok_status()
     }
 
-    fn validate_load_request(block_ids: &[i32], block_hashes: &[Vec<u8>]) -> Result<(), Status> {
-        if block_ids.len() != block_hashes.len() {
-            return Err(Status::invalid_argument(format!(
-                "block_ids and block_hashes must have the same length (got {} and {})",
-                block_ids.len(),
-                block_hashes.len()
-            )));
+    fn validate_prepared_load_items(items: &[CorePreparedLoadItem]) -> Result<(), Status> {
+        for (index, item) in items.iter().enumerate() {
+            if item.plan_id == 0 {
+                return Err(Status::invalid_argument(format!(
+                    "items[{index}].plan_id must be non-zero"
+                )));
+            }
+            if item.block_ids.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "items[{index}].block_ids must not be empty"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_prepare_load_request(request: &PrepareLoadRequest) -> Result<(), Status> {
+        if request.prepare_state_shm.is_empty() {
+            return Err(Status::invalid_argument(
+                "prepare_state_shm must not be empty",
+            ));
+        }
+        if request.virtual_block_size == 0 {
+            return Err(Status::invalid_argument(
+                "virtual_block_size must be greater than zero",
+            ));
+        }
+        if request.request_id.is_empty() {
+            return Err(Status::invalid_argument("request_id must not be empty"));
         }
         Ok(())
     }
@@ -372,13 +405,14 @@ impl Engine for GrpcEngineService {
 
         let req = request.into_inner();
         let layer_count = req.layer_names.len();
-        let block_count = req.block_ids.len();
-        let hash_count = req.block_hashes.len();
+        let item_count = req.items.len();
+        let block_count: usize = req.items.iter().map(|item| item.block_ids.len()).sum();
 
         trace_root!("rpc.load", root, || {
             [
                 ("instance_id", req.instance_id.clone()),
                 ("layers", layer_count.to_string()),
+                ("items", item_count.to_string()),
                 ("blocks", block_count.to_string()),
             ]
         });
@@ -388,35 +422,40 @@ impl Engine for GrpcEngineService {
                 instance_id,
                 tp_rank,
                 device_id,
-                layer_names,
-                block_ids,
-                block_hashes,
                 load_state_shm,
+                layer_names,
+                items,
                 ..
             } = req;
             let tp_rank = Self::usize_from_u32(tp_rank, "tp_rank")?;
+            let items: Vec<CorePreparedLoadItem> = items
+                .into_iter()
+                .map(|item| CorePreparedLoadItem {
+                    plan_id: item.plan_id,
+                    block_ids: item.block_ids,
+                })
+                .collect();
+            Self::validate_prepared_load_items(&items)?;
             debug!(
-                "RPC [load]: instance_id={} tp_rank={} device_id={} layers={} block_ids={} block_hashes={} load_state_shm_len={}",
+                "RPC [load]: instance_id={} tp_rank={} device_id={} layers={} items={} blocks={} load_state_shm_len={}",
                 instance_id,
                 tp_rank,
                 device_id,
                 layer_count,
+                item_count,
                 block_count,
-                hash_count,
                 load_state_shm.len()
             );
-            Self::validate_load_request(&block_ids, &block_hashes)?;
             let layer_refs: Vec<&str> = layer_names.iter().map(|s| s.as_str()).collect();
 
             self.engine
-                .batch_load_kv_blocks_multi_layer(
+                .load_prepared_kv_blocks_multi_layer(
                     &instance_id,
                     tp_rank,
                     device_id,
                     &load_state_shm,
                     &layer_refs,
-                    &block_ids,
-                    &block_hashes,
+                    &items,
                 )
                 .map_err(Self::map_engine_error)?;
 
@@ -430,8 +469,8 @@ impl Engine for GrpcEngineService {
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         match &result {
             Ok(_) => debug!(
-                "RPC [load] completed: ok layers={} blocks={} elapsed_ms={:.2}",
-                layer_count, block_count, elapsed_ms
+                "RPC [load] completed: ok layers={} items={} blocks={} elapsed_ms={:.2}",
+                layer_count, item_count, block_count, elapsed_ms
             ),
             Err(status) => warn!(
                 "RPC [load] failed: code={} message={} elapsed_ms={:.2}",
@@ -444,83 +483,114 @@ impl Engine for GrpcEngineService {
         result
     }
 
-    async fn query_prefetch(
+    async fn prepare_load(
         &self,
-        request: Request<QueryRequest>,
-    ) -> Result<Response<QueryResponse>, Status> {
+        request: Request<PrepareLoadRequest>,
+    ) -> Result<Response<PrepareLoadResponse>, Status> {
         let req = request.into_inner();
-        trace_root!("rpc.query_prefetch", root, || {
-            [
-                ("instance_id", req.instance_id.clone()),
-                ("block_hashes", req.block_hashes.len().to_string()),
-            ]
-        });
+        let lifecycle_trace = RequestTrace::load_lifecycle(
+            &req.instance_id,
+            &req.request_id,
+            req.block_hashes.len(),
+            req.num_prompt_tokens,
+            req.num_computed_tokens,
+        );
 
         let start = Instant::now();
+        let engine = Arc::clone(&self.engine);
+        let hll_tracker = Arc::clone(&self.hll_tracker);
+        let prepare_task_trace = lifecycle_trace.clone();
         let fut = async {
+            Self::validate_prepare_load_request(&req)?;
+            let state = PrepareLoadState::attach(&req.prepare_state_shm)
+                .map_err(|err| Status::invalid_argument(format!("invalid prepare shm: {err}")))?;
+            let core_request = CorePrepareLoadRequest {
+                instance_id: req.instance_id,
+                request_id: req.request_id,
+                block_hashes: req.block_hashes,
+                num_prompt_tokens: req.num_prompt_tokens,
+                num_computed_tokens: req.num_computed_tokens,
+                virtual_block_size: req.virtual_block_size,
+                decode_request_id: if req.decode_request_id.is_empty() {
+                    None
+                } else {
+                    Some(req.decode_request_id)
+                },
+                decode_expected_writes: Self::usize_from_u32(
+                    req.decode_expected_writes,
+                    "decode_expected_writes",
+                )?,
+            };
             debug!(
-                "RPC [query_prefetch]: instance_id={} block_hashes={}",
-                req.instance_id,
-                req.block_hashes.len()
+                "RPC [prepare_load]: instance_id={} request_id={} hashes={} computed={} prompt={} vbs={} decode={} shm_len={}",
+                core_request.instance_id,
+                core_request.request_id,
+                core_request.block_hashes.len(),
+                core_request.num_computed_tokens,
+                core_request.num_prompt_tokens,
+                core_request.virtual_block_size,
+                core_request.decode_request_id.as_deref().unwrap_or(""),
+                req.prepare_state_shm.len()
             );
 
-            // SSD prefetch-aware query
-            let status = self
-                .engine
-                .count_prefix_hit_blocks_with_prefetch(
-                    &req.instance_id,
-                    &req.req_id,
-                    &req.block_hashes,
-                )
-                .await
-                .map_err(Self::map_engine_error)?;
-
-            let (prefetch_state, hit_blocks, loading_blocks, missing_blocks) = match status {
-                PrefetchStatus::Done { hit, missing } => {
-                    if let Ok(mut t) = self.hll_tracker.lock() {
-                        t.record_hashes(&req.block_hashes);
+            tokio::spawn(async move {
+                match prepare_task_trace
+                    .in_span(
+                        "prepare_load",
+                        engine.prepare_load_with_trace(
+                            &core_request,
+                            Some(prepare_task_trace.clone()),
+                        ),
+                    )
+                    .await
+                {
+                    Ok(PrepareLoadOutcome::NoPlan) => {
+                        prepare_task_trace.add_property("result", "no_plan");
+                        if let Ok(mut tracker) = hll_tracker.lock() {
+                            tracker.record_hashes(&core_request.block_hashes);
+                        }
+                        state.set_ready_no_plan();
                     }
-                    (PrefetchState::PrefetchDone, hit as u64, 0, missing as u64)
+                    Ok(PrepareLoadOutcome::Plan {
+                        plan_id,
+                        num_tokens,
+                    }) => {
+                        if let Ok(mut tracker) = hll_tracker.lock() {
+                            tracker.record_hashes(&core_request.block_hashes);
+                        }
+                        state.set_ready_plan(num_tokens, plan_id);
+                    }
+                    Err(err) => {
+                        prepare_task_trace.add_property("result", "error");
+                        warn!(
+                            "prepare_load task failed: instance={} request={} error={}",
+                            core_request.instance_id, core_request.request_id, err
+                        );
+                        state.set_error();
+                    }
                 }
-                PrefetchStatus::Loading { hit, loading } => (
-                    PrefetchState::PrefetchLoading,
-                    hit as u64,
-                    loading as u64,
-                    0,
-                ),
-            };
+            });
 
-            Ok(Response::new(QueryResponse {
+            Ok(Response::new(PrepareLoadResponse {
                 status: Some(Self::build_simple_response()),
-                hit_blocks,
-                prefetch_state: prefetch_state.into(),
-                loading_blocks,
-                missing_blocks,
             }))
         };
 
-        let result: Result<Response<QueryResponse>, Status> = trace_in_span!(root, fut).await;
+        let result: Result<Response<PrepareLoadResponse>, Status> = lifecycle_trace
+            .in_span("prepare_load.rpc_accept", fut)
+            .await;
 
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         match &result {
-            Ok(response) => {
-                let resp = response.get_ref();
-                let state = PrefetchState::try_from(resp.prefetch_state)
-                    .map(|s| format!("{:?}", s))
-                    .unwrap_or_else(|_| format!("Unknown({})", resp.prefetch_state));
-                debug!(
-                    "RPC [query_prefetch] completed: ok hit={} loading={} missing={} state={} elapsed_ms={:.2}",
-                    resp.hit_blocks, resp.loading_blocks, resp.missing_blocks, state, elapsed_ms
-                );
-            }
+            Ok(_) => debug!("RPC [prepare_load] accepted: elapsed_ms={:.2}", elapsed_ms),
             Err(status) => warn!(
-                "RPC [query_prefetch] failed: code={} message={} elapsed_ms={:.2}",
+                "RPC [prepare_load] failed: code={} message={} elapsed_ms={:.2}",
                 status.code(),
                 status.message(),
                 elapsed_ms
             ),
         }
-        record_rpc_result("query_prefetch", &result, start);
+        record_rpc_result("prepare_load", &result, start);
         result
     }
 
@@ -709,6 +779,153 @@ impl Engine for GrpcEngineService {
         result
     }
 
+    async fn get_pd_receive_descriptor(
+        &self,
+        request: Request<GetPdReceiveDescriptorRequest>,
+    ) -> Result<Response<GetPdReceiveDescriptorResponse>, Status> {
+        let start = Instant::now();
+        let req = request.into_inner();
+
+        debug!(
+            "RPC [get_pd_receive_descriptor]: dst_instance_id={} request_id={} receive_rank={} handle={}",
+            req.dst_instance_id, req.request_id, req.receive_rank, req.handle
+        );
+
+        let result: Result<Response<GetPdReceiveDescriptorResponse>, Status> = async {
+            if req.dst_instance_id.is_empty() {
+                return Err(Status::invalid_argument(
+                    "dst_instance_id must not be empty",
+                ));
+            }
+            if req.request_id.is_empty() {
+                return Err(Status::invalid_argument("request_id must not be empty"));
+            }
+            let receive_rank = if req.receive_rank < 0 {
+                None
+            } else {
+                Some(usize::try_from(req.receive_rank).map_err(|_| {
+                    Status::invalid_argument("receive_rank does not fit into usize")
+                })?)
+            };
+
+            let lookup = self.engine.get_pd_receive_descriptor(
+                &req.dst_instance_id,
+                &req.request_id,
+                receive_rank,
+                Some(req.handle.as_str()),
+            );
+
+            let mut response = GetPdReceiveDescriptorResponse {
+                status: Some(Self::build_simple_response()),
+                state: PdReceiveDescriptorState::PdDescriptorPending.into(),
+                handle: String::new(),
+                slabs: Vec::new(),
+                layers: Vec::new(),
+                block_hashes: Vec::new(),
+                imm_data: 0,
+                expires_at_ms: 0,
+                data_ready: false,
+                ranks: Vec::new(),
+            };
+
+            match lookup {
+                PdReceiveDescriptorLookup::Pending => {}
+                PdReceiveDescriptorLookup::Failed => {
+                    response.state = PdReceiveDescriptorState::PdDescriptorFailed.into();
+                }
+                PdReceiveDescriptorLookup::Expired => {
+                    response.state = PdReceiveDescriptorState::PdDescriptorExpired.into();
+                }
+                PdReceiveDescriptorLookup::Ready(descriptor) => {
+                    response.state = PdReceiveDescriptorState::PdDescriptorReady.into();
+                    response.handle = descriptor.handle;
+                    response.imm_data = descriptor.imm_data;
+                    response.expires_at_ms = descriptor.expires_at_ms;
+                    response.data_ready = descriptor.data_ready;
+                    response.block_hashes = descriptor.block_hashes;
+                    response.ranks = descriptor
+                        .ranks
+                        .into_iter()
+                        .map(|rank| {
+                            Ok(PdReceiveRank {
+                                receive_rank: Self::u32_from_usize(
+                                    rank.receive_rank,
+                                    "receive_rank",
+                                )?,
+                                device_id: rank.device_id,
+                                tp_rank: Self::u32_from_usize(rank.tp_rank, "tp_rank")?,
+                                slab_index: Self::u32_from_usize(rank.slab_index, "slab_index")?,
+                                numa_node: rank.numa_node.0,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, Status>>()?;
+                    response.slabs = descriptor
+                        .slabs
+                        .into_iter()
+                        .map(|slab| PdReceiveSlab {
+                            base_ptr: slab.base_ptr,
+                            size: slab.size,
+                            numa_node: slab.numa_node.0,
+                        })
+                        .collect();
+                    response.layers = descriptor
+                        .layers
+                        .into_iter()
+                        .map(|layer| {
+                            Ok(ProtoPdReceiveLayerLayout {
+                                layer_name: layer.layer_name,
+                                slab_index: Self::u32_from_usize(layer.slab_index, "slab_index")?,
+                                layer_offset: layer.layer_offset,
+                                block_stride: layer.block_stride,
+                                segment_count: Self::u32_from_usize(
+                                    layer.segment_count,
+                                    "segment_count",
+                                )?,
+                                segment_size: layer.segment_size,
+                                padded_segment_stride: layer.padded_segment_stride,
+                                num_blocks: layer.num_blocks as u64,
+                                slot_id: Self::u32_from_usize(layer.slot_id, "slot_id")?,
+                                receive_rank: Self::u32_from_usize(
+                                    layer.receive_rank,
+                                    "receive_rank",
+                                )?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, Status>>()?;
+                }
+            }
+
+            Ok(Response::new(response))
+        }
+        .await;
+
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        match &result {
+            Ok(response) => {
+                let resp = response.get_ref();
+                let state = PdReceiveDescriptorState::try_from(resp.state)
+                    .map(|s| format!("{:?}", s))
+                    .unwrap_or_else(|_| format!("Unknown({})", resp.state));
+                debug!(
+                    "RPC [get_pd_receive_descriptor] completed: ok state={} ranks={} slabs={} layers={} elapsed_ms={:.2}",
+                    state,
+                    resp.ranks.len(),
+                    resp.slabs.len(),
+                    resp.layers.len(),
+                    elapsed_ms
+                );
+            }
+            Err(status) => warn!(
+                "RPC [get_pd_receive_descriptor] failed: code={} message={} elapsed_ms={:.2}",
+                status.code(),
+                status.message(),
+                elapsed_ms
+            ),
+        }
+        record_rpc_result("get_pd_receive_descriptor", &result, start);
+        result
+    }
+
     async fn rdma_handshake(
         &self,
         request: Request<RdmaHandshakeRequest>,
@@ -874,12 +1091,63 @@ mod tests {
     use super::*;
     use tonic::Code;
 
+    fn valid_prepare_load_request() -> PrepareLoadRequest {
+        PrepareLoadRequest {
+            instance_id: "instance".to_string(),
+            request_id: "request".to_string(),
+            block_hashes: Vec::new(),
+            num_prompt_tokens: 0,
+            num_computed_tokens: 0,
+            virtual_block_size: 16,
+            prepare_state_shm: "prepare-state".to_string(),
+            decode_request_id: String::new(),
+            decode_expected_writes: 0,
+        }
+    }
+
     #[tokio::test]
-    async fn load_rejects_mismatched_block_ids_and_hashes() {
-        let status = GrpcEngineService::validate_load_request(&[1, 2], &[vec![1]])
-            .expect_err("mismatched load request should fail");
+    async fn load_rejects_zero_plan_id() {
+        let status = GrpcEngineService::validate_prepared_load_items(&[CorePreparedLoadItem {
+            plan_id: 0,
+            block_ids: vec![1],
+        }])
+        .expect_err("zero plan_id should fail");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(status.message().contains("plan_id"));
+    }
+
+    #[tokio::test]
+    async fn load_rejects_empty_prepared_block_ids() {
+        let status = GrpcEngineService::validate_prepared_load_items(&[CorePreparedLoadItem {
+            plan_id: 1,
+            block_ids: vec![],
+        }])
+        .expect_err("empty prepared block_ids should fail");
         assert_eq!(status.code(), Code::InvalidArgument);
         assert!(status.message().contains("block_ids"));
-        assert!(status.message().contains("block_hashes"));
+    }
+
+    #[tokio::test]
+    async fn prepare_load_rejects_zero_virtual_block_size() {
+        let mut request = valid_prepare_load_request();
+        request.virtual_block_size = 0;
+
+        let status = GrpcEngineService::validate_prepare_load_request(&request)
+            .expect_err("zero virtual_block_size should fail");
+
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(status.message().contains("virtual_block_size"));
+    }
+
+    #[tokio::test]
+    async fn prepare_load_rejects_empty_request_id() {
+        let mut request = valid_prepare_load_request();
+        request.request_id.clear();
+
+        let status = GrpcEngineService::validate_prepare_load_request(&request)
+            .expect_err("empty request_id should fail");
+
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(status.message().contains("request_id"));
     }
 }

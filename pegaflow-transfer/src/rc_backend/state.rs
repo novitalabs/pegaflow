@@ -14,6 +14,23 @@ pub(super) struct RegisteredMemoryEntry {
     pub(super) mrs: Vec<Arc<MemoryRegion>>,
 }
 
+pub(super) struct SignalMemoryEntry {
+    pub(super) base_ptr: u64,
+    pub(super) len: usize,
+    pub(super) mr: Arc<MemoryRegion>,
+    pub(super) _storage: Box<[u8]>,
+}
+
+impl SignalMemoryEntry {
+    pub(super) fn region(&self) -> RegisteredMemoryRegion {
+        RegisteredMemoryRegion {
+            base_ptr: self.base_ptr,
+            len: self.len as u64,
+            rkey: self.mr.rkey(),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct RemoteMemoryEntry {
     base_ptr: u64,
@@ -110,6 +127,7 @@ impl PerNicState {
 pub(super) struct AddrConnection {
     pub(super) remote_qpns: Vec<u32>,
     pub(super) local_nics: Vec<NicHandshake>,
+    pub(super) remote_signal_regions: Vec<RegisteredMemoryRegion>,
 }
 
 pub(super) struct RcBackendState {

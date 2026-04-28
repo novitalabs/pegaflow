@@ -1,8 +1,15 @@
-use pegaflow_core::LoadState;
+use pegaflow_core::{
+    LoadState, PREPARE_LOAD_STATE_NO_PLAN, PREPARE_LOAD_STATE_PENDING, PREPARE_LOAD_STATE_PLAN,
+    PrepareLoadState,
+};
 use pegaflow_proto::proto::engine::{
-    HealthRequest, LoadRequest, QueryRequest, RegisterContextRequest, ResponseStatus, SaveLayer,
-    SaveRequest, SessionEvent, SessionRequest, ShutdownRequest, UnpinRequest, UnregisterRequest,
-    engine_client::EngineClient,
+    GetPdReceiveDescriptorRequest, HealthRequest, LoadPreparedItem, LoadRequest,
+    PdReceiveDescriptorState, PrepareLoadRequest, RdmaHandshakeRequest, RegisterContextRequest,
+    ResponseStatus, SaveLayer, SaveRequest, SessionEvent, SessionRequest, ShutdownRequest,
+    UnpinRequest, UnregisterRequest, engine_client::EngineClient,
+};
+use pegaflow_transfer::{
+    ConnectionStatus, HandshakeMetadata, MemoryRegion, TransferDesc, TransferEngine, TransferOp,
 };
 use pyo3::{
     create_exception,
@@ -11,6 +18,7 @@ use pyo3::{
 };
 use std::{
     future::Future,
+    ptr::NonNull,
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
@@ -99,12 +107,12 @@ fn status_tuple(method: &str, status: Option<ResponseStatus>) -> PyResult<(bool,
     Ok((status.ok, status.message))
 }
 
-fn u64_to_usize(value: u64, field: &str) -> PyResult<usize> {
-    usize::try_from(value)
-        .map_err(|_| PyRuntimeError::new_err(format!("{field}={value} exceeds usize range")))
+fn non_null_from_usize(ptr: usize, field: &str) -> PyResult<NonNull<u8>> {
+    NonNull::new(ptr as *mut u8)
+        .ok_or_else(|| PyRuntimeError::new_err(format!("{field} must not be null")))
 }
 
-#[pyclass]
+#[pyclass(name = "_NativeEngineClient")]
 struct EngineRpcClient {
     endpoint: String,
     client: EngineClient<Channel>,
@@ -143,7 +151,7 @@ impl EngineRpcClient {
 impl EngineRpcClient {
     #[new]
     #[pyo3(signature = (endpoint = None))]
-    fn new(endpoint: Option<String>) -> PyResult<Self> {
+    fn new(py: Python<'_>, endpoint: Option<String>) -> PyResult<Self> {
         let endpoint = endpoint.unwrap_or_else(|| "http://127.0.0.1:50055".to_string());
         let rt = get_runtime()?;
 
@@ -155,9 +163,13 @@ impl EngineRpcClient {
             .http2_keep_alive_interval(Duration::from_secs(30))
             .keep_alive_while_idle(true);
 
-        let channel = rt
-            .block_on(endpoint_cfg.connect())
-            .map_err(|err| transport_connect_error(&endpoint, err))?;
+        let channel = py.detach({
+            let endpoint = endpoint.clone();
+            move || {
+                rt.block_on(endpoint_cfg.connect())
+                    .map_err(|err| transport_connect_error(&endpoint, err))
+            }
+        })?;
         // Match server's 64 MiB limit to avoid Status::resource_exhausted on large payloads
         const MAX_GRPC_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
         let client = EngineClient::new(channel)
@@ -199,7 +211,6 @@ impl EngineRpcClient {
     ///     world_size: Total worker count (TP * PP * PCP)
     ///     device_id: CUDA device ID of the worker
     ///     num_layers: Total number of layers in the model
-    ///     layer_names: List of layer names
     ///     wrapper_bytes_list: List of serialized CUDA tensor wrappers
     ///     num_blocks_list: List of block counts per layer
     ///     bytes_per_block_list: List of block sizes per layer
@@ -288,19 +299,9 @@ impl EngineRpcClient {
         .and_then(|r| status_tuple("save", r.status))
     }
 
-    /// Load KV blocks from the engine.
-    ///
-    /// Args:
-    ///     instance_id: Model instance ID
-    ///     tp_rank: Tensor parallel rank
-    ///     device_id: CUDA device ID
-    ///     load_state_shm: Shared memory name for load state sync
-    ///     layer_names: List of layer names to load
-    ///     block_ids: GPU block IDs to load into
-    ///     block_hashes: Content hashes for blocks
-    ///
-    /// Returns: (ok: bool, message: str)
+    /// Load prepared KV blocks from the engine.
     #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (instance_id, tp_rank, device_id, load_state_shm, layer_names, items))]
     fn load(
         &self,
         py: Python<'_>,
@@ -309,9 +310,12 @@ impl EngineRpcClient {
         device_id: i32,
         load_state_shm: String,
         layer_names: Vec<String>,
-        block_ids: Vec<i32>,
-        block_hashes: Vec<Vec<u8>>,
+        items: Vec<(u64, Vec<i32>)>,
     ) -> PyResult<(bool, String)> {
+        let items = items
+            .into_iter()
+            .map(|(plan_id, block_ids)| LoadPreparedItem { plan_id, block_ids })
+            .collect();
         self.call(py, "load", |mut c| async move {
             let resp = c
                 .load(LoadRequest {
@@ -320,8 +324,7 @@ impl EngineRpcClient {
                     device_id,
                     load_state_shm,
                     layer_names,
-                    block_ids,
-                    block_hashes,
+                    items,
                 })
                 .await?;
             Ok(resp.into_inner())
@@ -329,62 +332,142 @@ impl EngineRpcClient {
         .and_then(|r| status_tuple("load", r.status))
     }
 
-    /// Query prefix cache hits with SSD prefetch support.
-    ///
-    /// Checks memory cache and triggers SSD prefetch for missing blocks.
-    /// Pins hit blocks for subsequent load operations.
-    ///
-    /// Args:
-    ///     instance_id: Model instance ID
-    ///     block_hashes: List of block hashes to check
-    ///
-    /// Returns: dict with keys:
-    ///     - ok: bool - whether the request succeeded
-    ///     - message: str - error message if failed
-    ///     - hit_blocks: int - number of blocks ready in cache
-    ///     - prefetch_state: str - one of "done", "loading"
-    ///     - loading_blocks: int - number of blocks being prefetched
-    ///     - missing_blocks: int - number of blocks not found
-    fn query_prefetch(
+    /// Begin scheduler-side external KV preparation.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (instance_id, request_id, block_hashes, num_prompt_tokens, num_computed_tokens, virtual_block_size, prepare_state_shm, decode_request_id = None, decode_expected_writes = 0))]
+    fn prepare_load(
         &self,
         py: Python<'_>,
         instance_id: String,
+        request_id: String,
         block_hashes: Vec<Vec<u8>>,
-        req_id: String,
-    ) -> PyResult<Py<pyo3::types::PyAny>> {
-        use pegaflow_proto::proto::engine::PrefetchState;
-
-        self.call(py, "query_prefetch", |mut c| async move {
+        num_prompt_tokens: u64,
+        num_computed_tokens: u64,
+        virtual_block_size: u64,
+        prepare_state_shm: String,
+        decode_request_id: Option<String>,
+        decode_expected_writes: u32,
+    ) -> PyResult<(bool, String)> {
+        self.call(py, "prepare_load", |mut c| async move {
             let resp = c
-                .query_prefetch(QueryRequest {
+                .prepare_load(PrepareLoadRequest {
                     instance_id,
+                    request_id,
                     block_hashes,
-                    req_id,
+                    num_prompt_tokens,
+                    num_computed_tokens,
+                    virtual_block_size,
+                    prepare_state_shm,
+                    decode_request_id: decode_request_id.unwrap_or_default(),
+                    decode_expected_writes,
+                })
+                .await?;
+            Ok(resp.into_inner())
+        })
+        .and_then(|r| status_tuple("prepare_load", r.status))
+    }
+
+    /// Fetch a D-side P/D receive descriptor.
+    ///
+    /// P-side in-process push uses this against D PegaFlow after prefill.
+    ///
+    /// Returns: dict with keys:
+    ///     - ok: bool
+    ///     - message: str
+    ///     - state: str ("pending", "ready", "failed", "expired")
+    ///     - handle: str
+    ///     - slabs: list[dict]
+    ///     - layers: list[dict]
+    ///     - block_hashes: list[bytes]
+    ///     - imm_data: int
+    ///     - expires_at_ms: int
+    ///     - data_ready: bool
+    #[pyo3(signature = (dst_instance_id, request_id, receive_rank = -1, handle = None))]
+    fn get_pd_receive_descriptor(
+        &self,
+        py: Python<'_>,
+        dst_instance_id: String,
+        request_id: String,
+        receive_rank: i32,
+        handle: Option<String>,
+    ) -> PyResult<Py<pyo3::types::PyAny>> {
+        self.call(py, "get_pd_receive_descriptor", |mut c| async move {
+            let resp = c
+                .get_pd_receive_descriptor(GetPdReceiveDescriptorRequest {
+                    dst_instance_id,
+                    request_id,
+                    handle: handle.unwrap_or_default(),
+                    receive_rank,
                 })
                 .await?;
             Ok(resp.into_inner())
         })
         .and_then(|r| {
-            let (ok, msg) = status_tuple("query_prefetch", r.status)?;
-            let hit = u64_to_usize(r.hit_blocks, "hit_blocks")?;
-            let loading = u64_to_usize(r.loading_blocks, "loading_blocks")?;
-            let missing = u64_to_usize(r.missing_blocks, "missing_blocks")?;
-
-            let prefetch_state = match PrefetchState::try_from(r.prefetch_state) {
-                Ok(PrefetchState::PrefetchDone) => "done",
-                Ok(PrefetchState::PrefetchLoading) => "loading",
-                _ => "done", // Default to done for unknown states
-            };
-
+            let (ok, msg) = status_tuple("get_pd_receive_descriptor", r.status)?;
             Python::attach(|py| {
-                use pyo3::types::PyDict;
+                use pyo3::types::{PyBytes, PyDict, PyList};
+
                 let dict = PyDict::new(py);
                 dict.set_item("ok", ok)?;
                 dict.set_item("message", msg)?;
-                dict.set_item("hit_blocks", hit)?;
-                dict.set_item("prefetch_state", prefetch_state)?;
-                dict.set_item("loading_blocks", loading)?;
-                dict.set_item("missing_blocks", missing)?;
+                let state = match PdReceiveDescriptorState::try_from(r.state) {
+                    Ok(PdReceiveDescriptorState::PdDescriptorPending) => "pending",
+                    Ok(PdReceiveDescriptorState::PdDescriptorReady) => "ready",
+                    Ok(PdReceiveDescriptorState::PdDescriptorFailed) => "failed",
+                    Ok(PdReceiveDescriptorState::PdDescriptorExpired) => "expired",
+                    _ => "pending",
+                };
+                dict.set_item("state", state)?;
+                dict.set_item("handle", r.handle)?;
+                dict.set_item("imm_data", r.imm_data)?;
+                dict.set_item("expires_at_ms", r.expires_at_ms)?;
+                dict.set_item("data_ready", r.data_ready)?;
+
+                let ranks = PyList::empty(py);
+                for rank in r.ranks {
+                    let item = PyDict::new(py);
+                    item.set_item("receive_rank", rank.receive_rank)?;
+                    item.set_item("device_id", rank.device_id)?;
+                    item.set_item("tp_rank", rank.tp_rank)?;
+                    item.set_item("slab_index", rank.slab_index)?;
+                    item.set_item("numa_node", rank.numa_node)?;
+                    ranks.append(item)?;
+                }
+                dict.set_item("ranks", ranks)?;
+
+                let slabs = PyList::empty(py);
+                for slab in r.slabs {
+                    let item = PyDict::new(py);
+                    item.set_item("base_ptr", slab.base_ptr)?;
+                    item.set_item("size", slab.size)?;
+                    item.set_item("numa_node", slab.numa_node)?;
+                    slabs.append(item)?;
+                }
+                dict.set_item("slabs", slabs)?;
+
+                let layers = PyList::empty(py);
+                for layer in r.layers {
+                    let item = PyDict::new(py);
+                    item.set_item("layer_name", layer.layer_name)?;
+                    item.set_item("slab_index", layer.slab_index)?;
+                    item.set_item("layer_offset", layer.layer_offset)?;
+                    item.set_item("block_stride", layer.block_stride)?;
+                    item.set_item("segment_count", layer.segment_count)?;
+                    item.set_item("segment_size", layer.segment_size)?;
+                    item.set_item("padded_segment_stride", layer.padded_segment_stride)?;
+                    item.set_item("num_blocks", layer.num_blocks)?;
+                    item.set_item("slot_id", layer.slot_id)?;
+                    item.set_item("receive_rank", layer.receive_rank)?;
+                    layers.append(item)?;
+                }
+                dict.set_item("layers", layers)?;
+
+                let block_hashes = PyList::empty(py);
+                for hash in r.block_hashes {
+                    block_hashes.append(PyBytes::new(py, &hash))?;
+                }
+                dict.set_item("block_hashes", block_hashes)?;
+
                 Ok(dict.into())
             })
         })
@@ -493,7 +576,7 @@ impl EngineRpcClient {
 /// - 0: pending (load in progress)
 /// - 1: success (all transfers complete)
 /// - <0: error (transfer failed)
-#[pyclass]
+#[pyclass(name = "_NativeLoadState")]
 struct PyLoadState {
     inner: Arc<LoadState>,
 }
@@ -530,6 +613,310 @@ impl PyLoadState {
     }
 }
 
+/// Python wrapper for PrepareLoadState.
+#[pyclass(name = "_NativePrepareLoadState")]
+struct PyPrepareLoadState {
+    inner: Arc<PrepareLoadState>,
+}
+
+#[pymethods]
+impl PyPrepareLoadState {
+    #[new]
+    fn new() -> PyResult<Self> {
+        let inner = PrepareLoadState::new().map_err(|e| {
+            PyRuntimeError::new_err(format!("failed to create PrepareLoadState: {e}"))
+        })?;
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
+    }
+
+    fn shm_name(&self) -> String {
+        self.inner.shm_name().to_string()
+    }
+
+    fn snapshot(&self) -> PyResult<Py<pyo3::types::PyAny>> {
+        Python::attach(|py| {
+            use pyo3::types::PyDict;
+            let snapshot = self.inner.snapshot();
+            let dict = PyDict::new(py);
+            dict.set_item("state", snapshot.state)?;
+            dict.set_item("num_tokens", snapshot.num_tokens)?;
+            dict.set_item("plan_id", snapshot.plan_id)?;
+            dict.set_item("preparing", snapshot.state == PREPARE_LOAD_STATE_PENDING)?;
+            dict.set_item(
+                "ready_no_plan",
+                snapshot.state == PREPARE_LOAD_STATE_NO_PLAN,
+            )?;
+            dict.set_item("ready_plan", snapshot.state == PREPARE_LOAD_STATE_PLAN)?;
+            Ok(dict.into())
+        })
+    }
+}
+
+/// In-process P-side runtime for outbound KV transfer.
+///
+/// This object lives in the vLLM worker process. It owns the transfer engine
+/// used by future P/D D2H -> RDMA WRITE -> WRITE_WITH_IMM tasks.
+#[pyclass]
+struct KvEgressRuntime {
+    transfer: Arc<TransferEngine>,
+    rt_handle: Handle,
+}
+
+#[pymethods]
+impl KvEgressRuntime {
+    /// Create a KV egress runtime with the selected RDMA NIC names.
+    #[new]
+    fn new(py: Python<'_>, nic_names: Vec<String>) -> PyResult<Self> {
+        if nic_names.is_empty() {
+            return Err(PyRuntimeError::new_err(
+                "KvEgressRuntime requires at least one RDMA NIC",
+            ));
+        }
+        let rt = get_runtime()?;
+        let transfer = py.detach({
+            let nic_names = nic_names.clone();
+            move || {
+                TransferEngine::new(&nic_names)
+                    .map_err(|err| PyRuntimeError::new_err(format!("create TransferEngine: {err}")))
+            }
+        })?;
+        Ok(Self {
+            transfer: Arc::new(transfer),
+            rt_handle: rt.handle().clone(),
+        })
+    }
+
+    /// Register local CPU/pinned memory for future RDMA operations.
+    fn _register_memory(&self, py: Python<'_>, ptr: usize, len: usize) -> PyResult<()> {
+        if len == 0 {
+            return Err(PyRuntimeError::new_err("len must be non-zero"));
+        }
+        let transfer = Arc::clone(&self.transfer);
+        py.detach(move || {
+            let ptr = non_null_from_usize(ptr, "ptr")?;
+            transfer
+                .register_memory(&[MemoryRegion { ptr, len }])
+                .map_err(|err| PyRuntimeError::new_err(format!("register_memory: {err}")))
+        })
+    }
+
+    fn _unregister_memory(&self, py: Python<'_>, ptr: usize) -> PyResult<()> {
+        let transfer = Arc::clone(&self.transfer);
+        py.detach(move || {
+            let ptr = non_null_from_usize(ptr, "ptr")?;
+            transfer
+                .unregister_memory(&[ptr])
+                .map_err(|err| PyRuntimeError::new_err(format!("unregister_memory: {err}")))
+        })
+    }
+
+    /// Establish an RDMA connection to D PegaFlow through its existing
+    /// RdmaHandshake RPC. `remote_addr` is the transfer-layer peer key and
+    /// should match the D PegaFlow endpoint key used by the descriptor path.
+    fn _ensure_connected(
+        &self,
+        py: Python<'_>,
+        remote_addr: String,
+        requester_id: String,
+        engine_client: PyRef<'_, EngineRpcClient>,
+    ) -> PyResult<()> {
+        let transfer = Arc::clone(&self.transfer);
+        let mut client = engine_client.client.clone();
+        let rt_handle = self.rt_handle.clone();
+
+        py.detach(move || {
+            rt_handle.block_on(async move {
+                let local_meta = match transfer.get_or_prepare(&remote_addr) {
+                    Ok(ConnectionStatus::Existing) => return Ok(()),
+                    Ok(ConnectionStatus::Connecting) => {
+                        return Err(PyRuntimeError::new_err(format!(
+                            "RDMA handshake to {remote_addr} already in progress"
+                        )));
+                    }
+                    Ok(ConnectionStatus::Prepared(meta)) => meta,
+                    Err(err) => {
+                        return Err(PyRuntimeError::new_err(format!(
+                            "RDMA get_or_prepare({remote_addr}): {err}"
+                        )));
+                    }
+                };
+
+                let response = match client
+                    .rdma_handshake(RdmaHandshakeRequest {
+                        requester_id,
+                        handshake_metadata: local_meta.to_bytes(),
+                    })
+                    .await
+                {
+                    Ok(resp) => resp.into_inner(),
+                    Err(err) => {
+                        transfer.abort_handshake(&remote_addr, &local_meta);
+                        return Err(rpc_status_error("rdma_handshake", err));
+                    }
+                };
+
+                let (ok, message) = status_tuple("rdma_handshake", response.status)?;
+                if !ok {
+                    transfer.abort_handshake(&remote_addr, &local_meta);
+                    return Err(PegaFlowBusinessError::new_err(format!(
+                        "rdma_handshake rejected: {message}"
+                    )));
+                }
+
+                let remote_meta = HandshakeMetadata::from_bytes(&response.handshake_metadata)
+                    .map_err(|err| {
+                        transfer.abort_handshake(&remote_addr, &local_meta);
+                        PyRuntimeError::new_err(format!("invalid remote handshake metadata: {err}"))
+                    })?;
+                transfer
+                    .complete_handshake(&remote_addr, &local_meta, &remote_meta)
+                    .map_err(|err| {
+                        transfer.abort_handshake(&remote_addr, &local_meta);
+                        PyRuntimeError::new_err(format!("complete_handshake: {err}"))
+                    })?;
+                Ok(())
+            })
+        })
+    }
+
+    /// RDMA WRITE from already-registered local memory to already-registered
+    /// remote memory. This is the low-level primitive the P/D push task will
+    /// use after D2H staging and descriptor resolution.
+    fn _write_registered(
+        &self,
+        py: Python<'_>,
+        remote_addr: String,
+        descs: Vec<(usize, usize, usize)>,
+    ) -> PyResult<(usize, usize)> {
+        if descs.is_empty() {
+            return Ok((0, 0));
+        }
+        for (_, _, len) in &descs {
+            if *len == 0 {
+                return Err(PyRuntimeError::new_err("transfer len must be non-zero"));
+            }
+        }
+
+        let transfer = Arc::clone(&self.transfer);
+        let rt_handle = self.rt_handle.clone();
+        py.detach(move || {
+            let mut transfer_descs = Vec::with_capacity(descs.len());
+            for (local_ptr, remote_ptr, len) in descs {
+                transfer_descs.push(TransferDesc {
+                    local_ptr: non_null_from_usize(local_ptr, "local_ptr")?,
+                    remote_ptr: non_null_from_usize(remote_ptr, "remote_ptr")?,
+                    len,
+                });
+            }
+
+            let receivers = transfer
+                .batch_transfer_async(TransferOp::Write, &remote_addr, &transfer_descs)
+                .map_err(|err| PyRuntimeError::new_err(format!("RDMA write submit: {err}")))?;
+            let nics_active = receivers.len();
+            rt_handle.block_on(async move {
+                let mut total = 0usize;
+                for rx in receivers {
+                    let bytes = rx
+                        .await
+                        .map_err(|err| {
+                            PyRuntimeError::new_err(format!("RDMA write dropped: {err}"))
+                        })?
+                        .map_err(|err| {
+                            PyRuntimeError::new_err(format!("RDMA write failed: {err}"))
+                        })?;
+                    total = total.saturating_add(bytes);
+                }
+                Ok((total, nics_active))
+            })
+        })
+    }
+
+    fn _preferred_nic_for_gpu(&self, device_id: u32) -> Option<usize> {
+        self.transfer.preferred_nic_index_for_gpu(device_id)
+    }
+
+    fn _write_registered_on_nic(
+        &self,
+        py: Python<'_>,
+        remote_addr: String,
+        descs: Vec<(usize, usize, usize)>,
+        nic_idx: usize,
+    ) -> PyResult<(usize, usize)> {
+        if descs.is_empty() {
+            return Ok((0, 0));
+        }
+        for (_, _, len) in &descs {
+            if *len == 0 {
+                return Err(PyRuntimeError::new_err("transfer len must be non-zero"));
+            }
+        }
+
+        let transfer = Arc::clone(&self.transfer);
+        let rt_handle = self.rt_handle.clone();
+        py.detach(move || {
+            let mut transfer_descs = Vec::with_capacity(descs.len());
+            for (local_ptr, remote_ptr, len) in descs {
+                transfer_descs.push(TransferDesc {
+                    local_ptr: non_null_from_usize(local_ptr, "local_ptr")?,
+                    remote_ptr: non_null_from_usize(remote_ptr, "remote_ptr")?,
+                    len,
+                });
+            }
+
+            let rx = transfer
+                .batch_transfer_async_on_nic(
+                    TransferOp::Write,
+                    &remote_addr,
+                    &transfer_descs,
+                    nic_idx,
+                )
+                .map_err(|err| PyRuntimeError::new_err(format!("RDMA write submit: {err}")))?;
+            rt_handle.block_on(async move {
+                let bytes = rx
+                    .await
+                    .map_err(|err| PyRuntimeError::new_err(format!("RDMA write dropped: {err}")))?
+                    .map_err(|err| PyRuntimeError::new_err(format!("RDMA write failed: {err}")))?;
+                Ok((bytes, 1))
+            })
+        })
+    }
+
+    /// Send the final RDMA WRITE-with-immediate readiness signal and wait for
+    /// local send completions.
+    fn _write_imm(
+        &self,
+        py: Python<'_>,
+        remote_addr: String,
+        imm_data: u32,
+    ) -> PyResult<(usize, usize)> {
+        let transfer = Arc::clone(&self.transfer);
+        let rt_handle = self.rt_handle.clone();
+        py.detach(move || {
+            let receivers = transfer
+                .write_imm_async(&remote_addr, imm_data)
+                .map_err(|err| PyRuntimeError::new_err(format!("WRITE_WITH_IMM submit: {err}")))?;
+            let nics_active = receivers.len();
+            rt_handle.block_on(async move {
+                let mut total = 0usize;
+                for rx in receivers {
+                    let bytes = rx
+                        .await
+                        .map_err(|err| {
+                            PyRuntimeError::new_err(format!("WRITE_WITH_IMM dropped: {err}"))
+                        })?
+                        .map_err(|err| {
+                            PyRuntimeError::new_err(format!("WRITE_WITH_IMM failed: {err}"))
+                        })?;
+                    total = total.saturating_add(bytes);
+                }
+                Ok((total, nics_active))
+            })
+        })
+    }
+}
+
 /// A Python module implemented in Rust.
 #[pymodule]
 fn pegaflow(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -537,6 +924,8 @@ fn pegaflow(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<EngineRpcClient>()?;
     m.add_class::<PyLoadState>()?;
+    m.add_class::<PyPrepareLoadState>()?;
+    m.add_class::<KvEgressRuntime>()?;
     // Register custom exceptions for error classification
     m.add("PegaFlowError", m.py().get_type::<PegaFlowError>())?;
     m.add(

@@ -15,7 +15,7 @@ async fn main() {
 
     // spawn server
     tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut stream = listener.accept().await.unwrap().0;
         let mut buf = [0u8; 8];
 
         loop {

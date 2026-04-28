@@ -263,15 +263,30 @@ class ClientContext:
         self._registered = False
 
     def query(self, block_hashes: list[bytes]) -> dict:
-        """Query available blocks (like SchedulerConnector._count_available_block_prefix).
+        """Begin a prepare-load request and return its current shm snapshot.
 
         Args:
-            block_hashes: List of block hashes to query
+            block_hashes: List of block hashes to prepare
 
         Returns:
-            Query result dict
+            Prepare state snapshot dict
         """
-        return self.engine_client.query_prefetch(self.instance_id, block_hashes, req_id="test")
+        import importlib
+
+        pegaflow_module = importlib.import_module("pegaflow.pegaflow")
+        state = pegaflow_module._NativePrepareLoadState()
+        self.engine_client.prepare_load(
+            self.instance_id,
+            "test",
+            block_hashes,
+            len(block_hashes) * 16,
+            0,
+            16,
+            state.shm_name(),
+            None,
+            0,
+        )
+        return state.snapshot()
 
     def get_kv_cache(self, layer: int = 0) -> torch.Tensor:
         """Get KV cache tensor for a specific layer."""

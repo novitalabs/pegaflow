@@ -17,12 +17,20 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+from pegaflow import LoadPlan, LoadRequest
 from pegaflow.connector.common import (
     ConnectorContext,
     LoadIntent,
     PegaConnectorMetadata,
 )
 from pegaflow.connector.worker import WorkerConnector
+
+
+class FakeLoadHandle:
+    def __init__(self, shm_name: str) -> None:
+        self.shm_name = shm_name
+        self.state = 0
+        self.done = False
 
 
 class FakeEngineClient:
@@ -36,23 +44,27 @@ class FakeEngineClient:
         self.fail_load_with_ok_false = False
         self.fail_load_with_exception: Exception | None = None
         self.load_calls: list[tuple] = []
+        self._next_shm = 0
 
-    def load(
-        self,
-        instance_id: str,
-        tp_rank: int,
-        device_id: int,
-        load_state_shm: str,
-        layer_names,
-        block_ids,
-        block_hashes,
-    ) -> tuple[bool, str]:
-        self.load_calls.append((instance_id, tp_rank, device_id, load_state_shm, list(block_ids)))
+    def load(self, request: LoadRequest) -> FakeLoadHandle:
+        block_ids = [int(block_id) for item in request.items for block_id in item.block_ids]
+        items = [(item.plan.plan_id, list(item.block_ids)) for item in request.items]
+        self.load_calls.append(
+            (
+                request.instance_id,
+                request.tp_rank,
+                request.device_id,
+                list(request.layer_names),
+                items,
+                block_ids,
+            )
+        )
         if self.fail_load_with_exception is not None:
             raise self.fail_load_with_exception
         if self.fail_load_with_ok_false:
-            return (False, "simulated load failure")
-        return (True, "ok")
+            raise RuntimeError("simulated load failure")
+        self._next_shm += 1
+        return FakeLoadHandle(f"fake-shm-{self._next_shm}")
 
     def health(self) -> tuple[bool, str]:
         return (True, "ok")
@@ -65,13 +77,14 @@ def _make_worker() -> tuple[WorkerConnector, FakeEngineClient, MagicMock]:
     ctx = ConnectorContext(
         instance_id="test_instance",
         namespace="ns",
+        layer_names=("ALL_LAYERS",),
         block_size=16,
         num_layers=1,
         tp_size=1,
         world_size=1,
         tp_rank=0,
         device_id=0,
-        engine_client=client,
+        client=client,
         state_manager=state_manager,
     )
     worker = WorkerConnector(ctx)
@@ -88,20 +101,57 @@ def _stub_forward_context() -> MagicMock:
     return ctx
 
 
+def _pending_load_reqs(worker: WorkerConnector) -> set[str]:
+    return {
+        req_id
+        for pending in worker._pending_loads_by_shm.values()
+        for req_id in pending.request_ids
+    }
+
+
 def _load_metadata(req_id: str, block_ids: tuple[int, ...]) -> PegaConnectorMetadata:
     return PegaConnectorMetadata(
         load_intents={
             req_id: LoadIntent(
                 block_ids=block_ids,
-                block_hashes=tuple(f"h{b}".encode() for b in block_ids),
+                plan=LoadPlan(
+                    request_id=req_id,
+                    plan_id=100,
+                    num_tokens=len(block_ids) * 16,
+                ),
                 num_tokens=len(block_ids) * 16,
             )
         }
     )
 
 
+def _pd_load_metadata() -> PegaConnectorMetadata:
+    return PegaConnectorMetadata(
+        load_intents={
+            "local-a": LoadIntent(
+                block_ids=(10, 11),
+                plan=LoadPlan(
+                    request_id="pd-a",
+                    plan_id=201,
+                    num_tokens=32,
+                ),
+                num_tokens=32,
+            ),
+            "local-b": LoadIntent(
+                block_ids=(20,),
+                plan=LoadPlan(
+                    request_id="pd-b",
+                    plan_id=202,
+                    num_tokens=16,
+                ),
+                num_tokens=16,
+            ),
+        }
+    )
+
+
 def test_load_rpc_ok_false_reports_failures_without_raise():
-    """B.1: engine_client.load returns ok=False -> no raise, failure surface populated."""
+    """B.1: client.load returns ok=False -> no raise, failure surface populated."""
     worker, client, state_mgr = _make_worker()
     client.fail_load_with_ok_false = True
 
@@ -125,15 +175,28 @@ def test_load_rpc_ok_false_reports_failures_without_raise():
     assert state_mgr.mark_unavailable.called
 
     # No PyLoadState registered: no permanent leak.
-    assert worker._pending_loads == {}
-    assert worker._pending_load_reqs == {}
-    assert worker._pending_load_meta == {}
+    assert worker._pending_loads_by_shm == {}
+
+    worker.shutdown()
+
+
+def test_pd_load_uses_one_batch_rpc_for_multiple_requests():
+    worker, client, _state_mgr = _make_worker()
+
+    worker.start_load_kv(_pd_load_metadata(), _stub_forward_context())
+
+    assert len(client.load_calls) == 1
+    _instance, _tp_rank, _device, _layers, items, _blocks = client.load_calls[0]
+    assert items == [
+        (201, [10, 11]),
+        (202, [20]),
+    ]
 
     worker.shutdown()
 
 
 def test_load_rpc_exception_reports_failures_without_raise():
-    """B.1: engine_client.load raises -> same failure-reporting path as ok=False."""
+    """B.1: client.load raises -> same failure-reporting path as ok=False."""
     worker, client, state_mgr = _make_worker()
     client.fail_load_with_exception = ConnectionError("server gone")
 
@@ -148,8 +211,7 @@ def test_load_rpc_exception_reports_failures_without_raise():
 
     assert state_mgr.mark_unavailable.called
 
-    assert worker._pending_loads == {}
-    assert worker._pending_load_meta == {}
+    assert worker._pending_loads_by_shm == {}
 
     worker.shutdown()
 
@@ -175,13 +237,13 @@ def test_in_flight_load_timeout_respects_configured_boundary(monkeypatch):
 
     metadata = _load_metadata("req_boundary", (5, 6, 7, 8))
     worker.start_load_kv(metadata, _stub_forward_context())
-    assert "req_boundary" in worker._pending_loads
+    assert _pending_load_reqs(worker) == {"req_boundary"}
 
     # Just before the deadline: must NOT time out.
     clock["now"] = t0 + (timeout - 1)
     _, finished_recving = worker.get_finished(set())
     assert finished_recving is None, "load flagged as timed out before the deadline"
-    assert "req_boundary" in worker._pending_loads
+    assert _pending_load_reqs(worker) == {"req_boundary"}
     assert worker.get_block_ids_with_load_errors() == set()
     assert not state_mgr.mark_unavailable.called
 
@@ -193,9 +255,7 @@ def test_in_flight_load_timeout_respects_configured_boundary(monkeypatch):
     assert state_mgr.mark_unavailable.called
 
     # In-flight state cleaned up — no permanent leak.
-    assert worker._pending_loads == {}
-    assert worker._pending_load_reqs == {}
-    assert worker._pending_load_meta == {}
+    assert worker._pending_loads_by_shm == {}
 
     worker.shutdown()
 

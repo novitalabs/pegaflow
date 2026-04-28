@@ -18,7 +18,7 @@ pub use service::GrpcEngineService;
 
 use clap::Parser;
 use cudarc::driver::result as cuda_driver;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use opentelemetry::global;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
@@ -129,8 +129,8 @@ pub struct Cli {
     #[arg(long, default_value_t = 800)]
     pub max_prefetch_blocks: usize,
 
-    /// Trace sampling rate (0.0–1.0). E.g. 0.01 = 1%. Default: 1.0 (100%)
-    #[arg(long, default_value_t = 1.0, value_parser = parse_sample_rate)]
+    /// Trace sampling rate (0.0-1.0). E.g. 0.01 = 1%. Default: 0.01 (1%)
+    #[arg(long, default_value_t = 0.01, value_parser = parse_sample_rate)]
     pub trace_sample_rate: f64,
 
     /// Number of shards for the pinned memory pool (reduces allocator lock contention).
@@ -507,6 +507,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             Arc::clone(&hll_tracker),
         );
 
+        spawn_pd_receive_imm_watcher(Arc::clone(&engine), Arc::clone(&shutdown));
+
         // Spawn background GC task for stale inflight blocks and expired transfer locks
         {
             let engine = Arc::clone(&engine);
@@ -605,4 +607,51 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
         Ok(())
     })
+}
+
+fn spawn_pd_receive_imm_watcher(engine: Arc<PegaEngine>, shutdown: Arc<Notify>) {
+    let has_rdma = engine.has_rdma_transport();
+    let Some(mut imm_rx) = engine.take_pd_receive_imm_receiver() else {
+        if has_rdma {
+            warn!("P/D receive IMM watcher not started: IMM receiver already taken");
+        } else {
+            debug!("P/D receive IMM watcher not started: RDMA transport is not configured");
+        }
+        return;
+    };
+
+    tokio::spawn(async move {
+        info!("P/D receive IMM watcher started");
+
+        loop {
+            tokio::select! {
+                _ = shutdown.notified() => {
+                    info!("P/D receive IMM watcher shutting down");
+                    break;
+                }
+                completion = imm_rx.recv() => {
+                    let Ok(completion) = completion else {
+                        info!("P/D receive IMM watcher receiver closed");
+                        break;
+                    };
+                    let matched = engine.observe_pd_receive_imm(completion.imm_data);
+                    if matched {
+                        debug!(
+                            "P/D receive IMM observed: imm={} nic_idx={} local_qpn={}",
+                            completion.imm_data,
+                            completion.nic_idx,
+                            completion.local_qpn,
+                        );
+                    } else {
+                        warn!(
+                            "P/D receive IMM did not match a live lease: imm={} nic_idx={} local_qpn={}",
+                            completion.imm_data,
+                            completion.nic_idx,
+                            completion.local_qpn,
+                        );
+                    }
+                }
+            }
+        }
+    });
 }

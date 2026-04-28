@@ -4,18 +4,27 @@ Scheduler-side connector logic.
 
 import time
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from pegaflow import (
+    LoadPlan,
+    PrepareLoadHandle,
+    PrepareLoadResult,
+)
 from pegaflow.connector.common import (
     ConnectorContext,
+    KvEgressIntent,
     LoadIntent,
     PegaConnectorMetadata,
     PegaKVConnectorStats,
     SaveIntent,
     logger,
-    parse_env_int,
 )
-from pegaflow.connector.connector_metrics import PrefetchTracker
+from pegaflow.kv_transfer import (
+    prefill_push_from_request,
+    prepare_load_request_from_request,
+)
 from pegaflow.pegaflow import PegaFlowBusinessError, PegaFlowServiceError
 
 if TYPE_CHECKING:
@@ -25,119 +34,59 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 
+@dataclass
+class _RequestState:
+    request: "Request"
+    handled_num_preemptions: int = 0
+    external_matched_blocks: int = 0
+    allocated_blocks: list[int] = field(default_factory=list)
+    scheduled_tokens: int = 0
+    next_stored_block_idx: int | None = None
+    load_plan: LoadPlan | None = None
+    prepare_handle: PrepareLoadHandle | None = None
+    pending_load_intent: LoadIntent | None = None
+    prefill_push_submitted: bool = False
+    pending_save: bool = False
+    hold_after_save: bool = False
+
+
 class SchedulerConnector:
     """Holds scheduler-only state and behaviors."""
 
-    # Bypass thresholds (configurable via environment variables).
-    # Default 0 means disabled - bypass strategy only activates when explicitly set.
-    # NOTE: Read from environment at module import time.
-    BYPASS_BLOCKS: int = parse_env_int("PEGA_BYPASS_BLOCKS", 0)
-    HIGH_LOAD_THRESHOLD: int = parse_env_int("PEGA_HIGH_LOAD_THRESHOLD", 0)
-
-    # Maximum number of requests that can have pending saves simultaneously.
-    # Default 0 means unlimited - drop strategy only activates when explicitly set.
-    # When this limit is reached, new save intents will be dropped (shorter first).
-    MAX_PENDING_SAVE_REQUESTS: int = parse_env_int("PEGA_MAX_PENDING_SAVE_REQUESTS", 0)
-
     def __init__(self, context: ConnectorContext):
         self._ctx = context
-
-        # Load state
-        self._pending_load_intents: dict[str, LoadIntent] = {}
-        self._prefetch_start_times: dict[str, float] = {}
-
-        # Prefetch tracking (for metrics and bypass decisions)
-        self._prefetch_tracker = PrefetchTracker()
-
-        # Bypass statistics
-        self._bypass_count: int = 0
-
-        # Save state (per-request)
-        self._block_hashes: dict[str, tuple[bytes, ...]] = {}
-        self._external_matched_blocks: dict[str, int] = {}
-        self._block_index_offsets: dict[str, int] = {}
-        self._allocated_blocks: dict[str, list[int]] = {}
-        self._scheduled_tokens: dict[str, int] = {}
-        self._next_stored_block_idx: dict[str, int] = {}
-
-        # Live Request references – used to refresh block_hashes during decode
-        # so that newly completed blocks can be saved, not just prefill blocks.
-        self._requests: dict[str, Request] = {}
-
-        # Completion tracking
-        self._pending_saves: set[str] = set()
-        self._held_requests: set[str] = set()
-
-        # Save drop statistics (for metrics)
-        self._save_dropped_count: int = 0
+        self._request_states: dict[str, _RequestState] = {}
 
     def get_num_new_matched_tokens(
         self,
         request: "Request",
         num_computed_tokens: int,
     ) -> tuple[int | None, bool]:
-        req_id = request.request_id
-        num_tokens = request.num_tokens
-        block_hashes = request.block_hashes
+        state = self._get_or_create_state(request)
 
         # request.block_hashes are already at virtual_block_size granularity
         # (vLLM hashes every scheduler_block_size =
         # block_size * dcp_world_size * pcp_world_size).
-        # Skip blocks that are already computed locally.
+        # Only the scheduler-visible index is needed here; source-specific
+        # matching and P/D waiting are handled by prepare_load.
         computed_blocks = num_computed_tokens // self._ctx.virtual_block_size
-        remaining_hashes = block_hashes[computed_blocks:]
 
-        if not remaining_hashes:
-            self._external_matched_blocks[req_id] = computed_blocks
-            return (0, False)
+        result = self._prepare_load(state, request, num_computed_tokens)
 
-        # Check if request should bypass remote cache lookup
-        # Bypass short requests when queue is busy to avoid blocking long-running queries
-        num_remaining_blocks = len(remaining_hashes)
-        pending = self._prefetch_tracker.pending_prefetches
-        if num_remaining_blocks < self.BYPASS_BLOCKS and pending >= self.HIGH_LOAD_THRESHOLD:
-            self._external_matched_blocks[req_id] = computed_blocks
-            self._bypass_count += 1
-            logger.debug(
-                "[PegaKVConnector] req=%s bypass: remaining_blocks=%d "
-                "pending_prefetches=%d bypass_count=%d",
-                req_id,
-                num_remaining_blocks,
-                pending,
-                self._bypass_count,
-            )
-            return (0, False)
-
-        lookup_start = time.perf_counter()
-        hit_blocks = self._count_available_block_prefix(remaining_hashes, req_id)
-        lookup_end = time.perf_counter()
-        elapsed_us = (lookup_end - lookup_start) * 1e6
-
-        # Prefetch in progress - tell scheduler to retry later
-        if hit_blocks is None:
+        if result.preparing:
             return (None, False)
 
-        self._external_matched_blocks[req_id] = computed_blocks + hit_blocks
-
-        # Each hit block = 1 virtual block = virtual_block_size global tokens.
-        num_hit_tokens = hit_blocks * self._ctx.virtual_block_size
-
-        logger.debug(
-            "[PegaKVConnector] req=%s cache_lookup: hit_blocks=%d computed_blocks=%d "
-            "hit_tokens=%d num_tokens=%d lookup_us=%.0f total_query_hashes=%d",
-            req_id,
-            hit_blocks,
-            computed_blocks,
-            num_hit_tokens,
-            num_tokens,
-            elapsed_us,
-            len(remaining_hashes),
-        )
-
-        if num_hit_tokens <= 0:
+        plan = result.plan
+        if plan is None:
+            state.load_plan = None
+            state.external_matched_blocks = computed_blocks
             return (0, False)
 
-        return (num_hit_tokens, True)
+        state.load_plan = plan
+        prepared_blocks = _ceil_div(plan.num_tokens, self._ctx.virtual_block_size)
+        state.external_matched_blocks = computed_blocks + prepared_blocks
+
+        return (plan.num_tokens, True)
 
     def update_state_after_alloc(
         self,
@@ -146,182 +95,125 @@ class SchedulerConnector:
         num_external_tokens: int,
     ) -> None:
         req_id = request.request_id
+        state = self._require_state(req_id)
+        assert state.request is request, f"req {req_id} request object unexpectedly replaced"
 
-        # Keep a live reference so we can refresh block_hashes during decode
-        # (Request.block_hashes grows as new full blocks are completed).
-        self._requests[req_id] = request
-
-        # request.block_hashes are already at virtual_block_size granularity
-        # (1 hash per scheduler block =
-        # block_size * dcp_world_size * pcp_world_size tokens).
-        # They are 1-to-1 with block_ids from the scheduler.
-        self._block_hashes[req_id] = tuple(request.block_hashes)
-        if req_id not in self._allocated_blocks:
+        if state.next_stored_block_idx is None:
+            assert not state.allocated_blocks, (
+                f"req {req_id} save cursor initialized before block ids were tracked"
+            )
+            assert state.scheduled_tokens == 0, (
+                f"req {req_id} save cursor initialized after scheduling started"
+            )
             # The first locally allocated block may be after an external-hit
             # prefix. Track that global block index explicitly.
-            base_block_idx = self._external_matched_blocks.get(req_id, 0)
-            self._block_index_offsets[req_id] = base_block_idx
-            self._allocated_blocks[req_id] = []
-            self._scheduled_tokens[req_id] = 0
-            self._next_stored_block_idx[req_id] = base_block_idx
+            state.next_stored_block_idx = state.external_matched_blocks
 
         if num_external_tokens > 0:
-            block_ids = list(blocks.get_block_ids()[0]) if blocks else []
-            num_computed_blocks = (
-                sum(block.block_hash is not None for block in blocks.blocks[0]) if blocks else 0
+            plan = state.load_plan
+            assert plan is not None, f"req {req_id} missing ready load plan"
+            block_ids = blocks.get_block_ids()[0]
+            num_load_blocks = _ceil_div(num_external_tokens, self._ctx.virtual_block_size)
+            assert num_load_blocks <= len(block_ids), (
+                f"req {req_id} load blocks exceed allocation: "
+                f"load={num_load_blocks} total={len(block_ids)}"
             )
-            start_block_idx = num_computed_blocks
-            num_load_blocks = num_external_tokens // self._ctx.virtual_block_size
-            expected_load_blocks = len(block_ids) - num_computed_blocks
-            assert num_load_blocks == expected_load_blocks, (
-                f"req {req_id} load block mismatch: external={num_load_blocks} "
-                f"expected={expected_load_blocks}"
-            )
+            start_block_idx = len(block_ids) - num_load_blocks
+            load_block_ids = tuple(block_ids[start_block_idx:])
+            if not load_block_ids:
+                raise RuntimeError(f"req {req_id} prepared load has no allocated block ids")
 
-            load_intent = LoadIntent(
-                block_ids=tuple(block_ids[start_block_idx:]),
-                block_hashes=tuple(
-                    self._block_hashes[req_id][start_block_idx : start_block_idx + num_load_blocks]
-                ),
+            state.pending_load_intent = LoadIntent(
+                block_ids=load_block_ids,
+                plan=plan,
                 num_tokens=num_external_tokens,
             )
-            self._pending_load_intents[req_id] = load_intent
+            state.load_plan = None
             logger.debug(
-                "[PegaKVConnector] req=%s alloc: total_blocks=%d computed_blocks=%d "
+                "[PegaKVConnector] req=%s alloc: total_blocks=%d local_prefix_blocks=%d "
                 "load_blocks=%d start_block_idx=%d load_tokens=%d pending_loads=%d",
                 req_id,
                 len(block_ids),
-                num_computed_blocks,
-                len(load_intent.block_ids),
                 start_block_idx,
-                load_intent.num_tokens,
-                len(self._pending_load_intents),
+                len(state.pending_load_intent.block_ids),
+                start_block_idx,
+                state.pending_load_intent.num_tokens,
+                self._pending_load_count(),
             )
 
     def build_connector_meta(self, scheduler_output: "SchedulerOutput") -> PegaConnectorMetadata:
-        # Collect potential save intents first, then apply drop decision
-        potential_saves: dict[str, SaveIntent] = {}
-
-        load_intents = self._pending_load_intents
-        self._pending_load_intents = {}
+        save_intents: dict[str, SaveIntent] = {}
+        for req_id in scheduler_output.preempted_req_ids or ():
+            state = self._require_state(req_id)
+            self._sync_preemption_state(state)
+        load_intents = self._drain_pending_load_intents()
+        scheduled_req_ids: set[str] = set()
 
         # Process new requests
         for req in scheduler_output.scheduled_new_reqs:
             req_id = req.req_id
+            scheduled_req_ids.add(req_id)
+            state = self._require_state(req_id)
             num_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
-
-            # Verify update_state_after_alloc was called for this request
-            assert req_id in self._block_hashes, (
-                f"req {req_id} not initialized in update_state_after_alloc"
-            )
 
             # Populate block IDs from scheduler_output — single source of
             # truth for the save path (consistent with offloading connector).
             if req.block_ids:
-                self._allocated_blocks[req_id] = list(req.block_ids[0])
+                state.allocated_blocks = list(req.block_ids[0])
 
-            self._scheduled_tokens[req_id] += num_tokens
+            state.scheduled_tokens += num_tokens
 
-            if save_intent := self._consume_save_intent(req_id):
-                potential_saves[req_id] = save_intent
+            if save_intent := self._consume_save_intent(req_id, state):
+                save_intents[req_id] = save_intent
 
         # Process cached (running) requests
         cached_reqs = scheduler_output.scheduled_cached_reqs
         for idx, req_id in enumerate(cached_reqs.req_ids):
-            if req_id not in self._block_hashes:
+            scheduled_req_ids.add(req_id)
+            state = self._request_states.get(req_id)
+            if state is None:
                 continue
 
-            # Refresh block hashes from the live Request object so that
-            # newly completed blocks during decode are also saved.
-            req = self._requests.get(req_id)
-            if req is not None:
-                self._block_hashes[req_id] = tuple(req.block_hashes)
-
             num_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
-            self._scheduled_tokens[req_id] += num_tokens
+            state.scheduled_tokens += num_tokens
 
             # Append newly allocated blocks
             new_block_ids = cached_reqs.new_block_ids[idx]
             if new_block_ids:
-                self._allocated_blocks[req_id].extend(new_block_ids[0])
+                state.allocated_blocks.extend(new_block_ids[0])
 
-            if save_intent := self._consume_save_intent(req_id):
-                potential_saves[req_id] = save_intent
-
-        # Apply save limit: drop new save intents if pending saves exceed limit
-        # Priority: longer requests (more blocks) are kept, shorter ones are dropped
-        # When MAX_PENDING_SAVE_REQUESTS <= 0, no limit is applied (all saves allowed)
-        save_intents: dict[str, SaveIntent] = {}
-
-        if self.MAX_PENDING_SAVE_REQUESTS <= 0:
-            # No limit configured - save all requests
-            save_intents = potential_saves
-        else:
-            # Apply limit with length-based priority
-            current_pending = len(self._pending_saves)
-            available_slots = max(0, self.MAX_PENDING_SAVE_REQUESTS - current_pending)
-
-            # Separate continuing saves (already in pending) from new requests
-            continuing_saves: dict[str, SaveIntent] = {}
-            new_saves: list[tuple[str, SaveIntent, int]] = []  # (req_id, intent, block_count)
-
-            for req_id, intent in potential_saves.items():
-                if req_id in self._pending_saves:
-                    # Continuing saves are always allowed
-                    continuing_saves[req_id] = intent
-                else:
-                    # New request - record its total block count for sorting
-                    block_count = len(self._block_hashes.get(req_id, ()))
-                    new_saves.append((req_id, intent, block_count))
-
-            # Sort new requests by block count (descending) - longer requests first
-            new_saves.sort(key=lambda x: x[2], reverse=True)
-
-            # Add all continuing saves
-            save_intents.update(continuing_saves)
-
-            # Add new saves up to available slots, prioritizing longer requests
-            for req_id, intent, block_count in new_saves:
-                if len(save_intents) - len(continuing_saves) < available_slots:
-                    save_intents[req_id] = intent
-                else:
-                    # Drop this save intent due to limit (shorter requests dropped first)
-                    self._save_dropped_count += 1
-                    logger.warning(
-                        "[PegaKVConnector] Save limit reached (%d/%d), dropping req=%s (blocks=%d)",
-                        current_pending,
-                        self.MAX_PENDING_SAVE_REQUESTS,
-                        req_id,
-                        block_count,
-                    )
+            if save_intent := self._consume_save_intent(req_id, state):
+                save_intents[req_id] = save_intent
 
         # Track requests with pending saves
-        self._pending_saves.update(save_intents.keys())
+        egress_intents = self._build_egress_intents(scheduled_req_ids.difference(load_intents))
+        for req_id in [*save_intents.keys(), *egress_intents.keys()]:
+            state = self._request_states.get(req_id)
+            if state is not None:
+                state.pending_save = True
 
         logger.debug(
-            "[PegaKVConnector] build_connector_meta: %d loads, %d saves (dropped %d)",
+            "[PegaKVConnector] build_connector_meta: %d loads, %d saves, %d egress",
             len(load_intents),
             len(save_intents),
-            len(potential_saves) - len(save_intents),
+            len(egress_intents),
         )
 
         return PegaConnectorMetadata(
             load_intents=load_intents,
             save_intents=save_intents,
+            egress_intents=egress_intents,
             preempted_req_ids=scheduler_output.preempted_req_ids or None,
         )
 
-    def _consume_save_intent(self, req_id: str) -> SaveIntent | None:
+    def _consume_save_intent(self, req_id: str, state: _RequestState) -> SaveIntent | None:
         """Calculate and return SaveIntent for new blocks that need saving."""
-        # block_hashes are at virtual_block_size granularity, 1-to-1 with block_ids.
-        block_hashes = self._block_hashes.get(req_id)
-        if block_hashes is None:
+        block_hashes = tuple(state.request.block_hashes)
+        if not block_hashes:
             return None
-
-        allocated = self._allocated_blocks.get(req_id, [])
-        scheduled = self._scheduled_tokens.get(req_id, 0)
-        base_block_idx = self._block_index_offsets.get(req_id, 0)
-        start_block_idx = self._next_stored_block_idx.get(req_id, base_block_idx)
+        allocated = state.allocated_blocks
+        start_block_idx = state.next_stored_block_idx
+        assert start_block_idx is not None, f"req {req_id} save cursor used before initialization"
 
         # _allocated_blocks tracks request block IDs in global request order.
         # In external-hit cases, the prefix-loaded block IDs are still present at
@@ -329,25 +221,26 @@ class SchedulerConnector:
         # rebasing to a local-only view.
         local_saveable = min(
             len(allocated),
-            scheduled // self._ctx.virtual_block_size,
+            state.scheduled_tokens // self._ctx.virtual_block_size,
         )
-        saveable_block_idx = min(len(block_hashes), base_block_idx + local_saveable)
+        saveable_block_idx = min(
+            len(block_hashes),
+            state.external_matched_blocks + local_saveable,
+        )
         new_blocks = saveable_block_idx - start_block_idx
         if new_blocks <= 0:
             return None
 
-        self._next_stored_block_idx[req_id] = saveable_block_idx
-        hash_start = start_block_idx
-        save_hashes = block_hashes[hash_start : hash_start + new_blocks]
-        save_block_ids = allocated[hash_start : hash_start + new_blocks]
+        state.next_stored_block_idx = saveable_block_idx
+        save_hashes = block_hashes[start_block_idx : start_block_idx + new_blocks]
+        save_block_ids = allocated[start_block_idx : start_block_idx + new_blocks]
 
         logger.debug(
-            "[PegaKVConnector] req=%s save_intent: start=%d hash_start=%d "
+            "[PegaKVConnector] req=%s save_intent: start_block_idx=%d "
             "base_block_idx=%d saveable_block_idx=%d new_blocks=%d total_hashes=%d",
             req_id,
-            hash_start,
-            hash_start,
-            base_block_idx,
+            start_block_idx,
+            state.external_matched_blocks,
             saveable_block_idx,
             new_blocks,
             len(block_hashes),
@@ -360,13 +253,15 @@ class SchedulerConnector:
 
     def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
         for req_id in connector_output.finished_sending or []:
-            self._pending_saves.discard(req_id)
+            state = self._request_states.get(req_id)
+            if state is None:
+                continue
+            state.pending_save = False
             logger.debug("[PegaKVConnector] Request %s save completed", req_id)
 
             # Clean up if request already finished
-            if req_id in self._held_requests:
+            if state.hold_after_save:
                 self._cleanup_request(req_id)
-                self._held_requests.discard(req_id)
 
     def request_finished(
         self,
@@ -374,10 +269,11 @@ class SchedulerConnector:
         block_ids: list[int],  # noqa: ARG002 - required by vLLM interface
     ) -> tuple[bool, dict | None]:
         req_id = request.request_id
+        state = self._request_states.get(req_id)
 
         # Check if there are pending saves for this request
-        if req_id in self._pending_saves:
-            self._held_requests.add(req_id)
+        if state is not None and state.pending_save:
+            state.hold_after_save = True
             logger.debug(
                 "[PegaKVConnector] Request %s blocks held for async save",
                 req_id,
@@ -390,130 +286,218 @@ class SchedulerConnector:
 
     def _cleanup_request(self, req_id: str) -> None:
         """Clean up all state for a completed request."""
-        self._requests.pop(req_id, None)
-        self._block_hashes.pop(req_id, None)
-        self._external_matched_blocks.pop(req_id, None)
-        self._block_index_offsets.pop(req_id, None)
-        self._allocated_blocks.pop(req_id, None)
-        self._scheduled_tokens.pop(req_id, None)
-        self._next_stored_block_idx.pop(req_id, None)
-        self._pending_saves.discard(req_id)
+        self._request_states.pop(req_id, None)
 
-    def _count_available_block_prefix(
-        self, block_hashes: Iterable[bytes], req_id: str
-    ) -> int | None:
-        """Query available blocks with prefetch support and fault tolerance.
+    def _build_egress_intents(self, candidate_req_ids: Iterable[str]) -> dict[str, KvEgressIntent]:
+        egress_intents: dict[str, KvEgressIntent] = {}
+        for req_id in candidate_req_ids:
+            state = self._request_states.get(req_id)
+            if state is None:
+                continue
+            if state.prefill_push_submitted:
+                continue
 
-        Returns:
-            int: Number of blocks ready in cache (proceed with this)
-            None: Blocks are being prefetched from DFS, retry later
+            request = state.request
+            push_tokens = _transferable_prompt_tokens(request, 0)
+            expected_blocks = _ceil_div(push_tokens, self._ctx.virtual_block_size)
+            if push_tokens <= 0 or expected_blocks == 0:
+                state.prefill_push_submitted = True
+                continue
 
-        Fault tolerance:
-            - If service unavailable, returns 0 (no cache hits)
-            - Any exception marks service unavailable and returns 0
-        """
-        # Check service availability first
-        if not self._ctx.state_manager.is_available():
-            return 0
-
-        block_hash_list = list(block_hashes)
-        try:
-            result = self._ctx.engine_client.query_prefetch(
-                self._ctx.instance_id,
-                block_hash_list,
-                req_id=req_id,
+            ready_blocks = self._prefill_push_ready_blocks(
+                state,
+                expected_blocks,
+                push_tokens,
             )
-        except PegaFlowServiceError as e:
-            # Service error (network/internal) - mark unavailable
-            self._ctx.state_manager.mark_unavailable(str(e))
-            return 0
-        except PegaFlowBusinessError as e:
-            # Business error (invalid args, etc.) - log details and propagate
-            logger.error(
-                "[PegaKVConnector] Query business error: %s, "
-                "req_id=%s, instance_id=%s, num_blocks=%d",
-                e,
+            if ready_blocks < expected_blocks or len(state.allocated_blocks) < expected_blocks:
+                continue
+
+            transfer = prefill_push_from_request(request)
+            if transfer is None:
+                continue
+
+            block_hashes = tuple(request.block_hashes)
+            hash_count = min(len(block_hashes), expected_blocks)
+
+            egress_intents[req_id] = KvEgressIntent(
+                request_id=transfer.request_id,
+                remote_endpoint=transfer.decode_endpoint,
+                remote_instance_id=transfer.decode_instance_id,
+                block_ids=tuple(state.allocated_blocks[:expected_blocks]),
+                block_hashes=block_hashes[:hash_count],
+                handle=transfer.handle,
+            )
+            state.prefill_push_submitted = True
+            logger.info(
+                "[PegaKVConnector] req=%s prefill push intent ready: "
+                "transfer_request_id=%s tokens=%d blocks=%d hashes=%d ready_blocks=%d",
                 req_id,
-                self._ctx.instance_id,
-                len(block_hash_list),
+                transfer.request_id,
+                push_tokens,
+                expected_blocks,
+                hash_count,
+                ready_blocks,
             )
-            raise
 
-        # Handle new dict response format
-        if isinstance(result, dict):
-            if not result.get("ok", False):
-                # Response-level errors are treated as business errors
-                error_msg = result.get("message", "unknown error")
+        return egress_intents
+
+    def _prefill_push_ready_blocks(
+        self,
+        state: _RequestState,
+        total_blocks: int,
+        ready_token_limit: int | None = None,
+    ) -> int:
+        token_ready_blocks = _ceil_div(state.scheduled_tokens, self._ctx.virtual_block_size)
+        if ready_token_limit is not None:
+            token_ready_blocks = min(
+                token_ready_blocks,
+                _ceil_div(ready_token_limit, self._ctx.virtual_block_size),
+            )
+        local_ready = min(
+            len(state.allocated_blocks),
+            token_ready_blocks,
+        )
+        ready = state.external_matched_blocks + local_ready
+        return min(total_blocks, ready)
+
+    def _prepare_load(
+        self,
+        state: _RequestState,
+        request: "Request",
+        num_computed_tokens: int,
+    ) -> PrepareLoadResult:
+        prepare_start = time.perf_counter()
+        req_id = request.request_id
+        if not self._ctx.state_manager.is_available():
+            state.prepare_handle = None
+            return PrepareLoadResult.done(None)
+
+        if state.prepare_handle is None:
+            prepare_request = prepare_load_request_from_request(
+                request,
+                self._ctx.instance_id,
+                num_computed_tokens,
+                self._ctx.virtual_block_size,
+            )
+            try:
+                state.prepare_handle = self._ctx.client.begin_prepare_load(prepare_request)
+            except PegaFlowServiceError as e:
+                self._ctx.state_manager.mark_unavailable(str(e))
+                logger.warning(
+                    "[PegaKVConnector] req=%s prepare_load service error: %s",
+                    req_id,
+                    e,
+                )
+                return PrepareLoadResult.done(None)
+            except PegaFlowBusinessError as e:
                 logger.error(
-                    "[PegaKVConnector] Query failed: %s, req_id=%s, instance_id=%s, num_blocks=%d",
-                    error_msg,
+                    "[PegaKVConnector] prepare_load business error: %s, "
+                    "req_id=%s instance_id=%s blocks=%d",
+                    e,
                     req_id,
                     self._ctx.instance_id,
-                    len(block_hash_list),
+                    len(prepare_request.block_hashes),
                 )
-                raise RuntimeError(f"Query failed: {error_msg}")
+                raise
 
-            prefetch_state = result.get("prefetch_state", "done")
-            hit_blocks = result.get("hit_blocks", 0)
+        # TODO: add a prepare-handle timeout. If pegaflow-server dies after
+        # accepting PrepareLoad, this shm can stay pending forever; the
+        # scheduler should eventually fall back locally and mark service
+        # unavailable.
+        result = state.prepare_handle.result()
 
-            if prefetch_state == "loading":
-                # Record first time we see loading state
-                if req_id not in self._prefetch_start_times:
-                    self._prefetch_start_times[req_id] = time.perf_counter()
-                    self._prefetch_tracker.on_prefetch_start()
-                    logger.debug(
-                        "[PegaKVConnector] Prefetch started: req=%s pending_prefetches=%d",
-                        req_id,
-                        self._prefetch_tracker.pending_prefetches,
-                    )
-                return None  # Signal scheduler to retry later
+        if not result.preparing:
+            plan = result.plan
+            state.prepare_handle = None
+            elapsed_us = (time.perf_counter() - prepare_start) * 1e6
+            prepared_blocks = (
+                _ceil_div(plan.num_tokens, self._ctx.virtual_block_size) if plan is not None else 0
+            )
+            logger.info(
+                "[PegaKVConnector] req=%s prepare_load ready: result=%s "
+                "external_tokens=%d external_blocks=%d prepare_us=%.0f",
+                req_id,
+                "prepared" if plan is not None else "no_plan",
+                plan.num_tokens if plan is not None else 0,
+                prepared_blocks,
+                elapsed_us,
+            )
 
-            # Prefetch done - log duration if we were tracking
-            if req_id in self._prefetch_start_times:
-                prefetch_duration_ms = (
-                    time.perf_counter() - self._prefetch_start_times.pop(req_id)
-                ) * 1000
-                self._prefetch_tracker.on_prefetch_complete(prefetch_duration_ms, hit_blocks)
-
-                logger.debug(
-                    "[PegaKVConnector] Prefetch completed: req=%s hit_blocks=%d "
-                    "prefetch_duration_ms=%.2f pending_prefetches=%d",
-                    req_id,
-                    hit_blocks,
-                    prefetch_duration_ms,
-                    self._prefetch_tracker.pending_prefetches,
-                )
-
-            return hit_blocks
-
-        # Legacy tuple response format (ok, message, hit_blocks)
-        _, _, hit_blocks = result
-        return hit_blocks
+        return result
 
     def get_stats(self) -> PegaKVConnectorStats | None:
-        """Get current connector stats for metrics exposure."""
-        # Get stats from prefetch tracker
-        prefetch_stats = self._prefetch_tracker.get_stats()
+        return None
 
-        data: dict = {
-            "pending_prefetches": prefetch_stats["pending_prefetches"],
-            "bypass_count": self._bypass_count,
-            "prefetch_duration": prefetch_stats["prefetch_duration"],
-            "prefetch_blocks": prefetch_stats["prefetch_blocks"],
-        }
+    def _get_or_create_state(self, request: "Request") -> _RequestState:
+        state = self._request_states.get(request.request_id)
+        if state is None:
+            state = _RequestState(
+                request=request,
+                handled_num_preemptions=request.num_preemptions,
+            )
+            self._request_states[request.request_id] = state
+        else:
+            assert state.request is request, (
+                f"req {request.request_id} request object unexpectedly replaced"
+            )
+            self._sync_preemption_state(state)
+        return state
 
-        # Add save_dropped_count if there were any drops
-        if self._save_dropped_count > 0:
-            data["save_dropped_count"] = self._save_dropped_count
-            self._save_dropped_count = 0
+    def _require_state(self, req_id: str) -> _RequestState:
+        state = self._request_states.get(req_id)
+        if state is None:
+            raise RuntimeError(f"req {req_id} missing scheduler connector state")
+        return state
 
-        # Reset bypass count after reporting (it's a counter)
-        self._bypass_count = 0
+    def _sync_preemption_state(self, state: _RequestState) -> None:
+        current_num_preemptions = state.request.num_preemptions
+        handled_num_preemptions = state.handled_num_preemptions
+        assert current_num_preemptions >= handled_num_preemptions, (
+            f"req {state.request.request_id} preemption counter went backwards: "
+            f"{current_num_preemptions} < {handled_num_preemptions}"
+        )
+        if current_num_preemptions == handled_num_preemptions:
+            return
 
-        stats = PegaKVConnectorStats(data=data)
-        if stats.is_empty():
-            return None
-        return stats
+        req_id = state.request.request_id
+        logger.info(
+            "[PegaKVConnector] req=%s resetting scheduling state after preemption: %d -> %d",
+            req_id,
+            handled_num_preemptions,
+            current_num_preemptions,
+        )
+        state.handled_num_preemptions = current_num_preemptions
+        state.external_matched_blocks = 0
+        state.allocated_blocks.clear()
+        state.scheduled_tokens = 0
+        state.next_stored_block_idx = None
+        state.load_plan = None
+        state.pending_load_intent = None
+
+    def _drain_pending_load_intents(self) -> dict[str, LoadIntent]:
+        load_intents: dict[str, LoadIntent] = {}
+        for req_id, state in self._request_states.items():
+            if state.pending_load_intent is None:
+                continue
+            load_intents[req_id] = state.pending_load_intent
+            state.pending_load_intent = None
+        return load_intents
+
+    def _pending_load_count(self) -> int:
+        return sum(state.pending_load_intent is not None for state in self._request_states.values())
+
+
+def _ceil_div(value: int, divisor: int) -> int:
+    if value <= 0:
+        return 0
+    return (int(value) + int(divisor) - 1) // int(divisor)
+
+
+def _transferable_prompt_tokens(request: "Request", num_computed_tokens: int) -> int:
+    # Match vLLM's P2P remote-prefill behavior: D loads KV up to the token
+    # before the final prompt token, then recomputes the final prompt token to
+    # produce logits locally.
+    return max(0, request.num_prompt_tokens - 1 - int(num_computed_tokens))
 
 
 __all__ = ["SchedulerConnector"]
