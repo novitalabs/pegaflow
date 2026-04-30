@@ -164,6 +164,104 @@ impl PinnedMemory {
             return Err(PinnedMemError::ZeroSize);
         }
 
+        let (ptr, actual_size) = match strategy {
+            AllocStrategy::Regular => {
+                let err = rt::cuda::host_alloc(size, rt::cuda::host_alloc_flags::DEFAULT);
+                if err != rt::cudaError::CUDA_SUCCESS {
+                    return Err(PinnedMemError::CudaAllocFailed(err));
+                }
+                let ptr = rt::cuda::host_alloc_ptr(size).expect("allocation succeeded");
+                (NonNull::new(ptr).expect("non-null"), size)
+            }
+            AllocStrategy::WriteCombined => {
+                let err = rt::cuda::host_alloc(
+                    size,
+                    rt::cuda::host_alloc_flags::WRITE_COMBINED,
+                );
+                if err != rt::cudaError::CUDA_SUCCESS {
+                    return Err(PinnedMemError::CudaAllocFailed(err));
+                }
+                let ptr = rt::cuda::host_alloc_ptr(size).expect("allocation succeeded");
+                (NonNull::new(ptr).expect("non-null"), size)
+            }
+            AllocStrategy::HugePages => {
+                return Self::allocate_hugepages_internal(size);
+            }
+        };
+
+        Ok(Self {
+            ptr,
+            size: actual_size,
+            strategy,
+        })
+    }
+
+    fn allocate_hugepages_internal(size: usize) -> Result<Self, PinnedMemError> {
+        let page_size = get_huge_page_size().ok_or(PinnedMemError::HugePageSizeUnavailable)?;
+
+        let aligned_size = (size + page_size - 1) & !(page_size - 1);
+
+        let ptr = unsafe {
+            let null_ptr: *mut libc::c_void = std::ptr::null_mut();
+            libc::mmap(
+                null_ptr,
+                aligned_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_HUGETLB,
+                -1,
+                0,
+            )
+        };
+
+        if ptr == libc::MAP_FAILED {
+            return Err(PinnedMemError::MmapFailed(io::Error::last_os_error()));
+        }
+
+        let err = rt::cuda::host_register(ptr, aligned_size);
+        if err != rt::cudaError::CUDA_SUCCESS {
+            unsafe {
+                libc::munmap(ptr, aligned_size);
+            }
+            return Err(PinnedMemError::CudaRegisterFailed(err));
+        }
+
+        Ok(Self {
+            ptr: NonNull::new(ptr).expect("non-null"),
+            size: aligned_size,
+            strategy: AllocStrategy::HugePages,
+        })
+    }
+
+    /// Get the raw pointer to the pinned memory
+    pub(crate) fn as_ptr(&self) -> *mut u8 {
+        self.ptr.as_ptr()
+    }
+
+    /// Get the size of the allocation in bytes
+    pub(crate) fn size(&self) -> usize {
+        self.size
+    }
+}
+
+impl Drop for PinnedMemory {
+    fn drop(&mut self) {
+        match self.strategy {
+            AllocStrategy::HugePages => {
+                unsafe {
+                    rt::cuda::host_unregister(self.ptr.as_ptr() as *const libc::c_void);
+                    libc::munmap(self.ptr.as_ptr() as *mut libc::c_void, self.size);
+                }
+            }
+            AllocStrategy::Regular | AllocStrategy::WriteCombined => {
+                rt::cuda::free_host(self.ptr.as_ptr() as *mut libc::c_void);
+            }
+        }
+    }
+}l(size: usize, strategy: AllocStrategy) -> Result<Self, PinnedMemError> {
+        if size == 0 {
+            return Err(PinnedMemError::ZeroSize);
+        }
+
         let (ptr, aligned_size) = match strategy {
             AllocStrategy::Regular => {
                 let mut ptr: *mut libc::c_void = std::ptr::null_mut();
