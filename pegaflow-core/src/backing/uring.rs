@@ -24,7 +24,7 @@ use tokio::sync::oneshot;
 
 /// Configuration for io_uring engine.
 #[derive(Debug, Clone)]
-pub(super) struct UringConfig {
+pub struct UringConfig {
     pub threads: usize,
     pub io_depth: usize,
     /// Enable SQ polling; requires kernel support. Off by default.
@@ -196,14 +196,14 @@ impl UringShard {
 }
 
 /// io_uring based engine for single-file read/write.
-pub(super) struct UringIoEngine {
+pub struct UringIoEngine {
     txs: Vec<mpsc::SyncSender<IoCtx>>,
     #[allow(dead_code)]
     handles: Vec<JoinHandle<()>>,
 }
 
 impl UringIoEngine {
-    pub(super) fn new(fd: RawFd, cfg: UringConfig) -> io::Result<Self> {
+    pub fn new(fd: RawFd, cfg: UringConfig) -> io::Result<Self> {
         if cfg.threads == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -253,7 +253,7 @@ impl UringIoEngine {
     ///
     /// # Safety
     /// Caller must ensure all buffer pointers remain valid until the returned receiver completes.
-    pub(super) fn readv_at_async(
+    pub fn readv_at_async(
         &self,
         iovecs: Vec<(*mut u8, usize)>,
         offset: u64,
@@ -300,7 +300,7 @@ impl UringIoEngine {
     ///
     /// # Safety
     /// Caller must ensure all buffer pointers remain valid until the returned receiver completes.
-    pub(super) fn writev_at_async(
+    pub fn writev_at_async(
         &self,
         iovecs: Vec<(*const u8, usize)>,
         offset: u64,

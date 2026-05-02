@@ -2,7 +2,7 @@ pub(super) mod rdma;
 pub(super) mod rdma_fetch;
 pub(super) mod ssd;
 pub(super) mod ssd_cache;
-pub(super) mod uring;
+pub mod uring;
 
 use std::sync::Arc;
 
