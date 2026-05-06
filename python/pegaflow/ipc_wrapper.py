@@ -24,6 +24,7 @@ class CudaIPCWrapper:
         handle: CUDA IPC handle tuple (device, ipc_handle, size, offset, ...)
         dtype: PyTorch dtype of the tensor
         shape: Shape tuple of the tensor
+        stride: Stride tuple of the tensor
         device_uuid: UUID string of the GPU device
 
     Example:
@@ -118,6 +119,8 @@ class CudaIPCWrapper:
         self.handle = handle
         self.dtype = tensor.dtype
         self.shape = tensor.shape
+        self.stride = tensor.stride()
+        self.storage_offset = tensor.storage_offset()
 
         # Store device UUID instead of device index to handle CUDA_VISIBLE_DEVICES
         device_index = tensor.device.index
@@ -148,11 +151,16 @@ class CudaIPCWrapper:
         # Create empty tensor on the correct device
         t = torch.tensor([], device=device, dtype=self.dtype)
 
-        # Set the tensor to use the shared storage
-        t.set_(storage)
-
-        # Reshape to original shape
-        return t.view(self.shape)
+        # Set the tensor to use the shared storage. Preserve stride because
+        # some KV cache layouts use padded storage where shape.numel() is
+        # smaller than the underlying storage size.
+        stride = getattr(self, "stride", None)
+        storage_offset = getattr(self, "storage_offset", 0)
+        if stride is None:
+            t.set_(storage)
+            return t.view(self.shape)
+        t.set_(storage, storage_offset, self.shape, stride)
+        return t
 
     def __eq__(self, other) -> bool:
         """Check equality with another CudaIPCWrapper.
@@ -169,12 +177,15 @@ class CudaIPCWrapper:
             self.handle == other.handle
             and self.dtype == other.dtype
             and self.shape == other.shape
+            and getattr(self, "stride", None) == getattr(other, "stride", None)
+            and getattr(self, "storage_offset", 0) == getattr(other, "storage_offset", 0)
             and self.device_uuid == other.device_uuid
         )
 
     def __repr__(self) -> str:
         return (
             f"CudaIPCWrapper(shape={self.shape}, dtype={self.dtype}, "
+            f"stride={getattr(self, 'stride', None)}, "
             f"device_uuid={self.device_uuid})"
         )
 
