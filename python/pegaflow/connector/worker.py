@@ -356,10 +356,10 @@ class WorkerConnector:
         if self._cross_layer_mode:
             target_layers = [self._cross_layer_key]
         else:
-            target_layers = []
-            for layer_name, layer in forward_context.no_compile_layers.items():
-                if hasattr(layer, "kv_cache"):
-                    target_layers.append(layer_name)
+            assert self._registered_layers, (
+                "KV caches must be registered before submitting load intents"
+            )
+            target_layers = list(self._registered_layers)
 
         if not target_layers:
             return

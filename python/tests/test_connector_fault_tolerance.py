@@ -47,7 +47,16 @@ class FakeEngineClient:
         block_ids,
         block_hashes,
     ) -> tuple[bool, str]:
-        self.load_calls.append((instance_id, tp_rank, device_id, load_state_shm, list(block_ids)))
+        self.load_calls.append(
+            (
+                instance_id,
+                tp_rank,
+                device_id,
+                load_state_shm,
+                list(layer_names),
+                list(block_ids),
+            )
+        )
         if self.fail_load_with_exception is not None:
             raise self.fail_load_with_exception
         if self.fail_load_with_ok_false:
@@ -55,6 +64,9 @@ class FakeEngineClient:
         return (True, "ok")
 
     def health(self) -> tuple[bool, str]:
+        return (True, "ok")
+
+    def unregister_context(self, instance_id: str) -> tuple[bool, str]:
         return (True, "ok")
 
 
@@ -210,5 +222,24 @@ def test_get_block_ids_with_load_errors_drains_between_calls():
 
     assert worker.get_block_ids_with_load_errors() == {1, 2, 3}
     assert worker.get_block_ids_with_load_errors() == set()
+
+    worker.shutdown()
+
+
+def test_load_uses_registered_layer_names_before_forward_context_names():
+    """Load must use the same layer names registered with the server."""
+    worker, client, _ = _make_worker()
+    worker._cross_layer_mode = False
+    worker._registered_layers = ["registered.layer.0", "registered.layer.1"]
+
+    forward_context = MagicMock()
+    forward_layer = MagicMock()
+    forward_layer.kv_cache = object()
+    forward_context.no_compile_layers = {"model.layers.0.attn": forward_layer}
+
+    worker.start_load_kv(_load_metadata("req_registered_layers", (1, 2)), forward_context)
+
+    assert len(client.load_calls) == 1
+    assert client.load_calls[0][4] == ["registered.layer.0", "registered.layer.1"]
 
     worker.shutdown()
