@@ -232,15 +232,17 @@ class ClientContext:
                 self.instance_id,
                 self.namespace,
                 0,  # tp_rank
+                0,  # pp_rank
                 1,  # tp_size
+                1,  # world_size
                 self.device_id,
                 self.num_layers,
-                layer_name,
-                wrapper_bytes,
-                num_blocks,
-                bytes_per_block,
-                kv_stride_bytes,
-                segments,
+                [layer_name],
+                [wrapper_bytes],
+                [num_blocks],
+                [bytes_per_block],
+                [kv_stride_bytes],
+                [segments],
             )
 
             if not ok:

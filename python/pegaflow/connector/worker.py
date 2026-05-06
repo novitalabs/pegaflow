@@ -182,6 +182,7 @@ class WorkerConnector:
             self._ctx.instance_id,
             self._ctx.namespace,
             self._ctx.effective_tp_rank,
+            self._ctx.pp_rank,
             self._ctx.effective_tp_size,
             self._ctx.world_size,
             self._ctx.device_id,
@@ -569,6 +570,7 @@ class WorkerConnector:
                 ok, message = self._ctx.engine_client.save(
                     self._ctx.instance_id,
                     self._ctx.effective_tp_rank,
+                    self._ctx.pp_rank,
                     self._ctx.device_id,
                     saves_list,
                 )

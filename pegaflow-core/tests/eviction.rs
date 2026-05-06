@@ -14,6 +14,14 @@ const NUM_BLOCKS: usize = 4;
 /// Pool fits one batch with headroom for metadata, but not two.
 const POOL_SIZE: usize = NUM_BLOCKS * BLOCK_SIZE * 2;
 
+fn eviction_storage_config() -> StorageConfig {
+    StorageConfig {
+        enable_lfu_admission: false,
+        enable_numa_affinity: false,
+        ..StorageConfig::default()
+    }
+}
+
 /// Save more blocks than the pool can hold — old blocks get evicted,
 /// new blocks round-trip with correct (overwritten) data.
 #[tokio::test]
@@ -21,6 +29,7 @@ async fn eviction_reclaims_old_blocks_for_new() {
     let mut env = TestEnvBuilder::new("inst-evict", "ns-evict")
         .layer("layer_0", NUM_BLOCKS, BLOCK_SIZE)
         .pool_size(POOL_SIZE)
+        .storage(eviction_storage_config())
         .build();
 
     let old = env.hashes(1);
@@ -44,6 +53,7 @@ async fn pinned_blocks_survive_eviction_pressure() {
     let env = TestEnvBuilder::new("inst-pin", "ns-pin")
         .layer("layer_0", NUM_BLOCKS, BLOCK_SIZE)
         .pool_size(POOL_SIZE)
+        .storage(eviction_storage_config())
         .build();
 
     let hashes = env.hashes(10);
@@ -67,9 +77,8 @@ async fn eviction_works_with_sharded_pool() {
         .layer("layer_0", NUM_BLOCKS, BLOCK_SIZE)
         .pool_size(POOL_SIZE)
         .storage(StorageConfig {
-            enable_lfu_admission: false,
             pool_shards: 2,
-            ..StorageConfig::default()
+            ..eviction_storage_config()
         })
         .build();
 

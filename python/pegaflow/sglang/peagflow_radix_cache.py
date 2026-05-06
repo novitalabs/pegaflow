@@ -300,6 +300,7 @@ class PeagflowRadixCache(RadixCache):
                 self.instance_id,
                 self.namespace,
                 0 if self.is_mla else self.tp_rank,
+                0,  # pp_rank
                 1 if self.is_mla else self.tp_size,
                 self.world_size,
                 self.device_id,
@@ -588,6 +589,7 @@ class PeagflowRadixCache(RadixCache):
                     ok, message = self.engine_client.save(
                         self.instance_id,
                         0 if self.is_mla else self.tp_rank,
+                        0,  # pp_rank
                         self.device_id,
                         saves,
                     )

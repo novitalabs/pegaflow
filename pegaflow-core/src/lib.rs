@@ -214,6 +214,7 @@ impl PegaEngine {
         namespace: &str,
         device_id: i32,
         tp_rank: usize,
+        pp_rank: usize,
         tp_size: usize,
         world_size: usize,
         num_layers: usize,
@@ -279,11 +280,11 @@ impl PegaEngine {
         }
 
         // Register GPU with all layers
-        instance.register_new_gpu(device_id, numa_node, kv_caches)?;
+        instance.register_new_gpu(device_id, tp_rank, pp_rank, numa_node, kv_caches)?;
 
         info!(
             "Registered context batch: instance={instance_id}, namespace={namespace}, \
-             device={device_id}, num_layers={num_layers}, tp_rank={tp_rank}/{tp_size}"
+             device={device_id}, num_layers={num_layers}, tp_rank={tp_rank}/{tp_size}, pp_rank={pp_rank}"
         );
         Ok(())
     }
@@ -325,6 +326,23 @@ impl PegaEngine {
             .keys()
             .cloned()
             .collect()
+    }
+
+    /// Return the effective TP size registered for this instance.
+    pub fn instance_tp_size(&self, instance_id: &str) -> Result<usize, EngineError> {
+        Ok(self.get_instance(instance_id)?.tp_size())
+    }
+
+    /// Return the unique valid NUMA nodes used by a registered save group.
+    pub fn registered_numa_nodes_for_save_group(
+        &self,
+        instance_id: &str,
+        tp_rank: usize,
+        pp_rank: usize,
+    ) -> Result<Vec<NumaNode>, EngineError> {
+        Ok(self
+            .get_instance(instance_id)?
+            .registered_numa_nodes_for_save_group(tp_rank, pp_rank))
     }
 
     /// Count prefix hit blocks with SSD prefetch support.

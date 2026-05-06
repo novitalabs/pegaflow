@@ -41,6 +41,7 @@ def main() -> int:
         instance_id,
         "test-ns",
         0,  # tp_rank
+        0,  # pp_rank
         1,  # tp_size
         1,  # world_size
         0,  # device_id

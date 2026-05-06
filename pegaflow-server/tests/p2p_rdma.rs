@@ -305,6 +305,7 @@ async fn p2p_rdma_remote_fetch_roundtrip() {
             NAMESPACE,
             DEVICE_ID,
             0, // tp_rank
+            0, // pp_rank
             1, // tp_size
             1, // world_size
             1, // num_layers
@@ -324,6 +325,7 @@ async fn p2p_rdma_remote_fetch_roundtrip() {
     engine_a
         .batch_save_kv_blocks_from_ipc(
             "inst-a",
+            0,
             0,
             DEVICE_ID,
             vec![LayerSave {
@@ -373,10 +375,11 @@ async fn p2p_rdma_remote_fetch_roundtrip() {
             "inst-b",
             NAMESPACE,
             DEVICE_ID,
-            0,
-            1,
-            1,
-            1,
+            0, // tp_rank
+            0, // pp_rank
+            1, // tp_size
+            1, // world_size
+            1, // num_layers
             &[LAYER.to_string()],
             &[gpu_b.as_u64()],
             &[TOTAL_SIZE],
