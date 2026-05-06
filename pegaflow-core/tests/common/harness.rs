@@ -229,6 +229,7 @@ impl TestEnvBuilder {
             &layer_infos,
             0,
             0,
+            0,
             1,
             self.world_size,
             layers.len(),
@@ -287,6 +288,7 @@ impl TestEnv {
         self.engine
             .batch_save_kv_blocks_from_ipc(
                 &self.instance_id,
+                0,
                 0,
                 0,
                 vec![LayerSave {

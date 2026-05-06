@@ -22,6 +22,7 @@ message RegisterContextRequest {
   repeated uint64 bytes_per_block = 11;
   repeated uint64 kv_stride_bytes = 12;
   repeated uint32 segments = 13;
+  uint32 pp_rank = 14;
 }
 
 message RegisterContextResponse {
@@ -39,6 +40,7 @@ message SaveRequest {
   uint32 tp_rank = 2;
   int32 device_id = 3;
   repeated SaveLayer saves = 4;
+  uint32 pp_rank = 5;
 }
 
 message SaveResponse {

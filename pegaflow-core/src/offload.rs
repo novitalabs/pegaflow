@@ -161,8 +161,36 @@ impl PegaEngine {
         &self,
         instance_id: &str,
         tp_rank: usize,
+        pp_rank: usize,
         device_id: i32,
         saves: Vec<LayerSave>,
+    ) -> Result<(), EngineError> {
+        self.batch_save_kv_blocks_from_ipc_with_numa_hint(
+            instance_id,
+            tp_rank,
+            pp_rank,
+            device_id,
+            saves,
+            None,
+        )
+        .await
+    }
+
+    /// Batch save KV blocks with an optional NUMA allocation override.
+    ///
+    /// `numa_hint` only changes the pinned-memory allocation node and the
+    /// recorded slot NUMA metadata. CUDA reads still use the registered GPU
+    /// context identified by `device_id`. Hints are accepted only when they
+    /// target a registered NUMA node for this effective TP/PP group.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn batch_save_kv_blocks_from_ipc_with_numa_hint(
+        &self,
+        instance_id: &str,
+        tp_rank: usize,
+        pp_rank: usize,
+        device_id: i32,
+        saves: Vec<LayerSave>,
+        numa_hint: Option<NumaNode>,
     ) -> Result<(), EngineError> {
         let batch_start = std::time::Instant::now();
         let total_layers = saves.len();
@@ -186,9 +214,7 @@ impl PegaEngine {
             allocs: Vec<LayerAlloc>,
         }
 
-        let gpu = instance
-            .get_gpu(device_id)
-            .ok_or_else(|| EngineError::WorkerMissing(instance_id.to_string(), device_id))?;
+        let gpu = instance.get_gpu_for_save_group(device_id, tp_rank, pp_rank)?;
 
         let mut layers: Vec<LayerContext> = Vec::with_capacity(saves.len());
 
@@ -318,7 +344,11 @@ impl PegaEngine {
         // ── Phase 2: Allocate pinned memory + build SaveBlocks for all layers ──
 
         trace_scope!("save.pinned_alloc", _s);
-        let numa_node = Some(gpu.preferred_numa());
+        let save_numa_node = match numa_hint {
+            Some(hint) => instance.validate_save_numa_hint(tp_rank, pp_rank, hint)?,
+            None => gpu.preferred_numa(),
+        };
+        let numa_node = Some(save_numa_node);
         let blockwise = self.storage.blockwise_alloc();
 
         let mut gpu_save_layers: Vec<SaveLayerData> = Vec::with_capacity(layers.len());
@@ -495,14 +525,16 @@ impl PegaEngine {
         }
 
         debug!(
-            "save_batch completed: instance_id={} tp_rank={} device_id={} layers={} layers_saved={} blocks_saved={} bytes={} total_ms={:.2}",
+            "save_batch completed: instance_id={} tp_rank={} pp_rank={} device_id={} layers={} layers_saved={} blocks_saved={} bytes={} numa={} total_ms={:.2}",
             instance_id,
             tp_rank,
+            pp_rank,
             device_id,
             total_layers,
             layers.len(),
             total_blocks_to_save,
             total_bytes,
+            save_numa_node,
             batch_start.elapsed().as_secs_f64() * 1000.0
         );
 
@@ -527,7 +559,7 @@ impl PegaEngine {
         self.storage.send_raw_insert(RawSaveBatch {
             namespace,
             total_slots,
-            numa_node: gpu.preferred_numa(),
+            numa_node: save_numa_node,
             layers: raw_layers,
         });
 

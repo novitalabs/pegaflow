@@ -15,6 +15,7 @@ use crate::registry::CudaTensorRegistry;
 use crate::session::SessionRegistry;
 use log::{debug, info, warn};
 use parking_lot::Mutex;
+use pegaflow_common::NumaNode;
 use pegaflow_core::{EngineError, LayerSave, PegaEngine, PrefetchStatus};
 use pyo3::{PyErr, Python};
 use std::sync::Arc;
@@ -76,8 +77,8 @@ impl GrpcEngineService {
         }
     }
 
-    fn context_key(instance_id: &str, tp_rank: u32, device_id: i32) -> String {
-        format!("{instance_id}:tp{tp_rank}:dev{device_id}")
+    fn context_key(instance_id: &str, tp_rank: u32, pp_rank: u32, device_id: i32) -> String {
+        format!("{instance_id}:tp{tp_rank}:pp{pp_rank}:dev{device_id}")
     }
 
     fn ok_status() -> ResponseStatus {
@@ -161,6 +162,55 @@ impl GrpcEngineService {
             }
         }
     }
+
+    fn save_numa_hint(
+        &self,
+        instance_id: &str,
+        tp_rank: usize,
+        pp_rank: usize,
+    ) -> Option<NumaNode> {
+        if tp_rank != 0 {
+            return None;
+        }
+
+        match self.engine.instance_tp_size(instance_id) {
+            Ok(1) => {}
+            Ok(_) => return None,
+            Err(err) => {
+                debug!(
+                    "save NUMA hint skipped: instance={} tp_rank={} could not read instance topology: {}",
+                    instance_id, tp_rank, err
+                );
+                return None;
+            }
+        }
+
+        let candidates = match self.engine.registered_numa_nodes_for_save_group(
+            instance_id,
+            tp_rank,
+            pp_rank,
+        ) {
+            Ok(candidates) => candidates,
+            Err(err) => {
+                debug!(
+                    "save NUMA hint skipped: instance={} tp_rank={} pp_rank={} could not read shard NUMA nodes: {}",
+                    instance_id, tp_rank, pp_rank, err
+                );
+                return None;
+            }
+        };
+
+        let hint =
+            self.session_registry
+                .next_save_numa_hint(instance_id, tp_rank, pp_rank, &candidates);
+        if let Some(numa) = hint {
+            debug!(
+                "save NUMA hint selected: instance={} tp_rank={} pp_rank={} session_tp_size={} candidates={:?} hint={}",
+                instance_id, tp_rank, pp_rank, numa.session_tp_size, candidates, numa.numa_node
+            );
+        }
+        hint.map(|hint| hint.numa_node)
+    }
 }
 
 #[async_trait]
@@ -173,11 +223,12 @@ impl Engine for GrpcEngineService {
         let result: Result<Response<RegisterContextResponse>, Status> = async {
             let req = request.into_inner();
             debug!(
-                "RPC [register_context_batch]: instance_id={} namespace={} device_id={} tp_rank={} tp_size={} world_size={} num_layers={} layer_names={:?} num_blocks={:?} bytes_per_block={:?} kv_stride_bytes={:?} segments={:?} wrapper_bytes_lens={:?}",
+                "RPC [register_context_batch]: instance_id={} namespace={} device_id={} tp_rank={} pp_rank={} tp_size={} world_size={} num_layers={} layer_names={:?} num_blocks={:?} bytes_per_block={:?} kv_stride_bytes={:?} segments={:?} wrapper_bytes_lens={:?}",
                 req.instance_id,
                 req.namespace,
                 req.device_id,
                 req.tp_rank,
+                req.pp_rank,
                 req.tp_size,
                 req.world_size,
                 req.num_layers,
@@ -214,7 +265,8 @@ impl Engine for GrpcEngineService {
             }
 
             // Materialize tensors and collect data_ptr/size_bytes
-            let context_key = Self::context_key(&req.instance_id, req.tp_rank, req.device_id);
+            let context_key =
+                Self::context_key(&req.instance_id, req.tp_rank, req.pp_rank, req.device_id);
             let mut data_ptrs = Vec::with_capacity(num_layers);
             let mut size_bytes_list = Vec::with_capacity(num_layers);
             {
@@ -252,6 +304,7 @@ impl Engine for GrpcEngineService {
                 .collect::<Result<_, _>>()?;
 
             let tp_rank = Self::usize_from_u32(req.tp_rank, "tp_rank")?;
+            let pp_rank = Self::usize_from_u32(req.pp_rank, "pp_rank")?;
             let tp_size = Self::usize_from_u32(req.tp_size, "tp_size")?;
             let world_size = Self::usize_from_u32(req.world_size, "world_size")?;
 
@@ -262,6 +315,7 @@ impl Engine for GrpcEngineService {
                     &req.namespace,
                     req.device_id,
                     tp_rank,
+                    pp_rank,
                     tp_size,
                     world_size,
                     num_layers,
@@ -318,11 +372,13 @@ impl Engine for GrpcEngineService {
             let SaveRequest {
                 instance_id,
                 tp_rank,
+                pp_rank,
                 device_id,
                 saves,
                 ..
             } = req;
             let tp_rank = Self::usize_from_u32(tp_rank, "tp_rank")?;
+            let pp_rank = Self::usize_from_u32(pp_rank, "pp_rank")?;
 
             let saves: Vec<LayerSave> = saves
                 .into_iter()
@@ -334,12 +390,21 @@ impl Engine for GrpcEngineService {
                 .collect();
 
             debug!(
-                "RPC [save]: instance_id={} tp_rank={} device_id={} layers={} blocks={} hashes={}",
-                instance_id, tp_rank, device_id, layer_count, total_blocks, total_hashes
+                "RPC [save]: instance_id={} tp_rank={} pp_rank={} device_id={} layers={} blocks={} hashes={}",
+                instance_id, tp_rank, pp_rank, device_id, layer_count, total_blocks, total_hashes
             );
 
+            let numa_hint = self.save_numa_hint(&instance_id, tp_rank, pp_rank);
+
             self.engine
-                .batch_save_kv_blocks_from_ipc(&instance_id, tp_rank, device_id, saves)
+                .batch_save_kv_blocks_from_ipc_with_numa_hint(
+                    &instance_id,
+                    tp_rank,
+                    pp_rank,
+                    device_id,
+                    saves,
+                    numa_hint,
+                )
                 .await
                 .map_err(Self::map_engine_error)?;
 
@@ -827,7 +892,12 @@ impl Engine for GrpcEngineService {
             return Err(Status::invalid_argument("instance_id must not be empty"));
         }
 
-        let token = self.session_registry.install(instance_id.clone());
+        let token = self.session_registry.install(
+            instance_id.clone(),
+            req.namespace.clone(),
+            req.tp_size,
+            req.world_size,
+        );
         info!(
             "Session opened: instance_id={} namespace={} tp_size={} world_size={} token={}",
             instance_id, req.namespace, req.tp_size, req.world_size, token

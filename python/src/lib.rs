@@ -195,6 +195,7 @@ impl EngineRpcClient {
     ///     instance_id: Model instance ID
     ///     namespace: Namespace for block hash isolation
     ///     tp_rank: Tensor parallel rank of the worker
+    ///     pp_rank: Pipeline parallel rank of the worker
     ///     tp_size: Total Tensor Parallel size
     ///     world_size: Total worker count (TP * PP * PCP)
     ///     device_id: CUDA device ID of the worker
@@ -208,13 +209,14 @@ impl EngineRpcClient {
     ///
     /// Returns: (ok: bool, message: str)
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (instance_id, namespace, tp_rank, tp_size, world_size, device_id, num_layers, layer_names, wrapper_bytes_list, num_blocks_list, bytes_per_block_list, kv_stride_bytes_list, segments_list))]
+    #[pyo3(signature = (instance_id, namespace, tp_rank, pp_rank, tp_size, world_size, device_id, num_layers, layer_names, wrapper_bytes_list, num_blocks_list, bytes_per_block_list, kv_stride_bytes_list, segments_list))]
     fn register_context_batch(
         &self,
         py: Python<'_>,
         instance_id: String,
         namespace: String,
         tp_rank: u32,
+        pp_rank: u32,
         tp_size: u32,
         world_size: u32,
         device_id: i32,
@@ -242,6 +244,7 @@ impl EngineRpcClient {
                     bytes_per_block: bytes_per_block_list,
                     kv_stride_bytes: kv_stride_bytes_list,
                     segments: segments_list,
+                    pp_rank,
                 })
                 .await?;
             Ok(resp.into_inner())
@@ -254,15 +257,18 @@ impl EngineRpcClient {
     /// Args:
     ///     instance_id: Model instance ID
     ///     tp_rank: Tensor parallel rank
+    ///     pp_rank: Pipeline parallel rank
     ///     device_id: CUDA device ID
     ///     saves: List of (layer_name, block_ids, block_hashes) tuples
     ///
     /// Returns: (ok: bool, message: str)
+    #[pyo3(signature = (instance_id, tp_rank, pp_rank, device_id, saves))]
     fn save(
         &self,
         py: Python<'_>,
         instance_id: String,
         tp_rank: u32,
+        pp_rank: u32,
         device_id: i32,
         saves: Vec<(String, Vec<i32>, Vec<Vec<u8>>)>,
     ) -> PyResult<(bool, String)> {
@@ -281,6 +287,7 @@ impl EngineRpcClient {
                     tp_rank,
                     device_id,
                     saves,
+                    pp_rank,
                 })
                 .await?;
             Ok(resp.into_inner())

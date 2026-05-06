@@ -72,6 +72,7 @@ class EngineRpcClient:
         instance_id: str,
         namespace: str,
         tp_rank: int,
+        pp_rank: int,
         tp_size: int,
         world_size: int,
         device_id: int,
@@ -89,6 +90,7 @@ class EngineRpcClient:
             instance_id: Model instance ID.
             namespace: Namespace for model isolation.
             tp_rank: Tensor parallel rank.
+            pp_rank: Pipeline parallel rank.
             tp_size: Total tensor parallel size.
             world_size: Total worker count (TP * PP * PCP).
             device_id: CUDA device ID.
@@ -113,6 +115,7 @@ class EngineRpcClient:
         self,
         instance_id: str,
         tp_rank: int,
+        pp_rank: int,
         device_id: int,
         saves: list[tuple[str, list[int], list[bytes]]],
     ) -> tuple[bool, str]:
@@ -121,6 +124,7 @@ class EngineRpcClient:
         Args:
             instance_id: Model instance ID.
             tp_rank: Tensor parallel rank.
+            pp_rank: Pipeline parallel rank.
             device_id: CUDA device ID.
             saves: List of (layer_name, block_ids, block_hashes) tuples.
                 Each tuple specifies blocks to save for one layer.

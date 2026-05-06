@@ -154,6 +154,12 @@ impl KVCacheRegistration {
 /// - Asynchronous worker pool for load/save operations
 /// - NUMA affinity for memory allocation optimization
 pub struct GpuContext {
+    /// Effective TP rank represented by this GPU context.
+    tp_rank: usize,
+
+    /// Pipeline-parallel rank represented by this GPU context.
+    pp_rank: usize,
+
     /// Preferred NUMA node for this GPU (for memory allocation).
     preferred_numa: NumaNode,
 
@@ -180,12 +186,16 @@ impl GpuContext {
     fn new(
         cuda_ctx: Arc<CudaContext>,
         device_id: i32,
+        tp_rank: usize,
+        pp_rank: usize,
         numa_node: NumaNode,
         kv_caches: HashMap<String, KVCacheRegistration>,
     ) -> Result<Self, EngineError> {
         let worker_pool = GpuWorkerPool::spawn(device_id, numa_node)?;
 
         Ok(Self {
+            tp_rank,
+            pp_rank,
             preferred_numa: numa_node,
             kv_caches,
             _cuda_ctx: cuda_ctx,
@@ -196,6 +206,16 @@ impl GpuContext {
     /// Get the preferred NUMA node for this GPU.
     pub(crate) fn preferred_numa(&self) -> NumaNode {
         self.preferred_numa
+    }
+
+    /// Effective TP rank represented by this shard.
+    pub(crate) fn tp_rank(&self) -> usize {
+        self.tp_rank
+    }
+
+    /// Pipeline-parallel rank represented by this shard.
+    pub(crate) fn pp_rank(&self) -> usize {
+        self.pp_rank
     }
 
     /// Retrieve a layer's registration information.
@@ -216,7 +236,7 @@ impl GpuContext {
 /// It supports tensor parallelism via the `tp_size` parameter.
 pub struct InstanceContext {
     /// Unique instance identifier.
-    _id: String,
+    id: String,
 
     /// Namespace for model isolation (e.g., model name or tenant ID).
     namespace: String,
@@ -255,7 +275,7 @@ impl InstanceContext {
         }
 
         Ok(Self {
-            _id: id,
+            id,
             namespace,
             num_layers: AtomicUsize::new(num_layers),
             tp_size,
@@ -343,6 +363,8 @@ impl InstanceContext {
     fn create_gpu(
         &self,
         device_id: i32,
+        tp_rank: usize,
+        pp_rank: usize,
         numa_node: NumaNode,
         kv_caches: HashMap<String, KVCacheRegistration>,
     ) -> Result<Arc<GpuContext>, EngineError> {
@@ -368,7 +390,9 @@ impl InstanceContext {
         let cuda_ctx = CudaContext::new(device_id as usize)
             .map_err(|e| EngineError::CudaInit(format!("{e:?}")))?;
 
-        let ctx = Arc::new(GpuContext::new(cuda_ctx, device_id, numa_node, kv_caches)?);
+        let ctx = Arc::new(GpuContext::new(
+            cuda_ctx, device_id, tp_rank, pp_rank, numa_node, kv_caches,
+        )?);
 
         // Insert and return
         let mut metadata = self.metadata.lock();
@@ -396,6 +420,28 @@ impl InstanceContext {
         metadata.gpu_contexts.get(&device_id).cloned()
     }
 
+    /// Get a GPU context and verify it belongs to the requested save group.
+    pub(crate) fn get_gpu_for_save_group(
+        &self,
+        device_id: i32,
+        tp_rank: usize,
+        pp_rank: usize,
+    ) -> Result<Arc<GpuContext>, EngineError> {
+        let gpu = self
+            .get_gpu(device_id)
+            .ok_or_else(|| EngineError::WorkerMissing(self.id.clone(), device_id))?;
+
+        if gpu.tp_rank() != tp_rank || gpu.pp_rank() != pp_rank {
+            return Err(EngineError::InvalidArgument(format!(
+                "device_id {device_id} is registered for tp_rank {}, pp_rank {}, but save requested tp_rank {tp_rank}, pp_rank {pp_rank}",
+                gpu.tp_rank(),
+                gpu.pp_rank()
+            )));
+        }
+
+        Ok(gpu)
+    }
+
     /// Register a new GPU with all its KV cache layers.
     ///
     /// # Errors
@@ -404,13 +450,21 @@ impl InstanceContext {
     pub(crate) fn register_new_gpu(
         &self,
         device_id: i32,
+        tp_rank: usize,
+        pp_rank: usize,
         numa_node: NumaNode,
         kv_caches: HashMap<String, KVCacheRegistration>,
     ) -> Result<(), EngineError> {
+        if tp_rank >= self.tp_size {
+            return Err(EngineError::InvalidArgument(format!(
+                "tp_rank {} out of range (tp_size {})",
+                tp_rank, self.tp_size
+            )));
+        }
         for layer_name in kv_caches.keys() {
             self.get_or_allocate_layer_id(layer_name);
         }
-        self.create_gpu(device_id, numa_node, kv_caches)?;
+        self.create_gpu(device_id, tp_rank, pp_rank, numa_node, kv_caches)?;
         Ok(())
     }
 
@@ -422,6 +476,53 @@ impl InstanceContext {
     /// Access the world size.
     pub(crate) fn world_size(&self) -> usize {
         self.world_size
+    }
+
+    /// Access the effective TP size registered with the engine.
+    pub(crate) fn tp_size(&self) -> usize {
+        self.tp_size
+    }
+
+    /// Return unique valid NUMA nodes for registered shards in one save group.
+    pub(crate) fn registered_numa_nodes_for_save_group(
+        &self,
+        tp_rank: usize,
+        pp_rank: usize,
+    ) -> Vec<NumaNode> {
+        let metadata = self.metadata.lock();
+        let mut nodes: Vec<NumaNode> = metadata
+            .gpu_contexts
+            .values()
+            .filter(|gpu| gpu.tp_rank() == tp_rank && gpu.pp_rank() == pp_rank)
+            .map(|gpu| gpu.preferred_numa())
+            .filter(|node| node.is_valid())
+            .collect();
+        nodes.sort_unstable();
+        nodes.dedup();
+        nodes
+    }
+
+    /// Validate that a save placement hint targets a registered shard NUMA node.
+    pub(crate) fn validate_save_numa_hint(
+        &self,
+        tp_rank: usize,
+        pp_rank: usize,
+        numa_node: NumaNode,
+    ) -> Result<NumaNode, EngineError> {
+        if !numa_node.is_valid() {
+            return Err(EngineError::InvalidArgument(format!(
+                "save NUMA hint must be a valid NUMA node, got {numa_node}"
+            )));
+        }
+
+        let candidates = self.registered_numa_nodes_for_save_group(tp_rank, pp_rank);
+        if candidates.contains(&numa_node) {
+            return Ok(numa_node);
+        }
+
+        Err(EngineError::InvalidArgument(format!(
+            "save NUMA hint {numa_node} is not registered for tp_rank {tp_rank}, pp_rank {pp_rank}; candidates={candidates:?}"
+        )))
     }
 
     /// Verify that the topology matches expected values.
@@ -526,7 +627,7 @@ mod tests {
 
         // 3. Register all layers at once
         instance
-            .register_new_gpu(0, numa, kv_caches)
+            .register_new_gpu(0, 0, 0, numa, kv_caches)
             .expect("register gpu with layers");
 
         // 4. Verify topology checking
@@ -543,7 +644,7 @@ mod tests {
             KVCacheRegistration::new(0x2000, 1024 * 1024, 100, 1024, 0, 1).unwrap(),
         )]);
         let err = instance
-            .register_new_gpu(0, numa, dup_caches)
+            .register_new_gpu(0, 0, 0, numa, dup_caches)
             .expect_err("duplicate GPU registration should fail");
         assert!(err.to_string().contains("already exists"));
 
@@ -585,5 +686,22 @@ mod tests {
         // Verify both layers exist with correct IDs
         assert_eq!(instance.get_layer_id("layer_0"), Some(0));
         assert_eq!(instance.get_layer_id("layer_1"), Some(1));
+    }
+
+    #[test]
+    fn save_numa_hint_validation_rejects_unknown_or_unregistered_nodes() {
+        let instance =
+            InstanceContext::new("hint-instance".to_string(), "hint-ns".to_string(), 1, 1, 1)
+                .expect("create instance");
+
+        let err = instance
+            .validate_save_numa_hint(0, 0, NumaNode::UNKNOWN)
+            .expect_err("unknown NUMA hint should fail");
+        assert!(err.to_string().contains("valid NUMA node"));
+
+        let err = instance
+            .validate_save_numa_hint(0, 0, NumaNode(0))
+            .expect_err("unregistered NUMA hint should fail");
+        assert!(err.to_string().contains("not registered"));
     }
 }
