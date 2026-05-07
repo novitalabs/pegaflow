@@ -1,7 +1,6 @@
 import importlib.util
 from pathlib import Path
 
-
 _IPC_WRAPPER_PATH = Path(__file__).resolve().parents[1] / "pegaflow" / "ipc_wrapper.py"
 _IPC_WRAPPER_SPEC = importlib.util.spec_from_file_location("ipc_wrapper", _IPC_WRAPPER_PATH)
 assert _IPC_WRAPPER_SPEC is not None
