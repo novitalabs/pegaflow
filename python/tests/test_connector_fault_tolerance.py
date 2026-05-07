@@ -92,7 +92,7 @@ def _load_metadata(req_id: str, block_ids: tuple[int, ...]) -> PegaConnectorMeta
     return PegaConnectorMetadata(
         load_intents={
             req_id: LoadIntent(
-                block_ids=block_ids,
+                group_block_ids=(block_ids,),
                 block_hashes=tuple(f"h{b}".encode() for b in block_ids),
                 num_tokens=len(block_ids) * 16,
             )

@@ -12,6 +12,7 @@ import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorRole,
+    SupportsHMA,
 )
 from vllm.distributed.parallel_state import get_pp_group, get_tensor_model_parallel_rank
 
@@ -31,7 +32,7 @@ from pegaflow.connector.worker import WorkerConnector
 from pegaflow.pegaflow import EngineRpcClient
 
 
-class PegaKVConnector(KVConnectorBase_V1):
+class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
     """v1 KV connector for PegaFlow with separated scheduler/worker logic."""
 
     def __init__(self, vllm_config, role: KVConnectorRole, kv_cache_config=None):
@@ -40,6 +41,11 @@ class PegaKVConnector(KVConnectorBase_V1):
         instance_id = resolve_instance_id(vllm_config)
         tp_size = vllm_config.parallel_config.tensor_parallel_size
         world_size = vllm_config.parallel_config.world_size
+        num_kv_groups = max(
+            1,
+            len(getattr(kv_cache_config, "kv_cache_groups", None) or []),
+        )
+        engine_world_size = world_size * num_kv_groups
         is_mla = detect_mla(vllm_config)
         dcp_world_size = (
             getattr(vllm_config.parallel_config, "decode_context_parallel_size", 1) or 1
@@ -67,7 +73,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             cross_layer_blocks=cross_layer_blocks,
         )
         num_layers = getattr(vllm_config.model_config.hf_text_config, "num_hidden_layers", 0)
-        block_size = vllm_config.cache_config.block_size
+        block_size = _resolve_connector_block_size(vllm_config, kv_cache_config)
 
         tp_rank: int | None = None
         device_id: int | None = None
@@ -108,7 +114,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             block_size=block_size,
             num_layers=num_layers,
             tp_size=tp_size,
-            world_size=world_size,
+            world_size=engine_world_size,
             tp_rank=tp_rank,
             device_id=device_id,
             engine_client=engine_client,
@@ -124,9 +130,9 @@ class PegaKVConnector(KVConnectorBase_V1):
         self._scheduler: SchedulerConnector | None = None
         self._worker: WorkerConnector | None = None
         if role == KVConnectorRole.SCHEDULER:
-            self._scheduler = SchedulerConnector(self._ctx)
+            self._scheduler = SchedulerConnector(self._ctx, kv_cache_config)
             # Open the liveness stream from the scheduler process only. One
-            # stream per vllm replica is enough — if any tp worker crashes,
+            # stream per vllm replica is enough - if any tp worker crashes,
             # the scheduler dies too, closing this stream and triggering
             # server-side cleanup of the instance's CUDA IPC mappings.
             engine_client.start_session_watcher(instance_id, namespace, tp_size, world_size)
@@ -135,7 +141,8 @@ class PegaKVConnector(KVConnectorBase_V1):
 
         logger.debug(
             "[PegaKVConnector] Initialized role=%s instance_id=%s device=%s "
-            "tp_rank=%s tp_size=%d pp_rank=%d pp_size=%d world_size=%d layers=%d namespace=%s "
+            "tp_rank=%s tp_size=%d pp_rank=%d pp_size=%d world_size=%d "
+            "engine_world_size=%d num_kv_groups=%d layers=%d namespace=%s "
             "is_mla=%s dcp_world_size=%d pcp_world_size=%d dcp_rank=%d",
             role.name,
             instance_id,
@@ -145,6 +152,8 @@ class PegaKVConnector(KVConnectorBase_V1):
             pp_rank,
             pp_size,
             world_size,
+            engine_world_size,
+            num_kv_groups,
             num_layers,
             namespace,
             is_mla,
@@ -224,6 +233,16 @@ class PegaKVConnector(KVConnectorBase_V1):
     ) -> tuple[bool, dict[str, Any] | None]:
         if self._scheduler:
             return self._scheduler.request_finished(request, block_ids)
+        return (False, None)
+
+    def request_finished_all_groups(
+        self,
+        request,
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        if self._scheduler:
+            flat = [bid for group in block_ids for bid in group]
+            return self._scheduler.request_finished(request, flat)
         return (False, None)
 
     def take_events(self) -> Iterable:
@@ -339,6 +358,35 @@ def _resolve_device_id() -> int:
         return int(mapped)
     except ValueError:
         return local_id
+
+
+def _resolve_connector_block_size(vllm_config, kv_cache_config) -> int:
+    """Resolve the block/hash granularity PegaFlow can safely use.
+
+    PegaFlow connector metadata currently assumes request.block_hashes and
+    physical block ids are 1:1 for every KV cache group. vLLM 0.20 added
+    heterogeneous group block sizes with finer hash granularity; that needs a
+    per-group hash mapping before it can be supported safely.
+    """
+    fallback = vllm_config.cache_config.block_size
+    groups = getattr(kv_cache_config, "kv_cache_groups", None) or []
+    if not groups:
+        return fallback
+
+    group_block_sizes: list[int] = []
+    for group in groups:
+        spec = getattr(group, "kv_cache_spec", None)
+        group_block_sizes.append(getattr(spec, "block_size", fallback))
+
+    if len(set(group_block_sizes)) > 1:
+        raise ValueError(
+            "PegaKVConnector does not support heterogeneous KV cache group "
+            f"block sizes yet: {group_block_sizes}. vLLM 0.20+ may use finer "
+            "request.block_hashes than physical group blocks; refusing to "
+            "avoid corrupt save/load hash mappings."
+        )
+
+    return group_block_sizes[0]
 
 
 __all__ = ["PegaKVConnector", "KVConnectorRole"]

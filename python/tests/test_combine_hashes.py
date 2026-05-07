@@ -224,12 +224,12 @@ class TestDecodeHashRefresh:
         blocks = _make_fake_blocks([10, 11, 12, 13])
 
         sc.update_state_after_alloc(req, blocks, num_external_tokens=0)
-        sc._allocated_blocks["r1"] = [10, 11, 12, 13]
+        sc._allocated_blocks["r1"] = [[10, 11, 12, 13]]
         sc._scheduled_tokens["r1"] = 128  # 4 * 32
 
         intent = sc._consume_save_intent("r1")
         assert intent is not None
-        assert len(intent.block_ids) == 4
+        assert len(intent.group_block_ids[0]) == 4
         assert len(intent.block_hashes) == 4
 
     def test_decode_blocks_saved_after_refresh(self):
@@ -240,18 +240,18 @@ class TestDecodeHashRefresh:
         blocks = _make_fake_blocks([10, 11, 12, 13])
 
         sc.update_state_after_alloc(req, blocks, num_external_tokens=0)
-        sc._allocated_blocks["r1"] = [10, 11, 12, 13]
+        sc._allocated_blocks["r1"] = [[10, 11, 12, 13]]
         sc._scheduled_tokens["r1"] = 128  # 4 * 32
 
         # Save initial 4 blocks
         intent = sc._consume_save_intent("r1")
         assert intent is not None
-        assert len(intent.block_ids) == 4
+        assert len(intent.group_block_ids[0]) == 4
 
         # Simulate decode: request grows by 2 blocks
         new_hashes = [_hash(i) for i in range(4, 6)]
         req.block_hashes.extend(new_hashes)  # live Request grows
-        sc._allocated_blocks["r1"].extend([14, 15])  # new block_ids
+        sc._allocated_blocks["r1"][0].extend([14, 15])  # new block_ids
         sc._scheduled_tokens["r1"] += 64  # 2 * 32 more tokens
 
         # Before refresh: _block_hashes is stale (4 entries) → no new saves
@@ -264,8 +264,8 @@ class TestDecodeHashRefresh:
         # Now the 2 decode blocks become saveable
         intent2 = sc._consume_save_intent("r1")
         assert intent2 is not None
-        assert len(intent2.block_ids) == 2
-        assert intent2.block_ids == (14, 15)
+        assert len(intent2.group_block_ids[0]) == 2
+        assert intent2.group_block_ids == ((14, 15),)
         assert intent2.block_hashes == (new_hashes[0], new_hashes[1])
 
     def test_cleanup_removes_request_ref(self):
@@ -291,20 +291,50 @@ class TestDecodeHashRefresh:
         sc._block_index_offsets["r1"] = 6
         sc._next_stored_block_idx["r1"] = 6
         sc._scheduled_tokens["r1"] = 48  # 3 virtual blocks beyond the external hit
+        sc._allocated_blocks["r1"] = [[100, 101, 102, 103, 104, 105, 200, 201, 202]]
+
+        intent = sc._consume_save_intent("r1")
+
+        assert intent is not None
+        assert intent.block_hashes == block_hashes[6:9]
+        assert intent.group_block_ids == ((200, 201, 202),)
+
+    def test_hybrid_save_uses_common_suffix(self):
+        """Hybrid save maps common hash suffix into each group's local block list."""
+        sc = self._make_connector()
+        block_hashes = tuple(_hash(i) for i in range(6))
+
+        sc._block_hashes["r1"] = block_hashes
+        sc._block_index_offsets["r1"] = 0
+        sc._next_stored_block_idx["r1"] = 0
+        sc._scheduled_tokens["r1"] = 6 * 32
         sc._allocated_blocks["r1"] = [
-            100,
-            101,
-            102,
-            103,
-            104,
-            105,
-            200,
-            201,
-            202,
+            [10, 11, 12, 13, 14, 15],
+            [30, 31, 32],
+        ]
+
+        intent = sc._consume_save_intent("r1")
+
+        assert intent is not None
+        assert intent.block_hashes == block_hashes[3:6]
+        assert intent.group_block_ids == ((13, 14, 15), (30, 31, 32))
+
+    def test_external_hit_hybrid_save_uses_group_suffix_offsets(self):
+        """External-hit save maps global suffix indices into shorter SWA groups."""
+        sc = self._make_connector(dcp_world_size=1)
+        block_hashes = tuple(_hash(i) for i in range(9))
+
+        sc._block_hashes["r1"] = block_hashes
+        sc._block_index_offsets["r1"] = 6
+        sc._next_stored_block_idx["r1"] = 6
+        sc._scheduled_tokens["r1"] = 48
+        sc._allocated_blocks["r1"] = [
+            [100, 101, 102, 103, 104, 105, 200, 201, 202],
+            [300, 301, 302],
         ]
 
         intent = sc._consume_save_intent("r1")
 
         assert intent is not None
         assert intent.block_hashes == block_hashes[6:9]
-        assert intent.block_ids == (200, 201, 202)
+        assert intent.group_block_ids == ((200, 201, 202), (300, 301, 302))
