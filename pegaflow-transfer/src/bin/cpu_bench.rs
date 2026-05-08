@@ -6,7 +6,10 @@
 //! Models a realistic workload: each "task" transfers N random-sized batches of fixed-size blocks
 //! via RDMA, measuring per-task latency. Runs single-NIC baselines then multi-NIC aggregate.
 
+use std::collections::{BTreeSet, HashSet};
+use std::io;
 use std::ptr::NonNull;
+use std::sync::OnceLock;
 use std::time::Instant;
 use std::{mem, ptr, thread};
 
@@ -35,6 +38,15 @@ struct Cli {
     #[arg(long, default_value = "150")]
     blocks_per_task: String,
 
+    /// Registered memory pool size. Transfers randomly pick block-sized chunks
+    /// from this pool. Defaults to the largest task transfer size.
+    #[arg(long)]
+    pool_size: Option<String>,
+
+    /// Allocate the registered memory pool with MAP_HUGETLB huge pages.
+    #[arg(long)]
+    use_hugepages: bool,
+
     /// Number of measured tasks.
     #[arg(long, default_value_t = 50)]
     tasks: usize,
@@ -51,9 +63,14 @@ struct Cli {
     #[arg(long)]
     nic: Option<String>,
 
-    /// Exclude a NIC (e.g. "mlx5_0").
-    #[arg(long)]
-    exclude_nic: Option<String>,
+    /// Restrict to NICs. Accepts comma-separated values or multiple values
+    /// after the flag (e.g. "--nics mlx5_0,mlx5_1" or "--nics mlx5_0 mlx5_1").
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    nics: Vec<String>,
+
+    /// Exclude NICs. Accepts comma-separated values or multiple values.
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    exclude_nic: Vec<String>,
 
     /// Restrict to a single NUMA node (e.g. 0).
     #[arg(long)]
@@ -130,6 +147,35 @@ fn parse_block_range(s: &str) -> (usize, usize) {
 }
 
 // ---------------------------------------------------------------------------
+// Huge page helpers
+// ---------------------------------------------------------------------------
+
+static HUGE_PAGE_SIZE: OnceLock<Option<usize>> = OnceLock::new();
+
+fn get_huge_page_size() -> Option<usize> {
+    *HUGE_PAGE_SIZE.get_or_init(read_hugepage_size_from_proc)
+}
+
+fn read_hugepage_size_from_proc() -> Option<usize> {
+    let content = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in content.lines() {
+        if line.starts_with("Hugepagesize:") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() == 3 && parts[2] == "kB" {
+                let kb: usize = parts[1].parse().ok()?;
+                return Some(kb * 1024);
+            }
+        }
+    }
+    None
+}
+
+fn align_up(value: usize, align: usize) -> usize {
+    assert!(align.is_power_of_two(), "alignment must be a power of two");
+    (value + align - 1) & !(align - 1)
+}
+
+// ---------------------------------------------------------------------------
 // NUMA-aware CPU buffer
 // ---------------------------------------------------------------------------
 
@@ -142,7 +188,7 @@ unsafe impl Send for NumaBuffer {}
 unsafe impl Sync for NumaBuffer {}
 
 impl NumaBuffer {
-    fn alloc(numa_node: u32, len: usize) -> Self {
+    fn alloc(numa_node: u32, len: usize, use_hugepages: bool) -> Self {
         assert!(len > 0);
 
         let cpu_topo =
@@ -152,6 +198,13 @@ impl NumaBuffer {
             .unwrap_or_else(|| panic!("no CPUs found for NUMA{}", numa_node));
 
         let cpus = cpus.clone();
+        let mmap_len = if use_hugepages {
+            let huge_page_size =
+                get_huge_page_size().expect("failed to read Hugepagesize from /proc/meminfo");
+            align_up(len, huge_page_size)
+        } else {
+            len
+        };
         let (tx, rx) = std::sync::mpsc::channel();
         let handle = thread::Builder::new()
             .name(format!("numa{}-alloc", numa_node))
@@ -171,20 +224,30 @@ impl NumaBuffer {
                     );
                 }
 
+                let flags = if use_hugepages {
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_HUGETLB
+                } else {
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS
+                };
                 let p = unsafe {
                     libc::mmap(
                         ptr::null_mut(),
-                        len,
+                        mmap_len,
                         libc::PROT_READ | libc::PROT_WRITE,
-                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        flags,
                         -1,
                         0,
                     )
                 };
-                assert_ne!(p, libc::MAP_FAILED, "mmap failed");
+                assert_ne!(
+                    p,
+                    libc::MAP_FAILED,
+                    "mmap failed: {}",
+                    io::Error::last_os_error()
+                );
                 // Touch all pages to fault them on the correct NUMA node.
                 unsafe {
-                    ptr::write_bytes(p as *mut u8, 0xAB, len);
+                    ptr::write_bytes(p as *mut u8, 0xAB, mmap_len);
                 }
                 tx.send(p as u64).unwrap();
             })
@@ -192,7 +255,7 @@ impl NumaBuffer {
         handle.join().expect("NUMA alloc thread panicked");
         let ptr = NonNull::new(rx.recv().unwrap() as *mut u8).expect("mmap returned null");
 
-        Self { ptr, len }
+        Self { ptr, len: mmap_len }
     }
 
     fn fill(&self, pattern: u8) {
@@ -270,15 +333,27 @@ fn generate_task_schedule(
 // Build scatter lists for a task
 // ---------------------------------------------------------------------------
 
-fn build_block_scatter(
+fn build_random_block_scatter(
     local_base: NonNull<u8>,
     remote_base: NonNull<u8>,
     nblocks: usize,
     block_size: usize,
+    pool_blocks: usize,
+    rng: &mut SimpleRng,
 ) -> Vec<TransferDesc> {
-    (0..nblocks)
-        .map(|i| {
-            let off = i * block_size;
+    let mut seen = HashSet::with_capacity(nblocks.min(pool_blocks));
+    let mut block_indices = Vec::with_capacity(nblocks);
+    while block_indices.len() < nblocks {
+        let block_idx = rng.range(0, pool_blocks - 1);
+        if nblocks > pool_blocks || seen.insert(block_idx) {
+            block_indices.push(block_idx);
+        }
+    }
+
+    block_indices
+        .into_iter()
+        .map(|block_idx| {
+            let off = block_idx * block_size;
             TransferDesc {
                 local_ptr: unsafe { NonNull::new_unchecked(local_base.as_ptr().add(off)) },
                 remote_ptr: unsafe { NonNull::new_unchecked(remote_base.as_ptr().add(off)) },
@@ -312,12 +387,20 @@ fn run_bench(
     schedule: &[usize],
     warmup: usize,
     block_size: usize,
+    pool_blocks: usize,
 ) -> BenchResult {
     let mut tasks = Vec::with_capacity(schedule.len().saturating_sub(warmup));
+    let mut rng = SimpleRng::new(0xfeed_4242);
 
     for (i, &nblocks) in schedule.iter().enumerate() {
-        let descs =
-            build_block_scatter(ctx.client_buf.ptr, ctx.server_buf.ptr, nblocks, block_size);
+        let descs = build_random_block_scatter(
+            ctx.client_buf.ptr,
+            ctx.server_buf.ptr,
+            nblocks,
+            block_size,
+            pool_blocks,
+            &mut rng,
+        );
 
         let start = Instant::now();
         let receivers = ctx
@@ -423,9 +506,10 @@ fn create_engine_context(
     nic_names: &[String],
     numa_node: u32,
     buf_size: usize,
+    use_hugepages: bool,
 ) -> EngineContext {
-    let server_buf = NumaBuffer::alloc(numa_node, buf_size);
-    let client_buf = NumaBuffer::alloc(numa_node, buf_size);
+    let server_buf = NumaBuffer::alloc(numa_node, buf_size, use_hugepages);
+    let client_buf = NumaBuffer::alloc(numa_node, buf_size, use_hugepages);
     server_buf.fill(0xAA);
     client_buf.fill(0xBB);
 
@@ -496,6 +580,11 @@ fn create_engine_context(
     }
 }
 
+fn cleanup_engine_context(ctx: &EngineContext) {
+    ctx.client.unregister_memory(&[ctx.client_buf.ptr]).ok();
+    ctx.server.unregister_memory(&[ctx.server_buf.ptr]).ok();
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -507,14 +596,43 @@ fn main() {
     let block_size = parse_size(&cli.block_size);
     let block_range = parse_block_range(&cli.blocks_per_task);
     let total_tasks = cli.warmup_tasks + cli.tasks;
+    let include_nics: BTreeSet<String> = cli.nic.iter().chain(cli.nics.iter()).cloned().collect();
+    let exclude_nics: BTreeSet<String> = cli.exclude_nic.iter().cloned().collect();
 
     let schedule = generate_task_schedule(total_tasks, block_range, 0x42);
     let max_blocks = *schedule.iter().max().unwrap();
+    let min_pool_size = max_blocks * block_size;
+    let pool_size = cli
+        .pool_size
+        .as_deref()
+        .map(parse_size)
+        .unwrap_or(min_pool_size);
+    assert!(
+        pool_size >= block_size,
+        "pool-size must be at least one block"
+    );
+    let pool_blocks = pool_size / block_size;
 
     println!(
-        "pegaflow-cpu-bench: block_size={} blocks_per_task={} tasks={} warmup={}",
-        cli.block_size, cli.blocks_per_task, cli.tasks, cli.warmup_tasks,
+        "pegaflow-cpu-bench: block_size={} blocks_per_task={} tasks={} warmup={} pool_size={} hugepages={}",
+        cli.block_size,
+        cli.blocks_per_task,
+        cli.tasks,
+        cli.warmup_tasks,
+        format_size(pool_size),
+        cli.use_hugepages,
     );
+    println!(
+        "  random pool: {} block(s) of {} usable for random block picks",
+        pool_blocks,
+        format_size(block_size),
+    );
+    if pool_size < min_pool_size {
+        println!(
+            "  note: pool is smaller than max task transfer ({}); random picks may repeat within a task",
+            format_size(min_pool_size),
+        );
+    }
     if block_range.0 != block_range.1 {
         println!(
             "  schedule: min={} max={} blocks (deterministic seed)",
@@ -525,14 +643,29 @@ fn main() {
     if let Some(ref nic) = cli.nic {
         println!("  filter: nic={}", nic);
     }
-    if let Some(ref nic) = cli.exclude_nic {
-        println!("  exclude: nic={}", nic);
+    if !include_nics.is_empty() {
+        println!(
+            "  filter: nics={}",
+            include_nics
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
+    if !exclude_nics.is_empty() {
+        println!(
+            "  exclude: nics={}",
+            exclude_nics
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
     }
     if let Some(numa) = cli.numa {
         println!("  filter: numa={}", numa);
     }
-
-    let buf_size = max_blocks * block_size;
 
     // Detect topology.
     let topo = SystemTopology::detect();
@@ -550,17 +683,19 @@ fn main() {
         std::process::exit(1);
     }
 
+    let mut selected_any = false;
     for group in &groups {
         let nics: Vec<_> = group
             .nics
             .iter()
-            .filter(|nic| cli.nic.as_ref().is_none_or(|f| &nic.name == f))
-            .filter(|nic| cli.exclude_nic.as_ref() != Some(&nic.name))
+            .filter(|nic| include_nics.is_empty() || include_nics.contains(&nic.name))
+            .filter(|nic| !exclude_nics.contains(&nic.name))
             .collect();
 
         if nics.is_empty() {
             continue;
         }
+        selected_any = true;
 
         let nic_count = nics.len();
 
@@ -573,55 +708,63 @@ fn main() {
                 .map(|n| n.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", "),
-            format_size(buf_size),
+            format_size(pool_size),
         );
 
-        // Build single-NIC contexts for baselines.
-        let single_contexts: Vec<EngineContext> = nics
-            .iter()
-            .map(|nic| {
+        let run_mode = |op: TransferOp| {
+            // Phase 1: single-NIC baselines.
+            for nic in &nics {
                 let ctx = create_engine_context(
                     nic.name.clone(),
                     std::slice::from_ref(&nic.name),
                     group.node.0,
-                    buf_size,
+                    pool_size,
+                    cli.use_hugepages,
                 );
                 println!("  {} ready (handshake complete)", nic.name);
-                ctx
-            })
-            .collect();
-
-        // Build multi-NIC context (if >1 NIC).
-        let multi_context = if nic_count > 1 {
-            let nic_names: Vec<String> = nics.iter().map(|n| n.name.clone()).collect();
-            let label = nic_names.join(", ");
-            let ctx = create_engine_context(label, &nic_names, group.node.0, buf_size);
-            println!(
-                "  multi-NIC engine ready ({} NICs, handshake complete)",
-                nic_count
-            );
-            Some(ctx)
-        } else {
-            None
-        };
-
-        let run_mode = |op: TransferOp| {
-            // Phase 1: single-NIC baselines.
-            for ctx in &single_contexts {
                 if op == TransferOp::Read {
                     ctx.client_buf.fill(0x00);
                 }
-                let result = run_bench(ctx, op, &schedule, cli.warmup_tasks, block_size);
+                let result = run_bench(
+                    &ctx,
+                    op,
+                    &schedule,
+                    cli.warmup_tasks,
+                    block_size,
+                    pool_blocks,
+                );
                 print_bench_result(&result, op, block_size, group.node.0, 1);
+                cleanup_engine_context(&ctx);
             }
 
             // Phase 2: multi-NIC aggregate (only if >1 NIC).
-            if let Some(ref ctx) = multi_context {
+            if nic_count > 1 {
+                let nic_names: Vec<String> = nics.iter().map(|n| n.name.clone()).collect();
+                let label = nic_names.join(", ");
+                let ctx = create_engine_context(
+                    label,
+                    &nic_names,
+                    group.node.0,
+                    pool_size,
+                    cli.use_hugepages,
+                );
+                println!(
+                    "  multi-NIC engine ready ({} NICs, handshake complete)",
+                    nic_count
+                );
                 if op == TransferOp::Read {
                     ctx.client_buf.fill(0x00);
                 }
-                let result = run_bench(ctx, op, &schedule, cli.warmup_tasks, block_size);
+                let result = run_bench(
+                    &ctx,
+                    op,
+                    &schedule,
+                    cli.warmup_tasks,
+                    block_size,
+                    pool_blocks,
+                );
                 print_bench_result(&result, op, block_size, group.node.0, nic_count);
+                cleanup_engine_context(&ctx);
             }
         };
 
@@ -633,16 +776,11 @@ fn main() {
                 run_mode(TransferOp::Read);
             }
         }
+    }
 
-        // Cleanup.
-        for ctx in &single_contexts {
-            ctx.client.unregister_memory(&[ctx.client_buf.ptr]).ok();
-            ctx.server.unregister_memory(&[ctx.server_buf.ptr]).ok();
-        }
-        if let Some(ref ctx) = multi_context {
-            ctx.client.unregister_memory(&[ctx.client_buf.ptr]).ok();
-            ctx.server.unregister_memory(&[ctx.server_buf.ptr]).ok();
-        }
+    if !selected_any {
+        eprintln!("error: no RDMA NICs matched the selected filters");
+        std::process::exit(1);
     }
 
     println!();
