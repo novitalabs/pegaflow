@@ -6,7 +6,7 @@ use crate::proto::engine::{
     RemoveBlockHashesResponse, ResponseStatus,
 };
 use crate::store::BlockHashStore;
-use log::{debug, info};
+use log::debug;
 use std::sync::Arc;
 use std::time::Instant;
 use tonic::{Request, Response, Status, async_trait};
@@ -67,7 +67,7 @@ impl MetaServer for GrpcMetaService {
             .insert_hashes(&req.namespace, &req.block_hashes, &req.node);
 
         let elapsed = start.elapsed();
-        info!(
+        debug!(
             "RPC [insert_block_hashes]: namespace={} node={} inserted={} hashes in {:?}",
             req.namespace, req.node, inserted, elapsed
         );
@@ -110,7 +110,7 @@ impl MetaServer for GrpcMetaService {
             .remove_hashes(&req.namespace, &req.block_hashes, &req.node);
 
         let elapsed = start.elapsed();
-        info!(
+        debug!(
             "RPC [remove_block_hashes]: namespace={} node={} removed={} hashes in {:?}",
             req.namespace, req.node, removed, elapsed
         );
@@ -153,7 +153,7 @@ impl MetaServer for GrpcMetaService {
         let prefix_len = existing.len();
 
         let elapsed = start.elapsed();
-        info!(
+        debug!(
             "RPC [query_prefix_blocks]: namespace={} prefix={}/{} in {:?}",
             req.namespace, prefix_len, total_queried, elapsed
         );
