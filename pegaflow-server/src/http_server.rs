@@ -59,6 +59,14 @@ struct CleanupResponse {
     removed_tensors: usize,
 }
 
+#[derive(Serialize)]
+struct MemoryCacheCleanupResponse {
+    evicted_blocks: usize,
+    evicted_bytes: u64,
+    reclaimed_bytes: u64,
+    still_referenced_blocks: u64,
+}
+
 /// POST /instances/cleanup[?id=<instance_id>]
 ///
 /// Without `id`: remove all instances and release all CUDA IPC tensors.
@@ -134,6 +142,21 @@ async fn cleanup_handler(
     }
 }
 
+/// POST /cache/memory/cleanup
+///
+/// Drops resident in-memory cache blocks while preserving backing-store data.
+async fn cleanup_memory_cache_handler(
+    State(state): State<AppState>,
+) -> Json<MemoryCacheCleanupResponse> {
+    let stats = state.engine.cleanup_memory_cache();
+    Json(MemoryCacheCleanupResponse {
+        evicted_blocks: stats.evicted_blocks,
+        evicted_bytes: stats.evicted_bytes,
+        reclaimed_bytes: stats.reclaimed_bytes,
+        still_referenced_blocks: stats.still_referenced_blocks,
+    })
+}
+
 /// Start HTTP server for health check, optional Prometheus metrics, and instance management.
 pub async fn start_http_server(
     addr: std::net::SocketAddr,
@@ -158,17 +181,18 @@ pub async fn start_http_server(
     let mut app = Router::new()
         .route("/health", get(health_handler))
         .route("/instances", get(list_instances_handler))
-        .route("/instances/cleanup", post(cleanup_handler));
+        .route("/instances/cleanup", post(cleanup_handler))
+        .route("/cache/memory/cleanup", post(cleanup_memory_cache_handler));
 
     if enable_prometheus {
         app = app.route("/metrics", get(metrics_handler));
         info!(
-            "Starting HTTP server on {} (/health, /metrics, /instances, /instances/cleanup)",
+            "Starting HTTP server on {} (/health, /metrics, /instances, /instances/cleanup, /cache/memory/cleanup)",
             addr
         );
     } else {
         info!(
-            "Starting HTTP server on {} (/health, /instances, /instances/cleanup)",
+            "Starting HTTP server on {} (/health, /instances, /instances/cleanup, /cache/memory/cleanup)",
             addr
         );
     }

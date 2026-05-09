@@ -25,6 +25,14 @@ pegaflow-server
 - `--metrics-otel-endpoint`: OTLP metrics export endpoint (optional, leave unset to disable)
 - `--metrics-period-secs`: Metrics export period in seconds (default: `10`, only used with OTLP)
 
+### HTTP Endpoints
+
+- `GET /health`: Health check.
+- `GET /metrics`: Prometheus metrics, when `--enable-prometheus` is enabled.
+- `GET /instances`: List registered instance IDs.
+- `POST /instances/cleanup[?id=<instance_id>]`: Remove one instance, or all instances when `id` is omitted.
+- `POST /cache/memory/cleanup`: Evict resident in-memory cache blocks while preserving backing-store data. `evicted_bytes` is the cache footprint removed from residency; `reclaimed_bytes` is the pinned-pool memory actually released immediately.
+
 ### SSD Cache
 
 - `--ssd-cache-path`: Enable SSD cache by providing cache file path (optional)

@@ -262,6 +262,10 @@ impl ReadCache {
             .collect()
     }
 
+    pub(super) fn remove_all(&self) -> Vec<(BlockKey, Arc<SealedBlock>)> {
+        self.inner.lock().cache.remove_all()
+    }
+
     #[cfg(test)]
     pub(super) fn pin_count(&self, instance_id: &str, key: &BlockKey) -> usize {
         let pin_key = (instance_id.to_string(), key.clone());
@@ -358,5 +362,22 @@ mod tests {
         // get_prefix_blocks: stops at key 1 (first miss), returns only key 0
         let (prefix_hit, _) = cache.get_prefix_blocks(&keys);
         assert_eq!(prefix_hit, 1);
+    }
+
+    #[test]
+    fn remove_all_evicts_resident_blocks() {
+        let cache = make_cache();
+        let key1 = BlockKey::new("ns".into(), vec![1]);
+        let key2 = BlockKey::new("ns".into(), vec![2]);
+
+        cache.batch_insert(vec![
+            (key1.clone(), make_block()),
+            (key2.clone(), make_block()),
+        ]);
+
+        let removed = cache.remove_all();
+        assert_eq!(removed.len(), 2);
+        assert_eq!(cache.get_blocks(&[key1, key2]).len(), 0);
+        assert!(cache.remove_all().is_empty());
     }
 }

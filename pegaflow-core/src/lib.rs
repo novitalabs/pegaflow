@@ -40,7 +40,7 @@ pub use pegaflow_common::NumaNode;
 use pegaflow_common::NumaTopology;
 pub use pinned_pool::PinnedAllocation;
 pub use seal_offload::SlotMeta;
-pub use storage::StorageConfig;
+pub use storage::{MemoryCacheCleanupStats, StorageConfig};
 pub use sync_state::{LoadState, LoadStateError};
 pub use trace::{set_trace_sample_rate, should_sample};
 
@@ -435,6 +435,11 @@ impl PegaEngine {
             release_refs_per_hash,
         );
         Ok(unpinned)
+    }
+
+    /// Evict all resident in-memory cache blocks while preserving backing-store data.
+    pub fn cleanup_memory_cache(&self) -> MemoryCacheCleanupStats {
+        self.storage.cleanup_memory_cache()
     }
 
     /// Batch load KV blocks for multiple layers asynchronously.
