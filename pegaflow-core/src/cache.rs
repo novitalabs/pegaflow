@@ -101,6 +101,10 @@ impl TinyLfuCache<BlockKey, ArcSealedBlock> {
     pub(crate) fn remove_lru(&mut self) -> Option<(BlockKey, ArcSealedBlock)> {
         self.lru.remove_lru()
     }
+
+    pub(crate) fn remove_all(&mut self) -> Vec<(BlockKey, ArcSealedBlock)> {
+        self.lru.drain().collect()
+    }
 }
 
 pub(crate) type ArcSealedBlock = Arc<SealedBlock>;

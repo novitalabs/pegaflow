@@ -27,6 +27,14 @@ use write_path::{InsertDeps, WritePipeline};
 
 const RECLAIM_BATCH_SIZE: usize = 64;
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryCacheCleanupStats {
+    pub evicted_blocks: usize,
+    pub evicted_bytes: u64,
+    pub reclaimed_bytes: u64,
+    pub still_referenced_blocks: u64,
+}
+
 #[derive(Clone)]
 pub struct StorageConfig {
     pub enable_lfu_admission: bool,
@@ -359,6 +367,73 @@ impl StorageEngine {
         )
     }
 
+    /// Evict all blocks from the resident in-memory read cache.
+    ///
+    /// This preserves backing-store copies and load pins. Blocks with
+    /// outstanding references may remain allocated until those holders release
+    /// the last `Arc`.
+    pub(crate) fn cleanup_memory_cache(&self) -> MemoryCacheCleanupStats {
+        let used_before = self.allocator.usage().0;
+        let evicted = self.read_cache.remove_all();
+        if evicted.is_empty() {
+            return MemoryCacheCleanupStats::default();
+        }
+
+        if let Some(client) = &self.metaserver_client {
+            let entries: Vec<(String, Vec<u8>)> = evicted
+                .iter()
+                .map(|(key, _)| (key.namespace.clone(), key.hash.clone()))
+                .collect();
+            client.try_unregister(entries);
+        }
+
+        let mut evicted_bytes = 0u64;
+        let mut still_referenced_blocks = 0u64;
+        for (_key, block) in &evicted {
+            let bytes = block.memory_footprint();
+            evicted_bytes = evicted_bytes.saturating_add(bytes);
+            if Arc::strong_count(block) > 1 {
+                still_referenced_blocks += 1;
+            }
+            core_metrics()
+                .cache_resident_bytes
+                .add(-(bytes as i64), &[]);
+        }
+
+        let evicted_blocks = evicted.len();
+        if still_referenced_blocks > 0 {
+            core_metrics()
+                .cache_block_evictions_still_referenced
+                .add(still_referenced_blocks, &[]);
+        }
+        core_metrics()
+            .cache_block_evictions
+            .add(evicted_blocks as u64, &[]);
+
+        drop(evicted);
+        let reclaimed_bytes = used_before.saturating_sub(self.allocator.usage().0);
+        if reclaimed_bytes > 0 {
+            core_metrics()
+                .cache_eviction_reclaimed_bytes
+                .add(reclaimed_bytes, &[]);
+        }
+
+        info!(
+            "Cleaned resident memory cache: evicted_blocks={} evicted_bytes={} reclaimed_bytes={} still_referenced_blocks={}",
+            evicted_blocks,
+            ByteSize(evicted_bytes),
+            ByteSize(reclaimed_bytes),
+            still_referenced_blocks
+        );
+
+        MemoryCacheCleanupStats {
+            evicted_blocks,
+            evicted_bytes,
+            reclaimed_bytes,
+            still_referenced_blocks,
+        }
+    }
+
     /// Check prefix blocks and schedule backing-store reads if needed.
     pub(crate) async fn check_prefix_and_prefetch(
         &self,
@@ -623,6 +698,26 @@ mod tests {
         let unpinned = storage.unpin_block_refs("inst1", "ns", &[vec![1]], 3);
         assert_eq!(unpinned, 3);
         assert_eq!(storage.test_pin_count("inst1", &key), 0);
+    }
+
+    #[tokio::test]
+    async fn cleanup_memory_cache_evicts_all_resident_blocks() {
+        let storage = make_engine();
+        let key1 = BlockKey::new("ns".into(), vec![1]);
+        let key2 = BlockKey::new("ns".into(), vec![2]);
+        let block1 = Arc::new(SealedBlock::from_slots(Vec::new()));
+        let block2 = Arc::new(SealedBlock::from_slots(Vec::new()));
+
+        storage.test_insert_cache(key1, Arc::clone(&block1));
+        storage.test_insert_cache(key2, block2);
+
+        let stats = storage.cleanup_memory_cache();
+        assert_eq!(stats.evicted_blocks, 2);
+        assert_eq!(stats.still_referenced_blocks, 1);
+        assert_eq!(stats.reclaimed_bytes, 0);
+
+        let stats = storage.cleanup_memory_cache();
+        assert_eq!(stats, MemoryCacheCleanupStats::default());
     }
 
     #[tokio::test]
