@@ -17,6 +17,12 @@
 - **Production-ready observability** — built-in Prometheus metrics and OTLP export, not an afterthought
 - **Pluggable** — works with vLLM and SGLang as a drop-in KV connector
 
+## Architecture
+
+<div align="center">
+  <img src="./assets/arch.svg" alt="PegaFlow architecture" />
+</div>
+
 ## Framework Integration
 
 | Framework | Status | Link |
