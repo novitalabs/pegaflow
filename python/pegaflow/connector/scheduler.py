@@ -41,12 +41,6 @@ class _PendingQueryProbe:
 class SchedulerConnector:
     """Holds scheduler-only state and behaviors."""
 
-    # Bypass thresholds (configurable via environment variables).
-    # Default 0 means disabled - bypass strategy only activates when explicitly set.
-    # NOTE: Read from environment at module import time.
-    BYPASS_BLOCKS: int = parse_env_int("PEGA_BYPASS_BLOCKS", 0)
-    HIGH_LOAD_THRESHOLD: int = parse_env_int("PEGA_HIGH_LOAD_THRESHOLD", 0)
-
     # Maximum number of requests that can have pending saves simultaneously.
     # Default 0 means unlimited - drop strategy only activates when explicitly set.
     # When this limit is reached, new save intents will be dropped (shorter first).
@@ -61,11 +55,8 @@ class SchedulerConnector:
         self._pending_query_probes: dict[str, _PendingQueryProbe] = {}
         self._pending_query_probe_releases: dict[str, _PendingQueryProbe] = {}
 
-        # Prefetch tracking (for metrics and bypass decisions)
+        # Prefetch tracking (for metrics)
         self._prefetch_tracker = PrefetchTracker()
-
-        # Bypass statistics
-        self._bypass_count: int = 0
 
         # Save state (per-request)
         self._block_hashes: dict[str, tuple[bytes, ...]] = {}
@@ -109,25 +100,6 @@ class SchedulerConnector:
             if not self._release_pending_query_probe(req_id):
                 return (None, False)
             self._external_matched_blocks[req_id] = computed_blocks
-            return (0, False)
-
-        # Check if request should bypass remote cache lookup
-        # Bypass short requests when queue is busy to avoid blocking long-running queries
-        num_remaining_blocks = len(remaining_hashes)
-        pending = self._prefetch_tracker.pending_prefetches
-        if num_remaining_blocks < self.BYPASS_BLOCKS and pending >= self.HIGH_LOAD_THRESHOLD:
-            self._external_matched_blocks[req_id] = computed_blocks
-            self._bypass_count += 1
-            if not self._release_pending_query_probe(req_id):
-                return (None, False)
-            logger.debug(
-                "[PegaKVConnector] req=%s bypass: remaining_blocks=%d "
-                "pending_prefetches=%d bypass_count=%d",
-                req_id,
-                num_remaining_blocks,
-                pending,
-                self._bypass_count,
-            )
             return (0, False)
 
         remaining_hashes_tuple = tuple(remaining_hashes)
@@ -565,7 +537,6 @@ class SchedulerConnector:
 
         data: dict = {
             "pending_prefetches": prefetch_stats["pending_prefetches"],
-            "bypass_count": self._bypass_count,
             "prefetch_duration": prefetch_stats["prefetch_duration"],
             "prefetch_blocks": prefetch_stats["prefetch_blocks"],
         }
@@ -574,9 +545,6 @@ class SchedulerConnector:
         if self._save_dropped_count > 0:
             data["save_dropped_count"] = self._save_dropped_count
             self._save_dropped_count = 0
-
-        # Reset bypass count after reporting (it's a counter)
-        self._bypass_count = 0
 
         stats = PegaKVConnectorStats(data=data)
         if stats.is_empty():

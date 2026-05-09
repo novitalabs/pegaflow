@@ -96,8 +96,6 @@ class PegaKVConnectorStats(KVConnectorStats):
     Metrics collected:
     - Scheduler-side (gauge):
         - pending_prefetches: number of requests waiting for SSD prefetch
-    - Scheduler-side (counter):
-        - bypass_count: requests that bypassed cache lookup
     - Scheduler-side (histogram):
         - prefetch_duration: prefetch operation duration in milliseconds
         - prefetch_blocks: number of blocks per prefetch operation
@@ -122,8 +120,6 @@ class PegaKVConnectorStats(KVConnectorStats):
         self.data: dict = {
             # Scheduler-side gauges
             "pending_prefetches": 0,
-            # Scheduler-side counters
-            "bypass_count": 0,
             # Scheduler-side prefetch histogram data
             "prefetch_duration": [],  # list[float] in ms
             "prefetch_blocks": [],  # list[int]
@@ -167,7 +163,6 @@ class PegaKVConnectorStats(KVConnectorStats):
 
         # Counter-like metrics: sum them
         for key in [
-            "bypass_count",
             "load_success_count",
             "load_failure_count",
             "save_success_count",
@@ -198,7 +193,6 @@ class PegaKVConnectorStats(KVConnectorStats):
         result: dict[str, int | float | str] = {
             "pending_prefetches": self.data.get("pending_prefetches", 0),
             "pending_save_requests": self.data.get("pending_save_requests", 0),
-            "bypass_count": self.data.get("bypass_count", 0),
         }
 
         # Prefetch stats (scheduler-side)
@@ -243,7 +237,6 @@ class PegaKVConnectorStats(KVConnectorStats):
         return (
             self.data.get("pending_prefetches", 0) == 0
             and self.data.get("pending_save_requests", 0) == 0
-            and self.data.get("bypass_count", 0) == 0
             and len(self.data.get("prefetch_duration", [])) == 0
             and len(self.data.get("load_duration", [])) == 0
             and self.data.get("load_success_count", 0) == 0
@@ -281,9 +274,7 @@ class PegaPromMetrics(KVConnectorPromMetrics):
             documentation="Number of requests waiting for SSD prefetch to complete.",
             labelnames=labelnames,
         )
-        self.gauge_pending_prefetches = _bind_metric_per_engine(
-            self, gauge_pending_prefetches
-        )
+        self.gauge_pending_prefetches = _bind_metric_per_engine(self, gauge_pending_prefetches)
 
         # Gauge metrics for worker-side state
         gauge_pending_save_requests = self._gauge_cls(
@@ -294,14 +285,6 @@ class PegaPromMetrics(KVConnectorPromMetrics):
         self.gauge_pending_save_requests = _bind_metric_per_engine(
             self, gauge_pending_save_requests
         )
-
-        # Counter for bypass events (scheduler-side)
-        counter_bypass = self._counter_cls(
-            name="vllm:pega_bypass_total",
-            documentation="Number of requests that bypassed cache lookup due to short request.",
-            labelnames=labelnames,
-        )
-        self.counter_bypass = _bind_metric_per_engine(self, counter_bypass)
 
         # Histogram for prefetch operations (scheduler-side)
         # Optimized for fast SSD: typical range 10-500ms
@@ -324,9 +307,7 @@ class PegaPromMetrics(KVConnectorPromMetrics):
             buckets=blocks_buckets,
             labelnames=labelnames,
         )
-        self.histogram_prefetch_blocks = _bind_metric_per_engine(
-            self, histogram_prefetch_blocks
-        )
+        self.histogram_prefetch_blocks = _bind_metric_per_engine(self, histogram_prefetch_blocks)
 
         # Histogram for load operations (worker-side)
         # Optimized for fast SSD: typical range 1-50ms
@@ -338,9 +319,7 @@ class PegaPromMetrics(KVConnectorPromMetrics):
             buckets=duration_buckets,
             labelnames=labelnames,
         )
-        self.histogram_load_duration = _bind_metric_per_engine(
-            self, histogram_load_duration
-        )
+        self.histogram_load_duration = _bind_metric_per_engine(self, histogram_load_duration)
 
         histogram_load_blocks = self._histogram_cls(
             name="vllm:pega_load_blocks",
@@ -348,27 +327,21 @@ class PegaPromMetrics(KVConnectorPromMetrics):
             buckets=blocks_buckets,
             labelnames=labelnames,
         )
-        self.histogram_load_blocks = _bind_metric_per_engine(
-            self, histogram_load_blocks
-        )
+        self.histogram_load_blocks = _bind_metric_per_engine(self, histogram_load_blocks)
 
         counter_load_success = self._counter_cls(
             name="vllm:pega_load_success_total",
             documentation="Number of successful KV cache load operations.",
             labelnames=labelnames,
         )
-        self.counter_load_success = _bind_metric_per_engine(
-            self, counter_load_success
-        )
+        self.counter_load_success = _bind_metric_per_engine(self, counter_load_success)
 
         counter_load_failure = self._counter_cls(
             name="vllm:pega_load_failure_total",
             documentation="Number of failed KV cache load operations.",
             labelnames=labelnames,
         )
-        self.counter_load_failure = _bind_metric_per_engine(
-            self, counter_load_failure
-        )
+        self.counter_load_failure = _bind_metric_per_engine(self, counter_load_failure)
 
         # Histogram for save operations
         histogram_save_duration = self._histogram_cls(
@@ -377,9 +350,7 @@ class PegaPromMetrics(KVConnectorPromMetrics):
             buckets=duration_buckets,
             labelnames=labelnames,
         )
-        self.histogram_save_duration = _bind_metric_per_engine(
-            self, histogram_save_duration
-        )
+        self.histogram_save_duration = _bind_metric_per_engine(self, histogram_save_duration)
 
         histogram_save_blocks = self._histogram_cls(
             name="vllm:pega_save_blocks",
@@ -387,36 +358,28 @@ class PegaPromMetrics(KVConnectorPromMetrics):
             buckets=blocks_buckets,
             labelnames=labelnames,
         )
-        self.histogram_save_blocks = _bind_metric_per_engine(
-            self, histogram_save_blocks
-        )
+        self.histogram_save_blocks = _bind_metric_per_engine(self, histogram_save_blocks)
 
         counter_save_success = self._counter_cls(
             name="vllm:pega_save_success_total",
             documentation="Number of successful KV cache save operations.",
             labelnames=labelnames,
         )
-        self.counter_save_success = _bind_metric_per_engine(
-            self, counter_save_success
-        )
+        self.counter_save_success = _bind_metric_per_engine(self, counter_save_success)
 
         counter_save_failure = self._counter_cls(
             name="vllm:pega_save_failure_total",
             documentation="Number of failed KV cache save operations.",
             labelnames=labelnames,
         )
-        self.counter_save_failure = _bind_metric_per_engine(
-            self, counter_save_failure
-        )
+        self.counter_save_failure = _bind_metric_per_engine(self, counter_save_failure)
 
         counter_save_dropped = self._counter_cls(
             name="vllm:pega_save_dropped_total",
             documentation="Number of save operations dropped due to queue limit.",
             labelnames=labelnames,
         )
-        self.counter_save_dropped = _bind_metric_per_engine(
-            self, counter_save_dropped
-        )
+        self.counter_save_dropped = _bind_metric_per_engine(self, counter_save_dropped)
 
     def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0):
         """Record stats to Prometheus metrics."""
@@ -429,11 +392,6 @@ class PegaPromMetrics(KVConnectorPromMetrics):
         self.gauge_pending_save_requests[engine_idx].set(
             transfer_stats_data.get("pending_save_requests", 0)
         )
-
-        # Counter: bypass (scheduler-side)
-        bypass_count = transfer_stats_data.get("bypass_count", 0)
-        if bypass_count > 0:
-            self.counter_bypass[engine_idx].inc(bypass_count)
 
         # Histogram: prefetch duration (scheduler-side)
         # prefetch_duration is in ms, convert to seconds for Prometheus
