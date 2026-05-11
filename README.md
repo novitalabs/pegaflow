@@ -76,6 +76,15 @@ cargo run -r                    # start server
 cd python && maturin develop -r # build Python bindings
 ```
 
+The default source build targets CUDA 12.8. If your environment uses CUDA 13,
+disable the default CUDA feature and enable `cuda-13` explicitly:
+
+```bash
+cargo run -r --no-default-features --features cuda-13 --bin pegaflow-server
+cd python && uv run maturin develop -r --no-default-features --features cuda-13
+./scripts/build-wheel.sh --release --no-default-features --features cuda-13
+```
+
 We use [Conventional Commits](https://www.conventionalcommits.org/) — run `cz c` for an interactive commit prompt.
 
 ## Benchmarks
