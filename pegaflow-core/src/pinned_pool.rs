@@ -89,7 +89,14 @@ impl PinnedMemoryPool {
         pool_size: usize,
         use_hugepages: bool,
         ssd_enabled: bool,
-        unit_size_hint: Option<NonZeroU64>,
+    ) -> Result<Self, crate::pinned_mem::PinnedMemError> {
+        let backing = if use_hugepages {
+            PinnedMemory::allocate_hugepages(pool_size)
+        } else if ssd_enabled {
+            PinnedMemory::allocate_regular(pool_size)
+        } else {
+            PinnedMemory::allocate_write_combined(pool_size)
+        }?; unit_size_hint: Option<NonZeroU64>,
     ) -> Self {
         assert!(
             pool_size != 0,
