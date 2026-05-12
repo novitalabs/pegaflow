@@ -29,7 +29,7 @@ pub struct GrpcEngineService {
     engine: Arc<PegaEngine>,
     registry: Arc<Mutex<CudaTensorRegistry>>,
     shutdown: Arc<Notify>,
-    hll_tracker: Arc<std::sync::Mutex<pegaflow_common::hll::HllTracker>>,
+    hll_tracker: Arc<std::sync::Mutex<pegaflow_common::hll::MultiWindowHllTracker>>,
     session_registry: Arc<SessionRegistry>,
 }
 
@@ -38,7 +38,7 @@ impl GrpcEngineService {
         engine: Arc<PegaEngine>,
         registry: Arc<Mutex<CudaTensorRegistry>>,
         shutdown: Arc<Notify>,
-        hll_tracker: Arc<std::sync::Mutex<pegaflow_common::hll::HllTracker>>,
+        hll_tracker: Arc<std::sync::Mutex<pegaflow_common::hll::MultiWindowHllTracker>>,
     ) -> Self {
         Self {
             engine,
