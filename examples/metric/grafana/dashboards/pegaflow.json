@@ -87,11 +87,11 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(pegaflow_cache_block_hits_total[1m])) / (sum(rate(pegaflow_cache_block_hits_total[1m])) + sum(rate(pegaflow_cache_block_misses_total[1m])))",
+          "expr": "sum(rate(pegaflow_cache_tier_block_requests_total{tier!=\"miss\"}[1m])) / sum(rate(pegaflow_cache_tier_block_requests_total[1m]))",
           "refId": "A"
         }
       ],
-      "title": "Cache Hit Ratio (1m)",
+      "title": "Tier-Attributed Cache Hit Ratio (1m)",
       "type": "gauge"
     },
     {
@@ -213,12 +213,12 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(pegaflow_cache_block_hits_total[1m])) / (sum(rate(pegaflow_cache_block_hits_total[1m])) + sum(rate(pegaflow_cache_block_misses_total[1m])))",
-          "legendFormat": "hit_ratio",
+          "expr": "sum(rate(pegaflow_cache_tier_block_requests_total{tier!=\"miss\"}[1m])) / sum(rate(pegaflow_cache_tier_block_requests_total[1m]))",
+          "legendFormat": "tier_attributed_hit_ratio",
           "refId": "A"
         }
       ],
-      "title": "Cache Hit Ratio",
+      "title": "Tier-Attributed Cache Hit Ratio",
       "type": "timeseries"
     },
     {

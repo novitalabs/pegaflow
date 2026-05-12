@@ -14,6 +14,9 @@ use crate::block::{BlockKey, PrefetchStatus};
 use crate::metrics::core_metrics;
 
 use super::read_cache::ReadCache;
+use super::tier_attribution::{
+    AttributionSource, TierAttribution, record_cache_tier_block_requests,
+};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum PrefetchSource {
@@ -26,6 +29,13 @@ impl PrefetchSource {
         match self {
             Self::Ssd => "ssd",
             Self::Rdma => "rdma",
+        }
+    }
+
+    const fn as_attribution(self) -> AttributionSource {
+        match self {
+            Self::Ssd => AttributionSource::Ssd,
+            Self::Rdma => AttributionSource::Rdma,
         }
     }
 }
@@ -41,6 +51,15 @@ struct LoadResult {
     found: usize,
     rx: oneshot::Receiver<PrefetchResult>,
     source: PrefetchSource,
+}
+
+struct PrefixScan<'a> {
+    instance_id: &'a str,
+    req_id: &'a str,
+    namespace: &'a str,
+    hashes: &'a [Vec<u8>],
+    num_workers: usize,
+    emit_tier_metrics: bool,
 }
 
 struct PrefetchState {
@@ -97,24 +116,33 @@ impl PrefetchScheduler {
         hashes: &[Vec<u8>],
         num_workers: usize,
     ) -> PrefetchStatus {
+        // Default: this call may be the first decision and should attribute.
+        let mut emit_tier_metrics = true;
         if let Some(status) = self.poll_existing(read_cache, req_id) {
             match status {
                 PollResult::StillLoading => {
                     return PrefetchStatus::Loading { hit: 0, loading: 1 };
                 }
                 PollResult::Completed => {
-                    // Fall through to full scan
+                    // Backing has just written blocks into read_cache. The
+                    // fall-through scan will re-see them as RAM hits; we MUST
+                    // NOT attribute again, because we already attributed
+                    // them as `rdma`/`ssd` on the first decision.
+                    emit_tier_metrics = false;
                 }
             }
         }
 
         self.full_prefix_scan(
             read_cache,
-            instance_id,
-            req_id,
-            namespace,
-            hashes,
-            num_workers,
+            PrefixScan {
+                instance_id,
+                req_id,
+                namespace,
+                hashes,
+                num_workers,
+                emit_tier_metrics,
+            },
         )
         .await
     }
@@ -163,18 +191,15 @@ impl PrefetchScheduler {
     async fn full_prefix_scan(
         &self,
         read_cache: &ReadCache,
-        instance_id: &str,
-        req_id: &str,
-        namespace: &str,
-        hashes: &[Vec<u8>],
-        num_workers: usize,
+        scan: PrefixScan<'_>,
     ) -> PrefetchStatus {
         let total_start = Instant::now();
 
         let key_build_start = Instant::now();
-        let keys: Vec<BlockKey> = hashes
+        let keys: Vec<BlockKey> = scan
+            .hashes
             .iter()
-            .map(|hash| BlockKey::new(namespace.to_string(), hash.clone()))
+            .map(|hash| BlockKey::new(scan.namespace.to_string(), hash.clone()))
             .collect();
         let key_build = key_build_start.elapsed();
 
@@ -184,7 +209,7 @@ impl PrefetchScheduler {
         let remaining = &keys[hit..];
 
         let load_select_start = Instant::now();
-        let load = self.try_load(req_id, namespace, remaining).await;
+        let load = self.try_load(scan.req_id, scan.namespace, remaining).await;
         let load_select = load_select_start.elapsed();
         let loading = load.as_ref().map_or(0, |l| l.found);
         let missing = keys.len() - hit - loading;
@@ -192,12 +217,20 @@ impl PrefetchScheduler {
         if let Some(load) = load {
             let source = load.source;
             let register_start = Instant::now();
-            self.register_inflight(req_id, load);
+            self.register_inflight(scan.req_id, load);
             let register = register_start.elapsed();
+
+            self.maybe_record_tier_attribution(
+                keys.len(),
+                hit,
+                loading,
+                Some(source.as_attribution()),
+                scan.emit_tier_metrics,
+            );
 
             info!(
                 "Prefetch scheduling timing: req_id={} source={} total_keys={} hit={} loading={} missing={} key_build={:?} cache_scan={:?} load_select={:?} register_inflight={:?} total={:?}",
-                req_id,
+                scan.req_id,
                 source.as_str(),
                 keys.len(),
                 hit,
@@ -212,11 +245,20 @@ impl PrefetchScheduler {
             PrefetchStatus::Loading { hit, loading }
         } else {
             let pin_start = Instant::now();
-            read_cache.pin_blocks(instance_id, num_workers, &blocks_to_pin);
+            read_cache.pin_blocks(scan.instance_id, scan.num_workers, &blocks_to_pin);
             let pin = pin_start.elapsed();
+
+            self.maybe_record_tier_attribution(
+                keys.len(),
+                hit,
+                /* loading = */ 0,
+                /* loading_source = */ None,
+                scan.emit_tier_metrics,
+            );
+
             info!(
                 "Prefetch local-hit timing: req_id={} total_keys={} hit={} missing={} key_build={:?} cache_scan={:?} load_select={:?} pin={:?} total={:?}",
-                req_id,
+                scan.req_id,
                 keys.len(),
                 hit,
                 missing,
@@ -230,7 +272,25 @@ impl PrefetchScheduler {
         }
     }
 
-    /// Priority fallback: RDMA → SSD. Returns `None` when neither source has blocks.
+    /// Attribute this `query_prefetch` decision. Skips attribution when:
+    /// * `emit_tier_metrics == false` (e.g. post-completion fall-through);
+    /// * `keys` was empty (no decision to attribute).
+    fn maybe_record_tier_attribution(
+        &self,
+        total: usize,
+        hit: usize,
+        loading: usize,
+        loading_source: Option<AttributionSource>,
+        emit_tier_metrics: bool,
+    ) {
+        if !emit_tier_metrics || total == 0 {
+            return;
+        }
+        let attribution = TierAttribution::classify(total, hit, loading, loading_source);
+        record_cache_tier_block_requests(total, attribution);
+    }
+
+    /// Priority fallback: RDMA -> SSD. Returns `None` when neither source has blocks.
     async fn try_load(
         &self,
         req_id: &str,
@@ -327,11 +387,13 @@ impl PrefetchScheduler {
         );
     }
 
+    /// Sweep `failed_remote` entries older than `max_age`.
+    /// Runs under the single `PrefetchState` mutex.
     pub(super) fn gc_failed_remote(&self, max_age: std::time::Duration) -> usize {
         let mut state = self.state.lock();
-        let before = state.failed_remote.len();
+        let failed_before = state.failed_remote.len();
         state.failed_remote.retain(|_, ts| ts.elapsed() < max_age);
-        before - state.failed_remote.len()
+        failed_before - state.failed_remote.len()
     }
 }
 

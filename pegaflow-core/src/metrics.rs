@@ -1,10 +1,22 @@
 use opentelemetry::{
-    global,
+    KeyValue, global,
     metrics::{Counter, Histogram, Meter, ObservableGauge, UpDownCounter},
 };
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use crate::backing::RdmaTransport;
+
+// ---------------------------------------------------------------------------
+// Tier-attribution label sets for `cache_tier_block_requests`.
+//
+// Stored as `LazyLock<[KeyValue; 1]>` so the hot path passes a `&[KeyValue]`
+// slice without rebuilding the attribute on every counter add.
+// ---------------------------------------------------------------------------
+
+static TIER_RAM: LazyLock<[KeyValue; 1]> = LazyLock::new(|| [KeyValue::new("tier", "ram")]);
+static TIER_RDMA: LazyLock<[KeyValue; 1]> = LazyLock::new(|| [KeyValue::new("tier", "rdma")]);
+static TIER_SSD: LazyLock<[KeyValue; 1]> = LazyLock::new(|| [KeyValue::new("tier", "ssd")]);
+static TIER_MISS: LazyLock<[KeyValue; 1]> = LazyLock::new(|| [KeyValue::new("tier", "miss")]);
 
 pub(crate) struct CoreMetrics {
     // Pinned pool (allocator-level)
@@ -20,6 +32,11 @@ pub(crate) struct CoreMetrics {
     pub cache_resident_bytes: UpDownCounter<i64>,
     pub cache_block_hits: Counter<u64>,
     pub cache_block_misses: Counter<u64>,
+    /// Per-decision block attribution for `query_prefetch`. Labelled by `tier`
+    /// (`ram` | `rdma` | `ssd` | `miss`). Each `query_prefetch` decision adds
+    /// at most four times (one per non-zero tier) and the sum across tiers
+    /// equals the request's `block_hashes.len()`.
+    pub cache_tier_block_requests: Counter<u64>,
     pub cache_block_insertions: Counter<u64>,
     pub cache_block_admission_rejections: Counter<u64>,
     pub cache_block_evictions: Counter<u64>,
@@ -139,6 +156,30 @@ pub(crate) fn register_rdma_gauges(transport: &Arc<RdmaTransport>) {
     });
 }
 
+pub(crate) fn record_cache_tier_block_requests(ram: usize, rdma: usize, ssd: usize, miss: usize) {
+    let metrics = core_metrics();
+    if ram > 0 {
+        metrics
+            .cache_tier_block_requests
+            .add(ram as u64, &*TIER_RAM);
+    }
+    if rdma > 0 {
+        metrics
+            .cache_tier_block_requests
+            .add(rdma as u64, &*TIER_RDMA);
+    }
+    if ssd > 0 {
+        metrics
+            .cache_tier_block_requests
+            .add(ssd as u64, &*TIER_SSD);
+    }
+    if miss > 0 {
+        metrics
+            .cache_tier_block_requests
+            .add(miss as u64, &*TIER_MISS);
+    }
+}
+
 pub(crate) fn core_metrics() -> &'static CoreMetrics {
     static METRICS: OnceLock<CoreMetrics> = OnceLock::new();
     METRICS.get_or_init(|| {
@@ -185,6 +226,17 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
             cache_block_misses: meter
                 .u64_counter("pegaflow_cache_block_misses")
                 .with_description("Complete blocks not found in cache (cache miss)")
+                .build(),
+            cache_tier_block_requests: meter
+                .u64_counter("pegaflow_cache_tier_block_requests")
+                .with_description(
+                    "Per-decision query_prefetch block attribution by storage tier \
+                     (tier=ram|rdma|ssd|miss). The sum across tiers equals the \
+                     request's block count for that decision. This is decision \
+                     attribution, not service attribution; backing failures must be \
+                     inspected via pegaflow_rdma_fetch_total{status=\"error\"} \
+                     and pegaflow_ssd_prefetch_failures_total.",
+                )
                 .build(),
             cache_block_insertions: meter
                 .u64_counter("pegaflow_cache_block_insertions")
