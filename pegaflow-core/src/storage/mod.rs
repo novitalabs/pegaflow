@@ -351,6 +351,15 @@ impl StorageEngine {
             .consume_load_lease(instance_id, load_lease_id)
     }
 
+    /// Return the block count covered by a load lease without consuming it.
+    pub(crate) fn load_lease_len(
+        &self,
+        instance_id: &str,
+        load_lease_id: &str,
+    ) -> Result<usize, String> {
+        self.read_cache.load_lease_len(instance_id, load_lease_id)
+    }
+
     /// Release a load lease in one cancellation operation.
     pub(crate) fn release_load_lease(&self, load_lease_id: &str) -> bool {
         self.read_cache.release_load_lease(load_lease_id)

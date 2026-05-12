@@ -346,6 +346,14 @@ impl TestEnv {
         self.engine.release_load_lease(lease_id);
     }
 
+    pub fn pending_load_lease(&self) -> String {
+        self.pending_load_lease
+            .lock()
+            .expect("lease lock")
+            .clone()
+            .expect("load lease must be reserved")
+    }
+
     /// Count cache hits, then release the lease (for probing without consuming).
     pub async fn count_hits_then_release(&self, hashes: &[Vec<u8>]) -> usize {
         match self.query(hashes).await {
@@ -363,22 +371,27 @@ impl TestEnv {
     pub async fn load_to_gpu(&self, hashes: &[Vec<u8>]) {
         let block_ids: Vec<i32> = (0..hashes.len() as i32).collect();
         let layer_names: Vec<&str> = self.layers.iter().map(|l| l.name.as_str()).collect();
+        let lease_id = self.pending_load_lease();
+        self.load_to_gpu_with_lease(&lease_id, &block_ids, &layer_names)
+            .await;
+    }
+
+    pub async fn load_to_gpu_with_lease(
+        &self,
+        lease_id: &str,
+        block_ids: &[i32],
+        layer_names: &[&str],
+    ) {
         let load_state = LoadState::new().expect("create LoadState");
         let shm_name = load_state.shm_name().to_string();
-        let lease_id = self
-            .pending_load_lease
-            .lock()
-            .expect("lease lock")
-            .clone()
-            .expect("load lease must be reserved before load");
-        let leases = vec![(lease_id.as_str(), block_ids)];
+        let leases = vec![(lease_id, block_ids.to_vec())];
         self.engine
             .batch_load_kv_blocks_multi_layer(
                 &self.instance_id,
                 0,
                 0,
                 &shm_name,
-                &layer_names,
+                layer_names,
                 &leases,
             )
             .expect("submit load");

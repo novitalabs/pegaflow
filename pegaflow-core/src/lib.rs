@@ -120,6 +120,17 @@ pub struct PegaEngine {
     topology: Arc<NumaTopology>,
 }
 
+struct ValidatedLoadPlan {
+    total_blocks: usize,
+    layers: Vec<ValidatedLoadLayer>,
+}
+
+struct ValidatedLoadLayer {
+    name: String,
+    registration: KVCacheRegistration,
+    slot_id: usize,
+}
+
 impl PegaEngine {
     /// Create an engine with full custom configuration.
     ///
@@ -462,65 +473,25 @@ impl PegaEngine {
             .get_gpu(device_id)
             .ok_or_else(|| EngineError::WorkerMissing(instance_id.to_string(), device_id))?;
 
-        // Consume all load leases reserved for this load.
+        let plan = self.validate_load_plan(
+            &instance,
+            &gpu,
+            instance_id,
+            tp_rank,
+            device_id,
+            layer_names,
+            leases,
+        )?;
+
+        // Consume all load leases after validation succeeds.
         trace_scope!("load.cache_lookup", _s);
-        let total_blocks = leases.iter().map(|(_, block_ids)| block_ids.len()).sum();
-        let mut block_ids = Vec::with_capacity(total_blocks);
-        let mut block_cache = Vec::with_capacity(total_blocks);
-        for (load_lease_id, lease_block_ids) in leases {
-            let lease_blocks = self
-                .storage
-                .consume_load_lease(instance_id, load_lease_id)
-                .map_err(EngineError::Storage)?;
-            if lease_blocks.len() != lease_block_ids.len() {
-                return Err(EngineError::InvalidArgument(format!(
-                    "lease {load_lease_id} contains {} blocks but request provided {} block_ids",
-                    lease_blocks.len(),
-                    lease_block_ids.len()
-                )));
-            }
-            block_ids.extend_from_slice(lease_block_ids);
-            block_cache.extend(lease_blocks);
-        }
+        let (block_ids, block_cache) =
+            self.consume_load_leases(instance_id, leases, plan.total_blocks)?;
         trace_drop!(_s);
 
-        // Build load tasks for each layer
+        // Build load tasks for each layer.
         trace_scope!("load.build_tasks");
-        let mut layers = Vec::with_capacity(layer_names.len());
-
-        for layer_name in layer_names {
-            let layer_id = instance.get_layer_id(layer_name).ok_or_else(|| {
-                EngineError::InvalidArgument(format!(
-                    "layer {layer_name} unknown for instance {instance_id}"
-                ))
-            })?;
-
-            let registration = gpu.get_registration(layer_name).ok_or_else(|| {
-                EngineError::InvalidArgument(format!(
-                    "layer {layer_name} not registered on device {device_id}"
-                ))
-            })?;
-
-            let slot_id = instance.get_slot_index(layer_id, tp_rank)?;
-
-            let blocks: Vec<LoadBlock> = block_ids
-                .iter()
-                .zip(block_cache.iter())
-                .filter_map(|(block_id, block_entry)| {
-                    let block_idx = usize::try_from(*block_id).ok()?;
-                    let block = block_entry.get_slot(slot_id)?.clone();
-                    Some(LoadBlock { block_idx, block })
-                })
-                .collect();
-
-            if !blocks.is_empty() {
-                layers.push(LayerLoadData {
-                    layer_name: (*layer_name).to_string(),
-                    registration,
-                    blocks,
-                });
-            }
-        }
+        let layers = Self::build_layer_loads(plan.layers, &block_ids, &block_cache);
 
         // Complete immediately if no blocks to load
         if layers.is_empty() {
@@ -534,6 +505,146 @@ impl PegaEngine {
             layers,
             load_state_shm: load_state_shm.to_string(),
         })
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "load validation needs the complete target context"
+    )]
+    fn validate_load_plan(
+        &self,
+        instance: &InstanceContext,
+        gpu: &GpuContext,
+        instance_id: &str,
+        tp_rank: usize,
+        device_id: i32,
+        layer_names: &[&str],
+        leases: &[(&str, Vec<i32>)],
+    ) -> Result<ValidatedLoadPlan, EngineError> {
+        let total_blocks = self.validate_load_leases(instance_id, leases)?;
+        let layers = Self::validate_load_layers(
+            instance,
+            gpu,
+            instance_id,
+            tp_rank,
+            device_id,
+            layer_names,
+        )?;
+
+        Ok(ValidatedLoadPlan {
+            total_blocks,
+            layers,
+        })
+    }
+
+    fn validate_load_leases(
+        &self,
+        instance_id: &str,
+        leases: &[(&str, Vec<i32>)],
+    ) -> Result<usize, EngineError> {
+        let mut total_blocks = 0usize;
+
+        for (load_lease_id, block_ids) in leases {
+            let lease_blocks = self
+                .storage
+                .load_lease_len(instance_id, load_lease_id)
+                .map_err(EngineError::Storage)?;
+
+            if lease_blocks != block_ids.len() {
+                return Err(EngineError::InvalidArgument(format!(
+                    "lease {load_lease_id} contains {lease_blocks} blocks but request provided {} block_ids",
+                    block_ids.len()
+                )));
+            }
+
+            total_blocks += block_ids.len();
+        }
+
+        Ok(total_blocks)
+    }
+
+    fn validate_load_layers(
+        instance: &InstanceContext,
+        gpu: &GpuContext,
+        instance_id: &str,
+        tp_rank: usize,
+        device_id: i32,
+        layer_names: &[&str],
+    ) -> Result<Vec<ValidatedLoadLayer>, EngineError> {
+        layer_names
+            .iter()
+            .map(|layer_name| {
+                let layer_id = instance.get_layer_id(layer_name).ok_or_else(|| {
+                    EngineError::InvalidArgument(format!(
+                        "layer {layer_name} unknown for instance {instance_id}"
+                    ))
+                })?;
+
+                let registration = gpu.get_registration(layer_name).ok_or_else(|| {
+                    EngineError::InvalidArgument(format!(
+                        "layer {layer_name} not registered on device {device_id}"
+                    ))
+                })?;
+
+                let slot_id = instance.get_slot_index(layer_id, tp_rank)?;
+
+                Ok(ValidatedLoadLayer {
+                    name: (*layer_name).to_string(),
+                    registration,
+                    slot_id,
+                })
+            })
+            .collect()
+    }
+
+    fn consume_load_leases(
+        &self,
+        instance_id: &str,
+        leases: &[(&str, Vec<i32>)],
+        total_blocks: usize,
+    ) -> Result<(Vec<i32>, Vec<Arc<SealedBlock>>), EngineError> {
+        let mut block_ids = Vec::with_capacity(total_blocks);
+        let mut blocks = Vec::with_capacity(total_blocks);
+
+        for (load_lease_id, lease_block_ids) in leases {
+            let lease_blocks = self
+                .storage
+                .consume_load_lease(instance_id, load_lease_id)
+                .map_err(EngineError::Storage)?;
+            debug_assert_eq!(lease_blocks.len(), lease_block_ids.len());
+
+            block_ids.extend_from_slice(lease_block_ids);
+            blocks.extend(lease_blocks);
+        }
+
+        Ok((block_ids, blocks))
+    }
+
+    fn build_layer_loads(
+        layers: Vec<ValidatedLoadLayer>,
+        block_ids: &[i32],
+        block_cache: &[Arc<SealedBlock>],
+    ) -> Vec<LayerLoadData> {
+        layers
+            .into_iter()
+            .filter_map(|layer| {
+                let blocks: Vec<LoadBlock> = block_ids
+                    .iter()
+                    .zip(block_cache.iter())
+                    .filter_map(|(block_id, block_entry)| {
+                        let block_idx = usize::try_from(*block_id).ok()?;
+                        let block = block_entry.get_slot(layer.slot_id)?.clone();
+                        Some(LoadBlock { block_idx, block })
+                    })
+                    .collect();
+
+                (!blocks.is_empty()).then_some(LayerLoadData {
+                    layer_name: layer.name,
+                    registration: layer.registration,
+                    blocks,
+                })
+            })
+            .collect()
     }
 
     /// Wait until all previously submitted save batches have been processed

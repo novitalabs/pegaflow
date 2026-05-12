@@ -198,6 +198,25 @@ impl ReadCache {
         Ok(result)
     }
 
+    pub(super) fn load_lease_len(
+        &self,
+        instance_id: &str,
+        load_lease_id: &str,
+    ) -> Result<usize, String> {
+        let inner = self.inner.lock();
+        let Some(lease) = inner.load_leases.get(load_lease_id) else {
+            return Err(format!("missing load lease {load_lease_id}"));
+        };
+        if lease.instance_id != instance_id {
+            return Err(format!(
+                "load lease {load_lease_id} belongs to instance {}, not {instance_id}",
+                lease.instance_id
+            ));
+        }
+
+        Ok(lease.blocks.len())
+    }
+
     /// Release an entire load lease. Idempotent for cancellation paths.
     pub(super) fn release_load_lease(&self, load_lease_id: &str) -> bool {
         let mut inner = self.inner.lock();
