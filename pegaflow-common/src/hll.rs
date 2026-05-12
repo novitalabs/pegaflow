@@ -361,6 +361,83 @@ impl HllTracker {
 }
 
 // ============================================================================
+// Multi-window tracker
+// ============================================================================
+
+/// Tracks the same hash stream across multiple sliding windows in parallel.
+///
+/// Each window is identified by a human-readable label (`"15m"`, `"1h"`, `"24h"`).
+/// `record_hashes` feeds all windows under a single lock; metric collection
+/// returns one snapshot per window with the label preserved for Prometheus.
+pub struct MultiWindowHllTracker {
+    windows: Vec<(String, HllTracker)>,
+}
+
+impl MultiWindowHllTracker {
+    /// Build a multi-window tracker. `windows` is a list of `(label, window_duration)`
+    /// pairs. Slot duration is derived per-window as `clamp(window / 24, 1min, 1h)`.
+    ///
+    /// Panics if `windows` is empty, contains a duplicate label, or any window
+    /// is shorter than 1 minute.
+    pub fn new(windows: Vec<(String, Duration)>, bucket_bits: u8) -> Self {
+        assert!(
+            !windows.is_empty(),
+            "MultiWindowHllTracker needs at least one window"
+        );
+        for (label, win) in &windows {
+            assert!(
+                *win >= Duration::from_secs(60),
+                "window {label} ({win:?}) must be at least 1 minute"
+            );
+        }
+        for i in 0..windows.len() {
+            for j in (i + 1)..windows.len() {
+                assert_ne!(
+                    windows[i].0, windows[j].0,
+                    "duplicate window label: {}",
+                    windows[i].0
+                );
+            }
+        }
+
+        let trackers = windows
+            .into_iter()
+            .map(|(label, window)| {
+                let slot = derive_slot_duration(window);
+                (label, HllTracker::new(slot, window, bucket_bits))
+            })
+            .collect();
+
+        Self { windows: trackers }
+    }
+
+    pub fn record_hashes(&mut self, hashes: &[Vec<u8>]) {
+        for (_, tracker) in &mut self.windows {
+            tracker.record_hashes(hashes);
+        }
+    }
+
+    /// Snapshot every window. Returned in insertion order.
+    pub fn metrics(&mut self) -> Vec<(String, HllMetric)> {
+        self.windows
+            .iter_mut()
+            .map(|(label, tracker)| (label.clone(), tracker.metric()))
+            .collect()
+    }
+
+    pub fn labels(&self) -> Vec<String> {
+        self.windows.iter().map(|(l, _)| l.clone()).collect()
+    }
+}
+
+fn derive_slot_duration(window: Duration) -> Duration {
+    const MIN_SLOT: Duration = Duration::from_secs(60);
+    const MAX_SLOT: Duration = Duration::from_secs(3600);
+    let target = window / 24;
+    target.clamp(MIN_SLOT, MAX_SLOT)
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -683,6 +760,84 @@ mod tests {
                 "n={n}: estimated={est:.0}, actual={actual:.0}, error={error:.4}"
             );
         }
+    }
+
+    // ---- MultiWindowHllTracker tests ----
+
+    #[test]
+    fn multi_window_records_into_each_window() {
+        let mut tracker = MultiWindowHllTracker::new(
+            vec![
+                ("15m".into(), Duration::from_secs(15 * 60)),
+                ("1h".into(), Duration::from_secs(3600)),
+                ("24h".into(), Duration::from_secs(86400)),
+            ],
+            14,
+        );
+
+        for i in 0u32..1000 {
+            let hash = sha256_like(i);
+            tracker.record_hashes(&[hash.to_vec()]);
+            tracker.record_hashes(&[hash.to_vec()]);
+        }
+
+        let metrics = tracker.metrics();
+        assert_eq!(metrics.len(), 3);
+        assert_eq!(metrics[0].0, "15m");
+        assert_eq!(metrics[1].0, "1h");
+        assert_eq!(metrics[2].0, "24h");
+        for (label, m) in metrics {
+            assert_eq!(m.total_requests, 2000, "{label}: total");
+            assert!(
+                (900.0..1100.0).contains(&m.cardinality),
+                "{label}: cardinality {} not ~1000",
+                m.cardinality
+            );
+        }
+    }
+
+    #[test]
+    fn derive_slot_clamps() {
+        assert_eq!(
+            derive_slot_duration(Duration::from_secs(15 * 60)),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            derive_slot_duration(Duration::from_secs(3600)),
+            Duration::from_secs(150)
+        );
+        assert_eq!(
+            derive_slot_duration(Duration::from_secs(86400)),
+            Duration::from_secs(3600)
+        );
+        assert_eq!(
+            derive_slot_duration(Duration::from_secs(7 * 86400)),
+            Duration::from_secs(3600)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate window label")]
+    fn multi_window_rejects_duplicate_labels() {
+        MultiWindowHllTracker::new(
+            vec![
+                ("1h".into(), Duration::from_secs(3600)),
+                ("1h".into(), Duration::from_secs(3600)),
+            ],
+            14,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "at least one window")]
+    fn multi_window_rejects_empty() {
+        MultiWindowHllTracker::new(vec![], 14);
+    }
+
+    #[test]
+    #[should_panic(expected = "at least 1 minute")]
+    fn multi_window_rejects_sub_minute_window() {
+        MultiWindowHllTracker::new(vec![("30s".into(), Duration::from_secs(30))], 14);
     }
 
     /// Generate a pseudo-SHA256 hash from an integer for testing.

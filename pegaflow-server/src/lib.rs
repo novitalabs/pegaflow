@@ -157,13 +157,11 @@ pub struct Cli {
     #[arg(long, default_value_t = pegaflow_core::DEFAULT_METASERVER_QUEUE_DEPTH)]
     pub metaserver_queue_depth: usize,
 
-    /// HLL time-slot rotation interval in seconds (default: 3600 = 1 hour)
-    #[arg(long, default_value_t = 3600)]
-    pub metric_hll_slot_secs: u64,
-
-    /// HLL sliding window duration in seconds (default: 86400 = 24 hours)
-    #[arg(long, default_value_t = 86400)]
-    pub metric_hll_window_secs: u64,
+    /// HLL sliding-window list for hit-rate estimation. Comma-separated humantime
+    /// durations; each becomes a labeled window in metrics (e.g. `15m,1h,24h`).
+    /// Slot duration is derived as `clamp(window/24, 1min, 1h)`.
+    #[arg(long, default_value = "15m,1h,24h", value_parser = parse_hll_windows)]
+    pub metric_hll_windows: Vec<(String, Duration)>,
 
     /// HLL bucket index bits 4–18 (default: 14 → 16384 buckets, ~0.8% error)
     #[arg(long, default_value_t = 14, value_parser = parse_hll_bucket_bits)]
@@ -184,6 +182,46 @@ fn parse_hll_bucket_bits(s: &str) -> Result<u8, String> {
         ));
     }
     Ok(v)
+}
+
+/// Parse a comma-separated list of humantime windows (e.g. `15m,1h,24h`).
+/// Each entry becomes `(label, duration)` where label is the original token.
+fn parse_hll_windows(s: &str) -> Result<Vec<(String, Duration)>, String> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for token in s.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        let dur = parse_humantime(token)?;
+        if dur < Duration::from_secs(60) {
+            return Err(format!("HLL window {token} must be at least 1 minute"));
+        }
+        if !seen.insert(token.to_string()) {
+            return Err(format!("duplicate HLL window label: {token}"));
+        }
+        out.push((token.to_string(), dur));
+    }
+    if out.is_empty() {
+        return Err("--metric-hll-windows must list at least one window".into());
+    }
+    Ok(out)
+}
+
+/// Minimal humantime parser: `<number><unit>` where unit ∈ {s, m, h, d}.
+fn parse_humantime(s: &str) -> Result<Duration, String> {
+    let (num_str, unit) = s.split_at(
+        s.find(|c: char| !c.is_ascii_digit())
+            .ok_or_else(|| format!("missing time unit in {s}"))?,
+    );
+    let n: u64 = num_str
+        .parse()
+        .map_err(|e| format!("invalid number in {s}: {e}"))?;
+    let secs = match unit {
+        "s" => n,
+        "m" => n * 60,
+        "h" => n * 3600,
+        "d" => n * 86400,
+        _ => return Err(format!("unknown time unit {unit:?} in {s}; use s/m/h/d")),
+    };
+    Ok(Duration::from_secs(secs))
 }
 
 fn parse_sample_rate(s: &str) -> Result<f64, String> {
@@ -482,9 +520,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     })?;
 
     let hll_tracker = Arc::new(std::sync::Mutex::new(
-        pegaflow_common::hll::HllTracker::new(
-            Duration::from_secs(cli.metric_hll_slot_secs),
-            Duration::from_secs(cli.metric_hll_window_secs),
+        pegaflow_common::hll::MultiWindowHllTracker::new(
+            cli.metric_hll_windows.clone(),
             cli.metric_hll_bucket_bits,
         ),
     ));

@@ -157,9 +157,8 @@ async fn spawn_engine_server(engine: Arc<PegaEngine>, port: u16) {
     let registry = Arc::new(Mutex::new(registry));
     let shutdown = Arc::new(Notify::new());
     let hll_tracker = Arc::new(std::sync::Mutex::new(
-        pegaflow_common::hll::HllTracker::new(
-            Duration::from_secs(3600),
-            Duration::from_secs(86400),
+        pegaflow_common::hll::MultiWindowHllTracker::new(
+            vec![("24h".into(), Duration::from_secs(86400))],
             14,
         ),
     ));
