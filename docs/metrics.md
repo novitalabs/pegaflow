@@ -54,12 +54,25 @@ PegaFlow exposes the following metrics for monitoring KV cache operations:
 
 ### Cache Metrics (Block-level)
 - **pegaflow_cache_block_hits_total** (Counter)
-  - Number of complete blocks found in cache
-  - Use case: Calculate cache hit ratio
+  - Legacy resident-cache hit counter
+  - Use case: Backward-compatible dashboards only; do not use for tier
+    contribution analysis
 
 - **pegaflow_cache_block_misses_total** (Counter)
-  - Number of complete blocks not found in cache
-  - Use case: Calculate cache miss ratio
+  - Legacy resident-cache miss counter
+  - Use case: Backward-compatible dashboards only; do not use for tier
+    contribution analysis
+
+- **pegaflow_cache_tier_block_requests_total** (Counter)
+  - Per-decision `query_prefetch` block attribution by `tier`
+    (`ram`, `rdma`, `ssd`, or `miss`)
+  - Use case: Calculate overall hit ratio and each cache tier's contribution
+    from one consistent denominator
+  - Invariant: for each attributed decision,
+    `ram + rdma + ssd + miss == block_hashes.len()`
+  - Semantics: this is decision attribution. `tier="rdma"` and `tier="ssd"`
+    mean the block was selected to be satisfied by that backing tier; they do
+    not guarantee the later backing operation succeeded.
 
 - **pegaflow_cache_block_insertions_total** (Counter)
   - New blocks inserted into cache
@@ -129,6 +142,34 @@ PegaFlow exposes the following metrics for monitoring KV cache operations:
 - **pegaflow_ssd_prefetch_success_total** (Counter) - Successful SSD prefetches
 - **pegaflow_ssd_prefetch_failures_total** (Counter) - Failed SSD prefetches
 - **pegaflow_ssd_prefetch_duration_seconds** (Histogram) - SSD prefetch latency
+
+### Tier Attribution Semantics
+
+`pegaflow_cache_tier_block_requests_total{tier}` is the canonical metric for
+explaining how each cache tier contributes to prefix-query hit ratio. It is
+emitted once for each `query_prefetch` decision and uses exactly one label:
+`tier`.
+
+Tier values:
+
+- `ram`: blocks already present in the resident RAM cache at the decision point
+- `rdma`: blocks selected to be satisfied by RDMA remote fetch
+- `ssd`: blocks selected to be satisfied by SSD prefetch
+- `miss`: blocks no tier selected for that decision, including SSD prefetch
+  backpressure and residual blocks after RDMA partial availability
+
+This metric intentionally records decisions, not completed service outcomes.
+For backing failure correlation, use:
+
+- `pegaflow_rdma_fetch_total{status="error"}` for RDMA fetch failures
+- `pegaflow_ssd_prefetch_failures_total` for SSD prefetch failures
+
+The legacy `pegaflow_cache_block_hits_total` and
+`pegaflow_cache_block_misses_total` counters are retained for compatibility.
+Their `Loading { hit, loading }` path only increments hits by `hit`; `loading`
+does not enter the legacy denominator. New dashboards should use
+`pegaflow_cache_tier_block_requests_total{tier}` instead of mixing legacy and
+tier counters.
 
 ### RPC Metrics
 - **pegaflow_rpc_requests_total** (Counter) - Total RPC requests by method and status
@@ -325,9 +366,25 @@ Same as above: http://localhost:3000
 ## PromQL Query Examples
 
 ```promql
-# Cache hit ratio (last 5 minutes)
-rate(pegaflow_cache_block_hits_total[5m]) /
-(rate(pegaflow_cache_block_hits_total[5m]) + rate(pegaflow_cache_block_misses_total[5m]))
+# Overall cache hit ratio from decision attribution (last 5 minutes)
+sum(rate(pegaflow_cache_tier_block_requests_total{tier!="miss"}[5m])) /
+sum(rate(pegaflow_cache_tier_block_requests_total[5m]))
+
+# RAM contribution to total requested blocks
+sum(rate(pegaflow_cache_tier_block_requests_total{tier="ram"}[5m])) /
+sum(rate(pegaflow_cache_tier_block_requests_total[5m]))
+
+# RDMA contribution to total requested blocks
+sum(rate(pegaflow_cache_tier_block_requests_total{tier="rdma"}[5m])) /
+sum(rate(pegaflow_cache_tier_block_requests_total[5m]))
+
+# SSD contribution to total requested blocks
+sum(rate(pegaflow_cache_tier_block_requests_total{tier="ssd"}[5m])) /
+sum(rate(pegaflow_cache_tier_block_requests_total[5m]))
+
+# Miss ratio from the same denominator
+sum(rate(pegaflow_cache_tier_block_requests_total{tier="miss"}[5m])) /
+sum(rate(pegaflow_cache_tier_block_requests_total[5m]))
 
 # Average save latency (p50)
 histogram_quantile(0.5, rate(pegaflow_save_duration_seconds_bucket[5m]))
@@ -374,7 +431,8 @@ pegaflow_pool_used_bytes / pegaflow_pool_capacity_bytes
 
 ## Best Practices
 
-1. **Monitor cache hit ratio**: Aim for >80% hit rate in production
+1. **Monitor tier-attributed hit ratio**: Aim for >80% hit rate in production
+   using `pegaflow_cache_tier_block_requests_total`
    - Low hit rate → consider increasing `--pool-size`
 
 2. **Watch eviction rate**: High evictions indicate memory pressure

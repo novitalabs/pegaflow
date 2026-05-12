@@ -1,5 +1,6 @@
 mod prefetch;
 mod read_cache;
+mod tier_attribution;
 pub(crate) mod transfer_lock;
 mod write_path;
 
