@@ -160,8 +160,8 @@ pub struct Cli {
     /// HLL sliding-window list for hit-rate estimation. Comma-separated humantime
     /// durations; each becomes a canonical `window` label in metrics (e.g. `15m,1h,1d`).
     /// Slot duration is derived as `clamp(window/24, 1min, 1h)`.
-    #[arg(long, default_value = "15m,1h,24h", value_parser = parse_hll_windows)]
-    pub metric_hll_windows: Vec<(String, Duration)>,
+    #[arg(long, default_value = "15m,1h,24h", value_parser = parse_hll_windows_arg)]
+    pub metric_hll_windows: String,
 
     /// HLL bucket index bits 4–18 (default: 14 → 16384 buckets, ~0.8% error)
     #[arg(long, default_value_t = 14, value_parser = parse_hll_bucket_bits)]
@@ -182,6 +182,11 @@ fn parse_hll_bucket_bits(s: &str) -> Result<u8, String> {
         ));
     }
     Ok(v)
+}
+
+fn parse_hll_windows_arg(s: &str) -> Result<String, String> {
+    parse_hll_windows(s)?;
+    Ok(s.to_string())
 }
 
 /// Parse a comma-separated list of humantime windows (e.g. `15m,1h,24h`).
@@ -550,7 +555,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
     let hll_tracker = Arc::new(std::sync::Mutex::new(
         pegaflow_common::hll::MultiWindowHllTracker::new(
-            cli.metric_hll_windows.clone(),
+            parse_hll_windows(&cli.metric_hll_windows)
+                .map_err(|err| format!("invalid --metric-hll-windows: {err}"))?,
             cli.metric_hll_bucket_bits,
         ),
     ));
@@ -681,14 +687,44 @@ mod tests {
     fn parse_hll_windows_canonicalizes_labels() {
         let windows = parse_hll_windows("15m,60m,24h").unwrap();
 
+        assert_eq!(windows, expected_hll_windows());
+    }
+
+    #[test]
+    fn cli_default_metric_hll_windows_parses_without_panic() {
+        let cli = Cli::try_parse_from(["pegaflow-server"]).unwrap();
+
         assert_eq!(
-            windows,
-            vec![
-                ("15m".to_string(), Duration::from_secs(15 * 60)),
-                ("1h".to_string(), Duration::from_secs(60 * 60)),
-                ("1d".to_string(), Duration::from_secs(24 * 60 * 60)),
-            ]
+            parse_hll_windows(&cli.metric_hll_windows).unwrap(),
+            expected_hll_windows()
         );
+    }
+
+    #[test]
+    fn cli_explicit_metric_hll_windows_parses_without_panic() {
+        let cli =
+            Cli::try_parse_from(["pegaflow-server", "--metric-hll-windows", "15m,1h,24h"]).unwrap();
+
+        assert_eq!(
+            parse_hll_windows(&cli.metric_hll_windows).unwrap(),
+            expected_hll_windows()
+        );
+    }
+
+    #[test]
+    fn cli_rejects_invalid_metric_hll_windows() {
+        let err = Cli::try_parse_from(["pegaflow-server", "--metric-hll-windows", "15m,,1h"])
+            .unwrap_err();
+
+        assert!(err.to_string().contains("empty window"), "{err}");
+    }
+
+    fn expected_hll_windows() -> Vec<(String, Duration)> {
+        vec![
+            ("15m".to_string(), Duration::from_secs(15 * 60)),
+            ("1h".to_string(), Duration::from_secs(60 * 60)),
+            ("1d".to_string(), Duration::from_secs(24 * 60 * 60)),
+        ]
     }
 
     #[test]
