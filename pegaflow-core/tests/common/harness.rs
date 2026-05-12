@@ -323,15 +323,6 @@ impl TestEnv {
             .expect("query")
     }
 
-    /// Query prefix hits using a caller-provided `req_id`. Useful for tests
-    /// that need to exercise the scheduler's in-flight polling path.
-    pub async fn query_with_req_id(&self, req_id: &str, hashes: &[Vec<u8>]) -> PrefetchStatus {
-        self.engine
-            .count_prefix_hit_blocks_with_prefetch(&self.instance_id, req_id, hashes)
-            .await
-            .expect("query")
-    }
-
     /// Query, assert all hit, leave pinned (scheduler step before load).
     pub async fn assert_all_hit_and_pin(&self, hashes: &[Vec<u8>]) {
         match self.query(hashes).await {

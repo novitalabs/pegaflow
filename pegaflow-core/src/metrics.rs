@@ -13,14 +13,10 @@ use crate::backing::RdmaTransport;
 // slice without rebuilding the attribute on every counter add.
 // ---------------------------------------------------------------------------
 
-pub(crate) static TIER_RAM: LazyLock<[KeyValue; 1]> =
-    LazyLock::new(|| [KeyValue::new("tier", "ram")]);
-pub(crate) static TIER_RDMA: LazyLock<[KeyValue; 1]> =
-    LazyLock::new(|| [KeyValue::new("tier", "rdma")]);
-pub(crate) static TIER_SSD: LazyLock<[KeyValue; 1]> =
-    LazyLock::new(|| [KeyValue::new("tier", "ssd")]);
-pub(crate) static TIER_MISS: LazyLock<[KeyValue; 1]> =
-    LazyLock::new(|| [KeyValue::new("tier", "miss")]);
+static TIER_RAM: LazyLock<[KeyValue; 1]> = LazyLock::new(|| [KeyValue::new("tier", "ram")]);
+static TIER_RDMA: LazyLock<[KeyValue; 1]> = LazyLock::new(|| [KeyValue::new("tier", "rdma")]);
+static TIER_SSD: LazyLock<[KeyValue; 1]> = LazyLock::new(|| [KeyValue::new("tier", "ssd")]);
+static TIER_MISS: LazyLock<[KeyValue; 1]> = LazyLock::new(|| [KeyValue::new("tier", "miss")]);
 
 pub(crate) struct CoreMetrics {
     // Pinned pool (allocator-level)
@@ -158,6 +154,30 @@ pub(crate) fn register_rdma_gauges(transport: &Arc<RdmaTransport>) {
             .build();
         RdmaGaugeHandles { _qps: qps }
     });
+}
+
+pub(crate) fn record_cache_tier_block_requests(ram: usize, rdma: usize, ssd: usize, miss: usize) {
+    let metrics = core_metrics();
+    if ram > 0 {
+        metrics
+            .cache_tier_block_requests
+            .add(ram as u64, &*TIER_RAM);
+    }
+    if rdma > 0 {
+        metrics
+            .cache_tier_block_requests
+            .add(rdma as u64, &*TIER_RDMA);
+    }
+    if ssd > 0 {
+        metrics
+            .cache_tier_block_requests
+            .add(ssd as u64, &*TIER_SSD);
+    }
+    if miss > 0 {
+        metrics
+            .cache_tier_block_requests
+            .add(miss as u64, &*TIER_MISS);
+    }
 }
 
 pub(crate) fn core_metrics() -> &'static CoreMetrics {

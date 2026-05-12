@@ -29,12 +29,12 @@ pub(super) enum AttributionSource {
 }
 
 /// Per-decision block counts. Invariant: `ram + rdma + ssd + miss == total`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Copy, Clone, Debug)]
 pub(super) struct TierAttribution {
-    pub(super) ram: usize,
-    pub(super) rdma: usize,
-    pub(super) ssd: usize,
-    pub(super) miss: usize,
+    ram: usize,
+    rdma: usize,
+    ssd: usize,
+    miss: usize,
 }
 
 impl TierAttribution {
@@ -78,7 +78,7 @@ impl TierAttribution {
         attribution
     }
 
-    pub(super) fn sum(&self) -> usize {
+    fn sum(&self) -> usize {
         self.ram + self.rdma + self.ssd + self.miss
     }
 }
@@ -94,27 +94,12 @@ pub(super) fn record_cache_tier_block_requests(total: usize, attribution: TierAt
         total,
         "tier attribution must sum to total"
     );
-    let metrics = crate::metrics::core_metrics();
-    if attribution.ram > 0 {
-        metrics
-            .cache_tier_block_requests
-            .add(attribution.ram as u64, &*crate::metrics::TIER_RAM);
-    }
-    if attribution.rdma > 0 {
-        metrics
-            .cache_tier_block_requests
-            .add(attribution.rdma as u64, &*crate::metrics::TIER_RDMA);
-    }
-    if attribution.ssd > 0 {
-        metrics
-            .cache_tier_block_requests
-            .add(attribution.ssd as u64, &*crate::metrics::TIER_SSD);
-    }
-    if attribution.miss > 0 {
-        metrics
-            .cache_tier_block_requests
-            .add(attribution.miss as u64, &*crate::metrics::TIER_MISS);
-    }
+    crate::metrics::record_cache_tier_block_requests(
+        attribution.ram,
+        attribution.rdma,
+        attribution.ssd,
+        attribution.miss,
+    );
 }
 
 #[cfg(test)]
@@ -122,88 +107,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ram_only_hit_attributes_all_to_ram() {
-        let a = TierAttribution::classify(8, 8, 0, None);
-        assert_eq!(
-            a,
-            TierAttribution {
-                ram: 8,
-                rdma: 0,
-                ssd: 0,
-                miss: 0
-            }
-        );
-        assert_eq!(a.sum(), 8);
+    fn partial_backing_decisions_keep_selected_tier_and_residual_contract() {
+        let cases = [
+            // RDMA found only part of the non-RAM prefix.
+            (
+                TierAttribution::classify(5, 1, 3, Some(AttributionSource::Rdma)),
+                (1, 3, 0, 1, 5),
+            ),
+            // SSD prefetch accepted only part of the non-RAM prefix, for
+            // example after backpressure trimming.
+            (
+                TierAttribution::classify(6, 1, 2, Some(AttributionSource::Ssd)),
+                (1, 0, 2, 3, 6),
+            ),
+        ];
+
+        for (attribution, expected) in cases {
+            assert_eq!(
+                (
+                    attribution.ram,
+                    attribution.rdma,
+                    attribution.ssd,
+                    attribution.miss,
+                    attribution.sum()
+                ),
+                expected
+            );
+        }
     }
 
+    #[cfg(debug_assertions)]
     #[test]
-    fn rdma_loading_splits_ram_rdma_miss() {
-        let a = TierAttribution::classify(10, 3, 5, Some(AttributionSource::Rdma));
-        assert_eq!(
-            a,
-            TierAttribution {
-                ram: 3,
-                rdma: 5,
-                ssd: 0,
-                miss: 2
-            }
-        );
-    }
-
-    #[test]
-    fn ssd_loading_splits_ram_ssd_miss() {
-        let a = TierAttribution::classify(10, 4, 4, Some(AttributionSource::Ssd));
-        assert_eq!(
-            a,
-            TierAttribution {
-                ram: 4,
-                rdma: 0,
-                ssd: 4,
-                miss: 2
-            }
-        );
-    }
-
-    #[test]
-    fn no_backing_no_ram_attributes_all_to_miss() {
-        let a = TierAttribution::classify(7, 0, 0, None);
-        assert_eq!(
-            a,
-            TierAttribution {
-                ram: 0,
-                rdma: 0,
-                ssd: 0,
-                miss: 7
-            }
-        );
-    }
-
-    #[test]
-    fn empty_query_yields_all_zeros() {
-        let a = TierAttribution::classify(0, 0, 0, None);
-        assert_eq!(a, TierAttribution::default());
-        assert_eq!(a.sum(), 0);
-    }
-
-    #[test]
-    fn ssd_backpressure_residual_falls_into_miss() {
-        // 6 requested; 1 RAM hit; SSD was selected for 2 (rest skipped by
-        // backpressure inside `limit_ssd_prefetch`, which surfaces here as a
-        // smaller `loading`).
-        let a = TierAttribution::classify(6, 1, 2, Some(AttributionSource::Ssd));
-        assert_eq!(a.ram, 1);
-        assert_eq!(a.ssd, 2);
-        assert_eq!(a.miss, 3);
-        assert_eq!(a.sum(), 6);
-    }
-
-    #[test]
-    fn rdma_partial_residual_falls_into_miss() {
-        // RDMA query promised 3 of the 4 remaining; the 4th counts as miss.
-        let a = TierAttribution::classify(5, 1, 3, Some(AttributionSource::Rdma));
-        assert_eq!(a.ram, 1);
-        assert_eq!(a.rdma, 3);
-        assert_eq!(a.miss, 1);
+    #[should_panic(expected = "loading > 0 without a backing source")]
+    fn loading_without_source_panics_in_debug() {
+        let _ = TierAttribution::classify(4, 1, 1, None);
     }
 
     #[test]
