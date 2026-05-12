@@ -158,7 +158,7 @@ pub struct Cli {
     pub metaserver_queue_depth: usize,
 
     /// HLL sliding-window list for hit-rate estimation. Comma-separated humantime
-    /// durations; each becomes a labeled window in metrics (e.g. `15m,1h,24h`).
+    /// durations; each becomes a canonical `window` label in metrics (e.g. `15m,1h,1d`).
     /// Slot duration is derived as `clamp(window/24, 1min, 1h)`.
     #[arg(long, default_value = "15m,1h,24h", value_parser = parse_hll_windows)]
     pub metric_hll_windows: Vec<(String, Duration)>,
@@ -185,19 +185,29 @@ fn parse_hll_bucket_bits(s: &str) -> Result<u8, String> {
 }
 
 /// Parse a comma-separated list of humantime windows (e.g. `15m,1h,24h`).
-/// Each entry becomes `(label, duration)` where label is the original token.
+/// Each entry becomes `(label, duration)` where label is canonicalized from
+/// the parsed duration.
 fn parse_hll_windows(s: &str) -> Result<Vec<(String, Duration)>, String> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for token in s.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+    for (idx, token) in s.split(',').map(str::trim).enumerate() {
+        if token.is_empty() {
+            return Err(format!(
+                "--metric-hll-windows contains an empty window at position {}",
+                idx + 1
+            ));
+        }
         let dur = parse_humantime(token)?;
         if dur < Duration::from_secs(60) {
             return Err(format!("HLL window {token} must be at least 1 minute"));
         }
-        if !seen.insert(token.to_string()) {
-            return Err(format!("duplicate HLL window label: {token}"));
+        if !seen.insert(dur) {
+            return Err(format!(
+                "duplicate HLL window duration: {token} ({})",
+                format_hll_window_label(dur)
+            ));
         }
-        out.push((token.to_string(), dur));
+        out.push((format_hll_window_label(dur), dur));
     }
     if out.is_empty() {
         return Err("--metric-hll-windows must list at least one window".into());
@@ -214,14 +224,33 @@ fn parse_humantime(s: &str) -> Result<Duration, String> {
     let n: u64 = num_str
         .parse()
         .map_err(|e| format!("invalid number in {s}: {e}"))?;
-    let secs = match unit {
+    let unit_secs = match unit {
         "s" => n,
-        "m" => n * 60,
-        "h" => n * 3600,
-        "d" => n * 86400,
+        "m" => n
+            .checked_mul(60)
+            .ok_or_else(|| format!("duration overflows seconds in {s}"))?,
+        "h" => n
+            .checked_mul(3600)
+            .ok_or_else(|| format!("duration overflows seconds in {s}"))?,
+        "d" => n
+            .checked_mul(86400)
+            .ok_or_else(|| format!("duration overflows seconds in {s}"))?,
         _ => return Err(format!("unknown time unit {unit:?} in {s}; use s/m/h/d")),
     };
-    Ok(Duration::from_secs(secs))
+    Ok(Duration::from_secs(unit_secs))
+}
+
+fn format_hll_window_label(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs.is_multiple_of(86400) {
+        format!("{}d", secs / 86400)
+    } else if secs.is_multiple_of(3600) {
+        format!("{}h", secs / 3600)
+    } else if secs.is_multiple_of(60) {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
 }
 
 fn parse_sample_rate(s: &str) -> Result<f64, String> {
@@ -642,4 +671,37 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_hll_windows_canonicalizes_labels() {
+        let windows = parse_hll_windows("15m,60m,24h").unwrap();
+
+        assert_eq!(
+            windows,
+            vec![
+                ("15m".to_string(), Duration::from_secs(15 * 60)),
+                ("1h".to_string(), Duration::from_secs(60 * 60)),
+                ("1d".to_string(), Duration::from_secs(24 * 60 * 60)),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_hll_windows_rejects_empty_tokens() {
+        let err = parse_hll_windows("15m,,1h").unwrap_err();
+
+        assert!(err.contains("empty window"), "{err}");
+    }
+
+    #[test]
+    fn parse_hll_windows_rejects_duplicate_durations() {
+        let err = parse_hll_windows("1h,60m").unwrap_err();
+
+        assert!(err.contains("duplicate HLL window duration"), "{err}");
+    }
 }

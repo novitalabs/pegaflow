@@ -366,7 +366,7 @@ impl HllTracker {
 
 /// Tracks the same hash stream across multiple sliding windows in parallel.
 ///
-/// Each window is identified by a human-readable label (`"15m"`, `"1h"`, `"24h"`).
+/// Each window is identified by a human-readable label (`"15m"`, `"1h"`, `"1d"`).
 /// `record_hashes` feeds all windows under a single lock; metric collection
 /// returns one snapshot per window with the label preserved for Prometheus.
 pub struct MultiWindowHllTracker {
@@ -377,8 +377,8 @@ impl MultiWindowHllTracker {
     /// Build a multi-window tracker. `windows` is a list of `(label, window_duration)`
     /// pairs. Slot duration is derived per-window as `clamp(window / 24, 1min, 1h)`.
     ///
-    /// Panics if `windows` is empty, contains a duplicate label, or any window
-    /// is shorter than 1 minute.
+    /// Panics if `windows` is empty, contains a duplicate duration, or any
+    /// window is shorter than 1 minute.
     pub fn new(windows: Vec<(String, Duration)>, bucket_bits: u8) -> Self {
         assert!(
             !windows.is_empty(),
@@ -393,9 +393,9 @@ impl MultiWindowHllTracker {
         for i in 0..windows.len() {
             for j in (i + 1)..windows.len() {
                 assert_ne!(
-                    windows[i].0, windows[j].0,
-                    "duplicate window label: {}",
-                    windows[i].0
+                    windows[i].1, windows[j].1,
+                    "duplicate window duration: {:?}",
+                    windows[i].1
                 );
             }
         }
@@ -423,10 +423,6 @@ impl MultiWindowHllTracker {
             .iter_mut()
             .map(|(label, tracker)| (label.clone(), tracker.metric()))
             .collect()
-    }
-
-    pub fn labels(&self) -> Vec<String> {
-        self.windows.iter().map(|(l, _)| l.clone()).collect()
     }
 }
 
@@ -817,12 +813,12 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "duplicate window label")]
-    fn multi_window_rejects_duplicate_labels() {
+    #[should_panic(expected = "duplicate window duration")]
+    fn multi_window_rejects_duplicate_durations() {
         MultiWindowHllTracker::new(
             vec![
                 ("1h".into(), Duration::from_secs(3600)),
-                ("1h".into(), Duration::from_secs(3600)),
+                ("60m".into(), Duration::from_secs(3600)),
             ],
             14,
         );

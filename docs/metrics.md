@@ -114,6 +114,29 @@ PegaFlow exposes the following metrics for monitoring KV cache operations:
   - Current bytes referenced by pinned_for_load (unique blocks; sum of footprints)
   - Use case: Attribute pinned pool usage to load-path pins
 
+### HLL Reuse Metrics
+- **pegaflow_hll_cardinality** (Gauge)
+  - Estimated distinct block hashes observed in a configured sliding window
+  - Labels: `window` (`15m`, `1h`, `1d` by default)
+  - Use case: Derive approximate prefix reuse over longer windows without
+    storing every block hash
+
+- **pegaflow_hll_total_requests** (Gauge)
+  - Total block hash observations in the same configured sliding window
+  - Labels: `window` (`15m`, `1h`, `1d` by default)
+  - Use case: Denominator for HLL-based estimated hit-rate PromQL
+
+PegaFlow does not export a separate HLL hit-rate gauge. Use PromQL so the
+ratio is computed from values in the same scrape:
+
+```promql
+1 - (
+  pegaflow_hll_cardinality{window="1h"}
+  /
+  clamp_min(pegaflow_hll_total_requests{window="1h"}, 1)
+)
+```
+
 ### Save Metrics (GPU → CPU)
 - **pegaflow_save_bytes_total** (Counter)
   - Total bytes saved from GPU to CPU storage
@@ -195,6 +218,17 @@ tier counters.
 
 - `--metrics-period-secs`: Metric export interval in seconds (default: `5`)
   - Only used when `--metrics-otel-endpoint` is set
+
+- `--metric-hll-windows`: Comma-separated HLL sliding windows for estimated
+  prefix reuse (default: `15m,1h,24h`)
+  - Supported units: `s`, `m`, `h`, `d`
+  - Each configured duration becomes a canonical `window` label. For example,
+    the default config exports `window="15m"`, `window="1h"`, and `window="1d"`.
+  - Empty entries such as `15m,,1h` and duplicate durations such as `1h,60m`
+    are rejected at startup.
+
+- `--metric-hll-bucket-bits`: HLL bucket index bits (default: `14`)
+  - Higher values use more memory and lower estimation error.
 
 **Example: Prometheus Metrics**
 ```bash
@@ -397,6 +431,20 @@ rate(pegaflow_save_bytes_total[1m]) / 1e6
 
 # Pool memory utilization
 pegaflow_pool_used_bytes / pegaflow_pool_capacity_bytes
+
+# HLL estimated hit rate for the 1h window
+1 - (
+  pegaflow_hll_cardinality{window="1h"}
+  /
+  clamp_min(pegaflow_hll_total_requests{window="1h"}, 1)
+)
+
+# HLL estimated hit rate for every configured window
+1 - (
+  pegaflow_hll_cardinality
+  /
+  clamp_min(pegaflow_hll_total_requests, 1)
+)
 ```
 
 ## Troubleshooting
