@@ -4,7 +4,7 @@ This file provides guidance for agents working in the PegaFlow repository.
 
 ## Project Overview
 
-PegaFlow is a high-performance KV cache transfer system for LLM inference, designed for vLLM and SGLang.
+PegaFlow is a high-performance KV cache transfer system for LLM inference, designed for vLLM.
 
 - Single-node KV cache offloading between GPU and host memory
 - Cross-node KV cache sharing via RDMA
@@ -40,7 +40,6 @@ pegaflow/
 | PyO3 bindings | `python/src/lib.rs` |
 | Python package and helpers | `python/pegaflow/` |
 | vLLM connector | `python/pegaflow/connector/` |
-| SGLang integration | `python/pegaflow/sglang/` |
 
 ## Key Entry Points
 

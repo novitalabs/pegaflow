@@ -15,7 +15,7 @@
 - **Topology-aware, PCIe-saturating transfers** — NUMA-aware pinned memory + layer-wise DMA to maximize hardware bandwidth
 - **GIL-free Rust core** — zero Python overhead on the hot path; your inference engine keeps its threads
 - **Production-ready observability** — built-in Prometheus metrics and OTLP export, not an afterthought
-- **Pluggable** — works with vLLM and SGLang as a drop-in KV connector
+- **Pluggable** — works with vLLM as a drop-in KV connector
 
 ## Architecture
 
@@ -28,7 +28,6 @@
 | Framework | Status | Link |
 |-----------|--------|------|
 | vLLM | ✅ Ready | [Quick Start](#3-launch-your-inference-engine) |
-| SGLang | 🚧 Under Review | [PR #17221](https://github.com/sgl-project/sglang/pull/17221) |
 
 ## Quick Start
 
@@ -47,19 +46,11 @@ pegaflow-server
 
 ### 3. Launch your inference engine
 
-**vLLM (recommended):**
+**vLLM:**
 
 ```bash
 vllm serve Qwen/Qwen3-0.6B \
   --kv-transfer-config '{"kv_connector": "PegaKVConnector", "kv_role": "kv_both", "kv_connector_module_path": "pegaflow.connector"}'
-```
-
-**SGLang:**
-
-```bash
-python3 -m sglang.launch_server \
-  --model-path Qwen/Qwen3-0.6B \
-  --enable-pegaflow
 ```
 
 > For full server options, multi-node setup, and advanced configuration, see [Server Configuration](./docs/server.md).

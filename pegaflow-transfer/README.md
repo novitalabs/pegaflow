@@ -12,7 +12,7 @@ Key capabilities:
 - **Automatic session management**: RC (Reliable Connection) queue pairs are established on-demand on first transfer to a peer
 - **Batch operations**: Transfer multiple discontiguous memory regions in a single call with pipelined WR chains
 - **NUMA-aware topology**: Detect GPUs, RDMA NICs, and CPUs grouped by NUMA node for optimal NIC selection
-- **Mooncake-compatible API**: Drop-in replacement for Mooncake transfer engine in vLLM/SGLang P/D disaggregation
+- **Mooncake-compatible API**: Drop-in replacement for Mooncake transfer engine in vLLM P/D disaggregation
 
 ## Architecture
 
@@ -243,7 +243,7 @@ The test allocates GPU memory via CUDA, performs RDMA WRITE from one engine to a
 
 ## Integration with PegaFlow
 
-This crate is consumed by the PegaFlow Python bindings (`python/src/transfer.rs`), which expose it as `pegaflow.TransferEngine` for use in vLLM/SGLang P/D disaggregated serving. The typical flow:
+This crate is consumed by the PegaFlow Python bindings (`python/src/transfer.rs`), which expose it as `pegaflow.TransferEngine` for use in vLLM P/D disaggregated serving. The typical flow:
 
 1. Each vLLM worker creates a `TransferEngine` and initializes it with the NUMA-local NIC
 2. Workers register their GPU KV cache memory regions

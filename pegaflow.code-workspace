@@ -5,9 +5,6 @@
 		},
 		{
 			"path": "../vllm"
-		},
-		{
-			"path": "../sglang"
 		}
 	],
 	"settings": {}

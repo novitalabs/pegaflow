@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-PegaFlow is a high-performance KV cache transfer system for LLM inference, designed to work with vLLM and SGLang. It provides RDMA-first, high-bandwidth transport optimized for GPU-to-CPU KV cache offloading and loading.
+PegaFlow is a high-performance KV cache transfer system for LLM inference, designed to work with vLLM. It provides RDMA-first, high-bandwidth transport optimized for GPU-to-CPU KV cache offloading and loading.
 
 ## Build Commands
 
@@ -96,14 +96,13 @@ cargo bench --bench uds_latency
 7. **python/** (Rust/PyO3 + Python): Python package (`pegaflow-llm` on PyPI)
    - `src/lib.rs`: PyO3 bindings exposing `PegaEngine` and gRPC client
    - `pegaflow/connector/`: vLLM v1 KV connector (scheduler + worker split)
-   - `pegaflow/sglang/`: SGLang integration
    - `pegaflow/ipc_wrapper.py`: CUDA IPC handle wrapper
    - CLI binaries: `pegaflow-server`, `pegaflow-metaserver` (installed via pip)
 
 ### Data Flow
 
 ```
-vLLM/SGLang Worker <--gRPC--> PegaEngine Server <--CUDA IPC--> GPU Memory
+vLLM Worker <--gRPC--> PegaEngine Server <--CUDA IPC--> GPU Memory
                                     |
                              Pinned CPU Memory (KV cache storage)
                                    / \
@@ -173,4 +172,3 @@ vLLM/SGLang Worker <--gRPC--> PegaEngine Server <--CUDA IPC--> GPU Memory
 - `python/pegaflow/pegaflow.pyi`: Type stubs for PyO3 bindings
 - `python/pegaflow/connector/scheduler.py`: vLLM scheduler-side connector
 - `python/pegaflow/connector/worker.py`: vLLM worker-side connector
-- `python/pegaflow/sglang/pegaflow_radix_cache.py`: sglang radix cache class

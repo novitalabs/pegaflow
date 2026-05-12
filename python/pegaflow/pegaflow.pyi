@@ -1,7 +1,7 @@
 """Type stubs for the pegaflow Rust extension module (PyO3 bindings).
 
 This module provides high-performance KV cache storage and gRPC client
-for distributed LLM inference with vLLM and SGLang.
+for distributed LLM inference with vLLM.
 """
 
 from typing import Any
