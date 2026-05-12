@@ -198,7 +198,10 @@ impl UringShard {
 /// io_uring based engine for single-file read/write.
 pub(super) struct UringIoEngine {
     txs: Vec<mpsc::SyncSender<IoCtx>>,
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "join handles keep io_uring shard threads alive until Drop"
+    )]
     handles: Vec<JoinHandle<()>>,
 }
 

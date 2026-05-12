@@ -208,7 +208,10 @@ impl EngineRpcClient {
     ///     segments_list: List of segment counts per layer
     ///
     /// Returns: (ok: bool, message: str)
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "PyO3 binding mirrors the public batch registration call shape"
+    )]
     #[pyo3(signature = (instance_id, namespace, tp_rank, pp_rank, tp_size, world_size, device_id, num_layers, layer_names, wrapper_bytes_list, num_blocks_list, bytes_per_block_list, kv_stride_bytes_list, segments_list))]
     fn register_context_batch(
         &self,
@@ -307,7 +310,10 @@ impl EngineRpcClient {
     ///     block_hashes: Content hashes for blocks
     ///
     /// Returns: (ok: bool, message: str)
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "PyO3 binding mirrors the connector load request shape"
+    )]
     fn load(
         &self,
         py: Python<'_>,

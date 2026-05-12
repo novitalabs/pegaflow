@@ -182,7 +182,10 @@ impl PegaEngine {
     /// recorded slot NUMA metadata. CUDA reads still use the registered GPU
     /// context identified by `device_id`. Hints are accepted only when they
     /// target a registered NUMA node for this effective TP/PP group.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "save requests carry the externally registered KV layout fields"
+    )]
     pub async fn batch_save_kv_blocks_from_ipc_with_numa_hint(
         &self,
         instance_id: &str,

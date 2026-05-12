@@ -23,7 +23,10 @@ pub struct LayerInfo {
     pub segments: usize,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "test registration helper mirrors the production batch registration API"
+)]
 pub fn register_layers(
     engine: &PegaEngine,
     instance_id: &str,

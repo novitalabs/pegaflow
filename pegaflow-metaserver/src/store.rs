@@ -118,7 +118,10 @@ impl BlockHashStore {
     }
 
     /// Clear all entries (for testing or maintenance)
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "maintenance API reserved for explicit store cleanup"
+    )]
     pub fn invalidate_all(&self) {
         self.map.clear();
     }

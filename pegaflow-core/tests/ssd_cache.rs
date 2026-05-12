@@ -14,7 +14,7 @@ const NUM_BLOCKS: usize = 4;
 const POOL_SIZE: usize = NUM_BLOCKS * BLOCK_SIZE * 2;
 const SSD_CAPACITY: u64 = 64 * 1024 * 1024;
 
-fn ssd_env(instance_id: &'static str) -> (TestEnv, std::path::PathBuf) {
+fn ssd_env(instance_id: &'static str) -> (TestEnv, std::path::PathBuf, tempfile::TempDir) {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let cache_path = temp_dir.path().join("cache.bin");
     let env = TestEnvBuilder::new(instance_id, "test-ns-ssd")
@@ -29,15 +29,13 @@ fn ssd_env(instance_id: &'static str) -> (TestEnv, std::path::PathBuf) {
             ..StorageConfig::default()
         })
         .build();
-    // Keep temp_dir alive so the cache file isn't deleted.
-    std::mem::forget(temp_dir);
-    (env, cache_path)
+    (env, cache_path, temp_dir)
 }
 
 /// Save blocks, flush to SSD, verify the cache file contains non-zero bytes.
 #[tokio::test]
 async fn ssd_write_persists_to_file() {
-    let (env, cache_path) = ssd_env("test-ssd-write");
+    let (env, cache_path, _temp_dir) = ssd_env("test-ssd-write");
 
     let file_meta = std::fs::metadata(&cache_path).expect("SSD cache file should be created");
     assert_eq!(
@@ -64,7 +62,7 @@ async fn ssd_write_persists_to_file() {
 /// query (triggers SSD prefetch) → load → verify data integrity.
 #[tokio::test]
 async fn ssd_prefetch_roundtrip_after_eviction() {
-    let (env, _cache_path) = ssd_env("test-ssd-prefetch");
+    let (env, _cache_path, _temp_dir) = ssd_env("test-ssd-prefetch");
 
     // Phase 1: Save target blocks and ensure they're persisted to SSD.
     let target = env.hashes(1);

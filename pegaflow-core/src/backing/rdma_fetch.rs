@@ -158,7 +158,10 @@ impl RdmaFetchStore {
 /// 2. gRPC QueryBlocksForTransfer RPC (connection reuse, no handshake)
 /// 3. RDMA READ all block segments + build SealedBlocks
 /// 4. ReleaseTransferLock (fire-and-forget, non-blocking)
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "RDMA task arguments are the per-fetch context passed from the scheduler"
+)]
 async fn rdma_fetch_task(
     rdma: &RdmaTransport,
     allocate_fn: &AllocateFn,

@@ -4,7 +4,12 @@
 //! - [`helpers`]: Engine construction, registration/save helpers, poll waiters.
 //! - [`harness`]: `RoundtripHarness` — one-call setup for save→query→load tests.
 
-#![allow(dead_code, unused_imports, unreachable_pub)]
+#![allow(
+    dead_code,
+    unused_imports,
+    unreachable_pub,
+    reason = "integration-test harness intentionally exposes helpers for multiple test binaries"
+)]
 
 mod gpu_buffer;
 mod harness;

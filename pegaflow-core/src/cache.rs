@@ -245,7 +245,10 @@ impl TinyLfu {
         }
     }
 
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "compact estimator constructor is kept for cache tuning experiments"
+    )]
     fn new_compact(cache_size: usize) -> Self {
         Self {
             estimator: Estimator::compact(cache_size),

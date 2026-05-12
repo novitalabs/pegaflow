@@ -120,7 +120,10 @@ fn copy_gpu_to_cpu_batch_async(
 }
 
 #[cfg(not(feature = "cuda-13"))]
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "CUDA 12 FFI wrapper preserves the driver API call shape"
+)]
 unsafe fn submit_batch_memcpy(
     dsts: *mut cudarc::driver::sys::CUdeviceptr,
     srcs: *mut cudarc::driver::sys::CUdeviceptr,
@@ -147,7 +150,10 @@ unsafe fn submit_batch_memcpy(
 }
 
 #[cfg(feature = "cuda-13")]
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "CUDA 13 FFI wrapper preserves the driver API call shape"
+)]
 unsafe fn submit_batch_memcpy(
     dsts: *mut cudarc::driver::sys::CUdeviceptr,
     srcs: *mut cudarc::driver::sys::CUdeviceptr,

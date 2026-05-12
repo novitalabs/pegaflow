@@ -14,6 +14,7 @@ use std::time::Instant;
 use std::{mem, ptr, thread};
 
 use clap::Parser;
+use log::warn;
 use pegaflow_common::read_cpu_topology_from_sysfs;
 use pegaflow_transfer::rdma_topo::SystemTopology;
 use pegaflow_transfer::{MemoryRegion, TransferDesc, TransferEngine, TransferOp, init_logging};
@@ -279,7 +280,10 @@ impl Drop for NumaBuffer {
 
 struct EngineContext {
     label: String,
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "keeps the server engine alive for benchmark lifetime"
+    )]
     server: TransferEngine,
     client: TransferEngine,
     server_buf: NumaBuffer,
@@ -581,8 +585,12 @@ fn create_engine_context(
 }
 
 fn cleanup_engine_context(ctx: &EngineContext) {
-    ctx.client.unregister_memory(&[ctx.client_buf.ptr]).ok();
-    ctx.server.unregister_memory(&[ctx.server_buf.ptr]).ok();
+    if let Err(err) = ctx.client.unregister_memory(&[ctx.client_buf.ptr]) {
+        warn!("failed to unregister client benchmark memory: {err}");
+    }
+    if let Err(err) = ctx.server.unregister_memory(&[ctx.server_buf.ptr]) {
+        warn!("failed to unregister server benchmark memory: {err}");
+    }
 }
 
 // ---------------------------------------------------------------------------

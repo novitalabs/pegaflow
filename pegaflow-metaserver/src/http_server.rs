@@ -2,7 +2,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::{Router, routing::get};
-use log::info;
+use log::{info, warn};
 use prometheus::{Registry, TextEncoder};
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -47,12 +47,14 @@ pub async fn start_http_server(
     info!("Starting HTTP server on {} (/health, /metrics)", addr);
 
     let handle = tokio::spawn(async move {
-        axum::serve(listener, app)
+        if let Err(err) = axum::serve(listener, app)
             .with_graceful_shutdown(async move {
                 shutdown.notified().await;
             })
             .await
-            .ok();
+        {
+            warn!("HTTP server stopped with error: {err}");
+        }
     });
 
     Ok(handle)

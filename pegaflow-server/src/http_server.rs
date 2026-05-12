@@ -200,12 +200,14 @@ pub async fn start_http_server(
     let app = app.with_state(state);
 
     let handle = tokio::spawn(async move {
-        axum::serve(listener, app)
+        if let Err(err) = axum::serve(listener, app)
             .with_graceful_shutdown(async move {
                 shutdown.notified().await;
             })
             .await
-            .ok();
+        {
+            warn!("HTTP server stopped with error: {err}");
+        }
     });
 
     Ok(handle)

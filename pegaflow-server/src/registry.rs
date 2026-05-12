@@ -11,7 +11,10 @@ pub struct TensorMetadata {
 }
 
 struct LayerTensor {
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "holding the Python tensor keeps CUDA IPC memory mapped"
+    )]
     tensor: Py<PyAny>,
     metadata: TensorMetadata,
 }

@@ -7,7 +7,10 @@ pub(super) mod uring;
 use std::sync::Arc;
 
 pub(crate) use ssd_cache::{DEFAULT_MAX_PREFETCH_BLOCKS, SSD_ALIGNMENT};
-#[allow(unreachable_pub)] // re-exported as pub in lib.rs
+#[allow(
+    unreachable_pub,
+    reason = "SSD config types are re-exported through the public crate API"
+)]
 pub use ssd_cache::{
     DEFAULT_SSD_PREFETCH_INFLIGHT, DEFAULT_SSD_PREFETCH_QUEUE_DEPTH, DEFAULT_SSD_WRITE_INFLIGHT,
     DEFAULT_SSD_WRITE_QUEUE_DEPTH, SsdCacheConfig,

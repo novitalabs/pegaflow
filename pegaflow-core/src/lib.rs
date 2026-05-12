@@ -207,7 +207,10 @@ impl PegaEngine {
     ///
     /// This reduces gRPC round-trips from N to 1 and allows the engine to
     /// construct the GPU context with all layer registrations at once.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "public API mirrors one batched registration RPC payload"
+    )]
     pub fn register_context_layer_batch(
         &self,
         instance_id: &str,
@@ -446,7 +449,10 @@ impl PegaEngine {
     ///
     /// Returns immediately after submitting the task to the GPU worker pool.
     /// The connector spin-waits on the `LoadState` until completion.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "public API mirrors one batched load RPC payload"
+    )]
     pub fn batch_load_kv_blocks_multi_layer(
         &self,
         instance_id: &str,
@@ -477,7 +483,10 @@ impl PegaEngine {
         result
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "internal helper keeps the public load API validation path explicit"
+    )]
     fn batch_load_kv_blocks_multi_layer_inner(
         &self,
         instance_id: &str,
