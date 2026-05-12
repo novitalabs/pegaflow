@@ -147,8 +147,8 @@ PegaFlow exposes the following metrics for monitoring KV cache operations:
 
 `pegaflow_cache_tier_block_requests_total{tier}` is the canonical metric for
 explaining how each cache tier contributes to prefix-query hit ratio. It is
-emitted at the first `query_prefetch` decision for a logical request id
-(`req_id`) and uses exactly one label: `tier`.
+emitted once for each `query_prefetch` decision and uses exactly one label:
+`tier`.
 
 Tier values:
 
@@ -157,14 +157,6 @@ Tier values:
 - `ssd`: blocks selected to be satisfied by SSD prefetch
 - `miss`: blocks no tier selected for that decision, including SSD prefetch
   backpressure and residual blocks after RDMA partial availability
-
-Repeated polls for the same `req_id` do not re-attribute. PegaFlow keeps a
-bounded attribution table with 4096 entries and the same TTL/GC lifecycle as
-`failed_remote`; reusing the same `req_id` will not create another tier
-attribution while its entry is still retained by both TTL and the table cap.
-Under high `req_id` churn, the cap may evict older entries before TTL expiry;
-after GC or cap eviction removes the entry, the same `req_id` is treated as a
-new logical query.
 
 This metric intentionally records decisions, not completed service outcomes.
 For backing failure correlation, use:

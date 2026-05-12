@@ -39,8 +39,7 @@ pub(crate) struct CoreMetrics {
     /// Per-decision block attribution for `query_prefetch`. Labelled by `tier`
     /// (`ram` | `rdma` | `ssd` | `miss`). Each `query_prefetch` decision adds
     /// at most four times (one per non-zero tier) and the sum across tiers
-    /// equals the request's `block_hashes.len()`. Repeated polls for the same
-    /// `req_id` do not re-attribute.
+    /// equals the request's `block_hashes.len()`.
     pub cache_tier_block_requests: Counter<u64>,
     pub cache_block_insertions: Counter<u64>,
     pub cache_block_admission_rejections: Counter<u64>,
@@ -213,10 +212,9 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
                 .with_description(
                     "Per-decision query_prefetch block attribution by storage tier \
                      (tier=ram|rdma|ssd|miss). The sum across tiers equals the \
-                     request's block count for that decision; repeated polls for \
-                     the same req_id do not re-attribute. This is decision \
-                     attribution, not service attribution; backing failures must \
-                     be inspected via pegaflow_rdma_fetch_total{status=\"error\"} \
+                     request's block count for that decision. This is decision \
+                     attribution, not service attribution; backing failures must be \
+                     inspected via pegaflow_rdma_fetch_total{status=\"error\"} \
                      and pegaflow_ssd_prefetch_failures_total.",
                 )
                 .build(),
