@@ -41,6 +41,39 @@ if _LOAD_TIMEOUT_RAW < _LOAD_TIMEOUT_FLOOR_SECONDS:
     _LOAD_TIMEOUT_RAW = _LOAD_TIMEOUT_FLOOR_SECONDS
 
 
+def _is_known_compressed_storage_shape(shape: tuple[int, ...]) -> bool:
+    # DeepSeek V4 compressed MLA stores one compressed storage page per manager
+    # block. Its small storage_block_size is not a manager->kernel page split.
+    return len(shape) == 3 and shape[-1] == 584
+
+
+def _infer_physical_block_size_tokens(shape: tuple[int, ...], layout: str) -> int | None:
+    if layout == "KV-first" and len(shape) >= 3:
+        return int(shape[2])
+    if layout == "blocks-first" and _is_known_compressed_storage_shape(shape):
+        return None
+    if layout == "blocks-first" and len(shape) >= 5 and shape[1] == 2:
+        return int(shape[2])
+    if layout == "blocks-first" and len(shape) == 3:
+        return int(shape[1])
+    return None
+
+
+def _detect_split_block_layout(
+    ctx: ConnectorContext,
+    shape: tuple[int, ...],
+    layout: str,
+) -> tuple[int, int] | None:
+    physical_block_size = _infer_physical_block_size_tokens(shape, layout)
+    if physical_block_size is None or physical_block_size >= ctx.block_size:
+        return None
+
+    if physical_block_size <= 0 or ctx.block_size % physical_block_size != 0:
+        return None
+
+    return physical_block_size, ctx.block_size // physical_block_size
+
+
 @dataclass
 class SaveTask:
     metadata: PegaConnectorMetadata
@@ -94,6 +127,7 @@ class WorkerConnector:
         self._cross_layer_key = _CROSS_LAYER_KEY
 
         self._finished_requests: set[str] = set()
+        self._reported_split_block_layout = False
 
         # Stats collection
         self._stats = PegaKVConnectorStats()
@@ -147,9 +181,6 @@ class WorkerConnector:
                 f"KV cache for {layer_name} must have zero storage offset"
             )
 
-            wrapper = CudaIPCWrapper(kv_cache)
-            wrapper_bytes = pickle.dumps(wrapper)
-
             shape = tuple(kv_cache.shape)
             stride = tuple(kv_cache.stride())
             element_size = kv_cache.element_size()
@@ -167,9 +198,35 @@ class WorkerConnector:
                 segments = 1
                 layout = "blocks-first"
 
+            split_layout = _detect_split_block_layout(self._ctx, shape, layout)
+            if split_layout is not None and not self._reported_split_block_layout:
+                physical_block_size, ratio = split_layout
+                logger.error(
+                    "[PegaKVConnector] detected split KV block layout: "
+                    "instance=%s layer=%s layout=%s shape=%s "
+                    "logical_block_size=%d physical_page_size=%d "
+                    "physical_pages_per_logical=%d. PegaFlow currently saves "
+                    "and loads one registered physical page per request block "
+                    "hash, so cache reuse can be incorrect for this layout. "
+                    "Use vLLM block_size=%d or disable PegaFlow KV cache until "
+                    "multi-page logical block support is implemented.",
+                    self._ctx.instance_id,
+                    layer_name,
+                    layout,
+                    shape,
+                    self._ctx.block_size,
+                    physical_block_size,
+                    ratio,
+                    physical_block_size,
+                )
+                self._reported_split_block_layout = True
+
             assert bytes_per_block != 0, (
                 f"Invalid bytes_per_block for {layer_name}: stride={stride}"
             )
+
+            wrapper = CudaIPCWrapper(kv_cache)
+            wrapper_bytes = pickle.dumps(wrapper)
 
             layer_names.append(layer_name)
             ipc_wrappers.append(wrapper_bytes)
