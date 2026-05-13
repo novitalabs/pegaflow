@@ -38,6 +38,7 @@ test = [
     "pytest-cov>=4.0",
     "pytest-xdist>=3.0",
     "numpy>=1.24",
+    "requests>=2.26.0",
 ]
 dev = [
     "pegaflow-llm[test]",

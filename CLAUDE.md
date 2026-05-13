@@ -26,30 +26,16 @@ Run all CI checks locally before committing:
 
 ### Python Test Gates
 
-```bash
-cd python
-uv run --extra test pytest
-```
+| Gate | When to run | Command | Notes |
+|------|-------------|---------|-------|
+| Default unit | Every Python PR before review | `cd python && uv run --extra test pytest` | Must not start vLLM, `pegaflow-server`, or GPU runtime. Collection still imports deselected files, so top-level imports must be in `python[test]` or moved behind fixtures. |
+| Source-only default | CI and dependency-boundary checks | `cd python && uv run --isolated --no-project --with pytest --with numpy --with 'requests>=2.26.0' pytest` | Proves default gate does not need torch, vLLM, CUDA, native extension build, or a running server. |
+| Integration | Server/native/client/session lifecycle changes | `cd python && uv run --extra test pytest -m integration` | Requires built native extension, server binary, and GPU where the test uses CUDA IPC. |
+| vLLM correctness E2E | Python test gates, vLLM connector, connector-visible cache semantics, save/load, query planning, or release-confidence changes | `cd python && uv run --extra test pytest -m e2e tests/test_vllm_e2e_correctness.py --model /data/models/Qwen3-4B --max-model-len 4096` | Merge-before gate: code author runs it, reviewer reruns it on the GPU machine. |
+| Stress | Query probe, preemption, pending unpin, scheduler concurrency | `cd python && uv run --extra test pytest -m stress tests/test_vllm_query_probe_stress.py --model /data/models/Qwen3-4B --max-model-len 4096` | Targeted evidence, not default PR feedback. |
+| Release smoke | Published wheel/image, loader path, installed console script, CUDA runtime | See `python/tests/README.md` | Validates final installed artifact, not the source checkout. |
 
-CI uses the source-only form below so the default Python gate does not compile the native extension or require torch, vLLM, CUDA, or a running server:
-
-```bash
-cd python
-uv run --isolated --no-project --with pytest --with numpy --with requests pytest
-```
-
-Python heavy gates are explicit and resource-bound:
-
-| Change area | Gate command |
-|-------------|--------------|
-| Server/native/client/session lifecycle | `cd python && uv run --extra test pytest -m integration` |
-| vLLM connector correctness, cache semantics, save/load/hit behavior | `cd python && uv run --extra test pytest -m e2e tests/test_vllm_e2e_correctness.py --model /data/models/Qwen3-4B --max-model-len 4096` |
-| Query probe, preemption, pending unpin, scheduler concurrency | `cd python && uv run --extra test pytest -m stress tests/test_vllm_query_probe_stress.py --model /data/models/Qwen3-4B --max-model-len 4096` |
-| Published wheel/image, loader path, installed console script, CUDA runtime | release smoke from `python/tests/README.md` |
-
-Do not default to running all of `python/tests`. The default gate is the dev-friendly PR feedback loop; heavy gates are targeted evidence for the change area.
-
-Do not add an `xtask` or wrapper just to hide command complexity. Current project taste is `uv` + pytest markers for Python and Cargo/CI for Rust. Consider `xtask` only after the command contract is stable and repeated manual execution has become the actual bottleneck.
+Do not default to running all of `python/tests`. Current project taste is `uv` + pytest markers for Python and Cargo/CI for Rust; do not add an `xtask` wrapper until the gate contract is stable and repeated execution is the real bottleneck.
 
 ### Running Benchmarks
 

@@ -7,7 +7,7 @@
 | Change area | Gate | Command | Failure boundary |
 | --- | --- | --- | --- |
 | Connector helper math, scheduler state, worker load failure handling, IPC wrapper compatibility | Default unit | `uv run --extra test pytest` | Python contract or local connector state-machine regression |
-| Clean source-only Python changes, docs touching test layout, CI test dependency changes | Source-only default | `uv run --isolated --no-project --with pytest --with numpy --with requests pytest` | Default test accidentally depends on torch, vLLM, CUDA, or native extension |
+| Clean source-only Python changes, docs touching test layout, CI test dependency changes | Source-only default | `uv run --isolated --no-project --with pytest --with numpy --with 'requests>=2.26.0' pytest` | Default test accidentally depends on torch, vLLM, CUDA, or native extension |
 | Server client, native extension, CUDA IPC registration, session lifecycle | Integration | `uv run --extra test pytest -m integration` | Server/native/GPU lifecycle regression |
 | vLLM connector correctness, cache semantics, save/load/hit behavior, release candidate confidence | vLLM correctness E2E | `uv run --extra test pytest -m e2e tests/test_vllm_e2e_correctness.py --model /data/models/Qwen3-4B` | Real vLLM connector correctness regression |
 | Query probe, preemption, pending unpin, scheduler concurrency or pressure behavior | Stress | `uv run --extra test pytest -m stress tests/test_vllm_query_probe_stress.py --model /data/models/Qwen3-4B` | Concurrent scheduler/query-probe regression |
@@ -22,11 +22,16 @@ cd python
 uv run --extra test pytest
 ```
 
+This command must not start vLLM, `pegaflow-server`, or any GPU runtime. It still
+imports every test module during pytest collection, so any top-level import used
+by deselected heavy tests must be present in the `test` extra or moved behind a
+fixture/helper boundary.
+
 CI uses the source-only variant below so the unit gate does not compile the native extension or require CUDA:
 
 ```bash
 cd python
-uv run --isolated --no-project --with pytest --with numpy --with requests pytest
+uv run --isolated --no-project --with pytest --with numpy --with 'requests>=2.26.0' pytest
 ```
 
 Runs:
@@ -66,6 +71,11 @@ uv run --extra test pytest -m e2e tests/test_vllm_e2e_correctness.py \
 ```
 
 This is the main correctness E2E. It starts baseline vLLM and PegaFlow-enabled vLLM, compares deterministic completions across one execution plan, and checks that PegaFlow metrics show save/load/hit activity.
+
+This gate is required before merging PRs that change Python test gates, the
+vLLM connector, cache semantics visible to the connector, save/load behavior,
+query planning, or release confidence. The code author runs it before requesting
+merge, and review reruns it independently on the GPU machine.
 
 Requirements:
 - vLLM installed in the active environment

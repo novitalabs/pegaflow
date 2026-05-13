@@ -162,7 +162,7 @@ jobs:
       - name: Run default Python test gate
         working-directory: python
         run: |
-          uv run --isolated --no-project --with pytest --with numpy --with requests pytest
+          uv run --isolated --no-project --with pytest --with numpy --with 'requests>=2.26.0' pytest
 
   cargo-check-variant:
     name: cargo check (${{ matrix.cuda-variant }})
