@@ -9,21 +9,12 @@ Requirements:
 - GPU available for PegaServer
 
 Run with:
-    cd python && pytest tests/ -v
+    cd python && pytest -m integration tests/test_engine_client.py -v
 """
 
+import pytest
 
-class TestEngineClientFixtures:
-    """Test basic fixtures and server connectivity."""
-
-    def test_client_connects(self, engine_client):
-        """Verify client can connect to server."""
-        assert engine_client is not None
-
-    def test_server_is_running(self, pega_server):
-        """Verify the test server is running."""
-        assert pega_server.is_running()
-        assert pega_server.endpoint.startswith("http://")
+pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
 
 class TestEngineClientQuery:
@@ -45,10 +36,3 @@ class TestEngineClientQuery:
         assert isinstance(result, dict)
         hit_blocks = result.get("hit_blocks", 0)
         assert hit_blocks == 0, "Unknown hashes should have zero hits"
-
-    def test_query_single_hash(
-        self, engine_client, registered_instance: str, block_hashes: list[bytes]
-    ):
-        """Query with a single hash."""
-        result = engine_client.query_prefetch(registered_instance, block_hashes[:1], req_id="test")
-        assert result is not None

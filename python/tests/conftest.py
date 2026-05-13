@@ -18,9 +18,12 @@ import time
 import uuid
 from collections.abc import Generator
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
-import torch
+
+if TYPE_CHECKING:
+    import torch
 
 # Import CudaIPCWrapper for IPC communication
 try:
@@ -43,6 +46,10 @@ SERVER_READY_CHECK_INTERVAL = 1.0  # seconds
 # =============================================================================
 # Utility Functions
 # =============================================================================
+
+
+def _torch():
+    return pytest.importorskip("torch", reason="torch is required for GPU integration tests")
 
 
 def find_available_port() -> int:
@@ -113,20 +120,24 @@ def wait_for_server_ready(endpoint: str, timeout: float = SERVER_STARTUP_TIMEOUT
 
 
 def initialize_kv_cache(
-    device: torch.device,
+    device: "torch.device",
     num_blocks: int = 64,
     num_layers: int = 1,
     block_size: int = 16,
     num_heads: int = 8,
     head_size: int = 128,
-    dtype: torch.dtype = torch.bfloat16,
-) -> list[torch.Tensor]:
+    dtype: "torch.dtype | None" = None,
+) -> list["torch.Tensor"]:
     """
     Initialize KV cache tensors on GPU for testing.
 
     Creates tensors in KV-first layout: (2, num_blocks, block_size, num_heads, head_size)
     where the first dimension is [K, V].
     """
+    torch = _torch()
+    if dtype is None:
+        dtype = torch.bfloat16
+
     torch.random.manual_seed(42)
 
     gpu_tensors = [
@@ -162,8 +173,11 @@ class ClientContext:
         block_size: int = 16,
         num_heads: int = 8,
         head_size: int = 128,
-        dtype: torch.dtype = torch.bfloat16,
+        dtype: "torch.dtype | None" = None,
     ):
+        torch = _torch()
+        if dtype is None:
+            dtype = torch.bfloat16
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is not available")
 
@@ -275,11 +289,11 @@ class ClientContext:
         """
         return self.engine_client.query_prefetch(self.instance_id, block_hashes, req_id="test")
 
-    def get_kv_cache(self, layer: int = 0) -> torch.Tensor:
+    def get_kv_cache(self, layer: int = 0) -> "torch.Tensor":
         """Get KV cache tensor for a specific layer."""
         return self.gpu_kv_caches[layer]
 
-    def get_tensor_slice(self, layer: int, start_block: int, num_blocks: int) -> torch.Tensor:
+    def get_tensor_slice(self, layer: int, start_block: int, num_blocks: int) -> "torch.Tensor":
         """Get a slice of the KV cache tensor for a specific layer."""
         return self.gpu_kv_caches[layer][:, start_block : start_block + num_blocks]
 
@@ -463,6 +477,7 @@ def client_context(
     Returns:
         ClientContext instance (automatically registered)
     """
+    torch = _torch()
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
 
@@ -495,7 +510,7 @@ def registered_instance(client_context: ClientContext) -> Generator[str, None, N
 
 
 # =============================================================================
-# Fixtures: E2E / Fuzz shared options
+# Fixtures: E2E shared options
 # =============================================================================
 
 
@@ -561,14 +576,14 @@ def pytest_addoption(parser):
         action="store",
         default=1,
         type=int,
-        help="Tensor parallel size for vLLM servers in E2E/Fuzz tests (tp * pp <= 4)",
+        help="Tensor parallel size for vLLM servers in E2E tests (tp * pp <= 4)",
     )
     parser.addoption(
         "--pipeline-parallel-size",
         action="store",
         default=1,
         type=int,
-        help="Pipeline parallel size for vLLM servers in E2E/Fuzz tests (tp * pp <= 4)",
+        help="Pipeline parallel size for vLLM servers in E2E tests (tp * pp <= 4)",
     )
     parser.addoption(
         "--max-model-len",
@@ -576,28 +591,6 @@ def pytest_addoption(parser):
         default=None,
         type=int,
         help="Max model length for vLLM servers (e.g. 16384 for large models on small GPUs)",
-    )
-    # Fuzz test options
-    parser.addoption(
-        "--fuzz-seed",
-        action="store",
-        default=42,
-        type=int,
-        help="Random seed for fuzz test reproducibility",
-    )
-    parser.addoption(
-        "--fuzz-corpus",
-        action="store",
-        default=500,
-        type=int,
-        help="Number of unique prompts to sample from ShareGPT",
-    )
-    parser.addoption(
-        "--fuzz-requests",
-        action="store",
-        default=1000,
-        type=int,
-        help="Number of requests to generate in fuzz test",
     )
 
 
@@ -610,8 +603,4 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         "e2e: marks tests as end-to-end tests (require vLLM + PegaFlow)",
-    )
-    config.addinivalue_line(
-        "markers",
-        "fuzz: marks tests as fuzz tests (long-running, skipped by default)",
     )

@@ -11,6 +11,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import pytest
 import requests
 
 from .vllm_helpers import (
@@ -19,6 +20,8 @@ from .vllm_helpers import (
     call_openai_api,
     fetch_pegaflow_metrics,
 )
+
+pytestmark = [pytest.mark.e2e, pytest.mark.stress, pytest.mark.gpu]
 
 STRESS_PROMPT = (
     "Distributed systems often rely on caching to reduce latency and improve "

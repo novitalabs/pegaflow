@@ -37,7 +37,6 @@ test = [
     "pytest>=8.0",
     "pytest-cov>=4.0",
     "pytest-xdist>=3.0",
-    "datasets>=2.0",
     "numpy>=1.24",
 ]
 dev = [
@@ -62,12 +61,16 @@ addopts = [
     "-v",
     "--strict-markers",
     "--tb=short",
+    "-m",
+    "not integration and not e2e and not stress and not gpu",
 ]
 markers = [
-    "integration: marks tests as integration tests (require running server)",
-    "slow: marks tests as slow (may take > 1 second)",
-    "gpu: marks tests that require GPU",
-    "fuzz: marks tests as fuzz tests (long-running, skipped by default)",
+    "integration: starts or requires pegaflow-server but does not run vLLM",
+    "e2e: runs baseline vLLM plus PegaFlow connector correctness checks",
+    "stress: long-running vLLM scenario for concurrency or pressure behavior",
+    "gpu: requires CUDA-capable GPU",
+    "slow: may take more than a few seconds",
+    "release_smoke: validates final installed artifact/runtime rather than source tree",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",

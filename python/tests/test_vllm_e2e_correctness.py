@@ -208,13 +208,16 @@ _LABEL_TO_BASELINE: dict[str, str] = {
 
 
 @pytest.mark.e2e
+@pytest.mark.gpu
 class TestE2ECorrectness:
     """E2E correctness: baseline vLLM vs PegaFlow-enabled vLLM.
 
     Two-phase structure:
       Phase 1 — run all unique prompts through baseline vLLM, collect golden outputs.
       Phase 2 — run execution plan through PegaFlow vLLM, collect outputs + metrics.
-    Each test method asserts one cache path independently.
+    The equality test walks every execution-plan label and reports the label
+    that failed, so one expensive fixture run does not pretend to be 11
+    independent tests.
     """
 
     @pytest.fixture(scope="class")
@@ -301,74 +304,21 @@ class TestE2ECorrectness:
             "metrics_end": metrics_end,
         }
 
-    # -- Individual test methods: each asserts one cache path --
+    def test_execution_plan_outputs_match_baseline(self, baseline_outputs, pegaflow_results):
+        """Every cache-path prompt in EXECUTION_PLAN must match baseline vLLM."""
+        mismatches: list[str] = []
+        for label, _prompt, expectation in EXECUTION_PLAN:
+            baseline_key = _LABEL_TO_BASELINE[label]
+            baseline = baseline_outputs[baseline_key]
+            pegaflow = pegaflow_results["outputs"][label]
+            if baseline != pegaflow:
+                mismatches.append(
+                    f"[{label}/{expectation}] Output mismatch:\n"
+                    f"  baseline ({len(baseline)} chars): {baseline[:120]}...\n"
+                    f"  pegaflow ({len(pegaflow)} chars): {pegaflow[:120]}..."
+                )
 
-    def _assert_match(
-        self,
-        baseline_outputs: dict[str, str],
-        pegaflow_results: dict,
-        label: str,
-    ):
-        baseline_key = _LABEL_TO_BASELINE[label]
-        baseline = baseline_outputs[baseline_key]
-        pegaflow = pegaflow_results["outputs"][label]
-        assert baseline == pegaflow, (
-            f"[{label}] Output mismatch:\n"
-            f"  baseline ({len(baseline)} chars): {baseline[:120]}...\n"
-            f"  pegaflow ({len(pegaflow)} chars): {pegaflow[:120]}..."
-        )
-
-    def test_cold_short(self, baseline_outputs, pegaflow_results):
-        """Short prompt cold save — incomplete block edge case."""
-        self._assert_match(baseline_outputs, pegaflow_results, "short_cold")
-
-    def test_cold_long(self, baseline_outputs, pegaflow_results):
-        """Long prompt cold save — multi-block boundary alignment."""
-        self._assert_match(baseline_outputs, pegaflow_results, "long_cold")
-
-    def test_warm_short(self, baseline_outputs, pegaflow_results):
-        """Short prompt warm hit — same prompt, full cache hit."""
-        self._assert_match(baseline_outputs, pegaflow_results, "short_warm")
-
-    def test_warm_long(self, baseline_outputs, pegaflow_results):
-        """Long prompt warm hit — same prompt, full cache hit."""
-        self._assert_match(baseline_outputs, pegaflow_results, "long_warm")
-
-    def test_prefix_base(self, baseline_outputs, pegaflow_results):
-        """Prefix base — cold save of prefix stem."""
-        self._assert_match(baseline_outputs, pegaflow_results, "prefix_base")
-
-    def test_prefix_extend(self, baseline_outputs, pegaflow_results):
-        """Prefix extension — cached 'A B C', now requesting 'A B C D E'.
-
-        This is the exact path changed by PR #204: external hit prefix
-        + new block computation with correct global index alignment.
-        """
-        self._assert_match(baseline_outputs, pegaflow_results, "prefix_extend")
-
-    def test_prefix_rollback(self, baseline_outputs, pegaflow_results):
-        """Prefix rollback — cached 'A B C D', now requesting shorter 'A B'.
-
-        Tests that a shorter request correctly reuses a subset of
-        a longer cached prefix without index misalignment.
-        """
-        self._assert_match(baseline_outputs, pegaflow_results, "rollback_short")
-
-    def test_rollback_long_cold(self, baseline_outputs, pegaflow_results):
-        """Rollback long prompt — cold save baseline."""
-        self._assert_match(baseline_outputs, pegaflow_results, "rollback_long")
-
-    def test_multi_round_r1(self, baseline_outputs, pegaflow_results):
-        """Multi-round decode R1 — cold save of initial context."""
-        self._assert_match(baseline_outputs, pegaflow_results, "multi_r1")
-
-    def test_multi_round_r2(self, baseline_outputs, pegaflow_results):
-        """Multi-round decode R2 — extends R1 context, partial cache hit."""
-        self._assert_match(baseline_outputs, pegaflow_results, "multi_r2")
-
-    def test_multi_round_r3(self, baseline_outputs, pegaflow_results):
-        """Multi-round decode R3 — extends R2 context, deeper partial hit."""
-        self._assert_match(baseline_outputs, pegaflow_results, "multi_r3")
+        assert not mismatches, "\n\n".join(mismatches)
 
     def test_cache_metrics(self, pegaflow_results):
         """Directional cache metrics — saves happened on cold, hits on warm/partial."""

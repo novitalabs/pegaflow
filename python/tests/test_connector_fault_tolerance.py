@@ -17,12 +17,18 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-from pegaflow.connector.common import (
+import pytest
+
+from .unit_stubs import install_connector_unit_stubs
+
+install_connector_unit_stubs()
+
+from pegaflow.connector.common import (  # noqa: E402
     ConnectorContext,
     LoadIntent,
     PegaConnectorMetadata,
 )
-from pegaflow.connector.worker import WorkerConnector
+from pegaflow.connector.worker import WorkerConnector  # noqa: E402
 
 
 class FakeEngineClient:
@@ -112,55 +118,41 @@ def _load_metadata(req_id: str, block_ids: tuple[int, ...]) -> PegaConnectorMeta
     )
 
 
-def test_load_rpc_ok_false_reports_failures_without_raise():
-    """B.1: engine_client.load returns ok=False -> no raise, failure surface populated."""
+@pytest.mark.parametrize(
+    ("failure_mode", "req_id", "block_ids"),
+    [
+        ("ok_false", "req_fail_ok", (1, 2, 3)),
+        ("exception", "req_fail_exc", (10, 20)),
+    ],
+)
+def test_load_rpc_failure_reports_failures_without_raise(
+    failure_mode: str,
+    req_id: str,
+    block_ids: tuple[int, ...],
+):
+    """B.1: failed load RPCs surface through vLLM recovery APIs instead of raising."""
     worker, client, state_mgr = _make_worker()
-    client.fail_load_with_ok_false = True
+    if failure_mode == "ok_false":
+        client.fail_load_with_ok_false = True
+    elif failure_mode == "exception":
+        client.fail_load_with_exception = ConnectionError("server gone")
 
-    metadata = _load_metadata("req_fail_ok", (1, 2, 3))
+    metadata = _load_metadata(req_id, block_ids)
 
-    # Must not raise; used to raise RuntimeError and crash the worker step.
+    # Must not raise; used to crash the worker step instead of letting vLLM recompute.
     worker.start_load_kv(metadata, _stub_forward_context())
 
-    # RPC was actually attempted.
     assert len(client.load_calls) == 1
-
-    # get_block_ids_with_load_errors returns the exact failed block ids, then drains.
-    assert worker.get_block_ids_with_load_errors() == {1, 2, 3}
+    assert worker.get_block_ids_with_load_errors() == set(block_ids)
     assert worker.get_block_ids_with_load_errors() == set()
 
-    # get_finished reports the failed request in finished_recving so vLLM unblocks.
     _, finished_recving = worker.get_finished(set())
-    assert finished_recving == {"req_fail_ok"}
+    assert finished_recving == {req_id}
 
-    # State manager was asked to mark unavailable so subsequent queries short-circuit.
     assert state_mgr.mark_unavailable.called
 
-    # No PyLoadState registered: no permanent leak.
     assert worker._pending_loads == {}
     assert worker._pending_load_reqs == {}
-    assert worker._pending_load_meta == {}
-
-    worker.shutdown()
-
-
-def test_load_rpc_exception_reports_failures_without_raise():
-    """B.1: engine_client.load raises -> same failure-reporting path as ok=False."""
-    worker, client, state_mgr = _make_worker()
-    client.fail_load_with_exception = ConnectionError("server gone")
-
-    metadata = _load_metadata("req_fail_exc", (10, 20))
-
-    worker.start_load_kv(metadata, _stub_forward_context())
-
-    assert worker.get_block_ids_with_load_errors() == {10, 20}
-
-    _, finished_recving = worker.get_finished(set())
-    assert finished_recving == {"req_fail_exc"}
-
-    assert state_mgr.mark_unavailable.called
-
-    assert worker._pending_loads == {}
     assert worker._pending_load_meta == {}
 
     worker.shutdown()

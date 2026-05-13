@@ -24,14 +24,32 @@ Run all CI checks locally before committing:
 ./scripts/check.sh       # Run fmt, typos, clippy, and cargo check
 ```
 
-### E2E Correctness Test
+### Python Test Gates
 
 ```bash
-pytest python/tests/test_vllm_e2e_correctness.py -v -s
-pytest python/tests/test_vllm_e2e_correctness.py -v -s --model /path/to/model --max-model-len 4096
+cd python
+uv run --extra test pytest
 ```
 
-pegaflow-server is auto-started via `cargo run -r` and stopped by the test. No manual setup needed.
+CI uses the source-only form below so the default Python gate does not compile the native extension or require torch, vLLM, CUDA, or a running server:
+
+```bash
+cd python
+uv run --isolated --no-project --with pytest --with numpy --with requests pytest
+```
+
+Python heavy gates are explicit and resource-bound:
+
+| Change area | Gate command |
+|-------------|--------------|
+| Server/native/client/session lifecycle | `cd python && uv run --extra test pytest -m integration` |
+| vLLM connector correctness, cache semantics, save/load/hit behavior | `cd python && uv run --extra test pytest -m e2e tests/test_vllm_e2e_correctness.py --model /data/models/Qwen3-4B --max-model-len 4096` |
+| Query probe, preemption, pending unpin, scheduler concurrency | `cd python && uv run --extra test pytest -m stress tests/test_vllm_query_probe_stress.py --model /data/models/Qwen3-4B --max-model-len 4096` |
+| Published wheel/image, loader path, installed console script, CUDA runtime | release smoke from `python/tests/README.md` |
+
+Do not default to running all of `python/tests`. The default gate is the dev-friendly PR feedback loop; heavy gates are targeted evidence for the change area.
+
+Do not add an `xtask` or wrapper just to hide command complexity. Current project taste is `uv` + pytest markers for Python and Cargo/CI for Rust. Consider `xtask` only after the command contract is stable and repeated manual execution has become the actual bottleneck.
 
 ### Running Benchmarks
 
@@ -136,6 +154,17 @@ vLLM Worker <--gRPC--> PegaEngine Server <--CUDA IPC--> GPU Memory
 - Use native generics (`list`, `dict`, `set`, `tuple`) instead of `typing.List`, `typing.Dict`, etc.
 - Use PEP 604 union syntax (`X | Y`, `X | None`) instead of `typing.Union`, `typing.Optional`
 - Logging: use `%s` formatting (`logger.info("x=%s", x)`) instead of f-strings to avoid evaluation overhead
+
+## Testing Principles
+
+- Do not add tests just for the sake of adding tests.
+- Before adding or keeping a test, answer: would skipping this test materially reduce confidence to merge a PR in its trigger area? If not, delete it or keep it out of routine gates.
+- Merge tests that protect the same contract; prefer table-driven cases with clear ids over copy-pasted methods.
+- Delete tests with no clear consumer. A test that no dev, reviewer, CI job, release gate, or scheduled job uses is noise.
+- Default Python tests must be dev friendly: fast, stable, no GPU, no vLLM, no native extension build, and failure messages that point to a Python contract.
+- Heavy tests must declare their trigger: integration, e2e, stress, or release smoke. A heavy test without a trigger should not live in the main pytest surface.
+- Stub and mock tests are allowed only for local contracts and must not shadow real runtime modules during integration/e2e collection.
+- Prefer integration tests when they prove a real boundary that units cannot. Prefer units when they give faster, clearer feedback for local connector state machines.
 
 ## Environment Variables
 

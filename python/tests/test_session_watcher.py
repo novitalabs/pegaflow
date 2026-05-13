@@ -28,6 +28,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = [pytest.mark.integration, pytest.mark.gpu]
+
 HELPER = Path(__file__).parent / "session_crash_helper.py"
 READY_TIMEOUT_SEC = 30.0
 CLEANUP_LOG_DEADLINE_SEC = 5.0

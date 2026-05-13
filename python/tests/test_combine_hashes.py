@@ -1,58 +1,16 @@
-"""Unit tests for DCP-aware block size logic in ConnectorContext.
-
-The Rust extension (pegaflow.pegaflow) is not always available in CI/dev,
-so we pre-load a stub into sys.modules before the real package __init__
-tries to import it.
-"""
+"""Unit tests for DCP-aware block size logic in ConnectorContext."""
 
 from __future__ import annotations
 
 import hashlib
-import sys
-import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-# ---------------------------------------------------------------------------
-# Stub the native extension *before* anything imports pegaflow.
-# ---------------------------------------------------------------------------
+import pytest
 
+from .unit_stubs import install_connector_unit_stubs
 
-class _FakeLoadState:
-    def shm_name(self) -> str:
-        return "test-shm"
-
-    def is_ready(self) -> bool:
-        return False
-
-    def get_state(self) -> int:
-        return 0
-
-
-_EXT_NAME = "pegaflow.pegaflow"
-if _EXT_NAME not in sys.modules:
-    _ext_stub = types.ModuleType(_EXT_NAME)
-    _ext_stub.EngineRpcClient = MagicMock  # type: ignore[attr-defined]
-    _ext_stub.PegaFlowBusinessError = type("PegaFlowBusinessError", (Exception,), {})  # type: ignore[attr-defined]
-    _ext_stub.PegaFlowError = type("PegaFlowError", (Exception,), {})  # type: ignore[attr-defined]
-    _ext_stub.PegaFlowServiceError = type("PegaFlowServiceError", (Exception,), {})  # type: ignore[attr-defined]
-    _ext_stub.PyLoadState = _FakeLoadState  # type: ignore[attr-defined]
-    _ext_stub.__version__ = "test"  # type: ignore[attr-defined]
-    sys.modules[_EXT_NAME] = _ext_stub
-else:
-    _ext_stub = sys.modules[_EXT_NAME]
-    if not hasattr(_ext_stub, "EngineRpcClient"):
-        _ext_stub.EngineRpcClient = MagicMock  # type: ignore[attr-defined]
-    if not hasattr(_ext_stub, "PegaFlowBusinessError"):
-        _ext_stub.PegaFlowBusinessError = type("PegaFlowBusinessError", (Exception,), {})  # type: ignore[attr-defined]
-    if not hasattr(_ext_stub, "PegaFlowError"):
-        _ext_stub.PegaFlowError = type("PegaFlowError", (Exception,), {})  # type: ignore[attr-defined]
-    if not hasattr(_ext_stub, "PegaFlowServiceError"):
-        _ext_stub.PegaFlowServiceError = type("PegaFlowServiceError", (Exception,), {})  # type: ignore[attr-defined]
-    if not hasattr(_ext_stub, "PyLoadState"):
-        _ext_stub.PyLoadState = _FakeLoadState  # type: ignore[attr-defined]
-    if not hasattr(_ext_stub, "__version__"):
-        _ext_stub.__version__ = "test"  # type: ignore[attr-defined]
+install_connector_unit_stubs()
 
 from pegaflow.connector.common import ConnectorContext  # noqa: E402
 from pegaflow.connector.scheduler import SchedulerConnector  # noqa: E402
@@ -97,119 +55,62 @@ def _make_ctx(
 # ---------------------------------------------------------------------------
 
 
-class TestVirtualBlockSize:
-    """Validate ConnectorContext.virtual_block_size property."""
-
-    def test_no_dcp(self):
-        ctx = _make_ctx(block_size=16, dcp_world_size=1)
-        assert ctx.virtual_block_size == 16
-
-    def test_dcp2(self):
-        ctx = _make_ctx(block_size=16, dcp_world_size=2)
-        assert ctx.virtual_block_size == 32
-
-    def test_dcp4(self):
-        ctx = _make_ctx(block_size=16, dcp_world_size=4)
-        assert ctx.virtual_block_size == 64
-
-    def test_different_physical_block_size(self):
-        ctx = _make_ctx(block_size=8, dcp_world_size=2)
-        assert ctx.virtual_block_size == 16
-
-    def test_pcp2(self):
-        ctx = _make_ctx(block_size=16, pcp_world_size=2)
-        assert ctx.virtual_block_size == 32
-
-    def test_dcp2_pcp2(self):
-        ctx = _make_ctx(block_size=16, dcp_world_size=2, pcp_world_size=2)
-        assert ctx.virtual_block_size == 64
+@pytest.mark.parametrize(
+    ("case", "kwargs", "expected"),
+    [
+        pytest.param("no_dcp", {"block_size": 16, "dcp_world_size": 1}, 16, id="no_dcp"),
+        pytest.param("dcp2", {"block_size": 16, "dcp_world_size": 2}, 32, id="dcp2"),
+        pytest.param("dcp4", {"block_size": 16, "dcp_world_size": 4}, 64, id="dcp4"),
+        pytest.param(
+            "smaller_physical_block",
+            {"block_size": 8, "dcp_world_size": 2},
+            16,
+            id="smaller_physical_block",
+        ),
+        pytest.param("pcp2", {"block_size": 16, "pcp_world_size": 2}, 32, id="pcp2"),
+        pytest.param(
+            "dcp2_pcp2",
+            {"block_size": 16, "dcp_world_size": 2, "pcp_world_size": 2},
+            64,
+            id="dcp2_pcp2",
+        ),
+    ],
+)
+def test_virtual_block_size_cases(case: str, kwargs: dict, expected: int):
+    ctx = _make_ctx(**kwargs)
+    assert ctx.virtual_block_size == expected, case
 
 
-# ---------------------------------------------------------------------------
-# Tests — effective_tp_rank / effective_tp_size
-# ---------------------------------------------------------------------------
-
-
-class TestEffectiveTP:
-    """Validate DCP-aware tp_rank / tp_size properties."""
-
-    def test_non_mla_ignores_dcp(self):
-        ctx = _make_ctx(is_mla=False, tp_rank=3, tp_size=4, dcp_world_size=2, dcp_rank=1)
-        assert ctx.effective_tp_rank == 3
-        assert ctx.effective_tp_size == 4
-
-    def test_mla_no_dcp(self):
-        ctx = _make_ctx(is_mla=True, tp_rank=3, tp_size=4, dcp_world_size=1, dcp_rank=0)
-        assert ctx.effective_tp_rank == 0
-        assert ctx.effective_tp_size == 1
-
-    def test_mla_with_dcp(self):
-        ctx = _make_ctx(is_mla=True, tp_rank=3, tp_size=4, dcp_world_size=2, dcp_rank=1)
-        assert ctx.effective_tp_rank == 1  # dcp_rank
-        assert ctx.effective_tp_size == 2  # dcp_world_size
-
-
-# ---------------------------------------------------------------------------
-# Tests — block index arithmetic
-#
-# These simulate the same arithmetic used in SchedulerConnector to make sure
-# virtual_block_size produces correct results.
-# ---------------------------------------------------------------------------
-
-
-class TestBlockIndexArithmetic:
-    """End-to-end sanity checks on the block arithmetic that the scheduler
-    connector relies on (computed_blocks, num_load_blocks, saveable)."""
-
-    def test_computed_blocks_no_dcp(self):
-        """128 tokens / virtual_block_size(16) = 8 blocks."""
-        ctx = _make_ctx(block_size=16, dcp_world_size=1)
-        num_computed_tokens = 128
-        computed_blocks = num_computed_tokens // ctx.virtual_block_size
-        assert computed_blocks == 8
-
-    def test_computed_blocks_dcp2(self):
-        """128 tokens / virtual_block_size(32) = 4 blocks."""
-        ctx = _make_ctx(block_size=16, dcp_world_size=2)
-        num_computed_tokens = 128
-        computed_blocks = num_computed_tokens // ctx.virtual_block_size
-        assert computed_blocks == 4
-
-    def test_remaining_hashes_index(self):
-        """After skipping computed blocks, remaining hashes are correct."""
-        ctx = _make_ctx(block_size=16, dcp_world_size=2)
-        # 6 hashes, each covering 32 tokens → 192 tokens total
-        all_hashes = [_hash(i) for i in range(6)]
-        num_computed_tokens = 64  # 2 virtual blocks already computed
-        computed_blocks = num_computed_tokens // ctx.virtual_block_size  # 2
-        remaining = all_hashes[computed_blocks:]
-        assert len(remaining) == 4
-        assert remaining[0] == all_hashes[2]
-
-    def test_num_load_blocks(self):
-        """num_external_tokens / virtual_block_size gives load block count."""
-        ctx = _make_ctx(block_size=16, dcp_world_size=2)
-        num_external_tokens = 96  # 3 virtual blocks
-        num_load_blocks = num_external_tokens // ctx.virtual_block_size
-        assert num_load_blocks == 3
-
-    def test_saveable_calculation(self):
-        """saveable = min(hashes, allocated, scheduled // virtual_block_size)."""
-        ctx = _make_ctx(block_size=16, dcp_world_size=2)
-        block_hashes = [_hash(i) for i in range(5)]
-        allocated = list(range(5))
-        scheduled_tokens = 128  # 4 virtual blocks
-        saveable = min(
-            len(block_hashes), len(allocated), scheduled_tokens // ctx.virtual_block_size
-        )
-        assert saveable == 4  # limited by scheduled tokens
-
-    def test_hit_tokens(self):
-        """hit_blocks * virtual_block_size gives correct token count."""
-        ctx = _make_ctx(block_size=16, dcp_world_size=2)
-        hit_blocks = 3
-        hit_tokens = hit_blocks * ctx.virtual_block_size
-        assert hit_tokens == 96
+@pytest.mark.parametrize(
+    ("case", "kwargs", "expected_rank", "expected_size"),
+    [
+        pytest.param(
+            "non_mla_keeps_tp",
+            {"is_mla": False, "tp_rank": 3, "tp_size": 4, "dcp_world_size": 2, "dcp_rank": 1},
+            3,
+            4,
+            id="non_mla_keeps_tp",
+        ),
+        pytest.param(
+            "mla_without_dcp_collapses_tp",
+            {"is_mla": True, "tp_rank": 3, "tp_size": 4},
+            0,
+            1,
+            id="mla_without_dcp_collapses_tp",
+        ),
+        pytest.param(
+            "mla_with_dcp_uses_dcp",
+            {"is_mla": True, "tp_rank": 3, "tp_size": 4, "dcp_world_size": 2, "dcp_rank": 1},
+            1,
+            2,
+            id="mla_with_dcp_uses_dcp",
+        ),
+    ],
+)
+def test_effective_tp_cases(case: str, kwargs: dict, expected_rank: int, expected_size: int):
+    ctx = _make_ctx(**kwargs)
+    assert ctx.effective_tp_rank == expected_rank, case
+    assert ctx.effective_tp_size == expected_size, case
 
 
 # ---------------------------------------------------------------------------

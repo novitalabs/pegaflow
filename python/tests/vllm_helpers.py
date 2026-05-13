@@ -1,4 +1,4 @@
-"""Shared utilities for vLLM E2E and fuzz tests.
+"""Shared utilities for vLLM E2E tests.
 
 Extracted from test_vllm_e2e_correctness.py to enable reuse across test modules.
 """
