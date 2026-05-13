@@ -84,6 +84,8 @@ class VLLMServer:
             str(self.gpu_memory_utilization),
             "--attention-backend",
             "FLASH_ATTN",
+            "--generation-config",
+            "vllm",
             "--tensor-parallel-size",
             str(self.tensor_parallel_size),
             "--pipeline-parallel-size",

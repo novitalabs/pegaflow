@@ -65,7 +65,7 @@ uv run --extra test pytest -m e2e tests/test_vllm_e2e_correctness.py \
   --max-model-len 4096
 ```
 
-This is the main correctness E2E. It starts baseline vLLM and PegaFlow-enabled vLLM, compares deterministic completions across one execution plan, and checks that PegaFlow metrics show save/load/hit activity.
+This is the main correctness E2E. It starts baseline vLLM and PegaFlow-enabled vLLM with vLLM's neutral generation defaults, compares deterministic completions across one execution plan, and checks that PegaFlow metrics show save/load/hit activity.
 
 Requirements:
 - vLLM installed in the active environment
