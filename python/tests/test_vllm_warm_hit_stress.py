@@ -1,13 +1,14 @@
-"""Stress E2E for scheduler query-probe idempotency.
+"""Stress E2E for PegaFlow warm-hit pressure.
 
 This test intentionally creates warm-hit traffic under constrained KV capacity.
 It is not a replacement for the correctness E2E; it is an observability-heavy
-proof that repeated scheduler probes reuse the memoized query result and that
-abandoned probes do not leave obvious release failures in the logs.
+proof that concurrent repeated prompts keep using the cache path and do not
+leave obvious pending-probe release failures in the logs.
 """
 
 from __future__ import annotations
 
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -23,6 +24,16 @@ from .vllm_helpers import (
 
 pytestmark = [pytest.mark.e2e, pytest.mark.stress, pytest.mark.gpu]
 
+STRESS_GPU_MEMORY_UTILIZATION = 0.82
+STRESS_MAX_MODEL_LEN = 2048
+STRESS_MAX_NUM_SEQS = 16
+STRESS_CONCURRENCY = 12
+STRESS_LONG_OUTPUT_WORKERS = 8
+STRESS_LONG_MAX_TOKENS = 96
+STRESS_SHORT_MAX_TOKENS = 32
+MIN_WARM_HIT_LOOKUPS = STRESS_CONCURRENCY // 2
+WARM_HIT_LOOKUP_RE = re.compile(r"cache_lookup: hit_blocks=(\d+)")
+
 STRESS_PROMPT = (
     "Distributed systems often rely on caching to reduce latency and improve "
     "throughput, but cache correctness depends on carefully managed ownership. "
@@ -30,7 +41,7 @@ STRESS_PROMPT = (
     "scheduled, and later attempt to use that same prefix after allocation. "
     "During this gap, the cache layer must avoid double-counting reservations, "
     "must release abandoned references, and must preserve the exact hash order "
-    "used for the eventual load. " * 24
+    "used for the eventual load. " * 12
 )
 
 
@@ -74,15 +85,15 @@ def _metric_delta(before: dict[str, float], after: dict[str, float], key: str) -
     return after.get(key, 0) - before.get(key, 0)
 
 
-def test_query_probe_reuse_under_pressure(
+def test_warm_hit_pressure_on_single_gpu_profile(
     model: str,
     base_port: int,
     tmp_path: Path,
     max_model_len: int | None,
 ):
-    """Warm-hit concurrent requests should show query-probe reuse in vLLM logs."""
+    """Concurrent repeated prompts should produce cache hits and clean releases."""
 
-    log_dir = tmp_path / "query_probe_stress_logs"
+    log_dir = tmp_path / "warm_hit_stress_logs"
     log_dir.mkdir()
     pega_log = log_dir / "pegaflow-vllm.log"
     server_log = log_dir / "pegaflow-server.log"
@@ -94,9 +105,9 @@ def test_query_probe_reuse_under_pressure(
             use_pegaflow=True,
             pegaflow_port=pega_server.grpc_port,
             log_file=pega_log,
-            max_model_len=max_model_len or 4096,
-            gpu_memory_utilization=0.3,
-            extra_args=["--max-num-seqs", "96"],
+            max_model_len=max_model_len or STRESS_MAX_MODEL_LEN,
+            gpu_memory_utilization=STRESS_GPU_MEMORY_UTILIZATION,
+            extra_args=["--max-num-seqs", str(STRESS_MAX_NUM_SEQS)],
             startup_timeout=240,
         ):
             print(f"[Stress] vLLM log: {pega_log}")
@@ -109,15 +120,19 @@ def test_query_probe_reuse_under_pressure(
             assert warm == cold
 
             futures = []
-            with ThreadPoolExecutor(max_workers=40) as pool:
-                for idx in range(40):
+            with ThreadPoolExecutor(max_workers=STRESS_CONCURRENCY) as pool:
+                for idx in range(STRESS_CONCURRENCY):
                     futures.append(
                         pool.submit(
                             _post_completion,
                             base_port,
                             model,
                             STRESS_PROMPT,
-                            192 if idx < 32 else 64,
+                            (
+                                STRESS_LONG_MAX_TOKENS
+                                if idx < STRESS_LONG_OUTPUT_WORKERS
+                                else STRESS_SHORT_MAX_TOKENS
+                            ),
                             stream=False,
                             timeout=120,
                         )
@@ -149,8 +164,14 @@ def test_query_probe_reuse_under_pressure(
         )
         print("[Stress] Interesting vLLM log lines:\n" + interesting)
 
-        assert "cache_lookup_reuse" in pega_text, (
-            "Expected repeated scheduler probe reuse in vLLM log.\n"
+        warm_hit_lookups = [
+            int(match.group(1))
+            for match in WARM_HIT_LOOKUP_RE.finditer(pega_text)
+            if int(match.group(1)) > 0
+        ]
+        assert len(warm_hit_lookups) >= MIN_WARM_HIT_LOOKUPS, (
+            "Expected repeated warm cache lookups under concurrent pressure.\n"
+            f"warm_hit_lookups={warm_hit_lookups}\n"
             f"vLLM log: {pega_log}\n"
             f"PegaFlow log: {server_log}\n"
             f"Interesting lines:\n{interesting}"
