@@ -17,22 +17,35 @@ import pytest
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
 
-class TestEngineClientQuery:
-    """Test query operations with various inputs."""
+@pytest.mark.parametrize(
+    ("case", "hash_count", "expected_missing"),
+    [
+        pytest.param("empty_query", 0, 0, id="empty_query"),
+        pytest.param("unknown_hashes", 5, 5, id="unknown_hashes"),
+    ],
+)
+def test_query_prefetch_miss_contract(
+    case: str,
+    hash_count: int,
+    expected_missing: int,
+    engine_client,
+    registered_instance: str,
+    block_hashes: list[bytes],
+):
+    """A fresh server query returns a concrete miss contract, not only connectivity."""
+    requested_hashes = block_hashes[:hash_count]
 
-    def test_query_empty_hashes(self, engine_client, registered_instance: str):
-        """Query with empty hashes should succeed."""
-        result = engine_client.query_prefetch(registered_instance, [], req_id="test")
+    result = engine_client.query_prefetch(
+        registered_instance,
+        requested_hashes,
+        req_id=f"query-contract-{case}",
+    )
 
-        assert isinstance(result, dict)
-        assert "hit_blocks" in result or "ok" in result
-
-    def test_query_unknown_hashes(
-        self, engine_client, registered_instance: str, block_hashes: list[bytes]
-    ):
-        """Query for unknown hashes should return zero hits (miss)."""
-        result = engine_client.query_prefetch(registered_instance, block_hashes[:5], req_id="test")
-
-        assert isinstance(result, dict)
-        hit_blocks = result.get("hit_blocks", 0)
-        assert hit_blocks == 0, "Unknown hashes should have zero hits"
+    assert result == {
+        "ok": True,
+        "message": "",
+        "hit_blocks": 0,
+        "prefetch_state": "done",
+        "loading_blocks": 0,
+        "missing_blocks": expected_missing,
+    }
