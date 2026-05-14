@@ -7,15 +7,19 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    thread,
+    time::Instant,
 };
 
 use bytesize::ByteSize;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 
 use crate::allocator::{Allocation, ScaledOffsetAllocator};
 use crate::metrics::core_metrics;
 use crate::pinned_mem::PinnedMemory;
 use pegaflow_common::{NumaNode, run_on_numa};
+
+const REGISTERED_MMAP_MIN_BYTES: usize = 1024 * 1024 * 1024;
 
 /// RAII guard for a pinned memory allocation.
 /// Automatically frees the allocation when dropped.
@@ -45,6 +49,37 @@ impl PinnedAllocation {
     /// Get the underlying NonNull pointer.
     pub(crate) fn as_non_null(&self) -> NonNull<u8> {
         self.ptr
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PoolBackingPlan {
+    HugePages,
+    Regular,
+    RegisteredMmap,
+    WriteCombined,
+}
+
+impl PoolBackingPlan {
+    fn for_request(pool_size: usize, use_hugepages: bool, ssd_enabled: bool) -> Self {
+        if use_hugepages {
+            PoolBackingPlan::HugePages
+        } else if pool_size >= REGISTERED_MMAP_MIN_BYTES {
+            PoolBackingPlan::RegisteredMmap
+        } else if ssd_enabled {
+            PoolBackingPlan::Regular
+        } else {
+            PoolBackingPlan::WriteCombined
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::HugePages => "hugepages",
+            Self::Regular => "regular",
+            Self::RegisteredMmap => "registered_mmap",
+            Self::WriteCombined => "write_combined",
+        }
     }
 }
 
@@ -82,8 +117,9 @@ impl PinnedMemoryPool {
     /// Allocate a new pinned memory pool of `pool_size` bytes.
     ///
     /// If `use_hugepages` is true, uses huge pages (requires system config).
-    /// If `ssd_enabled` is true, uses regular pinned memory instead of write-combined,
-    /// because SSD reads back data into CPU memory and write-combined has extremely slow CPU reads.
+    /// Large pools use registered mmap by default. For small SSD pools, uses
+    /// regular pinned memory instead of write-combined because SSD reads back
+    /// data into CPU memory and write-combined has extremely slow CPU reads.
     /// If `unit_size_hint` is provided, the allocator rounds allocations up to this size.
     fn new(
         pool_size: usize,
@@ -96,18 +132,19 @@ impl PinnedMemoryPool {
             "Pinned memory pool size must be greater than zero"
         );
 
-        let backing = if use_hugepages {
-            info!("Allocating pinned memory pool with huge pages");
-            PinnedMemory::allocate_hugepages(pool_size)
-                .expect("Failed to allocate pinned memory pool with huge pages")
-        } else if ssd_enabled {
-            info!("Allocating pinned memory pool with regular pages (SSD enabled)");
-            PinnedMemory::allocate_regular(pool_size)
-                .expect("Failed to allocate regular pinned memory pool")
-        } else {
-            info!("Allocating pinned memory pool with write-combined pages");
-            PinnedMemory::allocate_write_combined(pool_size)
-                .expect("Failed to allocate pinned memory pool")
+        let pool_start = Instant::now();
+        let plan = PoolBackingPlan::for_request(pool_size, use_hugepages, ssd_enabled);
+        let backing = match plan {
+            PoolBackingPlan::HugePages => PinnedMemory::allocate_hugepages(pool_size)
+                .expect("Failed to allocate pinned memory pool with huge pages"),
+            PoolBackingPlan::Regular => PinnedMemory::allocate_regular(pool_size)
+                .expect("Failed to allocate regular pinned memory pool"),
+            PoolBackingPlan::RegisteredMmap => {
+                PinnedMemory::allocate_registered_parallel(pool_size)
+                    .expect("Failed to allocate registered mmap pinned memory pool")
+            }
+            PoolBackingPlan::WriteCombined => PinnedMemory::allocate_write_combined(pool_size)
+                .expect("Failed to allocate pinned memory pool"),
         };
 
         let actual_size = backing.size() as u64;
@@ -115,12 +152,14 @@ impl PinnedMemoryPool {
         let max_units = actual_size / unit_size;
         let allocatable_bytes = max_units * unit_size;
 
-        info!(
-            "Pinned pool: backing_size={}, unit_size={}, max_units={}, allocatable_size={}",
+        debug!(
+            "Pinned pool shard backing ready: strategy={} backing_size={} unit_size={} max_units={} allocatable_size={} elapsed_ms={:.2}",
+            plan.as_str(),
             ByteSize(actual_size),
             ByteSize(unit_size),
             max_units,
-            ByteSize(allocatable_bytes)
+            ByteSize(allocatable_bytes),
+            pool_start.elapsed().as_secs_f64() * 1000.0
         );
 
         let metrics = core_metrics();
@@ -279,6 +318,31 @@ pub(crate) struct ShardedPinnedPool {
 }
 
 impl ShardedPinnedPool {
+    fn create_shard(
+        shard_idx: usize,
+        num_shards: usize,
+        per_shard: usize,
+        use_hugepages: bool,
+        ssd_enabled: bool,
+        unit_size_hint: Option<NonZeroU64>,
+    ) -> (usize, Arc<PinnedMemoryPool>) {
+        let shard_start = Instant::now();
+        let pool = Arc::new(PinnedMemoryPool::new(
+            per_shard,
+            use_hugepages,
+            ssd_enabled,
+            unit_size_hint,
+        ));
+        debug!(
+            "Pinned pool shard ready: shard={}/{} capacity={} elapsed_ms={:.2}",
+            shard_idx + 1,
+            num_shards,
+            ByteSize(per_shard as u64),
+            shard_start.elapsed().as_secs_f64() * 1000.0
+        );
+        (shard_idx, pool)
+    }
+
     /// Create a sharded pool by splitting `total_capacity` evenly across `num_shards` pools.
     ///
     /// When `num_shards <= 1`, a single pool is created (equivalent to the old behavior).
@@ -289,28 +353,60 @@ impl ShardedPinnedPool {
         ssd_enabled: bool,
         unit_size_hint: Option<NonZeroU64>,
     ) -> Self {
+        let total_start = Instant::now();
         let num_shards = num_shards.max(1);
         let per_shard = total_capacity / num_shards;
 
-        if num_shards > 1 {
-            info!(
-                "Creating sharded pinned pool: total={}, shards={}, per_shard={}",
-                ByteSize(total_capacity as u64),
+        let shards = if num_shards == 1 {
+            let (_, first_shard) = Self::create_shard(
+                0,
                 num_shards,
-                ByteSize(per_shard as u64)
+                per_shard,
+                use_hugepages,
+                ssd_enabled,
+                unit_size_hint,
             );
-        }
+            vec![first_shard]
+        } else {
+            let mut handles = Vec::with_capacity(num_shards);
+            for shard_idx in 0..num_shards {
+                let handle = thread::Builder::new()
+                    .name(format!("pinned-pool-shard-{shard_idx}"))
+                    .spawn(move || {
+                        Self::create_shard(
+                            shard_idx,
+                            num_shards,
+                            per_shard,
+                            use_hugepages,
+                            ssd_enabled,
+                            unit_size_hint,
+                        )
+                    })
+                    .expect("failed to spawn pinned pool shard init thread");
+                handles.push(handle);
+            }
 
-        let shards: Vec<Arc<PinnedMemoryPool>> = (0..num_shards)
-            .map(|_| {
-                Arc::new(PinnedMemoryPool::new(
-                    per_shard,
-                    use_hugepages,
-                    ssd_enabled,
-                    unit_size_hint,
-                ))
-            })
-            .collect();
+            let mut ordered = Vec::with_capacity(num_shards);
+            for handle in handles {
+                ordered.push(
+                    handle
+                        .join()
+                        .expect("pinned pool shard init thread panicked"),
+                );
+            }
+            ordered.sort_by_key(|(idx, _)| *idx);
+            ordered.into_iter().map(|(_, shard)| shard).collect()
+        };
+
+        let backing_plan = PoolBackingPlan::for_request(per_shard, use_hugepages, ssd_enabled);
+        info!(
+            "Pinned pool ready: total={} shards={} per_shard={} backing_strategy={} elapsed_ms={:.2}",
+            ByteSize(total_capacity as u64),
+            shards.len(),
+            ByteSize(per_shard as u64),
+            backing_plan.as_str(),
+            total_start.elapsed().as_secs_f64() * 1000.0
+        );
 
         Self {
             shards,
@@ -321,6 +417,9 @@ impl ShardedPinnedPool {
     /// Allocate from shards using round-robin with fallback to all shards.
     fn allocate(&self, size: NonZeroU64) -> Option<PinnedAllocation> {
         let n = self.shards.len();
+        if n == 0 {
+            return None;
+        }
         let start = self.cursor.fetch_add(1, Ordering::Relaxed) % n;
 
         for i in 0..n {
@@ -412,6 +511,7 @@ impl NumaAwarePinnedPools {
         ssd_enabled: bool,
         unit_size_hint: Option<NonZeroU64>,
     ) -> Self {
+        let total_start = Instant::now();
         let num_nodes = numa_nodes.len();
         if num_nodes == 0 {
             warn!("No NUMA nodes provided, creating empty NumaAwarePinnedPools");
@@ -440,6 +540,7 @@ impl NumaAwarePinnedPools {
             let hint = unit_size_hint;
 
             // Allocate sharded pool on a thread pinned to this NUMA node
+            let node_start = Instant::now();
             let result = run_on_numa(*node, move || {
                 ShardedPinnedPool::new(
                     per_node_capacity,
@@ -452,10 +553,12 @@ impl NumaAwarePinnedPools {
 
             match result {
                 Ok(pool) => {
+                    let elapsed = node_start.elapsed();
                     info!(
-                        "Created pinned pool on NUMA{}: capacity={}",
+                        "Created pinned pool on NUMA{}: capacity={} elapsed_ms={:.2}",
                         node_id,
-                        ByteSize(per_node_capacity as u64)
+                        ByteSize(per_node_capacity as u64),
+                        elapsed.as_secs_f64() * 1000.0
                     );
                     pools.insert(node_id, pool);
                 }
@@ -469,6 +572,14 @@ impl NumaAwarePinnedPools {
                 }
             }
         }
+
+        info!(
+            "NUMA-aware pinned pools ready: nodes={} configured_capacity={} usable_capacity={} elapsed_ms={:.2}",
+            pools.len(),
+            ByteSize(total_capacity as u64),
+            ByteSize((per_node_capacity * pools.len()) as u64),
+            total_start.elapsed().as_secs_f64() * 1000.0
+        );
 
         Self { pools }
     }
@@ -548,13 +659,26 @@ impl PinnedAllocator {
         ssd_enabled: bool,
         unit_hint: Option<NonZeroU64>,
     ) -> Self {
-        Self::Global(ShardedPinnedPool::new(
-            capacity,
+        let start = Instant::now();
+        info!(
+            "Pinned allocator global plan: capacity={} shards={} hugepages={} ssd_enabled={} unit_hint={}",
+            ByteSize(capacity as u64),
             num_shards,
             use_hugepages,
             ssd_enabled,
-            unit_hint,
-        ))
+            unit_hint
+                .map(|v| ByteSize(v.get()).to_string())
+                .unwrap_or_else(|| "none".to_string())
+        );
+        let pool =
+            ShardedPinnedPool::new(capacity, num_shards, use_hugepages, ssd_enabled, unit_hint);
+        info!(
+            "Pinned allocator global ready: capacity={} shards={} elapsed_ms={:.2}",
+            ByteSize(capacity as u64),
+            num_shards,
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+        Self::Global(pool)
     }
 
     /// Create a new NUMA-aware allocator.
@@ -568,20 +692,29 @@ impl PinnedAllocator {
         ssd_enabled: bool,
         unit_hint: Option<NonZeroU64>,
     ) -> Self {
+        let start = Instant::now();
         if numa_nodes.is_empty() {
             warn!(
                 "NUMA allocator requested but no nodes provided, falling back to global allocator"
             );
             return Self::new_global(capacity, num_shards, use_hugepages, ssd_enabled, unit_hint);
         }
-        Self::Numa(NumaAwarePinnedPools::new(
+        let pools = NumaAwarePinnedPools::new(
             capacity,
             numa_nodes,
             num_shards,
             use_hugepages,
             ssd_enabled,
             unit_hint,
-        ))
+        );
+        info!(
+            "Pinned allocator NUMA ready: capacity={} nodes={} shards_per_node={} elapsed_ms={:.2}",
+            ByteSize(capacity as u64),
+            numa_nodes.len(),
+            num_shards,
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+        Self::Numa(pools)
     }
 
     /// Allocate pinned memory.

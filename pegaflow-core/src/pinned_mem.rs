@@ -1,11 +1,16 @@
 //! Low-level pinned memory allocation for CUDA.
 //!
-//! This module provides two allocation strategies:
+//! This module provides pinned memory allocation strategies for different
+//! cold-start and data-path requirements:
 //!
 //! 1. **Write-combined** (`PinnedMemory::allocate_write_combined`): Uses `cudaHostAlloc` with write-combined flag.
 //!    Optimized for CPU-to-GPU transfers with better write performance.
 //!
-//! 2. **Huge pages** (`PinnedMemory::allocate_hugepages`): Uses `mmap(MAP_HUGETLB)` + `cudaHostRegister`.
+//! 2. **Registered mmap** (`PinnedMemory::allocate_registered_parallel`): Uses anonymous
+//!    `mmap`, parallel first-touch, then `cudaHostRegister`. Optimized for large
+//!    full-capacity startup where ordinary CPU backing is acceptable.
+//!
+//! 3. **Huge pages** (`PinnedMemory::allocate_hugepages`): Uses `mmap(MAP_HUGETLB)` + `cudaHostRegister`.
 //!    Much faster allocation for large buffers but requires pre-configured huge pages:
 //!    ```bash
 //!    # Reserve huge pages (size from /proc/meminfo, typically 2MB)
@@ -22,11 +27,16 @@
 use std::io;
 use std::ptr::NonNull;
 use std::sync::OnceLock;
+use std::thread;
+use std::time::Instant;
 
 use cudarc::runtime::sys as rt;
+use log::debug;
 
 /// Cached huge page size from /proc/meminfo
 static HUGE_PAGE_SIZE: OnceLock<Option<usize>> = OnceLock::new();
+
+const PARALLEL_REGISTER_MIN_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Read the system's default huge page size from /proc/meminfo.
 /// Returns None if reading or parsing fails.
@@ -92,6 +102,9 @@ pub(crate) enum AllocStrategy {
     /// Write-combined via cudaHostAlloc.
     /// Fast for CPU→GPU (write-only) workloads, but CPU reads are extremely slow.
     WriteCombined,
+    /// Anonymous mmap, parallel page pre-touch, then cudaHostRegister.
+    /// Used for large write-mostly pools to reduce full-capacity startup latency.
+    RegisteredMmap,
     /// Huge pages (size from /proc/meminfo, requires system configuration)
     HugePages,
 }
@@ -142,6 +155,17 @@ impl PinnedMemory {
         Self::allocate_internal(size, AllocStrategy::WriteCombined)
     }
 
+    /// Allocate pinned memory with mmap + parallel pre-touch + cudaHostRegister.
+    ///
+    /// This keeps the backing ordinary CPU memory but pins it after parallel first-touch,
+    /// which is much faster for large pools than one monolithic cudaHostAlloc on some hosts.
+    pub(crate) fn allocate_registered_parallel(size: usize) -> Result<Self, PinnedMemError> {
+        if size < PARALLEL_REGISTER_MIN_BYTES {
+            return Self::allocate_write_combined(size);
+        }
+        Self::allocate_internal(size, AllocStrategy::RegisteredMmap)
+    }
+
     /// Allocate pinned memory using huge pages.
     ///
     /// Uses `mmap(MAP_HUGETLB)` for fast allocation, then registers with CUDA.
@@ -164,6 +188,7 @@ impl PinnedMemory {
             return Err(PinnedMemError::ZeroSize);
         }
 
+        let alloc_start = Instant::now();
         let (ptr, aligned_size) = match strategy {
             AllocStrategy::Regular => {
                 let mut ptr: *mut libc::c_void = std::ptr::null_mut();
@@ -182,6 +207,47 @@ impl PinnedMemory {
                 if result != rt::cudaError::cudaSuccess {
                     return Err(PinnedMemError::CudaAllocFailed(result));
                 }
+                (ptr, size)
+            }
+            AllocStrategy::RegisteredMmap => {
+                // SAFETY: null hint, anonymous private mapping, validated non-zero size.
+                let ptr = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        size,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                };
+
+                if ptr == libc::MAP_FAILED {
+                    return Err(PinnedMemError::MmapFailed(std::io::Error::last_os_error()));
+                }
+
+                let touch_start = Instant::now();
+                parallel_touch_pages(ptr as *mut u8, size);
+                let touch_elapsed = touch_start.elapsed();
+
+                let register_start = Instant::now();
+                // SAFETY: ptr is a valid mmap'd region of `size` bytes.
+                let result =
+                    unsafe { rt::cudaHostRegister(ptr, size, rt::cudaHostRegisterDefault) };
+                let register_elapsed = register_start.elapsed();
+
+                if result != rt::cudaError::cudaSuccess {
+                    unsafe { libc::munmap(ptr, size) };
+                    return Err(PinnedMemError::CudaRegisterFailed(result));
+                }
+
+                debug!(
+                    "Pinned memory registered mmap ready: requested={} touch_ms={:.2} register_ms={:.2}",
+                    size,
+                    touch_elapsed.as_secs_f64() * 1000.0,
+                    register_elapsed.as_secs_f64() * 1000.0
+                );
+
                 (ptr, size)
             }
             AllocStrategy::HugePages => {
@@ -208,19 +274,42 @@ impl PinnedMemory {
                     return Err(PinnedMemError::MmapFailed(std::io::Error::last_os_error()));
                 }
 
+                let touch_start = Instant::now();
+                parallel_touch_pages(ptr as *mut u8, aligned);
+                let touch_elapsed = touch_start.elapsed();
+
                 // Register with CUDA for DMA
+                let register_start = Instant::now();
                 // SAFETY: ptr is a valid mmap'd region of `aligned` bytes (checked above).
                 let result =
                     unsafe { rt::cudaHostRegister(ptr, aligned, rt::cudaHostRegisterDefault) };
+                let register_elapsed = register_start.elapsed();
 
                 if result != rt::cudaError::cudaSuccess {
                     unsafe { libc::munmap(ptr, aligned) };
                     return Err(PinnedMemError::CudaRegisterFailed(result));
                 }
 
+                debug!(
+                    "Pinned memory hugepage backing ready: requested={} aligned={} touch_ms={:.2} register_ms={:.2}",
+                    size,
+                    aligned,
+                    touch_elapsed.as_secs_f64() * 1000.0,
+                    register_elapsed.as_secs_f64() * 1000.0
+                );
+
                 (ptr, aligned)
             }
         };
+
+        let elapsed = alloc_start.elapsed();
+        debug!(
+            "Pinned memory backing allocated: strategy={:?} requested={} aligned={} elapsed_ms={:.2}",
+            strategy,
+            size,
+            aligned_size,
+            elapsed.as_secs_f64() * 1000.0
+        );
 
         // SAFETY: allocation succeeded and returned non-null pointer
         let ptr = NonNull::new(ptr as *mut u8).expect("allocation returned null");
@@ -257,7 +346,7 @@ impl Drop for PinnedMemory {
                     eprintln!("Warning: cudaFreeHost failed: {:?}", result);
                 }
             }
-            AllocStrategy::HugePages => {
+            AllocStrategy::HugePages | AllocStrategy::RegisteredMmap => {
                 // SAFETY: ptr was registered with cudaHostRegister
                 unsafe {
                     let result = rt::cudaHostUnregister(self.ptr.as_ptr() as *mut libc::c_void);
@@ -275,6 +364,58 @@ impl Drop for PinnedMemory {
                 }
             }
         }
+    }
+}
+
+fn parallel_touch_pages(ptr: *mut u8, size: usize) {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let page_size = if page_size > 0 {
+        page_size as usize
+    } else {
+        4096
+    };
+    let hw_threads = thread::available_parallelism()
+        .map(|threads| threads.get())
+        .unwrap_or(1);
+    let touch_threads = if hw_threads > 64 {
+        16
+    } else {
+        hw_threads.min(8)
+    }
+    .max(1);
+    let chunk_size = size.div_ceil(touch_threads);
+
+    let base = ptr as usize;
+    let mut handles = Vec::with_capacity(touch_threads);
+    for thread_idx in 0..touch_threads {
+        let offset = thread_idx * chunk_size;
+        if offset >= size {
+            break;
+        }
+        let len = (size - offset).min(chunk_size);
+        handles.push(thread::spawn(move || {
+            touch_pages(base + offset, len, page_size);
+        }));
+    }
+
+    for handle in handles {
+        handle
+            .join()
+            .expect("pinned memory pre-touch thread panicked");
+    }
+}
+
+fn touch_pages(base: usize, len: usize, page_size: usize) {
+    let ptr = base as *mut u8;
+    let mut offset = 0usize;
+    while offset < len {
+        // SAFETY: caller passes a valid mmap range; offsets stay inside the chunk.
+        unsafe { ptr.add(offset).write_volatile(0u8) };
+        offset += page_size;
+    }
+    if len > 0 {
+        // SAFETY: last byte is inside the chunk and forces tail-page materialization.
+        unsafe { ptr.add(len - 1).write_volatile(0u8) };
     }
 }
 

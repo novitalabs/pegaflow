@@ -18,7 +18,7 @@ pub use service::GrpcEngineService;
 
 use clap::Parser;
 use cudarc::driver::result as cuda_driver;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use opentelemetry::global;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
@@ -30,7 +30,7 @@ use pyo3::{PyErr, Python, types::PyAnyMethods};
 use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tonic::transport::Server;
 use utils::parse_memory_size;
@@ -133,10 +133,11 @@ pub struct Cli {
     #[arg(long, default_value_t = 1.0, value_parser = parse_sample_rate)]
     pub trace_sample_rate: f64,
 
-    /// Number of shards for the pinned memory pool (reduces allocator lock contention).
+    /// Number of shards for the pinned memory pool.
     /// The pool is split into this many independent sub-pools with round-robin allocation.
-    #[arg(long, default_value_t = 1)]
-    pub pool_shards: usize,
+    /// Defaults to 1. Use only when the workload benefits from smaller allocator shards.
+    #[arg(long)]
+    pub pool_shards: Option<usize>,
 
     /// Allocate each block separately instead of contiguous batch allocation.
     /// Reduces memory fragmentation when blocks are freed in different order.
@@ -412,16 +413,23 @@ fn init_metrics(
 
 /// Main entry point for pegaflow-server
 pub fn run() -> Result<(), Box<dyn Error>> {
+    let process_start = Instant::now();
     let cli = Cli::parse();
     pegaflow_common::logging::init_stdout_colored(&cli.log_level);
     info!("Starting pega-engine-server v{}", env!("CARGO_PKG_VERSION"));
     trace::init();
     pegaflow_core::set_trace_sample_rate(cli.trace_sample_rate);
 
-    // Initialize CUDA in the main thread before starting Tokio runtime
+    // Initialize CUDA in the main thread before starting Tokio runtime.
+    let cuda_driver_start = Instant::now();
     init_cuda_driver()?;
+    debug!(
+        "CUDA driver initialized: elapsed_ms={:.2}",
+        cuda_driver_start.elapsed().as_secs_f64() * 1000.0
+    );
 
     // Determine which devices to initialize
+    let detect_devices_start = Instant::now();
     let devices = if cli.devices.is_empty() {
         // Auto-detect all available devices
         let detected = detect_cuda_devices()?;
@@ -435,23 +443,39 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         info!("Using specified CUDA device(s): {:?}", cli.devices);
         cli.devices.clone()
     };
+    debug!(
+        "CUDA devices selected: device_count={} elapsed_ms={:.2}",
+        devices.len(),
+        detect_devices_start.elapsed().as_secs_f64() * 1000.0
+    );
 
     if devices.is_empty() {
         return Err("No CUDA devices available".into());
     }
 
+    let python_cuda_start = Instant::now();
     init_python_cuda(&devices)?;
     info!(
         "CUDA runtime initialized for {} device(s): {:?}",
         devices.len(),
         devices
     );
+    debug!(
+        "Python CUDA runtime initialized: device_count={} elapsed_ms={:.2}",
+        devices.len(),
+        python_cuda_start.elapsed().as_secs_f64() * 1000.0
+    );
 
+    let registry_start = Instant::now();
     let registry = CudaTensorRegistry::new().map_err(|err| {
         let msg = format_py_err(err);
         std::io::Error::other(format!("failed to initialize torch CUDA context: {msg}"))
     })?;
     let registry = Arc::new(Mutex::new(registry));
+    debug!(
+        "CUDA tensor registry initialized: elapsed_ms={:.2}",
+        registry_start.elapsed().as_secs_f64() * 1000.0
+    );
 
     if let Some(hint_value_size) = cli.hint_value_size {
         if hint_value_size == 0 {
@@ -510,6 +534,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         None
     };
 
+    let pool_shards = cli.pool_shards.unwrap_or(1);
+
     let storage_config = pegaflow_core::StorageConfig {
         enable_lfu_admission: cli.enable_lfu_admission,
         hint_value_size_bytes: cli.hint_value_size,
@@ -522,13 +548,13 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         metaserver_addr: cli.metaserver_addr.clone(),
         advertise_addr,
         metaserver_queue_depth: cli.metaserver_queue_depth,
-        pool_shards: cli.pool_shards,
+        pool_shards,
     };
 
-    if cli.pool_shards > 1 {
+    if pool_shards > 1 {
         info!(
             "Pinned memory pool sharding enabled: {} shards",
-            cli.pool_shards
+            pool_shards
         );
     }
     if cli.enable_lfu_admission {
@@ -538,13 +564,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         info!("NUMA-aware memory allocation disabled");
     }
 
-    // Create Tokio runtime early - needed for OTLP metrics gRPC exporter
+    // Create Tokio runtime early - needed for OTLP metrics gRPC exporter.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
 
     // Initialize OTEL metrics BEFORE creating PegaEngine, so that core metrics
     // (pool, cache, save/load) use the real meter provider instead of noop.
+    let metrics_start = Instant::now();
     let metrics_state = runtime.block_on(async {
         init_metrics(
             cli.enable_prometheus,
@@ -552,6 +579,12 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             cli.metrics_period_secs,
         )
     })?;
+    debug!(
+        "Metrics initialized: prometheus={} otlp={} elapsed_ms={:.2}",
+        cli.enable_prometheus,
+        cli.metrics_otel_endpoint.is_some(),
+        metrics_start.elapsed().as_secs_f64() * 1000.0
+    );
 
     let hll_tracker = Arc::new(std::sync::Mutex::new(
         pegaflow_common::hll::MultiWindowHllTracker::new(
@@ -566,11 +599,16 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
     runtime.block_on(async move {
         // Create PegaEngine inside tokio runtime context (needed for SSD cache tokio::spawn)
+        let engine_start = Instant::now();
         let engine = Arc::new(PegaEngine::new_with_config(
             cli.pool_size,
             cli.use_hugepages,
             storage_config,
         ));
+        debug!(
+            "PegaEngine ready: elapsed_ms={:.2}",
+            engine_start.elapsed().as_secs_f64() * 1000.0
+        );
 
         let service = GrpcEngineService::new(
             Arc::clone(&engine),
@@ -643,8 +681,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             }
         };
 
-        info!("PegaEngine gRPC server listening on {}", cli.addr);
-
+        info!(
+            "PegaEngine gRPC server listening on {} (startup_elapsed_ms={:.2})",
+            cli.addr,
+            process_start.elapsed().as_secs_f64() * 1000.0
+        );
         const MAX_GRPC_MESSAGE_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
 
         let grpc_service = EngineServer::new(service)

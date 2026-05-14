@@ -48,6 +48,7 @@ use std::{
     collections::HashMap,
     fmt,
     sync::{Arc, RwLock},
+    time::Instant,
 };
 
 use log::{debug, info, warn};
@@ -129,8 +130,16 @@ impl PegaEngine {
         use_hugepages: bool,
         storage_config: storage::StorageConfig,
     ) -> Self {
+        let engine_start = Instant::now();
+        let topology_start = Instant::now();
         let topology = Arc::new(NumaTopology::detect());
+        let topology_elapsed = topology_start.elapsed();
         topology.log_summary();
+        debug!(
+            "NUMA topology detected: nodes={} elapsed_ms={:.2}",
+            topology.num_nodes(),
+            topology_elapsed.as_secs_f64() * 1000.0
+        );
 
         let config = storage_config;
         let numa_nodes: Vec<NumaNode> = if config.enable_numa_affinity && topology.is_multi_numa() {
@@ -143,13 +152,26 @@ impl PegaEngine {
             vec![]
         };
 
+        let storage_start = Instant::now();
         let storage = StorageEngine::new_with_config(pool_size, use_hugepages, config, &numa_nodes);
+        debug!(
+            "PegaEngine storage ready: elapsed_ms={:.2}",
+            storage_start.elapsed().as_secs_f64() * 1000.0
+        );
 
-        PegaEngine {
+        let engine = PegaEngine {
             instances: Arc::new(RwLock::new(HashMap::new())),
             storage,
             topology,
-        }
+        };
+        info!(
+            "PegaEngine initialized: pool_size={} hugepages={} numa_nodes={} elapsed_ms={:.2}",
+            pool_size,
+            use_hugepages,
+            numa_nodes.len(),
+            engine_start.elapsed().as_secs_f64() * 1000.0
+        );
+        engine
     }
 
     /// Get or create an instance with the specified topology.

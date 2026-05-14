@@ -9,7 +9,7 @@ use log::{debug, info};
 use std::collections::HashSet;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::backing::{
     AllocateFn, DEFAULT_MAX_PREFETCH_BLOCKS, RdmaFetchStore, RdmaTransport, SsdBackingStore,
@@ -103,6 +103,7 @@ impl StorageEngine {
         config: StorageConfig,
         numa_nodes: &[NumaNode],
     ) -> Arc<Self> {
+        let storage_start = Instant::now();
         let value_size_hint = config.hint_value_size_bytes.filter(|size| *size > 0);
         let unit_hint = value_size_hint.and_then(|size| NonZeroU64::new(size as u64));
         let max_prefetch_blocks = config.max_prefetch_blocks;
@@ -134,6 +135,7 @@ impl StorageEngine {
         let pool_shards = config.pool_shards;
 
         // Create unified allocator based on NUMA configuration
+        let allocator_start = Instant::now();
         let allocator = if !numa_nodes.is_empty() {
             info!(
                 "Creating NUMA-aware pinned pools for {} nodes",
@@ -157,6 +159,21 @@ impl StorageEngine {
                 unit_hint,
             ))
         };
+        let allocator_elapsed = allocator_start.elapsed();
+        let (_, usable_capacity) = allocator.usage();
+        let allocator_mode = if allocator.is_numa() {
+            "numa"
+        } else {
+            "global"
+        };
+        info!(
+            "Pinned allocator initialized: mode={} configured_capacity={} usable_capacity={} pool_shards={} elapsed_ms={:.2}",
+            allocator_mode,
+            ByteSize(capacity_bytes as u64),
+            ByteSize(usable_capacity),
+            pool_shards,
+            allocator_elapsed.as_secs_f64() * 1000.0
+        );
 
         // Sub-components
         let read_cache = Arc::new(ReadCache::new(
@@ -173,7 +190,18 @@ impl StorageEngine {
         let rdma_transport = rdma_nic_names
             .as_deref()
             .filter(|nics| !nics.is_empty())
-            .and_then(|nics| crate::backing::new_rdma(nics, &allocator));
+            .and_then(|nics| {
+                let rdma_start = Instant::now();
+                let transport = crate::backing::new_rdma(nics, &allocator);
+                let elapsed = rdma_start.elapsed();
+                info!(
+                    "RDMA startup phase completed: configured_nics={} enabled={} elapsed_ms={:.2}",
+                    nics.len(),
+                    transport.is_some(),
+                    elapsed.as_secs_f64() * 1000.0
+                );
+                transport
+            });
 
         if let Some(ref rdma) = rdma_transport {
             crate::metrics::register_rdma_gauges(rdma);
@@ -245,6 +273,18 @@ impl StorageEngine {
                 })
                 .expect("failed to spawn insert worker thread");
         }
+
+        let storage_elapsed = storage_start.elapsed();
+        info!(
+            "StorageEngine initialized: configured_capacity={} usable_capacity={} numa={} ssd={} rdma={} blockwise_alloc={} elapsed_ms={:.2}",
+            ByteSize(capacity_bytes as u64),
+            ByteSize(usable_capacity),
+            engine.is_numa_enabled(),
+            engine.ssd_store.is_some(),
+            engine.rdma_transport.is_some(),
+            engine.blockwise_alloc,
+            storage_elapsed.as_secs_f64() * 1000.0
+        );
 
         engine
     }
