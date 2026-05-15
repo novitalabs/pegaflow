@@ -298,7 +298,7 @@ impl Drop for PinnedMemory {
 /// affinity (typically set by `run_on_numa` at the call site).
 fn parallel_pre_touch(ptr: *mut u8, size: usize, node: NumaNode) {
     let page = page_size();
-    let threads = touch_threads();
+    let threads = touch_threads(size);
     let chunk = size.div_ceil(threads);
     // *mut u8 is not Send; smuggle as usize and reconstruct inside the scope.
     // Lifetimes are bounded by thread::scope.
@@ -331,10 +331,19 @@ fn parallel_pre_touch(ptr: *mut u8, size: usize, node: NumaNode) {
     });
 }
 
-fn touch_threads() -> usize {
-    std::thread::available_parallelism()
+/// Pick worker count for pre-touch.
+///
+/// Spinning up many threads for a small allocation costs more than it saves —
+/// each thread must at least pay a NUMA pin + page-walk. Grant each worker a
+/// minimum chunk so tiny allocations stay single-threaded and large ones still
+/// scale up to the CPU count.
+fn touch_threads(size: usize) -> usize {
+    const MIN_BYTES_PER_THREAD: usize = 1 << 30; // 1 GiB
+    let by_size = size.div_ceil(MIN_BYTES_PER_THREAD).max(1);
+    let by_cpu = std::thread::available_parallelism()
         .map_or(8, |n| n.get())
-        .max(1)
+        .max(1);
+    by_size.min(by_cpu)
 }
 
 fn page_size() -> usize {
