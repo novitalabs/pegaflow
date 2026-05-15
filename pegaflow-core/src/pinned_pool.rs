@@ -81,6 +81,10 @@ impl PinnedMemoryPool {
 
     /// Allocate a new pinned memory pool of `pool_size` bytes.
     ///
+    /// `node` is the target NUMA node for first-touch placement of the backing
+    /// region (used by Regular and HugePages strategies). Pass
+    /// `NumaNode::UNKNOWN` for placement-agnostic allocation.
+    ///
     /// If `use_hugepages` is true, uses huge pages (requires system config).
     /// If `ssd_enabled` is true, uses regular pinned memory instead of write-combined,
     /// because SSD reads back data into CPU memory and write-combined has extremely slow CPU reads.
@@ -90,6 +94,7 @@ impl PinnedMemoryPool {
         use_hugepages: bool,
         ssd_enabled: bool,
         unit_size_hint: Option<NonZeroU64>,
+        node: NumaNode,
     ) -> Self {
         assert!(
             pool_size != 0,
@@ -97,12 +102,15 @@ impl PinnedMemoryPool {
         );
 
         let backing = if use_hugepages {
-            info!("Allocating pinned memory pool with huge pages");
-            PinnedMemory::allocate_hugepages(pool_size)
+            info!("Allocating pinned memory pool with huge pages on {}", node);
+            PinnedMemory::allocate_hugepages(pool_size, node)
                 .expect("Failed to allocate pinned memory pool with huge pages")
         } else if ssd_enabled {
-            info!("Allocating pinned memory pool with regular pages (SSD enabled)");
-            PinnedMemory::allocate_regular(pool_size)
+            info!(
+                "Allocating pinned memory pool with regular pages on {} (SSD enabled)",
+                node
+            );
+            PinnedMemory::allocate_regular(pool_size, node)
                 .expect("Failed to allocate regular pinned memory pool")
         } else {
             info!("Allocating pinned memory pool with write-combined pages");
@@ -281,6 +289,9 @@ pub(crate) struct ShardedPinnedPool {
 impl ShardedPinnedPool {
     /// Create a sharded pool by splitting `total_capacity` evenly across `num_shards` pools.
     ///
+    /// `node` is the NUMA node every shard is bound to. `NumaNode::UNKNOWN`
+    /// disables NUMA pinning (placement falls back to caller-thread affinity).
+    ///
     /// When `num_shards <= 1`, a single pool is created (equivalent to the old behavior).
     fn new(
         total_capacity: usize,
@@ -288,13 +299,15 @@ impl ShardedPinnedPool {
         use_hugepages: bool,
         ssd_enabled: bool,
         unit_size_hint: Option<NonZeroU64>,
+        node: NumaNode,
     ) -> Self {
         let num_shards = num_shards.max(1);
         let per_shard = total_capacity / num_shards;
 
         if num_shards > 1 {
             info!(
-                "Creating sharded pinned pool: total={}, shards={}, per_shard={}",
+                "Creating sharded pinned pool on {}: total={}, shards={}, per_shard={}",
+                node,
                 ByteSize(total_capacity as u64),
                 num_shards,
                 ByteSize(per_shard as u64)
@@ -308,6 +321,7 @@ impl ShardedPinnedPool {
                     use_hugepages,
                     ssd_enabled,
                     unit_size_hint,
+                    node,
                 ))
             })
             .collect();
@@ -438,15 +452,17 @@ impl NumaAwarePinnedPools {
 
             let node_id = node.0;
             let hint = unit_size_hint;
+            let target_node = *node;
 
             // Allocate sharded pool on a thread pinned to this NUMA node
-            let result = run_on_numa(*node, move || {
+            let result = run_on_numa(target_node, move || {
                 ShardedPinnedPool::new(
                     per_node_capacity,
                     num_shards,
                     use_hugepages,
                     ssd_enabled,
                     hint,
+                    target_node,
                 )
             });
 
@@ -554,6 +570,7 @@ impl PinnedAllocator {
             use_hugepages,
             ssd_enabled,
             unit_hint,
+            NumaNode::UNKNOWN,
         ))
     }
 
@@ -646,11 +663,25 @@ mod tests {
         let mut pools = HashMap::new();
         pools.insert(
             0,
-            ShardedPinnedPool::new(4096, 1, false, false, NonZeroU64::new(512)),
+            ShardedPinnedPool::new(
+                4096,
+                1,
+                false,
+                false,
+                NonZeroU64::new(512),
+                NumaNode::UNKNOWN,
+            ),
         );
         pools.insert(
             1,
-            ShardedPinnedPool::new(4096, 1, false, false, NonZeroU64::new(512)),
+            ShardedPinnedPool::new(
+                4096,
+                1,
+                false,
+                false,
+                NonZeroU64::new(512),
+                NumaNode::UNKNOWN,
+            ),
         );
         let allocator = PinnedAllocator::Numa(NumaAwarePinnedPools { pools });
 
@@ -680,7 +711,14 @@ mod tests {
         let mut pools = HashMap::new();
         pools.insert(
             0,
-            ShardedPinnedPool::new(4096, 1, false, false, NonZeroU64::new(512)),
+            ShardedPinnedPool::new(
+                4096,
+                1,
+                false,
+                false,
+                NonZeroU64::new(512),
+                NumaNode::UNKNOWN,
+            ),
         );
         let allocator = PinnedAllocator::Numa(NumaAwarePinnedPools { pools });
 

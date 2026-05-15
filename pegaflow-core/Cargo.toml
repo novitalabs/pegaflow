@@ -60,3 +60,6 @@ harness = false
 
 [[example]]
 name = "pinned_alloc"
+
+[[example]]
+name = "pinned_alloc_parallel"

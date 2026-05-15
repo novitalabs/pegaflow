@@ -1,16 +1,25 @@
 //! Low-level pinned memory allocation for CUDA.
 //!
-//! This module provides two allocation strategies:
+//! Three strategies, all returning DMA-pinned memory:
 //!
-//! 1. **Write-combined** (`PinnedMemory::allocate_write_combined`): Uses `cudaHostAlloc` with write-combined flag.
-//!    Optimized for CPU-to-GPU transfers with better write performance.
+//! 1. **Regular** (`allocate_regular`): lazy `mmap` + parallel page pre-touch +
+//!    `cudaHostRegister`. Each touch thread is pinned to the target NUMA node
+//!    so first-touch places every page on that node's local memory.
 //!
-//! 2. **Huge pages** (`PinnedMemory::allocate_hugepages`): Uses `mmap(MAP_HUGETLB)` + `cudaHostRegister`.
-//!    Much faster allocation for large buffers but requires pre-configured huge pages:
+//! 2. **HugePages** (`allocate_hugepages`): `mmap(MAP_HUGETLB)` + parallel
+//!    pre-touch + `cudaHostRegister`. Same NUMA-aware touch. Requires reserved
+//!    hugepages:
 //!    ```bash
-//!    # Reserve huge pages (size from /proc/meminfo, typically 2MB)
-//!    sudo sh -c 'echo 15360 > /proc/sys/vm/nr_hugepages'
+//!    sudo sh -c 'echo 15360 > /proc/sys/vm/nr_hugepages'  # 30GB at 2MB pages
 //!    ```
+//!
+//! 3. **WriteCombined** (`allocate_write_combined`): `cudaHostAlloc` with WC
+//!    flag. CPU reads are extremely slow — don't use when SSD offload is on.
+//!    NUMA placement follows the calling thread's affinity (caller is expected
+//!    to wrap with `run_on_numa`).
+//!
+//! See `examples/pinned_alloc_parallel.rs` for the benchmarks motivating the
+//! parallel pre-touch path.
 //!
 //! # Safety
 //!
@@ -24,6 +33,7 @@ use std::ptr::NonNull;
 use std::sync::OnceLock;
 
 use cudarc::runtime::sys as rt;
+use pegaflow_common::{NumaNode, pin_thread_to_numa_node};
 
 /// Cached huge page size from /proc/meminfo
 static HUGE_PAGE_SIZE: OnceLock<Option<usize>> = OnceLock::new();
@@ -86,13 +96,14 @@ impl std::error::Error for PinnedMemError {}
 /// Allocation strategy for pinned memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AllocStrategy {
-    /// Regular pinned memory via cudaHostAlloc (flags=0).
+    /// `mmap` + parallel pre-touch + `cudaHostRegister`.
     /// Safe for both CPU reads and writes; use when SSD offload is enabled.
     Regular,
-    /// Write-combined via cudaHostAlloc.
+    /// `cudaHostAlloc` with write-combined flag.
     /// Fast for CPU→GPU (write-only) workloads, but CPU reads are extremely slow.
     WriteCombined,
-    /// Huge pages (size from /proc/meminfo, requires system configuration)
+    /// `mmap(MAP_HUGETLB)` + parallel pre-touch + `cudaHostRegister`.
+    /// Requires reserved hugepages.
     HugePages,
 }
 
@@ -125,106 +136,108 @@ unsafe impl Send for PinnedMemory {}
 unsafe impl Sync for PinnedMemory {}
 
 impl PinnedMemory {
-    /// Allocate regular pinned memory (flags=0).
+    /// Allocate regular pinned memory via `mmap` + parallel pre-touch + register.
     ///
-    /// Safe for both CPU reads and writes. Use when SSD offload is enabled,
-    /// since write-combined memory has extremely slow CPU reads.
-    pub(crate) fn allocate_regular(size: usize) -> Result<Self, PinnedMemError> {
-        Self::allocate_internal(size, AllocStrategy::Regular)
+    /// All pages are first-touched by threads pinned to `node`, so the entire
+    /// region lands NUMA-local to that node. Pass `NumaNode::UNKNOWN` to skip
+    /// pinning and rely on the calling thread's existing affinity.
+    pub(crate) fn allocate_regular(size: usize, node: NumaNode) -> Result<Self, PinnedMemError> {
+        Self::allocate_mmap_register(size, AllocStrategy::Regular, node)
     }
 
-    /// Allocate pinned memory using write-combined mode.
+    /// Allocate write-combined pinned memory via `cudaHostAlloc`.
     ///
-    /// Uses `cudaHostAlloc` with `cudaHostAllocWriteCombined` flag.
     /// Fast for CPU→GPU transfers but CPU reads are extremely slow.
-    /// Do NOT use when SSD offload is enabled.
+    /// Do NOT use when SSD offload is enabled. NUMA placement follows the
+    /// calling thread's affinity at allocation time.
     pub(crate) fn allocate_write_combined(size: usize) -> Result<Self, PinnedMemError> {
-        Self::allocate_internal(size, AllocStrategy::WriteCombined)
+        if size == 0 {
+            return Err(PinnedMemError::ZeroSize);
+        }
+        let mut ptr: *mut libc::c_void = std::ptr::null_mut();
+        // SAFETY: ptr is a valid stack pointer; size is validated non-zero above.
+        let result = unsafe { rt::cudaHostAlloc(&mut ptr, size, rt::cudaHostAllocWriteCombined) };
+        if result != rt::cudaError::cudaSuccess {
+            return Err(PinnedMemError::CudaAllocFailed(result));
+        }
+        let ptr = NonNull::new(ptr as *mut u8).expect("cudaHostAlloc returned null");
+        Ok(Self {
+            ptr,
+            size,
+            strategy: AllocStrategy::WriteCombined,
+        })
     }
 
-    /// Allocate pinned memory using huge pages.
+    /// Allocate hugepage-backed pinned memory.
     ///
-    /// Uses `mmap(MAP_HUGETLB)` for fast allocation, then registers with CUDA.
-    /// Much faster than regular pages but requires system configuration:
+    /// Uses `mmap(MAP_HUGETLB)` + parallel pre-touch + `cudaHostRegister`.
+    /// Touch threads are pinned to `node` for NUMA-local first-touch.
     ///
+    /// Requires reserved hugepages:
     /// ```bash
-    /// # Reserve huge pages (size depends on system, typically 2MB)
-    /// sudo sh -c 'echo 15360 > /proc/sys/vm/nr_hugepages'  # for 30GB with 2MB pages
+    /// sudo sh -c 'echo 15360 > /proc/sys/vm/nr_hugepages'  # 30GB at 2MB pages
     /// ```
     ///
     /// # Errors
     ///
     /// Returns `MmapFailed` if huge pages are not configured or insufficient.
-    pub(crate) fn allocate_hugepages(size: usize) -> Result<Self, PinnedMemError> {
-        Self::allocate_internal(size, AllocStrategy::HugePages)
+    pub(crate) fn allocate_hugepages(size: usize, node: NumaNode) -> Result<Self, PinnedMemError> {
+        Self::allocate_mmap_register(size, AllocStrategy::HugePages, node)
     }
 
-    fn allocate_internal(size: usize, strategy: AllocStrategy) -> Result<Self, PinnedMemError> {
+    fn allocate_mmap_register(
+        size: usize,
+        strategy: AllocStrategy,
+        node: NumaNode,
+    ) -> Result<Self, PinnedMemError> {
         if size == 0 {
             return Err(PinnedMemError::ZeroSize);
         }
 
-        let (ptr, aligned_size) = match strategy {
-            AllocStrategy::Regular => {
-                let mut ptr: *mut libc::c_void = std::ptr::null_mut();
-                // SAFETY: ptr is a valid stack pointer; size is validated non-zero above.
-                let result = unsafe { rt::cudaHostAlloc(&mut ptr, size, 0) };
-                if result != rt::cudaError::cudaSuccess {
-                    return Err(PinnedMemError::CudaAllocFailed(result));
-                }
-                (ptr, size)
-            }
-            AllocStrategy::WriteCombined => {
-                let mut ptr: *mut libc::c_void = std::ptr::null_mut();
-                // SAFETY: ptr is a valid stack pointer; size is validated non-zero above.
-                let result =
-                    unsafe { rt::cudaHostAlloc(&mut ptr, size, rt::cudaHostAllocWriteCombined) };
-                if result != rt::cudaError::cudaSuccess {
-                    return Err(PinnedMemError::CudaAllocFailed(result));
-                }
-                (ptr, size)
-            }
+        let (flags, aligned_size) = match strategy {
             AllocStrategy::HugePages => {
                 let huge_page_size =
                     get_huge_page_size().ok_or(PinnedMemError::HugePageSizeUnavailable)?;
                 let aligned = (size + huge_page_size - 1) & !(huge_page_size - 1);
-                let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_HUGETLB;
-
-                // SAFETY: All parameters are valid: null hint, aligned non-zero size,
-                // valid protection flags, MAP_ANONYMOUS with fd=-1. Return is checked
-                // against MAP_FAILED before use.
-                let ptr = unsafe {
-                    libc::mmap(
-                        std::ptr::null_mut(),
-                        aligned,
-                        libc::PROT_READ | libc::PROT_WRITE,
-                        flags,
-                        -1,
-                        0,
-                    )
-                };
-
-                if ptr == libc::MAP_FAILED {
-                    return Err(PinnedMemError::MmapFailed(std::io::Error::last_os_error()));
-                }
-
-                // Register with CUDA for DMA
-                // SAFETY: ptr is a valid mmap'd region of `aligned` bytes (checked above).
-                let result =
-                    unsafe { rt::cudaHostRegister(ptr, aligned, rt::cudaHostRegisterDefault) };
-
-                if result != rt::cudaError::cudaSuccess {
-                    unsafe { libc::munmap(ptr, aligned) };
-                    return Err(PinnedMemError::CudaRegisterFailed(result));
-                }
-
-                (ptr, aligned)
+                (
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_HUGETLB,
+                    aligned,
+                )
+            }
+            AllocStrategy::Regular => (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, size),
+            AllocStrategy::WriteCombined => {
+                unreachable!("WriteCombined does not use the mmap path")
             }
         };
 
-        // SAFETY: allocation succeeded and returned non-null pointer
-        let ptr = NonNull::new(ptr as *mut u8).expect("allocation returned null");
+        // SAFETY: null hint + anonymous mapping with valid prot/flags; the
+        // result is checked against MAP_FAILED before any use.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                aligned_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                flags,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(PinnedMemError::MmapFailed(io::Error::last_os_error()));
+        }
 
+        parallel_pre_touch(ptr.cast::<u8>(), aligned_size, node);
+
+        // SAFETY: ptr is a valid mapping of aligned_size bytes (checked above).
+        let result =
+            unsafe { rt::cudaHostRegister(ptr, aligned_size, rt::cudaHostRegisterDefault) };
+        if result != rt::cudaError::cudaSuccess {
+            // SAFETY: ptr was successfully mmap'd above.
+            unsafe { libc::munmap(ptr, aligned_size) };
+            return Err(PinnedMemError::CudaRegisterFailed(result));
+        }
+
+        let ptr = NonNull::new(ptr as *mut u8).expect("mmap returned null");
         Ok(Self {
             ptr,
             size: aligned_size,
@@ -250,32 +263,93 @@ impl PinnedMemory {
 impl Drop for PinnedMemory {
     fn drop(&mut self) {
         match self.strategy {
-            AllocStrategy::Regular | AllocStrategy::WriteCombined => {
-                // SAFETY: ptr was allocated with cudaHostAlloc
+            AllocStrategy::WriteCombined => {
+                // SAFETY: ptr was allocated with cudaHostAlloc.
                 let result = unsafe { rt::cudaFreeHost(self.ptr.as_ptr() as *mut libc::c_void) };
                 if result != rt::cudaError::cudaSuccess {
                     eprintln!("Warning: cudaFreeHost failed: {:?}", result);
                 }
             }
-            AllocStrategy::HugePages => {
-                // SAFETY: ptr was registered with cudaHostRegister
-                unsafe {
-                    let result = rt::cudaHostUnregister(self.ptr.as_ptr() as *mut libc::c_void);
-                    if result != rt::cudaError::cudaSuccess {
-                        eprintln!("Warning: cudaHostUnregister failed: {:?}", result);
-                    }
+            AllocStrategy::Regular | AllocStrategy::HugePages => {
+                // SAFETY: ptr was registered with cudaHostRegister.
+                let unreg =
+                    unsafe { rt::cudaHostUnregister(self.ptr.as_ptr() as *mut libc::c_void) };
+                if unreg != rt::cudaError::cudaSuccess {
+                    eprintln!("Warning: cudaHostUnregister failed: {:?}", unreg);
                 }
-
-                // SAFETY: ptr was allocated by mmap with the same size
-                unsafe {
-                    if libc::munmap(self.ptr.as_ptr() as *mut libc::c_void, self.size) == -1 {
-                        let err = std::io::Error::last_os_error();
-                        eprintln!("Warning: munmap failed: {}", err);
-                    }
+                // SAFETY: ptr was allocated by mmap with the same size.
+                let unmap =
+                    unsafe { libc::munmap(self.ptr.as_ptr() as *mut libc::c_void, self.size) };
+                if unmap == -1 {
+                    let err = io::Error::last_os_error();
+                    eprintln!("Warning: munmap failed: {}", err);
                 }
             }
         }
     }
+}
+
+/// Fault in every page of `[ptr, ptr+size)` across worker threads pinned to
+/// `node`. Each thread owns a disjoint chunk and writes one byte per page
+/// (plus a tail byte) to force materialization. First-touch on a pinned
+/// thread places each page on `node`'s local memory.
+///
+/// If `node.is_unknown()`, threads run with the calling thread's existing
+/// affinity (typically set by `run_on_numa` at the call site).
+fn parallel_pre_touch(ptr: *mut u8, size: usize, node: NumaNode) {
+    let page = page_size();
+    let threads = touch_threads(size);
+    let chunk = size.div_ceil(threads);
+    // *mut u8 is not Send; smuggle as usize and reconstruct inside the scope.
+    // Lifetimes are bounded by thread::scope.
+    let base = ptr as usize;
+
+    std::thread::scope(|s| {
+        for i in 0..threads {
+            let off = i * chunk;
+            if off >= size {
+                break;
+            }
+            let len = chunk.min(size - off);
+            s.spawn(move || {
+                if node.is_valid()
+                    && let Err(e) = pin_thread_to_numa_node(node)
+                {
+                    log::warn!("pre-touch NUMA pin to {} failed: {}", node, e);
+                }
+                let p = (base + off) as *mut u8;
+                let mut off = 0usize;
+                while off < len {
+                    // SAFETY: chunk is a disjoint sub-range of the caller's mapping.
+                    unsafe { p.add(off).write_volatile(0u8) };
+                    off += page;
+                }
+                // SAFETY: len > 0 is enforced by the chunk bookkeeping above.
+                unsafe { p.add(len - 1).write_volatile(0u8) };
+            });
+        }
+    });
+}
+
+/// Pick worker count for pre-touch.
+///
+/// Spinning up many threads for a small allocation costs more than it saves —
+/// each thread must at least pay a NUMA pin + page-walk. Grant each worker a
+/// minimum chunk so tiny allocations stay single-threaded and large ones still
+/// scale up to the CPU count.
+fn touch_threads(size: usize) -> usize {
+    const MIN_BYTES_PER_THREAD: usize = 1 << 30; // 1 GiB
+    let by_size = size.div_ceil(MIN_BYTES_PER_THREAD).max(1);
+    let by_cpu = std::thread::available_parallelism()
+        .map_or(8, |n| n.get())
+        .max(1);
+    by_size.min(by_cpu)
+}
+
+fn page_size() -> usize {
+    // SAFETY: sysconf with a valid name; non-positive result is fallback-handled.
+    let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if v > 0 { v as usize } else { 4096 }
 }
 
 #[cfg(test)]
@@ -294,9 +368,25 @@ mod tests {
     }
 
     #[test]
+    fn test_allocate_regular() {
+        if cudarc::driver::CudaContext::new(0).is_err() {
+            return;
+        }
+
+        let mem = PinnedMemory::allocate_regular(4096, NumaNode::UNKNOWN).unwrap();
+        assert!(mem.size() >= 4096);
+    }
+
+    #[test]
     fn test_zero_size_fails() {
-        let result = PinnedMemory::allocate_write_combined(0);
-        assert!(matches!(result, Err(PinnedMemError::ZeroSize)));
+        assert!(matches!(
+            PinnedMemory::allocate_write_combined(0),
+            Err(PinnedMemError::ZeroSize)
+        ));
+        assert!(matches!(
+            PinnedMemory::allocate_regular(0, NumaNode::UNKNOWN),
+            Err(PinnedMemError::ZeroSize)
+        ));
     }
 
     #[test]
