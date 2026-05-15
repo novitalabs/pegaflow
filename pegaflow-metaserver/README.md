@@ -61,10 +61,10 @@ cargo run -p pegaflow-metaserver -- --addr 0.0.0.0:50056
 cargo run -p pegaflow-metaserver -- --log-level debug
 
 # Custom node lifecycle timings
-cargo run -p pegaflow-metaserver -- --node-stale-secs 30 --node-purge-secs 90 --sweep-interval-secs 10
+cargo run -p pegaflow-metaserver -- --node-stale-secs 30 --ttl-minutes 120
 
 # All options combined
-cargo run -p pegaflow-metaserver -- --addr 0.0.0.0:50056 --node-stale-secs 30 --node-purge-secs 90 --log-level info
+cargo run -p pegaflow-metaserver -- --addr 0.0.0.0:50056 --node-stale-secs 30 --ttl-minutes 120 --log-level info
 
 # Show all options
 cargo run -p pegaflow-metaserver -- --help
@@ -75,8 +75,7 @@ cargo run -p pegaflow-metaserver -- --help
 - `--addr <ADDR>`: Bind address (default: `127.0.0.1:50056`)
 - `--log-level <LEVEL>`: Log level: `trace`, `debug`, `info`, `warn`, `error` (default: `info`)
 - `--node-stale-secs <SECONDS>`: Hide nodes from query after this many seconds without heartbeat (default: `30`)
-- `--node-purge-secs <SECONDS>`: Purge nodes and ownership after this many seconds without heartbeat (default: `90`)
-- `--sweep-interval-secs <SECONDS>`: Background lifecycle sweep interval (default: `10`)
+- `--ttl-minutes <MINUTES>`: Purge ownership and node records after this many minutes; the sweep runs at this interval (default: `120`)
 
 ### Storage Configuration
 
@@ -85,7 +84,7 @@ The MetaServer uses a DashMap-based in-memory store with the following character
 - **Multi-owner**: A block hash can be registered by multiple nodes simultaneously
 - **Node lifecycle**: Servers call `RegisterNode`, heartbeat periodically, and include the returned `node_id` in insert/remove RPCs.
 - **Stale filtering**: Nodes stop appearing in query results after 30 seconds without heartbeat by default.
-- **Purge sweep**: A background task removes stale owners and nodes after 90 seconds without heartbeat by default.
+- **TTL sweep**: A background task removes expired owners and nodes after `--ttl-minutes`.
 - **Conditional removal**: `RemoveBlockHashes` only removes the requesting node's ownership; other nodes' entries are untouched.
 - **Memory**: Scales with unique blocks across all nodes. No hard capacity cap — memory is naturally bounded by the total number of blocks in the cluster.
 
@@ -217,7 +216,7 @@ Graceful shutdown trigger.
 - **Data structure**: `blocks: DashMap<BlockKey, HashMap<Arc<str>, OwnerRecord>>` and `nodes: DashMap<Arc<str>, NodeRecord>`
 - **BlockKey**: `{ namespace: String, hash: Vec<u8> }` — matches pegaflow-core's BlockKey
 - **Multi-owner**: Multiple nodes can register the same block hash (e.g., after replication or shared prefill)
-- **Lifecycle sweep**: Background task removes owners whose node record is missing or older than `--node-purge-secs`; superseded sessions are hidden from queries by `node_id` matching and purged by key registration age.
+- **Lifecycle sweep**: Background task removes owners whose node record is missing or whose ownership TTL expired; superseded sessions are hidden from queries by `node_id` matching and purged by TTL.
 - **Concurrency**: DashMap uses shard-level locking for high-throughput concurrent access
 - **Persistence**: In-memory only (restart clears state)
 

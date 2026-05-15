@@ -44,13 +44,9 @@ pub struct Cli {
     #[arg(long, default_value_t = store::DEFAULT_NODE_STALE_SECS)]
     pub node_stale_secs: u64,
 
-    /// Seconds without heartbeat before a node and its block ownership are purged.
-    #[arg(long, default_value_t = store::DEFAULT_NODE_PURGE_SECS)]
-    pub node_purge_secs: u64,
-
-    /// Background sweep interval in seconds.
-    #[arg(long, default_value_t = 10)]
-    pub sweep_interval_secs: u64,
+    /// Minutes before block ownership records are purged by the lifecycle sweep.
+    #[arg(long, default_value_t = store::DEFAULT_TTL_MINUTES)]
+    pub ttl_minutes: u64,
 }
 
 fn init_metrics() -> Result<(SdkMeterProvider, Registry), Box<dyn Error>> {
@@ -108,13 +104,17 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     info!("Starting PegaFlow MetaServer");
     info!("Binding to address: {}", cli.addr);
     info!(
-        "Node lifecycle: stale_after={}s purge_after={}s sweep_interval={}s",
-        cli.node_stale_secs, cli.node_purge_secs, cli.sweep_interval_secs
+        "Node lifecycle: stale_after={}s ttl={}m",
+        cli.node_stale_secs, cli.ttl_minutes
     );
-    if cli.node_purge_secs < cli.node_stale_secs {
+    let ttl_secs = cli
+        .ttl_minutes
+        .checked_mul(60)
+        .ok_or("ttl-minutes is too large")?;
+    if ttl_secs < cli.node_stale_secs {
         return Err(format!(
-            "node-purge-secs ({}) must be >= node-stale-secs ({})",
-            cli.node_purge_secs, cli.node_stale_secs
+            "ttl-minutes ({}) must be >= node-stale-secs ({})",
+            cli.ttl_minutes, cli.node_stale_secs
         )
         .into());
     }
@@ -124,7 +124,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
 
     let store = Arc::new(BlockHashStore::with_config(store::StoreConfig {
         node_stale_after: Duration::from_secs(cli.node_stale_secs),
-        node_purge_after: Duration::from_secs(cli.node_purge_secs),
+        ttl: Duration::from_secs(ttl_secs),
     }));
 
     // Register store observable gauges
@@ -133,7 +133,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     // Spawn background node lifecycle sweep task.
     {
         let store = Arc::clone(&store);
-        let sweep_interval = Duration::from_secs(cli.sweep_interval_secs);
+        let sweep_interval = Duration::from_secs(ttl_secs);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(sweep_interval);
             loop {

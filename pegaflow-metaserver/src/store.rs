@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 pub const DEFAULT_NODE_STALE_SECS: u64 = 30;
-pub const DEFAULT_NODE_PURGE_SECS: u64 = 90;
+pub const DEFAULT_TTL_MINUTES: u64 = 120;
 
 /// A prefix query result: one block hash and all live nodes that own it.
 #[derive(Debug, Clone)]
@@ -18,14 +18,14 @@ pub struct PrefixEntry {
 #[derive(Debug, Clone, Copy)]
 pub struct StoreConfig {
     pub node_stale_after: Duration,
-    pub node_purge_after: Duration,
+    pub ttl: Duration,
 }
 
 impl Default for StoreConfig {
     fn default() -> Self {
         Self {
             node_stale_after: Duration::from_secs(DEFAULT_NODE_STALE_SECS),
-            node_purge_after: Duration::from_secs(DEFAULT_NODE_PURGE_SECS),
+            ttl: Duration::from_secs(DEFAULT_TTL_MINUTES * 60),
         }
     }
 }
@@ -82,6 +82,13 @@ impl BlockHashStore {
             nodes: DashMap::new(),
             config,
         }
+    }
+
+    pub fn with_ttl(ttl_minutes: u64) -> Self {
+        Self::with_config(StoreConfig {
+            node_stale_after: Duration::from_secs(DEFAULT_NODE_STALE_SECS),
+            ttl: Duration::from_secs(ttl_minutes * 60),
+        })
     }
 
     pub fn register_node(&self, node: &str) -> Uuid {
@@ -207,7 +214,7 @@ impl BlockHashStore {
         result
     }
 
-    /// Sweep owners whose node is missing or past purge age.
+    /// Sweep owners whose node is missing or whose ownership TTL has expired.
     pub fn sweep_expired(&self) -> SweepStats {
         let now = Instant::now();
         let mut stats = SweepStats::default();
@@ -225,9 +232,9 @@ impl BlockHashStore {
         });
 
         let node_before = self.nodes.len();
-        let purge_after = self.config.node_purge_after;
+        let ttl = self.config.ttl;
         self.nodes
-            .retain(|_, record| now.duration_since(record.last_seen) <= purge_after);
+            .retain(|_, record| now.duration_since(record.last_seen) <= ttl);
         stats.removed_nodes = node_before.saturating_sub(self.nodes.len());
 
         stats
@@ -252,7 +259,7 @@ impl BlockHashStore {
             let age = now.duration_since(node.last_seen);
             if age <= self.config.node_stale_after {
                 active += 1;
-            } else if age <= self.config.node_purge_after {
+            } else if age <= self.config.ttl {
                 stale += 1;
             }
         }
@@ -305,10 +312,8 @@ impl BlockHashStore {
         let Some(record) = self.nodes.get(node.as_ref()) else {
             return false;
         };
-        if record.node_id != owner.node_id {
-            return now.duration_since(owner.key_register_time) <= self.config.node_purge_after;
-        }
-        now.duration_since(record.last_seen) <= self.config.node_purge_after
+        now.duration_since(owner.key_register_time) <= self.config.ttl
+            && now.duration_since(record.last_seen) <= self.config.ttl
     }
 }
 
@@ -478,7 +483,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sweep_keeps_superseded_owner_until_node_purge() {
+    fn test_sweep_keeps_superseded_owner_until_ttl() {
         let store = BlockHashStore::new();
         let old_id = store.register_node("node-a");
         store
@@ -497,7 +502,7 @@ mod tests {
     fn test_sweep_removes_superseded_owner_after_key_purge_age() {
         let store = BlockHashStore::with_config(StoreConfig {
             node_stale_after: Duration::ZERO,
-            node_purge_after: Duration::ZERO,
+            ttl: Duration::ZERO,
         });
         let old_id = store.register_node("node-a");
         store
@@ -550,7 +555,7 @@ mod tests {
     fn test_query_filters_stale_node() {
         let store = BlockHashStore::with_config(StoreConfig {
             node_stale_after: Duration::ZERO,
-            node_purge_after: Duration::from_secs(60),
+            ttl: Duration::from_secs(60),
         });
         let node_id = store.register_node("node-a");
         store
@@ -567,7 +572,7 @@ mod tests {
     fn test_sweep_expired() {
         let store = BlockHashStore::with_config(StoreConfig {
             node_stale_after: Duration::ZERO,
-            node_purge_after: Duration::ZERO,
+            ttl: Duration::ZERO,
         });
         let node_id = store.register_node("node-a");
         store
