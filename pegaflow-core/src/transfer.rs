@@ -5,10 +5,13 @@ use crate::KVCacheRegistration;
 // ============================================================================
 // Transfer Functions Module
 //
-// This module contains all GPU<->CPU memory transfer operations:
-// - Low-level CUDA copy primitives (async)
-// - Batched transfer optimization for contiguous memory ranges
-// - Helper functions for offset/size calculations
+// GPU<->CPU memory transfer operations:
+// - Coalesce contiguous (gpu_offset, cpu_ptr) pairs into larger ranges to
+//   reduce the number of CUDA driver calls.
+// - Submit each merged range with cuMemcpyHtoDAsync_v2 / cuMemcpyDtoHAsync_v2
+//   (explicit direction). cuMemcpyBatchAsync* has shown driver instability on
+//   some CUDA stacks, while explicit directional copies preserve the same
+//   stream ordering without relying on that batch API path.
 // ============================================================================
 
 #[derive(Clone)]
@@ -57,143 +60,12 @@ pub fn segment_offset(
     Ok(offset)
 }
 
-fn copy_gpu_to_cpu_batch_async(
-    transfers: &[MergedGpuToCpuTransfer],
-    registration: &KVCacheRegistration,
-    stream: &CudaStream,
-) -> Result<(), String> {
-    use cudarc::driver::sys;
-
-    let mut dsts = Vec::with_capacity(transfers.len());
-    let mut srcs = Vec::with_capacity(transfers.len());
-    let mut sizes = Vec::with_capacity(transfers.len());
-    let mut attrs = [sys::CUmemcpyAttributes {
-        srcAccessOrder: sys::CUmemcpySrcAccessOrder_enum::CU_MEMCPY_SRC_ACCESS_ORDER_STREAM,
-        srcLocHint: sys::CUmemLocation {
-            type_: sys::CUmemLocationType_enum::CU_MEM_LOCATION_TYPE_INVALID,
-            id: 0,
-        },
-        dstLocHint: sys::CUmemLocation {
-            type_: sys::CUmemLocationType_enum::CU_MEM_LOCATION_TYPE_INVALID,
-            id: 0,
-        },
-        flags: 0,
-    }];
-    let mut attrs_idxs = [0usize];
-
-    for transfer in transfers {
-        let src_ptr = registration
-            .data_ptr
-            .checked_add(transfer.gpu_offset as u64)
-            .ok_or_else(|| {
-                format!(
-                    "GPU source pointer overflow for offset {}",
-                    transfer.gpu_offset
-                )
-            })?;
-        dsts.push(transfer.cpu_ptr as usize as sys::CUdeviceptr);
-        srcs.push(src_ptr);
-        sizes.push(transfer.size);
-    }
-
-    // SAFETY: The source GPU addresses are derived from a live registration and checked
-    // for overflow. Destination pointers refer to pinned host memory owned by the caller
-    // and remain valid until the caller synchronizes the stream. Contiguous ranges have
-    // been merged, so each entry is an independent non-overlapping copy.
-    unsafe {
-        let result = submit_batch_memcpy(
-            dsts.as_mut_ptr(),
-            srcs.as_mut_ptr(),
-            sizes.as_mut_ptr(),
-            transfers.len(),
-            attrs.as_mut_ptr(),
-            attrs_idxs.as_mut_ptr(),
-            attrs.len(),
-            stream.cu_stream(),
-        );
-        if result != sys::cudaError_enum::CUDA_SUCCESS {
-            return Err(format!("cuMemcpyBatchAsync DtoH failed: {:?}", result));
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(not(feature = "cuda-13"))]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "CUDA 12 FFI wrapper preserves the driver API call shape"
-)]
-unsafe fn submit_batch_memcpy(
-    dsts: *mut cudarc::driver::sys::CUdeviceptr,
-    srcs: *mut cudarc::driver::sys::CUdeviceptr,
-    sizes: *mut usize,
-    count: usize,
-    attrs: *mut cudarc::driver::sys::CUmemcpyAttributes,
-    attrs_idxs: *mut usize,
-    num_attrs: usize,
-    stream: cudarc::driver::sys::CUstream,
-) -> cudarc::driver::sys::CUresult {
-    unsafe {
-        cudarc::driver::sys::cuMemcpyBatchAsync(
-            dsts,
-            srcs,
-            sizes,
-            count,
-            attrs,
-            attrs_idxs,
-            num_attrs,
-            std::ptr::null_mut(),
-            stream,
-        )
-    }
-}
-
-#[cfg(feature = "cuda-13")]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "CUDA 13 FFI wrapper preserves the driver API call shape"
-)]
-unsafe fn submit_batch_memcpy(
-    dsts: *mut cudarc::driver::sys::CUdeviceptr,
-    srcs: *mut cudarc::driver::sys::CUdeviceptr,
-    sizes: *mut usize,
-    count: usize,
-    attrs: *mut cudarc::driver::sys::CUmemcpyAttributes,
-    attrs_idxs: *mut usize,
-    num_attrs: usize,
-    stream: cudarc::driver::sys::CUstream,
-) -> cudarc::driver::sys::CUresult {
-    unsafe {
-        cudarc::driver::sys::cuMemcpyBatchAsync_v2(
-            dsts, srcs, sizes, count, attrs, attrs_idxs, num_attrs, stream,
-        )
-    }
-}
-
-fn copy_cpu_to_gpu_batch_async(
+fn copy_cpu_to_gpu_merged_async(
     transfers: &[MergedCpuToGpuTransfer],
     registration: &KVCacheRegistration,
     stream: &CudaStream,
 ) -> Result<(), String> {
     use cudarc::driver::sys;
-
-    let mut dsts = Vec::with_capacity(transfers.len());
-    let mut srcs = Vec::with_capacity(transfers.len());
-    let mut sizes = Vec::with_capacity(transfers.len());
-    let mut attrs = [sys::CUmemcpyAttributes {
-        srcAccessOrder: sys::CUmemcpySrcAccessOrder_enum::CU_MEMCPY_SRC_ACCESS_ORDER_STREAM,
-        srcLocHint: sys::CUmemLocation {
-            type_: sys::CUmemLocationType_enum::CU_MEM_LOCATION_TYPE_INVALID,
-            id: 0,
-        },
-        dstLocHint: sys::CUmemLocation {
-            type_: sys::CUmemLocationType_enum::CU_MEM_LOCATION_TYPE_INVALID,
-            id: 0,
-        },
-        flags: 0,
-    }];
-    let mut attrs_idxs = [0usize];
 
     for transfer in transfers {
         let dst_ptr = registration
@@ -205,29 +77,72 @@ fn copy_cpu_to_gpu_batch_async(
                     transfer.gpu_offset
                 )
             })?;
-        dsts.push(dst_ptr);
-        srcs.push(transfer.cpu_ptr as usize as sys::CUdeviceptr);
-        sizes.push(transfer.size);
-    }
 
-    // SAFETY: Destination GPU addresses are derived from a live registration and checked
-    // for overflow. Source pointers refer to pinned host memory owned by the caller and
-    // stay valid until the caller synchronizes the stream. Each transfer copies a disjoint
-    // segment, so batch execution order does not matter.
-    unsafe {
-        let result = submit_batch_memcpy(
-            dsts.as_mut_ptr(),
-            srcs.as_mut_ptr(),
-            sizes.as_mut_ptr(),
-            transfers.len(),
-            attrs.as_mut_ptr(),
-            attrs_idxs.as_mut_ptr(),
-            attrs.len(),
-            stream.cu_stream(),
-        );
+        // SAFETY: dst_ptr range was checked when the merged transfer was built.
+        // cpu_ptr is pinned host memory owned by the caller and stays valid
+        // until the caller synchronizes the stream.
+        let result = unsafe {
+            sys::cuMemcpyHtoDAsync_v2(
+                dst_ptr,
+                transfer.cpu_ptr as *const std::ffi::c_void,
+                transfer.size,
+                stream.cu_stream(),
+            )
+        };
         if result != sys::cudaError_enum::CUDA_SUCCESS {
-            return Err(format!("cuMemcpyBatchAsync HtoD failed: {:?}", result));
+            return Err(format!("cuMemcpyHtoDAsync failed: {result:?}"));
         }
+    }
+    Ok(())
+}
+
+fn copy_gpu_to_cpu_merged_async(
+    transfers: &[MergedGpuToCpuTransfer],
+    registration: &KVCacheRegistration,
+    stream: &CudaStream,
+) -> Result<(), String> {
+    use cudarc::driver::sys;
+
+    for transfer in transfers {
+        let src_ptr = registration
+            .data_ptr
+            .checked_add(transfer.gpu_offset as u64)
+            .ok_or_else(|| {
+                format!(
+                    "GPU source pointer overflow for offset {}",
+                    transfer.gpu_offset
+                )
+            })?;
+
+        // SAFETY: src_ptr range was checked when the merged transfer was built.
+        // cpu_ptr is pinned host memory owned by the caller and stays valid
+        // until the caller synchronizes the stream.
+        let result = unsafe {
+            sys::cuMemcpyDtoHAsync_v2(
+                transfer.cpu_ptr as *mut std::ffi::c_void,
+                src_ptr,
+                transfer.size,
+                stream.cu_stream(),
+            )
+        };
+        if result != sys::cudaError_enum::CUDA_SUCCESS {
+            return Err(format!("cuMemcpyDtoHAsync failed: {result:?}"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_merged_transfer_bounds(
+    gpu_offset: usize,
+    size: usize,
+    registration: &KVCacheRegistration,
+    context: &str,
+) -> Result<(), String> {
+    if gpu_offset
+        .checked_add(size)
+        .is_none_or(|end| end > registration.size_bytes)
+    {
+        return Err(format!("{context}: transfer exceeds registered memory"));
     }
 
     Ok(())
@@ -236,6 +151,7 @@ fn copy_cpu_to_gpu_batch_async(
 fn merge_cpu_to_gpu_transfers(
     transfers: &[(usize, *const u8)],
     segment_size: usize,
+    registration: &KVCacheRegistration,
 ) -> Result<Vec<MergedCpuToGpuTransfer>, String> {
     let mut merged = Vec::with_capacity(transfers.len());
     let mut i = 0;
@@ -261,6 +177,12 @@ fn merge_cpu_to_gpu_transfers(
         let size = segment_size
             .checked_mul(count)
             .ok_or_else(|| "merge_cpu_to_gpu_transfers: total_size overflow".to_string())?;
+        validate_merged_transfer_bounds(
+            start_gpu_offset,
+            size,
+            registration,
+            "merge_cpu_to_gpu_transfers",
+        )?;
 
         merged.push(MergedCpuToGpuTransfer {
             gpu_offset: start_gpu_offset,
@@ -276,6 +198,7 @@ fn merge_cpu_to_gpu_transfers(
 fn merge_gpu_to_cpu_transfers(
     transfers: &[(usize, *mut u8)],
     segment_size: usize,
+    registration: &KVCacheRegistration,
 ) -> Result<Vec<MergedGpuToCpuTransfer>, String> {
     let mut merged = Vec::with_capacity(transfers.len());
     let mut i = 0;
@@ -301,6 +224,12 @@ fn merge_gpu_to_cpu_transfers(
         let size = segment_size
             .checked_mul(count)
             .ok_or_else(|| "merge_gpu_to_cpu_transfers: total_size overflow".to_string())?;
+        validate_merged_transfer_bounds(
+            start_gpu_offset,
+            size,
+            registration,
+            "merge_gpu_to_cpu_transfers",
+        )?;
 
         merged.push(MergedGpuToCpuTransfer {
             gpu_offset: start_gpu_offset,
@@ -313,8 +242,9 @@ fn merge_gpu_to_cpu_transfers(
     Ok(merged)
 }
 
-/// Batch copy segments from CPU to GPU by finding and merging contiguous ranges.
-/// Returns the number of merged contiguous transfer ranges submitted.
+/// Copy segments from CPU to GPU. Contiguous segments are merged into larger
+/// ranges and each merged range is submitted as one `cuMemcpyHtoDAsync_v2`.
+/// Returns the number of merged ranges submitted.
 pub fn batch_copy_segments_to_gpu(
     transfers: &[(usize, *const u8)],
     segment_size: usize,
@@ -325,13 +255,14 @@ pub fn batch_copy_segments_to_gpu(
         return Ok(0);
     }
 
-    let merged_transfers = merge_cpu_to_gpu_transfers(transfers, segment_size)?;
-    copy_cpu_to_gpu_batch_async(&merged_transfers, registration, stream)?;
+    let merged_transfers = merge_cpu_to_gpu_transfers(transfers, segment_size, registration)?;
+    copy_cpu_to_gpu_merged_async(&merged_transfers, registration, stream)?;
     Ok(merged_transfers.len())
 }
 
-/// Batch copy segments from GPU to CPU by finding and merging contiguous ranges.
-/// Returns the number of merged contiguous transfer ranges submitted.
+/// Copy segments from GPU to CPU. Contiguous segments are merged into larger
+/// ranges and each merged range is submitted as one `cuMemcpyDtoHAsync_v2`.
+/// Returns the number of merged ranges submitted.
 pub fn batch_copy_segments_from_gpu(
     transfers: &[(usize, *mut u8)], // (gpu_offset, cpu_dst_ptr)
     segment_size: usize,
@@ -342,15 +273,7 @@ pub fn batch_copy_segments_from_gpu(
         return Ok(0);
     }
 
-    if transfers.iter().any(|(offset, _)| {
-        registration
-            .size_bytes
-            .checked_sub(segment_size)
-            .is_none_or(|max_offset| *offset > max_offset)
-    }) {
-        return Err("batch_copy_segments_from_gpu: transfer exceeds registered memory".to_string());
-    }
-    let merged_transfers = merge_gpu_to_cpu_transfers(transfers, segment_size)?;
-    copy_gpu_to_cpu_batch_async(&merged_transfers, registration, stream)?;
+    let merged_transfers = merge_gpu_to_cpu_transfers(transfers, segment_size, registration)?;
+    copy_gpu_to_cpu_merged_async(&merged_transfers, registration, stream)?;
     Ok(merged_transfers.len())
 }
