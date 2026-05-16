@@ -112,7 +112,7 @@ class SchedulerConnector:
             hit_blocks = pending_probe.hit_blocks
             self._external_matched_blocks[req_id] = computed_blocks + hit_blocks
             num_hit_tokens = hit_blocks * self._ctx.virtual_block_size
-            logger.info(
+            logger.debug(
                 "[PegaKVConnector] req=%s cache_lookup_reuse: hit_blocks=%d "
                 "computed_blocks=%d hit_tokens=%d num_tokens=%d total_query_hashes=%d",
                 req_id,
