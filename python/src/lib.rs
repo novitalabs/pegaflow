@@ -386,7 +386,11 @@ impl EngineRpcClient {
             let prefetch_state = match PrefetchState::try_from(r.prefetch_state) {
                 Ok(PrefetchState::PrefetchDone) => "done",
                 Ok(PrefetchState::PrefetchLoading) => "loading",
-                _ => "done", // Default to done for unknown states
+                Err(value) => {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "query_prefetch returned unknown prefetch_state: {value}"
+                    )));
+                }
             };
 
             Python::attach(|py| {

@@ -274,6 +274,33 @@ class TestSchedulerQueryProbeReuse:
         engine_client.query_prefetch.assert_called_once()
         engine_client.unpin.assert_not_called()
 
+    def test_query_prefetch_dict_requires_contract_fields(self):
+        sc, engine_client = self._make_connector()
+        engine_client.query_prefetch.return_value = {
+            "ok": True,
+            "message": "ok",
+            "hit_blocks": 2,
+            "loading_blocks": 0,
+            "missing_blocks": 0,
+        }
+
+        with pytest.raises(KeyError, match="prefetch_state"):
+            sc._count_available_block_prefix([_hash(i) for i in range(4)], "r1")
+
+    def test_query_prefetch_dict_rejects_unknown_prefetch_state(self):
+        sc, engine_client = self._make_connector()
+        engine_client.query_prefetch.return_value = {
+            "ok": True,
+            "message": "ok",
+            "hit_blocks": 2,
+            "prefetch_state": "weird",
+            "loading_blocks": 0,
+            "missing_blocks": 0,
+        }
+
+        with pytest.raises(RuntimeError, match="prefetch_state"):
+            sc._count_available_block_prefix([_hash(i) for i in range(4)], "r1")
+
     def test_committed_probe_is_not_unpinned_on_cleanup(self):
         sc, engine_client = self._make_connector()
         req = _make_fake_request("r1", [_hash(i) for i in range(2)])

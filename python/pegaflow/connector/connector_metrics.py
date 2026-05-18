@@ -128,7 +128,6 @@ class PegaKVConnectorStats(KVConnectorStats):
         - load_failure_count: failed load operations
         - save_success_count: successful save operations
         - save_failure_count: failed save operations
-        - save_dropped_count: save operations dropped due to queue limit
     """
 
     def __post_init__(self):
@@ -154,7 +153,6 @@ class PegaKVConnectorStats(KVConnectorStats):
             "load_failure_count": 0,
             "save_success_count": 0,
             "save_failure_count": 0,
-            "save_dropped_count": 0,
         }
 
     def record_load(self, duration_seconds: float, num_blocks: int, success: bool):
@@ -186,7 +184,6 @@ class PegaKVConnectorStats(KVConnectorStats):
             "load_failure_count",
             "save_success_count",
             "save_failure_count",
-            "save_dropped_count",
         ]:
             self.data[key] = self.data.get(key, 0) + other.data.get(key, 0)
 
@@ -248,7 +245,6 @@ class PegaKVConnectorStats(KVConnectorStats):
             result["avg_save_blocks"] = round(sum(save_blocks) / num_saves, 1)
         result["save_success_count"] = self.data.get("save_success_count", 0)
         result["save_failure_count"] = self.data.get("save_failure_count", 0)
-        result["save_dropped_count"] = self.data.get("save_dropped_count", 0)
 
         return result
 
@@ -263,7 +259,6 @@ class PegaKVConnectorStats(KVConnectorStats):
             and len(self.data.get("save_duration", [])) == 0
             and self.data.get("save_success_count", 0) == 0
             and self.data.get("save_failure_count", 0) == 0
-            and self.data.get("save_dropped_count", 0) == 0
         )
 
     def clone_and_reset(self) -> "PegaKVConnectorStats":
@@ -391,13 +386,6 @@ class PegaPromMetrics(KVConnectorPromMetrics):
         )
         self.counter_save_failure = _bind_metric_per_engine(self, counter_save_failure)
 
-        counter_save_dropped = self._counter_cls(
-            name="vllm:pega_save_dropped_total",
-            documentation="Number of save operations dropped due to queue limit.",
-            labelnames=labelnames,
-        )
-        self.counter_save_dropped = _bind_metric_per_engine(self, counter_save_dropped)
-
     def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0):
         """Record stats to Prometheus metrics."""
         # Gauge metrics (scheduler-side)
@@ -437,16 +425,13 @@ class PegaPromMetrics(KVConnectorPromMetrics):
         for blocks in transfer_stats_data.get("save_blocks", []):
             self.histogram_save_blocks[engine_idx].observe(blocks)
 
-        # Counter: save success/failure/dropped
+        # Counter: save success/failure
         save_success = transfer_stats_data.get("save_success_count", 0)
         if save_success > 0:
             self.counter_save_success[engine_idx].inc(save_success)
         save_failure = transfer_stats_data.get("save_failure_count", 0)
         if save_failure > 0:
             self.counter_save_failure[engine_idx].inc(save_failure)
-        save_dropped = transfer_stats_data.get("save_dropped_count", 0)
-        if save_dropped > 0:
-            self.counter_save_dropped[engine_idx].inc(save_dropped)
 
 
 __all__ = [
