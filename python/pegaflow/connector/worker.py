@@ -342,12 +342,13 @@ class WorkerConnector:
         load_start = time.perf_counter()
 
         all_block_ids: list[int] = []
-        all_block_hashes: list[bytes] = []
+        loads: list[tuple[bytes, list[int]]] = []
         request_ids: list[str] = []
 
         for req_id, load_intent in metadata.load_intents.items():
-            all_block_ids.extend(load_intent.block_ids)
-            all_block_hashes.extend(load_intent.block_hashes)
+            block_ids = list(load_intent.block_ids)
+            all_block_ids.extend(block_ids)
+            loads.append((load_intent.lease, block_ids))
             request_ids.append(req_id)
 
         if not all_block_ids:
@@ -374,8 +375,7 @@ class WorkerConnector:
                 self._ctx.device_id,
                 shm_name,
                 target_layers,
-                all_block_ids,
-                all_block_hashes,
+                loads,
             )
         except Exception as e:
             logger.error(
@@ -385,6 +385,7 @@ class WorkerConnector:
                 request_ids,
                 len(all_block_ids),
             )
+            self._release_load_leases(loads)
             self._record_load_failure(request_ids, all_block_ids, load_start)
             self._ctx.state_manager.mark_unavailable(f"load rpc exception: {e}")
             return
@@ -397,6 +398,7 @@ class WorkerConnector:
                 request_ids,
                 len(all_block_ids),
             )
+            self._release_load_leases(loads)
             self._record_load_failure(request_ids, all_block_ids, load_start)
             self._ctx.state_manager.mark_unavailable(f"load rpc failed: {message}")
             return
@@ -433,6 +435,20 @@ class WorkerConnector:
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         pass
+
+    def _release_load_leases(self, loads: list[tuple[bytes, list[int]]]) -> None:
+        seen: set[bytes] = set()
+        for lease, _block_ids in loads:
+            if not lease or lease in seen:
+                continue
+            seen.add(lease)
+            try:
+                self._ctx.engine_client.release(lease)
+            except Exception:
+                logger.exception(
+                    "[PegaKVConnector] load failure lease release exception: lease_len=%d",
+                    len(lease),
+                )
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """Return block IDs whose load failed since the last call, then clear.

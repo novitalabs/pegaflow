@@ -16,7 +16,7 @@ from pegaflow.connector.common import (
     logger,
 )
 from pegaflow.connector.connector_metrics import PrefetchTracker
-from pegaflow.pegaflow import PegaFlowBusinessError, PegaFlowServiceError
+from pegaflow.pegaflow import QueryLoading, QueryReady
 
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -30,10 +30,10 @@ class _PendingQueryProbe:
     computed_blocks: int
     remaining_hashes: tuple[bytes, ...]
     hit_blocks: int
-    release_refs_per_hash: int
+    lease: bytes
 
     @property
-    def pinned_hashes(self) -> tuple[bytes, ...]:
+    def leased_hashes(self) -> tuple[bytes, ...]:
         return self.remaining_hashes[: self.hit_blocks]
 
 
@@ -47,7 +47,6 @@ class SchedulerConnector:
         self._pending_load_intents: dict[str, LoadIntent] = {}
         self._prefetch_start_times: dict[str, float] = {}
         self._pending_query_probes: dict[str, _PendingQueryProbe] = {}
-        self._pending_query_probe_releases: dict[str, _PendingQueryProbe] = {}
 
         # Prefetch tracking (for metrics)
         self._prefetch_tracker = PrefetchTracker()
@@ -74,8 +73,6 @@ class SchedulerConnector:
         num_computed_tokens: int,
     ) -> tuple[int | None, bool]:
         req_id = request.request_id
-        if not self._drain_pending_query_probe_releases(req_id):
-            return (None, False)
 
         num_tokens = request.num_tokens
         block_hashes = request.block_hashes
@@ -88,8 +85,7 @@ class SchedulerConnector:
         remaining_hashes = block_hashes[computed_blocks:]
 
         if not remaining_hashes:
-            if not self._release_pending_query_probe(req_id):
-                return (None, False)
+            self._release_pending_query_probe(req_id)
             self._external_matched_blocks[req_id] = computed_blocks
             return (0, False)
 
@@ -115,25 +111,30 @@ class SchedulerConnector:
             )
             return (num_hit_tokens, True)
 
-        if pending_probe is not None and not self._release_pending_query_probe(req_id):
-            return (None, False)
+        old_probe = pending_probe
 
         lookup_start = time.perf_counter()
-        hit_blocks = self._count_available_block_prefix(remaining_hashes, req_id)
+        ready = self._count_available_block_prefix(remaining_hashes, req_id)
         lookup_end = time.perf_counter()
         elapsed_us = (lookup_end - lookup_start) * 1e6
 
         # Prefetch in progress - tell scheduler to retry later
-        if hit_blocks is None:
+        if ready is None:
             return (None, False)
 
+        hit_blocks = ready.num_hit_blocks
         if hit_blocks > 0:
             self._pending_query_probes[req_id] = _PendingQueryProbe(
                 computed_blocks=computed_blocks,
                 remaining_hashes=remaining_hashes_tuple,
                 hit_blocks=hit_blocks,
-                release_refs_per_hash=max(1, self._ctx.world_size),
+                lease=ready.lease,
             )
+        else:
+            self._pending_query_probes.pop(req_id, None)
+
+        if old_probe is not None:
+            self._release_query_probe(req_id, old_probe)
 
         self._external_matched_blocks[req_id] = computed_blocks + hit_blocks
 
@@ -196,20 +197,23 @@ class SchedulerConnector:
                 f"expected={expected_load_blocks}"
             )
 
+            pending_probe = self._pending_query_probes.get(req_id)
             load_intent = LoadIntent(
                 block_ids=tuple(block_ids[start_block_idx:]),
-                block_hashes=tuple(
-                    self._block_hashes[req_id][start_block_idx : start_block_idx + num_load_blocks]
-                ),
+                lease=pending_probe.lease if pending_probe is not None else b"",
                 num_tokens=num_external_tokens,
             )
-            pending_probe = self._pending_query_probes.get(req_id)
             if (
                 pending_probe is not None
-                and load_intent.block_hashes != pending_probe.pinned_hashes
+                and tuple(
+                    self._block_hashes[req_id][start_block_idx : start_block_idx + num_load_blocks]
+                )
+                != pending_probe.leased_hashes
             ):
                 self._release_pending_query_probe(req_id)
                 raise RuntimeError(f"req {req_id} load hashes do not match pending query probe")
+            if not load_intent.lease:
+                raise RuntimeError(f"req {req_id} missing query lease for external load")
             self._pending_load_intents[req_id] = load_intent
             self._pending_query_probes.pop(req_id, None)
             logger.debug(
@@ -225,8 +229,6 @@ class SchedulerConnector:
             )
 
     def build_connector_meta(self, scheduler_output: "SchedulerOutput") -> PegaConnectorMetadata:
-        self._drain_pending_query_probe_releases()
-
         # Collect all save intents that became available this scheduler step.
         potential_saves: dict[str, SaveIntent] = {}
 
@@ -384,107 +386,54 @@ class SchedulerConnector:
 
     def _count_available_block_prefix(
         self, block_hashes: Iterable[bytes], req_id: str
-    ) -> int | None:
-        """Query available blocks with prefetch support and fault tolerance.
+    ) -> QueryReady | None:
+        """Query available blocks with prefetch support.
 
         Returns:
-            int: Number of blocks ready in cache (proceed with this)
+            QueryReady: Ready block count and lease
             None: Blocks are being prefetched from DFS, retry later
-
-        Fault tolerance:
-            - If service unavailable, returns 0 (no cache hits)
-            - Any exception marks service unavailable and returns 0
         """
-        # Check service availability first
-        if not self._ctx.state_manager.is_available():
-            return 0
-
         block_hash_list = list(block_hashes)
-        try:
-            result = self._ctx.engine_client.query_prefetch(
-                self._ctx.instance_id,
-                block_hash_list,
-                req_id=req_id,
-            )
-        except PegaFlowServiceError as e:
-            # Service error (network/internal) - mark unavailable
-            self._ctx.state_manager.mark_unavailable(str(e))
-            return 0
-        except PegaFlowBusinessError as e:
-            # Business error (invalid args, etc.) - log details and propagate
-            logger.error(
-                "[PegaKVConnector] Query business error: %s, "
-                "req_id=%s, instance_id=%s, num_blocks=%d",
-                e,
-                req_id,
-                self._ctx.instance_id,
-                len(block_hash_list),
-            )
-            raise
+        result = self._ctx.engine_client.query_prefetch(
+            self._ctx.instance_id,
+            block_hash_list,
+            req_id=req_id,
+        )
 
-        # Handle new dict response format
-        if isinstance(result, dict):
-            ok = result["ok"]
-            message = result["message"]
-            hit_blocks = result["hit_blocks"]
-            prefetch_state = result["prefetch_state"]
-            if prefetch_state not in {"done", "loading"}:
-                raise RuntimeError(
-                    "query_prefetch response field 'prefetch_state' must be "
-                    f"'done' or 'loading', got {prefetch_state!r}"
-                )
-
-            if not ok:
-                # Response-level errors are treated as business errors
-                logger.error(
-                    "[PegaKVConnector] Query failed: %s, req_id=%s, instance_id=%s, num_blocks=%d",
-                    message,
-                    req_id,
-                    self._ctx.instance_id,
-                    len(block_hash_list),
-                )
-                raise RuntimeError(f"Query failed: {message}")
-
-            if prefetch_state == "loading":
-                # Record first time we see loading state
-                if req_id not in self._prefetch_start_times:
-                    self._prefetch_start_times[req_id] = time.perf_counter()
-                    self._prefetch_tracker.on_prefetch_start()
-                    logger.debug(
-                        "[PegaKVConnector] Prefetch started: req=%s pending_prefetches=%d",
-                        req_id,
-                        self._prefetch_tracker.pending_prefetches,
-                    )
-                return None  # Signal scheduler to retry later
-
-            # Prefetch done - log duration if we were tracking
-            if req_id in self._prefetch_start_times:
-                prefetch_duration_ms = (
-                    time.perf_counter() - self._prefetch_start_times.pop(req_id)
-                ) * 1000
-                self._prefetch_tracker.on_prefetch_complete(prefetch_duration_ms, hit_blocks)
-
+        if isinstance(result, QueryLoading):
+            if req_id not in self._prefetch_start_times:
+                self._prefetch_start_times[req_id] = time.perf_counter()
+                self._prefetch_tracker.on_prefetch_start()
                 logger.debug(
-                    "[PegaKVConnector] Prefetch completed: req=%s hit_blocks=%d "
-                    "prefetch_duration_ms=%.2f pending_prefetches=%d",
+                    "[PegaKVConnector] Prefetch started: req=%s pending_prefetches=%d",
                     req_id,
-                    hit_blocks,
-                    prefetch_duration_ms,
                     self._prefetch_tracker.pending_prefetches,
                 )
+            return None
 
-            return hit_blocks
+        if not isinstance(result, QueryReady):
+            raise TypeError(f"query_prefetch returned unexpected outcome {type(result)!r}")
 
-        # Legacy tuple response format (ok, message, hit_blocks)
-        ok, message, hit_blocks = result
-        if not ok:
-            raise RuntimeError(f"Query failed: {message}")
-        return hit_blocks
+        hit_blocks = result.num_hit_blocks
+        if req_id in self._prefetch_start_times:
+            prefetch_duration_ms = (
+                time.perf_counter() - self._prefetch_start_times.pop(req_id)
+            ) * 1000
+            self._prefetch_tracker.on_prefetch_complete(prefetch_duration_ms, hit_blocks)
+
+            logger.debug(
+                "[PegaKVConnector] Prefetch completed: req=%s hit_blocks=%d "
+                "prefetch_duration_ms=%.2f pending_prefetches=%d",
+                req_id,
+                hit_blocks,
+                prefetch_duration_ms,
+                self._prefetch_tracker.pending_prefetches,
+            )
+
+        return result
 
     def get_stats(self) -> PegaKVConnectorStats | None:
         """Get current connector stats for metrics exposure."""
-        self._drain_pending_query_probe_releases()
-
         # Get stats from prefetch tracker
         prefetch_stats = self._prefetch_tracker.get_stats()
 
@@ -502,66 +451,24 @@ class SchedulerConnector:
     def shutdown(self) -> None:
         for req_id in list(self._pending_query_probes):
             self._release_pending_query_probe(req_id)
-        self._drain_pending_query_probe_releases()
 
     def _release_pending_query_probe(self, req_id: str) -> bool:
         probe = self._pending_query_probes.pop(req_id, None)
         if probe is None:
-            return self._drain_pending_query_probe_releases(req_id)
-
-        remaining_probe = self._unpin_query_probe_refs(req_id, probe)
-        if remaining_probe is None:
             return True
 
-        self._pending_query_probe_releases[req_id] = remaining_probe
-        return False
+        return self._release_query_probe(req_id, probe)
 
-    def _drain_pending_query_probe_releases(self, req_id: str | None = None) -> bool:
-        req_ids = [req_id] if req_id is not None else list(self._pending_query_probe_releases)
-        all_released = True
-        for release_req_id in req_ids:
-            probe = self._pending_query_probe_releases.pop(release_req_id, None)
-            if probe is None:
-                continue
-
-            remaining_probe = self._unpin_query_probe_refs(release_req_id, probe)
-            if remaining_probe is not None:
-                self._pending_query_probe_releases[release_req_id] = remaining_probe
-                all_released = False
-
-        return all_released
-
-    def _unpin_query_probe_refs(
-        self,
-        req_id: str,
-        probe: _PendingQueryProbe,
-    ) -> _PendingQueryProbe | None:
-        pinned_hashes = probe.pinned_hashes
-        if not pinned_hashes:
-            return None
-
-        pinned_hash_list = list(pinned_hashes)
+    def _release_query_probe(self, req_id: str, probe: _PendingQueryProbe) -> bool:
         try:
-            ok, message = self._ctx.engine_client.unpin(
-                self._ctx.instance_id,
-                pinned_hash_list,
-                probe.release_refs_per_hash,
-            )
-            if ok:
-                return None
-            logger.warning(
-                "[PegaKVConnector] pending query unpin failed: req=%s message=%s",
+            self._ctx.engine_client.release(probe.lease)
+        except Exception:
+            logger.exception(
+                "[PegaKVConnector] pending query lease release exception: req=%s",
                 req_id,
-                message,
             )
-        except Exception as e:
-            logger.warning(
-                "[PegaKVConnector] pending query unpin exception: req=%s error=%s",
-                req_id,
-                e,
-            )
-
-        return probe
+            return False
+        return True
 
 
 __all__ = ["SchedulerConnector"]

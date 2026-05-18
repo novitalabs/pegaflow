@@ -18,8 +18,9 @@ async fn save_query_load_roundtrip() {
 
     env.save_and_wait(&hashes).await;
     env.data().zero_gpu();
-    env.assert_all_hit_and_pin(&hashes).await;
-    env.load_to_gpu(&hashes).await;
+    let lease = env.assert_all_hit_lease(&hashes).await;
+
+    env.load_to_gpu(lease, hashes.len()).await;
     env.data().assert_gpu_matches_expected();
 }
 
@@ -37,8 +38,9 @@ async fn save_query_load_roundtrip_with_numa() {
 
     env.save_and_wait(&hashes).await;
     env.data().zero_gpu();
-    env.assert_all_hit_and_pin(&hashes).await;
-    env.load_to_gpu(&hashes).await;
+    let lease = env.assert_all_hit_lease(&hashes).await;
+
+    env.load_to_gpu(lease, hashes.len()).await;
     env.data().assert_gpu_matches_expected();
 }
 
@@ -53,7 +55,7 @@ async fn save_deduplicates_cached_blocks() {
     env.save_and_wait(&hashes).await;
     env.save_layer(0, &hashes).await; // second save — should dedup
 
-    assert_eq!(env.count_hits_then_unpin(&hashes).await, 4);
+    assert_eq!(env.count_hits_then_release(&hashes).await, 4);
 }
 
 /// Multi-layer: hash becomes hittable only after ALL layers are saved.
@@ -69,7 +71,7 @@ async fn multi_layer_partial_save_no_hit() {
     env.save_layer(0, &hashes).await;
     env.wait_cached().await;
     assert_eq!(
-        env.count_hits_then_unpin(&hashes).await,
+        env.count_hits_then_release(&hashes).await,
         0,
         "partial save must not expose as hit"
     );
@@ -77,7 +79,7 @@ async fn multi_layer_partial_save_no_hit() {
     // Save layer 1 — now all hit.
     env.save_layer(1, &hashes).await;
     env.wait_cached().await;
-    assert_eq!(env.count_hits_then_unpin(&hashes).await, 4);
+    assert_eq!(env.count_hits_then_release(&hashes).await, 4);
 }
 
 /// Split-storage (K/V separated) round-trip with data integrity check.
@@ -91,8 +93,9 @@ async fn save_query_load_roundtrip_split_storage() {
 
     env.save_and_wait(&hashes).await;
     env.data().zero_gpu();
-    env.assert_all_hit_and_pin(&hashes).await;
-    env.load_to_gpu(&hashes).await;
+    let lease = env.assert_all_hit_lease(&hashes).await;
+
+    env.load_to_gpu(lease, hashes.len()).await;
     env.data().assert_gpu_matches_expected();
 }
 
@@ -109,7 +112,7 @@ async fn namespace_isolation() {
 
     a.save_and_wait(&hashes).await;
     assert_eq!(
-        b.count_hits_then_unpin(&hashes).await,
+        b.count_hits_then_release(&hashes).await,
         0,
         "namespace isolation violated"
     );

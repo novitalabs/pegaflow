@@ -32,7 +32,8 @@ class VLLMServer:
         pipeline_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.8,
         extra_args: list[str] | None = None,
-        startup_timeout: int = 180,
+        startup_timeout: int = 600,
+        use_noop_connector: bool = False,
     ):
         self.model = model
         self.port = port
@@ -45,6 +46,7 @@ class VLLMServer:
         self.gpu_memory_utilization = gpu_memory_utilization
         self.extra_args = extra_args or []
         self.startup_timeout = startup_timeout
+        self.use_noop_connector = use_noop_connector
         self.health_endpoints = ["/health", "/v1/models"]
         self.process: subprocess.Popen | None = None
         self.log_handle = None
@@ -95,9 +97,10 @@ class VLLMServer:
         if self.max_model_len is not None:
             cmd.extend(["--max-model-len", str(self.max_model_len)])
 
-        if self.use_pegaflow:
+        if self.use_pegaflow or self.use_noop_connector:
+            connector_name = "PegaKVConnector" if self.use_pegaflow else "NoopKVConnector"
             kv_config = {
-                "kv_connector": "PegaKVConnector",
+                "kv_connector": connector_name,
                 "kv_role": "kv_both",
                 "kv_connector_module_path": "pegaflow.connector",
             }

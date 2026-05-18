@@ -4,8 +4,6 @@ This module provides high-performance KV cache storage and gRPC client
 for distributed LLM inference with vLLM.
 """
 
-from typing import Any
-
 __version__: str
 
 # Custom exceptions for error classification
@@ -15,23 +13,18 @@ class PegaFlowError(Exception):
 
     ...
 
-class PegaFlowServiceError(PegaFlowError):
-    """Service errors indicating server unavailability.
-
-    These errors should trigger health checks and retry logic.
-    Includes: UNAVAILABLE, DEADLINE_EXCEEDED, INTERNAL, ABORTED, CANCELLED.
-    """
+class PegaflowInternal(PegaFlowError):
+    """Internal server error."""
 
     ...
 
-class PegaFlowBusinessError(PegaFlowError):
-    """Business logic errors from the application layer.
+class QueryLoading:
+    def __init__(self) -> None: ...
 
-    These errors indicate invalid requests or state and should be propagated.
-    Includes: INVALID_ARGUMENT, FAILED_PRECONDITION, NOT_FOUND.
-    """
-
-    ...
+class QueryReady:
+    num_hit_blocks: int
+    lease: bytes
+    def __init__(self, num_hit_blocks: int, lease: bytes) -> None: ...
 
 class EngineRpcClient:
     """gRPC client for remote PegaEngine server communication.
@@ -47,7 +40,7 @@ class EngineRpcClient:
             endpoint: gRPC server endpoint (default: "http://127.0.0.1:50055").
 
         Raises:
-            PegaFlowServiceError: If connection to the server fails.
+            PegaFlowError: If connection to the server fails.
         """
         ...
 
@@ -106,8 +99,8 @@ class EngineRpcClient:
             Tuple of (ok, message) indicating success/failure.
 
         Raises:
-            PegaFlowServiceError: If server is unavailable.
-            PegaFlowBusinessError: If request is invalid.
+            PegaFlowError: If server is unavailable.
+            ValueError: If request is invalid.
         """
         ...
 
@@ -133,8 +126,8 @@ class EngineRpcClient:
             Tuple of (ok, message) indicating success/failure.
 
         Raises:
-            PegaFlowServiceError: If server is unavailable.
-            PegaFlowBusinessError: If request is invalid.
+            PegaFlowError: If server is unavailable.
+            ValueError: If request is invalid.
         """
         ...
 
@@ -145,8 +138,7 @@ class EngineRpcClient:
         device_id: int,
         load_state_shm: str,
         layer_names: list[str],
-        block_ids: list[int],
-        block_hashes: list[bytes],
+        loads: list[tuple[bytes, list[int]]],
     ) -> tuple[bool, str]:
         """Load KV blocks from the engine.
 
@@ -156,15 +148,14 @@ class EngineRpcClient:
             device_id: CUDA device ID.
             load_state_shm: Shared memory name from PyLoadState.shm_name().
             layer_names: List of layer names to load.
-            block_ids: GPU block IDs to load into.
-            block_hashes: Content hashes for blocks.
+            loads: List of (lease, destination block IDs) pairs.
 
         Returns:
             Tuple of (ok, message) indicating success/failure.
 
         Raises:
-            PegaFlowServiceError: If server is unavailable.
-            PegaFlowBusinessError: If request is invalid.
+            PegaFlowError: If server is unavailable.
+            ValueError: If request is invalid.
         """
         ...
 
@@ -173,11 +164,11 @@ class EngineRpcClient:
         instance_id: str,
         block_hashes: list[bytes],
         req_id: str,
-    ) -> dict[str, Any]:
+    ) -> QueryLoading | QueryReady:
         """Query prefix cache hits with SSD prefetch support.
 
         Checks memory cache and triggers SSD prefetch for missing blocks.
-        Pins hit blocks for subsequent load operations.
+        Ready hits are owned by an opaque lease consumed by load or release.
 
         Args:
             instance_id: Model instance ID.
@@ -185,42 +176,25 @@ class EngineRpcClient:
             req_id: Request ID for tracking and prefetch correlation.
 
         Returns:
-            Dict with keys:
-                - ok (bool): Whether the request succeeded.
-                - message (str): Error message if failed.
-                - hit_blocks (int): Number of blocks ready in cache.
-                - prefetch_state (str): One of "done", "loading".
-                - loading_blocks (int): Number of blocks being prefetched from SSD.
-                - missing_blocks (int): Number of blocks not found anywhere.
+            QueryLoading while backing fetch is in progress, otherwise QueryReady.
 
         Raises:
-            PegaFlowServiceError: If server is unavailable.
-            PegaFlowBusinessError: If request is invalid.
+            PegaFlowError: If server is unavailable.
+            ValueError: If request is invalid.
         """
         ...
 
-    def unpin(
+    def release(
         self,
-        instance_id: str,
-        block_hashes: list[bytes],
-        release_refs_per_hash: int,
-    ) -> tuple[bool, str]:
-        """Unpin blocks that were pinned during query.
-
-        Call this when load is cancelled or preempted before consumption
-        to release pinned blocks and prevent memory leaks.
+        lease: bytes,
+    ) -> None:
+        """Release a query lease.
 
         Args:
-            instance_id: Model instance ID.
-            block_hashes: List of block hashes to unpin.
-            release_refs_per_hash: Number of pin refs to release for each hash.
-
-        Returns:
-            Tuple of (ok, message) indicating success/failure.
+            lease: Opaque lease returned by QueryReady.
 
         Raises:
-            PegaFlowServiceError: If server is unavailable.
-            PegaFlowBusinessError: If request is invalid.
+            PegaFlowError: If server is unavailable.
         """
         ...
 
@@ -234,8 +208,8 @@ class EngineRpcClient:
             Tuple of (ok, message) indicating success/failure.
 
         Raises:
-            PegaFlowServiceError: If server is unavailable.
-            PegaFlowBusinessError: If request is invalid.
+            PegaFlowError: If server is unavailable.
+            ValueError: If request is invalid.
         """
         ...
 
@@ -246,7 +220,7 @@ class EngineRpcClient:
             Tuple of (ok, message) indicating success/failure.
 
         Raises:
-            PegaFlowServiceError: If server is unavailable.
+            PegaFlowError: If server is unavailable.
         """
         ...
 
@@ -271,8 +245,8 @@ class EngineRpcClient:
         session and the old one becomes a no-op on close.
 
         Raises:
-            PegaFlowServiceError: If the server is unavailable.
-            PegaFlowBusinessError: If the request is rejected.
+            PegaFlowError: If the server is unavailable.
+            ValueError: If the request is rejected.
         """
         ...
 

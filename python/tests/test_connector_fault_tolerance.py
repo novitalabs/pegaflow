@@ -42,6 +42,7 @@ class FakeEngineClient:
         self.fail_load_with_ok_false = False
         self.fail_load_with_exception: Exception | None = None
         self.load_calls: list[tuple] = []
+        self.release_calls: list[bytes] = []
 
     def load(
         self,
@@ -50,9 +51,9 @@ class FakeEngineClient:
         device_id: int,
         load_state_shm: str,
         layer_names,
-        block_ids,
-        block_hashes,
+        loads,
     ) -> tuple[bool, str]:
+        block_ids = [block_id for _, ids in loads for block_id in ids]
         self.load_calls.append(
             (
                 instance_id,
@@ -74,6 +75,9 @@ class FakeEngineClient:
 
     def unregister_context(self, instance_id: str) -> tuple[bool, str]:
         return (True, "ok")
+
+    def release(self, lease: bytes) -> None:
+        self.release_calls.append(lease)
 
 
 def _make_worker() -> tuple[WorkerConnector, FakeEngineClient, MagicMock]:
@@ -111,7 +115,7 @@ def _load_metadata(req_id: str, block_ids: tuple[int, ...]) -> PegaConnectorMeta
         load_intents={
             req_id: LoadIntent(
                 block_ids=block_ids,
-                block_hashes=tuple(f"h{b}".encode() for b in block_ids),
+                lease=f"lease-{req_id}".encode(),
                 num_tokens=len(block_ids) * 16,
             )
         }
@@ -150,6 +154,7 @@ def test_load_rpc_failure_reports_failures_without_raise(
     assert finished_recving == {req_id}
 
     assert state_mgr.mark_unavailable.called
+    assert client.release_calls == [f"lease-{req_id}".encode()]
 
     assert worker._pending_loads == {}
     assert worker._pending_load_reqs == {}

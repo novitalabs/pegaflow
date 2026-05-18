@@ -2,6 +2,7 @@
 // Block types for StorageEngine
 // ============================================================================
 
+use std::fmt;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::time::Instant;
@@ -25,31 +26,32 @@ pub struct LayerSave {
 }
 
 // ============================================================================
-// Block Status and Prefetch Status
+// Prefetch Status
 // ============================================================================
 
-/// Status of a block in the storage hierarchy
-#[derive(Debug, Clone)]
-pub enum BlockStatus {
-    /// Block is in memory cache, ready to use
-    Cached,
-    /// Block is being written (inflight)
-    Inflight,
-    /// Block is being prefetched from SSD
-    Prefetching,
-    /// Block exists in SSD, can trigger prefetch
-    InSsd,
-    /// Block not found anywhere
-    Miss,
-}
-
 /// Result of checking prefix hits with SSD prefetch support
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum PrefetchStatus {
     /// Blocks are being prefetched - caller should retry
-    Loading { hit: usize, loading: usize },
-    /// Terminal state: hit/missing counts final (missing=0 means full hit)
-    Done { hit: usize, missing: usize },
+    Loading,
+    /// Terminal state: all ready prefix blocks are owned by the caller.
+    Ready {
+        blocks: Vec<Arc<SealedBlock>>,
+        missing: usize,
+    },
+}
+
+impl fmt::Debug for PrefetchStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Loading => f.write_str("Loading"),
+            Self::Ready { blocks, missing } => f
+                .debug_struct("Ready")
+                .field("blocks", &blocks.len())
+                .field("missing", missing)
+                .finish(),
+        }
+    }
 }
 
 // ============================================================================

@@ -18,21 +18,20 @@ pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
 
 @pytest.mark.parametrize(
-    ("case", "hash_count", "expected_missing"),
+    ("case", "hash_count"),
     [
-        pytest.param("empty_query", 0, 0, id="empty_query"),
-        pytest.param("unknown_hashes", 5, 5, id="unknown_hashes"),
+        pytest.param("empty_query", 0, id="empty_query"),
+        pytest.param("unknown_hashes", 5, id="unknown_hashes"),
     ],
 )
-def test_query_prefetch_miss_contract(
+def test_query_prefetch_ready_zero_contract(
     case: str,
     hash_count: int,
-    expected_missing: int,
     engine_client,
     registered_instance: str,
     block_hashes: list[bytes],
 ):
-    """A fresh server query returns a concrete miss contract, not only connectivity."""
+    """A fresh server query returns Ready(0), not a dict or miss sentinel."""
     requested_hashes = block_hashes[:hash_count]
 
     result = engine_client.query_prefetch(
@@ -41,11 +40,5 @@ def test_query_prefetch_miss_contract(
         req_id=f"query-contract-{case}",
     )
 
-    assert result == {
-        "ok": True,
-        "message": "",
-        "hit_blocks": 0,
-        "prefetch_state": "done",
-        "loading_blocks": 0,
-        "missing_blocks": expected_missing,
-    }
+    assert result.num_hit_blocks == 0
+    assert result.lease == b""

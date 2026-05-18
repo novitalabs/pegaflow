@@ -8,10 +8,11 @@ This package provides:
 try:
     from .pegaflow import (
         EngineRpcClient,
-        PegaFlowBusinessError,
         PegaFlowError,
-        PegaFlowServiceError,
+        PegaflowInternal,
         PyLoadState,
+        QueryLoading,
+        QueryReady,
     )
     from .pegaflow import __version__ as _rust_version
 except ImportError:
@@ -24,8 +25,9 @@ __version__ = _rust_version
 __all__ = [
     "__version__",
     "EngineRpcClient",
-    "PegaFlowBusinessError",
     "PegaFlowError",
-    "PegaFlowServiceError",
+    "PegaflowInternal",
     "PyLoadState",
+    "QueryLoading",
+    "QueryReady",
 ]

@@ -3,20 +3,20 @@ use pegaflow_core::{trace_in_span, trace_root};
 use crate::metric::record_rpc_result;
 use crate::proto::engine::engine_server::Engine;
 use crate::proto::engine::{
-    HealthRequest, HealthResponse, LoadRequest, LoadResponse, PrefetchState,
-    QueryBlocksForTransferRequest, QueryBlocksForTransferResponse, QueryRequest, QueryResponse,
+    HealthRequest, HealthResponse, LoadRequest, LoadResponse, QueryBlocksForTransferRequest,
+    QueryBlocksForTransferResponse, QueryLoading, QueryReady, QueryRequest, QueryResponse,
     RdmaHandshakeRequest, RdmaHandshakeResponse, RegisterContextRequest, RegisterContextResponse,
-    ReleaseTransferLockRequest, ReleaseTransferLockResponse, ResponseStatus, SaveRequest,
-    SaveResponse, SessionEvent, SessionRequest, ShutdownRequest, ShutdownResponse,
-    TransferBlockInfo, TransferSlotInfo, UnpinRequest, UnpinResponse, UnregisterRequest,
-    UnregisterResponse,
+    ReleaseRequest, ReleaseResponse, ReleaseTransferLockRequest, ReleaseTransferLockResponse,
+    ResponseStatus, SaveRequest, SaveResponse, SessionEvent, SessionRequest, ShutdownRequest,
+    ShutdownResponse, TransferBlockInfo, TransferSlotInfo, UnregisterRequest, UnregisterResponse,
+    query_response,
 };
 use crate::registry::CudaTensorRegistry;
 use crate::session::SessionRegistry;
 use log::{debug, info, warn};
 use parking_lot::Mutex;
 use pegaflow_common::NumaNode;
-use pegaflow_core::{EngineError, LayerSave, PegaEngine, PrefetchStatus};
+use pegaflow_core::{EngineError, LayerSave, PegaEngine, PrefetchStatus, QueryLeaseId};
 use pyo3::{PyErr, Python};
 use std::sync::Arc;
 use std::time::Instant;
@@ -126,17 +126,6 @@ impl GrpcEngineService {
 
     fn build_simple_response() -> ResponseStatus {
         Self::ok_status()
-    }
-
-    fn validate_load_request(block_ids: &[i32], block_hashes: &[Vec<u8>]) -> Result<(), Status> {
-        if block_ids.len() != block_hashes.len() {
-            return Err(Status::invalid_argument(format!(
-                "block_ids and block_hashes must have the same length (got {} and {})",
-                block_ids.len(),
-                block_hashes.len()
-            )));
-        }
-        Ok(())
     }
 
     fn build_transfer_slot_info(
@@ -437,8 +426,8 @@ impl Engine for GrpcEngineService {
 
         let req = request.into_inner();
         let layer_count = req.layer_names.len();
-        let block_count = req.block_ids.len();
-        let hash_count = req.block_hashes.len();
+        let load_count = req.loads.len();
+        let block_count: usize = req.loads.iter().map(|load| load.block_ids.len()).sum();
 
         trace_root!("rpc.load", root, || {
             [
@@ -454,24 +443,30 @@ impl Engine for GrpcEngineService {
                 tp_rank,
                 device_id,
                 layer_names,
-                block_ids,
-                block_hashes,
+                loads,
                 load_state_shm,
                 ..
             } = req;
             let tp_rank = Self::usize_from_u32(tp_rank, "tp_rank")?;
             debug!(
-                "RPC [load]: instance_id={} tp_rank={} device_id={} layers={} block_ids={} block_hashes={} load_state_shm_len={}",
+                "RPC [load]: instance_id={} tp_rank={} device_id={} layers={} loads={} blocks={} load_state_shm_len={}",
                 instance_id,
                 tp_rank,
                 device_id,
                 layer_count,
+                load_count,
                 block_count,
-                hash_count,
                 load_state_shm.len()
             );
-            Self::validate_load_request(&block_ids, &block_hashes)?;
             let layer_refs: Vec<&str> = layer_names.iter().map(|s| s.as_str()).collect();
+            let loads: Vec<(QueryLeaseId, Vec<i32>)> = loads
+                .into_iter()
+                .map(|load| {
+                    QueryLeaseId::from_bytes(&load.lease)
+                        .map(|lease| (lease, load.block_ids))
+                        .map_err(Status::invalid_argument)
+                })
+                .collect::<Result<_, _>>()?;
 
             self.engine
                 .batch_load_kv_blocks_multi_layer(
@@ -480,8 +475,7 @@ impl Engine for GrpcEngineService {
                     device_id,
                     &load_state_shm,
                     &layer_refs,
-                    &block_ids,
-                    &block_hashes,
+                    &loads,
                 )
                 .map_err(Self::map_engine_error)?;
 
@@ -540,27 +534,38 @@ impl Engine for GrpcEngineService {
                 .await
                 .map_err(Self::map_engine_error)?;
 
-            let (prefetch_state, hit_blocks, loading_blocks, missing_blocks) = match status {
-                PrefetchStatus::Done { hit, missing } => {
+            let outcome = match status {
+                PrefetchStatus::Ready { blocks, missing } => {
+                    let hit = blocks.len();
                     if let Ok(mut t) = self.hll_tracker.lock() {
                         t.record_hashes(&req.block_hashes);
                     }
-                    (PrefetchState::PrefetchDone, hit as u64, 0, missing as u64)
+                    let lease = if hit == 0 {
+                        Vec::new()
+                    } else {
+                        self.engine
+                            .create_query_lease(&req.instance_id, blocks)
+                            .map_err(Self::map_engine_error)?
+                            .to_bytes()
+                            .to_vec()
+                    };
+                    debug!(
+                        "RPC [query_prefetch] ready: instance_id={} hit={} missing={} lease={}",
+                        req.instance_id,
+                        hit,
+                        missing,
+                        !lease.is_empty()
+                    );
+                    query_response::Outcome::Ready(QueryReady {
+                        num_hit_blocks: hit as u64,
+                        lease,
+                    })
                 }
-                PrefetchStatus::Loading { hit, loading } => (
-                    PrefetchState::PrefetchLoading,
-                    hit as u64,
-                    loading as u64,
-                    0,
-                ),
+                PrefetchStatus::Loading => query_response::Outcome::Loading(QueryLoading {}),
             };
 
             Ok(Response::new(QueryResponse {
-                status: Some(Self::build_simple_response()),
-                hit_blocks,
-                prefetch_state: prefetch_state.into(),
-                loading_blocks,
-                missing_blocks,
+                outcome: Some(outcome),
             }))
         };
 
@@ -570,13 +575,22 @@ impl Engine for GrpcEngineService {
         match &result {
             Ok(response) => {
                 let resp = response.get_ref();
-                let state = PrefetchState::try_from(resp.prefetch_state)
-                    .map(|s| format!("{:?}", s))
-                    .unwrap_or_else(|_| format!("Unknown({})", resp.prefetch_state));
-                debug!(
-                    "RPC [query_prefetch] completed: ok hit={} loading={} missing={} state={} elapsed_ms={:.2}",
-                    resp.hit_blocks, resp.loading_blocks, resp.missing_blocks, state, elapsed_ms
-                );
+                match &resp.outcome {
+                    Some(query_response::Outcome::Ready(ready)) => debug!(
+                        "RPC [query_prefetch] completed: ready hit={} lease={} elapsed_ms={:.2}",
+                        ready.num_hit_blocks,
+                        !ready.lease.is_empty(),
+                        elapsed_ms
+                    ),
+                    Some(query_response::Outcome::Loading(_)) => debug!(
+                        "RPC [query_prefetch] completed: loading elapsed_ms={:.2}",
+                        elapsed_ms
+                    ),
+                    None => warn!(
+                        "RPC [query_prefetch] completed without outcome elapsed_ms={:.2}",
+                        elapsed_ms
+                    ),
+                }
             }
             Err(status) => warn!(
                 "RPC [query_prefetch] failed: code={} message={} elapsed_ms={:.2}",
@@ -589,45 +603,41 @@ impl Engine for GrpcEngineService {
         result
     }
 
-    async fn unpin(
+    async fn release(
         &self,
-        request: Request<UnpinRequest>,
-    ) -> Result<Response<UnpinResponse>, Status> {
+        request: Request<ReleaseRequest>,
+    ) -> Result<Response<ReleaseResponse>, Status> {
         let start = Instant::now();
         let req = request.into_inner();
-        let hash_count = req.block_hashes.len();
-        let release_refs_per_hash = req.release_refs_per_hash as usize;
+        let lease_len = req.lease.len();
 
-        let result: Result<Response<UnpinResponse>, Status> = async {
-            debug!(
-                "RPC [unpin]: instance_id={} block_hashes={} release_refs_per_hash={}",
-                req.instance_id, hash_count, release_refs_per_hash
-            );
+        let result: Result<Response<ReleaseResponse>, Status> = async {
+            debug!("RPC [release]: lease_len={}", lease_len);
 
-            self.engine
-                .unpin_block_refs(&req.instance_id, &req.block_hashes, release_refs_per_hash)
-                .map_err(Self::map_engine_error)?;
+            if !req.lease.is_empty() {
+                let lease =
+                    QueryLeaseId::from_bytes(&req.lease).map_err(Status::invalid_argument)?;
+                self.engine.release_query_lease(&lease);
+            }
 
-            Ok(Response::new(UnpinResponse {
-                status: Some(Self::build_simple_response()),
-            }))
+            Ok(Response::new(ReleaseResponse {}))
         }
         .await;
 
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         match &result {
             Ok(_) => debug!(
-                "RPC [unpin] completed: ok blocks={} release_refs_per_hash={} elapsed_ms={:.2}",
-                hash_count, release_refs_per_hash, elapsed_ms
+                "RPC [release] completed: ok lease_len={} elapsed_ms={:.2}",
+                lease_len, elapsed_ms
             ),
             Err(status) => warn!(
-                "RPC [unpin] failed: code={} message={} elapsed_ms={:.2}",
+                "RPC [release] failed: code={} message={} elapsed_ms={:.2}",
                 status.code(),
                 status.message(),
                 elapsed_ms
             ),
         }
-        record_rpc_result("unpin", &result, start);
+        record_rpc_result("release", &result, start);
         result
     }
 
@@ -937,20 +947,5 @@ impl Engine for GrpcEngineService {
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tonic::Code;
-
-    #[tokio::test]
-    async fn load_rejects_mismatched_block_ids_and_hashes() {
-        let status = GrpcEngineService::validate_load_request(&[1, 2], &[vec![1]])
-            .expect_err("mismatched load request should fail");
-        assert_eq!(status.code(), Code::InvalidArgument);
-        assert!(status.message().contains("block_ids"));
-        assert!(status.message().contains("block_hashes"));
     }
 }

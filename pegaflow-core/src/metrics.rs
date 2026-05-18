@@ -43,9 +43,6 @@ pub(crate) struct CoreMetrics {
     pub cache_block_evictions_still_referenced: Counter<u64>,
     pub cache_eviction_reclaimed_bytes: Counter<u64>,
 
-    // Read-path pins (prevents eviction between prefix check and load)
-    pub pinned_for_load_unique_bytes: UpDownCounter<i64>,
-
     // GPU <-> CPU transfer
     pub save_bytes: Counter<u64>,
     pub save_duration_seconds: Histogram<f64>,
@@ -264,13 +261,6 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
                 .u64_counter("pegaflow_cache_eviction_reclaimed_bytes")
                 .with_unit("bytes")
                 .with_description("Estimated bytes actually reclaimed in pinned allocator after cache eviction")
-                .build(),
-
-            // Pins
-            pinned_for_load_unique_bytes: meter
-                .i64_up_down_counter("pegaflow_pinned_for_load_unique_bytes")
-                .with_unit("bytes")
-                .with_description("Current bytes referenced by pinned_for_load (unique blocks; sum of footprints)")
                 .build(),
 
             // Transfer

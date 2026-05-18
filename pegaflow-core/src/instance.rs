@@ -473,11 +473,6 @@ impl InstanceContext {
         &self.namespace
     }
 
-    /// Access the world size.
-    pub(crate) fn world_size(&self) -> usize {
-        self.world_size
-    }
-
     /// Access the effective TP size registered with the engine.
     pub(crate) fn tp_size(&self) -> usize {
         self.tp_size

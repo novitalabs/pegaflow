@@ -248,6 +248,7 @@ class TestE2ECorrectness:
             model,
             base_port,
             use_pegaflow=False,
+            use_noop_connector=True,
             log_file=log_dir / "baseline.log",
             tensor_parallel_size=tensor_parallel_size,
             pipeline_parallel_size=pipeline_parallel_size,
