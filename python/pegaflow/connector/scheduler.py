@@ -192,10 +192,15 @@ class SchedulerConnector:
             start_block_idx = num_computed_blocks
             num_load_blocks = num_external_tokens // self._ctx.virtual_block_size
             expected_load_blocks = len(block_ids) - num_computed_blocks
-            assert num_load_blocks == expected_load_blocks, (
-                f"req {req_id} load block mismatch: external={num_load_blocks} "
-                f"expected={expected_load_blocks}"
-            )
+            if (
+                num_external_tokens % self._ctx.virtual_block_size != 0
+                or num_load_blocks != expected_load_blocks
+            ):
+                self._release_pending_query_probe(req_id)
+                raise RuntimeError(
+                    f"req {req_id} load block mismatch: external={num_load_blocks} "
+                    f"expected={expected_load_blocks}"
+                )
 
             pending_probe = self._pending_query_probes.get(req_id)
             load_intent = LoadIntent(

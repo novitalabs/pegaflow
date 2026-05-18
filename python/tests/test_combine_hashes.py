@@ -291,6 +291,21 @@ class TestSchedulerQueryProbeReuse:
 
         engine_client.release.assert_not_called()
 
+    def test_load_block_mismatch_releases_probe_and_raises(self):
+        sc, engine_client = self._make_connector()
+        req = _make_fake_request("r1", [_hash(i) for i in range(2)])
+        blocks = _make_fake_blocks([10, 11])
+        blocks.blocks = [[SimpleNamespace(block_hash=None), SimpleNamespace(block_hash=None)]]
+
+        assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (32, True)
+
+        with pytest.raises(RuntimeError, match="load block mismatch"):
+            sc.update_state_after_alloc(req, blocks, num_external_tokens=16)
+
+        engine_client.release.assert_called_once_with(b"lease-1")
+        assert "r1" not in sc._pending_query_probes
+        assert "r1" not in sc._pending_load_intents
+
     def test_different_probe_releases_previous_uncommitted_probe(self):
         sc, engine_client = self._make_connector()
         req = _make_fake_request("r1", [_hash(i) for i in range(4)])
