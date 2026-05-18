@@ -75,7 +75,6 @@ pub(crate) struct CoreMetrics {
     pub metaserver_removal_blocks: Counter<u64>,
     pub metaserver_removal_failures: Counter<u64>,
     pub metaserver_removal_queue_full: Counter<u64>,
-    pub metaserver_node_register_failures: Counter<u64>,
     pub metaserver_heartbeat_failures: Counter<u64>,
     pub metaserver_session_resets: Counter<u64>,
     pub metaserver_unregister_failures: Counter<u64>,
@@ -379,10 +378,6 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
             metaserver_removal_queue_full: meter
                 .u64_counter("pegaflow_metaserver_removal_queue_full")
                 .with_description("Block hashes dropped due to full removal queue")
-                .build(),
-            metaserver_node_register_failures: meter
-                .u64_counter("pegaflow_metaserver_node_register_failures")
-                .with_description("MetaServer node heartbeat registration failures")
                 .build(),
             metaserver_heartbeat_failures: meter
                 .u64_counter("pegaflow_metaserver_heartbeat_failures")

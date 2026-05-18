@@ -474,6 +474,7 @@ async fn send_heartbeat(
             }
             Err(e) => {
                 error!("Failed to connect to MetaServer: {e}");
+                core_metrics().metaserver_heartbeat_failures.add(1, &[]);
                 tokio::time::sleep(tokio::time::Duration::from_millis(*backoff_ms)).await;
                 *backoff_ms = (*backoff_ms * 2).min(MAX_BACKOFF_MS);
                 return Err(());
@@ -490,7 +491,7 @@ async fn send_heartbeat(
         .await
     {
         Ok(_) => {
-            info!("Heartbeat accepted by MetaServer: node={advertise_addr} node_id={node_id}");
+            debug!("Heartbeat accepted by MetaServer: node={advertise_addr} node_id={node_id}");
             *node_registered = true;
             *backoff_ms = INITIAL_BACKOFF_MS;
             Ok(())

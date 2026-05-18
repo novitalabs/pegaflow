@@ -111,6 +111,9 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         .ttl_minutes
         .checked_mul(60)
         .ok_or("ttl-minutes is too large")?;
+    if cli.ttl_minutes == 0 {
+        return Err("ttl-minutes must be greater than 0".into());
+    }
     if ttl_secs < cli.node_stale_secs {
         return Err(format!(
             "ttl-minutes ({}) must be >= node-stale-secs ({})",
