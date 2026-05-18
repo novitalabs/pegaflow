@@ -55,6 +55,10 @@ impl MetaServer for GrpcMetaService {
     ) -> Result<Response<HeartbeatNodeResponse>, Status> {
         let start = Instant::now();
         let req = request.into_inner();
+        debug!(
+            "RPC [heartbeat_node]: node={} node_id={}",
+            req.node, req.node_id
+        );
         let result = async {
             let node_id = Self::parse_node_id(&req.node_id)?;
             self.store
@@ -75,6 +79,10 @@ impl MetaServer for GrpcMetaService {
     ) -> Result<Response<UnregisterNodeResponse>, Status> {
         let start = Instant::now();
         let req = request.into_inner();
+        debug!(
+            "RPC [unregister_node]: node={} node_id={}",
+            req.node, req.node_id
+        );
         let result = async {
             let node_id = Self::parse_node_id(&req.node_id)?;
             let removed = self
@@ -87,6 +95,14 @@ impl MetaServer for GrpcMetaService {
             }))
         }
         .await;
+        if let Ok(resp) = &result {
+            debug!(
+                "RPC [unregister_node]: node={} removed={} keys in {:?}",
+                req.node,
+                resp.get_ref().removed_keys,
+                start.elapsed()
+            );
+        }
         record_rpc_result("unregister_node", &result, start);
         result
     }
