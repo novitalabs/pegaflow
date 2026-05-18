@@ -15,6 +15,25 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
+TRANSFER_DURATION_BUCKETS_SECONDS = [
+    0.01,
+    0.025,
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    5.0,
+    7.5,
+    10.0,
+    15.0,
+    30.0,
+    60.0,
+]
+
 try:
     from vllm.v1.metrics.utils import create_metric_per_engine
 except ImportError:
@@ -309,14 +328,12 @@ class PegaPromMetrics(KVConnectorPromMetrics):
         )
         self.histogram_prefetch_blocks = _bind_metric_per_engine(self, histogram_prefetch_blocks)
 
-        # Histogram for load operations (worker-side)
-        # Optimized for fast SSD: typical range 1-50ms
-        # Buckets: 1, 2, 3, 5, 7.5, 10, 15, 20, 30, 50, 100 ms
-        duration_buckets = [0.001, 0.002, 0.003, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.05, 0.1]
+        # Histogram for load/save operations (worker-side), tuned for tail
+        # visibility over sub-10ms jitter. Buckets: 10ms to 60s.
         histogram_load_duration = self._histogram_cls(
             name="vllm:pega_load_duration_seconds",
             documentation="Histogram of KV cache load duration in seconds.",
-            buckets=duration_buckets,
+            buckets=TRANSFER_DURATION_BUCKETS_SECONDS,
             labelnames=labelnames,
         )
         self.histogram_load_duration = _bind_metric_per_engine(self, histogram_load_duration)
@@ -347,7 +364,7 @@ class PegaPromMetrics(KVConnectorPromMetrics):
         histogram_save_duration = self._histogram_cls(
             name="vllm:pega_save_duration_seconds",
             documentation="Histogram of KV cache save duration in seconds.",
-            buckets=duration_buckets,
+            buckets=TRANSFER_DURATION_BUCKETS_SECONDS,
             labelnames=labelnames,
         )
         self.histogram_save_duration = _bind_metric_per_engine(self, histogram_save_duration)

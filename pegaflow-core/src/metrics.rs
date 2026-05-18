@@ -113,23 +113,29 @@ fn rdma_fetch_duration_boundaries() -> Vec<f64> {
     ]
 }
 
-/// Custom histogram boundaries for duration in seconds (1ms to 5s)
-/// Optimized for local IPC workloads where most operations are 10-100ms
+/// Tail-focused transfer duration boundaries in seconds.
+///
+/// Load/save debugging cares more about sustained tail regressions than small
+/// sub-10ms jitter, so buckets stay coarse at the low end and distinguish
+/// transfer stalls up to one minute.
 fn duration_seconds_boundaries() -> Vec<f64> {
     vec![
-        0.001, // 1ms
-        0.005, // 5ms
         0.01,  // 10ms
         0.025, // 25ms
         0.05,  // 50ms
         0.1,   // 100ms
-        0.2,   // 200ms
-        0.3,   // 300ms
-        0.4,   // 400ms
+        0.25,  // 250ms
         0.5,   // 500ms
         1.0,   // 1s
+        1.5,   // 1.5s
         2.0,   // 2s
+        3.0,   // 3s
         5.0,   // 5s
+        7.5,   // 7.5s
+        10.0,  // 10s
+        15.0,  // 15s
+        30.0,  // 30s
+        60.0,  // 60s
     ]
 }
 
