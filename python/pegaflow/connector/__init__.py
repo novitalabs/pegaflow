@@ -318,6 +318,44 @@ class PegaKVConnector(KVConnectorBase_V1):
             self._state_manager.shutdown()
 
 
+class NoopKVConnector(KVConnectorBase_V1):
+    """Connector-path baseline for tests."""
+
+    def __init__(self, vllm_config, role: KVConnectorRole, kv_cache_config=None):
+        super().__init__(vllm_config, role, kv_cache_config)
+
+    @property
+    def prefer_cross_layer_blocks(self) -> bool:
+        return os.environ.get("PEGAFLOW_CROSS_LAYER_BLOCKS", "1") == "1"
+
+    def start_load_kv(self, forward_context, **kwargs: Any) -> None:
+        return
+
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        return
+
+    def save_kv_layer(
+        self,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        attn_metadata,
+        **kwargs: Any,
+    ) -> None:
+        return
+
+    def wait_for_save(self) -> None:
+        return
+
+    def get_num_new_matched_tokens(self, request, num_computed_tokens: int):
+        return (0, False)
+
+    def update_state_after_alloc(self, request, blocks, num_external_tokens: int) -> None:
+        return
+
+    def build_connector_meta(self, scheduler_output) -> PegaConnectorMetadata:
+        return PegaConnectorMetadata()
+
+
 def _resolve_device_id() -> int:
     """
     Return the global CUDA device id even when CUDA_VISIBLE_DEVICES masks GPUs.
@@ -343,4 +381,4 @@ def _resolve_device_id() -> int:
         return local_id
 
 
-__all__ = ["PegaKVConnector", "KVConnectorRole"]
+__all__ = ["PegaKVConnector", "NoopKVConnector", "KVConnectorRole"]

@@ -53,8 +53,12 @@ message LoadRequest {
   int32 device_id = 3;
   string load_state_shm = 4;
   repeated string layer_names = 5;
-  repeated int32 block_ids = 6;
-  repeated bytes block_hashes = 7;
+  repeated LeaseLoad loads = 6;
+}
+
+message LeaseLoad {
+  bytes lease = 1;
+  repeated int32 block_ids = 2;
 }
 
 message LoadResponse {
@@ -67,35 +71,25 @@ message QueryRequest {
   string req_id = 3;
 }
 
-// Prefetch status enum
-enum PrefetchState {
-  // Terminal: all available blocks ready, proceed with hit_blocks
-  PREFETCH_DONE = 0;
-  // Transient: blocks being prefetched from DFS, caller should retry
-  PREFETCH_LOADING = 1;
-}
-
 message QueryResponse {
-  ResponseStatus status = 1;
-  // Number of blocks ready in cache (for backwards compatibility)
-  uint64 hit_blocks = 2;
-  // Prefetch state for async prefetch support
-  PrefetchState prefetch_state = 3;
-  // Number of blocks currently being loaded from DFS
-  uint64 loading_blocks = 4;
-  // Number of blocks not found in DFS
-  uint64 missing_blocks = 5;
+  oneof outcome {
+    QueryLoading loading = 1;
+    QueryReady ready = 2;
+  }
 }
 
-message UnpinRequest {
-  string instance_id = 1;
-  repeated bytes block_hashes = 2;
-  // Number of pin refs to release for each block hash. Must be >= 1.
-  uint32 release_refs_per_hash = 3;
+message QueryLoading {}
+
+message QueryReady {
+  uint64 num_hit_blocks = 1;
+  bytes lease = 2;
 }
 
-message UnpinResponse {
-  ResponseStatus status = 1;
+message ReleaseRequest {
+  bytes lease = 1;
+}
+
+message ReleaseResponse {
 }
 
 message UnregisterRequest {
@@ -188,7 +182,7 @@ service Engine {
   rpc Load(LoadRequest) returns (LoadResponse);
   // Prefetch query: check memory + trigger SSD prefetch or cross-node RDMA fetch for missing blocks
   rpc QueryPrefetch(QueryRequest) returns (QueryResponse);
-  rpc Unpin(UnpinRequest) returns (UnpinResponse);
+  rpc Release(ReleaseRequest) returns (ReleaseResponse);
   rpc UnregisterContext(UnregisterRequest) returns (UnregisterResponse);
   // Cross-node transfer: get RDMA metadata for specific blocks (serving side)
   rpc QueryBlocksForTransfer(QueryBlocksForTransferRequest) returns (QueryBlocksForTransferResponse);

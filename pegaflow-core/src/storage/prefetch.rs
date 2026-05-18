@@ -54,11 +54,9 @@ struct LoadResult {
 }
 
 struct PrefixScan<'a> {
-    instance_id: &'a str,
     req_id: &'a str,
     namespace: &'a str,
     hashes: &'a [Vec<u8>],
-    num_workers: usize,
     emit_tier_metrics: bool,
 }
 
@@ -110,18 +108,16 @@ impl PrefetchScheduler {
     pub(super) async fn check_and_prefetch(
         &self,
         read_cache: &ReadCache,
-        instance_id: &str,
         req_id: &str,
         namespace: &str,
         hashes: &[Vec<u8>],
-        num_workers: usize,
     ) -> PrefetchStatus {
         // Default: this call may be the first decision and should attribute.
         let mut emit_tier_metrics = true;
         if let Some(status) = self.poll_existing(read_cache, req_id) {
             match status {
                 PollResult::StillLoading => {
-                    return PrefetchStatus::Loading { hit: 0, loading: 1 };
+                    return PrefetchStatus::Loading;
                 }
                 PollResult::Completed => {
                     // Backing has just written blocks into read_cache. The
@@ -136,11 +132,9 @@ impl PrefetchScheduler {
         self.full_prefix_scan(
             read_cache,
             PrefixScan {
-                instance_id,
                 req_id,
                 namespace,
                 hashes,
-                num_workers,
                 emit_tier_metrics,
             },
         )
@@ -204,7 +198,7 @@ impl PrefetchScheduler {
         let key_build = key_build_start.elapsed();
 
         let cache_scan_start = Instant::now();
-        let (hit, blocks_to_pin) = read_cache.get_prefix_blocks(&keys);
+        let (hit, prefix_blocks) = read_cache.get_prefix_blocks(&keys);
         let cache_scan = cache_scan_start.elapsed();
         let remaining = &keys[hit..];
 
@@ -242,12 +236,8 @@ impl PrefetchScheduler {
                 register,
                 total_start.elapsed()
             );
-            PrefetchStatus::Loading { hit, loading }
+            PrefetchStatus::Loading
         } else {
-            let pin_start = Instant::now();
-            read_cache.pin_blocks(scan.instance_id, scan.num_workers, &blocks_to_pin);
-            let pin = pin_start.elapsed();
-
             self.maybe_record_tier_attribution(
                 keys.len(),
                 hit,
@@ -257,7 +247,7 @@ impl PrefetchScheduler {
             );
 
             info!(
-                "Prefetch local-hit timing: req_id={} total_keys={} hit={} missing={} key_build={:?} cache_scan={:?} load_select={:?} pin={:?} total={:?}",
+                "Prefetch local-hit timing: req_id={} total_keys={} hit={} missing={} key_build={:?} cache_scan={:?} load_select={:?} total={:?}",
                 scan.req_id,
                 keys.len(),
                 hit,
@@ -265,10 +255,10 @@ impl PrefetchScheduler {
                 key_build,
                 cache_scan,
                 load_select,
-                pin,
                 total_start.elapsed()
             );
-            PrefetchStatus::Done { hit, missing }
+            let blocks = prefix_blocks.into_iter().map(|(_, block)| block).collect();
+            PrefetchStatus::Ready { blocks, missing }
         }
     }
 

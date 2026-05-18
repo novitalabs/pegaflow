@@ -197,6 +197,7 @@ impl PegaEngine {
     ) -> Result<(), EngineError> {
         let batch_start = std::time::Instant::now();
         let total_layers = saves.len();
+        self.query_leases.sweep_expired();
         let instance = self.get_instance(instance_id)?;
         let namespace = instance.namespace().to_string();
         let total_slots = instance.total_slots();

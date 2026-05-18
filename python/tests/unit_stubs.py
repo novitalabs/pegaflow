@@ -142,15 +142,22 @@ def _install_native_extension_stub() -> None:
         def get_state(self) -> int:
             return 0
 
+    class _QueryLoading:
+        pass
+
+    class _QueryReady:
+        def __init__(self, num_hit_blocks: int = 0, lease: bytes = b"") -> None:
+            self.num_hit_blocks = num_hit_blocks
+            self.lease = lease
+
     module.EngineRpcClient = getattr(module, "EngineRpcClient", MagicMock)
-    module.PegaFlowBusinessError = getattr(
-        module, "PegaFlowBusinessError", type("PegaFlowBusinessError", (Exception,), {})
-    )
     module.PegaFlowError = getattr(module, "PegaFlowError", type("PegaFlowError", (Exception,), {}))
-    module.PegaFlowServiceError = getattr(
-        module, "PegaFlowServiceError", type("PegaFlowServiceError", (Exception,), {})
+    module.PegaflowInternal = getattr(
+        module, "PegaflowInternal", type("PegaflowInternal", (Exception,), {})
     )
     module.PyLoadState = getattr(module, "PyLoadState", _FakeLoadState)
+    module.QueryLoading = getattr(module, "QueryLoading", _QueryLoading)
+    module.QueryReady = getattr(module, "QueryReady", _QueryReady)
     module.__version__ = getattr(module, "__version__", "test")
 
 

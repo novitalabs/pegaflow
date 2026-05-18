@@ -80,15 +80,12 @@ async fn ssd_prefetch_roundtrip_after_eviction() {
     loop {
         let status = env.query(&target).await;
         match status {
-            PrefetchStatus::Done { hit, .. } => {
-                if hit > 0 {
-                    env.unpin(&target[..hit]);
-                }
-                if hit == target.len() {
+            PrefetchStatus::Ready { blocks, .. } => {
+                if blocks.len() == target.len() {
                     break;
                 }
             }
-            PrefetchStatus::Loading { .. } => {}
+            PrefetchStatus::Loading => {}
         }
         assert!(
             std::time::Instant::now() < deadline,
@@ -97,9 +94,9 @@ async fn ssd_prefetch_roundtrip_after_eviction() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
-    // Phase 4: Pin, load to GPU, and verify data integrity.
-    env.assert_all_hit_and_pin(&target).await;
+    // Phase 4: Lease, load to GPU, and verify data integrity.
+    let lease = env.assert_all_hit_lease(&target).await;
     env.data().zero_gpu();
-    env.load_to_gpu(&target).await;
+    env.load_to_gpu(lease, target.len()).await;
     env.data().assert_gpu_matches_expected();
 }

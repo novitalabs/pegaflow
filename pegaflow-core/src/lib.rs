@@ -17,6 +17,7 @@ mod cache;
 mod gpu_worker;
 mod instance;
 mod internode;
+mod lease;
 pub use pegaflow_common::logging;
 mod metrics;
 mod offload;
@@ -32,10 +33,11 @@ pub use backing::{
     DEFAULT_SSD_WRITE_QUEUE_DEPTH, SsdCacheConfig,
 };
 pub use block::{
-    BlockHash, BlockKey, BlockStatus, LayerBlock, LayerSave, PrefetchStatus, RawBlock, SealedBlock,
+    BlockHash, BlockKey, LayerBlock, LayerSave, PrefetchStatus, RawBlock, SealedBlock,
 };
 pub use instance::{GpuContext, InstanceContext, KVCacheRegistration};
 pub use internode::{DEFAULT_METASERVER_QUEUE_DEPTH, MetaServerClient, MetaServerClientConfig};
+pub use lease::QueryLeaseId;
 pub use pegaflow_common::NumaNode;
 use pegaflow_common::NumaTopology;
 pub use pinned_pool::PinnedAllocation;
@@ -54,6 +56,7 @@ use log::{debug, info, warn};
 
 use crate::backing::SSD_ALIGNMENT;
 use crate::gpu_worker::{LayerLoadData, LoadBlock, LoadTask};
+use crate::lease::QueryLeaseManager;
 use crate::metrics::core_metrics;
 use crate::storage::StorageEngine;
 
@@ -109,7 +112,6 @@ impl From<LoadStateError> for EngineError {
 /// - Tracks GPU-NUMA topology for optimal memory locality
 ///
 /// The engine is thread-safe and can be shared across async tasks.
-#[derive(Clone)]
 pub struct PegaEngine {
     /// Active inference instances indexed by instance ID.
     instances: Arc<RwLock<HashMap<String, Arc<InstanceContext>>>>,
@@ -117,6 +119,8 @@ pub struct PegaEngine {
     storage: Arc<StorageEngine>,
     /// GPU-NUMA topology for memory allocation decisions.
     topology: Arc<NumaTopology>,
+    /// Query-ready blocks owned by opaque scheduler leases.
+    query_leases: QueryLeaseManager,
 }
 
 impl PegaEngine {
@@ -150,6 +154,7 @@ impl PegaEngine {
             instances: Arc::new(RwLock::new(HashMap::new())),
             storage,
             topology,
+            query_leases: QueryLeaseManager::default(),
         })
     }
 
@@ -304,6 +309,7 @@ impl PegaEngine {
         if removed.is_none() {
             return Err(EngineError::InstanceMissing(instance_id.to_string()));
         }
+        self.query_leases.release_instance(instance_id);
         info!("Unregistered instance: {}", instance_id);
         Ok(())
     }
@@ -316,6 +322,10 @@ impl PegaEngine {
             .expect("instances write lock poisoned");
         let ids: Vec<String> = instances.keys().cloned().collect();
         instances.clear();
+        drop(instances);
+        for id in &ids {
+            self.query_leases.release_instance(id);
+        }
         if !ids.is_empty() {
             info!("Unregistered all instances: {:?}", ids);
         }
@@ -352,9 +362,9 @@ impl PegaEngine {
     /// Count prefix hit blocks with SSD prefetch support.
     ///
     /// Returns:
-    /// - `Done { hit, missing: 0 }`: all blocks in memory cache
-    /// - `Loading { hit, loading }`: some blocks being fetched from SSD
-    /// - `Done { hit, missing }`: some blocks don't exist
+    /// - `Ready { blocks, missing: 0 }`: all blocks in memory cache
+    /// - `Loading`: some blocks being fetched from backing storage
+    /// - `Ready { blocks, missing }`: terminal prefix result with a miss suffix
     #[cfg_attr(
         feature = "tracing",
         fastrace::trace(name = "query_prefetch.count_prefix_hit")
@@ -367,82 +377,57 @@ impl PegaEngine {
     ) -> Result<PrefetchStatus, EngineError> {
         if req_id.is_empty() {
             warn!("count_prefix_hit_blocks_with_prefetch: empty req_id, returning 0 hits");
-            return Ok(PrefetchStatus::Done {
-                hit: 0,
+            return Ok(PrefetchStatus::Ready {
+                blocks: Vec::new(),
                 missing: block_hashes.len(),
             });
         }
 
         let instance = self.get_instance(instance_id)?;
         let namespace = instance.namespace();
-        let world_size = instance.world_size();
         let metrics = core_metrics();
 
         let status = self
             .storage
-            .check_prefix_and_prefetch(instance_id, req_id, namespace, block_hashes, world_size)
+            .check_prefix_and_prefetch(req_id, namespace, block_hashes)
             .await;
 
         match &status {
-            PrefetchStatus::Done { hit, missing } => {
-                metrics.cache_block_hits.add(*hit as u64, &[]);
+            PrefetchStatus::Ready { blocks, missing } => {
+                metrics.cache_block_hits.add(blocks.len() as u64, &[]);
                 if *missing > 0 {
                     metrics.cache_block_misses.add(*missing as u64, &[]);
                 }
             }
-            PrefetchStatus::Loading { hit, loading: _ } => {
-                metrics.cache_block_hits.add(*hit as u64, &[]);
-            }
+            PrefetchStatus::Loading => {}
         }
 
         Ok(status)
     }
 
-    /// Unpin blocks that were pinned during query.
-    ///
-    /// Used when load is cancelled or preempted before consumption.
-    pub fn unpin_blocks(
+    /// Create an opaque lease that owns query-ready blocks.
+    pub fn create_query_lease(
         &self,
         instance_id: &str,
-        block_hashes: &[Vec<u8>],
-    ) -> Result<usize, EngineError> {
-        self.unpin_block_refs(instance_id, block_hashes, 1)
-    }
-
-    /// Unpin multiple refs for each block hash that was pinned during query.
-    ///
-    /// Used when scheduler-side query ownership is cancelled before load
-    /// consumption by any worker.
-    pub fn unpin_block_refs(
-        &self,
-        instance_id: &str,
-        block_hashes: &[Vec<u8>],
-        release_refs_per_hash: usize,
-    ) -> Result<usize, EngineError> {
-        if release_refs_per_hash == 0 {
+        blocks: Vec<Arc<SealedBlock>>,
+    ) -> Result<QueryLeaseId, EngineError> {
+        self.get_instance(instance_id)?;
+        if blocks.is_empty() {
             return Err(EngineError::InvalidArgument(
-                "release_refs_per_hash must be greater than 0".to_string(),
+                "query lease requires at least one block".to_string(),
             ));
         }
-        let instance = self.get_instance(instance_id)?;
-        let namespace = instance.namespace();
-        let unpinned = self.storage.unpin_block_refs(
-            instance_id,
-            namespace,
-            block_hashes,
-            release_refs_per_hash,
-        );
-        debug!(
-            "unpin_block_refs: instance_id={instance_id} blocks={} release_refs_per_hash={} \
-             unpinned={unpinned}",
-            block_hashes.len(),
-            release_refs_per_hash,
-        );
-        Ok(unpinned)
+        Ok(self.query_leases.create(instance_id, blocks))
+    }
+
+    /// Release a query lease. Unknown leases are successful no-ops.
+    pub fn release_query_lease(&self, lease: &QueryLeaseId) {
+        self.query_leases.release(lease);
     }
 
     /// Evict all resident in-memory cache blocks while preserving backing-store data.
     pub fn cleanup_memory_cache(&self) -> MemoryCacheCleanupStats {
+        self.query_leases.sweep_expired();
         self.storage.cleanup_memory_cache()
     }
 
@@ -461,8 +446,7 @@ impl PegaEngine {
         device_id: i32,
         load_state_shm: &str,
         layer_names: &[&str],
-        block_ids: &[i32],
-        block_hashes: &[Vec<u8>],
+        loads: &[(QueryLeaseId, Vec<i32>)],
     ) -> Result<(), EngineError> {
         let load_state = LoadState::attach(load_state_shm)?;
 
@@ -472,8 +456,7 @@ impl PegaEngine {
             device_id,
             load_state_shm,
             layer_names,
-            block_ids,
-            block_hashes,
+            loads,
         );
 
         if let Err(ref e) = result {
@@ -495,22 +478,32 @@ impl PegaEngine {
         device_id: i32,
         load_state_shm: &str,
         layer_names: &[&str],
-        block_ids: &[i32],
-        block_hashes: &[Vec<u8>],
+        loads: &[(QueryLeaseId, Vec<i32>)],
     ) -> Result<(), EngineError> {
         let instance = self.get_instance(instance_id)?;
-        let namespace = instance.namespace();
-
         let gpu = instance
             .get_gpu(device_id)
             .ok_or_else(|| EngineError::WorkerMissing(instance_id.to_string(), device_id))?;
 
-        // Consume all pinned blocks reserved for this load.
+        // Consume query leases reserved for this load.
         trace_scope!("load.cache_lookup", _s);
-        let block_cache = self
-            .storage
-            .consume_pinned_blocks(instance_id, namespace, block_hashes)
-            .map_err(EngineError::Storage)?;
+        let mut block_ids = Vec::new();
+        let mut block_cache = Vec::new();
+        for (lease, lease_block_ids) in loads {
+            let blocks = self
+                .query_leases
+                .consume(instance_id, lease)
+                .map_err(EngineError::Storage)?;
+            if blocks.len() != lease_block_ids.len() {
+                return Err(EngineError::InvalidArgument(format!(
+                    "query lease block count {} does not match destination block count {}",
+                    blocks.len(),
+                    lease_block_ids.len()
+                )));
+            }
+            block_ids.extend_from_slice(lease_block_ids);
+            block_cache.extend(blocks);
+        }
         trace_drop!(_s);
 
         // Build load tasks for each layer

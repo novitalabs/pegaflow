@@ -188,8 +188,8 @@ async fn wait_for_cache(
             .await
             .expect("count_prefix_hit_blocks_with_prefetch");
         let hit = match status {
-            PrefetchStatus::Done { hit, .. } => hit,
-            PrefetchStatus::Loading { hit, .. } => hit,
+            PrefetchStatus::Ready { blocks, .. } => blocks.len(),
+            PrefetchStatus::Loading => 0,
         };
         if hit >= expected_hit {
             return;
@@ -232,7 +232,7 @@ async fn wait_for_prefetch_done(
     block_hashes: &[Vec<u8>],
     expected_hit: usize,
     timeout: Duration,
-) {
+) -> QueryLeaseId {
     let deadline = Instant::now() + timeout;
     loop {
         let status = engine
@@ -240,15 +240,20 @@ async fn wait_for_prefetch_done(
             .await
             .expect("count_prefix_hit_blocks_with_prefetch");
         match status {
-            PrefetchStatus::Done { hit, .. } if hit >= expected_hit => return,
-            PrefetchStatus::Done { hit, missing } => {
+            PrefetchStatus::Ready { blocks, .. } if blocks.len() >= expected_hit => {
+                return engine
+                    .create_query_lease(instance_id, blocks)
+                    .expect("create query lease");
+            }
+            PrefetchStatus::Ready { blocks, missing } => {
                 assert!(
                     Instant::now() < deadline,
-                    "prefetch done but hit={hit} missing={missing}, \
-                     expected hit>={expected_hit}"
+                    "prefetch done but hit={} missing={missing}, \
+                     expected hit>={expected_hit}",
+                    blocks.len()
                 );
             }
-            PrefetchStatus::Loading { .. } => {}
+            PrefetchStatus::Loading => {}
         }
         assert!(
             Instant::now() < deadline,
@@ -393,7 +398,7 @@ async fn p2p_rdma_remote_fetch_roundtrip() {
         .expect("register layer on engine B");
 
     // ── 8. Remote fetch: Engine B discovers blocks via MetaServer → RDMA READ ──
-    wait_for_prefetch_done(
+    let lease = wait_for_prefetch_done(
         &engine_b,
         "inst-b",
         "req-1",
@@ -414,8 +419,7 @@ async fn p2p_rdma_remote_fetch_roundtrip() {
             DEVICE_ID,
             &shm_name,
             &[LAYER],
-            &block_ids,
-            &block_hashes,
+            &[(lease, block_ids.clone())],
         )
         .expect("batch_load on engine B");
 

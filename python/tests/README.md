@@ -10,7 +10,7 @@
 | Clean source-only Python changes, docs touching test layout, CI test dependency changes | Source-only default | `uv run --isolated --no-project --with pytest --with numpy --with 'requests>=2.26.0' pytest` | Default test accidentally depends on torch, vLLM, CUDA, or native extension |
 | Server client, native extension, CUDA IPC registration, session lifecycle | Integration | `uv run --extra test pytest -m integration` | Server/native/GPU lifecycle regression |
 | vLLM connector correctness, cache semantics, save/load/hit behavior, release candidate confidence | vLLM correctness E2E | `uv run --extra test pytest -m e2e tests/test_vllm_e2e_correctness.py --model /data/models/Qwen3-4B` | Real vLLM connector correctness regression |
-| Warm-hit pressure, pending unpin, scheduler/cache concurrency | Stress | `uv run --extra test pytest -m stress tests/test_vllm_warm_hit_stress.py --model /data/models/Qwen3-4B --max-model-len 2048` | Real vLLM cache pressure regression |
+| Warm-hit pressure, pending lease release, scheduler/cache concurrency | Stress | `uv run --extra test pytest -m stress tests/test_vllm_warm_hit_stress.py --model /data/models/Qwen3-4B --max-model-len 2048` | Real vLLM cache pressure regression |
 | Wheel, loader path, installed console script, target CUDA runtime, published package | Release smoke | See Release Smoke | Packaging, loader, final artifact, or runtime contract regression |
 
 A heavy test without a clear trigger should not be promoted into a routine gate. A generated fuzz workload used to live here, but it had no stable owner, cadence, data contract, or debugging path; it was removed from the main pytest surface instead of pretending to be a regular gate.
@@ -92,7 +92,7 @@ uv run --extra test pytest -m stress tests/test_vllm_warm_hit_stress.py \
   --max-model-len 2048
 ```
 
-This is a targeted single-GPU vLLM scenario for warm-hit pressure. The checked profile uses `/data/models/Qwen3-4B`, `max_model_len=2048`, `gpu_memory_utilization=0.82`, `max_num_seqs=16`, and 12 concurrent repeated prompts; it has been validated on a 16GB GPU. Run it for cache warm-hit, pending unpin, scheduler/cache concurrency, or pressure-profile changes. It is not a default PR gate.
+This is a targeted single-GPU vLLM scenario for warm-hit pressure. The checked profile uses `/data/models/Qwen3-4B`, `max_model_len=2048`, `gpu_memory_utilization=0.82`, `max_num_seqs=16`, and 12 concurrent repeated prompts; it has been validated on a 16GB GPU. Run it for cache warm-hit, pending lease release, scheduler/cache concurrency, or pressure-profile changes. It is not a default PR gate.
 
 ## Release Smoke
 

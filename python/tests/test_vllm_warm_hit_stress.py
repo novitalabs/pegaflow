@@ -156,7 +156,7 @@ def test_warm_hit_pressure_on_single_gpu_profile(
             pega_text,
             (
                 "cache_lookup",
-                "pending query unpin",
+                "pending query lease",
                 "Preempt",
                 "preempt",
                 "abort",
@@ -177,12 +177,12 @@ def test_warm_hit_pressure_on_single_gpu_profile(
             f"Interesting lines:\n{interesting}"
         )
         assert "cache_lookup: hit_blocks=0" in pega_text
-        assert "pending query unpin failed" not in pega_text
-        assert "pending query unpin exception" not in pega_text
+        assert "pending query lease release failed" not in pega_text
+        assert "pending query lease release exception" not in pega_text
 
         hits = _metric_delta(metrics_start, metrics_end, "pegaflow_cache_block_hits_total")
         loads = _metric_delta(metrics_start, metrics_end, "pegaflow_load_bytes_total")
         assert hits > 0 or loads > 0, (
             f"Expected warm-hit/load activity, got hits={hits}, loads={loads}.\n"
-            f"Server log tail:\n{_grep_log(server_text, ('hit=', 'load', 'unpin'))}"
+            f"Server log tail:\n{_grep_log(server_text, ('hit=', 'load', 'release'))}"
         )

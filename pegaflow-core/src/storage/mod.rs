@@ -341,36 +341,9 @@ impl StorageEngine {
         }
     }
 
-    /// Consume pinned blocks for a load operation (each consumes one pin reservation).
-    pub(crate) fn consume_pinned_blocks(
-        &self,
-        instance_id: &str,
-        namespace: &str,
-        block_hashes: &[Vec<u8>],
-    ) -> Result<Vec<Arc<SealedBlock>>, String> {
-        self.read_cache
-            .consume_pinned_blocks(instance_id, namespace, block_hashes)
-    }
-
-    /// Unpin multiple refs for each block hash in one cancellation operation.
-    pub(crate) fn unpin_block_refs(
-        &self,
-        instance_id: &str,
-        namespace: &str,
-        block_hashes: &[Vec<u8>],
-        release_refs_per_hash: usize,
-    ) -> usize {
-        self.read_cache.unpin_block_refs(
-            instance_id,
-            namespace,
-            block_hashes,
-            release_refs_per_hash,
-        )
-    }
-
     /// Evict all blocks from the resident in-memory read cache.
     ///
-    /// This preserves backing-store copies and load pins. Blocks with
+    /// This preserves backing-store copies. Blocks with
     /// outstanding references may remain allocated until those holders release
     /// the last `Arc`.
     pub(crate) fn cleanup_memory_cache(&self) -> MemoryCacheCleanupStats {
@@ -438,21 +411,12 @@ impl StorageEngine {
     /// Check prefix blocks and schedule backing-store reads if needed.
     pub(crate) async fn check_prefix_and_prefetch(
         &self,
-        instance_id: &str,
         req_id: &str,
         namespace: &str,
         hashes: &[Vec<u8>],
-        num_workers: usize,
     ) -> PrefetchStatus {
         self.prefetch
-            .check_and_prefetch(
-                &self.read_cache,
-                instance_id,
-                req_id,
-                namespace,
-                hashes,
-                num_workers,
-            )
+            .check_and_prefetch(&self.read_cache, req_id, namespace, hashes)
             .await
     }
 
@@ -612,11 +576,6 @@ impl StorageEngine {
     pub(crate) fn test_insert_cache(&self, key: BlockKey, block: Arc<SealedBlock>) {
         self.read_cache.batch_insert(vec![(key, block)]);
     }
-
-    /// Get the pin refcount for a (instance, block) pair (test only).
-    pub(crate) fn test_pin_count(&self, instance_id: &str, key: &BlockKey) -> usize {
-        self.read_cache.pin_count(instance_id, key)
-    }
 }
 
 #[cfg(test)]
@@ -634,71 +593,6 @@ mod tests {
 
         storage.filter_hashes_not_in_cache_inplace("ns", &mut hashes);
         assert!(hashes.is_empty());
-    }
-
-    #[tokio::test]
-    async fn pin_consume_releases_immediately() {
-        let storage = make_engine();
-        let key = BlockKey::new("ns".into(), vec![1]);
-        let block = Arc::new(SealedBlock::from_slots(Vec::new()));
-
-        // Insert into cache, then pin
-        storage.test_insert_cache(key.clone(), block.clone());
-        storage
-            .read_cache
-            .pin_blocks("inst1", 1, &[(key.clone(), block)]);
-
-        assert_eq!(storage.test_pin_count("inst1", &key), 1);
-
-        // consume_pinned_blocks transfers Arc ownership and consumes the reservation
-        let blocks = storage
-            .consume_pinned_blocks("inst1", "ns", &[vec![1]])
-            .unwrap();
-        assert_eq!(blocks.len(), 1);
-
-        // Reservation is consumed immediately on lookup
-        assert_eq!(storage.test_pin_count("inst1", &key), 0);
-    }
-
-    #[tokio::test]
-    async fn unpin_blocks_cancellation_path() {
-        let storage = make_engine();
-        let key = BlockKey::new("ns".into(), vec![1]);
-        let block = Arc::new(SealedBlock::from_slots(Vec::new()));
-
-        storage.test_insert_cache(key.clone(), block.clone());
-        storage
-            .read_cache
-            .pin_blocks("inst1", 2, &[(key.clone(), block)]);
-
-        assert_eq!(storage.test_pin_count("inst1", &key), 2);
-
-        // Unpin once (simulating one worker cancellation)
-        let unpinned = storage.unpin_block_refs("inst1", "ns", &[vec![1]], 1);
-        assert_eq!(unpinned, 1);
-        assert_eq!(storage.test_pin_count("inst1", &key), 1);
-
-        // Unpin again
-        let unpinned = storage.unpin_block_refs("inst1", "ns", &[vec![1]], 1);
-        assert_eq!(unpinned, 1);
-        assert_eq!(storage.test_pin_count("inst1", &key), 0);
-    }
-
-    #[tokio::test]
-    async fn unpin_block_refs_releases_multiple_worker_refs() {
-        let storage = make_engine();
-        let key = BlockKey::new("ns".into(), vec![1]);
-        let block = Arc::new(SealedBlock::from_slots(Vec::new()));
-
-        storage.test_insert_cache(key.clone(), block.clone());
-        storage
-            .read_cache
-            .pin_blocks("inst1", 3, &[(key.clone(), block)]);
-        assert_eq!(storage.test_pin_count("inst1", &key), 3);
-
-        let unpinned = storage.unpin_block_refs("inst1", "ns", &[vec![1]], 3);
-        assert_eq!(unpinned, 3);
-        assert_eq!(storage.test_pin_count("inst1", &key), 0);
     }
 
     #[tokio::test]
@@ -747,42 +641,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multi_worker_consume_decrements_one_reservation_per_call() {
-        let storage = make_engine();
-        let key = BlockKey::new("ns".into(), vec![1]);
-        let block = Arc::new(SealedBlock::from_slots(Vec::new()));
-
-        storage.test_insert_cache(key.clone(), block.clone());
-        // Pin for 3 workers
-        storage
-            .read_cache
-            .pin_blocks("inst1", 3, &[(key.clone(), block)]);
-        assert_eq!(storage.test_pin_count("inst1", &key), 3);
-
-        // Worker 0 consumes
-        let blocks_0 = storage
-            .consume_pinned_blocks("inst1", "ns", &[vec![1]])
-            .unwrap();
-        assert_eq!(blocks_0.len(), 1);
-        assert_eq!(storage.test_pin_count("inst1", &key), 2);
-        // Worker 1 consumes
-        let blocks_1 = storage
-            .consume_pinned_blocks("inst1", "ns", &[vec![1]])
-            .unwrap();
-        assert_eq!(blocks_1.len(), 1);
-        assert_eq!(storage.test_pin_count("inst1", &key), 1);
-        // Worker 2 consumes
-        let blocks_2 = storage
-            .consume_pinned_blocks("inst1", "ns", &[vec![1]])
-            .unwrap();
-        assert_eq!(blocks_2.len(), 1);
-        assert_eq!(storage.test_pin_count("inst1", &key), 0);
-
-        // The owned Arcs can outlive reservation accounting.
-        assert_eq!(blocks_0.len() + blocks_1.len() + blocks_2.len(), 3);
-    }
-
-    #[tokio::test]
     async fn filter_hashes_not_in_cache_removes_cached() {
         let storage = make_engine();
         let key1 = BlockKey::new("ns".into(), vec![1]);
@@ -798,14 +656,6 @@ mod tests {
 
         assert_eq!(hashes.len(), 1);
         assert!(hashes.contains(&vec![3]));
-    }
-
-    #[tokio::test]
-    async fn consume_missing_pin_returns_error() {
-        let storage = make_engine();
-        // No pins exist — consume should fail
-        let result = storage.consume_pinned_blocks("inst1", "ns", &[vec![1]]);
-        assert!(result.is_err());
     }
 
     // ---- Cross-node transfer: serving side tests ----

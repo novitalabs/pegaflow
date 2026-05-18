@@ -315,7 +315,7 @@ impl TestEnv {
         self.engine.flush_saves().await;
     }
 
-    /// Query prefix hits. Returns raw PrefetchStatus. Leaves blocks pinned on hit.
+    /// Query prefix hits. Returns raw PrefetchStatus.
     pub async fn query(&self, hashes: &[Vec<u8>]) -> PrefetchStatus {
         self.engine
             .count_prefix_hit_blocks_with_prefetch(&self.instance_id, "test", hashes)
@@ -323,40 +323,45 @@ impl TestEnv {
             .expect("query")
     }
 
-    /// Query, assert all hit, leave pinned (scheduler step before load).
-    pub async fn assert_all_hit_and_pin(&self, hashes: &[Vec<u8>]) {
+    /// Query, assert all hit, and return a lease owning those blocks.
+    pub async fn assert_all_hit_lease(&self, hashes: &[Vec<u8>]) -> QueryLeaseId {
         match self.query(hashes).await {
-            PrefetchStatus::Done { hit, missing } => {
-                assert_eq!(hit, hashes.len(), "expected all blocks hit");
+            PrefetchStatus::Ready { blocks, missing } => {
+                assert_eq!(blocks.len(), hashes.len(), "expected all blocks hit");
                 assert_eq!(missing, 0);
+                self.engine
+                    .create_query_lease(&self.instance_id, blocks)
+                    .expect("create query lease")
             }
-            other => panic!("expected Done, got {:?}", other),
+            other => panic!("expected Ready, got {:?}", other),
         }
     }
 
-    pub fn unpin(&self, hashes: &[Vec<u8>]) {
-        for _ in 0..self.world_size.max(1) {
-            self.engine
-                .unpin_blocks(&self.instance_id, hashes)
-                .expect("unpin");
+    pub fn release(&self, lease: &QueryLeaseId) {
+        self.engine.release_query_lease(lease);
+    }
+
+    /// Count cache hits, then release the lease (for probing without consuming).
+    pub async fn count_hits_then_release(&self, hashes: &[Vec<u8>]) -> usize {
+        match self.query(hashes).await {
+            PrefetchStatus::Ready { blocks, .. } => {
+                let hit = blocks.len();
+                if hit > 0 {
+                    let lease = self
+                        .engine
+                        .create_query_lease(&self.instance_id, blocks)
+                        .expect("create query lease");
+                    self.release(&lease);
+                }
+                hit
+            }
+            PrefetchStatus::Loading => 0,
         }
     }
 
-    /// Count cache hits, then unpin (for probing without consuming).
-    pub async fn count_hits_then_unpin(&self, hashes: &[Vec<u8>]) -> usize {
-        let hit = match self.query(hashes).await {
-            PrefetchStatus::Done { hit, .. } => hit,
-            PrefetchStatus::Loading { hit, .. } => hit,
-        };
-        if hit > 0 {
-            self.unpin(&hashes[..hit]);
-        }
-        hit
-    }
-
-    /// Load blocks from cache to GPU (pin must already be held).
-    pub async fn load_to_gpu(&self, hashes: &[Vec<u8>]) {
-        let block_ids: Vec<i32> = (0..hashes.len() as i32).collect();
+    /// Load blocks from cache to GPU (lease must be held).
+    pub async fn load_to_gpu(&self, lease: QueryLeaseId, block_count: usize) {
+        let block_ids: Vec<i32> = (0..block_count as i32).collect();
         let layer_names: Vec<&str> = self.layers.iter().map(|l| l.name.as_str()).collect();
         let load_state = LoadState::new().expect("create LoadState");
         let shm_name = load_state.shm_name().to_string();
@@ -367,16 +372,15 @@ impl TestEnv {
                 0,
                 &shm_name,
                 &layer_names,
-                &block_ids,
-                hashes,
+                &[(lease, block_ids)],
             )
             .expect("submit load");
         wait_for_load(&load_state, LOAD_WAIT_TIMEOUT).await;
     }
 
     /// Submit load and assert it fails synchronously with `expected_msg`.
-    pub fn expect_load_error(&self, hashes: &[Vec<u8>], expected_msg: &str) {
-        let block_ids: Vec<i32> = (0..hashes.len() as i32).collect();
+    pub fn expect_load_error(&self, lease: QueryLeaseId, block_count: usize, expected_msg: &str) {
+        let block_ids: Vec<i32> = (0..block_count as i32).collect();
         let layer_names: Vec<&str> = self.layers.iter().map(|l| l.name.as_str()).collect();
         let load_state = LoadState::new().expect("create LoadState");
         let shm_name = load_state.shm_name().to_string();
@@ -388,8 +392,7 @@ impl TestEnv {
                 0,
                 &shm_name,
                 &layer_names,
-                &block_ids,
-                hashes,
+                &[(lease, block_ids)],
             )
             .expect_err("load should fail");
         assert!(

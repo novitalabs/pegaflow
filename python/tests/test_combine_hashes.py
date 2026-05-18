@@ -14,6 +14,7 @@ install_connector_unit_stubs()
 
 from pegaflow.connector.common import ConnectorContext  # noqa: E402
 from pegaflow.connector.scheduler import SchedulerConnector  # noqa: E402
+from pegaflow.pegaflow import QueryLoading, QueryReady  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -240,25 +241,16 @@ class TestDecodeHashRefresh:
 
 
 class TestSchedulerQueryProbeReuse:
-    """Repeated scheduler probes should not repeat server-side query pins."""
+    """Repeated scheduler probes should not repeat server-side query leases."""
 
-    def _make_connector(self, world_size: int = 1) -> tuple[SchedulerConnector, MagicMock]:
+    def _make_connector(self) -> tuple[SchedulerConnector, MagicMock]:
         engine_client = MagicMock()
-        engine_client.query_prefetch.return_value = {
-            "ok": True,
-            "message": "ok",
-            "hit_blocks": 2,
-            "prefetch_state": "done",
-            "loading_blocks": 0,
-            "missing_blocks": 0,
-        }
-        engine_client.unpin.return_value = (True, "ok")
+        engine_client.query_prefetch.return_value = QueryReady(2, b"lease-1")
+        engine_client.release.return_value = None
         state_manager = MagicMock()
-        state_manager.is_available.return_value = True
         ctx = _make_ctx(
             engine_client=engine_client,
             state_manager=state_manager,
-            world_size=world_size,
         )
         return SchedulerConnector(ctx), engine_client
 
@@ -272,36 +264,22 @@ class TestSchedulerQueryProbeReuse:
         assert first == (32, True)
         assert second == (32, True)
         engine_client.query_prefetch.assert_called_once()
-        engine_client.unpin.assert_not_called()
+        engine_client.release.assert_not_called()
 
-    def test_query_prefetch_dict_requires_contract_fields(self):
+    def test_query_loading_returns_retry(self):
         sc, engine_client = self._make_connector()
-        engine_client.query_prefetch.return_value = {
-            "ok": True,
-            "message": "ok",
-            "hit_blocks": 2,
-            "loading_blocks": 0,
-            "missing_blocks": 0,
-        }
+        engine_client.query_prefetch.return_value = QueryLoading()
 
-        with pytest.raises(KeyError, match="prefetch_state"):
+        assert sc._count_available_block_prefix([_hash(i) for i in range(4)], "r1") is None
+
+    def test_query_prefetch_rejects_unknown_outcome(self):
+        sc, engine_client = self._make_connector()
+        engine_client.query_prefetch.return_value = object()
+
+        with pytest.raises(TypeError, match="unexpected outcome"):
             sc._count_available_block_prefix([_hash(i) for i in range(4)], "r1")
 
-    def test_query_prefetch_dict_rejects_unknown_prefetch_state(self):
-        sc, engine_client = self._make_connector()
-        engine_client.query_prefetch.return_value = {
-            "ok": True,
-            "message": "ok",
-            "hit_blocks": 2,
-            "prefetch_state": "weird",
-            "loading_blocks": 0,
-            "missing_blocks": 0,
-        }
-
-        with pytest.raises(RuntimeError, match="prefetch_state"):
-            sc._count_available_block_prefix([_hash(i) for i in range(4)], "r1")
-
-    def test_committed_probe_is_not_unpinned_on_cleanup(self):
+    def test_committed_probe_is_not_released_on_cleanup(self):
         sc, engine_client = self._make_connector()
         req = _make_fake_request("r1", [_hash(i) for i in range(2)])
         blocks = _make_fake_blocks([10, 11])
@@ -311,100 +289,57 @@ class TestSchedulerQueryProbeReuse:
         sc.update_state_after_alloc(req, blocks, num_external_tokens=32)
         sc._cleanup_request("r1")
 
-        engine_client.unpin.assert_not_called()
+        engine_client.release.assert_not_called()
+
+    def test_load_block_mismatch_releases_probe_and_raises(self):
+        sc, engine_client = self._make_connector()
+        req = _make_fake_request("r1", [_hash(i) for i in range(2)])
+        blocks = _make_fake_blocks([10, 11])
+        blocks.blocks = [[SimpleNamespace(block_hash=None), SimpleNamespace(block_hash=None)]]
+
+        assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (32, True)
+
+        with pytest.raises(RuntimeError, match="load block mismatch"):
+            sc.update_state_after_alloc(req, blocks, num_external_tokens=16)
+
+        engine_client.release.assert_called_once_with(b"lease-1")
+        assert "r1" not in sc._pending_query_probes
+        assert "r1" not in sc._pending_load_intents
 
     def test_different_probe_releases_previous_uncommitted_probe(self):
         sc, engine_client = self._make_connector()
         req = _make_fake_request("r1", [_hash(i) for i in range(4)])
 
         assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (32, True)
+        engine_client.query_prefetch.return_value = QueryReady(2, b"lease-2")
         req.block_hashes = [_hash(i) for i in range(10, 14)]
         assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (32, True)
 
         assert engine_client.query_prefetch.call_count == 2
-        engine_client.unpin.assert_called_once_with("test", [_hash(0), _hash(1)], 1)
+        engine_client.release.assert_called_once_with(b"lease-1")
+        assert [call[0] for call in engine_client.method_calls] == [
+            "query_prefetch",
+            "query_prefetch",
+            "release",
+        ]
 
-    def test_uncommitted_probe_release_matches_world_size_pin_count(self):
-        sc, engine_client = self._make_connector(world_size=3)
+    def test_release_failure_does_not_abort_cleanup(self):
+        sc, engine_client = self._make_connector()
         req = _make_fake_request("r1", [_hash(i) for i in range(4)])
+        engine_client.release.side_effect = RuntimeError("server gone")
 
         assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (32, True)
         sc._cleanup_request("r1")
 
-        engine_client.unpin.assert_called_once_with("test", [_hash(0), _hash(1)], 3)
-
-    def test_failed_unpin_rpc_remains_tracked(self):
-        sc, engine_client = self._make_connector(world_size=3)
-        req = _make_fake_request("r1", [_hash(i) for i in range(4)])
-        engine_client.unpin.side_effect = RuntimeError("temporary")
-
-        assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (32, True)
-        sc._cleanup_request("r1")
-
-        engine_client.unpin.assert_called_once_with("test", [_hash(0), _hash(1)], 3)
         assert "r1" not in sc._pending_query_probes
-        assert sc._pending_query_probe_releases["r1"].release_refs_per_hash == 3
-
-    def test_different_probe_does_not_overwrite_failed_release(self):
-        sc, engine_client = self._make_connector(world_size=2)
-        req = _make_fake_request("r1", [_hash(i) for i in range(4)])
-
-        assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (32, True)
-
-        engine_client.unpin.side_effect = RuntimeError("temporary")
-        req.block_hashes = [_hash(i) for i in range(10, 14)]
-
-        assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (None, False)
-        assert engine_client.query_prefetch.call_count == 1
-        assert "r1" not in sc._pending_query_probes
-        assert sc._pending_query_probe_releases["r1"].remaining_hashes == tuple(
-            _hash(i) for i in range(4)
-        )
-        assert sc._pending_query_probe_releases["r1"].release_refs_per_hash == 2
-
-    def test_failed_release_must_clear_before_new_probe(self):
-        sc, engine_client = self._make_connector(world_size=2)
-        req = _make_fake_request("r1", [_hash(i) for i in range(4)])
-
-        assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (32, True)
-
-        engine_client.unpin.side_effect = RuntimeError("temporary")
-        req.block_hashes = [_hash(i) for i in range(10, 14)]
-        assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (None, False)
-
-        engine_client.unpin.side_effect = None
-        engine_client.unpin.return_value = (True, "ok")
-        assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (32, True)
-
-        assert engine_client.query_prefetch.call_count == 2
-        assert "r1" not in sc._pending_query_probe_releases
-        assert sc._pending_query_probes["r1"].remaining_hashes == tuple(
-            _hash(i) for i in range(10, 14)
-        )
-
-    def test_cleanup_release_retry_is_drained_by_stats(self):
-        sc, engine_client = self._make_connector(world_size=1)
-        req = _make_fake_request("r1", [_hash(i) for i in range(4)])
-
-        assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (32, True)
-
-        engine_client.unpin.side_effect = [RuntimeError("temporary")]
-        sc._cleanup_request("r1")
-        assert sc._pending_query_probe_releases["r1"].release_refs_per_hash == 1
-
-        engine_client.unpin.side_effect = None
-        engine_client.unpin.return_value = (True, "ok")
-        sc.get_stats()
-
-        assert "r1" not in sc._pending_query_probe_releases
+        engine_client.release.assert_called_once_with(b"lease-1")
 
     def test_shutdown_releases_uncommitted_probe(self):
-        sc, engine_client = self._make_connector(world_size=2)
+        sc, engine_client = self._make_connector()
         req = _make_fake_request("r1", [_hash(i) for i in range(4)])
 
         assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (32, True)
         sc.shutdown()
 
         assert "r1" not in sc._pending_query_probes
-        assert "r1" not in sc._pending_query_probe_releases
-        engine_client.unpin.assert_called_once_with("test", [_hash(0), _hash(1)], 2)
+        engine_client.release.assert_called_once_with(b"lease-1")

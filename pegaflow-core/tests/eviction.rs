@@ -1,7 +1,7 @@
 //! Memory-pressure eviction tests (pure CPU memory, no SSD).
 //!
 //! Verifies LRU eviction behavior when the pinned memory pool is exhausted:
-//! new blocks push out old ones, pinned blocks survive pressure, and loaded
+//! new blocks push out old ones, leased blocks survive pressure, and loaded
 //! data after eviction is from the correct batch.
 
 mod common;
@@ -42,15 +42,16 @@ async fn eviction_reclaims_old_blocks_for_new() {
 
     // Load new batch — must get the overwritten data.
     env.data().zero_gpu();
-    env.assert_all_hit_and_pin(&new).await;
-    env.load_to_gpu(&new).await;
+    let lease = env.assert_all_hit_lease(&new).await;
+
+    env.load_to_gpu(lease, new.len()).await;
     env.data().assert_gpu_matches_expected();
 }
 
-/// Pinned blocks survive memory pressure: query_prefetch pins prevent LRU eviction.
+/// Leased blocks survive memory pressure: query_prefetch leases prevent LRU eviction.
 #[tokio::test]
-async fn pinned_blocks_survive_eviction_pressure() {
-    let env = TestEnvBuilder::new("inst-pin", "ns-pin")
+async fn leased_blocks_survive_eviction_pressure() {
+    let env = TestEnvBuilder::new("inst-lease", "ns-lease")
         .layer("layer_0", NUM_BLOCKS, BLOCK_SIZE)
         .pool_size(POOL_SIZE)
         .storage(eviction_storage_config())
@@ -58,15 +59,15 @@ async fn pinned_blocks_survive_eviction_pressure() {
 
     let hashes = env.hashes(10);
     env.save_and_wait(&hashes).await;
-    env.assert_all_hit_and_pin(&hashes).await; // pins first batch
+    let lease = env.assert_all_hit_lease(&hashes).await;
 
-    // Second batch creates eviction pressure while first is pinned.
+    // Second batch creates eviction pressure while the first is leased.
     let pressure = make_block_hashes(NUM_BLOCKS, 20);
     env.save_layer(0, &pressure).await;
 
-    // First batch is still pinned — load must succeed.
+    // First batch is still leased — load must succeed.
     env.data().zero_gpu();
-    env.load_to_gpu(&hashes).await;
+    env.load_to_gpu(lease, hashes.len()).await;
     env.data().assert_gpu_matches_expected();
 }
 
@@ -90,7 +91,8 @@ async fn eviction_works_with_sharded_pool() {
     env.save_and_wait(&new).await;
 
     env.data().zero_gpu();
-    env.assert_all_hit_and_pin(&new).await;
-    env.load_to_gpu(&new).await;
+    let lease = env.assert_all_hit_lease(&new).await;
+
+    env.load_to_gpu(lease, new.len()).await;
     env.data().assert_gpu_matches_expected();
 }

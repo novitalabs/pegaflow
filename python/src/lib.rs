@@ -1,12 +1,12 @@
 use pegaflow_core::LoadState;
 use pegaflow_proto::proto::engine::{
-    HealthRequest, LoadRequest, QueryRequest, RegisterContextRequest, ResponseStatus, SaveLayer,
-    SaveRequest, SessionEvent, SessionRequest, ShutdownRequest, UnpinRequest, UnregisterRequest,
-    engine_client::EngineClient,
+    HealthRequest, LeaseLoad, LoadRequest, QueryRequest, RegisterContextRequest, ReleaseRequest,
+    ResponseStatus, SaveLayer, SaveRequest, SessionEvent, SessionRequest, ShutdownRequest,
+    UnregisterRequest, engine_client::EngineClient, query_response,
 };
 use pyo3::{
     create_exception,
-    exceptions::{PyException, PyRuntimeError},
+    exceptions::{PyException, PyRuntimeError, PyValueError},
     prelude::*,
 };
 use std::{
@@ -22,8 +22,7 @@ use tonic::{
 
 // Custom Python exceptions for error classification
 create_exception!(pegaflow, PegaFlowError, PyException);
-create_exception!(pegaflow, PegaFlowServiceError, PegaFlowError);
-create_exception!(pegaflow, PegaFlowBusinessError, PegaFlowError);
+create_exception!(pegaflow, PegaflowInternal, PegaFlowError);
 
 static TOKIO_RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
@@ -51,42 +50,17 @@ fn runtime_creation_error(err: impl std::fmt::Display) -> PyErr {
 }
 
 fn transport_connect_error(endpoint: &str, err: impl std::fmt::Display) -> PyErr {
-    PegaFlowServiceError::new_err(format!(
+    PegaFlowError::new_err(format!(
         "failed to connect to engine server at {endpoint}: {err}"
     ))
 }
 
-/// Classify gRPC status codes into service vs business errors.
-///
-/// Service errors (server unavailable, should trigger health check):
-/// - UNAVAILABLE: Server not reachable
-/// - DEADLINE_EXCEEDED: Request timed out
-/// - INTERNAL: Server internal error
-/// - ABORTED: Operation aborted
-/// - CANCELLED: Operation cancelled
-///
-/// Business errors (application logic errors, should propagate):
-/// - INVALID_ARGUMENT: Bad request parameters
-/// - FAILED_PRECONDITION: State precondition not met
-/// - NOT_FOUND: Resource not found
-/// - All other codes
-fn is_service_error(code: Code) -> bool {
-    matches!(
-        code,
-        Code::Unavailable
-            | Code::DeadlineExceeded
-            | Code::Internal
-            | Code::Aborted
-            | Code::Cancelled
-    )
-}
-
 fn rpc_status_error(method: &str, err: GrpcStatus) -> PyErr {
     let msg = format!("{method} RPC failed: {err}");
-    if is_service_error(err.code()) {
-        PegaFlowServiceError::new_err(msg)
-    } else {
-        PegaFlowBusinessError::new_err(msg)
+    match err.code() {
+        Code::InvalidArgument => PyValueError::new_err(msg),
+        Code::Internal => PegaflowInternal::new_err(msg),
+        _ => PegaFlowError::new_err(msg),
     }
 }
 
@@ -102,6 +76,80 @@ fn status_tuple(method: &str, status: Option<ResponseStatus>) -> PyResult<(bool,
 fn u64_to_usize(value: u64, field: &str) -> PyResult<usize> {
     usize::try_from(value)
         .map_err(|_| PyRuntimeError::new_err(format!("{field}={value} exceeds usize range")))
+}
+
+#[pyclass(frozen)]
+struct QueryLoading {}
+
+#[pymethods]
+impl QueryLoading {
+    #[new]
+    fn new() -> Self {
+        Self {}
+    }
+
+    fn __repr__(&self) -> String {
+        "QueryLoading()".to_string()
+    }
+}
+
+#[derive(Clone)]
+struct PyQueryLease(Vec<u8>);
+
+impl PyQueryLease {
+    fn into_proto(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+impl<'a, 'py> FromPyObject<'a, 'py> for PyQueryLease {
+    type Error = PyErr;
+
+    fn extract(obj: pyo3::Borrowed<'a, 'py, PyAny>) -> Result<Self, Self::Error> {
+        let bytes: Vec<u8> = obj.extract()?;
+        Ok(Self(bytes))
+    }
+}
+
+impl<'py> IntoPyObject<'py> for PyQueryLease {
+    type Target = pyo3::types::PyBytes;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        Ok(pyo3::types::PyBytes::new(py, &self.0))
+    }
+}
+
+#[pyclass(frozen)]
+struct QueryReady {
+    #[pyo3(get)]
+    num_hit_blocks: usize,
+    lease: PyQueryLease,
+}
+
+#[pymethods]
+impl QueryReady {
+    #[new]
+    fn new(num_hit_blocks: usize, lease: PyQueryLease) -> Self {
+        Self {
+            num_hit_blocks,
+            lease,
+        }
+    }
+
+    #[getter]
+    fn lease<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+        self.lease.clone().into_pyobject(py)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "QueryReady(num_hit_blocks={}, has_lease={})",
+            self.num_hit_blocks,
+            !self.lease.0.is_empty()
+        )
+    }
 }
 
 #[pyclass]
@@ -306,8 +354,7 @@ impl EngineRpcClient {
     ///     device_id: CUDA device ID
     ///     load_state_shm: Shared memory name for load state sync
     ///     layer_names: List of layer names to load
-    ///     block_ids: GPU block IDs to load into
-    ///     block_hashes: Content hashes for blocks
+    ///     loads: List of (lease, block_ids) pairs
     ///
     /// Returns: (ok: bool, message: str)
     #[allow(
@@ -322,9 +369,12 @@ impl EngineRpcClient {
         device_id: i32,
         load_state_shm: String,
         layer_names: Vec<String>,
-        block_ids: Vec<i32>,
-        block_hashes: Vec<Vec<u8>>,
+        loads: Vec<(Vec<u8>, Vec<i32>)>,
     ) -> PyResult<(bool, String)> {
+        let loads = loads
+            .into_iter()
+            .map(|(lease, block_ids)| LeaseLoad { lease, block_ids })
+            .collect();
         self.call(py, "load", |mut c| async move {
             let resp = c
                 .load(LoadRequest {
@@ -333,8 +383,7 @@ impl EngineRpcClient {
                     device_id,
                     load_state_shm,
                     layer_names,
-                    block_ids,
-                    block_hashes,
+                    loads,
                 })
                 .await?;
             Ok(resp.into_inner())
@@ -344,98 +393,80 @@ impl EngineRpcClient {
 
     /// Query prefix cache hits with SSD prefetch support.
     ///
-    /// Checks memory cache and triggers SSD prefetch for missing blocks.
-    /// Pins hit blocks for subsequent load operations.
+    /// Checks memory cache and triggers backing-store prefetch for missing blocks.
+    /// Ready blocks are owned by an opaque lease.
     ///
     /// Args:
     ///     instance_id: Model instance ID
     ///     block_hashes: List of block hashes to check
     ///
     /// Returns: dict with keys:
-    ///     - ok: bool - whether the request succeeded
-    ///     - message: str - error message if failed
-    ///     - hit_blocks: int - number of blocks ready in cache
-    ///     - prefetch_state: str - one of "done", "loading"
-    ///     - loading_blocks: int - number of blocks being prefetched
-    ///     - missing_blocks: int - number of blocks not found
+    ///     QueryLoading or QueryReady.
     fn query_prefetch(
         &self,
         py: Python<'_>,
         instance_id: String,
         block_hashes: Vec<Vec<u8>>,
         req_id: String,
-    ) -> PyResult<Py<pyo3::types::PyAny>> {
-        use pegaflow_proto::proto::engine::PrefetchState;
-
-        self.call(py, "query_prefetch", |mut c| async move {
-            let resp = c
-                .query_prefetch(QueryRequest {
-                    instance_id,
-                    block_hashes,
-                    req_id,
-                })
-                .await?;
-            Ok(resp.into_inner())
-        })
-        .and_then(|r| {
-            let (ok, msg) = status_tuple("query_prefetch", r.status)?;
-            let hit = u64_to_usize(r.hit_blocks, "hit_blocks")?;
-            let loading = u64_to_usize(r.loading_blocks, "loading_blocks")?;
-            let missing = u64_to_usize(r.missing_blocks, "missing_blocks")?;
-
-            let prefetch_state = match PrefetchState::try_from(r.prefetch_state) {
-                Ok(PrefetchState::PrefetchDone) => "done",
-                Ok(PrefetchState::PrefetchLoading) => "loading",
-                Err(value) => {
-                    return Err(PyRuntimeError::new_err(format!(
-                        "query_prefetch returned unknown prefetch_state: {value}"
-                    )));
-                }
-            };
-
-            Python::attach(|py| {
-                use pyo3::types::PyDict;
-                let dict = PyDict::new(py);
-                dict.set_item("ok", ok)?;
-                dict.set_item("message", msg)?;
-                dict.set_item("hit_blocks", hit)?;
-                dict.set_item("prefetch_state", prefetch_state)?;
-                dict.set_item("loading_blocks", loading)?;
-                dict.set_item("missing_blocks", missing)?;
-                Ok(dict.into())
+    ) -> PyResult<Py<PyAny>> {
+        let result = py.detach(|| {
+            self.rt_handle.block_on(async {
+                let mut client = self.client.clone();
+                client
+                    .query_prefetch(QueryRequest {
+                        instance_id,
+                        block_hashes,
+                        req_id,
+                    })
+                    .await
+                    .map(|resp| resp.into_inner())
             })
+        });
+
+        let response = match result {
+            Ok(response) => response,
+            Err(status) if matches!(status.code(), Code::Unavailable | Code::DeadlineExceeded) => {
+                return Python::attach(|py| {
+                    Py::new(
+                        py,
+                        QueryReady {
+                            num_hit_blocks: 0,
+                            lease: PyQueryLease(Vec::new()),
+                        },
+                    )
+                    .map(|obj| obj.into_any())
+                });
+            }
+            Err(status) => return Err(rpc_status_error("query_prefetch", status)),
+        };
+
+        Python::attach(|py| match response.outcome {
+            Some(query_response::Outcome::Loading(_)) => {
+                Py::new(py, QueryLoading {}).map(|obj| obj.into_any())
+            }
+            Some(query_response::Outcome::Ready(ready)) => Py::new(
+                py,
+                QueryReady {
+                    num_hit_blocks: u64_to_usize(ready.num_hit_blocks, "num_hit_blocks")?,
+                    lease: PyQueryLease(ready.lease),
+                },
+            )
+            .map(|obj| obj.into_any()),
+            None => Err(PyRuntimeError::new_err(
+                "query_prefetch response missing outcome",
+            )),
         })
     }
 
-    /// Unpin blocks that were pinned during query.
-    ///
-    /// This is used when load is cancelled or preempted before consumption.
-    /// Call this to release pinned blocks and prevent memory leaks.
-    ///
-    /// Args:
-    ///     instance_id: Model instance ID
-    ///     block_hashes: List of block hashes to unpin
-    ///     release_refs_per_hash: Number of pin refs to release for each hash
-    ///
-    /// Returns: (ok: bool, message: str)
-    fn unpin(
-        &self,
-        py: Python<'_>,
-        instance_id: String,
-        block_hashes: Vec<Vec<u8>>,
-        release_refs_per_hash: u32,
-    ) -> PyResult<(bool, String)> {
-        self.call(py, "unpin", |mut c| async move {
-            let resp = c
-                .unpin(UnpinRequest {
-                    instance_id,
-                    block_hashes,
-                    release_refs_per_hash,
-                })
-                .await?;
-            Ok(resp.into_inner())
+    /// Release a query lease. Unknown leases are successful no-ops.
+    fn release(&self, py: Python<'_>, lease: PyQueryLease) -> PyResult<()> {
+        self.call(py, "release", |mut c| async move {
+            c.release(ReleaseRequest {
+                lease: lease.into_proto(),
+            })
+            .await?;
+            Ok(())
         })
-        .and_then(|r| status_tuple("unpin", r.status))
     }
 
     /// Unregister a context/instance.
@@ -559,14 +590,9 @@ fn pegaflow(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyLoadState>()?;
     // Register custom exceptions for error classification
     m.add("PegaFlowError", m.py().get_type::<PegaFlowError>())?;
-    m.add(
-        "PegaFlowServiceError",
-        m.py().get_type::<PegaFlowServiceError>(),
-    )?;
-    m.add(
-        "PegaFlowBusinessError",
-        m.py().get_type::<PegaFlowBusinessError>(),
-    )?;
+    m.add("PegaflowInternal", m.py().get_type::<PegaflowInternal>())?;
+    m.add_class::<QueryLoading>()?;
+    m.add_class::<QueryReady>()?;
 
     Ok(())
 }
