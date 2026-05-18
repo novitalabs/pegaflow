@@ -338,7 +338,6 @@ async fn registration_loop(
         // Process inserts
         let insert_namespaces: Vec<(String, Vec<Vec<u8>>)> = inserts.into_iter().collect();
         let mut insert_failed_at = None;
-        let mut heartbeat_after_insert_failure = false;
 
         for (i, (namespace, hashes)) in insert_namespaces.iter().enumerate() {
             let count = hashes.len();
@@ -364,7 +363,7 @@ async fn registration_loop(
                     );
                     if e.code() == Code::FailedPrecondition {
                         core_metrics().metaserver_session_resets.add(1, &[]);
-                        heartbeat_after_insert_failure = true;
+                        node_registered = false;
                     }
                     insert_failed_at = Some(i);
                     break;
@@ -384,16 +383,12 @@ async fn registration_loop(
                     .add(remove_total as u64, &[]);
             }
             client = None;
-            if heartbeat_after_insert_failure {
-                node_registered = false;
-            }
             continue;
         }
 
         // Process removes
         let remove_namespaces: Vec<(String, Vec<Vec<u8>>)> = removes.into_iter().collect();
         let mut remove_failed_at = None;
-        let mut heartbeat_after_remove_failure = false;
 
         for (i, (namespace, hashes)) in remove_namespaces.iter().enumerate() {
             let count = hashes.len();
@@ -419,7 +414,7 @@ async fn registration_loop(
                     );
                     if e.code() == Code::FailedPrecondition {
                         core_metrics().metaserver_session_resets.add(1, &[]);
-                        heartbeat_after_remove_failure = true;
+                        node_registered = false;
                     }
                     remove_failed_at = Some(i);
                     break;
@@ -433,9 +428,6 @@ async fn registration_loop(
                 .metaserver_removal_failures
                 .add(dropped as u64, &[]);
             client = None;
-            if heartbeat_after_remove_failure {
-                node_registered = false;
-            }
         }
     }
 
