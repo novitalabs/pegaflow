@@ -4,11 +4,12 @@ use log::{debug, error, info, warn};
 use pegaflow_proto::proto::engine::meta_server_client::MetaServerClient as MetaServerGrpcClient;
 use pegaflow_proto::proto::engine::{
     HeartbeatNodeRequest, InsertBlockHashesRequest, NodePrefixResult, QueryPrefixBlocksRequest,
-    RegisterNodeRequest, RemoveBlockHashesRequest, UnregisterNodeRequest,
+    RemoveBlockHashesRequest, UnregisterNodeRequest,
 };
 use tokio::sync::{mpsc, oneshot};
 use tonic::Code;
 use tonic::transport::{Channel, Endpoint};
+use uuid::Uuid;
 
 use crate::metrics::core_metrics;
 
@@ -229,7 +230,8 @@ async fn registration_loop(
     advertise_addr: String,
 ) {
     let mut client: Option<MetaServerGrpcClient<Channel>> = None;
-    let mut node_id: Option<String> = None;
+    let node_id = Uuid::new_v4().to_string();
+    let mut node_registered = false;
     let mut backoff_ms: u64 = INITIAL_BACKOFF_MS;
     let heartbeat_period = tokio::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS);
     let mut heartbeat = tokio::time::interval_at(
@@ -245,28 +247,15 @@ async fn registration_loop(
                 None => break,
             },
             _ = heartbeat.tick() => {
-                if ensure_registered(
+                if send_heartbeat(
                     &mut client,
-                    &mut node_id,
+                    &mut node_registered,
                     &metaserver_addr,
                     &advertise_addr,
+                    &node_id,
                     &mut backoff_ms,
                 ).await.is_err() {
                     continue;
-                }
-                if let (Some(c), Some(id)) = (client.as_mut(), node_id.as_ref()) {
-                    if let Err(e) = c.heartbeat_node(HeartbeatNodeRequest {
-                        node: advertise_addr.clone(),
-                        node_id: id.clone(),
-                    }).await {
-                        warn!("MetaServer heartbeat failed: {e}");
-                        core_metrics().metaserver_heartbeat_failures.add(1, &[]);
-                        if e.code() == Code::FailedPrecondition {
-                            core_metrics().metaserver_session_resets.add(1, &[]);
-                            node_id = None;
-                        }
-                        client = None;
-                    }
                 }
                 continue;
             }
@@ -324,11 +313,12 @@ async fn registration_loop(
 
         let insert_total: usize = inserts.values().map(|v| v.len()).sum();
         let remove_total: usize = removes.values().map(|v| v.len()).sum();
-        if ensure_registered(
+        if ensure_heartbeat_registered(
             &mut client,
-            &mut node_id,
+            &mut node_registered,
             &metaserver_addr,
             &advertise_addr,
+            &node_id,
             &mut backoff_ms,
         )
         .await
@@ -344,15 +334,11 @@ async fn registration_loop(
         }
 
         let c = client.as_mut().expect("client is Some after lazy-connect");
-        let id = node_id
-            .as_ref()
-            .expect("node_id is Some after ensure_registered")
-            .clone();
 
         // Process inserts
         let insert_namespaces: Vec<(String, Vec<Vec<u8>>)> = inserts.into_iter().collect();
         let mut insert_failed_at = None;
-        let mut reset_session_after_insert_failure = false;
+        let mut heartbeat_after_insert_failure = false;
 
         for (i, (namespace, hashes)) in insert_namespaces.iter().enumerate() {
             let count = hashes.len();
@@ -360,7 +346,7 @@ async fn registration_loop(
                 namespace: namespace.clone(),
                 block_hashes: hashes.clone(),
                 node: advertise_addr.clone(),
-                node_id: id.clone(),
+                node_id: node_id.clone(),
             };
 
             match c.insert_block_hashes(request).await {
@@ -378,7 +364,7 @@ async fn registration_loop(
                     );
                     if e.code() == Code::FailedPrecondition {
                         core_metrics().metaserver_session_resets.add(1, &[]);
-                        reset_session_after_insert_failure = true;
+                        heartbeat_after_insert_failure = true;
                     }
                     insert_failed_at = Some(i);
                     break;
@@ -398,8 +384,8 @@ async fn registration_loop(
                     .add(remove_total as u64, &[]);
             }
             client = None;
-            if reset_session_after_insert_failure {
-                node_id = None;
+            if heartbeat_after_insert_failure {
+                node_registered = false;
             }
             continue;
         }
@@ -407,7 +393,7 @@ async fn registration_loop(
         // Process removes
         let remove_namespaces: Vec<(String, Vec<Vec<u8>>)> = removes.into_iter().collect();
         let mut remove_failed_at = None;
-        let mut reset_session_after_remove_failure = false;
+        let mut heartbeat_after_remove_failure = false;
 
         for (i, (namespace, hashes)) in remove_namespaces.iter().enumerate() {
             let count = hashes.len();
@@ -415,7 +401,7 @@ async fn registration_loop(
                 namespace: namespace.clone(),
                 block_hashes: hashes.clone(),
                 node: advertise_addr.clone(),
-                node_id: id.clone(),
+                node_id: node_id.clone(),
             };
 
             match c.remove_block_hashes(request).await {
@@ -433,7 +419,7 @@ async fn registration_loop(
                     );
                     if e.code() == Code::FailedPrecondition {
                         core_metrics().metaserver_session_resets.add(1, &[]);
-                        reset_session_after_remove_failure = true;
+                        heartbeat_after_remove_failure = true;
                     }
                     remove_failed_at = Some(i);
                     break;
@@ -447,8 +433,8 @@ async fn registration_loop(
                 .metaserver_removal_failures
                 .add(dropped as u64, &[]);
             client = None;
-            if reset_session_after_remove_failure {
-                node_id = None;
+            if heartbeat_after_remove_failure {
+                node_registered = false;
             }
         }
     }
@@ -456,11 +442,35 @@ async fn registration_loop(
     info!("MetaServer registration loop shutting down");
 }
 
-async fn ensure_registered(
+async fn ensure_heartbeat_registered(
     client: &mut Option<MetaServerGrpcClient<Channel>>,
-    node_id: &mut Option<String>,
+    node_registered: &mut bool,
     metaserver_addr: &str,
     advertise_addr: &str,
+    node_id: &str,
+    backoff_ms: &mut u64,
+) -> Result<(), ()> {
+    if *node_registered {
+        return Ok(());
+    }
+
+    send_heartbeat(
+        client,
+        node_registered,
+        metaserver_addr,
+        advertise_addr,
+        node_id,
+        backoff_ms,
+    )
+    .await
+}
+
+async fn send_heartbeat(
+    client: &mut Option<MetaServerGrpcClient<Channel>>,
+    node_registered: &mut bool,
+    metaserver_addr: &str,
+    advertise_addr: &str,
+    node_id: &str,
     backoff_ms: &mut u64,
 ) -> Result<(), ()> {
     if client.is_none() {
@@ -479,27 +489,27 @@ async fn ensure_registered(
         }
     }
 
-    if node_id.is_some() {
-        return Ok(());
-    }
-
     let c = client.as_mut().expect("client is connected");
     match c
-        .register_node(RegisterNodeRequest {
+        .heartbeat_node(HeartbeatNodeRequest {
             node: advertise_addr.to_string(),
+            node_id: node_id.to_string(),
         })
         .await
     {
-        Ok(resp) => {
-            let id = resp.into_inner().node_id;
-            info!("Registered MetaServer node session: node={advertise_addr} node_id={id}");
-            *node_id = Some(id);
+        Ok(_) => {
+            info!("Heartbeat accepted by MetaServer: node={advertise_addr} node_id={node_id}");
+            *node_registered = true;
             *backoff_ms = INITIAL_BACKOFF_MS;
             Ok(())
         }
         Err(e) => {
-            error!("MetaServer register_node failed: {e}");
-            core_metrics().metaserver_node_register_failures.add(1, &[]);
+            warn!("MetaServer heartbeat failed: {e}");
+            core_metrics().metaserver_heartbeat_failures.add(1, &[]);
+            if e.code() == Code::FailedPrecondition {
+                core_metrics().metaserver_session_resets.add(1, &[]);
+                *node_registered = false;
+            }
             *client = None;
             tokio::time::sleep(tokio::time::Duration::from_millis(*backoff_ms)).await;
             *backoff_ms = (*backoff_ms * 2).min(MAX_BACKOFF_MS);
@@ -512,12 +522,8 @@ async fn unregister_current_session(
     client: &mut Option<MetaServerGrpcClient<Channel>>,
     metaserver_addr: &str,
     advertise_addr: &str,
-    node_id: &Option<String>,
+    node_id: &str,
 ) {
-    let Some(id) = node_id.as_ref() else {
-        return;
-    };
-
     if client.is_none() {
         match MetaServerGrpcClient::connect(metaserver_addr.to_string()).await {
             Ok(c) => *client = Some(c),
@@ -534,7 +540,7 @@ async fn unregister_current_session(
     };
     let request = UnregisterNodeRequest {
         node: advertise_addr.to_string(),
-        node_id: id.clone(),
+        node_id: node_id.to_string(),
     };
     match tokio::time::timeout(
         tokio::time::Duration::from_secs(UNREGISTER_TIMEOUT_SECS),

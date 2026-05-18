@@ -3,8 +3,8 @@ use crate::proto::engine::meta_server_server::MetaServer;
 use crate::proto::engine::{
     HeartbeatNodeRequest, HeartbeatNodeResponse, InsertBlockHashesRequest,
     InsertBlockHashesResponse, NodePrefixResult, QueryPrefixBlocksRequest,
-    QueryPrefixBlocksResponse, RegisterNodeRequest, RegisterNodeResponse, RemoveBlockHashesRequest,
-    RemoveBlockHashesResponse, ResponseStatus, UnregisterNodeRequest, UnregisterNodeResponse,
+    QueryPrefixBlocksResponse, RemoveBlockHashesRequest, RemoveBlockHashesResponse, ResponseStatus,
+    UnregisterNodeRequest, UnregisterNodeResponse,
 };
 use crate::store::{BlockHashStore, StoreError};
 use log::debug;
@@ -49,27 +49,6 @@ impl GrpcMetaService {
 
 #[async_trait]
 impl MetaServer for GrpcMetaService {
-    async fn register_node(
-        &self,
-        request: Request<RegisterNodeRequest>,
-    ) -> Result<Response<RegisterNodeResponse>, Status> {
-        let start = Instant::now();
-        let req = request.into_inner();
-        if req.node.is_empty() {
-            let result = Err(Status::invalid_argument("node cannot be empty"));
-            record_rpc_result("register_node", &result, start);
-            return result;
-        }
-
-        let node_id = self.store.register_node(&req.node);
-        let result = Ok(Response::new(RegisterNodeResponse {
-            status: Some(Self::ok_status()),
-            node_id: node_id.to_string(),
-        }));
-        record_rpc_result("register_node", &result, start);
-        result
-    }
-
     async fn heartbeat_node(
         &self,
         request: Request<HeartbeatNodeRequest>,
@@ -307,18 +286,21 @@ mod tests {
         GrpcMetaService::new(Arc::new(BlockHashStore::new()))
     }
 
-    async fn register_node(svc: &GrpcMetaService, node: &str) -> String {
-        svc.register_node(Request::new(RegisterNodeRequest { node: node.into() }))
-            .await
-            .unwrap()
-            .into_inner()
-            .node_id
+    async fn heartbeat_node(svc: &GrpcMetaService, node: &str) -> String {
+        let node_id = Uuid::new_v4().to_string();
+        svc.heartbeat_node(Request::new(HeartbeatNodeRequest {
+            node: node.into(),
+            node_id: node_id.clone(),
+        }))
+        .await
+        .unwrap();
+        node_id
     }
 
     #[tokio::test]
     async fn test_remove_block_hashes_own_blocks() {
         let svc = make_service();
-        let node_id = register_node(&svc, "node-a").await;
+        let node_id = heartbeat_node(&svc, "node-a").await;
 
         // Insert
         svc.insert_block_hashes(Request::new(InsertBlockHashesRequest {
@@ -360,8 +342,8 @@ mod tests {
     #[tokio::test]
     async fn test_remove_block_hashes_wrong_owner_is_noop() {
         let svc = make_service();
-        let node_b_id = register_node(&svc, "node-b").await;
-        let node_a_id = register_node(&svc, "node-a").await;
+        let node_b_id = heartbeat_node(&svc, "node-b").await;
+        let node_a_id = heartbeat_node(&svc, "node-a").await;
 
         svc.insert_block_hashes(Request::new(InsertBlockHashesRequest {
             namespace: "ns".into(),
@@ -402,7 +384,7 @@ mod tests {
     #[tokio::test]
     async fn test_remove_block_hashes_empty_request_returns_error() {
         let svc = make_service();
-        let node_id = register_node(&svc, "node-a").await;
+        let node_id = heartbeat_node(&svc, "node-a").await;
 
         let resp = svc
             .remove_block_hashes(Request::new(RemoveBlockHashesRequest {
@@ -422,7 +404,7 @@ mod tests {
     #[tokio::test]
     async fn test_heartbeat_node_accepts_current_session() {
         let svc = make_service();
-        let node_id = register_node(&svc, "node-a").await;
+        let node_id = heartbeat_node(&svc, "node-a").await;
 
         let resp = svc
             .heartbeat_node(Request::new(HeartbeatNodeRequest {
@@ -437,10 +419,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_insert_with_old_session_is_rejected_after_reregister() {
+    async fn test_heartbeat_with_active_different_session_is_rejected() {
         let svc = make_service();
-        let old_id = register_node(&svc, "node-a").await;
-        let new_id = register_node(&svc, "node-a").await;
+        let old_id = heartbeat_node(&svc, "node-a").await;
+        let new_id = Uuid::new_v4().to_string();
+        assert_ne!(old_id, new_id);
+
+        let err = svc
+            .heartbeat_node(Request::new(HeartbeatNodeRequest {
+                node: "node-a".into(),
+                node_id: new_id,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn test_old_session_insert_is_rejected_after_stale_takeover() {
+        let store = Arc::new(BlockHashStore::with_config(crate::store::StoreConfig {
+            node_stale_after: std::time::Duration::ZERO,
+            ttl: std::time::Duration::from_secs(60),
+        }));
+        let svc = GrpcMetaService::new(store);
+        let old_id = heartbeat_node(&svc, "node-a").await;
+        let new_id = heartbeat_node(&svc, "node-a").await;
         assert_ne!(old_id, new_id);
 
         let err = svc
@@ -459,7 +462,7 @@ mod tests {
     #[tokio::test]
     async fn test_unregister_node_removes_matching_owners() {
         let svc = make_service();
-        let node_id = register_node(&svc, "node-a").await;
+        let node_id = heartbeat_node(&svc, "node-a").await;
 
         svc.insert_block_hashes(Request::new(InsertBlockHashesRequest {
             namespace: "ns".into(),
@@ -506,8 +509,8 @@ mod tests {
 
         let node_a = "node-a:50055";
         let node_b = "node-b:50055";
-        let node_a_id = register_node(&svc, node_a).await;
-        let node_b_id = register_node(&svc, node_b).await;
+        let node_a_id = heartbeat_node(&svc, node_a).await;
+        let node_b_id = heartbeat_node(&svc, node_b).await;
 
         svc.insert_block_hashes(Request::new(InsertBlockHashesRequest {
             namespace: namespace.into(),

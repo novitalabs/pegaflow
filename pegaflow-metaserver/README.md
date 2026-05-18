@@ -82,7 +82,7 @@ cargo run -p pegaflow-metaserver -- --help
 The MetaServer uses a DashMap-based in-memory store with the following characteristics:
 
 - **Multi-owner**: A block hash can be registered by multiple nodes simultaneously
-- **Node lifecycle**: Servers call `RegisterNode`, heartbeat periodically, and include the returned `node_id` in insert/remove RPCs.
+- **Node lifecycle**: Servers generate a `node_id`, announce it with `HeartbeatNode`, heartbeat periodically, and include the same `node_id` in insert/remove RPCs.
 - **Stale filtering**: Nodes stop appearing in query results after 30 seconds without heartbeat by default.
 - **TTL sweep**: A background task removes expired owners and nodes after `--ttl-minutes`.
 - **Conditional removal**: `RemoveBlockHashes` only removes the requesting node's ownership; other nodes' entries are untouched.
@@ -92,24 +92,11 @@ The MetaServer uses a DashMap-based in-memory store with the following character
 
 The MetaServer provides the following gRPC endpoints:
 
-### 1. RegisterNode
+### 1. HeartbeatNode
 
-Register a pegaflow-server node URL and receive a session id.
-
-```protobuf
-message RegisterNodeRequest {
-  string node = 1;
-}
-
-message RegisterNodeResponse {
-  ResponseStatus status = 1;
-  string node_id = 2;
-}
-```
-
-### 2. HeartbeatNode
-
-Refresh node liveness for the current session.
+Register or refresh node liveness for the current session. A different
+`node_id` may take over the same node URL only after the current session is
+stale.
 
 ```protobuf
 message HeartbeatNodeRequest {
@@ -118,7 +105,7 @@ message HeartbeatNodeRequest {
 }
 ```
 
-### 3. UnregisterNode
+### 2. UnregisterNode
 
 Gracefully remove a node and its matching ownership records.
 
@@ -129,7 +116,7 @@ message UnregisterNodeRequest {
 }
 ```
 
-### 4. InsertBlockHashes
+### 3. InsertBlockHashes
 
 Register a list of block hashes. The request must include the current `node_id`.
 
@@ -139,7 +126,7 @@ message InsertBlockHashesRequest {
   string namespace = 1;         // Model namespace (part of BlockKey)
   repeated bytes block_hashes = 2;  // List of block hashes to insert (part of BlockKey)
   string node = 3;              // The pegaflow-server gRPC address that owns these blocks
-  string node_id = 4;           // Session id returned by RegisterNode
+  string node_id = 4;           // Server-generated session id announced by HeartbeatNode
 }
 ```
 
@@ -151,7 +138,7 @@ message InsertBlockHashesResponse {
 }
 ```
 
-### 5. RemoveBlockHashes
+### 4. RemoveBlockHashes
 
 Remove block hashes owned by a specific node (conditional delete).
 
@@ -173,7 +160,7 @@ message RemoveBlockHashesResponse {
 }
 ```
 
-### 6. QueryPrefixBlocks
+### 5. QueryPrefixBlocks
 
 Query the longest contiguous prefix of block hashes that exist, with per-node prefix lengths.
 
@@ -197,14 +184,14 @@ message QueryPrefixBlocksResponse {
 }
 ```
 
-### 7. Health
+### 6. Health
 
 Health check endpoint.
 
 **Request:** `HealthRequest {}`
 **Response:** `HealthResponse { status }`
 
-### 8. Shutdown
+### 7. Shutdown
 
 Graceful shutdown trigger.
 
@@ -222,8 +209,8 @@ Graceful shutdown trigger.
 
 ## Integration with PegaFlow Core
 
-1. **On server startup**: Call `RegisterNode` and retain the returned `node_id`
-2. **During server lifetime**: Call `HeartbeatNode` periodically
+1. **On server startup**: Generate a `node_id` and announce it with `HeartbeatNode`
+2. **During server lifetime**: Call `HeartbeatNode` periodically with the same `node_id`
 3. **On block save**: Call `InsertBlockHashes` with `{ node, node_id }`
 4. **On cache eviction**: Call `RemoveBlockHashes` with `{ node, node_id }`
 5. **On block query**: Call `QueryPrefixBlocks` to discover which live nodes hold a prefix

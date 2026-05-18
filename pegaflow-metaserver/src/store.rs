@@ -1,4 +1,4 @@
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry};
 use pegaflow_common::BlockKey;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -91,20 +91,29 @@ impl BlockHashStore {
         })
     }
 
-    pub fn register_node(&self, node: &str) -> Uuid {
-        let node_id = Uuid::new_v4();
-        self.nodes.insert(
-            Arc::from(node),
-            NodeRecord {
-                node_id,
-                last_seen: Instant::now(),
-            },
-        );
-        node_id
-    }
-
     pub fn heartbeat_node(&self, node: &str, node_id: Uuid) -> Result<(), StoreError> {
-        self.touch_node_session(node, node_id)
+        let now = Instant::now();
+        match self.nodes.entry(Arc::from(node)) {
+            Entry::Vacant(entry) => {
+                entry.insert(NodeRecord {
+                    node_id,
+                    last_seen: now,
+                });
+                Ok(())
+            }
+            Entry::Occupied(mut entry) => {
+                let record = entry.get_mut();
+                let same_session = record.node_id == node_id;
+                let stale_session =
+                    now.duration_since(record.last_seen) > self.config.node_stale_after;
+                if same_session || stale_session {
+                    record.node_id = node_id;
+                    record.last_seen = now;
+                    return Ok(());
+                }
+                Err(StoreError::StaleSession)
+            }
+        }
     }
 
     pub fn unregister_node(&self, node: &str, node_id: Uuid) -> Result<usize, StoreError> {
@@ -321,12 +330,18 @@ impl Default for BlockHashStore {
 mod tests {
     use super::*;
 
+    fn heartbeat_node(store: &BlockHashStore, node: &str) -> Uuid {
+        let node_id = Uuid::new_v4();
+        store.heartbeat_node(node, node_id).unwrap();
+        node_id
+    }
+
     #[test]
     fn test_register_insert_and_query() {
         let store = BlockHashStore::new();
         let namespace = "model-a";
         let node = "10.0.0.1:50055";
-        let node_id = store.register_node(node);
+        let node_id = heartbeat_node(&store, node);
 
         let hashes = vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8], vec![9, 10, 11, 12]];
 
@@ -357,8 +372,8 @@ mod tests {
         let hash = vec![1, 2, 3, 4];
         let node_a = "node-a:50055";
         let node_b = "node-b:50055";
-        let node_a_id = store.register_node(node_a);
-        let node_b_id = store.register_node(node_b);
+        let node_a_id = heartbeat_node(&store, node_a);
+        let node_b_id = heartbeat_node(&store, node_b);
 
         store
             .insert_hashes(namespace, std::slice::from_ref(&hash), node_a, node_a_id)
@@ -394,7 +409,7 @@ mod tests {
         let namespace = "model-a";
         let hash = vec![1, 2, 3, 4];
         let node = "node-a";
-        let node_id = store.register_node(node);
+        let node_id = heartbeat_node(&store, node);
 
         store
             .insert_hashes(namespace, std::slice::from_ref(&hash), node, node_id)
@@ -412,8 +427,8 @@ mod tests {
         let store = BlockHashStore::new();
         let namespace = "model-a";
         let hash = vec![1, 2, 3, 4];
-        let node_b_id = store.register_node("node-b");
-        let node_a_id = store.register_node("node-a");
+        let node_b_id = heartbeat_node(&store, "node-b");
+        let node_a_id = heartbeat_node(&store, "node-a");
 
         store
             .insert_hashes(namespace, std::slice::from_ref(&hash), "node-b", node_b_id)
@@ -430,8 +445,8 @@ mod tests {
     fn test_remove_one_owner_keeps_others() {
         let store = BlockHashStore::new();
         let hash = vec![1, 2, 3];
-        let node_a_id = store.register_node("node-a");
-        let node_b_id = store.register_node("node-b");
+        let node_a_id = heartbeat_node(&store, "node-a");
+        let node_b_id = heartbeat_node(&store, "node-b");
 
         store
             .insert_hashes("ns", std::slice::from_ref(&hash), "node-a", node_a_id)
@@ -454,7 +469,7 @@ mod tests {
     #[test]
     fn test_remove_nonexistent_is_noop() {
         let store = BlockHashStore::new();
-        let node_id = store.register_node("node-a");
+        let node_id = heartbeat_node(&store, "node-a");
         let removed = store
             .remove_hashes("ns", &[vec![9, 9, 9]], "node-a", node_id)
             .unwrap();
@@ -462,13 +477,26 @@ mod tests {
     }
 
     #[test]
+    fn test_heartbeat_rejects_active_different_session() {
+        let store = BlockHashStore::new();
+        let old_id = heartbeat_node(&store, "node-a");
+        let new_id = Uuid::new_v4();
+        assert_ne!(old_id, new_id);
+
+        let err = store.heartbeat_node("node-a", new_id).unwrap_err();
+        assert_eq!(err, StoreError::StaleSession);
+    }
+
+    #[test]
     fn test_query_filters_superseded_node_session() {
         let store = BlockHashStore::new();
-        let old_id = store.register_node("node-a");
+        let old_id = heartbeat_node(&store, "node-a");
         store
             .insert_hashes("ns", &[vec![1]], "node-a", old_id)
             .unwrap();
-        let new_id = store.register_node("node-a");
+        store.nodes.get_mut("node-a").unwrap().last_seen =
+            Instant::now() - Duration::from_secs(DEFAULT_NODE_STALE_SECS + 1);
+        let new_id = heartbeat_node(&store, "node-a");
         assert_ne!(old_id, new_id);
 
         let existing = store.query_prefix("ns", &[vec![1]]);
@@ -479,11 +507,13 @@ mod tests {
     #[test]
     fn test_sweep_keeps_superseded_owner_until_ttl() {
         let store = BlockHashStore::new();
-        let old_id = store.register_node("node-a");
+        let old_id = heartbeat_node(&store, "node-a");
         store
             .insert_hashes("ns", &[vec![1]], "node-a", old_id)
             .unwrap();
-        let new_id = store.register_node("node-a");
+        store.nodes.get_mut("node-a").unwrap().last_seen =
+            Instant::now() - Duration::from_secs(DEFAULT_NODE_STALE_SECS + 1);
+        let new_id = heartbeat_node(&store, "node-a");
         assert_ne!(old_id, new_id);
 
         let removed = store.sweep_expired();
@@ -498,11 +528,12 @@ mod tests {
             node_stale_after: Duration::ZERO,
             ttl: Duration::ZERO,
         });
-        let old_id = store.register_node("node-a");
+        let old_id = heartbeat_node(&store, "node-a");
         store
             .insert_hashes("ns", &[vec![1]], "node-a", old_id)
             .unwrap();
-        let new_id = store.register_node("node-a");
+        store.nodes.get_mut("node-a").unwrap().last_seen = Instant::now() - Duration::from_secs(1);
+        let new_id = heartbeat_node(&store, "node-a");
         assert_ne!(old_id, new_id);
 
         let removed = store.sweep_expired();
@@ -520,8 +551,10 @@ mod tests {
     #[test]
     fn test_late_unregister_old_session_does_not_remove_current_node() {
         let store = BlockHashStore::new();
-        let old_id = store.register_node("node-a");
-        let new_id = store.register_node("node-a");
+        let old_id = heartbeat_node(&store, "node-a");
+        store.nodes.get_mut("node-a").unwrap().last_seen =
+            Instant::now() - Duration::from_secs(DEFAULT_NODE_STALE_SECS + 1);
+        let new_id = heartbeat_node(&store, "node-a");
         assert_ne!(old_id, new_id);
 
         store
@@ -551,7 +584,7 @@ mod tests {
             node_stale_after: Duration::ZERO,
             ttl: Duration::from_secs(60),
         });
-        let node_id = store.register_node("node-a");
+        let node_id = heartbeat_node(&store, "node-a");
         store
             .insert_hashes("ns", &[vec![1]], "node-a", node_id)
             .unwrap();
@@ -568,7 +601,7 @@ mod tests {
             node_stale_after: Duration::from_secs(60),
             ttl: Duration::from_secs(60),
         });
-        let node_id = store.register_node("node-a");
+        let node_id = heartbeat_node(&store, "node-a");
         store.nodes.get_mut("node-a").unwrap().last_seen = Instant::now() - Duration::from_secs(61);
 
         store
@@ -587,7 +620,7 @@ mod tests {
             node_stale_after: Duration::from_secs(60),
             ttl: Duration::from_secs(60),
         });
-        let node_id = store.register_node("node-a");
+        let node_id = heartbeat_node(&store, "node-a");
         store
             .insert_hashes("ns", &[vec![1]], "node-a", node_id)
             .unwrap();
@@ -606,7 +639,7 @@ mod tests {
             node_stale_after: Duration::ZERO,
             ttl: Duration::ZERO,
         });
-        let node_id = store.register_node("node-a");
+        let node_id = heartbeat_node(&store, "node-a");
         store
             .insert_hashes("ns", &[vec![1], vec![2]], "node-a", node_id)
             .unwrap();
@@ -630,7 +663,7 @@ mod tests {
     #[test]
     fn test_sweep_keeps_fresh_entries() {
         let store = BlockHashStore::new();
-        let node_id = store.register_node("node-a");
+        let node_id = heartbeat_node(&store, "node-a");
         store
             .insert_hashes("ns", &[vec![1], vec![2]], "node-a", node_id)
             .unwrap();
@@ -648,8 +681,8 @@ mod tests {
         let hash = vec![1, 2, 3, 4];
 
         for _ in 0..100 {
-            let node_a_id = store.register_node("node-a");
-            let node_b_id = store.register_node("node-b");
+            let node_a_id = heartbeat_node(&store, "node-a");
+            let node_b_id = heartbeat_node(&store, "node-b");
             store
                 .insert_hashes("ns", std::slice::from_ref(&hash), "node-a", node_a_id)
                 .unwrap();
@@ -688,7 +721,7 @@ mod tests {
         let store = BlockHashStore::new();
         let namespace = "model-test";
         let node = "10.0.0.1:50055";
-        let node_id = store.register_node(node);
+        let node_id = heartbeat_node(&store, node);
 
         let hashes = vec![vec![1, 2, 3], vec![4, 5, 6]];
         store

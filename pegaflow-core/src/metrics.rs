@@ -382,7 +382,7 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
                 .build(),
             metaserver_node_register_failures: meter
                 .u64_counter("pegaflow_metaserver_node_register_failures")
-                .with_description("MetaServer RegisterNode RPC failures")
+                .with_description("MetaServer node heartbeat registration failures")
                 .build(),
             metaserver_heartbeat_failures: meter
                 .u64_counter("pegaflow_metaserver_heartbeat_failures")

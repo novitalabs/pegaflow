@@ -40,7 +40,7 @@ internode/
 |                  | client.rs                          | registrar.rs                        |
 |------------------|------------------------------------|-------------------------------------|
 | Talks to         | Remote **pegaflow-server**         | Central **pegaflow-metaserver**     |
-| RPC service      | `Engine` (Query, Health)           | `MetaServer` (RegisterNode, HeartbeatNode, InsertBlockHashes) |
+| RPC service      | `Engine` (Query, Health)           | `MetaServer` (HeartbeatNode, InsertBlockHashes, RemoveBlockHashes) |
 | Direction        | Read path — query remote cache     | Write path — register sealed blocks |
 | Call pattern     | Request-response (caller awaits)   | Fire-and-forget (`try_send`)        |
 | Connection mgmt  | Pool of connections (multi-node)   | Single lazy connection + node session heartbeat |
@@ -61,11 +61,11 @@ insert_worker_loop (sync thread)
 
 Both use the same pattern: `tokio::sync::mpsc::try_send()` from the sync insert thread,
 with an async tokio task draining the channel on the other end. The background
-task registers this server's advertise address first, keeps the returned
-`node_id`, sends heartbeats, and attaches `{node, node_id}` to insert/remove
-RPCs. If the MetaServer restarts or rejects a stale session, the task
-re-registers and continues with future queued updates. It does not backfill
-resident cache keys that were registered before the MetaServer lost state.
+task generates a local `node_id`, announces it with `HeartbeatNode`, and attaches
+`{node, node_id}` to insert/remove RPCs. If the MetaServer restarts or rejects a
+missing session, the task sends heartbeat again and continues with future queued
+updates. It does not backfill resident cache keys that were registered before
+the MetaServer lost state.
 
 ## Configuration
 
