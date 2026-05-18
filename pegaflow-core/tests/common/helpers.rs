@@ -9,7 +9,7 @@ pub const LOAD_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_TEST_POOL_SIZE: usize = 16 << 20;
 
 pub fn test_engine_with_pool(pool_size: usize, config: StorageConfig) -> PegaEngine {
-    PegaEngine::new_with_config(pool_size, false, config)
+    PegaEngine::new_with_config(pool_size, false, config).expect("test engine should start")
 }
 
 /// Layer registration info for batch registration.

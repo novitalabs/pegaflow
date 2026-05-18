@@ -128,7 +128,7 @@ impl PegaEngine {
         pool_size: usize,
         use_hugepages: bool,
         storage_config: storage::StorageConfig,
-    ) -> Self {
+    ) -> Result<Self, EngineError> {
         let topology = Arc::new(NumaTopology::detect());
         topology.log_summary();
 
@@ -143,13 +143,14 @@ impl PegaEngine {
             vec![]
         };
 
-        let storage = StorageEngine::new_with_config(pool_size, use_hugepages, config, &numa_nodes);
+        let storage = StorageEngine::new_with_config(pool_size, use_hugepages, config, &numa_nodes)
+            .map_err(EngineError::Storage)?;
 
-        PegaEngine {
+        Ok(PegaEngine {
             instances: Arc::new(RwLock::new(HashMap::new())),
             storage,
             topology,
-        }
+        })
     }
 
     /// Get or create an instance with the specified topology.
@@ -701,5 +702,26 @@ impl PegaEngine {
             .map_err(|e| format!("complete_handshake failed: {e}"))?;
         info!("RDMA handshake accepted: client={client_addr}");
         Ok(server_meta.to_bytes())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rdma_initialization_failure_is_returned_to_caller() {
+        let config = storage::StorageConfig {
+            rdma_nic_names: Some(vec!["definitely-not-a-real-nic".to_string()]),
+            ..storage::StorageConfig::default()
+        };
+
+        let err = match PegaEngine::new_with_config(1 << 20, false, config) {
+            Ok(_) => panic!("engine startup must fail when RDMA NIC init fails"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(err.contains("Failed to initialise RDMA transport"), "{err}");
+        assert!(err.contains("definitely-not-a-real-nic"), "{err}");
     }
 }

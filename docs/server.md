@@ -45,7 +45,7 @@ pegaflow-server
 
 ### Cross-Node (Multi-Node Setup)
 
-- `--nics`: RDMA NIC names for inter-node transfer (e.g., `--nics mlx5_0 mlx5_1`). When set, pinned memory is registered for RDMA access on these NICs. Required for P2P KV cache sharing.
+- `--nics`: RDMA NIC names for inter-node transfer (e.g., `--nics mlx5_0,mlx5_1` or `--nics mlx5_0 mlx5_1`). When set, pinned memory is registered for RDMA access on these NICs. Required for P2P KV cache sharing.
 - `--metaserver-addr`: MetaServer gRPC address for cross-node block hash registry (e.g., `http://10.0.0.100:50056`). When set, saved block hashes are inserted to the metaserver for cross-node discovery. Requires `--addr` to be a routable IP (not `0.0.0.0` or `127.0.0.1`).
 - `--transfer-lock-timeout-secs`: Transfer lock timeout in seconds (default: `120`). Blocks held for cross-node RDMA transfer are locked for at most this duration before being force-released (crash recovery).
 - `--metaserver-queue-depth`: MetaServer registration queue depth, max pending registration batches

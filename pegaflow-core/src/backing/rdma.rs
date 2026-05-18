@@ -69,16 +69,12 @@ impl Drop for RdmaTransport {
     }
 }
 
-/// Create an [`RdmaTransport`], returning `None` on failure (logs the error).
+/// Create an [`RdmaTransport`].
 pub(crate) fn new_rdma(
     nic_names: &[String],
     allocator: &PinnedAllocator,
-) -> Option<Arc<RdmaTransport>> {
-    match RdmaTransport::new(nic_names, allocator) {
-        Ok(t) => Some(Arc::new(t)),
-        Err(e) => {
-            error!("Failed to initialise RDMA transport (nics={nic_names:?}): {e}");
-            None
-        }
-    }
+) -> Result<Arc<RdmaTransport>, String> {
+    RdmaTransport::new(nic_names, allocator)
+        .map(Arc::new)
+        .map_err(|e| format!("Failed to initialise RDMA transport (nics={nic_names:?}): {e}"))
 }

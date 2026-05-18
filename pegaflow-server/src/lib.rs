@@ -143,9 +143,9 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub blockwise_alloc: bool,
 
-    /// RDMA NIC names for inter-node transfer (e.g. --nics mlx5_0 mlx5_1).
+    /// RDMA NIC names for inter-node transfer (e.g. --nics mlx5_0,mlx5_1 or --nics mlx5_0 mlx5_1).
     /// When set, pinned memory is registered for RDMA access on these NICs.
-    #[arg(long, num_args = 1..)]
+    #[arg(long, value_delimiter = ',', value_parser = parse_nic_name, num_args = 1..)]
     pub nics: Option<Vec<String>>,
 
     /// MetaServer address for cross-node block hash registration (e.g. http://127.0.0.1:50056).
@@ -182,6 +182,14 @@ fn parse_hll_bucket_bits(s: &str) -> Result<u8, String> {
         ));
     }
     Ok(v)
+}
+
+fn parse_nic_name(s: &str) -> Result<String, String> {
+    let name = s.trim();
+    if name.is_empty() {
+        return Err("--nics contains an empty NIC name".into());
+    }
+    Ok(name.to_string())
 }
 
 fn parse_hll_windows_arg(s: &str) -> Result<String, String> {
@@ -570,7 +578,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             cli.pool_size,
             cli.use_hugepages,
             storage_config,
-        ));
+        )?);
 
         let service = GrpcEngineService::new(
             Arc::clone(&engine),
@@ -697,6 +705,58 @@ mod tests {
         assert_eq!(
             parse_hll_windows(&cli.metric_hll_windows).unwrap(),
             expected_hll_windows()
+        );
+    }
+
+    #[test]
+    fn cli_nics_accepts_comma_separated_values() {
+        let cli =
+            Cli::try_parse_from(["pegaflow-server", "--nics", "mlx5_0,mlx5_1,mlx5_2"]).unwrap();
+
+        assert_eq!(
+            cli.nics.unwrap(),
+            [
+                "mlx5_0".to_string(),
+                "mlx5_1".to_string(),
+                "mlx5_2".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn cli_nics_trims_comma_separated_values() {
+        let cli =
+            Cli::try_parse_from(["pegaflow-server", "--nics", "mlx5_0, mlx5_1, mlx5_2"]).unwrap();
+
+        assert_eq!(
+            cli.nics.unwrap(),
+            [
+                "mlx5_0".to_string(),
+                "mlx5_1".to_string(),
+                "mlx5_2".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn cli_nics_rejects_empty_comma_separated_values() {
+        let err = Cli::try_parse_from(["pegaflow-server", "--nics", "mlx5_0,,mlx5_1"]).unwrap_err();
+
+        assert!(err.to_string().contains("empty NIC name"), "{err}");
+    }
+
+    #[test]
+    fn cli_nics_accepts_repeated_values_after_flag() {
+        let cli = Cli::try_parse_from(["pegaflow-server", "--nics", "mlx5_0", "mlx5_1", "mlx5_2"])
+            .unwrap();
+
+        assert_eq!(
+            cli.nics.unwrap(),
+            [
+                "mlx5_0".to_string(),
+                "mlx5_1".to_string(),
+                "mlx5_2".to_string()
+            ]
         );
     }
 

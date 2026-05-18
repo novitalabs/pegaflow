@@ -287,7 +287,9 @@ async fn p2p_rdma_remote_fetch_roundtrip() {
         rdma_nic_names: Some(vec!["mlx5_1".into()]),
         ..StorageConfig::default()
     };
-    let engine_a = Arc::new(PegaEngine::new_with_config(16 << 20, false, config_a));
+    let engine_a = Arc::new(
+        PegaEngine::new_with_config(16 << 20, false, config_a).expect("engine A should start"),
+    );
 
     // ── 3. Start Engine A gRPC server ──
     spawn_engine_server(Arc::clone(&engine_a), port_a).await;
@@ -364,7 +366,8 @@ async fn p2p_rdma_remote_fetch_roundtrip() {
         rdma_nic_names: Some(vec!["mlx5_1".into()]),
         ..StorageConfig::default()
     };
-    let engine_b = PegaEngine::new_with_config(16 << 20, false, config_b);
+    let engine_b =
+        PegaEngine::new_with_config(16 << 20, false, config_b).expect("engine B should start");
 
     let gpu_b = GpuBuffer::alloc(TOTAL_SIZE);
     gpu_b.zero();

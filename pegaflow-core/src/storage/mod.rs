@@ -102,7 +102,7 @@ impl StorageEngine {
         use_hugepages: bool,
         config: StorageConfig,
         numa_nodes: &[NumaNode],
-    ) -> Arc<Self> {
+    ) -> Result<Arc<Self>, String> {
         let value_size_hint = config.hint_value_size_bytes.filter(|size| *size > 0);
         let unit_hint = value_size_hint.and_then(|size| NonZeroU64::new(size as u64));
         let max_prefetch_blocks = config.max_prefetch_blocks;
@@ -170,10 +170,10 @@ impl StorageEngine {
 
         // RDMA transport must be created after the allocator so it can
         // register the pinned memory regions with the RDMA NICs.
-        let rdma_transport = rdma_nic_names
-            .as_deref()
-            .filter(|nics| !nics.is_empty())
-            .and_then(|nics| crate::backing::new_rdma(nics, &allocator));
+        let rdma_transport = match rdma_nic_names.as_deref().filter(|nics| !nics.is_empty()) {
+            Some(nics) => Some(crate::backing::new_rdma(nics, &allocator)?),
+            None => None,
+        };
 
         if let Some(ref rdma) = rdma_transport {
             crate::metrics::register_rdma_gauges(rdma);
@@ -246,7 +246,7 @@ impl StorageEngine {
                 .expect("failed to spawn insert worker thread");
         }
 
-        engine
+        Ok(engine)
     }
 
     pub(crate) fn is_ssd_enabled(&self) -> bool {
@@ -624,7 +624,7 @@ mod tests {
     use super::*;
 
     fn make_engine() -> Arc<StorageEngine> {
-        StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[])
+        StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]).unwrap()
     }
 
     #[tokio::test]
@@ -725,7 +725,8 @@ mod tests {
     async fn allocate_bounded_reclaim_terminates() {
         // With a tiny pool, allocation of a huge block should fail fast
         // (not loop forever) thanks to MAX_RECLAIM_ROUNDS.
-        let storage = StorageEngine::new_with_config(4096, false, StorageConfig::default(), &[]);
+        let storage =
+            StorageEngine::new_with_config(4096, false, StorageConfig::default(), &[]).unwrap();
 
         // Try to allocate more than the entire pool
         let result = storage.allocate(NonZeroU64::new(1 << 30).unwrap(), None);
