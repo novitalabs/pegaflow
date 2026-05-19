@@ -478,6 +478,11 @@ impl InstanceContext {
         self.tp_size
     }
 
+    /// Total worker count registered for this instance.
+    pub(crate) fn world_size(&self) -> usize {
+        self.world_size
+    }
+
     /// Return unique valid NUMA nodes for registered shards in one save group.
     pub(crate) fn registered_numa_nodes_for_save_group(
         &self,

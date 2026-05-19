@@ -43,6 +43,7 @@ impl fmt::Debug for QueryLeaseId {
 struct QueryLease {
     instance_id: String,
     blocks: Vec<Arc<SealedBlock>>,
+    remaining_consumers: usize,
     expires_at: Instant,
 }
 
@@ -81,7 +82,12 @@ impl QueryLeaseManager {
         Self { inner, sweeper }
     }
 
-    pub(crate) fn create(&self, instance_id: &str, blocks: Vec<Arc<SealedBlock>>) -> QueryLeaseId {
+    pub(crate) fn create(
+        &self,
+        instance_id: &str,
+        blocks: Vec<Arc<SealedBlock>>,
+        consumers: usize,
+    ) -> QueryLeaseId {
         self.sweep_expired();
         debug_assert!(!blocks.is_empty(), "query leases require ready blocks");
 
@@ -89,6 +95,7 @@ impl QueryLeaseManager {
         let lease = QueryLease {
             instance_id: instance_id.to_string(),
             blocks,
+            remaining_consumers: consumers.max(1),
             expires_at: Instant::now() + DEFAULT_LEASE_TTL,
         };
         self.inner.insert(token, lease);
@@ -107,7 +114,7 @@ impl QueryLeaseManager {
             .lock()
             .expect("query leases lock poisoned");
         let lease = leases
-            .get(token)
+            .get_mut(token)
             .ok_or_else(|| "query lease is unknown or expired".to_string())?;
         if lease.instance_id != instance_id {
             return Err(format!(
@@ -115,6 +122,11 @@ impl QueryLeaseManager {
                 lease.instance_id, instance_id
             ));
         }
+        if lease.remaining_consumers > 1 {
+            lease.remaining_consumers -= 1;
+            return Ok(lease.blocks.clone());
+        }
+
         Ok(leases
             .remove(token)
             .expect("query lease disappeared during consume")
@@ -190,6 +202,7 @@ mod tests {
                 QueryLease {
                     instance_id: "inst-a".to_string(),
                     blocks: Vec::new(),
+                    remaining_consumers: 1,
                     expires_at: Instant::now() + DEFAULT_LEASE_TTL,
                 },
             );
@@ -203,5 +216,21 @@ mod tests {
         manager
             .consume("inst-a", &lease_id)
             .expect("original instance can still consume lease");
+    }
+
+    #[test]
+    fn consume_allows_configured_number_of_consumers() {
+        let manager = QueryLeaseManager::default();
+        let blocks = vec![Arc::new(SealedBlock::from_slots(Vec::new()))];
+        let lease_id = manager.create("inst-a", blocks, 2);
+
+        assert_eq!(manager.consume("inst-a", &lease_id).unwrap().len(), 1);
+        assert_eq!(manager.consume("inst-a", &lease_id).unwrap().len(), 1);
+
+        let err = manager
+            .consume("inst-a", &lease_id)
+            .err()
+            .expect("lease should be exhausted");
+        assert!(err.contains("query lease is unknown or expired"));
     }
 }

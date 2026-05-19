@@ -1,7 +1,7 @@
 //! Query lease protocol tests.
 //!
 //! Verifies the scheduler->worker contract: query_prefetch returns an opaque
-//! lease that owns ready blocks, and load consumes that lease exactly once.
+//! lease that owns ready blocks, and load consumes one lease share per worker.
 
 mod common;
 
@@ -26,7 +26,7 @@ async fn load_requires_query_prefetch() {
     env.expect_load_error(released, hashes.len(), "query lease is unknown or expired");
 }
 
-/// One scheduler query lease is consumed by one load.
+/// One scheduler query lease is consumed once per registered world-size worker.
 #[tokio::test]
 async fn query_then_load_consumes_reservation_budget() {
     let env = TestEnvBuilder::new("test-query-lease", "test-ns")
@@ -37,6 +37,10 @@ async fn query_then_load_consumes_reservation_budget() {
 
     env.save_and_wait(&hashes).await;
     let lease = env.assert_all_hit_lease(&hashes).await;
+
+    env.data().zero_gpu();
+    env.load_to_gpu(lease, hashes.len()).await;
+    env.data().assert_gpu_matches_expected();
 
     env.data().zero_gpu();
     env.load_to_gpu(lease, hashes.len()).await;
@@ -55,7 +59,7 @@ async fn query_then_load_consumes_reservation_budget() {
             &layer_names,
             &[(lease, block_ids)],
         )
-        .expect_err("second load should fail");
+        .expect_err("third load should fail");
     assert!(
         err.to_string()
             .contains("query lease is unknown or expired")

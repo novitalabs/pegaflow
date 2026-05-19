@@ -411,13 +411,15 @@ impl PegaEngine {
         instance_id: &str,
         blocks: Vec<Arc<SealedBlock>>,
     ) -> Result<QueryLeaseId, EngineError> {
-        self.get_instance(instance_id)?;
+        let instance = self.get_instance(instance_id)?;
         if blocks.is_empty() {
             return Err(EngineError::InvalidArgument(
                 "query lease requires at least one block".to_string(),
             ));
         }
-        Ok(self.query_leases.create(instance_id, blocks))
+        Ok(self
+            .query_leases
+            .create(instance_id, blocks, instance.world_size()))
     }
 
     /// Release a query lease. Unknown leases are successful no-ops.
