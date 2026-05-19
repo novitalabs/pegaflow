@@ -28,6 +28,7 @@ const ADVERTISE_ADDR: &str = "127.0.0.1:50055";
 
 const BLOCK_CASES: &[usize] = &[128, 1024, 8192, 32768];
 const BYTES_PER_BLOCK: usize = 1024;
+const MULTI_LAYER_COUNT: usize = 61;
 
 struct BenchFixture {
     engine: PegaEngine,
@@ -161,6 +162,108 @@ impl BenchFixture {
     }
 }
 
+struct MultiLayerBenchFixture {
+    engine: PegaEngine,
+    _ctx: Arc<CudaContext>,
+    _gpu: GpuBuffer,
+    layer_names: Vec<String>,
+    num_blocks: usize,
+}
+
+impl MultiLayerBenchFixture {
+    fn new(num_blocks: usize, bytes_per_block: usize) -> Self {
+        let ctx = CudaContext::new(DEVICE_ID as usize).expect("CUDA context");
+        ctx.bind_to_thread().expect("bind CUDA context");
+
+        let layer_bytes = num_blocks
+            .checked_mul(bytes_per_block)
+            .expect("registered GPU size overflow");
+        let gpu = GpuBuffer::new(Arc::clone(&ctx), layer_bytes);
+        let mut host = vec![0u8; layer_bytes];
+        fill_test_pattern(&mut host, bytes_per_block);
+        gpu.copy_from_host(&host);
+
+        let save_bytes = layer_bytes
+            .checked_mul(MULTI_LAYER_COUNT)
+            .expect("multi-layer save size overflow");
+        let pool_size = save_bytes
+            .checked_mul(4)
+            .and_then(|size| size.checked_add(64 << 20))
+            .expect("pool size overflow");
+        let engine = PegaEngine::new_with_config(
+            pool_size,
+            false,
+            StorageConfig {
+                enable_lfu_admission: false,
+                hint_value_size_bytes: Some(bytes_per_block),
+                enable_numa_affinity: false,
+                ..StorageConfig::default()
+            },
+        )
+        .expect("engine");
+
+        let layer_names: Vec<String> = (0..MULTI_LAYER_COUNT)
+            .map(|idx| format!("layer_{idx}"))
+            .collect();
+        let layer_ptrs = vec![gpu.as_u64(); MULTI_LAYER_COUNT];
+        let layer_sizes = vec![layer_bytes; MULTI_LAYER_COUNT];
+        let layer_blocks = vec![num_blocks; MULTI_LAYER_COUNT];
+        let block_sizes = vec![bytes_per_block; MULTI_LAYER_COUNT];
+        let strides = vec![0; MULTI_LAYER_COUNT];
+        let segments = vec![1; MULTI_LAYER_COUNT];
+
+        engine
+            .register_context_layer_batch(
+                INSTANCE_ID,
+                NAMESPACE,
+                DEVICE_ID,
+                0,
+                0,
+                1,
+                1,
+                1,
+                &layer_names,
+                &layer_ptrs,
+                &layer_sizes,
+                &layer_blocks,
+                &block_sizes,
+                &strides,
+                &segments,
+            )
+            .expect("register layers");
+
+        Self {
+            engine,
+            _ctx: ctx,
+            _gpu: gpu,
+            layer_names,
+            num_blocks,
+        }
+    }
+
+    async fn save_and_flush(&self, hashes: &[Vec<u8>]) {
+        let ids = block_ids(self.num_blocks);
+        let saves: Vec<LayerSave> = self
+            .layer_names
+            .iter()
+            .map(|layer_name| LayerSave {
+                layer_name: layer_name.clone(),
+                block_ids: ids.clone(),
+                block_hashes: hashes.to_vec(),
+            })
+            .collect();
+        self.engine
+            .batch_save_kv_blocks_from_ipc(INSTANCE_ID, 0, 0, DEVICE_ID, saves)
+            .await
+            .expect("save");
+        self.engine.flush_saves().await;
+    }
+
+    fn cleanup_cache(&self) {
+        black_box(self.engine.cleanup_memory_cache());
+    }
+}
+
 fn save_flush_benchmarks(c: &mut Criterion) {
     let rt = Runtime::new().expect("tokio runtime");
     let mut group = c.benchmark_group("cpu_path/save_flush_unique");
@@ -215,6 +318,39 @@ fn save_flush_metaserver_benchmarks(c: &mut Criterion) {
                         let hashes = make_block_hashes(num_blocks, iter + 1);
                         let start = Instant::now();
                         fixture.save_and_flush(hashes).await;
+                        measured += start.elapsed();
+                        fixture.cleanup_cache();
+                    }
+                    measured
+                })
+            });
+            drop(fixture);
+            std::thread::sleep(Duration::from_millis(50));
+        });
+    }
+
+    group.finish();
+}
+
+fn save_flush_multilayer_benchmarks(c: &mut Criterion) {
+    let rt = Runtime::new().expect("tokio runtime");
+    let mut group = c.benchmark_group("cpu_path/save_flush_unique_multilayer_61");
+    group.sample_size(10);
+
+    for &num_blocks in BLOCK_CASES {
+        group.throughput(Throughput::Bytes(bytes_per_iter(
+            num_blocks * MULTI_LAYER_COUNT,
+            BYTES_PER_BLOCK,
+        )));
+        group.bench_function(BenchmarkId::from_parameter(num_blocks), |b| {
+            let fixture = MultiLayerBenchFixture::new(num_blocks, BYTES_PER_BLOCK);
+            b.iter_custom(|iters| {
+                rt.block_on(async {
+                    let mut measured = Duration::ZERO;
+                    for iter in 0..iters {
+                        let hashes = make_block_hashes(num_blocks, iter + 1);
+                        let start = Instant::now();
+                        fixture.save_and_flush(&hashes).await;
                         measured += start.elapsed();
                         fixture.cleanup_cache();
                     }
@@ -390,6 +526,7 @@ criterion_group!(
     benches,
     save_flush_benchmarks,
     save_flush_metaserver_benchmarks,
+    save_flush_multilayer_benchmarks,
     query_benchmarks,
     load_benchmarks
 );
