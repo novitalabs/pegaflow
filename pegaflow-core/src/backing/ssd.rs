@@ -187,13 +187,18 @@ impl SsdBackingStore {
         }
     }
 
+    /// Count consecutive SSD-resident keys from the start of `keys`.
+    pub(crate) fn prefix_len(&self, keys: &[BlockKey]) -> usize {
+        let inner = self.inner.lock();
+        keys.iter()
+            .map_while(|key| inner.ring.get(key).map(|_| ()))
+            .count()
+    }
+
     /// Submit prefix reads: scan `keys` in order, submit reads for consecutive hits, stop at first miss.
     ///
     /// Returns `(submitted, done_rx)` where `done_rx` delivers completed blocks.
-    pub(crate) fn submit_prefix(
-        &self,
-        keys: Vec<BlockKey>,
-    ) -> (usize, oneshot::Receiver<PrefetchResult>) {
+    fn submit_prefix(&self, keys: Vec<BlockKey>) -> (usize, oneshot::Receiver<PrefetchResult>) {
         let (done_tx, done_rx) = oneshot::channel();
 
         // Prefix-scan the ring buffer: stop at first miss.
@@ -226,6 +231,22 @@ impl SsdBackingStore {
         }
 
         (found, done_rx)
+    }
+
+    /// Prefetch prefix reads and await completion.
+    pub(crate) async fn prefetch_prefix(&self, keys: Vec<BlockKey>) -> (usize, PrefetchResult) {
+        let (found, done_rx) = self.submit_prefix(keys);
+        if found == 0 {
+            return (0, Vec::new());
+        }
+
+        match done_rx.await {
+            Ok(blocks) => (found, blocks),
+            Err(_) => {
+                warn!("SSD prefetch completion channel closed");
+                (found, Vec::new())
+            }
+        }
     }
 }
 

@@ -13,6 +13,7 @@ const NUM_BLOCKS: usize = 4;
 /// Pool fits one batch with headroom but not two — forces eviction.
 const POOL_SIZE: usize = NUM_BLOCKS * BLOCK_SIZE * 2;
 const SSD_CAPACITY: u64 = 64 * 1024 * 1024;
+const PREFETCH_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn ssd_env(instance_id: &'static str) -> (TestEnv, std::path::PathBuf, tempfile::TempDir) {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
@@ -30,6 +31,52 @@ fn ssd_env(instance_id: &'static str) -> (TestEnv, std::path::PathBuf, tempfile:
         })
         .build();
     (env, cache_path, temp_dir)
+}
+
+fn ssd_split_env(instance_id: &'static str) -> (TestEnv, tempfile::TempDir) {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let cache_path = temp_dir.path().join("cache.bin");
+    let env = TestEnvBuilder::new(instance_id, "test-ns-ssd")
+        .split_layer(
+            "layer_0",
+            NUM_BLOCKS,
+            BLOCK_SIZE / 2,
+            BLOCK_SIZE * NUM_BLOCKS,
+        )
+        .pool_size(POOL_SIZE)
+        .storage(StorageConfig {
+            ssd_cache_config: Some(SsdCacheConfig {
+                cache_path,
+                capacity_bytes: SSD_CAPACITY,
+                ..SsdCacheConfig::default()
+            }),
+            ..StorageConfig::default()
+        })
+        .build();
+    (env, temp_dir)
+}
+
+async fn wait_query_ready(env: &TestEnv, hashes: &[Vec<u8>]) -> (usize, usize) {
+    let deadline = std::time::Instant::now() + PREFETCH_WAIT_TIMEOUT;
+    loop {
+        match env.query(hashes).await {
+            PrefetchStatus::Ready { blocks, missing } => return (blocks.len(), missing),
+            PrefetchStatus::Loading => {}
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for SSD prefetch to complete"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+fn cleanup_resident_memory(env: &TestEnv) {
+    let stats = env.engine.cleanup_memory_cache();
+    assert!(
+        stats.evicted_blocks > 0,
+        "cleanup_memory_cache should evict resident blocks"
+    );
 }
 
 /// Save blocks, flush to SSD, verify the cache file contains non-zero bytes.
@@ -69,32 +116,125 @@ async fn ssd_prefetch_roundtrip_after_eviction() {
     env.save_and_wait(&target).await;
     env.engine.flush_all().await;
 
-    // Phase 2: Evict target blocks from memory by saving filler that overflows the pool.
-    let filler = make_block_hashes(NUM_BLOCKS, 99);
-    env.save_layer(0, &filler).await;
-    env.engine.flush_saves().await;
+    // Phase 2: Evict target blocks from memory while preserving SSD data.
+    cleanup_resident_memory(&env);
 
     // Phase 3: Query the original hashes — should trigger SSD prefetch.
-    // First query may return Loading (SSD read in flight), poll until Done.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        let status = env.query(&target).await;
-        match status {
-            PrefetchStatus::Ready { blocks, .. } => {
-                if blocks.len() == target.len() {
-                    break;
-                }
-            }
-            PrefetchStatus::Loading => {}
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "timed out waiting for SSD prefetch to complete"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+    // First query may return Loading (SSD read in flight), poll until Ready.
+    let (hit, missing) = wait_query_ready(&env, &target).await;
+    assert_eq!(hit, target.len());
+    assert_eq!(missing, 0);
 
     // Phase 4: Lease, load to GPU, and verify data integrity.
+    let lease = env.assert_all_hit_lease(&target).await;
+    env.data().zero_gpu();
+    env.load_to_gpu(lease, target.len()).await;
+    env.data().assert_gpu_matches_expected();
+}
+
+/// SSD prefetch preserves prefix semantics: if SSD only has the first part of
+/// the requested prefix, the query resolves to that partial hit plus miss suffix.
+#[tokio::test]
+async fn ssd_prefetch_reports_partial_prefix_after_cleanup() {
+    let (env, _cache_path, _temp_dir) = ssd_env("test-ssd-partial-prefix");
+
+    let all_hashes = env.hashes(7);
+    let saved_prefix = all_hashes[..2].to_vec();
+    env.save_and_wait(&saved_prefix).await;
+    env.engine.flush_all().await;
+    cleanup_resident_memory(&env);
+
+    let (hit, missing) = wait_query_ready(&env, &all_hashes).await;
+    assert_eq!(hit, saved_prefix.len());
+    assert_eq!(missing, all_hashes.len() - saved_prefix.len());
+}
+
+/// A complete SSD miss should resolve to Ready with the original miss count,
+/// not stay in Loading forever.
+#[tokio::test]
+async fn ssd_miss_resolves_to_ready_missing_after_cleanup() {
+    let (env, _cache_path, _temp_dir) = ssd_env("test-ssd-miss");
+
+    let persisted = env.hashes(11);
+    env.save_and_wait(&persisted).await;
+    env.engine.flush_all().await;
+    cleanup_resident_memory(&env);
+
+    let missing_hashes = make_block_hashes(NUM_BLOCKS, 222);
+    let (hit, missing) = wait_query_ready(&env, &missing_hashes).await;
+    assert_eq!(hit, 0);
+    assert_eq!(missing, missing_hashes.len());
+}
+
+/// A miss result for one req_id must not permanently suppress later backing
+/// lookups for the same req_id once the hashes become available in SSD.
+#[tokio::test]
+async fn ssd_miss_does_not_poison_later_same_req_id_hit() {
+    let (env, _cache_path, _temp_dir) = ssd_env("test-ssd-miss-then-hit");
+
+    let unrelated = env.hashes(12);
+    env.save_and_wait(&unrelated).await;
+    env.engine.flush_all().await;
+    cleanup_resident_memory(&env);
+
+    let later_available = make_block_hashes(NUM_BLOCKS, 55);
+    let (hit, missing) = wait_query_ready(&env, &later_available).await;
+    assert_eq!(hit, 0);
+    assert_eq!(missing, later_available.len());
+
+    env.save_and_wait(&later_available).await;
+    env.engine.flush_all().await;
+    cleanup_resident_memory(&env);
+
+    let (hit, missing) = wait_query_ready(&env, &later_available).await;
+    assert_eq!(hit, later_available.len());
+    assert_eq!(missing, 0);
+}
+
+/// When RAM already satisfies a prefix and SSD has the suffix, the async
+/// prefetch result is the complete query answer: RAM prefix plus SSD suffix.
+#[tokio::test]
+async fn ssd_prefetch_combines_ram_prefix_with_ssd_suffix() {
+    let (env, _cache_path, _temp_dir) = ssd_env("test-ssd-ram-prefix-ssd-suffix");
+
+    let target = env.hashes(77);
+    env.save_and_wait(&target).await;
+    env.engine.flush_all().await;
+    cleanup_resident_memory(&env);
+
+    let ram_prefix = target[..2].to_vec();
+    env.save_and_wait(&ram_prefix).await;
+
+    match env.query(&target).await {
+        PrefetchStatus::Loading => {}
+        other => panic!("expected SSD suffix prefetch to start, got {other:?}"),
+    }
+
+    let (hit, missing) = wait_query_ready(&env, &target).await;
+    assert_eq!(hit, target.len());
+    assert_eq!(missing, 0);
+
+    let lease = env.assert_all_hit_lease(&target).await;
+    env.data().zero_gpu();
+    env.load_to_gpu(lease, target.len()).await;
+    env.data().assert_gpu_matches_expected();
+}
+
+/// Split K/V storage should survive the same SSD persistence -> memory cleanup
+/// -> prefetch -> load round-trip as contiguous storage.
+#[tokio::test]
+async fn ssd_prefetch_split_storage_roundtrip_after_cleanup() {
+    let (env, _temp_dir) = ssd_split_env("test-ssd-split-prefetch");
+
+    let target = env.hashes(66);
+    env.save_and_wait(&target).await;
+    env.engine.flush_all().await;
+    cleanup_resident_memory(&env);
+
+    let (hit, missing) = wait_query_ready(&env, &target).await;
+    assert_eq!(hit, target.len());
+    assert_eq!(missing, 0);
+
     let lease = env.assert_all_hit_lease(&target).await;
     env.data().zero_gpu();
     env.load_to_gpu(lease, target.len()).await;

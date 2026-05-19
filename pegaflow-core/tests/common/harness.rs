@@ -1,10 +1,18 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use cudarc::driver::CudaContext;
 use pegaflow_core::*;
 
 use super::gpu_buffer::GpuBuffer;
 use super::helpers::*;
+
+static CUDA_CONTEXT: OnceLock<Arc<CudaContext>> = OnceLock::new();
+
+fn test_cuda_context() -> Arc<CudaContext> {
+    let ctx = CUDA_CONTEXT.get_or_init(|| CudaContext::new(0).expect("CUDA init"));
+    ctx.bind_to_thread().expect("bind CUDA context");
+    Arc::clone(ctx)
+}
 
 // ---------------------------------------------------------------------------
 // TestGpuData: GPU buffer + expected content
@@ -17,9 +25,9 @@ pub struct TestGpuData {
 }
 
 impl TestGpuData {
-    pub fn new(num_blocks: usize, block_size: usize) -> Self {
+    pub fn new(ctx: Arc<CudaContext>, num_blocks: usize, block_size: usize) -> Self {
         let total = num_blocks * block_size;
-        let gpu = GpuBuffer::alloc(total);
+        let gpu = GpuBuffer::alloc(ctx, total);
         let mut expected = vec![0u8; total];
         fill_test_pattern(&mut expected, block_size);
         gpu.copy_from_host(&expected);
@@ -35,9 +43,14 @@ impl TestGpuData {
     /// `segment_size` is the size of one K or V segment.
     /// The GPU layout has K blocks at `[0..num_blocks*segment_size]` and
     /// V blocks at `[kv_stride..kv_stride+num_blocks*segment_size]`.
-    pub fn new_split(num_blocks: usize, segment_size: usize, kv_stride: usize) -> Self {
+    pub fn new_split(
+        ctx: Arc<CudaContext>,
+        num_blocks: usize,
+        segment_size: usize,
+        kv_stride: usize,
+    ) -> Self {
         let alloc_size = (num_blocks - 1) * segment_size + kv_stride + segment_size;
-        let gpu = GpuBuffer::alloc(alloc_size);
+        let gpu = GpuBuffer::alloc(ctx, alloc_size);
         let mut expected = vec![0u8; alloc_size];
 
         // Fill K region and V region with the same block pattern.
@@ -94,11 +107,11 @@ pub struct RegisteredLayer {
 }
 
 pub struct TestEnv {
-    pub _ctx: Arc<CudaContext>,
     pub engine: PegaEngine,
     pub instance_id: String,
     pub layers: Vec<RegisteredLayer>,
     pub world_size: usize,
+    pub _ctx: Arc<CudaContext>,
 }
 
 struct LayerSpec {
@@ -184,11 +197,8 @@ impl TestEnvBuilder {
     }
 
     pub fn build(self) -> TestEnv {
-        let ctx = CudaContext::new(0).expect("CUDA init");
-        let sc = self.storage_config.unwrap_or(StorageConfig {
-            enable_lfu_admission: false,
-            ..StorageConfig::default()
-        });
+        let ctx = test_cuda_context();
+        let sc = self.storage_config.unwrap_or_default();
         let engine = test_engine_with_pool(self.pool_size, sc);
 
         let layers: Vec<RegisteredLayer> = self
@@ -196,9 +206,14 @@ impl TestEnvBuilder {
             .iter()
             .map(|spec| {
                 let data = if spec.segments > 1 {
-                    TestGpuData::new_split(spec.num_blocks, spec.block_size, spec.kv_stride)
+                    TestGpuData::new_split(
+                        Arc::clone(&ctx),
+                        spec.num_blocks,
+                        spec.block_size,
+                        spec.kv_stride,
+                    )
                 } else {
-                    TestGpuData::new(spec.num_blocks, spec.block_size)
+                    TestGpuData::new(Arc::clone(&ctx), spec.num_blocks, spec.block_size)
                 };
                 RegisteredLayer {
                     name: spec.name.to_string(),
@@ -236,11 +251,11 @@ impl TestEnvBuilder {
         );
 
         TestEnv {
-            _ctx: ctx,
             engine,
             instance_id: self.instance_id.to_string(),
             layers,
             world_size: self.world_size,
+            _ctx: ctx,
         }
     }
 }

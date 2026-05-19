@@ -68,7 +68,7 @@ pub struct StorageConfig {
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
-            enable_lfu_admission: true,
+            enable_lfu_admission: false,
             hint_value_size_bytes: None,
             max_prefetch_blocks: DEFAULT_MAX_PREFETCH_BLOCKS,
             ssd_cache_config: None,
@@ -514,7 +514,12 @@ impl StorageEngine {
             .write_pipeline
             .gc_stale_inflight(inflight_max_age)
             .await;
-        let failed = self.prefetch.gc_failed_remote(failed_remote_max_age);
+        let (stale_prefetch, failed) = self
+            .prefetch
+            .gc_stale_entries(inflight_max_age, failed_remote_max_age);
+        if stale_prefetch > 0 {
+            log::debug!("gc: removed {stale_prefetch} stale prefetch entries");
+        }
         if failed > 0 {
             log::debug!("gc: cleared {failed} stale failed_remote entries");
         }

@@ -239,6 +239,12 @@ impl EngineRpcClient {
 
     /// Register all KV cache layers on a GPU with a single RPC call.
     ///
+    /// Argument contract:
+    /// - `device_id` must be non-negative.
+    /// - `num_layers`, `tp_size`, and `world_size` must be non-zero.
+    /// - `tp_rank` must be less than `tp_size`.
+    /// - Per-layer metadata lists must have the same non-zero length.
+    ///
     /// Args:
     ///     instance_id: Model instance ID
     ///     namespace: Namespace for block hash isolation
@@ -305,6 +311,10 @@ impl EngineRpcClient {
 
     /// Save KV blocks to the engine.
     ///
+    /// Argument contract:
+    /// - `device_id` must be non-negative.
+    /// - Each save tuple must have matching `block_ids` and `block_hashes` lengths.
+    ///
     /// Args:
     ///     instance_id: Model instance ID
     ///     tp_rank: Tensor parallel rank
@@ -347,6 +357,11 @@ impl EngineRpcClient {
     }
 
     /// Load KV blocks from the engine.
+    ///
+    /// Argument contract:
+    /// - `device_id` must be non-negative.
+    /// - Each lease must be a query lease returned by `query_prefetch`.
+    /// - Each lease's block count must match its destination block_ids count.
     ///
     /// Args:
     ///     instance_id: Model instance ID
@@ -396,12 +411,18 @@ impl EngineRpcClient {
     /// Checks memory cache and triggers backing-store prefetch for missing blocks.
     /// Ready blocks are owned by an opaque lease.
     ///
+    /// Argument contract:
+    /// - `instance_id` must identify a registered model instance.
+    /// - `req_id` must be non-empty and stable across retries for the same request.
+    /// - `block_hashes` may be empty; an empty list returns `QueryReady(0, empty lease)`.
+    ///
     /// Args:
     ///     instance_id: Model instance ID
     ///     block_hashes: List of block hashes to check
+    ///     req_id: Request ID for prefetch correlation
     ///
-    /// Returns: dict with keys:
-    ///     QueryLoading or QueryReady.
+    /// Returns:
+    ///     QueryLoading while backing fetch is in progress, otherwise QueryReady.
     fn query_prefetch(
         &self,
         py: Python<'_>,

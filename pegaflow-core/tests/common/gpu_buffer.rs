@@ -1,22 +1,25 @@
 use std::ffi::c_void;
+use std::sync::Arc;
 
-use cudarc::driver::sys;
+use cudarc::driver::{CudaContext, sys};
 
 pub struct GpuBuffer {
+    ctx: Arc<CudaContext>,
     ptr: sys::CUdeviceptr,
     len: usize,
 }
 
 impl GpuBuffer {
-    pub fn alloc(len: usize) -> Self {
+    pub fn alloc(ctx: Arc<CudaContext>, len: usize) -> Self {
         assert!(len > 0, "GpuBuffer::alloc: len must be > 0");
+        ctx.bind_to_thread().expect("bind CUDA context");
         let mut ptr: sys::CUdeviceptr = 0;
         // SAFETY: len > 0 (asserted above). ptr is a valid stack pointer.
         check_cuda(
             unsafe { sys::cuMemAlloc_v2(&raw mut ptr, len) },
             "cuMemAlloc_v2",
         );
-        Self { ptr, len }
+        Self { ctx, ptr, len }
     }
 
     pub fn as_u64(&self) -> u64 {
@@ -25,6 +28,7 @@ impl GpuBuffer {
 
     pub fn copy_from_host(&self, data: &[u8]) {
         assert_eq!(data.len(), self.len);
+        self.ctx.bind_to_thread().expect("bind CUDA context");
         // SAFETY: self.ptr is a valid device pointer from cuMemAlloc_v2.
         // data.len() matches the copy size.
         check_cuda(
@@ -34,6 +38,7 @@ impl GpuBuffer {
     }
 
     pub fn copy_to_host(&self) -> Vec<u8> {
+        self.ctx.bind_to_thread().expect("bind CUDA context");
         let mut output = vec![0u8; self.len];
         // SAFETY: self.ptr is valid, out has sufficient capacity (len bytes).
         check_cuda(
@@ -44,6 +49,7 @@ impl GpuBuffer {
     }
 
     pub fn zero(&self) {
+        self.ctx.bind_to_thread().expect("bind CUDA context");
         // SAFETY: self.ptr is a valid device pointer, self.len matches the allocation.
         check_cuda(
             unsafe { sys::cuMemsetD8_v2(self.ptr, 0, self.len) },
@@ -55,6 +61,7 @@ impl GpuBuffer {
 impl Drop for GpuBuffer {
     fn drop(&mut self) {
         if self.ptr != 0 {
+            self.ctx.bind_to_thread().expect("bind CUDA context");
             // SAFETY: self.ptr was allocated by cuMemAlloc_v2 and has not been freed.
             check_cuda(unsafe { sys::cuMemFree_v2(self.ptr) }, "cuMemFree_v2");
             self.ptr = 0;

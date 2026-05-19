@@ -742,7 +742,8 @@ async fn dispatch_prefetch_batch(
     // 3. Build BatchContext + PrefetchTasks and enqueue
     let ctx = Arc::new(BatchContext::new(requests.len(), done_tx));
 
-    for (block_idx, req) in requests.into_iter().enumerate() {
+    let mut iter = requests.into_iter().enumerate();
+    while let Some((block_idx, req)) = iter.next() {
         let allocs: Vec<SlotAlloc> = slot_allocs[block_idx]
             .drain(..)
             .map(|opt| opt.expect("all slots must have allocations"))
@@ -755,8 +756,13 @@ async fn dispatch_prefetch_batch(
             ctx: Arc::clone(&ctx),
         };
 
-        if task_tx.send(task).await.is_err() {
+        if let Err(err) = task_tx.send(task).await {
             debug!("SSD prefetch dispatcher: worker channel closed");
+            let task = err.0;
+            ctx.complete_one(task.key, None);
+            for (_, req) in iter {
+                ctx.complete_one(req.key, None);
+            }
             return false;
         }
     }

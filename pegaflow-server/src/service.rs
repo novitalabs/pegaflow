@@ -118,6 +118,56 @@ impl GrpcEngineService {
         })
     }
 
+    fn validate_device_id(device_id: i32) -> Result<(), Status> {
+        if device_id < 0 {
+            return Err(Status::invalid_argument(format!(
+                "device_id {device_id} must be >= 0"
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_register_context_request(req: &RegisterContextRequest) -> Result<(), Status> {
+        Self::validate_device_id(req.device_id)?;
+        if req.num_layers == 0 {
+            return Err(Status::invalid_argument("num_layers must be > 0"));
+        }
+        if req.tp_size == 0 {
+            return Err(Status::invalid_argument("tp_size must be > 0"));
+        }
+        if req.world_size == 0 {
+            return Err(Status::invalid_argument("world_size must be > 0"));
+        }
+        if req.tp_rank >= req.tp_size {
+            return Err(Status::invalid_argument(format!(
+                "tp_rank {} out of range (tp_size {})",
+                req.tp_rank, req.tp_size
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_save_layers(saves: &[crate::proto::engine::SaveLayer]) -> Result<(), Status> {
+        for layer in saves {
+            if layer.block_ids.len() != layer.block_hashes.len() {
+                return Err(Status::invalid_argument(format!(
+                    "block_ids length {} does not match block_hashes {} for layer {}",
+                    layer.block_ids.len(),
+                    layer.block_hashes.len(),
+                    layer.layer_name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_query_prefetch_request(req: &QueryRequest) -> Result<(), Status> {
+        if req.req_id.is_empty() {
+            return Err(Status::invalid_argument("req_id must not be empty"));
+        }
+        Ok(())
+    }
+
     fn build_register_context_response() -> RegisterContextResponse {
         RegisterContextResponse {
             status: Some(Self::ok_status()),
@@ -229,6 +279,7 @@ impl Engine for GrpcEngineService {
                 req.wrapper_bytes.iter().map(|b| b.len()).collect::<Vec<_>>()
             );
 
+            Self::validate_register_context_request(&req)?;
             let num_layers = Self::usize_from_u32(req.num_layers, "num_layers")?;
 
             // Validate array lengths are consistent with each other.
@@ -366,6 +417,8 @@ impl Engine for GrpcEngineService {
                 saves,
                 ..
             } = req;
+            Self::validate_device_id(device_id)?;
+            Self::validate_save_layers(&saves)?;
             let tp_rank = Self::usize_from_u32(tp_rank, "tp_rank")?;
             let pp_rank = Self::usize_from_u32(pp_rank, "pp_rank")?;
 
@@ -447,6 +500,7 @@ impl Engine for GrpcEngineService {
                 load_state_shm,
                 ..
             } = req;
+            Self::validate_device_id(device_id)?;
             let tp_rank = Self::usize_from_u32(tp_rank, "tp_rank")?;
             debug!(
                 "RPC [load]: instance_id={} tp_rank={} device_id={} layers={} loads={} blocks={} load_state_shm_len={}",
@@ -517,6 +571,7 @@ impl Engine for GrpcEngineService {
 
         let start = Instant::now();
         let fut = async {
+            Self::validate_query_prefetch_request(&req)?;
             debug!(
                 "RPC [query_prefetch]: instance_id={} block_hashes={}",
                 req.instance_id,
@@ -947,5 +1002,81 @@ impl Engine for GrpcEngineService {
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::engine::SaveLayer;
+    use tonic::Code;
+
+    #[test]
+    fn validate_query_prefetch_rejects_empty_req_id() {
+        let err = GrpcEngineService::validate_query_prefetch_request(&QueryRequest {
+            instance_id: "instance".to_string(),
+            block_hashes: Vec::new(),
+            req_id: String::new(),
+        })
+        .expect_err("empty req_id must be rejected before engine lookup");
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("req_id"));
+    }
+
+    #[test]
+    fn validate_query_prefetch_allows_empty_hashes() {
+        GrpcEngineService::validate_query_prefetch_request(&QueryRequest {
+            instance_id: "instance".to_string(),
+            block_hashes: Vec::new(),
+            req_id: "request".to_string(),
+        })
+        .expect("empty block_hashes are a valid zero-hit query");
+    }
+
+    #[test]
+    fn validate_register_context_rejects_pure_argument_errors() {
+        let err = GrpcEngineService::validate_register_context_request(&RegisterContextRequest {
+            instance_id: "instance".to_string(),
+            namespace: "namespace".to_string(),
+            tp_rank: 1,
+            tp_size: 1,
+            world_size: 1,
+            device_id: 0,
+            num_layers: 1,
+            layer_names: Vec::new(),
+            wrapper_bytes: Vec::new(),
+            num_blocks: Vec::new(),
+            bytes_per_block: Vec::new(),
+            kv_stride_bytes: Vec::new(),
+            segments: Vec::new(),
+            pp_rank: 0,
+        })
+        .expect_err("tp_rank outside tp_size must be rejected at RPC boundary");
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("tp_rank"));
+    }
+
+    #[test]
+    fn validate_save_layers_rejects_mismatched_block_shapes() {
+        let err = GrpcEngineService::validate_save_layers(&[SaveLayer {
+            layer_name: "layer_0".to_string(),
+            block_ids: vec![0, 1],
+            block_hashes: vec![vec![1]],
+        }])
+        .expect_err("service must reject malformed save shape");
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("does not match"));
+    }
+
+    #[test]
+    fn validate_device_id_rejects_negative_values() {
+        let err = GrpcEngineService::validate_device_id(-1)
+            .expect_err("negative device_id must be rejected at RPC boundary");
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("device_id"));
     }
 }

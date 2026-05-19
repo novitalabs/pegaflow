@@ -79,6 +79,10 @@ class EngineRpcClient:
     ) -> tuple[bool, str]:
         """Register all KV cache layers on a GPU with a single RPC call.
 
+        Contract: device_id must be non-negative; num_layers, tp_size,
+        and world_size must be non-zero; tp_rank must be less than tp_size;
+        per-layer metadata lists must have the same non-zero length.
+
         Args:
             instance_id: Model instance ID.
             namespace: Namespace for model isolation.
@@ -114,6 +118,9 @@ class EngineRpcClient:
     ) -> tuple[bool, str]:
         """Save KV blocks to the engine.
 
+        Contract: device_id must be non-negative, and each save tuple must
+        have matching block_ids and block_hashes lengths.
+
         Args:
             instance_id: Model instance ID.
             tp_rank: Tensor parallel rank.
@@ -142,6 +149,10 @@ class EngineRpcClient:
     ) -> tuple[bool, str]:
         """Load KV blocks from the engine.
 
+        Contract: device_id must be non-negative; each lease must be returned
+        by query_prefetch; each lease's block count must match its destination
+        block_ids count.
+
         Args:
             instance_id: Model instance ID.
             tp_rank: Tensor parallel rank.
@@ -169,6 +180,9 @@ class EngineRpcClient:
 
         Checks memory cache and triggers SSD prefetch for missing blocks.
         Ready hits are owned by an opaque lease consumed by load or release.
+        Contract: instance_id must be registered, req_id must be non-empty
+        and stable across retries for the same request, and block_hashes may
+        be empty.
 
         Args:
             instance_id: Model instance ID.

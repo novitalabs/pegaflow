@@ -83,6 +83,34 @@ async fn first_block_missing_yields_zero_prefix_hit() {
     // hit=0, no lease would be created by the server.
 }
 
+/// RAM-only queries are stateless with respect to req_id: a previous miss must
+/// not hide blocks that become resident later under the same req_id.
+#[tokio::test]
+async fn ram_miss_does_not_poison_later_same_req_id_hit() {
+    let env = TestEnvBuilder::new("test-ram-miss-then-hit", "test-ns")
+        .layer("layer_0", 4, 1024)
+        .build();
+
+    let hashes = env.hashes(40);
+    match env.query(&hashes).await {
+        PrefetchStatus::Ready { blocks, missing } => {
+            assert_eq!(blocks.len(), 0);
+            assert_eq!(missing, hashes.len());
+        }
+        other => panic!("expected Ready, got {other:?}"),
+    }
+
+    env.save_layer_and_flush(0, &hashes).await;
+
+    match env.query(&hashes).await {
+        PrefetchStatus::Ready { blocks, missing } => {
+            assert_eq!(blocks.len(), hashes.len());
+            assert_eq!(missing, 0);
+        }
+        other => panic!("expected Ready, got {other:?}"),
+    }
+}
+
 /// Empty hash list → zero hits, zero missing.
 #[tokio::test]
 async fn empty_query_returns_zero() {

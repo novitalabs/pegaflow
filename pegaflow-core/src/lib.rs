@@ -52,7 +52,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use log::{debug, info, warn};
+use log::{debug, info};
 
 use crate::backing::SSD_ALIGNMENT;
 use crate::gpu_worker::{LayerLoadData, LoadBlock, LoadTask};
@@ -213,6 +213,13 @@ impl PegaEngine {
     ///
     /// This reduces gRPC round-trips from N to 1 and allows the engine to
     /// construct the GPU context with all layer registrations at once.
+    ///
+    /// Argument contract:
+    /// - `device_id` must be non-negative; RPC callers validate this in service.rs.
+    /// - `num_layers`, `tp_size`, and `world_size` must be non-zero.
+    /// - `tp_rank` must be less than `tp_size`.
+    /// - Layer metadata arrays must all have the same length as `layer_names`.
+    /// - Registration sizes and pointers must describe a valid KV cache layout.
     #[allow(
         clippy::too_many_arguments,
         reason = "public API mirrors one batched registration RPC payload"
@@ -235,12 +242,6 @@ impl PegaEngine {
         kv_stride_bytes_list: &[usize],
         segments_list: &[usize],
     ) -> Result<(), EngineError> {
-        if device_id < 0 {
-            return Err(EngineError::InvalidArgument(
-                "device_id must be >= 0".to_string(),
-            ));
-        }
-
         // Build all registrations
         let ssd_enabled = self.storage.is_ssd_enabled();
         let batch_size = layer_names.len();
@@ -361,6 +362,11 @@ impl PegaEngine {
 
     /// Count prefix hit blocks with SSD prefetch support.
     ///
+    /// Argument contract:
+    /// - `instance_id` must identify a registered instance.
+    /// - `req_id` must be non-empty; RPC callers validate this in service.rs.
+    /// - `block_hashes` may be empty.
+    ///
     /// Returns:
     /// - `Ready { blocks, missing: 0 }`: all blocks in memory cache
     /// - `Loading`: some blocks being fetched from backing storage
@@ -375,17 +381,8 @@ impl PegaEngine {
         req_id: &str,
         block_hashes: &[Vec<u8>],
     ) -> Result<PrefetchStatus, EngineError> {
-        if req_id.is_empty() {
-            warn!("count_prefix_hit_blocks_with_prefetch: empty req_id, returning 0 hits");
-            return Ok(PrefetchStatus::Ready {
-                blocks: Vec::new(),
-                missing: block_hashes.len(),
-            });
-        }
-
         let instance = self.get_instance(instance_id)?;
         let namespace = instance.namespace();
-        let metrics = core_metrics();
 
         let status = self
             .storage
@@ -394,6 +391,7 @@ impl PegaEngine {
 
         match &status {
             PrefetchStatus::Ready { blocks, missing } => {
+                let metrics = core_metrics();
                 metrics.cache_block_hits.add(blocks.len() as u64, &[]);
                 if *missing > 0 {
                     metrics.cache_block_misses.add(*missing as u64, &[]);

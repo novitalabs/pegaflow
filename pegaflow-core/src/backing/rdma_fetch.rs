@@ -1,7 +1,4 @@
-// RDMA remote block fetch: MetaServer query → gRPC QueryBlocksForTransfer → RDMA READ.
-//
-// Follows the same submit/oneshot pattern as SsdBackingStore::submit_prefix so that
-// PrefetchScheduler can treat remote fetch the same way it treats SSD prefetch.
+// RDMA remote block fetch: MetaServer query -> gRPC QueryBlocksForTransfer -> RDMA READ.
 
 use std::collections::HashMap;
 use std::ptr::NonNull;
@@ -10,7 +7,6 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use log::{debug, info, warn};
-use mea::oneshot;
 use mea::singleflight::Group;
 use pegaflow_proto::proto::engine::engine_client::EngineClient;
 use pegaflow_proto::proto::engine::{
@@ -112,43 +108,26 @@ impl RdmaFetchStore {
         Some((best.node.clone(), prefix_len))
     }
 
-    /// Start an RDMA fetch of `hashes` from `remote_addr`.
-    /// Returns a receiver that delivers the fetched blocks.
-    pub(crate) fn fetch_blocks(
+    /// Fetch `hashes` from `remote_addr`.
+    pub(crate) async fn fetch_blocks(
         &self,
         remote_addr: &str,
         req_id: &str,
         namespace: &str,
-        hashes: Vec<Vec<u8>>,
-    ) -> oneshot::Receiver<PrefetchResult> {
-        let (done_tx, done_rx) = oneshot::channel();
-
-        let rdma = Arc::clone(&self.rdma_transport);
-        let alloc_fn = Arc::clone(&self.allocate_fn);
-        let channels = Arc::clone(&self.grpc_channels);
-        let connect_group = Arc::clone(&self.connect_group);
-        let advertise = self.advertise_addr.clone();
-        let remote = remote_addr.to_string();
-        let req = req_id.to_string();
-        let ns = namespace.to_string();
-
-        tokio::spawn(async move {
-            let result = rdma_fetch_task(
-                &rdma,
-                &alloc_fn,
-                &channels,
-                &connect_group,
-                &remote,
-                &req,
-                &advertise,
-                &ns,
-                &hashes,
-            )
-            .await;
-            let _ = done_tx.send(result);
-        });
-
-        done_rx
+        hashes: &[Vec<u8>],
+    ) -> PrefetchResult {
+        rdma_fetch_task(
+            &self.rdma_transport,
+            &self.allocate_fn,
+            &self.grpc_channels,
+            &self.connect_group,
+            remote_addr,
+            req_id,
+            &self.advertise_addr,
+            namespace,
+            hashes,
+        )
+        .await
     }
 }
 
