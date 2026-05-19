@@ -44,10 +44,13 @@ pub(crate) struct RegisteredMemoryRegion {
     pub(crate) rkey: u32,
 }
 
-/// Per-NIC handshake data: endpoint + memory region snapshot.
+/// Per-NIC handshake data: N endpoints (one per QP) + memory region snapshot.
+///
+/// The same NIC pair maintains N RC QPs so the caller can spread load across
+/// them. Both peers must agree on N (set via `qps_per_peer` at backend init).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct NicHandshake {
-    pub(crate) endpoint: RcEndpoint,
+    pub(crate) endpoints: Vec<RcEndpoint>,
     pub(crate) memory_regions: Vec<RegisteredMemoryRegion>,
 }
 
@@ -105,9 +108,9 @@ pub struct TransferEngine {
 }
 
 impl TransferEngine {
-    pub fn new(nic_names: &[String]) -> Result<Self> {
+    pub fn new(nic_names: &[String], qps_per_peer: usize) -> Result<Self> {
         Ok(Self {
-            backend: RcBackend::new(nic_names)?,
+            backend: RcBackend::new(nic_names, qps_per_peer)?,
         })
     }
 
@@ -195,12 +198,12 @@ mod tests {
     fn handshake_metadata_roundtrip() {
         let meta = HandshakeMetadata {
             nics: vec![NicHandshake {
-                endpoint: RcEndpoint {
+                endpoints: vec![RcEndpoint {
                     gid: [7u8; 16],
                     lid: 0,
                     qp_num: 200,
                     psn: 0x1111,
-                },
+                }],
                 memory_regions: vec![RegisteredMemoryRegion {
                     base_ptr: 0x1000,
                     len: 0x2000,
@@ -211,21 +214,29 @@ mod tests {
         let bytes = meta.to_bytes();
         let decoded = HandshakeMetadata::from_bytes(&bytes).expect("decode");
         assert_eq!(decoded.nics.len(), 1);
-        assert_eq!(decoded.nics[0].endpoint, meta.nics[0].endpoint);
+        assert_eq!(decoded.nics[0].endpoints, meta.nics[0].endpoints);
         assert_eq!(decoded.nics[0].memory_regions, meta.nics[0].memory_regions);
     }
 
     #[test]
-    fn handshake_metadata_multi_nic_roundtrip() {
+    fn handshake_metadata_multi_nic_multi_qp_roundtrip() {
         let meta = HandshakeMetadata {
             nics: vec![
                 NicHandshake {
-                    endpoint: RcEndpoint {
-                        gid: [1u8; 16],
-                        lid: 0,
-                        qp_num: 100,
-                        psn: 0x1000,
-                    },
+                    endpoints: vec![
+                        RcEndpoint {
+                            gid: [1u8; 16],
+                            lid: 0,
+                            qp_num: 100,
+                            psn: 0x1000,
+                        },
+                        RcEndpoint {
+                            gid: [1u8; 16],
+                            lid: 0,
+                            qp_num: 101,
+                            psn: 0x1001,
+                        },
+                    ],
                     memory_regions: vec![RegisteredMemoryRegion {
                         base_ptr: 0x1000,
                         len: 0x2000,
@@ -233,12 +244,20 @@ mod tests {
                     }],
                 },
                 NicHandshake {
-                    endpoint: RcEndpoint {
-                        gid: [2u8; 16],
-                        lid: 0,
-                        qp_num: 200,
-                        psn: 0x2000,
-                    },
+                    endpoints: vec![
+                        RcEndpoint {
+                            gid: [2u8; 16],
+                            lid: 0,
+                            qp_num: 200,
+                            psn: 0x2000,
+                        },
+                        RcEndpoint {
+                            gid: [2u8; 16],
+                            lid: 0,
+                            qp_num: 201,
+                            psn: 0x2001,
+                        },
+                    ],
                     memory_regions: vec![RegisteredMemoryRegion {
                         base_ptr: 0x1000,
                         len: 0x2000,
@@ -250,10 +269,11 @@ mod tests {
         let bytes = meta.to_bytes();
         let decoded = HandshakeMetadata::from_bytes(&bytes).expect("decode");
         assert_eq!(decoded.nics.len(), 2);
-        assert_eq!(decoded.nics[0].endpoint.qp_num, 100);
-        assert_eq!(decoded.nics[0].memory_regions[0].rkey, 10);
-        assert_eq!(decoded.nics[1].endpoint.qp_num, 200);
-        assert_eq!(decoded.nics[1].memory_regions[0].rkey, 20);
+        assert_eq!(decoded.nics[0].endpoints.len(), 2);
+        assert_eq!(decoded.nics[0].endpoints[0].qp_num, 100);
+        assert_eq!(decoded.nics[0].endpoints[1].qp_num, 101);
+        assert_eq!(decoded.nics[1].endpoints[0].qp_num, 200);
+        assert_eq!(decoded.nics[1].endpoints[1].qp_num, 201);
     }
 
     #[test]

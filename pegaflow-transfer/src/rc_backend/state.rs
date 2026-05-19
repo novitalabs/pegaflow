@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use sideway::ibverbs::memory_region::MemoryRegion;
 
@@ -22,27 +23,30 @@ struct RemoteMemoryEntry {
 }
 
 /// Per-NIC state: pending/connected sessions and remote memory cache.
+///
+/// With per-peer N QPs, `sessions` and `remote_memory` are keyed by the
+/// **first** remote QPN of that NIC pair — this is the stable connection id.
 #[derive(Default)]
 pub(super) struct PerNicState {
     /// Pre-connect sessions in FIFO order (first prepared, first connected).
     pub(super) pending: VecDeque<Arc<RcSession>>,
-    /// Connected sessions keyed by remote QP number.
-    pub(super) sessions: HashMap<u32, Arc<RcSession>>,
-    /// Remote memory cache keyed by remote QP number.
+    /// Connected session vectors keyed by first remote QPN; each Vec has N sessions.
+    pub(super) sessions: HashMap<u32, Vec<Arc<RcSession>>>,
+    /// Remote memory cache keyed by first remote QPN (shared across the N sessions).
     remote_memory: HashMap<u32, Vec<RemoteMemoryEntry>>,
 }
 
 impl PerNicState {
     /// Look up the remote rkey for `[remote_ptr, remote_ptr+len)` from the
-    /// handshake snapshot cached for `remote_qpn`.
+    /// handshake snapshot cached for `remote_first_qpn`.
     pub(super) fn find_remote_rkey(
         &self,
-        remote_qpn: u32,
+        remote_first_qpn: u32,
         remote_ptr: u64,
         len: usize,
     ) -> Option<u32> {
         let end = remote_ptr.checked_add(len as u64)?;
-        let entries = self.remote_memory.get(&remote_qpn)?;
+        let entries = self.remote_memory.get(&remote_first_qpn)?;
         let index = match entries.binary_search_by_key(&remote_ptr, |e| e.base_ptr) {
             Ok(i) => i,
             Err(0) => return None,
@@ -65,15 +69,15 @@ impl PerNicState {
         self.pending.remove(pos)
     }
 
-    pub(super) fn cleanup_connection(&mut self, remote_qpn: u32) {
-        self.sessions.remove(&remote_qpn);
-        self.remote_memory.remove(&remote_qpn);
+    pub(super) fn cleanup_connection(&mut self, remote_first_qpn: u32) {
+        self.sessions.remove(&remote_first_qpn);
+        self.remote_memory.remove(&remote_first_qpn);
     }
 
     /// Validate and cache the remote memory regions received during handshake.
     pub(super) fn cache_remote_memory(
         &mut self,
-        remote_qpn: u32,
+        remote_first_qpn: u32,
         remote_memory_regions: &[RegisteredMemoryRegion],
     ) -> Result<()> {
         let mut cached = Vec::with_capacity(remote_memory_regions.len());
@@ -102,14 +106,17 @@ impl PerNicState {
                 ));
             }
         }
-        self.remote_memory.insert(remote_qpn, cached);
+        self.remote_memory.insert(remote_first_qpn, cached);
         Ok(())
     }
 }
 
 pub(super) struct AddrConnection {
-    pub(super) remote_qpns: Vec<u32>,
+    /// First remote QPN per NIC — stable id used to key sessions/remote_memory.
+    pub(super) remote_first_qpns: Vec<u32>,
     pub(super) local_nics: Vec<NicHandshake>,
+    /// Round-robin counter per NIC for picking among the N sessions of that pair.
+    pub(super) rr_counters: Vec<AtomicUsize>,
 }
 
 pub(super) struct RcBackendState {

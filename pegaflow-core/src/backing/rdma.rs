@@ -29,9 +29,13 @@ impl RdmaTransport {
     }
 
     /// Create a new RDMA transport and register all pinned memory regions.
-    fn new(nic_names: &[String], allocator: &PinnedAllocator) -> Result<Self, String> {
+    fn new(
+        nic_names: &[String],
+        allocator: &PinnedAllocator,
+        qps_per_peer: usize,
+    ) -> Result<Self, String> {
         let t0 = Instant::now();
-        let engine = TransferEngine::new(nic_names).map_err(|e| e.to_string())?;
+        let engine = TransferEngine::new(nic_names, qps_per_peer).map_err(|e| e.to_string())?;
 
         let regions: Vec<(NonNull<u8>, usize)> = allocator.memory_regions();
         let mr_descs: Vec<MemoryRegion> = regions
@@ -73,8 +77,9 @@ impl Drop for RdmaTransport {
 pub(crate) fn new_rdma(
     nic_names: &[String],
     allocator: &PinnedAllocator,
+    qps_per_peer: usize,
 ) -> Result<Arc<RdmaTransport>, String> {
-    RdmaTransport::new(nic_names, allocator)
+    RdmaTransport::new(nic_names, allocator, qps_per_peer)
         .map(Arc::new)
         .map_err(|e| format!("Failed to initialise RDMA transport (nics={nic_names:?}): {e}"))
 }

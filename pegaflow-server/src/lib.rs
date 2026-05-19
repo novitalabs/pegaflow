@@ -148,6 +148,11 @@ pub struct Cli {
     #[arg(long, value_delimiter = ',', value_parser = parse_nic_name, num_args = 1..)]
     pub nics: Option<Vec<String>>,
 
+    /// Number of RC QPs per (local NIC, remote NIC) pair. Spreads WQE pressure
+    /// across N QPs; see `docs/resources/rdma-qp-count-impact.md`. Range [1, 16].
+    #[arg(long, default_value_t = 2)]
+    pub qps_per_peer: usize,
+
     /// MetaServer address for cross-node block hash registration (e.g. http://127.0.0.1:50056).
     /// When set, sealed block hashes are automatically registered with the MetaServer.
     #[arg(long)]
@@ -524,6 +529,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         max_prefetch_blocks: cli.max_prefetch_blocks,
         ssd_cache_config,
         rdma_nic_names: cli.nics.clone(),
+        rdma_qps_per_peer: cli.qps_per_peer,
         enable_numa_affinity: !cli.disable_numa_affinity,
         blockwise_alloc: cli.blockwise_alloc,
         transfer_lock_timeout: Duration::from_secs(cli.transfer_lock_timeout_secs),
