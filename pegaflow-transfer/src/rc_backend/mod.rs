@@ -461,8 +461,10 @@ impl RcBackend {
                     "no connection for remote addr {remote_addr}"
                 )))?;
 
-            // Prepare ops for each NIC that has work; pick one of the N sessions
-            // for that NIC via round-robin to spread WQE pressure across QPs.
+            // Spread ops across the N sessions per NIC. Round-robin at the WQE
+            // (per-op) level inside the batch — not per call — so a single
+            // batch can fill all N QPs. Per-call RR would leave the rest of the
+            // QPs idle while one QP works through the whole batch.
             for nic_idx in 0..nic_count {
                 let nic_descs = &per_nic[nic_idx];
                 if nic_descs.is_empty() {
@@ -474,11 +476,16 @@ impl RcBackend {
                     .sessions
                     .get(&remote_first_qpn)
                     .expect("session vec must exist for established connection");
-                let rr = conn.rr_counters[nic_idx].fetch_add(1, Ordering::Relaxed);
-                let session = Arc::clone(&sessions[rr % sessions.len()]);
+                let n = sessions.len();
+                // Rotate the starting bucket each call so small batches still
+                // hit different QPs across calls.
+                let rot = conn.rr_counters[nic_idx].fetch_add(1, Ordering::Relaxed);
 
-                let mut prepared = Vec::with_capacity(nic_descs.len());
-                for desc in nic_descs {
+                let per_bucket = nic_descs.len().div_ceil(n);
+                let mut buckets: Vec<Vec<RdmaOp>> =
+                    (0..n).map(|_| Vec::with_capacity(per_bucket)).collect();
+
+                for (i, desc) in nic_descs.iter().enumerate() {
                     let local_ptr = desc.local_ptr.as_ptr() as u64;
                     let remote_ptr = desc.remote_ptr.as_ptr() as u64;
                     let len = desc.len;
@@ -497,7 +504,8 @@ impl RcBackend {
                             "remote memory not found in handshake snapshot",
                         ))?;
 
-                    prepared.push(RdmaOp {
+                    let bucket = rot.wrapping_add(i) % n;
+                    buckets[bucket].push(RdmaOp {
                         local_mr,
                         local_ptr,
                         remote_ptr,
@@ -505,7 +513,13 @@ impl RcBackend {
                         remote_rkey,
                     });
                 }
-                nic_work.push((session, prepared));
+
+                for (q_idx, prepared) in buckets.into_iter().enumerate() {
+                    if prepared.is_empty() {
+                        continue;
+                    }
+                    nic_work.push((Arc::clone(&sessions[q_idx]), prepared));
+                }
             }
         }
         let lookup_dur = lookup_start.elapsed();
