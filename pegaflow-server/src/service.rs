@@ -614,10 +614,11 @@ impl Engine for GrpcEngineService {
         let result: Result<Response<ReleaseResponse>, Status> = async {
             debug!("RPC [release]: lease_len={}", lease_len);
 
-            if !req.lease.is_empty() {
-                let lease =
-                    QueryLeaseId::from_bytes(&req.lease).map_err(Status::invalid_argument)?;
-                self.engine.release_query_lease(&lease);
+            let lease = QueryLeaseId::from_bytes(&req.lease).map_err(Status::invalid_argument)?;
+            if !self.engine.release_query_lease(&lease) {
+                return Err(Status::failed_precondition(
+                    "query lease is unknown or expired",
+                ));
             }
 
             Ok(Response::new(ReleaseResponse {}))

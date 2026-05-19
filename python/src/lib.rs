@@ -458,7 +458,7 @@ impl EngineRpcClient {
         })
     }
 
-    /// Release a query lease. Unknown leases are successful no-ops.
+    /// Release a query lease.
     fn release(&self, py: Python<'_>, lease: PyQueryLease) -> PyResult<()> {
         self.call(py, "release", |mut c| async move {
             c.release(ReleaseRequest {

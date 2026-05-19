@@ -57,6 +57,12 @@ impl CudaTensorRegistry {
         })
     }
 
+    pub fn empty() -> Self {
+        Self {
+            contexts: HashMap::new(),
+        }
+    }
+
     pub fn register_layer(
         &mut self,
         context_key: &str,

@@ -133,9 +133,9 @@ impl QueryLeaseManager {
             .blocks)
     }
 
-    pub(crate) fn release(&self, token: &QueryLeaseId) {
+    pub(crate) fn release(&self, token: &QueryLeaseId) -> bool {
         self.sweep_expired();
-        self.inner.remove(token);
+        self.inner.remove(token)
     }
 
     pub(crate) fn release_instance(&self, instance_id: &str) {
@@ -168,11 +168,12 @@ impl QueryLeaseInner {
             .insert(token, lease);
     }
 
-    fn remove(&self, token: &QueryLeaseId) {
+    fn remove(&self, token: &QueryLeaseId) -> bool {
         self.leases
             .lock()
             .expect("query leases lock poisoned")
-            .remove(token);
+            .remove(token)
+            .is_some()
     }
 
     fn sweep_expired(&self) {

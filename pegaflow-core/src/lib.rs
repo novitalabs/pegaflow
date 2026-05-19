@@ -422,9 +422,9 @@ impl PegaEngine {
             .create(instance_id, blocks, instance.world_size()))
     }
 
-    /// Release a query lease. Unknown leases are successful no-ops.
-    pub fn release_query_lease(&self, lease: &QueryLeaseId) {
-        self.query_leases.release(lease);
+    /// Release a query lease. Returns false when the lease is unknown or expired.
+    pub fn release_query_lease(&self, lease: &QueryLeaseId) -> bool {
+        self.query_leases.release(lease)
     }
 
     /// Evict all resident in-memory cache blocks while preserving backing-store data.
