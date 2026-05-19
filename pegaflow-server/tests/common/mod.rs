@@ -191,10 +191,13 @@ impl MockVllmRpcHarness {
             pp_rank: 0,
         };
         match self.worker.save(request.clone()).await {
-            Ok(response) => Ok(RpcExchange {
-                request,
-                response: response.into_inner(),
-            }),
+            Ok(response) => {
+                let response = response.into_inner();
+                if response.status.as_ref().is_some_and(|status| status.ok) {
+                    self._engine.flush_saves().await;
+                }
+                Ok(RpcExchange { request, response })
+            }
             Err(status) => Err(RpcError { request, status }),
         }
     }
