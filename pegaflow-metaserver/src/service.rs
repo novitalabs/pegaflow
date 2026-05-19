@@ -66,6 +66,7 @@ impl MetaServer for GrpcMetaService {
                 .map_err(Self::store_error_status)?;
             Ok(Response::new(HeartbeatNodeResponse {
                 status: Some(Self::ok_status()),
+                stale_after_secs: self.store.config().node_stale_after.as_secs(),
             }))
         }
         .await;
@@ -90,7 +91,6 @@ impl MetaServer for GrpcMetaService {
                 .unregister_node(&req.node, node_id)
                 .map_err(Self::store_error_status)?;
             Ok(Response::new(UnregisterNodeResponse {
-                status: Some(Self::ok_status()),
                 removed_keys: removed as u64,
             }))
         }
@@ -498,7 +498,6 @@ mod tests {
             .unwrap()
             .into_inner();
 
-        assert!(resp.status.unwrap().ok);
         assert_eq!(resp.removed_keys, 2);
 
         let query_resp = svc

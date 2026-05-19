@@ -2174,6 +2174,7 @@ dependencies = [
  "smallvec",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tonic",
  "uuid",
 ]
@@ -2184,6 +2185,7 @@ version = "0.22.3"
 dependencies = [
  "axum",
  "clap",
+ "criterion",
  "dashmap",
  "log",
  "opentelemetry",

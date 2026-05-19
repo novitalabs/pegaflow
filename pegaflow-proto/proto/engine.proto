@@ -248,6 +248,7 @@ message HeartbeatNodeRequest {
 
 message HeartbeatNodeResponse {
   ResponseStatus status = 1;
+  uint64 stale_after_secs = 2;
 }
 
 message UnregisterNodeRequest {
@@ -256,8 +257,7 @@ message UnregisterNodeRequest {
 }
 
 message UnregisterNodeResponse {
-  ResponseStatus status = 1;
-  uint64 removed_keys = 2;
+  uint64 removed_keys = 1;
 }
 
 service MetaServer {

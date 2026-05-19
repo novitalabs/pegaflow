@@ -7,6 +7,7 @@ use pegaflow_proto::proto::engine::{
     RemoveBlockHashesRequest, UnregisterNodeRequest,
 };
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::{Duration, Instant};
 use tonic::Code;
 use tonic::transport::{Channel, Endpoint};
 use uuid::Uuid;
@@ -31,8 +32,26 @@ impl std::fmt::Display for ClientError {
 
 const INITIAL_BACKOFF_MS: u64 = 100;
 const MAX_BACKOFF_MS: u64 = 30_000;
-const HEARTBEAT_INTERVAL_SECS: u64 = 10;
+const MIN_HEARTBEAT_INTERVAL_SECS: u64 = 1;
 const UNREGISTER_TIMEOUT_SECS: u64 = 3;
+
+struct HeartbeatState {
+    node_registered: bool,
+    backoff_ms: u64,
+    period: Duration,
+    next_at: Instant,
+}
+
+impl HeartbeatState {
+    fn new() -> Self {
+        Self {
+            node_registered: false,
+            backoff_ms: INITIAL_BACKOFF_MS,
+            period: Duration::from_secs(MIN_HEARTBEAT_INTERVAL_SECS),
+            next_at: Instant::now(),
+        }
+    }
+}
 
 pub struct MetaServerClientConfig {
     pub metaserver_addr: String,
@@ -231,31 +250,31 @@ async fn registration_loop(
 ) {
     let mut client: Option<MetaServerGrpcClient<Channel>> = None;
     let node_id = Uuid::new_v4().to_string();
-    let mut node_registered = false;
-    let mut backoff_ms: u64 = INITIAL_BACKOFF_MS;
-    let heartbeat_period = tokio::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS);
-    let mut heartbeat = tokio::time::interval_at(
-        tokio::time::Instant::now() + heartbeat_period,
-        heartbeat_period,
-    );
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut heartbeat = HeartbeatState::new();
 
     loop {
+        let heartbeat_sleep = tokio::time::sleep_until(heartbeat.next_at);
+        tokio::pin!(heartbeat_sleep);
         let cmd = tokio::select! {
             cmd = rx.recv() => match cmd {
                 Some(cmd) => cmd,
                 None => break,
             },
-            _ = heartbeat.tick() => {
-                if send_heartbeat(
+            _ = &mut heartbeat_sleep => {
+                match send_heartbeat(
                     &mut client,
-                    &mut node_registered,
+                    &mut heartbeat,
                     &metaserver_addr,
                     &advertise_addr,
                     &node_id,
-                    &mut backoff_ms,
-                ).await.is_err() {
-                    continue;
+                ).await {
+                    Ok(next_period) => {
+                        heartbeat.period = next_period;
+                        heartbeat.next_at = Instant::now() + heartbeat.period;
+                    }
+                    Err(retry_after) => {
+                        heartbeat.next_at = Instant::now() + retry_after;
+                    }
                 }
                 continue;
             }
@@ -315,11 +334,10 @@ async fn registration_loop(
         let remove_total: usize = removes.values().map(|v| v.len()).sum();
         if ensure_heartbeat_registered(
             &mut client,
-            &mut node_registered,
             &metaserver_addr,
             &advertise_addr,
             &node_id,
-            &mut backoff_ms,
+            &mut heartbeat,
         )
         .await
         .is_err()
@@ -363,7 +381,7 @@ async fn registration_loop(
                     );
                     if e.code() == Code::FailedPrecondition {
                         core_metrics().metaserver_session_resets.add(1, &[]);
-                        node_registered = false;
+                        heartbeat.node_registered = false;
                     }
                     insert_failed_at = Some(i);
                     break;
@@ -414,7 +432,7 @@ async fn registration_loop(
                     );
                     if e.code() == Code::FailedPrecondition {
                         core_metrics().metaserver_session_resets.add(1, &[]);
-                        node_registered = false;
+                        heartbeat.node_registered = false;
                     }
                     remove_failed_at = Some(i);
                     break;
@@ -436,48 +454,50 @@ async fn registration_loop(
 
 async fn ensure_heartbeat_registered(
     client: &mut Option<MetaServerGrpcClient<Channel>>,
-    node_registered: &mut bool,
     metaserver_addr: &str,
     advertise_addr: &str,
     node_id: &str,
-    backoff_ms: &mut u64,
+    heartbeat: &mut HeartbeatState,
 ) -> Result<(), ()> {
-    if *node_registered {
+    if heartbeat.node_registered && client.is_some() {
         return Ok(());
     }
 
-    send_heartbeat(
-        client,
-        node_registered,
-        metaserver_addr,
-        advertise_addr,
-        node_id,
-        backoff_ms,
-    )
-    .await
+    if Instant::now() < heartbeat.next_at {
+        return Err(());
+    }
+
+    match send_heartbeat(client, heartbeat, metaserver_addr, advertise_addr, node_id).await {
+        Ok(next_period) => {
+            heartbeat.period = next_period;
+            heartbeat.next_at = Instant::now() + next_period;
+            Ok(())
+        }
+        Err(retry_after) => {
+            heartbeat.next_at = Instant::now() + retry_after;
+            Err(())
+        }
+    }
 }
 
 async fn send_heartbeat(
     client: &mut Option<MetaServerGrpcClient<Channel>>,
-    node_registered: &mut bool,
+    heartbeat: &mut HeartbeatState,
     metaserver_addr: &str,
     advertise_addr: &str,
     node_id: &str,
-    backoff_ms: &mut u64,
-) -> Result<(), ()> {
+) -> Result<Duration, Duration> {
     if client.is_none() {
         match MetaServerGrpcClient::connect(metaserver_addr.to_string()).await {
             Ok(c) => {
                 info!("Connected to MetaServer at {}", metaserver_addr);
                 *client = Some(c);
-                *backoff_ms = INITIAL_BACKOFF_MS;
+                heartbeat.backoff_ms = INITIAL_BACKOFF_MS;
             }
             Err(e) => {
                 error!("Failed to connect to MetaServer: {e}");
                 core_metrics().metaserver_heartbeat_failures.add(1, &[]);
-                tokio::time::sleep(tokio::time::Duration::from_millis(*backoff_ms)).await;
-                *backoff_ms = (*backoff_ms * 2).min(MAX_BACKOFF_MS);
-                return Err(());
+                return Err(heartbeat.advance_backoff());
             }
         }
     }
@@ -490,24 +510,39 @@ async fn send_heartbeat(
         })
         .await
     {
-        Ok(_) => {
-            debug!("Heartbeat accepted by MetaServer: node={advertise_addr} node_id={node_id}");
-            *node_registered = true;
-            *backoff_ms = INITIAL_BACKOFF_MS;
-            Ok(())
+        Ok(resp) => {
+            let heartbeat_period =
+                heartbeat_period_from_stale_after(resp.into_inner().stale_after_secs);
+            debug!(
+                "Heartbeat accepted by MetaServer: node={advertise_addr} node_id={node_id} next_in={:?}",
+                heartbeat_period
+            );
+            heartbeat.node_registered = true;
+            heartbeat.backoff_ms = INITIAL_BACKOFF_MS;
+            Ok(heartbeat_period)
         }
         Err(e) => {
             warn!("MetaServer heartbeat failed: {e}");
             core_metrics().metaserver_heartbeat_failures.add(1, &[]);
             if e.code() == Code::FailedPrecondition {
                 core_metrics().metaserver_session_resets.add(1, &[]);
-                *node_registered = false;
+                heartbeat.node_registered = false;
             }
             *client = None;
-            tokio::time::sleep(tokio::time::Duration::from_millis(*backoff_ms)).await;
-            *backoff_ms = (*backoff_ms * 2).min(MAX_BACKOFF_MS);
-            Err(())
+            Err(heartbeat.advance_backoff())
         }
+    }
+}
+
+fn heartbeat_period_from_stale_after(stale_after_secs: u64) -> Duration {
+    Duration::from_secs((stale_after_secs / 2).max(MIN_HEARTBEAT_INTERVAL_SECS))
+}
+
+impl HeartbeatState {
+    fn advance_backoff(&mut self) -> Duration {
+        let delay = Duration::from_millis(self.backoff_ms);
+        self.backoff_ms = (self.backoff_ms * 2).min(MAX_BACKOFF_MS);
+        delay
     }
 }
 
@@ -556,5 +591,180 @@ async fn unregister_current_session(
             warn!("MetaServer unregister_node timed out");
             core_metrics().metaserver_unregister_failures.add(1, &[]);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pegaflow_proto::proto::engine::meta_server_server::{MetaServer, MetaServerServer};
+    use pegaflow_proto::proto::engine::{
+        HeartbeatNodeResponse, InsertBlockHashesResponse, QueryPrefixBlocksResponse,
+        RemoveBlockHashesResponse, ResponseStatus, UnregisterNodeResponse,
+    };
+    use std::net::SocketAddr;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::net::TcpListener;
+    use tokio::sync::{Notify, oneshot};
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::{Request, Response, Status, async_trait};
+
+    #[derive(Default)]
+    struct FakeMetaServerState {
+        heartbeat_count: AtomicUsize,
+        insert_count: AtomicUsize,
+        unregister_count: AtomicUsize,
+        fail_insert_with_stale_session: AtomicUsize,
+        heartbeat_notify: Notify,
+        unregister_notify: Notify,
+    }
+
+    #[derive(Clone)]
+    struct FakeMetaServer {
+        state: Arc<FakeMetaServerState>,
+    }
+
+    #[async_trait]
+    impl MetaServer for FakeMetaServer {
+        async fn heartbeat_node(
+            &self,
+            _request: Request<HeartbeatNodeRequest>,
+        ) -> Result<Response<HeartbeatNodeResponse>, Status> {
+            self.state.heartbeat_count.fetch_add(1, Ordering::SeqCst);
+            self.state.heartbeat_notify.notify_waiters();
+            Ok(Response::new(HeartbeatNodeResponse {
+                status: Some(ResponseStatus {
+                    ok: true,
+                    message: String::new(),
+                }),
+                stale_after_secs: 2,
+            }))
+        }
+
+        async fn unregister_node(
+            &self,
+            _request: Request<UnregisterNodeRequest>,
+        ) -> Result<Response<UnregisterNodeResponse>, Status> {
+            self.state.unregister_count.fetch_add(1, Ordering::SeqCst);
+            self.state.unregister_notify.notify_waiters();
+            Ok(Response::new(UnregisterNodeResponse { removed_keys: 0 }))
+        }
+
+        async fn insert_block_hashes(
+            &self,
+            _request: Request<InsertBlockHashesRequest>,
+        ) -> Result<Response<InsertBlockHashesResponse>, Status> {
+            self.state.insert_count.fetch_add(1, Ordering::SeqCst);
+            if self
+                .state
+                .fail_insert_with_stale_session
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    (remaining > 0).then_some(remaining - 1)
+                })
+                .is_ok()
+            {
+                return Err(Status::failed_precondition("stale node session"));
+            }
+            Ok(Response::new(InsertBlockHashesResponse {
+                status: Some(ResponseStatus {
+                    ok: true,
+                    message: String::new(),
+                }),
+                inserted_count: 1,
+            }))
+        }
+
+        async fn remove_block_hashes(
+            &self,
+            _request: Request<RemoveBlockHashesRequest>,
+        ) -> Result<Response<RemoveBlockHashesResponse>, Status> {
+            Ok(Response::new(RemoveBlockHashesResponse {
+                status: Some(ResponseStatus {
+                    ok: true,
+                    message: String::new(),
+                }),
+                removed_count: 1,
+            }))
+        }
+
+        async fn query_prefix_blocks(
+            &self,
+            _request: Request<QueryPrefixBlocksRequest>,
+        ) -> Result<Response<QueryPrefixBlocksResponse>, Status> {
+            Ok(Response::new(QueryPrefixBlocksResponse { nodes: vec![] }))
+        }
+    }
+
+    async fn start_fake_metaserver() -> (String, Arc<FakeMetaServerState>, oneshot::Sender<()>) {
+        let state = Arc::new(FakeMetaServerState::default());
+        let service = FakeMetaServer {
+            state: Arc::clone(&state),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let incoming = TcpListenerStream::new(listener);
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(MetaServerServer::new(service))
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+        (format!("http://{addr}"), state, shutdown_tx)
+    }
+
+    async fn wait_for_count(notify: &Notify, count: &AtomicUsize, expected: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if count.load(Ordering::SeqCst) >= expected {
+                return;
+            }
+            tokio::select! {
+                _ = notify.notified() => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    panic!("timed out waiting for count {expected}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_loop_sends_initial_heartbeat_and_unregisters_on_shutdown() {
+        let (addr, service, shutdown_tx) = start_fake_metaserver().await;
+        let client = MetaServerClient::new(MetaServerClientConfig::new(
+            addr,
+            "node-a:50055".to_string(),
+        ));
+
+        wait_for_count(&service.heartbeat_notify, &service.heartbeat_count, 1).await;
+        client.shutdown().await;
+        wait_for_count(&service.unregister_notify, &service.unregister_count, 1).await;
+
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn stale_session_write_error_triggers_new_heartbeat() {
+        let (addr, service, shutdown_tx) = start_fake_metaserver().await;
+        service
+            .fail_insert_with_stale_session
+            .store(1, Ordering::SeqCst);
+        let client = MetaServerClient::new(MetaServerClientConfig::new(
+            addr,
+            "node-a:50055".to_string(),
+        ));
+
+        wait_for_count(&service.heartbeat_notify, &service.heartbeat_count, 1).await;
+        client.try_register(vec![("ns".to_string(), vec![1])]);
+        wait_for_count(&service.heartbeat_notify, &service.heartbeat_count, 2).await;
+
+        client.shutdown().await;
+        let _ = shutdown_tx.send(());
     }
 }

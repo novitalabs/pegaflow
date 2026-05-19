@@ -91,6 +91,10 @@ impl BlockHashStore {
         })
     }
 
+    pub fn config(&self) -> StoreConfig {
+        self.config
+    }
+
     pub fn heartbeat_node(&self, node: &str, node_id: Uuid) -> Result<(), StoreError> {
         let now = Instant::now();
         match self.nodes.entry(Arc::from(node)) {
@@ -581,13 +585,14 @@ mod tests {
     #[test]
     fn test_query_filters_stale_node() {
         let store = BlockHashStore::with_config(StoreConfig {
-            node_stale_after: Duration::ZERO,
+            node_stale_after: Duration::from_millis(1),
             ttl: Duration::from_secs(60),
         });
         let node_id = heartbeat_node(&store, "node-a");
         store
             .insert_hashes("ns", &[vec![1]], "node-a", node_id)
             .unwrap();
+        std::thread::sleep(Duration::from_millis(2));
 
         let existing = store.query_prefix("ns", &[vec![1]]);
         assert!(existing.is_empty());

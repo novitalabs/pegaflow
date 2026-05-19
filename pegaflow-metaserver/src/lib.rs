@@ -21,6 +21,8 @@ use tokio::signal;
 use tokio::sync::Notify;
 use tonic::transport::Server;
 
+const DEFAULT_SWEEP_INTERVAL_SECS: u64 = 600;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "pegaflow-metaserver",
@@ -47,6 +49,10 @@ pub struct Cli {
     /// Minutes before block ownership records are purged by the lifecycle sweep.
     #[arg(long, default_value_t = store::DEFAULT_TTL_MINUTES)]
     pub ttl_minutes: u64,
+
+    /// Seconds between lifecycle sweeps.
+    #[arg(long, default_value_t = DEFAULT_SWEEP_INTERVAL_SECS)]
+    pub sweep_interval_secs: u64,
 }
 
 fn init_metrics() -> Result<(SdkMeterProvider, Registry), Box<dyn Error>> {
@@ -104,8 +110,8 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     info!("Starting PegaFlow MetaServer");
     info!("Binding to address: {}", cli.addr);
     info!(
-        "Node lifecycle: stale_after={}s ttl={}m",
-        cli.node_stale_secs, cli.ttl_minutes
+        "Node lifecycle: stale_after={}s ttl={}m sweep_interval={}s",
+        cli.node_stale_secs, cli.ttl_minutes, cli.sweep_interval_secs
     );
     let ttl_secs = cli
         .ttl_minutes
@@ -113,6 +119,9 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         .ok_or("ttl-minutes is too large")?;
     if cli.ttl_minutes == 0 {
         return Err("ttl-minutes must be greater than 0".into());
+    }
+    if cli.sweep_interval_secs == 0 {
+        return Err("sweep-interval-secs must be greater than 0".into());
     }
     if ttl_secs < cli.node_stale_secs {
         return Err(format!(
@@ -136,7 +145,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     // Spawn background node lifecycle sweep task.
     {
         let store = Arc::clone(&store);
-        let sweep_interval = Duration::from_secs(ttl_secs);
+        let sweep_interval = Duration::from_secs(cli.sweep_interval_secs);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(sweep_interval);
             loop {

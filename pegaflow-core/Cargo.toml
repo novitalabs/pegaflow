@@ -44,6 +44,7 @@ mea = "0.6.3"
 criterion.workspace = true
 cudarc.workspace = true
 tokio.workspace = true
+tokio-stream = { workspace = true, features = ["net"] }
 tempfile = "3"
 
 [[bench]]
