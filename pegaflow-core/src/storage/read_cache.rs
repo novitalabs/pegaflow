@@ -33,18 +33,15 @@ impl ReadCache {
     }
 
     /// Scan cache for a prefix of `keys`, stopping at the first miss.
-    pub(super) fn get_prefix_blocks(
-        &self,
-        keys: &[BlockKey],
-    ) -> (usize, Vec<(BlockKey, Arc<SealedBlock>)>) {
+    pub(super) fn get_prefix_blocks(&self, keys: &[BlockKey]) -> (usize, Vec<Arc<SealedBlock>>) {
         let mut hit = 0usize;
-        let mut blocks = Vec::new();
+        let mut blocks = Vec::with_capacity(keys.len());
         {
             let mut inner = self.inner.lock();
             for key in keys {
                 if let Some(block) = inner.cache.get(key) {
                     hit += 1;
-                    blocks.push((key.clone(), Arc::clone(&block)));
+                    blocks.push(block);
                 } else {
                     break;
                 }

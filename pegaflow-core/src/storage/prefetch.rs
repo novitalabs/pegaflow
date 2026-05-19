@@ -236,18 +236,16 @@ impl PrefetchScheduler {
         let remaining = &keys[hit..];
 
         let task_start = Instant::now();
-        let task_started = self.start_prefetch_task(PrefetchStart {
-            req_id: scan.req_id,
-            namespace: scan.namespace,
-            remaining,
-            prefix_blocks: prefix_blocks
-                .iter()
-                .map(|(_, block)| Arc::clone(block))
-                .collect(),
-            total: keys.len(),
-            hit,
-            emit_tier_metrics: scan.emit_tier_metrics,
-        });
+        let task_started = !remaining.is_empty()
+            && self.start_prefetch_task(PrefetchStart {
+                req_id: scan.req_id,
+                namespace: scan.namespace,
+                remaining,
+                prefix_blocks: prefix_blocks.clone(),
+                total: keys.len(),
+                hit,
+                emit_tier_metrics: scan.emit_tier_metrics,
+            });
         let task_schedule = task_start.elapsed();
 
         if task_started {
@@ -284,8 +282,10 @@ impl PrefetchScheduler {
                 task_schedule,
                 total_start.elapsed()
             );
-            let blocks = prefix_blocks.into_iter().map(|(_, block)| block).collect();
-            PrefetchStatus::Ready { blocks, missing }
+            PrefetchStatus::Ready {
+                blocks: prefix_blocks,
+                missing,
+            }
         }
     }
 
