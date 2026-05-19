@@ -114,6 +114,27 @@ pub(crate) struct RawSaveBatch {
 pub(crate) fn build_insert_entries(batch: &RawSaveBatch) -> (InsertEntries, u64, usize) {
     use std::collections::HashMap;
 
+    if let [layer] = batch.layers.as_slice() {
+        let blockwise = layer.allocs.len() > 1;
+        let total_blocks = layer.block_hashes.len();
+        let total_bytes = (layer.padded_block_size as u64).saturating_mul(total_blocks as u64);
+        let entries = layer
+            .block_hashes
+            .iter()
+            .enumerate()
+            .map(|(i, hash)| {
+                let (alloc_idx, offset_in_alloc) = if blockwise { (i, 0) } else { (0, i) };
+                let block = layer.allocs[alloc_idx]
+                    .make_raw_block(offset_in_alloc, layer.padded_block_size);
+                (
+                    BlockKey::new(batch.namespace.clone(), hash.clone()),
+                    vec![(layer.slot_id, block)],
+                )
+            })
+            .collect();
+        return (entries, total_bytes, total_blocks);
+    }
+
     let mut hash_entries: HashMap<Vec<u8>, Vec<(usize, Arc<RawBlock>)>> = HashMap::new();
     let mut total_bytes: u64 = 0;
     let mut total_blocks: usize = 0;

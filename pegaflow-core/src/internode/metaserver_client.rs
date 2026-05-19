@@ -74,9 +74,31 @@ impl MetaServerClientConfig {
     }
 }
 
-/// A batch of (namespace, block_hash) pairs for MetaServer operations.
+/// A batch of block hashes grouped by namespace for MetaServer operations.
 struct BlockHashBatch {
-    entries: Vec<(String, Vec<u8>)>,
+    groups: Vec<(String, Vec<Vec<u8>>)>,
+}
+
+impl BlockHashBatch {
+    fn from_entries(entries: Vec<(String, Vec<u8>)>) -> Self {
+        let mut groups: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+        for (namespace, hash) in entries {
+            groups.entry(namespace).or_default().push(hash);
+        }
+        Self {
+            groups: groups.into_iter().collect(),
+        }
+    }
+
+    fn single_namespace(namespace: String, hashes: Vec<Vec<u8>>) -> Self {
+        Self {
+            groups: vec![(namespace, hashes)],
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.groups.iter().map(|(_, hashes)| hashes.len()).sum()
+    }
 }
 
 /// Command sent to the background MetaServer loop.
@@ -128,12 +150,15 @@ impl MetaServerClient {
     ///
     /// Accepts a flat list of (namespace, block_hash) pairs. The background loop
     /// groups by namespace before issuing gRPC calls.
-    pub(crate) fn try_register(&self, entries: Vec<(String, Vec<u8>)>) {
-        if entries.is_empty() {
+    pub(crate) fn try_register_namespace(&self, namespace: String, hashes: Vec<Vec<u8>>) {
+        if hashes.is_empty() {
             return;
         }
-        let count = entries.len();
-        let batch = BlockHashBatch { entries };
+        self.try_send_register_batch(BlockHashBatch::single_namespace(namespace, hashes));
+    }
+
+    fn try_send_register_batch(&self, batch: BlockHashBatch) {
+        let count = batch.count();
         match self.command_tx.try_send(MetaServerCommand::Insert(batch)) {
             Ok(()) => {
                 core_metrics()
@@ -170,8 +195,11 @@ impl MetaServerClient {
         if entries.is_empty() {
             return;
         }
-        let count = entries.len();
-        let batch = BlockHashBatch { entries };
+        self.try_send_unregister_batch(BlockHashBatch::from_entries(entries));
+    }
+
+    fn try_send_unregister_batch(&self, batch: BlockHashBatch) {
+        let count = batch.count();
         match self.command_tx.try_send(MetaServerCommand::Remove(batch)) {
             Ok(()) => {
                 core_metrics()
@@ -287,21 +315,36 @@ async fn registration_loop(
             break;
         }
 
-        // Drain all pending commands. For each (namespace, hash), keep only the last
-        // operation (last-write-wins), so [Remove(X), Insert(X)] correctly resolves
-        // to Insert(X) rather than being reversed by separate-bucket processing.
-        let mut net: HashMap<(String, Vec<u8>), bool> = HashMap::new(); // true=insert, false=remove
+        let mut inserts: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+        let mut removes: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+        let mut mixed_ops: Option<HashMap<(String, Vec<u8>), bool>> = None; // true=insert
+        let mut saw_insert = false;
+        let mut saw_remove = false;
 
+        // Drain all pending commands. Pure insert/remove batches stay grouped by
+        // namespace; mixed streams switch to last-write-wins netting.
         for cmd in std::iter::once(cmd).chain(std::iter::from_fn(|| rx.try_recv().ok())) {
             match cmd {
                 MetaServerCommand::Insert(batch) => {
-                    for (ns, hash) in batch.entries {
-                        net.insert((ns, hash), true);
+                    saw_insert = true;
+                    if saw_remove {
+                        let net = mixed_ops.get_or_insert_with(|| {
+                            build_net(std::mem::take(&mut inserts), std::mem::take(&mut removes))
+                        });
+                        insert_groups_into_net(net, batch.groups, true);
+                    } else {
+                        append_groups(&mut inserts, batch.groups);
                     }
                 }
                 MetaServerCommand::Remove(batch) => {
-                    for (ns, hash) in batch.entries {
-                        net.insert((ns, hash), false);
+                    saw_remove = true;
+                    if saw_insert {
+                        let net = mixed_ops.get_or_insert_with(|| {
+                            build_net(std::mem::take(&mut inserts), std::mem::take(&mut removes))
+                        });
+                        insert_groups_into_net(net, batch.groups, false);
+                    } else {
+                        append_groups(&mut removes, batch.groups);
                     }
                 }
                 MetaServerCommand::Shutdown(done) => {
@@ -319,14 +362,13 @@ async fn registration_loop(
             }
         }
 
-        let mut inserts: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
-        let mut removes: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
-
-        for ((ns, hash), is_insert) in net {
-            if is_insert {
-                inserts.entry(ns).or_default().push(hash);
-            } else {
-                removes.entry(ns).or_default().push(hash);
+        if let Some(net) = mixed_ops {
+            for ((namespace, hash), is_insert) in net {
+                if is_insert {
+                    inserts.entry(namespace).or_default().push(hash);
+                } else {
+                    removes.entry(namespace).or_default().push(hash);
+                }
             }
         }
 
@@ -458,6 +500,44 @@ async fn registration_loop(
     }
 
     info!("MetaServer registration loop shutting down");
+}
+
+fn append_groups(target: &mut HashMap<String, Vec<Vec<u8>>>, groups: Vec<(String, Vec<Vec<u8>>)>) {
+    for (namespace, mut hashes) in groups {
+        target.entry(namespace).or_default().append(&mut hashes);
+    }
+}
+
+fn build_net(
+    inserts: HashMap<String, Vec<Vec<u8>>>,
+    removes: HashMap<String, Vec<Vec<u8>>>,
+) -> HashMap<(String, Vec<u8>), bool> {
+    let mut net = HashMap::new();
+    insert_map_into_net(&mut net, inserts, true);
+    insert_map_into_net(&mut net, removes, false);
+    net
+}
+
+fn insert_map_into_net(
+    net: &mut HashMap<(String, Vec<u8>), bool>,
+    grouped: HashMap<String, Vec<Vec<u8>>>,
+    is_insert: bool,
+) {
+    for (namespace, hashes) in grouped {
+        insert_groups_into_net(net, vec![(namespace, hashes)], is_insert);
+    }
+}
+
+fn insert_groups_into_net(
+    net: &mut HashMap<(String, Vec<u8>), bool>,
+    groups: Vec<(String, Vec<Vec<u8>>)>,
+    is_insert: bool,
+) {
+    for (namespace, hashes) in groups {
+        for hash in hashes {
+            net.insert((namespace.clone(), hash), is_insert);
+        }
+    }
 }
 
 async fn ensure_heartbeat_registered(
@@ -775,7 +855,7 @@ mod tests {
         ));
 
         wait_for_count(&service.heartbeat_notify, &service.heartbeat_count, 1).await;
-        client.try_register(vec![("ns".to_string(), vec![1])]);
+        client.try_register_namespace("ns".to_string(), vec![vec![1]]);
         wait_for_count(&service.heartbeat_notify, &service.heartbeat_count, 2).await;
 
         client.shutdown().await;

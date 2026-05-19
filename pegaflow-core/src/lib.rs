@@ -540,15 +540,19 @@ impl PegaEngine {
 
             let slot_id = instance.get_slot_index(layer_id, tp_rank)?;
 
-            let blocks: Vec<LoadBlock> = block_ids
-                .iter()
-                .zip(block_cache.iter())
-                .filter_map(|(block_id, block_entry)| {
-                    let block_idx = usize::try_from(*block_id).ok()?;
-                    let block = block_entry.get_slot(slot_id)?.clone();
-                    Some(LoadBlock { block_idx, block })
-                })
-                .collect();
+            let mut blocks = Vec::with_capacity(block_ids.len());
+            for (block_id, block_entry) in block_ids.iter().zip(block_cache.iter()) {
+                let Ok(block_idx) = usize::try_from(*block_id) else {
+                    continue;
+                };
+                let Some(block) = block_entry.get_slot(slot_id) else {
+                    continue;
+                };
+                blocks.push(LoadBlock {
+                    block_idx,
+                    block: Arc::clone(block),
+                });
+            }
 
             if !blocks.is_empty() {
                 layers.push(LayerLoadData {

@@ -200,12 +200,19 @@ fn process_insert_batch(
     if !sealed_blocks.is_empty()
         && let Some(deps) = deps.upgrade()
     {
-        send_backing_batches(&deps, &sealed_blocks);
+        send_backing_batches(&deps, namespace, &sealed_blocks);
     }
 }
 
-fn send_backing_batches(deps: &InsertDeps, blocks: &[(BlockKey, Arc<SealedBlock>)]) {
+fn send_backing_batches(
+    deps: &InsertDeps,
+    namespace: &str,
+    blocks: &[(BlockKey, Arc<SealedBlock>)],
+) {
     if blocks.is_empty() {
+        return;
+    }
+    if deps.ssd_store.is_none() && deps.metaserver_client.is_none() {
         return;
     }
     let weak_blocks: Vec<(BlockKey, Weak<SealedBlock>)> = blocks
@@ -216,16 +223,17 @@ fn send_backing_batches(deps: &InsertDeps, blocks: &[(BlockKey, Arc<SealedBlock>
         ssd.ingest_batch(weak_blocks);
     }
     if let Some(client) = &deps.metaserver_client {
-        register_block_hashes(client, blocks);
+        register_block_hashes(client, namespace, blocks);
     }
 }
 
-fn register_block_hashes(client: &MetaServerClient, blocks: &[(BlockKey, Arc<SealedBlock>)]) {
-    let entries: Vec<(String, Vec<u8>)> = blocks
-        .iter()
-        .map(|(key, _)| (key.namespace.clone(), key.hash.clone()))
-        .collect();
-    client.try_register(entries);
+fn register_block_hashes(
+    client: &MetaServerClient,
+    namespace: &str,
+    blocks: &[(BlockKey, Arc<SealedBlock>)],
+) {
+    let hashes: Vec<Vec<u8>> = blocks.iter().map(|(key, _)| key.hash.clone()).collect();
+    client.try_register_namespace(namespace.to_string(), hashes);
 }
 
 fn gc_inflight(
