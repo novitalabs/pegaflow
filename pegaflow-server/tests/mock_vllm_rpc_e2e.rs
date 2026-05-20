@@ -59,20 +59,22 @@ async fn mock_vllm_save_query_load_roundtrip_over_rpc() {
 }
 
 #[tokio::test]
-async fn mock_vllm_empty_req_id_query_returns_zero_hit_ready() {
+async fn mock_vllm_empty_req_id_query_is_rejected() {
     let mut harness = MockVllmRpcHarness::new().await;
     let hashes = make_block_hashes(BLOCK_COUNT, 31);
 
     let save = harness.save_blocks(&hashes).await;
     assert_response_ok(save.response.status.as_ref(), "save");
 
-    let query = harness.query_prefetch("", &hashes).await;
+    let query = match harness.try_query_prefetch("", &hashes).await {
+        Ok(_) => panic!("empty req_id query should be rejected"),
+        Err(err) => err,
+    };
     assert_eq!(query.request.instance_id, INSTANCE_ID);
     assert_eq!(query.request.block_hashes, hashes);
     assert_eq!(query.request.req_id, "");
-    let ready = expect_query_ready(query.response.outcome, "empty req_id query");
-    assert_eq!(ready.num_hit_blocks, 0);
-    assert!(ready.lease.is_empty());
+    assert_eq!(query.status.code(), tonic::Code::InvalidArgument);
+    assert!(query.status.message().contains("req_id"));
 }
 
 #[tokio::test]

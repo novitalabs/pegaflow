@@ -138,11 +138,21 @@ impl PegaEngine {
 
         let config = storage_config;
         let numa_nodes: Vec<NumaNode> = if config.enable_numa_affinity && topology.is_multi_numa() {
-            info!(
-                "Auto-enabling NUMA-aware memory allocation for {} nodes",
-                topology.num_nodes()
-            );
-            topology.numa_nodes().to_vec()
+            let gpu_numa_nodes = topology.gpu_numa_nodes();
+            if gpu_numa_nodes.is_empty() {
+                info!(
+                    "Auto-enabling NUMA-aware memory allocation for {} CPU NUMA nodes; no GPU NUMA affinity detected",
+                    topology.num_nodes()
+                );
+                topology.numa_nodes().to_vec()
+            } else {
+                info!(
+                    "Auto-enabling NUMA-aware memory allocation for {} GPU-local NUMA nodes ({} CPU NUMA nodes detected)",
+                    gpu_numa_nodes.len(),
+                    topology.num_nodes()
+                );
+                gpu_numa_nodes
+            }
         } else {
             vec![]
         };

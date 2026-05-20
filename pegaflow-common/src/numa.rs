@@ -382,6 +382,19 @@ impl NumaTopology {
         &self.numa_nodes
     }
 
+    /// Get all valid NUMA nodes that have at least one GPU attached.
+    pub fn gpu_numa_nodes(&self) -> Vec<NumaNode> {
+        let mut nodes: Vec<NumaNode> = self
+            .gpu_numa_map
+            .values()
+            .copied()
+            .filter(NumaNode::is_valid)
+            .collect();
+        nodes.sort_unstable();
+        nodes.dedup();
+        nodes
+    }
+
     /// Get the number of NUMA nodes.
     pub fn num_nodes(&self) -> usize {
         self.numa_nodes.len()
@@ -542,6 +555,32 @@ mod tests {
     fn test_parse_cpulist_single_cpu() {
         let cpus = parse_cpulist("5").unwrap();
         assert_eq!(cpus, vec![5]);
+    }
+
+    #[test]
+    fn test_gpu_numa_nodes_are_valid_sorted_unique() {
+        let topology = NumaTopology {
+            gpu_numa_map: HashMap::from([
+                (0, NumaNode(3)),
+                (1, NumaNode(3)),
+                (2, NumaNode::UNKNOWN),
+                (3, NumaNode(0)),
+                (4, NumaNode(5)),
+            ]),
+            numa_nodes: vec![
+                NumaNode(0),
+                NumaNode(1),
+                NumaNode(2),
+                NumaNode(3),
+                NumaNode(4),
+                NumaNode(5),
+            ],
+        };
+
+        assert_eq!(
+            topology.gpu_numa_nodes(),
+            vec![NumaNode(0), NumaNode(3), NumaNode(5)]
+        );
     }
 
     #[test]
