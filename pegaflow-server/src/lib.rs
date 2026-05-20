@@ -148,9 +148,8 @@ pub struct Cli {
     #[arg(long, value_delimiter = ',', value_parser = parse_nic_name, num_args = 1..)]
     pub nics: Option<Vec<String>>,
 
-    /// Number of RC QPs per (local NIC, remote NIC) pair. Spreads WQE pressure
-    /// across N QPs; see `docs/resources/rdma-qp-count-impact.md`. Range [1, 16].
-    #[arg(long, default_value_t = 2)]
+    /// Number of RC QPs per (local NIC, remote NIC) pair.
+    #[arg(long, default_value_t = pegaflow_core::DEFAULT_RDMA_QPS_PER_PEER)]
     pub qps_per_peer: usize,
 
     /// MetaServer address for cross-node block hash registration (e.g. http://127.0.0.1:50056).

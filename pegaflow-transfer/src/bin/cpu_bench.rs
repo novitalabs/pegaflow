@@ -77,9 +77,7 @@ struct Cli {
     #[arg(long)]
     numa: Option<u32>,
 
-    /// QPs per peer per NIC; spreads WQE pressure across N QPs.
-    /// See `docs/resources/rdma-qp-count-impact.md` — small-msg workloads need
-    /// 4–8 to hit the NIC PPS ceiling; large-msg saturates at 2.
+    /// QPs per peer per NIC.
     #[arg(long, default_value_t = 2)]
     qps_per_peer: usize,
 }

@@ -98,11 +98,6 @@ pub(crate) enum GetOrPrepareResult {
     NeedHandshake(Vec<NicHandshake>),
 }
 
-/// Hard upper bound for QPs per peer per NIC. Each session owns a worker thread
-/// + a CQ; going wild here burns RAM and CPU. The RDMA QP-count sweep on CX-7
-/// (`docs/resources/rdma-qp-count-impact.md`) showed no benefit beyond 8.
-const MAX_QPS_PER_PEER: usize = 16;
-
 pub(crate) struct RcBackend {
     runtimes: Vec<Arc<RcRuntime>>,
     state: Arc<Mutex<RcBackendState>>,
@@ -117,10 +112,8 @@ impl RcBackend {
         if nic_names.is_empty() {
             return Err(TransferError::InvalidArgument("nic_names is empty"));
         }
-        if qps_per_peer == 0 || qps_per_peer > MAX_QPS_PER_PEER {
-            return Err(TransferError::InvalidArgument(
-                "qps_per_peer must be in [1, 16]",
-            ));
+        if qps_per_peer == 0 {
+            return Err(TransferError::InvalidArgument("qps_per_peer must be > 0"));
         }
         let mut runtimes = Vec::with_capacity(nic_names.len());
         for name in nic_names {
@@ -316,15 +309,14 @@ impl RcBackend {
                 info!("handshake won by concurrent path: remote={remote_addr}");
                 return Ok(());
             }
-            let mut sessions_per_nic: Vec<Vec<Arc<RcSession>>> =
-                (0..nic_count).map(|_| Vec::with_capacity(self.qps_per_peer)).collect();
+            let mut sessions_per_nic: Vec<Vec<Arc<RcSession>>> = (0..nic_count)
+                .map(|_| Vec::with_capacity(self.qps_per_peer))
+                .collect();
             for (nic_idx, nic) in local_nics.iter().enumerate() {
                 for ep in &nic.endpoints {
-                    let session = state.nics[nic_idx]
-                        .remove_pending_by_qpn(ep.qp_num)
-                        .ok_or(TransferError::Backend(
-                            "no pending session to complete".to_string(),
-                        ))?;
+                    let session = state.nics[nic_idx].remove_pending_by_qpn(ep.qp_num).ok_or(
+                        TransferError::Backend("no pending session to complete".to_string()),
+                    )?;
                     sessions_per_nic[nic_idx].push(session);
                 }
             }
@@ -461,12 +453,9 @@ impl RcBackend {
                     "no connection for remote addr {remote_addr}"
                 )))?;
 
-            // Spread ops across the N sessions per NIC. Round-robin at the WQE
-            // (per-op) level inside the batch — not per call — so a single
-            // batch can fill all N QPs. Per-call RR would leave the rest of the
-            // QPs idle while one QP works through the whole batch.
-            for nic_idx in 0..nic_count {
-                let nic_descs = &per_nic[nic_idx];
+            // Per-WQE round-robin across the N sessions per NIC so a single
+            // batch can fill all N QPs (per-call RR would leave the rest idle).
+            for (nic_idx, nic_descs) in per_nic.iter().enumerate() {
                 if nic_descs.is_empty() {
                     continue;
                 }
