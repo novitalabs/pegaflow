@@ -24,7 +24,7 @@ class FakeTensor:
         return self._element_size
 
 
-def test_blocks_first_flashmla_physical_rows_are_grouped_into_logical_blocks():
+def test_mla_blocks_first_physical_rows_are_grouped_into_logical_blocks():
     info = _infer_kv_cache_registration(
         FakeTensor(
             shape=(6, 64, 576),
@@ -32,6 +32,7 @@ def test_blocks_first_flashmla_physical_rows_are_grouped_into_logical_blocks():
             element_size=2,
         ),
         logical_block_size=128,
+        is_mla=True,
     )
 
     assert info.layout == "blocks-first"
@@ -42,7 +43,7 @@ def test_blocks_first_flashmla_physical_rows_are_grouped_into_logical_blocks():
     assert info.physical_blocks_per_logical_block == 2
 
 
-def test_kv_first_physical_rows_are_grouped_per_kv_segment():
+def test_non_mla_kv_first_uses_legacy_block_stride():
     info = _infer_kv_cache_registration(
         FakeTensor(
             shape=(2, 6, 64, 4, 8),
@@ -53,11 +54,11 @@ def test_kv_first_physical_rows_are_grouped_per_kv_segment():
     )
 
     assert info.layout == "KV-first"
-    assert info.num_blocks == 3
-    assert info.bytes_per_block == 2 * 64 * 4 * 8 * 2
+    assert info.num_blocks == 6
+    assert info.bytes_per_block == 64 * 4 * 8 * 2
     assert info.kv_stride_bytes == 6 * 64 * 4 * 8 * 2
     assert info.segments == 2
-    assert info.physical_blocks_per_logical_block == 2
+    assert info.physical_blocks_per_logical_block == 1
 
 
 def test_mla_prefers_blocks_first_when_first_dimension_is_two():
@@ -79,7 +80,7 @@ def test_mla_prefers_blocks_first_when_first_dimension_is_two():
     assert info.physical_blocks_per_logical_block == 2
 
 
-def test_equal_physical_and_logical_block_size_is_unchanged():
+def test_mla_equal_physical_and_logical_block_size_is_unchanged():
     info = _infer_kv_cache_registration(
         FakeTensor(
             shape=(3, 128, 576),
@@ -87,6 +88,7 @@ def test_equal_physical_and_logical_block_size_is_unchanged():
             element_size=2,
         ),
         logical_block_size=128,
+        is_mla=True,
     )
 
     assert info.num_blocks == 3
@@ -94,20 +96,27 @@ def test_equal_physical_and_logical_block_size_is_unchanged():
     assert info.physical_blocks_per_logical_block == 1
 
 
-def test_blocks_first_standard_attention_uses_third_dim_as_physical_block_size():
+def test_non_mla_cross_layer_layout_uses_legacy_block_stride():
     info = _infer_kv_cache_registration(
         FakeTensor(
-            shape=(6, 2, 64, 4, 8),
-            stride=(2 * 64 * 4 * 8, 64 * 4 * 8, 4 * 8, 8, 1),
+            shape=(6, 93, 2, 64, 1, 128),
+            stride=(
+                93 * 2 * 64 * 1 * 128,
+                2 * 64 * 1 * 128,
+                64 * 1 * 128,
+                1 * 128,
+                128,
+                1,
+            ),
             element_size=2,
         ),
         logical_block_size=128,
     )
 
     assert info.layout == "blocks-first"
-    assert info.num_blocks == 3
-    assert info.bytes_per_block == 2 * 2 * 64 * 4 * 8 * 2
-    assert info.physical_blocks_per_logical_block == 2
+    assert info.num_blocks == 6
+    assert info.bytes_per_block == 93 * 2 * 64 * 1 * 128 * 2
+    assert info.physical_blocks_per_logical_block == 1
 
 
 def test_logical_block_size_must_be_multiple_of_physical_block_size():
@@ -119,6 +128,7 @@ def test_logical_block_size_must_be_multiple_of_physical_block_size():
                 element_size=2,
             ),
             logical_block_size=128,
+            is_mla=True,
         )
 
 
@@ -131,6 +141,7 @@ def test_logical_block_size_must_be_positive():
                 element_size=2,
             ),
             logical_block_size=0,
+            is_mla=True,
         )
 
 
@@ -143,6 +154,7 @@ def test_physical_block_count_must_be_positive():
                 element_size=2,
             ),
             logical_block_size=128,
+            is_mla=True,
         )
 
 
@@ -155,6 +167,7 @@ def test_physical_block_size_must_be_positive():
                 element_size=2,
             ),
             logical_block_size=128,
+            is_mla=True,
         )
 
 
@@ -167,6 +180,7 @@ def test_physical_block_count_must_be_divisible_by_split_ratio():
                 element_size=2,
             ),
             logical_block_size=128,
+            is_mla=True,
         )
 
 
@@ -179,4 +193,5 @@ def test_bytes_per_block_must_be_nonzero():
                 element_size=2,
             ),
             logical_block_size=128,
+            is_mla=True,
         )

@@ -82,23 +82,40 @@ def _infer_kv_cache_registration(
     if logical_block_size <= 0:
         raise ValueError(f"logical block size must be > 0, got {logical_block_size}")
 
-    if not is_mla and len(shape) >= 2 and shape[0] == 2:
-        layout = "KV-first"
-        physical_num_blocks = shape[1]
-        physical_block_size = shape[2] if len(shape) >= 3 else logical_block_size
-        physical_bytes_per_block = stride[1] * element_size
-        kv_stride_bytes = stride[0] * element_size
-        segments = 2
-    else:
-        layout = "blocks-first"
-        physical_num_blocks = shape[0]
-        if len(shape) >= 3 and shape[1] == 2:
-            physical_block_size = shape[2]
+    if not is_mla:
+        if len(shape) >= 2 and shape[0] == 2:
+            layout = "KV-first"
+            num_blocks = shape[1]
+            bytes_per_block = stride[1] * element_size
+            kv_stride_bytes = stride[0] * element_size
+            segments = 2
         else:
-            physical_block_size = shape[1] if len(shape) >= 2 else logical_block_size
-        physical_bytes_per_block = stride[0] * element_size
-        kv_stride_bytes = 0
-        segments = 1
+            layout = "blocks-first"
+            num_blocks = shape[0]
+            bytes_per_block = stride[0] * element_size
+            kv_stride_bytes = 0
+            segments = 1
+
+        if num_blocks <= 0:
+            raise ValueError(f"physical block count must be > 0, got {num_blocks}")
+        if bytes_per_block == 0:
+            raise ValueError(f"Invalid bytes_per_block: shape={shape} stride={stride}")
+
+        return _KVCacheRegistrationInfo(
+            layout=layout,
+            num_blocks=num_blocks,
+            bytes_per_block=bytes_per_block,
+            kv_stride_bytes=kv_stride_bytes,
+            segments=segments,
+            physical_blocks_per_logical_block=1,
+        )
+
+    layout = "blocks-first"
+    physical_num_blocks = shape[0]
+    physical_block_size = shape[1] if len(shape) >= 2 else logical_block_size
+    physical_bytes_per_block = stride[0] * element_size
+    kv_stride_bytes = 0
+    segments = 1
 
     if physical_num_blocks <= 0:
         raise ValueError(
