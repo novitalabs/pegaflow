@@ -1,4 +1,3 @@
-use std::fs;
 use std::sync::Arc;
 
 use log::error;
@@ -40,17 +39,8 @@ impl RcRuntime {
             .alloc_pd()
             .map_err(|error| TransferError::Backend(error.to_string()))?;
 
-        let (port_num, link_layer, gid_index, mtu, local_gid) =
+        let (port_num, link_layer, local_lid, gid_index, mtu, local_gid) =
             Self::choose_port_and_gid(&device_ctx)?;
-        let local_lid = match link_layer {
-            LinkLayer::InfiniBand => Self::read_port_lid(nic_name, port_num)?,
-            LinkLayer::Ethernet => 0,
-            LinkLayer::Unspecified => {
-                return Err(TransferError::Backend(format!(
-                    "unsupported link layer on nic={nic_name}, port={port_num}: {link_layer:?}"
-                )));
-            }
-        };
         let numa_node = nic_numa_node(nic_name);
         log::info!(
             "RDMA NIC ready: nic={}, port={}, link_layer={:?}, local_lid={}, gid_index={}, mtu={:?}, numa={}",
@@ -79,7 +69,7 @@ impl RcRuntime {
 
     fn choose_port_and_gid(
         device_ctx: &Arc<DeviceContext>,
-    ) -> Result<(u8, LinkLayer, u8, Mtu, Gid)> {
+    ) -> Result<(u8, LinkLayer, u16, u8, Mtu, Gid)> {
         let dev_attr = device_ctx
             .query_device()
             .map_err(|error| TransferError::Backend(error.to_string()))?;
@@ -95,6 +85,25 @@ impl RcRuntime {
                 continue;
             }
             let link_layer = port_attr.link_layer();
+            let local_lid = match link_layer {
+                LinkLayer::InfiniBand => {
+                    let lid = port_attr.lid();
+                    if lid == 0 {
+                        return Err(TransferError::Backend(format!(
+                            "invalid zero LID for InfiniBand nic={}, port={port_num}",
+                            device_ctx.name()
+                        )));
+                    }
+                    lid
+                }
+                LinkLayer::Ethernet => 0,
+                LinkLayer::Unspecified => {
+                    return Err(TransferError::Backend(format!(
+                        "unsupported link layer on nic={}, port={port_num}: {link_layer:?}",
+                        device_ctx.name()
+                    )));
+                }
+            };
 
             // Pick the best GID: RoCEv2 + IPv4-mapped > IB > any non-link-local.
             // RoCEv1 cannot be routed across L3 — only RoCEv2 works cross-machine.
@@ -127,7 +136,14 @@ impl RcRuntime {
                 (0, gid)
             };
 
-            return Ok((port_num, link_layer, gid_index, port_attr.active_mtu(), gid));
+            return Ok((
+                port_num,
+                link_layer,
+                local_lid,
+                gid_index,
+                port_attr.active_mtu(),
+                gid,
+            ));
         }
 
         error!(
@@ -137,24 +153,5 @@ impl RcRuntime {
         Err(TransferError::Backend(
             "no active port found on selected NIC".to_string(),
         ))
-    }
-
-    fn read_port_lid(nic_name: &str, port_num: u8) -> Result<u16> {
-        let path = format!("/sys/class/infiniband/{nic_name}/ports/{port_num}/lid");
-        let raw = fs::read_to_string(&path)
-            .map_err(|error| TransferError::Backend(format!("failed to read {path}: {error}")))?;
-        let text = raw.trim();
-        let lid = if let Some(hex) = text.strip_prefix("0x") {
-            u16::from_str_radix(hex, 16)
-        } else {
-            text.parse()
-        }
-        .map_err(|error| TransferError::Backend(format!("invalid LID in {path}: {error}")))?;
-        if lid == 0 {
-            return Err(TransferError::Backend(format!(
-                "invalid zero LID for InfiniBand nic={nic_name}, port={port_num}"
-            )));
-        }
-        Ok(lid)
     }
 }
