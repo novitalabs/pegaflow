@@ -146,14 +146,13 @@ impl Worker {
         let (init_worker_tx, init_worker_rx) = oneshot::channel();
         let (init_uvm_tx, init_uvm_rx) = oneshot::channel();
 
-        // Collect Verbs domains. EFA was removed during the port; the
-        // DomainInfo enum currently has only one variant.
-        let mut verbs_domain_list = Vec::new();
-        for info in self.domain_list.into_iter() {
-            match info {
-                DomainInfo::Verbs(info) => verbs_domain_list.push(info),
-            }
-        }
+        // Collect Verbs domains. EFA was removed during the port; DomainInfo
+        // remains opaque so callers do not depend on provider internals.
+        let verbs_domain_list = self
+            .domain_list
+            .into_iter()
+            .map(DomainInfo::into_verbs)
+            .collect::<Vec<_>>();
 
         // Callback queue.
         let (cq_tx, cq_rx) = crossbeam_channel::bounded(128);

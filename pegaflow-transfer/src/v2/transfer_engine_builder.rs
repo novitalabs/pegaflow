@@ -3,8 +3,8 @@ use std::collections::HashSet;
 use anyhow::{Error, Result};
 
 use crate::v2::{
-    RdmaDomainInfo, provider_dispatch::DomainInfo, topo::detect_topology,
-    transfer_engine::TransferEngine, worker::Worker,
+    provider_dispatch::DomainInfo, topo::detect_topology, transfer_engine::TransferEngine,
+    worker::Worker,
 };
 
 struct GpuDomainSpec {

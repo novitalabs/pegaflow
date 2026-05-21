@@ -16,8 +16,8 @@ use parking_lot::Mutex;
 use parking_lot::RwLock;
 
 use crate::v2::{
-    BouncingErrorCallback, BouncingRecvCallback, ErrorCallback, FabricLibError, RdmaEngine,
-    RecvCallback, SendBuffer, SendCallback, SendRecvEngine,
+    BouncingErrorCallback, BouncingRecvCallback, CallbackResult, ErrorCallback, FabricLibError,
+    RdmaEngine, RecvCallback, SendBuffer, SendCallback, SendRecvEngine,
     api::{
         DomainAddress, GdrCounter, ImmCounter, MemoryRegionDescriptor, MemoryRegionHandle,
         PeerGroupHandle, SmallVec, TransferCompletionEntry, TransferCounter, TransferId,
@@ -33,8 +33,6 @@ use {
     crate::v2::AsyncTransferEngine,
     tokio::sync::{mpsc, oneshot},
 };
-
-pub type CallbackResult = std::result::Result<(), String>;
 
 pub struct TransferCallback {
     pub on_done: Box<dyn FnOnce() -> CallbackResult + Send + Sync>,
@@ -81,7 +79,7 @@ pub struct TransferEngine {
 }
 
 impl TransferEngine {
-    pub fn new(workers: Vec<(u8, Worker)>) -> Result<Self> {
+    pub(crate) fn new(workers: Vec<(u8, Worker)>) -> Result<Self> {
         let engine = Arc::new(FabricEngine::new(workers)?);
 
         let callbacks = Arc::new(Callbacks {
@@ -147,7 +145,7 @@ impl TransferEngine {
         self.engine.get_imm_counter(imm)
     }
 
-    pub fn get_gdr_counter(&self, imm: u32, flag: Arc<GdrFlag>) -> GdrCounter {
+    pub(crate) fn get_gdr_counter(&self, imm: u32, flag: Arc<GdrFlag>) -> GdrCounter {
         self.engine.get_gdr_counter(imm, flag)
     }
 
@@ -159,7 +157,10 @@ impl TransferEngine {
         self.engine.add_peer_group(addrs, device)
     }
 
-    pub fn alloc_scalar_watcher(&self, callback: UvmWatcherCallback) -> Result<UvmWatcherId> {
+    pub(crate) fn alloc_scalar_watcher(
+        &self,
+        callback: UvmWatcherCallback,
+    ) -> Result<UvmWatcherId> {
         let watcher_id = self.engine.acquire_uvm_watcher()?;
         self.callbacks.watchers.insert(watcher_id, callback);
         Ok(watcher_id)

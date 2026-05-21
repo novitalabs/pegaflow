@@ -105,9 +105,7 @@ impl From<&VerbsDeviceInfo> for PciAddress {
 
 impl From<&DomainInfo> for PciAddress {
     fn from(domain: &DomainInfo) -> Self {
-        match domain {
-            DomainInfo::Verbs(info) => info.into(),
-        }
+        domain.as_verbs().into()
     }
 }
 
@@ -437,7 +435,7 @@ fn get_visible_domains() -> Vec<DomainInfo> {
         return Vec::new();
     };
     (0..verbs_domains.num_devices)
-        .map(|i| DomainInfo::Verbs(VerbsDeviceInfo::new(verbs_domains.clone(), i)))
+        .map(|i| DomainInfo::verbs(VerbsDeviceInfo::new(verbs_domains.clone(), i)))
         .collect()
 }
 

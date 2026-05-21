@@ -1,6 +1,4 @@
-//! RDMA Verbs fabric (upstream-derived from `pplx-garden`).
-//!
-//! Exposes `FabricEngine`, `Worker`, `TransferEngine`, and supporting types.
+//! RDMA Verbs transfer engine (upstream-derived from `pplx-garden`).
 #![allow(
     dead_code,
     unreachable_pub,
@@ -17,7 +15,7 @@
     reason = "upstream-derived RDMA fabric keeps its porting shape while PD push integration lands"
 )]
 
-pub mod api;
+mod api;
 mod cpu_affinity;
 mod domain_group;
 mod error;
@@ -36,17 +34,23 @@ mod utils;
 mod verbs;
 mod worker;
 
-pub use domain_group::DomainGroup;
-pub use error::*;
-pub use fabric_engine::FabricEngine;
-pub use host_buffer::{HostBuffer, HostBufferAllocator};
-pub use interface::{
-    AsyncTransferEngine, BouncingErrorCallback, BouncingRecvCallback, ErrorCallback,
-    MockTestTransferEngine, RdmaEngine, RecvCallback, SendBuffer, SendCallback, SendRecvEngine,
+pub use crate::cuda_lib::{CudaDeviceId, Device};
+pub use api::{
+    BarrierTransferRequest, DomainAddress, DomainGroupRouting, GroupTransferRouting, ImmCounter,
+    ImmTransferRequest, MemoryRegionDescriptor, MemoryRegionHandle, MemoryRegionRemoteKey,
+    PagedTransferRequest, PeerGroupHandle, ScatterTarget, ScatterTransferRequest,
+    SingleTransferRequest, SmallVec, TransferRequest,
 };
-pub use provider::{RdmaDomain, RdmaDomainInfo};
+pub use error::{FabricLibError, Result, VerbsError};
+#[cfg(feature = "tokio")]
+pub use interface::AsyncTransferEngine;
+pub use interface::{
+    BouncingErrorCallback, BouncingRecvCallback, CallbackResult, ErrorCallback, RdmaEngine,
+    RecvCallback, SendBuffer, SendCallback, SendRecvEngine,
+};
 pub use provider_dispatch::DomainInfo;
 pub use topo::{TopologyGroup, detect_topology};
-pub use transfer_engine::{ImmCountCallback, TransferCallback, TransferEngine, UvmWatcherCallback};
+pub use transfer_engine::{ImmCallbackFn, ImmCountCallback, TransferCallback, TransferEngine};
 pub use transfer_engine_builder::TransferEngineBuilder;
-pub use worker::{InitializingWorker, Worker, WorkerHandle};
+
+pub(crate) use fabric_engine::FabricEngine;
