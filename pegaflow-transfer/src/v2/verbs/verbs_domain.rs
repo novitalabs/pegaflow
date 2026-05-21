@@ -17,9 +17,8 @@ use crate::libibverbs_sys::{
     ibv_dealloc_td, ibv_dereg_mr, ibv_destroy_ah, ibv_destroy_cq, ibv_destroy_srq, ibv_gid,
     ibv_global_route, ibv_mr, ibv_mtu, ibv_open_device, ibv_parent_domain_init_attr, ibv_pd,
     ibv_poll_cq, ibv_port_attr, ibv_post_recv, ibv_post_send, ibv_post_srq_recv, ibv_qp,
-    ibv_query_gid, ibv_query_port_wrap, ibv_recv_wr, ibv_reg_dmabuf_mr, ibv_reg_mr, ibv_send_wr,
-    ibv_sge, ibv_srq, ibv_srq_attr, ibv_srq_init_attr, ibv_td, ibv_td_init_attr, ibv_wc,
-    ibv_wc_status_str,
+    ibv_query_gid, ibv_query_port_wrap, ibv_recv_wr, ibv_reg_mr, ibv_send_wr, ibv_sge, ibv_srq,
+    ibv_srq_attr, ibv_srq_init_attr, ibv_td, ibv_td_init_attr, ibv_wc, ibv_wc_status_str,
 };
 use libc::ENOMEM;
 use log::{debug, error, warn};
@@ -650,36 +649,19 @@ impl VerbsDomain {
             access |= IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
         }
 
-        let (mr, fname) = match region.mapping() {
-            Mapping::Host
-            | Mapping::Device {
-                dmabuf_fd: None, ..
-            } => unsafe {
-                let mr = ibv_reg_mr(
-                    self.pd.as_ptr(),
-                    region.ptr().as_ptr(),
-                    region.len(),
-                    access as i32,
-                );
-                (mr, "ibv_reg_mr")
-            },
-            Mapping::Device {
-                dmabuf_fd: Some(dmabuf_fd),
-                ..
-            } => unsafe {
-                let mr = ibv_reg_dmabuf_mr(
-                    self.pd.as_ptr(),
-                    0,
-                    region.len(),
-                    region.ptr().as_ptr() as u64,
-                    *dmabuf_fd,
-                    access as i32,
-                );
-                (mr, "ibv_reg_dmabuf_mr")
-            },
+        // TODO: GPU dma-buf memory must use ibv_reg_dmabuf_mr once sideway/rdma-mummy-sys
+        // exposes it. This temporary ibv_reg_mr path exists to keep CPU-memory benchmarks
+        // buildable while the upstream binding gap is fixed.
+        let mr = unsafe {
+            ibv_reg_mr(
+                self.pd.as_ptr(),
+                region.ptr().as_ptr(),
+                region.len(),
+                access as i32,
+            )
         };
 
-        let mr = NonNull::new(mr).ok_or_else(|| VerbsError::with_last_os_error(fname))?;
+        let mr = NonNull::new(mr).ok_or_else(|| VerbsError::with_last_os_error("ibv_reg_mr"))?;
         self.local_mr_map.insert(region.ptr(), mr);
         Ok(MemoryRegionRemoteKey(unsafe { mr.as_ref() }.rkey as u64))
     }
