@@ -249,7 +249,7 @@ fn get_gpu_pci_device_id() -> Result<PciDeviceId> {
 struct PciProp {
     pci_addr: PciAddress,
     pci_device_id: PciDeviceId,
-    numa_node: usize,
+    numa_node: Option<usize>,
     parent_bus: PciAddress,
     branching_ancestor: PciAddress,
 }
@@ -294,15 +294,10 @@ fn scan_all_pci_devices() -> Result<Vec<PciProp>> {
         let pci_device_id = read_pci_device_id(&addr)?;
 
         let numa_node_path = addr.get_sys_path() + "/numa_node";
-        let Ok(numa_node) = std::fs::read_to_string(numa_node_path) else {
-            warn!("Skipping PCI device {addr} because it has no NUMA node");
-            continue;
-        };
-        let Ok(numa_node) = numa_node.trim().parse::<usize>() else {
-            // NOTE: /sys/bus/pci/devices/0000:00:00.0/numa_node can be -1.
-            warn!("Skipping PCI device {addr} because it has no NUMA node");
-            continue;
-        };
+        // NOTE: /sys/bus/pci/devices/0000:00:00.0/numa_node can be -1.
+        let numa_node = std::fs::read_to_string(numa_node_path)
+            .ok()
+            .and_then(|numa_node| numa_node.trim().parse::<usize>().ok());
         all_pcis.push(PciProp {
             pci_addr: addr,
             pci_device_id,
@@ -371,10 +366,30 @@ fn detect_system_topo(
     let all_gpus: Vec<_> = all_pcis
         .iter()
         .filter(|p| p.pci_device_id == gpu_pci_device_id)
+        .filter(|p| {
+            let has_numa = p.numa_node.is_some();
+            if !has_numa {
+                warn!(
+                    "Skipping GPU PCI device {} because it has no NUMA node",
+                    p.pci_addr
+                );
+            }
+            has_numa
+        })
         .collect();
     let all_nics: Vec<_> = all_pcis
         .iter()
         .filter(|p| p.pci_device_id == nic_pci_device_id)
+        .filter(|p| {
+            let has_numa = p.numa_node.is_some();
+            if !has_numa {
+                warn!(
+                    "Skipping NIC PCI device {} because it has no NUMA node",
+                    p.pci_addr
+                );
+            }
+            has_numa
+        })
         .collect();
 
     // Build PciSwitchGroup
@@ -403,7 +418,9 @@ fn detect_system_topo(
     // Count GPUs per NUMA node
     let mut numa_gpu_count = vec![0; numa_cpus.len()];
     for gpu in all_gpus {
-        numa_gpu_count[gpu.numa_node] += 1;
+        numa_gpu_count[gpu
+            .numa_node
+            .expect("GPU without NUMA node should be filtered")] += 1;
     }
 
     // Create topology groups
@@ -412,15 +429,18 @@ fn detect_system_topo(
     for switch in switch_groups.into_iter() {
         let nics_per_gpu = switch.nics.len() / switch.gpus.len();
         for (i_gpu, gpu) in switch.gpus.iter().enumerate() {
+            let gpu_numa_node = gpu
+                .numa_node
+                .expect("GPU without NUMA node should be filtered");
             // Assign NICs to GPUs
             let nics = &switch.nics[i_gpu * nics_per_gpu..(i_gpu + 1) * nics_per_gpu];
 
             // Assign CPUs to GPUs
-            let numa_gpu_index = numa_gpu_indices[gpu.numa_node];
-            numa_gpu_indices[gpu.numa_node] += 1;
-            let cpus_per_gpu = numa_cpus[gpu.numa_node].len() / numa_gpu_count[gpu.numa_node];
+            let numa_gpu_index = numa_gpu_indices[gpu_numa_node];
+            numa_gpu_indices[gpu_numa_node] += 1;
+            let cpus_per_gpu = numa_cpus[gpu_numa_node].len() / numa_gpu_count[gpu_numa_node];
             let cpu_start = numa_gpu_index * cpus_per_gpu;
-            let cpus = &numa_cpus[gpu.numa_node][cpu_start..cpu_start + cpus_per_gpu];
+            let cpus = &numa_cpus[gpu_numa_node][cpu_start..cpu_start + cpus_per_gpu];
             system_topo.push(PciTopoGroup {
                 gpu: (*gpu).clone(),
                 nics: nics.iter().map(|x| (*x).clone()).collect(),
@@ -501,7 +521,10 @@ fn do_detect_topology() -> Result<Vec<TopologyGroup>> {
 
         topo_groups.push(TopologyGroup {
             cuda_device: cuda_device as u8,
-            numa: group.gpu.numa_node as u8,
+            numa: group
+                .gpu
+                .numa_node
+                .expect("GPU without NUMA node should be filtered") as u8,
             domains,
             cpus: group.cpus,
         });
