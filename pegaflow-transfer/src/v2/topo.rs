@@ -4,10 +4,10 @@ use std::{
     hash::Hash,
     path::PathBuf,
     str::FromStr,
+    sync::LazyLock,
 };
 
 use crate::cuda_lib::rt::{cudaDeviceProp, cudaGetDeviceCount, cudaGetDeviceProperties};
-use once_cell::sync::Lazy;
 
 use crate::v2::{
     error::{FabricLibError, Result},
@@ -510,10 +510,10 @@ fn do_detect_topology() -> Result<Vec<TopologyGroup>> {
     Ok(topo_groups)
 }
 
-static GLOBAL: Lazy<Result<Vec<TopologyGroup>>> = Lazy::new(do_detect_topology);
+static GLOBAL: LazyLock<Result<Vec<TopologyGroup>>> = LazyLock::new(do_detect_topology);
 
 pub fn detect_topology() -> Result<&'static [TopologyGroup]> {
-    match Lazy::force(&GLOBAL) {
+    match LazyLock::force(&GLOBAL) {
         Ok(topo) => Ok(topo),
         Err(e) => Err(e.clone()),
     }

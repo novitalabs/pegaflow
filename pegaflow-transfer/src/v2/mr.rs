@@ -1,9 +1,8 @@
-use std::{ffi::c_void, ptr::NonNull};
+use std::{ffi::c_void, ptr::NonNull, sync::LazyLock};
 
 use crate::cuda_lib::driver::cu_get_dma_buf_fd;
 use crate::cuda_lib::rt::{cudaMemoryTypeDevice, cudaPointerGetAttributes};
 use crate::cuda_lib::{CudaDeviceId, Device};
-use once_cell::sync::Lazy;
 
 use crate::v2::error::{FabricLibError, Result};
 
@@ -82,7 +81,7 @@ impl Drop for MemoryRegion {
 #[repr(transparent)]
 pub struct MemoryRegionLocalDescriptor(pub u64);
 
-static LINUX_KERNEL_SUPPORTS_DMA_BUF: Lazy<bool> = Lazy::new(|| {
+static LINUX_KERNEL_SUPPORTS_DMA_BUF: LazyLock<bool> = LazyLock::new(|| {
     let Ok(version) = std::fs::read_to_string("/proc/sys/kernel/osrelease") else {
         return false;
     };

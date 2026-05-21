@@ -25,7 +25,10 @@ impl std::fmt::Display for CudartError {
             f,
             "CudartError: code {} ({:?}), context: {}",
             self.code,
-            unsafe { CStr::from_ptr(cudart_sys::cudaGetErrorString(self.code)) },
+            unsafe {
+                let err: cudart_sys::cudaError = std::mem::transmute_copy(&self.code);
+                CStr::from_ptr(cudart_sys::cudaGetErrorString(err))
+            },
             self.context
         )
     }
@@ -35,55 +38,61 @@ impl std::error::Error for CudartError {}
 
 pub use crate::cudart_sys::{cudaMemoryTypeDevice, cudaPointerAttributes};
 pub fn cudaPointerGetAttributes(ptr: NonNull<c_void>) -> CudaResult<cudaPointerAttributes> {
-    let mut attrs = cudaPointerAttributes::default();
+    let mut attrs: cudaPointerAttributes = unsafe { std::mem::zeroed() };
     let ret = unsafe { cudart_sys::cudaPointerGetAttributes(&raw mut attrs, ptr.as_ptr()) };
-    match ret {
-        0 => Ok(attrs),
-        _ => Err(CudartError::new(ret, "cudaPointerGetAttributes")),
+    if ret == cudart_sys::cudaError::cudaSuccess {
+        Ok(attrs)
+    } else {
+        Err(CudartError::new(ret as u32, "cudaPointerGetAttributes"))
     }
 }
 
 pub use crate::cudart_sys::cudaDeviceProp;
 pub fn cudaGetDeviceProperties(device: i32) -> CudaResult<cudaDeviceProp> {
-    let mut prop = cudaDeviceProp::default();
+    let mut prop: cudaDeviceProp = unsafe { std::mem::zeroed() };
     let ret = unsafe { cudart_sys::cudaGetDeviceProperties(&raw mut prop, device) };
-    match ret {
-        0 => Ok(prop),
-        _ => Err(CudartError::new(ret, "cudaGetDeviceProperties")),
+    if ret == cudart_sys::cudaError::cudaSuccess {
+        Ok(prop)
+    } else {
+        Err(CudartError::new(ret as u32, "cudaGetDeviceProperties"))
     }
 }
 
 pub fn cudaGetDeviceCount() -> CudaResult<i32> {
     let mut count = 0;
     let ret = unsafe { cudart_sys::cudaGetDeviceCount(&raw mut count) };
-    match ret {
-        0 => Ok(count),
-        _ => Err(CudartError::new(ret, "cudaGetDeviceCount")),
+    if ret == cudart_sys::cudaError::cudaSuccess {
+        Ok(count)
+    } else {
+        Err(CudartError::new(ret as u32, "cudaGetDeviceCount"))
     }
 }
 
 pub fn cudaSetDevice(device: i32) -> CudaResult<()> {
     let ret = unsafe { cudart_sys::cudaSetDevice(device) };
-    match ret {
-        0 => Ok(()),
-        _ => Err(CudartError::new(ret, "cudaSetDevice")),
+    if ret == cudart_sys::cudaError::cudaSuccess {
+        Ok(())
+    } else {
+        Err(CudartError::new(ret as u32, "cudaSetDevice"))
     }
 }
 
 pub fn cudaHostAlloc(size: usize, flags: u32) -> CudaResult<NonNull<c_void>> {
     let mut ptr = std::ptr::null_mut();
     let ret = unsafe { cudart_sys::cudaHostAlloc(&raw mut ptr, size, flags) };
-    match ret {
-        0 => Ok(NonNull::new(ptr).unwrap()),
-        _ => Err(CudartError::new(ret, "cudaHostAlloc")),
+    if ret == cudart_sys::cudaError::cudaSuccess {
+        Ok(NonNull::new(ptr).unwrap())
+    } else {
+        Err(CudartError::new(ret as u32, "cudaHostAlloc"))
     }
 }
 
 pub fn cudaFreeHost(ptr: NonNull<c_void>) -> CudaResult<()> {
     let ret = unsafe { cudart_sys::cudaFreeHost(ptr.as_ptr()) };
-    match ret {
-        0 => Ok(()),
-        _ => Err(CudartError::new(ret, "cudaFreeHost")),
+    if ret == cudart_sys::cudaError::cudaSuccess {
+        Ok(())
+    } else {
+        Err(CudartError::new(ret as u32, "cudaFreeHost"))
     }
 }
 
@@ -92,12 +101,13 @@ pub fn cudaGetNumSMs(device: u8) -> CudaResult<usize> {
     let ret = unsafe {
         cuda_sys::cuDeviceGetAttribute(
             &mut numSMs,
-            cudart_sys::cudaDevAttrMultiProcessorCount,
+            cuda_sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
             device as i32,
         )
     };
-    match ret {
-        0 => Ok(numSMs as usize),
-        _ => Err(CudartError::new(ret, "cudaGetNumSMs")),
+    if ret == cuda_sys::cudaError_enum::CUDA_SUCCESS {
+        Ok(numSMs as usize)
+    } else {
+        Err(CudartError::new(ret as u32, "cudaGetNumSMs"))
     }
 }

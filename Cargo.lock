@@ -2417,12 +2417,12 @@ dependencies = [
  "cc",
  "clap",
  "crossbeam-channel",
+ "cudarc",
  "dashmap",
  "libc",
  "log",
  "mea",
  "mockall",
- "once_cell",
  "oneshot",
  "parking_lot",
  "pegaflow-common",
@@ -2433,7 +2433,6 @@ dependencies = [
  "syscalls",
  "thiserror 2.0.18",
  "tokio",
- "tracing",
 ]
 
 [[package]]

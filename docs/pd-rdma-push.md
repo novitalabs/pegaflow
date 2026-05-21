@@ -157,7 +157,7 @@ pegaflow-transfer/
 ```
 
 要点：
-- **同一个 crate, feature 切**：默认仍跑 v1 路径，`--features v2` 才编 v2。**v1/v2 不互斥**，可以同时打开（v2 还在试，v1 仍在跑生产）；
+- **同一个 crate, v2 常驻**：v1 兼容 API 和 v2 RDMA fabric 同时编译，CUDA 版本通过 `default`/`cuda-13` feature 选择，不再用 `v2` feature 做开关；
 - **`libibverbs-sys` 作为 sub-crate**：跟 fabric-lib 同布局，path dep，不上 crates.io；
 - **共享 `error.rs` / `rdma_topo.rs`**：两版都要的拓扑探测和错误类型；
 - **v1 = 把现有 `engine.rs` + `rc_backend/` 整体挪进 `v1/` 子目录**，对外 `pegaflow_transfer::v1::MooncakeTransferEngine` 不变，再加一层 re-export 兼容旧路径（`pub use v1::engine::*` at crate root）；
@@ -557,7 +557,7 @@ pegainfer 那边 `pegainfer-comm/crates/pegainfer-comm-fabric-lib` 是 pplx-gard
 
 | 阶段 | 内容 | 验收 |
 | --- | --- | --- |
-| **P0** v2 模块落地 | 把 pplx-garden `fabric-lib` 内容搬进 `pegaflow-transfer/src/v2/` + `pegaflow-transfer/libibverbs-sys/`，删 efa / libfabric / provider_dispatch；feature flag `v2` 打开能 `cargo check` 过 | `cargo check -p pegaflow-transfer --features v2` 通过，原 v1 路径 `cargo test` 不退化 |
+| **P0** v2 模块落地 | 把 pplx-garden `fabric-lib` 内容搬进 `pegaflow-transfer/src/v2/`，删 efa / libfabric，v2 作为默认编译路径常驻 | `cargo check -p pegaflow-transfer` 通过，原 v1 API 路径不退化 |
 | **P1** RDMA 自检 | 写一个 Rust bin (`pegaflow-transfer/src/bin/v2_loopback.rs`)，loopback 跑 GPU→GPU WRITE + IMM；单机两进程 + ZMQ 握手 | 1 GB WRITE 走通，IMM 到达，带宽接近 line rate（具体数字由后续 benchmark 给）|
 | **P2** PD push crate | 写 `pegaflow-pd-push`，封装 OOB + chunk tracker + KV layout；不接 vLLM，写个 stub 跑通 producer/consumer 协议 | 双进程 stub 模拟"P 逐层 push 1024 个 block + IMM"，consumer 拿到 IMM 后能正确比对 KV |
 | **P3** vLLM hook 接入 | Python connector + PyO3 binding，单机 P + D 各占 1 GPU，跑小模型 | E2E 出第一 token，与 NIXL baseline 输出 token-level 一致 |

@@ -534,8 +534,7 @@ impl CUMulticastHandle {
             CUMemHandleKind::Local => cuda_sys::CU_MEM_HANDLE_TYPE_NONE,
             CUMemHandleKind::FileDescriptor => cuda_sys::CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
             CUMemHandleKind::Fabric => cuda_sys::CU_MEM_HANDLE_TYPE_FABRIC,
-        }
-        .into();
+        } as u64;
 
         let mut granularity: usize = 0;
         cuda_check!(cuda_sys::cuMulticastGetGranularity(

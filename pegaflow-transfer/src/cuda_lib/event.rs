@@ -10,24 +10,24 @@ impl CudaEvent {
     pub fn new() -> CudaResult<Self> {
         let mut event = std::ptr::null_mut();
         let ret = unsafe { cudart_sys::cudaEventCreate(&mut event) };
-        if ret != 0 {
-            return Err(CudartError::new(ret, "cudaEventCreate"));
+        if ret != cudart_sys::cudaError::cudaSuccess {
+            return Err(CudartError::new(ret as u32, "cudaEventCreate"));
         }
         Ok(CudaEvent { event })
     }
 
     pub fn record(&self) -> CudaResult<()> {
         let ret = unsafe { cudart_sys::cudaEventRecord(self.event, std::ptr::null_mut()) };
-        if ret != 0 {
-            return Err(CudartError::new(ret, "cudaEventRecord"));
+        if ret != cudart_sys::cudaError::cudaSuccess {
+            return Err(CudartError::new(ret as u32, "cudaEventRecord"));
         }
         Ok(())
     }
 
     pub fn synchronize(&self) -> CudaResult<()> {
         let ret = unsafe { cudart_sys::cudaEventSynchronize(self.event) };
-        if ret != 0 {
-            return Err(CudartError::new(ret, "cudaEventSynchronize"));
+        if ret != cudart_sys::cudaError::cudaSuccess {
+            return Err(CudartError::new(ret as u32, "cudaEventSynchronize"));
         }
         Ok(())
     }
@@ -36,8 +36,8 @@ impl CudaEvent {
 impl Drop for CudaEvent {
     fn drop(&mut self) {
         let ret = unsafe { cudart_sys::cudaEventDestroy(self.event) };
-        if ret != 0 {
-            panic!("cudaEventDestroy failed: {}", ret);
+        if ret != cudart_sys::cudaError::cudaSuccess {
+            panic!("cudaEventDestroy failed: {:?}", ret);
         }
     }
 }

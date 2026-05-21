@@ -11,9 +11,9 @@ use std::{
 
 use crate::cuda_lib::{Device, gdr::GdrFlag};
 use dashmap::DashMap;
+use log::{error, warn};
 use parking_lot::Mutex;
 use parking_lot::RwLock;
-use tracing::{error, warn};
 
 use crate::v2::{
     BouncingErrorCallback, BouncingRecvCallback, ErrorCallback, FabricLibError, RdmaEngine,
@@ -195,10 +195,7 @@ impl TransferEngine {
         if let Some(thread) = thread.take()
             && let Err(error) = thread.join()
         {
-            error!(
-                ?error,
-                "Failed to join the Transfer Engine callback thread."
-            );
+            error!("Failed to join the Transfer Engine callback thread: {error:?}");
         }
     }
 
@@ -412,7 +409,7 @@ fn callback_worker_thread(engine: Arc<FabricEngine>, states: Arc<Callbacks>) {
         };
 
         if let Err(e) = handle_transfer_completion(&engine, &states, comp) {
-            error!(?e, "Transfer Engine callback thread error. Exiting.");
+            error!("Transfer Engine callback thread error. Exiting: {e:?}");
             engine.stop();
             break;
         }
@@ -427,7 +424,7 @@ fn handle_transfer_completion(
     match comp {
         TransferCompletionEntry::Transfer(transfer_id) => {
             let Some((_, handler)) = states.transfer_ops.remove(&transfer_id) else {
-                warn!(?transfer_id, "Transfer callback not found");
+                warn!("Transfer callback not found: {transfer_id:?}");
                 return Ok(());
             };
             (handler.on_done)()
@@ -437,7 +434,7 @@ fn handle_transfer_completion(
             data_len,
         } => {
             let Some(handler) = states.recv_ops.get(&transfer_id) else {
-                warn!(?transfer_id, data_len, "Recv callback not found");
+                warn!("Recv callback not found: transfer_id={transfer_id:?} data_len={data_len}");
                 return Ok(());
             };
             // Run the callback handler.
@@ -449,7 +446,7 @@ fn handle_transfer_completion(
         }
         TransferCompletionEntry::Send(transfer_id) => {
             let Some((_, handler)) = states.send_ops.remove(&transfer_id) else {
-                warn!(?transfer_id, "Send callback not found");
+                warn!("Send callback not found: {transfer_id:?}");
                 return Ok(());
             };
             (handler)(Ok(()))
@@ -462,7 +459,7 @@ fn handle_transfer_completion(
         }
         TransferCompletionEntry::ImmCountReached(imm) => {
             let Some(handler) = states.imm_count.get(&imm) else {
-                warn!(imm, "Imm count context not found");
+                warn!("Imm count context not found: imm={imm}");
                 return Ok(());
             };
             match &*handler {
@@ -509,7 +506,7 @@ fn handle_transfer_completion(
         }
         TransferCompletionEntry::UvmWatch { id, old, new } => {
             let Some(callback) = states.watchers.get(&id) else {
-                warn!(?id, "UvmWatcher not found");
+                warn!("UvmWatcher not found: {id:?}");
                 return Ok(());
             };
             match callback(old, new) {
@@ -533,7 +530,9 @@ fn handle_transfer_completion(
                 } else if let Some((_, op)) = states.recv_ops.remove(&transfer_id) {
                     (op.on_error)(fabric_lib_error)
                 } else {
-                    error!(?transfer_id, ?fabric_lib_error, "Unhandled transfer error");
+                    error!(
+                        "Unhandled transfer error: transfer_id={transfer_id:?} error={fabric_lib_error:?}"
+                    );
                     return Ok(());
                 }
             };

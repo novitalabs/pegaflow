@@ -7,25 +7,9 @@ edition.workspace = true
 workspace = true
 
 [features]
-default = []
-tokio = ["v2", "dep:tokio"]
-# v2 RDMA stack (pplx-garden derived). Enables bindgen against libibverbs /
-# CUDA / GDRCopy and the verbs-based fabric (FabricEngine, Worker,
-# TransferEngine, ...). Default-off so dev boxes without these system libs can
-# still `cargo check` the v1 build.
-v2 = [
-    "dep:anyhow",
-    "dep:bytes",
-    "dep:crossbeam-channel",
-    "dep:dashmap",
-    "dep:mockall",
-    "dep:once_cell",
-    "dep:oneshot",
-    "dep:postcard",
-    "dep:smallvec",
-    "dep:syscalls",
-    "dep:tracing",
-]
+default = ["cudarc/cuda-12080"]
+cuda-13 = ["cudarc/cuda-13000"]
+tokio = ["dep:tokio"]
 
 [dependencies]
 parking_lot.workspace = true
@@ -37,22 +21,20 @@ serde.workspace = true
 bincode = { version = "2.0.1", features = ["serde"] }
 libc.workspace = true
 clap.workspace = true
-mea = "0.6.3"
+mea.workspace = true
 
-# v2-only deps. Pulled in by the `v2` cargo feature; the source files that use
-# them sit behind `#[cfg(feature = "v2")]` gates in lib.rs.
-anyhow = { version = "1.0", optional = true }
-bytes = { version = "1.10", features = ["serde"], optional = true }
-crossbeam-channel = { version = "0.5", optional = true }
-dashmap = { workspace = true, optional = true }
-mockall = { version = "0.13", optional = true }
-once_cell = { version = "1.21", optional = true }
-oneshot = { version = "0.1", optional = true }
-postcard = { version = "1.1", features = ["alloc", "use-std"], optional = true }
-smallvec = { version = "1.15", features = ["serde", "union"], optional = true }
-syscalls = { version = "0.7", optional = true }
-tracing = { version = "0.1", optional = true }
+# v2 RDMA stack deps. This path is always compiled for pegaflow-transfer.
+anyhow.workspace = true
+bytes.workspace = true
+crossbeam-channel.workspace = true
+dashmap.workspace = true
+mockall = "0.13"
+oneshot = "0.1"
+postcard = { version = "1.1", features = ["alloc", "use-std"] }
+smallvec.workspace = true
+syscalls = "0.7"
 tokio = { workspace = true, optional = true }
+cudarc.workspace = true
 
 [build-dependencies]
 bindgen = "0.72"

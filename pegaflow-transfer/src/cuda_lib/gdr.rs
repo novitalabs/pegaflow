@@ -52,7 +52,7 @@ impl GdrCopyContext {
         let page_size: usize = 1 << 16; // 64KB page size
         let bytesize = nbytes.div_ceil(page_size) * page_size;
 
-        if unsafe { cuda_sys::cuMemAlloc(&mut device_ptr, bytesize + page_size) }
+        if unsafe { cuda_sys::cuMemAlloc(&mut device_ptr, bytesize + page_size) } as u32
             != cuda_sys::CUDA_SUCCESS
         {
             return Err(CudaError::GdrCopyError("Failed to allocate GDR buffer"));

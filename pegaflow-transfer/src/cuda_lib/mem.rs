@@ -19,7 +19,7 @@ impl CudaDeviceMemory {
     pub fn device(size: usize) -> Result<Self, CudartError> {
         let mut ptr = std::ptr::null_mut();
         let ret = unsafe { cudart_sys::cudaMalloc(&raw mut ptr, size) };
-        let ptr = NonNull::new(ptr).ok_or_else(|| CudartError::new(ret, "cudaMalloc"))?;
+        let ptr = NonNull::new(ptr).ok_or_else(|| CudartError::new(ret as u32, "cudaMalloc"))?;
         Ok(Self { ptr, size })
     }
 
@@ -27,7 +27,8 @@ impl CudaDeviceMemory {
     pub fn alloc(size: usize) -> Result<Self, CudartError> {
         let mut ptr = std::ptr::null_mut();
         let ret = unsafe { cudart_sys::cudaMallocManaged(&raw mut ptr, size, cudaMemAttachGlobal) };
-        let ptr = NonNull::new(ptr).ok_or_else(|| CudartError::new(ret, "cudaMallocManaged"))?;
+        let ptr =
+            NonNull::new(ptr).ok_or_else(|| CudartError::new(ret as u32, "cudaMallocManaged"))?;
         Ok(Self { ptr, size })
     }
 

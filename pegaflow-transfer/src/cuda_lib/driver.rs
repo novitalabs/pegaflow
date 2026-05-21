@@ -26,7 +26,10 @@ impl CudaDriverError {
 impl std::fmt::Display for CudaDriverError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut errstr: *const c_char = null();
-        unsafe { cuGetErrorString(self.code, &mut errstr) };
+        unsafe {
+            let err: cuda_sys::cudaError_enum = std::mem::transmute_copy(&self.code);
+            cuGetErrorString(err, &mut errstr)
+        };
 
         write!(
             f,
@@ -51,8 +54,12 @@ pub fn cu_get_dma_buf_fd(ptr: NonNull<c_void>, len: usize) -> Result<i32> {
             0,
         )
     };
-    match ret {
-        0 => Ok(dmabuf_fd),
-        _ => Err(CudaDriverError::new(ret, "cuMemGetHandleForAddressRange")),
+    if ret == cuda_sys::cudaError_enum::CUDA_SUCCESS {
+        Ok(dmabuf_fd)
+    } else {
+        Err(CudaDriverError::new(
+            ret as u32,
+            "cuMemGetHandleForAddressRange",
+        ))
     }
 }

@@ -11,7 +11,7 @@ pub enum CudaError {
     CudaDriver(#[from] CudaDriverError),
     #[error("{0}")]
     Cudart(#[from] CudartError),
-    #[error("{0}")]
+    #[error("{0:?}")]
     CudaError(cuda_sys::CUresult),
     #[error("{0}")]
     GdrCopyError(&'static str),

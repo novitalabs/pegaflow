@@ -22,8 +22,8 @@ use crate::libibverbs_sys::{
     ibv_wc_status_str,
 };
 use libc::ENOMEM;
+use log::{debug, error, warn};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, error, warn};
 
 const MAX_OPS: usize = 1024;
 const CQ_DEPTH: usize = 4096;
@@ -177,7 +177,7 @@ impl VerbsDomain {
         unsafe {
             let device = info.device();
             let name = info.name().into_owned();
-            debug!(domain = name, "VerbsDomain::open");
+            debug!("VerbsDomain::open: domain={name}");
 
             // Context
             let context = NonNull::new(ibv_open_device(device))
@@ -402,7 +402,10 @@ impl VerbsDomain {
         buf: NonNull<u8>,
         msg: &T,
     ) -> Result<()> {
-        debug!(domain = self.name, ?peer_ud_addr, ?msg, "ud_send");
+        debug!(
+            "ud_send: domain={} peer_ud_addr={peer_ud_addr:?} msg={msg:?}",
+            self.name
+        );
         let length = postcard::to_slice(msg, unsafe {
             std::slice::from_raw_parts_mut(buf.as_ptr(), self.ud_mempool.chunk_size())
         })
@@ -494,7 +497,7 @@ impl VerbsDomain {
     }
 
     fn connect_peer(&self, peer: &Peer, ud_buf: NonNull<u8>) -> Result<()> {
-        debug!(domain = self.name, ?peer.ud_addr, "connect_peer");
+        debug!("connect_peer: domain={} peer={:?}", self.name, peer.ud_addr);
 
         // Send handshake to peer
         let handshake_info = PeerHandshakeInfo {
@@ -512,7 +515,7 @@ impl VerbsDomain {
     }
 
     fn handle_peer_handshake(&mut self, info: &PeerHandshakeInfo) -> Result<()> {
-        debug!(domain = self.name, ?info, "handle_peer_handshake");
+        debug!("handle_peer_handshake: domain={} info={info:?}", self.name);
         let peer_addr = DomainAddress::from(&info.ud_addr);
 
         let peer = if let Some(peer) = self.peers.get_mut(&peer_addr) {
@@ -562,7 +565,10 @@ impl VerbsDomain {
         peer.msg_rc.rc_rtr_to_rts(info.msg_psn)?;
         peer.rma_rc.rc_rtr_to_rts(info.rma_psn)?;
         // TODO: return error for pending submits if fails to connect.
-        debug!(domain = self.name, ?peer_addr, "RC handshake completed");
+        debug!(
+            "RC handshake completed: domain={} peer_addr={peer_addr:?}",
+            self.name
+        );
 
         // Transition to established state
         let (pending_submits, pending_group_write_ops) = match &mut peer.state {
@@ -979,7 +985,7 @@ impl VerbsDomain {
                     self.post_ud_recv(ptr).expect("TODO: handle UD error");
                 }
                 IBV_WC_SEND => {
-                    debug!(domain = self.name, wr_id = wc.wr_id, "UD SEND completed");
+                    debug!("UD SEND completed: domain={} wr_id={}", self.name, wc.wr_id);
                     // Return the buffer
                     unsafe {
                         let ptr = NonNull::new_unchecked(wc.wr_id as *mut u8);
@@ -988,11 +994,8 @@ impl VerbsDomain {
                 }
                 _ => {
                     warn!(
-                        domain = self.name,
-                        wr_id = wc.wr_id,
-                        status = wc.status,
-                        opcode = wc.opcode,
-                        "Unhandled UD completion event."
+                        "Unhandled UD completion event: domain={} wr_id={} status={} opcode={}",
+                        self.name, wc.wr_id, wc.status, wc.opcode
                     );
                 }
             }
@@ -1033,11 +1036,8 @@ impl VerbsDomain {
             };
             return if let Some(transfer_id) = transfer_id {
                 warn!(
-                    domain = self.name,
-                    wr_id = wc.wr_id,
-                    status = wc.status,
-                    opcode = wc.opcode,
-                    "Encountered RDMA op error. Send DomainCompletionEntry::Error to the caller."
+                    "Encountered RDMA op error. Send DomainCompletionEntry::Error to the caller: domain={} wr_id={} status={} opcode={}",
+                    self.name, wc.wr_id, wc.status, wc.opcode
                 );
                 Some(DomainCompletionEntry::Error(
                     transfer_id,
@@ -1045,11 +1045,8 @@ impl VerbsDomain {
                 ))
             } else {
                 error!(
-                    domain = self.name,
-                    wr_id = wc.wr_id,
-                    status = wc.status,
-                    msg = errmsg,
-                    "Unhandled RDMA op error."
+                    "Unhandled RDMA op error: domain={} wr_id={} status={} msg={}",
+                    self.name, wc.wr_id, wc.status, errmsg
                 );
                 None
             };
@@ -1094,11 +1091,8 @@ impl VerbsDomain {
             }
             _ => {
                 warn!(
-                    domain = self.name,
-                    wr_id = wc.wr_id,
-                    status = wc.status,
-                    opcode = wc.opcode,
-                    "Unhandled RDMA completion event."
+                    "Unhandled RDMA completion event: domain={} wr_id={} status={} opcode={}",
+                    self.name, wc.wr_id, wc.status, wc.opcode
                 );
                 None
             }
@@ -1328,7 +1322,7 @@ impl RdmaDomain for VerbsDomain {
 
 impl Drop for VerbsDomain {
     fn drop(&mut self) {
-        debug!(name = self.name, "VerbsDomain::drop");
+        debug!("VerbsDomain::drop: name={}", self.name);
         // TODO: drop only_qp and ud
         unsafe {
             for (_, mr) in self.local_mr_map.drain() {

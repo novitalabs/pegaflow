@@ -11,7 +11,7 @@ use std::{
 use super::cpu_affinity::pin_cpu;
 use crate::cuda_lib::CudaHostMemory;
 use crossbeam_channel::TryRecvError;
-use tracing::{debug, warn};
+use log::{debug, warn};
 
 use crate::v2::{
     api::{
@@ -305,7 +305,7 @@ impl UvmWatcherContext {
             *self.uvm_memory.get_mut(slot) = 0;
             self.last_values[slot] = 0;
         } else {
-            warn!(?id, "Ignoring release of an unused UvmWatcher");
+            warn!("Ignoring release of an unused UvmWatcher: {id:?}");
         }
     }
 }

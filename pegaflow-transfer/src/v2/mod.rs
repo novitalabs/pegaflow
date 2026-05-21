@@ -1,8 +1,21 @@
 //! RDMA Verbs fabric (upstream-derived from `pplx-garden`).
 //!
-//! Whole module is gated behind the crate-level `v2` feature. Exposes
-//! `FabricEngine`, `Worker`, `TransferEngine`, and supporting types.
-#![allow(dead_code, unreachable_pub, unused_imports)]
+//! Exposes `FabricEngine`, `Worker`, `TransferEngine`, and supporting types.
+#![allow(
+    dead_code,
+    unreachable_pub,
+    unused_imports,
+    clippy::allow_attributes_without_reason,
+    clippy::cloned_instead_of_copied,
+    clippy::enum_variant_names,
+    clippy::explicit_into_iter_loop,
+    clippy::explicit_iter_loop,
+    clippy::manual_assert,
+    clippy::semicolon_if_nothing_returned,
+    clippy::unnecessary_wraps,
+    clippy::useless_conversion,
+    reason = "upstream-derived RDMA fabric keeps its porting shape while PD push integration lands"
+)]
 
 pub mod api;
 mod cpu_affinity;
