@@ -27,6 +27,8 @@ class RdmaPort(Protocol):
 
     def wait_done(self, req_id: str) -> None: ...
 
+    def mark_done(self, req_id: str) -> None: ...
+
     def pop_finished_sending(self) -> set[str]: ...
 
     def pop_finished_recving(self) -> set[str]: ...
@@ -65,6 +67,9 @@ class NoopRdmaPort:
         self._finished_sending.add(req_id)
 
     def wait_done(self, req_id: str) -> None:
+        return None
+
+    def mark_done(self, req_id: str) -> None:
         self._finished_recving.add(req_id)
 
     def pop_finished_sending(self) -> set[str]:

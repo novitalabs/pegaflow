@@ -30,6 +30,10 @@ from pegaflow.pd_connector.metadata import (  # noqa: E402
     WaitReqMeta,
 )
 from pegaflow.pd_connector.oob import InMemoryOobPort  # noqa: E402
+from pegaflow.pd_connector.proxy import (  # noqa: E402
+    ProxyConfig,
+    build_pd_proxy_request,
+)
 from pegaflow.pd_connector.scheduler import PdSchedulerConnector  # noqa: E402
 from pegaflow.pd_connector.worker import PdWorkerConnector  # noqa: E402
 
@@ -239,3 +243,61 @@ def test_scheduler_carries_prompt_tokens_for_d_to_p_oob() -> None:
     meta = scheduler.build_connector_meta(SimpleNamespace())
 
     assert meta.reqs_to_wait["req-1"].prompt_token_ids == (11, 12, 13)
+
+
+def test_scheduler_carries_fake_rdma_done_endpoint() -> None:
+    scheduler = PdSchedulerConnector(
+        SimpleNamespace(kv_transfer_config=SimpleNamespace(engine_id="d"))
+    )
+    request = SimpleNamespace(
+        request_id="req-1",
+        num_prompt_tokens=3,
+        prompt_token_ids=[11, 12, 13],
+        kv_transfer_params={
+            "do_remote_prefill": True,
+            "remote_engine_id": "prefill",
+            "done_endpoint": "tcp://127.0.0.1:7200",
+        },
+    )
+
+    scheduler.update_state_after_alloc(request, ([1],), num_external_tokens=3)
+    meta = scheduler.build_connector_meta(SimpleNamespace())
+
+    assert meta.reqs_to_wait["req-1"].remote.done_endpoint == "tcp://127.0.0.1:7200"
+
+
+def test_pd_proxy_injects_p_and_d_transfer_params() -> None:
+    config = ProxyConfig(
+        prefill_url="http://127.0.0.1:8001",
+        decode_url="http://127.0.0.1:8002",
+        done_endpoint="tcp://127.0.0.1:7200",
+        timeout_s=30,
+        prefill_max_tokens=1,
+    )
+
+    req = build_pd_proxy_request(
+        {
+            "model": "/data/Qwen3-4B",
+            "prompt": "hello",
+            "max_tokens": 4,
+        },
+        config,
+        request_id="pd-test",
+    )
+
+    assert req.prefill_body["request_id"] == "pd-test-p"
+    assert req.prefill_body["max_tokens"] == 1
+    assert req.prefill_body["kv_transfer_params"] == {
+        "do_remote_prefill_sender": True,
+        "target_engine_id": "decode",
+        "target_request_id": "pd-test-d",
+        "done_endpoint": "tcp://127.0.0.1:7200",
+    }
+    assert req.decode_body["request_id"] == "pd-test-d"
+    assert req.decode_body["max_tokens"] == 4
+    assert req.decode_body["kv_transfer_params"] == {
+        "do_remote_prefill": True,
+        "remote_engine_id": "prefill",
+        "remote_request_id": "pd-test-p",
+        "done_endpoint": "tcp://127.0.0.1:7200",
+    }

@@ -42,6 +42,7 @@ class RemoteEndpoint:
     host: str | None = None
     port: int | None = None
     tp_size: int = 1
+    done_endpoint: str | None = None
 
 
 @dataclass(frozen=True)

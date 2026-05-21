@@ -616,6 +616,7 @@ pegaflow/
 │           ├── __init__.py            # PdConnector facade
 │           ├── scheduler.py           # scheduler-side hook state
 │           ├── worker.py              # worker-side hook execution
+│           ├── proxy.py               # 本地 P/D E2E 调试代理
 │           ├── rdma.py                # RdmaPort protocol + Noop/Mock implementation
 │           ├── oob.py                 # OOB message shape；先可 mock，不强依赖真实 ZMQ
 │           ├── metadata.py            # ConnectorMetadata / PdHandshake Python 镜像
@@ -633,7 +634,70 @@ pegaflow/
 - **Python 侧 connector 走全新 module path `pegaflow.pd_connector`**，不挤进现有 `pegaflow.connector`；
 - **Router 暂不动**：先本地构造 `kv_transfer_params` 做 connector-level 验证。
 
-### 5.1 关于 pegainfer 的统一
+### 5.1 本地 P/D proxy 调试
+
+当前先加一个 Python proxy，不接真实 router：
+
+```bash
+mkdir -p /tmp/pegaflow-pd-logs
+
+PYTHONPATH=$PWD/python CUDA_VISIBLE_DEVICES=0 vllm serve /data/Qwen3-4B \
+  --host 127.0.0.1 --port 8001 \
+  --kv-transfer-config '{
+    "kv_connector": "PdConnector",
+    "kv_connector_module_path": "pegaflow.pd_connector",
+    "kv_role": "kv_producer",
+    "engine_id": "prefill"
+  }' \
+  > /tmp/pegaflow-pd-logs/p.log 2>&1
+
+PYTHONPATH=$PWD/python CUDA_VISIBLE_DEVICES=1 vllm serve /data/Qwen3-4B \
+  --host 127.0.0.1 --port 8002 \
+  --kv-transfer-config '{
+    "kv_connector": "PdConnector",
+    "kv_connector_module_path": "pegaflow.pd_connector",
+    "kv_role": "kv_consumer",
+    "engine_id": "decode"
+  }' \
+  > /tmp/pegaflow-pd-logs/d.log 2>&1
+
+cd python
+uv run python -m pegaflow.pd_connector.proxy \
+  --listen-host 127.0.0.1 \
+  --listen-port 8100 \
+  --prefill-url http://127.0.0.1:8001 \
+  --decode-url http://127.0.0.1:8002 \
+  --done-endpoint tcp://127.0.0.1:7200 \
+  --log-file /tmp/pegaflow-pd-logs/proxy.log
+```
+
+请求只打 proxy：
+
+```bash
+curl -s http://127.0.0.1:8100/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "/data/Qwen3-4B",
+    "prompt": "Write a short note about RDMA.",
+    "max_tokens": 16,
+    "temperature": 0
+  }'
+```
+
+这条路径的语义：
+1. proxy 收到请求后生成同一个逻辑 request id；
+2. proxy 先向 D 发 decode 请求，注入 `do_remote_prefill=true` 和 `done_endpoint`；
+3. D 的 connector allocate KV blocks 后异步等待 fake-RDMA done，不在 hook 里阻塞；
+4. proxy 再向 P 发 prefill 请求，注入 `do_remote_prefill_sender=true`、D 的 request id 和同一个 `done_endpoint`；
+5. P 的 connector 在最后一层覆盖完目标 blocks 后，后台 ZMQ sender fire-and-forget 发 done；
+6. D 的后台 ZMQ receiver 收到 done 后在 `get_finished` 里上报 `finished_recving`，vLLM 才继续 decode。
+
+验收先看三份日志：
+- `proxy.log`：应出现 `request=... -> D`、`request=... -> P`、`P completed`、`D completed`；
+- `p.log`：应出现 `P queued async push`、`P finished fake RDMA push`、`P sent fake RDMA done`；
+- `d.log`：应出现 `D queued async wait`、`fake RDMA done receiver listening`、`D received fake RDMA done`。
+
+### 5.2 关于 pegainfer 的统一
 
 pegainfer 那边 `pegainfer-comm/crates/pegainfer-comm-fabric-lib` 是 pplx-garden 的另一份 vendor。pegaflow v2 稳定后，pegainfer 应当：
 1. 删掉 `pegainfer-comm-fabric-lib/`、`pegainfer-comm-libibverbs-sys/`；

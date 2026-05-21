@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import queue
+import threading
 from typing import Any
 
 from pegaflow.logging_utils import get_connector_logger
@@ -47,6 +50,8 @@ class PdWorkerConnector:
         self._push_reqs: dict[str, PushReqMeta] = {}
         self._tracker = ChunkTracker()
         self._failed_blocks: set[int] = set()
+        self._done_sender = _AsyncDoneSender()
+        self._done_receiver: _AsyncDoneReceiver | None = None
 
     def register_kv_caches(self, kv_caches: dict[str, Any]) -> None:
         self.layouts = {
@@ -73,20 +78,28 @@ class PdWorkerConnector:
     ) -> None:
         for req_id, req in metadata.reqs_to_wait.items():
             self._wait_reqs[req_id] = req
+            if req.remote.done_endpoint:
+                self._ensure_done_receiver(req.remote.done_endpoint)
             handshake = self._build_handshake(req_id, flatten_block_ids(req.local_block_ids))
             self.oob.publish_prefill_request(
                 PdPrefillRequest(
                     request_id=req.remote_request_id,
                     prompt_token_ids=req.prompt_token_ids,
-                    producer_kv_transfer_params={
-                        "do_remote_prefill_sender": True,
-                        "target_engine_id": self.engine_id,
-                        "target_request_id": req_id,
-                    },
+                    producer_kv_transfer_params=_producer_params(
+                        target_engine_id=self.engine_id,
+                        target_request_id=req_id,
+                        done_endpoint=req.remote.done_endpoint,
+                    ),
                     handshake=handshake,
                 )
             )
             self.rdma.register_remote(req_id, handshake)
+            logger.info(
+                "[PdConnector] D queued async wait req=%s remote_req=%s done_endpoint=%s",
+                req_id,
+                req.remote_request_id,
+                req.remote.done_endpoint or "<rdma>",
+            )
 
         for req_id, req in metadata.reqs_to_push.items():
             self._push_reqs[req_id] = req
@@ -94,6 +107,12 @@ class PdWorkerConnector:
             prefill_request = self.oob.get_prefill_request(req.target_request_id)
             handshake = prefill_request.handshake if prefill_request is not None else None
             self.rdma.register_remote(req_id, handshake)
+            logger.info(
+                "[PdConnector] P queued async push req=%s target_req=%s done_endpoint=%s",
+                req_id,
+                req.target_request_id,
+                req.target.done_endpoint or "<rdma>",
+            )
 
         for req_id in metadata.reqs_to_release:
             self._wait_reqs.pop(req_id, None)
@@ -104,8 +123,7 @@ class PdWorkerConnector:
         assert layer_name in self.layouts, (
             f"PdConnector saw unknown layer {layer_name}; registered={list(self.layouts)}"
         )
-        for req_id in list(self._wait_reqs):
-            self.rdma.wait_done(req_id)
+        self._drain_done_receiver()
 
     def save_kv_layer(
         self,
@@ -148,12 +166,33 @@ class PdWorkerConnector:
             self._tracker.mark_blocks_pushed(req_id, set(selected))
             if is_last_layer and self._tracker.has_pushed_all_blocks(req_id, req_blocks):
                 self.rdma.push_done(req_id)
+                if req.target.done_endpoint:
+                    self._done_sender.notify(
+                        req.target.done_endpoint,
+                        {
+                            "type": "pd.done",
+                            "request_id": req.target_request_id,
+                            "producer_request_id": req_id,
+                            "engine_id": self.engine_id,
+                            "tp_rank": self.tp_rank,
+                            "layers": len(self.layer_names),
+                            "blocks": len(req_blocks),
+                        },
+                    )
                 self._tracker.mark_done(req_id)
+                logger.info(
+                    "[PdConnector] P finished fake RDMA push req=%s target_req=%s layers=%d blocks=%d",
+                    req_id,
+                    req.target_request_id,
+                    len(self.layer_names),
+                    len(req_blocks),
+                )
 
     def wait_for_save(self) -> None:
         return None
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str] | None, set[str] | None]:
+        self._drain_done_receiver()
         finished_sending = self.rdma.pop_finished_sending()
         finished_recving = self.rdma.pop_finished_recving()
         for req_id in finished_sending:
@@ -171,6 +210,10 @@ class PdWorkerConnector:
     def shutdown(self) -> None:
         self._wait_reqs.clear()
         self._push_reqs.clear()
+        if self._done_receiver is not None:
+            self._done_receiver.close()
+            self._done_receiver = None
+        self._done_sender.close()
 
     def _layer_idx(self, layer_name: str) -> int:
         try:
@@ -191,3 +234,132 @@ class PdWorkerConnector:
                 for layer_idx, layer_name in enumerate(self.layer_names)
             ),
         )
+
+    def _ensure_done_receiver(self, endpoint: str) -> None:
+        if self._done_receiver is None:
+            self._done_receiver = _AsyncDoneReceiver(endpoint)
+            return
+        assert self._done_receiver.endpoint == endpoint, (
+            "PdConnector currently supports one fake-RDMA done endpoint per worker; "
+            f"existing={self._done_receiver.endpoint} new={endpoint}"
+        )
+
+    def _drain_done_receiver(self) -> None:
+        if self._done_receiver is None:
+            return
+        for req_id in self._done_receiver.drain():
+            if req_id in self._wait_reqs:
+                self.rdma.mark_done(req_id)
+                logger.info("[PdConnector] D received fake RDMA done req=%s", req_id)
+
+
+class _AsyncDoneReceiver:
+    def __init__(self, endpoint: str) -> None:
+        self.endpoint = endpoint
+        self._queue: queue.Queue[str] = queue.Queue()
+        self._closed = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="pd-done-receiver", daemon=True)
+        self._thread.start()
+        logger.info("[PdConnector] fake RDMA done receiver listening endpoint=%s", endpoint)
+
+    def drain(self) -> set[str]:
+        done: set[str] = set()
+        while True:
+            try:
+                done.add(self._queue.get_nowait())
+            except queue.Empty:
+                return done
+
+    def close(self) -> None:
+        self._closed.set()
+
+    def _run(self) -> None:
+        try:
+            import zmq  # type: ignore[import-not-found]
+        except Exception:
+            logger.exception("[PdConnector] pyzmq is required for fake RDMA done receiver")
+            return
+
+        context = zmq.Context.instance()
+        socket = context.socket(zmq.PULL)
+        socket.setsockopt(zmq.LINGER, 0)
+        socket.bind(self.endpoint)
+        poller = zmq.Poller()
+        poller.register(socket, zmq.POLLIN)
+        try:
+            while not self._closed.is_set():
+                events = dict(poller.poll(100))
+                if socket not in events:
+                    continue
+                message = socket.recv_json()
+                req_id = str(message["request_id"])
+                self._queue.put(req_id)
+                logger.info("[PdConnector] fake RDMA done message=%s", message)
+        finally:
+            socket.close(linger=0)
+
+
+class _AsyncDoneSender:
+    def __init__(self) -> None:
+        self._queue: queue.Queue[tuple[str, dict[str, Any]] | None] = queue.Queue()
+        self._thread = threading.Thread(target=self._run, name="pd-done-sender", daemon=True)
+        self._thread.start()
+
+    def notify(self, endpoint: str, message: dict[str, Any]) -> None:
+        self._queue.put((endpoint, message))
+
+    def close(self) -> None:
+        self._queue.put(None)
+
+    def _run(self) -> None:
+        sockets: dict[str, Any] = {}
+        context = None
+        zmq_mod = None
+        while True:
+            item = self._queue.get()
+            if item is None:
+                break
+            endpoint, message = item
+            try:
+                if zmq_mod is None:
+                    import zmq as zmq_mod  # type: ignore[import-not-found]
+
+                    context = zmq_mod.Context.instance()
+                assert context is not None
+                socket = sockets.get(endpoint)
+                if socket is None:
+                    socket = context.socket(zmq_mod.PUSH)
+                    socket.setsockopt(zmq_mod.LINGER, 0)
+                    socket.connect(endpoint)
+                    sockets[endpoint] = socket
+                socket.send_string(json.dumps(message))
+                logger.info(
+                    "[PdConnector] P sent fake RDMA done endpoint=%s message=%s",
+                    endpoint,
+                    message,
+                )
+            except Exception:
+                logger.exception(
+                    "[PdConnector] failed to send fake RDMA done endpoint=%s message=%s",
+                    endpoint,
+                    message,
+                )
+            finally:
+                self._queue.task_done()
+        for socket in sockets.values():
+            socket.close(linger=0)
+
+
+def _producer_params(
+    target_engine_id: str,
+    target_request_id: str,
+    done_endpoint: str | None,
+) -> dict[str, Any]:
+    params: dict[str, Any] = {
+        "do_remote_prefill_sender": True,
+        "target_engine_id": target_engine_id,
+        "target_request_id": target_request_id,
+    }
+    if done_endpoint:
+        params["done_endpoint"] = done_endpoint
+    return params
