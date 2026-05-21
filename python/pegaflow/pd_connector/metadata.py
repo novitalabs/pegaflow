@@ -50,6 +50,7 @@ class WaitReqMeta:
     local_block_ids: BlockIds
     remote: RemoteEndpoint
     remote_request_id: str
+    done_request_id: str
     num_prompt_tokens: int
     prompt_token_ids: tuple[int, ...]
 

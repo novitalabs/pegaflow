@@ -72,6 +72,7 @@ def build_pd_proxy_request(
         "do_remote_prefill": True,
         "remote_engine_id": "prefill",
         "remote_request_id": prefill_req_id,
+        "done_request_id": decode_req_id,
         "done_endpoint": config.done_endpoint,
     }
 

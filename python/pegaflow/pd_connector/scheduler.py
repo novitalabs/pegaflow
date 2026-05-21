@@ -79,6 +79,9 @@ class PdSchedulerConnector:
                     done_endpoint=params.get("done_endpoint"),
                 ),
                 remote_request_id=str(params.get("remote_request_id") or req_id),
+                done_request_id=str(
+                    params.get("done_request_id") or params.get("decode_request_id") or req_id
+                ),
                 num_prompt_tokens=_num_prompt_tokens(request),
                 prompt_token_ids=_prompt_token_ids(request),
             )

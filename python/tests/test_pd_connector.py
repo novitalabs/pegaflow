@@ -143,6 +143,7 @@ def test_pd_worker_publishes_wait_handshake_and_delays_done_until_all_blocks() -
                 local_block_ids=([1, 2],),
                 remote=RemoteEndpoint(engine_id="prefill"),
                 remote_request_id="req-1",
+                done_request_id="req-1",
                 num_prompt_tokens=32,
                 prompt_token_ids=(101, 102, 103),
             )
@@ -264,6 +265,7 @@ def test_scheduler_carries_fake_rdma_done_endpoint() -> None:
     meta = scheduler.build_connector_meta(SimpleNamespace())
 
     assert meta.reqs_to_wait["req-1"].remote.done_endpoint == "tcp://127.0.0.1:7200"
+    assert meta.reqs_to_wait["req-1"].done_request_id == "req-1"
 
 
 def test_pd_proxy_injects_p_and_d_transfer_params() -> None:
@@ -299,5 +301,6 @@ def test_pd_proxy_injects_p_and_d_transfer_params() -> None:
         "do_remote_prefill": True,
         "remote_engine_id": "prefill",
         "remote_request_id": "pd-test-p",
+        "done_request_id": "pd-test-d",
         "done_endpoint": "tcp://127.0.0.1:7200",
     }

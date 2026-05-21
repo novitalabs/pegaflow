@@ -48,6 +48,7 @@ class PdWorkerConnector:
         self.layer_names: list[str] = []
         self._wait_reqs: dict[str, WaitReqMeta] = {}
         self._push_reqs: dict[str, PushReqMeta] = {}
+        self._done_aliases: dict[str, str] = {}
         self._tracker = ChunkTracker()
         self._failed_blocks: set[int] = set()
         self._done_sender = _AsyncDoneSender()
@@ -78,6 +79,7 @@ class PdWorkerConnector:
     ) -> None:
         for req_id, req in metadata.reqs_to_wait.items():
             self._wait_reqs[req_id] = req
+            self._done_aliases[req.done_request_id] = req_id
             if req.remote.done_endpoint:
                 self._ensure_done_receiver(req.remote.done_endpoint)
             handshake = self._build_handshake(req_id, flatten_block_ids(req.local_block_ids))
@@ -117,6 +119,9 @@ class PdWorkerConnector:
         for req_id in metadata.reqs_to_release:
             self._wait_reqs.pop(req_id, None)
             self._push_reqs.pop(req_id, None)
+            self._done_aliases = {
+                alias: target for alias, target in self._done_aliases.items() if target != req_id
+            }
             self._tracker.remove(req_id)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -200,6 +205,9 @@ class PdWorkerConnector:
             self._tracker.remove(req_id)
         for req_id in finished_recving:
             self._wait_reqs.pop(req_id, None)
+            self._done_aliases = {
+                alias: target for alias, target in self._done_aliases.items() if target != req_id
+            }
         return finished_sending or None, finished_recving or None
 
     def get_block_ids_with_load_errors(self) -> set[int]:
@@ -210,6 +218,7 @@ class PdWorkerConnector:
     def shutdown(self) -> None:
         self._wait_reqs.clear()
         self._push_reqs.clear()
+        self._done_aliases.clear()
         if self._done_receiver is not None:
             self._done_receiver.close()
             self._done_receiver = None
@@ -248,9 +257,14 @@ class PdWorkerConnector:
         if self._done_receiver is None:
             return
         for req_id in self._done_receiver.drain():
-            if req_id in self._wait_reqs:
-                self.rdma.mark_done(req_id)
-                logger.info("[PdConnector] D received fake RDMA done req=%s", req_id)
+            internal_req_id = self._done_aliases.get(req_id, req_id)
+            if internal_req_id in self._wait_reqs:
+                self.rdma.mark_done(internal_req_id)
+                logger.info(
+                    "[PdConnector] D received fake RDMA done req=%s internal_req=%s",
+                    req_id,
+                    internal_req_id,
+                )
 
 
 class _AsyncDoneReceiver:
