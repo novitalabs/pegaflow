@@ -6,6 +6,7 @@
 
 pub use cudarc::runtime::sys::cudaDeviceAttr::cudaDevAttrMultiProcessorCount;
 pub use cudarc::runtime::sys::cudaGetDeviceProperties_v2 as cudaGetDeviceProperties;
+pub use cudarc::runtime::sys::cudaMemcpyKind::cudaMemcpyDeviceToHost;
 pub use cudarc::runtime::sys::cudaMemcpyKind::cudaMemcpyHostToDevice;
 pub use cudarc::runtime::sys::cudaMemoryType::cudaMemoryTypeDevice;
 pub use cudarc::runtime::sys::*;

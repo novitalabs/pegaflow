@@ -11,21 +11,20 @@ from pathlib import Path
 
 
 def load_pd_rdma_engine():
-    try:
-        from pegaflow.pegaflow import PdRdmaEngine
-
-        return PdRdmaEngine
-    except ImportError:
-        repo = Path(__file__).resolve().parents[1]
+    repo = Path(__file__).resolve().parents[1]
+    native = repo / "target" / "release" / "libpegaflow.so"
+    if not native.exists():
         native = repo / "target" / "debug" / "libpegaflow.so"
-        if not native.exists():
-            raise
+    if native.exists():
         spec = importlib.util.spec_from_file_location("pegaflow.pegaflow", native)
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
         sys.modules["pegaflow.pegaflow"] = module
         spec.loader.exec_module(module)
         return module.PdRdmaEngine
+    from pegaflow.pegaflow import PdRdmaEngine
+
+    return PdRdmaEngine
 
 
 def main() -> None:
@@ -34,6 +33,8 @@ def main() -> None:
     parser.add_argument("--numa-node", type=int)
     parser.add_argument("--domain", action="append", default=[])
     parser.add_argument("--device", choices=("cuda", "host"), default="cuda")
+    parser.add_argument("--pin-worker-cpu", type=int)
+    parser.add_argument("--pin-uvm-cpu", type=int)
     args = parser.parse_args()
 
     PdRdmaEngine = load_pd_rdma_engine()
@@ -42,6 +43,8 @@ def main() -> None:
         numa_node=args.numa_node,
         domains=args.domain or None,
         device=args.device,
+        pin_worker_cpu=args.pin_worker_cpu,
+        pin_uvm_cpu=args.pin_uvm_cpu,
     )
     print(
         json.dumps(
@@ -50,6 +53,8 @@ def main() -> None:
                 "num_domains": engine.num_domains(),
                 "num_groups": engine.num_groups(),
                 "aggregated_link_speed": engine.aggregated_link_speed(),
+                "pin_worker_cpu": engine.pin_worker_cpu(),
+                "pin_uvm_cpu": engine.pin_uvm_cpu(),
             },
             sort_keys=True,
         )

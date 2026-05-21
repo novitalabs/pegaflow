@@ -5,7 +5,7 @@ use pegaflow_proto::proto::engine::{
     UnregisterRequest, engine_client::EngineClient, query_response,
 };
 use pegaflow_transfer::v2::{
-    CudaDeviceId, Device, DomainAddress, DomainGroupRouting, ImmTransferRequest,
+    CudaDeviceId, CudaDeviceMemory, Device, DomainAddress, DomainGroupRouting, ImmTransferRequest,
     MemoryRegionDescriptor, MemoryRegionHandle, MemoryRegionRemoteKey, RdmaEngine,
     SingleTransferRequest, SmallVec, TransferEngine, TransferEngineBuilder, TransferRequest,
     detect_topology,
@@ -14,7 +14,7 @@ use pyo3::{
     create_exception,
     exceptions::{PyException, PyRuntimeError, PyValueError},
     prelude::*,
-    types::{PyDict, PyList},
+    types::{PyBytes, PyDict, PyList},
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -145,6 +145,44 @@ struct PdRemoteRequest {
 }
 
 #[pyclass]
+struct PdRdmaTestBuffer {
+    mem: CudaDeviceMemory,
+}
+
+#[pymethods]
+impl PdRdmaTestBuffer {
+    #[new]
+    #[pyo3(signature = (*, size, cuda_device = 0))]
+    fn new(size: usize, cuda_device: u8) -> PyResult<Self> {
+        let mem = CudaDeviceMemory::device_on(size, cuda_device)
+            .map_err(|err| pd_rdma_error("cuda test buffer allocation failed", err))?;
+        Ok(Self { mem })
+    }
+
+    fn ptr(&self) -> u64 {
+        self.mem.ptr().as_ptr() as u64
+    }
+
+    fn size(&self) -> usize {
+        self.mem.size()
+    }
+
+    fn fill(&self, value: u8) -> PyResult<()> {
+        self.mem
+            .fill(value)
+            .map_err(|err| pd_rdma_error("cuda test buffer fill failed", err))
+    }
+
+    fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let data = self
+            .mem
+            .copy_to_vec()
+            .map_err(|err| pd_rdma_error("cuda test buffer copy_to_vec failed", err))?;
+        Ok(PyBytes::new(py, &data))
+    }
+}
+
+#[pyclass]
 struct PdRdmaEngine {
     engine: Arc<TransferEngine>,
     device: Device,
@@ -155,6 +193,8 @@ struct PdRdmaEngine {
     imm_to_req: Arc<Mutex<HashMap<u32, String>>>,
     finished_sending: Arc<Mutex<HashSet<String>>>,
     finished_recving: Arc<Mutex<HashSet<String>>>,
+    pin_worker_cpu: u16,
+    pin_uvm_cpu: u16,
 }
 
 impl Drop for PdRdmaEngine {
@@ -166,12 +206,14 @@ impl Drop for PdRdmaEngine {
 #[pymethods]
 impl PdRdmaEngine {
     #[new]
-    #[pyo3(signature = (*, cuda_device = 0, numa_node = None, domains = None, device = "cuda"))]
+    #[pyo3(signature = (*, cuda_device = 0, numa_node = None, domains = None, device = "cuda", pin_worker_cpu = None, pin_uvm_cpu = None))]
     fn new(
         cuda_device: u8,
         numa_node: Option<u8>,
         domains: Option<Vec<String>>,
         device: &str,
+        pin_worker_cpu: Option<u16>,
+        pin_uvm_cpu: Option<u16>,
     ) -> PyResult<Self> {
         let topology =
             detect_topology().map_err(|err| pd_rdma_error("v2 topology detect failed", err))?;
@@ -221,11 +263,26 @@ impl PdRdmaEngine {
                 .join(",")
         );
 
-        let worker_cpu =
-            group.cpus.first().copied().ok_or_else(|| {
+        let worker_cpu = match pin_worker_cpu {
+            Some(cpu) if group.cpus.contains(&cpu) => cpu,
+            Some(cpu) => {
+                return Err(PyValueError::new_err(format!(
+                    "pin_worker_cpu {cpu} is not in the selected RDMA topology CPU set"
+                )));
+            }
+            None => group.cpus.first().copied().ok_or_else(|| {
                 PyRuntimeError::new_err("selected RDMA topology group has no CPU")
-            })?;
-        let uvm_cpu = group.cpus.get(1).copied().unwrap_or(worker_cpu);
+            })?,
+        };
+        let uvm_cpu = match pin_uvm_cpu {
+            Some(cpu) if group.cpus.contains(&cpu) => cpu,
+            Some(cpu) => {
+                return Err(PyValueError::new_err(format!(
+                    "pin_uvm_cpu {cpu} is not in the selected RDMA topology CPU set"
+                )));
+            }
+            None => group.cpus.get(1).copied().unwrap_or(worker_cpu),
+        };
         let mut builder = TransferEngineBuilder::default();
         builder.add_gpu_domains(cuda_device, selected_domains, worker_cpu, uvm_cpu);
         let engine = Arc::new(
@@ -266,6 +323,8 @@ impl PdRdmaEngine {
             imm_to_req,
             finished_sending: Arc::new(Mutex::new(HashSet::new())),
             finished_recving,
+            pin_worker_cpu: worker_cpu,
+            pin_uvm_cpu: uvm_cpu,
         })
     }
 
@@ -531,6 +590,14 @@ impl PdRdmaEngine {
 
     fn aggregated_link_speed(&self) -> u64 {
         self.engine.aggregated_link_speed()
+    }
+
+    fn pin_worker_cpu(&self) -> u16 {
+        self.pin_worker_cpu
+    }
+
+    fn pin_uvm_cpu(&self) -> u16 {
+        self.pin_uvm_cpu
     }
 }
 
@@ -1153,6 +1220,7 @@ fn pegaflow(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<EngineRpcClient>()?;
     m.add_class::<PyLoadState>()?;
     m.add_class::<PdRdmaEngine>()?;
+    m.add_class::<PdRdmaTestBuffer>()?;
     // Register custom exceptions for error classification
     m.add("PegaFlowError", m.py().get_type::<PegaFlowError>())?;
     m.add("PegaflowInternal", m.py().get_type::<PegaflowInternal>())?;

@@ -81,6 +81,23 @@ impl CudaDeviceMemory {
         }
     }
 
+    pub fn copy_to_vec(&self) -> Result<Vec<u8>, CudartError> {
+        let mut data = vec![0; self.size];
+        let ret = unsafe {
+            cudart_sys::cudaMemcpy(
+                data.as_mut_ptr() as *mut c_void,
+                self.ptr.as_ptr(),
+                self.size,
+                cudart_sys::cudaMemcpyDeviceToHost,
+            )
+        };
+        if ret == cudart_sys::cudaError::cudaSuccess {
+            Ok(data)
+        } else {
+            Err(CudartError::new(ret as u32, "cudaMemcpyDeviceToHost"))
+        }
+    }
+
     pub fn get_ptr<T>(&self) -> *const T {
         self.ptr.as_ptr() as *const T
     }
