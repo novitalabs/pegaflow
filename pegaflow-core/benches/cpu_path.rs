@@ -2,8 +2,9 @@
 //!
 //! This exercises the core engine API with the same save -> query -> load shape
 //! used by the mock vLLM RPC tests, while keeping tonic/prost out of CPU
-//! profiles. Use `perf record --call-graph dwarf -- cargo bench -p pegaflow-core
-//! --bench cpu_path -- --profile-time 30` for profile captures.
+//! profiles. The benchmark binds CUDA device 0 at runtime. Use
+//! `perf record --call-graph dwarf -- cargo bench -p pegaflow-core --bench
+//! cpu_path -- --profile-time 30` for profile captures.
 
 use std::ffi::c_void;
 use std::hint::black_box;
@@ -23,6 +24,8 @@ const NAMESPACE: &str = "cpu-path";
 const LAYER_NAME: &str = "layer_0";
 const DEVICE_ID: i32 = 0;
 const LOAD_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+// Unreachable by design: the MetaServer group measures client-side enqueue and
+// save-path overhead, not a successful MetaServer RPC round trip.
 const FAKE_METASERVER_ADDR: &str = "http://127.0.0.1:9";
 const ADVERTISE_ADDR: &str = "127.0.0.1:50055";
 

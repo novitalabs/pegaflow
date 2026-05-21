@@ -148,8 +148,8 @@ impl MetaServerClient {
 
     /// Fire-and-forget registration of block hashes.
     ///
-    /// Accepts a flat list of (namespace, block_hash) pairs. The background loop
-    /// groups by namespace before issuing gRPC calls.
+    /// Accepts one namespace and its block hashes so callers can preserve their
+    /// hot-path grouping and enqueue a single MetaServer command.
     pub(crate) fn try_register_namespace(&self, namespace: String, hashes: Vec<Vec<u8>>) {
         if hashes.is_empty() {
             return;
@@ -700,9 +700,10 @@ mod tests {
         HeartbeatNodeResponse, InsertBlockHashesResponse, QueryPrefixBlocksResponse,
         RemoveBlockHashesResponse, ResponseStatus, UnregisterNodeResponse,
     };
+    use std::collections::BTreeMap;
     use std::net::SocketAddr;
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
     use tokio::net::TcpListener;
@@ -710,13 +711,21 @@ mod tests {
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::{Request, Response, Status, async_trait};
 
+    type RequestLog = Mutex<Vec<(String, Vec<Vec<u8>>)>>;
+    type RequestSet = BTreeMap<String, Vec<Vec<u8>>>;
+
     #[derive(Default)]
     struct FakeMetaServerState {
         heartbeat_count: AtomicUsize,
         insert_count: AtomicUsize,
+        remove_count: AtomicUsize,
         unregister_count: AtomicUsize,
         fail_insert_with_stale_session: AtomicUsize,
+        insert_requests: RequestLog,
+        remove_requests: RequestLog,
         heartbeat_notify: Notify,
+        insert_notify: Notify,
+        remove_notify: Notify,
         unregister_notify: Notify,
     }
 
@@ -749,38 +758,55 @@ mod tests {
 
         async fn insert_block_hashes(
             &self,
-            _request: Request<InsertBlockHashesRequest>,
+            request: Request<InsertBlockHashesRequest>,
         ) -> Result<Response<InsertBlockHashesResponse>, Status> {
+            let request = request.into_inner();
             self.state.insert_count.fetch_add(1, Ordering::SeqCst);
             if self
                 .state
                 .fail_insert_with_stale_session
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                    (remaining > 0).then_some(remaining - 1)
+                    (remaining > 0).then(|| remaining - 1)
                 })
                 .is_ok()
             {
                 return Err(Status::failed_precondition("stale node session"));
             }
+            let inserted_count = request.block_hashes.len() as u64;
+            self.state
+                .insert_requests
+                .lock()
+                .unwrap()
+                .push((request.namespace, request.block_hashes));
+            self.state.insert_notify.notify_waiters();
             Ok(Response::new(InsertBlockHashesResponse {
                 status: Some(ResponseStatus {
                     ok: true,
                     message: String::new(),
                 }),
-                inserted_count: 1,
+                inserted_count,
             }))
         }
 
         async fn remove_block_hashes(
             &self,
-            _request: Request<RemoveBlockHashesRequest>,
+            request: Request<RemoveBlockHashesRequest>,
         ) -> Result<Response<RemoveBlockHashesResponse>, Status> {
+            let request = request.into_inner();
+            self.state.remove_count.fetch_add(1, Ordering::SeqCst);
+            let removed_count = request.block_hashes.len() as u64;
+            self.state
+                .remove_requests
+                .lock()
+                .unwrap()
+                .push((request.namespace, request.block_hashes));
+            self.state.remove_notify.notify_waiters();
             Ok(Response::new(RemoveBlockHashesResponse {
                 status: Some(ResponseStatus {
                     ok: true,
                     message: String::new(),
                 }),
-                removed_count: 1,
+                removed_count,
             }))
         }
 
@@ -811,6 +837,32 @@ mod tests {
                 .unwrap();
         });
         (format!("http://{addr}"), state, shutdown_tx)
+    }
+
+    fn collect_requests(requests: &RequestLog) -> RequestSet {
+        let mut grouped = BTreeMap::new();
+        for (namespace, hashes) in requests.lock().unwrap().iter() {
+            let namespace_hashes: &mut Vec<Vec<u8>> = grouped.entry(namespace.clone()).or_default();
+            namespace_hashes.extend(hashes.iter().cloned());
+        }
+        for hashes in grouped.values_mut() {
+            hashes.sort();
+        }
+        grouped
+    }
+
+    fn expected_requests(entries: &[(&str, Vec<u8>)]) -> RequestSet {
+        let mut grouped: RequestSet = BTreeMap::new();
+        for (namespace, hash) in entries {
+            grouped
+                .entry((*namespace).to_string())
+                .or_default()
+                .push(hash.clone());
+        }
+        for hashes in grouped.values_mut() {
+            hashes.sort();
+        }
+        grouped
     }
 
     async fn wait_for_count(notify: &Notify, count: &AtomicUsize, expected: usize) {
@@ -859,6 +911,67 @@ mod tests {
         wait_for_count(&service.heartbeat_notify, &service.heartbeat_count, 2).await;
 
         client.shutdown().await;
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn mixed_insert_remove_drain_preserves_last_write_per_namespace() {
+        let (addr, service, shutdown_tx) = start_fake_metaserver().await;
+        let (tx, rx) = mpsc::channel(16);
+
+        let insert_then_remove = vec![0xa0];
+        let remove_then_insert = vec![0xb0];
+        let remove_only = vec![0xc0];
+        let insert_only = vec![0xd0];
+
+        tx.try_send(MetaServerCommand::Insert(BlockHashBatch::single_namespace(
+            "ns-first".to_string(),
+            vec![insert_then_remove.clone()],
+        )))
+        .unwrap();
+        tx.try_send(MetaServerCommand::Remove(BlockHashBatch::from_entries(
+            vec![("ns-first".to_string(), insert_then_remove.clone())],
+        )))
+        .unwrap();
+        tx.try_send(MetaServerCommand::Remove(BlockHashBatch::from_entries(
+            vec![
+                ("ns-second".to_string(), remove_then_insert.clone()),
+                ("ns-remove".to_string(), remove_only.clone()),
+            ],
+        )))
+        .unwrap();
+        tx.try_send(MetaServerCommand::Insert(BlockHashBatch::single_namespace(
+            "ns-second".to_string(),
+            vec![remove_then_insert.clone()],
+        )))
+        .unwrap();
+        tx.try_send(MetaServerCommand::Insert(BlockHashBatch::single_namespace(
+            "ns-insert".to_string(),
+            vec![insert_only.clone()],
+        )))
+        .unwrap();
+
+        let loop_task = tokio::spawn(registration_loop(rx, addr, "node-a:50055".to_string()));
+
+        wait_for_count(&service.insert_notify, &service.insert_count, 2).await;
+        wait_for_count(&service.remove_notify, &service.remove_count, 2).await;
+
+        assert_eq!(
+            collect_requests(&service.insert_requests),
+            expected_requests(&[
+                ("ns-second", remove_then_insert),
+                ("ns-insert", insert_only),
+            ])
+        );
+        assert_eq!(
+            collect_requests(&service.remove_requests),
+            expected_requests(&[("ns-first", insert_then_remove), ("ns-remove", remove_only)])
+        );
+
+        let (done_tx, done_rx) = oneshot::channel();
+        tx.send(MetaServerCommand::Shutdown(done_tx)).await.unwrap();
+        done_rx.await.unwrap();
+        loop_task.await.unwrap();
         let _ = shutdown_tx.send(());
     }
 }

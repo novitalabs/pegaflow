@@ -131,15 +131,17 @@ fn process_insert_batch(
     total_slots: usize,
     numa_node: NumaNode,
     namespace: &str,
-) {
+) -> usize {
     let mut sealed_blocks: Vec<(BlockKey, Arc<SealedBlock>)> = Vec::new();
     let mut inflight_bytes_added: u64 = 0;
     let mut inflight_bytes_removed: u64 = 0;
+    let mut ordered_fast_path_seals = 0usize;
 
     for (key, slots) in entries {
         if !inflight.contains_key(&key) {
             match SealedBlock::from_ordered_slot_inserts(slots, total_slots, numa_node) {
                 Ok(sealed) => {
+                    ordered_fast_path_seals += 1;
                     sealed_blocks.push((key, Arc::new(sealed)));
                     continue;
                 }
@@ -190,6 +192,8 @@ fn process_insert_batch(
         deps.read_cache.batch_insert_refs(&sealed_blocks);
         send_backing_batches(&deps, namespace, &sealed_blocks);
     }
+
+    ordered_fast_path_seals
 }
 
 #[allow(
@@ -368,6 +372,41 @@ mod tests {
             engine.read_cache.contains_keys(std::slice::from_ref(&key))[0],
             "sealed block should be in cache"
         );
+    }
+
+    #[tokio::test]
+    async fn ordered_multi_slot_batch_seals_immediately() {
+        let engine =
+            StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]).unwrap();
+        let deps = make_deps(&engine);
+        let weak_deps = Arc::downgrade(&deps);
+
+        let key = BlockKey::new("ns".into(), vec![4, 5, 6]);
+        let block0 = make_raw_block(&engine, 64);
+        let block1 = make_raw_block(&engine, 96);
+        let block2 = make_raw_block(&engine, 128);
+        let expected_footprint =
+            block0.memory_footprint() + block1.memory_footprint() + block2.memory_footprint();
+
+        let entries: InsertEntries =
+            vec![(key.clone(), vec![(0, block0), (1, block1), (2, block2)])];
+        let mut inflight: HashMap<BlockKey, InflightBlock> = HashMap::new();
+
+        let ordered_fast_path_seals =
+            process_insert_batch(&mut inflight, &weak_deps, entries, 3, NumaNode(1), "ns");
+
+        assert_eq!(ordered_fast_path_seals, 1);
+        assert!(
+            inflight.is_empty(),
+            "ordered complete batch should skip inflight storage"
+        );
+        let cached = engine.read_cache.get_blocks(std::slice::from_ref(&key));
+        assert_eq!(cached.len(), 1, "sealed block should be in read cache");
+
+        let sealed = &cached[0].1;
+        assert_eq!(sealed.memory_footprint(), expected_footprint);
+        assert_eq!(sealed.slots().len(), 3);
+        assert_eq!(sealed.slot_numas(), &[NumaNode(1); 3]);
     }
 
     #[tokio::test]
