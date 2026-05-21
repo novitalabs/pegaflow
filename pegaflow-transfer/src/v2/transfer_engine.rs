@@ -16,8 +16,9 @@ use parking_lot::Mutex;
 use parking_lot::RwLock;
 
 use crate::v2::{
-    BouncingErrorCallback, BouncingRecvCallback, CallbackResult, ErrorCallback, FabricLibError,
-    RdmaEngine, RecvCallback, SendBuffer, SendCallback, SendRecvEngine,
+    AsyncTransferEngine, BouncingErrorCallback, BouncingRecvCallback, CallbackResult,
+    ErrorCallback, FabricLibError, RdmaEngine, RecvCallback, SendBuffer, SendCallback,
+    SendRecvEngine,
     api::{
         DomainAddress, GdrCounter, ImmCounter, MemoryRegionDescriptor, MemoryRegionHandle,
         PeerGroupHandle, SmallVec, TransferCompletionEntry, TransferCounter, TransferId,
@@ -28,11 +29,7 @@ use crate::v2::{
     imm_count::ImmCount,
     worker::Worker,
 };
-#[cfg(feature = "tokio")]
-use {
-    crate::v2::AsyncTransferEngine,
-    tokio::sync::{mpsc, oneshot},
-};
+use tokio::sync::{mpsc, oneshot};
 
 pub struct TransferCallback {
     pub on_done: Box<dyn FnOnce() -> CallbackResult + Send + Sync>,
@@ -328,7 +325,6 @@ impl SendRecvEngine for TransferEngine {
     }
 }
 
-#[cfg(feature = "tokio")]
 impl AsyncTransferEngine for TransferEngine {
     async fn wait_for_imm_count(&self, imm: u32, expected_count: NonZeroU32) -> Result<()> {
         let (tx, rx) = oneshot::channel();

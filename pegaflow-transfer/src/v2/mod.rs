@@ -42,11 +42,9 @@ pub use api::{
     SingleTransferRequest, SmallVec, TransferRequest,
 };
 pub use error::{FabricLibError, Result, VerbsError};
-#[cfg(feature = "tokio")]
-pub use interface::AsyncTransferEngine;
 pub use interface::{
-    BouncingErrorCallback, BouncingRecvCallback, CallbackResult, ErrorCallback, RdmaEngine,
-    RecvCallback, SendBuffer, SendCallback, SendRecvEngine,
+    AsyncTransferEngine, BouncingErrorCallback, BouncingRecvCallback, CallbackResult,
+    ErrorCallback, RdmaEngine, RecvCallback, SendBuffer, SendCallback, SendRecvEngine,
 };
 pub use provider_dispatch::DomainInfo;
 pub use topo::{TopologyGroup, detect_topology};

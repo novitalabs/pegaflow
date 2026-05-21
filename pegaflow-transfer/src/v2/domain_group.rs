@@ -273,7 +273,7 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
                 dst_rkey: *dst_rkey,
                 dst_offset: request.dst_offset + offset as u64,
             });
-            rdma_ops.push((op, dst_addr));
+            rdma_ops.push((i, op, dst_addr.clone()));
         }
 
         // Bookkeeping
@@ -287,8 +287,8 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
         );
 
         // Submit the transfer request to each domain
-        for (domain, (rdma_op, dst_addr)) in self.domains.iter_mut().zip(rdma_ops) {
-            domain.submit_write(transfer_id, dst_addr.clone(), rdma_op);
+        for (domain_idx, rdma_op, dst_addr) in rdma_ops {
+            self.domains[domain_idx].submit_write(transfer_id, dst_addr, rdma_op);
         }
         Ok(())
     }

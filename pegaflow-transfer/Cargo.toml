@@ -9,7 +9,6 @@ workspace = true
 [features]
 default = ["cudarc/cuda-12080"]
 cuda-13 = ["cudarc/cuda-13000"]
-tokio = ["dep:tokio"]
 
 [dependencies]
 parking_lot.workspace = true
@@ -33,7 +32,7 @@ oneshot = "0.1"
 postcard = { version = "1.1", features = ["alloc", "use-std"] }
 smallvec.workspace = true
 syscalls = "0.7"
-tokio = { workspace = true, optional = true }
+tokio.workspace = true
 cudarc.workspace = true
 
 [build-dependencies]
@@ -43,3 +42,7 @@ cc = "1.2"
 [[bin]]
 name = "pegaflow-cpu-bench"
 path = "src/bin/cpu_bench.rs"
+
+[[bin]]
+name = "pegaflow-cpu-bench-v2"
+path = "src/bin/cpu_bench_v2.rs"
