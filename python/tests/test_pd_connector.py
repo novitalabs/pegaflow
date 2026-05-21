@@ -54,11 +54,13 @@ class FakeTensor:
         stride: tuple[int, ...],
         ptr: int = 0x1000,
         element_size: int = 2,
+        device_index: int | None = None,
     ) -> None:
         self.shape = shape
         self._stride = stride
         self._ptr = ptr
         self._element_size = element_size
+        self.device = SimpleNamespace(index=device_index) if device_index is not None else None
 
     def stride(self) -> tuple[int, ...]:
         return self._stride
@@ -152,6 +154,23 @@ class FakeNativeRdmaEngine:
         finished = self.finished_recving
         self.finished_recving = []
         return finished
+
+
+class FakeNativeRdmaEngineCtor(FakeNativeRdmaEngine):
+    last_kwargs = None
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__()
+        type(self).last_kwargs = kwargs
+
+    def num_domains(self):
+        return 1
+
+    def num_groups(self):
+        return 1
+
+    def aggregated_link_speed(self):
+        return 400_000_000_000
 
 
 def test_flash_attn_hnd_layout_offsets() -> None:
@@ -264,6 +283,37 @@ def test_real_rdma_port_rejects_native_layout_without_block_mapping() -> None:
         rdma.register_local_layers((layer,))
 
 
+def test_pd_worker_builds_native_rdma_by_default_when_extension_exists(monkeypatch) -> None:
+    monkeypatch.setattr(native, "PdRdmaEngine", FakeNativeRdmaEngineCtor, raising=False)
+    tensor = FakeTensor(
+        shape=(2, 8, 16, 4, 32),
+        stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
+        device_index=2,
+    )
+    config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            engine_id="decode",
+            get_from_extra_config=lambda key, default: {
+                "pegaflow.pd.rdma.pin_worker_cpu": 64,
+                "pegaflow.pd.rdma.pin_uvm_cpu": 66,
+            }.get(key, default),
+        )
+    )
+
+    worker = PdWorkerConnector(config)
+    worker.register_kv_caches({"layer.0": tensor})
+
+    assert isinstance(worker.rdma, RealRdmaPort)
+    assert FakeNativeRdmaEngineCtor.last_kwargs == {
+        "cuda_device": 2,
+        "numa_node": None,
+        "domains": None,
+        "device": "cuda",
+        "pin_worker_cpu": 64,
+        "pin_uvm_cpu": 66,
+    }
+
+
 def test_pd_worker_pushes_flash_attn_hnd_blocks() -> None:
     tensor = FakeTensor(
         shape=(2, 8, 16, 4, 32),
@@ -336,11 +386,15 @@ def test_pd_worker_publishes_wait_handshake_and_delays_done_until_all_blocks() -
     prefill_request = oob.get_prefill_request("req-1")
     assert prefill_request is not None
     assert prefill_request.prompt_token_ids == (101, 102, 103)
-    assert prefill_request.producer_kv_transfer_params == {
+    producer_params = dict(prefill_request.producer_kv_transfer_params)
+    producer_handshake = producer_params.pop("pd_handshake")
+    assert producer_params == {
         "do_remote_prefill_sender": True,
         "target_engine_id": "decode",
         "target_request_id": "req-1",
     }
+    assert producer_handshake["request_id"] == "req-1"
+    assert producer_handshake["layers"][0]["block_ids"] == [1, 2]
 
     push_worker = PdWorkerConnector(SimpleNamespace(), oob=oob)
     push_worker.register_kv_caches({"layer.0": tensor, "layer.1": tensor})
@@ -418,6 +472,50 @@ def test_scheduler_carries_prompt_tokens_for_d_to_p_oob() -> None:
     meta = scheduler.build_connector_meta(SimpleNamespace())
 
     assert meta.reqs_to_wait["req-1"].prompt_token_ids == (11, 12, 13)
+
+
+def test_scheduler_carries_cross_process_rdma_handshake() -> None:
+    handshake = {
+        "request_id": "decode-1",
+        "engine_id": "decode",
+        "tp_rank": 0,
+        "tp_size": 1,
+        "block_size": 16,
+        "kv_layout": "HND",
+        "layers": [
+            {
+                "layer_name": "layer.0",
+                "layer_idx": 0,
+                "base_addr": 0x1000,
+                "block_bytes": 1024,
+                "block_ids": [1],
+                "k_block_addrs": [0x1000],
+                "v_block_addrs": [0x1400],
+                "mr_desc": {"addr_rkey_list": [["10.0.0.1:1", 17]]},
+            }
+        ],
+    }
+    scheduler = PdSchedulerConnector(
+        SimpleNamespace(kv_transfer_config=SimpleNamespace(engine_id="p"))
+    )
+    request = SimpleNamespace(
+        request_id="prefill-1",
+        num_prompt_tokens=3,
+        kv_transfer_params={
+            "do_remote_prefill_sender": True,
+            "target_engine_id": "decode",
+            "target_request_id": "decode-1",
+            "pd_handshake": handshake,
+        },
+    )
+
+    scheduler.update_state_after_alloc(request, ([1],), num_external_tokens=0)
+    meta = scheduler.build_connector_meta(SimpleNamespace())
+
+    parsed = meta.reqs_to_push["prefill-1"].handshake
+    assert parsed is not None
+    assert parsed.request_id == "decode-1"
+    assert parsed.layers[0].mr_desc == {"addr_rkey_list": [["10.0.0.1:1", 17]]}
 
 
 def test_scheduler_carries_fake_rdma_done_endpoint() -> None:
@@ -521,12 +619,16 @@ def test_d_worker_submits_prefill_request_after_alloc() -> None:
     assert task.prefill_url == "http://127.0.0.1:8001"
     assert task.model == "/data/Qwen3-4B"
     assert task.prompt_token_ids == (11, 12, 13)
-    assert task.kv_transfer_params == {
+    task_params = dict(task.kv_transfer_params)
+    task_handshake = task_params.pop("pd_handshake")
+    assert task_params == {
         "do_remote_prefill_sender": True,
         "target_engine_id": "decode",
         "target_request_id": "external-d",
         "done_endpoint": "tcp://127.0.0.1:7200",
     }
+    assert task_handshake["request_id"] == "internal-d"
+    assert task_handshake["layers"][0]["block_ids"] == [1]
 
 
 def test_pd_proxy_only_sends_decode_request_with_prefill_hint() -> None:

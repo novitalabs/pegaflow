@@ -10,6 +10,7 @@ from pegaflow.pd_connector.metadata import (
     PushReqMeta,
     RemoteEndpoint,
     WaitReqMeta,
+    handshake_from_dict,
     normalize_block_ids,
 )
 
@@ -113,6 +114,7 @@ class PdSchedulerConnector:
                 ),
                 target_request_id=str(params.get("target_request_id") or req_id),
                 num_prompt_tokens=_num_prompt_tokens(request),
+                handshake=handshake_from_dict(params.get("pd_handshake")),
             )
             self._pending_producer_reqs.add(req_id)
             logger.debug(

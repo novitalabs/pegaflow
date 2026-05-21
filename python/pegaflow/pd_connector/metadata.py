@@ -64,6 +64,7 @@ class PushReqMeta:
     target: RemoteEndpoint
     target_request_id: str
     num_prompt_tokens: int
+    handshake: PdHandshake | None = None
 
 
 @dataclass(frozen=True)
@@ -95,6 +96,60 @@ class PdPrefillRequest:
     prompt_token_ids: tuple[int, ...]
     producer_kv_transfer_params: dict[str, Any]
     handshake: PdHandshake
+
+
+def layer_layout_from_dict(data: dict[str, Any]) -> LayerRemoteLayout:
+    return LayerRemoteLayout(
+        layer_name=str(data["layer_name"]),
+        layer_idx=int(data["layer_idx"]),
+        base_addr=int(data["base_addr"]),
+        block_bytes=int(data["block_bytes"]),
+        block_ids=tuple(int(block_id) for block_id in data["block_ids"]),
+        k_block_addrs=tuple(int(addr) for addr in data["k_block_addrs"]),
+        v_block_addrs=tuple(int(addr) for addr in data["v_block_addrs"]),
+        mr_desc=data.get("mr_desc"),
+    )
+
+
+def handshake_from_dict(data: dict[str, Any] | None) -> PdHandshake | None:
+    if data is None:
+        return None
+    return PdHandshake(
+        request_id=str(data["request_id"]),
+        engine_id=str(data["engine_id"]),
+        tp_rank=int(data["tp_rank"]),
+        tp_size=int(data["tp_size"]),
+        block_size=int(data["block_size"]),
+        kv_layout=str(data["kv_layout"]),
+        layers=tuple(layer_layout_from_dict(layer) for layer in data["layers"]),
+    )
+
+
+def layer_layout_to_dict(layer: LayerRemoteLayout) -> dict[str, Any]:
+    return {
+        "layer_name": layer.layer_name,
+        "layer_idx": layer.layer_idx,
+        "base_addr": layer.base_addr,
+        "block_bytes": layer.block_bytes,
+        "block_ids": list(layer.block_ids),
+        "k_block_addrs": list(layer.k_block_addrs),
+        "v_block_addrs": list(layer.v_block_addrs),
+        "mr_desc": layer.mr_desc,
+    }
+
+
+def handshake_to_dict(handshake: PdHandshake | None) -> dict[str, Any] | None:
+    if handshake is None:
+        return None
+    return {
+        "request_id": handshake.request_id,
+        "engine_id": handshake.engine_id,
+        "tp_rank": handshake.tp_rank,
+        "tp_size": handshake.tp_size,
+        "block_size": handshake.block_size,
+        "kv_layout": handshake.kv_layout,
+        "layers": [layer_layout_to_dict(layer) for layer in handshake.layers],
+    }
 
 
 class PdConnectorMetadata(KVConnectorMetadata):

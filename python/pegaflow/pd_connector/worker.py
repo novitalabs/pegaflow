@@ -24,9 +24,10 @@ from pegaflow.pd_connector.metadata import (
     PushReqMeta,
     WaitReqMeta,
     flatten_block_ids,
+    handshake_to_dict,
 )
 from pegaflow.pd_connector.oob import InMemoryOobPort
-from pegaflow.pd_connector.rdma import NoopRdmaPort, RdmaPort
+from pegaflow.pd_connector.rdma import NoopRdmaPort, RdmaPort, build_rdma_port
 
 logger = get_connector_logger()
 
@@ -41,6 +42,7 @@ class PdWorkerConnector:
     ) -> None:
         self.vllm_config = vllm_config
         self.rdma = rdma or NoopRdmaPort()
+        self._rdma_is_injected = rdma is not None
         self.oob = oob or InMemoryOobPort()
         self.engine_id = (
             getattr(getattr(vllm_config, "kv_transfer_config", None), "engine_id", None) or ""
@@ -65,6 +67,8 @@ class PdWorkerConnector:
             for layer_name, tensor in kv_caches.items()
         }
         self.layer_names = list(kv_caches.keys())
+        if not self._rdma_is_injected:
+            self.rdma = build_rdma_port(self.vllm_config, _infer_cuda_device(kv_caches))
         self.rdma.register_local_layers(
             tuple(
                 self.layouts[layer_name].remote_layout(layer_idx)
@@ -99,6 +103,7 @@ class PdWorkerConnector:
                         target_engine_id=self.engine_id,
                         target_request_id=req.done_request_id,
                         done_endpoint=req.remote.done_endpoint,
+                        handshake=handshake,
                     ),
                     handshake=handshake,
                 )
@@ -116,6 +121,7 @@ class PdWorkerConnector:
                             target_engine_id=self.engine_id,
                             target_request_id=req.done_request_id,
                             done_endpoint=req.remote.done_endpoint,
+                            handshake=handshake,
                         ),
                     )
                 )
@@ -131,7 +137,9 @@ class PdWorkerConnector:
             self._push_reqs[req_id] = req
             self._tracker.add_request(req_id)
             prefill_request = self.oob.get_prefill_request(req.target_request_id)
-            handshake = prefill_request.handshake if prefill_request is not None else None
+            handshake = req.handshake
+            if handshake is None and prefill_request is not None:
+                handshake = prefill_request.handshake
             self.rdma.register_remote(req_id, handshake)
             logger.info(
                 "[PdConnector] P queued async push req=%s target_req=%s done_endpoint=%s",
@@ -478,6 +486,7 @@ def _producer_params(
     target_engine_id: str,
     target_request_id: str,
     done_endpoint: str | None,
+    handshake: PdHandshake | None = None,
 ) -> dict[str, Any]:
     params: dict[str, Any] = {
         "do_remote_prefill_sender": True,
@@ -486,4 +495,15 @@ def _producer_params(
     }
     if done_endpoint:
         params["done_endpoint"] = done_endpoint
+    if handshake is not None:
+        params["pd_handshake"] = handshake_to_dict(handshake)
     return params
+
+
+def _infer_cuda_device(kv_caches: dict[str, Any]) -> int | None:
+    for tensor in kv_caches.values():
+        device = getattr(tensor, "device", None)
+        index = getattr(device, "index", None)
+        if index is not None:
+            return int(index)
+    return None

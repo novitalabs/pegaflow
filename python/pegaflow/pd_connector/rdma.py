@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import asdict
 from typing import Any, Protocol
 
+from pegaflow.logging_utils import get_connector_logger
 from pegaflow.pd_connector.layout import BlockSlice, LayerBlockSlices
-from pegaflow.pd_connector.metadata import LayerRemoteLayout, PdHandshake
+from pegaflow.pd_connector.metadata import (
+    LayerRemoteLayout,
+    PdHandshake,
+    handshake_to_dict,
+)
+
+logger = get_connector_logger()
+_MISSING = object()
 
 
 class RdmaPort(Protocol):
@@ -141,11 +148,7 @@ def _layer_from_native(layer: LayerRemoteLayout | dict[str, Any]) -> LayerRemote
 
 
 def _handshake_to_native(handshake: PdHandshake | None) -> dict[str, Any] | None:
-    if handshake is None:
-        return None
-    data = asdict(handshake)
-    data["layers"] = [_layer_to_native(layer) for layer in handshake.layers]
-    return data
+    return handshake_to_dict(handshake)
 
 
 class RealRdmaPort:
@@ -197,3 +200,86 @@ class RealRdmaPort:
 
     def pop_finished_recving(self) -> set[str]:
         return set(self.engine.pop_finished_recving())
+
+
+def build_rdma_port(vllm_config: Any, cuda_device: int | None) -> RdmaPort:
+    config = getattr(vllm_config, "kv_transfer_config", None)
+    enabled = _extra(config, "pegaflow.pd.rdma.enabled", _MISSING)
+    if enabled is not _MISSING and not _as_bool(enabled):
+        logger.info("[PdConnector] native RDMA disabled by kv_transfer_config")
+        return NoopRdmaPort()
+
+    try:
+        from pegaflow.pegaflow import PdRdmaEngine
+    except ImportError:
+        if enabled is not _MISSING:
+            raise
+        logger.warning("[PdConnector] native RDMA extension is unavailable; using NoopRdmaPort")
+        return NoopRdmaPort()
+    except AttributeError as exc:
+        if enabled is not _MISSING:
+            raise RuntimeError("pegaflow.pegaflow does not expose PdRdmaEngine") from exc
+        logger.warning("[PdConnector] native PdRdmaEngine is unavailable; using NoopRdmaPort")
+        return NoopRdmaPort()
+
+    device = _extra(config, "pegaflow.pd.rdma.device", "cuda")
+    configured_cuda_device = _extra(config, "pegaflow.pd.rdma.cuda_device", None)
+    numa_node = _extra(config, "pegaflow.pd.rdma.numa_node", None)
+    domains = _normalize_domains(_extra(config, "pegaflow.pd.rdma.domains", None))
+    pin_worker_cpu = _extra(config, "pegaflow.pd.rdma.pin_worker_cpu", None)
+    pin_uvm_cpu = _extra(config, "pegaflow.pd.rdma.pin_uvm_cpu", None)
+    resolved_cuda_device = int(
+        configured_cuda_device if configured_cuda_device is not None else cuda_device or 0
+    )
+    engine = PdRdmaEngine(
+        cuda_device=resolved_cuda_device,
+        numa_node=_optional_int(numa_node),
+        domains=domains,
+        device=str(device),
+        pin_worker_cpu=_optional_int(pin_worker_cpu),
+        pin_uvm_cpu=_optional_int(pin_uvm_cpu),
+    )
+    logger.info(
+        "[PdConnector] native RDMA enabled cuda=%d domains=%d groups=%d link_speed=%s",
+        resolved_cuda_device,
+        engine.num_domains(),
+        engine.num_groups(),
+        engine.aggregated_link_speed(),
+    )
+    return RealRdmaPort(engine)
+
+
+def _extra(config: Any, key: str, default: Any) -> Any:
+    if config is None:
+        return default
+    getter = getattr(config, "get_from_extra_config", None)
+    if getter is not None:
+        return getter(key, default)
+    extra_config = getattr(config, "extra_config", None)
+    if isinstance(extra_config, dict):
+        return extra_config.get(key, default)
+    return default
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    return int(value)
+
+
+def _normalize_domains(value: Any) -> list[str] | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return [str(item) for item in value]
