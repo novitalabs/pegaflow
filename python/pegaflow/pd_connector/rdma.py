@@ -125,8 +125,47 @@ def _layer_blocks_to_native(blocks: list[LayerBlockSlices]) -> list[dict[str, An
             "k": _block_slice_to_native(block.k),
             "v": _block_slice_to_native(block.v),
         }
-        for block in blocks
+        for block in _coalesce_contiguous_blocks(blocks)
     ]
+
+
+def _coalesce_contiguous_blocks(blocks: list[LayerBlockSlices]) -> list[LayerBlockSlices]:
+    if len(blocks) < 2:
+        return blocks
+
+    coalesced: list[LayerBlockSlices] = []
+    current = blocks[0]
+    for block in blocks[1:]:
+        if _can_extend_block_range(current, block):
+            current = LayerBlockSlices(
+                k=BlockSlice(
+                    block_id=current.k.block_id,
+                    src_offset_bytes=current.k.src_offset_bytes,
+                    bytes=current.k.bytes + block.k.bytes,
+                ),
+                v=BlockSlice(
+                    block_id=current.v.block_id,
+                    src_offset_bytes=current.v.src_offset_bytes,
+                    bytes=current.v.bytes + block.v.bytes,
+                ),
+            )
+            continue
+        coalesced.append(current)
+        current = block
+    coalesced.append(current)
+    return coalesced
+
+
+def _can_extend_block_range(prev: LayerBlockSlices, nxt: LayerBlockSlices) -> bool:
+    return (
+        prev.k.block_id + (prev.k.bytes // nxt.k.bytes) == nxt.k.block_id
+        and prev.v.block_id + (prev.v.bytes // nxt.v.bytes) == nxt.v.block_id
+        and prev.k.src_offset_bytes + prev.k.bytes == nxt.k.src_offset_bytes
+        and prev.v.src_offset_bytes + prev.v.bytes == nxt.v.src_offset_bytes
+        and nxt.k.bytes == nxt.v.bytes
+        and prev.k.bytes % nxt.k.bytes == 0
+        and prev.v.bytes % nxt.v.bytes == 0
+    )
 
 
 def _layer_to_native(layer: LayerRemoteLayout) -> dict[str, Any]:
@@ -253,7 +292,12 @@ class RealRdmaPort:
         return close_request(req_id)
 
 
-def build_rdma_port(vllm_config: Any, cuda_device: int | None) -> RdmaPort:
+def build_rdma_port(
+    vllm_config: Any,
+    cuda_device: int | None,
+    *,
+    tp_rank: int | None = None,
+) -> RdmaPort:
     config = getattr(vllm_config, "kv_transfer_config", None)
     enabled = _extra(config, "pegaflow.pd.rdma.enabled", _MISSING)
     if enabled is not _MISSING and not _as_bool(enabled):
@@ -268,7 +312,8 @@ def build_rdma_port(vllm_config: Any, cuda_device: int | None) -> RdmaPort:
 
     _reject_legacy_rank_config(config)
     device = _extra(config, "pegaflow.pd.rdma.device", "cuda")
-    rank_config = _rank_rdma_config(config, _tp_rank(vllm_config))
+    resolved_tp_rank = _tp_rank(vllm_config) if tp_rank is None else int(tp_rank)
+    rank_config = _rank_rdma_config(config, resolved_tp_rank)
     resolved_cuda_device = int(cuda_device or 0)
     engine = PdRdmaEngine(
         cuda_device=resolved_cuda_device,

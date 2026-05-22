@@ -372,11 +372,17 @@ impl WriteOpIter {
     pub fn advance(&mut self, n: usize) {
         match self {
             WriteOpIter::Single(iter) => {
+                if n == 0 {
+                    return;
+                }
                 assert!(n == 1);
                 iter.mark_done();
             }
             WriteOpIter::Paged(iter) => iter.advance(n),
             WriteOpIter::Scatter(iter) => {
+                if n == 0 {
+                    return;
+                }
                 assert!(n == 1);
                 iter.advance_one();
             }

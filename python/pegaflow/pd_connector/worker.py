@@ -20,6 +20,7 @@ from vllm.distributed.parallel_state import (
 from pegaflow.logging_utils import get_connector_logger
 from pegaflow.pd_connector.chunk_tracker import ChunkTracker
 from pegaflow.pd_connector.layout import (
+    BlockSlice,
     FlashAttnHndLayout,
     LayerBlockSlices,
     unique_blocks_from_slot_mapping,
@@ -93,7 +94,11 @@ class PdWorkerConnector:
         }
         self.layer_names = list(kv_caches.keys())
         if not self._rdma_is_injected:
-            self.rdma = build_rdma_port(self.vllm_config, _infer_cuda_device(kv_caches))
+            self.rdma = build_rdma_port(
+                self.vllm_config,
+                _infer_cuda_device(kv_caches),
+                tp_rank=self.tp_rank,
+            )
             self._rdma_waiter = _AsyncRdmaDoneWaiter(self.rdma)
         assert self.rdma is not None
         registered_layers = self.rdma.register_local_layers(
@@ -404,15 +409,18 @@ class PdWorkerConnector:
                 f"req={req_id} selected={sorted(selected_blocks)} "
                 f"mapped={sorted(remote_block_ids)}"
             )
-            block_slices = [
-                self._block_slices_for_remote_write(
-                    layout,
-                    local_block_id=block_id,
-                    remote_block_id=remote_block_ids[block_id],
-                )
-                for block_id in sorted(selected_blocks)
-            ]
-            self._push_layer_async(req_id, req, layer_idx, block_slices)
+            block_slices = self._block_ranges_for_remote_write(
+                layout,
+                selected_blocks,
+                remote_block_ids,
+            )
+            self._push_layer_async(
+                req_id,
+                req,
+                layer_idx,
+                block_slices,
+                num_blocks=len(selected_blocks),
+            )
             self._tracker.mark_blocks_pushed(req_id, layer_idx, selected_blocks)
             if layer_idx != len(self.layer_names) - 1:
                 continue
@@ -456,6 +464,8 @@ class PdWorkerConnector:
         req: PushReqMeta,
         layer_idx: int,
         block_slices: list[LayerBlockSlices],
+        *,
+        num_blocks: int,
     ) -> None:
         assert self.rdma is not None, "PdConnector RDMA port is not initialized"
         self._push_sender.submit(
@@ -465,6 +475,7 @@ class PdWorkerConnector:
                 target_request_id=req.target_request_id,
                 layer_idx=layer_idx,
                 block_slices=block_slices,
+                num_blocks=num_blocks,
             )
         )
 
@@ -542,6 +553,75 @@ class PdWorkerConnector:
             v=replace(local.v, block_id=remote_block_id),
         )
 
+    @staticmethod
+    def _block_ranges_for_remote_write(
+        layout: FlashAttnHndLayout,
+        local_block_ids: set[int],
+        remote_block_ids: dict[int, int],
+    ) -> list[LayerBlockSlices]:
+        sorted_local_blocks = sorted(local_block_ids)
+        if not sorted_local_blocks:
+            return []
+
+        ranges: list[LayerBlockSlices] = []
+        start_local = sorted_local_blocks[0]
+        prev_local = start_local
+        start_remote = remote_block_ids[start_local]
+        prev_remote = start_remote
+        count = 1
+
+        for local_block_id in sorted_local_blocks[1:]:
+            remote_block_id = remote_block_ids[local_block_id]
+            if local_block_id == prev_local + 1 and remote_block_id == prev_remote + 1:
+                prev_local = local_block_id
+                prev_remote = remote_block_id
+                count += 1
+                continue
+            ranges.append(
+                PdWorkerConnector._block_range_for_remote_write(
+                    layout,
+                    local_block_id=start_local,
+                    remote_block_id=start_remote,
+                    count=count,
+                )
+            )
+            start_local = prev_local = local_block_id
+            start_remote = prev_remote = remote_block_id
+            count = 1
+
+        ranges.append(
+            PdWorkerConnector._block_range_for_remote_write(
+                layout,
+                local_block_id=start_local,
+                remote_block_id=start_remote,
+                count=count,
+            )
+        )
+        return ranges
+
+    @staticmethod
+    def _block_range_for_remote_write(
+        layout: FlashAttnHndLayout,
+        *,
+        local_block_id: int,
+        remote_block_id: int,
+        count: int,
+    ) -> LayerBlockSlices:
+        local = layout.block_slices(local_block_id)
+        bytes_total = layout.block_bytes * count
+        return LayerBlockSlices(
+            k=BlockSlice(
+                block_id=remote_block_id,
+                src_offset_bytes=local.k.src_offset_bytes,
+                bytes=bytes_total,
+            ),
+            v=BlockSlice(
+                block_id=remote_block_id,
+                src_offset_bytes=local.v.src_offset_bytes,
+                bytes=bytes_total,
+            ),
+        )
+
     def _remote_layout_with_mr_desc(
         self,
         layer_name: str,
@@ -577,6 +657,7 @@ class _LayerPushTask:
     target_request_id: str
     layer_idx: int
     block_slices: list[LayerBlockSlices]
+    num_blocks: int
 
 
 @dataclass(frozen=True)
@@ -658,10 +739,11 @@ def _run_layer_push(task: _LayerPushTask) -> None:
     elapsed_s = time.perf_counter() - start
     bandwidth_gbps = (bytes_total * 8 / elapsed_s / 1e9) if elapsed_s > 0 else 0.0
     logger.info(
-        "[PdConnector] P RDMA push req=%s target_req=%s layer=%d blocks=%d bytes=%d latency_ms=%.3f bandwidth_gbps=%.2f",
+        "[PdConnector] P RDMA push req=%s target_req=%s layer=%d blocks=%d ranges=%d bytes=%d latency_ms=%.3f bandwidth_gbps=%.2f",
         task.req_id,
         task.target_request_id,
         task.layer_idx,
+        task.num_blocks,
         len(task.block_slices),
         bytes_total,
         elapsed_s * 1000,
@@ -819,10 +901,11 @@ def _post_prefill_request(task: _PrefillHttpTask) -> None:
     }
     payload = json.dumps(body).encode()
     logger.info(
-        "[PdConnector] D -> P prefill request req=%s url=%s tokens=%d target_req=%s ts_ns=%d",
+        "[PdConnector] D -> P prefill request req=%s url=%s tokens=%d payload_bytes=%d target_req=%s ts_ns=%d",
         task.request_id,
         url,
         len(task.prompt_token_ids),
+        len(payload),
         task.kv_transfer_params.get("target_request_id"),
         start_ts_ns,
     )

@@ -869,15 +869,30 @@ pegainfer 那边 `pegainfer-comm/crates/pegainfer-comm-fabric-lib` 是 pplx-gard
 | --- | --- | --- |
 | **P0** v2 RDMA substrate | v2 默认编译；host/cuda memory WRITE+IMM bench | 已完成：h20 上 GPU2+mlx5_2，600 MiB/task，约 372.6 Gbps |
 | **P1** `pd_connector` connector skeleton | 新增 `pegaflow.pd_connector`；实现 vLLM connector class、Producer/Consumer 状态机、metadata、layout、chunk tracker；测试用 `MockRdmaPort` | hook 时序单测：D allocate 后等待，P save layer 后记录 push，最后 done 能释放请求 |
-| **P2** 明确 Python/Rust binding surface | 根据 P1 的 `RdmaPort` 调用点，整理最小 Rust API；第一版走 PyO3 `PdRdmaEngine` | 已暴露 `PdRdmaEngine` + `RealRdmaPort`，本地编译和契约单测通过；待 h20-100 probe |
-| **P3** 接真实 v2 RDMA | 把 `RealRdmaPort` 接到 `pegaflow-transfer::v2`；先单机 1P+1D、单 GPU、手动注入 `kv_transfer_params` | GPU buffer WRITE+IMM 代替 mock，consumer 收到 done |
+| **P2** 明确 Python/Rust binding surface | 根据 P1 的 `RdmaPort` 调用点，整理最小 Rust API；第一版走 PyO3 `PdRdmaEngine` | 已暴露 `PdRdmaEngine` + `RealRdmaPort`，本地编译、契约单测和 h20 probe 通过 |
+| **P3** 接真实 v2 RDMA | 把 `RealRdmaPort` 接到 `pegaflow-transfer::v2`；先单机 1P+1D、单 GPU、手动注入 `kv_transfer_params` | GPU buffer WRITE+IMM 代替 mock，consumer 收到 done；TP8 rank-i ↔ rank-i 已跑通 |
 | **P4** vLLM 小模型 E2E | 单机 P + D 各占 1 GPU，跑小模型 | 输出 token-level 与 baseline 一致 |
 | **P5** Router + 跨节点 benchmark | Router 只转发 D；D 通过 OOB 唤起 P 并携带 prompt/layout；对照 NIXL 同条件压测 | 压测细节后续给出；目标见 §1 设计抓手 |
 
 当前 P1/P2/P3 已经合流到真实 RDMA 默认路径：`pegaflow.pd_connector`、FlashAttention
 HND layout assert、`MockRdmaPort` 单测、`RealRdmaPort(PdRdmaEngine(...))` 生产路径、
 D handshake 发布、P 按 layer/block push、最后一层所有 block 推完后 IMM done。
-当前同 HCA 小模型 vLLM E2E 已跑通；跨 HCA/跨机多 domain 路由和 TP8 大模型压测仍是下一阶段。
+当前同 HCA 小模型 vLLM E2E 已跑通；跨机 TP8（h20-99 P + h20-97 D）也已跑通
+rank 聚合 prefill、RDMA WRITE 和 IMM done。Qwen3-8B dummy / 30k prompt / TP8 / prefix
+cache off 的阶段性结果：
+
+| 路径 | TTFT | 备注 |
+| --- | ---: | --- |
+| Direct P baseline | 836.9 ms | 无 PD push，仅 P 侧 prefill |
+| NIXL baseline | 1045.9 ms | 同条件参考线 |
+| PD push，未合并 WR | 2538.1 ms | 每层大量 4 KiB WR，Python/RDMA submit 成本主导 |
+| PD push，native range coalesce | 2046.5 ms | native 侧合并连续 block range |
+| PD push，worker 直接生成 range | 1475.4 ms | 30k 最后一段每层每 rank `blocks=339 ranges=1` |
+
+当前 RDMA 写本身已不再是主瓶颈：P 端单层每 rank 2.7-4.2 MiB range WRITE 通常
+0.03-0.10 ms，日志带宽多在数百 Gbps 量级。剩余差距主要在 P/D 调度、chunked
+prefill 多 step、D 聚合 handshake 后触发 P prefill 的控制面延迟，以及长上下文
+slot_mapping/JSON 路径。
 MLA layout 仍未支持：Kimi 等模型的 KV cache 不是当前的 FlashAttention 5D HND layout，
 现在会被 connector assert 拦下。后续要把 MLA 作为一等 layout 接入，而不是依赖 HND fallback。
 
@@ -899,12 +914,20 @@ MLA layout 仍未支持：Kimi 等模型的 KV cache 不是当前的 FlashAttent
    5D HND。当前 connector 只支持 `FlashAttnHndLayout` 并 assert 失败；需要新增 MLA layout
    解析、block 地址表生成、per-layer push/wait 覆盖逻辑和契约测试。压测阶段先用 HND 模型
    跑通链路，MLA 作为 P/D connector 的正式 TODO 继续推进。
-10. **TP8 handshake fan-in**：当前跨机 TP8 smoke 已证明每个 D worker 都会独立向 P 发
-    prefill HTTP，请求进入 P 后又广播到所有 P worker，实际变成 N×N producer request。
-    结果是 D→P HTTP 可以 200，P 端也能排队 push，但没有形成 rank-i ↔ rank-i 的
-    RDMA done 闭环，D 端最后 `wait_done` 超时。后续需要让 D 侧聚合每个 rank 的
-    handshake，再只发一次 P prefill；P worker 按自身 `tp_rank` 取对应 handshake，
-    这样才符合一一对应的 QP/IMM 语义。
+10. **TP8 handshake fan-in**：已从 "每个 D worker 都向 P 发一次 prefill HTTP" 改为
+    D scheduler fan-in 所有 rank 的 handshake，再由 D rank0 向 P 发一次 prefill。
+    P worker 按自身 `tp_rank` 选择同 rank 的 handshake，避免 N×N producer request，
+    也避免 IMM 落到错误 D rank 的 counter。后续要继续压 fan-in/JSON/HTTP 成本，
+    并补更大模型的实测。
+11. **slot_mapping cache 与完成轮询**：D 侧 `get_finished` 不再对 `_wait_reqs` 跑
+    `poll_done` for-loop，IMM 完成由后台 waiter 写入 `finished_recving`；P 侧
+    `slot_mapping` block 提取按 `forward_step_id + tensor identity` 做 LRU cache，
+    不因 `wait_for_save` 或 finished_sending 清掉，避免同 step 多层重复 `.cpu()`
+    同步和 Python loop。
+12. **handshake 体积**：HTTP control plane 使用 `block_addr_format=linear` 紧凑表示
+    连续 block layout，只发 `block_id_start/num_blocks/k_addr_start/v_addr_start/addr_stride`
+    等标量；生产 native 注册仍会在进 PyO3 前展开成 lookup map。这个展开留在本地
+    进程内，不进入 D→P HTTP body。D→P prefill 日志带 `payload_bytes` 用于持续观察。
 
 ## 8. 不做的事
 

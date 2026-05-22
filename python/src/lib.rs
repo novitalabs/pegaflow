@@ -796,9 +796,9 @@ impl PdRdmaEngine {
         let block_id: u64 = py_get(block, "block_id")?;
         let src_offset: u64 = py_get(block, "src_offset_bytes")?;
         let bytes: u64 = py_get(block, "bytes")?;
-        if bytes > local.block_bytes {
+        if bytes == 0 || !bytes.is_multiple_of(local.block_bytes) {
             return Err(PyValueError::new_err(format!(
-                "block slice bytes {bytes} exceeds layer block_bytes {}",
+                "block slice bytes {bytes} must be a positive multiple of layer block_bytes {}",
                 local.block_bytes
             )));
         }
