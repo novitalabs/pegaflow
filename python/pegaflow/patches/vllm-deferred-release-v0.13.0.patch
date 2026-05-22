@@ -1,0 +1,1236 @@
+diff --git a/docs/deferred_release_design.md b/docs/deferred_release_design.md
+new file mode 100644
+index 000000000..953e330ef
+--- /dev/null
++++ b/docs/deferred_release_design.md
+@@ -0,0 +1,269 @@
++# KV Cache Deferred Release Mechanism
++
++## 概述
++
++本次改动实现了 KV Cache 的**延迟释放（Deferred Release）**机制，主要目标是：
++
++1. **减少内存碎片**：通过对释放的块进行排序和合并，将相邻的空闲区域聚合在一起
++2. **降低高并发时的分配竞争**：释放操作不立即加入空闲池，而是缓存后批量合并
++3. **提升 KV Offload 传输效率**：连续的块可以通过更少的 DMA 传输操作完成
++
++## 改动文件清单
++
++| 文件 | 改动行数 | 改动目的 |
++|------|----------|----------|
++| `vllm/v1/core/kv_cache_utils.py` | +267 | 新增 `ReleaseCache` 类和 `FreeKVCacheBlockQueue` 的延迟释放方法 |
++| `vllm/v1/core/block_pool.py` | +142 | `BlockPool` 集成延迟释放逻辑 |
++| `vllm/v1/core/kv_cache_coordinator.py` | +24 | 传递延迟释放配置参数 |
++| `vllm/v1/core/kv_cache_manager.py` | +4 | 传递延迟释放配置参数 |
++| `vllm/v1/core/sched/scheduler.py` | +2 | 从 CacheConfig 读取配置并传递 |
++| `vllm/config/cache.py` | +20 | 新增配置选项 |
++| `tests/v1/core/test_deferred_release.py` | +450 | 新增单元测试 |
++
++---
++
++## 详细改动说明
++
++### 1. `vllm/v1/core/kv_cache_utils.py`
++
++#### 新增 `ReleaseCache` 类 (第156-220行)
++
++```python
++class ReleaseCache:
++    """释放缓存，用于暂存待释放的块"""
++
++    def __init__(self, enable_coalescing: bool = True)
++    def add(self, block: KVCacheBlock)           # 添加单个块
++    def add_batch(self, blocks: Iterable)        # 批量添加
++    def pop_all(self) -> list[KVCacheBlock]      # 弹出所有块（可排序）
++    def clear()                                   # 清空
++```
++
++**目的**：作为释放块的临时缓冲区，支持按 `block_id` 排序以实现块合并。
++
++#### 修改 `FreeKVCacheBlockQueue` 类
++
++**构造函数新增参数**：
++- `enable_deferred_release: bool = False` - 是否启用延迟释放
++- `enable_coalescing: bool = True` - 是否在合并时排序
++
++**新增方法**：
++
++| 方法 | 说明 |
++|------|------|
++| `deferred_free(block)` | 延迟释放单个块到缓存 |
++| `deferred_free_n(blocks)` | 延迟释放多个块到缓存 |
++| `merge_release_cache()` | 将缓存中的块合并到空闲池 |
++| `try_allocate_with_merge(n)` | 尝试分配，不够时先合并缓存再重试 |
++| `get_total_available_blocks()` | 获取总可用块数（空闲池+缓存） |
++| `get_contiguous_free_ranges()` | 获取连续空闲块的范围列表 |
++| `force_merge()` | 强制合并缓存 |
++
++---
++
++### 2. `vllm/v1/core/block_pool.py`
++
++#### 构造函数新增参数
++```python
++def __init__(
++    ...
++    enable_deferred_release: bool = False,  # 新增
++    enable_coalescing: bool = True,         # 新增
++)
++```
++
++#### 修改 `free_blocks` 方法
++
++原逻辑：直接将释放的块加入空闲池
++新逻辑：
++- 若 `enable_deferred_release=True`，调用 `deferred_free_n()` 缓存块
++- 若 `enable_deferred_release=False`，保持原有行为
++
++#### 新增方法
++
++| 方法 | 说明 |
++|------|------|
++| `free_blocks_deferred(blocks)` | 强制使用延迟释放（忽略全局设置） |
++| `get_num_free_blocks_in_pool()` | 仅获取空闲池中的块数 |
++| `get_num_blocks_in_release_cache()` | 获取缓存中的块数 |
++| `merge_release_cache()` | 强制合并缓存到空闲池 |
++| `get_new_blocks_with_merge(n)` | 分配时自动合并缓存 |
++| `get_contiguous_free_ranges()` | 获取连续空闲块范围（用于 KV Offload） |
++
++#### 修改 `get_num_free_blocks` 方法
++
++当启用延迟释放时，返回值包含空闲池和缓存的总和。
++
++---
++
++### 3. `vllm/v1/core/kv_cache_coordinator.py`
++
++所有 Coordinator 类（`KVCacheCoordinator`, `KVCacheCoordinatorNoPrefixCache`, `UnitaryKVCacheCoordinator`, `HybridKVCacheCoordinator`）的构造函数新增参数：
++
++```python
++enable_deferred_release: bool = False
++enable_coalescing: bool = True
++```
++
++并将参数传递给 `BlockPool`。
++
++`get_kv_cache_coordinator` 工厂函数同样新增这两个参数。
++
++---
++
++### 4. `vllm/v1/core/kv_cache_manager.py`
++
++`KVCacheManager.__init__` 新增参数并传递给 `get_kv_cache_coordinator`：
++
++```python
++enable_deferred_release: bool = False
++enable_coalescing: bool = True
++```
++
++---
++
++### 5. `vllm/v1/core/sched/scheduler.py`
++
++从 `cache_config` 读取配置并传递给 `KVCacheManager`：
++
++```python
++self.kv_cache_manager = KVCacheManager(
++    ...
++    enable_deferred_release=self.cache_config.enable_deferred_release,
++    enable_coalescing=self.cache_config.enable_block_coalescing,
++)
++```
++
++---
++
++### 6. `vllm/config/cache.py`
++
++新增两个配置选项：
++
++```python
++enable_deferred_release: bool = False
++"""启用 KV cache 块的延迟释放机制。
++启用后，释放的块会先缓存，分配失败时再合并排序后重试。
++可减少碎片化，提升高并发性能和 KV Offload 传输效率。"""
++
++enable_block_coalescing: bool = True
++"""启用块合并时的排序。
++启用后（需同时启用 enable_deferred_release），合并时按 block_id 排序，
++将相邻空闲区域聚合，减少内存碎片，提升 DMA 传输效率。"""
++```
++
++这两个配置被排除在 `compute_hash` 之外，不影响计算图。
++
++---
++
++### 7. `tests/v1/core/test_deferred_release.py`（新文件）
++
++完整的单元测试，覆盖：
++
++- `TestReleaseCache`: ReleaseCache 类的所有方法
++- `TestFreeKVCacheBlockQueueDeferredRelease`: FreeKVCacheBlockQueue 延迟释放方法
++- `TestBlockPoolDeferredRelease`: BlockPool 集成测试
++- `TestDeferredReleaseIntegration`: 集成场景测试（碎片化、高并发、KV Offload）
++
++---
++
++## 架构图
++
++```
++┌─────────────────────────────────────────────────────────────────┐
++│                     Block Lifecycle                              │
++│                                                                  │
++│   Allocated ──free()──► ReleaseCache ──merge()──► FreePool      │
++│       ▲                    (Buffer)                    │        │
++│       │                                                │        │
++│       └────────────── allocate() ◄─────────────────────┘        │
++│                                                                  │
++│   触发合并的条件:                                                 │
++│   1. 分配请求无法由当前空闲池满足                                  │
++│   2. 显式调用 merge_release_cache()                              │
++│   3. KV Offload 前调用 get_contiguous_free_ranges()              │
++└─────────────────────────────────────────────────────────────────┘
++```
++
++---
++
++## 使用方式
++
++### 启用延迟释放
++
++在启动 vLLM 时添加参数：
++
++```bash
++# 方式1: 通过命令行参数（如果支持）
++vllm serve model_name --enable-deferred-release --enable-block-coalescing
++
++# 方式2: 通过代码配置
++from vllm import LLM
++
++llm = LLM(
++    model="model_name",
++    enable_deferred_release=True,
++    enable_block_coalescing=True,
++)
++```
++
++### 配置说明
++
++| 配置项 | 默认值 | 说明 |
++|--------|--------|------|
++| `enable_deferred_release` | `False` | 是否启用延迟释放 |
++| `enable_block_coalescing` | `True` | 合并时是否按 block_id 排序 |
++
++---
++
++## 测试方式
++
++### 运行单元测试
++
++```bash
++# 运行所有延迟释放相关测试
++pytest tests/v1/core/test_deferred_release.py -v
++
++# 运行特定测试类
++pytest tests/v1/core/test_deferred_release.py::TestReleaseCache -v
++pytest tests/v1/core/test_deferred_release.py::TestBlockPoolDeferredRelease -v
++
++# 运行集成测试
++pytest tests/v1/core/test_deferred_release.py::TestDeferredReleaseIntegration -v
++```
++
++### 运行现有 KV Cache 测试（确保兼容性）
++
++```bash
++# 运行现有 kv_cache_utils 测试
++pytest tests/v1/core/test_kv_cache_utils.py -v
++
++# 运行现有 prefix caching 测试
++pytest tests/v1/core/test_prefix_caching.py -v
++```
++
++### 性能测试建议
++
++```bash
++# 1. 基准测试（不启用延迟释放）
++python benchmarks/benchmark_serving.py --model model_name
++
++# 2. 启用延迟释放后测试
++python benchmarks/benchmark_serving.py --model model_name \
++    --enable-deferred-release
++
++# 3. 高并发场景测试
++python benchmarks/benchmark_serving.py --model model_name \
++    --enable-deferred-release \
++    --num-prompts 1000 \
++    --request-rate 100
++```
++
++---
++
++## 后续优化方向
++
++1. **自适应合并策略**：根据分配压力动态决定何时合并
++2. **周期性后台合并**：避免分配时的延迟
++3. **与 KV Offload 深度集成**：利用连续块信息优化 DMA 传输
++4. **监控指标**：添加碎片化率、合并频率等 Prometheus 指标
+diff --git a/tests/v1/core/test_deferred_release.py b/tests/v1/core/test_deferred_release.py
+new file mode 100644
+index 000000000..d3159f070
+--- /dev/null
++++ b/tests/v1/core/test_deferred_release.py
+@@ -0,0 +1,282 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Unit tests for the deferred release mechanism in KV cache management.
++
++This module tests the ReleaseCache, FreeKVCacheBlockQueue's deferred release
++methods, and BlockPool's integration with the deferred release mechanism.
++"""
++
++import pytest
++
++from vllm.v1.core.block_pool import BlockPool
++from vllm.v1.core.kv_cache_utils import (
++    FreeKVCacheBlockQueue,
++    KVCacheBlock,
++    ReleaseCache,
++)
++
++pytestmark = pytest.mark.cpu_test
++
++
++class TestReleaseCache:
++    """Tests for the ReleaseCache class."""
++
++    def test_init(self):
++        """Test ReleaseCache initialization."""
++        cache = ReleaseCache()
++        assert len(cache) == 0
++        assert cache.enable_coalescing is True
++
++        cache_no_coalesce = ReleaseCache(enable_coalescing=False)
++        assert cache_no_coalesce.enable_coalescing is False
++
++    def test_add_and_add_batch(self):
++        """Test adding blocks to the release cache."""
++        cache = ReleaseCache()
++
++        # Test add single block
++        cache.add(KVCacheBlock(block_id=5))
++        assert len(cache) == 1
++
++        # Test add batch
++        blocks = [KVCacheBlock(block_id=i) for i in range(3)]
++        cache.add_batch(blocks)
++        assert len(cache) == 4
++
++    def test_pop_all_with_coalescing(self):
++        """Test pop_all with coalescing enabled (sorted by block_id)."""
++        cache = ReleaseCache(enable_coalescing=True)
++        blocks = [KVCacheBlock(block_id=i) for i in [5, 2, 8, 1, 3]]
++        cache.add_batch(blocks)
++
++        popped = cache.pop_all()
++        assert len(cache) == 0
++        assert [b.block_id for b in popped] == [1, 2, 3, 5, 8]
++
++    def test_pop_all_without_coalescing(self):
++        """Test pop_all without coalescing (original order preserved)."""
++        cache = ReleaseCache(enable_coalescing=False)
++        blocks = [KVCacheBlock(block_id=i) for i in [5, 2, 8, 1, 3]]
++        cache.add_batch(blocks)
++
++        popped = cache.pop_all()
++        assert [b.block_id for b in popped] == [5, 2, 8, 1, 3]
++
++    def test_clear(self):
++        """Test clearing the release cache."""
++        cache = ReleaseCache()
++        cache.add_batch([KVCacheBlock(block_id=i) for i in range(5)])
++        cache.clear()
++        assert len(cache) == 0
++
++
++class TestFreeKVCacheBlockQueueDeferredRelease:
++    """Tests for deferred release methods in FreeKVCacheBlockQueue."""
++
++    def test_deferred_free_enabled(self):
++        """Test deferred free when enabled."""
++        blocks = [KVCacheBlock(block_id=i) for i in range(10)]
++        queue = FreeKVCacheBlockQueue(blocks, enable_deferred_release=True)
++
++        allocated = queue.popleft_n(5)
++        assert queue.num_free_blocks == 5
++
++        # Single block deferred free
++        queue.deferred_free(allocated[0])
++        assert queue.num_free_blocks == 5  # Not added to free pool yet
++        assert queue.release_cache_size == 1
++
++        # Multiple blocks deferred free
++        queue.deferred_free_n(allocated[1:])
++        assert queue.num_free_blocks == 5
++        assert queue.release_cache_size == 5
++
++    def test_deferred_free_disabled(self):
++        """Test deferred_free falls back to immediate release when disabled."""
++        blocks = [KVCacheBlock(block_id=i) for i in range(10)]
++        queue = FreeKVCacheBlockQueue(blocks, enable_deferred_release=False)
++
++        allocated = queue.popleft_n(3)
++        assert queue.num_free_blocks == 7
++
++        queue.deferred_free(allocated[0])
++        assert queue.num_free_blocks == 8  # Added directly to free pool
++        assert queue.release_cache_size == 0
++
++    def test_merge_release_cache(self):
++        """Test merging release cache into free pool."""
++        blocks = [KVCacheBlock(block_id=i) for i in range(10)]
++        queue = FreeKVCacheBlockQueue(
++            blocks, enable_deferred_release=True, enable_coalescing=True
++        )
++
++        allocated = queue.popleft_n(5)
++        queue.deferred_free_n(allocated)
++
++        num_merged = queue.merge_release_cache()
++        assert num_merged == 5
++        assert queue.num_free_blocks == 10
++        assert queue.release_cache_size == 0
++
++    def test_try_allocate_with_merge(self):
++        """Test allocation that triggers merge when free pool is insufficient."""
++        blocks = [KVCacheBlock(block_id=i) for i in range(10)]
++        queue = FreeKVCacheBlockQueue(blocks, enable_deferred_release=True)
++
++        # Allocate all, then deferred free some
++        allocated = queue.popleft_n(10)
++        queue.deferred_free_n(allocated[:5])
++        assert queue.num_free_blocks == 0
++        assert queue.release_cache_size == 5
++
++        # Should merge and allocate
++        result = queue.try_allocate_with_merge(3)
++        assert result is not None
++        assert len(result) == 3
++        assert queue.num_free_blocks == 2
++        assert queue.release_cache_size == 0
++
++        # Insufficient even after merge
++        result = queue.try_allocate_with_merge(5)
++        assert result is None
++
++    def test_get_total_available_blocks(self):
++        """Test getting total available blocks count."""
++        blocks = [KVCacheBlock(block_id=i) for i in range(10)]
++        queue = FreeKVCacheBlockQueue(blocks, enable_deferred_release=True)
++
++        allocated = queue.popleft_n(3)
++        assert queue.get_total_available_blocks() == 7
++
++        queue.deferred_free_n(allocated)
++        assert queue.get_total_available_blocks() == 10
++
++    def test_get_contiguous_free_ranges(self):
++        """Test getting contiguous free block ranges."""
++        blocks = [KVCacheBlock(block_id=i) for i in range(10)]
++        queue = FreeKVCacheBlockQueue(
++            blocks, enable_deferred_release=True, enable_coalescing=True
++        )
++
++        # Allocate all, then free non-contiguous blocks: 0, 1, 2, 5, 6, 9
++        all_blocks = queue.popleft_n(10)
++        queue.deferred_free_n([all_blocks[i] for i in [0, 1, 2, 5, 6, 9]])
++        queue.merge_release_cache()
++
++        ranges = queue.get_contiguous_free_ranges()
++        assert len(ranges) == 3
++        assert (0, 3) in ranges  # blocks 0, 1, 2
++        assert (5, 2) in ranges  # blocks 5, 6
++        assert (9, 1) in ranges  # block 9
++
++
++class TestBlockPoolDeferredRelease:
++    """Tests for BlockPool with deferred release enabled."""
++
++    def test_free_blocks_deferred_release(self):
++        """Test free_blocks uses deferred release when enabled."""
++        pool = BlockPool(
++            num_gpu_blocks=100,
++            enable_caching=False,
++            hash_block_size=16,
++            enable_deferred_release=True,
++        )
++
++        blocks = pool.get_new_blocks(5)
++        initial_free = pool.get_num_free_blocks_in_pool()
++
++        pool.free_blocks(blocks)
++
++        assert pool.get_num_free_blocks_in_pool() == initial_free
++        assert pool.get_num_blocks_in_release_cache() == 5
++        assert pool.get_num_free_blocks() == initial_free + 5
++
++    def test_free_blocks_immediate_when_disabled(self):
++        """Test free_blocks is immediate when deferred release is disabled."""
++        pool = BlockPool(
++            num_gpu_blocks=100,
++            enable_caching=False,
++            hash_block_size=16,
++            enable_deferred_release=False,
++        )
++
++        blocks = pool.get_new_blocks(5)
++        initial_free = pool.get_num_free_blocks()
++
++        pool.free_blocks(blocks)
++
++        assert pool.get_num_free_blocks() == initial_free + 5
++        assert pool.get_num_blocks_in_release_cache() == 0
++
++    def test_get_new_blocks_with_merge(self):
++        """Test get_new_blocks_with_merge triggers merge when needed."""
++        pool = BlockPool(
++            num_gpu_blocks=20,
++            enable_caching=False,
++            hash_block_size=16,
++            enable_deferred_release=True,
++        )
++
++        # Allocate all, deferred free some
++        initial_blocks = pool.get_new_blocks(pool.get_num_free_blocks())
++        pool.free_blocks(initial_blocks[:10])
++        assert pool.get_num_free_blocks_in_pool() == 0
++        assert pool.get_num_blocks_in_release_cache() == 10
++
++        # Should merge and allocate
++        result = pool.get_new_blocks_with_merge(5)
++        assert result is not None
++        assert len(result) == 5
++        assert pool.get_num_blocks_in_release_cache() == 0
++
++        # Insufficient blocks
++        result = pool.get_new_blocks_with_merge(100)
++        assert result is None
++
++
++class TestDeferredReleaseIntegration:
++    """Integration tests for deferred release mechanism."""
++
++    def test_high_concurrency_simulation(self):
++        """Simulate high-concurrency allocation/deallocation patterns."""
++        pool = BlockPool(
++            num_gpu_blocks=100,
++            enable_caching=False,
++            hash_block_size=16,
++            enable_deferred_release=True,
++            enable_coalescing=True,
++        )
++
++        active_allocations = []
++        for _ in range(10):
++            blocks = pool.get_new_blocks_with_merge(5)
++            if blocks:
++                active_allocations.append(blocks)
++            if len(active_allocations) > 3:
++                pool.free_blocks(active_allocations.pop(0))
++
++        # Cleanup
++        for blocks in active_allocations:
++            pool.free_blocks(blocks)
++        pool.merge_release_cache()
++
++        # All blocks should be back (minus null block)
++        assert pool.get_num_free_blocks() == pool.num_gpu_blocks - 1
++
++    def test_kv_offload_scenario(self):
++        """Test scenario optimized for KV offload efficiency."""
++        pool = BlockPool(
++            num_gpu_blocks=100,
++            enable_caching=False,
++            hash_block_size=16,
++            enable_deferred_release=True,
++            enable_coalescing=True,
++        )
++
++        blocks = pool.get_new_blocks(50)
++        pool.free_blocks(blocks)
++        pool.merge_release_cache()
++
++        ranges = pool.get_contiguous_free_ranges()
++        total_in_ranges = sum(length for _, length in ranges)
++        assert total_in_ranges == pool.get_num_free_blocks()
+diff --git a/vllm/config/cache.py b/vllm/config/cache.py
+index 067799a44..d20d3aa34 100644
+--- a/vllm/config/cache.py
++++ b/vllm/config/cache.py
+@@ -159,6 +159,23 @@ class CacheConfig:
+     'native' (vLLM native CPU offloading), 'lmcache' This option must be used
+     together with kv_offloading_size."""
+ 
++    enable_deferred_release: bool = False
++    """Enable deferred release mechanism for KV cache blocks.
++    When enabled, freed blocks are buffered in a temporary cache instead of
++    immediately being added to the free pool. When an allocation request cannot
++    be satisfied by the current free pool alone, the allocator will merge the
++    buffered blocks with the free pool, sort them by block_id, and retry.
++    This design reduces allocation contention and fragmentation during
++    high-concurrency operations, and improves KV offload transfer efficiency
++    by maintaining block locality."""
++
++    enable_block_coalescing: bool = True
++    """Enable block coalescing when merging release cache.
++    When enabled (and enable_deferred_release is True), blocks are sorted by
++    block_id when merged from the release cache to the free pool. This helps
++    coalesce adjacent free regions, reducing memory fragmentation and improving
++    DMA transfer efficiency for KV offload operations."""
++
+     def compute_hash(self) -> str:
+         """
+         WARNING: Whenever a new field is added to this config,
+@@ -186,6 +203,9 @@ class CacheConfig:
+             "num_cpu_blocks",
+             # WIP feature toggle not impacting compiled graph shape
+             "kv_sharing_fast_prefill",
++            # Deferred release settings don't affect graph shape
++            "enable_deferred_release",
++            "enable_block_coalescing",
+         }
+ 
+         from vllm.config.utils import get_hash_factors, hash_factors
+diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
+index c779e3d34..e58eb755f 100644
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -142,6 +142,11 @@ class BlockPool:
+             actual block size can be a multiple of hash_block_size.
+         enable_kv_cache_events: Whether to enable kv cache events.
+         metrics_collector: Optional metrics collector for tracking block residency.
++        enable_deferred_release: Whether to enable deferred release mechanism.
++            When enabled, freed blocks are buffered and merged when allocation
++            fails, reducing fragmentation and improving KV offload efficiency.
++        enable_coalescing: Whether to sort blocks by block_id when merging
++            from release cache to coalesce adjacent free regions.
+     """
+ 
+     def __init__(
+@@ -151,11 +156,16 @@ class BlockPool:
+         hash_block_size: int,
+         enable_kv_cache_events: bool = False,
+         metrics_collector: KVCacheMetricsCollector | None = None,
++        enable_deferred_release: bool = False,
++        enable_coalescing: bool = True,
+     ):
+         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
+         self.num_gpu_blocks = num_gpu_blocks
+         self.enable_caching = enable_caching
+         self.hash_block_size = hash_block_size
++        self.enable_deferred_release = enable_deferred_release
++        self.enable_coalescing = enable_coalescing
++
+         # All kv-cache blocks.
+         self.blocks: list[KVCacheBlock] = [
+             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
+@@ -163,7 +173,11 @@ class BlockPool:
+         # Free block queue that constructs and manipulates a doubly linked
+         # list of free blocks (including eviction candidates when caching is
+         # enabled).
+-        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
++        self.free_block_queue = FreeKVCacheBlockQueue(
++            self.blocks,
++            enable_deferred_release=enable_deferred_release,
++            enable_coalescing=enable_coalescing,
++        )
+ 
+         # Cache for block lookup
+         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
+@@ -385,6 +399,10 @@ class BlockPool:
+         """Free a list of blocks. The blocks should be ordered by their
+         eviction priority, where the first block will be evicted first.
+ 
++        When deferred release is enabled, blocks are buffered in a release
++        cache instead of immediately added to the free pool. This reduces
++        fragmentation and improves allocation efficiency.
++
+         Args:
+             ordered_blocks: A list of blocks to free ordered by their eviction
+                 priority.
+@@ -393,9 +411,36 @@ class BlockPool:
+         blocks_list = list(ordered_blocks)
+         for block in blocks_list:
+             block.ref_cnt -= 1
+-        self.free_block_queue.append_n(
+-            [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
+-        )
++
++        freed_blocks = [
++            block for block in blocks_list if block.ref_cnt == 0 and not block.is_null
++        ]
++
++        if self.enable_deferred_release:
++            # Use deferred release: buffer blocks in release cache
++            self.free_block_queue.deferred_free_n(freed_blocks)
++        else:
++            # Immediate release: add directly to free pool
++            self.free_block_queue.append_n(freed_blocks)
++
++    def free_blocks_deferred(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
++        """Free blocks using deferred release, regardless of global setting.
++
++        This is useful when you want to explicitly use deferred release for
++        specific operations like batch preemption or KV offload preparation.
++
++        Args:
++            ordered_blocks: A list of blocks to free ordered by their eviction
++                priority.
++        """
++        blocks_list = list(ordered_blocks)
++        for block in blocks_list:
++            block.ref_cnt -= 1
++
++        freed_blocks = [
++            block for block in blocks_list if block.ref_cnt == 0 and not block.is_null
++        ]
++        self.free_block_queue.deferred_free_n(freed_blocks)
+ 
+     def evict_blocks(self, block_ids: set[int]) -> None:
+         """evict blocks from the prefix cache by their block IDs.
+@@ -454,11 +499,98 @@ class BlockPool:
+     def get_num_free_blocks(self) -> int:
+         """Get the number of free blocks in the pool.
+ 
++        When deferred release is enabled, this includes both the free pool
++        and the release cache to give an accurate count of available blocks.
++
+         Returns:
+             The number of free blocks.
+         """
++        if self.enable_deferred_release:
++            return self.free_block_queue.get_total_available_blocks()
++        return self.free_block_queue.num_free_blocks
++
++    def get_num_free_blocks_in_pool(self) -> int:
++        """Get the number of free blocks only in the free pool (not release cache).
++
++        Returns:
++            The number of free blocks in the free pool.
++        """
+         return self.free_block_queue.num_free_blocks
+ 
++    def get_num_blocks_in_release_cache(self) -> int:
++        """Get the number of blocks in the release cache.
++
++        Returns:
++            The number of blocks in the release cache.
++        """
++        return self.free_block_queue.release_cache_size
++
++    def merge_release_cache(self) -> int:
++        """Force merge all blocks from release cache to free pool.
++
++        This is useful for:
++        1. KV offload operations that need contiguous memory regions
++        2. Debugging and testing
++        3. Explicit control over when merging happens
++
++        Returns:
++            The number of blocks merged.
++        """
++        return self.free_block_queue.merge_release_cache()
++
++    def get_new_blocks_with_merge(self, num_blocks: int) -> list[KVCacheBlock] | None:
++        """Try to get new blocks, merging release cache if needed.
++
++        This is the deferred-release-aware version of get_new_blocks().
++        When the free pool doesn't have enough blocks, it will merge
++        blocks from the release cache (sorted by block_id for locality)
++        and retry the allocation.
++
++        Args:
++            num_blocks: The number of blocks to allocate.
++
++        Returns:
++            A list of blocks if successful, None if not enough blocks.
++        """
++        if not self.enable_deferred_release:
++            # Fall back to regular allocation
++            if num_blocks > self.get_num_free_blocks():
++                return None
++            return self.get_new_blocks(num_blocks)
++
++        # Try to allocate with merge
++        ret = self.free_block_queue.try_allocate_with_merge(num_blocks)
++        if ret is None:
++            return None
++
++        # Process allocated blocks (eviction and ref_cnt)
++        if self.enable_caching:
++            for block in ret:
++                self._maybe_evict_cached_block(block)
++                assert block.ref_cnt == 0
++                block.ref_cnt += 1
++                if self.metrics_collector:
++                    self.metrics_collector.on_block_allocated(block)
++        else:
++            for block in ret:
++                assert block.ref_cnt == 0
++                block.ref_cnt += 1
++                if self.metrics_collector:
++                    self.metrics_collector.on_block_allocated(block)
++        return ret
++
++    def get_contiguous_free_ranges(self) -> list[tuple[int, int]]:
++        """Get ranges of contiguous free block IDs.
++
++        This is useful for KV offload operations to identify contiguous
++        memory regions that can be transferred efficiently via DMA.
++
++        Returns:
++            A list of (start_block_id, length) tuples representing
++            contiguous ranges of free blocks.
++        """
++        return self.free_block_queue.get_contiguous_free_ranges()
++
+     def get_usage(self) -> float:
+         """Get the KV cache usage.
+ 
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index 4b09b76c1..b1bf0be78 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -41,6 +41,8 @@ class KVCacheCoordinator(ABC):
+         pcp_world_size: int,
+         hash_block_size: int,
+         metrics_collector: KVCacheMetricsCollector | None = None,
++        enable_deferred_release: bool = False,
++        enable_coalescing: bool = True,
+     ):
+         self.kv_cache_config = kv_cache_config
+         self.max_model_len = max_model_len
+@@ -52,6 +54,8 @@ class KVCacheCoordinator(ABC):
+             hash_block_size,
+             enable_kv_cache_events,
+             metrics_collector,
++            enable_deferred_release=enable_deferred_release,
++            enable_coalescing=enable_coalescing,
+         )
+ 
+         # Needs special handling for find_longest_cache_hit if eagle is enabled
+@@ -232,6 +236,8 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
+         pcp_world_size: int,
+         hash_block_size: int,
+         metrics_collector: KVCacheMetricsCollector | None = None,
++        enable_deferred_release: bool = False,
++        enable_coalescing: bool = True,
+     ):
+         super().__init__(
+             kv_cache_config,
+@@ -243,6 +249,8 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
+             pcp_world_size=pcp_world_size,
+             hash_block_size=hash_block_size,
+             metrics_collector=metrics_collector,
++            enable_deferred_release=enable_deferred_release,
++            enable_coalescing=enable_coalescing,
+         )
+         self.num_single_type_manager = len(self.single_type_managers)
+ 
+@@ -278,6 +286,8 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
+         pcp_world_size: int,
+         hash_block_size: int,
+         metrics_collector: KVCacheMetricsCollector | None = None,
++        enable_deferred_release: bool = False,
++        enable_coalescing: bool = True,
+     ):
+         super().__init__(
+             kv_cache_config,
+@@ -289,6 +299,8 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
+             pcp_world_size=pcp_world_size,
+             hash_block_size=hash_block_size,
+             metrics_collector=metrics_collector,
++            enable_deferred_release=enable_deferred_release,
++            enable_coalescing=enable_coalescing,
+         )
+         self.kv_cache_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
+         self.block_size = self.kv_cache_spec.block_size
+@@ -346,6 +358,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+         pcp_world_size: int,
+         hash_block_size: int,
+         metrics_collector: KVCacheMetricsCollector | None = None,
++        enable_deferred_release: bool = False,
++        enable_coalescing: bool = True,
+     ):
+         super().__init__(
+             kv_cache_config,
+@@ -357,6 +371,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+             pcp_world_size=pcp_world_size,
+             hash_block_size=hash_block_size,
+             metrics_collector=metrics_collector,
++            enable_deferred_release=enable_deferred_release,
++            enable_coalescing=enable_coalescing,
+         )
+         # hash_block_size: the block size used to compute block hashes.
+         # The actual block size usually equals hash_block_size, but in cases where
+@@ -533,6 +549,8 @@ def get_kv_cache_coordinator(
+     pcp_world_size: int,
+     hash_block_size: int,
+     metrics_collector: KVCacheMetricsCollector | None = None,
++    enable_deferred_release: bool = False,
++    enable_coalescing: bool = True,
+ ) -> KVCacheCoordinator:
+     if not enable_caching:
+         return KVCacheCoordinatorNoPrefixCache(
+@@ -544,6 +562,8 @@ def get_kv_cache_coordinator(
+             pcp_world_size=pcp_world_size,
+             hash_block_size=hash_block_size,
+             metrics_collector=metrics_collector,
++            enable_deferred_release=enable_deferred_release,
++            enable_coalescing=enable_coalescing,
+         )
+     if len(kv_cache_config.kv_cache_groups) == 1:
+         return UnitaryKVCacheCoordinator(
+@@ -556,6 +576,8 @@ def get_kv_cache_coordinator(
+             pcp_world_size=pcp_world_size,
+             hash_block_size=hash_block_size,
+             metrics_collector=metrics_collector,
++            enable_deferred_release=enable_deferred_release,
++            enable_coalescing=enable_coalescing,
+         )
+     return HybridKVCacheCoordinator(
+         kv_cache_config,
+@@ -567,4 +589,6 @@ def get_kv_cache_coordinator(
+         pcp_world_size=pcp_world_size,
+         hash_block_size=hash_block_size,
+         metrics_collector=metrics_collector,
++        enable_deferred_release=enable_deferred_release,
++        enable_coalescing=enable_coalescing,
+     )
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index 13086a66f..7da09c456 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -104,6 +104,8 @@ class KVCacheManager:
+         dcp_world_size: int = 1,
+         pcp_world_size: int = 1,
+         metrics_collector: KVCacheMetricsCollector | None = None,
++        enable_deferred_release: bool = False,
++        enable_coalescing: bool = True,
+     ) -> None:
+         self.max_model_len = max_model_len
+ 
+@@ -126,6 +128,8 @@ class KVCacheManager:
+             pcp_world_size=pcp_world_size,
+             hash_block_size=hash_block_size,
+             metrics_collector=self.metrics_collector,
++            enable_deferred_release=enable_deferred_release,
++            enable_coalescing=enable_coalescing,
+         )
+         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
+         self.block_pool = self.coordinator.block_pool
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index e4360de37..7f66b5ffc 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -153,6 +153,73 @@ class KVCacheBlock:
+         )
+ 
+ 
++class ReleaseCache:
++    """A temporary buffer for freed blocks before they are merged into the
++    free pool.
++
++    This class implements a deferred release mechanism where freed blocks are
++    first buffered here instead of immediately being added to the free pool.
++    When an allocation request cannot be satisfied by the current free pool,
++    the allocator will merge the buffered blocks with the free pool, sort them
++    by block_id, and retry the allocation.
++
++    Benefits:
++    1. Reduces allocation contention during high-concurrency operations
++    2. Mitigates memory fragmentation by coalescing adjacent free regions
++    3. Improves KV offload transfer efficiency by maintaining block locality
++
++    Args:
++        enable_coalescing: Whether to sort blocks by block_id when merging
++            to coalesce adjacent free regions. Default is True.
++    """
++
++    def __init__(self, enable_coalescing: bool = True) -> None:
++        self._buffer: list[KVCacheBlock] = []
++        self.enable_coalescing = enable_coalescing
++
++    def add(self, block: KVCacheBlock) -> None:
++        """Add a single block to the release cache."""
++        self._buffer.append(block)
++
++    def add_batch(self, blocks: Iterable[KVCacheBlock]) -> None:
++        """Add multiple blocks to the release cache."""
++        self._buffer.extend(blocks)
++
++    def pop_all(self) -> list[KVCacheBlock]:
++        """Pop all blocks from the release cache.
++
++        If coalescing is enabled, blocks are sorted by block_id to help
++        coalesce adjacent free regions when merged into the free pool.
++
++        Returns:
++            A list of all buffered blocks, potentially sorted by block_id.
++        """
++        if not self._buffer:
++            return []
++
++        blocks = self._buffer
++        self._buffer = []
++
++        if self.enable_coalescing:
++            # Sort by block_id to coalesce adjacent free regions
++            # This improves memory locality for KV offload operations
++            blocks.sort(key=lambda b: b.block_id)
++
++        return blocks
++
++    def __len__(self) -> int:
++        return len(self._buffer)
++
++    @property
++    def num_blocks(self) -> int:
++        """Number of blocks currently in the release cache."""
++        return len(self._buffer)
++
++    def clear(self) -> None:
++        """Clear all blocks from the release cache without returning them."""
++        self._buffer.clear()
++
++
+ class FreeKVCacheBlockQueue:
+     """This class organizes a list of KVCacheBlock objects to a doubly linked
+     list of free blocks. We implement this class instead of using Python
+@@ -173,10 +240,24 @@ class FreeKVCacheBlockQueue:
+ 
+     Args:
+         blocks: A list of KVCacheBlock objects.
++        enable_deferred_release: Whether to enable deferred release mechanism.
++            When enabled, freed blocks are buffered in a release cache and
++            merged back when allocation fails. Default is False.
++        enable_coalescing: Whether to sort blocks by block_id when merging
++            from release cache to coalesce adjacent free regions. Default is True.
+     """
+ 
+-    def __init__(self, blocks: list[KVCacheBlock]) -> None:
++    def __init__(
++        self,
++        blocks: list[KVCacheBlock],
++        enable_deferred_release: bool = False,
++        enable_coalescing: bool = True,
++    ) -> None:
+         self.num_free_blocks = len(blocks)
++        self.enable_deferred_release = enable_deferred_release
++
++        # Release cache for deferred release mechanism
++        self._release_cache = ReleaseCache(enable_coalescing=enable_coalescing)
+ 
+         # Initialize doubly links of consecutive blocks
+         for i in range(self.num_free_blocks):
+@@ -363,6 +444,189 @@ class FreeKVCacheBlockQueue:
+             curr_block = curr_block.next_free_block
+         return ret
+ 
++    # ==================== Deferred Release Methods ====================
++
++    def deferred_free(self, block: KVCacheBlock) -> None:
++        """Add a block to the release cache instead of immediately freeing it.
++
++        This is the deferred release version of append(). The block is buffered
++        in the release cache and will be merged back into the free pool later.
++
++        Args:
++            block: The block to defer release.
++        """
++        if self.enable_deferred_release:
++            self._release_cache.add(block)
++        else:
++            # Fall back to immediate release
++            self.append(block)
++
++    def deferred_free_n(self, blocks: list[KVCacheBlock]) -> None:
++        """Add multiple blocks to the release cache.
++
++        This is the deferred release version of append_n(). Blocks are buffered
++        in the release cache and will be merged back into the free pool later.
++
++        Args:
++            blocks: The blocks to defer release.
++        """
++        if not blocks:
++            return
++
++        if self.enable_deferred_release:
++            self._release_cache.add_batch(blocks)
++        else:
++            # Fall back to immediate release
++            self.append_n(blocks)
++
++    def merge_release_cache(self) -> int:
++        """Merge all blocks from the release cache into the free pool.
++
++        When coalescing is enabled, blocks are sorted by block_id before
++        being added to the free pool. This helps to maintain memory locality
++        and reduces fragmentation.
++
++        Returns:
++            The number of blocks merged from the release cache.
++        """
++        blocks = self._release_cache.pop_all()
++        if not blocks:
++            return 0
++
++        # When coalescing is enabled, blocks are already sorted by block_id
++        # We prepend them to the free list to maintain sorted order at the front
++        if self._release_cache.enable_coalescing:
++            self._prepend_sorted_blocks(blocks)
++        else:
++            self.append_n(blocks)
++
++        return len(blocks)
++
++    def _prepend_sorted_blocks(self, blocks: list[KVCacheBlock]) -> None:
++        """Prepend sorted blocks to the front of the free list.
++
++        This maintains block locality at the front of the queue, which is
++        beneficial for KV offload operations that prefer contiguous memory.
++
++        Args:
++            blocks: A list of blocks sorted by block_id.
++        """
++        if not blocks:
++            return
++
++        # Get the current first block (or fake_tail if empty)
++        first_block = self.fake_free_list_head.next_free_block
++        assert first_block is not None
++
++        # Build the chain for the new blocks
++        prev = self.fake_free_list_head
++        for block in blocks:
++            prev.next_free_block = block
++            block.prev_free_block = prev
++            prev = block
++
++        # Connect the last new block to the original first block
++        prev.next_free_block = first_block
++        first_block.prev_free_block = prev
++
++        self.num_free_blocks += len(blocks)
++
++    def try_allocate_with_merge(self, n: int) -> list[KVCacheBlock] | None:
++        """Try to allocate n blocks, merging release cache if needed.
++
++        This method first checks if the free pool has enough blocks. If not,
++        it merges the release cache and retries. This is the core of the
++        deferred release mechanism.
++
++        Args:
++            n: The number of blocks to allocate.
++
++        Returns:
++            A list of n blocks if successful, None if not enough blocks
++            even after merging the release cache.
++        """
++        total_available = self.num_free_blocks + self._release_cache.num_blocks
++
++        if n > total_available:
++            # Not enough blocks even after merging
++            return None
++
++        if n <= self.num_free_blocks:
++            # Enough blocks in the free pool, no need to merge
++            return self.popleft_n(n)
++
++        # Need to merge release cache first
++        self.merge_release_cache()
++
++        if n <= self.num_free_blocks:
++            return self.popleft_n(n)
++
++        # Should not reach here if total_available >= n
++        return None
++
++    def get_total_available_blocks(self) -> int:
++        """Get the total number of available blocks (free pool + release cache).
++
++        Returns:
++            Total number of blocks available for allocation.
++        """
++        return self.num_free_blocks + self._release_cache.num_blocks
++
++    @property
++    def release_cache_size(self) -> int:
++        """Get the number of blocks in the release cache."""
++        return self._release_cache.num_blocks
++
++    def force_merge(self) -> int:
++        """Force merge all blocks from release cache to free pool.
++
++        This is useful for scenarios like KV offload where we want to
++        consolidate all free blocks for efficient batch transfer.
++
++        Returns:
++            The number of blocks merged.
++        """
++        return self.merge_release_cache()
++
++    def get_contiguous_free_ranges(self) -> list[tuple[int, int]]:
++        """Get ranges of contiguous free block IDs.
++
++        This is useful for KV offload operations to identify contiguous
++        memory regions that can be transferred efficiently.
++
++        Returns:
++            A list of (start_block_id, length) tuples representing
++            contiguous ranges of free blocks.
++        """
++        # First merge any pending releases to get accurate picture
++        self.merge_release_cache()
++
++        free_blocks = self.get_all_free_blocks()
++        if not free_blocks:
++            return []
++
++        # Sort by block_id
++        free_blocks.sort(key=lambda b: b.block_id)
++
++        ranges: list[tuple[int, int]] = []
++        range_start = free_blocks[0].block_id
++        prev_id = range_start
++
++        for block in free_blocks[1:]:
++            if block.block_id == prev_id + 1:
++                # Continue the current range
++                prev_id = block.block_id
++            else:
++                # End the current range and start a new one
++                ranges.append((range_start, prev_id - range_start + 1))
++                range_start = block.block_id
++                prev_id = range_start
++
++        # Don't forget the last range
++        ranges.append((range_start, prev_id - range_start + 1))
++
++        return ranges
++
+ 
+ def need_extra_keys(request: Request) -> bool:
+     """Check whether the blocks allocated to this request need extra hash keys.
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 2aa04c911..c49b8e1a2 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -209,6 +209,8 @@ class Scheduler(SchedulerInterface):
+             pcp_world_size=self.pcp_world_size,
+             hash_block_size=self.block_size,
+             metrics_collector=self.kv_metrics_collector,
++            enable_deferred_release=self.cache_config.enable_deferred_release,
++            enable_coalescing=self.cache_config.enable_block_coalescing,
+         )
+         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
