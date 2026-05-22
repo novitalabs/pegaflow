@@ -891,6 +891,7 @@ cache off 的阶段性结果：
 | PD push，scheduler 直接触发 P prefill | 1373.0 ms | 去掉 scheduler→rank0 worker 派发等待；D fan-in 仍约 149 ms |
 | PD push，cached compact handshake | 1307.7 ms | handshake JSON 序列化约 0.33 ms；dispatch→HTTP 发起约 0.44 ms |
 | PD push，细分 timing 埋点后复测 | 1181.8 ms | `trace-30k-994e577`；仍未超过 NIXL，主要剩 P chunk 调度和 D fan-in |
+| PD push，`max_num_batched_tokens=32768` | 590.6 ms | `trace-30k-maxtok-32768`；P 端 30k prefill 从 4 chunk 变 1 chunk |
 
 当前 RDMA 写本身已不再是主瓶颈：P 端单层每 rank 2.7-4.2 MiB range WRITE 通常
 0.02-0.10 ms，单层日志带宽多在数百 Gbps 到 1 Tbps 以上。`trace-30k-994e577`
@@ -919,8 +920,13 @@ WRITE/IMM path 已经够快，TTFT 大头在 vLLM 和控制面。
 所以当前剩余差距主要是两块：第一，P 侧 30k prompt 被 vLLM chunked prefill 拆成
 4 个 chunk，每个 chunk 之间有明显 scheduler/worker 间隔，request forward span 约
 642 ms；第二，D 侧 TP8 handshake 从 worker export 到 scheduler dispatch 约 163 ms。
-下一轮优先验证 `--max-num-batched-tokens 32768` 是否能把 30k prefill 压成单 chunk，
-再看是否需要绕开 worker metadata fan-in 做更直接的 D-side rank aggregation。
+
+把 P/D 都显式设成 `--max-num-batched-tokens 32768` 后，`trace-30k-maxtok-32768`
+变成单 chunk：TTFT 590.6 ms，P 端 `chunks=1`，`request_forward_ms` 约 58-61 ms，
+`kv_submit_ms` 约 9 ms，`rdma_bytes=552960000`，`first_save_to_imm_ms` 约 71-74 ms。
+D 侧 handshake fan-in 仍约 138.6 ms，是下一块控制面开销。这个结果已经低于当前记录的
+NIXL 1045.9 ms，但 scheduler 配置不同；最终结论前要用同样的
+`max_num_batched_tokens=32768` 重新跑 Direct P 和 NIXL baseline。
 
 当前 P 端日志会把每个 chunk 的 `first save_kv_layer`、chunk/request forward span、
 chunk/request KV submit 累计耗时、observed GB/s、finalizer drain/IMM 耗时拆开打印；
