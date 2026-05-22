@@ -890,17 +890,42 @@ cache off 的阶段性结果：
 | PD push，worker 直接生成 range | 1475.4 ms | 30k 最后一段每层每 rank `blocks=339 ranges=1` |
 | PD push，scheduler 直接触发 P prefill | 1373.0 ms | 去掉 scheduler→rank0 worker 派发等待；D fan-in 仍约 149 ms |
 | PD push，cached compact handshake | 1307.7 ms | handshake JSON 序列化约 0.33 ms；dispatch→HTTP 发起约 0.44 ms |
+| PD push，细分 timing 埋点后复测 | 1181.8 ms | `trace-30k-994e577`；仍未超过 NIXL，主要剩 P chunk 调度和 D fan-in |
 
 当前 RDMA 写本身已不再是主瓶颈：P 端单层每 rank 2.7-4.2 MiB range WRITE 通常
-0.03-0.10 ms，日志带宽多在数百 Gbps 量级。剩余差距主要在 P/D 调度、chunked
-prefill 多 step、D 聚合 handshake 后触发 P prefill 的控制面延迟，以及长上下文
-slot_mapping/JSON 路径。当前 P 端日志会把每个 chunk 的 `first save_kv_layer`、
-chunk/request forward span、chunk/request KV submit 累计耗时、finalizer drain/IMM 耗时
-拆开打印；D 端日志会打印 scheduler wait、handshake fan-in dispatch、D→P HTTP payload
-和 IMM done 时间戳。`trace-30k-compact` 中 D 端 handshake fan-in 约 152.2 ms，D scheduler
-提交 dispatch 到真正发起 D→P HTTP 约 0.44 ms，handshake 序列化约 0.33 ms；P 端 4 个
-chunk 的 layer-wise RDMA submit 每 chunk 约 3 ms，最后一段从最后一层 save 到 IMM 约
-2.1-2.5 ms。
+0.02-0.10 ms，单层日志带宽多在数百 Gbps 到 1 Tbps 以上。`trace-30k-994e577`
+里每 rank 总共推 4 个 chunk × 36 层，累计 RDMA bytes 约 552.96 MiB；最后一层
+save 到 IMM 约 2.2-2.5 ms，`last_save_to_imm_gbps` 约 1.7-2.0 Tbps。这说明
+WRITE/IMM path 已经够快，TTFT 大头在 vLLM 和控制面。
+
+`trace-30k-994e577` 的关键分段：
+
+| 分段 | 时间 | 备注 |
+| --- | ---: | --- |
+| proxy accepted → D stream headers | 40.6 ms | D API 先返回 streaming header |
+| D scheduler wait → worker handshakes ready/exported | 80-84 ms | D workers 构造 remote MR layout |
+| D scheduler wait → dispatch submit | 163.0 ms | TP8 handshake fan-in 到 scheduler；这里仍偏大 |
+| dispatch submit → D→P HTTP 发起 | 0.25 ms | 已不是问题 |
+| handshake/payload 序列化 | 0.45 ms | compact layout 后 payload 约 273 KiB |
+| D→P HTTP 发起 → P scheduler push | 10.2 ms | P API + scheduler 入口 |
+| P scheduler push → worker queued first chunk | 264 ms | P 端 producer request 进入 worker 的控制面间隔最大 |
+| P first queued chunk → first `save_kv_layer` | 11 ms | 可接受 |
+| P 4 个 chunk request forward span | 641-647 ms | chunked prefill 的主要计算/调度段 |
+| P per-chunk layer-wise RDMA submit | 3.0-3.8 ms/chunk | 144 次 layer submit 总计约 14 ms/rank |
+| P final chunk last save → IMM | 2.2-2.5 ms | RDMA drain + IMM |
+| D RDMA done → scheduler finished recving | <1 ms | IMM 进 scheduler 很快 |
+| scheduler finished recving → proxy first stream chunk | 33 ms | D 继续 decode 并吐首 token |
+
+所以当前剩余差距主要是两块：第一，P 侧 30k prompt 被 vLLM chunked prefill 拆成
+4 个 chunk，每个 chunk 之间有明显 scheduler/worker 间隔，request forward span 约
+642 ms；第二，D 侧 TP8 handshake 从 worker export 到 scheduler dispatch 约 163 ms。
+下一轮优先验证 `--max-num-batched-tokens 32768` 是否能把 30k prefill 压成单 chunk，
+再看是否需要绕开 worker metadata fan-in 做更直接的 D-side rank aggregation。
+
+当前 P 端日志会把每个 chunk 的 `first save_kv_layer`、chunk/request forward span、
+chunk/request KV submit 累计耗时、observed GB/s、finalizer drain/IMM 耗时拆开打印；
+D 端日志会打印 scheduler wait、worker handshake ready/export、handshake fan-in
+dispatch、D→P HTTP payload、IMM done 和 scheduler finished recving 时间戳。
 MLA layout 仍未支持：Kimi 等模型的 KV cache 不是当前的 FlashAttention 5D HND layout，
 现在会被 connector assert 拦下。后续要把 MLA 作为一等 layout 接入，而不是依赖 HND fallback。
 
