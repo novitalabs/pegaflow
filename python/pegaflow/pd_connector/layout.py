@@ -160,11 +160,7 @@ class FlashAttnHndLayout:
 
 def unique_blocks_from_slot_mapping(slot_mapping: Any, block_size: int) -> set[int]:
     """Extract touched KV block ids from vLLM attention metadata slot_mapping."""
-    if hasattr(slot_mapping, "detach"):
-        slot_mapping = slot_mapping.detach()
-    if hasattr(slot_mapping, "cpu"):
-        slot_mapping = slot_mapping.cpu()
-    slots = slot_mapping.tolist() if hasattr(slot_mapping, "tolist") else list(slot_mapping)
+    slots = slot_mapping.detach().cpu().tolist()
     return {int(slot) // block_size for slot in slots if int(slot) >= 0}
 
 

@@ -23,7 +23,7 @@ class RdmaPort(Protocol):
         self, layers: tuple[LayerRemoteLayout, ...]
     ) -> tuple[LayerRemoteLayout, ...]: ...
 
-    def register_remote(self, req_id: str, handshake: PdHandshake | None = None) -> None: ...
+    def open_request(self, req_id: str, handshake: PdHandshake) -> None: ...
 
     def push_layer(
         self,
@@ -66,7 +66,7 @@ class MockRdmaPort:
         self.local_layers = layers
         return layers
 
-    def register_remote(self, req_id: str, handshake: PdHandshake | None = None) -> None:
+    def open_request(self, req_id: str, handshake: PdHandshake) -> None:
         self.registered.add(req_id)
         self.remote_handshakes[req_id] = handshake
 
@@ -208,11 +208,8 @@ def _layer_from_native(
     )
 
 
-def _handshake_to_native(handshake: PdHandshake | None) -> dict[str, Any] | None:
-    if handshake is None:
-        return None
+def _handshake_to_native(handshake: PdHandshake) -> dict[str, Any]:
     data = handshake_to_dict(handshake)
-    assert data is not None
     data["layers"] = [_layer_to_native(layer) for layer in handshake.layers]
     return data
 
@@ -250,7 +247,7 @@ class RealRdmaPort:
             for original, layer in zip(layers, registered, strict=True)
         )
 
-    def register_remote(self, req_id: str, handshake: PdHandshake | None = None) -> None:
+    def open_request(self, req_id: str, handshake: PdHandshake) -> None:
         self.engine.register_remote(req_id, _handshake_to_native(handshake))
 
     def push_layer(
@@ -366,12 +363,6 @@ def _as_bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
-
-
-def _optional_int(value: Any) -> int | None:
-    if value is None or value == "":
-        return None
-    return int(value)
 
 
 @dataclass(frozen=True)

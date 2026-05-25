@@ -16,6 +16,7 @@ from vllm.distributed.parallel_state import (
 
 from pegaflow.logging_utils import get_connector_logger
 from pegaflow.pd_connector.chunk_tracker import ChunkTracker
+from pegaflow.pd_connector.kv_params import ProducerKvParams
 from pegaflow.pd_connector.layout import (
     BlockSlice,
     FlashAttnHndLayout,
@@ -26,20 +27,12 @@ from pegaflow.pd_connector.metadata import (
     LayerRemoteLayout,
     PdConnectorMetadata,
     PdHandshake,
-    PdPrefillRequest,
     PdWorkerMetadata,
-    PeerLayerMr,
-    PeerMrRegistration,
     PushReqMeta,
     WaitReqMeta,
     flatten_block_ids,
 )
-from pegaflow.pd_connector.oob import InMemoryOobPort
-from pegaflow.pd_connector.prefill import (
-    AsyncPrefillSender,
-    prefill_task_from_dispatch,
-    producer_params,
-)
+from pegaflow.pd_connector.prefill import AsyncPrefillSender, PrefillHttpTask
 from pegaflow.pd_connector.rdma import RdmaPort, build_rdma_port
 
 logger = get_connector_logger()
@@ -51,16 +44,12 @@ class PdWorkerConnector:
         self,
         vllm_config: Any,
         rdma: RdmaPort | None = None,
-        oob: InMemoryOobPort | None = None,
         prefill_sender: Any | None = None,
     ) -> None:
         self.vllm_config = vllm_config
         self.rdma = rdma
         self._rdma_is_injected = rdma is not None
-        self.oob = oob or InMemoryOobPort()
-        self.engine_id = (
-            getattr(getattr(vllm_config, "kv_transfer_config", None), "engine_id", None) or ""
-        )
+        self.engine_id = getattr(vllm_config.kv_transfer_config, "engine_id", None) or ""
         self.tp_rank, self.tp_size = _tensor_parallel_identity(vllm_config)
         logger.info(
             "[PdConnector] worker initialized engine=%s tp_rank=%d tp_size=%d",
@@ -75,7 +64,8 @@ class PdWorkerConnector:
         self._push_reqs: dict[str, PushReqMeta] = {}
         self._pending_push_chunks: set[str] = set()
         self._push_chunk_maps: dict[str, tuple[dict[int, int], bool]] = {}
-        self._pending_worker_handshakes: dict[str, PdHandshake] = {}
+        self._peer_layouts: dict[int, dict[str, FlashAttnHndLayout]] = {}
+        self._peer_mr_descs: dict[int, dict[str, Any]] = {}
         self._tracker = ChunkTracker()
         self._failed_blocks: set[int] = set()
         self._completed_pushes: set[str] = set()
@@ -85,8 +75,6 @@ class PdWorkerConnector:
         self._slot_mapping_block_cache: OrderedDict[tuple[Any, ...], set[int]] = OrderedDict()
         self._forward_step_id = 0
         self._next_imm_id = 1
-        self._mr_registration: PeerMrRegistration | None = None
-        self._mr_registration_exported = False
         self._push_sender = _AsyncLayerPushSender()
         self._push_finalizer = _AsyncPushFinalizer(self._push_sender)
         self._rdma_waiter = _AsyncRdmaDoneWaiter(self.rdma) if self.rdma is not None else None
@@ -113,10 +101,11 @@ class PdWorkerConnector:
             )
         )
         self._registered_layers = {layer.layer_name: layer for layer in registered_layers}
-        self._mr_registration = self._build_mr_registration()
+        self._gather_peer_info()
         logger.info(
-            "[PdConnector] registered %d FlashAttention HND KV cache layers",
+            "[PdConnector] registered %d FlashAttention HND KV cache layers, gathered %d peer ranks",
             len(self.layouts),
+            len(self._peer_layouts),
         )
 
     def start_load_kv(
@@ -146,64 +135,30 @@ class PdWorkerConnector:
                 req.done_request_id,
                 flatten_block_ids(req.local_block_ids),
             )
-            self.oob.publish_prefill_request(
-                PdPrefillRequest(
-                    request_id=req.remote_request_id,
-                    prompt_token_ids=req.prompt_token_ids,
-                    producer_kv_transfer_params=producer_params(
-                        target_engine_id=self.engine_id,
-                        target_request_id=req.done_request_id,
-                        handshake=handshake,
-                    ),
-                    handshake=handshake,
-                )
-            )
-            self.rdma.register_remote(req_id, handshake)
+            self.rdma.open_request(req_id, handshake)
             self._rdma_waiter.submit(req_id)
-            if req.prefill_url:
-                self._pending_worker_handshakes[req_id] = handshake
-                logger.info(
-                    "[PdConnector] D worker handshake ready req=%s remote_req=%s rank=%d blocks=%d layers=%d ts_ns=%d",
-                    req_id,
-                    req.remote_request_id,
-                    self.tp_rank,
-                    len(flatten_block_ids(req.local_block_ids)),
-                    len(handshake.layers),
-                    time.time_ns(),
-                )
             logger.info(
-                "[PdConnector] D queued async wait req=%s remote_req=%s prefill_url=%s ts_ns=%d",
+                "[PdConnector] D queued async wait req=%s remote_req=%s prefill_url=%s rank=%d blocks=%d ts_ns=%d",
                 req_id,
                 req.remote_request_id,
                 req.prefill_url or "<oob>",
+                self.tp_rank,
+                len(flatten_block_ids(req.local_block_ids)),
                 time.time_ns(),
             )
-
-        for req_id, dispatch in metadata.prefill_dispatches.items():
-            if self.tp_rank != 0:
-                continue
-            self._prefill_sender.submit(prefill_task_from_dispatch(dispatch))
-            logger.info(
-                "[PdConnector] D rank0 submitted prefill dispatch req=%s remote_req=%s ranks=%s",
-                req_id,
-                dispatch.request_id,
-                [handshake.tp_rank for handshake in dispatch.handshakes],
-            )
+            if req.prefill_url and self.tp_rank == 0:
+                self._dispatch_prefill(req, handshake.imm_id)
 
         for req_id, req in metadata.reqs_to_push.items():
             self._tracker.add_request(req_id)
-            prefill_request = self.oob.get_prefill_request(req.target_request_id)
             handshake = self._select_push_handshake(req)
-            if handshake is None and prefill_request is not None:
-                handshake = prefill_request.handshake
-                req = replace(req, handshake=handshake)
             self._push_reqs[req_id] = req
             trace = self._push_traces.setdefault(req_id, _PushTrace(queued_ts_ns=time.time_ns()))
             queued_ts_ns = time.time_ns()
             trace.chunk_queued_ts_ns = queued_ts_ns
             self._pending_push_chunks.add(req_id)
             self._push_chunk_maps.pop(req_id, None)
-            self.rdma.register_remote(req_id, handshake)
+            self.rdma.open_request(req_id, handshake)
             logger.info(
                 "[PdConnector] P queued async push req=%s target_req=%s rank=%d blocks=%d layers=%d ts_ns=%d",
                 req_id,
@@ -222,12 +177,9 @@ class PdWorkerConnector:
             self._push_reqs.pop(req_id, None)
             self._pending_push_chunks.discard(req_id)
             self._push_chunk_maps.pop(req_id, None)
-            self._pending_worker_handshakes.pop(req_id, None)
             self._push_traces.pop(req_id, None)
             self._tracker.remove(req_id)
-            close_request = getattr(self.rdma, "close_request", None)
-            if close_request is not None:
-                close_request(req_id)
+            self.rdma.close_request(req_id)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         assert layer_name in self.layouts, (
@@ -255,13 +207,7 @@ class PdWorkerConnector:
         )
         if not self._push_reqs:
             return
-        slot_mapping = getattr(attn_metadata, "slot_mapping", None)
-        if slot_mapping is None:
-            logger.warning(
-                "[PdConnector] P save skipped layer=%s because attn_metadata has no slot_mapping",
-                layer_name,
-            )
-            return
+        slot_mapping = attn_metadata.slot_mapping
         touched_blocks = self._cached_unique_blocks_from_slot_mapping(
             slot_mapping,
             layout.block_size,
@@ -305,9 +251,7 @@ class PdWorkerConnector:
             }
         for req_id in finished_recving:
             self._wait_reqs.pop(req_id, None)
-            close_request = getattr(self.rdma, "close_request", None)
-            if close_request is not None:
-                close_request(req_id)
+            self.rdma.close_request(req_id)
         logger.debug(
             "[PdConnector] worker get_finished exit sending=%s recving=%s remaining_wait=%s remaining_push=%s",
             sorted(releasable_sending),
@@ -323,31 +267,7 @@ class PdWorkerConnector:
         return failed
 
     def build_connector_worker_meta(self) -> PdWorkerMetadata | None:
-        mr_registrations: dict[int, PeerMrRegistration] = {}
-        if self._mr_registration is not None and not self._mr_registration_exported:
-            mr_registrations[self.tp_rank] = self._mr_registration
-            self._mr_registration_exported = True
-            logger.info(
-                "[PdConnector] D worker MR registration exported rank=%d layers=%d ts_ns=%d",
-                self.tp_rank,
-                len(self._mr_registration.layers),
-                time.time_ns(),
-            )
-        if not self._pending_worker_handshakes and not mr_registrations:
-            return None
-        handshakes = {
-            req_id: {handshake.tp_rank: handshake}
-            for req_id, handshake in self._pending_worker_handshakes.items()
-        }
-        if handshakes:
-            logger.info(
-                "[PdConnector] D worker handshakes exported rank=%d reqs=%s ts_ns=%d",
-                self.tp_rank,
-                sorted(handshakes),
-                time.time_ns(),
-            )
-        self._pending_worker_handshakes = {}
-        return PdWorkerMetadata(handshakes=handshakes, mr_registrations=mr_registrations)
+        return None
 
     def shutdown(self) -> None:
         self._wait_reqs.clear()
@@ -357,7 +277,6 @@ class PdWorkerConnector:
         self._slot_mapping_block_cache.clear()
         self._completed_pushes.clear()
         self._producer_finished_req_ids.clear()
-        self._pending_worker_handshakes.clear()
         self._remote_block_offsets.clear()
         self._push_traces.clear()
         self._push_finalizer.close()
@@ -411,7 +330,6 @@ class PdWorkerConnector:
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
             block_size=next(iter(self.layouts.values())).block_size,
-            kv_layout="HND",
             layers=tuple(
                 self._remote_layout_with_mr_desc(layer_name, layer_idx, block_ids)
                 for layer_idx, layer_name in enumerate(self.layer_names)
@@ -419,31 +337,84 @@ class PdWorkerConnector:
             imm_id=imm_id,
         )
 
-    def _build_mr_registration(self) -> PeerMrRegistration:
-        first_layout = next(iter(self.layouts.values()))
-        layers: list[PeerLayerMr] = []
-        for layer_idx, layer_name in enumerate(self.layer_names):
-            layout = self.layouts[layer_name]
-            registered = self._registered_layers.get(layer_name)
-            layers.append(
-                PeerLayerMr(
-                    layer_name=layout.layer_name,
-                    layer_idx=layer_idx,
-                    base_addr=layout.base_addr,
-                    kv_stride_bytes=layout.strides[0] * layout.element_size,
-                    block_stride_bytes=layout.strides[1] * layout.element_size,
-                    block_bytes=layout.block_bytes,
-                    mr_desc=registered.mr_desc if registered is not None else None,
+    def _gather_peer_info(self) -> None:
+        mr_descs = {name: layer.mr_desc for name, layer in self._registered_layers.items()}
+        if self.tp_size <= 1:
+            self._peer_layouts = {0: self.layouts}
+            self._peer_mr_descs = {0: mr_descs}
+            return
+        try:
+            gathered = _all_gather_peer_info(self.layouts, mr_descs, self.tp_size)
+        except Exception:
+            logger.warning(
+                "[PdConnector] all_gather_object unavailable, rank 0 dispatch limited to local rank",
+            )
+            self._peer_layouts = {self.tp_rank: self.layouts}
+            self._peer_mr_descs = {self.tp_rank: mr_descs}
+            return
+        for rank, (layouts, descs) in enumerate(gathered):
+            self._peer_layouts[rank] = layouts
+            self._peer_mr_descs[rank] = descs
+
+    def _dispatch_prefill(self, req: WaitReqMeta, imm_id: int) -> None:
+        block_ids = flatten_block_ids(req.local_block_ids)
+        all_handshakes = self._build_all_rank_handshakes(
+            req.done_request_id,
+            block_ids,
+            imm_id,
+        )
+        params = ProducerKvParams(
+            target_engine_id=self.engine_id,
+            target_request_id=req.done_request_id,
+            handshakes=all_handshakes,
+        )
+        task = PrefillHttpTask(
+            request_id=req.remote_request_id,
+            prefill_url=req.prefill_url,
+            model=req.model,
+            prompt_token_ids=req.prompt_token_ids,
+            max_tokens=req.prefill_max_tokens,
+            kv_transfer_params=params.to_dict(),
+        )
+        self._prefill_sender.submit(task)
+        logger.info(
+            "[PdConnector] D rank0 dispatched prefill req=%s remote_req=%s ranks=%d ts_ns=%d",
+            req.remote_request_id,
+            req.done_request_id,
+            len(all_handshakes),
+            time.time_ns(),
+        )
+
+    def _build_all_rank_handshakes(
+        self,
+        req_id: str,
+        block_ids: set[int],
+        imm_id: int,
+    ) -> tuple[PdHandshake, ...]:
+        result = []
+        block_size = next(iter(self.layouts.values())).block_size
+        for rank in range(self.tp_size):
+            peer_layouts = self._peer_layouts[rank]
+            peer_mr_descs = self._peer_mr_descs[rank]
+            layers = tuple(
+                replace(
+                    peer_layouts[name].remote_layout(layer_idx, block_ids),
+                    mr_desc=peer_mr_descs.get(name),
+                )
+                for layer_idx, name in enumerate(self.layer_names)
+            )
+            result.append(
+                PdHandshake(
+                    request_id=req_id,
+                    engine_id=self.engine_id,
+                    tp_rank=rank,
+                    tp_size=self.tp_size,
+                    block_size=block_size,
+                    layers=layers,
+                    imm_id=imm_id,
                 )
             )
-        return PeerMrRegistration(
-            engine_id=self.engine_id,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
-            block_size=first_layout.block_size,
-            kv_layout="HND",
-            layers=tuple(layers),
-        )
+        return tuple(result)
 
     def _alloc_imm_id(self) -> int:
         imm_id = self._next_imm_id
@@ -622,11 +593,10 @@ class PdWorkerConnector:
             )
         )
 
-    def _select_push_handshake(self, req: PushReqMeta) -> PdHandshake | None:
-        if req.handshake is not None:
-            return req.handshake
-        if not req.handshakes:
-            return None
+    def _select_push_handshake(self, req: PushReqMeta) -> PdHandshake:
+        assert req.handshakes, (
+            f"PdConnector push request has no handshakes; target_req={req.target_request_id}"
+        )
         for handshake in req.handshakes:
             if handshake.tp_rank == self.tp_rank:
                 return handshake
@@ -642,7 +612,7 @@ class PdWorkerConnector:
         local_block_ids: set[int],
     ) -> tuple[dict[int, int], bool]:
         handshake = self._select_push_handshake(req)
-        if handshake is None or not handshake.layers:
+        if not handshake.layers:
             return {block_id: block_id for block_id in local_block_ids}, True
         remote_block_ids = handshake.layers[0].block_ids
         for layer in handshake.layers[1:]:
@@ -666,34 +636,6 @@ class PdWorkerConnector:
         self._remote_block_offsets[req_id] = next_offset
         return dict(zip(ordered_local, remote_chunk, strict=True)), next_offset == len(
             remote_block_ids
-        )
-
-    def _has_pushed_all_remote_blocks(
-        self,
-        req_id: str,
-        req: PushReqMeta,
-        local_block_ids: set[int],
-    ) -> bool:
-        handshake = self._select_push_handshake(req)
-        if handshake is None or not handshake.layers:
-            return self._tracker.has_pushed_all_blocks(
-                req_id,
-                local_block_ids,
-                num_layers=len(self.layer_names),
-            )
-        return self._remote_block_offsets.get(req_id, 0) >= len(handshake.layers[0].block_ids)
-
-    @staticmethod
-    def _block_slices_for_remote_write(
-        layout: FlashAttnHndLayout,
-        *,
-        local_block_id: int,
-        remote_block_id: int,
-    ) -> LayerBlockSlices:
-        local = layout.block_slices(local_block_id)
-        return LayerBlockSlices(
-            k=replace(local.k, block_id=remote_block_id),
-            v=replace(local.v, block_id=remote_block_id),
         )
 
     @staticmethod
@@ -779,18 +721,12 @@ class PdWorkerConnector:
 
 
 def _slot_mapping_cache_key(slot_mapping: Any, block_size: int) -> tuple[Any, ...]:
-    data_ptr = getattr(slot_mapping, "data_ptr", None)
-    if callable(data_ptr):
-        numel = getattr(slot_mapping, "numel", None)
-        shape = getattr(slot_mapping, "shape", ())
-        return (
-            "tensor",
-            int(data_ptr()),
-            int(numel()) if callable(numel) else None,
-            tuple(int(dim) for dim in shape),
-            block_size,
-        )
-    return ("object", id(slot_mapping), block_size)
+    return (
+        int(slot_mapping.data_ptr()),
+        int(slot_mapping.numel()),
+        tuple(int(dim) for dim in slot_mapping.shape),
+        block_size,
+    )
 
 
 def _elapsed_ms(start_ts_ns: int | None, end_ts_ns: int | None) -> float:
@@ -1082,3 +1018,15 @@ def _tensor_parallel_identity(vllm_config: Any) -> tuple[int, int]:
             int(getattr(parallel_config, "tensor_parallel_rank", 0) or 0),
             int(getattr(parallel_config, "tensor_parallel_size", 1) or 1),
         )
+
+
+def _all_gather_peer_info(
+    layouts: dict[str, FlashAttnHndLayout],
+    mr_descs: dict[str, Any],
+    tp_size: int,
+) -> list[tuple[dict[str, FlashAttnHndLayout], dict[str, Any]]]:
+    import torch.distributed as dist
+
+    gathered: list[tuple[dict[str, FlashAttnHndLayout], dict[str, Any]] | None] = [None] * tp_size
+    dist.all_gather_object(gathered, (layouts, mr_descs))
+    return gathered  # type: ignore[return-value]

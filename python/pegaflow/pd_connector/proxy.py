@@ -22,6 +22,8 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from pegaflow.pd_connector.kv_params import ConsumerKvParams
+
 logger = logging.getLogger("pegaflow.pd_proxy")
 
 
@@ -54,15 +56,11 @@ def build_pd_proxy_request(
     decode_body = copy.deepcopy(body)
 
     decode_body["request_id"] = decode_req_id
-    decode_body["kv_transfer_params"] = {
-        "do_remote_prefill": True,
-        "model": str(body.get("model", "")),
-        "prefill_url": config.prefill_url,
-        "prefill_max_tokens": int(body.get("pd_prefill_max_tokens", config.prefill_max_tokens)),
-        "remote_engine_id": "prefill",
-        "remote_request_id": prefill_req_id,
-        "done_request_id": decode_req_id,
-    }
+    decode_body["kv_transfer_params"] = ConsumerKvParams(
+        prefill_url=config.prefill_url,
+        remote_request_id=prefill_req_id,
+        done_request_id=decode_req_id,
+    ).to_dict()
 
     return PdProxyRequest(
         request_id=req_id,

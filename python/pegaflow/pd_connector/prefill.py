@@ -12,11 +12,6 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from pegaflow.logging_utils import get_connector_logger
-from pegaflow.pd_connector.metadata import (
-    PdHandshake,
-    PrefillDispatch,
-    handshake_to_dict,
-)
 
 logger = get_connector_logger()
 
@@ -52,37 +47,6 @@ class AsyncPrefillSender:
                 post_prefill_request(task)
             finally:
                 self._queue.task_done()
-
-
-def prefill_task_from_dispatch(dispatch: PrefillDispatch) -> PrefillHttpTask:
-    params = producer_params(
-        dispatch.target_engine_id,
-        dispatch.target_request_id,
-    )
-    params["pd_handshakes"] = [handshake_to_dict(handshake) for handshake in dispatch.handshakes]
-    return PrefillHttpTask(
-        request_id=dispatch.request_id,
-        prefill_url=dispatch.prefill_url,
-        model=dispatch.model,
-        prompt_token_ids=dispatch.prompt_token_ids,
-        max_tokens=dispatch.max_tokens,
-        kv_transfer_params=params,
-    )
-
-
-def producer_params(
-    target_engine_id: str,
-    target_request_id: str,
-    handshake: PdHandshake | None = None,
-) -> dict[str, Any]:
-    params: dict[str, Any] = {
-        "do_remote_prefill_sender": True,
-        "target_engine_id": target_engine_id,
-        "target_request_id": target_request_id,
-    }
-    if handshake is not None:
-        params["pd_handshake"] = handshake_to_dict(handshake)
-    return params
 
 
 def post_prefill_request(task: PrefillHttpTask) -> None:
