@@ -98,7 +98,14 @@ class PrefillHandler:
         )
         if not touched_blocks:
             return
-        self._push_touched_blocks(layer_name, touched_blocks)
+        import torch
+
+        if torch.cuda.is_available():
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream())
+        else:
+            event = None
+        self._push_touched_blocks(layer_name, touched_blocks, event)
 
     def wait_for_save(self) -> None:
         logger.debug(
@@ -163,7 +170,7 @@ class PrefillHandler:
         )
         return blocks
 
-    def _push_touched_blocks(self, layer_name: str, touched_blocks: set[int]) -> None:
+    def _push_touched_blocks(self, layer_name: str, touched_blocks: set[int], event: Any) -> None:
         layer_idx = self._w._layer_idx(layer_name)
         layout = self._w.layouts[layer_name]
         for req_id, req in list(self._push_reqs.items()):
@@ -210,6 +217,7 @@ class PrefillHandler:
                     req_id=req_id,
                     layer_idx=layer_idx,
                     block_slices=block_slices,
+                    event=event,
                 )
             )
             trace.rdma_bytes += rdma_bytes
@@ -335,6 +343,7 @@ class _LayerPushTask:
     req_id: str
     layer_idx: int
     block_slices: list[LayerBlockSlices]
+    event: Any = None
 
 
 @dataclass
@@ -427,6 +436,8 @@ class _AsyncLayerPushSender:
 
 
 def _run_layer_push(task: _LayerPushTask) -> None:
+    if task.event is not None:
+        task.event.synchronize()
     task.rdma.push_layer(task.req_id, task.layer_idx, task.block_slices)
 
 
