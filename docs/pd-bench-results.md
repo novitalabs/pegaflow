@@ -2,8 +2,8 @@
 
 ## Setup
 
-- Machine: h20-99 (NVIDIA H20-3e)
-- Model: Qwen3-8B (`/data/models/Qwen3-8B`)
+- Machine: single node, NVIDIA H20 (SXM, 96GB)
+- Model: Qwen3-8B
 - vLLM: 0.19.1
 - Branch: `refactor/pd-handshake-simplify`
 - Config: TP=1, bs=1, output_len=1, seed=42

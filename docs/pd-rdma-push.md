@@ -476,7 +476,7 @@ pegainfer 的 `pegainfer-comm-fabric-lib` 是 pplx-garden 的另一份 vendor。
 > ⚠️ 以下数据**不能**直接对比。各行使用了不同的 `max_num_batched_tokens` 和
 > vLLM scheduler 配置，仅用于观察优化方向。正式结论前需要统一配置重跑所有 baseline。
 
-条件：Qwen3-8B / 30k prompt / TP8 / prefix cache off / h20-99 P + h20-97 D
+条件：Qwen3-8B / 30k prompt / TP8 / prefix cache off / 2-node H20 (P + D)
 
 | 路径 | TTFT | 配置差异 |
 | --- | ---: | --- |
