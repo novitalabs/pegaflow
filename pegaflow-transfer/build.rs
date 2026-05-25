@@ -75,8 +75,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("cargo:rerun-if-changed=build_wrappers/libibverbs.h");
 
-    if env::var("CARGO_FEATURE_V2_RDMA").is_ok() {
-        build_libibverbs(&out_dir, &manifest)?;
-    }
+    build_libibverbs(&out_dir, &manifest)?;
     Ok(())
 }

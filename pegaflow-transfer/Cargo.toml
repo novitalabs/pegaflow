@@ -9,7 +9,6 @@ workspace = true
 [features]
 default = ["cudarc/cuda-12080"]
 cuda-13 = ["cudarc/cuda-13000"]
-v2-rdma = []
 
 [dependencies]
 parking_lot.workspace = true
@@ -47,4 +46,3 @@ path = "src/bin/cpu_bench.rs"
 [[bin]]
 name = "pegaflow-cpu-bench-v2"
 path = "src/bin/cpu_bench_v2.rs"
-required-features = ["v2-rdma"]
