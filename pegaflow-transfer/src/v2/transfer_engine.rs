@@ -90,10 +90,10 @@ impl TransferEngine {
 
         let thread = {
             let thread_engine = engine.clone();
-            let thread_calbacks = callbacks.clone();
+            let thread_callbacks = callbacks.clone();
             std::thread::Builder::new()
                 .name("tx_engine_callback".to_string())
-                .spawn(move || callback_worker_thread(thread_engine, thread_calbacks))
+                .spawn(move || callback_worker_thread(thread_engine, thread_callbacks))
                 .map_err(|_| FabricLibError::Custom("failed to launch callback worker thread"))
         }?;
 
