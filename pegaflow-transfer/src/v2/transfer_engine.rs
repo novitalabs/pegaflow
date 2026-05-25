@@ -9,7 +9,7 @@ use std::{
     thread::JoinHandle,
 };
 
-use crate::cuda_lib::{Device, gdr::GdrFlag};
+use crate::cuda_lib::Device;
 use dashmap::DashMap;
 use log::{error, warn};
 use parking_lot::Mutex;
@@ -20,9 +20,9 @@ use crate::v2::{
     ErrorCallback, FabricLibError, RdmaEngine, RecvCallback, SendBuffer, SendCallback,
     SendRecvEngine,
     api::{
-        DomainAddress, GdrCounter, ImmCounter, MemoryRegionDescriptor, MemoryRegionHandle,
-        PeerGroupHandle, SmallVec, TransferCompletionEntry, TransferCounter, TransferId,
-        TransferRequest, UvmWatcherId,
+        DomainAddress, ImmCounter, MemoryRegionDescriptor, MemoryRegionHandle, PeerGroupHandle,
+        SmallVec, TransferCompletionEntry, TransferCounter, TransferId, TransferRequest,
+        UvmWatcherId,
     },
     error::Result,
     fabric_engine::FabricEngine,
@@ -140,10 +140,6 @@ impl TransferEngine {
 
     pub fn get_imm_counter(&self, imm: u32) -> ImmCounter {
         self.engine.get_imm_counter(imm)
-    }
-
-    pub(crate) fn get_gdr_counter(&self, imm: u32, flag: Arc<GdrFlag>) -> GdrCounter {
-        self.engine.get_gdr_counter(imm, flag)
     }
 
     pub fn add_peer_group(

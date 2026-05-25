@@ -11,7 +11,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::cuda_lib::gdr::GdrFlag;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
@@ -239,26 +238,6 @@ impl ImmCounter {
             std::hint::spin_loop();
         }
         true
-    }
-}
-
-/// An immediate counter that sets a flag via GdrCopy.
-#[derive(Clone)]
-pub struct GdrCounter {
-    counter: Arc<AtomicI64>,
-    flag: Arc<GdrFlag>,
-}
-
-impl GdrCounter {
-    pub fn new(counter: Arc<AtomicI64>, flag: Arc<GdrFlag>) -> Self {
-        Self { counter, flag }
-    }
-
-    pub fn wait(&self, target: u32) {
-        let old = self.counter.fetch_sub(target as i64, Ordering::Relaxed);
-        if old >= target as i64 {
-            self.flag.set(true);
-        }
     }
 }
 

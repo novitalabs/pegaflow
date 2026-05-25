@@ -13,8 +13,6 @@ mod cuda_sys;
 #[cfg(feature = "v2-rdma")]
 mod cudart_sys;
 #[cfg(feature = "v2-rdma")]
-mod gdrapi_sys;
-#[cfg(feature = "v2-rdma")]
 mod libibverbs_sys;
 #[cfg(feature = "v2-rdma")]
 pub mod v2;

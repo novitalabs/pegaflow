@@ -1,5 +1,5 @@
 #[allow(unused_imports)]
-use crate::{cuda_sys, cudart_sys, gdrapi_sys};
+use crate::{cuda_sys, cudart_sys};
 use std::{ffi::c_void, ptr::NonNull};
 
 use crate::cudart_sys::{cudaHostAllocMapped, cudaHostAllocPortable, cudaMemAttachGlobal};

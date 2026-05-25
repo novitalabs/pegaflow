@@ -9,14 +9,14 @@ use std::{
     },
 };
 
-use crate::cuda_lib::{CudaDeviceId, Device, gdr::GdrFlag};
+use crate::cuda_lib::{CudaDeviceId, Device};
 use dashmap::DashMap;
 
 use crate::v2::{
     api::{
-        DomainAddress, GdrCounter, ImmCounter, MemoryRegionDescriptor, MemoryRegionHandle,
-        PeerGroupHandle, SmallVec, TransferCompletionEntry, TransferCounter, TransferId,
-        TransferRequest, UvmWatcherId,
+        DomainAddress, ImmCounter, MemoryRegionDescriptor, MemoryRegionHandle, PeerGroupHandle,
+        SmallVec, TransferCompletionEntry, TransferCounter, TransferId, TransferRequest,
+        UvmWatcherId,
     },
     error::{FabricLibError, Result},
     imm_count::{ImmCount, ImmCountMap},
@@ -225,10 +225,6 @@ impl FabricEngine {
 
     pub fn get_imm_counter(&self, imm: u32) -> ImmCounter {
         self.imm_count_map.get_imm_counter(imm)
-    }
-
-    pub fn get_gdr_counter(&self, imm: u32, flag: Arc<GdrFlag>) -> GdrCounter {
-        self.imm_count_map.get_gdr_counter(imm, flag)
     }
 
     pub fn submit_send(

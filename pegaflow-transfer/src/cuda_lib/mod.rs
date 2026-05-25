@@ -1,7 +1,6 @@
 //! CUDA wrapper layer (upstream-derived from `pplx-garden`).
 //!
-//! Exposes safe wrappers over the raw `cuda_sys` / `cudart_sys` / `gdrapi_sys`
-//! FFI modules.
+//! Exposes safe wrappers over the raw `cuda_sys` / `cudart_sys` FFI modules.
 #![allow(
     dead_code,
     non_snake_case,
@@ -17,7 +16,6 @@
 pub mod cumem;
 pub mod driver;
 pub mod event;
-pub mod gdr;
 pub mod rt;
 
 mod device;

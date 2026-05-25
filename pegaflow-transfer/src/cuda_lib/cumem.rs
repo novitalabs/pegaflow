@@ -1,6 +1,6 @@
 #![allow(clippy::macro_metavars_in_unsafe)]
 #[allow(unused_imports)]
-use crate::{cuda_check, cuda_sys, cuda_unwrap, cudart_sys, gdrapi_sys};
+use crate::{cuda_check, cuda_sys, cuda_unwrap, cudart_sys};
 
 use std::{
     ffi::c_void,

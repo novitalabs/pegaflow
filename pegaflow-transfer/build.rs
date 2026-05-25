@@ -1,7 +1,7 @@
 //! pegaflow-transfer build script.
 //!
-//! Generates FFI bindings for libibverbs and gdrapi. CUDA driver/runtime
-//! bindings come from `cudarc`.
+//! Generates FFI bindings for libibverbs when the `v2-rdma` feature is enabled.
+//! CUDA driver/runtime bindings come from `cudarc`.
 
 use std::{
     env,
@@ -69,24 +69,6 @@ fn build_libibverbs(out_dir: &Path, manifest: &Path) -> Result<(), Box<dyn std::
     Ok(())
 }
 
-fn build_gdrapi(out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let home = find_package("gdrapi", "GDRAPI_HOME", &["/usr"], "include/gdrapi.h");
-    let bindings = bindgen::Builder::default()
-        .header_contents("wrapper.h", "#include <gdrapi.h>")
-        .clang_arg(format!("-I{}/include", home.display()))
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
-        .prepend_enum_name(false)
-        .allowlist_item(r"gdr.*")
-        .derive_default(true)
-        .layout_tests(false)
-        .generate()
-        .map_err(|e| format!("gdrapi bindgen failed: {}", e))?;
-    bindings.write_to_file(out_dir.join("gdrapi-bindings.rs"))?;
-    println!("cargo:rustc-link-lib=gdrapi");
-    println!("cargo:rustc-link-search=native={}/lib", home.display());
-    Ok(())
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -95,7 +77,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if env::var("CARGO_FEATURE_V2_RDMA").is_ok() {
         build_libibverbs(&out_dir, &manifest)?;
-        build_gdrapi(&out_dir)?;
     }
     Ok(())
 }

@@ -14,8 +14,6 @@ pub enum CudaError {
     #[error("{0:?}")]
     CudaError(cuda_sys::CUresult),
     #[error("{0}")]
-    GdrCopyError(&'static str),
-    #[error("{0}")]
     CustomError(String),
     #[error("{0}")]
     Errno(i32),

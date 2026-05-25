@@ -1,6 +1,6 @@
 use crate::cuda_lib::rt::{CudaResult, CudartError};
 #[allow(unused_imports)]
-use crate::{cuda_sys, cudart_sys, gdrapi_sys};
+use crate::{cuda_sys, cudart_sys};
 
 pub struct CudaEvent {
     pub event: cudart_sys::cudaEvent_t,
