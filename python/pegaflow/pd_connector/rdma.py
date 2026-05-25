@@ -170,16 +170,30 @@ def _can_extend_block_range(prev: LayerBlockSlices, nxt: LayerBlockSlices) -> bo
 
 
 def _layer_to_native(layer: LayerRemoteLayout) -> dict[str, Any]:
+    block_ids, k_addrs, v_addrs = _expand_layer_addrs(layer)
     return {
         "layer_name": layer.layer_name,
         "layer_idx": layer.layer_idx,
         "base_addr": layer.base_addr,
         "block_bytes": layer.block_bytes,
-        "block_ids": list(layer.block_ids),
-        "k_block_addrs": list(layer.k_block_addrs),
-        "v_block_addrs": list(layer.v_block_addrs),
+        "block_ids": block_ids,
+        "k_block_addrs": k_addrs,
+        "v_block_addrs": v_addrs,
         "mr_desc": _mr_desc_to_native(layer.mr_desc),
     }
+
+
+def _expand_layer_addrs(
+    layer: LayerRemoteLayout,
+) -> tuple[list[int], list[int], list[int]]:
+    if layer.k_block_addrs:
+        return list(layer.block_ids), list(layer.k_block_addrs), list(layer.v_block_addrs)
+    lin = layer.linear
+    assert lin is not None, "LayerRemoteLayout has no addrs and no linear layout"
+    block_ids = [lin.block_id_start + i * lin.block_id_stride for i in range(lin.num_blocks)]
+    k_addrs = [lin.k_addr_start + i * lin.addr_stride for i in range(lin.num_blocks)]
+    v_addrs = [lin.v_addr_start + i * lin.addr_stride for i in range(lin.num_blocks)]
+    return block_ids, k_addrs, v_addrs
 
 
 def _layer_from_native(

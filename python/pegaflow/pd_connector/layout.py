@@ -123,6 +123,17 @@ class FlashAttnHndLayout:
             block_ids = set(range(self.num_blocks))
         ordered = tuple(sorted(block_ids))
         linear = self._linear_block_addr_layout(ordered)
+        if linear is not None:
+            return LayerRemoteLayout(
+                layer_name=self.layer_name,
+                layer_idx=layer_idx,
+                base_addr=self.base_addr,
+                block_bytes=self.block_bytes,
+                block_ids=ordered,
+                k_block_addrs=(),
+                v_block_addrs=(),
+                linear=linear,
+            )
         return LayerRemoteLayout(
             layer_name=self.layer_name,
             layer_idx=layer_idx,
@@ -135,7 +146,7 @@ class FlashAttnHndLayout:
             v_block_addrs=tuple(
                 self.base_addr + self.block_offset_bytes(1, block_id) for block_id in ordered
             ),
-            linear=linear,
+            linear=None,
         )
 
     def _linear_block_addr_layout(

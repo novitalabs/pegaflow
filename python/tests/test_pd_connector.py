@@ -682,14 +682,13 @@ def test_pd_worker_publishes_wait_handshake_and_delays_done_until_all_blocks() -
     assert handshake is not None
     assert handshake.engine_id == "decode"
     assert handshake.block_size == 16
-    assert handshake.layers[0].k_block_addrs == (
-        tensor.data_ptr() + 1 * 4 * 16 * 32 * 2,
-        tensor.data_ptr() + 2 * 4 * 16 * 32 * 2,
-    )
+    assert handshake.layers[0].k_block_addrs == ()
     assert isinstance(handshake.imm_id, int)
-    assert handshake.layers[0].linear is not None
-    assert handshake.layers[0].linear.block_id_start == 1
-    assert handshake.layers[0].linear.num_blocks == 2
+    linear = handshake.layers[0].linear
+    assert linear is not None
+    assert linear.block_id_start == 1
+    assert linear.num_blocks == 2
+    assert linear.k_addr_start == tensor.data_ptr() + 1 * 4 * 16 * 32 * 2
 
     push_worker = PdWorkerConnector(
         SimpleNamespace(kv_transfer_config=SimpleNamespace(engine_id="")), rdma=MockRdmaPort()
