@@ -266,19 +266,18 @@ fn send_backing_batches(
     if deps.ssd_store.is_none() && deps.metaserver_client.is_none() {
         return;
     }
-  if let Some(ssd) = &deps.ssd_store {
-      let weak_blocks: Vec<(BlockKey, Weak<SealedBlock>)> = blocks
-          .iter()
-          .map(|(k, b)| (k.clone(), Arc::downgrade(b)))
-          .collect();
+    if let Some(ssd) = &deps.ssd_store {
+        let weak_blocks: Vec<(BlockKey, Weak<SealedBlock>)> = blocks
+            .iter()
+            .map(|(k, b)| (k.clone(), Arc::downgrade(b)))
+            .collect();
 
-      ssd.ingest_batch(weak_blocks);
-  }
+        ssd.ingest_batch(weak_blocks);
+    }
 
-  if let Some(client) = &deps.metaserver_client {
-      register_block_hashes(client, namespace, blocks);
-  }
-
+    if let Some(client) = &deps.metaserver_client {
+        register_block_hashes(client, namespace, blocks);
+    }
 }
 
 fn register_block_hashes(
