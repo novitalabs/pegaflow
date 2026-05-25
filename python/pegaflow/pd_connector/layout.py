@@ -158,6 +158,53 @@ class FlashAttnHndLayout:
         )
 
 
+def block_slices_bytes(block_slices: list[LayerBlockSlices]) -> int:
+    return sum(block.k.bytes + block.v.bytes for block in block_slices)
+
+
+def block_ranges_for_remote_write(
+    layout: FlashAttnHndLayout,
+    local_block_ids: set[int],
+    remote_block_ids: dict[int, int],
+) -> list[LayerBlockSlices]:
+    sorted_local = sorted(local_block_ids)
+    if not sorted_local:
+        return []
+    ranges: list[LayerBlockSlices] = []
+    start_local = prev_local = sorted_local[0]
+    start_remote = prev_remote = remote_block_ids[start_local]
+    count = 1
+    for local_id in sorted_local[1:]:
+        remote_id = remote_block_ids[local_id]
+        if local_id == prev_local + 1 and remote_id == prev_remote + 1:
+            prev_local, prev_remote, count = local_id, remote_id, count + 1
+            continue
+        ranges.append(_coalesced_block_slice(layout, start_local, start_remote, count))
+        start_local = prev_local = local_id
+        start_remote = prev_remote = remote_id
+        count = 1
+    ranges.append(_coalesced_block_slice(layout, start_local, start_remote, count))
+    return ranges
+
+
+def _coalesced_block_slice(
+    layout: FlashAttnHndLayout,
+    local_block_id: int,
+    remote_block_id: int,
+    count: int,
+) -> LayerBlockSlices:
+    local = layout.block_slices(local_block_id)
+    bytes_total = layout.block_bytes * count
+    return LayerBlockSlices(
+        k=BlockSlice(
+            block_id=remote_block_id, src_offset_bytes=local.k.src_offset_bytes, bytes=bytes_total
+        ),
+        v=BlockSlice(
+            block_id=remote_block_id, src_offset_bytes=local.v.src_offset_bytes, bytes=bytes_total
+        ),
+    )
+
+
 def unique_blocks_from_slot_mapping(slot_mapping: Any, block_size: int) -> set[int]:
     """Extract touched KV block ids from vLLM attention metadata slot_mapping."""
     slots = slot_mapping.detach().cpu().tolist()

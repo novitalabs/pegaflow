@@ -85,13 +85,6 @@ class FakeSlotMapping(list[int]):
     def __init__(self, values: list[int]) -> None:
         super().__init__(values)
         self.cpu_calls = 0
-        self.shape = (len(values),)
-
-    def data_ptr(self) -> int:
-        return id(self)
-
-    def numel(self) -> int:
-        return len(self)
 
     def detach(self):
         return self
