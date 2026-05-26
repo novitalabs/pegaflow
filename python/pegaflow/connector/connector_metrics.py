@@ -15,29 +15,28 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
-TRANSFER_DURATION_BUCKETS_SECONDS = [
-    0.01,
-    0.025,
-    0.05,
-    0.1,
-    0.25,
-    0.5,
-    1.0,
-    1.5,
-    2.0,
-    3.0,
-    5.0,
-    7.5,
-    10.0,
-    15.0,
-    30.0,
-    60.0,
-]
-
 try:
     from vllm.v1.metrics.utils import create_metric_per_engine
 except ImportError:
     create_metric_per_engine = None
+
+
+def build_buckets(mantissa_lst: list[int], max_value: int, start_exp=0) -> list[int]:
+    """
+    Builds a list of buckets with increasing powers of 10 multiplied by
+    mantissa values until the value exceeds the specified maximum.
+
+    """
+    exponent = start_exp
+    buckets: list[int] = []
+    while True:
+        for m in mantissa_lst:
+            value = m * 10**exponent
+            if value <= max_value:
+                buckets.append(value)
+            else:
+                return buckets
+        exponent += 1
 
 
 def _bind_metric_per_engine(
@@ -303,22 +302,20 @@ class PegaPromMetrics(KVConnectorPromMetrics):
         # Histogram for prefetch operations (scheduler-side)
         # Optimized for fast SSD: typical range 10-500ms
         # Buckets: 10, 20, 30, 50, 75, 100, 150, 200, 300, 500, 1000 ms
-        prefetch_buckets = [0.01, 0.02, 0.03, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 1.0]
         histogram_prefetch_duration = self._histogram_cls(
             name="vllm:pega_prefetch_duration_seconds",
             documentation="Histogram of prefetch duration in seconds.",
-            buckets=prefetch_buckets,
+            buckets=build_buckets([1, 2, 4, 8], 200, -2),
             labelnames=labelnames,
         )
         self.histogram_prefetch_duration = _bind_metric_per_engine(
             self, histogram_prefetch_duration
         )
 
-        blocks_buckets = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
         histogram_prefetch_blocks = self._histogram_cls(
             name="vllm:pega_prefetch_blocks",
             documentation="Histogram of blocks per prefetch operation.",
-            buckets=blocks_buckets,
+            buckets=build_buckets([1, 2, 4, 8], 2000, 0),
             labelnames=labelnames,
         )
         self.histogram_prefetch_blocks = _bind_metric_per_engine(self, histogram_prefetch_blocks)
@@ -328,7 +325,7 @@ class PegaPromMetrics(KVConnectorPromMetrics):
         histogram_load_duration = self._histogram_cls(
             name="vllm:pega_load_duration_seconds",
             documentation="Histogram of KV cache load duration in seconds.",
-            buckets=TRANSFER_DURATION_BUCKETS_SECONDS,
+            buckets=build_buckets([1, 2, 4, 8], 100, -2),
             labelnames=labelnames,
         )
         self.histogram_load_duration = _bind_metric_per_engine(self, histogram_load_duration)
@@ -336,7 +333,7 @@ class PegaPromMetrics(KVConnectorPromMetrics):
         histogram_load_blocks = self._histogram_cls(
             name="vllm:pega_load_blocks",
             documentation="Histogram of blocks per KV cache load operation.",
-            buckets=blocks_buckets,
+            buckets=build_buckets([1, 2, 4, 8], 2000, 0),
             labelnames=labelnames,
         )
         self.histogram_load_blocks = _bind_metric_per_engine(self, histogram_load_blocks)
@@ -359,7 +356,7 @@ class PegaPromMetrics(KVConnectorPromMetrics):
         histogram_save_duration = self._histogram_cls(
             name="vllm:pega_save_duration_seconds",
             documentation="Histogram of KV cache save duration in seconds.",
-            buckets=TRANSFER_DURATION_BUCKETS_SECONDS,
+            buckets=build_buckets([1, 2, 4, 8], 100, -2),
             labelnames=labelnames,
         )
         self.histogram_save_duration = _bind_metric_per_engine(self, histogram_save_duration)
@@ -367,7 +364,7 @@ class PegaPromMetrics(KVConnectorPromMetrics):
         histogram_save_blocks = self._histogram_cls(
             name="vllm:pega_save_blocks",
             documentation="Histogram of blocks per KV cache save operation.",
-            buckets=blocks_buckets,
+            buckets=build_buckets([1, 2, 4, 8], 2000, 0),
             labelnames=labelnames,
         )
         self.histogram_save_blocks = _bind_metric_per_engine(self, histogram_save_blocks)
