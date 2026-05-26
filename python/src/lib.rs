@@ -237,7 +237,6 @@ struct PdRdmaEngine {
     finished_sending: Arc<Mutex<HashSet<String>>>,
     finished_recving: Arc<Mutex<HashSet<String>>>,
     pin_worker_cpu: u16,
-    pin_uvm_cpu: u16,
 }
 
 impl Drop for PdRdmaEngine {
@@ -249,14 +248,13 @@ impl Drop for PdRdmaEngine {
 #[pymethods]
 impl PdRdmaEngine {
     #[new]
-    #[pyo3(signature = (*, cuda_device = 0, numa_node = None, domains = None, device = "cuda", pin_worker_cpu = None, pin_uvm_cpu = None))]
+    #[pyo3(signature = (*, cuda_device = 0, numa_node = None, domains = None, device = "cuda", pin_worker_cpu = None))]
     fn new(
         cuda_device: u8,
         numa_node: Option<u8>,
         domains: Option<Vec<String>>,
         device: &str,
         pin_worker_cpu: Option<u16>,
-        pin_uvm_cpu: Option<u16>,
     ) -> PyResult<Self> {
         let topology =
             detect_topology().map_err(|err| pd_rdma_error("v2 topology detect failed", err))?;
@@ -317,17 +315,8 @@ impl PdRdmaEngine {
                 PyRuntimeError::new_err("selected RDMA topology group has no CPU")
             })?,
         };
-        let uvm_cpu = match pin_uvm_cpu {
-            Some(cpu) if group.cpus.contains(&cpu) => cpu,
-            Some(cpu) => {
-                return Err(PyValueError::new_err(format!(
-                    "pin_uvm_cpu {cpu} is not in the selected RDMA topology CPU set"
-                )));
-            }
-            None => group.cpus.get(1).copied().unwrap_or(worker_cpu),
-        };
         let mut builder = TransferEngineBuilder::default();
-        builder.add_gpu_domains(cuda_device, selected_domains, worker_cpu, uvm_cpu);
+        builder.add_gpu_domains(cuda_device, selected_domains, worker_cpu);
         let engine = Arc::new(
             builder
                 .build()
@@ -366,7 +355,6 @@ impl PdRdmaEngine {
             finished_sending: Arc::new(Mutex::new(HashSet::new())),
             finished_recving,
             pin_worker_cpu: worker_cpu,
-            pin_uvm_cpu: uvm_cpu,
         })
     }
 
@@ -750,10 +738,6 @@ impl PdRdmaEngine {
 
     fn pin_worker_cpu(&self) -> u16 {
         self.pin_worker_cpu
-    }
-
-    fn pin_uvm_cpu(&self) -> u16 {
-        self.pin_uvm_cpu
     }
 }
 

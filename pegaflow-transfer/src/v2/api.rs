@@ -78,20 +78,6 @@ impl std::str::FromStr for DomainAddress {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct UvmWatcherId(pub(crate) NonNull<c_void>);
-unsafe impl Send for UvmWatcherId {}
-unsafe impl Sync for UvmWatcherId {}
-impl UvmWatcherId {
-    pub fn as_non_null(&self) -> NonNull<c_void> {
-        self.0
-    }
-
-    pub fn as_u64(&self) -> u64 {
-        self.0.as_ptr() as u64
-    }
-}
-
 /// Determines how to shard the transfer across domains.
 /// Relevant if NICs per GPU is greater than 1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -195,11 +181,6 @@ pub enum TransferCompletionEntry {
     Transfer(TransferId),
     ImmData(u32),
     ImmCountReached(u32),
-    UvmWatch {
-        id: UvmWatcherId,
-        old: u64,
-        new: u64,
-    },
     Error(TransferId, FabricLibError),
 }
 

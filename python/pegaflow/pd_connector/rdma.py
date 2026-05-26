@@ -341,15 +341,13 @@ def build_rdma_port(
         domains=[rank_config.nic],
         device=str(device),
         pin_worker_cpu=rank_config.worker_cpu,
-        pin_uvm_cpu=rank_config.uvm_cpu,
     )
     logger.info(
-        "[PdConnector] native RDMA enabled tp_rank=%d cuda=%d nic=%s worker_cpu=%d uvm_cpu=%d domains=%d groups=%d link_speed=%s",
+        "[PdConnector] native RDMA enabled tp_rank=%d cuda=%d nic=%s worker_cpu=%d domains=%d groups=%d link_speed=%s",
         rank_config.tp_rank,
         resolved_cuda_device,
         rank_config.nic,
         rank_config.worker_cpu,
-        rank_config.uvm_cpu,
         engine.num_domains(),
         engine.num_groups(),
         engine.aggregated_link_speed(),
@@ -384,7 +382,6 @@ class _RankRdmaConfig:
     tp_rank: int
     nic: str
     worker_cpu: int
-    uvm_cpu: int
 
 
 def _tp_rank(vllm_config: Any) -> int:
@@ -398,7 +395,6 @@ def _reject_legacy_rank_config(config: Any) -> None:
         "pegaflow.pd.rdma.numa_node",
         "pegaflow.pd.rdma.domains",
         "pegaflow.pd.rdma.pin_worker_cpu",
-        "pegaflow.pd.rdma.pin_uvm_cpu",
     )
     present = [key for key in legacy_keys if _extra(config, key, _MISSING) is not _MISSING]
     if present:
@@ -423,16 +419,10 @@ def _rank_rdma_config(config: Any, tp_rank: int) -> _RankRdmaConfig:
     if not nic:
         raise RuntimeError(f"PdConnector RDMA rank_map[{tp_rank}] missing nic")
     worker_cpu = _required_rank_cpu(rank_entry, tp_rank, "worker_cpu")
-    uvm_cpu = _required_rank_cpu(rank_entry, tp_rank, "uvm_cpu")
-    if worker_cpu == uvm_cpu:
-        raise RuntimeError(
-            f"PdConnector RDMA rank_map[{tp_rank}] worker_cpu and uvm_cpu must differ"
-        )
     return _RankRdmaConfig(
         tp_rank=tp_rank,
         nic=nic,
         worker_cpu=worker_cpu,
-        uvm_cpu=uvm_cpu,
     )
 
 
@@ -446,18 +436,17 @@ def _validate_rank_map_cpus(config: Any, rank_map: dict[Any, Any]) -> None:
         nic = str(entry.get("nic") or "")
         if nic:
             nics.setdefault(nic, []).append(str(rank))
-        for field in ("worker_cpu", "uvm_cpu"):
-            cpu = _required_rank_cpu(entry, rank, field)
-            if cpu < reserved_floor:
-                raise RuntimeError(
-                    f"PdConnector RDMA rank_map[{rank}] {field}={cpu} is below reserved_cpu_floor={reserved_floor}"
-                )
-            owner = seen.get(cpu)
-            if owner is not None:
-                raise RuntimeError(
-                    f"PdConnector RDMA rank_map CPU {cpu} is reused by {owner} and rank {rank} {field}"
-                )
-            seen[cpu] = f"rank {rank} {field}"
+        cpu = _required_rank_cpu(entry, rank, "worker_cpu")
+        if cpu < reserved_floor:
+            raise RuntimeError(
+                f"PdConnector RDMA rank_map[{rank}] worker_cpu={cpu} is below reserved_cpu_floor={reserved_floor}"
+            )
+        owner = seen.get(cpu)
+        if owner is not None:
+            raise RuntimeError(
+                f"PdConnector RDMA rank_map CPU {cpu} is reused by {owner} and rank {rank} worker_cpu"
+            )
+        seen[cpu] = f"rank {rank} worker_cpu"
     for nic, ranks in sorted(nics.items()):
         if len(ranks) > 1:
             logger.warning(

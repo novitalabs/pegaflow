@@ -459,9 +459,7 @@ fn create_engine_context(
         .first()
         .copied()
         .expect("topology group has no CPU");
-    let prefill_uvm_cpu = group.cpus.get(1).copied().unwrap_or(prefill_worker_cpu);
-    let decode_worker_cpu = group.cpus.get(2).copied().unwrap_or(prefill_worker_cpu);
-    let decode_uvm_cpu = group.cpus.get(3).copied().unwrap_or(decode_worker_cpu);
+    let decode_worker_cpu = group.cpus.get(1).copied().unwrap_or(prefill_worker_cpu);
 
     let prefill_buf = BenchBuffer::alloc(
         memory,
@@ -480,18 +478,8 @@ fn create_engine_context(
     prefill_buf.fill(0xBB);
     decode_buf.fill(0xAA);
 
-    let prefill = build_engine(
-        group.cuda_device,
-        domains.clone(),
-        prefill_worker_cpu,
-        prefill_uvm_cpu,
-    );
-    let decode = build_engine(
-        group.cuda_device,
-        domains,
-        decode_worker_cpu,
-        decode_uvm_cpu,
-    );
+    let prefill = build_engine(group.cuda_device, domains.clone(), prefill_worker_cpu);
+    let decode = build_engine(group.cuda_device, domains, decode_worker_cpu);
 
     let prefill_mr = prefill
         .register_memory_local(
@@ -522,10 +510,9 @@ fn build_engine(
     cuda_device: u8,
     domains: Vec<pegaflow_transfer::v2::DomainInfo>,
     pin_worker_cpu: u16,
-    pin_uvm_cpu: u16,
 ) -> TransferEngine {
     let mut builder = TransferEngineBuilder::default();
-    builder.add_gpu_domains(cuda_device, domains, pin_worker_cpu, pin_uvm_cpu);
+    builder.add_gpu_domains(cuda_device, domains, pin_worker_cpu);
     builder.build().expect("v2 transfer engine build failed")
 }
 

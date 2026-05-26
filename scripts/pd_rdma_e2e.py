@@ -189,9 +189,7 @@ def main() -> None:
     parser.add_argument("--block-bytes", type=int, default=4 * 1024 * 1024)
     parser.add_argument("--blocks", type=int, default=8)
     parser.add_argument("--decode-worker-cpu", type=int)
-    parser.add_argument("--decode-uvm-cpu", type=int)
     parser.add_argument("--prefill-worker-cpu", type=int)
-    parser.add_argument("--prefill-uvm-cpu", type=int)
     parser.add_argument("--src-byte", type=lambda x: int(x, 0), default=0x5A)
     parser.add_argument("--dst-byte", type=lambda x: int(x, 0), default=0x00)
     args = parser.parse_args()
@@ -207,14 +205,12 @@ def main() -> None:
         cuda_device=args.cuda_device,
         device="cuda",
         pin_worker_cpu=args.decode_worker_cpu,
-        pin_uvm_cpu=args.decode_uvm_cpu,
     )
     stage("create prefill engine")
     prefill = native.PdRdmaEngine(
         cuda_device=args.cuda_device,
         device="cuda",
         pin_worker_cpu=args.prefill_worker_cpu,
-        pin_uvm_cpu=args.prefill_uvm_cpu,
     )
     stage("allocate and initialize test buffers")
     src = native.PdRdmaTestBuffer(size=total_bytes, cuda_device=args.cuda_device)
@@ -282,9 +278,7 @@ def main() -> None:
                 "groups": prefill.num_groups(),
                 "aggregated_link_speed": prefill.aggregated_link_speed(),
                 "decode_pin_worker_cpu": decode.pin_worker_cpu(),
-                "decode_pin_uvm_cpu": decode.pin_uvm_cpu(),
                 "prefill_pin_worker_cpu": prefill.pin_worker_cpu(),
-                "prefill_pin_uvm_cpu": prefill.pin_uvm_cpu(),
             },
             sort_keys=True,
         )

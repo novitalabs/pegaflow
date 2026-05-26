@@ -16,12 +16,11 @@ use crate::v2::{
     api::{
         DomainAddress, ImmCounter, MemoryRegionDescriptor, MemoryRegionHandle, PeerGroupHandle,
         SmallVec, TransferCompletionEntry, TransferCounter, TransferId, TransferRequest,
-        UvmWatcherId,
     },
     error::{FabricLibError, Result},
     imm_count::{ImmCount, ImmCountMap},
     mr::MemoryRegion,
-    worker::{UvmWatcherCall, Worker, WorkerCall, WorkerCommand, WorkerHandle},
+    worker::{Worker, WorkerCall, WorkerCommand, WorkerHandle},
 };
 
 pub struct FabricEngine {
@@ -184,35 +183,6 @@ impl FabricEngine {
             .recv()
             .map_err(|_| FabricLibError::Custom("Worker is down"))??;
         Ok(handle)
-    }
-
-    pub fn acquire_uvm_watcher(&self) -> Result<UvmWatcherId> {
-        let worker = self.get_main_worker()?;
-        let (tx, rx) = oneshot::channel();
-        let cmd = UvmWatcherCall::AcquireUvmWatcher { ret: tx };
-        worker
-            .worker
-            .uvm_call_tx
-            .send(cmd)
-            .map_err(|_| FabricLibError::Custom("Worker is down"))?;
-        let maybe = rx
-            .recv()
-            .map_err(|_| FabricLibError::Custom("Worker is down"))?;
-        maybe.ok_or(FabricLibError::Custom("Failed to acquire UVM watcher"))
-    }
-
-    pub fn release_uvm_watcher(&self, watcher: UvmWatcherId) -> Result<()> {
-        let worker = self.get_main_worker()?;
-        let (tx, rx) = oneshot::channel();
-        let cmd = UvmWatcherCall::ReleaseUvmWatcher { watcher, ret: tx };
-        worker
-            .worker
-            .uvm_call_tx
-            .send(cmd)
-            .map_err(|_| FabricLibError::Custom("Worker is down"))?;
-        rx.recv()
-            .map_err(|_| FabricLibError::Custom("Worker is down"))?;
-        Ok(())
     }
 
     pub fn set_imm_count_expected(&self, imm: u32, expected_count: NonZeroU32) -> Option<ImmCount> {

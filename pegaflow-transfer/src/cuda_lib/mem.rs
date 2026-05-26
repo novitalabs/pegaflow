@@ -2,11 +2,10 @@
 use crate::{cuda_sys, cudart_sys};
 use std::{ffi::c_void, ptr::NonNull};
 
-use crate::cudart_sys::{cudaHostAllocMapped, cudaHostAllocPortable, cudaMemAttachGlobal};
-use libc::memset;
+use crate::cudart_sys::cudaMemAttachGlobal;
 
 use crate::cuda_lib::rt::CudartError;
-use crate::cuda_lib::rt::{cudaFreeHost, cudaHostAlloc, cudaSetDevice};
+use crate::cuda_lib::rt::cudaSetDevice;
 
 /// Owned Cuda memory. It will be freed when dropped.
 pub struct CudaDeviceMemory {
@@ -124,60 +123,3 @@ impl Drop for CudaDeviceMemory {
 
 unsafe impl Send for CudaDeviceMemory {}
 unsafe impl Sync for CudaDeviceMemory {}
-
-pub struct CudaHostMemory {
-    pub ptr: NonNull<c_void>,
-    pub size: usize,
-}
-
-impl CudaHostMemory {
-    pub fn alloc(size: usize) -> Result<Self, CudartError> {
-        let ptr = cudaHostAlloc(size, cudaHostAllocPortable | cudaHostAllocMapped)?;
-        unsafe { memset(ptr.as_ptr(), 0, size) };
-        Ok(CudaHostMemory { ptr, size })
-    }
-
-    pub fn size(&self) -> usize {
-        self.size
-    }
-
-    pub fn get_ptr<T>(&self) -> *const T {
-        self.ptr.as_ptr() as *const T
-    }
-
-    pub fn get_mut_ptr<T>(&self) -> *mut T {
-        self.ptr.as_ptr() as *mut T
-    }
-
-    pub fn get_ref(&self, index: usize) -> &u64 {
-        unsafe { &*((self.ptr.as_ptr() as *const u64).add(index)) }
-    }
-
-    pub fn get_mut(&mut self, index: usize) -> &mut u64 {
-        unsafe { &mut *((self.ptr.as_ptr() as *mut u64).add(index)) }
-    }
-
-    pub fn zero(&self) {
-        unsafe {
-            let slice = std::slice::from_raw_parts_mut(self.ptr.as_ptr() as *mut u8, self.size);
-            slice.fill(0);
-        }
-    }
-
-    pub fn as_slice<T>(&self) -> &[T] {
-        let elemsize = std::mem::size_of::<T>();
-        assert!(self.size.is_multiple_of(elemsize));
-        unsafe { std::slice::from_raw_parts(self.get_ptr::<T>(), self.size / elemsize) }
-    }
-}
-
-impl Drop for CudaHostMemory {
-    fn drop(&mut self) {
-        if let Err(error) = cudaFreeHost(self.ptr) {
-            panic!("Failed to free UVM memory: {}", error);
-        }
-    }
-}
-
-unsafe impl Send for CudaHostMemory {}
-unsafe impl Sync for CudaHostMemory {}

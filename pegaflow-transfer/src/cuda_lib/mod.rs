@@ -24,4 +24,4 @@ mod mem;
 
 pub use device::{CudaDeviceId, Device};
 pub use error::{CudaError, CudaResult};
-pub use mem::{CudaDeviceMemory, CudaHostMemory};
+pub use mem::CudaDeviceMemory;

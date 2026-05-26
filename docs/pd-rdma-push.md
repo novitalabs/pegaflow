@@ -338,21 +338,21 @@ vllm serve $MODEL \
     "engine_id": "prefill",
     "kv_connector_extra_config": {
       "pegaflow.pd.rdma.rank_map": {
-        "0": {"nic": "mlx5_0", "worker_cpu": 16, "uvm_cpu": 17},
+        "0": {"nic": "mlx5_0", "worker_cpu": 16},
         ...
-        "7": {"nic": "mlx5_7", "worker_cpu": 30, "uvm_cpu": 31}
+        "7": {"nic": "mlx5_7", "worker_cpu": 30}
       }
     }
   }'
 ```
 
 **schema**：
-- key 是 TP rank 字符串；`nic` 每 rank 一张 HCA；`worker_cpu` / `uvm_cpu` 两个不同 CPU。
+- key 是 TP rank 字符串；`nic` 每 rank 一张 HCA；`worker_cpu` 指定 RDMA worker 线程 pin 的 CPU。
 - `cuda_device` 不写，由 `kv_caches.device.index` 推断。
 
 **校验规则**（启动时 fail-fast）：
 1. 当前 `tp_rank` 必须在 map 里。
-2. 所有 rank 的 `worker_cpu ∪ uvm_cpu` 必须互不相同。
+2. 所有 rank 的 `worker_cpu` 必须互不相同。
 3. CPU 不允许在 `{0..15}`（默认 floor=16，`pegaflow.pd.rdma.reserved_cpu_floor` 可覆盖）。
 4. `nic` 必须在 `ibv_get_device_list()` 里。
 5. NIC ↔ CPU 的 NUMA 不一致只 warn。
@@ -430,7 +430,7 @@ PYTHONPATH=$PWD/python CUDA_VISIBLE_DEVICES=0 vllm serve /data/Qwen3-4B \
     "kv_role": "kv_producer", "engine_id": "prefill",
     "kv_connector_extra_config": {
       "pegaflow.pd.rdma.rank_map": {
-        "0": {"nic": "mlx5_1", "worker_cpu": 60, "uvm_cpu": 62}
+        "0": {"nic": "mlx5_1", "worker_cpu": 60}
       }}}'
 
 # D 节点
@@ -441,7 +441,7 @@ PYTHONPATH=$PWD/python CUDA_VISIBLE_DEVICES=1 vllm serve /data/Qwen3-4B \
     "kv_role": "kv_consumer", "engine_id": "decode",
     "kv_connector_extra_config": {
       "pegaflow.pd.rdma.rank_map": {
-        "0": {"nic": "mlx5_1", "worker_cpu": 64, "uvm_cpu": 66}
+        "0": {"nic": "mlx5_1", "worker_cpu": 64}
       }}}'
 
 # Proxy

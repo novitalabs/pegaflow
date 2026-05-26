@@ -22,7 +22,6 @@ use crate::v2::{
     api::{
         DomainAddress, ImmCounter, MemoryRegionDescriptor, MemoryRegionHandle, PeerGroupHandle,
         SmallVec, TransferCompletionEntry, TransferCounter, TransferId, TransferRequest,
-        UvmWatcherId,
     },
     error::Result,
     fabric_engine::FabricEngine,
@@ -47,8 +46,6 @@ unsafe impl Send for RecvContext {}
 unsafe impl Sync for RecvContext {}
 
 pub type ImmCallbackFn = Box<dyn Fn(u32) -> CallbackResult + Send + Sync>;
-pub type UvmWatcherCallback =
-    Box<dyn Fn(u64, u64) -> std::result::Result<bool, String> + Send + Sync>;
 
 pub type ImmCountCallback = Box<dyn Fn() -> std::result::Result<bool, String> + Send + Sync>;
 
@@ -65,7 +62,6 @@ struct Callbacks {
     send_ops: DashMap<TransferId, SendCallback>,
     transfer_ops: DashMap<TransferId, TransferCallback>,
     imm_count: DashMap<u32, ImmCountFn>,
-    watchers: DashMap<UvmWatcherId, UvmWatcherCallback>,
 }
 
 pub struct TransferEngine {
@@ -85,7 +81,6 @@ impl TransferEngine {
             send_ops: DashMap::new(),
             transfer_ops: DashMap::new(),
             imm_count: DashMap::new(),
-            watchers: DashMap::new(),
         });
 
         let thread = {
@@ -148,15 +143,6 @@ impl TransferEngine {
         device: Device,
     ) -> Result<PeerGroupHandle> {
         self.engine.add_peer_group(addrs, device)
-    }
-
-    pub(crate) fn alloc_scalar_watcher(
-        &self,
-        callback: UvmWatcherCallback,
-    ) -> Result<UvmWatcherId> {
-        let watcher_id = self.engine.acquire_uvm_watcher()?;
-        self.callbacks.watchers.insert(watcher_id, callback);
-        Ok(watcher_id)
     }
 
     pub fn submit_transfer(
@@ -494,23 +480,6 @@ fn handle_transfer_completion(
                             Ok(())
                         }
                     }
-                }
-            }
-        }
-        TransferCompletionEntry::UvmWatch { id, old, new } => {
-            let Some(callback) = states.watchers.get(&id) else {
-                warn!("UvmWatcher not found: {id:?}");
-                return Ok(());
-            };
-            match callback(old, new) {
-                Ok(true) => Ok(()),
-                Ok(false) | Err(_) => {
-                    // Stop the watcher if the callback returns false or an error occurs
-                    if let Err(e) = engine.release_uvm_watcher(id) {
-                        error!("Failed to release UvmWatcher: {}", e);
-                    };
-                    states.watchers.remove(&id);
-                    Ok(())
                 }
             }
         }

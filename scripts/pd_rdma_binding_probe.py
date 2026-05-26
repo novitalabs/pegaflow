@@ -34,7 +34,6 @@ def main() -> None:
     parser.add_argument("--domain", action="append", default=[])
     parser.add_argument("--device", choices=("cuda", "host"), default="cuda")
     parser.add_argument("--pin-worker-cpu", type=int)
-    parser.add_argument("--pin-uvm-cpu", type=int)
     args = parser.parse_args()
 
     PdRdmaEngine = load_pd_rdma_engine()
@@ -44,7 +43,6 @@ def main() -> None:
         domains=args.domain or None,
         device=args.device,
         pin_worker_cpu=args.pin_worker_cpu,
-        pin_uvm_cpu=args.pin_uvm_cpu,
     )
     print(
         json.dumps(
@@ -54,7 +52,6 @@ def main() -> None:
                 "num_groups": engine.num_groups(),
                 "aggregated_link_speed": engine.aggregated_link_speed(),
                 "pin_worker_cpu": engine.pin_worker_cpu(),
-                "pin_uvm_cpu": engine.pin_uvm_cpu(),
             },
             sort_keys=True,
         )

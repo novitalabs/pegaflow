@@ -375,9 +375,7 @@ def test_pd_worker_builds_native_rdma_by_default_when_extension_exists(monkeypat
         kv_transfer_config=SimpleNamespace(
             engine_id="decode",
             get_from_extra_config=lambda key, default: {
-                "pegaflow.pd.rdma.rank_map": {
-                    "0": {"nic": "mlx5_2", "worker_cpu": 64, "uvm_cpu": 66}
-                },
+                "pegaflow.pd.rdma.rank_map": {"0": {"nic": "mlx5_2", "worker_cpu": 64}},
             }.get(key, default),
         ),
         parallel_config=SimpleNamespace(tensor_parallel_rank=0),
@@ -393,7 +391,6 @@ def test_pd_worker_builds_native_rdma_by_default_when_extension_exists(monkeypat
         "domains": ["mlx5_2"],
         "device": "cuda",
         "pin_worker_cpu": 64,
-        "pin_uvm_cpu": 66,
     }
 
 
@@ -411,8 +408,8 @@ def test_pd_worker_uses_runtime_tp_rank_for_rdma_rank_map(monkeypatch) -> None:
             engine_id="decode",
             get_from_extra_config=lambda key, default: {
                 "pegaflow.pd.rdma.rank_map": {
-                    "0": {"nic": "mlx5_1", "worker_cpu": 16, "uvm_cpu": 18},
-                    "2": {"nic": "mlx5_2", "worker_cpu": 60, "uvm_cpu": 62},
+                    "0": {"nic": "mlx5_1", "worker_cpu": 16},
+                    "2": {"nic": "mlx5_2", "worker_cpu": 60},
                 },
             }.get(key, default),
         ),
@@ -424,7 +421,6 @@ def test_pd_worker_uses_runtime_tp_rank_for_rdma_rank_map(monkeypatch) -> None:
 
     assert FakeNativeRdmaEngineCtor.last_kwargs["domains"] == ["mlx5_2"]
     assert FakeNativeRdmaEngineCtor.last_kwargs["pin_worker_cpu"] == 60
-    assert FakeNativeRdmaEngineCtor.last_kwargs["pin_uvm_cpu"] == 62
 
 
 def test_pd_worker_rejects_legacy_global_rdma_config(monkeypatch) -> None:
@@ -439,9 +435,7 @@ def test_pd_worker_rejects_legacy_global_rdma_config(monkeypatch) -> None:
             engine_id="decode",
             get_from_extra_config=lambda key, default: {
                 "pegaflow.pd.rdma.domains": ["mlx5_2"],
-                "pegaflow.pd.rdma.rank_map": {
-                    "0": {"nic": "mlx5_2", "worker_cpu": 64, "uvm_cpu": 66}
-                },
+                "pegaflow.pd.rdma.rank_map": {"0": {"nic": "mlx5_2", "worker_cpu": 64}},
             }.get(key, default),
         ),
         parallel_config=SimpleNamespace(tensor_parallel_rank=0),

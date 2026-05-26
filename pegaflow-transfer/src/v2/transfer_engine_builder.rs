@@ -11,7 +11,6 @@ struct GpuDomainSpec {
     cuda_device: u8,
     domains: Vec<DomainInfo>,
     pin_worker_cpu: u16,
-    pin_uvm_cpu: u16,
 }
 
 #[derive(Default)]
@@ -25,13 +24,11 @@ impl TransferEngineBuilder {
         cuda_device: u8,
         domains: Vec<DomainInfo>,
         pin_worker_cpu: u16,
-        pin_uvm_cpu: u16,
     ) {
         self.gpus.push(GpuDomainSpec {
             cuda_device,
             domains,
             pin_worker_cpu,
-            pin_uvm_cpu,
         })
     }
 
@@ -88,20 +85,17 @@ impl TransferEngineBuilder {
                 }
             }
 
-            for cpu in &[spec.pin_worker_cpu, spec.pin_uvm_cpu] {
-                if !topo.cpus.contains(cpu) {
-                    return Err(Error::msg(format!(
-                        "CPU {} not found in the topology group of cuda:{}",
-                        cpu, spec.cuda_device
-                    )));
-                }
+            if !topo.cpus.contains(&spec.pin_worker_cpu) {
+                return Err(Error::msg(format!(
+                    "CPU {} not found in the topology group of cuda:{}",
+                    spec.pin_worker_cpu, spec.cuda_device
+                )));
             }
 
             let domain_list: Vec<_> = spec.domains.to_vec();
             let worker = Worker {
                 domain_list,
                 pin_worker_cpu: Some(spec.pin_worker_cpu),
-                pin_uvm_cpu: Some(spec.pin_uvm_cpu),
             };
             workers.push((spec.cuda_device, worker));
         }
