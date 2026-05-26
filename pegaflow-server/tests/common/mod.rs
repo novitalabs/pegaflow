@@ -7,7 +7,7 @@ use cudarc::driver::CudaContext;
 use cudarc::driver::sys;
 use parking_lot::Mutex;
 use pegaflow_core::sync_state::{LOAD_STATE_ERROR, LOAD_STATE_SUCCESS};
-use pegaflow_core::{LoadState, PegaEngine, StorageConfig};
+use pegaflow_core::{LoadState, PegaEngine, PrefetchStatus, StorageConfig};
 use pegaflow_server::proto::engine::engine_client::EngineClient;
 use pegaflow_server::proto::engine::engine_server::EngineServer;
 use pegaflow_server::proto::engine::{
@@ -168,7 +168,12 @@ impl MockVllmRpcHarness {
         hashes: &[Vec<u8>],
     ) -> RpcExchange<SaveRequest, SaveResponse> {
         match self.try_save_blocks_for_worker(worker_index, hashes).await {
-            Ok(exchange) => exchange,
+            Ok(exchange) => {
+                let status = exchange.response.status.as_ref().expect("save status");
+                assert!(status.ok, "save RPC failed: {}", status.message);
+                self.wait_for_saved_blocks(hashes).await;
+                exchange
+            }
             Err(err) => panic!("save rpc failed unexpectedly: {}", err.status),
         }
     }
@@ -379,6 +384,29 @@ impl MockVllmRpcHarness {
 
     pub(crate) async fn wait_for_load(&self, load_state: &LoadState) {
         wait_for_load(load_state).await;
+    }
+
+    async fn wait_for_saved_blocks(&self, hashes: &[Vec<u8>]) {
+        let deadline = Instant::now() + LOAD_WAIT_TIMEOUT;
+        let req_id = format!("mock-vllm-save-visible-{}", hashes.len());
+        loop {
+            match self
+                ._engine
+                .count_prefix_hit_blocks_with_prefetch(INSTANCE_ID, &req_id, hashes)
+                .await
+                .expect("direct save visibility query")
+            {
+                PrefetchStatus::Ready { blocks, missing }
+                    if blocks.len() == hashes.len() && missing == 0 =>
+                {
+                    return;
+                }
+                _ if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                other => panic!("timed out waiting for saved blocks to become visible: {other:?}"),
+            }
+        }
     }
 }
 

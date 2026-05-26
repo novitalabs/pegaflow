@@ -19,8 +19,8 @@ license = "Apache-2.0"
 # Workspace members
 pegaflow-common = { path = "pegaflow-common" }
 pegaflow-core = { path = "pegaflow-core", default-features = false }
-pegaflow-transfer = { path = "pegaflow-transfer" }
-sideway = "0.4.1"
+pegaflow-transfer = { path = "pegaflow-transfer", default-features = false }
+sideway = "0.4.2"
 
 # Core dependencies
 cudarc = { version = "0.19.3" }
@@ -49,8 +49,13 @@ opentelemetry_sdk = { version = "0.31.0", features = [
 opentelemetry-prometheus = "0.31"
 prometheus = "0.14"
 bytesize = "2.3.1"
+anyhow = "1.0"
+bytes = { version = "1.10", features = ["serde"] }
+crossbeam-channel = "0.5"
 ahash = "0.8"
 futures = "0.3"
+smallvec = { version = "1.15", features = ["serde", "union"] }
+mea = "0.6.3"
 
 # HTTP/Web
 axum = "0.8"

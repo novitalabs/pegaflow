@@ -5,22 +5,38 @@ This package provides:
 2. PegaKVConnector: vLLM KV connector for distributed inference
 """
 
-try:
-    from .pegaflow import (
-        EngineRpcClient,
-        PegaFlowError,
-        PegaflowInternal,
-        PyLoadState,
-        QueryLoading,
-        QueryReady,
-    )
-    from .pegaflow import __version__ as _rust_version
-except ImportError:
-    raise ImportError(
-        "pegaflow rust extension is not available, check pegaflow-xxx.so file exists"
-    ) from None
+from importlib.metadata import PackageNotFoundError, version
+from typing import Any
 
-__version__ = _rust_version
+_NATIVE_EXPORTS = {
+    "EngineRpcClient",
+    "PegaFlowError",
+    "PegaflowInternal",
+    "PyLoadState",
+    "QueryLoading",
+    "QueryReady",
+}
+
+try:
+    from . import pegaflow as _native
+except ImportError:
+    _native = None
+
+try:
+    __version__ = _native.__version__ if _native is not None else version("pegaflow-llm")
+except PackageNotFoundError:
+    __version__ = "0.0.0"
+
+
+def __getattr__(name: str) -> Any:
+    if name not in _NATIVE_EXPORTS:
+        raise AttributeError(name)
+    if _native is None:
+        raise ImportError(
+            "pegaflow rust extension is not available, check pegaflow-xxx.so file exists"
+        ) from None
+    return getattr(_native, name)
+
 
 __all__ = [
     "__version__",

@@ -83,9 +83,17 @@ def _install_vllm_stubs() -> None:
     class KVConnectorMetadata:
         return_none: bool = False
 
+    class KVConnectorWorkerMetadata:
+        pass
+
+    class SupportsHMA:
+        pass
+
     base.KVConnectorRole = KVConnectorRole
     base.KVConnectorBase_V1 = KVConnectorBase_V1
     base.KVConnectorMetadata = KVConnectorMetadata
+    base.KVConnectorWorkerMetadata = KVConnectorWorkerMetadata
+    base.SupportsHMA = SupportsHMA
 
     metrics = _ensure_module("vllm.distributed.kv_transfer.kv_connector.v1.metrics")
 
@@ -108,7 +116,12 @@ def _install_vllm_stubs() -> None:
     metrics.PromMetricT = PromMetric
 
     parallel_state = _ensure_module("vllm.distributed.parallel_state")
-    parallel_state.get_tensor_model_parallel_rank = lambda: 0
+
+    def _not_in_distributed_context():
+        raise RuntimeError("unit test stub: not in distributed context")
+
+    parallel_state.get_tensor_model_parallel_rank = _not_in_distributed_context
+    parallel_state.get_tensor_model_parallel_world_size = _not_in_distributed_context
     parallel_state.get_decode_context_model_parallel_rank = lambda: 0
 
     class _PPGroup:

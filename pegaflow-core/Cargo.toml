@@ -7,8 +7,8 @@ edition.workspace = true
 workspace = true
 
 [features]
-default = ["cudarc/cuda-12080"]
-cuda-13 = ["cudarc/cuda-13000"]
+default = ["cudarc/cuda-12080", "pegaflow-transfer/default"]
+cuda-13 = ["cudarc/cuda-13000", "pegaflow-transfer/cuda-13"]
 tracing = ["fastrace"]
 
 [dependencies]
@@ -35,10 +35,10 @@ kube.workspace = true
 k8s-openapi.workspace = true
 tonic.workspace = true
 dashmap.workspace = true
-smallvec = "1"
+smallvec.workspace = true
 pegaflow-proto = { path = "../pegaflow-proto" }
-pegaflow-transfer = { path = "../pegaflow-transfer" }
-mea = "0.6.3"
+pegaflow-transfer = { path = "../pegaflow-transfer", default-features = false }
+mea.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
