@@ -14,6 +14,7 @@ from urllib.request import Request, urlopen
 from pegaflow.logging_utils import get_connector_logger
 
 logger = get_connector_logger()
+PREFILL_SENDER_WORKERS = 8
 
 
 @dataclass(frozen=True)
@@ -27,16 +28,27 @@ class PrefillHttpTask:
 
 
 class AsyncPrefillSender:
-    def __init__(self) -> None:
+    def __init__(self, worker_count: int = PREFILL_SENDER_WORKERS) -> None:
+        assert worker_count > 0, "prefill sender worker_count must be positive"
         self._queue: queue.Queue[PrefillHttpTask | None] = queue.Queue()
-        self._thread = threading.Thread(target=self._run, name="pd-prefill-sender", daemon=True)
-        self._thread.start()
+        self._threads = [
+            threading.Thread(
+                target=self._run,
+                name=f"pd-prefill-sender-{idx}",
+                daemon=True,
+            )
+            for idx in range(worker_count)
+        ]
+        for thread in self._threads:
+            thread.start()
+        logger.info("[PdConnector] D -> P prefill sender started workers=%d", worker_count)
 
     def submit(self, task: PrefillHttpTask) -> None:
         self._queue.put(task)
 
     def close(self) -> None:
-        self._queue.put(None)
+        for _ in self._threads:
+            self._queue.put(None)
 
     def _run(self) -> None:
         while True:

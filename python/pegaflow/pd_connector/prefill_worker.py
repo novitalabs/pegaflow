@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from pegaflow.pd_connector.worker import PdWorkerConnector
 
 logger = get_connector_logger()
+PD_RDMA_PUSH_SENDER_THREADS = 4
 
 
 class PrefillHandler:
@@ -82,6 +83,7 @@ class PrefillHandler:
         self._pending_push_chunks.discard(req_id)
         self._push_chunk_maps.pop(req_id, None)
         self._push_traces.pop(req_id, None)
+        self._push_sender.discard_req_stats(req_id)
         self._tracker.remove(req_id)
 
     def save_kv_layer(
@@ -450,11 +452,26 @@ class _AsyncLayerPushSender:
     def __init__(self) -> None:
         self._queue: queue.Queue[_LayerPushTask | None] = queue.Queue()
         self._condition = threading.Condition()
+        self._worker_count = PD_RDMA_PUSH_SENDER_THREADS
         self._inflight = 0
         self._inflight_by_req: dict[str, int] = {}
+        self._stats_by_req: dict[str, _ReqPushStats] = {}
+        self._discarded_stats_reqs: set[str] = set()
         self._error: BaseException | None = None
-        self._thread = threading.Thread(target=self._run, name="pd-rdma-push-sender", daemon=True)
-        self._thread.start()
+        self._threads = [
+            threading.Thread(
+                target=self._run,
+                name=f"pd-rdma-push-sender-{idx}",
+                daemon=True,
+            )
+            for idx in range(self._worker_count)
+        ]
+        for thread in self._threads:
+            thread.start()
+        logger.info(
+            "[PdConnector] P layer push sender started workers=%d",
+            self._worker_count,
+        )
 
     def submit(self, task: _LayerPushTask) -> None:
         with self._condition:
@@ -464,7 +481,7 @@ class _AsyncLayerPushSender:
             self._inflight_by_req[task.req_id] = self._inflight_by_req.get(task.req_id, 0) + 1
             inflight = self._inflight
             inflight_req = self._inflight_by_req[task.req_id]
-        logger.info(
+        logger.debug(
             "[PdConnector] P layer push queued req=%s target_req=%s chunk=%d layer=%d blocks=%d bytes=%d inflight=%d inflight_req=%d queue_depth=%d",
             task.req_id,
             task.target_request_id,
@@ -497,7 +514,19 @@ class _AsyncLayerPushSender:
                 raise error
 
     def close(self) -> None:
-        self._queue.put(None)
+        for _ in self._threads:
+            self._queue.put(None)
+
+    def pop_req_stats(self, req_id: str) -> _ReqPushStats:
+        with self._condition:
+            self._discarded_stats_reqs.discard(req_id)
+            return self._stats_by_req.pop(req_id, _ReqPushStats())
+
+    def discard_req_stats(self, req_id: str) -> None:
+        with self._condition:
+            self._stats_by_req.pop(req_id, None)
+            if self._inflight_by_req.get(req_id, 0) > 0:
+                self._discarded_stats_reqs.add(req_id)
 
     def _run(self) -> None:
         while True:
@@ -505,7 +534,10 @@ class _AsyncLayerPushSender:
             try:
                 if task is None:
                     return
-                _run_layer_push(task)
+                result = _run_layer_push(task)
+                with self._condition:
+                    if task.req_id not in self._discarded_stats_reqs:
+                        self._stats_by_req.setdefault(task.req_id, _ReqPushStats()).add(result)
             except BaseException as exc:
                 with self._condition:
                     self._error = exc
@@ -519,11 +551,44 @@ class _AsyncLayerPushSender:
                             self._inflight_by_req[task.req_id] = remaining
                         else:
                             self._inflight_by_req.pop(task.req_id, None)
+                            if task.req_id in self._discarded_stats_reqs:
+                                self._discarded_stats_reqs.discard(task.req_id)
+                                self._stats_by_req.pop(task.req_id, None)
                         self._condition.notify_all()
                 self._queue.task_done()
 
 
-def _run_layer_push(task: _LayerPushTask) -> None:
+@dataclass(frozen=True)
+class _LayerPushResult:
+    bytes: int
+    queue_wait_ms: float
+    event_ms: float
+    native_ms: float
+
+
+@dataclass
+class _ReqPushStats:
+    tasks: int = 0
+    bytes: int = 0
+    queue_wait_ms: float = 0.0
+    event_ms: float = 0.0
+    native_ms: float = 0.0
+    max_queue_wait_ms: float = 0.0
+    max_event_ms: float = 0.0
+    max_native_ms: float = 0.0
+
+    def add(self, result: _LayerPushResult) -> None:
+        self.tasks += 1
+        self.bytes += result.bytes
+        self.queue_wait_ms += result.queue_wait_ms
+        self.event_ms += result.event_ms
+        self.native_ms += result.native_ms
+        self.max_queue_wait_ms = max(self.max_queue_wait_ms, result.queue_wait_ms)
+        self.max_event_ms = max(self.max_event_ms, result.event_ms)
+        self.max_native_ms = max(self.max_native_ms, result.native_ms)
+
+
+def _run_layer_push(task: _LayerPushTask) -> _LayerPushResult:
     start_ts_ns = time.time_ns()
     event_done_ts_ns = start_ts_ns
     native_done_ts_ns = start_ts_ns
@@ -539,7 +604,10 @@ def _run_layer_push(task: _LayerPushTask) -> None:
         native_done_ts_ns = time.time_ns()
         raise
     finally:
-        logger.info(
+        queue_wait_ms = (start_ts_ns - task.enqueued_ts_ns) / 1_000_000
+        event_ms = (event_done_ts_ns - start_ts_ns) / 1_000_000
+        native_ms = (native_done_ts_ns - event_done_ts_ns) / 1_000_000
+        logger.debug(
             "[PdConnector] P layer push %s req=%s target_req=%s chunk=%d layer=%d blocks=%d bytes=%d queue_wait_ms=%.3f event_ms=%.3f native_ms=%.3f total_ms=%.3f",
             "failed" if failed else "done",
             task.req_id,
@@ -548,11 +616,17 @@ def _run_layer_push(task: _LayerPushTask) -> None:
             task.layer_idx,
             task.block_count,
             task.rdma_bytes,
-            (start_ts_ns - task.enqueued_ts_ns) / 1_000_000,
-            (event_done_ts_ns - start_ts_ns) / 1_000_000,
-            (native_done_ts_ns - event_done_ts_ns) / 1_000_000,
+            queue_wait_ms,
+            event_ms,
+            native_ms,
             (native_done_ts_ns - task.enqueued_ts_ns) / 1_000_000,
         )
+    return _LayerPushResult(
+        bytes=task.rdma_bytes,
+        queue_wait_ms=queue_wait_ms,
+        event_ms=event_ms,
+        native_ms=native_ms,
+    )
 
 
 class _AsyncPushFinalizer:
@@ -610,12 +684,13 @@ class _AsyncPushFinalizer:
                 start_ts_ns = time.time_ns()
                 self._push_sender.wait_req(task.req_id)
                 sender_done_ts_ns = time.time_ns()
+                push_stats = self._push_sender.pop_req_stats(task.req_id)
                 task.rdma.wait_for_pushes(task.req_id)
                 writes_done_ts_ns = time.time_ns()
                 task.rdma.push_done(task.req_id)
                 done_ts_ns = time.time_ns()
                 logger.info(
-                    "[PdConnector] P RDMA done req=%s target_req=%s chunks=%d blocks=%d rdma_bytes=%d save_to_imm_ms=%.3f schedule_to_imm_ms=%.3f wait_sender_ms=%.3f wait_writes_ms=%.3f imm_ms=%.3f save_gbps=%.2f tail_gbps=%.2f",
+                    "[PdConnector] P RDMA done req=%s target_req=%s chunks=%d blocks=%d rdma_bytes=%d save_to_imm_ms=%.3f schedule_to_imm_ms=%.3f wait_sender_ms=%.3f wait_writes_ms=%.3f imm_ms=%.3f save_gbps=%.2f tail_gbps=%.2f sender_workers=%d push_tasks=%d push_bytes=%d push_queue_sum_ms=%.3f push_queue_max_ms=%.3f push_event_sum_ms=%.3f push_event_max_ms=%.3f push_native_sum_ms=%.3f push_native_max_ms=%.3f",
                     task.req_id,
                     task.target_request_id,
                     task.chunk_count,
@@ -628,9 +703,19 @@ class _AsyncPushFinalizer:
                     _elapsed_ms(writes_done_ts_ns, done_ts_ns),
                     _gbps(task.rdma_bytes, task.first_save_ts_ns, done_ts_ns),
                     _gbps(task.rdma_bytes, task.finalize_queued_ts_ns, done_ts_ns),
+                    self._push_sender._worker_count,
+                    push_stats.tasks,
+                    push_stats.bytes,
+                    push_stats.queue_wait_ms,
+                    push_stats.max_queue_wait_ms,
+                    push_stats.event_ms,
+                    push_stats.max_event_ms,
+                    push_stats.native_ms,
+                    push_stats.max_native_ms,
                 )
             except BaseException as exc:
                 if task is not None:
+                    self._push_sender.discard_req_stats(task.req_id)
                     logger.exception(
                         "[PdConnector] P finalize failed req=%s target_req=%s chunks=%d blocks=%d bytes=%d",
                         task.req_id,

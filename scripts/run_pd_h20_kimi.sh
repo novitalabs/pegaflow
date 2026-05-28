@@ -8,6 +8,7 @@ TP_SIZE="${TP_SIZE:-8}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 LOAD_FORMAT="${LOAD_FORMAT:-dummy}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-32768}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 
 PREFILL_HOST="${PREFILL_HOST:-10.96.191.99}"
@@ -38,6 +39,7 @@ Defaults:
   VENV=$VENV
   MAX_MODEL_LEN=${MAX_MODEL_LEN:-<model default>}
   LOAD_FORMAT=$LOAD_FORMAT
+  MAX_NUM_BATCHED_TOKENS=$MAX_NUM_BATCHED_TOKENS
   PREFILL=http://$PREFILL_HOST:$PREFILL_PORT
   DECODE=http://$DECODE_HOST:$DECODE_PORT
   DECODE_SSH_HOST=$DECODE_SSH_HOST
@@ -89,6 +91,20 @@ wait_ready() {
   exit 1
 }
 
+wait_stopped() {
+  local name="$1"
+  local pid="$2"
+  local deadline=$((SECONDS + 60))
+  while kill -0 "$pid" >/dev/null 2>&1; do
+    if (( SECONDS >= deadline )); then
+      echo "[$name] did not stop; sending SIGKILL pid=$pid"
+      kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+      break
+    fi
+    sleep 1
+  done
+}
+
 start_vllm() {
   local name="$1"
   local port="$2"
@@ -119,6 +135,7 @@ start_vllm() {
     --tensor-parallel-size "$TP_SIZE" \
     --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
     --load-format "$LOAD_FORMAT" \
+    --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
     "${max_model_len_args[@]}" \
     --trust-remote-code \
     --no-enable-prefix-caching \
@@ -184,6 +201,7 @@ stop_all() {
       if kill -0 "$pid" >/dev/null 2>&1; then
         echo "[$name] stopping pid=$pid"
         kill -- "-$pid" 2>/dev/null || kill "$pid" || true
+        wait_stopped "$name" "$pid"
       fi
       rm -f "$pid_file"
     fi

@@ -125,20 +125,36 @@ fn wait_atomic_count(counter: &AtomicI64, target: i64, timeout: Duration) -> boo
     true
 }
 
-fn wait_write_window(
+fn reserve_write_window(
     submitted: &AtomicI64,
     completed: &AtomicI64,
     limit: i64,
     timeout: Duration,
-) -> bool {
+) -> Option<i64> {
     let deadline = Instant::now() + timeout;
-    while submitted.load(Ordering::Acquire) - completed.load(Ordering::Acquire) >= limit {
+    loop {
+        let submitted_now = submitted.load(Ordering::Acquire);
+        let completed_now = completed.load(Ordering::Acquire);
+        if submitted_now - completed_now < limit {
+            if submitted
+                .compare_exchange_weak(
+                    submitted_now,
+                    submitted_now + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Some(submitted_now + 1);
+            }
+            std::hint::spin_loop();
+            continue;
+        }
         if Instant::now() >= deadline {
-            return false;
+            return None;
         }
         std::hint::spin_loop();
     }
-    true
 }
 
 fn pd_imm(req_id: &str) -> u32 {
@@ -635,28 +651,31 @@ impl PdRdmaEngine {
         }
         let convert_ms = duration_ms(total_start.elapsed());
         let window_start = Instant::now();
-        if !py.detach(|| {
-            wait_write_window(
+        let submitted_after = match py.detach(|| {
+            reserve_write_window(
                 &self.write_submitted,
                 &self.write_completed,
                 PD_RDMA_WRITE_WINDOW,
                 Duration::from_secs(30),
             )
         }) {
-            log::error!(
-                "[PdRdmaEngine] RDMA WRITE window timeout req={} layer={} submitted={} completed={} window_wait_ms={:.3}",
-                req_id,
-                layer_idx,
-                self.write_submitted.load(Ordering::Acquire),
-                self.write_completed.load(Ordering::Acquire),
-                duration_ms(window_start.elapsed()),
-            );
-            return Err(PegaFlowError::new_err(format!(
-                "RDMA WRITE window timed out for req={req_id} layer={layer_idx} submitted={} completed={}",
-                self.write_submitted.load(Ordering::Acquire),
-                self.write_completed.load(Ordering::Acquire)
-            )));
-        }
+            Some(submitted_after) => submitted_after,
+            None => {
+                log::error!(
+                    "[PdRdmaEngine] RDMA WRITE window timeout req={} layer={} submitted={} completed={} window_wait_ms={:.3}",
+                    req_id,
+                    layer_idx,
+                    self.write_submitted.load(Ordering::Acquire),
+                    self.write_completed.load(Ordering::Acquire),
+                    duration_ms(window_start.elapsed()),
+                );
+                return Err(PegaFlowError::new_err(format!(
+                    "RDMA WRITE window timed out for req={req_id} layer={layer_idx} submitted={} completed={}",
+                    self.write_submitted.load(Ordering::Acquire),
+                    self.write_completed.load(Ordering::Acquire)
+                )));
+            }
+        };
         let window_ms = duration_ms(window_start.elapsed());
         let (req_completed, req_errors) = {
             let mut pending = self.pending_writes.lock().unwrap();
@@ -667,7 +686,6 @@ impl PdRdmaEngine {
             (Arc::clone(&state.completed), Arc::clone(&state.errors))
         };
         let scatter_targets = dsts.len();
-        let submitted_after = self.write_submitted.fetch_add(1, Ordering::Release) + 1;
         let global_completed = Arc::clone(&self.write_completed);
         let done_completed = Arc::clone(&req_completed);
         let error_completed = Arc::clone(&req_completed);
@@ -694,7 +712,7 @@ impl PdRdmaEngine {
                     on_done: Box::new(move || {
                         done_completed.fetch_add(1, Ordering::Release);
                         global_completed.fetch_add(1, Ordering::Release);
-                        log::info!(
+                        log::debug!(
                             "[PdRdmaEngine] RDMA WRITE completed req={} layer={} bytes={} latency_ms={:.3}",
                             done_req_id,
                             done_layer_idx,
@@ -733,7 +751,7 @@ impl PdRdmaEngine {
                 );
                 pd_rdma_error("submit RDMA WRITE failed", err)
             })?;
-        log::info!(
+        log::debug!(
             "[PdRdmaEngine] RDMA WRITE submitted req={} layer={} input_blocks={} scatter_targets={} bytes={} domains={} convert_ms={:.3} window_wait_ms={:.3} submit_ms={:.3} submitted={} completed={}",
             req_id,
             layer_idx,

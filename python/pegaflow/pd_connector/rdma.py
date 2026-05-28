@@ -277,7 +277,7 @@ class RealRdmaPort:
         start = time.perf_counter()
         self.engine.push_layer(req_id, layer_idx, native_blocks)
         elapsed_ms = (time.perf_counter() - start) * 1000
-        logger.info(
+        logger.debug(
             "[PdConnector] RDMA push_layer req=%s layer=%d input_blocks=%d coalesced_blocks=%d regions=%d bytes=%d native_ms=%.3f",
             req_id,
             layer_idx,

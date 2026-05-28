@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import queue
 import sys
+import threading
 import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -25,6 +27,8 @@ native.QueryReady = object
 native.__version__ = "test"
 sys.modules["pegaflow.pegaflow"] = native
 
+import pegaflow.pd_connector.prefill as prefill_mod  # noqa: E402
+import pegaflow.pd_connector.prefill_worker as prefill_worker_mod  # noqa: E402
 import pegaflow.pd_connector.worker as worker_mod  # noqa: E402
 from pegaflow.pd_connector import PdConnector  # noqa: E402
 from pegaflow.pd_connector.layout import (  # noqa: E402
@@ -42,6 +46,10 @@ from pegaflow.pd_connector.metadata import (  # noqa: E402
     WaitReqMeta,
     handshake_from_dict,
     handshake_to_dict,
+)
+from pegaflow.pd_connector.prefill import (  # noqa: E402
+    AsyncPrefillSender,
+    PrefillHttpTask,
 )
 from pegaflow.pd_connector.proxy import (  # noqa: E402
     ProxyConfig,
@@ -208,6 +216,13 @@ class FakeNativeRdmaEngineCtor(FakeNativeRdmaEngine):
 def drain_pd_pushes(worker: PdWorkerConnector) -> None:
     worker._push_sender.wait_all()
     worker._push_finalizer.wait_all()
+
+
+def pushed_layers_by_idx(
+    rdma: MockRdmaPort,
+    req_id: str,
+) -> dict[int, list[LayerBlockSlices]]:
+    return dict(rdma.pushed_layers[req_id])
 
 
 DUMMY_HANDSHAKE = PdHandshake(
@@ -774,12 +789,12 @@ def test_pd_worker_pushes_flash_attn_hnd_blocks() -> None:
     assert unique_blocks_from_slot_mapping(attn_metadata.slot_mapping, 16) == {1, 2}
     worker.wait_for_save()
     drain_pd_pushes(worker)
-    assert worker.rdma.pushed_layers["req-1"][0][0] == 0
-    first_layer_blocks = worker.rdma.pushed_layers["req-1"][0][1]
+    pushed_by_layer = pushed_layers_by_idx(worker.rdma, "req-1")
+    assert set(pushed_by_layer) == {0, 1}
+    first_layer_blocks = pushed_by_layer[0]
     assert len(first_layer_blocks) == 1
     assert first_layer_blocks[0].regions[0].block_id == 1
     assert first_layer_blocks[0].regions[0].bytes == tensor.element_size() * 16 * 4 * 32 * 2
-    assert worker.rdma.pushed_layers["req-1"][1][0] == 1
     finished_sending, finished_recving = worker.get_finished({"req-1"})
     assert finished_sending == {"req-1"}
     assert finished_recving is None
@@ -1183,6 +1198,99 @@ def test_d_worker_rank0_dispatches_prefill_on_wait() -> None:
     assert handshakes[0]["layers"][0]["block_ids"] == [1]
 
 
+def test_async_prefill_sender_dispatches_requests_in_parallel(monkeypatch) -> None:
+    started: queue.Queue[str] = queue.Queue()
+    finished: queue.Queue[str] = queue.Queue()
+    second_started = threading.Event()
+    release_first = threading.Event()
+
+    def fake_post_prefill_request(task: PrefillHttpTask) -> None:
+        started.put(task.request_id)
+        if task.request_id == "first":
+            assert second_started.wait(timeout=2)
+            assert release_first.wait(timeout=2)
+        else:
+            second_started.set()
+        finished.put(task.request_id)
+
+    monkeypatch.setattr(prefill_mod, "post_prefill_request", fake_post_prefill_request)
+    sender = AsyncPrefillSender(worker_count=2)
+    try:
+        sender.submit(_prefill_http_task("first"))
+        assert started.get(timeout=2) == "first"
+        sender.submit(_prefill_http_task("second"))
+
+        assert second_started.wait(timeout=2)
+        release_first.set()
+        assert {finished.get(timeout=2), finished.get(timeout=2)} == {"first", "second"}
+    finally:
+        release_first.set()
+        sender.close()
+
+
+def test_layer_push_sender_does_not_recreate_discarded_stats() -> None:
+    class FailingRdma:
+        def __init__(self) -> None:
+            self.release_slow = threading.Event()
+
+        def push_layer(self, req_id, layer_idx, blocks) -> None:
+            if layer_idx == 0:
+                raise RuntimeError("boom")
+            assert self.release_slow.wait(timeout=2)
+
+    rdma = FailingRdma()
+    sender = prefill_worker_mod._AsyncLayerPushSender()
+    try:
+        sender.submit(
+            prefill_worker_mod._LayerPushTask(
+                rdma=rdma,
+                req_id="req",
+                target_request_id="decode",
+                chunk_idx=1,
+                layer_idx=1,
+                block_count=1,
+                rdma_bytes=1,
+                block_slices=[],
+                enqueued_ts_ns=0,
+            )
+        )
+        sender.submit(
+            prefill_worker_mod._LayerPushTask(
+                rdma=rdma,
+                req_id="req",
+                target_request_id="decode",
+                chunk_idx=1,
+                layer_idx=0,
+                block_count=1,
+                rdma_bytes=1,
+                block_slices=[],
+                enqueued_ts_ns=0,
+            )
+        )
+
+        with pytest.raises(RuntimeError, match="boom"):
+            sender.wait_req("req")
+        sender.discard_req_stats("req")
+        rdma.release_slow.set()
+        sender.wait_all()
+
+        assert sender.pop_req_stats("req").tasks == 0
+    finally:
+        rdma.release_slow.set()
+        sender.close()
+
+
+def _prefill_http_task(request_id: str) -> PrefillHttpTask:
+    return PrefillHttpTask(
+        request_id=request_id,
+        prefill_url="http://p:8001",
+        model="model",
+        prompt_token_ids=(1,),
+        max_tokens=1,
+        kv_transfer_params={"target_request_id": request_id},
+    )
+
+
 def test_p_worker_selects_matching_tp_rank_handshake() -> None:
     tensor = FakeTensor(
         shape=(2, 8, 16, 4, 32),
@@ -1272,7 +1380,7 @@ def test_p_worker_pushes_registered_blocks_from_save_kv_layer() -> None:
     worker.wait_for_save()
     drain_pd_pushes(worker)
 
-    assert [layer_idx for layer_idx, _ in rdma.pushed_layers["prefill-r0"]] == [0, 1]
+    assert {layer_idx for layer_idx, _ in rdma.pushed_layers["prefill-r0"]} == {0, 1}
     assert worker.get_finished({"prefill-r0"})[0] == {"prefill-r0"}
 
 
