@@ -18,6 +18,7 @@ from vllm.distributed.parallel_state import get_pp_group, get_tensor_model_paral
 from pegaflow.connector.common import (
     ConnectorContext,
     PegaConnectorMetadata,
+    PegaConnectorMode,
     PegaKVConnectorStats,
     PegaPromMetrics,
     derive_namespace,
@@ -96,6 +97,11 @@ class PegaKVConnector(KVConnectorBase_V1):
         server_port = os.environ.get(
             "PEGAFLOW_PORT"
         ) or vllm_config.kv_transfer_config.get_from_extra_config("pegaflow.port", 50055)
+        mode = PegaConnectorMode.from_config(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "pegaflow.mode", PegaConnectorMode.READ_WRITE.value
+            )
+        )
         self._engine_endpoint = f"{server_host}:{server_port}"
         engine_client = EngineRpcClient(self._engine_endpoint)
         logger.debug("[PegaKVConnector] Connected to engine server at %s", self._engine_endpoint)
@@ -119,6 +125,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             dcp_rank=dcp_rank,
             pp_rank=pp_rank,
             pp_size=pp_size,
+            mode=mode,
         )
 
         self._scheduler: SchedulerConnector | None = None
@@ -136,7 +143,7 @@ class PegaKVConnector(KVConnectorBase_V1):
         logger.debug(
             "[PegaKVConnector] Initialized role=%s instance_id=%s device=%s "
             "tp_rank=%s tp_size=%d pp_rank=%d pp_size=%d world_size=%d layers=%d namespace=%s "
-            "is_mla=%s dcp_world_size=%d pcp_world_size=%d dcp_rank=%d",
+            "is_mla=%s dcp_world_size=%d pcp_world_size=%d dcp_rank=%d mode=%s",
             role.name,
             instance_id,
             device_id if device_id is not None else "cpu",
@@ -151,6 +158,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             dcp_world_size,
             pcp_world_size,
             dcp_rank,
+            mode.value,
         )
 
     # ==============================
