@@ -1,7 +1,8 @@
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 
 use bytesize::ByteSize;
-use log::{debug, error, info, warn};
+use log::{debug, info, warn};
 use mea::oneshot;
 use parking_lot::Mutex;
 
@@ -23,8 +24,8 @@ struct SsdInner {
 }
 
 pub(crate) struct SsdBackingStore {
-    /// Keeps the file descriptor alive for io_uring operations.
-    _file: std::fs::File,
+    /// Keeps file descriptors alive for io_uring operations.
+    _files: Vec<std::fs::File>,
     io: Arc<UringIoEngine>,
     write_tx: tokio::sync::mpsc::Sender<SsdWriteCommand>,
     prefetch_tx: tokio::sync::mpsc::Sender<PrefetchBatch>,
@@ -39,48 +40,43 @@ impl SsdBackingStore {
         allocate_fn: AllocateFn,
         is_numa: bool,
     ) -> std::io::Result<Arc<Self>> {
-        use std::fs::{self, OpenOptions};
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::fs::OpenOptions;
         use std::os::unix::io::AsRawFd;
 
-        if let Some(parent) = config.cache_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        let shard_count = config.shards.get();
+        let shard_capacity = aligned_shard_capacity(config.capacity_bytes, shard_count)?;
+        let files = open_cache_files(
+            &config.cache_path,
+            shard_count,
+            shard_capacity,
+            &mut OpenOptions::new(),
+        )?;
+        let fds: Vec<_> = files.iter().map(|file| file.as_raw_fd()).collect();
 
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_DIRECT)
-            .open(&config.cache_path)?;
-        file.set_len(config.capacity_bytes)?;
-
-        let io = Arc::new(UringIoEngine::new(
-            file.as_raw_fd(),
-            UringConfig::default(),
-        )?);
+        let io = Arc::new(UringIoEngine::new_multi(fds, UringConfig::default())?);
 
         let (write_tx, write_rx) = tokio::sync::mpsc::channel(config.write_queue_depth);
         let (prefetch_tx, prefetch_rx) = tokio::sync::mpsc::channel(config.prefetch_queue_depth);
 
-        let capacity = config.capacity_bytes;
+        let capacity = shard_capacity * shard_count as u64;
         let write_inflight = config.write_inflight;
         let prefetch_inflight = config.prefetch_inflight;
 
         info!(
-            "SSD cache initialized at {} (capacity {})",
+            "SSD cache initialized at {} (capacity {}, shards {}, shard capacity {})",
             config.cache_path.display(),
-            ByteSize(capacity)
+            ByteSize(capacity),
+            shard_count,
+            ByteSize(shard_capacity)
         );
 
         let store = Arc::new(Self {
-            _file: file,
+            _files: files,
             io: Arc::clone(&io),
             write_tx,
             prefetch_tx,
             inner: Mutex::new(SsdInner {
-                ring: SsdRingBuffer::new(capacity),
+                ring: SsdRingBuffer::new_sharded(vec![shard_capacity; shard_count]),
             }),
             allocate_fn,
             is_numa,
@@ -90,7 +86,6 @@ impl SsdBackingStore {
             &store,
             write_rx,
             prefetch_rx,
-            capacity,
             write_inflight,
             prefetch_inflight,
         );
@@ -98,8 +93,8 @@ impl SsdBackingStore {
         Ok(store)
     }
 
-    pub(super) fn is_offset_valid(&self, begin: u64) -> bool {
-        self.inner.lock().ring.is_offset_valid(begin)
+    pub(super) fn is_offset_valid(&self, entry: &super::ssd_cache::SsdIndexEntry) -> bool {
+        self.inner.lock().ring.is_offset_valid(entry)
     }
 
     pub(super) fn allocate_prefetch(
@@ -129,7 +124,6 @@ impl SsdBackingStore {
         store: &Arc<Self>,
         write_rx: tokio::sync::mpsc::Receiver<SsdWriteCommand>,
         prefetch_rx: tokio::sync::mpsc::Receiver<PrefetchBatch>,
-        capacity: u64,
         write_inflight: usize,
         prefetch_inflight: usize,
     ) {
@@ -144,14 +138,7 @@ impl SsdBackingStore {
         let prefetch_weak = Arc::downgrade(store);
         let prefetch_io = Arc::clone(&io);
         tokio::spawn(async move {
-            ssd_prefetch_loop(
-                prefetch_weak,
-                prefetch_rx,
-                prefetch_io,
-                capacity,
-                prefetch_inflight,
-            )
-            .await;
+            ssd_prefetch_loop(prefetch_weak, prefetch_rx, prefetch_io, prefetch_inflight).await;
         });
 
         debug!("SSD backing store workers spawned");
@@ -250,17 +237,73 @@ impl SsdBackingStore {
     }
 }
 
-/// Returns `None` if the SSD cache cannot be initialised (logs the error).
+fn aligned_shard_capacity(capacity_bytes: u64, shard_count: usize) -> std::io::Result<u64> {
+    let shard_count = u64::try_from(shard_count).expect("usize fits into u64");
+    let raw = capacity_bytes / shard_count;
+    let alignment = super::SSD_ALIGNMENT as u64;
+    let capacity = raw / alignment * alignment;
+    if capacity == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "SSD cache capacity is too small for the requested shard count",
+        ));
+    }
+    Ok(capacity)
+}
+
+fn open_cache_files(
+    cache_path: &Path,
+    shard_count: usize,
+    shard_capacity: u64,
+    options: &mut std::fs::OpenOptions,
+) -> std::io::Result<Vec<std::fs::File>> {
+    use std::fs;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    options
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_DIRECT);
+
+    if shard_count == 1 {
+        if let Some(parent) = cache_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = options.open(cache_path)?;
+        file.set_len(shard_capacity)?;
+        return Ok(vec![file]);
+    }
+
+    if cache_path.exists() && !cache_path.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "SSD cache path {} must be a directory when shards > 1",
+                cache_path.display()
+            ),
+        ));
+    }
+    fs::create_dir_all(cache_path)?;
+
+    let mut files = Vec::with_capacity(shard_count);
+    for shard_id in 0..shard_count {
+        let path: PathBuf = cache_path.join(format!("shard-{shard_id:06}.dat"));
+        let file = options.open(path)?;
+        file.set_len(shard_capacity)?;
+        files.push(file);
+    }
+
+    Ok(files)
+}
+
+/// Creates the SSD backing store, failing startup if it cannot be initialised.
 pub(crate) fn new_ssd(
     config: SsdCacheConfig,
     allocate_fn: AllocateFn,
     is_numa: bool,
-) -> Option<Arc<SsdBackingStore>> {
-    match SsdBackingStore::new(config, allocate_fn, is_numa) {
-        Ok(b) => Some(b),
-        Err(e) => {
-            error!("Failed to initialise SSD backing store: {}", e);
-            None
-        }
-    }
+) -> Arc<SsdBackingStore> {
+    SsdBackingStore::new(config, allocate_fn, is_numa)
+        .unwrap_or_else(|e| panic!("failed to initialise SSD backing store: {e}"))
 }

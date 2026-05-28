@@ -109,6 +109,10 @@ pub struct Cli {
     #[arg(long, default_value = "512gb", value_parser = parse_memory_size)]
     pub ssd_cache_capacity: usize,
 
+    /// SSD cache file shards. Use >1 for parallel filesystems such as GPFS. Default: 1
+    #[arg(long, default_value = "1")]
+    pub ssd_cache_shards: std::num::NonZeroUsize,
+
     /// SSD write queue depth (max pending write batches). Default: 8
     #[arg(long, default_value_t = pegaflow_core::DEFAULT_SSD_WRITE_QUEUE_DEPTH)]
     pub ssd_write_queue_depth: usize,
@@ -481,9 +485,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
     let ssd_cache_config = cli.ssd_cache_path.as_ref().map(|path| {
         info!(
-            "SSD cache enabled: path={}, capacity={:.2} GiB, write_queue={}, prefetch_queue={}, write_inflight={}, prefetch_inflight={}",
+            "SSD cache enabled: path={}, capacity={:.2} GiB, shards={}, write_queue={}, prefetch_queue={}, write_inflight={}, prefetch_inflight={}",
             path,
             cli.ssd_cache_capacity as f64 / (1024.0 * 1024.0 * 1024.0),
+            cli.ssd_cache_shards,
             cli.ssd_write_queue_depth,
             cli.ssd_prefetch_queue_depth,
             cli.ssd_write_inflight,
@@ -492,6 +497,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         pegaflow_core::SsdCacheConfig {
             cache_path: path.into(),
             capacity_bytes: cli.ssd_cache_capacity as u64,
+            shards: cli.ssd_cache_shards,
             write_queue_depth: cli.ssd_write_queue_depth,
             prefetch_queue_depth: cli.ssd_prefetch_queue_depth,
             write_inflight: cli.ssd_write_inflight,

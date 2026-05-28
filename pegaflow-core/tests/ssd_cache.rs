@@ -7,12 +7,15 @@ mod common;
 
 use common::*;
 use pegaflow_core::*;
+use std::num::NonZeroUsize;
 
 const BLOCK_SIZE: usize = 4096;
 const NUM_BLOCKS: usize = 4;
 /// Pool fits one batch with headroom but not two — forces eviction.
 const POOL_SIZE: usize = NUM_BLOCKS * BLOCK_SIZE * 2;
 const SSD_CAPACITY: u64 = 64 * 1024 * 1024;
+const SMALL_SSD_CAPACITY: u64 = (BLOCK_SIZE * 2) as u64;
+const OVERSIZED_SSD_CAPACITY: u64 = 512;
 const PREFETCH_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn ssd_env(instance_id: &'static str) -> (TestEnv, std::path::PathBuf, tempfile::TempDir) {
@@ -48,6 +51,46 @@ fn ssd_split_env(instance_id: &'static str) -> (TestEnv, tempfile::TempDir) {
             ssd_cache_config: Some(SsdCacheConfig {
                 cache_path,
                 capacity_bytes: SSD_CAPACITY,
+                ..SsdCacheConfig::default()
+            }),
+            ..StorageConfig::default()
+        })
+        .build();
+    (env, temp_dir)
+}
+
+fn ssd_sharded_env(instance_id: &'static str) -> (TestEnv, std::path::PathBuf, tempfile::TempDir) {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let cache_path = temp_dir.path().join("cache");
+    let env = TestEnvBuilder::new(instance_id, "test-ns-ssd")
+        .layer("layer_0", NUM_BLOCKS, BLOCK_SIZE)
+        .pool_size(POOL_SIZE)
+        .storage(StorageConfig {
+            ssd_cache_config: Some(SsdCacheConfig {
+                cache_path: cache_path.clone(),
+                capacity_bytes: SSD_CAPACITY,
+                shards: NonZeroUsize::new(4).unwrap(),
+                ..SsdCacheConfig::default()
+            }),
+            ..StorageConfig::default()
+        })
+        .build();
+    (env, cache_path, temp_dir)
+}
+
+fn ssd_custom_capacity_env(
+    instance_id: &'static str,
+    capacity_bytes: u64,
+) -> (TestEnv, tempfile::TempDir) {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let cache_path = temp_dir.path().join("cache.bin");
+    let env = TestEnvBuilder::new(instance_id, "test-ns-ssd")
+        .layer("layer_0", NUM_BLOCKS, BLOCK_SIZE)
+        .pool_size(POOL_SIZE)
+        .storage(StorageConfig {
+            ssd_cache_config: Some(SsdCacheConfig {
+                cache_path,
+                capacity_bytes,
                 ..SsdCacheConfig::default()
             }),
             ..StorageConfig::default()
@@ -130,6 +173,80 @@ async fn ssd_prefetch_roundtrip_after_eviction() {
     env.data().zero_gpu();
     env.load_to_gpu(lease, target.len()).await;
     env.data().assert_gpu_matches_expected();
+}
+
+#[tokio::test]
+async fn ssd_sharded_prefetch_roundtrip_after_eviction() {
+    let (env, cache_path, _temp_dir) = ssd_sharded_env("test-ssd-sharded");
+
+    assert!(
+        cache_path.is_dir(),
+        "sharded SSD cache path should be a directory"
+    );
+    for shard_id in 0..4 {
+        let shard_path = cache_path.join(format!("shard-{shard_id:06}.dat"));
+        let file_meta = std::fs::metadata(&shard_path).expect("SSD shard file should be created");
+        assert_eq!(
+            file_meta.len(),
+            SSD_CAPACITY / 4,
+            "SSD shard file should be preallocated"
+        );
+    }
+
+    let target = env.hashes(1);
+    env.save_and_wait(&target).await;
+    env.engine.flush_all().await;
+
+    for shard_id in 0..4 {
+        let shard_path = cache_path.join(format!("shard-{shard_id:06}.dat"));
+        let mut file = std::fs::File::open(&shard_path).expect("open SSD shard file");
+        let mut buf = vec![0u8; BLOCK_SIZE];
+        std::io::Read::read(&mut file, &mut buf).expect("read SSD shard file");
+        assert!(
+            buf.iter().any(|&b| b != 0),
+            "round-robin write should place data in shard {shard_id}"
+        );
+    }
+
+    cleanup_resident_memory(&env);
+
+    let (hit, missing) = wait_query_ready(&env, &target).await;
+    assert_eq!(hit, target.len());
+    assert_eq!(missing, 0);
+}
+
+#[tokio::test]
+async fn ssd_ring_wrap_evicts_old_entries() {
+    let (env, _temp_dir) = ssd_custom_capacity_env("test-ssd-wrap-evicts", SMALL_SSD_CAPACITY);
+
+    let old = env.hashes(31);
+    env.save_and_wait(&old).await;
+    env.engine.flush_all().await;
+    cleanup_resident_memory(&env);
+
+    let (hit, missing) = wait_query_ready(&env, &old).await;
+    assert_eq!(hit, 0);
+    assert_eq!(missing, old.len());
+}
+
+#[tokio::test]
+async fn ssd_oversized_block_drops_disk_write_but_keeps_ram_hit() {
+    let (env, _temp_dir) =
+        ssd_custom_capacity_env("test-ssd-oversized-drop", OVERSIZED_SSD_CAPACITY);
+
+    let target = env.hashes(33);
+    env.save_and_wait(&target).await;
+    env.engine.flush_all().await;
+
+    let (hit, missing) = wait_query_ready(&env, &target).await;
+    assert_eq!(hit, target.len());
+    assert_eq!(missing, 0);
+
+    cleanup_resident_memory(&env);
+
+    let (hit, missing) = wait_query_ready(&env, &target).await;
+    assert_eq!(hit, 0);
+    assert_eq!(missing, target.len());
 }
 
 /// SSD prefetch preserves prefix semantics: if SSD only has the first part of
