@@ -71,6 +71,44 @@ llm = LLM(
 )
 ```
 
+#### Connector Modes
+
+`PegaKVConnector` defaults to `read_write`: it queries PegaFlow for reusable KV
+blocks, loads matched blocks into vLLM, and saves newly computed full blocks
+back to PegaFlow.
+
+Set `pegaflow.mode` to `save_only` when another vLLM connector is responsible
+for reads and PegaFlow should only persist KV blocks for later reuse. This is
+intended for `MultiConnector` decode-side setups where an upstream connector
+owns the external hit/load path, while PegaFlow records the resulting KV cache.
+In `save_only` mode, PegaFlow does not query or load KV blocks.
+
+```bash
+vllm serve Qwen/Qwen3-0.6B \
+  --kv-transfer-config '{
+    "kv_connector": "MultiConnector",
+    "kv_role": "kv_both",
+    "kv_connector_extra_config": {
+      "connectors": [
+        {
+          "kv_connector": "<external-read-connector>",
+          "kv_role": "kv_both"
+        },
+        {
+          "kv_connector": "PegaKVConnector",
+          "kv_role": "kv_both",
+          "kv_connector_module_path": "pegaflow.connector",
+          "kv_connector_extra_config": {
+            "pegaflow.mode": "save_only"
+          }
+        }
+      ]
+    }
+  }'
+```
+
+Valid values are `read_write` and `save_only`.
+
 ## Development
 
 See the [examples](../examples/) directory for more usage examples.
