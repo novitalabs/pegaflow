@@ -5,7 +5,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from pegaflow.logging_utils import get_connector_logger
@@ -81,14 +81,25 @@ class DecodeHandler:
                 flatten_block_ids(req.local_block_ids),
             )
             self._w.rdma.open_request(req_id, handshake)
-            self._rdma_waiter.submit(req_id)
+            local_block_count = len(flatten_block_ids(req.local_block_ids))
+            self._rdma_waiter.submit(
+                _RdmaWaitTask(
+                    req_id=req_id,
+                    remote_request_id=req.remote_request_id,
+                    done_request_id=req.done_request_id,
+                    prefill_url=req.prefill_url,
+                    rank=self._w.tp_rank,
+                    block_count=local_block_count,
+                    queued_ts_ns=time.time_ns(),
+                )
+            )
             logger.info(
                 "[PdConnector] D queued async wait req=%s remote_req=%s prefill_url=%s rank=%d blocks=%d ts_ns=%d",
                 req_id,
                 req.remote_request_id,
                 req.prefill_url or "<oob>",
                 self._w.tp_rank,
-                len(flatten_block_ids(req.local_block_ids)),
+                local_block_count,
                 time.time_ns(),
             )
             if req.prefill_url and self._w.tp_rank == 0:
@@ -209,19 +220,40 @@ class DecodeHandler:
         return replace(layout, mr_desc=registered.mr_desc)
 
 
+@dataclass(frozen=True)
+class _RdmaWaitTask:
+    req_id: str
+    remote_request_id: str
+    done_request_id: str
+    prefill_url: str | None
+    rank: int
+    block_count: int
+    queued_ts_ns: int
+
+
 class _AsyncRdmaDoneWaiter:
     def __init__(self, rdma: RdmaPort) -> None:
         self.rdma = rdma
-        self._queue: queue.Queue[tuple[str, int] | None] = queue.Queue()
+        self._queue: queue.Queue[_RdmaWaitTask | None] = queue.Queue()
         self._submitted: set[str] = set()
         self._thread = threading.Thread(target=self._run, name="pd-rdma-done-waiter", daemon=True)
         self._thread.start()
 
-    def submit(self, req_id: str) -> None:
-        if req_id in self._submitted:
+    def submit(self, task: _RdmaWaitTask) -> None:
+        if task.req_id in self._submitted:
             return
-        self._submitted.add(req_id)
-        self._queue.put((req_id, time.time_ns()))
+        self._submitted.add(task.req_id)
+        logger.info(
+            "[PdConnector] D RDMA wait queued req=%s remote_req=%s done_req=%s rank=%d blocks=%d prefill_url=%s queue_depth=%d",
+            task.req_id,
+            task.remote_request_id,
+            task.done_request_id,
+            task.rank,
+            task.block_count,
+            task.prefill_url or "<oob>",
+            self._queue.qsize(),
+        )
+        self._queue.put(task)
 
     def close(self) -> None:
         self._queue.put(None)
@@ -231,18 +263,34 @@ class _AsyncRdmaDoneWaiter:
             item = self._queue.get()
             if item is None:
                 return
-            req_id, submit_ts_ns = item
+            task = item
+            start_ts_ns = time.time_ns()
             try:
-                self.rdma.wait_done(req_id)
+                self.rdma.wait_done(task.req_id)
                 done_ts_ns = time.time_ns()
                 logger.info(
-                    "[PdConnector] D received RDMA done req=%s wait_ms=%.3f ts_ns=%d",
-                    req_id,
-                    (done_ts_ns - submit_ts_ns) / 1_000_000,
+                    "[PdConnector] D received RDMA done req=%s remote_req=%s done_req=%s rank=%d blocks=%d queue_wait_ms=%.3f wait_ms=%.3f ts_ns=%d",
+                    task.req_id,
+                    task.remote_request_id,
+                    task.done_request_id,
+                    task.rank,
+                    task.block_count,
+                    (start_ts_ns - task.queued_ts_ns) / 1_000_000,
+                    (done_ts_ns - start_ts_ns) / 1_000_000,
                     done_ts_ns,
                 )
             except Exception:
-                logger.exception("[PdConnector] D RDMA done wait failed req=%s", req_id)
+                failed_ts_ns = time.time_ns()
+                logger.exception(
+                    "[PdConnector] D RDMA done wait failed req=%s remote_req=%s done_req=%s rank=%d blocks=%d queue_wait_ms=%.3f wait_ms=%.3f",
+                    task.req_id,
+                    task.remote_request_id,
+                    task.done_request_id,
+                    task.rank,
+                    task.block_count,
+                    (start_ts_ns - task.queued_ts_ns) / 1_000_000,
+                    (failed_ts_ns - start_ts_ns) / 1_000_000,
+                )
 
 
 def _all_gather_peer_info(

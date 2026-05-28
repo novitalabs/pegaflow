@@ -234,12 +234,18 @@ class PrefillHandler:
             )
             rdma_bytes = block_slices_bytes(block_slices)
             assert self._w.rdma is not None
+            chunk_idx = trace.chunk_count + 1
             self._push_sender.submit(
                 _LayerPushTask(
                     rdma=self._w.rdma,
                     req_id=req_id,
+                    target_request_id=req.target_request_id,
+                    chunk_idx=chunk_idx,
                     layer_idx=layer_idx,
+                    block_count=len(selected_blocks),
+                    rdma_bytes=rdma_bytes,
                     block_slices=block_slices,
+                    enqueued_ts_ns=time.time_ns(),
                     event=event,
                 )
             )
@@ -404,8 +410,13 @@ class _SkipPushRank(Exception):
 class _LayerPushTask:
     rdma: RdmaPort
     req_id: str
+    target_request_id: str
+    chunk_idx: int
     layer_idx: int
+    block_count: int
+    rdma_bytes: int
     block_slices: list[LayerBlockSlices]
+    enqueued_ts_ns: int
     event: Any = None
 
 
@@ -451,6 +462,20 @@ class _AsyncLayerPushSender:
                 raise self._error
             self._inflight += 1
             self._inflight_by_req[task.req_id] = self._inflight_by_req.get(task.req_id, 0) + 1
+            inflight = self._inflight
+            inflight_req = self._inflight_by_req[task.req_id]
+        logger.info(
+            "[PdConnector] P layer push queued req=%s target_req=%s chunk=%d layer=%d blocks=%d bytes=%d inflight=%d inflight_req=%d queue_depth=%d",
+            task.req_id,
+            task.target_request_id,
+            task.chunk_idx,
+            task.layer_idx,
+            task.block_count,
+            task.rdma_bytes,
+            inflight,
+            inflight_req,
+            self._queue.qsize(),
+        )
         self._queue.put(task)
 
     def wait_all(self) -> None:
@@ -499,9 +524,35 @@ class _AsyncLayerPushSender:
 
 
 def _run_layer_push(task: _LayerPushTask) -> None:
+    start_ts_ns = time.time_ns()
+    event_done_ts_ns = start_ts_ns
+    native_done_ts_ns = start_ts_ns
+    failed = False
     if task.event is not None:
         task.event.synchronize()
-    task.rdma.push_layer(task.req_id, task.layer_idx, task.block_slices)
+    event_done_ts_ns = time.time_ns()
+    try:
+        task.rdma.push_layer(task.req_id, task.layer_idx, task.block_slices)
+        native_done_ts_ns = time.time_ns()
+    except BaseException:
+        failed = True
+        native_done_ts_ns = time.time_ns()
+        raise
+    finally:
+        logger.info(
+            "[PdConnector] P layer push %s req=%s target_req=%s chunk=%d layer=%d blocks=%d bytes=%d queue_wait_ms=%.3f event_ms=%.3f native_ms=%.3f total_ms=%.3f",
+            "failed" if failed else "done",
+            task.req_id,
+            task.target_request_id,
+            task.chunk_idx,
+            task.layer_idx,
+            task.block_count,
+            task.rdma_bytes,
+            (start_ts_ns - task.enqueued_ts_ns) / 1_000_000,
+            (event_done_ts_ns - start_ts_ns) / 1_000_000,
+            (native_done_ts_ns - event_done_ts_ns) / 1_000_000,
+            (native_done_ts_ns - task.enqueued_ts_ns) / 1_000_000,
+        )
 
 
 class _AsyncPushFinalizer:
@@ -525,6 +576,17 @@ class _AsyncPushFinalizer:
                 return
             self._submitted.add(task.req_id)
             self._inflight += 1
+            inflight = self._inflight
+        logger.info(
+            "[PdConnector] P finalize queued req=%s target_req=%s chunks=%d blocks=%d bytes=%d inflight=%d queue_depth=%d",
+            task.req_id,
+            task.target_request_id,
+            task.chunk_count,
+            task.num_blocks,
+            task.rdma_bytes,
+            inflight,
+            self._queue.qsize(),
+        )
         self._queue.put(task)
 
     def wait_all(self) -> None:
@@ -545,12 +607,15 @@ class _AsyncPushFinalizer:
             try:
                 if task is None:
                     return
+                start_ts_ns = time.time_ns()
                 self._push_sender.wait_req(task.req_id)
+                sender_done_ts_ns = time.time_ns()
                 task.rdma.wait_for_pushes(task.req_id)
+                writes_done_ts_ns = time.time_ns()
                 task.rdma.push_done(task.req_id)
                 done_ts_ns = time.time_ns()
                 logger.info(
-                    "[PdConnector] P RDMA done req=%s target_req=%s chunks=%d blocks=%d rdma_bytes=%d save_to_imm_ms=%.3f schedule_to_imm_ms=%.3f gbps=%.2f",
+                    "[PdConnector] P RDMA done req=%s target_req=%s chunks=%d blocks=%d rdma_bytes=%d save_to_imm_ms=%.3f schedule_to_imm_ms=%.3f wait_sender_ms=%.3f wait_writes_ms=%.3f imm_ms=%.3f save_gbps=%.2f tail_gbps=%.2f",
                     task.req_id,
                     task.target_request_id,
                     task.chunk_count,
@@ -558,9 +623,22 @@ class _AsyncPushFinalizer:
                     task.rdma_bytes,
                     _elapsed_ms(task.first_save_ts_ns, done_ts_ns),
                     _elapsed_ms(task.finalize_queued_ts_ns, done_ts_ns),
+                    _elapsed_ms(start_ts_ns, sender_done_ts_ns),
+                    _elapsed_ms(sender_done_ts_ns, writes_done_ts_ns),
+                    _elapsed_ms(writes_done_ts_ns, done_ts_ns),
                     _gbps(task.rdma_bytes, task.first_save_ts_ns, done_ts_ns),
+                    _gbps(task.rdma_bytes, task.finalize_queued_ts_ns, done_ts_ns),
                 )
             except BaseException as exc:
+                if task is not None:
+                    logger.exception(
+                        "[PdConnector] P finalize failed req=%s target_req=%s chunks=%d blocks=%d bytes=%d",
+                        task.req_id,
+                        task.target_request_id,
+                        task.chunk_count,
+                        task.num_blocks,
+                        task.rdma_bytes,
+                    )
                 with self._condition:
                     self._error = exc
                     self._condition.notify_all()

@@ -783,6 +783,7 @@ def test_pd_worker_pushes_flash_attn_hnd_blocks() -> None:
     finished_sending, finished_recving = worker.get_finished({"req-1"})
     assert finished_sending == {"req-1"}
     assert finished_recving is None
+    assert "req-1" not in worker.rdma.registered
 
 
 def test_pd_worker_get_finished_does_not_poll_wait_reqs() -> None:
@@ -991,6 +992,9 @@ def test_scheduler_delays_producer_block_free_until_send_finishes() -> None:
     delay_free, params = scheduler.request_finished(request, ([1, 2],))
     assert delay_free is True
     assert params is None
+
+    early_release_meta = scheduler.build_connector_meta(SimpleNamespace())
+    assert early_release_meta.reqs_to_release == set()
 
     scheduler.update_connector_output(
         SimpleNamespace(finished_sending={"req-1"}, finished_recving=None)

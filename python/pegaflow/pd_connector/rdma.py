@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 from pegaflow.logging_utils import get_connector_logger
-from pegaflow.pd_connector.layout import BlockRegionSlice, LayerBlockSlices
+from pegaflow.pd_connector.layout import (
+    BlockRegionSlice,
+    LayerBlockSlices,
+    block_slices_bytes,
+)
 from pegaflow.pd_connector.metadata import (
     LayerRemoteLayout,
     PdHandshake,
@@ -230,13 +235,37 @@ class RealRdmaPort:
     def register_local_layers(
         self, layers: tuple[LayerRemoteLayout, ...]
     ) -> tuple[LayerRemoteLayout, ...]:
+        start = time.perf_counter()
         native_layers = [_layer_to_native(layer) for layer in layers]
         registered = self.engine.register_local_layers(native_layers)
         assert len(registered) == len(layers)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        logger.info(
+            "[PdConnector] RDMA register_local_layers layers=%d blocks_per_layer=%s regions_per_layer=%s native_ms=%.3f",
+            len(layers),
+            [len(layer.block_ids) for layer in layers],
+            [len(layer.regions) for layer in layers],
+            elapsed_ms,
+        )
         return tuple(_layer_from_native(layer) for layer in registered)
 
     def open_request(self, req_id: str, handshake: PdHandshake) -> None:
+        start = time.perf_counter()
         self.engine.register_remote(req_id, _handshake_to_native(handshake))
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        blocks_per_layer = len(handshake.layers[0].block_ids) if handshake.layers else 0
+        logger.info(
+            "[PdConnector] RDMA open_request req=%s remote_req=%s tp_rank=%d/%d imm_id=%s layers=%d blocks_per_layer=%d block_size=%d native_ms=%.3f",
+            req_id,
+            handshake.request_id,
+            handshake.tp_rank,
+            handshake.tp_size,
+            handshake.imm_id,
+            len(handshake.layers),
+            blocks_per_layer,
+            handshake.block_size,
+            elapsed_ms,
+        )
 
     def push_layer(
         self,
@@ -244,22 +273,59 @@ class RealRdmaPort:
         layer_idx: int,
         blocks: list[LayerBlockSlices],
     ) -> None:
-        self.engine.push_layer(req_id, layer_idx, _layer_blocks_to_native(blocks))
+        native_blocks = _layer_blocks_to_native(blocks)
+        start = time.perf_counter()
+        self.engine.push_layer(req_id, layer_idx, native_blocks)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        logger.info(
+            "[PdConnector] RDMA push_layer req=%s layer=%d input_blocks=%d coalesced_blocks=%d regions=%d bytes=%d native_ms=%.3f",
+            req_id,
+            layer_idx,
+            len(blocks),
+            len(native_blocks),
+            sum(len(block["regions"]) for block in native_blocks),
+            block_slices_bytes(blocks),
+            elapsed_ms,
+        )
 
     def wait_for_pushes(self, req_id: str) -> None:
         wait_for_pushes = getattr(self.engine, "wait_for_pushes", None)
         if wait_for_pushes is None:
             return None
-        return wait_for_pushes(req_id)
+        start = time.perf_counter()
+        try:
+            return wait_for_pushes(req_id)
+        finally:
+            logger.info(
+                "[PdConnector] RDMA wait_for_pushes req=%s native_ms=%.3f",
+                req_id,
+                (time.perf_counter() - start) * 1000,
+            )
 
     def push_done(self, req_id: str) -> None:
-        self.engine.push_done(req_id)
+        start = time.perf_counter()
+        try:
+            return self.engine.push_done(req_id)
+        finally:
+            logger.info(
+                "[PdConnector] RDMA push_done req=%s native_ms=%.3f",
+                req_id,
+                (time.perf_counter() - start) * 1000,
+            )
 
     def wait_done(self, req_id: str) -> None:
         wait_done = getattr(self.engine, "wait_done", None)
         if wait_done is None:
             return None
-        return wait_done(req_id)
+        start = time.perf_counter()
+        try:
+            return wait_done(req_id)
+        finally:
+            logger.info(
+                "[PdConnector] RDMA wait_done req=%s native_ms=%.3f",
+                req_id,
+                (time.perf_counter() - start) * 1000,
+            )
 
     def poll_done(self, req_id: str) -> bool:
         poll_done = getattr(self.engine, "poll_done", None)

@@ -164,6 +164,7 @@ class PdSchedulerConnector:
     def update_connector_output(self, connector_output: Any) -> None:
         for req_id in connector_output.finished_sending or ():
             self._active_pushes.pop(req_id, None)
+            self._reqs_to_release.add(req_id)
             logger.info("[PdConnector] scheduler finished sending req=%s", req_id)
 
         for req_id in connector_output.finished_recving or ():
@@ -180,7 +181,7 @@ class PdSchedulerConnector:
         params = _kv_params(request)
         is_prod = is_producer(params)
 
-        if is_consumer(params) or is_prod:
+        if is_consumer(params):
             self._reqs_to_release.add(req_id)
             self._active_waits.pop(req_id, None)
             self._completed_waits.discard(req_id)
@@ -194,6 +195,9 @@ class PdSchedulerConnector:
                 ),
             )
             return True, None
+        if is_prod:
+            self._reqs_to_release.add(req_id)
+            self._active_pushes.pop(req_id, None)
         return False, None
 
     def _add_cached_producer_chunks(self, scheduler_output: Any) -> None:

@@ -189,6 +189,8 @@ class PdWorkerConnector:
         )
 
         releasable_sending = self._prefill.get_finished_sending(finished_req_ids)
+        for req_id in releasable_sending:
+            self.rdma.close_request(req_id)
         finished_recving = self.rdma.pop_finished_recving()
         self._decode.finish_recving(finished_recving)
 

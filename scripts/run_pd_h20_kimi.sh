@@ -5,12 +5,14 @@ set -euo pipefail
 ROLE="${1:-}"
 MODEL="${MODEL:-/data/models/Kimi-K2.5}"
 TP_SIZE="${TP_SIZE:-8}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
+LOAD_FORMAT="${LOAD_FORMAT:-dummy}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 
 PREFILL_HOST="${PREFILL_HOST:-10.96.191.99}"
 DECODE_HOST="${DECODE_HOST:-10.96.191.100}"
+DECODE_SSH_HOST="${DECODE_SSH_HOST:-$DECODE_HOST}"
 PREFILL_PORT="${PREFILL_PORT:-18101}"
 DECODE_PORT="${DECODE_PORT:-18102}"
 PROXY_PORT="${PROXY_PORT:-18100}"
@@ -22,17 +24,23 @@ VENV="${VENV:-/root/develop/xingming/pegaflow-rdma-e2e/.venv}"
 LOG_DIR="${LOG_DIR:-$REPO_ROOT/pd_h20_logs}"
 mkdir -p "$LOG_DIR"
 
-RANK_MAP="${RANK_MAP:-{\"0\":{\"nic\":\"mlx5_1\",\"worker_cpu\":30},\"1\":{\"nic\":\"mlx5_1\",\"worker_cpu\":31},\"2\":{\"nic\":\"mlx5_2\",\"worker_cpu\":60},\"3\":{\"nic\":\"mlx5_2\",\"worker_cpu\":61},\"4\":{\"nic\":\"mlx5_3\",\"worker_cpu\":150},\"5\":{\"nic\":\"mlx5_3\",\"worker_cpu\":151},\"6\":{\"nic\":\"mlx5_4\",\"worker_cpu\":180},\"7\":{\"nic\":\"mlx5_4\",\"worker_cpu\":181}}}"
+if [[ -z "${RANK_MAP:-}" ]]; then
+  RANK_MAP='{"0":{"nic":"mlx5_1","worker_cpu":16},"1":{"nic":"mlx5_1","worker_cpu":30},"2":{"nic":"mlx5_2","worker_cpu":60},"3":{"nic":"mlx5_2","worker_cpu":90},"4":{"nic":"mlx5_3","worker_cpu":120},"5":{"nic":"mlx5_3","worker_cpu":150},"6":{"nic":"mlx5_4","worker_cpu":180},"7":{"nic":"mlx5_4","worker_cpu":210}}'
+fi
 
 usage() {
   cat <<EOF
 Usage: $0 {start-prefill|start-decode|start-proxy|status|stop|smoke}
+       $0 start-cluster  # run on the prefill/proxy node
 
 Defaults:
   MODEL=$MODEL
   VENV=$VENV
+  MAX_MODEL_LEN=${MAX_MODEL_LEN:-<model default>}
+  LOAD_FORMAT=$LOAD_FORMAT
   PREFILL=http://$PREFILL_HOST:$PREFILL_PORT
   DECODE=http://$DECODE_HOST:$DECODE_PORT
+  DECODE_SSH_HOST=$DECODE_SSH_HOST
   PROXY=http://0.0.0.0:$PROXY_PORT
   LOG_DIR=$LOG_DIR
 
@@ -65,7 +73,8 @@ wait_ready() {
   local port="$2"
   local pid="$3"
   local log_file="$4"
-  for _ in $(seq 1 240); do
+  local deadline=$((SECONDS + TIMEOUT_S))
+  while (( SECONDS < deadline )); do
     if curl -sf "http://127.0.0.1:$port/health" >/dev/null 2>&1; then
       echo "[$name] ready on port $port"
       return
@@ -87,7 +96,11 @@ start_vllm() {
   local log_file="$LOG_DIR/$name.log"
   local pid_file="$LOG_DIR/$name.pid"
   local config
+  local max_model_len_args=()
   config="$(kv_config "$engine_id")"
+  if [[ -n "$MAX_MODEL_LEN" ]]; then
+    max_model_len_args=(--max-model-len "$MAX_MODEL_LEN")
+  fi
 
   if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" >/dev/null 2>&1; then
     echo "[$name] already running pid=$(cat "$pid_file")"
@@ -105,7 +118,8 @@ start_vllm() {
     --port "$port" \
     --tensor-parallel-size "$TP_SIZE" \
     --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
-    --max-model-len "$MAX_MODEL_LEN" \
+    --load-format "$LOAD_FORMAT" \
+    "${max_model_len_args[@]}" \
     --trust-remote-code \
     --no-enable-prefix-caching \
     --kv-transfer-config "$config" \
@@ -135,6 +149,30 @@ start_proxy() {
     >"$log_file" 2>&1 &
   echo "$!" >"$pid_file"
   sleep 1
+}
+
+start_cluster() {
+  local prefill_launch_log="$LOG_DIR/start-prefill.launch.log"
+  local decode_launch_log="$LOG_DIR/start-decode.launch.log"
+  local quoted_repo_root
+  printf -v quoted_repo_root "%q" "$REPO_ROOT"
+
+  echo "[cluster] starting prefill locally and decode on $DECODE_SSH_HOST"
+  "$0" start-prefill >"$prefill_launch_log" 2>&1 &
+  local prefill_launcher=$!
+  ssh "$DECODE_SSH_HOST" "cd $quoted_repo_root && scripts/run_pd_h20_kimi.sh start-decode" \
+    >"$decode_launch_log" 2>&1 &
+  local decode_launcher=$!
+
+  local failed=0
+  wait "$prefill_launcher" || failed=1
+  wait "$decode_launcher" || failed=1
+  if [[ "$failed" != 0 ]]; then
+    echo "[cluster] start failed; check $prefill_launch_log and $decode_launch_log" >&2
+    exit 1
+  fi
+
+  start_proxy
 }
 
 stop_all() {
@@ -180,6 +218,9 @@ case "$ROLE" in
     ;;
   start-proxy)
     start_proxy
+    ;;
+  start-cluster)
+    start_cluster
     ;;
   status)
     status

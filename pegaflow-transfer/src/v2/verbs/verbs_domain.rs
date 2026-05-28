@@ -104,6 +104,7 @@ pub struct VerbsDomain {
     recv_ops: VecDeque<RecvOpContext>,
     send_ops: VecDeque<SendOpContext>,
     write_ops: VecDeque<NonNull<WriteOpContext>>,
+    write_op_contexts: HashSet<NonNull<WriteOpContext>>,
     completions: VecDeque<DomainCompletionEntry>,
 
     ud_mempool: MemoryPool,
@@ -357,6 +358,7 @@ impl VerbsDomain {
                 recv_ops: VecDeque::with_capacity(MAX_OPS),
                 send_ops: VecDeque::with_capacity(MAX_OPS),
                 write_ops: VecDeque::with_capacity(MAX_OPS),
+                write_op_contexts: HashSet::with_capacity(MAX_OPS),
                 completions: VecDeque::with_capacity(MAX_OPS),
 
                 ud_mempool,
@@ -549,24 +551,19 @@ impl VerbsDomain {
         debug!("handle_peer_handshake: domain={} info={info:?}", self.name);
         let peer_addr = DomainAddress::from(&info.ud_addr);
 
-        let peer = if let Some(peer) = self.peers.get_mut(&peer_addr) {
+        let send_response = if let Some(peer) = self.peers.get(&peer_addr) {
             if let PeerState::Established = peer.state {
                 return Ok(());
             }
-            peer
+            false
         } else {
-            // TODO: unify the code with do_submit
             let peer = self.create_peer(&peer_addr, vec![], vec![])?;
             self.peers.insert(peer_addr.clone(), peer);
-            let peer = unsafe { self.peers.get(&peer_addr).unwrap_unchecked() };
-            let buf = unsafe { self.ud_mempool.alloc() }.ok_or(FabricLibError::Custom(
-                "Failed to allocate UD message buffer",
-            ))?;
-            self.connect_peer(peer, buf)?;
-            unsafe { self.peers.get_mut(&peer_addr).unwrap_unchecked() }
+            true
         };
 
         // Activate QP
+        let peer = unsafe { self.peers.get_mut(&peer_addr).unwrap_unchecked() };
 
         let pkey_index = 0; // TODO: get pkey_index
         peer.msg_rc.rc_reset_to_init(self.port_num, pkey_index)?;
@@ -619,6 +616,15 @@ impl VerbsDomain {
         // Submit pending submits
         let msg_qp = peer.msg_rc.qp;
         let rma_qp = peer.rma_rc.qp;
+
+        if send_response {
+            let buf = unsafe { self.ud_mempool.alloc() }.ok_or(FabricLibError::Custom(
+                "Failed to allocate UD message buffer",
+            ))?;
+            let peer = unsafe { self.peers.get(&peer_addr).unwrap_unchecked() };
+            self.connect_peer(peer, buf)?;
+        }
+
         for (transfer_id, op) in pending_submits {
             self.do_submit_outbound_op(transfer_id, op, msg_qp, rma_qp);
         }
@@ -843,6 +849,7 @@ impl VerbsDomain {
             })
         };
         let context_ptr = unsafe { NonNull::new_unchecked(context) };
+        self.write_op_contexts.insert(context_ptr);
 
         // Try to eagerly post if currently there's no pending write ops.
         Self::progress_rdma_write_op_context(context);
@@ -971,6 +978,7 @@ impl VerbsDomain {
         if context.in_queue {
             return;
         }
+        self.write_op_contexts.remove(&ptr);
         unsafe { self.objpool_wr.free_and_drop(context.wr_chain_buffer) };
         unsafe { self.objpool_write_op.free_and_drop(ptr) };
     }
@@ -1047,29 +1055,27 @@ impl VerbsDomain {
 
         // Check if the completion is an error.
         if wc.status != IBV_WC_SUCCESS {
-            let transfer_id: Option<TransferId> = match wc.opcode {
-                IBV_WC_RECV | IBV_WC_SEND => {
-                    Some(unsafe { transmute::<u64, TransferId>(wc.wr_id) })
-                }
-                IBV_WC_RDMA_WRITE => {
-                    if let Some(context) = unsafe { (wc.wr_id as *mut WriteOpContext).as_mut() } {
-                        context.cnt_finished_ops += 1;
-                        let ret = if context.bad {
-                            None
-                        } else {
-                            // Return error to the caller only once.
-                            context.bad = true;
-                            Some(context.transfer_id)
-                        };
-                        self.maybe_drop_write_op_context(unsafe {
-                            NonNull::new_unchecked(context)
-                        });
-                        ret
-                    } else {
-                        None
+            let write_context = NonNull::new(wc.wr_id as *mut WriteOpContext)
+                .filter(|ptr| self.write_op_contexts.contains(ptr));
+            let transfer_id: Option<TransferId> = if let Some(mut ptr) = write_context {
+                let context = unsafe { ptr.as_mut() };
+                context.cnt_finished_ops += 1;
+                let ret = if context.bad {
+                    None
+                } else {
+                    // Return error to the caller only once.
+                    context.bad = true;
+                    Some(context.transfer_id)
+                };
+                self.maybe_drop_write_op_context(ptr);
+                ret
+            } else {
+                match wc.opcode {
+                    IBV_WC_RECV | IBV_WC_SEND => {
+                        Some(unsafe { transmute::<u64, TransferId>(wc.wr_id) })
                     }
+                    _ => None,
                 }
-                _ => None,
             };
             let errmsg = unsafe {
                 CStr::from_ptr(ibv_wc_status_str(wc.status))
@@ -1078,8 +1084,8 @@ impl VerbsDomain {
             };
             return if let Some(transfer_id) = transfer_id {
                 warn!(
-                    "Encountered RDMA op error. Send DomainCompletionEntry::Error to the caller: domain={} wr_id={} status={} opcode={}",
-                    self.name, wc.wr_id, wc.status, wc.opcode
+                    "Encountered RDMA op error. Send DomainCompletionEntry::Error to the caller: domain={} wr_id={} status={} msg={} opcode={} vendor_err={} qp_num={}",
+                    self.name, wc.wr_id, wc.status, errmsg, wc.opcode, wc.vendor_err, wc.qp_num
                 );
                 Some(DomainCompletionEntry::Error(
                     transfer_id,
