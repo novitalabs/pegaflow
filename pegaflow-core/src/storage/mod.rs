@@ -199,7 +199,7 @@ impl StorageEngine {
             });
 
             let ssd_store = ssd_cache_config
-                .and_then(|cfg| crate::backing::new_ssd(cfg, allocate_fn.clone(), is_numa));
+                .map(|cfg| crate::backing::new_ssd(cfg, allocate_fn.clone(), is_numa));
 
             let rdma_fetch = rdma_transport.as_ref().and_then(|rdma| {
                 let ms = metaserver_client.as_ref()?;
