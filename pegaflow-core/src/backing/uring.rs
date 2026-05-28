@@ -22,6 +22,10 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 use tokio::sync::oneshot;
 
+use super::SSD_ALIGNMENT;
+
+const DEFAULT_URING_THREADS: usize = 16;
+
 /// Configuration for io_uring engine.
 #[derive(Debug, Clone)]
 pub(super) struct UringConfig {
@@ -36,7 +40,7 @@ pub(super) struct UringConfig {
 impl Default for UringConfig {
     fn default() -> Self {
         Self {
-            threads: 1,
+            threads: DEFAULT_URING_THREADS,
             io_depth: 128,
             sqpoll: false,
             sqpoll_idle: 10,
@@ -52,6 +56,7 @@ enum IoType {
 
 struct IoCtx {
     io_type: IoType,
+    fd: RawFd,
     len: usize,
     offset: u64,
     complete: oneshot::Sender<io::Result<usize>>,
@@ -70,7 +75,7 @@ struct UringShard {
 }
 
 impl UringShard {
-    fn run(mut self, fd: RawFd) {
+    fn run(mut self) {
         let mut inflight = 0usize;
         let mut channel_closed = false;
 
@@ -102,7 +107,7 @@ impl UringShard {
                     None => break,
                 };
 
-                let fd = Fd(fd);
+                let fd = Fd(ctx.fd);
                 let sqe = match ctx.io_type {
                     IoType::Readv => {
                         let iovecs_ptr = ctx
@@ -195,8 +200,9 @@ impl UringShard {
     }
 }
 
-/// io_uring based engine for single-file read/write.
+/// io_uring based engine for read/write against one or more cache files.
 pub(super) struct UringIoEngine {
+    fds: Vec<RawFd>,
     txs: Vec<mpsc::SyncSender<IoCtx>>,
     #[allow(
         dead_code,
@@ -206,18 +212,24 @@ pub(super) struct UringIoEngine {
 }
 
 impl UringIoEngine {
-    pub(super) fn new(fd: RawFd, cfg: UringConfig) -> io::Result<Self> {
+    pub(super) fn new_multi(fds: Vec<RawFd>, cfg: UringConfig) -> io::Result<Self> {
         if cfg.threads == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "threads must be > 0",
             ));
         }
+        if fds.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "at least one fd is required",
+            ));
+        }
 
         let mut txs = Vec::with_capacity(cfg.threads);
         let mut handles = Vec::with_capacity(cfg.threads);
 
-        for _ in 0..cfg.threads {
+        for idx in 0..cfg.threads {
             let (tx, rx) = mpsc::sync_channel(cfg.io_depth * 2);
             let mut builder = IoUring::builder();
             if cfg.sqpoll {
@@ -230,22 +242,57 @@ impl UringIoEngine {
                 io_depth: cfg.io_depth,
             };
             let handle = std::thread::Builder::new()
-                .name("pegaflow-uring".to_string())
-                .spawn(move || shard.run(fd))?;
+                .name(format!("pegaflow-uring-{idx}"))
+                .spawn(move || shard.run())?;
             txs.push(tx);
             handles.push(handle);
         }
 
-        Ok(Self { txs, handles })
+        Ok(Self { fds, txs, handles })
     }
 
-    fn pick_tx(&self, offset: u64) -> &mpsc::SyncSender<IoCtx> {
+    fn pick_tx(&self, shard_id: usize) -> &mpsc::SyncSender<IoCtx> {
         let idx = if self.txs.len() == 1 {
             0
         } else {
-            (offset as usize / 4096) % self.txs.len()
+            shard_id % self.txs.len()
         };
         &self.txs[idx]
+    }
+
+    fn fd(&self, shard_id: usize) -> io::Result<RawFd> {
+        self.fds.get(shard_id).copied().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid SSD shard id {shard_id}"),
+            )
+        })
+    }
+
+    fn validate_direct_io(
+        iovecs: impl IntoIterator<Item = (usize, usize)>,
+        offset: u64,
+    ) -> io::Result<()> {
+        Self::ensure_aligned("offset", offset as usize)?;
+        for (addr, len) in iovecs {
+            Self::ensure_aligned("buffer address", addr)?;
+            Self::ensure_aligned("iovec length", len)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_aligned(name: &str, value: usize) -> io::Result<()>
+    where
+        Self: Sized,
+    {
+        if value.is_multiple_of(SSD_ALIGNMENT) {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("O_DIRECT {name} {value:#x} is not {SSD_ALIGNMENT}-byte aligned"),
+            ))
+        }
     }
 
     /// Vectorized read (readv) - reads into multiple buffers in a single syscall.
@@ -258,6 +305,7 @@ impl UringIoEngine {
     /// Caller must ensure all buffer pointers remain valid until the returned receiver completes.
     pub(super) fn readv_at_async(
         &self,
+        shard_id: usize,
         iovecs: Vec<(*mut u8, usize)>,
         offset: u64,
     ) -> io::Result<oneshot::Receiver<io::Result<usize>>> {
@@ -267,6 +315,10 @@ impl UringIoEngine {
                 "readv requires at least one iovec",
             ));
         }
+        Self::validate_direct_io(
+            iovecs.iter().map(|(ptr, len)| (*ptr as usize, *len)),
+            offset,
+        )?;
 
         let iovecs_libc: Box<[libc::iovec]> = iovecs
             .iter()
@@ -280,13 +332,14 @@ impl UringIoEngine {
         let (tx, rx) = oneshot::channel();
         let ctx = IoCtx {
             io_type: IoType::Readv,
+            fd: self.fd(shard_id)?,
             len: iovec_count,
             offset,
             complete: tx,
             iovecs: Some(iovecs_libc),
         };
 
-        self.pick_tx(offset).send(ctx).map_err(|e| {
+        self.pick_tx(shard_id).send(ctx).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 format!("io_uring readv send failed: {e}"),
@@ -305,6 +358,7 @@ impl UringIoEngine {
     /// Caller must ensure all buffer pointers remain valid until the returned receiver completes.
     pub(super) fn writev_at_async(
         &self,
+        shard_id: usize,
         iovecs: Vec<(*const u8, usize)>,
         offset: u64,
     ) -> io::Result<oneshot::Receiver<io::Result<usize>>> {
@@ -314,6 +368,10 @@ impl UringIoEngine {
                 "writev requires at least one iovec",
             ));
         }
+        Self::validate_direct_io(
+            iovecs.iter().map(|(ptr, len)| (*ptr as usize, *len)),
+            offset,
+        )?;
 
         // Convert to libc::iovec
         let iovecs_libc: Box<[libc::iovec]> = iovecs
@@ -328,13 +386,14 @@ impl UringIoEngine {
         let (tx, rx) = oneshot::channel();
         let ctx = IoCtx {
             io_type: IoType::Writev,
+            fd: self.fd(shard_id)?,
             len: iovec_count, // number of iovecs
             offset,
             complete: tx,
             iovecs: Some(iovecs_libc),
         };
 
-        self.pick_tx(offset).send(ctx).map_err(|e| {
+        self.pick_tx(shard_id).send(ctx).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 format!("io_uring writev send failed: {e}"),
@@ -351,5 +410,31 @@ impl Drop for UringIoEngine {
         for handle in self.handles.drain(..) {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_direct_io_rejects_unaligned_offset() {
+        let iovecs = vec![(SSD_ALIGNMENT, SSD_ALIGNMENT)];
+        let err = UringIoEngine::validate_direct_io(iovecs, 1).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn validate_direct_io_rejects_unaligned_buffer() {
+        let iovecs = vec![(SSD_ALIGNMENT + 1, SSD_ALIGNMENT)];
+        let err = UringIoEngine::validate_direct_io(iovecs, 0).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn validate_direct_io_rejects_unaligned_length() {
+        let iovecs = vec![(SSD_ALIGNMENT, SSD_ALIGNMENT - 1)];
+        let err = UringIoEngine::validate_direct_io(iovecs, 0).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 }

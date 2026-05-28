@@ -3,6 +3,7 @@ use log::{debug, warn};
 use mea::oneshot;
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
@@ -36,10 +37,10 @@ pub const DEFAULT_SSD_WRITE_INFLIGHT: usize = 2;
 /// Default max concurrent prefetches
 pub const DEFAULT_SSD_PREFETCH_INFLIGHT: usize = 16;
 
-/// Result of a single prefetch I/O: (key, begin_offset, block, duration_secs, block_size, ctx)
+/// Result of a single prefetch I/O.
 type SinglePrefetchResult = (
     BlockKey,
-    u64,
+    SsdIndexEntry,
     Option<Arc<SealedBlock>>,
     f64,
     u64,
@@ -57,6 +58,8 @@ pub struct SsdCacheConfig {
     pub cache_path: PathBuf,
     /// Total logical capacity of the cache (bytes).
     pub capacity_bytes: u64,
+    /// Number of cache files. 1 keeps the existing single-file SSD layout.
+    pub shards: NonZeroUsize,
     /// Max pending write batches. New sealed blocks are dropped if the queue is full.
     pub write_queue_depth: usize,
     /// Max pending prefetch batches (limits read tail latency).
@@ -72,6 +75,7 @@ impl Default for SsdCacheConfig {
         Self {
             cache_path: PathBuf::from("/tmp/pegaflow-ssd-cache/cache.bin"),
             capacity_bytes: 512 * 1024 * 1024 * 1024, // 512GB
+            shards: NonZeroUsize::new(1).unwrap(),
             write_queue_depth: DEFAULT_SSD_WRITE_QUEUE_DEPTH,
             prefetch_queue_depth: DEFAULT_SSD_PREFETCH_QUEUE_DEPTH,
             write_inflight: DEFAULT_SSD_WRITE_INFLIGHT,
@@ -87,6 +91,8 @@ impl Default for SsdCacheConfig {
 /// Metadata for a block stored in SSD cache
 #[derive(Clone)]
 pub(super) struct SsdIndexEntry {
+    /// Cache file shard containing this entry.
+    pub shard_id: usize,
     /// Logical offset in the ring buffer (monotonically increasing)
     pub begin: u64,
     /// Block size in bytes
@@ -108,11 +114,18 @@ pub(super) enum SsdEntryState {
 
 impl SsdEntryState {
     #[inline]
-    fn begin(&self) -> u64 {
+    fn entry(&self) -> &SsdIndexEntry {
         match self {
-            Self::Writing(e) | Self::Committed(e) => e.begin,
+            Self::Writing(e) | Self::Committed(e) => e,
         }
     }
+}
+
+struct SsdShardRing {
+    capacity: u64,
+    head: u64,
+    tail: u64,
+    order: VecDeque<BlockKey>,
 }
 
 /// SSD ring buffer: unified state for space allocation + block index.
@@ -123,14 +136,10 @@ impl SsdEntryState {
 /// Two-phase commit: prepare_batch inserts Writing state, commit transitions
 /// to Committed (or removes on failure). Only Committed entries are readable.
 pub(super) struct SsdRingBuffer {
-    /// Ring buffer capacity in bytes
-    capacity: u64,
-    /// Next write position (logical, monotonically increasing)
-    head: u64,
-    /// Oldest valid position (logical); entries with begin < tail are invalid
-    tail: u64,
-    /// Keys ordered by insertion time (oldest at front, may contain stale keys)
-    order: VecDeque<BlockKey>,
+    /// Per-file ring state.
+    shards: Vec<SsdShardRing>,
+    /// Round-robin cursor for selecting the next write shard.
+    next_shard: usize,
     /// Fast lookup: key -> state (Writing or Committed)
     entries: HashMap<BlockKey, SsdEntryState>,
 }
@@ -138,11 +147,25 @@ pub(super) struct SsdRingBuffer {
 impl SsdRingBuffer {
     /// Create a new ring buffer with given capacity.
     pub(super) fn new(capacity: u64) -> Self {
+        Self::new_sharded(vec![capacity])
+    }
+
+    pub(super) fn new_sharded(shard_capacities: Vec<u64>) -> Self {
+        assert!(
+            !shard_capacities.is_empty(),
+            "SSD cache needs at least one shard"
+        );
         Self {
-            capacity,
-            head: 0,
-            tail: 0,
-            order: VecDeque::new(),
+            shards: shard_capacities
+                .into_iter()
+                .map(|capacity| SsdShardRing {
+                    capacity,
+                    head: 0,
+                    tail: 0,
+                    order: VecDeque::new(),
+                })
+                .collect(),
+            next_shard: 0,
             entries: HashMap::new(),
         }
     }
@@ -151,7 +174,7 @@ impl SsdRingBuffer {
     #[cfg(test)]
     pub(super) fn has_valid_entry(&self, key: &BlockKey) -> bool {
         match self.entries.get(key) {
-            Some(SsdEntryState::Committed(e)) => e.begin >= self.tail,
+            Some(SsdEntryState::Committed(e)) => self.is_offset_valid(e),
             _ => false,
         }
     }
@@ -159,51 +182,59 @@ impl SsdRingBuffer {
     /// Lookup a Committed entry by key, returning None if Writing or expired.
     pub(super) fn get(&self, key: &BlockKey) -> Option<&SsdIndexEntry> {
         match self.entries.get(key) {
-            Some(SsdEntryState::Committed(e)) if e.begin >= self.tail => Some(e),
+            Some(SsdEntryState::Committed(e)) if self.is_offset_valid(e) => Some(e),
             _ => None,
         }
     }
 
     /// Check if a logical offset is still valid (not yet overwritten).
     #[inline]
-    pub(super) fn is_offset_valid(&self, begin: u64) -> bool {
-        begin >= self.tail
+    pub(super) fn is_offset_valid(&self, entry: &SsdIndexEntry) -> bool {
+        self.shards
+            .get(entry.shard_id)
+            .is_some_and(|shard| entry.begin >= shard.tail)
     }
 
     /// Allocate contiguous space for a batch and advance tail.
-    /// Returns (logical_begin, file_offset). Skips wrap-around gap if needed.
-    fn allocate_contiguous(&mut self, size: u64) -> (u64, u64) {
-        let phys = self.head % self.capacity;
-        let space_until_end = self.capacity - phys;
+    /// Returns (begin, file_offset). Skips wrap-around gap if needed.
+    fn allocate_contiguous(&mut self, shard_id: usize, size: u64) -> Option<(u64, u64)> {
+        let shard = &mut self.shards[shard_id];
+        if size > shard.capacity {
+            return None;
+        }
+        let phys = shard.head % shard.capacity;
+        let space_until_end = shard.capacity - phys;
         if size > space_until_end {
             // Skip to next wrap point
-            self.head += space_until_end;
+            shard.head += space_until_end;
         }
-        let begin = self.head;
-        self.head += size;
+        let begin = shard.head;
+        shard.head += size;
 
         // Advance tail to maintain invariant: head - tail <= capacity
-        let new_tail = self.head.saturating_sub(self.capacity);
-        self.advance_tail(new_tail);
+        let new_tail = shard.head.saturating_sub(shard.capacity);
+        let capacity = shard.capacity;
+        self.advance_tail(shard_id, new_tail);
 
-        (begin, begin % self.capacity)
+        Some((begin, begin % capacity))
     }
 
     /// Advance tail and prune expired entries (FIFO order).
     /// Handles both Writing and Committed states uniformly.
-    fn advance_tail(&mut self, new_tail: u64) {
-        if new_tail <= self.tail {
+    fn advance_tail(&mut self, shard_id: usize, new_tail: u64) {
+        if new_tail <= self.shards[shard_id].tail {
             return;
         }
-        self.tail = new_tail;
+        self.shards[shard_id].tail = new_tail;
 
-        while let Some(key) = self.order.front() {
+        while let Some(key) = self.shards[shard_id].order.front() {
             match self.entries.get(key) {
-                // Valid entry (Writing or Committed) with begin >= new_tail -> stop
-                Some(state) if state.begin() >= new_tail => break,
-                // Expired or already removed (aborted) -> clean up
+                Some(state) if state.entry().begin >= new_tail => break,
                 _ => {
-                    let key = self.order.pop_front().unwrap();
+                    let key = self.shards[shard_id]
+                        .order
+                        .pop_front()
+                        .expect("front key exists");
                     self.entries.remove(&key);
                 }
             }
@@ -228,7 +259,7 @@ impl SsdRingBuffer {
         };
 
         // Check if expired (eviction faster than write)
-        if entry.begin < self.tail {
+        if !self.is_offset_valid(entry) {
             warn!("SSD commit: entry expired before IO completed");
             self.entries.remove(key);
             return false;
@@ -263,56 +294,55 @@ impl SsdRingBuffer {
             return PreparedBatch::empty();
         }
 
-        // 2. Allocate contiguous space
-        let total_size: u64 = to_write.iter().map(|(_, b)| b.memory_footprint()).sum();
-        let (batch_begin, batch_file_offset) = self.allocate_contiguous(total_size);
-
-        // 3. Insert Writing state and build WriteInfo
-        let mut offset = 0u64;
-        let writes = to_write
-            .into_iter()
-            .map(|(key, block)| {
-                let size = block.memory_footprint();
-                let slot_numas = block.slot_numas();
-                debug_assert!(
-                    slot_numas.is_empty() || slot_numas.len() == block.slots().len(),
-                    "slot_numas length mismatch: {} vs {}",
-                    slot_numas.len(),
-                    block.slots().len(),
+        // 2. Insert Writing state and build WriteInfo
+        let mut writes = Vec::with_capacity(to_write.len());
+        for (key, block) in to_write {
+            let size = block.memory_footprint();
+            let shard_id = self.next_shard;
+            let Some((begin, file_offset)) = self.allocate_contiguous(shard_id, size) else {
+                warn!(
+                    "SSD cache: dropping block {:?}, size {} exceeds shard capacity {}",
+                    key, size, self.shards[shard_id].capacity
                 );
-                let slots: Vec<SlotMeta> = block
-                    .slots()
-                    .iter()
-                    .enumerate()
-                    .map(|(i, s)| {
-                        let segment_sizes: SmallVec<[u64; 2]> = (0..s.num_segments())
-                            .map(|idx| s.segment_size(idx).unwrap() as u64)
-                            .collect();
-                        SlotMeta::new(
-                            segment_sizes,
-                            slot_numas.get(i).copied().unwrap_or(NumaNode::UNKNOWN),
-                        )
-                    })
-                    .collect();
+                continue;
+            };
+            self.next_shard = (self.next_shard + 1) % self.shards.len();
+            let slot_numas = block.slot_numas();
+            debug_assert!(
+                slot_numas.is_empty() || slot_numas.len() == block.slots().len(),
+                "slot_numas length mismatch: {} vs {}",
+                slot_numas.len(),
+                block.slots().len(),
+            );
+            let slots: Vec<SlotMeta> = block
+                .slots()
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    let segment_sizes: SmallVec<[u64; 2]> = (0..s.num_segments())
+                        .map(|idx| s.segment_size(idx).unwrap() as u64)
+                        .collect();
+                    SlotMeta::new(
+                        segment_sizes,
+                        slot_numas.get(i).copied().unwrap_or(NumaNode::UNKNOWN),
+                    )
+                })
+                .collect();
+            let entry = SsdIndexEntry {
+                shard_id,
+                begin,
+                len: size,
+                file_offset,
+                slots,
+            };
 
-                let file_offset = batch_file_offset + offset;
-                let entry = SsdIndexEntry {
-                    begin: batch_begin + offset,
-                    len: size,
-                    file_offset,
-                    slots,
-                };
+            // Insert Writing state
+            self.entries
+                .insert(key.clone(), SsdEntryState::Writing(entry.clone()));
+            self.shards[shard_id].order.push_back(key.clone());
 
-                // Insert Writing state
-                self.entries
-                    .insert(key.clone(), SsdEntryState::Writing(entry.clone()));
-                self.order.push_back(key.clone());
-
-                let info = WriteInfo { key, block, entry };
-                offset += size;
-                info
-            })
-            .collect();
+            writes.push(WriteInfo { key, block, entry });
+        }
 
         PreparedBatch { writes }
     }
@@ -474,6 +504,7 @@ pub(super) async fn ssd_writer_loop(
                     let throughput = block_size as f64 / duration_secs;
                     metrics.ssd_write_throughput_bytes_per_second.record(throughput, &[]);
                 } else {
+                    metrics.ssd_write_failures.add(1, &[]);
                     warn!("SSD cache write failed for {:?}", key);
                 }
             }
@@ -560,6 +591,7 @@ async fn drain_inflight(
                 .ssd_write_throughput_bytes_per_second
                 .record(throughput, &[]);
         } else {
+            metrics.ssd_write_failures.add(1, &[]);
             warn!("SSD cache write failed for {:?}", key);
         }
     }
@@ -571,7 +603,13 @@ async fn execute_write(task: WriteTask, io: Arc<UringIoEngine>) -> WriteResult {
     let key = task.key;
     let block_size = task.block.memory_footprint();
 
-    let result = write_block_to_ssd(&io, task.entry.file_offset, &task.block).await;
+    let result = write_block_to_ssd(
+        &io,
+        task.entry.shard_id,
+        task.entry.file_offset,
+        &task.block,
+    )
+    .await;
 
     let duration_secs = start.elapsed().as_secs_f64();
     (key, result.is_ok(), duration_secs, block_size)
@@ -583,6 +621,7 @@ async fn execute_write(task: WriteTask, io: Arc<UringIoEngine>) -> WriteResult {
 /// compared to writing each slot separately.
 async fn write_block_to_ssd(
     io: &UringIoEngine,
+    shard_id: usize,
     offset: u64,
     block: &SealedBlock,
 ) -> std::io::Result<()> {
@@ -594,7 +633,7 @@ async fn write_block_to_ssd(
             .flat_map(|slot| seal_offload::write_iovecs(slot))
             .collect();
 
-        io.writev_at_async(iovecs, offset)?
+        io.writev_at_async(shard_id, iovecs, offset)?
     };
 
     rx.await
@@ -612,7 +651,6 @@ pub(super) async fn ssd_prefetch_loop(
     store: Weak<SsdBackingStore>,
     rx: tokio::sync::mpsc::Receiver<PrefetchBatch>,
     io: Arc<UringIoEngine>,
-    capacity: u64,
     prefetch_inflight: usize,
 ) {
     let prefetch_inflight = prefetch_inflight.max(1);
@@ -622,13 +660,7 @@ pub(super) async fn ssd_prefetch_loop(
 
     // Spawn dispatcher and worker
     let dispatcher = tokio::spawn(ssd_prefetch_dispatcher(store.clone(), rx, task_tx));
-    let worker = tokio::spawn(ssd_prefetch_worker(
-        store,
-        task_rx,
-        io,
-        capacity,
-        prefetch_inflight,
-    ));
+    let worker = tokio::spawn(ssd_prefetch_worker(store, task_rx, io, prefetch_inflight));
 
     // Wait for both to complete
     let _ = dispatcher.await;
@@ -775,7 +807,6 @@ async fn ssd_prefetch_worker(
     store: Weak<SsdBackingStore>,
     mut task_rx: tokio::sync::mpsc::Receiver<PrefetchTask>,
     io: Arc<UringIoEngine>,
-    capacity: u64,
     max_inflight: usize,
 ) {
     use std::future::Future;
@@ -791,11 +822,11 @@ async fn ssd_prefetch_worker(
             biased;
 
             // Complete finished tasks first (priority)
-            Some((key, begin, result, duration_secs, block_size, ctx)) = inflight.next(), if !inflight.is_empty() => {
+            Some((key, entry, result, duration_secs, block_size, ctx)) = inflight.next(), if !inflight.is_empty() => {
                 metrics.ssd_prefetch_inflight.add(-1, &[]);
 
                 // Validate data wasn't overwritten during read
-                let valid = store.upgrade().is_some_and(|s| s.is_offset_valid(begin));
+                let valid = store.upgrade().is_some_and(|s| s.is_offset_valid(&entry));
                 let result = if result.is_some() && !valid {
                     warn!("SSD prefetch: data overwritten during read, discarding");
                     metrics.ssd_prefetch_failures.add(1, &[]);
@@ -818,7 +849,7 @@ async fn ssd_prefetch_worker(
                 match task {
                     Some(t) => {
                         metrics.ssd_prefetch_inflight.add(1, &[]);
-                        inflight.push(Box::pin(execute_prefetch(t, io.clone(), capacity)));
+                        inflight.push(Box::pin(execute_prefetch(t, io.clone())));
                     }
                     None => {
                         // Channel closed, drain remaining
@@ -830,10 +861,10 @@ async fn ssd_prefetch_worker(
     }
 
     // Drain remaining inflight tasks
-    while let Some((key, begin, result, duration_secs, block_size, ctx)) = inflight.next().await {
+    while let Some((key, entry, result, duration_secs, block_size, ctx)) = inflight.next().await {
         metrics.ssd_prefetch_inflight.add(-1, &[]);
 
-        let valid = store.upgrade().is_some_and(|s| s.is_offset_valid(begin));
+        let valid = store.upgrade().is_some_and(|s| s.is_offset_valid(&entry));
         let result = if result.is_some() && !valid {
             metrics.ssd_prefetch_failures.add(1, &[]);
             None
@@ -856,25 +887,13 @@ async fn ssd_prefetch_worker(
 }
 
 /// Execute a single prefetch operation.
-async fn execute_prefetch(
-    task: PrefetchTask,
-    io: Arc<UringIoEngine>,
-    capacity: u64,
-) -> SinglePrefetchResult {
+async fn execute_prefetch(task: PrefetchTask, io: Arc<UringIoEngine>) -> SinglePrefetchResult {
     let start = Instant::now();
     let duration_secs = || start.elapsed().as_secs_f64();
 
     let key = task.key;
-    let begin = task.entry.begin;
     let block_size = task.entry.len;
     let ctx = task.ctx;
-
-    // Calculate physical offset in SSD file
-    let phys_offset = begin % capacity;
-    if phys_offset + block_size > capacity {
-        warn!("SSD prefetch: block wraps around ring buffer");
-        return (key, begin, None, duration_secs(), block_size, ctx);
-    }
 
     // Build iovecs from per-slot allocations
     let read_result = {
@@ -890,7 +909,7 @@ async fn execute_prefetch(
             })
             .collect();
 
-        io.readv_at_async(iovecs, phys_offset)
+        io.readv_at_async(task.entry.shard_id, iovecs, task.entry.file_offset)
     };
 
     // Await IO result and rebuild block
@@ -919,7 +938,7 @@ async fn execute_prefetch(
         }
     };
 
-    (key, begin, block, duration_secs(), block_size, ctx)
+    (key, task.entry, block, duration_secs(), block_size, ctx)
 }
 
 // ============================================================================
@@ -955,33 +974,33 @@ mod tests {
     }
 
     impl SsdRingBuffer {
+        fn test_entry(&self, shard_id: usize, begin: u64, len: u64) -> SsdIndexEntry {
+            SsdIndexEntry {
+                shard_id,
+                begin,
+                len,
+                file_offset: begin % self.shards[shard_id].capacity.max(1),
+                slots: vec![],
+            }
+        }
+
         /// Insert a Committed entry for testing. Returns the key.
         fn insert_committed(&mut self, n: u8, begin: u64, len: u64) -> BlockKey {
             let key = make_key(n);
-            let entry = SsdIndexEntry {
-                begin,
-                len,
-                file_offset: begin % self.capacity.max(1),
-                slots: vec![],
-            };
+            let entry = self.test_entry(0, begin, len);
             self.entries
                 .insert(key.clone(), SsdEntryState::Committed(entry));
-            self.order.push_back(key.clone());
+            self.shards[0].order.push_back(key.clone());
             key
         }
 
         /// Insert a Writing entry for testing. Returns the key.
         fn insert_writing(&mut self, n: u8, begin: u64, len: u64) -> BlockKey {
             let key = make_key(n);
-            let entry = SsdIndexEntry {
-                begin,
-                len,
-                file_offset: begin % self.capacity.max(1),
-                slots: vec![],
-            };
+            let entry = self.test_entry(0, begin, len);
             self.entries
                 .insert(key.clone(), SsdEntryState::Writing(entry));
-            self.order.push_back(key.clone());
+            self.shards[0].order.push_back(key.clone());
             key
         }
     }
@@ -994,23 +1013,29 @@ mod tests {
     fn test_allocate_contiguous_basic() {
         let mut ring = SsdRingBuffer::new(1000);
 
-        let (begin, offset) = ring.allocate_contiguous(100);
-        assert_eq!((begin, offset, ring.head, ring.tail), (0, 0, 100, 0));
+        let (begin, offset) = ring.allocate_contiguous(0, 100).unwrap();
+        assert_eq!(
+            (begin, offset, ring.shards[0].head, ring.shards[0].tail),
+            (0, 0, 100, 0)
+        );
 
-        let (begin, offset) = ring.allocate_contiguous(200);
-        assert_eq!((begin, offset, ring.head, ring.tail), (100, 100, 300, 0));
+        let (begin, offset) = ring.allocate_contiguous(0, 200).unwrap();
+        assert_eq!(
+            (begin, offset, ring.shards[0].head, ring.shards[0].tail),
+            (100, 100, 300, 0)
+        );
     }
 
     #[test]
     fn test_allocate_contiguous_wrap_around() {
         let mut ring = SsdRingBuffer::new(1000);
-        ring.allocate_contiguous(900);
+        ring.allocate_contiguous(0, 900).unwrap();
 
         // 200 bytes doesn't fit in remaining 100, skips to wrap point
-        let (begin, offset) = ring.allocate_contiguous(200);
+        let (begin, offset) = ring.allocate_contiguous(0, 200).unwrap();
         assert_eq!(begin, 1000); // skipped to wrap point
         assert_eq!(offset, 0); // wraps to file start
-        assert_eq!(ring.tail, 200); // head(1200) - capacity(1000)
+        assert_eq!(ring.shards[0].tail, 200); // head(1200) - capacity(1000)
     }
 
     #[test]
@@ -1018,11 +1043,11 @@ mod tests {
         let mut ring = SsdRingBuffer::new(1000);
         let key = ring.insert_committed(1, 0, 100);
 
-        ring.allocate_contiguous(600);
-        ring.allocate_contiguous(600); // head=1200, tail=200
+        ring.allocate_contiguous(0, 600).unwrap();
+        ring.allocate_contiguous(0, 600).unwrap(); // head=1200, tail=200
 
         assert!(!ring.entries.contains_key(&key));
-        assert!(ring.order.is_empty());
+        assert!(ring.shards[0].order.is_empty());
     }
 
     // ========================================================================
@@ -1032,11 +1057,11 @@ mod tests {
     #[test]
     fn test_is_offset_valid() {
         let mut ring = SsdRingBuffer::new(1000);
-        assert!(ring.is_offset_valid(0));
+        assert!(ring.is_offset_valid(&ring.test_entry(0, 0, 10)));
 
-        ring.tail = 50;
-        assert!(!ring.is_offset_valid(49));
-        assert!(ring.is_offset_valid(50));
+        ring.shards[0].tail = 50;
+        assert!(!ring.is_offset_valid(&ring.test_entry(0, 49, 10)));
+        assert!(ring.is_offset_valid(&ring.test_entry(0, 50, 10)));
     }
 
     // ========================================================================
@@ -1062,14 +1087,14 @@ mod tests {
 
         assert!(!ring.commit(&key, false));
         assert!(!ring.entries.contains_key(&key));
-        assert_eq!(ring.order.len(), 1); // order cleaned by advance_tail later
+        assert_eq!(ring.shards[0].order.len(), 1); // order cleaned by advance_tail later
     }
 
     #[test]
     fn test_commit_expired_entry() {
         let mut ring = SsdRingBuffer::new(1000);
         let key = ring.insert_writing(1, 100, 50);
-        ring.tail = 200; // expire it
+        ring.shards[0].tail = 200; // expire it
 
         assert!(!ring.commit(&key, true));
         assert!(!ring.entries.contains_key(&key));
@@ -1107,7 +1132,7 @@ mod tests {
         assert!(ring.has_valid_entry(&k_committed));
 
         // Expired: not readable
-        ring.tail = 250;
+        ring.shards[0].tail = 250;
         assert!(ring.get(&k_committed).is_none());
         assert!(!ring.has_valid_entry(&k_committed));
     }
@@ -1123,7 +1148,7 @@ mod tests {
         ring.insert_committed(1, 100, 50);
         ring.insert_committed(2, 200, 50);
 
-        ring.advance_tail(150);
+        ring.advance_tail(0, 150);
 
         assert_eq!(ring.entries.len(), 1);
         assert!(ring.get(&make_key(2)).is_some());
@@ -1133,13 +1158,13 @@ mod tests {
     fn test_advance_tail_cleans_ghost_entries() {
         let mut ring = SsdRingBuffer::new(1000);
         // Ghost: in order but not in entries (aborted write)
-        ring.order.push_back(make_key(1));
+        ring.shards[0].order.push_back(make_key(1));
         ring.insert_committed(2, 200, 50);
 
-        ring.advance_tail(100);
+        ring.advance_tail(0, 100);
 
-        assert_eq!(ring.order.len(), 1);
-        assert_eq!(ring.order.front(), Some(&make_key(2)));
+        assert_eq!(ring.shards[0].order.len(), 1);
+        assert_eq!(ring.shards[0].order.front(), Some(&make_key(2)));
     }
 
     #[test]
@@ -1147,7 +1172,7 @@ mod tests {
         let mut ring = SsdRingBuffer::new(1000);
         ring.insert_writing(1, 100, 50);
 
-        ring.advance_tail(50); // tail < begin, should preserve
+        ring.advance_tail(0, 50); // tail < begin, should preserve
 
         assert_eq!(ring.entries.len(), 1);
     }
@@ -1182,6 +1207,7 @@ mod tests {
         PrefetchRequest {
             key: make_key(n),
             entry: SsdIndexEntry {
+                shard_id: 0,
                 begin: 0,
                 len: total_size,
                 file_offset: 0,

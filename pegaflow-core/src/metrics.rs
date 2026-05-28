@@ -53,6 +53,7 @@ pub(crate) struct CoreMetrics {
 
     // SSD cache
     pub ssd_write_bytes: Counter<u64>,
+    pub ssd_write_failures: Counter<u64>,
     pub ssd_write_throughput_bytes_per_second: Histogram<f64>,
     pub ssd_write_queue_pending: UpDownCounter<i64>,
     pub ssd_write_queue_full: Counter<u64>,
@@ -300,6 +301,10 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
                 .u64_counter("pegaflow_ssd_write_bytes")
                 .with_unit("bytes")
                 .with_description("Bytes written to SSD cache")
+                .build(),
+            ssd_write_failures: meter
+                .u64_counter("pegaflow_ssd_write_failures")
+                .with_description("SSD write failures")
                 .build(),
             ssd_write_throughput_bytes_per_second: meter
                 .f64_histogram("pegaflow_ssd_write_throughput")
