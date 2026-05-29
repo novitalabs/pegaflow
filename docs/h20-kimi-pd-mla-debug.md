@@ -57,7 +57,14 @@ Before starting Kimi TP8 again, check for an idle 8-GPU host with idle
 `mlx5_1..4` NICs:
 
 ```bash
-uv run --no-project python scripts/find_h20_idle_gpus.py --require-free
+uv run --no-project python scripts/find_h20_idle_gpus.py --require-free --min-free-hosts 2
+```
+
+A short 16k proxy probe can use the same benchmark script without editing it:
+
+```bash
+LENGTHS=16384 NUM_PROMPTS=5 LABEL=kimi-proxy-fixed32k-probe \
+  scripts/run_h20_kimi_ttft_sweep.sh proxy
 ```
 
 ## Fixed Startup Contract For The Next Sweep

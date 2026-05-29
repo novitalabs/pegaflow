@@ -67,6 +67,7 @@ class HostResult:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("hosts", nargs="*", default=DEFAULT_HOSTS)
+    parser.add_argument("--min-free-hosts", type=int, default=1)
     parser.add_argument("--min-free-gpus", type=int, default=8)
     parser.add_argument("--busy-threshold-mib", type=int, default=1024)
     parser.add_argument("--connect-timeout-s", type=int, default=3)
@@ -79,10 +80,12 @@ def main() -> int:
     parser.add_argument(
         "--require-free",
         action="store_true",
-        help="exit 1 when no host has enough idle GPUs and idle requested NICs",
+        help="exit 1 unless at least --min-free-hosts hosts have enough idle GPUs and idle requested NICs",
     )
     args = parser.parse_args()
 
+    if args.min_free_hosts <= 0:
+        raise ValueError("--min-free-hosts must be positive")
     if args.min_free_gpus <= 0:
         raise ValueError("--min-free-gpus must be positive")
     if args.busy_threshold_mib < 0:
@@ -110,11 +113,14 @@ def main() -> int:
         expected_nics=len(nics),
         max_nic_gbps=args.max_nic_gbps,
     )
-    if args.require_free and not any(
-        result.has_enough_free_gpus(args.min_free_gpus, args.busy_threshold_mib)
-        and result.has_idle_nics(len(nics), args.max_nic_gbps)
-        for result in results
-    ):
+    free_hosts = count_free_hosts(
+        results,
+        min_free_gpus=args.min_free_gpus,
+        busy_threshold_mib=args.busy_threshold_mib,
+        expected_nics=len(nics),
+        max_nic_gbps=args.max_nic_gbps,
+    )
+    if args.require_free and free_hosts < args.min_free_hosts:
         return 1
     return 0
 
@@ -268,6 +274,21 @@ def parse_nic_traffic(output: str) -> list[NicTraffic]:
 def counter_gbps(counter_delta: int, sample_s: float) -> float:
     # IB port_xmit_data/port_rcv_data counters are 4-byte words.
     return counter_delta * 32 / sample_s / 1e9
+
+
+def count_free_hosts(
+    results: list[HostResult],
+    *,
+    min_free_gpus: int,
+    busy_threshold_mib: int,
+    expected_nics: int,
+    max_nic_gbps: float,
+) -> int:
+    return sum(
+        result.has_enough_free_gpus(min_free_gpus, busy_threshold_mib)
+        and result.has_idle_nics(expected_nics, max_nic_gbps)
+        for result in results
+    )
 
 
 def print_results(
