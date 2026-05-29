@@ -74,6 +74,14 @@ class SchedulerConnector:
     ) -> tuple[int | None, bool]:
         req_id = request.request_id
 
+        if not self._ctx.read_enabled:
+            logger.debug(
+                "[PegaKVConnector] req=%s cache_lookup_skipped: mode=%s",
+                req_id,
+                self._ctx.mode.value,
+            )
+            return (0, False)
+
         num_tokens = request.num_tokens
         block_hashes = request.block_hashes
 
@@ -255,7 +263,13 @@ class SchedulerConnector:
             if req.block_ids:
                 self._allocated_blocks[req_id] = list(req.block_ids[0])
 
-            self._scheduled_tokens[req_id] += num_tokens
+            if self._ctx.read_enabled:
+                self._scheduled_tokens[req_id] += num_tokens
+            else:
+                self._scheduled_tokens[req_id] = max(
+                    self._scheduled_tokens.get(req_id, 0),
+                    req.num_computed_tokens + num_tokens,
+                )
 
             if save_intent := self._consume_save_intent(req_id):
                 potential_saves[req_id] = save_intent
@@ -273,12 +287,22 @@ class SchedulerConnector:
                 self._block_hashes[req_id] = tuple(req.block_hashes)
 
             num_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
-            self._scheduled_tokens[req_id] += num_tokens
 
             # Append newly allocated blocks
             new_block_ids = cached_reqs.new_block_ids[idx]
-            if new_block_ids:
+            if req_id in cached_reqs.resumed_req_ids:
+                self._allocated_blocks[req_id] = list(new_block_ids[0]) if new_block_ids else []
+            elif new_block_ids:
                 self._allocated_blocks[req_id].extend(new_block_ids[0])
+
+            if self._ctx.read_enabled:
+                self._scheduled_tokens[req_id] += num_tokens
+            else:
+                prior_computed_tokens = cached_reqs.num_computed_tokens[idx]
+                self._scheduled_tokens[req_id] = max(
+                    self._scheduled_tokens.get(req_id, 0),
+                    prior_computed_tokens + num_tokens,
+                )
 
             if save_intent := self._consume_save_intent(req_id):
                 potential_saves[req_id] = save_intent

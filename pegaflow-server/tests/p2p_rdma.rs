@@ -13,13 +13,12 @@ use std::time::{Duration, Instant};
 
 use cudarc::driver::CudaContext;
 use cudarc::driver::sys;
-use parking_lot::Mutex;
 use pegaflow_core::sync_state::{LOAD_STATE_ERROR, LOAD_STATE_SUCCESS};
 use pegaflow_core::*;
 use pegaflow_metaserver::{BlockHashStore, GrpcMetaService};
 use pegaflow_proto::proto::engine::meta_server_server::MetaServerServer;
 use pegaflow_server::proto::engine::engine_server::EngineServer;
-use pegaflow_server::{CudaTensorRegistry, GrpcEngineService};
+use pegaflow_server::{CudaTensorRegistry, GrpcEngineService, RegistryHandle};
 use tokio::sync::Notify;
 use tonic::transport::Server;
 
@@ -154,7 +153,7 @@ async fn spawn_metaserver(port: u16) -> Arc<BlockHashStore> {
 
 async fn spawn_engine_server(engine: Arc<PegaEngine>, port: u16) {
     let registry = CudaTensorRegistry::new().expect("CudaTensorRegistry::new");
-    let registry = Arc::new(Mutex::new(registry));
+    let registry = RegistryHandle::spawn(registry);
     let shutdown = Arc::new(Notify::new());
     let hll_tracker = Arc::new(std::sync::Mutex::new(
         pegaflow_common::hll::MultiWindowHllTracker::new(

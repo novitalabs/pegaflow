@@ -5,7 +5,6 @@ use std::time::{Duration, Instant};
 
 use cudarc::driver::CudaContext;
 use cudarc::driver::sys;
-use parking_lot::Mutex;
 use pegaflow_core::sync_state::{LOAD_STATE_ERROR, LOAD_STATE_SUCCESS};
 use pegaflow_core::{LoadState, PegaEngine, PrefetchStatus, StorageConfig};
 use pegaflow_server::proto::engine::engine_client::EngineClient;
@@ -14,7 +13,7 @@ use pegaflow_server::proto::engine::{
     LeaseLoad, LoadRequest, LoadResponse, QueryRequest, QueryResponse, ReleaseRequest,
     ReleaseResponse, SaveLayer, SaveRequest, SaveResponse, SessionEvent, SessionRequest,
 };
-use pegaflow_server::{CudaTensorRegistry, GrpcEngineService};
+use pegaflow_server::{CudaTensorRegistry, GrpcEngineService, RegistryHandle};
 use tokio::sync::Notify;
 use tonic::transport::{Channel, Server};
 use tonic::{Status, Streaming};
@@ -425,7 +424,7 @@ async fn spawn_engine_server(
 ) {
     let port = unused_local_port();
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
-    let registry = Arc::new(Mutex::new(CudaTensorRegistry::empty()));
+    let registry = RegistryHandle::spawn(CudaTensorRegistry::empty());
     let shutdown = Arc::new(Notify::new());
     let hll_tracker = Arc::new(std::sync::Mutex::new(
         pegaflow_common::hll::MultiWindowHllTracker::new(

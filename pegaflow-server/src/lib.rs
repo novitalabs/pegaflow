@@ -13,7 +13,7 @@ mod trace {
 }
 mod utils;
 
-pub use registry::CudaTensorRegistry;
+pub use registry::{CudaTensorRegistry, RegistryHandle};
 pub use service::GrpcEngineService;
 
 use clap::Parser;
@@ -22,7 +22,6 @@ use log::{error, info, warn};
 use opentelemetry::global;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
-use parking_lot::Mutex;
 use pegaflow_core::PegaEngine;
 use prometheus::Registry;
 use proto::engine::engine_server::EngineServer;
@@ -467,7 +466,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         let msg = format_py_err(err);
         std::io::Error::other(format!("failed to initialize torch CUDA context: {msg}"))
     })?;
-    let registry = Arc::new(Mutex::new(registry));
+    // Confine the registry to its own thread: GIL + CUDA work now happens off
+    // the async runtime, so a wedged `empty_cache` can't starve tokio workers.
+    let registry = RegistryHandle::spawn(registry);
 
     if let Some(hint_value_size) = cli.hint_value_size {
         if hint_value_size == 0 {
@@ -593,7 +594,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
         let service = GrpcEngineService::new(
             Arc::clone(&engine),
-            Arc::clone(&registry),
+            registry.clone(),
             Arc::clone(&shutdown),
             Arc::clone(&hll_tracker),
         );
@@ -641,7 +642,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         let http_server_handle = http_server::start_http_server(
             cli.http_addr,
             Arc::clone(&engine),
-            Arc::clone(&registry),
+            registry,
             cli.enable_prometheus,
             metrics_state.prometheus_registry.clone(),
             Arc::clone(&shutdown),
