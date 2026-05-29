@@ -382,7 +382,7 @@ native write completion is not the long section:
 - `wait_sender_ms`: often about 1-2s
 - `schedule_to_imm_ms`: often about 1-2s
 - per-request `tail_gbps`: often about 8-9Gbps, sometimes lower under c4 queueing
-- future P-side logs include `ready_window_gbps`, `link_gbps`, and
+- current P-side logs include `ready_window_gbps`, `link_gbps`, and
   `ready_link_util_pct` to show how much of the selected NIC link is fed by
   layer-ready KV
 
@@ -391,13 +391,23 @@ D-side wait logs show large queueing under concurrency:
 - `queue_wait_ms`: often several seconds
 - Some requests later see near-zero `wait_ms`, because the P-side IMM already
   arrived before the D waiter reached that request.
-- future D-side logs include worker-level `finished_recving` timestamps plus
+- current D-side logs include worker-level `finished_recving` timestamps plus
   scheduler `proxy_to_finished_ms`, `matched_to_finished_ms`, and
   `wait_to_finished_ms`, so the post-RDMA D tail can be aligned with proxy first
   chunk timing.
 - the D-side RDMA done waiter now uses 8 fixed workers, so independent D
   requests can wait for IMM in parallel. P-side layer push remains one FIFO
   sender.
+
+Use the log summarizer after each run to keep the latency decomposition
+reproducible:
+
+```bash
+uv run --no-project python scripts/summarize_pd_connector_logs.py \
+  pd_h20_logs/prefill.log \
+  pd_h20_logs/decode.log \
+  pd_h20_logs/proxy.log
+```
 
 For the fixed 16k/c1 `handshakecache` run:
 

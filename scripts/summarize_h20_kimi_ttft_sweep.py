@@ -9,7 +9,6 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-
 INPUT_RE = re.compile(r"-in(?P<input_len>\d+)-")
 NIC_RE = re.compile(
     r"^(?P<nic>\S+) .*avg_xmit_gbps=(?P<avg_xmit>[0-9.]+) "

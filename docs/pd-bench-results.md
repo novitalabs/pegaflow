@@ -281,6 +281,15 @@ Decode node `h20-100` receive:
   wakeup. Increasing NIC count alone will not raise bandwidth until the upper
   pipeline can feed RDMA continuously.
 
+Summarize these fields after a run with:
+
+```bash
+uv run --no-project python scripts/summarize_pd_connector_logs.py \
+  pd_h20_logs/prefill.log \
+  pd_h20_logs/decode.log \
+  pd_h20_logs/proxy.log
+```
+
 ### Cleanup
 
 After this run, services were stopped on both nodes:
