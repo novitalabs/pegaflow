@@ -164,6 +164,19 @@ limited by native RDMA bandwidth. In the latest 16k/c1 run, D rank0
 the remaining TTFT delta is mostly before D scheduler matching plus work after
 `finished_recving`. One known later component is D-side last-token recompute.
 
+The 1s counter CSVs were also re-read with an active-sample filter
+(`>1Gbps` in the transfer direction). This avoids blaming only the idle tail:
+even while the serving transfer is active, P/D stays in single-digit to low
+teens Gbps per NIC.
+
+| input_len | P xmit active mean | P xmit active p95 | P xmit max 1s | D recv active mean | D recv active p95 | D recv max 1s |
+|-----------|--------------------|-------------------|---------------|--------------------|-------------------|---------------|
+| 1024 | 6.03Gbps | 6.36Gbps | 6.37Gbps | 7.18Gbps | 8.18Gbps | 8.80Gbps |
+| 4096 | 7.70Gbps | 8.35Gbps | 8.35Gbps | 7.24Gbps | 8.12Gbps | 8.80Gbps |
+| 8192 | 7.79Gbps | 8.80Gbps | 8.80Gbps | 7.17Gbps | 8.02Gbps | 10.00Gbps |
+| 16384 | 7.71Gbps | 8.50Gbps | 12.14Gbps | 7.83Gbps | 14.27Gbps | 18.53Gbps |
+| 30000 | 7.04Gbps | 7.78Gbps | 10.00Gbps | 7.04Gbps | 7.79Gbps | 10.56Gbps |
+
 Latest 16k/c1 log split:
 
 - D rank0 prefill dispatch: p50 0.07ms total, p95 0.14ms.

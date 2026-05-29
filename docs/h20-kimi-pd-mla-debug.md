@@ -353,6 +353,17 @@ Latest fixed 16k/c1 `waitmini` run: each P NIC transmitted 116.76GB over a
 Each D NIC received 116.76GB over a 139.4s window, averaging 6.70Gbps per NIC
 with max 1s peak 13.62Gbps.
 
+Re-reading the fixed c1 sweep CSVs with a `>1Gbps` active-sample filter shows
+the low serving bandwidth is not just idle tail dilution:
+
+| input_len | P xmit active mean | P xmit active p95 | P xmit max 1s | D recv active mean | D recv active p95 | D recv max 1s |
+|-----------|--------------------|-------------------|---------------|--------------------|-------------------|---------------|
+| 1024 | 6.03Gbps | 6.36Gbps | 6.37Gbps | 7.18Gbps | 8.18Gbps | 8.80Gbps |
+| 4096 | 7.70Gbps | 8.35Gbps | 8.35Gbps | 7.24Gbps | 8.12Gbps | 8.80Gbps |
+| 8192 | 7.79Gbps | 8.80Gbps | 8.80Gbps | 7.17Gbps | 8.02Gbps | 10.00Gbps |
+| 16384 | 7.71Gbps | 8.50Gbps | 12.14Gbps | 7.83Gbps | 14.27Gbps | 18.53Gbps |
+| 30000 | 7.04Gbps | 7.78Gbps | 10.00Gbps | 7.04Gbps | 7.79Gbps | 10.56Gbps |
+
 ## Log Evidence
 
 P-side final logs show about 1.1GB pushed per rank for a 16k request. However,
