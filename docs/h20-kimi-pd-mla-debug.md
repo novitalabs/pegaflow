@@ -53,6 +53,12 @@ Service endpoints:
 
 The services were stopped after the run.
 
+Before starting Kimi TP8 again, check for an idle 8-GPU host:
+
+```bash
+uv run --no-project python scripts/find_h20_idle_gpus.py --require-free
+```
+
 ## Fixed Startup Contract For The Next Sweep
 
 The final comparison must keep the vLLM serving shape fixed. Baseline and P/D
