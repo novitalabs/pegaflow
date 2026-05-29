@@ -2,6 +2,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::collections::HashMap;
+use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone)]
 pub struct TensorMetadata {
@@ -63,7 +64,7 @@ impl CudaTensorRegistry {
         }
     }
 
-    pub fn register_layer(
+    fn register_layer(
         &mut self,
         context_key: &str,
         layer_name: &str,
@@ -90,64 +91,54 @@ impl CudaTensorRegistry {
         Ok(metadata)
     }
 
-    pub fn drop_instance(&mut self, instance_id: &str) -> usize {
+    fn drop_instance(&mut self, instance_id: &str) -> usize {
         let prefix = format!("{instance_id}:");
-
-        // Collect keys to remove first
-        let keys_to_remove: Vec<String> = self
+        let keys: Vec<String> = self
             .contexts
             .keys()
             .filter(|key| key.starts_with(&prefix))
             .cloned()
             .collect();
+        self.release_contexts(keys)
+    }
 
-        // Count total tensors across all contexts being removed
-        let tensor_count: usize = keys_to_remove
+    /// Clear all contexts and return the total number of tensors removed.
+    fn clear_and_count(&mut self) -> usize {
+        let keys: Vec<String> = self.contexts.keys().cloned().collect();
+        self.release_contexts(keys)
+    }
+
+    /// Remove `keys` from the registry, returning the number of CUDA IPC tensors
+    /// released.
+    ///
+    /// This is the single place that decides whether GIL + CUDA teardown is
+    /// needed, so the decision can't drift between callers: it acquires the GIL
+    /// and runs `gc.collect()` + `torch.cuda.empty_cache()` ONLY when the
+    /// removed contexts actually hold live tensors. Dropping empty contexts is
+    /// pure Rust, so an idle/empty registry never forces a CUDA device sync —
+    /// which would block forever on a wedged GPU.
+    fn release_contexts(&mut self, keys: Vec<String>) -> usize {
+        let tensor_count: usize = keys
             .iter()
             .filter_map(|key| self.contexts.get(key))
             .map(|ctx| ctx.tensors.len())
             .sum();
 
         if tensor_count == 0 {
+            for key in &keys {
+                self.contexts.remove(key);
+            }
             return 0;
         }
 
-        // Remove contexts under GIL to ensure proper Python object cleanup.
-        // The Py<PyAny> inside LayerTensor will be dropped here, which will
-        // decrement the reference count and allow Python to garbage collect
-        // the CUDA IPC tensors, releasing the mapped GPU memory.
+        // Remove contexts under the GIL so each `Py<PyAny>` is dropped (decref)
+        // there, then force gc + empty_cache to actually unmap the CUDA IPC
+        // memory immediately instead of letting Python's GC defer it.
         Python::attach(|py| {
-            for key in keys_to_remove {
-                self.contexts.remove(&key);
+            for key in &keys {
+                self.contexts.remove(key);
             }
 
-            // Force garbage collection to release CUDA IPC memory immediately.
-            // Without this, Python's GC may defer cleanup, leaving GPU memory mapped.
-            let gc = py.import("gc").expect("gc module");
-            let _ = gc.call_method0("collect");
-
-            // Clear CUDA memory cache to return memory to the device
-            let torch = py.import("torch").expect("torch module");
-            let cuda = torch.getattr("cuda").expect("torch.cuda");
-            let _ = cuda.call_method0("empty_cache");
-        });
-
-        tensor_count
-    }
-
-    pub fn clear(&mut self) {
-        self.clear_and_count();
-    }
-
-    /// Clear all contexts and return the total number of tensors removed.
-    pub fn clear_and_count(&mut self) -> usize {
-        let tensor_count: usize = self.contexts.values().map(|ctx| ctx.tensors.len()).sum();
-
-        // Clear all contexts under GIL to ensure proper Python object cleanup
-        Python::attach(|py| {
-            self.contexts.clear();
-
-            // Force garbage collection and clear CUDA cache
             let gc = py.import("gc").expect("gc module");
             let _ = gc.call_method0("collect");
 
@@ -190,5 +181,135 @@ impl CudaTensorRegistry {
                 },
             })
         })
+    }
+}
+
+/// Work submitted to the dedicated registry thread. Each carries a `oneshot`
+/// the actor uses to hand the result back to the awaiting caller.
+enum RegistryCommand {
+    RegisterLayers {
+        context_key: String,
+        device_id: i32,
+        /// `(layer_name, wrapper_bytes)` for each layer in the batch.
+        layers: Vec<(String, Vec<u8>)>,
+        // The `PyErr` is stringified on the actor thread (which holds the GIL),
+        // so callers never need to touch the GIL to read an error message.
+        reply: oneshot::Sender<Result<Vec<TensorMetadata>, String>>,
+    },
+    DropInstance {
+        instance_id: String,
+        reply: oneshot::Sender<usize>,
+    },
+    Clear {
+        reply: oneshot::Sender<usize>,
+    },
+}
+
+/// Async handle to a [`CudaTensorRegistry`] that lives on its own OS thread.
+///
+/// Every mutating op takes the GIL and may run a blocking
+/// `torch.cuda.empty_cache()` that performs a CUDA device sync — which never
+/// returns if the GPU is wedged. Confining the registry to one dedicated thread
+/// keeps that blocking, GIL-bearing work off the async runtime *by
+/// construction*: handlers only ever `.await` a reply, so a wedged CUDA call
+/// pins this single thread instead of starving tokio workers (the outage where
+/// a few `cleanup` calls hung every endpoint, `/health` and `/metrics`
+/// included). Serializing on one thread also matches the GIL's own
+/// serialization — registry ops were never able to run concurrently anyway.
+#[derive(Clone)]
+pub struct RegistryHandle {
+    tx: mpsc::Sender<RegistryCommand>,
+}
+
+impl RegistryHandle {
+    /// Move `registry` onto a dedicated `cuda-registry` thread and return an
+    /// async handle to it. The thread runs until every handle is dropped.
+    pub fn spawn(registry: CudaTensorRegistry) -> Self {
+        // Bounds how many register/cleanup requests queue before callers await
+        // for space; the actor drains them one at a time under the GIL.
+        let (tx, rx) = mpsc::channel(64);
+        std::thread::Builder::new()
+            .name("cuda-registry".to_string())
+            .spawn(move || registry_actor(registry, rx))
+            .expect("spawn cuda-registry thread");
+        Self { tx }
+    }
+
+    /// Materialize and register a batch of layers under `context_key`. Returns
+    /// per-layer metadata in input order; on the first layer that fails to
+    /// materialize it returns that error (already stringified on the registry
+    /// thread). Fail-fast mirrors the original loop: layers registered before
+    /// the failing one stay registered and must be cleaned up via
+    /// [`Self::drop_instance`].
+    pub async fn register_layers(
+        &self,
+        context_key: String,
+        device_id: i32,
+        layers: Vec<(String, Vec<u8>)>,
+    ) -> Result<Vec<TensorMetadata>, String> {
+        let (reply, rx) = oneshot::channel();
+        self.dispatch(RegistryCommand::RegisterLayers {
+            context_key,
+            device_id,
+            layers,
+            reply,
+        })
+        .await;
+        rx.await.expect("cuda-registry thread dropped reply")
+    }
+
+    /// Drop all CUDA tensors belonging to `instance_id`; returns the count
+    /// released.
+    pub async fn drop_instance(&self, instance_id: String) -> usize {
+        let (reply, rx) = oneshot::channel();
+        self.dispatch(RegistryCommand::DropInstance { instance_id, reply })
+            .await;
+        rx.await.expect("cuda-registry thread dropped reply")
+    }
+
+    /// Drop every registered tensor; returns the count released.
+    pub async fn clear(&self) -> usize {
+        let (reply, rx) = oneshot::channel();
+        self.dispatch(RegistryCommand::Clear { reply }).await;
+        rx.await.expect("cuda-registry thread dropped reply")
+    }
+
+    async fn dispatch(&self, cmd: RegistryCommand) {
+        self.tx
+            .send(cmd)
+            .await
+            .expect("cuda-registry thread is gone");
+    }
+}
+
+/// Owns the registry and drains commands serially. Each op runs synchronously
+/// on this thread, so a GIL/CUDA stall blocks only here.
+fn registry_actor(mut registry: CudaTensorRegistry, mut rx: mpsc::Receiver<RegistryCommand>) {
+    while let Some(cmd) = rx.blocking_recv() {
+        match cmd {
+            RegistryCommand::RegisterLayers {
+                context_key,
+                device_id,
+                layers,
+                reply,
+            } => {
+                let result = layers
+                    .iter()
+                    .map(|(layer_name, wrapper_bytes)| {
+                        registry.register_layer(&context_key, layer_name, device_id, wrapper_bytes)
+                    })
+                    .collect::<PyResult<Vec<_>>>()
+                    // Stringify here, on the GIL-owning thread, so the gRPC
+                    // handler never needs `Python::attach` just to read the message.
+                    .map_err(|err| Python::attach(|py| err.value(py).to_string()));
+                let _ = reply.send(result);
+            }
+            RegistryCommand::DropInstance { instance_id, reply } => {
+                let _ = reply.send(registry.drop_instance(&instance_id));
+            }
+            RegistryCommand::Clear { reply } => {
+                let _ = reply.send(registry.clear_and_count());
+            }
+        }
     }
 }

@@ -3,7 +3,6 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::{Json, Router, routing::get, routing::post};
 use log::{info, warn};
-use parking_lot::Mutex;
 use pegaflow_core::PegaEngine;
 use prometheus::{Registry, TextEncoder};
 use serde::{Deserialize, Serialize};
@@ -11,12 +10,12 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 
-use crate::registry::CudaTensorRegistry;
+use crate::registry::RegistryHandle;
 
 #[derive(Clone)]
 struct AppState {
     engine: Arc<PegaEngine>,
-    registry: Arc<Mutex<CudaTensorRegistry>>,
+    registry: RegistryHandle,
     prometheus_registry: Option<Registry>,
 }
 
@@ -71,16 +70,19 @@ struct MemoryCacheCleanupResponse {
 ///
 /// Without `id`: remove all instances and release all CUDA IPC tensors.
 /// With `id`:    remove only the specified instance.
+///
+/// Releasing CUDA IPC tensors takes the GIL and runs a blocking
+/// `torch.cuda.empty_cache()`. That work runs on the dedicated registry thread
+/// behind [`RegistryHandle`]; the handler only `.await`s the reply, so a
+/// slow/wedged cleanup never occupies an async worker (the outage where a few
+/// `cleanup` calls hung every endpoint, `/health` and `/metrics` included).
 async fn cleanup_handler(
     State(state): State<AppState>,
     Query(query): Query<CleanupQuery>,
 ) -> impl IntoResponse {
     match query.id {
         None => {
-            let removed_tensors = {
-                let mut registry = state.registry.lock();
-                registry.clear_and_count()
-            };
+            let removed_tensors = state.registry.clear().await;
             let removed_instances = state.engine.unregister_all_instances();
 
             if !removed_instances.is_empty() || removed_tensors > 0 {
@@ -102,44 +104,40 @@ async fn cleanup_handler(
             )
         }
         Some(instance_id) => {
-            let removed_tensors = {
-                let mut registry = state.registry.lock();
-                registry.drop_instance(&instance_id)
-            };
-
+            let removed_tensors = state.registry.drop_instance(instance_id.clone()).await;
             match state.engine.unregister_instance(&instance_id) {
                 Ok(()) => {
                     warn!(
                         "Cleanup instance {}: {} CUDA tensor(s) released",
                         instance_id, removed_tensors
                     );
-                    (
-                        StatusCode::OK,
-                        Json(CleanupResponse {
-                            removed_instances: vec![instance_id],
-                            removed_tensors,
-                        })
-                        .into_response(),
-                    )
+                    cleanup_ok_response(instance_id, removed_tensors)
                 }
                 Err(_) if removed_tensors > 0 => {
                     warn!(
                         "Instance {} not in engine but cleaned {} CUDA tensor(s)",
                         instance_id, removed_tensors
                     );
-                    (
-                        StatusCode::OK,
-                        Json(CleanupResponse {
-                            removed_instances: vec![instance_id],
-                            removed_tensors,
-                        })
-                        .into_response(),
-                    )
+                    cleanup_ok_response(instance_id, removed_tensors)
                 }
                 Err(e) => (StatusCode::NOT_FOUND, format!("{e}").into_response()),
             }
         }
     }
+}
+
+fn cleanup_ok_response(
+    instance_id: String,
+    removed_tensors: usize,
+) -> (StatusCode, axum::response::Response) {
+    (
+        StatusCode::OK,
+        Json(CleanupResponse {
+            removed_instances: vec![instance_id],
+            removed_tensors,
+        })
+        .into_response(),
+    )
 }
 
 /// POST /cache/memory/cleanup
@@ -161,7 +159,7 @@ async fn cleanup_memory_cache_handler(
 pub async fn start_http_server(
     addr: std::net::SocketAddr,
     engine: Arc<PegaEngine>,
-    registry: Arc<Mutex<CudaTensorRegistry>>,
+    registry: RegistryHandle,
     enable_prometheus: bool,
     prometheus_registry: Option<Registry>,
     shutdown: Arc<Notify>,

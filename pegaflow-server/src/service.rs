@@ -11,13 +11,11 @@ use crate::proto::engine::{
     ShutdownResponse, TransferBlockInfo, TransferSlotInfo, UnregisterRequest, UnregisterResponse,
     query_response,
 };
-use crate::registry::CudaTensorRegistry;
+use crate::registry::RegistryHandle;
 use crate::session::SessionRegistry;
 use log::{debug, info, warn};
-use parking_lot::Mutex;
 use pegaflow_common::NumaNode;
 use pegaflow_core::{EngineError, LayerSave, PegaEngine, PrefetchStatus, QueryLeaseId};
-use pyo3::{PyErr, Python};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Notify, mpsc};
@@ -27,7 +25,7 @@ use tonic::{Request, Response, Status, async_trait};
 #[derive(Clone)]
 pub struct GrpcEngineService {
     engine: Arc<PegaEngine>,
-    registry: Arc<Mutex<CudaTensorRegistry>>,
+    registry: RegistryHandle,
     shutdown: Arc<Notify>,
     hll_tracker: Arc<std::sync::Mutex<pegaflow_common::hll::MultiWindowHllTracker>>,
     session_registry: Arc<SessionRegistry>,
@@ -36,7 +34,7 @@ pub struct GrpcEngineService {
 impl GrpcEngineService {
     pub fn new(
         engine: Arc<PegaEngine>,
-        registry: Arc<Mutex<CudaTensorRegistry>>,
+        registry: RegistryHandle,
         shutdown: Arc<Notify>,
         hll_tracker: Arc<std::sync::Mutex<pegaflow_common::hll::MultiWindowHllTracker>>,
     ) -> Self {
@@ -51,16 +49,13 @@ impl GrpcEngineService {
 
     /// Drop CUDA IPC tensors and engine-side instance state for `instance_id`.
     /// Idempotent — safe to call after the instance is already gone.
-    fn cleanup_instance(
+    async fn cleanup_instance(
         engine: &PegaEngine,
-        registry: &Mutex<CudaTensorRegistry>,
+        registry: &RegistryHandle,
         instance_id: &str,
         reason: &'static str,
     ) {
-        let removed = {
-            let mut registry = registry.lock();
-            registry.drop_instance(instance_id)
-        };
+        let removed = registry.drop_instance(instance_id.to_string()).await;
         if removed > 0 {
             info!(
                 "Session cleanup ({}): dropped {} CUDA tensors for instance {}",
@@ -99,11 +94,6 @@ impl GrpcEngineService {
                 Status::internal(err.to_string())
             }
         }
-    }
-
-    fn map_py_error(operation: &str, err: PyErr) -> Status {
-        let message = Python::attach(|py| err.value(py).to_string());
-        Status::internal(format!("{operation} failed: {message}"))
     }
 
     fn usize_from_u64(value: u64, field: &str) -> Result<usize, Status> {
@@ -307,19 +297,26 @@ impl Engine for GrpcEngineService {
             // Materialize tensors and collect data_ptr/size_bytes
             let context_key =
                 Self::context_key(&req.instance_id, req.tp_rank, req.pp_rank, req.device_id);
+            // Materialize on the dedicated registry thread (GIL + CUDA IPC) and
+            // await the result, so this RPC never blocks an async worker. Move
+            // the (large) wrapper bytes over; clone the layer names since the
+            // engine call below still needs them.
+            let layers: Vec<(String, Vec<u8>)> = req
+                .layer_names
+                .iter()
+                .cloned()
+                .zip(req.wrapper_bytes)
+                .collect();
+            let metadatas = self
+                .registry
+                .register_layers(context_key, req.device_id, layers)
+                .await
+                .map_err(|message| Status::internal(format!("register tensor failed: {message}")))?;
             let mut data_ptrs = Vec::with_capacity(num_layers);
             let mut size_bytes_list = Vec::with_capacity(num_layers);
-            {
-                let mut registry = self.registry.lock();
-                for (layer_name, wrapper_bytes) in
-                    req.layer_names.iter().zip(req.wrapper_bytes.iter())
-                {
-                    let metadata = registry
-                        .register_layer(&context_key, layer_name, req.device_id, wrapper_bytes)
-                        .map_err(|err| Self::map_py_error("register tensor", err))?;
-                    data_ptrs.push(metadata.data_ptr);
-                    size_bytes_list.push(metadata.size_bytes);
-                }
+            for metadata in &metadatas {
+                data_ptrs.push(metadata.data_ptr);
+                size_bytes_list.push(metadata.size_bytes);
             }
 
             let num_blocks_list: Vec<usize> = req
@@ -705,10 +702,7 @@ impl Engine for GrpcEngineService {
         let result: Result<Response<UnregisterResponse>, Status> = async {
             let req = request.into_inner();
             debug!("RPC [unregister_context]: instance_id={}", req.instance_id);
-            let removed = {
-                let mut registry = self.registry.lock();
-                registry.drop_instance(&req.instance_id)
-            };
+            let removed = self.registry.drop_instance(req.instance_id.clone()).await;
             if removed > 0 {
                 info!(
                     "Dropped {} CUDA tensors for instance {}",
@@ -893,10 +887,10 @@ impl Engine for GrpcEngineService {
         let start = Instant::now();
         let result: Result<Response<ShutdownResponse>, Status> = async {
             debug!("RPC [shutdown] requested");
-            {
-                let mut registry = self.registry.lock();
-                registry.clear();
-            }
+            // Deliberately do NOT release CUDA tensors here. The process is on
+            // its way out and the OS reclaims everything; meanwhile a
+            // `torch.cuda.empty_cache()` on a wedged GPU would block forever and
+            // stall the very shutdown path meant to let us escape. Just signal.
             warn!("Shutdown requested via RPC");
             self.shutdown.notify_waiters();
 
@@ -983,7 +977,7 @@ impl Engine for GrpcEngineService {
 
         let session_registry = Arc::clone(&self.session_registry);
         let engine = Arc::clone(&self.engine);
-        let cuda_registry = Arc::clone(&self.registry);
+        let cuda_registry = self.registry.clone();
         let id_for_watcher = instance_id.clone();
 
         tokio::spawn(async move {
@@ -993,7 +987,8 @@ impl Engine for GrpcEngineService {
                     "Session closed: instance_id={} token={} — running cleanup",
                     id_for_watcher, token
                 );
-                Self::cleanup_instance(&engine, &cuda_registry, &id_for_watcher, "stream closed");
+                Self::cleanup_instance(&engine, &cuda_registry, &id_for_watcher, "stream closed")
+                    .await;
             } else {
                 debug!(
                     "Session closed: instance_id={} token={} superseded — skip cleanup",
