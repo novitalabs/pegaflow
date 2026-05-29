@@ -1280,6 +1280,35 @@ def test_layer_push_sender_does_not_recreate_discarded_stats() -> None:
         sender.close()
 
 
+def test_req_push_stats_records_latency_distribution() -> None:
+    stats = prefill_worker_mod._ReqPushStats()
+    for queue_ms, event_ms, native_ms in (
+        (1.0, 10.0, 100.0),
+        (2.0, 20.0, 200.0),
+        (3.0, 30.0, 300.0),
+    ):
+        stats.add(
+            prefill_worker_mod._LayerPushResult(
+                bytes=4,
+                queue_wait_ms=queue_ms,
+                event_ms=event_ms,
+                native_ms=native_ms,
+            )
+        )
+
+    assert stats.tasks == 3
+    assert stats.bytes == 12
+    assert stats.avg_queue_wait_ms() == 2.0
+    assert stats.p50_queue_wait_ms() == 2.0
+    assert stats.p95_queue_wait_ms() == 3.0
+    assert stats.avg_event_ms() == 20.0
+    assert stats.p50_event_ms() == 20.0
+    assert stats.p95_event_ms() == 30.0
+    assert stats.avg_native_ms() == 200.0
+    assert stats.p50_native_ms() == 200.0
+    assert stats.p95_native_ms() == 300.0
+
+
 def _prefill_http_task(request_id: str) -> PrefillHttpTask:
     return PrefillHttpTask(
         request_id=request_id,

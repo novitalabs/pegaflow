@@ -5,7 +5,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from pegaflow.logging_utils import get_connector_logger
@@ -576,6 +576,9 @@ class _ReqPushStats:
     max_queue_wait_ms: float = 0.0
     max_event_ms: float = 0.0
     max_native_ms: float = 0.0
+    queue_wait_samples_ms: list[float] = field(default_factory=list)
+    event_samples_ms: list[float] = field(default_factory=list)
+    native_samples_ms: list[float] = field(default_factory=list)
 
     def add(self, result: _LayerPushResult) -> None:
         self.tasks += 1
@@ -586,6 +589,50 @@ class _ReqPushStats:
         self.max_queue_wait_ms = max(self.max_queue_wait_ms, result.queue_wait_ms)
         self.max_event_ms = max(self.max_event_ms, result.event_ms)
         self.max_native_ms = max(self.max_native_ms, result.native_ms)
+        self.queue_wait_samples_ms.append(result.queue_wait_ms)
+        self.event_samples_ms.append(result.event_ms)
+        self.native_samples_ms.append(result.native_ms)
+
+    def avg_queue_wait_ms(self) -> float:
+        return _avg_ms(self.queue_wait_samples_ms)
+
+    def p50_queue_wait_ms(self) -> float:
+        return _percentile_ms(self.queue_wait_samples_ms, 0.50)
+
+    def p95_queue_wait_ms(self) -> float:
+        return _percentile_ms(self.queue_wait_samples_ms, 0.95)
+
+    def avg_event_ms(self) -> float:
+        return _avg_ms(self.event_samples_ms)
+
+    def p50_event_ms(self) -> float:
+        return _percentile_ms(self.event_samples_ms, 0.50)
+
+    def p95_event_ms(self) -> float:
+        return _percentile_ms(self.event_samples_ms, 0.95)
+
+    def avg_native_ms(self) -> float:
+        return _avg_ms(self.native_samples_ms)
+
+    def p50_native_ms(self) -> float:
+        return _percentile_ms(self.native_samples_ms, 0.50)
+
+    def p95_native_ms(self) -> float:
+        return _percentile_ms(self.native_samples_ms, 0.95)
+
+
+def _avg_ms(samples: list[float]) -> float:
+    if not samples:
+        return 0.0
+    return sum(samples) / len(samples)
+
+
+def _percentile_ms(samples: list[float], percentile: float) -> float:
+    if not samples:
+        return 0.0
+    ordered = sorted(samples)
+    idx = round((len(ordered) - 1) * percentile)
+    return ordered[idx]
 
 
 def _run_layer_push(task: _LayerPushTask) -> _LayerPushResult:
@@ -690,7 +737,7 @@ class _AsyncPushFinalizer:
                 task.rdma.push_done(task.req_id)
                 done_ts_ns = time.time_ns()
                 logger.info(
-                    "[PdConnector] P RDMA done req=%s target_req=%s chunks=%d blocks=%d rdma_bytes=%d save_to_imm_ms=%.3f schedule_to_imm_ms=%.3f wait_sender_ms=%.3f wait_writes_ms=%.3f imm_ms=%.3f save_gbps=%.2f tail_gbps=%.2f sender_workers=%d push_tasks=%d push_bytes=%d push_queue_sum_ms=%.3f push_queue_max_ms=%.3f push_event_sum_ms=%.3f push_event_max_ms=%.3f push_native_sum_ms=%.3f push_native_max_ms=%.3f",
+                    "[PdConnector] P RDMA done req=%s target_req=%s chunks=%d blocks=%d rdma_bytes=%d save_to_imm_ms=%.3f schedule_to_imm_ms=%.3f wait_sender_ms=%.3f wait_writes_ms=%.3f imm_ms=%.3f save_gbps=%.2f tail_gbps=%.2f sender_workers=%d push_tasks=%d push_bytes=%d push_queue_sum_ms=%.3f push_queue_avg_ms=%.3f push_queue_p50_ms=%.3f push_queue_p95_ms=%.3f push_queue_max_ms=%.3f push_event_sum_ms=%.3f push_event_avg_ms=%.3f push_event_p50_ms=%.3f push_event_p95_ms=%.3f push_event_max_ms=%.3f push_native_sum_ms=%.3f push_native_avg_ms=%.3f push_native_p50_ms=%.3f push_native_p95_ms=%.3f push_native_max_ms=%.3f",
                     task.req_id,
                     task.target_request_id,
                     task.chunk_count,
@@ -707,10 +754,19 @@ class _AsyncPushFinalizer:
                     push_stats.tasks,
                     push_stats.bytes,
                     push_stats.queue_wait_ms,
+                    push_stats.avg_queue_wait_ms(),
+                    push_stats.p50_queue_wait_ms(),
+                    push_stats.p95_queue_wait_ms(),
                     push_stats.max_queue_wait_ms,
                     push_stats.event_ms,
+                    push_stats.avg_event_ms(),
+                    push_stats.p50_event_ms(),
+                    push_stats.p95_event_ms(),
                     push_stats.max_event_ms,
                     push_stats.native_ms,
+                    push_stats.avg_native_ms(),
+                    push_stats.p50_native_ms(),
+                    push_stats.p95_native_ms(),
                     push_stats.max_native_ms,
                 )
             except BaseException as exc:
