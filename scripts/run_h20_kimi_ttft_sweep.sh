@@ -45,6 +45,7 @@ mkdir -p "$RESULT_DIR"
 
 active_local_monitor_pid=""
 active_remote_monitor_pid=""
+active_remote_monitor_file=""
 
 monitor_local_nics() {
   local out_file="$1"
@@ -83,9 +84,21 @@ stop_monitor() {
   fi
 }
 
+stop_remote_monitor() {
+  local pid="$1"
+  local out_file="$2"
+  local quoted_out_file
+  stop_monitor "$pid"
+  if [[ -n "$out_file" ]]; then
+    printf -v quoted_out_file "%q" "$out_file"
+    ssh "$DECODE_SSH_HOST" "pkill -f $quoted_out_file || true" \
+      >/dev/null 2>&1 || true
+  fi
+}
+
 cleanup_active_monitors() {
   stop_monitor "$active_local_monitor_pid"
-  stop_monitor "$active_remote_monitor_pid"
+  stop_remote_monitor "$active_remote_monitor_pid" "$active_remote_monitor_file"
 }
 trap cleanup_active_monitors EXIT
 
@@ -140,13 +153,16 @@ for input_len in $LENGTHS; do
   remote_nic_csv="$RESULT_DIR/${run_label}-h20-100-nic.csv"
   local_monitor_pid=""
   remote_monitor_pid=""
+  remote_monitor_file=""
 
   echo "==> ${run_label}"
   if [[ "$MONITOR_NICS" == "1" ]]; then
     local_monitor_pid="$(monitor_local_nics "$local_nic_csv")"
     remote_monitor_pid="$(monitor_remote_nics "$remote_nic_csv")"
+    remote_monitor_file="$remote_nic_csv"
     active_local_monitor_pid="$local_monitor_pid"
     active_remote_monitor_pid="$remote_monitor_pid"
+    active_remote_monitor_file="$remote_monitor_file"
     sleep 2
   fi
 
@@ -177,9 +193,10 @@ for input_len in $LENGTHS; do
 
   if [[ "$MONITOR_NICS" == "1" ]]; then
     stop_monitor "$local_monitor_pid"
-    stop_monitor "$remote_monitor_pid"
+    stop_remote_monitor "$remote_monitor_pid" "$remote_monitor_file"
     active_local_monitor_pid=""
     active_remote_monitor_pid=""
+    active_remote_monitor_file=""
     summarize_nic_csv "$local_nic_csv" >"$RESULT_DIR/${run_label}-h20-99-nic-summary.txt"
     ssh "$DECODE_SSH_HOST" "cd '$REMOTE_REPO_ROOT' && $(declare -f summarize_nic_csv); summarize_nic_csv '$remote_nic_csv'" \
       >"$RESULT_DIR/${run_label}-h20-100-nic-summary.txt"

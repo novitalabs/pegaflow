@@ -45,6 +45,7 @@ from pegaflow.pd_connector.metadata import (  # noqa: E402
     TransferRegionLayout,
     WaitReqMeta,
     handshake_from_dict,
+    handshake_to_compact_dict,
     handshake_to_dict,
 )
 from pegaflow.pd_connector.prefill import (  # noqa: E402
@@ -572,6 +573,31 @@ def test_pd_handshake_serializes_regions_layout() -> None:
         0x10_000 + 9 * 0x400,
         0x10_000 + 10 * 0x400,
     )
+
+
+def test_pd_handshake_compact_serializes_shared_block_ids_once() -> None:
+    layers = (
+        hnd_remote_layer(layer_name="layer.0", layer_idx=0, block_ids=(8, 9, 10)),
+        hnd_remote_layer(layer_name="layer.1", layer_idx=1, block_ids=(8, 9, 10)),
+    )
+    handshake = PdHandshake(
+        request_id="req-1",
+        engine_id="decode",
+        tp_rank=0,
+        tp_size=1,
+        block_size=16,
+        layers=layers,
+    )
+
+    data = handshake_to_compact_dict(handshake)
+
+    assert data["block_ids"] == [8, 9, 10]
+    assert "block_ids" not in data["layers"][0]
+    assert "block_ids" not in data["layers"][1]
+    restored = handshake_from_dict(data)
+    assert restored is not None
+    assert restored.layers[0].block_ids == (8, 9, 10)
+    assert restored.layers[1].block_ids == (8, 9, 10)
 
 
 def test_pd_worker_builds_native_rdma_by_default_when_extension_exists(monkeypatch) -> None:
@@ -1195,7 +1221,8 @@ def test_d_worker_rank0_dispatches_prefill_on_wait() -> None:
     handshakes = task.kv_transfer_params["pd_handshakes"]
     assert len(handshakes) == 1
     assert handshakes[0]["request_id"] == "external-d"
-    assert handshakes[0]["layers"][0]["block_ids"] == [1]
+    assert handshakes[0]["block_ids"] == [1]
+    assert "block_ids" not in handshakes[0]["layers"][0]
 
 
 def test_async_prefill_sender_dispatches_requests_in_parallel(monkeypatch) -> None:
@@ -1247,7 +1274,7 @@ def test_layer_push_sender_does_not_recreate_discarded_stats() -> None:
                 req_id="req",
                 target_request_id="decode",
                 chunk_idx=1,
-                layer_idx=1,
+                layer_idx=0,
                 block_count=1,
                 rdma_bytes=1,
                 block_slices=[],
@@ -1260,7 +1287,7 @@ def test_layer_push_sender_does_not_recreate_discarded_stats() -> None:
                 req_id="req",
                 target_request_id="decode",
                 chunk_idx=1,
-                layer_idx=0,
+                layer_idx=1,
                 block_count=1,
                 rdma_bytes=1,
                 block_slices=[],
@@ -1277,6 +1304,68 @@ def test_layer_push_sender_does_not_recreate_discarded_stats() -> None:
         assert sender.pop_req_stats("req").tasks == 0
     finally:
         rdma.release_slow.set()
+        sender.close()
+
+
+def test_layer_push_sender_keeps_fifo_order() -> None:
+    class Event:
+        def __init__(self) -> None:
+            self.ready = threading.Event()
+
+        def synchronize(self) -> None:
+            assert self.ready.wait(timeout=2)
+
+    class RecordingRdma:
+        def __init__(self) -> None:
+            self.pushed: queue.Queue[int] = queue.Queue()
+
+        def push_layer(self, req_id, layer_idx, blocks) -> None:
+            self.pushed.put(layer_idx)
+
+    first_event = Event()
+    ready_event = Event()
+    ready_event.ready.set()
+    rdma = RecordingRdma()
+    sender = prefill_worker_mod._AsyncLayerPushSender()
+    try:
+        sender.submit(
+            prefill_worker_mod._LayerPushTask(
+                rdma=rdma,
+                req_id="req",
+                target_request_id="decode",
+                chunk_idx=1,
+                layer_idx=0,
+                block_count=1,
+                rdma_bytes=1,
+                block_slices=[],
+                enqueued_ts_ns=0,
+                event=first_event,
+            )
+        )
+        sender.submit(
+            prefill_worker_mod._LayerPushTask(
+                rdma=rdma,
+                req_id="req",
+                target_request_id="decode",
+                chunk_idx=1,
+                layer_idx=1,
+                block_count=1,
+                rdma_bytes=1,
+                block_slices=[],
+                enqueued_ts_ns=0,
+                event=ready_event,
+            )
+        )
+
+        with pytest.raises(queue.Empty):
+            rdma.pushed.get(timeout=0.1)
+        first_event.ready.set()
+        sender.wait_req("req")
+
+        assert rdma.pushed.get(timeout=2) == 0
+        assert rdma.pushed.get(timeout=2) == 1
+    finally:
+        first_event.ready.set()
         sender.close()
 
 

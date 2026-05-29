@@ -127,6 +127,7 @@ class DecodeHandler:
 
     def _build_handshake(self, req_id: str, block_ids: set[int]) -> PdHandshake:
         imm_id = self._alloc_imm_id()
+        ordered_block_ids = tuple(sorted(block_ids))
         return PdHandshake(
             request_id=req_id,
             engine_id=self._w.engine_id,
@@ -134,7 +135,7 @@ class DecodeHandler:
             tp_size=self._w.tp_size,
             block_size=next(iter(self._w.layouts.values())).block_size,
             layers=tuple(
-                self._remote_layout_with_mr_desc(layer_name, layer_idx, block_ids)
+                self._remote_layout_with_mr_desc(layer_name, layer_idx, ordered_block_ids)
                 for layer_idx, layer_name in enumerate(self._w.layer_names)
             ),
             imm_id=imm_id,
@@ -177,12 +178,13 @@ class DecodeHandler:
     ) -> tuple[PdHandshake, ...]:
         result = []
         block_size = next(iter(self._w.layouts.values())).block_size
+        ordered_block_ids = tuple(sorted(block_ids))
         for rank in range(self._w.tp_size):
             peer_layouts = self._peer_layouts[rank]
             peer_mr_descs = self._peer_mr_descs[rank]
             layers = tuple(
                 replace(
-                    peer_layouts[name].remote_layout(layer_idx, block_ids),
+                    peer_layouts[name].remote_layout(layer_idx, ordered_block_ids),
                     mr_desc=peer_mr_descs.get(name),
                 )
                 for layer_idx, name in enumerate(self._w.layer_names)
@@ -211,7 +213,7 @@ class DecodeHandler:
         self,
         layer_name: str,
         layer_idx: int,
-        block_ids: set[int],
+        block_ids: tuple[int, ...],
     ) -> LayerRemoteLayout:
         layout = self._w.layouts[layer_name].remote_layout(layer_idx, block_ids)
         registered = self._w._registered_layers.get(layer_name)

@@ -11,7 +11,7 @@ from typing import Any
 
 from pegaflow.pd_connector.metadata import (
     PdHandshake,
-    handshake_to_dict,
+    handshake_to_compact_dict,
     handshakes_from_dicts,
 )
 
@@ -49,7 +49,7 @@ class ProducerKvParams:
         }
         if self.handshakes:
             result["pd_handshakes"] = [
-                handshake_to_dict(handshake) for handshake in self.handshakes
+                handshake_to_compact_dict(handshake) for handshake in self.handshakes
             ]
         return result
 

@@ -91,7 +91,9 @@ scripts/run_pd_h20_kimi.sh start-cluster
 ## Code Changes Tested
 
 - D-side prefill HTTP dispatch was parallelized with 8 sender threads.
-- P-side RDMA layer push was parallelized with 4 sender threads per worker.
+- P-side RDMA layer push now uses one FIFO sender thread per worker. vLLM
+  computes layers in order; extra Python senders only wait on later CUDA events
+  and add queueing noise.
 - Native RDMA write window reservation was changed to reserve with CAS before
   submit, avoiding write-window overrun under concurrent Python push threads.
 - Hot per-layer RDMA write logs were moved to DEBUG.
@@ -162,15 +164,15 @@ The direct baseline leg was run on 2026-05-29 with the fixed serving contract:
 - benchmark: `--max-concurrency 1`, `--request-rate inf`,
   `--random-range-ratio 0.0`, `--random-output-len 1`, `--num-prompts 50`
 
-The P/D proxy leg has not been rerun yet for this fixed table, so the rows below
-are not acceptance results.
+The P/D proxy leg has only been rerun for 16k after the single FIFO sender and
+compact handshake changes. Other input lengths are still pending.
 
 | input_len | baseline_mean_TTFT_ms | proxy_PD_mean_TTFT_ms | delta_ms | delta_pct | baseline_p99_TTFT_ms | proxy_p99_TTFT_ms | baseline_success | proxy_success | baseline_req_s | proxy_req_s | proxy_avg_RDMA_Gbps_per_NIC | proxy_peak_RDMA_Gbps_per_NIC | notes |
 |-----------|-----------------------|-----------------------|----------|-----------|-----------------------|-------------------|------------------|---------------|----------------|-------------|-----------------------------|------------------------------|-------|
 | 1024 | 158.67 | TBD | TBD | TBD | 235.17 | TBD | 50/50 | TBD | 6.30 | TBD | TBD | TBD | missing proxy |
 | 4096 | 553.42 | TBD | TBD | TBD | 559.53 | TBD | 50/50 | TBD | 1.81 | TBD | TBD | TBD | missing proxy |
 | 8192 | 1111.23 | TBD | TBD | TBD | 1120.30 | TBD | 50/50 | TBD | 0.90 | TBD | TBD | TBD | missing proxy |
-| 16384 | 2334.77 | TBD | TBD | TBD | 2346.75 | TBD | 50/50 | TBD | 0.43 | TBD | TBD | TBD | missing proxy |
+| 16384 | 2334.77 | 2529.09 | 194.32 | 8.32% | 2346.75 | 2917.96 | 50/50 | 50/50 | 0.43 | 0.40 | 6.48 | 12.75 | proxy label `kimi-proxy-fixed32k-compacths2-singlefifo` |
 | 30000 | 4728.88 | TBD | TBD | TBD | 4738.49 | TBD | 50/50 | TBD | 0.21 | TBD | TBD | TBD | missing proxy |
 
 Artifacts:
@@ -180,6 +182,27 @@ Artifacts:
 - `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-baseline-fixed32k-in8192-out1-c1-n50-seed20260528.json`
 - `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-baseline-fixed32k-in16384-out1-c1-n50-seed20260528.json`
 - `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-baseline-fixed32k-in30000-out1-c1-n50-seed20260528.json`
+- `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-compacths2-singlefifo-in16384-out1-c1-n50-seed20260528.json`
+- `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-compacths2-singlefifo-in16384-out1-c1-n50-seed20260528-h20-99-nic-summary.txt`
+- `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-compacths2-singlefifo-in16384-out1-c1-n50-seed20260528-h20-100-nic-summary.txt`
+
+## RDMA-only Integration Test
+
+Before another connector change, the RDMA path was isolated with
+`scripts/pd_rdma_two_node_it.py`. The test uses the same 8-rank Kimi 16k shape
+as the P/D run: 61 layers, 1024 blocks, 18432 bytes per block, and the same
+rank-to-NIC map.
+
+Result on h20:
+
+| side | bytes | elapsed_ms | aggregate_Gbps | per-NIC active direction |
+|------|-------|------------|----------------|--------------------------|
+| P push | 36.84GB | 202.79 | 1453.46 | ~368.5Gbps xmit on each of `mlx5_1..4` |
+| D receive | 36.84GB | 204.48 | 1441.46 | ~365.5Gbps recv on each of `mlx5_1..4` |
+
+This rules out RDMA engine bandwidth as the current bottleneck. The low NIC
+average seen in vLLM pressure runs is caused by upper-layer submission cadence
+and prefill overlap, not by a one-NIC routing issue or slow native RDMA writes.
 
 ## Serving Result
 
@@ -195,6 +218,9 @@ direct baseline is restarted with the same fixed 32k vLLM serving flags.
 |-----|---------|------------|-------|-------------|--------------|-------------|
 | `d-baseline-16k` | 50/50 | 135.45 | 0.369 | 5999.04 | 2701.34 | 3513.22 |
 | `proxy-16k-c1-prefill-parallel-batch32768` | 50/50 | 130.52 | 0.383 | 6225.64 | 2609.82 | 2883.63 |
+| `kimi-proxy-fixed32k-singlefifo-in16384-out1-c1-n50-seed20260528` | 50/50 | 130.68 | 0.383 | 6269.62 | 2613.22 | 2772.61 |
+| `kimi-proxy-fixed32k-compacths-singlefifo-in16384-out1-c1-n50-seed20260528` | 50/50 | 127.20 | 0.393 | 6439.95 | 2543.45 | 3119.31 |
+| `kimi-proxy-fixed32k-compacths2-singlefifo-in16384-out1-c1-n50-seed20260528` | 50/50 | 126.48 | 0.395 | 6477.43 | 2529.09 | 2917.96 |
 | `proxy-16k-c4-prefill-parallel-batch32768-50` | 50/50 | 113.71 | 0.440 | 7145.87 | 8869.98 | 12085.89 |
 | `proxy-16k-c4-windowfix-batch32768` | 20/20 | 46.62 | 0.429 | 7080.97 | 8726.38 | 11874.28 |
 
@@ -207,7 +233,7 @@ The final experiment table should be keyed by input length:
 | 1024 | 158.67 | TBD | TBD | TBD | 235.17 | TBD | 50/50 | TBD | 6.30 | TBD | TBD | TBD | missing proxy |
 | 4096 | 553.42 | TBD | TBD | TBD | 559.53 | TBD | 50/50 | TBD | 1.81 | TBD | TBD | TBD | missing proxy |
 | 8192 | 1111.23 | TBD | TBD | TBD | 1120.30 | TBD | 50/50 | TBD | 0.90 | TBD | TBD | TBD | missing proxy |
-| 16384 | 2334.77 | TBD | TBD | TBD | 2346.75 | TBD | 50/50 | TBD | 0.43 | TBD | TBD | TBD | missing proxy |
+| 16384 | 2334.77 | 2529.09 | 194.32 | 8.32% | 2346.75 | 2917.96 | 50/50 | 50/50 | 0.43 | 0.40 | 6.48 | 12.75 | compact handshake + single FIFO sender |
 | 30000 | 4728.88 | TBD | TBD | TBD | 4738.49 | TBD | 50/50 | TBD | 0.21 | TBD | TBD | TBD | missing proxy |
 
 ## NIC Counter Result
@@ -252,19 +278,33 @@ D-side wait logs show large queueing under concurrency:
 - Some requests later see near-zero `wait_ms`, because the P-side IMM already
   arrived before the D waiter reached that request.
 
+For the fixed 16k/c1 `compacths2-singlefifo` run:
+
+- P-side `wait_writes_ms`: p50 0.83ms, p95 1.12ms.
+- P-side `push_native_avg_ms`: p50 0.035ms per layer push.
+- P-side `wait_sender_ms`: p50 1036.12ms. This is dominated by waiting for
+  CUDA layer events and the prefill tail, not RDMA completion.
+- D-side `RDMA open_request native_ms`: p50 2.20ms, p95 2.95ms.
+- D-side `RDMA wait_ms`: p50 2379.03ms, p95 2404.30ms, max 2777.53ms.
+- D rank0 queue-to-prefill dispatch: p50 29.99ms, p95 31.26ms.
+- D-to-P HTTP payload after compact handshake: p50 313KB, p95 328KB. Before the
+  compact handshake this was about 3.76MB.
+
 ## Conclusion
 
-Correctness passed, and all 4 NICs were used evenly. The result did not pass the
-bandwidth target: peak was only about 20Gbps per NIC, far below the expected H20
-RDMA link capacity.
+Correctness passed, and all 4 NICs were used evenly. The c4 diagnostic result
+did not pass the bandwidth target: peak was only about 20Gbps per NIC, far below
+the expected H20 RDMA link capacity. The RDMA-only integration test reaches
+about 1.45Tbps aggregate, so native RDMA bandwidth is available when the upper
+pipeline feeds it continuously.
 
 The evidence points away from a single-NIC routing issue. The next performance
-work should focus on making the upper pipeline feed RDMA continuously:
+work should focus on the remaining upper-layer latency:
 
-- reduce P-side layer scheduling and CUDA event wait gaps;
-- reduce P-side per-request push queue buildup;
-- reduce D-side RDMA done waiter queueing;
-- then rerun NIC counter sampling to verify sustained per-NIC bandwidth.
+- reduce the D rank0 queue-to-prefill dispatch and HTTP serialization path;
+- reduce the post-RDMA D decode/proxy response overhead;
+- keep P-side layer-wise push as one FIFO sender unless a future design can
+  prove readiness-aware scheduling without waiting on later CUDA events.
 
 ## Artifact Paths
 

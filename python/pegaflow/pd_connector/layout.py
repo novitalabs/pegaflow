@@ -7,6 +7,8 @@ from typing import Any, Protocol
 
 from pegaflow.pd_connector.metadata import LayerRemoteLayout, TransferRegionLayout
 
+BlockIdSelection = set[int] | tuple[int, ...] | None
+
 
 @dataclass(frozen=True)
 class BlockRegionSlice:
@@ -41,7 +43,7 @@ class KvCacheLayout(Protocol):
     def block_slices(self, block_id: int) -> LayerBlockSlices: ...
 
     def remote_layout(
-        self, layer_idx: int, block_ids: set[int] | None = None
+        self, layer_idx: int, block_ids: BlockIdSelection = None
     ) -> LayerRemoteLayout: ...
 
 
@@ -167,10 +169,10 @@ class FlashAttnHndLayout:
             ),
         )
 
-    def remote_layout(self, layer_idx: int, block_ids: set[int] | None = None) -> LayerRemoteLayout:
-        if block_ids is None:
-            block_ids = set(range(self.num_blocks))
-        ordered = tuple(sorted(block_ids))
+    def remote_layout(
+        self, layer_idx: int, block_ids: BlockIdSelection = None
+    ) -> LayerRemoteLayout:
+        ordered = _ordered_block_ids(block_ids, self.num_blocks)
         return LayerRemoteLayout(
             layer_name=self.layer_name,
             layer_idx=layer_idx,
@@ -290,13 +292,13 @@ class MlaBlocksLayout:
             ),
         )
 
-    def remote_layout(self, layer_idx: int, block_ids: set[int] | None = None) -> LayerRemoteLayout:
-        if block_ids is None:
-            block_ids = set(range(self.num_blocks))
+    def remote_layout(
+        self, layer_idx: int, block_ids: BlockIdSelection = None
+    ) -> LayerRemoteLayout:
         return LayerRemoteLayout(
             layer_name=self.layer_name,
             layer_idx=layer_idx,
-            block_ids=tuple(sorted(block_ids)),
+            block_ids=_ordered_block_ids(block_ids, self.num_blocks),
             regions=(
                 TransferRegionLayout(
                     region_idx=0,
@@ -341,6 +343,14 @@ def layout_from_tensor(
 
 def block_slices_bytes(block_slices: list[LayerBlockSlices]) -> int:
     return sum(region.bytes for block in block_slices for region in block.regions)
+
+
+def _ordered_block_ids(block_ids: BlockIdSelection, num_blocks: int) -> tuple[int, ...]:
+    if block_ids is None:
+        return tuple(range(num_blocks))
+    if isinstance(block_ids, tuple):
+        return block_ids
+    return tuple(sorted(block_ids))
 
 
 def block_ranges_for_remote_write(

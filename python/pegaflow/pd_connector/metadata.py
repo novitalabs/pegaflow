@@ -116,12 +116,21 @@ class PdHandshake:
     imm_id: int | None = None
 
 
-def layer_layout_from_dict(data: dict[str, Any]) -> LayerRemoteLayout:
+def layer_layout_from_dict(
+    data: dict[str, Any],
+    *,
+    block_ids: tuple[int, ...] | None = None,
+) -> LayerRemoteLayout:
     assert "regions" in data
+    raw_block_ids = data.get("block_ids")
+    if raw_block_ids is None:
+        if block_ids is None:
+            raise KeyError("block_ids")
+        raw_block_ids = block_ids
     return LayerRemoteLayout(
         layer_name=str(data["layer_name"]),
         layer_idx=int(data["layer_idx"]),
-        block_ids=tuple(int(block_id) for block_id in data["block_ids"]),
+        block_ids=tuple(int(block_id) for block_id in raw_block_ids),
         regions=tuple(
             TransferRegionLayout(
                 region_idx=int(region["region_idx"]),
@@ -137,13 +146,19 @@ def layer_layout_from_dict(data: dict[str, Any]) -> LayerRemoteLayout:
 def handshake_from_dict(data: dict[str, Any] | None) -> PdHandshake | None:
     if data is None:
         return None
+    block_ids = data.get("block_ids")
+    shared_block_ids = (
+        tuple(int(block_id) for block_id in block_ids) if block_ids is not None else None
+    )
     return PdHandshake(
         request_id=str(data["request_id"]),
         engine_id=str(data["engine_id"]),
         tp_rank=int(data["tp_rank"]),
         tp_size=int(data["tp_size"]),
         block_size=int(data["block_size"]),
-        layers=tuple(layer_layout_from_dict(layer) for layer in data["layers"]),
+        layers=tuple(
+            layer_layout_from_dict(layer, block_ids=shared_block_ids) for layer in data["layers"]
+        ),
         imm_id=int(data["imm_id"]) if data.get("imm_id") is not None else None,
     )
 
@@ -174,6 +189,22 @@ def layer_layout_to_dict(layer: LayerRemoteLayout) -> dict[str, Any]:
     }
 
 
+def layer_layout_to_compact_dict(layer: LayerRemoteLayout) -> dict[str, Any]:
+    return {
+        "layer_name": layer.layer_name,
+        "layer_idx": layer.layer_idx,
+        "regions": [
+            {
+                "region_idx": region.region_idx,
+                "base_addr": region.base_addr,
+                "block_len": region.block_len,
+            }
+            for region in layer.regions
+        ],
+        "mr_desc": layer.mr_desc,
+    }
+
+
 def handshake_to_dict(handshake: PdHandshake) -> dict[str, Any]:
     return {
         "request_id": handshake.request_id,
@@ -182,6 +213,24 @@ def handshake_to_dict(handshake: PdHandshake) -> dict[str, Any]:
         "tp_size": handshake.tp_size,
         "block_size": handshake.block_size,
         "layers": [layer_layout_to_dict(layer) for layer in handshake.layers],
+        "imm_id": handshake.imm_id,
+    }
+
+
+def handshake_to_compact_dict(handshake: PdHandshake) -> dict[str, Any]:
+    if not handshake.layers:
+        return handshake_to_dict(handshake)
+    block_ids = handshake.layers[0].block_ids
+    if any(layer.block_ids != block_ids for layer in handshake.layers):
+        return handshake_to_dict(handshake)
+    return {
+        "request_id": handshake.request_id,
+        "engine_id": handshake.engine_id,
+        "tp_rank": handshake.tp_rank,
+        "tp_size": handshake.tp_size,
+        "block_size": handshake.block_size,
+        "block_ids": list(block_ids),
+        "layers": [layer_layout_to_compact_dict(layer) for layer in handshake.layers],
         "imm_id": handshake.imm_id,
     }
 

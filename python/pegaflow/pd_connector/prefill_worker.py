@@ -28,7 +28,6 @@ if TYPE_CHECKING:
     from pegaflow.pd_connector.worker import PdWorkerConnector
 
 logger = get_connector_logger()
-PD_RDMA_PUSH_SENDER_THREADS = 4
 
 
 class PrefillHandler:
@@ -452,26 +451,25 @@ class _AsyncLayerPushSender:
     def __init__(self) -> None:
         self._queue: queue.Queue[_LayerPushTask | None] = queue.Queue()
         self._condition = threading.Condition()
-        self._worker_count = PD_RDMA_PUSH_SENDER_THREADS
         self._inflight = 0
         self._inflight_by_req: dict[str, int] = {}
         self._stats_by_req: dict[str, _ReqPushStats] = {}
         self._discarded_stats_reqs: set[str] = set()
         self._error: BaseException | None = None
-        self._threads = [
-            threading.Thread(
-                target=self._run,
-                name=f"pd-rdma-push-sender-{idx}",
-                daemon=True,
-            )
-            for idx in range(self._worker_count)
-        ]
-        for thread in self._threads:
-            thread.start()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="pd-rdma-push-sender",
+            daemon=True,
+        )
+        self._thread.start()
         logger.info(
             "[PdConnector] P layer push sender started workers=%d",
-            self._worker_count,
+            self.worker_count,
         )
+
+    @property
+    def worker_count(self) -> int:
+        return 1
 
     def submit(self, task: _LayerPushTask) -> None:
         with self._condition:
@@ -514,8 +512,7 @@ class _AsyncLayerPushSender:
                 raise error
 
     def close(self) -> None:
-        for _ in self._threads:
-            self._queue.put(None)
+        self._queue.put(None)
 
     def pop_req_stats(self, req_id: str) -> _ReqPushStats:
         with self._condition:
@@ -750,7 +747,7 @@ class _AsyncPushFinalizer:
                     _elapsed_ms(writes_done_ts_ns, done_ts_ns),
                     _gbps(task.rdma_bytes, task.first_save_ts_ns, done_ts_ns),
                     _gbps(task.rdma_bytes, task.finalize_queued_ts_ns, done_ts_ns),
-                    self._push_sender._worker_count,
+                    self._push_sender.worker_count,
                     push_stats.tasks,
                     push_stats.bytes,
                     push_stats.queue_wait_ms,
