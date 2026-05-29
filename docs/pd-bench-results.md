@@ -262,6 +262,9 @@ Decode node `h20-100` receive:
   `wait_writes_ms` is usually sub-ms to tens of ms while `wait_sender_ms` and
   `schedule_to_imm_ms` are often about 1-2s. Native RDMA submit/complete is not
   the long pole in this run.
+- P-side logs now also emit `ready_window_gbps`, `link_gbps`, and
+  `ready_link_util_pct` so future runs can directly distinguish layer-ready
+  cadence from RDMA transfer bandwidth.
 - D logs show large `queue_wait_ms` for concurrent requests, often several
   seconds. Some requests later observe IMM almost immediately because the P-side
   push already completed before the D waiter reached them.

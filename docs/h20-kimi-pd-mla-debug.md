@@ -382,6 +382,9 @@ native write completion is not the long section:
 - `wait_sender_ms`: often about 1-2s
 - `schedule_to_imm_ms`: often about 1-2s
 - per-request `tail_gbps`: often about 8-9Gbps, sometimes lower under c4 queueing
+- future P-side logs include `ready_window_gbps`, `link_gbps`, and
+  `ready_link_util_pct` to show how much of the selected NIC link is fed by
+  layer-ready KV
 
 D-side wait logs show large queueing under concurrency:
 

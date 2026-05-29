@@ -41,6 +41,8 @@ class RdmaPort(Protocol):
 
     def push_done(self, req_id: str) -> None: ...
 
+    def aggregated_link_speed(self) -> int: ...
+
     def wait_done(self, req_id: str) -> None: ...
 
     def poll_done(self, req_id: str) -> bool: ...
@@ -89,6 +91,9 @@ class MockRdmaPort:
 
     def push_done(self, req_id: str) -> None:
         self._finished_sending.add(req_id)
+
+    def aggregated_link_speed(self) -> int:
+        return 400_000_000_000
 
     def wait_done(self, req_id: str) -> None:
         return None
@@ -312,6 +317,9 @@ class RealRdmaPort:
                 req_id,
                 (time.perf_counter() - start) * 1000,
             )
+
+    def aggregated_link_speed(self) -> int:
+        return int(self.engine.aggregated_link_speed())
 
     def wait_done(self, req_id: str) -> None:
         wait_done = getattr(self.engine, "wait_done", None)

@@ -243,8 +243,10 @@ class PrefillHandler:
                 continue
             self._tracker.mark_done(req_id)
             finalize_ts_ns = time.time_ns()
+            ready_gbps = _gbps(trace.rdma_bytes, trace.first_save_ts_ns, trace.last_save_ts_ns)
+            link_gbps = _rdma_link_gbps(self._w.rdma)
             logger.info(
-                "[PdConnector] P all chunks done req=%s target_req=%s chunks=%d blocks=%d rdma_bytes=%d schedule_to_save_ms=%.3f forward_ms=%.3f gbps=%.2f ts_ns=%d",
+                "[PdConnector] P all chunks done req=%s target_req=%s chunks=%d blocks=%d rdma_bytes=%d schedule_to_save_ms=%.3f forward_ms=%.3f gbps=%.2f link_gbps=%.2f ready_link_util_pct=%.2f ts_ns=%d",
                 req_id,
                 req.target_request_id,
                 trace.chunk_count,
@@ -252,7 +254,9 @@ class PrefillHandler:
                 trace.rdma_bytes,
                 (finalize_ts_ns - trace.queued_ts_ns) / 1_000_000,
                 _elapsed_ms(trace.first_save_ts_ns, trace.last_save_ts_ns),
-                _gbps(trace.rdma_bytes, trace.first_save_ts_ns, trace.last_save_ts_ns),
+                ready_gbps,
+                link_gbps,
+                _pct(ready_gbps, link_gbps),
                 finalize_ts_ns,
             )
             self._push_finalizer.submit(
@@ -357,6 +361,22 @@ def _gbps(bytes_total: int, start_ts_ns: int | None, end_ts_ns: int | None) -> f
     if bytes_total <= 0 or start_ts_ns is None or end_ts_ns is None or end_ts_ns <= start_ts_ns:
         return 0.0
     return bytes_total * 8 / ((end_ts_ns - start_ts_ns) / 1_000_000_000) / 1e9
+
+
+def _pct(value: float, total: float) -> float:
+    if value <= 0 or total <= 0:
+        return 0.0
+    return value / total * 100
+
+
+def _rdma_link_gbps(rdma: RdmaPort | None) -> float:
+    if rdma is None:
+        return 0.0
+    try:
+        return rdma.aggregated_link_speed() / 1e9
+    except Exception:
+        logger.exception("[PdConnector] failed to read RDMA link speed")
+        return 0.0
 
 
 def _assert_handshake_tp_consistency(handshakes: tuple[PdHandshake, ...]) -> None:
@@ -702,8 +722,14 @@ class _AsyncPushFinalizer:
                 writes_done_ts_ns = time.time_ns()
                 task.rdma.push_done(task.req_id)
                 done_ts_ns = time.time_ns()
+                ready_window_gbps = _gbps(
+                    task.rdma_bytes,
+                    task.first_save_ts_ns,
+                    task.finalize_queued_ts_ns,
+                )
+                link_gbps = _rdma_link_gbps(task.rdma)
                 logger.info(
-                    "[PdConnector] P RDMA done req=%s target_req=%s chunks=%d blocks=%d rdma_bytes=%d save_to_imm_ms=%.3f schedule_to_imm_ms=%.3f wait_sender_ms=%.3f wait_writes_ms=%.3f imm_ms=%.3f save_gbps=%.2f tail_gbps=%.2f sender_workers=%d push_tasks=%d push_bytes=%d push_queue_sum_ms=%.3f push_queue_avg_ms=%.3f push_queue_p50_ms=%.3f push_queue_p95_ms=%.3f push_queue_max_ms=%.3f push_event_sum_ms=%.3f push_event_avg_ms=%.3f push_event_p50_ms=%.3f push_event_p95_ms=%.3f push_event_max_ms=%.3f push_native_sum_ms=%.3f push_native_avg_ms=%.3f push_native_p50_ms=%.3f push_native_p95_ms=%.3f push_native_max_ms=%.3f ts_ns=%d",
+                    "[PdConnector] P RDMA done req=%s target_req=%s chunks=%d blocks=%d rdma_bytes=%d save_to_imm_ms=%.3f schedule_to_imm_ms=%.3f wait_sender_ms=%.3f wait_writes_ms=%.3f imm_ms=%.3f save_gbps=%.2f tail_gbps=%.2f ready_window_gbps=%.2f link_gbps=%.2f ready_link_util_pct=%.2f sender_workers=%d push_tasks=%d push_bytes=%d push_queue_sum_ms=%.3f push_queue_avg_ms=%.3f push_queue_p50_ms=%.3f push_queue_p95_ms=%.3f push_queue_max_ms=%.3f push_event_sum_ms=%.3f push_event_avg_ms=%.3f push_event_p50_ms=%.3f push_event_p95_ms=%.3f push_event_max_ms=%.3f push_native_sum_ms=%.3f push_native_avg_ms=%.3f push_native_p50_ms=%.3f push_native_p95_ms=%.3f push_native_max_ms=%.3f ts_ns=%d",
                     task.req_id,
                     task.target_request_id,
                     task.chunk_count,
@@ -716,6 +742,9 @@ class _AsyncPushFinalizer:
                     _elapsed_ms(writes_done_ts_ns, done_ts_ns),
                     _gbps(task.rdma_bytes, task.first_save_ts_ns, done_ts_ns),
                     _gbps(task.rdma_bytes, task.finalize_queued_ts_ns, done_ts_ns),
+                    ready_window_gbps,
+                    link_gbps,
+                    _pct(ready_window_gbps, link_gbps),
                     self._push_sender.worker_count,
                     push_stats.tasks,
                     push_stats.bytes,
