@@ -48,6 +48,7 @@ def build_pd_proxy_request(
     body: dict[str, Any],
     config: ProxyConfig,
     request_id: str | None = None,
+    proxy_start_ts_ns: int = 0,
 ) -> PdProxyRequest:
     req_id = request_id or str(body.get("request_id") or f"pd-{uuid.uuid4().hex}")
     prefill_req_id = f"{req_id}-p"
@@ -61,6 +62,7 @@ def build_pd_proxy_request(
         remote_request_id=prefill_req_id,
         done_request_id=decode_req_id,
         prefill_max_tokens=config.prefill_max_tokens,
+        proxy_start_ts_ns=proxy_start_ts_ns,
     ).to_dict()
 
     return PdProxyRequest(
@@ -78,8 +80,8 @@ class PdProxy:
             payload = {"error": f"unsupported path {path}"}
             return HTTPStatus.NOT_FOUND, json.dumps(payload).encode(), "application/json"
 
-        req = build_pd_proxy_request(body, self.config)
         start_ts_ns = time.time_ns()
+        req = build_pd_proxy_request(body, self.config, proxy_start_ts_ns=start_ts_ns)
         logger.info(
             "[PdProxy] request=%s accepted path=%s ts_ns=%d",
             req.request_id,
@@ -116,9 +118,9 @@ class PdProxy:
                 json.dumps(payload).encode(),
             )
 
-        req = build_pd_proxy_request(body, self.config)
-        req.decode_body["stream"] = True
         start_ts_ns = time.time_ns()
+        req = build_pd_proxy_request(body, self.config, proxy_start_ts_ns=start_ts_ns)
+        req.decode_body["stream"] = True
         logger.info(
             "[PdProxy] request=%s accepted streaming path=%s ts_ns=%d",
             req.request_id,

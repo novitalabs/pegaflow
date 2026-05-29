@@ -80,6 +80,7 @@ class DecodeHandler:
             if req_id in self._wait_reqs:
                 logger.info("[PdConnector] D wait req=%s already registered", req_id)
                 continue
+            process_ts_ns = time.time_ns()
             self._wait_reqs[req_id] = req
             handshake = self._build_handshake(
                 req.done_request_id,
@@ -87,6 +88,7 @@ class DecodeHandler:
             )
             self._w.rdma.open_request(req_id, handshake)
             local_block_count = len(flatten_block_ids(req.local_block_ids))
+            waiter_queued_ts_ns = time.time_ns()
             self._rdma_waiter.submit(
                 _RdmaWaitTask(
                     req_id=req_id,
@@ -95,17 +97,24 @@ class DecodeHandler:
                     prefill_url=req.prefill_url,
                     rank=self._w.tp_rank,
                     block_count=local_block_count,
-                    queued_ts_ns=time.time_ns(),
+                    queued_ts_ns=waiter_queued_ts_ns,
                 )
             )
+            queued_ts_ns = time.time_ns()
             logger.info(
-                "[PdConnector] D queued async wait req=%s remote_req=%s prefill_url=%s rank=%d blocks=%d ts_ns=%d",
+                "[PdConnector] D queued async wait req=%s remote_req=%s prefill_url=%s rank=%d blocks=%d "
+                "proxy_to_worker_ms=%.3f matched_to_worker_ms=%.3f scheduler_wait_to_worker_ms=%.3f "
+                "open_request_ms=%.3f ts_ns=%d",
                 req_id,
                 req.remote_request_id,
                 req.prefill_url or "<oob>",
                 self._w.tp_rank,
                 local_block_count,
-                time.time_ns(),
+                _elapsed_ms(req.proxy_start_ts_ns, queued_ts_ns),
+                _elapsed_ms(req.matched_ts_ns, queued_ts_ns),
+                _elapsed_ms(req.scheduler_wait_ts_ns, queued_ts_ns),
+                _elapsed_ms(process_ts_ns, queued_ts_ns),
+                queued_ts_ns,
             )
             if req.prefill_url and self._w.tp_rank == 0:
                 self._dispatch_prefill(req, handshake.imm_id)
@@ -173,7 +182,9 @@ class DecodeHandler:
         self._prefill_sender.submit(task)
         submitted_ts_ns = time.time_ns()
         logger.info(
-            "[PdConnector] D rank0 dispatched prefill req=%s remote_req=%s ranks=%d blocks=%d block_ids_ms=%.3f handshakes_ms=%.3f params_ms=%.3f total_ms=%.3f ts_ns=%d",
+            "[PdConnector] D rank0 dispatched prefill req=%s remote_req=%s ranks=%d blocks=%d "
+            "block_ids_ms=%.3f handshakes_ms=%.3f params_ms=%.3f total_ms=%.3f "
+            "proxy_to_dispatch_ms=%.3f matched_to_dispatch_ms=%.3f scheduler_wait_to_dispatch_ms=%.3f ts_ns=%d",
             req.remote_request_id,
             req.done_request_id,
             len(all_handshakes),
@@ -182,6 +193,9 @@ class DecodeHandler:
             (handshakes_ts_ns - block_ids_ts_ns) / 1_000_000,
             (submitted_ts_ns - handshakes_ts_ns) / 1_000_000,
             (submitted_ts_ns - started_ts_ns) / 1_000_000,
+            _elapsed_ms(req.proxy_start_ts_ns, submitted_ts_ns),
+            _elapsed_ms(req.matched_ts_ns, submitted_ts_ns),
+            _elapsed_ms(req.scheduler_wait_ts_ns, submitted_ts_ns),
             submitted_ts_ns,
         )
 
@@ -327,3 +341,9 @@ def _all_gather_peer_info(
     gathered: list[tuple[dict[str, KvCacheLayout], dict[str, Any]] | None] = [None] * tp_size
     dist.all_gather_object(gathered, (layouts, mr_descs))
     return gathered  # type: ignore[return-value]
+
+
+def _elapsed_ms(start_ts_ns: int, end_ts_ns: int) -> float:
+    if start_ts_ns <= 0 or end_ts_ns <= 0 or end_ts_ns < start_ts_ns:
+        return -1.0
+    return (end_ts_ns - start_ts_ns) / 1_000_000

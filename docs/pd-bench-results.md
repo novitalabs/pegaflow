@@ -131,6 +131,7 @@ vLLM serving flags.
 | kimi-proxy-fixed32k-jsoncompact-singlefifo-in16384-out1-c1-n50-seed20260528 | 50/50 | 125.94 | 0.397 | 6505.33 | 2518.21 | 3016.47 |
 | kimi-proxy-fixed32k-schedblocks-in16384-out1-c1-n50-seed20260528 | 50/50 | 124.32 | 0.402 | 6589.97 | 2485.86 | 2986.99 |
 | kimi-proxy-fixed32k-handshakecache-in16384-out1-c1-n50-seed20260528 | 50/50 | 122.47 | 0.408 | 6689.38 | 2448.93 | 2897.89 |
+| kimi-proxy-fixed32k-trace-in16384-out1-c1-n50-seed20260528 | 50/50 | 122.05 | 0.410 | 6712.22 | 2440.53 | 2845.69 |
 | proxy-16k-c4-prefill-parallel-batch32768-50 | 50/50 | 113.71 | 0.440 | 7145.87 | 8869.98 | 12085.89 |
 | proxy-16k-c4-windowfix-batch32768 | 20/20 | 46.62 | 0.429 | 7080.97 | 8726.38 | 11874.28 |
 
@@ -143,23 +144,27 @@ P/D except for the connector/proxy shape: `--load-format dummy`,
 
 | input_len | baseline_mean_TTFT_ms | proxy_PD_mean_TTFT_ms | delta_ms | delta_pct | baseline_p99_TTFT_ms | proxy_p99_TTFT_ms | baseline_success | proxy_success | baseline_req_s | proxy_req_s |
 |-----------|-----------------------|-----------------------|----------|-----------|-----------------------|-------------------|------------------|---------------|----------------|-------------|
-| 16384 | 2334.77 | 2448.93 | 114.16 | 4.89% | 2346.75 | 2897.89 | 50/50 | 50/50 | 0.43 | 0.41 |
+| 16384 | 2334.77 | 2440.53 | 105.76 | 4.53% | 2346.75 | 2845.69 | 50/50 | 50/50 | 0.43 | 0.41 |
 
-The latest 16k proxy run moved 116.76GB per NIC over a 140.3s monitor window:
-average 6.66Gbps per NIC on P transmit and 6.66Gbps per NIC on D receive. The
+The latest 16k proxy run moved 116.27GB per P NIC over a 139.3s monitor window
+and 116.76GB per D NIC over a 140.2s monitor window: average 6.68Gbps per NIC
+on P transmit and 6.66Gbps per NIC on D receive. The
 verified RDMA-only two-node integration test using the same 8-rank Kimi 16k
 shape moved 36.84GB in about 239ms, passed 100.66MB D-side deterministic
 payload sampling with per-iteration destination reset, and reached 1.23Tbps
 aggregate with 312-313Gbps per NIC. Therefore the vLLM pressure run is not
 limited by native RDMA bandwidth. In the latest 16k/c1 run, D rank0 handshake
-build fell from about 39.7ms to 0.04ms p50; the remaining TTFT delta is mostly
-proxy/D request setup before dispatch plus work after `finished_recving`. One
-known component is D-side last-token recompute.
+build fell from about 39.7ms to 0.04ms p50; the scheduler trace shows the
+remaining TTFT delta is mostly before D scheduler matching plus work after
+`finished_recving`. One known later component is D-side last-token recompute.
 
 Latest 16k/c1 log split:
 
 - D rank0 prefill dispatch: p50 0.07ms total, p95 0.14ms.
 - Proxy accept to D rank0 dispatch: p50 108.94ms, p95 125.41ms.
+- Trace run `proxy_to_matched_ms`: p50 95.79ms, p95 104.66ms.
+- Trace run `matched_to_dispatch_ms`: p50 9.16ms, p95 10.13ms.
+- Trace run rank0 `open_request_ms`: p50 7.34ms, p95 8.35ms.
 - P-side `wait_writes_ms`: p50 0.83ms, p95 0.89ms.
 - P-side `push_native_avg_ms`: p50 0.03ms, p95 0.04ms per layer push.
 - P-side `wait_sender_ms`: p50 1036.67ms.

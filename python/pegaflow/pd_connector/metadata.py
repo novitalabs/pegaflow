@@ -52,6 +52,9 @@ class WaitReqMeta:
     prefill_url: str
     model: str = ""
     prefill_max_tokens: int = 1
+    proxy_start_ts_ns: int = 0
+    matched_ts_ns: int = 0
+    scheduler_wait_ts_ns: int = 0
 
 
 @dataclass(frozen=True)

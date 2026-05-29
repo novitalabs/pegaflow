@@ -177,7 +177,7 @@ cache changes. Other input lengths are still pending.
 | 1024 | 158.67 | TBD | TBD | TBD | 235.17 | TBD | 50/50 | TBD | 6.30 | TBD | TBD | TBD | missing proxy |
 | 4096 | 553.42 | TBD | TBD | TBD | 559.53 | TBD | 50/50 | TBD | 1.81 | TBD | TBD | TBD | missing proxy |
 | 8192 | 1111.23 | TBD | TBD | TBD | 1120.30 | TBD | 50/50 | TBD | 0.90 | TBD | TBD | TBD | missing proxy |
-| 16384 | 2334.77 | 2448.93 | 114.16 | 4.89% | 2346.75 | 2897.89 | 50/50 | 50/50 | 0.43 | 0.41 | 6.66 | 12.44 | proxy label `kimi-proxy-fixed32k-handshakecache` |
+| 16384 | 2334.77 | 2440.53 | 105.76 | 4.53% | 2346.75 | 2845.69 | 50/50 | 50/50 | 0.43 | 0.41 | 6.68 | 12.14 | proxy label `kimi-proxy-fixed32k-trace` |
 | 30000 | 4728.88 | TBD | TBD | TBD | 4738.49 | TBD | 50/50 | TBD | 0.21 | TBD | TBD | TBD | missing proxy |
 
 Artifacts:
@@ -196,6 +196,9 @@ Artifacts:
 - `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-handshakecache-in16384-out1-c1-n50-seed20260528.json`
 - `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-handshakecache-in16384-out1-c1-n50-seed20260528-h20-99-nic-summary.txt`
 - `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-handshakecache-in16384-out1-c1-n50-seed20260528-h20-100-nic-summary.txt`
+- `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-trace-in16384-out1-c1-n50-seed20260528.json`
+- `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-trace-in16384-out1-c1-n50-seed20260528-h20-99-nic-summary.txt`
+- `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-trace-in16384-out1-c1-n50-seed20260528-h20-100-nic-summary.txt`
 
 ## RDMA-only Integration Test
 
@@ -269,6 +272,7 @@ direct baseline is restarted with the same fixed 32k vLLM serving flags.
 | `kimi-proxy-fixed32k-jsoncompact-singlefifo-in16384-out1-c1-n50-seed20260528` | 50/50 | 125.94 | 0.397 | 6505.33 | 2518.21 | 3016.47 |
 | `kimi-proxy-fixed32k-schedblocks-in16384-out1-c1-n50-seed20260528` | 50/50 | 124.32 | 0.402 | 6589.97 | 2485.86 | 2986.99 |
 | `kimi-proxy-fixed32k-handshakecache-in16384-out1-c1-n50-seed20260528` | 50/50 | 122.47 | 0.408 | 6689.38 | 2448.93 | 2897.89 |
+| `kimi-proxy-fixed32k-trace-in16384-out1-c1-n50-seed20260528` | 50/50 | 122.05 | 0.410 | 6712.22 | 2440.53 | 2845.69 |
 | `proxy-16k-c4-prefill-parallel-batch32768-50` | 50/50 | 113.71 | 0.440 | 7145.87 | 8869.98 | 12085.89 |
 | `proxy-16k-c4-windowfix-batch32768` | 20/20 | 46.62 | 0.429 | 7080.97 | 8726.38 | 11874.28 |
 
@@ -281,7 +285,7 @@ The final experiment table should be keyed by input length:
 | 1024 | 158.67 | TBD | TBD | TBD | 235.17 | TBD | 50/50 | TBD | 6.30 | TBD | TBD | TBD | missing proxy |
 | 4096 | 553.42 | TBD | TBD | TBD | 559.53 | TBD | 50/50 | TBD | 1.81 | TBD | TBD | TBD | missing proxy |
 | 8192 | 1111.23 | TBD | TBD | TBD | 1120.30 | TBD | 50/50 | TBD | 0.90 | TBD | TBD | TBD | missing proxy |
-| 16384 | 2334.77 | 2448.93 | 114.16 | 4.89% | 2346.75 | 2897.89 | 50/50 | 50/50 | 0.43 | 0.41 | 6.66 | 12.44 | scheduler blocks + cached D handshake templates |
+| 16384 | 2334.77 | 2440.53 | 105.76 | 4.53% | 2346.75 | 2845.69 | 50/50 | 50/50 | 0.43 | 0.41 | 6.68 | 12.14 | scheduler trace instrumentation |
 | 30000 | 4728.88 | TBD | TBD | TBD | 4738.49 | TBD | 50/50 | TBD | 0.21 | TBD | TBD | TBD | missing proxy |
 
 ## NIC Counter Result
@@ -310,9 +314,10 @@ Decode node `h20-100` receive:
 | `mlx5_3` | 115.86GB | 5.16Gbps | 20.46Gbps |
 | `mlx5_4` | 115.86GB | 5.16Gbps | 20.46Gbps |
 
-Latest fixed 16k/c1 `handshakecache` run: each NIC moved 116.76GB over a
-140.3s monitor window. P transmit averaged 6.66Gbps per NIC with max 1s peak
-12.44Gbps; D receive averaged 6.66Gbps per NIC with max 1s peak 8.51Gbps.
+Latest fixed 16k/c1 `trace` run: each P NIC transmitted 116.27GB over a
+139.3s monitor window, averaging 6.68Gbps per NIC with max 1s peak 12.14Gbps.
+Each D NIC received 116.76GB over a 140.2s window, averaging 6.66Gbps per NIC
+with max 1s peak 9.06Gbps.
 
 ## Log Evidence
 
@@ -344,12 +349,25 @@ For the fixed 16k/c1 `handshakecache` run:
 - D-to-P HTTP payload after compact handshake and compact JSON: p50 280KB,
   p95 295KB. Before the compact handshake this was about 3.76MB.
 
+For the fixed 16k/c1 `trace` run:
+
+- `proxy_to_matched_ms`: p50 95.79ms, p95 104.66ms.
+- `matched_to_wait_ms`: p50 0.28ms, p95 0.37ms.
+- Rank0 `matched_to_worker_ms`: p50 9.04ms, p95 10.04ms.
+- Rank0 `open_request_ms`: p50 7.34ms, p95 8.35ms.
+- `proxy_to_dispatch_ms`: p50 104.96ms, p95 113.77ms.
+- `matched_to_dispatch_ms`: p50 9.16ms, p95 10.13ms.
+- D rank0 dispatch body itself remains small: p50 0.07ms, p95 0.12ms.
+
 After scheduler-block push and cached D handshake templates, D-side handshake
-construction is no longer material in the TTFT delta. The remaining median TTFT
-delta is mostly in proxy/D request setup before dispatch and work after
-`finished_recving`; one known component is that vLLM decrements a full external
-KV hit by one token, so D recomputes the last prompt token to produce sampling
-logits.
+construction is no longer material in the TTFT delta. The trace run shows that
+most fixed overhead is already present before D's scheduler-side
+`get_num_new_matched_tokens` callback runs. Scheduler wait construction is
+sub-ms, and scheduler-to-worker dispatch adds about 9ms, mostly RDMA
+`open_request`. The main remaining target is therefore D's vLLM HTTP/API to
+EngineCore ingress before scheduler matching; one known later component is that
+vLLM decrements a full external KV hit by one token, so D recomputes the last
+prompt token to produce sampling logits.
 
 ## TCP and HTTP Microbench
 

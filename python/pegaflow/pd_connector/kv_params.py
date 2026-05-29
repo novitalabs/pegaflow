@@ -24,10 +24,13 @@ class ConsumerKvParams:
     remote_request_id: str = ""
     done_request_id: str = ""
     prefill_max_tokens: int = 1
+    proxy_start_ts_ns: int = 0
 
     def __post_init__(self) -> None:
         if self.prefill_max_tokens <= 0:
             raise ValueError("prefill_max_tokens must be positive")
+        if self.proxy_start_ts_ns < 0:
+            raise ValueError("proxy_start_ts_ns must be non-negative")
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"do_remote_prefill": True, "prefill_url": self.prefill_url}
@@ -36,6 +39,8 @@ class ConsumerKvParams:
         if self.done_request_id:
             d["done_request_id"] = self.done_request_id
         d["prefill_max_tokens"] = self.prefill_max_tokens
+        if self.proxy_start_ts_ns:
+            d["proxy_start_ts_ns"] = self.proxy_start_ts_ns
         return d
 
 
@@ -72,6 +77,7 @@ def parse_consumer(params: dict[str, Any]) -> ConsumerKvParams | None:
         remote_request_id=str(params.get("remote_request_id") or ""),
         done_request_id=str(params.get("done_request_id") or ""),
         prefill_max_tokens=int(raw_prefill_max_tokens),
+        proxy_start_ts_ns=int(params.get("proxy_start_ts_ns") or 0),
     )
 
 
