@@ -49,7 +49,9 @@ D→P setup (37.9ms) further breaks down to:
 Standalone experiment note: [h20-kimi-pd-mla-debug.md](h20-kimi-pd-mla-debug.md).
 
 Note: this c4 run is a diagnostic queueing run. H20 PD MLA acceptance pressure
-tests should use `--max-concurrency 1`.
+tests should use `--max-concurrency 1`, sweep only input length, and compare
+direct baseline vs P/D proxy with the same fixed non-connector vLLM serving flags
+(`--load-format dummy --max-num-batched-tokens 32768`).
 
 ### Setup
 
@@ -103,7 +105,9 @@ vllm bench serve \
 |-----|---------|------------|-------|-------------|--------------|-------------|
 | proxy-16k-c4-nicdelta-50 | 50/50 | 114.23 | 0.438 | 7113.63 | 8911.54 | 12200.33 |
 
-Previous reference points from the same debug session:
+Previous reference points from the same debug session. The `batch32768` runs are
+diagnostic unless the direct baseline is also restarted with the same fixed 32k
+vLLM serving flags.
 
 | run | success | duration_s | req/s | total_tok/s | mean_TTFT_ms | p99_TTFT_ms |
 |-----|---------|------------|-------|-------------|--------------|-------------|

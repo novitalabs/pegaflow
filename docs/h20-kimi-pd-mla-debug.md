@@ -16,14 +16,15 @@ H20. The run passed request correctness but did not saturate RDMA bandwidth.
 - RDMA result: all 4 NICs were used evenly, but peak bandwidth was only about
   20Gbps per NIC
 - Benchmark discipline after this run: use `--max-concurrency 1` for acceptance
-  pressure tests. The c4 run below is kept only as a queueing diagnostic.
+  pressure tests, and compare only runs started with the same non-connector vLLM
+  flags. The c4 run below is kept only as a queueing diagnostic.
 
 The main conclusion is that the 4-NIC rank map is working, but the upper P/D
 pipeline is not feeding RDMA continuously enough to fill the links.
 
 ## Setup
 
-The services were started with:
+The P/D services in this historical run were started with:
 
 - TP=8 on both prefill and decode
 - `--load-format dummy`
@@ -50,6 +51,27 @@ Service endpoints:
 | decode | h20-100 | `http://10.96.191.100:18102` |
 
 The services were stopped after the run.
+
+## Fixed Startup Contract For The Next Sweep
+
+The final comparison must keep the vLLM serving shape fixed. Baseline and P/D
+proxy runs should use the same non-connector flags:
+
+```bash
+vllm serve /data/models/Kimi-K2.5 \
+  --host 0.0.0.0 \
+  --tensor-parallel-size 8 \
+  --gpu-memory-utilization 0.90 \
+  --load-format dummy \
+  --max-num-batched-tokens 32768 \
+  --trust-remote-code \
+  --no-enable-prefix-caching
+```
+
+The direct baseline starts this command without `--kv-transfer-config`. The P/D
+run starts the same command on P and D with the PdConnector
+`--kv-transfer-config`, plus the proxy. Do not compare a default-baseline run
+against a P/D run with a different scheduler/batching shape.
 
 ## Code Changes Tested
 
@@ -84,28 +106,27 @@ vllm bench serve \
 This was a diagnostic c4 run to expose queueing. It should not be used as the
 acceptance benchmark shape.
 
-## Acceptance Benchmark Command
+## Acceptance Sweep Command
 
-Future H20 PD MLA pressure tests should use concurrency 1:
+Future H20 PD MLA pressure tests should use concurrency 1 and only sweep input
+length. The helper script keeps the benchmark shape fixed:
 
 ```bash
-vllm bench serve \
-  --backend openai \
-  --base-url http://127.0.0.1:18100 \
-  --endpoint /v1/completions \
-  --model /data/models/Kimi-K2.5 \
-  --trust-remote-code \
-  --dataset-name random \
-  --random-range-ratio 0.1 \
-  --random-input-len 16384 \
-  --random-output-len 1 \
-  --request-rate inf \
-  --max-concurrency 1 \
-  --num-prompts 50 \
-  --save-result \
-  --result-dir pd_h20_logs/bench \
-  --result-filename proxy-16k-c1-nicdelta-50.json
+LENGTHS="1024 4096 8192 16384 30000" scripts/run_h20_kimi_ttft_sweep.sh baseline
+LENGTHS="1024 4096 8192 16384 30000" scripts/run_h20_kimi_ttft_sweep.sh proxy
 ```
+
+Both modes use:
+
+- `--max-concurrency 1`
+- `--request-rate inf`
+- `--random-range-ratio 0.0`
+- `--random-output-len 1`
+- `--num-prompts 50`
+- `--temperature 0`
+
+Proxy mode also samples `mlx5_1` through `mlx5_4` on both nodes and writes NIC
+summary files next to the benchmark JSON files.
 
 ## Serving Result
 
@@ -113,7 +134,9 @@ vllm bench serve \
 |-----|---------|------------|-------|-------------|--------------|-------------|
 | `proxy-16k-c4-nicdelta-50` | 50/50 | 114.23 | 0.438 | 7113.63 | 8911.54 | 12200.33 |
 
-Reference runs from the same debug session:
+Reference runs from the same debug session. The `batch32768` runs are useful
+diagnostic evidence, but they are not a valid baseline-aligned sweep unless the
+direct baseline is restarted with the same fixed 32k vLLM serving flags.
 
 | run | success | duration_s | req/s | total_tok/s | mean_TTFT_ms | p99_TTFT_ms |
 |-----|---------|------------|-------|-------------|--------------|-------------|
@@ -121,6 +144,18 @@ Reference runs from the same debug session:
 | `proxy-16k-c1-prefill-parallel-batch32768` | 50/50 | 130.52 | 0.383 | 6225.64 | 2609.82 | 2883.63 |
 | `proxy-16k-c4-prefill-parallel-batch32768-50` | 50/50 | 113.71 | 0.440 | 7145.87 | 8869.98 | 12085.89 |
 | `proxy-16k-c4-windowfix-batch32768` | 20/20 | 46.62 | 0.429 | 7080.97 | 8726.38 | 11874.28 |
+
+## Final Table Shape
+
+The final experiment table should be keyed by input length:
+
+| input_len | baseline_mean_TTFT_ms | proxy_PD_mean_TTFT_ms | delta_ms | delta_pct | baseline_p99_TTFT_ms | proxy_p99_TTFT_ms | proxy_avg_RDMA_Gbps_per_NIC | proxy_peak_RDMA_Gbps_per_NIC | notes |
+|-----------|-----------------------|-----------------------|----------|-----------|-----------------------|-------------------|-----------------------------|------------------------------|-------|
+| 1024 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | fixed 32k, c1 |
+| 4096 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | fixed 32k, c1 |
+| 8192 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | fixed 32k, c1 |
+| 16384 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | fixed 32k, c1 |
+| 30000 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | fixed 32k, c1 |
 
 ## NIC Counter Result
 
