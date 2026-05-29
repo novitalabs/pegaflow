@@ -44,10 +44,10 @@ jobs:
           method: 'network'
           sub-packages: '["nvcc", "nvrtc-dev", "cudart-dev"]'
 
-      - name: Install protobuf compiler
+      - name: Install protobuf compiler and RDMA headers
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          sudo apt-get install -y protobuf-compiler libibverbs-dev
 
       - name: Install rust toolchain
         uses: dtolnay/rust-toolchain@stable
