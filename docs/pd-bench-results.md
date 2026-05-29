@@ -52,6 +52,8 @@ Note: this c4 run is a diagnostic queueing run. H20 PD MLA acceptance pressure
 tests should use `--max-concurrency 1`, sweep only input length, and compare
 direct baseline vs P/D proxy with the same fixed non-connector vLLM serving flags
 (`--load-format dummy --max-num-batched-tokens 32768`).
+Use `scripts/run_pd_h20_kimi.sh start-baseline` for the direct baseline and
+`scripts/run_h20_kimi_ttft_sweep.sh` for the paired c1 sweep.
 
 ### Setup
 

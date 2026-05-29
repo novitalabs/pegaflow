@@ -4,11 +4,10 @@ set -euo pipefail
 
 ROLE="${1:-}"
 MODEL="${MODEL:-/data/models/Kimi-K2.5}"
-TP_SIZE="${TP_SIZE:-8}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-}"
-GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
-LOAD_FORMAT="${LOAD_FORMAT:-dummy}"
-MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-32768}"
+TP_SIZE=8
+GPU_MEMORY_UTILIZATION=0.90
+LOAD_FORMAT=dummy
+MAX_NUM_BATCHED_TOKENS=32768
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 
 PREFILL_HOST="${PREFILL_HOST:-10.96.191.99}"
@@ -31,13 +30,14 @@ fi
 
 usage() {
   cat <<EOF
-Usage: $0 {start-prefill|start-decode|start-proxy|status|stop|smoke}
+Usage: $0 {start-baseline|start-prefill|start-decode|start-proxy|status|stop|smoke}
        $0 start-cluster  # run on the prefill/proxy node
 
 Defaults:
   MODEL=$MODEL
   VENV=$VENV
-  MAX_MODEL_LEN=${MAX_MODEL_LEN:-<model default>}
+  TP_SIZE=$TP_SIZE
+  GPU_MEMORY_UTILIZATION=$GPU_MEMORY_UTILIZATION
   LOAD_FORMAT=$LOAD_FORMAT
   MAX_NUM_BATCHED_TOKENS=$MAX_NUM_BATCHED_TOKENS
   PREFILL=http://$PREFILL_HOST:$PREFILL_PORT
@@ -47,6 +47,7 @@ Defaults:
   LOG_DIR=$LOG_DIR
 
 No --block-size is passed; vLLM/model defaults decide the KV cache block shape.
+No --max-model-len is passed; baseline and P/D runs keep the same model limit.
 EOF
 }
 
@@ -112,11 +113,7 @@ start_vllm() {
   local log_file="$LOG_DIR/$name.log"
   local pid_file="$LOG_DIR/$name.pid"
   local config
-  local max_model_len_args=()
   config="$(kv_config "$engine_id")"
-  if [[ -n "$MAX_MODEL_LEN" ]]; then
-    max_model_len_args=(--max-model-len "$MAX_MODEL_LEN")
-  fi
 
   if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" >/dev/null 2>&1; then
     echo "[$name] already running pid=$(cat "$pid_file")"
@@ -136,15 +133,41 @@ start_vllm() {
     --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
     --load-format "$LOAD_FORMAT" \
     --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
-    "${max_model_len_args[@]}" \
     --trust-remote-code \
     --no-enable-prefix-caching \
     --kv-transfer-config "$config" \
-    ${EXTRA_VLLM_ARGS:-} \
     >"$log_file" 2>&1 &
   local pid=$!
   echo "$pid" >"$pid_file"
   wait_ready "$name" "$port" "$pid" "$log_file"
+}
+
+start_baseline() {
+  local log_file="$LOG_DIR/baseline.log"
+  local pid_file="$LOG_DIR/baseline.pid"
+  if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" >/dev/null 2>&1; then
+    echo "[baseline] already running pid=$(cat "$pid_file")"
+    return
+  fi
+
+  echo "[baseline] starting on port $DECODE_PORT, logs=$log_file"
+  CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" \
+  PYTHONHASHSEED=0 \
+  VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-INFO}" \
+  PATH="$VENV/bin:$PATH" \
+  nohup setsid "$VENV/bin/vllm" serve "$MODEL" \
+    --host 0.0.0.0 \
+    --port "$DECODE_PORT" \
+    --tensor-parallel-size "$TP_SIZE" \
+    --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
+    --load-format "$LOAD_FORMAT" \
+    --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
+    --trust-remote-code \
+    --no-enable-prefix-caching \
+    >"$log_file" 2>&1 &
+  local pid=$!
+  echo "$pid" >"$pid_file"
+  wait_ready baseline "$DECODE_PORT" "$pid" "$log_file"
 }
 
 start_proxy() {
@@ -193,7 +216,7 @@ start_cluster() {
 }
 
 stop_all() {
-  for name in proxy prefill decode; do
+  for name in proxy prefill decode baseline; do
     local pid_file="$LOG_DIR/$name.pid"
     if [[ -f "$pid_file" ]]; then
       local pid
@@ -209,7 +232,7 @@ stop_all() {
 }
 
 status() {
-  for name in proxy prefill decode; do
+  for name in proxy prefill decode baseline; do
     local pid_file="$LOG_DIR/$name.pid"
     if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" >/dev/null 2>&1; then
       echo "[$name] running pid=$(cat "$pid_file")"
@@ -228,6 +251,9 @@ smoke() {
 }
 
 case "$ROLE" in
+  start-baseline)
+    start_baseline
+    ;;
   start-prefill)
     start_vllm prefill "$PREFILL_PORT" prefill
     ;;

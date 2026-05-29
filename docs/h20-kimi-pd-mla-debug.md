@@ -73,6 +73,21 @@ run starts the same command on P and D with the PdConnector
 `--kv-transfer-config`, plus the proxy. Do not compare a default-baseline run
 against a P/D run with a different scheduler/batching shape.
 
+The launch script now has a dedicated direct-baseline role for this:
+
+```bash
+ssh h20-100 'cd /root/develop/xingming/pegaflow && scripts/run_pd_h20_kimi.sh stop && scripts/run_pd_h20_kimi.sh start-baseline'
+```
+
+For P/D proxy runs:
+
+```bash
+ssh h20-100 'cd /root/develop/xingming/pegaflow && scripts/run_pd_h20_kimi.sh stop'
+cd /root/develop/xingming/pegaflow
+scripts/run_pd_h20_kimi.sh stop
+scripts/run_pd_h20_kimi.sh start-cluster
+```
+
 ## Code Changes Tested
 
 - D-side prefill HTTP dispatch was parallelized with 8 sender threads.
@@ -127,6 +142,13 @@ Both modes use:
 
 Proxy mode also samples `mlx5_1` through `mlx5_4` on both nodes and writes NIC
 summary files next to the benchmark JSON files.
+
+Build the final table from the generated JSON and NIC summaries:
+
+```bash
+uv run --no-project python scripts/summarize_h20_kimi_ttft_sweep.py \
+  pd_h20_logs/bench/ttft-sweep
+```
 
 ## Serving Result
 
