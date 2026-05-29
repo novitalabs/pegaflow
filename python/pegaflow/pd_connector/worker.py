@@ -7,6 +7,7 @@ PdWorkerConnector is the public facade. It composes:
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from vllm.distributed.parallel_state import (
@@ -192,6 +193,15 @@ class PdWorkerConnector:
         for req_id in releasable_sending:
             self.rdma.close_request(req_id)
         finished_recving = self.rdma.pop_finished_recving()
+        if finished_recving:
+            report_ts_ns = time.time_ns()
+            logger.info(
+                "[PdConnector] D worker finished_recving reqs=%s count=%d remaining_wait_before=%d ts_ns=%d",
+                sorted(finished_recving),
+                len(finished_recving),
+                len(self._decode.wait_reqs),
+                report_ts_ns,
+            )
         self._decode.finish_recving(finished_recving)
 
         logger.debug(

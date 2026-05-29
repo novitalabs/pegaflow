@@ -183,10 +183,19 @@ class PdSchedulerConnector:
             logger.info("[PdConnector] scheduler finished sending req=%s", req_id)
 
         for req_id in connector_output.finished_recving or ():
+            finished_ts_ns = time.time_ns()
+            wait_req = self._active_waits.get(req_id)
             self._active_waits.pop(req_id, None)
             self._completed_waits.add(req_id)
-            self._matched_ts_ns.pop(req_id, None)
-            logger.info("[PdConnector] scheduler finished recving req=%s", req_id)
+            matched_ts_ns = self._matched_ts_ns.pop(req_id, None)
+            logger.info(
+                "[PdConnector] scheduler finished recving req=%s proxy_to_finished_ms=%.3f matched_to_finished_ms=%.3f wait_to_finished_ms=%.3f ts_ns=%d",
+                req_id,
+                _elapsed_ms(wait_req.proxy_start_ts_ns, finished_ts_ns) if wait_req else -1.0,
+                _elapsed_ms(matched_ts_ns or 0, finished_ts_ns),
+                _elapsed_ms(wait_req.scheduler_wait_ts_ns, finished_ts_ns) if wait_req else -1.0,
+                finished_ts_ns,
+            )
 
     def request_finished(
         self,

@@ -391,6 +391,10 @@ D-side wait logs show large queueing under concurrency:
 - `queue_wait_ms`: often several seconds
 - Some requests later see near-zero `wait_ms`, because the P-side IMM already
   arrived before the D waiter reached that request.
+- future D-side logs include worker-level `finished_recving` timestamps plus
+  scheduler `proxy_to_finished_ms`, `matched_to_finished_ms`, and
+  `wait_to_finished_ms`, so the post-RDMA D tail can be aligned with proxy first
+  chunk timing.
 
 For the fixed 16k/c1 `handshakecache` run:
 

@@ -268,6 +268,10 @@ Decode node `h20-100` receive:
 - D logs show large `queue_wait_ms` for concurrent requests, often several
   seconds. Some requests later observe IMM almost immediately because the P-side
   push already completed before the D waiter reached them.
+- D-side logs now emit worker-level `finished_recving` timestamps plus scheduler
+  `proxy_to_finished_ms`, `matched_to_finished_ms`, and `wait_to_finished_ms`.
+  These can be compared with `D received RDMA done ... ts_ns` and proxy first
+  stream chunk timestamps to isolate the post-RDMA D tail.
 - The next performance target should be the post-`finished_recving` path,
   including D-side last-token recompute, proxy response handling, and scheduler
   wakeup. Increasing NIC count alone will not raise bandwidth until the upper
