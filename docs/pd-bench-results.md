@@ -55,13 +55,12 @@ direct baseline vs P/D proxy with the same fixed non-connector vLLM serving flag
 Use `scripts/run_pd_h20_kimi.sh start-baseline` for the direct baseline and
 `scripts/run_h20_kimi_ttft_sweep.sh` for the paired c1 sweep.
 
-Current fixed 32k/c1 sweep progress: the direct baseline leg was rerun on
-2026-05-29 and recorded in
-[h20-kimi-pd-mla-debug.md](h20-kimi-pd-mla-debug.md). It completed 50/50
-requests for input lengths 1024, 4096, 8192, 16384, and 30000. The matching P/D
-proxy leg has only been rerun for 16k after the single FIFO sender, compact
-handshake, compact JSON, scheduler-block push, D handshake template cache, and
-minimal D wait-handshake changes.
+Current fixed 32k/c1 sweep progress: the direct baseline and matching P/D proxy
+legs were rerun on 2026-05-29 and recorded in
+[h20-kimi-pd-mla-debug.md](h20-kimi-pd-mla-debug.md). Both completed 50/50
+requests for input lengths 1024, 4096, 8192, 16384, and 30000 after the single
+FIFO sender, compact handshake, compact JSON, scheduler-block push, D handshake
+template cache, and minimal D wait-handshake changes.
 
 ### Setup
 
@@ -138,16 +137,20 @@ vLLM serving flags.
 | proxy-16k-c4-prefill-parallel-batch32768-50 | 50/50 | 113.71 | 0.440 | 7145.87 | 8869.98 | 12085.89 |
 | proxy-16k-c4-windowfix-batch32768 | 20/20 | 46.62 | 0.429 | 7080.97 | 8726.38 | 11874.28 |
 
-### Fixed 16k C1 Result
+### Fixed C1 Sweep Result
 
-The aligned 16k comparison uses the same vLLM serving command on baseline and
+The aligned comparison uses the same vLLM serving command on baseline and
 P/D except for the connector/proxy shape: `--load-format dummy`,
 `--max-num-batched-tokens 32768`, no explicit `--block-size`, and no explicit
 `--max-model-len`.
 
-| input_len | baseline_mean_TTFT_ms | proxy_PD_mean_TTFT_ms | delta_ms | delta_pct | baseline_p99_TTFT_ms | proxy_p99_TTFT_ms | baseline_success | proxy_success | baseline_req_s | proxy_req_s |
-|-----------|-----------------------|-----------------------|----------|-----------|-----------------------|-------------------|------------------|---------------|----------------|-------------|
-| 16384 | 2334.77 | 2429.02 | 94.25 | 4.04% | 2346.75 | 2809.90 | 50/50 | 50/50 | 0.43 | 0.41 |
+| input_len | baseline_mean_TTFT_ms | proxy_PD_mean_TTFT_ms | delta_ms | delta_pct | baseline_p99_TTFT_ms | proxy_p99_TTFT_ms | baseline_success | proxy_success | proxy_avg_RDMA_Gbps_per_NIC | proxy_peak_RDMA_Gbps_per_NIC |
+|-----------|-----------------------|-----------------------|----------|-----------|-----------------------|-------------------|------------------|---------------|-----------------------------|------------------------------|
+| 1024 | 158.67 | 199.19 | 40.51 | 25.53% | 235.17 | 448.19 | 50/50 | 50/50 | 3.08 | 6.37 |
+| 4096 | 553.42 | 600.52 | 47.10 | 8.51% | 559.53 | 782.72 | 50/50 | 50/50 | 5.79 | 8.35 |
+| 8192 | 1111.23 | 1183.15 | 71.92 | 6.47% | 1120.30 | 1431.78 | 50/50 | 50/50 | 6.48 | 8.80 |
+| 16384 | 2334.77 | 2429.02 | 94.25 | 4.04% | 2346.75 | 2809.90 | 50/50 | 50/50 | 6.71 | 13.62 |
+| 30000 | 4728.88 | 4848.75 | 119.87 | 2.53% | 4738.49 | 4894.93 | 50/50 | 50/50 | 6.38 | 10.56 |
 
 The latest 16k proxy run moved 116.76GB per P NIC over a 139.3s monitor window
 and 116.76GB per D NIC over a 139.4s monitor window: average 6.71Gbps per NIC

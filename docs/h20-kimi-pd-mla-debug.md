@@ -12,8 +12,8 @@ H20. The run passed request correctness but did not saturate RDMA bandwidth.
 - Prefill/proxy node: `h20-99`
 - Decode node: `h20-100`
 - Model: `/data/models/Kimi-K2.5`
-- Latest fixed 16k/c1 P/D result: 50/50 requests completed, 6744.16 total
-  tok/s, 2429.02ms mean TTFT
+- Latest fixed c1 P/D sweep result: 50/50 requests completed at every tested
+  input length. 16k mean TTFT is 2429.02ms; 30k mean TTFT is 4848.75ms.
 - RDMA result: all 4 NICs were used evenly, but serving peak bandwidth was
   only about 12-14Gbps per NIC
 - Benchmark discipline after this run: use `--max-concurrency 1` for acceptance
@@ -171,17 +171,17 @@ The direct baseline leg was run on 2026-05-29 with the fixed serving contract:
 - benchmark: `--max-concurrency 1`, `--request-rate inf`,
   `--random-range-ratio 0.0`, `--random-output-len 1`, `--num-prompts 50`
 
-The P/D proxy leg has only been rerun for 16k after the single FIFO sender,
-compact handshake, compact JSON, scheduler-block push, and D handshake template
-cache changes. Other input lengths are still pending.
+The P/D proxy leg was rerun for all input lengths after the single FIFO sender,
+compact handshake, compact JSON, scheduler-block push, D handshake template
+cache, and minimal D wait-handshake changes.
 
 | input_len | baseline_mean_TTFT_ms | proxy_PD_mean_TTFT_ms | delta_ms | delta_pct | baseline_p99_TTFT_ms | proxy_p99_TTFT_ms | baseline_success | proxy_success | baseline_req_s | proxy_req_s | proxy_avg_RDMA_Gbps_per_NIC | proxy_peak_RDMA_Gbps_per_NIC | notes |
 |-----------|-----------------------|-----------------------|----------|-----------|-----------------------|-------------------|------------------|---------------|----------------|-------------|-----------------------------|------------------------------|-------|
-| 1024 | 158.67 | TBD | TBD | TBD | 235.17 | TBD | 50/50 | TBD | 6.30 | TBD | TBD | TBD | missing proxy |
-| 4096 | 553.42 | TBD | TBD | TBD | 559.53 | TBD | 50/50 | TBD | 1.81 | TBD | TBD | TBD | missing proxy |
-| 8192 | 1111.23 | TBD | TBD | TBD | 1120.30 | TBD | 50/50 | TBD | 0.90 | TBD | TBD | TBD | missing proxy |
-| 16384 | 2334.77 | 2429.02 | 94.25 | 4.04% | 2346.75 | 2809.90 | 50/50 | 50/50 | 0.43 | 0.41 | 6.71 | 12.14 | proxy label `kimi-proxy-fixed32k-waitmini` |
-| 30000 | 4728.88 | TBD | TBD | TBD | 4738.49 | TBD | 50/50 | TBD | 0.21 | TBD | TBD | TBD | missing proxy |
+| 1024 | 158.67 | 199.19 | 40.51 | 25.53% | 235.17 | 448.19 | 50/50 | 50/50 | 6.30 | 5.01 | 3.08 | 6.37 | proxy label `kimi-proxy-fixed32k-waitmini` |
+| 4096 | 553.42 | 600.52 | 47.10 | 8.51% | 559.53 | 782.72 | 50/50 | 50/50 | 1.81 | 1.66 | 5.79 | 8.35 | proxy label `kimi-proxy-fixed32k-waitmini` |
+| 8192 | 1111.23 | 1183.15 | 71.92 | 6.47% | 1120.30 | 1431.78 | 50/50 | 50/50 | 0.90 | 0.84 | 6.48 | 8.80 | proxy label `kimi-proxy-fixed32k-waitmini` |
+| 16384 | 2334.77 | 2429.02 | 94.25 | 4.04% | 2346.75 | 2809.90 | 50/50 | 50/50 | 0.43 | 0.41 | 6.71 | 13.62 | proxy label `kimi-proxy-fixed32k-waitmini` |
+| 30000 | 4728.88 | 4848.75 | 119.87 | 2.53% | 4738.49 | 4894.93 | 50/50 | 50/50 | 0.21 | 0.21 | 6.38 | 10.56 | proxy label `kimi-proxy-fixed32k-waitmini` |
 
 Artifacts:
 
@@ -205,6 +205,10 @@ Artifacts:
 - `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-waitmini-in16384-out1-c1-n50-seed20260528.json`
 - `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-waitmini-in16384-out1-c1-n50-seed20260528-h20-99-nic-summary.txt`
 - `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-waitmini-in16384-out1-c1-n50-seed20260528-h20-100-nic-summary.txt`
+- `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-waitmini-in1024-out1-c1-n50-seed20260528.json`
+- `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-waitmini-in4096-out1-c1-n50-seed20260528.json`
+- `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-waitmini-in8192-out1-c1-n50-seed20260528.json`
+- `h20-99:/root/develop/xingming/pegaflow/pd_h20_logs/bench/ttft-sweep/kimi-proxy-fixed32k-waitmini-in30000-out1-c1-n50-seed20260528.json`
 
 ## Rejected Early-Prefill Experiment
 
@@ -308,17 +312,15 @@ direct baseline is restarted with the same fixed 32k vLLM serving flags.
 | `proxy-16k-c4-prefill-parallel-batch32768-50` | 50/50 | 113.71 | 0.440 | 7145.87 | 8869.98 | 12085.89 |
 | `proxy-16k-c4-windowfix-batch32768` | 20/20 | 46.62 | 0.429 | 7080.97 | 8726.38 | 11874.28 |
 
-## Final Table Shape
-
-The final experiment table should be keyed by input length:
+## Final Table
 
 | input_len | baseline_mean_TTFT_ms | proxy_PD_mean_TTFT_ms | delta_ms | delta_pct | baseline_p99_TTFT_ms | proxy_p99_TTFT_ms | baseline_success | proxy_success | baseline_req_s | proxy_req_s | proxy_avg_RDMA_Gbps_per_NIC | proxy_peak_RDMA_Gbps_per_NIC | notes |
 |-----------|-----------------------|-----------------------|----------|-----------|-----------------------|-------------------|------------------|---------------|----------------|-------------|-----------------------------|------------------------------|-------|
-| 1024 | 158.67 | TBD | TBD | TBD | 235.17 | TBD | 50/50 | TBD | 6.30 | TBD | TBD | TBD | missing proxy |
-| 4096 | 553.42 | TBD | TBD | TBD | 559.53 | TBD | 50/50 | TBD | 1.81 | TBD | TBD | TBD | missing proxy |
-| 8192 | 1111.23 | TBD | TBD | TBD | 1120.30 | TBD | 50/50 | TBD | 0.90 | TBD | TBD | TBD | missing proxy |
-| 16384 | 2334.77 | 2429.02 | 94.25 | 4.04% | 2346.75 | 2809.90 | 50/50 | 50/50 | 0.43 | 0.41 | 6.71 | 12.14 | minimal D wait handshake |
-| 30000 | 4728.88 | TBD | TBD | TBD | 4738.49 | TBD | 50/50 | TBD | 0.21 | TBD | TBD | TBD | missing proxy |
+| 1024 | 158.67 | 199.19 | 40.51 | 25.53% | 235.17 | 448.19 | 50/50 | 50/50 | 6.30 | 5.01 | 3.08 | 6.37 | minimal D wait handshake |
+| 4096 | 553.42 | 600.52 | 47.10 | 8.51% | 559.53 | 782.72 | 50/50 | 50/50 | 1.81 | 1.66 | 5.79 | 8.35 | minimal D wait handshake |
+| 8192 | 1111.23 | 1183.15 | 71.92 | 6.47% | 1120.30 | 1431.78 | 50/50 | 50/50 | 0.90 | 0.84 | 6.48 | 8.80 | minimal D wait handshake |
+| 16384 | 2334.77 | 2429.02 | 94.25 | 4.04% | 2346.75 | 2809.90 | 50/50 | 50/50 | 0.43 | 0.41 | 6.71 | 13.62 | minimal D wait handshake |
+| 30000 | 4728.88 | 4848.75 | 119.87 | 2.53% | 4738.49 | 4894.93 | 50/50 | 50/50 | 0.21 | 0.21 | 6.38 | 10.56 | minimal D wait handshake |
 
 ## NIC Counter Result
 
