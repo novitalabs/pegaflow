@@ -17,6 +17,20 @@ import requests
 DEFAULT_VLLM_SEED = 42
 
 
+def _detect_pegaflow_cargo_features() -> list[str]:
+    try:
+        import torch
+    except ImportError:
+        return []
+
+    cuda_version = getattr(torch.version, "cuda", None)
+    if not cuda_version:
+        return []
+
+    major = cuda_version.split(".", maxsplit=1)[0]
+    return ["cuda-13"] if major == "13" else []
+
+
 class VLLMServer:
     """Context manager for vLLM server lifecycle."""
 
@@ -34,6 +48,9 @@ class VLLMServer:
         extra_args: list[str] | None = None,
         startup_timeout: int = 600,
         use_noop_connector: bool = False,
+        kv_transfer_config: dict[str, object] | None = None,
+        server_label: str | None = None,
+        env_overrides: dict[str, str] | None = None,
     ):
         self.model = model
         self.port = port
@@ -47,6 +64,9 @@ class VLLMServer:
         self.extra_args = extra_args or []
         self.startup_timeout = startup_timeout
         self.use_noop_connector = use_noop_connector
+        self.kv_transfer_config = kv_transfer_config
+        self.server_label = server_label
+        self.env_overrides = env_overrides or {}
         self.health_endpoints = ["/health", "/v1/models"]
         self.process: subprocess.Popen | None = None
         self.log_handle = None
@@ -65,8 +85,9 @@ class VLLMServer:
         env["PYTHONHASHSEED"] = "0"
         env["VLLM_BATCH_INVARIANT"] = "1"
 
-        if self.use_pegaflow and self.pegaflow_port is not None:
+        if self.pegaflow_port is not None:
             env["PEGAFLOW_PORT"] = str(self.pegaflow_port)
+        env.update(self.env_overrides)
 
         # Resolve vllm binary from the current Python environment's bin dir
         import sys
@@ -97,7 +118,9 @@ class VLLMServer:
         if self.max_model_len is not None:
             cmd.extend(["--max-model-len", str(self.max_model_len)])
 
-        if self.use_pegaflow or self.use_noop_connector:
+        if self.kv_transfer_config is not None:
+            cmd.extend(["--kv-transfer-config", json.dumps(self.kv_transfer_config)])
+        elif self.use_pegaflow or self.use_noop_connector:
             connector_name = "PegaKVConnector" if self.use_pegaflow else "NoopKVConnector"
             kv_config = {
                 "kv_connector": connector_name,
@@ -108,7 +131,9 @@ class VLLMServer:
 
         cmd.extend(self.extra_args)
 
-        server_label = "PegaFlow" if self.use_pegaflow else "Baseline"
+        server_label = self.server_label or (
+            "PegaFlow" if self.use_pegaflow or self.kv_transfer_config is not None else "Baseline"
+        )
         print(f"\n[{server_label}] Starting vLLM server on port {self.port}")
 
         if self.log_file:
@@ -136,7 +161,11 @@ class VLLMServer:
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Stop the vLLM server and all child processes."""
         if self.process:
-            server_label = "PegaFlow" if self.use_pegaflow else "Baseline"
+            server_label = self.server_label or (
+                "PegaFlow"
+                if self.use_pegaflow or self.kv_transfer_config is not None
+                else "Baseline"
+            )
             print(f"\n[{server_label}] Stopping vLLM server...")
             try:
                 os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
@@ -221,10 +250,20 @@ class PegaFlowServer:
     Picks random available ports for gRPC and HTTP endpoints.
     """
 
-    def __init__(self, log_file: Path | None = None, pool_size: str = "30gb"):
+    def __init__(
+        self,
+        log_file: Path | None = None,
+        pool_size: str = "30gb",
+        log_level: str | None = None,
+        cargo_features: list[str] | None = None,
+    ):
         self.grpc_port = find_available_port()
         self.http_port = find_available_port()
         self.pool_size = pool_size
+        self.log_level = log_level
+        self.cargo_features = (
+            cargo_features if cargo_features is not None else _detect_pegaflow_cargo_features()
+        )
         self.log_file = log_file
         self.process: subprocess.Popen | None = None
         self.log_handle = None
@@ -240,17 +279,26 @@ class PegaFlowServer:
             "cargo",
             "run",
             "-r",
-            "--bin",
-            "pegaflow-server",
-            "--",
-            "--addr",
-            f"127.0.0.1:{self.grpc_port}",
-            "--http-addr",
-            f"0.0.0.0:{self.http_port}",
-            "--pool-size",
-            self.pool_size,
-            "--enable-prometheus",
         ]
+        if self.cargo_features:
+            cmd.append("--no-default-features")
+            cmd.extend(["--features", ",".join(self.cargo_features)])
+        cmd.extend(
+            [
+                "--bin",
+                "pegaflow-server",
+                "--",
+                "--addr",
+                f"127.0.0.1:{self.grpc_port}",
+                "--http-addr",
+                f"0.0.0.0:{self.http_port}",
+                "--pool-size",
+                self.pool_size,
+                "--enable-prometheus",
+            ]
+        )
+        if self.log_level is not None:
+            cmd.extend(["--log-level", self.log_level])
 
         # pegaflow-server embeds Python via PyO3 (for CUDA device detection via torch)
         import sys
@@ -266,7 +314,11 @@ class PegaFlowServer:
         site_packages = next((p for p in sys.path if "site-packages" in p), None)
         env["PYTHONPATH"] = f"{python_dir}" + (f":{site_packages}" if site_packages else "")
 
-        print(f"\n[PegaFlow Server] cargo run -r on gRPC={self.grpc_port}, HTTP={self.http_port}")
+        feature_label = ",".join(self.cargo_features) or "default"
+        print(
+            f"\n[PegaFlow Server] cargo run -r features={feature_label} "
+            f"on gRPC={self.grpc_port}, HTTP={self.http_port}"
+        )
 
         if self.log_file:
             print(f"[PegaFlow Server] Logging to: {self.log_file}")
@@ -328,7 +380,7 @@ class PegaFlowServer:
 def call_openai_api(
     port: int,
     model: str,
-    prompt: str,
+    prompt: str | list[int],
     max_tokens: int = 50,
     temperature: float = 0.0,
     seed: int | None = None,

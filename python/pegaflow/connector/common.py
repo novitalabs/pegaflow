@@ -6,6 +6,7 @@ import hashlib
 import os
 import uuid
 from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
@@ -18,6 +19,25 @@ if TYPE_CHECKING:
     from pegaflow.connector.state_manager import ServiceStateManager
 
 logger = get_connector_logger()
+
+
+class PegaConnectorMode(str, Enum):
+    """Read/write behavior for the PegaFlow connector."""
+
+    READ_WRITE = "read_write"
+    SAVE_ONLY = "save_only"
+
+    @classmethod
+    def from_config(cls, value: object) -> "PegaConnectorMode":
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            for mode in cls:
+                if normalized == mode.value:
+                    return mode
+        allowed = ", ".join(mode.value for mode in cls)
+        raise ValueError(f"Unsupported pegaflow.mode {value!r}; expected one of: {allowed}")
 
 
 @dataclass(frozen=True)
@@ -40,6 +60,11 @@ class ConnectorContext:
     dcp_rank: int = 0
     pp_rank: int = 0
     pp_size: int = 1
+    mode: PegaConnectorMode = PegaConnectorMode.READ_WRITE
+
+    @property
+    def read_enabled(self) -> bool:
+        return self.mode is PegaConnectorMode.READ_WRITE
 
     @property
     def virtual_block_size(self) -> int:
@@ -213,6 +238,7 @@ def detect_mla(vllm_config) -> bool:
 __all__ = [
     "ConnectorContext",
     "LoadIntent",
+    "PegaConnectorMode",
     "PegaConnectorMetadata",
     "PegaKVConnectorStats",
     "PegaPromMetrics",

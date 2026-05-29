@@ -12,7 +12,7 @@ from .unit_stubs import install_connector_unit_stubs
 
 install_connector_unit_stubs()
 
-from pegaflow.connector.common import ConnectorContext  # noqa: E402
+from pegaflow.connector.common import ConnectorContext, PegaConnectorMode  # noqa: E402
 from pegaflow.connector.scheduler import SchedulerConnector  # noqa: E402
 from pegaflow.pegaflow import QueryLoading, QueryReady  # noqa: E402
 
@@ -239,6 +239,129 @@ class TestDecodeHashRefresh:
         assert intent.block_hashes == block_hashes[6:9]
         assert intent.block_ids == (200, 201, 202)
 
+    def test_save_only_mode_counts_precomputed_prefix_as_saveable(self):
+        """NIXL-loaded prefix should be saveable in Pega save-only mode."""
+        sc = SchedulerConnector(_make_ctx(mode=PegaConnectorMode.SAVE_ONLY))
+        block_hashes = [_hash(i) for i in range(4)]
+        req = _make_fake_request("r1", list(block_hashes))
+
+        # MultiConnector passes empty blocks and zero external tokens to
+        # non-owner children. In save-only mode, Pega must later rely on
+        # scheduler output rather than this allocation callback.
+        sc.update_state_after_alloc(req, _make_fake_blocks([]), num_external_tokens=0)
+
+        scheduler_output = SimpleNamespace(
+            scheduled_new_reqs=[
+                SimpleNamespace(
+                    req_id="r1",
+                    block_ids=([10, 11, 12, 13],),
+                    num_computed_tokens=48,
+                )
+            ],
+            scheduled_cached_reqs=SimpleNamespace(
+                req_ids=[],
+                new_block_ids=[],
+                num_computed_tokens=[],
+            ),
+            num_scheduled_tokens={"r1": 1},
+            preempted_req_ids=set(),
+        )
+
+        metadata = sc.build_connector_meta(scheduler_output)
+
+        intent = metadata.save_intents["r1"]
+        assert intent.block_ids == (10, 11, 12)
+        assert intent.block_hashes == tuple(block_hashes[:3])
+
+    def test_save_only_mode_handles_full_prompt_hit_recompute_token(self):
+        """vLLM backs full prompt hits up by one token before scheduling."""
+        sc = SchedulerConnector(_make_ctx(mode=PegaConnectorMode.SAVE_ONLY))
+        block_hashes = [_hash(i) for i in range(4)]
+        req = _make_fake_request("r1", list(block_hashes))
+
+        sc.update_state_after_alloc(req, _make_fake_blocks([]), num_external_tokens=0)
+
+        scheduler_output = SimpleNamespace(
+            scheduled_new_reqs=[
+                SimpleNamespace(
+                    req_id="r1",
+                    block_ids=([10, 11, 12, 13],),
+                    num_computed_tokens=63,
+                )
+            ],
+            scheduled_cached_reqs=SimpleNamespace(
+                req_ids=[],
+                new_block_ids=[],
+                num_computed_tokens=[],
+            ),
+            num_scheduled_tokens={"r1": 1},
+            preempted_req_ids=set(),
+        )
+
+        metadata = sc.build_connector_meta(scheduler_output)
+
+        intent = metadata.save_intents["r1"]
+        assert intent.block_ids == (10, 11, 12, 13)
+        assert intent.block_hashes == tuple(block_hashes)
+
+    def test_read_write_mode_does_not_save_unowned_precomputed_prefix(self):
+        """Default mode keeps old behavior for Pega-owned read/write paths."""
+        sc = self._make_connector(dcp_world_size=1)
+        block_hashes = [_hash(i) for i in range(4)]
+        req = _make_fake_request("r1", list(block_hashes))
+
+        sc.update_state_after_alloc(req, _make_fake_blocks([]), num_external_tokens=0)
+
+        scheduler_output = SimpleNamespace(
+            scheduled_new_reqs=[
+                SimpleNamespace(
+                    req_id="r1",
+                    block_ids=([10, 11, 12, 13],),
+                    num_computed_tokens=48,
+                )
+            ],
+            scheduled_cached_reqs=SimpleNamespace(
+                req_ids=[],
+                new_block_ids=[],
+                num_computed_tokens=[],
+            ),
+            num_scheduled_tokens={"r1": 1},
+            preempted_req_ids=set(),
+        )
+
+        metadata = sc.build_connector_meta(scheduler_output)
+
+        assert "r1" not in metadata.save_intents
+
+    def test_resumed_cached_request_replaces_block_table(self):
+        """vLLM resumed reqs send the full block table, not append-only blocks."""
+        sc = SchedulerConnector(_make_ctx(mode=PegaConnectorMode.SAVE_ONLY))
+        block_hashes = [_hash(i) for i in range(4)]
+        req = _make_fake_request("r1", list(block_hashes))
+
+        sc.update_state_after_alloc(req, _make_fake_blocks([]), num_external_tokens=0)
+        sc._allocated_blocks["r1"] = [1, 2]
+        sc._next_stored_block_idx["r1"] = 2
+        sc._scheduled_tokens["r1"] = 32
+
+        scheduler_output = SimpleNamespace(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=SimpleNamespace(
+                req_ids=["r1"],
+                resumed_req_ids={"r1"},
+                new_block_ids=[([10, 11, 12, 13],)],
+                num_computed_tokens=[32],
+            ),
+            num_scheduled_tokens={"r1": 16},
+            preempted_req_ids=set(),
+        )
+
+        metadata = sc.build_connector_meta(scheduler_output)
+
+        intent = metadata.save_intents["r1"]
+        assert intent.block_hashes == tuple(block_hashes[2:3])
+        assert intent.block_ids == (12,)
+
 
 class TestSchedulerQueryProbeReuse:
     """Repeated scheduler probes should not repeat server-side query leases."""
@@ -271,6 +394,16 @@ class TestSchedulerQueryProbeReuse:
         engine_client.query_prefetch.return_value = QueryLoading()
 
         assert sc._count_available_block_prefix([_hash(i) for i in range(4)], "r1") is None
+
+    def test_save_only_mode_skips_query(self):
+        engine_client = MagicMock()
+        sc = SchedulerConnector(
+            _make_ctx(engine_client=engine_client, mode=PegaConnectorMode.SAVE_ONLY)
+        )
+        req = _make_fake_request("r1", [_hash(i) for i in range(4)])
+
+        assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (0, False)
+        engine_client.query_prefetch.assert_not_called()
 
     def test_query_prefetch_rejects_unknown_outcome(self):
         sc, engine_client = self._make_connector()
