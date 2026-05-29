@@ -53,7 +53,8 @@ Service endpoints:
 
 The services were stopped after the run.
 
-Before starting Kimi TP8 again, check for an idle 8-GPU host:
+Before starting Kimi TP8 again, check for an idle 8-GPU host with idle
+`mlx5_1..4` NICs:
 
 ```bash
 uv run --no-project python scripts/find_h20_idle_gpus.py --require-free
