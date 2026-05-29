@@ -52,8 +52,8 @@ Note: this c4 run is a diagnostic queueing run. H20 PD MLA acceptance pressure
 tests should use `--max-concurrency 1`, sweep only input length, and compare
 direct baseline vs P/D proxy with the same fixed non-connector vLLM serving flags
 (`--load-format dummy --max-num-batched-tokens 32768`).
-Use `scripts/run_pd_h20_kimi.sh start-baseline` for the direct baseline and
-`scripts/run_h20_kimi_ttft_sweep.sh` for the paired c1 sweep.
+The H20 helper scripts used for those internal runs are kept outside this
+repository under `/data/pegadev/scripts/pd-mla-h20/`.
 
 Current fixed 32k/c1 sweep progress: the direct baseline and matching P/D proxy
 legs were rerun on 2026-05-29 and recorded in
@@ -290,7 +290,7 @@ Decode node `h20-100` receive:
 Summarize these fields after a run with:
 
 ```bash
-uv run --no-project python scripts/summarize_pd_connector_logs.py \
+uv run --no-project python /data/pegadev/scripts/pd-mla-h20/summarize_pd_connector_logs.py \
   pd_h20_logs/prefill.log \
   pd_h20_logs/decode.log \
   pd_h20_logs/proxy.log

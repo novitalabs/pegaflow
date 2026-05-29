@@ -53,18 +53,22 @@ Service endpoints:
 
 The services were stopped after the run.
 
+The H20 helper scripts used for these internal runs are kept outside this
+repository under `/data/pegadev/scripts/pd-mla-h20/`.
+
 Before starting Kimi TP8 again, check for an idle 8-GPU host with idle
 `mlx5_1..4` NICs:
 
 ```bash
-uv run --no-project python scripts/find_h20_idle_gpus.py --require-free --min-free-hosts 2
+uv run --no-project python /data/pegadev/scripts/pd-mla-h20/find_h20_idle_gpus.py \
+  --require-free --min-free-hosts 2
 ```
 
 A short 16k proxy probe can use the same benchmark script without editing it:
 
 ```bash
 LENGTHS=16384 NUM_PROMPTS=5 LABEL=kimi-proxy-fixed32k-probe \
-  scripts/run_h20_kimi_ttft_sweep.sh proxy
+  /data/pegadev/scripts/pd-mla-h20/run_h20_kimi_ttft_sweep.sh proxy
 ```
 
 ## Fixed Startup Contract For The Next Sweep
@@ -91,16 +95,16 @@ against a P/D run with a different scheduler/batching shape.
 The launch script now has a dedicated direct-baseline role for this:
 
 ```bash
-ssh h20-100 'cd /root/develop/xingming/pegaflow && scripts/run_pd_h20_kimi.sh stop && scripts/run_pd_h20_kimi.sh start-baseline'
+ssh h20-100 'cd /root/develop/xingming/pegaflow && /data/pegadev/scripts/pd-mla-h20/run_pd_h20_kimi.sh stop && /data/pegadev/scripts/pd-mla-h20/run_pd_h20_kimi.sh start-baseline'
 ```
 
 For P/D proxy runs:
 
 ```bash
-ssh h20-100 'cd /root/develop/xingming/pegaflow && scripts/run_pd_h20_kimi.sh stop'
+ssh h20-100 'cd /root/develop/xingming/pegaflow && /data/pegadev/scripts/pd-mla-h20/run_pd_h20_kimi.sh stop'
 cd /root/develop/xingming/pegaflow
-scripts/run_pd_h20_kimi.sh stop
-scripts/run_pd_h20_kimi.sh start-cluster
+/data/pegadev/scripts/pd-mla-h20/run_pd_h20_kimi.sh stop
+/data/pegadev/scripts/pd-mla-h20/run_pd_h20_kimi.sh start-cluster
 ```
 
 ## Code Changes Tested
@@ -150,8 +154,10 @@ Future H20 PD MLA pressure tests should use concurrency 1 and only sweep input
 length. The helper script keeps the benchmark shape fixed:
 
 ```bash
-LENGTHS="1024 4096 8192 16384 30000" scripts/run_h20_kimi_ttft_sweep.sh baseline
-LENGTHS="1024 4096 8192 16384 30000" scripts/run_h20_kimi_ttft_sweep.sh proxy
+LENGTHS="1024 4096 8192 16384 30000" \
+  /data/pegadev/scripts/pd-mla-h20/run_h20_kimi_ttft_sweep.sh baseline
+LENGTHS="1024 4096 8192 16384 30000" \
+  /data/pegadev/scripts/pd-mla-h20/run_h20_kimi_ttft_sweep.sh proxy
 ```
 
 Both modes use:
@@ -169,7 +175,7 @@ summary files next to the benchmark JSON files.
 Build the final table from the generated JSON and NIC summaries:
 
 ```bash
-uv run --no-project python scripts/summarize_h20_kimi_ttft_sweep.py \
+uv run --no-project python /data/pegadev/scripts/pd-mla-h20/summarize_h20_kimi_ttft_sweep.py \
   pd_h20_logs/bench/ttft-sweep
 ```
 
@@ -252,7 +258,7 @@ Artifacts:
 ## RDMA-only Integration Test
 
 Before another connector change, the RDMA path was isolated with
-`scripts/pd_rdma_two_node_it.py`. The test uses the same 8-rank Kimi 16k shape
+`/data/pegadev/scripts/pd-mla-h20/pd_rdma_two_node_it.py`. The test uses the same 8-rank Kimi 16k shape
 as the P/D run: 61 layers, 1024 blocks, 18432 bytes per block, and the same
 rank-to-NIC map.
 
@@ -265,14 +271,14 @@ immediately after that iteration completes, so a later skipped transfer cannot b
 hidden by a previous successful transfer.
 
 ```bash
-python scripts/pd_rdma_two_node_it.py decode \
+python /data/pegadev/scripts/pd-mla-h20/pd_rdma_two_node_it.py decode \
   --iterations 4 \
   --min-bandwidth-gbps 1000 \
   --min-nic-gbps 300 \
   --min-nic-byte-ratio 0.98 \
   --verify-sample-bytes 1048576
 
-python scripts/pd_rdma_two_node_it.py prefill \
+python /data/pegadev/scripts/pd-mla-h20/pd_rdma_two_node_it.py prefill \
   --decode-host 10.96.191.100 \
   --iterations 4 \
   --min-bandwidth-gbps 1000 \
@@ -422,7 +428,7 @@ Use the log summarizer after each run to keep the latency decomposition
 reproducible:
 
 ```bash
-uv run --no-project python scripts/summarize_pd_connector_logs.py \
+uv run --no-project python /data/pegadev/scripts/pd-mla-h20/summarize_pd_connector_logs.py \
   pd_h20_logs/prefill.log \
   pd_h20_logs/decode.log \
   pd_h20_logs/proxy.log
