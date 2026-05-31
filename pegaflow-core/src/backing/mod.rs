@@ -1,4 +1,6 @@
+#[cfg(feature = "rdma")]
 pub(super) mod rdma;
+#[cfg(feature = "rdma")]
 pub(super) mod rdma_fetch;
 pub(super) mod ssd;
 pub(super) mod ssd_cache;
@@ -20,7 +22,9 @@ use crate::block::{BlockKey, SealedBlock};
 use crate::pinned_pool::PinnedAllocation;
 use pegaflow_common::NumaNode;
 
+#[cfg(feature = "rdma")]
 pub(crate) use rdma::{RdmaTransport, new_rdma};
+#[cfg(feature = "rdma")]
 pub(crate) use rdma_fetch::RdmaFetchStore;
 pub(crate) use ssd::SsdBackingStore;
 pub(crate) use ssd::new_ssd;

@@ -4,7 +4,7 @@
 import subprocess
 import sys
 
-from pegaflow._bin_utils import find_binary
+from pegaflow._bin_utils import binary_env, find_binary
 
 _BINARY = "pegaflow-server-py"
 
@@ -12,7 +12,7 @@ _BINARY = "pegaflow-server-py"
 def main():
     binary = find_binary(_BINARY)
     try:
-        result = subprocess.run([binary] + sys.argv[1:], check=False)
+        result = subprocess.run([binary] + sys.argv[1:], check=False, env=binary_env())
         sys.exit(result.returncode)
     except FileNotFoundError:
         print(f"Error: {_BINARY} binary not found at {binary}", file=sys.stderr)

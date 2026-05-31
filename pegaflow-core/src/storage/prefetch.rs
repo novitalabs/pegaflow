@@ -9,7 +9,9 @@ use log::{info, warn};
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 
-use crate::backing::{PrefetchResult, RdmaFetchStore, SsdBackingStore};
+#[cfg(feature = "rdma")]
+use crate::backing::RdmaFetchStore;
+use crate::backing::{PrefetchResult, SsdBackingStore};
 use crate::block::{BlockKey, PrefetchStatus, SealedBlock};
 use crate::metrics::core_metrics;
 
@@ -17,6 +19,46 @@ use super::read_cache::ReadCache;
 use super::tier_attribution::{
     AttributionSource, TierAttribution, record_cache_tier_block_requests,
 };
+
+#[cfg(feature = "rdma")]
+#[derive(Clone)]
+pub(super) struct RdmaFetch(Arc<RdmaFetchStore>);
+#[cfg(not(feature = "rdma"))]
+#[derive(Clone)]
+pub(super) struct RdmaFetch;
+
+#[cfg(feature = "rdma")]
+impl RdmaFetch {
+    pub(super) fn new(store: Arc<RdmaFetchStore>) -> Self {
+        Self(store)
+    }
+
+    async fn try_fetch_prefix(
+        &self,
+        req_id: &str,
+        namespace: &str,
+        remaining_hashes: &[Vec<u8>],
+    ) -> Option<(usize, PrefetchResult)> {
+        let (node, found) = self.0.query_prefix(namespace, remaining_hashes).await?;
+        let blocks = self
+            .0
+            .fetch_blocks(&node, req_id, namespace, &remaining_hashes[..found])
+            .await;
+        Some((found, blocks))
+    }
+}
+
+#[cfg(not(feature = "rdma"))]
+impl RdmaFetch {
+    async fn try_fetch_prefix(
+        &self,
+        _req_id: &str,
+        _namespace: &str,
+        _remaining_hashes: &[Vec<u8>],
+    ) -> Option<(usize, PrefetchResult)> {
+        None
+    }
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum PrefetchSource {
@@ -64,7 +106,7 @@ struct PrefetchStart<'a> {
 }
 
 struct PrefetchTaskDeps {
-    rdma_fetch: Option<Arc<RdmaFetchStore>>,
+    rdma_fetch: Option<RdmaFetch>,
     ssd_store: Option<Arc<SsdBackingStore>>,
     prefetch_state: Arc<Mutex<PrefetchState>>,
     max_prefetch_blocks: usize,
@@ -112,14 +154,14 @@ impl Drop for SsdPrefetchReservation {
 pub(super) struct PrefetchScheduler {
     state: Arc<Mutex<PrefetchState>>,
     ssd_store: Option<Arc<SsdBackingStore>>,
-    rdma_fetch: Option<Arc<RdmaFetchStore>>,
+    rdma_fetch: Option<RdmaFetch>,
     max_prefetch_blocks: usize,
 }
 
 impl PrefetchScheduler {
     pub(super) fn new(
         ssd_store: Option<Arc<SsdBackingStore>>,
-        rdma_fetch: Option<Arc<RdmaFetchStore>>,
+        rdma_fetch: Option<RdmaFetch>,
         max_prefetch_blocks: usize,
     ) -> Self {
         Self {
@@ -454,11 +496,10 @@ async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> 
     let remaining_hashes: Vec<Vec<u8>> = remaining_keys.iter().map(|k| k.hash.clone()).collect();
 
     if let Some(rdma) = deps.rdma_fetch
-        && let Some((node, found)) = rdma.query_prefix(&namespace, &remaining_hashes).await
+        && let Some((found, blocks)) = rdma
+            .try_fetch_prefix(&req_id, &namespace, &remaining_hashes)
+            .await
     {
-        let blocks = rdma
-            .fetch_blocks(&node, &req_id, &namespace, &remaining_hashes[..found])
-            .await;
         record_tier_attribution(
             total,
             hit,

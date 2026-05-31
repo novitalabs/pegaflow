@@ -7,7 +7,8 @@ edition.workspace = true
 workspace = true
 
 [features]
-default = ["cudarc/cuda-12080"]
+default = ["cuda-12"]
+cuda-12 = ["cudarc/cuda-12080"]
 cuda-13 = ["cudarc/cuda-13000"]
 
 [dependencies]

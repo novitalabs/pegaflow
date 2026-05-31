@@ -659,8 +659,15 @@ impl PegaEngine {
     }
 
     /// Returns true if RDMA transport is available.
+    #[cfg(feature = "rdma")]
     pub fn has_rdma_transport(&self) -> bool {
         self.storage.rdma_transport().is_some()
+    }
+
+    /// Returns true if RDMA transport is available.
+    #[cfg(not(feature = "rdma"))]
+    pub fn has_rdma_transport(&self) -> bool {
+        false
     }
 
     /// Perform server-side RDMA handshake with connection reuse.
@@ -670,6 +677,7 @@ impl PegaEngine {
     /// Otherwise, establish (or re-establish) a connection to the client.
     ///
     /// Returns `Err` if the handshake fails (bad client metadata, QP creation, etc.).
+    #[cfg(feature = "rdma")]
     pub fn rdma_accept_handshake(
         &self,
         client_addr: &str,
@@ -715,12 +723,23 @@ impl PegaEngine {
         info!("RDMA handshake accepted: client={client_addr}");
         Ok(server_meta.to_bytes())
     }
+
+    /// Perform server-side RDMA handshake with connection reuse.
+    #[cfg(not(feature = "rdma"))]
+    pub fn rdma_accept_handshake(
+        &self,
+        _client_addr: &str,
+        _client_handshake_bytes: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        Err("this binary was built without RDMA support".to_string())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(feature = "rdma")]
     #[test]
     fn rdma_initialization_failure_is_returned_to_caller() {
         let config = storage::StorageConfig {
@@ -735,5 +754,32 @@ mod tests {
 
         assert!(err.contains("Failed to initialise RDMA transport"), "{err}");
         assert!(err.contains("definitely-not-a-real-nic"), "{err}");
+    }
+
+    #[cfg(not(feature = "rdma"))]
+    #[test]
+    fn rdma_config_is_ignored_without_feature() {
+        let config = storage::StorageConfig {
+            rdma_nic_names: Some(vec!["mlx5_0".to_string()]),
+            ..storage::StorageConfig::default()
+        };
+
+        let engine = PegaEngine::new_with_config(1 << 20, false, config)
+            .expect("no-RDMA build should ignore RDMA NIC config");
+
+        assert!(!engine.has_rdma_transport());
+    }
+
+    #[cfg(not(feature = "rdma"))]
+    #[test]
+    fn rdma_handshake_reports_missing_feature() {
+        let engine = PegaEngine::new_with_config(1 << 20, false, storage::StorageConfig::default())
+            .expect("engine should start without RDMA");
+
+        let err = engine
+            .rdma_accept_handshake("127.0.0.1:50055", b"client-handshake")
+            .expect_err("no-RDMA build should reject RDMA handshakes");
+
+        assert_eq!(err, "this binary was built without RDMA support");
     }
 }
