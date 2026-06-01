@@ -22,7 +22,11 @@ const PREFETCH_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// Some containers restrict the `io_uring_setup` syscall via seccomp.
 fn io_uring_available() -> bool {
     unsafe {
-        let fd = libc::syscall(libc::SYS_io_uring_setup, 1i32, std::ptr::null_mut::<libc::c_void>());
+        let fd = libc::syscall(
+            libc::SYS_io_uring_setup,
+            1i32,
+            std::ptr::null_mut::<libc::c_void>(),
+        );
         if fd >= 0 {
             libc::close(fd as i32);
             true

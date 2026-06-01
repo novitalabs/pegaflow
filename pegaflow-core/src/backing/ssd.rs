@@ -362,7 +362,8 @@ mod tests {
         let path0 = temp_dir.path().join("ssd0");
         let path1 = temp_dir.path().join("ssd1");
         let mut options = std::fs::OpenOptions::new();
-        let files = open_cache_files(&[path0.clone(), path1.clone()], 4, 4096, &mut options).unwrap();
+        let files =
+            open_cache_files(&[path0.clone(), path1.clone()], 4, 4096, &mut options).unwrap();
         assert_eq!(files.len(), 4);
         assert!(path0.is_dir());
         assert!(path1.is_dir());
@@ -370,7 +371,11 @@ mod tests {
         for shard_id in 0..4 {
             let expected_path = if shard_id % 2 == 0 { &path0 } else { &path1 };
             let shard = expected_path.join(format!("shard-{shard_id:06}.dat"));
-            assert!(shard.is_file(), "shard {shard_id} should be at {}", shard.display());
+            assert!(
+                shard.is_file(),
+                "shard {shard_id} should be at {}",
+                shard.display()
+            );
             assert_eq!(fs::metadata(&shard).unwrap().len(), 4096);
         }
     }
