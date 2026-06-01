@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
 use bytesize::ByteSize;
@@ -46,7 +46,7 @@ impl SsdBackingStore {
         let shard_count = config.shards.get();
         let shard_capacity = aligned_shard_capacity(config.capacity_bytes, shard_count)?;
         let files = open_cache_files(
-            &config.cache_path,
+            &config.cache_paths,
             shard_count,
             shard_capacity,
             &mut OpenOptions::new(),
@@ -64,7 +64,12 @@ impl SsdBackingStore {
 
         info!(
             "SSD cache initialized at {} (capacity {}, shards {}, shard capacity {})",
-            config.cache_path.display(),
+            config
+                .cache_paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
             ByteSize(capacity),
             shard_count,
             ByteSize(shard_capacity)
@@ -252,7 +257,7 @@ fn aligned_shard_capacity(capacity_bytes: u64, shard_count: usize) -> std::io::R
 }
 
 fn open_cache_files(
-    cache_path: &Path,
+    cache_paths: &[PathBuf],
     shard_count: usize,
     shard_capacity: u64,
     options: &mut std::fs::OpenOptions,
@@ -267,30 +272,42 @@ fn open_cache_files(
         .write(true)
         .custom_flags(libc::O_DIRECT);
 
-    if shard_count == 1 {
-        if let Some(parent) = cache_path.parent() {
+    if cache_paths.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "SSD cache paths cannot be empty",
+        ));
+    }
+
+    // Backward compatibility: single path + single shard = single file.
+    if shard_count == 1 && cache_paths.len() == 1 {
+        if let Some(parent) = cache_paths[0].parent() {
             fs::create_dir_all(parent)?;
         }
-        let file = options.open(cache_path)?;
+        let file = options.open(&cache_paths[0])?;
         file.set_len(shard_capacity)?;
         return Ok(vec![file]);
     }
 
-    if cache_path.exists() && !cache_path.is_dir() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "SSD cache path {} must be a directory when shards > 1",
-                cache_path.display()
-            ),
-        ));
+    // Multi-path or multi-shard: each path must be a directory.
+    for path in cache_paths {
+        if path.exists() && !path.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "SSD cache path {} must be a directory when using multiple paths or shards",
+                    path.display()
+                ),
+            ));
+        }
+        fs::create_dir_all(path)?;
     }
-    fs::create_dir_all(cache_path)?;
 
     let mut files = Vec::with_capacity(shard_count);
     for shard_id in 0..shard_count {
-        let path: PathBuf = cache_path.join(format!("shard-{shard_id:06}.dat"));
-        let file = options.open(path)?;
+        let path = &cache_paths[shard_id % cache_paths.len()];
+        let file_path = path.join(format!("shard-{shard_id:06}.dat"));
+        let file = options.open(&file_path)?;
         file.set_len(shard_capacity)?;
         files.push(file);
     }
@@ -306,4 +323,62 @@ pub(crate) fn new_ssd(
 ) -> Arc<SsdBackingStore> {
     SsdBackingStore::new(config, allocate_fn, is_numa)
         .unwrap_or_else(|e| panic!("failed to initialise SSD backing store: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn test_open_cache_files_single_path_single_shard() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_path = temp_dir.path().join("cache.bin");
+        let mut options = std::fs::OpenOptions::new();
+        let files = open_cache_files(&[cache_path.clone()], 1, 4096, &mut options).unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(cache_path.is_file());
+        assert_eq!(fs::metadata(&cache_path).unwrap().len(), 4096);
+    }
+
+    #[test]
+    fn test_open_cache_files_single_path_multi_shard() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_path = temp_dir.path().join("cache");
+        let mut options = std::fs::OpenOptions::new();
+        let files = open_cache_files(&[cache_path.clone()], 4, 4096, &mut options).unwrap();
+        assert_eq!(files.len(), 4);
+        assert!(cache_path.is_dir());
+        for shard_id in 0..4 {
+            let shard = cache_path.join(format!("shard-{shard_id:06}.dat"));
+            assert!(shard.is_file());
+            assert_eq!(fs::metadata(&shard).unwrap().len(), 4096);
+        }
+    }
+
+    #[test]
+    fn test_open_cache_files_multi_path_round_robin() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path0 = temp_dir.path().join("ssd0");
+        let path1 = temp_dir.path().join("ssd1");
+        let mut options = std::fs::OpenOptions::new();
+        let files = open_cache_files(&[path0.clone(), path1.clone()], 4, 4096, &mut options).unwrap();
+        assert_eq!(files.len(), 4);
+        assert!(path0.is_dir());
+        assert!(path1.is_dir());
+        // shard 0 -> path0, shard 1 -> path1, shard 2 -> path0, shard 3 -> path1
+        for shard_id in 0..4 {
+            let expected_path = if shard_id % 2 == 0 { &path0 } else { &path1 };
+            let shard = expected_path.join(format!("shard-{shard_id:06}.dat"));
+            assert!(shard.is_file(), "shard {shard_id} should be at {}", shard.display());
+            assert_eq!(fs::metadata(&shard).unwrap().len(), 4096);
+        }
+    }
+
+    #[test]
+    fn test_open_cache_files_empty_paths_fails() {
+        let mut options = std::fs::OpenOptions::new();
+        let result = open_cache_files(&[], 1, 4096, &mut options);
+        assert!(result.is_err());
+    }
 }

@@ -100,9 +100,10 @@ pub struct Cli {
     #[arg(long, default_value = "info")]
     pub log_level: String,
 
-    /// Enable SSD cache for sealed blocks. Provide the cache file path to enable.
-    #[arg(long)]
-    pub ssd_cache_path: Option<String>,
+    /// Enable SSD cache for sealed blocks. Provide one or more cache directories.
+    /// Repeat the flag to use multiple paths (e.g. one per SSD device).
+    #[arg(long, num_args = 1..)]
+    pub ssd_cache_path: Vec<String>,
 
     /// SSD cache capacity (supports units: kb, mb, gb, tb). Default: 512gb
     #[arg(long, default_value = "512gb", value_parser = parse_memory_size)]
@@ -484,10 +485,12 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         cli.use_hugepages
     );
 
-    let ssd_cache_config = cli.ssd_cache_path.as_ref().map(|path| {
+    let ssd_cache_config = if cli.ssd_cache_path.is_empty() {
+        None
+    } else {
         info!(
-            "SSD cache enabled: path={}, capacity={:.2} GiB, shards={}, write_queue={}, prefetch_queue={}, write_inflight={}, prefetch_inflight={}",
-            path,
+            "SSD cache enabled: paths={}, capacity={:.2} GiB, shards={}, write_queue={}, prefetch_queue={}, write_inflight={}, prefetch_inflight={}",
+            cli.ssd_cache_path.join(", "),
             cli.ssd_cache_capacity as f64 / (1024.0 * 1024.0 * 1024.0),
             cli.ssd_cache_shards,
             cli.ssd_write_queue_depth,
@@ -495,16 +498,16 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             cli.ssd_write_inflight,
             cli.ssd_prefetch_inflight,
         );
-        pegaflow_core::SsdCacheConfig {
-            cache_path: path.into(),
+        Some(pegaflow_core::SsdCacheConfig {
+            cache_paths: cli.ssd_cache_path.iter().map(|p| p.into()).collect(),
             capacity_bytes: cli.ssd_cache_capacity as u64,
             shards: cli.ssd_cache_shards,
             write_queue_depth: cli.ssd_write_queue_depth,
             prefetch_queue_depth: cli.ssd_prefetch_queue_depth,
             write_inflight: cli.ssd_write_inflight,
             prefetch_inflight: cli.ssd_prefetch_inflight,
-        }
-    });
+        })
+    };
 
     let has_metaserver = cli.metaserver_addr.is_some();
     let has_nics = cli.nics.as_ref().is_some_and(|n| !n.is_empty());

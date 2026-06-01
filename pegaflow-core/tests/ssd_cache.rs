@@ -18,6 +18,29 @@ const SMALL_SSD_CAPACITY: u64 = (BLOCK_SIZE * 2) as u64;
 const OVERSIZED_SSD_CAPACITY: u64 = 512;
 const PREFETCH_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Probe whether io_uring is usable in the current environment.
+/// Some containers restrict the `io_uring_setup` syscall via seccomp.
+fn io_uring_available() -> bool {
+    unsafe {
+        let fd = libc::syscall(libc::SYS_io_uring_setup, 1i32, std::ptr::null_mut::<libc::c_void>());
+        if fd >= 0 {
+            libc::close(fd as i32);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+macro_rules! skip_without_io_uring {
+    () => {
+        if !io_uring_available() {
+            eprintln!("Skipping test: io_uring is not available in this environment");
+            return;
+        }
+    };
+}
+
 fn ssd_env(instance_id: &'static str) -> (TestEnv, std::path::PathBuf, tempfile::TempDir) {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let cache_path = temp_dir.path().join("cache.bin");
@@ -26,7 +49,7 @@ fn ssd_env(instance_id: &'static str) -> (TestEnv, std::path::PathBuf, tempfile:
         .pool_size(POOL_SIZE)
         .storage(StorageConfig {
             ssd_cache_config: Some(SsdCacheConfig {
-                cache_path: cache_path.clone(),
+                cache_paths: vec![cache_path.clone()],
                 capacity_bytes: SSD_CAPACITY,
                 ..SsdCacheConfig::default()
             }),
@@ -49,7 +72,7 @@ fn ssd_split_env(instance_id: &'static str) -> (TestEnv, tempfile::TempDir) {
         .pool_size(POOL_SIZE)
         .storage(StorageConfig {
             ssd_cache_config: Some(SsdCacheConfig {
-                cache_path,
+                cache_paths: vec![cache_path],
                 capacity_bytes: SSD_CAPACITY,
                 ..SsdCacheConfig::default()
             }),
@@ -57,6 +80,28 @@ fn ssd_split_env(instance_id: &'static str) -> (TestEnv, tempfile::TempDir) {
         })
         .build();
     (env, temp_dir)
+}
+
+fn ssd_multi_path_env(
+    instance_id: &'static str,
+) -> (TestEnv, Vec<std::path::PathBuf>, tempfile::TempDir) {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let path0 = temp_dir.path().join("ssd0");
+    let path1 = temp_dir.path().join("ssd1");
+    let env = TestEnvBuilder::new(instance_id, "test-ns-ssd")
+        .layer("layer_0", NUM_BLOCKS, BLOCK_SIZE)
+        .pool_size(POOL_SIZE)
+        .storage(StorageConfig {
+            ssd_cache_config: Some(SsdCacheConfig {
+                cache_paths: vec![path0.clone(), path1.clone()],
+                capacity_bytes: SSD_CAPACITY,
+                shards: NonZeroUsize::new(4).unwrap(),
+                ..SsdCacheConfig::default()
+            }),
+            ..StorageConfig::default()
+        })
+        .build();
+    (env, vec![path0, path1], temp_dir)
 }
 
 fn ssd_sharded_env(instance_id: &'static str) -> (TestEnv, std::path::PathBuf, tempfile::TempDir) {
@@ -67,7 +112,7 @@ fn ssd_sharded_env(instance_id: &'static str) -> (TestEnv, std::path::PathBuf, t
         .pool_size(POOL_SIZE)
         .storage(StorageConfig {
             ssd_cache_config: Some(SsdCacheConfig {
-                cache_path: cache_path.clone(),
+                cache_paths: vec![cache_path.clone()],
                 capacity_bytes: SSD_CAPACITY,
                 shards: NonZeroUsize::new(4).unwrap(),
                 ..SsdCacheConfig::default()
@@ -89,7 +134,7 @@ fn ssd_custom_capacity_env(
         .pool_size(POOL_SIZE)
         .storage(StorageConfig {
             ssd_cache_config: Some(SsdCacheConfig {
-                cache_path,
+                cache_paths: vec![cache_path],
                 capacity_bytes,
                 ..SsdCacheConfig::default()
             }),
@@ -125,6 +170,7 @@ fn cleanup_resident_memory(env: &TestEnv) {
 /// Save blocks, flush to SSD, verify the cache file contains non-zero bytes.
 #[tokio::test]
 async fn ssd_write_persists_to_file() {
+    skip_without_io_uring!();
     let (env, cache_path, _temp_dir) = ssd_env("test-ssd-write");
 
     let file_meta = std::fs::metadata(&cache_path).expect("SSD cache file should be created");
@@ -152,6 +198,7 @@ async fn ssd_write_persists_to_file() {
 /// query (triggers SSD prefetch) → load → verify data integrity.
 #[tokio::test]
 async fn ssd_prefetch_roundtrip_after_eviction() {
+    skip_without_io_uring!();
     let (env, _cache_path, _temp_dir) = ssd_env("test-ssd-prefetch");
 
     // Phase 1: Save target blocks and ensure they're persisted to SSD.
@@ -177,6 +224,7 @@ async fn ssd_prefetch_roundtrip_after_eviction() {
 
 #[tokio::test]
 async fn ssd_sharded_prefetch_roundtrip_after_eviction() {
+    skip_without_io_uring!();
     let (env, cache_path, _temp_dir) = ssd_sharded_env("test-ssd-sharded");
 
     assert!(
@@ -216,7 +264,44 @@ async fn ssd_sharded_prefetch_roundtrip_after_eviction() {
 }
 
 #[tokio::test]
+async fn ssd_multi_path_prefetch_roundtrip_after_eviction() {
+    skip_without_io_uring!();
+    let (env, cache_paths, _temp_dir) = ssd_multi_path_env("test-ssd-multi-path");
+
+    for (shard_id, path) in cache_paths.iter().enumerate().take(4) {
+        let shard_path = path.join(format!("shard-{shard_id:06}.dat"));
+        assert!(
+            shard_path.is_file(),
+            "shard {shard_id} should be on path {}",
+            path.display()
+        );
+        let file_meta = std::fs::metadata(&shard_path).expect("SSD shard file should be created");
+        assert_eq!(
+            file_meta.len(),
+            SSD_CAPACITY / 4,
+            "SSD shard file should be preallocated"
+        );
+    }
+
+    let target = env.hashes(1);
+    env.save_and_wait(&target).await;
+    env.engine.flush_all().await;
+
+    cleanup_resident_memory(&env);
+
+    let (hit, missing) = wait_query_ready(&env, &target).await;
+    assert_eq!(hit, target.len());
+    assert_eq!(missing, 0);
+
+    let lease = env.assert_all_hit_lease(&target).await;
+    env.data().zero_gpu();
+    env.load_to_gpu(lease, target.len()).await;
+    env.data().assert_gpu_matches_expected();
+}
+
+#[tokio::test]
 async fn ssd_ring_wrap_evicts_old_entries() {
+    skip_without_io_uring!();
     let (env, _temp_dir) = ssd_custom_capacity_env("test-ssd-wrap-evicts", SMALL_SSD_CAPACITY);
 
     let old = env.hashes(31);
@@ -231,6 +316,7 @@ async fn ssd_ring_wrap_evicts_old_entries() {
 
 #[tokio::test]
 async fn ssd_oversized_block_drops_disk_write_but_keeps_ram_hit() {
+    skip_without_io_uring!();
     let (env, _temp_dir) =
         ssd_custom_capacity_env("test-ssd-oversized-drop", OVERSIZED_SSD_CAPACITY);
 
@@ -253,6 +339,7 @@ async fn ssd_oversized_block_drops_disk_write_but_keeps_ram_hit() {
 /// the requested prefix, the query resolves to that partial hit plus miss suffix.
 #[tokio::test]
 async fn ssd_prefetch_reports_partial_prefix_after_cleanup() {
+    skip_without_io_uring!();
     let (env, _cache_path, _temp_dir) = ssd_env("test-ssd-partial-prefix");
 
     let all_hashes = env.hashes(7);
@@ -270,6 +357,7 @@ async fn ssd_prefetch_reports_partial_prefix_after_cleanup() {
 /// not stay in Loading forever.
 #[tokio::test]
 async fn ssd_miss_resolves_to_ready_missing_after_cleanup() {
+    skip_without_io_uring!();
     let (env, _cache_path, _temp_dir) = ssd_env("test-ssd-miss");
 
     let persisted = env.hashes(11);
@@ -287,6 +375,7 @@ async fn ssd_miss_resolves_to_ready_missing_after_cleanup() {
 /// lookups for the same req_id once the hashes become available in SSD.
 #[tokio::test]
 async fn ssd_miss_does_not_poison_later_same_req_id_hit() {
+    skip_without_io_uring!();
     let (env, _cache_path, _temp_dir) = ssd_env("test-ssd-miss-then-hit");
 
     let unrelated = env.hashes(12);
@@ -312,6 +401,7 @@ async fn ssd_miss_does_not_poison_later_same_req_id_hit() {
 /// prefetch result is the complete query answer: RAM prefix plus SSD suffix.
 #[tokio::test]
 async fn ssd_prefetch_combines_ram_prefix_with_ssd_suffix() {
+    skip_without_io_uring!();
     let (env, _cache_path, _temp_dir) = ssd_env("test-ssd-ram-prefix-ssd-suffix");
 
     let target = env.hashes(77);
@@ -341,6 +431,7 @@ async fn ssd_prefetch_combines_ram_prefix_with_ssd_suffix() {
 /// -> prefetch -> load round-trip as contiguous storage.
 #[tokio::test]
 async fn ssd_prefetch_split_storage_roundtrip_after_cleanup() {
+    skip_without_io_uring!();
     let (env, _temp_dir) = ssd_split_env("test-ssd-split-prefetch");
 
     let target = env.hashes(66);
