@@ -10,6 +10,7 @@ import signal
 import socket
 import subprocess
 import time
+from contextlib import suppress
 from pathlib import Path
 
 import requests
@@ -256,11 +257,15 @@ class PegaFlowServer:
         pool_size: str = "30gb",
         log_level: str | None = None,
         cargo_features: list[str] | None = None,
+        transfer_backend: str = "direct",
+        use_hugepages: bool = False,
     ):
         self.grpc_port = find_available_port()
         self.http_port = find_available_port()
         self.pool_size = pool_size
         self.log_level = log_level
+        self.transfer_backend = transfer_backend
+        self.use_hugepages = use_hugepages
         self.cargo_features = (
             cargo_features if cargo_features is not None else _detect_pegaflow_cargo_features()
         )
@@ -294,9 +299,13 @@ class PegaFlowServer:
                 f"0.0.0.0:{self.http_port}",
                 "--pool-size",
                 self.pool_size,
+                "--transfer-backend",
+                self.transfer_backend,
                 "--enable-prometheus",
             ]
         )
+        if self.use_hugepages:
+            cmd.append("--use-hugepages")
         if self.log_level is not None:
             cmd.extend(["--log-level", self.log_level])
 
@@ -317,6 +326,7 @@ class PegaFlowServer:
         feature_label = ",".join(self.cargo_features) or "default"
         print(
             f"\n[PegaFlow Server] cargo run -r features={feature_label} "
+            f"transfer_backend={self.transfer_backend} "
             f"on gRPC={self.grpc_port}, HTTP={self.http_port}"
         )
 
@@ -367,11 +377,15 @@ class PegaFlowServer:
             print("\n[PegaFlow Server] Stopping...")
             try:
                 os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
-                self.process.wait(timeout=10)
+                self.process.wait(timeout=30)
             except (subprocess.TimeoutExpired, ProcessLookupError, OSError):
                 if self.process:
-                    os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
-                    self.process.wait(timeout=5)
+                    with suppress(ProcessLookupError, OSError):
+                        os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
+                    try:
+                        self.process.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        print("pegaflow-server did not exit after SIGKILL")
             print("pegaflow-server stopped.\n")
         if self.log_handle:
             self.log_handle.close()

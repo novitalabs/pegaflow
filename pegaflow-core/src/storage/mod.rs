@@ -69,6 +69,8 @@ pub struct StorageConfig {
     pub metaserver_queue_depth: usize,
     /// Number of shards for the pinned memory pool (reduces allocator lock contention).
     pub pool_shards: usize,
+    /// H2D/D2H transfer backend used by the GPU workers.
+    pub transfer_mode: crate::TransferMode,
 }
 
 impl Default for StorageConfig {
@@ -87,6 +89,7 @@ impl Default for StorageConfig {
             advertise_addr: None,
             metaserver_queue_depth: crate::internode::DEFAULT_METASERVER_QUEUE_DEPTH,
             pool_shards: 1,
+            transfer_mode: crate::TransferMode::default(),
         }
     }
 }

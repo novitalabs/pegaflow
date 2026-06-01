@@ -146,6 +146,12 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub blockwise_alloc: bool,
 
+    /// H2D/D2H transfer backend: "direct" (one cuMemcpyAsync per coalesced
+    /// range, default) or "kernel" (a single copy kernel over mapped pinned
+    /// memory; lower latency when transfers are highly fragmented).
+    #[arg(long, default_value = "direct", value_parser = parse_transfer_mode)]
+    pub transfer_backend: pegaflow_core::TransferMode,
+
     /// RDMA NIC names for inter-node transfer (e.g. --nics mlx5_0,mlx5_1 or --nics mlx5_0 mlx5_1).
     /// When set, pinned memory is registered for RDMA access on these NICs.
     #[arg(long, value_delimiter = ',', value_parser = parse_nic_name, num_args = 1..)]
@@ -197,6 +203,10 @@ fn parse_nic_name(s: &str) -> Result<String, String> {
         return Err("--nics contains an empty NIC name".into());
     }
     Ok(name.to_string())
+}
+
+fn parse_transfer_mode(s: &str) -> Result<pegaflow_core::TransferMode, String> {
+    s.parse()
 }
 
 fn parse_hll_windows_arg(s: &str) -> Result<String, String> {
@@ -543,6 +553,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         advertise_addr,
         metaserver_queue_depth: cli.metaserver_queue_depth,
         pool_shards: cli.pool_shards,
+        transfer_mode: cli.transfer_backend,
     };
 
     if cli.pool_shards > 1 {

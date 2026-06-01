@@ -15,7 +15,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use cudarc::driver::{CudaContext, sys};
 use pegaflow_core::sync_state::{LOAD_STATE_ERROR, LOAD_STATE_SUCCESS};
 use pegaflow_core::{
-    LayerSave, LoadState, PegaEngine, PrefetchStatus, QueryLeaseId, StorageConfig,
+    LayerSave, LoadState, PegaEngine, PrefetchStatus, QueryLeaseId, StorageConfig, TransferMode,
 };
 use tokio::runtime::Runtime;
 
@@ -32,6 +32,7 @@ const ADVERTISE_ADDR: &str = "127.0.0.1:50055";
 const BLOCK_CASES: &[usize] = &[128, 1024, 8192, 32768];
 const DTOH_MULTILAYER_BLOCK_CASES: &[usize] = &[128, 1024, 8192];
 const CPU_STAGE_BLOCK_CASES: &[usize] = &[1024, 8192, 32768];
+const TRANSFER_FRAGMENT_BLOCK_CASES: &[usize] = &[1024, 8192];
 const BYTES_PER_BLOCK: usize = 1024;
 const CPU_PATH_BYTES_PER_BLOCK: usize = 1;
 const MULTI_LAYER_COUNT: usize = 61;
@@ -41,18 +42,77 @@ struct BenchFixture {
     _ctx: Arc<CudaContext>,
     _gpu: GpuBuffer,
     num_blocks: usize,
+    block_ids: Vec<i32>,
 }
 
 impl BenchFixture {
     fn new(num_blocks: usize, bytes_per_block: usize) -> Self {
-        Self::with_metaserver(num_blocks, bytes_per_block, false)
+        Self::with_config(
+            num_blocks,
+            bytes_per_block,
+            StorageConfig {
+                enable_lfu_admission: false,
+                hint_value_size_bytes: Some(bytes_per_block),
+                enable_numa_affinity: false,
+                ..StorageConfig::default()
+            },
+            block_ids(num_blocks),
+        )
     }
 
     fn with_metaserver(num_blocks: usize, bytes_per_block: usize, enable_metaserver: bool) -> Self {
+        Self::with_config(
+            num_blocks,
+            bytes_per_block,
+            StorageConfig {
+                enable_lfu_admission: false,
+                hint_value_size_bytes: Some(bytes_per_block),
+                enable_numa_affinity: false,
+                metaserver_addr: enable_metaserver.then(|| FAKE_METASERVER_ADDR.to_string()),
+                advertise_addr: enable_metaserver.then(|| ADVERTISE_ADDR.to_string()),
+                ..StorageConfig::default()
+            },
+            block_ids(num_blocks),
+        )
+    }
+
+    fn with_transfer_layout(
+        num_blocks: usize,
+        bytes_per_block: usize,
+        transfer_mode: TransferMode,
+        layout: TransferFragmentLayout,
+    ) -> Self {
+        let block_ids = layout.block_ids(num_blocks);
+        let registered_blocks = block_ids
+            .iter()
+            .copied()
+            .max()
+            .map(|id| usize::try_from(id).expect("block id must be non-negative") + 1)
+            .unwrap_or(num_blocks);
+        Self::with_config(
+            registered_blocks,
+            bytes_per_block,
+            StorageConfig {
+                enable_lfu_admission: false,
+                hint_value_size_bytes: Some(bytes_per_block),
+                enable_numa_affinity: false,
+                transfer_mode,
+                ..StorageConfig::default()
+            },
+            block_ids,
+        )
+    }
+
+    fn with_config(
+        registered_blocks: usize,
+        bytes_per_block: usize,
+        config: StorageConfig,
+        block_ids: Vec<i32>,
+    ) -> Self {
         let ctx = CudaContext::new(DEVICE_ID as usize).expect("CUDA context");
         ctx.bind_to_thread().expect("bind CUDA context");
 
-        let total_bytes = num_blocks
+        let total_bytes = registered_blocks
             .checked_mul(bytes_per_block)
             .expect("registered GPU size overflow");
         let gpu = GpuBuffer::new(Arc::clone(&ctx), total_bytes);
@@ -64,19 +124,7 @@ impl BenchFixture {
             .checked_mul(4)
             .and_then(|size| size.checked_add(64 << 20))
             .expect("pool size overflow");
-        let engine = PegaEngine::new_with_config(
-            pool_size,
-            false,
-            StorageConfig {
-                enable_lfu_admission: false,
-                hint_value_size_bytes: Some(bytes_per_block),
-                enable_numa_affinity: false,
-                metaserver_addr: enable_metaserver.then(|| FAKE_METASERVER_ADDR.to_string()),
-                advertise_addr: enable_metaserver.then(|| ADVERTISE_ADDR.to_string()),
-                ..StorageConfig::default()
-            },
-        )
-        .expect("engine");
+        let engine = PegaEngine::new_with_config(pool_size, false, config).expect("engine");
 
         engine
             .register_context_layer_batch(
@@ -91,7 +139,7 @@ impl BenchFixture {
                 &[LAYER_NAME.to_string()],
                 &[gpu.as_u64()],
                 &[total_bytes],
-                &[num_blocks],
+                &[registered_blocks],
                 &[bytes_per_block],
                 &[0],
                 &[1],
@@ -102,7 +150,8 @@ impl BenchFixture {
             engine,
             _ctx: ctx,
             _gpu: gpu,
-            num_blocks,
+            num_blocks: block_ids.len(),
+            block_ids,
         }
     }
 
@@ -115,7 +164,7 @@ impl BenchFixture {
                 DEVICE_ID,
                 vec![LayerSave {
                     layer_name: LAYER_NAME.to_string(),
-                    block_ids: block_ids(self.num_blocks),
+                    block_ids: self.block_ids.clone(),
                     block_hashes: hashes,
                 }],
             )
@@ -157,7 +206,7 @@ impl BenchFixture {
                 DEVICE_ID,
                 load_state.shm_name(),
                 &[LAYER_NAME],
-                &[(lease, block_ids(self.num_blocks))],
+                &[(lease, self.block_ids.clone())],
             )
             .expect("submit load");
         wait_for_load(&load_state).await;
@@ -180,6 +229,37 @@ struct MultiLayerBenchFixture {
 enum MultiLayerGpuLayout {
     SharedSource,
     DistinctLayerSources,
+}
+
+#[derive(Clone, Copy)]
+enum TransferFragmentLayout {
+    Contiguous,
+    StridedDevice,
+}
+
+impl TransferFragmentLayout {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Contiguous => "contiguous",
+            Self::StridedDevice => "strided_device",
+        }
+    }
+
+    fn block_ids(self, num_blocks: usize) -> Vec<i32> {
+        match self {
+            Self::Contiguous => block_ids(num_blocks),
+            Self::StridedDevice => (0..num_blocks)
+                .map(|idx| i32::try_from(idx * 2).expect("block index exceeds i32"))
+                .collect(),
+        }
+    }
+}
+
+fn transfer_mode_name(mode: TransferMode) -> &'static str {
+    match mode {
+        TransferMode::Direct => "direct",
+        TransferMode::Kernel => "kernel",
+    }
 }
 
 impl MultiLayerBenchFixture {
@@ -519,6 +599,57 @@ fn save_flush_multilayer_dtoh_benchmarks(c: &mut Criterion) {
     group.finish();
 }
 
+fn save_flush_transfer_fragmentation_benchmarks(c: &mut Criterion) {
+    let rt = Runtime::new().expect("tokio runtime");
+    let mut group = c.benchmark_group("cpu_path/save_flush_transfer_fragmentation");
+    group.sample_size(10);
+
+    for &num_blocks in TRANSFER_FRAGMENT_BLOCK_CASES {
+        group.throughput(Throughput::Bytes(bytes_per_iter(
+            num_blocks,
+            BYTES_PER_BLOCK,
+        )));
+
+        for transfer_mode in [TransferMode::Direct, TransferMode::Kernel] {
+            for layout in [
+                TransferFragmentLayout::Contiguous,
+                TransferFragmentLayout::StridedDevice,
+            ] {
+                let id = BenchmarkId::new(
+                    format!("{}_{}", transfer_mode_name(transfer_mode), layout.name()),
+                    num_blocks,
+                );
+
+                group.bench_function(id, |b| {
+                    let fixture = BenchFixture::with_transfer_layout(
+                        num_blocks,
+                        BYTES_PER_BLOCK,
+                        transfer_mode,
+                        layout,
+                    );
+                    b.iter_custom(|iters| {
+                        rt.block_on(async {
+                            let mut measured = Duration::ZERO;
+                            for iter in 0..iters {
+                                let hashes = make_block_hashes(num_blocks, iter + 1);
+                                let start = Instant::now();
+                                fixture.save_and_flush(hashes).await;
+                                measured += start.elapsed();
+                                fixture.cleanup_cache();
+                            }
+                            measured
+                        })
+                    });
+                    drop(fixture);
+                    std::thread::sleep(Duration::from_millis(50));
+                });
+            }
+        }
+    }
+
+    group.finish();
+}
+
 fn query_benchmarks(c: &mut Criterion) {
     let rt = Runtime::new().expect("tokio runtime");
     let mut group = c.benchmark_group("cpu_path/query_prefetch_lease");
@@ -691,6 +822,7 @@ criterion_group!(
     save_submit_multilayer_cpu_benchmarks,
     save_insert_flush_multilayer_cpu_benchmarks,
     save_flush_multilayer_dtoh_benchmarks,
+    save_flush_transfer_fragmentation_benchmarks,
     query_benchmarks,
     load_benchmarks
 );

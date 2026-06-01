@@ -331,11 +331,10 @@ mod tests {
 
     fn make_raw_block(engine: &StorageEngine, size: u64) -> Arc<RawBlock> {
         use crate::block::Segment;
-        let mut alloc = engine
+        let alloc = engine
             .allocate(NonZeroU64::new(size).unwrap(), None)
             .expect("test pool should have space");
-        let ptr = Arc::get_mut(&mut alloc).unwrap().as_mut_ptr();
-        let ptr = std::ptr::NonNull::new(ptr).expect("test alloc pointer must be non-null");
+        let ptr = alloc.as_non_null();
         Arc::new(RawBlock::new(vec![Segment::new(ptr, size as usize, alloc)]))
     }
 

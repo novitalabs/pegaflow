@@ -225,9 +225,20 @@ class TestE2ECorrectness:
         return tmp_path_factory.mktemp("e2e_logs")
 
     @pytest.fixture(scope="class")
-    def pegaflow_server(self, log_dir: Path):
+    def pegaflow_server(
+        self,
+        log_dir: Path,
+        pegaflow_transfer_backend: str,
+        pegaflow_use_hugepages: bool,
+        pegaflow_pool_size: str,
+    ):
         """Auto-start pegaflow-server with prometheus metrics."""
-        with PegaFlowServer(log_file=log_dir / "pegaflow-server.log") as server:
+        with PegaFlowServer(
+            log_file=log_dir / "pegaflow-server.log",
+            pool_size=pegaflow_pool_size,
+            transfer_backend=pegaflow_transfer_backend,
+            use_hugepages=pegaflow_use_hugepages,
+        ) as server:
             yield server
 
     @pytest.fixture(scope="class")
