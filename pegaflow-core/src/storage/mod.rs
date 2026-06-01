@@ -5,16 +5,17 @@ pub(crate) mod transfer_lock;
 mod write_path;
 
 use bytesize::ByteSize;
+#[cfg(not(feature = "rdma"))]
+use log::warn;
 use log::{debug, info};
 use std::collections::HashSet;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use crate::backing::{
-    AllocateFn, DEFAULT_MAX_PREFETCH_BLOCKS, RdmaFetchStore, RdmaTransport, SsdBackingStore,
-    SsdCacheConfig,
-};
+use crate::backing::{AllocateFn, DEFAULT_MAX_PREFETCH_BLOCKS, SsdBackingStore, SsdCacheConfig};
+#[cfg(feature = "rdma")]
+use crate::backing::{RdmaFetchStore, RdmaTransport};
 use crate::block::{BlockKey, PrefetchStatus, SealedBlock};
 use crate::internode::MetaServerClient;
 use crate::internode::metaserver_client::MetaServerClientConfig;
@@ -23,6 +24,8 @@ use crate::pinned_pool::{PinnedAllocation, PinnedAllocator};
 use pegaflow_common::NumaNode;
 
 use prefetch::PrefetchScheduler;
+#[cfg(feature = "rdma")]
+use prefetch::RdmaFetch;
 use read_cache::ReadCache;
 use write_path::{InsertDeps, WritePipeline};
 
@@ -94,6 +97,7 @@ pub(crate) struct StorageEngine {
     prefetch: PrefetchScheduler,
     write_pipeline: Arc<WritePipeline>,
     ssd_store: Option<Arc<SsdBackingStore>>,
+    #[cfg(feature = "rdma")]
     rdma_transport: Option<Arc<RdmaTransport>>,
     blockwise_alloc: bool,
     metaserver_client: Option<Arc<MetaServerClient>>,
@@ -112,6 +116,7 @@ impl StorageEngine {
         let max_prefetch_blocks = config.max_prefetch_blocks;
         let ssd_cache_config = config.ssd_cache_config;
         let rdma_nic_names = config.rdma_nic_names;
+        #[cfg(feature = "rdma")]
         let rdma_qps_per_peer = config.rdma_qps_per_peer;
         let blockwise_alloc = config.blockwise_alloc;
         let transfer_lock_timeout = config.transfer_lock_timeout;
@@ -175,17 +180,21 @@ impl StorageEngine {
 
         // RDMA transport must be created after the allocator so it can
         // register the pinned memory regions with the RDMA NICs.
-        let rdma_transport = match rdma_nic_names.as_deref().filter(|nics| !nics.is_empty()) {
-            Some(nics) => Some(crate::backing::new_rdma(
-                nics,
-                &allocator,
-                rdma_qps_per_peer,
-            )?),
-            None => None,
+        let rdma_nics = rdma_nic_names.as_deref().filter(|nics| !nics.is_empty());
+        #[cfg(feature = "rdma")]
+        let rdma_transport = if let Some(nics) = rdma_nics {
+            let rdma = crate::backing::new_rdma(nics, &allocator, rdma_qps_per_peer)?;
+            crate::metrics::register_rdma_gauges(&rdma);
+            Some(rdma)
+        } else {
+            None
         };
 
-        if let Some(ref rdma) = rdma_transport {
-            crate::metrics::register_rdma_gauges(rdma);
+        #[cfg(not(feature = "rdma"))]
+        if rdma_nics.is_some() {
+            warn!(
+                "RDMA NICs were configured, but this binary was built without the `rdma` feature; ignoring RDMA config"
+            );
         }
 
         let is_numa = allocator.is_numa();
@@ -201,19 +210,22 @@ impl StorageEngine {
             let ssd_store = ssd_cache_config
                 .map(|cfg| crate::backing::new_ssd(cfg, allocate_fn.clone(), is_numa));
 
+            #[cfg(feature = "rdma")]
             let rdma_fetch = rdma_transport.as_ref().and_then(|rdma| {
                 let ms = metaserver_client.as_ref()?;
                 let advertise = config
                     .advertise_addr
                     .clone()
                     .unwrap_or_else(|| "127.0.0.1:50055".to_string());
-                Some(Arc::new(RdmaFetchStore::new(
+                Some(RdmaFetch::new(Arc::new(RdmaFetchStore::new(
                     Arc::clone(ms),
                     Arc::clone(rdma),
                     allocate_fn.clone(),
                     advertise,
-                )))
+                ))))
             });
+            #[cfg(not(feature = "rdma"))]
+            let rdma_fetch = None;
 
             let prefetch =
                 PrefetchScheduler::new(ssd_store.clone(), rdma_fetch, max_prefetch_blocks);
@@ -228,6 +240,7 @@ impl StorageEngine {
                 prefetch,
                 write_pipeline: write_pipeline.clone(),
                 ssd_store,
+                #[cfg(feature = "rdma")]
                 rdma_transport,
                 blockwise_alloc,
                 metaserver_client,
@@ -579,6 +592,7 @@ impl StorageEngine {
             .collect()
     }
 
+    #[cfg(feature = "rdma")]
     pub(crate) fn rdma_transport(&self) -> Option<&Arc<RdmaTransport>> {
         self.rdma_transport.as_ref()
     }

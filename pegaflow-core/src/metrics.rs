@@ -1,9 +1,14 @@
+#[cfg(feature = "rdma")]
+use opentelemetry::metrics::ObservableGauge;
 use opentelemetry::{
     KeyValue, global,
-    metrics::{Counter, Histogram, Meter, ObservableGauge, UpDownCounter},
+    metrics::{Counter, Histogram, Meter, UpDownCounter},
 };
-use std::sync::{Arc, LazyLock, OnceLock};
+#[cfg(feature = "rdma")]
+use std::sync::Arc;
+use std::sync::{LazyLock, OnceLock};
 
+#[cfg(feature = "rdma")]
 use crate::backing::RdmaTransport;
 
 // ---------------------------------------------------------------------------
@@ -85,8 +90,11 @@ pub(crate) struct CoreMetrics {
     pub transfer_lock_timeouts_total: Counter<u64>,
 
     // RDMA remote fetch (client side)
+    #[cfg(feature = "rdma")]
     pub rdma_fetch_total: Counter<u64>,
+    #[cfg(feature = "rdma")]
     pub rdma_fetch_duration_seconds: Histogram<f64>,
+    #[cfg(feature = "rdma")]
     pub rdma_fetch_bytes: Counter<u64>,
 }
 
@@ -101,6 +109,7 @@ fn ssd_throughput_boundaries() -> Vec<f64> {
 }
 
 /// Histogram boundaries for RDMA remote fetch (gRPC + handshake + RDMA READ).
+#[cfg(feature = "rdma")]
 fn rdma_fetch_duration_boundaries() -> Vec<f64> {
     vec![
         0.01, // 10ms
@@ -140,14 +149,17 @@ fn duration_seconds_boundaries() -> Vec<f64> {
     ]
 }
 
+#[cfg(feature = "rdma")]
 struct RdmaGaugeHandles {
     _qps: ObservableGauge<u64>,
 }
 
+#[cfg(feature = "rdma")]
 static RDMA_GAUGES: OnceLock<RdmaGaugeHandles> = OnceLock::new();
 
 /// Register RDMA observable gauges backed by the given transport.
 /// Must be called after [`RdmaTransport`] is created; safe to call multiple times (no-op after first).
+#[cfg(feature = "rdma")]
 pub(crate) fn register_rdma_gauges(transport: &Arc<RdmaTransport>) {
     let t = Arc::clone(transport);
     RDMA_GAUGES.get_or_init(|| {
@@ -408,16 +420,19 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
                 .build(),
 
             // RDMA remote fetch (client side)
+            #[cfg(feature = "rdma")]
             rdma_fetch_total: meter
                 .u64_counter("pegaflow_rdma_fetch_total")
                 .with_description("RDMA remote fetch attempts (status=ok|error)")
                 .build(),
+            #[cfg(feature = "rdma")]
             rdma_fetch_duration_seconds: meter
                 .f64_histogram("pegaflow_rdma_fetch_duration")
                 .with_unit("s")
                 .with_description("End-to-end RDMA fetch latency (gRPC + handshake + RDMA READ)")
                 .with_boundaries(rdma_fetch_duration_boundaries())
                 .build(),
+            #[cfg(feature = "rdma")]
             rdma_fetch_bytes: meter
                 .u64_counter("pegaflow_rdma_fetch_bytes")
                 .with_unit("bytes")
