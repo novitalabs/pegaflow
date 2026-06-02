@@ -241,6 +241,20 @@ def hnd_remote_layer(
     )
 
 
+def decode_handshakes(tp_size: int, *, block_size: int = 16) -> tuple[PdHandshake, ...]:
+    return tuple(
+        PdHandshake(
+            request_id=f"decode-r{rank}",
+            engine_id="decode",
+            tp_rank=rank,
+            tp_size=tp_size,
+            block_size=block_size,
+            layers=(),
+        )
+        for rank in range(tp_size)
+    )
+
+
 def fake_mla_config(
     *,
     tp_rank: int = 0,

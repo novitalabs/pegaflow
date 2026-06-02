@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # ruff: noqa: F403,F405,I001
 from .pd_connector_test_utils import *
+from pegaflow.pd_connector.layout_mapping import HeadSlice, build_push_layout_plan
 
 
 def test_flash_attn_hnd_layout_offsets() -> None:
@@ -199,6 +200,185 @@ def test_p_worker_skips_non_representative_mla_prefill_rank() -> None:
 
     assert "prefill-r3" not in worker.rdma.remote_handshakes
     assert worker.get_finished({"prefill-r3"}) == ({"prefill-r3"}, None)
+
+
+def test_layout_mapping_homogeneous_tp_reads_same_remote_rank() -> None:
+    handshakes = decode_handshakes(tp_size=4)
+
+    plan = build_push_layout_plan(
+        prefill_tp_rank=2,
+        prefill_tp_size=4,
+        decode_handshakes=handshakes,
+        local_num_kv_heads=2,
+        remote_num_kv_heads=2,
+        total_num_kv_heads=8,
+        use_mla=False,
+    )
+
+    assert [(target.handshake.tp_rank, target.head_slices) for target in plan.targets] == [
+        (
+            2,
+            (
+                HeadSlice(
+                    local_start=0,
+                    local_end=2,
+                    remote_start=0,
+                    remote_end=2,
+                    global_heads=(4, 5),
+                ),
+            ),
+        )
+    ]
+
+
+def test_layout_mapping_decode_tp_greater_than_prefill_tp_splits_local_heads() -> None:
+    handshakes = decode_handshakes(tp_size=4)
+
+    plan = build_push_layout_plan(
+        prefill_tp_rank=1,
+        prefill_tp_size=2,
+        decode_handshakes=handshakes,
+        local_num_kv_heads=4,
+        remote_num_kv_heads=2,
+        total_num_kv_heads=8,
+        use_mla=False,
+    )
+
+    assert [(target.handshake.tp_rank, target.head_slices) for target in plan.targets] == [
+        (
+            2,
+            (
+                HeadSlice(
+                    local_start=0,
+                    local_end=2,
+                    remote_start=0,
+                    remote_end=2,
+                    global_heads=(4, 5),
+                ),
+            ),
+        ),
+        (
+            3,
+            (
+                HeadSlice(
+                    local_start=2,
+                    local_end=4,
+                    remote_start=0,
+                    remote_end=2,
+                    global_heads=(6, 7),
+                ),
+            ),
+        ),
+    ]
+
+
+def test_layout_mapping_prefill_tp_greater_than_decode_tp_offsets_remote_heads() -> None:
+    handshakes = decode_handshakes(tp_size=2)
+
+    plan = build_push_layout_plan(
+        prefill_tp_rank=3,
+        prefill_tp_size=4,
+        decode_handshakes=handshakes,
+        local_num_kv_heads=2,
+        remote_num_kv_heads=4,
+        total_num_kv_heads=8,
+        use_mla=False,
+    )
+
+    assert [(target.handshake.tp_rank, target.head_slices) for target in plan.targets] == [
+        (
+            1,
+            (
+                HeadSlice(
+                    local_start=0,
+                    local_end=2,
+                    remote_start=2,
+                    remote_end=4,
+                    global_heads=(6, 7),
+                ),
+            ),
+        )
+    ]
+
+
+def test_layout_mapping_mla_uses_one_remote_rank_and_skips_duplicates() -> None:
+    handshakes = decode_handshakes(tp_size=4)
+
+    selected = build_push_layout_plan(
+        prefill_tp_rank=2,
+        prefill_tp_size=8,
+        decode_handshakes=handshakes,
+        local_num_kv_heads=1,
+        remote_num_kv_heads=1,
+        total_num_kv_heads=1,
+        use_mla=True,
+    )
+    skipped = build_push_layout_plan(
+        prefill_tp_rank=3,
+        prefill_tp_size=8,
+        decode_handshakes=handshakes,
+        local_num_kv_heads=1,
+        remote_num_kv_heads=1,
+        total_num_kv_heads=1,
+        use_mla=True,
+    )
+
+    assert [(target.handshake.tp_rank, target.head_slices) for target in selected.targets] == [
+        (1, ())
+    ]
+    assert skipped.targets == ()
+
+
+def test_layout_mapping_gqa_dedup_skips_redundant_prefill_rank() -> None:
+    handshakes = decode_handshakes(tp_size=1)
+
+    owner = build_push_layout_plan(
+        prefill_tp_rank=0,
+        prefill_tp_size=4,
+        decode_handshakes=handshakes,
+        local_num_kv_heads=1,
+        remote_num_kv_heads=2,
+        total_num_kv_heads=2,
+        use_mla=False,
+    )
+    duplicate = build_push_layout_plan(
+        prefill_tp_rank=2,
+        prefill_tp_size=4,
+        decode_handshakes=handshakes,
+        local_num_kv_heads=1,
+        remote_num_kv_heads=2,
+        total_num_kv_heads=2,
+        use_mla=False,
+    )
+
+    assert [(target.handshake.tp_rank, target.head_slices) for target in owner.targets] == [
+        (
+            0,
+            (
+                HeadSlice(
+                    local_start=0,
+                    local_end=1,
+                    remote_start=0,
+                    remote_end=1,
+                    global_heads=(0,),
+                ),
+            ),
+        )
+    ]
+    assert duplicate.targets == ()
+
+
+def test_layout_mapping_rejects_non_divisible_tp_ratios() -> None:
+    with pytest.raises(AssertionError, match="requires divisible TP sizes"):
+        build_push_layout_plan(
+            prefill_tp_rank=0,
+            prefill_tp_size=2,
+            decode_handshakes=decode_handshakes(tp_size=3),
+            local_num_kv_heads=3,
+            remote_num_kv_heads=2,
+            total_num_kv_heads=6,
+            use_mla=False,
+        )
 
 
 def test_real_rdma_port_preserves_native_contract_for_pd_push() -> None:
