@@ -69,11 +69,13 @@ class TransferRegionLayout:
     region_idx: int
     base_addr: int
     block_len: int
+    block_stride: int | None = None
 
     def __post_init__(self) -> None:
         assert self.region_idx >= 0
         assert self.base_addr > 0
         assert self.block_len > 0
+        assert self.block_stride is None or self.block_stride >= self.block_len
 
 
 @dataclass(frozen=True)
@@ -129,6 +131,9 @@ def layer_layout_from_dict(
                 region_idx=int(region["region_idx"]),
                 base_addr=int(region["base_addr"]),
                 block_len=int(region["block_len"]),
+                block_stride=(
+                    int(region["block_stride"]) if region.get("block_stride") is not None else None
+                ),
             )
             for region in data["regions"]
         ),
@@ -170,14 +175,7 @@ def layer_layout_to_dict(layer: LayerRemoteLayout) -> dict[str, Any]:
         "layer_name": layer.layer_name,
         "layer_idx": layer.layer_idx,
         "block_ids": list(layer.block_ids),
-        "regions": [
-            {
-                "region_idx": region.region_idx,
-                "base_addr": region.base_addr,
-                "block_len": region.block_len,
-            }
-            for region in layer.regions
-        ],
+        "regions": [_region_layout_to_dict(region) for region in layer.regions],
         "mr_desc": layer.mr_desc,
     }
 
@@ -186,16 +184,20 @@ def layer_layout_to_compact_dict(layer: LayerRemoteLayout) -> dict[str, Any]:
     return {
         "layer_name": layer.layer_name,
         "layer_idx": layer.layer_idx,
-        "regions": [
-            {
-                "region_idx": region.region_idx,
-                "base_addr": region.base_addr,
-                "block_len": region.block_len,
-            }
-            for region in layer.regions
-        ],
+        "regions": [_region_layout_to_dict(region) for region in layer.regions],
         "mr_desc": layer.mr_desc,
     }
+
+
+def _region_layout_to_dict(region: TransferRegionLayout) -> dict[str, Any]:
+    data = {
+        "region_idx": region.region_idx,
+        "base_addr": region.base_addr,
+        "block_len": region.block_len,
+    }
+    if region.block_stride is not None:
+        data["block_stride"] = region.block_stride
+    return data
 
 
 def handshake_to_dict(handshake: PdHandshake) -> dict[str, Any]:

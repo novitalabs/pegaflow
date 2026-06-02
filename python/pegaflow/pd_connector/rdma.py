@@ -190,16 +190,20 @@ def _layer_to_native(layer: LayerRemoteLayout) -> dict[str, Any]:
         "layer_name": layer.layer_name,
         "layer_idx": layer.layer_idx,
         "block_ids": list(layer.block_ids),
-        "regions": [
-            {
-                "region_idx": region.region_idx,
-                "base_addr": region.base_addr,
-                "block_len": region.block_len,
-            }
-            for region in layer.regions
-        ],
+        "regions": [_region_to_native(region) for region in layer.regions],
         "mr_desc": _mr_desc_to_native(layer.mr_desc),
     }
+
+
+def _region_to_native(region: Any) -> dict[str, int]:
+    data = {
+        "region_idx": region.region_idx,
+        "base_addr": region.base_addr,
+        "block_len": region.block_len,
+    }
+    if region.block_stride is not None:
+        data["block_stride"] = region.block_stride
+    return data
 
 
 def _layer_from_native(layer: LayerRemoteLayout | dict[str, Any]) -> LayerRemoteLayout:

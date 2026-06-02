@@ -145,6 +145,10 @@ class FlashAttnHndLayout:
     def block_bytes(self) -> int:
         return self.block_size * self.num_kv_heads * self.head_size * self.element_size
 
+    @property
+    def head_bytes(self) -> int:
+        return self.block_size * self.head_size * self.element_size
+
     def block_offset_bytes(self, kv_idx: int, block_id: int) -> int:
         assert kv_idx in (0, 1), f"kv_idx must be 0 (K) or 1 (V), got {kv_idx}"
         assert 0 <= block_id < self.num_blocks, (
@@ -169,6 +173,34 @@ class FlashAttnHndLayout:
             ),
         )
 
+    def block_head_slices(
+        self,
+        block_id: int,
+        start_head: int,
+        end_head: int,
+    ) -> LayerBlockSlices:
+        assert 0 <= start_head < end_head <= self.num_kv_heads, (
+            f"invalid KV head range [{start_head}, {end_head}) for layer={self.layer_name} "
+            f"num_kv_heads={self.num_kv_heads}"
+        )
+        head_count = end_head - start_head
+        head_offset = start_head * self.head_bytes
+        bytes_len = head_count * self.head_bytes
+        return LayerBlockSlices(
+            regions=(
+                BlockRegionSlice(
+                    block_id=block_id,
+                    src_offset_bytes=self.block_offset_bytes(0, block_id) + head_offset,
+                    bytes=bytes_len,
+                ),
+                BlockRegionSlice(
+                    block_id=block_id,
+                    src_offset_bytes=self.block_offset_bytes(1, block_id) + head_offset,
+                    bytes=bytes_len,
+                ),
+            ),
+        )
+
     def remote_layout(
         self, layer_idx: int, block_ids: BlockIdSelection = None
     ) -> LayerRemoteLayout:
@@ -187,6 +219,41 @@ class FlashAttnHndLayout:
                     region_idx=1,
                     base_addr=self.base_addr + self.block_offset_bytes(1, 0),
                     block_len=self.block_bytes,
+                ),
+            ),
+        )
+
+    def remote_head_layout(
+        self,
+        layer_idx: int,
+        block_ids: BlockIdSelection,
+        start_head: int,
+        end_head: int,
+    ) -> LayerRemoteLayout:
+        assert 0 <= start_head < end_head <= self.num_kv_heads, (
+            f"invalid KV head range [{start_head}, {end_head}) for layer={self.layer_name} "
+            f"num_kv_heads={self.num_kv_heads}"
+        )
+        ordered = _ordered_block_ids(block_ids, self.num_blocks)
+        head_count = end_head - start_head
+        head_offset = start_head * self.head_bytes
+        block_len = head_count * self.head_bytes
+        return LayerRemoteLayout(
+            layer_name=self.layer_name,
+            layer_idx=layer_idx,
+            block_ids=ordered,
+            regions=(
+                TransferRegionLayout(
+                    region_idx=0,
+                    base_addr=self.base_addr + self.block_offset_bytes(0, 0) + head_offset,
+                    block_len=block_len,
+                    block_stride=self.block_bytes,
+                ),
+                TransferRegionLayout(
+                    region_idx=1,
+                    base_addr=self.base_addr + self.block_offset_bytes(1, 0) + head_offset,
+                    block_len=block_len,
+                    block_stride=self.block_bytes,
                 ),
             ),
         )
