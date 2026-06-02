@@ -274,6 +274,23 @@ def fake_mla_config(
     )
 
 
+def fake_mtp_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(engine_id="pd"),
+        model_config=SimpleNamespace(
+            use_mla=False,
+            hf_text_config=SimpleNamespace(num_nextn_predict_layers=1),
+        ),
+        cache_config=SimpleNamespace(block_size=16),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_rank=0,
+            tensor_parallel_size=1,
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
+    )
+
+
 def fake_kv_cache_config(
     *,
     num_blocks: int,
