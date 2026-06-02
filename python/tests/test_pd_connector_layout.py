@@ -112,6 +112,11 @@ def test_pd_connector_mla_returns_default_layout_and_allows_128_block_size() -> 
     PdConnector(fake_mla_config(block_size=128), KVConnectorRole.WORKER)
 
 
+def test_pd_connector_rejects_mtp_layout() -> None:
+    with pytest.raises(AssertionError, match="PdConnector does not support MTP layout"):
+        PdConnector(fake_mtp_config(), KVConnectorRole.WORKER)
+
+
 def test_pd_worker_rejects_mla_physical_logical_block_split() -> None:
     tensor = FakeTensor(
         shape=(8, 32, 128),

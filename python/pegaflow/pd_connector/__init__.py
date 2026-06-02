@@ -137,6 +137,7 @@ __all__ = ["PdConnector"]
 
 
 def _assert_supported_config(vllm_config: Any) -> None:
+    _assert_mtp_not_supported(vllm_config)
     if not model_uses_mla(vllm_config):
         return
     parallel_config = getattr(vllm_config, "parallel_config", None)
@@ -148,3 +149,22 @@ def _assert_supported_config(vllm_config: Any) -> None:
     assert pcp_world_size == 1, (
         "PdConnector MLA first version requires prefill_context_parallel_size == 1"
     )
+
+
+def _assert_mtp_not_supported(vllm_config: Any) -> None:
+    model_config = getattr(vllm_config, "model_config", None)
+    hf_config = getattr(model_config, "hf_text_config", None)
+    candidates = (model_config, hf_config)
+    numeric_fields = (
+        "num_nextn_predict_layers",
+        "num_mtp_layers",
+        "mtp_num_layers",
+    )
+    for config in candidates:
+        if config is None:
+            continue
+        if bool(getattr(config, "use_mtp", False)):
+            raise AssertionError("PdConnector does not support MTP layout")
+        for field in numeric_fields:
+            if int(getattr(config, field, 0) or 0) > 0:
+                raise AssertionError("PdConnector does not support MTP layout")
