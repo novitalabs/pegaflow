@@ -48,6 +48,19 @@ where
     value.extract()
 }
 
+fn py_get_optional<'py, T>(dict: &Bound<'py, PyDict>, key: &str) -> PyResult<Option<T>>
+where
+    for<'a> T: FromPyObject<'a, 'py, Error = PyErr>,
+{
+    let Some(value) = dict.get_item(key)? else {
+        return Ok(None);
+    };
+    if value.is_none() {
+        return Ok(None);
+    }
+    value.extract().map(Some)
+}
+
 fn wait_atomic_count(counter: &AtomicI64, target: i64, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     let mut waits = 0;
@@ -108,6 +121,7 @@ struct PdLocalLayer {
 struct PdRemoteRegion {
     base_addr: u64,
     block_len: u64,
+    block_stride: u64,
 }
 
 #[derive(Clone)]
@@ -463,7 +477,9 @@ impl PdRdmaEngine {
                 }
                 let base_addr: u64 = py_get(&region, "base_addr")?;
                 let block_len: u64 = py_get(&region, "block_len")?;
-                if base_addr == 0 || block_len == 0 {
+                let block_stride: u64 =
+                    py_get_optional(&region, "block_stride")?.unwrap_or(block_len);
+                if base_addr == 0 || block_len == 0 || block_stride < block_len {
                     return Err(PyValueError::new_err(format!(
                         "remote layer {layer_idx} region {region_idx} has invalid address range"
                     )));
@@ -471,6 +487,7 @@ impl PdRdmaEngine {
                 regions.push(PdRemoteRegion {
                     base_addr,
                     block_len,
+                    block_stride,
                 });
             }
             if regions.is_empty() {
@@ -1012,7 +1029,7 @@ impl PdRdmaEngine {
             }
         }
         let remote_addr = block_id
-            .checked_mul(region.block_len)
+            .checked_mul(region.block_stride)
             .and_then(|offset| region.base_addr.checked_add(offset))
             .ok_or_else(|| PyValueError::new_err("remote block address overflow"))?;
         let dst_offset = remote_addr

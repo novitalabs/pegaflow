@@ -19,6 +19,52 @@ def test_flash_attn_hnd_layout_offsets() -> None:
     assert layout.block_offset_bytes(1, 3) == (8 * 4 * 16 * 32 + 3 * 4 * 16 * 32) * 2
 
 
+def test_flash_attn_hnd_head_slice_layouts_use_full_block_stride() -> None:
+    tensor = FakeTensor(
+        shape=(2, 8, 16, 4, 32),
+        stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
+        ptr=0x1000,
+    )
+    layout = FlashAttnHndLayout.from_tensor("layer.0", tensor)
+
+    slices = layout.block_head_slices(block_id=3, start_head=1, end_head=3)
+
+    assert slices.regions == (
+        BlockRegionSlice(
+            block_id=3,
+            src_offset_bytes=(3 * 4 * 16 * 32 + 1 * 16 * 32) * 2,
+            bytes=2 * 16 * 32 * 2,
+        ),
+        BlockRegionSlice(
+            block_id=3,
+            src_offset_bytes=(8 * 4 * 16 * 32 + 3 * 4 * 16 * 32 + 1 * 16 * 32) * 2,
+            bytes=2 * 16 * 32 * 2,
+        ),
+    )
+
+    remote = layout.remote_head_layout(
+        layer_idx=0,
+        block_ids=(3, 4),
+        start_head=1,
+        end_head=3,
+    )
+
+    assert remote.regions == (
+        TransferRegionLayout(
+            region_idx=0,
+            base_addr=0x1000 + 1 * 16 * 32 * 2,
+            block_len=2 * 16 * 32 * 2,
+            block_stride=4 * 16 * 32 * 2,
+        ),
+        TransferRegionLayout(
+            region_idx=1,
+            base_addr=0x1000 + 8 * 4 * 16 * 32 * 2 + 1 * 16 * 32 * 2,
+            block_len=2 * 16 * 32 * 2,
+            block_stride=4 * 16 * 32 * 2,
+        ),
+    )
+
+
 def test_pd_worker_registers_mla_and_indexer_layouts_from_layer_specs() -> None:
     main_tensor = FakeTensor(
         shape=(8, 64, 656),
@@ -280,6 +326,56 @@ def test_pd_handshake_serializes_regions_layout() -> None:
     restored = handshake_from_dict(data)
     assert restored is not None
     assert restored.layers[0].block_ids == layer.block_ids
+    assert restored.layers[0].regions == layer.regions
+
+
+def test_pd_handshake_serializes_strided_regions_layout() -> None:
+    layer = LayerRemoteLayout(
+        layer_name="layer.0",
+        layer_idx=0,
+        block_ids=(8, 9, 10),
+        regions=(
+            TransferRegionLayout(
+                region_idx=0,
+                base_addr=0x10_400,
+                block_len=0x400,
+                block_stride=0x1000,
+            ),
+            TransferRegionLayout(
+                region_idx=1,
+                base_addr=0x20_400,
+                block_len=0x400,
+                block_stride=0x1000,
+            ),
+        ),
+    )
+    handshake = PdHandshake(
+        request_id="req-1",
+        engine_id="decode",
+        tp_rank=0,
+        tp_size=1,
+        block_size=16,
+        layers=(layer,),
+    )
+
+    data = handshake_to_dict(handshake)
+
+    assert data["layers"][0]["regions"] == [
+        {
+            "region_idx": 0,
+            "base_addr": 0x10_400,
+            "block_len": 0x400,
+            "block_stride": 0x1000,
+        },
+        {
+            "region_idx": 1,
+            "base_addr": 0x20_400,
+            "block_len": 0x400,
+            "block_stride": 0x1000,
+        },
+    ]
+    restored = handshake_from_dict(data)
+    assert restored is not None
     assert restored.layers[0].regions == layer.regions
 
 
