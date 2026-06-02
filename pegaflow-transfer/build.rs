@@ -1,6 +1,6 @@
 //! pegaflow-transfer build script.
 //!
-//! Generates FFI bindings for libibverbs when the `v2-rdma` feature is enabled.
+//! Generates FFI bindings for libibverbs when this RDMA transfer crate is built.
 //! CUDA driver/runtime bindings come from `cudarc`.
 
 use std::{
@@ -75,6 +75,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("cargo:rerun-if-changed=build_wrappers/libibverbs.h");
 
-    build_libibverbs(&out_dir, &manifest)?;
-    Ok(())
+    build_libibverbs(&out_dir, &manifest)
 }

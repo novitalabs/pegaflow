@@ -27,8 +27,10 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use cudarc::driver::CudaContext;
@@ -105,6 +107,8 @@ fn wait_until_serving(addr: SocketAddr) {
 struct TestCluster {
     http_addr: SocketAddr,
     client: EngineClient<Channel>,
+    registry: RegistryHandle,
+    shutdown: Arc<Notify>,
     rt: tokio::runtime::Runtime,
     // Kept alive so the engine's pinned pool stays valid for the whole test.
     _ctx: Arc<CudaContext>,
@@ -158,6 +162,68 @@ impl TestCluster {
             "register_context completed despite the GIL wedge — the wedge did not take \
              effect, so this test proves nothing about starvation"
         );
+    }
+
+    fn wait_for_tasks(&self, handles: Vec<tokio::task::JoinHandle<()>>, timeout: Duration) {
+        self.rt.block_on(async move {
+            for handle in handles {
+                tokio::time::timeout(timeout, handle)
+                    .await
+                    .expect("register task did not finish after releasing the GIL wedge")
+                    .expect("register task panicked");
+            }
+        });
+    }
+
+    fn wait_for_registry_drain(&self, timeout: Duration) {
+        let registry = self.registry.clone();
+        self.rt
+            .block_on(async move { tokio::time::timeout(timeout, registry.clear()).await })
+            .expect("registry actor did not drain after releasing the GIL wedge");
+    }
+
+    fn shutdown(self) {
+        self.shutdown.notify_waiters();
+        self.rt.shutdown_timeout(Duration::from_secs(2));
+    }
+}
+
+struct GilWedge {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl GilWedge {
+    fn hold() -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let thread_stop = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            Python::attach(|_py| {
+                let _ = ready_tx.send(());
+                while !thread_stop.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(50));
+                }
+            });
+        });
+
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("GIL holder thread did not acquire the GIL");
+
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for GilWedge {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            handle.join().expect("GIL holder thread panicked");
+        }
     }
 }
 
@@ -222,7 +288,7 @@ fn start_cluster(worker_threads: usize) -> TestCluster {
         start_http_server(
             http_addr,
             Arc::clone(&engine),
-            registry,
+            registry.clone(),
             true,
             Some(Registry::new()),
             Arc::clone(&shutdown),
@@ -249,6 +315,8 @@ fn start_cluster(worker_threads: usize) -> TestCluster {
     TestCluster {
         http_addr,
         client,
+        registry,
+        shutdown,
         rt,
         _ctx: ctx,
     }
@@ -271,29 +339,25 @@ fn wedged_registry_actor_does_not_starve_async_endpoints() {
     cluster.assert_http("/metrics", "200", Duration::from_secs(2), "baseline");
     cluster.assert_grpc_health(Duration::from_secs(2), "baseline");
 
-    // Hold the process-wide GIL forever from a side thread. This is the real
-    // thing that makes a registry op block: any later `Python::attach` waits
-    // here. (No torch needed — the actor blocks acquiring the GIL, before it
-    // would import torch.)
-    thread::spawn(|| {
-        Python::attach(|_py| {
-            loop {
-                thread::sleep(Duration::from_secs(3600));
-            }
-        });
-    });
-    thread::sleep(Duration::from_millis(300)); // ensure the GIL is actually held
+    // Hold the process-wide GIL from a side thread. This is the real thing that
+    // makes a registry op block: any later `Python::attach` waits here. (No
+    // torch needed — the actor blocks acquiring the GIL, before it would import
+    // torch.) The guard releases the GIL before process teardown; a permanent
+    // GIL holder leaves CPython/PyO3 in an unclean state and can segfault after
+    // the test body has already passed.
+    let gil_wedge = GilWedge::hold();
 
     // Drive the gRPC register hot path. Each RPC reaches the registry actor,
     // which blocks in `Python::attach`; the RPCs hang (their replies never
     // come) but only ever `.await` — no async worker is pinned.
+    let mut register_tasks = Vec::new();
     for i in 0..4 {
         let mut client = cluster.client.clone();
-        cluster.rt.spawn(async move {
+        register_tasks.push(cluster.rt.spawn(async move {
             let _ = client
                 .register_context_batch(wedge_register_request(i))
                 .await;
-        });
+        }));
     }
     thread::sleep(Duration::from_millis(500)); // let the actor pick up + block
 
@@ -312,7 +376,11 @@ fn wedged_registry_actor_does_not_starve_async_endpoints() {
         t.elapsed()
     );
 
-    // The GIL-holder thread keeps the actor wedged; drop the runtime without
-    // joining the stuck register tasks.
-    cluster.rt.shutdown_background();
+    // Release the synthetic wedge and wait for the queued invalid register RPCs
+    // to fail normally. This keeps the regression guard from leaking a Python
+    // GIL holder and a blocked registry thread into test-process teardown.
+    drop(gil_wedge);
+    cluster.wait_for_tasks(register_tasks, Duration::from_secs(5));
+    cluster.wait_for_registry_drain(Duration::from_secs(5));
+    cluster.shutdown();
 }

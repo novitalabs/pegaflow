@@ -266,7 +266,9 @@ impl Drop for PinnedMemory {
             AllocStrategy::WriteCombined => {
                 // SAFETY: ptr was allocated with cudaHostAlloc.
                 let result = unsafe { rt::cudaFreeHost(self.ptr.as_ptr() as *mut libc::c_void) };
-                if result != rt::cudaError::cudaSuccess {
+                if result != rt::cudaError::cudaSuccess
+                    && result != rt::cudaError::cudaErrorCudartUnloading
+                {
                     eprintln!("Warning: cudaFreeHost failed: {:?}", result);
                 }
             }
@@ -274,7 +276,9 @@ impl Drop for PinnedMemory {
                 // SAFETY: ptr was registered with cudaHostRegister.
                 let unreg =
                     unsafe { rt::cudaHostUnregister(self.ptr.as_ptr() as *mut libc::c_void) };
-                if unreg != rt::cudaError::cudaSuccess {
+                if unreg != rt::cudaError::cudaSuccess
+                    && unreg != rt::cudaError::cudaErrorCudartUnloading
+                {
                     eprintln!("Warning: cudaHostUnregister failed: {:?}", unreg);
                 }
                 // SAFETY: ptr was allocated by mmap with the same size.

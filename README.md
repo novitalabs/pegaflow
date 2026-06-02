@@ -17,6 +17,10 @@
 - **Production-ready observability** — built-in Prometheus metrics and OTLP export, not an afterthought
 - **Pluggable** — works with vLLM as a drop-in KV connector
 
+## News
+
+- **2026-05-18** — [vLLM x Novita AI: PegaFlow for Production-Grade External KV Cache](https://vllm.ai/blog/2026-05-18-pegaflow), a joint blog post with the vLLM team.
+
 ## Architecture
 
 <div align="center">

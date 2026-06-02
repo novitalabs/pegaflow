@@ -7,8 +7,10 @@ edition.workspace = true
 workspace = true
 
 [features]
-default = ["cudarc/cuda-12080", "pegaflow-transfer/default"]
-cuda-13 = ["cudarc/cuda-13000", "pegaflow-transfer/cuda-13"]
+default = ["cuda-12", "rdma"]
+cuda-12 = ["cudarc/cuda-12080", "pegaflow-transfer?/cuda-12"]
+cuda-13 = ["cudarc/cuda-13000", "pegaflow-transfer?/cuda-13"]
+rdma = ["dep:pegaflow-transfer"]
 tracing = ["fastrace"]
 
 [dependencies]
@@ -37,7 +39,7 @@ tonic.workspace = true
 dashmap.workspace = true
 smallvec.workspace = true
 pegaflow-proto = { path = "../pegaflow-proto" }
-pegaflow-transfer = { path = "../pegaflow-transfer", default-features = false }
+pegaflow-transfer = { path = "../pegaflow-transfer", default-features = false, optional = true }
 mea.workspace = true
 
 [dev-dependencies]
