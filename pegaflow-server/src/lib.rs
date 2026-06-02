@@ -1,3 +1,4 @@
+mod check_cuda_version;
 pub mod http_server;
 pub mod metric;
 pub mod proto;
@@ -435,6 +436,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
     // Initialize CUDA in the main thread before starting Tokio runtime
     init_cuda_driver()?;
+    check_cuda_version::preflight()?;
 
     // Determine which devices to initialize
     let devices = if cli.devices.is_empty() {
