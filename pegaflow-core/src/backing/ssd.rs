@@ -335,7 +335,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let cache_path = temp_dir.path().join("cache.bin");
         let mut options = std::fs::OpenOptions::new();
-        let files = open_cache_files(&[cache_path.clone()], 1, 4096, &mut options).unwrap();
+        let files = open_cache_files(std::slice::from_ref(&cache_path), 1, 4096, &mut options).unwrap();
         assert_eq!(files.len(), 1);
         assert!(cache_path.is_file());
         assert_eq!(fs::metadata(&cache_path).unwrap().len(), 4096);
@@ -346,7 +346,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let cache_path = temp_dir.path().join("cache");
         let mut options = std::fs::OpenOptions::new();
-        let files = open_cache_files(&[cache_path.clone()], 4, 4096, &mut options).unwrap();
+        let files = open_cache_files(std::slice::from_ref(&cache_path), 4, 4096, &mut options).unwrap();
         assert_eq!(files.len(), 4);
         assert!(cache_path.is_dir());
         for shard_id in 0..4 {
