@@ -301,6 +301,8 @@ async fn mock_vllm_naive_tp2_load_roundtrip_over_rpc() {
     let mut harness = MockVllmRpcHarness::naive_tp2().await;
     let hashes = make_block_hashes(BLOCK_COUNT, 23);
 
+    // TP0 alone must not make the hash prefix visible; TP1 below completes the
+    // full TP group and uses the wait-for-visibility helper.
     let save_tp0 = harness.save_blocks_for_worker_no_wait(0, &hashes).await;
     assert_eq!(save_tp0.request.tp_rank, 0);
     assert_eq!(save_tp0.request.device_id, 0);
