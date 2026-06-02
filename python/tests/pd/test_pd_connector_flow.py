@@ -692,6 +692,128 @@ def test_p_worker_pushes_registered_blocks_from_save_kv_layer() -> None:
     assert worker.get_finished({"prefill-r0"})[0] == {"prefill-r0"}
 
 
+def test_p_worker_pushes_to_multiple_decode_ranks_when_decode_tp_is_larger() -> None:
+    tensor = FakeTensor(
+        shape=(2, 8, 16, 4, 32),
+        stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
+    )
+    rdma = MockRdmaPort()
+    worker = PdWorkerConnector(
+        SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(engine_id="prefill"),
+            parallel_config=SimpleNamespace(tensor_parallel_rank=1, tensor_parallel_size=2),
+        ),
+        rdma=rdma,
+    )
+    worker.register_kv_caches({"layer.0": tensor})
+    worker.start_load_kv(
+        PdConnectorMetadata(
+            reqs_to_push={
+                "prefill-r1": PushReqMeta(
+                    local_block_ids=([3],),
+                    target_request_id="decode",
+                    handshakes=tuple(
+                        PdHandshake(
+                            request_id=f"decode-r{rank}",
+                            engine_id="decode",
+                            tp_rank=rank,
+                            tp_size=4,
+                            block_size=16,
+                            layers=(hnd_remote_layer(block_ids=(68,), block_len=2048),),
+                        )
+                        for rank in range(4)
+                    ),
+                )
+            }
+        ),
+        None,
+    )
+
+    worker.save_kv_layer(
+        "layer.0",
+        tensor,
+        SimpleNamespace(slot_mapping=FakeSlotMapping([3 * 16])),
+    )
+    drain_pd_pushes(worker)
+
+    assert sorted(rdma.remote_handshakes) == ["prefill-r1#d2", "prefill-r1#d3"]
+    assert rdma.remote_handshakes["prefill-r1#d2"].request_id == "decode-r2"
+    assert rdma.remote_handshakes["prefill-r1#d3"].request_id == "decode-r3"
+    d2_push = rdma.pushed_layers["prefill-r1#d2"][0][1]
+    d3_push = rdma.pushed_layers["prefill-r1#d3"][0][1]
+    assert d2_push[0].regions[0] == BlockRegionSlice(
+        block_id=68,
+        src_offset_bytes=(3 * 4 * 16 * 32) * 2,
+        bytes=2 * 16 * 32 * 2,
+    )
+    assert d3_push[0].regions[0] == BlockRegionSlice(
+        block_id=68,
+        src_offset_bytes=(3 * 4 * 16 * 32 + 2 * 16 * 32) * 2,
+        bytes=2 * 16 * 32 * 2,
+    )
+    assert worker.get_finished({"prefill-r1"})[0] == {"prefill-r1"}
+    assert "prefill-r1#d2" not in rdma.registered
+    assert "prefill-r1#d3" not in rdma.registered
+
+
+def test_p_worker_offsets_remote_heads_when_prefill_tp_is_larger() -> None:
+    tensor = FakeTensor(
+        shape=(2, 8, 16, 2, 32),
+        stride=(8 * 2 * 16 * 32, 2 * 16 * 32, 32, 16 * 32, 1),
+    )
+    rdma = MockRdmaPort()
+    worker = PdWorkerConnector(
+        SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(engine_id="prefill"),
+            parallel_config=SimpleNamespace(tensor_parallel_rank=3, tensor_parallel_size=4),
+        ),
+        rdma=rdma,
+    )
+    worker.register_kv_caches({"layer.0": tensor})
+    worker.start_load_kv(
+        PdConnectorMetadata(
+            reqs_to_push={
+                "prefill-r3": PushReqMeta(
+                    local_block_ids=([3],),
+                    target_request_id="decode",
+                    handshakes=tuple(
+                        PdHandshake(
+                            request_id=f"decode-r{rank}",
+                            engine_id="decode",
+                            tp_rank=rank,
+                            tp_size=2,
+                            block_size=16,
+                            layers=(hnd_remote_layer(block_ids=(68,), block_len=4096),),
+                        )
+                        for rank in range(2)
+                    ),
+                )
+            }
+        ),
+        None,
+    )
+
+    worker.save_kv_layer(
+        "layer.0",
+        tensor,
+        SimpleNamespace(slot_mapping=FakeSlotMapping([3 * 16])),
+    )
+    drain_pd_pushes(worker)
+
+    assert sorted(rdma.remote_handshakes) == ["prefill-r3"]
+    assert rdma.remote_handshakes["prefill-r3"].request_id == "decode-r1"
+    remote_layer = rdma.remote_handshakes["prefill-r3"].layers[0]
+    assert remote_layer.regions[0].base_addr == 0x1000 + 2 * 16 * 32 * 2
+    assert remote_layer.regions[0].block_len == 2 * 16 * 32 * 2
+    assert remote_layer.regions[0].block_stride == 4 * 16 * 32 * 2
+    pushed = rdma.pushed_layers["prefill-r3"][0][1]
+    assert pushed[0].regions[0] == BlockRegionSlice(
+        block_id=68,
+        src_offset_bytes=(3 * 2 * 16 * 32) * 2,
+        bytes=2 * 16 * 32 * 2,
+    )
+
+
 def test_p_worker_maps_local_blocks_to_remote_blocks_by_position() -> None:
     tensor = FakeTensor(
         shape=(2, 16, 16, 4, 32),

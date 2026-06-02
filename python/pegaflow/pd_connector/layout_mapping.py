@@ -126,7 +126,11 @@ def build_push_layout_plan(
     targets = tuple(
         PushTargetPlan(
             handshake=handshakes_by_rank[rank],
-            head_slices=_coalesce_head_slices(slices),
+            head_slices=_drop_full_rank_slice(
+                _coalesce_head_slices(slices),
+                local_num_kv_heads=local_num_kv_heads,
+                remote_num_kv_heads=remote_num_kv_heads,
+            ),
         )
         for rank, slices in sorted(target_slices.items())
     )
@@ -217,6 +221,24 @@ def _coalesce_head_slices(slices: list[HeadSlice]) -> tuple[HeadSlice, ...]:
             continue
         coalesced.append(item)
     return tuple(coalesced)
+
+
+def _drop_full_rank_slice(
+    slices: tuple[HeadSlice, ...],
+    *,
+    local_num_kv_heads: int,
+    remote_num_kv_heads: int,
+) -> tuple[HeadSlice, ...]:
+    if len(slices) == 1:
+        only = slices[0]
+        if (
+            only.local_start == 0
+            and only.local_end == local_num_kv_heads
+            and only.remote_start == 0
+            and only.remote_end == remote_num_kv_heads
+        ):
+            return ()
+    return slices
 
 
 def _assert_handshake_tp_consistency(handshakes: tuple[PdHandshake, ...]) -> None:

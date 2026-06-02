@@ -5,18 +5,27 @@ from __future__ import annotations
 import queue
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from pegaflow.logging_utils import get_connector_logger
 from pegaflow.pd_connector.chunk_tracker import ChunkTracker
 from pegaflow.pd_connector.layout import (
+    BlockRegionSlice,
+    FlashAttnHndLayout,
     LayerBlockSlices,
     block_ranges_for_remote_write,
     block_slices_bytes,
     layout_from_tensor,
 )
+from pegaflow.pd_connector.layout_mapping import (
+    HeadSlice,
+    PushLayoutPlan,
+    PushTargetPlan,
+    build_push_layout_plan,
+)
 from pegaflow.pd_connector.metadata import (
+    LayerRemoteLayout,
     PdHandshake,
     PushReqMeta,
     flatten_block_ids,
@@ -39,8 +48,12 @@ class PrefillHandler:
         self._push_chunk_maps: dict[str, tuple[dict[int, int], bool]] = {}
         self._tracker = ChunkTracker()
         self._completed_pushes: set[str] = set()
+        self._completed_physical_pushes: set[str] = set()
         self._producer_finished_req_ids: set[str] = set()
         self._remote_block_offsets: dict[str, int] = {}
+        self._push_plans: dict[str, PushLayoutPlan] = {}
+        self._physical_to_logical: dict[str, str] = {}
+        self._logical_to_physical: dict[str, tuple[str, ...]] = {}
         self._push_traces: dict[str, _PushTrace] = {}
         self._skipped_pushes = 0
         self._push_sender = _AsyncLayerPushSender()
@@ -49,13 +62,12 @@ class PrefillHandler:
     def process_push_reqs(self, reqs_to_push: dict[str, PushReqMeta]) -> None:
         for req_id, req in reqs_to_push.items():
             self._tracker.add_request(req_id)
-            try:
-                handshake = self._select_push_handshake(req)
-            except _SkipPushRank:
+            plan = self._build_push_layout_plan(req)
+            if plan.should_skip:
                 self._skipped_pushes += 1
                 self._completed_pushes.add(req_id)
                 logger.info(
-                    "[PdConnector] P skipped MLA push req=%s target_req=%s rank=%d skipped_total=%d",
+                    "[PdConnector] P skipped push req=%s target_req=%s rank=%d skipped_total=%d",
                     req_id,
                     req.target_request_id,
                     self._w.tp_rank,
@@ -63,15 +75,28 @@ class PrefillHandler:
                 )
                 continue
             self._push_reqs[req_id] = req
+            self._push_plans[req_id] = plan
             self._push_traces.setdefault(req_id, _PushTrace(queued_ts_ns=time.time_ns()))
             self._pending_push_chunks.add(req_id)
             self._push_chunk_maps.pop(req_id, None)
-            self._w.rdma.open_request(req_id, handshake)
+            physical_req_ids = self._physical_req_ids(req_id, plan)
+            self._logical_to_physical[req_id] = physical_req_ids
+            for physical_req_id, target in zip(physical_req_ids, plan.targets, strict=True):
+                self._physical_to_logical[physical_req_id] = req_id
+                local_layout = next(iter(self._w.layouts.values()), None)
+                self._w.rdma.open_request(
+                    physical_req_id,
+                    _target_handshake_for_local_layout(
+                        target,
+                        local_layout,
+                    ),
+                )
             logger.info(
-                "[PdConnector] P queued push req=%s target_req=%s rank=%d blocks=%d",
+                "[PdConnector] P queued push req=%s target_req=%s rank=%d physical_reqs=%d blocks=%d",
                 req_id,
                 req.target_request_id,
                 self._w.tp_rank,
+                len(physical_req_ids),
                 len(flatten_block_ids(req.local_block_ids)),
             )
 
@@ -79,6 +104,11 @@ class PrefillHandler:
         self._push_reqs.pop(req_id, None)
         self._pending_push_chunks.discard(req_id)
         self._push_chunk_maps.pop(req_id, None)
+        self._push_plans.pop(req_id, None)
+        physical_req_ids = self._logical_to_physical.pop(req_id, ())
+        for physical_req_id in physical_req_ids:
+            self._physical_to_logical.pop(physical_req_id, None)
+            self._completed_physical_pushes.discard(physical_req_id)
         self._push_traces.pop(req_id, None)
         self._tracker.remove(req_id)
 
@@ -134,7 +164,7 @@ class PrefillHandler:
         """Return req_ids that are done sending and also finished by the producer."""
         self._producer_finished_req_ids.update(finished_req_ids)
         finished_sending = self._w.rdma.pop_finished_sending()
-        self._completed_pushes.update(finished_sending)
+        self._record_finished_physical_pushes(finished_sending)
         releasable_sending = self._completed_pushes & self._producer_finished_req_ids
         for req_id in releasable_sending:
             self._completed_pushes.discard(req_id)
@@ -142,10 +172,19 @@ class PrefillHandler:
             self._push_reqs.pop(req_id, None)
             self._pending_push_chunks.discard(req_id)
             self._push_chunk_maps.pop(req_id, None)
+            self._push_plans.pop(req_id, None)
+            physical_req_ids = self._logical_to_physical.pop(req_id, ())
+            self._w.rdma.close_request(req_id)
+            for physical_req_id in physical_req_ids:
+                self._physical_to_logical.pop(physical_req_id, None)
+                self._completed_physical_pushes.discard(physical_req_id)
+                self._w.rdma.close_request(physical_req_id)
             self._push_traces.pop(req_id, None)
             self._tracker.remove(req_id)
             self._remote_block_offsets = {
-                key: value for key, value in self._remote_block_offsets.items() if key != req_id
+                key: value
+                for key, value in self._remote_block_offsets.items()
+                if not (key == req_id or key.startswith(f"{req_id}#"))
             }
         return releasable_sending
 
@@ -154,8 +193,12 @@ class PrefillHandler:
         self._pending_push_chunks.clear()
         self._push_chunk_maps.clear()
         self._completed_pushes.clear()
+        self._completed_physical_pushes.clear()
         self._producer_finished_req_ids.clear()
         self._remote_block_offsets.clear()
+        self._push_plans.clear()
+        self._physical_to_logical.clear()
+        self._logical_to_physical.clear()
         self._push_traces.clear()
         self._push_finalizer.close()
         self._push_sender.close()
@@ -182,35 +225,41 @@ class PrefillHandler:
             )
             if trace.first_save_ts_ns is None:
                 trace.first_save_ts_ns = time.time_ns()
-            remote_block_ids, all_chunks_seen = self._push_chunk_maps.get(req_id, ({}, False))
-            if not remote_block_ids:
-                remote_block_ids, all_chunks_seen = self._remote_block_id_map(
+            plan = self._push_plans[req_id]
+            target_maps, all_chunks_seen = self._push_chunk_maps.get(req_id, ({}, False))
+            if not target_maps:
+                target_maps, all_chunks_seen = self._remote_block_id_maps(
                     req_id,
-                    req,
+                    plan,
                     req_blocks,
                 )
-                self._push_chunk_maps[req_id] = (remote_block_ids, all_chunks_seen)
-            assert req_blocks.issubset(remote_block_ids), (
-                "PdConnector selected blocks must match the current registered push chunk; "
-                f"req={req_id} selected={sorted(req_blocks)} "
-                f"mapped={sorted(remote_block_ids)}"
-            )
-            block_slices = block_ranges_for_remote_write(
-                layout,
-                req_blocks,
-                remote_block_ids,
-            )
-            rdma_bytes = block_slices_bytes(block_slices)
+                self._push_chunk_maps[req_id] = (target_maps, all_chunks_seen)
             assert self._w.rdma is not None
-            self._push_sender.submit(
-                _LayerPushTask(
-                    rdma=self._w.rdma,
-                    req_id=req_id,
-                    layer_idx=layer_idx,
-                    block_slices=block_slices,
-                    event=event,
+            rdma_bytes = 0
+            physical_req_ids = self._logical_to_physical[req_id]
+            for physical_req_id, target in zip(physical_req_ids, plan.targets, strict=True):
+                remote_block_ids = target_maps[physical_req_id]
+                assert req_blocks.issubset(remote_block_ids), (
+                    "PdConnector selected blocks must match the current registered push chunk; "
+                    f"req={req_id} physical_req={physical_req_id} selected={sorted(req_blocks)} "
+                    f"mapped={sorted(remote_block_ids)}"
                 )
-            )
+                block_slices = _target_block_ranges_for_remote_write(
+                    layout,
+                    target,
+                    req_blocks,
+                    remote_block_ids,
+                )
+                rdma_bytes += block_slices_bytes(block_slices)
+                self._push_sender.submit(
+                    _LayerPushTask(
+                        rdma=self._w.rdma,
+                        req_id=physical_req_id,
+                        layer_idx=layer_idx,
+                        block_slices=block_slices,
+                        event=event,
+                    )
+                )
             trace.rdma_bytes += rdma_bytes
             self._tracker.mark_blocks_pushed(req_id, layer_idx, req_blocks)
             if layer_idx != len(self._w.layer_names) - 1:
@@ -255,7 +304,7 @@ class PrefillHandler:
             self._push_finalizer.submit(
                 _PushFinalizeTask(
                     rdma=self._w.rdma,
-                    req_id=req_id,
+                    req_ids=self._logical_to_physical[req_id],
                     target_request_id=req.target_request_id,
                     num_blocks=len(req_blocks),
                     chunk_count=trace.chunk_count,
@@ -264,6 +313,53 @@ class PrefillHandler:
                     rdma_bytes=trace.rdma_bytes,
                 )
             )
+
+    def _build_push_layout_plan(self, req: PushReqMeta) -> PushLayoutPlan:
+        assert req.handshakes, (
+            f"PdConnector push request has no handshakes; target_req={req.target_request_id}"
+        )
+        if not self._w.layouts:
+            assert self._w.use_mla, "PdConnector push requires registered KV cache layouts"
+            try:
+                handshake = self._select_push_handshake(req)
+            except _SkipPushRank:
+                return PushLayoutPlan(targets=())
+            return PushLayoutPlan(
+                targets=(PushTargetPlan(handshake=handshake, head_slices=()),)
+            )
+        first_layout = next(iter(self._w.layouts.values()))
+        local_heads = int(getattr(first_layout, "num_kv_heads", 1))
+        first_handshake = req.handshakes[0]
+        remote_heads = _remote_num_kv_heads(first_handshake, first_layout, local_heads)
+        total_heads = _total_num_kv_heads(
+            local_heads=local_heads,
+            local_tp_size=self._w.tp_size,
+            remote_heads=remote_heads,
+            remote_tp_size=first_handshake.tp_size,
+            use_mla=self._w.use_mla,
+        )
+        return build_push_layout_plan(
+            prefill_tp_rank=self._w.tp_rank,
+            prefill_tp_size=self._w.tp_size,
+            decode_handshakes=req.handshakes,
+            local_num_kv_heads=local_heads,
+            remote_num_kv_heads=remote_heads,
+            total_num_kv_heads=total_heads,
+            use_mla=self._w.use_mla,
+        )
+
+    def _physical_req_ids(self, req_id: str, plan: PushLayoutPlan) -> tuple[str, ...]:
+        if len(plan.targets) == 1:
+            return (req_id,)
+        return tuple(f"{req_id}#d{target.handshake.tp_rank}" for target in plan.targets)
+
+    def _record_finished_physical_pushes(self, physical_req_ids: set[str]) -> None:
+        self._completed_physical_pushes.update(physical_req_ids)
+        for physical_req_id in physical_req_ids:
+            logical_req_id = self._physical_to_logical.get(physical_req_id, physical_req_id)
+            physical_for_logical = self._logical_to_physical.get(logical_req_id, (logical_req_id,))
+            if set(physical_for_logical).issubset(self._completed_physical_pushes):
+                self._completed_pushes.add(logical_req_id)
 
     def _select_push_handshake(self, req: PushReqMeta) -> PdHandshake:
         assert req.handshakes, (
@@ -338,6 +434,29 @@ class PrefillHandler:
             remote_block_ids
         )
 
+    def _remote_block_id_maps(
+        self,
+        req_id: str,
+        plan: PushLayoutPlan,
+        local_block_ids: set[int],
+    ) -> tuple[dict[str, dict[int, int]], bool]:
+        result = {}
+        all_chunks_seen = True
+        for physical_req_id, target in zip(
+            self._logical_to_physical[req_id],
+            plan.targets,
+            strict=True,
+        ):
+            remote_block_ids, target_all_chunks_seen = _remote_block_id_map_for_handshake(
+                offset_key=physical_req_id,
+                handshake=target.handshake,
+                local_block_ids=local_block_ids,
+                remote_block_offsets=self._remote_block_offsets,
+            )
+            result[physical_req_id] = remote_block_ids
+            all_chunks_seen = all_chunks_seen and target_all_chunks_seen
+        return result, all_chunks_seen
+
 
 # ---------------------------------------------------------------------------
 # Free functions
@@ -370,6 +489,152 @@ def _rdma_link_gbps(rdma: RdmaPort | None) -> float:
     except Exception:
         logger.exception("[PdConnector] failed to read RDMA link speed")
         return 0.0
+
+
+def _target_block_ranges_for_remote_write(
+    layout: Any,
+    target: PushTargetPlan,
+    local_block_ids: set[int],
+    remote_block_ids: dict[int, int],
+) -> list[LayerBlockSlices]:
+    if not target.head_slices:
+        return block_ranges_for_remote_write(layout, local_block_ids, remote_block_ids)
+    assert isinstance(layout, FlashAttnHndLayout), (
+        "PdConnector head-sliced layout mapping requires FlashAttention HND layout; "
+        f"layout={type(layout).__name__}"
+    )
+    ranges = []
+    for local_block_id in sorted(local_block_ids):
+        remote_block_id = remote_block_ids[local_block_id]
+        regions = []
+        for head_slice in target.head_slices:
+            block_slice = layout.block_head_slices(
+                local_block_id,
+                head_slice.local_start,
+                head_slice.local_end,
+            )
+            regions.extend(
+                BlockRegionSlice(
+                    block_id=remote_block_id,
+                    src_offset_bytes=region.src_offset_bytes,
+                    bytes=region.bytes,
+                )
+                for region in block_slice.regions
+            )
+        ranges.append(LayerBlockSlices(regions=tuple(regions)))
+    return ranges
+
+
+def _target_handshake_for_local_layout(
+    target: PushTargetPlan,
+    layout: Any,
+) -> PdHandshake:
+    if not target.head_slices or not target.handshake.layers:
+        return target.handshake
+    assert isinstance(layout, FlashAttnHndLayout), (
+        "PdConnector head-sliced layout mapping requires FlashAttention HND layout; "
+        f"layout={type(layout).__name__}"
+    )
+    head_slice = _single_remote_head_slice(target.head_slices)
+    return replace(
+        target.handshake,
+        layers=tuple(
+            _remote_head_layer(layer, head_slice, layout.head_bytes)
+            for layer in target.handshake.layers
+        ),
+    )
+
+
+def _remote_head_layer(
+    layer: LayerRemoteLayout,
+    head_slice: HeadSlice,
+    head_bytes: int,
+) -> LayerRemoteLayout:
+    return replace(
+        layer,
+        regions=tuple(
+            replace(
+                region,
+                base_addr=region.base_addr + head_slice.remote_start * head_bytes,
+                block_len=(head_slice.remote_end - head_slice.remote_start) * head_bytes,
+                block_stride=region.block_stride or region.block_len,
+            )
+            for region in layer.regions
+        ),
+    )
+
+
+def _single_remote_head_slice(head_slices: tuple[HeadSlice, ...]) -> HeadSlice:
+    assert head_slices, "PdConnector target has no head slices"
+    assert len(head_slices) == 1, (
+        "PdConnector first head-sliced version expects one contiguous head slice per target; "
+        f"head_slices={head_slices}"
+    )
+    return head_slices[0]
+
+
+def _remote_block_id_map_for_handshake(
+    *,
+    offset_key: str,
+    handshake: PdHandshake,
+    local_block_ids: set[int],
+    remote_block_offsets: dict[str, int],
+) -> tuple[dict[int, int], bool]:
+    if not handshake.layers:
+        return {block_id: block_id for block_id in local_block_ids}, True
+    remote_block_ids = handshake.layers[0].block_ids
+    for layer in handshake.layers[1:]:
+        assert layer.block_ids == remote_block_ids, (
+            "PdConnector expects one decode block-id layout shared by all layers; "
+            f"layer=0 blocks={list(remote_block_ids)} layer={layer.layer_idx} "
+            f"blocks={list(layer.block_ids)}"
+        )
+    ordered_local = sorted(local_block_ids)
+    if len(ordered_local) == len(remote_block_ids):
+        remote_block_offsets[offset_key] = len(remote_block_ids)
+        return dict(zip(ordered_local, remote_block_ids, strict=True)), True
+
+    offset = remote_block_offsets.get(offset_key, 0)
+    next_offset = offset + len(ordered_local)
+    assert next_offset <= len(remote_block_ids), (
+        "PdConnector P/D block count mismatch "
+        f"offset={offset} local_blocks={ordered_local} remote_blocks={list(remote_block_ids)}"
+    )
+    remote_chunk = remote_block_ids[offset:next_offset]
+    remote_block_offsets[offset_key] = next_offset
+    return dict(zip(ordered_local, remote_chunk, strict=True)), next_offset == len(
+        remote_block_ids
+    )
+
+
+def _remote_num_kv_heads(
+    handshake: PdHandshake,
+    local_layout: Any,
+    fallback: int,
+) -> int:
+    if not handshake.layers or not isinstance(local_layout, FlashAttnHndLayout):
+        return fallback
+    layer = handshake.layers[0]
+    if len(layer.regions) < 1:
+        return fallback
+    head_bytes = local_layout.head_bytes
+    block_len = layer.regions[0].block_len
+    if block_len % head_bytes != 0:
+        return fallback
+    return max(1, block_len // head_bytes)
+
+
+def _total_num_kv_heads(
+    *,
+    local_heads: int,
+    local_tp_size: int,
+    remote_heads: int,
+    remote_tp_size: int,
+    use_mla: bool,
+) -> int:
+    if use_mla:
+        return local_heads
+    return min(local_heads * local_tp_size, remote_heads * remote_tp_size)
 
 
 def _assert_handshake_tp_consistency(handshakes: tuple[PdHandshake, ...]) -> None:
@@ -410,7 +675,7 @@ class _PushTrace:
 @dataclass(frozen=True)
 class _PushFinalizeTask:
     rdma: RdmaPort
-    req_id: str
+    req_ids: tuple[str, ...]
     target_request_id: str
     num_blocks: int
     chunk_count: int
@@ -502,7 +767,7 @@ class _AsyncPushFinalizer:
         self._push_sender = push_sender
         self._queue: queue.Queue[_PushFinalizeTask | None] = queue.Queue()
         self._condition = threading.Condition()
-        self._submitted: set[str] = set()
+        self._submitted: set[tuple[str, ...]] = set()
         self._inflight = 0
         self._error: BaseException | None = None
         self._thread = threading.Thread(
@@ -514,9 +779,9 @@ class _AsyncPushFinalizer:
         with self._condition:
             if self._error is not None:
                 raise self._error
-            if task.req_id in self._submitted:
+            if task.req_ids in self._submitted:
                 return
-            self._submitted.add(task.req_id)
+            self._submitted.add(task.req_ids)
             self._inflight += 1
         self._queue.put(task)
 
@@ -538,17 +803,18 @@ class _AsyncPushFinalizer:
             try:
                 if task is None:
                     return
-                self._push_sender.wait_req(task.req_id)
-                task.rdma.wait_for_pushes(task.req_id)
-                task.rdma.push_done(task.req_id)
+                for req_id in task.req_ids:
+                    self._push_sender.wait_req(req_id)
+                    task.rdma.wait_for_pushes(req_id)
+                    task.rdma.push_done(req_id)
                 done_ts_ns = time.time_ns()
                 save_gbps = _gbps(task.rdma_bytes, task.first_save_ts_ns, done_ts_ns)
                 link_gbps = _rdma_link_gbps(task.rdma)
                 logger.info(
-                    "[PdConnector] P RDMA done req=%s target_req=%s chunks=%d blocks=%d "
+                    "[PdConnector] P RDMA done reqs=%s target_req=%s chunks=%d blocks=%d "
                     "rdma_bytes=%d save_to_imm_ms=%.3f schedule_to_imm_ms=%.3f "
                     "save_gbps=%.2f tail_gbps=%.2f link_gbps=%.2f link_util_pct=%.2f",
-                    task.req_id,
+                    list(task.req_ids),
                     task.target_request_id,
                     task.chunk_count,
                     task.num_blocks,
@@ -563,8 +829,8 @@ class _AsyncPushFinalizer:
             except BaseException as exc:
                 if task is not None:
                     logger.exception(
-                        "[PdConnector] P finalize failed req=%s target_req=%s chunks=%d blocks=%d bytes=%d",
-                        task.req_id,
+                        "[PdConnector] P finalize failed reqs=%s target_req=%s chunks=%d blocks=%d bytes=%d",
+                        list(task.req_ids),
                         task.target_request_id,
                         task.chunk_count,
                         task.num_blocks,
@@ -576,7 +842,7 @@ class _AsyncPushFinalizer:
             finally:
                 if task is not None:
                     with self._condition:
-                        self._submitted.discard(task.req_id)
+                        self._submitted.discard(task.req_ids)
                         self._inflight -= 1
                         self._condition.notify_all()
                 self._queue.task_done()

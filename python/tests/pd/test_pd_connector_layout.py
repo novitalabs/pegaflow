@@ -215,20 +215,7 @@ def test_layout_mapping_homogeneous_tp_reads_same_remote_rank() -> None:
         use_mla=False,
     )
 
-    assert [(target.handshake.tp_rank, target.head_slices) for target in plan.targets] == [
-        (
-            2,
-            (
-                HeadSlice(
-                    local_start=0,
-                    local_end=2,
-                    remote_start=0,
-                    remote_end=2,
-                    global_heads=(4, 5),
-                ),
-            ),
-        )
-    ]
+    assert [(target.handshake.tp_rank, target.head_slices) for target in plan.targets] == [(2, ())]
 
 
 def test_layout_mapping_decode_tp_greater_than_prefill_tp_splits_local_heads() -> None:
