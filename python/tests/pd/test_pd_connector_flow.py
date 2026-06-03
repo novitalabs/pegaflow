@@ -1255,5 +1255,14 @@ def test_pd_proxy_streams_sse_lines_without_large_read_buffering() -> None:
     ]
 
 
-def test_pd_connector_allows_full_decode_cudagraph() -> None:
-    assert PdConnector.requires_piecewise_for_cudagraph({}) is False
+def test_pd_connector_requires_piecewise_cudagraph_by_default() -> None:
+    assert PdConnector.requires_piecewise_for_cudagraph({}) is True
+
+
+def test_pd_connector_can_allow_full_decode_cudagraph() -> None:
+    assert (
+        PdConnector.requires_piecewise_for_cudagraph(
+            {"pegaflow.pd.allow_full_decode_cudagraph": True}
+        )
+        is False
+    )

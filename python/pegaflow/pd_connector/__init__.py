@@ -39,7 +39,7 @@ class PdConnector(KVConnectorBase_V1, SupportsHMA):
 
     @classmethod
     def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
-        return False
+        return not bool(extra_config.get("pegaflow.pd.allow_full_decode_cudagraph", False))
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         if self._worker is not None:
