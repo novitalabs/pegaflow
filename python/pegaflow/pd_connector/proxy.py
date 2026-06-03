@@ -230,6 +230,20 @@ def _open_json(
         raise
 
 
+def iter_http_stream_chunks(response) -> Any:
+    pending = bytearray()
+    while True:
+        line = response.readline()
+        if not line:
+            if pending:
+                yield bytes(pending)
+            return
+        pending.extend(line)
+        if line in {b"\n", b"\r\n"}:
+            yield bytes(pending)
+            pending.clear()
+
+
 class _Handler(BaseHTTPRequestHandler):
     server: _PdHttpServer
 
@@ -262,7 +276,7 @@ class _Handler(BaseHTTPRequestHandler):
                     return
                 with response:
                     first_chunk = True
-                    while chunk := response.read(65536):
+                    for chunk in iter_http_stream_chunks(response):
                         if first_chunk:
                             first_chunk = False
                             now_ns = time.time_ns()

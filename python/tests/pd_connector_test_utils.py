@@ -55,6 +55,7 @@ from pegaflow.pd_connector.prefill import (  # noqa: E402
 from pegaflow.pd_connector.proxy import (  # noqa: E402
     ProxyConfig,
     build_pd_proxy_request,
+    iter_http_stream_chunks,
 )
 from pegaflow.pd_connector.rdma import (  # noqa: E402
     MockRdmaPort,

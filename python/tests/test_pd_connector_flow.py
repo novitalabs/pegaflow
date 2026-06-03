@@ -1000,5 +1000,32 @@ def test_pd_proxy_preserves_streaming_decode_request() -> None:
     assert req.decode_body["stream"] is True
 
 
+def test_pd_proxy_streams_sse_lines_without_large_read_buffering() -> None:
+    class SlowSseBody:
+        def __init__(self) -> None:
+            self.lines = iter(
+                [
+                    b"data: {\"choices\":[{\"text\":\"a\"}]}\n",
+                    b"\n",
+                    b"data: {\"choices\":[{\"text\":\"b\"}]}\n",
+                    b"\n",
+                    b"data: [DONE]\n",
+                    b"\n",
+                ]
+            )
+
+        def readline(self):
+            return next(self.lines, b"")
+
+        def read(self, _size=-1):
+            raise AssertionError("stream forwarding must not use large buffered reads")
+
+    assert list(iter_http_stream_chunks(SlowSseBody())) == [
+        b"data: {\"choices\":[{\"text\":\"a\"}]}\n\n",
+        b"data: {\"choices\":[{\"text\":\"b\"}]}\n\n",
+        b"data: [DONE]\n\n",
+    ]
+
+
 def test_pd_connector_requires_piecewise_cudagraph_for_layer_push() -> None:
     assert PdConnector.requires_piecewise_for_cudagraph({}) is True
