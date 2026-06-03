@@ -6,10 +6,7 @@ so we can see the throughput improvement from multi-path configuration.
 """
 
 import os
-import sys
 import time
-import tempfile
-import threading
 import ctypes
 import shutil
 from concurrent.futures import ThreadPoolExecutor
@@ -115,7 +112,7 @@ def main():
     print("SSD Multi-Path Throughput Report")
     print("=" * 60)
     print(f"Workload: {TOTAL_BYTES / (1024*1024):.1f} MiB total, {BLOCK_SIZE} B block size")
-    print(f"Method:   parallel O_DIRECT write/read across all shards")
+    print("Method:   parallel O_DIRECT write/read across all shards")
     print()
 
     data = bytes([i % 256 for i in range(TOTAL_BYTES)])
