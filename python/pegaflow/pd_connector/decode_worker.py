@@ -145,6 +145,9 @@ class DecodeHandler:
     def wait_reqs(self) -> dict[str, WaitReqMeta]:
         return self._wait_reqs
 
+    def is_idle(self) -> bool:
+        return not self._wait_reqs
+
     def _build_wait_handshake(
         self,
         req_id: str,
