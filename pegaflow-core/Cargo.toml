@@ -65,6 +65,10 @@ harness = false
 name = "cpu_path"
 harness = false
 
+[[bench]]
+name = "ssd_multi_path"
+harness = false
+
 [[example]]
 name = "pinned_alloc"
 

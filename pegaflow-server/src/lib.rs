@@ -109,7 +109,9 @@ pub struct Cli {
     #[arg(long, default_value = "512gb", value_parser = parse_memory_size)]
     pub ssd_cache_capacity: usize,
 
-    /// SSD cache file shards. Use >1 for parallel filesystems such as GPFS. Default: 1
+    /// SSD cache file shards per path. Use >1 for parallel filesystems such as GPFS.
+    /// When multiple --ssd-cache-path values are given each path receives this many
+    /// shards so that every device is utilised. Default: 1
     #[arg(long, default_value = "1")]
     pub ssd_cache_shards: std::num::NonZeroUsize,
 

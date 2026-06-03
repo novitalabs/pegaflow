@@ -62,7 +62,9 @@ pub struct SsdCacheConfig {
     pub cache_paths: Vec<PathBuf>,
     /// Total logical capacity of the cache (bytes).
     pub capacity_bytes: u64,
-    /// Number of cache files. 1 keeps the existing single-file SSD layout.
+    /// Number of cache files per path. 1 keeps the existing single-file SSD layout
+    /// when only one path is configured. With multiple paths each path receives this
+    /// many shards so that every device is utilised.
     pub shards: NonZeroUsize,
     /// Max pending write batches. New sealed blocks are dropped if the queue is full.
     pub write_queue_depth: usize,

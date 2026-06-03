@@ -22,10 +22,11 @@ const PREFETCH_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// Some containers restrict the `io_uring_setup` syscall via seccomp.
 fn io_uring_available() -> bool {
     unsafe {
+        let mut params = std::mem::MaybeUninit::<[u8; 128]>::zeroed();
         let fd = libc::syscall(
             libc::SYS_io_uring_setup,
             1i32,
-            std::ptr::null_mut::<libc::c_void>(),
+            params.as_mut_ptr() as *mut libc::c_void,
         );
         if fd >= 0 {
             libc::close(fd as i32);
@@ -99,7 +100,7 @@ fn ssd_multi_path_env(
             ssd_cache_config: Some(SsdCacheConfig {
                 cache_paths: vec![path0.clone(), path1.clone()],
                 capacity_bytes: SSD_CAPACITY,
-                shards: NonZeroUsize::new(4).unwrap(),
+                shards: NonZeroUsize::new(2).unwrap(),
                 ..SsdCacheConfig::default()
             }),
             ..StorageConfig::default()
@@ -272,19 +273,24 @@ async fn ssd_multi_path_prefetch_roundtrip_after_eviction() {
     skip_without_io_uring!();
     let (env, cache_paths, _temp_dir) = ssd_multi_path_env("test-ssd-multi-path");
 
-    for (shard_id, path) in cache_paths.iter().enumerate().take(4) {
-        let shard_path = path.join(format!("shard-{shard_id:06}.dat"));
-        assert!(
-            shard_path.is_file(),
-            "shard {shard_id} should be on path {}",
-            path.display()
-        );
-        let file_meta = std::fs::metadata(&shard_path).expect("SSD shard file should be created");
-        assert_eq!(
-            file_meta.len(),
-            SSD_CAPACITY / 4,
-            "SSD shard file should be preallocated"
-        );
+    let shards_per_path = 2;
+    for (path_id, path) in cache_paths.iter().enumerate() {
+        for local_shard in 0..shards_per_path {
+            let global_shard_id = path_id * shards_per_path + local_shard;
+            let shard_path = path.join(format!("shard-{global_shard_id:06}.dat"));
+            assert!(
+                shard_path.is_file(),
+                "shard {global_shard_id} should be on path {}",
+                path.display()
+            );
+            let file_meta =
+                std::fs::metadata(&shard_path).expect("SSD shard file should be created");
+            assert_eq!(
+                file_meta.len(),
+                SSD_CAPACITY / 4,
+                "SSD shard file should be preallocated"
+            );
+        }
     }
 
     let target = env.hashes(1);
