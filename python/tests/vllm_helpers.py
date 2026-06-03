@@ -10,6 +10,7 @@ import signal
 import socket
 import subprocess
 import time
+from contextlib import suppress
 from pathlib import Path
 
 import requests
@@ -226,6 +227,36 @@ def fetch_pegaflow_metrics(metrics_port: int) -> dict[str, float]:
     return metrics
 
 
+def fetch_pegaflow_rpc_failures(metrics_port: int, method: str | None = None) -> dict[str, float]:
+    """Return non-ok RPC counts keyed by ``"method/status"``.
+
+    ``fetch_pegaflow_metrics`` collapses label sets, so it cannot tell a failed
+    RPC from a successful one. This keeps the ``method``/``status`` labels so a
+    test can assert that no connector<->server RPC failed. Pass ``method`` to
+    restrict to one RPC; ``None`` (default) reports failures across all methods.
+    """
+    url = f"http://localhost:{metrics_port}/metrics"
+    response = requests.get(url, timeout=5)
+    response.raise_for_status()
+
+    failures: dict[str, float] = {}
+    for line in response.text.splitlines():
+        if not line.startswith("pegaflow_rpc_requests"):
+            continue
+        match = re.match(r"^pegaflow_rpc_requests(?:_total)?\{([^}]*)\}\s+([\d.eE+-]+)$", line)
+        if not match:
+            continue
+        labels = dict(re.findall(r'(\w+)="([^"]*)"', match.group(1)))
+        if labels.get("status") == "ok":
+            continue
+        rpc = labels.get("method", "")
+        if method is not None and rpc != method:
+            continue
+        key = f"{rpc}/{labels.get('status', '')}"
+        failures[key] = failures.get(key, 0.0) + float(match.group(2))
+    return failures
+
+
 def check_pegaflow_server(metrics_port: int) -> bool:
     """Check if PegaFlow server is running and metrics endpoint is available."""
     try:
@@ -256,11 +287,15 @@ class PegaFlowServer:
         pool_size: str = "30gb",
         log_level: str | None = None,
         cargo_features: list[str] | None = None,
+        transfer_backend: str = "direct",
+        use_hugepages: bool = False,
     ):
         self.grpc_port = find_available_port()
         self.http_port = find_available_port()
         self.pool_size = pool_size
         self.log_level = log_level
+        self.transfer_backend = transfer_backend
+        self.use_hugepages = use_hugepages
         self.cargo_features = (
             cargo_features if cargo_features is not None else _detect_pegaflow_cargo_features()
         )
@@ -294,9 +329,13 @@ class PegaFlowServer:
                 f"0.0.0.0:{self.http_port}",
                 "--pool-size",
                 self.pool_size,
+                "--transfer-backend",
+                self.transfer_backend,
                 "--enable-prometheus",
             ]
         )
+        if self.use_hugepages:
+            cmd.append("--use-hugepages")
         if self.log_level is not None:
             cmd.extend(["--log-level", self.log_level])
 
@@ -317,6 +356,7 @@ class PegaFlowServer:
         feature_label = ",".join(self.cargo_features) or "default"
         print(
             f"\n[PegaFlow Server] cargo run -r features={feature_label} "
+            f"transfer_backend={self.transfer_backend} "
             f"on gRPC={self.grpc_port}, HTTP={self.http_port}"
         )
 
@@ -367,11 +407,15 @@ class PegaFlowServer:
             print("\n[PegaFlow Server] Stopping...")
             try:
                 os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
-                self.process.wait(timeout=10)
+                self.process.wait(timeout=30)
             except (subprocess.TimeoutExpired, ProcessLookupError, OSError):
                 if self.process:
-                    os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
-                    self.process.wait(timeout=5)
+                    with suppress(ProcessLookupError, OSError):
+                        os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
+                    try:
+                        self.process.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        print("pegaflow-server did not exit after SIGKILL")
             print("pegaflow-server stopped.\n")
         if self.log_handle:
             self.log_handle.close()

@@ -118,6 +118,17 @@ impl GrpcEngineService {
     }
 
     fn validate_register_context_request(req: &RegisterContextRequest) -> Result<(), Status> {
+        let server_version = env!("CARGO_PKG_VERSION");
+        if req.client_version != server_version {
+            return Err(Status::failed_precondition(format!(
+                "PegaFlow version mismatch: client={} server={server_version}",
+                if req.client_version.is_empty() {
+                    "<missing>"
+                } else {
+                    &req.client_version
+                }
+            )));
+        }
         Self::validate_device_id(req.device_id)?;
         if req.num_layers == 0 {
             return Err(Status::invalid_argument("num_layers must be > 0"));
@@ -1035,6 +1046,7 @@ mod tests {
         let err = GrpcEngineService::validate_register_context_request(&RegisterContextRequest {
             instance_id: "instance".to_string(),
             namespace: "namespace".to_string(),
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
             tp_rank: 1,
             tp_size: 1,
             world_size: 1,
@@ -1052,6 +1064,36 @@ mod tests {
 
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("tp_rank"));
+    }
+
+    #[test]
+    fn validate_register_context_rejects_client_version_mismatch() {
+        let err = GrpcEngineService::validate_register_context_request(&RegisterContextRequest {
+            instance_id: "instance".to_string(),
+            namespace: "namespace".to_string(),
+            client_version: "0.0.0-test-mismatch".to_string(),
+            tp_rank: 0,
+            tp_size: 1,
+            world_size: 1,
+            device_id: 0,
+            num_layers: 1,
+            layer_names: Vec::new(),
+            wrapper_bytes: Vec::new(),
+            num_blocks: Vec::new(),
+            bytes_per_block: Vec::new(),
+            kv_stride_bytes: Vec::new(),
+            segments: Vec::new(),
+            pp_rank: 0,
+        })
+        .expect_err("client/server version mismatch must be rejected before registration");
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("PegaFlow version mismatch"));
+        assert!(err.message().contains("client=0.0.0-test-mismatch"));
+        assert!(
+            err.message()
+                .contains(concat!("server=", env!("CARGO_PKG_VERSION")))
+        );
     }
 
     #[test]

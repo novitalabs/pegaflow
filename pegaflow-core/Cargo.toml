@@ -8,8 +8,8 @@ workspace = true
 
 [features]
 default = ["cuda-12", "rdma"]
-cuda-12 = ["cudarc/cuda-12080", "pegaflow-transfer?/cuda-12"]
-cuda-13 = ["cudarc/cuda-13000", "pegaflow-transfer?/cuda-13"]
+cuda-12 = ["cudarc/cuda-12080", "cudarc/nvrtc", "pegaflow-transfer?/cuda-12"]
+cuda-13 = ["cudarc/cuda-13000", "cudarc/nvrtc", "pegaflow-transfer?/cuda-13"]
 rdma = ["dep:pegaflow-transfer"]
 tracing = ["fastrace"]
 
@@ -50,10 +50,6 @@ tokio-stream = { workspace = true, features = ["net"] }
 tempfile = "3"
 
 [[bench]]
-name = "transfer_batch"
-harness = false
-
-[[bench]]
 name = "pinned_copy"
 harness = false
 
@@ -67,6 +63,7 @@ harness = false
 
 [[bench]]
 name = "ssd_multi_path"
+name = "transfer_h2d"
 harness = false
 
 [[example]]

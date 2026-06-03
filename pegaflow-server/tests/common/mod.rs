@@ -166,11 +166,22 @@ impl MockVllmRpcHarness {
         worker_index: usize,
         hashes: &[Vec<u8>],
     ) -> RpcExchange<SaveRequest, SaveResponse> {
+        let exchange = self
+            .save_blocks_for_worker_no_wait(worker_index, hashes)
+            .await;
+        self.wait_for_saved_blocks(hashes).await;
+        exchange
+    }
+
+    pub(crate) async fn save_blocks_for_worker_no_wait(
+        &mut self,
+        worker_index: usize,
+        hashes: &[Vec<u8>],
+    ) -> RpcExchange<SaveRequest, SaveResponse> {
         match self.try_save_blocks_for_worker(worker_index, hashes).await {
             Ok(exchange) => {
                 let status = exchange.response.status.as_ref().expect("save status");
                 assert!(status.ok, "save RPC failed: {}", status.message);
-                self.wait_for_saved_blocks(hashes).await;
                 exchange
             }
             Err(err) => panic!("save rpc failed unexpectedly: {}", err.status),

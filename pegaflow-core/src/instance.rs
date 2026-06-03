@@ -15,7 +15,7 @@ use std::{
 use cudarc::driver::CudaContext;
 use log::info;
 
-use crate::{EngineError, gpu_worker::GpuWorkerPool};
+use crate::{EngineError, TransferMode, gpu_worker::GpuWorkerPool};
 use pegaflow_common::NumaNode;
 
 /// Layer metadata protected by a single mutex.
@@ -189,9 +189,10 @@ impl GpuContext {
         tp_rank: usize,
         pp_rank: usize,
         numa_node: NumaNode,
+        transfer_mode: TransferMode,
         kv_caches: HashMap<String, KVCacheRegistration>,
     ) -> Result<Self, EngineError> {
-        let worker_pool = GpuWorkerPool::spawn(device_id, numa_node)?;
+        let worker_pool = GpuWorkerPool::spawn(device_id, numa_node, transfer_mode)?;
 
         Ok(Self {
             tp_rank,
@@ -366,6 +367,7 @@ impl InstanceContext {
         tp_rank: usize,
         pp_rank: usize,
         numa_node: NumaNode,
+        transfer_mode: TransferMode,
         kv_caches: HashMap<String, KVCacheRegistration>,
     ) -> Result<Arc<GpuContext>, EngineError> {
         if device_id < 0 {
@@ -391,7 +393,13 @@ impl InstanceContext {
             .map_err(|e| EngineError::CudaInit(format!("{e:?}")))?;
 
         let ctx = Arc::new(GpuContext::new(
-            cuda_ctx, device_id, tp_rank, pp_rank, numa_node, kv_caches,
+            cuda_ctx,
+            device_id,
+            tp_rank,
+            pp_rank,
+            numa_node,
+            transfer_mode,
+            kv_caches,
         )?);
 
         // Insert and return
@@ -453,6 +461,7 @@ impl InstanceContext {
         tp_rank: usize,
         pp_rank: usize,
         numa_node: NumaNode,
+        transfer_mode: TransferMode,
         kv_caches: HashMap<String, KVCacheRegistration>,
     ) -> Result<(), EngineError> {
         if tp_rank >= self.tp_size {
@@ -464,7 +473,14 @@ impl InstanceContext {
         for layer_name in kv_caches.keys() {
             self.get_or_allocate_layer_id(layer_name);
         }
-        self.create_gpu(device_id, tp_rank, pp_rank, numa_node, kv_caches)?;
+        self.create_gpu(
+            device_id,
+            tp_rank,
+            pp_rank,
+            numa_node,
+            transfer_mode,
+            kv_caches,
+        )?;
         Ok(())
     }
 
@@ -627,7 +643,7 @@ mod tests {
 
         // 3. Register all layers at once
         instance
-            .register_new_gpu(0, 0, 0, numa, kv_caches)
+            .register_new_gpu(0, 0, 0, numa, TransferMode::Direct, kv_caches)
             .expect("register gpu with layers");
 
         // 4. Verify topology checking
@@ -644,7 +660,7 @@ mod tests {
             KVCacheRegistration::new(0x2000, 1024 * 1024, 100, 1024, 0, 1).unwrap(),
         )]);
         let err = instance
-            .register_new_gpu(0, 0, 0, numa, dup_caches)
+            .register_new_gpu(0, 0, 0, numa, TransferMode::Direct, dup_caches)
             .expect_err("duplicate GPU registration should fail");
         assert!(err.to_string().contains("already exists"));
 

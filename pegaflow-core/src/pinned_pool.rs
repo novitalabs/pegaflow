@@ -17,11 +17,48 @@ use crate::metrics::core_metrics;
 use crate::pinned_mem::PinnedMemory;
 use pegaflow_common::{NumaNode, run_on_numa};
 
+#[derive(Clone, Copy)]
+pub(crate) struct MappedPinnedPtr {
+    host: NonNull<u8>,
+    device: NonNull<u8>,
+}
+
+// SAFETY: Both pointers identify the same CUDA pinned allocation. Ownership is
+// carried separately by PinnedAllocation/RawBlock/LayerAlloc, and this value is
+// only an address pair used to build CUDA copy descriptors.
+unsafe impl Send for MappedPinnedPtr {}
+unsafe impl Sync for MappedPinnedPtr {}
+
+impl MappedPinnedPtr {
+    pub(crate) fn new(host: NonNull<u8>, device: NonNull<u8>) -> Self {
+        Self { host, device }
+    }
+
+    pub(crate) fn host(self) -> NonNull<u8> {
+        self.host
+    }
+
+    pub(crate) fn device(self) -> NonNull<u8> {
+        self.device
+    }
+
+    pub(crate) fn add(self, offset: usize) -> Self {
+        // SAFETY: callers create offsets from validated allocation/segment ranges.
+        unsafe {
+            Self {
+                host: NonNull::new_unchecked(self.host.as_ptr().add(offset)),
+                device: NonNull::new_unchecked(self.device.as_ptr().add(offset)),
+            }
+        }
+    }
+}
+
 /// RAII guard for a pinned memory allocation.
 /// Automatically frees the allocation when dropped.
 pub struct PinnedAllocation {
     allocation: Allocation,
     ptr: NonNull<u8>,
+    device_ptr: NonNull<u8>,
     pool: Arc<PinnedMemoryPool>,
 }
 
@@ -37,14 +74,38 @@ impl PinnedAllocation {
         self.ptr.as_ptr()
     }
 
-    /// Get a mutable pointer to the allocated memory
-    pub(crate) fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.ptr.as_ptr()
-    }
-
     /// Get the underlying NonNull pointer.
+    #[cfg_attr(not(feature = "rdma"), allow(dead_code))]
     pub(crate) fn as_non_null(&self) -> NonNull<u8> {
         self.ptr
+    }
+
+    pub(crate) fn mapped_ptr(&self) -> MappedPinnedPtr {
+        MappedPinnedPtr::new(self.ptr, self.device_ptr)
+    }
+
+    pub(crate) fn mapped_ptr_at(&self, offset: usize, size: usize) -> MappedPinnedPtr {
+        let alloc_size = self.allocation.size_bytes.get() as usize;
+        assert!(
+            offset
+                .checked_add(size)
+                .is_some_and(|end| end <= alloc_size),
+            "mapped device pointer range exceeds pinned allocation"
+        );
+        self.mapped_ptr().add(offset)
+    }
+
+    pub(crate) fn mapped_ptr_for_host_range(
+        &self,
+        host_ptr: NonNull<u8>,
+        size: usize,
+    ) -> MappedPinnedPtr {
+        let base = self.ptr.as_ptr() as usize;
+        let host = host_ptr.as_ptr() as usize;
+        let offset = host
+            .checked_sub(base)
+            .expect("host pointer is before pinned allocation base");
+        self.mapped_ptr_at(offset, size)
     }
 }
 
@@ -113,9 +174,9 @@ impl PinnedMemoryPool {
             PinnedMemory::allocate_regular(pool_size, node)
                 .expect("Failed to allocate regular pinned memory pool")
         } else {
-            info!("Allocating pinned memory pool with write-combined pages");
-            PinnedMemory::allocate_write_combined(pool_size)
-                .expect("Failed to allocate pinned memory pool")
+            info!("Allocating pinned memory pool with cudaHostAlloc mapped pages");
+            PinnedMemory::allocate_cuda_host_alloc(pool_size)
+                .expect("Failed to allocate mapped pinned memory pool")
         };
 
         let actual_size = backing.size() as u64;
@@ -196,7 +257,10 @@ impl PinnedMemoryPool {
 
         let offset = allocation.offset_bytes as usize;
         let ptr = unsafe { self.backing.as_ptr().add(offset) };
+        let device_ptr = unsafe { self.backing.device_ptr().as_ptr().add(offset) };
         let ptr = NonNull::new(ptr as *mut u8).expect("PinnedMemoryPool returned null pointer");
+        let device_ptr =
+            NonNull::new(device_ptr).expect("PinnedMemoryPool returned null device pointer");
 
         if let Ok(size_i64) = i64::try_from(size_bytes) {
             core_metrics().pool_used_bytes.add(size_i64, &[]);
@@ -205,6 +269,7 @@ impl PinnedMemoryPool {
         Some(PinnedAllocation {
             allocation,
             ptr,
+            device_ptr,
             pool: Arc::clone(self),
         })
     }

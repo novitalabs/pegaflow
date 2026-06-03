@@ -7,7 +7,7 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::pinned_pool::PinnedAllocation;
+use crate::pinned_pool::{MappedPinnedPtr, PinnedAllocation};
 use pegaflow_common::NumaNode;
 
 // ============================================================================
@@ -60,7 +60,7 @@ impl fmt::Debug for PrefetchStatus {
 
 /// A single contiguous memory segment in pinned memory.
 pub(crate) struct Segment {
-    ptr: NonNull<u8>,
+    ptr: MappedPinnedPtr,
     size: usize,
     /// Held for RAII drop semantics -- memory freed when last Arc drops.
     _allocation: Arc<PinnedAllocation>,
@@ -68,6 +68,7 @@ pub(crate) struct Segment {
 
 impl Segment {
     pub(crate) fn new(ptr: NonNull<u8>, size: usize, allocation: Arc<PinnedAllocation>) -> Self {
+        let ptr = allocation.mapped_ptr_for_host_range(ptr, size);
         Self {
             ptr,
             size,
@@ -159,6 +160,11 @@ impl RawBlock {
 
     /// Get segment pointer by index.
     pub(crate) fn segment_ptr(&self, index: usize) -> Option<NonNull<u8>> {
+        self.segments.as_slice().get(index).map(|s| s.ptr.host())
+    }
+
+    /// Get mapped host/device pointer pair by index.
+    pub(crate) fn segment_mapped_ptr(&self, index: usize) -> Option<MappedPinnedPtr> {
         self.segments.as_slice().get(index).map(|s| s.ptr)
     }
 
@@ -169,7 +175,10 @@ impl RawBlock {
 
     /// Iterator over (NonNull<u8>, size) pairs -- used for SSD I/O.
     pub(crate) fn segment_iovecs(&self) -> impl Iterator<Item = (NonNull<u8>, usize)> + '_ {
-        self.segments.as_slice().iter().map(|s| (s.ptr, s.size))
+        self.segments
+            .as_slice()
+            .iter()
+            .map(|s| (s.ptr.host(), s.size))
     }
 
     /// Total memory footprint.

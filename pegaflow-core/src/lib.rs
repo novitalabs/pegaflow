@@ -45,6 +45,7 @@ pub use seal_offload::SlotMeta;
 pub use storage::{DEFAULT_RDMA_QPS_PER_PEER, MemoryCacheCleanupStats, StorageConfig};
 pub use sync_state::{LoadState, LoadStateError};
 pub use trace::{set_trace_sample_rate, should_sample};
+pub use transfer::TransferMode;
 
 use std::{
     collections::HashMap,
@@ -121,6 +122,8 @@ pub struct PegaEngine {
     topology: Arc<NumaTopology>,
     /// Query-ready blocks owned by opaque scheduler leases.
     query_leases: QueryLeaseManager,
+    /// H2D/D2H transfer backend used by GPU worker pools.
+    transfer_mode: TransferMode,
 }
 
 impl PegaEngine {
@@ -137,6 +140,7 @@ impl PegaEngine {
         topology.log_summary();
 
         let config = storage_config;
+        let transfer_mode = config.transfer_mode;
         let numa_nodes: Vec<NumaNode> = if config.enable_numa_affinity && topology.is_multi_numa() {
             let gpu_numa_nodes = topology.gpu_numa_nodes();
             if gpu_numa_nodes.is_empty() {
@@ -165,6 +169,7 @@ impl PegaEngine {
             storage,
             topology,
             query_leases: QueryLeaseManager::default(),
+            transfer_mode,
         })
     }
 
@@ -300,7 +305,14 @@ impl PegaEngine {
         }
 
         // Register GPU with all layers
-        instance.register_new_gpu(device_id, tp_rank, pp_rank, numa_node, kv_caches)?;
+        instance.register_new_gpu(
+            device_id,
+            tp_rank,
+            pp_rank,
+            numa_node,
+            self.transfer_mode,
+            kv_caches,
+        )?;
 
         info!(
             "Registered context batch: instance={instance_id}, namespace={namespace}, \

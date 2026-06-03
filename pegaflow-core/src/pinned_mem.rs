@@ -3,18 +3,17 @@
 //! Three strategies, all returning DMA-pinned memory:
 //!
 //! 1. **Regular** (`allocate_regular`): lazy `mmap` + parallel page pre-touch +
-//!    `cudaHostRegister`. Each touch thread is pinned to the target NUMA node
-//!    so first-touch places every page on that node's local memory.
+//!    mapped `cudaHostRegister`. Each touch thread is pinned to the target NUMA
+//!    node so first-touch places every page on that node's local memory.
 //!
 //! 2. **HugePages** (`allocate_hugepages`): `mmap(MAP_HUGETLB)` + parallel
-//!    pre-touch + `cudaHostRegister`. Same NUMA-aware touch. Requires reserved
-//!    hugepages:
+//!    pre-touch + mapped `cudaHostRegister`. Same NUMA-aware touch. Requires
+//!    reserved hugepages:
 //!    ```bash
 //!    sudo sh -c 'echo 15360 > /proc/sys/vm/nr_hugepages'  # 30GB at 2MB pages
 //!    ```
 //!
-//! 3. **WriteCombined** (`allocate_write_combined`): `cudaHostAlloc` with WC
-//!    flag. CPU reads are extremely slow — don't use when SSD offload is on.
+//! 3. **CudaHostAlloc** (`allocate_cuda_host_alloc`): mapped `cudaHostAlloc`.
 //!    NUMA placement follows the calling thread's affinity (caller is expected
 //!    to wrap with `run_on_numa`).
 //!
@@ -70,6 +69,8 @@ pub(crate) enum PinnedMemError {
     CudaAllocFailed(rt::cudaError),
     /// cudaHostRegister failed
     CudaRegisterFailed(rt::cudaError),
+    /// cudaHostGetDevicePointer failed
+    CudaGetDevicePointerFailed(rt::cudaError),
     /// Size must be greater than zero
     ZeroSize,
     /// Failed to determine huge page size from /proc/meminfo
@@ -82,6 +83,9 @@ impl std::fmt::Display for PinnedMemError {
             Self::MmapFailed(e) => write!(f, "mmap failed: {}", e),
             Self::CudaAllocFailed(e) => write!(f, "cudaHostAlloc failed: {:?}", e),
             Self::CudaRegisterFailed(e) => write!(f, "cudaHostRegister failed: {:?}", e),
+            Self::CudaGetDevicePointerFailed(e) => {
+                write!(f, "cudaHostGetDevicePointer failed: {:?}", e)
+            }
             Self::ZeroSize => write!(f, "size must be greater than zero"),
             Self::HugePageSizeUnavailable => write!(
                 f,
@@ -96,13 +100,12 @@ impl std::error::Error for PinnedMemError {}
 /// Allocation strategy for pinned memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AllocStrategy {
-    /// `mmap` + parallel pre-touch + `cudaHostRegister`.
+    /// `mmap` + parallel pre-touch + mapped `cudaHostRegister`.
     /// Safe for both CPU reads and writes; use when SSD offload is enabled.
     Regular,
-    /// `cudaHostAlloc` with write-combined flag.
-    /// Fast for CPU→GPU (write-only) workloads, but CPU reads are extremely slow.
-    WriteCombined,
-    /// `mmap(MAP_HUGETLB)` + parallel pre-touch + `cudaHostRegister`.
+    /// Mapped `cudaHostAlloc`.
+    CudaHostAlloc,
+    /// `mmap(MAP_HUGETLB)` + parallel pre-touch + mapped `cudaHostRegister`.
     /// Requires reserved hugepages.
     HugePages,
 }
@@ -112,6 +115,7 @@ pub(crate) enum AllocStrategy {
 /// Memory is automatically freed/unmapped and unregistered when dropped.
 pub(crate) struct PinnedMemory {
     ptr: NonNull<u8>,
+    device_ptr: NonNull<u8>,
     size: usize,
     strategy: AllocStrategy,
 }
@@ -120,6 +124,7 @@ impl std::fmt::Debug for PinnedMemory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PinnedMemory")
             .field("ptr", &format!("{:p}", self.ptr.as_ptr()))
+            .field("device_ptr", &format!("{:p}", self.device_ptr.as_ptr()))
             .field("size", &self.size)
             .field("strategy", &self.strategy)
             .finish()
@@ -145,26 +150,34 @@ impl PinnedMemory {
         Self::allocate_mmap_register(size, AllocStrategy::Regular, node)
     }
 
-    /// Allocate write-combined pinned memory via `cudaHostAlloc`.
+    /// Allocate mapped pinned memory via `cudaHostAlloc`.
     ///
-    /// Fast for CPU→GPU transfers but CPU reads are extremely slow.
-    /// Do NOT use when SSD offload is enabled. NUMA placement follows the
-    /// calling thread's affinity at allocation time.
-    pub(crate) fn allocate_write_combined(size: usize) -> Result<Self, PinnedMemError> {
+    /// NUMA placement follows the calling thread's affinity at allocation time.
+    pub(crate) fn allocate_cuda_host_alloc(size: usize) -> Result<Self, PinnedMemError> {
         if size == 0 {
             return Err(PinnedMemError::ZeroSize);
         }
         let mut ptr: *mut libc::c_void = std::ptr::null_mut();
+        let flags = rt::cudaHostAllocMapped;
         // SAFETY: ptr is a valid stack pointer; size is validated non-zero above.
-        let result = unsafe { rt::cudaHostAlloc(&mut ptr, size, rt::cudaHostAllocWriteCombined) };
+        let result = unsafe { rt::cudaHostAlloc(&mut ptr, size, flags) };
         if result != rt::cudaError::cudaSuccess {
             return Err(PinnedMemError::CudaAllocFailed(result));
         }
         let ptr = NonNull::new(ptr as *mut u8).expect("cudaHostAlloc returned null");
+        let device_ptr = match mapped_device_pointer(ptr) {
+            Ok(device_ptr) => device_ptr,
+            Err(err) => {
+                // SAFETY: ptr was returned by cudaHostAlloc above.
+                unsafe { rt::cudaFreeHost(ptr.as_ptr() as *mut libc::c_void) };
+                return Err(err);
+            }
+        };
         Ok(Self {
             ptr,
+            device_ptr,
             size,
-            strategy: AllocStrategy::WriteCombined,
+            strategy: AllocStrategy::CudaHostAlloc,
         })
     }
 
@@ -205,8 +218,8 @@ impl PinnedMemory {
                 )
             }
             AllocStrategy::Regular => (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, size),
-            AllocStrategy::WriteCombined => {
-                unreachable!("WriteCombined does not use the mmap path")
+            AllocStrategy::CudaHostAlloc => {
+                unreachable!("CudaHostAlloc does not use the mmap path")
             }
         };
 
@@ -229,8 +242,7 @@ impl PinnedMemory {
         parallel_pre_touch(ptr.cast::<u8>(), aligned_size, node);
 
         // SAFETY: ptr is a valid mapping of aligned_size bytes (checked above).
-        let result =
-            unsafe { rt::cudaHostRegister(ptr, aligned_size, rt::cudaHostRegisterDefault) };
+        let result = unsafe { rt::cudaHostRegister(ptr, aligned_size, rt::cudaHostRegisterMapped) };
         if result != rt::cudaError::cudaSuccess {
             // SAFETY: ptr was successfully mmap'd above.
             unsafe { libc::munmap(ptr, aligned_size) };
@@ -238,8 +250,20 @@ impl PinnedMemory {
         }
 
         let ptr = NonNull::new(ptr as *mut u8).expect("mmap returned null");
+        let device_ptr = match mapped_device_pointer(ptr) {
+            Ok(device_ptr) => device_ptr,
+            Err(err) => {
+                // SAFETY: ptr was successfully registered and mmap'd above.
+                unsafe {
+                    rt::cudaHostUnregister(ptr.as_ptr() as *mut libc::c_void);
+                    libc::munmap(ptr.as_ptr() as *mut libc::c_void, aligned_size);
+                }
+                return Err(err);
+            }
+        };
         Ok(Self {
             ptr,
+            device_ptr,
             size: aligned_size,
             strategy,
         })
@@ -251,6 +275,10 @@ impl PinnedMemory {
         self.ptr.as_ptr()
     }
 
+    pub(crate) fn device_ptr(&self) -> NonNull<u8> {
+        self.device_ptr
+    }
+
     /// Get the size of the allocation in bytes.
     ///
     /// This is the aligned size, which may be larger than the requested size.
@@ -260,10 +288,22 @@ impl PinnedMemory {
     }
 }
 
+fn mapped_device_pointer(host_ptr: NonNull<u8>) -> Result<NonNull<u8>, PinnedMemError> {
+    let mut device_ptr: *mut libc::c_void = std::ptr::null_mut();
+    // SAFETY: host_ptr is mapped pinned memory allocated/registered by CUDA.
+    let result = unsafe {
+        rt::cudaHostGetDevicePointer(&mut device_ptr, host_ptr.as_ptr() as *mut libc::c_void, 0)
+    };
+    if result != rt::cudaError::cudaSuccess {
+        return Err(PinnedMemError::CudaGetDevicePointerFailed(result));
+    }
+    Ok(NonNull::new(device_ptr as *mut u8).expect("cudaHostGetDevicePointer returned null"))
+}
+
 impl Drop for PinnedMemory {
     fn drop(&mut self) {
         match self.strategy {
-            AllocStrategy::WriteCombined => {
+            AllocStrategy::CudaHostAlloc => {
                 // SAFETY: ptr was allocated with cudaHostAlloc.
                 let result = unsafe { rt::cudaFreeHost(self.ptr.as_ptr() as *mut libc::c_void) };
                 if result != rt::cudaError::cudaSuccess
@@ -361,13 +401,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_allocate_write_combined() {
+    fn test_allocate_cuda_host_alloc() {
         // Skip if no CUDA context available
         if cudarc::driver::CudaContext::new(0).is_err() {
             return;
         }
 
-        let mem = PinnedMemory::allocate_write_combined(4096).unwrap();
+        let mem = PinnedMemory::allocate_cuda_host_alloc(4096).unwrap();
         assert!(mem.size() >= 4096);
     }
 
@@ -384,7 +424,7 @@ mod tests {
     #[test]
     fn test_zero_size_fails() {
         assert!(matches!(
-            PinnedMemory::allocate_write_combined(0),
+            PinnedMemory::allocate_cuda_host_alloc(0),
             Err(PinnedMemError::ZeroSize)
         ));
         assert!(matches!(

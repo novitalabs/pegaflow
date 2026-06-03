@@ -30,6 +30,7 @@ from .vllm_helpers import (
     VLLMServer,
     call_openai_api,
     fetch_pegaflow_metrics,
+    fetch_pegaflow_rpc_failures,
 )
 
 # ---------------------------------------------------------------------------
@@ -225,9 +226,20 @@ class TestE2ECorrectness:
         return tmp_path_factory.mktemp("e2e_logs")
 
     @pytest.fixture(scope="class")
-    def pegaflow_server(self, log_dir: Path):
+    def pegaflow_server(
+        self,
+        log_dir: Path,
+        pegaflow_transfer_backend: str,
+        pegaflow_use_hugepages: bool,
+        pegaflow_pool_size: str,
+    ):
         """Auto-start pegaflow-server with prometheus metrics."""
-        with PegaFlowServer(log_file=log_dir / "pegaflow-server.log") as server:
+        with PegaFlowServer(
+            log_file=log_dir / "pegaflow-server.log",
+            pool_size=pegaflow_pool_size,
+            transfer_backend=pegaflow_transfer_backend,
+            use_hugepages=pegaflow_use_hugepages,
+        ) as server:
             yield server
 
     @pytest.fixture(scope="class")
@@ -342,4 +354,43 @@ class TestE2ECorrectness:
         print(
             f"\n[Metrics] saves={insertions:.0f} blocks ({save_bytes / 1e6:.1f}MB), "
             f"hits={hits:.0f} blocks ({load_bytes / 1e6:.1f}MB)"
+        )
+
+    def test_no_data_path_rpc_failures(self, pegaflow_results, pegaflow_server: PegaFlowServer):
+        """Every connector<->server RPC must return ok during a correct run.
+
+        Generalizes the 0.22.5 empty-lease regression: that bug surfaced as
+        release/"Client specified an invalid argument" on every cache miss, but
+        the same gate also catches a failed load, save, or query_prefetch — none
+        of which the output-equality test reliably exposes.
+
+        The miss guard makes the gate non-vacuous: it proves the plan actually
+        drove the zero-hit path the bug lived on, so a green run means something.
+        """
+        # pegaflow_results forces the real cache plan to run against this server.
+        del pegaflow_results
+        counters = fetch_pegaflow_metrics(pegaflow_server.metrics_port)
+        assert counters.get("pegaflow_cache_block_misses_total", 0) > 0, (
+            "execution plan exercised no cache miss; the RPC-health gate would be vacuous"
+        )
+        failures = fetch_pegaflow_rpc_failures(pegaflow_server.metrics_port)
+        assert not failures, f"non-ok data-path RPCs during run: {failures}"
+
+    def test_no_kv_load_failures(self, pegaflow_results, pegaflow_server: PegaFlowServer):
+        """KV loads must not fail.
+
+        A load failure is silently masked by test_execution_plan_outputs_match_baseline:
+        vLLM reports the failed blocks via get_block_ids_with_load_errors and
+        recomputes them locally, so the final text still matches baseline. Only
+        the failure counter exposes it, which is why this is a separate gate.
+        """
+        del pegaflow_results
+        counters = fetch_pegaflow_metrics(pegaflow_server.metrics_port)
+        loads_happened = (
+            counters.get("pegaflow_cache_block_hits_total", 0) > 0
+            or counters.get("pegaflow_load_bytes_total", 0) > 0
+        )
+        assert loads_happened, "plan performed no KV load; cannot assert load health"
+        assert counters.get("pegaflow_load_failures_total", 0) == 0, (
+            f"KV load failures during run: {counters.get('pegaflow_load_failures_total')}"
         )

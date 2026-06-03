@@ -544,6 +544,21 @@ def max_model_len(request) -> int | None:
     return request.config.getoption("--max-model-len")
 
 
+@pytest.fixture(scope="module")
+def pegaflow_transfer_backend(request) -> str:
+    return request.config.getoption("--pegaflow-transfer-backend")
+
+
+@pytest.fixture(scope="module")
+def pegaflow_use_hugepages(request) -> bool:
+    return request.config.getoption("--pegaflow-use-hugepages")
+
+
+@pytest.fixture(scope="module")
+def pegaflow_pool_size(request) -> str:
+    return request.config.getoption("--pegaflow-pool-size")
+
+
 # =============================================================================
 # Pytest Configuration
 # =============================================================================
@@ -591,6 +606,25 @@ def pytest_addoption(parser):
         default=None,
         type=int,
         help="Max model length for vLLM servers (e.g. 16384 for large models on small GPUs)",
+    )
+    parser.addoption(
+        "--pegaflow-transfer-backend",
+        action="store",
+        default="direct",
+        choices=("direct", "kernel"),
+        help="PegaFlow server H2D/D2H transfer backend for E2E tests",
+    )
+    parser.addoption(
+        "--pegaflow-use-hugepages",
+        action="store_true",
+        default=False,
+        help="Start pegaflow-server with --use-hugepages for E2E tests",
+    )
+    parser.addoption(
+        "--pegaflow-pool-size",
+        action="store",
+        default="30gb",
+        help="PegaFlow server pinned memory pool size for E2E tests",
     )
 
 

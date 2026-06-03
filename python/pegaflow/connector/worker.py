@@ -305,7 +305,11 @@ class WorkerConnector:
         )
 
         if not ok:
-            raise RuntimeError(f"Register context failed for {layer_name}: {message}")
+            if "PegaFlow version mismatch" in message:
+                raise RuntimeError(f"Register context failed: {message}")
+            raise RuntimeError(
+                f"Register context batch failed for layers {layer_names}: {message}"
+            )
 
         if split_layer_count:
             logger.info(

@@ -293,6 +293,7 @@ impl EngineRpcClient {
                 .register_context_batch(RegisterContextRequest {
                     instance_id,
                     namespace,
+                    client_version: env!("CARGO_PKG_VERSION").to_string(),
                     tp_rank,
                     tp_size,
                     world_size,
