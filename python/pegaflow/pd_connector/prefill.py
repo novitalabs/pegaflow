@@ -27,16 +27,26 @@ class PrefillHttpTask:
 
 
 class AsyncPrefillSender:
-    def __init__(self) -> None:
+    def __init__(self, worker_count: int = 16) -> None:
         self._queue: queue.Queue[PrefillHttpTask | None] = queue.Queue()
-        self._thread = threading.Thread(target=self._run, name="pd-prefill-sender", daemon=True)
-        self._thread.start()
+        self._worker_count = max(1, int(worker_count))
+        self._threads = [
+            threading.Thread(
+                target=self._run,
+                name=f"pd-prefill-sender-{idx}",
+                daemon=True,
+            )
+            for idx in range(self._worker_count)
+        ]
+        for thread in self._threads:
+            thread.start()
 
     def submit(self, task: PrefillHttpTask) -> None:
         self._queue.put(task)
 
     def close(self) -> None:
-        self._queue.put(None)
+        for _ in self._threads:
+            self._queue.put(None)
 
     def _run(self) -> None:
         while True:

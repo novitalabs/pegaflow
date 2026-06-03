@@ -784,6 +784,26 @@ def _prefill_http_task(request_id: str) -> PrefillHttpTask:
     )
 
 
+def test_async_prefill_sender_runs_requests_concurrently(monkeypatch) -> None:
+    entered: queue.Queue[str] = queue.Queue()
+    release = threading.Event()
+
+    def fake_post_prefill_request(task: PrefillHttpTask) -> None:
+        entered.put(task.request_id)
+        assert release.wait(timeout=2)
+
+    monkeypatch.setattr(prefill_mod, "post_prefill_request", fake_post_prefill_request)
+    sender = AsyncPrefillSender(worker_count=2)
+    try:
+        sender.submit(_prefill_http_task("req-1"))
+        sender.submit(_prefill_http_task("req-2"))
+
+        assert {entered.get(timeout=2), entered.get(timeout=2)} == {"req-1", "req-2"}
+    finally:
+        release.set()
+        sender.close()
+
+
 def test_p_worker_selects_matching_tp_rank_handshake() -> None:
     tensor = FakeTensor(
         shape=(2, 8, 16, 4, 32),
