@@ -119,6 +119,29 @@ def test_p_worker_save_kv_layer_noops_without_push_reqs() -> None:
     worker.save_kv_layer("unknown-layer", object(), None)
 
 
+def test_d_worker_idle_decode_step_skips_layer_hooks() -> None:
+    class LayoutsThatShouldNotBeRead(dict):
+        def __contains__(self, key: object) -> bool:
+            raise AssertionError("idle decode step should not inspect layouts")
+
+    worker = PdWorkerConnector(
+        SimpleNamespace(kv_transfer_config=SimpleNamespace(engine_id="decode")), rdma=MockRdmaPort()
+    )
+    worker.layouts = LayoutsThatShouldNotBeRead()
+    worker.start_load_kv(PdConnectorMetadata(), None)
+
+    worker._prefill.save_kv_layer = MagicMock(
+        side_effect=AssertionError("idle decode step should not delegate save")
+    )
+    worker._prefill.wait_for_save = MagicMock(
+        side_effect=AssertionError("idle decode step should not delegate wait_for_save")
+    )
+
+    worker.wait_for_layer_load("layer.0")
+    worker.save_kv_layer("layer.0", object(), None)
+    worker.wait_for_save()
+
+
 def test_d_worker_release_cancels_inflight_rdma_wait() -> None:
     class BlockingWaitRdma(MockRdmaPort):
         def __init__(self) -> None:
