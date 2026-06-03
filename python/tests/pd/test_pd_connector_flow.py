@@ -111,6 +111,14 @@ def test_pd_worker_get_finished_does_not_poll_wait_reqs() -> None:
     assert worker.get_finished(set()) == (None, {"req-1"})
 
 
+def test_p_worker_save_kv_layer_noops_without_push_reqs() -> None:
+    worker = PdWorkerConnector(
+        SimpleNamespace(kv_transfer_config=SimpleNamespace(engine_id="")), rdma=MockRdmaPort()
+    )
+
+    worker.save_kv_layer("unknown-layer", object(), None)
+
+
 def test_d_worker_release_cancels_inflight_rdma_wait() -> None:
     class BlockingWaitRdma(MockRdmaPort):
         def __init__(self) -> None:

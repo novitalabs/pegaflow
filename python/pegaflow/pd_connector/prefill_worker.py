@@ -120,6 +120,8 @@ class PrefillHandler:
         attn_metadata: Any,
         **kwargs: Any,
     ) -> None:
+        if not self._push_reqs:
+            return
         layout = self._w.layouts.get(layer_name)
         assert layout is not None, (
             f"PdConnector saw unknown layer {layer_name}; registered={list(self._w.layouts)}"
@@ -141,8 +143,6 @@ class PrefillHandler:
             f"PdConnector KV shape changed for {layer_name}: "
             f"registered={layout.shape} runtime={runtime_layout.shape}"
         )
-        if not self._push_reqs:
-            return
         import torch
 
         if torch.cuda.is_available():
@@ -207,6 +207,17 @@ class PrefillHandler:
     @property
     def push_reqs(self) -> dict[str, PushReqMeta]:
         return self._push_reqs
+
+    def has_state(self) -> bool:
+        return any(
+            (
+                self._push_reqs,
+                self._pending_push_chunks,
+                self._completed_pushes,
+                self._completed_physical_pushes,
+                self._producer_finished_req_ids,
+            )
+        ) or not (self._push_sender.is_idle() and self._push_finalizer.is_idle())
 
     def _push_pending_blocks(self, layer_name: str, event: Any) -> None:
         layer_idx = self._w._layer_idx(layer_name)
@@ -733,6 +744,10 @@ class _AsyncLayerPushSender:
     def close(self) -> None:
         self._queue.put(None)
 
+    def is_idle(self) -> bool:
+        with self._condition:
+            return self._inflight == 0 and self._error is None
+
     def _run(self) -> None:
         while True:
             task = self._queue.get()
@@ -797,6 +812,10 @@ class _AsyncPushFinalizer:
 
     def close(self) -> None:
         self._queue.put(None)
+
+    def is_idle(self) -> bool:
+        with self._condition:
+            return self._inflight == 0 and self._error is None
 
     def _run(self) -> None:
         while True:

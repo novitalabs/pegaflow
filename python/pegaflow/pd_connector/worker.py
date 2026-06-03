@@ -186,6 +186,13 @@ class PdWorkerConnector:
         self._prefill.wait_for_save()
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str] | None, set[str] | None]:
+        if (
+            not finished_req_ids
+            and self._decode.is_idle()
+            and not self._prefill.has_state()
+        ):
+            return None, None
+
         logger.debug(
             "[PdConnector] worker get_finished enter finished_req_ids=%s wait_reqs=%s push_reqs=%s",
             sorted(finished_req_ids),
