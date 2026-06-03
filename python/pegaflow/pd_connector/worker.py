@@ -56,6 +56,7 @@ class PdWorkerConnector:
         self.layer_names: list[str] = []
         self._registered_layers: dict[str, LayerRemoteLayout] = {}
         self._forward_step_id = 0
+        self._idle_decode_step = False
 
         self._decode = DecodeHandler(self, prefill_sender=prefill_sender)
         self._prefill = PrefillHandler(self)
@@ -143,6 +144,7 @@ class PdWorkerConnector:
         **kwargs: Any,
     ) -> None:
         self._forward_step_id += 1
+        self._idle_decode_step = False
         logger.debug(
             "[PdConnector] worker start_load_kv metadata=%s wait_reqs=%s push_reqs=%s release=%s known_wait=%s known_push=%s",
             metadata,
@@ -152,6 +154,16 @@ class PdWorkerConnector:
             sorted(self._decode.wait_reqs),
             sorted(self._prefill.push_reqs),
         )
+        if (
+            not metadata.reqs_to_wait
+            and not metadata.reqs_to_push
+            and not metadata.reqs_to_release
+            and self._decode.is_idle()
+            and not self._prefill.has_state()
+        ):
+            self._idle_decode_step = True
+            return
+
         assert self.rdma is not None, "PdConnector RDMA port is not initialized"
 
         self._decode.process_wait_reqs(metadata.reqs_to_wait)
@@ -168,6 +180,8 @@ class PdWorkerConnector:
                 self.rdma.close_request(req_id)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
+        if self._idle_decode_step:
+            return None
         assert layer_name in self.layouts, (
             f"PdConnector saw unknown layer {layer_name}; registered={list(self.layouts)}"
         )
@@ -180,9 +194,13 @@ class PdWorkerConnector:
         attn_metadata: Any,
         **kwargs: Any,
     ) -> None:
+        if self._idle_decode_step:
+            return
         self._prefill.save_kv_layer(layer_name, kv_layer, attn_metadata, **kwargs)
 
     def wait_for_save(self) -> None:
+        if self._idle_decode_step:
+            return
         self._prefill.wait_for_save()
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str] | None, set[str] | None]:
