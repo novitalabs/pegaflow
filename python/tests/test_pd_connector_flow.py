@@ -1255,5 +1255,5 @@ def test_pd_proxy_streams_sse_lines_without_large_read_buffering() -> None:
     ]
 
 
-def test_pd_connector_requires_piecewise_cudagraph_for_layer_push() -> None:
-    assert PdConnector.requires_piecewise_for_cudagraph({}) is True
+def test_pd_connector_allows_full_decode_cudagraph() -> None:
+    assert PdConnector.requires_piecewise_for_cudagraph({}) is False
