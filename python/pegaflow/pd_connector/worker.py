@@ -160,8 +160,12 @@ class PdWorkerConnector:
         for req_id in metadata.reqs_to_release:
             logger.debug("[PdConnector] worker release req=%s", req_id)
             self._decode.release(req_id)
-            self._prefill.release(req_id)
-            self.rdma.close_request(req_id)
+            released_push_req_ids = self._prefill.release(req_id)
+            if released_push_req_ids:
+                for push_req_id in released_push_req_ids:
+                    self.rdma.close_request(push_req_id)
+            else:
+                self.rdma.close_request(req_id)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         assert layer_name in self.layouts, (

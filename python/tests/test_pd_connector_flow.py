@@ -111,6 +111,183 @@ def test_pd_worker_get_finished_does_not_poll_wait_reqs() -> None:
     assert worker.get_finished(set()) == (None, {"req-1"})
 
 
+def test_d_worker_release_cancels_inflight_rdma_wait() -> None:
+    class BlockingWaitRdma(MockRdmaPort):
+        def __init__(self) -> None:
+            super().__init__()
+            self.wait_started = threading.Event()
+            self.wait_can_return = threading.Event()
+            self.closed_reqs: list[str] = []
+
+        def wait_done(self, req_id: str) -> None:
+            self.wait_started.set()
+            assert self.wait_can_return.wait(timeout=5), "wait_done was not released"
+
+        def close_request(self, req_id: str) -> None:
+            self.closed_reqs.append(req_id)
+            super().close_request(req_id)
+
+    tensor = FakeTensor(
+        shape=(2, 8, 16, 4, 32),
+        stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
+    )
+    rdma = BlockingWaitRdma()
+    worker = PdWorkerConnector(
+        SimpleNamespace(kv_transfer_config=SimpleNamespace(engine_id="decode")), rdma=rdma
+    )
+    worker.register_kv_caches({"layer.0": tensor})
+    worker.start_load_kv(
+        PdConnectorMetadata(
+            reqs_to_wait={
+                "req-1": WaitReqMeta(
+                    local_block_ids=([1],),
+                    remote_request_id="req-1-p",
+                    done_request_id="req-1-d",
+                    prompt_token_ids=(1,),
+                    prefill_url="",
+                )
+            }
+        ),
+        None,
+    )
+    assert rdma.wait_started.wait(timeout=5), "waiter did not start"
+
+    worker.start_load_kv(PdConnectorMetadata(reqs_to_release={"req-1"}), None)
+
+    waiter = worker._decode._rdma_waiter
+    assert waiter is not None
+    with waiter._lock:
+        assert "req-1" not in waiter._submitted
+    assert "req-1" not in worker._decode.wait_reqs
+    assert "req-1" not in rdma.registered
+    assert rdma.closed_reqs == ["req-1"]
+
+    rdma.wait_can_return.set()
+
+
+def test_d_worker_reregister_keeps_new_rdma_wait_after_old_wait_exits() -> None:
+    class SequencedWaitRdma(MockRdmaPort):
+        def __init__(self) -> None:
+            super().__init__()
+            self._lock = threading.Lock()
+            self.wait_calls = 0
+            self.first_started = threading.Event()
+            self.first_can_return = threading.Event()
+            self.second_started = threading.Event()
+            self.second_can_return = threading.Event()
+
+        def wait_done(self, req_id: str) -> None:
+            with self._lock:
+                self.wait_calls += 1
+                wait_call = self.wait_calls
+            if wait_call == 1:
+                self.first_started.set()
+                assert self.first_can_return.wait(timeout=5), "first wait was not released"
+                return
+            if wait_call == 2:
+                self.second_started.set()
+                assert self.second_can_return.wait(timeout=5), "second wait was not released"
+                return
+            raise AssertionError(f"unexpected wait call {wait_call} for {req_id}")
+
+    tensor = FakeTensor(
+        shape=(2, 8, 16, 4, 32),
+        stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
+    )
+    rdma = SequencedWaitRdma()
+    worker = PdWorkerConnector(
+        SimpleNamespace(kv_transfer_config=SimpleNamespace(engine_id="decode")), rdma=rdma
+    )
+    worker.register_kv_caches({"layer.0": tensor})
+    wait_meta = PdConnectorMetadata(
+        reqs_to_wait={
+            "req-1": WaitReqMeta(
+                local_block_ids=([1],),
+                remote_request_id="req-1-p",
+                done_request_id="req-1-d",
+                prompt_token_ids=(1,),
+                prefill_url="",
+            )
+        }
+    )
+    worker.start_load_kv(wait_meta, None)
+    assert rdma.first_started.wait(timeout=5), "first wait did not start"
+
+    worker.start_load_kv(PdConnectorMetadata(reqs_to_release={"req-1"}), None)
+    worker.start_load_kv(wait_meta, None)
+    rdma.first_can_return.set()
+    assert rdma.second_started.wait(timeout=5), "second wait did not start"
+
+    waiter = worker._decode._rdma_waiter
+    assert waiter is not None
+    with waiter._lock:
+        assert "req-1" in waiter._submitted
+
+    worker.start_load_kv(PdConnectorMetadata(reqs_to_release={"req-1"}), None)
+    rdma.second_can_return.set()
+
+
+def test_p_worker_release_closes_all_physical_decode_targets() -> None:
+    class TrackingRdma(MockRdmaPort):
+        def __init__(self) -> None:
+            super().__init__()
+            self.closed_reqs: list[str] = []
+
+        def close_request(self, req_id: str) -> None:
+            self.closed_reqs.append(req_id)
+            super().close_request(req_id)
+
+    tensor = FakeTensor(
+        shape=(2, 8, 16, 4, 32),
+        stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
+    )
+    handshakes = tuple(
+        PdHandshake(
+            request_id=f"decode-r{rank}",
+            engine_id="decode",
+            tp_rank=rank,
+            tp_size=4,
+            block_size=16,
+            layers=(
+                hnd_remote_layer(
+                    layer_name="layer.0",
+                    layer_idx=0,
+                    block_ids=(1,),
+                    block_len=2 * 16 * 32 * 2,
+                ),
+            ),
+        )
+        for rank in range(4)
+    )
+    rdma = TrackingRdma()
+    worker = PdWorkerConnector(
+        SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(engine_id="prefill"),
+            parallel_config=SimpleNamespace(tensor_parallel_rank=1, tensor_parallel_size=2),
+        ),
+        rdma=rdma,
+    )
+    worker.register_kv_caches({"layer.0": tensor})
+    worker.start_load_kv(
+        PdConnectorMetadata(
+            reqs_to_push={
+                "prefill-r1": PushReqMeta(
+                    local_block_ids=([1],),
+                    target_request_id="decode",
+                    handshakes=handshakes,
+                )
+            }
+        ),
+        None,
+    )
+    assert sorted(rdma.registered) == ["prefill-r1#d2", "prefill-r1#d3"]
+
+    worker.start_load_kv(PdConnectorMetadata(reqs_to_release={"prefill-r1"}), None)
+
+    assert sorted(rdma.closed_reqs) == ["prefill-r1#d2", "prefill-r1#d3"]
+    assert rdma.registered == set()
+
+
 def test_p_worker_uses_scheduler_blocks_without_slot_mapping_cpu_sync() -> None:
     tensor = FakeTensor(
         shape=(2, 8, 16, 4, 32),

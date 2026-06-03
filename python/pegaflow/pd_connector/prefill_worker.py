@@ -100,7 +100,7 @@ class PrefillHandler:
                 len(flatten_block_ids(req.local_block_ids)),
             )
 
-    def release(self, req_id: str) -> None:
+    def release(self, req_id: str) -> tuple[str, ...]:
         self._push_reqs.pop(req_id, None)
         self._pending_push_chunks.discard(req_id)
         self._push_chunk_maps.pop(req_id, None)
@@ -111,6 +111,7 @@ class PrefillHandler:
             self._completed_physical_pushes.discard(physical_req_id)
         self._push_traces.pop(req_id, None)
         self._tracker.remove(req_id)
+        return physical_req_ids
 
     def save_kv_layer(
         self,
