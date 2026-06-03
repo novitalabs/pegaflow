@@ -227,6 +227,36 @@ def fetch_pegaflow_metrics(metrics_port: int) -> dict[str, float]:
     return metrics
 
 
+def fetch_pegaflow_rpc_failures(metrics_port: int, method: str | None = None) -> dict[str, float]:
+    """Return non-ok RPC counts keyed by ``"method/status"``.
+
+    ``fetch_pegaflow_metrics`` collapses label sets, so it cannot tell a failed
+    RPC from a successful one. This keeps the ``method``/``status`` labels so a
+    test can assert that no connector<->server RPC failed. Pass ``method`` to
+    restrict to one RPC; ``None`` (default) reports failures across all methods.
+    """
+    url = f"http://localhost:{metrics_port}/metrics"
+    response = requests.get(url, timeout=5)
+    response.raise_for_status()
+
+    failures: dict[str, float] = {}
+    for line in response.text.splitlines():
+        if not line.startswith("pegaflow_rpc_requests"):
+            continue
+        match = re.match(r"^pegaflow_rpc_requests(?:_total)?\{([^}]*)\}\s+([\d.eE+-]+)$", line)
+        if not match:
+            continue
+        labels = dict(re.findall(r'(\w+)="([^"]*)"', match.group(1)))
+        if labels.get("status") == "ok":
+            continue
+        rpc = labels.get("method", "")
+        if method is not None and rpc != method:
+            continue
+        key = f"{rpc}/{labels.get('status', '')}"
+        failures[key] = failures.get(key, 0.0) + float(match.group(2))
+    return failures
+
+
 def check_pegaflow_server(metrics_port: int) -> bool:
     """Check if PegaFlow server is running and metrics endpoint is available."""
     try:

@@ -52,10 +52,7 @@ class _QueryProbe:
         return self.hit_blocks is not None
 
     def matches(self, computed_blocks: int, query_hashes: tuple[bytes, ...]) -> bool:
-        return (
-            self.computed_blocks == computed_blocks
-            and self.query_hashes == query_hashes
-        )
+        return self.computed_blocks == computed_blocks and self.query_hashes == query_hashes
 
     def mark_ready(self, ready: QueryReady) -> None:
         hit_blocks = ready.num_hit_blocks
@@ -570,8 +567,8 @@ class SchedulerConnector:
         return self._release_query_probe(req_id, probe)
 
     def _release_query_probe(self, req_id: str, probe: _QueryProbe) -> bool:
-        if not probe.is_ready:
-            return True  # no lease to release yet
+        if not probe.lease:
+            return True  # nothing leased server-side (still loading, or zero-hit Ready)
         try:
             self._ctx.engine_client.release(probe.lease)
         except Exception:
