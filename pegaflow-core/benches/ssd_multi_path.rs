@@ -220,7 +220,10 @@ impl BenchFixture {
             if state == pegaflow_core::sync_state::LOAD_STATE_SUCCESS {
                 break;
             }
-            assert!(state != pegaflow_core::sync_state::LOAD_STATE_ERROR, "load error");
+            assert!(
+                state != pegaflow_core::sync_state::LOAD_STATE_ERROR,
+                "load error"
+            );
             assert!(Instant::now() < deadline, "load timeout");
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
@@ -292,7 +295,9 @@ fn io_uring_available() -> bool {
 
 fn write_benchmarks(c: &mut Criterion) {
     if !io_uring_available() {
-        eprintln!("Skipping SSD multi-path benchmarks: io_uring is not available in this environment");
+        eprintln!(
+            "Skipping SSD multi-path benchmarks: io_uring is not available in this environment"
+        );
         return;
     }
     let rt = Runtime::new().expect("tokio runtime");
@@ -308,11 +313,8 @@ fn write_benchmarks(c: &mut Criterion) {
                 let _ = std::fs::remove_dir_all(path);
             }
 
-            let fixture = BenchFixture::new(
-                NUM_BLOCKS,
-                BYTES_PER_BLOCK,
-                Some(make_ssd_config(cfg)),
-            );
+            let fixture =
+                BenchFixture::new(NUM_BLOCKS, BYTES_PER_BLOCK, Some(make_ssd_config(cfg)));
 
             b.iter_custom(|iters| {
                 rt.block_on(async {
@@ -350,11 +352,8 @@ fn read_benchmarks(c: &mut Criterion) {
                 let _ = std::fs::remove_dir_all(path);
             }
 
-            let fixture = BenchFixture::new(
-                NUM_BLOCKS,
-                BYTES_PER_BLOCK,
-                Some(make_ssd_config(cfg)),
-            );
+            let fixture =
+                BenchFixture::new(NUM_BLOCKS, BYTES_PER_BLOCK, Some(make_ssd_config(cfg)));
 
             // Prime SSD cache.
             let prime_hashes = make_block_hashes(NUM_BLOCKS, 0);
