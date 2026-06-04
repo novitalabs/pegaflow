@@ -106,6 +106,9 @@ class PrefillHandler:
         self._push_chunk_maps.pop(req_id, None)
         self._push_plans.pop(req_id, None)
         physical_req_ids = self._logical_to_physical.pop(req_id, ())
+        if physical_req_ids:
+            self._push_sender.cancel_many(physical_req_ids)
+            self._push_finalizer.cancel_many(physical_req_ids)
         for physical_req_id in physical_req_ids:
             self._physical_to_logical.pop(physical_req_id, None)
             self._completed_physical_pushes.discard(physical_req_id)
@@ -674,6 +677,7 @@ class _AsyncLayerPushSender:
         self._condition = threading.Condition()
         self._inflight = 0
         self._inflight_by_req: dict[str, int] = {}
+        self._cancelled: set[str] = set()
         self._error: BaseException | None = None
         self._thread = threading.Thread(
             target=self._run,
@@ -708,6 +712,16 @@ class _AsyncLayerPushSender:
                 self._error = None
                 raise error
 
+    def cancel(self, req_id: str) -> None:
+        self.cancel_many((req_id,))
+
+    def cancel_many(self, req_ids: tuple[str, ...]) -> None:
+        with self._condition:
+            self._cancelled.update(
+                req_id for req_id in req_ids if self._inflight_by_req.get(req_id, 0) > 0
+            )
+            self._condition.notify_all()
+
     def close(self) -> None:
         self._queue.put(None)
 
@@ -721,7 +735,8 @@ class _AsyncLayerPushSender:
             try:
                 if task is None:
                     return
-                _run_layer_push(task)
+                if task.req_id not in self._cancelled:
+                    _run_layer_push(task)
             except BaseException as exc:
                 with self._condition:
                     self._error = exc
@@ -735,6 +750,7 @@ class _AsyncLayerPushSender:
                             self._inflight_by_req[task.req_id] = remaining
                         else:
                             self._inflight_by_req.pop(task.req_id, None)
+                            self._cancelled.discard(task.req_id)
                         self._condition.notify_all()
                 self._queue.task_done()
 
@@ -751,6 +767,7 @@ class _AsyncPushFinalizer:
         self._queue: queue.Queue[_PushFinalizeTask | None] = queue.Queue()
         self._condition = threading.Condition()
         self._submitted: set[tuple[str, ...]] = set()
+        self._cancelled: set[str] = set()
         self._inflight = 0
         self._error: BaseException | None = None
         self._thread = threading.Thread(
@@ -767,6 +784,18 @@ class _AsyncPushFinalizer:
             self._submitted.add(task.req_ids)
             self._inflight += 1
         self._queue.put(task)
+
+    def cancel_many(self, req_ids: tuple[str, ...]) -> None:
+        with self._condition:
+            submitted_req_ids = {
+                submitted_req_id
+                for submitted in self._submitted
+                for submitted_req_id in submitted
+            }
+            self._cancelled.update(
+                req_id for req_id in req_ids if req_id in submitted_req_ids
+            )
+            self._condition.notify_all()
 
     def wait_all(self) -> None:
         with self._condition:
@@ -791,8 +820,14 @@ class _AsyncPushFinalizer:
                 if task is None:
                     return
                 for req_id in task.req_ids:
+                    if req_id in self._cancelled:
+                        continue
                     self._push_sender.wait_req(req_id)
+                    if req_id in self._cancelled:
+                        continue
                     task.rdma.wait_for_pushes(req_id)
+                    if req_id in self._cancelled:
+                        continue
                     task.rdma.push_done(req_id)
                 done_ts_ns = time.time_ns()
                 save_gbps = _gbps(task.rdma_bytes, task.first_save_ts_ns, done_ts_ns)
@@ -830,6 +865,8 @@ class _AsyncPushFinalizer:
                 if task is not None:
                     with self._condition:
                         self._submitted.discard(task.req_ids)
+                        for req_id in task.req_ids:
+                            self._cancelled.discard(req_id)
                         self._inflight -= 1
                         self._condition.notify_all()
                 self._queue.task_done()

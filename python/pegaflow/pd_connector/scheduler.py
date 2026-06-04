@@ -39,6 +39,20 @@ def _prompt_token_ids(request: Any) -> tuple[int, ...]:
     return tuple(int(token_id) for token_id in request.prompt_token_ids)
 
 
+def _request_was_aborted(request: Any) -> bool:
+    status = getattr(request, "status", None)
+    if status is not None and "ABORT" in str(status).upper():
+        return True
+    finish_reason = getattr(request, "finish_reason", None)
+    if finish_reason is not None and str(finish_reason).upper() == "ABORT":
+        return True
+    get_finished_reason = getattr(request, "get_finished_reason", None)
+    if get_finished_reason is None:
+        return False
+    reason = get_finished_reason()
+    return reason is not None and str(reason).upper() == "ABORT"
+
+
 class PdSchedulerConnector:
     def __init__(self, vllm_config: Any, **_kwargs: Any) -> None:
         self.vllm_config = vllm_config
@@ -211,6 +225,11 @@ class PdSchedulerConnector:
             self._active_waits.pop(req_id, None)
             self._completed_waits.discard(req_id)
             self._matched_ts_ns.pop(req_id, None)
+
+        if is_prod and _request_was_aborted(request):
+            self._reqs_to_release.add(req_id)
+            self._active_pushes.pop(req_id, None)
+            return False, None
 
         if is_prod and _has_blocks(block_ids):
             self._active_pushes.setdefault(
