@@ -26,9 +26,16 @@ class PrefillHttpTask:
     kv_transfer_params: dict[str, Any]
 
 
+class PrefillRequestError(RuntimeError):
+    def __init__(self, request_id: str, message: str) -> None:
+        super().__init__(message)
+        self.request_id = request_id
+
+
 class AsyncPrefillSender:
-    def __init__(self, worker_count: int = 16) -> None:
+    def __init__(self, worker_count: int = 16, failure_callback: Any | None = None) -> None:
         self._worker_count = max(1, int(worker_count))
+        self._failure_callback = failure_callback
         self._closed = False
         self._loop_ready = threading.Event()
         self._thread = threading.Thread(
@@ -107,6 +114,10 @@ class AsyncPrefillSender:
         except asyncio.CancelledError:
             logger.info("[PdConnector] D -> P prefill cancelled req=%s", task.request_id)
             raise
+        except Exception as exc:
+            logger.exception("[PdConnector] D -> P prefill failed req=%s", task.request_id)
+            if self._failure_callback is not None:
+                self._failure_callback(task.request_id, exc)
 
 
 def _prefill_request_body(task: PrefillHttpTask) -> dict[str, Any]:
@@ -156,7 +167,10 @@ async def post_prefill_request_async(
                 response.status_code,
                 response_body[:512],
             )
-            return
+            raise PrefillRequestError(
+                task.request_id,
+                f"prefill request failed with status={response.status_code}",
+            )
         logger.info(
             "[PdConnector] D -> P prefill completed req=%s status=%s bytes=%d latency_ms=%.3f ts_ns=%d",
             task.request_id,
@@ -171,6 +185,7 @@ async def post_prefill_request_async(
             task.request_id,
             url,
         )
+        raise
     finally:
         if owns_client:
             await client.aclose()

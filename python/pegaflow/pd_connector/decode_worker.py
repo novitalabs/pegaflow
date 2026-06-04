@@ -40,22 +40,32 @@ class DecodeHandler:
         prefill_sender: Any | None = None,
     ) -> None:
         self._w = worker
+        self._lock = threading.Lock()
         self._wait_reqs: dict[str, WaitReqMeta] = {}
         self._peer_layouts: dict[int, dict[str, KvCacheLayout]] = {}
         self._peer_mr_descs: dict[int, dict[str, Any]] = {}
         self._peer_layer_templates: dict[int, tuple[dict[str, Any], ...]] = {}
         self._expected_imm_counts: dict[int, int] = {}
         self._peer_block_size: int | None = None
+        self._failed_recving: set[str] = set()
+        self._failed_block_ids: set[int] = set()
         self._next_imm_id = 1
         self._rdma_waiter: _AsyncRdmaDoneWaiter | None = (
-            _AsyncRdmaDoneWaiter(worker.rdma) if worker.rdma is not None else None
+            _AsyncRdmaDoneWaiter(worker.rdma, failure_callback=self._mark_wait_failed)
+            if worker.rdma is not None
+            else None
         )
-        self._prefill_sender = prefill_sender or AsyncPrefillSender()
+        self._prefill_sender = prefill_sender or AsyncPrefillSender(
+            failure_callback=self._mark_prefill_failed
+        )
 
     def init_rdma_waiter(self) -> None:
         """Called after RDMA port is built (during register_kv_caches)."""
         if self._rdma_waiter is None and self._w.rdma is not None:
-            self._rdma_waiter = _AsyncRdmaDoneWaiter(self._w.rdma)
+            self._rdma_waiter = _AsyncRdmaDoneWaiter(
+                self._w.rdma,
+                failure_callback=self._mark_wait_failed,
+            )
 
     def gather_peer_info(self) -> None:
         mr_descs = {name: layer.mr_desc for name, layer in self._w._registered_layers.items()}
@@ -87,7 +97,8 @@ class DecodeHandler:
                 logger.info("[PdConnector] D wait req=%s already registered", req_id)
                 continue
             process_ts_ns = time.time_ns()
-            self._wait_reqs[req_id] = req
+            with self._lock:
+                self._wait_reqs[req_id] = req
             block_ids = flatten_block_ids(req.local_block_ids)
             imm_id = self._alloc_imm_id()
             wait_handshake = self._build_wait_handshake(
@@ -130,7 +141,8 @@ class DecodeHandler:
                 self._dispatch_prefill(req, block_ids, imm_id)
 
     def release(self, req_id: str) -> None:
-        req = self._wait_reqs.pop(req_id, None)
+        with self._lock:
+            req = self._wait_reqs.pop(req_id, None)
         cancel_prefill = getattr(self._prefill_sender, "cancel", None)
         if req is not None and cancel_prefill is not None:
             cancel_prefill(req.remote_request_id)
@@ -139,11 +151,27 @@ class DecodeHandler:
 
     def finish_recving(self, finished_recving: set[str]) -> None:
         for req_id in finished_recving:
-            self._wait_reqs.pop(req_id, None)
+            with self._lock:
+                self._wait_reqs.pop(req_id, None)
             self._w.rdma.close_request(req_id)
 
+    def pop_failed_recving(self) -> set[str]:
+        with self._lock:
+            failed = self._failed_recving
+            self._failed_recving = set()
+            return failed
+
+    def pop_failed_block_ids(self) -> set[int]:
+        with self._lock:
+            failed = self._failed_block_ids
+            self._failed_block_ids = set()
+            return failed
+
     def shutdown(self) -> None:
-        self._wait_reqs.clear()
+        with self._lock:
+            self._wait_reqs.clear()
+            self._failed_recving.clear()
+            self._failed_block_ids.clear()
         if self._rdma_waiter is not None:
             self._rdma_waiter.close()
         close = getattr(self._prefill_sender, "close", None)
@@ -155,7 +183,48 @@ class DecodeHandler:
         return self._wait_reqs
 
     def is_idle(self) -> bool:
-        return not self._wait_reqs
+        with self._lock:
+            return not self._wait_reqs and not self._failed_recving and not self._failed_block_ids
+
+    def _mark_prefill_failed(self, remote_request_id: str, exc: BaseException) -> None:
+        with self._lock:
+            for req_id, req in list(self._wait_reqs.items()):
+                if req.remote_request_id != remote_request_id:
+                    continue
+                self._mark_failed_locked(req_id, req, exc)
+                return
+        logger.warning(
+            "[PdConnector] D prefill failed for unknown/finished remote_req=%s: %s",
+            remote_request_id,
+            exc,
+        )
+
+    def _mark_wait_failed(self, req_id: str, exc: BaseException) -> None:
+        with self._lock:
+            req = self._wait_reqs.get(req_id)
+            if req is None:
+                logger.warning(
+                    "[PdConnector] D wait failed for unknown/finished req=%s: %s",
+                    req_id,
+                    exc,
+                )
+                return
+            self._mark_failed_locked(req_id, req, exc)
+
+    def _mark_failed_locked(self, req_id: str, req: WaitReqMeta, exc: BaseException) -> None:
+        failed_blocks = flatten_block_ids(req.local_block_ids)
+        self._failed_recving.add(req_id)
+        self._failed_block_ids.update(failed_blocks)
+        self._wait_reqs.pop(req_id, None)
+        logger.error(
+            "[PdConnector] D marked recv failed req=%s remote_req=%s blocks=%d error=%s",
+            req_id,
+            req.remote_request_id,
+            len(failed_blocks),
+            exc,
+        )
+        if self._rdma_waiter is not None:
+            self._rdma_waiter.cancel(req_id)
 
     def _build_wait_handshake(
         self,
@@ -347,8 +416,9 @@ class _AsyncRdmaDoneWaiter:
     dropped from it once its wait resolves so the set tracks only in-flight waits.
     """
 
-    def __init__(self, rdma: RdmaPort) -> None:
+    def __init__(self, rdma: RdmaPort, failure_callback: Any | None = None) -> None:
         self.rdma = rdma
+        self._failure_callback = failure_callback
         self._queue: queue.Queue[_RdmaWaitTask | None] = queue.Queue()
         self._submitted: dict[str, int] = {}
         self._cancelled: dict[str, set[int]] = {}
@@ -431,7 +501,7 @@ class _AsyncRdmaDoneWaiter:
                     (done_ts_ns - start_ts_ns) / 1_000_000,
                     done_ts_ns,
                 )
-            except Exception:
+            except Exception as exc:
                 logger.exception(
                     "[PdConnector] D RDMA done wait failed req=%s remote_req=%s done_req=%s rank=%d blocks=%d",
                     task.req_id,
@@ -440,6 +510,8 @@ class _AsyncRdmaDoneWaiter:
                     task.rank,
                     task.block_count,
                 )
+                if self._failure_callback is not None:
+                    self._failure_callback(task.req_id, exc)
             finally:
                 with self._lock:
                     if self._submitted.get(task.req_id) == task.generation:

@@ -57,6 +57,7 @@ class PdWorkerConnector:
         self._registered_layers: dict[str, LayerRemoteLayout] = {}
         self._forward_step_id = 0
         self._idle_decode_step = False
+        self._failed_load_block_ids: set[int] = set()
 
         self._decode = DecodeHandler(self, prefill_sender=prefill_sender)
         self._prefill = PrefillHandler(self)
@@ -222,6 +223,9 @@ class PdWorkerConnector:
         for req_id in releasable_sending:
             self.rdma.close_request(req_id)
         finished_recving = self.rdma.pop_finished_recving()
+        failed_recving = self._decode.pop_failed_recving()
+        if failed_recving:
+            finished_recving.update(failed_recving)
         if finished_recving:
             report_ts_ns = time.time_ns()
             logger.info(
@@ -243,7 +247,10 @@ class PdWorkerConnector:
         return releasable_sending or None, finished_recving or None
 
     def get_block_ids_with_load_errors(self) -> set[int]:
-        return set()
+        self._failed_load_block_ids.update(self._decode.pop_failed_block_ids())
+        failed = self._failed_load_block_ids
+        self._failed_load_block_ids = set()
+        return failed
 
     def build_connector_worker_meta(self) -> PdWorkerMetadata | None:
         return None

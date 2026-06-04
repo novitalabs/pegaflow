@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 # ruff: noqa: F403,F405,I001
 from .pd_connector_test_utils import *
@@ -327,6 +328,99 @@ def test_d_worker_release_cancels_remote_prefill_request() -> None:
     worker.start_load_kv(PdConnectorMetadata(reqs_to_release={"decode-1"}), None)
 
     assert prefill_sender.cancelled == ["prefill-1"]
+
+
+def test_d_worker_prefill_failure_reports_load_error(monkeypatch) -> None:
+    tensor = FakeTensor(
+        shape=(2, 8, 16, 4, 32),
+        stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
+    )
+
+    async def fail_prefill_request(task: PrefillHttpTask, _client=None) -> None:
+        raise prefill_mod.PrefillRequestError(task.request_id, "p aborted")
+
+    monkeypatch.setattr(
+        prefill_mod,
+        "post_prefill_request_async",
+        fail_prefill_request,
+    )
+    worker = PdWorkerConnector(
+        SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(engine_id="decode"),
+            parallel_config=SimpleNamespace(tensor_parallel_rank=0, tensor_parallel_size=1),
+        ),
+        rdma=MockRdmaPort(),
+    )
+    worker.register_kv_caches({"layer.0": tensor})
+    worker.start_load_kv(
+        PdConnectorMetadata(
+            reqs_to_wait={
+                "decode-1": WaitReqMeta(
+                    local_block_ids=([3, 4],),
+                    remote_request_id="prefill-1",
+                    done_request_id="decode-1",
+                    prompt_token_ids=(1,),
+                    prefill_url="http://p:8001",
+                )
+            }
+        ),
+        None,
+    )
+
+    deadline = time.time() + 2
+    finished_recving = None
+    while time.time() < deadline:
+        _, finished_recving = worker.get_finished(set())
+        if finished_recving:
+            break
+        time.sleep(0.01)
+
+    assert finished_recving == {"decode-1"}
+    assert worker.get_block_ids_with_load_errors() == {3, 4}
+    assert worker.get_block_ids_with_load_errors() == set()
+    worker.shutdown()
+
+
+def test_d_worker_rdma_wait_failure_reports_load_error() -> None:
+    class FailingWaitRdma(MockRdmaPort):
+        def wait_done(self, req_id: str) -> None:
+            raise RuntimeError("rdma timeout")
+
+    tensor = FakeTensor(
+        shape=(2, 8, 16, 4, 32),
+        stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
+    )
+    worker = PdWorkerConnector(
+        SimpleNamespace(kv_transfer_config=SimpleNamespace(engine_id="decode")),
+        rdma=FailingWaitRdma(),
+    )
+    worker.register_kv_caches({"layer.0": tensor})
+    worker.start_load_kv(
+        PdConnectorMetadata(
+            reqs_to_wait={
+                "decode-1": WaitReqMeta(
+                    local_block_ids=([5],),
+                    remote_request_id="prefill-1",
+                    done_request_id="decode-1",
+                    prompt_token_ids=(1,),
+                    prefill_url="",
+                )
+            }
+        ),
+        None,
+    )
+
+    deadline = time.time() + 2
+    finished_recving = None
+    while time.time() < deadline:
+        _, finished_recving = worker.get_finished(set())
+        if finished_recving:
+            break
+        time.sleep(0.01)
+
+    assert finished_recving == {"decode-1"}
+    assert worker.get_block_ids_with_load_errors() == {5}
+    worker.shutdown()
 
 
 def test_d_worker_reregister_keeps_new_rdma_wait_after_old_wait_exits() -> None:
