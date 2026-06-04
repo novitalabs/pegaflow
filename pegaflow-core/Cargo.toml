@@ -62,10 +62,6 @@ name = "cpu_path"
 harness = false
 
 [[bench]]
-name = "ssd_multi_path"
-harness = false
-
-[[bench]]
 name = "transfer_h2d"
 harness = false
 
