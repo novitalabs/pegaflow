@@ -196,6 +196,8 @@ class PdSchedulerConnector:
         return meta
 
     def update_connector_output(self, connector_output: Any) -> None:
+        worker_meta = getattr(connector_output, "kv_connector_worker_meta", None)
+        failed_recving = set(getattr(worker_meta, "failed_recving", None) or ())
         for req_id in connector_output.finished_sending or ():
             self._active_pushes.pop(req_id, None)
             self._reqs_to_release.add(req_id)
@@ -205,11 +207,15 @@ class PdSchedulerConnector:
             finished_ts_ns = time.time_ns()
             wait_req = self._active_waits.get(req_id)
             self._active_waits.pop(req_id, None)
-            self._completed_waits.add(req_id)
+            if req_id in failed_recving:
+                self._completed_waits.discard(req_id)
+            else:
+                self._completed_waits.add(req_id)
             matched_ts_ns = self._matched_ts_ns.pop(req_id, None)
             logger.info(
-                "[PdConnector] scheduler finished recving req=%s proxy_to_finished_ms=%.3f matched_to_finished_ms=%.3f wait_to_finished_ms=%.3f ts_ns=%d",
+                "[PdConnector] scheduler finished recving req=%s failed=%s proxy_to_finished_ms=%.3f matched_to_finished_ms=%.3f wait_to_finished_ms=%.3f ts_ns=%d",
                 req_id,
+                req_id in failed_recving,
                 _elapsed_ms(wait_req.proxy_start_ts_ns, finished_ts_ns) if wait_req else -1.0,
                 _elapsed_ms(matched_ts_ns or 0, finished_ts_ns),
                 _elapsed_ms(wait_req.scheduler_wait_ts_ns, finished_ts_ns) if wait_req else -1.0,

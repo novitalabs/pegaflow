@@ -259,7 +259,10 @@ class PdWorkerConnector:
         return failed
 
     def build_connector_worker_meta(self) -> PdWorkerMetadata | None:
-        return None
+        failed_recving = self._decode.pop_failed_recving_for_meta()
+        if not failed_recving:
+            return None
+        return PdWorkerMetadata(failed_recving=failed_recving)
 
     def shutdown(self) -> None:
         self._decode.shutdown()

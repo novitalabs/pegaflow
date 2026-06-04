@@ -420,6 +420,9 @@ def test_d_worker_rdma_wait_failure_reports_load_error() -> None:
 
     assert finished_recving == {"decode-1"}
     assert worker.get_block_ids_with_load_errors() == {5}
+    meta = worker.build_connector_worker_meta()
+    assert meta is not None
+    assert meta.failed_recving == {"decode-1"}
     worker.shutdown()
 
 
@@ -1010,6 +1013,91 @@ def test_scheduler_registers_remote_wait_once_until_done() -> None:
     scheduler.update_state_after_alloc(request, ([1],), num_external_tokens=3)
     after_release = scheduler.build_connector_meta(SimpleNamespace())
     assert set(after_release.reqs_to_wait) == {"req-1"}
+
+
+def test_scheduler_failed_recv_allows_remote_wait_retry() -> None:
+    scheduler = PdSchedulerConnector(
+        SimpleNamespace(kv_transfer_config=SimpleNamespace(engine_id="d"))
+    )
+    request = SimpleNamespace(
+        request_id="req-1",
+        prompt_token_ids=[11, 12, 13],
+        kv_transfer_params={
+            "do_remote_prefill": True,
+            "prefill_url": "http://127.0.0.1:8001",
+        },
+    )
+
+    scheduler.update_state_after_alloc(request, ([1],), num_external_tokens=3)
+    first = scheduler.build_connector_meta(SimpleNamespace())
+    assert set(first.reqs_to_wait) == {"req-1"}
+
+    scheduler.update_connector_output(
+        SimpleNamespace(
+            finished_sending=None,
+            finished_recving={"req-1"},
+            kv_connector_worker_meta=PdWorkerMetadata(failed_recving={"req-1"}),
+        )
+    )
+    scheduler.update_state_after_alloc(request, ([2],), num_external_tokens=3)
+    retry = scheduler.build_connector_meta(SimpleNamespace())
+
+    assert set(retry.reqs_to_wait) == {"req-1"}
+    assert retry.reqs_to_wait["req-1"].local_block_ids == ([2],)
+
+
+def test_d_failed_load_retry_dispatches_prefill_again() -> None:
+    tensor = FakeTensor(
+        shape=(2, 8, 16, 4, 32),
+        stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
+    )
+    prefill_sender = FakePrefillSender()
+    worker = PdWorkerConnector(
+        SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(engine_id="decode"),
+            parallel_config=SimpleNamespace(tensor_parallel_rank=0, tensor_parallel_size=1),
+        ),
+        rdma=MockRdmaPort(),
+        prefill_sender=prefill_sender,
+    )
+    worker.register_kv_caches({"layer.0": tensor})
+    scheduler = PdSchedulerConnector(
+        SimpleNamespace(kv_transfer_config=SimpleNamespace(engine_id="d"))
+    )
+    request = SimpleNamespace(
+        request_id="decode-1",
+        prompt_token_ids=[11, 12, 13],
+        kv_transfer_params={
+            "do_remote_prefill": True,
+            "prefill_url": "http://p:8001",
+            "remote_request_id": "prefill-1",
+            "done_request_id": "decode-1",
+        },
+    )
+
+    scheduler.update_state_after_alloc(request, ([1],), num_external_tokens=3)
+    worker.start_load_kv(scheduler.build_connector_meta(SimpleNamespace()), None)
+    assert [task.request_id for task in prefill_sender.tasks] == ["prefill-1"]
+
+    worker._decode._mark_wait_failed("decode-1", RuntimeError("p preempted"))
+    _, finished_recving = worker.get_finished(set())
+    assert finished_recving == {"decode-1"}
+    failed_blocks = worker.get_block_ids_with_load_errors()
+    assert failed_blocks == {1}
+    scheduler.update_connector_output(
+        SimpleNamespace(
+            finished_sending=None,
+            finished_recving=finished_recving,
+            invalid_block_ids=failed_blocks,
+            kv_connector_worker_meta=worker.build_connector_worker_meta(),
+        )
+    )
+
+    scheduler.update_state_after_alloc(request, ([2],), num_external_tokens=3)
+    worker.start_load_kv(scheduler.build_connector_meta(SimpleNamespace()), None)
+
+    assert [task.request_id for task in prefill_sender.tasks] == ["prefill-1", "prefill-1"]
+    worker.shutdown()
 
 
 def test_d_worker_rank0_dispatches_prefill_on_wait() -> None:
