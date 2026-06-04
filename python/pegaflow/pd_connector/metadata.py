@@ -12,6 +12,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 
 BlockIds = tuple[list[int], ...]
 
+RELEASE_CONSUMER_ABORT = "consumer_abort"
+RELEASE_PRODUCER_ABORT = "producer_abort"
+RELEASE_PRODUCER_FINISHED = "producer_finished"
+RELEASE_PRODUCER_PREEMPTED = "producer_preempted"
+
 
 def normalize_block_ids(block_ids: Any) -> BlockIds:
     """Convert vLLM block-id containers to a tuple of mutable group lists."""
@@ -108,6 +113,7 @@ class PdHandshake:
     layers: tuple[LayerRemoteLayout, ...]
     imm_id: int | None = None
     fail_imm_id: int | None = None
+    abort_imm_id: int | None = None
     expected_imm_count: int = 1
 
 
@@ -161,6 +167,7 @@ def handshake_from_dict(data: dict[str, Any] | None) -> PdHandshake | None:
         ),
         imm_id=int(data["imm_id"]) if data.get("imm_id") is not None else None,
         fail_imm_id=int(data["fail_imm_id"]) if data.get("fail_imm_id") is not None else None,
+        abort_imm_id=int(data["abort_imm_id"]) if data.get("abort_imm_id") is not None else None,
         expected_imm_count=int(data.get("expected_imm_count") or 1),
     )
 
@@ -214,6 +221,7 @@ def handshake_to_dict(handshake: PdHandshake) -> dict[str, Any]:
         "layers": [layer_layout_to_dict(layer) for layer in handshake.layers],
         "imm_id": handshake.imm_id,
         "fail_imm_id": handshake.fail_imm_id,
+        "abort_imm_id": handshake.abort_imm_id,
         "expected_imm_count": handshake.expected_imm_count,
     }
 
@@ -234,6 +242,7 @@ def handshake_to_compact_dict(handshake: PdHandshake) -> dict[str, Any]:
         "layers": [layer_layout_to_compact_dict(layer) for layer in handshake.layers],
         "imm_id": handshake.imm_id,
         "fail_imm_id": handshake.fail_imm_id,
+        "abort_imm_id": handshake.abort_imm_id,
         "expected_imm_count": handshake.expected_imm_count,
     }
 
@@ -246,12 +255,14 @@ class PdConnectorMetadata(KVConnectorMetadata):
         reqs_to_wait: dict[str, WaitReqMeta] | None = None,
         reqs_to_push: dict[str, PushReqMeta] | None = None,
         reqs_to_release: set[str] | None = None,
+        release_reasons: dict[str, str] | None = None,
         preempted_req_ids: set[str] | None = None,
     ) -> None:
         super().__init__()
         self.reqs_to_wait = reqs_to_wait or {}
         self.reqs_to_push = reqs_to_push or {}
         self.reqs_to_release = reqs_to_release or set()
+        self.release_reasons = release_reasons or {}
         self.preempted_req_ids = preempted_req_ids or set()
 
 

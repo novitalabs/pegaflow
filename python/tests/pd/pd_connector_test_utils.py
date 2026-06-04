@@ -34,6 +34,10 @@ from pegaflow.pd_connector.metadata import (  # noqa: E402
     PdConnectorMetadata,
     PdHandshake,
     PdWorkerMetadata,
+    RELEASE_CONSUMER_ABORT,
+    RELEASE_PRODUCER_ABORT,
+    RELEASE_PRODUCER_FINISHED,
+    RELEASE_PRODUCER_PREEMPTED,
     PushReqMeta,
     TransferRegionLayout,
     WaitReqMeta,
@@ -148,6 +152,7 @@ class FakeNativeRdmaEngine:
         assert handshake["request_id"]
         assert handshake.get("imm_id") is None or isinstance(handshake["imm_id"], int)
         assert handshake.get("fail_imm_id") is None or isinstance(handshake["fail_imm_id"], int)
+        assert handshake.get("abort_imm_id") is None or isinstance(handshake["abort_imm_id"], int)
         for layer in handshake["layers"]:
             assert layer["mr_desc"]["addr_rkey_list"]
             assert isinstance(layer["mr_desc"]["addr_rkey_list"][0], tuple)
@@ -173,6 +178,9 @@ class FakeNativeRdmaEngine:
 
     def fail_request(self, req_id):
         return None
+
+    def abort_request(self, req_id):
+        self.finished_recving.append(req_id)
 
     def wait_done(self, req_id):
         self.waited_reqs.append(req_id)

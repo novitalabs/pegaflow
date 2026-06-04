@@ -28,6 +28,10 @@ from pegaflow.pd_connector.metadata import (
     LayerRemoteLayout,
     PdHandshake,
     PushReqMeta,
+    RELEASE_CONSUMER_ABORT,
+    RELEASE_PRODUCER_ABORT,
+    RELEASE_PRODUCER_FINISHED,
+    RELEASE_PRODUCER_PREEMPTED,
     flatten_block_ids,
 )
 from pegaflow.pd_connector.rdma import RdmaPort
@@ -100,7 +104,7 @@ class PrefillHandler:
                 len(flatten_block_ids(req.local_block_ids)),
             )
 
-    def release(self, req_id: str) -> tuple[str, ...]:
+    def release(self, req_id: str, reason: str = RELEASE_CONSUMER_ABORT) -> tuple[str, ...]:
         self._push_reqs.pop(req_id, None)
         self._pending_push_chunks.discard(req_id)
         self._push_chunk_maps.pop(req_id, None)
@@ -109,7 +113,10 @@ class PrefillHandler:
         if physical_req_ids:
             self._push_sender.cancel_many(physical_req_ids)
             self._push_finalizer.cancel_many(physical_req_ids)
-            self._fail_physical_requests(physical_req_ids)
+            if reason == RELEASE_CONSUMER_ABORT:
+                self._abort_physical_requests(physical_req_ids)
+            elif reason in (RELEASE_PRODUCER_ABORT, RELEASE_PRODUCER_PREEMPTED):
+                self._fail_physical_requests(physical_req_ids)
         for physical_req_id in physical_req_ids:
             self._physical_to_logical.pop(physical_req_id, None)
             self._completed_physical_pushes.discard(physical_req_id)
@@ -117,18 +124,37 @@ class PrefillHandler:
         self._tracker.remove(req_id)
         return physical_req_ids
 
+    def _abort_physical_requests(self, physical_req_ids: tuple[str, ...]) -> None:
+        abort_request = getattr(self._w.rdma, "abort_request", None)
+        if abort_request is None:
+            return
+        for physical_req_id in physical_req_ids:
+            try:
+                self._drain_physical_request(physical_req_id)
+                abort_request(physical_req_id)
+            except Exception:
+                logger.exception(
+                    "[PdConnector] P failed to notify decode abort ack req=%s",
+                    physical_req_id,
+                )
+
     def _fail_physical_requests(self, physical_req_ids: tuple[str, ...]) -> None:
         fail_request = getattr(self._w.rdma, "fail_request", None)
         if fail_request is None:
             return
         for physical_req_id in physical_req_ids:
             try:
+                self._drain_physical_request(physical_req_id)
                 fail_request(physical_req_id)
             except Exception:
                 logger.exception(
                     "[PdConnector] P failed to notify decode abort req=%s",
                     physical_req_id,
                 )
+
+    def _drain_physical_request(self, physical_req_id: str) -> None:
+        self._push_sender.wait_req(physical_req_id)
+        self._w.rdma.wait_for_pushes(physical_req_id)
 
     def save_kv_layer(
         self,

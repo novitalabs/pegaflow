@@ -44,6 +44,7 @@ def test_pd_worker_wait_handshake_uses_registered_native_mr_desc() -> None:
     assert layer["block_ids"] == [1]
     assert handshake["expected_imm_count"] == 1
     assert handshake["fail_imm_id"] == (handshake["imm_id"] ^ 0x8000_0000)
+    assert handshake["abort_imm_id"] == (handshake["imm_id"] ^ 0x4000_0000)
 
 
 def test_d_worker_waits_for_all_prefill_ranks_when_prefill_tp_is_larger() -> None:
@@ -241,7 +242,7 @@ def test_d_worker_idle_decode_step_skips_layer_hooks() -> None:
     worker.wait_for_save()
 
 
-def test_d_worker_release_cancels_inflight_rdma_wait() -> None:
+def test_d_worker_release_waits_for_abort_ack_before_finishing() -> None:
     class BlockingWaitRdma(MockRdmaPort):
         def __init__(self) -> None:
             super().__init__()
@@ -252,6 +253,7 @@ def test_d_worker_release_cancels_inflight_rdma_wait() -> None:
         def wait_done(self, req_id: str) -> None:
             self.wait_started.set()
             assert self.wait_can_return.wait(timeout=5), "wait_done was not released"
+            self.mark_done(req_id)
 
         def close_request(self, req_id: str) -> None:
             self.closed_reqs.append(req_id)
@@ -282,17 +284,37 @@ def test_d_worker_release_cancels_inflight_rdma_wait() -> None:
     )
     assert rdma.wait_started.wait(timeout=5), "waiter did not start"
 
-    worker.start_load_kv(PdConnectorMetadata(reqs_to_release={"req-1"}), None)
+    worker.start_load_kv(
+        PdConnectorMetadata(
+            reqs_to_release={"req-1"},
+            release_reasons={"req-1": RELEASE_CONSUMER_ABORT},
+        ),
+        None,
+    )
 
     waiter = worker._decode._rdma_waiter
     assert waiter is not None
     with waiter._lock:
-        assert "req-1" not in waiter._submitted
+        assert "req-1" in waiter._submitted
+    assert "req-1" in worker._decode.wait_reqs
+    assert "req-1" in rdma.registered
+    assert rdma.closed_reqs == []
+    assert worker.get_finished(set()) == (None, None)
+
+    rdma.wait_can_return.set()
+    deadline = time.time() + 2
+    finished = None
+    while time.time() < deadline:
+        _, finished = worker.get_finished(set())
+        if finished:
+            break
+        time.sleep(0.01)
+
+    assert finished == {"req-1"}
+    assert worker.get_block_ids_with_load_errors() == set()
     assert "req-1" not in worker._decode.wait_reqs
     assert "req-1" not in rdma.registered
     assert rdma.closed_reqs == ["req-1"]
-
-    rdma.wait_can_return.set()
 
 
 def test_d_worker_release_cancels_remote_prefill_request() -> None:
@@ -326,7 +348,13 @@ def test_d_worker_release_cancels_remote_prefill_request() -> None:
     )
     assert [task.request_id for task in prefill_sender.tasks] == ["prefill-1"]
 
-    worker.start_load_kv(PdConnectorMetadata(reqs_to_release={"decode-1"}), None)
+    worker.start_load_kv(
+        PdConnectorMetadata(
+            reqs_to_release={"decode-1"},
+            release_reasons={"decode-1": RELEASE_CONSUMER_ABORT},
+        ),
+        None,
+    )
 
     assert prefill_sender.cancelled == ["prefill-1"]
 
@@ -445,10 +473,12 @@ def test_d_worker_reregister_keeps_new_rdma_wait_after_old_wait_exits() -> None:
             if wait_call == 1:
                 self.first_started.set()
                 assert self.first_can_return.wait(timeout=5), "first wait was not released"
+                self.mark_done(req_id)
                 return
             if wait_call == 2:
                 self.second_started.set()
                 assert self.second_can_return.wait(timeout=5), "second wait was not released"
+                self.mark_done(req_id)
                 return
             raise AssertionError(f"unexpected wait call {wait_call} for {req_id}")
 
@@ -477,7 +507,19 @@ def test_d_worker_reregister_keeps_new_rdma_wait_after_old_wait_exits() -> None:
 
     worker.start_load_kv(PdConnectorMetadata(reqs_to_release={"req-1"}), None)
     worker.start_load_kv(wait_meta, None)
+    assert not rdma.second_started.wait(timeout=0.05)
     rdma.first_can_return.set()
+
+    deadline = time.time() + 2
+    finished = None
+    while time.time() < deadline:
+        _, finished = worker.get_finished(set())
+        if finished:
+            break
+        time.sleep(0.01)
+    assert finished == {"req-1"}
+
+    worker.start_load_kv(wait_meta, None)
     assert rdma.second_started.wait(timeout=5), "second wait did not start"
 
     waiter = worker._decode._rdma_waiter
@@ -485,7 +527,6 @@ def test_d_worker_reregister_keeps_new_rdma_wait_after_old_wait_exits() -> None:
     with waiter._lock:
         assert "req-1" in waiter._submitted
 
-    worker.start_load_kv(PdConnectorMetadata(reqs_to_release={"req-1"}), None)
     rdma.second_can_return.set()
 
 
@@ -495,9 +536,17 @@ def test_p_worker_release_closes_all_physical_decode_targets() -> None:
             super().__init__()
             self.closed_reqs: list[str] = []
             self.failed_reqs: list[str] = []
+            self.aborted_reqs: list[str] = []
+            self.drained_reqs: list[str] = []
 
         def fail_request(self, req_id: str) -> None:
             self.failed_reqs.append(req_id)
+
+        def abort_request(self, req_id: str) -> None:
+            self.aborted_reqs.append(req_id)
+
+        def wait_for_pushes(self, req_id: str) -> None:
+            self.drained_reqs.append(req_id)
 
         def close_request(self, req_id: str) -> None:
             self.closed_reqs.append(req_id)
@@ -548,9 +597,17 @@ def test_p_worker_release_closes_all_physical_decode_targets() -> None:
     )
     assert sorted(rdma.registered) == ["prefill-r1#d2", "prefill-r1#d3"]
 
-    worker.start_load_kv(PdConnectorMetadata(reqs_to_release={"prefill-r1"}), None)
+    worker.start_load_kv(
+        PdConnectorMetadata(
+            reqs_to_release={"prefill-r1"},
+            release_reasons={"prefill-r1": RELEASE_CONSUMER_ABORT},
+        ),
+        None,
+    )
 
-    assert sorted(rdma.failed_reqs) == ["prefill-r1#d2", "prefill-r1#d3"]
+    assert rdma.failed_reqs == []
+    assert sorted(rdma.drained_reqs) == ["prefill-r1#d2", "prefill-r1#d3"]
+    assert sorted(rdma.aborted_reqs) == ["prefill-r1#d2", "prefill-r1#d3"]
     assert sorted(rdma.closed_reqs) == ["prefill-r1#d2", "prefill-r1#d3"]
     assert rdma.registered == set()
 
@@ -561,9 +618,13 @@ def test_p_worker_preemption_cancels_push_without_waiting_for_done() -> None:
             super().__init__()
             self.closed_reqs: list[str] = []
             self.failed_reqs: list[str] = []
+            self.drained_reqs: list[str] = []
 
         def fail_request(self, req_id: str) -> None:
             self.failed_reqs.append(req_id)
+
+        def wait_for_pushes(self, req_id: str) -> None:
+            self.drained_reqs.append(req_id)
 
         def close_request(self, req_id: str) -> None:
             self.closed_reqs.append(req_id)
@@ -596,6 +657,7 @@ def test_p_worker_preemption_cancels_push_without_waiting_for_done() -> None:
     worker.start_load_kv(PdConnectorMetadata(preempted_req_ids={"prefill-1"}), None)
 
     assert rdma.failed_reqs == ["prefill-1"]
+    assert rdma.drained_reqs == ["prefill-1"]
     assert rdma.closed_reqs == ["prefill-1"]
     assert rdma.registered == set()
     assert worker.get_finished({"prefill-1"}) == (None, None)
@@ -707,6 +769,7 @@ def test_pd_worker_publishes_wait_handshake_and_delays_done_until_all_blocks() -
 
     assert len(prefill_sender.tasks) == 1
     task = prefill_sender.tasks[0]
+    assert task.kv_transfer_params["pd_consumer_abort_returns_ack"] is True
     handshake = handshake_from_dict(task.kv_transfer_params["pd_handshakes"][0])
     assert handshake is not None
     assert handshake.engine_id == "decode"
@@ -809,6 +872,7 @@ def test_scheduler_delays_producer_block_free_until_send_finishes() -> None:
     )
     release_meta = scheduler.build_connector_meta(SimpleNamespace())
     assert release_meta.reqs_to_release == {"req-1"}
+    assert release_meta.release_reasons == {"req-1": RELEASE_PRODUCER_FINISHED}
 
 
 def test_scheduler_does_not_delay_aborted_producer_block_free() -> None:
@@ -834,6 +898,34 @@ def test_scheduler_does_not_delay_aborted_producer_block_free() -> None:
     assert delay_free is False
     assert params is None
     assert release_meta.reqs_to_release == {"req-1"}
+    assert release_meta.release_reasons == {"req-1": RELEASE_PRODUCER_ABORT}
+
+
+def test_scheduler_marks_remote_prefill_abort_as_consumer_abort_ack() -> None:
+    scheduler = PdSchedulerConnector(
+        SimpleNamespace(kv_transfer_config=SimpleNamespace(engine_id="p"))
+    )
+    request = SimpleNamespace(
+        request_id="req-1",
+        status="FINISHED_ABORTED",
+        kv_transfer_params={
+            "do_remote_prefill_sender": True,
+            "target_engine_id": "decode",
+            "target_request_id": "req-1",
+            "pd_consumer_abort_returns_ack": True,
+        },
+    )
+
+    scheduler.update_state_after_alloc(request, ([1, 2],), num_external_tokens=0)
+    scheduler.build_connector_meta(SimpleNamespace())
+
+    delay_free, params = scheduler.request_finished(request, ([1, 2],))
+    release_meta = scheduler.build_connector_meta(SimpleNamespace())
+
+    assert delay_free is False
+    assert params is None
+    assert release_meta.reqs_to_release == {"req-1"}
+    assert release_meta.release_reasons == {"req-1": RELEASE_CONSUMER_ABORT}
 
 
 def test_scheduler_marks_preempted_producer_for_worker_release() -> None:
@@ -853,7 +945,25 @@ def test_scheduler_marks_preempted_producer_for_worker_release() -> None:
     meta = scheduler.build_connector_meta(SimpleNamespace(preempted_req_ids={"req-1"}))
 
     assert meta.preempted_req_ids == {"req-1"}
+    assert meta.release_reasons == {"req-1": RELEASE_PRODUCER_PREEMPTED}
     assert "req-1" not in meta.reqs_to_release
+
+
+def test_scheduler_marks_consumer_abort_release_reason() -> None:
+    scheduler = PdSchedulerConnector(
+        SimpleNamespace(kv_transfer_config=SimpleNamespace(engine_id="d"))
+    )
+    request = SimpleNamespace(
+        request_id="req-1",
+        status="FINISHED_ABORTED",
+        kv_transfer_params={"do_remote_prefill": True, "prefill_url": "http://p:8001"},
+    )
+
+    scheduler.request_finished(request, ([1],))
+    meta = scheduler.build_connector_meta(SimpleNamespace())
+
+    assert meta.reqs_to_release == {"req-1"}
+    assert meta.release_reasons == {"req-1": RELEASE_CONSUMER_ABORT}
 
 
 def test_scheduler_emits_cached_producer_chunks() -> None:

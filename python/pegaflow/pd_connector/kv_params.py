@@ -51,6 +51,7 @@ class ProducerKvParams:
     target_engine_id: str
     target_request_id: str
     handshakes: tuple[PdHandshake, ...] = ()
+    consumer_abort_returns_ack: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -62,6 +63,8 @@ class ProducerKvParams:
             result["pd_handshakes"] = [
                 handshake_to_compact_dict(handshake) for handshake in self.handshakes
             ]
+        if self.consumer_abort_returns_ack:
+            result["pd_consumer_abort_returns_ack"] = True
         return result
 
 
@@ -89,6 +92,7 @@ def parse_producer(params: dict[str, Any]) -> ProducerKvParams | None:
         target_engine_id=str(params.get("target_engine_id") or ""),
         target_request_id=str(params.get("target_request_id") or ""),
         handshakes=handshakes,
+        consumer_abort_returns_ack=bool(params.get("pd_consumer_abort_returns_ack")),
     )
 
 

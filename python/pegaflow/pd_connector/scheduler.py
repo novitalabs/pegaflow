@@ -16,6 +16,10 @@ from pegaflow.pd_connector.kv_params import (
 from pegaflow.pd_connector.metadata import (
     PdConnectorMetadata,
     PushReqMeta,
+    RELEASE_CONSUMER_ABORT,
+    RELEASE_PRODUCER_ABORT,
+    RELEASE_PRODUCER_FINISHED,
+    RELEASE_PRODUCER_PREEMPTED,
     WaitReqMeta,
     normalize_block_ids,
 )
@@ -62,6 +66,7 @@ class PdSchedulerConnector:
         self._reqs_to_wait: dict[str, WaitReqMeta] = {}
         self._reqs_to_push: dict[str, PushReqMeta] = {}
         self._reqs_to_release: set[str] = set()
+        self._release_reasons: dict[str, str] = {}
 
         # D-side cross-step state
         self._active_waits: dict[str, WaitReqMeta] = {}
@@ -185,6 +190,10 @@ class PdSchedulerConnector:
             reqs_to_wait=self._reqs_to_wait,
             reqs_to_push=self._reqs_to_push,
             reqs_to_release=self._reqs_to_release,
+            release_reasons={
+                **self._release_reasons,
+                **{req_id: RELEASE_PRODUCER_PREEMPTED for req_id in preempted_req_ids},
+            },
             preempted_req_ids=preempted_req_ids,
         )
         for req_id in preempted_req_ids:
@@ -193,6 +202,7 @@ class PdSchedulerConnector:
         self._reqs_to_wait = {}
         self._reqs_to_push = {}
         self._reqs_to_release = set()
+        self._release_reasons = {}
         return meta
 
     def update_connector_output(self, connector_output: Any) -> None:
@@ -201,6 +211,7 @@ class PdSchedulerConnector:
         for req_id in connector_output.finished_sending or ():
             self._active_pushes.pop(req_id, None)
             self._reqs_to_release.add(req_id)
+            self._release_reasons[req_id] = RELEASE_PRODUCER_FINISHED
             logger.info("[PdConnector] scheduler finished sending req=%s", req_id)
 
         for req_id in connector_output.finished_recving or ():
@@ -233,12 +244,18 @@ class PdSchedulerConnector:
 
         if is_consumer(params):
             self._reqs_to_release.add(req_id)
+            self._release_reasons[req_id] = RELEASE_CONSUMER_ABORT
             self._active_waits.pop(req_id, None)
             self._completed_waits.discard(req_id)
             self._matched_ts_ns.pop(req_id, None)
 
         if is_prod and _request_was_aborted(request):
             self._reqs_to_release.add(req_id)
+            producer = parse_producer(params)
+            if producer is not None and producer.consumer_abort_returns_ack:
+                self._release_reasons[req_id] = RELEASE_CONSUMER_ABORT
+            else:
+                self._release_reasons[req_id] = RELEASE_PRODUCER_ABORT
             self._active_pushes.pop(req_id, None)
             return False, None
 
@@ -253,6 +270,7 @@ class PdSchedulerConnector:
             return True, None
         if is_prod:
             self._reqs_to_release.add(req_id)
+            self._release_reasons[req_id] = RELEASE_PRODUCER_FINISHED
             self._active_pushes.pop(req_id, None)
         return False, None
 

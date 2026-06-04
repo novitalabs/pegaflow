@@ -22,6 +22,8 @@ from pegaflow.pd_connector.metadata import (
     LayerRemoteLayout,
     PdConnectorMetadata,
     PdWorkerMetadata,
+    RELEASE_CONSUMER_ABORT,
+    RELEASE_PRODUCER_PREEMPTED,
 )
 from pegaflow.pd_connector.prefill_worker import PrefillHandler
 from pegaflow.pd_connector.rdma import RdmaPort, build_rdma_port
@@ -173,17 +175,19 @@ class PdWorkerConnector:
 
         for req_id in metadata.preempted_req_ids:
             logger.debug("[PdConnector] worker preempt req=%s", req_id)
-            for push_req_id in self._prefill.release(req_id):
+            for push_req_id in self._prefill.release(req_id, RELEASE_PRODUCER_PREEMPTED):
                 self.rdma.close_request(push_req_id)
 
         for req_id in metadata.reqs_to_release:
-            logger.debug("[PdConnector] worker release req=%s", req_id)
-            self._decode.release(req_id)
-            released_push_req_ids = self._prefill.release(req_id)
+            reason = metadata.release_reasons.get(req_id, RELEASE_CONSUMER_ABORT)
+            logger.debug("[PdConnector] worker release req=%s reason=%s", req_id, reason)
+            if reason == RELEASE_CONSUMER_ABORT:
+                self._decode.release(req_id)
+            released_push_req_ids = self._prefill.release(req_id, reason)
             if released_push_req_ids:
                 for push_req_id in released_push_req_ids:
                     self.rdma.close_request(push_req_id)
-            else:
+            elif reason != RELEASE_CONSUMER_ABORT:
                 self.rdma.close_request(req_id)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -229,6 +233,7 @@ class PdWorkerConnector:
         for req_id in releasable_sending:
             self.rdma.close_request(req_id)
         finished_recving = self.rdma.pop_finished_recving()
+        finished_recving.update(self._decode.pop_finished_aborted_recving())
         failed_recving = self._decode.pop_failed_recving()
         if failed_recving:
             finished_recving.update(failed_recving)
