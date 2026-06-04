@@ -25,7 +25,6 @@ shared_memory.workspace = true
 uuid.workspace = true
 opentelemetry.workspace = true
 bytesize.workspace = true
-serde.workspace = true
 libc.workspace = true
 rand.workspace = true
 ahash.workspace = true
@@ -33,8 +32,6 @@ io-uring = "0.7"
 futures.workspace = true
 parking_lot.workspace = true
 fastrace = { workspace = true, optional = true }
-kube.workspace = true
-k8s-openapi.workspace = true
 tonic.workspace = true
 dashmap.workspace = true
 smallvec.workspace = true

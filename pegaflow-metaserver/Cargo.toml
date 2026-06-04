@@ -18,16 +18,12 @@ path = "src/main.rs"
 [dependencies]
 pegaflow-common.workspace = true
 pegaflow-proto = { path = "../pegaflow-proto" }
-prost.workspace = true
 tonic.workspace = true
 tokio.workspace = true
 clap.workspace = true
 log.workspace = true
-parking_lot.workspace = true
 dashmap.workspace = true
 uuid.workspace = true
-serde.workspace = true
-serde_json.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 opentelemetry-prometheus.workspace = true

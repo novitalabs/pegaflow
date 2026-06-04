@@ -5,7 +5,7 @@
 //! - Tensor parallelism (TP) across multiple GPUs
 //! - Split-storage layout for efficient K/V batch transfers
 //! - SSD caching tier
-//! - Kubernetes service discovery for inter-node communication
+//! - MetaServer-backed block discovery and RDMA fetch
 
 #[macro_use]
 mod trace;

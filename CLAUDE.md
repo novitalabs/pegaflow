@@ -56,10 +56,9 @@ cargo bench --bench uds_latency
 2. **pegaflow-core** (Rust): Core storage engine
    - `PegaEngine`: Main engine managing GPU workers and KV cache storage
    - `storage/`: Modular block storage engine
-     - `mod.rs`: `StorageEngine` — aggregates allocator, read cache, prefetch, write pipeline, SSD store, remote fetch
+     - `mod.rs`: `StorageEngine` — aggregates allocator, read cache, prefetch, write pipeline, SSD store, RDMA fetch
      - `read_cache.rs`: Pin/unpin/consume operations on sealed blocks
-     - `prefetch.rs`: Per-request SSD prefetch state machine
-     - `remote_fetch.rs`: Per-request cross-node remote fetch state machine (oneshot + backpressure)
+     - `prefetch.rs`: Per-request SSD/RDMA prefetch state machine
      - `transfer_lock.rs`: Transfer lock manager — prevents LRU eviction during RDMA transfer
      - `write_path.rs`: Async insert worker thread for batched writes
    - `backing/`: SSD backing store
@@ -71,11 +70,7 @@ cargo bench --bench uds_latency
    - `cache.rs`: LRU cache for blocks
    - `gpu_worker.rs`: Per-GPU worker handling async operations
    - `internode/`: Cross-node communication
-     - `client.rs`: `PegaflowClient` / `PegaflowClientPool` for querying remote nodes
-     - `metaserver_query.rs`: MetaServer query client for block location discovery
-     - `remote_fetch_worker.rs`: Async RDMA fetch worker (MetaServer → gRPC → RDMA READ → SealedBlock)
-     - `registrar.rs`: Fire-and-forget block hash registration with MetaServer
-     - `service_discovery.rs`: Kubernetes pod watcher for PegaFlow instance discovery
+     - `metaserver_client.rs`: MetaServer registration, removal, query, and node heartbeat
 
 3. **pegaflow-proto** (Rust): Protobuf definitions
    - gRPC service definitions built with prost/tonic
@@ -168,16 +163,13 @@ vLLM Worker <--gRPC--> PegaEngine Server <--CUDA IPC--> GPU Memory
 - `pegaflow-common/src/logging.rs`: Unified log initialization
 - `pegaflow-common/src/numa.rs`: NUMA topology detection and CPU affinity
 - `pegaflow-core/src/lib.rs`: Main PegaEngine implementation
-- `pegaflow-core/src/storage/mod.rs`: StorageEngine (allocator, read cache, prefetch, write pipeline, remote fetch)
+- `pegaflow-core/src/storage/mod.rs`: StorageEngine (allocator, read cache, prefetch, write pipeline, RDMA fetch)
 - `pegaflow-core/src/storage/read_cache.rs`: Pin/unpin/consume operations
-- `pegaflow-core/src/storage/prefetch.rs`: SSD prefetch state machine
-- `pegaflow-core/src/storage/remote_fetch.rs`: Cross-node remote fetch state machine
+- `pegaflow-core/src/storage/prefetch.rs`: SSD/RDMA prefetch state machine
 - `pegaflow-core/src/storage/transfer_lock.rs`: Transfer lock manager for RDMA transfers
 - `pegaflow-core/src/storage/write_path.rs`: Async insert worker thread
 - `pegaflow-core/src/backing/ssd.rs`: SSD backing store coordinator
-- `pegaflow-core/src/internode/client.rs`: PegaflowClient/PegaflowClientPool for remote nodes
-- `pegaflow-core/src/internode/metaserver_query.rs`: MetaServer query client
-- `pegaflow-core/src/internode/remote_fetch_worker.rs`: Async RDMA fetch worker
+- `pegaflow-core/src/internode/metaserver_client.rs`: MetaServer registration, query, and node heartbeat
 - `pegaflow-server/src/service.rs`: gRPC service implementation
 - `pegaflow-metaserver/src/lib.rs`: MetaServer entry point and CLI
 - `pegaflow-metaserver/src/service.rs`: MetaServer gRPC service

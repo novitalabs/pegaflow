@@ -6,6 +6,9 @@ edition.workspace = true
 [lints]
 workspace = true
 
+[package.metadata.cargo-machete]
+ignored = ["prost", "tonic-prost"]
+
 [dependencies]
 prost.workspace = true
 tonic.workspace = true
