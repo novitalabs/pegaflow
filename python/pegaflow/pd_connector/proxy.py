@@ -102,8 +102,8 @@ def build_pd_proxy_request(
     prefill_req_id = f"{req_id}-p"
     decode_req_id = f"{req_id}-d"
     route = config.router.select() if config.router is not None else None
-    prefill_url = route.prefill.url if route is not None else config.prefill_url
-    decode_url = route.decode.url if route is not None else config.decode_url
+    prefill_url = (route.prefill.url if route is not None else config.prefill_url).rstrip("/")
+    decode_url = (route.decode.url if route is not None else config.decode_url).rstrip("/")
 
     decode_body = {
         **body,

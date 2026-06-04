@@ -2010,6 +2010,21 @@ def test_pd_proxy_build_router_preserves_policy_abstraction() -> None:
     assert second.decode.url == "http://d0"
 
 
+def test_pd_proxy_build_request_fallback_normalizes_endpoint_urls() -> None:
+    config = ProxyConfig(
+        prefill_url="http://p0/",
+        decode_url="http://d0/",
+        timeout_s=30,
+        prefill_max_tokens=1,
+        router=None,
+    )
+
+    req = build_pd_proxy_request({"model": "m", "prompt": "a"}, config, request_id="r0")
+
+    assert req.decode_url == "http://d0"
+    assert req.decode_body["kv_transfer_params"]["prefill_url"] == "http://p0"
+
+
 def test_pd_proxy_streams_sse_lines_without_large_read_buffering() -> None:
     class SlowSseBody:
         def __init__(self) -> None:
