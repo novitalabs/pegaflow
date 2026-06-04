@@ -64,6 +64,7 @@ from pegaflow.pd_connector.proxy import (  # noqa: E402
     PdEndpoint,
     ProxyConfig,
     RoundRobinPairRouter,
+    build_router,
     build_pd_proxy_request,
     iter_http_stream_chunks,
 )

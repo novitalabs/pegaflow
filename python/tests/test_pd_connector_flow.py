@@ -1994,6 +1994,22 @@ def test_pd_proxy_round_robin_pairs_all_prefill_decode_combinations() -> None:
     ]
 
 
+def test_pd_proxy_build_router_preserves_policy_abstraction() -> None:
+    router = build_router(
+        prefill_urls=("http://p0/", "http://p1/"),
+        decode_urls=("http://d0/",),
+        routing_policy="round_robin",
+    )
+
+    first = router.select()
+    second = router.select()
+
+    assert first.prefill.url == "http://p0"
+    assert first.decode.url == "http://d0"
+    assert second.prefill.url == "http://p1"
+    assert second.decode.url == "http://d0"
+
+
 def test_pd_proxy_streams_sse_lines_without_large_read_buffering() -> None:
     class SlowSseBody:
         def __init__(self) -> None:

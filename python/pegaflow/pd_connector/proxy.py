@@ -18,7 +18,7 @@ import uuid
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -43,6 +43,11 @@ class PdRoute:
 
     def as_tuple(self) -> tuple[str, str]:
         return (self.prefill.url, self.decode.url)
+
+
+class PdRouter(Protocol):
+    def select(self) -> PdRoute:
+        ...
 
 
 class RoundRobinPairRouter:
@@ -77,7 +82,7 @@ class ProxyConfig:
     decode_url: str
     timeout_s: float
     prefill_max_tokens: int
-    router: RoundRobinPairRouter | None = None
+    router: PdRouter | None = None
 
 
 @dataclass(frozen=True)
@@ -383,14 +388,16 @@ def build_router(
 ) -> RoundRobinPairRouter:
     if routing_policy != "round_robin":
         raise ValueError(f"unsupported routing policy {routing_policy!r}")
+    normalized_prefill_urls = tuple(url.rstrip("/") for url in prefill_urls)
+    normalized_decode_urls = tuple(url.rstrip("/") for url in decode_urls)
     return RoundRobinPairRouter(
         prefill_endpoints=tuple(
             PdEndpoint(url=url, instance_id=f"p{index}")
-            for index, url in enumerate(prefill_urls)
+            for index, url in enumerate(normalized_prefill_urls)
         ),
         decode_endpoints=tuple(
             PdEndpoint(url=url, instance_id=f"d{index}")
-            for index, url in enumerate(decode_urls)
+            for index, url in enumerate(normalized_decode_urls)
         ),
     )
 
