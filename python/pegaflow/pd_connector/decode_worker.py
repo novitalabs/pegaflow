@@ -130,7 +130,10 @@ class DecodeHandler:
                 self._dispatch_prefill(req, block_ids, imm_id)
 
     def release(self, req_id: str) -> None:
-        self._wait_reqs.pop(req_id, None)
+        req = self._wait_reqs.pop(req_id, None)
+        cancel_prefill = getattr(self._prefill_sender, "cancel", None)
+        if req is not None and cancel_prefill is not None:
+            cancel_prefill(req.remote_request_id)
         if self._rdma_waiter is not None:
             self._rdma_waiter.cancel(req_id)
 

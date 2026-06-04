@@ -117,9 +117,13 @@ class FakeSlotMapping(list[int]):
 class FakePrefillSender:
     def __init__(self) -> None:
         self.tasks = []
+        self.cancelled = []
 
     def submit(self, task) -> None:
         self.tasks.append(task)
+
+    def cancel(self, request_id: str) -> None:
+        self.cancelled.append(request_id)
 
 
 class FakeNativeRdmaEngine:

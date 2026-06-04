@@ -44,6 +44,11 @@ class AsyncPrefillSender:
             return
         asyncio.run_coroutine_threadsafe(self._submit(task), self._loop)
 
+    def cancel(self, request_id: str) -> None:
+        if self._closed:
+            return
+        asyncio.run_coroutine_threadsafe(self._cancel(request_id), self._loop)
+
     def close(self) -> None:
         if self._closed:
             return
@@ -62,23 +67,46 @@ class AsyncPrefillSender:
         )
         self._semaphore = asyncio.Semaphore(self._worker_count)
         self._tasks: set[asyncio.Task[None]] = set()
+        self._tasks_by_req: dict[str, asyncio.Task[None]] = {}
         self._loop_ready.set()
         self._loop.run_forever()
         self._loop.run_until_complete(self._client.aclose())
         self._loop.close()
 
     async def _submit(self, task: PrefillHttpTask) -> None:
+        old_task = self._tasks_by_req.pop(task.request_id, None)
+        if old_task is not None:
+            old_task.cancel()
         async_task = asyncio.create_task(self._run_task(task))
         self._tasks.add(async_task)
-        async_task.add_done_callback(self._tasks.discard)
+        self._tasks_by_req[task.request_id] = async_task
+
+        def _discard(done_task: asyncio.Task[None]) -> None:
+            self._tasks.discard(done_task)
+            if self._tasks_by_req.get(task.request_id) is done_task:
+                self._tasks_by_req.pop(task.request_id, None)
+
+        async_task.add_done_callback(_discard)
+
+    async def _cancel(self, request_id: str) -> None:
+        task = self._tasks_by_req.pop(request_id, None)
+        if task is not None:
+            task.cancel()
 
     async def _shutdown(self) -> None:
         if self._tasks:
+            for task in tuple(self._tasks):
+                task.cancel()
             await asyncio.gather(*tuple(self._tasks), return_exceptions=True)
+        self._tasks_by_req.clear()
 
     async def _run_task(self, task: PrefillHttpTask) -> None:
-        async with self._semaphore:
-            await post_prefill_request_async(task, self._client)
+        try:
+            async with self._semaphore:
+                await post_prefill_request_async(task, self._client)
+        except asyncio.CancelledError:
+            logger.info("[PdConnector] D -> P prefill cancelled req=%s", task.request_id)
+            raise
 
 
 def _prefill_request_body(task: PrefillHttpTask) -> dict[str, Any]:

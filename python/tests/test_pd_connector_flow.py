@@ -293,6 +293,42 @@ def test_d_worker_release_cancels_inflight_rdma_wait() -> None:
     rdma.wait_can_return.set()
 
 
+def test_d_worker_release_cancels_remote_prefill_request() -> None:
+    tensor = FakeTensor(
+        shape=(2, 8, 16, 4, 32),
+        stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
+    )
+    prefill_sender = FakePrefillSender()
+    worker = PdWorkerConnector(
+        SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(engine_id="decode"),
+            parallel_config=SimpleNamespace(tensor_parallel_rank=0, tensor_parallel_size=1),
+        ),
+        rdma=MockRdmaPort(),
+        prefill_sender=prefill_sender,
+    )
+    worker.register_kv_caches({"layer.0": tensor})
+    worker.start_load_kv(
+        PdConnectorMetadata(
+            reqs_to_wait={
+                "decode-1": WaitReqMeta(
+                    local_block_ids=([1],),
+                    remote_request_id="prefill-1",
+                    done_request_id="decode-1",
+                    prompt_token_ids=(1,),
+                    prefill_url="http://p:8001",
+                )
+            }
+        ),
+        None,
+    )
+    assert [task.request_id for task in prefill_sender.tasks] == ["prefill-1"]
+
+    worker.start_load_kv(PdConnectorMetadata(reqs_to_release={"decode-1"}), None)
+
+    assert prefill_sender.cancelled == ["prefill-1"]
+
+
 def test_d_worker_reregister_keeps_new_rdma_wait_after_old_wait_exits() -> None:
     class SequencedWaitRdma(MockRdmaPort):
         def __init__(self) -> None:
@@ -626,6 +662,31 @@ def test_scheduler_delays_producer_block_free_until_send_finishes() -> None:
     assert release_meta.reqs_to_release == {"req-1"}
 
 
+def test_scheduler_does_not_delay_aborted_producer_block_free() -> None:
+    scheduler = PdSchedulerConnector(
+        SimpleNamespace(kv_transfer_config=SimpleNamespace(engine_id="p"))
+    )
+    request = SimpleNamespace(
+        request_id="req-1",
+        status="FINISHED_ABORTED",
+        kv_transfer_params={
+            "do_remote_prefill_sender": True,
+            "target_engine_id": "decode",
+            "target_request_id": "req-1",
+        },
+    )
+
+    scheduler.update_state_after_alloc(request, ([1, 2],), num_external_tokens=0)
+    scheduler.build_connector_meta(SimpleNamespace())
+
+    delay_free, params = scheduler.request_finished(request, ([1, 2],))
+    release_meta = scheduler.build_connector_meta(SimpleNamespace())
+
+    assert delay_free is False
+    assert params is None
+    assert release_meta.reqs_to_release == {"req-1"}
+
+
 def test_scheduler_emits_cached_producer_chunks() -> None:
     scheduler = PdSchedulerConnector(
         SimpleNamespace(kv_transfer_config=SimpleNamespace(engine_id="p"))
@@ -893,6 +954,70 @@ def test_layer_push_sender_keeps_fifo_order() -> None:
         sender.close()
 
 
+def test_layer_push_sender_cancel_skips_queued_req() -> None:
+    class Event:
+        def __init__(self) -> None:
+            self.ready = threading.Event()
+
+        def synchronize(self) -> None:
+            assert self.ready.wait(timeout=2)
+
+    class RecordingRdma:
+        def __init__(self) -> None:
+            self.pushed: queue.Queue[str] = queue.Queue()
+
+        def push_layer(self, req_id, layer_idx, blocks) -> None:
+            self.pushed.put(req_id)
+
+    hold_event = Event()
+    ready_event = Event()
+    ready_event.ready.set()
+    rdma = RecordingRdma()
+    sender = prefill_worker_mod._AsyncLayerPushSender()
+    try:
+        sender.submit(
+            prefill_worker_mod._LayerPushTask(
+                rdma=rdma,
+                req_id="hold",
+                layer_idx=0,
+                block_slices=[],
+                event=hold_event,
+            )
+        )
+        sender.submit(
+            prefill_worker_mod._LayerPushTask(
+                rdma=rdma,
+                req_id="cancelled",
+                layer_idx=0,
+                block_slices=[],
+                event=ready_event,
+            )
+        )
+
+        sender.cancel("cancelled")
+        hold_event.ready.set()
+        sender.wait_all()
+
+        assert rdma.pushed.get(timeout=2) == "hold"
+        with pytest.raises(queue.Empty):
+            rdma.pushed.get(timeout=0.1)
+
+        sender.submit(
+            prefill_worker_mod._LayerPushTask(
+                rdma=rdma,
+                req_id="cancelled",
+                layer_idx=1,
+                block_slices=[],
+                event=ready_event,
+            )
+        )
+        sender.wait_req("cancelled")
+        assert rdma.pushed.get(timeout=2) == "cancelled"
+    finally:
+        hold_event.ready.set()
+        sender.close()
+
+
 def _prefill_http_task(request_id: str) -> PrefillHttpTask:
     return PrefillHttpTask(
         request_id=request_id,
@@ -925,6 +1050,35 @@ def test_async_prefill_sender_runs_requests_concurrently(monkeypatch) -> None:
         assert {entered.get(timeout=2), entered.get(timeout=2)} == {"req-1", "req-2"}
     finally:
         release.set()
+        sender.close()
+
+
+def test_async_prefill_sender_cancel_cancels_running_request(monkeypatch) -> None:
+    entered: queue.Queue[str] = queue.Queue()
+    cancelled: queue.Queue[str] = queue.Queue()
+
+    async def fake_post_prefill_request(task: PrefillHttpTask, _client=None) -> None:
+        entered.put(task.request_id)
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.put(task.request_id)
+            raise
+
+    monkeypatch.setattr(
+        prefill_mod,
+        "post_prefill_request_async",
+        fake_post_prefill_request,
+    )
+    sender = AsyncPrefillSender(worker_count=1)
+    try:
+        sender.submit(_prefill_http_task("req-1"))
+        assert entered.get(timeout=2) == "req-1"
+
+        sender.cancel("req-1")
+
+        assert cancelled.get(timeout=2) == "req-1"
+    finally:
         sender.close()
 
 
