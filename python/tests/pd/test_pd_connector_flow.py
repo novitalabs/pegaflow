@@ -1356,6 +1356,46 @@ def test_pd_proxy_streams_sse_lines_without_large_read_buffering() -> None:
     ]
 
 
+def test_pd_proxy_fastapi_route_injects_request(monkeypatch) -> None:
+    testclient = pytest.importorskip("fastapi.testclient")
+    responses = pytest.importorskip("fastapi.responses")
+
+    from pegaflow.pd_connector import proxy as proxy_mod
+
+    config = ProxyConfig(
+        prefill_url="http://127.0.0.1:8001",
+        decode_url="http://127.0.0.1:8002",
+        timeout_s=30,
+        prefill_max_tokens=1,
+    )
+    observed: dict[str, Any] = {}
+
+    async def handle_openai_request(self, path: str, body: dict[str, Any]):
+        observed["path"] = path
+        observed["body"] = body
+        return responses.Response(
+            content=b"{\"ok\":true}",
+            media_type="application/json",
+        )
+
+    monkeypatch.setattr(
+        proxy_mod.PdProxy,
+        "handle_openai_request",
+        handle_openai_request,
+    )
+
+    app = proxy_mod.create_app(config)
+    with testclient.TestClient(app) as client:
+        response = client.post("/v1/completions", json={"prompt": "hello"})
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"ok": True}
+    assert observed == {
+        "path": "/v1/completions",
+        "body": {"prompt": "hello"},
+    }
+
+
 def test_pd_connector_requires_piecewise_cudagraph_by_default() -> None:
     assert PdConnector.requires_piecewise_for_cudagraph({}) is True
 

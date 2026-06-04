@@ -1,4 +1,4 @@
-"""Small P/D proxy for exercising PdConnector with two local vLLM servers.
+"""Small async P/D proxy for exercising PdConnector with two local vLLM servers.
 
 The proxy accepts OpenAI-compatible completion requests, injects the
 ``kv_transfer_params`` expected by ``PdConnector``, and sends the request only
@@ -7,8 +7,6 @@ the prefill side. D begins decoding after its connector observes the RDMA IMM
 notification from P.
 """
 
-from __future__ import annotations
-
 import argparse
 import json
 import logging
@@ -16,15 +14,13 @@ import time
 import uuid
 from dataclasses import dataclass
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from typing import Any, AsyncIterator
+
+import httpx
 
 from pegaflow.pd_connector.kv_params import ConsumerKvParams
 
 logger = logging.getLogger("pegaflow.pd_proxy")
-
 
 SUPPORTED_PATHS = {"/v1/completions", "/v1/chat/completions"}
 
@@ -72,162 +68,196 @@ def build_pd_proxy_request(
 
 
 class PdProxy:
-    def __init__(self, config: ProxyConfig) -> None:
+    def __init__(self, config: ProxyConfig, client: httpx.AsyncClient) -> None:
         self.config = config
+        self.client = client
 
-    def handle_openai_request(self, path: str, body: dict[str, Any]) -> tuple[int, bytes, str]:
+    async def handle_openai_request(
+        self,
+        path: str,
+        body: dict[str, Any],
+    ) -> Any:
         if path not in SUPPORTED_PATHS:
             payload = {"error": f"unsupported path {path}"}
-            return HTTPStatus.NOT_FOUND, json.dumps(payload).encode(), "application/json"
+            from fastapi.responses import Response
+
+            return Response(
+                content=json.dumps(payload).encode(),
+                status_code=HTTPStatus.NOT_FOUND,
+                media_type="application/json",
+            )
 
         start_ts_ns = time.time_ns()
         req = build_pd_proxy_request(body, self.config, proxy_start_ts_ns=start_ts_ns)
+        if body.get("stream"):
+            req.decode_body["stream"] = True
+            logger.info(
+                "[PdProxy] request=%s accepted streaming path=%s ts_ns=%d",
+                req.request_id,
+                path,
+                start_ts_ns,
+            )
+            return await self._open_decode_stream(path, req, start_ts_ns)
+
         logger.info(
             "[PdProxy] request=%s accepted path=%s ts_ns=%d",
             req.request_id,
             path,
             start_ts_ns,
         )
+        return await self._post_decode(path, req, start_ts_ns)
 
-        decode_status, decode_body, decode_content_type = _post_json(
-            self.config.decode_url + path,
-            req.decode_body,
-            self.config.timeout_s,
+    async def _post_decode(
+        self,
+        path: str,
+        req: PdProxyRequest,
+        start_ts_ns: int,
+    ) -> Any:
+        from fastapi.responses import Response
+
+        payload = _compact_json_bytes(req.decode_body)
+        url = self.config.decode_url + path
+        logger.info(
+            "[PdProxy] request=%s -> D url=%s body_bytes=%d kv=%s",
             req.request_id,
-            "D",
+            url,
+            len(payload),
+            req.decode_body.get("kv_transfer_params"),
         )
+        response = await self.client.post(
+            url,
+            content=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        response_body = response.content
+        end_ts_ns = time.time_ns()
         logger.info(
             "[PdProxy] request=%s D completed status=%s bytes=%d latency_ms=%.3f ts_ns=%d",
             req.request_id,
-            decode_status,
-            len(decode_body),
-            (end_ts_ns := time.time_ns() - start_ts_ns) / 1_000_000,
-            start_ts_ns + end_ts_ns,
+            response.status_code,
+            len(response_body),
+            (end_ts_ns - start_ts_ns) / 1_000_000,
+            end_ts_ns,
         )
-        return decode_status, decode_body, decode_content_type
+        return Response(
+            content=response_body,
+            status_code=response.status_code,
+            media_type=response.headers.get("Content-Type", "application/json"),
+        )
 
-    def open_openai_stream(self, path: str, body: dict[str, Any]):
-        if path not in SUPPORTED_PATHS:
-            payload = {"error": f"unsupported path {path}"}
-            return (
-                HTTPStatus.NOT_FOUND,
-                "application/json",
-                None,
-                "",
-                time.time_ns(),
-                json.dumps(payload).encode(),
-            )
+    async def _open_decode_stream(
+        self,
+        path: str,
+        req: PdProxyRequest,
+        start_ts_ns: int,
+    ) -> Any:
+        from fastapi.responses import StreamingResponse
 
-        start_ts_ns = time.time_ns()
-        req = build_pd_proxy_request(body, self.config, proxy_start_ts_ns=start_ts_ns)
-        req.decode_body["stream"] = True
+        payload = _compact_json_bytes(req.decode_body)
+        url = self.config.decode_url + path
         logger.info(
-            "[PdProxy] request=%s accepted streaming path=%s ts_ns=%d",
+            "[PdProxy] request=%s -> D stream url=%s body_bytes=%d kv=%s",
             req.request_id,
-            path,
-            start_ts_ns,
+            url,
+            len(payload),
+            req.decode_body.get("kv_transfer_params"),
         )
-        response = _open_json(
-            self.config.decode_url + path,
-            req.decode_body,
-            self.config.timeout_s,
-            req.request_id,
-            "D",
-        )
-        logger.info(
-            "[PdProxy] request=%s D stream headers status=%s latency_ms=%.3f ts_ns=%d",
-            req.request_id,
-            int(response.status),
-            (header_delta_ns := time.time_ns() - start_ts_ns) / 1_000_000,
-            start_ts_ns + header_delta_ns,
-        )
-        return (
-            int(response.status),
-            response.headers.get("Content-Type", "text/event-stream"),
-            response,
-            req.request_id,
-            start_ts_ns,
-            None,
+
+        async def generate() -> AsyncIterator[bytes]:
+            first_chunk = True
+            async with self.client.stream(
+                "POST",
+                url,
+                content=payload,
+                headers={"Content-Type": "application/json"},
+            ) as response:
+                response.raise_for_status()
+                header_ts_ns = time.time_ns()
+                logger.info(
+                    "[PdProxy] request=%s D stream headers status=%s latency_ms=%.3f ts_ns=%d",
+                    req.request_id,
+                    response.status_code,
+                    (header_ts_ns - start_ts_ns) / 1_000_000,
+                    header_ts_ns,
+                )
+                async for chunk in response.aiter_bytes():
+                    if first_chunk:
+                        first_chunk = False
+                        now_ns = time.time_ns()
+                        logger.info(
+                            "[PdProxy] request=%s first stream chunk bytes=%d ttft_ms=%.3f ts_ns=%d",
+                            req.request_id,
+                            len(chunk),
+                            (now_ns - start_ts_ns) / 1_000_000,
+                            now_ns,
+                        )
+                    yield chunk
+
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache"},
         )
 
     def close(self) -> None:
         return None
 
 
-def _post_json(
-    url: str,
-    body: dict[str, Any],
-    timeout_s: float,
-    request_id: str,
-    role: str,
-) -> tuple[int, bytes, str]:
-    payload = json.dumps(body, separators=(",", ":")).encode()
-    logger.info(
-        "[PdProxy] request=%s -> %s url=%s body_bytes=%d kv=%s",
-        request_id,
-        role,
-        url,
-        len(payload),
-        body.get("kv_transfer_params"),
-    )
-    request = Request(
-        url,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urlopen(request, timeout=timeout_s) as response:
-            response_body = response.read()
-            return (
-                int(response.status),
-                response_body,
-                response.headers.get("Content-Type", "application/json"),
-            )
-    except HTTPError as exc:
-        response_body = exc.read()
-        logger.error(
-            "[PdProxy] request=%s %s returned status=%s body=%s",
-            request_id,
-            role,
-            exc.code,
-            response_body[:512],
+def create_app(config: ProxyConfig):
+    from contextlib import asynccontextmanager
+
+    from fastapi import FastAPI, Request
+    from fastapi.responses import Response
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        app.state.decode_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(config.timeout_s),
+            limits=httpx.Limits(max_connections=None, max_keepalive_connections=None),
         )
-        return int(exc.code), response_body, exc.headers.get("Content-Type", "application/json")
-    except URLError:
-        logger.exception("[PdProxy] request=%s %s connection failed url=%s", request_id, role, url)
-        raise
+        yield
+        await app.state.decode_client.aclose()
+
+    app = FastAPI(lifespan=lifespan)
+
+    async def handle(path: str, request: Request) -> Response:
+        try:
+            body = await request.json()
+            proxy = PdProxy(config, request.app.state.decode_client)
+            return await proxy.handle_openai_request(path, body)
+        except httpx.HTTPStatusError as exc:
+            logger.exception("[PdProxy] D returned HTTP error")
+            return Response(
+                content=await exc.response.aread(),
+                status_code=exc.response.status_code,
+                media_type=exc.response.headers.get("Content-Type", "application/json"),
+            )
+        except Exception as exc:
+            logger.exception("[PdProxy] request handling failed")
+            return Response(
+                content=json.dumps({"error": str(exc)}).encode(),
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                media_type="application/json",
+            )
+
+    @app.post("/v1/completions")
+    async def completions(request: Request) -> Response:
+        return await handle("/v1/completions", request)
+
+    @app.post("/v1/chat/completions")
+    async def chat_completions(request: Request) -> Response:
+        return await handle("/v1/chat/completions", request)
+
+    @app.get("/health")
+    @app.get("/healthcheck")
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    return app
 
 
-def _open_json(
-    url: str,
-    body: dict[str, Any],
-    timeout_s: float,
-    request_id: str,
-    role: str,
-):
-    payload = json.dumps(body, separators=(",", ":")).encode()
-    logger.info(
-        "[PdProxy] request=%s -> %s stream url=%s body_bytes=%d kv=%s",
-        request_id,
-        role,
-        url,
-        len(payload),
-        body.get("kv_transfer_params"),
-    )
-    request = Request(
-        url,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        return urlopen(request, timeout=timeout_s)
-    except HTTPError:
-        raise
-    except URLError:
-        logger.exception("[PdProxy] request=%s %s connection failed url=%s", request_id, role, url)
-        raise
+def _compact_json_bytes(body: dict[str, Any]) -> bytes:
+    return json.dumps(body, separators=(",", ":")).encode()
 
 
 def iter_http_stream_chunks(response) -> Any:
@@ -242,82 +272,6 @@ def iter_http_stream_chunks(response) -> Any:
         if line in {b"\n", b"\r\n"}:
             yield bytes(pending)
             pending.clear()
-
-
-class _Handler(BaseHTTPRequestHandler):
-    server: _PdHttpServer
-
-    def do_POST(self) -> None:
-        content_length = int(self.headers.get("Content-Length", "0"))
-        raw_body = self.rfile.read(content_length)
-        try:
-            body = json.loads(raw_body)
-            if body.get("stream"):
-                (
-                    status,
-                    content_type,
-                    response,
-                    request_id,
-                    start_ts_ns,
-                    payload,
-                ) = self.server.proxy.open_openai_stream(
-                    self.path,
-                    body,
-                )
-                self.send_response(int(status))
-                self.send_header("Content-Type", content_type)
-                if payload is not None:
-                    self.send_header("Content-Length", str(len(payload)))
-                else:
-                    self.send_header("Cache-Control", "no-cache")
-                self.end_headers()
-                if payload is not None:
-                    self.wfile.write(payload)
-                    return
-                with response:
-                    first_chunk = True
-                    for chunk in iter_http_stream_chunks(response):
-                        if first_chunk:
-                            first_chunk = False
-                            now_ns = time.time_ns()
-                            logger.info(
-                                "[PdProxy] request=%s first stream chunk bytes=%d ttft_ms=%.3f ts_ns=%d",
-                                request_id,
-                                len(chunk),
-                                (now_ns - start_ts_ns) / 1_000_000,
-                                now_ns,
-                            )
-                        self.wfile.write(chunk)
-                        self.wfile.flush()
-                return
-            status, payload, content_type = self.server.proxy.handle_openai_request(
-                self.path,
-                body,
-            )
-        except HTTPError as exc:
-            payload = exc.read()
-            status = int(exc.code)
-            content_type = exc.headers.get("Content-Type", "application/json")
-        except Exception as exc:
-            logger.exception("[PdProxy] request handling failed")
-            status = HTTPStatus.INTERNAL_SERVER_ERROR
-            payload = json.dumps({"error": str(exc)}).encode()
-            content_type = "application/json"
-
-        self.send_response(int(status))
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def log_message(self, format: str, *args: Any) -> None:
-        logger.info("[PdProxyHTTP] " + format, *args)
-
-
-class _PdHttpServer(ThreadingHTTPServer):
-    def __init__(self, server_address: tuple[str, int], proxy: PdProxy) -> None:
-        super().__init__(server_address, _Handler)
-        self.proxy = proxy
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -346,8 +300,6 @@ def main(argv: list[str] | None = None) -> None:
         timeout_s=args.timeout_s,
         prefill_max_tokens=args.prefill_max_tokens,
     )
-    proxy = PdProxy(config)
-    server = _PdHttpServer((args.listen_host, args.listen_port), proxy)
     logger.info(
         "[PdProxy] listening http://%s:%d prefill=%s decode=%s",
         args.listen_host,
@@ -355,11 +307,9 @@ def main(argv: list[str] | None = None) -> None:
         config.prefill_url,
         config.decode_url,
     )
-    try:
-        server.serve_forever()
-    finally:
-        proxy.close()
-        server.server_close()
+    import uvicorn
+
+    uvicorn.run(create_app(config), host=args.listen_host, port=args.listen_port)
 
 
 if __name__ == "__main__":
