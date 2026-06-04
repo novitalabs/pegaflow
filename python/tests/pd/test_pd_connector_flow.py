@@ -546,6 +546,47 @@ def test_p_worker_release_closes_all_physical_decode_targets() -> None:
     assert rdma.registered == set()
 
 
+def test_p_worker_preemption_cancels_push_without_waiting_for_done() -> None:
+    class TrackingRdma(MockRdmaPort):
+        def __init__(self) -> None:
+            super().__init__()
+            self.closed_reqs: list[str] = []
+
+        def close_request(self, req_id: str) -> None:
+            self.closed_reqs.append(req_id)
+            super().close_request(req_id)
+
+    tensor = FakeTensor(
+        shape=(2, 8, 16, 4, 32),
+        stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
+    )
+    rdma = TrackingRdma()
+    worker = PdWorkerConnector(
+        SimpleNamespace(kv_transfer_config=SimpleNamespace(engine_id="prefill")),
+        rdma=rdma,
+    )
+    worker.register_kv_caches({"layer.0": tensor, "layer.1": tensor})
+    worker.start_load_kv(
+        PdConnectorMetadata(
+            reqs_to_push={
+                "prefill-1": PushReqMeta(
+                    local_block_ids=([1],),
+                    target_request_id="decode-1",
+                    handshakes=(DUMMY_HANDSHAKE,),
+                )
+            }
+        ),
+        None,
+    )
+    assert rdma.registered == {"prefill-1"}
+
+    worker.start_load_kv(PdConnectorMetadata(preempted_req_ids={"prefill-1"}), None)
+
+    assert rdma.closed_reqs == ["prefill-1"]
+    assert rdma.registered == set()
+    assert worker.get_finished({"prefill-1"}) == (None, None)
+
+
 def test_p_worker_uses_scheduler_blocks_without_slot_mapping_cpu_sync() -> None:
     tensor = FakeTensor(
         shape=(2, 8, 16, 4, 32),
@@ -779,6 +820,26 @@ def test_scheduler_does_not_delay_aborted_producer_block_free() -> None:
     assert delay_free is False
     assert params is None
     assert release_meta.reqs_to_release == {"req-1"}
+
+
+def test_scheduler_marks_preempted_producer_for_worker_release() -> None:
+    scheduler = PdSchedulerConnector(
+        SimpleNamespace(kv_transfer_config=SimpleNamespace(engine_id="p"))
+    )
+    request = SimpleNamespace(
+        request_id="req-1",
+        kv_transfer_params={
+            "do_remote_prefill_sender": True,
+            "target_engine_id": "decode",
+            "target_request_id": "req-1",
+        },
+    )
+
+    scheduler.update_state_after_alloc(request, ([1, 2],), num_external_tokens=0)
+    meta = scheduler.build_connector_meta(SimpleNamespace(preempted_req_ids={"req-1"}))
+
+    assert meta.preempted_req_ids == {"req-1"}
+    assert "req-1" not in meta.reqs_to_release
 
 
 def test_scheduler_emits_cached_producer_chunks() -> None:

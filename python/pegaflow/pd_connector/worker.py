@@ -159,6 +159,7 @@ class PdWorkerConnector:
             not metadata.reqs_to_wait
             and not metadata.reqs_to_push
             and not metadata.reqs_to_release
+            and not metadata.preempted_req_ids
             and self._decode.is_idle()
             and not self._prefill.has_state()
         ):
@@ -169,6 +170,11 @@ class PdWorkerConnector:
 
         self._decode.process_wait_reqs(metadata.reqs_to_wait)
         self._prefill.process_push_reqs(metadata.reqs_to_push)
+
+        for req_id in metadata.preempted_req_ids:
+            logger.debug("[PdConnector] worker preempt req=%s", req_id)
+            for push_req_id in self._prefill.release(req_id):
+                self.rdma.close_request(push_req_id)
 
         for req_id in metadata.reqs_to_release:
             logger.debug("[PdConnector] worker release req=%s", req_id)
