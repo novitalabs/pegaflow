@@ -28,8 +28,11 @@ def _detect_pegaflow_cargo_features() -> list[str]:
     if not cuda_version:
         return []
 
+    # Keep parity with the default feature set (cuda-12 + rdma) so the e2e
+    # server build shares the cargo cache with maturin dev builds instead of
+    # invalidating it on every alternation.
     major = cuda_version.split(".", maxsplit=1)[0]
-    return ["cuda-13"] if major == "13" else []
+    return ["cuda-13", "rdma"] if major == "13" else []
 
 
 class VLLMServer:
@@ -185,6 +188,9 @@ class VLLMServer:
         start_time = time.time()
         print("Waiting for server to be ready...")
         while time.time() - start_time < timeout:
+            if self.process.poll() is not None:
+                hint = f", see {self.log_file}" if self.log_file else ""
+                raise RuntimeError(f"vLLM server exited with code {self.process.returncode}{hint}")
             for endpoint in self.health_endpoints:
                 url = f"http://localhost:{self.port}{endpoint}"
                 try:

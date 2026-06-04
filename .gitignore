@@ -13,6 +13,7 @@ venv/
 .pytest_cache/
 examples/bench_results/
 examples/pd_logs/
+python/tests/*.log
 
 # Built binaries in Python package (generated during wheel build)
 python/pegaflow/pegaflow-server
