@@ -253,7 +253,11 @@ class PdConnectorMetadata(KVConnectorMetadata):
 
 @dataclass
 class PdWorkerMetadata(KVConnectorWorkerMetadata):
+    failed_recving: set[str] = field(default_factory=set)
+
     def aggregate(self, other: KVConnectorWorkerMetadata) -> KVConnectorWorkerMetadata:
+        assert isinstance(other, PdWorkerMetadata)
+        self.failed_recving.update(other.failed_recving)
         return self
 
 

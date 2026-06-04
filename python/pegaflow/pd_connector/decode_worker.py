@@ -48,6 +48,7 @@ class DecodeHandler:
         self._expected_imm_counts: dict[int, int] = {}
         self._peer_block_size: int | None = None
         self._failed_recving: set[str] = set()
+        self._failed_recving_for_meta: set[str] = set()
         self._failed_block_ids: set[int] = set()
         self._next_imm_id = 1
         self._rdma_waiter: _AsyncRdmaDoneWaiter | None = (
@@ -161,6 +162,12 @@ class DecodeHandler:
             self._failed_recving = set()
             return failed
 
+    def pop_failed_recving_for_meta(self) -> set[str]:
+        with self._lock:
+            failed = self._failed_recving_for_meta
+            self._failed_recving_for_meta = set()
+            return failed
+
     def pop_failed_block_ids(self) -> set[int]:
         with self._lock:
             failed = self._failed_block_ids
@@ -171,6 +178,7 @@ class DecodeHandler:
         with self._lock:
             self._wait_reqs.clear()
             self._failed_recving.clear()
+            self._failed_recving_for_meta.clear()
             self._failed_block_ids.clear()
         if self._rdma_waiter is not None:
             self._rdma_waiter.close()
@@ -214,6 +222,7 @@ class DecodeHandler:
     def _mark_failed_locked(self, req_id: str, req: WaitReqMeta, exc: BaseException) -> None:
         failed_blocks = flatten_block_ids(req.local_block_ids)
         self._failed_recving.add(req_id)
+        self._failed_recving_for_meta.add(req_id)
         self._failed_block_ids.update(failed_blocks)
         self._wait_reqs.pop(req_id, None)
         logger.error(

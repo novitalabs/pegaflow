@@ -44,6 +44,7 @@ from pegaflow.pd_connector.metadata import (  # noqa: E402
     LayerRemoteLayout,
     PdConnectorMetadata,
     PdHandshake,
+    PdWorkerMetadata,
     PushReqMeta,
     TransferRegionLayout,
     WaitReqMeta,
