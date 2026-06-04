@@ -530,6 +530,49 @@ def test_d_worker_reregister_keeps_new_rdma_wait_after_old_wait_exits() -> None:
     rdma.second_can_return.set()
 
 
+def test_d_worker_starts_multiple_rdma_waits_concurrently() -> None:
+    class BlockingWaitRdma(MockRdmaPort):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = {f"req-{idx}": threading.Event() for idx in (1, 2)}
+            self.can_return = threading.Event()
+
+        def wait_done(self, req_id: str) -> None:
+            self.started[req_id].set()
+            assert self.can_return.wait(timeout=5), f"wait for {req_id} was not released"
+            self.mark_done(req_id)
+
+    tensor = FakeTensor(
+        shape=(2, 8, 16, 4, 32),
+        stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
+    )
+    rdma = BlockingWaitRdma()
+    worker = PdWorkerConnector(
+        SimpleNamespace(kv_transfer_config=SimpleNamespace(engine_id="decode")), rdma=rdma
+    )
+    worker.register_kv_caches({"layer.0": tensor})
+
+    worker.start_load_kv(
+        PdConnectorMetadata(
+            reqs_to_wait={
+                f"req-{idx}": WaitReqMeta(
+                    local_block_ids=([idx],),
+                    remote_request_id=f"req-{idx}-p",
+                    done_request_id=f"req-{idx}-d",
+                    prompt_token_ids=(idx,),
+                    prefill_url="",
+                )
+                for idx in (1, 2)
+            }
+        ),
+        None,
+    )
+
+    assert rdma.started["req-1"].wait(timeout=5)
+    assert rdma.started["req-2"].wait(timeout=0.2)
+    rdma.can_return.set()
+
+
 def test_p_worker_release_closes_all_physical_decode_targets() -> None:
     class TrackingRdma(MockRdmaPort):
         def __init__(self) -> None:

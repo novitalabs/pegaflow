@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import queue
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
@@ -451,23 +451,24 @@ class _RdmaWaitTask:
 
 
 class _AsyncRdmaDoneWaiter:
-    """One background thread blocking on each request's RDMA IMM completion.
+    """Background pool blocking on request RDMA IMM completion."""
 
-    submit() runs on the vLLM worker thread; _run() is the sole consumer.
-    _submitted is shared by those two threads, hence the lock. A request is
-    dropped from it once its wait resolves so the set tracks only in-flight waits.
-    """
-
-    def __init__(self, rdma: RdmaPort, failure_callback: Any | None = None) -> None:
+    def __init__(
+        self,
+        rdma: RdmaPort,
+        failure_callback: Any | None = None,
+        max_workers: int = 16,
+    ) -> None:
         self.rdma = rdma
         self._failure_callback = failure_callback
-        self._queue: queue.Queue[_RdmaWaitTask | None] = queue.Queue()
+        self._executor = ThreadPoolExecutor(
+            max_workers=max(1, int(max_workers)),
+            thread_name_prefix="pd-rdma-done-waiter",
+        )
         self._submitted: dict[str, int] = {}
         self._cancelled: dict[str, set[int]] = {}
         self._next_generation: dict[str, int] = {}
         self._lock = threading.Lock()
-        self._thread = threading.Thread(target=self._run, name="pd-rdma-done-waiter", daemon=True)
-        self._thread.start()
 
     def submit(self, task: _RdmaWaitTask) -> _RdmaWaitTask | None:
         with self._lock:
@@ -485,9 +486,9 @@ class _AsyncRdmaDoneWaiter:
             task.rank,
             task.block_count,
             task.prefill_url or "<oob>",
-            self._queue.qsize(),
+            len(self._submitted),
         )
-        self._queue.put(task)
+        self._executor.submit(self._run_task, task)
         return task
 
     def cancel(self, req_id: str) -> None:
@@ -498,42 +499,26 @@ class _AsyncRdmaDoneWaiter:
             self._cancelled.setdefault(req_id, set()).add(generation)
 
     def close(self) -> None:
-        self._queue.put(None)
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
-    def _run(self) -> None:
-        while True:
-            task = self._queue.get()
-            if task is None:
-                return
-            try:
-                if self._is_cancelled(task.req_id, task.generation):
-                    logger.info(
-                        "[PdConnector] D RDMA done wait cancelled before start req=%s remote_req=%s done_req=%s rank=%d blocks=%d",
-                        task.req_id,
-                        task.remote_request_id,
-                        task.done_request_id,
-                        task.rank,
-                        task.block_count,
-                    )
-                    continue
-                start_ts_ns = time.time_ns()
-                self.rdma.wait_done(task.req_id)
-                done_ts_ns = time.time_ns()
-                if self._is_cancelled(task.req_id, task.generation):
-                    logger.info(
-                        "[PdConnector] D RDMA done wait cancelled req=%s remote_req=%s done_req=%s rank=%d blocks=%d queue_wait_ms=%.3f wait_ms=%.3f ts_ns=%d",
-                        task.req_id,
-                        task.remote_request_id,
-                        task.done_request_id,
-                        task.rank,
-                        task.block_count,
-                        (start_ts_ns - task.queued_ts_ns) / 1_000_000,
-                        (done_ts_ns - start_ts_ns) / 1_000_000,
-                        done_ts_ns,
-                    )
-                    continue
+    def _run_task(self, task: _RdmaWaitTask) -> None:
+        try:
+            if self._is_cancelled(task.req_id, task.generation):
                 logger.info(
-                    "[PdConnector] D received RDMA done req=%s remote_req=%s done_req=%s rank=%d blocks=%d queue_wait_ms=%.3f wait_ms=%.3f ts_ns=%d",
+                    "[PdConnector] D RDMA done wait cancelled before start req=%s remote_req=%s done_req=%s rank=%d blocks=%d",
+                    task.req_id,
+                    task.remote_request_id,
+                    task.done_request_id,
+                    task.rank,
+                    task.block_count,
+                )
+                return
+            start_ts_ns = time.time_ns()
+            self.rdma.wait_done(task.req_id)
+            done_ts_ns = time.time_ns()
+            if self._is_cancelled(task.req_id, task.generation):
+                logger.info(
+                    "[PdConnector] D RDMA done wait cancelled req=%s remote_req=%s done_req=%s rank=%d blocks=%d queue_wait_ms=%.3f wait_ms=%.3f ts_ns=%d",
                     task.req_id,
                     task.remote_request_id,
                     task.done_request_id,
@@ -543,27 +528,38 @@ class _AsyncRdmaDoneWaiter:
                     (done_ts_ns - start_ts_ns) / 1_000_000,
                     done_ts_ns,
                 )
-            except Exception as exc:
-                logger.exception(
-                    "[PdConnector] D RDMA done wait failed req=%s remote_req=%s done_req=%s rank=%d blocks=%d",
-                    task.req_id,
-                    task.remote_request_id,
-                    task.done_request_id,
-                    task.rank,
-                    task.block_count,
-                )
-                if self._failure_callback is not None:
-                    self._failure_callback(task.req_id, exc)
-            finally:
-                with self._lock:
-                    if self._submitted.get(task.req_id) == task.generation:
-                        self._submitted.pop(task.req_id, None)
-                    cancelled = self._cancelled.get(task.req_id)
-                    if cancelled is not None:
-                        cancelled.discard(task.generation)
-                        if not cancelled:
-                            self._cancelled.pop(task.req_id, None)
-                self._queue.task_done()
+                return
+            logger.info(
+                "[PdConnector] D received RDMA done req=%s remote_req=%s done_req=%s rank=%d blocks=%d queue_wait_ms=%.3f wait_ms=%.3f ts_ns=%d",
+                task.req_id,
+                task.remote_request_id,
+                task.done_request_id,
+                task.rank,
+                task.block_count,
+                (start_ts_ns - task.queued_ts_ns) / 1_000_000,
+                (done_ts_ns - start_ts_ns) / 1_000_000,
+                done_ts_ns,
+            )
+        except Exception as exc:
+            logger.exception(
+                "[PdConnector] D RDMA done wait failed req=%s remote_req=%s done_req=%s rank=%d blocks=%d",
+                task.req_id,
+                task.remote_request_id,
+                task.done_request_id,
+                task.rank,
+                task.block_count,
+            )
+            if self._failure_callback is not None:
+                self._failure_callback(task.req_id, exc)
+        finally:
+            with self._lock:
+                if self._submitted.get(task.req_id) == task.generation:
+                    self._submitted.pop(task.req_id, None)
+                cancelled = self._cancelled.get(task.req_id)
+                if cancelled is not None:
+                    cancelled.discard(task.generation)
+                    if not cancelled:
+                        self._cancelled.pop(task.req_id, None)
 
     def _is_cancelled(self, req_id: str, generation: int) -> bool:
         with self._lock:
