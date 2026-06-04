@@ -3,13 +3,16 @@ use std::collections::HashMap;
 use log::{debug, error, info, warn};
 use pegaflow_proto::proto::engine::meta_server_client::MetaServerClient as MetaServerGrpcClient;
 use pegaflow_proto::proto::engine::{
-    HeartbeatNodeRequest, InsertBlockHashesRequest, NodePrefixResult, QueryPrefixBlocksRequest,
-    RemoveBlockHashesRequest, UnregisterNodeRequest,
+    HeartbeatNodeRequest, InsertBlockHashesRequest, RemoveBlockHashesRequest, UnregisterNodeRequest,
 };
+#[cfg(feature = "rdma")]
+use pegaflow_proto::proto::engine::{NodePrefixResult, QueryPrefixBlocksRequest};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, Instant};
 use tonic::Code;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
+#[cfg(feature = "rdma")]
+use tonic::transport::Endpoint;
 use uuid::Uuid;
 
 use crate::metrics::core_metrics;
@@ -17,11 +20,13 @@ use crate::metrics::core_metrics;
 pub const DEFAULT_METASERVER_QUEUE_DEPTH: usize = 256;
 
 /// Error type for MetaServer client operations.
+#[cfg(feature = "rdma")]
 #[derive(Debug)]
 pub(crate) enum ClientError {
     RpcFailed(String),
 }
 
+#[cfg(feature = "rdma")]
 impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -113,6 +118,7 @@ pub struct MetaServerClient {
     /// Fire-and-forget command channel for insert/remove operations.
     command_tx: mpsc::Sender<MetaServerCommand>,
     /// Lazy-connect query client
+    #[cfg(feature = "rdma")]
     query_client: MetaServerGrpcClient<Channel>,
 }
 
@@ -130,10 +136,13 @@ impl MetaServerClient {
         ));
 
         // Lazy-connect query client: connects on first RPC, not here
-        let channel = Endpoint::from_shared(config.metaserver_addr.clone())
-            .expect("valid metaserver_addr URI")
-            .connect_lazy();
-        let query_client = MetaServerGrpcClient::new(channel);
+        #[cfg(feature = "rdma")]
+        let query_client = {
+            let channel = Endpoint::from_shared(config.metaserver_addr.clone())
+                .expect("valid metaserver_addr URI")
+                .connect_lazy();
+            MetaServerGrpcClient::new(channel)
+        };
 
         info!(
             "MetaServer client started (queue_depth={}, addr={})",
@@ -142,6 +151,7 @@ impl MetaServerClient {
 
         Self {
             command_tx,
+            #[cfg(feature = "rdma")]
             query_client,
         }
     }
@@ -242,6 +252,7 @@ impl MetaServerClient {
 
     /// Query MetaServer for the longest prefix of blocks that exist remotely.
     /// Returns per-node prefix lengths.
+    #[cfg(feature = "rdma")]
     pub(crate) async fn query_prefix(
         &self,
         namespace: &str,
@@ -697,8 +708,9 @@ mod tests {
     use super::*;
     use pegaflow_proto::proto::engine::meta_server_server::{MetaServer, MetaServerServer};
     use pegaflow_proto::proto::engine::{
-        HeartbeatNodeResponse, InsertBlockHashesResponse, QueryPrefixBlocksResponse,
-        RemoveBlockHashesResponse, ResponseStatus, UnregisterNodeResponse,
+        HeartbeatNodeResponse, InsertBlockHashesResponse, QueryPrefixBlocksRequest,
+        QueryPrefixBlocksResponse, RemoveBlockHashesResponse, ResponseStatus,
+        UnregisterNodeResponse,
     };
     use std::collections::BTreeMap;
     use std::net::SocketAddr;
