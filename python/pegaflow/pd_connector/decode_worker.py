@@ -50,6 +50,8 @@ class DecodeHandler:
         self._failed_recving: set[str] = set()
         self._failed_recving_for_meta: set[str] = set()
         self._failed_block_ids: set[int] = set()
+        self._aborted_waits: set[str] = set()
+        self._finished_aborted_recving: set[str] = set()
         self._next_imm_id = 1
         self._rdma_waiter: _AsyncRdmaDoneWaiter | None = (
             _AsyncRdmaDoneWaiter(worker.rdma, failure_callback=self._mark_wait_failed)
@@ -143,18 +145,25 @@ class DecodeHandler:
 
     def release(self, req_id: str) -> None:
         with self._lock:
-            req = self._wait_reqs.pop(req_id, None)
+            req = self._wait_reqs.get(req_id)
+            if req is not None:
+                self._aborted_waits.add(req_id)
         cancel_prefill = getattr(self._prefill_sender, "cancel", None)
         if req is not None and cancel_prefill is not None:
             cancel_prefill(req.remote_request_id)
-        if self._rdma_waiter is not None:
-            self._rdma_waiter.cancel(req_id)
 
     def finish_recving(self, finished_recving: set[str]) -> None:
         for req_id in finished_recving:
             with self._lock:
                 self._wait_reqs.pop(req_id, None)
+                self._aborted_waits.discard(req_id)
             self._w.rdma.close_request(req_id)
+
+    def pop_finished_aborted_recving(self) -> set[str]:
+        with self._lock:
+            finished = self._finished_aborted_recving
+            self._finished_aborted_recving = set()
+            return finished
 
     def pop_failed_recving(self) -> set[str]:
         with self._lock:
@@ -180,6 +189,8 @@ class DecodeHandler:
             self._failed_recving.clear()
             self._failed_recving_for_meta.clear()
             self._failed_block_ids.clear()
+            self._aborted_waits.clear()
+            self._finished_aborted_recving.clear()
         if self._rdma_waiter is not None:
             self._rdma_waiter.close()
         close = getattr(self._prefill_sender, "close", None)
@@ -192,7 +203,12 @@ class DecodeHandler:
 
     def is_idle(self) -> bool:
         with self._lock:
-            return not self._wait_reqs and not self._failed_recving and not self._failed_block_ids
+            return (
+                not self._wait_reqs
+                and not self._failed_recving
+                and not self._failed_block_ids
+                and not self._finished_aborted_recving
+            )
 
     def _mark_prefill_failed(self, remote_request_id: str, exc: BaseException) -> None:
         with self._lock:
@@ -217,6 +233,17 @@ class DecodeHandler:
                     exc,
                 )
                 return
+            if req_id in self._aborted_waits:
+                self._wait_reqs.pop(req_id, None)
+                self._aborted_waits.discard(req_id)
+                self._finished_aborted_recving.add(req_id)
+                logger.info(
+                    "[PdConnector] D treating aborted wait as finished req=%s remote_req=%s error=%s",
+                    req_id,
+                    req.remote_request_id,
+                    exc,
+                )
+                return
             self._mark_failed_locked(req_id, req, exc)
 
     def _mark_failed_locked(self, req_id: str, req: WaitReqMeta, exc: BaseException) -> None:
@@ -224,6 +251,7 @@ class DecodeHandler:
         self._failed_recving.add(req_id)
         self._failed_recving_for_meta.add(req_id)
         self._failed_block_ids.update(failed_blocks)
+        self._aborted_waits.discard(req_id)
         self._wait_reqs.pop(req_id, None)
         logger.error(
             "[PdConnector] D marked recv failed req=%s remote_req=%s blocks=%d error=%s",
@@ -259,6 +287,7 @@ class DecodeHandler:
             ),
             imm_id=imm_id,
             fail_imm_id=_fail_imm_id(imm_id),
+            abort_imm_id=_abort_imm_id(imm_id),
             expected_imm_count=self._expected_imm_count_for_local_rank(),
         )
 
@@ -279,6 +308,7 @@ class DecodeHandler:
             "target_engine_id": self._w.engine_id,
             "target_request_id": req.done_request_id,
             "pd_handshakes": all_handshakes,
+            "pd_consumer_abort_returns_ack": True,
         }
         task = PrefillHttpTask(
             request_id=req.remote_request_id,
@@ -327,6 +357,7 @@ class DecodeHandler:
                     "layers": list(self._peer_layer_templates[rank]),
                     "imm_id": imm_id,
                     "fail_imm_id": _fail_imm_id(imm_id),
+                    "abort_imm_id": _abort_imm_id(imm_id),
                     "expected_imm_count": self._expected_imm_count_for_rank(rank),
                 }
             )
@@ -579,3 +610,7 @@ def _ceil_div(value: int, divisor: int) -> int:
 
 def _fail_imm_id(imm_id: int) -> int:
     return imm_id ^ 0x8000_0000
+
+
+def _abort_imm_id(imm_id: int) -> int:
+    return imm_id ^ 0x4000_0000
