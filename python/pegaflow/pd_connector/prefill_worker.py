@@ -5,6 +5,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
@@ -712,27 +713,32 @@ class _PushFinalizeTask:
 
 
 class _AsyncLayerPushSender:
-    def __init__(self) -> None:
-        self._queue: queue.Queue[_LayerPushTask | None] = queue.Queue()
+    def __init__(self, max_workers: int = 16) -> None:
         self._condition = threading.Condition()
         self._inflight = 0
         self._inflight_by_req: dict[str, int] = {}
         self._cancelled: set[str] = set()
         self._error: BaseException | None = None
-        self._thread = threading.Thread(
-            target=self._run,
-            name="pd-rdma-push-sender",
-            daemon=True,
+        self._closed = False
+        self._executor = ThreadPoolExecutor(
+            max_workers=max(1, int(max_workers)),
+            thread_name_prefix="pd-rdma-push",
         )
-        self._thread.start()
 
     def submit(self, task: _LayerPushTask) -> None:
         with self._condition:
+            if self._closed:
+                raise RuntimeError("PdConnector RDMA push sender is closed")
             if self._error is not None:
                 raise self._error
             self._inflight += 1
             self._inflight_by_req[task.req_id] = self._inflight_by_req.get(task.req_id, 0) + 1
-        self._queue.put(task)
+        try:
+            self._executor.submit(self._run_task, task)
+        except BaseException:
+            with self._condition:
+                self._finish_task(task)
+            raise
 
     def wait_all(self) -> None:
         with self._condition:
@@ -763,36 +769,38 @@ class _AsyncLayerPushSender:
             self._condition.notify_all()
 
     def close(self) -> None:
-        self._queue.put(None)
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
     def is_idle(self) -> bool:
         with self._condition:
             return self._inflight == 0 and self._error is None
 
-    def _run(self) -> None:
-        while True:
-            task = self._queue.get()
-            try:
-                if task is None:
-                    return
-                if task.req_id not in self._cancelled:
-                    _run_layer_push(task)
-            except BaseException as exc:
-                with self._condition:
-                    self._error = exc
-                    self._condition.notify_all()
-            finally:
-                if task is not None:
-                    with self._condition:
-                        self._inflight -= 1
-                        remaining = self._inflight_by_req.get(task.req_id, 0) - 1
-                        if remaining > 0:
-                            self._inflight_by_req[task.req_id] = remaining
-                        else:
-                            self._inflight_by_req.pop(task.req_id, None)
-                            self._cancelled.discard(task.req_id)
-                        self._condition.notify_all()
-                self._queue.task_done()
+    def _run_task(self, task: _LayerPushTask) -> None:
+        try:
+            with self._condition:
+                cancelled = task.req_id in self._cancelled
+            if not cancelled:
+                _run_layer_push(task)
+        except BaseException as exc:
+            with self._condition:
+                self._error = exc
+                self._condition.notify_all()
+        finally:
+            with self._condition:
+                self._finish_task(task)
+
+    def _finish_task(self, task: _LayerPushTask) -> None:
+        self._inflight -= 1
+        remaining = self._inflight_by_req.get(task.req_id, 0) - 1
+        if remaining > 0:
+            self._inflight_by_req[task.req_id] = remaining
+        else:
+            self._inflight_by_req.pop(task.req_id, None)
+            self._cancelled.discard(task.req_id)
+        self._condition.notify_all()
 
 
 def _run_layer_push(task: _LayerPushTask) -> None:

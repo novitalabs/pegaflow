@@ -1309,7 +1309,7 @@ def test_d_worker_rank0_dispatches_prefill_on_wait() -> None:
     assert parsed.layers[0].block_ids == (1,)
 
 
-def test_layer_push_sender_keeps_fifo_order() -> None:
+def test_layer_push_sender_runs_requests_concurrently() -> None:
     class Event:
         def __init__(self) -> None:
             self.ready = threading.Event()
@@ -1317,47 +1317,46 @@ def test_layer_push_sender_keeps_fifo_order() -> None:
         def synchronize(self) -> None:
             assert self.ready.wait(timeout=2)
 
-    class RecordingRdma:
+    class BlockingRdma:
         def __init__(self) -> None:
-            self.pushed: queue.Queue[int] = queue.Queue()
+            self.entered: queue.Queue[str] = queue.Queue()
+            self.release = threading.Event()
 
         def push_layer(self, req_id, layer_idx, blocks) -> None:
-            self.pushed.put(layer_idx)
+            self.entered.put(req_id)
+            assert self.release.wait(timeout=2)
 
-    first_event = Event()
     ready_event = Event()
     ready_event.ready.set()
-    rdma = RecordingRdma()
+    rdma = BlockingRdma()
     sender = prefill_worker_mod._AsyncLayerPushSender()
     try:
         sender.submit(
             prefill_worker_mod._LayerPushTask(
                 rdma=rdma,
-                req_id="req",
+                req_id="req-1",
                 layer_idx=0,
                 block_slices=[],
-                event=first_event,
+                event=ready_event,
             )
         )
         sender.submit(
             prefill_worker_mod._LayerPushTask(
                 rdma=rdma,
-                req_id="req",
+                req_id="req-2",
                 layer_idx=1,
                 block_slices=[],
                 event=ready_event,
             )
         )
 
-        with pytest.raises(queue.Empty):
-            rdma.pushed.get(timeout=0.1)
-        first_event.ready.set()
-        sender.wait_req("req")
+        entered = {rdma.entered.get(timeout=2), rdma.entered.get(timeout=2)}
+        assert entered == {"req-1", "req-2"}
 
-        assert rdma.pushed.get(timeout=2) == 0
-        assert rdma.pushed.get(timeout=2) == 1
+        rdma.release.set()
+        sender.wait_all()
     finally:
-        first_event.ready.set()
+        rdma.release.set()
         sender.close()
 
 
@@ -1380,7 +1379,7 @@ def test_layer_push_sender_cancel_skips_queued_req() -> None:
     ready_event = Event()
     ready_event.ready.set()
     rdma = RecordingRdma()
-    sender = prefill_worker_mod._AsyncLayerPushSender()
+    sender = prefill_worker_mod._AsyncLayerPushSender(max_workers=1)
     try:
         sender.submit(
             prefill_worker_mod._LayerPushTask(
