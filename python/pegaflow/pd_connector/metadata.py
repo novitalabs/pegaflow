@@ -242,11 +242,13 @@ class PdConnectorMetadata(KVConnectorMetadata):
         reqs_to_wait: dict[str, WaitReqMeta] | None = None,
         reqs_to_push: dict[str, PushReqMeta] | None = None,
         reqs_to_release: set[str] | None = None,
+        preempted_req_ids: set[str] | None = None,
     ) -> None:
         super().__init__()
         self.reqs_to_wait = reqs_to_wait or {}
         self.reqs_to_push = reqs_to_push or {}
         self.reqs_to_release = reqs_to_release or set()
+        self.preempted_req_ids = preempted_req_ids or set()
 
 
 @dataclass

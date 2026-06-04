@@ -180,11 +180,16 @@ class PdSchedulerConnector:
 
     def build_connector_meta(self, scheduler_output: Any) -> PdConnectorMetadata:
         self._add_cached_producer_chunks(scheduler_output)
+        preempted_req_ids = self._preempted_producer_req_ids(scheduler_output)
         meta = PdConnectorMetadata(
             reqs_to_wait=self._reqs_to_wait,
             reqs_to_push=self._reqs_to_push,
             reqs_to_release=self._reqs_to_release,
+            preempted_req_ids=preempted_req_ids,
         )
+        for req_id in preempted_req_ids:
+            self._active_pushes.pop(req_id, None)
+            self._reqs_to_push.pop(req_id, None)
         self._reqs_to_wait = {}
         self._reqs_to_push = {}
         self._reqs_to_release = set()
@@ -261,6 +266,10 @@ class PdSchedulerConnector:
             if not _has_blocks(local_block_ids):
                 continue
             self._reqs_to_push[req_id] = replace(push_req, local_block_ids=local_block_ids)
+
+    def _preempted_producer_req_ids(self, scheduler_output: Any) -> set[str]:
+        preempted = getattr(scheduler_output, "preempted_req_ids", None) or set()
+        return {str(req_id) for req_id in preempted if str(req_id) in self._active_pushes}
 
     def shutdown(self) -> None:
         pass
