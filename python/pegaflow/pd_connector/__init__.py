@@ -12,6 +12,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 
 from pegaflow.pd_connector.metadata import PdConnectorMetadata
+from pegaflow.pd_connector.metrics import PdKVConnectorStats, PdMetricsTracker, PdPromMetrics
 from pegaflow.pd_connector.scheduler import PdSchedulerConnector
 from pegaflow.pd_connector.worker import PdWorkerConnector, model_uses_mla
 
@@ -24,10 +25,15 @@ class PdConnector(KVConnectorBase_V1, SupportsHMA):
         _assert_supported_config(vllm_config)
         self._scheduler: PdSchedulerConnector | None = None
         self._worker: PdWorkerConnector | None = None
+        self._metrics = PdMetricsTracker()
         if role == KVConnectorRole.SCHEDULER:
-            self._scheduler = PdSchedulerConnector(vllm_config)
+            self._scheduler = PdSchedulerConnector(vllm_config, metrics=self._metrics)
         elif role == KVConnectorRole.WORKER:
-            self._worker = PdWorkerConnector(vllm_config, kv_cache_config=kv_cache_config)
+            self._worker = PdWorkerConnector(
+                vllm_config,
+                kv_cache_config=kv_cache_config,
+                metrics=self._metrics,
+            )
         else:
             raise ValueError(f"unsupported KV connector role: {role}")
 
@@ -131,6 +137,25 @@ class PdConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self._scheduler is not None
         return self._scheduler.request_finished(request, block_ids)
+
+    def get_kv_connector_stats(self) -> PdKVConnectorStats | None:
+        return self._metrics.get_stats()
+
+    @classmethod
+    def build_kv_connector_stats(cls, data: dict | None = None) -> PdKVConnectorStats | None:
+        if data is None:
+            return None
+        return PdKVConnectorStats(data=data)
+
+    @classmethod
+    def build_prom_metrics(
+        cls,
+        vllm_config,
+        metric_types,
+        labelnames,
+        per_engine_labelvalues,
+    ) -> PdPromMetrics:
+        return PdPromMetrics(vllm_config, metric_types, labelnames, per_engine_labelvalues)
 
 
 __all__ = ["PdConnector"]

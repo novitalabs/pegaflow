@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import queue
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -26,13 +25,12 @@ from pegaflow.pd_connector.layout_mapping import (
     build_push_layout_plan,
 )
 from pegaflow.pd_connector.metadata import (
+    RELEASE_CONSUMER_ABORT,
+    RELEASE_PRODUCER_ABORT,
+    RELEASE_PRODUCER_PREEMPTED,
     LayerRemoteLayout,
     PdHandshake,
     PushReqMeta,
-    RELEASE_CONSUMER_ABORT,
-    RELEASE_PRODUCER_ABORT,
-    RELEASE_PRODUCER_FINISHED,
-    RELEASE_PRODUCER_PREEMPTED,
     flatten_block_ids,
 )
 from pegaflow.pd_connector.rdma import RdmaPort
@@ -61,8 +59,8 @@ class PrefillHandler:
         self._logical_to_physical: dict[str, tuple[str, ...]] = {}
         self._push_traces: dict[str, _PushTrace] = {}
         self._skipped_pushes = 0
-        self._push_sender = _AsyncLayerPushSender()
-        self._push_finalizer = _AsyncPushFinalizer(self._push_sender)
+        self._push_sender = _AsyncLayerPushSender(metrics=worker.metrics)
+        self._push_finalizer = _AsyncPushFinalizer(self._push_sender, metrics=worker.metrics)
 
     def process_push_reqs(self, reqs_to_push: dict[str, PushReqMeta]) -> None:
         for req_id, req in reqs_to_push.items():
@@ -70,6 +68,7 @@ class PrefillHandler:
             plan = self._build_push_layout_plan(req)
             if plan.should_skip:
                 self._skipped_pushes += 1
+                self._w.metrics.record_prefill_skipped_push()
                 self._completed_pushes.add(req_id)
                 logger.info(
                     "[PdConnector] P skipped push req=%s target_req=%s rank=%d skipped_total=%d",
@@ -80,6 +79,7 @@ class PrefillHandler:
                 )
                 continue
             self._push_reqs[req_id] = req
+            self._w.metrics.set_prefill_active_pushes(len(self._push_reqs))
             self._push_plans[req_id] = plan
             self._push_traces.setdefault(req_id, _PushTrace(queued_ts_ns=time.time_ns()))
             self._pending_push_chunks.add(req_id)
@@ -107,6 +107,8 @@ class PrefillHandler:
 
     def release(self, req_id: str, reason: str = RELEASE_CONSUMER_ABORT) -> tuple[str, ...]:
         self._push_reqs.pop(req_id, None)
+        self._w.metrics.set_prefill_active_pushes(len(self._push_reqs))
+        self._w.metrics.record_prefill_release()
         self._pending_push_chunks.discard(req_id)
         self._push_chunk_maps.pop(req_id, None)
         self._push_plans.pop(req_id, None)
@@ -215,6 +217,7 @@ class PrefillHandler:
             self._completed_pushes.discard(req_id)
             self._producer_finished_req_ids.discard(req_id)
             self._push_reqs.pop(req_id, None)
+            self._w.metrics.set_prefill_active_pushes(len(self._push_reqs))
             self._pending_push_chunks.discard(req_id)
             self._push_chunk_maps.pop(req_id, None)
             self._push_plans.pop(req_id, None)
@@ -235,6 +238,7 @@ class PrefillHandler:
 
     def shutdown(self) -> None:
         self._push_reqs.clear()
+        self._w.metrics.set_prefill_active_pushes(0)
         self._pending_push_chunks.clear()
         self._push_chunk_maps.clear()
         self._completed_pushes.clear()
@@ -380,9 +384,7 @@ class PrefillHandler:
                 handshake = self._select_push_handshake(req)
             except _SkipPushRank:
                 return PushLayoutPlan(targets=())
-            return PushLayoutPlan(
-                targets=(PushTargetPlan(handshake=handshake, head_slices=()),)
-            )
+            return PushLayoutPlan(targets=(PushTargetPlan(handshake=handshake, head_slices=()),))
         first_layout = next(iter(self._w.layouts.values()))
         local_heads = int(getattr(first_layout, "num_kv_heads", 1))
         first_handshake = req.handshakes[0]
@@ -625,9 +627,7 @@ def _remote_block_id_map_for_handshake(
     )
     remote_chunk = remote_block_ids[offset:next_offset]
     remote_block_offsets[offset_key] = next_offset
-    return dict(zip(ordered_local, remote_chunk, strict=True)), next_offset == len(
-        remote_block_ids
-    )
+    return dict(zip(ordered_local, remote_chunk, strict=True)), next_offset == len(remote_block_ids)
 
 
 def _remote_num_kv_heads(
@@ -713,7 +713,8 @@ class _PushFinalizeTask:
 
 
 class _AsyncLayerPushSender:
-    def __init__(self, max_workers: int = 16) -> None:
+    def __init__(self, metrics: Any | None = None, max_workers: int = 16) -> None:
+        self._metrics = metrics
         self._condition = threading.Condition()
         self._inflight = 0
         self._inflight_by_req: dict[str, int] = {}
@@ -733,6 +734,7 @@ class _AsyncLayerPushSender:
                 raise self._error
             self._inflight += 1
             self._inflight_by_req[task.req_id] = self._inflight_by_req.get(task.req_id, 0) + 1
+            self._set_inflight_metric_locked()
         try:
             self._executor.submit(self._run_task, task)
         except BaseException:
@@ -800,7 +802,12 @@ class _AsyncLayerPushSender:
         else:
             self._inflight_by_req.pop(task.req_id, None)
             self._cancelled.discard(task.req_id)
+        self._set_inflight_metric_locked()
         self._condition.notify_all()
+
+    def _set_inflight_metric_locked(self) -> None:
+        if self._metrics is not None:
+            self._metrics.set_prefill_inflight_push_tasks(self._inflight)
 
 
 def _run_layer_push(task: _LayerPushTask) -> None:
@@ -810,8 +817,14 @@ def _run_layer_push(task: _LayerPushTask) -> None:
 
 
 class _AsyncPushFinalizer:
-    def __init__(self, push_sender: _AsyncLayerPushSender, max_workers: int = 16) -> None:
+    def __init__(
+        self,
+        push_sender: _AsyncLayerPushSender,
+        metrics: Any | None = None,
+        max_workers: int = 16,
+    ) -> None:
         self._push_sender = push_sender
+        self._metrics = metrics
         self._condition = threading.Condition()
         self._submitted: set[tuple[str, ...]] = set()
         self._cancelled: set[str] = set()
@@ -833,6 +846,7 @@ class _AsyncPushFinalizer:
                 return
             self._submitted.add(task.req_ids)
             self._inflight += 1
+            self._set_inflight_metric_locked()
         try:
             self._executor.submit(self._run_task, task)
         except BaseException:
@@ -843,13 +857,9 @@ class _AsyncPushFinalizer:
     def cancel_many(self, req_ids: tuple[str, ...]) -> None:
         with self._condition:
             submitted_req_ids = {
-                submitted_req_id
-                for submitted in self._submitted
-                for submitted_req_id in submitted
+                submitted_req_id for submitted in self._submitted for submitted_req_id in submitted
             }
-            self._cancelled.update(
-                req_id for req_id in req_ids if req_id in submitted_req_ids
-            )
+            self._cancelled.update(req_id for req_id in req_ids if req_id in submitted_req_ids)
             self._condition.notify_all()
 
     def wait_all(self) -> None:
@@ -873,17 +883,35 @@ class _AsyncPushFinalizer:
 
     def _run_task(self, task: _PushFinalizeTask) -> None:
         try:
+            wait_for_pushes_s = 0.0
+            completed = False
             for req_id in task.req_ids:
                 if self._is_cancelled(req_id):
                     continue
                 self._push_sender.wait_req(req_id)
                 if self._is_cancelled(req_id):
                     continue
+                per_req_wait_start_ts_ns = time.time_ns()
                 task.rdma.wait_for_pushes(req_id)
+                wait_for_pushes_s += (time.time_ns() - per_req_wait_start_ts_ns) / 1_000_000_000
                 if self._is_cancelled(req_id):
                     continue
                 task.rdma.push_done(req_id)
+                completed = True
             done_ts_ns = time.time_ns()
+            if completed and self._metrics is not None:
+                self._metrics.record_prefill_push(
+                    duration_s=(done_ts_ns - task.finalize_queued_ts_ns) / 1_000_000_000,
+                    first_save_to_done_s=(
+                        (done_ts_ns - task.first_save_ts_ns) / 1_000_000_000
+                        if task.first_save_ts_ns is not None
+                        else None
+                    ),
+                    wait_for_pushes_s=wait_for_pushes_s,
+                    blocks=task.num_blocks,
+                    bytes_total=task.rdma_bytes,
+                    success=True,
+                )
             save_gbps = _gbps(task.rdma_bytes, task.first_save_ts_ns, done_ts_ns)
             link_gbps = _rdma_link_gbps(task.rdma)
             logger.info(
@@ -914,6 +942,15 @@ class _AsyncPushFinalizer:
             with self._condition:
                 self._error = exc
                 self._condition.notify_all()
+            if self._metrics is not None:
+                self._metrics.record_prefill_push(
+                    duration_s=(time.time_ns() - task.finalize_queued_ts_ns) / 1_000_000_000,
+                    first_save_to_done_s=None,
+                    wait_for_pushes_s=None,
+                    blocks=task.num_blocks,
+                    bytes_total=task.rdma_bytes,
+                    success=False,
+                )
         finally:
             with self._condition:
                 self._finish_task(task)
@@ -927,4 +964,9 @@ class _AsyncPushFinalizer:
         for req_id in task.req_ids:
             self._cancelled.discard(req_id)
         self._inflight -= 1
+        self._set_inflight_metric_locked()
         self._condition.notify_all()
+
+    def _set_inflight_metric_locked(self) -> None:
+        if self._metrics is not None:
+            self._metrics.set_prefill_inflight_finalize_tasks(self._inflight)

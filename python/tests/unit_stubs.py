@@ -102,7 +102,14 @@ def _install_vllm_stubs() -> None:
         data: dict | None = field(default_factory=dict)
 
     class KVConnectorPromMetrics:
-        per_engine_labelvalues: dict = {}
+        def __init__(
+            self,
+            _vllm_config=None,
+            _metric_types=None,
+            _labelnames=None,
+            per_engine_labelvalues=None,
+        ) -> None:
+            self.per_engine_labelvalues = per_engine_labelvalues or {0: []}
 
         def make_per_engine(self, metric):
             return {}

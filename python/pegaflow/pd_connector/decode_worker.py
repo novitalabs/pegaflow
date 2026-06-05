@@ -10,15 +10,15 @@ from typing import TYPE_CHECKING, Any
 
 from pegaflow.logging_utils import get_connector_logger
 from pegaflow.pd_connector.layout import KvCacheLayout
+from pegaflow.pd_connector.layout_mapping import (
+    decode_rank_source_counts,
+)
 from pegaflow.pd_connector.metadata import (
     LayerRemoteLayout,
     PdHandshake,
     WaitReqMeta,
     flatten_block_ids,
     layer_layout_to_compact_dict,
-)
-from pegaflow.pd_connector.layout_mapping import (
-    decode_rank_source_counts,
 )
 from pegaflow.pd_connector.prefill import AsyncPrefillSender, PrefillHttpTask
 from pegaflow.pd_connector.rdma import RdmaPort
@@ -54,7 +54,11 @@ class DecodeHandler:
         self._finished_aborted_recving: set[str] = set()
         self._next_imm_id = 1
         self._rdma_waiter: _AsyncRdmaDoneWaiter | None = (
-            _AsyncRdmaDoneWaiter(worker.rdma, failure_callback=self._mark_wait_failed)
+            _AsyncRdmaDoneWaiter(
+                worker.rdma,
+                failure_callback=self._mark_wait_failed,
+                success_callback=self._record_rdma_wait_done,
+            )
             if worker.rdma is not None
             else None
         )
@@ -68,6 +72,7 @@ class DecodeHandler:
             self._rdma_waiter = _AsyncRdmaDoneWaiter(
                 self._w.rdma,
                 failure_callback=self._mark_wait_failed,
+                success_callback=self._record_rdma_wait_done,
             )
 
     def gather_peer_info(self) -> None:
@@ -102,6 +107,7 @@ class DecodeHandler:
             process_ts_ns = time.time_ns()
             with self._lock:
                 self._wait_reqs[req_id] = req
+                self._w.metrics.set_decode_active_waits(len(self._wait_reqs))
             block_ids = flatten_block_ids(req.local_block_ids)
             imm_id = self._alloc_imm_id()
             wait_handshake = self._build_wait_handshake(
@@ -148,6 +154,7 @@ class DecodeHandler:
             req = self._wait_reqs.get(req_id)
             if req is not None:
                 self._aborted_waits.add(req_id)
+                self._w.metrics.record_decode_abort()
         cancel_prefill = getattr(self._prefill_sender, "cancel", None)
         if req is not None and cancel_prefill is not None:
             cancel_prefill(req.remote_request_id)
@@ -155,8 +162,16 @@ class DecodeHandler:
     def finish_recving(self, finished_recving: set[str]) -> None:
         for req_id in finished_recving:
             with self._lock:
-                self._wait_reqs.pop(req_id, None)
+                req = self._wait_reqs.pop(req_id, None)
                 self._aborted_waits.discard(req_id)
+                self._w.metrics.set_decode_active_waits(len(self._wait_reqs))
+            if req is not None:
+                self._w.metrics.record_decode_wait(
+                    duration_s=_elapsed_seconds(req.scheduler_wait_ts_ns, time.time_ns()),
+                    rdma_wait_s=None,
+                    blocks=len(flatten_block_ids(req.local_block_ids)),
+                    success=req_id not in self._failed_recving,
+                )
             self._w.rdma.close_request(req_id)
 
     def pop_finished_aborted_recving(self) -> set[str]:
@@ -237,6 +252,7 @@ class DecodeHandler:
                 self._wait_reqs.pop(req_id, None)
                 self._aborted_waits.discard(req_id)
                 self._finished_aborted_recving.add(req_id)
+                self._w.metrics.set_decode_active_waits(len(self._wait_reqs))
                 logger.info(
                     "[PdConnector] D treating aborted wait as finished req=%s remote_req=%s error=%s",
                     req_id,
@@ -246,6 +262,12 @@ class DecodeHandler:
                 return
             self._mark_failed_locked(req_id, req, exc)
 
+    def _record_rdma_wait_done(self, req_id: str, wait_s: float) -> None:
+        with self._lock:
+            if req_id not in self._wait_reqs:
+                return
+        self._w.metrics.record_decode_rdma_wait(wait_s)
+
     def _mark_failed_locked(self, req_id: str, req: WaitReqMeta, exc: BaseException) -> None:
         failed_blocks = flatten_block_ids(req.local_block_ids)
         self._failed_recving.add(req_id)
@@ -253,6 +275,13 @@ class DecodeHandler:
         self._failed_block_ids.update(failed_blocks)
         self._aborted_waits.discard(req_id)
         self._wait_reqs.pop(req_id, None)
+        self._w.metrics.set_decode_active_waits(len(self._wait_reqs))
+        self._w.metrics.record_decode_wait(
+            duration_s=_elapsed_seconds(req.scheduler_wait_ts_ns, time.time_ns()),
+            rdma_wait_s=None,
+            blocks=len(failed_blocks),
+            success=False,
+        )
         logger.error(
             "[PdConnector] D marked recv failed req=%s remote_req=%s blocks=%d error=%s",
             req_id,
@@ -320,6 +349,9 @@ class DecodeHandler:
         )
         self._prefill_sender.submit(task)
         submitted_ts_ns = time.time_ns()
+        self._w.metrics.record_prefill_http_submit(
+            (submitted_ts_ns - started_ts_ns) / 1_000_000_000
+        )
         logger.info(
             "[PdConnector] D rank0 dispatched prefill req=%s remote_req=%s ranks=%d blocks=%d "
             "build_ms=%.3f proxy_to_dispatch_ms=%.3f matched_to_dispatch_ms=%.3f "
@@ -388,7 +420,7 @@ class DecodeHandler:
 
     def _refresh_expected_imm_counts(self) -> None:
         if self._w.use_mla:
-            self._expected_imm_counts = {rank: 1 for rank in range(self._w.tp_size)}
+            self._expected_imm_counts = dict.fromkeys(range(self._w.tp_size), 1)
             return
 
         local_layout = self._peer_layouts.get(self._w.tp_rank, self._w.layouts)
@@ -457,10 +489,12 @@ class _AsyncRdmaDoneWaiter:
         self,
         rdma: RdmaPort,
         failure_callback: Any | None = None,
+        success_callback: Any | None = None,
         max_workers: int = 16,
     ) -> None:
         self.rdma = rdma
         self._failure_callback = failure_callback
+        self._success_callback = success_callback
         self._executor = ThreadPoolExecutor(
             max_workers=max(1, int(max_workers)),
             thread_name_prefix="pd-rdma-done-waiter",
@@ -540,6 +574,8 @@ class _AsyncRdmaDoneWaiter:
                 (done_ts_ns - start_ts_ns) / 1_000_000,
                 done_ts_ns,
             )
+            if self._success_callback is not None:
+                self._success_callback(task.req_id, (done_ts_ns - start_ts_ns) / 1_000_000_000)
         except Exception as exc:
             logger.exception(
                 "[PdConnector] D RDMA done wait failed req=%s remote_req=%s done_req=%s rank=%d blocks=%d",
@@ -582,6 +618,12 @@ def _elapsed_ms(start_ts_ns: int, end_ts_ns: int) -> float:
     if start_ts_ns <= 0 or end_ts_ns <= 0 or end_ts_ns < start_ts_ns:
         return -1.0
     return (end_ts_ns - start_ts_ns) / 1_000_000
+
+
+def _elapsed_seconds(start_ts_ns: int, end_ts_ns: int) -> float:
+    if start_ts_ns <= 0 or end_ts_ns <= 0 or end_ts_ns < start_ts_ns:
+        return 0.0
+    return (end_ts_ns - start_ts_ns) / 1_000_000_000
 
 
 def _total_num_kv_heads_from_config(vllm_config: Any) -> int | None:

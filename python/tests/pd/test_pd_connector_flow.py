@@ -47,6 +47,175 @@ def test_pd_worker_wait_handshake_uses_registered_native_mr_desc() -> None:
     assert handshake["abort_imm_id"] == (handshake["imm_id"] ^ 0x4000_0000)
 
 
+def test_pd_connector_exposes_empty_stats_for_vllm_metrics() -> None:
+    connector = PdConnector(
+        SimpleNamespace(kv_transfer_config=SimpleNamespace(engine_id="decode")),
+        KVConnectorRole.SCHEDULER,
+    )
+
+    stats = connector.get_kv_connector_stats()
+
+    assert stats is not None
+    assert stats.data["pd_decode_active_waits"] == 0
+    assert stats.data["pd_prefill_active_pushes"] == 0
+    assert stats.is_empty()
+
+
+def test_pd_prom_metrics_observes_connector_stats(monkeypatch) -> None:
+    class FakeGauge:
+        def __init__(self, **_kwargs) -> None:
+            self.value = None
+
+        def set(self, value) -> None:
+            self.value = value
+
+    class FakeHistogram:
+        def __init__(self, **_kwargs) -> None:
+            self.values = []
+
+        def observe(self, value) -> None:
+            self.values.append(value)
+
+    class FakeCounter:
+        def __init__(self, **_kwargs) -> None:
+            self.value = 0
+
+        def inc(self, value=1) -> None:
+            self.value += value
+
+    import pegaflow.pd_connector.metrics as pd_metrics_mod
+    from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorPromMetrics
+
+    monkeypatch.setattr(
+        pd_metrics_mod,
+        "_bind_metric_per_engine",
+        lambda _prom_metrics, metric: {0: metric},
+    )
+    monkeypatch.setattr(
+        KVConnectorPromMetrics,
+        "__init__",
+        lambda self, _vllm_config, _metric_types, _labelnames, per_engine_labelvalues: setattr(
+            self,
+            "per_engine_labelvalues",
+            per_engine_labelvalues,
+        ),
+    )
+
+    monkeypatch.setattr(pd_metrics_mod.PdPromMetrics, "_gauge_cls", FakeGauge, raising=False)
+    monkeypatch.setattr(
+        pd_metrics_mod.PdPromMetrics,
+        "_histogram_cls",
+        FakeHistogram,
+        raising=False,
+    )
+    monkeypatch.setattr(pd_metrics_mod.PdPromMetrics, "_counter_cls", FakeCounter, raising=False)
+
+    prom = PdConnector.build_prom_metrics(
+        SimpleNamespace(kv_transfer_config=SimpleNamespace()),
+        {PromMetric: PromMetric},
+        [],
+        {0: []},
+    )
+    stats = PdConnector.build_kv_connector_stats(
+        {
+            "pd_decode_active_waits": 2,
+            "pd_prefill_active_pushes": 1,
+            "pd_prefill_inflight_push_tasks": 3,
+            "pd_prefill_inflight_finalize_tasks": 4,
+            "pd_decode_wait_duration": [0.1],
+            "pd_decode_rdma_wait_duration": [0.2],
+            "pd_decode_prefill_http_submit_duration": [0.003],
+            "pd_load_blocks": [8],
+            "pd_prefill_push_duration": [0.4],
+            "pd_prefill_first_save_to_done_duration": [0.5],
+            "pd_prefill_wait_for_pushes_duration": [0.6],
+            "pd_prefill_push_blocks": [8],
+            "pd_prefill_push_bytes": [1024],
+            "pd_load_success_count": 1,
+            "pd_load_failure_count": 2,
+            "pd_prefill_push_success_count": 3,
+            "pd_prefill_push_failure_count": 4,
+            "pd_decode_abort_count": 5,
+            "pd_prefill_release_count": 6,
+            "pd_prefill_skipped_push_count": 7,
+        }
+    )
+
+    prom.observe(stats.data, engine_idx=0)
+
+    assert prom.gauge_decode_active_waits[0].value == 2
+    assert prom.hist_decode_wait_duration[0].values == [0.1]
+    assert prom.counter_load_success[0].value == 1
+    assert prom.counter_prefill_skipped_push[0].value == 7
+
+
+def test_pd_proxy_metrics_render_low_cardinality_route_stats() -> None:
+    router = RoundRobinPairRouter(
+        prefill_endpoints=(
+            PdEndpoint("http://p0:8000", instance_id="p0"),
+            PdEndpoint("http://p1:8000", instance_id="p1"),
+        ),
+        decode_endpoints=(PdEndpoint("http://d0:8000", instance_id="d0"),),
+    )
+    config = ProxyConfig(
+        prefill_url="http://p0:8000",
+        decode_url="http://d0:8000",
+        timeout_s=1.0,
+        prefill_max_tokens=1,
+        router=router,
+    )
+    build_pd_proxy_request({"request_id": "secret-request"}, config)
+
+    rendered = render_proxy_metrics(config).decode()
+
+    assert "pega_pd_proxy_route_total" in rendered
+    assert 'prefill_instance="p0"' in rendered
+    assert 'decode_instance="d0"' in rendered
+    assert "secret-request" not in rendered
+
+
+def test_pd_worker_stats_record_decode_wait_completion() -> None:
+    tensor = FakeTensor(
+        shape=(2, 8, 16, 8, 32),
+        stride=(8 * 8 * 16 * 32, 8 * 16 * 32, 32, 16 * 32, 1),
+    )
+    rdma = MockRdmaPort()
+    worker = PdWorkerConnector(
+        SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(engine_id="decode"),
+            parallel_config=SimpleNamespace(tensor_parallel_rank=0, tensor_parallel_size=1),
+        ),
+        rdma=rdma,
+    )
+    worker.register_kv_caches({"layer.0": tensor})
+    worker.start_load_kv(
+        PdConnectorMetadata(
+            reqs_to_wait={
+                "req-1": WaitReqMeta(
+                    local_block_ids=([1, 2],),
+                    remote_request_id="req-1-p",
+                    done_request_id="req-1-d",
+                    prompt_token_ids=(11, 12, 13),
+                    prefill_url="http://p:8001",
+                    scheduler_wait_ts_ns=time.time_ns(),
+                )
+            }
+        ),
+        None,
+    )
+    rdma.mark_done("req-1")
+    worker.get_finished(set())
+
+    stats = worker.get_stats()
+
+    assert stats is not None
+    assert stats.data["pd_decode_active_waits"] == 0
+    assert stats.data["pd_load_success_count"] == 1
+    assert stats.data["pd_load_failure_count"] == 0
+    assert stats.data["pd_load_blocks"] == [2]
+    assert len(stats.data["pd_decode_wait_duration"]) == 1
+
+
 def test_d_worker_waits_for_all_prefill_ranks_when_prefill_tp_is_larger() -> None:
     tensor = FakeTensor(
         shape=(2, 8, 16, 8, 32),
@@ -2030,9 +2199,9 @@ def test_pd_proxy_streams_sse_lines_without_large_read_buffering() -> None:
         def __init__(self) -> None:
             self.lines = iter(
                 [
-                    b"data: {\"choices\":[{\"text\":\"a\"}]}\n",
+                    b'data: {"choices":[{"text":"a"}]}\n',
                     b"\n",
-                    b"data: {\"choices\":[{\"text\":\"b\"}]}\n",
+                    b'data: {"choices":[{"text":"b"}]}\n',
                     b"\n",
                     b"data: [DONE]\n",
                     b"\n",
@@ -2046,8 +2215,8 @@ def test_pd_proxy_streams_sse_lines_without_large_read_buffering() -> None:
             raise AssertionError("stream forwarding must not use large buffered reads")
 
     assert list(iter_http_stream_chunks(SlowSseBody())) == [
-        b"data: {\"choices\":[{\"text\":\"a\"}]}\n\n",
-        b"data: {\"choices\":[{\"text\":\"b\"}]}\n\n",
+        b'data: {"choices":[{"text":"a"}]}\n\n',
+        b'data: {"choices":[{"text":"b"}]}\n\n',
         b"data: [DONE]\n\n",
     ]
 

@@ -19,12 +19,13 @@ from pegaflow.logging_utils import get_connector_logger
 from pegaflow.pd_connector.decode_worker import DecodeHandler
 from pegaflow.pd_connector.layout import KvCacheLayout, layout_from_tensor
 from pegaflow.pd_connector.metadata import (
+    RELEASE_CONSUMER_ABORT,
+    RELEASE_PRODUCER_PREEMPTED,
     LayerRemoteLayout,
     PdConnectorMetadata,
     PdWorkerMetadata,
-    RELEASE_CONSUMER_ABORT,
-    RELEASE_PRODUCER_PREEMPTED,
 )
+from pegaflow.pd_connector.metrics import PdKVConnectorStats, PdMetricsTracker
 from pegaflow.pd_connector.prefill_worker import PrefillHandler
 from pegaflow.pd_connector.rdma import RdmaPort, build_rdma_port
 
@@ -38,9 +39,11 @@ class PdWorkerConnector:
         kv_cache_config: Any = None,
         rdma: RdmaPort | None = None,
         prefill_sender: Any | None = None,
+        metrics: PdMetricsTracker | None = None,
     ) -> None:
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
+        self.metrics = metrics or PdMetricsTracker()
         self.use_mla = model_uses_mla(vllm_config)
         self.logical_block_size = _logical_block_size(vllm_config)
         self._layer_specs = _layer_specs_from_config(kv_cache_config)
@@ -215,11 +218,7 @@ class PdWorkerConnector:
         self._prefill.wait_for_save()
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str] | None, set[str] | None]:
-        if (
-            not finished_req_ids
-            and self._decode.is_idle()
-            and not self._prefill.has_state()
-        ):
+        if not finished_req_ids and self._decode.is_idle() and not self._prefill.has_state():
             return None, None
 
         logger.debug(
@@ -268,6 +267,9 @@ class PdWorkerConnector:
         if not failed_recving:
             return None
         return PdWorkerMetadata(failed_recving=failed_recving)
+
+    def get_stats(self) -> PdKVConnectorStats:
+        return self.metrics.get_stats()
 
     def shutdown(self) -> None:
         self._decode.shutdown()

@@ -15,10 +15,11 @@ install_connector_unit_stubs()
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (  # noqa: E402
     KVConnectorRole,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import PromMetric  # noqa: E402
 
-import pegaflow.pd_connector.prefill_worker as prefill_worker_mod  # noqa: E402
-import pegaflow.pd_connector.prefill as prefill_mod  # noqa: E402
 import pegaflow.pd_connector.decode_worker as decode_worker_mod  # noqa: E402
+import pegaflow.pd_connector.prefill as prefill_mod  # noqa: E402
+import pegaflow.pd_connector.prefill_worker as prefill_worker_mod  # noqa: E402
 import pegaflow.pd_connector.worker as worker_mod  # noqa: E402
 import pegaflow.pegaflow as native  # noqa: E402
 from pegaflow.pd_connector import PdConnector  # noqa: E402
@@ -30,14 +31,14 @@ from pegaflow.pd_connector.layout import (  # noqa: E402
     unique_blocks_from_slot_mapping,
 )
 from pegaflow.pd_connector.metadata import (  # noqa: E402
-    LayerRemoteLayout,
-    PdConnectorMetadata,
-    PdHandshake,
-    PdWorkerMetadata,
     RELEASE_CONSUMER_ABORT,
     RELEASE_PRODUCER_ABORT,
     RELEASE_PRODUCER_FINISHED,
     RELEASE_PRODUCER_PREEMPTED,
+    LayerRemoteLayout,
+    PdConnectorMetadata,
+    PdHandshake,
+    PdWorkerMetadata,
     PushReqMeta,
     TransferRegionLayout,
     WaitReqMeta,
@@ -53,9 +54,10 @@ from pegaflow.pd_connector.proxy import (  # noqa: E402
     PdEndpoint,
     ProxyConfig,
     RoundRobinPairRouter,
-    build_router,
     build_pd_proxy_request,
+    build_router,
     iter_http_stream_chunks,
+    render_proxy_metrics,
 )
 from pegaflow.pd_connector.rdma import (  # noqa: E402
     MockRdmaPort,
