@@ -20,7 +20,7 @@ jobs:
             cargo-features: ""
           - cuda-variant: cu13
             cuda-version: '13.0.2'
-            cargo-features: "--no-default-features --features cuda-13"
+            cargo-features: "--no-default-features --features cuda-13,rdma"
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
