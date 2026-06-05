@@ -1789,6 +1789,27 @@ def _prefill_http_task(request_id: str) -> PrefillHttpTask:
     )
 
 
+def _fake_httpx_module(created_clients: list[object] | None = None):
+    class Timeout:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+    class Limits:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+    class AsyncClient:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.closed = False
+            if created_clients is not None:
+                created_clients.append(self)
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    return SimpleNamespace(Timeout=Timeout, Limits=Limits, AsyncClient=AsyncClient)
+
+
 def test_async_prefill_sender_runs_requests_concurrently(monkeypatch) -> None:
     entered: queue.Queue[str] = queue.Queue()
     release = threading.Event()
@@ -1802,6 +1823,7 @@ def test_async_prefill_sender_runs_requests_concurrently(monkeypatch) -> None:
         "post_prefill_request_async",
         fake_post_prefill_request,
     )
+    monkeypatch.setattr(prefill_mod, "_httpx", lambda: _fake_httpx_module())
     sender = AsyncPrefillSender(worker_count=2)
     try:
         sender.submit(_prefill_http_task("req-1"))
@@ -1810,6 +1832,37 @@ def test_async_prefill_sender_runs_requests_concurrently(monkeypatch) -> None:
         assert {entered.get(timeout=2), entered.get(timeout=2)} == {"req-1", "req-2"}
     finally:
         release.set()
+        sender.close()
+
+
+def test_async_prefill_sender_reuses_lazy_http_client(monkeypatch) -> None:
+    entered: queue.Queue[str] = queue.Queue()
+    clients: queue.Queue[object] = queue.Queue()
+    created_clients: list[object] = []
+    fake_httpx = _fake_httpx_module(created_clients)
+
+    async def fake_post_prefill_request(task: PrefillHttpTask, client=None) -> None:
+        entered.put(task.request_id)
+        clients.put(client)
+
+    monkeypatch.setattr(prefill_mod, "_httpx", lambda: fake_httpx)
+    monkeypatch.setattr(
+        prefill_mod,
+        "post_prefill_request_async",
+        fake_post_prefill_request,
+    )
+    sender = AsyncPrefillSender(worker_count=1)
+    try:
+        sender.submit(_prefill_http_task("req-1"))
+        sender.submit(_prefill_http_task("req-2"))
+
+        assert [entered.get(timeout=2), entered.get(timeout=2)] == ["req-1", "req-2"]
+        first_client = clients.get(timeout=2)
+        second_client = clients.get(timeout=2)
+        assert first_client is not None
+        assert first_client is second_client
+        assert created_clients == [first_client]
+    finally:
         sender.close()
 
 
@@ -1830,6 +1883,7 @@ def test_async_prefill_sender_cancel_cancels_running_request(monkeypatch) -> Non
         "post_prefill_request_async",
         fake_post_prefill_request,
     )
+    monkeypatch.setattr(prefill_mod, "_httpx", lambda: _fake_httpx_module())
     sender = AsyncPrefillSender(worker_count=1)
     try:
         sender.submit(_prefill_http_task("req-1"))

@@ -9,11 +9,15 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-import httpx
-
 from pegaflow.logging_utils import get_connector_logger
 
 logger = get_connector_logger()
+
+
+def _httpx() -> Any:
+    import httpx
+
+    return httpx
 
 
 @dataclass(frozen=True)
@@ -68,16 +72,14 @@ class AsyncPrefillSender:
     def _run_loop(self) -> None:
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
-        self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(600.0),
-            limits=httpx.Limits(max_connections=None, max_keepalive_connections=None),
-        )
+        self._client = None
         self._semaphore = asyncio.Semaphore(self._worker_count)
         self._tasks: set[asyncio.Task[None]] = set()
         self._tasks_by_req: dict[str, asyncio.Task[None]] = {}
         self._loop_ready.set()
         self._loop.run_forever()
-        self._loop.run_until_complete(self._client.aclose())
+        if self._client is not None:
+            self._loop.run_until_complete(self._client.aclose())
         self._loop.close()
 
     async def _submit(self, task: PrefillHttpTask) -> None:
@@ -110,6 +112,12 @@ class AsyncPrefillSender:
     async def _run_task(self, task: PrefillHttpTask) -> None:
         try:
             async with self._semaphore:
+                if self._client is None:
+                    httpx = _httpx()
+                    self._client = httpx.AsyncClient(
+                        timeout=httpx.Timeout(600.0),
+                        limits=httpx.Limits(max_connections=None, max_keepalive_connections=None),
+                    )
                 await post_prefill_request_async(task, self._client)
         except asyncio.CancelledError:
             logger.info("[PdConnector] D -> P prefill cancelled req=%s", task.request_id)
@@ -134,8 +142,9 @@ def _prefill_request_body(task: PrefillHttpTask) -> dict[str, Any]:
 
 async def post_prefill_request_async(
     task: PrefillHttpTask,
-    client: httpx.AsyncClient | None = None,
+    client: Any | None = None,
 ) -> None:
+    httpx = _httpx()
     url = task.prefill_url.rstrip("/") + "/v1/completions"
     start_ts_ns = time.time_ns()
     body = _prefill_request_body(task)
