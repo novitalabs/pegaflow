@@ -17,7 +17,6 @@ import argparse
 import json
 import statistics
 import sys
-import time
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -310,7 +309,7 @@ def main() -> int:
 
     # Single run
     d2h, h2d = run_benchmark(cfg)
-    print(f"Configuration:")
+    print("Configuration:")
     for k, v in asdict(cfg).items():
         print(f"  {k}: {v}")
     print()
