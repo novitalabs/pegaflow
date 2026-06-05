@@ -1,10 +1,14 @@
 //! Shared-memory synchronization state for async KV cache loading.
 //!
-//! Only the batch-level `LoadState` is supported. Other platforms are not
-//! supported; compilation will fail outside x86_64 Linux.
+//! Only the batch-level `LoadState` is supported. It requires 64-bit Linux
+//! with 64-bit atomics; compilation will fail on other platforms.
 
-#[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
-compile_error!("LoadState is only supported on x86_64 Linux");
+#[cfg(not(all(
+    target_os = "linux",
+    target_pointer_width = "64",
+    target_has_atomic = "64"
+)))]
+compile_error!("LoadState requires 64-bit Linux with 64-bit atomics");
 
 use shared_memory::{Shmem, ShmemConf, ShmemError};
 use std::{

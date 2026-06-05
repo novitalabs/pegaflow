@@ -42,6 +42,9 @@ class FakeEngineClient:
         self.fail_load_with_ok_false = False
         self.fail_load_with_exception: Exception | None = None
         self.load_calls: list[tuple] = []
+        self.register_response: tuple[bool, str] = (True, "ok")
+        self.register_exception: Exception | None = None
+        self.register_calls: list[tuple] = []
         self.release_calls: list[bytes] = []
 
     def load(
@@ -69,6 +72,12 @@ class FakeEngineClient:
         if self.fail_load_with_ok_false:
             return (False, "simulated load failure")
         return (True, "ok")
+
+    def register_context_batch(self, *args) -> tuple[bool, str]:
+        self.register_calls.append(args)
+        if self.register_exception is not None:
+            raise self.register_exception
+        return self.register_response
 
     def health(self) -> tuple[bool, str]:
         return (True, "ok")
@@ -238,5 +247,89 @@ def test_load_uses_registered_layer_names_before_forward_context_names():
 
     assert len(client.load_calls) == 1
     assert client.load_calls[0][4] == ["registered.layer.0", "registered.layer.1"]
+
+    worker.shutdown()
+
+
+class FakeTensor:
+    shape = (1, 16)
+
+    def storage_offset(self) -> int:
+        return 0
+
+    @property
+    def device(self) -> str:
+        return "cuda:0"
+
+    def stride(self) -> tuple[int, int]:
+        return (16, 1)
+
+    def element_size(self) -> int:
+        return 2
+
+
+class FakeCudaIPCWrapper:
+    def __init__(self, _tensor) -> None:
+        pass
+
+
+def test_register_version_mismatch_raises_startup_error(monkeypatch):
+    worker, client, _ = _make_worker()
+    client.register_response = (
+        False,
+        "PegaFlow version mismatch: client=0.22.4 server=0.22.5",
+    )
+
+    monkeypatch.setattr("pegaflow.connector.worker.CudaIPCWrapper", FakeCudaIPCWrapper)
+
+    with pytest.raises(RuntimeError, match="PegaFlow version mismatch") as exc_info:
+        worker.register_kv_caches({"layer.0": FakeTensor()})
+
+    assert "client=0.22.4" in str(exc_info.value)
+    assert "server=0.22.5" in str(exc_info.value)
+    assert "for layer.0" not in str(exc_info.value)
+    assert len(client.register_calls) == 1
+
+    worker.shutdown()
+
+
+def test_register_non_version_failure_reports_batch_layers(monkeypatch):
+    worker, client, _ = _make_worker()
+    client.register_response = (False, "invalid tensor metadata")
+
+    monkeypatch.setattr("pegaflow.connector.worker.CudaIPCWrapper", FakeCudaIPCWrapper)
+
+    with pytest.raises(RuntimeError, match="invalid tensor metadata") as exc_info:
+        worker.register_kv_caches(
+            {
+                "layer.0": FakeTensor(),
+                "layer.1": FakeTensor(),
+            }
+        )
+
+    message = str(exc_info.value)
+    assert "Register context batch failed for layers ['layer.0', 'layer.1']" in message
+    assert "for layer.1" not in message
+    assert len(client.register_calls) == 1
+
+    worker.shutdown()
+
+
+def test_register_version_mismatch_rpc_error_stops_startup(monkeypatch):
+    worker, client, _ = _make_worker()
+    client.register_exception = RuntimeError(
+        "register_context_batch RPC failed: status: FailedPrecondition, "
+        'message: "PegaFlow version mismatch: client=0.22.4 server=0.22.5"'
+    )
+
+    monkeypatch.setattr("pegaflow.connector.worker.CudaIPCWrapper", FakeCudaIPCWrapper)
+
+    with pytest.raises(RuntimeError, match="PegaFlow version mismatch") as exc_info:
+        worker.register_kv_caches({"layer.0": FakeTensor()})
+
+    assert "FailedPrecondition" in str(exc_info.value)
+    assert "client=0.22.4" in str(exc_info.value)
+    assert "server=0.22.5" in str(exc_info.value)
+    assert len(client.register_calls) == 1
 
     worker.shutdown()

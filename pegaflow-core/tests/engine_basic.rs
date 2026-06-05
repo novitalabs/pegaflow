@@ -6,7 +6,7 @@
 mod common;
 
 use common::*;
-use pegaflow_core::StorageConfig;
+use pegaflow_core::{StorageConfig, TransferMode};
 
 /// Full save -> query -> load round-trip with data integrity check.
 #[tokio::test]
@@ -88,6 +88,30 @@ async fn save_query_load_roundtrip_split_storage() {
     // segment_size=512, kv_stride=4096 (stride > segment → split path)
     let env = TestEnvBuilder::new("test-split", "test-ns")
         .split_layer("layer_0", 4, 512, 4096)
+        .build();
+    let hashes = env.hashes(0);
+
+    env.save_and_wait(&hashes).await;
+    env.data().zero_gpu();
+    let lease = env.assert_all_hit_lease(&hashes).await;
+
+    env.load_to_gpu(lease, hashes.len()).await;
+    env.data().assert_gpu_matches_expected();
+}
+
+/// Kernel backend round-trip over real mapped pinned allocations.
+///
+/// Split storage exercises both K and V segment descriptors, so this covers the
+/// production path from `PinnedAllocation` through `RawBlock`/`LayerAlloc` into
+/// `CopyDesc.host_device` for save and load.
+#[tokio::test]
+async fn kernel_backend_roundtrip_split_storage() {
+    let env = TestEnvBuilder::new("test-kernel-split", "test-ns")
+        .split_layer("layer_0", 2, 4096, 16384)
+        .storage(StorageConfig {
+            transfer_mode: TransferMode::Kernel,
+            ..StorageConfig::default()
+        })
         .build();
     let hashes = env.hashes(0);
 

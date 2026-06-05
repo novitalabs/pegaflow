@@ -23,6 +23,7 @@ message RegisterContextRequest {
   repeated uint64 kv_stride_bytes = 12;
   repeated uint32 segments = 13;
   uint32 pp_rank = 14;
+  string client_version = 15;
 }
 
 message RegisterContextResponse {

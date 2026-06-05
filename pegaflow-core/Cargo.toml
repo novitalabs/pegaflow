@@ -7,8 +7,10 @@ edition.workspace = true
 workspace = true
 
 [features]
-default = ["cudarc/cuda-12080", "pegaflow-transfer/default"]
-cuda-13 = ["cudarc/cuda-13000", "pegaflow-transfer/cuda-13"]
+default = ["cuda-12", "rdma"]
+cuda-12 = ["cudarc/cuda-12080", "cudarc/nvrtc", "pegaflow-transfer?/cuda-12"]
+cuda-13 = ["cudarc/cuda-13000", "cudarc/nvrtc", "pegaflow-transfer?/cuda-13"]
+rdma = ["dep:pegaflow-transfer"]
 tracing = ["fastrace"]
 
 [dependencies]
@@ -23,7 +25,6 @@ shared_memory.workspace = true
 uuid.workspace = true
 opentelemetry.workspace = true
 bytesize.workspace = true
-serde.workspace = true
 libc.workspace = true
 rand.workspace = true
 ahash.workspace = true
@@ -31,13 +32,11 @@ io-uring = "0.7"
 futures.workspace = true
 parking_lot.workspace = true
 fastrace = { workspace = true, optional = true }
-kube.workspace = true
-k8s-openapi.workspace = true
 tonic.workspace = true
 dashmap.workspace = true
 smallvec.workspace = true
 pegaflow-proto = { path = "../pegaflow-proto" }
-pegaflow-transfer = { path = "../pegaflow-transfer", default-features = false }
+pegaflow-transfer = { path = "../pegaflow-transfer", default-features = false, optional = true }
 mea.workspace = true
 
 [dev-dependencies]
@@ -46,10 +45,6 @@ cudarc.workspace = true
 tokio.workspace = true
 tokio-stream = { workspace = true, features = ["net"] }
 tempfile = "3"
-
-[[bench]]
-name = "transfer_batch"
-harness = false
 
 [[bench]]
 name = "pinned_copy"
@@ -61,6 +56,10 @@ harness = false
 
 [[bench]]
 name = "cpu_path"
+harness = false
+
+[[bench]]
+name = "transfer_h2d"
 harness = false
 
 [[example]]

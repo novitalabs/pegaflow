@@ -51,14 +51,20 @@ type SinglePrefetchResult = (
 // Configuration
 // ============================================================================
 
-/// Configuration for the single-file SSD cache (logical ring).
+/// Configuration for the SSD cache (logical ring).
+///
+/// Supports one or more cache directories. When multiple paths are provided,
+/// cache shards are distributed across them in round-robin order so that I/O
+/// is balanced across independent devices.
 #[derive(Debug, Clone)]
 pub struct SsdCacheConfig {
-    /// File path for the cache data file.
-    pub cache_path: PathBuf,
+    /// Cache data directories. Each path receives a subset of the total shards.
+    pub cache_paths: Vec<PathBuf>,
     /// Total logical capacity of the cache (bytes).
     pub capacity_bytes: u64,
-    /// Number of cache files. 1 keeps the existing single-file SSD layout.
+    /// Number of cache files per path. 1 keeps the existing single-file SSD layout
+    /// when only one path is configured. With multiple paths each path receives this
+    /// many shards so that every device is utilised.
     pub shards: NonZeroUsize,
     /// Max pending write batches. New sealed blocks are dropped if the queue is full.
     pub write_queue_depth: usize,
@@ -73,7 +79,7 @@ pub struct SsdCacheConfig {
 impl Default for SsdCacheConfig {
     fn default() -> Self {
         Self {
-            cache_path: PathBuf::from("/tmp/pegaflow-ssd-cache/cache.bin"),
+            cache_paths: vec![PathBuf::from("/tmp/pegaflow-ssd-cache/cache.bin")],
             capacity_bytes: 512 * 1024 * 1024 * 1024, // 512GB
             shards: NonZeroUsize::new(1).unwrap(),
             write_queue_depth: DEFAULT_SSD_WRITE_QUEUE_DEPTH,

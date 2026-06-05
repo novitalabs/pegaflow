@@ -25,16 +25,54 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 
-@dataclass(frozen=True)
-class _PendingQueryProbe:
+@dataclass(slots=True)
+class _QueryProbe:
+    """One remote prefix-query snapshot.
+
+    A probe is keyed by:
+
+    * ``computed_blocks`` — blocks already computed locally when the query was
+      issued
+    * ``query_hashes`` — remaining block hashes sent to the backend
+
+    If the request keeps making local progress while the backend is loading,
+    the current query key may drift.  A *Ready* result is accepted only if the
+    current key still matches this snapshot.
+    """
+
     computed_blocks: int
-    remaining_hashes: tuple[bytes, ...]
-    hit_blocks: int
-    lease: bytes
+    query_hashes: tuple[bytes, ...]
+
+    # ``None`` means the backend is still loading.
+    hit_blocks: int | None = None
+    lease: bytes = b""
+
+    @property
+    def is_ready(self) -> bool:
+        return self.hit_blocks is not None
+
+    def matches(self, computed_blocks: int, query_hashes: tuple[bytes, ...]) -> bool:
+        return self.computed_blocks == computed_blocks and self.query_hashes == query_hashes
+
+    def mark_ready(self, ready: QueryReady) -> None:
+        hit_blocks = ready.num_hit_blocks
+        if hit_blocks > len(self.query_hashes):
+            raise RuntimeError(
+                f"invariant violated: server returned {hit_blocks} hits for "
+                f"{len(self.query_hashes)} hashes"
+            )
+        self.hit_blocks = hit_blocks
+        self.lease = ready.lease
+
+    def require_hit_blocks(self) -> int:
+        if self.hit_blocks is None:
+            raise RuntimeError("query probe is still loading")
+        return self.hit_blocks
 
     @property
     def leased_hashes(self) -> tuple[bytes, ...]:
-        return self.remaining_hashes[: self.hit_blocks]
+        """Hashes covered by the lease. Only valid after Ready."""
+        return self.query_hashes[: self.require_hit_blocks()]
 
 
 class SchedulerConnector:
@@ -46,7 +84,7 @@ class SchedulerConnector:
         # Load state
         self._pending_load_intents: dict[str, LoadIntent] = {}
         self._prefetch_start_times: dict[str, float] = {}
-        self._pending_query_probes: dict[str, _PendingQueryProbe] = {}
+        self._pending_query_probes: dict[str, _QueryProbe] = {}
 
         # Prefetch tracking (for metrics)
         self._prefetch_tracker = PrefetchTracker()
@@ -82,89 +120,129 @@ class SchedulerConnector:
             )
             return (0, False)
 
-        num_tokens = request.num_tokens
-        block_hashes = request.block_hashes
-
-        # request.block_hashes are already at virtual_block_size granularity
-        # (vLLM hashes every scheduler_block_size =
-        # block_size * dcp_world_size * pcp_world_size).
-        # Skip blocks that are already computed locally.
         computed_blocks = num_computed_tokens // self._ctx.virtual_block_size
-        remaining_hashes = block_hashes[computed_blocks:]
+        query_hashes = tuple(request.block_hashes[computed_blocks:])
 
-        if not remaining_hashes:
+        # Everything is already computed locally.
+        if not query_hashes:
             self._release_pending_query_probe(req_id)
             self._external_matched_blocks[req_id] = computed_blocks
             return (0, False)
 
-        remaining_hashes_tuple = tuple(remaining_hashes)
-        pending_probe = self._pending_query_probes.get(req_id)
-        if (
-            pending_probe is not None
-            and pending_probe.computed_blocks == computed_blocks
-            and pending_probe.remaining_hashes == remaining_hashes_tuple
-        ):
-            hit_blocks = pending_probe.hit_blocks
-            self._external_matched_blocks[req_id] = computed_blocks + hit_blocks
-            num_hit_tokens = hit_blocks * self._ctx.virtual_block_size
+        probe = self._pending_query_probes.get(req_id)
+
+        # Ready result already cached.  Reuse it only if the request identity
+        # has not drifted since the query was issued.
+        if probe is not None and probe.is_ready:
+            if probe.matches(computed_blocks, query_hashes):
+                return self._finish_cache_lookup(
+                    req_id=req_id,
+                    num_tokens=request.num_tokens,
+                    probe=probe,
+                    lookup_us=None,
+                    reused=True,
+                )
+
+            # Cached Ready is stale.  It has a lease, so release it.
+            self._release_pending_query_probe(req_id)
+            probe = None
+
+        # No reusable Ready result.  Ask backend.
+        lookup_start = time.perf_counter()
+        ready = self._count_available_block_prefix(query_hashes, req_id)
+        lookup_us = (time.perf_counter() - lookup_start) * 1e6
+
+        # Backend is still loading.  Keep the original snapshot.
+        if ready is None:
+            if probe is None:
+                self._pending_query_probes[req_id] = _QueryProbe(
+                    computed_blocks=computed_blocks,
+                    query_hashes=query_hashes,
+                )
+            return (None, False)
+
+        # A previous Loading probe exists, but the request has moved on.
+        # This Ready belongs to the old query.  Do not consume it.
+        if probe is not None and not probe.matches(computed_blocks, query_hashes):
+            logger.warning(
+                "[PegaKVConnector] req=%s query identity drifted: "
+                "snapshot computed=%d/%d hashes, current computed=%d/%d hashes "
+                "- discarding stale Ready",
+                req_id,
+                probe.computed_blocks,
+                len(probe.query_hashes),
+                computed_blocks,
+                len(query_hashes),
+            )
+            if ready.lease:
+                self._ctx.engine_client.release(ready.lease)
+            self._pending_query_probes.pop(req_id, None)
+            return (None, False)
+
+        # Either:
+        #   1. IDLE -> Ready
+        #   2. Loading probe -> Ready (identity matched above)
+        if probe is None:
+            probe = _QueryProbe(
+                computed_blocks=computed_blocks,
+                query_hashes=query_hashes,
+            )
+            self._pending_query_probes[req_id] = probe
+
+        probe.mark_ready(ready)
+        return self._finish_cache_lookup(
+            req_id=req_id,
+            num_tokens=request.num_tokens,
+            probe=probe,
+            lookup_us=lookup_us,
+            reused=False,
+        )
+
+    def _finish_cache_lookup(
+        self,
+        *,
+        req_id: str,
+        num_tokens: int,
+        probe: _QueryProbe,
+        lookup_us: float | None,
+        reused: bool,
+    ) -> tuple[int, bool]:
+        hit_blocks = probe.require_hit_blocks()
+        computed_blocks = probe.computed_blocks
+        hit_tokens = hit_blocks * self._ctx.virtual_block_size
+
+        self._external_matched_blocks[req_id] = computed_blocks + hit_blocks
+
+        if reused:
             logger.debug(
                 "[PegaKVConnector] req=%s cache_lookup_reuse: hit_blocks=%d "
                 "computed_blocks=%d hit_tokens=%d num_tokens=%d total_query_hashes=%d",
                 req_id,
                 hit_blocks,
                 computed_blocks,
-                num_hit_tokens,
+                hit_tokens,
                 num_tokens,
-                len(remaining_hashes),
-            )
-            return (num_hit_tokens, True)
-
-        old_probe = pending_probe
-
-        lookup_start = time.perf_counter()
-        ready = self._count_available_block_prefix(remaining_hashes, req_id)
-        lookup_end = time.perf_counter()
-        elapsed_us = (lookup_end - lookup_start) * 1e6
-
-        # Prefetch in progress - tell scheduler to retry later
-        if ready is None:
-            return (None, False)
-
-        hit_blocks = ready.num_hit_blocks
-        if hit_blocks > 0:
-            self._pending_query_probes[req_id] = _PendingQueryProbe(
-                computed_blocks=computed_blocks,
-                remaining_hashes=remaining_hashes_tuple,
-                hit_blocks=hit_blocks,
-                lease=ready.lease,
+                len(probe.query_hashes),
             )
         else:
-            self._pending_query_probes.pop(req_id, None)
+            logger.info(
+                "[PegaKVConnector] req=%s cache_lookup: hit_blocks=%d computed_blocks=%d "
+                "hit_tokens=%d num_tokens=%d lookup_us=%.0f total_query_hashes=%d",
+                req_id,
+                hit_blocks,
+                computed_blocks,
+                hit_tokens,
+                num_tokens,
+                lookup_us or 0.0,
+                len(probe.query_hashes),
+            )
 
-        if old_probe is not None:
-            self._release_query_probe(req_id, old_probe)
-
-        self._external_matched_blocks[req_id] = computed_blocks + hit_blocks
-
-        # Each hit block = 1 virtual block = virtual_block_size global tokens.
-        num_hit_tokens = hit_blocks * self._ctx.virtual_block_size
-
-        logger.info(
-            "[PegaKVConnector] req=%s cache_lookup: hit_blocks=%d computed_blocks=%d "
-            "hit_tokens=%d num_tokens=%d lookup_us=%.0f total_query_hashes=%d",
-            req_id,
-            hit_blocks,
-            computed_blocks,
-            num_hit_tokens,
-            num_tokens,
-            elapsed_us,
-            len(remaining_hashes),
-        )
-
-        if num_hit_tokens <= 0:
+        if hit_tokens <= 0:
+            # No external load will consume this lease.
+            self._release_pending_query_probe(req_id)
             return (0, False)
 
-        return (num_hit_tokens, True)
+        return (hit_tokens, True)
 
     def update_state_after_alloc(
         self,
@@ -488,7 +566,9 @@ class SchedulerConnector:
 
         return self._release_query_probe(req_id, probe)
 
-    def _release_query_probe(self, req_id: str, probe: _PendingQueryProbe) -> bool:
+    def _release_query_probe(self, req_id: str, probe: _QueryProbe) -> bool:
+        if not probe.lease:
+            return True  # nothing leased server-side (still loading, or zero-hit Ready)
         try:
             self._ctx.engine_client.release(probe.lease)
         except Exception:

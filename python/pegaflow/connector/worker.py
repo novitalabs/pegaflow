@@ -118,13 +118,9 @@ def _infer_kv_cache_registration(
     segments = 1
 
     if physical_num_blocks <= 0:
-        raise ValueError(
-            f"physical block count must be > 0, got {physical_num_blocks}"
-        )
+        raise ValueError(f"physical block count must be > 0, got {physical_num_blocks}")
     if physical_block_size <= 0:
-        raise ValueError(
-            f"physical block size must be > 0, got {physical_block_size}"
-        )
+        raise ValueError(f"physical block size must be > 0, got {physical_block_size}")
     if logical_block_size % physical_block_size != 0:
         raise ValueError(
             "logical block size must be a multiple of physical block size "
@@ -274,9 +270,7 @@ class WorkerConnector:
 
             if registration.physical_blocks_per_logical_block > 1:
                 split_layer_count += 1
-                split_blocks_per_logical = (
-                    registration.physical_blocks_per_logical_block
-                )
+                split_blocks_per_logical = registration.physical_blocks_per_logical_block
                 split_logical_blocks = registration.num_blocks
                 logger.debug(
                     "[PegaKVConnector] Registered %s with virtual block split: "
@@ -305,7 +299,9 @@ class WorkerConnector:
         )
 
         if not ok:
-            raise RuntimeError(f"Register context failed for {layer_name}: {message}")
+            if "PegaFlow version mismatch" in message:
+                raise RuntimeError(f"Register context failed: {message}")
+            raise RuntimeError(f"Register context batch failed for layers {layer_names}: {message}")
 
         if split_layer_count:
             logger.info(

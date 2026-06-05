@@ -13,6 +13,7 @@ use std::sync::Arc;
 use log::{debug, info};
 
 use crate::block::{BlockKey, LayerSave, RawBlock, Segment};
+use crate::pinned_pool::MappedPinnedPtr;
 
 /// Grouped insert entries: each hash maps to its per-slot `RawBlock`s.
 pub(crate) type InsertEntries = Vec<(BlockKey, Vec<(usize, Arc<RawBlock>)>)>;
@@ -35,14 +36,14 @@ pub(crate) enum LayerAlloc {
     Split {
         k_allocation: Arc<PinnedAllocation>,
         v_allocation: Arc<PinnedAllocation>,
-        k_base: usize,
-        v_base: usize,
+        k_base: MappedPinnedPtr,
+        v_base: MappedPinnedPtr,
         /// Per-segment stride in pinned memory (padded for SSD alignment).
         padded_segment_size: usize,
     },
     Contiguous {
         allocation: Arc<PinnedAllocation>,
-        base_addr: usize,
+        base: MappedPinnedPtr,
     },
 }
 
@@ -56,28 +57,22 @@ impl LayerAlloc {
                 k_base,
                 v_base,
                 padded_segment_size,
+                ..
             } => {
                 let half = block_size / 2;
-                let k_ptr = (k_base + index * padded_segment_size) as *mut u8;
-                let v_ptr = (v_base + index * padded_segment_size) as *mut u8;
+                let k_ptr = k_base.add(index * padded_segment_size).host();
+                let v_ptr = v_base.add(index * padded_segment_size).host();
                 // Safety: pointers are within pinned allocations, validated during allocation.
-                let k_ptr =
-                    std::ptr::NonNull::new(k_ptr).expect("split block K pointer must be non-null");
-                let v_ptr =
-                    std::ptr::NonNull::new(v_ptr).expect("split block V pointer must be non-null");
                 Arc::new(RawBlock::two_segments(
                     Segment::new(k_ptr, half, Arc::clone(k_allocation)),
                     Segment::new(v_ptr, half, Arc::clone(v_allocation)),
                 ))
             }
             LayerAlloc::Contiguous {
-                allocation,
-                base_addr,
+                allocation, base, ..
             } => {
-                let ptr = (base_addr + index * block_size) as *mut u8;
+                let ptr = base.add(index * block_size).host();
                 // Safety: pointer is within pinned allocation, validated during allocation.
-                let ptr =
-                    std::ptr::NonNull::new(ptr).expect("contiguous block pointer must be non-null");
                 Arc::new(RawBlock::single_segment(Segment::new(
                     ptr,
                     block_size,
@@ -249,6 +244,7 @@ impl PegaEngine {
         /// Unified per-layer context for the save pipeline.
         /// Combines metadata, filtered blocks, and allocation results.
         struct LayerContext {
+            layer_name: String,
             registration: KVCacheRegistration,
             slot_id: usize,
             padded_block_size: usize,
@@ -314,6 +310,7 @@ impl PegaEngine {
 
             let padded_block_size = registration.padded_block_size_bytes;
             layers.push(LayerContext {
+                layer_name,
                 registration,
                 slot_id,
                 padded_block_size,
@@ -439,31 +436,27 @@ impl PegaEngine {
                             )
                         })?;
 
-                    let mut k_allocation = self
-                        .storage
-                        .allocate(alloc_size, numa_node)
-                        .ok_or_else(|| {
-                            EngineError::Storage(
-                                "pinned pool exhausted while allocating K segment buffer"
-                                    .to_string(),
-                            )
-                        })?;
-                    let mut v_allocation = self
-                        .storage
-                        .allocate(alloc_size, numa_node)
-                        .ok_or_else(|| {
-                            EngineError::Storage(
-                                "pinned pool exhausted while allocating V segment buffer"
-                                    .to_string(),
-                            )
-                        })?;
+                    let k_allocation =
+                        self.storage
+                            .allocate(alloc_size, numa_node)
+                            .ok_or_else(|| {
+                                EngineError::Storage(
+                                    "pinned pool exhausted while allocating K segment buffer"
+                                        .to_string(),
+                                )
+                            })?;
+                    let v_allocation =
+                        self.storage
+                            .allocate(alloc_size, numa_node)
+                            .ok_or_else(|| {
+                                EngineError::Storage(
+                                    "pinned pool exhausted while allocating V segment buffer"
+                                        .to_string(),
+                                )
+                            })?;
 
-                    let k_base = Arc::get_mut(&mut k_allocation)
-                        .expect("k_allocation must be uniquely owned")
-                        .as_mut_ptr() as usize;
-                    let v_base = Arc::get_mut(&mut v_allocation)
-                        .expect("v_allocation must be uniquely owned")
-                        .as_mut_ptr() as usize;
+                    let k_base = k_allocation.mapped_ptr();
+                    let v_base = v_allocation.mapped_ptr();
 
                     layer.allocs.push(LayerAlloc::Split {
                         k_allocation,
@@ -485,17 +478,19 @@ impl PegaEngine {
                             LayerAlloc::Split { k_base, v_base, .. } => (*k_base, *v_base),
                             _ => unreachable!(),
                         };
+                        let offset = offset_in_alloc * padded_segment_size;
+                        let k_dst = k_base.add(offset);
+                        let v_dst = v_base.add(offset);
                         SaveBlock {
                             block_idx: *block_idx,
-                            k_dst_ptr: (k_base + offset_in_alloc * padded_segment_size) as *mut u8,
-                            v_dst_ptr: Some(
-                                (v_base + offset_in_alloc * padded_segment_size) as *mut u8,
-                            ),
+                            k_dst,
+                            v_dst: Some(v_dst),
                         }
                     })
                     .collect();
 
                 gpu_save_layers.push(SaveLayerData {
+                    layer_name: layer.layer_name.clone(),
                     registration: registration.clone(),
                     blocks: save_blocks,
                 });
@@ -510,7 +505,7 @@ impl PegaEngine {
                             EngineError::Storage("allocation size overflow".to_string())
                         })?;
 
-                    let mut allocation =
+                    let allocation =
                         self.storage
                             .allocate(alloc_size, numa_node)
                             .ok_or_else(|| {
@@ -520,16 +515,11 @@ impl PegaEngine {
                                 )
                             })?;
 
-                    let base_addr = Arc::get_mut(&mut allocation)
-                        .ok_or_else(|| {
-                            EngineError::Storage("allocation shared unexpectedly".to_string())
-                        })?
-                        .as_mut_ptr() as usize;
+                    let base = allocation.mapped_ptr();
 
-                    layer.allocs.push(LayerAlloc::Contiguous {
-                        allocation,
-                        base_addr,
-                    });
+                    layer
+                        .allocs
+                        .push(LayerAlloc::Contiguous { allocation, base });
                 }
 
                 // Build SaveBlocks from layer.allocs
@@ -539,19 +529,22 @@ impl PegaEngine {
                     .enumerate()
                     .map(|(i, (block_idx, _))| {
                         let (alloc_idx, offset_in_alloc) = if blockwise { (i, 0) } else { (0, i) };
-                        let base_addr = match &layer.allocs[alloc_idx] {
-                            LayerAlloc::Contiguous { base_addr, .. } => *base_addr,
+                        let base = match &layer.allocs[alloc_idx] {
+                            LayerAlloc::Contiguous { base, .. } => *base,
                             _ => unreachable!(),
                         };
+                        let offset = offset_in_alloc * padded_block_size;
+                        let dst = base.add(offset);
                         SaveBlock {
                             block_idx: *block_idx,
-                            k_dst_ptr: (base_addr + offset_in_alloc * padded_block_size) as *mut u8,
-                            v_dst_ptr: None,
+                            k_dst: dst,
+                            v_dst: None,
                         }
                     })
                     .collect();
 
                 gpu_save_layers.push(SaveLayerData {
+                    layer_name: layer.layer_name.clone(),
                     registration: registration.clone(),
                     blocks: save_blocks,
                 });

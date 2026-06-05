@@ -8,8 +8,10 @@ default-run = "pegaflow-server"
 workspace = true
 
 [features]
-default = ["pegaflow-core/default"]
+default = ["cuda-12", "rdma"]
+cuda-12 = ["pegaflow-core/cuda-12"]
 cuda-13 = ["pegaflow-core/cuda-13"]
+rdma = ["pegaflow-core/rdma"]
 tracing = ["fastrace", "pegaflow-core/tracing"]
 
 [lib]
@@ -24,11 +26,9 @@ path = "src/main.rs"
 pegaflow-common.workspace = true
 pegaflow-core = { workspace = true, default-features = false }
 pegaflow-proto = { path = "../pegaflow-proto" }
-prost.workspace = true
 pyo3 = { workspace = true, features = ["auto-initialize"] }
 cudarc.workspace = true
 tonic.workspace = true
-tonic-prost.workspace = true
 tokio.workspace = true
 clap.workspace = true
 log.workspace = true

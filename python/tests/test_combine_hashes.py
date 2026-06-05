@@ -450,10 +450,11 @@ class TestSchedulerQueryProbeReuse:
 
         assert engine_client.query_prefetch.call_count == 2
         engine_client.release.assert_called_once_with(b"lease-1")
+        # Stale probe is released before the second server call.
         assert [call[0] for call in engine_client.method_calls] == [
             "query_prefetch",
-            "query_prefetch",
             "release",
+            "query_prefetch",
         ]
 
     def test_release_failure_does_not_abort_cleanup(self):

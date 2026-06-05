@@ -1,62 +1,52 @@
 # internode/ — Cross-Node Communication
 
-This module handles all inter-node communication for PegaFlow's multi-node KV cache sharing.
+This module handles MetaServer coordination for PegaFlow's multi-node KV cache sharing.
 
 ## Module Overview
 
 ```
 internode/
-├── mod.rs               Module root + re-exports
-├── types.rs             Shared types: configs, errors, PegaflowInstance
-├── registry.rs          InstanceRegistry — thread-safe store of discovered nodes
-├── service_discovery.rs K8s pod watcher (label: novita.ai/pegaflow=app)
-├── client.rs            gRPC client → remote pegaflow-server (Engine service)
-└── registrar.rs         Fire-and-forget registrar → pegaflow-metaserver (Meta service)
+├── mod.rs                Module root + re-exports
+└── metaserver_client.rs  MetaServer registration, removal, query, and node heartbeat
 ```
 
 ## Data Flow
 
 ```
-                        ┌──────────────┐
-  service_discovery ──► │   registry   │  K8s watches pods, populates registry
-                        └──────┬───────┘
-                               │
-           ┌───────────────────┴───────────────────┐
-           ▼                                       ▼
-    ┌─────────────┐                        ┌──────────────┐
-    │  client.rs  │  READ path             │ registrar.rs │  WRITE path
-    │             │  "do you have          │              │  "I just sealed
-    │  Query /    │   these blocks?"       │  Insert      │   these blocks"
-    │  Health     │                        │  BlockHashes │
-    └──────┬──────┘                        └──────┬───────┘
-           │                                      │
-           ▼                                      ▼
-    Remote pegaflow-server              Central pegaflow-metaserver
-    (per-node Engine gRPC)              (shared Meta gRPC)
+  write path                       read path
+      |                                |
+      v                                v
+  try_register_namespace          query_prefix
+  try_unregister
+      |                                |
+      v                                v
+  background MetaServer loop       lazy MetaServer gRPC client
+      |                                |
+      +--------------+-----------------+
+                     |
+                     v
+            pegaflow-metaserver
 ```
 
-## client.rs vs registrar.rs
+## MetaServer Client Responsibilities
 
-|                  | client.rs                          | registrar.rs                        |
-|------------------|------------------------------------|-------------------------------------|
-| Talks to         | Remote **pegaflow-server**         | Central **pegaflow-metaserver**     |
-| RPC service      | `Engine` (Query, Health)           | `MetaServer` (HeartbeatNode, InsertBlockHashes, RemoveBlockHashes) |
-| Direction        | Read path — query remote cache     | Write path — register sealed blocks |
-| Call pattern     | Request-response (caller awaits)   | Fire-and-forget (`try_send`)        |
-| Connection mgmt  | Pool of connections (multi-node)   | Single lazy connection + node session heartbeat |
-| Failure mode     | Returns error to caller            | Log + metric, drop on queue full    |
-| Used by          | P/D router, cross-node queries     | Write pipeline (after block seal)   |
+| Responsibility | Path | Behavior |
+|----------------|------|----------|
+| Block registration | Write path | Fire-and-forget `try_send` after block seal |
+| Block removal | Eviction path | Best-effort remove messages after local cache eviction |
+| Prefix query | Read path | Request-response query for per-node prefix lengths |
+| Node session | Background task | Heartbeat, stale-session recovery, and graceful unregister |
 
-## How registrar.rs Integrates
+## How Registration Integrates
 
-The registrar plugs into the **write path** via `InsertDeps`:
+The MetaServer client plugs into the **write path** via `InsertDeps`:
 
 ```
 insert_worker_loop (sync thread)
   └─► process_insert_batch
         └─► send_backing_batches
               ├─► SsdBackingStore::ingest_batch()     (SSD write, fire-and-forget)
-              └─► MetaServerRegistrar::try_register()  (metaserver registration, fire-and-forget)
+              └─► MetaServerClient::try_register_namespace() (MetaServer registration, fire-and-forget)
 ```
 
 Both use the same pattern: `tokio::sync::mpsc::try_send()` from the sync insert thread,
@@ -69,7 +59,7 @@ the MetaServer lost state.
 
 ## Configuration
 
-The registrar is enabled via CLI flags on `pegaflow-server`:
+MetaServer registration is enabled via CLI flags on `pegaflow-server`:
 
 ```bash
 pegaflow-server \
