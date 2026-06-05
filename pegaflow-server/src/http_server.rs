@@ -10,12 +10,12 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 
-use crate::registry::RegistryHandle;
+use crate::teardown::InstanceTeardown;
 
 #[derive(Clone)]
 struct AppState {
     engine: Arc<PegaEngine>,
-    registry: RegistryHandle,
+    teardown: Arc<InstanceTeardown>,
     prometheus_registry: Option<Registry>,
 }
 
@@ -56,6 +56,9 @@ struct CleanupQuery {
 struct CleanupResponse {
     removed_instances: Vec<String>,
     removed_tensors: usize,
+    /// Instances whose GPU workers failed to drain; their CUDA IPC mappings
+    /// are deliberately leaked instead of being unmapped under stale tasks.
+    leaked_instances: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -71,9 +74,10 @@ struct MemoryCacheCleanupResponse {
 /// Without `id`: remove all instances and release all CUDA IPC tensors.
 /// With `id`:    remove only the specified instance.
 ///
-/// Releasing CUDA IPC tensors takes the GIL and runs a blocking
-/// `torch.cuda.empty_cache()`. That work runs on the dedicated registry thread
-/// behind [`RegistryHandle`]; the handler only `.await`s the reply, so a
+/// Both go through [`InstanceTeardown`]: fence the instance, drain its GPU
+/// worker queues, then unmap. Releasing CUDA IPC tensors takes the GIL and
+/// runs a blocking `torch.cuda.empty_cache()`. That work runs on the
+/// dedicated registry thread; the handler only `.await`s the reply, so a
 /// slow/wedged cleanup never occupies an async worker (the outage where a few
 /// `cleanup` calls hung every endpoint, `/health` and `/metrics` included).
 async fn cleanup_handler(
@@ -82,62 +86,67 @@ async fn cleanup_handler(
 ) -> impl IntoResponse {
     match query.id {
         None => {
-            let removed_tensors = state.registry.clear().await;
-            let removed_instances = state.engine.unregister_all_instances();
+            let outcome = state.teardown.cleanup_all("http cleanup").await;
 
-            if !removed_instances.is_empty() || removed_tensors > 0 {
+            if !outcome.removed_instances.is_empty() || outcome.dropped_tensors > 0 {
                 warn!(
-                    "Cleanup all: removed {:?}, {} CUDA tensor(s) released",
-                    removed_instances, removed_tensors
+                    "Cleanup all: removed {:?}, {} CUDA tensor(s) released, leaked {:?}",
+                    outcome.removed_instances, outcome.dropped_tensors, outcome.leaked_instances
                 );
             } else {
                 info!("Cleanup all: nothing to remove");
             }
 
+            let status = if outcome.leaked_instances.is_empty() {
+                StatusCode::OK
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
             (
-                StatusCode::OK,
+                status,
                 Json(CleanupResponse {
-                    removed_instances,
-                    removed_tensors,
+                    removed_instances: outcome.removed_instances,
+                    removed_tensors: outcome.dropped_tensors,
+                    leaked_instances: outcome.leaked_instances,
                 })
                 .into_response(),
             )
         }
         Some(instance_id) => {
-            let removed_tensors = state.registry.drop_instance(instance_id.clone()).await;
-            match state.engine.unregister_instance(&instance_id) {
-                Ok(()) => {
-                    warn!(
-                        "Cleanup instance {}: {} CUDA tensor(s) released",
-                        instance_id, removed_tensors
-                    );
-                    cleanup_ok_response(instance_id, removed_tensors)
-                }
-                Err(_) if removed_tensors > 0 => {
-                    warn!(
-                        "Instance {} not in engine but cleaned {} CUDA tensor(s)",
-                        instance_id, removed_tensors
-                    );
-                    cleanup_ok_response(instance_id, removed_tensors)
-                }
-                Err(e) => (StatusCode::NOT_FOUND, format!("{e}").into_response()),
+            let outcome = state.teardown.cleanup(&instance_id, "http cleanup").await;
+            if !outcome.drained {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(CleanupResponse {
+                        removed_instances: vec![instance_id.clone()],
+                        removed_tensors: 0,
+                        leaked_instances: vec![instance_id],
+                    })
+                    .into_response(),
+                );
+            }
+            if outcome.instance_found || outcome.dropped_tensors > 0 {
+                warn!(
+                    "Cleanup instance {}: {} CUDA tensor(s) released",
+                    instance_id, outcome.dropped_tensors
+                );
+                (
+                    StatusCode::OK,
+                    Json(CleanupResponse {
+                        removed_instances: vec![instance_id],
+                        removed_tensors: outcome.dropped_tensors,
+                        leaked_instances: Vec::new(),
+                    })
+                    .into_response(),
+                )
+            } else {
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("instance {instance_id} not found").into_response(),
+                )
             }
         }
     }
-}
-
-fn cleanup_ok_response(
-    instance_id: String,
-    removed_tensors: usize,
-) -> (StatusCode, axum::response::Response) {
-    (
-        StatusCode::OK,
-        Json(CleanupResponse {
-            removed_instances: vec![instance_id],
-            removed_tensors,
-        })
-        .into_response(),
-    )
 }
 
 /// POST /cache/memory/cleanup
@@ -159,7 +168,7 @@ async fn cleanup_memory_cache_handler(
 pub async fn start_http_server(
     addr: std::net::SocketAddr,
     engine: Arc<PegaEngine>,
-    registry: RegistryHandle,
+    teardown: Arc<InstanceTeardown>,
     enable_prometheus: bool,
     prometheus_registry: Option<Registry>,
     shutdown: Arc<Notify>,
@@ -168,7 +177,7 @@ pub async fn start_http_server(
 
     let state = AppState {
         engine,
-        registry,
+        teardown,
         prometheus_registry: if enable_prometheus {
             prometheus_registry
         } else {

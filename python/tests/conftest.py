@@ -4,6 +4,7 @@ Provides fixtures for automatically starting/stopping PegaServer
 and test helpers for connector testing against a running server.
 """
 
+import contextlib
 import hashlib
 import logging
 import os
@@ -403,9 +404,12 @@ class PegaServerProcess:
             os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
             self.process.wait(timeout=5)
         except (subprocess.TimeoutExpired, ProcessLookupError, OSError):
-            if self.process:
-                os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
-                self.process.wait(timeout=2)
+            # The process group may already be gone (e.g. the server crashed
+            # before teardown); a second failure must not mask the test.
+            with contextlib.suppress(subprocess.TimeoutExpired, ProcessLookupError, OSError):
+                if self.process:
+                    os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
+                    self.process.wait(timeout=2)
         finally:
             self.process = None
             self._close_log()
@@ -421,8 +425,6 @@ class PegaServerProcess:
         return self._log_path.read_text(errors="replace")
 
     def _close_log(self) -> None:
-        import contextlib
-
         if self._log_file is not None:
             with contextlib.suppress(OSError):
                 self._log_file.close()

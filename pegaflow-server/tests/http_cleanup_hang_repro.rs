@@ -277,6 +277,7 @@ fn start_cluster(worker_threads: usize) -> TestCluster {
         Arc::clone(&shutdown),
         hll_tracker,
     );
+    let teardown = service.teardown();
     rt.spawn(async move {
         Server::builder()
             .add_service(EngineServer::new(service))
@@ -289,7 +290,7 @@ fn start_cluster(worker_threads: usize) -> TestCluster {
         start_http_server(
             http_addr,
             Arc::clone(&engine),
-            registry.clone(),
+            teardown,
             true,
             Some(Registry::new()),
             Arc::clone(&shutdown),

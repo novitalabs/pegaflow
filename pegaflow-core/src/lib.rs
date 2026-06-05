@@ -321,38 +321,43 @@ impl PegaEngine {
         Ok(())
     }
 
-    /// Unregister an instance and release all associated resources.
-    pub fn unregister_instance(&self, instance_id: &str) -> Result<(), EngineError> {
+    /// Unregister an instance: fence it from new RPCs and release its query
+    /// leases. Returns the removed [`InstanceContext`] so the caller can
+    /// `shutdown().await` it (drain GPU worker queues) before unmapping the
+    /// CUDA IPC memory its queued tasks still reference.
+    pub fn unregister_instance(
+        &self,
+        instance_id: &str,
+    ) -> Result<Arc<InstanceContext>, EngineError> {
         let removed = self
             .instances
             .write()
             .expect("instances write lock poisoned")
-            .remove(instance_id);
+            .remove(instance_id)
+            .ok_or_else(|| EngineError::InstanceMissing(instance_id.to_string()))?;
 
-        if removed.is_none() {
-            return Err(EngineError::InstanceMissing(instance_id.to_string()));
-        }
         self.query_leases.release_instance(instance_id);
         info!("Unregistered instance: {}", instance_id);
-        Ok(())
+        Ok(removed)
     }
 
-    /// Unregister all instances, returning the IDs that were removed.
-    pub fn unregister_all_instances(&self) -> Vec<String> {
+    /// Unregister all instances, returning the removed contexts. The same
+    /// drain-before-unmap contract as [`Self::unregister_instance`] applies.
+    pub fn unregister_all_instances(&self) -> Vec<Arc<InstanceContext>> {
         let mut instances = self
             .instances
             .write()
             .expect("instances write lock poisoned");
-        let ids: Vec<String> = instances.keys().cloned().collect();
-        instances.clear();
+        let removed: Vec<Arc<InstanceContext>> = instances.drain().map(|(_, ctx)| ctx).collect();
         drop(instances);
-        for id in &ids {
-            self.query_leases.release_instance(id);
+        for instance in &removed {
+            self.query_leases.release_instance(instance.id());
         }
-        if !ids.is_empty() {
+        if !removed.is_empty() {
+            let ids: Vec<&str> = removed.iter().map(|i| i.id()).collect();
             info!("Unregistered all instances: {:?}", ids);
         }
-        ids
+        removed
     }
 
     /// List all registered instance IDs.

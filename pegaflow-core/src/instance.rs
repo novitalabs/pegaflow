@@ -484,6 +484,35 @@ impl InstanceContext {
         Ok(())
     }
 
+    /// Access the instance identifier.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Quiesce all GPU worker pools: fence new task submissions, then wait
+    /// until every worker thread has drained its queue and exited.
+    ///
+    /// After this resolves, no queued or in-flight save/load task of this
+    /// instance can dereference client GPU memory anymore — the caller may
+    /// safely unmap the CUDA IPC mappings backing the registrations.
+    ///
+    /// In-flight RPC handlers that still hold this `InstanceContext` get a
+    /// channel-closed error on submission instead of racing the unmap.
+    pub async fn shutdown(&self) {
+        let gpus: Vec<Arc<GpuContext>> = {
+            let metadata = self.metadata.lock();
+            metadata.gpu_contexts.values().cloned().collect()
+        };
+
+        // Fence all pools first so they drain concurrently, then await each.
+        for gpu in &gpus {
+            gpu.worker_pool().close();
+        }
+        for gpu in &gpus {
+            gpu.worker_pool().wait_workers_exited().await;
+        }
+    }
+
     /// Access the instance namespace.
     pub(crate) fn namespace(&self) -> &str {
         &self.namespace

@@ -5,6 +5,8 @@ pub mod proto;
 pub mod registry;
 pub mod service;
 pub mod session;
+mod teardown;
+pub use teardown::InstanceTeardown;
 #[cfg(feature = "tracing")]
 mod trace;
 #[cfg(not(feature = "tracing"))]
@@ -616,6 +618,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             Arc::clone(&shutdown),
             Arc::clone(&hll_tracker),
         );
+        let teardown = service.teardown();
 
         // Spawn background GC task for stale inflight blocks and expired transfer locks
         {
@@ -660,7 +663,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         let http_server_handle = http_server::start_http_server(
             cli.http_addr,
             Arc::clone(&engine),
-            registry,
+            teardown,
             cli.enable_prometheus,
             metrics_state.prometheus_registry.clone(),
             Arc::clone(&shutdown),
@@ -689,7 +692,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
             .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE);
 
+        // HTTP/2 PING keepalive: without it, a client host that vanishes
+        // without RST (hard power-off, network partition) leaves the Session
+        // stream half-open and the disconnect watcher never fires. With it,
+        // dead-peer detection is bounded by interval + timeout.
         if let Err(err) = Server::builder()
+            .http2_keepalive_interval(Some(Duration::from_secs(10)))
+            .http2_keepalive_timeout(Some(Duration::from_secs(20)))
+            .tcp_keepalive(Some(Duration::from_secs(30)))
             .add_service(grpc_service)
             .serve_with_shutdown(cli.addr, shutdown_signal)
             .await

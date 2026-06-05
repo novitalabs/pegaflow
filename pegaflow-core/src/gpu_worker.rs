@@ -3,6 +3,8 @@ use std::sync::{Arc, mpsc as std_mpsc};
 use cudarc::driver::{CudaContext, CudaStream};
 use log::{debug, error, info, warn};
 use logforth::diagnostic::ThreadLocalDiagnostic;
+use mea::latch::Latch;
+use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::block::RawBlock;
@@ -67,8 +69,28 @@ unsafe impl Send for SaveLayerData {}
 /// Per-GPU worker pool with dedicated load and save threads
 pub(crate) struct GpuWorkerPool {
     device_id: i32,
+    /// Task senders, taken by [`Self::close`] to fence new submissions while
+    /// RPC handlers may still hold an `Arc<InstanceContext>`. Dropping the
+    /// senders lets the worker loops drain already-queued tasks and exit.
+    channels: Mutex<Option<WorkerChannels>>,
+    /// Reaches zero when both worker threads have exited, i.e. no task will
+    /// ever dereference a `KVCacheRegistration::data_ptr` from this pool again.
+    workers_exited: Arc<Latch>,
+}
+
+struct WorkerChannels {
     load_tx: mpsc::UnboundedSender<LoadTask>,
     save_tx: mpsc::UnboundedSender<SaveTask>,
+}
+
+/// Counts the latch down when the owning worker thread exits, including the
+/// CUDA-init-failure and panic paths.
+struct CountDownOnDrop(Arc<Latch>);
+
+impl Drop for CountDownOnDrop {
+    fn drop(&mut self) {
+        self.0.count_down();
+    }
 }
 
 impl GpuWorkerPool {
@@ -89,13 +111,16 @@ impl GpuWorkerPool {
         let (save_tx, save_rx) = mpsc::unbounded_channel();
         let (load_ready_tx, load_ready_rx) = std_mpsc::channel();
         let (save_ready_tx, save_ready_rx) = std_mpsc::channel();
+        let workers_exited = Arc::new(Latch::new(2));
 
         // Spawn load worker thread
         let load_device_id = device_id;
         let load_numa = numa_node;
+        let load_exit_guard = CountDownOnDrop(Arc::clone(&workers_exited));
         std::thread::Builder::new()
             .name(format!("gpu{}-load", device_id))
             .spawn(move || {
+                let _exit_guard = load_exit_guard;
                 // Pin thread to NUMA node before any allocations
                 if load_numa.is_valid()
                     && let Err(e) = pin_thread_to_numa_node(load_numa)
@@ -117,9 +142,11 @@ impl GpuWorkerPool {
         // Spawn save worker thread
         let save_device_id = device_id;
         let save_numa = numa_node;
+        let save_exit_guard = CountDownOnDrop(Arc::clone(&workers_exited));
         std::thread::Builder::new()
             .name(format!("gpu{}-save", device_id))
             .spawn(move || {
+                let _exit_guard = save_exit_guard;
                 // Pin thread to NUMA node before any allocations
                 if save_numa.is_valid()
                     && let Err(e) = pin_thread_to_numa_node(save_numa)
@@ -147,14 +174,33 @@ impl GpuWorkerPool {
         );
         Ok(Self {
             device_id,
-            load_tx,
-            save_tx,
+            channels: Mutex::new(Some(WorkerChannels { load_tx, save_tx })),
+            workers_exited,
         })
+    }
+
+    /// Fence new task submissions: drop the senders so the worker loops drain
+    /// already-queued tasks and exit. Idempotent.
+    pub(crate) fn close(&self) {
+        self.channels.lock().take();
+    }
+
+    /// Wait until both worker threads have exited. After this resolves, no
+    /// task from this pool will ever touch GPU memory again, so the caller
+    /// may safely unmap the CUDA IPC mappings the tasks referenced.
+    pub(crate) async fn wait_workers_exited(&self) {
+        self.workers_exited.wait().await;
     }
 
     /// Submit a load task (CPU -> GPU) - fire and forget
     pub(crate) fn submit_load(&self, task: LoadTask) -> Result<(), EngineError> {
-        self.load_tx.send(task).map_err(|_| {
+        let Some(load_tx) = self.channels.lock().as_ref().map(|c| c.load_tx.clone()) else {
+            return Err(EngineError::Storage(format!(
+                "Load worker channel closed for device {}",
+                self.device_id
+            )));
+        };
+        load_tx.send(task).map_err(|_| {
             EngineError::Storage(format!(
                 "Load worker channel closed for device {}",
                 self.device_id
@@ -174,7 +220,13 @@ impl GpuWorkerPool {
             trace_ctx: ::fastrace::prelude::SpanContext::current_local_parent(),
         };
 
-        self.save_tx.send(task).map_err(|_| {
+        let Some(save_tx) = self.channels.lock().as_ref().map(|c| c.save_tx.clone()) else {
+            return Err(EngineError::Storage(format!(
+                "Save worker channel closed for device {}",
+                self.device_id
+            )));
+        };
+        save_tx.send(task).map_err(|_| {
             EngineError::Storage(format!(
                 "Save worker channel closed for device {}",
                 self.device_id

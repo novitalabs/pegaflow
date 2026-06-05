@@ -13,6 +13,7 @@ use crate::proto::engine::{
 };
 use crate::registry::RegistryHandle;
 use crate::session::SessionRegistry;
+use crate::teardown::InstanceTeardown;
 use log::{debug, info, warn};
 use pegaflow_common::NumaNode;
 use pegaflow_core::{EngineError, LayerSave, PegaEngine, PrefetchStatus, QueryLeaseId};
@@ -29,6 +30,7 @@ pub struct GrpcEngineService {
     shutdown: Arc<Notify>,
     hll_tracker: Arc<std::sync::Mutex<pegaflow_common::hll::MultiWindowHllTracker>>,
     session_registry: Arc<SessionRegistry>,
+    teardown: Arc<InstanceTeardown>,
 }
 
 impl GrpcEngineService {
@@ -38,38 +40,20 @@ impl GrpcEngineService {
         shutdown: Arc<Notify>,
         hll_tracker: Arc<std::sync::Mutex<pegaflow_common::hll::MultiWindowHllTracker>>,
     ) -> Self {
+        let teardown = InstanceTeardown::new(Arc::clone(&engine), registry.clone());
         Self {
             engine,
             registry,
             shutdown,
             hll_tracker,
             session_registry: SessionRegistry::new(),
+            teardown,
         }
     }
 
-    /// Drop CUDA IPC tensors and engine-side instance state for `instance_id`.
-    /// Idempotent — safe to call after the instance is already gone.
-    async fn cleanup_instance(
-        engine: &PegaEngine,
-        registry: &RegistryHandle,
-        instance_id: &str,
-        reason: &'static str,
-    ) {
-        let removed = registry.drop_instance(instance_id.to_string()).await;
-        if removed > 0 {
-            info!(
-                "Session cleanup ({}): dropped {} CUDA tensors for instance {}",
-                reason, removed, instance_id
-            );
-        }
-        if let Err(err) = engine.unregister_instance(instance_id) {
-            // `InstanceMissing` is normal if the instance was never registered
-            // (vllm died before any register_context_batch). Log at debug.
-            debug!(
-                "Session cleanup ({}): engine.unregister_instance({}) returned {}",
-                reason, instance_id, err
-            );
-        }
+    /// The shared teardown choreography, for wiring into the HTTP admin server.
+    pub fn teardown(&self) -> Arc<InstanceTeardown> {
+        Arc::clone(&self.teardown)
     }
 
     fn context_key(instance_id: &str, tp_rank: u32, pp_rank: u32, device_id: i32) -> String {
@@ -713,17 +697,23 @@ impl Engine for GrpcEngineService {
         let result: Result<Response<UnregisterResponse>, Status> = async {
             let req = request.into_inner();
             debug!("RPC [unregister_context]: instance_id={}", req.instance_id);
-            let removed = self.registry.drop_instance(req.instance_id.clone()).await;
-            if removed > 0 {
-                info!(
-                    "Dropped {} CUDA tensors for instance {}",
-                    removed, req.instance_id
-                );
-            }
+            let outcome = self
+                .teardown
+                .cleanup(&req.instance_id, "unregister rpc")
+                .await;
 
-            self.engine
-                .unregister_instance(&req.instance_id)
-                .map_err(Self::map_engine_error)?;
+            if !outcome.drained {
+                return Err(Status::internal(format!(
+                    "GPU workers for instance {} did not drain in time; \
+                     CUDA IPC mappings leaked",
+                    req.instance_id
+                )));
+            }
+            if !outcome.instance_found {
+                return Err(Self::map_engine_error(EngineError::InstanceMissing(
+                    req.instance_id,
+                )));
+            }
 
             Ok(Response::new(UnregisterResponse {
                 status: Some(Self::build_simple_response()),
@@ -987,8 +977,7 @@ impl Engine for GrpcEngineService {
         let cleanup_tx = tx.clone();
 
         let session_registry = Arc::clone(&self.session_registry);
-        let engine = Arc::clone(&self.engine);
-        let cuda_registry = self.registry.clone();
+        let teardown = Arc::clone(&self.teardown);
         let id_for_watcher = instance_id.clone();
 
         tokio::spawn(async move {
@@ -998,8 +987,7 @@ impl Engine for GrpcEngineService {
                     "Session closed: instance_id={} token={} — running cleanup",
                     id_for_watcher, token
                 );
-                Self::cleanup_instance(&engine, &cuda_registry, &id_for_watcher, "stream closed")
-                    .await;
+                teardown.cleanup(&id_for_watcher, "stream closed").await;
             } else {
                 debug!(
                     "Session closed: instance_id={} token={} superseded — skip cleanup",
