@@ -2,15 +2,13 @@ from __future__ import annotations
 
 # ruff: noqa: E402,F401
 import queue
-import sys
 import threading
-import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
-from .unit_stubs import install_connector_unit_stubs
+from ..unit_stubs import install_connector_unit_stubs
 
 install_connector_unit_stubs()
 
@@ -18,18 +16,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (  # noqa: E402
     KVConnectorRole,
 )
 
-native = types.ModuleType("pegaflow.pegaflow")
-native.EngineRpcClient = MagicMock
-native.PegaFlowError = type("PegaFlowError", (Exception,), {})
-native.PegaflowInternal = type("PegaflowInternal", (Exception,), {})
-native.PyLoadState = object
-native.QueryLoading = object
-native.QueryReady = object
-native.__version__ = "test"
-sys.modules["pegaflow.pegaflow"] = native
-
 import pegaflow.pd_connector.prefill_worker as prefill_worker_mod  # noqa: E402
 import pegaflow.pd_connector.worker as worker_mod  # noqa: E402
+import pegaflow.pegaflow as native  # noqa: E402
 from pegaflow.pd_connector import PdConnector  # noqa: E402
 from pegaflow.pd_connector.kv_params import parse_consumer  # noqa: E402
 from pegaflow.pd_connector.layout import (  # noqa: E402
@@ -63,10 +52,6 @@ from pegaflow.pd_connector.rdma import (  # noqa: E402
 )
 from pegaflow.pd_connector.scheduler import PdSchedulerConnector  # noqa: E402
 from pegaflow.pd_connector.worker import PdWorkerConnector  # noqa: E402
-
-
-def teardown_module() -> None:
-    sys.modules.pop("pegaflow.pegaflow", None)
 
 
 class FakeTensor:
