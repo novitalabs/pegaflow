@@ -41,10 +41,6 @@ def build_buckets(
         exponent += 1
 
 
-PREFETCH_DURATION_BUCKETS = build_buckets([1, 2, 4, 8], 200, -2)
-KV_TRANSFER_DURATION_BUCKETS = build_buckets([1, 2, 4, 8], 1000, -2)
-
-
 def _bind_metric_per_engine(
     prom_metrics: KVConnectorPromMetrics,
     metric: PromMetric,
@@ -307,11 +303,11 @@ class PegaPromMetrics(KVConnectorPromMetrics):
 
         # Histogram for prefetch operations (scheduler-side)
         # Optimized for fast SSD: typical range 10-500ms
-        # Buckets: 10, 20, 30, 50, 75, 100, 150, 200, 300, 500, 1000 ms
+        # Buckets: 10ms to 8000s.
         histogram_prefetch_duration = self._histogram_cls(
             name="vllm:pega_prefetch_duration_seconds",
             documentation="Histogram of prefetch duration in seconds.",
-            buckets=PREFETCH_DURATION_BUCKETS,
+            buckets=build_buckets([1, 2, 4, 8], 8000, -2),
             labelnames=labelnames,
         )
         self.histogram_prefetch_duration = _bind_metric_per_engine(
@@ -327,11 +323,11 @@ class PegaPromMetrics(KVConnectorPromMetrics):
         self.histogram_prefetch_blocks = _bind_metric_per_engine(self, histogram_prefetch_blocks)
 
         # Histogram for load/save operations (worker-side), tuned for tail
-        # visibility over sub-10ms jitter. Buckets: 10ms to 1000s.
+        # visibility over sub-10ms jitter. Buckets: 10ms to 8000s.
         histogram_load_duration = self._histogram_cls(
             name="vllm:pega_load_duration_seconds",
             documentation="Histogram of KV cache load duration in seconds.",
-            buckets=KV_TRANSFER_DURATION_BUCKETS,
+            buckets=build_buckets([1, 2, 4, 8], 8000, -2),
             labelnames=labelnames,
         )
         self.histogram_load_duration = _bind_metric_per_engine(self, histogram_load_duration)
@@ -362,7 +358,7 @@ class PegaPromMetrics(KVConnectorPromMetrics):
         histogram_save_duration = self._histogram_cls(
             name="vllm:pega_save_duration_seconds",
             documentation="Histogram of KV cache save duration in seconds.",
-            buckets=KV_TRANSFER_DURATION_BUCKETS,
+            buckets=build_buckets([1, 2, 4, 8], 8000, -2),
             labelnames=labelnames,
         )
         self.histogram_save_duration = _bind_metric_per_engine(self, histogram_save_duration)
@@ -439,7 +435,6 @@ class PegaPromMetrics(KVConnectorPromMetrics):
 
 __all__ = [
     "PrefetchTracker",
-    "KV_TRANSFER_DURATION_BUCKETS",
     "PegaKVConnectorStats",
     "PegaPromMetrics",
 ]
