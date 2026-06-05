@@ -275,7 +275,10 @@ class PdProxy:
                 "D",
             )
             end_ts_ns = time.time_ns()
-            self.config.metrics.finish_request((end_ts_ns - start_ts_ns) / 1_000_000_000)
+            self.config.metrics.finish_request(
+                (end_ts_ns - start_ts_ns) / 1_000_000_000,
+                error=decode_status >= 400,
+            )
             logger.info(
                 "[PdProxy] request=%s D completed status=%s bytes=%d latency_ms=%.3f ts_ns=%d",
                 req.request_id,
@@ -297,7 +300,7 @@ class PdProxy:
                 "application/json",
                 None,
                 "",
-                time.time_ns(),
+                0,
                 json.dumps(payload).encode(),
             )
 
@@ -488,9 +491,11 @@ class _Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 if payload is not None:
                     self.wfile.write(payload)
-                    self.server.proxy.config.metrics.finish_request(
-                        (time.time_ns() - start_ts_ns) / 1_000_000_000
-                    )
+                    if start_ts_ns > 0:
+                        self.server.proxy.config.metrics.finish_request(
+                            (time.time_ns() - start_ts_ns) / 1_000_000_000,
+                            error=int(status) >= 400,
+                        )
                     return
                 try:
                     with response:

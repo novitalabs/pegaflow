@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from http import HTTPStatus
 import time
 
 # ruff: noqa: F403,F405,I001
@@ -172,6 +173,98 @@ def test_pd_proxy_metrics_render_low_cardinality_route_stats() -> None:
     assert 'prefill_instance="p0"' in rendered
     assert 'decode_instance="d0"' in rendered
     assert "secret-request" not in rendered
+
+
+def test_pd_proxy_counts_non_stream_decode_http_errors(monkeypatch) -> None:
+    from pegaflow.pd_connector import proxy as proxy_mod
+
+    def fake_post_json(*_args, **_kwargs):
+        return HTTPStatus.BAD_GATEWAY, b'{"error":"decode failed"}', "application/json"
+
+    monkeypatch.setattr(proxy_mod, "_post_json", fake_post_json)
+    config = ProxyConfig(
+        prefill_url="http://p0:8000",
+        decode_url="http://d0:8000",
+        timeout_s=1.0,
+        prefill_max_tokens=1,
+    )
+    proxy = proxy_mod.PdProxy(config)
+
+    status, _payload, _content_type = proxy.handle_openai_request(
+        "/v1/completions",
+        {"request_id": "req-1", "model": "model", "prompt": "hello"},
+    )
+
+    metrics = config.metrics.snapshot()
+    assert status == HTTPStatus.BAD_GATEWAY
+    assert metrics["request_count"] == 1
+    assert metrics["error_count"] == 1
+
+
+def test_pd_proxy_unsupported_stream_does_not_record_decode_duration() -> None:
+    from pegaflow.pd_connector import proxy as proxy_mod
+
+    config = ProxyConfig(
+        prefill_url="http://p0:8000",
+        decode_url="http://d0:8000",
+        timeout_s=1.0,
+        prefill_max_tokens=1,
+    )
+    proxy = proxy_mod.PdProxy(config)
+
+    status, _content_type, _response, _request_id, start_ts_ns, payload = (
+        proxy.open_openai_stream("/unsupported", {"stream": True})
+    )
+    if payload is not None and start_ts_ns > 0:
+        config.metrics.finish_request((time.time_ns() - start_ts_ns) / 1_000_000_000)
+
+    metrics = config.metrics.snapshot()
+    assert status == HTTPStatus.NOT_FOUND
+    assert metrics["request_count"] == 0
+    assert metrics["decode_request_durations_s"] == []
+
+
+def test_d_consumer_release_does_not_increment_prefill_release_metric() -> None:
+    tensor = FakeTensor(
+        shape=(2, 8, 16, 8, 32),
+        stride=(8 * 8 * 16 * 32, 8 * 16 * 32, 32, 16 * 32, 1),
+    )
+    rdma = MockRdmaPort()
+    worker = PdWorkerConnector(
+        SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(engine_id="decode"),
+            parallel_config=SimpleNamespace(tensor_parallel_rank=0, tensor_parallel_size=1),
+        ),
+        rdma=rdma,
+    )
+    worker.register_kv_caches({"layer.0": tensor})
+    worker.start_load_kv(
+        PdConnectorMetadata(
+            reqs_to_wait={
+                "decode-1": WaitReqMeta(
+                    local_block_ids=([1],),
+                    remote_request_id="prefill-1",
+                    done_request_id="decode-1",
+                    prompt_token_ids=(1,),
+                    prefill_url="http://p:8001",
+                )
+            }
+        ),
+        None,
+    )
+
+    worker.start_load_kv(
+        PdConnectorMetadata(
+            reqs_to_release={"decode-1"},
+            release_reasons={"decode-1": RELEASE_CONSUMER_ABORT},
+        ),
+        None,
+    )
+
+    stats = worker.get_stats()
+    assert stats.data["pd_decode_abort_count"] == 1
+    assert stats.data["pd_prefill_release_count"] == 0
+    worker.shutdown()
 
 
 def test_pd_worker_stats_record_decode_wait_completion() -> None:
@@ -1627,6 +1720,7 @@ def test_push_finalizer_runs_requests_concurrently() -> None:
                     chunk_count=1,
                     first_save_ts_ns=time.time_ns(),
                     finalize_queued_ts_ns=time.time_ns(),
+                    schedule_queued_ts_ns=time.time_ns(),
                     rdma_bytes=1,
                 )
             )
@@ -1640,6 +1734,48 @@ def test_push_finalizer_runs_requests_concurrently() -> None:
     finally:
         rdma.release.set()
         finalizer.close()
+
+
+def test_push_finalizer_records_schedule_to_done_duration() -> None:
+    class Sender:
+        def wait_req(self, req_id: str) -> None:
+            return None
+
+    class RecordingRdma:
+        def wait_for_pushes(self, req_id: str) -> None:
+            return None
+
+        def push_done(self, req_id: str) -> None:
+            return None
+
+        def aggregated_link_speed(self) -> int:
+            return 400_000_000_000
+
+    from pegaflow.pd_connector.metrics import PdMetricsTracker
+
+    metrics = PdMetricsTracker()
+    now_ns = time.time_ns()
+    finalizer = prefill_worker_mod._AsyncPushFinalizer(Sender(), metrics=metrics)
+    try:
+        finalizer.submit(
+            prefill_worker_mod._PushFinalizeTask(
+                rdma=RecordingRdma(),
+                req_ids=("req-1",),
+                target_request_id="req-1",
+                num_blocks=1,
+                chunk_count=1,
+                first_save_ts_ns=now_ns - 800_000_000,
+                finalize_queued_ts_ns=now_ns - 100_000_000,
+                schedule_queued_ts_ns=now_ns - 1_000_000_000,
+                rdma_bytes=1,
+            )
+        )
+        finalizer.wait_all()
+    finally:
+        finalizer.close()
+
+    stats = metrics.get_stats()
+    assert stats.data["pd_prefill_push_duration"][0] >= 0.8
 
 
 def _prefill_http_task(request_id: str) -> PrefillHttpTask:

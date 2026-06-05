@@ -14,12 +14,12 @@ from pegaflow.pd_connector.kv_params import (
     parse_producer,
 )
 from pegaflow.pd_connector.metadata import (
-    PdConnectorMetadata,
-    PushReqMeta,
     RELEASE_CONSUMER_ABORT,
     RELEASE_PRODUCER_ABORT,
     RELEASE_PRODUCER_FINISHED,
     RELEASE_PRODUCER_PREEMPTED,
+    PdConnectorMetadata,
+    PushReqMeta,
     WaitReqMeta,
     normalize_block_ids,
 )
@@ -192,7 +192,7 @@ class PdSchedulerConnector:
             reqs_to_release=self._reqs_to_release,
             release_reasons={
                 **self._release_reasons,
-                **{req_id: RELEASE_PRODUCER_PREEMPTED for req_id in preempted_req_ids},
+                **dict.fromkeys(preempted_req_ids, RELEASE_PRODUCER_PREEMPTED),
             },
             preempted_req_ids=preempted_req_ids,
         )

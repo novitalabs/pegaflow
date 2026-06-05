@@ -106,9 +106,19 @@ class PrefillHandler:
             )
 
     def release(self, req_id: str, reason: str = RELEASE_CONSUMER_ABORT) -> tuple[str, ...]:
+        had_push_state = (
+            req_id in self._push_reqs
+            or req_id in self._pending_push_chunks
+            or req_id in self._push_chunk_maps
+            or req_id in self._push_plans
+            or req_id in self._logical_to_physical
+            or req_id in self._push_traces
+            or self._tracker.has_request(req_id)
+        )
         self._push_reqs.pop(req_id, None)
         self._w.metrics.set_prefill_active_pushes(len(self._push_reqs))
-        self._w.metrics.record_prefill_release()
+        if had_push_state:
+            self._w.metrics.record_prefill_release()
         self._pending_push_chunks.discard(req_id)
         self._push_chunk_maps.pop(req_id, None)
         self._push_plans.pop(req_id, None)
@@ -370,6 +380,7 @@ class PrefillHandler:
                     chunk_count=trace.chunk_count,
                     first_save_ts_ns=trace.first_save_ts_ns,
                     finalize_queued_ts_ns=finalize_ts_ns,
+                    schedule_queued_ts_ns=trace.queued_ts_ns,
                     rdma_bytes=trace.rdma_bytes,
                 )
             )
@@ -704,6 +715,7 @@ class _PushFinalizeTask:
     chunk_count: int
     first_save_ts_ns: int | None
     finalize_queued_ts_ns: int
+    schedule_queued_ts_ns: int
     rdma_bytes: int
 
 
@@ -901,7 +913,7 @@ class _AsyncPushFinalizer:
             done_ts_ns = time.time_ns()
             if completed and self._metrics is not None:
                 self._metrics.record_prefill_push(
-                    duration_s=(done_ts_ns - task.finalize_queued_ts_ns) / 1_000_000_000,
+                    duration_s=(done_ts_ns - task.schedule_queued_ts_ns) / 1_000_000_000,
                     first_save_to_done_s=(
                         (done_ts_ns - task.first_save_ts_ns) / 1_000_000_000
                         if task.first_save_ts_ns is not None
@@ -924,7 +936,7 @@ class _AsyncPushFinalizer:
                 task.num_blocks,
                 task.rdma_bytes,
                 _elapsed_ms(task.first_save_ts_ns, done_ts_ns),
-                _elapsed_ms(task.finalize_queued_ts_ns, done_ts_ns),
+                _elapsed_ms(task.schedule_queued_ts_ns, done_ts_ns),
                 save_gbps,
                 _gbps(task.rdma_bytes, task.finalize_queued_ts_ns, done_ts_ns),
                 link_gbps,
@@ -944,7 +956,7 @@ class _AsyncPushFinalizer:
                 self._condition.notify_all()
             if self._metrics is not None:
                 self._metrics.record_prefill_push(
-                    duration_s=(time.time_ns() - task.finalize_queued_ts_ns) / 1_000_000_000,
+                    duration_s=(time.time_ns() - task.schedule_queued_ts_ns) / 1_000_000_000,
                     first_save_to_done_s=None,
                     wait_for_pushes_s=None,
                     blocks=task.num_blocks,

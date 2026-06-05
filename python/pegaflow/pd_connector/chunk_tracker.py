@@ -18,6 +18,9 @@ class ChunkTracker:
     def add_request(self, req_id: str) -> None:
         self._requests.setdefault(req_id, RequestChunks())
 
+    def has_request(self, req_id: str) -> bool:
+        return req_id in self._requests
+
     def mark_blocks_pushed(self, req_id: str, layer_idx: int, block_ids: set[int]) -> None:
         self.add_request(req_id)
         self._requests[req_id].pushed_pairs.update((layer_idx, block_id) for block_id in block_ids)
