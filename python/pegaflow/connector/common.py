@@ -61,6 +61,7 @@ class ConnectorContext:
     pp_rank: int = 0
     pp_size: int = 1
     mode: PegaConnectorMode = PegaConnectorMode.READ_WRITE
+    layer_id_by_name: dict[str, int] | None = None
 
     @property
     def read_enabled(self) -> bool:

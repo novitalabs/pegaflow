@@ -35,6 +35,7 @@ pub use backing::{
 pub use block::{
     BlockHash, BlockKey, LayerBlock, LayerSave, PrefetchStatus, RawBlock, SealedBlock,
 };
+use instance::GpuRegistration;
 pub use instance::{GpuContext, InstanceContext, KVCacheRegistration};
 pub use internode::{DEFAULT_METASERVER_QUEUE_DEPTH, MetaServerClient, MetaServerClientConfig};
 pub use lease::QueryLeaseId;
@@ -234,6 +235,7 @@ impl PegaEngine {
     /// - `num_layers`, `tp_size`, and `world_size` must be non-zero.
     /// - `tp_rank` must be less than `tp_size`.
     /// - Layer metadata arrays must all have the same length as `layer_names`.
+    /// - `layer_ids` must be connector-declared IDs in `0..num_layers`.
     /// - Registration sizes and pointers must describe a valid KV cache layout.
     #[allow(
         clippy::too_many_arguments,
@@ -250,6 +252,7 @@ impl PegaEngine {
         world_size: usize,
         num_layers: usize,
         layer_names: &[String],
+        layer_ids: &[usize],
         data_ptrs: &[u64],
         size_bytes_list: &[usize],
         num_blocks_list: &[usize],
@@ -260,7 +263,27 @@ impl PegaEngine {
         // Build all registrations
         let ssd_enabled = self.storage.is_ssd_enabled();
         let batch_size = layer_names.len();
+        if layer_ids.len() != batch_size
+            || data_ptrs.len() != batch_size
+            || size_bytes_list.len() != batch_size
+            || num_blocks_list.len() != batch_size
+            || bytes_per_block_list.len() != batch_size
+            || kv_stride_bytes_list.len() != batch_size
+            || segments_list.len() != batch_size
+        {
+            return Err(EngineError::InvalidArgument(format!(
+                "registration metadata length mismatch: layer_names={batch_size}, layer_ids={}, data_ptrs={}, size_bytes={}, num_blocks={}, bytes_per_block={}, kv_stride_bytes={}, segments={}",
+                layer_ids.len(),
+                data_ptrs.len(),
+                size_bytes_list.len(),
+                num_blocks_list.len(),
+                bytes_per_block_list.len(),
+                kv_stride_bytes_list.len(),
+                segments_list.len()
+            )));
+        }
         let mut kv_caches = HashMap::with_capacity(batch_size);
+        let mut layer_ids_by_name = HashMap::with_capacity(batch_size);
 
         for i in 0..batch_size {
             let layer_name = &layer_names[i];
@@ -284,7 +307,12 @@ impl PegaEngine {
                 }
             }
 
-            kv_caches.insert(layer_name.clone(), registration);
+            if kv_caches.insert(layer_name.clone(), registration).is_some() {
+                return Err(EngineError::InvalidArgument(format!(
+                    "duplicate layer name in registration batch: {layer_name}"
+                )));
+            }
+            layer_ids_by_name.insert(layer_name.clone(), layer_ids[i]);
         }
 
         // Get or create instance
@@ -305,14 +333,15 @@ impl PegaEngine {
         }
 
         // Register GPU with all layers
-        instance.register_new_gpu(
+        instance.register_new_gpu(GpuRegistration {
             device_id,
             tp_rank,
             pp_rank,
             numa_node,
-            self.transfer_mode,
+            transfer_mode: self.transfer_mode,
             kv_caches,
-        )?;
+            layer_ids_by_name,
+        })?;
 
         info!(
             "Registered context batch: instance={instance_id}, namespace={namespace}, \
@@ -508,6 +537,7 @@ impl PegaEngine {
         loads: &[(QueryLeaseId, Vec<i32>)],
     ) -> Result<(), EngineError> {
         let instance = self.get_instance(instance_id)?;
+        instance.ensure_all_slots_registered()?;
         let gpu = instance
             .get_gpu(device_id)
             .ok_or_else(|| EngineError::WorkerMissing(instance_id.to_string(), device_id))?;

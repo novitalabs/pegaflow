@@ -252,6 +252,7 @@ class ClientContext:
                 self.device_id,
                 self.num_layers,
                 [layer_name],
+                [self._layer_name_to_id[layer_name]],
                 [wrapper_bytes],
                 [num_blocks],
                 [bytes_per_block],

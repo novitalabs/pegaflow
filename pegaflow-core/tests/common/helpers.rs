@@ -40,6 +40,7 @@ pub fn register_layers(
     num_layers: usize,
 ) {
     let layer_names: Vec<String> = layers.iter().map(|l| l.name.clone()).collect();
+    let layer_ids: Vec<usize> = (0..layers.len()).collect();
     let gpu_ptrs: Vec<u64> = layers.iter().map(|l| l.gpu_ptr).collect();
     let total_sizes: Vec<usize> = layers.iter().map(|l| l.total_size).collect();
     let num_blocks_list: Vec<usize> = layers.iter().map(|l| l.num_blocks).collect();
@@ -58,6 +59,7 @@ pub fn register_layers(
             world_size,
             num_layers,
             &layer_names,
+            &layer_ids,
             &gpu_ptrs,
             &total_sizes,
             &num_blocks_list,

@@ -137,6 +137,22 @@ def _install_vllm_stubs() -> None:
     parallel_state.get_pp_group = lambda: _PPGroup()
 
     _ensure_module("vllm.config").VllmConfig = object
+    models_utils = _ensure_module("vllm.model_executor.models.utils")
+
+    def extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
+        int_vals: list[int] = []
+        for subname in layer_name.split("."):
+            try:
+                int_vals.append(int(subname))
+            except ValueError:
+                continue
+        if num_attn_module == 1 or "attn" not in layer_name:
+            assert len(int_vals) == 1, f"layer name {layer_name} should only contain one integer"
+            return int_vals[0]
+        assert len(int_vals) <= 2, f"layer name {layer_name} should contain most two integers"
+        return int_vals[0] * num_attn_module + int_vals[1] if len(int_vals) == 2 else int_vals[0]
+
+    models_utils.extract_layer_index = extract_layer_index
     _ensure_module("vllm.v1")
     _ensure_module("vllm.v1.metrics")
     _ensure_module("vllm.v1.metrics.utils").create_metric_per_engine = lambda *_args, **_kwargs: {}

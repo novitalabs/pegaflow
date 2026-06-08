@@ -94,12 +94,15 @@ def build_push_layout_plan(
         total_heads=total_num_kv_heads,
     )
     for local_idx, global_head in enumerate(local_heads):
-        if _owner_rank_for_global_head(
-            global_head,
-            rank_count=prefill_tp_size,
-            local_heads=local_num_kv_heads,
-            total_heads=total_num_kv_heads,
-        ) != prefill_tp_rank:
+        if (
+            _owner_rank_for_global_head(
+                global_head,
+                rank_count=prefill_tp_size,
+                local_heads=local_num_kv_heads,
+                total_heads=total_num_kv_heads,
+            )
+            != prefill_tp_rank
+        ):
             continue
         decode_rank = _owner_rank_for_global_head(
             global_head,
@@ -195,9 +198,7 @@ def _build_mla_plan(
             f"prefill_tp={prefill_tp_size} decode_tp={decode_tp_size}"
         )
         ratio = decode_tp_size // prefill_tp_size
-        decode_ranks = tuple(
-            range(prefill_tp_rank * ratio, (prefill_tp_rank + 1) * ratio)
-        )
+        decode_ranks = tuple(range(prefill_tp_rank * ratio, (prefill_tp_rank + 1) * ratio))
         return PushLayoutPlan(
             targets=tuple(
                 PushTargetPlan(

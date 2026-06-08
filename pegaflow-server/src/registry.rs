@@ -1,7 +1,7 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone)]
@@ -64,31 +64,50 @@ impl CudaTensorRegistry {
         }
     }
 
-    fn register_layer(
+    fn register_layers(
         &mut self,
         context_key: &str,
-        layer_name: &str,
         device_id: i32,
-        wrapper_bytes: &[u8],
-    ) -> PyResult<TensorMetadata> {
-        let layer_tensor = Self::materialize_tensor(device_id, wrapper_bytes)?;
-        let metadata = layer_tensor.metadata.clone();
-
-        let context = self
-            .contexts
-            .entry(context_key.to_string())
-            .or_insert_with(|| ContextState::new(device_id));
-
-        if context.device_id != metadata.device_id {
+        layers: Vec<(String, Vec<u8>)>,
+    ) -> PyResult<Vec<TensorMetadata>> {
+        if self.contexts.contains_key(context_key) {
             return Err(PyValueError::new_err(format!(
-                "context {context_key} is pinned to device {} but got {}",
-                context.device_id, metadata.device_id
+                "context {context_key} is already registered"
             )));
         }
 
-        context.tensors.insert(layer_name.to_string(), layer_tensor);
+        let mut seen_layers = HashSet::with_capacity(layers.len());
+        for (layer_name, _) in &layers {
+            if !seen_layers.insert(layer_name.as_str()) {
+                return Err(PyValueError::new_err(format!(
+                    "layer {layer_name} appears more than once in context {context_key}"
+                )));
+            }
+        }
 
-        Ok(metadata)
+        let mut context = ContextState::new(device_id);
+        let mut metadatas = Vec::with_capacity(layers.len());
+        for (layer_name, wrapper_bytes) in layers {
+            let layer_tensor = Self::materialize_tensor(device_id, &wrapper_bytes)?;
+            let metadata = layer_tensor.metadata.clone();
+
+            if context.device_id != metadata.device_id {
+                return Err(PyValueError::new_err(format!(
+                    "context {context_key} is pinned to device {} but got {}",
+                    context.device_id, metadata.device_id
+                )));
+            }
+
+            context.tensors.insert(layer_name, layer_tensor);
+            metadatas.push(metadata);
+        }
+
+        self.contexts.insert(context_key.to_string(), context);
+        Ok(metadatas)
+    }
+
+    fn drop_context(&mut self, context_key: &str) -> usize {
+        self.release_contexts(vec![context_key.to_string()])
     }
 
     fn drop_instance(&mut self, instance_id: &str) -> usize {
@@ -200,6 +219,10 @@ enum RegistryCommand {
         instance_id: String,
         reply: oneshot::Sender<usize>,
     },
+    DropContext {
+        context_key: String,
+        reply: oneshot::Sender<usize>,
+    },
     Clear {
         reply: oneshot::Sender<usize>,
     },
@@ -236,11 +259,10 @@ impl RegistryHandle {
     }
 
     /// Materialize and register a batch of layers under `context_key`. Returns
-    /// per-layer metadata in input order; on the first layer that fails to
-    /// materialize it returns that error (already stringified on the registry
-    /// thread). Fail-fast mirrors the original loop: layers registered before
-    /// the failing one stay registered and must be cleaned up via
-    /// [`Self::drop_instance`].
+    /// per-layer metadata in input order. The batch is transactional with
+    /// respect to the registry: an existing context is rejected before any
+    /// tensor is materialized, and a materialization failure does not publish a
+    /// partial context.
     pub async fn register_layers(
         &self,
         context_key: String,
@@ -263,6 +285,14 @@ impl RegistryHandle {
     pub async fn drop_instance(&self, instance_id: String) -> usize {
         let (reply, rx) = oneshot::channel();
         self.dispatch(RegistryCommand::DropInstance { instance_id, reply })
+            .await;
+        rx.await.expect("cuda-registry thread dropped reply")
+    }
+
+    /// Drop exactly one context; returns the number of CUDA tensors released.
+    pub async fn drop_context(&self, context_key: String) -> usize {
+        let (reply, rx) = oneshot::channel();
+        self.dispatch(RegistryCommand::DropContext { context_key, reply })
             .await;
         rx.await.expect("cuda-registry thread dropped reply")
     }
@@ -293,12 +323,8 @@ fn registry_actor(mut registry: CudaTensorRegistry, mut rx: mpsc::Receiver<Regis
                 layers,
                 reply,
             } => {
-                let result = layers
-                    .iter()
-                    .map(|(layer_name, wrapper_bytes)| {
-                        registry.register_layer(&context_key, layer_name, device_id, wrapper_bytes)
-                    })
-                    .collect::<PyResult<Vec<_>>>()
+                let result = registry
+                    .register_layers(&context_key, device_id, layers)
                     // Stringify here, on the GIL-owning thread, so the gRPC
                     // handler never needs `Python::attach` just to read the message.
                     .map_err(|err| Python::attach(|py| err.value(py).to_string()));
@@ -307,9 +333,56 @@ fn registry_actor(mut registry: CudaTensorRegistry, mut rx: mpsc::Receiver<Regis
             RegistryCommand::DropInstance { instance_id, reply } => {
                 let _ = reply.send(registry.drop_instance(&instance_id));
             }
+            RegistryCommand::DropContext { context_key, reply } => {
+                let _ = reply.send(registry.drop_context(&context_key));
+            }
             RegistryCommand::Clear { reply } => {
                 let _ = reply.send(registry.clear_and_count());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drop_context_removes_only_that_context() {
+        let mut registry = CudaTensorRegistry::empty();
+        registry
+            .contexts
+            .insert("instance-a:tp0:pp0:dev0".to_string(), ContextState::new(0));
+        registry
+            .contexts
+            .insert("instance-a:tp0:pp1:dev1".to_string(), ContextState::new(1));
+
+        assert_eq!(registry.drop_context("instance-a:tp0:pp0:dev0"), 0);
+
+        assert!(!registry.contexts.contains_key("instance-a:tp0:pp0:dev0"));
+        assert!(registry.contexts.contains_key("instance-a:tp0:pp1:dev1"));
+    }
+
+    #[test]
+    fn register_layers_rejects_existing_context_before_materializing() {
+        let mut registry = CudaTensorRegistry::empty();
+        registry
+            .contexts
+            .insert("instance-a:tp0:pp0:dev0".to_string(), ContextState::new(7));
+
+        let err = registry
+            .register_layers("instance-a:tp0:pp0:dev0", 0, Vec::new())
+            .expect_err("existing context must be rejected");
+
+        let message = Python::attach(|py| err.value(py).to_string());
+        assert!(message.contains("already registered"));
+        assert_eq!(
+            registry
+                .contexts
+                .get("instance-a:tp0:pp0:dev0")
+                .expect("existing context remains")
+                .device_id,
+            7
+        );
     }
 }

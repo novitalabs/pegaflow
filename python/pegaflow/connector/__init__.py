@@ -14,6 +14,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
 )
 from vllm.distributed.parallel_state import get_pp_group, get_tensor_model_parallel_rank
+from vllm.model_executor.models.utils import extract_layer_index
 
 from pegaflow.connector.common import (
     ConnectorContext,
@@ -30,6 +31,41 @@ from pegaflow.connector.scheduler import SchedulerConnector
 from pegaflow.connector.state_manager import ServiceStateManager
 from pegaflow.connector.worker import WorkerConnector
 from pegaflow.pegaflow import EngineRpcClient
+
+
+def _build_layer_id_by_name(kv_cache_config, num_layers: int) -> dict[str, int]:
+    if kv_cache_config is None:
+        return {}
+
+    names: list[str] = []
+    for group in getattr(kv_cache_config, "kv_cache_groups", ()):
+        names.extend(getattr(group, "layer_names", ()))
+    for tensor in getattr(kv_cache_config, "kv_cache_tensors", ()):
+        names.extend(getattr(tensor, "shared_by", ()))
+
+    ordered_names = list(dict.fromkeys(names))
+    layer_id_by_name: dict[str, int] = {}
+    unknown_names: list[str] = []
+    for name in ordered_names:
+        try:
+            layer_id_by_name[name] = extract_layer_index(name)
+        except (AssertionError, ValueError):
+            unknown_names.append(name)
+
+    if unknown_names:
+        if len(ordered_names) < num_layers:
+            logger.warning(
+                "[PegaKVConnector] Cannot assign fallback layer ids for non-standard "
+                "layer names from a PP-local subset: %s",
+                unknown_names,
+            )
+            return layer_id_by_name
+
+        next_id = max(layer_id_by_name.values(), default=-1) + 1
+        for offset, name in enumerate(sorted(unknown_names)):
+            layer_id_by_name[name] = next_id + offset
+
+    return layer_id_by_name
 
 
 class PegaKVConnector(KVConnectorBase_V1):
@@ -69,6 +105,7 @@ class PegaKVConnector(KVConnectorBase_V1):
         )
         num_layers = getattr(vllm_config.model_config.hf_text_config, "num_hidden_layers", 0)
         block_size = vllm_config.cache_config.block_size
+        layer_id_by_name = _build_layer_id_by_name(kv_cache_config, num_layers)
 
         tp_rank: int | None = None
         device_id: int | None = None
@@ -126,6 +163,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             pp_rank=pp_rank,
             pp_size=pp_size,
             mode=mode,
+            layer_id_by_name=layer_id_by_name,
         )
 
         self._scheduler: SchedulerConnector | None = None

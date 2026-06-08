@@ -4,13 +4,7 @@
 //! multi-tenant inference instances and their associated GPU resources.
 
 use parking_lot::Mutex;
-use std::{
-    collections::HashMap,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-};
+use std::{collections::HashMap, sync::Arc};
 
 use cudarc::driver::CudaContext;
 use log::info;
@@ -27,7 +21,7 @@ struct LayerMetadata {
     name_to_id: HashMap<String, usize>,
 
     /// Inverse mapping from IDs to layer names.
-    names: Vec<String>,
+    names: Vec<Option<String>>,
 
     /// GPU contexts indexed by CUDA device ID.
     gpu_contexts: HashMap<i32, Arc<GpuContext>>,
@@ -154,6 +148,9 @@ impl KVCacheRegistration {
 /// - Asynchronous worker pool for load/save operations
 /// - NUMA affinity for memory allocation optimization
 pub struct GpuContext {
+    /// CUDA device ID for diagnostics and duplicate registration checks.
+    device_id: i32,
+
     /// Effective TP rank represented by this GPU context.
     tp_rank: usize,
 
@@ -195,6 +192,7 @@ impl GpuContext {
         let worker_pool = GpuWorkerPool::spawn(device_id, numa_node, transfer_mode)?;
 
         Ok(Self {
+            device_id,
             tp_rank,
             pp_rank,
             preferred_numa: numa_node,
@@ -207,6 +205,11 @@ impl GpuContext {
     /// Get the preferred NUMA node for this GPU.
     pub(crate) fn preferred_numa(&self) -> NumaNode {
         self.preferred_numa
+    }
+
+    /// CUDA device ID represented by this shard.
+    pub(crate) fn device_id(&self) -> i32 {
+        self.device_id
     }
 
     /// Effective TP rank represented by this shard.
@@ -230,6 +233,16 @@ impl GpuContext {
     }
 }
 
+pub(crate) struct GpuRegistration {
+    pub(crate) device_id: i32,
+    pub(crate) tp_rank: usize,
+    pub(crate) pp_rank: usize,
+    pub(crate) numa_node: NumaNode,
+    pub(crate) transfer_mode: TransferMode,
+    pub(crate) kv_caches: HashMap<String, KVCacheRegistration>,
+    pub(crate) layer_ids_by_name: HashMap<String, usize>,
+}
+
 /// Instance context for a model inference process.
 ///
 /// An `InstanceContext` represents a single inference instance (e.g., one
@@ -242,9 +255,8 @@ pub struct InstanceContext {
     /// Namespace for model isolation (e.g., model name or tenant ID).
     namespace: String,
 
-    /// Number of transformer layers in the model.
-    /// Grows via `expand_num_layers` when PP ranks register additional layers.
-    num_layers: AtomicUsize,
+    /// Number of connector-declared logical layers for this instance.
+    num_layers: usize,
 
     /// Tensor parallelism degree (number of GPUs per instance).
     tp_size: usize,
@@ -278,36 +290,125 @@ impl InstanceContext {
         Ok(Self {
             id,
             namespace,
-            num_layers: AtomicUsize::new(num_layers),
+            num_layers,
             tp_size,
             world_size,
             metadata: Mutex::new(LayerMetadata {
                 name_to_id: HashMap::new(),
-                names: Vec::new(),
+                names: vec![None; num_layers],
                 gpu_contexts: HashMap::new(),
             }),
         })
     }
 
-    /// Get existing layer ID or allocate a new one.
-    ///
-    /// This is idempotent: calling multiple times with the same layer name
-    /// returns the same ID. Used for MLA where multiple TP ranks register
-    /// the same layer name on different devices.
-    fn get_or_allocate_layer_id(&self, layer_name: &str) -> usize {
-        let mut metadata = self.metadata.lock();
-
-        if let Some(&id) = metadata.name_to_id.get(layer_name) {
-            return id;
+    /// Register the connector-declared numeric ID for a layer name.
+    #[cfg(test)]
+    fn register_layer_id(&self, layer_name: &str, layer_id: usize) -> Result<(), EngineError> {
+        if layer_id >= self.num_layers {
+            return Err(EngineError::InvalidArgument(format!(
+                "layer {layer_name} id {layer_id} out of range (num_layers {})",
+                self.num_layers
+            )));
         }
 
-        let id = metadata.names.len();
-        metadata.names.push(layer_name.to_string());
-        metadata.name_to_id.insert(layer_name.to_string(), id);
-        // Grow num_layers to cover the newly allocated layer ID so that
-        // total_slots() and get_slot_index() stay in bounds.
-        self.num_layers.fetch_max(id + 1, Ordering::Relaxed);
-        id
+        let mut metadata = self.metadata.lock();
+
+        if let Some(&id) = metadata.name_to_id.get(layer_name)
+            && id != layer_id
+        {
+            return Err(EngineError::InvalidArgument(format!(
+                "layer {layer_name} already registered with id {id}, got {layer_id}"
+            )));
+        }
+
+        if let Some(existing_name) = &metadata.names[layer_id]
+            && existing_name != layer_name
+        {
+            return Err(EngineError::InvalidArgument(format!(
+                "layer id {layer_id} already registered for {existing_name}, got {layer_name}"
+            )));
+        }
+
+        metadata.names[layer_id] = Some(layer_name.to_string());
+        metadata.name_to_id.insert(layer_name.to_string(), layer_id);
+        Ok(())
+    }
+
+    fn build_layer_id_assignments(
+        &self,
+        kv_caches: &HashMap<String, KVCacheRegistration>,
+        layer_ids_by_name: &HashMap<String, usize>,
+    ) -> Result<Vec<(String, usize)>, EngineError> {
+        let mut assignments = Vec::with_capacity(kv_caches.len());
+        let mut names_by_id = HashMap::with_capacity(kv_caches.len());
+
+        for layer_name in kv_caches.keys() {
+            let layer_id = *layer_ids_by_name.get(layer_name).ok_or_else(|| {
+                EngineError::InvalidArgument(format!("missing layer id for {layer_name}"))
+            })?;
+
+            if layer_id >= self.num_layers {
+                return Err(EngineError::InvalidArgument(format!(
+                    "layer {layer_name} id {layer_id} out of range (num_layers {})",
+                    self.num_layers
+                )));
+            }
+
+            if let Some(existing_name) = names_by_id.insert(layer_id, layer_name.as_str()) {
+                return Err(EngineError::InvalidArgument(format!(
+                    "layer id {layer_id} appears more than once in registration batch: {existing_name}, {layer_name}"
+                )));
+            }
+
+            assignments.push((layer_name.clone(), layer_id));
+        }
+
+        Ok(assignments)
+    }
+
+    fn validate_layer_id_assignments(
+        &self,
+        metadata: &LayerMetadata,
+        assignments: &[(String, usize)],
+    ) -> Result<(), EngineError> {
+        for (layer_name, layer_id) in assignments {
+            if let Some(&id) = metadata.name_to_id.get(layer_name)
+                && id != *layer_id
+            {
+                return Err(EngineError::InvalidArgument(format!(
+                    "layer {layer_name} already registered with id {id}, got {layer_id}"
+                )));
+            }
+
+            if let Some(existing_name) = &metadata.names[*layer_id]
+                && existing_name != layer_name
+            {
+                return Err(EngineError::InvalidArgument(format!(
+                    "layer id {layer_id} already registered for {existing_name}, got {layer_name}"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn commit_layer_id_assignments(metadata: &mut LayerMetadata, assignments: &[(String, usize)]) {
+        for (layer_name, layer_id) in assignments {
+            metadata.names[*layer_id] = Some(layer_name.clone());
+            metadata.name_to_id.insert(layer_name.clone(), *layer_id);
+        }
+    }
+
+    fn ensure_device_unregistered(
+        metadata: &LayerMetadata,
+        device_id: i32,
+    ) -> Result<(), EngineError> {
+        if metadata.gpu_contexts.contains_key(&device_id) {
+            return Err(EngineError::InvalidArgument(format!(
+                "GPU context for device {device_id} already exists"
+            )));
+        }
+        Ok(())
     }
 
     /// Look up the numeric ID for a layer name.
@@ -322,7 +423,7 @@ impl InstanceContext {
     ///
     /// Slots are organized as a flattened 2D array: `[layer][tp_rank]`.
     pub(crate) fn total_slots(&self) -> usize {
-        self.num_layers.load(Ordering::Relaxed) * self.tp_size
+        self.num_layers * self.tp_size
     }
 
     /// Compute the slot index for a specific layer and TP rank.
@@ -337,11 +438,10 @@ impl InstanceContext {
         layer_id: usize,
         tp_rank: usize,
     ) -> Result<usize, EngineError> {
-        let num_layers = self.num_layers.load(Ordering::Relaxed);
-        if layer_id >= num_layers {
+        if layer_id >= self.num_layers {
             return Err(EngineError::InvalidArgument(format!(
                 "layer_id {} out of range ({} layers)",
-                layer_id, num_layers
+                layer_id, self.num_layers
             )));
         }
         if tp_rank >= self.tp_size {
@@ -353,7 +453,7 @@ impl InstanceContext {
         Ok(layer_id * self.tp_size + tp_rank)
     }
 
-    /// Get or create a GPU context for the specified device.
+    /// Build a GPU context for the specified device.
     ///
     /// This method lazily initializes CUDA contexts as devices are first accessed.
     /// The `numa_node` should be obtained from `NumaTopology::numa_for_gpu()`.
@@ -361,7 +461,7 @@ impl InstanceContext {
     /// # Errors
     /// Returns `EngineError::InvalidArgument` for negative device IDs,
     /// or `EngineError::CudaInit` if CUDA context creation fails.
-    fn create_gpu(
+    fn build_gpu_context(
         &self,
         device_id: i32,
         tp_rank: usize,
@@ -377,22 +477,10 @@ impl InstanceContext {
             )));
         }
 
-        // Check if context already exists
-        {
-            let metadata = self.metadata.lock();
-            if metadata.gpu_contexts.contains_key(&device_id) {
-                return Err(EngineError::InvalidArgument(format!(
-                    "GPU context for device {} already exists",
-                    device_id
-                )));
-            }
-        }
-
-        // Create new context
         let cuda_ctx = CudaContext::new(device_id as usize)
             .map_err(|e| EngineError::CudaInit(format!("{e:?}")))?;
 
-        let ctx = Arc::new(GpuContext::new(
+        Ok(Arc::new(GpuContext::new(
             cuda_ctx,
             device_id,
             tp_rank,
@@ -400,26 +488,7 @@ impl InstanceContext {
             numa_node,
             transfer_mode,
             kv_caches,
-        )?);
-
-        // Insert and return
-        let mut metadata = self.metadata.lock();
-
-        // Double-check after acquiring lock
-        if metadata.gpu_contexts.contains_key(&device_id) {
-            return Err(EngineError::InvalidArgument(format!(
-                "GPU context for device {} already exists",
-                device_id
-            )));
-        }
-
-        metadata.gpu_contexts.insert(device_id, Arc::clone(&ctx));
-
-        info!(
-            "Initialized GPU context: device_id={}, numa_node={}",
-            device_id, numa_node
-        );
-        Ok(ctx)
+        )?))
     }
 
     /// Get an existing GPU context without creating one.
@@ -457,23 +526,42 @@ impl InstanceContext {
     /// - `EngineError::CudaInit` if GPU context creation fails
     pub(crate) fn register_new_gpu(
         &self,
-        device_id: i32,
-        tp_rank: usize,
-        pp_rank: usize,
-        numa_node: NumaNode,
-        transfer_mode: TransferMode,
-        kv_caches: HashMap<String, KVCacheRegistration>,
+        registration: GpuRegistration,
     ) -> Result<(), EngineError> {
+        let GpuRegistration {
+            device_id,
+            tp_rank,
+            pp_rank,
+            numa_node,
+            transfer_mode,
+            kv_caches,
+            layer_ids_by_name,
+        } = registration;
+
         if tp_rank >= self.tp_size {
             return Err(EngineError::InvalidArgument(format!(
                 "tp_rank {} out of range (tp_size {})",
                 tp_rank, self.tp_size
             )));
         }
-        for layer_name in kv_caches.keys() {
-            self.get_or_allocate_layer_id(layer_name);
+        if kv_caches.len() != layer_ids_by_name.len() {
+            return Err(EngineError::InvalidArgument(format!(
+                "layer id count {} does not match layer cache count {}",
+                layer_ids_by_name.len(),
+                kv_caches.len()
+            )));
         }
-        self.create_gpu(
+
+        let layer_id_assignments =
+            self.build_layer_id_assignments(&kv_caches, &layer_ids_by_name)?;
+
+        {
+            let metadata = self.metadata.lock();
+            Self::ensure_device_unregistered(&metadata, device_id)?;
+            self.validate_layer_id_assignments(&metadata, &layer_id_assignments)?;
+        }
+
+        let ctx = self.build_gpu_context(
             device_id,
             tp_rank,
             pp_rank,
@@ -481,6 +569,75 @@ impl InstanceContext {
             transfer_mode,
             kv_caches,
         )?;
+
+        {
+            let mut metadata = self.metadata.lock();
+            Self::ensure_device_unregistered(&metadata, device_id)?;
+            self.validate_layer_id_assignments(&metadata, &layer_id_assignments)?;
+            Self::commit_layer_id_assignments(&mut metadata, &layer_id_assignments);
+            metadata.gpu_contexts.insert(device_id, ctx);
+        }
+
+        info!("Initialized GPU context: device_id={device_id}, numa_node={numa_node}");
+        Ok(())
+    }
+
+    /// Verify every declared logical layer has a registered slot for every TP rank.
+    pub(crate) fn ensure_all_slots_registered(&self) -> Result<(), EngineError> {
+        let metadata = self.metadata.lock();
+        let total_slots = self.total_slots();
+        let mut owners: Vec<Option<String>> = vec![None; total_slots];
+
+        for gpu in metadata.gpu_contexts.values() {
+            if gpu.tp_rank() >= self.tp_size {
+                return Err(EngineError::InvalidArgument(format!(
+                    "registered gpu device {} has tp_rank {} out of range (tp_size {})",
+                    gpu.device_id(),
+                    gpu.tp_rank(),
+                    self.tp_size
+                )));
+            }
+
+            for layer_name in gpu.kv_caches.keys() {
+                let layer_id = metadata.name_to_id.get(layer_name).ok_or_else(|| {
+                    EngineError::InvalidArgument(format!(
+                        "layer {layer_name} registered on device {} without a layer id",
+                        gpu.device_id()
+                    ))
+                })?;
+                let slot_id = layer_id * self.tp_size + gpu.tp_rank();
+                if slot_id >= total_slots {
+                    return Err(EngineError::InvalidArgument(format!(
+                        "slot_id {slot_id} out of range (total_slots {total_slots})"
+                    )));
+                }
+                let owner = format!(
+                    "device={} pp_rank={} tp_rank={} layer={}",
+                    gpu.device_id(),
+                    gpu.pp_rank(),
+                    gpu.tp_rank(),
+                    layer_name
+                );
+                if let Some(existing_owner) = owners[slot_id].replace(owner.clone()) {
+                    return Err(EngineError::InvalidArgument(format!(
+                        "slot {slot_id} registered twice: {existing_owner}; {owner}"
+                    )));
+                }
+            }
+        }
+
+        let registered_slots = owners.iter().filter(|owner| owner.is_some()).count();
+        if registered_slots != total_slots {
+            let first_missing = owners
+                .iter()
+                .position(Option::is_none)
+                .expect("missing slot must exist when counts differ");
+            return Err(EngineError::InvalidArgument(format!(
+                "instance {} has incomplete KV registration: registered_slots={} expected_slots={} first_missing_slot={}",
+                self.id, registered_slots, total_slots, first_missing
+            )));
+        }
+
         Ok(())
     }
 
@@ -546,178 +703,21 @@ impl InstanceContext {
     /// Returns `Ok(())` if matches, or an error message describing the mismatch.
     pub(crate) fn verify_topology(
         &self,
-        _num_layers: usize,
+        num_layers: usize,
         tp_size: usize,
         world_size: usize,
     ) -> Result<(), String> {
-        if self.tp_size != tp_size || self.world_size != world_size {
+        if self.num_layers != num_layers || self.tp_size != tp_size || self.world_size != world_size
+        {
             return Err(format!(
-                "exists with tp={}, world={}; \
-                 requested tp={}, world={}",
-                self.tp_size, self.world_size, tp_size, world_size
+                "exists with layers={}, tp={}, world={}; \
+                 requested layers={}, tp={}, world={}",
+                self.num_layers, self.tp_size, self.world_size, num_layers, tp_size, world_size
             ));
         }
-        // num_layers grows automatically in get_or_allocate_layer_id
-        // when PP ranks register new layers, so no check needed here.
         Ok(())
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn registration_valid() {
-        let reg = KVCacheRegistration::new(0x1000, 1024 * 1024, 100, 1024, 0, 1).unwrap();
-        assert_eq!(reg.block_size_bytes, 1024);
-    }
-
-    #[test]
-    fn registration_null_pointer_rejected() {
-        assert!(KVCacheRegistration::new(0, 1024, 10, 64, 0, 1).is_err());
-    }
-
-    #[test]
-    fn registration_memory_too_small() {
-        let err = KVCacheRegistration::new(0x1000, 5120, 10, 1024, 0, 1).unwrap_err();
-        assert!(err.contains("too small"));
-    }
-
-    #[test]
-    fn padded_block_size() {
-        // Unaligned: 8848 % 512 = 144, padded to 9216
-        let reg = KVCacheRegistration::new(0x1000, 10_000_000, 100, 8848, 0, 1)
-            .unwrap()
-            .with_ssd_padding(512);
-        assert_eq!(reg.padded_bytes_per_block, 9216);
-        assert_eq!(reg.padded_block_size_bytes, 9216);
-
-        // Already aligned: no change
-        let reg = KVCacheRegistration::new(0x1000, 1024 * 1024, 100, 1024, 0, 1)
-            .unwrap()
-            .with_ssd_padding(512);
-        assert_eq!(reg.padded_bytes_per_block, 1024);
-        assert_eq!(reg.padded_block_size_bytes, 1024);
-
-        // Split layout: padded per segment, total = padded * segments
-        let reg = KVCacheRegistration::new(0x1000, 10_000_000, 100, 8848, 900_000, 2)
-            .unwrap()
-            .with_ssd_padding(512);
-        assert_eq!(reg.padded_bytes_per_block, 9216);
-        assert_eq!(reg.padded_block_size_bytes, 9216 * 2);
-    }
-
-    /// Simulates the inference-side registration flow (single GPU).
-    /// Covers: instance creation -> GPU context creation -> batch layer registration.
-    #[test]
-    fn inference_registration_flow() {
-        // 1. Create instance (like get_or_create_instance)
-        let instance = InstanceContext::new(
-            "test-instance-1".to_string(),
-            "model-ns".to_string(),
-            64, // num_layers
-            8,  // tp_size
-            8,  // world_size
-        )
-        .expect("create instance");
-
-        // Use UNKNOWN NUMA node for tests (no actual GPU/NUMA in CI)
-        let numa = NumaNode::UNKNOWN;
-
-        // 2. Build all layer registrations for device 0
-        let mut kv_caches = HashMap::new();
-        for layer_id in 0..4 {
-            let layer_name = format!("layer_{}", layer_id);
-            let reg = KVCacheRegistration::new(
-                0x1000 + layer_id as u64 * 0x10000,
-                1024 * 1024,
-                100,
-                1024,
-                0,
-                1,
-            )
-            .unwrap();
-            kv_caches.insert(layer_name, reg);
-        }
-
-        // 3. Register all layers at once
-        instance
-            .register_new_gpu(0, 0, 0, numa, TransferMode::Direct, kv_caches)
-            .expect("register gpu with layers");
-
-        // 4. Verify topology checking
-        assert!(instance.verify_topology(64, 8, 8).is_ok());
-        // num_layers can grow (PP ranks register incrementally), so smaller is ok
-        assert!(instance.verify_topology(32, 8, 8).is_ok());
-        // tp_size / world_size mismatch is still rejected
-        assert!(instance.verify_topology(64, 4, 8).is_err());
-        assert!(instance.verify_topology(64, 8, 4).is_err());
-
-        // 5. Verify duplicate GPU registration fails
-        let dup_caches = HashMap::from([(
-            "layer_0".to_string(),
-            KVCacheRegistration::new(0x2000, 1024 * 1024, 100, 1024, 0, 1).unwrap(),
-        )]);
-        let err = instance
-            .register_new_gpu(0, 0, 0, numa, TransferMode::Direct, dup_caches)
-            .expect_err("duplicate GPU registration should fail");
-        assert!(err.to_string().contains("already exists"));
-
-        // 6. Verify we can get the registered layer back
-        let gpu = instance.get_gpu(0).expect("get gpu context");
-        let reg = gpu.get_registration("layer_0").expect("get registration");
-        assert_eq!(reg.data_ptr, 0x1000);
-        assert_eq!(reg.num_blocks, 100);
-    }
-
-    /// Tests MLA-style registration where the same layer name is used
-    /// by multiple TP ranks. Verifies layer ID allocation is idempotent.
-    #[test]
-    fn mla_layer_id_allocation() {
-        let instance = InstanceContext::new(
-            "mla-instance".to_string(),
-            "mla-ns".to_string(),
-            10, // num_layers
-            1,  // tp_size (MLA uses tp_size=1)
-            8,  // world_size (8 TP ranks, but treated as 1 for storage)
-        )
-        .expect("create instance");
-
-        // Simulate 8 TP ranks calling get_or_allocate_layer_id for the same layer
-        // This is the MLA pattern where all ranks share the same KV data
-        for _ in 0..8 {
-            // All calls should return the same layer_id=0
-            let layer_id = instance.get_or_allocate_layer_id("layer_0");
-            assert_eq!(layer_id, 0, "all calls should get same layer_id");
-        }
-
-        // Verify only one layer was allocated
-        assert_eq!(instance.get_layer_id("layer_0"), Some(0));
-
-        // Allocate another layer
-        let layer_id = instance.get_or_allocate_layer_id("layer_1");
-        assert_eq!(layer_id, 1);
-
-        // Verify both layers exist with correct IDs
-        assert_eq!(instance.get_layer_id("layer_0"), Some(0));
-        assert_eq!(instance.get_layer_id("layer_1"), Some(1));
-    }
-
-    #[test]
-    fn save_numa_hint_validation_rejects_unknown_or_unregistered_nodes() {
-        let instance =
-            InstanceContext::new("hint-instance".to_string(), "hint-ns".to_string(), 1, 1, 1)
-                .expect("create instance");
-
-        let err = instance
-            .validate_save_numa_hint(0, 0, NumaNode::UNKNOWN)
-            .expect_err("unknown NUMA hint should fail");
-        assert!(err.to_string().contains("valid NUMA node"));
-
-        let err = instance
-            .validate_save_numa_hint(0, 0, NumaNode(0))
-            .expect_err("unregistered NUMA hint should fail");
-        assert!(err.to_string().contains("not registered"));
-    }
-}
+mod tests;

@@ -71,6 +71,7 @@ class EngineRpcClient:
         device_id: int,
         num_layers: int,
         layer_names: list[str],
+        layer_ids: list[int],
         wrapper_bytes_list: list[bytes],
         num_blocks_list: list[int],
         bytes_per_block_list: list[int],
@@ -93,6 +94,7 @@ class EngineRpcClient:
             device_id: CUDA device ID.
             num_layers: Number of model layers.
             layer_names: List of layer names.
+            layer_ids: Canonical numeric layer IDs parallel to layer_names.
             wrapper_bytes_list: List of serialized CUDA IPC tensor wrappers.
             num_blocks_list: List of block counts per layer.
             bytes_per_block_list: List of block sizes per layer.

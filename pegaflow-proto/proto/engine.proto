@@ -24,6 +24,7 @@ message RegisterContextRequest {
   repeated uint32 segments = 13;
   uint32 pp_rank = 14;
   string client_version = 15;
+  repeated uint32 layer_ids = 16;
 }
 
 message RegisterContextResponse {

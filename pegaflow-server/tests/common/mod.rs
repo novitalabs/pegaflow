@@ -528,6 +528,7 @@ fn register_instance_layers(
                 world_size,
                 1,
                 &[LAYER_NAME.to_string()],
+                &[0],
                 &[gpu.ptr()],
                 &[gpu.total_size()],
                 &[BLOCK_COUNT],
