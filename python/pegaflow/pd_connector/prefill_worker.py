@@ -138,13 +138,10 @@ class PrefillHandler:
         return physical_req_ids
 
     def _abort_physical_requests(self, physical_req_ids: tuple[str, ...]) -> None:
-        abort_request = getattr(self._w.rdma, "abort_request", None)
-        if abort_request is None:
-            return
         for physical_req_id in physical_req_ids:
             try:
                 self._drain_physical_request(physical_req_id)
-                abort_request(physical_req_id)
+                self._w.rdma.abort_request(physical_req_id)
             except Exception:
                 logger.exception(
                     "[PdConnector] P failed to notify decode abort ack req=%s",
@@ -152,13 +149,10 @@ class PrefillHandler:
                 )
 
     def _fail_physical_requests(self, physical_req_ids: tuple[str, ...]) -> None:
-        fail_request = getattr(self._w.rdma, "fail_request", None)
-        if fail_request is None:
-            return
         for physical_req_id in physical_req_ids:
             try:
                 self._drain_physical_request(physical_req_id)
-                fail_request(physical_req_id)
+                self._w.rdma.fail_request(physical_req_id)
             except Exception:
                 logger.exception(
                     "[PdConnector] P failed to notify decode abort req=%s",

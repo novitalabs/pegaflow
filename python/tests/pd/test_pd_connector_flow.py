@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from http import HTTPStatus
 import time
+from http import HTTPStatus
 
 # ruff: noqa: F403,F405,I001
 from .pd_connector_test_utils import *
@@ -84,8 +84,11 @@ def test_pd_prom_metrics_observes_connector_stats(monkeypatch) -> None:
         def inc(self, value=1) -> None:
             self.value += value
 
+    from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+        KVConnectorPromMetrics,
+    )
+
     import pegaflow.pd_connector.metrics as pd_metrics_mod
-    from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorPromMetrics
 
     monkeypatch.setattr(
         pd_metrics_mod,
@@ -212,8 +215,8 @@ def test_pd_proxy_unsupported_stream_does_not_record_decode_duration() -> None:
     )
     proxy = proxy_mod.PdProxy(config)
 
-    status, _content_type, _response, _request_id, start_ts_ns, payload = (
-        proxy.open_openai_stream("/unsupported", {"stream": True})
+    status, _content_type, _response, _request_id, start_ts_ns, payload = proxy.open_openai_stream(
+        "/unsupported", {"stream": True}
     )
     if payload is not None and start_ts_ns > 0:
         config.metrics.finish_request((time.time_ns() - start_ts_ns) / 1_000_000_000)
@@ -296,7 +299,7 @@ def test_pd_worker_stats_record_decode_wait_completion() -> None:
         ),
         None,
     )
-    rdma.mark_done("req-1")
+    rdma._finished_recving.add("req-1")
     worker.get_finished(set())
 
     stats = worker.get_stats()
@@ -464,11 +467,7 @@ def test_pd_worker_get_finished_does_not_poll_wait_reqs() -> None:
         prefill_url="http://p:8001",
     )
 
-    def fail_poll_done(req_id: str) -> bool:
-        raise AssertionError(f"poll_done should not run for {req_id}")
-
-    rdma.poll_done = fail_poll_done  # type: ignore[method-assign]
-    rdma.mark_done("req-1")
+    rdma._finished_recving.add("req-1")
 
     assert worker.get_finished(set()) == (None, {"req-1"})
 
@@ -515,7 +514,7 @@ def test_d_worker_release_waits_for_abort_ack_before_finishing() -> None:
         def wait_done(self, req_id: str) -> None:
             self.wait_started.set()
             assert self.wait_can_return.wait(timeout=5), "wait_done was not released"
-            self.mark_done(req_id)
+            self._finished_recving.add(req_id)
 
         def close_request(self, req_id: str) -> None:
             self.closed_reqs.append(req_id)
@@ -611,7 +610,7 @@ def test_d_worker_release_ack_does_not_record_successful_load() -> None:
         ),
         None,
     )
-    rdma.mark_done("req-1")
+    rdma._finished_recving.add("req-1")
     worker.get_finished(set())
     stats = worker.get_stats()
 
@@ -779,12 +778,12 @@ def test_d_worker_reregister_keeps_new_rdma_wait_after_old_wait_exits() -> None:
             if wait_call == 1:
                 self.first_started.set()
                 assert self.first_can_return.wait(timeout=5), "first wait was not released"
-                self.mark_done(req_id)
+                self._finished_recving.add(req_id)
                 return
             if wait_call == 2:
                 self.second_started.set()
                 assert self.second_can_return.wait(timeout=5), "second wait was not released"
-                self.mark_done(req_id)
+                self._finished_recving.add(req_id)
                 return
             raise AssertionError(f"unexpected wait call {wait_call} for {req_id}")
 
@@ -846,7 +845,7 @@ def test_d_worker_starts_multiple_rdma_waits_concurrently() -> None:
         def wait_done(self, req_id: str) -> None:
             self.started[req_id].set()
             assert self.can_return.wait(timeout=5), f"wait for {req_id} was not released"
-            self.mark_done(req_id)
+            self._finished_recving.add(req_id)
 
     tensor = FakeTensor(
         shape=(2, 8, 16, 4, 32),

@@ -154,7 +154,7 @@ Python 侧通过 `RdmaPort` protocol 抽象，`RealRdmaPort` 接 PyO3 `PdRdmaEng
 - `register_remote(req_id, handshake)` → 建立 peer group / remote MR view，预注册 IMM counter
 - `push_layer(req_id, layer_idx, blocks)` → 提交 scatter RDMA WRITE，write window 限流
 - `wait_for_pushes(req_id)` / `push_done(req_id)` → 等 WRITE 落地 + 发 IMM
-- `wait_done(req_id)` / `poll_done(req_id)` → 等/查 IMM 完成
+- `wait_done(req_id)` → 等 IMM 完成
 - `pop_finished_sending()` / `pop_finished_recving()` → 完成集合
 - `close_request(req_id)` → 清理 per-request 状态
 
@@ -302,7 +302,7 @@ get_finished(finished_req_ids):
 要点：
 - `wait_for_pushes` 不能砍：多 NIC scatter 跨 QP 不保序，IMM 必须等所有 WRITE 落地才发；但在后台线程做。
 - `finished_req_ids & _completed_pushes` 交集是正确性要求：早回 `finished_sending` 会让 vLLM 回收 KV 显存，后台 RDMA 会读到脏数据。
-- D 侧 `get_finished` 不对 `_wait_reqs` 跑 `poll_done` for-loop。IMM 完成由后台 waiter 写入 `finished_recving`，主线程直接 `pop_finished_recving()`。
+- D 侧 IMM 完成由后台 waiter 写入 `finished_recving`，主线程直接 `pop_finished_recving()`。
 - 超时失败走对称路径上报，触发 D 本地重算。
 
 ## 4. vLLM 接入（不 fork vllm）

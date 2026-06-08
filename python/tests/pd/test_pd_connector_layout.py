@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-# ruff: noqa: F403,F405,I001
-from .pd_connector_test_utils import *
 from pegaflow.pd_connector.layout_mapping import (
     HeadSlice,
     build_push_layout_plan,
     decode_rank_source_counts,
 )
+
+# ruff: noqa: F403,F405,I001
+from .pd_connector_test_utils import *
 
 
 def test_flash_attn_hnd_layout_offsets() -> None:
@@ -587,7 +588,6 @@ def test_real_rdma_port_preserves_native_contract_for_pd_push() -> None:
     )
     rdma.push_done("req-1")
     rdma.wait_done("req-1")
-    rdma.mark_done("req-1")
 
     _, _, pushed_blocks = native_engine.pushed_layers[0]
     assert pushed_blocks == [
@@ -610,7 +610,6 @@ def test_real_rdma_port_preserves_native_contract_for_pd_push() -> None:
     ]
     assert native_engine.done_reqs == ["req-1"]
     assert native_engine.waited_reqs == ["req-1"]
-    assert native_engine.marked_reqs == ["req-1"]
     assert rdma.pop_finished_sending() == {"sent-1"}
     assert rdma.pop_finished_sending() == set()
     assert rdma.pop_finished_recving() == {"recv-1"}

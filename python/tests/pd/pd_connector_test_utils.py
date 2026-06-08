@@ -15,7 +15,9 @@ install_connector_unit_stubs()
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (  # noqa: E402
     KVConnectorRole,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.metrics import PromMetric  # noqa: E402
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (  # noqa: E402
+    PromMetric,
+)
 
 import pegaflow.pd_connector.decode_worker as decode_worker_mod  # noqa: E402
 import pegaflow.pd_connector.prefill as prefill_mod  # noqa: E402
@@ -128,8 +130,8 @@ class FakeNativeRdmaEngine:
         self.pushed_layers = []
         self.done_reqs = []
         self.waited_reqs = []
-        self.polled_reqs = []
-        self.marked_reqs = []
+        self.waited_push_reqs = []
+        self.closed_reqs = []
         self.finished_sending = ["sent-1"]
         self.finished_recving = ["recv-1"]
 
@@ -181,6 +183,9 @@ class FakeNativeRdmaEngine:
     def push_done(self, req_id):
         self.done_reqs.append(req_id)
 
+    def wait_for_pushes(self, req_id):
+        self.waited_push_reqs.append(req_id)
+
     def fail_request(self, req_id):
         return None
 
@@ -189,13 +194,6 @@ class FakeNativeRdmaEngine:
 
     def wait_done(self, req_id):
         self.waited_reqs.append(req_id)
-
-    def poll_done(self, req_id):
-        self.polled_reqs.append(req_id)
-        return req_id in self.finished_recving
-
-    def mark_done(self, req_id):
-        self.marked_reqs.append(req_id)
 
     def pop_finished_sending(self):
         finished = self.finished_sending
@@ -206,6 +204,9 @@ class FakeNativeRdmaEngine:
         finished = self.finished_recving
         self.finished_recving = []
         return finished
+
+    def close_request(self, req_id):
+        self.closed_reqs.append(req_id)
 
 
 class FakeNativeRdmaEngineCtor(FakeNativeRdmaEngine):

@@ -1,16 +1,15 @@
 use crate::{PegaFlowError, u64_to_usize};
 
 use pegaflow_transfer::v2::{
-    CudaDeviceId, CudaDeviceMemory, Device, DomainAddress, DomainGroupRouting, FabricLibError,
-    GroupTransferRouting, ImmCounter, ImmTransferRequest, MemoryRegionDescriptor,
-    MemoryRegionHandle, MemoryRegionRemoteKey, RdmaEngine, ScatterTarget, ScatterTransferRequest,
-    SmallVec, TransferCallback, TransferEngine, TransferEngineBuilder, TransferRequest,
-    detect_topology,
+    CudaDeviceId, Device, DomainAddress, DomainGroupRouting, FabricLibError, GroupTransferRouting,
+    ImmCounter, ImmTransferRequest, MemoryRegionDescriptor, MemoryRegionHandle,
+    MemoryRegionRemoteKey, RdmaEngine, ScatterTarget, ScatterTransferRequest, SmallVec,
+    TransferCallback, TransferEngine, TransferEngineBuilder, TransferRequest, detect_topology,
 };
 use pyo3::{
     exceptions::{PyRuntimeError, PyValueError},
     prelude::*,
-    types::{PyBytes, PyDict, PyList},
+    types::{PyDict, PyList},
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -214,44 +213,6 @@ impl PendingRdmaWrites {
 }
 
 #[pyclass]
-struct PdRdmaTestBuffer {
-    mem: CudaDeviceMemory,
-}
-
-#[pymethods]
-impl PdRdmaTestBuffer {
-    #[new]
-    #[pyo3(signature = (*, size, cuda_device = 0))]
-    fn new(size: usize, cuda_device: u8) -> PyResult<Self> {
-        let mem = CudaDeviceMemory::device_on(size, cuda_device)
-            .map_err(|err| pd_rdma_error("cuda test buffer allocation failed", err))?;
-        Ok(Self { mem })
-    }
-
-    fn ptr(&self) -> u64 {
-        self.mem.ptr().as_ptr() as u64
-    }
-
-    fn size(&self) -> usize {
-        self.mem.size()
-    }
-
-    fn fill(&self, value: u8) -> PyResult<()> {
-        self.mem
-            .fill(value)
-            .map_err(|err| pd_rdma_error("cuda test buffer fill failed", err))
-    }
-
-    fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let data = self
-            .mem
-            .copy_to_vec()
-            .map_err(|err| pd_rdma_error("cuda test buffer copy_to_vec failed", err))?;
-        Ok(PyBytes::new(py, &data))
-    }
-}
-
-#[pyclass]
 struct PdRdmaEngine {
     engine: Arc<TransferEngine>,
     device: Device,
@@ -265,7 +226,6 @@ struct PdRdmaEngine {
     imm_to_req: Arc<Mutex<HashMap<u32, String>>>,
     finished_sending: Arc<Mutex<HashSet<String>>>,
     finished_recving: Arc<Mutex<HashSet<String>>>,
-    pin_worker_cpu: u16,
 }
 
 impl Drop for PdRdmaEngine {
@@ -383,7 +343,6 @@ impl PdRdmaEngine {
             imm_to_req,
             finished_sending: Arc::new(Mutex::new(HashSet::new())),
             finished_recving,
-            pin_worker_cpu: worker_cpu,
         })
     }
 
@@ -485,11 +444,8 @@ impl PdRdmaEngine {
         &self,
         py: Python<'_>,
         req_id: String,
-        handshake: Option<Py<PyDict>>,
+        handshake: Py<PyDict>,
     ) -> PyResult<()> {
-        let Some(handshake) = handshake else {
-            return Ok(());
-        };
         let handshake = handshake.bind(py);
         let remote_request_id: String = py_get(handshake, "request_id")?;
         let imm = match handshake.get_item("imm_id")? {
@@ -958,35 +914,6 @@ impl PdRdmaEngine {
         Ok(())
     }
 
-    fn poll_done(&self, req_id: String) -> bool {
-        if self.finished_recving.lock().unwrap().contains(&req_id) {
-            return true;
-        }
-        let imm_data = self
-            .remote_requests
-            .lock()
-            .unwrap()
-            .get(&req_id)
-            .map(|request| request.imm_data)
-            .unwrap_or_else(|| pd_imm(&req_id));
-        let counter = self
-            .imm_counters
-            .lock()
-            .unwrap()
-            .entry(req_id.clone())
-            .or_insert_with(|| self.engine.get_imm_counter(imm_data))
-            .clone();
-        if counter.wait_timeout(1, Duration::ZERO) {
-            self.finished_recving.lock().unwrap().insert(req_id);
-            return true;
-        }
-        false
-    }
-
-    fn mark_done(&self, req_id: String) {
-        self.finished_recving.lock().unwrap().insert(req_id);
-    }
-
     fn pop_finished_sending(&self) -> HashSet<String> {
         std::mem::take(&mut *self.finished_sending.lock().unwrap())
     }
@@ -1016,10 +943,6 @@ impl PdRdmaEngine {
         self.finished_recving.lock().unwrap().remove(&req_id);
     }
 
-    fn main_address(&self) -> String {
-        self.engine.main_address().to_string()
-    }
-
     fn num_domains(&self) -> usize {
         self.engine.num_domains()
     }
@@ -1030,10 +953,6 @@ impl PdRdmaEngine {
 
     fn aggregated_link_speed(&self) -> u64 {
         self.engine.aggregated_link_speed()
-    }
-
-    fn pin_worker_cpu(&self) -> u16 {
-        self.pin_worker_cpu
     }
 }
 
@@ -1319,6 +1238,5 @@ fn mr_desc_from_py(dict: &Bound<'_, PyDict>) -> PyResult<MemoryRegionDescriptor>
 
 pub(crate) fn add_classes(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PdRdmaEngine>()?;
-    m.add_class::<PdRdmaTestBuffer>()?;
     Ok(())
 }

@@ -50,10 +50,6 @@ class RdmaPort(Protocol):
 
     def wait_done(self, req_id: str) -> None: ...
 
-    def poll_done(self, req_id: str) -> bool: ...
-
-    def mark_done(self, req_id: str) -> None: ...
-
     def pop_finished_sending(self) -> set[str]: ...
 
     def pop_finished_recving(self) -> set[str]: ...
@@ -108,12 +104,6 @@ class MockRdmaPort:
 
     def wait_done(self, req_id: str) -> None:
         return None
-
-    def poll_done(self, req_id: str) -> bool:
-        return req_id in self._finished_recving
-
-    def mark_done(self, req_id: str) -> None:
-        self._finished_recving.add(req_id)
 
     def pop_finished_sending(self) -> set[str]:
         finished = self._finished_sending
@@ -310,12 +300,9 @@ class RealRdmaPort:
             )
 
     def wait_for_pushes(self, req_id: str) -> None:
-        wait_for_pushes = getattr(self.engine, "wait_for_pushes", None)
-        if wait_for_pushes is None:
-            return None
         start = time.perf_counter()
         try:
-            return wait_for_pushes(req_id)
+            return self.engine.wait_for_pushes(req_id)
         finally:
             logger.info(
                 "[PdConnector] RDMA wait_for_pushes req=%s native_ms=%.3f",
@@ -335,12 +322,9 @@ class RealRdmaPort:
             )
 
     def fail_request(self, req_id: str) -> None:
-        fail_request = getattr(self.engine, "fail_request", None)
-        if fail_request is None:
-            return None
         start = time.perf_counter()
         try:
-            return fail_request(req_id)
+            return self.engine.fail_request(req_id)
         finally:
             logger.info(
                 "[PdConnector] RDMA fail_request req=%s native_ms=%.3f",
@@ -349,12 +333,9 @@ class RealRdmaPort:
             )
 
     def abort_request(self, req_id: str) -> None:
-        abort_request = getattr(self.engine, "abort_request", None)
-        if abort_request is None:
-            return None
         start = time.perf_counter()
         try:
-            return abort_request(req_id)
+            return self.engine.abort_request(req_id)
         finally:
             logger.info(
                 "[PdConnector] RDMA abort_request req=%s native_ms=%.3f",
@@ -366,30 +347,15 @@ class RealRdmaPort:
         return int(self.engine.aggregated_link_speed())
 
     def wait_done(self, req_id: str) -> None:
-        wait_done = getattr(self.engine, "wait_done", None)
-        if wait_done is None:
-            return None
         start = time.perf_counter()
         try:
-            return wait_done(req_id)
+            return self.engine.wait_done(req_id)
         finally:
             logger.info(
                 "[PdConnector] RDMA wait_done req=%s native_ms=%.3f",
                 req_id,
                 (time.perf_counter() - start) * 1000,
             )
-
-    def poll_done(self, req_id: str) -> bool:
-        poll_done = getattr(self.engine, "poll_done", None)
-        if poll_done is None:
-            return False
-        return bool(poll_done(req_id))
-
-    def mark_done(self, req_id: str) -> None:
-        mark_done = getattr(self.engine, "mark_done", None)
-        if mark_done is None:
-            return None
-        return mark_done(req_id)
 
     def pop_finished_sending(self) -> set[str]:
         return set(self.engine.pop_finished_sending())
@@ -398,10 +364,7 @@ class RealRdmaPort:
         return set(self.engine.pop_finished_recving())
 
     def close_request(self, req_id: str) -> None:
-        close_request = getattr(self.engine, "close_request", None)
-        if close_request is None:
-            return None
-        return close_request(req_id)
+        return self.engine.close_request(req_id)
 
 
 def build_rdma_port(

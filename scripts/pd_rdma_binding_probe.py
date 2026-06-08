@@ -47,11 +47,9 @@ def main() -> None:
     print(
         json.dumps(
             {
-                "main_address": engine.main_address(),
                 "num_domains": engine.num_domains(),
                 "num_groups": engine.num_groups(),
                 "aggregated_link_speed": engine.aggregated_link_speed(),
-                "pin_worker_cpu": engine.pin_worker_cpu(),
             },
             sort_keys=True,
         )

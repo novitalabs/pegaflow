@@ -37,20 +37,23 @@ class BlockSlice:
 
 
 @dataclass(frozen=True)
-class LayerBlockSlices:
-    k: BlockSlice
-    v: BlockSlice
+class BlockRegions:
+    regions: tuple[BlockSlice, ...]
+
+
+@dataclass(frozen=True)
+class TransferRegionLayout:
+    region_idx: int
+    base_addr: int
+    block_len: int
 
 
 @dataclass(frozen=True)
 class LayerRemoteLayout:
     layer_name: str
     layer_idx: int
-    base_addr: int
-    block_bytes: int
     block_ids: tuple[int, ...]
-    k_block_addrs: tuple[int, ...]
-    v_block_addrs: tuple[int, ...]
+    regions: tuple[TransferRegionLayout, ...]
     mr_desc: object | None = None
 
 
@@ -71,10 +74,8 @@ class RealRdmaPort:
 
     def register_local_layers(self, layers):
         native_layers = [_layer_to_native(layer) for layer in layers]
-        return tuple(
-            _layer_from_native(layer)
-            for layer in self.engine.register_local_layers(native_layers)
-        )
+        registered_layers = self.engine.register_local_layers(native_layers)
+        return tuple(_layer_from_native(layer) for layer in registered_layers)
 
     def register_remote(self, req_id, handshake):
         self.engine.register_remote(
@@ -96,16 +97,15 @@ class RealRdmaPort:
             layer_idx,
             [
                 {
-                    "k": {
-                        "block_id": block.k.block_id,
-                        "src_offset_bytes": block.k.src_offset_bytes,
-                        "bytes": block.k.bytes,
-                    },
-                    "v": {
-                        "block_id": block.v.block_id,
-                        "src_offset_bytes": block.v.src_offset_bytes,
-                        "bytes": block.v.bytes,
-                    },
+                    "regions": [
+                        {
+                            "region_idx": region_idx,
+                            "block_id": region.block_id,
+                            "src_offset_bytes": region.src_offset_bytes,
+                            "bytes": region.bytes,
+                        }
+                        for region_idx, region in enumerate(block.regions)
+                    ],
                 }
                 for block in blocks
             ],
@@ -119,11 +119,15 @@ def _layer_to_native(layer):
     return {
         "layer_name": layer.layer_name,
         "layer_idx": layer.layer_idx,
-        "base_addr": layer.base_addr,
-        "block_bytes": layer.block_bytes,
         "block_ids": list(layer.block_ids),
-        "k_block_addrs": list(layer.k_block_addrs),
-        "v_block_addrs": list(layer.v_block_addrs),
+        "regions": [
+            {
+                "region_idx": region.region_idx,
+                "base_addr": region.base_addr,
+                "block_len": region.block_len,
+            }
+            for region in layer.regions
+        ],
         "mr_desc": layer.mr_desc,
     }
 
@@ -132,47 +136,62 @@ def _layer_from_native(layer):
     return LayerRemoteLayout(
         layer_name=layer["layer_name"],
         layer_idx=layer["layer_idx"],
-        base_addr=layer["base_addr"],
-        block_bytes=layer["block_bytes"],
         block_ids=tuple(layer["block_ids"]),
-        k_block_addrs=tuple(layer["k_block_addrs"]),
-        v_block_addrs=tuple(layer["v_block_addrs"]),
+        regions=tuple(
+            TransferRegionLayout(
+                region_idx=region["region_idx"],
+                base_addr=region["base_addr"],
+                block_len=region["block_len"],
+            )
+            for region in layer["regions"]
+        ),
         mr_desc=layer["mr_desc"],
     )
 
 
 def build_layer(
-    buf_ptr: int, block_bytes: int, block_ids: tuple[int, ...]
+    buf_ptr: int,
+    block_bytes: int,
+    block_ids: tuple[int, ...],
 ) -> LayerRemoteLayout:
     num_blocks = len(block_ids)
     return LayerRemoteLayout(
         layer_name="layer.0",
         layer_idx=0,
-        base_addr=buf_ptr,
-        block_bytes=block_bytes,
         block_ids=block_ids,
-        k_block_addrs=tuple(buf_ptr + block_id * block_bytes for block_id in block_ids),
-        v_block_addrs=tuple(
-            buf_ptr + (num_blocks + block_id) * block_bytes for block_id in block_ids
+        regions=(
+            TransferRegionLayout(
+                region_idx=0,
+                base_addr=buf_ptr,
+                block_len=block_bytes,
+            ),
+            TransferRegionLayout(
+                region_idx=1,
+                base_addr=buf_ptr + num_blocks * block_bytes,
+                block_len=block_bytes,
+            ),
         ),
     )
 
 
 def build_slices(
-    block_bytes: int, block_ids: tuple[int, ...]
-) -> list[LayerBlockSlices]:
+    block_bytes: int,
+    block_ids: tuple[int, ...],
+) -> list[BlockRegions]:
     num_blocks = len(block_ids)
     return [
-        LayerBlockSlices(
-            k=BlockSlice(
-                block_id=block_id,
-                src_offset_bytes=block_id * block_bytes,
-                bytes=block_bytes,
-            ),
-            v=BlockSlice(
-                block_id=block_id,
-                src_offset_bytes=(num_blocks + block_id) * block_bytes,
-                bytes=block_bytes,
+        BlockRegions(
+            regions=(
+                BlockSlice(
+                    block_id=block_id,
+                    src_offset_bytes=block_id * block_bytes,
+                    bytes=block_bytes,
+                ),
+                BlockSlice(
+                    block_id=block_id,
+                    src_offset_bytes=(num_blocks + block_id) * block_bytes,
+                    bytes=block_bytes,
+                ),
             ),
         )
         for block_id in block_ids
@@ -194,6 +213,8 @@ def main() -> None:
     parser.add_argument("--dst-byte", type=lambda x: int(x, 0), default=0x00)
     args = parser.parse_args()
 
+    import torch
+
     assert args.blocks > 0
     assert args.block_bytes > 0
     native = load_native()
@@ -213,20 +234,21 @@ def main() -> None:
         pin_worker_cpu=args.prefill_worker_cpu,
     )
     stage("allocate and initialize test buffers")
-    src = native.PdRdmaTestBuffer(size=total_bytes, cuda_device=args.cuda_device)
-    dst = native.PdRdmaTestBuffer(size=total_bytes, cuda_device=args.cuda_device)
-    src.fill(args.src_byte)
-    dst.fill(args.dst_byte)
+    device = torch.device(f"cuda:{args.cuda_device}")
+    src = torch.empty((total_bytes,), dtype=torch.uint8, device=device)
+    dst = torch.empty((total_bytes,), dtype=torch.uint8, device=device)
+    src.fill_(args.src_byte)
+    dst.fill_(args.dst_byte)
+    torch.cuda.synchronize(device)
 
     stage("register local memory")
     decode_port = RealRdmaPort(decode)
     prefill_port = RealRdmaPort(prefill)
     decode_layers = decode_port.register_local_layers(
-        (build_layer(dst.ptr(), args.block_bytes, block_ids),)
+        (build_layer(dst.data_ptr(), args.block_bytes, block_ids),)
     )
-    prefill_port.register_local_layers(
-        (build_layer(src.ptr(), args.block_bytes, block_ids),)
-    )
+    prefill_layer = build_layer(src.data_ptr(), args.block_bytes, block_ids)
+    prefill_port.register_local_layers((prefill_layer,))
     handshake = PdHandshake(
         request_id="decode-req",
         engine_id="decode",
@@ -262,9 +284,9 @@ def main() -> None:
     elapsed_s = time.perf_counter() - started
 
     stage("copy destination buffer to host and verify")
-    data = dst.to_bytes()
-    expected = bytes([args.src_byte]) * total_bytes
-    assert data == expected, "RDMA copied bytes do not match source fill pattern"
+    torch.cuda.synchronize(device)
+    copied = torch.all(dst == args.src_byte).item()
+    assert copied, "RDMA copied bytes do not match source fill pattern"
     bandwidth_gbps = total_bytes * 8 / elapsed_s / 1e9
     print(
         json.dumps(
@@ -277,8 +299,6 @@ def main() -> None:
                 "domains": prefill.num_domains(),
                 "groups": prefill.num_groups(),
                 "aggregated_link_speed": prefill.aggregated_link_speed(),
-                "decode_pin_worker_cpu": decode.pin_worker_cpu(),
-                "prefill_pin_worker_cpu": prefill.pin_worker_cpu(),
             },
             sort_keys=True,
         )
