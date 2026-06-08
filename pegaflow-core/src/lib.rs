@@ -47,16 +47,13 @@ pub use sync_state::{LoadState, LoadStateError};
 pub use trace::{set_trace_sample_rate, should_sample};
 pub use transfer::TransferMode;
 
-use std::{
-    collections::HashMap,
-    fmt,
-    sync::{Arc, RwLock},
-};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 use log::{debug, info};
 
 use crate::backing::SSD_ALIGNMENT;
 use crate::gpu_worker::{LayerLoadData, LoadBlock, LoadTask};
+use crate::instance::InstanceRegistry;
 use crate::lease::QueryLeaseManager;
 use crate::metrics::core_metrics;
 use crate::storage::StorageEngine;
@@ -74,8 +71,6 @@ pub enum EngineError {
     CudaInit(String),
     /// Storage engine error.
     Storage(String),
-    /// Internal lock poisoned.
-    Poisoned(&'static str),
     /// Topology mismatch between registration and existing instance.
     TopologyMismatch(String),
 }
@@ -90,7 +85,6 @@ impl fmt::Display for EngineError {
             EngineError::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
             EngineError::CudaInit(msg) => write!(f, "failed to initialize CUDA: {msg}"),
             EngineError::Storage(msg) => write!(f, "storage error: {msg}"),
-            EngineError::Poisoned(what) => write!(f, "internal lock poisoned: {what}"),
             EngineError::TopologyMismatch(msg) => write!(f, "topology mismatch: {msg}"),
         }
     }
@@ -115,7 +109,7 @@ impl From<LoadStateError> for EngineError {
 /// The engine is thread-safe and can be shared across async tasks.
 pub struct PegaEngine {
     /// Active inference instances indexed by instance ID.
-    instances: Arc<RwLock<HashMap<String, Arc<InstanceContext>>>>,
+    instances: InstanceRegistry,
     /// Storage engine for pinned memory, block cache, and SSD tier.
     storage: Arc<StorageEngine>,
     /// GPU-NUMA topology for memory allocation decisions.
@@ -165,7 +159,7 @@ impl PegaEngine {
             .map_err(EngineError::Storage)?;
 
         Ok(PegaEngine {
-            instances: Arc::new(RwLock::new(HashMap::new())),
+            instances: InstanceRegistry::new(),
             storage,
             topology,
             query_leases: QueryLeaseManager::default(),
@@ -185,43 +179,13 @@ impl PegaEngine {
         tp_size: usize,
         world_size: usize,
     ) -> Result<Arc<InstanceContext>, EngineError> {
-        let mut instances = self
-            .instances
-            .write()
-            .expect("instances write lock poisoned");
-
-        if let Some(instance) = instances.get(instance_id) {
-            // Already exists, verify topology
-            instance
-                .verify_topology(num_layers, tp_size, world_size)
-                .map_err(|e| {
-                    EngineError::TopologyMismatch(format!("instance {instance_id} {e}"))
-                })?;
-            return Ok(Arc::clone(instance));
-        }
-
-        // Create new instance
-        let instance = InstanceContext::new(
-            instance_id.to_string(),
-            namespace.to_string(),
-            num_layers,
-            tp_size,
-            world_size,
-        )
-        .map_err(EngineError::InvalidArgument)?;
-
-        let instance = Arc::new(instance);
-        instances.insert(instance_id.to_string(), Arc::clone(&instance));
-        Ok(instance)
+        self.instances
+            .get_or_create(instance_id, namespace, num_layers, tp_size, world_size)
     }
 
     /// Look up an instance by ID.
     fn get_instance(&self, instance_id: &str) -> Result<Arc<InstanceContext>, EngineError> {
-        let instances = self.instances.read().expect("instances read lock poisoned");
-        instances
-            .get(instance_id)
-            .cloned()
-            .ok_or_else(|| EngineError::InstanceMissing(instance_id.to_string()))
+        self.instances.get(instance_id)
     }
 
     /// Batch register multiple KV cache layers for a single GPU.
@@ -322,30 +286,23 @@ impl PegaEngine {
     }
 
     /// Unregister an instance and release all associated resources.
+    ///
+    /// Blocks while joining the instance's GPU worker threads, so callers on a
+    /// Tokio runtime must invoke this from `spawn_blocking`, never directly on a
+    /// runtime worker.
     pub fn unregister_instance(&self, instance_id: &str) -> Result<(), EngineError> {
-        let removed = self
-            .instances
-            .write()
-            .expect("instances write lock poisoned")
-            .remove(instance_id);
-
-        if removed.is_none() {
-            return Err(EngineError::InstanceMissing(instance_id.to_string()));
-        }
+        self.instances.unregister(instance_id)?;
         self.query_leases.release_instance(instance_id);
         info!("Unregistered instance: {}", instance_id);
         Ok(())
     }
 
     /// Unregister all instances, returning the IDs that were removed.
+    ///
+    /// Blocks while joining every instance's GPU worker threads; call from
+    /// `spawn_blocking` on a Tokio runtime, never directly on a runtime worker.
     pub fn unregister_all_instances(&self) -> Vec<String> {
-        let mut instances = self
-            .instances
-            .write()
-            .expect("instances write lock poisoned");
-        let ids: Vec<String> = instances.keys().cloned().collect();
-        instances.clear();
-        drop(instances);
+        let ids = self.instances.unregister_all();
         for id in &ids {
             self.query_leases.release_instance(id);
         }
@@ -357,12 +314,7 @@ impl PegaEngine {
 
     /// List all registered instance IDs.
     pub fn list_instance_ids(&self) -> Vec<String> {
-        self.instances
-            .read()
-            .expect("instances read lock poisoned")
-            .keys()
-            .cloned()
-            .collect()
+        self.instances.list_ids()
     }
 
     /// Return the effective TP size registered for this instance.

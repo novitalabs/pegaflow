@@ -556,7 +556,7 @@ impl PegaEngine {
 
         trace_future!(
             "save.gpu_copy",
-            gpu.worker_pool().batch_save(gpu_save_layers)
+            gpu.worker_pool().save_layers(gpu_save_layers)
         )
         .await?;
 

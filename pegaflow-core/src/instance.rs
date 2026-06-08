@@ -3,7 +3,7 @@
 //! This module provides the hierarchical context structure for managing
 //! multi-tenant inference instances and their associated GPU resources.
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::{
     collections::HashMap,
     sync::{
@@ -13,10 +13,101 @@ use std::{
 };
 
 use cudarc::driver::CudaContext;
-use log::info;
+use log::{error, info};
 
 use crate::{EngineError, TransferMode, gpu_worker::GpuWorkerPool};
 use pegaflow_common::NumaNode;
+
+/// Registry of active inference instances.
+pub(crate) struct InstanceRegistry {
+    instances: RwLock<HashMap<String, Arc<InstanceContext>>>,
+}
+
+impl InstanceRegistry {
+    pub(crate) fn new() -> Self {
+        Self {
+            instances: RwLock::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn get_or_create(
+        &self,
+        instance_id: &str,
+        namespace: &str,
+        num_layers: usize,
+        tp_size: usize,
+        world_size: usize,
+    ) -> Result<Arc<InstanceContext>, EngineError> {
+        let mut instances = self.instances.write();
+
+        if let Some(instance) = instances.get(instance_id) {
+            instance
+                .verify_topology(num_layers, tp_size, world_size)
+                .map_err(|e| {
+                    EngineError::TopologyMismatch(format!("instance {instance_id} {e}"))
+                })?;
+            return Ok(Arc::clone(instance));
+        }
+
+        let instance = InstanceContext::new(
+            instance_id.to_string(),
+            namespace.to_string(),
+            num_layers,
+            tp_size,
+            world_size,
+        )
+        .map_err(EngineError::InvalidArgument)?;
+        let instance = Arc::new(instance);
+        instances.insert(instance_id.to_string(), Arc::clone(&instance));
+        Ok(instance)
+    }
+
+    pub(crate) fn get(&self, instance_id: &str) -> Result<Arc<InstanceContext>, EngineError> {
+        self.instances
+            .read()
+            .get(instance_id)
+            .cloned()
+            .ok_or_else(|| EngineError::InstanceMissing(instance_id.to_string()))
+    }
+
+    /// Remove an instance and shut down its GPU workers.
+    ///
+    /// Shutdown drains and joins the worker threads, so any in-flight save/load
+    /// finishes touching GPU memory before this returns. The instance is taken
+    /// out of the map first, so a concurrently-submitted save either lands
+    /// before the channel closes (and is drained) or fails cleanly with a
+    /// "channel closed" error — never a use-after-unmap.
+    pub(crate) fn unregister(&self, instance_id: &str) -> Result<(), EngineError> {
+        let instance = self
+            .instances
+            .write()
+            .remove(instance_id)
+            .ok_or_else(|| EngineError::InstanceMissing(instance_id.to_string()))?;
+        instance.shutdown()
+    }
+
+    /// Remove every instance and shut down its GPU workers, best-effort.
+    ///
+    /// A failed shutdown on one instance is logged and does not stop the others
+    /// from being torn down. Returns the IDs that were removed.
+    pub(crate) fn unregister_all(&self) -> Vec<String> {
+        let removed: Vec<(String, Arc<InstanceContext>)> = self.instances.write().drain().collect();
+
+        removed
+            .into_iter()
+            .map(|(instance_id, instance)| {
+                if let Err(err) = instance.shutdown() {
+                    error!("Failed to shut down instance {instance_id}: {err}");
+                }
+                instance_id
+            })
+            .collect()
+    }
+
+    pub(crate) fn list_ids(&self) -> Vec<String> {
+        self.instances.read().keys().cloned().collect()
+    }
+}
 
 /// Layer metadata protected by a single mutex.
 ///
@@ -227,6 +318,10 @@ impl GpuContext {
     /// Access the worker pool for submitting GPU operations.
     pub(crate) fn worker_pool(&self) -> &GpuWorkerPool {
         &self.worker_pool
+    }
+
+    fn shutdown(&self) -> Result<(), EngineError> {
+        self.worker_pool.shutdown()
     }
 }
 
@@ -539,6 +634,39 @@ impl InstanceContext {
         Err(EngineError::InvalidArgument(format!(
             "save NUMA hint {numa_node} is not registered for tp_rank {tp_rank}, pp_rank {pp_rank}; candidates={candidates:?}"
         )))
+    }
+
+    /// Shut down every GPU worker for this instance, draining in-flight
+    /// transfers via the worker-thread join.
+    ///
+    /// Callable through a shared reference, so an instance can be torn down
+    /// while other tasks still hold an `Arc` to it. GPU contexts are cloned out
+    /// from under the metadata lock so the join does not block concurrent
+    /// `get_gpu`. Every GPU is attempted even if one fails, so no thread leaks;
+    /// the first error is returned.
+    pub(crate) fn shutdown(&self) -> Result<(), EngineError> {
+        let gpus: Vec<(i32, Arc<GpuContext>)> = {
+            let metadata = self.metadata.lock();
+            metadata
+                .gpu_contexts
+                .iter()
+                .map(|(device_id, gpu)| (*device_id, Arc::clone(gpu)))
+                .collect()
+        };
+
+        let mut first_err = None;
+        for (device_id, gpu) in gpus {
+            if let Err(err) = gpu.shutdown() {
+                let err = EngineError::Storage(format!(
+                    "failed to shut down GPU worker for instance {} device {device_id}: {err}",
+                    self.id
+                ));
+                error!("{err}");
+                first_err.get_or_insert(err);
+            }
+        }
+
+        first_err.map_or(Ok(()), Err)
     }
 
     /// Verify that the topology matches expected values.

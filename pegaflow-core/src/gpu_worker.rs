@@ -1,9 +1,14 @@
-use std::sync::{Arc, mpsc as std_mpsc};
+use std::{
+    sync::{Arc, mpsc as std_mpsc},
+    thread::JoinHandle,
+};
 
+use crossbeam_channel::{Receiver, Sender};
 use cudarc::driver::{CudaContext, CudaStream};
 use log::{debug, error, info, warn};
 use logforth::diagnostic::ThreadLocalDiagnostic;
-use tokio::sync::{mpsc, oneshot};
+use parking_lot::Mutex;
+use tokio::sync::oneshot;
 
 use crate::block::RawBlock;
 use crate::metrics::core_metrics;
@@ -67,8 +72,8 @@ unsafe impl Send for SaveLayerData {}
 /// Per-GPU worker pool with dedicated load and save threads
 pub(crate) struct GpuWorkerPool {
     device_id: i32,
-    load_tx: mpsc::UnboundedSender<LoadTask>,
-    save_tx: mpsc::UnboundedSender<SaveTask>,
+    load: Worker<LoadTask>,
+    save: Worker<SaveTask>,
 }
 
 impl GpuWorkerPool {
@@ -85,61 +90,20 @@ impl GpuWorkerPool {
         numa_node: NumaNode,
         transfer_mode: TransferMode,
     ) -> Result<Self, EngineError> {
-        let (load_tx, load_rx) = mpsc::unbounded_channel();
-        let (save_tx, save_rx) = mpsc::unbounded_channel();
-        let (load_ready_tx, load_ready_rx) = std_mpsc::channel();
-        let (save_ready_tx, save_ready_rx) = std_mpsc::channel();
-
-        // Spawn load worker thread
-        let load_device_id = device_id;
-        let load_numa = numa_node;
-        std::thread::Builder::new()
-            .name(format!("gpu{}-load", device_id))
-            .spawn(move || {
-                // Pin thread to NUMA node before any allocations
-                if load_numa.is_valid()
-                    && let Err(e) = pin_thread_to_numa_node(load_numa)
-                {
-                    warn!("Failed to pin load worker to {}: {}", load_numa, e);
-                }
-                match init_worker(load_device_id, transfer_mode) {
-                    Ok(runtime) => {
-                        let _ = load_ready_tx.send(Ok(()));
-                        load_worker_loop(load_device_id, load_rx, runtime);
-                    }
-                    Err(e) => {
-                        let _ = load_ready_tx.send(Err(e));
-                    }
-                }
-            })
-            .map_err(|e| EngineError::CudaInit(format!("Failed to spawn load worker: {e}")))?;
-
-        // Spawn save worker thread
-        let save_device_id = device_id;
-        let save_numa = numa_node;
-        std::thread::Builder::new()
-            .name(format!("gpu{}-save", device_id))
-            .spawn(move || {
-                // Pin thread to NUMA node before any allocations
-                if save_numa.is_valid()
-                    && let Err(e) = pin_thread_to_numa_node(save_numa)
-                {
-                    warn!("Failed to pin save worker to {}: {}", save_numa, e);
-                }
-                match init_worker(save_device_id, transfer_mode) {
-                    Ok(runtime) => {
-                        let _ = save_ready_tx.send(Ok(()));
-                        save_worker_loop(save_device_id, save_rx, runtime);
-                    }
-                    Err(e) => {
-                        let _ = save_ready_tx.send(Err(e));
-                    }
-                }
-            })
-            .map_err(|e| EngineError::CudaInit(format!("Failed to spawn save worker: {e}")))?;
-
-        wait_worker_ready("load", device_id, load_ready_rx)?;
-        wait_worker_ready("save", device_id, save_ready_rx)?;
+        let load = spawn_worker(
+            "load",
+            device_id,
+            numa_node,
+            transfer_mode,
+            load_worker_loop,
+        )?;
+        let save = spawn_worker(
+            "save",
+            device_id,
+            numa_node,
+            transfer_mode,
+            save_worker_loop,
+        )?;
 
         info!(
             "GPU worker pool started: device={}, numa_node={}, transfer_mode={:?}",
@@ -147,25 +111,20 @@ impl GpuWorkerPool {
         );
         Ok(Self {
             device_id,
-            load_tx,
-            save_tx,
+            load,
+            save,
         })
     }
 
     /// Submit a load task (CPU -> GPU) - fire and forget
     pub(crate) fn submit_load(&self, task: LoadTask) -> Result<(), EngineError> {
-        self.load_tx.send(task).map_err(|_| {
-            EngineError::Storage(format!(
-                "Load worker channel closed for device {}",
-                self.device_id
-            ))
-        })
+        self.load.submit(task)
     }
 
-    /// Submit a multi-layer save task (GPU -> CPU) - async, wait for completion.
+    /// Submit a multi-layer save task (GPU -> CPU) and wait for completion.
     /// All layers are copied on the same CUDA stream with a single synchronization,
     /// which is significantly faster than submitting individual per-layer tasks.
-    pub(crate) async fn batch_save(&self, layers: Vec<SaveLayerData>) -> Result<(), EngineError> {
+    pub(crate) async fn save_layers(&self, layers: Vec<SaveLayerData>) -> Result<(), EngineError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let task = SaveTask {
             layers,
@@ -174,12 +133,7 @@ impl GpuWorkerPool {
             trace_ctx: ::fastrace::prelude::SpanContext::current_local_parent(),
         };
 
-        self.save_tx.send(task).map_err(|_| {
-            EngineError::Storage(format!(
-                "Save worker channel closed for device {}",
-                self.device_id
-            ))
-        })?;
+        self.save.submit(task)?;
 
         // Await the result (this is async, won't block tokio runtime)
         reply_rx.await.map_err(|_| {
@@ -189,11 +143,156 @@ impl GpuWorkerPool {
             ))
         })?
     }
+
+    /// Stop accepting new tasks, drain queued work, and join worker threads.
+    ///
+    /// Callable through a shared reference and idempotent: only the first call
+    /// observes the running threads. Joining guarantees no worker is still
+    /// touching GPU memory when this returns, so callers may release CUDA
+    /// tensors afterwards without risking a use-after-unmap.
+    pub(crate) fn shutdown(&self) -> Result<(), EngineError> {
+        // Attempt both regardless of the first result so neither thread leaks.
+        let load = self.load.shutdown();
+        let save = self.save.shutdown();
+        let load = load?;
+        let save = save?;
+        if load || save {
+            debug!("GPU worker pool shut down: device={}", self.device_id);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for GpuWorkerPool {
+    fn drop(&mut self) {
+        if let Err(err) = self.shutdown() {
+            error!("{err}");
+        }
+    }
 }
 
 struct WorkerRuntime {
     stream: Arc<CudaStream>,
     backend: Box<dyn TransferBackend>,
+}
+
+/// A worker thread plus the channel feeding it.
+///
+/// `tx` and `handle` live behind locks so that [`Worker::shutdown`] can close
+/// the channel and join the thread through a shared reference, without needing
+/// to own the `Worker`. This is what lets an instance be torn down while other
+/// tasks still hold an `Arc` to its `GpuContext`.
+struct Worker<T> {
+    name: &'static str,
+    device_id: i32,
+    tx: Mutex<Option<Sender<T>>>,
+    handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl<T> Worker<T> {
+    fn new(name: &'static str, device_id: i32, tx: Sender<T>, handle: JoinHandle<()>) -> Self {
+        Self {
+            name,
+            device_id,
+            tx: Mutex::new(Some(tx)),
+            handle: Mutex::new(Some(handle)),
+        }
+    }
+
+    fn submit(&self, task: T) -> Result<(), EngineError> {
+        let guard = self.tx.lock();
+        let tx = guard.as_ref().ok_or_else(|| {
+            EngineError::Storage(format!(
+                "{} worker is shut down for device {}",
+                self.name, self.device_id
+            ))
+        })?;
+
+        tx.send(task).map_err(|_| {
+            EngineError::Storage(format!(
+                "{} worker channel closed for device {}",
+                self.name, self.device_id
+            ))
+        })
+    }
+
+    /// Close the channel and join the worker thread.
+    ///
+    /// Returns `Ok(true)` if this call joined a live thread, `Ok(false)` if the
+    /// worker was already shut down. Dropping the sole `Sender` makes the loop
+    /// exit only after its queue drains, so in-flight tasks finish first.
+    fn shutdown(&self) -> Result<bool, EngineError> {
+        drop(self.tx.lock().take());
+
+        let Some(handle) = self.handle.lock().take() else {
+            return Ok(false);
+        };
+        handle.join().map_err(|_| {
+            EngineError::Storage(format!(
+                "{} worker panicked on device {}",
+                self.name, self.device_id
+            ))
+        })?;
+        Ok(true)
+    }
+}
+
+impl<T> Drop for Worker<T> {
+    fn drop(&mut self) {
+        // Safety net for a `Worker` dropped without an explicit shutdown, e.g.
+        // when pool construction fails after this worker was already spawned.
+        if let Err(err) = self.shutdown() {
+            error!("{err}");
+        }
+    }
+}
+
+fn spawn_worker<T, F>(
+    name: &'static str,
+    device_id: i32,
+    numa_node: NumaNode,
+    transfer_mode: TransferMode,
+    run_loop: F,
+) -> Result<Worker<T>, EngineError>
+where
+    T: Send + 'static,
+    F: FnOnce(i32, Receiver<T>, WorkerRuntime) + Send + 'static,
+{
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let (ready_tx, ready_rx) = std_mpsc::channel();
+
+    let handle = std::thread::Builder::new()
+        .name(format!("gpu{}-{name}", device_id))
+        .spawn(move || {
+            if numa_node.is_valid()
+                && let Err(e) = pin_thread_to_numa_node(numa_node)
+            {
+                warn!("Failed to pin {name} worker to {numa_node}: {e}");
+            }
+
+            match init_worker(device_id, transfer_mode) {
+                Ok(runtime) => {
+                    let _ = ready_tx.send(Ok(()));
+                    run_loop(device_id, rx, runtime);
+                }
+                Err(e) => {
+                    let _ = ready_tx.send(Err(e));
+                }
+            }
+        })
+        .map_err(|e| EngineError::CudaInit(format!("Failed to spawn {name} worker: {e}")))?;
+
+    if let Err(err) = wait_worker_ready(name, device_id, ready_rx) {
+        drop(tx);
+        if handle.join().is_err() {
+            return Err(EngineError::CudaInit(format!(
+                "{name} worker panicked during CUDA initialization on device {device_id}"
+            )));
+        }
+        return Err(err);
+    }
+
+    Ok(Worker::new(name, device_id, tx, handle))
 }
 
 fn wait_worker_ready(
@@ -247,12 +346,8 @@ fn init_worker(device_id: i32, transfer_mode: TransferMode) -> Result<WorkerRunt
 }
 
 /// Load worker thread main loop
-fn load_worker_loop(
-    device_id: i32,
-    mut rx: mpsc::UnboundedReceiver<LoadTask>,
-    runtime: WorkerRuntime,
-) {
-    while let Some(task) = rx.blocking_recv() {
+fn load_worker_loop(device_id: i32, rx: Receiver<LoadTask>, runtime: WorkerRuntime) {
+    while let Ok(task) = rx.recv() {
         let result = process_load_task(&task, &runtime.stream, runtime.backend.as_ref());
 
         // Attach to LoadState and signal completion
@@ -279,12 +374,8 @@ fn load_worker_loop(
 }
 
 /// Save worker thread main loop
-fn save_worker_loop(
-    device_id: i32,
-    mut rx: mpsc::UnboundedReceiver<SaveTask>,
-    runtime: WorkerRuntime,
-) {
-    while let Some(task) = rx.blocking_recv() {
+fn save_worker_loop(device_id: i32, rx: Receiver<SaveTask>, runtime: WorkerRuntime) {
+    while let Ok(task) = rx.recv() {
         let result = process_save_task(&task, &runtime.stream, runtime.backend.as_ref());
         let _ = task.reply.send(result);
     }
