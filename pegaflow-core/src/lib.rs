@@ -257,6 +257,54 @@ impl PegaEngine {
         kv_stride_bytes_list: &[usize],
         segments_list: &[usize],
     ) -> Result<(), EngineError> {
+        // Dense default: block stride == bytes_per_block (layer-first layout).
+        self.register_context_layer_batch_strided(
+            instance_id,
+            namespace,
+            device_id,
+            tp_rank,
+            pp_rank,
+            tp_size,
+            world_size,
+            num_layers,
+            layer_names,
+            data_ptrs,
+            size_bytes_list,
+            num_blocks_list,
+            bytes_per_block_list,
+            kv_stride_bytes_list,
+            segments_list,
+            None,
+        )
+    }
+
+    /// Like [`Self::register_context_layer_batch`] but with an explicit per-layer
+    /// block stride (see [`KVCacheRegistration::with_block_stride`]). When
+    /// `block_stride_bytes_list` is `Some` it must match `layer_names` in length;
+    /// each entry overrides that layer's stride.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "public API mirrors one batched registration RPC payload"
+    )]
+    pub fn register_context_layer_batch_strided(
+        &self,
+        instance_id: &str,
+        namespace: &str,
+        device_id: i32,
+        tp_rank: usize,
+        pp_rank: usize,
+        tp_size: usize,
+        world_size: usize,
+        num_layers: usize,
+        layer_names: &[String],
+        data_ptrs: &[u64],
+        size_bytes_list: &[usize],
+        num_blocks_list: &[usize],
+        bytes_per_block_list: &[usize],
+        kv_stride_bytes_list: &[usize],
+        segments_list: &[usize],
+        block_stride_bytes_list: Option<&[usize]>,
+    ) -> Result<(), EngineError> {
         // Build all registrations
         let ssd_enabled = self.storage.is_ssd_enabled();
         let batch_size = layer_names.len();
@@ -273,6 +321,12 @@ impl PegaEngine {
                 segments_list[i],
             )
             .map_err(|e| EngineError::InvalidArgument(format!("layer {layer_name}: {e}")))?;
+
+            if let Some(strides) = block_stride_bytes_list {
+                registration = registration.with_block_stride(strides[i]).map_err(|e| {
+                    EngineError::InvalidArgument(format!("layer {layer_name}: {e}"))
+                })?;
+            }
 
             if ssd_enabled {
                 registration = registration.with_ssd_padding(SSD_ALIGNMENT);
