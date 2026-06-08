@@ -1,7 +1,4 @@
-use std::{
-    sync::{Arc, mpsc as std_mpsc},
-    thread::JoinHandle,
-};
+use std::{sync::Arc, thread::JoinHandle};
 
 use crossbeam_channel::{Receiver, Sender};
 use cudarc::driver::{CudaContext, CudaStream};
@@ -259,7 +256,8 @@ where
     F: FnOnce(i32, Receiver<T>, WorkerRuntime) + Send + 'static,
 {
     let (tx, rx) = crossbeam_channel::unbounded();
-    let (ready_tx, ready_rx) = std_mpsc::channel();
+    // One-shot handshake: the worker reports CUDA-init success/failure exactly once.
+    let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
 
     let handle = std::thread::Builder::new()
         .name(format!("gpu{}-{name}", device_id))
@@ -298,7 +296,7 @@ where
 fn wait_worker_ready(
     worker_name: &str,
     device_id: i32,
-    rx: std_mpsc::Receiver<Result<(), EngineError>>,
+    rx: Receiver<Result<(), EngineError>>,
 ) -> Result<(), EngineError> {
     rx.recv().map_err(|_| {
         EngineError::CudaInit(format!(
