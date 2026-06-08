@@ -6,7 +6,6 @@ pub mod rdma_topo;
 mod cuda_lib;
 mod cuda_sys;
 mod cudart_sys;
-mod libibverbs_sys;
 pub mod v2;
 
 pub use engine::{

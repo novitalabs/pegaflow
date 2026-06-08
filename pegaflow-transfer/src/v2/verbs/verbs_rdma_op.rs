@@ -6,14 +6,12 @@ use std::{
     sync::Arc,
 };
 
-use crate::libibverbs_sys::{
-    IBV_SEND_SIGNALED, IBV_WR_RDMA_WRITE, IBV_WR_RDMA_WRITE_WITH_IMM, IBV_WR_SEND, ibv_qp,
-    ibv_recv_wr, ibv_send_wr, ibv_sge,
-};
+use rdma_mummy_sys::{ibv_qp, ibv_recv_wr, ibv_send_flags, ibv_send_wr, ibv_sge, ibv_wr_opcode};
 
 use crate::v2::{
     api::ScatterTarget,
     rdma_op::{ImmWriteOp, PagedWriteOp, RecvOp, ScatterGroupWriteOp, SendOp, SingleWriteOp},
+    verbs::zeroed,
 };
 
 /// The maximum number of WRs in a WR chain.
@@ -49,10 +47,10 @@ impl SingleWriteOpIter {
             sg_list: sge,
             num_sge: 1,
             opcode,
-            send_flags: IBV_SEND_SIGNALED,
-            ..Default::default()
+            send_flags: ibv_send_flags::IBV_SEND_SIGNALED.0,
+            ..unsafe { zeroed() }
         });
-        wr.__bindgen_anon_1.imm_data = imm.to_be();
+        wr.imm_data_invalidated_rkey_union.imm_data = imm.to_be();
         wr.wr.rdma.remote_addr = op.dst_ptr + op.dst_offset;
         wr.wr.rdma.rkey = op.dst_rkey.0 as u32;
         Self {
@@ -75,11 +73,11 @@ impl SingleWriteOpIter {
             next: null_mut(),
             sg_list: null_mut(),
             num_sge: 0,
-            opcode: IBV_WR_RDMA_WRITE_WITH_IMM,
-            send_flags: IBV_SEND_SIGNALED,
-            ..Default::default()
+            opcode: ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM,
+            send_flags: ibv_send_flags::IBV_SEND_SIGNALED.0,
+            ..unsafe { zeroed() }
         });
-        wr.__bindgen_anon_1.imm_data = op.imm_data.to_be();
+        wr.imm_data_invalidated_rkey_union.imm_data = op.imm_data.to_be();
         wr.wr.rdma.remote_addr = op.dst_ptr;
         wr.wr.rdma.rkey = op.dst_rkey.0 as u32;
         Self {
@@ -150,10 +148,10 @@ impl PagedWriteOpIter {
                 sg_list: sge,
                 num_sge: 1,
                 opcode,
-                send_flags: IBV_SEND_SIGNALED,
-                ..Default::default()
+                send_flags: ibv_send_flags::IBV_SEND_SIGNALED.0,
+                ..unsafe { zeroed() }
             });
-            wr.__bindgen_anon_1.imm_data = imm.to_be();
+            wr.imm_data_invalidated_rkey_union.imm_data = imm.to_be();
             wr.wr.rdma.rkey = op.dst_rkey.0 as u32;
         }
         let mut slf = Self {
@@ -274,10 +272,10 @@ impl ScatterWriteOpIter {
             sg_list: sge,
             num_sge: 1,
             opcode,
-            send_flags: IBV_SEND_SIGNALED,
-            ..Default::default()
+            send_flags: ibv_send_flags::IBV_SEND_SIGNALED.0,
+            ..unsafe { zeroed() }
         });
-        wr.__bindgen_anon_1.imm_data = imm.to_be();
+        wr.imm_data_invalidated_rkey_union.imm_data = imm.to_be();
         let mut slf = Self {
             qp_list,
             wr_chain_buffer,
@@ -340,9 +338,9 @@ impl ScatterWriteOpIter {
 
 fn opcode_imm(imm_data: Option<u32>) -> (u32, u32) {
     if let Some(imm_data) = imm_data {
-        (IBV_WR_RDMA_WRITE_WITH_IMM, imm_data)
+        (ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM, imm_data)
     } else {
-        (IBV_WR_RDMA_WRITE, 0)
+        (ibv_wr_opcode::IBV_WR_RDMA_WRITE, 0)
     }
 }
 
@@ -407,9 +405,9 @@ pub fn fill_send_op(
             next: null_mut(),
             sg_list: sge.as_mut_ptr(),
             num_sge: 1,
-            opcode: IBV_WR_SEND,
-            send_flags: IBV_SEND_SIGNALED,
-            ..Default::default()
+            opcode: ibv_wr_opcode::IBV_WR_SEND,
+            send_flags: ibv_send_flags::IBV_SEND_SIGNALED.0,
+            ..zeroed()
         };
     }
 }

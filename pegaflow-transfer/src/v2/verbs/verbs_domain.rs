@@ -8,20 +8,19 @@ use std::{
 };
 
 use crate::cuda_lib::Device;
-use crate::libibverbs_sys::{
-    IBV_ACCESS_LOCAL_WRITE, IBV_ACCESS_RELAXED_ORDERING, IBV_ACCESS_REMOTE_READ,
-    IBV_ACCESS_REMOTE_WRITE, IBV_LINK_LAYER_INFINIBAND, IBV_SEND_SIGNALED, IBV_WC_RDMA_WRITE,
-    IBV_WC_RECV, IBV_WC_RECV_RDMA_WITH_IMM, IBV_WC_SEND, IBV_WC_SUCCESS, IBV_WR_SEND, ibv_ah,
-    ibv_ah_attr, ibv_alloc_parent_domain, ibv_alloc_pd, ibv_alloc_td, ibv_close_device,
-    ibv_context, ibv_cq, ibv_create_ah, ibv_create_cq, ibv_create_srq, ibv_dealloc_pd,
-    ibv_dealloc_td, ibv_dereg_mr, ibv_destroy_ah, ibv_destroy_cq, ibv_destroy_srq, ibv_gid,
-    ibv_global_route, ibv_mr, ibv_mtu, ibv_open_device, ibv_parent_domain_init_attr, ibv_pd,
-    ibv_poll_cq, ibv_port_attr, ibv_post_recv, ibv_post_send, ibv_post_srq_recv, ibv_qp,
-    ibv_query_gid, ibv_query_port_wrap, ibv_recv_wr, ibv_reg_mr, ibv_send_wr, ibv_sge, ibv_srq,
-    ibv_srq_attr, ibv_srq_init_attr, ibv_td, ibv_td_init_attr, ibv_wc, ibv_wc_status_str,
-};
-use libc::{ENOMEM, RTLD_LAZY, dlopen, dlsym};
+use libc::ENOMEM;
 use log::{debug, error, info, warn};
+use rdma_mummy_sys::{
+    IBV_LINK_LAYER_INFINIBAND, ibv_access_flags, ibv_ah, ibv_ah_attr, ibv_alloc_parent_domain,
+    ibv_alloc_pd, ibv_alloc_td, ibv_close_device, ibv_context, ibv_cq, ibv_create_ah,
+    ibv_create_cq, ibv_create_srq, ibv_dealloc_pd, ibv_dealloc_td, ibv_dereg_mr, ibv_destroy_ah,
+    ibv_destroy_cq, ibv_destroy_srq, ibv_gid, ibv_global_route, ibv_mr, ibv_mtu, ibv_open_device,
+    ibv_parent_domain_init_attr, ibv_pd, ibv_poll_cq, ibv_port_attr, ibv_post_recv, ibv_post_send,
+    ibv_post_srq_recv, ibv_qp, ibv_query_gid, ibv_query_port, ibv_recv_wr, ibv_reg_dmabuf_mr,
+    ibv_reg_mr, ibv_send_flags, ibv_send_wr, ibv_sge, ibv_srq, ibv_srq_attr, ibv_srq_init_attr,
+    ibv_td, ibv_td_init_attr, ibv_wc, ibv_wc_opcode, ibv_wc_status, ibv_wc_status_str,
+    ibv_wr_opcode,
+};
 use serde::{Deserialize, Serialize};
 
 const MAX_OPS: usize = 1024;
@@ -31,24 +30,6 @@ const GRH_BYTES: usize = 40;
 const MAX_UD_MSG_BYTES: usize = 4096;
 const NUM_UD_RECVS: usize = 128;
 const MAX_UD_SENDS: usize = 128;
-
-type IbvRegDmabufMr = unsafe extern "C" fn(*mut ibv_pd, u64, usize, u64, i32, i32) -> *mut ibv_mr;
-
-fn ibv_reg_dmabuf_mr() -> Option<IbvRegDmabufMr> {
-    static SYMBOL: std::sync::OnceLock<Option<IbvRegDmabufMr>> = std::sync::OnceLock::new();
-    *SYMBOL.get_or_init(|| unsafe {
-        let handle = dlopen(c"libibverbs.so.1".as_ptr(), RTLD_LAZY);
-        if handle.is_null() {
-            return None;
-        }
-        let symbol = dlsym(handle, c"ibv_reg_dmabuf_mr".as_ptr());
-        if symbol.is_null() {
-            None
-        } else {
-            Some(transmute::<*mut c_void, IbvRegDmabufMr>(symbol))
-        }
-    })
-}
 
 use crate::v2::{
     api::{DomainAddress, MemoryRegionRemoteKey, PeerGroupHandle, TransferId},
@@ -66,6 +47,7 @@ use crate::v2::{
             PagedWriteOpIter, ScatterWriteOpIter, SingleWriteOpIter, WrChainBuffer, WriteOpIter,
             fill_recv_op, fill_send_op,
         },
+        zeroed,
     },
 };
 
@@ -77,7 +59,7 @@ pub struct VerbsDomain {
     context: NonNull<ibv_context>,
     lid: u16,
     gid: Gid,
-    mtu: ibv_mtu,
+    mtu: ibv_mtu::Type,
     is_infiniband: bool,
     link_speed: u64,
 
@@ -205,15 +187,15 @@ impl VerbsDomain {
             });
 
             // Query Port
-            let mut port_attr = ibv_port_attr::default();
-            let errno = ibv_query_port_wrap(context.as_ptr(), info.port_num, &raw mut port_attr);
+            let mut port_attr: ibv_port_attr = zeroed();
+            let errno = ibv_query_port(context.as_ptr(), info.port_num, &raw mut port_attr);
             if errno != 0 {
-                return Err(VerbsError::with_code(errno, "ibv_query_port_wrap").into());
+                return Err(VerbsError::with_code(errno, "ibv_query_port").into());
             }
             let lid = port_attr.lid;
             let mtu = port_attr.active_mtu;
-            let is_infiniband = port_attr.link_layer == IBV_LINK_LAYER_INFINIBAND as u8;
-            let mut gid = ibv_gid::default();
+            let is_infiniband = port_attr.link_layer == IBV_LINK_LAYER_INFINIBAND;
+            let mut gid: ibv_gid = zeroed();
             let errno = ibv_query_gid(
                 context.as_ptr(),
                 info.port_num,
@@ -260,7 +242,7 @@ impl VerbsDomain {
                 pd: mt_pd.as_ptr(),
                 td: td.as_ptr(),
                 comp_mask: 0,
-                ..Default::default()
+                ..zeroed()
             };
             let pd = NonNull::new(ibv_alloc_parent_domain(
                 context.as_ptr(),
@@ -290,7 +272,7 @@ impl VerbsDomain {
                 attr: ibv_srq_attr {
                     max_wr: MAX_OPS as u32,
                     max_sge: 1,
-                    ..Default::default()
+                    ..zeroed()
                 },
             };
             let msg_srq = NonNull::new(ibv_create_srq(pd.as_ptr(), &raw mut srq_init_attr))
@@ -455,9 +437,9 @@ impl VerbsDomain {
             next: null_mut(),
             sg_list: &raw mut sge,
             num_sge: 1,
-            opcode: IBV_WR_SEND,
-            send_flags: IBV_SEND_SIGNALED,
-            ..Default::default()
+            opcode: ibv_wr_opcode::IBV_WR_SEND,
+            send_flags: ibv_send_flags::IBV_SEND_SIGNALED.0,
+            ..unsafe { zeroed() }
         };
         wr.wr.ud.ah = peer_ah.as_ptr();
         wr.wr.ud.remote_qpn = peer_ud_addr.qp_num;
@@ -507,12 +489,12 @@ impl VerbsDomain {
                 hop_limit: 64,
                 dgid: peer_ud_addr.gid.into(),
                 sgid_index: self.gid_index,
-                ..Default::default()
+                ..unsafe { zeroed() }
             },
             dlid: peer_ud_addr.lid,
             is_global: if self.is_infiniband { 0 } else { 1 },
             port_num: self.port_num,
-            ..Default::default()
+            ..unsafe { zeroed() }
         };
         let ah = NonNull::new(unsafe { ibv_create_ah(self.pd.as_ptr(), &raw mut ah_attr) })
             .ok_or_else(|| VerbsError::with_last_os_error("ibv_create_ah"))?;
@@ -682,9 +664,11 @@ impl VerbsDomain {
         }
 
         // NOTE(lequn): Need to set IBV_ACCESS_RELAXED_ORDERING otherwise it's under 200 Gbps.
-        let mut access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_RELAXED_ORDERING;
+        let mut access = ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
+            | ibv_access_flags::IBV_ACCESS_RELAXED_ORDERING;
         if allow_remote {
-            access |= IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
+            access |= ibv_access_flags::IBV_ACCESS_REMOTE_READ
+                | ibv_access_flags::IBV_ACCESS_REMOTE_WRITE;
         }
 
         let mr = match region.mapping() {
@@ -693,17 +677,14 @@ impl VerbsDomain {
                 ..
             } => {
                 let iova = region.ptr().as_ptr() as u64;
-                let reg_dmabuf_mr = ibv_reg_dmabuf_mr().ok_or(FabricLibError::Custom(
-                    "libibverbs does not expose ibv_reg_dmabuf_mr",
-                ))?;
                 let mr = unsafe {
-                    reg_dmabuf_mr(
+                    ibv_reg_dmabuf_mr(
                         self.pd.as_ptr(),
                         0,
                         region.len(),
                         iova,
                         *dmabuf_fd,
-                        access as i32,
+                        access.0 as i32,
                     )
                 };
                 NonNull::new(mr)
@@ -722,7 +703,7 @@ impl VerbsDomain {
                         self.pd.as_ptr(),
                         region.ptr().as_ptr(),
                         region.len(),
-                        access as i32,
+                        access.0 as i32,
                     )
                 };
                 NonNull::new(mr).ok_or_else(|| VerbsError::with_last_os_error("ibv_reg_mr"))?
@@ -1012,12 +993,12 @@ impl VerbsDomain {
 
     fn handle_cqe(&mut self, wc: &ibv_wc) -> Option<DomainCompletionEntry> {
         if wc.qp_num == unsafe { *self.ud.qp.as_ptr() }.qp_num {
-            if wc.status != IBV_WC_SUCCESS {
+            if wc.status != ibv_wc_status::IBV_WC_SUCCESS {
                 panic!("TODO: handle UD errors. status: {}", wc.status);
             }
 
             match wc.opcode {
-                IBV_WC_RECV => {
+                ibv_wc_opcode::IBV_WC_RECV => {
                     // Handle RC handshake
                     let ptr = unsafe { NonNull::new_unchecked(wc.wr_id as *mut u8) };
                     let buf = unsafe {
@@ -1034,7 +1015,7 @@ impl VerbsDomain {
                     // Post RECV for UD
                     self.post_ud_recv(ptr).expect("TODO: handle UD error");
                 }
-                IBV_WC_SEND => {
+                ibv_wc_opcode::IBV_WC_SEND => {
                     debug!("UD SEND completed: domain={} wr_id={}", self.name, wc.wr_id);
                     // Return the buffer
                     unsafe {
@@ -1054,7 +1035,7 @@ impl VerbsDomain {
         }
 
         // Check if the completion is an error.
-        if wc.status != IBV_WC_SUCCESS {
+        if wc.status != ibv_wc_status::IBV_WC_SUCCESS {
             let write_context = NonNull::new(wc.wr_id as *mut WriteOpContext)
                 .filter(|ptr| self.write_op_contexts.contains(ptr));
             let transfer_id: Option<TransferId> = if let Some(mut ptr) = write_context {
@@ -1071,7 +1052,7 @@ impl VerbsDomain {
                 ret
             } else {
                 match wc.opcode {
-                    IBV_WC_RECV | IBV_WC_SEND => {
+                    ibv_wc_opcode::IBV_WC_RECV | ibv_wc_opcode::IBV_WC_SEND => {
                         Some(unsafe { transmute::<u64, TransferId>(wc.wr_id) })
                     }
                     _ => None,
@@ -1102,18 +1083,18 @@ impl VerbsDomain {
 
         // Handle successful completion
         match wc.opcode {
-            IBV_WC_RECV => {
+            ibv_wc_opcode::IBV_WC_RECV => {
                 let transfer_id: TransferId = unsafe { transmute(wc.wr_id) };
                 Some(DomainCompletionEntry::Recv {
                     transfer_id,
                     data_len: wc.byte_len as usize,
                 })
             }
-            IBV_WC_SEND => {
+            ibv_wc_opcode::IBV_WC_SEND => {
                 let transfer_id: TransferId = unsafe { transmute(wc.wr_id) };
                 Some(DomainCompletionEntry::Send(transfer_id))
             }
-            IBV_WC_RDMA_WRITE => {
+            ibv_wc_opcode::IBV_WC_RDMA_WRITE => {
                 let context = unsafe { (wc.wr_id as *mut WriteOpContext).as_mut() }?;
                 context.cnt_finished_ops += 1;
                 if context.cnt_finished_ops < context.total_ops {
@@ -1124,13 +1105,13 @@ impl VerbsDomain {
                 self.maybe_drop_write_op_context(unsafe { NonNull::new_unchecked(context) });
                 Some(DomainCompletionEntry::Transfer(transfer_id))
             }
-            IBV_WC_RECV_RDMA_WITH_IMM => {
+            ibv_wc_opcode::IBV_WC_RECV_RDMA_WITH_IMM => {
                 // Submit zero-byte RECV for WRITE_IMM.
                 self.post_imm_recv()
                     .expect("TODO: handle error. maybe make ImmRecv a Op");
 
                 // Return different types of completions.
-                let imm = u32::from_be(unsafe { wc.__bindgen_anon_1.imm_data });
+                let imm = u32::from_be(unsafe { wc.imm_data_invalidated_rkey_union.imm_data });
                 match self.imm_count_map.inc(imm) {
                     ImmCountStatus::Vacant => Some(DomainCompletionEntry::ImmData(imm)),
                     ImmCountStatus::NotReached => None,

@@ -251,26 +251,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bindgen"
-version = "0.72.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "993776b509cfb49c750f11b8f07a46fa23e0a1386ffc01fb1e7d343efc387895"
-dependencies = [
- "bitflags 2.11.0",
- "cexpr",
- "clang-sys",
- "itertools 0.13.0",
- "log",
- "prettyplease",
- "proc-macro2",
- "quote",
- "regex",
- "rustc-hash 2.1.1",
- "shlex",
- "syn",
-]
-
-[[package]]
 name = "bitflags"
 version = "1.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -489,7 +469,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -715,7 +695,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1362,7 +1342,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2041,9 +2021,7 @@ version = "0.22.6"
 dependencies = [
  "anyhow",
  "bincode",
- "bindgen 0.72.1",
  "bytes",
- "cc",
  "clap",
  "crossbeam-channel",
  "cudarc",
@@ -2056,6 +2034,7 @@ dependencies = [
  "parking_lot",
  "pegaflow-common",
  "postcard",
+ "rdma-mummy-sys",
  "serde",
  "sideway",
  "smallvec",
@@ -2589,11 +2568,11 @@ dependencies = [
 
 [[package]]
 name = "rdma-mummy-sys"
-version = "0.2.3"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47d20f5590e60bfd80b5b515e3c9a11eee61065f630ce23947b41fb5c833ae2d"
+checksum = "56f8ead4d7835190d761b9365d9e53906a226d7699007b35bdca49d7edb89a15"
 dependencies = [
- "bindgen 0.66.1",
+ "bindgen",
  "cmake",
  "libc",
  "memoffset 0.9.1",
@@ -2779,7 +2758,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2836,7 +2815,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3038,9 +3017,9 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "sideway"
-version = "0.4.2"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07c0d63c17a1bd342a8324f137d460d5567b87aedb972d9c2968f7c34d48aefd"
+checksum = "7669500361477013bc37bcf21f6c9cd6ffcf4839b6fbffb3cb9df11e30a78c3e"
 dependencies = [
  "bitmask-enum",
  "libc",
@@ -3298,7 +3277,7 @@ dependencies = [
  "getrandom 0.4.1",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3966,7 +3945,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

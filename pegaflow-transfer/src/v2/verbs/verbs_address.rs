@@ -1,5 +1,5 @@
-use crate::libibverbs_sys::ibv_gid;
 use bytes::Bytes;
+use rdma_mummy_sys::ibv_gid;
 use serde::{Deserialize, Serialize};
 
 use crate::v2::{api::DomainAddress, utils::hex::fmt_hex};

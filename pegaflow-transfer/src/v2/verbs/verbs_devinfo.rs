@@ -5,8 +5,8 @@ use crate::v2::{
     provider::RdmaDomainInfo,
 };
 
-use crate::libibverbs_sys::{ibv_device, ibv_free_device_list, ibv_get_device_list};
 use log::{info, warn};
+use rdma_mummy_sys::{ibv_device, ibv_free_device_list, ibv_get_device_list};
 use sideway::ibverbs::{
     address::GidType,
     device::{DeviceInfo, DeviceList},
