@@ -352,10 +352,9 @@ class PrefillHandler:
                 continue
             self._tracker.mark_done(req_id)
             finalize_ts_ns = time.time_ns()
-            ready_gbps = _gbps(trace.rdma_bytes, trace.first_save_ts_ns, trace.last_save_ts_ns)
             link_gbps = _rdma_link_gbps(self._w.rdma)
             logger.info(
-                "[PdConnector] P all chunks done req=%s target_req=%s chunks=%d blocks=%d rdma_bytes=%d schedule_to_save_ms=%.3f forward_ms=%.3f gbps=%.2f link_gbps=%.2f ready_link_util_pct=%.2f ts_ns=%d",
+                "[PdConnector] P all chunks submitted req=%s target_req=%s chunks=%d blocks=%d rdma_bytes=%d schedule_to_save_ms=%.3f forward_ms=%.3f link_gbps=%.2f ts_ns=%d",
                 req_id,
                 req.target_request_id,
                 trace.chunk_count,
@@ -363,9 +362,7 @@ class PrefillHandler:
                 trace.rdma_bytes,
                 (finalize_ts_ns - trace.queued_ts_ns) / 1_000_000,
                 _elapsed_ms(trace.first_save_ts_ns, trace.last_save_ts_ns),
-                ready_gbps,
                 link_gbps,
-                _pct(ready_gbps, link_gbps),
                 finalize_ts_ns,
             )
             self._push_finalizer.submit(
@@ -954,6 +951,7 @@ class _AsyncPushFinalizer:
                 completed = True
             done_ts_ns = time.time_ns()
             if completed and self._metrics is not None:
+                push_gbps = _gbps(task.rdma_bytes, task.first_save_ts_ns, done_ts_ns)
                 self._metrics.record_prefill_push(
                     duration_s=(done_ts_ns - task.schedule_queued_ts_ns) / 1_000_000_000,
                     first_save_to_done_s=(
@@ -964,14 +962,15 @@ class _AsyncPushFinalizer:
                     wait_for_pushes_s=wait_for_pushes_s,
                     blocks=task.num_blocks,
                     bytes_total=task.rdma_bytes,
+                    gbps=push_gbps,
                     success=True,
                 )
-            save_gbps = _gbps(task.rdma_bytes, task.first_save_ts_ns, done_ts_ns)
+            push_gbps = _gbps(task.rdma_bytes, task.first_save_ts_ns, done_ts_ns)
             link_gbps = _rdma_link_gbps(task.rdma)
             logger.info(
                 "[PdConnector] P RDMA done reqs=%s target_req=%s chunks=%d blocks=%d "
                 "rdma_bytes=%d save_to_imm_ms=%.3f schedule_to_imm_ms=%.3f "
-                "save_gbps=%.2f tail_gbps=%.2f link_gbps=%.2f link_util_pct=%.2f",
+                "gbps=%.2f link_gbps=%.2f link_util_pct=%.2f",
                 list(task.req_ids),
                 task.target_request_id,
                 task.chunk_count,
@@ -979,10 +978,9 @@ class _AsyncPushFinalizer:
                 task.rdma_bytes,
                 _elapsed_ms(task.first_save_ts_ns, done_ts_ns),
                 _elapsed_ms(task.schedule_queued_ts_ns, done_ts_ns),
-                save_gbps,
-                _gbps(task.rdma_bytes, task.finalize_queued_ts_ns, done_ts_ns),
+                push_gbps,
                 link_gbps,
-                _pct(save_gbps, link_gbps),
+                _pct(push_gbps, link_gbps),
             )
         except BaseException as exc:
             logger.exception(
@@ -1003,6 +1001,7 @@ class _AsyncPushFinalizer:
                     wait_for_pushes_s=None,
                     blocks=task.num_blocks,
                     bytes_total=task.rdma_bytes,
+                    gbps=None,
                     success=False,
                 )
         finally:

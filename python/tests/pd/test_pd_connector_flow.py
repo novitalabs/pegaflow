@@ -135,6 +135,7 @@ def test_pd_prom_metrics_observes_connector_stats(monkeypatch) -> None:
             "pd_prefill_wait_for_pushes_duration": [0.6],
             "pd_prefill_push_blocks": [8],
             "pd_prefill_push_bytes": [1024],
+            "pd_prefill_push_gbps": [2.5],
             "pd_load_success_count": 1,
             "pd_load_failure_count": 2,
             "pd_prefill_push_success_count": 3,
@@ -149,6 +150,7 @@ def test_pd_prom_metrics_observes_connector_stats(monkeypatch) -> None:
 
     assert prom.gauge_decode_active_waits[0].value == 2
     assert prom.hist_decode_wait_duration[0].values == [0.1]
+    assert prom.hist_prefill_push_gbps[0].values == [2.5]
     assert prom.counter_load_success[0].value == 1
     assert prom.counter_prefill_skipped_push[0].value == 7
 
@@ -2019,6 +2021,7 @@ def test_push_finalizer_records_schedule_to_done_duration() -> None:
 
     stats = metrics.get_stats()
     assert stats.data["pd_prefill_push_duration"][0] >= 0.8
+    assert stats.data["pd_prefill_push_gbps"][0] > 0
 
 
 def _prefill_http_task(request_id: str) -> PrefillHttpTask:
