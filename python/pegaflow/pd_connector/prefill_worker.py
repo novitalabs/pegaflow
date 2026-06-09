@@ -133,6 +133,7 @@ class PrefillHandler:
         for physical_req_id in physical_req_ids:
             self._physical_to_logical.pop(physical_req_id, None)
             self._completed_physical_pushes.discard(physical_req_id)
+        self._clear_remote_block_offsets(req_id, physical_req_ids)
         self._push_traces.pop(req_id, None)
         self._tracker.remove(req_id)
         return physical_req_ids
@@ -232,11 +233,7 @@ class PrefillHandler:
                 self._w.rdma.close_request(physical_req_id)
             self._push_traces.pop(req_id, None)
             self._tracker.remove(req_id)
-            self._remote_block_offsets = {
-                key: value
-                for key, value in self._remote_block_offsets.items()
-                if not (key == req_id or key.startswith(f"{req_id}#"))
-            }
+            self._clear_remote_block_offsets(req_id, physical_req_ids)
         return releasable_sending
 
     def shutdown(self) -> None:
@@ -498,6 +495,16 @@ class PrefillHandler:
     def _clear_push_chunk_maps(self, req_id: str) -> None:
         self._push_chunk_maps = {
             key: value for key, value in self._push_chunk_maps.items() if key[0] != req_id
+        }
+
+    def _clear_remote_block_offsets(
+        self, req_id: str, physical_req_ids: tuple[str, ...]
+    ) -> None:
+        prefixes = (req_id, *(f"{physical_req_id}#" for physical_req_id in physical_req_ids))
+        self._remote_block_offsets = {
+            key: value
+            for key, value in self._remote_block_offsets.items()
+            if not (key == req_id or any(key.startswith(prefix) for prefix in prefixes))
         }
 
     def _block_ids_by_layer(self, block_ids: Any) -> dict[int, set[int]]:

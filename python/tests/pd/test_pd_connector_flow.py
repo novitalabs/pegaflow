@@ -999,6 +999,56 @@ def test_p_worker_release_closes_all_physical_decode_targets() -> None:
     assert rdma.registered == set()
 
 
+def test_p_worker_completion_clears_physical_remote_block_offsets() -> None:
+    tensor = FakeTensor(
+        shape=(2, 8, 16, 4, 32),
+        stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
+    )
+    rdma = MockRdmaPort()
+    worker = PdPrefillWorkerConnector(
+        SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(engine_id="prefill"),
+            parallel_config=SimpleNamespace(tensor_parallel_rank=1, tensor_parallel_size=2),
+        ),
+        rdma=rdma,
+    )
+    worker.register_kv_caches({"layer.0": tensor})
+    worker.start_load_kv(
+        PdConnectorMetadata(
+            reqs_to_push={
+                "prefill-r1": PushReqMeta(
+                    local_block_ids=([1],),
+                    target_request_id="decode",
+                    handshakes=tuple(
+                        PdHandshake(
+                            request_id=f"decode-r{rank}",
+                            engine_id="decode",
+                            tp_rank=rank,
+                            tp_size=4,
+                            block_size=16,
+                            layers=(hnd_remote_layer(block_ids=(68,), block_len=2048),),
+                        )
+                        for rank in range(4)
+                    ),
+                )
+            }
+        ),
+        None,
+    )
+    worker._prefill._remote_block_offsets.update(
+        {
+            "prefill-r1#d2#l0": 1,
+            "prefill-r1#d3#l0": 1,
+            "other#d0#l0": 1,
+        }
+    )
+
+    worker._prefill._completed_pushes.add("prefill-r1")
+    assert worker.get_finished({"prefill-r1"})[0] == {"prefill-r1"}
+
+    assert worker._prefill._remote_block_offsets == {"other#d0#l0": 1}
+
+
 def test_p_worker_preemption_cancels_push_without_waiting_for_done() -> None:
     class TrackingRdma(MockRdmaPort):
         def __init__(self) -> None:
