@@ -301,39 +301,6 @@ impl InstanceContext {
         })
     }
 
-    /// Register the connector-declared numeric ID for a layer name.
-    #[cfg(test)]
-    fn register_layer_id(&self, layer_name: &str, layer_id: usize) -> Result<(), EngineError> {
-        if layer_id >= self.num_layers {
-            return Err(EngineError::InvalidArgument(format!(
-                "layer {layer_name} id {layer_id} out of range (num_layers {})",
-                self.num_layers
-            )));
-        }
-
-        let mut metadata = self.metadata.lock();
-
-        if let Some(&id) = metadata.name_to_id.get(layer_name)
-            && id != layer_id
-        {
-            return Err(EngineError::InvalidArgument(format!(
-                "layer {layer_name} already registered with id {id}, got {layer_id}"
-            )));
-        }
-
-        if let Some(existing_name) = &metadata.names[layer_id]
-            && existing_name != layer_name
-        {
-            return Err(EngineError::InvalidArgument(format!(
-                "layer id {layer_id} already registered for {existing_name}, got {layer_name}"
-            )));
-        }
-
-        metadata.names[layer_id] = Some(layer_name.to_string());
-        metadata.name_to_id.insert(layer_name.to_string(), layer_id);
-        Ok(())
-    }
-
     fn build_layer_id_assignments(
         &self,
         kv_caches: &HashMap<String, KVCacheRegistration>,
