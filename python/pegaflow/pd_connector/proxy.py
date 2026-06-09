@@ -253,6 +253,8 @@ def build_pd_proxy_request(
 class PdProxy:
     def __init__(self, config: ProxyConfig) -> None:
         self.config = config
+        self._stream_client: httpx.Client | None = None
+        self._stream_client_lock = threading.Lock()
 
     def handle_openai_request(self, path: str, body: dict[str, Any]) -> tuple[int, bytes, str]:
         if path not in SUPPORTED_PATHS:
@@ -324,6 +326,7 @@ class PdProxy:
                 self.config.timeout_s,
                 req.request_id,
                 "D",
+                client=self._get_stream_client(),
             )
             header_ts_ns = time.time_ns()
             logger.info(
@@ -346,7 +349,20 @@ class PdProxy:
             raise
 
     def close(self) -> None:
-        return None
+        with self._stream_client_lock:
+            client = self._stream_client
+            self._stream_client = None
+        if client is not None:
+            client.close()
+
+    def _get_stream_client(self) -> httpx.Client:
+        with self._stream_client_lock:
+            if self._stream_client is None:
+                self._stream_client = httpx.Client(
+                    timeout=self.config.timeout_s,
+                    limits=httpx.Limits(max_connections=None, max_keepalive_connections=None),
+                )
+            return self._stream_client
 
 
 def _post_json(
@@ -405,6 +421,8 @@ def _open_json(
     timeout_s: float,
     request_id: str,
     role: str,
+    *,
+    client: httpx.Client | None = None,
 ):
     payload = json.dumps(body, separators=(",", ":")).encode()
     logger.info(
@@ -415,13 +433,14 @@ def _open_json(
         len(payload),
         body.get("kv_transfer_params"),
     )
-    client: httpx.Client | None = None
     stream_cm: Any | None = None
+    owns_client = client is None
     try:
-        client = httpx.Client(
-            timeout=timeout_s,
-            limits=httpx.Limits(max_connections=None, max_keepalive_connections=None),
-        )
+        if client is None:
+            client = httpx.Client(
+                timeout=timeout_s,
+                limits=httpx.Limits(max_connections=None, max_keepalive_connections=None),
+            )
         stream_cm = client.stream(
             "POST",
             url,
@@ -429,11 +448,16 @@ def _open_json(
             headers={"Content-Type": "application/json"},
         )
         response = stream_cm.__enter__()
-        return _OpenHttpxStream(client=client, stream_cm=stream_cm, response=response)
+        return _OpenHttpxStream(
+            client=client,
+            stream_cm=stream_cm,
+            response=response,
+            owns_client=owns_client,
+        )
     except Exception:
         if stream_cm is not None:
             stream_cm.__exit__(None, None, None)
-        if client is not None:
+        if client is not None and owns_client:
             client.close()
         logger.exception(
             "[PdProxy] request=%s %s connection failed url=%s",
@@ -449,6 +473,7 @@ class _OpenHttpxStream:
     client: httpx.Client
     stream_cm: Any
     response: httpx.Response
+    owns_client: bool = True
 
     @property
     def status(self) -> int:
@@ -473,7 +498,8 @@ class _OpenHttpxStream:
         try:
             self.stream_cm.__exit__(exc_type, exc, traceback)
         finally:
-            self.client.close()
+            if self.owns_client:
+                self.client.close()
 
 
 def iter_http_stream_bytes(response, chunk_size: int | None = None) -> Any:

@@ -229,6 +229,70 @@ def test_pd_proxy_unsupported_stream_does_not_record_decode_duration() -> None:
     assert metrics["decode_request_durations_s"] == []
 
 
+def test_pd_proxy_reuses_stream_http_client(monkeypatch) -> None:
+    from pegaflow.pd_connector import proxy as proxy_mod
+
+    class FakeHeaders(dict):
+        def get(self, key, default=None):
+            return super().get(key, default)
+
+    class FakeResponse:
+        status_code = 200
+        headers = FakeHeaders({"Content-Type": "text/event-stream"})
+
+        def iter_bytes(self):
+            yield b"data: {}\n\n"
+
+    class FakeStream:
+        def __enter__(self):
+            return FakeResponse()
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            return None
+
+    class FakeClient:
+        created = 0
+        closed = 0
+
+        def __init__(self, **_kwargs) -> None:
+            type(self).created += 1
+
+        def stream(self, *_args, **_kwargs):
+            return FakeStream()
+
+        def close(self) -> None:
+            type(self).closed += 1
+
+    monkeypatch.setattr(proxy_mod.httpx, "Client", FakeClient)
+    config = ProxyConfig(
+        prefill_url="http://p0:8000",
+        decode_url="http://d0:8000",
+        timeout_s=1.0,
+        prefill_max_tokens=1,
+    )
+    proxy = proxy_mod.PdProxy(config)
+
+    first = proxy.open_openai_stream(
+        "/v1/completions",
+        {"stream": True, "request_id": "req-1", "model": "model", "prompt": "a"},
+    )
+    second = proxy.open_openai_stream(
+        "/v1/completions",
+        {"stream": True, "request_id": "req-2", "model": "model", "prompt": "b"},
+    )
+
+    assert first[2] is not None
+    assert second[2] is not None
+    first[2].__exit__(None, None, None)
+    second[2].__exit__(None, None, None)
+    assert FakeClient.created == 1
+    assert FakeClient.closed == 0
+
+    proxy.close()
+
+    assert FakeClient.closed == 1
+
+
 def test_d_consumer_release_does_not_increment_prefill_release_metric() -> None:
     tensor = FakeTensor(
         shape=(2, 8, 16, 8, 32),
