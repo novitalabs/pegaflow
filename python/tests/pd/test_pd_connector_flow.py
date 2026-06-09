@@ -1112,8 +1112,9 @@ def test_pd_worker_publishes_wait_handshake_and_delays_done_until_all_blocks() -
     assert wait_handshake.engine_id == "decode"
     assert wait_handshake.block_size == 16
     assert isinstance(wait_handshake.imm_id, int)
-    assert len(wait_handshake.layers) == 1
+    assert len(wait_handshake.layers) == 2
     assert wait_handshake.layers[0].block_ids == (1,)
+    assert wait_handshake.layers[1].block_ids == (1,)
 
     assert len(prefill_sender.tasks) == 1
     task = prefill_sender.tasks[0]
@@ -1124,6 +1125,7 @@ def test_pd_worker_publishes_wait_handshake_and_delays_done_until_all_blocks() -
     assert handshake.block_size == 16
     assert handshake.imm_id == wait_handshake.imm_id
     assert handshake.layers[0].block_ids == (1, 2)
+    assert handshake.layers[1].block_ids == (1, 2)
     assert handshake.layers[0].regions[0] == TransferRegionLayout(
         region_idx=0,
         base_addr=tensor.data_ptr(),
