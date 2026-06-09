@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     import torch
 
 
-class PdDecodeConnector(KVConnectorBase_V1, SupportsHMA, PdConnectorClassMixin):
+class PdDecodeConnector(PdConnectorClassMixin, KVConnectorBase_V1, SupportsHMA):
     """Decode-side vLLM connector for P/D RDMA push."""
 
     def __init__(self, vllm_config: Any, role: KVConnectorRole, kv_cache_config: Any = None):
@@ -139,7 +139,7 @@ class PdDecodeConnector(KVConnectorBase_V1, SupportsHMA, PdConnectorClassMixin):
         return self._scheduler.request_finished(request, block_ids)
 
 
-class PdPrefillConnector(KVConnectorBase_V1, SupportsHMA, PdConnectorClassMixin):
+class PdPrefillConnector(PdConnectorClassMixin, KVConnectorBase_V1, SupportsHMA):
     """Prefill-side vLLM connector for P/D RDMA push."""
 
     def __init__(self, vllm_config: Any, role: KVConnectorRole, kv_cache_config: Any = None):
