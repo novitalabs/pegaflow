@@ -454,6 +454,45 @@ def test_pd_worker_pushes_flash_attn_hnd_blocks() -> None:
     assert "req-1" not in worker.rdma.registered
 
 
+def test_p_worker_closes_single_target_push_once_when_finished() -> None:
+    class TrackingCloseRdma(MockRdmaPort):
+        def __init__(self) -> None:
+            super().__init__()
+            self.closed_reqs: list[str] = []
+
+        def close_request(self, req_id: str) -> None:
+            self.closed_reqs.append(req_id)
+            super().close_request(req_id)
+
+    tensor = FakeTensor(
+        shape=(2, 8, 16, 4, 32),
+        stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
+    )
+    rdma = TrackingCloseRdma()
+    worker = PdPrefillWorkerConnector(
+        SimpleNamespace(kv_transfer_config=SimpleNamespace(engine_id="prefill")),
+        rdma=rdma,
+    )
+    worker.register_kv_caches({"layer.0": tensor})
+    worker.start_load_kv(
+        PdConnectorMetadata(
+            reqs_to_push={
+                "req-1": PushReqMeta(
+                    local_block_ids=([1],),
+                    target_request_id="decode",
+                    handshakes=(DUMMY_HANDSHAKE,),
+                )
+            }
+        ),
+        None,
+    )
+
+    worker.save_kv_layer("layer.0", tensor, SimpleNamespace())
+    drain_pd_pushes(worker)
+    assert worker.get_finished({"req-1"}) == ({"req-1"}, None)
+    assert rdma.closed_reqs == ["req-1"]
+
+
 def test_pd_worker_get_finished_does_not_poll_wait_reqs() -> None:
     rdma = MockRdmaPort()
     worker = PdDecodeWorkerConnector(

@@ -226,8 +226,7 @@ class PrefillHandler:
             self._clear_push_chunk_maps(req_id)
             self._push_plans.pop(req_id, None)
             physical_req_ids = self._logical_to_physical.pop(req_id, ())
-            self._w.rdma.close_request(req_id)
-            for physical_req_id in physical_req_ids:
+            for physical_req_id in dict.fromkeys(physical_req_ids):
                 self._physical_to_logical.pop(physical_req_id, None)
                 self._completed_physical_pushes.discard(physical_req_id)
                 self._w.rdma.close_request(physical_req_id)
