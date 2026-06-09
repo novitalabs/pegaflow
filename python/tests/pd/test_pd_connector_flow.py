@@ -2613,6 +2613,26 @@ def test_pd_proxy_streams_decode_bytes_without_sse_event_aggregation() -> None:
     ]
 
 
+def test_pd_proxy_prefers_httpx_stream_chunks_over_fixed_size_reads() -> None:
+    class HttpxLikeBody:
+        def iter_bytes(self):
+            yield b'data: {"text":"'
+            yield b"\xe6\xb5\x8b"
+            yield b'"}\n\n'
+
+        def read1(self, _size=-1):
+            raise AssertionError("httpx-style stream should not be re-chunked with read1")
+
+        def read(self, _size=-1):
+            raise AssertionError("httpx-style stream should not be re-chunked with read")
+
+    assert list(iter_http_stream_bytes(HttpxLikeBody())) == [
+        b'data: {"text":"',
+        b"\xe6\xb5\x8b",
+        b'"}\n\n',
+    ]
+
+
 def test_pd_connector_requires_piecewise_cudagraph_by_default() -> None:
     assert PdDecodeConnector.requires_piecewise_for_cudagraph({}) is True
 

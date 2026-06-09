@@ -18,9 +18,12 @@ import uuid
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import TracebackType
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+import httpx
 
 from pegaflow.pd_connector.kv_params import ConsumerKvParams
 
@@ -412,17 +415,26 @@ def _open_json(
         len(payload),
         body.get("kv_transfer_params"),
     )
-    request = Request(
-        url,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+    client: httpx.Client | None = None
+    stream_cm: Any | None = None
     try:
-        return urlopen(request, timeout=timeout_s)
-    except HTTPError:
-        raise
-    except URLError:
+        client = httpx.Client(
+            timeout=timeout_s,
+            limits=httpx.Limits(max_connections=None, max_keepalive_connections=None),
+        )
+        stream_cm = client.stream(
+            "POST",
+            url,
+            content=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        response = stream_cm.__enter__()
+        return _OpenHttpxStream(client=client, stream_cm=stream_cm, response=response)
+    except Exception:
+        if stream_cm is not None:
+            stream_cm.__exit__(None, None, None)
+        if client is not None:
+            client.close()
         logger.exception(
             "[PdProxy] request=%s %s connection failed url=%s",
             request_id,
@@ -432,7 +444,49 @@ def _open_json(
         raise
 
 
-def iter_http_stream_bytes(response, chunk_size: int = 64 * 1024) -> Any:
+@dataclass
+class _OpenHttpxStream:
+    client: httpx.Client
+    stream_cm: Any
+    response: httpx.Response
+
+    @property
+    def status(self) -> int:
+        return self.response.status_code
+
+    @property
+    def headers(self) -> httpx.Headers:
+        return self.response.headers
+
+    def iter_bytes(self) -> Any:
+        yield from self.response.iter_bytes()
+
+    def __enter__(self) -> "_OpenHttpxStream":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        try:
+            self.stream_cm.__exit__(exc_type, exc, traceback)
+        finally:
+            self.client.close()
+
+
+def iter_http_stream_bytes(response, chunk_size: int | None = None) -> Any:
+    iter_bytes = getattr(response, "iter_bytes", None)
+    if iter_bytes is not None:
+        if chunk_size is None:
+            yield from iter_bytes()
+        else:
+            yield from iter_bytes(chunk_size=chunk_size)
+        return
+
+    if chunk_size is None:
+        chunk_size = 64 * 1024
     read_chunk = getattr(response, "read1", None)
     if read_chunk is None:
         read_chunk = response.read
