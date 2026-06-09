@@ -36,7 +36,7 @@ from pegaflow.pd_connector.metadata import (
 from pegaflow.pd_connector.rdma import RdmaPort
 
 if TYPE_CHECKING:
-    from pegaflow.pd_connector.worker import PdWorkerConnector
+    from pegaflow.pd_connector.worker import PdWorkerBase
 
 logger = get_connector_logger()
 
@@ -44,11 +44,11 @@ logger = get_connector_logger()
 class PrefillHandler:
     """Handles P-side (prefill) requests: KV push via RDMA."""
 
-    def __init__(self, worker: PdWorkerConnector) -> None:
+    def __init__(self, worker: PdWorkerBase) -> None:
         self._w = worker
         self._push_reqs: dict[str, PushReqMeta] = {}
         self._pending_push_chunks: set[str] = set()
-        self._push_chunk_maps: dict[str, tuple[dict[int, int], bool]] = {}
+        self._push_chunk_maps: dict[tuple[str, int], tuple[dict[str, dict[int, int]], bool]] = {}
         self._tracker = ChunkTracker()
         self._completed_pushes: set[str] = set()
         self._completed_physical_pushes: set[str] = set()
@@ -83,7 +83,7 @@ class PrefillHandler:
             self._push_plans[req_id] = plan
             self._push_traces.setdefault(req_id, _PushTrace(queued_ts_ns=time.time_ns()))
             self._pending_push_chunks.add(req_id)
-            self._push_chunk_maps.pop(req_id, None)
+            self._clear_push_chunk_maps(req_id)
             physical_req_ids = self._physical_req_ids(req_id, plan)
             self._logical_to_physical[req_id] = physical_req_ids
             for physical_req_id, target in zip(physical_req_ids, plan.targets, strict=True):
@@ -109,7 +109,7 @@ class PrefillHandler:
         had_push_state = (
             req_id in self._push_reqs
             or req_id in self._pending_push_chunks
-            or req_id in self._push_chunk_maps
+            or any(key[0] == req_id for key in self._push_chunk_maps)
             or req_id in self._push_plans
             or req_id in self._logical_to_physical
             or req_id in self._push_traces
@@ -120,7 +120,7 @@ class PrefillHandler:
         if had_push_state:
             self._w.metrics.record_prefill_release()
         self._pending_push_chunks.discard(req_id)
-        self._push_chunk_maps.pop(req_id, None)
+        self._clear_push_chunk_maps(req_id)
         self._push_plans.pop(req_id, None)
         physical_req_ids = self._logical_to_physical.pop(req_id, ())
         if physical_req_ids:
@@ -223,7 +223,7 @@ class PrefillHandler:
             self._push_reqs.pop(req_id, None)
             self._w.metrics.set_prefill_active_pushes(len(self._push_reqs))
             self._pending_push_chunks.discard(req_id)
-            self._push_chunk_maps.pop(req_id, None)
+            self._clear_push_chunk_maps(req_id)
             self._push_plans.pop(req_id, None)
             physical_req_ids = self._logical_to_physical.pop(req_id, ())
             self._w.rdma.close_request(req_id)
@@ -280,7 +280,7 @@ class PrefillHandler:
                 continue
             if self._tracker.is_done(req_id):
                 continue
-            req_blocks = flatten_block_ids(req.local_block_ids)
+            req_blocks = self._w.block_ids_for_layer(req.local_block_ids, layer_name)
             if not req_blocks:
                 continue
             trace = self._push_traces.setdefault(
@@ -290,14 +290,16 @@ class PrefillHandler:
             if trace.first_save_ts_ns is None:
                 trace.first_save_ts_ns = time.time_ns()
             plan = self._push_plans[req_id]
-            target_maps, all_chunks_seen = self._push_chunk_maps.get(req_id, ({}, False))
+            chunk_key = (req_id, layer_idx)
+            target_maps, all_chunks_seen = self._push_chunk_maps.get(chunk_key, ({}, False))
             if not target_maps:
                 target_maps, all_chunks_seen = self._remote_block_id_maps(
                     req_id,
                     plan,
                     req_blocks,
+                    layer_idx,
                 )
-                self._push_chunk_maps[req_id] = (target_maps, all_chunks_seen)
+                self._push_chunk_maps[chunk_key] = (target_maps, all_chunks_seen)
             assert self._w.rdma is not None
             rdma_bytes = 0
             physical_req_ids = self._logical_to_physical[req_id]
@@ -331,13 +333,18 @@ class PrefillHandler:
             trace.chunk_count += 1
             trace.last_save_ts_ns = time.time_ns()
             self._pending_push_chunks.discard(req_id)
-            self._push_chunk_maps.pop(req_id, None)
+            all_layer_chunks_seen = self._all_layer_chunks_seen(
+                req_id,
+                current_layer_idx=layer_idx,
+                current_all_chunks_seen=all_chunks_seen,
+            )
+            self._clear_push_chunk_maps(req_id)
             chunk_complete = self._tracker.has_pushed_all_blocks(
                 req_id,
-                req_blocks,
+                self._block_ids_by_layer(req.local_block_ids),
                 num_layers=len(self._w.layer_names),
             )
-            if not (chunk_complete and all_chunks_seen):
+            if not (chunk_complete and all_layer_chunks_seen):
                 logger.info(
                     "[PdConnector] P chunk req=%s target_req=%s chunk=%d blocks=%d forward_ms=%.3f",
                     req_id,
@@ -469,6 +476,7 @@ class PrefillHandler:
         req_id: str,
         plan: PushLayoutPlan,
         local_block_ids: set[int],
+        layer_idx: int,
     ) -> tuple[dict[str, dict[int, int]], bool]:
         result = {}
         all_chunks_seen = True
@@ -478,14 +486,46 @@ class PrefillHandler:
             strict=True,
         ):
             remote_block_ids, target_all_chunks_seen = _remote_block_id_map_for_handshake(
-                offset_key=physical_req_id,
+                offset_key=f"{physical_req_id}#l{layer_idx}",
                 handshake=target.handshake,
                 local_block_ids=local_block_ids,
+                layer_idx=layer_idx,
                 remote_block_offsets=self._remote_block_offsets,
             )
             result[physical_req_id] = remote_block_ids
             all_chunks_seen = all_chunks_seen and target_all_chunks_seen
         return result, all_chunks_seen
+
+    def _clear_push_chunk_maps(self, req_id: str) -> None:
+        self._push_chunk_maps = {
+            key: value for key, value in self._push_chunk_maps.items() if key[0] != req_id
+        }
+
+    def _block_ids_by_layer(self, block_ids: Any) -> dict[int, set[int]]:
+        return {
+            layer_idx: self._w.block_ids_for_layer(block_ids, layer_name)
+            for layer_idx, layer_name in enumerate(self._w.layer_names)
+        }
+
+    def _all_layer_chunks_seen(
+        self,
+        req_id: str,
+        *,
+        current_layer_idx: int,
+        current_all_chunks_seen: bool,
+    ) -> bool:
+        seen_by_layer = {
+            layer_idx: all_chunks_seen
+            for (chunk_req_id, layer_idx), (
+                _target_maps,
+                all_chunks_seen,
+            ) in self._push_chunk_maps.items()
+            if chunk_req_id == req_id
+        }
+        seen_by_layer[current_layer_idx] = current_all_chunks_seen
+        return all(
+            seen_by_layer.get(layer_idx, False) for layer_idx in range(len(self._w.layer_names))
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -608,17 +648,20 @@ def _remote_block_id_map_for_handshake(
     offset_key: str,
     handshake: PdHandshake,
     local_block_ids: set[int],
+    layer_idx: int,
     remote_block_offsets: dict[str, int],
 ) -> tuple[dict[int, int], bool]:
     if not handshake.layers:
         return {block_id: block_id for block_id in local_block_ids}, True
-    remote_block_ids = handshake.layers[0].block_ids
-    for layer in handshake.layers[1:]:
-        assert layer.block_ids == remote_block_ids, (
-            "PdConnector expects one decode block-id layout shared by all layers; "
-            f"layer=0 blocks={list(remote_block_ids)} layer={layer.layer_idx} "
-            f"blocks={list(layer.block_ids)}"
-        )
+    remote_layer = next(
+        (layer for layer in handshake.layers if layer.layer_idx == layer_idx),
+        None,
+    )
+    assert remote_layer is not None, (
+        "PdConnector missing decode layer layout for push "
+        f"layer_idx={layer_idx} available={[layer.layer_idx for layer in handshake.layers]}"
+    )
+    remote_block_ids = remote_layer.block_ids
     ordered_local = sorted(local_block_ids)
     if len(ordered_local) == len(remote_block_ids):
         remote_block_offsets[offset_key] = len(remote_block_ids)

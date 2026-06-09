@@ -91,7 +91,7 @@ def test_pd_worker_registers_mla_and_indexer_layouts_from_layer_specs() -> None:
             "indexer.0": SimpleNamespace(block_size=64, page_size_bytes=64 * 128),
         },
     )
-    worker = PdWorkerConnector(
+    worker = PdDecodeWorkerConnector(
         fake_mla_config(),
         kv_cache_config=kv_cache_config,
         rdma=MockRdmaPort(),
@@ -113,13 +113,13 @@ def test_pd_worker_registers_mla_and_indexer_layouts_from_layer_specs() -> None:
 
 
 def test_pd_connector_mla_returns_default_layout_and_allows_128_block_size() -> None:
-    assert PdConnector.get_required_kvcache_layout(fake_mla_config(block_size=64)) is None
-    PdConnector(fake_mla_config(block_size=128), KVConnectorRole.WORKER)
+    assert PdDecodeConnector.get_required_kvcache_layout(fake_mla_config(block_size=64)) is None
+    PdDecodeConnector(fake_mla_config(block_size=128), KVConnectorRole.WORKER)
 
 
-def test_pd_connector_rejects_mtp_layout() -> None:
-    with pytest.raises(AssertionError, match="PdConnector does not support MTP layout"):
-        PdConnector(fake_mtp_config(), KVConnectorRole.WORKER)
+def test_pd_connectors_allow_mtp_layout() -> None:
+    PdDecodeConnector(fake_mtp_config(), KVConnectorRole.WORKER)
+    PdPrefillConnector(fake_mtp_config(), KVConnectorRole.WORKER)
 
 
 def test_pd_worker_rejects_mla_physical_logical_block_split() -> None:
@@ -135,7 +135,7 @@ def test_pd_worker_rejects_mla_physical_logical_block_split() -> None:
             "layer.0": SimpleNamespace(block_size=64, page_size_bytes=32 * 128),
         },
     )
-    worker = PdWorkerConnector(
+    worker = PdDecodeWorkerConnector(
         fake_mla_config(block_size=64),
         kv_cache_config=kv_cache_config,
         rdma=MockRdmaPort(),
@@ -157,7 +157,7 @@ def test_p_worker_maps_mla_prefill_tp_greater_than_decode_tp() -> None:
         )
         for rank in range(4)
     )
-    worker = PdWorkerConnector(
+    worker = PdPrefillWorkerConnector(
         fake_mla_config(tp_rank=2, tp_size=8),
         rdma=MockRdmaPort(),
     )
@@ -190,7 +190,7 @@ def test_p_worker_skips_non_representative_mla_prefill_rank() -> None:
         )
         for rank in range(4)
     )
-    worker = PdWorkerConnector(
+    worker = PdPrefillWorkerConnector(
         fake_mla_config(tp_rank=3, tp_size=8),
         rdma=MockRdmaPort(),
     )
@@ -328,8 +328,8 @@ def test_p_worker_prefill_tp_greater_than_decode_tp_registers_remote_head_slices
         layers=(decode_layer,),
     )
 
-    def build_worker(rank: int) -> PdWorkerConnector:
-        worker = PdWorkerConnector(
+    def build_worker(rank: int) -> PdPrefillWorkerConnector:
+        worker = PdPrefillWorkerConnector(
             SimpleNamespace(
                 kv_transfer_config=SimpleNamespace(engine_id="prefill"),
                 model_config=SimpleNamespace(
@@ -758,7 +758,7 @@ def test_pd_worker_builds_native_rdma_by_default_when_extension_exists(monkeypat
         parallel_config=SimpleNamespace(tensor_parallel_rank=0),
     )
 
-    worker = PdWorkerConnector(config)
+    worker = PdDecodeWorkerConnector(config)
     worker.register_kv_caches({"layer.0": tensor})
 
     assert isinstance(worker.rdma, RealRdmaPort)
@@ -793,7 +793,7 @@ def test_pd_worker_uses_runtime_tp_rank_for_rdma_rank_map(monkeypatch) -> None:
         parallel_config=SimpleNamespace(tensor_parallel_rank=0, tensor_parallel_size=8),
     )
 
-    worker = PdWorkerConnector(config)
+    worker = PdDecodeWorkerConnector(config)
     worker.register_kv_caches({"layer.0": tensor})
 
     assert FakeNativeRdmaEngineCtor.last_kwargs["domains"] == ["mlx5_2"]
@@ -818,7 +818,7 @@ def test_pd_worker_rejects_legacy_global_rdma_config(monkeypatch) -> None:
         parallel_config=SimpleNamespace(tensor_parallel_rank=0),
     )
 
-    worker = PdWorkerConnector(config)
+    worker = PdDecodeWorkerConnector(config)
     with pytest.raises(RuntimeError, match="legacy keys"):
         worker.register_kv_caches({"layer.0": tensor})
 

@@ -1,9 +1,4 @@
-"""Worker-side logic for the experimental P/D connector.
-
-PdWorkerConnector is the public facade. It composes:
-- DecodeHandler  (D side — receives KV via RDMA)
-- PrefillHandler (P side — pushes KV via RDMA)
-"""
+"""Worker-side logic for the experimental P/D connectors."""
 
 from __future__ import annotations
 
@@ -19,6 +14,7 @@ from pegaflow.logging_utils import get_connector_logger
 from pegaflow.pd_connector.decode_worker import DecodeHandler
 from pegaflow.pd_connector.layout import KvCacheLayout, layout_from_tensor
 from pegaflow.pd_connector.metadata import (
+    BlockIds,
     RELEASE_CONSUMER_ABORT,
     RELEASE_PRODUCER_PREEMPTED,
     LayerRemoteLayout,
@@ -32,7 +28,7 @@ from pegaflow.pd_connector.rdma import RdmaPort, build_rdma_port
 logger = get_connector_logger()
 
 
-class PdWorkerConnector:
+class PdWorkerBase:
     def __init__(
         self,
         vllm_config: Any,
@@ -47,6 +43,7 @@ class PdWorkerConnector:
         self.use_mla = model_uses_mla(vllm_config)
         self.logical_block_size = _logical_block_size(vllm_config)
         self._layer_specs = _layer_specs_from_config(kv_cache_config)
+        self._layer_group_indices = _layer_group_indices_from_config(kv_cache_config)
         self.rdma = rdma
         self._rdma_is_injected = rdma is not None
         self.engine_id = getattr(vllm_config.kv_transfer_config, "engine_id", None) or ""
@@ -281,6 +278,92 @@ class PdWorkerConnector:
         except ValueError as exc:
             raise AssertionError(f"unknown layer {layer_name}") from exc
 
+    def group_idx_for_layer(self, layer_name: str) -> int:
+        if not self._layer_group_indices:
+            return 0
+        try:
+            return self._layer_group_indices[layer_name]
+        except KeyError as exc:
+            raise AssertionError(f"unknown KV cache group for layer {layer_name}") from exc
+
+    def block_ids_for_layer(self, block_ids: BlockIds, layer_name: str) -> set[int]:
+        group_idx = self.group_idx_for_layer(layer_name)
+        if group_idx >= len(block_ids):
+            return set()
+        return set(block_ids[group_idx])
+
+
+class PdDecodeWorkerConnector(PdWorkerBase):
+    """Decode-side worker facade.
+
+    It reuses the existing worker initialization and decode handler while
+    intentionally ignoring producer push metadata and save callbacks.
+    """
+
+    def start_load_kv(
+        self,
+        metadata: PdConnectorMetadata,
+        forward_context: Any,
+        **kwargs: Any,
+    ) -> None:
+        decode_metadata = PdConnectorMetadata(
+            reqs_to_wait=metadata.reqs_to_wait,
+            reqs_to_release=metadata.reqs_to_release,
+            release_reasons=metadata.release_reasons,
+        )
+        super().start_load_kv(decode_metadata, forward_context, **kwargs)
+
+    def save_kv_layer(
+        self,
+        layer_name: str,
+        kv_layer: Any,
+        attn_metadata: Any,
+        **kwargs: Any,
+    ) -> None:
+        return None
+
+    def wait_for_save(self) -> None:
+        return None
+
+    def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str] | None, set[str] | None]:
+        sending, recving = super().get_finished(finished_req_ids)
+        return None, recving
+
+
+class PdPrefillWorkerConnector(PdWorkerBase):
+    """Prefill-side worker facade.
+
+    It reuses the existing worker initialization and prefill handler while
+    intentionally ignoring consumer wait metadata and load callbacks.
+    """
+
+    def start_load_kv(
+        self,
+        metadata: PdConnectorMetadata,
+        forward_context: Any,
+        **kwargs: Any,
+    ) -> None:
+        prefill_metadata = PdConnectorMetadata(
+            reqs_to_push=metadata.reqs_to_push,
+            reqs_to_release=metadata.reqs_to_release,
+            release_reasons=metadata.release_reasons,
+            preempted_req_ids=metadata.preempted_req_ids,
+        )
+        super().start_load_kv(prefill_metadata, forward_context, **kwargs)
+
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        return None
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        return set()
+
+    def build_connector_worker_meta(self) -> PdWorkerMetadata | None:
+        return None
+
+    def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str] | None, set[str] | None]:
+        sending, recving = super().get_finished(finished_req_ids)
+        return sending, None
+
 
 # ---------------------------------------------------------------------------
 # Module-level helpers (kept here so monkeypatching worker_mod.X still works)
@@ -332,6 +415,16 @@ def _layer_specs_from_config(kv_cache_config: Any) -> dict[str, Any]:
     return {
         layer_name: group.kv_cache_spec
         for group in kv_cache_config.kv_cache_groups
+        for layer_name in group.layer_names
+    }
+
+
+def _layer_group_indices_from_config(kv_cache_config: Any) -> dict[str, int]:
+    if kv_cache_config is None:
+        return {}
+    return {
+        layer_name: group_idx
+        for group_idx, group in enumerate(kv_cache_config.kv_cache_groups)
         for layer_name in group.layer_names
     }
 
