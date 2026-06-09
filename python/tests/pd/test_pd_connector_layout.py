@@ -122,6 +122,51 @@ def test_pd_connectors_allow_mtp_layout() -> None:
     PdPrefillConnector(fake_mtp_config(), KVConnectorRole.WORKER)
 
 
+def test_legacy_pd_connector_selects_decode_by_engine_id() -> None:
+    config = fake_mtp_config()
+    config.kv_transfer_config.engine_id = "d0"
+
+    connector = PdConnector(config, KVConnectorRole.WORKER)
+
+    assert isinstance(connector._delegate, PdDecodeConnector)
+
+
+def test_legacy_pd_connector_selects_prefill_by_engine_id() -> None:
+    config = fake_mtp_config()
+    config.kv_transfer_config.engine_id = "p0"
+
+    connector = PdConnector(config, KVConnectorRole.WORKER)
+
+    assert isinstance(connector._delegate, PdPrefillConnector)
+
+
+def test_legacy_pd_connector_forwards_bound_metadata() -> None:
+    config = fake_mtp_config()
+    config.kv_transfer_config.engine_id = "d0"
+    connector = PdConnector(config, KVConnectorRole.WORKER)
+    metadata = PdConnectorMetadata()
+
+    connector.bind_connector_metadata(metadata)
+
+    assert connector._connector_metadata is metadata
+    assert connector._delegate._connector_metadata is metadata
+
+    connector.clear_connector_metadata()
+
+    assert connector._connector_metadata is None
+    assert connector._delegate._connector_metadata is None
+
+
+def test_legacy_pd_connector_preserves_piecewise_default_for_prefill() -> None:
+    assert PdConnector.requires_piecewise_for_cudagraph({}) is True
+    assert (
+        PdConnector.requires_piecewise_for_cudagraph(
+            {"pegaflow.pd.allow_full_decode_cudagraph": True}
+        )
+        is False
+    )
+
+
 def test_vllm_plugin_registers_split_pd_connectors(monkeypatch) -> None:
     import sys
 
@@ -143,6 +188,11 @@ def test_vllm_plugin_registers_split_pd_connectors(monkeypatch) -> None:
     vllm_plugin.register()
 
     assert (
+        "PdConnector",
+        "pegaflow.pd_connector",
+        "PdConnector",
+    ) in registered
+    assert (
         "PdDecodeConnector",
         "pegaflow.pd_connector",
         "PdDecodeConnector",
@@ -152,7 +202,6 @@ def test_vllm_plugin_registers_split_pd_connectors(monkeypatch) -> None:
         "pegaflow.pd_connector",
         "PdPrefillConnector",
     ) in registered
-    assert all(name != "PdConnector" for name, _module, _class_name in registered)
 
 
 def test_pd_worker_rejects_mla_physical_logical_block_split() -> None:

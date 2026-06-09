@@ -27,6 +27,12 @@ def register() -> None:
         )
     with contextlib.suppress(ValueError):
         KVConnectorFactory.register_connector(
+            "PdConnector",
+            "pegaflow.pd_connector",
+            "PdConnector",
+        )
+    with contextlib.suppress(ValueError):
+        KVConnectorFactory.register_connector(
             "PdDecodeConnector",
             "pegaflow.pd_connector",
             "PdDecodeConnector",
