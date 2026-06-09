@@ -122,6 +122,39 @@ def test_pd_connectors_allow_mtp_layout() -> None:
     PdPrefillConnector(fake_mtp_config(), KVConnectorRole.WORKER)
 
 
+def test_vllm_plugin_registers_split_pd_connectors(monkeypatch) -> None:
+    import sys
+
+    import pegaflow.vllm_plugin as vllm_plugin
+
+    registered = []
+
+    class FakeFactory:
+        @staticmethod
+        def register_connector(name: str, module: str, class_name: str) -> None:
+            registered.append((name, module, class_name))
+
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.distributed.kv_transfer.kv_connector.factory",
+        SimpleNamespace(KVConnectorFactory=FakeFactory),
+    )
+
+    vllm_plugin.register()
+
+    assert (
+        "PdDecodeConnector",
+        "pegaflow.pd_connector",
+        "PdDecodeConnector",
+    ) in registered
+    assert (
+        "PdPrefillConnector",
+        "pegaflow.pd_connector",
+        "PdPrefillConnector",
+    ) in registered
+    assert all(name != "PdConnector" for name, _module, _class_name in registered)
+
+
 def test_pd_worker_rejects_mla_physical_logical_block_split() -> None:
     tensor = FakeTensor(
         shape=(8, 32, 128),
