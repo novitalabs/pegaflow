@@ -32,6 +32,10 @@ if TYPE_CHECKING:
 class PdDecodeConnector(PdConnectorClassMixin, KVConnectorBase_V1, SupportsHMA):
     """Decode-side vLLM connector for P/D RDMA push."""
 
+    @classmethod
+    def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
+        return False
+
     def __init__(self, vllm_config: Any, role: KVConnectorRole, kv_cache_config: Any = None):
         super().__init__(vllm_config, role, kv_cache_config)
         assert_supported_config(vllm_config)
