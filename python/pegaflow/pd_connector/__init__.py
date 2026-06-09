@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorRole,
@@ -25,6 +24,9 @@ from pegaflow.pd_connector.worker import (
     PdDecodeWorkerConnector,
     PdPrefillWorkerConnector,
 )
+
+if TYPE_CHECKING:
+    import torch
 
 
 class PdDecodeConnector(KVConnectorBase_V1, SupportsHMA, PdConnectorClassMixin):
@@ -47,7 +49,7 @@ class PdDecodeConnector(KVConnectorBase_V1, SupportsHMA, PdConnectorClassMixin):
         else:
             raise ValueError(f"unsupported KV connector role: {role}")
 
-    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
+    def register_kv_caches(self, kv_caches: dict[str, Any]) -> None:
         if self._worker is not None:
             self._worker.register_kv_caches(kv_caches)
 
@@ -65,7 +67,7 @@ class PdDecodeConnector(KVConnectorBase_V1, SupportsHMA, PdConnectorClassMixin):
     def save_kv_layer(
         self,
         layer_name: str,
-        kv_layer: torch.Tensor,
+        kv_layer: Any,
         attn_metadata: Any,
         **kwargs: Any,
     ) -> None:
@@ -157,7 +159,7 @@ class PdPrefillConnector(KVConnectorBase_V1, SupportsHMA, PdConnectorClassMixin)
         else:
             raise ValueError(f"unsupported KV connector role: {role}")
 
-    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
+    def register_kv_caches(self, kv_caches: dict[str, Any]) -> None:
         if self._worker is not None:
             self._worker.register_kv_caches(kv_caches)
 
@@ -174,7 +176,7 @@ class PdPrefillConnector(KVConnectorBase_V1, SupportsHMA, PdConnectorClassMixin)
     def save_kv_layer(
         self,
         layer_name: str,
-        kv_layer: torch.Tensor,
+        kv_layer: Any,
         attn_metadata: Any,
         **kwargs: Any,
     ) -> None:
