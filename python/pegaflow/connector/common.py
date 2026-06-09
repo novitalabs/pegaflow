@@ -47,6 +47,8 @@ class ConnectorContext:
     instance_id: str
     namespace: str
     block_size: int
+    # Size of the flattened KV-layer id space (>= num_hidden_layers; e.g. doubled
+    # for DeepSeek-V3.2 where each layer owns a main + an indexer cache).
     num_layers: int
     tp_size: int
     world_size: int
