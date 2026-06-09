@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+# ruff: noqa: F403,F405,I001
+from .pd_connector_test_utils import *
+
 from pegaflow.pd_connector.layout_mapping import (
     HeadSlice,
     build_push_layout_plan,
     decode_rank_source_counts,
 )
-
-# ruff: noqa: F403,F405,I001
-from .pd_connector_test_utils import *
 
 
 def test_flash_attn_hnd_layout_offsets() -> None:
