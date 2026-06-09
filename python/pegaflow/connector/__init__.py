@@ -33,7 +33,7 @@ from pegaflow.connector.worker import WorkerConnector
 from pegaflow.pegaflow import EngineRpcClient
 
 
-def _build_layer_id_space(kv_cache_config, num_hidden_layers: int) -> tuple[dict[str, int], int]:
+def _build_layer_id_space(kv_cache_config, num_model_layers: int) -> tuple[dict[str, int], int]:
     """Map each KV-cache layer name to a globally unique, role-independent id.
 
     The id and the total layer count must be identical on every process that
@@ -51,14 +51,18 @@ def _build_layer_id_space(kv_cache_config, num_hidden_layers: int) -> tuple[dict
     vLLM coalesces them into a single kv-cache group, so a group ordinal cannot
     tell them apart. We give each cache that shares an index a stable intra-layer
     ordinal (its rank among those names in sorted order) and lay the space out as
-    ``index * caches_per_layer + ordinal`` over ``[0, num_hidden_layers *
-    caches_per_layer)``. For a conventional one-cache-per-layer model this reduces
-    to the in-model index, so previously stored caches stay addressable. An
+    ``index * caches_per_layer + ordinal`` over ``[0, num_model_layers *
+    caches_per_layer)``, where ``num_model_layers`` counts every attention layer
+    that owns a KV cache -- the ``num_hidden_layers`` main layers plus any
+    speculative MTP / next-n predictor layers, whose in-model index continues past
+    ``num_hidden_layers`` (e.g. GLM-5.1's MTP layer is ``model.layers.78`` when
+    ``num_hidden_layers`` is 78). For a conventional one-cache-per-layer model this
+    reduces to the in-model index, so previously stored caches stay addressable. An
     unparsable layer name is a genuinely unsupported topology and raises here
     rather than being papered over with an invented id.
     """
     if kv_cache_config is None:
-        return {}, num_hidden_layers
+        return {}, num_model_layers
 
     names_by_index: dict[int, list[str]] = {}
     for group in kv_cache_config.kv_cache_groups:
@@ -71,7 +75,7 @@ def _build_layer_id_space(kv_cache_config, num_hidden_layers: int) -> tuple[dict
         for ordinal, name in enumerate(sorted(names)):
             layer_id_by_name[name] = index * caches_per_layer + ordinal
 
-    return layer_id_by_name, num_hidden_layers * caches_per_layer
+    return layer_id_by_name, num_model_layers * caches_per_layer
 
 
 class PegaKVConnector(KVConnectorBase_V1):
@@ -109,12 +113,19 @@ class PegaKVConnector(KVConnectorBase_V1):
             pcp_world_size,
             cross_layer_blocks=cross_layer_blocks,
         )
-        num_hidden_layers = getattr(vllm_config.model_config.hf_text_config, "num_hidden_layers", 0)
+        hf_text_config = vllm_config.model_config.hf_text_config
+        num_hidden_layers = getattr(hf_text_config, "num_hidden_layers", 0)
+        # Speculative MTP / next-n predictor layers register their own KV caches at
+        # in-model indices that continue past num_hidden_layers (vLLM places them at
+        # model.layers.{num_hidden_layers + i}); count them so their canonical id
+        # stays inside num_layers instead of overflowing it.
+        num_nextn_layers = getattr(hf_text_config, "num_nextn_predict_layers", 0) or 0
+        num_model_layers = num_hidden_layers + num_nextn_layers
         block_size = vllm_config.cache_config.block_size
         # `num_layers` is the flattened KV-layer id space the engine stores into,
-        # which is wider than num_hidden_layers when a layer owns several caches
+        # which is wider than num_model_layers when a layer owns several caches
         # (e.g. DeepSeek-V3.2 main attention + sparse indexer).
-        layer_id_by_name, num_layers = _build_layer_id_space(kv_cache_config, num_hidden_layers)
+        layer_id_by_name, num_layers = _build_layer_id_space(kv_cache_config, num_model_layers)
 
         tp_rank: int | None = None
         device_id: int | None = None
