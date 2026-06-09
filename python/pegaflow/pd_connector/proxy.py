@@ -20,8 +20,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import TracebackType
 from typing import Any, Protocol
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 
 import httpx
 
@@ -253,6 +252,8 @@ def build_pd_proxy_request(
 class PdProxy:
     def __init__(self, config: ProxyConfig) -> None:
         self.config = config
+        self._client: httpx.Client | None = None
+        self._client_lock = threading.Lock()
         self._stream_client: httpx.Client | None = None
         self._stream_client_lock = threading.Lock()
 
@@ -278,6 +279,7 @@ class PdProxy:
                 self.config.timeout_s,
                 req.request_id,
                 "D",
+                client=self._get_client(),
             )
             end_ts_ns = time.time_ns()
             self.config.metrics.finish_request(
@@ -349,11 +351,25 @@ class PdProxy:
             raise
 
     def close(self) -> None:
-        with self._stream_client_lock:
-            client = self._stream_client
-            self._stream_client = None
+        with self._client_lock:
+            client = self._client
+            self._client = None
         if client is not None:
             client.close()
+        with self._stream_client_lock:
+            stream_client = self._stream_client
+            self._stream_client = None
+        if stream_client is not None:
+            stream_client.close()
+
+    def _get_client(self) -> httpx.Client:
+        with self._client_lock:
+            if self._client is None:
+                self._client = httpx.Client(
+                    timeout=self.config.timeout_s,
+                    limits=httpx.Limits(max_connections=None, max_keepalive_connections=None),
+                )
+            return self._client
 
     def _get_stream_client(self) -> httpx.Client:
         with self._stream_client_lock:
@@ -371,6 +387,8 @@ def _post_json(
     timeout_s: float,
     request_id: str,
     role: str,
+    *,
+    client: httpx.Client | None = None,
 ) -> tuple[int, bytes, str]:
     payload = json.dumps(body, separators=(",", ":")).encode()
     logger.info(
@@ -381,38 +399,43 @@ def _post_json(
         len(payload),
         body.get("kv_transfer_params"),
     )
-    request = Request(
-        url,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+    owns_client = client is None
     try:
-        with urlopen(request, timeout=timeout_s) as response:
-            response_body = response.read()
-            return (
-                int(response.status),
-                response_body,
-                response.headers.get("Content-Type", "application/json"),
+        if client is None:
+            client = httpx.Client(
+                timeout=timeout_s,
+                limits=httpx.Limits(max_connections=None, max_keepalive_connections=None),
             )
-    except HTTPError as exc:
-        response_body = exc.read()
-        logger.error(
-            "[PdProxy] request=%s %s returned status=%s body=%s",
-            request_id,
-            role,
-            exc.code,
-            response_body[:512],
+        response = client.post(
+            url,
+            content=payload,
+            headers={"Content-Type": "application/json"},
         )
-        return int(exc.code), response_body, exc.headers.get("Content-Type", "application/json")
-    except URLError:
-        logger.exception(
+    except httpx.RequestError:
+        logger.error(
             "[PdProxy] request=%s %s connection failed url=%s",
             request_id,
             role,
             url,
         )
         raise
+    finally:
+        if owns_client and client is not None:
+            client.close()
+    response_body = response.content
+    if response.status_code >= 400:
+        logger.error(
+            "[PdProxy] request=%s %s returned status=%s body=%s",
+            request_id,
+            role,
+            response.status_code,
+            response_body[:512],
+        )
+    return (
+        int(response.status_code),
+        response_body,
+        response.headers.get("Content-Type", "application/json"),
+    )
 
 
 def _open_json(

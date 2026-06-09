@@ -206,6 +206,55 @@ def test_pd_proxy_counts_non_stream_decode_http_errors(monkeypatch) -> None:
     assert metrics["error_count"] == 1
 
 
+def test_pd_proxy_reuses_non_stream_http_client(monkeypatch) -> None:
+    from pegaflow.pd_connector import proxy as proxy_mod
+
+    class FakeResponse:
+        status_code = 200
+        content = b'{"text":"ok"}'
+        headers = {"Content-Type": "application/json"}
+
+    class FakeClient:
+        created = 0
+        closed = 0
+
+        def __init__(self, **_kwargs) -> None:
+            type(self).created += 1
+
+        def post(self, *_args, **_kwargs):
+            return FakeResponse()
+
+        def close(self) -> None:
+            type(self).closed += 1
+
+    monkeypatch.setattr(proxy_mod.httpx, "Client", FakeClient)
+    config = ProxyConfig(
+        prefill_url="http://p0:8000",
+        decode_url="http://d0:8000",
+        timeout_s=1.0,
+        prefill_max_tokens=1,
+    )
+    proxy = proxy_mod.PdProxy(config)
+
+    first = proxy.handle_openai_request(
+        "/v1/completions",
+        {"request_id": "req-1", "model": "model", "prompt": "hello"},
+    )
+    second = proxy.handle_openai_request(
+        "/v1/completions",
+        {"request_id": "req-2", "model": "model", "prompt": "world"},
+    )
+
+    assert first[0] == HTTPStatus.OK
+    assert second[0] == HTTPStatus.OK
+    assert FakeClient.created == 1
+    assert FakeClient.closed == 0
+
+    proxy.close()
+
+    assert FakeClient.closed == 1
+
+
 def test_pd_proxy_unsupported_stream_does_not_record_decode_duration() -> None:
     from pegaflow.pd_connector import proxy as proxy_mod
 
