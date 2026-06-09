@@ -2448,6 +2448,82 @@ def test_p_worker_advances_remote_blocks_across_chunk_prefill() -> None:
     assert worker.get_finished({"prefill-r0"})[0] == {"prefill-r0"}
 
 
+def test_p_worker_trims_extra_prefill_blocks_beyond_decode_handshake() -> None:
+    tensor = FakeTensor(
+        shape=(2, 32, 16, 4, 32),
+        stride=(32 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
+    )
+    rdma = MockRdmaPort()
+    worker = PdPrefillWorkerConnector(
+        SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(engine_id="prefill"),
+            parallel_config=SimpleNamespace(tensor_parallel_rank=0, tensor_parallel_size=1),
+        ),
+        rdma=rdma,
+    )
+    worker.register_kv_caches({"layer.0": tensor})
+    handshake = PdHandshake(
+        request_id="decode",
+        engine_id="decode",
+        tp_rank=0,
+        tp_size=1,
+        block_size=16,
+        layers=(
+            hnd_remote_layer(
+                block_ids=tuple(range(68, 96)),
+                block_len=4096,
+            ),
+        ),
+    )
+
+    worker.start_load_kv(
+        PdConnectorMetadata(
+            reqs_to_push={
+                "prefill-r0": PushReqMeta(
+                    local_block_ids=(list(range(3, 11)),),
+                    target_request_id="decode",
+                    handshakes=(handshake,),
+                )
+            }
+        ),
+        None,
+    )
+    worker.save_kv_layer(
+        "layer.0",
+        tensor,
+        SimpleNamespace(slot_mapping=FakeSlotMapping([block * 16 for block in range(3, 11)])),
+    )
+    worker.wait_for_save()
+    drain_pd_pushes(worker)
+
+    assert worker.get_finished(set())[0] is None
+
+    worker.start_load_kv(
+        PdConnectorMetadata(
+            reqs_to_push={
+                "prefill-r0": PushReqMeta(
+                    local_block_ids=(list(range(11, 32)),),
+                    target_request_id="decode",
+                    handshakes=(handshake,),
+                )
+            }
+        ),
+        None,
+    )
+    worker.save_kv_layer(
+        "layer.0",
+        tensor,
+        SimpleNamespace(slot_mapping=FakeSlotMapping([block * 16 for block in range(11, 32)])),
+    )
+    worker.wait_for_save()
+    drain_pd_pushes(worker)
+
+    second_push = rdma.pushed_layers["prefill-r0"][1][1]
+    assert [block.regions[0].block_id for block in second_push] == [76]
+    assert second_push[0].regions[0].bytes == tensor.stride()[1] * tensor.element_size() * 20
+    assert worker.get_finished({"prefill-r0"})[0] == {"prefill-r0"}
+
+
 def test_pd_proxy_only_sends_decode_request_with_prefill_hint() -> None:
     config = ProxyConfig(
         prefill_url="http://127.0.0.1:8001",

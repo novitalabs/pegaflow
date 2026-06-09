@@ -301,18 +301,18 @@ class PrefillHandler:
                 self._push_chunk_maps[chunk_key] = (target_maps, all_chunks_seen)
             assert self._w.rdma is not None
             rdma_bytes = 0
+            pushed_req_blocks: set[int] = set()
             physical_req_ids = self._logical_to_physical[req_id]
             for physical_req_id, target in zip(physical_req_ids, plan.targets, strict=True):
                 remote_block_ids = target_maps[physical_req_id]
-                assert req_blocks.issubset(remote_block_ids), (
-                    "PdConnector selected blocks must match the current registered push chunk; "
-                    f"req={req_id} physical_req={physical_req_id} selected={sorted(req_blocks)} "
-                    f"mapped={sorted(remote_block_ids)}"
-                )
+                if not remote_block_ids:
+                    continue
+                target_req_blocks = set(remote_block_ids)
+                pushed_req_blocks.update(target_req_blocks)
                 block_slices = _target_block_ranges_for_remote_write(
                     layout,
                     target,
-                    req_blocks,
+                    target_req_blocks,
                     remote_block_ids,
                 )
                 rdma_bytes += block_slices_bytes(block_slices)
@@ -326,7 +326,7 @@ class PrefillHandler:
                     )
                 )
             trace.rdma_bytes += rdma_bytes
-            self._tracker.mark_blocks_pushed(req_id, layer_idx, req_blocks)
+            self._tracker.mark_blocks_pushed(req_id, layer_idx, pushed_req_blocks)
             if layer_idx != len(self._w.layer_names) - 1:
                 continue
             trace.chunk_count += 1
@@ -342,7 +342,7 @@ class PrefillHandler:
                 req_id,
                 self._block_ids_by_layer(req.local_block_ids),
                 num_layers=len(self._w.layer_names),
-            )
+            ) or all_layer_chunks_seen
             if not (chunk_complete and all_layer_chunks_seen):
                 logger.info(
                     "[PdConnector] P chunk req=%s target_req=%s chunk=%d blocks=%d forward_ms=%.3f",
@@ -667,11 +667,10 @@ def _remote_block_id_map_for_handshake(
         return dict(zip(ordered_local, remote_block_ids, strict=True)), True
 
     offset = remote_block_offsets.get(offset_key, 0)
-    next_offset = offset + len(ordered_local)
-    assert next_offset <= len(remote_block_ids), (
-        "PdConnector P/D block count mismatch "
-        f"offset={offset} local_blocks={ordered_local} remote_blocks={list(remote_block_ids)}"
-    )
+    if offset >= len(remote_block_ids):
+        return {}, True
+    next_offset = min(offset + len(ordered_local), len(remote_block_ids))
+    ordered_local = ordered_local[: next_offset - offset]
     remote_chunk = remote_block_ids[offset:next_offset]
     remote_block_offsets[offset_key] = next_offset
     return dict(zip(ordered_local, remote_chunk, strict=True)), next_offset == len(remote_block_ids)
