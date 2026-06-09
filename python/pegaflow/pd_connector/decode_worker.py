@@ -63,8 +63,16 @@ class DecodeHandler:
             if worker.rdma is not None
             else None
         )
+        prefill_sender_worker_count = int(
+            extra_config_value(
+                worker.vllm_config,
+                "pegaflow.pd.prefill_sender_worker_count",
+                3,
+            )
+        )
         self._prefill_sender = prefill_sender or AsyncPrefillSender(
-            failure_callback=self._mark_prefill_failed
+            worker_count=prefill_sender_worker_count,
+            failure_callback=self._mark_prefill_failed,
         )
 
     def init_rdma_waiter(self) -> None:

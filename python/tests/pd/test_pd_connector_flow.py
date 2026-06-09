@@ -255,6 +255,91 @@ def test_pd_proxy_reuses_non_stream_http_client(monkeypatch) -> None:
     assert FakeClient.closed == 1
 
 
+def test_pd_proxy_warms_decode_connections_with_non_stream_client(monkeypatch) -> None:
+    from pegaflow.pd_connector import proxy as proxy_mod
+
+    class FakeResponse:
+        status_code = 200
+        content = b"ok"
+        headers = {"Content-Type": "text/plain"}
+
+    class FakeClient:
+        created = 0
+        gets: list[str] = []
+        posts: list[str] = []
+
+        def __init__(self, **_kwargs) -> None:
+            type(self).created += 1
+
+        def get(self, url, **_kwargs):
+            type(self).gets.append(url)
+            return FakeResponse()
+
+        def post(self, url, **_kwargs):
+            type(self).posts.append(url)
+            return FakeResponse()
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(proxy_mod.httpx, "Client", FakeClient)
+    config = ProxyConfig(
+        prefill_url="http://p0:8000",
+        decode_url="http://d0:8000/",
+        timeout_s=1.0,
+        prefill_max_tokens=1,
+    )
+    proxy = proxy_mod.PdProxy(config)
+
+    proxy.warmup_decode_connections(connection_count=3)
+    status, _payload, _content_type = proxy.handle_openai_request(
+        "/v1/completions",
+        {"request_id": "req-1", "model": "model", "prompt": "hello"},
+    )
+
+    assert status == HTTPStatus.OK
+    assert FakeClient.created == 2
+    assert FakeClient.gets == ["http://d0:8000/health"] * 6
+    assert FakeClient.posts == ["http://d0:8000/v1/completions"]
+
+
+def test_pd_proxy_warms_decode_connections_with_stream_client(monkeypatch) -> None:
+    from pegaflow.pd_connector import proxy as proxy_mod
+
+    class FakeResponse:
+        status_code = 200
+        content = b"ok"
+        headers = {"Content-Type": "text/plain"}
+
+    class FakeClient:
+        created = 0
+        gets: list[str] = []
+
+        def __init__(self, **_kwargs) -> None:
+            type(self).created += 1
+
+        def get(self, url, **_kwargs):
+            type(self).gets.append(url)
+            return FakeResponse()
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(proxy_mod.httpx, "Client", FakeClient)
+    config = ProxyConfig(
+        prefill_url="http://p0:8000",
+        decode_url="http://d0:8000",
+        timeout_s=1.0,
+        prefill_max_tokens=1,
+    )
+    proxy = proxy_mod.PdProxy(config)
+
+    proxy.warmup_decode_connections(connection_count=2)
+
+    assert FakeClient.created == 2
+    assert FakeClient.gets == ["http://d0:8000/health"] * 4
+
+
 def test_pd_proxy_unsupported_stream_does_not_record_decode_duration() -> None:
     from pegaflow.pd_connector import proxy as proxy_mod
 
@@ -816,6 +901,57 @@ def test_d_worker_release_cancels_remote_prefill_request() -> None:
     )
 
     assert prefill_sender.cancelled == ["prefill-1"]
+
+
+def test_decode_worker_prefill_sender_worker_count_comes_from_extra_config(monkeypatch) -> None:
+    created_worker_counts: list[int] = []
+
+    class FakeAsyncPrefillSender:
+        def __init__(self, *, worker_count=16, failure_callback=None) -> None:
+            created_worker_counts.append(worker_count)
+            self.failure_callback = failure_callback
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(decode_worker_mod, "AsyncPrefillSender", FakeAsyncPrefillSender)
+    vllm_config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            engine_id="decode",
+            get_from_extra_config=lambda key, default=None: {
+                "pegaflow.pd.prefill_sender_worker_count": 4,
+            }.get(key, default),
+        ),
+        parallel_config=SimpleNamespace(tensor_parallel_rank=0, tensor_parallel_size=1),
+    )
+
+    worker = PdDecodeWorkerConnector(vllm_config, rdma=MockRdmaPort())
+
+    assert created_worker_counts == [4]
+    worker.shutdown()
+
+
+def test_decode_worker_prefill_sender_worker_count_defaults_to_three(monkeypatch) -> None:
+    created_worker_counts: list[int] = []
+
+    class FakeAsyncPrefillSender:
+        def __init__(self, *, worker_count=16, failure_callback=None) -> None:
+            created_worker_counts.append(worker_count)
+            self.failure_callback = failure_callback
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(decode_worker_mod, "AsyncPrefillSender", FakeAsyncPrefillSender)
+    vllm_config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(engine_id="decode"),
+        parallel_config=SimpleNamespace(tensor_parallel_rank=0, tensor_parallel_size=1),
+    )
+
+    worker = PdDecodeWorkerConnector(vllm_config, rdma=MockRdmaPort())
+
+    assert created_worker_counts == [3]
+    worker.shutdown()
 
 
 def test_d_worker_prefill_failure_reports_load_error(monkeypatch) -> None:

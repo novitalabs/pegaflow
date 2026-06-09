@@ -10,6 +10,7 @@ notification from P.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import threading
@@ -362,6 +363,45 @@ class PdProxy:
         if stream_client is not None:
             stream_client.close()
 
+    def warmup_decode_connections(self, *, connection_count: int = 8) -> None:
+        if connection_count <= 0:
+            return
+        decode_urls = self._decode_warmup_urls()
+        warmup_timeout_s = min(self.config.timeout_s, 2.0)
+
+        def warmup_one(client: httpx.Client, health_url: str) -> None:
+            try:
+                response = client.get(health_url, timeout=warmup_timeout_s)
+            except httpx.RequestError:
+                logger.warning(
+                    "[PdProxy] decode warmup connection failed url=%s",
+                    health_url,
+                    exc_info=True,
+                )
+                return
+            logger.info(
+                "[PdProxy] decode warmup url=%s status=%s",
+                health_url,
+                response.status_code,
+            )
+
+        health_urls = [
+            decode_url.rstrip("/") + "/health"
+            for decode_url in decode_urls
+            for _ in range(connection_count)
+        ]
+        clients = (self._get_client(), self._get_stream_client())
+        warmups = [(client, health_url) for client in clients for health_url in health_urls]
+        max_workers = min(len(warmups), connection_count * len(clients))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            list(executor.map(lambda args: warmup_one(*args), warmups))
+
+    def _decode_warmup_urls(self) -> tuple[str, ...]:
+        router = self.config.router
+        if isinstance(router, RoundRobinPairRouter):
+            return tuple(endpoint.url for endpoint in router._decode_endpoints)
+        return (self.config.decode_url,)
+
     def _get_client(self) -> httpx.Client:
         with self._client_lock:
             if self._client is None:
@@ -694,6 +734,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--routing-policy", choices=["round_robin"], default="round_robin")
     parser.add_argument("--timeout-s", type=float, default=600.0)
     parser.add_argument("--prefill-max-tokens", type=int, default=1)
+    parser.add_argument("--decode-warmup-connections", type=int, default=8)
     parser.add_argument("--log-file")
     args = parser.parse_args(argv)
 
@@ -721,6 +762,7 @@ def main(argv: list[str] | None = None) -> None:
         router=router,
     )
     proxy = PdProxy(config)
+    proxy.warmup_decode_connections(connection_count=args.decode_warmup_connections)
     server = _PdHttpServer((args.listen_host, args.listen_port), proxy)
     logger.info(
         "[PdProxy] listening http://%s:%d policy=%s prefill=%s decode=%s",
