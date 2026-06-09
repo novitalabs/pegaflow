@@ -98,7 +98,7 @@ pub(crate) fn segment_offset(
     }
 
     let base = block_idx
-        .checked_mul(registration.bytes_per_block)
+        .checked_mul(registration.block_stride_bytes)
         .ok_or_else(|| "Block offset overflow".to_string())?;
 
     let segment_offset = segment_idx

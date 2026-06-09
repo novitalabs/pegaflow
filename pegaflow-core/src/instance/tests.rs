@@ -9,6 +9,49 @@ fn registration_valid() {
 }
 
 #[test]
+fn block_stride_decouples_step_from_copy_size() {
+    use crate::transfer::segment_offset;
+
+    let bytes_per_block = 4096 * 2;
+    let page_stride_bytes = 8192 * 2;
+    let num_blocks = 8;
+    let size_bytes = num_blocks * page_stride_bytes;
+
+    let reg = KVCacheRegistration::new(0x10000, size_bytes, num_blocks, bytes_per_block, 0, 1)
+        .unwrap()
+        .with_block_stride(page_stride_bytes)
+        .unwrap();
+
+    assert_eq!(reg.block_stride_bytes, page_stride_bytes);
+    assert_eq!(segment_offset(&reg, 0, 0).unwrap(), 0);
+    assert_eq!(segment_offset(&reg, 3, 0).unwrap(), 3 * page_stride_bytes);
+    assert_eq!(segment_offset(&reg, 7, 0).unwrap(), 7 * page_stride_bytes);
+}
+
+#[test]
+fn block_stride_defaults_to_dense_and_validates() {
+    use crate::transfer::segment_offset;
+
+    let reg = KVCacheRegistration::new(0x1000, 1024 * 1024, 100, 1024, 0, 1).unwrap();
+    assert_eq!(reg.block_stride_bytes, 1024);
+    assert_eq!(segment_offset(&reg, 5, 0).unwrap(), 5 * 1024);
+
+    assert!(
+        KVCacheRegistration::new(0x1000, 1024 * 1024, 100, 1024, 0, 1)
+            .unwrap()
+            .with_block_stride(512)
+            .is_err()
+    );
+
+    assert!(
+        KVCacheRegistration::new(0x1000, 8 * 1024, 8, 1024, 0, 1)
+            .unwrap()
+            .with_block_stride(4096)
+            .is_err()
+    );
+}
+
+#[test]
 fn registration_null_pointer_rejected() {
     assert!(KVCacheRegistration::new(0, 1024, 10, 64, 0, 1).is_err());
 }

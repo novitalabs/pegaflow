@@ -46,6 +46,12 @@ pub struct KVCacheRegistration {
     /// Used for CUDA memcpy sizes and GPU offset calculations.
     pub bytes_per_block: usize,
 
+    /// Byte stride between a layer's consecutive blocks. Defaults to
+    /// `bytes_per_block` (dense layer-first); override via
+    /// [`KVCacheRegistration::with_block_stride`] when the step exceeds the
+    /// per-block copy size.
+    pub block_stride_bytes: usize,
+
     /// Actual GPU-side total block size (`bytes_per_block * segments`).
     pub block_size_bytes: usize,
 
@@ -98,9 +104,43 @@ impl KVCacheRegistration {
             .checked_mul(segments)
             .ok_or_else(|| "block_size_bytes overflow".to_string())?;
 
-        // Validate memory layout doesn't overflow the buffer
+        // Default: dense layer-first layout — block step equals the copied size.
+        let block_stride_bytes = bytes_per_block;
+        Self::check_layout_bounds(
+            num_blocks,
+            block_stride_bytes,
+            bytes_per_block,
+            kv_stride_bytes,
+            segments,
+            size_bytes,
+        )?;
+
+        Ok(Self {
+            data_ptr,
+            size_bytes,
+            num_blocks,
+            bytes_per_block,
+            block_stride_bytes,
+            block_size_bytes,
+            kv_stride_bytes,
+            segments,
+            padded_bytes_per_block: bytes_per_block,
+            padded_block_size_bytes: block_size_bytes,
+        })
+    }
+
+    /// Validate that `num_blocks` blocks, stepped by `block_stride` and reaching
+    /// `bytes_per_block` past the last segment, fit within `size_bytes`.
+    fn check_layout_bounds(
+        num_blocks: usize,
+        block_stride: usize,
+        bytes_per_block: usize,
+        kv_stride_bytes: usize,
+        segments: usize,
+        size_bytes: usize,
+    ) -> Result<(), String> {
         let max_block_offset = (num_blocks - 1)
-            .checked_mul(bytes_per_block)
+            .checked_mul(block_stride)
             .and_then(|o| o.checked_add((segments - 1).checked_mul(kv_stride_bytes)?))
             .ok_or_else(|| "memory layout overflow".to_string())?;
 
@@ -114,18 +154,35 @@ impl KVCacheRegistration {
                 end, size_bytes
             ));
         }
+        Ok(())
+    }
 
-        Ok(Self {
-            data_ptr,
-            size_bytes,
-            num_blocks,
-            bytes_per_block,
-            block_size_bytes,
-            kv_stride_bytes,
-            segments,
-            padded_bytes_per_block: bytes_per_block,
-            padded_block_size_bytes: block_size_bytes,
-        })
+    /// Override the per-block stride for a non-contiguous per-layer view — e.g.
+    /// one layer's blocks inside a fused buffer holding all layers per block,
+    /// where consecutive blocks sit `page_stride` apart but each copy spans only
+    /// `bytes_per_block`. Defaults to `bytes_per_block` (a contiguous per-layer
+    /// region, where the block step already equals the copy size).
+    ///
+    /// # Errors
+    /// `stride < bytes_per_block` (blocks would overlap), or the strided layout
+    /// overflows the registered region.
+    pub(crate) fn with_block_stride(mut self, stride: usize) -> Result<Self, String> {
+        if stride < self.bytes_per_block {
+            return Err(format!(
+                "block_stride {} must be >= bytes_per_block {}",
+                stride, self.bytes_per_block
+            ));
+        }
+        Self::check_layout_bounds(
+            self.num_blocks,
+            stride,
+            self.bytes_per_block,
+            self.kv_stride_bytes,
+            self.segments,
+            self.size_bytes,
+        )?;
+        self.block_stride_bytes = stride;
+        Ok(self)
     }
 
     /// Apply SSD alignment padding to segment sizes.

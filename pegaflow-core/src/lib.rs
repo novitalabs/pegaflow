@@ -57,10 +57,11 @@ use std::{
 use log::{debug, info};
 
 use crate::backing::SSD_ALIGNMENT;
-use crate::gpu_worker::{LayerLoadData, LoadBlock, LoadTask};
+use crate::gpu_worker::{LayerLoadData, LoadBlock, LoadCompletion, LoadTask};
 use crate::lease::QueryLeaseManager;
 use crate::metrics::core_metrics;
 use crate::storage::StorageEngine;
+use tokio::sync::oneshot;
 
 /// Errors that can occur during engine operations.
 #[derive(Debug)]
@@ -260,6 +261,56 @@ impl PegaEngine {
         kv_stride_bytes_list: &[usize],
         segments_list: &[usize],
     ) -> Result<(), EngineError> {
+        // Dense default: block stride == bytes_per_block (layer-first layout).
+        self.register_context_layer_batch_strided(
+            instance_id,
+            namespace,
+            device_id,
+            tp_rank,
+            pp_rank,
+            tp_size,
+            world_size,
+            num_layers,
+            layer_names,
+            layer_ids,
+            data_ptrs,
+            size_bytes_list,
+            num_blocks_list,
+            bytes_per_block_list,
+            kv_stride_bytes_list,
+            segments_list,
+            None,
+        )
+    }
+
+    /// Like [`Self::register_context_layer_batch`] but with an explicit per-layer
+    /// block stride (see [`KVCacheRegistration::with_block_stride`]). When
+    /// `block_stride_bytes_list` is `Some` it must match `layer_names` in length;
+    /// each entry overrides that layer's stride.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "public API mirrors one batched registration RPC payload"
+    )]
+    pub fn register_context_layer_batch_strided(
+        &self,
+        instance_id: &str,
+        namespace: &str,
+        device_id: i32,
+        tp_rank: usize,
+        pp_rank: usize,
+        tp_size: usize,
+        world_size: usize,
+        num_layers: usize,
+        layer_names: &[String],
+        layer_ids: &[usize],
+        data_ptrs: &[u64],
+        size_bytes_list: &[usize],
+        num_blocks_list: &[usize],
+        bytes_per_block_list: &[usize],
+        kv_stride_bytes_list: &[usize],
+        segments_list: &[usize],
+        block_stride_bytes_list: Option<&[usize]>,
+    ) -> Result<(), EngineError> {
         // Build all registrations
         let ssd_enabled = self.storage.is_ssd_enabled();
         let batch_size = layer_names.len();
@@ -282,6 +333,14 @@ impl PegaEngine {
                 segments_list.len()
             )));
         }
+        if let Some(strides) = block_stride_bytes_list
+            && strides.len() != batch_size
+        {
+            return Err(EngineError::InvalidArgument(format!(
+                "registration metadata length mismatch: layer_names={batch_size}, block_stride_bytes={}",
+                strides.len()
+            )));
+        }
         let mut kv_caches = HashMap::with_capacity(batch_size);
         let mut layer_ids_by_name = HashMap::with_capacity(batch_size);
 
@@ -296,6 +355,12 @@ impl PegaEngine {
                 segments_list[i],
             )
             .map_err(|e| EngineError::InvalidArgument(format!("layer {layer_name}: {e}")))?;
+
+            if let Some(strides) = block_stride_bytes_list {
+                registration = registration.with_block_stride(strides[i]).map_err(|e| {
+                    EngineError::InvalidArgument(format!("layer {layer_name}: {e}"))
+                })?;
+            }
 
             if ssd_enabled {
                 registration = registration.with_ssd_padding(SSD_ALIGNMENT);
@@ -510,9 +575,9 @@ impl PegaEngine {
             instance_id,
             tp_rank,
             device_id,
-            load_state_shm,
             layer_names,
             loads,
+            LoadCompletion::Shm(load_state_shm.to_string()),
         );
 
         if let Err(ref e) = result {
@@ -521,6 +586,35 @@ impl PegaEngine {
         }
 
         result
+    }
+
+    /// In-process variant of [`Self::batch_load_kv_blocks_multi_layer`]: instead
+    /// of a caller-managed shared-memory `LoadState`, it returns a oneshot
+    /// receiver that resolves when the GPU worker finishes the load (`Ok`) or it
+    /// fails (`Err`). Poll it with `try_recv` to keep admission non-blocking, or
+    /// await it. For in-process Rust embedders that register raw device pointers
+    /// and have no second process to coordinate a `LoadState` with.
+    ///
+    /// On a pre-submit error the receiver is dropped (yields `RecvError`); the
+    /// same error is returned synchronously here.
+    pub fn batch_load_kv_blocks_multi_layer_inproc(
+        &self,
+        instance_id: &str,
+        tp_rank: usize,
+        device_id: i32,
+        layer_names: &[&str],
+        loads: &[(QueryLeaseId, Vec<i32>)],
+    ) -> Result<oneshot::Receiver<Result<(), EngineError>>, EngineError> {
+        let (reply, rx) = oneshot::channel();
+        self.batch_load_kv_blocks_multi_layer_inner(
+            instance_id,
+            tp_rank,
+            device_id,
+            layer_names,
+            loads,
+            LoadCompletion::Channel(reply),
+        )?;
+        Ok(rx)
     }
 
     #[allow(
@@ -532,9 +626,9 @@ impl PegaEngine {
         instance_id: &str,
         tp_rank: usize,
         device_id: i32,
-        load_state_shm: &str,
         layer_names: &[&str],
         loads: &[(QueryLeaseId, Vec<i32>)],
+        completion: LoadCompletion,
     ) -> Result<(), EngineError> {
         let instance = self.get_instance(instance_id)?;
         instance.ensure_all_slots_registered()?;
@@ -608,15 +702,13 @@ impl PegaEngine {
         // Complete immediately if no blocks to load
         if layers.is_empty() {
             debug!("No blocks to load, completing immediately");
-            LoadState::attach(load_state_shm)?.set_completed();
+            completion.signal(Ok(()));
             return Ok(());
         }
 
         // Submit to worker pool (fire and forget)
-        gpu.worker_pool().submit_load(LoadTask {
-            layers,
-            load_state_shm: load_state_shm.to_string(),
-        })
+        gpu.worker_pool()
+            .submit_load(LoadTask { layers, completion })
     }
 
     /// Wait until all previously submitted save batches have been processed

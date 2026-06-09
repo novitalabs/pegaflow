@@ -18,7 +18,39 @@ use pegaflow_common::{NumaNode, pin_thread_to_numa_node};
 /// A task to load KV blocks from CPU to GPU for multiple layers
 pub(crate) struct LoadTask {
     pub layers: Vec<LayerLoadData>,
-    pub load_state_shm: String,
+    pub completion: LoadCompletion,
+}
+
+/// How a finished [`LoadTask`] hands its result back to the submitter.
+///
+/// Loads run on the GPU worker thread, so the outcome has to cross back to
+/// whoever requested it. Cross-process callers (the vLLM Python worker) watch a
+/// shared-memory `LoadState`; in-process Rust callers await a oneshot, the same
+/// way [`SaveTask`] already replies. Exactly one of these fires when the task
+/// settles.
+pub(crate) enum LoadCompletion {
+    /// Signal a shared-memory `LoadState` the caller polls (cross-process).
+    Shm(String),
+    /// Resolve a oneshot the caller awaits or polls (in-process).
+    Channel(oneshot::Sender<Result<(), EngineError>>),
+}
+
+impl LoadCompletion {
+    /// Deliver the task's terminal result. Consumes self so it fires once.
+    pub(crate) fn signal(self, result: Result<(), EngineError>) {
+        match self {
+            LoadCompletion::Shm(shm) => match LoadState::attach(&shm) {
+                Ok(load_state) => match result {
+                    Ok(()) => load_state.set_completed(),
+                    Err(_) => load_state.set_error(),
+                },
+                Err(e) => error!("Failed to attach to LoadState shm={shm}: {e:?}"),
+            },
+            LoadCompletion::Channel(reply) => {
+                let _ = reply.send(result);
+            }
+        }
+    }
 }
 
 /// Data for loading a single layer
@@ -253,26 +285,14 @@ fn load_worker_loop(
     runtime: WorkerRuntime,
 ) {
     while let Some(task) = rx.blocking_recv() {
-        let result = process_load_task(&task, &runtime.stream, runtime.backend.as_ref());
+        let LoadTask { layers, completion } = task;
+        let result = process_load_task(&layers, &runtime.stream, runtime.backend.as_ref());
 
-        // Attach to LoadState and signal completion
-        match LoadState::attach(&task.load_state_shm) {
-            Ok(load_state) => match result {
-                Ok(()) => load_state.set_completed(),
-                Err(ref e) => {
-                    error!("Load task failed: device={} error={:?}", device_id, e);
-                    core_metrics().load_failures.add(1, &[]);
-                    load_state.set_error();
-                }
-            },
-            Err(e) => {
-                error!(
-                    "Failed to attach to LoadState: device={} shm={} error={:?}",
-                    device_id, task.load_state_shm, e
-                );
-                core_metrics().load_failures.add(1, &[]);
-            }
+        if let Err(ref e) = result {
+            error!("Load task failed: device={device_id} error={e:?}");
+            core_metrics().load_failures.add(1, &[]);
         }
+        completion.signal(result);
     }
 
     info!("Load worker shutting down: device={}", device_id);
@@ -331,7 +351,7 @@ fn device_addr(
 /// layers. All layers and segments are collected into one descriptor batch,
 /// handed to a single backend (memcpy or kernel), then synchronized once.
 fn process_load_task(
-    task: &LoadTask,
+    layers: &[LayerLoadData],
     stream: &Arc<CudaStream>,
     backend: &dyn TransferBackend,
 ) -> Result<(), EngineError> {
@@ -339,12 +359,12 @@ fn process_load_task(
     let start = std::time::Instant::now();
     let mut total_bytes = 0usize;
     // Use the first layer's block count as the physical block count (all layers have the same)
-    let total_blocks = task.layers.first().map(|l| l.blocks.len()).unwrap_or(0);
+    let total_blocks = layers.first().map(|l| l.blocks.len()).unwrap_or(0);
     let metrics = core_metrics();
 
     let mut copies: Vec<CopyDesc> = Vec::new();
 
-    for layer_data in &task.layers {
+    for layer_data in layers {
         let registration = &layer_data.registration;
         let layer_name = &layer_data.layer_name;
 
@@ -433,7 +453,7 @@ fn process_load_task(
 
     info!(
         "Load task completed: layers={} blocks={} copies={} bytes={} elapsed_ms={:.2} bandwidth_gbps={:.2} backend={}",
-        task.layers.len(),
+        layers.len(),
         total_blocks,
         copies.len(),
         total_bytes,
