@@ -432,18 +432,15 @@ def _open_json(
         raise
 
 
-def iter_http_stream_chunks(response) -> Any:
-    pending = bytearray()
+def iter_http_stream_bytes(response, chunk_size: int = 64 * 1024) -> Any:
+    read_chunk = getattr(response, "read1", None)
+    if read_chunk is None:
+        read_chunk = response.read
     while True:
-        line = response.readline()
-        if not line:
-            if pending:
-                yield bytes(pending)
+        chunk = read_chunk(chunk_size)
+        if not chunk:
             return
-        pending.extend(line)
-        if line in {b"\n", b"\r\n"}:
-            yield bytes(pending)
-            pending.clear()
+        yield chunk
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -500,7 +497,7 @@ class _Handler(BaseHTTPRequestHandler):
                 try:
                     with response:
                         first_chunk = True
-                        for chunk in iter_http_stream_chunks(response):
+                        for chunk in iter_http_stream_bytes(response):
                             self.server.proxy.config.metrics.record_stream_chunk(len(chunk))
                             if first_chunk:
                                 first_chunk = False
