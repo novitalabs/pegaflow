@@ -882,6 +882,36 @@ def test_pd_worker_uses_runtime_tp_rank_for_rdma_rank_map(monkeypatch) -> None:
     assert FakeNativeRdmaEngineCtor.last_kwargs["pin_worker_cpu"] == 60
 
 
+def test_pd_worker_uses_cuda_device_rank_map_for_tp1_replicas(monkeypatch) -> None:
+    monkeypatch.setattr(native, "PdRdmaEngine", FakeNativeRdmaEngineCtor, raising=False)
+    monkeypatch.setattr(worker_mod, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(worker_mod, "get_tensor_model_parallel_world_size", lambda: 1)
+    tensor = FakeTensor(
+        shape=(2, 8, 16, 4, 32),
+        stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
+        device_index=4,
+    )
+    config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            engine_id="decode",
+            get_from_extra_config=lambda key, default: {
+                "pegaflow.pd.rdma.rank_map": {
+                    "0": {"nic": "mlx5_0", "worker_cpu": 16},
+                    "4": {"nic": "mlx5_4", "worker_cpu": 120},
+                },
+            }.get(key, default),
+        ),
+        parallel_config=SimpleNamespace(tensor_parallel_rank=0, tensor_parallel_size=1),
+    )
+
+    worker = PdDecodeWorkerConnector(config)
+    worker.register_kv_caches({"layer.0": tensor})
+
+    assert FakeNativeRdmaEngineCtor.last_kwargs["cuda_device"] == 4
+    assert FakeNativeRdmaEngineCtor.last_kwargs["domains"] == ["mlx5_4"]
+    assert FakeNativeRdmaEngineCtor.last_kwargs["pin_worker_cpu"] == 120
+
+
 def test_pd_worker_rejects_legacy_global_rdma_config(monkeypatch) -> None:
     monkeypatch.setattr(native, "PdRdmaEngine", FakeNativeRdmaEngineCtor, raising=False)
     tensor = FakeTensor(

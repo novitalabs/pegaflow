@@ -135,6 +135,25 @@ struct ConnectingPeerGroup {
     pending_group_ops: Vec<(TransferId, GroupWriteOp)>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MrRegistrationMethod {
+    DmaBuf,
+    Legacy,
+}
+
+fn mr_registration_method(mapping: &Mapping) -> MrRegistrationMethod {
+    match mapping {
+        Mapping::Device {
+            dmabuf_fd: Some(_),
+            ..
+        } => MrRegistrationMethod::DmaBuf,
+        Mapping::Device {
+            dmabuf_fd: None, ..
+        }
+        | Mapping::Host => MrRegistrationMethod::Legacy,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerHandshakeInfo {
     ud_addr: VerbsUDAddress,
@@ -671,11 +690,15 @@ impl VerbsDomain {
                 | ibv_access_flags::IBV_ACCESS_REMOTE_WRITE;
         }
 
-        let mr = match region.mapping() {
-            Mapping::Device {
-                dmabuf_fd: Some(dmabuf_fd),
-                ..
-            } => {
+        let mr = match mr_registration_method(region.mapping()) {
+            MrRegistrationMethod::DmaBuf => {
+                let Mapping::Device {
+                    dmabuf_fd: Some(dmabuf_fd),
+                    ..
+                } = region.mapping()
+                else {
+                    unreachable!("DmaBuf registration requires a dma-buf fd")
+                };
                 let iova = region.ptr().as_ptr() as u64;
                 let mr = unsafe {
                     ibv_reg_dmabuf_mr(
@@ -690,14 +713,7 @@ impl VerbsDomain {
                 NonNull::new(mr)
                     .ok_or_else(|| VerbsError::with_last_os_error("ibv_reg_dmabuf_mr"))?
             }
-            Mapping::Device {
-                dmabuf_fd: None, ..
-            } => {
-                return Err(FabricLibError::Custom(
-                    "CUDA memory registration requires a dma-buf fd",
-                ));
-            }
-            Mapping::Host => {
+            MrRegistrationMethod::Legacy => {
                 let mr = unsafe {
                     ibv_reg_mr(
                         self.pd.as_ptr(),
@@ -1374,5 +1390,20 @@ impl Drop for VerbsDomain {
 impl Drop for Peer {
     fn drop(&mut self) {
         unsafe { ibv_destroy_ah(self.ah.as_ptr()) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cuda_memory_without_dmabuf_uses_legacy_registration() {
+        let mapping = Mapping::Device {
+            device_id: crate::cuda_lib::CudaDeviceId(0),
+            dmabuf_fd: None,
+        };
+
+        assert_eq!(mr_registration_method(&mapping), MrRegistrationMethod::Legacy);
     }
 }
