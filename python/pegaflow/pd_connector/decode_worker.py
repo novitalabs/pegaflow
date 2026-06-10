@@ -18,7 +18,6 @@ from pegaflow.pd_connector.metadata import (
     LayerRemoteLayout,
     PdHandshake,
     WaitReqMeta,
-    encode_handshake_payload,
     flatten_block_ids,
     layer_layout_to_compact_dict,
 )
@@ -374,7 +373,7 @@ class DecodeHandler:
             "do_remote_prefill_sender": True,
             "target_engine_id": self._w.engine_id,
             "target_request_id": req.done_request_id,
-            "pd_handshakes": encode_handshake_payload(all_handshakes),
+            "pd_handshakes": all_handshakes,
             "pd_consumer_abort_returns_ack": True,
         }
         task = PrefillHttpTask(

@@ -1544,6 +1544,7 @@ def test_p_worker_completion_clears_physical_remote_block_offsets() -> None:
         {
             "prefill-r1#d2#l0": 1,
             "prefill-r1#d3#l0": 1,
+            "prefill-r10#d2#l0": 1,
             "other#d0#l0": 1,
         }
     )
@@ -1551,7 +1552,10 @@ def test_p_worker_completion_clears_physical_remote_block_offsets() -> None:
     worker._prefill._completed_pushes.add("prefill-r1")
     assert worker.get_finished({"prefill-r1"})[0] == {"prefill-r1"}
 
-    assert worker._prefill._remote_block_offsets == {"other#d0#l0": 1}
+    assert worker._prefill._remote_block_offsets == {
+        "prefill-r10#d2#l0": 1,
+        "other#d0#l0": 1,
+    }
 
 
 def test_p_worker_preemption_cancels_push_without_waiting_for_done() -> None:
@@ -2137,7 +2141,7 @@ def test_scheduler_carries_cross_process_rdma_handshake() -> None:
     assert parsed.layers[0].mr_desc == {"addr_rkey_list": [["10.0.0.1:1", 17]]}
 
 
-def test_scheduler_carries_compressed_cross_process_rdma_handshake() -> None:
+def test_scheduler_carries_cross_process_rdma_handshake_list() -> None:
     handshake = {
         "request_id": "decode-1",
         "engine_id": "decode",
@@ -2166,7 +2170,7 @@ def test_scheduler_carries_compressed_cross_process_rdma_handshake() -> None:
             "do_remote_prefill_sender": True,
             "target_engine_id": "decode",
             "target_request_id": "decode-1",
-            "pd_handshakes": encode_handshake_payload([handshake]),
+            "pd_handshakes": [handshake],
         },
     )
 

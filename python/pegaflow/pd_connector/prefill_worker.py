@@ -573,11 +573,11 @@ class PrefillHandler:
     def _clear_remote_block_offsets(
         self, req_id: str, physical_req_ids: tuple[str, ...]
     ) -> None:
-        prefixes = (req_id, *(f"{physical_req_id}#" for physical_req_id in physical_req_ids))
+        physical_prefixes = tuple(f"{physical_req_id}#" for physical_req_id in physical_req_ids)
         self._remote_block_offsets = {
             key: value
             for key, value in self._remote_block_offsets.items()
-            if not (key == req_id or any(key.startswith(prefix) for prefix in prefixes))
+            if key != req_id and not any(key.startswith(prefix) for prefix in physical_prefixes)
         }
 
     def _block_ids_by_layer(self, block_ids: Any) -> dict[int, set[int]]:
