@@ -793,7 +793,11 @@ impl PegaEngine {
         // prefixes out across threads. The first global mismatch is the
         // minimum of the chunk-local first mismatches.
         let homogeneous = if prefix.len() >= 256 {
-            let threads = 4.min(prefix.len());
+            // Read-only scan: no refcount writes, so it scales with threads
+            // (unlike Arc-cloning builds). Keep chunks >= 64 blocks.
+            let threads = (prefix.len() / 64)
+                .clamp(1, 16)
+                .min(std::thread::available_parallelism().map_or(4, |n| n.get()));
             let chunk = prefix.len().div_ceil(threads);
             let template = &template;
             let prefix = prefix.as_slice();
@@ -962,57 +966,47 @@ impl PegaEngine {
         // resolve its slab cursor once instead of per segment.
         let session_elapsed = t0.elapsed();
         let build_start = std::time::Instant::now();
-        let mut segments = Vec::new();
+
+        // Replay the bump allocation with the first block's sizes (the
+        // template the requester sized its slabs from) to fix each
+        // (slot, K/V) run's destination window up front. The per-segment
+        // source scan below then has no shared cursor and fans out across
+        // threads; per-run end checks subsume the old global cursor check
+        // and reject divergence at finer granularity.
+        struct RunDst {
+            mr_index: u32,
+            base: u64,
+            end: u64,
+        }
+        let mut runs: Vec<RunDst> = Vec::with_capacity(slot_numas.len() * 2);
         for (slot_idx, slot_numa) in slot_numas.iter().enumerate() {
             let numa = slot_numa.0;
+            let slab = slabs.get_mut(&numa).ok_or_else(|| {
+                PushBlocksError::Rejected(format!("no requester slab for NUMA node {numa}"))
+            })?;
+            let first = &session_blocks[0].1;
             for seg_idx in 0..2 {
-                let slab = slabs.get_mut(&numa).ok_or_else(|| {
-                    PushBlocksError::Rejected(format!("no requester slab for NUMA node {numa}"))
-                })?;
-                // Within one (slot, K/V) run the destination is a single bump
-                // region, so source-contiguous segments of consecutive blocks
-                // merge into one WRITE-sized segment. Layer allocations keep
-                // consecutive blocks adjacent, so a run typically collapses
-                // to one segment per (slot, K/V).
-                let mut run = PushSegment {
-                    src_addr: 0,
-                    len: 0,
-                    dst_mr_index: slab.mr_index,
-                    dst_addr: 0,
-                };
-                for (_key, sealed) in &session_blocks {
-                    let raw = &sealed.slots()[slot_idx];
-                    let (Some(ptr), Some(size)) =
-                        (raw.segment_ptr(seg_idx), raw.segment_size(seg_idx))
-                    else {
-                        continue;
-                    };
-                    let len = size as u64;
-                    if len == 0 {
-                        continue;
-                    }
-                    if len > slab.end - slab.next {
-                        return Err(PushBlocksError::Rejected(format!(
-                            "slab for NUMA node {numa} exhausted during replay: cursor=0x{:x} len={len} end=0x{:x}",
-                            slab.next, slab.end
-                        )));
-                    }
-                    let src = ptr.as_ptr() as u64;
-                    if run.len > 0 && run.src_addr + run.len == src {
-                        run.len += len;
-                    } else {
-                        if run.len > 0 {
-                            segments.push(run);
-                        }
-                        run.src_addr = src;
-                        run.dst_addr = slab.next;
-                        run.len = len;
-                    }
-                    slab.next += len;
+                let size = first.slots()[slot_idx].segment_size(seg_idx).unwrap_or(0) as u64;
+                let total = size
+                    .checked_mul(session_blocks.len() as u64)
+                    .ok_or_else(|| {
+                        PushBlocksError::Rejected(format!(
+                            "run size overflows: {size} x {} blocks",
+                            session_blocks.len()
+                        ))
+                    })?;
+                if total > slab.end - slab.next {
+                    return Err(PushBlocksError::Rejected(format!(
+                        "slab for NUMA node {numa} exhausted during replay: cursor=0x{:x} run={total} end=0x{:x}",
+                        slab.next, slab.end
+                    )));
                 }
-                if run.len > 0 {
-                    segments.push(run);
-                }
+                runs.push(RunDst {
+                    mr_index: slab.mr_index,
+                    base: slab.next,
+                    end: slab.next + total,
+                });
+                slab.next += total;
             }
         }
 
@@ -1027,6 +1021,83 @@ impl PegaEngine {
                 )));
             }
         }
+
+        // Within one (slot, K/V) run the destination is a single bump
+        // region, so source-contiguous segments of consecutive blocks merge
+        // into one WRITE-sized segment. Layer allocations keep consecutive
+        // blocks adjacent, so a run typically collapses to one segment.
+        let build_run = |run_idx: usize| -> Result<Vec<PushSegment>, String> {
+            let (slot_idx, seg_idx) = (run_idx / 2, run_idx % 2);
+            let dst = &runs[run_idx];
+            let mut out = Vec::new();
+            let mut cursor = dst.base;
+            let mut run = PushSegment {
+                src_addr: 0,
+                len: 0,
+                dst_mr_index: dst.mr_index,
+                dst_addr: 0,
+            };
+            for (_key, sealed) in &session_blocks {
+                let raw = &sealed.slots()[slot_idx];
+                let (Some(ptr), Some(size)) = (raw.segment_ptr(seg_idx), raw.segment_size(seg_idx))
+                else {
+                    continue;
+                };
+                let len = size as u64;
+                if len == 0 {
+                    continue;
+                }
+                if len > dst.end - cursor {
+                    return Err(format!(
+                        "block segment overruns its run during replay: cursor=0x{cursor:x} len={len} run_end=0x{:x}",
+                        dst.end
+                    ));
+                }
+                let src = ptr.as_ptr() as u64;
+                if run.len > 0 && run.src_addr + run.len == src {
+                    run.len += len;
+                } else {
+                    if run.len > 0 {
+                        out.push(run);
+                    }
+                    run.src_addr = src;
+                    run.dst_addr = cursor;
+                    run.len = len;
+                }
+                cursor += len;
+            }
+            if run.len > 0 {
+                out.push(run);
+            }
+            if cursor != dst.end {
+                return Err(format!(
+                    "bump replay mismatch in run {run_idx}: cursor ended at 0x{cursor:x} but requester allocated up to 0x{:x}",
+                    dst.end
+                ));
+            }
+            Ok(out)
+        };
+        let threads = (runs.len() / 16)
+            .clamp(1, 8)
+            .min(std::thread::available_parallelism().map_or(4, |n| n.get()));
+        let chunk = runs.len().div_ceil(threads).max(1);
+        let per_run_segments: Vec<Vec<PushSegment>> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..threads)
+                .map(|t| {
+                    let lo = (t * chunk).min(runs.len());
+                    let hi = ((t + 1) * chunk).min(runs.len());
+                    let build_run = &build_run;
+                    scope.spawn(move || (lo..hi).map(build_run).collect::<Result<Vec<_>, _>>())
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|w| w.join().expect("replay worker panicked"))
+                .collect::<Result<Vec<_>, _>>()
+                .map(|chunks| chunks.into_iter().flatten().collect())
+        })
+        .map_err(PushBlocksError::Rejected)?;
+        let segments: Vec<PushSegment> = per_run_segments.into_iter().flatten().collect();
 
         let build_elapsed = build_start.elapsed();
         let rdma_start = std::time::Instant::now();
