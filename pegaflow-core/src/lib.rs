@@ -839,7 +839,6 @@ impl PegaEngine {
             })
         };
 
-        let mut segments = Vec::new();
         for ((key, sealed), dst_block) in session_blocks.iter().zip(&request.blocks) {
             if key.hash != dst_block.block_hash {
                 return Err(PushBlocksError::Rejected(format!(
@@ -853,8 +852,26 @@ impl PegaEngine {
                     sealed.slots().len()
                 )));
             }
-            for (raw, dst_slot) in sealed.slots().iter().zip(&dst_block.slots) {
+        }
+
+        // Slot-major, K run before V run — the same order in which the
+        // requester assigned destinations from its bump allocator. Each
+        // layer's K (and V) segments of consecutive blocks are adjacent in
+        // the pinned pool, so this order yields source- and
+        // destination-contiguous runs that push_segments coalesces.
+        let max_slots = session_blocks
+            .iter()
+            .map(|(_, sealed)| sealed.slots().len())
+            .max()
+            .unwrap_or(0);
+        let mut segments = Vec::new();
+        for slot_idx in 0..max_slots {
+            for ((key, sealed), dst_block) in session_blocks.iter().zip(&request.blocks) {
+                let Some(raw) = sealed.slots().get(slot_idx) else {
+                    continue;
+                };
                 let layer_block = LayerBlock::new(Arc::clone(raw));
+                let dst_slot = &dst_block.slots[slot_idx];
                 let k_dst = dst_slot.k.as_ref().ok_or_else(|| {
                     PushBlocksError::Rejected(format!("missing K destination for block {key:?}"))
                 })?;
@@ -864,19 +881,25 @@ impl PegaEngine {
                     dst_mr: segment_dst(k_dst)?,
                     dst_addr: k_dst.dst_addr,
                 });
-                if let Some(v_ptr) = layer_block.v_ptr() {
-                    let v_dst = dst_slot.v.as_ref().ok_or_else(|| {
-                        PushBlocksError::Rejected(format!(
-                            "missing V destination for block {key:?}"
-                        ))
-                    })?;
-                    segments.push(PushSegment {
-                        src_addr: v_ptr as u64,
-                        len: layer_block.v_size().unwrap_or(0) as u64,
-                        dst_mr: segment_dst(v_dst)?,
-                        dst_addr: v_dst.dst_addr,
-                    });
-                }
+            }
+            for ((key, sealed), dst_block) in session_blocks.iter().zip(&request.blocks) {
+                let Some(raw) = sealed.slots().get(slot_idx) else {
+                    continue;
+                };
+                let layer_block = LayerBlock::new(Arc::clone(raw));
+                let Some(v_ptr) = layer_block.v_ptr() else {
+                    continue;
+                };
+                let dst_slot = &dst_block.slots[slot_idx];
+                let v_dst = dst_slot.v.as_ref().ok_or_else(|| {
+                    PushBlocksError::Rejected(format!("missing V destination for block {key:?}"))
+                })?;
+                segments.push(PushSegment {
+                    src_addr: v_ptr as u64,
+                    len: layer_block.v_size().unwrap_or(0) as u64,
+                    dst_mr: segment_dst(v_dst)?,
+                    dst_addr: v_dst.dst_addr,
+                });
             }
         }
 

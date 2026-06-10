@@ -284,45 +284,60 @@ async fn fetch_blocks_via_push(
             ))
         };
 
-        for block_info in blocks {
-            slot_count += block_info.slots.len();
-            let mut slot_allocs = Vec::with_capacity(block_info.slots.len());
-            let mut slot_dsts = Vec::with_capacity(block_info.slots.len());
+        // Slot-major assignment, K run before V run: the holder stores each
+        // layer's K and V in separate allocations with consecutive blocks
+        // adjacent inside, so visiting (slot, K) across all blocks gives the
+        // holder source-contiguous runs it can coalesce into single WRITEs.
+        // The holder builds its segment list in this same order.
+        let mut slot_dsts: Vec<Vec<PushSlotDst>> = blocks
+            .iter()
+            .map(|b| vec![PushSlotDst { k: None, v: None }; b.slots.len()])
+            .collect();
+        let mut slot_allocs: Vec<Vec<Vec<SegmentAlloc>>> = blocks
+            .iter()
+            .map(|b| (0..b.slots.len()).map(|_| Vec::new()).collect())
+            .collect();
+        let max_slots = blocks.iter().map(|b| b.slots.len()).max().unwrap_or(0);
 
-            for slot in &block_info.slots {
-                let mut segments = Vec::new();
-                let numa = NumaNode(slot.numa_node);
-
-                let k_dst = if slot.k_size > 0 {
+        for slot_idx in 0..max_slots {
+            for (block_idx, block_info) in blocks.iter().enumerate() {
+                let Some(slot) = block_info.slots.get(slot_idx) else {
+                    continue;
+                };
+                if slot.k_size > 0 {
                     let len = usize::try_from(slot.k_size)
                         .map_err(|_| format!("K size exceeds usize: {}", slot.k_size))?;
-                    let (dst, alloc) = segment_dst(&mut numa_slabs, numa, len, "K")?;
-                    segments.push(alloc);
+                    let (dst, alloc) =
+                        segment_dst(&mut numa_slabs, NumaNode(slot.numa_node), len, "K")?;
+                    slot_dsts[block_idx][slot_idx].k = Some(dst);
+                    slot_allocs[block_idx][slot_idx].push(alloc);
                     segment_count += 1;
-                    Some(dst)
-                } else {
-                    None
+                }
+            }
+            for (block_idx, block_info) in blocks.iter().enumerate() {
+                let Some(slot) = block_info.slots.get(slot_idx) else {
+                    continue;
                 };
-
-                let v_dst = if slot.v_size > 0 {
+                if slot.v_size > 0 {
                     let len = usize::try_from(slot.v_size)
                         .map_err(|_| format!("V size exceeds usize: {}", slot.v_size))?;
-                    let (dst, alloc) = segment_dst(&mut numa_slabs, numa, len, "V")?;
-                    segments.push(alloc);
+                    let (dst, alloc) =
+                        segment_dst(&mut numa_slabs, NumaNode(slot.numa_node), len, "V")?;
+                    slot_dsts[block_idx][slot_idx].v = Some(dst);
+                    slot_allocs[block_idx][slot_idx].push(alloc);
                     segment_count += 1;
-                    Some(dst)
-                } else {
-                    None
-                };
-
-                slot_dsts.push(PushSlotDst { k: k_dst, v: v_dst });
-                slot_allocs.push(segments);
+                }
             }
+        }
 
-            block_allocs.push((block_info.block_hash.clone(), slot_allocs));
+        for (block_info, (dsts, allocs)) in
+            blocks.iter().zip(slot_dsts.into_iter().zip(slot_allocs))
+        {
+            slot_count += block_info.slots.len();
+            block_allocs.push((block_info.block_hash.clone(), allocs));
             push_blocks.push(PushBlockDst {
                 block_hash: block_info.block_hash.clone(),
-                slots: slot_dsts,
+                slots: dsts,
             });
         }
     }
