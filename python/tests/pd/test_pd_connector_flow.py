@@ -3366,8 +3366,8 @@ def test_pd_decode_connector_allows_full_cudagraph_by_default() -> None:
     assert PdDecodeConnector.requires_piecewise_for_cudagraph({}) is False
 
 
-def test_pd_prefill_connector_allows_full_decode_cudagraph_by_default() -> None:
-    assert PdPrefillConnector.requires_piecewise_for_cudagraph({}) is False
+def test_pd_prefill_connector_requires_piecewise_cudagraph_for_layerwise_push() -> None:
+    assert PdPrefillConnector.requires_piecewise_for_cudagraph({}) is True
 
 
 def test_pd_connector_can_allow_full_decode_cudagraph() -> None:
