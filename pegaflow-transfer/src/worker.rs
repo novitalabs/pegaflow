@@ -7,7 +7,7 @@ use std::{
     },
 };
 
-use super::cpu_affinity::pin_cpu;
+use super::cpu_affinity::pin_cpus;
 use crossbeam_channel::TryRecvError;
 use log::{debug, info};
 
@@ -77,7 +77,9 @@ unsafe impl Send for WorkerCall {}
 
 pub(crate) struct Worker {
     pub domain_list: Vec<DomainInfo>,
-    pub pin_worker_cpu: Option<u16>,
+    /// CPU affinity for the polling worker thread. Empty = no affinity; one
+    /// CPU = exact-core pin; multiple CPUs = NUMA-local set.
+    pub pin_worker_cpus: Vec<u16>,
 }
 
 unsafe impl Send for Worker {}
@@ -143,7 +145,7 @@ impl Worker {
                 worker_thread_builder.spawn(move || {
                     rdma_worker_thread::<VerbsDomain, $n>(
                         verbs_domain_list,
-                        self.pin_worker_cpu,
+                        self.pin_worker_cpus,
                         imm_count_map,
                         init_worker_tx,
                         cq_tx,
@@ -208,16 +210,19 @@ impl InitializingWorker {
 
 fn rdma_worker_thread<D: RdmaDomain, const N: usize>(
     domain_list: Vec<D::Info>,
-    maybe_pin_cpu: Option<u16>,
+    pin_worker_cpus: Vec<u16>,
     imm_count_map: Arc<ImmCountMap>,
     init_tx: oneshot::Sender<Result<InitializedWorker>>,
     cq_tx: crossbeam_channel::Sender<TransferCompletionEntry>,
 ) {
-    // Pin CPU if specified
-    if let Some(cpu) = maybe_pin_cpu {
+    // Restrict CPU affinity if specified
+    if !pin_worker_cpus.is_empty() {
         let names: Vec<_> = domain_list.iter().map(|info| info.name()).collect();
-        info!("Pin Domain Worker CPU {} for {:?}", cpu, names);
-        if let Err(e) = pin_cpu(cpu as usize) {
+        info!(
+            "Pin Domain Worker CPUs {:?} for {:?}",
+            pin_worker_cpus, names
+        );
+        if let Err(e) = pin_cpus(&pin_worker_cpus) {
             // Ignore send error
             let _ = init_tx.send(Err(FabricLibError::Errno(e)));
             return;

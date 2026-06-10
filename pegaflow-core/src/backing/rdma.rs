@@ -98,11 +98,12 @@ impl RdmaTransport {
                 continue;
             }
             let num_domains = domains.len();
-            // Pin the engine's polling worker to the last CPU of the NUMA
-            // group; low CPU indices are favoured by other pinned threads.
-            let pin_cpu = group.cpus.last().copied();
-            let engine =
-                TransferEngineBuilder::build_host(domains, pin_cpu).map_err(|e| e.to_string())?;
+            // Keep the polling worker NUMA-local but let the scheduler pick
+            // the core: multiple processes on one machine would otherwise pin
+            // their busy-poll workers to the same deterministic core and
+            // starve each other.
+            let engine = TransferEngineBuilder::build_host(domains, group.cpus.clone())
+                .map_err(|e| e.to_string())?;
             engines.push(NumaEngine {
                 numa: NumaNode(group.numa as u32),
                 engine,

@@ -20,12 +20,13 @@ pub struct TransferEngineBuilder {
 
 impl TransferEngineBuilder {
     /// Build a host-memory transfer engine: one worker driving `domains`,
-    /// optionally pinned to `pin_worker_cpu`. Unlike [`Self::build`], this does
-    /// not consult the GPU topology; callers group NICs per NUMA node
-    /// themselves (see `detect_host_topology`).
+    /// with its polling thread restricted to `pin_worker_cpus` (typically the
+    /// CPUs of one NUMA node; empty = no affinity). Unlike [`Self::build`],
+    /// this does not consult the GPU topology; callers group NICs per NUMA
+    /// node themselves (see `detect_host_topology`).
     pub fn build_host(
         domains: Vec<DomainInfo>,
-        pin_worker_cpu: Option<u16>,
+        pin_worker_cpus: Vec<u16>,
     ) -> Result<TransferEngine> {
         if domains.is_empty() {
             return Err(Error::msg("No domains for host transfer engine"));
@@ -40,7 +41,7 @@ impl TransferEngineBuilder {
         }
         let worker = Worker {
             domain_list: domains,
-            pin_worker_cpu,
+            pin_worker_cpus,
         };
         Ok(TransferEngine::new(vec![(0, worker)])?)
     }
@@ -121,7 +122,7 @@ impl TransferEngineBuilder {
             let domain_list: Vec<_> = spec.domains.to_vec();
             let worker = Worker {
                 domain_list,
-                pin_worker_cpu: Some(spec.pin_worker_cpu),
+                pin_worker_cpus: vec![spec.pin_worker_cpu],
             };
             workers.push((spec.cuda_device, worker));
         }
