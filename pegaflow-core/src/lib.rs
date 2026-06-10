@@ -789,10 +789,39 @@ impl PegaEngine {
             .first()
             .map(|(_, block)| block_slot_template(block))
             .unwrap_or_default();
-        let homogeneous = prefix
-            .iter()
-            .take_while(|(_, block)| block_matches_template(block, &template))
-            .count();
+        // The scan dereferences every slot Arc of every block; fan large
+        // prefixes out across threads. The first global mismatch is the
+        // minimum of the chunk-local first mismatches.
+        let homogeneous = if prefix.len() >= 256 {
+            let threads = 4.min(prefix.len());
+            let chunk = prefix.len().div_ceil(threads);
+            let template = &template;
+            let prefix = prefix.as_slice();
+            std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..threads)
+                    .map(|t| {
+                        let lo = t * chunk;
+                        let hi = ((t + 1) * chunk).min(prefix.len());
+                        scope.spawn(move || {
+                            prefix[lo..hi]
+                                .iter()
+                                .position(|(_, block)| !block_matches_template(block, template))
+                                .map(|p| lo + p)
+                        })
+                    })
+                    .collect();
+                workers
+                    .into_iter()
+                    .filter_map(|w| w.join().expect("homogeneity scan worker panicked"))
+                    .min()
+                    .unwrap_or(prefix.len())
+            })
+        } else {
+            prefix
+                .iter()
+                .take_while(|(_, block)| block_matches_template(block, &template))
+                .count()
+        };
         prefix.truncate(homogeneous);
 
         let template_elapsed = t0.elapsed() - lookup_elapsed;

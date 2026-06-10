@@ -325,15 +325,25 @@ async fn fetch_blocks_via_push(
         return Ok((Vec::new(), timing));
     }
 
-    // Materialize per-block SealedBlocks from the run table, blocks fanned
-    // out across threads (~600k Segment/Arc constructions otherwise dominate
-    // the fetch's CPU time). Only the cache insert waits for the push.
+    // Materialize per-block SealedBlocks from the run table. The ~600k
+    // Segment constructions each clone the owning slab's
+    // Arc<PinnedAllocation>, so workers are partitioned by NUMA: every slab
+    // refcount is touched by exactly one thread (cross-thread contention on
+    // those two cache lines costs more than the construction itself).
+    // Workers build per-slot columns; a transpose of moves assembles blocks.
     let sealed_blocks: Vec<Arc<SealedBlock>> = {
         let runs = &runs;
-        let build_block = move |block_idx: usize| -> Arc<SealedBlock> {
-            let slots: Vec<Arc<RawBlock>> = runs
-                .iter()
-                .map(|(k, v)| {
+        let mut slots_by_numa: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (slot_idx, slot) in template.iter().enumerate() {
+            slots_by_numa
+                .entry(slot.numa_node)
+                .or_default()
+                .push(slot_idx);
+        }
+        let build_column = move |slot_idx: usize| -> (usize, Vec<Arc<RawBlock>>) {
+            let (k, v) = &runs[slot_idx];
+            let column = (0..hashes.len())
+                .map(|block_idx| {
                     let seg = |r: &RunDesc| r.segment(block_idx);
                     Arc::new(match (k, v) {
                         (Some(k), Some(v)) => RawBlock::two_segments(seg(k), seg(v)),
@@ -342,27 +352,42 @@ async fn fetch_blocks_via_push(
                     })
                 })
                 .collect();
-            Arc::new(SealedBlock::from_slots(slots))
+            (slot_idx, column)
         };
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .clamp(1, 8)
-            .min(hashes.len());
-        let chunk = hashes.len().div_ceil(threads);
+        let mut columns: Vec<Option<Vec<Arc<RawBlock>>>> = Vec::new();
+        columns.resize_with(template.len(), || None);
         std::thread::scope(|scope| {
-            let workers: Vec<_> = (0..threads)
-                .map(|t| {
-                    let lo = t * chunk;
-                    let hi = ((t + 1) * chunk).min(hashes.len());
-                    scope.spawn(move || (lo..hi).map(build_block).collect::<Vec<_>>())
+            let workers: Vec<_> = slots_by_numa
+                .values()
+                .map(|slot_indices| {
+                    let slot_indices = slot_indices.as_slice();
+                    scope.spawn(move || {
+                        slot_indices
+                            .iter()
+                            .map(|&s| build_column(s))
+                            .collect::<Vec<_>>()
+                    })
                 })
                 .collect();
-            workers
-                .into_iter()
-                .flat_map(|w| w.join().expect("block build worker panicked"))
-                .collect()
-        })
+            for worker in workers {
+                for (slot_idx, column) in worker.join().expect("column build worker panicked") {
+                    columns[slot_idx] = Some(column);
+                }
+            }
+        });
+        let mut column_iters: Vec<_> = columns
+            .into_iter()
+            .map(|c| c.expect("every slot has a column").into_iter())
+            .collect();
+        (0..hashes.len())
+            .map(|_| {
+                let slots: Vec<Arc<RawBlock>> = column_iters
+                    .iter_mut()
+                    .map(|it| it.next().expect("column length == block count"))
+                    .collect();
+                Arc::new(SealedBlock::from_slots(slots))
+            })
+            .collect()
     };
     let build = build_start.elapsed();
     debug!(
