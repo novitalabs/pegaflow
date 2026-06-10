@@ -854,15 +854,21 @@ impl PegaEngine {
                 ))
             })?;
 
-        // Blocks rebuilt from SSD or a previous RDMA fetch carry no per-slot
-        // NUMA info; the replay below indexes slot_numas per slot, so such
-        // blocks must be rejected, not panicked on.
+        // The replay below assumes the session is layout-homogeneous (the
+        // query locked only such a prefix): every block has full per-slot
+        // NUMA info identical to the first block's. Blocks rebuilt from SSD
+        // or a previous RDMA fetch carry no per-slot NUMA info and must be
+        // rejected, not panicked on.
+        let slot_numas = session_blocks
+            .first()
+            .map(|(_, sealed)| sealed.slot_numas())
+            .unwrap_or(&[]);
         for (key, sealed) in &session_blocks {
-            if sealed.slot_numas().len() != sealed.slots().len() {
+            if sealed.slot_numas().len() != sealed.slots().len()
+                || sealed.slot_numas() != slot_numas
+            {
                 return Err(PushBlocksError::Rejected(format!(
-                    "block {key:?} has {} slots but {} NUMA entries; it cannot be re-served",
-                    sealed.slots().len(),
-                    sealed.slot_numas().len()
+                    "block {key:?} breaks the session's slot layout; it cannot be re-served"
                 )));
             }
         }
@@ -910,73 +916,48 @@ impl PegaEngine {
                 )));
             }
         }
-        let mut alloc_dst = |numa: u32, len: u64| -> Result<(u32, u64), PushBlocksError> {
-            let slab = slabs.get_mut(&numa).ok_or_else(|| {
-                PushBlocksError::Rejected(format!("no requester slab for NUMA node {numa}"))
-            })?;
-            if len > slab.end - slab.next {
-                return Err(PushBlocksError::Rejected(format!(
-                    "slab for NUMA node {numa} exhausted during replay: cursor=0x{:x} len={len} end=0x{:x}",
-                    slab.next, slab.end
-                )));
-            }
-            let dst = slab.next;
-            slab.next += len;
-            Ok((slab.mr_index, dst))
-        };
-
         // Slot-major, K run before V run — the same order in which the
         // requester assigned destinations from its bump allocator. Each
         // layer's K (and V) segments of consecutive blocks are adjacent in
         // the pinned pool, so this order yields source- and
         // destination-contiguous runs that push_segments coalesces.
+        //
+        // Layout homogeneity (validated above) lets each (slot, K/V) run
+        // resolve its slab cursor once instead of per segment.
         let session_elapsed = t0.elapsed();
         let build_start = std::time::Instant::now();
-        let max_slots = session_blocks
-            .iter()
-            .map(|(_, sealed)| sealed.slots().len())
-            .max()
-            .unwrap_or(0);
         let mut segments = Vec::new();
-        for slot_idx in 0..max_slots {
-            for (_key, sealed) in &session_blocks {
-                let Some(raw) = sealed.slots().get(slot_idx) else {
-                    continue;
-                };
-                let layer_block = LayerBlock::new(Arc::clone(raw));
-                let len = layer_block.k_size() as u64;
-                if len == 0 {
-                    continue;
+        for (slot_idx, slot_numa) in slot_numas.iter().enumerate() {
+            let numa = slot_numa.0;
+            for seg_idx in 0..2 {
+                let slab = slabs.get_mut(&numa).ok_or_else(|| {
+                    PushBlocksError::Rejected(format!("no requester slab for NUMA node {numa}"))
+                })?;
+                for (_key, sealed) in &session_blocks {
+                    let raw = &sealed.slots()[slot_idx];
+                    let (Some(ptr), Some(size)) =
+                        (raw.segment_ptr(seg_idx), raw.segment_size(seg_idx))
+                    else {
+                        continue;
+                    };
+                    let len = size as u64;
+                    if len == 0 {
+                        continue;
+                    }
+                    if len > slab.end - slab.next {
+                        return Err(PushBlocksError::Rejected(format!(
+                            "slab for NUMA node {numa} exhausted during replay: cursor=0x{:x} len={len} end=0x{:x}",
+                            slab.next, slab.end
+                        )));
+                    }
+                    segments.push(PushSegment {
+                        src_addr: ptr.as_ptr() as u64,
+                        len,
+                        dst_mr_index: slab.mr_index,
+                        dst_addr: slab.next,
+                    });
+                    slab.next += len;
                 }
-                let numa = sealed.slot_numas()[slot_idx].0;
-                let (dst_mr_index, dst_addr) = alloc_dst(numa, len)?;
-                segments.push(PushSegment {
-                    src_addr: layer_block.k_ptr() as u64,
-                    len,
-                    dst_mr_index,
-                    dst_addr,
-                });
-            }
-            for (_key, sealed) in &session_blocks {
-                let Some(raw) = sealed.slots().get(slot_idx) else {
-                    continue;
-                };
-                let layer_block = LayerBlock::new(Arc::clone(raw));
-                let Some(v_ptr) = layer_block.v_ptr() else {
-                    continue;
-                };
-                let len = layer_block.v_size().unwrap_or(0) as u64;
-                if len == 0 {
-                    continue;
-                }
-                let numa = sealed.slot_numas()[slot_idx].0;
-                let (dst_mr_index, dst_addr) = alloc_dst(numa, len)?;
-                segments.push(PushSegment {
-                    src_addr: v_ptr as u64,
-                    len,
-                    dst_mr_index,
-                    dst_addr,
-                });
             }
         }
 
