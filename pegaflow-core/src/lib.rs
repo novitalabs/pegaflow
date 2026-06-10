@@ -17,6 +17,7 @@ mod cache;
 mod gpu_worker;
 mod instance;
 mod internode;
+mod layout;
 mod lease;
 pub use pegaflow_common::logging;
 mod metrics;
@@ -36,8 +37,9 @@ pub use block::{
     BlockHash, BlockKey, LayerBlock, LayerSave, PrefetchStatus, RawBlock, SealedBlock,
 };
 use instance::GpuRegistration;
-pub use instance::{GpuContext, InstanceContext, KVCacheRegistration};
+pub use instance::{GpuContext, InstanceContext};
 pub use internode::{DEFAULT_METASERVER_QUEUE_DEPTH, MetaServerClient, MetaServerClientConfig};
+use layout::KVCacheLayout;
 pub use lease::QueryLeaseId;
 pub use pegaflow_common::NumaNode;
 use pegaflow_common::NumaTopology;
@@ -57,7 +59,7 @@ use std::{
 use log::{debug, info};
 
 use crate::backing::SSD_ALIGNMENT;
-use crate::gpu_worker::{LayerLoadData, LoadBlock, LoadCompletion, LoadTask};
+use crate::gpu_worker::{LayerTransferData, LoadCompletion, LoadTask, TransferBlock};
 use crate::lease::QueryLeaseManager;
 use crate::metrics::core_metrics;
 use crate::storage::StorageEngine;
@@ -346,7 +348,7 @@ impl PegaEngine {
 
         for i in 0..batch_size {
             let layer_name = &layer_names[i];
-            let mut registration = KVCacheRegistration::new(
+            let mut layout = KVCacheLayout::new(
                 data_ptrs[i],
                 size_bytes_list[i],
                 num_blocks_list[i],
@@ -357,22 +359,23 @@ impl PegaEngine {
             .map_err(|e| EngineError::InvalidArgument(format!("layer {layer_name}: {e}")))?;
 
             if let Some(strides) = block_stride_bytes_list {
-                registration = registration.with_block_stride(strides[i]).map_err(|e| {
+                layout = layout.with_block_stride(strides[i]).map_err(|e| {
                     EngineError::InvalidArgument(format!("layer {layer_name}: {e}"))
                 })?;
             }
 
             if ssd_enabled {
-                registration = registration.with_ssd_padding(SSD_ALIGNMENT);
-                if registration.padded_bytes_per_block != registration.bytes_per_block {
+                layout = layout.with_ssd_padding(SSD_ALIGNMENT);
+                if layout.padded_segment_bytes() != layout.segment_bytes() {
                     info!(
                         "SSD alignment padding: layer={layer_name}, bytes_per_block={} -> padded={}",
-                        registration.bytes_per_block, registration.padded_bytes_per_block
+                        layout.segment_bytes(),
+                        layout.padded_segment_bytes()
                     );
                 }
             }
 
-            if kv_caches.insert(layer_name.clone(), registration).is_some() {
+            if kv_caches.insert(layer_name.clone(), layout).is_some() {
                 return Err(EngineError::InvalidArgument(format!(
                     "duplicate layer name in registration batch: {layer_name}"
                 )));
@@ -668,7 +671,7 @@ impl PegaEngine {
                 ))
             })?;
 
-            let registration = gpu.get_registration(layer_name).ok_or_else(|| {
+            let layout = gpu.get_layout(layer_name).ok_or_else(|| {
                 EngineError::InvalidArgument(format!(
                     "layer {layer_name} not registered on device {device_id}"
                 ))
@@ -684,16 +687,16 @@ impl PegaEngine {
                 let Some(block) = block_entry.get_slot(slot_id) else {
                     continue;
                 };
-                blocks.push(LoadBlock {
+                blocks.push(TransferBlock {
                     block_idx,
                     block: Arc::clone(block),
                 });
             }
 
             if !blocks.is_empty() {
-                layers.push(LayerLoadData {
+                layers.push(LayerTransferData {
                     layer_name: (*layer_name).to_string(),
-                    registration,
+                    layout,
                     blocks,
                 });
             }

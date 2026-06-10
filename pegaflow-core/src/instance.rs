@@ -9,6 +9,7 @@ use std::{collections::HashMap, sync::Arc};
 use cudarc::driver::CudaContext;
 use log::info;
 
+use crate::layout::KVCacheLayout;
 use crate::{EngineError, TransferMode, gpu_worker::GpuWorkerPool};
 use pegaflow_common::NumaNode;
 
@@ -25,176 +26,6 @@ struct LayerMetadata {
 
     /// GPU contexts indexed by CUDA device ID.
     gpu_contexts: HashMap<i32, Arc<GpuContext>>,
-}
-
-/// Registration information for a KV cache layer.
-///
-/// This struct captures the memory layout of a layer's KV cache,
-/// supporting both contiguous and split (K/V-separated) storage formats.
-#[derive(Debug, Clone)]
-pub struct KVCacheRegistration {
-    /// GPU memory base pointer for this layer's KV cache.
-    pub data_ptr: u64,
-
-    /// Total size of the registered GPU memory region in bytes.
-    pub size_bytes: usize,
-
-    /// Number of blocks in this layer's cache.
-    pub num_blocks: usize,
-
-    /// Actual GPU-side segment size in bytes (one of K or V).
-    /// Used for CUDA memcpy sizes and GPU offset calculations.
-    pub bytes_per_block: usize,
-
-    /// Byte stride between a layer's consecutive blocks. Defaults to
-    /// `bytes_per_block` (dense layer-first); override via
-    /// [`KVCacheRegistration::with_block_stride`] when the step exceeds the
-    /// per-block copy size.
-    pub block_stride_bytes: usize,
-
-    /// Actual GPU-side total block size (`bytes_per_block * segments`).
-    pub block_size_bytes: usize,
-
-    /// Stride in bytes between K and V segments for split storage layouts.
-    /// Zero when using contiguous single-segment storage.
-    pub kv_stride_bytes: usize,
-
-    /// Number of segments per block (1 for contiguous, 2 for K/V split).
-    pub segments: usize,
-
-    /// CPU/SSD-side segment size, rounded up to SSD alignment.
-    /// Controls pinned memory allocation stride and SSD iovec lengths.
-    /// Equals `bytes_per_block` when no SSD padding is needed.
-    pub padded_bytes_per_block: usize,
-
-    /// CPU/SSD-side total block size (`padded_bytes_per_block * segments`).
-    /// Becomes `RawBlock.total_size` → `SlotMeta.total_size()` for SSD I/O.
-    pub padded_block_size_bytes: usize,
-}
-
-impl KVCacheRegistration {
-    /// Construct and validate a new registration.
-    ///
-    /// # Errors
-    /// Returns a simple error message string if validation fails.
-    pub(crate) fn new(
-        data_ptr: u64,
-        size_bytes: usize,
-        num_blocks: usize,
-        bytes_per_block: usize,
-        kv_stride_bytes: usize,
-        segments: usize,
-    ) -> Result<Self, String> {
-        // Basic non-zero checks
-        if data_ptr == 0 {
-            return Err("data_ptr must not be null".into());
-        }
-        if size_bytes == 0 {
-            return Err("size_bytes must be > 0".into());
-        }
-        if bytes_per_block == 0 || num_blocks == 0 || segments == 0 {
-            return Err("bytes_per_block, num_blocks, and segments must be non-zero".into());
-        }
-        if segments > 1 && kv_stride_bytes == 0 {
-            return Err("kv_stride_bytes must be > 0 when segments > 1".into());
-        }
-
-        // Compute block_size_bytes (may overflow)
-        let block_size_bytes = bytes_per_block
-            .checked_mul(segments)
-            .ok_or_else(|| "block_size_bytes overflow".to_string())?;
-
-        // Default: dense layer-first layout — block step equals the copied size.
-        let block_stride_bytes = bytes_per_block;
-        Self::check_layout_bounds(
-            num_blocks,
-            block_stride_bytes,
-            bytes_per_block,
-            kv_stride_bytes,
-            segments,
-            size_bytes,
-        )?;
-
-        Ok(Self {
-            data_ptr,
-            size_bytes,
-            num_blocks,
-            bytes_per_block,
-            block_stride_bytes,
-            block_size_bytes,
-            kv_stride_bytes,
-            segments,
-            padded_bytes_per_block: bytes_per_block,
-            padded_block_size_bytes: block_size_bytes,
-        })
-    }
-
-    /// Validate that `num_blocks` blocks, stepped by `block_stride` and reaching
-    /// `bytes_per_block` past the last segment, fit within `size_bytes`.
-    fn check_layout_bounds(
-        num_blocks: usize,
-        block_stride: usize,
-        bytes_per_block: usize,
-        kv_stride_bytes: usize,
-        segments: usize,
-        size_bytes: usize,
-    ) -> Result<(), String> {
-        let max_block_offset = (num_blocks - 1)
-            .checked_mul(block_stride)
-            .and_then(|o| o.checked_add((segments - 1).checked_mul(kv_stride_bytes)?))
-            .ok_or_else(|| "memory layout overflow".to_string())?;
-
-        let end = max_block_offset
-            .checked_add(bytes_per_block)
-            .ok_or_else(|| "memory layout end overflow".to_string())?;
-
-        if end > size_bytes {
-            return Err(format!(
-                "registered memory too small: need {} bytes, got {}",
-                end, size_bytes
-            ));
-        }
-        Ok(())
-    }
-
-    /// Override the per-block stride for a non-contiguous per-layer view — e.g.
-    /// one layer's blocks inside a fused buffer holding all layers per block,
-    /// where consecutive blocks sit `page_stride` apart but each copy spans only
-    /// `bytes_per_block`. Defaults to `bytes_per_block` (a contiguous per-layer
-    /// region, where the block step already equals the copy size).
-    ///
-    /// # Errors
-    /// `stride < bytes_per_block` (blocks would overlap), or the strided layout
-    /// overflows the registered region.
-    pub(crate) fn with_block_stride(mut self, stride: usize) -> Result<Self, String> {
-        if stride < self.bytes_per_block {
-            return Err(format!(
-                "block_stride {} must be >= bytes_per_block {}",
-                stride, self.bytes_per_block
-            ));
-        }
-        Self::check_layout_bounds(
-            self.num_blocks,
-            stride,
-            self.bytes_per_block,
-            self.kv_stride_bytes,
-            self.segments,
-            self.size_bytes,
-        )?;
-        self.block_stride_bytes = stride;
-        Ok(self)
-    }
-
-    /// Apply SSD alignment padding to segment sizes.
-    ///
-    /// Each segment (`bytes_per_block`) is rounded up to the next multiple of
-    /// `alignment` so that every iovec in split writev is independently aligned.
-    pub(crate) fn with_ssd_padding(mut self, alignment: usize) -> Self {
-        let padded = self.bytes_per_block.next_multiple_of(alignment);
-        self.padded_bytes_per_block = padded;
-        self.padded_block_size_bytes = padded * self.segments;
-        self
-    }
 }
 
 /// Per-GPU execution context.
@@ -217,8 +48,8 @@ pub struct GpuContext {
     /// Preferred NUMA node for this GPU (for memory allocation).
     preferred_numa: NumaNode,
 
-    /// KV cache layout registrations by layer name.
-    kv_caches: HashMap<String, KVCacheRegistration>,
+    /// KV cache layouts by layer name.
+    kv_caches: HashMap<String, KVCacheLayout>,
 
     /// CUDA context handle (kept alive for the lifetime of this context).
     _cuda_ctx: Arc<CudaContext>,
@@ -244,7 +75,7 @@ impl GpuContext {
         pp_rank: usize,
         numa_node: NumaNode,
         transfer_mode: TransferMode,
-        kv_caches: HashMap<String, KVCacheRegistration>,
+        kv_caches: HashMap<String, KVCacheLayout>,
     ) -> Result<Self, EngineError> {
         let worker_pool = GpuWorkerPool::spawn(device_id, numa_node, transfer_mode)?;
 
@@ -279,8 +110,8 @@ impl GpuContext {
         self.pp_rank
     }
 
-    /// Retrieve a layer's registration information.
-    pub(crate) fn get_registration(&self, layer_name: &str) -> Option<KVCacheRegistration> {
+    /// Retrieve a layer's KV cache layout.
+    pub(crate) fn get_layout(&self, layer_name: &str) -> Option<KVCacheLayout> {
         self.kv_caches.get(layer_name).cloned()
     }
 
@@ -296,7 +127,7 @@ pub(crate) struct GpuRegistration {
     pub(crate) pp_rank: usize,
     pub(crate) numa_node: NumaNode,
     pub(crate) transfer_mode: TransferMode,
-    pub(crate) kv_caches: HashMap<String, KVCacheRegistration>,
+    pub(crate) kv_caches: HashMap<String, KVCacheLayout>,
     pub(crate) layer_ids_by_name: HashMap<String, usize>,
 }
 
@@ -360,7 +191,7 @@ impl InstanceContext {
 
     fn build_layer_id_assignments(
         &self,
-        kv_caches: &HashMap<String, KVCacheRegistration>,
+        kv_caches: &HashMap<String, KVCacheLayout>,
         layer_ids_by_name: &HashMap<String, usize>,
     ) -> Result<Vec<(String, usize)>, EngineError> {
         let mut assignments = Vec::with_capacity(kv_caches.len());
@@ -492,7 +323,7 @@ impl InstanceContext {
         pp_rank: usize,
         numa_node: NumaNode,
         transfer_mode: TransferMode,
-        kv_caches: HashMap<String, KVCacheRegistration>,
+        kv_caches: HashMap<String, KVCacheLayout>,
     ) -> Result<Arc<GpuContext>, EngineError> {
         if device_id < 0 {
             return Err(EngineError::InvalidArgument(format!(
@@ -623,28 +454,12 @@ impl InstanceContext {
         let mut owners: Vec<Option<(i32, usize)>> = vec![None; total_slots];
 
         for gpu in metadata.gpu_contexts.values() {
-            if gpu.tp_rank() >= self.tp_size {
-                return Err(EngineError::InvalidArgument(format!(
-                    "registered gpu device {} has tp_rank {} out of range (tp_size {})",
-                    gpu.device_id(),
-                    gpu.tp_rank(),
-                    self.tp_size
-                )));
-            }
-
             for layer_name in gpu.kv_caches.keys() {
-                let layer_id = metadata.name_to_id.get(layer_name).ok_or_else(|| {
-                    EngineError::InvalidArgument(format!(
-                        "layer {layer_name} registered on device {} without a layer id",
-                        gpu.device_id()
-                    ))
-                })?;
+                let layer_id = metadata
+                    .name_to_id
+                    .get(layer_name)
+                    .expect("registered layer must have a committed id");
                 let slot_id = layer_id * self.tp_size + gpu.tp_rank();
-                if slot_id >= total_slots {
-                    return Err(EngineError::InvalidArgument(format!(
-                        "slot_id {slot_id} out of range (total_slots {total_slots})"
-                    )));
-                }
                 match owners[slot_id] {
                     None => owners[slot_id] = Some((gpu.device_id(), gpu.pp_rank())),
                     Some((existing_device, existing_pp_rank)) => {

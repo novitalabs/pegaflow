@@ -13,14 +13,12 @@ use std::sync::Arc;
 use log::{debug, info};
 
 use crate::block::{BlockKey, LayerSave, RawBlock, Segment};
-use crate::pinned_pool::MappedPinnedPtr;
 
 /// Grouped insert entries: each hash maps to its per-slot `RawBlock`s.
 pub(crate) type InsertEntries = Vec<(BlockKey, Vec<(usize, Arc<RawBlock>)>)>;
-use crate::gpu_worker::{SaveBlock, SaveLayerData};
-use crate::instance::KVCacheRegistration;
+use crate::gpu_worker::{LayerTransferData, TransferBlock};
+use crate::layout::KVCacheLayout;
 use crate::metrics::core_metrics;
-use crate::pinned_pool::PinnedAllocation;
 use crate::{EngineError, PegaEngine};
 use pegaflow_common::NumaNode;
 
@@ -28,69 +26,18 @@ use pegaflow_common::NumaNode;
 // Types sent to the insert worker (deferred Phase 4)
 // ============================================================================
 
-/// How a layer's blocks are laid out in pinned memory after GPU copy.
+/// One layer's saved blocks, ready for cache insertion.
 ///
-/// Sizes here are *padded* (SSD-aligned). GPU copies use actual (unpadded)
-/// sizes from `KVCacheRegistration`; the padding tail is unused.
-pub(crate) enum LayerAlloc {
-    Split {
-        k_allocation: Arc<PinnedAllocation>,
-        v_allocation: Arc<PinnedAllocation>,
-        k_base: MappedPinnedPtr,
-        v_base: MappedPinnedPtr,
-        /// Per-segment stride in pinned memory (padded for SSD alignment).
-        padded_segment_size: usize,
-    },
-    Contiguous {
-        allocation: Arc<PinnedAllocation>,
-        base: MappedPinnedPtr,
-    },
-}
-
-impl LayerAlloc {
-    /// Construct a `RawBlock` for the i-th block in this allocation.
-    fn make_raw_block(&self, index: usize, block_size: usize) -> Arc<RawBlock> {
-        match self {
-            LayerAlloc::Split {
-                k_allocation,
-                v_allocation,
-                k_base,
-                v_base,
-                padded_segment_size,
-                ..
-            } => {
-                let half = block_size / 2;
-                let k_ptr = k_base.add(index * padded_segment_size).host();
-                let v_ptr = v_base.add(index * padded_segment_size).host();
-                // Safety: pointers are within pinned allocations, validated during allocation.
-                Arc::new(RawBlock::two_segments(
-                    Segment::new(k_ptr, half, Arc::clone(k_allocation)),
-                    Segment::new(v_ptr, half, Arc::clone(v_allocation)),
-                ))
-            }
-            LayerAlloc::Contiguous {
-                allocation, base, ..
-            } => {
-                let ptr = base.add(index * block_size).host();
-                // Safety: pointer is within pinned allocation, validated during allocation.
-                Arc::new(RawBlock::single_segment(Segment::new(
-                    ptr,
-                    block_size,
-                    Arc::clone(allocation),
-                )))
-            }
-        }
-    }
-}
-
-/// Per-layer data for deferred RawBlock construction.
+/// The `RawBlock`s are constructed at allocation time (Phase 2) and shared
+/// with the GPU copy task; their segments own the pinned allocations, so no
+/// separate allocation bookkeeping is needed.
 pub(crate) struct RawSaveLayer {
     pub slot_id: usize,
     /// Padded block size (SSD-aligned). Becomes `RawBlock.total_size` → `SlotMeta.total_size()`.
     pub padded_block_size: usize,
-    /// Allocations for this layer. Vec length is 1 (batch) or num_blocks (blockwise).
-    pub allocs: Vec<LayerAlloc>,
-    /// Block hashes in allocation order.
+    /// Saved blocks, parallel to `block_hashes`.
+    pub blocks: Vec<Arc<RawBlock>>,
+    /// Block hashes in save order.
     pub block_hashes: Vec<Vec<u8>>,
 }
 
@@ -102,84 +49,79 @@ pub(crate) struct RawSaveBatch {
     pub layers: Vec<RawSaveLayer>,
 }
 
+/// Unified per-layer context for the save pipeline.
+/// Combines metadata, filtered blocks, and allocation results.
+struct LayerContext {
+    layer_name: String,
+    layout: KVCacheLayout,
+    slot_id: usize,
+    /// Blocks to save: (block_idx, hash). Filtered in Phase 1.
+    blocks_to_save: Vec<(usize, Vec<u8>)>,
+    /// Host-side block images, parallel to `blocks_to_save`.
+    /// Constructed in Phase 2; shared with the GPU copy task.
+    raw_blocks: Vec<Arc<RawBlock>>,
+}
+
 /// Build insert entries from a raw batch (called by the insert worker).
 ///
 /// Returns `(entries, total_bytes, total_blocks)` where entries is grouped
 /// by hash: `Vec<(BlockKey, Vec<(slot_id, Arc<RawBlock>)>)>`.
 pub(crate) fn build_insert_entries(batch: &RawSaveBatch) -> (InsertEntries, u64, usize) {
-    use std::collections::HashMap;
-
-    if let Some(entries) = build_ordered_insert_entries(batch) {
-        return entries;
-    }
-
-    let mut hash_entries: HashMap<Vec<u8>, Vec<(usize, Arc<RawBlock>)>> = HashMap::new();
     let mut total_bytes: u64 = 0;
     let mut total_blocks: usize = 0;
-
     for layer in &batch.layers {
-        let blockwise = layer.allocs.len() > 1;
-        for (i, hash) in layer.block_hashes.iter().enumerate() {
-            let (alloc_idx, offset_in_alloc) = if blockwise {
-                (i, 0) // Each block has its own allocation
-            } else {
-                (0, i) // All blocks in one allocation
-            };
-            let block =
-                layer.allocs[alloc_idx].make_raw_block(offset_in_alloc, layer.padded_block_size);
-            hash_entries
-                .entry(hash.clone())
-                .or_default()
-                .push((layer.slot_id, block));
-        }
         let layer_blocks = layer.block_hashes.len();
         total_blocks += layer_blocks;
         total_bytes += (layer.padded_block_size as u64).saturating_mul(layer_blocks as u64);
     }
 
-    let entries: InsertEntries = hash_entries
-        .into_iter()
-        .map(|(hash, slots)| (BlockKey::new(batch.namespace.clone(), hash), slots))
-        .collect();
-
+    let entries =
+        build_ordered_insert_entries(batch).unwrap_or_else(|| build_hashed_insert_entries(batch));
     (entries, total_bytes, total_blocks)
 }
 
-fn build_ordered_insert_entries(batch: &RawSaveBatch) -> Option<(InsertEntries, u64, usize)> {
+/// Fast path: all layers share one hash order, so entries can be built
+/// block-by-block without a hash map.
+fn build_ordered_insert_entries(batch: &RawSaveBatch) -> Option<InsertEntries> {
     let first_layer = batch.layers.first()?;
-    let num_entries = first_layer.block_hashes.len();
-    if batch.layers.iter().any(|layer| {
-        layer.block_hashes.len() != num_entries || layer.block_hashes != first_layer.block_hashes
-    }) {
+    if batch
+        .layers
+        .iter()
+        .any(|layer| layer.block_hashes != first_layer.block_hashes)
+    {
         return None;
     }
 
-    let mut total_blocks = 0usize;
-    let mut total_bytes = 0u64;
-    for layer in &batch.layers {
-        total_blocks += layer.block_hashes.len();
-        total_bytes +=
-            (layer.padded_block_size as u64).saturating_mul(layer.block_hashes.len() as u64);
-    }
-
-    let mut entries = Vec::with_capacity(num_entries);
+    let mut entries = Vec::with_capacity(first_layer.block_hashes.len());
     for (block_idx, hash) in first_layer.block_hashes.iter().enumerate() {
-        let mut slots = Vec::with_capacity(batch.layers.len());
-        for layer in &batch.layers {
-            let blockwise = layer.allocs.len() > 1;
-            let (alloc_idx, offset_in_alloc) = if blockwise {
-                (block_idx, 0)
-            } else {
-                (0, block_idx)
-            };
-            let block =
-                layer.allocs[alloc_idx].make_raw_block(offset_in_alloc, layer.padded_block_size);
-            slots.push((layer.slot_id, block));
-        }
+        let slots = batch
+            .layers
+            .iter()
+            .map(|layer| (layer.slot_id, Arc::clone(&layer.blocks[block_idx])))
+            .collect();
         entries.push((BlockKey::new(batch.namespace.clone(), hash.clone()), slots));
     }
+    Some(entries)
+}
 
-    Some((entries, total_bytes, total_blocks))
+/// Fallback for heterogeneous per-layer hash sets: group via a hash map.
+fn build_hashed_insert_entries(batch: &RawSaveBatch) -> InsertEntries {
+    use std::collections::HashMap;
+
+    let mut hash_entries: HashMap<Vec<u8>, Vec<(usize, Arc<RawBlock>)>> = HashMap::new();
+    for layer in &batch.layers {
+        for (i, hash) in layer.block_hashes.iter().enumerate() {
+            hash_entries
+                .entry(hash.clone())
+                .or_default()
+                .push((layer.slot_id, Arc::clone(&layer.blocks[i])));
+        }
+    }
+
+    hash_entries
+        .into_iter()
+        .map(|(hash, slots)| (BlockKey::new(batch.namespace.clone(), hash), slots))
+        .collect()
 }
 
 // ============================================================================
@@ -231,9 +173,11 @@ impl PegaEngine {
         saves: Vec<LayerSave>,
         numa_hint: Option<NumaNode>,
     ) -> Result<(), EngineError> {
+        self.query_leases.sweep_expired();
+
         let batch_start = std::time::Instant::now();
         let total_layers = saves.len();
-        self.query_leases.sweep_expired();
+
         let instance = self.get_instance(instance_id)?;
         instance.ensure_all_slots_registered()?;
         let namespace = instance.namespace().to_string();
@@ -242,23 +186,10 @@ impl PegaEngine {
         // ── Phase 0: Resolve per-layer metadata and build valid_blocks ──
         trace_scope!("save.resolve_metadata", _s);
 
-        /// Unified per-layer context for the save pipeline.
-        /// Combines metadata, filtered blocks, and allocation results.
-        struct LayerContext {
-            layer_name: String,
-            registration: KVCacheRegistration,
-            slot_id: usize,
-            padded_block_size: usize,
-            /// Blocks to save: (block_idx, hash). Filtered in Phase 1.
-            blocks_to_save: Vec<(usize, Vec<u8>)>,
-            /// Allocation results, populated in Phase 2.
-            /// Vec to support blockwise allocation (1 element for batch, N for blockwise).
-            allocs: Vec<LayerAlloc>,
-        }
+        let gpu_context = instance.get_gpu_for_save_group(device_id, tp_rank, pp_rank)?;
 
-        let gpu = instance.get_gpu_for_save_group(device_id, tp_rank, pp_rank)?;
-
-        let mut layers: Vec<LayerContext> = Vec::with_capacity(saves.len());
+        let mut layer_contexts: Vec<LayerContext> = Vec::with_capacity(saves.len());
+        let mut hashes_to_save: HashSet<Vec<u8>> = HashSet::new();
 
         for LayerSave {
             layer_name,
@@ -266,6 +197,8 @@ impl PegaEngine {
             block_hashes,
         } in saves
         {
+            // Engine-level contract: in-process callers bypass the RPC-layer
+            // validation in service.rs, and zip below would silently truncate.
             if block_ids.len() != block_hashes.len() {
                 return Err(EngineError::InvalidArgument(format!(
                     "block_ids length {} does not match block_hashes {} for layer {}",
@@ -279,49 +212,48 @@ impl PegaEngine {
                 EngineError::InvalidArgument(format!("layer {layer_name} unknown"))
             })?;
 
-            let registration = gpu.get_registration(&layer_name).ok_or_else(|| {
+            let layout = gpu_context.get_layout(&layer_name).ok_or_else(|| {
                 EngineError::InvalidArgument(format!("layer {layer_name} not registered on device"))
             })?;
 
             let slot_id = instance.get_slot_index(layer_id, tp_rank)?;
-            if slot_id >= total_slots {
-                return Err(EngineError::InvalidArgument(format!(
-                    "slot_id {} out of range (total_slots {})",
-                    slot_id, total_slots
-                )));
-            }
+
+            let num_blocks = layout.num_blocks();
 
             let blocks_to_save: Vec<(usize, Vec<u8>)> = block_ids
                 .into_iter()
                 .zip(block_hashes)
-                .filter(|(id, _)| *id >= 0)
-                .filter_map(|(id, hash)| {
+                .map(|(id, hash)| {
                     let idx = id as usize;
-                    if idx < registration.num_blocks {
-                        Some((idx, hash))
-                    } else {
-                        None
+                    if idx >= num_blocks {
+                        return Err(EngineError::InvalidArgument(format!(
+                            "block_id {} out of range (num_blocks={}) for layer {}",
+                            id, num_blocks, layer_name
+                        )));
                     }
+                    Ok((idx, hash))
                 })
-                .collect();
+                .collect::<Result<_, _>>()?;
 
             if blocks_to_save.is_empty() {
                 continue;
             }
 
-            let padded_block_size = registration.padded_block_size_bytes;
-            layers.push(LayerContext {
+            for (_, hash) in &blocks_to_save {
+                hashes_to_save.insert(hash.clone());
+            }
+
+            layer_contexts.push(LayerContext {
                 layer_name,
-                registration,
+                layout,
                 slot_id,
-                padded_block_size,
                 blocks_to_save,
-                allocs: Vec::new(),
+                raw_blocks: Vec::new(),
             });
         }
         trace_drop!(_s);
 
-        if layers.is_empty() {
+        if layer_contexts.is_empty() {
             info!(
                 "save_batch skipped (no valid blocks): instance_id={} tp_rank={} device_id={} layers={}",
                 instance_id, tp_rank, device_id, total_layers
@@ -329,38 +261,9 @@ impl PegaEngine {
             return Ok(());
         }
 
-        // ── Phase 1: Union-filter hashes across all layers ──
-        //
-        // Layers may have different hash sets (heterogeneous). Compute the
-        // union of all hashes, filter once against the cache, then per-layer
-        // in-memory filter to determine which blocks each layer needs to save.
+        // ── Phase 1: Filter hashes against cache ──
 
         trace_scope!("save.hash_filter", _s);
-
-        let shared_hash_order = if let Some((first_layer, rest_layers)) = layers.split_first() {
-            rest_layers.iter().all(|layer| {
-                layer.blocks_to_save.len() == first_layer.blocks_to_save.len()
-                    && layer
-                        .blocks_to_save
-                        .iter()
-                        .zip(&first_layer.blocks_to_save)
-                        .all(|((_, hash), (_, first_hash))| hash == first_hash)
-            })
-        } else {
-            false
-        };
-
-        let mut hashes_to_save: HashSet<Vec<u8>> = HashSet::new();
-        let hash_source_layers = if shared_hash_order {
-            &layers[..1]
-        } else {
-            &layers[..]
-        };
-        for layer in hash_source_layers {
-            for (_, hash) in &layer.blocks_to_save {
-                hashes_to_save.insert(hash.clone());
-            }
-        }
 
         // Single in-place cache filter for all unique hashes
         self.storage
@@ -368,23 +271,18 @@ impl PegaEngine {
 
         if hashes_to_save.is_empty() {
             trace_drop!(_s);
-            debug!(
-                "save_batch skipped (all cached): instance_id={} tp_rank={} device_id={} layers={}",
-                instance_id, tp_rank, device_id, total_layers
-            );
             return Ok(());
         }
 
         // Per-layer filter: keep only blocks whose hash needs saving
         let mut total_blocks_to_save = 0usize;
-        for layer in &mut layers {
-            layer
-                .blocks_to_save
+        for ctx in &mut layer_contexts {
+            ctx.blocks_to_save
                 .retain(|(_, hash)| hashes_to_save.contains(hash.as_slice()));
-            total_blocks_to_save += layer.blocks_to_save.len();
+            total_blocks_to_save += ctx.blocks_to_save.len();
         }
         // Remove layers with no blocks to save
-        layers.retain(|layer| !layer.blocks_to_save.is_empty());
+        layer_contexts.retain(|ctx| !ctx.blocks_to_save.is_empty());
 
         trace_drop!(_s, || {
             [
@@ -393,11 +291,7 @@ impl PegaEngine {
             ]
         });
 
-        if layers.is_empty() {
-            debug!(
-                "save_batch skipped (all filtered): instance_id={} tp_rank={} device_id={} layers={}",
-                instance_id, tp_rank, device_id, total_layers
-            );
+        if layer_contexts.is_empty() {
             return Ok(());
         }
 
@@ -406,150 +300,88 @@ impl PegaEngine {
         trace_scope!("save.pinned_alloc", _s);
         let save_numa_node = match numa_hint {
             Some(hint) => instance.validate_save_numa_hint(tp_rank, pp_rank, hint)?,
-            None => gpu.preferred_numa(),
+            None => gpu_context.preferred_numa(),
         };
         let numa_node = Some(save_numa_node);
         let blockwise = self.storage.blockwise_alloc();
 
-        let mut gpu_save_layers: Vec<SaveLayerData> = Vec::with_capacity(layers.len());
+        let mut gpu_save_layers: Vec<LayerTransferData> = Vec::with_capacity(layer_contexts.len());
 
-        for layer in &mut layers {
-            let registration = &layer.registration;
-            let num_blocks = layer.blocks_to_save.len();
+        for ctx in &mut layer_contexts {
+            let layout = &ctx.layout;
+            let num_blocks = ctx.blocks_to_save.len();
 
             // Blockwise: allocate once per block; Batch: allocate once for all blocks
             let alloc_count = if blockwise { num_blocks } else { 1 };
             let blocks_per_alloc = if blockwise { 1 } else { num_blocks };
 
-            let is_split = registration.segments == 2
-                && registration.kv_stride_bytes > registration.bytes_per_block;
+            let alloc_pinned = |stride: usize, what: &str| {
+                let alloc_size = (stride as u64)
+                    .checked_mul(blocks_per_alloc as u64)
+                    .and_then(NonZeroU64::new)
+                    .ok_or_else(|| {
+                        EngineError::Storage(format!("allocation size overflow for {what}"))
+                    })?;
+                self.storage.allocate(alloc_size, numa_node).ok_or_else(|| {
+                    EngineError::Storage(format!("pinned pool exhausted while allocating {what}"))
+                })
+            };
 
-            if is_split {
-                let padded_segment_size = registration.padded_bytes_per_block;
-
-                for _ in 0..alloc_count {
-                    let alloc_size = (padded_segment_size as u64)
-                        .checked_mul(blocks_per_alloc as u64)
-                        .and_then(NonZeroU64::new)
-                        .ok_or_else(|| {
-                            EngineError::Storage(
-                                "allocation size overflow for K segments".to_string(),
-                            )
-                        })?;
-
-                    let k_allocation =
-                        self.storage
-                            .allocate(alloc_size, numa_node)
-                            .ok_or_else(|| {
-                                EngineError::Storage(
-                                    "pinned pool exhausted while allocating K segment buffer"
-                                        .to_string(),
-                                )
-                            })?;
-                    let v_allocation =
-                        self.storage
-                            .allocate(alloc_size, numa_node)
-                            .ok_or_else(|| {
-                                EngineError::Storage(
-                                    "pinned pool exhausted while allocating V segment buffer"
-                                        .to_string(),
-                                )
-                            })?;
-
-                    let k_base = k_allocation.mapped_ptr();
-                    let v_base = v_allocation.mapped_ptr();
-
-                    layer.allocs.push(LayerAlloc::Split {
-                        k_allocation,
-                        v_allocation,
-                        k_base,
-                        v_base,
-                        padded_segment_size,
-                    });
+            // Allocate pinned memory and construct the host-side RawBlocks in
+            // save order. Strides are padded (SSD-aligned); GPU copies later
+            // use actual (unpadded) sizes, leaving the padding tail unused.
+            let mut raw_blocks: Vec<Arc<RawBlock>> = Vec::with_capacity(num_blocks);
+            for _ in 0..alloc_count {
+                if layout.is_split() {
+                    let stride = layout.padded_segment_bytes();
+                    let k_alloc = alloc_pinned(stride, "K segment buffer")?;
+                    let v_alloc = alloc_pinned(stride, "V segment buffer")?;
+                    for i in 0..blocks_per_alloc {
+                        let offset = i * stride;
+                        // Safety: offsets are within the just-made allocations.
+                        raw_blocks.push(Arc::new(RawBlock::two_segments(
+                            Segment::new(
+                                k_alloc.mapped_ptr().add(offset).host(),
+                                stride,
+                                Arc::clone(&k_alloc),
+                            ),
+                            Segment::new(
+                                v_alloc.mapped_ptr().add(offset).host(),
+                                stride,
+                                Arc::clone(&v_alloc),
+                            ),
+                        )));
+                    }
+                } else {
+                    let stride = layout.padded_block_bytes();
+                    let alloc = alloc_pinned(stride, "block buffer")?;
+                    for i in 0..blocks_per_alloc {
+                        // Safety: offset is within the just-made allocation.
+                        raw_blocks.push(Arc::new(RawBlock::single_segment(Segment::new(
+                            alloc.mapped_ptr().add(i * stride).host(),
+                            stride,
+                            Arc::clone(&alloc),
+                        ))));
+                    }
                 }
-
-                // Build SaveBlocks from layer.allocs
-                let save_blocks: Vec<SaveBlock> = layer
-                    .blocks_to_save
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (block_idx, _))| {
-                        let (alloc_idx, offset_in_alloc) = if blockwise { (i, 0) } else { (0, i) };
-                        let (k_base, v_base) = match &layer.allocs[alloc_idx] {
-                            LayerAlloc::Split { k_base, v_base, .. } => (*k_base, *v_base),
-                            _ => unreachable!(),
-                        };
-                        let offset = offset_in_alloc * padded_segment_size;
-                        let k_dst = k_base.add(offset);
-                        let v_dst = v_base.add(offset);
-                        SaveBlock {
-                            block_idx: *block_idx,
-                            k_dst,
-                            v_dst: Some(v_dst),
-                        }
-                    })
-                    .collect();
-
-                gpu_save_layers.push(SaveLayerData {
-                    layer_name: layer.layer_name.clone(),
-                    registration: registration.clone(),
-                    blocks: save_blocks,
-                });
-            } else {
-                let padded_block_size = layer.padded_block_size;
-
-                for _ in 0..alloc_count {
-                    let alloc_size = (padded_block_size as u64)
-                        .checked_mul(blocks_per_alloc as u64)
-                        .and_then(NonZeroU64::new)
-                        .ok_or_else(|| {
-                            EngineError::Storage("allocation size overflow".to_string())
-                        })?;
-
-                    let allocation =
-                        self.storage
-                            .allocate(alloc_size, numa_node)
-                            .ok_or_else(|| {
-                                EngineError::Storage(
-                                    "pinned pool exhausted while allocating contiguous block buffer"
-                                        .to_string(),
-                                )
-                            })?;
-
-                    let base = allocation.mapped_ptr();
-
-                    layer
-                        .allocs
-                        .push(LayerAlloc::Contiguous { allocation, base });
-                }
-
-                // Build SaveBlocks from layer.allocs
-                let save_blocks: Vec<SaveBlock> = layer
-                    .blocks_to_save
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (block_idx, _))| {
-                        let (alloc_idx, offset_in_alloc) = if blockwise { (i, 0) } else { (0, i) };
-                        let base = match &layer.allocs[alloc_idx] {
-                            LayerAlloc::Contiguous { base, .. } => *base,
-                            _ => unreachable!(),
-                        };
-                        let offset = offset_in_alloc * padded_block_size;
-                        let dst = base.add(offset);
-                        SaveBlock {
-                            block_idx: *block_idx,
-                            k_dst: dst,
-                            v_dst: None,
-                        }
-                    })
-                    .collect();
-
-                gpu_save_layers.push(SaveLayerData {
-                    layer_name: layer.layer_name.clone(),
-                    registration: registration.clone(),
-                    blocks: save_blocks,
-                });
             }
+
+            let save_blocks: Vec<TransferBlock> = ctx
+                .blocks_to_save
+                .iter()
+                .zip(&raw_blocks)
+                .map(|((block_idx, _), block)| TransferBlock {
+                    block_idx: *block_idx,
+                    block: Arc::clone(block),
+                })
+                .collect();
+
+            gpu_save_layers.push(LayerTransferData {
+                layer_name: ctx.layer_name.clone(),
+                layout: layout.clone(),
+                blocks: save_blocks,
+            });
+            ctx.raw_blocks = raw_blocks;
         }
         trace_drop!(_s);
 
@@ -557,7 +389,7 @@ impl PegaEngine {
 
         trace_future!(
             "save.gpu_copy",
-            gpu.worker_pool().batch_save(gpu_save_layers)
+            gpu_context.worker_pool().batch_save(gpu_save_layers)
         )
         .await?;
 
@@ -566,9 +398,9 @@ impl PegaEngine {
         // Record metrics on the RPC path (cheap, measures RPC-visible latency)
         let metrics = core_metrics();
         let mut total_bytes = 0u64;
-        for layer in &layers {
-            let num_blocks = layer.blocks_to_save.len();
-            let bytes = (layer.padded_block_size as u64)
+        for ctx in &layer_contexts {
+            let num_blocks = ctx.blocks_to_save.len();
+            let bytes = (ctx.layout.padded_block_bytes() as u64)
                 .checked_mul(num_blocks as u64)
                 .unwrap_or(0);
             total_bytes += bytes;
@@ -587,7 +419,7 @@ impl PegaEngine {
             pp_rank,
             device_id,
             total_layers,
-            layers.len(),
+            layer_contexts.len(),
             total_blocks_to_save,
             total_bytes,
             save_numa_node,
@@ -595,18 +427,18 @@ impl PegaEngine {
         );
 
         // Build RawSaveBatch and send to insert worker (fire-and-forget)
-        let raw_layers: Vec<RawSaveLayer> = layers
+        let raw_layers: Vec<RawSaveLayer> = layer_contexts
             .into_iter()
-            .map(|layer| {
-                let block_hashes: Vec<Vec<u8>> = layer
+            .map(|ctx| {
+                let block_hashes: Vec<Vec<u8>> = ctx
                     .blocks_to_save
                     .into_iter()
                     .map(|(_, hash)| hash)
                     .collect();
                 RawSaveLayer {
-                    slot_id: layer.slot_id,
-                    padded_block_size: layer.padded_block_size,
-                    allocs: layer.allocs,
+                    slot_id: ctx.slot_id,
+                    padded_block_size: ctx.layout.padded_block_bytes(),
+                    blocks: ctx.raw_blocks,
                     block_hashes,
                 }
             })

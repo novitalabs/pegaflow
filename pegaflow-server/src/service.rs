@@ -158,6 +158,12 @@ impl GrpcEngineService {
                     layer.layer_name
                 )));
             }
+            if let Some(id) = layer.block_ids.iter().find(|id| **id < 0) {
+                return Err(Status::invalid_argument(format!(
+                    "negative block_id {} in layer {}",
+                    id, layer.layer_name
+                )));
+            }
         }
         Ok(())
     }

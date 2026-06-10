@@ -25,8 +25,6 @@ use std::sync::Arc;
 
 use cudarc::driver::CudaStream;
 
-use crate::KVCacheRegistration;
-
 /// One contiguous copy between device memory and mapped, pinned host memory.
 ///
 /// `device` is an absolute device virtual address. `host` is the host virtual
@@ -84,37 +82,4 @@ impl std::str::FromStr for TransferMode {
             )),
         }
     }
-}
-
-/// Calculate the byte offset for a given block/segment combination, relative to
-/// the layer's `data_ptr`.
-pub(crate) fn segment_offset(
-    registration: &KVCacheRegistration,
-    block_idx: usize,
-    segment_idx: usize,
-) -> Result<usize, String> {
-    if segment_idx >= registration.segments {
-        return Err("Segment index out of range".to_string());
-    }
-
-    let base = block_idx
-        .checked_mul(registration.block_stride_bytes)
-        .ok_or_else(|| "Block offset overflow".to_string())?;
-
-    let segment_offset = segment_idx
-        .checked_mul(registration.kv_stride_bytes)
-        .ok_or_else(|| "Segment offset overflow".to_string())?;
-
-    let offset = base
-        .checked_add(segment_offset)
-        .ok_or_else(|| "Combined offset overflow".to_string())?;
-
-    if offset + registration.bytes_per_block > registration.size_bytes {
-        return Err(format!(
-            "Block {} segment {} exceeds registered memory (offset {}, size {}, limit {})",
-            block_idx, segment_idx, offset, registration.bytes_per_block, registration.size_bytes
-        ));
-    }
-
-    Ok(offset)
 }

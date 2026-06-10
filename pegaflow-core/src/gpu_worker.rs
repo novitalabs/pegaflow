@@ -5,19 +5,17 @@ use log::{debug, error, info, warn};
 use logforth::diagnostic::ThreadLocalDiagnostic;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::EngineError;
 use crate::block::RawBlock;
+use crate::layout::{BlockCopies, KVCacheLayout};
 use crate::metrics::core_metrics;
-use crate::pinned_pool::MappedPinnedPtr;
 use crate::sync_state::LoadState;
-use crate::transfer::{
-    self, CopyDesc, KernelBackend, MemcpyBackend, TransferBackend, TransferMode,
-};
-use crate::{EngineError, KVCacheRegistration};
+use crate::transfer::{CopyDesc, KernelBackend, MemcpyBackend, TransferBackend, TransferMode};
 use pegaflow_common::{NumaNode, pin_thread_to_numa_node};
 
 /// A task to load KV blocks from CPU to GPU for multiple layers
 pub(crate) struct LoadTask {
-    pub layers: Vec<LayerLoadData>,
+    pub layers: Vec<LayerTransferData>,
     pub completion: LoadCompletion,
 }
 
@@ -53,48 +51,30 @@ impl LoadCompletion {
     }
 }
 
-/// Data for loading a single layer
-pub(crate) struct LayerLoadData {
+/// One layer in a transfer task (either direction): GPU layout plus the
+/// blocks to move.
+pub(crate) struct LayerTransferData {
     pub layer_name: String,
-    pub registration: KVCacheRegistration,
-    pub blocks: Vec<LoadBlock>,
+    pub layout: KVCacheLayout,
+    pub blocks: Vec<TransferBlock>,
 }
 
-pub(crate) struct LoadBlock {
+/// One block in a transfer: the GPU slot index and its host-side image.
+/// Loads copy `block` -> GPU slot, saves copy GPU slot -> `block`.
+pub(crate) struct TransferBlock {
     pub block_idx: usize,
     pub block: Arc<RawBlock>,
 }
 
 /// A task to save KV blocks from GPU to CPU for multiple layers.
-/// Caller pre-allocates pinned memory, worker does the GPU->CPU copy.
+/// Caller pre-allocates the host blocks, worker does the GPU->CPU copy.
 /// All layers are copied on the same CUDA stream with a single synchronization.
 pub(crate) struct SaveTask {
-    pub layers: Vec<SaveLayerData>,
+    pub layers: Vec<LayerTransferData>,
     pub reply: oneshot::Sender<Result<(), EngineError>>,
     #[cfg(feature = "tracing")]
     pub trace_ctx: Option<::fastrace::prelude::SpanContext>,
 }
-
-/// Data for saving a single layer's blocks from GPU to CPU.
-pub(crate) struct SaveLayerData {
-    pub layer_name: String,
-    pub registration: KVCacheRegistration,
-    pub blocks: Vec<SaveBlock>,
-}
-
-pub(crate) struct SaveBlock {
-    pub block_idx: usize,
-    pub k_dst: MappedPinnedPtr,
-    pub v_dst: Option<MappedPinnedPtr>,
-}
-
-// SAFETY: SaveBlock contains raw pointers to pinned memory that is managed
-// by PinnedAllocation. The caller ensures the backing memory stays alive
-// until the task completes.
-unsafe impl Send for SaveBlock {}
-// SAFETY: SaveLayerData contains SaveBlocks which hold raw pointers to pinned
-// memory. Same safety guarantees as SaveBlock apply.
-unsafe impl Send for SaveLayerData {}
 
 /// Per-GPU worker pool with dedicated load and save threads
 pub(crate) struct GpuWorkerPool {
@@ -197,7 +177,10 @@ impl GpuWorkerPool {
     /// Submit a multi-layer save task (GPU -> CPU) - async, wait for completion.
     /// All layers are copied on the same CUDA stream with a single synchronization,
     /// which is significantly faster than submitting individual per-layer tasks.
-    pub(crate) async fn batch_save(&self, layers: Vec<SaveLayerData>) -> Result<(), EngineError> {
+    pub(crate) async fn batch_save(
+        &self,
+        layers: Vec<LayerTransferData>,
+    ) -> Result<(), EngineError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let task = SaveTask {
             layers,
@@ -312,120 +295,81 @@ fn save_worker_loop(
     info!("Save worker shutting down: device={}", device_id);
 }
 
-fn device_addr(
-    registration: &KVCacheRegistration,
-    offset: usize,
-    size: usize,
-    layer_name: &str,
-) -> Result<u64, EngineError> {
-    let end = offset.checked_add(size).ok_or_else(|| {
-        EngineError::Storage(format!(
-            "layer {layer_name}: GPU copy range overflow: offset={offset} size={size}"
-        ))
-    })?;
-    if end > registration.size_bytes {
-        return Err(EngineError::Storage(format!(
-            "layer {layer_name}: GPU copy range exceeds registration: offset={offset} size={size} registration_size={}",
-            registration.size_bytes
-        )));
+/// Build one `CopyDesc` per GPU segment of every block across all layers,
+/// pairing device ranges from the layout with the host segments of each
+/// block's `RawBlock`. Direction-agnostic: load and save submit the same
+/// descriptors to `h2d`/`d2h` respectively.
+///
+/// Returns `(copies, total_bytes)`.
+fn build_copy_descs(layers: &[LayerTransferData]) -> Result<(Vec<CopyDesc>, usize), EngineError> {
+    let mut copies: Vec<CopyDesc> = Vec::new();
+    let mut total_bytes = 0usize;
+
+    for layer in layers {
+        let layer_name = &layer.layer_name;
+
+        for block in &layer.blocks {
+            let block_copies = layer
+                .layout
+                .block_copies(block.block_idx)
+                .map_err(|e| EngineError::Storage(format!("layer {layer_name}: {e}")))?;
+
+            match block_copies {
+                BlockCopies::Split { k, v } => {
+                    let k_ptr = block.block.segment_mapped_ptr(0).unwrap();
+                    // SAFETY: For a contiguous host block (segment 1 absent), the
+                    // allocation is 2 * segment size, so k + k.bytes is in bounds.
+                    let v_ptr = block
+                        .block
+                        .segment_mapped_ptr(1)
+                        .unwrap_or_else(|| k_ptr.add(k.bytes));
+
+                    copies.push(CopyDesc {
+                        device: k.addr,
+                        host: k_ptr.host().as_ptr(),
+                        host_device: k_ptr.device().as_ptr() as u64,
+                        size: k.bytes,
+                    });
+                    copies.push(CopyDesc {
+                        device: v.addr,
+                        host: v_ptr.host().as_ptr(),
+                        host_device: v_ptr.device().as_ptr() as u64,
+                        size: v.bytes,
+                    });
+                    total_bytes += k.bytes + v.bytes;
+                }
+                BlockCopies::Contiguous(c) => {
+                    let ptr = block.block.segment_mapped_ptr(0).unwrap();
+                    copies.push(CopyDesc {
+                        device: c.addr,
+                        host: ptr.host().as_ptr(),
+                        host_device: ptr.device().as_ptr() as u64,
+                        size: c.bytes,
+                    });
+                    total_bytes += c.bytes;
+                }
+            }
+        }
     }
 
-    let addr = registration
-        .data_ptr
-        .checked_add(offset as u64)
-        .ok_or_else(|| {
-            EngineError::Storage(format!(
-                "layer {layer_name}: GPU pointer overflow: base=0x{:x} offset={offset}",
-                registration.data_ptr
-            ))
-        })?;
-    addr.checked_add(size as u64).ok_or_else(|| {
-        EngineError::Storage(format!(
-            "layer {layer_name}: GPU pointer range overflow: addr=0x{addr:x} size={size}"
-        ))
-    })?;
-    Ok(addr)
+    Ok((copies, total_bytes))
 }
 
 /// Process a load task: copy blocks from CPU pinned memory to GPU for multiple
 /// layers. All layers and segments are collected into one descriptor batch,
 /// handed to a single backend (memcpy or kernel), then synchronized once.
 fn process_load_task(
-    layers: &[LayerLoadData],
+    layers: &[LayerTransferData],
     stream: &Arc<CudaStream>,
     backend: &dyn TransferBackend,
 ) -> Result<(), EngineError> {
     trace_root!("gpu.load_task", _root);
     let start = std::time::Instant::now();
-    let mut total_bytes = 0usize;
     // Use the first layer's block count as the physical block count (all layers have the same)
     let total_blocks = layers.first().map(|l| l.blocks.len()).unwrap_or(0);
     let metrics = core_metrics();
 
-    let mut copies: Vec<CopyDesc> = Vec::new();
-
-    for layer_data in layers {
-        let registration = &layer_data.registration;
-        let layer_name = &layer_data.layer_name;
-
-        if layer_data.blocks.is_empty() {
-            continue;
-        }
-
-        if registration.segments == 2 && registration.kv_stride_bytes > registration.bytes_per_block
-        {
-            // Layer-first layout with KV stride: K and V live in separate
-            // regions. Actual (unpadded) GPU segment size matches GPU layout.
-            let segment_size = registration.bytes_per_block;
-
-            for block in &layer_data.blocks {
-                let k_offset = transfer::segment_offset(registration, block.block_idx, 0)
-                    .map_err(EngineError::Storage)?;
-                let v_offset = transfer::segment_offset(registration, block.block_idx, 1)
-                    .map_err(EngineError::Storage)?;
-
-                let k_ptr = block.block.segment_mapped_ptr(0).unwrap();
-                // SAFETY: For contiguous layout (segment 1 absent), the allocation
-                // is 2 * segment_size bytes, so k_host + segment_size is in bounds.
-                let v_ptr = block
-                    .block
-                    .segment_mapped_ptr(1)
-                    .unwrap_or_else(|| k_ptr.add(segment_size));
-
-                copies.push(CopyDesc {
-                    device: device_addr(registration, k_offset, segment_size, layer_name)?,
-                    host: k_ptr.host().as_ptr(),
-                    host_device: k_ptr.device().as_ptr() as u64,
-                    size: segment_size,
-                });
-                copies.push(CopyDesc {
-                    device: device_addr(registration, v_offset, segment_size, layer_name)?,
-                    host: v_ptr.host().as_ptr(),
-                    host_device: v_ptr.device().as_ptr() as u64,
-                    size: segment_size,
-                });
-            }
-
-            total_bytes += layer_data.blocks.len() * segment_size * 2;
-        } else {
-            // Contiguous or single-segment layout. Actual (unpadded) block size.
-            let block_size = registration.block_size_bytes;
-
-            for block in &layer_data.blocks {
-                let offset = transfer::segment_offset(registration, block.block_idx, 0)
-                    .map_err(EngineError::Storage)?;
-                let ptr = block.block.segment_mapped_ptr(0).unwrap();
-                copies.push(CopyDesc {
-                    device: device_addr(registration, offset, block_size, layer_name)?,
-                    host: ptr.host().as_ptr(),
-                    host_device: ptr.device().as_ptr() as u64,
-                    size: block_size,
-                });
-            }
-
-            total_bytes += layer_data.blocks.len() * block_size;
-        }
-    }
+    let (copies, total_bytes) = build_copy_descs(layers)?;
 
     backend.h2d(&copies, stream).map_err(EngineError::Storage)?;
 
@@ -475,67 +419,9 @@ fn process_save_task(
 ) -> Result<(), EngineError> {
     trace_child!("gpu.save_task", task.trace_ctx);
     let start = std::time::Instant::now();
-    let mut total_bytes = 0usize;
-    let mut total_blocks = 0usize;
+    let total_blocks: usize = task.layers.iter().map(|l| l.blocks.len()).sum();
 
-    let mut copies: Vec<CopyDesc> = Vec::new();
-
-    for layer in &task.layers {
-        let registration = &layer.registration;
-        let layer_name = &layer.layer_name;
-
-        if layer.blocks.is_empty() {
-            continue;
-        }
-        total_blocks += layer.blocks.len();
-
-        if registration.segments == 2 && registration.kv_stride_bytes > registration.bytes_per_block
-        {
-            // Layer-first layout: K and V segments stored separately. Actual
-            // (unpadded) GPU segment size — pinned memory may use a larger
-            // padded stride, but CUDA copies only the real data.
-            let segment_size = registration.bytes_per_block;
-
-            for block in &layer.blocks {
-                let k_offset = transfer::segment_offset(registration, block.block_idx, 0)
-                    .map_err(EngineError::Storage)?;
-                let v_offset = transfer::segment_offset(registration, block.block_idx, 1)
-                    .map_err(EngineError::Storage)?;
-                let v_dst = block.v_dst.unwrap_or_else(|| block.k_dst.add(segment_size));
-
-                copies.push(CopyDesc {
-                    device: device_addr(registration, k_offset, segment_size, layer_name)?,
-                    host: block.k_dst.host().as_ptr(),
-                    host_device: block.k_dst.device().as_ptr() as u64,
-                    size: segment_size,
-                });
-                copies.push(CopyDesc {
-                    device: device_addr(registration, v_offset, segment_size, layer_name)?,
-                    host: v_dst.host().as_ptr(),
-                    host_device: v_dst.device().as_ptr() as u64,
-                    size: segment_size,
-                });
-            }
-
-            total_bytes += layer.blocks.len() * segment_size * 2;
-        } else {
-            // Contiguous or single-segment layout. Actual (unpadded) block size.
-            let block_size = registration.block_size_bytes;
-
-            for block in &layer.blocks {
-                let offset = transfer::segment_offset(registration, block.block_idx, 0)
-                    .map_err(EngineError::Storage)?;
-                copies.push(CopyDesc {
-                    device: device_addr(registration, offset, block_size, layer_name)?,
-                    host: block.k_dst.host().as_ptr(),
-                    host_device: block.k_dst.device().as_ptr() as u64,
-                    size: block_size,
-                });
-            }
-
-            total_bytes += layer.blocks.len() * block_size;
-        }
-    }
+    let (copies, total_bytes) = build_copy_descs(&task.layers)?;
 
     backend.d2h(&copies, stream).map_err(EngineError::Storage)?;
 

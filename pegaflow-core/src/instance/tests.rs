@@ -1,90 +1,7 @@
 use super::*;
+use crate::layout::BlockCopies;
 
-// --- KVCacheRegistration layout validation (pure, no device) ---
-
-#[test]
-fn registration_valid() {
-    let reg = KVCacheRegistration::new(0x1000, 1024 * 1024, 100, 1024, 0, 1).unwrap();
-    assert_eq!(reg.block_size_bytes, 1024);
-}
-
-#[test]
-fn block_stride_decouples_step_from_copy_size() {
-    use crate::transfer::segment_offset;
-
-    let bytes_per_block = 4096 * 2;
-    let page_stride_bytes = 8192 * 2;
-    let num_blocks = 8;
-    let size_bytes = num_blocks * page_stride_bytes;
-
-    let reg = KVCacheRegistration::new(0x10000, size_bytes, num_blocks, bytes_per_block, 0, 1)
-        .unwrap()
-        .with_block_stride(page_stride_bytes)
-        .unwrap();
-
-    assert_eq!(reg.block_stride_bytes, page_stride_bytes);
-    assert_eq!(segment_offset(&reg, 0, 0).unwrap(), 0);
-    assert_eq!(segment_offset(&reg, 3, 0).unwrap(), 3 * page_stride_bytes);
-    assert_eq!(segment_offset(&reg, 7, 0).unwrap(), 7 * page_stride_bytes);
-}
-
-#[test]
-fn block_stride_defaults_to_dense_and_validates() {
-    use crate::transfer::segment_offset;
-
-    let reg = KVCacheRegistration::new(0x1000, 1024 * 1024, 100, 1024, 0, 1).unwrap();
-    assert_eq!(reg.block_stride_bytes, 1024);
-    assert_eq!(segment_offset(&reg, 5, 0).unwrap(), 5 * 1024);
-
-    assert!(
-        KVCacheRegistration::new(0x1000, 1024 * 1024, 100, 1024, 0, 1)
-            .unwrap()
-            .with_block_stride(512)
-            .is_err()
-    );
-
-    assert!(
-        KVCacheRegistration::new(0x1000, 8 * 1024, 8, 1024, 0, 1)
-            .unwrap()
-            .with_block_stride(4096)
-            .is_err()
-    );
-}
-
-#[test]
-fn registration_null_pointer_rejected() {
-    assert!(KVCacheRegistration::new(0, 1024, 10, 64, 0, 1).is_err());
-}
-
-#[test]
-fn registration_memory_too_small() {
-    let err = KVCacheRegistration::new(0x1000, 5120, 10, 1024, 0, 1).unwrap_err();
-    assert!(err.contains("too small"));
-}
-
-#[test]
-fn padded_block_size() {
-    // Unaligned: 8848 % 512 = 144, padded to 9216
-    let reg = KVCacheRegistration::new(0x1000, 10_000_000, 100, 8848, 0, 1)
-        .unwrap()
-        .with_ssd_padding(512);
-    assert_eq!(reg.padded_bytes_per_block, 9216);
-    assert_eq!(reg.padded_block_size_bytes, 9216);
-
-    // Already aligned: no change
-    let reg = KVCacheRegistration::new(0x1000, 1024 * 1024, 100, 1024, 0, 1)
-        .unwrap()
-        .with_ssd_padding(512);
-    assert_eq!(reg.padded_bytes_per_block, 1024);
-    assert_eq!(reg.padded_block_size_bytes, 1024);
-
-    // Split layout: padded per segment, total = padded * segments
-    let reg = KVCacheRegistration::new(0x1000, 10_000_000, 100, 8848, 900_000, 2)
-        .unwrap()
-        .with_ssd_padding(512);
-    assert_eq!(reg.padded_bytes_per_block, 9216);
-    assert_eq!(reg.padded_block_size_bytes, 9216 * 2);
-}
+// Pure layout validation tests live in `crate::layout::tests`.
 
 // --- Real registration path ---
 //
@@ -100,7 +17,7 @@ fn gpu_registration(device_id: i32, tp_rank: usize, layers: &[(&str, usize)]) ->
     let mut kv_caches = HashMap::new();
     let mut layer_ids_by_name = HashMap::new();
     for (index, (name, id)) in layers.iter().enumerate() {
-        let reg = KVCacheRegistration::new(
+        let layout = KVCacheLayout::new(
             0x1000 + index as u64 * 0x10000,
             1024 * 1024,
             100,
@@ -109,7 +26,7 @@ fn gpu_registration(device_id: i32, tp_rank: usize, layers: &[(&str, usize)]) ->
             1,
         )
         .unwrap();
-        kv_caches.insert((*name).to_string(), reg);
+        kv_caches.insert((*name).to_string(), layout);
         layer_ids_by_name.insert((*name).to_string(), *id);
     }
     GpuRegistration {
@@ -162,9 +79,12 @@ fn inference_registration_flow() {
 
     // The registered layer is retrievable with its original layout.
     let gpu = instance.get_gpu(0).expect("get gpu context");
-    let reg = gpu.get_registration("layer_0").expect("get registration");
-    assert_eq!(reg.data_ptr, 0x1000);
-    assert_eq!(reg.num_blocks, 100);
+    let layout = gpu.get_layout("layer_0").expect("get layout");
+    assert_eq!(layout.num_blocks(), 100);
+    match layout.block_copies(0).expect("block 0 in range") {
+        BlockCopies::Contiguous(c) => assert_eq!(c.addr, 0x1000),
+        BlockCopies::Split { .. } => panic!("dense test layout must be contiguous"),
+    }
 }
 
 /// An id outside `[0, num_layers)` is rejected while building assignments,
