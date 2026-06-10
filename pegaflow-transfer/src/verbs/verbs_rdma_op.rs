@@ -24,6 +24,7 @@ pub(super) struct SingleWriteOpIter {
     rma_qp: NonNull<ibv_qp>,
     wr_chain_buffer: NonNull<WrChainBuffer>,
     done: bool,
+    bytes: u64,
 }
 
 impl SingleWriteOpIter {
@@ -57,6 +58,7 @@ impl SingleWriteOpIter {
             rma_qp,
             wr_chain_buffer,
             done: false,
+            bytes: op.length,
         }
     }
 
@@ -84,6 +86,7 @@ impl SingleWriteOpIter {
             rma_qp,
             wr_chain_buffer,
             done: false,
+            bytes: 0,
         }
     }
 
@@ -103,6 +106,7 @@ impl SingleWriteOpIter {
 
 pub(super) struct PagedWriteOpIter {
     rma_qp: NonNull<ibv_qp>,
+    bytes: u64,
     // Buffer
     wr_chain_buffer: NonNull<WrChainBuffer>,
     i_wr_head: usize,
@@ -156,6 +160,7 @@ impl PagedWriteOpIter {
         }
         let mut slf = Self {
             rma_qp,
+            bytes: (op.page_indices_end - op.page_indices_beg) as u64 * op.length,
             wr_chain_buffer,
             i_wr_head: 0,
             i_wr_tail: 0,
@@ -232,6 +237,7 @@ impl PagedWriteOpIter {
 
 pub(super) struct ScatterWriteOpIter {
     qp_list: Rc<Vec<NonNull<ibv_qp>>>,
+    bytes: u64,
     // Buffer
     wr_chain_buffer: NonNull<WrChainBuffer>,
     // Request
@@ -276,8 +282,20 @@ impl ScatterWriteOpIter {
             ..unsafe { zeroed() }
         });
         wr.imm_data_invalidated_rkey_union.imm_data = imm.to_be();
+        let bytes = op.dsts[op.dst_beg..op.dst_end]
+            .iter()
+            .map(|dst| {
+                let base = dst.length as u32 / op.byte_shards;
+                if op.byte_shard_idx == op.byte_shards - 1 {
+                    (dst.length as u32 - base * op.byte_shard_idx) as u64
+                } else {
+                    base as u64
+                }
+            })
+            .sum();
         let mut slf = Self {
             qp_list,
+            bytes,
             wr_chain_buffer,
             domain_idx: op.domain_idx,
             src_ptr: op.src_ptr,
@@ -371,6 +389,14 @@ impl WriteOpIter {
             WriteOpIter::Single(iter) => iter.peek(),
             WriteOpIter::Paged(iter) => iter.peek(),
             WriteOpIter::Scatter(iter) => iter.peek(),
+        }
+    }
+
+    pub(super) fn total_bytes(&self) -> u64 {
+        match self {
+            WriteOpIter::Single(iter) => iter.bytes,
+            WriteOpIter::Paged(iter) => iter.bytes,
+            WriteOpIter::Scatter(iter) => iter.bytes,
         }
     }
 

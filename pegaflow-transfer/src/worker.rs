@@ -9,7 +9,7 @@ use std::{
 
 use super::cpu_affinity::pin_cpu;
 use crossbeam_channel::TryRecvError;
-use log::debug;
+use log::{debug, info};
 
 use crate::{
     api::{
@@ -216,7 +216,7 @@ fn rdma_worker_thread<D: RdmaDomain, const N: usize>(
     // Pin CPU if specified
     if let Some(cpu) = maybe_pin_cpu {
         let names: Vec<_> = domain_list.iter().map(|info| info.name()).collect();
-        debug!("Pin Domain Worker CPU {} for {:?}", cpu, names);
+        info!("Pin Domain Worker CPU {} for {:?}", cpu, names);
         if let Err(e) = pin_cpu(cpu as usize) {
             // Ignore send error
             let _ = init_tx.send(Err(FabricLibError::Errno(e)));

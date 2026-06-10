@@ -174,8 +174,11 @@ struct WriteOpContext {
     rdma_op_iter: WriteOpIter,
     wr_chain_buffer: NonNull<WrChainBuffer>,
     total_ops: usize,
+    total_bytes: u64,
     cnt_posted_ops: usize,
     cnt_finished_ops: usize,
+    created_at: Instant,
+    posted_at: Option<Instant>,
     in_queue: bool,
 
     /// True when there's a completion error.
@@ -892,14 +895,18 @@ impl VerbsDomain {
 
         // Initialize the context
         let total_ops = rdma_op_iter.total_ops();
+        let total_bytes = rdma_op_iter.total_bytes();
         let context = unsafe {
             context.as_mut().write(WriteOpContext {
                 transfer_id,
                 rdma_op_iter,
                 wr_chain_buffer,
                 total_ops,
+                total_bytes,
                 cnt_posted_ops: 0,
                 cnt_finished_ops: 0,
+                created_at: Instant::now(),
+                posted_at: None,
                 in_queue: false,
                 bad: false,
             })
@@ -988,6 +995,9 @@ impl VerbsDomain {
         loop {
             let (rma_qp, wr, wr_len) = context.rdma_op_iter.peek();
             if wr_len == 0 {
+                if context.posted_at.is_none() {
+                    context.posted_at = Some(Instant::now());
+                }
                 break;
             }
 
@@ -1033,6 +1043,22 @@ impl VerbsDomain {
         }
         if context.in_queue {
             return;
+        }
+        if context.total_bytes >= (1 << 20) {
+            let total_s = context.created_at.elapsed().as_secs_f64();
+            let post_ms = context
+                .posted_at
+                .map_or(-1.0, |t| (t - context.created_at).as_secs_f64() * 1e3);
+            info!(
+                "RDMA write op done: domain={} ops={} bytes={} post_ms={:.2} total_ms={:.2} bw={:.2}GiB/s bad={}",
+                self.name,
+                context.total_ops,
+                context.total_bytes,
+                post_ms,
+                total_s * 1e3,
+                context.total_bytes as f64 / total_s / (1u64 << 30) as f64,
+                context.bad,
+            );
         }
         self.write_op_contexts.remove(&ptr);
         unsafe { self.objpool_wr.free_and_drop(context.wr_chain_buffer) };
