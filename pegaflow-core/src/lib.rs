@@ -764,6 +764,7 @@ impl PegaEngine {
         usize,
         Vec<pegaflow_proto::proto::engine::TransferSlotInfo>,
     ) {
+        let t0 = std::time::Instant::now();
         let keys: Vec<BlockKey> = block_hashes
             .iter()
             .map(|h| BlockKey::new(namespace.to_string(), h.clone()))
@@ -772,6 +773,7 @@ impl PegaEngine {
         // `get_blocks_for_transfer` returns the present subset in request
         // order; cut it down to the contiguous prefix of the request.
         let found = self.storage.get_blocks_for_transfer(&keys);
+        let lookup_elapsed = t0.elapsed();
         let mut found_iter = found.into_iter().peekable();
         let mut prefix: Vec<(BlockKey, Arc<SealedBlock>)> = Vec::new();
         for key in &keys {
@@ -789,16 +791,21 @@ impl PegaEngine {
             .unwrap_or_default();
         let homogeneous = prefix
             .iter()
-            .take_while(|(_, block)| block_slot_template(block) == template)
+            .take_while(|(_, block)| block_matches_template(block, &template))
             .count();
         prefix.truncate(homogeneous);
 
+        let template_elapsed = t0.elapsed() - lookup_elapsed;
+        let lock_start = std::time::Instant::now();
         let session_id = self.storage.lock_blocks_for_transfer(requester_id, &prefix);
 
         debug!(
-            "query_blocks_for_transfer: namespace={namespace} requested={} locked_prefix={} session={session_id}",
+            "query_blocks_for_transfer: namespace={namespace} requested={} locked_prefix={} session={session_id} lookup_ms={:.2} template_ms={:.2} lock_ms={:.2}",
             block_hashes.len(),
             prefix.len(),
+            lookup_elapsed.as_secs_f64() * 1000.0,
+            template_elapsed.as_secs_f64() * 1000.0,
+            lock_start.elapsed().as_secs_f64() * 1000.0,
         );
 
         (session_id, prefix.len(), template)
@@ -1027,18 +1034,34 @@ fn block_slot_template(
         .slots()
         .iter()
         .zip(block.slot_numas())
-        .map(|(raw, numa)| {
-            let layer_block = LayerBlock::new(Arc::clone(raw));
-            pegaflow_proto::proto::engine::TransferSlotInfo {
-                k_size: layer_block.k_size() as u64,
-                v_size: layer_block
-                    .v_ptr()
-                    .and_then(|_| layer_block.v_size())
-                    .unwrap_or(0) as u64,
+        .map(
+            |(raw, numa)| pegaflow_proto::proto::engine::TransferSlotInfo {
+                k_size: raw.segment_size(0).unwrap_or(0) as u64,
+                v_size: raw.segment_size(1).unwrap_or(0) as u64,
                 numa_node: numa.0,
-            }
-        })
+            },
+        )
         .collect()
+}
+
+/// Field-wise template match without materializing a per-block template Vec —
+/// the query's homogeneity scan runs this over every candidate block.
+fn block_matches_template(
+    block: &SealedBlock,
+    template: &[pegaflow_proto::proto::engine::TransferSlotInfo],
+) -> bool {
+    block.slots().len() == template.len()
+        && block.slot_numas().len() == template.len()
+        && block
+            .slots()
+            .iter()
+            .zip(block.slot_numas())
+            .zip(template)
+            .all(|((raw, numa), t)| {
+                raw.segment_size(0).unwrap_or(0) as u64 == t.k_size
+                    && raw.segment_size(1).unwrap_or(0) as u64 == t.v_size
+                    && numa.0 == t.numa_node
+            })
 }
 
 /// Error from serving a PushBlocks request.

@@ -262,6 +262,7 @@ async fn fetch_blocks_via_push(
     let bytes_per_numa = sum_segment_bytes_by_numa(template, hashes.len())?;
     let mut numa_slabs = allocate_numa_slabs(allocate_fn, bytes_per_numa)?;
     let numa_slab_count = numa_slabs.len();
+    let slab_alloc_elapsed = build_start.elapsed();
 
     let slot_count = hashes.len() * template.len();
     let mut segment_count = 0usize;
@@ -364,6 +365,11 @@ async fn fetch_blocks_via_push(
         })
     };
     let build = build_start.elapsed();
+    debug!(
+        "RDMA fetch build phases: slab_alloc_ms={:.2} total_ms={:.2}",
+        slab_alloc_elapsed.as_secs_f64() * 1000.0,
+        build.as_secs_f64() * 1000.0,
+    );
 
     let push_start = Instant::now();
     let request = PushBlocksRequest {
