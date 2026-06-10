@@ -11,8 +11,8 @@ use dashmap::DashMap;
 use log::{debug, info, warn};
 use pegaflow_proto::proto::engine::engine_client::EngineClient;
 use pegaflow_proto::proto::engine::{
-    PushBlockDst, PushBlocksRequest, PushSegmentDst, PushSlotDst, QueryBlocksForTransferRequest,
-    QueryBlocksForTransferResponse, RemoteMemoryRegion, TransferBlockInfo,
+    PushBlocksRequest, PushSlabDst, QueryBlocksForTransferRequest, QueryBlocksForTransferResponse,
+    RemoteMemoryRegion, TransferSlotInfo,
 };
 use tonic::transport::{Channel, Endpoint};
 
@@ -167,19 +167,32 @@ async fn rdma_fetch_task(
     };
     let query_elapsed = query_start.elapsed();
 
-    let blocks = response.blocks;
-    let total_bytes: u64 = blocks
-        .iter()
-        .flat_map(|b| &b.slots)
-        .map(|s| s.k_size + s.v_size)
-        .sum();
+    let block_count = response.block_count as usize;
+    if block_count > block_hashes.len() {
+        warn!(
+            "Remote {remote_addr} locked {block_count} blocks but only {} were requested",
+            block_hashes.len()
+        );
+        core_metrics()
+            .rdma_fetch_total
+            .add(1, &[KeyValue::new("status", "error")]);
+        return Vec::new();
+    }
+    let template = response.slot_template;
+    // Remote-controlled values; saturate instead of trusting them — the
+    // checked path in sum_segment_bytes_by_numa is the real gate.
+    let per_block_bytes = template.iter().fold(0u64, |acc, s| {
+        acc.saturating_add(s.k_size).saturating_add(s.v_size)
+    });
+    let total_bytes = per_block_bytes.saturating_mul(block_count as u64);
     let (result, timing) = match fetch_blocks_via_push(
         rdma,
         allocate_fn,
         client,
         namespace,
         response.transfer_session_id,
-        &blocks,
+        &block_hashes[..block_count],
+        &template,
     )
     .await
     {
@@ -226,119 +239,105 @@ async fn rdma_fetch_task(
 }
 
 /// Allocate local memory, send PushBlocks, build SealedBlocks.
+///
+/// `hashes` is the locked prefix in request order and `template` the
+/// per-slot layout shared by every block (both from QueryBlocksForTransfer).
+/// Destinations are assigned by slot-major bump allocation over the
+/// template; the wire request carries only the slab bases, and the holder
+/// replays the identical allocation to derive every address.
 async fn fetch_blocks_via_push(
     rdma: &RdmaTransport,
     allocate_fn: &AllocateFn,
     mut client: EngineClient<Channel>,
     namespace: &str,
     transfer_session_id: String,
-    blocks: &[TransferBlockInfo],
+    hashes: &[Vec<u8>],
+    template: &[TransferSlotInfo],
 ) -> Result<(PrefetchResult, FetchTiming), String> {
-    if blocks.is_empty() {
+    if hashes.is_empty() {
         return Ok((Vec::new(), FetchTiming::default()));
     }
 
     let build_start = Instant::now();
-    let bytes_per_numa = sum_segment_bytes_by_numa(blocks)?;
+    let bytes_per_numa = sum_segment_bytes_by_numa(template, hashes.len())?;
     let mut numa_slabs = allocate_numa_slabs(allocate_fn, bytes_per_numa)?;
     let numa_slab_count = numa_slabs.len();
 
     // (block_hash, Vec<slot segments>) — for building SealedBlocks afterwards
     let mut block_allocs: Vec<(Vec<u8>, Vec<Vec<SegmentAlloc>>)> = Vec::new();
-    let mut slot_count = 0usize;
+    let slot_count = hashes.len() * template.len();
     let mut segment_count = 0usize;
 
     // Wire MR table, deduplicated by region base pointer.
     let mut mr_table: Vec<RemoteMemoryRegion> = Vec::new();
     let mut mr_index_by_base: HashMap<u64, u32> = HashMap::new();
-    let mut push_blocks: Vec<PushBlockDst> = Vec::new();
+    let mut push_slabs: Vec<PushSlabDst> = Vec::new();
 
-    // Allocation and request assembly stay in a sync block so that NonNull
+    // Allocation and bookkeeping stay in a sync block so that NonNull
     // pointers (not Send) are dropped before any .await.
     {
-        let mut segment_dst = |slabs: &mut HashMap<NumaNode, NumaSlab>,
-                               numa: NumaNode,
-                               len: usize,
-                               kind: &str|
-         -> Result<(PushSegmentDst, SegmentAlloc), String> {
-            let (local_ptr, alloc) = alloc_segment_from_slab(slabs, numa, len, kind)?;
-            let addr = local_ptr.as_ptr() as u64;
-            let region = rdma.region_for(addr, len as u64).ok_or_else(|| {
-                format!("slab segment 0x{addr:x}+{len} is not in a registered RDMA region")
+        // Wire slab table: one entry per NUMA slab.
+        for (numa, slab) in &numa_slabs {
+            let base = slab.allocation.as_non_null().as_ptr() as u64;
+            let capacity = slab.capacity as u64;
+            let region = rdma.region_for(base, capacity).ok_or_else(|| {
+                format!("slab 0x{base:x}+{capacity} is not in a registered RDMA region")
             })?;
             let desc = region.descriptor();
             let mr_index = *mr_index_by_base.entry(desc.ptr).or_insert_with(|| {
                 mr_table.push(mr_desc_to_proto(desc));
                 (mr_table.len() - 1) as u32
             });
-            Ok((
-                PushSegmentDst {
-                    mr_index,
-                    dst_addr: addr,
-                },
-                SegmentAlloc {
-                    ptr_addr: addr,
-                    alloc,
-                    size: len,
-                },
-            ))
-        };
+            push_slabs.push(PushSlabDst {
+                numa_node: numa.0,
+                mr_index,
+                base_addr: base,
+                capacity,
+            });
+        }
 
         // Slot-major assignment, K run before V run: the holder stores each
         // layer's K and V in separate allocations with consecutive blocks
         // adjacent inside, so visiting (slot, K) across all blocks gives the
         // holder source-contiguous runs it can coalesce into single WRITEs.
-        // The holder builds its segment list in this same order.
-        let mut slot_dsts: Vec<Vec<PushSlotDst>> = blocks
+        // The holder replays this exact order to derive the addresses.
+        let mut slot_allocs: Vec<Vec<Vec<SegmentAlloc>>> = hashes
             .iter()
-            .map(|b| vec![PushSlotDst { k: None, v: None }; b.slots.len()])
+            .map(|_| (0..template.len()).map(|_| Vec::new()).collect())
             .collect();
-        let mut slot_allocs: Vec<Vec<Vec<SegmentAlloc>>> = blocks
-            .iter()
-            .map(|b| (0..b.slots.len()).map(|_| Vec::new()).collect())
-            .collect();
-        let max_slots = blocks.iter().map(|b| b.slots.len()).max().unwrap_or(0);
 
-        for slot_idx in 0..max_slots {
-            for (block_idx, block_info) in blocks.iter().enumerate() {
-                let Some(slot) = block_info.slots.get(slot_idx) else {
-                    continue;
-                };
-                if slot.k_size > 0 {
-                    let len = usize::try_from(slot.k_size)
-                        .map_err(|_| format!("K size exceeds usize: {}", slot.k_size))?;
-                    let (dst, alloc) =
-                        segment_dst(&mut numa_slabs, NumaNode(slot.numa_node), len, "K")?;
-                    slot_dsts[block_idx][slot_idx].k = Some(dst);
-                    slot_allocs[block_idx][slot_idx].push(alloc);
+        let bump = |slabs: &mut HashMap<NumaNode, NumaSlab>,
+                    numa: u32,
+                    size: u64,
+                    kind: &str|
+         -> Result<SegmentAlloc, String> {
+            let len =
+                usize::try_from(size).map_err(|_| format!("{kind} size exceeds usize: {size}"))?;
+            let (local_ptr, alloc) = alloc_segment_from_slab(slabs, NumaNode(numa), len, kind)?;
+            Ok(SegmentAlloc {
+                ptr_addr: local_ptr.as_ptr() as u64,
+                alloc,
+                size: len,
+            })
+        };
+
+        for (slot_idx, slot) in template.iter().enumerate() {
+            if slot.k_size > 0 {
+                for allocs in &mut slot_allocs {
+                    allocs[slot_idx].push(bump(&mut numa_slabs, slot.numa_node, slot.k_size, "K")?);
                     segment_count += 1;
                 }
             }
-            for (block_idx, block_info) in blocks.iter().enumerate() {
-                let Some(slot) = block_info.slots.get(slot_idx) else {
-                    continue;
-                };
-                if slot.v_size > 0 {
-                    let len = usize::try_from(slot.v_size)
-                        .map_err(|_| format!("V size exceeds usize: {}", slot.v_size))?;
-                    let (dst, alloc) =
-                        segment_dst(&mut numa_slabs, NumaNode(slot.numa_node), len, "V")?;
-                    slot_dsts[block_idx][slot_idx].v = Some(dst);
-                    slot_allocs[block_idx][slot_idx].push(alloc);
+            if slot.v_size > 0 {
+                for allocs in &mut slot_allocs {
+                    allocs[slot_idx].push(bump(&mut numa_slabs, slot.numa_node, slot.v_size, "V")?);
                     segment_count += 1;
                 }
             }
         }
 
-        for (block_info, (dsts, allocs)) in
-            blocks.iter().zip(slot_dsts.into_iter().zip(slot_allocs))
-        {
-            slot_count += block_info.slots.len();
-            block_allocs.push((block_info.block_hash.clone(), allocs));
-            push_blocks.push(PushBlockDst {
-                block_hash: block_info.block_hash.clone(),
-                slots: dsts,
-            });
+        for (hash, allocs) in hashes.iter().zip(slot_allocs) {
+            block_allocs.push((hash.clone(), allocs));
         }
     }
     let build = build_start.elapsed();
@@ -357,7 +356,7 @@ async fn fetch_blocks_via_push(
     let request = PushBlocksRequest {
         transfer_session_id,
         memory_regions: mr_table,
-        blocks: push_blocks,
+        slabs: push_slabs,
     };
     let push_result = tokio::time::timeout(PUSH_TIMEOUT, client.push_blocks(request)).await;
     let response = match push_result {
@@ -447,25 +446,23 @@ fn leak_allocations(
 }
 
 fn sum_segment_bytes_by_numa(
-    blocks: &[TransferBlockInfo],
+    template: &[TransferSlotInfo],
+    block_count: usize,
 ) -> Result<HashMap<NumaNode, u64>, String> {
     let mut bytes_per_numa: HashMap<NumaNode, u64> = HashMap::new();
-    for block_info in blocks {
-        for slot in &block_info.slots {
-            let numa = NumaNode(slot.numa_node);
-            if slot.k_size > 0 {
-                let total = bytes_per_numa.entry(numa).or_insert(0);
-                *total = total.checked_add(slot.k_size).ok_or_else(|| {
-                    format!("numa bytes overflow while summing K segments on {numa}")
-                })?;
-            }
-            if slot.v_size > 0 {
-                let total = bytes_per_numa.entry(numa).or_insert(0);
-                *total = total.checked_add(slot.v_size).ok_or_else(|| {
-                    format!("numa bytes overflow while summing V segments on {numa}")
-                })?;
-            }
-        }
+    for slot in template {
+        let numa = NumaNode(slot.numa_node);
+        let per_block = slot
+            .k_size
+            .checked_add(slot.v_size)
+            .ok_or_else(|| format!("slot bytes overflow on {numa}"))?;
+        let slot_total = per_block
+            .checked_mul(block_count as u64)
+            .ok_or_else(|| format!("numa bytes overflow on {numa}"))?;
+        let total = bytes_per_numa.entry(numa).or_insert(0);
+        *total = total
+            .checked_add(slot_total)
+            .ok_or_else(|| format!("numa bytes overflow on {numa}"))?;
     }
     Ok(bytes_per_numa)
 }
@@ -571,12 +568,7 @@ fn get_or_create_channel(
         .map_err(|e| format!("invalid remote address: {e}"))?
         .connect_timeout(Duration::from_secs(5))
         .connect_lazy();
-    // QueryBlocksForTransfer responses and PushBlocks requests carry per-slot
-    // destinations; at thousands of blocks they exceed tonic's 4 MiB default.
-    const MAX_GRPC_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
-    let client = EngineClient::new(channel)
-        .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
-        .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE);
+    let client = EngineClient::new(channel);
     cache.insert(addr.to_string(), client.clone());
     Ok(client)
 }
@@ -620,8 +612,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use pegaflow_proto::proto::engine::TransferSlotInfo;
-
     fn slot(k_size: u64, v_size: u64, numa: u32) -> TransferSlotInfo {
         TransferSlotInfo {
             k_size,
@@ -646,23 +636,15 @@ mod tests {
 
     #[test]
     fn sum_segment_bytes_by_numa_aggregates_k_and_v() {
-        let blocks = vec![
-            TransferBlockInfo {
-                block_hash: vec![1],
-                slots: vec![
-                    slot(100, 0, 0),   // contiguous
-                    slot(200, 300, 0), // split KV
-                ],
-            },
-            TransferBlockInfo {
-                block_hash: vec![2],
-                slots: vec![slot(400, 500, 1)],
-            },
+        let template = vec![
+            slot(100, 0, 0),   // contiguous
+            slot(200, 300, 0), // split KV
+            slot(400, 500, 1),
         ];
 
-        let totals = sum_segment_bytes_by_numa(&blocks).expect("sum bytes");
-        assert_eq!(totals.get(&NumaNode(0)), Some(&600)); // 100 + (200 + 300)
-        assert_eq!(totals.get(&NumaNode(1)), Some(&900)); // 400 + 500
+        let totals = sum_segment_bytes_by_numa(&template, 2).expect("sum bytes");
+        assert_eq!(totals.get(&NumaNode(0)), Some(&1200)); // (100 + 200 + 300) * 2 blocks
+        assert_eq!(totals.get(&NumaNode(1)), Some(&1800)); // (400 + 500) * 2 blocks
     }
 
     #[test]

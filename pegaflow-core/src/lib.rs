@@ -747,29 +747,61 @@ impl PegaEngine {
     // Cross-node transfer: serving side
     // =========================================================================
 
-    /// Look up blocks and lock them for RDMA transfer. Returns metadata
-    /// for each found block plus a session ID for later unlock.
+    /// Lock the longest present, layout-homogeneous prefix of `block_hashes`
+    /// for RDMA transfer. Returns the session ID, the number of blocks
+    /// locked, and the per-slot layout template every locked block matches.
+    ///
+    /// Both sides derive all transfer addresses by replaying slot-major bump
+    /// allocation over the template, so the prefix must be exact: a missing
+    /// block or a block with a different layout truncates it.
     pub fn query_blocks_for_transfer(
         &self,
         namespace: &str,
         block_hashes: &[Vec<u8>],
         requester_id: &str,
-    ) -> (String, Vec<(BlockKey, Arc<SealedBlock>)>) {
+    ) -> (
+        String,
+        usize,
+        Vec<pegaflow_proto::proto::engine::TransferSlotInfo>,
+    ) {
         let keys: Vec<BlockKey> = block_hashes
             .iter()
             .map(|h| BlockKey::new(namespace.to_string(), h.clone()))
             .collect();
 
+        // `get_blocks_for_transfer` returns the present subset in request
+        // order; cut it down to the contiguous prefix of the request.
         let found = self.storage.get_blocks_for_transfer(&keys);
-        let session_id = self.storage.lock_blocks_for_transfer(requester_id, &found);
+        let mut found_iter = found.into_iter().peekable();
+        let mut prefix: Vec<(BlockKey, Arc<SealedBlock>)> = Vec::new();
+        for key in &keys {
+            match found_iter.peek() {
+                Some((fk, _)) if fk == key => {
+                    prefix.push(found_iter.next().expect("peeked entry exists"));
+                }
+                _ => break,
+            }
+        }
+
+        let template = prefix
+            .first()
+            .map(|(_, block)| block_slot_template(block))
+            .unwrap_or_default();
+        let homogeneous = prefix
+            .iter()
+            .take_while(|(_, block)| block_slot_template(block) == template)
+            .count();
+        prefix.truncate(homogeneous);
+
+        let session_id = self.storage.lock_blocks_for_transfer(requester_id, &prefix);
 
         debug!(
-            "query_blocks_for_transfer: namespace={namespace} requested={} found={} session={session_id}",
+            "query_blocks_for_transfer: namespace={namespace} requested={} locked_prefix={} session={session_id}",
             block_hashes.len(),
-            found.len(),
+            prefix.len(),
         );
 
-        (session_id, found)
+        (session_id, prefix.len(), template)
     }
 
     /// GC expired transfer lock sessions.
@@ -822,33 +854,76 @@ impl PegaEngine {
                 ))
             })?;
 
-        if request.blocks.len() != session_blocks.len() {
-            return Err(PushBlocksError::Rejected(format!(
-                "push request has {} blocks but session has {}",
-                request.blocks.len(),
-                session_blocks.len()
-            )));
+        // Blocks rebuilt from SSD or a previous RDMA fetch carry no per-slot
+        // NUMA info; the replay below indexes slot_numas per slot, so such
+        // blocks must be rejected, not panicked on.
+        for (key, sealed) in &session_blocks {
+            if sealed.slot_numas().len() != sealed.slots().len() {
+                return Err(PushBlocksError::Rejected(format!(
+                    "block {key:?} has {} slots but {} NUMA entries; it cannot be re-served",
+                    sealed.slots().len(),
+                    sealed.slot_numas().len()
+                )));
+            }
         }
+
         let mr_descs: Vec<_> = request
             .memory_regions
             .iter()
             .map(mr_desc_from_proto)
             .collect();
 
-        for ((key, sealed), dst_block) in session_blocks.iter().zip(&request.blocks) {
-            if key.hash != dst_block.block_hash {
+        // Bump-replay cursors, one per requester slab. The request carries
+        // only slab bases; every destination address is derived here by
+        // replaying the requester's allocation order with our own segment
+        // sizes (the same sizes we returned in the query's slot_template).
+        struct SlabCursor {
+            mr_index: u32,
+            next: u64,
+            end: u64,
+        }
+        let mut slabs: std::collections::HashMap<u32, SlabCursor> =
+            std::collections::HashMap::new();
+        for slab in &request.slabs {
+            if slab.mr_index as usize >= mr_descs.len() {
                 return Err(PushBlocksError::Rejected(format!(
-                    "push request block hash mismatch for session block {key:?}"
+                    "slab mr_index {} out of bounds ({} regions in request)",
+                    slab.mr_index,
+                    mr_descs.len()
                 )));
             }
-            if sealed.slots().len() != dst_block.slots.len() {
+            let end = slab.base_addr.checked_add(slab.capacity).ok_or_else(|| {
+                PushBlocksError::Rejected(format!(
+                    "slab 0x{:x}+{} overflows the address space",
+                    slab.base_addr, slab.capacity
+                ))
+            })?;
+            let cursor = SlabCursor {
+                mr_index: slab.mr_index,
+                next: slab.base_addr,
+                end,
+            };
+            if slabs.insert(slab.numa_node, cursor).is_some() {
                 return Err(PushBlocksError::Rejected(format!(
-                    "push request has {} slots but block {key:?} has {}",
-                    dst_block.slots.len(),
-                    sealed.slots().len()
+                    "duplicate slab for NUMA node {}",
+                    slab.numa_node
                 )));
             }
         }
+        let mut alloc_dst = |numa: u32, len: u64| -> Result<(u32, u64), PushBlocksError> {
+            let slab = slabs.get_mut(&numa).ok_or_else(|| {
+                PushBlocksError::Rejected(format!("no requester slab for NUMA node {numa}"))
+            })?;
+            if len > slab.end - slab.next {
+                return Err(PushBlocksError::Rejected(format!(
+                    "slab for NUMA node {numa} exhausted during replay: cursor=0x{:x} len={len} end=0x{:x}",
+                    slab.next, slab.end
+                )));
+            }
+            let dst = slab.next;
+            slab.next += len;
+            Ok((slab.mr_index, dst))
+        };
 
         // Slot-major, K run before V run — the same order in which the
         // requester assigned destinations from its bump allocator. Each
@@ -864,23 +939,25 @@ impl PegaEngine {
             .unwrap_or(0);
         let mut segments = Vec::new();
         for slot_idx in 0..max_slots {
-            for ((key, sealed), dst_block) in session_blocks.iter().zip(&request.blocks) {
+            for (_key, sealed) in &session_blocks {
                 let Some(raw) = sealed.slots().get(slot_idx) else {
                     continue;
                 };
                 let layer_block = LayerBlock::new(Arc::clone(raw));
-                let dst_slot = &dst_block.slots[slot_idx];
-                let k_dst = dst_slot.k.as_ref().ok_or_else(|| {
-                    PushBlocksError::Rejected(format!("missing K destination for block {key:?}"))
-                })?;
+                let len = layer_block.k_size() as u64;
+                if len == 0 {
+                    continue;
+                }
+                let numa = sealed.slot_numas()[slot_idx].0;
+                let (dst_mr_index, dst_addr) = alloc_dst(numa, len)?;
                 segments.push(PushSegment {
                     src_addr: layer_block.k_ptr() as u64,
-                    len: layer_block.k_size() as u64,
-                    dst_mr_index: k_dst.mr_index,
-                    dst_addr: k_dst.dst_addr,
+                    len,
+                    dst_mr_index,
+                    dst_addr,
                 });
             }
-            for ((key, sealed), dst_block) in session_blocks.iter().zip(&request.blocks) {
+            for (_key, sealed) in &session_blocks {
                 let Some(raw) = sealed.slots().get(slot_idx) else {
                     continue;
                 };
@@ -888,16 +965,30 @@ impl PegaEngine {
                 let Some(v_ptr) = layer_block.v_ptr() else {
                     continue;
                 };
-                let dst_slot = &dst_block.slots[slot_idx];
-                let v_dst = dst_slot.v.as_ref().ok_or_else(|| {
-                    PushBlocksError::Rejected(format!("missing V destination for block {key:?}"))
-                })?;
+                let len = layer_block.v_size().unwrap_or(0) as u64;
+                if len == 0 {
+                    continue;
+                }
+                let numa = sealed.slot_numas()[slot_idx].0;
+                let (dst_mr_index, dst_addr) = alloc_dst(numa, len)?;
                 segments.push(PushSegment {
                     src_addr: v_ptr as u64,
-                    len: layer_block.v_size().unwrap_or(0) as u64,
-                    dst_mr_index: v_dst.mr_index,
-                    dst_addr: v_dst.dst_addr,
+                    len,
+                    dst_mr_index,
+                    dst_addr,
                 });
+            }
+        }
+
+        // The replayed cursors must land exactly on the requester's
+        // allocation ends. Any divergence means the two sides disagree on
+        // block count, sizes, or order — reject before submitting a WRITE.
+        for (numa, slab) in &slabs {
+            if slab.next != slab.end {
+                return Err(PushBlocksError::Rejected(format!(
+                    "bump replay mismatch on NUMA node {numa}: cursor ended at 0x{:x} but requester allocated up to 0x{:x}",
+                    slab.next, slab.end
+                )));
             }
         }
 
@@ -923,6 +1014,31 @@ impl PegaEngine {
             "this binary was built without RDMA support".to_string(),
         ))
     }
+}
+
+/// Per-slot layout of a sealed block as the transfer protocol sees it.
+/// The requester sizes its slabs from this template and both sides replay
+/// slot-major bump allocation over it, so it is the protocol's source of
+/// truth for segment sizes and NUMA placement.
+fn block_slot_template(
+    block: &SealedBlock,
+) -> Vec<pegaflow_proto::proto::engine::TransferSlotInfo> {
+    block
+        .slots()
+        .iter()
+        .zip(block.slot_numas())
+        .map(|(raw, numa)| {
+            let layer_block = LayerBlock::new(Arc::clone(raw));
+            pegaflow_proto::proto::engine::TransferSlotInfo {
+                k_size: layer_block.k_size() as u64,
+                v_size: layer_block
+                    .v_ptr()
+                    .and_then(|_| layer_block.v_size())
+                    .unwrap_or(0) as u64,
+                numa_node: numa.0,
+            }
+        })
+        .collect()
 }
 
 /// Error from serving a PushBlocks request.

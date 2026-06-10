@@ -128,18 +128,13 @@ message SessionRequest {
 message SessionEvent {
 }
 
-// Cross-node transfer: per-slot segment sizes. The requester allocates local
-// memory from these and mirrors the holder's NUMA placement.
+// Cross-node transfer: per-slot segment sizes. One template describes every
+// block in the session; the requester allocates local memory from it and
+// mirrors the holder's NUMA placement.
 message TransferSlotInfo {
   uint64 k_size = 1;     // Size of the K segment in bytes
   uint64 v_size = 2;     // Size of the V segment in bytes (0 if contiguous)
   uint32 numa_node = 3;  // NUMA node where this slot resides on the holder
-}
-
-// Cross-node transfer: per-block metadata
-message TransferBlockInfo {
-  bytes block_hash = 1;
-  repeated TransferSlotInfo slots = 2;  // One per TP slot
 }
 
 message QueryBlocksForTransferRequest {
@@ -150,8 +145,14 @@ message QueryBlocksForTransferRequest {
 
 message QueryBlocksForTransferResponse {
   ResponseStatus status = 1;
-  repeated TransferBlockInfo blocks = 2;
+  reserved 2;                           // was: repeated TransferBlockInfo blocks
   string transfer_session_id = 3;       // Session ID consumed by PushBlocks
+  // The longest prefix of the requested hashes that is present, locked, and
+  // layout-homogeneous (every block matches slot_template). Both sides derive
+  // all transfer addresses by replaying slot-major bump allocation over the
+  // template, so nothing per-block or per-slot goes on the wire.
+  uint32 block_count = 4;
+  repeated TransferSlotInfo slot_template = 5;  // One entry per TP slot
 }
 
 // PushBlocks: the requester asks the holder to RDMA-WRITE the session's
@@ -173,28 +174,25 @@ message RemoteMemoryRegion {
   repeated RemoteDomainRkey rkeys = 2;
 }
 
-// Destination of one K or V segment in requester memory.
-message PushSegmentDst {
-  uint32 mr_index = 1;   // Index into PushBlocksRequest.memory_regions
-  uint64 dst_addr = 2;   // Absolute address in requester memory
-}
-
-message PushSlotDst {
-  PushSegmentDst k = 1;
-  optional PushSegmentDst v = 2;  // Unset if the slot is contiguous
-}
-
-// Blocks must match the session's blocks 1:1 in order (as returned by
-// QueryBlocksForTransfer).
-message PushBlockDst {
-  bytes block_hash = 1;
-  repeated PushSlotDst slots = 2;
+// One requester slab: the bump-allocation arena for every segment whose
+// holder slot lives on `numa_node`. The holder replays the requester's
+// slot-major allocation order (per slot: all blocks' K, then all blocks' V)
+// from `base_addr`, using its own segment sizes — which are the sizes it
+// returned in slot_template. The replayed cursor must land exactly on
+// `base_addr + capacity`; any divergence rejects the push before a single
+// WRITE is submitted.
+message PushSlabDst {
+  uint32 numa_node = 1;
+  uint32 mr_index = 2;   // Index into PushBlocksRequest.memory_regions
+  uint64 base_addr = 3;  // Absolute requester address of the slab
+  uint64 capacity = 4;   // Total bytes the requester allocated
 }
 
 message PushBlocksRequest {
   string transfer_session_id = 1;
   repeated RemoteMemoryRegion memory_regions = 2;
-  repeated PushBlockDst blocks = 3;
+  reserved 3;                           // was: repeated PushBlockDst blocks
+  repeated PushSlabDst slabs = 4;
 }
 
 message PushBlocksResponse {
