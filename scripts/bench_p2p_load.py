@@ -2,8 +2,8 @@
 """End-to-end P2P load benchmark.
 
 Starts one metaserver, two PegaFlow servers (both seeing all GPUs), and two
-vLLM instances (one per server). For each trial it sends the same long prompt
-three times and compares TTFT:
+vLLM instances (one per server). For each prompt length in the sweep it sends
+the same prompt three times and compares TTFT:
 
   1. cold  -> vllm1: full prefill, KV saved to server1
   2. p2p   -> vllm2: server2 fetches the KV from server1 over RDMA
@@ -13,7 +13,7 @@ Run on an 8-GPU RDMA node:
 
     PEGAFLOW_NICS=mlx5_gpu0,... PEGAFLOW_HOST_IP=10.0.0.1 \
       python/.venv/bin/python scripts/bench_p2p_load.py \
-      --model /data/models/Qwen3-8B --prompt-tokens 4000 --trials 3
+      --model /data/models/Qwen3-8B --prompt-tokens 2000,8000,16000,31000
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ import re
 import shutil
 import signal
 import socket
+import statistics
 import subprocess
 import sys
 import sysconfig
@@ -70,6 +71,8 @@ def server_cmd(binary_name: str) -> list[str]:
 
 def base_env() -> dict[str, str]:
     env = os.environ.copy()
+    # Identical block hashes across vLLM instances; without a fixed hash seed
+    # the two replicas compute different hashes and never hit each other's KV.
     env["PYTHONHASHSEED"] = "0"
     env["PYO3_PYTHON"] = sys.executable
     env["PYTHONHOME"] = sys.base_prefix
@@ -296,10 +299,10 @@ def wait_metric_settled(
     http_port: int, prefixes: tuple[str, ...], baseline: float
 ) -> float:
     """Wait until the metric rises above baseline and stops increasing."""
-    deadline = time.time() + 120
+    deadline = time.time() + 300
     last = baseline
     while time.time() < deadline:
-        time.sleep(2)
+        time.sleep(1)
         current = fetch_metric(http_port, prefixes)
         if current > baseline and current == last:
             return current
@@ -307,6 +310,31 @@ def wait_metric_settled(
     raise TimeoutError(
         f"metric {prefixes} did not settle (baseline={baseline}, last={last})"
     )
+
+
+def gpu_mem_snapshot() -> str:
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return "n/a"
+    used = [int(line) for line in out.split() if line]
+    return f"{min(used)}-{max(used)} MiB/GPU" if used else "n/a"
+
+
+def count_tokens(port: int, text: str) -> int:
+    response = requests.post(
+        f"http://127.0.0.1:{port}/tokenize",
+        json={"model": MODEL_ALIAS, "prompt": text},
+        timeout=60,
+    )
+    response.raise_for_status()
+    return response.json()["count"]
 
 
 def timed_completion(port: int, prompt: str, max_tokens: int) -> dict:
@@ -345,33 +373,92 @@ def timed_completion(port: int, prompt: str, max_tokens: int) -> dict:
     }
 
 
-def make_prompt(trial: int, target_tokens: int) -> str:
-    rng = random.Random(20260610 + trial)
-    body = " ".join(rng.choice(WORDS) for _ in range(target_tokens))
-    return f"Log {trial}: {body}\nSummarize the pattern above:"
+def make_words(seed: int, num_words: int) -> str:
+    rng = random.Random(20260610 + seed)
+    return " ".join(rng.choice(WORDS) for _ in range(num_words))
+
+
+def make_prompt(port: int, seed: int, target_tokens: int) -> str:
+    """Build a unique prompt of ~target_tokens, verified via /tokenize."""
+    probe = make_words(seed, 512)
+    tokens_per_word = count_tokens(port, probe) / 512
+    num_words = int(target_tokens / tokens_per_word)
+    for _ in range(8):
+        prompt = f"Log {seed}: {make_words(seed, num_words)}\nSummarize briefly:"
+        actual = count_tokens(port, prompt)
+        if abs(actual - target_tokens) <= max(32, target_tokens // 100):
+            return prompt
+        num_words = int(num_words * target_tokens / actual)
+    return prompt
 
 
 def fmt_mib(value: float) -> str:
-    return f"{value / (1 << 20):.0f} MiB"
+    return f"{value / (1 << 20):.0f}MiB"
+
+
+def run_trial(
+    vllm1: VllmReplica,
+    vllm2: VllmReplica,
+    pega1: PegaServer,
+    pega2: PegaServer,
+    prompt: str,
+    max_tokens: int,
+) -> dict:
+    save_before = fetch_metric(pega1.http_port, SAVE_METRICS)
+    cold = timed_completion(vllm1.port, prompt, max_tokens)
+    # Wait for the async save to land on server1 and propagate to the
+    # metaserver before asking server2 for the same blocks.
+    wait_metric_settled(pega1.http_port, SAVE_METRICS, save_before)
+    time.sleep(3)
+
+    fetch_before = fetch_metric(pega2.http_port, FETCH_BYTES_METRICS)
+    p2p = timed_completion(vllm2.port, prompt, max_tokens)
+    fetched = fetch_metric(pega2.http_port, FETCH_BYTES_METRICS) - fetch_before
+
+    load_before = fetch_metric(pega1.http_port, LOAD_BYTES_METRICS)
+    warm = timed_completion(vllm1.port, prompt, max_tokens)
+    loaded = fetch_metric(pega1.http_port, LOAD_BYTES_METRICS) - load_before
+
+    return {
+        "tokens": cold["prompt_tokens"],
+        "cold": cold,
+        "p2p": p2p,
+        "warm": warm,
+        "fetched": fetched,
+        "loaded": loaded,
+    }
 
 
 def main() -> None:
+    sys.stdout.reconfigure(line_buffering=True)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--prompt-tokens", type=int, default=4000)
-    parser.add_argument("--trials", type=int, default=3)
+    parser.add_argument(
+        "--prompt-tokens",
+        default="2000,4000,8000,16000,31000",
+        help="comma-separated prompt lengths to sweep",
+    )
+    parser.add_argument("--trials", type=int, default=2, help="trials per length")
     parser.add_argument("--max-tokens", type=int, default=8)
-    parser.add_argument("--max-model-len", type=int, default=8192)
+    parser.add_argument(
+        "--max-model-len",
+        type=int,
+        default=0,
+        help="0 = max sweep length + 256",
+    )
     parser.add_argument("--tp", type=int, default=8)
     parser.add_argument("--devices", default="0,1,2,3,4,5,6,7")
-    parser.add_argument("--pool-size", default="40gb")
+    parser.add_argument("--pool-size", default="60gb")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.3)
     parser.add_argument("--log-dir", default="/tmp/pegaflow_p2p_bench")
     args = parser.parse_args()
 
+    sweep = [int(x) for x in args.prompt_tokens.split(",")]
+    max_model_len = args.max_model_len or max(sweep) + 256
+
     nics = os.environ.get("PEGAFLOW_NICS", "")
     if not nics:
-        raise SystemExit("PEGAFLOW_NICS is required (comma-separated RDMA device list)")
+        raise SystemExit("PEGAFLOW_NICS is required (comma-separated RDMA devices)")
     host = os.environ.get("PEGAFLOW_HOST_IP", "127.0.0.1")
 
     log_dir = Path(args.log_dir)
@@ -399,9 +486,10 @@ def main() -> None:
                 args.gpu_memory_utilization,
                 pega1,
                 log_dir,
-                args.max_model_len,
+                max_model_len,
             )
         )
+        print(f"[gpu] after vllm-1: {gpu_mem_snapshot()}")
         vllm2 = stack.enter_context(
             VllmReplica(
                 "2",
@@ -412,65 +500,61 @@ def main() -> None:
                 args.gpu_memory_utilization,
                 pega2,
                 log_dir,
-                args.max_model_len,
+                max_model_len,
             )
         )
+        print(f"[gpu] after vllm-2: {gpu_mem_snapshot()}")
 
-        # Warm up both replicas so CUDA graphs/allocator state do not skew trial 1.
-        timed_completion(vllm1.port, make_prompt(-1, 64), args.max_tokens)
-        timed_completion(vllm2.port, make_prompt(-2, 64), args.max_tokens)
+        # Warm up both replicas so allocator/runtime state does not skew trial 1.
+        timed_completion(vllm1.port, make_prompt(vllm1.port, -1, 256), args.max_tokens)
+        timed_completion(vllm2.port, make_prompt(vllm1.port, -2, 256), args.max_tokens)
 
-        for trial in range(args.trials):
-            prompt = make_prompt(trial, args.prompt_tokens)
+        seed = 0
+        for target in sweep:
+            for trial in range(args.trials):
+                seed += 1
+                prompt = make_prompt(vllm1.port, seed, target)
+                row = run_trial(vllm1, vllm2, pega1, pega2, prompt, args.max_tokens)
+                row.update(target=target, trial=trial)
+                results.append(row)
+                print(
+                    f"tokens={row['tokens']} trial={trial}: "
+                    f"cold={row['cold']['ttft_ms']:.0f}ms "
+                    f"p2p={row['p2p']['ttft_ms']:.0f}ms "
+                    f"(rdma {fmt_mib(row['fetched'])}) "
+                    f"warm={row['warm']['ttft_ms']:.0f}ms "
+                    f"(local {fmt_mib(row['loaded'])}) "
+                    f"gpu={gpu_mem_snapshot()}"
+                )
 
-            save_before = fetch_metric(pega1.http_port, SAVE_METRICS)
-            cold = timed_completion(vllm1.port, prompt, args.max_tokens)
-            # Wait for the async save to land on server1 and propagate to the
-            # metaserver before asking server2 for the same blocks.
-            wait_metric_settled(pega1.http_port, SAVE_METRICS, save_before)
-            time.sleep(3)
-
-            fetch_before = fetch_metric(pega2.http_port, FETCH_BYTES_METRICS)
-            p2p = timed_completion(vllm2.port, prompt, args.max_tokens)
-            fetched = fetch_metric(pega2.http_port, FETCH_BYTES_METRICS) - fetch_before
-
-            load_before = fetch_metric(pega1.http_port, LOAD_BYTES_METRICS)
-            warm = timed_completion(vllm1.port, prompt, args.max_tokens)
-            loaded = fetch_metric(pega1.http_port, LOAD_BYTES_METRICS) - load_before
-
-            results.append(
-                {
-                    "trial": trial,
-                    "tokens": cold["prompt_tokens"],
-                    "cold": cold,
-                    "p2p": p2p,
-                    "warm": warm,
-                    "fetched": fetched,
-                    "loaded": loaded,
-                }
-            )
-            print(
-                f"trial {trial} ({cold['prompt_tokens']} prompt tokens): "
-                f"cold={cold['ttft_ms']:.0f}ms "
-                f"p2p={p2p['ttft_ms']:.0f}ms (rdma {fmt_mib(fetched)}) "
-                f"warm={warm['ttft_ms']:.0f}ms (local {fmt_mib(loaded)})"
-            )
-
-    print("\n=== P2P load benchmark ===")
-    print(f"model={args.model} tp={args.tp} prompt_tokens~{args.prompt_tokens}")
-    print(
-        f"{'trial':>5} {'tokens':>7} {'cold TTFT':>10} {'p2p TTFT':>10} {'warm TTFT':>10} {'rdma fetched':>13}"
+    (log_dir / "results.json").write_text(
+        json.dumps({"args": vars(args), "rows": results}, indent=2)
     )
-    for r in results:
+
+    print("\n=== P2P load benchmark (median TTFT over trials) ===")
+    print(f"model={args.model} tp={args.tp} trials={args.trials}")
+    header = f"{'tokens':>7} {'cold':>9} {'p2p':>9} {'warm':>9} {'cold/p2p':>9} {'rdma fetched':>13}"
+    print(header)
+    for target in sweep:
+        rows = [r for r in results if r["target"] == target]
+        cold = statistics.median(r["cold"]["ttft_ms"] for r in rows)
+        p2p = statistics.median(r["p2p"]["ttft_ms"] for r in rows)
+        warm = statistics.median(r["warm"]["ttft_ms"] for r in rows)
+        fetched = statistics.median(r["fetched"] for r in rows)
         print(
-            f"{r['trial']:>5} {r['tokens'] or '?':>7} "
-            f"{r['cold']['ttft_ms']:>8.0f}ms {r['p2p']['ttft_ms']:>8.0f}ms "
-            f"{r['warm']['ttft_ms']:>8.0f}ms {fmt_mib(r['fetched']):>13}"
+            f"{rows[0]['tokens']:>7} {cold:>7.0f}ms {p2p:>7.0f}ms {warm:>7.0f}ms "
+            f"{cold / p2p if p2p else 0:>8.1f}x {fmt_mib(fetched):>13}"
         )
     for r in results:
         if r["fetched"] <= 0:
             print(
-                f"WARNING: trial {r['trial']} fetched 0 RDMA bytes — p2p path not exercised"
+                f"WARNING: tokens={r['target']} trial={r['trial']} fetched 0 RDMA "
+                "bytes — p2p path not exercised"
+            )
+        if r["loaded"] <= 0:
+            print(
+                f"WARNING: tokens={r['target']} trial={r['trial']} loaded 0 local "
+                "bytes — warm path not exercised"
             )
 
 
