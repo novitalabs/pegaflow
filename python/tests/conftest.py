@@ -335,9 +335,10 @@ def block_hashes() -> list[bytes]:
 class PegaServerProcess:
     """Manages a PegaServer subprocess for testing."""
 
-    def __init__(self, port: int, pool_size: str = DEFAULT_POOL_SIZE):
+    def __init__(self, port: int, pool_size: str = DEFAULT_POOL_SIZE, devices: str = "0"):
         self.port = port
         self.pool_size = pool_size
+        self.devices = devices
         self.endpoint = f"http://127.0.0.1:{port}"
         self.process: subprocess.Popen | None = None
         self._binary_path = find_server_binary()
@@ -369,7 +370,7 @@ class PegaServerProcess:
             "--pool-size",
             self.pool_size,
             "--devices",
-            "0",
+            self.devices,
         ]
 
         # Route logs to a tempfile so the pipe buffer cannot fill up and
