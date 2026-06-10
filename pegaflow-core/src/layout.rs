@@ -90,7 +90,7 @@ impl KVCacheLayout {
         data_ptr
             .checked_add(size_bytes as u64)
             .ok_or_else(|| "data_ptr + size_bytes overflows the address space".to_string())?;
-        segment_bytes
+        let block_bytes = segment_bytes
             .checked_mul(segments)
             .ok_or_else(|| "block size overflow".to_string())?;
 
@@ -116,7 +116,10 @@ impl KVCacheLayout {
             data_ptr,
             size_bytes,
             num_blocks,
-            block_stride_bytes: segment_bytes,
+            block_stride_bytes: match seg {
+                SegmentLayout::Contiguous => block_bytes,
+                SegmentLayout::Split { .. } => segment_bytes,
+            },
             segment_bytes,
             segments,
             padded_segment_bytes: segment_bytes,
@@ -156,24 +159,68 @@ impl KVCacheLayout {
         self
     }
 
-    /// Validate that the last block's last byte fits in `size_bytes`.
+    /// Validate that all addressed bytes fit in `size_bytes` and no two block
+    /// ranges alias the same device memory.
     fn check_bounds(&self) -> Result<(), String> {
-        let per_block_extent = match self.seg {
-            SegmentLayout::Contiguous => self.block_bytes(),
-            SegmentLayout::Split { kv_stride_bytes } => kv_stride_bytes
-                .checked_add(self.segment_bytes)
-                .ok_or_else(|| "memory layout overflow".to_string())?,
+        let end = match self.seg {
+            SegmentLayout::Contiguous => {
+                let block_bytes = self.block_bytes();
+                if self.block_stride_bytes < block_bytes {
+                    return Err(format!(
+                        "block_stride {} must be >= block_bytes {block_bytes}: blocks would overlap",
+                        self.block_stride_bytes
+                    ));
+                }
+                (self.num_blocks - 1)
+                    .checked_mul(self.block_stride_bytes)
+                    .and_then(|o| o.checked_add(block_bytes))
+                    .ok_or_else(|| "memory layout overflow".to_string())?
+            }
+            SegmentLayout::Split { kv_stride_bytes } => {
+                if self.block_stride_bytes < self.segment_bytes {
+                    return Err(format!(
+                        "block_stride {} must be >= segment_bytes {}: blocks would overlap",
+                        self.block_stride_bytes, self.segment_bytes
+                    ));
+                }
+                self.check_split_segments_disjoint(kv_stride_bytes)?;
+                let last_segment_end = (self.num_blocks - 1)
+                    .checked_mul(self.block_stride_bytes)
+                    .and_then(|o| o.checked_add(self.segment_bytes))
+                    .ok_or_else(|| "memory layout overflow".to_string())?;
+                kv_stride_bytes
+                    .checked_add(last_segment_end)
+                    .ok_or_else(|| "memory layout overflow".to_string())?
+            }
         };
-        let end = (self.num_blocks - 1)
-            .checked_mul(self.block_stride_bytes)
-            .and_then(|o| o.checked_add(per_block_extent))
-            .ok_or_else(|| "memory layout overflow".to_string())?;
         if end > self.size_bytes {
             return Err(format!(
                 "registered memory too small: need {end} bytes, got {}",
                 self.size_bytes
             ));
         }
+        Ok(())
+    }
+
+    fn check_split_segments_disjoint(&self, kv_stride_bytes: usize) -> Result<(), String> {
+        let max_block_distance = self.num_blocks - 1;
+        let nearest = kv_stride_bytes / self.block_stride_bytes;
+
+        for distance in [nearest, nearest.saturating_add(1)] {
+            if distance == 0 || distance > max_block_distance {
+                continue;
+            }
+            let block_distance_bytes = distance
+                .checked_mul(self.block_stride_bytes)
+                .ok_or_else(|| "memory layout overflow".to_string())?;
+            let gap = kv_stride_bytes.abs_diff(block_distance_bytes);
+            if gap < self.segment_bytes {
+                return Err(format!(
+                    "kv_stride_bytes {kv_stride_bytes} overlaps blocks {distance} apart"
+                ));
+            }
+        }
+
         Ok(())
     }
 
@@ -284,12 +331,58 @@ mod tests {
             BlockCopies::Contiguous(c) => assert_eq!(c.bytes, 2048),
             BlockCopies::Split { .. } => panic!("expected contiguous copies"),
         }
+        assert_eq!(contiguous_addr(&layout, 1), 0x1000 + 2048);
     }
 
     #[test]
     fn overlapping_kv_stride_rejected() {
         let err = KVCacheLayout::new(0x1000, 200 * 1024, 100, 1024, 512, 2).unwrap_err();
         assert!(err.contains("overlap"), "{err}");
+    }
+
+    #[test]
+    fn split_kv_regions_must_not_overlap() {
+        let err = KVCacheLayout::new(0x1000, 200 * 1024, 100, 1024, 2048, 2).unwrap_err();
+        assert!(err.contains("overlaps blocks 2 apart"), "{err}");
+    }
+
+    #[test]
+    fn sparse_split_layout_can_have_interleaved_disjoint_segments() {
+        let layout = KVCacheLayout::new(0x1000, 1_600, 2, 100, 500, 2)
+            .unwrap()
+            .with_block_stride(1_000)
+            .unwrap();
+
+        match layout.block_copies(0).unwrap() {
+            BlockCopies::Split { k, v } => {
+                assert_eq!(k.addr, 0x1000);
+                assert_eq!(v.addr, 0x1000 + 500);
+            }
+            BlockCopies::Contiguous(_) => panic!("expected split copies"),
+        }
+        match layout.block_copies(1).unwrap() {
+            BlockCopies::Split { k, v } => {
+                assert_eq!(k.addr, 0x1000 + 1_000);
+                assert_eq!(v.addr, 0x1000 + 1_500);
+            }
+            BlockCopies::Contiguous(_) => panic!("expected split copies"),
+        }
+    }
+
+    #[test]
+    fn adjacent_kv_default_stride_keeps_blocks_disjoint() {
+        let layout = KVCacheLayout::new(0x1000, 200 * 1024, 100, 1024, 1024, 2).unwrap();
+
+        let block0 = match layout.block_copies(0).unwrap() {
+            BlockCopies::Contiguous(c) => c,
+            BlockCopies::Split { .. } => panic!("expected contiguous copies"),
+        };
+        let block1 = match layout.block_copies(1).unwrap() {
+            BlockCopies::Contiguous(c) => c,
+            BlockCopies::Split { .. } => panic!("expected contiguous copies"),
+        };
+
+        assert_eq!(block0.addr + block0.bytes as u64, block1.addr);
     }
 
     #[test]
@@ -334,6 +427,14 @@ mod tests {
                 .with_block_stride(4096)
                 .is_err()
         );
+
+        // Split K/V regions that are disjoint with the default dense stride can
+        // overlap again if the explicit per-block stride grows too far.
+        let err = KVCacheLayout::new(0x1000, 200 * 1024, 100, 1024, 100 * 1024, 2)
+            .unwrap()
+            .with_block_stride(2048)
+            .unwrap_err();
+        assert!(err.contains("overlaps blocks 50 apart"), "{err}");
     }
 
     #[test]
