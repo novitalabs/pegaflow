@@ -357,10 +357,17 @@ async fn fetch_blocks_via_push(
         let mut columns: Vec<Option<Vec<Arc<RawBlock>>>> = Vec::new();
         columns.resize_with(template.len(), || None);
         std::thread::scope(|scope| {
+            // Two workers per NUMA group: 2-way refcount contention is mild
+            // and halves the wall time of the column build.
             let workers: Vec<_> = slots_by_numa
                 .values()
+                .flat_map(|slot_indices| {
+                    let mid = slot_indices.len().div_ceil(2);
+                    let (a, b) = slot_indices.split_at(mid);
+                    [a, b]
+                })
+                .filter(|part| !part.is_empty())
                 .map(|slot_indices| {
-                    let slot_indices = slot_indices.as_slice();
                     scope.spawn(move || {
                         slot_indices
                             .iter()
@@ -375,6 +382,15 @@ async fn fetch_blocks_via_push(
                 }
             }
         });
+        // Transpose with moves. Footprint and per-slot NUMA placement are
+        // template-derived, so sealing dereferences no slot Arcs — and the
+        // populated slot_numas keep fetched blocks re-servable to a third
+        // node (the requester mirrors the holder's NUMA placement).
+        let footprint: u64 = template
+            .iter()
+            .map(|s| s.k_size.saturating_add(s.v_size))
+            .sum();
+        let slot_numas: Vec<NumaNode> = template.iter().map(|s| NumaNode(s.numa_node)).collect();
         let mut column_iters: Vec<_> = columns
             .into_iter()
             .map(|c| c.expect("every slot has a column").into_iter())
@@ -385,7 +401,11 @@ async fn fetch_blocks_via_push(
                     .iter_mut()
                     .map(|it| it.next().expect("column length == block count"))
                     .collect();
-                Arc::new(SealedBlock::from_slots(slots))
+                Arc::new(SealedBlock::from_slots_with_footprint(
+                    slots.into_boxed_slice(),
+                    footprint,
+                    slot_numas.clone(),
+                ))
             })
             .collect()
     };

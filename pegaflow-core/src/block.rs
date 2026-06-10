@@ -279,7 +279,7 @@ impl SealedBlock {
     }
 
     /// Create from slots with pre-computed footprint (internal use)
-    fn from_slots_with_footprint(
+    pub(crate) fn from_slots_with_footprint(
         slots: Box<[Arc<RawBlock>]>,
         footprint: u64,
         slot_numas: Vec<NumaNode>,
