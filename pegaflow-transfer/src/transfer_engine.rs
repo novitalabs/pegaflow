@@ -15,7 +15,7 @@ use log::{error, warn};
 use parking_lot::Mutex;
 use parking_lot::RwLock;
 
-use crate::v2::{
+use crate::{
     AsyncTransferEngine, BouncingErrorCallback, BouncingRecvCallback, CallbackResult,
     ErrorCallback, FabricLibError, RdmaEngine, RecvCallback, SendBuffer, SendCallback,
     SendRecvEngine,
@@ -51,7 +51,6 @@ pub type ImmCountCallback = Box<dyn Fn() -> std::result::Result<bool, String> + 
 
 enum ImmCountFn {
     /// The callback will be called once when the expected count is reached.
-    #[allow(dead_code)]
     Once(Box<dyn FnOnce() + Send + Sync>),
     /// The callback will be called every time the expected count is reached.
     Repeated(Box<dyn Fn() -> std::result::Result<bool, String> + Send + Sync>),
@@ -335,11 +334,11 @@ impl AsyncTransferEngine for TransferEngine {
         let (tx, rx) = oneshot::channel();
 
         let callback = Box::new(move |result: Result<()>| {
-            if tx.send(result).is_err() {
-                Err("Failed to send result through oneshot channel".to_string())
-            } else {
-                Ok(())
-            }
+            // A dropped receiver means the caller was cancelled (e.g. timed
+            // out); the completion is simply discarded. It must not be
+            // reported as a callback error, which would stop the engine.
+            let _ = tx.send(result);
+            Ok(())
         });
 
         tokio::task::block_in_place(move || self.submit_send(addr, buffer, callback))?;
@@ -358,15 +357,16 @@ impl AsyncTransferEngine for TransferEngine {
         let done_tx = tx.clone();
         let error_tx = tx;
         let callback = TransferCallback {
+            // A dropped receiver means the caller was cancelled (e.g. timed
+            // out); the completion is simply discarded. It must not be
+            // reported as a callback error, which would stop the engine.
             on_done: Box::new(move || {
-                done_tx
-                    .blocking_send(Ok(()))
-                    .map_err(|e| format!("Failed to send result through oneshot channel: {}", e))
+                let _ = done_tx.blocking_send(Ok(()));
+                Ok(())
             }),
             on_error: Box::new(move |e: FabricLibError| {
-                error_tx
-                    .blocking_send(Err(e))
-                    .map_err(|e| format!("Failed to send error through oneshot channel: {}", e))
+                let _ = error_tx.blocking_send(Err(e));
+                Ok(())
             }),
         };
 
@@ -432,7 +432,7 @@ fn handle_transfer_completion(
         }
         TransferCompletionEntry::ImmData(imm_data) => {
             for callback in states.imm.read().iter() {
-                callback(imm_data)?
+                callback(imm_data)?;
             }
             Ok(())
         }
@@ -472,7 +472,7 @@ fn handle_transfer_completion(
                                 if count > 0 {
                                     for _ in 0..count {
                                         for callback in states.imm.read().iter() {
-                                            callback(imm)?
+                                            callback(imm)?;
                                         }
                                     }
                                 }

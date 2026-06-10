@@ -7,7 +7,7 @@ use std::ptr::NonNull;
 /// - Previously returned pointers remain valid for the lifetime of the pool.
 /// - Not thread-safe. Wrap in a Mutex if needed.
 /// - Safety: You must call `free_and_drop` to run `T`'s destructor if `T: Drop`.
-pub struct ObjectPool<T> {
+pub(crate) struct ObjectPool<T> {
     chunks: Vec<Box<[MaybeUninit<T>]>>,
     chunk_size: usize,
 
@@ -21,7 +21,7 @@ pub struct ObjectPool<T> {
 
 impl<T> ObjectPool<T> {
     /// Create a pool with a given chunk size.
-    pub fn with_chunk_size(chunk_size: usize) -> Self {
+    pub(crate) fn with_chunk_size(chunk_size: usize) -> Self {
         assert!(chunk_size > 0, "chunk_size must be > 0");
         Self {
             chunks: Vec::new(),
@@ -36,7 +36,7 @@ impl<T> ObjectPool<T> {
     /// Safety:
     /// - Returned pointer must be written with a valid `T` before any read or `dealloc_init`.
     /// - Pointer remains valid until returned to this pool or the pool is dropped.
-    pub unsafe fn alloc_uninit(&mut self) -> NonNull<MaybeUninit<T>> {
+    pub(crate) unsafe fn alloc_uninit(&mut self) -> NonNull<MaybeUninit<T>> {
         if let Some(p) = self.free_list.pop() {
             return p;
         }
@@ -58,23 +58,10 @@ impl<T> ObjectPool<T> {
     /// Safety:
     /// - `p` must have been returned by `alloc_uninit` of *this* pool,
     ///   and not already deallocated.
-    pub unsafe fn free_and_drop(&mut self, p: NonNull<T>) {
+    pub(crate) unsafe fn free_and_drop(&mut self, p: NonNull<T>) {
         // SAFETY: caller guarantees p originated from this pool and is not freed twice.
         unsafe { std::ptr::drop_in_place(p.as_ptr()) };
         self.free_list
             .push(unsafe { NonNull::new_unchecked(p.as_ptr() as *mut MaybeUninit<T>) });
-    }
-
-    /// Deallocate a previously allocated pointer without running its destructor.
-    ///
-    /// Safety:
-    /// - `p` must have been returned by `alloc_uninit` of *this* pool,
-    ///   and not already deallocated.
-    /// - Only use this if `p` was never initialized or T is POD.
-    #[allow(dead_code)]
-    pub unsafe fn free_no_drop(&mut self, p: *mut MaybeUninit<T>) {
-        debug_assert!(!p.is_null());
-        // SAFETY: caller guarantees p originated from this pool and is not freed twice.
-        self.free_list.push(unsafe { NonNull::new_unchecked(p) });
     }
 }

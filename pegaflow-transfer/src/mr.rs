@@ -4,10 +4,10 @@ use crate::cuda_lib::driver::cu_get_dma_buf_fd;
 use crate::cuda_lib::rt::{cudaMemoryTypeDevice, cudaPointerGetAttributes};
 use crate::cuda_lib::{CudaDeviceId, Device};
 
-use crate::v2::error::{FabricLibError, Result};
+use crate::error::{FabricLibError, Result};
 
 #[derive(Debug, PartialEq, Eq, Hash)]
-pub enum Mapping {
+pub(crate) enum Mapping {
     Host,
     Device {
         device_id: CudaDeviceId,
@@ -16,14 +16,14 @@ pub enum Mapping {
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
-pub struct MemoryRegion {
+pub(crate) struct MemoryRegion {
     ptr: NonNull<c_void>,
     len: usize,
     mapping: Mapping,
 }
 
 impl MemoryRegion {
-    pub fn new(ptr: NonNull<c_void>, len: usize, device: Device) -> Result<Self> {
+    pub(crate) fn new(ptr: NonNull<c_void>, len: usize, device: Device) -> Result<Self> {
         let mapping = match device {
             Device::Host => Mapping::Host,
             Device::Cuda(device_id) => {
@@ -45,15 +45,15 @@ impl MemoryRegion {
         Ok(MemoryRegion { ptr, len, mapping })
     }
 
-    pub fn ptr(&self) -> NonNull<c_void> {
+    pub(crate) fn ptr(&self) -> NonNull<c_void> {
         self.ptr
     }
 
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.len
     }
 
-    pub fn mapping(&self) -> &Mapping {
+    pub(crate) fn mapping(&self) -> &Mapping {
         &self.mapping
     }
 }
@@ -79,7 +79,7 @@ impl Drop for MemoryRegion {
 /// For verbs, this is the MR LKEY.
 #[derive(Debug, Clone, Copy)]
 #[repr(transparent)]
-pub struct MemoryRegionLocalDescriptor(pub u64);
+pub(crate) struct MemoryRegionLocalDescriptor(pub u64);
 
 static LINUX_KERNEL_SUPPORTS_DMA_BUF: LazyLock<bool> = LazyLock::new(|| {
     let Ok(version) = std::fs::read_to_string("/proc/sys/kernel/osrelease") else {

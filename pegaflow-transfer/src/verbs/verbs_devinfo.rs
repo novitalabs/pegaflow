@@ -1,6 +1,6 @@
 use std::{borrow::Cow, ffi::CStr, sync::Arc};
 
-use crate::v2::{
+use crate::{
     error::{Result, VerbsError},
     provider::RdmaDomainInfo,
 };
@@ -13,7 +13,7 @@ use sideway::ibverbs::{
     device_context::PortState,
 };
 
-pub struct VerbsDeviceList {
+pub(crate) struct VerbsDeviceList {
     pub list: *mut *mut ibv_device,
     pub num_devices: usize,
 }
@@ -22,7 +22,7 @@ unsafe impl Send for VerbsDeviceList {}
 unsafe impl Sync for VerbsDeviceList {}
 
 impl VerbsDeviceList {
-    pub fn get_all_devices() -> Result<Arc<Self>> {
+    pub(crate) fn get_all_devices() -> Result<Arc<Self>> {
         let mut num_devices = 0;
         let list = unsafe { ibv_get_device_list(&raw mut num_devices) };
         if list.is_null() {
@@ -43,7 +43,7 @@ impl Drop for VerbsDeviceList {
 }
 
 #[derive(Clone)]
-pub struct VerbsDeviceInfo {
+pub(crate) struct VerbsDeviceInfo {
     pub device_list: Arc<VerbsDeviceList>,
     pub device_index: usize,
     pub port_num: u8,
@@ -51,7 +51,7 @@ pub struct VerbsDeviceInfo {
 }
 
 impl VerbsDeviceInfo {
-    pub fn new(device_list: Arc<VerbsDeviceList>, device_index: usize) -> Self {
+    pub(crate) fn new(device_list: Arc<VerbsDeviceList>, device_index: usize) -> Self {
         let device_name =
             unsafe { CStr::from_ptr((*(*device_list.list.add(device_index))).name.as_ptr()) }
                 .to_string_lossy()
@@ -70,7 +70,7 @@ impl VerbsDeviceInfo {
         }
     }
 
-    pub fn device(&self) -> *mut ibv_device {
+    pub(crate) fn device(&self) -> *mut ibv_device {
         unsafe { *self.device_list.list.add(self.device_index) }
     }
 }

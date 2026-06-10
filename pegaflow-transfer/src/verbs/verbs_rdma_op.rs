@@ -8,7 +8,7 @@ use std::{
 
 use rdma_mummy_sys::{ibv_qp, ibv_recv_wr, ibv_send_flags, ibv_send_wr, ibv_sge, ibv_wr_opcode};
 
-use crate::v2::{
+use crate::{
     api::ScatterTarget,
     rdma_op::{ImmWriteOp, PagedWriteOp, RecvOp, ScatterGroupWriteOp, SendOp, SingleWriteOp},
     verbs::zeroed,
@@ -16,18 +16,18 @@ use crate::v2::{
 
 /// The maximum number of WRs in a WR chain.
 /// NOTE(lequn): Benchmark shows no performance gain above 4.
-pub const WR_CHAIN_LEN: usize = 4;
+pub(super) const WR_CHAIN_LEN: usize = 4;
 
-pub type WrChainBuffer = [(MaybeUninit<ibv_send_wr>, MaybeUninit<ibv_sge>); WR_CHAIN_LEN];
+pub(super) type WrChainBuffer = [(MaybeUninit<ibv_send_wr>, MaybeUninit<ibv_sge>); WR_CHAIN_LEN];
 
-pub struct SingleWriteOpIter {
+pub(super) struct SingleWriteOpIter {
     rma_qp: NonNull<ibv_qp>,
     wr_chain_buffer: NonNull<WrChainBuffer>,
     done: bool,
 }
 
 impl SingleWriteOpIter {
-    pub fn new_single(
+    pub(super) fn new_single(
         op: SingleWriteOp,
         rma_qp: NonNull<ibv_qp>,
         mut wr_chain_buffer: NonNull<WrChainBuffer>,
@@ -60,7 +60,7 @@ impl SingleWriteOpIter {
         }
     }
 
-    pub fn new_imm(
+    pub(super) fn new_imm(
         op: ImmWriteOp,
         rma_qp: NonNull<ibv_qp>,
         mut wr_chain_buffer: NonNull<WrChainBuffer>,
@@ -87,7 +87,7 @@ impl SingleWriteOpIter {
         }
     }
 
-    pub fn peek(&self) -> (*mut ibv_qp, *mut ibv_send_wr, usize) {
+    pub(super) fn peek(&self) -> (*mut ibv_qp, *mut ibv_send_wr, usize) {
         if self.done {
             (self.rma_qp.as_ptr(), null_mut(), 0)
         } else {
@@ -96,12 +96,12 @@ impl SingleWriteOpIter {
         }
     }
 
-    pub fn mark_done(&mut self) {
+    pub(super) fn mark_done(&mut self) {
         self.done = true;
     }
 }
 
-pub struct PagedWriteOpIter {
+pub(super) struct PagedWriteOpIter {
     rma_qp: NonNull<ibv_qp>,
     // Buffer
     wr_chain_buffer: NonNull<WrChainBuffer>,
@@ -122,7 +122,7 @@ pub struct PagedWriteOpIter {
 }
 
 impl PagedWriteOpIter {
-    pub fn new(
+    pub(super) fn new(
         op: PagedWriteOp,
         rma_qp: NonNull<ibv_qp>,
         mut wr_chain_buffer: NonNull<WrChainBuffer>,
@@ -179,11 +179,11 @@ impl PagedWriteOpIter {
         slf
     }
 
-    pub fn total_ops(&self) -> usize {
+    pub(super) fn total_ops(&self) -> usize {
         self.page_indices_end - self.page_indices_beg
     }
 
-    pub fn peek(&self) -> (*mut ibv_qp, *mut ibv_send_wr, usize) {
+    pub(super) fn peek(&self) -> (*mut ibv_qp, *mut ibv_send_wr, usize) {
         if self.wr_len == 0 {
             return (null_mut(), null_mut(), 0);
         }
@@ -195,7 +195,7 @@ impl PagedWriteOpIter {
         )
     }
 
-    pub fn advance(&mut self, n: usize) {
+    pub(super) fn advance(&mut self, n: usize) {
         self.i_wr_head = (self.i_wr_head + n) % WR_CHAIN_LEN;
         self.wr_len -= n;
         while self.i_page < self.page_indices_end && self.wr_len < WR_CHAIN_LEN {
@@ -230,7 +230,7 @@ impl PagedWriteOpIter {
     }
 }
 
-pub struct ScatterWriteOpIter {
+pub(super) struct ScatterWriteOpIter {
     qp_list: Rc<Vec<NonNull<ibv_qp>>>,
     // Buffer
     wr_chain_buffer: NonNull<WrChainBuffer>,
@@ -247,7 +247,7 @@ pub struct ScatterWriteOpIter {
 }
 
 impl ScatterWriteOpIter {
-    pub fn new(
+    pub(super) fn new(
         op: ScatterGroupWriteOp,
         qp_list: Rc<Vec<NonNull<ibv_qp>>>,
         mut wr_chain_buffer: NonNull<WrChainBuffer>,
@@ -295,11 +295,11 @@ impl ScatterWriteOpIter {
         slf
     }
 
-    pub fn total_ops(&self) -> usize {
+    pub(super) fn total_ops(&self) -> usize {
         self.dst_end - self.dst_beg
     }
 
-    pub fn peek(&self) -> (*mut ibv_qp, *mut ibv_send_wr, usize) {
+    pub(super) fn peek(&self) -> (*mut ibv_qp, *mut ibv_send_wr, usize) {
         if self.i_dst == self.dst_end {
             return (null_mut(), null_mut(), 0);
         }
@@ -308,7 +308,7 @@ impl ScatterWriteOpIter {
         (self.qp_list[self.i_dst].as_ptr(), wr.as_mut_ptr(), 1)
     }
 
-    pub fn advance_one(&mut self) {
+    pub(super) fn advance_one(&mut self) {
         self.i_dst += 1;
         if self.i_dst != self.dst_end {
             self.fill_wr();
@@ -321,10 +321,17 @@ impl ScatterWriteOpIter {
         let wr = unsafe { wr.assume_init_mut() };
         let sge = unsafe { sge.assume_init_mut() };
 
-        // Update output buffers
+        // Update output buffers. Shards split the target into `length / N`
+        // chunks; the last shard also takes the remainder so every byte of
+        // the target is written.
         let dst = &self.dsts[self.i_dst];
-        let len = dst.length as u32 / self.byte_shards;
-        let offset = len * self.byte_shard_idx;
+        let base = dst.length as u32 / self.byte_shards;
+        let offset = base * self.byte_shard_idx;
+        let len = if self.byte_shard_idx == self.byte_shards - 1 {
+            dst.length as u32 - offset
+        } else {
+            base
+        };
         sge.addr = unsafe {
             self.src_ptr
                 .as_ptr()
@@ -344,14 +351,14 @@ fn opcode_imm(imm_data: Option<u32>) -> (u32, u32) {
     }
 }
 
-pub enum WriteOpIter {
+pub(super) enum WriteOpIter {
     Single(SingleWriteOpIter),
     Paged(PagedWriteOpIter),
     Scatter(ScatterWriteOpIter),
 }
 
 impl WriteOpIter {
-    pub fn total_ops(&self) -> usize {
+    pub(super) fn total_ops(&self) -> usize {
         match self {
             WriteOpIter::Single(_) => 1,
             WriteOpIter::Paged(iter) => iter.total_ops(),
@@ -359,7 +366,7 @@ impl WriteOpIter {
         }
     }
 
-    pub fn peek(&self) -> (*mut ibv_qp, *mut ibv_send_wr, usize) {
+    pub(super) fn peek(&self) -> (*mut ibv_qp, *mut ibv_send_wr, usize) {
         match self {
             WriteOpIter::Single(iter) => iter.peek(),
             WriteOpIter::Paged(iter) => iter.peek(),
@@ -367,7 +374,7 @@ impl WriteOpIter {
         }
     }
 
-    pub fn advance(&mut self, n: usize) {
+    pub(super) fn advance(&mut self, n: usize) {
         match self {
             WriteOpIter::Single(iter) => {
                 if n == 0 {
@@ -388,7 +395,7 @@ impl WriteOpIter {
     }
 }
 
-pub fn fill_send_op(
+pub(super) fn fill_send_op(
     op: &SendOp,
     sge: &mut MaybeUninit<ibv_sge>,
     wr: &mut MaybeUninit<ibv_send_wr>,
@@ -412,7 +419,7 @@ pub fn fill_send_op(
     }
 }
 
-pub fn fill_recv_op(
+pub(super) fn fill_recv_op(
     op: &RecvOp,
     sge: &mut MaybeUninit<ibv_sge>,
     wr: &mut MaybeUninit<ibv_recv_wr>,

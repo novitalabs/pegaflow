@@ -2,7 +2,7 @@ use bytes::Bytes;
 use rdma_mummy_sys::ibv_gid;
 use serde::{Deserialize, Serialize};
 
-use crate::v2::{api::DomainAddress, utils::hex::fmt_hex};
+use crate::{api::DomainAddress, utils::hex::fmt_hex};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(transparent)]
@@ -19,7 +19,7 @@ pub struct VerbsUDAddress {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct VerbsRCAddress {
+pub(super) struct VerbsRCAddress {
     pub gid: Gid,
     pub lid: u16,
     pub qp_num: u32,

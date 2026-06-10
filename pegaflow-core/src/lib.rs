@@ -43,7 +43,7 @@ pub use pegaflow_common::NumaNode;
 use pegaflow_common::NumaTopology;
 pub use pinned_pool::PinnedAllocation;
 pub use seal_offload::SlotMeta;
-pub use storage::{DEFAULT_RDMA_QPS_PER_PEER, MemoryCacheCleanupStats, StorageConfig};
+pub use storage::{MemoryCacheCleanupStats, StorageConfig};
 pub use sync_state::{LoadState, LoadStateError};
 pub use trace::{set_trace_sample_rate, should_sample};
 pub use transfer::TransferMode;
@@ -772,15 +772,6 @@ impl PegaEngine {
         (session_id, found)
     }
 
-    pub fn transfer_lock_timeout(&self) -> std::time::Duration {
-        self.storage.transfer_lock_timeout()
-    }
-
-    /// Release a transfer lock session. Returns the number of blocks released.
-    pub fn release_transfer_lock(&self, session_id: &str) -> usize {
-        self.storage.release_transfer_lock(session_id)
-    }
-
     /// GC expired transfer lock sessions.
     pub fn gc_expired_transfer_locks(&self) -> usize {
         self.storage.gc_expired_transfer_locks()
@@ -804,68 +795,126 @@ impl PegaEngine {
         false
     }
 
-    /// Perform server-side RDMA handshake with connection reuse.
-    ///
-    /// If `client_handshake_bytes` is empty, the client believes it is already
-    /// connected -- return our cached local metadata (or empty if not found).
-    /// Otherwise, establish (or re-establish) a connection to the client.
-    ///
-    /// Returns `Err` if the handshake fails (bad client metadata, QP creation, etc.).
+    /// Serve a PushBlocks request: take the transfer session's locked blocks
+    /// and RDMA-WRITE them into the requester's memory. Returns the number of
+    /// bytes pushed once every WRITE has completed; the transfer lock is
+    /// released when this function returns (success or failure).
     #[cfg(feature = "rdma")]
-    pub fn rdma_accept_handshake(
+    pub async fn push_blocks_for_transfer(
         &self,
-        client_addr: &str,
-        client_handshake_bytes: &[u8],
-    ) -> Result<Vec<u8>, String> {
-        let rdma = self
-            .storage
-            .rdma_transport()
-            .ok_or_else(|| "RDMA transport not configured".to_string())?;
+        request: &pegaflow_proto::proto::engine::PushBlocksRequest,
+    ) -> Result<u64, PushBlocksError> {
+        use crate::backing::{PushSegment, mr_desc_from_proto};
 
-        if client_handshake_bytes.is_empty() {
-            // Client thinks it's already connected -- return our cached meta if we have it
-            return Ok(rdma
-                .engine()
-                .local_meta_for(client_addr)
-                .map(|m| m.to_bytes())
-                .unwrap_or_default());
+        let rdma = self.storage.rdma_transport().ok_or_else(|| {
+            PushBlocksError::Rejected("RDMA transport not configured".to_string())
+        })?;
+
+        // Holding the Arcs keeps the blocks alive while the WRITEs run.
+        let session_blocks = self
+            .storage
+            .take_transfer_session(&request.transfer_session_id)
+            .ok_or_else(|| {
+                PushBlocksError::Rejected(format!(
+                    "transfer session {} not found (expired or already pushed)",
+                    request.transfer_session_id
+                ))
+            })?;
+
+        if request.blocks.len() != session_blocks.len() {
+            return Err(PushBlocksError::Rejected(format!(
+                "push request has {} blocks but session has {}",
+                request.blocks.len(),
+                session_blocks.len()
+            )));
+        }
+        let mr_descs: Vec<_> = request
+            .memory_regions
+            .iter()
+            .map(mr_desc_from_proto)
+            .collect();
+        let segment_dst = |seg: &pegaflow_proto::proto::engine::PushSegmentDst| {
+            mr_descs.get(seg.mr_index as usize).cloned().ok_or_else(|| {
+                PushBlocksError::Rejected(format!("mr_index {} out of bounds", seg.mr_index))
+            })
+        };
+
+        let mut segments = Vec::new();
+        for ((key, sealed), dst_block) in session_blocks.iter().zip(&request.blocks) {
+            if key.hash != dst_block.block_hash {
+                return Err(PushBlocksError::Rejected(format!(
+                    "push request block hash mismatch for session block {key:?}"
+                )));
+            }
+            if sealed.slots().len() != dst_block.slots.len() {
+                return Err(PushBlocksError::Rejected(format!(
+                    "push request has {} slots but block {key:?} has {}",
+                    dst_block.slots.len(),
+                    sealed.slots().len()
+                )));
+            }
+            for (raw, dst_slot) in sealed.slots().iter().zip(&dst_block.slots) {
+                let layer_block = LayerBlock::new(Arc::clone(raw));
+                let k_dst = dst_slot.k.as_ref().ok_or_else(|| {
+                    PushBlocksError::Rejected(format!("missing K destination for block {key:?}"))
+                })?;
+                segments.push(PushSegment {
+                    src_addr: layer_block.k_ptr() as u64,
+                    len: layer_block.k_size() as u64,
+                    dst_mr: segment_dst(k_dst)?,
+                    dst_addr: k_dst.dst_addr,
+                });
+                if let Some(v_ptr) = layer_block.v_ptr() {
+                    let v_dst = dst_slot.v.as_ref().ok_or_else(|| {
+                        PushBlocksError::Rejected(format!(
+                            "missing V destination for block {key:?}"
+                        ))
+                    })?;
+                    segments.push(PushSegment {
+                        src_addr: v_ptr as u64,
+                        len: layer_block.v_size().unwrap_or(0) as u64,
+                        dst_mr: segment_dst(v_dst)?,
+                        dst_addr: v_dst.dst_addr,
+                    });
+                }
+            }
         }
 
-        let client_meta = pegaflow_transfer::HandshakeMetadata::from_bytes(client_handshake_bytes)
-            .map_err(|e| format!("invalid client handshake metadata: {e}"))?;
-
-        // Client sent handshake bytes → it has no connection. If we have a stale
-        // one (e.g. client restarted), tear it down so get_or_prepare creates fresh QPs.
-        rdma.engine().invalidate_connection(client_addr);
-
-        let server_meta = match rdma
-            .engine()
-            .get_or_prepare(client_addr)
-            .map_err(|e| format!("get_or_prepare failed: {e}"))?
-        {
-            pegaflow_transfer::ConnectionStatus::Prepared(m) => m,
-            pegaflow_transfer::ConnectionStatus::Existing => {
-                unreachable!("just invalidated connection for {client_addr}")
-            }
-            pegaflow_transfer::ConnectionStatus::Connecting => {
-                return Err(format!("handshake to {client_addr} already in progress"));
-            }
-        };
-        rdma.engine()
-            .complete_handshake(client_addr, &server_meta, &client_meta)
-            .map_err(|e| format!("complete_handshake failed: {e}"))?;
-        info!("RDMA handshake accepted: client={client_addr}");
-        Ok(server_meta.to_bytes())
+        rdma.push_segments(segments).await
     }
 
-    /// Perform server-side RDMA handshake with connection reuse.
+    /// Serve a PushBlocks request.
     #[cfg(not(feature = "rdma"))]
-    pub fn rdma_accept_handshake(
+    pub async fn push_blocks_for_transfer(
         &self,
-        _client_addr: &str,
-        _client_handshake_bytes: &[u8],
-    ) -> Result<Vec<u8>, String> {
-        Err("this binary was built without RDMA support".to_string())
+        _request: &pegaflow_proto::proto::engine::PushBlocksRequest,
+    ) -> Result<u64, PushBlocksError> {
+        Err(PushBlocksError::Rejected(
+            "this binary was built without RDMA support".to_string(),
+        ))
+    }
+}
+
+/// Error from serving a PushBlocks request.
+///
+/// The split matters for the requester's memory safety: a `Rejected` push
+/// never submitted an RDMA WRITE, so the requester may recycle its
+/// destination buffers; after `Failed`, WRITEs may still be in flight and
+/// the requester must leak them.
+#[derive(Debug)]
+pub enum PushBlocksError {
+    /// Rejected before any RDMA WRITE was submitted.
+    Rejected(String),
+    /// Failed after WRITEs may have been submitted.
+    Failed(String),
+}
+
+impl std::fmt::Display for PushBlocksError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(msg) => write!(f, "rejected: {msg}"),
+            Self::Failed(msg) => write!(f, "failed: {msg}"),
+        }
     }
 }
 
@@ -905,15 +954,19 @@ mod tests {
     }
 
     #[cfg(not(feature = "rdma"))]
-    #[test]
-    fn rdma_handshake_reports_missing_feature() {
+    #[tokio::test]
+    async fn push_blocks_reports_missing_feature() {
         let engine = PegaEngine::new_with_config(1 << 20, false, storage::StorageConfig::default())
             .expect("engine should start without RDMA");
 
         let err = engine
-            .rdma_accept_handshake("127.0.0.1:50055", b"client-handshake")
-            .expect_err("no-RDMA build should reject RDMA handshakes");
+            .push_blocks_for_transfer(&pegaflow_proto::proto::engine::PushBlocksRequest::default())
+            .await
+            .expect_err("no-RDMA build should reject push requests");
 
-        assert_eq!(err, "this binary was built without RDMA support");
+        assert!(
+            matches!(err, PushBlocksError::Rejected(ref msg) if msg.contains("without RDMA")),
+            "expected Rejected, got {err:?}"
+        );
     }
 }

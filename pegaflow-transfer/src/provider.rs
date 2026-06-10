@@ -1,6 +1,6 @@
 use std::{borrow::Cow, ffi::c_void, ptr::NonNull, sync::Arc};
 
-use crate::v2::{
+use crate::{
     api::{DomainAddress, MemoryRegionRemoteKey, PeerGroupHandle, TransferId},
     error::{FabricLibError, Result},
     imm_count::ImmCountMap,
@@ -8,12 +8,12 @@ use crate::v2::{
     rdma_op::{GroupWriteOp, RecvOp, SendOp, WriteOp},
 };
 
-pub trait RdmaDomainInfo {
+pub(crate) trait RdmaDomainInfo {
     fn name(&self) -> Cow<'_, str>;
     fn link_speed(&self) -> u64;
 }
 
-pub trait RdmaDomain {
+pub(crate) trait RdmaDomain {
     type Info: RdmaDomainInfo;
 
     fn open(info: Self::Info, imm_count_map: Arc<ImmCountMap>) -> Result<Self>
@@ -44,7 +44,7 @@ pub trait RdmaDomain {
     fn get_completion(&mut self) -> Option<DomainCompletionEntry>;
 }
 
-pub enum DomainCompletionEntry {
+pub(crate) enum DomainCompletionEntry {
     Recv {
         transfer_id: TransferId,
         data_len: usize,

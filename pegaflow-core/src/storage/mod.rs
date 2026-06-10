@@ -30,7 +30,6 @@ use read_cache::ReadCache;
 use write_path::{InsertDeps, WritePipeline};
 
 const RECLAIM_BATCH_SIZE: usize = 64;
-pub const DEFAULT_RDMA_QPS_PER_PEER: usize = 2;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryCacheCleanupStats {
@@ -51,8 +50,6 @@ pub struct StorageConfig {
     pub ssd_cache_config: Option<SsdCacheConfig>,
     /// Optional RDMA NIC names for inter-node transfer (e.g. `["mlx5_0", "mlx5_1"]`).
     pub rdma_nic_names: Option<Vec<String>>,
-    /// Number of RC QPs per (local NIC, remote NIC) pair.
-    pub rdma_qps_per_peer: usize,
     /// Enable NUMA-aware memory allocation.
     pub enable_numa_affinity: bool,
     /// Allocate each block separately instead of contiguous batch allocation.
@@ -81,7 +78,6 @@ impl Default for StorageConfig {
             max_prefetch_blocks: DEFAULT_MAX_PREFETCH_BLOCKS,
             ssd_cache_config: None,
             rdma_nic_names: None,
-            rdma_qps_per_peer: DEFAULT_RDMA_QPS_PER_PEER,
             enable_numa_affinity: true,
             blockwise_alloc: false,
             transfer_lock_timeout: Duration::from_secs(120),
@@ -108,6 +104,13 @@ pub(crate) struct StorageEngine {
 }
 
 impl StorageEngine {
+    #[cfg_attr(
+        not(feature = "rdma"),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "only RDMA transport init can fail; keep one signature across builds"
+        )
+    )]
     pub(crate) fn new_with_config(
         capacity_bytes: usize,
         use_hugepages: bool,
@@ -119,8 +122,6 @@ impl StorageEngine {
         let max_prefetch_blocks = config.max_prefetch_blocks;
         let ssd_cache_config = config.ssd_cache_config;
         let rdma_nic_names = config.rdma_nic_names;
-        #[cfg(feature = "rdma")]
-        let rdma_qps_per_peer = config.rdma_qps_per_peer;
         let blockwise_alloc = config.blockwise_alloc;
         let transfer_lock_timeout = config.transfer_lock_timeout;
 
@@ -186,7 +187,7 @@ impl StorageEngine {
         let rdma_nics = rdma_nic_names.as_deref().filter(|nics| !nics.is_empty());
         #[cfg(feature = "rdma")]
         let rdma_transport = if let Some(nics) = rdma_nics {
-            let rdma = crate::backing::new_rdma(nics, &allocator, rdma_qps_per_peer)?;
+            let rdma = crate::backing::new_rdma(nics, &allocator)?;
             crate::metrics::register_rdma_gauges(&rdma);
             Some(rdma)
         } else {
@@ -571,13 +572,14 @@ impl StorageEngine {
             .lock_blocks(requester_id, blocks.to_vec())
     }
 
-    pub(crate) fn transfer_lock_timeout(&self) -> Duration {
-        self.transfer_lock.lock_timeout()
-    }
-
-    /// Release a transfer lock session. Returns the number of blocks released.
-    pub(crate) fn release_transfer_lock(&self, session_id: &str) -> usize {
-        self.transfer_lock.release(session_id)
+    /// Take a transfer session's blocks for a push. The returned Arcs keep
+    /// the blocks alive while the RDMA WRITEs run.
+    #[cfg(any(feature = "rdma", test))]
+    pub(crate) fn take_transfer_session(
+        &self,
+        session_id: &str,
+    ) -> Option<Vec<(BlockKey, Arc<SealedBlock>)>> {
+        self.transfer_lock.take(session_id)
     }
 
     /// GC expired transfer lock sessions. Returns the number of sessions expired.
@@ -738,7 +740,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lock_and_release_transfer_when_enabled() {
+    async fn lock_and_take_transfer_session() {
         let storage = make_engine();
         let key = BlockKey::new("ns".into(), vec![1]);
         let block = Arc::new(SealedBlock::from_slots(Vec::new()));
@@ -751,7 +753,10 @@ mod tests {
             "lock_blocks_for_transfer should return a UUID when enabled"
         );
 
-        let released = storage.release_transfer_lock(&session_id);
-        assert_eq!(released, 1);
+        let taken = storage
+            .take_transfer_session(&session_id)
+            .expect("session should exist");
+        assert_eq!(taken.len(), 1);
+        assert!(storage.take_transfer_session(&session_id).is_none());
     }
 }

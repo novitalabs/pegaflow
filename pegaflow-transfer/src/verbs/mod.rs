@@ -4,8 +4,8 @@ mod verbs_domain;
 mod verbs_qp;
 mod verbs_rdma_op;
 
-pub use verbs_devinfo::{VerbsDeviceInfo, VerbsDeviceList};
-pub use verbs_domain::VerbsDomain;
+pub(crate) use verbs_devinfo::{VerbsDeviceInfo, VerbsDeviceList};
+pub(crate) use verbs_domain::VerbsDomain;
 
 pub(super) unsafe fn zeroed<T>() -> T {
     unsafe { std::mem::zeroed() }

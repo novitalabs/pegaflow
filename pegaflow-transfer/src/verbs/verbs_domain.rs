@@ -5,6 +5,7 @@ use std::{
     ptr::{NonNull, null_mut},
     rc::Rc,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use crate::cuda_lib::Device;
@@ -28,10 +29,12 @@ const CQ_DEPTH: usize = 4096;
 const NUM_IMM_RECVS: usize = 128;
 const GRH_BYTES: usize = 40;
 const MAX_UD_MSG_BYTES: usize = 4096;
+/// UD is unreliable; retransmit the RC handshake until the peer answers.
+const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const NUM_UD_RECVS: usize = 128;
 const MAX_UD_SENDS: usize = 128;
 
-use crate::v2::{
+use crate::{
     api::{DomainAddress, MemoryRegionRemoteKey, PeerGroupHandle, TransferId},
     error::{FabricLibError, Result, VerbsError},
     imm_count::{ImmCountMap, ImmCountStatus},
@@ -51,7 +54,7 @@ use crate::v2::{
     },
 };
 
-pub struct VerbsDomain {
+pub(crate) struct VerbsDomain {
     name: String,
     port_num: u8,
     gid_index: u8,
@@ -91,6 +94,8 @@ pub struct VerbsDomain {
 
     ud_mempool: MemoryPool,
     ud_mempool_lkey: MemoryRegionLocalDescriptor,
+    /// Number of peers currently in [`PeerState::Connecting`].
+    num_connecting_peers: usize,
 }
 
 struct Peer {
@@ -108,6 +113,8 @@ enum PeerState {
     Connecting {
         pending_submits: Vec<(TransferId, OutboundOp)>,
         pending_group_write_ops: Vec<NonNull<PendingGroupWriteOp>>,
+        last_connect_attempt: Instant,
+        connect_attempts: u32,
     },
     Established,
 }
@@ -136,7 +143,7 @@ struct ConnectingPeerGroup {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PeerHandshakeInfo {
+pub(super) struct PeerHandshakeInfo {
     ud_addr: VerbsUDAddress,
     lid: u16,
     gid: Gid,
@@ -144,6 +151,11 @@ pub struct PeerHandshakeInfo {
     msg_psn: u32,
     rma_qp_num: u32,
     rma_psn: u32,
+    /// True if this message answers a received handshake. Requests are
+    /// always (re-)answered — even on duplicates — so a lost reply cannot
+    /// strand the initiator; replies are never answered, so the exchange
+    /// cannot ping-pong.
+    is_reply: bool,
 }
 
 struct RecvOpContext {
@@ -345,6 +357,7 @@ impl VerbsDomain {
 
                 ud_mempool,
                 ud_mempool_lkey: MemoryRegionLocalDescriptor(0), // Set in post_init
+                num_connecting_peers: 0,
             };
 
             domain.post_init()?;
@@ -507,12 +520,17 @@ impl VerbsDomain {
             state: PeerState::Connecting {
                 pending_submits,
                 pending_group_write_ops,
+                last_connect_attempt: Instant::now(),
+                connect_attempts: 0,
             },
         })
     }
 
-    fn connect_peer(&self, peer: &Peer, ud_buf: NonNull<u8>) -> Result<()> {
-        debug!("connect_peer: domain={} peer={:?}", self.name, peer.ud_addr);
+    fn connect_peer(&self, peer: &Peer, ud_buf: NonNull<u8>, is_reply: bool) -> Result<()> {
+        debug!(
+            "connect_peer: domain={} peer={:?} is_reply={is_reply}",
+            self.name, peer.ud_addr
+        );
 
         // Send handshake to peer
         let handshake_info = PeerHandshakeInfo {
@@ -523,31 +541,85 @@ impl VerbsDomain {
             msg_psn: peer.msg_rc.addr.psn,
             rma_qp_num: peer.rma_rc.addr.qp_num,
             rma_psn: peer.rma_rc.addr.psn,
+            is_reply,
         };
         self.ud_send(&peer.ud_addr, peer.ah, ud_buf, &handshake_info)?;
 
         Ok(())
     }
 
+    /// Retransmit the RC handshake for peers stuck in `Connecting`. UD has
+    /// no delivery guarantee, so without this a single lost handshake packet
+    /// would strand the peer (and every op queued on it) forever.
+    fn retry_pending_connects(&mut self) {
+        let now = Instant::now();
+        let mut retry_addrs = Vec::new();
+        for (addr, peer) in &mut self.peers {
+            if let PeerState::Connecting {
+                last_connect_attempt,
+                connect_attempts,
+                ..
+            } = &mut peer.state
+                && now.duration_since(*last_connect_attempt) >= CONNECT_RETRY_INTERVAL
+            {
+                *last_connect_attempt = now;
+                *connect_attempts += 1;
+                warn!(
+                    "UD handshake unanswered: domain={} peer={:?} retransmitting (attempt {})",
+                    self.name, peer.ud_addr, *connect_attempts
+                );
+                retry_addrs.push(addr.clone());
+            }
+        }
+        for addr in retry_addrs {
+            let Some(buf) = (unsafe { self.ud_mempool.alloc() }) else {
+                // UD buffers exhausted; the next interval retries.
+                return;
+            };
+            let peer = &self.peers[&addr];
+            if let Err(e) = self.connect_peer(peer, buf, false) {
+                warn!(
+                    "Handshake retransmit failed: domain={} peer={:?} error={e}",
+                    self.name, peer.ud_addr
+                );
+            }
+        }
+    }
+
     fn handle_peer_handshake(&mut self, info: &PeerHandshakeInfo) -> Result<()> {
         debug!("handle_peer_handshake: domain={} info={info:?}", self.name);
         let peer_addr = DomainAddress::from(&info.ud_addr);
 
-        let send_response = if let Some(peer) = self.peers.get(&peer_addr) {
-            if let PeerState::Established = peer.state {
-                return Ok(());
+        if let Some(peer) = self.peers.get(&peer_addr)
+            && let PeerState::Established = peer.state
+        {
+            // Duplicate request: the remote retransmits because our reply
+            // was lost — re-send it. Replies are never answered, so this
+            // cannot ping-pong.
+            if !info.is_reply {
+                let buf = unsafe { self.ud_mempool.alloc() }.ok_or(FabricLibError::Custom(
+                    "Failed to allocate UD message buffer",
+                ))?;
+                self.connect_peer(peer, buf, true)?;
             }
-            false
-        } else {
+            return Ok(());
+        }
+        if !self.peers.contains_key(&peer_addr) {
             let peer = self.create_peer(&peer_addr, vec![], vec![])?;
             self.peers.insert(peer_addr.clone(), peer);
-            true
-        };
+            self.num_connecting_peers += 1;
+        }
+        let send_response = !info.is_reply;
 
-        // Activate QP
+        // Activate QP. Force the QPs back to RESET first: a previous partial
+        // activation (e.g. a failure halfway through this sequence) may have
+        // left them in INIT/RTR, from which re-running the sequence would
+        // otherwise fail forever.
         let peer = unsafe { self.peers.get_mut(&peer_addr).unwrap_unchecked() };
 
         let pkey_index = 0; // TODO: get pkey_index
+        peer.msg_rc.rc_to_reset()?;
+        peer.rma_rc.rc_to_reset()?;
         peer.msg_rc.rc_reset_to_init(self.port_num, pkey_index)?;
         peer.rma_rc.rc_reset_to_init(self.port_num, pkey_index)?;
 
@@ -585,6 +657,7 @@ impl VerbsDomain {
             PeerState::Connecting {
                 pending_submits,
                 pending_group_write_ops,
+                ..
             } => (
                 std::mem::take(pending_submits),
                 std::mem::take(pending_group_write_ops),
@@ -598,13 +671,14 @@ impl VerbsDomain {
         // Submit pending submits
         let msg_qp = peer.msg_rc.qp;
         let rma_qp = peer.rma_rc.qp;
+        self.num_connecting_peers = self.num_connecting_peers.saturating_sub(1);
 
         if send_response {
             let buf = unsafe { self.ud_mempool.alloc() }.ok_or(FabricLibError::Custom(
                 "Failed to allocate UD message buffer",
             ))?;
             let peer = unsafe { self.peers.get(&peer_addr).unwrap_unchecked() };
-            self.connect_peer(peer, buf)?;
+            self.connect_peer(peer, buf, true)?;
         }
 
         for (transfer_id, op) in pending_submits {
@@ -613,7 +687,7 @@ impl VerbsDomain {
 
         // Check peer group
         let mut connected_peer_groups = Vec::new();
-        for (handle, group) in self.connecting_peer_groups.iter_mut() {
+        for (handle, group) in &mut self.connecting_peer_groups {
             if group.pending_peers.remove(&rma_qp) && group.pending_peers.is_empty() {
                 connected_peer_groups.push(*handle);
             }
@@ -725,7 +799,7 @@ impl VerbsDomain {
                 PeerState::Established => {
                     let msg_qp = peer.msg_rc.qp;
                     let rma_qp = peer.rma_rc.qp;
-                    self.do_submit_outbound_op(transfer_id, op, msg_qp, rma_qp)
+                    self.do_submit_outbound_op(transfer_id, op, msg_qp, rma_qp);
                 }
                 // If connecting, queue the submit
                 PeerState::Connecting {
@@ -739,11 +813,12 @@ impl VerbsDomain {
             let res = (|| -> Result<()> {
                 let peer = self.create_peer(&dest_addr, vec![(transfer_id, op)], vec![])?;
                 self.peers.insert(dest_addr.clone(), peer);
+                self.num_connecting_peers += 1;
                 let peer = unsafe { self.peers.get(&dest_addr).unwrap_unchecked() };
                 let buf = unsafe { self.ud_mempool.alloc() }.ok_or(FabricLibError::Custom(
                     "Failed to allocate UD message buffer",
                 ))?;
-                self.connect_peer(peer, buf)?;
+                self.connect_peer(peer, buf, false)?;
                 Ok(())
             })();
             if let Err(e) = res {
@@ -965,7 +1040,7 @@ impl VerbsDomain {
     }
 
     fn progress_rdma_write_ops(&mut self) {
-        while let Some(mut ptr) = self.write_ops.front().cloned() {
+        while let Some(mut ptr) = self.write_ops.front().copied() {
             let context = unsafe { ptr.as_mut() };
             assert!(
                 context.cnt_finished_ops <= context.cnt_posted_ops,
@@ -994,7 +1069,19 @@ impl VerbsDomain {
     fn handle_cqe(&mut self, wc: &ibv_wc) -> Option<DomainCompletionEntry> {
         if wc.qp_num == unsafe { *self.ud.qp.as_ptr() }.qp_num {
             if wc.status != ibv_wc_status::IBV_WC_SUCCESS {
-                panic!("TODO: handle UD errors. status: {}", wc.status);
+                // On error CQEs only wr_id and status are valid, so SEND and
+                // RECV buffers cannot be told apart; return the buffer to the
+                // pool and rely on handshake retransmission. Losing a RECV
+                // slot shrinks the UD ring but keeps the control plane alive.
+                warn!(
+                    "UD completion error: domain={} wr_id={} status={}",
+                    self.name, wc.wr_id, wc.status
+                );
+                unsafe {
+                    let ptr = NonNull::new_unchecked(wc.wr_id as *mut u8);
+                    self.ud_mempool.free(ptr);
+                }
+                return None;
             }
 
             match wc.opcode {
@@ -1007,13 +1094,27 @@ impl VerbsDomain {
                             wc.byte_len as usize - GRH_BYTES,
                         )
                     };
-                    let msg: PeerHandshakeInfo =
-                        postcard::from_bytes(buf).expect("TODO: handle UD error");
-                    self.handle_peer_handshake(&msg)
-                        .expect("TODO: handle UD error");
+                    match postcard::from_bytes::<PeerHandshakeInfo>(buf) {
+                        Ok(msg) => {
+                            if let Err(e) = self.handle_peer_handshake(&msg) {
+                                warn!(
+                                    "Failed to handle UD handshake: domain={} error={e}",
+                                    self.name
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Malformed UD handshake message: domain={} error={e}",
+                                self.name
+                            );
+                        }
+                    }
 
                     // Post RECV for UD
-                    self.post_ud_recv(ptr).expect("TODO: handle UD error");
+                    if let Err(e) = self.post_ud_recv(ptr) {
+                        warn!("Failed to repost UD recv: domain={} error={e}", self.name);
+                    }
                 }
                 ibv_wc_opcode::IBV_WC_SEND => {
                     debug!("UD SEND completed: domain={} wr_id={}", self.name, wc.wr_id);
@@ -1217,18 +1318,25 @@ impl RdmaDomain for VerbsDomain {
         }
         let mut rma_qps = Vec::with_capacity(addrs.len());
         let mut pending_peers = HashSet::new();
-        for addr in addrs.iter() {
+        for addr in &addrs {
             if let Some(peer) = self.peers.get(addr) {
-                rma_qps.push(peer.rma_rc.qp);
+                let rma_qp = peer.rma_rc.qp;
+                rma_qps.push(rma_qp);
+                // A known peer may still be mid-handshake; the group must
+                // wait for it like a newly created peer.
+                if matches!(peer.state, PeerState::Connecting { .. }) {
+                    pending_peers.insert(rma_qp);
+                }
             } else {
                 // Initiate peer connection
                 let peer = self.create_peer(addr, vec![], vec![])?;
                 self.peers.insert(addr.clone(), peer);
+                self.num_connecting_peers += 1;
                 let peer = unsafe { self.peers.get(addr).unwrap_unchecked() };
                 let buf = unsafe { self.ud_mempool.alloc() }.ok_or(FabricLibError::Custom(
                     "Failed to allocate UD message buffer",
                 ))?;
-                self.connect_peer(peer, buf)?;
+                self.connect_peer(peer, buf, false)?;
 
                 let rma_qp = peer.rma_rc.qp;
                 rma_qps.push(rma_qp);
@@ -1281,26 +1389,72 @@ impl RdmaDomain for VerbsDomain {
             let mut pending_peers = HashSet::new();
             let mut maybe_ctx_ptr = None;
             for addr in op.peer_addr_iter() {
-                if let Some(peer) = self.peers.get(addr) {
-                    rma_qps.push(peer.rma_rc.qp);
+                if let Some(peer) = self.peers.get_mut(addr) {
+                    let rma_qp = peer.rma_rc.qp;
+                    rma_qps.push(rma_qp);
+                    // The peer may exist but still be mid-handshake; posting on
+                    // its RC QP before it reaches RTS is a fatal QP error, so
+                    // this op must wait for establishment like a new peer's.
+                    if let PeerState::Connecting {
+                        pending_group_write_ops,
+                        ..
+                    } = &mut peer.state
+                        && pending_peers.insert(rma_qp)
+                    {
+                        let ctx_ptr = if let Some(ctx_ptr) = maybe_ctx_ptr {
+                            ctx_ptr
+                        } else {
+                            let ctx_ptr = unsafe {
+                                let mut p = self.objpool_pending_group_write_op.alloc_uninit();
+                                // Initialize as inert immediately: if the error
+                                // path below returns after this ctx was already
+                                // registered in some peers, their establishment
+                                // must find a valid (empty) op, not uninitialized
+                                // memory. The slot is then leaked, bounded by
+                                // the error rate.
+                                p.as_mut().write(PendingGroupWriteOp {
+                                    transfer_id,
+                                    op: None,
+                                    rma_qps: Vec::new(),
+                                    pending_peers: HashSet::new(),
+                                });
+                                p.cast()
+                            };
+                            maybe_ctx_ptr = Some(ctx_ptr);
+                            ctx_ptr
+                        };
+                        pending_group_write_ops.push(ctx_ptr);
+                    }
                 } else {
                     // Initiate peer connection
                     let ctx_ptr = if let Some(ctx_ptr) = maybe_ctx_ptr {
                         ctx_ptr
                     } else {
-                        let ctx_ptr =
-                            unsafe { self.objpool_pending_group_write_op.alloc_uninit().cast() };
+                        let ctx_ptr = unsafe {
+                            let mut p = self.objpool_pending_group_write_op.alloc_uninit();
+                            // See the Connecting branch above: initialize as
+                            // inert so error-path returns cannot leave peers
+                            // holding an uninitialized ctx.
+                            p.as_mut().write(PendingGroupWriteOp {
+                                transfer_id,
+                                op: None,
+                                rma_qps: Vec::new(),
+                                pending_peers: HashSet::new(),
+                            });
+                            p.cast()
+                        };
                         maybe_ctx_ptr = Some(ctx_ptr);
                         ctx_ptr
                     };
                     let res = (|| -> Result<()> {
                         let peer = self.create_peer(addr, vec![], vec![ctx_ptr])?;
                         self.peers.insert(addr.clone(), peer);
+                        self.num_connecting_peers += 1;
                         let peer = unsafe { self.peers.get(addr).unwrap_unchecked() };
                         let buf = unsafe { self.ud_mempool.alloc() }.ok_or(
                             FabricLibError::Custom("Failed to allocate UD message buffer"),
                         )?;
-                        self.connect_peer(peer, buf)?;
+                        self.connect_peer(peer, buf, false)?;
                         Ok(())
                     })();
                     if let Err(e) = res {
@@ -1321,17 +1475,11 @@ impl RdmaDomain for VerbsDomain {
                 }
             }
             if !pending_peers.is_empty() {
-                let mut ptr = maybe_ctx_ptr
-                    .unwrap()
-                    .cast::<MaybeUninit<PendingGroupWriteOp>>();
-                unsafe {
-                    ptr.as_mut().write(PendingGroupWriteOp {
-                        transfer_id,
-                        op: Some(op),
-                        rma_qps,
-                        pending_peers,
-                    })
-                };
+                let mut ptr: NonNull<PendingGroupWriteOp> = maybe_ctx_ptr.unwrap();
+                let ctx = unsafe { ptr.as_mut() };
+                ctx.op = Some(op);
+                ctx.rma_qps = rma_qps;
+                ctx.pending_peers = pending_peers;
                 return;
             }
             Rc::new(rma_qps)
@@ -1342,6 +1490,9 @@ impl RdmaDomain for VerbsDomain {
     fn poll_progress(&mut self) {
         self.poll_cq();
         self.progress_ops();
+        if self.num_connecting_peers > 0 {
+            self.retry_pending_connects();
+        }
     }
 
     fn get_completion(&mut self) -> Option<DomainCompletionEntry> {

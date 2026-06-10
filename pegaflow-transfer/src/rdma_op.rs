@@ -1,11 +1,11 @@
 use std::{ffi::c_void, ptr::NonNull, sync::Arc};
 
-use crate::v2::{
+use crate::{
     api::{DomainAddress, MemoryRegionRemoteKey, ScatterTarget},
     mr::MemoryRegionLocalDescriptor,
 };
 
-pub struct SingleWriteOp {
+pub(crate) struct SingleWriteOp {
     pub src_ptr: NonNull<c_void>,
     pub src_desc: MemoryRegionLocalDescriptor,
     pub src_offset: u64,
@@ -16,13 +16,13 @@ pub struct SingleWriteOp {
     pub dst_offset: u64,
 }
 
-pub struct ImmWriteOp {
+pub(crate) struct ImmWriteOp {
     pub imm_data: u32,
     pub dst_ptr: u64,
     pub dst_rkey: MemoryRegionRemoteKey,
 }
 
-pub struct PagedWriteOp {
+pub(crate) struct PagedWriteOp {
     pub src_page_indices: Arc<Vec<u32>>,
     pub dst_page_indices: Arc<Vec<u32>>,
     pub page_indices_beg: usize,
@@ -39,13 +39,13 @@ pub struct PagedWriteOp {
     pub imm_data: Option<u32>,
 }
 
-pub enum WriteOp {
+pub(crate) enum WriteOp {
     Single(SingleWriteOp),
     Imm(ImmWriteOp),
     Paged(PagedWriteOp),
 }
 
-pub struct ScatterGroupWriteOp {
+pub(crate) struct ScatterGroupWriteOp {
     pub domain_idx: usize,
     pub src_ptr: NonNull<c_void>,
     pub src_desc: MemoryRegionLocalDescriptor,
@@ -57,18 +57,18 @@ pub struct ScatterGroupWriteOp {
     pub byte_shard_idx: u32,
 }
 
-pub enum GroupWriteOp {
+pub(crate) enum GroupWriteOp {
     Scatter(ScatterGroupWriteOp),
 }
 
 impl GroupWriteOp {
-    pub fn num_targets(&self) -> usize {
+    pub(crate) fn num_targets(&self) -> usize {
         match self {
             GroupWriteOp::Scatter(op) => op.dsts.len(),
         }
     }
 
-    pub fn peer_addr_iter(&self) -> impl Iterator<Item = &DomainAddress> {
+    pub(crate) fn peer_addr_iter(&self) -> impl Iterator<Item = &DomainAddress> {
         match self {
             GroupWriteOp::Scatter(op) => op
                 .dsts
@@ -78,13 +78,13 @@ impl GroupWriteOp {
     }
 }
 
-pub struct SendOp {
+pub(crate) struct SendOp {
     pub ptr: NonNull<c_void>,
     pub len: usize,
     pub desc: MemoryRegionLocalDescriptor,
 }
 
-pub struct RecvOp {
+pub(crate) struct RecvOp {
     pub ptr: NonNull<c_void>,
     pub len: usize,
     pub desc: MemoryRegionLocalDescriptor,

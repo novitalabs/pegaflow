@@ -23,7 +23,7 @@ use crate::pinned_pool::PinnedAllocation;
 use pegaflow_common::NumaNode;
 
 #[cfg(feature = "rdma")]
-pub(crate) use rdma::{RdmaTransport, new_rdma};
+pub(crate) use rdma::{PushSegment, RdmaTransport, mr_desc_from_proto, new_rdma};
 #[cfg(feature = "rdma")]
 pub(crate) use rdma_fetch::RdmaFetchStore;
 pub(crate) use ssd::SsdBackingStore;

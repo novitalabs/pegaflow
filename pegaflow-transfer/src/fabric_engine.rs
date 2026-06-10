@@ -12,7 +12,7 @@ use std::{
 use crate::cuda_lib::{CudaDeviceId, Device};
 use dashmap::DashMap;
 
-use crate::v2::{
+use crate::{
     api::{
         DomainAddress, ImmCounter, MemoryRegionDescriptor, MemoryRegionHandle, PeerGroupHandle,
         SmallVec, TransferCompletionEntry, TransferCounter, TransferId, TransferRequest,
@@ -23,7 +23,7 @@ use crate::v2::{
     worker::{Worker, WorkerCall, WorkerCommand, WorkerHandle},
 };
 
-pub struct FabricEngine {
+pub(crate) struct FabricEngine {
     workers: BTreeMap<u8, WorkerContext>,
     main_address: DomainAddress,
     num_groups: usize,
@@ -40,7 +40,7 @@ struct WorkerContext {
 }
 
 impl FabricEngine {
-    pub fn new(workers: Vec<(u8, Worker)>) -> Result<Self> {
+    pub(crate) fn new(workers: Vec<(u8, Worker)>) -> Result<Self> {
         let imm_count_map = Arc::new(ImmCountMap::default());
 
         let spawned_workers = workers
@@ -68,7 +68,7 @@ impl FabricEngine {
         let mut num_groups = 0;
         let mut num_domains = 0;
         let mut aggregated_link_speed = 0;
-        for (device, w) in initialized_workers.into_iter() {
+        for (device, w) in initialized_workers {
             num_groups += 1;
             num_domains += w.address_list.len();
             aggregated_link_speed += w.aggregated_link_speed;
@@ -88,27 +88,27 @@ impl FabricEngine {
         })
     }
 
-    pub fn main_address(&self) -> DomainAddress {
+    pub(crate) fn main_address(&self) -> DomainAddress {
         self.main_address.clone()
     }
 
-    pub fn num_groups(&self) -> usize {
+    pub(crate) fn num_groups(&self) -> usize {
         self.num_groups
     }
 
-    pub fn num_domains(&self) -> usize {
+    pub(crate) fn num_domains(&self) -> usize {
         self.num_domains
     }
 
-    pub fn aggregated_link_speed(&self) -> u64 {
+    pub(crate) fn aggregated_link_speed(&self) -> u64 {
         self.aggregated_link_speed
     }
 
-    pub fn nets_per_gpu(&self) -> NonZeroU8 {
+    pub(crate) fn nets_per_gpu(&self) -> NonZeroU8 {
         self.nets_per_gpu
     }
 
-    pub fn register_memory_local(
+    pub(crate) fn register_memory_local(
         &self,
         ptr: NonNull<c_void>,
         len: usize,
@@ -130,7 +130,7 @@ impl FabricEngine {
         Ok(handle)
     }
 
-    pub fn register_memory_allow_remote(
+    pub(crate) fn register_memory_allow_remote(
         &self,
         ptr: NonNull<c_void>,
         len: usize,
@@ -152,8 +152,8 @@ impl FabricEngine {
         Ok((handle, desc))
     }
 
-    pub fn unregister_memory(&self, ptr: NonNull<c_void>) -> Result<()> {
-        let worker = self.get_main_worker()?;
+    pub(crate) fn unregister_memory(&self, ptr: NonNull<c_void>) -> Result<()> {
+        let worker = self.get_main_worker();
         let (tx, rx) = oneshot::channel();
         let cmd = WorkerCall::UnregisterMR { ptr, ret: tx };
         worker
@@ -166,7 +166,7 @@ impl FabricEngine {
         Ok(())
     }
 
-    pub fn add_peer_group(
+    pub(crate) fn add_peer_group(
         &self,
         addrs: Vec<SmallVec<DomainAddress>>,
         device: Device,
@@ -185,19 +185,23 @@ impl FabricEngine {
         Ok(handle)
     }
 
-    pub fn set_imm_count_expected(&self, imm: u32, expected_count: NonZeroU32) -> Option<ImmCount> {
+    pub(crate) fn set_imm_count_expected(
+        &self,
+        imm: u32,
+        expected_count: NonZeroU32,
+    ) -> Option<ImmCount> {
         self.imm_count_map.set_expected(imm, expected_count)
     }
 
-    pub fn remove_imm_count(&self, imm: u32) -> Option<ImmCount> {
+    pub(crate) fn remove_imm_count(&self, imm: u32) -> Option<ImmCount> {
         self.imm_count_map.remove(imm)
     }
 
-    pub fn get_imm_counter(&self, imm: u32) -> ImmCounter {
+    pub(crate) fn get_imm_counter(&self, imm: u32) -> ImmCounter {
         self.imm_count_map.get_imm_counter(imm)
     }
 
-    pub fn submit_send(
+    pub(crate) fn submit_send(
         &self,
         transfer_id: TransferId,
         addr: DomainAddress,
@@ -205,7 +209,7 @@ impl FabricEngine {
         ptr: NonNull<c_void>,
         len: usize,
     ) -> Result<()> {
-        let worker = self.get_main_worker()?;
+        let worker = self.get_main_worker();
         let cmd = WorkerCommand::SubmitSend {
             transfer_id,
             addr,
@@ -217,14 +221,14 @@ impl FabricEngine {
         Ok(())
     }
 
-    pub fn submit_recv(
+    pub(crate) fn submit_recv(
         &self,
         transfer_id: TransferId,
         mr: MemoryRegionHandle,
         ptr: NonNull<c_void>,
         len: usize,
     ) -> Result<()> {
-        let worker = self.get_main_worker()?;
+        let worker = self.get_main_worker();
         worker.send_command(Box::new(WorkerCommand::SubmitRecv {
             transfer_id,
             mr,
@@ -234,15 +238,15 @@ impl FabricEngine {
         Ok(())
     }
 
-    pub fn submit_transfer(
+    pub(crate) fn submit_transfer(
         &self,
         transfer_id: TransferId,
         request: TransferRequest,
         tx_counter: Option<TransferCounter>,
     ) -> Result<()> {
         let worker = match &request {
-            TransferRequest::Imm(_) => self.get_main_worker()?,
-            TransferRequest::Barrier(_) => self.get_main_worker()?,
+            TransferRequest::Imm(_) => self.get_main_worker(),
+            TransferRequest::Barrier(_) => self.get_main_worker(),
             TransferRequest::Single(req) => self.get_worker_by_mr(req.src_mr)?,
             TransferRequest::Paged(req) => self.get_worker_by_mr(req.src_mr)?,
             TransferRequest::Scatter(req) => self.get_worker_by_mr(req.src_mr)?,
@@ -254,8 +258,8 @@ impl FabricEngine {
         }))
     }
 
-    pub fn poll_transfer_completion(&self) -> Option<TransferCompletionEntry> {
-        for (_, ctx) in self.workers.iter() {
+    pub(crate) fn poll_transfer_completion(&self) -> Option<TransferCompletionEntry> {
+        for ctx in self.workers.values() {
             if let Ok(completion) = ctx.worker.cq_rx.try_recv() {
                 return Some(completion);
             }
@@ -264,14 +268,14 @@ impl FabricEngine {
         None
     }
 
-    pub fn stop(&self) {
+    pub(crate) fn stop(&self) {
         self.stop_signal.store(true, SeqCst);
-        for (_, ctx) in self.workers.iter() {
+        for ctx in self.workers.values() {
             ctx.worker.stop();
         }
     }
 
-    pub fn is_stopped(&self) -> bool {
+    pub(crate) fn is_stopped(&self) -> bool {
         self.stop_signal.load(SeqCst)
     }
 
@@ -285,7 +289,7 @@ impl FabricEngine {
 
     fn get_worker(&self, device: &Device) -> Result<&WorkerContext> {
         match device {
-            Device::Host => self.get_main_worker(),
+            Device::Host => Ok(self.get_main_worker()),
             Device::Cuda(CudaDeviceId(device_id)) => self
                 .workers
                 .get(device_id)
@@ -293,8 +297,8 @@ impl FabricEngine {
         }
     }
 
-    fn get_main_worker(&self) -> Result<&WorkerContext> {
-        Ok(self.workers.first_key_value().unwrap().1)
+    fn get_main_worker(&self) -> &WorkerContext {
+        self.workers.first_key_value().unwrap().1
     }
 }
 
@@ -303,12 +307,13 @@ impl Drop for FabricEngine {
         self.stop();
         while let Some((_, ctx)) = self.workers.pop_first() {
             ctx.worker.stop();
+            ctx.worker.join();
         }
     }
 }
 
 impl WorkerContext {
-    pub fn send_command(&self, cmd: Box<WorkerCommand>) -> Result<()> {
+    pub(crate) fn send_command(&self, cmd: Box<WorkerCommand>) -> Result<()> {
         self.worker
             .cmd_tx
             .send(cmd)

@@ -1,6 +1,6 @@
 use std::ptr::NonNull;
 
-use crate::v2::{
+use crate::{
     error::{Result, VerbsError},
     verbs::{
         verbs_address::{Gid, VerbsRCAddress, VerbsUDAddress},
@@ -13,13 +13,13 @@ use rdma_mummy_sys::{
     ibv_srq,
 };
 
-pub struct UDQueuePair {
+pub(super) struct UDQueuePair {
     pub addr: VerbsUDAddress,
     pub qp: NonNull<ibv_qp>,
 }
 
 impl UDQueuePair {
-    pub fn new(
+    pub(super) fn new(
         cq: NonNull<ibv_cq>,
         pd: NonNull<ibv_pd>,
         gid: Gid,
@@ -55,7 +55,7 @@ impl UDQueuePair {
         })
     }
 
-    pub fn ud_reset_to_init(&self, pkey_index: u16, port_num: u8) -> Result<()> {
+    pub(super) fn ud_reset_to_init(&self, pkey_index: u16, port_num: u8) -> Result<()> {
         let mut qp_attr = ibv_qp_attr {
             qp_state: ibv_qp_state::IBV_QPS_INIT,
             pkey_index,
@@ -74,7 +74,7 @@ impl UDQueuePair {
         Ok(())
     }
 
-    pub fn ud_init_to_rtr(&self) -> Result<()> {
+    pub(super) fn ud_init_to_rtr(&self) -> Result<()> {
         let mut qp_attr = ibv_qp_attr {
             qp_state: ibv_qp_state::IBV_QPS_RTR,
             ..unsafe { zeroed() }
@@ -87,7 +87,7 @@ impl UDQueuePair {
         Ok(())
     }
 
-    pub fn ud_rtr_to_rts(&self) -> Result<()> {
+    pub(super) fn ud_rtr_to_rts(&self) -> Result<()> {
         let mut qp_attr = ibv_qp_attr {
             qp_state: ibv_qp_state::IBV_QPS_RTS,
             ..unsafe { zeroed() }
@@ -101,21 +101,21 @@ impl UDQueuePair {
         Ok(())
     }
 
-    pub fn destroy(&mut self) {
+    pub(super) fn destroy(&mut self) {
         unsafe {
             ibv_destroy_qp(self.qp.as_ptr());
         }
     }
 }
 
-pub struct RCQueuePair {
+pub(super) struct RCQueuePair {
     // TODO: state enum
     pub addr: VerbsRCAddress,
     pub qp: NonNull<ibv_qp>,
 }
 
 impl RCQueuePair {
-    pub fn new(
+    pub(super) fn new(
         cq: NonNull<ibv_cq>,
         pd: NonNull<ibv_pd>,
         srq: NonNull<ibv_srq>,
@@ -151,7 +151,22 @@ impl RCQueuePair {
         })
     }
 
-    pub fn rc_reset_to_init(&self, port_num: u8, pkey_index: u16) -> Result<()> {
+    /// Force the QP back to RESET. Valid from any state; makes re-running
+    /// the activation sequence after a partial failure safe.
+    pub(super) fn rc_to_reset(&self) -> Result<()> {
+        let mut qp_attr = ibv_qp_attr {
+            qp_state: ibv_qp_state::IBV_QPS_RESET,
+            ..unsafe { zeroed() }
+        };
+        let flags = ibv_qp_attr_mask::IBV_QP_STATE;
+        let ec = unsafe { ibv_modify_qp(self.qp.as_ptr(), &raw mut qp_attr, flags.0 as i32) };
+        if ec != 0 {
+            return Err(VerbsError::with_code(ec, "ibv_modify_qp: rc_to_reset").into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn rc_reset_to_init(&self, port_num: u8, pkey_index: u16) -> Result<()> {
         let mut qp_attr = ibv_qp_attr {
             qp_state: ibv_qp_state::IBV_QPS_INIT,
             pkey_index,
@@ -173,8 +188,11 @@ impl RCQueuePair {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn rc_init_to_rtr(
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "RTR transition needs the full peer endpoint"
+    )]
+    pub(super) fn rc_init_to_rtr(
         &self,
         is_infiniband: bool,
         gid_index: u8,
@@ -219,7 +237,7 @@ impl RCQueuePair {
         Ok(())
     }
 
-    pub fn rc_rtr_to_rts(&self, peer_psn: u32) -> Result<()> {
+    pub(super) fn rc_rtr_to_rts(&self, peer_psn: u32) -> Result<()> {
         let mut qp_attr = ibv_qp_attr {
             qp_state: ibv_qp_state::IBV_QPS_RTS,
             timeout: 14,
@@ -242,7 +260,7 @@ impl RCQueuePair {
         Ok(())
     }
 
-    pub fn destroy(&mut self) {
+    pub(super) fn destroy(&mut self) {
         unsafe {
             ibv_destroy_qp(self.qp.as_ptr());
         }

@@ -9,7 +9,7 @@ use std::{
 
 use crate::cuda_lib::Device;
 
-use crate::v2::{
+use crate::{
     api::{DomainAddress, MemoryRegionDescriptor, MemoryRegionHandle, TransferRequest},
     error::{FabricLibError, Result},
 };

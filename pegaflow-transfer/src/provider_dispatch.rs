@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use crate::v2::{provider::RdmaDomainInfo, verbs::VerbsDeviceInfo};
+use crate::{provider::RdmaDomainInfo, verbs::VerbsDeviceInfo};
 
 // NOTE: This enum was originally a dispatch point between multiple RDMA
 // providers (EFA + Verbs upstream). The non-Verbs provider was removed during

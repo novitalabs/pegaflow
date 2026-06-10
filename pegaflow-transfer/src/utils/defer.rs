@@ -1,14 +1,14 @@
-pub struct Defer<F: FnMut()> {
+pub(crate) struct Defer<F: FnMut()> {
     f: F,
     canceled: bool,
 }
 
 impl<F: FnMut()> Defer<F> {
-    pub fn new(f: F) -> Self {
+    pub(crate) fn new(f: F) -> Self {
         Self { f, canceled: false }
     }
 
-    pub fn cancel(&mut self) {
+    pub(crate) fn cancel(&mut self) {
         self.canceled = true;
     }
 }

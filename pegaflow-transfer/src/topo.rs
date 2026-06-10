@@ -9,7 +9,7 @@ use std::{
 
 use crate::cuda_lib::rt::{cudaDeviceProp, cudaGetDeviceCount, cudaGetDeviceProperties};
 
-use crate::v2::{
+use crate::{
     error::{FabricLibError, Result},
     provider_dispatch::DomainInfo,
     verbs::{VerbsDeviceInfo, VerbsDeviceList},
@@ -19,6 +19,15 @@ use log::{info, warn};
 #[derive(Clone)]
 pub struct TopologyGroup {
     pub cuda_device: u8,
+    pub numa: u8,
+    pub domains: Vec<DomainInfo>,
+    pub cpus: Vec<u16>,
+}
+
+/// NICs and CPUs of one NUMA node, for host-memory transfer engines that do
+/// not bind to a GPU (e.g. pinned-pool KV cache transfer between servers).
+#[derive(Clone)]
+pub struct HostTopologyGroup {
     pub numa: u8,
     pub domains: Vec<DomainInfo>,
     pub cpus: Vec<u16>,
@@ -92,9 +101,7 @@ impl From<&VerbsDeviceInfo> for PciAddress {
             .file_name()
             .expect("Failed to read verbs dev_path basename")
             .to_string_lossy();
-        if pci_addr.len() != 12 {
-            panic!("Unexpected verbs PCI address format");
-        }
+        assert!(pci_addr.len() == 12, "Unexpected verbs PCI address format");
         PciAddress {
             domain: u16::from_str_radix(&pci_addr[0..4], 16).expect("Failed to parse domain"),
             bus: u8::from_str_radix(&pci_addr[5..7], 16).expect("Failed to parse bus"),
@@ -433,7 +440,7 @@ fn detect_system_topo(
     // Create topology groups
     let mut system_topo = Vec::new();
     let mut numa_gpu_indices = vec![0; numa_cpus.len()];
-    for switch in switch_groups.into_iter() {
+    for switch in switch_groups {
         let nics_per_gpu = if switch.nics.is_empty() {
             0
         } else {
@@ -574,6 +581,86 @@ static GLOBAL: LazyLock<Result<Vec<TopologyGroup>>> = LazyLock::new(do_detect_to
 
 pub fn detect_topology() -> Result<&'static [TopologyGroup]> {
     match LazyLock::force(&GLOBAL) {
+        Ok(topo) => Ok(topo),
+        Err(e) => Err(e.clone()),
+    }
+}
+
+fn do_detect_host_topology() -> Result<Vec<HostTopologyGroup>> {
+    let domains = get_visible_domains();
+    if domains.is_empty() {
+        return Err(FabricLibError::Custom("No visible NICs"));
+    }
+
+    let numa_cpus = get_numa_physical_cpus()?;
+
+    // Group visible NICs by the NUMA node of their PCI device.
+    let mut numa_domains: HashMap<usize, Vec<DomainInfo>> = HashMap::new();
+    for domain in domains {
+        let pci_addr = PciAddress::from(&domain);
+        let numa_node = std::fs::read_to_string(pci_addr.get_sys_path() + "/numa_node")
+            .ok()
+            .and_then(|s| s.trim().parse::<isize>().ok())
+            .filter(|&n| n >= 0)
+            .map(|n| n as usize);
+        let Some(numa_node) = numa_node else {
+            warn!(
+                "Skipping NIC {} ({}) because it has no NUMA node",
+                domain.name(),
+                pci_addr
+            );
+            continue;
+        };
+        if numa_node >= numa_cpus.len() {
+            warn!(
+                "Skipping NIC {} ({}) because NUMA node {} has no CPUs",
+                domain.name(),
+                pci_addr,
+                numa_node
+            );
+            continue;
+        }
+        numa_domains.entry(numa_node).or_default().push(domain);
+    }
+
+    let mut groups: Vec<HostTopologyGroup> = numa_domains
+        .into_iter()
+        .map(|(numa, domains)| HostTopologyGroup {
+            numa: numa as u8,
+            domains,
+            cpus: numa_cpus[numa].clone(),
+        })
+        .collect();
+    groups.sort_by_key(|g| g.numa);
+
+    if groups.is_empty() {
+        return Err(FabricLibError::Custom("No NICs with a known NUMA node"));
+    }
+    info!(
+        "Host topology: {}",
+        groups
+            .iter()
+            .map(|g| format!(
+                "numa{}=[{}]",
+                g.numa,
+                g.domains
+                    .iter()
+                    .map(|d| d.name().into_owned())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    Ok(groups)
+}
+
+static GLOBAL_HOST: LazyLock<Result<Vec<HostTopologyGroup>>> =
+    LazyLock::new(do_detect_host_topology);
+
+/// Detect NIC/CPU topology grouped by NUMA node, without requiring CUDA.
+pub fn detect_host_topology() -> Result<&'static [HostTopologyGroup]> {
+    match LazyLock::force(&GLOBAL_HOST) {
         Ok(topo) => Ok(topo),
         Err(e) => Err(e.clone()),
     }

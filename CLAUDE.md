@@ -86,11 +86,12 @@ cargo bench --bench uds_latency
    - `store.rs`: Multi-owner block hash store with TTL sweep (backed by DashMap)
    - Used for multi-node KV cache coordination — each pegaflow-server registers its block hashes here
 
-6. **pegaflow-transfer** (Rust): RDMA-based inter-node memory transfer engine
-   - `engine.rs`: `MooncakeTransferEngine` — Mooncake-compatible API for one-sided RDMA READ/WRITE
-   - `sideway_backend.rs`: UD control plane + RC data plane with per-peer sessions
-   - `rdma_topo.rs`: NUMA-aware topology detection (GPUs, RDMA NICs, CPUs)
-   - CLI tools: `pegaflow_topo_cli` (topology display), `pegaflow_cpu_bench` (RDMA benchmark)
+6. **pegaflow-transfer** (Rust): RDMA verbs transfer engine (pplx-garden derived)
+   - `transfer_engine.rs` / `fabric_engine.rs`: `TransferEngine` — one-sided RDMA WRITE data plane (Single/Paged/Scatter/Imm/Barrier requests)
+   - `worker.rs` / `domain_group.rs`: one polling worker thread per domain group (1-8 NICs), UD control plane handshakes RC QPs lazily per peer
+   - `topo.rs`: NUMA-aware topology detection — `detect_topology()` (GPU-centric groups), `detect_host_topology()` (host NUMA groups)
+   - `transfer_engine_builder.rs`: `build()` (GPU engines for P/D), `build_host()` (per-NUMA host engine for KV fetch)
+   - CLI tool: `pegaflow-cpu-bench` (RDMA push benchmark)
 
 7. **python/** (Rust/PyO3 + Python): Python package (`pegaflow-llm` on PyPI)
    - `src/lib.rs`: PyO3 bindings exposing `PegaEngine` and gRPC client
@@ -105,7 +106,7 @@ vLLM Worker <--gRPC--> PegaEngine Server <--CUDA IPC--> GPU Memory
                                     |
                              Pinned CPU Memory (KV cache storage)
                                    / \
-                   SSD Cache (io_uring)  Remote Node (RDMA READ)
+                   SSD Cache (io_uring)  Remote Node (RDMA WRITE push)
                                               |
                                         MetaServer (block discovery)
 ```
@@ -174,7 +175,9 @@ vLLM Worker <--gRPC--> PegaEngine Server <--CUDA IPC--> GPU Memory
 - `pegaflow-metaserver/src/lib.rs`: MetaServer entry point and CLI
 - `pegaflow-metaserver/src/service.rs`: MetaServer gRPC service
 - `pegaflow-metaserver/src/store.rs`: Block hash store (LRU + TTL)
-- `pegaflow-transfer/src/engine.rs`: RDMA transfer engine (MooncakeTransferEngine)
+- `pegaflow-transfer/src/transfer_engine.rs`: RDMA transfer engine (TransferEngine)
+- `pegaflow-core/src/backing/rdma.rs`: RDMA transport (per-NUMA engines, push_segments)
+- `pegaflow-core/src/backing/rdma_fetch.rs`: cross-node KV fetch via PushBlocks RPC
 - `python/src/lib.rs`: PyO3 bindings (Rust side)
 - `python/pegaflow/pegaflow.pyi`: Type stubs for PyO3 bindings
 - `python/pegaflow/connector/scheduler.py`: vLLM scheduler-side connector

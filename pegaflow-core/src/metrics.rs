@@ -96,6 +96,10 @@ pub(crate) struct CoreMetrics {
     pub rdma_fetch_duration_seconds: Histogram<f64>,
     #[cfg(feature = "rdma")]
     pub rdma_fetch_bytes: Counter<u64>,
+    /// Pinned bytes deliberately leaked after a failed push (remote WRITEs may
+    /// still be in flight, so the memory cannot be recycled).
+    #[cfg(feature = "rdma")]
+    pub rdma_fetch_leaked_bytes: Counter<u64>,
 }
 
 fn init_meter() -> Meter {
@@ -151,7 +155,7 @@ fn duration_seconds_boundaries() -> Vec<f64> {
 
 #[cfg(feature = "rdma")]
 struct RdmaGaugeHandles {
-    _qps: ObservableGauge<u64>,
+    _domains: ObservableGauge<u64>,
 }
 
 #[cfg(feature = "rdma")]
@@ -164,14 +168,14 @@ pub(crate) fn register_rdma_gauges(transport: &Arc<RdmaTransport>) {
     let t = Arc::clone(transport);
     RDMA_GAUGES.get_or_init(|| {
         let meter = init_meter();
-        let qps = meter
-            .u64_observable_gauge("pegaflow_rdma_qps")
-            .with_description("Active RC queue pairs across all RDMA NICs")
+        let domains = meter
+            .u64_observable_gauge("pegaflow_rdma_domains")
+            .with_description("RDMA NIC domains driven by the transfer engines")
             .with_callback(move |observer| {
-                observer.observe(t.engine().num_qps() as u64, &[]);
+                observer.observe(t.num_domains() as u64, &[]);
             })
             .build();
-        RdmaGaugeHandles { _qps: qps }
+        RdmaGaugeHandles { _domains: domains }
     });
 }
 
@@ -437,6 +441,12 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
                 .u64_counter("pegaflow_rdma_fetch_bytes")
                 .with_unit("bytes")
                 .with_description("Total bytes fetched via RDMA from remote nodes")
+                .build(),
+            #[cfg(feature = "rdma")]
+            rdma_fetch_leaked_bytes: meter
+                .u64_counter("pegaflow_rdma_fetch_leaked_bytes")
+                .with_unit("bytes")
+                .with_description("Pinned bytes leaked after failed pushes (writes may still be in flight)")
                 .build(),
         }
     })

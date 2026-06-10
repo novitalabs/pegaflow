@@ -1,4 +1,6 @@
-// RDMA remote block fetch: MetaServer query -> gRPC QueryBlocksForTransfer -> RDMA READ.
+// RDMA remote block fetch: MetaServer query -> gRPC QueryBlocksForTransfer
+// (locks blocks, returns sizes) -> gRPC PushBlocks (holder RDMA-WRITEs the
+// blocks into our pinned memory; the RPC response is the completion signal).
 
 use std::collections::HashMap;
 use std::ptr::NonNull;
@@ -7,36 +9,33 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use log::{debug, info, warn};
-use mea::singleflight::Group;
 use pegaflow_proto::proto::engine::engine_client::EngineClient;
 use pegaflow_proto::proto::engine::{
-    QueryBlocksForTransferRequest, QueryBlocksForTransferResponse, RdmaHandshakeRequest,
-    ReleaseTransferLockRequest, TransferBlockInfo,
+    PushBlockDst, PushBlocksRequest, PushSegmentDst, PushSlotDst, QueryBlocksForTransferRequest,
+    QueryBlocksForTransferResponse, RemoteMemoryRegion, TransferBlockInfo,
 };
-use pegaflow_transfer::{ConnectionStatus, HandshakeMetadata, TransferDesc, TransferOp};
 use tonic::transport::{Channel, Endpoint};
 
 use pegaflow_common::NumaNode;
 
 use opentelemetry::KeyValue;
 
+use super::rdma::mr_desc_to_proto;
 use super::{AllocateFn, PrefetchResult, RdmaTransport};
 use crate::block::{BlockKey, RawBlock, SealedBlock, Segment};
 use crate::internode::MetaServerClient;
 use crate::metrics::core_metrics;
 
-/// Minimum usable transfer timeout. If the server's lock timeout minus the
-/// safety margin falls below this, we use this floor to avoid instant timeouts.
-const MIN_TRANSFER_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Safety margin subtracted from the server's lock timeout. The client must
-/// finish the RDMA transfer before the server releases the lock.
-const LOCK_TIMEOUT_MARGIN: Duration = Duration::from_secs(60);
+/// Hard ceiling on one PushBlocks RPC. If this fires, the holder may still
+/// have RDMA WRITEs in flight targeting our slabs, so the slabs are leaked
+/// instead of recycled (see `leak_allocations`).
+const PUSH_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// RDMA remote block fetch backing store.
 ///
 /// When all requested blocks are missing locally, queries MetaServer for their
-/// location, picks the best remote node, and uses gRPC + RDMA READ to fetch them.
+/// location, picks the best remote node, and asks it to push the blocks into
+/// local pinned memory via RDMA WRITE.
 pub(crate) struct RdmaFetchStore {
     metaserver_client: Arc<MetaServerClient>,
     rdma_transport: Arc<RdmaTransport>,
@@ -45,11 +44,6 @@ pub(crate) struct RdmaFetchStore {
     /// Lazy gRPC channel cache keyed by remote address. Tonic channels multiplex
     /// requests over a single HTTP/2 connection; cloning is cheap.
     grpc_channels: Arc<DashMap<String, EngineClient<Channel>>>,
-    /// Singleflight group to deduplicate concurrent RDMA handshakes to the
-    /// same remote address. Without this, N concurrent fetches to the same
-    /// peer would each create QPs and race on the server, causing all but
-    /// the last handshake's QPs to be invalidated.
-    connect_group: Arc<Group<String, ()>>,
 }
 
 impl RdmaFetchStore {
@@ -66,7 +60,6 @@ impl RdmaFetchStore {
             allocate_fn,
             advertise_addr,
             grpc_channels: Arc::new(DashMap::new()),
-            connect_group: Arc::new(Group::new()),
         }
     }
 
@@ -120,7 +113,6 @@ impl RdmaFetchStore {
             &self.rdma_transport,
             &self.allocate_fn,
             &self.grpc_channels,
-            &self.connect_group,
             remote_addr,
             req_id,
             &self.advertise_addr,
@@ -131,12 +123,13 @@ impl RdmaFetchStore {
     }
 }
 
-/// Execute RDMA fetch against a single remote node.
+/// Execute a push fetch against a single remote node.
 ///
-/// 1. Ensure RDMA connection (singleflight per remote_addr)
-/// 2. gRPC QueryBlocksForTransfer RPC (connection reuse, no handshake)
-/// 3. RDMA READ all block segments + build SealedBlocks
-/// 4. ReleaseTransferLock (fire-and-forget, non-blocking)
+/// 1. gRPC QueryBlocksForTransfer (locks blocks remotely, returns sizes)
+/// 2. Allocate local NUMA slabs and build the push request
+/// 3. gRPC PushBlocks — the holder RDMA-WRITEs into our slabs and releases
+///    its transfer lock before responding
+/// 4. Build SealedBlocks from the now-filled slabs
 #[allow(
     clippy::too_many_arguments,
     reason = "RDMA task arguments are the per-fetch context passed from the scheduler"
@@ -145,7 +138,6 @@ async fn rdma_fetch_task(
     rdma: &RdmaTransport,
     allocate_fn: &AllocateFn,
     grpc_channels: &DashMap<String, EngineClient<Channel>>,
-    connect_group: &Group<String, ()>,
     remote_addr: &str,
     req_id: &str,
     advertise_addr: &str,
@@ -154,26 +146,6 @@ async fn rdma_fetch_task(
 ) -> PrefetchResult {
     let t0 = Instant::now();
 
-    // 1. Ensure RDMA connection (singleflight: at most one handshake per remote_addr)
-    let connect_start = Instant::now();
-    if let Err(e) = ensure_connected(
-        connect_group,
-        rdma,
-        grpc_channels,
-        remote_addr,
-        advertise_addr,
-    )
-    .await
-    {
-        warn!("RDMA connect to {remote_addr} failed: {e}");
-        core_metrics()
-            .rdma_fetch_total
-            .add(1, &[KeyValue::new("status", "error")]);
-        return Vec::new();
-    }
-    let connect_elapsed = connect_start.elapsed();
-
-    // 2. gRPC QueryBlocksForTransfer (connection already established)
     let query_start = Instant::now();
     let (client, response) = match query_remote_blocks(
         grpc_channels,
@@ -195,40 +167,31 @@ async fn rdma_fetch_task(
     };
     let query_elapsed = query_start.elapsed();
 
-    let transfer_session_id = response.transfer_session_id.clone();
-
-    // 3. RDMA READ all blocks + build SealedBlocks
-    let transfer_timeout = transfer_timeout_from_server(response.lock_timeout_secs);
     let blocks = response.blocks;
     let total_bytes: u64 = blocks
         .iter()
         .flat_map(|b| &b.slots)
         .map(|s| s.k_size + s.v_size)
         .sum();
-    let (result, transfer_timing) = match fetch_blocks_via_rdma(
+    let (result, timing) = match fetch_blocks_via_push(
         rdma,
         allocate_fn,
+        client,
         namespace,
-        remote_addr,
+        response.transfer_session_id,
         &blocks,
-        transfer_timeout,
     )
     .await
     {
         Ok(r) => r,
         Err(e) => {
-            warn!("RDMA transfer from {remote_addr} failed: {e}");
-            rdma.engine().invalidate_connection(remote_addr);
-            spawn_release_lock(client, transfer_session_id);
+            warn!("RDMA push fetch from {remote_addr} failed: {e}");
             core_metrics()
                 .rdma_fetch_total
                 .add(1, &[KeyValue::new("status", "error")]);
             return Vec::new();
         }
     };
-
-    // 4. Release transfer lock (fire-and-forget: spawns a detached task)
-    spawn_release_lock(client, transfer_session_id);
 
     let elapsed = t0.elapsed();
     let mb = total_bytes as f64 / (1024.0 * 1024.0);
@@ -239,21 +202,19 @@ async fn rdma_fetch_task(
         0.0
     };
     info!(
-        "RDMA fetch summary: req_id={req_id} remote={remote_addr} blocks={}/{} slots={} descs={} slabs={} bytes_mib={mb:.1} total_ms={elapsed_ms:.2} tp_mib_s={throughput_mib_s:.0}",
+        "RDMA fetch summary: req_id={req_id} remote={remote_addr} blocks={}/{} slots={} segments={} slabs={} bytes_mib={mb:.1} total_ms={elapsed_ms:.2} tp_mib_s={throughput_mib_s:.0}",
         result.len(),
         block_hashes.len(),
-        transfer_timing.slot_count,
-        transfer_timing.transfer_desc_count,
-        transfer_timing.numa_slab_count,
+        timing.slot_count,
+        timing.segment_count,
+        timing.numa_slab_count,
     );
     info!(
-        "RDMA fetch stages: req_id={req_id} remote={remote_addr} connect_ms={:.2} query_ms={:.2} build_transfer_tasks_ms={:.2} submit_transfer_ms={:.2} rdma_wait_ms={:.2} rebuild_ms={:.2}",
-        connect_elapsed.as_secs_f64() * 1000.0,
+        "RDMA fetch stages: req_id={req_id} remote={remote_addr} query_ms={:.2} build_ms={:.2} push_ms={:.2} rebuild_ms={:.2}",
         query_elapsed.as_secs_f64() * 1000.0,
-        transfer_timing.build_transfer_tasks.as_secs_f64() * 1000.0,
-        transfer_timing.submit_transfer.as_secs_f64() * 1000.0,
-        transfer_timing.rdma_wait.as_secs_f64() * 1000.0,
-        transfer_timing.rebuild.as_secs_f64() * 1000.0,
+        timing.build.as_secs_f64() * 1000.0,
+        timing.push.as_secs_f64() * 1000.0,
+        timing.rebuild.as_secs_f64() * 1000.0,
     );
     let m = core_metrics();
     let ok = &[KeyValue::new("status", "ok")];
@@ -264,182 +225,153 @@ async fn rdma_fetch_task(
     result
 }
 
-/// Ensure an RDMA connection to `remote_addr` exists, using singleflight to
-/// deduplicate concurrent handshakes to the same peer.
-///
-/// On the first call for a given remote, one task performs the full handshake
-/// (prepare QPs → gRPC metadata exchange → complete connection). Concurrent
-/// callers wait for that handshake to finish and then reuse the connection.
-/// If the handshake fails, the error is returned to the leader and waiting
-/// callers retry independently (mea try_work semantics).
-async fn ensure_connected(
-    connect_group: &Group<String, ()>,
-    rdma: &RdmaTransport,
-    grpc_channels: &DashMap<String, EngineClient<Channel>>,
-    remote_addr: &str,
-    advertise_addr: &str,
-) -> Result<(), String> {
-    connect_group
-        .try_work(remote_addr.to_string(), async || {
-            // Fast path: already connected
-            let local_meta = match rdma.engine().get_or_prepare(remote_addr) {
-                Ok(ConnectionStatus::Existing) => return Ok(()),
-                Ok(ConnectionStatus::Connecting) => {
-                    return Err("handshake to this peer already in progress".into());
-                }
-                Ok(ConnectionStatus::Prepared(m)) => m,
-                Err(e) => return Err(format!("RDMA prepare: {e}")),
-            };
-
-            // Exchange handshake metadata via the dedicated RdmaHandshake RPC.
-            let mut client = get_or_create_channel(grpc_channels, remote_addr)
-                .inspect_err(|_| rdma.engine().abort_handshake(remote_addr, &local_meta))?;
-
-            let request = RdmaHandshakeRequest {
-                requester_id: advertise_addr.to_string(),
-                handshake_metadata: local_meta.to_bytes(),
-            };
-            let response = client
-                .rdma_handshake(request)
-                .await
-                .map_err(|e| format!("RdmaHandshake RPC failed: {e}"))
-                .inspect_err(|_| rdma.engine().abort_handshake(remote_addr, &local_meta))?
-                .into_inner();
-
-            // Complete the RDMA connection with the server's QP info.
-            finish_handshake(rdma, remote_addr, &local_meta, &response.handshake_metadata)
-                .inspect_err(|_| rdma.engine().abort_handshake(remote_addr, &local_meta))?;
-
-            Ok(())
-        })
-        .await
-}
-
-/// Allocate local memory, build TransferDescs, execute RDMA READ, build SealedBlocks.
-async fn fetch_blocks_via_rdma(
+/// Allocate local memory, send PushBlocks, build SealedBlocks.
+async fn fetch_blocks_via_push(
     rdma: &RdmaTransport,
     allocate_fn: &AllocateFn,
+    mut client: EngineClient<Channel>,
     namespace: &str,
-    remote_addr: &str,
+    transfer_session_id: String,
     blocks: &[TransferBlockInfo],
-    transfer_timeout: Duration,
-) -> Result<(PrefetchResult, TransferTiming), String> {
+) -> Result<(PrefetchResult, FetchTiming), String> {
     if blocks.is_empty() {
-        return Ok((Vec::new(), TransferTiming::default()));
+        return Ok((Vec::new(), FetchTiming::default()));
     }
 
+    let build_start = Instant::now();
     let bytes_per_numa = sum_segment_bytes_by_numa(blocks)?;
     let mut numa_slabs = allocate_numa_slabs(allocate_fn, bytes_per_numa)?;
+    let numa_slab_count = numa_slabs.len();
 
-    // (block_hash, Vec<(slot_segments)>) — for building SealedBlock afterwards
+    // (block_hash, Vec<slot segments>) — for building SealedBlocks afterwards
     let mut block_allocs: Vec<(Vec<u8>, Vec<Vec<SegmentAlloc>>)> = Vec::new();
     let mut slot_count = 0usize;
-    let build_start = Instant::now();
+    let mut segment_count = 0usize;
 
-    // Build TransferDescs and submit RDMA READ inside a sync block so that
-    // all_descs (which contains NonNull<u8>, !Send) is dropped before any .await.
-    let (receivers, mut timing) = {
-        let mut all_descs: Vec<TransferDesc> = Vec::new();
+    // Wire MR table, deduplicated by region base pointer.
+    let mut mr_table: Vec<RemoteMemoryRegion> = Vec::new();
+    let mut mr_index_by_base: HashMap<u64, u32> = HashMap::new();
+    let mut push_blocks: Vec<PushBlockDst> = Vec::new();
+
+    // Allocation and request assembly stay in a sync block so that NonNull
+    // pointers (not Send) are dropped before any .await.
+    {
+        let mut segment_dst = |slabs: &mut HashMap<NumaNode, NumaSlab>,
+                               numa: NumaNode,
+                               len: usize,
+                               kind: &str|
+         -> Result<(PushSegmentDst, SegmentAlloc), String> {
+            let (local_ptr, alloc) = alloc_segment_from_slab(slabs, numa, len, kind)?;
+            let addr = local_ptr.as_ptr() as u64;
+            let region = rdma.region_for(addr, len as u64).ok_or_else(|| {
+                format!("slab segment 0x{addr:x}+{len} is not in a registered RDMA region")
+            })?;
+            let desc = region.descriptor();
+            let mr_index = *mr_index_by_base.entry(desc.ptr).or_insert_with(|| {
+                mr_table.push(mr_desc_to_proto(desc));
+                (mr_table.len() - 1) as u32
+            });
+            Ok((
+                PushSegmentDst {
+                    mr_index,
+                    dst_addr: addr,
+                },
+                SegmentAlloc {
+                    ptr_addr: addr,
+                    alloc,
+                    size: len,
+                },
+            ))
+        };
 
         for block_info in blocks {
             slot_count += block_info.slots.len();
             let mut slot_allocs = Vec::with_capacity(block_info.slots.len());
+            let mut slot_dsts = Vec::with_capacity(block_info.slots.len());
 
             for slot in &block_info.slots {
                 let mut segments = Vec::new();
                 let numa = NumaNode(slot.numa_node);
 
-                // K segment
-                if slot.k_size > 0 {
+                let k_dst = if slot.k_size > 0 {
                     let len = usize::try_from(slot.k_size)
                         .map_err(|_| format!("K size exceeds usize: {}", slot.k_size))?;
-                    let (local_ptr, alloc) =
-                        alloc_segment_from_slab(&mut numa_slabs, numa, len, "K")?;
-                    let remote_ptr = NonNull::new(slot.k_ptr as *mut u8)
-                        .ok_or_else(|| "remote K ptr is null".to_string())?;
-                    all_descs.push(TransferDesc {
-                        local_ptr,
-                        remote_ptr,
-                        len,
-                    });
-                    segments.push(SegmentAlloc {
-                        ptr_addr: local_ptr.as_ptr() as u64,
-                        alloc,
-                        size: len,
-                    });
-                }
+                    let (dst, alloc) = segment_dst(&mut numa_slabs, numa, len, "K")?;
+                    segments.push(alloc);
+                    segment_count += 1;
+                    Some(dst)
+                } else {
+                    None
+                };
 
-                // V segment (split KV)
-                if slot.v_size > 0 && slot.v_ptr != 0 {
+                let v_dst = if slot.v_size > 0 {
                     let len = usize::try_from(slot.v_size)
                         .map_err(|_| format!("V size exceeds usize: {}", slot.v_size))?;
-                    let (local_ptr, alloc) =
-                        alloc_segment_from_slab(&mut numa_slabs, numa, len, "V")?;
-                    let remote_ptr = NonNull::new(slot.v_ptr as *mut u8)
-                        .ok_or_else(|| "remote V ptr is null".to_string())?;
-                    all_descs.push(TransferDesc {
-                        local_ptr,
-                        remote_ptr,
-                        len,
-                    });
-                    segments.push(SegmentAlloc {
-                        ptr_addr: local_ptr.as_ptr() as u64,
-                        alloc,
-                        size: len,
-                    });
-                }
+                    let (dst, alloc) = segment_dst(&mut numa_slabs, numa, len, "V")?;
+                    segments.push(alloc);
+                    segment_count += 1;
+                    Some(dst)
+                } else {
+                    None
+                };
 
+                slot_dsts.push(PushSlotDst { k: k_dst, v: v_dst });
                 slot_allocs.push(segments);
             }
 
             block_allocs.push((block_info.block_hash.clone(), slot_allocs));
+            push_blocks.push(PushBlockDst {
+                block_hash: block_info.block_hash.clone(),
+                slots: slot_dsts,
+            });
         }
+    }
+    let build = build_start.elapsed();
 
-        if all_descs.is_empty() {
-            let timing = TransferTiming {
-                build_transfer_tasks: build_start.elapsed(),
-                slot_count,
-                numa_slab_count: numa_slabs.len(),
-                ..TransferTiming::default()
-            };
-            return Ok((Vec::new(), timing));
-        }
-
-        let transfer_desc_count = all_descs.len();
-
-        // Submit RDMA READ; all_descs is dropped at the end of this block.
-        let submit_start = Instant::now();
-        let receivers = rdma
-            .engine()
-            .batch_transfer_async(TransferOp::Read, remote_addr, &all_descs)
-            .map_err(|e| format!("RDMA batch_transfer_async failed: {e}"))?;
-        let submit_transfer = submit_start.elapsed();
-
-        let timing = TransferTiming {
-            build_transfer_tasks: build_start.elapsed().saturating_sub(submit_transfer),
-            submit_transfer,
-            transfer_desc_count,
+    if segment_count == 0 {
+        let timing = FetchTiming {
+            build,
             slot_count,
-            numa_slab_count: numa_slabs.len(),
-            ..TransferTiming::default()
+            numa_slab_count,
+            ..FetchTiming::default()
         };
-        (receivers, timing)
+        return Ok((Vec::new(), timing));
+    }
+
+    let push_start = Instant::now();
+    let request = PushBlocksRequest {
+        transfer_session_id,
+        memory_regions: mr_table,
+        blocks: push_blocks,
     };
-
-    let wait_start = Instant::now();
-    tokio::time::timeout(transfer_timeout, async {
-        for rx in receivers {
-            rx.await
-                .map_err(|_| "RDMA transfer channel closed".to_string())?
-                .map_err(|e| format!("RDMA transfer failed: {e}"))?;
+    let push_result = tokio::time::timeout(PUSH_TIMEOUT, client.push_blocks(request)).await;
+    let response = match push_result {
+        Ok(Ok(response)) => response.into_inner(),
+        Ok(Err(status)) => {
+            // FAILED_PRECONDITION is the holder's contract for "rejected
+            // before submitting any WRITE": the slabs were never touched and
+            // dropping them recycles the memory. Any other failure leaves
+            // the WRITE state unknown and the slabs must be leaked.
+            if status.code() == tonic::Code::FailedPrecondition {
+                return Err(format!("PushBlocks rejected by holder: {status}"));
+            }
+            leak_allocations(numa_slabs, block_allocs);
+            return Err(format!("PushBlocks RPC failed: {status}"));
         }
-        Ok::<(), String>(())
-    })
-    .await
-    .map_err(|_| "RDMA transfer timed out".to_string())??;
-    timing.rdma_wait = wait_start.elapsed();
+        Err(_) => {
+            leak_allocations(numa_slabs, block_allocs);
+            return Err(format!("PushBlocks timed out after {PUSH_TIMEOUT:?}"));
+        }
+    };
+    if let Some(st) = &response.status
+        && !st.ok
+    {
+        leak_allocations(numa_slabs, block_allocs);
+        return Err(format!("PushBlocks rejected by holder: {}", st.message));
+    }
+    let push = push_start.elapsed();
 
-    // Build SealedBlocks from allocated memory
+    // Build SealedBlocks from the now-filled memory.
     let rebuild_start = Instant::now();
     let mut result: PrefetchResult = Vec::with_capacity(block_allocs.len());
     for (hash, slot_allocs) in block_allocs {
@@ -461,9 +393,42 @@ async fn fetch_blocks_via_rdma(
         let sealed = Arc::new(SealedBlock::from_slots(slots));
         result.push((key, sealed));
     }
-    timing.rebuild = rebuild_start.elapsed();
 
+    let timing = FetchTiming {
+        build,
+        push,
+        rebuild: rebuild_start.elapsed(),
+        segment_count,
+        slot_count,
+        numa_slab_count,
+    };
     Ok((result, timing))
+}
+
+/// Leak the fetch's pinned allocations after a failed push.
+///
+/// After a push failure we cannot know whether the holder still has RDMA
+/// WRITEs in flight targeting these slabs (the gRPC path and the RDMA fabric
+/// can fail independently). Returning the memory to the pool could let a
+/// late WRITE corrupt an unrelated allocation, so we deliberately leak it.
+#[allow(
+    clippy::mem_forget,
+    reason = "leak is the safety mechanism: freed memory could be corrupted by in-flight WRITEs"
+)]
+fn leak_allocations(
+    numa_slabs: HashMap<NumaNode, NumaSlab>,
+    block_allocs: Vec<(Vec<u8>, Vec<Vec<SegmentAlloc>>)>,
+) {
+    let leaked: usize = numa_slabs.values().map(|s| s.capacity).sum();
+    log::error!(
+        "Leaking {leaked} bytes of pinned memory across {} slab(s): push failed and remote WRITEs may still be in flight",
+        numa_slabs.len()
+    );
+    core_metrics()
+        .rdma_fetch_leaked_bytes
+        .add(leaked as u64, &[]);
+    std::mem::forget(numa_slabs);
+    std::mem::forget(block_allocs);
 }
 
 fn sum_segment_bytes_by_numa(
@@ -479,7 +444,7 @@ fn sum_segment_bytes_by_numa(
                     format!("numa bytes overflow while summing K segments on {numa}")
                 })?;
             }
-            if slot.v_size > 0 && slot.v_ptr != 0 {
+            if slot.v_size > 0 {
                 let total = bytes_per_numa.entry(numa).or_insert(0);
                 *total = total.checked_add(slot.v_size).ok_or_else(|| {
                     format!("numa bytes overflow while summing V segments on {numa}")
@@ -566,12 +531,11 @@ struct SegmentAlloc {
 }
 
 #[derive(Default)]
-struct TransferTiming {
-    build_transfer_tasks: Duration,
-    submit_transfer: Duration,
-    rdma_wait: Duration,
+struct FetchTiming {
+    build: Duration,
+    push: Duration,
     rebuild: Duration,
-    transfer_desc_count: usize,
+    segment_count: usize,
     slot_count: usize,
     numa_slab_count: usize,
 }
@@ -628,48 +592,6 @@ async fn query_remote_blocks(
     Ok((client, response))
 }
 
-/// Decode remote handshake metadata and complete the RDMA connection.
-fn finish_handshake(
-    rdma: &RdmaTransport,
-    remote_addr: &str,
-    local_meta: &HandshakeMetadata,
-    remote_bytes: &[u8],
-) -> Result<(), String> {
-    if remote_bytes.is_empty() {
-        return Err("server returned empty handshake_metadata".into());
-    }
-    let remote_meta = HandshakeMetadata::from_bytes(remote_bytes)
-        .map_err(|e| format!("invalid metadata: {e}"))?;
-    rdma.engine()
-        .complete_handshake(remote_addr, local_meta, &remote_meta)
-        .map_err(|e| format!("{e}"))
-}
-
-/// Compute client-side transfer timeout from server's lock timeout.
-/// Returns `max(server_timeout - 60s, 10s)` so the client always finishes
-/// before the server force-releases the lock.
-fn transfer_timeout_from_server(lock_timeout_secs: u32) -> Duration {
-    let server = Duration::from_secs(lock_timeout_secs as u64);
-    server
-        .saturating_sub(LOCK_TIMEOUT_MARGIN)
-        .max(MIN_TRANSFER_TIMEOUT)
-}
-
-/// Release a transfer lock in a detached task. Does not block the caller.
-fn spawn_release_lock(mut client: EngineClient<Channel>, transfer_session_id: String) {
-    if transfer_session_id.is_empty() {
-        return;
-    }
-    tokio::spawn(async move {
-        let req = ReleaseTransferLockRequest {
-            transfer_session_id: transfer_session_id.clone(),
-        };
-        if let Err(e) = client.release_transfer_lock(req).await {
-            warn!("ReleaseTransferLock failed for session {transfer_session_id}: {e}");
-        }
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -680,11 +602,9 @@ mod tests {
 
     use pegaflow_proto::proto::engine::TransferSlotInfo;
 
-    fn slot(k_size: u64, v_ptr: u64, v_size: u64, numa: u32) -> TransferSlotInfo {
+    fn slot(k_size: u64, v_size: u64, numa: u32) -> TransferSlotInfo {
         TransferSlotInfo {
-            k_ptr: 0x1000,
             k_size,
-            v_ptr,
             v_size,
             numa_node: numa,
         }
@@ -710,13 +630,13 @@ mod tests {
             TransferBlockInfo {
                 block_hash: vec![1],
                 slots: vec![
-                    slot(100, 0, 0, 0),        // contiguous
-                    slot(200, 0x2000, 300, 0), // split KV
+                    slot(100, 0, 0),   // contiguous
+                    slot(200, 300, 0), // split KV
                 ],
             },
             TransferBlockInfo {
                 block_hash: vec![2],
-                slots: vec![slot(400, 0x3000, 500, 1)],
+                slots: vec![slot(400, 500, 1)],
             },
         ];
 

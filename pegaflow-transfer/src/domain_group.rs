@@ -1,6 +1,6 @@
 use std::{cmp::min, collections::HashMap, ffi::c_void, ptr::NonNull, sync::Arc};
 
-use crate::v2::{
+use crate::{
     api::{
         DomainAddress, DomainGroupRouting, GroupTransferRouting, MemoryRegionDescriptor,
         MemoryRegionHandle, PagedTransferRequest, PeerGroupHandle, ScatterTransferRequest,
@@ -15,7 +15,7 @@ use crate::v2::{
     },
 };
 
-pub struct DomainGroup<D: RdmaDomain, const N: usize> {
+pub(crate) struct DomainGroup<D: RdmaDomain, const N: usize> {
     domains: [D; N],
     write_ops: HashMap<TransferId, WriteOpContext>,
     rr_next: usize,
@@ -34,7 +34,7 @@ struct PeerGroup {
 }
 
 impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
-    pub fn new(domains: [D; N]) -> Self {
+    pub(crate) fn new(domains: [D; N]) -> Self {
         Self {
             domains,
             write_ops: HashMap::new(),
@@ -44,16 +44,16 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
         }
     }
 
-    pub fn aggregate_link_speed(&self) -> u64 {
+    pub(crate) fn aggregate_link_speed(&self) -> u64 {
         self.domains.iter().map(|d| d.link_speed()).sum()
     }
 
-    pub fn register_mr_allow_remote(
+    pub(crate) fn register_mr_allow_remote(
         &mut self,
         region: &MemoryRegion,
     ) -> Result<(MemoryRegionHandle, MemoryRegionDescriptor)> {
         let mut addr_rkey_list = SmallVec::new();
-        for domain in self.domains.iter_mut() {
+        for domain in &mut self.domains {
             let rkey = domain.register_mr_allow_remote(region)?;
             addr_rkey_list.push((domain.addr(), rkey));
         }
@@ -66,24 +66,27 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
         Ok((local, remote))
     }
 
-    pub fn register_mr_local(&mut self, region: &MemoryRegion) -> Result<MemoryRegionHandle> {
-        for domain in self.domains.iter_mut() {
+    pub(crate) fn register_mr_local(
+        &mut self,
+        region: &MemoryRegion,
+    ) -> Result<MemoryRegionHandle> {
+        for domain in &mut self.domains {
             domain.register_mr_local(region)?;
         }
         Ok(MemoryRegionHandle::new(region.ptr()))
     }
 
-    pub fn unregister_mr(&mut self, ptr: NonNull<c_void>) {
-        for domain in self.domains.iter_mut() {
+    pub(crate) fn unregister_mr(&mut self, ptr: NonNull<c_void>) {
+        for domain in &mut self.domains {
             domain.unregister_mr(ptr);
         }
     }
 
-    pub fn add_peer_group(
+    pub(crate) fn add_peer_group(
         &mut self,
         addrs: Vec<SmallVec<DomainAddress>>,
     ) -> Result<PeerGroupHandle> {
-        for (handle, group) in self.peer_groups.iter() {
+        for (handle, group) in &self.peer_groups {
             if group.addrs == addrs {
                 return Ok(*handle);
             }
@@ -105,7 +108,7 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
         Ok(handle)
     }
 
-    pub fn submit_transfer_request(
+    pub(crate) fn submit_transfer_request(
         &mut self,
         transfer_id: TransferId,
         request: TransferRequest,
@@ -138,7 +141,7 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
         }
     }
 
-    pub fn submit_imm_transfer_request(
+    pub(crate) fn submit_imm_transfer_request(
         &mut self,
         transfer_id: TransferId,
         imm_data: u32,
@@ -209,7 +212,7 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
         Ok(())
     }
 
-    pub fn submit_single_transfer_request(
+    pub(crate) fn submit_single_transfer_request(
         &mut self,
         transfer_id: TransferId,
         request: SingleTransferRequest,
@@ -294,7 +297,7 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
         Ok(())
     }
 
-    pub fn submit_paged_transfer_request(
+    pub(crate) fn submit_paged_transfer_request(
         &mut self,
         transfer_id: TransferId,
         request: PagedTransferRequest,
@@ -360,7 +363,7 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
         Ok(())
     }
 
-    pub fn submit_scatter_transfer_request(
+    pub(crate) fn submit_scatter_transfer_request(
         &mut self,
         transfer_id: TransferId,
         request: ScatterTransferRequest,
@@ -369,6 +372,21 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
         // Validate
         if request.dsts.is_empty() {
             return Err(FabricLibError::Custom("Empty scatter targets"));
+        }
+        if request
+            .dsts
+            .iter()
+            .any(|dst| dst.dst_mr.addr_rkey_list.len() < self.domains.len())
+        {
+            return Err(FabricLibError::Custom(
+                "Scatter target has fewer remote addresses than local domains",
+            ));
+        }
+        // Per-target lengths are carried in 32-bit SGEs.
+        if request.dsts.iter().any(|dst| dst.length > u32::MAX as u64) {
+            return Err(FabricLibError::Custom(
+                "Scatter target length exceeds u32::MAX",
+            ));
         }
         if let Some(dst_handle) = &request.dst_handle {
             let group = self
@@ -388,11 +406,8 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
         match request.domain {
             GroupTransferRouting::AllDomainsShardPeers => {
                 let dst_range = divide_evenly(request.dsts.len(), self.domains.len());
-                for ((domain_idx, domain), (beg, end)) in self
-                    .domains
-                    .iter_mut()
-                    .enumerate()
-                    .zip(dst_range.into_iter())
+                for ((domain_idx, domain), (beg, end)) in
+                    self.domains.iter_mut().enumerate().zip(dst_range)
                 {
                     let src_desc = domain.get_mem_desc(request.src_mr.ptr)?;
                     let op = GroupWriteOp::Scatter(ScatterGroupWriteOp {
@@ -466,7 +481,7 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
         Ok(())
     }
 
-    pub fn submit_send(
+    pub(crate) fn submit_send(
         &mut self,
         transfer_id: TransferId,
         mr: MemoryRegionHandle,
@@ -480,7 +495,7 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
         Ok(())
     }
 
-    pub fn submit_recv(
+    pub(crate) fn submit_recv(
         &mut self,
         transfer_id: TransferId,
         mr: MemoryRegionHandle,
@@ -494,8 +509,8 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
     }
 
     /// Poll RDMA completion queue and send pending RDMA operations.
-    pub fn poll_progress(&mut self) {
-        for domain in self.domains.iter_mut() {
+    pub(crate) fn poll_progress(&mut self) {
+        for domain in &mut self.domains {
             domain.poll_progress();
         }
     }
@@ -504,8 +519,8 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
     /// Return Transfer if all domains have completed the transfer.
     /// Return Recv, Send, ImmData if any domain returns so.
     /// Return None otherwise.
-    pub fn get_completion(&mut self) -> Option<DomainCompletionEntry> {
-        for domain in self.domains.iter_mut() {
+    pub(crate) fn get_completion(&mut self) -> Option<DomainCompletionEntry> {
+        for domain in &mut self.domains {
             if let Some(c) = domain.get_completion() {
                 match c {
                     DomainCompletionEntry::Error(transfer_id, err) => {

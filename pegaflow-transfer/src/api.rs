@@ -14,7 +14,7 @@ use std::{
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-use crate::v2::{
+use crate::{
     error::FabricLibError,
     utils::hex::{fmt_hex, from_hex},
 };
@@ -48,7 +48,7 @@ pub struct MemoryRegionDescriptor {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TransferId(pub u64);
+pub(crate) struct TransferId(pub u64);
 
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DomainAddress(pub Bytes);
@@ -172,7 +172,7 @@ pub enum TransferRequest {
 }
 
 #[derive(Debug)]
-pub enum TransferCompletionEntry {
+pub(crate) enum TransferCompletionEntry {
     Recv {
         transfer_id: TransferId,
         data_len: usize,
@@ -223,13 +223,13 @@ impl ImmCounter {
 }
 
 /// Transfer counter exposing a pollable interface to transfer completion.
-pub struct TransferCounter {
+pub(crate) struct TransferCounter {
     counter: Arc<AtomicI64>,
     err_counter: Arc<AtomicI64>,
 }
 
 impl TransferCounter {
-    pub fn new(counter: Arc<AtomicI64>, err_counter: Arc<AtomicI64>) -> Self {
+    pub(crate) fn new(counter: Arc<AtomicI64>, err_counter: Arc<AtomicI64>) -> Self {
         Self {
             counter,
             err_counter,

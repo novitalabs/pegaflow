@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use anyhow::{Error, Result};
 
-use crate::v2::{
+use crate::{
     provider_dispatch::DomainInfo, topo::detect_topology, transfer_engine::TransferEngine,
     worker::Worker,
 };
@@ -19,6 +19,32 @@ pub struct TransferEngineBuilder {
 }
 
 impl TransferEngineBuilder {
+    /// Build a host-memory transfer engine: one worker driving `domains`,
+    /// optionally pinned to `pin_worker_cpu`. Unlike [`Self::build`], this does
+    /// not consult the GPU topology; callers group NICs per NUMA node
+    /// themselves (see `detect_host_topology`).
+    pub fn build_host(
+        domains: Vec<DomainInfo>,
+        pin_worker_cpu: Option<u16>,
+    ) -> Result<TransferEngine> {
+        if domains.is_empty() {
+            return Err(Error::msg("No domains for host transfer engine"));
+        }
+        let num_unique = domains
+            .iter()
+            .map(|d| d.name())
+            .collect::<HashSet<_>>()
+            .len();
+        if num_unique != domains.len() {
+            return Err(Error::msg("Duplicated domains for host transfer engine"));
+        }
+        let worker = Worker {
+            domain_list: domains,
+            pin_worker_cpu,
+        };
+        Ok(TransferEngine::new(vec![(0, worker)])?)
+    }
+
     pub fn add_gpu_domains(
         &mut self,
         cuda_device: u8,
@@ -29,7 +55,7 @@ impl TransferEngineBuilder {
             cuda_device,
             domains,
             pin_worker_cpu,
-        })
+        });
     }
 
     pub fn build(&self) -> Result<TransferEngine> {
@@ -51,7 +77,7 @@ impl TransferEngineBuilder {
 
         // Validate builder params and prepare workers
         let mut workers = Vec::with_capacity(self.gpus.len());
-        for spec in self.gpus.iter() {
+        for spec in &self.gpus {
             let Some(topo) = system_topo
                 .iter()
                 .find(|t| t.cuda_device == spec.cuda_device)
@@ -75,7 +101,7 @@ impl TransferEngineBuilder {
                 )));
             }
 
-            for d in spec.domains.iter() {
+            for d in &spec.domains {
                 if !topo.domains.iter().any(|t| t.name() == d.name()) {
                     return Err(Error::msg(format!(
                         "Domain {} not found in the topology group of cuda:{}",
