@@ -537,10 +537,12 @@ async fn main() {
         kv_bytes: cli.kv_bytes,
         blocks: cli.blocks,
     };
+    // Generous slack: if the pool runs tight the engine evicts earlier sets
+    // (and deregisters them from MetaServer), which breaks the run.
     let pool_bytes = if cli.pool_gib > 0 {
         cli.pool_gib << 30
     } else {
-        cli.sets * shape.set_bytes() + shape.set_bytes() / 4
+        (cli.sets * shape.set_bytes() + shape.set_bytes() / 2).max(1 << 30)
     };
     info!(
         "p2p_bench role={:?} shape: layers={} tp={} kv_bytes={} blocks={} sets={} set_bytes={:.1}MiB pool={:.1}GiB",
