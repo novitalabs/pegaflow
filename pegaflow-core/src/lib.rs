@@ -833,11 +833,6 @@ impl PegaEngine {
             .iter()
             .map(mr_desc_from_proto)
             .collect();
-        let segment_dst = |seg: &pegaflow_proto::proto::engine::PushSegmentDst| {
-            mr_descs.get(seg.mr_index as usize).cloned().ok_or_else(|| {
-                PushBlocksError::Rejected(format!("mr_index {} out of bounds", seg.mr_index))
-            })
-        };
 
         for ((key, sealed), dst_block) in session_blocks.iter().zip(&request.blocks) {
             if key.hash != dst_block.block_hash {
@@ -878,7 +873,7 @@ impl PegaEngine {
                 segments.push(PushSegment {
                     src_addr: layer_block.k_ptr() as u64,
                     len: layer_block.k_size() as u64,
-                    dst_mr: segment_dst(k_dst)?,
+                    dst_mr_index: k_dst.mr_index,
                     dst_addr: k_dst.dst_addr,
                 });
             }
@@ -897,13 +892,13 @@ impl PegaEngine {
                 segments.push(PushSegment {
                     src_addr: v_ptr as u64,
                     len: layer_block.v_size().unwrap_or(0) as u64,
-                    dst_mr: segment_dst(v_dst)?,
+                    dst_mr_index: v_dst.mr_index,
                     dst_addr: v_dst.dst_addr,
                 });
             }
         }
 
-        rdma.push_segments(segments).await
+        rdma.push_segments(&mr_descs, segments).await
     }
 
     /// Serve a PushBlocks request.

@@ -52,11 +52,13 @@ impl RegisteredRegion {
 }
 
 /// One segment of a push transfer: holder-local source bytes and the
-/// requester-side destination (MR descriptor + absolute address).
+/// requester-side destination (index into the request's MR table + absolute
+/// address). Indexing instead of embedding the descriptor keeps the build
+/// loop free of per-segment rkey-list clones.
 pub(crate) struct PushSegment {
     pub(crate) src_addr: u64,
     pub(crate) len: u64,
-    pub(crate) dst_mr: MemoryRegionDescriptor,
+    pub(crate) dst_mr_index: u32,
     pub(crate) dst_addr: u64,
 }
 
@@ -180,9 +182,10 @@ impl RdmaTransport {
     /// from the build phase is a clean [`PushBlocksError::Rejected`].
     pub(crate) async fn push_segments(
         &self,
+        mr_descs: &[MemoryRegionDescriptor],
         segments: Vec<PushSegment>,
     ) -> Result<u64, PushBlocksError> {
-        let mut groups: HashMap<usize, Vec<ScatterTarget>> = HashMap::new();
+        let mut groups: HashMap<usize, Vec<(u32, ScatterTarget)>> = HashMap::new();
         let mut total_bytes = 0u64;
         let raw_segments = segments.len();
         // Adjacency diagnostics: how many consecutive segment pairs are
@@ -190,54 +193,75 @@ impl RdmaTransport {
         let mut src_adjacent = 0usize;
         let mut dst_adjacent = 0usize;
         let mut prev_ends: Option<(u64, u64)> = None;
+        // Consecutive segments almost always share a region (slot-major
+        // order makes sources adjacent), so try the previous hit first.
+        let mut last_region_idx = 0usize;
         for seg in segments {
             if let Some((src_end, dst_end)) = prev_ends {
                 src_adjacent += usize::from(src_end == seg.src_addr);
                 dst_adjacent += usize::from(dst_end == seg.dst_addr);
             }
             prev_ends = Some((seg.src_addr + seg.len, seg.dst_addr + seg.len));
-            let region_idx = self
+            let region_idx = if self
                 .regions
-                .iter()
-                .position(|r| r.contains(seg.src_addr, seg.len))
-                .ok_or_else(|| {
-                    PushBlocksError::Rejected(format!(
-                        "push source 0x{:x}+{} is not in any registered region",
-                        seg.src_addr, seg.len
-                    ))
-                })?;
+                .get(last_region_idx)
+                .is_some_and(|r| r.contains(seg.src_addr, seg.len))
+            {
+                last_region_idx
+            } else {
+                self.regions
+                    .iter()
+                    .position(|r| r.contains(seg.src_addr, seg.len))
+                    .ok_or_else(|| {
+                        PushBlocksError::Rejected(format!(
+                            "push source 0x{:x}+{} is not in any registered region",
+                            seg.src_addr, seg.len
+                        ))
+                    })?
+            };
+            last_region_idx = region_idx;
             let region = &self.regions[region_idx];
-            if self.engines[region.engine_idx].num_domains > seg.dst_mr.addr_rkey_list.len() {
+            let dst_mr = mr_descs.get(seg.dst_mr_index as usize).ok_or_else(|| {
+                PushBlocksError::Rejected(format!(
+                    "mr_index {} out of bounds ({} regions in request)",
+                    seg.dst_mr_index,
+                    mr_descs.len()
+                ))
+            })?;
+            if self.engines[region.engine_idx].num_domains > dst_mr.addr_rkey_list.len() {
                 return Err(PushBlocksError::Rejected(format!(
                     "requester MR has {} domain rkeys but local engine has {} NICs; \
                      NIC counts must match 1:1 per NUMA group",
-                    seg.dst_mr.addr_rkey_list.len(),
+                    dst_mr.addr_rkey_list.len(),
                     self.engines[region.engine_idx].num_domains
                 )));
             }
-            let dst_offset = seg.dst_addr.checked_sub(seg.dst_mr.ptr).ok_or_else(|| {
+            let dst_offset = seg.dst_addr.checked_sub(dst_mr.ptr).ok_or_else(|| {
                 PushBlocksError::Rejected(format!(
                     "push destination 0x{:x} is below its MR base 0x{:x}",
-                    seg.dst_addr, seg.dst_mr.ptr
+                    seg.dst_addr, dst_mr.ptr
                 ))
             })?;
             total_bytes += seg.len;
             let src_offset = seg.src_addr - region.base;
             let targets = groups.entry(region_idx).or_default();
             match targets.last_mut() {
-                Some(last)
-                    if last.dst_mr.ptr == seg.dst_mr.ptr
+                Some((last_mr_index, last))
+                    if *last_mr_index == seg.dst_mr_index
                         && last.src_offset + last.length == src_offset
                         && last.dst_offset + last.length == dst_offset =>
                 {
                     last.length += seg.len;
                 }
-                _ => targets.push(ScatterTarget {
-                    dst_mr: seg.dst_mr,
-                    length: seg.len,
-                    src_offset,
-                    dst_offset,
-                }),
+                _ => targets.push((
+                    seg.dst_mr_index,
+                    ScatterTarget {
+                        dst_mr: dst_mr.clone(),
+                        length: seg.len,
+                        src_offset,
+                        dst_offset,
+                    },
+                )),
             }
         }
 
@@ -248,6 +272,7 @@ impl RdmaTransport {
         );
 
         let transfers = groups.into_iter().map(|(region_idx, targets)| {
+            let targets: Vec<ScatterTarget> = targets.into_iter().map(|(_, t)| t).collect();
             let region = &self.regions[region_idx];
             let engine = &self.engines[region.engine_idx].engine;
             engine.submit_transfer_async(TransferRequest::Scatter(ScatterTransferRequest {
