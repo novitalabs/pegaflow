@@ -42,6 +42,8 @@ class RdmaPort(Protocol):
 
     def push_done(self, req_id: str) -> None: ...
 
+    def write_stats(self, req_id: str) -> dict[str, Any]: ...
+
     def fail_request(self, req_id: str) -> None: ...
 
     def abort_request(self, req_id: str) -> None: ...
@@ -92,6 +94,20 @@ class MockRdmaPort:
 
     def push_done(self, req_id: str) -> None:
         self._finished_sending.add(req_id)
+
+    def write_stats(self, req_id: str) -> dict[str, Any]:
+        bytes_total = sum(
+            block_slices_bytes(blocks)
+            for _, blocks in self.pushed_layers.get(req_id, [])
+        )
+        return {
+            "submitted": len(self.pushed_layers.get(req_id, [])),
+            "completed": len(self.pushed_layers.get(req_id, [])),
+            "errors": 0,
+            "bytes": bytes_total,
+            "has_submit": bytes_total > 0,
+            "has_complete": bytes_total > 0,
+        }
 
     def fail_request(self, req_id: str) -> None:
         return None
@@ -320,6 +336,9 @@ class RealRdmaPort:
                 req_id,
                 (time.perf_counter() - start) * 1000,
             )
+
+    def write_stats(self, req_id: str) -> dict[str, Any]:
+        return dict(self.engine.write_stats(req_id))
 
     def fail_request(self, req_id: str) -> None:
         start = time.perf_counter()

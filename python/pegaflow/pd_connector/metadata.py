@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+import json
+import zlib
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -115,6 +118,14 @@ class PdHandshake:
     fail_imm_id: int | None = None
     abort_imm_id: int | None = None
     expected_imm_count: int = 1
+    layers_by_idx: dict[int, LayerRemoteLayout] = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "layers_by_idx",
+            {layer.layer_idx: layer for layer in self.layers},
+        )
 
 
 def layer_layout_from_dict(
@@ -175,10 +186,22 @@ def handshake_from_dict(data: dict[str, Any] | None) -> PdHandshake | None:
 def handshakes_from_dicts(data: Any) -> tuple[PdHandshake, ...]:
     if data is None:
         return ()
+    if isinstance(data, str):
+        data = _decode_handshake_payload(data)
     iterable = data.values() if isinstance(data, dict) else data
     handshakes = tuple(handshake_from_dict(item) for item in iterable)
     assert all(handshake is not None for handshake in handshakes)
     return handshakes  # type: ignore[return-value]
+
+
+def encode_handshake_payload(data: Any) -> str:
+    raw = json.dumps(data, separators=(",", ":")).encode()
+    return base64.b64encode(zlib.compress(raw, level=1)).decode("ascii")
+
+
+def _decode_handshake_payload(data: str) -> Any:
+    raw = zlib.decompress(base64.b64decode(data.encode("ascii")))
+    return json.loads(raw)
 
 
 def layer_layout_to_dict(layer: LayerRemoteLayout) -> dict[str, Any]:

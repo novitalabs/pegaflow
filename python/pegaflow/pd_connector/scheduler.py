@@ -270,7 +270,11 @@ class PdPrefillSchedulerConnector:
             self._active_pushes.pop(req_id, None)
             self._reqs_to_release.add(req_id)
             self._release_reasons[req_id] = RELEASE_PRODUCER_FINISHED
-            logger.info("[PdConnector] P scheduler finished sending req=%s", req_id)
+            logger.info(
+                "[PdConnector] P scheduler finished sending req=%s ts_ns=%d",
+                req_id,
+                time.time_ns(),
+            )
 
     def request_finished(
         self,
