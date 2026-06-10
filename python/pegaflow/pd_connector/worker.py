@@ -14,9 +14,9 @@ from pegaflow.logging_utils import get_connector_logger
 from pegaflow.pd_connector.decode_worker import DecodeHandler
 from pegaflow.pd_connector.layout import KvCacheLayout, layout_from_tensor
 from pegaflow.pd_connector.metadata import (
-    BlockIds,
     RELEASE_CONSUMER_ABORT,
     RELEASE_PRODUCER_PREEMPTED,
+    BlockIds,
     LayerRemoteLayout,
     PdConnectorMetadata,
     PdWorkerMetadata,

@@ -10,12 +10,12 @@ notification from P.
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,14 +23,18 @@ from types import TracebackType
 from typing import Any, Protocol
 from urllib.error import HTTPError
 
-import httpx
-
 from pegaflow.pd_connector.kv_params import ConsumerKvParams
 
 logger = logging.getLogger("pegaflow.pd_proxy")
 
 
 SUPPORTED_PATHS = {"/v1/completions", "/v1/chat/completions"}
+
+
+def _httpx() -> Any:
+    import httpx
+
+    return httpx
 
 
 @dataclass(frozen=True)
@@ -253,9 +257,9 @@ def build_pd_proxy_request(
 class PdProxy:
     def __init__(self, config: ProxyConfig) -> None:
         self.config = config
-        self._client: httpx.Client | None = None
+        self._client: Any | None = None
         self._client_lock = threading.Lock()
-        self._stream_client: httpx.Client | None = None
+        self._stream_client: Any | None = None
         self._stream_client_lock = threading.Lock()
 
     def handle_openai_request(self, path: str, body: dict[str, Any]) -> tuple[int, bytes, str]:
@@ -369,7 +373,9 @@ class PdProxy:
         decode_urls = self._decode_warmup_urls()
         warmup_timeout_s = min(self.config.timeout_s, 2.0)
 
-        def warmup_one(client: httpx.Client, health_url: str) -> None:
+        httpx = _httpx()
+
+        def warmup_one(client: Any, health_url: str) -> None:
             try:
                 response = client.get(health_url, timeout=warmup_timeout_s)
             except httpx.RequestError:
@@ -402,18 +408,20 @@ class PdProxy:
             return tuple(endpoint.url for endpoint in router._decode_endpoints)
         return (self.config.decode_url,)
 
-    def _get_client(self) -> httpx.Client:
+    def _get_client(self) -> Any:
         with self._client_lock:
             if self._client is None:
+                httpx = _httpx()
                 self._client = httpx.Client(
                     timeout=self.config.timeout_s,
                     limits=httpx.Limits(max_connections=None, max_keepalive_connections=None),
                 )
             return self._client
 
-    def _get_stream_client(self) -> httpx.Client:
+    def _get_stream_client(self) -> Any:
         with self._stream_client_lock:
             if self._stream_client is None:
+                httpx = _httpx()
                 self._stream_client = httpx.Client(
                     timeout=self.config.timeout_s,
                     limits=httpx.Limits(max_connections=None, max_keepalive_connections=None),
@@ -428,7 +436,7 @@ def _post_json(
     request_id: str,
     role: str,
     *,
-    client: httpx.Client | None = None,
+    client: Any | None = None,
 ) -> tuple[int, bytes, str]:
     payload = json.dumps(body, separators=(",", ":")).encode()
     logger.info(
@@ -440,6 +448,7 @@ def _post_json(
         body.get("kv_transfer_params"),
     )
     owns_client = client is None
+    httpx = _httpx()
     try:
         if client is None:
             client = httpx.Client(
@@ -485,7 +494,7 @@ def _open_json(
     request_id: str,
     role: str,
     *,
-    client: httpx.Client | None = None,
+    client: Any | None = None,
 ):
     payload = json.dumps(body, separators=(",", ":")).encode()
     logger.info(
@@ -498,6 +507,7 @@ def _open_json(
     )
     stream_cm: Any | None = None
     owns_client = client is None
+    httpx = _httpx()
     try:
         if client is None:
             client = httpx.Client(
@@ -533,9 +543,9 @@ def _open_json(
 
 @dataclass
 class _OpenHttpxStream:
-    client: httpx.Client
+    client: Any
     stream_cm: Any
-    response: httpx.Response
+    response: Any
     owns_client: bool = True
 
     @property
@@ -543,13 +553,13 @@ class _OpenHttpxStream:
         return self.response.status_code
 
     @property
-    def headers(self) -> httpx.Headers:
+    def headers(self) -> Any:
         return self.response.headers
 
     def iter_bytes(self) -> Any:
         yield from self.response.iter_bytes()
 
-    def __enter__(self) -> "_OpenHttpxStream":
+    def __enter__(self) -> _OpenHttpxStream:
         return self
 
     def __exit__(

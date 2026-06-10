@@ -46,9 +46,9 @@ from pegaflow.pd_connector.metadata import (  # noqa: E402
     WaitReqMeta,
     encode_handshake_payload,
     handshake_from_dict,
-    handshakes_from_dicts,
     handshake_to_compact_dict,
     handshake_to_dict,
+    handshakes_from_dicts,
 )
 from pegaflow.pd_connector.prefill import (  # noqa: E402
     AsyncPrefillSender,

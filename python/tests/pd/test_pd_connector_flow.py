@@ -187,6 +187,7 @@ def test_pd_proxy_counts_non_stream_decode_http_errors(monkeypatch) -> None:
         return HTTPStatus.BAD_GATEWAY, b'{"error":"decode failed"}', "application/json"
 
     monkeypatch.setattr(proxy_mod, "_post_json", fake_post_json)
+    monkeypatch.setattr(proxy_mod.PdProxy, "_get_client", lambda self: object())
     config = ProxyConfig(
         prefill_url="http://p0:8000",
         decode_url="http://d0:8000",
@@ -227,7 +228,15 @@ def test_pd_proxy_reuses_non_stream_http_client(monkeypatch) -> None:
         def close(self) -> None:
             type(self).closed += 1
 
-    monkeypatch.setattr(proxy_mod.httpx, "Client", FakeClient)
+    monkeypatch.setattr(
+        proxy_mod,
+        "_httpx",
+        lambda: SimpleNamespace(
+            Client=FakeClient,
+            Limits=lambda **kwargs: kwargs,
+            RequestError=Exception,
+        ),
+    )
     config = ProxyConfig(
         prefill_url="http://p0:8000",
         decode_url="http://d0:8000",
@@ -282,7 +291,15 @@ def test_pd_proxy_warms_decode_connections_with_non_stream_client(monkeypatch) -
         def close(self) -> None:
             return None
 
-    monkeypatch.setattr(proxy_mod.httpx, "Client", FakeClient)
+    monkeypatch.setattr(
+        proxy_mod,
+        "_httpx",
+        lambda: SimpleNamespace(
+            Client=FakeClient,
+            Limits=lambda **kwargs: kwargs,
+            RequestError=Exception,
+        ),
+    )
     config = ProxyConfig(
         prefill_url="http://p0:8000",
         decode_url="http://d0:8000/",
@@ -325,7 +342,15 @@ def test_pd_proxy_warms_decode_connections_with_stream_client(monkeypatch) -> No
         def close(self) -> None:
             return None
 
-    monkeypatch.setattr(proxy_mod.httpx, "Client", FakeClient)
+    monkeypatch.setattr(
+        proxy_mod,
+        "_httpx",
+        lambda: SimpleNamespace(
+            Client=FakeClient,
+            Limits=lambda **kwargs: kwargs,
+            RequestError=Exception,
+        ),
+    )
     config = ProxyConfig(
         prefill_url="http://p0:8000",
         decode_url="http://d0:8000",
@@ -397,7 +422,15 @@ def test_pd_proxy_reuses_stream_http_client(monkeypatch) -> None:
         def close(self) -> None:
             type(self).closed += 1
 
-    monkeypatch.setattr(proxy_mod.httpx, "Client", FakeClient)
+    monkeypatch.setattr(
+        proxy_mod,
+        "_httpx",
+        lambda: SimpleNamespace(
+            Client=FakeClient,
+            Limits=lambda **kwargs: kwargs,
+            RequestError=Exception,
+        ),
+    )
     config = ProxyConfig(
         prefill_url="http://p0:8000",
         decode_url="http://d0:8000",

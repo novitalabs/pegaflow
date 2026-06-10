@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from pegaflow.logging_utils import get_connector_logger
 from pegaflow.pd_connector.chunk_tracker import ChunkTracker
+from pegaflow.pd_connector.config import extra_config_value
 from pegaflow.pd_connector.layout import (
     BlockRegionSlice,
     FlashAttnHndLayout,
@@ -34,7 +35,6 @@ from pegaflow.pd_connector.metadata import (
     flatten_block_ids,
 )
 from pegaflow.pd_connector.rdma import RdmaPort
-from pegaflow.pd_connector.config import extra_config_value
 
 if TYPE_CHECKING:
     from pegaflow.pd_connector.worker import PdWorkerBase

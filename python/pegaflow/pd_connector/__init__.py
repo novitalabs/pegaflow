@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
@@ -24,9 +24,6 @@ from pegaflow.pd_connector.worker import (
     PdDecodeWorkerConnector,
     PdPrefillWorkerConnector,
 )
-
-if TYPE_CHECKING:
-    import torch
 
 
 class PdDecodeConnector(PdConnectorClassMixin, KVConnectorBase_V1, SupportsHMA):
