@@ -325,104 +325,39 @@ async fn fetch_blocks_via_push(
         return Ok((Vec::new(), timing));
     }
 
-    // Materialize per-block SealedBlocks from the run table. The ~600k
-    // Segment constructions each clone the owning slab's
-    // Arc<PinnedAllocation>, so workers are partitioned by NUMA: every slab
-    // refcount is touched by exactly one thread (cross-thread contention on
-    // those two cache lines costs more than the construction itself).
-    // Workers build per-slot columns; a transpose of moves assembles blocks.
-    let sealed_blocks: Vec<Arc<SealedBlock>> = {
-        let runs = &runs;
-        let mut slots_by_numa: HashMap<u32, Vec<usize>> = HashMap::new();
-        for (slot_idx, slot) in template.iter().enumerate() {
-            slots_by_numa
-                .entry(slot.numa_node)
-                .or_default()
-                .push(slot_idx);
-        }
-        let build_column = move |slot_idx: usize| -> (usize, Vec<Arc<RawBlock>>) {
-            let (k, v) = &runs[slot_idx];
-            let column = (0..hashes.len())
-                .map(|block_idx| {
-                    let seg = |r: &RunDesc| r.segment(block_idx);
-                    Arc::new(match (k, v) {
-                        (Some(k), Some(v)) => RawBlock::two_segments(seg(k), seg(v)),
-                        (Some(s), None) | (None, Some(s)) => RawBlock::single_segment(seg(s)),
-                        (None, None) => unreachable!("rejected above"),
-                    })
-                })
-                .collect();
-            (slot_idx, column)
-        };
-        let mut columns: Vec<Option<Vec<Arc<RawBlock>>>> = Vec::new();
-        columns.resize_with(template.len(), || None);
-        std::thread::scope(|scope| {
-            // Two workers per NUMA group: 2-way refcount contention is mild
-            // and halves the wall time of the column build.
-            let workers: Vec<_> = slots_by_numa
-                .values()
-                .flat_map(|slot_indices| {
-                    let mid = slot_indices.len().div_ceil(2);
-                    let (a, b) = slot_indices.split_at(mid);
-                    [a, b]
-                })
-                .filter(|part| !part.is_empty())
-                .map(|slot_indices| {
-                    scope.spawn(move || {
-                        slot_indices
-                            .iter()
-                            .map(|&s| build_column(s))
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect();
-            for worker in workers {
-                for (slot_idx, column) in worker.join().expect("column build worker panicked") {
-                    columns[slot_idx] = Some(column);
-                }
-            }
-        });
-        // Transpose with moves. Footprint and per-slot NUMA placement are
-        // template-derived, so sealing dereferences no slot Arcs — and the
-        // populated slot_numas keep fetched blocks re-servable to a third
-        // node (the requester mirrors the holder's NUMA placement).
-        let footprint: u64 = template
-            .iter()
-            .map(|s| s.k_size.saturating_add(s.v_size))
-            .sum();
-        let slot_numas: Vec<NumaNode> = template.iter().map(|s| NumaNode(s.numa_node)).collect();
-        let mut column_iters: Vec<_> = columns
-            .into_iter()
-            .map(|c| c.expect("every slot has a column").into_iter())
-            .collect();
-        (0..hashes.len())
-            .map(|_| {
-                let slots: Vec<Arc<RawBlock>> = column_iters
-                    .iter_mut()
-                    .map(|it| it.next().expect("column length == block count"))
-                    .collect();
-                Arc::new(SealedBlock::from_slots_with_footprint(
-                    slots.into_boxed_slice(),
-                    footprint,
-                    slot_numas.clone(),
-                ))
-            })
-            .collect()
-    };
-    let build = build_start.elapsed();
-    debug!(
-        "RDMA fetch build phases: slab_alloc_ms={:.2} total_ms={:.2}",
-        slab_alloc_elapsed.as_secs_f64() * 1000.0,
-        build.as_secs_f64() * 1000.0,
-    );
-
+    // Fire the push RPC and materialize SealedBlocks concurrently: the
+    // destinations were fixed by the run table above, so sealing depends
+    // only on local metadata, never on the RPC result. The holder's RDMA
+    // WRITE time hides the entire build.
     let push_start = Instant::now();
     let request = PushBlocksRequest {
         transfer_session_id,
         memory_regions: mr_table,
         slabs: push_slabs,
     };
-    let push_result = tokio::time::timeout(PUSH_TIMEOUT, client.push_blocks(request)).await;
+    let block_count = hashes.len();
+    let template_owned = template.to_vec();
+    let build_handle = tokio::task::spawn_blocking(move || {
+        build_sealed_blocks(&template_owned, &runs, block_count)
+    });
+    let (push_result, build_result) = tokio::join!(
+        tokio::time::timeout(PUSH_TIMEOUT, client.push_blocks(request)),
+        build_handle,
+    );
+    let (sealed_blocks, build) = match build_result {
+        Ok(r) => r,
+        Err(e) => {
+            // The build never touches slab memory, but the push outcome is
+            // unknown here — leak the slabs to stay safe.
+            leak_allocations(numa_slabs, Vec::new());
+            return Err(format!("sealed block build panicked: {e}"));
+        }
+    };
+    debug!(
+        "RDMA fetch build phases: slab_alloc_ms={:.2} sealing_ms={:.2} (overlapped with push)",
+        slab_alloc_elapsed.as_secs_f64() * 1000.0,
+        build.as_secs_f64() * 1000.0,
+    );
     let response = match push_result {
         Ok(Ok(response)) => response.into_inner(),
         Ok(Err(status)) => {
@@ -466,6 +401,96 @@ async fn fetch_blocks_via_push(
         numa_slab_count,
     };
     Ok((result, timing))
+}
+
+/// Materialize per-block SealedBlocks from the run table. The ~600k
+/// Segment constructions each clone the owning slab's
+/// Arc<PinnedAllocation>, so workers are partitioned by NUMA: every slab
+/// refcount is touched by at most two threads (cross-thread contention on
+/// those two cache lines costs more than the construction itself).
+/// Workers build per-slot columns; a transpose of moves assembles blocks.
+fn build_sealed_blocks(
+    template: &[TransferSlotInfo],
+    runs: &[(Option<RunDesc>, Option<RunDesc>)],
+    block_count: usize,
+) -> (Vec<Arc<SealedBlock>>, Duration) {
+    let start = Instant::now();
+    let mut slots_by_numa: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (slot_idx, slot) in template.iter().enumerate() {
+        slots_by_numa
+            .entry(slot.numa_node)
+            .or_default()
+            .push(slot_idx);
+    }
+    let build_column = move |slot_idx: usize| -> (usize, Vec<Arc<RawBlock>>) {
+        let (k, v) = &runs[slot_idx];
+        let column = (0..block_count)
+            .map(|block_idx| {
+                let seg = |r: &RunDesc| r.segment(block_idx);
+                Arc::new(match (k, v) {
+                    (Some(k), Some(v)) => RawBlock::two_segments(seg(k), seg(v)),
+                    (Some(s), None) | (None, Some(s)) => RawBlock::single_segment(seg(s)),
+                    (None, None) => unreachable!("rejected above"),
+                })
+            })
+            .collect();
+        (slot_idx, column)
+    };
+    let mut columns: Vec<Option<Vec<Arc<RawBlock>>>> = Vec::new();
+    columns.resize_with(template.len(), || None);
+    std::thread::scope(|scope| {
+        // Two workers per NUMA group: 2-way refcount contention is mild
+        // and halves the wall time of the column build.
+        let workers: Vec<_> = slots_by_numa
+            .values()
+            .flat_map(|slot_indices| {
+                let mid = slot_indices.len().div_ceil(2);
+                let (a, b) = slot_indices.split_at(mid);
+                [a, b]
+            })
+            .filter(|part| !part.is_empty())
+            .map(|slot_indices| {
+                scope.spawn(move || {
+                    slot_indices
+                        .iter()
+                        .map(|&s| build_column(s))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        for worker in workers {
+            for (slot_idx, column) in worker.join().expect("column build worker panicked") {
+                columns[slot_idx] = Some(column);
+            }
+        }
+    });
+    // Transpose with moves. Footprint and per-slot NUMA placement are
+    // template-derived, so sealing dereferences no slot Arcs — and the
+    // populated slot_numas keep fetched blocks re-servable to a third
+    // node (the requester mirrors the holder's NUMA placement).
+    let footprint: u64 = template
+        .iter()
+        .map(|s| s.k_size.saturating_add(s.v_size))
+        .sum();
+    let slot_numas: Vec<NumaNode> = template.iter().map(|s| NumaNode(s.numa_node)).collect();
+    let mut column_iters: Vec<_> = columns
+        .into_iter()
+        .map(|c| c.expect("every slot has a column").into_iter())
+        .collect();
+    let sealed = (0..block_count)
+        .map(|_| {
+            let slots: Vec<Arc<RawBlock>> = column_iters
+                .iter_mut()
+                .map(|it| it.next().expect("column length == block count"))
+                .collect();
+            Arc::new(SealedBlock::from_slots_with_footprint(
+                slots.into_boxed_slice(),
+                footprint,
+                slot_numas.clone(),
+            ))
+        })
+        .collect();
+    (sealed, start.elapsed())
 }
 
 /// Leak the fetch's pinned allocations after a failed push.
