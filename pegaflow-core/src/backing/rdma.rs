@@ -275,12 +275,15 @@ impl RdmaTransport {
             let targets: Vec<ScatterTarget> = targets.into_iter().map(|(_, t)| t).collect();
             let region = &self.regions[region_idx];
             let engine = &self.engines[region.engine_idx].engine;
+            // Coalesced targets are ~MB-sized runs, one per (slot, K/V); whole
+            // targets round-robined across NICs beat byte-sharding each one
+            // into N sub-MTU-pipeline writes.
             engine.submit_transfer_async(TransferRequest::Scatter(ScatterTransferRequest {
                 src_mr: region.handle,
                 dst_handle: None,
                 dsts: Arc::new(targets),
                 imm_data: None,
-                domain: GroupTransferRouting::AllDomainsShardBytes,
+                domain: GroupTransferRouting::AllDomainsShardPeers,
             }))
         });
         futures::future::try_join_all(transfers)

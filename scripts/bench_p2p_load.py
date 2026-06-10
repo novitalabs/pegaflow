@@ -203,7 +203,6 @@ class PegaServer(ManagedProcess):
             "kernel",
             "--log-level",
             "info",
-            "--disable-numa-affinity",
             "--enable-prometheus",
             "--metaserver-addr",
             f"http://{advertise_host}:{metaserver.grpc_port}",
