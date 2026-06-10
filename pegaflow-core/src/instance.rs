@@ -607,10 +607,20 @@ impl InstanceContext {
     }
 
     /// Verify every declared logical layer has a registered slot for every TP rank.
+    ///
+    /// A slot may have several owners: MLA models replicate KV across TP ranks,
+    /// so the connector collapses them to one effective tp_rank and every worker
+    /// registers the same slot range from its own device (rank 0 saves, each
+    /// device loads into its own copy). Same slot implies same layer and
+    /// tp_rank — `layer_id * tp_size + tp_rank` decomposes uniquely because
+    /// tp_rank < tp_size — so replica owners can only disagree on pp_rank,
+    /// which would mean two pipeline stages claimed the same layer and is
+    /// rejected.
     pub(crate) fn ensure_all_slots_registered(&self) -> Result<(), EngineError> {
         let metadata = self.metadata.lock();
         let total_slots = self.total_slots();
-        let mut owners: Vec<Option<String>> = vec![None; total_slots];
+        // Per slot: (device_id, pp_rank) of the first registered owner.
+        let mut owners: Vec<Option<(i32, usize)>> = vec![None; total_slots];
 
         for gpu in metadata.gpu_contexts.values() {
             if gpu.tp_rank() >= self.tp_size {
@@ -635,17 +645,20 @@ impl InstanceContext {
                         "slot_id {slot_id} out of range (total_slots {total_slots})"
                     )));
                 }
-                let owner = format!(
-                    "device={} pp_rank={} tp_rank={} layer={}",
-                    gpu.device_id(),
-                    gpu.pp_rank(),
-                    gpu.tp_rank(),
-                    layer_name
-                );
-                if let Some(existing_owner) = owners[slot_id].replace(owner.clone()) {
-                    return Err(EngineError::InvalidArgument(format!(
-                        "slot {slot_id} registered twice: {existing_owner}; {owner}"
-                    )));
+                match owners[slot_id] {
+                    None => owners[slot_id] = Some((gpu.device_id(), gpu.pp_rank())),
+                    Some((existing_device, existing_pp_rank)) => {
+                        if existing_pp_rank != gpu.pp_rank() {
+                            return Err(EngineError::InvalidArgument(format!(
+                                "slot {slot_id} claimed by different pipeline stages: \
+                                 device={existing_device} pp_rank={existing_pp_rank}; \
+                                 device={} pp_rank={} tp_rank={} layer={layer_name}",
+                                gpu.device_id(),
+                                gpu.pp_rank(),
+                                gpu.tp_rank(),
+                            )));
+                        }
+                    }
                 }
             }
         }

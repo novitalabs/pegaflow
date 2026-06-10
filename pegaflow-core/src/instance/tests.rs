@@ -266,6 +266,119 @@ fn ensure_all_slots_registered_detects_missing_slot() {
     assert!(err.to_string().contains("incomplete KV registration"));
 }
 
+/// True when the host exposes at least `n` CUDA devices. Replica-registration
+/// contract tests need one real CUDA context per device; on smaller boxes they
+/// skip instead of failing.
+fn has_cuda_devices(n: usize) -> bool {
+    (0..n).all(|device_id| CudaContext::new(device_id).is_ok())
+}
+
+/// GLM-5.1-FP8 scaled to 2 model layers x 2 caches (main MLA attention + DSA
+/// sparse indexer); the layer at the last in-model index stands in for the MTP
+/// next-n predictor, whose ids sit at the top of the space.
+const MLA_DSA_LAYERS: &[(&str, usize)] = &[
+    ("model.layers.0.self_attn.attn", 0),
+    ("model.layers.0.self_attn.indexer.k_cache", 1),
+    ("model.layers.1.self_attn.attn", 2),
+    ("model.layers.1.self_attn.indexer.k_cache", 3),
+];
+
+/// Registration contract for MLA replicas: KV is identical across TP ranks, so
+/// the connector collapses them to effective tp_rank 0 and every worker
+/// registers the full slot range from its own device (rank 0 saves, each
+/// device loads into its own copy). Multiple owners per slot are valid.
+#[test]
+fn mla_replica_registration_is_accepted() {
+    if !has_cuda_devices(2) {
+        eprintln!("skipping mla_replica_registration_is_accepted: needs >= 2 CUDA devices");
+        return;
+    }
+
+    let instance = InstanceContext::new("mla-replica".into(), "mla-ns".into(), 4, 1, 2).unwrap();
+    instance
+        .register_new_gpu(gpu_registration(0, 0, MLA_DSA_LAYERS))
+        .expect("register replica on device 0");
+    instance
+        .register_new_gpu(gpu_registration(1, 0, MLA_DSA_LAYERS))
+        .expect("register replica on device 1");
+
+    instance
+        .ensure_all_slots_registered()
+        .expect("replica owners on the same slots are a valid MLA topology");
+}
+
+/// Replicas may only share a slot within one pipeline stage: the same layer
+/// claimed from two pp_ranks is a topology error, not replication.
+#[test]
+fn rejects_replicas_across_pipeline_stages() {
+    if !has_cuda_devices(2) {
+        eprintln!("skipping rejects_replicas_across_pipeline_stages: needs >= 2 CUDA devices");
+        return;
+    }
+
+    let instance = InstanceContext::new("pp-conflict".into(), "pp-ns".into(), 1, 1, 2).unwrap();
+    let layers = &[("model.layers.0.self_attn.attn", 0)];
+    instance
+        .register_new_gpu(gpu_registration(0, 0, layers))
+        .expect("register pp_rank 0 owner");
+    instance
+        .register_new_gpu(GpuRegistration {
+            pp_rank: 1,
+            ..gpu_registration(1, 0, layers)
+        })
+        .expect("name/id mapping is consistent, registration itself succeeds");
+
+    let err = instance
+        .ensure_all_slots_registered()
+        .expect_err("one layer on two pipeline stages must be rejected");
+    assert!(err.to_string().contains("different pipeline stages"));
+}
+
+/// PP x MLA: pipeline stages partition the id space and each stage holds its
+/// own replica group. Completeness requires every stage registered.
+#[test]
+fn pp_stages_partition_slots_with_replicas_per_stage() {
+    if !has_cuda_devices(4) {
+        eprintln!(
+            "skipping pp_stages_partition_slots_with_replicas_per_stage: needs >= 4 CUDA devices"
+        );
+        return;
+    }
+
+    let stage0 = &MLA_DSA_LAYERS[..2];
+    let stage1 = &MLA_DSA_LAYERS[2..];
+    let instance = InstanceContext::new("pp-mla".into(), "pp-mla-ns".into(), 4, 1, 4).unwrap();
+
+    instance
+        .register_new_gpu(gpu_registration(0, 0, stage0))
+        .expect("stage 0 replica on device 0");
+    instance
+        .register_new_gpu(gpu_registration(1, 0, stage0))
+        .expect("stage 0 replica on device 1");
+
+    let err = instance
+        .ensure_all_slots_registered()
+        .expect_err("stage 1 slots are still unregistered");
+    assert!(err.to_string().contains("incomplete KV registration"));
+
+    instance
+        .register_new_gpu(GpuRegistration {
+            pp_rank: 1,
+            ..gpu_registration(2, 0, stage1)
+        })
+        .expect("stage 1 replica on device 2");
+    instance
+        .register_new_gpu(GpuRegistration {
+            pp_rank: 1,
+            ..gpu_registration(3, 0, stage1)
+        })
+        .expect("stage 1 replica on device 3");
+
+    instance
+        .ensure_all_slots_registered()
+        .expect("both stages covered, replicas within each stage");
+}
+
 #[test]
 fn save_numa_hint_validation_rejects_unknown_or_unregistered_nodes() {
     let instance =
