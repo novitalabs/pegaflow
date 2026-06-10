@@ -185,7 +185,17 @@ impl RdmaTransport {
         let mut groups: HashMap<usize, Vec<ScatterTarget>> = HashMap::new();
         let mut total_bytes = 0u64;
         let raw_segments = segments.len();
+        // Adjacency diagnostics: how many consecutive segment pairs are
+        // contiguous on each side. Coalescing needs both.
+        let mut src_adjacent = 0usize;
+        let mut dst_adjacent = 0usize;
+        let mut prev_ends: Option<(u64, u64)> = None;
         for seg in segments {
+            if let Some((src_end, dst_end)) = prev_ends {
+                src_adjacent += usize::from(src_end == seg.src_addr);
+                dst_adjacent += usize::from(dst_end == seg.dst_addr);
+            }
+            prev_ends = Some((seg.src_addr + seg.len, seg.dst_addr + seg.len));
             let region_idx = self
                 .regions
                 .iter()
@@ -233,7 +243,7 @@ impl RdmaTransport {
 
         let coalesced: usize = groups.values().map(Vec::len).sum();
         info!(
-            "RDMA push: segments={raw_segments} coalesced={coalesced} bytes={total_bytes} groups={}",
+            "RDMA push: segments={raw_segments} coalesced={coalesced} bytes={total_bytes} groups={} src_adjacent={src_adjacent} dst_adjacent={dst_adjacent}",
             groups.len()
         );
 
