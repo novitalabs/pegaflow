@@ -297,46 +297,73 @@ async fn fetch_blocks_via_push(
     // holder source-contiguous runs it can coalesce into single WRITEs.
     // The holder replays this exact order to derive the addresses.
     //
-    // Blocks are assembled into RawBlocks here; only the SealedBlock wrap
-    // waits until the push has filled the memory.
-    let mut block_slots: Vec<Vec<Arc<RawBlock>>> = (0..hashes.len())
-        .map(|_| Vec::with_capacity(template.len()))
-        .collect();
+    // One slab allocation covers a whole (slot, K/V) run — the per-segment
+    // addresses inside it are `base + block_idx * len`, exactly the
+    // per-segment bump the holder replays.
+    let mut runs: Vec<(Option<RunDesc>, Option<RunDesc>)> = Vec::with_capacity(template.len());
     for slot in template {
         let numa = NumaNode(slot.numa_node);
-        let k_segs = stage_slot_run(&mut numa_slabs, numa, slot.k_size, hashes.len(), "K")?;
-        let v_segs = stage_slot_run(&mut numa_slabs, numa, slot.v_size, hashes.len(), "V")?;
-        match (k_segs, v_segs) {
-            (Some(ks), Some(vs)) => {
-                segment_count += ks.len() + vs.len();
-                for ((slots, k), v) in block_slots.iter_mut().zip(ks).zip(vs) {
-                    slots.push(Arc::new(RawBlock::two_segments(k, v)));
-                }
-            }
-            (Some(segs), None) | (None, Some(segs)) => {
-                segment_count += segs.len();
-                for (slots, seg) in block_slots.iter_mut().zip(segs) {
-                    slots.push(Arc::new(RawBlock::single_segment(seg)));
-                }
-            }
-            (None, None) => {
-                return Err(format!(
-                    "slot template entry has zero-size K and V on {numa}"
-                ));
-            }
+        let k = alloc_run(&mut numa_slabs, numa, slot.k_size, hashes.len(), "K")?;
+        let v = alloc_run(&mut numa_slabs, numa, slot.v_size, hashes.len(), "V")?;
+        if k.is_none() && v.is_none() {
+            return Err(format!(
+                "slot template entry has zero-size K and V on {numa}"
+            ));
         }
+        segment_count += (k.is_some() as usize + v.is_some() as usize) * hashes.len();
+        runs.push((k, v));
     }
-    let build = build_start.elapsed();
 
     if segment_count == 0 {
         let timing = FetchTiming {
-            build,
+            build: build_start.elapsed(),
             slot_count,
             numa_slab_count,
             ..FetchTiming::default()
         };
         return Ok((Vec::new(), timing));
     }
+
+    // Materialize per-block SealedBlocks from the run table, blocks fanned
+    // out across threads (~600k Segment/Arc constructions otherwise dominate
+    // the fetch's CPU time). Only the cache insert waits for the push.
+    let sealed_blocks: Vec<Arc<SealedBlock>> = {
+        let runs = &runs;
+        let build_block = move |block_idx: usize| -> Arc<SealedBlock> {
+            let slots: Vec<Arc<RawBlock>> = runs
+                .iter()
+                .map(|(k, v)| {
+                    let seg = |r: &RunDesc| r.segment(block_idx);
+                    Arc::new(match (k, v) {
+                        (Some(k), Some(v)) => RawBlock::two_segments(seg(k), seg(v)),
+                        (Some(s), None) | (None, Some(s)) => RawBlock::single_segment(seg(s)),
+                        (None, None) => unreachable!("rejected above"),
+                    })
+                })
+                .collect();
+            Arc::new(SealedBlock::from_slots(slots))
+        };
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, 8)
+            .min(hashes.len());
+        let chunk = hashes.len().div_ceil(threads);
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..threads)
+                .map(|t| {
+                    let lo = t * chunk;
+                    let hi = ((t + 1) * chunk).min(hashes.len());
+                    scope.spawn(move || (lo..hi).map(build_block).collect::<Vec<_>>())
+                })
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|w| w.join().expect("block build worker panicked"))
+                .collect()
+        })
+    };
+    let build = build_start.elapsed();
 
     let push_start = Instant::now();
     let request = PushBlocksRequest {
@@ -355,31 +382,28 @@ async fn fetch_blocks_via_push(
             if status.code() == tonic::Code::FailedPrecondition {
                 return Err(format!("PushBlocks rejected by holder: {status}"));
             }
-            leak_allocations(numa_slabs, block_slots);
+            leak_allocations(numa_slabs, sealed_blocks);
             return Err(format!("PushBlocks RPC failed: {status}"));
         }
         Err(_) => {
-            leak_allocations(numa_slabs, block_slots);
+            leak_allocations(numa_slabs, sealed_blocks);
             return Err(format!("PushBlocks timed out after {PUSH_TIMEOUT:?}"));
         }
     };
     if let Some(st) = &response.status
         && !st.ok
     {
-        leak_allocations(numa_slabs, block_slots);
+        leak_allocations(numa_slabs, sealed_blocks);
         return Err(format!("PushBlocks rejected by holder: {}", st.message));
     }
     let push = push_start.elapsed();
 
-    // The memory is filled; wrap the prebuilt slots into SealedBlocks.
+    // The memory is filled; key the prebuilt SealedBlocks for cache insert.
     let rebuild_start = Instant::now();
     let result: PrefetchResult = hashes
         .iter()
-        .zip(block_slots)
-        .map(|(hash, slots)| {
-            let key = BlockKey::new(namespace.to_string(), hash.clone());
-            (key, Arc::new(SealedBlock::from_slots(slots)))
-        })
+        .zip(sealed_blocks)
+        .map(|(hash, sealed)| (BlockKey::new(namespace.to_string(), hash.clone()), sealed))
         .collect();
 
     let timing = FetchTiming {
@@ -403,7 +427,7 @@ async fn fetch_blocks_via_push(
     clippy::mem_forget,
     reason = "leak is the safety mechanism: freed memory could be corrupted by in-flight WRITEs"
 )]
-fn leak_allocations(numa_slabs: HashMap<NumaNode, NumaSlab>, block_slots: Vec<Vec<Arc<RawBlock>>>) {
+fn leak_allocations(numa_slabs: HashMap<NumaNode, NumaSlab>, sealed_blocks: Vec<Arc<SealedBlock>>) {
     let leaked: usize = numa_slabs.values().map(|s| s.capacity).sum();
     log::error!(
         "Leaking {leaked} bytes of pinned memory across {} slab(s): push failed and remote WRITEs may still be in flight",
@@ -413,32 +437,50 @@ fn leak_allocations(numa_slabs: HashMap<NumaNode, NumaSlab>, block_slots: Vec<Ve
         .rdma_fetch_leaked_bytes
         .add(leaked as u64, &[]);
     std::mem::forget(numa_slabs);
-    std::mem::forget(block_slots);
+    std::mem::forget(sealed_blocks);
 }
 
-/// Allocate one slot's run of `count` equal-size segments from the slab on
-/// `numa` — the slab cursor is resolved once for the whole run. Returns
-/// `None` for absent segments (`size == 0`).
-fn stage_slot_run(
+/// One (slot, K/V) run of equal-size segments for all blocks, carved from a
+/// NUMA slab in a single bump allocation.
+struct RunDesc {
+    base: u64,
+    len: usize,
+    alloc: Arc<crate::pinned_pool::PinnedAllocation>,
+}
+
+impl RunDesc {
+    fn segment(&self, block_idx: usize) -> Segment {
+        let addr = self.base + (block_idx * self.len) as u64;
+        let ptr = NonNull::new(addr as *mut u8).expect("run segment pointer must be non-null");
+        Segment::new(ptr, self.len, Arc::clone(&self.alloc))
+    }
+}
+
+/// Allocate one slot's run (`count` segments of `size` bytes) from the slab
+/// on `numa`. Returns `None` for absent segments (`size == 0`).
+fn alloc_run(
     slabs: &mut HashMap<NumaNode, NumaSlab>,
     numa: NumaNode,
     size: u64,
     count: usize,
     kind: &str,
-) -> Result<Option<Vec<Segment>>, String> {
+) -> Result<Option<RunDesc>, String> {
     if size == 0 {
         return Ok(None);
     }
     let len = usize::try_from(size).map_err(|_| format!("{kind} size exceeds usize: {size}"))?;
+    let total = len
+        .checked_mul(count)
+        .ok_or_else(|| format!("{kind} run size overflows: {len} x {count}"))?;
     let slab = slabs
         .get_mut(&numa)
         .ok_or_else(|| format!("missing slab for {numa} while allocating {kind}"))?;
-    let mut segs = Vec::with_capacity(count);
-    for _ in 0..count {
-        let (ptr, alloc) = slab.allocate(len, kind)?;
-        segs.push(Segment::new(ptr, len, alloc));
-    }
-    Ok(Some(segs))
+    let (ptr, alloc) = slab.allocate(total, kind)?;
+    Ok(Some(RunDesc {
+        base: ptr.as_ptr() as u64,
+        len,
+        alloc,
+    }))
 }
 
 fn sum_segment_bytes_by_numa(

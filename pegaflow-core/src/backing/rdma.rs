@@ -55,6 +55,7 @@ impl RegisteredRegion {
 /// requester-side destination (index into the request's MR table + absolute
 /// address). Indexing instead of embedding the descriptor keeps the build
 /// loop free of per-segment rkey-list clones.
+#[derive(Clone, Copy)]
 pub(crate) struct PushSegment {
     pub(crate) src_addr: u64,
     pub(crate) len: u64,

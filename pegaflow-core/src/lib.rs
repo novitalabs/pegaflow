@@ -933,6 +933,17 @@ impl PegaEngine {
                 let slab = slabs.get_mut(&numa).ok_or_else(|| {
                     PushBlocksError::Rejected(format!("no requester slab for NUMA node {numa}"))
                 })?;
+                // Within one (slot, K/V) run the destination is a single bump
+                // region, so source-contiguous segments of consecutive blocks
+                // merge into one WRITE-sized segment. Layer allocations keep
+                // consecutive blocks adjacent, so a run typically collapses
+                // to one segment per (slot, K/V).
+                let mut run = PushSegment {
+                    src_addr: 0,
+                    len: 0,
+                    dst_mr_index: slab.mr_index,
+                    dst_addr: 0,
+                };
                 for (_key, sealed) in &session_blocks {
                     let raw = &sealed.slots()[slot_idx];
                     let (Some(ptr), Some(size)) =
@@ -950,13 +961,21 @@ impl PegaEngine {
                             slab.next, slab.end
                         )));
                     }
-                    segments.push(PushSegment {
-                        src_addr: ptr.as_ptr() as u64,
-                        len,
-                        dst_mr_index: slab.mr_index,
-                        dst_addr: slab.next,
-                    });
+                    let src = ptr.as_ptr() as u64;
+                    if run.len > 0 && run.src_addr + run.len == src {
+                        run.len += len;
+                    } else {
+                        if run.len > 0 {
+                            segments.push(run);
+                        }
+                        run.src_addr = src;
+                        run.dst_addr = slab.next;
+                        run.len = len;
+                    }
                     slab.next += len;
+                }
+                if run.len > 0 {
+                    segments.push(run);
                 }
             }
         }
