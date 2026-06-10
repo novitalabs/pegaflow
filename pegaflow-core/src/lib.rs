@@ -806,6 +806,7 @@ impl PegaEngine {
     ) -> Result<u64, PushBlocksError> {
         use crate::backing::{PushSegment, mr_desc_from_proto};
 
+        let t0 = std::time::Instant::now();
         let rdma = self.storage.rdma_transport().ok_or_else(|| {
             PushBlocksError::Rejected("RDMA transport not configured".to_string())
         })?;
@@ -854,6 +855,8 @@ impl PegaEngine {
         // layer's K (and V) segments of consecutive blocks are adjacent in
         // the pinned pool, so this order yields source- and
         // destination-contiguous runs that push_segments coalesces.
+        let session_elapsed = t0.elapsed();
+        let build_start = std::time::Instant::now();
         let max_slots = session_blocks
             .iter()
             .map(|(_, sealed)| sealed.slots().len())
@@ -898,7 +901,16 @@ impl PegaEngine {
             }
         }
 
-        rdma.push_segments(&mr_descs, segments).await
+        let build_elapsed = build_start.elapsed();
+        let rdma_start = std::time::Instant::now();
+        let result = rdma.push_segments(&mr_descs, segments).await;
+        info!(
+            "PushBlocks timing: session_ms={:.2} build_ms={:.2} rdma_ms={:.2}",
+            session_elapsed.as_secs_f64() * 1000.0,
+            build_elapsed.as_secs_f64() * 1000.0,
+            rdma_start.elapsed().as_secs_f64() * 1000.0,
+        );
+        result
     }
 
     /// Serve a PushBlocks request.
