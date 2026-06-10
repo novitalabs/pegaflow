@@ -169,6 +169,13 @@ impl RdmaTransport {
     /// bytes written once every WRITE has completed (RC completion implies
     /// remote placement).
     ///
+    /// Adjacent segments whose source and destination are both contiguous are
+    /// coalesced into one WRITE: TP-sliced KV blocks arrive as ~4 KiB
+    /// segments and push throughput is bounded by WR posting rate, not
+    /// bandwidth. The requester assigns destinations from a bump allocator in
+    /// the same iteration order, so coalescing only depends on holder-side
+    /// source adjacency.
+    ///
     /// All segments are validated before anything is submitted, so an error
     /// from the build phase is a clean [`PushBlocksError::Rejected`].
     pub(crate) async fn push_segments(
@@ -177,6 +184,7 @@ impl RdmaTransport {
     ) -> Result<u64, PushBlocksError> {
         let mut groups: HashMap<usize, Vec<ScatterTarget>> = HashMap::new();
         let mut total_bytes = 0u64;
+        let raw_segments = segments.len();
         for seg in segments {
             let region_idx = self
                 .regions
@@ -204,13 +212,30 @@ impl RdmaTransport {
                 ))
             })?;
             total_bytes += seg.len;
-            groups.entry(region_idx).or_default().push(ScatterTarget {
-                dst_mr: seg.dst_mr,
-                length: seg.len,
-                src_offset: seg.src_addr - region.base,
-                dst_offset,
-            });
+            let src_offset = seg.src_addr - region.base;
+            let targets = groups.entry(region_idx).or_default();
+            match targets.last_mut() {
+                Some(last)
+                    if last.dst_mr.ptr == seg.dst_mr.ptr
+                        && last.src_offset + last.length == src_offset
+                        && last.dst_offset + last.length == dst_offset =>
+                {
+                    last.length += seg.len;
+                }
+                _ => targets.push(ScatterTarget {
+                    dst_mr: seg.dst_mr,
+                    length: seg.len,
+                    src_offset,
+                    dst_offset,
+                }),
+            }
         }
+
+        let coalesced: usize = groups.values().map(Vec::len).sum();
+        info!(
+            "RDMA push: segments={raw_segments} coalesced={coalesced} bytes={total_bytes} groups={}",
+            groups.len()
+        );
 
         let transfers = groups.into_iter().map(|(region_idx, targets)| {
             let region = &self.regions[region_idx];
