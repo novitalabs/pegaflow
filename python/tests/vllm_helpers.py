@@ -110,7 +110,11 @@ class VLLMServer:
             "--gpu-memory-utilization",
             str(self.gpu_memory_utilization),
             "--attention-backend",
-            "FLASH_ATTN",
+            # FLASH_ATTN keeps outputs batch-invariant for the baseline/warm
+            # comparison, but it cannot serve MLA models on every GPU
+            # generation (e.g. sm_120 has no FlashMLA); allow overriding with
+            # an MLA-capable backend like TRITON_MLA there.
+            os.environ.get("VLLM_TEST_ATTN_BACKEND", "FLASH_ATTN"),
             "--generation-config",
             "vllm",
             "--tensor-parallel-size",
