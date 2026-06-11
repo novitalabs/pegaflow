@@ -144,8 +144,7 @@ enum MrRegistrationMethod {
 fn mr_registration_method(mapping: &Mapping) -> MrRegistrationMethod {
     match mapping {
         Mapping::Device {
-            dmabuf_fd: Some(_),
-            ..
+            dmabuf_fd: Some(_), ..
         } => MrRegistrationMethod::DmaBuf,
         Mapping::Device {
             dmabuf_fd: None, ..
@@ -1404,6 +1403,9 @@ mod tests {
             dmabuf_fd: None,
         };
 
-        assert_eq!(mr_registration_method(&mapping), MrRegistrationMethod::Legacy);
+        assert_eq!(
+            mr_registration_method(&mapping),
+            MrRegistrationMethod::Legacy
+        );
     }
 }
