@@ -136,7 +136,11 @@ class PegaKVConnector(KVConnectorBase_V1):
             # server-side cleanup of the instance's CUDA IPC mappings.
             engine_client.start_session_watcher(instance_id, namespace, tp_size, world_size)
         else:
-            self._worker = WorkerConnector(self._ctx)
+            self._worker = WorkerConnector(
+                self._ctx,
+                vllm_config=vllm_config,
+                kv_cache_config=kv_cache_config,
+            )
 
         logger.debug(
             "[PegaKVConnector] Initialized role=%s instance_id=%s device=%s "

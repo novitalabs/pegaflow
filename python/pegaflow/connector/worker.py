@@ -158,8 +158,18 @@ class WorkerConnector:
     # to prevent production misconfiguration from dropping every in-flight load.
     LOAD_TIMEOUT_SECONDS: int = _LOAD_TIMEOUT_RAW
 
-    def __init__(self, context: ConnectorContext):
+    def __init__(
+        self,
+        context: ConnectorContext,
+        vllm_config=None,
+        kv_cache_config=None,
+    ):
         self._ctx = context
+        self._kv_cache_config = kv_cache_config
+        additional_config = getattr(vllm_config, "additional_config", {}) or {}
+        self._use_mla_layer_split_registration = context.is_mla and bool(
+            additional_config.get("mla_layer_split_kv_cache", False)
+        )
 
         self._save_queue = queue.Queue()
         self._save_thread = threading.Thread(
@@ -225,6 +235,35 @@ class WorkerConnector:
         assert self._ctx.device_id is not None, (
             "CUDA device id is unknown; cannot register KV caches"
         )
+
+        if self._use_mla_layer_split_registration:
+            kv_cache_tensors = getattr(self._kv_cache_config, "kv_cache_tensors", None)
+            if not kv_cache_tensors:
+                raise RuntimeError(
+                    "Layer-split KV cache registration requires "
+                    "kv_cache_config.kv_cache_tensors"
+                )
+
+            layer_names = [
+                layer_name
+                for kv_cache_tensor in kv_cache_tensors
+                for layer_name in (getattr(kv_cache_tensor, "shared_by", None) or ())
+            ]
+            if not layer_names:
+                raise RuntimeError("Layer-split KV cache registration selected no layers")
+
+            missing_layer_names = [
+                layer_name for layer_name in layer_names if layer_name not in kv_caches
+            ]
+            if missing_layer_names:
+                raise RuntimeError(
+                    "Layer-split KV cache registration is missing layers: "
+                    f"{missing_layer_names[:8]}"
+                )
+
+            kv_caches = {layer_name: kv_caches[layer_name] for layer_name in layer_names}
+        if not kv_caches:
+            raise RuntimeError("No KV cache layers were selected for registration")
 
         self._registered_layers = list(kv_caches.keys())
         self._torch_device = next(iter(kv_caches.values())).device
@@ -760,7 +799,12 @@ class WorkerConnector:
             )
 
     def _should_skip_save_submission(self) -> bool:
-        return self._ctx.is_mla and self._ctx.dcp_world_size == 1 and (self._ctx.tp_rank or 0) != 0
+        return (
+            self._ctx.is_mla
+            and not self._use_mla_layer_split_registration
+            and self._ctx.dcp_world_size == 1
+            and (self._ctx.tp_rank or 0) != 0
+        )
 
     def handle_preemptions(self, preempted_req_ids: set[str] | None) -> None:
         """Wait for preempted requests' saves to complete before blocks are reused.

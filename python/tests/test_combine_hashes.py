@@ -113,6 +113,62 @@ def test_effective_tp_cases(case: str, kwargs: dict, expected_rank: int, expecte
     assert ctx.effective_tp_size == expected_size, case
 
 
+@pytest.mark.parametrize(
+    ("case", "kwargs", "additional_config", "expected"),
+    [
+        pytest.param(
+            "ordinary_mla_replica_skips_nonzero_tp_save",
+            {
+                "is_mla": True,
+                "tp_rank": 1,
+                "tp_size": 2,
+            },
+            {},
+            True,
+            id="ordinary_mla_replica",
+        ),
+        pytest.param(
+            "mla_layer_split_registration_does_not_skip_nonzero_tp_save",
+            {
+                "is_mla": True,
+                "tp_rank": 1,
+                "tp_size": 2,
+            },
+            {"mla_layer_split_kv_cache": True},
+            False,
+            id="mla_layer_split_registration",
+        ),
+        pytest.param(
+            "dcp_mla_does_not_skip_save",
+            {
+                "is_mla": True,
+                "tp_rank": 1,
+                "tp_size": 2,
+                "dcp_world_size": 2,
+                "dcp_rank": 1,
+            },
+            {},
+            False,
+            id="dcp_mla",
+        ),
+    ],
+)
+def test_save_skip_keeps_ordinary_mla_optimization(
+    case: str, kwargs: dict, additional_config: dict, expected: bool
+):
+    from pegaflow.connector.worker import WorkerConnector
+
+    ctx = _make_ctx(**kwargs)
+    worker = WorkerConnector(
+        ctx,
+        vllm_config=SimpleNamespace(additional_config=additional_config),
+    )
+    try:
+        assert worker._should_skip_save_submission() is expected, case
+    finally:
+        worker.shutdown()
+
+
 # ---------------------------------------------------------------------------
 # Tests — SchedulerConnector decode hash refresh
 #

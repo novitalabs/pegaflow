@@ -92,24 +92,33 @@ class FakeEngineClient:
 def _make_worker(
     pp_rank: int = 0,
     pp_size: int = 1,
+    kv_cache_config=None,
+    vllm_config=None,
+    **ctx_kwargs,
 ) -> tuple[WorkerConnector, FakeEngineClient, MagicMock]:
     client = FakeEngineClient()
     state_manager = MagicMock()
     state_manager.is_available.return_value = True
-    ctx = ConnectorContext(
-        instance_id="test_instance",
-        namespace="ns",
-        block_size=16,
-        tp_size=1,
-        world_size=1,
-        tp_rank=0,
-        device_id=0,
-        engine_client=client,
-        state_manager=state_manager,
-        pp_rank=pp_rank,
-        pp_size=pp_size,
+    defaults = {
+        "instance_id": "test_instance",
+        "namespace": "ns",
+        "block_size": 16,
+        "tp_size": 1,
+        "world_size": 1,
+        "tp_rank": 0,
+        "device_id": 0,
+        "engine_client": client,
+        "state_manager": state_manager,
+        "pp_rank": pp_rank,
+        "pp_size": pp_size,
+    }
+    defaults.update(ctx_kwargs)
+    ctx = ConnectorContext(**defaults)
+    worker = WorkerConnector(
+        ctx,
+        vllm_config=vllm_config,
+        kv_cache_config=kv_cache_config,
     )
-    worker = WorkerConnector(ctx)
     # cross-layer mode skips forward_context layer enumeration so we can drive
     # start_load_kv with a stub forward_context.
     worker._cross_layer_mode = True
@@ -316,6 +325,86 @@ def test_register_non_version_failure_reports_batch_layers(monkeypatch):
     assert "for layer.1" not in message
     assert len(client.register_calls) == 1
     assert client.register_calls[0][7] == ["layer.0", "layer.1"]
+
+    worker.shutdown()
+
+
+def test_register_kv_caches_ignores_shared_by_without_layer_split_opt_in(monkeypatch):
+    kv_cache_config = MagicMock()
+    kv_cache_config.kv_cache_groups = [
+        MagicMock(layer_names=("layer.0", "layer.1", "layer.2"))
+    ]
+    kv_cache_config.kv_cache_tensors = [
+        MagicMock(shared_by=("layer.1",)),
+    ]
+    worker, client, _ = _make_worker(
+        kv_cache_config=kv_cache_config,
+    )
+
+    monkeypatch.setattr("pegaflow.connector.worker.CudaIPCWrapper", FakeCudaIPCWrapper)
+
+    worker.register_kv_caches(
+        {
+            "layer.0": FakeTensor(),
+            "layer.1": FakeTensor(),
+            "layer.2": FakeTensor(),
+        }
+    )
+
+    assert worker._registered_layers == ["layer.0", "layer.1", "layer.2"]
+    assert len(client.register_calls) == 1
+    assert client.register_calls[0][7] == ["layer.0", "layer.1", "layer.2"]
+
+    worker.shutdown()
+
+
+def test_register_kv_caches_uses_layer_split_shared_by_plan(monkeypatch):
+    kv_cache_config = MagicMock()
+    kv_cache_config.kv_cache_groups = [
+        MagicMock(layer_names=("layer.0", "layer.1", "layer.2"))
+    ]
+    kv_cache_config.kv_cache_tensors = [
+        MagicMock(shared_by=("layer.1",)),
+        MagicMock(shared_by=()),
+        MagicMock(shared_by=("layer.0",)),
+    ]
+    worker, client, _ = _make_worker(
+        kv_cache_config=kv_cache_config,
+        vllm_config=MagicMock(additional_config={"mla_layer_split_kv_cache": True}),
+        is_mla=True,
+    )
+
+    monkeypatch.setattr("pegaflow.connector.worker.CudaIPCWrapper", FakeCudaIPCWrapper)
+
+    worker.register_kv_caches(
+        {
+            "layer.0": FakeTensor(),
+            "layer.1": FakeTensor(),
+            "layer.2": FakeTensor(),
+        }
+    )
+
+    assert worker._registered_layers == ["layer.1", "layer.0"]
+    assert len(client.register_calls) == 1
+    assert client.register_calls[0][7] == ["layer.1", "layer.0"]
+
+    worker.shutdown()
+
+
+def test_register_kv_caches_requires_shared_by_layers(monkeypatch):
+    kv_cache_config = MagicMock()
+    kv_cache_config.kv_cache_groups = [MagicMock(layer_names=("layer.0", "layer.1"))]
+    kv_cache_config.kv_cache_tensors = [MagicMock(shared_by=("layer.1",))]
+    worker, _, _ = _make_worker(
+        kv_cache_config=kv_cache_config,
+        vllm_config=MagicMock(additional_config={"mla_layer_split_kv_cache": True}),
+        is_mla=True,
+    )
+
+    monkeypatch.setattr("pegaflow.connector.worker.CudaIPCWrapper", FakeCudaIPCWrapper)
+
+    with pytest.raises(RuntimeError, match="missing layers"):
+        worker.register_kv_caches({"layer.0": FakeTensor()})
 
     worker.shutdown()
 
