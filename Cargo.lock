@@ -1909,6 +1909,7 @@ name = "pegaflow-core"
 version = "0.22.8"
 dependencies = [
  "ahash",
+ "bytes",
  "bytesize",
  "criterion",
  "cudarc",
@@ -2028,7 +2029,6 @@ dependencies = [
  "dashmap",
  "libc",
  "log",
- "mea",
  "mockall",
  "oneshot",
  "parking_lot",

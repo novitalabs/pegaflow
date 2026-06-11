@@ -271,7 +271,9 @@ const NAMESPACE: &str = "test-p2p";
 const LAYER: &str = "layer_0";
 const DEVICE_ID: i32 = 0;
 
-#[tokio::test]
+// Multi-thread flavor matches the production runtime; the v2 transfer engine
+// uses `block_in_place`, which panics on a current-thread runtime.
+#[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires RDMA hardware (mlx5_1), CUDA GPU, and Python+torch
 async fn p2p_rdma_remote_fetch_roundtrip() {
     pegaflow_common::logging::init_stdout_colored("debug");

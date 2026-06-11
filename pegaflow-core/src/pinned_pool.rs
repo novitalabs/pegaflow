@@ -75,7 +75,10 @@ impl PinnedAllocation {
     }
 
     /// Get the underlying NonNull pointer.
-    #[cfg_attr(not(feature = "rdma"), allow(dead_code))]
+    #[cfg_attr(
+        not(feature = "rdma"),
+        allow(dead_code, reason = "non-RDMA builds only touch this from tests")
+    )]
     pub(crate) fn as_non_null(&self) -> NonNull<u8> {
         self.ptr
     }
@@ -710,6 +713,28 @@ impl PinnedAllocator {
         match self {
             Self::Global(pool) => pool.memory_regions(),
             Self::Numa(pools) => pools.memory_regions(),
+        }
+    }
+
+    /// Return all backing memory regions with the NUMA node they reside on.
+    /// Global pools report `NumaNode::UNKNOWN`.
+    #[cfg(feature = "rdma")]
+    pub(crate) fn memory_regions_with_numa(&self) -> Vec<(NonNull<u8>, usize, NumaNode)> {
+        match self {
+            Self::Global(pool) => pool
+                .memory_regions()
+                .into_iter()
+                .map(|(ptr, len)| (ptr, len, NumaNode::UNKNOWN))
+                .collect(),
+            Self::Numa(pools) => pools
+                .pools
+                .iter()
+                .flat_map(|(&node, pool)| {
+                    pool.memory_regions()
+                        .into_iter()
+                        .map(move |(ptr, len)| (ptr, len, NumaNode(node)))
+                })
+                .collect(),
         }
     }
 }

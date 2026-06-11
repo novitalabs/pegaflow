@@ -45,7 +45,7 @@ pub use pegaflow_common::NumaNode;
 use pegaflow_common::NumaTopology;
 pub use pinned_pool::PinnedAllocation;
 pub use seal_offload::SlotMeta;
-pub use storage::{DEFAULT_RDMA_QPS_PER_PEER, MemoryCacheCleanupStats, StorageConfig};
+pub use storage::{MemoryCacheCleanupStats, StorageConfig};
 pub use sync_state::{LoadState, LoadStateError};
 pub use trace::{set_trace_sample_rate, should_sample};
 pub use transfer::TransferMode;
@@ -750,38 +750,106 @@ impl PegaEngine {
     // Cross-node transfer: serving side
     // =========================================================================
 
-    /// Look up blocks and lock them for RDMA transfer. Returns metadata
-    /// for each found block plus a session ID for later unlock.
+    /// Lock the longest present, layout-homogeneous prefix of `block_hashes`
+    /// for RDMA transfer. Returns the session ID, the number of blocks
+    /// locked, and the per-slot layout template every locked block matches.
+    ///
+    /// Both sides derive all transfer addresses by replaying slot-major bump
+    /// allocation over the template, so the prefix must be exact: a missing
+    /// block or a block with a different layout truncates it.
     pub fn query_blocks_for_transfer(
         &self,
         namespace: &str,
         block_hashes: &[Vec<u8>],
         requester_id: &str,
-    ) -> (String, Vec<(BlockKey, Arc<SealedBlock>)>) {
+    ) -> (
+        String,
+        usize,
+        Vec<pegaflow_proto::proto::engine::TransferSlotInfo>,
+    ) {
+        let t0 = std::time::Instant::now();
         let keys: Vec<BlockKey> = block_hashes
             .iter()
             .map(|h| BlockKey::new(namespace.to_string(), h.clone()))
             .collect();
 
+        // `get_blocks_for_transfer` returns the present subset in request
+        // order; cut it down to the contiguous prefix of the request.
         let found = self.storage.get_blocks_for_transfer(&keys);
-        let session_id = self.storage.lock_blocks_for_transfer(requester_id, &found);
+        let lookup_elapsed = t0.elapsed();
+        let mut found_iter = found.into_iter().peekable();
+        let mut prefix: Vec<(BlockKey, Arc<SealedBlock>)> = Vec::new();
+        for key in &keys {
+            match found_iter.peek() {
+                Some((fk, _)) if fk == key => {
+                    prefix.push(found_iter.next().expect("peeked entry exists"));
+                }
+                _ => break,
+            }
+        }
+
+        let template = prefix
+            .first()
+            .map(|(_, block)| block_slot_template(block))
+            .unwrap_or_default();
+        // The scan dereferences every slot Arc of every block; fan large
+        // prefixes out across threads. The first global mismatch is the
+        // minimum of the chunk-local first mismatches.
+        // Gate and size the fanout by total (block, slot) visits, like the
+        // push replay: a short prefix over a wide template is still real
+        // work, and a long prefix over a narrow one is not.
+        let scan_visits = prefix.len().saturating_mul(template.len());
+        let homogeneous = if scan_visits >= 16384 {
+            // Read-only scan: no refcount writes, so it scales with threads
+            // (unlike Arc-cloning builds).
+            let threads = (scan_visits / 16384)
+                .clamp(1, 16)
+                .min(prefix.len())
+                .min(std::thread::available_parallelism().map_or(4, |n| n.get()));
+            let chunk = prefix.len().div_ceil(threads);
+            let template = &template;
+            let prefix = prefix.as_slice();
+            std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..threads)
+                    .map(|t| {
+                        let lo = t * chunk;
+                        let hi = ((t + 1) * chunk).min(prefix.len());
+                        scope.spawn(move || {
+                            prefix[lo..hi]
+                                .iter()
+                                .position(|(_, block)| !block_matches_template(block, template))
+                                .map(|p| lo + p)
+                        })
+                    })
+                    .collect();
+                workers
+                    .into_iter()
+                    .filter_map(|w| w.join().expect("homogeneity scan worker panicked"))
+                    .min()
+                    .unwrap_or(prefix.len())
+            })
+        } else {
+            prefix
+                .iter()
+                .take_while(|(_, block)| block_matches_template(block, &template))
+                .count()
+        };
+        prefix.truncate(homogeneous);
+
+        let template_elapsed = t0.elapsed() - lookup_elapsed;
+        let lock_start = std::time::Instant::now();
+        let session_id = self.storage.lock_blocks_for_transfer(requester_id, &prefix);
 
         debug!(
-            "query_blocks_for_transfer: namespace={namespace} requested={} found={} session={session_id}",
+            "query_blocks_for_transfer: namespace={namespace} requested={} locked_prefix={} session={session_id} lookup_ms={:.2} template_ms={:.2} lock_ms={:.2}",
             block_hashes.len(),
-            found.len(),
+            prefix.len(),
+            lookup_elapsed.as_secs_f64() * 1000.0,
+            template_elapsed.as_secs_f64() * 1000.0,
+            lock_start.elapsed().as_secs_f64() * 1000.0,
         );
 
-        (session_id, found)
-    }
-
-    pub fn transfer_lock_timeout(&self) -> std::time::Duration {
-        self.storage.transfer_lock_timeout()
-    }
-
-    /// Release a transfer lock session. Returns the number of blocks released.
-    pub fn release_transfer_lock(&self, session_id: &str) -> usize {
-        self.storage.release_transfer_lock(session_id)
+        (session_id, prefix.len(), template)
     }
 
     /// GC expired transfer lock sessions.
@@ -807,68 +875,340 @@ impl PegaEngine {
         false
     }
 
-    /// Perform server-side RDMA handshake with connection reuse.
-    ///
-    /// If `client_handshake_bytes` is empty, the client believes it is already
-    /// connected -- return our cached local metadata (or empty if not found).
-    /// Otherwise, establish (or re-establish) a connection to the client.
-    ///
-    /// Returns `Err` if the handshake fails (bad client metadata, QP creation, etc.).
+    /// Serve a PushBlocks request: take the transfer session's locked blocks
+    /// and RDMA-WRITE them into the requester's memory. Returns the number of
+    /// bytes pushed once every WRITE has completed; the transfer lock is
+    /// released when this function returns (success or failure).
     #[cfg(feature = "rdma")]
-    pub fn rdma_accept_handshake(
+    pub async fn push_blocks_for_transfer(
         &self,
-        client_addr: &str,
-        client_handshake_bytes: &[u8],
-    ) -> Result<Vec<u8>, String> {
-        let rdma = self
-            .storage
-            .rdma_transport()
-            .ok_or_else(|| "RDMA transport not configured".to_string())?;
+        request: &pegaflow_proto::proto::engine::PushBlocksRequest,
+    ) -> Result<u64, PushBlocksError> {
+        use crate::backing::{PushSegment, mr_desc_from_proto};
 
-        if client_handshake_bytes.is_empty() {
-            // Client thinks it's already connected -- return our cached meta if we have it
-            return Ok(rdma
-                .engine()
-                .local_meta_for(client_addr)
-                .map(|m| m.to_bytes())
-                .unwrap_or_default());
+        let t0 = std::time::Instant::now();
+        let rdma = self.storage.rdma_transport().ok_or_else(|| {
+            PushBlocksError::Rejected("RDMA transport not configured".to_string())
+        })?;
+
+        // Holding the Arcs keeps the blocks alive while the WRITEs run.
+        let session_blocks = self
+            .storage
+            .take_transfer_session(&request.transfer_session_id)
+            .ok_or_else(|| {
+                PushBlocksError::Rejected(format!(
+                    "transfer session {} not found (expired or already pushed)",
+                    request.transfer_session_id
+                ))
+            })?;
+
+        // The replay below assumes the session is layout-homogeneous (the
+        // query locked only such a prefix): every block has full per-slot
+        // NUMA info identical to the first block's. Blocks rebuilt from SSD
+        // or a previous RDMA fetch carry no per-slot NUMA info and must be
+        // rejected, not panicked on.
+        let slot_numas = session_blocks
+            .first()
+            .map(|(_, sealed)| sealed.slot_numas())
+            .unwrap_or(&[]);
+        for (key, sealed) in &session_blocks {
+            if sealed.slot_numas().len() != sealed.slots().len()
+                || sealed.slot_numas() != slot_numas
+            {
+                return Err(PushBlocksError::Rejected(format!(
+                    "block {key:?} breaks the session's slot layout; it cannot be re-served"
+                )));
+            }
         }
 
-        let client_meta = pegaflow_transfer::HandshakeMetadata::from_bytes(client_handshake_bytes)
-            .map_err(|e| format!("invalid client handshake metadata: {e}"))?;
+        let mr_descs: Vec<_> = request
+            .memory_regions
+            .iter()
+            .map(mr_desc_from_proto)
+            .collect();
 
-        // Client sent handshake bytes → it has no connection. If we have a stale
-        // one (e.g. client restarted), tear it down so get_or_prepare creates fresh QPs.
-        rdma.engine().invalidate_connection(client_addr);
+        // Bump-replay cursors, one per requester slab. The request carries
+        // only slab bases; every destination address is derived here by
+        // replaying the requester's allocation order with our own segment
+        // sizes (the same sizes we returned in the query's slot_template).
+        struct SlabCursor {
+            mr_index: u32,
+            next: u64,
+            end: u64,
+        }
+        let mut slabs: std::collections::HashMap<u32, SlabCursor> =
+            std::collections::HashMap::new();
+        for slab in &request.slabs {
+            if slab.mr_index as usize >= mr_descs.len() {
+                return Err(PushBlocksError::Rejected(format!(
+                    "slab mr_index {} out of bounds ({} regions in request)",
+                    slab.mr_index,
+                    mr_descs.len()
+                )));
+            }
+            let end = slab.base_addr.checked_add(slab.capacity).ok_or_else(|| {
+                PushBlocksError::Rejected(format!(
+                    "slab 0x{:x}+{} overflows the address space",
+                    slab.base_addr, slab.capacity
+                ))
+            })?;
+            let cursor = SlabCursor {
+                mr_index: slab.mr_index,
+                next: slab.base_addr,
+                end,
+            };
+            if slabs.insert(slab.numa_node, cursor).is_some() {
+                return Err(PushBlocksError::Rejected(format!(
+                    "duplicate slab for NUMA node {}",
+                    slab.numa_node
+                )));
+            }
+        }
+        // Slot-major, K run before V run — the same order in which the
+        // requester assigned destinations from its bump allocator. Each
+        // layer's K (and V) segments of consecutive blocks are adjacent in
+        // the pinned pool, so this order yields source- and
+        // destination-contiguous runs that push_segments coalesces.
+        //
+        // Layout homogeneity (validated above) lets each (slot, K/V) run
+        // resolve its slab cursor once instead of per segment.
+        let session_elapsed = t0.elapsed();
+        let build_start = std::time::Instant::now();
 
-        let server_meta = match rdma
-            .engine()
-            .get_or_prepare(client_addr)
-            .map_err(|e| format!("get_or_prepare failed: {e}"))?
-        {
-            pegaflow_transfer::ConnectionStatus::Prepared(m) => m,
-            pegaflow_transfer::ConnectionStatus::Existing => {
-                unreachable!("just invalidated connection for {client_addr}")
+        // Replay the bump allocation with the first block's sizes (the
+        // template the requester sized its slabs from) to fix each
+        // (slot, K/V) run's destination window up front. The per-segment
+        // source scan below then has no shared cursor and fans out across
+        // threads; per-run end checks subsume the old global cursor check
+        // and reject divergence at finer granularity.
+        struct RunDst {
+            mr_index: u32,
+            base: u64,
+            end: u64,
+            /// Every segment in the run must have exactly this size — the
+            /// requester derived its addresses from it (`base + i * size`),
+            /// so a sum-level check alone would let compensating size
+            /// divergence land data at wrong offsets undetected.
+            seg_size: u64,
+        }
+        let mut runs: Vec<RunDst> = Vec::with_capacity(slot_numas.len() * 2);
+        for (slot_idx, slot_numa) in slot_numas.iter().enumerate() {
+            let numa = slot_numa.0;
+            let slab = slabs.get_mut(&numa).ok_or_else(|| {
+                PushBlocksError::Rejected(format!("no requester slab for NUMA node {numa}"))
+            })?;
+            let first = &session_blocks[0].1;
+            for seg_idx in 0..2 {
+                let size = first.slots()[slot_idx].segment_size(seg_idx).unwrap_or(0) as u64;
+                let total = size
+                    .checked_mul(session_blocks.len() as u64)
+                    .ok_or_else(|| {
+                        PushBlocksError::Rejected(format!(
+                            "run size overflows: {size} x {} blocks",
+                            session_blocks.len()
+                        ))
+                    })?;
+                if total > slab.end - slab.next {
+                    return Err(PushBlocksError::Rejected(format!(
+                        "slab for NUMA node {numa} exhausted during replay: cursor=0x{:x} run={total} end=0x{:x}",
+                        slab.next, slab.end
+                    )));
+                }
+                runs.push(RunDst {
+                    mr_index: slab.mr_index,
+                    base: slab.next,
+                    end: slab.next + total,
+                    seg_size: size,
+                });
+                slab.next += total;
             }
-            pegaflow_transfer::ConnectionStatus::Connecting => {
-                return Err(format!("handshake to {client_addr} already in progress"));
+        }
+
+        // The replayed cursors must land exactly on the requester's
+        // allocation ends. Any divergence means the two sides disagree on
+        // block count, sizes, or order — reject before submitting a WRITE.
+        for (numa, slab) in &slabs {
+            if slab.next != slab.end {
+                return Err(PushBlocksError::Rejected(format!(
+                    "bump replay mismatch on NUMA node {numa}: cursor ended at 0x{:x} but requester allocated up to 0x{:x}",
+                    slab.next, slab.end
+                )));
             }
+        }
+
+        // Within one (slot, K/V) run the destination is a single bump
+        // region, so source-contiguous segments of consecutive blocks merge
+        // into one WRITE-sized segment. Layer allocations keep consecutive
+        // blocks adjacent, so a run typically collapses to one segment.
+        let build_run = |run_idx: usize| -> Result<Vec<PushSegment>, String> {
+            let (slot_idx, seg_idx) = (run_idx / 2, run_idx % 2);
+            let dst = &runs[run_idx];
+            let mut out = Vec::new();
+            let mut cursor = dst.base;
+            let mut run = PushSegment {
+                src_addr: 0,
+                len: 0,
+                dst_mr_index: dst.mr_index,
+                dst_addr: 0,
+            };
+            for (_key, sealed) in &session_blocks {
+                let raw = &sealed.slots()[slot_idx];
+                let (Some(ptr), Some(size)) = (raw.segment_ptr(seg_idx), raw.segment_size(seg_idx))
+                else {
+                    continue;
+                };
+                let len = size as u64;
+                if len == 0 {
+                    continue;
+                }
+                if len != dst.seg_size {
+                    return Err(format!(
+                        "block segment size {len} diverges from the session's first block ({}) in run {run_idx}",
+                        dst.seg_size
+                    ));
+                }
+                let src = ptr.as_ptr() as u64;
+                if run.len > 0 && run.src_addr + run.len == src {
+                    run.len += len;
+                } else {
+                    if run.len > 0 {
+                        out.push(run);
+                    }
+                    run.src_addr = src;
+                    run.dst_addr = cursor;
+                    run.len = len;
+                }
+                cursor += len;
+            }
+            if run.len > 0 {
+                out.push(run);
+            }
+            if cursor != dst.end {
+                return Err(format!(
+                    "bump replay mismatch in run {run_idx}: cursor ended at 0x{cursor:x} but requester allocated up to 0x{:x}",
+                    dst.end
+                ));
+            }
+            Ok(out)
         };
-        rdma.engine()
-            .complete_handshake(client_addr, &server_meta, &client_meta)
-            .map_err(|e| format!("complete_handshake failed: {e}"))?;
-        info!("RDMA handshake accepted: client={client_addr}");
-        Ok(server_meta.to_bytes())
+        // Thread count scales with total (block, slot) visits, not run count:
+        // a single-block fetch has hundreds of runs but trivial work, and
+        // spawning threads for it costs more than the whole replay.
+        let total_visits = runs.len().saturating_mul(session_blocks.len());
+        let threads = (total_visits / 65536)
+            .clamp(1, 8)
+            .min(std::thread::available_parallelism().map_or(4, |n| n.get()));
+        let per_run_segments: Vec<Vec<PushSegment>> = if threads == 1 {
+            (0..runs.len())
+                .map(&build_run)
+                .collect::<Result<_, _>>()
+                .map_err(PushBlocksError::Rejected)?
+        } else {
+            let chunk = runs.len().div_ceil(threads).max(1);
+            std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..threads)
+                    .map(|t| {
+                        let lo = (t * chunk).min(runs.len());
+                        let hi = ((t + 1) * chunk).min(runs.len());
+                        let build_run = &build_run;
+                        scope.spawn(move || (lo..hi).map(build_run).collect::<Result<Vec<_>, _>>())
+                    })
+                    .collect();
+                workers
+                    .into_iter()
+                    .map(|w| w.join().expect("replay worker panicked"))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(|chunks| chunks.into_iter().flatten().collect())
+            })
+            .map_err(PushBlocksError::Rejected)?
+        };
+        let segments: Vec<PushSegment> = per_run_segments.into_iter().flatten().collect();
+
+        let build_elapsed = build_start.elapsed();
+        let rdma_start = std::time::Instant::now();
+        let result = rdma.push_segments(&mr_descs, segments).await;
+        info!(
+            "PushBlocks timing: session_ms={:.2} build_ms={:.2} rdma_ms={:.2}",
+            session_elapsed.as_secs_f64() * 1000.0,
+            build_elapsed.as_secs_f64() * 1000.0,
+            rdma_start.elapsed().as_secs_f64() * 1000.0,
+        );
+        result
     }
 
-    /// Perform server-side RDMA handshake with connection reuse.
+    /// Serve a PushBlocks request.
     #[cfg(not(feature = "rdma"))]
-    pub fn rdma_accept_handshake(
+    pub async fn push_blocks_for_transfer(
         &self,
-        _client_addr: &str,
-        _client_handshake_bytes: &[u8],
-    ) -> Result<Vec<u8>, String> {
-        Err("this binary was built without RDMA support".to_string())
+        _request: &pegaflow_proto::proto::engine::PushBlocksRequest,
+    ) -> Result<u64, PushBlocksError> {
+        Err(PushBlocksError::Rejected(
+            "this binary was built without RDMA support".to_string(),
+        ))
+    }
+}
+
+/// Per-slot layout of a sealed block as the transfer protocol sees it.
+/// The requester sizes its slabs from this template and both sides replay
+/// slot-major bump allocation over it, so it is the protocol's source of
+/// truth for segment sizes and NUMA placement.
+fn block_slot_template(
+    block: &SealedBlock,
+) -> Vec<pegaflow_proto::proto::engine::TransferSlotInfo> {
+    block
+        .slots()
+        .iter()
+        .zip(block.slot_numas())
+        .map(
+            |(raw, numa)| pegaflow_proto::proto::engine::TransferSlotInfo {
+                k_size: raw.segment_size(0).unwrap_or(0) as u64,
+                v_size: raw.segment_size(1).unwrap_or(0) as u64,
+                numa_node: numa.0,
+            },
+        )
+        .collect()
+}
+
+/// Field-wise template match without materializing a per-block template Vec —
+/// the query's homogeneity scan runs this over every candidate block.
+fn block_matches_template(
+    block: &SealedBlock,
+    template: &[pegaflow_proto::proto::engine::TransferSlotInfo],
+) -> bool {
+    block.slots().len() == template.len()
+        && block.slot_numas().len() == template.len()
+        && block
+            .slots()
+            .iter()
+            .zip(block.slot_numas())
+            .zip(template)
+            .all(|((raw, numa), t)| {
+                raw.segment_size(0).unwrap_or(0) as u64 == t.k_size
+                    && raw.segment_size(1).unwrap_or(0) as u64 == t.v_size
+                    && numa.0 == t.numa_node
+            })
+}
+
+/// Error from serving a PushBlocks request.
+///
+/// The split matters for the requester's memory safety: a `Rejected` push
+/// never submitted an RDMA WRITE, so the requester may recycle its
+/// destination buffers; after `Failed`, WRITEs may still be in flight and
+/// the requester must leak them.
+#[derive(Debug)]
+pub enum PushBlocksError {
+    /// Rejected before any RDMA WRITE was submitted.
+    Rejected(String),
+    /// Failed after WRITEs may have been submitted.
+    Failed(String),
+}
+
+impl std::fmt::Display for PushBlocksError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(msg) => write!(f, "rejected: {msg}"),
+            Self::Failed(msg) => write!(f, "failed: {msg}"),
+        }
     }
 }
 
@@ -908,15 +1248,19 @@ mod tests {
     }
 
     #[cfg(not(feature = "rdma"))]
-    #[test]
-    fn rdma_handshake_reports_missing_feature() {
+    #[tokio::test]
+    async fn push_blocks_reports_missing_feature() {
         let engine = PegaEngine::new_with_config(1 << 20, false, storage::StorageConfig::default())
             .expect("engine should start without RDMA");
 
         let err = engine
-            .rdma_accept_handshake("127.0.0.1:50055", b"client-handshake")
-            .expect_err("no-RDMA build should reject RDMA handshakes");
+            .push_blocks_for_transfer(&pegaflow_proto::proto::engine::PushBlocksRequest::default())
+            .await
+            .expect_err("no-RDMA build should reject push requests");
 
-        assert_eq!(err, "this binary was built without RDMA support");
+        assert!(
+            matches!(err, PushBlocksError::Rejected(ref msg) if msg.contains("without RDMA")),
+            "expected Rejected, got {err:?}"
+        );
     }
 }

@@ -128,19 +128,13 @@ message SessionRequest {
 message SessionEvent {
 }
 
-// Cross-node transfer: per-slot RDMA metadata
+// Cross-node transfer: per-slot segment sizes. One template describes every
+// block in the session; the requester allocates local memory from it and
+// mirrors the holder's NUMA placement.
 message TransferSlotInfo {
-  uint64 k_ptr = 1;      // Remote pinned memory address for K segment
-  uint64 k_size = 2;     // Size of the K segment in bytes (per-segment, not total slot size)
-  uint64 v_ptr = 3;      // Remote pinned memory address for V segment (0 if contiguous)
-  uint64 v_size = 4;     // Size of the V segment in bytes (0 if contiguous)
-  uint32 numa_node = 5;  // NUMA node where this slot's memory resides (for RDMA NIC affinity)
-}
-
-// Cross-node transfer: per-block RDMA metadata
-message TransferBlockInfo {
-  bytes block_hash = 1;
-  repeated TransferSlotInfo slots = 2;  // One per TP slot
+  uint64 k_size = 1;     // Size of the K segment in bytes
+  uint64 v_size = 2;     // Size of the V segment in bytes (0 if contiguous)
+  uint32 numa_node = 3;  // NUMA node where this slot resides on the holder
 }
 
 message QueryBlocksForTransferRequest {
@@ -151,31 +145,59 @@ message QueryBlocksForTransferRequest {
 
 message QueryBlocksForTransferResponse {
   ResponseStatus status = 1;
-  repeated TransferBlockInfo blocks = 2;
-  string transfer_session_id = 3;       // Opaque session ID for ReleaseTransferLock
-  uint32 lock_timeout_secs = 4;         // Server's transfer lock timeout — client must finish before this
+  reserved 2;                           // was: repeated TransferBlockInfo blocks
+  string transfer_session_id = 3;       // Session ID consumed by PushBlocks
+  // The longest prefix of the requested hashes that is present, locked, and
+  // layout-homogeneous (every block matches slot_template). Both sides derive
+  // all transfer addresses by replaying slot-major bump allocation over the
+  // template, so nothing per-block or per-slot goes on the wire.
+  uint32 block_count = 4;
+  repeated TransferSlotInfo slot_template = 5;  // One entry per TP slot
 }
 
-// RDMA handshake: establish a new RDMA connection between two peers.
-// Caller MUST ensure its own side is not-yet-connected and calls are serialized.
-// Server invalidates any stale connection for this requester before creating fresh QPs.
-message RdmaHandshakeRequest {
-  string requester_id = 1;              // Client's advertise address
-  bytes handshake_metadata = 2;         // Client's HandshakeMetadata (bincode-serialized)
+// PushBlocks: the requester asks the holder to RDMA-WRITE the session's
+// locked blocks into requester memory. The RPC response is the completion
+// signal: when status.ok, all bytes have been placed in requester memory
+// (RC WRITE completion implies remote placement). The holder releases the
+// transfer lock before returning, so no separate release RPC is needed.
+
+// One (domain address, rkey) pair of a requester memory region. Entries are
+// ordered; the holder's NIC i targets entry i (NICs pair 1:1 by index).
+message RemoteDomainRkey {
+  bytes domain_address = 1;  // Transfer engine domain address
+  uint64 rkey = 2;
 }
 
-message RdmaHandshakeResponse {
-  ResponseStatus status = 1;
-  bytes handshake_metadata = 2;         // Server's HandshakeMetadata (bincode-serialized)
+// A requester-registered RDMA memory region.
+message RemoteMemoryRegion {
+  uint64 base_ptr = 1;
+  repeated RemoteDomainRkey rkeys = 2;
 }
 
-message ReleaseTransferLockRequest {
+// One requester slab: the bump-allocation arena for every segment whose
+// holder slot lives on `numa_node`. The holder replays the requester's
+// slot-major allocation order (per slot: all blocks' K, then all blocks' V)
+// from `base_addr`, using its own segment sizes — which are the sizes it
+// returned in slot_template. The replayed cursor must land exactly on
+// `base_addr + capacity`; any divergence rejects the push before a single
+// WRITE is submitted.
+message PushSlabDst {
+  uint32 numa_node = 1;
+  uint32 mr_index = 2;   // Index into PushBlocksRequest.memory_regions
+  uint64 base_addr = 3;  // Absolute requester address of the slab
+  uint64 capacity = 4;   // Total bytes the requester allocated
+}
+
+message PushBlocksRequest {
   string transfer_session_id = 1;
+  repeated RemoteMemoryRegion memory_regions = 2;
+  reserved 3;                           // was: repeated PushBlockDst blocks
+  repeated PushSlabDst slabs = 4;
 }
 
-message ReleaseTransferLockResponse {
+message PushBlocksResponse {
   ResponseStatus status = 1;
-  uint64 released_blocks = 2;
+  uint64 bytes_pushed = 2;
 }
 
 service Engine {
@@ -186,12 +208,10 @@ service Engine {
   rpc QueryPrefetch(QueryRequest) returns (QueryResponse);
   rpc Release(ReleaseRequest) returns (ReleaseResponse);
   rpc UnregisterContext(UnregisterRequest) returns (UnregisterResponse);
-  // Cross-node transfer: get RDMA metadata for specific blocks (serving side)
+  // Cross-node transfer: look up and lock blocks, return sizes (serving side)
   rpc QueryBlocksForTransfer(QueryBlocksForTransferRequest) returns (QueryBlocksForTransferResponse);
-  // Cross-node transfer: release block locks after RDMA transfer completes
-  rpc ReleaseTransferLock(ReleaseTransferLockRequest) returns (ReleaseTransferLockResponse);
-  // RDMA handshake: establish a new peer-to-peer RDMA connection
-  rpc RdmaHandshake(RdmaHandshakeRequest) returns (RdmaHandshakeResponse);
+  // Cross-node transfer: RDMA-WRITE a locked session's blocks into requester memory
+  rpc PushBlocks(PushBlocksRequest) returns (PushBlocksResponse);
   rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
   rpc Health(HealthRequest) returns (HealthResponse);
   // Liveness channel: server drops the instance's CUDA IPC mappings when

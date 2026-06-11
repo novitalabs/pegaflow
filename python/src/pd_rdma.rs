@@ -1,6 +1,6 @@
 use crate::{PegaFlowError, u64_to_usize};
 
-use pegaflow_transfer::v2::{
+use pegaflow_transfer::{
     CudaDeviceId, Device, DomainAddress, DomainGroupRouting, FabricLibError, GroupTransferRouting,
     ImmCounter, ImmTransferRequest, MemoryRegionDescriptor, MemoryRegionHandle,
     MemoryRegionRemoteKey, RdmaEngine, ScatterTarget, ScatterTransferRequest, SmallVec,

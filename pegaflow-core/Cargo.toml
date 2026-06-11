@@ -30,6 +30,7 @@ rand.workspace = true
 ahash.workspace = true
 io-uring = "0.7"
 futures.workspace = true
+bytes.workspace = true
 parking_lot.workspace = true
 fastrace = { workspace = true, optional = true }
 tonic.workspace = true

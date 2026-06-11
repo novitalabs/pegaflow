@@ -27,3 +27,4 @@ python/pegaflow/pegaflow-server-py
 
 # Claude
 CLAUDE.local.md
+python/uv.lock
