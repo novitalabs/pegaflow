@@ -14,7 +14,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
 )
 from vllm.distributed.parallel_state import get_pp_group, get_tensor_model_parallel_rank
-from vllm.model_executor.models.utils import extract_layer_index
 
 from pegaflow.connector.common import (
     ConnectorContext,
@@ -31,51 +30,6 @@ from pegaflow.connector.scheduler import SchedulerConnector
 from pegaflow.connector.state_manager import ServiceStateManager
 from pegaflow.connector.worker import WorkerConnector
 from pegaflow.pegaflow import EngineRpcClient
-
-
-def _build_layer_id_space(kv_cache_config, num_model_layers: int) -> tuple[dict[str, int], int]:
-    """Map each KV-cache layer name to a globally unique, role-independent id.
-
-    The id and the total layer count must be identical on every process that
-    touches the same KV (producer, local consumer, RDMA consumer) and on every
-    PP rank, because the engine stores blocks by ``layer_id * tp_size + tp_rank``.
-
-    The id must therefore be anchored to something every process derives the same
-    way regardless of how pipeline parallelism shards the layers across ranks --
-    a rank only ever sees its own slice of ``kv_cache_groups``, so any id based on
-    local position would collide across ranks. The layer's in-model index
-    (``extract_layer_index``) is that anchor: it is global and identical on every
-    rank. A bare index is not unique, though -- DeepSeek-V3.2-style models register
-    two caches per transformer layer (the main MLA attention and the sparse
-    indexer) that share an index, and because the connector is not ``SupportsHMA``
-    vLLM coalesces them into a single kv-cache group, so a group ordinal cannot
-    tell them apart. We give each cache that shares an index a stable intra-layer
-    ordinal (its rank among those names in sorted order) and lay the space out as
-    ``index * caches_per_layer + ordinal`` over ``[0, num_model_layers *
-    caches_per_layer)``, where ``num_model_layers`` counts every attention layer
-    that owns a KV cache -- the ``num_hidden_layers`` main layers plus any
-    speculative MTP / next-n predictor layers, whose in-model index continues past
-    ``num_hidden_layers`` (e.g. GLM-5.1's MTP layer is ``model.layers.78`` when
-    ``num_hidden_layers`` is 78). For a conventional one-cache-per-layer model this
-    reduces to the in-model index, so previously stored caches stay addressable. An
-    unparsable layer name is a genuinely unsupported topology and raises here
-    rather than being papered over with an invented id.
-    """
-    if kv_cache_config is None:
-        return {}, num_model_layers
-
-    names_by_index: dict[int, list[str]] = {}
-    for group in kv_cache_config.kv_cache_groups:
-        for name in group.layer_names:
-            names_by_index.setdefault(extract_layer_index(name), []).append(name)
-
-    caches_per_layer = max((len(names) for names in names_by_index.values()), default=1)
-    layer_id_by_name: dict[str, int] = {}
-    for index, names in names_by_index.items():
-        for ordinal, name in enumerate(sorted(names)):
-            layer_id_by_name[name] = index * caches_per_layer + ordinal
-
-    return layer_id_by_name, num_model_layers * caches_per_layer
 
 
 class PegaKVConnector(KVConnectorBase_V1):
@@ -113,19 +67,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             pcp_world_size,
             cross_layer_blocks=cross_layer_blocks,
         )
-        hf_text_config = vllm_config.model_config.hf_text_config
-        num_hidden_layers = getattr(hf_text_config, "num_hidden_layers", 0)
-        # Speculative MTP / next-n predictor layers register their own KV caches at
-        # in-model indices that continue past num_hidden_layers (vLLM places them at
-        # model.layers.{num_hidden_layers + i}); count them so their canonical id
-        # stays inside num_layers instead of overflowing it.
-        num_nextn_layers = getattr(hf_text_config, "num_nextn_predict_layers", 0) or 0
-        num_model_layers = num_hidden_layers + num_nextn_layers
         block_size = vllm_config.cache_config.block_size
-        # `num_layers` is the flattened KV-layer id space the engine stores into,
-        # which is wider than num_model_layers when a layer owns several caches
-        # (e.g. DeepSeek-V3.2 main attention + sparse indexer).
-        layer_id_by_name, num_layers = _build_layer_id_space(kv_cache_config, num_model_layers)
 
         tp_rank: int | None = None
         device_id: int | None = None
@@ -169,7 +111,6 @@ class PegaKVConnector(KVConnectorBase_V1):
             instance_id=instance_id,
             namespace=namespace,
             block_size=block_size,
-            num_layers=num_layers,
             tp_size=tp_size,
             world_size=world_size,
             tp_rank=tp_rank,
@@ -183,7 +124,6 @@ class PegaKVConnector(KVConnectorBase_V1):
             pp_rank=pp_rank,
             pp_size=pp_size,
             mode=mode,
-            layer_id_by_name=layer_id_by_name,
         )
 
         self._scheduler: SchedulerConnector | None = None
@@ -200,7 +140,7 @@ class PegaKVConnector(KVConnectorBase_V1):
 
         logger.debug(
             "[PegaKVConnector] Initialized role=%s instance_id=%s device=%s "
-            "tp_rank=%s tp_size=%d pp_rank=%d pp_size=%d world_size=%d layers=%d namespace=%s "
+            "tp_rank=%s tp_size=%d pp_rank=%d pp_size=%d world_size=%d namespace=%s "
             "is_mla=%s dcp_world_size=%d pcp_world_size=%d dcp_rank=%d mode=%s",
             role.name,
             instance_id,
@@ -210,7 +150,6 @@ class PegaKVConnector(KVConnectorBase_V1):
             pp_rank,
             pp_size,
             world_size,
-            num_layers,
             namespace,
             is_mla,
             dcp_world_size,

@@ -135,9 +135,7 @@ impl BenchFixture {
                 0,
                 1,
                 1,
-                1,
                 &[LAYER_NAME.to_string()],
-                &[0],
                 &[gpu.as_u64()],
                 &[total_bytes],
                 &[registered_blocks],
@@ -304,7 +302,6 @@ impl MultiLayerBenchFixture {
         let layer_names: Vec<String> = (0..MULTI_LAYER_COUNT)
             .map(|idx| format!("layer_{idx}"))
             .collect();
-        let layer_ids: Vec<usize> = (0..MULTI_LAYER_COUNT).collect();
         let layer_ptrs: Vec<u64> = match layout {
             MultiLayerGpuLayout::SharedSource => vec![gpu.as_u64(); MULTI_LAYER_COUNT],
             MultiLayerGpuLayout::DistinctLayerSources => (0..MULTI_LAYER_COUNT)
@@ -326,9 +323,7 @@ impl MultiLayerBenchFixture {
                 0,
                 1,
                 1,
-                MULTI_LAYER_COUNT,
                 &layer_names,
-                &layer_ids,
                 &layer_ptrs,
                 &layer_sizes,
                 &layer_blocks,

@@ -14,15 +14,15 @@ Observed failure (GLM-5.1-FP8 TP8, vLLM + PegaFlow, 2026-06-09):
      device=3 pp_rank=0 tp_rank=0 layer=model.layers.40.self_attn.attn;
      device=6 pp_rank=0 tp_rank=0 layer=model.layers.40.self_attn.attn"
 
-``ensure_all_slots_registered`` (pegaflow-core/src/instance.rs) assumes one
-owner per ``layer_id * tp_size + tp_rank`` slot, which every MLA replica
-violates by design. Every save and load on such an instance fails.
+The engine seals the instance topology (one slot per ``layer_id * tp_size +
+tp_rank``) once every worker has registered; MLA replicas mean several devices
+own the same slot, which the seal must accept within one pipeline stage.
 
 This test scales the production topology to 2 devices: both register the full
-GLM-5.1 layer-id space (158 ids = (78 hidden + 1 MTP) layers x 2 caches,
-derived from the real config.json in tests/data) with the same effective
-tp_rank. Save from device 0 must succeed and the saved blocks must be loadable
-into device 1 with identical bytes.
+GLM-5.1 layer set (158 caches = (78 hidden + 1 MTP) layers x 2 caches, derived
+from the real config.json in tests/data) with the same effective tp_rank. Save
+from device 0 must succeed and the saved blocks must be loadable into device 1
+with identical bytes.
 
 Requires >= 2 CUDA devices (run on a multi-GPU box, e.g. jiuzhang 39).
 """
@@ -36,9 +36,7 @@ from types import SimpleNamespace
 import pytest
 
 torch = pytest.importorskip("torch")
-pytest.importorskip("vllm", reason="layer-id space derivation uses vllm.extract_layer_index")
 
-from pegaflow.connector import _build_layer_id_space  # noqa: E402
 from pegaflow.connector.common import ConnectorContext, detect_mla  # noqa: E402
 from pegaflow.connector.state_manager import ServiceStateManager  # noqa: E402
 from pegaflow.connector.worker import WorkerConnector  # noqa: E402
@@ -57,13 +55,8 @@ LOAD_DST_BLOCK_IDS = [2, 3]
 WAIT_TIMEOUT_SECONDS = 30.0
 
 
-def _glm51_topology() -> tuple[dict, list[str], dict[str, int], int]:
-    """Derive the GLM-5.1 KV topology from the real config.json.
-
-    Returns (hf_config, layer_names, layer_id_by_name, num_layers) where the
-    id space comes from the production ``_build_layer_id_space`` so the test
-    breaks if the connector mapping and this repro ever diverge.
-    """
+def _glm51_topology() -> tuple[dict, list[str]]:
+    """Derive the GLM-5.1 KV layer set from the real config.json."""
     hf_config = json.loads(GLM51_CONFIG_PATH.read_text())
 
     # GLM-5.1 must be detected as MLA: that is what flips every TP rank to
@@ -82,12 +75,7 @@ def _glm51_topology() -> tuple[dict, list[str], dict[str, int], int]:
         layer_names.append(f"model.layers.{i}.self_attn.attn")
         layer_names.append(f"model.layers.{i}.self_attn.indexer.k_cache")
 
-    kv_cache_config = SimpleNamespace(
-        kv_cache_groups=[SimpleNamespace(layer_names=list(layer_names))]
-    )
-    layer_id_by_name, num_layers = _build_layer_id_space(kv_cache_config, num_model_layers)
-    assert num_layers == 2 * num_model_layers
-    return hf_config, layer_names, layer_id_by_name, num_layers
+    return hf_config, layer_names
 
 
 class ReplicaWorker:
@@ -95,7 +83,7 @@ class ReplicaWorker:
 
     Registers through the production ``WorkerConnector.register_kv_caches``
     path so the RPC carries exactly what vLLM workers send: per-cache CUDA IPC
-    handles, the canonical layer ids, and the MLA-collapsed
+    handles, the layer names, and the MLA-collapsed
     effective_tp_rank/effective_tp_size.
     """
 
@@ -108,8 +96,6 @@ class ReplicaWorker:
         world_size: int,
         hf_config: dict,
         layer_names: list[str],
-        layer_id_by_name: dict[str, int],
-        num_layers: int,
         fill: str,
     ):
         device = torch.device(f"cuda:{tp_rank}")
@@ -131,7 +117,6 @@ class ReplicaWorker:
             instance_id=instance_id,
             namespace=namespace,
             block_size=BLOCK_SIZE,
-            num_layers=num_layers,
             tp_size=world_size,
             world_size=world_size,
             tp_rank=tp_rank,
@@ -139,7 +124,6 @@ class ReplicaWorker:
             engine_client=engine_client,
             state_manager=ServiceStateManager(engine_client),
             is_mla=True,
-            layer_id_by_name=layer_id_by_name,
         )
         # Pin the production contract this repro depends on: MLA collapses the
         # engine-visible TP topology to a single rank.
@@ -183,15 +167,16 @@ def _wait_for_ready_lease(engine_client, instance_id: str, block_hashes: list[by
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs >= 2 CUDA devices")
 def test_mla_replica_devices_save_and_load(dual_device_server):
-    hf_config, layer_names, layer_id_by_name, num_layers = _glm51_topology()
+    hf_config, layer_names = _glm51_topology()
 
     engine_client = EngineRpcClient(dual_device_server.endpoint)
     instance_id = f"glm51-mla-{uuid.uuid4().hex[:8]}"
     workers: list[ReplicaWorker] = []
     try:
         # Worker 0 holds the data to save; worker 1 starts zeroed and is the
-        # load target. Both register the full 158-layer id space with
-        # effective_tp_rank=0, exactly like GLM-5.1 TP8 ranks do.
+        # load target. Both register the full 158-cache layer set with
+        # effective_tp_rank=0, exactly like GLM-5.1 TP8 ranks do. The engine
+        # seals the topology when the second (world_size-th) worker registers.
         for tp_rank, fill in ((0, "random"), (1, "zeros")):
             worker = ReplicaWorker(
                 engine_client,
@@ -201,8 +186,6 @@ def test_mla_replica_devices_save_and_load(dual_device_server):
                 world_size=2,
                 hf_config=hf_config,
                 layer_names=layer_names,
-                layer_id_by_name=layer_id_by_name,
-                num_layers=num_layers,
                 fill=fill,
             )
             workers.append(worker)

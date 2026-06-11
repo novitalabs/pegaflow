@@ -47,9 +47,6 @@ class ConnectorContext:
     instance_id: str
     namespace: str
     block_size: int
-    # Size of the flattened KV-layer id space (>= num_hidden_layers; e.g. doubled
-    # for DeepSeek-V3.2 where each layer owns a main + an indexer cache).
-    num_layers: int
     tp_size: int
     world_size: int
     tp_rank: int | None
@@ -63,7 +60,6 @@ class ConnectorContext:
     pp_rank: int = 0
     pp_size: int = 1
     mode: PegaConnectorMode = PegaConnectorMode.READ_WRITE
-    layer_id_by_name: dict[str, int] | None = None
 
     @property
     def read_enabled(self) -> bool:

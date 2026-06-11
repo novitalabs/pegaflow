@@ -45,9 +45,7 @@ def main() -> int:
         1,  # tp_size
         1,  # world_size
         0,  # device_id
-        1,  # num_layers
         ["layer_0"],
-        [0],
         [wrapper_bytes],
         [num_blocks],
         [bytes_per_block],

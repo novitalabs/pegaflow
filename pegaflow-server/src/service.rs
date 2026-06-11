@@ -130,9 +130,6 @@ impl GrpcEngineService {
             )));
         }
         Self::validate_device_id(req.device_id)?;
-        if req.num_layers == 0 {
-            return Err(Status::invalid_argument("num_layers must be > 0"));
-        }
         if req.tp_size == 0 {
             return Err(Status::invalid_argument("tp_size must be > 0"));
         }
@@ -269,7 +266,7 @@ impl Engine for GrpcEngineService {
         let result: Result<Response<RegisterContextResponse>, Status> = async {
             let req = request.into_inner();
             debug!(
-                "RPC [register_context_batch]: instance_id={} namespace={} device_id={} tp_rank={} pp_rank={} tp_size={} world_size={} num_layers={} layer_names={:?} layer_ids={:?} num_blocks={:?} bytes_per_block={:?} kv_stride_bytes={:?} segments={:?} wrapper_bytes_lens={:?}",
+                "RPC [register_context_batch]: instance_id={} namespace={} device_id={} tp_rank={} pp_rank={} tp_size={} world_size={} layer_names={:?} num_blocks={:?} bytes_per_block={:?} kv_stride_bytes={:?} segments={:?} wrapper_bytes_lens={:?}",
                 req.instance_id,
                 req.namespace,
                 req.device_id,
@@ -277,9 +274,7 @@ impl Engine for GrpcEngineService {
                 req.pp_rank,
                 req.tp_size,
                 req.world_size,
-                req.num_layers,
                 req.layer_names,
-                req.layer_ids,
                 req.num_blocks,
                 req.bytes_per_block,
                 req.kv_stride_bytes,
@@ -288,16 +283,11 @@ impl Engine for GrpcEngineService {
             );
 
             Self::validate_register_context_request(&req)?;
-            let num_layers = Self::usize_from_u32(req.num_layers, "num_layers")?;
 
             // Validate array lengths are consistent with each other.
-            // Note: num_layers is the *instance-wide* total (used for topology),
-            // which may exceed the local batch size when pipeline parallelism
-            // splits layers across ranks.
             let batch_len = req.layer_names.len();
             if batch_len == 0
                 || req.wrapper_bytes.len() != batch_len
-                || req.layer_ids.len() != batch_len
                 || req.num_blocks.len() != batch_len
                 || req.bytes_per_block.len() != batch_len
                 || req.kv_stride_bytes.len() != batch_len
@@ -307,28 +297,11 @@ impl Engine for GrpcEngineService {
                     "all layer arrays must have the same non-zero length (got layer_names={batch_len})"
                 )));
             }
-            if batch_len > num_layers {
-                return Err(Status::invalid_argument(format!(
-                    "layer batch size {batch_len} exceeds instance num_layers {num_layers}"
-                )));
-            }
-            if let Some(layer_id) = req.layer_ids.iter().find(|layer_id| **layer_id >= req.num_layers)
-            {
-                return Err(Status::invalid_argument(format!(
-                    "layer_id {layer_id} out of range (num_layers {})",
-                    req.num_layers
-                )));
-            }
 
             let num_blocks_list: Vec<usize> = req
                 .num_blocks
                 .into_iter()
                 .map(|v| Self::usize_from_u64(v, "num_blocks"))
-                .collect::<Result<_, _>>()?;
-            let layer_ids: Vec<usize> = req
-                .layer_ids
-                .into_iter()
-                .map(|v| Self::usize_from_u32(v, "layer_ids"))
                 .collect::<Result<_, _>>()?;
             let bytes_per_block_list: Vec<usize> = req
                 .bytes_per_block
@@ -369,8 +342,8 @@ impl Engine for GrpcEngineService {
                 .register_layers(context_key.clone(), req.device_id, layers)
                 .await
                 .map_err(|message| Status::internal(format!("register tensor failed: {message}")))?;
-            let mut data_ptrs = Vec::with_capacity(num_layers);
-            let mut size_bytes_list = Vec::with_capacity(num_layers);
+            let mut data_ptrs = Vec::with_capacity(batch_len);
+            let mut size_bytes_list = Vec::with_capacity(batch_len);
             for metadata in &metadatas {
                 data_ptrs.push(metadata.data_ptr);
                 size_bytes_list.push(metadata.size_bytes);
@@ -385,9 +358,7 @@ impl Engine for GrpcEngineService {
                 pp_rank,
                 tp_size,
                 world_size,
-                num_layers,
                 &req.layer_names,
-                &layer_ids,
                 &data_ptrs,
                 &size_bytes_list,
                 &num_blocks_list,
@@ -1080,9 +1051,7 @@ mod tests {
             tp_size: 1,
             world_size: 1,
             device_id: 0,
-            num_layers: 1,
             layer_names: Vec::new(),
-            layer_ids: Vec::new(),
             wrapper_bytes: Vec::new(),
             num_blocks: Vec::new(),
             bytes_per_block: Vec::new(),
@@ -1106,9 +1075,7 @@ mod tests {
             tp_size: 1,
             world_size: 1,
             device_id: 0,
-            num_layers: 1,
             layer_names: Vec::new(),
-            layer_ids: Vec::new(),
             wrapper_bytes: Vec::new(),
             num_blocks: Vec::new(),
             bytes_per_block: Vec::new(),

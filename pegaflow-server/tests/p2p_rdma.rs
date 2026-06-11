@@ -313,9 +313,7 @@ async fn p2p_rdma_remote_fetch_roundtrip() {
             0, // pp_rank
             1, // tp_size
             1, // world_size
-            1, // num_layers
             &[LAYER.to_string()],
-            &[0],
             &[gpu_a.as_u64()],
             &[TOTAL_SIZE],
             &[NUM_BLOCKS],
@@ -386,9 +384,7 @@ async fn p2p_rdma_remote_fetch_roundtrip() {
             0, // pp_rank
             1, // tp_size
             1, // world_size
-            1, // num_layers
             &[LAYER.to_string()],
-            &[0],
             &[gpu_b.as_u64()],
             &[TOTAL_SIZE],
             &[NUM_BLOCKS],

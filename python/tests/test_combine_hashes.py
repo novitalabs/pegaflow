@@ -36,7 +36,6 @@ def _make_ctx(
         "instance_id": "test",
         "namespace": "ns",
         "block_size": block_size,
-        "num_layers": 1,
         "tp_size": 1,
         "world_size": 1,
         "tp_rank": 0,

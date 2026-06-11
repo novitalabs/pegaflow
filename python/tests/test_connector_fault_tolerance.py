@@ -100,7 +100,6 @@ def _make_worker(
         instance_id="test_instance",
         namespace="ns",
         block_size=16,
-        num_layers=2,
         tp_size=1,
         world_size=1,
         tp_rank=0,
@@ -109,7 +108,6 @@ def _make_worker(
         state_manager=state_manager,
         pp_rank=pp_rank,
         pp_size=pp_size,
-        layer_id_by_name={"layer.0": 0, "layer.1": 1},
     )
     worker = WorkerConnector(ctx)
     # cross-layer mode skips forward_context layer enumeration so we can drive
@@ -317,14 +315,12 @@ def test_register_non_version_failure_reports_batch_layers(monkeypatch):
     assert "Register context batch failed for layers ['layer.0', 'layer.1']" in message
     assert "for layer.1" not in message
     assert len(client.register_calls) == 1
-    assert client.register_calls[0][7] == 2
-    assert client.register_calls[0][8] == ["layer.0", "layer.1"]
-    assert client.register_calls[0][9] == [0, 1]
+    assert client.register_calls[0][7] == ["layer.0", "layer.1"]
 
     worker.shutdown()
 
 
-def test_cross_layer_registration_uses_pp_rank_as_layer_id(monkeypatch):
+def test_cross_layer_registration_uses_pp_suffixed_name(monkeypatch):
     worker, client, _ = _make_worker(pp_rank=1, pp_size=4)
 
     monkeypatch.setattr("pegaflow.connector.worker.CudaIPCWrapper", FakeCudaIPCWrapper)
@@ -332,9 +328,7 @@ def test_cross_layer_registration_uses_pp_rank_as_layer_id(monkeypatch):
     worker.register_cross_layers_kv_cache(FakeTensor(), attn_backend=object())
 
     assert len(client.register_calls) == 1
-    assert client.register_calls[0][7] == 4
-    assert client.register_calls[0][8] == ["ALL_LAYERS_pp1"]
-    assert client.register_calls[0][9] == [1]
+    assert client.register_calls[0][7] == ["ALL_LAYERS_pp1"]
 
     worker.shutdown()
 

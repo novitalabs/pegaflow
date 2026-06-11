@@ -7,15 +7,22 @@ message ResponseStatus {
   string message = 2;
 }
 
-// Batch registration request for all layers on a GPU (reduces N RPCs to 1)
+// Batch registration request for all layers on a GPU (reduces N RPCs to 1).
+//
+// Workers declare only the layers that actually exist on the device; the
+// engine derives the instance-wide layer-id space once all `world_size`
+// workers have registered. Fields 7 (num_layers) and 16 (layer_ids) carried
+// the connector-guessed topology and are retired.
 message RegisterContextRequest {
+  reserved 7, 16;
+  reserved "num_layers", "layer_ids";
+
   string instance_id = 1;
   string namespace = 2;
   uint32 tp_rank = 3;
   uint32 tp_size = 4;
   uint32 world_size = 5;
   int32 device_id = 6;
-  uint32 num_layers = 7;
   repeated string layer_names = 8;
   repeated bytes wrapper_bytes = 9;
   repeated uint64 num_blocks = 10;
@@ -24,7 +31,6 @@ message RegisterContextRequest {
   repeated uint32 segments = 13;
   uint32 pp_rank = 14;
   string client_version = 15;
-  repeated uint32 layer_ids = 16;
 }
 
 message RegisterContextResponse {

@@ -179,9 +179,9 @@ impl PegaEngine {
         let total_layers = saves.len();
 
         let instance = self.get_instance(instance_id)?;
-        instance.ensure_all_slots_registered()?;
+        let topology = instance.sealed_topology()?;
         let namespace = instance.namespace().to_string();
-        let total_slots = instance.total_slots();
+        let total_slots = topology.total_slots();
 
         // ── Phase 0: Resolve per-layer metadata and build valid_blocks ──
         trace_scope!("save.resolve_metadata", _s);
@@ -208,15 +208,13 @@ impl PegaEngine {
                 )));
             }
 
-            let layer_id = instance.get_layer_id(&layer_name).ok_or_else(|| {
-                EngineError::InvalidArgument(format!("layer {layer_name} unknown"))
-            })?;
+            let layer_id = topology.layer_id(&layer_name)?;
 
             let layout = gpu_context.get_layout(&layer_name).ok_or_else(|| {
                 EngineError::InvalidArgument(format!("layer {layer_name} not registered on device"))
             })?;
 
-            let slot_id = instance.get_slot_index(layer_id, tp_rank)?;
+            let slot_id = topology.slot_index(layer_id, tp_rank)?;
 
             let num_blocks = layout.num_blocks();
 

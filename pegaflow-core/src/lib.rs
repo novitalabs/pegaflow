@@ -185,7 +185,6 @@ impl PegaEngine {
         &self,
         instance_id: &str,
         namespace: &str,
-        num_layers: usize,
         tp_size: usize,
         world_size: usize,
     ) -> Result<Arc<InstanceContext>, EngineError> {
@@ -196,11 +195,9 @@ impl PegaEngine {
 
         if let Some(instance) = instances.get(instance_id) {
             // Already exists, verify topology
-            instance
-                .verify_topology(num_layers, tp_size, world_size)
-                .map_err(|e| {
-                    EngineError::TopologyMismatch(format!("instance {instance_id} {e}"))
-                })?;
+            instance.verify_topology(tp_size, world_size).map_err(|e| {
+                EngineError::TopologyMismatch(format!("instance {instance_id} {e}"))
+            })?;
             return Ok(Arc::clone(instance));
         }
 
@@ -208,7 +205,6 @@ impl PegaEngine {
         let instance = InstanceContext::new(
             instance_id.to_string(),
             namespace.to_string(),
-            num_layers,
             tp_size,
             world_size,
         )
@@ -235,11 +231,14 @@ impl PegaEngine {
     ///
     /// Argument contract:
     /// - `device_id` must be non-negative; RPC callers validate this in service.rs.
-    /// - `num_layers`, `tp_size`, and `world_size` must be non-zero.
+    /// - `tp_size` and `world_size` must be non-zero.
     /// - `tp_rank` must be less than `tp_size`.
     /// - Layer metadata arrays must all have the same length as `layer_names`.
-    /// - `layer_ids` must be connector-declared IDs in `0..num_layers`.
     /// - Registration sizes and pointers must describe a valid KV cache layout.
+    ///
+    /// The instance's layer-id space is sealed by the engine once `world_size`
+    /// devices have registered; callers declare only the layers that actually
+    /// exist on each device.
     #[allow(
         clippy::too_many_arguments,
         reason = "public API mirrors one batched registration RPC payload"
@@ -253,9 +252,7 @@ impl PegaEngine {
         pp_rank: usize,
         tp_size: usize,
         world_size: usize,
-        num_layers: usize,
         layer_names: &[String],
-        layer_ids: &[usize],
         data_ptrs: &[u64],
         size_bytes_list: &[usize],
         num_blocks_list: &[usize],
@@ -272,9 +269,7 @@ impl PegaEngine {
             pp_rank,
             tp_size,
             world_size,
-            num_layers,
             layer_names,
-            layer_ids,
             data_ptrs,
             size_bytes_list,
             num_blocks_list,
@@ -302,9 +297,7 @@ impl PegaEngine {
         pp_rank: usize,
         tp_size: usize,
         world_size: usize,
-        num_layers: usize,
         layer_names: &[String],
-        layer_ids: &[usize],
         data_ptrs: &[u64],
         size_bytes_list: &[usize],
         num_blocks_list: &[usize],
@@ -316,8 +309,7 @@ impl PegaEngine {
         // Build all registrations
         let ssd_enabled = self.storage.is_ssd_enabled();
         let batch_size = layer_names.len();
-        if layer_ids.len() != batch_size
-            || data_ptrs.len() != batch_size
+        if data_ptrs.len() != batch_size
             || size_bytes_list.len() != batch_size
             || num_blocks_list.len() != batch_size
             || bytes_per_block_list.len() != batch_size
@@ -325,8 +317,7 @@ impl PegaEngine {
             || segments_list.len() != batch_size
         {
             return Err(EngineError::InvalidArgument(format!(
-                "registration metadata length mismatch: layer_names={batch_size}, layer_ids={}, data_ptrs={}, size_bytes={}, num_blocks={}, bytes_per_block={}, kv_stride_bytes={}, segments={}",
-                layer_ids.len(),
+                "registration metadata length mismatch: layer_names={batch_size}, data_ptrs={}, size_bytes={}, num_blocks={}, bytes_per_block={}, kv_stride_bytes={}, segments={}",
                 data_ptrs.len(),
                 size_bytes_list.len(),
                 num_blocks_list.len(),
@@ -344,7 +335,6 @@ impl PegaEngine {
             )));
         }
         let mut kv_caches = HashMap::with_capacity(batch_size);
-        let mut layer_ids_by_name = HashMap::with_capacity(batch_size);
 
         for i in 0..batch_size {
             let layer_name = &layer_names[i];
@@ -380,12 +370,10 @@ impl PegaEngine {
                     "duplicate layer name in registration batch: {layer_name}"
                 )));
             }
-            layer_ids_by_name.insert(layer_name.clone(), layer_ids[i]);
         }
 
         // Get or create instance
-        let instance =
-            self.get_or_create_instance(instance_id, namespace, num_layers, tp_size, world_size)?;
+        let instance = self.get_or_create_instance(instance_id, namespace, tp_size, world_size)?;
 
         // Get NUMA affinity for this GPU
         let numa_node = self.topology.numa_for_gpu(device_id);
@@ -408,12 +396,11 @@ impl PegaEngine {
             numa_node,
             transfer_mode: self.transfer_mode,
             kv_caches,
-            layer_ids_by_name,
         })?;
 
         info!(
             "Registered context batch: instance={instance_id}, namespace={namespace}, \
-             device={device_id}, num_layers={num_layers}, tp_rank={tp_rank}/{tp_size}, pp_rank={pp_rank}"
+             device={device_id}, layers={batch_size}, tp_rank={tp_rank}/{tp_size}, pp_rank={pp_rank}"
         );
         Ok(())
     }
@@ -634,7 +621,7 @@ impl PegaEngine {
         completion: LoadCompletion,
     ) -> Result<(), EngineError> {
         let instance = self.get_instance(instance_id)?;
-        instance.ensure_all_slots_registered()?;
+        let topology = instance.sealed_topology()?;
         let gpu = instance
             .get_gpu(device_id)
             .ok_or_else(|| EngineError::WorkerMissing(instance_id.to_string(), device_id))?;
@@ -655,6 +642,21 @@ impl PegaEngine {
                     lease_block_ids.len()
                 )));
             }
+            // A stored block must carry exactly this instance's slot layout.
+            // A mismatch means the namespace is shared by instances with
+            // different layer sets (e.g. MTP enabled vs disabled) — loading
+            // would silently leave layers uninitialized, so fail loudly and
+            // let vLLM recompute.
+            for block in &blocks {
+                if block.slots().len() != topology.total_slots() {
+                    return Err(EngineError::InvalidArgument(format!(
+                        "stored block has {} slots but instance {instance_id} expects {}: \
+                         namespace is shared by incompatible KV layouts",
+                        block.slots().len(),
+                        topology.total_slots()
+                    )));
+                }
+            }
             block_ids.extend_from_slice(lease_block_ids);
             block_cache.extend(blocks);
         }
@@ -665,11 +667,7 @@ impl PegaEngine {
         let mut layers = Vec::with_capacity(layer_names.len());
 
         for layer_name in layer_names {
-            let layer_id = instance.get_layer_id(layer_name).ok_or_else(|| {
-                EngineError::InvalidArgument(format!(
-                    "layer {layer_name} unknown for instance {instance_id}"
-                ))
-            })?;
+            let layer_id = topology.layer_id(layer_name)?;
 
             let layout = gpu.get_layout(layer_name).ok_or_else(|| {
                 EngineError::InvalidArgument(format!(
@@ -677,16 +675,20 @@ impl PegaEngine {
                 ))
             })?;
 
-            let slot_id = instance.get_slot_index(layer_id, tp_rank)?;
+            let slot_id = topology.slot_index(layer_id, tp_rank)?;
 
             let mut blocks = Vec::with_capacity(block_ids.len());
             for (block_id, block_entry) in block_ids.iter().zip(block_cache.iter()) {
-                let Ok(block_idx) = usize::try_from(*block_id) else {
-                    continue;
-                };
-                let Some(block) = block_entry.get_slot(slot_id) else {
-                    continue;
-                };
+                let block_idx = usize::try_from(*block_id).map_err(|_| {
+                    EngineError::InvalidArgument(format!(
+                        "negative destination block id {block_id} for layer {layer_name}"
+                    ))
+                })?;
+                let block = block_entry.get_slot(slot_id).ok_or_else(|| {
+                    EngineError::InvalidArgument(format!(
+                        "stored block is missing slot {slot_id} for layer {layer_name}"
+                    ))
+                })?;
                 blocks.push(TransferBlock {
                     block_idx,
                     block: Arc::clone(block),

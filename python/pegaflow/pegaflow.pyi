@@ -69,9 +69,7 @@ class EngineRpcClient:
         tp_size: int,
         world_size: int,
         device_id: int,
-        num_layers: int,
         layer_names: list[str],
-        layer_ids: list[int],
         wrapper_bytes_list: list[bytes],
         num_blocks_list: list[int],
         bytes_per_block_list: list[int],
@@ -80,9 +78,13 @@ class EngineRpcClient:
     ) -> tuple[bool, str]:
         """Register all KV cache layers on a GPU with a single RPC call.
 
-        Contract: device_id must be non-negative; num_layers, tp_size,
-        and world_size must be non-zero; tp_rank must be less than tp_size;
-        per-layer metadata lists must have the same non-zero length.
+        Workers declare only the layers that actually exist on the device;
+        the engine derives the instance-wide layer-id space once all
+        world_size workers have registered.
+
+        Contract: device_id must be non-negative; tp_size and world_size
+        must be non-zero; tp_rank must be less than tp_size; per-layer
+        metadata lists must have the same non-zero length.
 
         Args:
             instance_id: Model instance ID.
@@ -92,9 +94,7 @@ class EngineRpcClient:
             tp_size: Total tensor parallel size.
             world_size: Total worker count (TP * PP * PCP).
             device_id: CUDA device ID.
-            num_layers: Number of model layers.
             layer_names: List of layer names.
-            layer_ids: Canonical numeric layer IDs parallel to layer_names.
             wrapper_bytes_list: List of serialized CUDA IPC tensor wrappers.
             num_blocks_list: List of block counts per layer.
             bytes_per_block_list: List of block sizes per layer.

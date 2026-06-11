@@ -14,6 +14,13 @@ fn test_cuda_context() -> Arc<CudaContext> {
     Arc::clone(ctx)
 }
 
+/// True when the host exposes at least `n` CUDA devices. Multi-worker envs
+/// register one device per worker; tests that need more devices than the
+/// host has should skip instead of failing.
+pub fn has_cuda_devices(n: usize) -> bool {
+    (0..n).all(|device_id| CudaContext::new(device_id).is_ok())
+}
+
 // ---------------------------------------------------------------------------
 // TestGpuData: GPU buffer + expected content
 // ---------------------------------------------------------------------------
@@ -237,18 +244,23 @@ impl TestEnvBuilder {
             })
             .collect();
 
-        register_layers(
-            &engine,
-            self.instance_id,
-            self.namespace,
-            &layer_infos,
-            0,
-            0,
-            0,
-            1,
-            self.world_size,
-            layers.len(),
-        );
+        // The engine seals the instance topology only after `world_size`
+        // devices have registered. Multi-worker envs register the same layer
+        // set from each device at effective tp_rank 0 — the MLA replica
+        // shape — so device 0 stays the save/load target.
+        for device_id in 0..self.world_size {
+            register_layers(
+                &engine,
+                self.instance_id,
+                self.namespace,
+                &layer_infos,
+                device_id as i32,
+                0,
+                0,
+                1,
+                self.world_size,
+            );
+        }
 
         TestEnv {
             engine,

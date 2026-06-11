@@ -188,7 +188,6 @@ class WorkerConnector:
         self._failed_load_reqs: set[str] = set()
 
         self._registered_layers: list[str] = []
-        self._layer_name_to_id: dict[str, int] = {}
         self._torch_device: torch.device | None = None
 
         self._cross_layer_mode = False
@@ -216,30 +215,13 @@ class WorkerConnector:
 
         self._registered_layers.clear()
 
-    def _canonical_layer_id(self, layer_name: str) -> int:
-        layer_id_by_name = self._ctx.layer_id_by_name or {}
-        if layer_name in layer_id_by_name:
-            layer_id = layer_id_by_name[layer_name]
-        else:
-            raise RuntimeError(
-                f"Cannot determine canonical layer id for {layer_name}; "
-                "vLLM did not expose a parseable layer index"
-            )
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        """Register exactly the KV caches vLLM built on this device.
 
-        if layer_id < 0 or layer_id >= self._ctx.num_layers:
-            raise RuntimeError(
-                f"Canonical layer id {layer_id} for {layer_name} is out of "
-                f"range for num_layers={self._ctx.num_layers}"
-            )
-        return layer_id
-
-    def register_kv_caches(
-        self,
-        kv_caches: dict[str, torch.Tensor],
-        *,
-        layer_ids: list[int] | None = None,
-        instance_num_layers: int | None = None,
-    ):
+        The engine derives the instance-wide layer-id space once every worker
+        has registered, so optional speculative MTP layers, external drafters,
+        and hybrid attention layouts need no connector-side layer accounting.
+        """
         assert self._ctx.device_id is not None, (
             "CUDA device id is unknown; cannot register KV caches"
         )
@@ -247,26 +229,9 @@ class WorkerConnector:
         self._registered_layers = list(kv_caches.keys())
         self._torch_device = next(iter(kv_caches.values())).device
 
-        if layer_ids is None:
-            layer_ids = [self._canonical_layer_id(layer_name) for layer_name in kv_caches]
-        if len(layer_ids) != len(kv_caches):
-            raise RuntimeError(
-                f"layer_ids length {len(layer_ids)} does not match kv_caches length {len(kv_caches)}"
-            )
-
-        self._layer_name_to_id.clear()
-        for layer_id, layer_name in zip(layer_ids, kv_caches.keys(), strict=True):
-            self._layer_name_to_id[layer_name] = layer_id
-
-        if instance_num_layers is None:
-            instance_num_layers = self._ctx.num_layers
-        if instance_num_layers <= 0:
-            raise RuntimeError(f"instance_num_layers must be positive, got {instance_num_layers}")
-
         layout = "unknown"
 
         layer_names = []
-        rpc_layer_ids = []
         ipc_wrappers = []
         layer_num_blocks = []
         layer_bytes_per_block = []
@@ -292,7 +257,6 @@ class WorkerConnector:
             layout = registration.layout
 
             layer_names.append(layer_name)
-            rpc_layer_ids.append(self._layer_name_to_id[layer_name])
             ipc_wrappers.append(wrapper_bytes)
             layer_num_blocks.append(registration.num_blocks)
             layer_bytes_per_block.append(registration.bytes_per_block)
@@ -320,9 +284,7 @@ class WorkerConnector:
             self._ctx.effective_tp_size,
             self._ctx.world_size,
             self._ctx.device_id,
-            instance_num_layers,
             layer_names,
-            rpc_layer_ids,
             ipc_wrappers,
             layer_num_blocks,
             layer_bytes_per_block,
@@ -360,11 +322,7 @@ class WorkerConnector:
             self._cross_layer_key = f"{_CROSS_LAYER_KEY}_pp{self._ctx.pp_rank}"
         else:
             self._cross_layer_key = _CROSS_LAYER_KEY
-        self.register_kv_caches(
-            {self._cross_layer_key: kv_cache},
-            layer_ids=[self._ctx.pp_rank],
-            instance_num_layers=self._ctx.pp_size,
-        )
+        self.register_kv_caches({self._cross_layer_key: kv_cache})
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str] | None, set[str] | None]:
         finished_sending: set[str] | None = None

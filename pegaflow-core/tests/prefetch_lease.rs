@@ -29,6 +29,11 @@ async fn load_requires_query_prefetch() {
 /// One scheduler query lease is consumed once per registered world-size worker.
 #[tokio::test]
 async fn query_then_load_consumes_reservation_budget() {
+    if !has_cuda_devices(2) {
+        eprintln!("skipping query_then_load_consumes_reservation_budget: needs >= 2 CUDA devices");
+        return;
+    }
+
     let env = TestEnvBuilder::new("test-query-lease", "test-ns")
         .layer("layer_0", 4, 1024)
         .world_size(2)

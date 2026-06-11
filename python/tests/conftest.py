@@ -205,7 +205,6 @@ class ClientContext:
 
         # Map layer index to layer name (for compatibility with vLLM)
         self._layer_names = [f"layer_{i}" for i in range(num_layers)]
-        self._layer_name_to_id = {name: i for i, name in enumerate(self._layer_names)}
         self._registered = False
 
     def register_kv_caches(self) -> None:
@@ -217,6 +216,13 @@ class ClientContext:
             return
 
         kv_caches = {name: self.gpu_kv_caches[i] for i, name in enumerate(self._layer_names)}
+
+        layer_names: list[str] = []
+        wrapper_bytes_list: list[bytes] = []
+        num_blocks_list: list[int] = []
+        bytes_per_block_list: list[int] = []
+        kv_stride_bytes_list: list[int] = []
+        segments_list: list[int] = []
 
         for layer_name, kv_cache in kv_caches.items():
             if not kv_cache.is_contiguous():
@@ -242,26 +248,33 @@ class ClientContext:
                 kv_stride_bytes = 0
                 segments = 1
 
-            ok, message = self.engine_client.register_context_batch(
-                self.instance_id,
-                self.namespace,
-                0,  # tp_rank
-                0,  # pp_rank
-                1,  # tp_size
-                1,  # world_size
-                self.device_id,
-                self.num_layers,
-                [layer_name],
-                [self._layer_name_to_id[layer_name]],
-                [wrapper_bytes],
-                [num_blocks],
-                [bytes_per_block],
-                [kv_stride_bytes],
-                [segments],
-            )
+            layer_names.append(layer_name)
+            wrapper_bytes_list.append(wrapper_bytes)
+            num_blocks_list.append(num_blocks)
+            bytes_per_block_list.append(bytes_per_block)
+            kv_stride_bytes_list.append(kv_stride_bytes)
+            segments_list.append(segments)
 
-            if not ok:
-                raise RuntimeError(f"Register context failed for {layer_name}: {message}")
+        # One batch per device, like the production worker: the engine seals
+        # the instance topology once all world_size devices have registered.
+        ok, message = self.engine_client.register_context_batch(
+            self.instance_id,
+            self.namespace,
+            0,  # tp_rank
+            0,  # pp_rank
+            1,  # tp_size
+            1,  # world_size
+            self.device_id,
+            layer_names,
+            wrapper_bytes_list,
+            num_blocks_list,
+            bytes_per_block_list,
+            kv_stride_bytes_list,
+            segments_list,
+        )
+
+        if not ok:
+            raise RuntimeError(f"Register context failed for {layer_names}: {message}")
 
         self._registered = True
 

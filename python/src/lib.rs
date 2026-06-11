@@ -242,9 +242,13 @@ impl EngineRpcClient {
 
     /// Register all KV cache layers on a GPU with a single RPC call.
     ///
+    /// Workers declare only the layers that actually exist on the device; the
+    /// engine derives the instance-wide layer-id space once all `world_size`
+    /// workers have registered.
+    ///
     /// Argument contract:
     /// - `device_id` must be non-negative.
-    /// - `num_layers`, `tp_size`, and `world_size` must be non-zero.
+    /// - `tp_size` and `world_size` must be non-zero.
     /// - `tp_rank` must be less than `tp_size`.
     /// - Per-layer metadata lists must have the same non-zero length.
     ///
@@ -256,9 +260,7 @@ impl EngineRpcClient {
     ///     tp_size: Total Tensor Parallel size
     ///     world_size: Total worker count (TP * PP * PCP)
     ///     device_id: CUDA device ID of the worker
-    ///     num_layers: Total number of layers in the model
     ///     layer_names: List of layer names
-    ///     layer_ids: Canonical numeric layer IDs parallel to layer_names
     ///     wrapper_bytes_list: List of serialized CUDA tensor wrappers
     ///     num_blocks_list: List of block counts per layer
     ///     bytes_per_block_list: List of block sizes per layer
@@ -270,7 +272,7 @@ impl EngineRpcClient {
         clippy::too_many_arguments,
         reason = "PyO3 binding mirrors the public batch registration call shape"
     )]
-    #[pyo3(signature = (instance_id, namespace, tp_rank, pp_rank, tp_size, world_size, device_id, num_layers, layer_names, layer_ids, wrapper_bytes_list, num_blocks_list, bytes_per_block_list, kv_stride_bytes_list, segments_list))]
+    #[pyo3(signature = (instance_id, namespace, tp_rank, pp_rank, tp_size, world_size, device_id, layer_names, wrapper_bytes_list, num_blocks_list, bytes_per_block_list, kv_stride_bytes_list, segments_list))]
     fn register_context_batch(
         &self,
         py: Python<'_>,
@@ -281,9 +283,7 @@ impl EngineRpcClient {
         tp_size: u32,
         world_size: u32,
         device_id: i32,
-        num_layers: u32,
         layer_names: Vec<String>,
-        layer_ids: Vec<u32>,
         wrapper_bytes_list: Vec<Vec<u8>>,
         num_blocks_list: Vec<u64>,
         bytes_per_block_list: Vec<u64>,
@@ -300,9 +300,7 @@ impl EngineRpcClient {
                     tp_size,
                     world_size,
                     device_id,
-                    num_layers,
                     layer_names,
-                    layer_ids,
                     wrapper_bytes: wrapper_bytes_list,
                     num_blocks: num_blocks_list,
                     bytes_per_block: bytes_per_block_list,
