@@ -40,7 +40,7 @@ def test_pd_worker_wait_handshake_uses_registered_native_mr_desc() -> None:
     layer = handshake["layers"][0]
     assert layer["mr_desc"] == {
         "ptr": tensor.data_ptr(),
-        "addr_rkey_list": [("10.0.0.1:1", 17)],
+        "addr_rkey_list": [["10.0.0.1:1", 17]],
     }
     assert layer["block_ids"] == [1]
     assert handshake["expected_imm_count"] == 1

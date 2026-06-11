@@ -1958,6 +1958,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pegaflow-pd-wire"
+version = "0.22.8"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "pegaflow-proto"
 version = "0.22.8"
 dependencies = [
@@ -1975,6 +1983,7 @@ dependencies = [
  "pegaflow-common",
  "pegaflow-core",
  "pegaflow-metaserver",
+ "pegaflow-pd-wire",
  "pegaflow-proto",
  "pegaflow-server",
  "pegaflow-transfer",

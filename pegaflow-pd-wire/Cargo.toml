@@ -1,0 +1,13 @@
+[package]
+name = "pegaflow-pd-wire"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Sealed wire schema for the PegaFlow P/D KV-push handshake"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

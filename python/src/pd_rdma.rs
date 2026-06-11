@@ -1,5 +1,6 @@
 use crate::{PegaFlowError, u64_to_usize};
 
+use pegaflow_pd_wire as pd_wire;
 use pegaflow_transfer::v2::{
     CudaDeviceId, Device, DomainAddress, DomainGroupRouting, FabricLibError, GroupTransferRouting,
     ImmCounter, ImmTransferRequest, MemoryRegionDescriptor, MemoryRegionHandle,
@@ -51,19 +52,6 @@ where
         .get_item(key)?
         .ok_or_else(|| PyValueError::new_err(format!("missing {key}")))?;
     value.extract()
-}
-
-fn py_get_optional<'py, T>(dict: &Bound<'py, PyDict>, key: &str) -> PyResult<Option<T>>
-where
-    for<'a> T: FromPyObject<'a, 'py, Error = PyErr>,
-{
-    let Some(value) = dict.get_item(key)? else {
-        return Ok(None);
-    };
-    if value.is_none() {
-        return Ok(None);
-    }
-    value.extract().map(Some)
 }
 
 fn wait_atomic_count(counter: &AtomicI64, target: i64, timeout: Duration) -> bool {
@@ -534,37 +522,53 @@ impl PdRdmaEngine {
         &self,
         py: Python<'_>,
         req_id: String,
-        handshake: Py<PyDict>,
+        handshake_json: String,
     ) -> PyResult<()> {
-        let handshake = handshake.bind(py);
-        let remote_request_id: String = py_get(handshake, "request_id")?;
-        let imm = match handshake.get_item("imm_id")? {
-            Some(value) if !value.is_none() => value.extract()?,
-            _ => pd_imm(&remote_request_id),
-        };
-        let fail_imm = match handshake.get_item("fail_imm_id")? {
-            Some(value) if !value.is_none() => value.extract()?,
-            _ => pd_fail_imm(imm),
-        };
-        let abort_imm = match handshake.get_item("abort_imm_id")? {
-            Some(value) if !value.is_none() => value.extract()?,
-            _ => pd_abort_imm(imm),
-        };
-        if fail_imm == imm {
-            return Err(PyValueError::new_err("fail_imm_id must differ from imm_id"));
-        }
-        if abort_imm == imm || abort_imm == fail_imm {
+        // The wire crate owns the schema: parsing implies full validation.
+        let handshake = py
+            .detach(|| pd_wire::Handshake::from_json(&handshake_json))
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let remote_request_id = handshake.request_id.clone();
+        let imm = handshake
+            .imm_id
+            .unwrap_or_else(|| pd_imm(&remote_request_id));
+        let fail_imm = handshake.fail_imm_id().unwrap_or_else(|| pd_fail_imm(imm));
+        let abort_imm = handshake
+            .abort_imm_id()
+            .unwrap_or_else(|| pd_abort_imm(imm));
+        if fail_imm == imm || abort_imm == imm || abort_imm == fail_imm {
             return Err(PyValueError::new_err(
-                "abort_imm_id must differ from imm_id and fail_imm_id",
+                "imm_id, fail_imm_id and abort_imm_id must be distinct",
             ));
         }
-        let expected_imm_count = match handshake.get_item("expected_imm_count")? {
-            Some(value) if !value.is_none() => value.extract::<u32>()?,
-            _ => 1,
-        };
-        if expected_imm_count == 0 {
-            return Err(PyValueError::new_err("expected_imm_count must be positive"));
+        let expected_imm_count = handshake.expected_imm_count.get();
+
+        let mut layers = HashMap::new();
+        for layer in &handshake.layers {
+            let block_ids = handshake.layer_block_ids(layer).ok_or_else(|| {
+                PyValueError::new_err(format!("remote layer {} has no block_ids", layer.layer_idx))
+            })?;
+            let mr_desc = layer.mr_desc.as_ref().ok_or_else(|| {
+                PyValueError::new_err(format!("remote layer {} missing mr_desc", layer.layer_idx))
+            })?;
+            layers.insert(
+                layer.layer_idx,
+                PdRemoteLayer {
+                    mr_desc: mr_desc_from_wire(mr_desc)?,
+                    allowed_block_ids: block_ids.iter().copied().collect::<HashSet<_>>(),
+                    regions: layer
+                        .regions
+                        .iter()
+                        .map(|region| PdRemoteRegion {
+                            base_addr: region.base_addr,
+                            block_len: region.block_len,
+                            block_stride: region.block_stride(),
+                        })
+                        .collect(),
+                },
+            );
         }
+
         self.imm_to_req.lock().unwrap().insert(imm, req_id.clone());
         self.imm_counters
             .lock()
@@ -582,70 +586,6 @@ impl PdRdmaEngine {
             .entry(abort_counter_key(&req_id))
             .or_insert_with(|| self.engine.get_imm_counter(abort_imm));
 
-        let layers_any = handshake
-            .get_item("layers")?
-            .ok_or_else(|| PyValueError::new_err("handshake missing layers"))?;
-        let mut layers = HashMap::new();
-        for layer_any in layers_any.try_iter()? {
-            let layer = layer_any?.cast_into::<PyDict>()?;
-            let layer_idx: u64 = py_get(&layer, "layer_idx")?;
-            let block_ids: Vec<u64> = py_get(&layer, "block_ids")?;
-            if block_ids.is_empty() {
-                return Err(PyValueError::new_err(format!(
-                    "remote layer {layer_idx} has no block_ids"
-                )));
-            }
-            let allowed_block_ids = block_ids.iter().copied().collect::<HashSet<_>>();
-            if allowed_block_ids.len() != block_ids.len() {
-                return Err(PyValueError::new_err(format!(
-                    "remote layer {layer_idx} has duplicate block_ids"
-                )));
-            }
-            let regions_any = layer
-                .get_item("regions")?
-                .ok_or_else(|| PyValueError::new_err("remote layer missing regions"))?;
-            let mut regions = Vec::new();
-            for (expected_region_idx, region_any) in regions_any.try_iter()?.enumerate() {
-                let region = region_any?.cast_into::<PyDict>()?;
-                let region_idx: usize = py_get(&region, "region_idx")?;
-                if region_idx != expected_region_idx {
-                    return Err(PyValueError::new_err(format!(
-                        "remote layer {layer_idx} regions must be ordered by region_idx"
-                    )));
-                }
-                let base_addr: u64 = py_get(&region, "base_addr")?;
-                let block_len: u64 = py_get(&region, "block_len")?;
-                let block_stride: u64 =
-                    py_get_optional(&region, "block_stride")?.unwrap_or(block_len);
-                if base_addr == 0 || block_len == 0 || block_stride < block_len {
-                    return Err(PyValueError::new_err(format!(
-                        "remote layer {layer_idx} region {region_idx} has invalid address range"
-                    )));
-                }
-                regions.push(PdRemoteRegion {
-                    base_addr,
-                    block_len,
-                    block_stride,
-                });
-            }
-            if regions.is_empty() {
-                return Err(PyValueError::new_err(format!(
-                    "remote layer {layer_idx} has no regions"
-                )));
-            }
-            let mr_desc_any = layer
-                .get_item("mr_desc")?
-                .ok_or_else(|| PyValueError::new_err("remote layer missing mr_desc"))?;
-            let mr_desc = mr_desc_from_py(&mr_desc_any.cast_into::<PyDict>()?)?;
-            layers.insert(
-                layer_idx,
-                PdRemoteLayer {
-                    mr_desc,
-                    allowed_block_ids,
-                    regions,
-                },
-            );
-        }
         let layer_count = layers.len();
         let blocks_per_layer = layers
             .values()
@@ -1350,18 +1290,16 @@ fn mr_desc_to_py(py: Python<'_>, mr_desc: &MemoryRegionDescriptor) -> PyResult<P
     Ok(out.into_any().unbind())
 }
 
-fn mr_desc_from_py(dict: &Bound<'_, PyDict>) -> PyResult<MemoryRegionDescriptor> {
-    let ptr: u64 = py_get(dict, "ptr")?;
-    let addr_rkey_list: Vec<(String, u64)> = py_get(dict, "addr_rkey_list")?;
+fn mr_desc_from_wire(mr_desc: &pd_wire::MrDesc) -> PyResult<MemoryRegionDescriptor> {
     let mut pairs = SmallVec::new();
-    for (addr, rkey) in addr_rkey_list {
+    for (addr, rkey) in &mr_desc.addr_rkey_list {
         let addr = addr
             .parse::<DomainAddress>()
             .map_err(|err| pd_rdma_error("invalid DomainAddress", err))?;
-        pairs.push((addr, MemoryRegionRemoteKey(rkey)));
+        pairs.push((addr, MemoryRegionRemoteKey(*rkey)));
     }
     Ok(MemoryRegionDescriptor {
-        ptr,
+        ptr: mr_desc.ptr,
         addr_rkey_list: pairs,
     })
 }

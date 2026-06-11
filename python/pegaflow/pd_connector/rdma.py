@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -97,8 +98,7 @@ class MockRdmaPort:
 
     def write_stats(self, req_id: str) -> dict[str, Any]:
         bytes_total = sum(
-            block_slices_bytes(blocks)
-            for _, blocks in self.pushed_layers.get(req_id, [])
+            block_slices_bytes(blocks) for _, blocks in self.pushed_layers.get(req_id, [])
         )
         return {
             "submitted": len(self.pushed_layers.get(req_id, [])),
@@ -229,12 +229,6 @@ def _layer_from_native(layer: LayerRemoteLayout | dict[str, Any]) -> LayerRemote
     return layer_layout_from_dict(layer)
 
 
-def _handshake_to_native(handshake: PdHandshake) -> dict[str, Any]:
-    data = handshake_to_dict(handshake)
-    data["layers"] = [_layer_to_native(layer) for layer in handshake.layers]
-    return data
-
-
 def _mr_desc_to_native(mr_desc: Any | None) -> Any | None:
     if not isinstance(mr_desc, dict):
         return mr_desc
@@ -277,7 +271,8 @@ class RealRdmaPort:
 
     def open_request(self, req_id: str, handshake: PdHandshake) -> None:
         start = time.perf_counter()
-        self.engine.register_remote(req_id, _handshake_to_native(handshake))
+        # The native engine consumes the sealed wire JSON (pegaflow-pd-wire).
+        self.engine.register_remote(req_id, json.dumps(handshake_to_dict(handshake)))
         elapsed_ms = (time.perf_counter() - start) * 1000
         blocks_per_layer = len(handshake.layers[0].block_ids) if handshake.layers else 0
         logger.info(
