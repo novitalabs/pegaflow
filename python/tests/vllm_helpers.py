@@ -350,6 +350,12 @@ class PegaFlowServer:
         import sysconfig
 
         env = os.environ.copy()
+        # The connector reports global device ids (it un-maps
+        # CUDA_VISIBLE_DEVICES before registering); the server must see every
+        # GPU so those ids and the IPC tensor devices line up. Without this, a
+        # masked pytest run (e.g. CUDA_VISIBLE_DEVICES=1,2 on a shared box)
+        # fails registration with "pinned to device N but got M".
+        env.pop("CUDA_VISIBLE_DEVICES", None)
         env["PYTHONHASHSEED"] = "0"
         env["PYO3_PYTHON"] = sys.executable
         env["PYTHONHOME"] = sys.base_prefix
