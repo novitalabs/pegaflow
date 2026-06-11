@@ -792,11 +792,16 @@ impl PegaEngine {
         // The scan dereferences every slot Arc of every block; fan large
         // prefixes out across threads. The first global mismatch is the
         // minimum of the chunk-local first mismatches.
-        let homogeneous = if prefix.len() >= 256 {
+        // Gate and size the fanout by total (block, slot) visits, like the
+        // push replay: a short prefix over a wide template is still real
+        // work, and a long prefix over a narrow one is not.
+        let scan_visits = prefix.len().saturating_mul(template.len());
+        let homogeneous = if scan_visits >= 16384 {
             // Read-only scan: no refcount writes, so it scales with threads
-            // (unlike Arc-cloning builds). Keep chunks >= 64 blocks.
-            let threads = (prefix.len() / 64)
+            // (unlike Arc-cloning builds).
+            let threads = (scan_visits / 16384)
                 .clamp(1, 16)
+                .min(prefix.len())
                 .min(std::thread::available_parallelism().map_or(4, |n| n.get()));
             let chunk = prefix.len().div_ceil(threads);
             let template = &template;
@@ -977,6 +982,11 @@ impl PegaEngine {
             mr_index: u32,
             base: u64,
             end: u64,
+            /// Every segment in the run must have exactly this size — the
+            /// requester derived its addresses from it (`base + i * size`),
+            /// so a sum-level check alone would let compensating size
+            /// divergence land data at wrong offsets undetected.
+            seg_size: u64,
         }
         let mut runs: Vec<RunDst> = Vec::with_capacity(slot_numas.len() * 2);
         for (slot_idx, slot_numa) in slot_numas.iter().enumerate() {
@@ -1005,6 +1015,7 @@ impl PegaEngine {
                     mr_index: slab.mr_index,
                     base: slab.next,
                     end: slab.next + total,
+                    seg_size: size,
                 });
                 slab.next += total;
             }
@@ -1047,10 +1058,10 @@ impl PegaEngine {
                 if len == 0 {
                     continue;
                 }
-                if len > dst.end - cursor {
+                if len != dst.seg_size {
                     return Err(format!(
-                        "block segment overruns its run during replay: cursor=0x{cursor:x} len={len} run_end=0x{:x}",
-                        dst.end
+                        "block segment size {len} diverges from the session's first block ({}) in run {run_idx}",
+                        dst.seg_size
                     ));
                 }
                 let src = ptr.as_ptr() as u64;

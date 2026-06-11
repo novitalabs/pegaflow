@@ -245,6 +245,14 @@ async fn rdma_fetch_task(
 /// Destinations are assigned by slot-major bump allocation over the
 /// template; the wire request carries only the slab bases, and the holder
 /// replays the identical allocation to derive every address.
+///
+/// CANCELLATION: this future must not be dropped once the push RPC has
+/// been fired. Dropping it drops `numa_slabs` (and, after the
+/// spawn_blocking build finishes, the sealed blocks), recycling the slabs
+/// while the holder may still have RDMA WRITEs in flight — the leak-vs-
+/// recycle contract only holds when the future runs to completion. The
+/// sole caller is a detached prefetch task that is never aborted; do not
+/// wrap this in `timeout()`/`abort()` without rethinking that contract.
 async fn fetch_blocks_via_push(
     rdma: &RdmaTransport,
     allocate_fn: &AllocateFn,
