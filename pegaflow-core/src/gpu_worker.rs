@@ -314,15 +314,42 @@ fn build_copy_descs(layers: &[LayerTransferData]) -> Result<(Vec<CopyDesc>, usiz
                 .block_copies(block.block_idx)
                 .map_err(|e| EngineError::Storage(format!("layer {layer_name}: {e}")))?;
 
+            // The host block may come from a foreign source (shared
+            // namespace, SSD, remote node) whose geometry differs from this
+            // instance's layout. Copy sizes come from the layout, so verify
+            // each host segment is large enough before handing the ranges to
+            // CUDA — an undersized segment would be an out-of-bounds read or
+            // write on the pinned pool.
+            let check_segment = |seg_idx: usize, need: usize| -> Result<(), EngineError> {
+                let have = block
+                    .block
+                    .segment_size(seg_idx)
+                    .expect("caller checked segment presence");
+                if have < need {
+                    return Err(EngineError::Storage(format!(
+                        "layer {layer_name}: stored block segment {seg_idx} has {have} bytes \
+                         but layout needs {need}: namespace is shared by incompatible KV layouts"
+                    )));
+                }
+                Ok(())
+            };
+
             match block_copies {
                 BlockCopies::Split { k, v } => {
                     let k_ptr = block.block.segment_mapped_ptr(0).unwrap();
-                    // SAFETY: For a contiguous host block (segment 1 absent), the
-                    // allocation is 2 * segment size, so k + k.bytes is in bounds.
-                    let v_ptr = block
-                        .block
-                        .segment_mapped_ptr(1)
-                        .unwrap_or_else(|| k_ptr.add(k.bytes));
+                    let v_ptr = match block.block.segment_mapped_ptr(1) {
+                        Some(ptr) => {
+                            check_segment(0, k.bytes)?;
+                            check_segment(1, v.bytes)?;
+                            ptr
+                        }
+                        None => {
+                            // Contiguous host block holding both segments:
+                            // K and V are adjacent in one allocation.
+                            check_segment(0, k.bytes + v.bytes)?;
+                            k_ptr.add(k.bytes)
+                        }
+                    };
 
                     copies.push(CopyDesc {
                         device: k.addr,
@@ -339,6 +366,19 @@ fn build_copy_descs(layers: &[LayerTransferData]) -> Result<(Vec<CopyDesc>, usiz
                     total_bytes += k.bytes + v.bytes;
                 }
                 BlockCopies::Contiguous(c) => {
+                    // A multi-segment host block stores V in segment 1, not
+                    // at a byte offset inside segment 0 — one contiguous copy
+                    // cannot serve it even when segment 0's padding is large
+                    // enough to pass the size check.
+                    let num_segments = block.block.num_segments();
+                    if num_segments != 1 {
+                        return Err(EngineError::Storage(format!(
+                            "layer {layer_name}: stored block has {num_segments} segments \
+                             but layout expects one contiguous block: \
+                             namespace is shared by incompatible KV layouts"
+                        )));
+                    }
+                    check_segment(0, c.bytes)?;
                     let ptr = block.block.segment_mapped_ptr(0).unwrap();
                     copies.push(CopyDesc {
                         device: c.addr,
