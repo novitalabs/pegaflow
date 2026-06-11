@@ -1077,26 +1077,37 @@ impl PegaEngine {
             }
             Ok(out)
         };
-        let threads = (runs.len() / 16)
+        // Thread count scales with total (block, slot) visits, not run count:
+        // a single-block fetch has hundreds of runs but trivial work, and
+        // spawning threads for it costs more than the whole replay.
+        let total_visits = runs.len().saturating_mul(session_blocks.len());
+        let threads = (total_visits / 65536)
             .clamp(1, 8)
             .min(std::thread::available_parallelism().map_or(4, |n| n.get()));
-        let chunk = runs.len().div_ceil(threads).max(1);
-        let per_run_segments: Vec<Vec<PushSegment>> = std::thread::scope(|scope| {
-            let workers: Vec<_> = (0..threads)
-                .map(|t| {
-                    let lo = (t * chunk).min(runs.len());
-                    let hi = ((t + 1) * chunk).min(runs.len());
-                    let build_run = &build_run;
-                    scope.spawn(move || (lo..hi).map(build_run).collect::<Result<Vec<_>, _>>())
-                })
-                .collect();
-            workers
-                .into_iter()
-                .map(|w| w.join().expect("replay worker panicked"))
-                .collect::<Result<Vec<_>, _>>()
-                .map(|chunks| chunks.into_iter().flatten().collect())
-        })
-        .map_err(PushBlocksError::Rejected)?;
+        let per_run_segments: Vec<Vec<PushSegment>> = if threads == 1 {
+            (0..runs.len())
+                .map(&build_run)
+                .collect::<Result<_, _>>()
+                .map_err(PushBlocksError::Rejected)?
+        } else {
+            let chunk = runs.len().div_ceil(threads).max(1);
+            std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..threads)
+                    .map(|t| {
+                        let lo = (t * chunk).min(runs.len());
+                        let hi = ((t + 1) * chunk).min(runs.len());
+                        let build_run = &build_run;
+                        scope.spawn(move || (lo..hi).map(build_run).collect::<Result<Vec<_>, _>>())
+                    })
+                    .collect();
+                workers
+                    .into_iter()
+                    .map(|w| w.join().expect("replay worker panicked"))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(|chunks| chunks.into_iter().flatten().collect())
+            })
+            .map_err(PushBlocksError::Rejected)?
+        };
         let segments: Vec<PushSegment> = per_run_segments.into_iter().flatten().collect();
 
         let build_elapsed = build_start.elapsed();

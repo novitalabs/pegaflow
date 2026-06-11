@@ -438,32 +438,40 @@ fn build_sealed_blocks(
     };
     let mut columns: Vec<Option<Vec<Arc<RawBlock>>>> = Vec::new();
     columns.resize_with(template.len(), || None);
-    std::thread::scope(|scope| {
-        // Two workers per NUMA group: 2-way refcount contention is mild
-        // and halves the wall time of the column build.
-        let workers: Vec<_> = slots_by_numa
-            .values()
-            .flat_map(|slot_indices| {
-                let mid = slot_indices.len().div_ceil(2);
-                let (a, b) = slot_indices.split_at(mid);
-                [a, b]
-            })
-            .filter(|part| !part.is_empty())
-            .map(|slot_indices| {
-                scope.spawn(move || {
-                    slot_indices
-                        .iter()
-                        .map(|&s| build_column(s))
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect();
-        for worker in workers {
-            for (slot_idx, column) in worker.join().expect("column build worker panicked") {
-                columns[slot_idx] = Some(column);
-            }
+    if template.len() * block_count < 65536 {
+        // Small fetches: thread spawns cost more than the whole build.
+        for slot_idx in 0..template.len() {
+            let (idx, column) = build_column(slot_idx);
+            columns[idx] = Some(column);
         }
-    });
+    } else {
+        std::thread::scope(|scope| {
+            // Two workers per NUMA group: 2-way refcount contention is mild
+            // and halves the wall time of the column build.
+            let workers: Vec<_> = slots_by_numa
+                .values()
+                .flat_map(|slot_indices| {
+                    let mid = slot_indices.len().div_ceil(2);
+                    let (a, b) = slot_indices.split_at(mid);
+                    [a, b]
+                })
+                .filter(|part| !part.is_empty())
+                .map(|slot_indices| {
+                    scope.spawn(move || {
+                        slot_indices
+                            .iter()
+                            .map(|&s| build_column(s))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            for worker in workers {
+                for (slot_idx, column) in worker.join().expect("column build worker panicked") {
+                    columns[slot_idx] = Some(column);
+                }
+            }
+        });
+    }
     // Transpose with moves. Footprint and per-slot NUMA placement are
     // template-derived, so sealing dereferences no slot Arcs — and the
     // populated slot_numas keep fetched blocks re-servable to a third
