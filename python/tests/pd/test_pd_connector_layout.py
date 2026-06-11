@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-# ruff: noqa: F403,F405,I001
-from .pd_connector_test_utils import *
-
 from pegaflow.pd_connector.layout_mapping import (
     HeadSlice,
     build_push_layout_plan,
     decode_rank_source_counts,
 )
+
+# ruff: noqa: F403,F405,I001
+from .pd_connector_test_utils import *
 
 
 def test_flash_attn_hnd_layout_offsets() -> None:
@@ -647,6 +647,7 @@ def test_real_rdma_port_preserves_native_contract_for_pd_push() -> None:
         tp_rank=0,
         tp_size=1,
         block_size=16,
+        imm_id=7,
         layers=registered,
     )
     rdma.open_request("req-1", handshake)
@@ -727,6 +728,7 @@ def test_pd_handshake_serializes_regions_layout() -> None:
         tp_rank=0,
         tp_size=1,
         block_size=16,
+        imm_id=7,
         layers=(layer,),
     )
 
@@ -774,6 +776,7 @@ def test_pd_handshake_serializes_strided_regions_layout() -> None:
         tp_rank=0,
         tp_size=1,
         block_size=16,
+        imm_id=7,
         layers=(layer,),
     )
 
@@ -809,6 +812,7 @@ def test_pd_handshake_compact_serializes_shared_block_ids_once() -> None:
         tp_rank=0,
         tp_size=1,
         block_size=16,
+        imm_id=7,
         layers=layers,
     )
 

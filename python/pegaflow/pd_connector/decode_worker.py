@@ -448,9 +448,7 @@ class DecodeHandler:
             }
             if compact:
                 payload["block_ids"] = list(shared_block_ids)
-            result.append(
-                payload
-            )
+            result.append(payload)
         return result
 
     def _expected_imm_count_for_local_rank(self) -> int:
@@ -511,7 +509,9 @@ class DecodeHandler:
     def _alloc_imm_id(self) -> int:
         imm_id = self._next_imm_id
         self._next_imm_id += 1
-        if self._next_imm_id > 0xFFFF_FFFF:
+        # The wire contract (pegaflow-pd-wire) reserves the top two bits of
+        # imm_id for the fail/abort XOR flags, so wrap before reaching them.
+        if self._next_imm_id > 0x3FFF_FFFF:
             self._next_imm_id = 1
         return imm_id
 

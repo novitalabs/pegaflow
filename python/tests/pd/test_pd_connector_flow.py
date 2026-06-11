@@ -40,7 +40,7 @@ def test_pd_worker_wait_handshake_uses_registered_native_mr_desc() -> None:
     layer = handshake["layers"][0]
     assert layer["mr_desc"] == {
         "ptr": tensor.data_ptr(),
-        "addr_rkey_list": [("10.0.0.1:1", 17)],
+        "addr_rkey_list": [["10.0.0.1:1", 17]],
     }
     assert layer["block_ids"] == [1]
     assert handshake["expected_imm_count"] == 1
@@ -2105,6 +2105,7 @@ def test_scheduler_carries_cross_process_rdma_handshake() -> None:
         "tp_rank": 0,
         "tp_size": 1,
         "block_size": 16,
+        "imm_id": 7,
         "layers": [
             {
                 "layer_name": "layer.0",
@@ -2149,6 +2150,7 @@ def test_scheduler_carries_cross_process_rdma_handshake_list() -> None:
         "tp_size": 1,
         "block_size": 16,
         "block_ids": [1],
+        "imm_id": 7,
         "layers": [
             {
                 "layer_name": "layer.0",

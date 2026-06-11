@@ -173,7 +173,7 @@ def handshake_from_dict(data: dict[str, Any] | None) -> PdHandshake | None:
         layers=tuple(
             layer_layout_from_dict(layer, block_ids=shared_block_ids) for layer in data["layers"]
         ),
-        imm_id=int(data["imm_id"]) if data.get("imm_id") is not None else None,
+        imm_id=int(data["imm_id"]),
         fail_imm_id=int(data["fail_imm_id"]) if data.get("fail_imm_id") is not None else None,
         abort_imm_id=int(data["abort_imm_id"]) if data.get("abort_imm_id") is not None else None,
         expected_imm_count=int(data.get("expected_imm_count") or 1),

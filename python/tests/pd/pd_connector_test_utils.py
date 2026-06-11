@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 # ruff: noqa: E402,F401
+import json
 import queue
 import threading
 from types import SimpleNamespace
@@ -24,7 +25,11 @@ import pegaflow.pd_connector.prefill as prefill_mod  # noqa: E402
 import pegaflow.pd_connector.prefill_worker as prefill_worker_mod  # noqa: E402
 import pegaflow.pd_connector.worker as worker_mod  # noqa: E402
 import pegaflow.pegaflow as native  # noqa: E402
-from pegaflow.pd_connector import PdConnector, PdDecodeConnector, PdPrefillConnector  # noqa: E402
+from pegaflow.pd_connector import (  # noqa: E402
+    PdConnector,
+    PdDecodeConnector,
+    PdPrefillConnector,
+)
 from pegaflow.pd_connector.kv_params import parse_consumer  # noqa: E402
 from pegaflow.pd_connector.layout import (  # noqa: E402
     BlockRegionSlice,
@@ -161,15 +166,20 @@ class FakeNativeRdmaEngine:
             )
         return registered
 
-    def register_remote(self, req_id, handshake):
-        assert handshake is not None
+    def register_remote(self, req_id, handshake_json):
+        # The native engine consumes the sealed wire JSON (pegaflow-pd-wire).
+        assert isinstance(handshake_json, str)
+        handshake = json.loads(handshake_json)
         assert handshake["request_id"]
-        assert handshake.get("imm_id") is None or isinstance(handshake["imm_id"], int)
+        assert isinstance(handshake["imm_id"], int)
+        assert handshake["imm_id"] & 0xC000_0000 == 0, (
+            "imm_id must keep the reserved flag bits clear"
+        )
         assert handshake.get("fail_imm_id") is None or isinstance(handshake["fail_imm_id"], int)
         assert handshake.get("abort_imm_id") is None or isinstance(handshake["abort_imm_id"], int)
         for layer in handshake["layers"]:
             assert layer["mr_desc"]["addr_rkey_list"]
-            assert isinstance(layer["mr_desc"]["addr_rkey_list"][0], tuple)
+            assert len(layer["mr_desc"]["addr_rkey_list"][0]) == 2
             assert layer["block_ids"]
             assert layer["regions"]
             assert [region["region_idx"] for region in layer["regions"]] == list(
