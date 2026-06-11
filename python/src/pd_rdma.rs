@@ -134,25 +134,8 @@ fn wait_backoff(waits: &mut u32) {
     *waits = waits.saturating_add(1);
 }
 
-fn pd_imm(req_id: &str) -> u32 {
-    let mut hash = 0x811c_9dc5u32;
-    for byte in req_id.as_bytes() {
-        hash ^= u32::from(*byte);
-        hash = hash.wrapping_mul(0x0100_0193);
-    }
-    hash
-}
-
-fn pd_fail_imm(imm: u32) -> u32 {
-    imm ^ 0x8000_0000
-}
-
 fn fail_counter_key(req_id: &str) -> String {
     format!("{req_id}#fail")
-}
-
-fn pd_abort_imm(imm: u32) -> u32 {
-    imm ^ 0x4000_0000
 }
 
 fn abort_counter_key(req_id: &str) -> String {
@@ -529,18 +512,9 @@ impl PdRdmaEngine {
             .detach(|| pd_wire::Handshake::from_json(&handshake_json))
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
         let remote_request_id = handshake.request_id.clone();
-        let imm = handshake
-            .imm_id
-            .unwrap_or_else(|| pd_imm(&remote_request_id));
-        let fail_imm = handshake.fail_imm_id().unwrap_or_else(|| pd_fail_imm(imm));
-        let abort_imm = handshake
-            .abort_imm_id()
-            .unwrap_or_else(|| pd_abort_imm(imm));
-        if fail_imm == imm || abort_imm == imm || abort_imm == fail_imm {
-            return Err(PyValueError::new_err(
-                "imm_id, fail_imm_id and abort_imm_id must be distinct",
-            ));
-        }
+        let imm = handshake.imm_id;
+        let fail_imm = handshake.fail_imm_id();
+        let abort_imm = handshake.abort_imm_id();
         let expected_imm_count = handshake.expected_imm_count.get();
 
         let mut layers = HashMap::new();
@@ -857,6 +831,10 @@ impl PdRdmaEngine {
     }
 
     fn wait_done(&self, py: Python<'_>, req_id: String) -> PyResult<()> {
+        if self.finished_recving.lock().unwrap().contains(&req_id) {
+            log::info!("[PdRdmaEngine] RDMA IMM wait already done req={}", req_id);
+            return Ok(());
+        }
         let (remote_request_id, imm_data, fail_imm_data, abort_imm_data, expected_imm_count) = self
             .remote_requests
             .lock()
@@ -871,26 +849,9 @@ impl PdRdmaEngine {
                     request.expected_imm_count,
                 )
             })
-            .unwrap_or_else(|| {
-                let fallback = pd_imm(&req_id);
-                (
-                    req_id.clone(),
-                    fallback,
-                    pd_fail_imm(fallback),
-                    pd_abort_imm(fallback),
-                    1,
-                )
-            });
-        if self.finished_recving.lock().unwrap().contains(&req_id) {
-            log::info!(
-                "[PdRdmaEngine] RDMA IMM wait already done req={} remote_req={} imm={} expected={}",
-                req_id,
-                remote_request_id,
-                imm_data,
-                expected_imm_count,
-            );
-            return Ok(());
-        }
+            .ok_or_else(|| {
+                PyRuntimeError::new_err(format!("remote req {req_id} is not registered"))
+            })?;
         let counter = self
             .imm_counters
             .lock()

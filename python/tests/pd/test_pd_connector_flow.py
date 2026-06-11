@@ -2105,6 +2105,7 @@ def test_scheduler_carries_cross_process_rdma_handshake() -> None:
         "tp_rank": 0,
         "tp_size": 1,
         "block_size": 16,
+        "imm_id": 7,
         "layers": [
             {
                 "layer_name": "layer.0",
@@ -2149,6 +2150,7 @@ def test_scheduler_carries_cross_process_rdma_handshake_list() -> None:
         "tp_size": 1,
         "block_size": 16,
         "block_ids": [1],
+        "imm_id": 7,
         "layers": [
             {
                 "layer_name": "layer.0",

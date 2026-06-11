@@ -171,7 +171,10 @@ class FakeNativeRdmaEngine:
         assert isinstance(handshake_json, str)
         handshake = json.loads(handshake_json)
         assert handshake["request_id"]
-        assert handshake.get("imm_id") is None or isinstance(handshake["imm_id"], int)
+        assert isinstance(handshake["imm_id"], int)
+        assert handshake["imm_id"] & 0xC000_0000 == 0, (
+            "imm_id must keep the reserved flag bits clear"
+        )
         assert handshake.get("fail_imm_id") is None or isinstance(handshake["fail_imm_id"], int)
         assert handshake.get("abort_imm_id") is None or isinstance(handshake["abort_imm_id"], int)
         for layer in handshake["layers"]:

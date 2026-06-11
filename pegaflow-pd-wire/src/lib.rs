@@ -15,7 +15,8 @@
 //! # Completion contract
 //!
 //! The producer finishes a transfer with an RDMA WRITE_WITH_IMM per source
-//! rank. The consumer waits for `expected_imm_count` arrivals of `imm_id`.
+//! rank. The consumer waits for `expected_imm_count` arrivals of `imm_id`;
+//! the consumer allocates `imm_id` and every handshake must carry one.
 //! Failure and abort are signalled by XOR-ing dedicated flag bits into
 //! `imm_id`, so a valid `imm_id` must keep both flag bits clear.
 
@@ -120,8 +121,8 @@ pub struct Handshake {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_ids: Option<Vec<u64>>,
     pub layers: Vec<Layer>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub imm_id: Option<u32>,
+    /// Completion immediate; must keep [`IMM_FLAG_BITS`] clear.
+    pub imm_id: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fail_imm_id: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -172,13 +173,13 @@ impl Handshake {
     }
 
     /// Failure immediate, derived from `imm_id` unless overridden.
-    pub fn fail_imm_id(&self) -> Option<u32> {
-        self.fail_imm_id.or(self.imm_id.map(fail_imm))
+    pub fn fail_imm_id(&self) -> u32 {
+        self.fail_imm_id.unwrap_or(fail_imm(self.imm_id))
     }
 
     /// Abort-ack immediate, derived from `imm_id` unless overridden.
-    pub fn abort_imm_id(&self) -> Option<u32> {
-        self.abort_imm_id.or(self.imm_id.map(abort_imm))
+    pub fn abort_imm_id(&self) -> u32 {
+        self.abort_imm_id.unwrap_or(abort_imm(self.imm_id))
     }
 
     pub fn validate(&self) -> Result<(), WireError> {
@@ -209,20 +210,27 @@ impl Handshake {
     }
 
     fn validate_imm_ids(&self) -> Result<(), WireError> {
-        let Some(imm_id) = self.imm_id else {
-            return Ok(());
-        };
+        let imm_id = self.imm_id;
         if imm_id & IMM_FLAG_BITS != 0 {
             return Err(WireError::new(format!(
                 "imm_id {imm_id:#x} uses reserved flag bits (max {MAX_IMM_ID:#x})"
             )));
         }
-        let fail = self.fail_imm_id().expect("imm_id is set");
-        let abort = self.abort_imm_id().expect("imm_id is set");
+        let fail = self.fail_imm_id();
+        let abort = self.abort_imm_id();
         if fail == imm_id || abort == imm_id || abort == fail {
             return Err(WireError::new(format!(
                 "imm_id/fail_imm_id/abort_imm_id must be distinct: {imm_id:#x}/{fail:#x}/{abort:#x}"
             )));
+        }
+        // Signal immediates must stay outside the completion-imm namespace,
+        // or one request's fail/abort could alias another request's imm_id.
+        for (name, value) in [("fail_imm_id", fail), ("abort_imm_id", abort)] {
+            if value & IMM_FLAG_BITS == 0 {
+                return Err(WireError::new(format!(
+                    "{name} {value:#x} must set a reserved flag bit"
+                )));
+            }
         }
         Ok(())
     }
@@ -351,9 +359,18 @@ mod tests {
     #[test]
     fn imm_helpers_derive_fail_and_abort() {
         let handshake = fixture();
-        assert_eq!(handshake.fail_imm_id(), Some(5 ^ FAIL_IMM_FLAG));
-        assert_eq!(handshake.abort_imm_id(), Some(5 ^ ABORT_IMM_FLAG));
+        assert_eq!(handshake.fail_imm_id(), 5 ^ FAIL_IMM_FLAG);
+        assert_eq!(handshake.abort_imm_id(), 5 ^ ABORT_IMM_FLAG);
         assert_eq!(fail_imm(abort_imm(5)), 5 ^ IMM_FLAG_BITS);
+    }
+
+    #[test]
+    fn missing_or_null_imm_id_is_rejected_at_parse_time() {
+        let json = COMPACT_FIXTURE.replace(r#""imm_id": 5"#, r#""dummy": 0"#);
+        let err = Handshake::from_json(&json).unwrap_err().to_string();
+        assert!(err.contains("imm_id"), "{err}");
+        let json = COMPACT_FIXTURE.replace(r#""imm_id": 5"#, r#""imm_id": null"#);
+        Handshake::from_json(&json).expect_err("null imm_id must be rejected");
     }
 
     #[test]
@@ -401,8 +418,10 @@ mod tests {
 
     #[test]
     fn validation_rejects_schema_violations() {
-        rejects(|h| h.imm_id = Some(FAIL_IMM_FLAG | 1), "reserved flag bits");
+        rejects(|h| h.imm_id = FAIL_IMM_FLAG | 1, "reserved flag bits");
         rejects(|h| h.fail_imm_id = Some(5), "must be distinct");
+        rejects(|h| h.fail_imm_id = Some(6), "must set a reserved flag bit");
+        rejects(|h| h.abort_imm_id = Some(6), "must set a reserved flag bit");
         rejects(|h| h.layers[1].layer_idx = 0, "duplicate layer_idx");
         rejects(
             |h| h.layers[1].block_ids = Some(vec![7, 3]),
