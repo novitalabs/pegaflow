@@ -193,6 +193,28 @@ def resolve_instance_id(vllm_config, dp_rank_suffix: bool = True) -> str:
     return instance_id
 
 
+# Speculative methods whose drafter has no KV cache of its own: the registered
+# KV layer set is identical with or without them, so they share the namespace.
+_SPECULATIVE_METHODS_WITHOUT_KV = frozenset({"ngram", "ngram_gpu", "suffix"})
+
+
+def _speculative_factor(speculative_config) -> str | None:
+    """Namespace factor for the drafter's KV layers.
+
+    MTP/EAGLE-style drafters register extra KV cache layers, changing the
+    block slot layout — blocks saved with the drafter loaded are incompatible
+    with blocks saved without it. Unknown methods are conservatively assumed
+    to carry KV (a needless split is a cold cache; a missed split is
+    cross-contamination).
+    """
+    if speculative_config is None:
+        return None
+    method = speculative_config.method
+    if method in _SPECULATIVE_METHODS_WITHOUT_KV:
+        return None
+    return f"{method}:{speculative_config.model}"
+
+
 def derive_namespace(
     vllm_config,
     tp_size: int,
@@ -203,9 +225,10 @@ def derive_namespace(
     """
     Derive namespace for storage isolation.
 
-    Different DCP/PCP configurations or cross-layer vs per-layer layouts
-    produce incompatible KV data, so all are included as factors to prevent
-    cross-contamination.
+    The namespace must split whenever two deployments would produce
+    incompatible stored blocks: different block geometry (block_size, heads,
+    dtype), different parallelism (TP/DCP/PCP), or a different registered KV
+    layer set (speculative drafters with their own KV cache, e.g. MTP/EAGLE).
     """
     model_config = vllm_config.model_config
     cache_config = vllm_config.cache_config
@@ -218,6 +241,8 @@ def derive_namespace(
         "head_size": model_config.get_head_size(),
         "num_hidden_layers": model_config.get_total_num_hidden_layers(),
         "cache_dtype": str(cache_config.cache_dtype),
+        "block_size": cache_config.block_size,
+        "speculative": _speculative_factor(vllm_config.speculative_config),
         "dcp_world_size": dcp_world_size,
         "pcp_world_size": pcp_world_size,
         "cross_layer_blocks": cross_layer_blocks,
