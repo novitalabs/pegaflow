@@ -14,6 +14,7 @@ from pegaflow.pd_connector.layout_mapping import (
     decode_rank_source_counts,
 )
 from pegaflow.pd_connector.metadata import (
+    BlockIds,
     LayerRemoteLayout,
     PdHandshake,
     WaitReqMeta,
@@ -24,7 +25,7 @@ from pegaflow.pd_connector.prefill import AsyncPrefillSender, PrefillHttpTask
 from pegaflow.pd_connector.rdma import RdmaPort
 
 if TYPE_CHECKING:
-    from pegaflow.pd_connector.worker import PdWorkerConnector
+    from pegaflow.pd_connector.worker import PdWorkerBase
 
 from pegaflow.pd_connector.config import extra_config_value
 
@@ -36,7 +37,7 @@ class DecodeHandler:
 
     def __init__(
         self,
-        worker: PdWorkerConnector,
+        worker: PdWorkerBase,
         prefill_sender: Any | None = None,
     ) -> None:
         self._w = worker
@@ -52,6 +53,7 @@ class DecodeHandler:
         self._failed_block_ids: set[int] = set()
         self._aborted_waits: set[str] = set()
         self._finished_aborted_recving: set[str] = set()
+        self._finished_rdma_waits: set[str] = set()
         self._next_imm_id = 1
         self._rdma_waiter: _AsyncRdmaDoneWaiter | None = (
             _AsyncRdmaDoneWaiter(
@@ -62,8 +64,16 @@ class DecodeHandler:
             if worker.rdma is not None
             else None
         )
+        prefill_sender_worker_count = int(
+            extra_config_value(
+                worker.vllm_config,
+                "pegaflow.pd.prefill_sender_worker_count",
+                16,
+            )
+        )
         self._prefill_sender = prefill_sender or AsyncPrefillSender(
-            failure_callback=self._mark_prefill_failed
+            worker_count=prefill_sender_worker_count,
+            failure_callback=self._mark_prefill_failed,
         )
 
     def init_rdma_waiter(self) -> None:
@@ -112,7 +122,7 @@ class DecodeHandler:
             imm_id = self._alloc_imm_id()
             wait_handshake = self._build_wait_handshake(
                 req.done_request_id,
-                block_ids,
+                req.local_block_ids,
                 imm_id,
             )
             self._w.rdma.open_request(req_id, wait_handshake)
@@ -147,7 +157,7 @@ class DecodeHandler:
                 queued_ts_ns,
             )
             if req.prefill_url and self._w.tp_rank == 0:
-                self._dispatch_prefill(req, block_ids, imm_id)
+                self._dispatch_prefill(req, req.local_block_ids, imm_id)
 
     def release(self, req_id: str) -> None:
         with self._lock:
@@ -181,6 +191,12 @@ class DecodeHandler:
             self._finished_aborted_recving = set()
             return finished
 
+    def pop_finished_rdma_waits(self) -> set[str]:
+        with self._lock:
+            finished = self._finished_rdma_waits
+            self._finished_rdma_waits = set()
+            return finished
+
     def pop_failed_recving(self) -> set[str]:
         with self._lock:
             failed = self._failed_recving
@@ -207,6 +223,7 @@ class DecodeHandler:
             self._failed_block_ids.clear()
             self._aborted_waits.clear()
             self._finished_aborted_recving.clear()
+            self._finished_rdma_waits.clear()
         if self._rdma_waiter is not None:
             self._rdma_waiter.close()
         close = getattr(self._prefill_sender, "close", None)
@@ -224,6 +241,7 @@ class DecodeHandler:
                 and not self._failed_recving
                 and not self._failed_block_ids
                 and not self._finished_aborted_recving
+                and not self._finished_rdma_waits
             )
 
     def _mark_prefill_failed(self, remote_request_id: str, exc: BaseException) -> None:
@@ -264,10 +282,22 @@ class DecodeHandler:
             self._mark_failed_locked(req_id, req, exc)
 
     def _record_rdma_wait_done(self, req_id: str, wait_s: float) -> None:
+        done_ts_ns = time.time_ns()
         with self._lock:
             if req_id not in self._wait_reqs:
                 return
+            req = self._wait_reqs[req_id]
+            self._finished_rdma_waits.add(req_id)
         self._w.metrics.record_decode_rdma_wait(wait_s)
+        logger.info(
+            "[PdConnector] D RDMA wait done req=%s remote_req=%s wait_ms=%.3f proxy_to_rdma_done_ms=%.3f scheduler_wait_to_rdma_done_ms=%.3f ts_ns=%d",
+            req_id,
+            req.remote_request_id,
+            wait_s * 1000,
+            _elapsed_ms(req.proxy_start_ts_ns, done_ts_ns),
+            _elapsed_ms(req.scheduler_wait_ts_ns, done_ts_ns),
+            done_ts_ns,
+        )
 
     def _mark_failed_locked(self, req_id: str, req: WaitReqMeta, exc: BaseException) -> None:
         failed_blocks = flatten_block_ids(req.local_block_ids)
@@ -275,6 +305,8 @@ class DecodeHandler:
         self._failed_recving_for_meta.add(req_id)
         self._failed_block_ids.update(failed_blocks)
         self._aborted_waits.discard(req_id)
+        self._finished_rdma_waits.discard(req_id)
+        self._finished_aborted_recving.discard(req_id)
         self._wait_reqs.pop(req_id, None)
         self._w.metrics.set_decode_active_waits(len(self._wait_reqs))
         self._w.metrics.record_decode_wait(
@@ -296,25 +328,29 @@ class DecodeHandler:
     def _build_wait_handshake(
         self,
         req_id: str,
-        block_ids: set[int],
+        block_ids: BlockIds,
         imm_id: int,
     ) -> PdHandshake:
-        assert block_ids, f"PdConnector D wait req={req_id} has no local KV blocks"
-        first_layer_name = self._w.layer_names[0]
-        first_block_id = min(block_ids)
+        layers = []
+        for layer_idx, layer_name in enumerate(self._w.layer_names):
+            layer_block_ids = self._w.block_ids_for_layer(block_ids, layer_name)
+            if not layer_block_ids:
+                continue
+            layers.append(
+                self._remote_layout_with_mr_desc(
+                    layer_name,
+                    layer_idx,
+                    (min(layer_block_ids),),
+                )
+            )
+        assert layers, f"PdConnector D wait req={req_id} has no local KV blocks"
         return PdHandshake(
             request_id=req_id,
             engine_id=self._w.engine_id,
             tp_rank=self._w.tp_rank,
             tp_size=self._w.tp_size,
             block_size=next(iter(self._w.layouts.values())).block_size,
-            layers=(
-                self._remote_layout_with_mr_desc(
-                    first_layer_name,
-                    0,
-                    (first_block_id,),
-                ),
-            ),
+            layers=tuple(layers),
             imm_id=imm_id,
             fail_imm_id=_fail_imm_id(imm_id),
             abort_imm_id=_abort_imm_id(imm_id),
@@ -324,7 +360,7 @@ class DecodeHandler:
     def _dispatch_prefill(
         self,
         req: WaitReqMeta,
-        block_ids: set[int],
+        block_ids: BlockIds,
         imm_id: int,
     ) -> None:
         started_ts_ns = time.time_ns()
@@ -360,7 +396,7 @@ class DecodeHandler:
             req.remote_request_id,
             req.done_request_id,
             len(all_handshakes),
-            len(block_ids),
+            len(flatten_block_ids(block_ids)),
             (submitted_ts_ns - started_ts_ns) / 1_000_000,
             _elapsed_ms(req.proxy_start_ts_ns, submitted_ts_ns),
             _elapsed_ms(req.matched_ts_ns, submitted_ts_ns),
@@ -371,28 +407,49 @@ class DecodeHandler:
     def _build_all_rank_handshake_dicts(
         self,
         req_id: str,
-        block_ids: set[int],
+        block_ids: BlockIds,
         imm_id: int,
     ) -> list[dict[str, Any]]:
         result = []
         block_size = self._peer_block_size
         assert block_size is not None, "peer layer templates are not initialized"
-        ordered_block_ids = sorted(block_ids)
         for rank in range(self._w.tp_size):
+            layers = []
+            for layer in self._peer_layer_templates[rank]:
+                layer_name = str(layer["layer_name"])
+                layer_block_ids = self._w.block_ids_for_layer(block_ids, layer_name)
+                if not layer_block_ids:
+                    continue
+                layer_dict = dict(layer)
+                layer_dict["block_ids"] = sorted(layer_block_ids)
+                layers.append(layer_dict)
+            assert layers, f"PdConnector D wait req={req_id} has no local KV blocks"
+            block_ids_by_layer = [tuple(layer["block_ids"]) for layer in layers]
+            shared_block_ids = block_ids_by_layer[0]
+            compact = all(ids == shared_block_ids for ids in block_ids_by_layer)
+            if compact:
+                payload_layers = [
+                    {key: value for key, value in layer.items() if key != "block_ids"}
+                    for layer in layers
+                ]
+            else:
+                payload_layers = layers
+            payload: dict[str, Any] = {
+                "request_id": req_id,
+                "engine_id": self._w.engine_id,
+                "tp_rank": rank,
+                "tp_size": self._w.tp_size,
+                "block_size": block_size,
+                "layers": payload_layers,
+                "imm_id": imm_id,
+                "fail_imm_id": _fail_imm_id(imm_id),
+                "abort_imm_id": _abort_imm_id(imm_id),
+                "expected_imm_count": self._expected_imm_count_for_rank(rank),
+            }
+            if compact:
+                payload["block_ids"] = list(shared_block_ids)
             result.append(
-                {
-                    "request_id": req_id,
-                    "engine_id": self._w.engine_id,
-                    "tp_rank": rank,
-                    "tp_size": self._w.tp_size,
-                    "block_size": block_size,
-                    "block_ids": list(ordered_block_ids),
-                    "layers": list(self._peer_layer_templates[rank]),
-                    "imm_id": imm_id,
-                    "fail_imm_id": _fail_imm_id(imm_id),
-                    "abort_imm_id": _abort_imm_id(imm_id),
-                    "expected_imm_count": self._expected_imm_count_for_rank(rank),
-                }
+                payload
             )
         return result
 

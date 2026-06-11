@@ -32,6 +32,12 @@ fn duration_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
 
+fn instant_elapsed_ms(start: Instant, end: Instant) -> f64 {
+    end.checked_duration_since(start)
+        .map(duration_ms)
+        .unwrap_or(0.0)
+}
+
 fn nonnull_from_u64(ptr: u64, field: &str) -> PyResult<NonNull<c_void>> {
     NonNull::new(ptr as *mut c_void)
         .ok_or_else(|| PyValueError::new_err(format!("{field} must be non-zero")))
@@ -200,6 +206,7 @@ struct PendingRdmaWrites {
     submitted: i64,
     completed: Arc<AtomicI64>,
     errors: Arc<AtomicI64>,
+    stats: Arc<Mutex<PendingRdmaWriteStats>>,
 }
 
 impl PendingRdmaWrites {
@@ -208,7 +215,90 @@ impl PendingRdmaWrites {
             submitted: 0,
             completed: Arc::new(AtomicI64::new(0)),
             errors: Arc::new(AtomicI64::new(0)),
+            stats: Arc::new(Mutex::new(PendingRdmaWriteStats::default())),
         }
+    }
+}
+
+#[derive(Default)]
+struct PendingRdmaWriteStats {
+    bytes: u64,
+    first_submit: Option<Instant>,
+    last_submit: Option<Instant>,
+    first_complete: Option<Instant>,
+    last_complete: Option<Instant>,
+    write_latency_count: u64,
+    write_latency_sum_ms: f64,
+    write_latency_max_ms: f64,
+}
+
+impl PendingRdmaWriteStats {
+    fn record_submit(&mut self, bytes: u64, at: Instant) {
+        self.bytes = self.bytes.saturating_add(bytes);
+        if self.first_submit.is_none() {
+            self.first_submit = Some(at);
+        }
+        self.last_submit = Some(at);
+    }
+
+    fn record_complete(&mut self, at: Instant, latency_ms: f64) {
+        if self.first_complete.is_none() {
+            self.first_complete = Some(at);
+        }
+        self.last_complete = Some(at);
+        self.write_latency_count = self.write_latency_count.saturating_add(1);
+        self.write_latency_sum_ms += latency_ms;
+        self.write_latency_max_ms = self.write_latency_max_ms.max(latency_ms);
+    }
+
+    fn to_py_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(py);
+        dict.set_item("bytes", self.bytes)?;
+        dict.set_item("has_submit", self.first_submit.is_some())?;
+        dict.set_item("has_complete", self.last_complete.is_some())?;
+        dict.set_item("write_latency_count", self.write_latency_count)?;
+        dict.set_item("write_latency_sum_ms", self.write_latency_sum_ms)?;
+        dict.set_item("write_latency_max_ms", self.write_latency_max_ms)?;
+        let active_s = self.write_latency_sum_ms / 1000.0;
+        let active_gbps = if active_s > 0.0 {
+            self.bytes as f64 * 8.0 / active_s / 1_000_000_000.0
+        } else {
+            0.0
+        };
+        dict.set_item("active_gbps", active_gbps)?;
+        if let Some(first_submit) = self.first_submit {
+            if let Some(last_submit) = self.last_submit {
+                dict.set_item(
+                    "submit_span_ms",
+                    instant_elapsed_ms(first_submit, last_submit),
+                )?;
+            }
+            if let Some(first_complete) = self.first_complete {
+                dict.set_item(
+                    "first_complete_ms",
+                    instant_elapsed_ms(first_submit, first_complete),
+                )?;
+            }
+            if let Some(last_complete) = self.last_complete {
+                let xfer_window_ms = instant_elapsed_ms(first_submit, last_complete);
+                dict.set_item("xfer_window_ms", xfer_window_ms)?;
+                let xfer_s = xfer_window_ms / 1000.0;
+                let xfer_gbps = if xfer_s > 0.0 {
+                    self.bytes as f64 * 8.0 / xfer_s / 1_000_000_000.0
+                } else {
+                    0.0
+                };
+                dict.set_item("xfer_gbps", xfer_gbps)?;
+            }
+            if let (Some(last_submit), Some(last_complete)) = (self.last_submit, self.last_complete)
+            {
+                dict.set_item(
+                    "completion_tail_ms",
+                    instant_elapsed_ms(last_submit, last_complete),
+                )?;
+            }
+        }
+        Ok(dict)
     }
 }
 
@@ -676,19 +766,31 @@ impl PdRdmaEngine {
         }
         self.write_submitted.fetch_add(1, Ordering::Release);
         let window_ms = duration_ms(window_start.elapsed());
-        let (req_completed, req_errors) = {
+        let submit_at = Instant::now();
+        let (req_completed, req_errors, req_stats) = {
             let mut pending = self.pending_writes.lock().unwrap();
             let state = pending
                 .entry(req_id.clone())
                 .or_insert_with(PendingRdmaWrites::new);
             state.submitted += 1;
-            (Arc::clone(&state.completed), Arc::clone(&state.errors))
+            state
+                .stats
+                .lock()
+                .unwrap()
+                .record_submit(dst_bytes, submit_at);
+            (
+                Arc::clone(&state.completed),
+                Arc::clone(&state.errors),
+                Arc::clone(&state.stats),
+            )
         };
         let scatter_targets = dsts.len();
         let global_completed = Arc::clone(&self.write_completed);
         let done_completed = Arc::clone(&req_completed);
         let error_completed = Arc::clone(&req_completed);
         let error_counter = Arc::clone(&req_errors);
+        let done_stats = Arc::clone(&req_stats);
+        let error_stats = Arc::clone(&req_stats);
         let error_global_completed = Arc::clone(&global_completed);
         let submit_start = Instant::now();
         let callback_start = Instant::now();
@@ -709,6 +811,11 @@ impl PdRdmaEngine {
                 }),
                 TransferCallback {
                     on_done: Box::new(move || {
+                        let latency_ms = duration_ms(callback_start.elapsed());
+                        done_stats
+                            .lock()
+                            .unwrap()
+                            .record_complete(Instant::now(), latency_ms);
                         done_completed.fetch_add(1, Ordering::Release);
                         global_completed.fetch_add(1, Ordering::Release);
                         log::debug!(
@@ -716,11 +823,16 @@ impl PdRdmaEngine {
                             done_req_id,
                             done_layer_idx,
                             done_bytes,
-                            duration_ms(callback_start.elapsed()),
+                            latency_ms,
                         );
                         Ok(())
                     }),
                     on_error: Box::new(move |err: FabricLibError| {
+                        let latency_ms = duration_ms(callback_start.elapsed());
+                        error_stats
+                            .lock()
+                            .unwrap()
+                            .record_complete(Instant::now(), latency_ms);
                         error_counter.fetch_add(1, Ordering::Release);
                         error_completed.fetch_add(1, Ordering::Release);
                         error_global_completed.fetch_add(1, Ordering::Release);
@@ -729,7 +841,7 @@ impl PdRdmaEngine {
                             error_req_id,
                             error_layer_idx,
                             error_bytes,
-                            duration_ms(callback_start.elapsed()),
+                            latency_ms,
                         );
                         Ok(())
                     }),
@@ -776,6 +888,24 @@ impl PdRdmaEngine {
         self.send_request_imm(py, &req_id, PdRequestImmKind::Done)?;
         self.finished_sending.lock().unwrap().insert(req_id);
         Ok(())
+    }
+
+    fn write_stats<'py>(&self, py: Python<'py>, req_id: String) -> PyResult<Bound<'py, PyDict>> {
+        let Some(state) = self.pending_writes.lock().unwrap().get(&req_id).cloned() else {
+            let dict = PyDict::new(py);
+            dict.set_item("submitted", 0_i64)?;
+            dict.set_item("completed", 0_i64)?;
+            dict.set_item("errors", 0_i64)?;
+            dict.set_item("bytes", 0_u64)?;
+            dict.set_item("has_submit", false)?;
+            dict.set_item("has_complete", false)?;
+            return Ok(dict);
+        };
+        let dict = state.stats.lock().unwrap().to_py_dict(py)?;
+        dict.set_item("submitted", state.submitted)?;
+        dict.set_item("completed", state.completed.load(Ordering::Acquire))?;
+        dict.set_item("errors", state.errors.load(Ordering::Acquire))?;
+        Ok(dict)
     }
 
     fn fail_request(&self, py: Python<'_>, req_id: String) -> PyResult<()> {

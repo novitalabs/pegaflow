@@ -115,6 +115,14 @@ class PdHandshake:
     fail_imm_id: int | None = None
     abort_imm_id: int | None = None
     expected_imm_count: int = 1
+    layers_by_idx: dict[int, LayerRemoteLayout] = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "layers_by_idx",
+            {layer.layer_idx: layer for layer in self.layers},
+        )
 
 
 def layer_layout_from_dict(

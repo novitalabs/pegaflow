@@ -15,12 +15,13 @@ import logging
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import TracebackType
 from typing import Any, Protocol
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 
 from pegaflow.pd_connector.kv_params import ConsumerKvParams
 
@@ -28,6 +29,12 @@ logger = logging.getLogger("pegaflow.pd_proxy")
 
 
 SUPPORTED_PATHS = {"/v1/completions", "/v1/chat/completions"}
+
+
+def _httpx() -> Any:
+    import httpx
+
+    return httpx
 
 
 @dataclass(frozen=True)
@@ -250,6 +257,10 @@ def build_pd_proxy_request(
 class PdProxy:
     def __init__(self, config: ProxyConfig) -> None:
         self.config = config
+        self._client: Any | None = None
+        self._client_lock = threading.Lock()
+        self._stream_client: Any | None = None
+        self._stream_client_lock = threading.Lock()
 
     def handle_openai_request(self, path: str, body: dict[str, Any]) -> tuple[int, bytes, str]:
         if path not in SUPPORTED_PATHS:
@@ -273,6 +284,7 @@ class PdProxy:
                 self.config.timeout_s,
                 req.request_id,
                 "D",
+                client=self._get_client(),
             )
             end_ts_ns = time.time_ns()
             self.config.metrics.finish_request(
@@ -321,6 +333,7 @@ class PdProxy:
                 self.config.timeout_s,
                 req.request_id,
                 "D",
+                client=self._get_stream_client(),
             )
             header_ts_ns = time.time_ns()
             logger.info(
@@ -343,7 +356,77 @@ class PdProxy:
             raise
 
     def close(self) -> None:
-        return None
+        with self._client_lock:
+            client = self._client
+            self._client = None
+        if client is not None:
+            client.close()
+        with self._stream_client_lock:
+            stream_client = self._stream_client
+            self._stream_client = None
+        if stream_client is not None:
+            stream_client.close()
+
+    def warmup_decode_connections(self, *, connection_count: int = 8) -> None:
+        if connection_count <= 0:
+            return
+        decode_urls = self._decode_warmup_urls()
+        warmup_timeout_s = min(self.config.timeout_s, 2.0)
+
+        httpx = _httpx()
+
+        def warmup_one(client: Any, health_url: str) -> None:
+            try:
+                response = client.get(health_url, timeout=warmup_timeout_s)
+            except httpx.RequestError:
+                logger.warning(
+                    "[PdProxy] decode warmup connection failed url=%s",
+                    health_url,
+                    exc_info=True,
+                )
+                return
+            logger.info(
+                "[PdProxy] decode warmup url=%s status=%s",
+                health_url,
+                response.status_code,
+            )
+
+        health_urls = [
+            decode_url.rstrip("/") + "/health"
+            for decode_url in decode_urls
+            for _ in range(connection_count)
+        ]
+        clients = (self._get_client(), self._get_stream_client())
+        warmups = [(client, health_url) for client in clients for health_url in health_urls]
+        max_workers = min(len(warmups), connection_count * len(clients))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            list(executor.map(lambda args: warmup_one(*args), warmups))
+
+    def _decode_warmup_urls(self) -> tuple[str, ...]:
+        router = self.config.router
+        if isinstance(router, RoundRobinPairRouter):
+            return tuple(endpoint.url for endpoint in router._decode_endpoints)
+        return (self.config.decode_url,)
+
+    def _get_client(self) -> Any:
+        with self._client_lock:
+            if self._client is None:
+                httpx = _httpx()
+                self._client = httpx.Client(
+                    timeout=self.config.timeout_s,
+                    limits=httpx.Limits(max_connections=None, max_keepalive_connections=None),
+                )
+            return self._client
+
+    def _get_stream_client(self) -> Any:
+        with self._stream_client_lock:
+            if self._stream_client is None:
+                httpx = _httpx()
+                self._stream_client = httpx.Client(
+                    timeout=self.config.timeout_s,
+                    limits=httpx.Limits(max_connections=None, max_keepalive_connections=None),
+                )
+            return self._stream_client
 
 
 def _post_json(
@@ -352,6 +435,8 @@ def _post_json(
     timeout_s: float,
     request_id: str,
     role: str,
+    *,
+    client: Any | None = None,
 ) -> tuple[int, bytes, str]:
     payload = json.dumps(body, separators=(",", ":")).encode()
     logger.info(
@@ -362,38 +447,44 @@ def _post_json(
         len(payload),
         body.get("kv_transfer_params"),
     )
-    request = Request(
-        url,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+    owns_client = client is None
+    httpx = _httpx()
     try:
-        with urlopen(request, timeout=timeout_s) as response:
-            response_body = response.read()
-            return (
-                int(response.status),
-                response_body,
-                response.headers.get("Content-Type", "application/json"),
+        if client is None:
+            client = httpx.Client(
+                timeout=timeout_s,
+                limits=httpx.Limits(max_connections=None, max_keepalive_connections=None),
             )
-    except HTTPError as exc:
-        response_body = exc.read()
-        logger.error(
-            "[PdProxy] request=%s %s returned status=%s body=%s",
-            request_id,
-            role,
-            exc.code,
-            response_body[:512],
+        response = client.post(
+            url,
+            content=payload,
+            headers={"Content-Type": "application/json"},
         )
-        return int(exc.code), response_body, exc.headers.get("Content-Type", "application/json")
-    except URLError:
-        logger.exception(
+    except httpx.RequestError:
+        logger.error(
             "[PdProxy] request=%s %s connection failed url=%s",
             request_id,
             role,
             url,
         )
         raise
+    finally:
+        if owns_client and client is not None:
+            client.close()
+    response_body = response.content
+    if response.status_code >= 400:
+        logger.error(
+            "[PdProxy] request=%s %s returned status=%s body=%s",
+            request_id,
+            role,
+            response.status_code,
+            response_body[:512],
+        )
+    return (
+        int(response.status_code),
+        response_body,
+        response.headers.get("Content-Type", "application/json"),
+    )
 
 
 def _open_json(
@@ -402,6 +493,8 @@ def _open_json(
     timeout_s: float,
     request_id: str,
     role: str,
+    *,
+    client: Any | None = None,
 ):
     payload = json.dumps(body, separators=(",", ":")).encode()
     logger.info(
@@ -412,17 +505,33 @@ def _open_json(
         len(payload),
         body.get("kv_transfer_params"),
     )
-    request = Request(
-        url,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+    stream_cm: Any | None = None
+    owns_client = client is None
+    httpx = _httpx()
     try:
-        return urlopen(request, timeout=timeout_s)
-    except HTTPError:
-        raise
-    except URLError:
+        if client is None:
+            client = httpx.Client(
+                timeout=timeout_s,
+                limits=httpx.Limits(max_connections=None, max_keepalive_connections=None),
+            )
+        stream_cm = client.stream(
+            "POST",
+            url,
+            content=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        response = stream_cm.__enter__()
+        return _OpenHttpxStream(
+            client=client,
+            stream_cm=stream_cm,
+            response=response,
+            owns_client=owns_client,
+        )
+    except Exception:
+        if stream_cm is not None:
+            stream_cm.__exit__(None, None, None)
+        if client is not None and owns_client:
+            client.close()
         logger.exception(
             "[PdProxy] request=%s %s connection failed url=%s",
             request_id,
@@ -432,18 +541,59 @@ def _open_json(
         raise
 
 
-def iter_http_stream_chunks(response) -> Any:
-    pending = bytearray()
+@dataclass
+class _OpenHttpxStream:
+    client: Any
+    stream_cm: Any
+    response: Any
+    owns_client: bool = True
+
+    @property
+    def status(self) -> int:
+        return self.response.status_code
+
+    @property
+    def headers(self) -> Any:
+        return self.response.headers
+
+    def iter_bytes(self) -> Any:
+        yield from self.response.iter_bytes()
+
+    def __enter__(self) -> _OpenHttpxStream:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        try:
+            self.stream_cm.__exit__(exc_type, exc, traceback)
+        finally:
+            if self.owns_client:
+                self.client.close()
+
+
+def iter_http_stream_bytes(response, chunk_size: int | None = None) -> Any:
+    iter_bytes = getattr(response, "iter_bytes", None)
+    if iter_bytes is not None:
+        if chunk_size is None:
+            yield from iter_bytes()
+        else:
+            yield from iter_bytes(chunk_size=chunk_size)
+        return
+
+    if chunk_size is None:
+        chunk_size = 64 * 1024
+    read_chunk = getattr(response, "read1", None)
+    if read_chunk is None:
+        read_chunk = response.read
     while True:
-        line = response.readline()
-        if not line:
-            if pending:
-                yield bytes(pending)
+        chunk = read_chunk(chunk_size)
+        if not chunk:
             return
-        pending.extend(line)
-        if line in {b"\n", b"\r\n"}:
-            yield bytes(pending)
-            pending.clear()
+        yield chunk
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -500,7 +650,7 @@ class _Handler(BaseHTTPRequestHandler):
                 try:
                     with response:
                         first_chunk = True
-                        for chunk in iter_http_stream_chunks(response):
+                        for chunk in iter_http_stream_bytes(response):
                             self.server.proxy.config.metrics.record_stream_chunk(len(chunk))
                             if first_chunk:
                                 first_chunk = False
@@ -594,6 +744,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--routing-policy", choices=["round_robin"], default="round_robin")
     parser.add_argument("--timeout-s", type=float, default=600.0)
     parser.add_argument("--prefill-max-tokens", type=int, default=1)
+    parser.add_argument("--decode-warmup-connections", type=int, default=8)
     parser.add_argument("--log-file")
     args = parser.parse_args(argv)
 
@@ -621,6 +772,7 @@ def main(argv: list[str] | None = None) -> None:
         router=router,
     )
     proxy = PdProxy(config)
+    proxy.warmup_decode_connections(connection_count=args.decode_warmup_connections)
     server = _PdHttpServer((args.listen_host, args.listen_port), proxy)
     logger.info(
         "[PdProxy] listening http://%s:%d policy=%s prefill=%s decode=%s",

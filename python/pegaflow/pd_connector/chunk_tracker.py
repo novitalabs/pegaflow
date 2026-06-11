@@ -28,13 +28,15 @@ class ChunkTracker:
     def has_pushed_all_blocks(
         self,
         req_id: str,
-        block_ids: set[int],
+        block_ids_by_layer: dict[int, set[int]],
         *,
         num_layers: int,
     ) -> bool:
         self.add_request(req_id)
         expected = {
-            (layer_idx, block_id) for layer_idx in range(num_layers) for block_id in block_ids
+            (layer_idx, block_id)
+            for layer_idx in range(num_layers)
+            for block_id in block_ids_by_layer.get(layer_idx, set())
         }
         return expected.issubset(self._requests[req_id].pushed_pairs)
 

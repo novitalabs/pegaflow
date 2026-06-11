@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+# ruff: noqa: F403,F405,I001
+from .pd_connector_test_utils import *
+
 from pegaflow.pd_connector.layout_mapping import (
     HeadSlice,
     build_push_layout_plan,
     decode_rank_source_counts,
 )
-
-# ruff: noqa: F403,F405,I001
-from .pd_connector_test_utils import *
 
 
 def test_flash_attn_hnd_layout_offsets() -> None:
@@ -91,7 +91,7 @@ def test_pd_worker_registers_mla_and_indexer_layouts_from_layer_specs() -> None:
             "indexer.0": SimpleNamespace(block_size=64, page_size_bytes=64 * 128),
         },
     )
-    worker = PdWorkerConnector(
+    worker = PdDecodeWorkerConnector(
         fake_mla_config(),
         kv_cache_config=kv_cache_config,
         rdma=MockRdmaPort(),
@@ -113,13 +113,95 @@ def test_pd_worker_registers_mla_and_indexer_layouts_from_layer_specs() -> None:
 
 
 def test_pd_connector_mla_returns_default_layout_and_allows_128_block_size() -> None:
-    assert PdConnector.get_required_kvcache_layout(fake_mla_config(block_size=64)) is None
-    PdConnector(fake_mla_config(block_size=128), KVConnectorRole.WORKER)
+    assert PdDecodeConnector.get_required_kvcache_layout(fake_mla_config(block_size=64)) is None
+    PdDecodeConnector(fake_mla_config(block_size=128), KVConnectorRole.WORKER)
 
 
-def test_pd_connector_rejects_mtp_layout() -> None:
-    with pytest.raises(AssertionError, match="PdConnector does not support MTP layout"):
-        PdConnector(fake_mtp_config(), KVConnectorRole.WORKER)
+def test_pd_connectors_allow_mtp_layout() -> None:
+    PdDecodeConnector(fake_mtp_config(), KVConnectorRole.WORKER)
+    PdPrefillConnector(fake_mtp_config(), KVConnectorRole.WORKER)
+
+
+def test_legacy_pd_connector_selects_decode_by_engine_id() -> None:
+    config = fake_mtp_config()
+    config.kv_transfer_config.engine_id = "d0"
+
+    connector = PdConnector(config, KVConnectorRole.WORKER)
+
+    assert isinstance(connector._delegate, PdDecodeConnector)
+
+
+def test_legacy_pd_connector_selects_prefill_by_engine_id() -> None:
+    config = fake_mtp_config()
+    config.kv_transfer_config.engine_id = "p0"
+
+    connector = PdConnector(config, KVConnectorRole.WORKER)
+
+    assert isinstance(connector._delegate, PdPrefillConnector)
+
+
+def test_legacy_pd_connector_forwards_bound_metadata() -> None:
+    config = fake_mtp_config()
+    config.kv_transfer_config.engine_id = "d0"
+    connector = PdConnector(config, KVConnectorRole.WORKER)
+    metadata = PdConnectorMetadata()
+
+    connector.bind_connector_metadata(metadata)
+
+    assert connector._connector_metadata is metadata
+    assert connector._delegate._connector_metadata is metadata
+
+    connector.clear_connector_metadata()
+
+    assert connector._connector_metadata is None
+    assert connector._delegate._connector_metadata is None
+
+
+def test_legacy_pd_connector_preserves_piecewise_default_for_prefill() -> None:
+    assert PdConnector.requires_piecewise_for_cudagraph({}) is True
+    assert (
+        PdConnector.requires_piecewise_for_cudagraph(
+            {"pegaflow.pd.allow_full_decode_cudagraph": True}
+        )
+        is False
+    )
+
+
+def test_vllm_plugin_registers_split_pd_connectors(monkeypatch) -> None:
+    import sys
+
+    import pegaflow.vllm_plugin as vllm_plugin
+
+    registered = []
+
+    class FakeFactory:
+        @staticmethod
+        def register_connector(name: str, module: str, class_name: str) -> None:
+            registered.append((name, module, class_name))
+
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.distributed.kv_transfer.kv_connector.factory",
+        SimpleNamespace(KVConnectorFactory=FakeFactory),
+    )
+
+    vllm_plugin.register()
+
+    assert (
+        "PdConnector",
+        "pegaflow.pd_connector",
+        "PdConnector",
+    ) in registered
+    assert (
+        "PdDecodeConnector",
+        "pegaflow.pd_connector",
+        "PdDecodeConnector",
+    ) in registered
+    assert (
+        "PdPrefillConnector",
+        "pegaflow.pd_connector",
+        "PdPrefillConnector",
+    ) in registered
 
 
 def test_pd_worker_rejects_mla_physical_logical_block_split() -> None:
@@ -135,7 +217,7 @@ def test_pd_worker_rejects_mla_physical_logical_block_split() -> None:
             "layer.0": SimpleNamespace(block_size=64, page_size_bytes=32 * 128),
         },
     )
-    worker = PdWorkerConnector(
+    worker = PdDecodeWorkerConnector(
         fake_mla_config(block_size=64),
         kv_cache_config=kv_cache_config,
         rdma=MockRdmaPort(),
@@ -157,7 +239,7 @@ def test_p_worker_maps_mla_prefill_tp_greater_than_decode_tp() -> None:
         )
         for rank in range(4)
     )
-    worker = PdWorkerConnector(
+    worker = PdPrefillWorkerConnector(
         fake_mla_config(tp_rank=2, tp_size=8),
         rdma=MockRdmaPort(),
     )
@@ -190,7 +272,7 @@ def test_p_worker_skips_non_representative_mla_prefill_rank() -> None:
         )
         for rank in range(4)
     )
-    worker = PdWorkerConnector(
+    worker = PdPrefillWorkerConnector(
         fake_mla_config(tp_rank=3, tp_size=8),
         rdma=MockRdmaPort(),
     )
@@ -328,8 +410,8 @@ def test_p_worker_prefill_tp_greater_than_decode_tp_registers_remote_head_slices
         layers=(decode_layer,),
     )
 
-    def build_worker(rank: int) -> PdWorkerConnector:
-        worker = PdWorkerConnector(
+    def build_worker(rank: int) -> PdPrefillWorkerConnector:
+        worker = PdPrefillWorkerConnector(
             SimpleNamespace(
                 kv_transfer_config=SimpleNamespace(engine_id="prefill"),
                 model_config=SimpleNamespace(
@@ -758,7 +840,7 @@ def test_pd_worker_builds_native_rdma_by_default_when_extension_exists(monkeypat
         parallel_config=SimpleNamespace(tensor_parallel_rank=0),
     )
 
-    worker = PdWorkerConnector(config)
+    worker = PdDecodeWorkerConnector(config)
     worker.register_kv_caches({"layer.0": tensor})
 
     assert isinstance(worker.rdma, RealRdmaPort)
@@ -793,11 +875,41 @@ def test_pd_worker_uses_runtime_tp_rank_for_rdma_rank_map(monkeypatch) -> None:
         parallel_config=SimpleNamespace(tensor_parallel_rank=0, tensor_parallel_size=8),
     )
 
-    worker = PdWorkerConnector(config)
+    worker = PdDecodeWorkerConnector(config)
     worker.register_kv_caches({"layer.0": tensor})
 
     assert FakeNativeRdmaEngineCtor.last_kwargs["domains"] == ["mlx5_2"]
     assert FakeNativeRdmaEngineCtor.last_kwargs["pin_worker_cpu"] == 60
+
+
+def test_pd_worker_uses_cuda_device_rank_map_for_tp1_replicas(monkeypatch) -> None:
+    monkeypatch.setattr(native, "PdRdmaEngine", FakeNativeRdmaEngineCtor, raising=False)
+    monkeypatch.setattr(worker_mod, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(worker_mod, "get_tensor_model_parallel_world_size", lambda: 1)
+    tensor = FakeTensor(
+        shape=(2, 8, 16, 4, 32),
+        stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
+        device_index=4,
+    )
+    config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            engine_id="decode",
+            get_from_extra_config=lambda key, default: {
+                "pegaflow.pd.rdma.rank_map": {
+                    "0": {"nic": "mlx5_0", "worker_cpu": 16},
+                    "4": {"nic": "mlx5_4", "worker_cpu": 120},
+                },
+            }.get(key, default),
+        ),
+        parallel_config=SimpleNamespace(tensor_parallel_rank=0, tensor_parallel_size=1),
+    )
+
+    worker = PdDecodeWorkerConnector(config)
+    worker.register_kv_caches({"layer.0": tensor})
+
+    assert FakeNativeRdmaEngineCtor.last_kwargs["cuda_device"] == 4
+    assert FakeNativeRdmaEngineCtor.last_kwargs["domains"] == ["mlx5_4"]
+    assert FakeNativeRdmaEngineCtor.last_kwargs["pin_worker_cpu"] == 120
 
 
 def test_pd_worker_rejects_legacy_global_rdma_config(monkeypatch) -> None:
@@ -818,7 +930,7 @@ def test_pd_worker_rejects_legacy_global_rdma_config(monkeypatch) -> None:
         parallel_config=SimpleNamespace(tensor_parallel_rank=0),
     )
 
-    worker = PdWorkerConnector(config)
+    worker = PdDecodeWorkerConnector(config)
     with pytest.raises(RuntimeError, match="legacy keys"):
         worker.register_kv_caches({"layer.0": tensor})
 

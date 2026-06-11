@@ -42,6 +42,8 @@ class RdmaPort(Protocol):
 
     def push_done(self, req_id: str) -> None: ...
 
+    def write_stats(self, req_id: str) -> dict[str, Any]: ...
+
     def fail_request(self, req_id: str) -> None: ...
 
     def abort_request(self, req_id: str) -> None: ...
@@ -92,6 +94,20 @@ class MockRdmaPort:
 
     def push_done(self, req_id: str) -> None:
         self._finished_sending.add(req_id)
+
+    def write_stats(self, req_id: str) -> dict[str, Any]:
+        bytes_total = sum(
+            block_slices_bytes(blocks)
+            for _, blocks in self.pushed_layers.get(req_id, [])
+        )
+        return {
+            "submitted": len(self.pushed_layers.get(req_id, [])),
+            "completed": len(self.pushed_layers.get(req_id, [])),
+            "errors": 0,
+            "bytes": bytes_total,
+            "has_submit": bytes_total > 0,
+            "has_complete": bytes_total > 0,
+        }
 
     def fail_request(self, req_id: str) -> None:
         return None
@@ -321,6 +337,9 @@ class RealRdmaPort:
                 (time.perf_counter() - start) * 1000,
             )
 
+    def write_stats(self, req_id: str) -> dict[str, Any]:
+        return dict(self.engine.write_stats(req_id))
+
     def fail_request(self, req_id: str) -> None:
         start = time.perf_counter()
         try:
@@ -387,9 +406,13 @@ def build_rdma_port(
 
     _reject_legacy_rank_config(config)
     device = _extra(config, "pegaflow.pd.rdma.device", "cuda")
-    resolved_tp_rank = _tp_rank(vllm_config) if tp_rank is None else int(tp_rank)
-    rank_config = _rank_rdma_config(config, resolved_tp_rank)
     resolved_cuda_device = int(cuda_device or 0)
+    resolved_tp_rank = _tp_rank(vllm_config) if tp_rank is None else int(tp_rank)
+    rank_config = _rank_rdma_config(
+        config,
+        resolved_tp_rank,
+        cuda_device=resolved_cuda_device,
+    )
     engine = PdRdmaEngine(
         cuda_device=resolved_cuda_device,
         numa_node=None,
@@ -459,12 +482,26 @@ def _reject_legacy_rank_config(config: Any) -> None:
         )
 
 
-def _rank_rdma_config(config: Any, tp_rank: int) -> _RankRdmaConfig:
+def _rank_rdma_config(
+    config: Any,
+    tp_rank: int,
+    *,
+    cuda_device: int | None = None,
+) -> _RankRdmaConfig:
     rank_map = _extra(config, "pegaflow.pd.rdma.rank_map", _MISSING)
     if not isinstance(rank_map, dict):
         raise RuntimeError("PdConnector RDMA requires pegaflow.pd.rdma.rank_map")
     _validate_rank_map_cpus(config, rank_map)
     rank_entry = rank_map.get(str(tp_rank))
+    selected_rank = tp_rank
+    if (
+        cuda_device is not None
+        and tp_rank == 0
+        and cuda_device != 0
+        and str(cuda_device) in rank_map
+    ):
+        rank_entry = rank_map[str(cuda_device)]
+        selected_rank = cuda_device
     if not isinstance(rank_entry, dict):
         known = ", ".join(sorted(str(rank) for rank in rank_map))
         raise RuntimeError(
@@ -473,9 +510,9 @@ def _rank_rdma_config(config: Any, tp_rank: int) -> _RankRdmaConfig:
     nic = str(rank_entry.get("nic") or "")
     if not nic:
         raise RuntimeError(f"PdConnector RDMA rank_map[{tp_rank}] missing nic")
-    worker_cpu = _required_rank_cpu(rank_entry, tp_rank, "worker_cpu")
+    worker_cpu = _required_rank_cpu(rank_entry, selected_rank, "worker_cpu")
     return _RankRdmaConfig(
-        tp_rank=tp_rank,
+        tp_rank=selected_rank,
         nic=nic,
         worker_cpu=worker_cpu,
     )

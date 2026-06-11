@@ -24,7 +24,7 @@ import pegaflow.pd_connector.prefill as prefill_mod  # noqa: E402
 import pegaflow.pd_connector.prefill_worker as prefill_worker_mod  # noqa: E402
 import pegaflow.pd_connector.worker as worker_mod  # noqa: E402
 import pegaflow.pegaflow as native  # noqa: E402
-from pegaflow.pd_connector import PdConnector  # noqa: E402
+from pegaflow.pd_connector import PdConnector, PdDecodeConnector, PdPrefillConnector  # noqa: E402
 from pegaflow.pd_connector.kv_params import parse_consumer  # noqa: E402
 from pegaflow.pd_connector.layout import (  # noqa: E402
     BlockRegionSlice,
@@ -47,6 +47,7 @@ from pegaflow.pd_connector.metadata import (  # noqa: E402
     handshake_from_dict,
     handshake_to_compact_dict,
     handshake_to_dict,
+    handshakes_from_dicts,
 )
 from pegaflow.pd_connector.prefill import (  # noqa: E402
     AsyncPrefillSender,
@@ -58,7 +59,7 @@ from pegaflow.pd_connector.proxy import (  # noqa: E402
     RoundRobinPairRouter,
     build_pd_proxy_request,
     build_router,
-    iter_http_stream_chunks,
+    iter_http_stream_bytes,
     render_proxy_metrics,
 )
 from pegaflow.pd_connector.rdma import (  # noqa: E402
@@ -66,8 +67,14 @@ from pegaflow.pd_connector.rdma import (  # noqa: E402
     RealRdmaPort,
     _layer_blocks_to_native,
 )
-from pegaflow.pd_connector.scheduler import PdSchedulerConnector  # noqa: E402
-from pegaflow.pd_connector.worker import PdWorkerConnector  # noqa: E402
+from pegaflow.pd_connector.scheduler import (  # noqa: E402
+    PdDecodeSchedulerConnector,
+    PdPrefillSchedulerConnector,
+)
+from pegaflow.pd_connector.worker import (  # noqa: E402
+    PdDecodeWorkerConnector,
+    PdPrefillWorkerConnector,
+)
 
 
 class FakeTensor:
@@ -226,7 +233,7 @@ class FakeNativeRdmaEngineCtor(FakeNativeRdmaEngine):
         return 400_000_000_000
 
 
-def drain_pd_pushes(worker: PdWorkerConnector) -> None:
+def drain_pd_pushes(worker: PdDecodeWorkerConnector | PdPrefillWorkerConnector) -> None:
     worker._push_sender.wait_all()
     worker._push_finalizer.wait_all()
 
@@ -330,6 +337,30 @@ def fake_kv_cache_config(
                 layer_names=tuple(specs),
                 kv_cache_spec=SimpleNamespace(kv_cache_specs=specs),
             )
+        ],
+    )
+
+
+def fake_mtp_kv_cache_config(*, num_blocks: int = 8) -> SimpleNamespace:
+    base_spec = SimpleNamespace(block_size=16, page_size_bytes=2 * 16 * 4 * 32 * 2)
+    draft_spec = SimpleNamespace(block_size=16, page_size_bytes=2 * 16 * 4 * 32 * 2)
+    return SimpleNamespace(
+        num_blocks=num_blocks,
+        kv_cache_groups=[
+            SimpleNamespace(
+                layer_names=("model.layers.0.self_attn",),
+                kv_cache_spec=SimpleNamespace(
+                    kv_cache_specs={"model.layers.0.self_attn": base_spec}
+                ),
+                is_eagle_group=False,
+            ),
+            SimpleNamespace(
+                layer_names=("model.layers.27.self_attn",),
+                kv_cache_spec=SimpleNamespace(
+                    kv_cache_specs={"model.layers.27.self_attn": draft_spec}
+                ),
+                is_eagle_group=True,
+            ),
         ],
     )
 

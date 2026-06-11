@@ -49,6 +49,7 @@ PD_LIST_KEYS = (
     "pd_prefill_wait_for_pushes_duration",
     "pd_prefill_push_blocks",
     "pd_prefill_push_bytes",
+    "pd_prefill_push_gbps",
 )
 
 
@@ -170,6 +171,7 @@ class PdMetricsTracker:
         blocks: int,
         bytes_total: int,
         success: bool,
+        gbps: float | None = None,
     ) -> None:
         with self._lock:
             data = self._stats.data
@@ -177,6 +179,8 @@ class PdMetricsTracker:
             data["pd_prefill_push_duration"].append(max(0.0, duration_s))
             data["pd_prefill_push_blocks"].append(max(0, blocks))
             data["pd_prefill_push_bytes"].append(max(0, bytes_total))
+            if gbps is not None:
+                data["pd_prefill_push_gbps"].append(max(0.0, gbps))
             if first_save_to_done_s is not None:
                 data["pd_prefill_first_save_to_done_duration"].append(
                     max(0.0, first_save_to_done_s)
@@ -274,6 +278,7 @@ class PdPromMetrics(KVConnectorPromMetrics):
         duration_buckets = build_buckets([1, 2, 4, 8], 100, -3)
         block_buckets = build_buckets([1, 2, 4, 8], 4096, 0)
         byte_buckets = build_buckets([1, 2, 4, 8], 1 << 34, 10)
+        gbps_buckets = build_buckets([1, 2, 4, 8], 1024, -1)
 
         self.hist_decode_wait_duration = _bind_metric_per_engine(
             self,
@@ -356,6 +361,15 @@ class PdPromMetrics(KVConnectorPromMetrics):
                 labelnames=labelnames,
             ),
         )
+        self.hist_prefill_push_gbps = _bind_metric_per_engine(
+            self,
+            self._histogram_cls(
+                name="vllm:pega_pd_prefill_push_gbps",
+                documentation="Effective prefill-side P/D KV push throughput in GB/s.",
+                buckets=gbps_buckets,
+                labelnames=labelnames,
+            ),
+        )
 
         self.counter_load_success = self._counter("vllm:pega_pd_load_success_total", labelnames)
         self.counter_load_failure = self._counter("vllm:pega_pd_load_failure_total", labelnames)
@@ -406,6 +420,7 @@ class PdPromMetrics(KVConnectorPromMetrics):
             ),
             (self.hist_prefill_push_blocks, "pd_prefill_push_blocks"),
             (self.hist_prefill_push_bytes, "pd_prefill_push_bytes"),
+            (self.hist_prefill_push_gbps, "pd_prefill_push_gbps"),
         )
         for metric, key in histograms:
             self._observe_hist(engine_idx, metric, transfer_stats_data, key)

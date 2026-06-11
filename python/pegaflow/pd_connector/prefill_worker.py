@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -10,13 +11,13 @@ from typing import TYPE_CHECKING, Any
 
 from pegaflow.logging_utils import get_connector_logger
 from pegaflow.pd_connector.chunk_tracker import ChunkTracker
+from pegaflow.pd_connector.config import extra_config_value
 from pegaflow.pd_connector.layout import (
     BlockRegionSlice,
     FlashAttnHndLayout,
     LayerBlockSlices,
     block_ranges_for_remote_write,
     block_slices_bytes,
-    layout_from_tensor,
 )
 from pegaflow.pd_connector.layout_mapping import (
     HeadSlice,
@@ -36,7 +37,7 @@ from pegaflow.pd_connector.metadata import (
 from pegaflow.pd_connector.rdma import RdmaPort
 
 if TYPE_CHECKING:
-    from pegaflow.pd_connector.worker import PdWorkerConnector
+    from pegaflow.pd_connector.worker import PdWorkerBase
 
 logger = get_connector_logger()
 
@@ -44,11 +45,14 @@ logger = get_connector_logger()
 class PrefillHandler:
     """Handles P-side (prefill) requests: KV push via RDMA."""
 
-    def __init__(self, worker: PdWorkerConnector) -> None:
+    def __init__(self, worker: PdWorkerBase) -> None:
         self._w = worker
         self._push_reqs: dict[str, PushReqMeta] = {}
         self._pending_push_chunks: set[str] = set()
-        self._push_chunk_maps: dict[str, tuple[dict[int, int], bool]] = {}
+        self._push_chunk_maps: dict[tuple[str, int], tuple[dict[str, dict[int, int]], bool]] = {}
+        self._push_layer_plans: dict[str, dict[int, _PreparedLayerPush]] = {}
+        self._push_all_layers_seen: dict[str, bool] = {}
+        self._push_complete_layer_count: dict[str, int] = {}
         self._tracker = ChunkTracker()
         self._completed_pushes: set[str] = set()
         self._completed_physical_pushes: set[str] = set()
@@ -59,8 +63,36 @@ class PrefillHandler:
         self._logical_to_physical: dict[str, tuple[str, ...]] = {}
         self._push_traces: dict[str, _PushTrace] = {}
         self._skipped_pushes = 0
-        self._push_sender = _AsyncLayerPushSender(metrics=worker.metrics)
-        self._push_finalizer = _AsyncPushFinalizer(self._push_sender, metrics=worker.metrics)
+        push_worker_count = int(
+            extra_config_value(
+                worker.vllm_config,
+                "pegaflow.pd.push_worker_count",
+                16,
+            )
+        )
+        push_finalizer_worker_count = int(
+            extra_config_value(
+                worker.vllm_config,
+                "pegaflow.pd.push_finalizer_worker_count",
+                16,
+            )
+        )
+        self._push_sender = _AsyncLayerPushSender(
+            metrics=worker.metrics,
+            max_workers=push_worker_count,
+        )
+        self._push_finalizer = _AsyncPushFinalizer(
+            self._push_sender,
+            metrics=worker.metrics,
+            max_workers=push_finalizer_worker_count,
+        )
+        self._validate_runtime_layout = _bool_config(
+            extra_config_value(
+                worker.vllm_config,
+                "pegaflow.pd.validate_runtime_layout",
+                logger.isEnabledFor(logging.DEBUG),
+            )
+        )
 
     def process_push_reqs(self, reqs_to_push: dict[str, PushReqMeta]) -> None:
         for req_id, req in reqs_to_push.items():
@@ -83,7 +115,8 @@ class PrefillHandler:
             self._push_plans[req_id] = plan
             self._push_traces.setdefault(req_id, _PushTrace(queued_ts_ns=time.time_ns()))
             self._pending_push_chunks.add(req_id)
-            self._push_chunk_maps.pop(req_id, None)
+            self._clear_push_chunk_maps(req_id)
+            self._clear_push_layer_plans(req_id)
             physical_req_ids = self._physical_req_ids(req_id, plan)
             self._logical_to_physical[req_id] = physical_req_ids
             for physical_req_id, target in zip(physical_req_ids, plan.targets, strict=True):
@@ -96,6 +129,7 @@ class PrefillHandler:
                         local_layout,
                     ),
                 )
+            self._prepare_push_layers(req_id, req, plan)
             logger.info(
                 "[PdConnector] P queued push req=%s target_req=%s rank=%d physical_reqs=%d blocks=%d",
                 req_id,
@@ -109,7 +143,8 @@ class PrefillHandler:
         had_push_state = (
             req_id in self._push_reqs
             or req_id in self._pending_push_chunks
-            or req_id in self._push_chunk_maps
+            or any(key[0] == req_id for key in self._push_chunk_maps)
+            or req_id in self._push_layer_plans
             or req_id in self._push_plans
             or req_id in self._logical_to_physical
             or req_id in self._push_traces
@@ -120,7 +155,8 @@ class PrefillHandler:
         if had_push_state:
             self._w.metrics.record_prefill_release()
         self._pending_push_chunks.discard(req_id)
-        self._push_chunk_maps.pop(req_id, None)
+        self._clear_push_chunk_maps(req_id)
+        self._clear_push_layer_plans(req_id)
         self._push_plans.pop(req_id, None)
         physical_req_ids = self._logical_to_physical.pop(req_id, ())
         if physical_req_ids:
@@ -133,6 +169,7 @@ class PrefillHandler:
         for physical_req_id in physical_req_ids:
             self._physical_to_logical.pop(physical_req_id, None)
             self._completed_physical_pushes.discard(physical_req_id)
+        self._clear_remote_block_offsets(req_id, physical_req_ids)
         self._push_traces.pop(req_id, None)
         self._tracker.remove(req_id)
         return physical_req_ids
@@ -176,23 +213,8 @@ class PrefillHandler:
         assert layout is not None, (
             f"PdConnector saw unknown layer {layer_name}; registered={list(self._w.layouts)}"
         )
-        # Re-assert the runtime tensor. CUDA graph or backend changes must not
-        # silently swap in a different layout.
-        runtime_layout = layout_from_tensor(
-            layer_name,
-            kv_layer,
-            layer_spec=self._w._layer_spec(layer_name),
-            logical_block_size=self._w.logical_block_size,
-            expected_num_blocks=layout.num_blocks,
-        )
-        assert type(runtime_layout) is type(layout), (
-            f"PdConnector KV layout type changed for {layer_name}: "
-            f"registered={type(layout).__name__} runtime={type(runtime_layout).__name__}"
-        )
-        assert runtime_layout.shape == layout.shape, (
-            f"PdConnector KV shape changed for {layer_name}: "
-            f"registered={layout.shape} runtime={runtime_layout.shape}"
-        )
+        if self._validate_runtime_layout:
+            _assert_runtime_layout_matches(layer_name, kv_layer, layout)
         import torch
 
         if torch.cuda.is_available():
@@ -223,21 +245,17 @@ class PrefillHandler:
             self._push_reqs.pop(req_id, None)
             self._w.metrics.set_prefill_active_pushes(len(self._push_reqs))
             self._pending_push_chunks.discard(req_id)
-            self._push_chunk_maps.pop(req_id, None)
+            self._clear_push_chunk_maps(req_id)
+            self._clear_push_layer_plans(req_id)
             self._push_plans.pop(req_id, None)
             physical_req_ids = self._logical_to_physical.pop(req_id, ())
-            self._w.rdma.close_request(req_id)
-            for physical_req_id in physical_req_ids:
+            for physical_req_id in dict.fromkeys(physical_req_ids):
                 self._physical_to_logical.pop(physical_req_id, None)
                 self._completed_physical_pushes.discard(physical_req_id)
                 self._w.rdma.close_request(physical_req_id)
             self._push_traces.pop(req_id, None)
             self._tracker.remove(req_id)
-            self._remote_block_offsets = {
-                key: value
-                for key, value in self._remote_block_offsets.items()
-                if not (key == req_id or key.startswith(f"{req_id}#"))
-            }
+            self._clear_remote_block_offsets(req_id, physical_req_ids)
         return releasable_sending
 
     def shutdown(self) -> None:
@@ -245,6 +263,9 @@ class PrefillHandler:
         self._w.metrics.set_prefill_active_pushes(0)
         self._pending_push_chunks.clear()
         self._push_chunk_maps.clear()
+        self._push_layer_plans.clear()
+        self._push_all_layers_seen.clear()
+        self._push_complete_layer_count.clear()
         self._completed_pushes.clear()
         self._completed_physical_pushes.clear()
         self._producer_finished_req_ids.clear()
@@ -273,15 +294,14 @@ class PrefillHandler:
 
     def _push_pending_blocks(self, layer_name: str, event: Any) -> None:
         layer_idx = self._w._layer_idx(layer_name)
-        layout = self._w.layouts[layer_name]
         for req_id, req in list(self._push_reqs.items()):
             req = self._push_reqs.get(req_id)
             if req is None:
                 continue
             if self._tracker.is_done(req_id):
                 continue
-            req_blocks = flatten_block_ids(req.local_block_ids)
-            if not req_blocks:
+            prepared = self._push_layer_plans.get(req_id, {}).get(layer_idx)
+            if prepared is None:
                 continue
             trace = self._push_traces.setdefault(
                 req_id,
@@ -289,80 +309,69 @@ class PrefillHandler:
             )
             if trace.first_save_ts_ns is None:
                 trace.first_save_ts_ns = time.time_ns()
-            plan = self._push_plans[req_id]
-            target_maps, all_chunks_seen = self._push_chunk_maps.get(req_id, ({}, False))
-            if not target_maps:
-                target_maps, all_chunks_seen = self._remote_block_id_maps(
-                    req_id,
-                    plan,
-                    req_blocks,
-                )
-                self._push_chunk_maps[req_id] = (target_maps, all_chunks_seen)
             assert self._w.rdma is not None
-            rdma_bytes = 0
-            physical_req_ids = self._logical_to_physical[req_id]
-            for physical_req_id, target in zip(physical_req_ids, plan.targets, strict=True):
-                remote_block_ids = target_maps[physical_req_id]
-                assert req_blocks.issubset(remote_block_ids), (
-                    "PdConnector selected blocks must match the current registered push chunk; "
-                    f"req={req_id} physical_req={physical_req_id} selected={sorted(req_blocks)} "
-                    f"mapped={sorted(remote_block_ids)}"
-                )
-                block_slices = _target_block_ranges_for_remote_write(
-                    layout,
-                    target,
-                    req_blocks,
-                    remote_block_ids,
-                )
-                rdma_bytes += block_slices_bytes(block_slices)
+            for target_push in prepared.target_pushes:
                 self._push_sender.submit(
                     _LayerPushTask(
                         rdma=self._w.rdma,
-                        req_id=physical_req_id,
+                        req_id=target_push.physical_req_id,
                         layer_idx=layer_idx,
-                        block_slices=block_slices,
+                        block_slices=target_push.block_slices,
                         event=event,
                     )
                 )
-            trace.rdma_bytes += rdma_bytes
-            self._tracker.mark_blocks_pushed(req_id, layer_idx, req_blocks)
+            trace.rdma_bytes += prepared.rdma_bytes
+            all_layer_chunks_seen = self._push_all_layers_seen.get(req_id, False)
+            chunk_complete = all_layer_chunks_seen
+            if not all_layer_chunks_seen:
+                self._push_chunk_maps[(req_id, layer_idx)] = ({}, prepared.all_chunks_seen)
+                self._tracker.mark_blocks_pushed(
+                    req_id,
+                    layer_idx,
+                    set(prepared.pushed_req_blocks),
+                )
             if layer_idx != len(self._w.layer_names) - 1:
                 continue
             trace.chunk_count += 1
             trace.last_save_ts_ns = time.time_ns()
             self._pending_push_chunks.discard(req_id)
-            self._push_chunk_maps.pop(req_id, None)
-            chunk_complete = self._tracker.has_pushed_all_blocks(
-                req_id,
-                req_blocks,
-                num_layers=len(self._w.layer_names),
-            )
-            if not (chunk_complete and all_chunks_seen):
+            if not all_layer_chunks_seen:
+                all_layer_chunks_seen = self._all_layer_chunks_seen(
+                    req_id,
+                    current_layer_idx=layer_idx,
+                    current_all_chunks_seen=prepared.all_chunks_seen,
+                )
+                self._clear_push_chunk_maps(req_id)
+                chunk_complete = self._tracker.has_pushed_all_blocks(
+                    req_id,
+                    self._block_ids_by_layer(req.local_block_ids),
+                    num_layers=len(self._w.layer_names),
+                ) or all_layer_chunks_seen
+            if not (chunk_complete and all_layer_chunks_seen):
                 logger.info(
                     "[PdConnector] P chunk req=%s target_req=%s chunk=%d blocks=%d forward_ms=%.3f",
                     req_id,
                     req.target_request_id,
                     trace.chunk_count,
-                    len(req_blocks),
+                    len(prepared.req_blocks),
                     _elapsed_ms(trace.first_save_ts_ns, trace.last_save_ts_ns),
                 )
                 continue
+            self._clear_push_chunk_maps(req_id)
+            self._clear_push_layer_plans(req_id)
             self._tracker.mark_done(req_id)
             finalize_ts_ns = time.time_ns()
-            ready_gbps = _gbps(trace.rdma_bytes, trace.first_save_ts_ns, trace.last_save_ts_ns)
             link_gbps = _rdma_link_gbps(self._w.rdma)
             logger.info(
-                "[PdConnector] P all chunks done req=%s target_req=%s chunks=%d blocks=%d rdma_bytes=%d schedule_to_save_ms=%.3f forward_ms=%.3f gbps=%.2f link_gbps=%.2f ready_link_util_pct=%.2f ts_ns=%d",
+                "[PdConnector] P all chunks submitted req=%s target_req=%s chunks=%d blocks=%d rdma_bytes=%d schedule_to_save_ms=%.3f forward_ms=%.3f link_gbps=%.2f ts_ns=%d",
                 req_id,
                 req.target_request_id,
                 trace.chunk_count,
-                len(req_blocks),
+                len(prepared.req_blocks),
                 trace.rdma_bytes,
                 (finalize_ts_ns - trace.queued_ts_ns) / 1_000_000,
                 _elapsed_ms(trace.first_save_ts_ns, trace.last_save_ts_ns),
-                ready_gbps,
                 link_gbps,
-                _pct(ready_gbps, link_gbps),
                 finalize_ts_ns,
             )
             self._push_finalizer.submit(
@@ -370,7 +379,7 @@ class PrefillHandler:
                     rdma=self._w.rdma,
                     req_ids=self._logical_to_physical[req_id],
                     target_request_id=req.target_request_id,
-                    num_blocks=len(req_blocks),
+                    num_blocks=len(prepared.req_blocks),
                     chunk_count=trace.chunk_count,
                     first_save_ts_ns=trace.first_save_ts_ns,
                     finalize_queued_ts_ns=finalize_ts_ns,
@@ -378,6 +387,68 @@ class PrefillHandler:
                     rdma_bytes=trace.rdma_bytes,
                 )
             )
+
+    def _prepare_push_layers(
+        self,
+        req_id: str,
+        req: PushReqMeta,
+        plan: PushLayoutPlan,
+    ) -> None:
+        layers: dict[int, _PreparedLayerPush] = {}
+        all_layers_seen = True
+        complete_layer_count = 0
+        for layer_idx, layer_name in enumerate(self._w.layer_names):
+            layout = self._w.layouts[layer_name]
+            req_blocks = self._w.block_ids_for_layer(req.local_block_ids, layer_name)
+            if not req_blocks:
+                all_layers_seen = False
+                continue
+            target_maps, all_chunks_seen = self._remote_block_id_maps(
+                req_id,
+                plan,
+                req_blocks,
+                layer_idx,
+            )
+            target_pushes: list[_PreparedTargetPush] = []
+            pushed_req_blocks: set[int] = set()
+            rdma_bytes = 0
+            for physical_req_id, target in zip(
+                self._logical_to_physical[req_id],
+                plan.targets,
+                strict=True,
+            ):
+                remote_block_ids = target_maps[physical_req_id]
+                if not remote_block_ids:
+                    continue
+                target_req_blocks = set(remote_block_ids)
+                pushed_req_blocks.update(target_req_blocks)
+                block_slices = _target_block_ranges_for_remote_write(
+                    layout,
+                    target,
+                    target_req_blocks,
+                    remote_block_ids,
+                )
+                rdma_bytes += block_slices_bytes(block_slices)
+                target_pushes.append(
+                    _PreparedTargetPush(
+                        physical_req_id=physical_req_id,
+                        block_slices=block_slices,
+                    )
+                )
+            pushed_req_blocks_frozen = frozenset(pushed_req_blocks)
+            layers[layer_idx] = _PreparedLayerPush(
+                req_blocks=frozenset(req_blocks),
+                pushed_req_blocks=pushed_req_blocks_frozen,
+                target_pushes=tuple(target_pushes),
+                rdma_bytes=rdma_bytes,
+                all_chunks_seen=all_chunks_seen,
+            )
+            all_layers_seen = all_layers_seen and all_chunks_seen
+            if pushed_req_blocks_frozen.issuperset(req_blocks):
+                complete_layer_count += 1
+        self._push_layer_plans[req_id] = layers
+        self._push_all_layers_seen[req_id] = all_layers_seen
+        self._push_complete_layer_count[req_id] = complete_layer_count
 
     def _build_push_layout_plan(self, req: PushReqMeta) -> PushLayoutPlan:
         assert req.handshakes, (
@@ -469,6 +540,7 @@ class PrefillHandler:
         req_id: str,
         plan: PushLayoutPlan,
         local_block_ids: set[int],
+        layer_idx: int,
     ) -> tuple[dict[str, dict[int, int]], bool]:
         result = {}
         all_chunks_seen = True
@@ -478,14 +550,61 @@ class PrefillHandler:
             strict=True,
         ):
             remote_block_ids, target_all_chunks_seen = _remote_block_id_map_for_handshake(
-                offset_key=physical_req_id,
+                offset_key=f"{physical_req_id}#l{layer_idx}",
                 handshake=target.handshake,
                 local_block_ids=local_block_ids,
+                layer_idx=layer_idx,
                 remote_block_offsets=self._remote_block_offsets,
             )
             result[physical_req_id] = remote_block_ids
             all_chunks_seen = all_chunks_seen and target_all_chunks_seen
         return result, all_chunks_seen
+
+    def _clear_push_chunk_maps(self, req_id: str) -> None:
+        self._push_chunk_maps = {
+            key: value for key, value in self._push_chunk_maps.items() if key[0] != req_id
+        }
+
+    def _clear_push_layer_plans(self, req_id: str) -> None:
+        self._push_layer_plans.pop(req_id, None)
+        self._push_all_layers_seen.pop(req_id, None)
+        self._push_complete_layer_count.pop(req_id, None)
+
+    def _clear_remote_block_offsets(
+        self, req_id: str, physical_req_ids: tuple[str, ...]
+    ) -> None:
+        physical_prefixes = tuple(f"{physical_req_id}#" for physical_req_id in physical_req_ids)
+        self._remote_block_offsets = {
+            key: value
+            for key, value in self._remote_block_offsets.items()
+            if key != req_id and not any(key.startswith(prefix) for prefix in physical_prefixes)
+        }
+
+    def _block_ids_by_layer(self, block_ids: Any) -> dict[int, set[int]]:
+        return {
+            layer_idx: self._w.block_ids_for_layer(block_ids, layer_name)
+            for layer_idx, layer_name in enumerate(self._w.layer_names)
+        }
+
+    def _all_layer_chunks_seen(
+        self,
+        req_id: str,
+        *,
+        current_layer_idx: int,
+        current_all_chunks_seen: bool,
+    ) -> bool:
+        seen_by_layer = {
+            layer_idx: all_chunks_seen
+            for (chunk_req_id, layer_idx), (
+                _target_maps,
+                all_chunks_seen,
+            ) in self._push_chunk_maps.items()
+            if chunk_req_id == req_id
+        }
+        seen_by_layer[current_layer_idx] = current_all_chunks_seen
+        return all(
+            seen_by_layer.get(layer_idx, False) for layer_idx in range(len(self._w.layer_names))
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -519,6 +638,93 @@ def _rdma_link_gbps(rdma: RdmaPort | None) -> float:
     except Exception:
         logger.exception("[PdConnector] failed to read RDMA link speed")
         return 0.0
+
+
+def _rdma_write_stats(
+    rdma: RdmaPort,
+    req_ids: tuple[str, ...],
+    *,
+    fallback_bytes: int,
+    fallback_start_ts_ns: int | None,
+    fallback_end_ts_ns: int | None,
+) -> dict[str, float | int | bool]:
+    stats_by_req = []
+    for req_id in req_ids:
+        try:
+            stats_by_req.append(rdma.write_stats(req_id))
+        except AttributeError:
+            continue
+        except Exception:
+            logger.exception("[PdConnector] failed to read RDMA write stats req=%s", req_id)
+    if not stats_by_req:
+        return {
+            "submitted": 0,
+            "completed": 0,
+            "errors": 0,
+            "bytes": fallback_bytes,
+            "has_submit": False,
+            "has_complete": False,
+            "submit_span_ms": 0.0,
+            "xfer_window_ms": 0.0,
+            "completion_tail_ms": 0.0,
+            "window_gbps": 0.0,
+            "gbps": _gbps(fallback_bytes, fallback_start_ts_ns, fallback_end_ts_ns),
+        }
+
+    bytes_total = sum(int(stats.get("bytes", 0)) for stats in stats_by_req)
+    xfer_window_ms = max(float(stats.get("xfer_window_ms", 0.0)) for stats in stats_by_req)
+    window_gbps = bytes_total * 8 / (xfer_window_ms / 1000.0) / 1e9 if xfer_window_ms > 0 else 0.0
+    write_latency_sum_ms = sum(float(stats.get("write_latency_sum_ms", 0.0)) for stats in stats_by_req)
+    active_gbps = (
+        bytes_total * 8 / (write_latency_sum_ms / 1000.0) / 1e9
+        if write_latency_sum_ms > 0
+        else window_gbps
+    )
+    return {
+        "submitted": sum(int(stats.get("submitted", 0)) for stats in stats_by_req),
+        "completed": sum(int(stats.get("completed", 0)) for stats in stats_by_req),
+        "errors": sum(int(stats.get("errors", 0)) for stats in stats_by_req),
+        "bytes": bytes_total,
+        "has_submit": any(bool(stats.get("has_submit", False)) for stats in stats_by_req),
+        "has_complete": any(bool(stats.get("has_complete", False)) for stats in stats_by_req),
+        "submit_span_ms": max(float(stats.get("submit_span_ms", 0.0)) for stats in stats_by_req),
+        "first_complete_ms": max(
+            float(stats.get("first_complete_ms", 0.0)) for stats in stats_by_req
+        ),
+        "xfer_window_ms": xfer_window_ms,
+        "completion_tail_ms": max(
+            float(stats.get("completion_tail_ms", 0.0)) for stats in stats_by_req
+        ),
+        "write_latency_sum_ms": write_latency_sum_ms,
+        "write_latency_max_ms": max(
+            float(stats.get("write_latency_max_ms", 0.0)) for stats in stats_by_req
+        ),
+        "window_gbps": window_gbps,
+        "gbps": active_gbps,
+    }
+
+
+def _bool_config(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _assert_runtime_layout_matches(layer_name: str, kv_layer: Any, layout: Any) -> None:
+    shape = tuple(int(dim) for dim in kv_layer.shape)
+    assert shape == layout.shape, (
+        f"PdConnector KV shape changed for {layer_name}: "
+        f"registered={layout.shape} runtime={shape}"
+    )
+    runtime_stride = tuple(int(stride) for stride in kv_layer.stride())
+    assert runtime_stride == layout.strides, (
+        f"PdConnector KV strides changed for {layer_name}: "
+        f"registered={layout.strides} runtime={runtime_stride}"
+    )
+    assert int(kv_layer.data_ptr()) == int(layout.base_addr), (
+        f"PdConnector KV base address changed for {layer_name}: "
+        f"registered={layout.base_addr} runtime={int(kv_layer.data_ptr())}"
+    )
 
 
 def _target_block_ranges_for_remote_write(
@@ -608,28 +814,27 @@ def _remote_block_id_map_for_handshake(
     offset_key: str,
     handshake: PdHandshake,
     local_block_ids: set[int],
+    layer_idx: int,
     remote_block_offsets: dict[str, int],
 ) -> tuple[dict[int, int], bool]:
     if not handshake.layers:
         return {block_id: block_id for block_id in local_block_ids}, True
-    remote_block_ids = handshake.layers[0].block_ids
-    for layer in handshake.layers[1:]:
-        assert layer.block_ids == remote_block_ids, (
-            "PdConnector expects one decode block-id layout shared by all layers; "
-            f"layer=0 blocks={list(remote_block_ids)} layer={layer.layer_idx} "
-            f"blocks={list(layer.block_ids)}"
-        )
+    remote_layer = handshake.layers_by_idx.get(layer_idx)
+    assert remote_layer is not None, (
+        "PdConnector missing decode layer layout for push "
+        f"layer_idx={layer_idx} available={[layer.layer_idx for layer in handshake.layers]}"
+    )
+    remote_block_ids = remote_layer.block_ids
     ordered_local = sorted(local_block_ids)
     if len(ordered_local) == len(remote_block_ids):
         remote_block_offsets[offset_key] = len(remote_block_ids)
         return dict(zip(ordered_local, remote_block_ids, strict=True)), True
 
     offset = remote_block_offsets.get(offset_key, 0)
-    next_offset = offset + len(ordered_local)
-    assert next_offset <= len(remote_block_ids), (
-        "PdConnector P/D block count mismatch "
-        f"offset={offset} local_blocks={ordered_local} remote_blocks={list(remote_block_ids)}"
-    )
+    if offset >= len(remote_block_ids):
+        return {}, True
+    next_offset = min(offset + len(ordered_local), len(remote_block_ids))
+    ordered_local = ordered_local[: next_offset - offset]
     remote_chunk = remote_block_ids[offset:next_offset]
     remote_block_offsets[offset_key] = next_offset
     return dict(zip(ordered_local, remote_chunk, strict=True)), next_offset == len(remote_block_ids)
@@ -689,6 +894,21 @@ class _LayerPushTask:
     layer_idx: int
     block_slices: list[LayerBlockSlices]
     event: Any = None
+
+
+@dataclass(frozen=True)
+class _PreparedTargetPush:
+    physical_req_id: str
+    block_slices: list[LayerBlockSlices]
+
+
+@dataclass(frozen=True)
+class _PreparedLayerPush:
+    req_blocks: frozenset[int]
+    pushed_req_blocks: frozenset[int]
+    target_pushes: tuple[_PreparedTargetPush, ...]
+    rdma_bytes: int
+    all_chunks_seen: bool
 
 
 @dataclass
@@ -905,7 +1125,15 @@ class _AsyncPushFinalizer:
                 task.rdma.push_done(req_id)
                 completed = True
             done_ts_ns = time.time_ns()
+            write_stats = _rdma_write_stats(
+                task.rdma,
+                task.req_ids,
+                fallback_bytes=task.rdma_bytes,
+                fallback_start_ts_ns=task.first_save_ts_ns,
+                fallback_end_ts_ns=done_ts_ns,
+            )
             if completed and self._metrics is not None:
+                push_gbps = float(write_stats.get("gbps", 0.0))
                 self._metrics.record_prefill_push(
                     duration_s=(done_ts_ns - task.schedule_queued_ts_ns) / 1_000_000_000,
                     first_save_to_done_s=(
@@ -916,14 +1144,18 @@ class _AsyncPushFinalizer:
                     wait_for_pushes_s=wait_for_pushes_s,
                     blocks=task.num_blocks,
                     bytes_total=task.rdma_bytes,
+                    gbps=push_gbps,
                     success=True,
                 )
-            save_gbps = _gbps(task.rdma_bytes, task.first_save_ts_ns, done_ts_ns)
+            push_gbps = float(write_stats.get("gbps", 0.0))
             link_gbps = _rdma_link_gbps(task.rdma)
             logger.info(
                 "[PdConnector] P RDMA done reqs=%s target_req=%s chunks=%d blocks=%d "
                 "rdma_bytes=%d save_to_imm_ms=%.3f schedule_to_imm_ms=%.3f "
-                "save_gbps=%.2f tail_gbps=%.2f link_gbps=%.2f link_util_pct=%.2f",
+                "submit_span_ms=%.3f xfer_window_ms=%.3f completion_tail_ms=%.3f "
+                "write_latency_sum_ms=%.3f write_latency_max_ms=%.3f "
+                "writes=%d/%d errors=%d gbps=%.2f window_gbps=%.2f "
+                "link_gbps=%.2f link_util_pct=%.2f ts_ns=%d",
                 list(task.req_ids),
                 task.target_request_id,
                 task.chunk_count,
@@ -931,10 +1163,19 @@ class _AsyncPushFinalizer:
                 task.rdma_bytes,
                 _elapsed_ms(task.first_save_ts_ns, done_ts_ns),
                 _elapsed_ms(task.schedule_queued_ts_ns, done_ts_ns),
-                save_gbps,
-                _gbps(task.rdma_bytes, task.finalize_queued_ts_ns, done_ts_ns),
+                float(write_stats.get("submit_span_ms", 0.0)),
+                float(write_stats.get("xfer_window_ms", 0.0)),
+                float(write_stats.get("completion_tail_ms", 0.0)),
+                float(write_stats.get("write_latency_sum_ms", 0.0)),
+                float(write_stats.get("write_latency_max_ms", 0.0)),
+                int(write_stats.get("completed", 0)),
+                int(write_stats.get("submitted", 0)),
+                int(write_stats.get("errors", 0)),
+                push_gbps,
+                float(write_stats.get("window_gbps", 0.0)),
                 link_gbps,
-                _pct(save_gbps, link_gbps),
+                _pct(push_gbps, link_gbps),
+                done_ts_ns,
             )
         except BaseException as exc:
             logger.exception(
@@ -955,6 +1196,7 @@ class _AsyncPushFinalizer:
                     wait_for_pushes_s=None,
                     blocks=task.num_blocks,
                     bytes_total=task.rdma_bytes,
+                    gbps=None,
                     success=False,
                 )
         finally:
