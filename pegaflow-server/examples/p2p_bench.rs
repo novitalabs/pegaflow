@@ -310,7 +310,10 @@ async fn run_holder(cli: &Cli, shape: &Shape, pool_bytes: usize) {
         PegaEngine::new_with_config(pool_bytes, cli.use_hugepages, config).expect("holder engine"),
     );
 
-    let registry = RegistryHandle::spawn(CudaTensorRegistry::new().expect("CudaTensorRegistry"));
+    // The bench saves in-process (no gRPC IPC saves), so the registry stays
+    // empty; `empty()` avoids dragging an embedded-Python torch import into
+    // a bench that never registers IPC tensors.
+    let registry = RegistryHandle::spawn(CudaTensorRegistry::empty());
     let shutdown = Arc::new(Notify::new());
     let hll = Arc::new(std::sync::Mutex::new(
         pegaflow_common::hll::MultiWindowHllTracker::new(
