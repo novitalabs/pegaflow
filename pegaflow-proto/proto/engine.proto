@@ -134,19 +134,13 @@ message SessionRequest {
 message SessionEvent {
 }
 
-// Cross-node transfer: per-slot RDMA metadata
+// Cross-node transfer: per-slot segment sizes. One template describes every
+// block in the response; remote segment addresses arrive separately as
+// run-encoded lanes in QueryBlocksForTransferResponse.
 message TransferSlotInfo {
-  uint64 k_ptr = 1;      // Remote pinned memory address for K segment
-  uint64 k_size = 2;     // Size of the K segment in bytes (per-segment, not total slot size)
-  uint64 v_ptr = 3;      // Remote pinned memory address for V segment (0 if contiguous)
-  uint64 v_size = 4;     // Size of the V segment in bytes (0 if contiguous)
-  uint32 numa_node = 5;  // NUMA node where this slot's memory resides (for RDMA NIC affinity)
-}
-
-// Cross-node transfer: per-block RDMA metadata
-message TransferBlockInfo {
-  bytes block_hash = 1;
-  repeated TransferSlotInfo slots = 2;  // One per TP slot
+  uint64 k_size = 1;     // Size of the K segment in bytes (per-segment, not total slot size)
+  uint64 v_size = 2;     // Size of the V segment in bytes (0 if contiguous)
+  uint32 numa_node = 3;  // NUMA node where this slot's memory resides (for RDMA NIC affinity)
 }
 
 message QueryBlocksForTransferRequest {
@@ -157,9 +151,26 @@ message QueryBlocksForTransferRequest {
 
 message QueryBlocksForTransferResponse {
   ResponseStatus status = 1;
-  repeated TransferBlockInfo blocks = 2;
+  reserved 2;                           // was: repeated TransferBlockInfo blocks
   string transfer_session_id = 3;       // Opaque session ID for ReleaseTransferLock
   uint32 lock_timeout_secs = 4;         // Server's transfer lock timeout — client must finish before this
+  // The longest prefix of the requested hashes that is present, locked, and
+  // layout-homogeneous (every block matches slot_template). Block identity is
+  // implicit: entry i corresponds to block_hashes[i] of the request.
+  uint32 block_count = 5;
+  repeated TransferSlotInfo slot_template = 6;  // One entry per TP slot
+  // Remote segment addresses for RDMA READ, run-encoded per lane. A lane is
+  // one template segment (slot 0 K, slot 0 V if split, slot 1 K, ...) across
+  // all blocks of the prefix. Holder memory comes from sequential bump
+  // allocation, so a lane normally collapses to a single affine run:
+  //   addr(block i) = run_base + i * run_stride.
+  // Lane l owns runs_per_lane[l] consecutive entries of the three parallel
+  // run arrays; within a lane, run counts sum to block_count. A run with
+  // run_count == 1 carries stride 0.
+  repeated uint32 runs_per_lane = 7;
+  repeated fixed64 run_base = 8;
+  repeated uint64 run_stride = 9;
+  repeated uint32 run_count = 10;
 }
 
 // RDMA handshake: establish a new RDMA connection between two peers.

@@ -28,6 +28,8 @@ mod seal_offload;
 mod storage;
 pub mod sync_state;
 pub mod transfer;
+mod transfer_runs;
+pub use transfer_runs::SegmentRunTable;
 
 pub use backing::{
     DEFAULT_SSD_PREFETCH_INFLIGHT, DEFAULT_SSD_PREFETCH_QUEUE_DEPTH, DEFAULT_SSD_WRITE_INFLIGHT,
@@ -63,6 +65,7 @@ use crate::gpu_worker::{LayerTransferData, LoadCompletion, LoadTask, TransferBlo
 use crate::lease::QueryLeaseManager;
 use crate::metrics::core_metrics;
 use crate::storage::StorageEngine;
+use pegaflow_proto::proto::engine::TransferSlotInfo;
 use tokio::sync::oneshot;
 
 /// Errors that can occur during engine operations.
@@ -752,29 +755,103 @@ impl PegaEngine {
     // Cross-node transfer: serving side
     // =========================================================================
 
-    /// Look up blocks and lock them for RDMA transfer. Returns metadata
-    /// for each found block plus a session ID for later unlock.
+    /// Lock the longest present, layout-homogeneous prefix of `block_hashes`
+    /// for RDMA transfer.
+    ///
+    /// The wire format carries one template plus per-segment addresses, so
+    /// the prefix must be exact: a missing block, a block with a different
+    /// layout, or a block without per-slot NUMA info (rebuilt from SSD or a
+    /// previous RDMA fetch) truncates it.
     pub fn query_blocks_for_transfer(
         &self,
         namespace: &str,
         block_hashes: &[Vec<u8>],
         requester_id: &str,
-    ) -> (String, Vec<(BlockKey, Arc<SealedBlock>)>) {
+    ) -> LockedTransferPrefix {
         let keys: Vec<BlockKey> = block_hashes
             .iter()
             .map(|h| BlockKey::new(namespace.to_string(), h.clone()))
             .collect();
 
+        // `get_blocks_for_transfer` returns the present subset in request
+        // order; cut it down to the contiguous prefix of the request.
         let found = self.storage.get_blocks_for_transfer(&keys);
-        let session_id = self.storage.lock_blocks_for_transfer(requester_id, &found);
+        let mut found_iter = found.into_iter().peekable();
+        let mut prefix: Vec<(BlockKey, Arc<SealedBlock>)> = Vec::new();
+        for key in &keys {
+            match found_iter.peek() {
+                Some((fk, _)) if fk == key => {
+                    prefix.push(found_iter.next().expect("peeked entry exists"));
+                }
+                _ => break,
+            }
+        }
+
+        let template = prefix
+            .first()
+            .and_then(|(_, block)| block_slot_template(block))
+            .unwrap_or_default();
+
+        // Scan the prefix block by block: verify each block against the
+        // template slot by slot (no per-block allocation, no Arc traffic),
+        // then feed its segment addresses to the per-lane run accumulators.
+        // Verification runs over the whole block first so a mid-block layout
+        // mismatch never leaves partially recorded addresses behind.
+        let lane_count: usize = template
+            .iter()
+            .map(|t| usize::from(t.k_size > 0) + usize::from(t.v_size > 0))
+            .sum();
+        let mut runs = transfer_runs::RunTableBuilder::new(lane_count);
+        let mut homogeneous = 0;
+        'scan: for (_, block) in &prefix {
+            let slots = block.slots();
+            let numas = block.slot_numas();
+            if numas.len() != slots.len() || slots.len() != template.len() {
+                break;
+            }
+            for ((raw, numa), t) in slots.iter().zip(numas).zip(&template) {
+                let k_size = raw.segment_size(0).unwrap_or(0) as u64;
+                let v_size = raw.segment_size(1).unwrap_or(0) as u64;
+                let seg_count = usize::from(t.k_size > 0) + usize::from(t.v_size > 0);
+                if k_size != t.k_size
+                    || v_size != t.v_size
+                    || numa.0 != t.numa_node
+                    || raw.num_segments() != seg_count
+                {
+                    break 'scan;
+                }
+            }
+            let mut lane = 0;
+            for (raw, t) in slots.iter().zip(&template) {
+                if t.k_size > 0 {
+                    let ptr = raw.segment_ptr(0).expect("K segment size checked above");
+                    runs.push(lane, ptr.as_ptr() as u64);
+                    lane += 1;
+                }
+                if t.v_size > 0 {
+                    let ptr = raw.segment_ptr(1).expect("V segment size checked above");
+                    runs.push(lane, ptr.as_ptr() as u64);
+                    lane += 1;
+                }
+            }
+            homogeneous += 1;
+        }
+        prefix.truncate(homogeneous);
+
+        let session_id = self.storage.lock_blocks_for_transfer(requester_id, &prefix);
 
         debug!(
-            "query_blocks_for_transfer: namespace={namespace} requested={} found={} session={session_id}",
+            "query_blocks_for_transfer: namespace={namespace} requested={} locked_prefix={} session={session_id}",
             block_hashes.len(),
-            found.len(),
+            prefix.len(),
         );
 
-        (session_id, found)
+        LockedTransferPrefix {
+            session_id,
+            block_count: prefix.len(),
+            slot_template: template,
+            segment_runs: runs.finish(),
+        }
     }
 
     pub fn transfer_lock_timeout(&self) -> std::time::Duration {
@@ -872,6 +949,45 @@ impl PegaEngine {
     ) -> Result<Vec<u8>, String> {
         Err("this binary was built without RDMA support".to_string())
     }
+}
+
+/// The longest present, layout-homogeneous prefix of a transfer query,
+/// locked under `session_id` until released or timed out. Every locked
+/// block matches `slot_template`; `segment_runs` carries the blocks'
+/// segment addresses as per-lane affine runs, ready for the
+/// QueryBlocksForTransfer response.
+pub struct LockedTransferPrefix {
+    pub session_id: String,
+    pub block_count: usize,
+    pub slot_template: Vec<TransferSlotInfo>,
+    pub segment_runs: SegmentRunTable,
+}
+
+/// Per-slot layout of a sealed block, or `None` when the block carries no
+/// per-slot NUMA info (rebuilt from SSD or a previous RDMA fetch) and
+/// therefore cannot be served over the template-based transfer wire format.
+fn block_slot_template(block: &SealedBlock) -> Option<Vec<TransferSlotInfo>> {
+    if block.slot_numas().len() != block.slots().len() {
+        return None;
+    }
+    Some(
+        block
+            .slots()
+            .iter()
+            .zip(block.slot_numas())
+            .map(|(raw, numa)| {
+                let layer_block = LayerBlock::new(Arc::clone(raw));
+                TransferSlotInfo {
+                    k_size: layer_block.k_size() as u64,
+                    v_size: layer_block
+                        .v_ptr()
+                        .and_then(|_| layer_block.v_size())
+                        .unwrap_or(0) as u64,
+                    numa_node: numa.0,
+                }
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]
