@@ -592,7 +592,13 @@ fn get_or_create_channel(
         .map_err(|e| format!("invalid remote address: {e}"))?
         .connect_timeout(Duration::from_secs(5))
         .connect_lazy();
-    let client = EngineClient::new(channel);
+    // Match the engine server's 64 MiB message cap: a QueryBlocksForTransfer
+    // response carries per-slot transfer descriptors, so a large block batch
+    // overflows tonic's default 4 MiB decode limit.
+    const MAX_GRPC_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+    let client = EngineClient::new(channel)
+        .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
+        .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE);
     cache.insert(addr.to_string(), client.clone());
     Ok(client)
 }
