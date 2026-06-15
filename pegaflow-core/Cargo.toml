@@ -36,6 +36,7 @@ tonic.workspace = true
 dashmap.workspace = true
 smallvec.workspace = true
 pegaflow-proto = { path = "../pegaflow-proto" }
+pegaflow-transfer-wire.workspace = true
 pegaflow-transfer = { path = "../pegaflow-transfer", default-features = false, optional = true }
 mea.workspace = true
 

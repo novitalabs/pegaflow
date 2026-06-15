@@ -270,6 +270,10 @@ impl SealedBlock {
 
     /// Create from a vec of slots (for deserialization / prefetch rebuild)
     pub(crate) fn from_slots(slots: Vec<RawBlock>) -> Self {
+        assert!(
+            !slots.is_empty(),
+            "sealed block must have at least one slot"
+        );
         let footprint = slots.iter().map(|s| s.memory_footprint()).sum();
         Self {
             slots: slots.into_boxed_slice(),
@@ -297,6 +301,7 @@ impl SealedBlock {
         total_slots: usize,
         numa_node: NumaNode,
     ) -> Result<Self, Vec<(usize, RawBlock)>> {
+        assert!(total_slots > 0, "total_slots must be > 0");
         if slots.len() != total_slots
             || slots
                 .iter()
@@ -318,6 +323,23 @@ impl SealedBlock {
             footprint,
             vec![numa_node; total_slots],
         ))
+    }
+}
+
+#[cfg(test)]
+impl SealedBlock {
+    /// Minimal sealed block for unit tests that only need a non-empty slot layout.
+    pub(crate) fn test_dummy() -> Self {
+        use std::num::NonZeroU64;
+
+        let allocator = Arc::new(crate::pinned_pool::PinnedAllocator::new_global(
+            4096, 1, false, false, None,
+        ));
+        let allocation = allocator
+            .allocate(NonZeroU64::new(64).unwrap(), NumaNode::UNKNOWN)
+            .expect("test allocation");
+        let segment = Segment::new(allocation.as_non_null(), 64, allocation);
+        Self::from_slots(vec![RawBlock::single_segment(segment)])
     }
 }
 
@@ -354,6 +376,7 @@ pub(crate) struct InflightBlock {
 
 impl InflightBlock {
     pub(crate) fn new(total_slots: usize) -> Self {
+        assert!(total_slots > 0, "total_slots must be > 0");
         Self {
             slots: (0..total_slots).map(|_| None).collect(),
             remaining: total_slots,

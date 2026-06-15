@@ -157,7 +157,7 @@ mod tests {
 
     fn make_test_block() -> (BlockKey, Arc<SealedBlock>) {
         let key = BlockKey::new("ns".into(), vec![1, 2, 3]);
-        let block = Arc::new(SealedBlock::from_slots(Vec::new()));
+        let block = Arc::new(SealedBlock::test_dummy());
         (key, block)
     }
 
@@ -203,7 +203,7 @@ mod tests {
         let mgr = TransferLockManager::new(Duration::from_secs(30));
         let (key1, block1) = make_test_block();
         let key2 = BlockKey::new("ns".into(), vec![4, 5, 6]);
-        let block2 = Arc::new(SealedBlock::from_slots(Vec::new()));
+        let block2 = Arc::new(SealedBlock::test_dummy());
 
         let s1 = mgr.lock_blocks("node-a", vec![(key1.clone(), block1.clone())]);
         let s2 = mgr.lock_blocks("node-b", vec![(key1, block1), (key2, block2)]);
@@ -223,7 +223,7 @@ mod tests {
     fn arc_keeps_memory_alive() {
         let mgr = TransferLockManager::new(Duration::from_secs(30));
         let key = BlockKey::new("ns".into(), vec![1]);
-        let block = Arc::new(SealedBlock::from_slots(Vec::new()));
+        let block = Arc::new(SealedBlock::test_dummy());
 
         // Lock holds an Arc clone
         let session_id = mgr.lock_blocks("node-a", vec![(key, block.clone())]);
@@ -285,7 +285,7 @@ mod tests {
             let blocks: Vec<(BlockKey, Arc<SealedBlock>)> = (0..blocks_per_session)
                 .map(|j| {
                     let key = BlockKey::new("ns".into(), vec![i as u8, j as u8]);
-                    let block = Arc::new(SealedBlock::from_slots(Vec::new()));
+                    let block = Arc::new(SealedBlock::test_dummy());
                     (key, block)
                 })
                 .collect();
@@ -339,7 +339,7 @@ mod tests {
 
         // Session 2: fresh, should NOT expire
         let key2 = BlockKey::new("ns".into(), vec![7, 8, 9]);
-        let block2 = Arc::new(SealedBlock::from_slots(Vec::new()));
+        let block2 = Arc::new(SealedBlock::test_dummy());
         let s2 = mgr.lock_blocks("node-b", vec![(key2, block2)]);
 
         assert_eq!(mgr.active_session_count(), 2);

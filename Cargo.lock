@@ -1927,6 +1927,7 @@ dependencies = [
  "pegaflow-common",
  "pegaflow-proto",
  "pegaflow-transfer",
+ "pegaflow-transfer-wire",
  "rand 0.10.0",
  "shared_memory",
  "smallvec",
@@ -2050,6 +2051,15 @@ dependencies = [
  "syscalls",
  "thiserror 2.0.18",
  "tokio",
+]
+
+[[package]]
+name = "pegaflow-transfer-wire"
+version = "0.22.9"
+dependencies = [
+ "postcard",
+ "serde",
+ "smallvec",
 ]
 
 [[package]]

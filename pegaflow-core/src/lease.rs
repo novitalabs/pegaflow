@@ -222,7 +222,7 @@ mod tests {
     #[test]
     fn consume_allows_configured_number_of_consumers() {
         let manager = QueryLeaseManager::default();
-        let blocks = vec![Arc::new(SealedBlock::from_slots(Vec::new()))];
+        let blocks = vec![Arc::new(SealedBlock::test_dummy())];
         let lease_id = manager.create("inst-a", blocks, 2);
 
         assert_eq!(manager.consume("inst-a", &lease_id).unwrap().len(), 1);

@@ -637,8 +637,8 @@ mod tests {
         let storage = make_engine();
         let key1 = BlockKey::new("ns".into(), vec![1]);
         let key2 = BlockKey::new("ns".into(), vec![2]);
-        let block1 = Arc::new(SealedBlock::from_slots(Vec::new()));
-        let block2 = Arc::new(SealedBlock::from_slots(Vec::new()));
+        let block1 = Arc::new(SealedBlock::test_dummy());
+        let block2 = Arc::new(SealedBlock::test_dummy());
 
         storage.test_insert_cache(key1, Arc::clone(&block1));
         storage.test_insert_cache(key2, block2);
@@ -682,7 +682,7 @@ mod tests {
         let storage = make_engine();
         let key1 = BlockKey::new("ns".into(), vec![1]);
         let key2 = BlockKey::new("ns".into(), vec![2]);
-        let block = Arc::new(SealedBlock::from_slots(Vec::new()));
+        let block = Arc::new(SealedBlock::test_dummy());
 
         storage.test_insert_cache(key1, block.clone());
         storage.test_insert_cache(key2, block);
@@ -703,7 +703,7 @@ mod tests {
         let key1 = BlockKey::new("ns".into(), vec![1]);
         let key2 = BlockKey::new("ns".into(), vec![2]);
         let key3 = BlockKey::new("ns".into(), vec![3]);
-        let block = Arc::new(SealedBlock::from_slots(Vec::new()));
+        let block = Arc::new(SealedBlock::test_dummy());
 
         storage.test_insert_cache(key1.clone(), block.clone());
         storage.test_insert_cache(key3.clone(), block.clone());
@@ -741,7 +741,7 @@ mod tests {
     async fn lock_and_release_transfer_when_enabled() {
         let storage = make_engine();
         let key = BlockKey::new("ns".into(), vec![1]);
-        let block = Arc::new(SealedBlock::from_slots(Vec::new()));
+        let block = Arc::new(SealedBlock::test_dummy());
 
         storage.test_insert_cache(key.clone(), block.clone());
 

@@ -266,7 +266,7 @@ mod tests {
     fn contains_key_does_not_bump_frequency() {
         let mut cache = TinyLfuCache::new_unbounded(1024, true, Some(1));
         let key = BlockKey::new("ns".to_string(), vec![1, 2, 3, 4]);
-        let value = Arc::new(SealedBlock::from_slots(Vec::new()));
+        let value = Arc::new(SealedBlock::test_dummy());
 
         let _ = cache.insert(key.clone(), value);
         let before = cache.freq.as_ref().expect("lfu enabled").get(&key);

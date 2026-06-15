@@ -113,7 +113,7 @@ mod tests {
     }
 
     fn make_block() -> Arc<SealedBlock> {
-        Arc::new(SealedBlock::from_slots(Vec::new()))
+        Arc::new(SealedBlock::test_dummy())
     }
 
     #[test]
