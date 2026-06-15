@@ -311,7 +311,7 @@ impl TestEnv {
     /// Save one layer's blocks to cache.
     pub async fn save_layer(&self, layer_index: usize, hashes: &[Vec<u8>]) {
         let layer = &self.layers[layer_index];
-        let block_ids: Vec<i32> = (0..hashes.len() as i32).collect();
+        let block_ids: Vec<usize> = (0..hashes.len()).collect();
         self.engine
             .batch_save_kv_blocks_from_ipc(
                 &self.instance_id,
@@ -388,7 +388,7 @@ impl TestEnv {
 
     /// Load blocks from cache to GPU (lease must be held).
     pub async fn load_to_gpu(&self, lease: QueryLeaseId, block_count: usize) {
-        let block_ids: Vec<i32> = (0..block_count as i32).collect();
+        let block_ids: Vec<usize> = (0..block_count).collect();
         let layer_names: Vec<&str> = self.layers.iter().map(|l| l.name.as_str()).collect();
         let load_state = LoadState::new().expect("create LoadState");
         let shm_name = load_state.shm_name().to_string();
@@ -407,7 +407,7 @@ impl TestEnv {
 
     /// Submit load and assert it fails synchronously with `expected_msg`.
     pub fn expect_load_error(&self, lease: QueryLeaseId, block_count: usize, expected_msg: &str) {
-        let block_ids: Vec<i32> = (0..block_count as i32).collect();
+        let block_ids: Vec<usize> = (0..block_count).collect();
         let layer_names: Vec<&str> = self.layers.iter().map(|l| l.name.as_str()).collect();
         let load_state = LoadState::new().expect("create LoadState");
         let shm_name = load_state.shm_name().to_string();

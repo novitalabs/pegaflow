@@ -221,12 +221,11 @@ impl PegaEngine {
             let blocks_to_save: Vec<(usize, Vec<u8>)> = block_ids
                 .into_iter()
                 .zip(block_hashes)
-                .map(|(id, hash)| {
-                    let idx = id as usize;
+                .map(|(idx, hash)| {
                     if idx >= num_blocks {
                         return Err(EngineError::InvalidArgument(format!(
                             "block_id {} out of range (num_blocks={}) for layer {}",
-                            id, num_blocks, layer_name
+                            idx, num_blocks, layer_name
                         )));
                     }
                     Ok((idx, hash))

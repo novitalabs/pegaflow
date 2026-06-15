@@ -39,7 +39,7 @@ message RegisterContextResponse {
 
 message SaveLayer {
   string layer_name = 1;
-  repeated int32 block_ids = 2;
+  repeated uint32 block_ids = 2;
   repeated bytes block_hashes = 3;
 }
 
@@ -66,7 +66,7 @@ message LoadRequest {
 
 message LeaseLoad {
   bytes lease = 1;
-  repeated int32 block_ids = 2;
+  repeated uint32 block_ids = 2;
 }
 
 message LoadResponse {

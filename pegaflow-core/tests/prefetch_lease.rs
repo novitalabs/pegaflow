@@ -51,7 +51,7 @@ async fn query_then_load_consumes_reservation_budget() {
     env.load_to_gpu(lease, hashes.len()).await;
     env.data().assert_gpu_matches_expected();
 
-    let block_ids: Vec<i32> = (0..hashes.len() as i32).collect();
+    let block_ids: Vec<usize> = (0..hashes.len()).collect();
     let layer_names: Vec<&str> = env.layers.iter().map(|l| l.name.as_str()).collect();
     let load_state = LoadState::new().expect("create LoadState");
     let err = env

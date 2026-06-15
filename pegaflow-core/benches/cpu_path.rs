@@ -42,7 +42,7 @@ struct BenchFixture {
     _ctx: Arc<CudaContext>,
     _gpu: GpuBuffer,
     num_blocks: usize,
-    block_ids: Vec<i32>,
+    block_ids: Vec<usize>,
 }
 
 impl BenchFixture {
@@ -87,7 +87,7 @@ impl BenchFixture {
             .iter()
             .copied()
             .max()
-            .map(|id| usize::try_from(id).expect("block id must be non-negative") + 1)
+            .map(|id| id + 1)
             .unwrap_or(num_blocks);
         Self::with_config(
             registered_blocks,
@@ -107,7 +107,7 @@ impl BenchFixture {
         registered_blocks: usize,
         bytes_per_block: usize,
         config: StorageConfig,
-        block_ids: Vec<i32>,
+        block_ids: Vec<usize>,
     ) -> Self {
         let ctx = CudaContext::new(DEVICE_ID as usize).expect("CUDA context");
         ctx.bind_to_thread().expect("bind CUDA context");
@@ -244,12 +244,10 @@ impl TransferFragmentLayout {
         }
     }
 
-    fn block_ids(self, num_blocks: usize) -> Vec<i32> {
+    fn block_ids(self, num_blocks: usize) -> Vec<usize> {
         match self {
             Self::Contiguous => block_ids(num_blocks),
-            Self::StridedDevice => (0..num_blocks)
-                .map(|idx| i32::try_from(idx * 2).expect("block index exceeds i32"))
-                .collect(),
+            Self::StridedDevice => (0..num_blocks).map(|idx| idx * 2).collect(),
         }
     }
 }
@@ -713,10 +711,8 @@ fn load_benchmarks(c: &mut Criterion) {
     group.finish();
 }
 
-fn block_ids(num_blocks: usize) -> Vec<i32> {
-    (0..num_blocks)
-        .map(|idx| i32::try_from(idx).expect("block index exceeds i32"))
-        .collect()
+fn block_ids(num_blocks: usize) -> Vec<usize> {
+    (0..num_blocks).collect()
 }
 
 fn bytes_per_iter(num_blocks: usize, bytes_per_block: usize) -> u64 {

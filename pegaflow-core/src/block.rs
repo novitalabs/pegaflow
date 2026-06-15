@@ -21,7 +21,7 @@ pub type BlockHash = Vec<u8>;
 /// Per-layer save input: layer name + block IDs + content hashes.
 pub struct LayerSave {
     pub layer_name: String,
-    pub block_ids: Vec<i32>,
+    pub block_ids: Vec<usize>,
     pub block_hashes: Vec<Vec<u8>>,
 }
 

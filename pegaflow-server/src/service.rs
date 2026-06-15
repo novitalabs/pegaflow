@@ -155,12 +155,6 @@ impl GrpcEngineService {
                     layer.layer_name
                 )));
             }
-            if let Some(id) = layer.block_ids.iter().find(|id| **id < 0) {
-                return Err(Status::invalid_argument(format!(
-                    "negative block_id {} in layer {}",
-                    id, layer.layer_name
-                )));
-            }
         }
         Ok(())
     }
@@ -434,7 +428,7 @@ impl Engine for GrpcEngineService {
                 .into_iter()
                 .map(|layer| LayerSave {
                     layer_name: layer.layer_name,
-                    block_ids: layer.block_ids,
+                    block_ids: layer.block_ids.into_iter().map(|id| id as usize).collect(),
                     block_hashes: layer.block_hashes,
                 })
                 .collect();
@@ -521,12 +515,13 @@ impl Engine for GrpcEngineService {
                 load_state_shm.len()
             );
             let layer_refs: Vec<&str> = layer_names.iter().map(|s| s.as_str()).collect();
-            let loads: Vec<(QueryLeaseId, Vec<i32>)> = loads
+            let loads: Vec<(QueryLeaseId, Vec<usize>)> = loads
                 .into_iter()
                 .map(|load| {
-                    QueryLeaseId::from_bytes(&load.lease)
-                        .map(|lease| (lease, load.block_ids))
-                        .map_err(Status::invalid_argument)
+                    let lease =
+                        QueryLeaseId::from_bytes(&load.lease).map_err(Status::invalid_argument)?;
+                    let block_ids = load.block_ids.into_iter().map(|id| id as usize).collect();
+                    Ok::<_, Status>((lease, block_ids))
                 })
                 .collect::<Result<_, _>>()?;
 

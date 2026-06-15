@@ -200,7 +200,7 @@ impl MockVllmRpcHarness {
             device_id: worker.device_id,
             saves: vec![SaveLayer {
                 layer_name: LAYER_NAME.to_string(),
-                block_ids: (0..hashes.len() as i32).collect(),
+                block_ids: (0..hashes.len() as u32).collect(),
                 block_hashes: hashes.to_vec(),
             }],
             pp_rank: 0,
@@ -375,7 +375,7 @@ impl MockVllmRpcHarness {
             layer_names: vec![LAYER_NAME.to_string()],
             loads: vec![LeaseLoad {
                 lease,
-                block_ids: (0..block_count as i32).collect(),
+                block_ids: (0..block_count as u32).collect(),
             }],
         };
         match self.worker.load(request.clone()).await {
