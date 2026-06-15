@@ -94,8 +94,8 @@ fn fill_test_pattern(host_data: &mut [u8], block_size: usize) {
     }
 }
 
-fn make_block_ids(num_blocks: usize) -> Vec<i32> {
-    (0..num_blocks).map(|i| i as i32).collect()
+fn make_block_ids(num_blocks: usize) -> Vec<usize> {
+    (0..num_blocks).collect()
 }
 
 fn make_block_hashes(num_blocks: usize, salt: u8) -> Vec<Vec<u8>> {

@@ -557,7 +557,7 @@ impl PegaEngine {
         device_id: i32,
         load_state_shm: &str,
         layer_names: &[&str],
-        loads: &[(QueryLeaseId, Vec<i32>)],
+        loads: &[(QueryLeaseId, Vec<usize>)],
     ) -> Result<(), EngineError> {
         let load_state = LoadState::attach(load_state_shm)?;
 
@@ -593,7 +593,7 @@ impl PegaEngine {
         tp_rank: usize,
         device_id: i32,
         layer_names: &[&str],
-        loads: &[(QueryLeaseId, Vec<i32>)],
+        loads: &[(QueryLeaseId, Vec<usize>)],
     ) -> Result<oneshot::Receiver<Result<(), EngineError>>, EngineError> {
         let (reply, rx) = oneshot::channel();
         self.batch_load_kv_blocks_multi_layer_inner(
@@ -617,7 +617,7 @@ impl PegaEngine {
         tp_rank: usize,
         device_id: i32,
         layer_names: &[&str],
-        loads: &[(QueryLeaseId, Vec<i32>)],
+        loads: &[(QueryLeaseId, Vec<usize>)],
         completion: LoadCompletion,
     ) -> Result<(), EngineError> {
         let instance = self.get_instance(instance_id)?;
@@ -678,12 +678,7 @@ impl PegaEngine {
             let slot_id = topology.slot_index(layer_id, tp_rank)?;
 
             let mut blocks = Vec::with_capacity(block_ids.len());
-            for (block_id, block_entry) in block_ids.iter().zip(block_cache.iter()) {
-                let block_idx = usize::try_from(*block_id).map_err(|_| {
-                    EngineError::InvalidArgument(format!(
-                        "negative destination block id {block_id} for layer {layer_name}"
-                    ))
-                })?;
+            for (block_idx, block_entry) in block_ids.iter().copied().zip(block_cache.iter()) {
                 let block = block_entry.get_slot(slot_id).ok_or_else(|| {
                     EngineError::InvalidArgument(format!(
                         "stored block is missing slot {slot_id} for layer {layer_name}"

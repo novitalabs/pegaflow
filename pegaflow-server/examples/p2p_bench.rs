@@ -332,7 +332,7 @@ async fn run_holder(cli: &Cli, shape: &Shape, pool_bytes: usize) {
     });
 
     let ranks = register_ranks(&engine, shape);
-    let block_ids: Vec<i32> = (0..shape.blocks as i32).collect();
+    let block_ids: Vec<usize> = (0..shape.blocks).collect();
     let layer_names = shape.layer_names();
 
     let mut image = vec![0u8; shape.rank_bytes()];
@@ -473,7 +473,7 @@ async fn verify_set(
         PrefetchStatus::Loading => panic!("verify: set {set} still loading"),
     };
     assert_eq!(blocks.len(), shape.blocks, "verify: incomplete set {set}");
-    let block_ids: Vec<i32> = (0..shape.blocks as i32).collect();
+    let block_ids: Vec<usize> = (0..shape.blocks).collect();
     let layer_names = shape.layer_names();
     let layer_name_refs: Vec<&str> = layer_names.iter().map(|s| s.as_str()).collect();
 
