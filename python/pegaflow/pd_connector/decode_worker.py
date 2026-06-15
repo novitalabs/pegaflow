@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from pegaflow.logging_utils import get_connector_logger
+from pegaflow.pd_connector.async_runner import AsyncTaskPool
 from pegaflow.pd_connector.layout import KvCacheLayout
 from pegaflow.pd_connector.layout_mapping import (
     decode_rank_source_counts,
@@ -540,7 +540,7 @@ class _RdmaWaitTask:
     queued_ts_ns: int
 
 
-class _AsyncRdmaDoneWaiter:
+class _AsyncRdmaDoneWaiter(AsyncTaskPool):
     """Background pool blocking on request RDMA IMM completion."""
 
     def __init__(
@@ -550,17 +550,13 @@ class _AsyncRdmaDoneWaiter:
         success_callback: Any | None = None,
         max_workers: int = 16,
     ) -> None:
+        super().__init__("pd-rdma-done-waiter", max_workers=max_workers)
         self.rdma = rdma
         self._failure_callback = failure_callback
         self._success_callback = success_callback
-        self._executor = ThreadPoolExecutor(
-            max_workers=max(1, int(max_workers)),
-            thread_name_prefix="pd-rdma-done-waiter",
-        )
         self._submitted: dict[str, int] = {}
         self._cancelled: dict[str, set[int]] = {}
         self._next_generation: dict[str, int] = {}
-        self._lock = threading.Lock()
 
     def submit(self, task: _RdmaWaitTask) -> _RdmaWaitTask | None:
         with self._lock:
@@ -580,7 +576,7 @@ class _AsyncRdmaDoneWaiter:
             task.prefill_url or "<oob>",
             len(self._submitted),
         )
-        self._executor.submit(self._run_task, task)
+        self._spawn(task)
         return task
 
     def cancel(self, req_id: str) -> None:
@@ -590,10 +586,7 @@ class _AsyncRdmaDoneWaiter:
                 return
             self._cancelled.setdefault(req_id, set()).add(generation)
 
-    def close(self) -> None:
-        self._executor.shutdown(wait=False, cancel_futures=True)
-
-    def _run_task(self, task: _RdmaWaitTask) -> None:
+    def _execute(self, task: _RdmaWaitTask) -> None:
         try:
             if self._is_cancelled(task.req_id, task.generation):
                 logger.info(
