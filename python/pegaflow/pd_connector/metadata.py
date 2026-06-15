@@ -125,6 +125,32 @@ class PdHandshake:
         )
 
 
+# ---------------------------------------------------------------------------
+# Wire (de)serialization codecs
+#
+# Grouped by type so each dict<->dataclass pair sits together. The byte/JSON
+# shape is part of the P/D wire contract — reorder freely, but do not change
+# the emitted keys or value encodings.
+# ---------------------------------------------------------------------------
+
+
+# -- TransferRegionLayout ---------------------------------------------------
+
+
+def _region_layout_to_dict(region: TransferRegionLayout) -> dict[str, Any]:
+    data = {
+        "region_idx": region.region_idx,
+        "base_addr": region.base_addr,
+        "block_len": region.block_len,
+    }
+    if region.block_stride is not None:
+        data["block_stride"] = region.block_stride
+    return data
+
+
+# -- LayerRemoteLayout ------------------------------------------------------
+
+
 def layer_layout_from_dict(
     data: dict[str, Any],
     *,
@@ -157,6 +183,28 @@ def layer_layout_from_dict(
     )
 
 
+def layer_layout_to_dict(layer: LayerRemoteLayout) -> dict[str, Any]:
+    return {
+        "layer_name": layer.layer_name,
+        "layer_idx": layer.layer_idx,
+        "block_ids": list(layer.block_ids),
+        "regions": [_region_layout_to_dict(region) for region in layer.regions],
+        "mr_desc": layer.mr_desc,
+    }
+
+
+def layer_layout_to_compact_dict(layer: LayerRemoteLayout) -> dict[str, Any]:
+    return {
+        "layer_name": layer.layer_name,
+        "layer_idx": layer.layer_idx,
+        "regions": [_region_layout_to_dict(region) for region in layer.regions],
+        "mr_desc": layer.mr_desc,
+    }
+
+
+# -- PdHandshake ------------------------------------------------------------
+
+
 def handshake_from_dict(data: dict[str, Any] | None) -> PdHandshake | None:
     if data is None:
         return None
@@ -187,36 +235,6 @@ def handshakes_from_dicts(data: Any) -> tuple[PdHandshake, ...]:
     handshakes = tuple(handshake_from_dict(item) for item in iterable)
     assert all(handshake is not None for handshake in handshakes)
     return handshakes  # type: ignore[return-value]
-
-
-def layer_layout_to_dict(layer: LayerRemoteLayout) -> dict[str, Any]:
-    return {
-        "layer_name": layer.layer_name,
-        "layer_idx": layer.layer_idx,
-        "block_ids": list(layer.block_ids),
-        "regions": [_region_layout_to_dict(region) for region in layer.regions],
-        "mr_desc": layer.mr_desc,
-    }
-
-
-def layer_layout_to_compact_dict(layer: LayerRemoteLayout) -> dict[str, Any]:
-    return {
-        "layer_name": layer.layer_name,
-        "layer_idx": layer.layer_idx,
-        "regions": [_region_layout_to_dict(region) for region in layer.regions],
-        "mr_desc": layer.mr_desc,
-    }
-
-
-def _region_layout_to_dict(region: TransferRegionLayout) -> dict[str, Any]:
-    data = {
-        "region_idx": region.region_idx,
-        "base_addr": region.base_addr,
-        "block_len": region.block_len,
-    }
-    if region.block_stride is not None:
-        data["block_stride"] = region.block_stride
-    return data
 
 
 def handshake_to_dict(handshake: PdHandshake) -> dict[str, Any]:
