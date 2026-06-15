@@ -6,7 +6,7 @@ use logforth::diagnostic::ThreadLocalDiagnostic;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::EngineError;
-use crate::block::RawBlock;
+use crate::block::{RawBlock, SealedBlock};
 use crate::layout::{BlockCopies, KVCacheLayout};
 use crate::metrics::core_metrics;
 use crate::sync_state::LoadState;
@@ -59,11 +59,33 @@ pub(crate) struct LayerTransferData {
     pub blocks: Vec<TransferBlock>,
 }
 
+/// Host-side block image for a GPU transfer.
+pub(crate) enum HostBlock {
+    /// Save path: uniquely owned, moved through the GPU worker and returned.
+    Owned(RawBlock),
+    /// Load path: slot borrowed from a cached sealed block.
+    Cached {
+        sealed: Arc<SealedBlock>,
+        slot_id: usize,
+    },
+}
+
+impl HostBlock {
+    pub(crate) fn raw(&self) -> &RawBlock {
+        match self {
+            Self::Owned(block) => block,
+            Self::Cached { sealed, slot_id } => sealed
+                .get_slot(*slot_id)
+                .expect("cached slot_id validated at construction"),
+        }
+    }
+}
+
 /// One block in a transfer: the GPU slot index and its host-side image.
 /// Loads copy `block` -> GPU slot, saves copy GPU slot -> `block`.
 pub(crate) struct TransferBlock {
     pub block_idx: usize,
-    pub block: Arc<RawBlock>,
+    pub block: HostBlock,
 }
 
 /// A task to save KV blocks from GPU to CPU for multiple layers.
@@ -71,7 +93,7 @@ pub(crate) struct TransferBlock {
 /// All layers are copied on the same CUDA stream with a single synchronization.
 pub(crate) struct SaveTask {
     pub layers: Vec<LayerTransferData>,
-    pub reply: oneshot::Sender<Result<(), EngineError>>,
+    pub reply: oneshot::Sender<Result<Vec<LayerTransferData>, EngineError>>,
     #[cfg(feature = "tracing")]
     pub trace_ctx: Option<::fastrace::prelude::SpanContext>,
 }
@@ -180,7 +202,7 @@ impl GpuWorkerPool {
     pub(crate) async fn batch_save(
         &self,
         layers: Vec<LayerTransferData>,
-    ) -> Result<(), EngineError> {
+    ) -> Result<Vec<LayerTransferData>, EngineError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let task = SaveTask {
             layers,
@@ -288,8 +310,21 @@ fn save_worker_loop(
     runtime: WorkerRuntime,
 ) {
     while let Some(task) = rx.blocking_recv() {
-        let result = process_save_task(&task, &runtime.stream, runtime.backend.as_ref());
-        let _ = task.reply.send(result);
+        let SaveTask {
+            layers,
+            reply,
+            #[cfg(feature = "tracing")]
+            trace_ctx,
+        } = task;
+        let result = process_save_task(
+            &layers,
+            &runtime.stream,
+            runtime.backend.as_ref(),
+            #[cfg(feature = "tracing")]
+            trace_ctx,
+        )
+        .map(|()| layers);
+        let _ = reply.send(result);
     }
 
     info!("Save worker shutting down: device={}", device_id);
@@ -316,11 +351,11 @@ fn build_copy_descs(layers: &[LayerTransferData]) -> Result<(Vec<CopyDesc>, usiz
 
             match block_copies {
                 BlockCopies::Split { k, v } => {
-                    let k_ptr = block.block.segment_mapped_ptr(0).unwrap();
+                    let raw = block.block.raw();
+                    let k_ptr = raw.segment_mapped_ptr(0).unwrap();
                     // SAFETY: For a contiguous host block (segment 1 absent), the
                     // allocation is 2 * segment size, so k + k.bytes is in bounds.
-                    let v_ptr = block
-                        .block
+                    let v_ptr = raw
                         .segment_mapped_ptr(1)
                         .unwrap_or_else(|| k_ptr.add(k.bytes));
 
@@ -339,7 +374,7 @@ fn build_copy_descs(layers: &[LayerTransferData]) -> Result<(Vec<CopyDesc>, usiz
                     total_bytes += k.bytes + v.bytes;
                 }
                 BlockCopies::Contiguous(c) => {
-                    let ptr = block.block.segment_mapped_ptr(0).unwrap();
+                    let ptr = block.block.raw().segment_mapped_ptr(0).unwrap();
                     copies.push(CopyDesc {
                         device: c.addr,
                         host: ptr.host().as_ptr(),
@@ -413,15 +448,16 @@ fn process_load_task(
 /// and segments are collected into one descriptor batch, handed to a single
 /// backend, then synchronized once.
 fn process_save_task(
-    task: &SaveTask,
+    layers: &[LayerTransferData],
     stream: &Arc<CudaStream>,
     backend: &dyn TransferBackend,
+    #[cfg(feature = "tracing")] trace_ctx: Option<::fastrace::prelude::SpanContext>,
 ) -> Result<(), EngineError> {
-    trace_child!("gpu.save_task", task.trace_ctx);
+    trace_child!("gpu.save_task", trace_ctx);
     let start = std::time::Instant::now();
-    let total_blocks: usize = task.layers.iter().map(|l| l.blocks.len()).sum();
+    let total_blocks: usize = layers.iter().map(|l| l.blocks.len()).sum();
 
-    let (copies, total_bytes) = build_copy_descs(&task.layers)?;
+    let (copies, total_bytes) = build_copy_descs(layers)?;
 
     backend.d2h(&copies, stream).map_err(EngineError::Storage)?;
 
@@ -442,7 +478,7 @@ fn process_save_task(
 
     debug!(
         "Save task completed: layers={} blocks={} copies={} bytes={} elapsed_ms={:.2} bandwidth_gbps={:.2} backend={}",
-        task.layers.len(),
+        layers.len(),
         total_blocks,
         copies.len(),
         total_bytes,

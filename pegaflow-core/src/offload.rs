@@ -15,8 +15,8 @@ use log::{debug, info};
 use crate::block::{BlockKey, LayerSave, RawBlock, Segment};
 
 /// Grouped insert entries: each hash maps to its per-slot `RawBlock`s.
-pub(crate) type InsertEntries = Vec<(BlockKey, Vec<(usize, Arc<RawBlock>)>)>;
-use crate::gpu_worker::{LayerTransferData, TransferBlock};
+pub(crate) type InsertEntries = Vec<(BlockKey, Vec<(usize, RawBlock)>)>;
+use crate::gpu_worker::{HostBlock, LayerTransferData, TransferBlock};
 use crate::layout::KVCacheLayout;
 use crate::metrics::core_metrics;
 use crate::{EngineError, PegaEngine};
@@ -36,7 +36,7 @@ pub(crate) struct RawSaveLayer {
     /// Padded block size (SSD-aligned). Becomes `RawBlock.total_size` → `SlotMeta.total_size()`.
     pub padded_block_size: usize,
     /// Saved blocks, parallel to `block_hashes`.
-    pub blocks: Vec<Arc<RawBlock>>,
+    pub blocks: Vec<RawBlock>,
     /// Block hashes in save order.
     pub block_hashes: Vec<Vec<u8>>,
 }
@@ -58,15 +58,15 @@ struct LayerContext {
     /// Blocks to save: (block_idx, hash). Filtered in Phase 1.
     blocks_to_save: Vec<(usize, Vec<u8>)>,
     /// Host-side block images, parallel to `blocks_to_save`.
-    /// Constructed in Phase 2; shared with the GPU copy task.
-    raw_blocks: Vec<Arc<RawBlock>>,
+    /// Filled after the GPU save task returns the moved blocks.
+    raw_blocks: Vec<RawBlock>,
 }
 
 /// Build insert entries from a raw batch (called by the insert worker).
 ///
 /// Returns `(entries, total_bytes, total_blocks)` where entries is grouped
-/// by hash: `Vec<(BlockKey, Vec<(slot_id, Arc<RawBlock>)>)>`.
-pub(crate) fn build_insert_entries(batch: &RawSaveBatch) -> (InsertEntries, u64, usize) {
+/// by hash: `Vec<(BlockKey, Vec<(slot_id, RawBlock)>)>`.
+pub(crate) fn build_insert_entries(batch: RawSaveBatch) -> (InsertEntries, u64, usize) {
     let mut total_bytes: u64 = 0;
     let mut total_blocks: usize = 0;
     for layer in &batch.layers {
@@ -75,52 +75,65 @@ pub(crate) fn build_insert_entries(batch: &RawSaveBatch) -> (InsertEntries, u64,
         total_bytes += (layer.padded_block_size as u64).saturating_mul(layer_blocks as u64);
     }
 
-    let entries =
-        build_ordered_insert_entries(batch).unwrap_or_else(|| build_hashed_insert_entries(batch));
+    let entries = if can_use_ordered_fast_path(&batch.layers) {
+        build_ordered_insert_entries(batch.namespace, batch.layers)
+    } else {
+        build_hashed_insert_entries(batch.namespace, batch.layers)
+    };
     (entries, total_bytes, total_blocks)
+}
+
+fn can_use_ordered_fast_path(layers: &[RawSaveLayer]) -> bool {
+    let Some(first_layer) = layers.first() else {
+        return false;
+    };
+    layers
+        .iter()
+        .all(|layer| layer.block_hashes == first_layer.block_hashes)
 }
 
 /// Fast path: all layers share one hash order, so entries can be built
 /// block-by-block without a hash map.
-fn build_ordered_insert_entries(batch: &RawSaveBatch) -> Option<InsertEntries> {
-    let first_layer = batch.layers.first()?;
-    if batch
-        .layers
-        .iter()
-        .any(|layer| layer.block_hashes != first_layer.block_hashes)
-    {
-        return None;
+fn build_ordered_insert_entries(namespace: String, layers: Vec<RawSaveLayer>) -> InsertEntries {
+    let hashes = layers
+        .first()
+        .map(|layer| layer.block_hashes.clone())
+        .unwrap_or_default();
+    let num_blocks = hashes.len();
+    let mut per_block_slots: Vec<Vec<(usize, RawBlock)>> =
+        (0..num_blocks).map(|_| Vec::new()).collect();
+
+    for layer in layers {
+        let slot_id = layer.slot_id;
+        for (block_idx, block) in layer.blocks.into_iter().enumerate() {
+            per_block_slots[block_idx].push((slot_id, block));
+        }
     }
 
-    let mut entries = Vec::with_capacity(first_layer.block_hashes.len());
-    for (block_idx, hash) in first_layer.block_hashes.iter().enumerate() {
-        let slots = batch
-            .layers
-            .iter()
-            .map(|layer| (layer.slot_id, Arc::clone(&layer.blocks[block_idx])))
-            .collect();
-        entries.push((BlockKey::new(batch.namespace.clone(), hash.clone()), slots));
-    }
-    Some(entries)
+    hashes
+        .into_iter()
+        .zip(per_block_slots)
+        .map(|(hash, slots)| (BlockKey::new(namespace.clone(), hash), slots))
+        .collect()
 }
 
 /// Fallback for heterogeneous per-layer hash sets: group via a hash map.
-fn build_hashed_insert_entries(batch: &RawSaveBatch) -> InsertEntries {
+fn build_hashed_insert_entries(namespace: String, layers: Vec<RawSaveLayer>) -> InsertEntries {
     use std::collections::HashMap;
 
-    let mut hash_entries: HashMap<Vec<u8>, Vec<(usize, Arc<RawBlock>)>> = HashMap::new();
-    for layer in &batch.layers {
-        for (i, hash) in layer.block_hashes.iter().enumerate() {
+    let mut hash_entries: HashMap<Vec<u8>, Vec<(usize, RawBlock)>> = HashMap::new();
+    for layer in layers {
+        for (block, hash) in layer.blocks.into_iter().zip(layer.block_hashes) {
             hash_entries
-                .entry(hash.clone())
+                .entry(hash)
                 .or_default()
-                .push((layer.slot_id, Arc::clone(&layer.blocks[i])));
+                .push((layer.slot_id, block));
         }
     }
 
     hash_entries
         .into_iter()
-        .map(|(hash, slots)| (BlockKey::new(batch.namespace.clone(), hash), slots))
+        .map(|(hash, slots)| (BlockKey::new(namespace.clone(), hash), slots))
         .collect()
 }
 
@@ -327,7 +340,7 @@ impl PegaEngine {
             // Allocate pinned memory and construct the host-side RawBlocks in
             // save order. Strides are padded (SSD-aligned); GPU copies later
             // use actual (unpadded) sizes, leaving the padding tail unused.
-            let mut raw_blocks: Vec<Arc<RawBlock>> = Vec::with_capacity(num_blocks);
+            let mut raw_blocks: Vec<RawBlock> = Vec::with_capacity(num_blocks);
             for _ in 0..alloc_count {
                 if layout.is_split() {
                     let stride = layout.padded_segment_bytes();
@@ -336,7 +349,7 @@ impl PegaEngine {
                     for i in 0..blocks_per_alloc {
                         let offset = i * stride;
                         // Safety: offsets are within the just-made allocations.
-                        raw_blocks.push(Arc::new(RawBlock::two_segments(
+                        raw_blocks.push(RawBlock::two_segments(
                             Segment::new(
                                 k_alloc.mapped_ptr().add(offset).host(),
                                 stride,
@@ -347,18 +360,18 @@ impl PegaEngine {
                                 stride,
                                 Arc::clone(&v_alloc),
                             ),
-                        )));
+                        ));
                     }
                 } else {
                     let stride = layout.padded_block_bytes();
                     let alloc = alloc_pinned(stride, "block buffer")?;
                     for i in 0..blocks_per_alloc {
                         // Safety: offset is within the just-made allocation.
-                        raw_blocks.push(Arc::new(RawBlock::single_segment(Segment::new(
+                        raw_blocks.push(RawBlock::single_segment(Segment::new(
                             alloc.mapped_ptr().add(i * stride).host(),
                             stride,
                             Arc::clone(&alloc),
-                        ))));
+                        )));
                     }
                 }
             }
@@ -366,10 +379,10 @@ impl PegaEngine {
             let save_blocks: Vec<TransferBlock> = ctx
                 .blocks_to_save
                 .iter()
-                .zip(&raw_blocks)
+                .zip(raw_blocks)
                 .map(|((block_idx, _), block)| TransferBlock {
                     block_idx: *block_idx,
-                    block: Arc::clone(block),
+                    block: HostBlock::Owned(block),
                 })
                 .collect();
 
@@ -378,17 +391,29 @@ impl PegaEngine {
                 layout: layout.clone(),
                 blocks: save_blocks,
             });
-            ctx.raw_blocks = raw_blocks;
         }
         trace_drop!(_s);
 
         // ── Phase 3: Submit all GPU copies as one batch task (single sync) ──
 
-        trace_future!(
+        let returned_layers = trace_future!(
             "save.gpu_copy",
             gpu_context.worker_pool().batch_save(gpu_save_layers)
         )
         .await?;
+
+        for (ctx, layer) in layer_contexts.iter_mut().zip(returned_layers) {
+            ctx.raw_blocks = layer
+                .blocks
+                .into_iter()
+                .map(|transfer_block| match transfer_block.block {
+                    HostBlock::Owned(block) => block,
+                    HostBlock::Cached { .. } => {
+                        panic!("save path must return HostBlock::Owned blocks")
+                    }
+                })
+                .collect();
+        }
 
         // ── Phase 4 (deferred): Build RawBlocks + insert — sent to worker ──
 

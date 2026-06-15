@@ -636,7 +636,7 @@ async fn write_block_to_ssd(
         let iovecs: Vec<_> = block
             .slots()
             .iter()
-            .flat_map(|slot| seal_offload::write_iovecs(slot))
+            .flat_map(seal_offload::write_iovecs)
             .collect();
 
         io.writev_at_async(shard_id, iovecs, offset)?

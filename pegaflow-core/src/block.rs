@@ -195,14 +195,14 @@ impl RawBlock {
 /// Lives in the service/GPU layer, NOT in storage.
 ///
 /// Invariant: inner RawBlock has >= 1 segment.
-pub struct LayerBlock {
-    raw: Arc<RawBlock>,
+pub struct LayerBlock<'a> {
+    raw: &'a RawBlock,
 }
 
-impl LayerBlock {
+impl<'a> LayerBlock<'a> {
     /// Wrap a RawBlock as a KV layer block.
     /// Panics if the block has zero segments (violated invariant from construction).
-    pub fn new(raw: Arc<RawBlock>) -> Self {
+    pub fn new(raw: &'a RawBlock) -> Self {
         debug_assert!(
             raw.num_segments() > 0,
             "LayerBlock requires at least 1 segment"
@@ -242,7 +242,7 @@ impl LayerBlock {
 
 /// Immutable block after all slots are filled. Exposed to callers.
 pub struct SealedBlock {
-    slots: Box<[Arc<RawBlock>]>,
+    slots: Box<[RawBlock]>,
     footprint: u64,
     /// Per-slot NUMA affinity, carried from InflightBlock for SSD write path.
     /// Empty when reconstructed from SSD prefetch (NUMA info lives in SlotMeta).
@@ -250,7 +250,7 @@ pub struct SealedBlock {
 }
 
 impl SealedBlock {
-    pub(crate) fn get_slot(&self, slot_id: usize) -> Option<&Arc<RawBlock>> {
+    pub(crate) fn get_slot(&self, slot_id: usize) -> Option<&RawBlock> {
         self.slots.get(slot_id)
     }
 
@@ -259,7 +259,7 @@ impl SealedBlock {
     }
 
     /// Get all slots (for serialization / cross-node transfer)
-    pub fn slots(&self) -> &[Arc<RawBlock>] {
+    pub fn slots(&self) -> &[RawBlock] {
         &self.slots
     }
 
@@ -269,7 +269,7 @@ impl SealedBlock {
     }
 
     /// Create from a vec of slots (for deserialization / prefetch rebuild)
-    pub(crate) fn from_slots(slots: Vec<Arc<RawBlock>>) -> Self {
+    pub(crate) fn from_slots(slots: Vec<RawBlock>) -> Self {
         let footprint = slots.iter().map(|s| s.memory_footprint()).sum();
         Self {
             slots: slots.into_boxed_slice(),
@@ -280,7 +280,7 @@ impl SealedBlock {
 
     /// Create from slots with pre-computed footprint (internal use)
     fn from_slots_with_footprint(
-        slots: Box<[Arc<RawBlock>]>,
+        slots: Box<[RawBlock]>,
         footprint: u64,
         slot_numas: Vec<NumaNode>,
     ) -> Self {
@@ -293,10 +293,10 @@ impl SealedBlock {
 
     /// Create from a fully populated, slot-id ordered insert batch.
     pub(crate) fn from_ordered_slot_inserts(
-        slots: Vec<(usize, Arc<RawBlock>)>,
+        slots: Vec<(usize, RawBlock)>,
         total_slots: usize,
         numa_node: NumaNode,
-    ) -> Result<Self, Vec<(usize, Arc<RawBlock>)>> {
+    ) -> Result<Self, Vec<(usize, RawBlock)>> {
         if slots.len() != total_slots
             || slots
                 .iter()
@@ -342,7 +342,7 @@ pub(crate) enum SlotInsertResult {
 
 /// Block that is still being written. Internal to StorageEngine.
 pub(crate) struct InflightBlock {
-    slots: Vec<Option<Arc<RawBlock>>>,
+    slots: Vec<Option<RawBlock>>,
     remaining: usize,
     total_slots: usize,
     footprint: u64,
@@ -355,7 +355,7 @@ pub(crate) struct InflightBlock {
 impl InflightBlock {
     pub(crate) fn new(total_slots: usize) -> Self {
         Self {
-            slots: vec![None; total_slots],
+            slots: (0..total_slots).map(|_| None).collect(),
             remaining: total_slots,
             total_slots,
             footprint: 0,
@@ -388,7 +388,7 @@ impl InflightBlock {
     pub(crate) fn insert_slot(
         &mut self,
         slot_id: usize,
-        block: Arc<RawBlock>,
+        block: RawBlock,
         numa_node: NumaNode,
     ) -> SlotInsertResult {
         debug_assert!(
@@ -420,7 +420,7 @@ impl InflightBlock {
     /// Seal the block, converting to immutable SealedBlock.
     /// Panics if not all slots are filled.
     pub(crate) fn seal(self) -> SealedBlock {
-        let slots: Vec<Arc<RawBlock>> = self
+        let slots: Vec<RawBlock> = self
             .slots
             .into_iter()
             .map(|opt| opt.expect("all slots must be filled before sealing"))

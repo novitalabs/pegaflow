@@ -108,13 +108,13 @@ fn process_raw_save_batch(
     batch: crate::offload::RawSaveBatch,
 ) {
     let start = std::time::Instant::now();
-    let namespace = &batch.namespace;
+    let namespace = batch.namespace.clone();
     let numa_node = batch.numa_node;
     let total_slots = batch.total_slots;
 
-    let (entries, total_bytes, total_blocks) = crate::offload::build_insert_entries(&batch);
+    let (entries, total_bytes, total_blocks) = crate::offload::build_insert_entries(batch);
 
-    process_insert_batch(inflight, deps, entries, total_slots, numa_node, namespace);
+    process_insert_batch(inflight, deps, entries, total_slots, numa_node, &namespace);
 
     debug!(
         "insert_worker: batch sealed blocks={} bytes={} ms={:.2}",
@@ -203,7 +203,7 @@ fn process_insert_batch(
 fn insert_partial_slots(
     inflight: &mut HashMap<BlockKey, InflightBlock>,
     key: BlockKey,
-    slots: Vec<(usize, Arc<crate::block::RawBlock>)>,
+    slots: Vec<(usize, crate::block::RawBlock)>,
     total_slots: usize,
     numa_node: NumaNode,
     namespace: &str,
@@ -329,13 +329,13 @@ mod tests {
     use crate::block::RawBlock;
     use crate::storage::{StorageConfig, StorageEngine};
 
-    fn make_raw_block(engine: &StorageEngine, size: u64) -> Arc<RawBlock> {
+    fn make_raw_block(engine: &StorageEngine, size: u64) -> RawBlock {
         use crate::block::Segment;
         let alloc = engine
             .allocate(NonZeroU64::new(size).unwrap(), None)
             .expect("test pool should have space");
         let ptr = alloc.as_non_null();
-        Arc::new(RawBlock::new(vec![Segment::new(ptr, size as usize, alloc)]))
+        RawBlock::new(vec![Segment::new(ptr, size as usize, alloc)])
     }
 
     fn make_deps(engine: &StorageEngine) -> Arc<InsertDeps> {

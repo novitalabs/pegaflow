@@ -16,6 +16,8 @@ cargo build --release    # Release build
 cargo test               # Run Rust tests
 ```
 
+On CUDA 13 dev machines, pass `--no-default-features --features cuda-13,rdma` to `cargo test`/`cargo clippy` (default `cuda-12` can fail with missing `libcudart` symbols).
+
 ### CI Checks (Local)
 
 Run all CI checks locally before committing:

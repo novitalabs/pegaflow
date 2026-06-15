@@ -57,7 +57,7 @@ pub(crate) unsafe fn reconstruct_raw_block(
     meta: &SlotMeta,
     allocation: Arc<PinnedAllocation>,
     base_offset: usize,
-) -> Arc<RawBlock> {
+) -> RawBlock {
     let base_ptr = allocation.as_ptr() as *mut u8;
     debug_assert!(
         !base_ptr.is_null(),
@@ -85,7 +85,7 @@ pub(crate) unsafe fn reconstruct_raw_block(
         ));
         offset += seg_size as usize;
     }
-    Arc::new(RawBlock::new(segments))
+    RawBlock::new(segments)
 }
 
 /// Build iovecs for writing a slot's RawBlock to SSD.

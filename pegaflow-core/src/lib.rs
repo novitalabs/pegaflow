@@ -59,7 +59,7 @@ use std::{
 use log::{debug, info};
 
 use crate::backing::SSD_ALIGNMENT;
-use crate::gpu_worker::{LayerTransferData, LoadCompletion, LoadTask, TransferBlock};
+use crate::gpu_worker::{HostBlock, LayerTransferData, LoadCompletion, LoadTask, TransferBlock};
 use crate::lease::QueryLeaseManager;
 use crate::metrics::core_metrics;
 use crate::storage::StorageEngine;
@@ -679,14 +679,17 @@ impl PegaEngine {
 
             let mut blocks = Vec::with_capacity(block_ids.len());
             for (block_idx, block_entry) in block_ids.iter().copied().zip(block_cache.iter()) {
-                let block = block_entry.get_slot(slot_id).ok_or_else(|| {
-                    EngineError::InvalidArgument(format!(
+                if block_entry.get_slot(slot_id).is_none() {
+                    return Err(EngineError::InvalidArgument(format!(
                         "stored block is missing slot {slot_id} for layer {layer_name}"
-                    ))
-                })?;
+                    )));
+                }
                 blocks.push(TransferBlock {
                     block_idx,
-                    block: Arc::clone(block),
+                    block: HostBlock::Cached {
+                        sealed: Arc::clone(block_entry),
+                        slot_id,
+                    },
                 });
             }
 

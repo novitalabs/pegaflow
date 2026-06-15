@@ -66,6 +66,8 @@ cargo build --release
 cargo test
 ```
 
+On CUDA 13 dev machines, pass `--no-default-features --features cuda-13,rdma` to `cargo test`/`cargo clippy` (default `cuda-12` can fail with missing `libcudart` symbols).
+
 ### Python Bindings
 
 ```bash

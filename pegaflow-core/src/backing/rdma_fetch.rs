@@ -444,7 +444,7 @@ async fn fetch_blocks_via_rdma(
     let mut result: PrefetchResult = Vec::with_capacity(block_allocs.len());
     for (hash, slot_allocs) in block_allocs {
         let key = BlockKey::new(namespace.to_string(), hash);
-        let slots: Vec<Arc<RawBlock>> = slot_allocs
+        let slots: Vec<RawBlock> = slot_allocs
             .into_iter()
             .map(|segs| {
                 let segments: Vec<Segment> = segs
@@ -455,7 +455,7 @@ async fn fetch_blocks_via_rdma(
                         Segment::new(ptr, sa.size, sa.alloc)
                     })
                     .collect();
-                Arc::new(RawBlock::new(segments))
+                RawBlock::new(segments)
             })
             .collect();
         let sealed = Arc::new(SealedBlock::from_slots(slots));

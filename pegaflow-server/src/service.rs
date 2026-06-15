@@ -177,10 +177,10 @@ impl GrpcEngineService {
     }
 
     fn build_transfer_slot_info(
-        raw_block: &Arc<pegaflow_core::RawBlock>,
+        raw_block: &pegaflow_core::RawBlock,
         numa_node: pegaflow_common::NumaNode,
     ) -> TransferSlotInfo {
-        let layer_block = pegaflow_core::LayerBlock::new(Arc::clone(raw_block));
+        let layer_block = pegaflow_core::LayerBlock::new(raw_block);
         if let Some(v_ptr) = layer_block.v_ptr() {
             TransferSlotInfo {
                 k_ptr: layer_block.k_ptr() as u64,
