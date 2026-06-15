@@ -22,6 +22,9 @@ use crate::engine::{NicHandshake, RegisteredMemoryRegion, TransferDesc, Transfer
 use crate::error::{Result, TransferError};
 use pegaflow_common::NumaNode;
 
+/// Max bytes per RDMA work request; larger `TransferDesc`s are split at the engine entry.
+const MAX_RDMA_TRANSFER_BYTES: usize = 128 * 1024 * 1024;
+
 struct NicGroup {
     nic_indices: Vec<usize>,
     rr_counter: AtomicUsize,
@@ -475,32 +478,45 @@ impl RcBackend {
                     (0..n).map(|_| Vec::with_capacity(per_bucket)).collect();
 
                 for (i, desc) in nic_descs.iter().enumerate() {
-                    let local_ptr = desc.local_ptr.as_ptr() as u64;
-                    let remote_ptr = desc.remote_ptr.as_ptr() as u64;
+                    let base_local = desc.local_ptr.as_ptr() as u64;
+                    let base_remote = desc.remote_ptr.as_ptr() as u64;
                     let len = desc.len;
 
                     if len == 0 {
                         return Err(TransferError::InvalidArgument("len must be non-zero"));
                     }
 
-                    let local_mr = state
-                        .find_local_mr(nic_idx, local_ptr, len)
-                        .ok_or(TransferError::MemoryNotRegistered { ptr: local_ptr })?;
-
-                    let remote_rkey = state.nics[nic_idx]
-                        .find_remote_rkey(remote_first_qpn, remote_ptr, len)
-                        .ok_or(TransferError::InvalidArgument(
-                            "remote memory not found in handshake snapshot",
-                        ))?;
-
                     let bucket = rot.wrapping_add(i) % n;
-                    buckets[bucket].push(RdmaOp {
-                        local_mr,
-                        local_ptr,
-                        remote_ptr,
-                        len,
-                        remote_rkey,
-                    });
+
+                    let mut offset = 0usize;
+                    while offset < len {
+                        let chunk_len = (len - offset).min(MAX_RDMA_TRANSFER_BYTES);
+                        let local_ptr = base_local.checked_add(offset as u64).ok_or(
+                            TransferError::InvalidArgument("local_ptr + offset overflow"),
+                        )?;
+                        let remote_ptr = base_remote.checked_add(offset as u64).ok_or(
+                            TransferError::InvalidArgument("remote_ptr + offset overflow"),
+                        )?;
+
+                        let local_mr = state
+                            .find_local_mr(nic_idx, local_ptr, chunk_len)
+                            .ok_or(TransferError::MemoryNotRegistered { ptr: local_ptr })?;
+
+                        let remote_rkey = state.nics[nic_idx]
+                            .find_remote_rkey(remote_first_qpn, remote_ptr, chunk_len)
+                            .ok_or(TransferError::InvalidArgument(
+                                "remote memory not found in handshake snapshot",
+                            ))?;
+
+                        buckets[bucket].push(RdmaOp {
+                            local_mr,
+                            local_ptr,
+                            remote_ptr,
+                            len: chunk_len,
+                            remote_rkey,
+                        });
+                        offset += chunk_len;
+                    }
                 }
 
                 for (q_idx, prepared) in buckets.into_iter().enumerate() {
