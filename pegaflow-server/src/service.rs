@@ -426,26 +426,12 @@ impl Engine for GrpcEngineService {
 
             let saves: Vec<LayerSave> = saves
                 .into_iter()
-                .map(|layer| {
-                    let block_ids = layer
-                        .block_ids
-                        .into_iter()
-                        .map(|id| {
-                            usize::try_from(id).map_err(|_| {
-                                Status::invalid_argument(format!(
-                                    "negative block_id {id} in layer {}",
-                                    layer.layer_name
-                                ))
-                            })
-                        })
-                        .collect::<Result<Vec<usize>, _>>()?;
-                    Ok::<_, Status>(LayerSave {
-                        layer_name: layer.layer_name,
-                        block_ids,
-                        block_hashes: layer.block_hashes,
-                    })
+                .map(|layer| LayerSave {
+                    layer_name: layer.layer_name,
+                    block_ids: layer.block_ids.into_iter().map(|id| id as usize).collect(),
+                    block_hashes: layer.block_hashes,
                 })
-                .collect::<Result<_, _>>()?;
+                .collect();
 
             debug!(
                 "RPC [save]: instance_id={} tp_rank={} pp_rank={} device_id={} layers={} blocks={} hashes={}",
@@ -534,17 +520,7 @@ impl Engine for GrpcEngineService {
                 .map(|load| {
                     let lease =
                         QueryLeaseId::from_bytes(&load.lease).map_err(Status::invalid_argument)?;
-                    let block_ids = load
-                        .block_ids
-                        .into_iter()
-                        .map(|id| {
-                            usize::try_from(id).map_err(|_| {
-                                Status::invalid_argument(format!(
-                                    "negative destination block_id {id}"
-                                ))
-                            })
-                        })
-                        .collect::<Result<Vec<usize>, _>>()?;
+                    let block_ids = load.block_ids.into_iter().map(|id| id as usize).collect();
                     Ok::<_, Status>((lease, block_ids))
                 })
                 .collect::<Result<_, _>>()?;

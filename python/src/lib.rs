@@ -336,7 +336,7 @@ impl EngineRpcClient {
         tp_rank: u32,
         pp_rank: u32,
         device_id: i32,
-        saves: Vec<(String, Vec<i32>, Vec<Vec<u8>>)>,
+        saves: Vec<(String, Vec<u32>, Vec<Vec<u8>>)>,
     ) -> PyResult<(bool, String)> {
         let saves = saves
             .into_iter()
@@ -389,7 +389,7 @@ impl EngineRpcClient {
         device_id: i32,
         load_state_shm: String,
         layer_names: Vec<String>,
-        loads: Vec<(Vec<u8>, Vec<i32>)>,
+        loads: Vec<(Vec<u8>, Vec<u32>)>,
     ) -> PyResult<(bool, String)> {
         let loads = loads
             .into_iter()
