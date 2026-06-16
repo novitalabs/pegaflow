@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from pegaflow.logging_utils import get_connector_logger
+from pegaflow.pd_connector.async_runner import AsyncTaskPool
 from pegaflow.pd_connector.layout import KvCacheLayout
 from pegaflow.pd_connector.layout_mapping import (
     decode_rank_source_counts,
@@ -32,6 +32,324 @@ from pegaflow.pd_connector.config import extra_config_value
 logger = get_connector_logger()
 
 
+class _DecodeWaitState:
+    """Thread-safe bookkeeping for in-flight decode receives.
+
+    Groups the seven request-tracking collections that the RDMA waiter and
+    prefill-sender callbacks mutate concurrently with the vLLM forward thread,
+    behind a single lock (the original ``DecodeHandler._lock``).
+
+    Failure marking writes the three failure channels together, but they are
+    drained by *different* vLLM callbacks (``get_finished`` /
+    ``build_connector_worker_meta`` / ``get_block_ids_with_load_errors``), so
+    they remain separate collections rather than one merged set.
+    """
+
+    def __init__(self, metrics: Any) -> None:
+        self._metrics = metrics
+        self._lock = threading.Lock()
+        self.wait_reqs: dict[str, WaitReqMeta] = {}
+        self.aborted_waits: set[str] = set()
+        self.failed_recving: set[str] = set()
+        self.failed_recving_for_meta: set[str] = set()
+        self.failed_block_ids: set[int] = set()
+        self.finished_aborted_recving: set[str] = set()
+        self.finished_rdma_waits: set[str] = set()
+
+    # -- registration / completion -----------------------------------------
+
+    def has_wait(self, req_id: str) -> bool:
+        with self._lock:
+            return req_id in self.wait_reqs
+
+    def register_wait(self, req_id: str, req: WaitReqMeta) -> None:
+        with self._lock:
+            self.wait_reqs[req_id] = req
+            self._metrics.set_decode_active_waits(len(self.wait_reqs))
+
+    def mark_aborted(self, req_id: str) -> WaitReqMeta | None:
+        with self._lock:
+            req = self.wait_reqs.get(req_id)
+            if req is not None:
+                self.aborted_waits.add(req_id)
+                self._metrics.record_decode_abort()
+            return req
+
+    def finish_recving_one(self, req_id: str) -> tuple[WaitReqMeta | None, bool, bool]:
+        with self._lock:
+            req = self.wait_reqs.pop(req_id, None)
+            was_aborted = req_id in self.aborted_waits
+            self.aborted_waits.discard(req_id)
+            self._metrics.set_decode_active_waits(len(self.wait_reqs))
+            is_failed = req_id in self.failed_recving
+            return req, was_aborted, is_failed
+
+    def record_rdma_done(self, req_id: str) -> WaitReqMeta | None:
+        with self._lock:
+            if req_id not in self.wait_reqs:
+                return None
+            self.finished_rdma_waits.add(req_id)
+            return self.wait_reqs[req_id]
+
+    # -- failure paths ------------------------------------------------------
+
+    def _mark_failed_unlocked(self, req_id: str, req: WaitReqMeta) -> set[int]:
+        failed_blocks = flatten_block_ids(req.local_block_ids)
+        self.failed_recving.add(req_id)
+        self.failed_recving_for_meta.add(req_id)
+        self.failed_block_ids.update(failed_blocks)
+        self.aborted_waits.discard(req_id)
+        self.finished_rdma_waits.discard(req_id)
+        self.finished_aborted_recving.discard(req_id)
+        self.wait_reqs.pop(req_id, None)
+        self._metrics.set_decode_active_waits(len(self.wait_reqs))
+        return failed_blocks
+
+    def mark_prefill_failed(
+        self, remote_request_id: str
+    ) -> tuple[str, WaitReqMeta, set[int]] | None:
+        with self._lock:
+            for req_id, req in list(self.wait_reqs.items()):
+                if req.remote_request_id != remote_request_id:
+                    continue
+                failed_blocks = self._mark_failed_unlocked(req_id, req)
+                return req_id, req, failed_blocks
+        return None
+
+    def mark_wait_failed(
+        self, req_id: str
+    ) -> tuple[str, WaitReqMeta | None, set[int] | None]:
+        """Returns (kind, req, failed_blocks) where kind is one of
+        ``"unknown"`` / ``"aborted_finished"`` / ``"failed"``."""
+        with self._lock:
+            req = self.wait_reqs.get(req_id)
+            if req is None:
+                return "unknown", None, None
+            if req_id in self.aborted_waits:
+                self.wait_reqs.pop(req_id, None)
+                self.aborted_waits.discard(req_id)
+                self.finished_aborted_recving.add(req_id)
+                self._metrics.set_decode_active_waits(len(self.wait_reqs))
+                return "aborted_finished", req, None
+            failed_blocks = self._mark_failed_unlocked(req_id, req)
+            return "failed", req, failed_blocks
+
+    # -- drains (one per consuming vLLM callback) --------------------------
+
+    def drain_finished_aborted_recving(self) -> set[str]:
+        with self._lock:
+            finished = self.finished_aborted_recving
+            self.finished_aborted_recving = set()
+            return finished
+
+    def drain_finished_rdma_waits(self) -> set[str]:
+        with self._lock:
+            finished = self.finished_rdma_waits
+            self.finished_rdma_waits = set()
+            return finished
+
+    def drain_failed_recving(self) -> set[str]:
+        with self._lock:
+            failed = self.failed_recving
+            self.failed_recving = set()
+            return failed
+
+    def drain_failed_recving_for_meta(self) -> set[str]:
+        with self._lock:
+            failed = self.failed_recving_for_meta
+            self.failed_recving_for_meta = set()
+            return failed
+
+    def drain_failed_block_ids(self) -> set[int]:
+        with self._lock:
+            failed = self.failed_block_ids
+            self.failed_block_ids = set()
+            return failed
+
+    # -- lifecycle ----------------------------------------------------------
+
+    def is_idle(self) -> bool:
+        with self._lock:
+            return (
+                not self.wait_reqs
+                and not self.failed_recving
+                and not self.failed_block_ids
+                and not self.finished_aborted_recving
+                and not self.finished_rdma_waits
+            )
+
+    def clear(self) -> None:
+        with self._lock:
+            self.wait_reqs.clear()
+            self.failed_recving.clear()
+            self.failed_recving_for_meta.clear()
+            self.failed_block_ids.clear()
+            self.aborted_waits.clear()
+            self.finished_aborted_recving.clear()
+            self.finished_rdma_waits.clear()
+
+
+class _DecodePeerState:
+    """Peer tensor-parallel topology and IMM-id allocation for the decode side.
+
+    After ``register_kv_caches`` the decode worker all-gathers every peer rank's
+    KV layouts and memory-region descriptors, then derives per-rank layer
+    templates and the expected IMM completion counts used to build wait
+    handshakes. This groups that topology state plus the monotonic IMM-id
+    allocator, which were previously flat fields on ``DecodeHandler``.
+
+    Single-threaded: populated during registration and read while building
+    handshakes on the forward thread; no locking needed.
+    """
+
+    def __init__(self, worker: PdWorkerBase) -> None:
+        self._w = worker
+        self.layouts: dict[int, dict[str, KvCacheLayout]] = {}
+        self.mr_descs: dict[int, dict[str, Any]] = {}
+        self.layer_templates: dict[int, tuple[dict[str, Any], ...]] = {}
+        self.expected_imm_counts: dict[int, int] = {}
+        self._next_imm_id = 1
+
+    @property
+    def block_size(self) -> int:
+        return next(iter(self._w.layouts.values())).block_size
+
+    def gather(self) -> None:
+        mr_descs = {name: layer.mr_desc for name, layer in self._w._registered_layers.items()}
+        if self._w.tp_size <= 1:
+            self.layouts = {0: self._w.layouts}
+            self.mr_descs = {0: mr_descs}
+            self._refresh_layer_templates()
+            return
+        try:
+            gathered = _all_gather_peer_info(self._w.layouts, mr_descs, self._w.tp_size)
+        except Exception:
+            logger.warning(
+                "[PdConnector] all_gather_object unavailable, rank 0 dispatch limited to local rank",
+            )
+            self.layouts = {self._w.tp_rank: self._w.layouts}
+            self.mr_descs = {self._w.tp_rank: mr_descs}
+            self._refresh_layer_templates()
+            return
+        for rank, (layouts, descs) in enumerate(gathered):
+            self.layouts[rank] = layouts
+            self.mr_descs[rank] = descs
+        self._refresh_layer_templates()
+
+    def alloc_imm_id(self) -> int:
+        imm_id = self._next_imm_id
+        self._next_imm_id += 1
+        # The wire contract (pegaflow-pd-wire) reserves the top two bits of
+        # imm_id for the fail/abort XOR flags, so wrap before reaching them.
+        if self._next_imm_id > 0x3FFF_FFFF:
+            self._next_imm_id = 1
+        return imm_id
+
+    def expected_imm_count(self, rank: int) -> int:
+        if not self.expected_imm_counts:
+            self._refresh_expected_imm_counts()
+        return self.expected_imm_counts.get(rank, 1)
+
+    def local_expected_imm_count(self) -> int:
+        return self.expected_imm_count(self._w.tp_rank)
+
+    def build_all_rank_handshake_dicts(
+        self,
+        req_id: str,
+        block_ids: BlockIds,
+        imm_id: int,
+    ) -> list[dict[str, Any]]:
+        result = []
+        block_size = self.block_size
+        # Iterate the ranks actually gathered rather than range(tp_size): in the
+        # all_gather fallback gather() populates only the local rank, and the
+        # warning there promises dispatch is limited to it. range(tp_size) would
+        # KeyError on the missing peers and contradict that promise.
+        for rank in sorted(self.layer_templates):
+            layers = []
+            for layer in self.layer_templates[rank]:
+                layer_name = str(layer["layer_name"])
+                layer_block_ids = self._w.block_ids_for_layer(block_ids, layer_name)
+                if not layer_block_ids:
+                    continue
+                layer_dict = dict(layer)
+                layer_dict["block_ids"] = sorted(layer_block_ids)
+                layers.append(layer_dict)
+            assert layers, f"PdConnector D wait req={req_id} has no local KV blocks"
+            block_ids_by_layer = [tuple(layer["block_ids"]) for layer in layers]
+            shared_block_ids = block_ids_by_layer[0]
+            compact = all(ids == shared_block_ids for ids in block_ids_by_layer)
+            if compact:
+                payload_layers = [
+                    {key: value for key, value in layer.items() if key != "block_ids"}
+                    for layer in layers
+                ]
+            else:
+                payload_layers = layers
+            payload: dict[str, Any] = {
+                "request_id": req_id,
+                "engine_id": self._w.engine_id,
+                "tp_rank": rank,
+                "tp_size": self._w.tp_size,
+                "block_size": block_size,
+                "layers": payload_layers,
+                "imm_id": imm_id,
+                "fail_imm_id": _fail_imm_id(imm_id),
+                "abort_imm_id": _abort_imm_id(imm_id),
+                "expected_imm_count": self.expected_imm_count(rank),
+            }
+            if compact:
+                payload["block_ids"] = list(shared_block_ids)
+            result.append(payload)
+        return result
+
+    def _refresh_layer_templates(self) -> None:
+        self.layer_templates = {}
+        for rank, peer_layouts in self.layouts.items():
+            peer_mr_descs = self.mr_descs[rank]
+            layers = []
+            for layer_idx, name in enumerate(self._w.layer_names):
+                layer = replace(
+                    peer_layouts[name].remote_layout(layer_idx, (0,)),
+                    mr_desc=peer_mr_descs.get(name),
+                )
+                layers.append(layer_layout_to_compact_dict(layer))
+            self.layer_templates[rank] = tuple(layers)
+        self._refresh_expected_imm_counts()
+
+    def _refresh_expected_imm_counts(self) -> None:
+        if self._w.use_mla:
+            self.expected_imm_counts = dict.fromkeys(range(self._w.tp_size), 1)
+            return
+
+        local_layout = self.layouts.get(self._w.tp_rank, self._w.layouts)
+        first_layout = next(iter(local_layout.values()))
+        remote_heads = int(getattr(first_layout, "num_kv_heads", 1))
+        prefill_tp_size = int(
+            extra_config_value(
+                self._w.vllm_config,
+                "pegaflow.pd.prefill_tp_size",
+                self._w.tp_size,
+            )
+            or self._w.tp_size
+        )
+        total_heads = _total_num_kv_heads_from_config(self._w.vllm_config)
+        if total_heads is None:
+            total_heads = remote_heads * self._w.tp_size
+        local_heads = _ceil_div(total_heads, prefill_tp_size)
+        source_counts = decode_rank_source_counts(
+            prefill_tp_size=prefill_tp_size,
+            decode_tp_size=self._w.tp_size,
+            local_num_kv_heads=local_heads,
+            remote_num_kv_heads=remote_heads,
+            total_num_kv_heads=total_heads,
+            use_mla=False,
+        )
+        self.expected_imm_counts = {
+            rank: source_counts.get(rank, 1) for rank in range(self._w.tp_size)
+        }
+
+
 class DecodeHandler:
     """Handles D-side (decode) requests: RDMA receive, handshake, prefill dispatch."""
 
@@ -41,20 +359,8 @@ class DecodeHandler:
         prefill_sender: Any | None = None,
     ) -> None:
         self._w = worker
-        self._lock = threading.Lock()
-        self._wait_reqs: dict[str, WaitReqMeta] = {}
-        self._peer_layouts: dict[int, dict[str, KvCacheLayout]] = {}
-        self._peer_mr_descs: dict[int, dict[str, Any]] = {}
-        self._peer_layer_templates: dict[int, tuple[dict[str, Any], ...]] = {}
-        self._expected_imm_counts: dict[int, int] = {}
-        self._peer_block_size: int | None = None
-        self._failed_recving: set[str] = set()
-        self._failed_recving_for_meta: set[str] = set()
-        self._failed_block_ids: set[int] = set()
-        self._aborted_waits: set[str] = set()
-        self._finished_aborted_recving: set[str] = set()
-        self._finished_rdma_waits: set[str] = set()
-        self._next_imm_id = 1
+        self._state = _DecodeWaitState(worker.metrics)
+        self._peers = _DecodePeerState(worker)
         self._rdma_waiter: _AsyncRdmaDoneWaiter | None = (
             _AsyncRdmaDoneWaiter(
                 worker.rdma,
@@ -86,40 +392,19 @@ class DecodeHandler:
             )
 
     def gather_peer_info(self) -> None:
-        mr_descs = {name: layer.mr_desc for name, layer in self._w._registered_layers.items()}
-        if self._w.tp_size <= 1:
-            self._peer_layouts = {0: self._w.layouts}
-            self._peer_mr_descs = {0: mr_descs}
-            self._refresh_peer_layer_templates()
-            return
-        try:
-            gathered = _all_gather_peer_info(self._w.layouts, mr_descs, self._w.tp_size)
-        except Exception:
-            logger.warning(
-                "[PdConnector] all_gather_object unavailable, rank 0 dispatch limited to local rank",
-            )
-            self._peer_layouts = {self._w.tp_rank: self._w.layouts}
-            self._peer_mr_descs = {self._w.tp_rank: mr_descs}
-            self._refresh_peer_layer_templates()
-            return
-        for rank, (layouts, descs) in enumerate(gathered):
-            self._peer_layouts[rank] = layouts
-            self._peer_mr_descs[rank] = descs
-        self._refresh_peer_layer_templates()
+        self._peers.gather()
 
     def process_wait_reqs(self, reqs_to_wait: dict[str, WaitReqMeta]) -> None:
         assert self._w.rdma is not None, "PdConnector RDMA port is not initialized"
         assert self._rdma_waiter is not None, "PdConnector RDMA waiter is not initialized"
         for req_id, req in reqs_to_wait.items():
-            if req_id in self._wait_reqs:
+            if self._state.has_wait(req_id):
                 logger.info("[PdConnector] D wait req=%s already registered", req_id)
                 continue
             process_ts_ns = time.time_ns()
-            with self._lock:
-                self._wait_reqs[req_id] = req
-                self._w.metrics.set_decode_active_waits(len(self._wait_reqs))
+            self._state.register_wait(req_id, req)
             block_ids = flatten_block_ids(req.local_block_ids)
-            imm_id = self._alloc_imm_id()
+            imm_id = self._peers.alloc_imm_id()
             wait_handshake = self._build_wait_handshake(
                 req.done_request_id,
                 req.local_block_ids,
@@ -160,70 +445,40 @@ class DecodeHandler:
                 self._dispatch_prefill(req, req.local_block_ids, imm_id)
 
     def release(self, req_id: str) -> None:
-        with self._lock:
-            req = self._wait_reqs.get(req_id)
-            if req is not None:
-                self._aborted_waits.add(req_id)
-                self._w.metrics.record_decode_abort()
+        req = self._state.mark_aborted(req_id)
         cancel_prefill = getattr(self._prefill_sender, "cancel", None)
         if req is not None and cancel_prefill is not None:
             cancel_prefill(req.remote_request_id)
 
     def finish_recving(self, finished_recving: set[str]) -> None:
         for req_id in finished_recving:
-            with self._lock:
-                req = self._wait_reqs.pop(req_id, None)
-                was_aborted = req_id in self._aborted_waits
-                self._aborted_waits.discard(req_id)
-                self._w.metrics.set_decode_active_waits(len(self._wait_reqs))
+            req, was_aborted, is_failed = self._state.finish_recving_one(req_id)
             if req is not None and not was_aborted:
                 self._w.metrics.record_decode_wait(
                     duration_s=_elapsed_seconds(req.scheduler_wait_ts_ns, time.time_ns()),
                     rdma_wait_s=None,
                     blocks=len(flatten_block_ids(req.local_block_ids)),
-                    success=req_id not in self._failed_recving,
+                    success=not is_failed,
                 )
             self._w.rdma.close_request(req_id)
 
     def pop_finished_aborted_recving(self) -> set[str]:
-        with self._lock:
-            finished = self._finished_aborted_recving
-            self._finished_aborted_recving = set()
-            return finished
+        return self._state.drain_finished_aborted_recving()
 
     def pop_finished_rdma_waits(self) -> set[str]:
-        with self._lock:
-            finished = self._finished_rdma_waits
-            self._finished_rdma_waits = set()
-            return finished
+        return self._state.drain_finished_rdma_waits()
 
     def pop_failed_recving(self) -> set[str]:
-        with self._lock:
-            failed = self._failed_recving
-            self._failed_recving = set()
-            return failed
+        return self._state.drain_failed_recving()
 
     def pop_failed_recving_for_meta(self) -> set[str]:
-        with self._lock:
-            failed = self._failed_recving_for_meta
-            self._failed_recving_for_meta = set()
-            return failed
+        return self._state.drain_failed_recving_for_meta()
 
     def pop_failed_block_ids(self) -> set[int]:
-        with self._lock:
-            failed = self._failed_block_ids
-            self._failed_block_ids = set()
-            return failed
+        return self._state.drain_failed_block_ids()
 
     def shutdown(self) -> None:
-        with self._lock:
-            self._wait_reqs.clear()
-            self._failed_recving.clear()
-            self._failed_recving_for_meta.clear()
-            self._failed_block_ids.clear()
-            self._aborted_waits.clear()
-            self._finished_aborted_recving.clear()
-            self._finished_rdma_waits.clear()
+        self._state.clear()
         if self._rdma_waiter is not None:
             self._rdma_waiter.close()
         close = getattr(self._prefill_sender, "close", None)
@@ -232,62 +487,67 @@ class DecodeHandler:
 
     @property
     def wait_reqs(self) -> dict[str, WaitReqMeta]:
-        return self._wait_reqs
+        return self._state.wait_reqs
+
+    # Backward-compatible field access for tests / worker.py that reach into
+    # the decode handler's internal collections directly.
+    @property
+    def _wait_reqs(self) -> dict[str, WaitReqMeta]:
+        return self._state.wait_reqs
+
+    @_wait_reqs.setter
+    def _wait_reqs(self, value: dict[str, WaitReqMeta]) -> None:
+        self._state.wait_reqs = value
+
+    @property
+    def _finished_rdma_waits(self) -> set[str]:
+        return self._state.finished_rdma_waits
+
+    @property
+    def _peer_layouts(self) -> dict[int, dict[str, KvCacheLayout]]:
+        return self._peers.layouts
 
     def is_idle(self) -> bool:
-        with self._lock:
-            return (
-                not self._wait_reqs
-                and not self._failed_recving
-                and not self._failed_block_ids
-                and not self._finished_aborted_recving
-                and not self._finished_rdma_waits
-            )
+        return self._state.is_idle()
 
     def _mark_prefill_failed(self, remote_request_id: str, exc: BaseException) -> None:
-        with self._lock:
-            for req_id, req in list(self._wait_reqs.items()):
-                if req.remote_request_id != remote_request_id:
-                    continue
-                self._mark_failed_locked(req_id, req, exc)
-                return
-        logger.warning(
-            "[PdConnector] D prefill failed for unknown/finished remote_req=%s: %s",
-            remote_request_id,
-            exc,
-        )
+        result = self._state.mark_prefill_failed(remote_request_id)
+        if result is None:
+            logger.warning(
+                "[PdConnector] D prefill failed for unknown/finished remote_req=%s: %s",
+                remote_request_id,
+                exc,
+            )
+            return
+        req_id, req, failed_blocks = result
+        self._after_mark_failed(req_id, req, failed_blocks, exc)
 
     def _mark_wait_failed(self, req_id: str, exc: BaseException) -> None:
-        with self._lock:
-            req = self._wait_reqs.get(req_id)
-            if req is None:
-                logger.warning(
-                    "[PdConnector] D wait failed for unknown/finished req=%s: %s",
-                    req_id,
-                    exc,
-                )
-                return
-            if req_id in self._aborted_waits:
-                self._wait_reqs.pop(req_id, None)
-                self._aborted_waits.discard(req_id)
-                self._finished_aborted_recving.add(req_id)
-                self._w.metrics.set_decode_active_waits(len(self._wait_reqs))
-                logger.info(
-                    "[PdConnector] D treating aborted wait as finished req=%s remote_req=%s error=%s",
-                    req_id,
-                    req.remote_request_id,
-                    exc,
-                )
-                return
-            self._mark_failed_locked(req_id, req, exc)
+        kind, req, failed_blocks = self._state.mark_wait_failed(req_id)
+        if kind == "unknown":
+            logger.warning(
+                "[PdConnector] D wait failed for unknown/finished req=%s: %s",
+                req_id,
+                exc,
+            )
+            return
+        if kind == "aborted_finished":
+            assert req is not None
+            logger.info(
+                "[PdConnector] D treating aborted wait as finished req=%s remote_req=%s error=%s",
+                req_id,
+                req.remote_request_id,
+                exc,
+            )
+            return
+        assert req is not None and failed_blocks is not None
+        self._after_mark_failed(req_id, req, failed_blocks, exc)
 
     def _record_rdma_wait_done(self, req_id: str, wait_s: float) -> None:
         done_ts_ns = time.time_ns()
-        with self._lock:
-            if req_id not in self._wait_reqs:
-                return
-            req = self._wait_reqs[req_id]
-            self._finished_rdma_waits.add(req_id)
+        req = self._state.record_rdma_done(req_id)
+        if req is None:
+            return
         self._w.metrics.record_decode_rdma_wait(wait_s)
         logger.info(
             "[PdConnector] D RDMA wait done req=%s remote_req=%s wait_ms=%.3f proxy_to_rdma_done_ms=%.3f scheduler_wait_to_rdma_done_ms=%.3f ts_ns=%d",
@@ -299,16 +559,15 @@ class DecodeHandler:
             done_ts_ns,
         )
 
-    def _mark_failed_locked(self, req_id: str, req: WaitReqMeta, exc: BaseException) -> None:
-        failed_blocks = flatten_block_ids(req.local_block_ids)
-        self._failed_recving.add(req_id)
-        self._failed_recving_for_meta.add(req_id)
-        self._failed_block_ids.update(failed_blocks)
-        self._aborted_waits.discard(req_id)
-        self._finished_rdma_waits.discard(req_id)
-        self._finished_aborted_recving.discard(req_id)
-        self._wait_reqs.pop(req_id, None)
-        self._w.metrics.set_decode_active_waits(len(self._wait_reqs))
+    def _after_mark_failed(
+        self,
+        req_id: str,
+        req: WaitReqMeta,
+        failed_blocks: set[int],
+        exc: BaseException,
+    ) -> None:
+        """Side effects after a failure is recorded in state: emit the wait
+        metric, log, and cancel the RDMA waiter."""
         self._w.metrics.record_decode_wait(
             duration_s=_elapsed_seconds(req.scheduler_wait_ts_ns, time.time_ns()),
             rdma_wait_s=None,
@@ -349,12 +608,12 @@ class DecodeHandler:
             engine_id=self._w.engine_id,
             tp_rank=self._w.tp_rank,
             tp_size=self._w.tp_size,
-            block_size=next(iter(self._w.layouts.values())).block_size,
+            block_size=self._peers.block_size,
             layers=tuple(layers),
             imm_id=imm_id,
             fail_imm_id=_fail_imm_id(imm_id),
             abort_imm_id=_abort_imm_id(imm_id),
-            expected_imm_count=self._expected_imm_count_for_local_rank(),
+            expected_imm_count=self._peers.local_expected_imm_count(),
         )
 
     def _dispatch_prefill(
@@ -364,7 +623,7 @@ class DecodeHandler:
         imm_id: int,
     ) -> None:
         started_ts_ns = time.time_ns()
-        all_handshakes = self._build_all_rank_handshake_dicts(
+        all_handshakes = self._peers.build_all_rank_handshake_dicts(
             req.done_request_id,
             block_ids,
             imm_id,
@@ -404,117 +663,6 @@ class DecodeHandler:
             submitted_ts_ns,
         )
 
-    def _build_all_rank_handshake_dicts(
-        self,
-        req_id: str,
-        block_ids: BlockIds,
-        imm_id: int,
-    ) -> list[dict[str, Any]]:
-        result = []
-        block_size = self._peer_block_size
-        assert block_size is not None, "peer layer templates are not initialized"
-        for rank in range(self._w.tp_size):
-            layers = []
-            for layer in self._peer_layer_templates[rank]:
-                layer_name = str(layer["layer_name"])
-                layer_block_ids = self._w.block_ids_for_layer(block_ids, layer_name)
-                if not layer_block_ids:
-                    continue
-                layer_dict = dict(layer)
-                layer_dict["block_ids"] = sorted(layer_block_ids)
-                layers.append(layer_dict)
-            assert layers, f"PdConnector D wait req={req_id} has no local KV blocks"
-            block_ids_by_layer = [tuple(layer["block_ids"]) for layer in layers]
-            shared_block_ids = block_ids_by_layer[0]
-            compact = all(ids == shared_block_ids for ids in block_ids_by_layer)
-            if compact:
-                payload_layers = [
-                    {key: value for key, value in layer.items() if key != "block_ids"}
-                    for layer in layers
-                ]
-            else:
-                payload_layers = layers
-            payload: dict[str, Any] = {
-                "request_id": req_id,
-                "engine_id": self._w.engine_id,
-                "tp_rank": rank,
-                "tp_size": self._w.tp_size,
-                "block_size": block_size,
-                "layers": payload_layers,
-                "imm_id": imm_id,
-                "fail_imm_id": _fail_imm_id(imm_id),
-                "abort_imm_id": _abort_imm_id(imm_id),
-                "expected_imm_count": self._expected_imm_count_for_rank(rank),
-            }
-            if compact:
-                payload["block_ids"] = list(shared_block_ids)
-            result.append(payload)
-        return result
-
-    def _expected_imm_count_for_local_rank(self) -> int:
-        return self._expected_imm_count_for_rank(self._w.tp_rank)
-
-    def _expected_imm_count_for_rank(self, rank: int) -> int:
-        if not self._expected_imm_counts:
-            self._refresh_expected_imm_counts()
-        return self._expected_imm_counts.get(rank, 1)
-
-    def _refresh_peer_layer_templates(self) -> None:
-        self._peer_layer_templates = {}
-        self._peer_block_size = next(iter(self._w.layouts.values())).block_size
-        for rank, peer_layouts in self._peer_layouts.items():
-            peer_mr_descs = self._peer_mr_descs[rank]
-            layers = []
-            for layer_idx, name in enumerate(self._w.layer_names):
-                layer = replace(
-                    peer_layouts[name].remote_layout(layer_idx, (0,)),
-                    mr_desc=peer_mr_descs.get(name),
-                )
-                layers.append(layer_layout_to_compact_dict(layer))
-            self._peer_layer_templates[rank] = tuple(layers)
-        self._refresh_expected_imm_counts()
-
-    def _refresh_expected_imm_counts(self) -> None:
-        if self._w.use_mla:
-            self._expected_imm_counts = dict.fromkeys(range(self._w.tp_size), 1)
-            return
-
-        local_layout = self._peer_layouts.get(self._w.tp_rank, self._w.layouts)
-        first_layout = next(iter(local_layout.values()))
-        remote_heads = int(getattr(first_layout, "num_kv_heads", 1))
-        prefill_tp_size = int(
-            extra_config_value(
-                self._w.vllm_config,
-                "pegaflow.pd.prefill_tp_size",
-                self._w.tp_size,
-            )
-            or self._w.tp_size
-        )
-        total_heads = _total_num_kv_heads_from_config(self._w.vllm_config)
-        if total_heads is None:
-            total_heads = remote_heads * self._w.tp_size
-        local_heads = _ceil_div(total_heads, prefill_tp_size)
-        source_counts = decode_rank_source_counts(
-            prefill_tp_size=prefill_tp_size,
-            decode_tp_size=self._w.tp_size,
-            local_num_kv_heads=local_heads,
-            remote_num_kv_heads=remote_heads,
-            total_num_kv_heads=total_heads,
-            use_mla=False,
-        )
-        self._expected_imm_counts = {
-            rank: source_counts.get(rank, 1) for rank in range(self._w.tp_size)
-        }
-
-    def _alloc_imm_id(self) -> int:
-        imm_id = self._next_imm_id
-        self._next_imm_id += 1
-        # The wire contract (pegaflow-pd-wire) reserves the top two bits of
-        # imm_id for the fail/abort XOR flags, so wrap before reaching them.
-        if self._next_imm_id > 0x3FFF_FFFF:
-            self._next_imm_id = 1
-        return imm_id
-
     def _remote_layout_with_mr_desc(
         self,
         layer_name: str,
@@ -540,7 +688,7 @@ class _RdmaWaitTask:
     queued_ts_ns: int
 
 
-class _AsyncRdmaDoneWaiter:
+class _AsyncRdmaDoneWaiter(AsyncTaskPool):
     """Background pool blocking on request RDMA IMM completion."""
 
     def __init__(
@@ -550,17 +698,13 @@ class _AsyncRdmaDoneWaiter:
         success_callback: Any | None = None,
         max_workers: int = 16,
     ) -> None:
+        super().__init__("pd-rdma-done-waiter", max_workers=max_workers)
         self.rdma = rdma
         self._failure_callback = failure_callback
         self._success_callback = success_callback
-        self._executor = ThreadPoolExecutor(
-            max_workers=max(1, int(max_workers)),
-            thread_name_prefix="pd-rdma-done-waiter",
-        )
         self._submitted: dict[str, int] = {}
         self._cancelled: dict[str, set[int]] = {}
         self._next_generation: dict[str, int] = {}
-        self._lock = threading.Lock()
 
     def submit(self, task: _RdmaWaitTask) -> _RdmaWaitTask | None:
         with self._lock:
@@ -580,7 +724,7 @@ class _AsyncRdmaDoneWaiter:
             task.prefill_url or "<oob>",
             len(self._submitted),
         )
-        self._executor.submit(self._run_task, task)
+        self._spawn(task)
         return task
 
     def cancel(self, req_id: str) -> None:
@@ -590,10 +734,7 @@ class _AsyncRdmaDoneWaiter:
                 return
             self._cancelled.setdefault(req_id, set()).add(generation)
 
-    def close(self) -> None:
-        self._executor.shutdown(wait=False, cancel_futures=True)
-
-    def _run_task(self, task: _RdmaWaitTask) -> None:
+    def _execute(self, task: _RdmaWaitTask) -> None:
         try:
             if self._is_cancelled(task.req_id, task.generation):
                 logger.info(
