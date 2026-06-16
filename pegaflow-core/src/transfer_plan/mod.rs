@@ -220,4 +220,25 @@ mod tests {
             materialize_transfer_plan(&plan, &test_allocate_fn()).expect("materialize");
         assert_eq!(materialized.rebuild.slabs.len(), 2);
     }
+
+    /// A block whose slots carry UNKNOWN NUMA must fail rebuild loudly rather
+    /// than silently materialize on an arbitrary node. This guards the
+    /// crash-early invariant of the per-slot NUMA source map: encode also warns
+    /// (`view.rs`) and the production fetch boundary logs + meters the error
+    /// (`rdma_fetch`), so the degradation is never silent.
+    #[test]
+    fn rebuild_rejects_unknown_numa_loudly() {
+        let (found, _slab) = make_stride_blocks_with_numa(2, 128, 64, |_| NumaNode::UNKNOWN);
+        let plan = encode_transfer_plan(&found).expect("encode");
+        let materialized =
+            materialize_transfer_plan(&plan, &test_allocate_fn()).expect("materialize");
+        let err = match rebuild_sealed_blocks(&plan, &materialized.rebuild, "bench-ns") {
+            Ok(_) => panic!("rebuild must reject unknown NUMA, not silently accept it"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("unknown NUMA"),
+            "expected an unknown-NUMA rejection, got: {err}"
+        );
+    }
 }
