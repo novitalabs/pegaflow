@@ -21,6 +21,15 @@ pub fn has_cuda_devices(n: usize) -> bool {
     (0..n).all(|device_id| CudaContext::new(device_id).is_ok())
 }
 
+/// True when the kernel transfer backend can JIT-load its PTX on this driver.
+/// A driver older than the build's CUDA toolkit rejects the PTX
+/// (`UNSUPPORTED_PTX_VERSION`), so kernel-backend tests skip instead of failing;
+/// they still run wherever the driver supports the kernel.
+pub fn kernel_backend_available() -> bool {
+    let ctx = test_cuda_context();
+    pegaflow_core::transfer::KernelBackend::new(&ctx).is_ok()
+}
+
 // ---------------------------------------------------------------------------
 // TestGpuData: GPU buffer + expected content
 // ---------------------------------------------------------------------------

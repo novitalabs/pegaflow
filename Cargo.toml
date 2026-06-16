@@ -6,6 +6,7 @@ members = [
   "pegaflow-server",
   "pegaflow-metaserver",
   "pegaflow-pd-wire",
+  "pegaflow-transfer-wire",
   "pegaflow-transfer",
   "python",
 ]
@@ -21,6 +22,7 @@ license = "Apache-2.0"
 pegaflow-common = { path = "pegaflow-common" }
 pegaflow-core = { path = "pegaflow-core", default-features = false }
 pegaflow-pd-wire = { path = "pegaflow-pd-wire" }
+pegaflow-transfer-wire = { path = "pegaflow-transfer-wire" }
 pegaflow-transfer = { path = "pegaflow-transfer", default-features = false }
 sideway = "0.4.3"
 rdma-mummy-sys = "0.2.4"

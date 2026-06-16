@@ -22,6 +22,25 @@ use crate::engine::{NicHandshake, RegisteredMemoryRegion, TransferDesc, Transfer
 use crate::error::{Result, TransferError};
 use pegaflow_common::NumaNode;
 
+/// Max bytes per RDMA work request; larger `TransferDesc`s are split at the engine entry.
+const MAX_RDMA_TRANSFER_BYTES: usize = 128 * 1024 * 1024;
+
+/// Granularity at which a single `TransferDesc` is striped across the NICs of
+/// its NUMA group. A coalesced read from an upper layer can be one huge desc;
+/// without striping it would land on a single NIC (and, via the per-desc QP
+/// bucket below, a single QP), capping throughput at one NIC's bandwidth. At
+/// 8 MiB a transfer of N MiB fans into N/8 stripes — enough to cover every
+/// (NIC, QP) in a NUMA group for any read large enough to be bandwidth-bound,
+/// while keeping each work request large enough to amortize posting overhead.
+const NIC_STRIPE_BYTES: usize = 8 * 1024 * 1024;
+
+fn mr_access_flags() -> AccessFlags {
+    AccessFlags::LocalWrite
+        | AccessFlags::RemoteWrite
+        | AccessFlags::RemoteRead
+        | AccessFlags::RelaxedOrdering
+}
+
 struct NicGroup {
     nic_indices: Vec<usize>,
     rr_counter: AtomicUsize,
@@ -32,6 +51,22 @@ impl NicGroup {
         let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed);
         self.nic_indices[idx % self.nic_indices.len()]
     }
+}
+
+/// Split `len` into `<= NIC_STRIPE_BYTES` stripes and assign each, round-robin,
+/// to a NIC in `group`. Returns `(offset, stripe_len, nic_idx)` per stripe.
+///
+/// Pure so the fan-out invariant (a large transfer touches every NIC in its
+/// group) is unit-testable without RDMA hardware.
+fn stripe_plan(len: usize, group: &NicGroup) -> Vec<(usize, usize, usize)> {
+    let mut stripes = Vec::with_capacity(len.div_ceil(NIC_STRIPE_BYTES));
+    let mut offset = 0;
+    while offset < len {
+        let stripe = (len - offset).min(NIC_STRIPE_BYTES);
+        stripes.push((offset, stripe, group.next()));
+        offset += stripe;
+    }
+    stripes
 }
 
 struct NumaRoundRobin {
@@ -82,13 +117,15 @@ impl NumaRoundRobin {
         }
     }
 
-    fn pick(&self, numa: NumaNode) -> usize {
+    /// NIC group for `numa`: its NUMA-local NICs, or all NICs when the node is
+    /// unknown / has no dedicated NICs.
+    fn group_for(&self, numa: NumaNode) -> &NicGroup {
         if numa.is_valid()
             && let Some(group) = self.groups.get(&numa)
         {
-            return group.next();
+            return group;
         }
-        self.fallback.next()
+        &self.fallback
     }
 }
 
@@ -151,14 +188,8 @@ impl RcBackend {
         // Register on every NIC's PD.
         let mut mrs = Vec::with_capacity(self.nic_count());
         for runtime in &self.runtimes {
-            let mr = unsafe {
-                runtime.pd.reg_mr(
-                    raw as usize,
-                    len,
-                    AccessFlags::LocalWrite | AccessFlags::RemoteWrite | AccessFlags::RemoteRead,
-                )
-            }
-            .map_err(|error| TransferError::Backend(error.to_string()))?;
+            let mr = unsafe { runtime.pd.reg_mr(raw as usize, len, mr_access_flags()) }
+                .map_err(|error| TransferError::Backend(error.to_string()))?;
             mrs.push(mr);
         }
 
@@ -419,24 +450,41 @@ impl RcBackend {
 
         let nic_count = self.nic_count();
 
-        // NUMA-aware NIC assignment: query the NUMA node of each descriptor's
-        // first page and route to a NIC on the same NUMA node.
+        // NUMA-aware NIC assignment: route each descriptor to NICs on its
+        // memory's NUMA node, and stripe a large descriptor across all of that
+        // node's NICs so one coalesced read saturates the whole group instead
+        // of a single NIC.
         let mut per_nic: Vec<Vec<TransferDesc>> = (0..nic_count).map(|_| Vec::new()).collect();
-        if self.numa_rr.single_numa {
-            // All NICs on one NUMA node — skip move_pages, plain round-robin.
-            for &desc in descs {
-                let nic_idx = self.numa_rr.fallback.next();
-                per_nic[nic_idx].push(desc);
-            }
+        // Single NUMA node: every NIC shares it, so skip the move_pages syscall
+        // and stripe across all NICs (the fallback group) via UNKNOWN.
+        let numa_nodes: Vec<NumaNode> = if self.numa_rr.single_numa {
+            Vec::new()
         } else {
             let addrs: Vec<*const u8> = descs
                 .iter()
                 .map(|d| d.local_ptr.as_ptr() as *const u8)
                 .collect();
-            let numa_nodes = pegaflow_common::query_pages_numa(&addrs);
-            for (i, &desc) in descs.iter().enumerate() {
-                let nic_idx = self.numa_rr.pick(numa_nodes[i]);
-                per_nic[nic_idx].push(desc);
+            pegaflow_common::query_pages_numa(&addrs)
+        };
+
+        for (i, desc) in descs.iter().enumerate() {
+            if desc.len == 0 {
+                return Err(TransferError::InvalidArgument("len must be non-zero"));
+            }
+            let numa = numa_nodes.get(i).copied().unwrap_or(NumaNode::UNKNOWN);
+            let group = self.numa_rr.group_for(numa);
+            for (offset, stripe_len, nic_idx) in stripe_plan(desc.len, group) {
+                // SAFETY: offset < desc.len and [ptr, ptr+len) is registered, so
+                // the offset pointers are non-null and within the same region.
+                let local_ptr =
+                    unsafe { NonNull::new_unchecked(desc.local_ptr.as_ptr().add(offset)) };
+                let remote_ptr =
+                    unsafe { NonNull::new_unchecked(desc.remote_ptr.as_ptr().add(offset)) };
+                per_nic[nic_idx].push(TransferDesc {
+                    local_ptr,
+                    remote_ptr,
+                    len: stripe_len,
+                });
             }
         }
 
@@ -475,32 +523,45 @@ impl RcBackend {
                     (0..n).map(|_| Vec::with_capacity(per_bucket)).collect();
 
                 for (i, desc) in nic_descs.iter().enumerate() {
-                    let local_ptr = desc.local_ptr.as_ptr() as u64;
-                    let remote_ptr = desc.remote_ptr.as_ptr() as u64;
+                    let base_local = desc.local_ptr.as_ptr() as u64;
+                    let base_remote = desc.remote_ptr.as_ptr() as u64;
                     let len = desc.len;
 
                     if len == 0 {
                         return Err(TransferError::InvalidArgument("len must be non-zero"));
                     }
 
-                    let local_mr = state
-                        .find_local_mr(nic_idx, local_ptr, len)
-                        .ok_or(TransferError::MemoryNotRegistered { ptr: local_ptr })?;
-
-                    let remote_rkey = state.nics[nic_idx]
-                        .find_remote_rkey(remote_first_qpn, remote_ptr, len)
-                        .ok_or(TransferError::InvalidArgument(
-                            "remote memory not found in handshake snapshot",
-                        ))?;
-
                     let bucket = rot.wrapping_add(i) % n;
-                    buckets[bucket].push(RdmaOp {
-                        local_mr,
-                        local_ptr,
-                        remote_ptr,
-                        len,
-                        remote_rkey,
-                    });
+
+                    let mut offset = 0usize;
+                    while offset < len {
+                        let chunk_len = (len - offset).min(MAX_RDMA_TRANSFER_BYTES);
+                        let local_ptr = base_local.checked_add(offset as u64).ok_or(
+                            TransferError::InvalidArgument("local_ptr + offset overflow"),
+                        )?;
+                        let remote_ptr = base_remote.checked_add(offset as u64).ok_or(
+                            TransferError::InvalidArgument("remote_ptr + offset overflow"),
+                        )?;
+
+                        let local_mr = state
+                            .find_local_mr(nic_idx, local_ptr, chunk_len)
+                            .ok_or(TransferError::MemoryNotRegistered { ptr: local_ptr })?;
+
+                        let remote_rkey = state.nics[nic_idx]
+                            .find_remote_rkey(remote_first_qpn, remote_ptr, chunk_len)
+                            .ok_or(TransferError::InvalidArgument(
+                                "remote memory not found in handshake snapshot",
+                            ))?;
+
+                        buckets[bucket].push(RdmaOp {
+                            local_mr,
+                            local_ptr,
+                            remote_ptr,
+                            len: chunk_len,
+                            remote_rkey,
+                        });
+                        offset += chunk_len;
+                    }
                 }
 
                 for (q_idx, prepared) in buckets.into_iter().enumerate() {
@@ -528,5 +589,46 @@ impl RcBackend {
             receivers.push(session.transfer_batch_async(prepared, op)?);
         }
         Ok(receivers)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn group(nic_indices: Vec<usize>) -> NicGroup {
+        NicGroup {
+            nic_indices,
+            rr_counter: AtomicUsize::new(0),
+        }
+    }
+
+    #[test]
+    fn large_desc_fans_out_across_every_nic_in_group() {
+        let g = group(vec![2, 3, 4, 5]); // a 4-NIC NUMA group
+        let len = 100 * NIC_STRIPE_BYTES + 1; // forces many stripes
+        let stripes = stripe_plan(len, &g);
+
+        // Every NIC in the group gets work — the regression was all bytes
+        // landing on a single NIC.
+        let nics: std::collections::HashSet<usize> = stripes.iter().map(|s| s.2).collect();
+        assert_eq!(nics, [2, 3, 4, 5].into_iter().collect());
+
+        // Stripes tile [0, len) contiguously with no gaps/overlap, none oversized.
+        let mut next = 0;
+        for (offset, stripe_len, _) in &stripes {
+            assert_eq!(*offset, next);
+            assert!(*stripe_len <= NIC_STRIPE_BYTES && *stripe_len > 0);
+            next += stripe_len;
+        }
+        assert_eq!(next, len);
+    }
+
+    #[test]
+    fn small_desc_stays_on_one_nic() {
+        let g = group(vec![0, 1, 2, 3]);
+        let stripes = stripe_plan(NIC_STRIPE_BYTES / 4, &g);
+        assert_eq!(stripes.len(), 1);
+        assert_eq!(stripes[0], (0, NIC_STRIPE_BYTES / 4, 0));
     }
 }

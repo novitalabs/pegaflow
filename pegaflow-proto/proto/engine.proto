@@ -134,21 +134,6 @@ message SessionRequest {
 message SessionEvent {
 }
 
-// Cross-node transfer: per-slot RDMA metadata
-message TransferSlotInfo {
-  uint64 k_ptr = 1;      // Remote pinned memory address for K segment
-  uint64 k_size = 2;     // Size of the K segment in bytes (per-segment, not total slot size)
-  uint64 v_ptr = 3;      // Remote pinned memory address for V segment (0 if contiguous)
-  uint64 v_size = 4;     // Size of the V segment in bytes (0 if contiguous)
-  uint32 numa_node = 5;  // NUMA node where this slot's memory resides (for RDMA NIC affinity)
-}
-
-// Cross-node transfer: per-block RDMA metadata
-message TransferBlockInfo {
-  bytes block_hash = 1;
-  repeated TransferSlotInfo slots = 2;  // One per TP slot
-}
-
 message QueryBlocksForTransferRequest {
   string namespace = 1;
   repeated bytes block_hashes = 2;
@@ -157,9 +142,9 @@ message QueryBlocksForTransferRequest {
 
 message QueryBlocksForTransferResponse {
   ResponseStatus status = 1;
-  repeated TransferBlockInfo blocks = 2;
-  string transfer_session_id = 3;       // Opaque session ID for ReleaseTransferLock
-  uint32 lock_timeout_secs = 4;         // Server's transfer lock timeout — client must finish before this
+  string transfer_session_id = 2;       // Opaque session ID for ReleaseTransferLock
+  uint32 lock_timeout_secs = 3;         // Server's transfer lock timeout — client must finish before this
+  bytes transfer_plan = 4;              // postcard(pegaflow-transfer-wire::TransferPlan)
 }
 
 // RDMA handshake: establish a new RDMA connection between two peers.

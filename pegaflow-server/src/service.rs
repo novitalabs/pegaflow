@@ -8,8 +8,7 @@ use crate::proto::engine::{
     RdmaHandshakeRequest, RdmaHandshakeResponse, RegisterContextRequest, RegisterContextResponse,
     ReleaseRequest, ReleaseResponse, ReleaseTransferLockRequest, ReleaseTransferLockResponse,
     ResponseStatus, SaveRequest, SaveResponse, SessionEvent, SessionRequest, ShutdownRequest,
-    ShutdownResponse, TransferBlockInfo, TransferSlotInfo, UnregisterRequest, UnregisterResponse,
-    query_response,
+    ShutdownResponse, UnregisterRequest, UnregisterResponse, query_response,
 };
 use crate::registry::RegistryHandle;
 use crate::session::SessionRegistry;
@@ -174,30 +173,6 @@ impl GrpcEngineService {
 
     fn build_simple_response() -> ResponseStatus {
         Self::ok_status()
-    }
-
-    fn build_transfer_slot_info(
-        raw_block: &pegaflow_core::RawBlock,
-        numa_node: pegaflow_common::NumaNode,
-    ) -> TransferSlotInfo {
-        let layer_block = pegaflow_core::LayerBlock::new(raw_block);
-        if let Some(v_ptr) = layer_block.v_ptr() {
-            TransferSlotInfo {
-                k_ptr: layer_block.k_ptr() as u64,
-                k_size: layer_block.k_size() as u64,
-                v_ptr: v_ptr as u64,
-                v_size: layer_block.v_size().unwrap_or(0) as u64,
-                numa_node: numa_node.0,
-            }
-        } else {
-            TransferSlotInfo {
-                k_ptr: layer_block.k_ptr() as u64,
-                k_size: layer_block.k_size() as u64,
-                v_ptr: 0,
-                v_size: 0,
-                numa_node: numa_node.0,
-            }
-        }
     }
 
     fn save_numa_hint(
@@ -769,27 +744,23 @@ impl Engine for GrpcEngineService {
                 &req.requester_id,
             );
 
-            let blocks: Vec<TransferBlockInfo> = found_blocks
-                .iter()
-                .map(|(key, block)| {
-                    let slots: Vec<TransferSlotInfo> = block
-                        .slots()
-                        .iter()
-                        .zip(block.slot_numas())
-                        .map(|(raw, &numa)| Self::build_transfer_slot_info(raw, numa))
-                        .collect();
-                    TransferBlockInfo {
-                        block_hash: key.hash.clone(),
-                        slots,
-                    }
-                })
-                .collect();
+            // The engine already took the transfer lock on `found_blocks`. If
+            // encoding fails, the requester never learns the session id, so it
+            // can never release it — drop the lock here instead of leaking it
+            // until the lock GC sweep.
+            let transfer_plan = match pegaflow_core::encode_transfer_plan_bytes(&found_blocks) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    self.engine.release_transfer_lock(&session_id);
+                    return Err(Status::invalid_argument(e));
+                }
+            };
 
             Ok(Response::new(QueryBlocksForTransferResponse {
                 status: Some(Self::build_simple_response()),
-                blocks,
                 transfer_session_id: session_id,
                 lock_timeout_secs: self.engine.transfer_lock_timeout().as_secs() as u32,
+                transfer_plan,
             }))
         }
         .await;
@@ -797,8 +768,8 @@ impl Engine for GrpcEngineService {
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         match &result {
             Ok(response) => debug!(
-                "RPC [query_blocks_for_transfer] completed: ok found={} session={} elapsed_ms={:.2}",
-                response.get_ref().blocks.len(),
+                "RPC [query_blocks_for_transfer] completed: ok plan_bytes={} session={} elapsed_ms={:.2}",
+                response.get_ref().transfer_plan.len(),
                 response.get_ref().transfer_session_id,
                 elapsed_ms
             ),

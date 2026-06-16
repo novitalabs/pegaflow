@@ -28,6 +28,20 @@ mod seal_offload;
 mod storage;
 pub mod sync_state;
 pub mod transfer;
+#[cfg(feature = "rdma")]
+pub(crate) mod transfer_plan;
+
+/// Benchmark-only fixtures for the cross-node rebuild hot path. Gated behind the
+/// `bench` feature; never present in production builds.
+#[cfg(all(feature = "bench", feature = "rdma"))]
+pub use transfer_plan::bench_support;
+
+#[cfg(feature = "rdma")]
+pub fn encode_transfer_plan_bytes(
+    found_blocks: &[(BlockKey, Arc<SealedBlock>)],
+) -> Result<Vec<u8>, String> {
+    transfer_plan::encode_transfer_plan_bytes(found_blocks)
+}
 
 pub use backing::{
     DEFAULT_SSD_PREFETCH_INFLIGHT, DEFAULT_SSD_PREFETCH_QUEUE_DEPTH, DEFAULT_SSD_WRITE_INFLIGHT,

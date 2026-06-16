@@ -1,440 +1,579 @@
-//! P2P RDMA remote fetch integration test.
+//! P2P RDMA integration tests: production cross-node fetch + transfer-plan NUMA.
 //!
-//! Verifies the end-to-end flow:
-//! Engine A saves blocks → MetaServer discovers them → Engine B fetches via RDMA READ
-//! → data integrity verified.
+//! ```bash
+//! cargo test -p pegaflow-server --test p2p_rdma -- --ignored --nocapture
+//! ```
 //!
-//! Run with: `cargo test -p pegaflow-server --test p2p_rdma -- --ignored`
+//! The cases here enumerate how a stored block's slots map onto NUMA nodes,
+//! because that mapping is what the transfer plan must reproduce and the
+//! requester must rebuild:
+//!
+//! - **A (single writer)** — `SingleLayer` / `MultiLayerMultiBlock`: one worker,
+//!   every slot on one NUMA. Baseline encode/fetch/load.
+//! - **B (cross-slot NUMA)** — normal MHA TP>1: each rank owns a distinct slot
+//!   column and saves with its own GPU's NUMA, so a *single block* spans NUMA
+//!   when ranks land on different sockets. No server NUMA hint (eff tp_size>1).
+//! - **C (cross-block NUMA)** — MLA replica without DCP: only effective rank 0
+//!   saves, but the server round-robins each save RPC's NUMA across the replica
+//!   candidates, so each block is single-NUMA while the *batch* spans NUMA.
+//!
+//! Multi-NUMA assertions self-adapt: on a single-NUMA box the distinct-NUMA set
+//! collapses to one and the cross-NUMA shape is logged as not exercised, but the
+//! multi-worker topology and the data roundtrip are still verified.
 
-use std::ffi::c_void;
-use std::net::SocketAddr;
+// The p2p harness is standalone: include it directly so this binary does not
+// drag in the unrelated mock-vLLM helpers under `common/` (and vice versa).
+#[path = "common/p2p_harness.rs"]
+mod p2p_harness;
+
+use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use cudarc::driver::CudaContext;
-use cudarc::driver::sys;
-use pegaflow_core::sync_state::{LOAD_STATE_ERROR, LOAD_STATE_SUCCESS};
-use pegaflow_core::*;
-use pegaflow_metaserver::{BlockHashStore, GrpcMetaService};
-use pegaflow_proto::proto::engine::meta_server_server::MetaServerServer;
-use pegaflow_server::proto::engine::engine_server::EngineServer;
-use pegaflow_server::{CudaTensorRegistry, GrpcEngineService, RegistryHandle};
-use tokio::sync::Notify;
-use tonic::transport::Server;
+use pegaflow_common::NumaNode;
+use pegaflow_core::{PegaEngine, StorageConfig};
+use pegaflow_server::session::SessionRegistry;
 
-// ── GPU buffer (from pegaflow-core/tests/common/gpu_buffer.rs) ──────────────
+use p2p_harness::{
+    DeviceGpu, GpuBuffer, P2P_NAMESPACE, P2pCase, P2pShape, any_block_spans_multiple_numa,
+    assert_transfer_plan_numa, cuda_device_count, distinct_slot_numas, fill_test_pattern_salted,
+    get_free_port, holder_save_blocks, holder_slot_numas_per_block, make_block_hashes,
+    query_holder_transfer_plan, register_worker, requester_load_and_verify,
+    requester_load_worker_and_verify, save_worker_blocks, spawn_engine_server, spawn_metaserver,
+    unique_chunk_numa_nodes, wait_for_cache, wait_for_metaserver_registration,
+    wait_for_prefetch_done,
+};
 
-struct GpuBuffer {
-    ptr: sys::CUdeviceptr,
-    len: usize,
-}
+/// Cap multi-GPU fan-out: enough to span both sockets on a 2-NUMA box without
+/// registering an absurd number of CUDA contexts.
+const MAX_TEST_GPUS: usize = 8;
 
-impl GpuBuffer {
-    fn alloc(len: usize) -> Self {
-        assert!(len > 0);
-        let mut ptr: sys::CUdeviceptr = 0;
-        check_cuda(
-            unsafe { sys::cuMemAlloc_v2(&raw mut ptr, len) },
-            "cuMemAlloc_v2",
-        );
-        Self { ptr, len }
-    }
-
-    fn as_u64(&self) -> u64 {
-        self.ptr
-    }
-
-    fn copy_from_host(&self, data: &[u8]) {
-        assert_eq!(data.len(), self.len);
-        check_cuda(
-            unsafe { sys::cuMemcpyHtoD_v2(self.ptr, data.as_ptr() as *const c_void, self.len) },
-            "cuMemcpyHtoD_v2",
-        );
-    }
-
-    fn copy_to_host(&self) -> Vec<u8> {
-        let mut output = vec![0u8; self.len];
-        check_cuda(
-            unsafe { sys::cuMemcpyDtoH_v2(output.as_mut_ptr() as *mut c_void, self.ptr, self.len) },
-            "cuMemcpyDtoH_v2",
-        );
-        output
-    }
-
-    fn zero(&self) {
-        check_cuda(
-            unsafe { sys::cuMemsetD8_v2(self.ptr, 0, self.len) },
-            "cuMemsetD8_v2",
-        );
+fn case_salt(case: P2pCase) -> u8 {
+    match case {
+        P2pCase::SingleLayer => 42,
+        P2pCase::MultiLayerMultiBlock => 43,
     }
 }
 
-impl Drop for GpuBuffer {
-    fn drop(&mut self) {
-        if self.ptr != 0 {
-            check_cuda(unsafe { sys::cuMemFree_v2(self.ptr) }, "cuMemFree_v2");
-            self.ptr = 0;
+struct P2pCluster {
+    meta_port: u16,
+    port_holder: u16,
+    port_requester: u16,
+}
+
+impl P2pCluster {
+    fn new() -> Self {
+        Self {
+            meta_port: get_free_port(),
+            port_holder: get_free_port(),
+            port_requester: get_free_port(),
+        }
+    }
+
+    fn holder_config(&self) -> StorageConfig {
+        StorageConfig {
+            metaserver_addr: Some(format!("http://127.0.0.1:{}", self.meta_port)),
+            advertise_addr: Some(format!("127.0.0.1:{}", self.port_holder)),
+            rdma_nic_names: Some(p2p_harness::rdma_nic_names()),
+            ..StorageConfig::default()
+        }
+    }
+
+    fn requester_config(&self) -> StorageConfig {
+        StorageConfig {
+            metaserver_addr: Some(format!("http://127.0.0.1:{}", self.meta_port)),
+            advertise_addr: Some(format!("127.0.0.1:{}", self.port_requester)),
+            rdma_nic_names: Some(p2p_harness::rdma_nic_names()),
+            ..StorageConfig::default()
         }
     }
 }
 
-fn check_cuda(result: sys::CUresult, op: &str) {
-    assert!(
-        result == sys::CUresult::CUDA_SUCCESS,
-        "{op} failed with {result:?}"
-    );
-}
+// =============================================================================
+// Class A: single writer, single NUMA
+// =============================================================================
 
-// ── Helpers (from pegaflow-core/tests/common/helpers.rs) ────────────────────
-
-fn fill_test_pattern(host_data: &mut [u8], block_size: usize) {
-    for (i, block) in host_data.chunks_exact_mut(block_size).enumerate() {
-        let fill = ((i % 251) + 1) as u8;
-        block.fill(fill);
-    }
-}
-
-fn make_block_ids(num_blocks: usize) -> Vec<usize> {
-    (0..num_blocks).collect()
-}
-
-fn make_block_hashes(num_blocks: usize, salt: u8) -> Vec<Vec<u8>> {
-    (0..num_blocks)
-        .map(|idx| {
-            let mut hash = Vec::with_capacity(5);
-            hash.push(salt);
-            hash.extend_from_slice(&(idx as u32).to_le_bytes());
-            hash
-        })
-        .collect()
-}
-
-// ── Infrastructure ──────────────────────────────────────────────────────────
-
-fn get_free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("local_addr")
-        .port()
-}
-
-async fn wait_for_grpc_ready(port: u16) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
-            .await
-            .is_ok()
-        {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for gRPC on port {port}"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
-
-async fn spawn_metaserver(port: u16) -> Arc<BlockHashStore> {
-    let store = Arc::new(BlockHashStore::new());
-    let service = GrpcMetaService::new(Arc::clone(&store));
-    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
-    tokio::spawn(async move {
-        Server::builder()
-            .add_service(MetaServerServer::new(service))
-            .serve(addr)
-            .await
-            .expect("MetaServer gRPC serve");
-    });
-    wait_for_grpc_ready(port).await;
-    store
-}
-
-async fn spawn_engine_server(engine: Arc<PegaEngine>, port: u16) {
-    let registry = CudaTensorRegistry::new().expect("CudaTensorRegistry::new");
-    let registry = RegistryHandle::spawn(registry);
-    let shutdown = Arc::new(Notify::new());
-    let hll_tracker = Arc::new(std::sync::Mutex::new(
-        pegaflow_common::hll::MultiWindowHllTracker::new(
-            vec![("24h".into(), Duration::from_secs(86400))],
-            14,
-        ),
-    ));
-    let service = GrpcEngineService::new(engine, registry, shutdown, hll_tracker);
-    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
-    tokio::spawn(async move {
-        Server::builder()
-            .add_service(EngineServer::new(service))
-            .serve(addr)
-            .await
-            .expect("Engine gRPC serve");
-    });
-    wait_for_grpc_ready(port).await;
-}
-
-async fn wait_for_cache(
-    engine: &PegaEngine,
-    instance_id: &str,
-    block_hashes: &[Vec<u8>],
-    expected_hit: usize,
-    timeout: Duration,
-) {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let status = engine
-            .count_prefix_hit_blocks_with_prefetch(instance_id, "wait-for-cache", block_hashes)
-            .await
-            .expect("count_prefix_hit_blocks_with_prefetch");
-        let hit = match status {
-            PrefetchStatus::Ready { blocks, .. } => blocks.len(),
-            PrefetchStatus::Loading => 0,
-        };
-        if hit >= expected_hit {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for {expected_hit} cached blocks (got {hit})"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
-
-async fn wait_for_metaserver_registration(
-    store: &BlockHashStore,
-    namespace: &str,
-    hashes: &[Vec<u8>],
-    expected: usize,
-    timeout: Duration,
-) {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let found = store.query_prefix(namespace, hashes);
-        if found.len() >= expected {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for MetaServer registration ({} / {})",
-            found.len(),
-            expected
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-async fn wait_for_prefetch_done(
-    engine: &PegaEngine,
-    instance_id: &str,
-    req_id: &str,
-    block_hashes: &[Vec<u8>],
-    expected_hit: usize,
-    timeout: Duration,
-) -> QueryLeaseId {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let status = engine
-            .count_prefix_hit_blocks_with_prefetch(instance_id, req_id, block_hashes)
-            .await
-            .expect("count_prefix_hit_blocks_with_prefetch");
-        match status {
-            PrefetchStatus::Ready { blocks, .. } if blocks.len() >= expected_hit => {
-                return engine
-                    .create_query_lease(instance_id, blocks)
-                    .expect("create query lease");
-            }
-            PrefetchStatus::Ready { blocks, missing } => {
-                assert!(
-                    Instant::now() < deadline,
-                    "prefetch done but hit={} missing={missing}, \
-                     expected hit>={expected_hit}",
-                    blocks.len()
-                );
-            }
-            PrefetchStatus::Loading => {}
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for prefetch done"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-// ── Test ────────────────────────────────────────────────────────────────────
-
-const NUM_BLOCKS: usize = 4;
-const BLOCK_SIZE: usize = 1024;
-const TOTAL_SIZE: usize = NUM_BLOCKS * BLOCK_SIZE;
-const NAMESPACE: &str = "test-p2p";
-const LAYER: &str = "layer_0";
-const DEVICE_ID: i32 = 0;
-
-#[tokio::test]
-#[ignore] // Requires RDMA hardware (mlx5_1), CUDA GPU, and Python+torch
-async fn p2p_rdma_remote_fetch_roundtrip() {
+async fn run_roundtrip(case: P2pCase) {
     pegaflow_common::logging::init_stdout_colored("debug");
-    let _cuda_ctx = CudaContext::new(0).expect("CUDA init");
+    let shape = case.default_shape();
+    let _ = CudaContext::new(0).expect("CUDA init");
 
-    // Allocate ephemeral ports
-    let meta_port = get_free_port();
-    let port_a = get_free_port();
+    let cluster = P2pCluster::new();
+    let meta_store = spawn_metaserver(cluster.meta_port).await;
 
-    // ── 1. Start MetaServer ──
-    let meta_store = spawn_metaserver(meta_port).await;
-
-    // ── 2. Create Engine A (source of blocks) ──
-    let config_a = StorageConfig {
-        metaserver_addr: Some(format!("http://127.0.0.1:{meta_port}")),
-        advertise_addr: Some(format!("127.0.0.1:{port_a}")),
-        rdma_nic_names: Some(vec!["mlx5_1".into()]),
-        ..StorageConfig::default()
-    };
     let engine_a = Arc::new(
-        PegaEngine::new_with_config(16 << 20, false, config_a).expect("engine A should start"),
+        PegaEngine::new_with_config(256 << 20, false, cluster.holder_config())
+            .expect("holder engine"),
     );
+    spawn_engine_server(Arc::clone(&engine_a), cluster.port_holder).await;
 
-    // ── 3. Start Engine A gRPC server ──
-    spawn_engine_server(Arc::clone(&engine_a), port_a).await;
+    let block_hashes = make_block_hashes(shape.blocks, case_salt(case));
+    let gpu_holder = GpuBuffer::alloc(shape.rank_bytes());
+    let holder_host = holder_save_blocks(
+        &engine_a,
+        "inst-a",
+        &shape,
+        0,
+        0,
+        &block_hashes,
+        &gpu_holder,
+    )
+    .await;
 
-    // ── 4. Save blocks on Engine A ──
-    let gpu_a = GpuBuffer::alloc(TOTAL_SIZE);
-    let mut host_data = vec![0u8; TOTAL_SIZE];
-    fill_test_pattern(&mut host_data, BLOCK_SIZE);
-    gpu_a.copy_from_host(&host_data);
-
-    engine_a
-        .register_context_layer_batch(
-            "inst-a",
-            NAMESPACE,
-            DEVICE_ID,
-            0, // tp_rank
-            0, // pp_rank
-            1, // tp_size
-            1, // world_size
-            &[LAYER.to_string()],
-            &[gpu_a.as_u64()],
-            &[TOTAL_SIZE],
-            &[NUM_BLOCKS],
-            &[BLOCK_SIZE],
-            &[0], // kv_strides
-            &[1], // segments
-        )
-        .expect("register layer on engine A");
-
-    let block_ids = make_block_ids(NUM_BLOCKS);
-    let block_hashes = make_block_hashes(NUM_BLOCKS, 42);
-
-    engine_a
-        .batch_save_kv_blocks_from_ipc(
-            "inst-a",
-            0,
-            0,
-            DEVICE_ID,
-            vec![LayerSave {
-                layer_name: LAYER.to_string(),
-                block_ids: block_ids.clone(),
-                block_hashes: block_hashes.clone(),
-            }],
-        )
-        .await
-        .expect("save blocks on engine A");
-
-    // ── 5. Wait for Engine A cache ──
     wait_for_cache(
         &engine_a,
         "inst-a",
         &block_hashes,
-        NUM_BLOCKS,
-        Duration::from_secs(5),
+        shape.blocks,
+        Duration::from_secs(60),
     )
     .await;
-
-    // ── 6. Wait for MetaServer registration (fire-and-forget async) ──
     wait_for_metaserver_registration(
         &meta_store,
-        NAMESPACE,
+        P2P_NAMESPACE,
         &block_hashes,
-        NUM_BLOCKS,
-        Duration::from_secs(10),
-    )
-    .await;
-
-    // ── 7. Create Engine B (fetcher) ──
-    let port_b = get_free_port();
-    let config_b = StorageConfig {
-        metaserver_addr: Some(format!("http://127.0.0.1:{meta_port}")),
-        advertise_addr: Some(format!("127.0.0.1:{port_b}")),
-        rdma_nic_names: Some(vec!["mlx5_1".into()]),
-        ..StorageConfig::default()
-    };
-    let engine_b =
-        PegaEngine::new_with_config(16 << 20, false, config_b).expect("engine B should start");
-
-    let gpu_b = GpuBuffer::alloc(TOTAL_SIZE);
-    gpu_b.zero();
-
-    engine_b
-        .register_context_layer_batch(
-            "inst-b",
-            NAMESPACE,
-            DEVICE_ID,
-            0, // tp_rank
-            0, // pp_rank
-            1, // tp_size
-            1, // world_size
-            &[LAYER.to_string()],
-            &[gpu_b.as_u64()],
-            &[TOTAL_SIZE],
-            &[NUM_BLOCKS],
-            &[BLOCK_SIZE],
-            &[0],
-            &[1],
-        )
-        .expect("register layer on engine B");
-
-    // ── 8. Remote fetch: Engine B discovers blocks via MetaServer → RDMA READ ──
-    let lease = wait_for_prefetch_done(
-        &engine_b,
-        "inst-b",
-        "req-1",
-        &block_hashes,
-        NUM_BLOCKS,
+        shape.blocks,
         Duration::from_secs(30),
     )
     .await;
 
-    // ── 9. Load from Engine B cache → GPU ──
-    let load_state = LoadState::new().expect("create LoadState");
-    let shm_name = load_state.shm_name().to_string();
+    let plan = query_holder_transfer_plan(&engine_a, &block_hashes, "p2p-it-requester").await;
+    assert_transfer_plan_numa(&plan);
+    let (_, found) =
+        engine_a.query_blocks_for_transfer(P2P_NAMESPACE, &block_hashes, "p2p-it-check");
+    let holder_numas = holder_slot_numas_per_block(&found);
+    assert_eq!(holder_numas.len(), shape.blocks);
+    for slot_numas in &holder_numas {
+        assert!(!slot_numas.is_empty());
+        assert!(slot_numas.iter().all(|n| n.is_valid()));
+    }
+    let distinct = unique_chunk_numa_nodes(&plan);
+    eprintln!(
+        "{case:?}: plan blocks={} chunks={} distinct_chunk_numa={distinct:?}",
+        plan.block_hashes.len(),
+        plan.remote_chunks.len()
+    );
 
-    engine_b
-        .batch_load_kv_blocks_multi_layer(
-            "inst-b",
-            0,
-            DEVICE_ID,
-            &shm_name,
-            &[LAYER],
-            &[(lease, block_ids.clone())],
-        )
-        .expect("batch_load on engine B");
+    let engine_b = Arc::new(
+        PegaEngine::new_with_config(256 << 20, false, cluster.requester_config())
+            .expect("requester engine"),
+    );
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let state = load_state.get();
-        if state == LOAD_STATE_SUCCESS {
-            break;
-        }
-        assert!(state != LOAD_STATE_ERROR, "load reported ERROR");
-        assert!(Instant::now() < deadline, "timed out waiting for load");
-        tokio::time::sleep(Duration::from_millis(10)).await;
+    let gpu_req = GpuBuffer::alloc(shape.rank_bytes());
+    gpu_req.zero();
+    register_worker(
+        &engine_b,
+        "inst-b",
+        &shape,
+        0,
+        0,
+        0,
+        shape.tp_size,
+        shape.world_size,
+        gpu_req.as_u64(),
+    );
+
+    let lease = wait_for_prefetch_done(
+        &engine_b,
+        "inst-b",
+        &format!("p2p-{case:?}"),
+        &block_hashes,
+        shape.blocks,
+        Duration::from_secs(120),
+    )
+    .await;
+
+    let block_ids: Vec<usize> = (0..shape.blocks).collect();
+    requester_load_and_verify(
+        &engine_b,
+        "inst-b",
+        &shape,
+        0,
+        0,
+        lease,
+        &block_ids,
+        &holder_host,
+        &gpu_req,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires RDMA NIC + CUDA GPU"]
+async fn p2p_rdma_single_layer_roundtrip() {
+    run_roundtrip(P2pCase::SingleLayer).await;
+}
+
+#[tokio::test]
+#[ignore = "requires RDMA NIC + CUDA GPU"]
+async fn p2p_rdma_multi_layer_multi_block() {
+    run_roundtrip(P2pCase::MultiLayerMultiBlock).await;
+}
+
+// =============================================================================
+// Class B: normal MHA TP>1 — cross-slot NUMA (each rank owns a slot column)
+// =============================================================================
+
+#[tokio::test]
+#[ignore = "requires RDMA NIC + multiple CUDA GPUs spanning NUMA"]
+async fn p2p_rdma_normal_tp_cross_numa() {
+    pegaflow_common::logging::init_stdout_colored("debug");
+
+    let tp_size = cuda_device_count().min(MAX_TEST_GPUS);
+    if tp_size < 2 {
+        eprintln!("skip: need >= 2 CUDA devices for normal-TP cross-NUMA case");
+        return;
     }
 
-    // ── 10. Verify data integrity ──
-    let loaded = gpu_b.copy_to_host();
-    assert_eq!(
-        loaded, host_data,
-        "GPU data mismatch: remote-fetched blocks differ from original"
+    let shape = P2pShape {
+        layers: 4,
+        blocks: 16,
+        block_size: 512,
+        tp_size,
+        world_size: tp_size,
+    };
+    let rank_bytes = shape.rank_bytes();
+    let block_ids: Vec<usize> = (0..shape.blocks).collect();
+    let block_hashes = make_block_hashes(shape.blocks, 81);
+
+    let cluster = P2pCluster::new();
+    let meta_store = spawn_metaserver(cluster.meta_port).await;
+    let engine_a = Arc::new(
+        PegaEngine::new_with_config(512 << 20, false, cluster.holder_config())
+            .expect("holder engine"),
     );
+    spawn_engine_server(Arc::clone(&engine_a), cluster.port_holder).await;
+
+    // Each TP rank gets its own device + a distinct payload under the same
+    // hashes (different KV heads = different bytes). Register *all* ranks before
+    // saving — sealing requires the full worker set.
+    let mut holder_gpus: Vec<DeviceGpu> = Vec::with_capacity(tp_size);
+    let mut holder_host: Vec<Vec<u8>> = Vec::with_capacity(tp_size);
+    for rank in 0..tp_size {
+        let gpu = DeviceGpu::alloc(rank as i32, rank_bytes);
+        let mut host = vec![0u8; rank_bytes];
+        fill_test_pattern_salted(&mut host, shape.block_size, rank);
+        gpu.copy_from_host(&host);
+        register_worker(
+            &engine_a,
+            "inst-a",
+            &shape,
+            rank as i32,
+            rank,
+            0,
+            tp_size,
+            tp_size,
+            gpu.as_u64(),
+        );
+        holder_gpus.push(gpu);
+        holder_host.push(host);
+    }
+    for rank in 0..tp_size {
+        save_worker_blocks(
+            &engine_a,
+            "inst-a",
+            &shape,
+            rank as i32,
+            rank,
+            0,
+            &block_ids,
+            &block_hashes,
+            None,
+        )
+        .await;
+    }
+
+    wait_for_cache(
+        &engine_a,
+        "inst-a",
+        &block_hashes,
+        shape.blocks,
+        Duration::from_secs(60),
+    )
+    .await;
+    wait_for_metaserver_registration(
+        &meta_store,
+        P2P_NAMESPACE,
+        &block_hashes,
+        shape.blocks,
+        Duration::from_secs(30),
+    )
+    .await;
+
+    let (_, found) =
+        engine_a.query_blocks_for_transfer(P2P_NAMESPACE, &block_hashes, "p2p-it-check");
+    let holder_numas = holder_slot_numas_per_block(&found);
+    assert_eq!(holder_numas.len(), shape.blocks);
+    for slot_numas in &holder_numas {
+        assert_eq!(
+            slot_numas.len(),
+            shape.layers * tp_size,
+            "each block has one slot per (layer, tp_rank)"
+        );
+        assert!(slot_numas.iter().all(|n| n.is_valid()));
+    }
+
+    let plan = query_holder_transfer_plan(&engine_a, &block_hashes, "p2p-it-requester").await;
+    assert_transfer_plan_numa(&plan);
+    let slot_numa = distinct_slot_numas(&found);
+    assert_eq!(
+        unique_chunk_numa_nodes(&plan),
+        slot_numa,
+        "plan remote-chunk NUMA set must equal the holder's slot NUMA set"
+    );
+    if slot_numa.len() > 1 {
+        assert!(
+            any_block_spans_multiple_numa(&found),
+            "TP across sockets must produce blocks whose slots span >1 NUMA"
+        );
+        eprintln!("normal-TP cross-slot multi-NUMA exercised: distinct={slot_numa:?}");
+    } else {
+        eprintln!("single-NUMA box: cross-slot multi-NUMA not exercised (distinct={slot_numa:?})");
+    }
+
+    // Requester mirrors the TP topology; each rank loads its own column.
+    let engine_b = Arc::new(
+        PegaEngine::new_with_config(512 << 20, false, cluster.requester_config())
+            .expect("requester engine"),
+    );
+    let mut req_gpus: Vec<DeviceGpu> = Vec::with_capacity(tp_size);
+    for rank in 0..tp_size {
+        let gpu = DeviceGpu::alloc(rank as i32, rank_bytes);
+        gpu.zero();
+        register_worker(
+            &engine_b,
+            "inst-b",
+            &shape,
+            rank as i32,
+            rank,
+            0,
+            tp_size,
+            tp_size,
+            gpu.as_u64(),
+        );
+        req_gpus.push(gpu);
+    }
+
+    let lease = wait_for_prefetch_done(
+        &engine_b,
+        "inst-b",
+        "p2p-normal-tp",
+        &block_hashes,
+        shape.blocks,
+        Duration::from_secs(120),
+    )
+    .await;
+
+    for rank in 0..tp_size {
+        requester_load_worker_and_verify(
+            &engine_b,
+            "inst-b",
+            &shape,
+            rank as i32,
+            rank,
+            lease,
+            &block_ids,
+            &holder_host[rank],
+            &req_gpus[rank],
+        )
+        .await;
+    }
+}
+
+// =============================================================================
+// Class C: MLA replica (no DCP) — cross-block NUMA via server round-robin
+// =============================================================================
+
+#[tokio::test]
+#[ignore = "requires RDMA NIC + multiple CUDA GPUs spanning NUMA"]
+async fn p2p_rdma_mla_replica_round_robin_numa() {
+    pegaflow_common::logging::init_stdout_colored("debug");
+
+    let replicas = cuda_device_count().min(MAX_TEST_GPUS);
+    if replicas < 2 {
+        eprintln!("skip: need >= 2 CUDA devices for MLA-replica round-robin case");
+        return;
+    }
+
+    // MLA without DCP: effective tp_size == 1 (one slot column), world_size ==
+    // replica count. KV is identical across replicas, so the latent layout is a
+    // single contiguous segment per slot.
+    let shape = P2pShape {
+        layers: 4,
+        blocks: 16,
+        block_size: 512,
+        tp_size: 1,
+        world_size: replicas,
+    };
+    let rank_bytes = shape.rank_bytes();
+    let block_ids: Vec<usize> = (0..shape.blocks).collect();
+    let block_hashes = make_block_hashes(shape.blocks, 82);
+
+    let cluster = P2pCluster::new();
+    let meta_store = spawn_metaserver(cluster.meta_port).await;
+    let engine_a = Arc::new(
+        PegaEngine::new_with_config(512 << 20, false, cluster.holder_config())
+            .expect("holder engine"),
+    );
+    spawn_engine_server(Arc::clone(&engine_a), cluster.port_holder).await;
+
+    // Register every replica (so the save group's NUMA candidates span both
+    // sockets), but only effective rank 0 (device 0) carries and writes data.
+    let mut host = vec![0u8; rank_bytes];
+    fill_test_pattern_salted(&mut host, shape.block_size, 0);
+    let mut holder_gpus: Vec<DeviceGpu> = Vec::with_capacity(replicas);
+    for device in 0..replicas {
+        let gpu = DeviceGpu::alloc(device as i32, rank_bytes);
+        if device == 0 {
+            gpu.copy_from_host(&host);
+        }
+        register_worker(
+            &engine_a,
+            "inst-a",
+            &shape,
+            device as i32,
+            0,
+            0,
+            shape.tp_size,
+            shape.world_size,
+            gpu.as_u64(),
+        );
+        holder_gpus.push(gpu);
+    }
+
+    // Drive the real server-side round-robin: one save RPC per block, each with
+    // the next candidate NUMA. On a single-NUMA box candidates.len() < 2 makes
+    // this fall back to the device's NUMA (no rotation).
+    let candidates = engine_a
+        .registered_numa_nodes_for_save_group("inst-a", 0, 0)
+        .expect("save-group NUMA candidates");
+    let session = SessionRegistry::new();
+    session.install(
+        "inst-a".to_string(),
+        P2P_NAMESPACE.to_string(),
+        replicas as u32,
+        replicas as u32,
+    );
+    for &block_id in &block_ids {
+        let hint: Option<NumaNode> = session
+            .next_save_numa_hint("inst-a", 0, 0, &candidates)
+            .map(|h| h.numa_node);
+        save_worker_blocks(
+            &engine_a,
+            "inst-a",
+            &shape,
+            0,
+            0,
+            0,
+            std::slice::from_ref(&block_id),
+            std::slice::from_ref(&block_hashes[block_id]),
+            hint,
+        )
+        .await;
+    }
+
+    wait_for_cache(
+        &engine_a,
+        "inst-a",
+        &block_hashes,
+        shape.blocks,
+        Duration::from_secs(60),
+    )
+    .await;
+    wait_for_metaserver_registration(
+        &meta_store,
+        P2P_NAMESPACE,
+        &block_hashes,
+        shape.blocks,
+        Duration::from_secs(30),
+    )
+    .await;
+
+    let (_, found) =
+        engine_a.query_blocks_for_transfer(P2P_NAMESPACE, &block_hashes, "p2p-it-check");
+    let holder_numas = holder_slot_numas_per_block(&found);
+    assert_eq!(holder_numas.len(), shape.blocks);
+    for slot_numas in &holder_numas {
+        assert_eq!(
+            slot_numas.len(),
+            shape.layers,
+            "MLA replica has one slot per layer (effective tp_size == 1)"
+        );
+        assert!(slot_numas.iter().all(|n| n.is_valid()));
+        let block_set: BTreeSet<u32> = slot_numas.iter().map(|n| n.0).collect();
+        assert_eq!(
+            block_set.len(),
+            1,
+            "each replica block is written by one save RPC, so all its slots share one NUMA"
+        );
+    }
+
+    let plan = query_holder_transfer_plan(&engine_a, &block_hashes, "p2p-it-requester").await;
+    assert_transfer_plan_numa(&plan);
+    let slot_numa = distinct_slot_numas(&found);
+    assert_eq!(
+        unique_chunk_numa_nodes(&plan),
+        slot_numa,
+        "plan remote-chunk NUMA set must equal the holder's slot NUMA set"
+    );
+    assert!(
+        !any_block_spans_multiple_numa(&found),
+        "MLA replica blocks must each be single-NUMA (cross-block, not cross-slot)"
+    );
+    if slot_numa.len() > 1 {
+        eprintln!(
+            "MLA-replica round-robin cross-block multi-NUMA exercised: distinct={slot_numa:?}"
+        );
+    } else {
+        eprintln!("single-NUMA box: round-robin not exercised (distinct={slot_numa:?})");
+    }
+
+    // Requester mirrors the replica topology; every replica loads the full block.
+    let engine_b = Arc::new(
+        PegaEngine::new_with_config(512 << 20, false, cluster.requester_config())
+            .expect("requester engine"),
+    );
+    let mut req_gpus: Vec<DeviceGpu> = Vec::with_capacity(replicas);
+    for device in 0..replicas {
+        let gpu = DeviceGpu::alloc(device as i32, rank_bytes);
+        gpu.zero();
+        register_worker(
+            &engine_b,
+            "inst-b",
+            &shape,
+            device as i32,
+            0,
+            0,
+            shape.tp_size,
+            shape.world_size,
+            gpu.as_u64(),
+        );
+        req_gpus.push(gpu);
+    }
+
+    let lease = wait_for_prefetch_done(
+        &engine_b,
+        "inst-b",
+        "p2p-mla-replica",
+        &block_hashes,
+        shape.blocks,
+        Duration::from_secs(120),
+    )
+    .await;
+
+    for (device, gpu) in req_gpus.iter().enumerate() {
+        requester_load_worker_and_verify(
+            &engine_b,
+            "inst-b",
+            &shape,
+            device as i32,
+            0,
+            lease,
+            &block_ids,
+            &host,
+            gpu,
+        )
+        .await;
+    }
 }

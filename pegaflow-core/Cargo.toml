@@ -12,6 +12,8 @@ cuda-12 = ["cudarc/cuda-12080", "cudarc/nvrtc", "pegaflow-transfer?/cuda-12"]
 cuda-13 = ["cudarc/cuda-13000", "cudarc/nvrtc", "pegaflow-transfer?/cuda-13"]
 rdma = ["dep:pegaflow-transfer"]
 tracing = ["fastrace"]
+# Exposes `bench_support` for criterion benches; not for production builds.
+bench = []
 
 [dependencies]
 pegaflow-common.workspace = true
@@ -36,6 +38,7 @@ tonic.workspace = true
 dashmap.workspace = true
 smallvec.workspace = true
 pegaflow-proto = { path = "../pegaflow-proto" }
+pegaflow-transfer-wire.workspace = true
 pegaflow-transfer = { path = "../pegaflow-transfer", default-features = false, optional = true }
 mea.workspace = true
 
@@ -61,6 +64,24 @@ harness = false
 [[bench]]
 name = "transfer_h2d"
 harness = false
+
+[[bench]]
+name = "transfer_rebuild"
+harness = false
+required-features = ["bench", "rdma"]
+
+[[bench]]
+name = "transfer_query"
+harness = false
+required-features = ["bench", "rdma"]
+
+[[example]]
+name = "rebuild_profile"
+required-features = ["bench", "rdma"]
+
+[[example]]
+name = "encode_profile"
+required-features = ["bench", "rdma"]
 
 [[example]]
 name = "pinned_alloc"
