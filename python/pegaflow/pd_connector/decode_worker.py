@@ -261,7 +261,11 @@ class _DecodePeerState:
     ) -> list[dict[str, Any]]:
         result = []
         block_size = self.block_size
-        for rank in range(self._w.tp_size):
+        # Iterate the ranks actually gathered rather than range(tp_size): in the
+        # all_gather fallback gather() populates only the local rank, and the
+        # warning there promises dispatch is limited to it. range(tp_size) would
+        # KeyError on the missing peers and contradict that promise.
+        for rank in sorted(self.layer_templates):
             layers = []
             for layer in self.layer_templates[rank]:
                 layer_name = str(layer["layer_name"])
