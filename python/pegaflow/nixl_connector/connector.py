@@ -50,6 +50,9 @@ from pegaflow.nixl_connector.push_scheduler import (
 from pegaflow.nixl_connector.push_worker import (
     NixlPushConnectorWorker,
 )
+from pegaflow.nixl_connector.pega_push_worker import (
+    PegaNixlPushConnectorWorker,
+)
 from pegaflow.nixl_connector.stats import (
     NixlKVConnectorStats,
     NixlPromMetrics,
@@ -386,9 +389,29 @@ class PegaNixlConnector(NixlPushConnector):
     """PegaFlow NIXL connector facade.
 
     This class intentionally starts from vLLM's WRITE-based NIXL connector
-    contract. The worker transport is replaced in later changes while preserving
-    the scheduler-facing NIXL P/D semantics.
+    contract. The scheduler keeps the NIXL P/D semantics while the worker
+    uses PegaFlow RDMA for the data plane.
     """
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        role: KVConnectorRole,
+        kv_cache_config: "KVCacheConfig",
+    ):
+        NixlBaseConnector.__init__(self, vllm_config, role, kv_cache_config)
+        self.connector_scheduler: NixlPushConnectorScheduler | None = None
+        self.connector_worker: PegaNixlPushConnectorWorker | None = None
+        if role == KVConnectorRole.SCHEDULER:
+            self.connector_scheduler = NixlPushConnectorScheduler(
+                vllm_config, self.engine_id, kv_cache_config
+            )
+        elif role == KVConnectorRole.WORKER:
+            self.connector_worker = PegaNixlPushConnectorWorker(
+                vllm_config, self.engine_id, kv_cache_config
+            )
+        else:
+            raise ValueError(f"Unsupported KVConnectorRole: {role}")
 
 
 # PegaFlow's packaged NIXL connector defaults to the WRITE-based P/D path.

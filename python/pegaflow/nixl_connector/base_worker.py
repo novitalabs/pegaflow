@@ -235,11 +235,15 @@ class NixlBaseConnectorWorker:
         engine_id: str,
         kv_cache_config: "KVCacheConfig",
     ):
+        self._use_pega_rdma_transport = bool(
+            getattr(self, "_use_pega_rdma_transport", False)
+        )
         nixl_wrapper_cls = NixlWrapper
-        if nixl_wrapper_cls is None:
-            logger.error("NIXL is not available")
-            raise RuntimeError("NIXL is not available")
-        logger.info("Initializing NIXL wrapper")
+        if not self._use_pega_rdma_transport:
+            if nixl_wrapper_cls is None:
+                logger.error("NIXL is not available")
+                raise RuntimeError("NIXL is not available")
+            logger.info("Initializing NIXL wrapper")
         logger.info("Initializing NIXL worker %s", engine_id)
 
         # Config.
@@ -328,7 +332,11 @@ class NixlBaseConnectorWorker:
                 else nixl_agent_config(num_threads=num_threads, capture_telemetry=True)
             )
 
-        self.nixl_wrapper = nixl_wrapper_cls(str(uuid.uuid4()), config)
+        self.nixl_wrapper = (
+            None
+            if self._use_pega_rdma_transport
+            else nixl_wrapper_cls(str(uuid.uuid4()), config)
+        )
         # Map of engine_id -> {rank0: agent_name0, rank1: agent_name1..}.
         self._remote_agents: dict[EngineId, dict[int, str]] = defaultdict(dict)
 

@@ -2,45 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """NIXL KV-cache transfer connector (disaggregated prefill / decode)."""
 
-from pegaflow.nixl_connector.base_scheduler import (
-    NixlBaseConnectorScheduler,
-)
-from pegaflow.nixl_connector.base_worker import (
-    NixlBaseConnectorWorker,
-)
-from pegaflow.nixl_connector.connector import (
-    NixlBaseConnector,
-    NixlConnector,
-    PegaNixlConnector,
-    NixlPullConnector,
-    NixlPushConnector,
-)
-from pegaflow.nixl_connector.metadata import (
-    NixlAgentMetadata,
-    NixlConnectorMetadata,
-    NixlHandshakePayload,
-)
-from pegaflow.nixl_connector.pull_scheduler import (
-    NixlPullConnectorScheduler,
-)
-from pegaflow.nixl_connector.pull_worker import (
-    NixlPullConnectorWorker,
-)
-from pegaflow.nixl_connector.push_scheduler import (
-    NixlPushConnectorScheduler,
-)
-from pegaflow.nixl_connector.push_worker import (
-    NixlPushConnectorWorker,
-)
-from pegaflow.nixl_connector.scheduler import (
-    NixlConnectorScheduler,
-)
-from pegaflow.nixl_connector.stats import (
-    NixlKVConnectorStats,
-)
-from pegaflow.nixl_connector.worker import (
-    NixlConnectorWorker,
-)
+from typing import Any
 
 __all__ = [
     "NixlAgentMetadata",
@@ -61,3 +23,34 @@ __all__ = [
     "NixlPushConnectorScheduler",
     "NixlPushConnectorWorker",
 ]
+
+_EXPORT_MODULES = {
+    "NixlAgentMetadata": "pegaflow.nixl_connector.metadata",
+    "NixlBaseConnector": "pegaflow.nixl_connector.connector",
+    "NixlBaseConnectorScheduler": "pegaflow.nixl_connector.base_scheduler",
+    "NixlBaseConnectorWorker": "pegaflow.nixl_connector.base_worker",
+    "NixlConnector": "pegaflow.nixl_connector.connector",
+    "NixlConnectorMetadata": "pegaflow.nixl_connector.metadata",
+    "NixlConnectorScheduler": "pegaflow.nixl_connector.scheduler",
+    "NixlConnectorWorker": "pegaflow.nixl_connector.worker",
+    "NixlHandshakePayload": "pegaflow.nixl_connector.metadata",
+    "NixlKVConnectorStats": "pegaflow.nixl_connector.stats",
+    "PegaNixlConnector": "pegaflow.nixl_connector.connector",
+    "NixlPullConnector": "pegaflow.nixl_connector.connector",
+    "NixlPullConnectorScheduler": "pegaflow.nixl_connector.pull_scheduler",
+    "NixlPullConnectorWorker": "pegaflow.nixl_connector.pull_worker",
+    "NixlPushConnector": "pegaflow.nixl_connector.connector",
+    "NixlPushConnectorScheduler": "pegaflow.nixl_connector.push_scheduler",
+    "NixlPushConnectorWorker": "pegaflow.nixl_connector.push_worker",
+}
+
+
+def __getattr__(name: str) -> Any:
+    module_name = _EXPORT_MODULES.get(name)
+    if module_name is None:
+        raise AttributeError(name)
+    import importlib
+
+    value = getattr(importlib.import_module(module_name), name)
+    globals()[name] = value
+    return value

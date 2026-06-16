@@ -21,6 +21,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from pegaflow.nixl_connector.metadata import (
     GET_META_MSG,
+    PUSH_REG_NOTIF_PREFIX,
     HeartbeatInfo,
     NixlConnectorMetadata,
     NixlHandshakePayload,
@@ -100,6 +101,8 @@ class NixlBaseConnectorScheduler:
         # Background thread for handling new handshake requests.
         self._nixl_handshake_listener_t: threading.Thread | None = None
         self._stop_event = threading.Event()
+        self._incoming_push_registrations: dict[ReqId, dict[str, Any]] = {}
+        self._incoming_push_registrations_lock = threading.Lock()
 
         # Requests that need to start recv/send.
         # New requests are added by update_state_after_alloc in
@@ -274,6 +277,8 @@ class NixlBaseConnectorScheduler:
                 target=self._nixl_handshake_listener,
                 args=(
                     encoded_data,
+                    self._incoming_push_registrations,
+                    self._incoming_push_registrations_lock,
                     ready_event,
                     self._stop_event,
                     self.side_channel_host,
@@ -288,6 +293,8 @@ class NixlBaseConnectorScheduler:
     @staticmethod
     def _nixl_handshake_listener(
         encoded_data: dict[int, Any],
+        incoming_push_registrations: dict[ReqId, dict[str, Any]],
+        incoming_push_registrations_lock: threading.Lock,
         ready_event: threading.Event,
         stop_event: threading.Event,
         host: str,
@@ -310,15 +317,33 @@ class NixlBaseConnectorScheduler:
                     if stop_event.is_set():
                         break
                     continue
-                # Decode the message which contains (GET_META_MSG, rank)
-                msg, target_tp_rank = msgspec.msgpack.decode(msg)
+                # Decode the message which contains either:
+                #   - (GET_META_MSG, rank)
+                #   - (PUSH_REG_NOTIF_PREFIX, prefixed msgpack payload)
+                msg, payload = msgspec.msgpack.decode(msg)
                 logger.debug(
-                    "Received message for tp rank %s",
-                    target_tp_rank,
+                    "Received side-channel message %s",
+                    msg,
                 )
-                if msg != GET_META_MSG:
+                if msg == GET_META_MSG:
+                    sock.send_multipart((identity, b"", encoded_data[payload]))
+                    continue
+                if msg == PUSH_REG_NOTIF_PREFIX:
+                    try:
+                        reg_data = msgspec.msgpack.decode(
+                            payload[len(PUSH_REG_NOTIF_PREFIX) :]
+                        )
+                        req_id = reg_data["request_id"]
+                        with incoming_push_registrations_lock:
+                            incoming_push_registrations[str(req_id)] = reg_data
+                        sock.send_multipart((identity, b"", b"OK"))
+                    except Exception:
+                        logger.exception("Failed to receive Pega NIXL PUSH_REG")
+                        sock.send_multipart((identity, b"", b"ERR"))
+                    continue
+                else:
                     logger.warning("Connection listener got unexpected message %s", msg)
-                sock.send_multipart((identity, b"", encoded_data[target_tp_rank]))
+                    sock.send_multipart((identity, b"", b"ERR"))
 
     def _mamba_prefill_token_count(self, num_prompt_tokens: int) -> int:
         """D-side only. Returns N-1 for Mamba models since the decoder
@@ -416,6 +441,13 @@ class NixlBaseConnectorScheduler:
             if now - self._last_heartbeat_time >= self._heartbeat_interval:
                 self._last_heartbeat_time = now
                 meta.heartbeat_by_engine = self._heartbeat_by_engine
+
+        with self._incoming_push_registrations_lock:
+            if self._incoming_push_registrations:
+                meta.push_incoming_registrations = dict(
+                    self._incoming_push_registrations
+                )
+                self._incoming_push_registrations.clear()
 
         # Clear the list once workers start the transfers
         self._reqs_need_recv.clear()
