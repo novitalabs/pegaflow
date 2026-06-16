@@ -170,8 +170,10 @@ impl TransferEngine {
 
     /// Submit a batch of RDMA READ or WRITE operations against a connected peer.
     ///
-    /// Ops are NUMA-aware distributed across NICs. Returns one receiver per
-    /// active NIC; each yields the bytes transferred on that NIC.
+    /// Ops are routed NUMA-aware, and each op is striped across all NICs of its
+    /// NUMA node (and their QPs), so a single large op saturates the whole group
+    /// rather than one NIC. Returns one receiver per submitted (NIC, QP) batch;
+    /// await all of them. The caller need not pre-shard to get NIC parallelism.
     ///
     /// The connection must be established via `get_or_prepare` +
     /// `complete_handshake` before calling this method.
