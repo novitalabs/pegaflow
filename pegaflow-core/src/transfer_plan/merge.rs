@@ -163,6 +163,9 @@ fn assign_chunks(
 
     intervals.sort_by_key(|(start, _, _)| *start);
 
+    // Sorted by start, so a same-NUMA interval whose start touches or overlaps
+    // the previous one (`start <= last.end`, which includes the adjacent
+    // `start == last.end` case) extends it. One pass coalesces fully.
     let mut merged: Vec<Interval> = Vec::new();
     for (start, end, numa) in intervals {
         if let Some(last) = merged.last_mut()
@@ -179,19 +182,7 @@ fn assign_chunks(
         });
     }
 
-    let mut coalesced: Vec<Interval> = Vec::new();
-    for interval in merged {
-        if let Some(last) = coalesced.last_mut()
-            && last.numa_node == interval.numa_node
-            && last.end == interval.start
-        {
-            last.end = interval.end;
-        } else {
-            coalesced.push(interval);
-        }
-    }
-
-    let remote_chunks: Vec<RemoteChunk> = coalesced
+    let remote_chunks: Vec<RemoteChunk> = merged
         .iter()
         .map(|iv| RemoteChunk {
             base_ptr: iv.start,
@@ -266,7 +257,6 @@ mod tests {
             })
             .collect();
         let slot_schemas = vec![SlotSchema {
-            numa_node: 0,
             segments: smallvec![SegmentSchema {
                 bytes,
                 block_stride: stride,
@@ -313,7 +303,6 @@ mod tests {
             })
             .collect();
         let slot_schemas = vec![SlotSchema {
-            numa_node: 0,
             segments: smallvec![SegmentSchema {
                 bytes,
                 block_stride: stride,

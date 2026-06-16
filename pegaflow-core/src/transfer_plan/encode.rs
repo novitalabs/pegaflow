@@ -12,7 +12,7 @@ use super::view::block_views_from_found;
 pub(crate) fn encode_transfer_plan(
     found_blocks: &[(BlockKey, Arc<SealedBlock>)],
 ) -> Result<TransferPlan, TransferPlanError> {
-    let views = block_views_from_found(found_blocks);
+    let views = block_views_from_found(found_blocks)?;
     if views.is_empty() {
         return Ok(TransferPlan {
             slot_schemas: vec![],
@@ -22,7 +22,7 @@ pub(crate) fn encode_transfer_plan(
         });
     }
 
-    let slot_schemas = derive_slot_schemas(&views);
+    let slot_schemas = derive_slot_schemas(&views)?;
     let (remote_chunks, placements) = build_transfer_geometry(&views, &slot_schemas);
     let block_hashes = views.into_iter().map(|v| v.hash).collect();
 

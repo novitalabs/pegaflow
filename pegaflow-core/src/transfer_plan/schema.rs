@@ -22,17 +22,36 @@ impl fmt::Display for TransferPlanError {
 
 impl std::error::Error for TransferPlanError {}
 
-pub(crate) fn derive_slot_schemas(views: &[BlockView]) -> Vec<SlotSchema> {
+pub(crate) fn derive_slot_schemas(
+    views: &[BlockView],
+) -> Result<Vec<SlotSchema>, TransferPlanError> {
     if views.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let slot_count = views[0].slots.len();
     let segment_count = views[0].slots[0].segments.len();
-    assert!(
-        (1..=2).contains(&segment_count),
-        "invalid segment count {segment_count}"
-    );
+    if !(1..=2).contains(&segment_count) {
+        return Err(TransferPlanError::new(format!(
+            "invalid segment count {segment_count}"
+        )));
+    }
+
+    // Validate every block shares block 0's segment geometry up front, so the
+    // per-segment indexing below cannot go out of bounds. A mismatch means a
+    // namespace shared by incompatible KV layouts; the load path treats that as
+    // a recoverable error, so encode returns Err rather than panicking.
+    // (Slot-count consistency is already enforced by `block_views_from_found`.)
+    for (block_idx, view) in views.iter().enumerate() {
+        for (slot_idx, slot) in view.slots.iter().enumerate() {
+            if slot.segments.len() != segment_count {
+                return Err(TransferPlanError::new(format!(
+                    "block {block_idx} slot {slot_idx} segment count {} != {segment_count}",
+                    slot.segments.len()
+                )));
+            }
+        }
+    }
 
     let mut schemas = Vec::with_capacity(slot_count);
     for slot_idx in 0..slot_count {
@@ -40,21 +59,21 @@ pub(crate) fn derive_slot_schemas(views: &[BlockView]) -> Vec<SlotSchema> {
 
         for segment_idx in 0..segment_count {
             let expected_len = views[0].slots[slot_idx].segments[segment_idx].len;
-            let mut stride = expected_len;
+            for (block_idx, view) in views.iter().enumerate() {
+                let seg_len = view.slots[slot_idx].segments[segment_idx].len;
+                if seg_len != expected_len {
+                    return Err(TransferPlanError::new(format!(
+                        "block {block_idx} slot {slot_idx} segment {segment_idx} len \
+                         {seg_len} != {expected_len}"
+                    )));
+                }
+            }
 
+            let mut stride = expected_len;
             let ptrs: Vec<u64> = views
                 .iter()
                 .map(|view| view.slots[slot_idx].segments[segment_idx].ptr)
                 .collect();
-
-            for (block_idx, view) in views.iter().enumerate() {
-                let seg = &view.slots[slot_idx].segments[segment_idx];
-                assert_eq!(
-                    seg.len, expected_len,
-                    "block {block_idx} slot {slot_idx} segment {segment_idx} len mismatch"
-                );
-            }
-
             for window in ptrs.windows(2) {
                 if window[1] > window[0] {
                     let delta = (window[1] - window[0]) as usize;
@@ -70,25 +89,10 @@ pub(crate) fn derive_slot_schemas(views: &[BlockView]) -> Vec<SlotSchema> {
             });
         }
 
-        for view in views.iter().skip(1) {
-            assert_eq!(
-                view.slots.len(),
-                slot_count,
-                "inconsistent slot count across blocks"
-            );
-            assert_eq!(
-                view.slots[slot_idx].segments.len(),
-                segment_count,
-                "slot {slot_idx} segment count mismatch"
-            );
-        }
-
-        // NUMA affinity lives on each [`RemoteChunk`]; this field is wire-compat only.
         schemas.push(SlotSchema {
-            numa_node: views[0].slots[slot_idx].numa.0,
             segments: segment_schemas,
         });
     }
 
-    schemas
+    Ok(schemas)
 }

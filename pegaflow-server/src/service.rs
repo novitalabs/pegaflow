@@ -744,8 +744,17 @@ impl Engine for GrpcEngineService {
                 &req.requester_id,
             );
 
-            let transfer_plan = pegaflow_core::encode_transfer_plan_bytes(&found_blocks)
-                .map_err(Status::invalid_argument)?;
+            // The engine already took the transfer lock on `found_blocks`. If
+            // encoding fails, the requester never learns the session id, so it
+            // can never release it — drop the lock here instead of leaking it
+            // until the lock GC sweep.
+            let transfer_plan = match pegaflow_core::encode_transfer_plan_bytes(&found_blocks) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    self.engine.release_transfer_lock(&session_id);
+                    return Err(Status::invalid_argument(e));
+                }
+            };
 
             Ok(Response::new(QueryBlocksForTransferResponse {
                 status: Some(Self::build_simple_response()),

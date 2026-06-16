@@ -29,11 +29,9 @@ impl std::error::Error for WireError {}
 
 /// One slot (layer): shared segment shape across every block in the plan.
 ///
-/// NUMA placement is expressed on each [`RemoteChunk`]; [`Self::numa_node`] is
-/// retained for wire compatibility and mirrors block 0 only.
+/// NUMA placement is expressed per [`RemoteChunk`], not per slot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotSchema {
-    pub numa_node: u32,
     pub segments: SmallVec<[SegmentSchema; 2]>,
 }
 
@@ -227,7 +225,6 @@ mod tests {
     fn sample_plan() -> TransferPlan {
         TransferPlan {
             slot_schemas: vec![SlotSchema {
-                numa_node: 0,
                 segments: smallvec![SegmentSchema {
                     bytes: 64,
                     block_stride: 128,
