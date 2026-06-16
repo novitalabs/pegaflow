@@ -281,12 +281,17 @@ mod tests {
         let blocks_per_session = 5;
         let num_sessions = 100;
 
+        // The manager only refcounts opaque Arc<SealedBlock> handles, so every
+        // entry shares one block. Allocating a distinct block per entry would
+        // mean num_sessions * blocks_per_session real cudaHostAlloc pinned pools
+        // (each mapped allocation reserves ~100MB), OOM-killing the test box.
+        let block = Arc::new(SealedBlock::test_dummy());
+
         for i in 0..num_sessions {
             let blocks: Vec<(BlockKey, Arc<SealedBlock>)> = (0..blocks_per_session)
                 .map(|j| {
                     let key = BlockKey::new("ns".into(), vec![i as u8, j as u8]);
-                    let block = Arc::new(SealedBlock::test_dummy());
-                    (key, block)
+                    (key, Arc::clone(&block))
                 })
                 .collect();
             let requester = format!("node-{}", i);

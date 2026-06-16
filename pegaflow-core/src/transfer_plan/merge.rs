@@ -1,10 +1,9 @@
 use pegaflow_transfer_wire::{RemoteChunk, SegmentPlacement, SlotSchema};
 
-use super::view::SegmentPoint;
+use super::view::{BlockMatrix, SegmentPoint};
 
 type TransferGeometry = (Vec<RemoteChunk>, Vec<SegmentPlacement>);
 type PtrInterval = (u64, u64, u32);
-type PartitionOutput = (Vec<PendingRun>, Vec<PendingSingle>, Vec<PtrInterval>);
 
 #[derive(Debug, Clone, Copy)]
 struct Interval {
@@ -30,73 +29,86 @@ struct PendingSingle {
     ptr: u64,
 }
 
+/// Accumulates the per-column partition results across every `(slot, segment)`
+/// before they are resolved into coalesced chunks + placements.
+#[derive(Default)]
+struct PartitionSink {
+    runs: Vec<PendingRun>,
+    singles: Vec<PendingSingle>,
+    intervals: Vec<PtrInterval>,
+}
+
 pub(crate) fn build_transfer_geometry(
-    views: &[super::view::BlockView],
+    matrix: &BlockMatrix,
     slot_schemas: &[SlotSchema],
 ) -> TransferGeometry {
-    if views.is_empty() {
+    let block_count = matrix.block_count();
+    if block_count == 0 {
         return (vec![], vec![]);
     }
 
-    let mut pending_runs = Vec::new();
-    let mut pending_singles = Vec::new();
-    let mut intervals = Vec::new();
+    let mut sink = PartitionSink::default();
+    // One scratch buffer reused across every (slot, segment) column instead of
+    // allocating a fresh point vector per column.
+    let mut points: Vec<SegmentPoint> = Vec::with_capacity(block_count);
 
     for (slot_idx, slot_schema) in slot_schemas.iter().enumerate() {
+        let numas = matrix.numas(slot_idx);
         for (segment_idx, seg_schema) in slot_schema.segments.iter().enumerate() {
-            let points: Vec<SegmentPoint> = views
-                .iter()
-                .enumerate()
-                .map(|(block_idx, view)| {
-                    view.segment_point(block_idx as u32, slot_idx, segment_idx)
-                })
-                .collect();
+            let ptrs = matrix.seg_ptrs(slot_idx, segment_idx);
+            let lens = matrix.seg_lens(slot_idx, segment_idx);
+            points.clear();
+            for block_idx in 0..block_count {
+                points.push(SegmentPoint {
+                    block_idx: block_idx as u32,
+                    ptr: ptrs[block_idx],
+                    len: lens[block_idx],
+                    numa_node: numas[block_idx],
+                });
+            }
 
-            let (runs, singles, seg_intervals) = partition_points(
+            partition_points(
                 slot_idx as u32,
                 segment_idx as u32,
-                points,
+                &mut points,
                 seg_schema.block_stride,
                 seg_schema.bytes,
+                &mut sink,
             );
-            pending_runs.extend(runs);
-            pending_singles.extend(singles);
-            intervals.extend(seg_intervals);
         }
     }
 
-    assign_chunks(intervals, pending_runs, pending_singles)
+    assign_chunks(sink)
 }
 
 fn partition_points(
     slot_idx: u32,
     segment_idx: u32,
-    points: Vec<SegmentPoint>,
+    points: &mut [SegmentPoint],
     expected_stride: usize,
     expected_len: usize,
-) -> PartitionOutput {
+    sink: &mut PartitionSink,
+) {
     if points.is_empty() {
-        return (vec![], vec![], vec![]);
+        return;
     }
 
-    let mut sorted = points;
+    let sorted = points;
     sorted.sort_by_key(|p| p.ptr);
 
-    let mut runs = Vec::new();
-    let mut singles = Vec::new();
-    let mut intervals = Vec::new();
     let mut i = 0;
 
     while i < sorted.len() {
         let start = sorted[i];
         if start.len != expected_len {
-            singles.push(PendingSingle {
+            sink.singles.push(PendingSingle {
                 block_idx: start.block_idx,
                 slot_idx,
                 segment_idx,
                 ptr: start.ptr,
             });
-            intervals.push((start.ptr, start.ptr + start.len as u64, start.numa_node));
+            sink.intervals
+                .push((start.ptr, start.ptr + start.len as u64, start.numa_node));
             i += 1;
             continue;
         }
@@ -128,35 +140,35 @@ fn partition_points(
         if count >= 2 {
             let end =
                 base_ptr + u64::from(count - 1) * expected_stride as u64 + expected_len as u64;
-            runs.push(PendingRun {
+            sink.runs.push(PendingRun {
                 slot_idx,
                 segment_idx,
                 block_start,
                 block_count: count,
                 base_ptr,
             });
-            intervals.push((base_ptr, end, run_numa));
+            sink.intervals.push((base_ptr, end, run_numa));
         } else {
-            singles.push(PendingSingle {
+            sink.singles.push(PendingSingle {
                 block_idx: start.block_idx,
                 slot_idx,
                 segment_idx,
                 ptr: start.ptr,
             });
-            intervals.push((start.ptr, start.ptr + start.len as u64, start.numa_node));
+            sink.intervals
+                .push((start.ptr, start.ptr + start.len as u64, start.numa_node));
         }
 
         i = j;
     }
-
-    (runs, singles, intervals)
 }
 
-fn assign_chunks(
-    mut intervals: Vec<PtrInterval>,
-    pending_runs: Vec<PendingRun>,
-    pending_singles: Vec<PendingSingle>,
-) -> TransferGeometry {
+fn assign_chunks(sink: PartitionSink) -> TransferGeometry {
+    let PartitionSink {
+        runs: pending_runs,
+        singles: pending_singles,
+        mut intervals,
+    } = sink;
     if intervals.is_empty() {
         return (vec![], vec![]);
     }
@@ -236,39 +248,32 @@ mod tests {
     use pegaflow_transfer_wire::SegmentSchema;
 
     use super::*;
-    use crate::transfer_plan::view::{BlockView, SegmentView, SlotView};
-    use pegaflow_common::NumaNode;
 
     use smallvec::smallvec;
 
-    fn contiguous_views(stride: usize, count: usize) -> (Vec<BlockView>, Vec<SlotSchema>) {
-        let base = 0x5000u64;
-        let bytes = 64usize;
-        let views: Vec<BlockView> = (0..count)
-            .map(|i| BlockView {
-                hash: vec![i as u8],
-                slots: vec![SlotView {
-                    numa: NumaNode(0),
-                    segments: vec![SegmentView {
-                        ptr: base + (i as u64) * stride as u64,
-                        len: bytes,
-                    }],
-                }],
-            })
+    const BASE: u64 = 0x5000;
+    const BYTES: usize = 64;
+
+    /// One slot, one segment, `count` blocks at `BASE + i*stride`, all NUMA 0.
+    fn contiguous_matrix(stride: usize, count: usize) -> (BlockMatrix, Vec<SlotSchema>) {
+        let seg_ptr: Vec<u64> = (0..count)
+            .map(|i| BASE + (i as u64) * stride as u64)
             .collect();
+        let matrix =
+            BlockMatrix::from_columns(count, 1, 1, seg_ptr, vec![BYTES; count], vec![0; count]);
         let slot_schemas = vec![SlotSchema {
             segments: smallvec![SegmentSchema {
-                bytes,
+                bytes: BYTES,
                 block_stride: stride,
             }],
         }];
-        (views, slot_schemas)
+        (matrix, slot_schemas)
     }
 
     #[test]
     fn batch_blocks_form_one_placement() {
-        let (views, slot_schemas) = contiguous_views(128, 4);
-        let (remote_chunks, placements) = build_transfer_geometry(&views, &slot_schemas);
+        let (matrix, slot_schemas) = contiguous_matrix(128, 4);
+        let (remote_chunks, placements) = build_transfer_geometry(&matrix, &slot_schemas);
         assert_eq!(remote_chunks.len(), 1);
         assert_eq!(placements.len(), 1);
         assert_eq!(placements[0].block_count, 4);
@@ -276,9 +281,18 @@ mod tests {
 
     #[test]
     fn broken_stride_produces_singleton_placement() {
-        let (mut views, slot_schemas) = contiguous_views(128, 3);
-        views[2].slots[0].segments[0].ptr = 0x8000;
-        let (_, placements) = build_transfer_geometry(&views, &slot_schemas);
+        let stride = 128usize;
+        let mut seg_ptr: Vec<u64> = (0..3).map(|i| BASE + (i as u64) * stride as u64).collect();
+        seg_ptr[2] = 0x8000;
+        let matrix = BlockMatrix::from_columns(3, 1, 1, seg_ptr, vec![BYTES; 3], vec![0; 3]);
+        let slot_schemas = vec![SlotSchema {
+            segments: smallvec![SegmentSchema {
+                bytes: BYTES,
+                block_stride: stride,
+            }],
+        }];
+
+        let (_, placements) = build_transfer_geometry(&matrix, &slot_schemas);
         assert_eq!(placements.len(), 2);
         assert_eq!(placements[0].block_count, 2);
         assert_eq!(placements[1].block_count, 1);
@@ -287,29 +301,18 @@ mod tests {
 
     #[test]
     fn mixed_numa_splits_contiguous_run_into_separate_chunks() {
-        let base = 0x5000u64;
-        let bytes = 64usize;
         let stride = 128usize;
-        let views: Vec<BlockView> = (0..4)
-            .map(|i| BlockView {
-                hash: vec![i as u8],
-                slots: vec![SlotView {
-                    numa: NumaNode(if i < 2 { 0 } else { 1 }),
-                    segments: vec![SegmentView {
-                        ptr: base + (i as u64) * stride as u64,
-                        len: bytes,
-                    }],
-                }],
-            })
-            .collect();
+        let seg_ptr: Vec<u64> = (0..4).map(|i| BASE + (i as u64) * stride as u64).collect();
+        let numa: Vec<u32> = (0..4).map(|i| if i < 2 { 0 } else { 1 }).collect();
+        let matrix = BlockMatrix::from_columns(4, 1, 1, seg_ptr, vec![BYTES; 4], numa);
         let slot_schemas = vec![SlotSchema {
             segments: smallvec![SegmentSchema {
-                bytes,
+                bytes: BYTES,
                 block_stride: stride,
             }],
         }];
 
-        let (remote_chunks, placements) = build_transfer_geometry(&views, &slot_schemas);
+        let (remote_chunks, placements) = build_transfer_geometry(&matrix, &slot_schemas);
         assert_eq!(remote_chunks.len(), 2);
         assert_eq!(remote_chunks[0].numa_node, 0);
         assert_eq!(remote_chunks[1].numa_node, 1);

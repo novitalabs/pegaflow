@@ -1,5 +1,7 @@
 //! Build a compact [`TransferPlan`] from in-memory sealed blocks.
 
+#[cfg(all(feature = "bench", feature = "rdma"))]
+pub mod bench_support;
 mod encode;
 #[cfg(feature = "rdma")]
 mod materialize;

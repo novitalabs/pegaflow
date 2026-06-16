@@ -110,6 +110,11 @@ fn slab_ptr_at(slab: &LocalSlab, offset: usize) -> Result<NonNull<u8>, String> {
     NonNull::new(ptr).ok_or_else(|| "computed slab pointer is null".to_string())
 }
 
+/// Resolve a chunk-relative offset to its local host pointer and owning slab.
+///
+/// Only the test transfer simulation needs this now; the production rebuild
+/// path resolves slabs once per chunk (see `rebuild::resolve_chunk_locs`).
+#[cfg(test)]
 pub(crate) fn chunk_ptr_at(
     rebuild: &RebuildContext,
     plan: &TransferPlan,

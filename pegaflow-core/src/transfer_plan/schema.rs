@@ -3,7 +3,7 @@ use std::fmt;
 use pegaflow_transfer_wire::{SegmentSchema, SlotSchema};
 use smallvec::SmallVec;
 
-use super::view::BlockView;
+use super::view::BlockMatrix;
 
 #[derive(Debug)]
 pub(crate) struct TransferPlanError(String);
@@ -23,34 +23,26 @@ impl fmt::Display for TransferPlanError {
 impl std::error::Error for TransferPlanError {}
 
 pub(crate) fn derive_slot_schemas(
-    views: &[BlockView],
+    matrix: &BlockMatrix,
 ) -> Result<Vec<SlotSchema>, TransferPlanError> {
-    if views.is_empty() {
+    // No blocks => no schemas. Guard here (not just at the caller) so the
+    // per-column `lens[0]` below is self-evidently in bounds: an empty matrix
+    // has empty columns.
+    let slot_count = matrix.slot_count();
+    if slot_count == 0 || matrix.block_count() == 0 {
         return Ok(Vec::new());
     }
 
-    let slot_count = views[0].slots.len();
-    let segment_count = views[0].slots[0].segments.len();
+    // `block_matrix_from_found` already enforced that every block shares block
+    // 0's slot and segment counts; here we only reject a globally invalid
+    // segment count (the wire format coalesces at most K/V). A mismatch means a
+    // namespace shared by incompatible KV layouts; the load path treats that as
+    // a recoverable error, so encode returns Err rather than panicking.
+    let segment_count = matrix.segment_count();
     if !(1..=2).contains(&segment_count) {
         return Err(TransferPlanError::new(format!(
             "invalid segment count {segment_count}"
         )));
-    }
-
-    // Validate every block shares block 0's segment geometry up front, so the
-    // per-segment indexing below cannot go out of bounds. A mismatch means a
-    // namespace shared by incompatible KV layouts; the load path treats that as
-    // a recoverable error, so encode returns Err rather than panicking.
-    // (Slot-count consistency is already enforced by `block_views_from_found`.)
-    for (block_idx, view) in views.iter().enumerate() {
-        for (slot_idx, slot) in view.slots.iter().enumerate() {
-            if slot.segments.len() != segment_count {
-                return Err(TransferPlanError::new(format!(
-                    "block {block_idx} slot {slot_idx} segment count {} != {segment_count}",
-                    slot.segments.len()
-                )));
-            }
-        }
     }
 
     let mut schemas = Vec::with_capacity(slot_count);
@@ -58,29 +50,32 @@ pub(crate) fn derive_slot_schemas(
         let mut segment_schemas = SmallVec::<[SegmentSchema; 2]>::new();
 
         for segment_idx in 0..segment_count {
-            let expected_len = views[0].slots[slot_idx].segments[segment_idx].len;
-            for (block_idx, view) in views.iter().enumerate() {
-                let seg_len = view.slots[slot_idx].segments[segment_idx].len;
-                if seg_len != expected_len {
+            let ptrs = matrix.seg_ptrs(slot_idx, segment_idx);
+            let lens = matrix.seg_lens(slot_idx, segment_idx);
+            let expected_len = lens[0];
+
+            // Single streaming pass over the block-ordered column: validate
+            // length uniformity and derive the block stride (largest
+            // consecutive-block pointer delta that is at least one segment
+            // wide).
+            let mut stride = expected_len;
+            let mut prev_ptr: Option<u64> = None;
+            for (block_idx, (&ptr, &len)) in ptrs.iter().zip(lens).enumerate() {
+                if len != expected_len {
                     return Err(TransferPlanError::new(format!(
                         "block {block_idx} slot {slot_idx} segment {segment_idx} len \
-                         {seg_len} != {expected_len}"
+                         {len} != {expected_len}"
                     )));
                 }
-            }
-
-            let mut stride = expected_len;
-            let ptrs: Vec<u64> = views
-                .iter()
-                .map(|view| view.slots[slot_idx].segments[segment_idx].ptr)
-                .collect();
-            for window in ptrs.windows(2) {
-                if window[1] > window[0] {
-                    let delta = (window[1] - window[0]) as usize;
+                if let Some(prev) = prev_ptr
+                    && ptr > prev
+                {
+                    let delta = (ptr - prev) as usize;
                     if delta >= expected_len {
                         stride = delta;
                     }
                 }
+                prev_ptr = Some(ptr);
             }
 
             segment_schemas.push(SegmentSchema {
