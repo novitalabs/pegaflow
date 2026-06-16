@@ -38,40 +38,9 @@ mod tests {
         Vec<(BlockKey, Arc<SealedBlock>)>,
         Arc<crate::pinned_pool::PinnedAllocation>,
     ) {
-        let allocator = Arc::new(PinnedAllocator::new_global(
-            64 * 1024 * 1024,
-            1,
-            false,
-            false,
-            None,
-        ));
-        let total = stride
-            .checked_mul(count)
-            .and_then(|n| NonZeroU64::new(n as u64))
-            .expect("allocation size");
-        let slab = allocator
-            .allocate(total, NumaNode::UNKNOWN)
-            .expect("slab allocation");
-
-        let mut found = Vec::with_capacity(count);
-        for i in 0..count {
-            let offset = i * stride;
-            let host = slab.mapped_ptr().add(offset).host();
-            for b in 0..seg_bytes {
-                unsafe {
-                    *host.as_ptr().add(b) = i as u8;
-                }
-            }
-            let segment = Segment::new(host, seg_bytes, Arc::clone(&slab));
-            let key = BlockKey::new("bench-ns".to_string(), vec![i as u8]);
-            found.push((
-                key,
-                Arc::new(SealedBlock::from_slots(vec![RawBlock::single_segment(
-                    segment,
-                )])),
-            ));
-        }
-        (found, slab)
+        // Blocks that flow through encode → transfer → rebuild must carry a known
+        // NUMA (rebuild rejects UNKNOWN), so default every fixture block to NUMA 0.
+        make_stride_blocks_with_numa(count, stride, seg_bytes, |_| NumaNode(0))
     }
 
     fn test_allocate_fn() -> AllocateFn {
@@ -163,6 +132,73 @@ mod tests {
         assert!(wire.len() < block_count * 64, "wire bytes={}", wire.len());
     }
 
+    fn make_stride_blocks_with_numa(
+        count: usize,
+        stride: usize,
+        seg_bytes: usize,
+        numa_for_block: impl Fn(usize) -> NumaNode,
+    ) -> (
+        Vec<(BlockKey, Arc<SealedBlock>)>,
+        Arc<crate::pinned_pool::PinnedAllocation>,
+    ) {
+        let allocator = Arc::new(PinnedAllocator::new_global(
+            64 * 1024 * 1024,
+            1,
+            false,
+            false,
+            None,
+        ));
+        let total = stride
+            .checked_mul(count)
+            .and_then(|n| NonZeroU64::new(n as u64))
+            .expect("allocation size");
+        let slab = allocator
+            .allocate(total, NumaNode::UNKNOWN)
+            .expect("slab allocation");
+
+        let mut found = Vec::with_capacity(count);
+        for i in 0..count {
+            let offset = i * stride;
+            let host = slab.mapped_ptr().add(offset).host();
+            for b in 0..seg_bytes {
+                unsafe {
+                    *host.as_ptr().add(b) = i as u8;
+                }
+            }
+            let segment = Segment::new(host, seg_bytes, Arc::clone(&slab));
+            let key = BlockKey::new("bench-ns".to_string(), vec![i as u8]);
+            let sealed = match SealedBlock::from_ordered_slot_inserts(
+                vec![(0, RawBlock::single_segment(segment))],
+                1,
+                numa_for_block(i),
+            ) {
+                Ok(block) => block,
+                Err(_) => panic!("ordered slot inserts"),
+            };
+            found.push((key, Arc::new(sealed)));
+        }
+        (found, slab)
+    }
+
+    #[test]
+    fn rebuild_preserves_per_block_slot_numa_from_remote_chunks() {
+        let (found, _slab) =
+            make_stride_blocks_with_numa(4, 128, 64, |i| NumaNode(u32::from(i >= 2)));
+        let plan = encode_transfer_plan(&found).expect("encode");
+        assert_eq!(plan.remote_chunks.len(), 2);
+
+        let materialized =
+            materialize_transfer_plan(&plan, &test_allocate_fn()).expect("materialize");
+        simulate_transfer(&plan, &found, &materialized.rebuild);
+        let rebuilt =
+            rebuild_sealed_blocks(&plan, &materialized.rebuild, "bench-ns").expect("rebuild");
+
+        assert_eq!(rebuilt[0].1.slot_numas(), &[NumaNode(0)]);
+        assert_eq!(rebuilt[1].1.slot_numas(), &[NumaNode(0)]);
+        assert_eq!(rebuilt[2].1.slot_numas(), &[NumaNode(1)]);
+        assert_eq!(rebuilt[3].1.slot_numas(), &[NumaNode(1)]);
+    }
+
     #[test]
     fn materialize_allocates_one_slab_per_numa() {
         let (found, _) = make_stride_blocks(4, 128, 64);
@@ -174,5 +210,14 @@ mod tests {
             materialized.rebuild.slabs[0].length >= plan.total_remote_bytes() as usize,
             "slab should cover all chunk bytes on NUMA"
         );
+    }
+
+    #[test]
+    fn materialize_allocates_one_slab_per_distinct_chunk_numa() {
+        let (found, _) = make_stride_blocks_with_numa(4, 128, 64, |i| NumaNode(u32::from(i >= 2)));
+        let plan = encode_transfer_plan(&found).expect("encode");
+        let materialized =
+            materialize_transfer_plan(&plan, &test_allocate_fn()).expect("materialize");
+        assert_eq!(materialized.rebuild.slabs.len(), 2);
     }
 }

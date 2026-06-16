@@ -268,18 +268,33 @@ impl SealedBlock {
         &self.slot_numas
     }
 
-    /// Create from a vec of slots (for deserialization / prefetch rebuild)
+    /// Create from a vec of slots (for deserialization / prefetch rebuild).
+    ///
+    /// Leaves `slot_numas` empty on purpose: these blocks carry NUMA in
+    /// `SlotMeta`, and consumers fall back to `UNKNOWN` (see `ssd_cache`). The
+    /// strict per-slot NUMA path is [`Self::from_slots_with_numas`].
     pub(crate) fn from_slots(slots: Vec<RawBlock>) -> Self {
         assert!(
             !slots.is_empty(),
             "sealed block must have at least one slot"
         );
         let footprint = slots.iter().map(|s| s.memory_footprint()).sum();
-        Self {
-            slots: slots.into_boxed_slice(),
-            footprint,
-            slot_numas: Vec::new(),
-        }
+        Self::from_slots_with_footprint(slots.into_boxed_slice(), footprint, Vec::new())
+    }
+
+    /// Rebuild path: preserve per-slot NUMA (e.g. from transfer-plan chunk placement).
+    pub(crate) fn from_slots_with_numas(slots: Vec<RawBlock>, slot_numas: Vec<NumaNode>) -> Self {
+        assert!(
+            !slots.is_empty(),
+            "sealed block must have at least one slot"
+        );
+        assert_eq!(
+            slots.len(),
+            slot_numas.len(),
+            "slot_numas length must match slot count"
+        );
+        let footprint = slots.iter().map(|s| s.memory_footprint()).sum();
+        Self::from_slots_with_footprint(slots.into_boxed_slice(), footprint, slot_numas)
     }
 
     /// Create from slots with pre-computed footprint (internal use)

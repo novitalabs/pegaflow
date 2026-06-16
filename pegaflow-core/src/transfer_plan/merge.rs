@@ -43,7 +43,6 @@ pub(crate) fn build_transfer_geometry(
     let mut intervals = Vec::new();
 
     for (slot_idx, slot_schema) in slot_schemas.iter().enumerate() {
-        let numa_node = slot_schema.numa_node;
         for (segment_idx, seg_schema) in slot_schema.segments.iter().enumerate() {
             let points: Vec<SegmentPoint> = views
                 .iter()
@@ -56,7 +55,6 @@ pub(crate) fn build_transfer_geometry(
             let (runs, singles, seg_intervals) = partition_points(
                 slot_idx as u32,
                 segment_idx as u32,
-                numa_node,
                 points,
                 seg_schema.block_stride,
                 seg_schema.bytes,
@@ -73,7 +71,6 @@ pub(crate) fn build_transfer_geometry(
 fn partition_points(
     slot_idx: u32,
     segment_idx: u32,
-    numa_node: u32,
     points: Vec<SegmentPoint>,
     expected_stride: usize,
     expected_len: usize,
@@ -99,13 +96,14 @@ fn partition_points(
                 segment_idx,
                 ptr: start.ptr,
             });
-            intervals.push((start.ptr, start.ptr + start.len as u64, numa_node));
+            intervals.push((start.ptr, start.ptr + start.len as u64, start.numa_node));
             i += 1;
             continue;
         }
 
         let block_start = start.block_idx;
         let base_ptr = start.ptr;
+        let run_numa = start.numa_node;
         let mut count = 1u32;
         let mut j = i + 1;
 
@@ -116,7 +114,10 @@ fn partition_points(
                 break;
             }
             let expected_ptr = prev.ptr + expected_stride as u64;
-            if next.ptr == expected_ptr && next.block_idx == prev.block_idx + 1 {
+            if next.ptr == expected_ptr
+                && next.block_idx == prev.block_idx + 1
+                && next.numa_node == run_numa
+            {
                 count += 1;
                 j += 1;
             } else {
@@ -134,7 +135,7 @@ fn partition_points(
                 block_count: count,
                 base_ptr,
             });
-            intervals.push((base_ptr, end, numa_node));
+            intervals.push((base_ptr, end, run_numa));
         } else {
             singles.push(PendingSingle {
                 block_idx: start.block_idx,
@@ -142,7 +143,7 @@ fn partition_points(
                 segment_idx,
                 ptr: start.ptr,
             });
-            intervals.push((start.ptr, start.ptr + start.len as u64, numa_node));
+            intervals.push((start.ptr, start.ptr + start.len as u64, start.numa_node));
         }
 
         i = j;
@@ -291,6 +292,41 @@ mod tests {
         assert_eq!(placements.len(), 2);
         assert_eq!(placements[0].block_count, 2);
         assert_eq!(placements[1].block_count, 1);
+        assert_eq!(placements[1].block_start, 2);
+    }
+
+    #[test]
+    fn mixed_numa_splits_contiguous_run_into_separate_chunks() {
+        let base = 0x5000u64;
+        let bytes = 64usize;
+        let stride = 128usize;
+        let views: Vec<BlockView> = (0..4)
+            .map(|i| BlockView {
+                hash: vec![i as u8],
+                slots: vec![SlotView {
+                    numa: NumaNode(if i < 2 { 0 } else { 1 }),
+                    segments: vec![SegmentView {
+                        ptr: base + (i as u64) * stride as u64,
+                        len: bytes,
+                    }],
+                }],
+            })
+            .collect();
+        let slot_schemas = vec![SlotSchema {
+            numa_node: 0,
+            segments: smallvec![SegmentSchema {
+                bytes,
+                block_stride: stride,
+            }],
+        }];
+
+        let (remote_chunks, placements) = build_transfer_geometry(&views, &slot_schemas);
+        assert_eq!(remote_chunks.len(), 2);
+        assert_eq!(remote_chunks[0].numa_node, 0);
+        assert_eq!(remote_chunks[1].numa_node, 1);
+        assert_eq!(placements.len(), 2);
+        assert_eq!(placements[0].block_count, 2);
+        assert_eq!(placements[1].block_count, 2);
         assert_eq!(placements[1].block_start, 2);
     }
 }

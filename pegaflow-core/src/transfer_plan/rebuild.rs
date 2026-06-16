@@ -3,6 +3,8 @@ use std::sync::Arc;
 
 use pegaflow_transfer_wire::TransferPlan;
 
+use pegaflow_common::NumaNode;
+
 use crate::backing::PrefetchResult;
 use crate::block::{BlockKey, RawBlock, SealedBlock, Segment};
 use crate::pinned_pool::PinnedAllocation;
@@ -31,8 +33,20 @@ pub(crate) fn rebuild_sealed_blocks(
                 .collect()
         })
         .collect();
+    let mut block_slot_numas: Vec<Vec<Option<NumaNode>>> = (0..block_count)
+        .map(|_| (0..slot_count).map(|_| None).collect())
+        .collect();
 
     for placement in &plan.placements {
+        let chunk = &plan.remote_chunks[placement.chunk_idx as usize];
+        let placement_numa = NumaNode(chunk.numa_node);
+        if placement_numa.is_unknown() {
+            return Err(format!(
+                "remote chunk {} has unknown NUMA for rebuild",
+                placement.chunk_idx
+            ));
+        }
+
         let seg = &plan.slot_schemas[placement.slot_idx as usize].segments
             [placement.segment_idx as usize];
         let seg_len = seg.bytes;
@@ -45,6 +59,19 @@ pub(crate) fn rebuild_sealed_blocks(
                 chunk_ptr_at(rebuild, plan, placement.chunk_idx, offset_in_chunk)?;
             block_slots[block_idx][placement.slot_idx as usize][placement.segment_idx as usize] =
                 Some((ptr, seg_len, allocation));
+
+            match block_slot_numas[block_idx][placement.slot_idx as usize] {
+                Some(existing) if existing != placement_numa => {
+                    return Err(format!(
+                        "block {block_idx} slot {} NUMA mismatch: {existing} vs {placement_numa}",
+                        placement.slot_idx
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    block_slot_numas[block_idx][placement.slot_idx as usize] = Some(placement_numa);
+                }
+            }
         }
     }
 
@@ -66,7 +93,14 @@ pub(crate) fn rebuild_sealed_blocks(
             })
             .collect::<Result<Vec<_>, String>>()?;
         let key = BlockKey::new(namespace.to_string(), hash.clone());
-        result.push((key, Arc::new(SealedBlock::from_slots(slots))));
+        let slot_numas: Vec<NumaNode> = block_slot_numas[block_idx]
+            .iter()
+            .map(|numa| numa.ok_or_else(|| format!("block {block_idx} missing slot NUMA metadata")))
+            .collect::<Result<Vec<_>, String>>()?;
+        result.push((
+            key,
+            Arc::new(SealedBlock::from_slots_with_numas(slots, slot_numas)),
+        ));
     }
 
     Ok(result)

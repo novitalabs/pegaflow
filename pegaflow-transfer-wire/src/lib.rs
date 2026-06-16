@@ -28,6 +28,9 @@ impl fmt::Display for WireError {
 impl std::error::Error for WireError {}
 
 /// One slot (layer): shared segment shape across every block in the plan.
+///
+/// NUMA placement is expressed on each [`RemoteChunk`]; [`Self::numa_node`] is
+/// retained for wire compatibility and mirrors block 0 only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotSchema {
     pub numa_node: u32,

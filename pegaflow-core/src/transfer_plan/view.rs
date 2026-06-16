@@ -12,6 +12,8 @@ pub(crate) struct SegmentPoint {
     pub block_idx: u32,
     pub ptr: u64,
     pub len: usize,
+    /// Holder-side NUMA for this block's slot; drives [`RemoteChunk::numa_node`].
+    pub numa_node: u32,
 }
 
 /// One block row in the transfer matrix.
@@ -115,6 +117,7 @@ impl BlockView {
             block_idx,
             ptr: seg.ptr,
             len: seg.len,
+            numa_node: self.slots[slot_idx].numa.0,
         }
     }
 }

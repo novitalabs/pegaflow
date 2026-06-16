@@ -2012,6 +2012,7 @@ dependencies = [
  "pegaflow-core",
  "pegaflow-metaserver",
  "pegaflow-proto",
+ "pegaflow-transfer-wire",
  "prometheus",
  "pyo3",
  "pyo3-build-config",

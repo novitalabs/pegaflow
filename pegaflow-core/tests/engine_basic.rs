@@ -106,6 +106,14 @@ async fn save_query_load_roundtrip_split_storage() {
 /// `CopyDesc.host_device` for save and load.
 #[tokio::test]
 async fn kernel_backend_roundtrip_split_storage() {
+    if !kernel_backend_available() {
+        eprintln!(
+            "skip kernel_backend_roundtrip_split_storage: kernel backend unavailable on this \
+             driver (PTX newer than the driver supports)"
+        );
+        return;
+    }
+
     let env = TestEnvBuilder::new("test-kernel-split", "test-ns")
         .split_layer("layer_0", 2, 4096, 16384)
         .storage(StorageConfig {

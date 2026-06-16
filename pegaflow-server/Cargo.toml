@@ -50,6 +50,7 @@ fastrace = { workspace = true, features = ["enable"], optional = true }
 
 [dev-dependencies]
 pegaflow-metaserver = { path = "../pegaflow-metaserver", default-features = false }
+pegaflow-transfer-wire = { path = "../pegaflow-transfer-wire" }
 
 [build-dependencies]
 pyo3-build-config.workspace = true

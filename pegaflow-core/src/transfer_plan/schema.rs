@@ -36,7 +36,6 @@ pub(crate) fn derive_slot_schemas(views: &[BlockView]) -> Vec<SlotSchema> {
 
     let mut schemas = Vec::with_capacity(slot_count);
     for slot_idx in 0..slot_count {
-        let numa = views[0].slots[slot_idx].numa.0;
         let mut segment_schemas = SmallVec::<[SegmentSchema; 2]>::new();
 
         for segment_idx in 0..segment_count {
@@ -82,14 +81,11 @@ pub(crate) fn derive_slot_schemas(views: &[BlockView]) -> Vec<SlotSchema> {
                 segment_count,
                 "slot {slot_idx} segment count mismatch"
             );
-            assert_eq!(
-                view.slots[slot_idx].numa.0, numa,
-                "slot {slot_idx} NUMA mismatch across blocks"
-            );
         }
 
+        // NUMA affinity lives on each [`RemoteChunk`]; this field is wire-compat only.
         schemas.push(SlotSchema {
-            numa_node: numa,
+            numa_node: views[0].slots[slot_idx].numa.0,
             segments: segment_schemas,
         });
     }
