@@ -25,6 +25,13 @@ use pegaflow_common::NumaNode;
 /// Max bytes per RDMA work request; larger `TransferDesc`s are split at the engine entry.
 const MAX_RDMA_TRANSFER_BYTES: usize = 128 * 1024 * 1024;
 
+fn mr_access_flags() -> AccessFlags {
+    AccessFlags::LocalWrite
+        | AccessFlags::RemoteWrite
+        | AccessFlags::RemoteRead
+        | AccessFlags::RelaxedOrdering
+}
+
 struct NicGroup {
     nic_indices: Vec<usize>,
     rr_counter: AtomicUsize,
@@ -154,14 +161,8 @@ impl RcBackend {
         // Register on every NIC's PD.
         let mut mrs = Vec::with_capacity(self.nic_count());
         for runtime in &self.runtimes {
-            let mr = unsafe {
-                runtime.pd.reg_mr(
-                    raw as usize,
-                    len,
-                    AccessFlags::LocalWrite | AccessFlags::RemoteWrite | AccessFlags::RemoteRead,
-                )
-            }
-            .map_err(|error| TransferError::Backend(error.to_string()))?;
+            let mr = unsafe { runtime.pd.reg_mr(raw as usize, len, mr_access_flags()) }
+                .map_err(|error| TransferError::Backend(error.to_string()))?;
             mrs.push(mr);
         }
 
