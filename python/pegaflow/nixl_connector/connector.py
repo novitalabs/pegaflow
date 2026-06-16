@@ -9,7 +9,7 @@ and worker classes; the connector classes here only forward calls.
 * :class:`NixlBaseConnector` – common logic shared by pull and push.
 * :class:`NixlPullConnector` – pull-based (READ) KV transfer.
 * :class:`NixlPushConnector` – push-based (WRITE) KV transfer.
-* ``NixlConnector`` – backward-compatible alias for :class:`NixlPullConnector`.
+* :class:`PegaNixlConnector` – PegaFlow's WRITE-based P/D connector.
 """
 
 from typing import TYPE_CHECKING, Any
@@ -382,13 +382,23 @@ class NixlPushConnector(NixlBaseConnector):
         self.connector_worker.start_load_kv(self._connector_metadata)
 
 
-# Backward compatibility: NixlConnector is the pull-based connector.
-NixlConnector = NixlPullConnector
+class PegaNixlConnector(NixlPushConnector):
+    """PegaFlow NIXL connector facade.
+
+    This class intentionally starts from vLLM's WRITE-based NIXL connector
+    contract. The worker transport is replaced in later changes while preserving
+    the scheduler-facing NIXL P/D semantics.
+    """
+
+
+# PegaFlow's packaged NIXL connector defaults to the WRITE-based P/D path.
+NixlConnector = PegaNixlConnector
 
 
 __all__ = [
     "NixlBaseConnector",
     "NixlConnector",
+    "PegaNixlConnector",
     "NixlPullConnector",
     "NixlPushConnector",
 ]
