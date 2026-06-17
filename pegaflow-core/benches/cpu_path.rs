@@ -646,6 +646,58 @@ fn save_flush_transfer_fragmentation_benchmarks(c: &mut Criterion) {
     group.finish();
 }
 
+fn load_transfer_fragmentation_benchmarks(c: &mut Criterion) {
+    let rt = Runtime::new().expect("tokio runtime");
+    let mut group = c.benchmark_group("cpu_path/load_transfer_fragmentation");
+    group.sample_size(10);
+
+    for &num_blocks in TRANSFER_FRAGMENT_BLOCK_CASES {
+        group.throughput(Throughput::Bytes(bytes_per_iter(
+            num_blocks,
+            BYTES_PER_BLOCK,
+        )));
+
+        for transfer_mode in [TransferMode::Direct, TransferMode::Kernel] {
+            for layout in [
+                TransferFragmentLayout::Contiguous,
+                TransferFragmentLayout::StridedDevice,
+            ] {
+                let id = BenchmarkId::new(
+                    format!("{}_{}", transfer_mode_name(transfer_mode), layout.name()),
+                    num_blocks,
+                );
+
+                group.bench_function(id, |b| {
+                    let fixture = BenchFixture::with_transfer_layout(
+                        num_blocks,
+                        BYTES_PER_BLOCK,
+                        transfer_mode,
+                        layout,
+                    );
+                    let hashes = rt.block_on(fixture.prime_cache());
+                    b.iter_custom(|iters| {
+                        rt.block_on(async {
+                            let mut measured = Duration::ZERO;
+                            for iter in 0..iters {
+                                let req_id = format!("load-fragmentation-{iter}");
+                                let lease = fixture.query_lease(&req_id, &hashes).await;
+                                let start = Instant::now();
+                                fixture.load_and_wait(lease).await;
+                                measured += start.elapsed();
+                            }
+                            measured
+                        })
+                    });
+                    drop(fixture);
+                    std::thread::sleep(Duration::from_millis(50));
+                });
+            }
+        }
+    }
+
+    group.finish();
+}
+
 fn query_benchmarks(c: &mut Criterion) {
     let rt = Runtime::new().expect("tokio runtime");
     let mut group = c.benchmark_group("cpu_path/query_prefetch_lease");
@@ -817,6 +869,7 @@ criterion_group!(
     save_insert_flush_multilayer_cpu_benchmarks,
     save_flush_multilayer_dtoh_benchmarks,
     save_flush_transfer_fragmentation_benchmarks,
+    load_transfer_fragmentation_benchmarks,
     query_benchmarks,
     load_benchmarks
 );
