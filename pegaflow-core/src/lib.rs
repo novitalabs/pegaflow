@@ -453,23 +453,6 @@ impl PegaEngine {
             .collect()
     }
 
-    /// Return the effective TP size registered for this instance.
-    pub fn instance_tp_size(&self, instance_id: &str) -> Result<usize, EngineError> {
-        Ok(self.get_instance(instance_id)?.tp_size())
-    }
-
-    /// Return the unique valid NUMA nodes used by a registered save group.
-    pub fn registered_numa_nodes_for_save_group(
-        &self,
-        instance_id: &str,
-        tp_rank: usize,
-        pp_rank: usize,
-    ) -> Result<Vec<NumaNode>, EngineError> {
-        Ok(self
-            .get_instance(instance_id)?
-            .registered_numa_nodes_for_save_group(tp_rank, pp_rank))
-    }
-
     /// Count prefix hit blocks with SSD prefetch support.
     ///
     /// Argument contract:

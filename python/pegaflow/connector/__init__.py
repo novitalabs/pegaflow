@@ -132,6 +132,19 @@ class PegaKVConnector(KVConnectorBase_V1):
             mode=mode,
         )
 
+        # MLA attention backends expose no num-layers stride dimension, so vLLM
+        # cannot build a cross-layer (uniform) KV cache for MLA. Requesting it
+        # is silently ignored upstream and falls back to per-layer — surface
+        # that instead of pretending the request was honored.
+        env_cross_layer = os.environ.get("PEGAFLOW_CROSS_LAYER_BLOCKS", "1") == "1"
+        self._prefer_cross_layer = env_cross_layer and not is_mla
+        if is_mla and env_cross_layer:
+            logger.warning(
+                "[PegaKVConnector] PEGAFLOW_CROSS_LAYER_BLOCKS=1 is ignored for MLA "
+                "models: cross-layer KV cache is unsupported by MLA attention backends; "
+                "using per-layer registration."
+            )
+
         self._scheduler: SchedulerConnector | None = None
         self._worker: WorkerConnector | None = None
         if role == KVConnectorRole.SCHEDULER:
@@ -312,7 +325,7 @@ class PegaKVConnector(KVConnectorBase_V1):
 
     @property
     def prefer_cross_layer_blocks(self) -> bool:
-        return os.environ.get("PEGAFLOW_CROSS_LAYER_BLOCKS", "1") == "1"
+        return self._prefer_cross_layer
 
     def register_cross_layers_kv_cache(self, kv_cache, attn_backend):
         if not self._worker:
@@ -339,10 +352,12 @@ class NoopKVConnector(KVConnectorBase_V1):
 
     def __init__(self, vllm_config, role: KVConnectorRole, kv_cache_config=None):
         super().__init__(vllm_config, role, kv_cache_config)
+        self._is_mla = detect_mla(vllm_config)
 
     @property
     def prefer_cross_layer_blocks(self) -> bool:
-        return os.environ.get("PEGAFLOW_CROSS_LAYER_BLOCKS", "1") == "1"
+        # MLA cannot use cross-layer KV (no num-layers stride); be honest.
+        return not self._is_mla and os.environ.get("PEGAFLOW_CROSS_LAYER_BLOCKS", "1") == "1"
 
     def start_load_kv(self, forward_context, **kwargs: Any) -> None:
         return

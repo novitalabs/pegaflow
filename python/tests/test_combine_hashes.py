@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -12,7 +12,12 @@ from .unit_stubs import install_connector_unit_stubs
 
 install_connector_unit_stubs()
 
-from pegaflow.connector.common import ConnectorContext, PegaConnectorMode  # noqa: E402
+from pegaflow.connector.common import (  # noqa: E402
+    ConnectorContext,
+    PegaConnectorMetadata,
+    PegaConnectorMode,
+    SaveIntent,
+)
 from pegaflow.connector.scheduler import SchedulerConnector  # noqa: E402
 from pegaflow.pegaflow import QueryLoading, QueryReady  # noqa: E402
 
@@ -117,43 +122,43 @@ def test_effective_tp_cases(case: str, kwargs: dict, expected_rank: int, expecte
     ("case", "kwargs", "additional_config", "expected"),
     [
         pytest.param(
-            "ordinary_mla_replica_skips_nonzero_tp_save",
-            {
-                "is_mla": True,
-                "tp_rank": 1,
-                "tp_size": 2,
-            },
+            "ordinary_mla_replica_shards_by_layer",
+            {"is_mla": True, "tp_rank": 1, "tp_size": 2},
             {},
             True,
             id="ordinary_mla_replica",
         ),
         pytest.param(
-            "mla_layer_split_registration_does_not_skip_nonzero_tp_save",
-            {
-                "is_mla": True,
-                "tp_rank": 1,
-                "tp_size": 2,
-            },
+            "mla_layer_split_registration_already_distributes",
+            {"is_mla": True, "tp_rank": 1, "tp_size": 2},
             {"mla_layer_split_kv_cache": True},
             False,
             id="mla_layer_split_registration",
         ),
         pytest.param(
-            "dcp_mla_does_not_skip_save",
-            {
-                "is_mla": True,
-                "tp_rank": 1,
-                "tp_size": 2,
-                "dcp_world_size": 2,
-                "dcp_rank": 1,
-            },
+            "dcp_mla_stores_distinct_tokens",
+            {"is_mla": True, "tp_rank": 1, "tp_size": 2, "dcp_world_size": 2, "dcp_rank": 1},
             {},
             False,
             id="dcp_mla",
         ),
+        pytest.param(
+            "non_mla_already_unique_per_rank",
+            {"is_mla": False, "tp_rank": 1, "tp_size": 2},
+            {},
+            False,
+            id="non_mla",
+        ),
+        pytest.param(
+            "mla_single_gpu_nothing_to_shard",
+            {"is_mla": True, "tp_rank": 0, "tp_size": 1},
+            {},
+            False,
+            id="mla_tp1",
+        ),
     ],
 )
-def test_save_skip_keeps_ordinary_mla_optimization(
+def test_mla_replica_save_detection(
     case: str, kwargs: dict, additional_config: dict, expected: bool
 ):
     from pegaflow.connector.worker import WorkerConnector
@@ -164,9 +169,61 @@ def test_save_skip_keeps_ordinary_mla_optimization(
         vllm_config=SimpleNamespace(additional_config=additional_config),
     )
     try:
-        assert worker._should_skip_save_submission() is expected, case
+        assert worker._mla_replica_save() is expected, case
     finally:
         worker.shutdown()
+
+
+def test_mla_save_layer_shard_is_a_partition():
+    """Across ranks the per-rank layer shards must be disjoint and cover every
+    layer — otherwise blocks never seal (missing slot) or get double-saved."""
+    from pegaflow.connector.worker import WorkerConnector
+
+    layers = [f"model.layers.{i}.self_attn.attn" for i in range(13)]
+    tp_size = 4
+
+    seen: list[str] = []
+    for tp_rank in range(tp_size):
+        ctx = _make_ctx(is_mla=True, tp_rank=tp_rank, tp_size=tp_size)
+        worker = WorkerConnector(ctx, vllm_config=SimpleNamespace(additional_config={}))
+        try:
+            worker._registered_layers = list(layers)
+            shard = worker._compute_save_layer_shard()
+            worker._registered_layers = []  # skip mock unregister on shutdown
+        finally:
+            worker.shutdown()
+        assert shard is not None, tp_rank
+        seen.extend(shard)
+
+    # Equal sorted multisets ⇒ complete coverage and no duplicates across ranks.
+    assert sorted(seen) == sorted(layers)
+
+
+def test_mla_replica_save_submits_only_this_ranks_shard():
+    """A non-zero MLA rank must save its layer slice (not all layers, not
+    nothing) — this is what replaces the old TP0-only save."""
+    from pegaflow.connector.worker import SaveTask, WorkerConnector
+
+    ctx = _make_ctx(is_mla=True, tp_rank=1, tp_size=2, device_id=1)
+    worker = WorkerConnector(ctx, vllm_config=SimpleNamespace(additional_config={}))
+    worker._registered_layers = ["a", "b", "c", "d"]
+    worker._save_layer_shard = worker._compute_save_layer_shard()  # sorted idx%2==1 → b, d
+    worker._torch_device = None
+    ctx.engine_client.save.return_value = (True, "")
+
+    meta = PegaConnectorMetadata(
+        save_intents={"r1": SaveIntent(block_ids=(0, 1), block_hashes=(b"h0", b"h1"))}
+    )
+    try:
+        with patch("torch.cuda.synchronize"):
+            worker._process_save_batch([SaveTask(metadata=meta, request_ids=["r1"])])
+    finally:
+        worker._registered_layers = []  # skip mock unregister on shutdown
+        worker.shutdown()
+
+    ctx.engine_client.save.assert_called_once()
+    saves_list = ctx.engine_client.save.call_args.args[4]
+    assert {name for name, _ids, _hashes in saves_list} == {"b", "d"}
 
 
 # ---------------------------------------------------------------------------

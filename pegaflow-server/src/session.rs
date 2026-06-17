@@ -6,9 +6,6 @@
 //! a no-op.
 
 use dashmap::DashMap;
-use parking_lot::Mutex;
-use pegaflow_common::NumaNode;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -19,22 +16,9 @@ pub struct SessionTopology {
     pub world_size: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SaveNumaHint {
-    pub session_tp_size: u32,
-    pub numa_node: NumaNode,
-}
-
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-struct SaveNumaGroup {
-    tp_rank: usize,
-    pp_rank: usize,
-}
-
 struct SessionEntry {
     token: u64,
     topology: SessionTopology,
-    save_numa_cursors: Mutex<HashMap<SaveNumaGroup, usize>>,
 }
 
 #[derive(Default)]
@@ -68,7 +52,6 @@ impl SessionRegistry {
                     tp_size,
                     world_size,
                 },
-                save_numa_cursors: Mutex::new(HashMap::new()),
             },
         );
         token
@@ -78,34 +61,6 @@ impl SessionRegistry {
         self.sessions
             .get(instance_id)
             .map(|entry| entry.topology.clone())
-    }
-
-    pub fn next_save_numa_hint(
-        &self,
-        instance_id: &str,
-        tp_rank: usize,
-        pp_rank: usize,
-        candidates: &[NumaNode],
-    ) -> Option<SaveNumaHint> {
-        if tp_rank != 0 || candidates.len() < 2 {
-            return None;
-        }
-        let entry = self.sessions.get(instance_id)?;
-        if entry.topology.tp_size <= 1 {
-            return None;
-        }
-        let group = SaveNumaGroup { tp_rank, pp_rank };
-        let index = {
-            let mut cursors = entry.save_numa_cursors.lock();
-            let cursor = cursors.entry(group).or_insert(0);
-            let index = *cursor % candidates.len();
-            *cursor = cursor.wrapping_add(1);
-            index
-        };
-        Some(SaveNumaHint {
-            session_tp_size: entry.topology.tp_size,
-            numa_node: candidates[index],
-        })
     }
 
     /// CAS-remove: only removes if `token` is still the current one.
@@ -146,102 +101,5 @@ mod tests {
         assert!(!registry.take("inst", first));
         assert!(registry.take("inst", second));
         assert_eq!(registry.topology("inst"), None);
-    }
-
-    #[test]
-    fn save_numa_hint_round_robins_candidates() {
-        let registry = SessionRegistry::default();
-        registry.install("inst".to_string(), "ns".to_string(), 8, 8);
-        let candidates = [NumaNode(0), NumaNode(1), NumaNode(2)];
-
-        assert_eq!(
-            registry.next_save_numa_hint("inst", 0, 0, &candidates),
-            Some(SaveNumaHint {
-                session_tp_size: 8,
-                numa_node: NumaNode(0),
-            })
-        );
-        assert_eq!(
-            registry.next_save_numa_hint("inst", 0, 0, &candidates),
-            Some(SaveNumaHint {
-                session_tp_size: 8,
-                numa_node: NumaNode(1),
-            })
-        );
-        assert_eq!(
-            registry.next_save_numa_hint("inst", 0, 0, &candidates),
-            Some(SaveNumaHint {
-                session_tp_size: 8,
-                numa_node: NumaNode(2),
-            })
-        );
-        assert_eq!(
-            registry.next_save_numa_hint("inst", 0, 0, &candidates),
-            Some(SaveNumaHint {
-                session_tp_size: 8,
-                numa_node: NumaNode(0),
-            })
-        );
-    }
-
-    #[test]
-    fn save_numa_hint_checks_eligibility_without_advancing_cursor() {
-        let registry = SessionRegistry::default();
-        let candidates = [NumaNode(0), NumaNode(1)];
-
-        registry.install("inst".to_string(), "ns".to_string(), 1, 1);
-        assert_eq!(
-            registry.next_save_numa_hint("inst", 0, 0, &candidates),
-            None
-        );
-
-        registry.install("inst".to_string(), "ns".to_string(), 8, 8);
-        assert_eq!(
-            registry.next_save_numa_hint("inst", 1, 0, &candidates),
-            None
-        );
-        assert_eq!(
-            registry.next_save_numa_hint("inst", 0, 0, &candidates),
-            Some(SaveNumaHint {
-                session_tp_size: 8,
-                numa_node: NumaNode(0),
-            })
-        );
-    }
-
-    #[test]
-    fn save_numa_hint_round_robins_pp_groups_independently() {
-        let registry = SessionRegistry::default();
-        registry.install("inst".to_string(), "ns".to_string(), 8, 16);
-        let candidates = [NumaNode(0), NumaNode(1)];
-
-        assert_eq!(
-            registry.next_save_numa_hint("inst", 0, 0, &candidates),
-            Some(SaveNumaHint {
-                session_tp_size: 8,
-                numa_node: NumaNode(0),
-            })
-        );
-        assert_eq!(
-            registry.next_save_numa_hint("inst", 0, 1, &candidates),
-            Some(SaveNumaHint {
-                session_tp_size: 8,
-                numa_node: NumaNode(0),
-            })
-        );
-        assert_eq!(
-            registry.next_save_numa_hint("inst", 0, 0, &candidates),
-            Some(SaveNumaHint {
-                session_tp_size: 8,
-                numa_node: NumaNode(1),
-            })
-        );
-        assert_eq!(
-            registry.next_save_numa_hint("inst", 0, 1, &candidates),
-            Some(SaveNumaHint {
-                session_tp_size: 8,
-                numa_node: NumaNode(1),
-            })
-        );
     }
 }
