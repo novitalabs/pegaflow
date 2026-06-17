@@ -2,7 +2,7 @@ use pegaflow_core::LoadState;
 use pegaflow_proto::proto::engine::{
     HealthRequest, LeaseLoad, LoadRequest, QueryRequest, RegisterContextRequest, ReleaseRequest,
     ResponseStatus, SaveLayer, SaveRequest, SessionEvent, SessionRequest, ShutdownRequest,
-    UnregisterRequest, engine_client::EngineClient, query_response,
+    TransferMode, UnregisterRequest, engine_client::EngineClient, query_response,
 };
 use pyo3::{
     create_exception,
@@ -272,7 +272,7 @@ impl EngineRpcClient {
         clippy::too_many_arguments,
         reason = "PyO3 binding mirrors the public batch registration call shape"
     )]
-    #[pyo3(signature = (instance_id, namespace, tp_rank, pp_rank, tp_size, world_size, device_id, layer_names, wrapper_bytes_list, num_blocks_list, bytes_per_block_list, kv_stride_bytes_list, segments_list))]
+    #[pyo3(signature = (instance_id, namespace, tp_rank, pp_rank, tp_size, world_size, device_id, layer_names, wrapper_bytes_list, num_blocks_list, bytes_per_block_list, kv_stride_bytes_list, segments_list, transfer_backend))]
     fn register_context_batch(
         &self,
         py: Python<'_>,
@@ -289,7 +289,17 @@ impl EngineRpcClient {
         bytes_per_block_list: Vec<u64>,
         kv_stride_bytes_list: Vec<u64>,
         segments_list: Vec<u32>,
+        transfer_backend: &str,
     ) -> PyResult<(bool, String)> {
+        let transfer_mode = match transfer_backend {
+            "direct" => TransferMode::Direct,
+            "kernel" => TransferMode::Kernel,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown transfer_backend '{other}' (expected 'direct' or 'kernel')"
+                )));
+            }
+        };
         self.call(py, "register_context_batch", |mut c| async move {
             let resp = c
                 .register_context_batch(RegisterContextRequest {
@@ -307,6 +317,7 @@ impl EngineRpcClient {
                     kv_stride_bytes: kv_stride_bytes_list,
                     segments: segments_list,
                     pp_rank,
+                    transfer_mode: transfer_mode as i32,
                 })
                 .await?;
             Ok(resp.into_inner())

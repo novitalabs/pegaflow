@@ -55,11 +55,13 @@ class VLLMServer:
         kv_transfer_config: dict[str, object] | None = None,
         server_label: str | None = None,
         env_overrides: dict[str, str] | None = None,
+        transfer_backend: str | None = None,
     ):
         self.model = model
         self.port = port
         self.use_pegaflow = use_pegaflow
         self.pegaflow_port = pegaflow_port
+        self.transfer_backend = transfer_backend
         self.log_file = log_file
         self.max_model_len = max_model_len
         self.tensor_parallel_size = tensor_parallel_size
@@ -130,11 +132,18 @@ class VLLMServer:
             cmd.extend(["--kv-transfer-config", json.dumps(self.kv_transfer_config)])
         elif self.use_pegaflow or self.use_noop_connector:
             connector_name = "PegaKVConnector" if self.use_pegaflow else "NoopKVConnector"
-            kv_config = {
+            kv_config: dict[str, object] = {
                 "kv_connector": connector_name,
                 "kv_role": "kv_both",
                 "kv_connector_module_path": "pegaflow.connector",
             }
+            # The server no longer selects a transfer backend; the connector
+            # does. Force it here so --pegaflow-transfer-backend still exercises
+            # the chosen path end-to-end, regardless of the model's MLA default.
+            if self.use_pegaflow and self.transfer_backend is not None:
+                kv_config["kv_connector_extra_config"] = {
+                    "pegaflow.transfer_backend": self.transfer_backend,
+                }
             cmd.extend(["--kv-transfer-config", json.dumps(kv_config)])
 
         cmd.extend(self.extra_args)
@@ -297,14 +306,12 @@ class PegaFlowServer:
         pool_size: str = "30gb",
         log_level: str | None = None,
         cargo_features: list[str] | None = None,
-        transfer_backend: str = "direct",
         use_hugepages: bool = False,
     ):
         self.grpc_port = find_available_port()
         self.http_port = find_available_port()
         self.pool_size = pool_size
         self.log_level = log_level
-        self.transfer_backend = transfer_backend
         self.use_hugepages = use_hugepages
         self.cargo_features = (
             cargo_features if cargo_features is not None else _detect_pegaflow_cargo_features()
@@ -339,8 +346,6 @@ class PegaFlowServer:
                 f"0.0.0.0:{self.http_port}",
                 "--pool-size",
                 self.pool_size,
-                "--transfer-backend",
-                self.transfer_backend,
                 "--enable-prometheus",
             ]
         )
@@ -372,7 +377,6 @@ class PegaFlowServer:
         feature_label = ",".join(self.cargo_features) or "default"
         print(
             f"\n[PegaFlow Server] cargo run -r features={feature_label} "
-            f"transfer_backend={self.transfer_backend} "
             f"on gRPC={self.grpc_port}, HTTP={self.http_port}"
         )
 

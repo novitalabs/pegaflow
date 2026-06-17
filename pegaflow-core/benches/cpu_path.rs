@@ -56,6 +56,7 @@ impl BenchFixture {
                 enable_numa_affinity: false,
                 ..StorageConfig::default()
             },
+            TransferMode::Direct,
             block_ids(num_blocks),
         )
     }
@@ -72,6 +73,7 @@ impl BenchFixture {
                 advertise_addr: enable_metaserver.then(|| ADVERTISE_ADDR.to_string()),
                 ..StorageConfig::default()
             },
+            TransferMode::Direct,
             block_ids(num_blocks),
         )
     }
@@ -96,9 +98,9 @@ impl BenchFixture {
                 enable_lfu_admission: false,
                 hint_value_size_bytes: Some(bytes_per_block),
                 enable_numa_affinity: false,
-                transfer_mode,
                 ..StorageConfig::default()
             },
+            transfer_mode,
             block_ids,
         )
     }
@@ -107,6 +109,7 @@ impl BenchFixture {
         registered_blocks: usize,
         bytes_per_block: usize,
         config: StorageConfig,
+        transfer_mode: TransferMode,
         block_ids: Vec<usize>,
     ) -> Self {
         let ctx = CudaContext::new(DEVICE_ID as usize).expect("CUDA context");
@@ -142,6 +145,7 @@ impl BenchFixture {
                 &[bytes_per_block],
                 &[0],
                 &[1],
+                transfer_mode,
             )
             .expect("register layer");
 
@@ -328,6 +332,7 @@ impl MultiLayerBenchFixture {
                 &block_sizes,
                 &strides,
                 &segments,
+                TransferMode::Direct,
             )
             .expect("register layers");
 

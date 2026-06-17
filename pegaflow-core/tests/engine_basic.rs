@@ -108,10 +108,7 @@ async fn save_query_load_roundtrip_split_storage() {
 async fn kernel_backend_roundtrip_split_storage() {
     let env = TestEnvBuilder::new("test-kernel-split", "test-ns")
         .split_layer("layer_0", 2, 4096, 16384)
-        .storage(StorageConfig {
-            transfer_mode: TransferMode::Kernel,
-            ..StorageConfig::default()
-        })
+        .transfer_mode(TransferMode::Kernel)
         .build();
     let hashes = env.hashes(0);
 

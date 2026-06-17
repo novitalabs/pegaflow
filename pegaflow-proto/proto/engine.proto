@@ -7,6 +7,12 @@ message ResponseStatus {
   string message = 2;
 }
 
+// H2D/D2H transfer backend the engine uses for an instance's GPU worker pools.
+enum TransferMode {
+  TRANSFER_MODE_DIRECT = 0;
+  TRANSFER_MODE_KERNEL = 1;
+}
+
 // Batch registration request for all layers on a GPU (reduces N RPCs to 1).
 //
 // Workers declare only the layers that actually exist on the device; the
@@ -31,6 +37,10 @@ message RegisterContextRequest {
   repeated uint32 segments = 13;
   uint32 pp_rank = 14;
   string client_version = 15;
+  // Transfer backend the connector chose for this instance (kernel for MLA,
+  // direct otherwise; overridable via pegaflow.transfer_backend). The engine
+  // spawns this instance's GPU worker pools with the requested backend.
+  TransferMode transfer_mode = 17;
 }
 
 message RegisterContextResponse {

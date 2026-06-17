@@ -229,7 +229,6 @@ class TestE2ECorrectness:
     def pegaflow_server(
         self,
         log_dir: Path,
-        pegaflow_transfer_backend: str,
         pegaflow_use_hugepages: bool,
         pegaflow_pool_size: str,
     ):
@@ -237,7 +236,6 @@ class TestE2ECorrectness:
         with PegaFlowServer(
             log_file=log_dir / "pegaflow-server.log",
             pool_size=pegaflow_pool_size,
-            transfer_backend=pegaflow_transfer_backend,
             use_hugepages=pegaflow_use_hugepages,
         ) as server:
             yield server
@@ -280,6 +278,7 @@ class TestE2ECorrectness:
         model: str,
         base_port: int,
         pegaflow_server: PegaFlowServer,
+        pegaflow_transfer_backend: str,
         log_dir: Path,
         tensor_parallel_size: int,
         pipeline_parallel_size: int,
@@ -299,6 +298,7 @@ class TestE2ECorrectness:
             tensor_parallel_size=tensor_parallel_size,
             pipeline_parallel_size=pipeline_parallel_size,
             max_model_len=max_model_len,
+            transfer_backend=pegaflow_transfer_backend,
         ):
             metrics_port = pegaflow_server.metrics_port
             metrics_start = fetch_pegaflow_metrics(metrics_port)

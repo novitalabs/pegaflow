@@ -37,6 +37,7 @@ pub fn register_layers(
     pp_rank: usize,
     tp_size: usize,
     world_size: usize,
+    transfer_mode: TransferMode,
 ) {
     let layer_names: Vec<String> = layers.iter().map(|l| l.name.clone()).collect();
     let gpu_ptrs: Vec<u64> = layers.iter().map(|l| l.gpu_ptr).collect();
@@ -62,6 +63,7 @@ pub fn register_layers(
             &block_sizes,
             &kv_strides,
             &segments,
+            transfer_mode,
         )
         .expect("register_context_layer_batch");
 }

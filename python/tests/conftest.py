@@ -271,6 +271,7 @@ class ClientContext:
             bytes_per_block_list,
             kv_stride_bytes_list,
             segments_list,
+            "direct",
         )
 
         if not ok:

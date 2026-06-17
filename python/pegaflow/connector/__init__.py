@@ -25,6 +25,7 @@ from pegaflow.connector.common import (
     detect_mla,
     logger,
     resolve_instance_id,
+    resolve_transfer_backend,
 )
 from pegaflow.connector.scheduler import SchedulerConnector
 from pegaflow.connector.state_manager import ServiceStateManager
@@ -101,6 +102,10 @@ class PegaKVConnector(KVConnectorBase_V1):
                 "pegaflow.mode", PegaConnectorMode.READ_WRITE.value
             )
         )
+        transfer_backend = resolve_transfer_backend(
+            is_mla,
+            vllm_config.kv_transfer_config.get_from_extra_config("pegaflow.transfer_backend", None),
+        )
         self._engine_endpoint = f"{server_host}:{server_port}"
         engine_client = EngineRpcClient(self._engine_endpoint)
         logger.debug("[PegaKVConnector] Connected to engine server at %s", self._engine_endpoint)
@@ -118,6 +123,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             engine_client=engine_client,
             state_manager=self._state_manager,
             is_mla=is_mla,
+            transfer_backend=transfer_backend,
             dcp_world_size=dcp_world_size,
             pcp_world_size=pcp_world_size,
             dcp_rank=dcp_rank,
@@ -145,7 +151,7 @@ class PegaKVConnector(KVConnectorBase_V1):
         logger.debug(
             "[PegaKVConnector] Initialized role=%s instance_id=%s device=%s "
             "tp_rank=%s tp_size=%d pp_rank=%d pp_size=%d world_size=%d namespace=%s "
-            "is_mla=%s dcp_world_size=%d pcp_world_size=%d dcp_rank=%d mode=%s",
+            "is_mla=%s transfer_backend=%s dcp_world_size=%d pcp_world_size=%d dcp_rank=%d mode=%s",
             role.name,
             instance_id,
             device_id if device_id is not None else "cpu",
@@ -156,6 +162,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             world_size,
             namespace,
             is_mla,
+            transfer_backend,
             dcp_world_size,
             pcp_world_size,
             dcp_rank,

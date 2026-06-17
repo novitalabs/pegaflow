@@ -126,8 +126,6 @@ pub struct PegaEngine {
     topology: Arc<NumaTopology>,
     /// Query-ready blocks owned by opaque scheduler leases.
     query_leases: QueryLeaseManager,
-    /// H2D/D2H transfer backend used by GPU worker pools.
-    transfer_mode: TransferMode,
 }
 
 impl PegaEngine {
@@ -144,7 +142,6 @@ impl PegaEngine {
         topology.log_summary();
 
         let config = storage_config;
-        let transfer_mode = config.transfer_mode;
         let numa_nodes: Vec<NumaNode> = if config.enable_numa_affinity && topology.is_multi_numa() {
             let gpu_numa_nodes = topology.gpu_numa_nodes();
             if gpu_numa_nodes.is_empty() {
@@ -173,7 +170,6 @@ impl PegaEngine {
             storage,
             topology,
             query_leases: QueryLeaseManager::default(),
-            transfer_mode,
         })
     }
 
@@ -259,6 +255,7 @@ impl PegaEngine {
         bytes_per_block_list: &[usize],
         kv_stride_bytes_list: &[usize],
         segments_list: &[usize],
+        transfer_mode: TransferMode,
     ) -> Result<(), EngineError> {
         // Dense default: block stride == bytes_per_block (layer-first layout).
         self.register_context_layer_batch_strided(
@@ -277,6 +274,7 @@ impl PegaEngine {
             kv_stride_bytes_list,
             segments_list,
             None,
+            transfer_mode,
         )
     }
 
@@ -284,6 +282,10 @@ impl PegaEngine {
     /// block stride (see [`KVCacheRegistration::with_block_stride`]). When
     /// `block_stride_bytes_list` is `Some` it must match `layer_names` in length;
     /// each entry overrides that layer's stride.
+    ///
+    /// `transfer_mode` selects the GPU worker pools' H2D/D2H backend for this
+    /// instance. The pools are spawned per (instance, GPU) at registration, so
+    /// each instance can run a different backend.
     #[allow(
         clippy::too_many_arguments,
         reason = "public API mirrors one batched registration RPC payload"
@@ -305,6 +307,7 @@ impl PegaEngine {
         kv_stride_bytes_list: &[usize],
         segments_list: &[usize],
         block_stride_bytes_list: Option<&[usize]>,
+        transfer_mode: TransferMode,
     ) -> Result<(), EngineError> {
         // Build all registrations
         let ssd_enabled = self.storage.is_ssd_enabled();
@@ -388,13 +391,14 @@ impl PegaEngine {
             )));
         }
 
-        // Register GPU with all layers
+        // Register GPU with all layers. The connector picks the backend per
+        // model and sends it with the registration.
         instance.register_new_gpu(GpuRegistration {
             device_id,
             tp_rank,
             pp_rank,
             numa_node,
-            transfer_mode: self.transfer_mode,
+            transfer_mode,
             kv_caches,
         })?;
 

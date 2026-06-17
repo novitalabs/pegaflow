@@ -231,7 +231,6 @@ class PegaServer(ManagedProcess):
         devices: str,
         log_dir: Path,
         pool_size: str,
-        transfer_backend: str,
         metaserver: MetaServer,
         nics: str,
         advertise_host: str,
@@ -251,8 +250,6 @@ class PegaServer(ManagedProcess):
                 devices,
                 "--pool-size",
                 pool_size,
-                "--transfer-backend",
-                transfer_backend,
                 "--log-level",
                 os.environ.get("PEGAFLOW_LOG_LEVEL", "debug"),
                 "--disable-numa-affinity",
@@ -290,6 +287,7 @@ class VllmReplica(ManagedProcess):
         pega_server: PegaServer,
         log_dir: Path,
         max_model_len: int,
+        transfer_backend: str,
     ) -> None:
         kv_config = {
             "kv_connector": "PegaKVConnector",
@@ -299,6 +297,7 @@ class VllmReplica(ManagedProcess):
                 "pegaflow.host": f"http://{pega_server.grpc_host}",
                 "pegaflow.port": pega_server.grpc_port,
                 "pegaflow.mode": "read_write",
+                "pegaflow.transfer_backend": transfer_backend,
             },
         }
         env = _env()
@@ -541,7 +540,6 @@ def test_pp4_p2p_matches_local_cache_load(
                 source_devices,
                 log_dir,
                 pool_size,
-                pegaflow_transfer_backend,
                 metaserver,
                 nics,
                 server_host,
@@ -556,6 +554,7 @@ def test_pp4_p2p_matches_local_cache_load(
                 source_pega,
                 log_dir,
                 server_max_model_len,
+                pegaflow_transfer_backend,
             )
         )
 
@@ -580,6 +579,7 @@ def test_pp4_p2p_matches_local_cache_load(
             source_pega,
             log_dir,
             server_max_model_len,
+            pegaflow_transfer_backend,
         ):
             local_before = fetch_pegaflow_metrics(source_pega.metrics_port)
             local_outputs = _call_batch(local_consumer_port, PROMPTS, request_max_tokens)
@@ -600,7 +600,6 @@ def test_pp4_p2p_matches_local_cache_load(
                 consumer_devices,
                 log_dir,
                 pool_size,
-                pegaflow_transfer_backend,
                 metaserver,
                 nics,
                 server_host,
@@ -614,6 +613,7 @@ def test_pp4_p2p_matches_local_cache_load(
             remote_pega,
             log_dir,
             server_max_model_len,
+            pegaflow_transfer_backend,
         ):
             rdma_before = fetch_pegaflow_metrics(remote_pega.metrics_port)
             rdma_series_before = _snapshot_metrics(

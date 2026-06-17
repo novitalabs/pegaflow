@@ -75,6 +75,7 @@ class EngineRpcClient:
         bytes_per_block_list: list[int],
         kv_stride_bytes_list: list[int],
         segments_list: list[int],
+        transfer_backend: str,
     ) -> tuple[bool, str]:
         """Register all KV cache layers on a GPU with a single RPC call.
 
@@ -100,13 +101,15 @@ class EngineRpcClient:
             bytes_per_block_list: List of block sizes per layer.
             kv_stride_bytes_list: List of K/V strides per layer.
             segments_list: List of segment counts per layer.
+            transfer_backend: H2D/D2H backend for this instance's GPU worker
+                pools, "direct" or "kernel". Chosen by the connector per model.
 
         Returns:
             Tuple of (ok, message) indicating success/failure.
 
         Raises:
             PegaFlowError: If server is unavailable.
-            ValueError: If request is invalid.
+            ValueError: If request is invalid or transfer_backend is unknown.
         """
         ...
 

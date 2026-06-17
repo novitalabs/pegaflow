@@ -135,6 +135,7 @@ pub struct TestEnvBuilder {
     pool_size: usize,
     world_size: usize,
     storage_config: Option<StorageConfig>,
+    transfer_mode: TransferMode,
     layers: Vec<LayerSpec>,
 }
 
@@ -146,6 +147,7 @@ impl TestEnvBuilder {
             pool_size: 16 << 20,
             world_size: 1,
             storage_config: None,
+            transfer_mode: TransferMode::Direct,
             layers: vec![],
         }
     }
@@ -200,6 +202,12 @@ impl TestEnvBuilder {
 
     pub fn storage(mut self, config: StorageConfig) -> Self {
         self.storage_config = Some(config);
+        self
+    }
+
+    /// Select the H2D/D2H backend for this env's GPU worker pools.
+    pub fn transfer_mode(mut self, mode: TransferMode) -> Self {
+        self.transfer_mode = mode;
         self
     }
 
@@ -259,6 +267,7 @@ impl TestEnvBuilder {
                 0,
                 1,
                 self.world_size,
+                self.transfer_mode,
             );
         }
 

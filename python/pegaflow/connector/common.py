@@ -54,6 +54,7 @@ class ConnectorContext:
     engine_client: EngineRpcClient
     state_manager: "ServiceStateManager"
     is_mla: bool = False
+    transfer_backend: str = "direct"
     dcp_world_size: int = 1
     pcp_world_size: int = 1
     dcp_rank: int = 0
@@ -234,6 +235,29 @@ def detect_mla(vllm_config) -> bool:
     return getattr(hf_config, "kv_lora_rank", None) is not None
 
 
+_TRANSFER_BACKENDS = ("direct", "kernel")
+
+
+def resolve_transfer_backend(is_mla: bool, override: str | None) -> str:
+    """Pick the engine's H2D/D2H backend for this model.
+
+    MLA models save/load many small, highly fragmented slots where the kernel
+    backend's single launch beats one cuMemcpyAsync per slot; everything else
+    defaults to direct (best bandwidth for few/large transfers). A non-empty
+    `override` (from `pegaflow.transfer_backend`) wins, and an unknown value is
+    rejected rather than silently falling back.
+    """
+    if override is None:
+        return "kernel" if is_mla else "direct"
+    normalized = override.strip().lower()
+    if normalized not in _TRANSFER_BACKENDS:
+        allowed = ", ".join(_TRANSFER_BACKENDS)
+        raise ValueError(
+            f"Unsupported pegaflow.transfer_backend {override!r}; expected one of: {allowed}"
+        )
+    return normalized
+
+
 __all__ = [
     "ConnectorContext",
     "LoadIntent",
@@ -247,4 +271,5 @@ __all__ = [
     "logger",
     "parse_env_int",
     "resolve_instance_id",
+    "resolve_transfer_backend",
 ]

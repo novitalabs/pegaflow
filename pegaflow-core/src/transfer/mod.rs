@@ -57,7 +57,10 @@ pub trait TransferBackend: Send {
     fn name(&self) -> &'static str;
 }
 
-/// Which [`TransferBackend`] the GPU workers use, selected once at startup.
+/// Which [`TransferBackend`] an instance's GPU worker pools use. The connector
+/// picks this per model (kernel for MLA, direct otherwise) and sends it with
+/// the registration; the pools are spawned per (instance, GPU), so each
+/// instance can run a different backend.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TransferMode {
     /// One directional `cuMemcpyAsync` per coalesced range, on the DMA copy
@@ -68,18 +71,4 @@ pub enum TransferMode {
     /// memory directly. Wins when the batch is so fragmented that per-call
     /// launch latency on the direct path dominates.
     Kernel,
-}
-
-impl std::str::FromStr for TransferMode {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "direct" | "memcpy" => Ok(Self::Direct),
-            "kernel" => Ok(Self::Kernel),
-            other => Err(format!(
-                "unknown transfer mode '{other}' (expected 'direct' or 'kernel')"
-            )),
-        }
-    }
 }

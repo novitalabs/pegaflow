@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use cudarc::driver::CudaContext;
 use cudarc::driver::sys;
 use pegaflow_core::sync_state::{LOAD_STATE_ERROR, LOAD_STATE_SUCCESS};
-use pegaflow_core::{LoadState, PegaEngine, PrefetchStatus, StorageConfig};
+use pegaflow_core::{LoadState, PegaEngine, PrefetchStatus, StorageConfig, TransferMode};
 use pegaflow_server::proto::engine::engine_client::EngineClient;
 use pegaflow_server::proto::engine::engine_server::EngineServer;
 use pegaflow_server::proto::engine::{
@@ -533,6 +533,7 @@ fn register_instance_layers(
                 &[BYTES_PER_BLOCK],
                 &[0],
                 &[1],
+                TransferMode::Direct,
             )
             .expect("register_context_layer_batch");
     }

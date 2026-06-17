@@ -240,8 +240,7 @@ class WorkerConnector:
             kv_cache_tensors = getattr(self._kv_cache_config, "kv_cache_tensors", None)
             if not kv_cache_tensors:
                 raise RuntimeError(
-                    "Layer-split KV cache registration requires "
-                    "kv_cache_config.kv_cache_tensors"
+                    "Layer-split KV cache registration requires kv_cache_config.kv_cache_tensors"
                 )
 
             layer_names = [
@@ -329,6 +328,7 @@ class WorkerConnector:
             layer_bytes_per_block,
             layer_kv_stride_bytes,
             layer_segments,
+            self._ctx.transfer_backend,
         )
 
         if not ok:

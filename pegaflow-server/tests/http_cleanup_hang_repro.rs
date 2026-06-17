@@ -38,7 +38,7 @@ use pegaflow_core::{PegaEngine, StorageConfig};
 use pegaflow_server::http_server::start_http_server;
 use pegaflow_server::proto::engine::engine_client::EngineClient;
 use pegaflow_server::proto::engine::engine_server::EngineServer;
-use pegaflow_server::proto::engine::{HealthRequest, RegisterContextRequest};
+use pegaflow_server::proto::engine::{HealthRequest, RegisterContextRequest, TransferMode};
 use pegaflow_server::{CudaTensorRegistry, GrpcEngineService, RegistryHandle};
 use prometheus::Registry;
 use pyo3::Python;
@@ -247,6 +247,7 @@ fn wedge_register_request(i: usize) -> RegisterContextRequest {
         kv_stride_bytes: vec![1],
         segments: vec![1],
         pp_rank: 0,
+        transfer_mode: TransferMode::Direct as i32,
     }
 }
 

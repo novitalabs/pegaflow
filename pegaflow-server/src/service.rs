@@ -8,8 +8,8 @@ use crate::proto::engine::{
     RdmaHandshakeRequest, RdmaHandshakeResponse, RegisterContextRequest, RegisterContextResponse,
     ReleaseRequest, ReleaseResponse, ReleaseTransferLockRequest, ReleaseTransferLockResponse,
     ResponseStatus, SaveRequest, SaveResponse, SessionEvent, SessionRequest, ShutdownRequest,
-    ShutdownResponse, TransferBlockInfo, TransferSlotInfo, UnregisterRequest, UnregisterResponse,
-    query_response,
+    ShutdownResponse, TransferBlockInfo, TransferMode as ProtoTransferMode, TransferSlotInfo,
+    UnregisterRequest, UnregisterResponse, query_response,
 };
 use crate::registry::RegistryHandle;
 use crate::session::SessionRegistry;
@@ -278,6 +278,13 @@ impl Engine for GrpcEngineService {
 
             Self::validate_register_context_request(&req)?;
 
+            // The connector picks the H2D/D2H backend per model and sends it
+            // here. Read it before `req` is partially moved below.
+            let transfer_mode = match req.transfer_mode() {
+                ProtoTransferMode::Direct => pegaflow_core::TransferMode::Direct,
+                ProtoTransferMode::Kernel => pegaflow_core::TransferMode::Kernel,
+            };
+
             // Validate array lengths are consistent with each other.
             let batch_len = req.layer_names.len();
             if batch_len == 0
@@ -359,6 +366,7 @@ impl Engine for GrpcEngineService {
                 &bytes_per_block_list,
                 &kv_stride_bytes_list,
                 &segments_list,
+                transfer_mode,
             ) {
                 let status = Self::map_engine_error(err);
                 let removed = self.registry.drop_context(context_key.clone()).await;
@@ -1053,6 +1061,7 @@ mod tests {
             kv_stride_bytes: Vec::new(),
             segments: Vec::new(),
             pp_rank: 0,
+            transfer_mode: ProtoTransferMode::Direct as i32,
         })
         .expect_err("tp_rank outside tp_size must be rejected at RPC boundary");
 
@@ -1077,6 +1086,7 @@ mod tests {
             kv_stride_bytes: Vec::new(),
             segments: Vec::new(),
             pp_rank: 0,
+            transfer_mode: ProtoTransferMode::Direct as i32,
         })
         .expect_err("client/server version mismatch must be rejected before registration");
 
