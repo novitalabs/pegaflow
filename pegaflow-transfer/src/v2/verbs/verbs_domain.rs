@@ -153,6 +153,13 @@ fn mr_registration_method(mapping: &Mapping) -> MrRegistrationMethod {
     }
 }
 
+fn is_rma_transfer_completion(opcode: ibv_wc_opcode::Type) -> bool {
+    matches!(
+        opcode,
+        ibv_wc_opcode::IBV_WC_RDMA_WRITE | ibv_wc_opcode::IBV_WC_RDMA_READ
+    )
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerHandshakeInfo {
     ud_addr: VerbsUDAddress,
@@ -1109,7 +1116,7 @@ impl VerbsDomain {
                 let transfer_id: TransferId = unsafe { transmute(wc.wr_id) };
                 Some(DomainCompletionEntry::Send(transfer_id))
             }
-            ibv_wc_opcode::IBV_WC_RDMA_WRITE => {
+            opcode if is_rma_transfer_completion(opcode) => {
                 let context = unsafe { (wc.wr_id as *mut WriteOpContext).as_mut() }?;
                 context.cnt_finished_ops += 1;
                 if context.cnt_finished_ops < context.total_ops {
@@ -1407,5 +1414,12 @@ mod tests {
             mr_registration_method(&mapping),
             MrRegistrationMethod::Legacy
         );
+    }
+
+    #[test]
+    fn rdma_read_completion_finishes_rma_transfer() {
+        assert!(is_rma_transfer_completion(ibv_wc_opcode::IBV_WC_RDMA_WRITE));
+        assert!(is_rma_transfer_completion(ibv_wc_opcode::IBV_WC_RDMA_READ));
+        assert!(!is_rma_transfer_completion(ibv_wc_opcode::IBV_WC_SEND));
     }
 }
