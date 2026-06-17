@@ -8,6 +8,7 @@ import logging
 from typing import Any
 
 from pegaflow.pd_connector.layout import (
+    BlockRegionSlice,
     KvCacheLayout,
     LayerBlockSlices,
     block_ranges_for_remote_write,
@@ -158,6 +159,34 @@ class PegaNixlRdmaTransport:
         self.rdma.wait_for_pushes(request_id)
         self.rdma.push_done(request_id)
 
+    def pull_blocks(
+        self,
+        *,
+        request_id: str,
+        remote_handshake: PdHandshake,
+        local_block_ids: BlockIds,
+        remote_block_ids: BlockIds,
+    ) -> None:
+        assert self.rdma is not None, "Pega NIXL RDMA transport is not initialized"
+        self.open_request(request_id, remote_handshake)
+        remote_map = _remote_block_map(local_block_ids, remote_block_ids)
+        if not remote_map:
+            logger.warning("Pega NIXL RDMA pull has no mapped blocks req=%s", request_id)
+            self.rdma.wait_for_pulls(request_id)
+            return
+
+        for layer_idx, layer_name in enumerate(self.layer_names):
+            group_idx = 0
+            local_group = set(local_block_ids[group_idx]) if local_block_ids else set()
+            blocks = _block_ranges_for_remote_read(
+                self.layouts[layer_name],
+                local_group,
+                remote_map,
+            )
+            if blocks:
+                self.rdma.pull_layer(request_id, layer_idx, blocks)
+        self.rdma.wait_for_pulls(request_id)
+
     def pop_finished_sending(self) -> set[str]:
         assert self.rdma is not None, "Pega NIXL RDMA transport is not initialized"
         return self.rdma.pop_finished_sending()
@@ -230,6 +259,30 @@ def _remote_block_map(local_block_ids: BlockIds, remote_block_ids: BlockIds) -> 
         for local_id, remote_id in zip(local_group, remote_group, strict=False):
             mapping[int(local_id)] = int(remote_id)
     return mapping
+
+
+def _block_ranges_for_remote_read(
+    layout: KvCacheLayout,
+    local_block_ids: set[int],
+    remote_block_ids: dict[int, int],
+) -> list[LayerBlockSlices]:
+    ranges: list[LayerBlockSlices] = []
+    for local_id in sorted(local_block_ids):
+        remote_id = remote_block_ids[local_id]
+        remote = layout.block_slices(remote_id)
+        ranges.append(
+            LayerBlockSlices(
+                regions=tuple(
+                    BlockRegionSlice(
+                        block_id=local_id,
+                        src_offset_bytes=region.src_offset_bytes,
+                        bytes=region.bytes,
+                    )
+                    for region in remote.regions
+                ),
+            )
+        )
+    return ranges
 
 
 def layer_block_slices_bytes(blocks: list[LayerBlockSlices]) -> int:

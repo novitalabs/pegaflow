@@ -117,3 +117,35 @@ def test_transport_pushes_matching_local_blocks_to_remote_blocks() -> None:
         3 * kv_cache.stride()[1] * kv_cache.element_size(),
     ]
     assert "prefill-req" in rdma.pop_finished_sending()
+
+
+def test_transport_pulls_remote_blocks_into_local_blocks() -> None:
+    rdma = RegisteringRdmaPort()
+    transport = PegaNixlRdmaTransport(
+        vllm_config=_vllm_config(),
+        engine_id="d0",
+        tp_rank=0,
+        tp_size=1,
+        rdma=rdma,
+    )
+    kv_cache = FakeTensor((2, 8, 2, 1, 8))
+    transport.register_kv_caches({"layer.0": kv_cache})
+    remote_handshake = transport.build_local_handshake("prefill-req", [2, 4])
+
+    transport.pull_blocks(
+        request_id="decode-req",
+        remote_handshake=remote_handshake,
+        local_block_ids=([6, 7],),
+        remote_block_ids=([2, 4],),
+    )
+
+    pulled = rdma.pulled_layers["decode-req"]
+    assert len(pulled) == 1
+    layer_idx, blocks = pulled[0]
+    assert layer_idx == 0
+    assert [block.regions[0].block_id for block in blocks] == [6, 7]
+    assert [block.regions[0].src_offset_bytes for block in blocks] == [
+        2 * kv_cache.stride()[1] * kv_cache.element_size(),
+        4 * kv_cache.stride()[1] * kv_cache.element_size(),
+    ]
+    assert "decode-req" in rdma.pop_finished_recving()

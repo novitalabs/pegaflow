@@ -41,6 +41,15 @@ class RdmaPort(Protocol):
 
     def wait_for_pushes(self, req_id: str) -> None: ...
 
+    def pull_layer(
+        self,
+        req_id: str,
+        layer_idx: int,
+        blocks: list[LayerBlockSlices],
+    ) -> None: ...
+
+    def wait_for_pulls(self, req_id: str) -> None: ...
+
     def push_done(self, req_id: str) -> None: ...
 
     def write_stats(self, req_id: str) -> dict[str, Any]: ...
@@ -68,6 +77,7 @@ class MockRdmaPort:
         self.registered: set[str] = set()
         self.remote_handshakes: dict[str, PdHandshake | None] = {}
         self.pushed_layers: dict[str, list[tuple[int, list[LayerBlockSlices]]]] = {}
+        self.pulled_layers: dict[str, list[tuple[int, list[LayerBlockSlices]]]] = {}
         self._finished_sending: set[str] = set()
         self._finished_recving: set[str] = set()
 
@@ -92,6 +102,18 @@ class MockRdmaPort:
 
     def wait_for_pushes(self, req_id: str) -> None:
         return None
+
+    def pull_layer(
+        self,
+        req_id: str,
+        layer_idx: int,
+        blocks: list[LayerBlockSlices],
+    ) -> None:
+        self.pulled_layers.setdefault(req_id, [])
+        self.pulled_layers[req_id].append((layer_idx, blocks))
+
+    def wait_for_pulls(self, req_id: str) -> None:
+        self._finished_recving.add(req_id)
 
     def push_done(self, req_id: str) -> None:
         self._finished_sending.add(req_id)
@@ -135,6 +157,7 @@ class MockRdmaPort:
         self.registered.discard(req_id)
         self.remote_handshakes.pop(req_id, None)
         self.pushed_layers.pop(req_id, None)
+        self.pulled_layers.pop(req_id, None)
         self._finished_sending.discard(req_id)
         self._finished_recving.discard(req_id)
 
