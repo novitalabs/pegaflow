@@ -137,7 +137,17 @@ fn process_insert_batch(
     let mut inflight_bytes_removed: u64 = 0;
     let mut ordered_fast_path_seals = 0usize;
 
+    // Upgrade once: dedup against resident blocks below + publish seals at the end.
+    let deps = deps.upgrade();
+
     for (key, slots) in entries {
+        // Drop a late duplicate save of an already-resident block.
+        if let Some(deps) = &deps
+            && deps.read_cache.contains_keys(std::slice::from_ref(&key))[0]
+        {
+            continue;
+        }
+
         if !inflight.contains_key(&key) {
             match SealedBlock::from_ordered_slot_inserts(slots, total_slots, numa_node) {
                 Ok(sealed) => {
@@ -187,10 +197,10 @@ fn process_insert_batch(
     }
 
     if !sealed_blocks.is_empty()
-        && let Some(deps) = deps.upgrade()
+        && let Some(deps) = &deps
     {
         deps.read_cache.batch_insert_refs(&sealed_blocks);
-        send_backing_batches(&deps, namespace, &sealed_blocks);
+        send_backing_batches(deps, namespace, &sealed_blocks);
     }
 
     ordered_fast_path_seals
@@ -525,6 +535,57 @@ mod tests {
 
         let inflight_block = inflight.get(&key).unwrap();
         assert_eq!(inflight_block.filled_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn late_save_for_resident_block_is_dropped() {
+        // A block saved more times than `total_slots` (e.g. concurrent re-saves
+        // of a shared prefix): the first full set seals it; a late duplicate
+        // batch must not recreate a partial InflightBlock that never seals.
+        let engine =
+            StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]).unwrap();
+        let deps = make_deps(&engine);
+        let weak_deps = Arc::downgrade(&deps);
+
+        let key = BlockKey::new("ns".into(), vec![9]);
+        let mut inflight: HashMap<BlockKey, InflightBlock> = HashMap::new();
+
+        // Seal the block: both slots arrive, block moves to the read cache.
+        let block0 = make_raw_block(&engine, 64);
+        let block1 = make_raw_block(&engine, 64);
+        let entries: InsertEntries = vec![(key.clone(), vec![(0, block0), (1, block1)])];
+        process_insert_batch(
+            &mut inflight,
+            &weak_deps,
+            entries,
+            2,
+            NumaNode::UNKNOWN,
+            "ns",
+        );
+        assert!(
+            inflight.is_empty(),
+            "block should be sealed into read cache"
+        );
+        assert!(engine.read_cache.contains_keys(std::slice::from_ref(&key))[0]);
+
+        // Late duplicate save of the already-resident block: a single column
+        // for the same key arrives after the seal. It must be dropped, not
+        // turned into a permanently-incomplete inflight block.
+        let late = make_raw_block(&engine, 64);
+        let entries: InsertEntries = vec![(key.clone(), vec![(0, late)])];
+        process_insert_batch(
+            &mut inflight,
+            &weak_deps,
+            entries,
+            2,
+            NumaNode::UNKNOWN,
+            "ns",
+        );
+
+        assert!(
+            inflight.is_empty(),
+            "late save for an already-resident block must not leak a partial inflight block"
+        );
     }
 
     #[tokio::test]
