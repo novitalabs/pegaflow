@@ -4,8 +4,9 @@ use pegaflow_pd_wire as pd_wire;
 use pegaflow_transfer::v2::{
     CudaDeviceId, Device, DomainAddress, DomainGroupRouting, FabricLibError, GroupTransferRouting,
     ImmCounter, ImmTransferRequest, MemoryRegionDescriptor, MemoryRegionHandle,
-    MemoryRegionRemoteKey, RdmaEngine, ScatterTarget, ScatterTransferRequest, SmallVec,
-    TransferCallback, TransferEngine, TransferEngineBuilder, TransferRequest, detect_topology,
+    MemoryRegionRemoteKey, RdmaEngine, ScatterTarget, ScatterTransferRequest,
+    SingleTransferRequest, SmallVec, TransferCallback, TransferEngine, TransferEngineBuilder,
+    TransferRequest, detect_topology,
 };
 use pyo3::{
     exceptions::{PyRuntimeError, PyValueError},
@@ -15,6 +16,7 @@ use pyo3::{
 use std::{
     collections::{HashMap, HashSet},
     ffi::c_void,
+    num::NonZeroU8,
     ptr::NonNull,
     sync::atomic::{AtomicI64, Ordering},
     sync::{Arc, Mutex},
@@ -22,6 +24,7 @@ use std::{
 };
 
 const PD_RDMA_WRITE_WINDOW: i64 = 64;
+const PD_RDMA_READ_WINDOW: i64 = 64;
 const WAIT_SPINS_BEFORE_YIELD: u32 = 64;
 const WAIT_YIELDS_BEFORE_SLEEP: u32 = 512;
 
@@ -147,6 +150,7 @@ struct PdLocalLayer {
     base_addr: u64,
     mr: MemoryRegionHandle,
     mr_desc: MemoryRegionDescriptor,
+    regions: Vec<PdRemoteRegion>,
 }
 
 #[derive(Clone)]
@@ -172,38 +176,45 @@ struct PdRemoteRequest {
     layers: HashMap<u64, PdRemoteLayer>,
 }
 
+struct SingleReadTarget {
+    remote_mr: MemoryRegionDescriptor,
+    remote_offset: u64,
+    local_offset: u64,
+    length: u64,
+}
+
 #[derive(Clone)]
-struct PendingRdmaWrites {
+struct PendingRdmaTransfers {
     submitted: i64,
     completed: Arc<AtomicI64>,
     errors: Arc<AtomicI64>,
-    stats: Arc<Mutex<PendingRdmaWriteStats>>,
+    stats: Arc<Mutex<PendingRdmaTransferStats>>,
 }
 
-impl PendingRdmaWrites {
+impl PendingRdmaTransfers {
     fn new() -> Self {
         Self {
             submitted: 0,
             completed: Arc::new(AtomicI64::new(0)),
             errors: Arc::new(AtomicI64::new(0)),
-            stats: Arc::new(Mutex::new(PendingRdmaWriteStats::default())),
+            stats: Arc::new(Mutex::new(PendingRdmaTransferStats::default())),
         }
     }
 }
 
 #[derive(Default)]
-struct PendingRdmaWriteStats {
+struct PendingRdmaTransferStats {
     bytes: u64,
     first_submit: Option<Instant>,
     last_submit: Option<Instant>,
     first_complete: Option<Instant>,
     last_complete: Option<Instant>,
-    write_latency_count: u64,
-    write_latency_sum_ms: f64,
-    write_latency_max_ms: f64,
+    transfer_latency_count: u64,
+    transfer_latency_sum_ms: f64,
+    transfer_latency_max_ms: f64,
 }
 
-impl PendingRdmaWriteStats {
+impl PendingRdmaTransferStats {
     fn record_submit(&mut self, bytes: u64, at: Instant) {
         self.bytes = self.bytes.saturating_add(bytes);
         if self.first_submit.is_none() {
@@ -217,9 +228,9 @@ impl PendingRdmaWriteStats {
             self.first_complete = Some(at);
         }
         self.last_complete = Some(at);
-        self.write_latency_count = self.write_latency_count.saturating_add(1);
-        self.write_latency_sum_ms += latency_ms;
-        self.write_latency_max_ms = self.write_latency_max_ms.max(latency_ms);
+        self.transfer_latency_count = self.transfer_latency_count.saturating_add(1);
+        self.transfer_latency_sum_ms += latency_ms;
+        self.transfer_latency_max_ms = self.transfer_latency_max_ms.max(latency_ms);
     }
 
     fn to_py_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
@@ -227,10 +238,13 @@ impl PendingRdmaWriteStats {
         dict.set_item("bytes", self.bytes)?;
         dict.set_item("has_submit", self.first_submit.is_some())?;
         dict.set_item("has_complete", self.last_complete.is_some())?;
-        dict.set_item("write_latency_count", self.write_latency_count)?;
-        dict.set_item("write_latency_sum_ms", self.write_latency_sum_ms)?;
-        dict.set_item("write_latency_max_ms", self.write_latency_max_ms)?;
-        let active_s = self.write_latency_sum_ms / 1000.0;
+        dict.set_item("transfer_latency_count", self.transfer_latency_count)?;
+        dict.set_item("transfer_latency_sum_ms", self.transfer_latency_sum_ms)?;
+        dict.set_item("transfer_latency_max_ms", self.transfer_latency_max_ms)?;
+        dict.set_item("write_latency_count", self.transfer_latency_count)?;
+        dict.set_item("write_latency_sum_ms", self.transfer_latency_sum_ms)?;
+        dict.set_item("write_latency_max_ms", self.transfer_latency_max_ms)?;
+        let active_s = self.transfer_latency_sum_ms / 1000.0;
         let active_gbps = if active_s > 0.0 {
             self.bytes as f64 * 8.0 / active_s / 1_000_000_000.0
         } else {
@@ -281,9 +295,12 @@ struct PdRdmaEngine {
     local_layers: Mutex<HashMap<u64, PdLocalLayer>>,
     remote_requests: Mutex<HashMap<String, PdRemoteRequest>>,
     imm_counters: Mutex<HashMap<String, ImmCounter>>,
-    pending_writes: Mutex<HashMap<String, PendingRdmaWrites>>,
+    pending_writes: Mutex<HashMap<String, PendingRdmaTransfers>>,
+    pending_reads: Mutex<HashMap<String, PendingRdmaTransfers>>,
     write_submitted: AtomicI64,
     write_completed: Arc<AtomicI64>,
+    read_submitted: AtomicI64,
+    read_completed: Arc<AtomicI64>,
     imm_to_req: Arc<Mutex<HashMap<u32, String>>>,
     finished_sending: Arc<Mutex<HashSet<String>>>,
     finished_recving: Arc<Mutex<HashSet<String>>>,
@@ -399,8 +416,11 @@ impl PdRdmaEngine {
             remote_requests: Mutex::new(HashMap::new()),
             imm_counters: Mutex::new(HashMap::new()),
             pending_writes: Mutex::new(HashMap::new()),
+            pending_reads: Mutex::new(HashMap::new()),
             write_submitted: AtomicI64::new(0),
             write_completed: Arc::new(AtomicI64::new(0)),
+            read_submitted: AtomicI64::new(0),
+            read_completed: Arc::new(AtomicI64::new(0)),
             imm_to_req,
             finished_sending: Arc::new(Mutex::new(HashSet::new())),
             finished_recving,
@@ -433,7 +453,7 @@ impl PdRdmaEngine {
                 .ok_or_else(|| PyValueError::new_err("local layer missing regions"))?;
             let mut min_addr = u64::MAX;
             let mut max_addr = 0_u64;
-            let mut region_count = 0_usize;
+            let mut regions = Vec::new();
             for (expected_region_idx, region_any) in regions_any.try_iter()?.enumerate() {
                 let region = region_any?.cast_into::<PyDict>()?;
                 let region_idx: usize = py_get(&region, "region_idx")?;
@@ -449,16 +469,30 @@ impl PdRdmaEngine {
                         "local layer {layer_idx} region {region_idx} has invalid address range"
                     )));
                 }
+                let block_stride = region
+                    .get_item("block_stride")?
+                    .map(|value| value.extract::<u64>())
+                    .transpose()?
+                    .unwrap_or(block_len);
+                if block_stride < block_len {
+                    return Err(PyValueError::new_err(format!(
+                        "local layer {layer_idx} region {region_idx} block_stride={block_stride} is smaller than block_len={block_len}"
+                    )));
+                }
                 let end = max_block_id
-                    .checked_add(1)
-                    .and_then(|block_count| block_count.checked_mul(block_len))
+                    .checked_mul(block_stride)
+                    .and_then(|byte_offset| byte_offset.checked_add(block_len))
                     .and_then(|byte_len| base_addr.checked_add(byte_len))
                     .ok_or_else(|| PyValueError::new_err("local layer address range overflow"))?;
                 min_addr = min_addr.min(base_addr);
                 max_addr = max_addr.max(end);
-                region_count += 1;
+                regions.push(PdRemoteRegion {
+                    base_addr,
+                    block_len,
+                    block_stride,
+                });
             }
-            if region_count == 0 {
+            if regions.is_empty() {
                 return Err(PyValueError::new_err(format!(
                     "local layer {layer_idx} has no regions"
                 )));
@@ -472,12 +506,14 @@ impl PdRdmaEngine {
                 .engine
                 .register_memory_allow_remote(ptr, u64_to_usize(len, "layer length")?, self.device)
                 .map_err(|err| pd_rdma_error("register_memory_allow_remote failed", err))?;
+            let region_count = regions.len();
             local_layers.insert(
                 layer_idx,
                 PdLocalLayer {
                     base_addr: min_addr,
                     mr,
                     mr_desc: mr_desc.clone(),
+                    regions,
                 },
             );
             log::info!(
@@ -685,7 +721,7 @@ impl PdRdmaEngine {
             let mut pending = self.pending_writes.lock().unwrap();
             let state = pending
                 .entry(req_id.clone())
-                .or_insert_with(PendingRdmaWrites::new);
+                .or_insert_with(PendingRdmaTransfers::new);
             state.submitted += 1;
             state
                 .stats
@@ -794,32 +830,252 @@ impl PdRdmaEngine {
     }
 
     fn wait_for_pushes(&self, py: Python<'_>, req_id: String) -> PyResult<()> {
-        self.wait_for_request_writes(py, &req_id, Duration::from_secs(30))
+        self.wait_for_request_transfers(
+            py,
+            &self.pending_writes,
+            "WRITE",
+            &req_id,
+            Duration::from_secs(30),
+        )
     }
 
     fn push_done(&self, py: Python<'_>, req_id: String) -> PyResult<()> {
-        self.wait_for_request_writes(py, &req_id, Duration::from_secs(30))?;
+        self.wait_for_request_transfers(
+            py,
+            &self.pending_writes,
+            "WRITE",
+            &req_id,
+            Duration::from_secs(30),
+        )?;
         self.send_request_imm(py, &req_id, PdRequestImmKind::Done)?;
         self.finished_sending.lock().unwrap().insert(req_id);
         Ok(())
     }
 
     fn write_stats<'py>(&self, py: Python<'py>, req_id: String) -> PyResult<Bound<'py, PyDict>> {
-        let Some(state) = self.pending_writes.lock().unwrap().get(&req_id).cloned() else {
-            let dict = PyDict::new(py);
-            dict.set_item("submitted", 0_i64)?;
-            dict.set_item("completed", 0_i64)?;
-            dict.set_item("errors", 0_i64)?;
-            dict.set_item("bytes", 0_u64)?;
-            dict.set_item("has_submit", false)?;
-            dict.set_item("has_complete", false)?;
-            return Ok(dict);
-        };
-        let dict = state.stats.lock().unwrap().to_py_dict(py)?;
-        dict.set_item("submitted", state.submitted)?;
-        dict.set_item("completed", state.completed.load(Ordering::Acquire))?;
-        dict.set_item("errors", state.errors.load(Ordering::Acquire))?;
-        Ok(dict)
+        self.transfer_stats(py, &self.pending_writes, &req_id)
+    }
+
+    fn pull_layer(
+        &self,
+        py: Python<'_>,
+        req_id: String,
+        layer_idx: u64,
+        blocks: Vec<Py<PyDict>>,
+    ) -> PyResult<()> {
+        let total_start = Instant::now();
+        let input_blocks = blocks.len();
+        let local = self
+            .local_layers
+            .lock()
+            .unwrap()
+            .get(&layer_idx)
+            .cloned()
+            .ok_or_else(|| {
+                PyRuntimeError::new_err(format!("local layer {layer_idx} is not registered"))
+            })?;
+        let remote = self
+            .remote_requests
+            .lock()
+            .unwrap()
+            .get(&req_id)
+            .and_then(|request| request.layers.get(&layer_idx).cloned())
+            .ok_or_else(|| {
+                PyRuntimeError::new_err(format!(
+                    "remote layer {layer_idx} for req {req_id} is not registered"
+                ))
+            })?;
+
+        let mut reads = Vec::with_capacity(blocks.len() * remote.regions.len());
+        let mut read_bytes = 0_u64;
+        for block in blocks {
+            let block = block.bind(py);
+            let regions_any = block
+                .get_item("regions")?
+                .ok_or_else(|| PyValueError::new_err("block missing regions"))?;
+            for (expected_region_idx, region_any) in regions_any.try_iter()?.enumerate() {
+                let region = region_any?.cast_into::<PyDict>()?;
+                let region_idx: usize = py_get(&region, "region_idx")?;
+                if region_idx != expected_region_idx {
+                    return Err(PyValueError::new_err(
+                        "block regions must be ordered by region_idx",
+                    ));
+                }
+                let targets =
+                    self.block_slice_to_read_targets(&local, &remote, &region, region_idx)?;
+                for target in targets {
+                    read_bytes = read_bytes.checked_add(target.length).ok_or_else(|| {
+                        PyValueError::new_err(format!(
+                            "RDMA read byte count overflow for req={req_id} layer={layer_idx}"
+                        ))
+                    })?;
+                    reads.push(target);
+                }
+            }
+        }
+        if reads.is_empty() {
+            return Ok(());
+        }
+
+        let convert_ms = duration_ms(total_start.elapsed());
+        let scatter_targets = reads.len();
+        let submit_start = Instant::now();
+        for target in reads {
+            let window_start = Instant::now();
+            if !py.detach(|| {
+                wait_write_window(
+                    &self.read_submitted,
+                    &self.read_completed,
+                    PD_RDMA_READ_WINDOW,
+                    Duration::from_secs(30),
+                )
+            }) {
+                log::error!(
+                    "[PdRdmaEngine] RDMA READ window timeout req={} layer={} submitted={} completed={} window_wait_ms={:.3}",
+                    req_id,
+                    layer_idx,
+                    self.read_submitted.load(Ordering::Acquire),
+                    self.read_completed.load(Ordering::Acquire),
+                    duration_ms(window_start.elapsed()),
+                );
+                return Err(PegaFlowError::new_err(format!(
+                    "RDMA READ window timed out for req={req_id} layer={layer_idx} submitted={} completed={}",
+                    self.read_submitted.load(Ordering::Acquire),
+                    self.read_completed.load(Ordering::Acquire)
+                )));
+            }
+            self.read_submitted.fetch_add(1, Ordering::Release);
+            let submit_at = Instant::now();
+            let (req_completed, req_errors, req_stats) = {
+                let mut pending = self.pending_reads.lock().unwrap();
+                let state = pending
+                    .entry(req_id.clone())
+                    .or_insert_with(PendingRdmaTransfers::new);
+                state.submitted += 1;
+                state
+                    .stats
+                    .lock()
+                    .unwrap()
+                    .record_submit(target.length, submit_at);
+                (
+                    Arc::clone(&state.completed),
+                    Arc::clone(&state.errors),
+                    Arc::clone(&state.stats),
+                )
+            };
+            let global_completed = Arc::clone(&self.read_completed);
+            let done_completed = Arc::clone(&req_completed);
+            let error_completed = Arc::clone(&req_completed);
+            let error_counter = Arc::clone(&req_errors);
+            let done_stats = Arc::clone(&req_stats);
+            let error_stats = Arc::clone(&req_stats);
+            let error_global_completed = Arc::clone(&global_completed);
+            let callback_start = Instant::now();
+            let done_req_id = req_id.clone();
+            let error_req_id = req_id.clone();
+            let done_layer_idx = layer_idx;
+            let error_layer_idx = layer_idx;
+            let bytes = target.length;
+            let local_offset = target.local_offset;
+            let remote_mr = target.remote_mr;
+            let remote_offset = target.remote_offset;
+            self.engine
+                .submit_transfer(
+                    TransferRequest::Single(SingleTransferRequest {
+                        src_mr: local.mr,
+                        src_offset: local_offset,
+                        length: bytes,
+                        imm_data: None,
+                        dst_mr: remote_mr,
+                        dst_offset: remote_offset,
+                        domain: DomainGroupRouting::RoundRobinSharded {
+                            num_shards: NonZeroU8::new(1).unwrap(),
+                        },
+                        read: true,
+                    }),
+                    TransferCallback {
+                        on_done: Box::new(move || {
+                            let latency_ms = duration_ms(callback_start.elapsed());
+                            done_stats
+                                .lock()
+                                .unwrap()
+                                .record_complete(Instant::now(), latency_ms);
+                            done_completed.fetch_add(1, Ordering::Release);
+                            global_completed.fetch_add(1, Ordering::Release);
+                            log::debug!(
+                                "[PdRdmaEngine] RDMA READ completed req={} layer={} bytes={} latency_ms={:.3}",
+                                done_req_id,
+                                done_layer_idx,
+                                bytes,
+                                latency_ms,
+                            );
+                            Ok(())
+                        }),
+                        on_error: Box::new(move |err: FabricLibError| {
+                            let latency_ms = duration_ms(callback_start.elapsed());
+                            error_stats
+                                .lock()
+                                .unwrap()
+                                .record_complete(Instant::now(), latency_ms);
+                            error_counter.fetch_add(1, Ordering::Release);
+                            error_completed.fetch_add(1, Ordering::Release);
+                            error_global_completed.fetch_add(1, Ordering::Release);
+                            log::error!(
+                                "[PdRdmaEngine] RDMA READ completion error req={} layer={} bytes={} latency_ms={:.3} err={err}",
+                                error_req_id,
+                                error_layer_idx,
+                                bytes,
+                                latency_ms,
+                            );
+                            Ok(())
+                        }),
+                    },
+                )
+                .map_err(|err| {
+                    req_errors.fetch_add(1, Ordering::Release);
+                    req_completed.fetch_add(1, Ordering::Release);
+                    self.read_completed.fetch_add(1, Ordering::Release);
+                    log::error!(
+                        "[PdRdmaEngine] RDMA READ submit failed req={} layer={} input_blocks={} bytes={} domains={} err={err}",
+                        req_id,
+                        layer_idx,
+                        input_blocks,
+                        bytes,
+                        self.engine.num_domains(),
+                    );
+                    pd_rdma_error("submit RDMA READ failed", err)
+                })?;
+        }
+        log::debug!(
+            "[PdRdmaEngine] RDMA READ submitted req={} layer={} input_blocks={} scatter_targets={} bytes={} domains={} convert_ms={:.3} submit_ms={:.3} submitted={} completed={}",
+            req_id,
+            layer_idx,
+            input_blocks,
+            scatter_targets,
+            read_bytes,
+            self.engine.num_domains(),
+            convert_ms,
+            duration_ms(submit_start.elapsed()),
+            self.read_submitted.load(Ordering::Acquire),
+            self.read_completed.load(Ordering::Acquire),
+        );
+        Ok(())
+    }
+
+    fn wait_for_pulls(&self, py: Python<'_>, req_id: String) -> PyResult<()> {
+        self.wait_for_request_transfers(
+            py,
+            &self.pending_reads,
+            "READ",
+            &req_id,
+            Duration::from_secs(30),
+        )?;
+        self.finished_recving.lock().unwrap().insert(req_id);
+        Ok(())
+    }
+
+    fn read_stats<'py>(&self, py: Python<'py>, req_id: String) -> PyResult<Bound<'py, PyDict>> {
+        self.transfer_stats(py, &self.pending_reads, &req_id)
     }
 
     fn fail_request(&self, py: Python<'_>, req_id: String) -> PyResult<()> {
@@ -970,6 +1226,7 @@ impl PdRdmaEngine {
             .unwrap()
             .remove(&abort_counter_key(&req_id));
         self.pending_writes.lock().unwrap().remove(&req_id);
+        self.pending_reads.lock().unwrap().remove(&req_id);
         self.finished_sending.lock().unwrap().remove(&req_id);
         self.finished_recving.lock().unwrap().remove(&req_id);
     }
@@ -1083,13 +1340,15 @@ impl PdRdmaEngine {
         Ok(())
     }
 
-    fn wait_for_request_writes(
+    fn wait_for_request_transfers(
         &self,
         py: Python<'_>,
+        pending: &Mutex<HashMap<String, PendingRdmaTransfers>>,
+        label: &str,
         req_id: &str,
         timeout: Duration,
     ) -> PyResult<()> {
-        let Some(state) = self.pending_writes.lock().unwrap().get(req_id).cloned() else {
+        let Some(state) = pending.lock().unwrap().get(req_id).cloned() else {
             return Ok(());
         };
         let submitted = state.submitted;
@@ -1098,7 +1357,8 @@ impl PdRdmaEngine {
         }
         let start = Instant::now();
         log::info!(
-            "[PdRdmaEngine] RDMA WRITE wait start req={} submitted={} completed={} errors={}",
+            "[PdRdmaEngine] RDMA {} wait start req={} submitted={} completed={} errors={}",
+            label,
             req_id,
             submitted,
             state.completed.load(Ordering::Acquire),
@@ -1106,7 +1366,8 @@ impl PdRdmaEngine {
         );
         if !py.detach(|| wait_atomic_count(&state.completed, submitted, timeout)) {
             log::error!(
-                "[PdRdmaEngine] RDMA WRITE wait timeout req={} submitted={} completed={} errors={} wait_ms={:.3}",
+                "[PdRdmaEngine] RDMA {} wait timeout req={} submitted={} completed={} errors={} wait_ms={:.3}",
+                label,
                 req_id,
                 submitted,
                 state.completed.load(Ordering::Acquire),
@@ -1114,14 +1375,15 @@ impl PdRdmaEngine {
                 duration_ms(start.elapsed()),
             );
             return Err(PegaFlowError::new_err(format!(
-                "RDMA WRITE timed out for req={req_id} submitted={submitted} completed={}",
+                "RDMA {label} timed out for req={req_id} submitted={submitted} completed={}",
                 state.completed.load(Ordering::Acquire)
             )));
         }
         let errors = state.errors.load(Ordering::Acquire);
         if errors != 0 {
             log::error!(
-                "[PdRdmaEngine] RDMA WRITE wait failed req={} submitted={} completed={} errors={} wait_ms={:.3}",
+                "[PdRdmaEngine] RDMA {} wait failed req={} submitted={} completed={} errors={} wait_ms={:.3}",
+                label,
                 req_id,
                 submitted,
                 state.completed.load(Ordering::Acquire),
@@ -1129,17 +1391,41 @@ impl PdRdmaEngine {
                 duration_ms(start.elapsed()),
             );
             return Err(PegaFlowError::new_err(format!(
-                "RDMA WRITE failed for req={req_id} errors={errors}"
+                "RDMA {label} failed for req={req_id} errors={errors}"
             )));
         }
         log::info!(
-            "[PdRdmaEngine] RDMA WRITE wait done req={} submitted={} completed={} wait_ms={:.3}",
+            "[PdRdmaEngine] RDMA {} wait done req={} submitted={} completed={} wait_ms={:.3}",
+            label,
             req_id,
             submitted,
             state.completed.load(Ordering::Acquire),
             duration_ms(start.elapsed()),
         );
         Ok(())
+    }
+
+    fn transfer_stats<'py>(
+        &self,
+        py: Python<'py>,
+        pending: &Mutex<HashMap<String, PendingRdmaTransfers>>,
+        req_id: &str,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let Some(state) = pending.lock().unwrap().get(req_id).cloned() else {
+            let dict = PyDict::new(py);
+            dict.set_item("submitted", 0_i64)?;
+            dict.set_item("completed", 0_i64)?;
+            dict.set_item("errors", 0_i64)?;
+            dict.set_item("bytes", 0_u64)?;
+            dict.set_item("has_submit", false)?;
+            dict.set_item("has_complete", false)?;
+            return Ok(dict);
+        };
+        let dict = state.stats.lock().unwrap().to_py_dict(py)?;
+        dict.set_item("submitted", state.submitted)?;
+        dict.set_item("completed", state.completed.load(Ordering::Acquire))?;
+        dict.set_item("errors", state.errors.load(Ordering::Acquire))?;
+        Ok(dict)
     }
 
     fn block_slice_to_scatter_targets(
@@ -1157,6 +1443,9 @@ impl PdRdmaEngine {
         }
         let region = remote.regions.get(region_idx).ok_or_else(|| {
             PyValueError::new_err(format!("remote region {region_idx} is not registered"))
+        })?;
+        let local_region = local.regions.get(region_idx).ok_or_else(|| {
+            PyValueError::new_err(format!("local region {region_idx} is not registered"))
         })?;
         if !bytes.is_multiple_of(region.block_len) {
             return Err(PyValueError::new_err(format!(
@@ -1205,6 +1494,66 @@ impl PdRdmaEngine {
         Ok(targets)
     }
 
+    fn block_slice_to_read_targets(
+        &self,
+        local: &PdLocalLayer,
+        remote: &PdRemoteLayer,
+        block: &Bound<'_, PyDict>,
+        region_idx: usize,
+    ) -> PyResult<Vec<SingleReadTarget>> {
+        let local_block_id: u64 = py_get(block, "block_id")?;
+        let remote_offset: u64 = py_get(block, "src_offset_bytes")?;
+        let bytes: u64 = py_get(block, "bytes")?;
+        if bytes == 0 {
+            return Err(PyValueError::new_err("block slice bytes must be positive"));
+        }
+        let region = remote.regions.get(region_idx).ok_or_else(|| {
+            PyValueError::new_err(format!("remote region {region_idx} is not registered"))
+        })?;
+        if !bytes.is_multiple_of(region.block_len) {
+            return Err(PyValueError::new_err(format!(
+                "block slice bytes {bytes} must be a positive multiple of remote region block_len {}",
+                region.block_len
+            )));
+        }
+        let block_count = bytes / region.block_len;
+        if block_count == 1 || region.block_stride == region.block_len {
+            return Ok(vec![self.make_single_read_target(
+                local,
+                remote,
+                local_region,
+                local_block_id,
+                remote_offset,
+                bytes,
+                region,
+            )?]);
+        }
+
+        let mut targets = Vec::with_capacity(u64_to_usize(block_count, "block_count")?);
+        for offset in 0..block_count {
+            let local_block_id = local_block_id
+                .checked_add(offset)
+                .ok_or_else(|| PyValueError::new_err("local block id overflow"))?;
+            let remote_offset = remote_offset
+                .checked_add(
+                    offset
+                        .checked_mul(region.block_len)
+                        .ok_or_else(|| PyValueError::new_err("remote offset overflow"))?,
+                )
+                .ok_or_else(|| PyValueError::new_err("remote offset overflow"))?;
+            targets.push(self.make_single_read_target(
+                local,
+                remote,
+                local_region,
+                local_block_id,
+                remote_offset,
+                region.block_len,
+                region,
+            )?);
+        }
+        Ok(targets)
+    }
+
     fn make_scatter_target(
         &self,
         local: &PdLocalLayer,
@@ -1236,6 +1585,58 @@ impl PdRdmaEngine {
             length: bytes,
             src_offset: src_mr_offset,
             dst_offset,
+        })
+    }
+
+    fn make_single_read_target(
+        &self,
+        local: &PdLocalLayer,
+        remote: &PdRemoteLayer,
+        local_region: &PdRemoteRegion,
+        local_block_id: u64,
+        remote_offset: u64,
+        bytes: u64,
+        region: &PdRemoteRegion,
+    ) -> PyResult<SingleReadTarget> {
+        let remote_source_absolute = remote
+            .mr_desc
+            .ptr
+            .checked_add(remote_offset)
+            .ok_or_else(|| PyValueError::new_err("remote source address overflow"))?;
+        let remote_block_offset = remote_source_absolute
+            .checked_sub(region.base_addr)
+            .ok_or_else(|| PyRuntimeError::new_err("remote source address is below region base"))?;
+        if remote_block_offset % region.block_stride != 0 {
+            return Err(PyValueError::new_err(
+                "remote source address is not aligned to remote block stride",
+            ));
+        }
+        let remote_block_id = remote_block_offset / region.block_stride;
+        let block_count = bytes / region.block_len;
+        for offset in 0..block_count {
+            let block_id = remote_block_id
+                .checked_add(offset)
+                .ok_or_else(|| PyValueError::new_err("remote block id overflow"))?;
+            if !remote.allowed_block_ids.contains(&block_id) {
+                return Err(PyRuntimeError::new_err(format!(
+                    "remote block {block_id} is not registered"
+                )));
+            }
+        }
+        let local_addr = local_block_id
+            .checked_mul(local_region.block_stride)
+            .and_then(|offset| local_region.base_addr.checked_add(offset))
+            .ok_or_else(|| PyValueError::new_err("local block address overflow"))?;
+        if local_addr < local.mr_desc.ptr {
+            return Err(PyValueError::new_err(
+                "local block address is below local MR base",
+            ));
+        }
+        Ok(SingleReadTarget {
+            remote_mr: remote.mr_desc.clone(),
+            remote_offset,
+            local_offset: local_addr - local.mr_desc.ptr,
+            length: bytes,
         })
     }
 }

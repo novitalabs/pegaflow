@@ -14,6 +14,7 @@ pub struct SingleWriteOp {
     pub dst_ptr: u64,
     pub dst_rkey: MemoryRegionRemoteKey,
     pub dst_offset: u64,
+    pub read: bool,
 }
 
 pub struct ImmWriteOp {

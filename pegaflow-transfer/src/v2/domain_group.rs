@@ -273,6 +273,7 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
                 dst_ptr: request.dst_mr.ptr,
                 dst_rkey: *dst_rkey,
                 dst_offset: request.dst_offset + offset as u64,
+                read: request.read,
             });
             rdma_ops.push((i, op, dst_addr.clone()));
         }

@@ -545,6 +545,7 @@ fn run_bench(
                 dst_mr: ctx.decode_mr.clone(),
                 dst_offset: offset as u64,
                 domain: routing.transfer_domain(),
+                read: false,
             });
             ctx.prefill
                 .submit_transfer_atomic(request, Arc::clone(&tx_counter), Arc::clone(&err_counter))

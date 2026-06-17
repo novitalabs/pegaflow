@@ -54,6 +54,8 @@ class RdmaPort(Protocol):
 
     def write_stats(self, req_id: str) -> dict[str, Any]: ...
 
+    def read_stats(self, req_id: str) -> dict[str, Any]: ...
+
     def fail_request(self, req_id: str) -> None: ...
 
     def abort_request(self, req_id: str) -> None: ...
@@ -125,6 +127,19 @@ class MockRdmaPort:
         return {
             "submitted": len(self.pushed_layers.get(req_id, [])),
             "completed": len(self.pushed_layers.get(req_id, [])),
+            "errors": 0,
+            "bytes": bytes_total,
+            "has_submit": bytes_total > 0,
+            "has_complete": bytes_total > 0,
+        }
+
+    def read_stats(self, req_id: str) -> dict[str, Any]:
+        bytes_total = sum(
+            block_slices_bytes(blocks) for _, blocks in self.pulled_layers.get(req_id, [])
+        )
+        return {
+            "submitted": len(self.pulled_layers.get(req_id, [])),
+            "completed": len(self.pulled_layers.get(req_id, [])),
             "errors": 0,
             "bytes": bytes_total,
             "has_submit": bytes_total > 0,
@@ -344,6 +359,39 @@ class RealRdmaPort:
                 (time.perf_counter() - start) * 1000,
             )
 
+    def pull_layer(
+        self,
+        req_id: str,
+        layer_idx: int,
+        blocks: list[LayerBlockSlices],
+    ) -> None:
+        native_blocks = _layer_blocks_to_native(blocks)
+        start = time.perf_counter()
+        self.engine.pull_layer(req_id, layer_idx, native_blocks)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[PdConnector] RDMA pull_layer req=%s layer=%d input_blocks=%d coalesced_blocks=%d regions=%d bytes=%d native_ms=%.3f",
+                req_id,
+                layer_idx,
+                len(blocks),
+                len(native_blocks),
+                sum(len(block["regions"]) for block in native_blocks),
+                block_slices_bytes(blocks),
+                elapsed_ms,
+            )
+
+    def wait_for_pulls(self, req_id: str) -> None:
+        start = time.perf_counter()
+        try:
+            return self.engine.wait_for_pulls(req_id)
+        finally:
+            logger.info(
+                "[PdConnector] RDMA wait_for_pulls req=%s native_ms=%.3f",
+                req_id,
+                (time.perf_counter() - start) * 1000,
+            )
+
     def push_done(self, req_id: str) -> None:
         start = time.perf_counter()
         try:
@@ -357,6 +405,9 @@ class RealRdmaPort:
 
     def write_stats(self, req_id: str) -> dict[str, Any]:
         return dict(self.engine.write_stats(req_id))
+
+    def read_stats(self, req_id: str) -> dict[str, Any]:
+        return dict(self.engine.read_stats(req_id))
 
     def fail_request(self, req_id: str) -> None:
         start = time.perf_counter()

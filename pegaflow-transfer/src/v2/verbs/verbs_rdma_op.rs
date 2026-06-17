@@ -40,7 +40,12 @@ impl SingleWriteOpIter {
             length: op.length as u32,
             lkey: op.src_desc.0 as u32,
         });
-        let (opcode, imm) = opcode_imm(op.imm_data);
+        assert!(!op.read || op.imm_data.is_none());
+        let (opcode, imm) = if op.read {
+            (ibv_wr_opcode::IBV_WR_RDMA_READ, 0)
+        } else {
+            opcode_imm(op.imm_data)
+        };
         let wr = wr.write(ibv_send_wr {
             wr_id: context as u64,
             next: null_mut(),

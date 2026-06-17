@@ -122,6 +122,7 @@ pub struct SingleTransferRequest {
     pub dst_mr: MemoryRegionDescriptor,
     pub dst_offset: u64,
     pub domain: DomainGroupRouting,
+    pub read: bool,
 }
 
 #[derive(Clone, Debug)]
