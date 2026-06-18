@@ -2272,8 +2272,8 @@ class NixlBaseConnectorWorker:
         if self.transfer_topo is not None:
             _unregister_remote_engine_if_supported(self.transfer_topo, engine_id)
 
-        last_active = self._engine_last_active.pop(engine_id)
-        if log_eviction:
+        last_active = self._engine_last_active.pop(engine_id, None)
+        if log_eviction and last_active is not None:
             logger.info(
                 "Evicted stale remote engine %s (inactive for %.1fs).",
                 engine_id,

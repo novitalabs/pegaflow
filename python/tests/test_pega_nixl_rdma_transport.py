@@ -9,6 +9,7 @@ install_connector_unit_stubs()
 
 from pegaflow.nixl_connector.metadata import NixlHandshakePayload
 from pegaflow.nixl_connector.base_worker import (
+    NixlBaseConnectorWorker,
     _unregister_remote_engine_if_supported,
     _virtually_split_kv_in_blocks,
 )
@@ -203,6 +204,29 @@ def test_missing_topology_unregister_method_is_ignored() -> None:
     old_vllm_topology = SimpleNamespace()
 
     _unregister_remote_engine_if_supported(old_vllm_topology, "p0")
+
+
+def test_cleanup_remote_engine_without_last_active_is_idempotent() -> None:
+    worker = object.__new__(NixlBaseConnectorWorker)
+    released_handles = []
+    removed_agents = []
+    worker.dst_xfer_side_handles = {"d0": {0: "handle-d0-r0"}}
+    worker._remote_agents = {"d0": {0: "agent-d0-r0"}}
+    worker.kv_caches_base_addr = {"d0": 0x1234}
+    worker.dst_num_blocks = {"d0": 8}
+    worker.tp_mappings = {"d0": object()}
+    worker._engine_last_active = {}
+    worker.transfer_topo = SimpleNamespace(unregister_remote_engine=lambda _engine_id: None)
+    worker.nixl_wrapper = SimpleNamespace(
+        release_dlist_handle=released_handles.append,
+        remove_remote_agent=removed_agents.append,
+    )
+
+    worker._cleanup_remote_engine("d0", log_eviction=False)
+
+    assert released_handles == ["handle-d0-r0"]
+    assert removed_agents == ["agent-d0-r0"]
+    assert worker._remote_agents == {}
 
 
 def test_pega_pull_worker_uses_rdma_pull_and_reports_completion() -> None:
