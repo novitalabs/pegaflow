@@ -12,7 +12,6 @@ from pegaflow.nixl_connector.base_scheduler import _push_registration_key
 from pegaflow.nixl_connector.base_worker import (
     NixlBaseConnectorWorker,
     _unregister_remote_engine_if_supported,
-    _virtually_split_kv_in_blocks,
 )
 from pegaflow.nixl_connector.pega_pull_worker import (
     PegaNixlPullConnectorWorker,
@@ -211,12 +210,6 @@ class ImmediateExecutor:
                 callback(self)
 
         return DoneFuture()
-
-
-def test_missing_virtual_split_topology_defaults_to_unsplit_layout() -> None:
-    old_vllm_topology = SimpleNamespace()
-
-    assert _virtually_split_kv_in_blocks(old_vllm_topology) is False
 
 
 def test_missing_topology_unregister_method_is_ignored() -> None:

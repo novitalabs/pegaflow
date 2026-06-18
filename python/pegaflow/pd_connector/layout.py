@@ -260,6 +260,176 @@ class FlashAttnHndLayout:
 
 
 @dataclass(frozen=True)
+class FlashAttnBlocksFirstLayout(FlashAttnHndLayout):
+    """FlashAttention blocks-first layout.
+
+    Logical tensor shape:
+        [num_blocks, 2, block_size, num_kv_heads, head_size]
+
+    HND physical order:
+        [num_blocks, 2, num_kv_heads, block_size, head_size]
+    """
+
+    shape: tuple[int, int, int, int, int]
+    strides: tuple[int, int, int, int, int]
+
+    @classmethod
+    def from_tensor(
+        cls,
+        layer_name: str,
+        tensor: Any,
+        *,
+        layer_spec: Any | None = None,
+        expected_num_blocks: int | None = None,
+    ) -> FlashAttnBlocksFirstLayout:
+        shape = tuple(int(dim) for dim in tensor.shape)
+        assert len(shape) == 5, (
+            f"PdConnector only supports FlashAttention 5D KV cache; "
+            f"layer={layer_name} shape={shape}"
+        )
+        assert shape[1] == 2, (
+            "PdConnector FlashAttention blocks-first layout must be "
+            f"[num_blocks, 2, block_size, num_kv_heads, head_size]; "
+            f"layer={layer_name} shape={shape}"
+        )
+
+        strides = tuple(int(stride) for stride in tensor.stride())
+        _, _, block_size, num_kv_heads, head_size = shape
+        expected_token_stride = head_size
+        expected_head_stride = block_size * head_size
+        expected_kv_stride = block_size * num_kv_heads * head_size
+        if num_kv_heads > 1:
+            assert strides[3] == expected_head_stride, (
+                f"PdConnector requires blocks-first HND KV cache; layer={layer_name} "
+                f"expected head stride {expected_head_stride}, got {strides[3]} "
+                f"shape={shape} strides={strides}"
+            )
+        if block_size > 1:
+            assert strides[2] == expected_token_stride, (
+                f"PdConnector requires blocks-first HND KV cache; layer={layer_name} "
+                f"expected token stride {expected_token_stride}, got {strides[2]} "
+                f"shape={shape} strides={strides}"
+            )
+        assert strides[1] == expected_kv_stride, (
+            f"PdConnector requires contiguous K/V blocks; layer={layer_name} "
+            f"expected kv stride {expected_kv_stride}, got {strides[1]} "
+            f"shape={shape} strides={strides}"
+        )
+        if expected_num_blocks is not None:
+            assert shape[0] == expected_num_blocks, (
+                f"PdConnector requires all KV cache tensors to share num_blocks; "
+                f"layer={layer_name} expected={expected_num_blocks} shape={shape}"
+            )
+
+        layout = cls(
+            layer_name=layer_name,
+            shape=shape,  # type: ignore[arg-type]
+            strides=strides,  # type: ignore[arg-type]
+            element_size=int(tensor.element_size()),
+            base_addr=int(tensor.data_ptr()),
+        )
+        if layer_spec is not None:
+            region_block_len = _region_block_len_from_spec(
+                _unwrap_layer_spec(layer_spec, layer_name),
+                region_count=2,
+            )
+            assert region_block_len == layout.block_bytes, (
+                "PdConnector blocks-first layer block bytes must match "
+                f"KVCacheSpec page size; layer={layer_name} "
+                f"tensor_block_bytes={layout.block_bytes} "
+                f"spec_region_block_len={region_block_len}"
+            )
+        return layout
+
+    @property
+    def num_blocks(self) -> int:
+        return self.shape[0]
+
+    @property
+    def block_size(self) -> int:
+        return self.shape[2]
+
+    @property
+    def num_kv_heads(self) -> int:
+        return self.shape[3]
+
+    @property
+    def head_size(self) -> int:
+        return self.shape[4]
+
+    def block_offset_bytes(self, kv_idx: int, block_id: int) -> int:
+        assert kv_idx in (0, 1), f"kv_idx must be 0 (K) or 1 (V), got {kv_idx}"
+        assert 0 <= block_id < self.num_blocks, (
+            f"block_id {block_id} out of range for layer={self.layer_name} "
+            f"num_blocks={self.num_blocks}"
+        )
+        return (block_id * self.strides[0] + kv_idx * self.strides[1]) * self.element_size
+
+    @property
+    def block_stride_bytes(self) -> int:
+        return self.strides[0] * self.element_size
+
+    def remote_layout(
+        self, layer_idx: int, block_ids: BlockIdSelection = None
+    ) -> LayerRemoteLayout:
+        ordered = _ordered_block_ids(block_ids, self.num_blocks)
+        return LayerRemoteLayout(
+            layer_name=self.layer_name,
+            layer_idx=layer_idx,
+            block_ids=ordered,
+            regions=(
+                TransferRegionLayout(
+                    region_idx=0,
+                    base_addr=self.base_addr + self.block_offset_bytes(0, 0),
+                    block_len=self.block_bytes,
+                    block_stride=self.block_stride_bytes,
+                ),
+                TransferRegionLayout(
+                    region_idx=1,
+                    base_addr=self.base_addr + self.block_offset_bytes(1, 0),
+                    block_len=self.block_bytes,
+                    block_stride=self.block_stride_bytes,
+                ),
+            ),
+        )
+
+    def remote_head_layout(
+        self,
+        layer_idx: int,
+        block_ids: BlockIdSelection,
+        start_head: int,
+        end_head: int,
+    ) -> LayerRemoteLayout:
+        assert 0 <= start_head < end_head <= self.num_kv_heads, (
+            f"invalid KV head range [{start_head}, {end_head}) for layer={self.layer_name} "
+            f"num_kv_heads={self.num_kv_heads}"
+        )
+        ordered = _ordered_block_ids(block_ids, self.num_blocks)
+        head_count = end_head - start_head
+        head_offset = start_head * self.head_bytes
+        block_len = head_count * self.head_bytes
+        return LayerRemoteLayout(
+            layer_name=self.layer_name,
+            layer_idx=layer_idx,
+            block_ids=ordered,
+            regions=(
+                TransferRegionLayout(
+                    region_idx=0,
+                    base_addr=self.base_addr + self.block_offset_bytes(0, 0) + head_offset,
+                    block_len=block_len,
+                    block_stride=self.block_stride_bytes,
+                ),
+                TransferRegionLayout(
+                    region_idx=1,
+                    base_addr=self.base_addr + self.block_offset_bytes(1, 0) + head_offset,
+                    block_len=block_len,
+                    block_stride=self.block_stride_bytes,
+                ),
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class MlaBlocksLayout:
     """FlashMLA blocks-first layout used by MLA and indexer cache tensors."""
 
@@ -397,6 +567,13 @@ def layout_from_tensor(
             expected_num_blocks=expected_num_blocks,
         )
     if len(shape) == 5:
+        if shape[0] != 2 and shape[1] == 2:
+            return FlashAttnBlocksFirstLayout.from_tensor(
+                layer_name,
+                cache_tensor,
+                layer_spec=layer_spec,
+                expected_num_blocks=expected_num_blocks,
+            )
         return FlashAttnHndLayout.from_tensor(
             layer_name,
             cache_tensor,

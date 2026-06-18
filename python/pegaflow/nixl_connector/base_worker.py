@@ -83,10 +83,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _virtually_split_kv_in_blocks(transfer_topo: object) -> bool:
-    return bool(getattr(transfer_topo, "virtually_split_kv_in_blocks", False))
-
-
 def _unregister_remote_engine_if_supported(
     transfer_topo: object,
     engine_id: EngineId,
@@ -221,7 +217,7 @@ class NixlBaseConnectorWorker:
         if n_regions == 0 or self.num_regions == 0:
             return [False] * num_fa_descs
         nblk = num_fa_descs // self.num_regions
-        virtually_split = _virtually_split_kv_in_blocks(self.transfer_topo)
+        virtually_split = self.transfer_topo.virtually_split_kv_in_blocks
         flags: list[bool] = []
         for i in range(n_regions):
             replicated = self._is_region_replicated(i)
@@ -1028,7 +1024,7 @@ class NixlBaseConnectorWorker:
         self.kv_caches_base_addr[self.engine_id][self.tp_rank] = seen_base_addresses
         self.num_regions = len(caches_data)
 
-        if _virtually_split_kv_in_blocks(self.transfer_topo):
+        if self.transfer_topo.virtually_split_kv_in_blocks:
             # NOTE (NickLucche) When FlashInfer is used, memory is registered
             # with joint KV for each block. This minimizes the overhead in
             # registerMem allowing faster descs queries. In order to be able to
@@ -1209,7 +1205,7 @@ class NixlBaseConnectorWorker:
                 result.append((addr, kv_block_len, self.device_id))
 
             if (
-                _virtually_split_kv_in_blocks(self.transfer_topo)
+                self.transfer_topo.virtually_split_kv_in_blocks
                 and not self._is_region_replicated(i)
             ):
                 # Separate and interleave K/V regions to maintain the same
@@ -1268,7 +1264,7 @@ class NixlBaseConnectorWorker:
                 addr = base_addr + block_offset + rank_offset
                 result.append((addr, local_block_len, nixl_agent_meta.device_id))
 
-            emits_v = _virtually_split_kv_in_blocks(self.transfer_topo) and not replicated
+            emits_v = self.transfer_topo.virtually_split_kv_in_blocks and not replicated
             if emits_v:
                 # With FlashInfer index V separately to allow head splitting.
                 second_split = self.get_backend_aware_kv_block_len(
@@ -2192,7 +2188,7 @@ class NixlBaseConnectorWorker:
            |1st_split-2nd_split|         |1st_split-2nd_split |
         """
         assert self.transfer_topo is not None
-        virtually_split = _virtually_split_kv_in_blocks(self.transfer_topo)
+        virtually_split = self.transfer_topo.virtually_split_kv_in_blocks
         if virtually_split and mamba_view:
             block_len = self._mamba_ssm_size[not first_split]
         else:

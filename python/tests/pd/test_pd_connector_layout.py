@@ -71,6 +71,100 @@ def test_flash_attn_hnd_head_slice_layouts_use_full_block_stride() -> None:
     )
 
 
+def test_flash_attn_blocks_first_layout_offsets() -> None:
+    # Logical shape [num_blocks, 2, block_size, num_kv_heads, head_size].
+    # HND physical order [num_blocks, 2, num_kv_heads, block_size, head_size].
+    tensor = FakeTensor(
+        shape=(8, 2, 16, 4, 32),
+        stride=(2 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
+        ptr=0x1000,
+    )
+
+    layout = FlashAttnBlocksFirstLayout.from_tensor("layer.0", tensor)
+
+    assert layout.num_blocks == 8
+    assert layout.block_bytes == 16 * 4 * 32 * 2
+    assert layout.block_offset_bytes(0, 3) == 3 * 2 * 16 * 4 * 32 * 2
+    assert layout.block_offset_bytes(1, 3) == (
+        3 * 2 * 16 * 4 * 32 + 16 * 4 * 32
+    ) * 2
+    assert layout.block_slices(3).regions == (
+        BlockRegionSlice(
+            block_id=3,
+            src_offset_bytes=3 * 2 * 16 * 4 * 32 * 2,
+            bytes=16 * 4 * 32 * 2,
+        ),
+        BlockRegionSlice(
+            block_id=3,
+            src_offset_bytes=(3 * 2 * 16 * 4 * 32 + 16 * 4 * 32) * 2,
+            bytes=16 * 4 * 32 * 2,
+        ),
+    )
+    assert layout.remote_layout(0).regions == (
+        TransferRegionLayout(
+            region_idx=0,
+            base_addr=0x1000,
+            block_len=16 * 4 * 32 * 2,
+            block_stride=2 * 16 * 4 * 32 * 2,
+        ),
+        TransferRegionLayout(
+            region_idx=1,
+            base_addr=0x1000 + 16 * 4 * 32 * 2,
+            block_len=16 * 4 * 32 * 2,
+            block_stride=2 * 16 * 4 * 32 * 2,
+        ),
+    )
+
+
+def test_flash_attn_blocks_first_head_slice_layouts_use_full_block_stride() -> None:
+    tensor = FakeTensor(
+        shape=(8, 2, 16, 4, 32),
+        stride=(2 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
+        ptr=0x1000,
+    )
+    layout = FlashAttnBlocksFirstLayout.from_tensor("layer.0", tensor)
+
+    slices = layout.block_head_slices(block_id=3, start_head=1, end_head=3)
+
+    assert slices.regions == (
+        BlockRegionSlice(
+            block_id=3,
+            src_offset_bytes=(3 * 2 * 16 * 4 * 32 + 1 * 16 * 32) * 2,
+            bytes=2 * 16 * 32 * 2,
+        ),
+        BlockRegionSlice(
+            block_id=3,
+            src_offset_bytes=(
+                3 * 2 * 16 * 4 * 32 + 16 * 4 * 32 + 1 * 16 * 32
+            )
+            * 2,
+            bytes=2 * 16 * 32 * 2,
+        ),
+    )
+
+    remote = layout.remote_head_layout(
+        layer_idx=0,
+        block_ids=(3, 4),
+        start_head=1,
+        end_head=3,
+    )
+
+    assert remote.regions == (
+        TransferRegionLayout(
+            region_idx=0,
+            base_addr=0x1000 + 1 * 16 * 32 * 2,
+            block_len=2 * 16 * 32 * 2,
+            block_stride=2 * 16 * 4 * 32 * 2,
+        ),
+        TransferRegionLayout(
+            region_idx=1,
+            base_addr=0x1000 + 16 * 4 * 32 * 2 + 1 * 16 * 32 * 2,
+            block_len=2 * 16 * 32 * 2,
+            block_stride=2 * 16 * 4 * 32 * 2,
+        ),
+    )
+
+
 def test_pd_worker_registers_mla_and_indexer_layouts_from_layer_specs() -> None:
     main_tensor = FakeTensor(
         shape=(8, 64, 656),

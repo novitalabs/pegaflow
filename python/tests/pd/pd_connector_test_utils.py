@@ -33,6 +33,7 @@ from pegaflow.pd_connector import (  # noqa: E402
 from pegaflow.pd_connector.kv_params import parse_consumer  # noqa: E402
 from pegaflow.pd_connector.layout import (  # noqa: E402
     BlockRegionSlice,
+    FlashAttnBlocksFirstLayout,
     FlashAttnHndLayout,
     LayerBlockSlices,
     unique_blocks_from_slot_mapping,
