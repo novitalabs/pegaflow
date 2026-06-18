@@ -8,6 +8,10 @@ from .unit_stubs import install_connector_unit_stubs
 install_connector_unit_stubs()
 
 from pegaflow.nixl_connector.metadata import NixlHandshakePayload
+from pegaflow.nixl_connector.base_worker import (
+    _unregister_remote_engine_if_supported,
+    _virtually_split_kv_in_blocks,
+)
 from pegaflow.nixl_connector.pega_pull_worker import (
     PegaNixlPullConnectorWorker,
     encode_pega_rdma_handshake_payload,
@@ -187,6 +191,18 @@ class ImmediateExecutor:
                 callback(self)
 
         return DoneFuture()
+
+
+def test_missing_virtual_split_topology_defaults_to_unsplit_layout() -> None:
+    old_vllm_topology = SimpleNamespace()
+
+    assert _virtually_split_kv_in_blocks(old_vllm_topology) is False
+
+
+def test_missing_topology_unregister_method_is_ignored() -> None:
+    old_vllm_topology = SimpleNamespace()
+
+    _unregister_remote_engine_if_supported(old_vllm_topology, "p0")
 
 
 def test_pega_pull_worker_uses_rdma_pull_and_reports_completion() -> None:
