@@ -148,6 +148,9 @@ impl PegaEngine {
     /// reduces Python-Rust boundary crossings and batches GPU copies + storage
     /// operations across all layers for minimal lock overhead and a single
     /// CUDA stream synchronization.
+    ///
+    /// Pinned memory is allocated on the saving GPU's own NUMA node, keeping
+    /// every D2H copy socket-local.
     pub async fn batch_save_kv_blocks_from_ipc(
         &self,
         instance_id: &str,
@@ -155,36 +158,6 @@ impl PegaEngine {
         pp_rank: usize,
         device_id: i32,
         saves: Vec<LayerSave>,
-    ) -> Result<(), EngineError> {
-        self.batch_save_kv_blocks_from_ipc_with_numa_hint(
-            instance_id,
-            tp_rank,
-            pp_rank,
-            device_id,
-            saves,
-            None,
-        )
-        .await
-    }
-
-    /// Batch save KV blocks with an optional NUMA allocation override.
-    ///
-    /// `numa_hint` only changes the pinned-memory allocation node and the
-    /// recorded slot NUMA metadata. CUDA reads still use the registered GPU
-    /// context identified by `device_id`. Hints are accepted only when they
-    /// target a registered NUMA node for this effective TP/PP group.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "save requests carry the externally registered KV layout fields"
-    )]
-    pub async fn batch_save_kv_blocks_from_ipc_with_numa_hint(
-        &self,
-        instance_id: &str,
-        tp_rank: usize,
-        pp_rank: usize,
-        device_id: i32,
-        saves: Vec<LayerSave>,
-        numa_hint: Option<NumaNode>,
     ) -> Result<(), EngineError> {
         self.query_leases.sweep_expired();
 
@@ -308,10 +281,7 @@ impl PegaEngine {
         // ── Phase 2: Allocate pinned memory + build SaveBlocks for all layers ──
 
         trace_scope!("save.pinned_alloc", _s);
-        let save_numa_node = match numa_hint {
-            Some(hint) => instance.validate_save_numa_hint(tp_rank, pp_rank, hint)?,
-            None => gpu_context.preferred_numa(),
-        };
+        let save_numa_node = gpu_context.preferred_numa();
         let numa_node = Some(save_numa_node);
         let blockwise = self.storage.blockwise_alloc();
 

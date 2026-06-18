@@ -191,8 +191,9 @@ def test_mla_replica_devices_save_and_load(dual_device_server):
             workers.append(worker)
             worker.register()
 
-        # Only the effective rank-0 worker submits saves for MLA models
-        # (WorkerConnector._should_skip_save_submission); it saves every layer.
+        # Drive the engine directly: rank-0 saves every layer (a valid server
+        # path — replica slots accept any device as owner, see #336). Connector-
+        # level per-rank layer sharding is covered in test_combine_hashes.py.
         block_hashes = [uuid.uuid4().bytes * 2 for _ in SAVED_BLOCK_IDS]
         saves = [(name, SAVED_BLOCK_IDS, block_hashes) for name in layer_names]
         ok, message = engine_client.save(

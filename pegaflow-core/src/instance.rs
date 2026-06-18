@@ -529,56 +529,9 @@ impl InstanceContext {
         &self.namespace
     }
 
-    /// Access the effective TP size registered with the engine.
-    pub(crate) fn tp_size(&self) -> usize {
-        self.tp_size
-    }
-
     /// Total worker count registered for this instance.
     pub(crate) fn world_size(&self) -> usize {
         self.world_size
-    }
-
-    /// Return unique valid NUMA nodes for registered shards in one save group.
-    pub(crate) fn registered_numa_nodes_for_save_group(
-        &self,
-        tp_rank: usize,
-        pp_rank: usize,
-    ) -> Vec<NumaNode> {
-        let state = self.state.lock();
-        let mut nodes: Vec<NumaNode> = state
-            .gpu_contexts
-            .values()
-            .filter(|gpu| gpu.tp_rank() == tp_rank && gpu.pp_rank() == pp_rank)
-            .map(|gpu| gpu.preferred_numa())
-            .filter(|node| node.is_valid())
-            .collect();
-        nodes.sort_unstable();
-        nodes.dedup();
-        nodes
-    }
-
-    /// Validate that a save placement hint targets a registered shard NUMA node.
-    pub(crate) fn validate_save_numa_hint(
-        &self,
-        tp_rank: usize,
-        pp_rank: usize,
-        numa_node: NumaNode,
-    ) -> Result<NumaNode, EngineError> {
-        if !numa_node.is_valid() {
-            return Err(EngineError::InvalidArgument(format!(
-                "save NUMA hint must be a valid NUMA node, got {numa_node}"
-            )));
-        }
-
-        let candidates = self.registered_numa_nodes_for_save_group(tp_rank, pp_rank);
-        if candidates.contains(&numa_node) {
-            return Ok(numa_node);
-        }
-
-        Err(EngineError::InvalidArgument(format!(
-            "save NUMA hint {numa_node} is not registered for tp_rank {tp_rank}, pp_rank {pp_rank}; candidates={candidates:?}"
-        )))
     }
 
     /// Verify that the topology matches expected values.

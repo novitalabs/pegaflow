@@ -14,7 +14,6 @@ use crate::proto::engine::{
 use crate::registry::RegistryHandle;
 use crate::session::SessionRegistry;
 use log::{debug, info, warn};
-use pegaflow_common::NumaNode;
 use pegaflow_core::{EngineError, LayerSave, PegaEngine, PrefetchStatus, QueryLeaseId};
 use std::sync::Arc;
 use std::time::Instant;
@@ -198,55 +197,6 @@ impl GrpcEngineService {
                 numa_node: numa_node.0,
             }
         }
-    }
-
-    fn save_numa_hint(
-        &self,
-        instance_id: &str,
-        tp_rank: usize,
-        pp_rank: usize,
-    ) -> Option<NumaNode> {
-        if tp_rank != 0 {
-            return None;
-        }
-
-        match self.engine.instance_tp_size(instance_id) {
-            Ok(1) => {}
-            Ok(_) => return None,
-            Err(err) => {
-                debug!(
-                    "save NUMA hint skipped: instance={} tp_rank={} could not read instance topology: {}",
-                    instance_id, tp_rank, err
-                );
-                return None;
-            }
-        }
-
-        let candidates = match self.engine.registered_numa_nodes_for_save_group(
-            instance_id,
-            tp_rank,
-            pp_rank,
-        ) {
-            Ok(candidates) => candidates,
-            Err(err) => {
-                debug!(
-                    "save NUMA hint skipped: instance={} tp_rank={} pp_rank={} could not read shard NUMA nodes: {}",
-                    instance_id, tp_rank, pp_rank, err
-                );
-                return None;
-            }
-        };
-
-        let hint =
-            self.session_registry
-                .next_save_numa_hint(instance_id, tp_rank, pp_rank, &candidates);
-        if let Some(numa) = hint {
-            debug!(
-                "save NUMA hint selected: instance={} tp_rank={} pp_rank={} session_tp_size={} candidates={:?} hint={}",
-                instance_id, tp_rank, pp_rank, numa.session_tp_size, candidates, numa.numa_node
-            );
-        }
-        hint.map(|hint| hint.numa_node)
     }
 }
 
@@ -446,17 +396,8 @@ impl Engine for GrpcEngineService {
                 instance_id, tp_rank, pp_rank, device_id, layer_count, total_blocks, total_hashes
             );
 
-            let numa_hint = self.save_numa_hint(&instance_id, tp_rank, pp_rank);
-
             self.engine
-                .batch_save_kv_blocks_from_ipc_with_numa_hint(
-                    &instance_id,
-                    tp_rank,
-                    pp_rank,
-                    device_id,
-                    saves,
-                    numa_hint,
-                )
+                .batch_save_kv_blocks_from_ipc(&instance_id, tp_rank, pp_rank, device_id, saves)
                 .await
                 .map_err(Self::map_engine_error)?;
 

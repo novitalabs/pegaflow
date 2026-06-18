@@ -293,19 +293,3 @@ fn seal_rejects_inconsistent_layer_geometry() {
         .expect_err("same name with different geometry must fail the seal");
     assert!(err.to_string().contains("inconsistent geometry"));
 }
-
-#[test]
-fn save_numa_hint_validation_rejects_unknown_or_unregistered_nodes() {
-    let instance = InstanceContext::new("hint-instance".to_string(), "hint-ns".to_string(), 1, 1)
-        .expect("create instance");
-
-    let err = instance
-        .validate_save_numa_hint(0, 0, NumaNode::UNKNOWN)
-        .expect_err("unknown NUMA hint should fail");
-    assert!(err.to_string().contains("valid NUMA node"));
-
-    let err = instance
-        .validate_save_numa_hint(0, 0, NumaNode(0))
-        .expect_err("unregistered NUMA hint should fail");
-    assert!(err.to_string().contains("not registered"));
-}

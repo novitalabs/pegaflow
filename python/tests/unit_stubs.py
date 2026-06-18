@@ -46,6 +46,10 @@ def _install_torch_stub() -> None:
         def empty_cache() -> None:
             return None
 
+        @staticmethod
+        def synchronize(_device=None) -> None:
+            return None
+
     class _Random:
         @staticmethod
         def manual_seed(_seed: int) -> None:

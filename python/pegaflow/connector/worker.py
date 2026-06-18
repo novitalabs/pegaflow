@@ -198,6 +198,8 @@ class WorkerConnector:
         self._failed_load_reqs: set[str] = set()
 
         self._registered_layers: list[str] = []
+        # Layer subset this rank saves (MLA replica sharding); None = save all.
+        self._save_layer_shard: list[str] | None = None
         self._torch_device: torch.device | None = None
 
         self._cross_layer_mode = False
@@ -265,6 +267,7 @@ class WorkerConnector:
             raise RuntimeError("No KV cache layers were selected for registration")
 
         self._registered_layers = list(kv_caches.keys())
+        self._save_layer_shard = self._compute_save_layer_shard()
         self._torch_device = next(iter(kv_caches.values())).device
 
         layout = "unknown"
@@ -646,19 +649,6 @@ class WorkerConnector:
 
         request_ids = list(metadata.save_intents.keys())
 
-        if self._should_skip_save_submission():
-            logger.debug(
-                "[PegaKVConnector] Skipping save submission on non-zero TP rank for MLA "
-                "without DCP: tp_rank=%s reqs=%s",
-                self._ctx.tp_rank,
-                request_ids,
-            )
-            with self._save_completion_lock:
-                for req_id in request_ids:
-                    self._req_pending_saves.add(req_id)
-            self._complete_save_requests(request_ids)
-            return
-
         with self._save_completion_lock:
             for req_id in request_ids:
                 if req_id not in self._req_pending_saves:
@@ -708,6 +698,9 @@ class WorkerConnector:
 
                 if self._cross_layer_mode:
                     target_layers = (self._cross_layer_key,)
+                elif self._save_layer_shard is not None:
+                    # MLA replica save: this rank only writes its layer slice.
+                    target_layers = tuple(self._save_layer_shard)
                 else:
                     assert self._registered_layers, (
                         "KV caches must be registered before submitting save intents"
@@ -798,13 +791,43 @@ class WorkerConnector:
                 suffix,
             )
 
-    def _should_skip_save_submission(self) -> bool:
+    def _mla_replica_save(self) -> bool:
+        """Whether to shard the save by layer across TP ranks.
+
+        MLA without DCP replicates the full KV on every TP rank's GPU. Instead
+        of TP0 saving every layer (one GPU's copy engine carries all D2H), each
+        rank writes its own layer slice to its NUMA-local pool. Returns False
+        when KV is already unique per rank (non-MLA), per-rank layer-split
+        registration is in effect, or DCP makes each rank store distinct tokens.
+        """
         return (
             self._ctx.is_mla
             and not self._use_mla_layer_split_registration
             and self._ctx.dcp_world_size == 1
-            and (self._ctx.tp_rank or 0) != 0
+            and self._ctx.tp_size > 1
         )
+
+    def _compute_save_layer_shard(self) -> list[str] | None:
+        """Layer subset this rank is responsible for saving, or None for all.
+
+        Ranks sort registered layer names (matching the server's sorted-name
+        layer-id space) and take a strided slice. Striding by tp_rank is a
+        disjoint, complete partition of the layers with no cross-rank
+        coordination, so the union still fills every block's slots.
+
+        Correctness depends on every rank in the save group registering the
+        identical layer set, which holds here by construction: this path runs
+        only when `_mla_replica_save()` is true, i.e. MLA fully replicates the
+        KV cache across TP ranks and each rank registers the same full layer
+        set. The one mode that registers a per-rank layer subset
+        (`mla_layer_split_kv_cache`) is excluded by `_mla_replica_save()` and
+        already distributes the save itself.
+        """
+        if not self._mla_replica_save():
+            return None
+        ordered = sorted(self._registered_layers)
+        tp_rank = self._ctx.tp_rank or 0
+        return [name for idx, name in enumerate(ordered) if idx % self._ctx.tp_size == tp_rank]
 
     def handle_preemptions(self, preempted_req_ids: set[str] | None) -> None:
         """Wait for preempted requests' saves to complete before blocks are reused.
