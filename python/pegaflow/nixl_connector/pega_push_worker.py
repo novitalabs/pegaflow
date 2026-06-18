@@ -29,7 +29,8 @@ from pegaflow.nixl_connector.rdma_transport import (
     handshake_from_wire,
     handshake_to_wire,
 )
-from pegaflow.nixl_connector.utils import zmq_ctx
+from pegaflow.nixl_connector.tp_mapping import compute_tp_mapping
+from pegaflow.nixl_connector.utils import get_base_request_id, zmq_ctx
 from vllm.logger import init_logger
 from vllm.utils.network_utils import make_zmq_path
 
@@ -183,6 +184,14 @@ class PegaNixlPushConnectorWorker(NixlPushConnectorWorker):
         if not isinstance(reg_data, dict):
             raise RuntimeError(f"missing Pega RDMA registration data for {req_id}")
         handshake = handshake_from_wire(reg_data["pega_rdma_handshake"])
+        if not self._should_push_to_decode_rank(reg_data):
+            logger.debug(
+                "Skipping Pega NIXL RDMA push req=%s from rank=%d to decode rank=%d",
+                req_id,
+                self.tp_rank,
+                handshake.tp_rank,
+            )
+            return
         self.pega_rdma.push_blocks(
             request_id=req_id,
             remote_handshake=handshake,
@@ -244,10 +253,14 @@ class PegaNixlPushConnectorWorker(NixlPushConnectorWorker):
                 self._finished_blocks_inbox.put((req_id, block_ids))
             self._push_writer_wake.set()
 
-        for req_id, reg_data in metadata.push_incoming_registrations.items():
-            self._pending_d_registrations[req_id] = reg_data
-            match = self._pop_matching_finished_blocks(req_id)
+        for reg_key, reg_data in metadata.push_incoming_registrations.items():
+            if not self._should_push_to_decode_rank(reg_data):
+                continue
+            decode_req_id = reg_data["request_id"]
+            self._pending_d_registrations[reg_key] = reg_data
+            match = self._pop_matching_finished_blocks(decode_req_id)
             if match is not None:
+                self._pending_d_registrations.pop(reg_key, None)
                 fin_id, blocks = match
                 self._do_start_push_kv(fin_id, blocks, reg_data)
         if metadata.push_incoming_registrations:
@@ -333,6 +346,29 @@ class PegaNixlPushConnectorWorker(NixlPushConnectorWorker):
         )
         self._attach_registration(push_meta, registration_data)
         self._xfer_blocks_for_req(req_id=request_id, meta=push_meta)
+
+    def _pop_matching_registration(self, request_id: str) -> dict[str, Any] | None:
+        base_id = get_base_request_id(request_id)
+        for reg_key, reg_data in list(self._pending_d_registrations.items()):
+            decode_req_id = reg_data.get("request_id")
+            if (
+                decode_req_id == request_id
+                or get_base_request_id(decode_req_id) == base_id
+            ):
+                return self._pending_d_registrations.pop(reg_key)
+        return super()._pop_matching_registration(request_id)
+
+    def _should_push_to_decode_rank(self, registration_data: dict[str, Any]) -> bool:
+        handshake = handshake_from_wire(registration_data["pega_rdma_handshake"])
+        decode_tp_size = int(registration_data.get("decode_tp_size", handshake.tp_size))
+        if self.transfer_topo is None:
+            return handshake.tp_rank == self.tp_rank
+        plan = compute_tp_mapping(
+            transfer_topology=self.transfer_topo,
+            remote_tp_size=decode_tp_size,
+            group_spec_types=self._group_spec_types,
+        )
+        return handshake.tp_rank in plan.all_source_ranks
 
     def _submit_rdma_wait(self, req_id: str) -> None:
         self._rdma_wait_executor.submit(self._wait_done, req_id)

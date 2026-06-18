@@ -67,7 +67,11 @@ def _install_vllm_stubs() -> None:
     if _module_available("vllm"):
         return
 
-    _ensure_module("vllm")
+    vllm = _ensure_module("vllm")
+    envs = _ensure_module("vllm.envs")
+    envs.VLLM_NIXL_SIDE_CHANNEL_HOST = "127.0.0.1"
+    envs.VLLM_NIXL_SIDE_CHANNEL_PORT = 5555
+    vllm.envs = envs
     _ensure_module("vllm.distributed")
     _ensure_module("vllm.distributed.kv_transfer")
     _ensure_module("vllm.distributed.kv_transfer.kv_connector")
@@ -75,6 +79,7 @@ def _install_vllm_stubs() -> None:
     utils = _ensure_module("vllm.distributed.kv_transfer.kv_connector.utils")
     utils.BlockIds = tuple
     utils.EngineId = str
+    utils.yield_req_data = lambda _scheduler_output: iter(())
 
     @dataclass
     class EngineTransferInfo:
@@ -256,6 +261,7 @@ def _install_vllm_stubs() -> None:
 
     platforms.current_platform = _CurrentPlatform()
     _ensure_module("vllm.utils")
+    _ensure_module("vllm.utils.math_utils").cdiv = lambda a, b: (a + b - 1) // b
     network_utils = _ensure_module("vllm.utils.network_utils")
     network_utils.make_zmq_path = lambda protocol, host, port: f"{protocol}://{host}:{port}"
     network_utils.make_zmq_socket = lambda *, ctx, path, socket_type, bind: MagicMock()
@@ -282,6 +288,9 @@ def _install_vllm_stubs() -> None:
 
     models_utils.extract_layer_index = extract_layer_index
     _ensure_module("vllm.v1")
+    _ensure_module("vllm.v1.core")
+    _ensure_module("vllm.v1.core.sched")
+    _ensure_module("vllm.v1.core.sched.output").SchedulerOutput = object
     _ensure_module("vllm.v1.attention")
     _ensure_module("vllm.v1.attention.backends")
     _ensure_module("vllm.v1.attention.backends.utils").get_kv_cache_layout = lambda: "HND"
@@ -302,6 +311,9 @@ def _install_vllm_stubs() -> None:
     class MambaSpec(KVCacheSpec):
         pass
 
+    class SlidingWindowSpec(FullAttentionSpec):
+        pass
+
     class UniformTypeKVCacheSpecs:
         def __init__(self, kv_cache_specs=None):
             self.kv_cache_specs = kv_cache_specs or {}
@@ -311,6 +323,7 @@ def _install_vllm_stubs() -> None:
     kv_iface.FullAttentionSpec = FullAttentionSpec
     kv_iface.MLAAttentionSpec = MLAAttentionSpec
     kv_iface.MambaSpec = MambaSpec
+    kv_iface.SlidingWindowSpec = SlidingWindowSpec
     kv_iface.UniformTypeKVCacheSpecs = UniformTypeKVCacheSpecs
     _ensure_module("vllm.v1.worker")
     _ensure_module("vllm.v1.worker.block_table").BlockTable = object

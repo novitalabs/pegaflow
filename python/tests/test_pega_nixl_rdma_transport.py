@@ -8,6 +8,7 @@ from .unit_stubs import install_connector_unit_stubs
 install_connector_unit_stubs()
 
 from pegaflow.nixl_connector.metadata import NixlHandshakePayload
+from pegaflow.nixl_connector.base_scheduler import _push_registration_key
 from pegaflow.nixl_connector.base_worker import (
     NixlBaseConnectorWorker,
     _unregister_remote_engine_if_supported,
@@ -17,9 +18,13 @@ from pegaflow.nixl_connector.pega_pull_worker import (
     PegaNixlPullConnectorWorker,
     encode_pega_rdma_handshake_payload,
 )
+from pegaflow.nixl_connector.pega_push_worker import PegaNixlPushConnectorWorker
 from pegaflow.nixl_connector.rdma_transport import PegaNixlRdmaTransport
+from pegaflow.nixl_connector.metadata import NixlConnectorMetadata
+from pegaflow.nixl_connector.rdma_transport import handshake_to_wire
 from pegaflow.pd_connector.metadata import LayerRemoteLayout
 from pegaflow.pd_connector.rdma import MockRdmaPort
+from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 
 def _vllm_config() -> SimpleNamespace:
@@ -160,6 +165,20 @@ def test_transport_pulls_remote_blocks_into_local_blocks() -> None:
         4 * kv_cache.stride()[1] * kv_cache.element_size(),
     ]
     assert "decode-req" in rdma.pop_finished_recving()
+
+
+def test_push_registration_key_preserves_decode_tp_rank() -> None:
+    reg_rank0 = {
+        "request_id": "decode-req",
+        "pega_rdma_handshake": {"tp_rank": 0},
+    }
+    reg_rank1 = {
+        "request_id": "decode-req",
+        "pega_rdma_handshake": {"tp_rank": 1},
+    }
+
+    assert _push_registration_key(reg_rank0) == "decode-req#d0"
+    assert _push_registration_key(reg_rank1) == "decode-req#d1"
 
 
 class RecordingPegaRdma:
@@ -315,6 +334,57 @@ def test_pega_pull_handshake_payload_round_trips() -> None:
     assert payload.compatibility_hash == "compat"
 
 
+def test_pega_push_worker_keeps_only_assigned_decode_rank_registration() -> None:
+    worker = object.__new__(PegaNixlPushConnectorWorker)
+    worker.tp_rank = 0
+    worker.world_size = 2
+    worker.block_size = 2
+    worker.engine_id = "p0"
+    worker.use_mla = False
+    worker.transfer_topo = SimpleNamespace(
+        tp_rank=0,
+        tp_size=2,
+        engine_id="p0",
+        is_mla=False,
+        total_num_kv_heads=8,
+    )
+    worker._group_spec_types = (FullAttentionSpec,)
+    worker._pending_d_registrations = {}
+    worker._push_finished_blocks = {"decode-req": ([1],)}
+    worker._push_writer_wake = SimpleNamespace(set=lambda: None)
+    worker._push_writer_stop = SimpleNamespace(set=lambda: None)
+    worker._push_writer_thread = None
+    worker._rdma_wait_executor = SimpleNamespace(
+        shutdown=lambda *, wait, cancel_futures: None
+    )
+    worker._handshake_initiation_executor = SimpleNamespace(
+        shutdown=lambda *, wait, cancel_futures: None
+    )
+    worker._reqs_to_process = set()
+    worker._reqs_to_send = {}
+    worker._logical_to_kernel_block_ids = lambda block_ids: block_ids
+    worker._as_grouped_block_ids = PegaNixlPushConnectorWorker._as_grouped_block_ids
+    started: list[dict[str, object]] = []
+    worker._do_start_push_kv = lambda req_id, blocks, reg: started.append(
+        {
+            "req_id": req_id,
+            "blocks": blocks,
+            "rank": reg["pega_rdma_handshake"]["tp_rank"],
+        }
+    )
+
+    metadata = NixlConnectorMetadata()
+    metadata.push_incoming_registrations = {
+        "decode-req#d0": _push_registration("decode-req", 0),
+        "decode-req#d1": _push_registration("decode-req", 1),
+    }
+
+    worker.start_load_kv(metadata)
+
+    assert started == [{"req_id": "decode-req", "blocks": ([1],), "rank": 0}]
+    assert sorted(worker._pending_d_registrations) == []
+
+
 def _remote_handshake():
     rdma = RegisteringRdmaPort()
     transport = PegaNixlRdmaTransport(
@@ -326,3 +396,24 @@ def _remote_handshake():
     )
     transport.register_kv_caches({"layer.0": FakeTensor((2, 8, 2, 1, 8))})
     return transport.build_local_handshake("prefill-req", [2, 4])
+
+
+def _push_registration(request_id: str, tp_rank: int) -> dict[str, object]:
+    rdma = RegisteringRdmaPort()
+    transport = PegaNixlRdmaTransport(
+        vllm_config=_vllm_config(),
+        engine_id="d0",
+        tp_rank=tp_rank,
+        tp_size=2,
+        rdma=rdma,
+    )
+    transport.register_kv_caches({"layer.0": FakeTensor((2, 8, 2, 1, 8))})
+    return {
+        "request_id": request_id,
+        "decode_engine_id": "d0",
+        "decode_tp_size": 2,
+        "local_block_ids": ([5],),
+        "pega_rdma_handshake": handshake_to_wire(
+            transport.build_local_handshake(request_id, [5], imm_id=tp_rank + 1)
+        ),
+    }

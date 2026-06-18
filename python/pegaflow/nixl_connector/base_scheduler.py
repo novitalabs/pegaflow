@@ -49,6 +49,14 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _push_registration_key(reg_data: dict[str, Any]) -> str:
+    request_id = str(reg_data["request_id"])
+    handshake = reg_data.get("pega_rdma_handshake")
+    if isinstance(handshake, dict) and handshake.get("tp_rank") is not None:
+        return f"{request_id}#d{int(handshake['tp_rank'])}"
+    return request_id
+
+
 class NixlBaseConnectorScheduler:
     """Base implementation of Scheduler side methods shared by pull and push."""
 
@@ -333,7 +341,7 @@ class NixlBaseConnectorScheduler:
                         reg_data = msgspec.msgpack.decode(
                             payload[len(PUSH_REG_NOTIF_PREFIX) :]
                         )
-                        req_id = reg_data["request_id"]
+                        req_id = _push_registration_key(reg_data)
                         with incoming_push_registrations_lock:
                             incoming_push_registrations[str(req_id)] = reg_data
                         sock.send_multipart((identity, b"", b"OK"))
