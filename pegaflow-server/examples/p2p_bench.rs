@@ -126,6 +126,15 @@ struct Cli {
     #[arg(long)]
     page_first: bool,
 
+    /// Model the KV as a single MLA replica (effective_tp_size=1): register all
+    /// `--tp` GPUs into one slot space (tp_rank=0, unique device_id) and
+    /// block-stripe the save (GPU r stores blocks where block_id % tp == r, all
+    /// layers). Stores ONE logical copy striped across the GPUs / both NUMA
+    /// nodes -- the real GLM-5.1 MLA-TP transfer shape. Without it, `--tp` is
+    /// dense (N independent full copies).
+    #[arg(long)]
+    mla_replica: bool,
+
     /// Blocks per set (one set ~= one request's KV prefix = seq_len / block_size).
     #[arg(long, default_value_t = 1000)]
     blocks: usize,
@@ -227,13 +236,22 @@ impl LayerSpec {
 
 struct Shape {
     layers: Vec<LayerSpec>,
+    /// Physical GPU / device count.
     tp: usize,
     blocks: usize,
+    /// One MLA replica striped across the `tp` GPUs (effective_tp_size=1).
+    mla_replica: bool,
 }
 
 impl Shape {
     fn num_layers(&self) -> usize {
         self.layers.len()
+    }
+
+    /// Effective tp_size the engine sees: 1 for an MLA replica, else the
+    /// physical GPU count (dense TP).
+    fn eng_tp_size(&self) -> usize {
+        if self.mla_replica { 1 } else { self.tp }
     }
 
     /// Byte offset of layer `i` inside a rank's buffer (prefix sum).
@@ -248,8 +266,14 @@ impl Shape {
         self.layers.iter().map(|l| l.total_bytes(self.blocks)).sum()
     }
 
+    /// Bytes stored and transferred for one set: dense = `tp` independent
+    /// copies; mla-replica = one copy striped across the `tp` GPUs.
     fn set_bytes(&self) -> usize {
-        self.tp * self.rank_bytes()
+        if self.mla_replica {
+            self.rank_bytes()
+        } else {
+            self.tp * self.rank_bytes()
+        }
     }
 
     fn layer_names(&self) -> Vec<String> {
@@ -260,21 +284,23 @@ impl Shape {
 
     /// Host slots a single block occupies on the fetch path.
     fn slots_per_block(&self, page_first: bool) -> usize {
+        let eng_tp = self.eng_tp_size();
         if page_first {
-            self.tp
+            eng_tp
         } else {
-            self.num_layers() * self.tp
+            self.num_layers() * eng_tp
         }
     }
 
     /// RDMA read descriptors the requester issues for one set.
     fn descriptors(&self, page_first: bool) -> usize {
+        let eng_tp = self.eng_tp_size();
         if page_first {
-            // one contiguous page per (block, rank), single segment
-            self.blocks * self.tp
+            // one contiguous page per (block, slot), single segment
+            self.blocks * eng_tp
         } else {
             let segs_per_rank: usize = self.layers.iter().map(|l| l.segments).sum();
-            self.blocks * segs_per_rank * self.tp
+            self.blocks * segs_per_rank * eng_tp
         }
     }
 }
@@ -356,6 +382,9 @@ fn register_ranks(engine: &PegaEngine, shape: &Shape, page_first: bool) -> Vec<R
         .collect();
     let segments: Vec<usize> = shape.layers.iter().map(|l| l.segments).collect();
     let num_blocks = vec![shape.blocks; shape.num_layers()];
+    // MLA replica: every GPU registers tp_rank=0, tp_size=1 (one slot space),
+    // distinguished only by device_id. Dense: tp_rank=device, tp_size=tp.
+    let eng_tp = shape.eng_tp_size();
 
     (0..shape.tp)
         .map(|rank| {
@@ -364,15 +393,16 @@ fn register_ranks(engine: &PegaEngine, shape: &Shape, page_first: bool) -> Vec<R
             let ptrs: Vec<u64> = (0..shape.num_layers())
                 .map(|l| buf.ptr + shape.layer_offset(l) as u64)
                 .collect();
+            let tp_rank = if shape.mla_replica { 0 } else { rank };
             engine
                 .register_context_layer_batch(
                     INSTANCE,
                     NAMESPACE,
-                    rank as i32, // device_id
-                    rank,        // tp_rank
-                    0,           // pp_rank
-                    shape.tp,
-                    shape.tp, // world_size
+                    rank as i32, // device_id (the worker key)
+                    tp_rank,
+                    0, // pp_rank
+                    eng_tp,
+                    shape.tp, // world_size = physical GPU count
                     &layer_names,
                     &ptrs,
                     &size_bytes,
@@ -491,25 +521,37 @@ async fn run_holder(cli: &Cli, shape: &Shape, pool_bytes: usize) {
     });
 
     let ranks = register_ranks(&engine, shape, cli.page_first);
-    let block_ids: Vec<usize> = (0..shape.blocks).collect();
     let layer_names = shape.layer_names();
 
     let mut image = vec![0u8; shape.rank_bytes()];
     for set in 0..cli.sets {
         let hashes = make_block_hashes(shape.blocks, set);
         for (rank, rb) in ranks.iter().enumerate() {
-            fill_rank_image(shape, set, rank, &mut image);
+            // MLA replica: all GPUs hold identical content and each saves only
+            // its block stripe (block_id % tp == rank), so the union is exactly
+            // one copy. Dense: each GPU has distinct content and saves every block.
+            let content_rank = if cli.mla_replica { 0 } else { rank };
+            fill_rank_image(shape, set, content_rank, &mut image);
             rb.buf.copy_from_host(&image);
+            let (block_ids, block_hashes): (Vec<usize>, Vec<Vec<u8>>) = if cli.mla_replica {
+                (0..shape.blocks)
+                    .filter(|b| b % shape.tp == rank)
+                    .map(|b| (b, hashes[b].clone()))
+                    .unzip()
+            } else {
+                ((0..shape.blocks).collect(), hashes.clone())
+            };
+            let tp_rank = if cli.mla_replica { 0 } else { rank };
             let saves = layer_names
                 .iter()
                 .map(|name| LayerSave {
                     layer_name: name.clone(),
                     block_ids: block_ids.clone(),
-                    block_hashes: hashes.clone(),
+                    block_hashes: block_hashes.clone(),
                 })
                 .collect();
             engine
-                .batch_save_kv_blocks_from_ipc(INSTANCE, rank, 0, rb.device as i32, saves)
+                .batch_save_kv_blocks_from_ipc(INSTANCE, tp_rank, 0, rb.device as i32, saves)
                 .await
                 .expect("save");
         }
@@ -646,8 +688,18 @@ async fn verify_set(
     let layer_names = shape.layer_names();
     let layer_name_refs: Vec<&str> = layer_names.iter().map(|s| s.as_str()).collect();
 
+    // MLA replica: one stored copy loadable from any worker (tp_rank=0); verify
+    // it once on device 0. Dense: verify each rank's distinct shard.
+    let targets: Vec<(usize, &RankBuffers)> = if shape.mla_replica {
+        vec![(0usize, &ranks[0])]
+    } else {
+        ranks.iter().enumerate().collect()
+    };
+
     let mut expected = vec![0u8; shape.rank_bytes()];
-    for (rank, rb) in ranks.iter().enumerate() {
+    for (rank, rb) in targets {
+        let tp_rank = if shape.mla_replica { 0 } else { rank };
+        let content_rank = if shape.mla_replica { 0 } else { rank };
         let lease = engine
             .create_query_lease(INSTANCE, blocks.clone())
             .expect("create lease");
@@ -656,7 +708,7 @@ async fn verify_set(
         engine
             .batch_load_kv_blocks_multi_layer(
                 INSTANCE,
-                rank,
+                tp_rank,
                 rb.device as i32,
                 load_state.shm_name(),
                 &layer_name_refs,
@@ -675,16 +727,14 @@ async fn verify_set(
         }
 
         let loaded = rb.buf.copy_to_host();
-        fill_rank_image(shape, set, rank, &mut expected);
+        fill_rank_image(shape, set, content_rank, &mut expected);
         assert!(
             loaded == expected,
             "verify FAILED: set {set} rank {rank} differs from generator pattern"
         );
     }
-    println!(
-        "VERIFY set={set} ok (all {} ranks, every byte)",
-        ranks.len()
-    );
+    let n = if shape.mla_replica { 1 } else { ranks.len() };
+    println!("VERIFY set={set} ok ({n} target(s), every byte)");
 }
 
 fn nic_config(cli: &Cli) -> Option<Vec<String>> {
@@ -704,6 +754,7 @@ async fn main() {
         layers: build_layers(&cli),
         tp: cli.tp,
         blocks: cli.blocks,
+        mla_replica: cli.mla_replica,
     };
     // Generous slack: if the pool runs tight the engine evicts earlier sets
     // (and deregisters them from MetaServer), which breaks the run.
@@ -714,7 +765,7 @@ async fn main() {
     };
     info!(
         "p2p_bench role={:?} model={:?} layers={} tp={} blocks={} sets={} \
-         set_bytes={:.1}MiB pool={:.1}GiB page_first={}",
+         set_bytes={:.1}MiB pool={:.1}GiB page_first={} mla_replica={}",
         cli.role,
         cli.model,
         shape.num_layers(),
@@ -724,6 +775,7 @@ async fn main() {
         shape.set_bytes() as f64 / (1024.0 * 1024.0),
         pool_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
         cli.page_first,
+        cli.mla_replica,
     );
 
     match cli.role {
