@@ -1,13 +1,29 @@
 //! End-to-end p2p RDMA fetch benchmark and integrity test.
 //!
 //! Drives the production cross-node path without vLLM. The holder saves
-//! blocks through the real GPU save path with a vLLM-shaped layout
-//! (`layers x tp_ranks` slots per block, split K/V segments), registers them
-//! in an in-process MetaServer, and serves the production Engine gRPC
-//! service. The requester registers the same layout, then walks the real
-//! prefetch path: MetaServer discovery -> QueryBlocksForTransfer ->
-//! RDMA READ (requester reads holder slabs) -> SealedBlock rebuild, and
-//! optionally loads the blocks to GPU and verifies every byte.
+//! blocks through the real GPU save path, registers them in an in-process
+//! MetaServer, and serves the production Engine gRPC service. The requester
+//! registers the same layout, then walks the real prefetch path: MetaServer
+//! discovery -> QueryBlocksForTransfer -> RDMA READ (requester reads holder
+//! slabs) -> SealedBlock rebuild, and optionally loads to GPU and verifies
+//! every byte.
+//!
+//! Two layouts:
+//!   * `--model uniform` (default): vLLM dense-attention shape, `layers`
+//!     equal-size split-K/V layers (`--segments 2`). One host slot per
+//!     (layer, tp_rank).
+//!   * `--model glm51`: GLM-5.1 (glm_moe_dsa) MLA shape. Each transformer
+//!     layer contributes two single-segment KV layers -- an MLA latent cache
+//!     (kv_lora_rank 512 + qk_rope_head_dim 64 = 576 dims) and a DSA sparse
+//!     indexer k_cache (index_head_dim 128), both bf16. MLA replicates KV
+//!     across TP, so the realistic transfer shape is `--tp 1` (one effective
+//!     copy).
+//!
+//! `--page-first` collapses host slots from (layers x tp) to (tp): one
+//! contiguous page per (block, tp_rank) instead of one slot per
+//! (block, layer, tp_rank). This cuts RDMA descriptors and the
+//! QueryBlocksForTransfer response payload by ~num_layers. Page-first requires
+//! single-segment layers (it rejects split K/V).
 //!
 //! Holder (node A):
 //!   p2p_bench --role holder --advertise-ip <A> --nics mlx5_0,...
@@ -36,6 +52,15 @@ use tonic::transport::Server;
 enum Role {
     Holder,
     Requester,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq)]
+enum Model {
+    /// vLLM dense-attention: `layers` equal-size split-K/V layers.
+    Uniform,
+    /// GLM-5.1 (glm_moe_dsa): per transformer layer, an MLA latent cache +
+    /// a DSA indexer k_cache, both single-segment bf16.
+    Glm51,
 }
 
 #[derive(Parser)]
@@ -67,19 +92,41 @@ struct Cli {
     #[arg(long, value_delimiter = ',', num_args = 1..)]
     nics: Vec<String>,
 
-    /// Model shape: transformer layers (block slots = layers * tp).
+    /// Layout model.
+    #[arg(long, value_enum, default_value_t = Model::Uniform)]
+    model: Model,
+
+    /// `uniform`: transformer layers (block slots = layers * tp).
     #[arg(long, default_value_t = 36)]
     layers: usize,
 
-    /// Model shape: tensor-parallel ranks; rank r uses CUDA device r.
-    #[arg(long, default_value_t = 8)]
-    tp: usize,
+    /// `glm51`: transformer layers incl. MTP; KV layers = 2 * this.
+    #[arg(long, default_value_t = 79)]
+    glm_layers: usize,
 
-    /// K segment bytes per (block, layer, rank); V segment is the same size.
+    /// Tokens per block (KV page size). `glm51` derives per-layer bytes from it.
+    #[arg(long, default_value_t = 64)]
+    block_size: usize,
+
+    /// `uniform`: K segment bytes per (block, layer, rank). V segment matches.
     #[arg(long, default_value_t = 4096)]
     kv_bytes: usize,
 
-    /// Blocks per set (one set ~= one request's KV prefix).
+    /// `uniform`: segments per slot (2 = split K/V, 1 = single). Page-first
+    /// requires 1.
+    #[arg(long, default_value_t = 2)]
+    segments: usize,
+
+    /// Tensor-parallel ranks; rank r uses CUDA device r. MLA uses tp=1.
+    #[arg(long, default_value_t = 8)]
+    tp: usize,
+
+    /// Store one contiguous page per (block, tp_rank) instead of one slot per
+    /// (block, layer, tp_rank). Collapses metadata ~num_layers. Single-segment only.
+    #[arg(long)]
+    page_first: bool,
+
+    /// Blocks per set (one set ~= one request's KV prefix = seq_len / block_size).
     #[arg(long, default_value_t = 1000)]
     blocks: usize,
 
@@ -87,7 +134,7 @@ struct Cli {
     #[arg(long, default_value_t = 4)]
     sets: usize,
 
-    /// Pinned pool size in GiB. 0 = auto (sets * set bytes + 25% slack).
+    /// Pinned pool size in GiB. 0 = auto (sets * set bytes + 50% slack).
     #[arg(long, default_value_t = 0)]
     pool_gib: usize,
 
@@ -155,27 +202,50 @@ impl GpuBuffer {
     }
 }
 
-/// One tp rank's GPU state: a single buffer backing all layers,
-/// layer l at offset `l * layer_bytes`, K run then V run inside a layer.
+/// One tp rank's GPU state: a single buffer backing all layers, layer `i` at
+/// `layer_offset(i)`, segments laid out back to back inside a layer.
 struct RankBuffers {
     device: usize,
     buf: GpuBuffer,
 }
 
-struct Shape {
-    layers: usize,
-    tp: usize,
+/// One KV layer's per-block geometry.
+#[derive(Clone, Copy)]
+struct LayerSpec {
+    /// Bytes per block for ONE segment of this layer.
     kv_bytes: usize,
+    /// Segments per slot: 1 (single latent) or 2 (split K/V).
+    segments: usize,
+}
+
+impl LayerSpec {
+    /// Bytes one rank stores for this layer across all blocks and segments.
+    fn total_bytes(&self, blocks: usize) -> usize {
+        self.segments * blocks * self.kv_bytes
+    }
+}
+
+struct Shape {
+    layers: Vec<LayerSpec>,
+    tp: usize,
     blocks: usize,
 }
 
 impl Shape {
-    fn layer_bytes(&self) -> usize {
-        2 * self.blocks * self.kv_bytes
+    fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Byte offset of layer `i` inside a rank's buffer (prefix sum).
+    fn layer_offset(&self, i: usize) -> usize {
+        self.layers[..i]
+            .iter()
+            .map(|l| l.total_bytes(self.blocks))
+            .sum()
     }
 
     fn rank_bytes(&self) -> usize {
-        self.layers * self.layer_bytes()
+        self.layers.iter().map(|l| l.total_bytes(self.blocks)).sum()
     }
 
     fn set_bytes(&self) -> usize {
@@ -183,11 +253,61 @@ impl Shape {
     }
 
     fn layer_names(&self) -> Vec<String> {
-        (0..self.layers).map(|l| format!("layer_{l}")).collect()
+        (0..self.num_layers())
+            .map(|l| format!("layer_{l}"))
+            .collect()
+    }
+
+    /// Host slots a single block occupies on the fetch path.
+    fn slots_per_block(&self, page_first: bool) -> usize {
+        if page_first {
+            self.tp
+        } else {
+            self.num_layers() * self.tp
+        }
+    }
+
+    /// RDMA read descriptors the requester issues for one set.
+    fn descriptors(&self, page_first: bool) -> usize {
+        if page_first {
+            // one contiguous page per (block, rank), single segment
+            self.blocks * self.tp
+        } else {
+            let segs_per_rank: usize = self.layers.iter().map(|l| l.segments).sum();
+            self.blocks * segs_per_rank * self.tp
+        }
     }
 }
 
-/// Deterministic content for one (set, rank, layer, block, segment) cell —
+/// Build the per-layer geometry from CLI flags.
+fn build_layers(cli: &Cli) -> Vec<LayerSpec> {
+    match cli.model {
+        Model::Uniform => (0..cli.layers)
+            .map(|_| LayerSpec {
+                kv_bytes: cli.kv_bytes,
+                segments: cli.segments,
+            })
+            .collect(),
+        Model::Glm51 => {
+            // GLM-5.1 (glm_moe_dsa) per-transformer-layer caches, both single
+            // segment, bf16. MTP is counted in glm_layers.
+            const MLA_DIM: usize = 512 + 64; // kv_lora_rank + qk_rope_head_dim
+            const IDX_DIM: usize = 128; // index_head_dim
+            const ELEM: usize = 2; // bf16
+            let attn = LayerSpec {
+                kv_bytes: cli.block_size * MLA_DIM * ELEM,
+                segments: 1,
+            };
+            let idx = LayerSpec {
+                kv_bytes: cli.block_size * IDX_DIM * ELEM,
+                segments: 1,
+            };
+            (0..cli.glm_layers).flat_map(|_| [attn, idx]).collect()
+        }
+    }
+}
+
+/// Deterministic content for one (set, rank, layer, block, segment) cell --
 /// both sides derive it independently, so the requester can verify bytes
 /// without shipping the expected data out of band.
 fn cell_fill(set: usize, rank: usize, layer: usize, block: usize, seg: usize) -> u8 {
@@ -197,10 +317,10 @@ fn cell_fill(set: usize, rank: usize, layer: usize, block: usize, seg: usize) ->
 /// Fill one rank's host image for `set` in the registered GPU layout.
 fn fill_rank_image(shape: &Shape, set: usize, rank: usize, out: &mut [u8]) {
     assert_eq!(out.len(), shape.rank_bytes());
-    let kv = shape.kv_bytes;
-    for layer in 0..shape.layers {
-        let layer_base = layer * shape.layer_bytes();
-        for seg in 0..2 {
+    for (layer, spec) in shape.layers.iter().enumerate() {
+        let layer_base = shape.layer_offset(layer);
+        let kv = spec.kv_bytes;
+        for seg in 0..spec.segments {
             let seg_base = layer_base + seg * shape.blocks * kv;
             for block in 0..shape.blocks {
                 let fill = cell_fill(set, rank, layer, block, seg);
@@ -221,14 +341,28 @@ fn make_block_hashes(blocks: usize, set: usize) -> Vec<Vec<u8>> {
         .collect()
 }
 
-fn register_ranks(engine: &PegaEngine, shape: &Shape) -> Vec<RankBuffers> {
+fn register_ranks(engine: &PegaEngine, shape: &Shape, page_first: bool) -> Vec<RankBuffers> {
     let layer_names = shape.layer_names();
+    let size_bytes: Vec<usize> = shape
+        .layers
+        .iter()
+        .map(|l| l.total_bytes(shape.blocks))
+        .collect();
+    let bytes_per_block: Vec<usize> = shape.layers.iter().map(|l| l.kv_bytes).collect();
+    let kv_stride: Vec<usize> = shape
+        .layers
+        .iter()
+        .map(|l| shape.blocks * l.kv_bytes)
+        .collect();
+    let segments: Vec<usize> = shape.layers.iter().map(|l| l.segments).collect();
+    let num_blocks = vec![shape.blocks; shape.num_layers()];
+
     (0..shape.tp)
         .map(|rank| {
             let ctx = CudaContext::new(rank).expect("CUDA context");
             let buf = GpuBuffer::alloc(ctx, shape.rank_bytes());
-            let ptrs: Vec<u64> = (0..shape.layers)
-                .map(|l| buf.ptr + (l * shape.layer_bytes()) as u64)
+            let ptrs: Vec<u64> = (0..shape.num_layers())
+                .map(|l| buf.ptr + shape.layer_offset(l) as u64)
                 .collect();
             engine
                 .register_context_layer_batch(
@@ -241,13 +375,13 @@ fn register_ranks(engine: &PegaEngine, shape: &Shape) -> Vec<RankBuffers> {
                     shape.tp, // world_size
                     &layer_names,
                     &ptrs,
-                    &vec![shape.layer_bytes(); shape.layers],
-                    &vec![shape.blocks; shape.layers],
-                    &vec![shape.kv_bytes; shape.layers],
-                    &vec![shape.blocks * shape.kv_bytes; shape.layers], // kv_stride
-                    &vec![2; shape.layers],                             // split K/V
+                    &size_bytes,
+                    &num_blocks,
+                    &bytes_per_block,
+                    &kv_stride,
+                    &segments,
                     TransferMode::Direct,
-                    false,
+                    page_first,
                 )
                 .expect("register rank");
             RankBuffers { device: rank, buf }
@@ -287,6 +421,29 @@ async fn cached_blocks(engine: &PegaEngine, req_id: &str, hashes: &[Vec<u8>]) ->
         PrefetchStatus::Ready { blocks, .. } => blocks.len(),
         PrefetchStatus::Loading => 0,
     }
+}
+
+/// Print the layout's metadata footprint -- the quantities page-first shrinks.
+fn report_metadata(shape: &Shape, page_first: bool) {
+    let slots = shape.blocks * shape.slots_per_block(page_first);
+    let descs = shape.descriptors(page_first);
+    // QueryBlocksForTransferResponse carries one TransferSlotInfo per host
+    // slot (5 fields; v_ptr/v_size are 0 for single-segment) plus a per-block
+    // hash. ~25 B/slot + ~12 B/block on the wire is a close estimate.
+    let query_bytes = slots * 25 + shape.blocks * 12;
+    println!(
+        "META page_first={page_first} model_layers={} tp={} blocks={} \
+         set_mib={:.1} slots_per_block={} total_slots={} rdma_descriptors={} \
+         query_resp_kib={:.1}",
+        shape.num_layers(),
+        shape.tp,
+        shape.blocks,
+        shape.set_bytes() as f64 / (1024.0 * 1024.0),
+        shape.slots_per_block(page_first),
+        slots,
+        descs,
+        query_bytes as f64 / 1024.0,
+    );
 }
 
 async fn run_holder(cli: &Cli, shape: &Shape, pool_bytes: usize) {
@@ -333,7 +490,7 @@ async fn run_holder(cli: &Cli, shape: &Shape, pool_bytes: usize) {
             .expect("Engine gRPC serve");
     });
 
-    let ranks = register_ranks(&engine, shape);
+    let ranks = register_ranks(&engine, shape, cli.page_first);
     let block_ids: Vec<usize> = (0..shape.blocks).collect();
     let layer_names = shape.layer_names();
 
@@ -383,6 +540,7 @@ async fn run_holder(cli: &Cli, shape: &Shape, pool_bytes: usize) {
         );
     }
 
+    report_metadata(shape, cli.page_first);
     println!(
         "HOLDER_READY sets={} blocks={} set_mib={:.1}",
         cli.sets,
@@ -408,8 +566,9 @@ async fn run_requester(cli: &Cli, shape: &Shape, pool_bytes: usize) {
         PegaEngine::new_with_config(pool_bytes, cli.use_hugepages, config)
             .expect("requester engine"),
     );
-    let ranks = register_ranks(&engine, shape);
+    let ranks = register_ranks(&engine, shape, cli.page_first);
     let set_mib = shape.set_bytes() as f64 / (1024.0 * 1024.0);
+    report_metadata(shape, cli.page_first);
 
     let mut results: Vec<(usize, f64)> = Vec::new();
     for set in 0..cli.sets {
@@ -432,8 +591,11 @@ async fn run_requester(cli: &Cli, shape: &Shape, pool_bytes: usize) {
         let gib_s = shape.set_bytes() as f64 / (1024.0 * 1024.0 * 1024.0) / elapsed.as_secs_f64();
         let label = if set == 0 { "warmup" } else { "measure" };
         println!(
-            "FETCH {label} set={set} mib={set_mib:.1} ms={:.2} gib_s={gib_s:.2}",
-            elapsed.as_secs_f64() * 1000.0
+            "FETCH {label} page_first={} set={set} mib={set_mib:.1} ms={:.2} \
+             gib_s={gib_s:.2} descriptors={}",
+            cli.page_first,
+            elapsed.as_secs_f64() * 1000.0,
+            shape.descriptors(cli.page_first),
         );
         if set > 0 {
             results.push((set, elapsed.as_secs_f64()));
@@ -449,8 +611,13 @@ async fn run_requester(cli: &Cli, shape: &Shape, pool_bytes: usize) {
         times.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let median = times[times.len() / 2];
         println!(
-            "SUMMARY sets_measured={} set_mib={set_mib:.1} median_ms={:.2} median_gib_s={:.2}",
-            times.len(),
+            "SUMMARY page_first={} model_layers={} tp={} blocks={} set_mib={set_mib:.1} \
+             descriptors={} median_ms={:.2} median_gib_s={:.2}",
+            cli.page_first,
+            shape.num_layers(),
+            shape.tp,
+            shape.blocks,
+            shape.descriptors(cli.page_first),
             median * 1000.0,
             shape.set_bytes() as f64 / (1024.0 * 1024.0 * 1024.0) / median
         );
@@ -534,9 +701,8 @@ async fn main() {
     pegaflow_common::logging::init_stdout_colored("info");
 
     let shape = Shape {
-        layers: cli.layers,
+        layers: build_layers(&cli),
         tp: cli.tp,
-        kv_bytes: cli.kv_bytes,
         blocks: cli.blocks,
     };
     // Generous slack: if the pool runs tight the engine evicts earlier sets
@@ -547,15 +713,17 @@ async fn main() {
         (cli.sets * shape.set_bytes() + shape.set_bytes() / 2).max(1 << 30)
     };
     info!(
-        "p2p_bench role={:?} shape: layers={} tp={} kv_bytes={} blocks={} sets={} set_bytes={:.1}MiB pool={:.1}GiB",
+        "p2p_bench role={:?} model={:?} layers={} tp={} blocks={} sets={} \
+         set_bytes={:.1}MiB pool={:.1}GiB page_first={}",
         cli.role,
-        shape.layers,
+        cli.model,
+        shape.num_layers(),
         shape.tp,
-        shape.kv_bytes,
         shape.blocks,
         cli.sets,
         shape.set_bytes() as f64 / (1024.0 * 1024.0),
         pool_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        cli.page_first,
     );
 
     match cli.role {
