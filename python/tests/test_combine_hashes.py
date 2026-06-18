@@ -118,49 +118,61 @@ def test_effective_tp_cases(case: str, kwargs: dict, expected_rank: int, expecte
     assert ctx.effective_tp_size == expected_size, case
 
 
+# ---------------------------------------------------------------------------
+# Tests — page-first storage (all layers of a block in one page slot)
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.parametrize(
     ("case", "kwargs", "additional_config", "expected"),
     [
         pytest.param(
-            "ordinary_mla_replica_shards_by_layer",
-            {"is_mla": True, "tp_rank": 1, "tp_size": 2},
+            "mla_no_dcp_uses_page_first",
+            {"is_mla": True, "tp_rank": 0, "tp_size": 2},
             {},
             True,
-            id="ordinary_mla_replica",
+            id="mla_no_dcp",
         ),
         pytest.param(
-            "mla_layer_split_registration_already_distributes",
-            {"is_mla": True, "tp_rank": 1, "tp_size": 2},
+            "mla_tp1_still_page_first",
+            {"is_mla": True, "tp_rank": 0, "tp_size": 1},
+            {},
+            True,
+            id="mla_tp1",
+        ),
+        pytest.param(
+            "mla_layer_split_opts_out",
+            {"is_mla": True, "tp_rank": 0, "tp_size": 2},
             {"mla_layer_split_kv_cache": True},
             False,
-            id="mla_layer_split_registration",
+            id="layer_split",
         ),
         pytest.param(
-            "dcp_mla_stores_distinct_tokens",
-            {"is_mla": True, "tp_rank": 1, "tp_size": 2, "dcp_world_size": 2, "dcp_rank": 1},
+            "dcp_mla_opts_out",
+            {"is_mla": True, "tp_rank": 0, "tp_size": 2, "dcp_world_size": 2, "dcp_rank": 1},
             {},
             False,
-            id="dcp_mla",
+            id="dcp",
         ),
         pytest.param(
-            "non_mla_already_unique_per_rank",
-            {"is_mla": False, "tp_rank": 1, "tp_size": 2},
+            # PP stages each hold only their own layers, so no single worker can
+            # write a block's whole page — page-first must opt out.
+            "pp_mla_opts_out",
+            {"is_mla": True, "tp_rank": 0, "tp_size": 2, "pp_size": 2, "pp_rank": 1},
+            {},
+            False,
+            id="pp",
+        ),
+        pytest.param(
+            "non_mla_opts_out",
+            {"is_mla": False, "tp_rank": 0, "tp_size": 2},
             {},
             False,
             id="non_mla",
         ),
-        pytest.param(
-            "mla_single_gpu_nothing_to_shard",
-            {"is_mla": True, "tp_rank": 0, "tp_size": 1},
-            {},
-            False,
-            id="mla_tp1",
-        ),
     ],
 )
-def test_mla_replica_save_detection(
-    case: str, kwargs: dict, additional_config: dict, expected: bool
-):
+def test_use_page_first_detection(case: str, kwargs: dict, additional_config: dict, expected: bool):
     from pegaflow.connector.worker import WorkerConnector
 
     ctx = _make_ctx(**kwargs)
@@ -169,50 +181,57 @@ def test_mla_replica_save_detection(
         vllm_config=SimpleNamespace(additional_config=additional_config),
     )
     try:
-        assert worker._mla_replica_save() is expected, case
+        assert worker._use_page_first() is expected, case
     finally:
         worker.shutdown()
 
 
-def test_mla_save_layer_shard_is_a_partition():
-    """Across ranks the per-rank layer shards must be disjoint and cover every
-    layer — otherwise blocks never seal (missing slot) or get double-saved."""
+def test_page_first_block_shard_is_a_partition():
+    """Page-first distributes saves by block, not by layer. Across ranks the
+    block stripes must be disjoint and cover every block — otherwise a block's
+    page is dropped (never sealed) or saved twice."""
     from pegaflow.connector.worker import WorkerConnector
 
-    layers = [f"model.layers.{i}.self_attn.attn" for i in range(13)]
+    block_ids = tuple(range(13))
+    block_hashes = tuple(bytes([i]) for i in block_ids)
+    intent = SaveIntent(block_ids=block_ids, block_hashes=block_hashes)
     tp_size = 4
 
-    seen: list[str] = []
+    seen: list[int] = []
     for tp_rank in range(tp_size):
         ctx = _make_ctx(is_mla=True, tp_rank=tp_rank, tp_size=tp_size)
         worker = WorkerConnector(ctx, vllm_config=SimpleNamespace(additional_config={}))
         try:
-            worker._registered_layers = list(layers)
-            shard = worker._compute_save_layer_shard()
-            worker._registered_layers = []  # skip mock unregister on shutdown
+            ids, hashes = worker._block_shard(intent)
         finally:
             worker.shutdown()
-        assert shard is not None, tp_rank
-        seen.extend(shard)
+        # block_ids and block_hashes stay aligned after striping.
+        assert [bytes([i]) for i in ids] == hashes, tp_rank
+        seen.extend(ids)
 
     # Equal sorted multisets ⇒ complete coverage and no duplicates across ranks.
-    assert sorted(seen) == sorted(layers)
+    assert sorted(seen) == sorted(block_ids)
 
 
-def test_mla_replica_save_submits_only_this_ranks_shard():
-    """A non-zero MLA rank must save its layer slice (not all layers, not
-    nothing) — this is what replaces the old TP0-only save."""
+def test_page_first_saves_all_layers_for_this_ranks_block_stripe():
+    """A page needs every layer, so a page-first rank saves ALL layers but only
+    its block stripe (block_id % tp_size == tp_rank)."""
     from pegaflow.connector.worker import SaveTask, WorkerConnector
 
     ctx = _make_ctx(is_mla=True, tp_rank=1, tp_size=2, device_id=1)
     worker = WorkerConnector(ctx, vllm_config=SimpleNamespace(additional_config={}))
-    worker._registered_layers = ["a", "b", "c", "d"]
-    worker._save_layer_shard = worker._compute_save_layer_shard()  # sorted idx%2==1 → b, d
+    worker._registered_layers = ["a", "b", "c"]
+    worker._page_first = True
     worker._torch_device = None
     ctx.engine_client.save.return_value = (True, "")
 
     meta = PegaConnectorMetadata(
-        save_intents={"r1": SaveIntent(block_ids=(0, 1), block_hashes=(b"h0", b"h1"))}
+        save_intents={
+            "r1": SaveIntent(
+                block_ids=(0, 1, 2, 3),
+                block_hashes=(b"h0", b"h1", b"h2", b"h3"),
+            )
+        }
     )
     try:
         with patch("torch.cuda.synchronize"):
@@ -223,7 +242,12 @@ def test_mla_replica_save_submits_only_this_ranks_shard():
 
     ctx.engine_client.save.assert_called_once()
     saves_list = ctx.engine_client.save.call_args.args[4]
-    assert {name for name, _ids, _hashes in saves_list} == {"b", "d"}
+    # Every layer is saved (the whole page)...
+    assert {name for name, _ids, _hashes in saves_list} == {"a", "b", "c"}
+    # ...but only rank 1's block stripe (odd block ids), hashes kept aligned.
+    for _name, ids, hashes in saves_list:
+        assert list(ids) == [1, 3]
+        assert list(hashes) == [b"h1", b"h3"]
 
 
 # ---------------------------------------------------------------------------

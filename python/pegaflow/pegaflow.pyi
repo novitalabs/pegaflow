@@ -76,6 +76,7 @@ class EngineRpcClient:
         kv_stride_bytes_list: list[int],
         segments_list: list[int],
         transfer_backend: str,
+        page_first: bool,
     ) -> tuple[bool, str]:
         """Register all KV cache layers on a GPU with a single RPC call.
 

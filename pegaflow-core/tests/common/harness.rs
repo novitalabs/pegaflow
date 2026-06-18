@@ -136,6 +136,7 @@ pub struct TestEnvBuilder {
     world_size: usize,
     storage_config: Option<StorageConfig>,
     transfer_mode: TransferMode,
+    page_first: bool,
     layers: Vec<LayerSpec>,
 }
 
@@ -148,8 +149,15 @@ impl TestEnvBuilder {
             world_size: 1,
             storage_config: None,
             transfer_mode: TransferMode::Direct,
+            page_first: false,
             layers: vec![],
         }
+    }
+
+    /// Store blocks page-first (all layers of a block in one host page slot).
+    pub fn page_first(mut self) -> Self {
+        self.page_first = true;
+        self
     }
 
     /// Add a contiguous (single-segment) layer.
@@ -268,6 +276,7 @@ impl TestEnvBuilder {
                 1,
                 self.world_size,
                 self.transfer_mode,
+                self.page_first,
             );
         }
 
@@ -348,6 +357,26 @@ impl TestEnv {
         for i in 0..self.layers.len() {
             self.save_layer(i, hashes).await;
         }
+        self.engine.flush_saves().await;
+    }
+
+    /// Save every layer in ONE batch call, then flush. Page-first requires all
+    /// layers of a block in a single save so the page is complete; this mirrors
+    /// the connector, which submits all layers in one `save` RPC.
+    pub async fn save_all_layers_one_batch(&self, hashes: &[Vec<u8>]) {
+        let saves: Vec<LayerSave> = self
+            .layers
+            .iter()
+            .map(|layer| LayerSave {
+                layer_name: layer.name.clone(),
+                block_ids: (0..hashes.len()).collect(),
+                block_hashes: hashes.to_vec(),
+            })
+            .collect();
+        self.engine
+            .batch_save_kv_blocks_from_ipc(&self.instance_id, 0, 0, 0, saves)
+            .await
+            .expect("save all layers");
         self.engine.flush_saves().await;
     }
 

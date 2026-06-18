@@ -67,6 +67,10 @@ pub(crate) enum HostBlock {
     Cached {
         sealed: Arc<SealedBlock>,
         slot_id: usize,
+        /// Byte offset into the slot's `RawBlock` where this layer begins.
+        /// Page-first reads every layer from one page slot at distinct
+        /// offsets; layer-first is always 0 (the slot is the layer).
+        offset: usize,
     },
 }
 
@@ -74,9 +78,19 @@ impl HostBlock {
     pub(crate) fn raw(&self) -> &RawBlock {
         match self {
             Self::Owned(block) => block,
-            Self::Cached { sealed, slot_id } => sealed
+            Self::Cached {
+                sealed, slot_id, ..
+            } => sealed
                 .get_slot(*slot_id)
                 .expect("cached slot_id validated at construction"),
+        }
+    }
+
+    /// Byte offset of this layer within its host slot (0 unless page-first).
+    fn host_offset(&self) -> usize {
+        match self {
+            Self::Owned(_) => 0,
+            Self::Cached { offset, .. } => *offset,
         }
     }
 }
@@ -349,14 +363,19 @@ fn build_copy_descs(layers: &[LayerTransferData]) -> Result<(Vec<CopyDesc>, usiz
                 .block_copies(block.block_idx)
                 .map_err(|e| EngineError::Storage(format!("layer {layer_name}: {e}")))?;
 
+            // Page-first reads/writes every layer from one slot at its byte
+            // offset; layer-first leaves this 0 (slot == layer).
+            let host_offset = block.block.host_offset();
+
             match block_copies {
                 BlockCopies::Split { k, v } => {
                     let raw = block.block.raw();
-                    let k_ptr = raw.segment_mapped_ptr(0).unwrap();
+                    let k_ptr = raw.segment_mapped_ptr(0).unwrap().add(host_offset);
                     // SAFETY: For a contiguous host block (segment 1 absent), the
                     // allocation is 2 * segment size, so k + k.bytes is in bounds.
                     let v_ptr = raw
                         .segment_mapped_ptr(1)
+                        .map(|p| p.add(host_offset))
                         .unwrap_or_else(|| k_ptr.add(k.bytes));
 
                     copies.push(CopyDesc {
@@ -374,7 +393,12 @@ fn build_copy_descs(layers: &[LayerTransferData]) -> Result<(Vec<CopyDesc>, usiz
                     total_bytes += k.bytes + v.bytes;
                 }
                 BlockCopies::Contiguous(c) => {
-                    let ptr = block.block.raw().segment_mapped_ptr(0).unwrap();
+                    let ptr = block
+                        .block
+                        .raw()
+                        .segment_mapped_ptr(0)
+                        .unwrap()
+                        .add(host_offset);
                     copies.push(CopyDesc {
                         device: c.addr,
                         host: ptr.host().as_ptr(),

@@ -146,6 +146,7 @@ impl BenchFixture {
                 &[0],
                 &[1],
                 transfer_mode,
+                false,
             )
             .expect("register layer");
 
@@ -333,6 +334,7 @@ impl MultiLayerBenchFixture {
                 &strides,
                 &segments,
                 TransferMode::Direct,
+                false,
             )
             .expect("register layers");
 

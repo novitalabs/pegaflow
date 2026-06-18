@@ -248,6 +248,7 @@ fn wedge_register_request(i: usize) -> RegisterContextRequest {
         segments: vec![1],
         pp_rank: 0,
         transfer_mode: TransferMode::Direct as i32,
+        page_first: false,
     }
 }
 

@@ -41,6 +41,11 @@ message RegisterContextRequest {
   // direct otherwise; overridable via pegaflow.transfer_backend). The engine
   // spawns this instance's GPU worker pools with the requested backend.
   TransferMode transfer_mode = 17;
+  // Page-first storage: collapse all layers of a block into one contiguous
+  // page per tp_rank, so total_slots = tp_size instead of num_layers * tp_size.
+  // Set by the connector for MLA; the engine derives per-layer page offsets
+  // from the registered layouts. See spec.md.
+  bool page_first = 18;
 }
 
 message RegisterContextResponse {

@@ -534,6 +534,7 @@ fn register_instance_layers(
                 &[0],
                 &[1],
                 TransferMode::Direct,
+                false,
             )
             .expect("register_context_layer_batch");
     }

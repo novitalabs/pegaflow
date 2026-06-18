@@ -183,6 +183,7 @@ impl PegaEngine {
         namespace: &str,
         tp_size: usize,
         world_size: usize,
+        page_first: bool,
     ) -> Result<Arc<InstanceContext>, EngineError> {
         let mut instances = self
             .instances
@@ -191,9 +192,11 @@ impl PegaEngine {
 
         if let Some(instance) = instances.get(instance_id) {
             // Already exists, verify topology
-            instance.verify_topology(tp_size, world_size).map_err(|e| {
-                EngineError::TopologyMismatch(format!("instance {instance_id} {e}"))
-            })?;
+            instance
+                .verify_topology(tp_size, world_size, page_first)
+                .map_err(|e| {
+                    EngineError::TopologyMismatch(format!("instance {instance_id} {e}"))
+                })?;
             return Ok(Arc::clone(instance));
         }
 
@@ -203,6 +206,7 @@ impl PegaEngine {
             namespace.to_string(),
             tp_size,
             world_size,
+            page_first,
         )
         .map_err(EngineError::InvalidArgument)?;
 
@@ -256,6 +260,7 @@ impl PegaEngine {
         kv_stride_bytes_list: &[usize],
         segments_list: &[usize],
         transfer_mode: TransferMode,
+        page_first: bool,
     ) -> Result<(), EngineError> {
         // Dense default: block stride == bytes_per_block (layer-first layout).
         self.register_context_layer_batch_strided(
@@ -275,6 +280,7 @@ impl PegaEngine {
             segments_list,
             None,
             transfer_mode,
+            page_first,
         )
     }
 
@@ -308,6 +314,7 @@ impl PegaEngine {
         segments_list: &[usize],
         block_stride_bytes_list: Option<&[usize]>,
         transfer_mode: TransferMode,
+        page_first: bool,
     ) -> Result<(), EngineError> {
         // Build all registrations
         let ssd_enabled = self.storage.is_ssd_enabled();
@@ -376,7 +383,8 @@ impl PegaEngine {
         }
 
         // Get or create instance
-        let instance = self.get_or_create_instance(instance_id, namespace, tp_size, world_size)?;
+        let instance =
+            self.get_or_create_instance(instance_id, namespace, tp_size, world_size, page_first)?;
 
         // Get NUMA affinity for this GPU
         let numa_node = self.topology.numa_for_gpu(device_id);
@@ -663,6 +671,12 @@ impl PegaEngine {
             })?;
 
             let slot_id = topology.slot_index(layer_id, tp_rank)?;
+            // Page-first: every layer reads from the one page slot (tp_rank) at
+            // its sealed byte offset. Layer-first: offset 0 (the whole slot
+            // RawBlock is the layer).
+            let host_offset = topology
+                .page_placement(layer_id)
+                .map_or(0, |(offset, _)| offset);
 
             let mut blocks = Vec::with_capacity(block_ids.len());
             for (block_idx, block_entry) in block_ids.iter().copied().zip(block_cache.iter()) {
@@ -676,6 +690,7 @@ impl PegaEngine {
                     block: HostBlock::Cached {
                         sealed: Arc::clone(block_entry),
                         slot_id,
+                        offset: host_offset,
                     },
                 });
             }

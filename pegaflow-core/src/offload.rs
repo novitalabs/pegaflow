@@ -19,6 +19,7 @@ pub(crate) type InsertEntries = Vec<(BlockKey, Vec<(usize, RawBlock)>)>;
 use crate::gpu_worker::{HostBlock, LayerTransferData, TransferBlock};
 use crate::layout::KVCacheLayout;
 use crate::metrics::core_metrics;
+use crate::pinned_pool::PinnedAllocation;
 use crate::{EngineError, PegaEngine};
 use pegaflow_common::NumaNode;
 
@@ -142,6 +143,103 @@ fn build_hashed_insert_entries(namespace: String, layers: Vec<RawSaveLayer>) -> 
 // ============================================================================
 
 impl PegaEngine {
+    /// Page-first allocation: one contiguous pinned page per block, holding
+    /// every layer at its sealed page offset. Each layer's GPU copy targets a
+    /// sub-view into the pages; the pages themselves are sealed as the single
+    /// stored slot (see Phase 4). Fills `pages` and `gpu_save_layers`.
+    fn alloc_page_first_targets(
+        &self,
+        topology: &crate::instance::LayerTopology,
+        layer_contexts: &[LayerContext],
+        numa_node: Option<NumaNode>,
+        pages: &mut Vec<Arc<PinnedAllocation>>,
+        gpu_save_layers: &mut Vec<LayerTransferData>,
+    ) -> Result<(), EngineError> {
+        let page_size = topology
+            .page_size()
+            .expect("page-first topology must have a page size");
+
+        // A page holds all layers of one block, so every layer must save the
+        // same blocks in the same order. Block hashes are content-derived
+        // (identical across layers) and block_idx is the same physical KV slot
+        // across layers, so this invariant holds for MLA saves.
+        let reference = &layer_contexts[0].blocks_to_save;
+        for ctx in layer_contexts {
+            if ctx.layout.is_split() {
+                return Err(EngineError::InvalidArgument(format!(
+                    "page-first save does not support split K/V (layer {})",
+                    ctx.layer_name
+                )));
+            }
+            if ctx.blocks_to_save != *reference {
+                return Err(EngineError::InvalidArgument(
+                    "page-first save requires the same block set across all layers".into(),
+                ));
+            }
+        }
+
+        // A page-first block has a single slot, sealed by the first save, so
+        // that one save must carry EVERY layer of the page. A partial save
+        // (e.g. a pipeline stage that holds only some layers) would seal a page
+        // whose foreign-layer offsets are never written — they stay as stale
+        // pool memory and load returns another block's KV. Reject it loudly.
+        let mut layer_ids: Vec<usize> = layer_contexts
+            .iter()
+            .map(|ctx| topology.layer_id(&ctx.layer_name))
+            .collect::<Result<_, _>>()?;
+        layer_ids.sort_unstable();
+        layer_ids.dedup();
+        if layer_ids.len() != topology.num_layers() {
+            return Err(EngineError::InvalidArgument(format!(
+                "page-first save must cover all {} layers, got {} distinct \
+                 (one worker must write a block's entire page; pipeline \
+                 parallelism is unsupported)",
+                topology.num_layers(),
+                layer_ids.len()
+            )));
+        }
+
+        // One page per block.
+        let page_bytes = NonZeroU64::new(page_size as u64)
+            .ok_or_else(|| EngineError::Storage("page size is zero".into()))?;
+        for _ in 0..reference.len() {
+            let page = self
+                .storage
+                .allocate(page_bytes, numa_node)
+                .ok_or_else(|| {
+                    EngineError::Storage("pinned pool exhausted while allocating page".into())
+                })?;
+            pages.push(page);
+        }
+
+        // Each layer copies its block into its slice of every page.
+        for ctx in layer_contexts {
+            let layer_id = topology.layer_id(&ctx.layer_name)?;
+            let (offset, layer_bytes) = topology
+                .page_placement(layer_id)
+                .expect("page-first layer placement");
+            let save_blocks: Vec<TransferBlock> = ctx
+                .blocks_to_save
+                .iter()
+                .zip(pages.iter())
+                .map(|((block_idx, _), page)| TransferBlock {
+                    block_idx: *block_idx,
+                    block: HostBlock::Owned(RawBlock::single_segment(Segment::new(
+                        page.mapped_ptr().add(offset).host(),
+                        layer_bytes,
+                        Arc::clone(page),
+                    ))),
+                })
+                .collect();
+            gpu_save_layers.push(LayerTransferData {
+                layer_name: ctx.layer_name.clone(),
+                layout: ctx.layout.clone(),
+                blocks: save_blocks,
+            });
+        }
+        Ok(())
+    }
+
     /// Batch save KV blocks from multiple layers.
     ///
     /// More efficient than calling `save_kv_blocks_from_ipc` in a loop as it
@@ -284,83 +382,101 @@ impl PegaEngine {
         let save_numa_node = gpu_context.preferred_numa();
         let numa_node = Some(save_numa_node);
         let blockwise = self.storage.blockwise_alloc();
+        let page_first = topology.is_page_first();
 
         let mut gpu_save_layers: Vec<LayerTransferData> = Vec::with_capacity(layer_contexts.len());
+        // Page-first only: one contiguous page per block holds every layer.
+        // Each layer's GPU copy targets a sub-view into these pages, and the
+        // pages themselves become the single stored slot in Phase 4. Kept alive
+        // across the GPU copy so the segments stay valid.
+        let mut pages: Vec<Arc<PinnedAllocation>> = Vec::new();
 
-        for ctx in &mut layer_contexts {
-            let layout = &ctx.layout;
-            let num_blocks = ctx.blocks_to_save.len();
+        if page_first {
+            self.alloc_page_first_targets(
+                &topology,
+                &layer_contexts,
+                numa_node,
+                &mut pages,
+                &mut gpu_save_layers,
+            )?;
+        } else {
+            for ctx in &mut layer_contexts {
+                let layout = &ctx.layout;
+                let num_blocks = ctx.blocks_to_save.len();
 
-            // Blockwise: allocate once per block; Batch: allocate once for all blocks
-            let alloc_count = if blockwise { num_blocks } else { 1 };
-            let blocks_per_alloc = if blockwise { 1 } else { num_blocks };
+                // Blockwise: allocate once per block; Batch: allocate once for all blocks
+                let alloc_count = if blockwise { num_blocks } else { 1 };
+                let blocks_per_alloc = if blockwise { 1 } else { num_blocks };
 
-            let alloc_pinned = |stride: usize, what: &str| {
-                let alloc_size = (stride as u64)
-                    .checked_mul(blocks_per_alloc as u64)
-                    .and_then(NonZeroU64::new)
-                    .ok_or_else(|| {
-                        EngineError::Storage(format!("allocation size overflow for {what}"))
-                    })?;
-                self.storage.allocate(alloc_size, numa_node).ok_or_else(|| {
-                    EngineError::Storage(format!("pinned pool exhausted while allocating {what}"))
-                })
-            };
+                let alloc_pinned = |stride: usize, what: &str| {
+                    let alloc_size = (stride as u64)
+                        .checked_mul(blocks_per_alloc as u64)
+                        .and_then(NonZeroU64::new)
+                        .ok_or_else(|| {
+                            EngineError::Storage(format!("allocation size overflow for {what}"))
+                        })?;
+                    self.storage.allocate(alloc_size, numa_node).ok_or_else(|| {
+                        EngineError::Storage(format!(
+                            "pinned pool exhausted while allocating {what}"
+                        ))
+                    })
+                };
 
-            // Allocate pinned memory and construct the host-side RawBlocks in
-            // save order. Strides are padded (SSD-aligned); GPU copies later
-            // use actual (unpadded) sizes, leaving the padding tail unused.
-            let mut raw_blocks: Vec<RawBlock> = Vec::with_capacity(num_blocks);
-            for _ in 0..alloc_count {
-                if layout.is_split() {
-                    let stride = layout.padded_segment_bytes();
-                    let k_alloc = alloc_pinned(stride, "K segment buffer")?;
-                    let v_alloc = alloc_pinned(stride, "V segment buffer")?;
-                    for i in 0..blocks_per_alloc {
-                        let offset = i * stride;
-                        // Safety: offsets are within the just-made allocations.
-                        raw_blocks.push(RawBlock::two_segments(
-                            Segment::new(
-                                k_alloc.mapped_ptr().add(offset).host(),
+                // Allocate pinned memory and construct the host-side RawBlocks in
+                // save order. Strides are padded (SSD-aligned); GPU copies later
+                // use actual (unpadded) sizes, leaving the padding tail unused.
+                let mut raw_blocks: Vec<RawBlock> = Vec::with_capacity(num_blocks);
+                for _ in 0..alloc_count {
+                    if layout.is_split() {
+                        let stride = layout.padded_segment_bytes();
+                        let k_alloc = alloc_pinned(stride, "K segment buffer")?;
+                        let v_alloc = alloc_pinned(stride, "V segment buffer")?;
+                        for i in 0..blocks_per_alloc {
+                            let offset = i * stride;
+                            // Safety: offsets are within the just-made allocations.
+                            raw_blocks.push(RawBlock::two_segments(
+                                Segment::new(
+                                    k_alloc.mapped_ptr().add(offset).host(),
+                                    stride,
+                                    Arc::clone(&k_alloc),
+                                ),
+                                Segment::new(
+                                    v_alloc.mapped_ptr().add(offset).host(),
+                                    stride,
+                                    Arc::clone(&v_alloc),
+                                ),
+                            ));
+                        }
+                    } else {
+                        let stride = layout.padded_block_bytes();
+                        let alloc = alloc_pinned(stride, "block buffer")?;
+                        for i in 0..blocks_per_alloc {
+                            // Safety: offset is within the just-made allocation.
+                            raw_blocks.push(RawBlock::single_segment(Segment::new(
+                                alloc.mapped_ptr().add(i * stride).host(),
                                 stride,
-                                Arc::clone(&k_alloc),
-                            ),
-                            Segment::new(
-                                v_alloc.mapped_ptr().add(offset).host(),
-                                stride,
-                                Arc::clone(&v_alloc),
-                            ),
-                        ));
-                    }
-                } else {
-                    let stride = layout.padded_block_bytes();
-                    let alloc = alloc_pinned(stride, "block buffer")?;
-                    for i in 0..blocks_per_alloc {
-                        // Safety: offset is within the just-made allocation.
-                        raw_blocks.push(RawBlock::single_segment(Segment::new(
-                            alloc.mapped_ptr().add(i * stride).host(),
-                            stride,
-                            Arc::clone(&alloc),
-                        )));
+                                Arc::clone(&alloc),
+                            )));
+                        }
                     }
                 }
+
+                let save_blocks: Vec<TransferBlock> = ctx
+                    .blocks_to_save
+                    .iter()
+                    .zip(raw_blocks)
+                    .map(|((block_idx, _), block)| TransferBlock {
+                        block_idx: *block_idx,
+                        block: HostBlock::Owned(block),
+                    })
+                    .collect();
+
+                gpu_save_layers.push(LayerTransferData {
+                    layer_name: ctx.layer_name.clone(),
+                    layout: layout.clone(),
+                    blocks: save_blocks,
+                });
             }
-
-            let save_blocks: Vec<TransferBlock> = ctx
-                .blocks_to_save
-                .iter()
-                .zip(raw_blocks)
-                .map(|((block_idx, _), block)| TransferBlock {
-                    block_idx: *block_idx,
-                    block: HostBlock::Owned(block),
-                })
-                .collect();
-
-            gpu_save_layers.push(LayerTransferData {
-                layer_name: ctx.layer_name.clone(),
-                layout: layout.clone(),
-                blocks: save_blocks,
-            });
         }
         trace_drop!(_s);
 
@@ -372,17 +488,23 @@ impl PegaEngine {
         )
         .await?;
 
-        for (ctx, layer) in layer_contexts.iter_mut().zip(returned_layers) {
-            ctx.raw_blocks = layer
-                .blocks
-                .into_iter()
-                .map(|transfer_block| match transfer_block.block {
-                    HostBlock::Owned(block) => block,
-                    HostBlock::Cached { .. } => {
-                        panic!("save path must return HostBlock::Owned blocks")
-                    }
-                })
-                .collect();
+        if page_first {
+            // The pages already hold the copied data; the returned sub-view
+            // blocks share those pages via Arc and are dropped here.
+            drop(returned_layers);
+        } else {
+            for (ctx, layer) in layer_contexts.iter_mut().zip(returned_layers) {
+                ctx.raw_blocks = layer
+                    .blocks
+                    .into_iter()
+                    .map(|transfer_block| match transfer_block.block {
+                        HostBlock::Owned(block) => block,
+                        HostBlock::Cached { .. } => {
+                            panic!("save path must return HostBlock::Owned blocks")
+                        }
+                    })
+                    .collect();
+            }
         }
 
         // ── Phase 4 (deferred): Build RawBlocks + insert — sent to worker ──
@@ -418,23 +540,48 @@ impl PegaEngine {
             batch_start.elapsed().as_secs_f64() * 1000.0
         );
 
-        // Build RawSaveBatch and send to insert worker (fire-and-forget)
-        let raw_layers: Vec<RawSaveLayer> = layer_contexts
-            .into_iter()
-            .map(|ctx| {
-                let block_hashes: Vec<Vec<u8>> = ctx
-                    .blocks_to_save
-                    .into_iter()
-                    .map(|(_, hash)| hash)
-                    .collect();
-                RawSaveLayer {
-                    slot_id: ctx.slot_id,
-                    padded_block_size: ctx.layout.padded_block_bytes(),
-                    blocks: ctx.raw_blocks,
-                    block_hashes,
-                }
-            })
-            .collect();
+        // Build RawSaveBatch and send to insert worker (fire-and-forget).
+        // Page-first collapses every layer into one page slot per block, so a
+        // whole block is a single RawSaveLayer regardless of num_layers.
+        let raw_layers: Vec<RawSaveLayer> = if page_first {
+            let page_size = topology.page_size().expect("page-first page size");
+            let slot_id = layer_contexts[0].slot_id;
+            let block_hashes: Vec<Vec<u8>> = layer_contexts[0]
+                .blocks_to_save
+                .iter()
+                .map(|(_, hash)| hash.clone())
+                .collect();
+            let blocks: Vec<RawBlock> = pages
+                .into_iter()
+                .map(|page| {
+                    let ptr = page.mapped_ptr().host();
+                    RawBlock::single_segment(Segment::new(ptr, page_size, page))
+                })
+                .collect();
+            vec![RawSaveLayer {
+                slot_id,
+                padded_block_size: page_size,
+                blocks,
+                block_hashes,
+            }]
+        } else {
+            layer_contexts
+                .into_iter()
+                .map(|ctx| {
+                    let block_hashes: Vec<Vec<u8>> = ctx
+                        .blocks_to_save
+                        .into_iter()
+                        .map(|(_, hash)| hash)
+                        .collect();
+                    RawSaveLayer {
+                        slot_id: ctx.slot_id,
+                        padded_block_size: ctx.layout.padded_block_bytes(),
+                        blocks: ctx.raw_blocks,
+                        block_hashes,
+                    }
+                })
+                .collect()
+        };
 
         self.storage.send_raw_insert(RawSaveBatch {
             namespace,

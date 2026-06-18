@@ -51,6 +51,24 @@ struct RegistrationState {
 pub(crate) struct LayerTopology {
     name_to_id: HashMap<String, usize>,
     tp_size: usize,
+    /// Page-first layout when `Some`: all layers of a block collapse into one
+    /// contiguous page per tp_rank, so `total_slots = tp_size`. `None` is the
+    /// legacy layer-first layout (`total_slots = num_layers * tp_size`).
+    page_layout: Option<PageLayout>,
+}
+
+/// Page-first placement: where each layer lives inside one contiguous per-block
+/// page. Built at seal time from the registered per-layer padded block sizes,
+/// in layer-id (sorted-name) order, so save/load and every node agree.
+#[derive(Debug)]
+struct PageLayout {
+    /// Byte offset of each layer within the page, indexed by layer_id.
+    layer_offsets: Vec<usize>,
+    /// Padded byte size of each layer's block, indexed by layer_id.
+    layer_bytes: Vec<usize>,
+    /// Total page size = sum of `layer_bytes` (also each layer's offset is
+    /// SSD-aligned because every `layer_bytes` entry is alignment-padded).
+    page_size: usize,
 }
 
 impl LayerTopology {
@@ -66,12 +84,37 @@ impl LayerTopology {
         self.name_to_id.len()
     }
 
-    /// Total number of storage slots, organized as `[layer][tp_rank]`.
-    pub(crate) fn total_slots(&self) -> usize {
-        self.num_layers() * self.tp_size
+    /// Whether blocks are stored page-first (one page per tp_rank).
+    pub(crate) fn is_page_first(&self) -> bool {
+        self.page_layout.is_some()
     }
 
-    /// Compute the slot index for a specific layer and TP rank.
+    /// Total number of storage slots per block: `tp_size` page-first, else
+    /// `num_layers * tp_size` (layer-first).
+    pub(crate) fn total_slots(&self) -> usize {
+        match self.page_layout {
+            Some(_) => self.tp_size,
+            None => self.num_layers() * self.tp_size,
+        }
+    }
+
+    /// Page-first only: total contiguous page size in bytes (one slot).
+    pub(crate) fn page_size(&self) -> Option<usize> {
+        self.page_layout.as_ref().map(|p| p.page_size)
+    }
+
+    /// Page-first only: `(byte_offset, padded_bytes)` of `layer_id` within a page.
+    pub(crate) fn page_placement(&self, layer_id: usize) -> Option<(usize, usize)> {
+        self.page_layout
+            .as_ref()
+            .map(|p| (p.layer_offsets[layer_id], p.layer_bytes[layer_id]))
+    }
+
+    /// Compute the storage slot index for a specific layer and TP rank.
+    ///
+    /// Page-first collapses the layer dimension into the page, so the slot is
+    /// just `tp_rank`; the layer's position is its page offset
+    /// ([`Self::page_placement`]). Layer-first keeps `[layer][tp_rank]`.
     pub(crate) fn slot_index(&self, layer_id: usize, tp_rank: usize) -> Result<usize, EngineError> {
         if layer_id >= self.num_layers() {
             return Err(EngineError::InvalidArgument(format!(
@@ -86,7 +129,10 @@ impl LayerTopology {
                 tp_rank, self.tp_size
             )));
         }
-        Ok(layer_id * self.tp_size + tp_rank)
+        Ok(match self.page_layout {
+            Some(_) => tp_rank,
+            None => layer_id * self.tp_size + tp_rank,
+        })
     }
 }
 
@@ -211,6 +257,10 @@ pub struct InstanceContext {
     /// devices have registered.
     world_size: usize,
 
+    /// Page-first storage: collapse a block's layers into one contiguous page
+    /// per tp_rank. Fixed by the first registrant; later workers must agree.
+    page_first: bool,
+
     /// Registration state and GPU contexts protected by a single mutex.
     state: Mutex<RegistrationState>,
 }
@@ -225,6 +275,7 @@ impl InstanceContext {
         namespace: String,
         tp_size: usize,
         world_size: usize,
+        page_first: bool,
     ) -> Result<Self, String> {
         if tp_size == 0 || world_size == 0 {
             return Err("tp_size and world_size must be > 0".into());
@@ -235,6 +286,7 @@ impl InstanceContext {
             namespace,
             tp_size,
             world_size,
+            page_first,
             state: Mutex::new(RegistrationState {
                 gpu_contexts: HashMap::new(),
                 topology: None,
@@ -309,20 +361,29 @@ impl InstanceContext {
         };
 
         // Union of layer names with geometry consistency across devices.
-        let mut geometry_by_name: HashMap<&str, (usize, bool)> = HashMap::new();
+        // The third tuple element (padded_block_bytes) is the per-layer page
+        // footprint; it must also agree across devices because the page-first
+        // layout concatenates layers by this size.
+        let mut geometry_by_name: HashMap<&str, (usize, bool, usize)> = HashMap::new();
         for gpu in gpus() {
             for (name, layout) in &gpu.kv_caches {
-                let geometry = (layout.segment_bytes(), layout.is_split());
+                let geometry = (
+                    layout.segment_bytes(),
+                    layout.is_split(),
+                    layout.padded_block_bytes(),
+                );
                 match geometry_by_name.insert(name, geometry) {
                     None => {}
                     Some(existing) if existing == geometry => {}
-                    Some((existing_bytes, existing_split)) => {
+                    Some((existing_bytes, existing_split, existing_padded)) => {
                         return Err(EngineError::InvalidArgument(format!(
                             "layer {name} registered with inconsistent geometry: \
-                             segment_bytes={existing_bytes} split={existing_split} vs \
-                             segment_bytes={} split={} on device {}",
+                             segment_bytes={existing_bytes} split={existing_split} \
+                             padded_block_bytes={existing_padded} vs \
+                             segment_bytes={} split={} padded_block_bytes={} on device {}",
                             layout.segment_bytes(),
                             layout.is_split(),
+                            layout.padded_block_bytes(),
                             gpu.device_id(),
                         )));
                     }
@@ -337,19 +398,17 @@ impl InstanceContext {
             .enumerate()
             .map(|(id, name)| (name.clone(), id))
             .collect();
-        let topology = LayerTopology {
-            name_to_id,
-            tp_size: self.tp_size,
-        };
 
-        // Per slot: (device_id, pp_rank) of the first registered owner.
-        let mut owners: Vec<Option<(i32, usize)>> = vec![None; topology.total_slots()];
+        // Validate registration completeness on the full `[layer][tp_rank]`
+        // grid, independent of how slots are stored: every (layer, tp_rank)
+        // pair needs an owner regardless of page-first collapsing.
+        let mut owners: Vec<Option<(i32, usize)>> = vec![None; names.len() * self.tp_size];
         for gpu in gpus() {
             for layer_name in gpu.kv_caches.keys() {
-                let layer_id = topology.layer_id(layer_name)?;
-                let slot_id = layer_id * self.tp_size + gpu.tp_rank();
-                match owners[slot_id] {
-                    None => owners[slot_id] = Some((gpu.device_id(), gpu.pp_rank())),
+                let layer_id = name_to_id[layer_name];
+                let grid_id = layer_id * self.tp_size + gpu.tp_rank();
+                match owners[grid_id] {
+                    None => owners[grid_id] = Some((gpu.device_id(), gpu.pp_rank())),
                     Some((existing_device, existing_pp_rank)) => {
                         if existing_pp_rank != gpu.pp_rank() {
                             return Err(EngineError::InvalidArgument(format!(
@@ -366,9 +425,9 @@ impl InstanceContext {
             }
         }
 
-        if let Some(missing_slot) = owners.iter().position(Option::is_none) {
-            let layer_id = missing_slot / self.tp_size;
-            let tp_rank = missing_slot % self.tp_size;
+        if let Some(missing) = owners.iter().position(Option::is_none) {
+            let layer_id = missing / self.tp_size;
+            let tp_rank = missing % self.tp_size;
             return Err(EngineError::InvalidArgument(format!(
                 "instance {} has incomplete KV registration: layer {} has no owner \
                  for tp_rank {tp_rank} after all {} workers registered",
@@ -376,7 +435,33 @@ impl InstanceContext {
             )));
         }
 
-        Ok(topology)
+        // Page-first: lay layers out contiguously in layer-id order. Each
+        // layer's padded_block_bytes is already SSD-aligned, so every per-layer
+        // offset (a prefix sum of aligned sizes) stays aligned too.
+        let page_layout = if self.page_first {
+            let mut layer_offsets = Vec::with_capacity(names.len());
+            let mut layer_bytes = Vec::with_capacity(names.len());
+            let mut offset = 0usize;
+            for name in &names {
+                let padded = geometry_by_name[name.as_str()].2;
+                layer_offsets.push(offset);
+                layer_bytes.push(padded);
+                offset += padded;
+            }
+            Some(PageLayout {
+                layer_offsets,
+                layer_bytes,
+                page_size: offset,
+            })
+        } else {
+            None
+        };
+
+        Ok(LayerTopology {
+            name_to_id,
+            tp_size: self.tp_size,
+            page_layout,
+        })
     }
 
     /// Build a GPU context for the specified device.
@@ -537,11 +622,17 @@ impl InstanceContext {
     /// Verify that the topology matches expected values.
     ///
     /// Returns `Ok(())` if matches, or an error message describing the mismatch.
-    pub(crate) fn verify_topology(&self, tp_size: usize, world_size: usize) -> Result<(), String> {
-        if self.tp_size != tp_size || self.world_size != world_size {
+    pub(crate) fn verify_topology(
+        &self,
+        tp_size: usize,
+        world_size: usize,
+        page_first: bool,
+    ) -> Result<(), String> {
+        if self.tp_size != tp_size || self.world_size != world_size || self.page_first != page_first
+        {
             return Err(format!(
-                "exists with tp={}, world={}; requested tp={}, world={}",
-                self.tp_size, self.world_size, tp_size, world_size
+                "exists with tp={}, world={}, page_first={}; requested tp={}, world={}, page_first={}",
+                self.tp_size, self.world_size, self.page_first, tp_size, world_size, page_first
             ));
         }
         Ok(())

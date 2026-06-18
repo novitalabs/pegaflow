@@ -149,6 +149,11 @@ vLLM Worker <--gRPC--> PegaEngine Server <--CUDA IPC--> GPU Memory
 - Stub and mock tests are allowed only for local contracts and must not shadow real runtime modules during integration/e2e collection.
 - Prefer integration tests when they prove a real boundary that units cannot. Prefer units when they give faster, clearer feedback for local connector state machines.
 
+## Compatibility & Durability
+
+- We have a strict version handshake (`CARGO_PKG_VERSION` exact match at registration), so do NOT design for backward compatibility with older clients or older stored formats — bump the version and break freely.
+- SSD cache is ephemeral: it is wiped on restart. Do NOT add migration, on-disk versioning, or cross-version SSD compatibility handling.
+
 ## Environment Variables
 
 - `PEGAFLOW_ENGINE_ENDPOINT`: gRPC endpoint (default: `127.0.0.1:50055`)

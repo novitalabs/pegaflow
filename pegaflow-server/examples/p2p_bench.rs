@@ -247,6 +247,7 @@ fn register_ranks(engine: &PegaEngine, shape: &Shape) -> Vec<RankBuffers> {
                     &vec![shape.blocks * shape.kv_bytes; shape.layers], // kv_stride
                     &vec![2; shape.layers],                             // split K/V
                     TransferMode::Direct,
+                    false,
                 )
                 .expect("register rank");
             RankBuffers { device: rank, buf }

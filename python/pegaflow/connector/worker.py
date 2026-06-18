@@ -198,8 +198,9 @@ class WorkerConnector:
         self._failed_load_reqs: set[str] = set()
 
         self._registered_layers: list[str] = []
-        # Layer subset this rank saves (MLA replica sharding); None = save all.
-        self._save_layer_shard: list[str] | None = None
+        # Page-first storage: all layers of a block in one host page, one slot
+        # per tp_rank. Saves distribute by block stripe instead of by layer.
+        self._page_first: bool = False
         self._torch_device: torch.device | None = None
 
         self._cross_layer_mode = False
@@ -267,7 +268,7 @@ class WorkerConnector:
             raise RuntimeError("No KV cache layers were selected for registration")
 
         self._registered_layers = list(kv_caches.keys())
-        self._save_layer_shard = self._compute_save_layer_shard()
+        self._page_first = self._use_page_first()
         self._torch_device = next(iter(kv_caches.values())).device
 
         layout = "unknown"
@@ -332,6 +333,7 @@ class WorkerConnector:
             layer_kv_stride_bytes,
             layer_segments,
             self._ctx.transfer_backend,
+            self._page_first,
         )
 
         if not ok:
@@ -696,23 +698,34 @@ class WorkerConnector:
                 if not save_intent.block_ids:
                     continue
 
+                block_ids = save_intent.block_ids
+                block_hashes = save_intent.block_hashes
+
                 if self._cross_layer_mode:
                     target_layers = (self._cross_layer_key,)
-                elif self._save_layer_shard is not None:
-                    # MLA replica save: this rank only writes its layer slice.
-                    target_layers = tuple(self._save_layer_shard)
+                elif self._page_first:
+                    # Page-first: a block's page holds every layer, so this rank
+                    # writes all layers for its block stripe (not a layer slice).
+                    assert self._registered_layers, (
+                        "KV caches must be registered before submitting save intents"
+                    )
+                    target_layers = tuple(self._registered_layers)
+                    block_ids, block_hashes = self._block_shard(save_intent)
                 else:
                     assert self._registered_layers, (
                         "KV caches must be registered before submitting save intents"
                     )
                     target_layers = tuple(self._registered_layers)
 
+                if not block_ids:
+                    continue
+
                 for layer_name in target_layers:
                     if layer_name not in saves_by_layer:
                         saves_by_layer[layer_name] = ([], [])
 
-                    saves_by_layer[layer_name][0].extend(save_intent.block_ids)
-                    saves_by_layer[layer_name][1].extend(save_intent.block_hashes)
+                    saves_by_layer[layer_name][0].extend(block_ids)
+                    saves_by_layer[layer_name][1].extend(block_hashes)
 
         if saves_by_layer:
             # Ensure all GPU kernels have completed before reading KV cache
@@ -791,43 +804,54 @@ class WorkerConnector:
                 suffix,
             )
 
-    def _mla_replica_save(self) -> bool:
-        """Whether to shard the save by layer across TP ranks.
+    def _use_page_first(self) -> bool:
+        """Whether this instance stores blocks page-first.
 
-        MLA without DCP replicates the full KV on every TP rank's GPU. Instead
-        of TP0 saving every layer (one GPU's copy engine carries all D2H), each
-        rank writes its own layer slice to its NUMA-local pool. Returns False
-        when KV is already unique per rank (non-MLA), per-rank layer-split
-        registration is in effect, or DCP makes each rank store distinct tokens.
+        Page-first packs all layers of a block into one contiguous host page
+        (one slot per tp_rank instead of one per layer), cutting per-block
+        metadata by a factor of num_layers. Phase 1 scope: MLA without DCP and
+        without per-rank layer-split registration — the full-replica case where
+        every rank holds all layers and can assemble a complete page for its
+        block stripe. At tp_size == 1 there is no cross-rank striping, but the
+        per-block metadata collapse still applies.
+
+        Pipeline parallelism is excluded: with pp_size > 1 each stage registers
+        only its own layers, but the engine seals one topology spanning the
+        union of all stages' layers, so a page covers layers no single worker
+        holds. Since total_slots collapses to 1, the first save seals the page
+        with only that stage's layers written — the rest stay stale and the
+        other stages' same-hash saves dedup instead of repairing it. Page-first
+        requires that one worker can write a block's entire page.
         """
         return (
             self._ctx.is_mla
-            and not self._use_mla_layer_split_registration
             and self._ctx.dcp_world_size == 1
-            and self._ctx.tp_size > 1
+            and self._ctx.pp_size == 1
+            and not self._use_mla_layer_split_registration
         )
 
-    def _compute_save_layer_shard(self) -> list[str] | None:
-        """Layer subset this rank is responsible for saving, or None for all.
+    def _block_shard(self, save_intent) -> tuple[list[int], list[bytes]]:
+        """`(block_ids, hashes)` this rank saves under page-first: a block stripe.
 
-        Ranks sort registered layer names (matching the server's sorted-name
-        layer-id space) and take a strided slice. Striding by tp_rank is a
-        disjoint, complete partition of the layers with no cross-rank
-        coordination, so the union still fills every block's slots.
-
-        Correctness depends on every rank in the save group registering the
-        identical layer set, which holds here by construction: this path runs
-        only when `_mla_replica_save()` is true, i.e. MLA fully replicates the
-        KV cache across TP ranks and each rank registers the same full layer
-        set. The one mode that registers a per-rank layer subset
-        (`mla_layer_split_kv_cache`) is excluded by `_mla_replica_save()` and
-        already distributes the save itself.
+        A page needs all layers, so page-first distributes save work by block
+        rather than by layer: rank r saves physical blocks where
+        `block_id % tp_size == r`, writing all their layers. The stripes are
+        disjoint and complete, so every block's page is written exactly once.
+        With tp_size == 1 this is the whole set.
         """
-        if not self._mla_replica_save():
-            return None
-        ordered = sorted(self._registered_layers)
+        tp_size = self._ctx.tp_size
+        if tp_size <= 1:
+            return list(save_intent.block_ids), list(save_intent.block_hashes)
         tp_rank = self._ctx.tp_rank or 0
-        return [name for idx, name in enumerate(ordered) if idx % self._ctx.tp_size == tp_rank]
+        ids: list[int] = []
+        hashes: list[bytes] = []
+        for block_id, block_hash in zip(
+            save_intent.block_ids, save_intent.block_hashes, strict=True
+        ):
+            if block_id % tp_size == tp_rank:
+                ids.append(block_id)
+                hashes.append(block_hash)
+        return ids, hashes
 
     def handle_preemptions(self, preempted_req_ids: set[str] | None) -> None:
         """Wait for preempted requests' saves to complete before blocks are reused.

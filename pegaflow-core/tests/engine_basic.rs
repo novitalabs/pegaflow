@@ -6,7 +6,7 @@
 mod common;
 
 use common::*;
-use pegaflow_core::{StorageConfig, TransferMode};
+use pegaflow_core::{LayerSave, StorageConfig, TransferMode};
 
 /// Full save -> query -> load round-trip with data integrity check.
 #[tokio::test]
@@ -22,6 +22,71 @@ async fn save_query_load_roundtrip() {
 
     env.load_to_gpu(lease, hashes.len()).await;
     env.data().assert_gpu_matches_expected();
+}
+
+/// Page-first round-trip: all layers of a block live in one host page slot,
+/// saved in a single batch and loaded back. Each layer is given DISTINCT
+/// content AND a DISTINCT (512-aligned) size, so the page offsets are an
+/// uneven prefix sum (0, 512, 1536). A wrong offset or a mishandled prefix
+/// sum makes a layer read/write another layer's slice and fails the assert.
+#[tokio::test]
+async fn page_first_multi_layer_roundtrip() {
+    let mut env = TestEnvBuilder::new("test-page-first", "test-ns")
+        .page_first()
+        .layer("layer_a", 4, 512)
+        .layer("layer_b", 4, 1024)
+        .layer("layer_c", 4, 1536)
+        .build();
+
+    // Make every layer's content unique so layer offsets are actually checked.
+    env.layers[1].data.overwrite(0x40);
+    env.layers[2].data.overwrite(0x80);
+
+    let hashes = make_block_hashes(4, 0xAB);
+
+    env.save_all_layers_one_batch(&hashes).await;
+    for layer in &env.layers {
+        layer.data.zero_gpu();
+    }
+
+    let lease = env.assert_all_hit_lease(&hashes).await;
+    env.load_to_gpu(lease, hashes.len()).await;
+
+    for layer in &env.layers {
+        layer.data.assert_gpu_matches_expected();
+    }
+}
+
+/// Page-first seals a block's single slot on the first save, so one save must
+/// carry EVERY layer of the page. A save covering only some layers (e.g. a
+/// pipeline stage holding a subset) would seal a page whose other offsets are
+/// never written — stale pool memory that load would return as another block's
+/// KV. The engine must reject such a partial-layer page-first save loudly.
+#[tokio::test]
+async fn page_first_rejects_partial_layer_save() {
+    let env = TestEnvBuilder::new("test-page-first-partial", "test-ns")
+        .page_first()
+        .layer("layer_a", 4, 512)
+        .layer("layer_b", 4, 512)
+        .layer("layer_c", 4, 512)
+        .build();
+    let hashes = make_block_hashes(4, 0xCD);
+
+    // Submit only layer_a — a partial page that must not seal.
+    let partial = vec![LayerSave {
+        layer_name: env.layers[0].name.clone(),
+        block_ids: (0..hashes.len()).collect(),
+        block_hashes: hashes.clone(),
+    }];
+    let err = env
+        .engine
+        .batch_save_kv_blocks_from_ipc(&env.instance_id, 0, 0, 0, partial)
+        .await
+        .expect_err("partial page-first save must be rejected");
+    assert!(
+        err.to_string().contains("must cover all"),
+        "unexpected error: {err}"
+    );
 }
 
 /// Round-trip with NUMA-aware allocation enabled.

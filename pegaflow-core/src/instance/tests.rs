@@ -50,7 +50,8 @@ fn gpu_registration_with_segment_bytes(
 /// device 0.
 #[test]
 fn single_worker_registration_seals_topology() {
-    let instance = InstanceContext::new("test-instance-1".into(), "model-ns".into(), 1, 1).unwrap();
+    let instance =
+        InstanceContext::new("test-instance-1".into(), "model-ns".into(), 1, 1, false).unwrap();
 
     // Names intentionally out of registration order: ids come from sorted
     // names, not from declaration order.
@@ -73,9 +74,9 @@ fn single_worker_registration_seals_topology() {
     assert_eq!(topology.total_slots(), 4);
 
     // Topology parameters are pinned at creation.
-    assert!(instance.verify_topology(1, 1).is_ok());
-    assert!(instance.verify_topology(2, 1).is_err());
-    assert!(instance.verify_topology(1, 2).is_err());
+    assert!(instance.verify_topology(1, 1, false).is_ok());
+    assert!(instance.verify_topology(2, 1, false).is_err());
+    assert!(instance.verify_topology(1, 2, false).is_err());
 
     // A sealed instance accepts no further devices.
     let err = instance
@@ -93,11 +94,50 @@ fn single_worker_registration_seals_topology() {
     }
 }
 
+/// Page-first folds the layer dimension into one page slot per tp_rank and
+/// lays layers out contiguously in sorted-name (layer-id) order. Commits
+/// device 0.
+#[test]
+fn page_first_collapses_slots_and_lays_out_page() {
+    let instance = InstanceContext::new("page-first".into(), "page-ns".into(), 1, 1, true).unwrap();
+
+    // segment_bytes=1024, single segment, no SSD padding on this path, so each
+    // layer's padded_block_bytes == 1024.
+    instance
+        .register_new_gpu(gpu_registration_with_segment_bytes(
+            0,
+            0,
+            &["layer_b", "layer_a", "layer_c"],
+            1024,
+        ))
+        .expect("register page-first gpu");
+
+    let topology = instance.sealed_topology().expect("sealed");
+    assert!(topology.is_page_first());
+    assert_eq!(topology.num_layers(), 3);
+    // Layer dimension folds away: one slot per tp_rank (here tp_size == 1).
+    assert_eq!(topology.total_slots(), 1);
+    for layer_id in 0..3 {
+        assert_eq!(topology.slot_index(layer_id, 0).unwrap(), 0);
+    }
+    // Page = all layers concatenated in sorted-name order (a<b<c).
+    assert_eq!(topology.page_size(), Some(3 * 1024));
+    assert_eq!(topology.page_placement(0), Some((0, 1024)));
+    assert_eq!(topology.page_placement(1), Some((1024, 1024)));
+    assert_eq!(topology.page_placement(2), Some((2048, 1024)));
+
+    // page_first is part of the topology contract: a mismatched re-registration
+    // intent is rejected.
+    assert!(instance.verify_topology(1, 1, true).is_ok());
+    assert!(instance.verify_topology(1, 1, false).is_err());
+}
+
 /// Until every worker has registered there is no topology: save/load must be
 /// rejected with a registration-progress error. Commits device 0.
 #[test]
 fn unsealed_instance_rejects_topology_access() {
-    let instance = InstanceContext::new("partial".into(), "partial-ns".into(), 2, 2).unwrap();
+    let instance =
+        InstanceContext::new("partial".into(), "partial-ns".into(), 2, 2, false).unwrap();
     instance
         .register_new_gpu(gpu_registration(0, 0, &["layer_0"]))
         .expect("first of two workers");
@@ -118,7 +158,7 @@ fn unsealed_instance_rejects_topology_access() {
 /// sealed topology contract; reject it outright.
 #[test]
 fn registration_without_layers_is_rejected() {
-    let instance = InstanceContext::new("empty".into(), "empty-ns".into(), 1, 1).unwrap();
+    let instance = InstanceContext::new("empty".into(), "empty-ns".into(), 1, 1, false).unwrap();
     let err = instance
         .register_new_gpu(gpu_registration(0, 0, &[]))
         .expect_err("empty registration must fail");
@@ -145,7 +185,7 @@ fn seal_derives_layer_space_from_union_of_workers() {
         return;
     }
 
-    let instance = InstanceContext::new("pp-mtp".into(), "pp-mtp-ns".into(), 1, 2).unwrap();
+    let instance = InstanceContext::new("pp-mtp".into(), "pp-mtp-ns".into(), 1, 2, false).unwrap();
     instance
         .register_new_gpu(gpu_registration(0, 0, &["model.layers.0.self_attn.attn"]))
         .expect("stage 0 registers the main layer");
@@ -192,7 +232,8 @@ fn mla_replica_registration_seals() {
         return;
     }
 
-    let instance = InstanceContext::new("mla-replica".into(), "mla-ns".into(), 1, 2).unwrap();
+    let instance =
+        InstanceContext::new("mla-replica".into(), "mla-ns".into(), 1, 2, false).unwrap();
     instance
         .register_new_gpu(gpu_registration(0, 0, MLA_DSA_LAYERS))
         .expect("register replica on device 0");
@@ -216,7 +257,7 @@ fn seal_rejects_replicas_across_pipeline_stages() {
         return;
     }
 
-    let instance = InstanceContext::new("pp-conflict".into(), "pp-ns".into(), 1, 2).unwrap();
+    let instance = InstanceContext::new("pp-conflict".into(), "pp-ns".into(), 1, 2, false).unwrap();
     let layers = &["model.layers.0.self_attn.attn"];
     instance
         .register_new_gpu(gpu_registration(0, 0, layers))
@@ -246,7 +287,8 @@ fn seal_rejects_missing_slot_owner() {
         return;
     }
 
-    let instance = InstanceContext::new("missing-slot".into(), "missing-ns".into(), 2, 2).unwrap();
+    let instance =
+        InstanceContext::new("missing-slot".into(), "missing-ns".into(), 2, 2, false).unwrap();
     instance
         .register_new_gpu(gpu_registration(0, 0, &["layer_0", "layer_1"]))
         .expect("rank 0 registers both layers");
@@ -273,7 +315,7 @@ fn seal_rejects_inconsistent_layer_geometry() {
         return;
     }
 
-    let instance = InstanceContext::new("geom".into(), "geom-ns".into(), 1, 2).unwrap();
+    let instance = InstanceContext::new("geom".into(), "geom-ns".into(), 1, 2, false).unwrap();
     instance
         .register_new_gpu(gpu_registration_with_segment_bytes(
             0,

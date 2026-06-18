@@ -272,7 +272,7 @@ impl EngineRpcClient {
         clippy::too_many_arguments,
         reason = "PyO3 binding mirrors the public batch registration call shape"
     )]
-    #[pyo3(signature = (instance_id, namespace, tp_rank, pp_rank, tp_size, world_size, device_id, layer_names, wrapper_bytes_list, num_blocks_list, bytes_per_block_list, kv_stride_bytes_list, segments_list, transfer_backend))]
+    #[pyo3(signature = (instance_id, namespace, tp_rank, pp_rank, tp_size, world_size, device_id, layer_names, wrapper_bytes_list, num_blocks_list, bytes_per_block_list, kv_stride_bytes_list, segments_list, transfer_backend, page_first))]
     fn register_context_batch(
         &self,
         py: Python<'_>,
@@ -290,6 +290,7 @@ impl EngineRpcClient {
         kv_stride_bytes_list: Vec<u64>,
         segments_list: Vec<u32>,
         transfer_backend: &str,
+        page_first: bool,
     ) -> PyResult<(bool, String)> {
         let transfer_mode = match transfer_backend {
             "direct" => TransferMode::Direct,
@@ -318,6 +319,7 @@ impl EngineRpcClient {
                     segments: segments_list,
                     pp_rank,
                     transfer_mode: transfer_mode as i32,
+                    page_first,
                 })
                 .await?;
             Ok(resp.into_inner())

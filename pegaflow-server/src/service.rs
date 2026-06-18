@@ -317,6 +317,7 @@ impl Engine for GrpcEngineService {
                 &kv_stride_bytes_list,
                 &segments_list,
                 transfer_mode,
+                req.page_first,
             ) {
                 let status = Self::map_engine_error(err);
                 let removed = self.registry.drop_context(context_key.clone()).await;
@@ -1003,6 +1004,7 @@ mod tests {
             segments: Vec::new(),
             pp_rank: 0,
             transfer_mode: ProtoTransferMode::Direct as i32,
+            page_first: false,
         })
         .expect_err("tp_rank outside tp_size must be rejected at RPC boundary");
 
@@ -1028,6 +1030,7 @@ mod tests {
             segments: Vec::new(),
             pp_rank: 0,
             transfer_mode: ProtoTransferMode::Direct as i32,
+            page_first: false,
         })
         .expect_err("client/server version mismatch must be rejected before registration");
 

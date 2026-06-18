@@ -321,6 +321,7 @@ async fn p2p_rdma_remote_fetch_roundtrip() {
             &[0], // kv_strides
             &[1], // segments
             TransferMode::Direct,
+            false,
         )
         .expect("register layer on engine A");
 
@@ -393,6 +394,7 @@ async fn p2p_rdma_remote_fetch_roundtrip() {
             &[0],
             &[1],
             TransferMode::Direct,
+            false,
         )
         .expect("register layer on engine B");
 
