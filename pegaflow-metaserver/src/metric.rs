@@ -14,6 +14,8 @@ struct StoreGaugeHandles {
     _entries: ObservableGauge<u64>,
     _owners: ObservableGauge<u64>,
     _nodes: ObservableGauge<u64>,
+    _redundancy: ObservableGauge<u64>,
+    _redundancy_avg: ObservableGauge<f64>,
 }
 
 static STORE_GAUGES: OnceLock<StoreGaugeHandles> = OnceLock::new();
@@ -49,10 +51,42 @@ pub fn register_store_gauges(store: &Arc<BlockHashStore>) {
                 observer.observe(stale, &[KeyValue::new("state", "stale")]);
             })
             .build();
+        let redundancy_store = Arc::clone(&s);
+        let redundancy = meter
+            .u64_observable_gauge("pegaflow_metaserver_block_redundancy")
+            .with_description("Block keys bucketed by live owner count (replication factor)")
+            .with_callback(move |observer| {
+                let snap = redundancy_store.redundancy_snapshot();
+                observer.observe(snap.keys_1, &[KeyValue::new("owners", "1")]);
+                observer.observe(snap.keys_2, &[KeyValue::new("owners", "2")]);
+                observer.observe(snap.keys_3, &[KeyValue::new("owners", "3")]);
+                observer.observe(snap.keys_4plus, &[KeyValue::new("owners", ">=4")]);
+            })
+            .build();
+        let redundancy_avg_store = Arc::clone(&s);
+        let redundancy_avg = meter
+            .f64_observable_gauge("pegaflow_metaserver_block_redundancy_avg")
+            .with_description(
+                "Average live owners per block key with at least one live owner \
+                 (cluster replication factor / cache capacity shrink factor)",
+            )
+            .with_callback(move |observer| {
+                let snap = redundancy_avg_store.redundancy_snapshot();
+                let keys = snap.keys_1 + snap.keys_2 + snap.keys_3 + snap.keys_4plus;
+                let avg = if keys == 0 {
+                    0.0
+                } else {
+                    snap.copies as f64 / keys as f64
+                };
+                observer.observe(avg, &[]);
+            })
+            .build();
         StoreGaugeHandles {
             _entries: entries,
             _owners: owners,
             _nodes: nodes,
+            _redundancy: redundancy,
+            _redundancy_avg: redundancy_avg,
         }
     });
 }
