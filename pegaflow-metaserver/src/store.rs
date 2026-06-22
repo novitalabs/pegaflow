@@ -2,7 +2,7 @@ use dashmap::{DashMap, mapref::entry::Entry};
 use log::{info, warn};
 use pegaflow_common::BlockKey;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -44,6 +44,34 @@ impl SweepStats {
     }
 }
 
+/// Live-owner redundancy distribution over block keys, recomputed each sweep and
+/// cached so metric scrapes stay O(1). Keys are bucketed by their number of
+/// query-visible owners (1, 2, 3, >=4); keys with zero visible owners are
+/// excluded from every bucket. `copies` is the exact total of visible owners, so
+/// average redundancy (the cache capacity shrink factor) is
+/// `copies / (keys_1 + keys_2 + keys_3 + keys_4plus)`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RedundancySnapshot {
+    pub keys_1: u64,
+    pub keys_2: u64,
+    pub keys_3: u64,
+    pub keys_4plus: u64,
+    pub copies: u64,
+}
+
+impl RedundancySnapshot {
+    fn record(&mut self, visible_owners: u64) {
+        match visible_owners {
+            0 => {}
+            1 => self.keys_1 += 1,
+            2 => self.keys_2 += 1,
+            3 => self.keys_3 += 1,
+            _ => self.keys_4plus += 1,
+        }
+        self.copies += visible_owners;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreError {
     UnknownNode,
@@ -66,6 +94,15 @@ struct NodeRecord {
     last_seen: Instant,
 }
 
+/// Both lifecycle decisions for one owner record, produced from a single `nodes`
+/// lookup: `keep` (survives the TTL purge) and `visible` (query-visible: current
+/// session and node still fresh). Lets the sweep tally live redundancy without
+/// probing the node map twice per owner.
+struct OwnerEval {
+    keep: bool,
+    visible: bool,
+}
+
 /// Async thread-safe block hash storage using DashMap.
 ///
 /// `blocks` maps each block key to node URL ownership records. `nodes` tracks
@@ -74,6 +111,9 @@ pub struct BlockHashStore {
     blocks: DashMap<BlockKey, HashMap<Arc<str>, OwnerRecord>>,
     nodes: DashMap<Arc<str>, NodeRecord>,
     config: StoreConfig,
+    /// Latest live-owner redundancy distribution, refreshed each sweep and read
+    /// by metric callbacks. Decouples the O(N) scan from the scrape path.
+    redundancy: Mutex<RedundancySnapshot>,
 }
 
 impl BlockHashStore {
@@ -86,6 +126,7 @@ impl BlockHashStore {
             blocks: DashMap::new(),
             nodes: DashMap::new(),
             config,
+            redundancy: Mutex::new(RedundancySnapshot::default()),
         }
     }
 
@@ -244,21 +285,30 @@ impl BlockHashStore {
         result
     }
 
-    /// Sweep owners whose node is missing or whose ownership TTL has expired.
+    /// Sweep owners whose node is missing or whose ownership TTL has expired, and
+    /// refresh the cached live-owner redundancy snapshot in the same walk.
     pub fn sweep_expired(&self) -> SweepStats {
         let now = Instant::now();
         let mut stats = SweepStats::default();
+        let mut snapshot = RedundancySnapshot::default();
 
         self.blocks.retain(|_, owners| {
             let before = owners.len();
-            owners.retain(|node, owner| self.should_keep_owner(node, owner, now));
+            let mut visible = 0u64;
+            owners.retain(|node, owner| {
+                let eval = self.eval_owner(node, owner, now);
+                if eval.keep && eval.visible {
+                    visible += 1;
+                }
+                eval.keep
+            });
             stats.removed_owners += before.saturating_sub(owners.len());
             if owners.is_empty() {
                 stats.removed_keys += 1;
-                false
-            } else {
-                true
+                return false;
             }
+            snapshot.record(visible);
+            true
         });
 
         let node_before = self.nodes.len();
@@ -277,7 +327,20 @@ impl BlockHashStore {
         });
         stats.removed_nodes = node_before.saturating_sub(self.nodes.len());
 
+        *self
+            .redundancy
+            .lock()
+            .expect("redundancy snapshot mutex poisoned") = snapshot;
+
         stats
+    }
+
+    /// Latest cached live-owner redundancy distribution (refreshed each sweep).
+    pub fn redundancy_snapshot(&self) -> RedundancySnapshot {
+        *self
+            .redundancy
+            .lock()
+            .expect("redundancy snapshot mutex poisoned")
     }
 
     pub fn entry_count(&self) -> u64 {
@@ -313,6 +376,10 @@ impl BlockHashStore {
     pub fn invalidate_all(&self) {
         self.blocks.clear();
         self.nodes.clear();
+        *self
+            .redundancy
+            .lock()
+            .expect("redundancy snapshot mutex poisoned") = RedundancySnapshot::default();
     }
 
     fn touch_node_session(&self, node: &str, node_id: Uuid) -> Result<(), StoreError> {
@@ -349,20 +416,26 @@ impl BlockHashStore {
         removed
     }
 
-    fn is_owner_visible(&self, node: &Arc<str>, owner: &OwnerRecord, now: Instant) -> bool {
+    /// Evaluate one owner against the current node session and clocks with a
+    /// single `nodes` lookup. A missing node means the owner is neither kept nor
+    /// visible.
+    fn eval_owner(&self, node: &Arc<str>, owner: &OwnerRecord, now: Instant) -> OwnerEval {
         let Some(record) = self.nodes.get(node.as_ref()) else {
-            return false;
+            return OwnerEval {
+                keep: false,
+                visible: false,
+            };
         };
-        record.node_id == owner.node_id
-            && now.duration_since(record.last_seen) <= self.config.node_stale_after
+        let node_age = now.duration_since(record.last_seen);
+        OwnerEval {
+            keep: now.duration_since(owner.key_register_time) <= self.config.ttl
+                && node_age <= self.config.ttl,
+            visible: record.node_id == owner.node_id && node_age <= self.config.node_stale_after,
+        }
     }
 
-    fn should_keep_owner(&self, node: &Arc<str>, owner: &OwnerRecord, now: Instant) -> bool {
-        let Some(record) = self.nodes.get(node.as_ref()) else {
-            return false;
-        };
-        now.duration_since(owner.key_register_time) <= self.config.ttl
-            && now.duration_since(record.last_seen) <= self.config.ttl
+    fn is_owner_visible(&self, node: &Arc<str>, owner: &OwnerRecord, now: Instant) -> bool {
+        self.eval_owner(node, owner, now).visible
     }
 }
 
@@ -785,5 +858,56 @@ mod tests {
         assert_eq!(store.entry_count(), 0);
         assert_eq!(store.owner_count(), 0);
         assert_eq!(store.node_counts(), (0, 0));
+    }
+
+    #[test]
+    fn test_redundancy_snapshot_buckets_live_owners() {
+        let store = BlockHashStore::new();
+        let a = heartbeat_node(&store, "n-a");
+        let b = heartbeat_node(&store, "n-b");
+        let c = heartbeat_node(&store, "n-c");
+        let d = heartbeat_node(&store, "n-d");
+
+        // 1 owner, 2 owners, and 4 owners across three distinct keys.
+        store.insert_hashes("ns", &[vec![1]], "n-a", a).unwrap();
+        store.insert_hashes("ns", &[vec![2]], "n-a", a).unwrap();
+        store.insert_hashes("ns", &[vec![2]], "n-b", b).unwrap();
+        for (node, id) in [("n-a", a), ("n-b", b), ("n-c", c), ("n-d", d)] {
+            store.insert_hashes("ns", &[vec![3]], node, id).unwrap();
+        }
+
+        store.sweep_expired();
+
+        assert_eq!(
+            store.redundancy_snapshot(),
+            RedundancySnapshot {
+                keys_1: 1,
+                keys_2: 1,
+                keys_3: 0,
+                keys_4plus: 1,
+                copies: 1 + 2 + 4,
+            }
+        );
+    }
+
+    #[test]
+    fn test_redundancy_snapshot_excludes_superseded_owner() {
+        // A block whose only owner is a superseded session has zero *visible*
+        // owners, so it must not appear in any bucket even though the raw record
+        // survives until the TTL purge.
+        let store = BlockHashStore::new();
+        let old_id = heartbeat_node(&store, "node-a");
+        store
+            .insert_hashes("ns", &[vec![1]], "node-a", old_id)
+            .unwrap();
+        store.nodes.get_mut("node-a").unwrap().last_seen =
+            Instant::now() - Duration::from_secs(DEFAULT_NODE_STALE_SECS + 1);
+        let new_id = heartbeat_node(&store, "node-a");
+        assert_ne!(old_id, new_id);
+
+        store.sweep_expired();
+
+        assert_eq!(store.owner_count(), 1, "raw record still present");
+        assert_eq!(store.redundancy_snapshot(), RedundancySnapshot::default());
     }
 }
