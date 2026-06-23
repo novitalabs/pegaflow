@@ -229,13 +229,29 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
             self._completed_rdma_recvs.put(request_id)
             return
 
-        remote_handshake = self._remote_rdma_handshakes[dst_engine_id][remote_rank]
+        try:
+            remote_handshake = self._remote_rdma_handshakes[dst_engine_id][remote_rank]
+            self.pega_rdma.start_pull_blocks(
+                request_id=request_id,
+                remote_handshake=remote_handshake,
+                local_block_ids=_as_block_ids(local_block_ids),
+                remote_block_ids=_as_block_ids(remote_block_ids),
+            )
+        except Exception as e:
+            self._log_failure(
+                failure_type="pega_rdma_pull_submit_failed",
+                req_id=request_id,
+                error=e,
+                dst_engine_id=dst_engine_id,
+                remote_rank=remote_rank,
+            )
+            self._handle_failed_transfer(request_id, None)
+            self._pending_rdma_recvs.pop(request_id, None)
+            return
+
         future = self._rdma_pull_executor.submit(
-            self.pega_rdma.pull_blocks,
+            self.pega_rdma.wait_for_pull_blocks,
             request_id=request_id,
-            remote_handshake=remote_handshake,
-            local_block_ids=_as_block_ids(local_block_ids),
-            remote_block_ids=_as_block_ids(remote_block_ids),
         )
 
         def _done_callback(_future, req_id: str = request_id) -> None:

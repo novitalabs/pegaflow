@@ -167,6 +167,22 @@ class PegaNixlRdmaTransport:
         local_block_ids: BlockIds,
         remote_block_ids: BlockIds,
     ) -> None:
+        self.start_pull_blocks(
+            request_id=request_id,
+            remote_handshake=remote_handshake,
+            local_block_ids=local_block_ids,
+            remote_block_ids=remote_block_ids,
+        )
+        self.wait_for_pull_blocks(request_id)
+
+    def start_pull_blocks(
+        self,
+        *,
+        request_id: str,
+        remote_handshake: PdHandshake,
+        local_block_ids: BlockIds,
+        remote_block_ids: BlockIds,
+    ) -> None:
         assert self.rdma is not None, "Pega NIXL RDMA transport is not initialized"
         remote_map = _remote_block_map(local_block_ids, remote_block_ids)
         remote_handshake = _handshake_for_remote_blocks(
@@ -176,7 +192,6 @@ class PegaNixlRdmaTransport:
         self.open_request(request_id, remote_handshake)
         if not remote_map:
             logger.warning("Pega NIXL RDMA pull has no mapped blocks req=%s", request_id)
-            self.rdma.wait_for_pulls(request_id)
             return
 
         layers: list[tuple[int, list[LayerBlockSlices]]] = []
@@ -192,6 +207,9 @@ class PegaNixlRdmaTransport:
                 layers.append((layer_idx, blocks))
         if layers:
             self.rdma.pull_layers(request_id, layers)
+
+    def wait_for_pull_blocks(self, request_id: str) -> None:
+        assert self.rdma is not None, "Pega NIXL RDMA transport is not initialized"
         self.rdma.wait_for_pulls(request_id)
 
     def pop_finished_sending(self) -> set[str]:

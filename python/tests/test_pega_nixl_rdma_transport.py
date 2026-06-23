@@ -169,6 +169,34 @@ def test_transport_pulls_remote_blocks_into_local_blocks() -> None:
     assert "decode-req" in rdma.pop_finished_recving()
 
 
+def test_transport_can_start_pull_before_waiting() -> None:
+    rdma = RegisteringRdmaPort()
+    transport = PegaNixlRdmaTransport(
+        vllm_config=_vllm_config(),
+        engine_id="d0",
+        tp_rank=0,
+        tp_size=1,
+        rdma=rdma,
+    )
+    kv_cache = FakeTensor((2, 8, 2, 1, 8))
+    transport.register_kv_caches({"layer.0": kv_cache})
+    remote_handshake = transport.build_local_handshake("prefill-req", [2, 4])
+
+    transport.start_pull_blocks(
+        request_id="decode-req",
+        remote_handshake=remote_handshake,
+        local_block_ids=([6, 7],),
+        remote_block_ids=([2, 4],),
+    )
+
+    assert len(rdma.pull_layers_calls) == 1
+    assert rdma.pop_finished_recving() == set()
+
+    transport.wait_for_pull_blocks("decode-req")
+
+    assert "decode-req" in rdma.pop_finished_recving()
+
+
 def test_transport_pull_registers_only_requested_remote_blocks() -> None:
     rdma = RegisteringRdmaPort()
     transport = PegaNixlRdmaTransport(
@@ -214,10 +242,18 @@ def test_push_registration_key_preserves_decode_tp_rank() -> None:
 
 class RecordingPegaRdma:
     def __init__(self) -> None:
-        self.pull_calls: list[dict[str, object]] = []
+        self.start_pull_calls: list[dict[str, object]] = []
+        self.wait_pull_calls: list[str] = []
 
     def pull_blocks(self, **kwargs: object) -> None:
-        self.pull_calls.append(kwargs)
+        self.start_pull_blocks(**kwargs)
+        self.wait_for_pull_blocks(str(kwargs["request_id"]))
+
+    def start_pull_blocks(self, **kwargs: object) -> None:
+        self.start_pull_calls.append(kwargs)
+
+    def wait_for_pull_blocks(self, request_id: str) -> None:
+        self.wait_pull_calls.append(request_id)
 
     def pop_finished_recving(self) -> set[str]:
         return {"decode-req"}
@@ -340,7 +376,7 @@ def test_pega_pull_worker_uses_rdma_pull_and_reports_completion() -> None:
     )
 
     worker.start_load_kv(metadata)
-    assert rdma.pull_calls == [
+    assert rdma.start_pull_calls == [
         {
             "request_id": "decode-req",
             "remote_handshake": _remote_handshake(),
@@ -348,6 +384,7 @@ def test_pega_pull_worker_uses_rdma_pull_and_reports_completion() -> None:
             "remote_block_ids": ([2, 4],),
         }
     ]
+    assert rdma.wait_pull_calls == ["decode-req"]
 
     assert worker.get_finished() == (set(), {"decode-req"})
 
