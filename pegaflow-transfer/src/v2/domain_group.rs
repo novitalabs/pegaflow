@@ -273,7 +273,6 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
                 dst_ptr: request.dst_mr.ptr,
                 dst_rkey: *dst_rkey,
                 dst_offset: request.dst_offset + offset as u64,
-                read: request.read,
             });
             rdma_ops.push((i, op, dst_addr.clone()));
         }
@@ -371,11 +370,6 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
         if request.dsts.is_empty() {
             return Err(FabricLibError::Custom("Empty scatter targets"));
         }
-        if request.read && request.imm_data.is_some() {
-            return Err(FabricLibError::Custom(
-                "RDMA read scatter does not support immediate data",
-            ));
-        }
         if let Some(dst_handle) = &request.dst_handle {
             let group = self
                 .peer_groups
@@ -411,7 +405,6 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
                         dst_end: end,
                         byte_shards: 1,
                         byte_shard_idx: 0,
-                        read: request.read,
                     });
                     rdma_ops.push(op);
                     domain_indices.push(domain_idx);
@@ -430,7 +423,6 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
                         dst_end: request.dsts.len(),
                         byte_shards: N as u32,
                         byte_shard_idx: domain_idx as u32,
-                        read: request.read,
                     });
                     rdma_ops.push(op);
                     domain_indices.push(domain_idx);
@@ -449,7 +441,6 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
                     dst_end: request.dsts.len(),
                     byte_shards: 1,
                     byte_shard_idx: 0,
-                    read: request.read,
                 });
                 rdma_ops.push(op);
                 domain_indices.push(domain_idx as usize);

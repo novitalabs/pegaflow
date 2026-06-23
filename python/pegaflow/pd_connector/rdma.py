@@ -77,6 +77,19 @@ class RdmaPort(Protocol):
     def close_request(self, req_id: str) -> None: ...
 
 
+class V1HandshakePort(Protocol):
+    def prepare_peer(self, peer_key: str) -> str: ...
+
+    def complete_peer(self, peer_key: str, remote_metadata: str) -> None: ...
+
+    def open_request_with_peer(
+        self,
+        req_id: str,
+        handshake: PdHandshake,
+        peer_key: str,
+    ) -> None: ...
+
+
 class MockRdmaPort:
     """A test double that records RDMA calls without touching native verbs."""
 
@@ -84,6 +97,9 @@ class MockRdmaPort:
         self.local_layers: tuple[LayerRemoteLayout, ...] = ()
         self.registered: set[str] = set()
         self.remote_handshakes: dict[str, PdHandshake | None] = {}
+        self.remote_peer_keys: dict[str, str] = {}
+        self.prepared_peers: list[str] = []
+        self.completed_peers: list[tuple[str, str]] = []
         self.pushed_layers: dict[str, list[tuple[int, list[LayerBlockSlices]]]] = {}
         self.pulled_layers: dict[str, list[tuple[int, list[LayerBlockSlices]]]] = {}
         self.pull_layer_calls: list[tuple[str, int, list[LayerBlockSlices]]] = []
@@ -102,6 +118,22 @@ class MockRdmaPort:
     def open_request(self, req_id: str, handshake: PdHandshake) -> None:
         self.registered.add(req_id)
         self.remote_handshakes[req_id] = handshake
+
+    def prepare_peer(self, peer_key: str) -> str:
+        self.prepared_peers.append(peer_key)
+        return f"mock-meta:{peer_key}"
+
+    def complete_peer(self, peer_key: str, remote_metadata: str) -> None:
+        self.completed_peers.append((peer_key, remote_metadata))
+
+    def open_request_with_peer(
+        self,
+        req_id: str,
+        handshake: PdHandshake,
+        peer_key: str,
+    ) -> None:
+        self.open_request(req_id, handshake)
+        self.remote_peer_keys[req_id] = peer_key
 
     def push_layer(
         self,
@@ -502,23 +534,54 @@ class RealRdmaPort:
         return self.engine.close_request(req_id)
 
 
+class V1RdmaPort(RealRdmaPort):
+    """Adapter for the minimal v1 RDMA data plane used by Pega NIXL.
+
+    The Python-facing engine API is intentionally kept isomorphic to
+    ``PdRdmaEngine`` so the connector only swaps the data plane underneath.
+    """
+
+    def prepare_peer(self, peer_key: str) -> str:
+        return str(self.engine.prepare_peer(peer_key))
+
+    def complete_peer(self, peer_key: str, remote_metadata: str) -> None:
+        return self.engine.complete_peer(peer_key, remote_metadata)
+
+    def open_request_with_peer(
+        self,
+        req_id: str,
+        handshake: PdHandshake,
+        peer_key: str,
+    ) -> None:
+        start = time.perf_counter()
+        self.engine.register_remote(
+            req_id,
+            json.dumps(handshake_to_dict(handshake)),
+            peer_key,
+        )
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        logger.info(
+            "[PdConnector] RDMA v1 open_request req=%s remote_req=%s peer=%s layers=%d native_ms=%.3f",
+            req_id,
+            handshake.request_id,
+            peer_key,
+            len(handshake.layers),
+            elapsed_ms,
+        )
+
+
 def build_rdma_port(
     vllm_config: Any,
     cuda_device: int | None,
     *,
     tp_rank: int | None = None,
+    data_plane: str = "v2",
+    peer_key: str | None = None,
 ) -> RdmaPort:
     config = getattr(vllm_config, "kv_transfer_config", None)
     enabled = _extra(config, "pegaflow.pd.rdma.enabled", _MISSING)
     if enabled is not _MISSING and not _as_bool(enabled):
         raise RuntimeError("PdConnector requires native RDMA; pegaflow.pd.rdma.enabled=false")
-
-    try:
-        from pegaflow.pegaflow import PdRdmaEngine
-    except ImportError as exc:
-        raise RuntimeError("PdConnector requires native RDMA extension pegaflow.pegaflow") from exc
-    except AttributeError as exc:
-        raise RuntimeError("pegaflow.pegaflow does not expose PdRdmaEngine") from exc
 
     _reject_legacy_rank_config(config)
     device = _extra(config, "pegaflow.pd.rdma.device", "cuda")
@@ -529,6 +592,42 @@ def build_rdma_port(
         resolved_tp_rank,
         cuda_device=resolved_cuda_device,
     )
+    if data_plane == "v1":
+        try:
+            from pegaflow.pegaflow import PdRdmaV1Engine
+        except ImportError as exc:
+            raise RuntimeError(
+                "Pega NIXL requires native RDMA extension pegaflow.pegaflow"
+            ) from exc
+        except AttributeError as exc:
+            raise RuntimeError("pegaflow.pegaflow does not expose PdRdmaV1Engine") from exc
+        qps_per_peer = int(_extra(config, "pegaflow.pd.rdma.v1.qps_per_peer", 1))
+        engine = PdRdmaV1Engine(
+            cuda_device=resolved_cuda_device,
+            domains=[rank_config.nic],
+            qps_per_peer=qps_per_peer,
+            local_peer_key=peer_key or f"rank:{rank_config.tp_rank}",
+        )
+        logger.info(
+            "[PdConnector] native RDMA v1 enabled tp_rank=%d cuda=%d nic=%s worker_cpu=%d qps_per_peer=%d link_speed=%s",
+            rank_config.tp_rank,
+            resolved_cuda_device,
+            rank_config.nic,
+            rank_config.worker_cpu,
+            qps_per_peer,
+            engine.aggregated_link_speed(),
+        )
+        return V1RdmaPort(engine)
+    if data_plane != "v2":
+        raise ValueError(f"unsupported RDMA data_plane={data_plane!r}")
+
+    try:
+        from pegaflow.pegaflow import PdRdmaEngine
+    except ImportError as exc:
+        raise RuntimeError("PdConnector requires native RDMA extension pegaflow.pegaflow") from exc
+    except AttributeError as exc:
+        raise RuntimeError("pegaflow.pegaflow does not expose PdRdmaEngine") from exc
+
     engine = PdRdmaEngine(
         cuda_device=resolved_cuda_device,
         numa_node=None,

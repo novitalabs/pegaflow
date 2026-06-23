@@ -53,6 +53,7 @@ class PegaNixlRdmaTransport:
         self.layouts: dict[str, KvCacheLayout] = {}
         self.layer_names: list[str] = []
         self.registered_layers: dict[str, LayerRemoteLayout] = {}
+        self._connected_peers: set[str] = set()
 
     def register_kv_caches(
         self,
@@ -78,6 +79,8 @@ class PegaNixlRdmaTransport:
                 self.vllm_config,
                 _infer_cuda_device(kv_caches),
                 tp_rank=self.tp_rank,
+                data_plane="v1",
+                peer_key=self.local_peer_key,
             )
         registered_layers = self.rdma.register_local_layers(
             tuple(
@@ -128,7 +131,41 @@ class PegaNixlRdmaTransport:
 
     def open_request(self, request_id: str, remote_handshake: PdHandshake) -> None:
         assert self.rdma is not None, "Pega NIXL RDMA transport is not initialized"
-        self.rdma.open_request(request_id, remote_handshake)
+        peer_key = self.peer_key(remote_handshake.engine_id, remote_handshake.tp_rank)
+        open_with_peer = getattr(self.rdma, "open_request_with_peer", None)
+        if open_with_peer is not None:
+            open_with_peer(request_id, remote_handshake, peer_key)
+        else:
+            self.rdma.open_request(request_id, remote_handshake)
+
+    @property
+    def local_peer_key(self) -> str:
+        return self.peer_key(self.engine_id, self.tp_rank)
+
+    @staticmethod
+    def peer_key(engine_id: str, tp_rank: int) -> str:
+        return f"{engine_id}:{int(tp_rank)}"
+
+    def prepare_rdma_peer(self, peer_key: str) -> str:
+        assert self.rdma is not None, "Pega NIXL RDMA transport is not initialized"
+        prepare = getattr(self.rdma, "prepare_peer", None)
+        if prepare is None:
+            raise RuntimeError("Pega NIXL RDMA v1 port does not support prepare_peer")
+        return str(prepare(peer_key))
+
+    def complete_rdma_peer(self, peer_key: str, remote_metadata: str) -> None:
+        assert self.rdma is not None, "Pega NIXL RDMA transport is not initialized"
+        complete = getattr(self.rdma, "complete_peer", None)
+        if complete is None:
+            raise RuntimeError("Pega NIXL RDMA v1 port does not support complete_peer")
+        complete(peer_key, remote_metadata)
+        self._connected_peers.add(peer_key)
+
+    def mark_rdma_peer_connected(self, peer_key: str) -> None:
+        self._connected_peers.add(peer_key)
+
+    def has_rdma_peer(self, peer_key: str) -> bool:
+        return peer_key in self._connected_peers
 
     def push_blocks(
         self,

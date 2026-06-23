@@ -40,12 +40,7 @@ impl SingleWriteOpIter {
             length: op.length as u32,
             lkey: op.src_desc.0 as u32,
         });
-        assert!(!op.read || op.imm_data.is_none());
-        let (opcode, imm) = if op.read {
-            (ibv_wr_opcode::IBV_WR_RDMA_READ, 0)
-        } else {
-            opcode_imm(op.imm_data)
-        };
+        let (opcode, imm) = opcode_imm(op.imm_data);
         let wr = wr.write(ibv_send_wr {
             wr_id: context as u64,
             next: null_mut(),
@@ -247,7 +242,6 @@ pub struct ScatterWriteOpIter {
     dst_end: usize,
     byte_shards: u32,
     byte_shard_idx: u32,
-    read: bool,
     // Loop variables
     i_dst: usize,
 }
@@ -264,12 +258,7 @@ impl ScatterWriteOpIter {
         assert!(qp_list.len() == op.dsts.len());
 
         // Prepare WR template
-        assert!(!op.read || op.imm_data.is_none());
-        let (opcode, imm) = if op.read {
-            (ibv_wr_opcode::IBV_WR_RDMA_READ, 0)
-        } else {
-            opcode_imm(op.imm_data)
-        };
+        let (opcode, imm) = opcode_imm(op.imm_data);
         let buf = unsafe { wr_chain_buffer.as_mut() };
         let (wr, sge) = &mut buf[0];
         let sge = sge.write(ibv_sge {
@@ -297,7 +286,6 @@ impl ScatterWriteOpIter {
             dst_end: op.dst_end,
             byte_shards: op.byte_shards,
             byte_shard_idx: op.byte_shard_idx,
-            read: op.read,
             i_dst: op.dst_beg,
         };
 
@@ -442,66 +430,5 @@ pub fn fill_recv_op(
             sg_list: sge.as_mut_ptr(),
             num_sge: 1,
         };
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::v2::{
-        api::{DomainAddress, MemoryRegionDescriptor, MemoryRegionRemoteKey, ScatterTarget},
-        mr::MemoryRegionLocalDescriptor,
-    };
-    use bytes::Bytes;
-    use std::ptr::NonNull;
-
-    #[test]
-    fn scatter_read_uses_rdma_read_opcode() {
-        let mut data = [0_u8; 64];
-        let src_ptr = NonNull::new(data.as_mut_ptr().cast::<c_void>()).unwrap();
-        let remote_mr = MemoryRegionDescriptor {
-            ptr: 0x1000,
-            addr_rkey_list: smallvec::smallvec![(
-                DomainAddress(Bytes::from_static(b"peer")),
-                MemoryRegionRemoteKey(17),
-            )],
-        };
-        let dsts = Arc::new(vec![ScatterTarget {
-            dst_mr: remote_mr,
-            length: 16,
-            src_offset: 8,
-            dst_offset: 32,
-        }]);
-        let op = ScatterGroupWriteOp {
-            domain_idx: 0,
-            src_ptr,
-            src_desc: MemoryRegionLocalDescriptor(3),
-            imm_data: None,
-            dsts,
-            dst_beg: 0,
-            dst_end: 1,
-            byte_shards: 1,
-            byte_shard_idx: 0,
-            read: true,
-        };
-        let qp = NonNull::dangling();
-        let mut wr_chain_buffer = unsafe { MaybeUninit::<WrChainBuffer>::zeroed().assume_init() };
-        let iter = ScatterWriteOpIter::new(
-            op,
-            Rc::new(vec![qp]),
-            NonNull::new((&mut wr_chain_buffer as *mut WrChainBuffer).cast()).unwrap(),
-            std::ptr::null_mut(),
-        );
-
-        let (_, wr, wr_len) = iter.peek();
-        assert_eq!(wr_len, 1);
-        let wr = unsafe { &*wr };
-        let sge = unsafe { &*wr.sg_list };
-        assert_eq!(wr.opcode, ibv_wr_opcode::IBV_WR_RDMA_READ);
-        assert_eq!(sge.addr, unsafe { src_ptr.as_ptr().byte_add(8) } as u64);
-        assert_eq!(sge.length, 16);
-        assert_eq!(sge.lkey, 3);
-        assert_eq!(unsafe { wr.wr.rdma.remote_addr }, 0x1000 + 32);
-        assert_eq!(unsafe { wr.wr.rdma.rkey }, 17);
     }
 }

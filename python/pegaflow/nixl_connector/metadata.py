@@ -20,6 +20,7 @@ ReqId = str
 
 GET_META_MSG = b"get_meta_msg"
 HEARTBEAT_MSG = b"heartbeat_msg"
+PEGA_RDMA_HANDSHAKE_MSG = b"pega_rdma_handshake_msg"
 
 # Push-mode (WRITE-based) registration notification.
 # Sent worker-to-worker over NIXL: D worker -> P worker, encoded as

@@ -25,6 +25,12 @@ from pegaflow.nixl_connector.metadata import (
     compute_nixl_compatibility_hash,
 )
 from pegaflow.nixl_connector.push_worker import NixlPushConnectorWorker
+from pegaflow.nixl_connector.rdma_control import (
+    PegaRdmaControlServer,
+    exchange_rdma_handshake,
+    rdma_control_host,
+    rdma_control_port,
+)
 from pegaflow.nixl_connector.rdma_transport import (
     PegaNixlRdmaTransport,
     handshake_from_wire,
@@ -58,6 +64,9 @@ class PegaNixlPushConnectorWorker(NixlPushConnectorWorker):
             max_workers=16,
             thread_name_prefix="pega-nixl-rdma-done-waiter",
         )
+        self._rdma_control_host = rdma_control_host()
+        self._rdma_control_port = rdma_control_port(self.vllm_config, self.tp_rank)
+        self._rdma_control_server: PegaRdmaControlServer | None = None
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         self.transfer_topo = TransferTopology(
@@ -90,7 +99,18 @@ class PegaNixlPushConnectorWorker(NixlPushConnectorWorker):
             compatibility_hash=self.compat_hash,
             agent_metadata_bytes=b"pega-rdma",
         )
+        self._ensure_rdma_control_server_started()
         self._ensure_push_writer_started()
+
+    def _ensure_rdma_control_server_started(self) -> None:
+        if self._rdma_control_server is not None:
+            return
+        self._rdma_control_server = PegaRdmaControlServer(
+            transport=self.pega_rdma,
+            host=self._rdma_control_host,
+            port=self._rdma_control_port,
+        )
+        self._rdma_control_server.start()
 
     def _ensure_push_writer_started(self) -> None:
         if self._push_writer_thread is not None:
@@ -109,6 +129,10 @@ class PegaNixlPushConnectorWorker(NixlPushConnectorWorker):
         if self._push_writer_thread is not None:
             self._push_writer_thread.join(timeout=2)
             self._push_writer_thread = None
+        rdma_control_server = getattr(self, "_rdma_control_server", None)
+        if rdma_control_server is not None:
+            rdma_control_server.shutdown()
+            self._rdma_control_server = None
         self._rdma_wait_executor.shutdown(wait=False, cancel_futures=True)
         self._handshake_initiation_executor.shutdown(wait=False, cancel_futures=True)
 
@@ -127,11 +151,10 @@ class PegaNixlPushConnectorWorker(NixlPushConnectorWorker):
             fail_imm_id=_fail_imm_id(imm_id),
             abort_imm_id=_abort_imm_id(imm_id),
         )
-        self.pega_rdma.open_request(req_id, handshake)
         self._submit_rdma_wait(req_id)
-        reg_data["pega_rdma_handshake"] = handshake_to_wire(
-            handshake
-        )
+        reg_data["pega_rdma_handshake"] = handshake_to_wire(handshake)
+        reg_data["decode_rdma_control_host"] = self._rdma_control_host
+        reg_data["decode_rdma_control_port"] = self._rdma_control_port
         self._do_send_reg_notif(req_id, reg_data)
 
     def _do_send_reg_notif(self, req_id: str, reg_data: dict[str, Any]) -> None:
@@ -177,6 +200,26 @@ class PegaNixlPushConnectorWorker(NixlPushConnectorWorker):
     ) -> bool:
         return True
 
+    def _ensure_rdma_peer_for_push(
+        self,
+        registration_data: dict[str, Any],
+        handshake,
+    ) -> None:
+        remote_peer_key = self.pega_rdma.peer_key(handshake.engine_id, handshake.tp_rank)
+        if self.pega_rdma.has_rdma_peer(remote_peer_key):
+            return
+        host = registration_data.get("decode_rdma_control_host")
+        port = registration_data.get("decode_rdma_control_port")
+        if host is None or port is None:
+            raise RuntimeError("Pega NIXL push registration missing RDMA control endpoint")
+        exchange_rdma_handshake(
+            transport=self.pega_rdma,
+            local_peer_key=self.pega_rdma.local_peer_key,
+            remote_peer_key=remote_peer_key,
+            remote_host=str(host),
+            remote_port=int(port),
+        )
+
     def _xfer_blocks_for_req(self, req_id: str, meta: ReqMeta):
         assert meta.remote is not None
         reg_data = getattr(meta, "registration_data", None)
@@ -191,6 +234,7 @@ class PegaNixlPushConnectorWorker(NixlPushConnectorWorker):
                 handshake.tp_rank,
             )
             return
+        self._ensure_rdma_peer_for_push(reg_data, handshake)
         self.pega_rdma.push_blocks(
             request_id=req_id,
             remote_handshake=handshake,

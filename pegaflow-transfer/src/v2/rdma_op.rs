@@ -14,7 +14,6 @@ pub struct SingleWriteOp {
     pub dst_ptr: u64,
     pub dst_rkey: MemoryRegionRemoteKey,
     pub dst_offset: u64,
-    pub read: bool,
 }
 
 pub struct ImmWriteOp {
@@ -56,7 +55,6 @@ pub struct ScatterGroupWriteOp {
     pub dst_end: usize,
     pub byte_shards: u32,
     pub byte_shard_idx: u32,
-    pub read: bool,
 }
 
 pub enum GroupWriteOp {

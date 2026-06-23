@@ -122,7 +122,6 @@ pub struct SingleTransferRequest {
     pub dst_mr: MemoryRegionDescriptor,
     pub dst_offset: u64,
     pub domain: DomainGroupRouting,
-    pub read: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -160,7 +159,6 @@ pub struct ScatterTransferRequest {
     pub dsts: Arc<Vec<ScatterTarget>>,
     pub imm_data: Option<u32>,
     pub domain: GroupTransferRouting,
-    pub read: bool,
 }
 
 /// Use static dispatch for performance.

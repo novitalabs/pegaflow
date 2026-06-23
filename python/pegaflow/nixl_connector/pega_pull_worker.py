@@ -31,6 +31,12 @@ from pegaflow.nixl_connector.metadata import (
     compute_nixl_compatibility_hash,
 )
 from pegaflow.nixl_connector.pull_worker import NixlPullConnectorWorker
+from pegaflow.nixl_connector.rdma_control import (
+    PegaRdmaControlServer,
+    exchange_rdma_handshake,
+    rdma_control_host,
+    rdma_control_port,
+)
 from pegaflow.nixl_connector.rdma_transport import (
     PegaNixlRdmaTransport,
     handshake_from_wire,
@@ -72,6 +78,9 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
             max_workers=16,
             thread_name_prefix="pega-nixl-rdma-pull",
         )
+        self._rdma_control_host = rdma_control_host()
+        self._rdma_control_port = rdma_control_port(self.vllm_config, self.tp_rank)
+        self._rdma_control_server: PegaRdmaControlServer | None = None
 
     def _pega_zmq_ctx(self, path: str):
         return zmq_ctx(zmq.REQ, path)
@@ -111,7 +120,20 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         self.xfer_handshake_metadata = encode_pega_rdma_handshake_payload(
             self.compat_hash,
             local_handshake,
+            rdma_control_host=self._rdma_control_host,
+            rdma_control_port=self._rdma_control_port,
         )
+        self._ensure_rdma_control_server_started()
+
+    def _ensure_rdma_control_server_started(self) -> None:
+        if self._rdma_control_server is not None:
+            return
+        self._rdma_control_server = PegaRdmaControlServer(
+            transport=self.pega_rdma,
+            host=self._rdma_control_host,
+            port=self._rdma_control_port,
+        )
+        self._rdma_control_server.start()
 
     def _nixl_handshake(
         self,
@@ -145,11 +167,25 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
                         f"Local: {self.compat_hash}, "
                         f"Remote: {handshake_payload.compatibility_hash}."
                     )
-                handshake = decode_pega_rdma_handshake_payload(handshake_payload)
+                handshake, rdma_control = decode_pega_rdma_handshake_payload(
+                    handshake_payload
+                )
                 if handshake.engine_id != expected_engine_id:
                     raise RuntimeError(
                         "Remote Pega RDMA engine ID mismatch. "
                         f"Expected {expected_engine_id}, received {handshake.engine_id}."
+                    )
+                remote_peer_key = self.pega_rdma.peer_key(
+                    handshake.engine_id,
+                    handshake.tp_rank,
+                )
+                if not self.pega_rdma.has_rdma_peer(remote_peer_key):
+                    exchange_rdma_handshake(
+                        transport=self.pega_rdma,
+                        local_peer_key=self.pega_rdma.local_peer_key,
+                        remote_peer_key=remote_peer_key,
+                        remote_host=rdma_control["host"],
+                        remote_port=rdma_control["port"],
                     )
                 self._add_remote_rdma_handshake(
                     expected_engine_id,
@@ -365,6 +401,9 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
     def shutdown(self):
         if not hasattr(self, "_handshake_initiation_executor"):
             return
+        if self._rdma_control_server is not None:
+            self._rdma_control_server.shutdown()
+            self._rdma_control_server = None
         self._rdma_pull_executor.shutdown(wait=False, cancel_futures=True)
         self._handshake_initiation_executor.shutdown(wait=False)
         for req_id in list(self._recving_metadata):
@@ -377,15 +416,32 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
 def encode_pega_rdma_handshake_payload(
     compatibility_hash: str,
     handshake: PdHandshake,
+    *,
+    rdma_control_host: str,
+    rdma_control_port: int,
 ) -> NixlHandshakePayload:
     return NixlHandshakePayload(
         compatibility_hash=compatibility_hash,
-        agent_metadata_bytes=msgspec.msgpack.encode(handshake_to_wire(handshake)),
+        agent_metadata_bytes=msgspec.msgpack.encode(
+            {
+                "handshake": handshake_to_wire(handshake),
+                "rdma_control_host": rdma_control_host,
+                "rdma_control_port": int(rdma_control_port),
+            }
+        ),
     )
 
 
-def decode_pega_rdma_handshake_payload(payload: NixlHandshakePayload) -> PdHandshake:
-    return handshake_from_wire(msgspec.msgpack.decode(payload.agent_metadata_bytes))
+def decode_pega_rdma_handshake_payload(
+    payload: NixlHandshakePayload,
+) -> tuple[PdHandshake, dict[str, Any]]:
+    data = msgspec.msgpack.decode(payload.agent_metadata_bytes)
+    if isinstance(data, dict) and "handshake" in data:
+        return handshake_from_wire(data["handshake"]), {
+            "host": str(data["rdma_control_host"]),
+            "port": int(data["rdma_control_port"]),
+        }
+    return handshake_from_wire(data), {"host": "", "port": 0}
 
 
 def _infer_cuda_device(kv_caches: dict[str, Any]) -> int:
