@@ -29,7 +29,7 @@ rdma-mummy-sys = "0.2.4"
 cudarc = { version = "0.19.3" }
 offset-allocator = "0.2.0"
 hashlink = "0.11.0"
-tokio = { version = "1.50.0", features = ["full"] }
+tokio = { version = "1.48.0", features = ["full"] }
 rand = "0.10"
 shared_memory = "0.12"
 uuid = { version = "1.22", features = ["v4"] }
