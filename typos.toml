@@ -1,3 +1,7 @@
 [default.extend-words]
 # Rust std library path (std::f64::consts)
 consts = "consts"
+# NumPy API name used by the vendored NIXL connector.
+arange = "arange"
+# Ordinal suffix in vLLM's ASCII layout diagram ("2nd").
+nd = "nd"

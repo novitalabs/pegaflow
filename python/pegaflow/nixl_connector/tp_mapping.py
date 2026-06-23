@@ -7,7 +7,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
     TransferTopology,

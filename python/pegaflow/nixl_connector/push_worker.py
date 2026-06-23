@@ -37,8 +37,9 @@ from typing import TYPE_CHECKING, Any
 
 import msgspec
 import numpy as np
-
 from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
+from vllm.logger import init_logger
+
 from pegaflow.nixl_connector.base_worker import (
     NixlBaseConnectorWorker,
 )
@@ -52,11 +53,9 @@ from pegaflow.nixl_connector.metadata import (
 )
 from pegaflow.nixl_connector.tp_mapping import ReadSpec
 from pegaflow.nixl_connector.utils import get_base_request_id
-from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     import torch
-
     from vllm.config import VllmConfig
     from vllm.v1.kv_cache_interface import KVCacheConfig
 

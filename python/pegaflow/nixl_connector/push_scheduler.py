@@ -31,6 +31,8 @@ from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
 )
+from vllm.logger import init_logger
+
 from pegaflow.nixl_connector.base_scheduler import (
     NixlBaseConnectorScheduler,
 )
@@ -38,7 +40,6 @@ from pegaflow.nixl_connector.metadata import (
     NixlConnectorMetadata,
     ReqId,
 )
-from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -272,17 +273,17 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             self._finished_request_blocks[request.request_id] = block_ids
             self._newly_finished_push_blocks[request.request_id] = block_ids
 
-        return delay_free_blocks, dict(
-            do_remote_prefill=True,
-            do_remote_decode=False,
-            remote_block_ids=block_ids,
-            remote_engine_id=self.engine_id,
-            remote_request_id=request.request_id,
-            remote_host=self.side_channel_host,
-            remote_port=self.side_channel_port,
-            tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
-            remote_num_tokens=remote_num_tokens,
-        )
+        return delay_free_blocks, {
+            "do_remote_prefill": True,
+            "do_remote_decode": False,
+            "remote_block_ids": block_ids,
+            "remote_engine_id": self.engine_id,
+            "remote_request_id": request.request_id,
+            "remote_host": self.side_channel_host,
+            "remote_port": self.side_channel_port,
+            "tp_size": self.vllm_config.parallel_config.tensor_parallel_size,
+            "remote_num_tokens": remote_num_tokens,
+        }
 
     def build_connector_meta(
         self,

@@ -12,8 +12,9 @@ from typing import TYPE_CHECKING, Any
 
 import msgspec
 import zmq
-
 from vllm.distributed.kv_transfer.kv_connector.utils import TransferTopology
+from vllm.logger import init_logger
+from vllm.utils.network_utils import make_zmq_path
 
 from pegaflow.nixl_connector.metadata import (
     PUSH_REG_NOTIF_PREFIX,
@@ -31,8 +32,6 @@ from pegaflow.nixl_connector.rdma_transport import (
 )
 from pegaflow.nixl_connector.tp_mapping import compute_tp_mapping
 from pegaflow.nixl_connector.utils import get_base_request_id, zmq_ctx
-from vllm.logger import init_logger
-from vllm.utils.network_utils import make_zmq_path
 
 if TYPE_CHECKING:
     import torch
@@ -60,7 +59,7 @@ class PegaNixlPushConnectorWorker(NixlPushConnectorWorker):
             thread_name_prefix="pega-nixl-rdma-done-waiter",
         )
 
-    def register_kv_caches(self, kv_caches: dict[str, "torch.Tensor"]):
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         self.transfer_topo = TransferTopology(
             tp_rank=self.tp_rank,
             tp_size=self.world_size,
@@ -233,7 +232,7 @@ class PegaNixlPushConnectorWorker(NixlPushConnectorWorker):
 
     @staticmethod
     def _attach_registration(meta: ReqMeta, registration_data: dict[str, Any]) -> ReqMeta:
-        setattr(meta, "registration_data", registration_data)
+        meta.registration_data = registration_data
         return meta
 
     def start_load_kv(self, metadata):

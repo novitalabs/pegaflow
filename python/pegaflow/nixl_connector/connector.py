@@ -15,7 +15,6 @@ and worker classes; the connector classes here only forward calls.
 from typing import TYPE_CHECKING, Any
 
 import torch
-
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     EngineId,
@@ -35,8 +34,22 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     PromMetric,
     PromMetricT,
 )
+from vllm.forward_context import ForwardContext
+from vllm.logger import init_logger
+from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
+from vllm.v1.attention.backends.utils import get_kv_cache_layout
+from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.outputs import KVConnectorOutput
+
 from pegaflow.nixl_connector.metadata import (
     NixlConnectorMetadata,
+)
+from pegaflow.nixl_connector.pega_pull_worker import (
+    PegaNixlPullConnectorWorker,
+)
+from pegaflow.nixl_connector.pega_push_worker import (
+    PegaNixlPushConnectorWorker,
 )
 from pegaflow.nixl_connector.pull_scheduler import (
     NixlPullConnectorScheduler,
@@ -50,34 +63,22 @@ from pegaflow.nixl_connector.push_scheduler import (
 from pegaflow.nixl_connector.push_worker import (
     NixlPushConnectorWorker,
 )
-from pegaflow.nixl_connector.pega_push_worker import (
-    PegaNixlPushConnectorWorker,
-)
-from pegaflow.nixl_connector.pega_pull_worker import (
-    PegaNixlPullConnectorWorker,
-)
 from pegaflow.nixl_connector.stats import (
     NixlKVConnectorStats,
     NixlPromMetrics,
 )
-from vllm.forward_context import ForwardContext
-from vllm.logger import init_logger
-from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
-from vllm.v1.attention.backends.utils import get_kv_cache_layout
-from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_interface import MambaSpec
-from vllm.v1.outputs import KVConnectorOutput
 
 if TYPE_CHECKING:
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm.v1.request import Request
+
     from pegaflow.nixl_connector.base_scheduler import (
         NixlBaseConnectorScheduler,
     )
     from pegaflow.nixl_connector.base_worker import (
         NixlBaseConnectorWorker,
     )
-    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-    from vllm.v1.kv_cache_interface import KVCacheConfig
-    from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
@@ -88,10 +89,8 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
     @property
     def prefer_cross_layer_blocks(self) -> bool:
         if any(
-            [
-                isinstance(group.kv_cache_spec, MambaSpec)
+            isinstance(group.kv_cache_spec, MambaSpec)
                 for group in self.kv_cache_config.kv_cache_groups
-            ]
         ):
             # Hybrid SSM models do not yet support cross-layer layout
             return False

@@ -17,7 +17,6 @@ import msgspec
 import numpy as np
 import torch
 import zmq
-
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
     EngineId,
@@ -30,6 +29,28 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import CopyBlocksOp
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (
+    MambaConvSplitInfo,
+    derive_mamba_conv_split,
+)
+from vllm.distributed.nixl_utils import NixlWrapper, nixl_agent_config
+from vllm.distributed.parallel_state import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+from vllm.logger import init_logger
+from vllm.platforms import current_platform
+from vllm.utils.network_utils import make_zmq_path
+from vllm.v1.attention.backends.utils import get_kv_cache_layout
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    MambaSpec,
+    MLAAttentionSpec,
+    UniformTypeKVCacheSpecs,
+)
+from vllm.v1.worker.block_table import BlockTable
+from vllm.v1.worker.utils import select_common_block_size
+
 from pegaflow.nixl_connector.metadata import (
     GET_META_MSG,
     NixlAgentMetadata,
@@ -54,27 +75,6 @@ from pegaflow.nixl_connector.utils import (
     get_representative_spec_type,
     zmq_ctx,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (
-    MambaConvSplitInfo,
-    derive_mamba_conv_split,
-)
-from vllm.distributed.nixl_utils import NixlWrapper, nixl_agent_config
-from vllm.distributed.parallel_state import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
-from vllm.logger import init_logger
-from vllm.platforms import current_platform
-from vllm.utils.network_utils import make_zmq_path
-from vllm.v1.attention.backends.utils import get_kv_cache_layout
-from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
-    MambaSpec,
-    MLAAttentionSpec,
-    UniformTypeKVCacheSpecs,
-)
-from vllm.v1.worker.block_table import BlockTable
-from vllm.v1.worker.utils import select_common_block_size
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -1154,10 +1154,7 @@ class NixlBaseConnectorWorker:
         conv_size_remote = nixl_agent_meta.ssm_sizes[0]
 
         conv_offsets = self._conv_decomp.remote_conv_offsets(local_offset, tp_ratio)
-        if tp_ratio >= 1:
-            ssm_read_size = self._mamba_ssm_size[1]
-        else:
-            ssm_read_size = nixl_agent_meta.ssm_sizes[1]
+        ssm_read_size = self._mamba_ssm_size[1] if tp_ratio >= 1 else nixl_agent_meta.ssm_sizes[1]
 
         remote_physical_per_logical = transfer_info.remote_physical_blocks_per_logical
         num_blocks = nixl_agent_meta.num_blocks // remote_physical_per_logical

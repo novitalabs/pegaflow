@@ -12,12 +12,14 @@ from typing import TYPE_CHECKING, Any
 import msgspec
 import numpy as np
 import zmq
-
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     EngineId,
     EngineTransferInfo,
     TransferTopology,
 )
+from vllm.logger import init_logger
+from vllm.platforms import current_platform
+from vllm.utils.network_utils import make_zmq_path
 
 from pegaflow.nixl_connector.metadata import (
     GET_META_MSG,
@@ -36,13 +38,9 @@ from pegaflow.nixl_connector.rdma_transport import (
 from pegaflow.nixl_connector.tp_mapping import ReadSpec, compute_tp_mapping
 from pegaflow.nixl_connector.utils import zmq_ctx
 from pegaflow.pd_connector.metadata import BlockIds, PdHandshake
-from vllm.logger import init_logger
-from vllm.platforms import current_platform
-from vllm.utils.network_utils import make_zmq_path
 
 if TYPE_CHECKING:
     import torch
-
     from vllm.config import VllmConfig
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
@@ -54,9 +52,9 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
 
     def __init__(
         self,
-        vllm_config: "VllmConfig",
+        vllm_config: VllmConfig,
         engine_id: str,
-        kv_cache_config: "KVCacheConfig",
+        kv_cache_config: KVCacheConfig,
     ):
         self._use_pega_rdma_transport = True
         super().__init__(vllm_config, engine_id, kv_cache_config)
@@ -74,7 +72,7 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
             thread_name_prefix="pega-nixl-rdma-pull",
         )
 
-    def register_kv_caches(self, kv_caches: dict[str, "torch.Tensor"]):
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         self.transfer_topo = TransferTopology(
             tp_rank=self.tp_rank,
             tp_size=self.world_size,

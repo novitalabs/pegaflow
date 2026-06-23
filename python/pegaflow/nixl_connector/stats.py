@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
-
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     KVConnectorPromMetrics,
@@ -250,7 +249,7 @@ class NixlPromMetrics(KVConnectorPromMetrics):
                 "post_duration",
                 "bytes_transferred",
                 "num_descriptors",
-            ],
+            ], strict=False,
         ):
             for list_item in transfer_stats_data[list_item_key]:
                 prom_obj[engine_idx].observe(list_item)
@@ -260,7 +259,7 @@ class NixlPromMetrics(KVConnectorPromMetrics):
                 self.counter_nixl_num_failed_notifications,
                 self.counter_nixl_num_kv_expired_reqs,
             ],
-            ["num_failed_transfers", "num_failed_notifications", "num_kv_expired_reqs"],
+            ["num_failed_transfers", "num_failed_notifications", "num_kv_expired_reqs"], strict=False,
         ):
             for list_item in transfer_stats_data[counter_item_key]:
                 counter_obj[engine_idx].inc(list_item)

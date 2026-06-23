@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any
 
 import msgspec
 import zmq
-
 from vllm import envs
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
@@ -19,15 +18,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
 )
-from pegaflow.nixl_connector.metadata import (
-    GET_META_MSG,
-    PUSH_REG_NOTIF_PREFIX,
-    HeartbeatInfo,
-    NixlConnectorMetadata,
-    NixlHandshakePayload,
-    ReqId,
-)
-from pegaflow.nixl_connector.utils import zmq_ctx
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
@@ -38,6 +28,16 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     SlidingWindowSpec,
 )
+
+from pegaflow.nixl_connector.metadata import (
+    GET_META_MSG,
+    PUSH_REG_NOTIF_PREFIX,
+    HeartbeatInfo,
+    NixlConnectorMetadata,
+    NixlHandshakePayload,
+    ReqId,
+)
+from pegaflow.nixl_connector.utils import zmq_ctx
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig

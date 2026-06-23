@@ -7,13 +7,14 @@ small and are only installed by tests that mock the connector boundary.
 
 from __future__ import annotations
 
+import logging
+import pickle
+import re
 import sys
 import types
 from dataclasses import dataclass, field
 from enum import Enum
 from importlib import util as importlib_util
-import logging
-import pickle
 from unittest.mock import MagicMock
 
 
@@ -21,6 +22,8 @@ def install_connector_unit_stubs() -> None:
     """Install minimal torch/vLLM/native-extension modules for unit tests."""
 
     _install_torch_stub()
+    _install_regex_stub()
+    _install_zmq_stub()
     _install_vllm_stubs()
     _install_msgspec_stub()
     _install_native_extension_stub()
@@ -61,6 +64,39 @@ def _install_torch_stub() -> None:
     torch.device = lambda value: value  # type: ignore[attr-defined]
     torch.bfloat16 = "bfloat16"  # type: ignore[attr-defined]
     sys.modules["torch"] = torch
+
+
+def _install_regex_stub() -> None:
+    if _module_available("regex"):
+        return
+
+    regex = types.ModuleType("regex")
+    regex.IGNORECASE = re.IGNORECASE
+    regex.compile = re.compile
+    sys.modules["regex"] = regex
+
+
+def _install_zmq_stub() -> None:
+    if _module_available("zmq"):
+        return
+
+    zmq = types.ModuleType("zmq")
+
+    class Again(Exception):
+        pass
+
+    class Context:
+        def destroy(self, *, linger: int = 0) -> None:
+            return None
+
+    zmq.Again = Again
+    zmq.Context = Context
+    zmq.REQ = 1
+    zmq.ROUTER = 2
+    zmq.RCVTIMEO = 3
+    zmq.SNDTIMEO = 4
+    zmq.Socket = MagicMock
+    sys.modules["zmq"] = zmq
 
 
 def _install_vllm_stubs() -> None:

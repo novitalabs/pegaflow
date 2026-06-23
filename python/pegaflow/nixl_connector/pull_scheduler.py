@@ -6,10 +6,11 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
+from vllm.logger import init_logger
+
 from pegaflow.nixl_connector.base_scheduler import (
     NixlBaseConnectorScheduler,
 )
-from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -262,14 +263,14 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
 
             remote_num_tokens = request.num_computed_tokens
 
-        return delay_free_blocks, dict(
-            do_remote_prefill=is_p_node,
-            do_remote_decode=is_d_node,
-            remote_block_ids=block_ids,
-            remote_engine_id=self.engine_id,
-            remote_request_id=request.request_id,
-            remote_host=self.side_channel_host,
-            remote_port=self.side_channel_port,
-            tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
-            remote_num_tokens=remote_num_tokens,
-        )
+        return delay_free_blocks, {
+            "do_remote_prefill": is_p_node,
+            "do_remote_decode": is_d_node,
+            "remote_block_ids": block_ids,
+            "remote_engine_id": self.engine_id,
+            "remote_request_id": request.request_id,
+            "remote_host": self.side_channel_host,
+            "remote_port": self.side_channel_port,
+            "tp_size": self.vllm_config.parallel_config.tensor_parallel_size,
+            "remote_num_tokens": remote_num_tokens,
+        }

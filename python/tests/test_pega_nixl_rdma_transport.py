@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# ruff: noqa: E402, I001
+
 import queue
 from types import SimpleNamespace
 
@@ -7,23 +9,22 @@ from .unit_stubs import install_connector_unit_stubs
 
 install_connector_unit_stubs()
 
-from pegaflow.nixl_connector.metadata import NixlHandshakePayload
+from vllm.v1.kv_cache_interface import FullAttentionSpec
+
 from pegaflow.nixl_connector.base_scheduler import _push_registration_key
 from pegaflow.nixl_connector.base_worker import (
     NixlBaseConnectorWorker,
     _unregister_remote_engine_if_supported,
 )
+from pegaflow.nixl_connector.metadata import NixlConnectorMetadata, NixlHandshakePayload
 from pegaflow.nixl_connector.pega_pull_worker import (
     PegaNixlPullConnectorWorker,
     encode_pega_rdma_handshake_payload,
 )
 from pegaflow.nixl_connector.pega_push_worker import PegaNixlPushConnectorWorker
-from pegaflow.nixl_connector.rdma_transport import PegaNixlRdmaTransport
-from pegaflow.nixl_connector.metadata import NixlConnectorMetadata
-from pegaflow.nixl_connector.rdma_transport import handshake_to_wire
+from pegaflow.nixl_connector.rdma_transport import PegaNixlRdmaTransport, handshake_to_wire
 from pegaflow.pd_connector.metadata import LayerRemoteLayout
 from pegaflow.pd_connector.rdma import MockRdmaPort
-from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 
 def _vllm_config() -> SimpleNamespace:

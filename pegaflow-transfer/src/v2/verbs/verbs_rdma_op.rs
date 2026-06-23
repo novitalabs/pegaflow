@@ -501,7 +501,7 @@ mod tests {
         assert_eq!(sge.addr, unsafe { src_ptr.as_ptr().byte_add(8) } as u64);
         assert_eq!(sge.length, 16);
         assert_eq!(sge.lkey, 3);
-        assert_eq!(wr.wr.rdma.remote_addr, 0x1000 + 32);
-        assert_eq!(wr.wr.rdma.rkey, 17);
+        assert_eq!(unsafe { wr.wr.rdma.remote_addr }, 0x1000 + 32);
+        assert_eq!(unsafe { wr.wr.rdma.rkey }, 17);
     }
 }
