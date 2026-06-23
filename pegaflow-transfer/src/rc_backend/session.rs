@@ -42,6 +42,13 @@ pub(crate) struct RdmaOp {
     pub(crate) remote_rkey: u32,
 }
 
+struct RcSessionIo {
+    qp: Mutex<GenericQueuePair>,
+    send_cq: GenericCompletionQueue,
+    _recv_cq: GenericCompletionQueue,
+    local_endpoint: RcEndpoint,
+}
+
 enum SessionCommand {
     Transfer {
         ops: Vec<RdmaOp>,
@@ -51,9 +58,7 @@ enum SessionCommand {
 }
 
 pub(crate) struct RcSession {
-    qp: Mutex<GenericQueuePair>,
-    send_cq: GenericCompletionQueue,
-    _recv_cq: GenericCompletionQueue,
+    io: Arc<RcSessionIo>,
     pub(crate) local_endpoint: RcEndpoint,
     cmd_tx: std_mpsc::Sender<SessionCommand>,
 }
@@ -107,15 +112,19 @@ impl RcSession {
         };
 
         let (cmd_tx, cmd_rx) = std_mpsc::channel();
-        let session = Arc::new(Self {
+        let io = Arc::new(RcSessionIo {
             qp: Mutex::new(qp),
             send_cq,
             _recv_cq: recv_cq,
             local_endpoint,
+        });
+        let session = Arc::new(Self {
+            io: Arc::clone(&io),
+            local_endpoint,
             cmd_tx,
         });
 
-        Self::spawn_worker(Arc::clone(&session), cmd_rx, runtime.numa_node)?;
+        Self::spawn_worker(io, cmd_rx, runtime.numa_node)?;
         Ok(session)
     }
 
@@ -159,7 +168,7 @@ impl RcSession {
             }
         }
 
-        let mut qp = self.qp.lock();
+        let mut qp = self.io.qp.lock();
         let mut rtr_attr = QueuePairAttribute::new();
         rtr_attr
             .setup_state(QueuePairState::ReadyToReceive)
@@ -205,7 +214,7 @@ impl RcSession {
     }
 
     fn spawn_worker(
-        session: Arc<Self>,
+        io: Arc<RcSessionIo>,
         cmd_rx: std_mpsc::Receiver<SessionCommand>,
         numa_node: NumaNode,
     ) -> Result<()> {
@@ -219,16 +228,16 @@ impl RcSession {
                 }
                 debug!(
                     "session worker started: local_qpn={}, numa={}",
-                    session.local_endpoint.qp_num, numa_node
+                    io.local_endpoint.qp_num, numa_node
                 );
                 while let Ok(command) = cmd_rx.recv() {
                     match command {
                         SessionCommand::Transfer { ops, op, done_tx } => {
-                            let result = Self::execute_batch(&session, ops, op);
+                            let result = Self::execute_batch(&io, ops, op);
                             if done_tx.send(result).is_err() {
                                 debug!(
                                     "session worker reply receiver dropped: local_qpn={}",
-                                    session.local_endpoint.qp_num
+                                    io.local_endpoint.qp_num
                                 );
                             }
                         }
@@ -236,7 +245,7 @@ impl RcSession {
                 }
                 debug!(
                     "session worker stopped: local_qpn={}",
-                    session.local_endpoint.qp_num
+                    io.local_endpoint.qp_num
                 );
             })
             .map_err(|e| TransferError::Backend(format!("failed to spawn session worker: {e}")))?;
@@ -281,7 +290,7 @@ impl RcSession {
         Ok(ops.len())
     }
 
-    fn execute_batch(session: &Self, ops: Vec<RdmaOp>, op: TransferOp) -> Result<usize> {
+    fn execute_batch(io: &RcSessionIo, ops: Vec<RdmaOp>, op: TransferOp) -> Result<usize> {
         let total_ops = ops.len();
         if total_ops == 0 {
             return Ok(0);
@@ -297,7 +306,7 @@ impl RcSession {
                 let available = MAX_SEND_WR as usize - inflight.len();
                 let remaining = total_ops - next_idx;
                 let chain_len = MAX_WR_CHAIN_OPS.min(available).min(remaining);
-                let mut qp = session.qp.lock();
+                let mut qp = io.qp.lock();
                 let posted = Self::post_rdma_wr_chain(
                     &mut qp,
                     &ops[next_idx..next_idx + chain_len],
@@ -315,7 +324,7 @@ impl RcSession {
                 next_idx += posted;
             }
 
-            match session.send_cq.start_poll() {
+            match io.send_cq.start_poll() {
                 Ok(mut poller) => {
                     let mut did_work = false;
                     for wc in &mut poller {
@@ -326,7 +335,7 @@ impl RcSession {
                         if wc.status() != WorkCompletionStatus::Success as u32 {
                             return Err(TransferError::Backend(format!(
                                 "send completion failed: local_qpn={}, status={}, opcode={}, vendor_err={}",
-                                session.local_endpoint.qp_num,
+                                io.local_endpoint.qp_num,
                                 wc.status(),
                                 wc.opcode(),
                                 wc.vendor_err()
@@ -344,7 +353,7 @@ impl RcSession {
                 Err(error) => {
                     return Err(TransferError::Backend(format!(
                         "poll send CQ failed: local_qpn={}, {error}",
-                        session.local_endpoint.qp_num
+                        io.local_endpoint.qp_num
                     )));
                 }
             }
