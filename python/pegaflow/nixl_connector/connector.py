@@ -35,25 +35,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     PromMetric,
     PromMetricT,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
-    NixlConnectorMetadata,
-)
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_scheduler import (
-    NixlPullConnectorScheduler,
-)
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_worker import (
-    NixlPullConnectorWorker,
-)
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_scheduler import (
-    NixlPushConnectorScheduler,
-)
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
-    NixlPushConnectorWorker,
-)
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import (
-    NixlKVConnectorStats,
-    NixlPromMetrics,
-)
 from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
@@ -62,16 +43,37 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.outputs import KVConnectorOutput
 
+from pegaflow.nixl_connector.metadata import (
+    NixlConnectorMetadata,
+)
+from pegaflow.nixl_connector.pull_scheduler import (
+    NixlPullConnectorScheduler,
+)
+from pegaflow.nixl_connector.pull_worker import (
+    NixlPullConnectorWorker,
+)
+from pegaflow.nixl_connector.push_scheduler import (
+    NixlPushConnectorScheduler,
+)
+from pegaflow.nixl_connector.push_worker import (
+    NixlPushConnectorWorker,
+)
+from pegaflow.nixl_connector.stats import (
+    NixlKVConnectorStats,
+    NixlPromMetrics,
+)
+
 if TYPE_CHECKING:
-    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
-        NixlBaseConnectorScheduler,
-    )
-    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
-        NixlBaseConnectorWorker,
-    )
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
+
+    from pegaflow.nixl_connector.base_scheduler import (
+        NixlBaseConnectorScheduler,
+    )
+    from pegaflow.nixl_connector.base_worker import (
+        NixlBaseConnectorWorker,
+    )
 
 logger = init_logger(__name__)
 

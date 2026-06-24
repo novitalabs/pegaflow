@@ -30,30 +30,6 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import CopyBlocksOp
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
-    GET_META_MSG,
-    NixlAgentMetadata,
-    NixlConnectorMetadata,
-    NixlHandshakePayload,
-    ReqId,
-    ReqMeta,
-    TransferHandle,
-    compute_nixl_compatibility_hash,
-)
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import (
-    NixlKVConnectorStats,
-)
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
-    TPMapping,
-    _is_attention_spec,
-    _is_ssm_spec,
-    compute_tp_mapping,
-)
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
-    _NIXL_SUPPORTED_DEVICE,
-    get_representative_spec_type,
-    zmq_ctx,
-)
 from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (
     MambaConvSplitInfo,
     derive_mamba_conv_split,
@@ -76,6 +52,31 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.block_table import BlockTable
 from vllm.v1.worker.utils import select_common_block_size
+
+from pegaflow.nixl_connector.metadata import (
+    GET_META_MSG,
+    NixlAgentMetadata,
+    NixlConnectorMetadata,
+    NixlHandshakePayload,
+    ReqId,
+    ReqMeta,
+    TransferHandle,
+    compute_nixl_compatibility_hash,
+)
+from pegaflow.nixl_connector.stats import (
+    NixlKVConnectorStats,
+)
+from pegaflow.nixl_connector.tp_mapping import (
+    TPMapping,
+    _is_attention_spec,
+    _is_ssm_spec,
+    compute_tp_mapping,
+)
+from pegaflow.nixl_connector.utils import (
+    _NIXL_SUPPORTED_DEVICE,
+    get_representative_spec_type,
+    zmq_ctx,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig

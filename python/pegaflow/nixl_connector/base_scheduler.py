@@ -19,14 +19,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
-    GET_META_MSG,
-    HeartbeatInfo,
-    NixlConnectorMetadata,
-    NixlHandshakePayload,
-    ReqId,
-)
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import zmq_ctx
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
@@ -37,6 +29,15 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     SlidingWindowSpec,
 )
+
+from pegaflow.nixl_connector.metadata import (
+    GET_META_MSG,
+    HeartbeatInfo,
+    NixlConnectorMetadata,
+    NixlHandshakePayload,
+    ReqId,
+)
+from pegaflow.nixl_connector.utils import zmq_ctx
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig

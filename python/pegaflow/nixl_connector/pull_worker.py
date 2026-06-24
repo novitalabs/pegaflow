@@ -7,17 +7,18 @@ import time
 from typing import TYPE_CHECKING
 
 import numpy as np
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
+from vllm.logger import init_logger
+
+from pegaflow.nixl_connector.base_worker import (
     NixlBaseConnectorWorker,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+from pegaflow.nixl_connector.metadata import (
     NixlConnectorMetadata,
     ReqMeta,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
+from pegaflow.nixl_connector.tp_mapping import (
     ReadSpec,
 )
-from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig

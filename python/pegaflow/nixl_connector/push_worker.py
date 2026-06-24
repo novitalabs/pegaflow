@@ -39,10 +39,12 @@ from typing import TYPE_CHECKING, Any
 import msgspec
 import numpy as np
 from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
+from vllm.logger import init_logger
+
+from pegaflow.nixl_connector.base_worker import (
     NixlBaseConnectorWorker,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+from pegaflow.nixl_connector.metadata import (
     PUSH_REG_NOTIF_PREFIX,
     NixlConnectorMetadata,
     RemoteMeta,
@@ -50,9 +52,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     ReqMeta,
     TransferHandle,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import ReadSpec
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import get_base_request_id
-from vllm.logger import init_logger
+from pegaflow.nixl_connector.tp_mapping import ReadSpec
+from pegaflow.nixl_connector.utils import get_base_request_id
 
 if TYPE_CHECKING:
     import torch

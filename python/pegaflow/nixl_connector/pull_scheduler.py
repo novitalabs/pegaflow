@@ -7,10 +7,11 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
+from vllm.logger import init_logger
+
+from pegaflow.nixl_connector.base_scheduler import (
     NixlBaseConnectorScheduler,
 )
-from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
