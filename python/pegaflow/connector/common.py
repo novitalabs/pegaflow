@@ -204,17 +204,27 @@ def derive_namespace(
     """
     Derive namespace for storage isolation.
 
-    Different DCP/PCP configurations or cross-layer vs per-layer layouts
-    produce incompatible KV data, so all are included as factors to prevent
-    cross-contamination.
+    Every factor that changes the on-storage KV block layout must be included,
+    otherwise two incompatible layouts share one namespace and a load hits the
+    server-side slot-count guard (`stored block has N slots but instance
+    expects M`). Beyond DCP/PCP and cross-layer, this covers:
+
+    - `pp_size`: the pipeline-parallel degree decides how the model's layers
+      are split across stages, so a given server registers a different layer
+      subset (and slot count) per degree.
+    - `mla_layer_split_kv_cache`: MLA layer-split registration shards each
+      block's slots across ranks, a different per-block layout than the
+      default full-slot registration.
     """
     model_config = vllm_config.model_config
     cache_config = vllm_config.cache_config
+    additional_config = getattr(vllm_config, "additional_config", None) or {}
 
     factors = {
         "model": model_config.model,
         "dtype": str(model_config.dtype),
         "tp_size": tp_size,
+        "pp_size": vllm_config.parallel_config.pipeline_parallel_size,
         "num_kv_heads": model_config.get_total_num_kv_heads(),
         "head_size": model_config.get_head_size(),
         "num_hidden_layers": model_config.get_total_num_hidden_layers(),
@@ -222,6 +232,7 @@ def derive_namespace(
         "dcp_world_size": dcp_world_size,
         "pcp_world_size": pcp_world_size,
         "cross_layer_blocks": cross_layer_blocks,
+        "mla_layer_split_kv_cache": bool(additional_config.get("mla_layer_split_kv_cache", False)),
     }
 
     factor_str = str(sorted(factors.items()))
