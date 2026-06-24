@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by PegaFlow contributors in 2026.
 """Stats and Prometheus metrics for the NIXL connector."""
 
 import copy
@@ -7,7 +8,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
-
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     KVConnectorPromMetrics,
@@ -165,8 +165,7 @@ class NixlPromMetrics(KVConnectorPromMetrics):
         )
         nixl_histogram_post_time = self._histogram_cls(
             name="vllm:nixl_post_time_seconds",
-            documentation="Histogram of transfer post time for NIXL KV"
-            " Cache transfers.",
+            documentation="Histogram of transfer post time for NIXL KV Cache transfers.",
             buckets=buckets,
             labelnames=labelnames,
         )
@@ -202,8 +201,7 @@ class NixlPromMetrics(KVConnectorPromMetrics):
         ]
         nixl_histogram_num_descriptors = self._histogram_cls(
             name="vllm:nixl_num_descriptors",
-            documentation="Histogram of number of descriptors per NIXL"
-            "  KV Cache transfers.",
+            documentation="Histogram of number of descriptors per NIXL  KV Cache transfers.",
             buckets=buckets,
             labelnames=labelnames,
         )
@@ -251,6 +249,7 @@ class NixlPromMetrics(KVConnectorPromMetrics):
                 "bytes_transferred",
                 "num_descriptors",
             ],
+            strict=False,
         ):
             for list_item in transfer_stats_data[list_item_key]:
                 prom_obj[engine_idx].observe(list_item)
@@ -261,6 +260,7 @@ class NixlPromMetrics(KVConnectorPromMetrics):
                 self.counter_nixl_num_kv_expired_reqs,
             ],
             ["num_failed_transfers", "num_failed_notifications", "num_kv_expired_reqs"],
+            strict=False,
         ):
             for list_item in transfer_stats_data[counter_item_key]:
                 counter_obj[engine_idx].inc(list_item)

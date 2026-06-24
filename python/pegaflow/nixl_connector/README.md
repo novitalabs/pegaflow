@@ -1,6 +1,6 @@
 # vLLM NIXL Connector Import
 
-This directory contains an unmodified copy of the vLLM NIXL KV connector from:
+This directory was initially imported from the vLLM NIXL KV connector at:
 
 - Repository: `vllm-project/vllm`
 - Release branch: `releases/v0.24.0`
@@ -13,6 +13,10 @@ The Python files retain their upstream SPDX headers:
 
 - `SPDX-License-Identifier: Apache-2.0`
 - `SPDX-FileCopyrightText: Copyright contributors to the vLLM project`
+
+Files changed after import carry a `Modified by PegaFlow contributors` notice.
+This directory is expected to diverge from upstream as PegaFlow integrates its
+own RDMA transport while keeping the vLLM connector provenance auditable.
 
 ## License Notes
 

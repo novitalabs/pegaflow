@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by PegaFlow contributors in 2026.
 """NIXL connector facades.
 
 This module hosts the thin facade classes that vLLM's KV-connector layer
@@ -15,7 +16,6 @@ and worker classes; the connector classes here only forward calls.
 from typing import TYPE_CHECKING, Any
 
 import torch
-
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     EngineId,
@@ -82,10 +82,8 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
     @property
     def prefer_cross_layer_blocks(self) -> bool:
         if any(
-            [
-                isinstance(group.kv_cache_spec, MambaSpec)
-                for group in self.kv_cache_config.kv_cache_groups
-            ]
+            isinstance(group.kv_cache_spec, MambaSpec)
+            for group in self.kv_cache_config.kv_cache_groups
         ):
             # Hybrid SSM models do not yet support cross-layer layout
             return False
@@ -104,10 +102,7 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
             return False
 
         extra_config = self.kv_transfer_config.kv_connector_extra_config
-        return (
-            str(extra_config.get("enable_cross_layers_blocks", "False")).lower()
-            == "true"
-        )
+        return str(extra_config.get("enable_cross_layers_blocks", "False")).lower() == "true"
 
     def __init__(
         self,
@@ -141,8 +136,7 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
     def get_required_kvcache_layout(cls, vllm_config: VllmConfig):
         if vllm_config.model_config is None:
             logger.warning_once(
-                "Unable to detect current VLLM config. "
-                "Fallback to default kv cache layout."
+                "Unable to detect current VLLM config. Fallback to default kv cache layout."
             )
             return None
         use_mla = vllm_config.model_config.use_mla
@@ -164,9 +158,7 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
         self, request: "Request", num_computed_tokens: int
     ) -> tuple[int | None, bool]:
         assert self.connector_scheduler is not None
-        return self.connector_scheduler.get_num_new_matched_tokens(
-            request, num_computed_tokens
-        )
+        return self.connector_scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
 
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
@@ -255,11 +247,7 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
     def build_kv_connector_stats(
         cls, data: dict[str, Any] | None = None
     ) -> KVConnectorStats | None:
-        return (
-            NixlKVConnectorStats(data=data)
-            if data is not None
-            else NixlKVConnectorStats()
-        )
+        return NixlKVConnectorStats(data=data) if data is not None else NixlKVConnectorStats()
 
     @classmethod
     def build_prom_metrics(
@@ -269,9 +257,7 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
         labelnames: list[str],
         per_engine_labelvalues: dict[int, list[object]],
     ) -> KVConnectorPromMetrics:
-        return NixlPromMetrics(
-            vllm_config, metric_types, labelnames, per_engine_labelvalues
-        )
+        return NixlPromMetrics(vllm_config, metric_types, labelnames, per_engine_labelvalues)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """NixlConnector does not do layerwise saving."""

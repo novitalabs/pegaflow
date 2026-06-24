@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by PegaFlow contributors in 2026.
 """TP mapping computation for NIXL KV cache transfers."""
 
 from __future__ import annotations
@@ -7,7 +8,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
     TransferTopology,
@@ -109,8 +109,7 @@ def compute_tp_mapping(
 
     # --- Per-group ordered source ranks ---
     source_ranks_per_group = tuple(
-        tuple(ssm_ranks) if _is_ssm_spec(t) else tuple(attn_ranks)
-        for t in group_spec_types
+        tuple(ssm_ranks) if _is_ssm_spec(t) else tuple(attn_ranks) for t in group_spec_types
     )
 
     # --- Attention head slots ---
@@ -118,8 +117,7 @@ def compute_tp_mapping(
     for i, r in enumerate(attn_ranks):
         head_to_slot[r * total_num_kv_heads // remote_tp_size] = i
     rank_to_attention_slot = {
-        r: head_to_slot.get(r * total_num_kv_heads // remote_tp_size, 0)
-        for r in all_ranks
+        r: head_to_slot.get(r * total_num_kv_heads // remote_tp_size, 0) for r in all_ranks
     }
 
     # --- Rank offset factor ---

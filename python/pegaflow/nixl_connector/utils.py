@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by PegaFlow contributors in 2026.
 """Shared constants, lazy imports and helpers for the NIXL connector."""
 
 import contextlib
@@ -8,7 +9,6 @@ from typing import Any
 
 import regex as re
 import zmq
-
 from vllm.platforms import current_platform
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.v1.kv_cache_interface import KVCacheSpec, UniformTypeKVCacheSpecs

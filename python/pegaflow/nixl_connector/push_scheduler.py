@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by PegaFlow contributors in 2026.
 """Push-specific scheduler-side logic for the NIXL connector.
 
 In push mode, scheduler-side responsibilities are:
@@ -210,8 +211,7 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
 
         params = request.kv_transfer_params
         logger.debug(
-            "NixlPushConnector request_finished(%s), request_status=%s, "
-            "kv_transfer_params=%s",
+            "NixlPushConnector request_finished(%s), request_status=%s, kv_transfer_params=%s",
             request.request_id,
             request.status,
             params,
@@ -260,9 +260,7 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
                 request.request_id,
                 self._kv_lease_duration,
             )
-            self._reqs_need_send[request.request_id] = (
-                time.perf_counter() + self._kv_lease_duration
-            )
+            self._reqs_need_send[request.request_id] = time.perf_counter() + self._kv_lease_duration
 
             block_ids = self.get_sw_clipped_blocks(block_ids)
             remote_num_tokens = request.num_computed_tokens
@@ -272,17 +270,17 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             self._finished_request_blocks[request.request_id] = block_ids
             self._newly_finished_push_blocks[request.request_id] = block_ids
 
-        return delay_free_blocks, dict(
-            do_remote_prefill=True,
-            do_remote_decode=False,
-            remote_block_ids=block_ids,
-            remote_engine_id=self.engine_id,
-            remote_request_id=request.request_id,
-            remote_host=self.side_channel_host,
-            remote_port=self.side_channel_port,
-            tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
-            remote_num_tokens=remote_num_tokens,
-        )
+        return delay_free_blocks, {
+            "do_remote_prefill": True,
+            "do_remote_decode": False,
+            "remote_block_ids": block_ids,
+            "remote_engine_id": self.engine_id,
+            "remote_request_id": request.request_id,
+            "remote_host": self.side_channel_host,
+            "remote_port": self.side_channel_port,
+            "tp_size": self.vllm_config.parallel_config.tensor_parallel_size,
+            "remote_num_tokens": remote_num_tokens,
+        }
 
     def build_connector_meta(
         self,

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by PegaFlow contributors in 2026.
 """Base scheduler-side logic for the NIXL connector."""
 
 import threading
@@ -8,7 +9,6 @@ from typing import TYPE_CHECKING, Any
 
 import msgspec
 import zmq
-
 from vllm import envs
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
@@ -63,23 +63,18 @@ class NixlBaseConnectorScheduler:
         self.kv_cache_config = kv_cache_config
         self.side_channel_host = envs.VLLM_NIXL_SIDE_CHANNEL_HOST
         self.side_channel_port = (
-            envs.VLLM_NIXL_SIDE_CHANNEL_PORT
-            + vllm_config.parallel_config.data_parallel_index
+            envs.VLLM_NIXL_SIDE_CHANNEL_PORT + vllm_config.parallel_config.data_parallel_index
         )
         assert vllm_config.kv_transfer_config is not None
-        self._kv_lease_duration: int = (
-            vllm_config.kv_transfer_config.get_from_extra_config(
-                "kv_lease_duration", 30
-            )
+        self._kv_lease_duration: int = vllm_config.kv_transfer_config.get_from_extra_config(
+            "kv_lease_duration", 30
         )
         # NOTE (NickLucche): For now we use a hardcoded value for a simpler interface.
         self._heartbeat_interval = self._kv_lease_duration // 6
         if current_platform.device_type == "cpu":
             self.use_host_buffer = False
         else:
-            self.use_host_buffer = (
-                vllm_config.kv_transfer_config.kv_buffer_device == "cpu"
-            )
+            self.use_host_buffer = vllm_config.kv_transfer_config.kv_buffer_device == "cpu"
         self._is_hma_required = (
             not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
             # Also handle unlikely SW-only model case instead of checking num_groups>1.
@@ -89,8 +84,7 @@ class NixlBaseConnectorScheduler:
             )
         )
         self._has_mamba = any(
-            isinstance(g.kv_cache_spec, MambaSpec)
-            for g in kv_cache_config.kv_cache_groups
+            isinstance(g.kv_cache_spec, MambaSpec) for g in kv_cache_config.kv_cache_groups
         )
 
         logger.info("Initializing NIXL Scheduler %s", engine_id)
@@ -139,22 +133,16 @@ class NixlBaseConnectorScheduler:
         # or pull from a remote node: minimum number of remote
         # tokens to amortize the xfer latencies
         self.kv_recompute_threshold: int = int(
-            vllm_config.kv_transfer_config.get_from_extra_config(
-                "kv_recompute_threshold", 64
-            )
+            vllm_config.kv_transfer_config.get_from_extra_config("kv_recompute_threshold", 64)
         )
 
         # Bi-directional KV transfer feature supports KV block
         # transfers from D node to P node
         self.is_bidirectional_kv_xfer_enabled = (
-            vllm_config.kv_transfer_config.get_from_extra_config(
-                "bidirectional_kv_xfer", False
-            )
+            vllm_config.kv_transfer_config.get_from_extra_config("bidirectional_kv_xfer", False)
         )
-        self.decoder_kv_blocks_ttl = (
-            vllm_config.kv_transfer_config.get_from_extra_config(
-                "decoder_kv_blocks_ttl", 480
-            )
+        self.decoder_kv_blocks_ttl = vllm_config.kv_transfer_config.get_from_extra_config(
+            "decoder_kv_blocks_ttl", 480
         )
 
         if self.is_bidirectional_kv_xfer_enabled and self.kv_recompute_threshold > 0:
@@ -230,15 +218,11 @@ class NixlBaseConnectorScheduler:
         # NOTE (NickLucche) This logic is currently handled at the connector level
         # because offloading connectors might want to receive the whole sequence even
         # for SWA groups. We will abstract this logic once the interface is more stable
-        assert len(block_ids) == len(self.blocks_per_sw), (
-            "Number of KV cache groups must match"
-        )
+        assert len(block_ids) == len(self.blocks_per_sw), "Number of KV cache groups must match"
         # For non-SWA groups, blocks_per_sw is 0 so we return all block_ids unchanged
         return tuple(
             [
-                blocks[-self.blocks_per_sw[i] :]
-                if self.blocks_per_sw[i] > 0
-                else blocks
+                blocks[-self.blocks_per_sw[i] :] if self.blocks_per_sw[i] > 0 else blocks
                 for i, blocks in enumerate(block_ids)
             ]
         )
@@ -257,8 +241,7 @@ class NixlBaseConnectorScheduler:
         for tp_rank, rank_metadata in metadata.items():
             if not isinstance(rank_metadata, NixlHandshakePayload):
                 raise ValueError(
-                    "NixlConnectorScheduler expects NixlHandshakePayload for "
-                    "handshake metadata."
+                    "NixlConnectorScheduler expects NixlHandshakePayload for handshake metadata."
                 )
             encoded_data[tp_rank] = encoder.encode(rank_metadata)
             logger.debug(
@@ -377,9 +360,7 @@ class NixlBaseConnectorScheduler:
             )
             assert scheduler_output.num_scheduled_tokens is not None
             num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
-            is_partial = (
-                req.num_computed_tokens + num_scheduled_tokens
-            ) < req.num_prompt_tokens
+            is_partial = (req.num_computed_tokens + num_scheduled_tokens) < req.num_prompt_tokens
             if not is_partial:
                 # For non-partial prefills, once new req_meta is scheduled, it
                 # can be removed from _reqs_need_save.

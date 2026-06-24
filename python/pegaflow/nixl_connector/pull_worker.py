@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by PegaFlow contributors in 2026.
 """Pull-specific (READ) worker-side logic for the NIXL connector."""
 
 import time
 from typing import TYPE_CHECKING
 
 import numpy as np
-
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
     NixlBaseConnectorWorker,
 )
@@ -43,9 +43,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         We check for these trnxs to complete in each step().
         """
         for req_id, meta in metadata.reqs_to_recv.items():
-            meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
-                meta.local_block_ids
-            )
+            meta.local_physical_block_ids = self._logical_to_kernel_block_ids(meta.local_block_ids)
             assert meta.remote is not None
             # Remote block IDs are kept logical here; expanded in
             # _read_blocks_for_req using the remote engine's phys ratio.
@@ -119,15 +117,11 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             ReadSpec(
                 remote_rank=rank,
                 local_block_ids=[
-                    list(local_block_ids[g])
-                    if rank in plan.source_ranks_per_group[g]
-                    else []
+                    list(local_block_ids[g]) if rank in plan.source_ranks_per_group[g] else []
                     for g in range(num_groups)
                 ],
                 remote_block_ids=[
-                    list(remote_block_ids[g])
-                    if rank in plan.source_ranks_per_group[g]
-                    else []
+                    list(remote_block_ids[g]) if rank in plan.source_ranks_per_group[g] else []
                     for g in range(num_groups)
                 ],
             )
@@ -159,9 +153,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             else:
                 # Single read from remote, we write to the whole memory region.
                 # Also handle remote block size different from local block size.
-                local_xfer_side_handle = self.src_xfer_handles_by_block_size[
-                    remote_block_size
-                ]
+                local_xfer_side_handle = self.src_xfer_handles_by_block_size[remote_block_size]
 
             # Destination handle: remote_engine_id -> remote_rank -> handle.
             remote_xfer_side_handle = self.dst_xfer_side_handles[meta.remote.engine_id][
@@ -205,9 +197,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         remote_block_ids = read_spec.remote_block_ids
 
         remote_info = self.transfer_topo.get_engine_info(dst_engine_id)
-        block_size_ratio = self.transfer_topo.block_size_ratio(
-            remote_info.remote_block_size
-        )
+        block_size_ratio = self.transfer_topo.block_size_ratio(remote_info.remote_block_size)
         if block_size_ratio > 1:
             # TODO (NickLucche) assume HMA is off. Change to handle multiple KV groups.
             assert not self._is_hma_required
@@ -228,9 +218,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 # Then we clip local to align with prefill
                 # [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] to
                 # [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-                local_block_ids_mapped = local_block_ids_mapped[
-                    : len(remote_block_ids0)
-                ]
+                local_block_ids_mapped = local_block_ids_mapped[: len(remote_block_ids0)]
             local_block_ids = [local_block_ids_mapped] if local_block_ids_mapped else []
             remote_block_ids = [remote_block_ids0]
         # NOTE(rob): having the staging blocks be on the READER side is
@@ -347,10 +335,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     continue
 
                 req_id, tp_size = msg.rsplit(":", 1)
-                if (
-                    req_id not in self._reqs_to_send
-                    and req_id not in self._reqs_to_process
-                ):
+                if req_id not in self._reqs_to_send and req_id not in self._reqs_to_process:
                     logger.error(
                         "Potentially invalid KV blocks for "
                         "unrecognized request %s were retrieved by "
@@ -365,16 +350,11 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
 
                 # Number of reads *per producer* to wait for.
                 # When remote D TP > local P TP we expect `tp_ratio` reads.
-                consumers_per_producer = (
-                    -tp_ratio if n_consumers > self.world_size else 1
-                )
+                consumers_per_producer = -tp_ratio if n_consumers > self.world_size else 1
 
                 self.consumer_notification_counts_by_req[req_id] += 1
                 # Wait all consumers (D) to be done reading before freeing.
-                if (
-                    self.consumer_notification_counts_by_req[req_id]
-                    == consumers_per_producer
-                ):
+                if self.consumer_notification_counts_by_req[req_id] == consumers_per_producer:
                     notified_req_ids.add(req_id)
                     del self.consumer_notification_counts_by_req[req_id]
                     self._reqs_to_process.remove(req_id)

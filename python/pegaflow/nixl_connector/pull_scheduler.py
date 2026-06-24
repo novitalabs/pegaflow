@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by PegaFlow contributors in 2026.
 """Pull-specific scheduler-side logic for the NIXL connector."""
 
 import time
@@ -87,16 +88,11 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             # The tokens will be loaded if not already present
             # in the prefill node local cache
             remote_num_tokens = params.get("remote_num_tokens") or 0
-            count = (
-                min(remote_num_tokens, request.num_prompt_tokens) - num_computed_tokens
-            )
+            count = min(remote_num_tokens, request.num_prompt_tokens) - num_computed_tokens
             if count > 0:
                 # Check kv_recompute_threshold: skip pull if
                 # remote tokens are below the threshold.
-                if (
-                    self.kv_recompute_threshold > 0
-                    and count < self.kv_recompute_threshold
-                ):
+                if self.kv_recompute_threshold > 0 and count < self.kv_recompute_threshold:
                     logger.debug(
                         "Skipping remote pull for %s: %d remote tokens < threshold %d",
                         request.request_id,
@@ -114,8 +110,7 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
     ):
         params = request.kv_transfer_params
         logger.debug(
-            "NIXLConnector update_state_after_alloc: "
-            "num_external_tokens=%s, kv_transfer_params=%s",
+            "NIXLConnector update_state_after_alloc: num_external_tokens=%s, kv_transfer_params=%s",
             num_external_tokens,
             params,
         )
@@ -155,9 +150,7 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                         if num_external_tokens > 0
                         else ()
                     )
-                    local_block_ids = self.get_sw_clipped_blocks(
-                        unhashed_local_block_ids
-                    )
+                    local_block_ids = self.get_sw_clipped_blocks(unhashed_local_block_ids)
 
                     # Get unhashed blocks to pull from remote. Mind that a full prefix
                     # cache hit is indicated with an empty list.
@@ -191,8 +184,7 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
 
         params = request.kv_transfer_params
         logger.debug(
-            "NIXLConnector request_finished(%s), request_status=%s, "
-            "kv_transfer_params=%s",
+            "NIXLConnector request_finished(%s), request_status=%s, kv_transfer_params=%s",
             request.request_id,
             request.status,
             params,
@@ -246,14 +238,11 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                 # lease mechanism as turn2 request is client-driven.
                 request_kv_blocks_ttl = self.decoder_kv_blocks_ttl
             logger.debug(
-                "NIXLConnector request_finished(%s) waiting for %d seconds "
-                "before releasing blocks",
+                "NIXLConnector request_finished(%s) waiting for %d seconds before releasing blocks",
                 request.request_id,
                 request_kv_blocks_ttl,
             )
-            self._reqs_need_send[request.request_id] = (
-                time.perf_counter() + request_kv_blocks_ttl
-            )
+            self._reqs_need_send[request.request_id] = time.perf_counter() + request_kv_blocks_ttl
             # NOTE HMA will "mark" empty/null blocks in groups with 0s (eg SWA ones),
             # trimming down after allocating for the whole sequence length. Empty
             # blocks are always at the start of the list.
@@ -262,14 +251,14 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
 
             remote_num_tokens = request.num_computed_tokens
 
-        return delay_free_blocks, dict(
-            do_remote_prefill=is_p_node,
-            do_remote_decode=is_d_node,
-            remote_block_ids=block_ids,
-            remote_engine_id=self.engine_id,
-            remote_request_id=request.request_id,
-            remote_host=self.side_channel_host,
-            remote_port=self.side_channel_port,
-            tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
-            remote_num_tokens=remote_num_tokens,
-        )
+        return delay_free_blocks, {
+            "do_remote_prefill": is_p_node,
+            "do_remote_decode": is_d_node,
+            "remote_block_ids": block_ids,
+            "remote_engine_id": self.engine_id,
+            "remote_request_id": request.request_id,
+            "remote_host": self.side_channel_host,
+            "remote_port": self.side_channel_port,
+            "tp_size": self.vllm_config.parallel_config.tensor_parallel_size,
+            "remote_num_tokens": remote_num_tokens,
+        }

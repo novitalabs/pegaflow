@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by PegaFlow contributors in 2026.
 """Metadata dataclasses and helpers for the NIXL connector."""
 
 from dataclasses import dataclass
@@ -204,9 +205,7 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         local_block_ids: BlockIds,
         kv_transfer_params: dict[str, Any],
     ):
-        self.reqs_to_save[request_id] = self._add_new_req(
-            local_block_ids, kv_transfer_params
-        )
+        self.reqs_to_save[request_id] = self._add_new_req(local_block_ids, kv_transfer_params)
 
     def add_new_req_to_recv(
         self,
