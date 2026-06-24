@@ -46,6 +46,9 @@ from vllm.v1.outputs import KVConnectorOutput
 from pegaflow.nixl_connector.metadata import (
     NixlConnectorMetadata,
 )
+from pegaflow.nixl_connector.pega_pull_worker import (
+    PegaNixlPullConnectorWorker,
+)
 from pegaflow.nixl_connector.pull_scheduler import (
     NixlPullConnectorScheduler,
 )
@@ -374,9 +377,38 @@ class NixlPushConnector(NixlBaseConnector):
 NixlConnector = NixlPullConnector
 
 
+class PegaNixlPullConnector(NixlPullConnector):
+    """Pull connector using NIXL logic with PegaFlow RDMA v1 data READs."""
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        role: KVConnectorRole,
+        kv_cache_config: "KVCacheConfig",
+    ):
+        NixlBaseConnector.__init__(self, vllm_config, role, kv_cache_config)
+        if role == KVConnectorRole.SCHEDULER:
+            self.connector_scheduler = NixlPullConnectorScheduler(
+                vllm_config, self.engine_id, kv_cache_config
+            )
+            self.connector_worker = None
+        elif role == KVConnectorRole.WORKER:
+            self.connector_scheduler = None
+            self.connector_worker = PegaNixlPullConnectorWorker(
+                vllm_config, self.engine_id, kv_cache_config
+            )
+        else:
+            raise ValueError(f"Unsupported KVConnectorRole: {role}")
+
+
+PegaNixlConnector = PegaNixlPullConnector
+
+
 __all__ = [
     "NixlBaseConnector",
     "NixlConnector",
     "NixlPullConnector",
     "NixlPushConnector",
+    "PegaNixlConnector",
+    "PegaNixlPullConnector",
 ]

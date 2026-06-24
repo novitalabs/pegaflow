@@ -13,11 +13,16 @@ from pegaflow.nixl_connector.connector import (
     NixlConnector,
     NixlPullConnector,
     NixlPushConnector,
+    PegaNixlConnector,
+    PegaNixlPullConnector,
 )
 from pegaflow.nixl_connector.metadata import (
     NixlAgentMetadata,
     NixlConnectorMetadata,
     NixlHandshakePayload,
+)
+from pegaflow.nixl_connector.pega_pull_worker import (
+    PegaNixlPullConnectorWorker,
 )
 from pegaflow.nixl_connector.pull_scheduler import (
     NixlPullConnectorScheduler,
@@ -58,4 +63,7 @@ __all__ = [
     "NixlPushConnector",
     "NixlPushConnectorScheduler",
     "NixlPushConnectorWorker",
+    "PegaNixlConnector",
+    "PegaNixlPullConnector",
+    "PegaNixlPullConnectorWorker",
 ]
