@@ -59,6 +59,7 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         self._pega_local_handshake: dict[str, bytes] = {}
         self._pega_pending_requests = defaultdict[str, list[tuple[str, str]]](list)
         self._pega_pending_since: dict[str, float] = {}
+        self._pega_response_agents: dict[str, str] = {}
         self._pega_expected_peers: dict[str, set[str]] = defaultdict(set)
         self._pega_submitted_peers: dict[str, set[str]] = defaultdict(set)
         self._pega_completed_peers: dict[str, set[str]] = defaultdict(set)
@@ -243,7 +244,11 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         agent_name = self._remote_agents[dst_engine_id][remote_rank]
         self.nixl_wrapper.send_notif(
             agent_name,
-            notif_msg=encode_handshake_request(peer_key, local_metadata),
+            notif_msg=encode_handshake_request(
+                peer_key,
+                local_metadata,
+                self.nixl_wrapper.get_agent_metadata(),
+            ),
         )
         self._add_pending_request(peer_key, request_id, dst_engine_id)
         self._pega_pending_since.setdefault(peer_key, time.perf_counter())
@@ -259,11 +264,11 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         assert self.transfer_topo is not None
         self._expire_pega_rdma_handshakes()
         notified_req_ids: set[str] = set()
-        for source_agent, notifs in self.nixl_wrapper.get_new_notifs().items():
+        for _source_agent, notifs in self.nixl_wrapper.get_new_notifs().items():
             for notif in notifs:
                 handshake = decode_handshake_notif(notif)
                 if handshake is not None:
-                    self._handle_pega_rdma_handshake_notif(handshake, source_agent)
+                    self._handle_pega_rdma_handshake_notif(handshake)
                     continue
 
                 msg = notif.decode("utf-8")
@@ -295,22 +300,27 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
     def _handle_pega_rdma_handshake_notif(
         self,
         payload: dict[str, object],
-        source_agent: str,
     ) -> None:
         kind = payload.get("kind")
         peer_key = payload.get("peer_key")
         metadata = payload.get("metadata")
+        response_agent_metadata = payload.get("response_agent_metadata")
         if not isinstance(kind, str) or not isinstance(peer_key, str) or not isinstance(
             metadata, bytes
         ):
             raise ValueError("invalid Pega RDMA v1 handshake notification")
 
         if kind == "request":
+            if not isinstance(response_agent_metadata, bytes):
+                raise ValueError(
+                    "Pega RDMA v1 handshake request missing response agent metadata"
+                )
             local_peer_key = reverse_peer_key(peer_key)
             local = self._prepare_or_get_local_metadata(local_peer_key)
             self._pega_rdma.complete_handshake(local_peer_key, local, metadata)
+            agent_name = self._get_pega_response_agent(peer_key, response_agent_metadata)
             self.nixl_wrapper.send_notif(
-                source_agent,
+                agent_name,
                 notif_msg=encode_handshake_response(peer_key, local),
             )
             logger.debug("Pega RDMA v1 handshake request accepted peer=%s", local_peer_key)
@@ -337,6 +347,14 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
             return
 
         raise ValueError(f"unknown Pega RDMA v1 handshake kind {kind!r}")
+
+    def _get_pega_response_agent(self, peer_key: str, agent_metadata: bytes) -> str:
+        agent_name = self._pega_response_agents.get(peer_key)
+        if agent_name is not None:
+            return agent_name
+        agent_name = self.nixl_wrapper.add_remote_agent(agent_metadata)
+        self._pega_response_agents[peer_key] = agent_name
+        return agent_name
 
     def _expire_pega_rdma_handshakes(self) -> None:
         now = time.perf_counter()
@@ -464,6 +482,12 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         self._pega_pending_since.clear()
         self._pega_pending_requests.clear()
         self._recving_transfers.clear()
+        for agent_name in self._pega_response_agents.values():
+            try:
+                self.nixl_wrapper.remove_remote_agent(agent_name)
+            except Exception:
+                logger.debug("Failed to remove Pega RDMA v1 response agent", exc_info=True)
+        self._pega_response_agents.clear()
         try:
             self._pega_rdma.unregister_memory(
                 [addr for addr, _size, _device_id, _tag in self.local_registered_blocks_data]

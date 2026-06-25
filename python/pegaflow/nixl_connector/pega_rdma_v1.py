@@ -10,7 +10,7 @@ from typing import Any
 
 import msgspec
 
-from pegaflow import PegaRdmaV1Engine
+from pegaflow.pegaflow import PegaRdmaV1Engine
 
 PEGA_RDMA_V1_HANDSHAKE_PREFIX = b"PEGA_RDMA_V1_HS:"
 
@@ -69,6 +69,16 @@ def make_peer_key(local_engine_id: str, local_tp_rank: int, remote_engine_id: st
     return f"{local_engine_id}:{local_tp_rank}->{remote_engine_id}:{remote_rank}"
 
 
+def parse_peer_endpoint(endpoint: str) -> tuple[str, int]:
+    engine_id, rank = endpoint.rsplit(":", 1)
+    return engine_id, int(rank)
+
+
+def peer_key_source(peer_key: str) -> tuple[str, int]:
+    source, _target = peer_key.split("->", 1)
+    return parse_peer_endpoint(source)
+
+
 def reverse_peer_key(peer_key: str) -> str:
     local, remote = peer_key.split("->", 1)
     return f"{remote}->{local}"
@@ -106,12 +116,17 @@ def build_read_descs(
     return descs
 
 
-def encode_handshake_request(peer_key: str, metadata: bytes) -> bytes:
+def encode_handshake_request(
+    peer_key: str,
+    metadata: bytes,
+    response_agent_metadata: bytes,
+) -> bytes:
     return PEGA_RDMA_V1_HANDSHAKE_PREFIX + msgspec.msgpack.encode(
         {
             "kind": "request",
             "peer_key": peer_key,
             "metadata": metadata,
+            "response_agent_metadata": response_agent_metadata,
         }
     )
 
