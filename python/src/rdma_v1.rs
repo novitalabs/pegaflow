@@ -87,6 +87,8 @@ impl PegaRdmaV1Engine {
     #[new]
     #[pyo3(signature = (*, nics, qps_per_peer = 4))]
     fn new(nics: Vec<String>, qps_per_peer: usize) -> PyResult<Self> {
+        // Create one RDMA v1 transfer engine bound to the connector-provided
+        // NIC list.  Python owns the lifecycle through the connector worker.
         if nics.is_empty() {
             return Err(PyValueError::new_err("nics must not be empty"));
         }
@@ -102,6 +104,9 @@ impl PegaRdmaV1Engine {
     }
 
     fn register_memory(&self, py: Python<'_>, regions: Vec<Py<PyDict>>) -> PyResult<()> {
+        // Register local memory regions that Pega RDMA v1 may use as READ
+        // destinations or sources, depending on which worker side this engine
+        // is running on.
         let mut native = Vec::with_capacity(regions.len());
         for region in regions {
             let region = region.bind(py);
@@ -121,6 +126,8 @@ impl PegaRdmaV1Engine {
     }
 
     fn unregister_memory(&self, addrs: Vec<u64>) -> PyResult<()> {
+        // Drop registrations for local memory regions during connector
+        // shutdown.  The transfer engine owns the actual deregistration logic.
         let mut ptrs = Vec::with_capacity(addrs.len());
         for addr in addrs {
             ptrs.push(nonnull_from_u64(addr, "addr")?);
@@ -163,6 +170,9 @@ impl PegaRdmaV1Engine {
         py: Python<'py>,
         remote_addr: String,
     ) -> Option<Bound<'py, pyo3::types::PyBytes>> {
+        // Return cached local handshake metadata for a peer that is already
+        // prepared or connected.  This is used when replying to a peer's
+        // handshake request after the local side was prepared earlier.
         self.engine
             .local_meta_for(&remote_addr)
             .map(|metadata| pyo3::types::PyBytes::new(py, &metadata.to_bytes()))
@@ -188,6 +198,8 @@ impl PegaRdmaV1Engine {
     }
 
     fn abort_handshake(&self, remote_addr: String, local_metadata: Vec<u8>) -> PyResult<()> {
+        // Abort a prepared-but-incomplete handshake after the Python connector's
+        // timeout expires, so the transfer engine can release pending state.
         let local = HandshakeMetadata::from_bytes(&local_metadata)
             .map_err(|err| rdma_v1_error("decode local handshake failed", err))?;
         self.engine.abort_handshake(&remote_addr, &local);
@@ -224,6 +236,8 @@ impl PegaRdmaV1Engine {
     }
 
     fn drop_blocks_table(&self, handle: u64) -> PyResult<()> {
+        // Remove a cached block table during worker shutdown.  The underlying
+        // memory registration remains owned by register_memory/unregister_memory.
         self.block_tables
             .lock()
             .map_err(|_| PyRuntimeError::new_err("block_tables mutex poisoned"))?
@@ -239,6 +253,9 @@ impl PegaRdmaV1Engine {
         local_desc_ids: Vec<usize>,
         remote_desc_ids: Vec<usize>,
     ) -> PyResult<(u64, usize, usize)> {
+        // Submit one batch READ by looking up NIXL-produced descriptor indices
+        // in cached local/remote block tables.  Returns the Python handle plus
+        // transfer statistics used by the inherited NIXL metrics path.
         if local_desc_ids.len() != remote_desc_ids.len() {
             return Err(PyValueError::new_err(
                 "local_desc_ids and remote_desc_ids must have the same length",
@@ -332,6 +349,8 @@ impl PegaRdmaV1Engine {
     }
 
     fn release_read(&self, handle: u64) -> PyResult<()> {
+        // Forget a pending READ after request failure or shutdown.  Completed
+        // READs are removed by check_read when it returns "done".
         self.pending_reads
             .lock()
             .map_err(|_| PyRuntimeError::new_err("pending_reads mutex poisoned"))?
@@ -340,10 +359,13 @@ impl PegaRdmaV1Engine {
     }
 
     fn invalidate_connection(&self, remote_addr: String) {
+        // Mark the peer connection unusable after a transfer failure so the
+        // next request does a fresh transport handshake.
         self.engine.invalidate_connection(&remote_addr);
     }
 
     fn num_qps(&self) -> usize {
+        // Expose the native queue-pair count for diagnostics.
         self.engine.num_qps()
     }
 }

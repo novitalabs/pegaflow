@@ -76,10 +76,12 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         self._pega_completed_peers: dict[str, set[str]] = defaultdict(set)
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        """Register NIXL KV caches, then register the same buffers for RDMA v1."""
         super().register_kv_caches(kv_caches)
         self._register_pega_rdma_memory()
 
     def _register_pega_rdma_memory(self) -> None:
+        """Register locally exported KV blocks with the Pega RDMA v1 engine."""
         if self.use_host_buffer:
             logger.warning(
                 "PegaNixlPullConnector is registering host transfer buffers for RDMA v1"
@@ -104,6 +106,11 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         local_xfer_side_handle: int,
         remote_xfer_side_handle: int,
     ):
+        """Submit a pull-mode KV READ through Pega RDMA v1.
+
+        The inherited NIXL worker computes all request/block/TP mapping state.
+        This override only changes how the final READ payload is transferred.
+        """
         assert self.transfer_topo is not None
         remote_rank = read_spec.remote_rank
         local_block_ids = read_spec.local_block_ids
@@ -234,6 +241,7 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         *,
         block_size: int,
     ) -> list[tuple[int, int, int]]:
+        """Resolve the local NIXL transfer handle to registered block data."""
         if local_xfer_side_handle == self.src_xfer_handles_by_block_size[block_size]:
             return self.src_blocks_data_by_block_size[block_size]
         for tp_ratio, handles in self.src_xfer_handles_by_tp_ratio.items():
@@ -248,6 +256,7 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         *,
         block_size: int,
     ) -> int:
+        """Return a cached native block-table handle for local KV blocks."""
         key = ("local", local_xfer_side_handle)
         table = self._pega_block_tables.get(key)
         if table is not None:
@@ -258,6 +267,7 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         return table
 
     def _remote_blocks_table(self, dst_engine_id: str, remote_rank: int) -> int:
+        """Return a cached native block-table handle for remote KV blocks."""
         key = ("remote", dst_engine_id, remote_rank)
         table = self._pega_block_tables.get(key)
         if table is not None:
@@ -274,6 +284,11 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         remote_rank: int,
         request_id: str,
     ) -> bool:
+        """Ensure a Pega RDMA v1 peer connection exists before READ submit.
+
+        Returns ``True`` when the connection is ready.  Returns ``False`` when
+        the request has been queued behind an in-flight transport handshake.
+        """
         status = self._pega_rdma.get_or_prepare(peer_key)
         if status.status == "existing":
             self._pega_rdma_perf.record_ns("ensure_existing", 0)
@@ -308,12 +323,14 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         return False
 
     def _add_pending_request(self, peer_key: str, request_id: str, dst_engine_id: str) -> None:
+        """Remember a request waiting for this peer's RDMA v1 handshake."""
         pending = self._pega_pending_requests[peer_key]
         entry = (request_id, dst_engine_id)
         if entry not in pending:
             pending.append(entry)
 
     def _get_new_notifs(self) -> set[str]:
+        """Drain NIXL notifications plus embedded Pega RDMA handshake messages."""
         assert self.transfer_topo is not None
         self._expire_pega_rdma_handshakes()
         notified_req_ids: set[str] = set()
@@ -354,6 +371,7 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         self,
         payload: dict[str, object],
     ) -> None:
+        """Handle one Pega RDMA v1 handshake notification from the NIXL channel."""
         kind = payload.get("kind")
         peer_key = payload.get("peer_key")
         metadata = payload.get("metadata")
@@ -410,6 +428,7 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         raise ValueError(f"unknown Pega RDMA v1 handshake kind {kind!r}")
 
     def _get_pega_response_agent(self, peer_key: str, agent_metadata: bytes) -> str:
+        """Register or reuse the temporary NIXL agent used for handshake replies."""
         agent_name = self._pega_response_agents.get(peer_key)
         if agent_name is not None:
             return agent_name
@@ -418,6 +437,7 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         return agent_name
 
     def _expire_pega_rdma_handshakes(self) -> None:
+        """Fail requests blocked on RDMA v1 handshakes that exceeded timeout."""
         now = time.perf_counter()
         timeout_s = self._pega_rdma_config.handshake_timeout_s
         expired_peers = [
@@ -459,6 +479,7 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
                 self._handle_failed_transfer(req_id, None)
 
     def _prepare_or_get_local_metadata(self, peer_key: str) -> bytes:
+        """Return local RDMA v1 metadata for replying to or completing a handshake."""
         local = self._pega_local_handshake.get(peer_key)
         if local is not None:
             return local
@@ -478,6 +499,7 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         return local
 
     def _pop_done_transfers(self, transfers: dict[str, list[int]]) -> set[str]:
+        """Poll Pega RDMA READs and emit normal NIXL completion notifications."""
         done_req_ids: set[str] = set()
         for req_id, handles in list(transfers.items()):
             in_progress = []
@@ -534,6 +556,7 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         return done_req_ids
 
     def _handle_failed_transfer(self, req_id: str, handle: int | None):
+        """Release Pega RDMA state, then delegate request failure to NIXL."""
         if handle is not None:
             read = self._pega_rdma_reads.pop(handle, None)
             if read is not None:
@@ -546,6 +569,7 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         super()._handle_failed_transfer(req_id, handle)
 
     def shutdown(self):
+        """Release Pega RDMA resources before the inherited NIXL shutdown."""
         self._pega_rdma_perf.log_final_summary()
         for read in list(self._pega_rdma_reads.values()):
             self._pega_rdma.release_read(read.handle)

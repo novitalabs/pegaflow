@@ -38,6 +38,7 @@ class PegaRdmaV1Config:
 
     @classmethod
     def from_extra_config(cls, extra_config: dict[str, Any]) -> PegaRdmaV1Config:
+        """Parse Pega RDMA v1 settings from vLLM's connector extra config."""
         raw_nics = extra_config.get("pegaflow.nixl.rdma_v1.nics")
         if raw_nics is None:
             raw_nics = extra_config.get("pegaflow.pd.rdma.nics")
@@ -97,6 +98,7 @@ class PegaRdmaV1Read:
 
 class PegaRdmaV1Perf:
     def __init__(self, *, enabled: bool, log_every: int, logger_name: str):
+        """Create an opt-in lightweight stage timer for the RDMA v1 path."""
         self.enabled = enabled
         self.log_every = log_every
         self.logger_name = logger_name
@@ -107,6 +109,7 @@ class PegaRdmaV1Perf:
 
     @contextmanager
     def measure(self, stage: str):
+        """Measure one named stage when perf probes are enabled."""
         if not self.enabled:
             yield
             return
@@ -117,6 +120,7 @@ class PegaRdmaV1Perf:
             self.record_ns(stage, time.perf_counter_ns() - start_ns)
 
     def record_ns(self, stage: str, elapsed_ns: int) -> None:
+        """Record a measured stage duration in nanoseconds."""
         if not self.enabled:
             return
         self._count_by_stage[stage] += 1
@@ -127,6 +131,7 @@ class PegaRdmaV1Perf:
             self.log_summary()
 
     def log_summary(self) -> None:
+        """Log aggregate timing counters collected so far."""
         if not self.enabled or not self._count_by_stage:
             return
         import logging
@@ -143,6 +148,7 @@ class PegaRdmaV1Perf:
         )
 
     def log_final_summary(self) -> None:
+        """Emit the final timing summary during worker shutdown."""
         if not self.enabled:
             return
         import logging
@@ -152,6 +158,7 @@ class PegaRdmaV1Perf:
 
 
 def _config_bool(value: Any, *, default: bool) -> bool:
+    """Coerce a connector config value to bool with a caller-provided default."""
     if value is None:
         return default
     if isinstance(value, bool):
@@ -162,20 +169,24 @@ def _config_bool(value: Any, *, default: bool) -> bool:
 
 
 def make_peer_key(local_engine_id: str, local_tp_rank: int, remote_engine_id: str, remote_rank: int):
+    """Build a stable directional key for one local TP rank to one remote rank."""
     return f"{local_engine_id}:{local_tp_rank}->{remote_engine_id}:{remote_rank}"
 
 
 def parse_peer_endpoint(endpoint: str) -> tuple[str, int]:
+    """Parse the ``engine_id:rank`` endpoint encoded in a peer key."""
     engine_id, rank = endpoint.rsplit(":", 1)
     return engine_id, int(rank)
 
 
 def peer_key_source(peer_key: str) -> tuple[str, int]:
+    """Return the source endpoint of a directional Pega RDMA peer key."""
     source, _target = peer_key.split("->", 1)
     return parse_peer_endpoint(source)
 
 
 def reverse_peer_key(peer_key: str) -> str:
+    """Reverse a directional peer key for the opposite side of the connection."""
     local, remote = peer_key.split("->", 1)
     return f"{remote}->{local}"
 
@@ -239,4 +250,5 @@ def decode_handshake_notif(notif: bytes) -> dict[str, Any] | None:
 
 
 def create_rdma_engine(config: PegaRdmaV1Config) -> PegaRdmaV1Engine:
+    """Create the native Pega RDMA v1 engine from parsed connector config."""
     return PegaRdmaV1Engine(nics=config.nics, qps_per_peer=config.qps_per_peer)
