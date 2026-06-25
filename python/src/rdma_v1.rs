@@ -4,7 +4,7 @@ use pegaflow_transfer::{
     ConnectionStatus, HandshakeMetadata, MemoryRegion, TransferDesc, TransferEngine, TransferOp,
 };
 use pyo3::{
-    exceptions::{PyRuntimeError, PyValueError},
+    exceptions::{PyIndexError, PyRuntimeError, PyValueError},
     prelude::*,
     types::PyDict,
 };
@@ -64,11 +64,19 @@ struct PendingRead {
     bytes_done: usize,
 }
 
+#[derive(Clone, Copy)]
+struct BlockEntry {
+    addr: u64,
+    len: usize,
+}
+
 #[pyclass]
 struct PegaRdmaV1Engine {
     engine: Arc<TransferEngine>,
     pending_reads: Mutex<HashMap<u64, PendingRead>>,
     next_handle: Mutex<u64>,
+    block_tables: Mutex<HashMap<u64, Vec<BlockEntry>>>,
+    next_table_handle: Mutex<u64>,
 }
 
 #[pymethods]
@@ -85,6 +93,8 @@ impl PegaRdmaV1Engine {
             engine: Arc::new(engine),
             pending_reads: Mutex::new(HashMap::new()),
             next_handle: Mutex::new(1),
+            block_tables: Mutex::new(HashMap::new()),
+            next_table_handle: Mutex::new(1),
         })
     }
 
@@ -173,6 +183,40 @@ impl PegaRdmaV1Engine {
         Ok(())
     }
 
+    fn register_blocks_table(&self, blocks: Vec<(u64, u64, u64)>) -> PyResult<u64> {
+        let mut table = Vec::with_capacity(blocks.len());
+        for (addr, len, _device_id) in blocks {
+            if len == 0 {
+                return Err(PyValueError::new_err("block len must be positive"));
+            }
+            table.push(BlockEntry {
+                addr,
+                len: u64_to_usize(len, "block len")?,
+            });
+        }
+        let mut next_handle = self
+            .next_table_handle
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("next_table_handle mutex poisoned"))?;
+        let handle = *next_handle;
+        *next_handle = next_handle
+            .checked_add(1)
+            .ok_or_else(|| PyRuntimeError::new_err("RDMA block table handle overflow"))?;
+        self.block_tables
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("block_tables mutex poisoned"))?
+            .insert(handle, table);
+        Ok(handle)
+    }
+
+    fn drop_blocks_table(&self, handle: u64) -> PyResult<()> {
+        self.block_tables
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("block_tables mutex poisoned"))?
+            .remove(&handle);
+        Ok(())
+    }
+
     fn read_async(
         &self,
         py: Python<'_>,
@@ -194,29 +238,62 @@ impl PegaRdmaV1Engine {
                 len: u64_to_usize(len, "transfer desc len")?,
             });
         }
-        let receivers = self
-            .engine
-            .batch_transfer_async(TransferOp::Read, &remote_addr, &native)
-            .map_err(|err| rdma_v1_error("submit RDMA READ failed", err))?;
-        let mut next_handle = self
-            .next_handle
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("next_handle mutex poisoned"))?;
-        let handle = *next_handle;
-        *next_handle = next_handle
-            .checked_add(1)
-            .ok_or_else(|| PyRuntimeError::new_err("RDMA read handle overflow"))?;
-        self.pending_reads
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("pending_reads mutex poisoned"))?
-            .insert(
-                handle,
-                PendingRead {
-                    receivers: receivers.into_iter().map(Some).collect(),
-                    bytes_done: 0,
-                },
-            );
-        Ok(handle)
+        self.submit_read_native(remote_addr, native)
+    }
+
+    fn read_async_indices(
+        &self,
+        remote_addr: String,
+        local_table_handle: u64,
+        remote_table_handle: u64,
+        local_desc_ids: Vec<usize>,
+        remote_desc_ids: Vec<usize>,
+    ) -> PyResult<(u64, usize, usize)> {
+        if local_desc_ids.len() != remote_desc_ids.len() {
+            return Err(PyValueError::new_err(
+                "local_desc_ids and remote_desc_ids must have the same length",
+            ));
+        }
+
+        let prepared = {
+            let tables = self
+                .block_tables
+                .lock()
+                .map_err(|_| PyRuntimeError::new_err("block_tables mutex poisoned"))?;
+            let local_table = tables.get(&local_table_handle).ok_or_else(|| {
+                PyValueError::new_err(format!("unknown local block table {local_table_handle}"))
+            })?;
+            let remote_table = tables.get(&remote_table_handle).ok_or_else(|| {
+                PyValueError::new_err(format!("unknown remote block table {remote_table_handle}"))
+            })?;
+
+            let mut native = Vec::with_capacity(local_desc_ids.len());
+            let mut bytes = 0usize;
+            for (local_idx, remote_idx) in local_desc_ids.into_iter().zip(remote_desc_ids) {
+                let local = local_table.get(local_idx).ok_or_else(|| {
+                    PyIndexError::new_err(format!("local desc index out of range: {local_idx}"))
+                })?;
+                let remote = remote_table.get(remote_idx).ok_or_else(|| {
+                    PyIndexError::new_err(format!("remote desc index out of range: {remote_idx}"))
+                })?;
+                let len = local.len.min(remote.len);
+                if len == 0 {
+                    continue;
+                }
+                native.push(TransferDesc {
+                    local_ptr: nonnull_from_u64(local.addr, "local_addr")?,
+                    remote_ptr: nonnull_from_u64(remote.addr, "remote_addr")?,
+                    len,
+                });
+                bytes = bytes.saturating_add(len);
+            }
+            (native, bytes)
+        };
+
+        let (native, bytes) = prepared;
+        let desc_count = native.len();
+        let handle = self.submit_read_native(remote_addr, native)?;
+        Ok((handle, bytes, desc_count))
     }
 
     fn check_read(&self, handle: u64) -> PyResult<String> {
@@ -272,6 +349,34 @@ impl PegaRdmaV1Engine {
 
     fn num_qps(&self) -> usize {
         self.engine.num_qps()
+    }
+}
+
+impl PegaRdmaV1Engine {
+    fn submit_read_native(&self, remote_addr: String, native: Vec<TransferDesc>) -> PyResult<u64> {
+        let receivers = self
+            .engine
+            .batch_transfer_async(TransferOp::Read, &remote_addr, &native)
+            .map_err(|err| rdma_v1_error("submit RDMA READ failed", err))?;
+        let mut next_handle = self
+            .next_handle
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("next_handle mutex poisoned"))?;
+        let handle = *next_handle;
+        *next_handle = next_handle
+            .checked_add(1)
+            .ok_or_else(|| PyRuntimeError::new_err("RDMA read handle overflow"))?;
+        self.pending_reads
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("pending_reads mutex poisoned"))?
+            .insert(
+                handle,
+                PendingRead {
+                    receivers: receivers.into_iter().map(Some).collect(),
+                    bytes_done: 0,
+                },
+            );
+        Ok(handle)
     }
 }
 

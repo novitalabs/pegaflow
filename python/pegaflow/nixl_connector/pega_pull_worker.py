@@ -18,7 +18,6 @@ from pegaflow.nixl_connector.pega_rdma_v1 import (
     PegaRdmaV1Perf,
     PegaRdmaV1Read,
     build_memory_regions,
-    build_read_descs,
     create_rdma_engine,
     decode_handshake_notif,
     encode_handshake_request,
@@ -71,6 +70,7 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         self._pega_pending_requests = defaultdict[str, list[tuple[str, str]]](list)
         self._pega_pending_since: dict[str, float] = {}
         self._pega_response_agents: dict[str, str] = {}
+        self._pega_block_tables: dict[object, int] = {}
         self._pega_expected_peers: dict[str, set[str]] = defaultdict(set)
         self._pega_submitted_peers: dict[str, set[str]] = defaultdict(set)
         self._pega_completed_peers: dict[str, set[str]] = defaultdict(set)
@@ -178,28 +178,27 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
             if peer_key in self._pega_submitted_peers[request_id]:
                 return
 
-            local_blocks_data = self._local_blocks_data_for_handle(
+            local_table = self._local_blocks_table_for_handle(
                 local_xfer_side_handle,
                 block_size=remote_info.remote_block_size,
             )
-            remote_blocks_data = self.dst_blocks_data[dst_engine_id][remote_rank]
-            with self._pega_rdma_perf.measure("build_descs"):
-                descs = build_read_descs(
-                    local_blocks_data,
-                    remote_blocks_data,
-                    local_block_descs_ids,
-                    remote_block_descs_ids,
-                )
+            remote_table = self._remote_blocks_table(dst_engine_id, remote_rank)
             with self._pega_rdma_perf.measure("read_async_submit"):
-                handle = self._pega_rdma.read_async(peer_key, descs)
+                handle, bytes_transferred, num_descriptors = self._pega_rdma.read_async_indices(
+                    peer_key,
+                    local_table,
+                    remote_table,
+                    local_block_descs_ids.tolist(),
+                    remote_block_descs_ids.tolist(),
+                )
             self._pega_rdma_reads[handle] = PegaRdmaV1Read(
                 remote_addr=peer_key,
                 handle=handle,
                 notif_agent=self._remote_agents[dst_engine_id][remote_rank],
                 notif_msg=notif_id,
                 submitted_at=time.perf_counter(),
-                bytes_transferred=sum(desc["len"] for desc in descs),
-                num_descriptors=len(descs),
+                bytes_transferred=bytes_transferred,
+                num_descriptors=num_descriptors,
             )
             self._recving_transfers[request_id].append(handle)
             self._pega_submitted_peers[request_id].add(peer_key)
@@ -208,7 +207,7 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
                 request_id,
                 dst_engine_id,
                 remote_rank,
-                len(descs),
+                num_descriptors,
             )
         except Exception as e:
             self._log_failure(
@@ -234,6 +233,31 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
                 if handle == local_xfer_side_handle:
                     return self.src_blocks_data_by_tp_ratio[tp_ratio][idx]
         raise RuntimeError(f"unknown local xfer side handle {local_xfer_side_handle}")
+
+    def _local_blocks_table_for_handle(
+        self,
+        local_xfer_side_handle: int,
+        *,
+        block_size: int,
+    ) -> int:
+        key = ("local", local_xfer_side_handle)
+        table = self._pega_block_tables.get(key)
+        if table is not None:
+            return table
+        blocks = self._local_blocks_data_for_handle(local_xfer_side_handle, block_size=block_size)
+        table = self._pega_rdma.register_blocks_table(blocks)
+        self._pega_block_tables[key] = table
+        return table
+
+    def _remote_blocks_table(self, dst_engine_id: str, remote_rank: int) -> int:
+        key = ("remote", dst_engine_id, remote_rank)
+        table = self._pega_block_tables.get(key)
+        if table is not None:
+            return table
+        blocks = self.dst_blocks_data[dst_engine_id][remote_rank]
+        table = self._pega_rdma.register_blocks_table(blocks)
+        self._pega_block_tables[key] = table
+        return table
 
     def _ensure_pega_rdma_connection(
         self,
@@ -504,6 +528,12 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         self._pega_pending_since.clear()
         self._pega_pending_requests.clear()
         self._recving_transfers.clear()
+        for table in self._pega_block_tables.values():
+            try:
+                self._pega_rdma.drop_blocks_table(table)
+            except Exception:
+                logger.debug("Failed to drop Pega RDMA v1 block table", exc_info=True)
+        self._pega_block_tables.clear()
         for agent_name in self._pega_response_agents.values():
             try:
                 self.nixl_wrapper.remove_remote_agent(agent_name)
