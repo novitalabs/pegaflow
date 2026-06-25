@@ -66,6 +66,9 @@ struct PendingRead {
 
 #[derive(Clone, Copy)]
 struct BlockEntry {
+    // Keep block table entries as plain integers.  The PyO3 class can then stay
+    // Send-friendly, and pointers are converted to NonNull only while building
+    // the native transfer descriptors for a submitted READ.
     addr: u64,
     len: usize,
 }
@@ -128,6 +131,10 @@ impl PegaRdmaV1Engine {
     }
 
     fn get_or_prepare(&self, remote_addr: String) -> PyResult<PegaRdmaV1Handshake> {
+        // Expose TransferEngine's state machine without leaking Rust enums into
+        // Python.  "prepared" means the caller must send this side's RDMA v1
+        // handshake metadata to its peer; "connecting" means another request is
+        // already doing that for the same peer.
         let status = self
             .engine
             .get_or_prepare(&remote_addr)
@@ -167,6 +174,10 @@ impl PegaRdmaV1Engine {
         local_metadata: Vec<u8>,
         remote_metadata: Vec<u8>,
     ) -> PyResult<()> {
+        // The local and remote byte blobs are PegaFlow RDMA v1 metadata, not
+        // NIXL agent metadata.  The Python connector transports these bytes over
+        // NIXL notifications but completes them against the Pega transfer
+        // engine here.
         let local = HandshakeMetadata::from_bytes(&local_metadata)
             .map_err(|err| rdma_v1_error("decode local handshake failed", err))?;
         let remote = HandshakeMetadata::from_bytes(&remote_metadata)
@@ -184,6 +195,9 @@ impl PegaRdmaV1Engine {
     }
 
     fn register_blocks_table(&self, blocks: Vec<(u64, u64, u64)>) -> PyResult<u64> {
+        // Blocks are stable after NIXL registers KV cache memory.  Registering a
+        // compact table once lets the hot path pass descriptor indices instead
+        // of allocating and parsing Python dictionaries for every READ.
         let mut table = Vec::with_capacity(blocks.len());
         for (addr, len, _device_id) in blocks {
             if len == 0 {
@@ -256,6 +270,9 @@ impl PegaRdmaV1Engine {
                 if len == 0 {
                     continue;
                 }
+                // NIXL owns descriptor ordering and index selection; this layer
+                // only materializes those indices into native RDMA READ
+                // descriptors for the PegaFlow v1 transfer engine.
                 native.push(TransferDesc {
                     local_ptr: nonnull_from_u64(local.addr, "local_addr")?,
                     remote_ptr: nonnull_from_u64(remote.addr, "remote_addr")?,
@@ -273,6 +290,9 @@ impl PegaRdmaV1Engine {
     }
 
     fn check_read(&self, handle: u64) -> PyResult<String> {
+        // Poll all per-descriptor completion receivers under a single Python
+        // handle.  The connector keeps polling until every descriptor finishes,
+        // then sends the regular NIXL completion notification.
         let mut pending = self
             .pending_reads
             .lock()
@@ -330,6 +350,9 @@ impl PegaRdmaV1Engine {
 
 impl PegaRdmaV1Engine {
     fn submit_read_native(&self, remote_addr: String, native: Vec<TransferDesc>) -> PyResult<u64> {
+        // TransferEngine returns one completion receiver per descriptor.  Python
+        // sees a single monotonically increasing handle so the worker can store
+        // request-level metadata alongside the native completions.
         let receivers = self
             .engine
             .batch_transfer_async(TransferOp::Read, &remote_addr, &native)

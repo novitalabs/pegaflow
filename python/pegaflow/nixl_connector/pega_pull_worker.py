@@ -156,6 +156,10 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
             block_size_ratio=None,
             physical_blocks_per_logical=remote_info.remote_physical_blocks_per_logical,
         )
+        # Keep NIXL's mapping contract intact: the connector computes logical
+        # request blocks, prefix-cache trims, TP ratios, and physical KV block
+        # descriptors exactly as the vendored pull worker does.  Pega RDMA only
+        # consumes the resulting descriptor indices to submit the READ payload.
         local_block_descs_ids = self._compute_desc_ids(
             block_ids=local_block_ids,
             dst_num_blocks=self.dst_num_blocks[self.engine_id],
@@ -178,6 +182,10 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
             if peer_key in self._pega_submitted_peers[request_id]:
                 return
 
+            # Fast path: register stable local/remote block tables once, then
+            # pass compact descriptor indices into Rust for every READ.  This
+            # avoids rebuilding Python dict descriptors in the hot path while
+            # preserving NIXL's block ordering and TP-rank decisions above.
             local_table = self._local_blocks_table_for_handle(
                 local_xfer_side_handle,
                 block_size=remote_info.remote_block_size,
@@ -281,6 +289,10 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         local_metadata = bytes(status.metadata)
         self._pega_local_handshake[peer_key] = local_metadata
         agent_name = self._remote_agents[dst_engine_id][remote_rank]
+        # NIXL's own handshake does not expose PegaFlow RDMA v1 connection
+        # metadata.  We reuse NIXL notifications as the control channel for the
+        # Pega transport handshake, then keep all later request lifecycle events
+        # on the original NIXL paths.
         with self._pega_rdma_perf.measure("send_hs_request"):
             self.nixl_wrapper.send_notif(
                 agent_name,
@@ -360,6 +372,9 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
                 local_peer_key = reverse_peer_key(peer_key)
                 local = self._prepare_or_get_local_metadata(local_peer_key)
                 self._pega_rdma.complete_handshake(local_peer_key, local, metadata)
+                # This response must not rely on _remote_agents[d0][rank]: the
+                # P worker can receive the Pega transport handshake before the
+                # decode-side agent table is fully populated for that rank.
                 agent_name = self._get_pega_response_agent(peer_key, response_agent_metadata)
                 self.nixl_wrapper.send_notif(
                     agent_name,
@@ -379,6 +394,9 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
                 for req_id, engine_id in pending:
                     meta = self._recving_metadata.get(req_id)
                     if meta is not None:
+                        # Requeue the original request metadata so the normal
+                        # NIXL pull worker path can recompute block mappings and
+                        # submit the READ now that the Pega connection exists.
                         self._ready_requests.put((req_id, meta))
                     else:
                         logger.debug(
@@ -424,6 +442,9 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
             for req_id, engine_id in pending:
                 if req_id not in self._recving_metadata:
                     continue
+                # Match NIXL's failure semantics: if the transport handshake
+                # cannot complete, the request's received blocks are treated as
+                # invalid and the inherited failure handler releases state.
                 self._log_failure(
                     failure_type="pega_rdma_handshake_timeout",
                     req_id=req_id,
@@ -498,6 +519,10 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
 
             expected = self._pega_expected_peers.get(req_id, set())
             completed = self._pega_completed_peers.get(req_id, set())
+            # A request may require READs from multiple remote TP ranks.  The
+            # request is visible to the inherited scheduler only after every
+            # expected Pega RDMA peer has completed and sent its normal NIXL
+            # completion notification.
             if not in_progress and expected and completed.issuperset(expected):
                 done_req_ids.add(req_id)
                 del transfers[req_id]

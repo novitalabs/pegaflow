@@ -1,7 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Modified by PegaFlow contributors in 2026.
-"""PegaFlow RDMA v1 adapter for the vendored NIXL pull connector."""
+"""PegaFlow RDMA v1 adapter for the vendored NIXL pull connector.
+
+The vendored NIXL connector still owns scheduler metadata, TP/block mapping,
+heartbeats, and completion notifications.  This module only defines the small
+Pega RDMA v1 side channel used to exchange native RDMA handshake metadata and
+submit the KV READ data plane from the pull worker.
+"""
 
 from __future__ import annotations
 
@@ -16,6 +22,9 @@ import msgspec
 
 from pegaflow.pegaflow import PegaRdmaV1Engine
 
+# Pega RDMA v1 handshake messages share NIXL's notification channel, so they
+# need an explicit prefix to stay distinguishable from regular request/HB
+# notifications handled by the upstream NIXL worker.
 PEGA_RDMA_V1_HANDSHAKE_PREFIX = b"PEGA_RDMA_V1_HS:"
 
 
@@ -172,6 +181,12 @@ def reverse_peer_key(peer_key: str) -> str:
 
 
 def build_memory_regions(blocks_data: list[tuple[int, int, int]]) -> list[dict[str, int]]:
+    """Build native registration regions from NIXL block descriptors.
+
+    NIXL may describe the same backing allocation through many logical KV
+    block entries.  Pega RDMA v1 only needs each base address registered once,
+    so duplicate addresses are merged before crossing into PyO3.
+    """
     merged: dict[int, int] = {}
     for addr, size, _device_id in blocks_data:
         if size <= 0:
@@ -185,6 +200,13 @@ def encode_handshake_request(
     metadata: bytes,
     response_agent_metadata: bytes,
 ) -> bytes:
+    """Encode the D->P Pega RDMA handshake request.
+
+    The extra ``response_agent_metadata`` is the decode worker's NIXL agent
+    metadata.  The prefill worker cannot assume the decode agent is already in
+    its ``_remote_agents`` table while replying to this transport-level
+    handshake, so it registers a temporary response agent from this metadata.
+    """
     return PEGA_RDMA_V1_HANDSHAKE_PREFIX + msgspec.msgpack.encode(
         {
             "kind": "request",
@@ -196,6 +218,7 @@ def encode_handshake_request(
 
 
 def encode_handshake_response(peer_key: str, metadata: bytes) -> bytes:
+    """Encode the P->D Pega RDMA metadata response."""
     return PEGA_RDMA_V1_HANDSHAKE_PREFIX + msgspec.msgpack.encode(
         {
             "kind": "response",
@@ -206,6 +229,7 @@ def encode_handshake_response(peer_key: str, metadata: bytes) -> bytes:
 
 
 def decode_handshake_notif(notif: bytes) -> dict[str, Any] | None:
+    """Return a Pega RDMA handshake payload, or ``None`` for normal NIXL notifs."""
     if not notif.startswith(PEGA_RDMA_V1_HANDSHAKE_PREFIX):
         return None
     payload = msgspec.msgpack.decode(notif[len(PEGA_RDMA_V1_HANDSHAKE_PREFIX) :])
