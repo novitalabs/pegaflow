@@ -17,7 +17,9 @@ use uuid::Uuid;
 
 use crate::metrics::core_metrics;
 
-pub const DEFAULT_METASERVER_QUEUE_DEPTH: usize = 256;
+// Shared insert/remove command channel depth. Eviction bursts outrun the single
+// consumer's per-RPC drain, so a shallow queue silently drops removals.
+pub const DEFAULT_METASERVER_QUEUE_DEPTH: usize = 4096;
 
 /// Error type for MetaServer client operations.
 #[cfg(feature = "rdma")]

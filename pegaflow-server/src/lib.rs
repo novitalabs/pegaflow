@@ -164,7 +164,7 @@ pub struct Cli {
     #[arg(long)]
     pub metaserver_addr: Option<String>,
 
-    /// MetaServer registration queue depth (max pending registration batches).
+    /// MetaServer command queue depth (pending insert/remove commands, shared channel).
     #[arg(long, default_value_t = pegaflow_core::DEFAULT_METASERVER_QUEUE_DEPTH)]
     pub metaserver_queue_depth: usize,
 

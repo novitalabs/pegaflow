@@ -29,7 +29,9 @@ use prefetch::RdmaFetch;
 use read_cache::ReadCache;
 use write_path::{InsertDeps, WritePipeline};
 
-const RECLAIM_BATCH_SIZE: usize = 64;
+// Each reclaim iteration emits one MetaServer removal command; a small batch
+// turns an eviction burst into a command flood that overflows the removal queue.
+const RECLAIM_BATCH_SIZE: usize = 512;
 pub const DEFAULT_RDMA_QPS_PER_PEER: usize = 2;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
