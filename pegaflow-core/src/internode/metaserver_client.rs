@@ -17,7 +17,15 @@ use uuid::Uuid;
 
 use crate::metrics::core_metrics;
 
-pub const DEFAULT_METASERVER_QUEUE_DEPTH: usize = 256;
+// Shared insert/remove command channel depth. Eviction bursts outrun the single
+// consumer's per-RPC drain, so a shallow queue silently drops removals.
+pub const DEFAULT_METASERVER_QUEUE_DEPTH: usize = 4096;
+
+// Cap hashes per insert/remove RPC. The consumer coalesces a whole queue drain
+// per namespace, so without a cap one RPC could reach queue_depth * batch_size
+// hashes and blow past the MetaServer's gRPC decode limit. 32-byte sha256 hashes
+// keep a full chunk near 0.5 MiB, well under tonic's 4 MiB default.
+const MAX_HASHES_PER_RPC: usize = 16_384;
 
 /// Error type for MetaServer client operations.
 #[cfg(feature = "rdma")]
@@ -408,46 +416,48 @@ async fn registration_loop(
 
         // Process inserts
         let insert_namespaces: Vec<(String, Vec<Vec<u8>>)> = inserts.into_iter().collect();
-        let mut insert_failed_at = None;
+        let mut insert_failed_at: Option<(usize, usize)> = None;
 
-        for (i, (namespace, hashes)) in insert_namespaces.iter().enumerate() {
-            let count = hashes.len();
-            let request = InsertBlockHashesRequest {
-                namespace: namespace.clone(),
-                block_hashes: hashes.clone(),
-                node: advertise_addr.clone(),
-                node_id: node_id.clone(),
-            };
+        'insert: for (i, (namespace, hashes)) in insert_namespaces.iter().enumerate() {
+            for (chunk_idx, chunk) in hashes.chunks(MAX_HASHES_PER_RPC).enumerate() {
+                let count = chunk.len();
+                let request = InsertBlockHashesRequest {
+                    namespace: namespace.clone(),
+                    block_hashes: chunk.to_vec(),
+                    node: advertise_addr.clone(),
+                    node_id: node_id.clone(),
+                };
 
-            match c.insert_block_hashes(request).await {
-                Ok(resp) => {
-                    let inner = resp.into_inner();
-                    debug!(
-                        "Registered {} block hashes with MetaServer (namespace={}, inserted={})",
-                        count, namespace, inner.inserted_count
-                    );
-                }
-                Err(e) => {
-                    error!(
-                        "MetaServer insert_block_hashes failed (namespace={}, count={}): {e}",
-                        namespace, count
-                    );
-                    if e.code() == Code::FailedPrecondition {
-                        warn!(
-                            "MetaServer insert rejected current session; resetting node registration: node={} node_id={}",
-                            advertise_addr, node_id
+                match c.insert_block_hashes(request).await {
+                    Ok(resp) => {
+                        let inner = resp.into_inner();
+                        debug!(
+                            "Registered {} block hashes with MetaServer (namespace={}, inserted={})",
+                            count, namespace, inner.inserted_count
                         );
-                        core_metrics().metaserver_session_resets.add(1, &[]);
-                        heartbeat.node_registered = false;
                     }
-                    insert_failed_at = Some(i);
-                    break;
+                    Err(e) => {
+                        error!(
+                            "MetaServer insert_block_hashes failed (namespace={}, count={}): {e}",
+                            namespace, count
+                        );
+                        if e.code() == Code::FailedPrecondition {
+                            warn!(
+                                "MetaServer insert rejected current session; resetting node registration: node={} node_id={}",
+                                advertise_addr, node_id
+                            );
+                            core_metrics().metaserver_session_resets.add(1, &[]);
+                            heartbeat.node_registered = false;
+                        }
+                        insert_failed_at = Some((i, chunk_idx * MAX_HASHES_PER_RPC));
+                        break 'insert;
+                    }
                 }
             }
         }
 
-        if let Some(idx) = insert_failed_at {
-            let dropped: usize = insert_namespaces[idx..].iter().map(|(_, h)| h.len()).sum();
+        if let Some((idx, offset)) = insert_failed_at {
+            let dropped = unsent_after_failure(&insert_namespaces, idx, offset);
             core_metrics()
                 .metaserver_registration_failures
                 .add(dropped as u64, &[]);
@@ -463,46 +473,48 @@ async fn registration_loop(
 
         // Process removes
         let remove_namespaces: Vec<(String, Vec<Vec<u8>>)> = removes.into_iter().collect();
-        let mut remove_failed_at = None;
+        let mut remove_failed_at: Option<(usize, usize)> = None;
 
-        for (i, (namespace, hashes)) in remove_namespaces.iter().enumerate() {
-            let count = hashes.len();
-            let request = RemoveBlockHashesRequest {
-                namespace: namespace.clone(),
-                block_hashes: hashes.clone(),
-                node: advertise_addr.clone(),
-                node_id: node_id.clone(),
-            };
+        'remove: for (i, (namespace, hashes)) in remove_namespaces.iter().enumerate() {
+            for (chunk_idx, chunk) in hashes.chunks(MAX_HASHES_PER_RPC).enumerate() {
+                let count = chunk.len();
+                let request = RemoveBlockHashesRequest {
+                    namespace: namespace.clone(),
+                    block_hashes: chunk.to_vec(),
+                    node: advertise_addr.clone(),
+                    node_id: node_id.clone(),
+                };
 
-            match c.remove_block_hashes(request).await {
-                Ok(resp) => {
-                    let inner = resp.into_inner();
-                    debug!(
-                        "Removed {} block hashes from MetaServer (namespace={}, removed={})",
-                        count, namespace, inner.removed_count
-                    );
-                }
-                Err(e) => {
-                    error!(
-                        "MetaServer remove_block_hashes failed (namespace={}, count={}): {e}",
-                        namespace, count
-                    );
-                    if e.code() == Code::FailedPrecondition {
-                        warn!(
-                            "MetaServer remove rejected current session; resetting node registration: node={} node_id={}",
-                            advertise_addr, node_id
+                match c.remove_block_hashes(request).await {
+                    Ok(resp) => {
+                        let inner = resp.into_inner();
+                        debug!(
+                            "Removed {} block hashes from MetaServer (namespace={}, removed={})",
+                            count, namespace, inner.removed_count
                         );
-                        core_metrics().metaserver_session_resets.add(1, &[]);
-                        heartbeat.node_registered = false;
                     }
-                    remove_failed_at = Some(i);
-                    break;
+                    Err(e) => {
+                        error!(
+                            "MetaServer remove_block_hashes failed (namespace={}, count={}): {e}",
+                            namespace, count
+                        );
+                        if e.code() == Code::FailedPrecondition {
+                            warn!(
+                                "MetaServer remove rejected current session; resetting node registration: node={} node_id={}",
+                                advertise_addr, node_id
+                            );
+                            core_metrics().metaserver_session_resets.add(1, &[]);
+                            heartbeat.node_registered = false;
+                        }
+                        remove_failed_at = Some((i, chunk_idx * MAX_HASHES_PER_RPC));
+                        break 'remove;
+                    }
                 }
             }
         }
 
-        if let Some(idx) = remove_failed_at {
-            let dropped: usize = remove_namespaces[idx..].iter().map(|(_, h)| h.len()).sum();
+        if let Some((idx, offset)) = remove_failed_at {
+            let dropped = unsent_after_failure(&remove_namespaces, idx, offset);
             core_metrics()
                 .metaserver_removal_failures
                 .add(dropped as u64, &[]);
@@ -511,6 +523,22 @@ async fn registration_loop(
     }
 
     info!("MetaServer registration loop shutting down");
+}
+
+/// Hashes that did not reach the MetaServer after a chunked send failed at
+/// `failed_offset` within namespace `failed_idx`: the unsent tail of that
+/// namespace (earlier chunks already landed) plus every later namespace.
+fn unsent_after_failure(
+    namespaces: &[(String, Vec<Vec<u8>>)],
+    failed_idx: usize,
+    failed_offset: usize,
+) -> usize {
+    let unsent_in_ns = namespaces[failed_idx].1.len().saturating_sub(failed_offset);
+    let later: usize = namespaces[failed_idx + 1..]
+        .iter()
+        .map(|(_, h)| h.len())
+        .sum();
+    unsent_in_ns + later
 }
 
 fn append_groups(target: &mut HashMap<String, Vec<Vec<u8>>>, groups: Vec<(String, Vec<Vec<u8>>)>) {
@@ -921,6 +949,78 @@ mod tests {
         wait_for_count(&service.heartbeat_notify, &service.heartbeat_count, 1).await;
         client.try_register_namespace("ns".to_string(), vec![vec![1]]);
         wait_for_count(&service.heartbeat_notify, &service.heartbeat_count, 2).await;
+
+        client.shutdown().await;
+        let _ = shutdown_tx.send(());
+    }
+
+    #[test]
+    fn unsent_after_failure_counts_only_unsent_tail() {
+        let ns = |name: &str, n: usize| (name.to_string(), vec![vec![0u8]; n]);
+        let namespaces = vec![ns("a", 100), ns("b", 50), ns("c", 30)];
+
+        // First chunk of "b" failed (nothing of b sent yet): all of b + c.
+        assert_eq!(unsent_after_failure(&namespaces, 1, 0), 50 + 30);
+        // 40 hashes of "b" already landed before the failing chunk: b's tail + c.
+        assert_eq!(unsent_after_failure(&namespaces, 1, 40), 10 + 30);
+        // Failure in the last namespace: only its unsent tail, no later namespaces.
+        assert_eq!(unsent_after_failure(&namespaces, 2, 20), 10);
+        // Offset past the namespace length saturates to zero unsent.
+        assert_eq!(unsent_after_failure(&namespaces, 2, 999), 0);
+    }
+
+    #[tokio::test]
+    async fn large_namespace_removal_splits_into_bounded_rpcs() {
+        let (addr, service, shutdown_tx) = start_fake_metaserver().await;
+        let client = MetaServerClient::new(MetaServerClientConfig::new(
+            addr,
+            "node-a:50055".to_string(),
+        ));
+        wait_for_count(&service.heartbeat_notify, &service.heartbeat_count, 1).await;
+
+        // One namespace coalesced past the per-RPC cap. Use sha256-sized (32B)
+        // hashes so the full payload (~5 MiB) exceeds tonic's 4 MiB default
+        // decode limit: without chunking this single RPC would be rejected.
+        // Chunking holds each request to MAX_HASHES_PER_RPC * 32B = 512 KiB.
+        let sha256_hash = |i: u32| {
+            let mut h = vec![0u8; 32];
+            h[..4].copy_from_slice(&i.to_le_bytes());
+            h
+        };
+        let total = MAX_HASHES_PER_RPC * 10 + 1;
+        let expected_chunks = total.div_ceil(MAX_HASHES_PER_RPC);
+        let entries: Vec<(String, Vec<u8>)> = (0..total as u32)
+            .map(|i| ("ns".to_string(), sha256_hash(i)))
+            .collect();
+        client.try_unregister(entries);
+
+        wait_for_count(
+            &service.remove_notify,
+            &service.remove_count,
+            expected_chunks,
+        )
+        .await;
+
+        let logged = service.remove_requests.lock().unwrap().clone();
+        assert_eq!(
+            logged.len(),
+            expected_chunks,
+            "removal split into wrong RPC count"
+        );
+        let mut sent: Vec<Vec<u8>> = Vec::with_capacity(total);
+        for (namespace, hashes) in &logged {
+            assert_eq!(namespace, "ns");
+            assert!(
+                hashes.len() <= MAX_HASHES_PER_RPC,
+                "chunk of {} hashes exceeds cap {MAX_HASHES_PER_RPC}",
+                hashes.len()
+            );
+            sent.extend(hashes.iter().cloned());
+        }
+        sent.sort();
+        let mut expected: Vec<Vec<u8>> = (0..total as u32).map(sha256_hash).collect();
+        expected.sort();
+        assert_eq!(sent, expected, "chunking lost or duplicated hashes");
 
         client.shutdown().await;
         let _ = shutdown_tx.send(());
