@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use super::ssd::SsdBackingStore;
 use super::uring::UringIoEngine;
-use crate::block::{BlockKey, SealedBlock};
+use crate::block::{BlockKey, RawBlock, SealedBlock};
 use crate::metrics::core_metrics;
 use crate::pinned_pool::PinnedAllocation;
 use crate::seal_offload::{self, SlotMeta};
@@ -314,11 +314,10 @@ impl SsdRingBuffer {
             };
             self.next_shard = (self.next_shard + 1) % self.shards.len();
             let slot_numas = block.slot_numas();
-            debug_assert!(
-                slot_numas.is_empty() || slot_numas.len() == block.slots().len(),
-                "slot_numas length mismatch: {} vs {}",
+            assert_eq!(
                 slot_numas.len(),
                 block.slots().len(),
+                "slot_numas must cover every slot",
             );
             let slots: Vec<SlotMeta> = block
                 .slots()
@@ -328,10 +327,7 @@ impl SsdRingBuffer {
                     let segment_sizes: SmallVec<[u64; 2]> = (0..s.num_segments())
                         .map(|idx| s.segment_size(idx).unwrap() as u64)
                         .collect();
-                    SlotMeta::new(
-                        segment_sizes,
-                        slot_numas.get(i).copied().unwrap_or(NumaNode::UNKNOWN),
-                    )
+                    SlotMeta::new(segment_sizes, slot_numas[i])
                 })
                 .collect();
             let entry = SsdIndexEntry {
@@ -959,15 +955,18 @@ fn rebuild_sealed_block_per_slot(
     slot_allocs: Vec<SlotAlloc>,
     slot_metas: &[SlotMeta],
 ) -> SealedBlock {
-    let raw_blocks: Vec<_> = slot_metas
+    let slots: Vec<(RawBlock, NumaNode)> = slot_metas
         .iter()
         .zip(slot_allocs)
-        .map(|(meta, alloc)| unsafe {
-            seal_offload::reconstruct_raw_block(meta, alloc.allocation, alloc.offset)
+        .map(|(meta, alloc)| {
+            let raw = unsafe {
+                seal_offload::reconstruct_raw_block(meta, alloc.allocation, alloc.offset)
+            };
+            (raw, meta.numa_node)
         })
         .collect();
 
-    SealedBlock::from_slots(raw_blocks)
+    SealedBlock::from_slots(slots)
 }
 
 #[cfg(test)]

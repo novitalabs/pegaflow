@@ -244,8 +244,8 @@ impl<'a> LayerBlock<'a> {
 pub struct SealedBlock {
     slots: Box<[RawBlock]>,
     footprint: u64,
-    /// Per-slot NUMA affinity, carried from InflightBlock for SSD write path.
-    /// Empty when reconstructed from SSD prefetch (NUMA info lives in SlotMeta).
+    /// Per-slot NUMA affinity; always covers every slot (`len == slots.len()`).
+    /// Used by the SSD write path and advertised on cross-node transfer.
     slot_numas: Vec<NumaNode>,
 }
 
@@ -268,13 +268,22 @@ impl SealedBlock {
         &self.slot_numas
     }
 
-    /// Create from a vec of slots (for deserialization / prefetch rebuild)
-    pub(crate) fn from_slots(slots: Vec<RawBlock>) -> Self {
-        let footprint = slots.iter().map(|s| s.memory_footprint()).sum();
+    /// Create from per-slot `(block, NUMA)` pairs (deserialization / prefetch rebuild).
+    /// Pairing keeps each slot and its advertised NUMA affinity in lockstep, so the
+    /// cross-node serve path can never truncate slots against a short `slot_numas`.
+    pub(crate) fn from_slots(slots: Vec<(RawBlock, NumaNode)>) -> Self {
+        let mut blocks = Vec::with_capacity(slots.len());
+        let mut slot_numas = Vec::with_capacity(slots.len());
+        let mut footprint = 0u64;
+        for (block, numa) in slots {
+            footprint = footprint.saturating_add(block.memory_footprint());
+            blocks.push(block);
+            slot_numas.push(numa);
+        }
         Self {
-            slots: slots.into_boxed_slice(),
+            slots: blocks.into_boxed_slice(),
             footprint,
-            slot_numas: Vec::new(),
+            slot_numas,
         }
     }
 

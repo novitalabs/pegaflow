@@ -315,6 +315,12 @@ async fn ensure_connected(
         .await
 }
 
+/// One fetched slot: its RDMA-staged segments plus the NUMA node they sit on.
+/// The NUMA travels with the slot so a re-served block advertises real topology.
+type StagedSlot = (Vec<SegmentAlloc>, NumaNode);
+/// A staged block awaiting SealedBlock rebuild: its hash and per-slot allocations.
+type StagedBlock = (Vec<u8>, Vec<StagedSlot>);
+
 /// Allocate local memory, build TransferDescs, execute RDMA READ, build SealedBlocks.
 async fn fetch_blocks_via_rdma(
     rdma: &RdmaTransport,
@@ -331,8 +337,9 @@ async fn fetch_blocks_via_rdma(
     let bytes_per_numa = sum_segment_bytes_by_numa(blocks)?;
     let mut numa_slabs = allocate_numa_slabs(allocate_fn, bytes_per_numa)?;
 
-    // (block_hash, Vec<(slot_segments)>) — for building SealedBlock afterwards
-    let mut block_allocs: Vec<(Vec<u8>, Vec<Vec<SegmentAlloc>>)> = Vec::new();
+    // (block_hash, Vec<(slot_segments, slot_numa)>) — for building SealedBlock afterwards.
+    // The per-slot NUMA is preserved so a re-served fetched block advertises real topology.
+    let mut block_allocs: Vec<StagedBlock> = Vec::new();
     let mut slot_count = 0usize;
     let build_start = Instant::now();
 
@@ -389,7 +396,7 @@ async fn fetch_blocks_via_rdma(
                     });
                 }
 
-                slot_allocs.push(segments);
+                slot_allocs.push((segments, numa));
             }
 
             block_allocs.push((block_info.block_hash.clone(), slot_allocs));
@@ -444,9 +451,9 @@ async fn fetch_blocks_via_rdma(
     let mut result: PrefetchResult = Vec::with_capacity(block_allocs.len());
     for (hash, slot_allocs) in block_allocs {
         let key = BlockKey::new(namespace.to_string(), hash);
-        let slots: Vec<RawBlock> = slot_allocs
+        let slots: Vec<(RawBlock, NumaNode)> = slot_allocs
             .into_iter()
-            .map(|segs| {
+            .map(|(segs, numa)| {
                 let segments: Vec<Segment> = segs
                     .into_iter()
                     .map(|sa| {
@@ -455,7 +462,7 @@ async fn fetch_blocks_via_rdma(
                         Segment::new(ptr, sa.size, sa.alloc)
                     })
                     .collect();
-                RawBlock::new(segments)
+                (RawBlock::new(segments), numa)
             })
             .collect();
         let sealed = Arc::new(SealedBlock::from_slots(slots));
