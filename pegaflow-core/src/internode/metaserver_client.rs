@@ -416,10 +416,10 @@ async fn registration_loop(
 
         // Process inserts
         let insert_namespaces: Vec<(String, Vec<Vec<u8>>)> = inserts.into_iter().collect();
-        let mut insert_failed_at = None;
+        let mut insert_failed_at: Option<(usize, usize)> = None;
 
         'insert: for (i, (namespace, hashes)) in insert_namespaces.iter().enumerate() {
-            for chunk in hashes.chunks(MAX_HASHES_PER_RPC) {
+            for (chunk_idx, chunk) in hashes.chunks(MAX_HASHES_PER_RPC).enumerate() {
                 let count = chunk.len();
                 let request = InsertBlockHashesRequest {
                     namespace: namespace.clone(),
@@ -449,15 +449,15 @@ async fn registration_loop(
                             core_metrics().metaserver_session_resets.add(1, &[]);
                             heartbeat.node_registered = false;
                         }
-                        insert_failed_at = Some(i);
+                        insert_failed_at = Some((i, chunk_idx * MAX_HASHES_PER_RPC));
                         break 'insert;
                     }
                 }
             }
         }
 
-        if let Some(idx) = insert_failed_at {
-            let dropped: usize = insert_namespaces[idx..].iter().map(|(_, h)| h.len()).sum();
+        if let Some((idx, offset)) = insert_failed_at {
+            let dropped = unsent_after_failure(&insert_namespaces, idx, offset);
             core_metrics()
                 .metaserver_registration_failures
                 .add(dropped as u64, &[]);
@@ -473,10 +473,10 @@ async fn registration_loop(
 
         // Process removes
         let remove_namespaces: Vec<(String, Vec<Vec<u8>>)> = removes.into_iter().collect();
-        let mut remove_failed_at = None;
+        let mut remove_failed_at: Option<(usize, usize)> = None;
 
         'remove: for (i, (namespace, hashes)) in remove_namespaces.iter().enumerate() {
-            for chunk in hashes.chunks(MAX_HASHES_PER_RPC) {
+            for (chunk_idx, chunk) in hashes.chunks(MAX_HASHES_PER_RPC).enumerate() {
                 let count = chunk.len();
                 let request = RemoveBlockHashesRequest {
                     namespace: namespace.clone(),
@@ -506,15 +506,15 @@ async fn registration_loop(
                             core_metrics().metaserver_session_resets.add(1, &[]);
                             heartbeat.node_registered = false;
                         }
-                        remove_failed_at = Some(i);
+                        remove_failed_at = Some((i, chunk_idx * MAX_HASHES_PER_RPC));
                         break 'remove;
                     }
                 }
             }
         }
 
-        if let Some(idx) = remove_failed_at {
-            let dropped: usize = remove_namespaces[idx..].iter().map(|(_, h)| h.len()).sum();
+        if let Some((idx, offset)) = remove_failed_at {
+            let dropped = unsent_after_failure(&remove_namespaces, idx, offset);
             core_metrics()
                 .metaserver_removal_failures
                 .add(dropped as u64, &[]);
@@ -523,6 +523,22 @@ async fn registration_loop(
     }
 
     info!("MetaServer registration loop shutting down");
+}
+
+/// Hashes that did not reach the MetaServer after a chunked send failed at
+/// `failed_offset` within namespace `failed_idx`: the unsent tail of that
+/// namespace (earlier chunks already landed) plus every later namespace.
+fn unsent_after_failure(
+    namespaces: &[(String, Vec<Vec<u8>>)],
+    failed_idx: usize,
+    failed_offset: usize,
+) -> usize {
+    let unsent_in_ns = namespaces[failed_idx].1.len().saturating_sub(failed_offset);
+    let later: usize = namespaces[failed_idx + 1..]
+        .iter()
+        .map(|(_, h)| h.len())
+        .sum();
+    unsent_in_ns + later
 }
 
 fn append_groups(target: &mut HashMap<String, Vec<Vec<u8>>>, groups: Vec<(String, Vec<Vec<u8>>)>) {
@@ -936,6 +952,21 @@ mod tests {
 
         client.shutdown().await;
         let _ = shutdown_tx.send(());
+    }
+
+    #[test]
+    fn unsent_after_failure_counts_only_unsent_tail() {
+        let ns = |name: &str, n: usize| (name.to_string(), vec![vec![0u8]; n]);
+        let namespaces = vec![ns("a", 100), ns("b", 50), ns("c", 30)];
+
+        // First chunk of "b" failed (nothing of b sent yet): all of b + c.
+        assert_eq!(unsent_after_failure(&namespaces, 1, 0), 50 + 30);
+        // 40 hashes of "b" already landed before the failing chunk: b's tail + c.
+        assert_eq!(unsent_after_failure(&namespaces, 1, 40), 10 + 30);
+        // Failure in the last namespace: only its unsent tail, no later namespaces.
+        assert_eq!(unsent_after_failure(&namespaces, 2, 20), 10);
+        // Offset past the namespace length saturates to zero unsent.
+        assert_eq!(unsent_after_failure(&namespaces, 2, 999), 0);
     }
 
     #[tokio::test]
