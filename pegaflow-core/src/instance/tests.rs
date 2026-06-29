@@ -1,5 +1,11 @@
 use super::*;
 use crate::layout::BlockCopies;
+use std::collections::BTreeSet;
+
+/// `["layer_0", "layer_1", ...]` for `build_page_layout` unit tests.
+fn layer_names(n: usize) -> Vec<String> {
+    (0..n).map(|i| format!("layer_{i}")).collect()
+}
 
 // Pure layout validation tests live in `crate::layout::tests`.
 
@@ -94,9 +100,9 @@ fn single_worker_registration_seals_topology() {
     }
 }
 
-/// Page-first folds the layer dimension into one page slot per tp_rank and
-/// lays layers out contiguously in sorted-name (layer-id) order. Commits
-/// device 0.
+/// Page-first full-replica is the single-shard case: one worker holding every
+/// layer folds them into one slot, laid out contiguously in sorted-name
+/// (layer-id) order. Commits device 0.
 #[test]
 fn page_first_collapses_slots_and_lays_out_page() {
     let instance = InstanceContext::new("page-first".into(), "page-ns".into(), 1, 1, true).unwrap();
@@ -115,13 +121,14 @@ fn page_first_collapses_slots_and_lays_out_page() {
     let topology = instance.sealed_topology().expect("sealed");
     assert!(topology.is_page_first());
     assert_eq!(topology.num_layers(), 3);
-    // Layer dimension folds away: one slot per tp_rank (here tp_size == 1).
+    // One worker, one shard: the layer dimension folds into a single slot.
     assert_eq!(topology.total_slots(), 1);
     for layer_id in 0..3 {
         assert_eq!(topology.slot_index(layer_id, 0).unwrap(), 0);
     }
-    // Page = all layers concatenated in sorted-name order (a<b<c).
-    assert_eq!(topology.page_size(), Some(3 * 1024));
+    // Shard 0's page = all layers concatenated in sorted-name order (a<b<c).
+    assert_eq!(topology.shard_page_size(0), Some(3 * 1024));
+    assert_eq!(topology.shard_layer_count(0), Some(3));
     assert_eq!(topology.page_placement(0), Some((0, 1024)));
     assert_eq!(topology.page_placement(1), Some((1024, 1024)));
     assert_eq!(topology.page_placement(2), Some((2048, 1024)));
@@ -130,6 +137,112 @@ fn page_first_collapses_slots_and_lays_out_page() {
     // intent is rejected.
     assert!(instance.verify_topology(1, 1, true).is_ok());
     assert!(instance.verify_topology(1, 1, false).is_err());
+}
+
+/// Full-replica: identical registered sets collapse to one shard whose page is
+/// every layer in id order, with an uneven (per-layer) prefix sum of offsets.
+#[test]
+fn build_page_layout_single_shard_replica() {
+    let sets = vec![BTreeSet::from([0, 1, 2]), BTreeSet::from([0, 1, 2])];
+    let names = layer_names(3);
+    let padded = vec![512, 1024, 2048];
+    let layout = build_page_layout(&sets, &names, &padded).unwrap();
+    assert_eq!(layout.shard_page_sizes, vec![512 + 1024 + 2048]);
+    assert_eq!(layout.layer_shard, vec![0, 0, 0]);
+    assert_eq!(layout.layer_offsets, vec![0, 512, 1536]);
+    assert_eq!(layout.layer_bytes, vec![512, 1024, 2048]);
+}
+
+/// Layer-split: disjoint sets become one shard each, ordered by minimum layer
+/// id. Offsets reset per shard, so a shard whose layers are non-contiguous in
+/// the global id space still packs them tightly. Distinct padded sizes mean a
+/// wrong offset would be caught.
+#[test]
+fn build_page_layout_layer_split_partitions_into_shards() {
+    // Two writers own strided, non-contiguous layer sets {0,2} and {1,3}.
+    let sets = vec![BTreeSet::from([0, 2]), BTreeSet::from([1, 3])];
+    let names = layer_names(4);
+    let padded = vec![512, 1024, 1536, 2048];
+    let layout = build_page_layout(&sets, &names, &padded).unwrap();
+    // Shard 0 = {0,2} (min id 0), shard 1 = {1,3} (min id 1).
+    assert_eq!(layout.layer_shard, vec![0, 1, 0, 1]);
+    // Per-shard pages: shard0 = l0+l2, shard1 = l1+l3.
+    assert_eq!(layout.shard_page_sizes, vec![512 + 1536, 1024 + 2048]);
+    // Each shard's offsets start at 0, in layer-id order within the shard.
+    assert_eq!(layout.layer_offsets, vec![0, 0, 512, 1024]);
+    assert_eq!(layout.layer_bytes, vec![512, 1024, 1536, 2048]);
+}
+
+/// Overlapping registered sets are neither replica (identical) nor clean split
+/// (disjoint): two writers would race one page region. Reject loudly.
+#[test]
+fn build_page_layout_rejects_overlapping_shards() {
+    let sets = vec![BTreeSet::from([0, 1]), BTreeSet::from([1, 2])];
+    let names = layer_names(3);
+    let padded = vec![512, 512, 512];
+    let err = build_page_layout(&sets, &names, &padded).unwrap_err();
+    assert!(err.to_string().contains("claimed by shards"), "{err}");
+}
+
+/// A layer no worker registered is a gap the partition must reject — load
+/// would otherwise read uninitialized page memory.
+#[test]
+fn build_page_layout_rejects_uncovered_layer() {
+    let sets = vec![BTreeSet::from([0]), BTreeSet::from([1])];
+    let names = layer_names(3); // layer_2 owned by nobody
+    let padded = vec![512, 512, 512];
+    let err = build_page_layout(&sets, &names, &padded).unwrap_err();
+    assert!(err.to_string().contains("no shard owner"), "{err}");
+}
+
+/// Layer-split page-first through the real registration path: two workers
+/// register disjoint layer subsets at effective tp_rank 0. The engine seals one
+/// shard per worker, collapsing each rank's layers into a single slot while
+/// every layer still maps to its shard-relative page offset. Needs 2 CUDA
+/// devices.
+#[test]
+fn page_first_layer_split_seals_per_shard_slots() {
+    if !has_cuda_devices(2) {
+        eprintln!("skipping page_first_layer_split_seals_per_shard_slots: needs >= 2 CUDA devices");
+        return;
+    }
+
+    // tp_size stays 1 (MLA collapses TP to effective rank 0); the two workers
+    // are distinguished by their disjoint layer sets, not by tp_rank.
+    let instance =
+        InstanceContext::new("split-page".into(), "split-ns".into(), 1, 2, true).unwrap();
+    instance
+        .register_new_gpu(gpu_registration_with_segment_bytes(
+            0,
+            0,
+            &["layer_a", "layer_c"],
+            1024,
+        ))
+        .expect("rank 0 registers its shard");
+    instance
+        .register_new_gpu(gpu_registration_with_segment_bytes(
+            1,
+            0,
+            &["layer_b"],
+            1024,
+        ))
+        .expect("rank 1 registers its shard, sealing the instance");
+
+    let topology = instance.sealed_topology().expect("sealed");
+    assert!(topology.is_page_first());
+    assert_eq!(topology.num_layers(), 3);
+    // ids by sorted name: a=0, b=1, c=2. Shards by min id: {a,c}=0, {b}=1.
+    assert_eq!(topology.total_slots(), 2);
+    assert_eq!(topology.slot_index(0, 0).unwrap(), 0); // layer_a -> shard 0
+    assert_eq!(topology.slot_index(1, 0).unwrap(), 1); // layer_b -> shard 1
+    assert_eq!(topology.slot_index(2, 0).unwrap(), 0); // layer_c -> shard 0
+    assert_eq!(topology.shard_page_size(0), Some(2 * 1024));
+    assert_eq!(topology.shard_page_size(1), Some(1024));
+    assert_eq!(topology.shard_layer_count(0), Some(2));
+    assert_eq!(topology.shard_layer_count(1), Some(1));
+    assert_eq!(topology.page_placement(0), Some((0, 1024))); // layer_a
+    assert_eq!(topology.page_placement(2), Some((1024, 1024))); // layer_c after a
+    assert_eq!(topology.page_placement(1), Some((0, 1024))); // layer_b in its own shard
 }
 
 /// Until every worker has registered there is no topology: save/load must be

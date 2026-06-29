@@ -144,9 +144,10 @@ fn build_hashed_insert_entries(namespace: String, layers: Vec<RawSaveLayer>) -> 
 
 impl PegaEngine {
     /// Page-first allocation: one contiguous pinned page per block, holding
-    /// every layer at its sealed page offset. Each layer's GPU copy targets a
-    /// sub-view into the pages; the pages themselves are sealed as the single
-    /// stored slot (see Phase 4). Fills `pages` and `gpu_save_layers`.
+    /// this writer's shard layers at their sealed shard-relative offsets. Each
+    /// layer's GPU copy targets a sub-view into the pages; the pages themselves
+    /// are sealed as the shard's stored slot (see Phase 4). Fills `pages` and
+    /// `gpu_save_layers`.
     fn alloc_page_first_targets(
         &self,
         topology: &crate::instance::LayerTopology,
@@ -155,11 +156,14 @@ impl PegaEngine {
         pages: &mut Vec<Arc<PinnedAllocation>>,
         gpu_save_layers: &mut Vec<LayerTransferData>,
     ) -> Result<(), EngineError> {
+        // One writer saves exactly one shard (its registered layers), so every
+        // layer in this batch maps to the same shard/slot.
+        let shard = layer_contexts[0].slot_id;
         let page_size = topology
-            .page_size()
-            .expect("page-first topology must have a page size");
+            .shard_page_size(shard)
+            .expect("page-first topology must have a shard page size");
 
-        // A page holds all layers of one block, so every layer must save the
+        // A page holds all of the shard's layers, so every layer must save the
         // same blocks in the same order. Block hashes are content-derived
         // (identical across layers) and block_idx is the same physical KV slot
         // across layers, so this invariant holds for MLA saves.
@@ -171,6 +175,11 @@ impl PegaEngine {
                     ctx.layer_name
                 )));
             }
+            if ctx.slot_id != shard {
+                return Err(EngineError::InvalidArgument(
+                    "page-first save spans multiple shards (one writer must save one shard)".into(),
+                ));
+            }
             if ctx.blocks_to_save != *reference {
                 return Err(EngineError::InvalidArgument(
                     "page-first save requires the same block set across all layers".into(),
@@ -178,23 +187,24 @@ impl PegaEngine {
             }
         }
 
-        // A page-first block has a single slot, sealed by the first save, so
-        // that one save must carry EVERY layer of the page. A partial save
-        // (e.g. a pipeline stage that holds only some layers) would seal a page
-        // whose foreign-layer offsets are never written — they stay as stale
-        // pool memory and load returns another block's KV. Reject it loudly.
+        // A shard's page is sealed by this single save, so the save must carry
+        // EVERY layer of the shard. A partial save (e.g. a pipeline stage that
+        // holds only some of the shard's layers) would seal a page whose
+        // missing-layer offsets are never written — they stay as stale pool
+        // memory and load returns another block's KV. Reject it loudly.
         let mut layer_ids: Vec<usize> = layer_contexts
             .iter()
             .map(|ctx| topology.layer_id(&ctx.layer_name))
             .collect::<Result<_, _>>()?;
         layer_ids.sort_unstable();
         layer_ids.dedup();
-        if layer_ids.len() != topology.num_layers() {
+        let shard_layers = topology
+            .shard_layer_count(shard)
+            .expect("page-first topology must have a shard layer count");
+        if layer_ids.len() != shard_layers {
             return Err(EngineError::InvalidArgument(format!(
-                "page-first save must cover all {} layers, got {} distinct \
-                 (one worker must write a block's entire page; pipeline \
-                 parallelism is unsupported)",
-                topology.num_layers(),
+                "page-first save must cover all {shard_layers} layers of shard {shard}, \
+                 got {} distinct (one worker must write a shard's entire page)",
                 layer_ids.len()
             )));
         }
@@ -541,11 +551,13 @@ impl PegaEngine {
         );
 
         // Build RawSaveBatch and send to insert worker (fire-and-forget).
-        // Page-first collapses every layer into one page slot per block, so a
-        // whole block is a single RawSaveLayer regardless of num_layers.
+        // Page-first collapses a shard's layers into one page slot per block, so
+        // a whole shard is a single RawSaveLayer regardless of its layer count.
         let raw_layers: Vec<RawSaveLayer> = if page_first {
-            let page_size = topology.page_size().expect("page-first page size");
             let slot_id = layer_contexts[0].slot_id;
+            let page_size = topology
+                .shard_page_size(slot_id)
+                .expect("page-first shard page size");
             let block_hashes: Vec<Vec<u8>> = layer_contexts[0]
                 .blocks_to_save
                 .iter()

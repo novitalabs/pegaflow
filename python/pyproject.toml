@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "pegaflow-llm"
-version = "0.22.10"
+version = "0.23.0"
 description = "High-performance key-value storage engine with Python bindings"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -114,6 +114,6 @@ profile = "black"
 
 [tool.commitizen]
 name = "cz_conventional_commits"
-version = "0.22.10"
+version = "0.23.0"
 version_files = ["pyproject.toml:^version", "../Cargo.toml:^version"]
 tag_format = "v$version"
