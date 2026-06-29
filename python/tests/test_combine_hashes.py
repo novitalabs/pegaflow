@@ -141,10 +141,12 @@ def test_effective_tp_cases(case: str, kwargs: dict, expected_rank: int, expecte
             id="mla_tp1",
         ),
         pytest.param(
-            "mla_layer_split_opts_out",
+            # Layer-split: each rank holds a disjoint layer subset = one shard
+            # and writes its own sub-page, so page-first applies (per-shard).
+            "mla_layer_split_uses_page_first",
             {"is_mla": True, "tp_rank": 0, "tp_size": 2},
             {"mla_layer_split_kv_cache": True},
-            False,
+            True,
             id="layer_split",
         ),
         pytest.param(
@@ -248,6 +250,48 @@ def test_page_first_saves_all_layers_for_this_ranks_block_stripe():
     for _name, ids, hashes in saves_list:
         assert list(ids) == [1, 3]
         assert list(hashes) == [b"h1", b"h3"]
+
+
+def test_page_first_layer_split_saves_own_layers_for_all_blocks():
+    """Layer-split: each rank is the sole writer of its shard (its own layers),
+    so it saves ALL blocks for its registered layers — no block striping."""
+    from pegaflow.connector.worker import SaveTask, WorkerConnector
+
+    ctx = _make_ctx(is_mla=True, tp_rank=1, tp_size=2, device_id=1)
+    worker = WorkerConnector(
+        ctx,
+        vllm_config=SimpleNamespace(additional_config={"mla_layer_split_kv_cache": True}),
+    )
+    assert worker._use_mla_layer_split_registration
+    # This rank's shard is layers {b, d}; the other rank holds the rest.
+    worker._registered_layers = ["b", "d"]
+    worker._page_first = True
+    worker._torch_device = None
+    ctx.engine_client.save.return_value = (True, "")
+
+    meta = PegaConnectorMetadata(
+        save_intents={
+            "r1": SaveIntent(
+                block_ids=(0, 1, 2, 3),
+                block_hashes=(b"h0", b"h1", b"h2", b"h3"),
+            )
+        }
+    )
+    try:
+        with patch("torch.cuda.synchronize"):
+            worker._process_save_batch([SaveTask(metadata=meta, request_ids=["r1"])])
+    finally:
+        worker._registered_layers = []  # skip mock unregister on shutdown
+        worker.shutdown()
+
+    ctx.engine_client.save.assert_called_once()
+    saves_list = ctx.engine_client.save.call_args.args[4]
+    # Only this rank's shard layers...
+    assert {name for name, _ids, _hashes in saves_list} == {"b", "d"}
+    # ...and every block (no striping), hashes kept aligned.
+    for _name, ids, hashes in saves_list:
+        assert list(ids) == [0, 1, 2, 3]
+        assert list(hashes) == [b"h0", b"h1", b"h2", b"h3"]
 
 
 # ---------------------------------------------------------------------------

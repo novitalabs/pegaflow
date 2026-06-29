@@ -704,13 +704,18 @@ class WorkerConnector:
                 if self._cross_layer_mode:
                     target_layers = (self._cross_layer_key,)
                 elif self._page_first:
-                    # Page-first: a block's page holds every layer, so this rank
-                    # writes all layers for its block stripe (not a layer slice).
+                    # Page-first: a block's page holds a whole shard's layers, so
+                    # this rank writes all its registered layers (its shard).
                     assert self._registered_layers, (
                         "KV caches must be registered before submitting save intents"
                     )
                     target_layers = tuple(self._registered_layers)
-                    block_ids, block_hashes = self._block_shard(save_intent)
+                    if not self._use_mla_layer_split_registration:
+                        # Full-replica (one shard): every rank holds all layers,
+                        # so spread the whole-page writes across ranks by block
+                        # stripe. Layer-split ranks are each the sole writer of
+                        # their shard and keep the full block set (no striping).
+                        block_ids, block_hashes = self._block_shard(save_intent)
                 else:
                     assert self._registered_layers, (
                         "KV caches must be registered before submitting save intents"
@@ -807,28 +812,26 @@ class WorkerConnector:
     def _use_page_first(self) -> bool:
         """Whether this instance stores blocks page-first.
 
-        Page-first packs all layers of a block into one contiguous host page
-        (one slot per tp_rank instead of one per layer), cutting per-block
-        metadata by a factor of num_layers. Phase 1 scope: MLA without DCP and
-        without per-rank layer-split registration — the full-replica case where
-        every rank holds all layers and can assemble a complete page for its
-        block stripe. At tp_size == 1 there is no cross-rank striping, but the
-        per-block metadata collapse still applies.
+        Page-first packs each block's layers into contiguous host pages — one
+        slot per *shard* (the set of layers one worker holds) instead of one
+        slot per layer — cutting per-block metadata by ~num_layers / num_shards.
+        Two MLA shapes qualify:
 
-        Pipeline parallelism is excluded: with pp_size > 1 each stage registers
-        only its own layers, but the engine seals one topology spanning the
-        union of all stages' layers, so a page covers layers no single worker
-        holds. Since total_slots collapses to 1, the first save seals the page
-        with only that stage's layers written — the rest stay stale and the
-        other stages' same-hash saves dedup instead of repairing it. Page-first
-        requires that one worker can write a block's entire page.
+        * full-replica (every rank holds all layers): one shard, so a block's
+          whole page is a single slot and ranks block-stripe the writes.
+        * layer-split (each rank holds a disjoint subset): one shard per rank,
+          and each rank writes its own sub-page as a slot.
+
+        Pipeline parallelism is excluded: with pp_size > 1 each stage holds only
+        some layers, but the engine seals one topology spanning the union of all
+        stages, so the layers a single worker holds are not one of the sealed
+        shards. The first save would seal a partial page and the other stages'
+        same-hash saves dedup instead of repairing it. Page-first requires that
+        one worker can write each shard's entire page. DCP is excluded because a
+        DCP rank stores a different token slice of every layer, not a layer
+        partition.
         """
-        return (
-            self._ctx.is_mla
-            and self._ctx.dcp_world_size == 1
-            and self._ctx.pp_size == 1
-            and not self._use_mla_layer_split_registration
-        )
+        return self._ctx.is_mla and self._ctx.dcp_world_size == 1 and self._ctx.pp_size == 1
 
     def _block_shard(self, save_intent) -> tuple[list[int], list[bytes]]:
         """`(block_ids, hashes)` this rank saves under page-first: a block stripe.

@@ -24,7 +24,10 @@
 //! query-lease consumption already count to `world_size` on a single server.
 
 use parking_lot::Mutex;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::Arc,
+};
 
 use cudarc::driver::CudaContext;
 use log::info;
@@ -51,24 +54,97 @@ struct RegistrationState {
 pub(crate) struct LayerTopology {
     name_to_id: HashMap<String, usize>,
     tp_size: usize,
-    /// Page-first layout when `Some`: all layers of a block collapse into one
-    /// contiguous page per tp_rank, so `total_slots = tp_size`. `None` is the
+    /// Page-first layout when `Some`: each block's layers collapse into
+    /// contiguous per-shard pages, so `total_slots = num_shards`. `None` is the
     /// legacy layer-first layout (`total_slots = num_layers * tp_size`).
     page_layout: Option<PageLayout>,
 }
 
-/// Page-first placement: where each layer lives inside one contiguous per-block
-/// page. Built at seal time from the registered per-layer padded block sizes,
-/// in layer-id (sorted-name) order, so save/load and every node agree.
+/// Page-first placement. A *shard* is the set of layers one writer holds; each
+/// shard becomes one storage slot — a contiguous sub-page laid out in layer-id
+/// (sorted-name) order. Full-replica MLA is the single-shard case (every layer
+/// in shard 0); layer-split has one shard per rank. Built at seal time from the
+/// registered partition and per-layer padded block sizes, so save/load and
+/// every node agree on offsets.
 #[derive(Debug)]
 struct PageLayout {
-    /// Byte offset of each layer within the page, indexed by layer_id.
+    /// Shard (storage slot) that owns each layer, indexed by layer_id.
+    layer_shard: Vec<usize>,
+    /// Byte offset of each layer within *its shard's* page, indexed by layer_id.
     layer_offsets: Vec<usize>,
     /// Padded byte size of each layer's block, indexed by layer_id.
     layer_bytes: Vec<usize>,
-    /// Total page size = sum of `layer_bytes` (also each layer's offset is
-    /// SSD-aligned because every `layer_bytes` entry is alignment-padded).
-    page_size: usize,
+    /// Page size of each shard (sum of its layers' padded bytes), indexed by
+    /// shard id. Each layer's padded bytes are SSD-aligned, so every per-shard
+    /// offset (a prefix sum of aligned sizes) stays aligned. `len()` is the
+    /// shard count = page-first `total_slots`.
+    shard_page_sizes: Vec<usize>,
+}
+
+/// Build the page-first shard layout from each worker's registered layer-id
+/// set. A shard is a distinct registered set: identical sets collapse to one
+/// shard (replicas), disjoint sets are separate shards (layer-split). Shards
+/// are ordered by their minimum layer id so the slot assignment is
+/// deterministic and device-id independent — P2P peers that register the same
+/// partition agree on which slot holds which layer. The shards must partition
+/// the layer space exactly (every layer owned by one shard).
+///
+/// Pure (no CUDA), so the slot/offset math is unit-tested directly.
+fn build_page_layout(
+    worker_layer_sets: &[BTreeSet<usize>],
+    names: &[String],
+    padded_bytes: &[usize],
+) -> Result<PageLayout, EngineError> {
+    // Distinct registered sets become shards, ordered by minimum layer id.
+    let mut shards: Vec<BTreeSet<usize>> = Vec::new();
+    for set in worker_layer_sets {
+        if !shards.iter().any(|existing| existing == set) {
+            shards.push(set.clone());
+        }
+    }
+    shards.sort_by_key(|set| set.iter().next().copied().unwrap_or(usize::MAX));
+
+    // The shards must partition the layer space: every layer owned by exactly
+    // one shard. Overlap means two writers race one page region; a gap means a
+    // layer no save covers. Both corrupt loads, so reject loudly.
+    let mut layer_shard = vec![usize::MAX; names.len()];
+    for (shard_id, set) in shards.iter().enumerate() {
+        for &layer_id in set {
+            if layer_shard[layer_id] != usize::MAX {
+                return Err(EngineError::InvalidArgument(format!(
+                    "page-first layer {} claimed by shards {} and {shard_id}: registered \
+                     layer sets must be identical (replica) or disjoint (split)",
+                    names[layer_id], layer_shard[layer_id]
+                )));
+            }
+            layer_shard[layer_id] = shard_id;
+        }
+    }
+    if let Some(layer_id) = layer_shard.iter().position(|&s| s == usize::MAX) {
+        return Err(EngineError::InvalidArgument(format!(
+            "page-first layer {} has no shard owner after sealing",
+            names[layer_id]
+        )));
+    }
+
+    // Lay each shard's layers out contiguously in layer-id (sorted-name) order.
+    let mut layer_offsets = vec![0usize; names.len()];
+    let mut layer_bytes = vec![0usize; names.len()];
+    let mut shard_page_sizes = vec![0usize; shards.len()];
+    for layer_id in 0..names.len() {
+        let shard = layer_shard[layer_id];
+        let padded = padded_bytes[layer_id];
+        layer_offsets[layer_id] = shard_page_sizes[shard];
+        layer_bytes[layer_id] = padded;
+        shard_page_sizes[shard] += padded;
+    }
+
+    Ok(PageLayout {
+        layer_shard,
+        layer_offsets,
+        layer_bytes,
+        shard_page_sizes,
+    })
 }
 
 impl LayerTopology {
@@ -89,21 +165,29 @@ impl LayerTopology {
         self.page_layout.is_some()
     }
 
-    /// Total number of storage slots per block: `tp_size` page-first, else
+    /// Total number of storage slots per block: `num_shards` page-first, else
     /// `num_layers * tp_size` (layer-first).
     pub(crate) fn total_slots(&self) -> usize {
-        match self.page_layout {
-            Some(_) => self.tp_size,
+        match &self.page_layout {
+            Some(p) => p.shard_page_sizes.len(),
             None => self.num_layers() * self.tp_size,
         }
     }
 
-    /// Page-first only: total contiguous page size in bytes (one slot).
-    pub(crate) fn page_size(&self) -> Option<usize> {
-        self.page_layout.as_ref().map(|p| p.page_size)
+    /// Page-first only: contiguous page size in bytes of `shard` (one slot).
+    pub(crate) fn shard_page_size(&self, shard: usize) -> Option<usize> {
+        self.page_layout.as_ref().map(|p| p.shard_page_sizes[shard])
     }
 
-    /// Page-first only: `(byte_offset, padded_bytes)` of `layer_id` within a page.
+    /// Page-first only: number of layers laid out in `shard`'s page.
+    pub(crate) fn shard_layer_count(&self, shard: usize) -> Option<usize> {
+        self.page_layout
+            .as_ref()
+            .map(|p| p.layer_shard.iter().filter(|&&s| s == shard).count())
+    }
+
+    /// Page-first only: `(byte_offset, padded_bytes)` of `layer_id` within its
+    /// shard's page.
     pub(crate) fn page_placement(&self, layer_id: usize) -> Option<(usize, usize)> {
         self.page_layout
             .as_ref()
@@ -112,8 +196,8 @@ impl LayerTopology {
 
     /// Compute the storage slot index for a specific layer and TP rank.
     ///
-    /// Page-first collapses the layer dimension into the page, so the slot is
-    /// just `tp_rank`; the layer's position is its page offset
+    /// Page-first collapses the layer dimension into per-shard pages, so the
+    /// slot is the layer's shard; the layer's position is its page offset
     /// ([`Self::page_placement`]). Layer-first keeps `[layer][tp_rank]`.
     pub(crate) fn slot_index(&self, layer_id: usize, tp_rank: usize) -> Result<usize, EngineError> {
         if layer_id >= self.num_layers() {
@@ -129,8 +213,8 @@ impl LayerTopology {
                 tp_rank, self.tp_size
             )));
         }
-        Ok(match self.page_layout {
-            Some(_) => tp_rank,
+        Ok(match &self.page_layout {
+            Some(p) => p.layer_shard[layer_id],
             None => layer_id * self.tp_size + tp_rank,
         })
     }
@@ -435,24 +519,23 @@ impl InstanceContext {
             )));
         }
 
-        // Page-first: lay layers out contiguously in layer-id order. Each
-        // layer's padded_block_bytes is already SSD-aligned, so every per-layer
-        // offset (a prefix sum of aligned sizes) stays aligned too.
+        // Page-first: group layers into shards (one per distinct registered
+        // layer set) and lay each shard's layers out as a contiguous page. The
+        // partition and offset math lives in `build_page_layout` so it can be
+        // unit-tested without CUDA.
         let page_layout = if self.page_first {
-            let mut layer_offsets = Vec::with_capacity(names.len());
-            let mut layer_bytes = Vec::with_capacity(names.len());
-            let mut offset = 0usize;
-            for name in &names {
-                let padded = geometry_by_name[name.as_str()].2;
-                layer_offsets.push(offset);
-                layer_bytes.push(padded);
-                offset += padded;
-            }
-            Some(PageLayout {
-                layer_offsets,
-                layer_bytes,
-                page_size: offset,
-            })
+            let worker_layer_sets: Vec<BTreeSet<usize>> = gpus()
+                .map(|gpu| gpu.kv_caches.keys().map(|name| name_to_id[name]).collect())
+                .collect();
+            let padded_bytes: Vec<usize> = names
+                .iter()
+                .map(|name| geometry_by_name[name.as_str()].2)
+                .collect();
+            Some(build_page_layout(
+                &worker_layer_sets,
+                &names,
+                &padded_bytes,
+            )?)
         } else {
             None
         };
