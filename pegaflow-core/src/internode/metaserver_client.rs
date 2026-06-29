@@ -1,18 +1,25 @@
 use std::collections::HashMap;
 
 use log::{debug, error, info, warn};
+use pegaflow_common::grpc::{
+    GRPC_CONNECT_TIMEOUT, GRPC_HTTP2_KEEPALIVE_INTERVAL, GRPC_HTTP2_KEEPALIVE_TIMEOUT,
+    GRPC_RPC_TIMEOUT,
+};
+use pegaflow_proto::MAX_GRPC_MESSAGE_SIZE;
 use pegaflow_proto::proto::engine::meta_server_client::MetaServerClient as MetaServerGrpcClient;
 use pegaflow_proto::proto::engine::{
     HeartbeatNodeRequest, InsertBlockHashesRequest, RemoveBlockHashesRequest, UnregisterNodeRequest,
 };
 #[cfg(feature = "rdma")]
 use pegaflow_proto::proto::engine::{NodePrefixResult, QueryPrefixBlocksRequest};
+#[cfg(feature = "rdma")]
+use tokio::sync::Mutex;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, Instant};
-use tonic::Code;
-use tonic::transport::Channel;
 #[cfg(feature = "rdma")]
-use tonic::transport::Endpoint;
+use tonic::Status;
+use tonic::transport::{Channel, Endpoint};
+use tonic::{Code, Request};
 use uuid::Uuid;
 
 use crate::metrics::core_metrics;
@@ -23,8 +30,8 @@ pub const DEFAULT_METASERVER_QUEUE_DEPTH: usize = 4096;
 
 // Cap hashes per insert/remove RPC. The consumer coalesces a whole queue drain
 // per namespace, so without a cap one RPC could reach queue_depth * batch_size
-// hashes and blow past the MetaServer's gRPC decode limit. 32-byte sha256 hashes
-// keep a full chunk near 0.5 MiB, well under tonic's 4 MiB default.
+// hashes. 32-byte sha256 hashes keep a full chunk near 0.5 MiB, so registration
+// bursts stay small even though MetaServer now accepts larger gRPC messages.
 const MAX_HASHES_PER_RPC: usize = 16_384;
 
 /// Error type for MetaServer client operations.
@@ -121,47 +128,94 @@ enum MetaServerCommand {
     Shutdown(oneshot::Sender<()>),
 }
 
+fn metaserver_endpoint(metaserver_addr: String) -> Result<Endpoint, tonic::transport::Error> {
+    Endpoint::from_shared(metaserver_addr).map(|endpoint| {
+        endpoint
+            .connect_timeout(GRPC_CONNECT_TIMEOUT)
+            .timeout(GRPC_RPC_TIMEOUT)
+            .tcp_nodelay(true)
+            .http2_keep_alive_interval(GRPC_HTTP2_KEEPALIVE_INTERVAL)
+            .keep_alive_timeout(GRPC_HTTP2_KEEPALIVE_TIMEOUT)
+            .keep_alive_while_idle(true)
+    })
+}
+
+fn metaserver_grpc_client(channel: Channel) -> MetaServerGrpcClient<Channel> {
+    MetaServerGrpcClient::new(channel)
+        .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
+        .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE)
+}
+
+async fn connect_metaserver_client(
+    endpoint: &Endpoint,
+) -> Result<MetaServerGrpcClient<Channel>, tonic::transport::Error> {
+    endpoint.connect().await.map(metaserver_grpc_client)
+}
+
+fn request_with_timeout<T>(message: T) -> Request<T> {
+    let mut request = Request::new(message);
+    request.set_timeout(GRPC_RPC_TIMEOUT);
+    request
+}
+
+#[cfg(feature = "rdma")]
+fn is_retryable_query_status(status: &Status) -> bool {
+    match status.code() {
+        Code::Unavailable | Code::DeadlineExceeded => true,
+        Code::Cancelled => status.message() == "Timeout expired",
+        Code::Unknown => {
+            let message = status.message();
+            message.starts_with("Service was not ready:")
+                || message.contains("transport error")
+                || message.contains("Connection reset")
+                || message.contains("connection reset")
+        }
+        _ => false,
+    }
+}
+
 /// Unified MetaServer client handling both insert (fire-and-forget) and query (direct RPC).
 pub struct MetaServerClient {
     /// Fire-and-forget command channel for insert/remove operations.
     command_tx: mpsc::Sender<MetaServerCommand>,
-    /// Lazy-connect query client
+    /// Lazy-connect query channel.
     #[cfg(feature = "rdma")]
-    query_client: MetaServerGrpcClient<Channel>,
+    query_endpoint: Endpoint,
+    #[cfg(feature = "rdma")]
+    query_channel: Mutex<Channel>,
 }
 
 impl MetaServerClient {
     /// Create a new client and spawn the background registration loop.
     ///
     /// Must be called from within a tokio runtime context.
-    pub fn new(config: MetaServerClientConfig) -> Self {
+    pub fn new(config: MetaServerClientConfig) -> Result<Self, tonic::transport::Error> {
+        let endpoint = metaserver_endpoint(config.metaserver_addr.clone())?;
         let (command_tx, rx) = mpsc::channel(config.queue_depth);
 
         tokio::spawn(registration_loop(
             rx,
             config.metaserver_addr.clone(),
+            endpoint.clone(),
             config.advertise_addr,
         ));
 
         // Lazy-connect query client: connects on first RPC, not here
         #[cfg(feature = "rdma")]
-        let query_client = {
-            let channel = Endpoint::from_shared(config.metaserver_addr.clone())
-                .expect("valid metaserver_addr URI")
-                .connect_lazy();
-            MetaServerGrpcClient::new(channel)
-        };
+        let query_channel = Mutex::new(endpoint.connect_lazy());
 
         info!(
             "MetaServer client started (queue_depth={}, addr={})",
             config.queue_depth, config.metaserver_addr
         );
 
-        Self {
+        Ok(Self {
             command_tx,
             #[cfg(feature = "rdma")]
-            query_client,
-        }
+            query_endpoint: endpoint,
+            #[cfg(feature = "rdma")]
+            query_channel,
+        })
     }
 
     /// Fire-and-forget registration of block hashes.
@@ -266,33 +320,83 @@ impl MetaServerClient {
         namespace: &str,
         hashes: &[Vec<u8>],
     ) -> Result<Vec<NodePrefixResult>, ClientError> {
-        let request = QueryPrefixBlocksRequest {
+        let make_request = || QueryPrefixBlocksRequest {
             namespace: namespace.to_string(),
             block_hashes: hashes.to_vec(),
         };
 
-        let response = self
-            .query_client
-            .clone()
-            .query_prefix_blocks(request)
-            .await
-            .map_err(|e| ClientError::RpcFailed(format!("MetaServer query failed: {e}")))?;
-
-        let resp = response.into_inner();
+        let response = match self.query_prefix_once(make_request()).await {
+            Ok(response) => response,
+            Err(err) if is_retryable_query_status(&err) => {
+                warn!(
+                    "MetaServer query failed with retryable status, refreshing channel and retrying once: {err}"
+                );
+                self.query_prefix_after_channel_refresh(make_request())
+                    .await
+                    .map_err(|retry_err| {
+                        ClientError::RpcFailed(format!(
+                            "MetaServer query failed after reconnect: {retry_err}"
+                        ))
+                    })?
+            }
+            Err(err) => {
+                return Err(ClientError::RpcFailed(format!(
+                    "MetaServer query failed: {err}"
+                )));
+            }
+        };
 
         debug!(
             "MetaServer query_prefix: namespace={} nodes={}",
             namespace,
-            resp.nodes.len()
+            response.nodes.len()
         );
 
-        Ok(resp.nodes)
+        Ok(response.nodes)
+    }
+
+    #[cfg(feature = "rdma")]
+    async fn query_client(&self) -> MetaServerGrpcClient<Channel> {
+        let channel = self.query_channel.lock().await.clone();
+        metaserver_grpc_client(channel)
+    }
+
+    #[cfg(feature = "rdma")]
+    async fn refresh_query_client(&self) -> MetaServerGrpcClient<Channel> {
+        let channel = self.query_endpoint.connect_lazy();
+        *self.query_channel.lock().await = channel.clone();
+        metaserver_grpc_client(channel)
+    }
+
+    #[cfg(feature = "rdma")]
+    async fn query_prefix_once(
+        &self,
+        request: QueryPrefixBlocksRequest,
+    ) -> Result<pegaflow_proto::proto::engine::QueryPrefixBlocksResponse, Status> {
+        self.query_client()
+            .await
+            .query_prefix_blocks(request_with_timeout(request))
+            .await
+            .map(|response| response.into_inner())
+    }
+
+    #[cfg(feature = "rdma")]
+    async fn query_prefix_after_channel_refresh(
+        &self,
+        request: QueryPrefixBlocksRequest,
+    ) -> Result<pegaflow_proto::proto::engine::QueryPrefixBlocksResponse, Status> {
+        self.refresh_query_client()
+            .await
+            .query_prefix_blocks(request_with_timeout(request))
+            .await
+            .map(|response| response.into_inner())
     }
 }
 
 async fn registration_loop(
     mut rx: mpsc::Receiver<MetaServerCommand>,
     metaserver_addr: String,
+    endpoint: Endpoint,
     advertise_addr: String,
 ) {
     let mut client: Option<MetaServerGrpcClient<Channel>> = None;
@@ -312,6 +416,7 @@ async fn registration_loop(
                     &mut client,
                     &mut heartbeat,
                     &metaserver_addr,
+                    &endpoint,
                     &advertise_addr,
                     &node_id,
                 ).await {
@@ -328,8 +433,14 @@ async fn registration_loop(
         };
 
         if let MetaServerCommand::Shutdown(done) = cmd {
-            unregister_current_session(&mut client, &metaserver_addr, &advertise_addr, &node_id)
-                .await;
+            unregister_current_session(
+                &mut client,
+                &metaserver_addr,
+                &endpoint,
+                &advertise_addr,
+                &node_id,
+            )
+            .await;
             let _ = done.send(());
             break;
         }
@@ -370,6 +481,7 @@ async fn registration_loop(
                     unregister_current_session(
                         &mut client,
                         &metaserver_addr,
+                        &endpoint,
                         &advertise_addr,
                         &node_id,
                     )
@@ -396,6 +508,7 @@ async fn registration_loop(
         if ensure_heartbeat_registered(
             &mut client,
             &metaserver_addr,
+            &endpoint,
             &advertise_addr,
             &node_id,
             &mut heartbeat,
@@ -428,7 +541,7 @@ async fn registration_loop(
                     node_id: node_id.clone(),
                 };
 
-                match c.insert_block_hashes(request).await {
+                match c.insert_block_hashes(request_with_timeout(request)).await {
                     Ok(resp) => {
                         let inner = resp.into_inner();
                         debug!(
@@ -485,7 +598,7 @@ async fn registration_loop(
                     node_id: node_id.clone(),
                 };
 
-                match c.remove_block_hashes(request).await {
+                match c.remove_block_hashes(request_with_timeout(request)).await {
                     Ok(resp) => {
                         let inner = resp.into_inner();
                         debug!(
@@ -582,6 +695,7 @@ fn insert_groups_into_net(
 async fn ensure_heartbeat_registered(
     client: &mut Option<MetaServerGrpcClient<Channel>>,
     metaserver_addr: &str,
+    endpoint: &Endpoint,
     advertise_addr: &str,
     node_id: &str,
     heartbeat: &mut HeartbeatState,
@@ -594,7 +708,16 @@ async fn ensure_heartbeat_registered(
         return Err(());
     }
 
-    match send_heartbeat(client, heartbeat, metaserver_addr, advertise_addr, node_id).await {
+    match send_heartbeat(
+        client,
+        heartbeat,
+        metaserver_addr,
+        endpoint,
+        advertise_addr,
+        node_id,
+    )
+    .await
+    {
         Ok(next_period) => {
             heartbeat.period = next_period;
             heartbeat.next_at = Instant::now() + next_period;
@@ -611,11 +734,12 @@ async fn send_heartbeat(
     client: &mut Option<MetaServerGrpcClient<Channel>>,
     heartbeat: &mut HeartbeatState,
     metaserver_addr: &str,
+    endpoint: &Endpoint,
     advertise_addr: &str,
     node_id: &str,
 ) -> Result<Duration, Duration> {
     if client.is_none() {
-        match MetaServerGrpcClient::connect(metaserver_addr.to_string()).await {
+        match connect_metaserver_client(endpoint).await {
             Ok(c) => {
                 info!("Connected to MetaServer at {}", metaserver_addr);
                 *client = Some(c);
@@ -631,10 +755,10 @@ async fn send_heartbeat(
 
     let c = client.as_mut().expect("client is connected");
     match c
-        .heartbeat_node(HeartbeatNodeRequest {
+        .heartbeat_node(request_with_timeout(HeartbeatNodeRequest {
             node: advertise_addr.to_string(),
             node_id: node_id.to_string(),
-        })
+        }))
         .await
     {
         Ok(resp) => {
@@ -686,14 +810,15 @@ impl HeartbeatState {
 async fn unregister_current_session(
     client: &mut Option<MetaServerGrpcClient<Channel>>,
     metaserver_addr: &str,
+    endpoint: &Endpoint,
     advertise_addr: &str,
     node_id: &str,
 ) {
     if client.is_none() {
-        match MetaServerGrpcClient::connect(metaserver_addr.to_string()).await {
+        match connect_metaserver_client(endpoint).await {
             Ok(c) => *client = Some(c),
             Err(e) => {
-                warn!("Failed to connect to MetaServer for unregister: {e}");
+                warn!("Failed to connect to MetaServer for unregister at {metaserver_addr}: {e}");
                 core_metrics().metaserver_unregister_failures.add(1, &[]);
                 return;
             }
@@ -709,7 +834,7 @@ async fn unregister_current_session(
     };
     match tokio::time::timeout(
         tokio::time::Duration::from_secs(UNREGISTER_TIMEOUT_SECS),
-        c.unregister_node(request),
+        c.unregister_node(request_with_timeout(request)),
     )
     .await
     {
@@ -732,358 +857,4 @@ async fn unregister_current_session(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use pegaflow_proto::proto::engine::meta_server_server::{MetaServer, MetaServerServer};
-    use pegaflow_proto::proto::engine::{
-        HeartbeatNodeResponse, InsertBlockHashesResponse, QueryPrefixBlocksRequest,
-        QueryPrefixBlocksResponse, RemoveBlockHashesResponse, ResponseStatus,
-        UnregisterNodeResponse,
-    };
-    use std::collections::BTreeMap;
-    use std::net::SocketAddr;
-    use std::sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    };
-    use tokio::net::TcpListener;
-    use tokio::sync::{Notify, oneshot};
-    use tokio_stream::wrappers::TcpListenerStream;
-    use tonic::{Request, Response, Status, async_trait};
-
-    type RequestLog = Mutex<Vec<(String, Vec<Vec<u8>>)>>;
-    type RequestSet = BTreeMap<String, Vec<Vec<u8>>>;
-
-    #[derive(Default)]
-    struct FakeMetaServerState {
-        heartbeat_count: AtomicUsize,
-        insert_count: AtomicUsize,
-        remove_count: AtomicUsize,
-        unregister_count: AtomicUsize,
-        fail_insert_with_stale_session: AtomicUsize,
-        insert_requests: RequestLog,
-        remove_requests: RequestLog,
-        heartbeat_notify: Notify,
-        insert_notify: Notify,
-        remove_notify: Notify,
-        unregister_notify: Notify,
-    }
-
-    #[derive(Clone)]
-    struct FakeMetaServer {
-        state: Arc<FakeMetaServerState>,
-    }
-
-    #[async_trait]
-    impl MetaServer for FakeMetaServer {
-        async fn heartbeat_node(
-            &self,
-            _request: Request<HeartbeatNodeRequest>,
-        ) -> Result<Response<HeartbeatNodeResponse>, Status> {
-            self.state.heartbeat_count.fetch_add(1, Ordering::SeqCst);
-            self.state.heartbeat_notify.notify_waiters();
-            Ok(Response::new(HeartbeatNodeResponse {
-                stale_after_secs: 2,
-            }))
-        }
-
-        async fn unregister_node(
-            &self,
-            _request: Request<UnregisterNodeRequest>,
-        ) -> Result<Response<UnregisterNodeResponse>, Status> {
-            self.state.unregister_count.fetch_add(1, Ordering::SeqCst);
-            self.state.unregister_notify.notify_waiters();
-            Ok(Response::new(UnregisterNodeResponse { removed_owners: 0 }))
-        }
-
-        async fn insert_block_hashes(
-            &self,
-            request: Request<InsertBlockHashesRequest>,
-        ) -> Result<Response<InsertBlockHashesResponse>, Status> {
-            let request = request.into_inner();
-            self.state.insert_count.fetch_add(1, Ordering::SeqCst);
-            if self
-                .state
-                .fail_insert_with_stale_session
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                    (remaining > 0).then(|| remaining - 1)
-                })
-                .is_ok()
-            {
-                return Err(Status::failed_precondition("stale node session"));
-            }
-            let inserted_count = request.block_hashes.len() as u64;
-            self.state
-                .insert_requests
-                .lock()
-                .unwrap()
-                .push((request.namespace, request.block_hashes));
-            self.state.insert_notify.notify_waiters();
-            Ok(Response::new(InsertBlockHashesResponse {
-                status: Some(ResponseStatus {
-                    ok: true,
-                    message: String::new(),
-                }),
-                inserted_count,
-            }))
-        }
-
-        async fn remove_block_hashes(
-            &self,
-            request: Request<RemoveBlockHashesRequest>,
-        ) -> Result<Response<RemoveBlockHashesResponse>, Status> {
-            let request = request.into_inner();
-            self.state.remove_count.fetch_add(1, Ordering::SeqCst);
-            let removed_count = request.block_hashes.len() as u64;
-            self.state
-                .remove_requests
-                .lock()
-                .unwrap()
-                .push((request.namespace, request.block_hashes));
-            self.state.remove_notify.notify_waiters();
-            Ok(Response::new(RemoveBlockHashesResponse {
-                status: Some(ResponseStatus {
-                    ok: true,
-                    message: String::new(),
-                }),
-                removed_count,
-            }))
-        }
-
-        async fn query_prefix_blocks(
-            &self,
-            _request: Request<QueryPrefixBlocksRequest>,
-        ) -> Result<Response<QueryPrefixBlocksResponse>, Status> {
-            Ok(Response::new(QueryPrefixBlocksResponse { nodes: vec![] }))
-        }
-    }
-
-    async fn start_fake_metaserver() -> (String, Arc<FakeMetaServerState>, oneshot::Sender<()>) {
-        let state = Arc::new(FakeMetaServerState::default());
-        let service = FakeMetaServer {
-            state: Arc::clone(&state),
-        };
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr: SocketAddr = listener.local_addr().unwrap();
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let incoming = TcpListenerStream::new(listener);
-        tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(MetaServerServer::new(service))
-                .serve_with_incoming_shutdown(incoming, async {
-                    let _ = shutdown_rx.await;
-                })
-                .await
-                .unwrap();
-        });
-        (format!("http://{addr}"), state, shutdown_tx)
-    }
-
-    fn collect_requests(requests: &RequestLog) -> RequestSet {
-        let mut grouped = BTreeMap::new();
-        for (namespace, hashes) in requests.lock().unwrap().iter() {
-            let namespace_hashes: &mut Vec<Vec<u8>> = grouped.entry(namespace.clone()).or_default();
-            namespace_hashes.extend(hashes.iter().cloned());
-        }
-        for hashes in grouped.values_mut() {
-            hashes.sort();
-        }
-        grouped
-    }
-
-    fn expected_requests(entries: &[(&str, Vec<u8>)]) -> RequestSet {
-        let mut grouped: RequestSet = BTreeMap::new();
-        for (namespace, hash) in entries {
-            grouped
-                .entry((*namespace).to_string())
-                .or_default()
-                .push(hash.clone());
-        }
-        for hashes in grouped.values_mut() {
-            hashes.sort();
-        }
-        grouped
-    }
-
-    async fn wait_for_count(notify: &Notify, count: &AtomicUsize, expected: usize) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        loop {
-            if count.load(Ordering::SeqCst) >= expected {
-                return;
-            }
-            tokio::select! {
-                _ = notify.notified() => {}
-                _ = tokio::time::sleep_until(deadline) => {
-                    panic!("timed out waiting for count {expected}");
-                }
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn heartbeat_loop_sends_initial_heartbeat_and_unregisters_on_shutdown() {
-        let (addr, service, shutdown_tx) = start_fake_metaserver().await;
-        let client = MetaServerClient::new(MetaServerClientConfig::new(
-            addr,
-            "node-a:50055".to_string(),
-        ));
-
-        wait_for_count(&service.heartbeat_notify, &service.heartbeat_count, 1).await;
-        client.shutdown().await;
-        wait_for_count(&service.unregister_notify, &service.unregister_count, 1).await;
-
-        let _ = shutdown_tx.send(());
-    }
-
-    #[tokio::test]
-    async fn stale_session_write_error_triggers_new_heartbeat() {
-        let (addr, service, shutdown_tx) = start_fake_metaserver().await;
-        service
-            .fail_insert_with_stale_session
-            .store(1, Ordering::SeqCst);
-        let client = MetaServerClient::new(MetaServerClientConfig::new(
-            addr,
-            "node-a:50055".to_string(),
-        ));
-
-        wait_for_count(&service.heartbeat_notify, &service.heartbeat_count, 1).await;
-        client.try_register_namespace("ns".to_string(), vec![vec![1]]);
-        wait_for_count(&service.heartbeat_notify, &service.heartbeat_count, 2).await;
-
-        client.shutdown().await;
-        let _ = shutdown_tx.send(());
-    }
-
-    #[test]
-    fn unsent_after_failure_counts_only_unsent_tail() {
-        let ns = |name: &str, n: usize| (name.to_string(), vec![vec![0u8]; n]);
-        let namespaces = vec![ns("a", 100), ns("b", 50), ns("c", 30)];
-
-        // First chunk of "b" failed (nothing of b sent yet): all of b + c.
-        assert_eq!(unsent_after_failure(&namespaces, 1, 0), 50 + 30);
-        // 40 hashes of "b" already landed before the failing chunk: b's tail + c.
-        assert_eq!(unsent_after_failure(&namespaces, 1, 40), 10 + 30);
-        // Failure in the last namespace: only its unsent tail, no later namespaces.
-        assert_eq!(unsent_after_failure(&namespaces, 2, 20), 10);
-        // Offset past the namespace length saturates to zero unsent.
-        assert_eq!(unsent_after_failure(&namespaces, 2, 999), 0);
-    }
-
-    #[tokio::test]
-    async fn large_namespace_removal_splits_into_bounded_rpcs() {
-        let (addr, service, shutdown_tx) = start_fake_metaserver().await;
-        let client = MetaServerClient::new(MetaServerClientConfig::new(
-            addr,
-            "node-a:50055".to_string(),
-        ));
-        wait_for_count(&service.heartbeat_notify, &service.heartbeat_count, 1).await;
-
-        // One namespace coalesced past the per-RPC cap. Use sha256-sized (32B)
-        // hashes so the full payload (~5 MiB) exceeds tonic's 4 MiB default
-        // decode limit: without chunking this single RPC would be rejected.
-        // Chunking holds each request to MAX_HASHES_PER_RPC * 32B = 512 KiB.
-        let sha256_hash = |i: u32| {
-            let mut h = vec![0u8; 32];
-            h[..4].copy_from_slice(&i.to_le_bytes());
-            h
-        };
-        let total = MAX_HASHES_PER_RPC * 10 + 1;
-        let expected_chunks = total.div_ceil(MAX_HASHES_PER_RPC);
-        let entries: Vec<(String, Vec<u8>)> = (0..total as u32)
-            .map(|i| ("ns".to_string(), sha256_hash(i)))
-            .collect();
-        client.try_unregister(entries);
-
-        wait_for_count(
-            &service.remove_notify,
-            &service.remove_count,
-            expected_chunks,
-        )
-        .await;
-
-        let logged = service.remove_requests.lock().unwrap().clone();
-        assert_eq!(
-            logged.len(),
-            expected_chunks,
-            "removal split into wrong RPC count"
-        );
-        let mut sent: Vec<Vec<u8>> = Vec::with_capacity(total);
-        for (namespace, hashes) in &logged {
-            assert_eq!(namespace, "ns");
-            assert!(
-                hashes.len() <= MAX_HASHES_PER_RPC,
-                "chunk of {} hashes exceeds cap {MAX_HASHES_PER_RPC}",
-                hashes.len()
-            );
-            sent.extend(hashes.iter().cloned());
-        }
-        sent.sort();
-        let mut expected: Vec<Vec<u8>> = (0..total as u32).map(sha256_hash).collect();
-        expected.sort();
-        assert_eq!(sent, expected, "chunking lost or duplicated hashes");
-
-        client.shutdown().await;
-        let _ = shutdown_tx.send(());
-    }
-
-    #[tokio::test]
-    async fn mixed_insert_remove_drain_preserves_last_write_per_namespace() {
-        let (addr, service, shutdown_tx) = start_fake_metaserver().await;
-        let (tx, rx) = mpsc::channel(16);
-
-        let insert_then_remove = vec![0xa0];
-        let remove_then_insert = vec![0xb0];
-        let remove_only = vec![0xc0];
-        let insert_only = vec![0xd0];
-
-        tx.try_send(MetaServerCommand::Insert(BlockHashBatch::single_namespace(
-            "ns-first".to_string(),
-            vec![insert_then_remove.clone()],
-        )))
-        .unwrap();
-        tx.try_send(MetaServerCommand::Remove(BlockHashBatch::from_entries(
-            vec![("ns-first".to_string(), insert_then_remove.clone())],
-        )))
-        .unwrap();
-        tx.try_send(MetaServerCommand::Remove(BlockHashBatch::from_entries(
-            vec![
-                ("ns-second".to_string(), remove_then_insert.clone()),
-                ("ns-remove".to_string(), remove_only.clone()),
-            ],
-        )))
-        .unwrap();
-        tx.try_send(MetaServerCommand::Insert(BlockHashBatch::single_namespace(
-            "ns-second".to_string(),
-            vec![remove_then_insert.clone()],
-        )))
-        .unwrap();
-        tx.try_send(MetaServerCommand::Insert(BlockHashBatch::single_namespace(
-            "ns-insert".to_string(),
-            vec![insert_only.clone()],
-        )))
-        .unwrap();
-
-        let loop_task = tokio::spawn(registration_loop(rx, addr, "node-a:50055".to_string()));
-
-        wait_for_count(&service.insert_notify, &service.insert_count, 2).await;
-        wait_for_count(&service.remove_notify, &service.remove_count, 2).await;
-
-        assert_eq!(
-            collect_requests(&service.insert_requests),
-            expected_requests(&[
-                ("ns-second", remove_then_insert),
-                ("ns-insert", insert_only),
-            ])
-        );
-        assert_eq!(
-            collect_requests(&service.remove_requests),
-            expected_requests(&[("ns-first", insert_then_remove), ("ns-remove", remove_only)])
-        );
-
-        let (done_tx, done_rx) = oneshot::channel();
-        tx.send(MetaServerCommand::Shutdown(done_tx)).await.unwrap();
-        done_rx.await.unwrap();
-        loop_task.await.unwrap();
-        let _ = shutdown_tx.send(());
-    }
-}
+mod tests;

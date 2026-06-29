@@ -32,6 +32,7 @@ axum.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+tokio-stream = { workspace = true, features = ["net"] }
 
 [[bench]]
 name = "unregister_node"

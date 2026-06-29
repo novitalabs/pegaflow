@@ -1,4 +1,6 @@
+use pegaflow_common::grpc::{GRPC_CONNECT_TIMEOUT, GRPC_HTTP2_KEEPALIVE_INTERVAL};
 use pegaflow_core::LoadState;
+use pegaflow_proto::MAX_GRPC_MESSAGE_SIZE;
 use pegaflow_proto::proto::engine::{
     HealthRequest, LeaseLoad, LoadRequest, QueryRequest, RegisterContextRequest, ReleaseRequest,
     ResponseStatus, SaveLayer, SaveRequest, SessionEvent, SessionRequest, ShutdownRequest,
@@ -12,7 +14,6 @@ use pyo3::{
 use std::{
     future::Future,
     sync::{Arc, Mutex, OnceLock},
-    time::Duration,
 };
 use tokio::runtime::{Handle, Runtime};
 use tonic::{
@@ -201,16 +202,14 @@ impl EngineRpcClient {
         // Avoid per-RPC overhead by eager-connecting and reusing a warmed client handle.
         let endpoint_cfg = Endpoint::from_shared(endpoint.clone())
             .map_err(|err| transport_connect_error(&endpoint, err))?
-            .connect_timeout(Duration::from_millis(500))
+            .connect_timeout(GRPC_CONNECT_TIMEOUT)
             .tcp_nodelay(true)
-            .http2_keep_alive_interval(Duration::from_secs(30))
+            .http2_keep_alive_interval(GRPC_HTTP2_KEEPALIVE_INTERVAL)
             .keep_alive_while_idle(true);
 
         let channel = rt
             .block_on(endpoint_cfg.connect())
             .map_err(|err| transport_connect_error(&endpoint, err))?;
-        // Match server's 64 MiB limit to avoid Status::resource_exhausted on large payloads
-        const MAX_GRPC_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
         let client = EngineClient::new(channel)
             .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
             .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE);

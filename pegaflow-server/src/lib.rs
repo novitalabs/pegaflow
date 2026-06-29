@@ -24,6 +24,7 @@ use opentelemetry::global;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use pegaflow_core::PegaEngine;
+use pegaflow_proto::MAX_GRPC_MESSAGE_SIZE;
 use prometheus::Registry;
 use proto::engine::engine_server::EngineServer;
 use pyo3::{PyErr, Python, types::PyAnyMethods};
@@ -671,8 +672,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         };
 
         info!("PegaEngine gRPC server listening on {}", cli.addr);
-
-        const MAX_GRPC_MESSAGE_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
 
         let grpc_service = EngineServer::new(service)
             .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)

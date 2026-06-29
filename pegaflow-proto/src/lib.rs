@@ -7,3 +7,5 @@ pub mod proto {
         tonic::include_proto!("pegaflow");
     }
 }
+
+pub const MAX_GRPC_MESSAGE_SIZE: usize = 64 * 1024 * 1024;

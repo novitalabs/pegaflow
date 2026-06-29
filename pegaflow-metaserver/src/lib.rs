@@ -11,6 +11,8 @@ use clap::Parser;
 use log::{error, info};
 use opentelemetry::global;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
+use pegaflow_common::grpc::{GRPC_HTTP2_KEEPALIVE_INTERVAL, GRPC_HTTP2_KEEPALIVE_TIMEOUT};
+use pegaflow_proto::MAX_GRPC_MESSAGE_SIZE;
 use pegaflow_proto::proto::engine::meta_server_server::MetaServerServer;
 use prometheus::Registry;
 use std::error::Error;
@@ -65,6 +67,12 @@ fn init_metrics() -> Result<(SdkMeterProvider, Registry), Box<dyn Error>> {
     info!("Prometheus metrics exporter enabled");
 
     Ok((meter_provider, registry))
+}
+
+pub fn grpc_meta_server(service: GrpcMetaService) -> MetaServerServer<GrpcMetaService> {
+    MetaServerServer::new(service)
+        .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
+        .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE)
 }
 
 /// Wait for OS termination signal (Ctrl+C or SIGTERM), then notify dependents.
@@ -181,7 +189,9 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
 
     // Start the gRPC server
     let server_future = Server::builder()
-        .add_service(MetaServerServer::new(service))
+        .http2_keepalive_interval(Some(GRPC_HTTP2_KEEPALIVE_INTERVAL))
+        .http2_keepalive_timeout(Some(GRPC_HTTP2_KEEPALIVE_TIMEOUT))
+        .add_service(grpc_meta_server(service))
         .serve_with_shutdown(cli.addr, shutdown_signal(shutdown.clone()));
 
     if let Err(e) = server_future.await {
@@ -196,4 +206,74 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
 
     info!("MetaServer shut down gracefully");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pegaflow_proto::proto::engine::meta_server_client::MetaServerClient;
+    use pegaflow_proto::proto::engine::{HeartbeatNodeRequest, InsertBlockHashesRequest};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::transport::{Channel, Server};
+
+    async fn start_grpc_metaserver() -> (MetaServerClient<Channel>, oneshot::Sender<()>) {
+        let store = Arc::new(BlockHashStore::new());
+        let service = GrpcMetaService::new(store);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let incoming = TcpListenerStream::new(listener);
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(grpc_meta_server(service))
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        let channel = Channel::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let client = MetaServerClient::new(channel)
+            .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
+            .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE);
+        (client, shutdown_tx)
+    }
+
+    #[tokio::test]
+    async fn grpc_meta_server_accepts_insert_payload_above_tonic_default() {
+        let (mut client, shutdown_tx) = start_grpc_metaserver().await;
+        let node_id = uuid::Uuid::new_v4().to_string();
+        client
+            .heartbeat_node(HeartbeatNodeRequest {
+                node: "node-a:50055".to_string(),
+                node_id: node_id.clone(),
+            })
+            .await
+            .unwrap();
+
+        let one_mib = 1024 * 1024;
+        let block_hashes: Vec<Vec<u8>> = (0..5).map(|i| vec![i as u8; one_mib]).collect();
+        let response = client
+            .insert_block_hashes(InsertBlockHashesRequest {
+                namespace: "ns".to_string(),
+                block_hashes,
+                node: "node-a:50055".to_string(),
+                node_id,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.inserted_count, 5);
+        assert!(response.status.unwrap().ok);
+
+        let _ = shutdown_tx.send(());
+    }
 }

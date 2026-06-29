@@ -1953,6 +1953,7 @@ dependencies = [
  "pegaflow-proto",
  "prometheus",
  "tokio",
+ "tokio-stream",
  "tonic",
  "uuid",
 ]

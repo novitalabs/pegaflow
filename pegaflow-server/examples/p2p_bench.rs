@@ -41,8 +41,7 @@ use cudarc::driver::{CudaContext, sys};
 use log::info;
 use pegaflow_core::sync_state::{LOAD_STATE_ERROR, LOAD_STATE_SUCCESS};
 use pegaflow_core::*;
-use pegaflow_metaserver::{BlockHashStore, GrpcMetaService};
-use pegaflow_proto::proto::engine::meta_server_server::MetaServerServer;
+use pegaflow_metaserver::{BlockHashStore, GrpcMetaService, grpc_meta_server};
 use pegaflow_server::proto::engine::engine_server::EngineServer;
 use pegaflow_server::{CudaTensorRegistry, GrpcEngineService, RegistryHandle};
 use tokio::sync::Notify;
@@ -482,7 +481,7 @@ async fn run_holder(cli: &Cli, shape: &Shape, pool_bytes: usize) {
     let meta_service = GrpcMetaService::new(Arc::clone(&meta_store));
     tokio::spawn(async move {
         Server::builder()
-            .add_service(MetaServerServer::new(meta_service))
+            .add_service(grpc_meta_server(meta_service))
             .serve(meta_addr)
             .await
             .expect("MetaServer gRPC serve");

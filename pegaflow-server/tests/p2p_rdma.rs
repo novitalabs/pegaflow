@@ -15,8 +15,7 @@ use cudarc::driver::CudaContext;
 use cudarc::driver::sys;
 use pegaflow_core::sync_state::{LOAD_STATE_ERROR, LOAD_STATE_SUCCESS};
 use pegaflow_core::*;
-use pegaflow_metaserver::{BlockHashStore, GrpcMetaService};
-use pegaflow_proto::proto::engine::meta_server_server::MetaServerServer;
+use pegaflow_metaserver::{BlockHashStore, GrpcMetaService, grpc_meta_server};
 use pegaflow_server::proto::engine::engine_server::EngineServer;
 use pegaflow_server::{CudaTensorRegistry, GrpcEngineService, RegistryHandle};
 use tokio::sync::Notify;
@@ -142,7 +141,7 @@ async fn spawn_metaserver(port: u16) -> Arc<BlockHashStore> {
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
     tokio::spawn(async move {
         Server::builder()
-            .add_service(MetaServerServer::new(service))
+            .add_service(grpc_meta_server(service))
             .serve(addr)
             .await
             .expect("MetaServer gRPC serve");

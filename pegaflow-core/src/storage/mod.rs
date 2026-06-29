@@ -124,7 +124,7 @@ impl StorageEngine {
         let transfer_lock_timeout = config.transfer_lock_timeout;
 
         // Create MetaServer client if configured
-        let metaserver_client = config.metaserver_addr.as_ref().map(|addr| {
+        let metaserver_client = if let Some(addr) = config.metaserver_addr.as_ref() {
             let advertise = config
                 .advertise_addr
                 .clone()
@@ -135,8 +135,12 @@ impl StorageEngine {
             );
             let ms_config = MetaServerClientConfig::new(addr.clone(), advertise)
                 .with_queue_depth(config.metaserver_queue_depth);
-            Arc::new(MetaServerClient::new(ms_config))
-        });
+            Some(Arc::new(MetaServerClient::new(ms_config).map_err(
+                |err| format!("invalid MetaServer endpoint {addr}: {err}"),
+            )?))
+        } else {
+            None
+        };
 
         if blockwise_alloc {
             info!("Blockwise allocation enabled for batch_save");
