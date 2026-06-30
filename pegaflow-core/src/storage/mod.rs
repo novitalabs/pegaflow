@@ -7,7 +7,7 @@ mod write_path;
 use bytesize::ByteSize;
 #[cfg(not(feature = "rdma"))]
 use log::warn;
-use log::{debug, info};
+use log::{debug, info, warn};
 use std::collections::HashSet;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Weak};
@@ -542,7 +542,10 @@ impl StorageEngine {
             .prefetch
             .gc_stale_entries(inflight_max_age, failed_remote_max_age);
         if stale_prefetch > 0 {
-            log::debug!("gc: removed {stale_prefetch} stale prefetch entries");
+            core_metrics()
+                .prefetch_stale_gc_total
+                .add(stale_prefetch as u64, &[]);
+            warn!("Prefetch GC: removed {stale_prefetch} stale active entries (age > threshold)");
         }
         if failed > 0 {
             log::debug!("gc: cleared {failed} stale failed_remote entries");

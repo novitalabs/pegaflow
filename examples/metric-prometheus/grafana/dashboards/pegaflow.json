@@ -870,9 +870,14 @@
           "expr": "rate(pegaflow_inflight_gc_cleaned_total[1m])",
           "legendFormat": "inflight gc cleaned/sec",
           "refId": "A"
+        },
+        {
+          "expr": "rate(pegaflow_prefetch_stale_gc_total[1m])",
+          "legendFormat": "prefetch stale gc/sec",
+          "refId": "B"
         }
       ],
-      "title": "Inflight GC Cleaned Rate",
+      "title": "Background GC Rates",
       "type": "timeseries"
     }
   ],
