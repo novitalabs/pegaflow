@@ -23,6 +23,9 @@ use log::{error, info, warn};
 use opentelemetry::global;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
+use pegaflow_common::grpc::{
+    GRPC_SERVER_HTTP2_KEEPALIVE_INTERVAL, GRPC_SERVER_HTTP2_KEEPALIVE_TIMEOUT,
+};
 use pegaflow_core::PegaEngine;
 use prometheus::Registry;
 use proto::engine::engine_server::EngineServer;
@@ -679,6 +682,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE);
 
         if let Err(err) = Server::builder()
+            .http2_keepalive_interval(Some(GRPC_SERVER_HTTP2_KEEPALIVE_INTERVAL))
+            .http2_keepalive_timeout(Some(GRPC_SERVER_HTTP2_KEEPALIVE_TIMEOUT))
             .add_service(grpc_service)
             .serve_with_shutdown(cli.addr, shutdown_signal)
             .await

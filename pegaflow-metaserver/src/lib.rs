@@ -11,6 +11,9 @@ use clap::Parser;
 use log::{error, info};
 use opentelemetry::global;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
+use pegaflow_common::grpc::{
+    GRPC_SERVER_HTTP2_KEEPALIVE_INTERVAL, GRPC_SERVER_HTTP2_KEEPALIVE_TIMEOUT,
+};
 use pegaflow_proto::proto::engine::meta_server_server::MetaServerServer;
 use prometheus::Registry;
 use std::error::Error;
@@ -181,6 +184,8 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
 
     // Start the gRPC server
     let server_future = Server::builder()
+        .http2_keepalive_interval(Some(GRPC_SERVER_HTTP2_KEEPALIVE_INTERVAL))
+        .http2_keepalive_timeout(Some(GRPC_SERVER_HTTP2_KEEPALIVE_TIMEOUT))
         .add_service(MetaServerServer::new(service))
         .serve_with_shutdown(cli.addr, shutdown_signal(shutdown.clone()));
 
