@@ -84,6 +84,10 @@ class PrefetchTracker:
         self._prefetch_durations.append(duration_ms)
         self._prefetch_blocks.append(hit_blocks)
 
+    def on_prefetch_cancel(self) -> None:
+        """Called when prefetch polling stops before QueryReady (e.g. request finish)."""
+        self._pending_prefetches = max(0, self._pending_prefetches - 1)
+
     @property
     def pending_prefetches(self) -> int:
         """Current number of requests waiting for prefetch."""
