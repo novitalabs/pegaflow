@@ -539,6 +539,22 @@ class SchedulerConnector:
 
         return result
 
+    def _cancel_prefetch_tracking(self, req_id: str) -> None:
+        """Drop in-flight prefetch metrics when polling stops before QueryReady."""
+        if req_id not in self._prefetch_start_times:
+            return
+
+        started_at = self._prefetch_start_times.pop(req_id)
+        self._prefetch_tracker.on_prefetch_cancel()
+        waited_ms = (time.perf_counter() - started_at) * 1000
+        logger.warning(
+            "[PegaKVConnector] Prefetch aborted before ready: req=%s waited_ms=%.2f "
+            "pending_prefetches=%d",
+            req_id,
+            waited_ms,
+            self._prefetch_tracker.pending_prefetches,
+        )
+
     def get_stats(self) -> PegaKVConnectorStats | None:
         """Get current connector stats for metrics exposure."""
         # Get stats from prefetch tracker
@@ -568,6 +584,7 @@ class SchedulerConnector:
 
     def _release_query_probe(self, req_id: str, probe: _QueryProbe) -> bool:
         if not probe.lease:
+            self._cancel_prefetch_tracking(req_id)
             return True  # nothing leased server-side (still loading, or zero-hit Ready)
         try:
             self._ctx.engine_client.release(probe.lease)

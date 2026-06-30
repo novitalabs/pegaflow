@@ -575,6 +575,20 @@ class TestSchedulerQueryProbeReuse:
 
         assert sc._count_available_block_prefix([_hash(i) for i in range(4)], "r1") is None
 
+    def test_prefetch_loading_cancelled_on_request_cleanup(self):
+        sc, engine_client = self._make_connector()
+        engine_client.query_prefetch.return_value = QueryLoading()
+        req = _make_fake_request("r1", [_hash(i) for i in range(4)])
+
+        assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (None, False)
+        assert sc._prefetch_tracker.pending_prefetches == 1
+
+        sc._cleanup_request("r1")
+
+        assert sc._prefetch_tracker.pending_prefetches == 0
+        assert "r1" not in sc._prefetch_start_times
+        assert "r1" not in sc._pending_query_probes
+
     def test_save_only_mode_skips_query(self):
         engine_client = MagicMock()
         sc = SchedulerConnector(
