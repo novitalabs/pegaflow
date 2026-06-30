@@ -454,7 +454,7 @@ fn process_load_task(
             .record(elapsed.as_secs_f64(), &[]);
     }
 
-    info!(
+    debug!(
         "Load task completed: layers={} blocks={} copies={} bytes={} elapsed_ms={:.2} bandwidth_gbps={:.2} backend={}",
         layers.len(),
         total_blocks,

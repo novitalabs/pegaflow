@@ -138,6 +138,7 @@ P2P-related Prometheus metrics (on `:9091/metrics` by default):
 | `pegaflow_rdma_qps` | Gauge | Active RDMA queue pairs |
 | `pegaflow_transfer_lock_active` | UpDownCounter | Currently held transfer locks |
 | `pegaflow_transfer_lock_timeouts_total` | Counter | Transfer lock timeout events |
+| `pegaflow_prefetch_stale_gc_total` | Counter | Stale prefetch active entries removed by background GC |
 
 ## Troubleshooting
 
