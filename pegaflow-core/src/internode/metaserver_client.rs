@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use log::{debug, error, info, warn};
+use pegaflow_common::grpc::{GRPC_CLIENT_HTTP2_KEEPALIVE_INTERVAL, GRPC_CONNECT_TIMEOUT};
 use pegaflow_proto::proto::engine::meta_server_client::MetaServerClient as MetaServerGrpcClient;
 use pegaflow_proto::proto::engine::{
     HeartbeatNodeRequest, InsertBlockHashesRequest, RemoveBlockHashesRequest, UnregisterNodeRequest,
@@ -10,9 +11,7 @@ use pegaflow_proto::proto::engine::{NodePrefixResult, QueryPrefixBlocksRequest};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, Instant};
 use tonic::Code;
-use tonic::transport::Channel;
-#[cfg(feature = "rdma")]
-use tonic::transport::Endpoint;
+use tonic::transport::{Channel, Endpoint};
 use uuid::Uuid;
 
 use crate::metrics::core_metrics;
@@ -121,6 +120,21 @@ enum MetaServerCommand {
     Shutdown(oneshot::Sender<()>),
 }
 
+fn metaserver_endpoint(metaserver_addr: String) -> Endpoint {
+    // keep_alive_timeout is 20s by default on both client and server side (tonic).
+    Endpoint::from_shared(metaserver_addr)
+        .expect("valid metaserver_addr URI")
+        .connect_timeout(GRPC_CONNECT_TIMEOUT)
+        .http2_keep_alive_interval(GRPC_CLIENT_HTTP2_KEEPALIVE_INTERVAL)
+        .keep_alive_while_idle(true)
+}
+
+async fn connect_metaserver_client(
+    endpoint: &Endpoint,
+) -> Result<MetaServerGrpcClient<Channel>, tonic::transport::Error> {
+    endpoint.connect().await.map(MetaServerGrpcClient::new)
+}
+
 /// Unified MetaServer client handling both insert (fire-and-forget) and query (direct RPC).
 pub struct MetaServerClient {
     /// Fire-and-forget command channel for insert/remove operations.
@@ -135,20 +149,20 @@ impl MetaServerClient {
     ///
     /// Must be called from within a tokio runtime context.
     pub fn new(config: MetaServerClientConfig) -> Self {
+        let endpoint = metaserver_endpoint(config.metaserver_addr.clone());
         let (command_tx, rx) = mpsc::channel(config.queue_depth);
 
         tokio::spawn(registration_loop(
             rx,
             config.metaserver_addr.clone(),
+            endpoint.clone(),
             config.advertise_addr,
         ));
 
         // Lazy-connect query client: connects on first RPC, not here
         #[cfg(feature = "rdma")]
         let query_client = {
-            let channel = Endpoint::from_shared(config.metaserver_addr.clone())
-                .expect("valid metaserver_addr URI")
-                .connect_lazy();
+            let channel = endpoint.connect_lazy();
             MetaServerGrpcClient::new(channel)
         };
 
@@ -293,6 +307,7 @@ impl MetaServerClient {
 async fn registration_loop(
     mut rx: mpsc::Receiver<MetaServerCommand>,
     metaserver_addr: String,
+    endpoint: Endpoint,
     advertise_addr: String,
 ) {
     let mut client: Option<MetaServerGrpcClient<Channel>> = None;
@@ -312,6 +327,7 @@ async fn registration_loop(
                     &mut client,
                     &mut heartbeat,
                     &metaserver_addr,
+                    &endpoint,
                     &advertise_addr,
                     &node_id,
                 ).await {
@@ -328,8 +344,14 @@ async fn registration_loop(
         };
 
         if let MetaServerCommand::Shutdown(done) = cmd {
-            unregister_current_session(&mut client, &metaserver_addr, &advertise_addr, &node_id)
-                .await;
+            unregister_current_session(
+                &mut client,
+                &metaserver_addr,
+                &endpoint,
+                &advertise_addr,
+                &node_id,
+            )
+            .await;
             let _ = done.send(());
             break;
         }
@@ -370,6 +392,7 @@ async fn registration_loop(
                     unregister_current_session(
                         &mut client,
                         &metaserver_addr,
+                        &endpoint,
                         &advertise_addr,
                         &node_id,
                     )
@@ -396,6 +419,7 @@ async fn registration_loop(
         if ensure_heartbeat_registered(
             &mut client,
             &metaserver_addr,
+            &endpoint,
             &advertise_addr,
             &node_id,
             &mut heartbeat,
@@ -582,6 +606,7 @@ fn insert_groups_into_net(
 async fn ensure_heartbeat_registered(
     client: &mut Option<MetaServerGrpcClient<Channel>>,
     metaserver_addr: &str,
+    endpoint: &Endpoint,
     advertise_addr: &str,
     node_id: &str,
     heartbeat: &mut HeartbeatState,
@@ -594,7 +619,16 @@ async fn ensure_heartbeat_registered(
         return Err(());
     }
 
-    match send_heartbeat(client, heartbeat, metaserver_addr, advertise_addr, node_id).await {
+    match send_heartbeat(
+        client,
+        heartbeat,
+        metaserver_addr,
+        endpoint,
+        advertise_addr,
+        node_id,
+    )
+    .await
+    {
         Ok(next_period) => {
             heartbeat.period = next_period;
             heartbeat.next_at = Instant::now() + next_period;
@@ -611,11 +645,12 @@ async fn send_heartbeat(
     client: &mut Option<MetaServerGrpcClient<Channel>>,
     heartbeat: &mut HeartbeatState,
     metaserver_addr: &str,
+    endpoint: &Endpoint,
     advertise_addr: &str,
     node_id: &str,
 ) -> Result<Duration, Duration> {
     if client.is_none() {
-        match MetaServerGrpcClient::connect(metaserver_addr.to_string()).await {
+        match connect_metaserver_client(endpoint).await {
             Ok(c) => {
                 info!("Connected to MetaServer at {}", metaserver_addr);
                 *client = Some(c);
@@ -686,14 +721,15 @@ impl HeartbeatState {
 async fn unregister_current_session(
     client: &mut Option<MetaServerGrpcClient<Channel>>,
     metaserver_addr: &str,
+    endpoint: &Endpoint,
     advertise_addr: &str,
     node_id: &str,
 ) {
     if client.is_none() {
-        match MetaServerGrpcClient::connect(metaserver_addr.to_string()).await {
+        match connect_metaserver_client(endpoint).await {
             Ok(c) => *client = Some(c),
             Err(e) => {
-                warn!("Failed to connect to MetaServer for unregister: {e}");
+                warn!("Failed to connect to MetaServer for unregister at {metaserver_addr}: {e}");
                 core_metrics().metaserver_unregister_failures.add(1, &[]);
                 return;
             }
@@ -1063,7 +1099,13 @@ mod tests {
         )))
         .unwrap();
 
-        let loop_task = tokio::spawn(registration_loop(rx, addr, "node-a:50055".to_string()));
+        let endpoint = metaserver_endpoint(addr.clone());
+        let loop_task = tokio::spawn(registration_loop(
+            rx,
+            addr,
+            endpoint,
+            "node-a:50055".to_string(),
+        ));
 
         wait_for_count(&service.insert_notify, &service.insert_count, 2).await;
         wait_for_count(&service.remove_notify, &service.remove_count, 2).await;

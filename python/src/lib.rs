@@ -1,3 +1,4 @@
+use pegaflow_common::grpc::{GRPC_CLIENT_HTTP2_KEEPALIVE_INTERVAL, GRPC_CONNECT_TIMEOUT};
 use pegaflow_core::LoadState;
 use pegaflow_proto::proto::engine::{
     HealthRequest, LeaseLoad, LoadRequest, QueryRequest, RegisterContextRequest, ReleaseRequest,
@@ -12,7 +13,6 @@ use pyo3::{
 use std::{
     future::Future,
     sync::{Arc, Mutex, OnceLock},
-    time::Duration,
 };
 use tokio::runtime::{Handle, Runtime};
 use tonic::{
@@ -201,9 +201,9 @@ impl EngineRpcClient {
         // Avoid per-RPC overhead by eager-connecting and reusing a warmed client handle.
         let endpoint_cfg = Endpoint::from_shared(endpoint.clone())
             .map_err(|err| transport_connect_error(&endpoint, err))?
-            .connect_timeout(Duration::from_millis(500))
+            .connect_timeout(GRPC_CONNECT_TIMEOUT)
             .tcp_nodelay(true)
-            .http2_keep_alive_interval(Duration::from_secs(30))
+            .http2_keep_alive_interval(GRPC_CLIENT_HTTP2_KEEPALIVE_INTERVAL)
             .keep_alive_while_idle(true);
 
         let channel = rt

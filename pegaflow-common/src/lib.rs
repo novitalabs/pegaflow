@@ -1,4 +1,5 @@
 pub mod block;
+pub mod grpc;
 pub mod hll;
 pub mod logging;
 #[cfg(target_os = "linux")]
