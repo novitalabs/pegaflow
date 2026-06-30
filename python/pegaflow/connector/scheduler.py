@@ -541,10 +541,10 @@ class SchedulerConnector:
 
     def _cancel_prefetch_tracking(self, req_id: str) -> None:
         """Drop in-flight prefetch metrics when polling stops before QueryReady."""
-        started_at = self._prefetch_start_times.pop(req_id, None)
-        if started_at is None:
+        if req_id not in self._prefetch_start_times:
             return
 
+        started_at = self._prefetch_start_times.pop(req_id)
         self._prefetch_tracker.on_prefetch_cancel()
         waited_ms = (time.perf_counter() - started_at) * 1000
         logger.warning(
