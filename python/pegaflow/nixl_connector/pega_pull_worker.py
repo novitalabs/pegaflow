@@ -12,20 +12,24 @@ from typing import TYPE_CHECKING
 import msgspec
 import numpy as np
 import zmq
+from vllm import envs
 from vllm.logger import init_logger
-from vllm.utils.network_utils import make_zmq_path
 
-from pegaflow.nixl_connector.metadata import GET_META_MSG, NixlHandshakePayload, TransferHandle
+from pegaflow.nixl_connector.metadata import TransferHandle
 from pegaflow.nixl_connector.pega_rdma_v1 import (
-    PEGA_RDMA_V1_ACCEPT_ENDPOINT,
+    PEGA_RDMA_V1_ACCEPT_ACK,
+    PEGA_RDMA_V1_ACCEPT_REGISTER,
+    PEGA_RDMA_V1_ACCEPT_REQUEST,
     PegaRdmaV1Config,
     PegaRdmaV1Perf,
     PegaRdmaV1Read,
     build_handshake_request_extension,
     build_memory_regions,
     create_rdma_engine,
+    make_accept_broker_endpoint,
     make_peer_key,
     parse_handshake_response_extension,
+    worker_identity,
 )
 from pegaflow.nixl_connector.pull_worker import NixlPullConnectorWorker
 from pegaflow.nixl_connector.tp_mapping import ReadSpec
@@ -75,14 +79,20 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         self._pega_completed_peers: dict[str, set[str]] = defaultdict(set)
         self._pega_accept_stop = None
         self._pega_accept_thread = None
-        self._pega_accept_endpoint: str | None = None
+        side_channel_port = (
+            envs.VLLM_NIXL_SIDE_CHANNEL_PORT
+            + vllm_config.parallel_config.data_parallel_index
+        )
+        self._pega_accept_broker_endpoint = make_accept_broker_endpoint(
+            self.engine_id,
+            side_channel_port,
+        )
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register NIXL KV caches, then register the same buffers for RDMA v1."""
         super().register_kv_caches(kv_caches)
         self._register_pega_rdma_memory()
         self._start_pega_rdma_accept_service()
-        self._attach_pega_rdma_accept_endpoint()
 
     def _register_pega_rdma_memory(self) -> None:
         """Register locally exported KV blocks with the Pega RDMA v1 engine."""
@@ -102,77 +112,81 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         )
 
     def _start_pega_rdma_accept_service(self) -> None:
-        """Start the local ZMQ bridge used by the P scheduler handshake listener."""
+        """Connect to the scheduler-owned broker for worker-owned RDMA accepts."""
         if self._pega_accept_thread is not None:
             return
         import threading
 
-        endpoint = make_zmq_path(
-            "ipc",
-            f"/tmp/pegaflow-nixl-rdma-v1-{self.engine_id}-{self.tp_rank}-{id(self)}.sock",
-        )
-        try:
-            import os
-
-            os.unlink(endpoint[len("ipc://") :])
-        except FileNotFoundError:
-            pass
         stop_event = threading.Event()
         ready_event = threading.Event()
         thread = threading.Thread(
             target=self._pega_rdma_accept_loop,
-            args=(endpoint, ready_event, stop_event),
+            args=(self._pega_accept_broker_endpoint, ready_event, stop_event),
             daemon=True,
             name=f"pega-rdma-v1-accept-{self.engine_id}-{self.tp_rank}",
         )
         thread.start()
-        if not ready_event.wait(timeout=self._pega_rdma_config.handshake_timeout_s):
-            stop_event.set()
-            raise RuntimeError(f"Pega RDMA v1 accept service failed to bind {endpoint}")
-        self._pega_accept_endpoint = endpoint
+        ready_event.wait(timeout=1.0)
         self._pega_accept_stop = stop_event
         self._pega_accept_thread = thread
 
-    def _attach_pega_rdma_accept_endpoint(self) -> None:
-        """Advertise the local accept endpoint through NIXL handshake metadata."""
-        assert self.xfer_handshake_metadata is not None
-        assert self._pega_accept_endpoint is not None
-        payload = self.xfer_handshake_metadata
-        extensions = dict(payload.extensions or {})
-        extensions[PEGA_RDMA_V1_ACCEPT_ENDPOINT] = self._pega_accept_endpoint
-        self.xfer_handshake_metadata = NixlHandshakePayload(
-            compatibility_hash=payload.compatibility_hash,
-            agent_metadata_bytes=payload.agent_metadata_bytes,
-            extensions=extensions,
-        )
-
     def _pega_rdma_accept_loop(self, endpoint, ready_event, stop_event) -> None:
-        """Serve local scheduler requests that need worker-owned RDMA accept."""
-        with zmq_ctx(zmq.ROUTER, endpoint) as sock:
+        """Serve scheduler broker requests that need worker-owned RDMA accept."""
+        identity = worker_identity(self.engine_id, self.tp_rank)
+        with zmq_ctx(zmq.DEALER, endpoint, identity=identity) as sock:
             sock.setsockopt(zmq.RCVTIMEO, 1000)
+            sock.setsockopt(zmq.SNDTIMEO, int(self._pega_rdma_config.handshake_timeout_s * 1000))
             ready_event.set()
+            register_msg = msgspec.msgpack.encode(
+                {
+                    "kind": PEGA_RDMA_V1_ACCEPT_REGISTER,
+                    "tp_rank": self.tp_rank,
+                }
+            )
             while not stop_event.is_set():
                 try:
-                    identity, _, msg = sock.recv_multipart()
+                    sock.send(register_msg)
+                    response = msgspec.msgpack.decode(sock.recv())
+                    if (
+                        isinstance(response, dict)
+                        and response.get("ok")
+                        and response.get("kind") == PEGA_RDMA_V1_ACCEPT_ACK
+                    ):
+                        break
+                except zmq.Again:
+                    pass
+                time.sleep(0.05)
+            while not stop_event.is_set():
+                try:
+                    msg = sock.recv()
                 except zmq.Again:
                     continue
                 try:
                     request = msgspec.msgpack.decode(msg)
                     if not isinstance(request, dict):
                         raise ValueError("accept request must be a dict")
-                    if request.get("kind") != "accept":
+                    if request.get("kind") != PEGA_RDMA_V1_ACCEPT_REQUEST:
                         raise ValueError(f"unexpected accept request kind {request.get('kind')!r}")
                     peer_key = request.get("peer_key")
                     metadata = request.get("metadata")
+                    request_id = request.get("request_id")
                     if not isinstance(peer_key, str) or not isinstance(metadata, bytes):
                         raise ValueError("accept request missing peer_key/metadata")
                     with self._pega_rdma_perf.measure("handle_hs_request"):
                         response_metadata = self._pega_rdma.accept_handshake(peer_key, metadata)
-                    response = {"ok": True, "metadata": bytes(response_metadata)}
+                    response = {
+                        "ok": True,
+                        "request_id": request_id,
+                        "metadata": bytes(response_metadata),
+                    }
                 except Exception as exc:
                     logger.debug("Pega RDMA v1 local accept failed", exc_info=True)
-                    response = {"ok": False, "error": str(exc)}
-                sock.send_multipart((identity, b"", msgspec.msgpack.encode(response)))
+                    response = {
+                        "ok": False,
+                        "request_id": request.get("request_id") if isinstance(request, dict) else None,
+                        "error": str(exc),
+                    }
+                sock.send(msgspec.msgpack.encode(response))
 
     def _build_handshake_request_extensions(
         self,
@@ -183,14 +197,14 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         peer_key = make_peer_key(self.engine_id, self.tp_rank, remote_engine_id, remote_rank)
         status = self._pega_rdma.prepare_handshake(peer_key)
         if status.status == "existing":
-            self._pega_rdma_perf.record_ns("ensure_existing", 0)
+            self._pega_rdma_perf.record_ns("rdma_conn_existing", 0)
             return None
         if status.status == "connecting":
-            self._pega_rdma_perf.record_ns("ensure_connecting", 0)
+            self._pega_rdma_perf.record_ns("rdma_conn_connecting", 0)
             raise RuntimeError(f"RDMA v1 handshake already in progress for {peer_key}")
         if status.metadata is None:
             raise RuntimeError(f"RDMA v1 prepare_handshake({peer_key}) returned no metadata")
-        self._pega_rdma_perf.record_ns("ensure_prepared", 0)
+        self._pega_rdma_perf.record_ns("rdma_conn_prepared", 0)
         return build_handshake_request_extension(peer_key, bytes(status.metadata))
 
     def _handle_handshake_response_extensions(
@@ -306,18 +320,7 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         try:
             peer_key = make_peer_key(self.engine_id, self.tp_rank, dst_engine_id, remote_rank)
             self._pega_expected_peers[request_id].add(peer_key)
-            request_meta = self._recving_metadata[request_id]
-            assert request_meta.remote is not None
-            if not self._ensure_pega_rdma_connection(
-                peer_key,
-                dst_engine_id,
-                remote_rank,
-                request_meta.remote.host,
-                request_meta.remote.port,
-                request_meta.tp_size,
-                request_id,
-            ):
-                return
+            self._require_pega_rdma_connection(peer_key)
             if peer_key in self._pega_submitted_peers[request_id]:
                 return
 
@@ -409,90 +412,19 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         self._pega_block_tables[key] = table
         return table
 
-    def _ensure_pega_rdma_connection(
-        self,
-        peer_key: str,
-        dst_engine_id: str,
-        remote_rank: int,
-        remote_host: str,
-        remote_port: int,
-        remote_tp_size: int,
-        request_id: str,
-    ) -> bool:
-        """Ensure a Pega RDMA v1 peer connection exists before READ submit.
-
-        The normal fast path is established during NIXL's remote-agent
-        handshake.  If a failed READ invalidated only the Pega RDMA connection
-        while the NIXL agent is still cached, this method performs a small
-        extended GET_META round trip to refresh just the RDMA metadata.
-        """
+    def _require_pega_rdma_connection(self, peer_key: str) -> None:
+        """Require the RDMA connection created by the initial NIXL handshake."""
         status = self._pega_rdma.prepare_handshake(peer_key)
         if status.status == "existing":
-            self._pega_rdma_perf.record_ns("ensure_existing", 0)
-            return True
+            self._pega_rdma_perf.record_ns("rdma_conn_existing", 0)
+            return
         if status.status == "connecting":
-            self._pega_rdma_perf.record_ns("ensure_connecting", 0)
+            self._pega_rdma_perf.record_ns("rdma_conn_connecting", 0)
             raise RuntimeError(f"RDMA v1 handshake already in progress for {peer_key}")
-        if status.metadata is None:
-            raise RuntimeError(f"RDMA v1 prepare_handshake({peer_key}) returned no metadata")
-
-        self._pega_rdma_perf.record_ns("ensure_prepared", 0)
-        request_extensions = build_handshake_request_extension(peer_key, bytes(status.metadata))
-        try:
-            self._exchange_pega_rdma_handshake(
-                remote_host,
-                remote_port,
-                remote_tp_size,
-                dst_engine_id,
-                remote_rank,
-                request_extensions,
-            )
-        except Exception:
-            self._pega_rdma.abort_handshake(peer_key)
-            raise
-        return True
-
-    def _exchange_pega_rdma_handshake(
-        self,
-        remote_host: str,
-        remote_port: int,
-        remote_tp_size: int,
-        remote_engine_id: str,
-        remote_rank: int,
-        request_extensions: dict[str, object],
-    ) -> None:
-        """Refresh Pega RDMA metadata through NIXL GET_META without re-adding agents."""
-        if not self.use_host_buffer:
-            from vllm.platforms import current_platform
-
-            current_platform.set_device(self.device_id)
-
-        assert self.transfer_topo is not None
-        target_ranks = self.transfer_topo.handshake_target_ranks(remote_tp_size)
-        if remote_rank not in target_ranks:
-            raise RuntimeError(
-                f"remote rank {remote_rank} is not a handshake target among {target_ranks}"
-            )
-
-        path = make_zmq_path("tcp", remote_host, remote_port)
-        with zmq_ctx(zmq.REQ, path) as sock:
-            sock.setsockopt(zmq.RCVTIMEO, int(self._pega_rdma_config.handshake_timeout_s * 1000))
-            sock.setsockopt(zmq.SNDTIMEO, int(self._pega_rdma_config.handshake_timeout_s * 1000))
-            sock.send(msgspec.msgpack.encode((GET_META_MSG, remote_rank, request_extensions)))
-            handshake_bytes = sock.recv()
-
-        payload = msgspec.msgpack.decode(handshake_bytes, type=NixlHandshakePayload)
-        assert self.compat_hash is not None
-        if self.enforce_compat_hash and payload.compatibility_hash != self.compat_hash:
-            raise RuntimeError(
-                f"NIXL compatibility hash mismatch during Pega RDMA refresh. "
-                f"Local: {self.compat_hash}, Remote: {payload.compatibility_hash}."
-            )
-        self._handle_handshake_response_extensions(
-            remote_engine_id,
-            remote_rank,
-            payload.extensions,
-            request_extensions,
+        self._pega_rdma_perf.record_ns("rdma_conn_missing", 0)
+        self._pega_rdma.abort_handshake(peer_key)
+        raise RuntimeError(
+            f"Pega RDMA v1 connection for {peer_key} is missing after NIXL handshake"
         )
 
     def _pop_done_transfers(self, transfers: dict[str, list[int]]) -> set[str]:
@@ -572,15 +504,6 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
             self._pega_accept_stop.set()
         if self._pega_accept_thread is not None:
             self._pega_accept_thread.join(timeout=2.0)
-        if self._pega_accept_endpoint and self._pega_accept_endpoint.startswith("ipc://"):
-            try:
-                import os
-
-                os.unlink(self._pega_accept_endpoint[len("ipc://") :])
-            except FileNotFoundError:
-                pass
-            except Exception:
-                logger.debug("Failed to remove Pega RDMA v1 accept socket", exc_info=True)
         self._pega_accept_stop = None
         self._pega_accept_thread = None
         for read in list(self._pega_rdma_reads.values()):

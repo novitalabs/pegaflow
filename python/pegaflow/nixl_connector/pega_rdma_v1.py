@@ -16,16 +16,21 @@ import time
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import msgspec
 import zmq
+from vllm import envs
 
 from pegaflow.nixl_connector.utils import zmq_ctx
 from pegaflow.pegaflow import PegaRdmaV1Engine
 
 PEGA_RDMA_V1_EXTENSION = "pegaflow_rdma_v1"
 PEGA_RDMA_V1_ACCEPT_ENDPOINT = "pegaflow_rdma_v1_accept_endpoint"
+PEGA_RDMA_V1_ACCEPT_REGISTER = "register"
+PEGA_RDMA_V1_ACCEPT_REQUEST = "accept"
+PEGA_RDMA_V1_ACCEPT_ACK = "registered"
 
 
 @dataclass(frozen=True)
@@ -191,6 +196,19 @@ def reverse_peer_key(peer_key: str) -> str:
     return f"{remote}->{local}"
 
 
+def worker_identity(engine_id: str, tp_rank: int) -> bytes:
+    """Return the stable broker identity for one Pega RDMA worker rank."""
+    return f"{engine_id}:{tp_rank}".encode()
+
+
+def make_accept_broker_endpoint(engine_id: str, side_channel_port: int) -> str:
+    """Build the scheduler-owned local IPC endpoint for Pega RDMA accepts."""
+    base_path = Path(envs.VLLM_RPC_BASE_PATH)
+    base_path.mkdir(parents=True, exist_ok=True)
+    filename = f"pegaflow-nixl-rdma-v1-{engine_id}-{side_channel_port}.sock"
+    return f"ipc://{base_path / filename}"
+
+
 def build_memory_regions(blocks_data: list[tuple[int, int, int]]) -> list[dict[str, int]]:
     """Build native registration regions from NIXL block descriptors.
 
@@ -238,14 +256,16 @@ def parse_handshake_response_extension(
 
 def accept_handshake_via_zmq(
     endpoint: str,
+    target_tp_rank: int,
     peer_key: str,
     metadata: bytes,
     timeout_ms: int,
 ) -> bytes:
-    """Ask the local P worker to accept one Pega RDMA v1 handshake."""
+    """Ask the scheduler-owned broker to route one RDMA accept to a P worker."""
     request = msgspec.msgpack.encode(
         {
-            "kind": "accept",
+            "kind": PEGA_RDMA_V1_ACCEPT_REQUEST,
+            "target_tp_rank": target_tp_rank,
             "peer_key": peer_key,
             "metadata": metadata,
         }
@@ -253,6 +273,7 @@ def accept_handshake_via_zmq(
     with zmq_ctx(zmq.REQ, endpoint) as sock:
         sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
         sock.setsockopt(zmq.SNDTIMEO, timeout_ms)
+        sock.setsockopt(zmq.LINGER, 0)
         sock.send(request)
         response = msgspec.msgpack.decode(sock.recv())
     if not isinstance(response, dict):
