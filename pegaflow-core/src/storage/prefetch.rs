@@ -13,6 +13,7 @@ use tokio::task::JoinHandle;
 use crate::backing::RdmaFetchStore;
 use crate::backing::{PrefetchResult, SsdBackingStore};
 use crate::block::{BlockKey, PrefetchStatus, SealedBlock};
+use crate::internode::MetaServerClient;
 use crate::metrics::core_metrics;
 
 use super::read_cache::ReadCache;
@@ -155,6 +156,7 @@ pub(super) struct PrefetchScheduler {
     state: Arc<Mutex<PrefetchState>>,
     ssd_store: Option<Arc<SsdBackingStore>>,
     rdma_fetch: Option<RdmaFetch>,
+    metaserver_client: Option<Arc<MetaServerClient>>,
     max_prefetch_blocks: usize,
 }
 
@@ -162,6 +164,7 @@ impl PrefetchScheduler {
     pub(super) fn new(
         ssd_store: Option<Arc<SsdBackingStore>>,
         rdma_fetch: Option<RdmaFetch>,
+        metaserver_client: Option<Arc<MetaServerClient>>,
         max_prefetch_blocks: usize,
     ) -> Self {
         Self {
@@ -172,6 +175,7 @@ impl PrefetchScheduler {
             })),
             ssd_store,
             rdma_fetch,
+            metaserver_client,
             max_prefetch_blocks,
         }
     }
@@ -250,7 +254,31 @@ impl PrefetchScheduler {
             );
         }
 
+        // RDMA-fetched blocks are now resident on this node. Re-advertise them
+        // to the MetaServer so peers can discover and fetch from here too.
+        // SSD prefetch is skipped: those blocks were already registered by this
+        // node's own save path, and eviction explicitly unregisters them.
+        let rdma_registration: Option<(String, Vec<Vec<u8>>)> =
+            if result.source == Some(PrefetchSource::Rdma) && !result.cache_inserts.is_empty() {
+                let namespace = result.cache_inserts[0].0.namespace.clone();
+                let hashes = result
+                    .cache_inserts
+                    .iter()
+                    .map(|(k, _)| k.hash.clone())
+                    .collect();
+                Some((namespace, hashes))
+            } else {
+                None
+            };
+
         read_cache.batch_insert(result.cache_inserts);
+
+        if let Some(client) = &self.metaserver_client
+            && let Some((namespace, hashes)) = rdma_registration
+        {
+            client.try_register_namespace(namespace, hashes);
+        }
+
         PollResult::Ready(PrefetchStatus::Ready {
             blocks: result.ready_blocks,
             missing: result.missing,
