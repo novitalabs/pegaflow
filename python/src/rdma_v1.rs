@@ -73,14 +73,18 @@ struct BlockEntry {
     len: usize,
 }
 
+struct EngineState {
+    pending_handshakes: HashMap<String, HandshakeMetadata>,
+    pending_reads: HashMap<u64, PendingRead>,
+    next_handle: u64,
+    local_block_tables: HashMap<u64, Vec<BlockEntry>>,
+    remote_block_tables: HashMap<(String, usize), Vec<BlockEntry>>,
+}
+
 #[pyclass]
 struct PegaRdmaV1Engine {
     engine: Arc<TransferEngine>,
-    pending_handshakes: Mutex<HashMap<String, HandshakeMetadata>>,
-    pending_reads: Mutex<HashMap<u64, PendingRead>>,
-    next_handle: Mutex<u64>,
-    block_tables: Mutex<HashMap<u64, Vec<BlockEntry>>>,
-    next_table_handle: Mutex<u64>,
+    state: Mutex<EngineState>,
 }
 
 #[pymethods]
@@ -97,11 +101,13 @@ impl PegaRdmaV1Engine {
             .map_err(|err| rdma_v1_error("v1 transfer engine init failed", err))?;
         Ok(Self {
             engine: Arc::new(engine),
-            pending_handshakes: Mutex::new(HashMap::new()),
-            pending_reads: Mutex::new(HashMap::new()),
-            next_handle: Mutex::new(1),
-            block_tables: Mutex::new(HashMap::new()),
-            next_table_handle: Mutex::new(1),
+            state: Mutex::new(EngineState {
+                pending_handshakes: HashMap::new(),
+                pending_reads: HashMap::new(),
+                next_handle: 1,
+                local_block_tables: HashMap::new(),
+                remote_block_tables: HashMap::new(),
+            }),
         })
     }
 
@@ -109,7 +115,7 @@ impl PegaRdmaV1Engine {
         // Register local memory regions that Pega RDMA v1 may use as READ
         // destinations or sources, depending on which worker side this engine
         // is running on.
-        let mut native = Vec::with_capacity(regions.len());
+        let mut raw_regions = Vec::with_capacity(regions.len());
         for region in regions {
             let region = region.bind(py);
             let addr: u64 = py_get(region, "addr")?;
@@ -117,34 +123,48 @@ impl PegaRdmaV1Engine {
             if len == 0 {
                 return Err(PyValueError::new_err("memory region len must be positive"));
             }
-            native.push(MemoryRegion {
-                ptr: nonnull_from_u64(addr, "addr")?,
-                len: u64_to_usize(len, "memory region len")?,
-            });
+            raw_regions.push((addr, u64_to_usize(len, "memory region len")?));
         }
-        self.engine
-            .register_memory(&native)
-            .map_err(|err| rdma_v1_error("register_memory failed", err))
+        let engine = Arc::clone(&self.engine);
+        py.detach(move || -> PyResult<()> {
+            let mut native = Vec::with_capacity(raw_regions.len());
+            for (addr, len) in raw_regions {
+                native.push(MemoryRegion {
+                    ptr: nonnull_from_u64(addr, "addr")?,
+                    len,
+                });
+            }
+            engine
+                .register_memory(&native)
+                .map_err(|err| rdma_v1_error("register_memory failed", err))
+        })
     }
 
-    fn unregister_memory(&self, addrs: Vec<u64>) -> PyResult<()> {
+    fn unregister_memory(&self, py: Python<'_>, addrs: Vec<u64>) -> PyResult<()> {
         // Drop registrations for local memory regions during connector
         // shutdown.  The transfer engine owns the actual deregistration logic.
-        let mut ptrs = Vec::with_capacity(addrs.len());
-        for addr in addrs {
-            ptrs.push(nonnull_from_u64(addr, "addr")?);
-        }
-        self.engine
-            .unregister_memory(&ptrs)
-            .map_err(|err| rdma_v1_error("unregister_memory failed", err))
+        let engine = Arc::clone(&self.engine);
+        py.detach(move || -> PyResult<()> {
+            let mut ptrs = Vec::with_capacity(addrs.len());
+            for addr in addrs {
+                ptrs.push(nonnull_from_u64(addr, "addr")?);
+            }
+            engine
+                .unregister_memory(&ptrs)
+                .map_err(|err| rdma_v1_error("unregister_memory failed", err))
+        })
     }
 
-    fn prepare_handshake(&self, remote_addr: String) -> PyResult<PegaRdmaV1Handshake> {
+    fn prepare_handshake(
+        &self,
+        py: Python<'_>,
+        remote_addr: String,
+    ) -> PyResult<PegaRdmaV1Handshake> {
         // Expose TransferEngine's initiator state machine without leaking Rust
         // enums into Python. "prepared" means Python must send this opaque RDMA
         // metadata to its peer; "connecting" means another request is already
         // doing that for the same peer.
-        self.prepare_handshake_inner(&remote_addr)
+        self.prepare_handshake_inner(py, &remote_addr)
     }
 
     fn accept_handshake<'py>(
@@ -156,75 +176,76 @@ impl PegaRdmaV1Engine {
         // Responder-side equivalent of PegaEngine::rdma_accept_handshake. The
         // Python connector only transports opaque bytes; stale connection
         // invalidation, local QP preparation, and completion stay in Rust.
-        let local = self.accept_handshake_inner(&remote_addr, &remote_metadata)?;
+        let local = self.accept_handshake_inner(py, &remote_addr, &remote_metadata)?;
         Ok(pyo3::types::PyBytes::new(py, &local))
     }
 
-    fn finish_handshake(&self, remote_addr: String, remote_metadata: Vec<u8>) -> PyResult<()> {
+    fn finish_handshake(
+        &self,
+        py: Python<'_>,
+        remote_addr: String,
+        remote_metadata: Vec<u8>,
+    ) -> PyResult<()> {
         // Initiator-side completion. The local metadata was cached by
         // prepare_handshake, so Python does not need to keep or decode it.
-        self.finish_handshake_inner(&remote_addr, &remote_metadata)
+        self.finish_handshake_inner(py, &remote_addr, &remote_metadata)
     }
 
-    fn abort_handshake(&self, remote_addr: String) -> PyResult<()> {
+    fn abort_handshake(&self, py: Python<'_>, remote_addr: String) -> PyResult<()> {
         // Abort a prepared-but-incomplete initiator handshake after the Python
         // connector's timeout expires. If there is no prepared local metadata
         // left, the peer is already connected or gone, so abort is a no-op.
-        if let Some(local) = self
-            .pending_handshakes
+        let local = self
+            .state
             .lock()
-            .map_err(|_| PyRuntimeError::new_err("pending_handshakes mutex poisoned"))?
-            .remove(&remote_addr)
-        {
-            self.engine.abort_handshake(&remote_addr, &local);
+            .map_err(|_| PyRuntimeError::new_err("PegaRdmaV1Engine state mutex poisoned"))?
+            .pending_handshakes
+            .remove(&remote_addr);
+        if let Some(local) = local {
+            py.detach(|| self.engine.abort_handshake(&remote_addr, &local));
         }
         Ok(())
     }
 
-    fn register_blocks_table(&self, blocks: Vec<(u64, u64, u64)>) -> PyResult<u64> {
-        // Blocks are stable after NIXL registers KV cache memory.  Registering a
-        // compact table once lets the hot path pass descriptor indices instead
-        // of allocating and parsing Python dictionaries for every READ.
-        let mut table = Vec::with_capacity(blocks.len());
-        for (addr, len, _device_id) in blocks {
-            if len == 0 {
-                return Err(PyValueError::new_err("block len must be positive"));
-            }
-            table.push(BlockEntry {
-                addr,
-                len: u64_to_usize(len, "block len")?,
-            });
-        }
-        let mut next_handle = self
-            .next_table_handle
+    fn register_local_blocks(
+        &self,
+        nixl_handle: u64,
+        blocks: Vec<(u64, u64, u64)>,
+    ) -> PyResult<()> {
+        // Blocks are stable after NIXL registers KV cache memory.  Rust owns the
+        // descriptor tables keyed by NIXL's actual dlist handle, so Python does
+        // not need shadow maps or synthetic table handles.
+        let table = Self::build_block_table(blocks)?;
+        self.state
             .lock()
-            .map_err(|_| PyRuntimeError::new_err("next_table_handle mutex poisoned"))?;
-        let handle = *next_handle;
-        *next_handle = next_handle
-            .checked_add(1)
-            .ok_or_else(|| PyRuntimeError::new_err("RDMA block table handle overflow"))?;
-        self.block_tables
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("block_tables mutex poisoned"))?
-            .insert(handle, table);
-        Ok(handle)
+            .map_err(|_| PyRuntimeError::new_err("PegaRdmaV1Engine state mutex poisoned"))?
+            .local_block_tables
+            .insert(nixl_handle, table);
+        Ok(())
     }
 
-    fn drop_blocks_table(&self, handle: u64) -> PyResult<()> {
-        // Remove a cached block table during worker shutdown.  The underlying
-        // memory registration remains owned by register_memory/unregister_memory.
-        self.block_tables
+    fn register_remote_blocks(
+        &self,
+        engine_id: String,
+        tp_rank: usize,
+        blocks: Vec<(u64, u64, u64)>,
+    ) -> PyResult<()> {
+        let table = Self::build_block_table(blocks)?;
+        self.state
             .lock()
-            .map_err(|_| PyRuntimeError::new_err("block_tables mutex poisoned"))?
-            .remove(&handle);
+            .map_err(|_| PyRuntimeError::new_err("PegaRdmaV1Engine state mutex poisoned"))?
+            .remote_block_tables
+            .insert((engine_id, tp_rank), table);
         Ok(())
     }
 
     fn read_async_indices(
         &self,
+        py: Python<'_>,
         remote_addr: String,
-        local_table_handle: u64,
-        remote_table_handle: u64,
+        local_xfer_side_handle: u64,
+        remote_engine_id: String,
+        remote_tp_rank: usize,
         local_desc_ids: Vec<usize>,
         remote_desc_ids: Vec<usize>,
     ) -> PyResult<(u64, usize, usize)> {
@@ -238,15 +259,24 @@ impl PegaRdmaV1Engine {
         }
 
         let prepared = {
-            let tables = self
-                .block_tables
+            let state = self
+                .state
                 .lock()
-                .map_err(|_| PyRuntimeError::new_err("block_tables mutex poisoned"))?;
-            let local_table = tables.get(&local_table_handle).ok_or_else(|| {
-                PyValueError::new_err(format!("unknown local block table {local_table_handle}"))
-            })?;
-            let remote_table = tables.get(&remote_table_handle).ok_or_else(|| {
-                PyValueError::new_err(format!("unknown remote block table {remote_table_handle}"))
+                .map_err(|_| PyRuntimeError::new_err("PegaRdmaV1Engine state mutex poisoned"))?;
+            let local_table = state
+                .local_block_tables
+                .get(&local_xfer_side_handle)
+                .ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "unknown local block table for NIXL handle {local_xfer_side_handle}"
+                    ))
+                })?;
+            let remote_key = (remote_engine_id.clone(), remote_tp_rank);
+            let remote_table = state.remote_block_tables.get(&remote_key).ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "unknown remote block table for engine={} rank={}",
+                    remote_engine_id, remote_tp_rank
+                ))
             })?;
 
             let mut native = Vec::with_capacity(local_desc_ids.len());
@@ -265,11 +295,7 @@ impl PegaRdmaV1Engine {
                 // NIXL owns descriptor ordering and index selection; this layer
                 // only materializes those indices into native RDMA READ
                 // descriptors for the PegaFlow v1 transfer engine.
-                native.push(TransferDesc {
-                    local_ptr: nonnull_from_u64(local.addr, "local_addr")?,
-                    remote_ptr: nonnull_from_u64(remote.addr, "remote_addr")?,
-                    len,
-                });
+                native.push((local.addr, remote.addr, len));
                 bytes = bytes.saturating_add(len);
             }
             (native, bytes)
@@ -277,7 +303,7 @@ impl PegaRdmaV1Engine {
 
         let (native, bytes) = prepared;
         let desc_count = native.len();
-        let handle = self.submit_read_native(remote_addr, native)?;
+        let handle = self.submit_read_native(py, remote_addr, native)?;
         Ok((handle, bytes, desc_count))
     }
 
@@ -286,10 +312,11 @@ impl PegaRdmaV1Engine {
         // handle.  The connector keeps polling until every descriptor finishes,
         // then sends the regular NIXL completion notification.
         let mut pending = self
-            .pending_reads
+            .state
             .lock()
-            .map_err(|_| PyRuntimeError::new_err("pending_reads mutex poisoned"))?;
+            .map_err(|_| PyRuntimeError::new_err("PegaRdmaV1Engine state mutex poisoned"))?;
         let read = pending
+            .pending_reads
             .get_mut(&handle)
             .ok_or_else(|| PyRuntimeError::new_err(format!("unknown RDMA read handle {handle}")))?;
         for slot in &mut read.receivers {
@@ -318,7 +345,7 @@ impl PegaRdmaV1Engine {
             return Ok("pending".to_string());
         }
         let total = read.bytes_done;
-        pending.remove(&handle);
+        pending.pending_reads.remove(&handle);
         log::debug!("[PegaRdmaV1Engine] RDMA READ done handle={handle} bytes={total}");
         Ok("done".to_string())
     }
@@ -326,9 +353,10 @@ impl PegaRdmaV1Engine {
     fn release_read(&self, handle: u64) -> PyResult<()> {
         // Forget a pending READ after request failure or shutdown.  Completed
         // READs are removed by check_read when it returns "done".
-        self.pending_reads
+        self.state
             .lock()
-            .map_err(|_| PyRuntimeError::new_err("pending_reads mutex poisoned"))?
+            .map_err(|_| PyRuntimeError::new_err("PegaRdmaV1Engine state mutex poisoned"))?
+            .pending_reads
             .remove(&handle);
         Ok(())
     }
@@ -346,10 +374,27 @@ impl PegaRdmaV1Engine {
 }
 
 impl PegaRdmaV1Engine {
-    fn prepare_handshake_inner(&self, remote_addr: &str) -> PyResult<PegaRdmaV1Handshake> {
-        let status = self
-            .engine
-            .get_or_prepare(remote_addr)
+    fn build_block_table(blocks: Vec<(u64, u64, u64)>) -> PyResult<Vec<BlockEntry>> {
+        let mut table = Vec::with_capacity(blocks.len());
+        for (addr, len, _device_id) in blocks {
+            if len == 0 {
+                return Err(PyValueError::new_err("block len must be positive"));
+            }
+            table.push(BlockEntry {
+                addr,
+                len: u64_to_usize(len, "block len")?,
+            });
+        }
+        Ok(table)
+    }
+
+    fn prepare_handshake_inner(
+        &self,
+        py: Python<'_>,
+        remote_addr: &str,
+    ) -> PyResult<PegaRdmaV1Handshake> {
+        let status = py
+            .detach(|| self.engine.get_or_prepare(remote_addr))
             .map_err(|err| rdma_v1_error("prepare_handshake failed", err))?;
         Ok(match status {
             ConnectionStatus::Existing => PegaRdmaV1Handshake {
@@ -363,9 +408,10 @@ impl PegaRdmaV1Engine {
                 metadata: None,
             },
             ConnectionStatus::Prepared(metadata) => {
-                self.pending_handshakes
+                self.state
                     .lock()
-                    .map_err(|_| PyRuntimeError::new_err("pending_handshakes mutex poisoned"))?
+                    .map_err(|_| PyRuntimeError::new_err("PegaRdmaV1Engine state mutex poisoned"))?
+                    .pending_handshakes
                     .insert(remote_addr.to_string(), metadata.clone());
                 PegaRdmaV1Handshake {
                     status: "prepared".to_string(),
@@ -378,6 +424,7 @@ impl PegaRdmaV1Engine {
 
     fn accept_handshake_inner(
         &self,
+        py: Python<'_>,
         remote_addr: &str,
         remote_metadata: &[u8],
     ) -> PyResult<Vec<u8>> {
@@ -387,11 +434,10 @@ impl PegaRdmaV1Engine {
         // Match the server-side PegaEngine RDMA handshake behavior: a peer
         // that sends fresh metadata is asking for a fresh connection, so drop
         // stale local state before preparing response QPs.
-        self.engine.invalidate_connection(remote_addr);
+        py.detach(|| self.engine.invalidate_connection(remote_addr));
 
-        let local = match self
-            .engine
-            .get_or_prepare(remote_addr)
+        let local = match py
+            .detach(|| self.engine.get_or_prepare(remote_addr))
             .map_err(|err| rdma_v1_error("accept_handshake prepare failed", err))?
         {
             ConnectionStatus::Prepared(metadata) => metadata,
@@ -405,56 +451,83 @@ impl PegaRdmaV1Engine {
             }
         };
 
-        self.engine
-            .complete_handshake(remote_addr, &local, &remote)
+        py.detach(|| self.engine.complete_handshake(remote_addr, &local, &remote))
             .map_err(|err| rdma_v1_error("accept_handshake complete failed", err))?;
         Ok(local.to_bytes())
     }
 
-    fn finish_handshake_inner(&self, remote_addr: &str, remote_metadata: &[u8]) -> PyResult<()> {
+    fn finish_handshake_inner(
+        &self,
+        py: Python<'_>,
+        remote_addr: &str,
+        remote_metadata: &[u8],
+    ) -> PyResult<()> {
         let remote = HandshakeMetadata::from_bytes(remote_metadata)
             .map_err(|err| rdma_v1_error("decode remote handshake failed", err))?;
         let local = self
-            .pending_handshakes
+            .state
             .lock()
-            .map_err(|_| PyRuntimeError::new_err("pending_handshakes mutex poisoned"))?
-            .remove(remote_addr)
+            .map_err(|_| PyRuntimeError::new_err("PegaRdmaV1Engine state mutex poisoned"))?
+            .pending_handshakes
+            .get(remote_addr)
+            .cloned()
             .ok_or_else(|| {
                 PegaFlowError::new_err(format!(
                     "finish_handshake called without prepared local metadata for {remote_addr}"
                 ))
             })?;
-        self.engine
-            .complete_handshake(remote_addr, &local, &remote)
-            .map_err(|err| rdma_v1_error("finish_handshake complete failed", err))
+        if let Err(err) = py.detach(|| self.engine.complete_handshake(remote_addr, &local, &remote))
+        {
+            py.detach(|| self.engine.abort_handshake(remote_addr, &local));
+            return Err(rdma_v1_error("finish_handshake complete failed", err));
+        }
+        self.state
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("PegaRdmaV1Engine state mutex poisoned"))?
+            .pending_handshakes
+            .remove(remote_addr);
+        Ok(())
     }
 
-    fn submit_read_native(&self, remote_addr: String, native: Vec<TransferDesc>) -> PyResult<u64> {
+    fn submit_read_native(
+        &self,
+        py: Python<'_>,
+        remote_addr: String,
+        raw_descs: Vec<(u64, u64, usize)>,
+    ) -> PyResult<u64> {
         // TransferEngine returns one completion receiver per descriptor.  Python
         // sees a single monotonically increasing handle so the worker can store
         // request-level metadata alongside the native completions.
-        let receivers = self
-            .engine
-            .batch_transfer_async(TransferOp::Read, &remote_addr, &native)
-            .map_err(|err| rdma_v1_error("submit RDMA READ failed", err))?;
-        let mut next_handle = self
-            .next_handle
+        let engine = Arc::clone(&self.engine);
+        let receivers = py.detach(move || -> PyResult<_> {
+            let mut native = Vec::with_capacity(raw_descs.len());
+            for (local_addr, remote_addr, len) in raw_descs {
+                native.push(TransferDesc {
+                    local_ptr: nonnull_from_u64(local_addr, "local_addr")?,
+                    remote_ptr: nonnull_from_u64(remote_addr, "remote_addr")?,
+                    len,
+                });
+            }
+            engine
+                .batch_transfer_async(TransferOp::Read, &remote_addr, &native)
+                .map_err(|err| rdma_v1_error("submit RDMA READ failed", err))
+        })?;
+        let mut state = self
+            .state
             .lock()
-            .map_err(|_| PyRuntimeError::new_err("next_handle mutex poisoned"))?;
-        let handle = *next_handle;
-        *next_handle = next_handle
+            .map_err(|_| PyRuntimeError::new_err("PegaRdmaV1Engine state mutex poisoned"))?;
+        let handle = state.next_handle;
+        state.next_handle = state
+            .next_handle
             .checked_add(1)
             .ok_or_else(|| PyRuntimeError::new_err("RDMA read handle overflow"))?;
-        self.pending_reads
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("pending_reads mutex poisoned"))?
-            .insert(
-                handle,
-                PendingRead {
-                    receivers: receivers.into_iter().map(Some).collect(),
-                    bytes_done: 0,
-                },
-            );
+        state.pending_reads.insert(
+            handle,
+            PendingRead {
+                receivers: receivers.into_iter().map(Some).collect(),
+                bytes_done: 0,
+            },
+        );
         Ok(handle)
     }
 }

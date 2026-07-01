@@ -382,25 +382,18 @@ class NixlBaseConnectorWorker:
         # Current rank may pull from multiple remote TP workers.
         # EngineId, dict[int, list[int]] -> engine_id, tp_rank, base_addr_for_layer
         self.kv_caches_base_addr = defaultdict[EngineId, dict[int, list[int]]](dict)
-        self.local_registered_blocks_data: list[tuple[int, int, int, str]] = []
 
         # Number of NIXL regions. Currently one region per cache
         # (so 1 per layer for MLA, otherwise 2 per layer)
         self.num_regions = 0
 
         # nixl_prepped_dlist_handle.
-        self.src_xfer_handles_by_block_size: dict[int, int] = {}
-        self.src_blocks_data_by_block_size: dict[int, list[tuple[int, int, int]]] = {}
+        self.src_xfer_handles_by_block_size: dict[int, object] = {}
         # Populated dynamically during handshake based on remote configuration.
         # Keep track of regions at different tp_ratio values. tp_ratio->handles
-        self.src_xfer_handles_by_tp_ratio: dict[int, list[int]] = {}
-        # Map of engine_id -> {tp_rank: nixl_prepped_dlist_handle (int)}.
-        self.dst_xfer_side_handles = defaultdict[EngineId, dict[int, int]](dict)
-        # Descriptor backing data keyed the same way as NIXL dlist handles.
-        # Pega RDMA v1 reuses NIXL's descriptor-id computation and translates
-        # those ids into raw address/length tuples at transfer submission time.
-        self.dst_blocks_data = defaultdict[EngineId, dict[int, list[tuple[int, int, int]]]](dict)
-        self.src_blocks_data_by_tp_ratio: dict[int, list[list[tuple[int, int, int]]]] = {}
+        self.src_xfer_handles_by_tp_ratio: dict[int, list[object]] = {}
+        # Map of engine_id -> {tp_rank: opaque nixl_prepped_dlist_handle}.
+        self.dst_xfer_side_handles = defaultdict[EngineId, dict[int, object]](dict)
 
         # Map of engine_id -> num_blocks. All ranks in the same deployment will
         # have the same number of blocks.
@@ -913,7 +906,6 @@ class NixlBaseConnectorWorker:
 
         self.device_id = device_id
         caches_data = [(base_addr, total_size, self.device_id, "")]
-        self.local_registered_blocks_data = caches_data
 
         self.block_len_per_layer = [block_stride]
         self.num_regions = 1
@@ -923,13 +915,13 @@ class NixlBaseConnectorWorker:
         descs = self.nixl_wrapper.get_reg_descs(caches_data, self.nixl_memory_type)
         self.nixl_wrapper.register_memory(descs, backends=self.nixl_backends)
         self._registered_descs.append(descs)
+        self._on_local_memory_registered(caches_data)
 
         self.dst_num_blocks[self.engine_id] = self.num_blocks
 
-        self.src_xfer_handles_by_block_size[self.block_size], (self.src_blocks_data) = (
-            self.register_local_xfer_handler(self.block_size)
+        self.src_xfer_handles_by_block_size[self.block_size] = self.register_local_xfer_handler(
+            self.block_size
         )
-        self.src_blocks_data_by_block_size[self.block_size] = self.src_blocks_data
 
         agent_metadata = NixlAgentMetadata(
             engine_id=self.engine_id,
@@ -1108,7 +1100,6 @@ class NixlBaseConnectorWorker:
         assert len(self.block_len_per_layer) == len(seen_base_addresses) == len(self._region_is_mla)
 
         self.kv_caches_base_addr[self.engine_id][self.tp_rank] = seen_base_addresses
-        self.local_registered_blocks_data = caches_data
         self.num_regions = len(caches_data)
 
         if self.transfer_topo.virtually_split_kv_in_blocks:
@@ -1134,6 +1125,7 @@ class NixlBaseConnectorWorker:
         self.nixl_wrapper.register_memory(descs, backends=self.nixl_backends)
         logger.debug("Done registering descs")
         self._registered_descs.append(descs)
+        self._on_local_memory_registered(caches_data)
 
         self.device_kv_caches = kv_caches
         self.dst_num_blocks[self.engine_id] = self.num_blocks
@@ -1153,10 +1145,9 @@ class NixlBaseConnectorWorker:
             )
 
         # Register local/src descr for NIXL xfer.
-        self.src_xfer_handles_by_block_size[self.block_size], self.src_blocks_data = (
-            self.register_local_xfer_handler(self.block_size)
+        self.src_xfer_handles_by_block_size[self.block_size] = self.register_local_xfer_handler(
+            self.block_size
         )
-        self.src_blocks_data_by_block_size[self.block_size] = self.src_blocks_data
 
         # After KV Caches registered, listen for new connections.
         agent_metadata = NixlAgentMetadata(
@@ -1349,21 +1340,31 @@ class NixlBaseConnectorWorker:
                     result.append((v_addr, second_split, nixl_agent_meta.device_id))
         return result
 
-    def register_local_xfer_handler(
+    def _on_local_memory_registered(
+        self,
+        regions: list[tuple[int, int, int, str]],
+    ) -> None:
+        """Called after local KV memory regions are registered with NIXL."""
+
+    def _on_local_blocks_registered(
+        self,
+        nixl_handle: object,
+        blocks_data: list[tuple[int, int, int]],
+    ) -> None:
+        """Called after local KV blocks are registered with NIXL."""
+
+    def _on_remote_blocks_registered(
+        self,
+        engine_id: str,
+        tp_rank: int,
+        blocks_data: list[tuple[int, int, int]],
+    ) -> None:
+        """Called after remote agent blocks are registered with NIXL."""
+
+    def _build_local_blocks_data(
         self,
         block_size: int,
-    ) -> tuple[int, list[tuple[int, int, int]]]:
-        """
-        Function used for register local xfer handler with local block_size or
-        Remote block_size.
-
-        When local block_size is same as remote block_size, we use local block_size
-        to register local_xfer_handler during init.
-
-        When remote block size is less than local block size, we need to use
-        register another local_xfer_handler using remote block len to ensure
-        data copy correctness.
-        """
+    ) -> list[tuple[int, int, int]]:
         assert self.transfer_topo is not None
         block_size_ratio = self.block_size // block_size
         local_base_addresses = self.kv_caches_base_addr[self.engine_id][self.tp_rank]
@@ -1386,10 +1387,30 @@ class NixlBaseConnectorWorker:
             # because local descs are created before knowing the remote TP.
             logger.debug("Registering local Mamba descriptors (4 regions/layer)")
             blocks_data.extend(self._build_mamba_local(local_base_addresses, block_size_ratio))
+        return blocks_data
+
+    def register_local_xfer_handler(
+        self,
+        block_size: int,
+    ) -> object:
+        """
+        Function used for register local xfer handler with local block_size or
+        Remote block_size.
+
+        When local block_size is same as remote block_size, we use local block_size
+        to register local_xfer_handler during init.
+
+        When remote block size is less than local block size, we need to use
+        register another local_xfer_handler using remote block len to ensure
+        data copy correctness.
+        """
+        blocks_data = self._build_local_blocks_data(block_size)
 
         descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
         # NIXL_INIT_AGENT to be used for preparations of local descs.
-        return self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs), blocks_data
+        handle = self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs)
+        self._on_local_blocks_registered(handle, blocks_data)
+        return handle
 
     def add_remote_agent(
         self,
@@ -1510,13 +1531,13 @@ class NixlBaseConnectorWorker:
 
             for handle_data in self._build_local_splits_from_plan(
                 plan,
-                self.src_blocks_data,
+                self._build_local_blocks_data(self.block_size),
                 self.num_descs,
             ):
                 descs = self.nixl_wrapper.get_xfer_descs(handle_data, self.nixl_memory_type)
                 handle = self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs)
                 self.src_xfer_handles_by_tp_ratio[tp_ratio].append(handle)
-                self.src_blocks_data_by_tp_ratio.setdefault(tp_ratio, []).append(handle_data)
+                self._on_local_blocks_registered(handle, handle_data)
 
         ### Register remote agent memory regions
         # With homogeneous TP, D pulls the whole kv cache from corresponding rank. With
@@ -1556,15 +1577,14 @@ class NixlBaseConnectorWorker:
         self.dst_xfer_side_handles[engine_id][remote_tp_rank] = self.nixl_wrapper.prep_xfer_dlist(
             remote_agent_name, descs
         )
-        self.dst_blocks_data[engine_id][remote_tp_rank] = blocks_data
+        self._on_remote_blocks_registered(engine_id, remote_tp_rank, blocks_data)
 
         if block_size_ratio > 1:
             # when prefill with smaller block_size, we need to init a
             # new handler with same block_len to match
-            (
-                self.src_xfer_handles_by_block_size[nixl_agent_meta.block_size],
-                self.src_blocks_data_by_block_size[nixl_agent_meta.block_size],
-            ) = self.register_local_xfer_handler(nixl_agent_meta.block_size)
+            self.src_xfer_handles_by_block_size[nixl_agent_meta.block_size] = (
+                self.register_local_xfer_handler(nixl_agent_meta.block_size)
+            )
 
         return remote_agent_name
 
@@ -2279,7 +2299,6 @@ class NixlBaseConnectorWorker:
 
         for handle in self.dst_xfer_side_handles.pop(engine_id).values():
             self.nixl_wrapper.release_dlist_handle(handle)
-        self.dst_blocks_data.pop(engine_id, None)
         for agent_name in self._remote_agents.pop(engine_id).values():
             self.nixl_wrapper.remove_remote_agent(agent_name)
 
@@ -2313,12 +2332,10 @@ class NixlBaseConnectorWorker:
         for handle in self.src_xfer_handles_by_block_size.values():
             self.nixl_wrapper.release_dlist_handle(handle)
         self.src_xfer_handles_by_block_size.clear()
-        self.src_blocks_data_by_block_size.clear()
         for handles in self.src_xfer_handles_by_tp_ratio.values():
             for handle in handles:
                 self.nixl_wrapper.release_dlist_handle(handle)
         self.src_xfer_handles_by_tp_ratio.clear()
-        self.src_blocks_data_by_tp_ratio.clear()
         for engine_id in list(self._remote_agents):
             self._cleanup_remote_engine(engine_id, log_eviction=False)
         for desc in self._registered_descs:
