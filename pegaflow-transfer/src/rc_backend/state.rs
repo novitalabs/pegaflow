@@ -15,8 +15,8 @@ pub(super) struct RegisteredMemoryEntry {
     pub(super) mrs: Vec<Arc<MemoryRegion>>,
 }
 
-#[derive(Clone, Copy)]
-struct RemoteMemoryEntry {
+#[derive(Clone, Copy, Debug)]
+pub(super) struct RemoteMemoryEntry {
     base_ptr: u64,
     end_ptr: u64,
     rkey: u32,
@@ -74,12 +74,10 @@ impl PerNicState {
         self.remote_memory.remove(&remote_first_qpn);
     }
 
-    /// Validate and cache the remote memory regions received during handshake.
-    pub(super) fn cache_remote_memory(
-        &mut self,
-        remote_first_qpn: u32,
+    /// Validate the remote memory regions received during handshake.
+    pub(super) fn build_remote_memory_cache(
         remote_memory_regions: &[RegisteredMemoryRegion],
-    ) -> Result<()> {
+    ) -> Result<Vec<RemoteMemoryEntry>> {
         let mut cached = Vec::with_capacity(remote_memory_regions.len());
         for entry in remote_memory_regions.iter().copied() {
             if entry.len == 0 {
@@ -106,8 +104,15 @@ impl PerNicState {
                 ));
             }
         }
+        Ok(cached)
+    }
+
+    pub(super) fn insert_remote_memory_cache(
+        &mut self,
+        remote_first_qpn: u32,
+        cached: Vec<RemoteMemoryEntry>,
+    ) {
         self.remote_memory.insert(remote_first_qpn, cached);
-        Ok(())
     }
 }
 
@@ -169,7 +174,6 @@ mod tests {
 
     #[test]
     fn cache_remote_memory_rejects_overlapping_regions() {
-        let mut nic = PerNicState::default();
         let regions = vec![
             RegisteredMemoryRegion {
                 base_ptr: 0x1000,
@@ -183,9 +187,8 @@ mod tests {
             },
         ];
 
-        let error = nic
-            .cache_remote_memory(1, &regions)
-            .expect_err("overlap should fail");
+        let error =
+            PerNicState::build_remote_memory_cache(&regions).expect_err("overlap should fail");
         assert_eq!(
             error,
             TransferError::Backend(
@@ -215,8 +218,8 @@ mod tests {
                 rkey: 2,
             },
         ];
-        nic.cache_remote_memory(remote_qpn, &regions)
-            .expect("snapshot cache");
+        let cache = PerNicState::build_remote_memory_cache(&regions).expect("snapshot cache");
+        nic.insert_remote_memory_cache(remote_qpn, cache);
 
         let hit = nic.find_remote_rkey(remote_qpn, 0x2080, 0x10);
         assert_eq!(hit, Some(2));

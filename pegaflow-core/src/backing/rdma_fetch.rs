@@ -231,15 +231,16 @@ async fn rdma_fetch_task(
     spawn_release_lock(client, transfer_session_id);
 
     let elapsed = t0.elapsed();
+    let secs = elapsed.as_secs_f64();
     let mb = total_bytes as f64 / (1024.0 * 1024.0);
-    let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
-    let throughput_mib_s = if elapsed.as_secs_f64() > 0.0 {
-        mb / elapsed.as_secs_f64()
+    let elapsed_ms = secs * 1000.0;
+    let bandwidth_gb_s = if secs > 0.0 {
+        (total_bytes as f64 / 1e9) / secs
     } else {
         0.0
     };
     info!(
-        "RDMA fetch summary: req_id={req_id} remote={remote_addr} blocks={}/{} slots={} descs={} slabs={} bytes_mib={mb:.1} total_ms={elapsed_ms:.2} tp_mib_s={throughput_mib_s:.0}",
+        "RDMA fetch summary: req_id={req_id} remote={remote_addr} blocks={}/{} slots={} descs={} slabs={} bytes_mib={mb:.1} total_ms={elapsed_ms:.2} bandwidth_gb_s={bandwidth_gb_s:.2}",
         result.len(),
         block_hashes.len(),
         transfer_timing.slot_count,

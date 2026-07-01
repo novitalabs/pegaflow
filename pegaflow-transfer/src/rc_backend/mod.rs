@@ -13,7 +13,7 @@ use sideway::ibverbs::AccessFlags;
 
 use self::runtime::RcRuntime;
 use self::session::{RcSession, RdmaOp};
-use self::state::{AddrConnection, RcBackendState, RegisteredMemoryEntry};
+use self::state::{AddrConnection, PerNicState, RcBackendState, RegisteredMemoryEntry};
 use std::ptr::NonNull;
 
 use mea::oneshot;
@@ -277,7 +277,39 @@ impl RcBackend {
         local_nics: Vec<NicHandshake>,
         remote_nics: &[NicHandshake],
     ) -> Result<()> {
+        let result = self.complete_handshake_for_inner(remote_addr, &local_nics, remote_nics);
+        if let Err(err) = result {
+            let (removed_connecting, removed_pending) =
+                self.cleanup_handshake_attempt(remote_addr, &local_nics);
+            warn!(
+                "handshake completion failed: remote={remote_addr} removed_connecting={removed_connecting} removed_pending={removed_pending}: {err}"
+            );
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn complete_handshake_for_inner(
+        &self,
+        remote_addr: &str,
+        local_nics: &[NicHandshake],
+        remote_nics: &[NicHandshake],
+    ) -> Result<()> {
         let nic_count = self.nic_count();
+        if local_nics.len() != nic_count {
+            return Err(TransferError::InvalidArgument(
+                "local NIC count mismatch in handshake",
+            ));
+        }
+        for (nic_idx, nic) in local_nics.iter().enumerate() {
+            if nic.endpoints.len() != self.qps_per_peer {
+                return Err(TransferError::Backend(format!(
+                    "local qps_per_peer mismatch on nic={nic_idx}: local={}, expected={}",
+                    nic.endpoints.len(),
+                    self.qps_per_peer,
+                )));
+            }
+        }
         if remote_nics.len() != nic_count {
             return Err(TransferError::InvalidArgument(
                 "remote NIC count mismatch in handshake",
@@ -292,6 +324,15 @@ impl RcBackend {
                 )));
             }
         }
+        let remote_first_qpns: Vec<u32> = remote_nics
+            .iter()
+            .map(|nic| nic.endpoints[0].qp_num)
+            .collect();
+        let remote_memory: Result<Vec<_>> = remote_nics
+            .iter()
+            .map(|nic| PerNicState::build_remote_memory_cache(&nic.memory_regions))
+            .collect();
+        let remote_memory = remote_memory?;
 
         // Pop pending sessions by matching QPN from local_nics (not blind FIFO).
         // Concurrent prepare/complete for different remote addrs could reorder the
@@ -333,15 +374,12 @@ impl RcBackend {
 
         // Store sessions + addr_connections
         let mut state = self.state.lock();
-        let mut remote_first_qpns = Vec::with_capacity(nic_count);
-        for (nic_idx, sessions) in pending.into_iter().enumerate() {
-            let remote = &remote_nics[nic_idx];
-            let remote_first_qpn = remote.endpoints[0].qp_num;
-            state.nics[nic_idx].cache_remote_memory(remote_first_qpn, &remote.memory_regions)?;
+        for (nic_idx, (sessions, memory)) in pending.into_iter().zip(remote_memory).enumerate() {
+            let remote_first_qpn = remote_first_qpns[nic_idx];
+            state.nics[nic_idx].insert_remote_memory_cache(remote_first_qpn, memory);
             state.nics[nic_idx]
                 .sessions
                 .insert(remote_first_qpn, sessions);
-            remote_first_qpns.push(remote_first_qpn);
         }
         let removed = state.connecting.remove(remote_addr);
         debug_assert!(removed, "connecting set should contain {remote_addr}");
@@ -362,7 +400,7 @@ impl RcBackend {
             remote_addr.to_string(),
             AddrConnection {
                 remote_first_qpns,
-                local_nics,
+                local_nics: local_nics.to_vec(),
                 rr_counters,
             },
         );
@@ -371,15 +409,36 @@ impl RcBackend {
 
     /// Drop pending sessions created by get_or_prepare when handshake failed.
     pub(crate) fn abort_handshake(&self, remote_addr: &str, local_nics: &[NicHandshake]) {
+        let (removed_connecting, removed_pending) =
+            self.cleanup_handshake_attempt(remote_addr, local_nics);
+        if removed_connecting || removed_pending > 0 {
+            warn!(
+                "handshake aborted: remote={remote_addr} removed_connecting={removed_connecting} removed_pending={removed_pending}"
+            );
+        } else {
+            debug!("handshake abort ignored after prior cleanup: remote={remote_addr}");
+        }
+    }
+
+    fn cleanup_handshake_attempt(
+        &self,
+        remote_addr: &str,
+        local_nics: &[NicHandshake],
+    ) -> (bool, usize) {
         let mut state = self.state.lock();
-        let removed = state.connecting.remove(remote_addr);
-        debug_assert!(removed, "connecting set should contain {remote_addr}");
-        for (nic_idx, nic) in local_nics.iter().enumerate() {
+        let removed_connecting = state.connecting.remove(remote_addr);
+        let mut removed_pending = 0usize;
+        for (nic_idx, nic) in local_nics.iter().enumerate().take(state.nics.len()) {
             for ep in &nic.endpoints {
-                state.nics[nic_idx].remove_pending_by_qpn(ep.qp_num);
+                if state.nics[nic_idx]
+                    .remove_pending_by_qpn(ep.qp_num)
+                    .is_some()
+                {
+                    removed_pending += 1;
+                }
             }
         }
-        warn!("handshake aborted: remote={remote_addr}");
+        (removed_connecting, removed_pending)
     }
 
     /// Get local NicHandshake metadata for an established connection.
