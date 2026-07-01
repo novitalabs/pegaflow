@@ -827,6 +827,7 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         self._pega_expected_peers: dict[str, set[str]] = defaultdict(set)
         self._pega_submitted_peers: dict[str, set[str]] = defaultdict(set)
         self._pega_completed_peers: dict[str, set[str]] = defaultdict(set)
+        self._pega_local_block_table_handles: set[int] = set()
         self._pega_accept_stop = None
         self._pega_accept_thread = None
         self._pega_accept_broker_endpoint = make_accept_broker_endpoint_from_config(
@@ -868,7 +869,9 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         nixl_handle: object,
         blocks_data: list[tuple[int, int, int]],
     ) -> None:
-        self._pega_rdma.register_local_blocks(id(nixl_handle), blocks_data)
+        table_handle = id(nixl_handle)
+        self._pega_rdma.register_local_blocks(table_handle, blocks_data)
+        self._pega_local_block_table_handles.add(table_handle)
 
     def _on_remote_blocks_registered(
         self,
@@ -877,6 +880,18 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         blocks_data: list[tuple[int, int, int]],
     ) -> None:
         self._pega_rdma.register_remote_blocks(engine_id, tp_rank, blocks_data)
+
+    def _cleanup_remote_engine(self, engine_id: str, *, log_eviction: bool = True) -> None:
+        """Remove inherited NIXL state and matching Pega RDMA remote block tables."""
+        try:
+            self._pega_rdma.unregister_remote_blocks(engine_id)
+        except Exception:
+            logger.debug(
+                "Failed to unregister Pega RDMA v1 remote blocks for engine %s",
+                engine_id,
+                exc_info=True,
+            )
+        super()._cleanup_remote_engine(engine_id, log_eviction=log_eviction)
 
     def _start_pega_rdma_accept_service(self) -> None:
         """Connect to the scheduler-owned broker for worker-owned RDMA accepts."""
@@ -1153,6 +1168,7 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
         done_req_ids: set[str] = set()
         for req_id, handles in list(transfers.items()):
             in_progress = []
+            failed = False
             for handle in handles:
                 read = self._pega_rdma_reads.get(handle)
                 if read is None:
@@ -1180,6 +1196,8 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
                             msg=f"unexpected Pega RDMA v1 state {state}",
                         )
                         self._handle_failed_transfer(req_id, handle)
+                        failed = True
+                        break
                 except Exception as e:
                     self._log_failure(
                         failure_type="transfer_exception",
@@ -1188,6 +1206,11 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
                         error=e,
                     )
                     self._handle_failed_transfer(req_id, handle)
+                    failed = True
+                    break
+
+            if failed:
+                continue
 
             expected = self._pega_expected_peers.get(req_id, set())
             completed = self._pega_completed_peers.get(req_id, set())
@@ -1207,16 +1230,18 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
 
     def _handle_failed_transfer(self, req_id: str, handle: int | None):
         """Release Pega RDMA state, then delegate request failure to NIXL."""
+        handles_to_release = set(self._recving_transfers.pop(req_id, []))
         if handle is not None:
-            read = self._pega_rdma_reads.pop(handle, None)
+            handles_to_release.add(handle)
+        for pending_handle in handles_to_release:
+            read = self._pega_rdma_reads.pop(pending_handle, None)
             if read is not None:
-                self._pega_rdma.release_read(handle)
+                self._pega_rdma.release_read(pending_handle)
                 self._pega_rdma.invalidate_connection(read.remote_addr)
-                handle = None
         self._pega_expected_peers.pop(req_id, None)
         self._pega_submitted_peers.pop(req_id, None)
         self._pega_completed_peers.pop(req_id, None)
-        super()._handle_failed_transfer(req_id, handle)
+        super()._handle_failed_transfer(req_id, None)
 
     def shutdown(self):
         """Release Pega RDMA resources before the inherited NIXL shutdown."""
@@ -1231,6 +1256,16 @@ class PegaNixlPullConnectorWorker(NixlPullConnectorWorker):
             self._pega_rdma.release_read(read.handle)
         self._pega_rdma_reads.clear()
         self._recving_transfers.clear()
+        for table_handle in list(self._pega_local_block_table_handles):
+            try:
+                self._pega_rdma.unregister_local_blocks(table_handle)
+            except Exception:
+                logger.debug(
+                    "Failed to unregister Pega RDMA v1 local blocks for handle %s",
+                    table_handle,
+                    exc_info=True,
+                )
+        self._pega_local_block_table_handles.clear()
         try:
             self._pega_rdma.unregister_memory(
                 [addr for addr, _size, _device_id, _tag in self._pega_local_memory_regions]

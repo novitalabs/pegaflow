@@ -224,6 +224,15 @@ impl PegaRdmaV1Engine {
         Ok(())
     }
 
+    fn unregister_local_blocks(&self, nixl_handle: u64) -> PyResult<()> {
+        self.state
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("PegaRdmaV1Engine state mutex poisoned"))?
+            .local_block_tables
+            .remove(&nixl_handle);
+        Ok(())
+    }
+
     fn register_remote_blocks(
         &self,
         engine_id: String,
@@ -236,6 +245,22 @@ impl PegaRdmaV1Engine {
             .map_err(|_| PyRuntimeError::new_err("PegaRdmaV1Engine state mutex poisoned"))?
             .remote_block_tables
             .insert((engine_id, tp_rank), table);
+        Ok(())
+    }
+
+    #[pyo3(signature = (engine_id, tp_rank = None))]
+    fn unregister_remote_blocks(&self, engine_id: String, tp_rank: Option<usize>) -> PyResult<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("PegaRdmaV1Engine state mutex poisoned"))?;
+        if let Some(tp_rank) = tp_rank {
+            state.remote_block_tables.remove(&(engine_id, tp_rank));
+        } else {
+            state
+                .remote_block_tables
+                .retain(|(table_engine_id, _), _| table_engine_id != &engine_id);
+        }
         Ok(())
     }
 
