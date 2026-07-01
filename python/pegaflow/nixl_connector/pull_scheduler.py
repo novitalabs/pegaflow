@@ -3,6 +3,8 @@
 # Modified by PegaFlow contributors in 2026.
 """Pull-specific scheduler-side logic for the NIXL connector."""
 
+from __future__ import annotations
+
 import os
 import threading
 import time
@@ -47,14 +49,14 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
 
     def __init__(
         self,
-        vllm_config: "VllmConfig",
+        vllm_config: VllmConfig,
         engine_id: str,
-        kv_cache_config: "KVCacheConfig",
+        kv_cache_config: KVCacheConfig,
     ):
         super().__init__(vllm_config, engine_id, kv_cache_config)
 
     def get_num_new_matched_tokens(
-        self, request: "Request", num_computed_tokens: int
+        self, request: Request, num_computed_tokens: int
     ) -> tuple[int, bool]:
         """
         For remote prefill, pull all prompt blocks from remote
@@ -127,7 +129,7 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
         return 0, False
 
     def update_state_after_alloc(
-        self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
+        self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
     ):
         params = request.kv_transfer_params
         logger.debug(
@@ -194,8 +196,8 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
 
     def request_finished(
         self,
-        request: "Request",
-        block_ids: "BlockIds",
+        request: Request,
+        block_ids: BlockIds,
     ) -> tuple[bool, dict[str, Any] | None]:
         """
         Once a request is finished, determine whether request blocks
@@ -337,8 +339,7 @@ class PegaNixlPullConnectorScheduler(NixlPullConnectorScheduler):
         if not ready_event.wait(timeout=self._pega_rdma_config.handshake_timeout_s):
             self._pega_accept_broker_stop.set()
             raise RuntimeError(
-                f"Pega RDMA v1 accept broker failed to bind "
-                f"{self._pega_accept_broker_endpoint}"
+                f"Pega RDMA v1 accept broker failed to bind " f"{self._pega_accept_broker_endpoint}"
             )
         self._pega_accept_broker_thread = thread
 
@@ -362,9 +363,7 @@ class PegaNixlPullConnectorScheduler(NixlPullConnectorScheduler):
                         "ok": False,
                         "error": "Pega RDMA v1 worker accept timed out",
                     }
-                    sock.send_multipart(
-                        (*client_reply_prefix, msgspec.msgpack.encode(response))
-                    )
+                    sock.send_multipart((*client_reply_prefix, msgspec.msgpack.encode(response)))
                 try:
                     frames = sock.recv_multipart()
                 except zmq.Again:
@@ -393,9 +392,7 @@ class PegaNixlPullConnectorScheduler(NixlPullConnectorScheduler):
                             )
                         )
                         for payload_to_send in queued_payloads:
-                            sock.send_multipart(
-                                (identity, msgspec.msgpack.encode(payload_to_send))
-                            )
+                            sock.send_multipart((identity, msgspec.msgpack.encode(payload_to_send)))
                     elif kind == PEGA_RDMA_V1_ACCEPT_RESPONSE:
                         request_id = payload.get("request_id")
                         if not isinstance(request_id, int):
@@ -407,9 +404,7 @@ class PegaNixlPullConnectorScheduler(NixlPullConnectorScheduler):
                                 request_id,
                             )
                             continue
-                        sock.send_multipart(
-                            (*client_reply_prefix, msgspec.msgpack.encode(payload))
-                        )
+                        sock.send_multipart((*client_reply_prefix, msgspec.msgpack.encode(payload)))
                     elif kind == PEGA_RDMA_V1_ACCEPT_REQUEST:
                         target_tp_rank = payload.get("target_tp_rank")
                         if not isinstance(target_tp_rank, int):
