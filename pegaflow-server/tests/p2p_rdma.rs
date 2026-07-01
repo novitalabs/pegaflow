@@ -224,6 +224,32 @@ async fn wait_for_metaserver_registration(
     }
 }
 
+async fn wait_for_metaserver_ownership(
+    store: &BlockHashStore,
+    namespace: &str,
+    hashes: &[Vec<u8>],
+    node: &str,
+    expected: usize,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let found = store.query_prefix(namespace, hashes);
+        let owned = found
+            .iter()
+            .filter(|entry| entry.nodes.iter().any(|n| &**n == node))
+            .count();
+        if owned >= expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for MetaServer ownership by {node} ({owned} / {expected})"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 async fn wait_for_prefetch_done(
     engine: &PegaEngine,
     instance_id: &str,
@@ -406,6 +432,19 @@ async fn p2p_rdma_remote_fetch_roundtrip() {
         &block_hashes,
         NUM_BLOCKS,
         Duration::from_secs(30),
+    )
+    .await;
+
+    // ── 8b. Verify Engine B re-registered fetched blocks to MetaServer ──
+    // RDMA-fetched blocks are now resident on B, so B must advertise them so
+    // other nodes can discover and fetch from B (not just from A).
+    wait_for_metaserver_ownership(
+        &meta_store,
+        NAMESPACE,
+        &block_hashes,
+        &format!("127.0.0.1:{port_b}"),
+        NUM_BLOCKS,
+        Duration::from_secs(10),
     )
     .await;
 

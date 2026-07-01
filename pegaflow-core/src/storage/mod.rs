@@ -229,8 +229,12 @@ impl StorageEngine {
             #[cfg(not(feature = "rdma"))]
             let rdma_fetch = None;
 
-            let prefetch =
-                PrefetchScheduler::new(ssd_store.clone(), rdma_fetch, max_prefetch_blocks);
+            let prefetch = PrefetchScheduler::new(
+                ssd_store.clone(),
+                rdma_fetch,
+                metaserver_client.clone(),
+                max_prefetch_blocks,
+            );
 
             let transfer_lock = Arc::new(transfer_lock::TransferLockManager::new(
                 transfer_lock_timeout,
