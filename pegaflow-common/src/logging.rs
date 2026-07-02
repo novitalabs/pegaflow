@@ -155,7 +155,14 @@ fn init(config: LoggingConfig) {
             }
         }
 
-        builder.apply();
+        // try_apply, not apply: an embedding host (e.g. an inference engine
+        // using pegaflow-core as a library) typically installed its own global
+        // logger before constructing the engine. Losing pegaflow's preferred
+        // format is correct there — the host's logger receives our `log`
+        // records; panicking on its existence is not.
+        if let Err(err) = builder.try_apply() {
+            eprintln!("pegaflow logging setup skipped (global logger already installed): {err}");
+        }
     });
 }
 
