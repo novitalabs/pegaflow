@@ -117,6 +117,9 @@ impl BlockHashBatch {
 enum MetaServerCommand {
     Insert(BlockHashBatch),
     Remove(BlockHashBatch),
+    /// Barrier: acked once every insert/remove enqueued before it has been
+    /// delivered to the MetaServer (or dropped after a failed attempt).
+    Flush(oneshot::Sender<()>),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -272,6 +275,26 @@ impl MetaServerClient {
         let _ = tokio::time::timeout(shutdown_timeout, done_rx).await;
     }
 
+    /// Barrier: resolves once every registration enqueued before this call has
+    /// been delivered to the MetaServer — or dropped after a failed attempt.
+    /// "Attempted" is the strongest contract the fire-and-forget queue can
+    /// offer; on ack, a subsequent MetaServer query observes every hash whose
+    /// insert RPC succeeded.
+    ///
+    /// Returns immediately if the registration loop has already exited.
+    pub async fn flush(&self) {
+        let (done_tx, done_rx) = oneshot::channel();
+        if self
+            .command_tx
+            .send(MetaServerCommand::Flush(done_tx))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let _ = done_rx.await;
+    }
+
     /// Query MetaServer for the longest prefix of blocks that exist remotely.
     /// Returns per-node prefix lengths.
     #[cfg(feature = "rdma")]
@@ -361,6 +384,9 @@ async fn registration_loop(
         let mut mixed_ops: Option<HashMap<(String, Vec<u8>), bool>> = None; // true=insert
         let mut saw_insert = false;
         let mut saw_remove = false;
+        // Flush barriers drained in this batch; acked after the sends below, so
+        // an ack means "everything enqueued before the flush has been attempted".
+        let mut flush_acks: Vec<oneshot::Sender<()>> = Vec::new();
 
         // Drain all pending commands. Pure insert/remove batches stay grouped by
         // namespace; mixed streams switch to last-write-wins netting.
@@ -387,6 +413,9 @@ async fn registration_loop(
                     } else {
                         append_groups(&mut removes, batch.groups);
                     }
+                }
+                MetaServerCommand::Flush(done) => {
+                    flush_acks.push(done);
                 }
                 MetaServerCommand::Shutdown(done) => {
                     unregister_current_session(
@@ -433,6 +462,9 @@ async fn registration_loop(
             core_metrics()
                 .metaserver_removal_failures
                 .add(remove_total as u64, &[]);
+            // The batched hashes are dropped, not retried: the barrier's
+            // "delivered or dropped" contract is met, so ack the flushes.
+            ack_flushes(flush_acks);
             continue;
         }
 
@@ -492,6 +524,7 @@ async fn registration_loop(
                     .add(remove_total as u64, &[]);
             }
             client = None;
+            ack_flushes(flush_acks);
             continue;
         }
 
@@ -544,9 +577,16 @@ async fn registration_loop(
                 .add(dropped as u64, &[]);
             client = None;
         }
+        ack_flushes(flush_acks);
     }
 
     info!("MetaServer registration loop shutting down");
+}
+
+fn ack_flushes(acks: Vec<oneshot::Sender<()>>) {
+    for done in acks {
+        let _ = done.send(());
+    }
 }
 
 /// Hashes that did not reach the MetaServer after a chunked send failed at
@@ -985,6 +1025,54 @@ mod tests {
         wait_for_count(&service.heartbeat_notify, &service.heartbeat_count, 1).await;
         client.try_register_namespace("ns".to_string(), vec![vec![1]]);
         wait_for_count(&service.heartbeat_notify, &service.heartbeat_count, 2).await;
+
+        client.shutdown().await;
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn flush_barrier_waits_for_prior_registrations() {
+        let (addr, service, shutdown_tx) = start_fake_metaserver().await;
+        let client = MetaServerClient::new(MetaServerClientConfig::new(
+            addr,
+            "node-a:50055".to_string(),
+        ));
+
+        client.try_register_namespace("ns".to_string(), vec![vec![1], vec![2]]);
+        // On return, the insert enqueued above must have been delivered — no
+        // wait_for_count polling; the barrier itself is the synchronization.
+        client.flush().await;
+        assert_eq!(
+            collect_requests(&service.insert_requests),
+            expected_requests(&[("ns", vec![1]), ("ns", vec![2])])
+        );
+
+        // Flush with an empty queue resolves promptly (no deadlock).
+        client.flush().await;
+
+        client.shutdown().await;
+        // Flush after shutdown: loop has exited, must return, not hang.
+        client.flush().await;
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn flush_barrier_acks_even_when_insert_fails() {
+        let (addr, service, shutdown_tx) = start_fake_metaserver().await;
+        // Fail both the insert attempt and the session-reset retry heartbeat
+        // path's next insert, so the batch is dropped rather than delivered.
+        service
+            .fail_insert_with_stale_session
+            .store(usize::MAX, Ordering::SeqCst);
+        let client = MetaServerClient::new(MetaServerClientConfig::new(
+            addr,
+            "node-a:50055".to_string(),
+        ));
+
+        client.try_register_namespace("ns".to_string(), vec![vec![1]]);
+        // The contract is "delivered or dropped": a failed insert drops the
+        // batch and the flush must still resolve instead of hanging.
+        client.flush().await;
 
         client.shutdown().await;
         let _ = shutdown_tx.send(());

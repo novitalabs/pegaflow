@@ -350,6 +350,15 @@ impl StorageEngine {
         }
     }
 
+    /// Flush the MetaServer registration queue: waits until every hash
+    /// registration enqueued before this call has been delivered (or dropped
+    /// after a failed attempt). No-op without a MetaServer client.
+    pub(crate) async fn flush_metaserver_registrations(&self) {
+        if let Some(client) = &self.metaserver_client {
+            client.flush().await;
+        }
+    }
+
     pub(crate) fn filter_hashes_not_in_cache_inplace(
         &self,
         namespace: &str,

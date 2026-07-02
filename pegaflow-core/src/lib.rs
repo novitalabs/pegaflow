@@ -38,7 +38,9 @@ pub use block::{
 };
 use instance::GpuRegistration;
 pub use instance::{GpuContext, InstanceContext};
-pub use internode::{DEFAULT_METASERVER_QUEUE_DEPTH, MetaServerClient, MetaServerClientConfig};
+pub use internode::{
+    DEFAULT_METASERVER_QUEUE_DEPTH, MetaServerClient, MetaServerClientConfig, P2pTransferService,
+};
 use layout::KVCacheLayout;
 pub use lease::QueryLeaseId;
 pub use pegaflow_common::NumaNode;
@@ -724,6 +726,21 @@ impl PegaEngine {
     /// read cache (or inflight map) by the time this future resolves.
     pub async fn flush_saves(&self) {
         self.storage.flush_write_pipeline().await;
+    }
+
+    /// [`Self::flush_saves`] plus a MetaServer registration barrier: on return,
+    /// every block saved before this call is cache-resident *and* its hash
+    /// registration has been delivered to the MetaServer (or dropped after a
+    /// failed attempt — registration stays best-effort, this only bounds when).
+    ///
+    /// The P/D handoff barrier: a prefill node calls this before signalling
+    /// "KV ready", so a decode node's MetaServer query is guaranteed to
+    /// discover the blocks. Ordering matters — the write pipeline enqueues the
+    /// registrations as it seals blocks, so the pipeline must drain first.
+    /// Without a MetaServer client this degrades to [`Self::flush_saves`].
+    pub async fn flush_saves_and_registrations(&self) {
+        self.storage.flush_write_pipeline().await;
+        self.storage.flush_metaserver_registrations().await;
     }
 
     /// Flush write pipeline and SSD writer.
