@@ -38,3 +38,4 @@ pegaflow-transfer = { workspace = true, optional = true }
 tokio.workspace = true
 tonic.workspace = true
 log.workspace = true
+mea.workspace = true

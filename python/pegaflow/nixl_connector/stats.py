@@ -49,6 +49,19 @@ class NixlKVConnectorStats(KVConnectorStats):
         self.data["bytes_transferred"].append(res.totalBytes)
         self.data["num_descriptors"].append(res.descCount)
 
+    def record_transfer_values(
+        self,
+        *,
+        transfer_duration: float,
+        post_duration: float,
+        bytes_transferred: int,
+        num_descriptors: int,
+    ):
+        self.data["transfer_duration"].append(transfer_duration)
+        self.data["post_duration"].append(post_duration)
+        self.data["bytes_transferred"].append(bytes_transferred)
+        self.data["num_descriptors"].append(num_descriptors)
+
     def record_failed_transfer(self):
         """Record a failed NIXL transfer operation."""
         self.data["num_failed_transfers"].append(1)

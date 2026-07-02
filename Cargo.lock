@@ -1980,6 +1980,7 @@ name = "pegaflow-py"
 version = "0.23.2"
 dependencies = [
  "log",
+ "mea",
  "pegaflow-common",
  "pegaflow-core",
  "pegaflow-metaserver",
