@@ -730,14 +730,18 @@ impl PegaEngine {
 
     /// [`Self::flush_saves`] plus a MetaServer registration barrier: on return,
     /// every block saved before this call is cache-resident *and* its hash
-    /// registration has been delivered to the MetaServer (or dropped after a
-    /// failed attempt — registration stays best-effort, this only bounds when).
+    /// registration has been delivered to the MetaServer — or dropped after a
+    /// failed attempt. Registration stays best-effort: this bounds *when*
+    /// delivery is attempted, never *whether* it succeeds (a full queue drops
+    /// hashes at enqueue time, a MetaServer outage drops the whole batch).
     ///
     /// The P/D handoff barrier: a prefill node calls this before signalling
-    /// "KV ready", so a decode node's MetaServer query is guaranteed to
-    /// discover the blocks. Ordering matters — the write pipeline enqueues the
-    /// registrations as it seals blocks, so the pipeline must drain first.
-    /// Without a MetaServer client this degrades to [`Self::flush_saves`].
+    /// "KV ready", so a decode node's MetaServer query observes every
+    /// registration that made it through; blocks whose registration was
+    /// dropped are simply recomputed on the decode side. Ordering matters —
+    /// the write pipeline enqueues the registrations as it seals blocks, so
+    /// the pipeline must drain first. Without a MetaServer client this
+    /// degrades to [`Self::flush_saves`].
     pub async fn flush_saves_and_registrations(&self) {
         self.storage.flush_write_pipeline().await;
         self.storage.flush_metaserver_registrations().await;

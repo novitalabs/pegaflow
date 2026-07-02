@@ -530,11 +530,18 @@ impl CUMulticastHandle {
         let mut props = unsafe { std::mem::zeroed::<cuda_sys::CUmulticastObjectProp>() };
         props.numDevices = num_devices;
         props.size = size;
-        props.handleTypes = match handle_kind {
-            CUMemHandleKind::Local => cuda_sys::CU_MEM_HANDLE_TYPE_NONE,
-            CUMemHandleKind::FileDescriptor => cuda_sys::CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
-            CUMemHandleKind::Fabric => cuda_sys::CU_MEM_HANDLE_TYPE_FABRIC,
-        } as u64;
+        // cudarc >=0.19.7 generates CUmemAllocationHandleType as a newtype
+        // over c_uint; `.0` reads the raw bitmask the driver API expects.
+        props.handleTypes = u64::from(
+            match handle_kind {
+                CUMemHandleKind::Local => cuda_sys::CU_MEM_HANDLE_TYPE_NONE,
+                CUMemHandleKind::FileDescriptor => {
+                    cuda_sys::CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+                }
+                CUMemHandleKind::Fabric => cuda_sys::CU_MEM_HANDLE_TYPE_FABRIC,
+            }
+            .0,
+        );
 
         let mut granularity: usize = 0;
         cuda_check!(cuda_sys::cuMulticastGetGranularity(

@@ -64,6 +64,32 @@ impl P2pTransferService {
             .await
     }
 
+    /// [`Self::serve`] over a caller-bound listener stream. Binding first lets
+    /// the embedder fail loud on a taken port before reporting itself ready.
+    pub async fn serve_with_incoming<I, IO, IE>(
+        engine: Arc<PegaEngine>,
+        incoming: I,
+        shutdown: impl std::future::Future<Output = ()> + Send,
+    ) -> Result<(), tonic::transport::Error>
+    where
+        I: futures::Stream<Item = Result<IO, IE>>,
+        IO: tonic::transport::server::Connected
+            + tokio::io::AsyncRead
+            + tokio::io::AsyncWrite
+            + Send
+            + Unpin
+            + 'static,
+        IE: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        let service = EngineServer::new(Self::new(engine))
+            .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
+            .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE);
+        tonic::transport::Server::builder()
+            .add_service(service)
+            .serve_with_incoming_shutdown(incoming, shutdown)
+            .await
+    }
+
     fn ok_status() -> ResponseStatus {
         ResponseStatus {
             ok: true,
