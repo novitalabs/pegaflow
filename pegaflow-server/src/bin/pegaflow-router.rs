@@ -158,6 +158,12 @@ async fn handle_completion(
     // Prepare P request (max_tokens=1, non-streaming)
     let mut p_body = body.clone();
     p_body["max_tokens"] = json!(1);
+    // Chat clients send the modern `max_completion_tokens` field (OpenAI
+    // deprecated `max_tokens` for chat); engines prefer it when both are
+    // present, so it must be capped too or P runs the full decode.
+    if p_body.get("max_completion_tokens").is_some() {
+        p_body["max_completion_tokens"] = json!(1);
+    }
     p_body["stream"] = json!(false);
     p_body["request_id"] = json!(req_id.clone());
 
