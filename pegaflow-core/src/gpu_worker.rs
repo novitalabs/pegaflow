@@ -393,18 +393,46 @@ fn build_copy_descs(layers: &[LayerTransferData]) -> Result<(Vec<CopyDesc>, usiz
                     total_bytes += k.bytes + v.bytes;
                 }
                 BlockCopies::Contiguous(c) => {
-                    let ptr = block
-                        .block
-                        .raw()
-                        .segment_mapped_ptr(0)
-                        .unwrap()
-                        .add(host_offset);
-                    copies.push(CopyDesc {
-                        device: c.addr,
-                        host: ptr.host().as_ptr(),
-                        host_device: ptr.device().as_ptr() as u64,
-                        size: c.bytes,
-                    });
+                    let raw = block.block.raw();
+                    // Mirror of the Split branch's contiguous-host fallback:
+                    // a peer with a split-KV registration seals K and V as two
+                    // host segments, while this instance's device block is one
+                    // [K|V] span. Copy each segment to its half of the span.
+                    if let Some(seg1) = raw.segment_mapped_ptr(1) {
+                        let k_bytes = raw.segment_size(0).unwrap();
+                        let v_bytes = raw.segment_size(1).unwrap();
+                        if raw.num_segments() != 2 || k_bytes + v_bytes != c.bytes {
+                            return Err(EngineError::Storage(format!(
+                                "layer {layer_name}: stored block segments ({} x {k_bytes}+{v_bytes} bytes) \
+                                 do not span the contiguous device block ({} bytes): \
+                                 namespace is shared by incompatible KV layouts",
+                                raw.num_segments(),
+                                c.bytes
+                            )));
+                        }
+                        let k_ptr = raw.segment_mapped_ptr(0).unwrap().add(host_offset);
+                        let v_ptr = seg1.add(host_offset);
+                        copies.push(CopyDesc {
+                            device: c.addr,
+                            host: k_ptr.host().as_ptr(),
+                            host_device: k_ptr.device().as_ptr() as u64,
+                            size: k_bytes,
+                        });
+                        copies.push(CopyDesc {
+                            device: c.addr + k_bytes as u64,
+                            host: v_ptr.host().as_ptr(),
+                            host_device: v_ptr.device().as_ptr() as u64,
+                            size: v_bytes,
+                        });
+                    } else {
+                        let ptr = raw.segment_mapped_ptr(0).unwrap().add(host_offset);
+                        copies.push(CopyDesc {
+                            device: c.addr,
+                            host: ptr.host().as_ptr(),
+                            host_device: ptr.device().as_ptr() as u64,
+                            size: c.bytes,
+                        });
+                    }
                     total_bytes += c.bytes;
                 }
             }
