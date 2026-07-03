@@ -75,6 +75,7 @@ class NixlHandshakePayload(KVConnectorHandshakeMetadata):
 
     compatibility_hash: str
     agent_metadata_bytes: bytes  # NixlAgentMetadata encoded
+    extensions: dict[str, Any] | None = None
 
 
 def compute_nixl_compatibility_hash(

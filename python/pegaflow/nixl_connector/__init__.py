@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by PegaFlow contributors in 2026.
 """NIXL KV-cache transfer connector (disaggregated prefill / decode)."""
 
 from pegaflow.nixl_connector.base_scheduler import (
@@ -13,6 +14,8 @@ from pegaflow.nixl_connector.connector import (
     NixlConnector,
     NixlPullConnector,
     NixlPushConnector,
+    PegaNixlConnector,
+    PegaNixlPullConnector,
 )
 from pegaflow.nixl_connector.metadata import (
     NixlAgentMetadata,
@@ -21,9 +24,11 @@ from pegaflow.nixl_connector.metadata import (
 )
 from pegaflow.nixl_connector.pull_scheduler import (
     NixlPullConnectorScheduler,
+    PegaNixlPullConnectorScheduler,
 )
 from pegaflow.nixl_connector.pull_worker import (
     NixlPullConnectorWorker,
+    PegaNixlPullConnectorWorker,
 )
 from pegaflow.nixl_connector.push_scheduler import (
     NixlPushConnectorScheduler,
@@ -58,4 +63,8 @@ __all__ = [
     "NixlPushConnector",
     "NixlPushConnectorScheduler",
     "NixlPushConnectorWorker",
+    "PegaNixlConnector",
+    "PegaNixlPullConnector",
+    "PegaNixlPullConnectorScheduler",
+    "PegaNixlPullConnectorWorker",
 ]

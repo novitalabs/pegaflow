@@ -237,18 +237,19 @@ class NixlBaseConnectorScheduler:
         Args:
             metadata (dict): the handshake metadata to set.
         """
-        encoded_data: dict[int, bytes] = {}
+        handshake_payloads: dict[int, NixlHandshakePayload] = {}
         encoder = msgspec.msgpack.Encoder()
         for tp_rank, rank_metadata in metadata.items():
             if not isinstance(rank_metadata, NixlHandshakePayload):
                 raise ValueError(
                     "NixlConnectorScheduler expects NixlHandshakePayload for handshake metadata."
                 )
-            encoded_data[tp_rank] = encoder.encode(rank_metadata)
+            handshake_payloads[tp_rank] = rank_metadata
+            encoded_data = encoder.encode(rank_metadata)
             logger.debug(
                 "Tp rank %d: encoded NixlHandshakePayload size: %s bytes",
                 tp_rank,
-                str(len(encoded_data[tp_rank])),
+                str(len(encoded_data)),
             )
 
         # Only start the listener when we have metadata to serve.
@@ -257,11 +258,12 @@ class NixlBaseConnectorScheduler:
             self._nixl_handshake_listener_t = threading.Thread(
                 target=self._nixl_handshake_listener,
                 args=(
-                    encoded_data,
+                    handshake_payloads,
                     ready_event,
                     self._stop_event,
                     self.side_channel_host,
                     self.side_channel_port,
+                    self._handle_handshake_extensions,
                 ),
                 daemon=True,
                 name="nixl_handshake_listener",
@@ -271,11 +273,12 @@ class NixlBaseConnectorScheduler:
 
     @staticmethod
     def _nixl_handshake_listener(
-        encoded_data: dict[int, Any],
+        handshake_payloads: dict[int, NixlHandshakePayload],
         ready_event: threading.Event,
         stop_event: threading.Event,
         host: str,
         port: int,
+        extension_handler: Any,
     ):
         """Background thread for getting new NIXL handshakes."""
         # NOTE(rob): this is a simple implementation. We will move
@@ -294,15 +297,37 @@ class NixlBaseConnectorScheduler:
                     if stop_event.is_set():
                         break
                     continue
-                # Decode the message which contains (GET_META_MSG, rank)
-                msg, target_tp_rank = msgspec.msgpack.decode(msg)
+                # Transport-specific connectors fold their own metadata
+                # exchange into NIXL's existing request/response handshake.
+                decoded = msgspec.msgpack.decode(msg)
+                if len(decoded) != 3:
+                    logger.warning("Connection listener got malformed message %s", decoded)
+                    continue
+                msg, target_tp_rank, request_extensions = decoded
                 logger.debug(
                     "Received message for tp rank %s",
                     target_tp_rank,
                 )
                 if msg != GET_META_MSG:
                     logger.warning("Connection listener got unexpected message %s", msg)
-                sock.send_multipart((identity, b"", encoded_data[target_tp_rank]))
+                payload = handshake_payloads[target_tp_rank]
+                if not isinstance(request_extensions, dict):
+                    logger.warning(
+                        "Connection listener got invalid extensions %s",
+                        request_extensions,
+                    )
+                    continue
+                payload = extension_handler(target_tp_rank, payload, request_extensions)
+                sock.send_multipart((identity, b"", msgspec.msgpack.encode(payload)))
+
+    def _handle_handshake_extensions(
+        self,
+        target_tp_rank: int,
+        payload: NixlHandshakePayload,
+        request_extensions: dict[str, Any],
+    ) -> NixlHandshakePayload:
+        """Let connector variants enrich a NIXL handshake response."""
+        return payload
 
     def _mamba_prefill_token_count(self, num_prompt_tokens: int) -> int:
         """D-side only. Returns N-1 for Mamba models since the decoder

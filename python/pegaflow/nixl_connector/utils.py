@@ -33,17 +33,27 @@ _NIXL_SUPPORTED_DEVICE.update(current_platform.get_nixl_supported_devices())
 
 # TODO: merge with vllm.utils.network_utils.zmq_socket_ctx
 @contextlib.contextmanager
-def zmq_ctx(socket_type: Any, addr: str) -> Iterator[zmq.Socket]:
+def zmq_ctx(
+    socket_type: Any,
+    addr: str,
+    *,
+    bind: bool | None = None,
+    identity: bytes | None = None,
+) -> Iterator[zmq.Socket]:
     """Context manager for a ZMQ socket"""
 
-    if socket_type not in (zmq.ROUTER, zmq.REQ):
+    if socket_type not in (zmq.ROUTER, zmq.REQ, zmq.DEALER):
         raise ValueError(f"Unexpected socket type: {socket_type}")
 
     ctx: zmq.Context | None = None
     try:
         ctx = zmq.Context()  # type: ignore[attr-defined]
         yield make_zmq_socket(
-            ctx=ctx, path=addr, socket_type=socket_type, bind=socket_type == zmq.ROUTER
+            ctx=ctx,
+            path=addr,
+            socket_type=socket_type,
+            bind=socket_type == zmq.ROUTER if bind is None else bind,
+            identity=identity,
         )
     finally:
         if ctx is not None:

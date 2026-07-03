@@ -67,3 +67,15 @@ def register() -> None:
             "pegaflow.nixl_connector",
             "NixlPushConnector",
         )
+    with contextlib.suppress(ValueError):
+        KVConnectorFactory.register_connector(
+            "PegaNixlConnector",
+            "pegaflow.nixl_connector",
+            "PegaNixlConnector",
+        )
+    with contextlib.suppress(ValueError):
+        KVConnectorFactory.register_connector(
+            "PegaNixlPullConnector",
+            "pegaflow.nixl_connector",
+            "PegaNixlPullConnector",
+        )
