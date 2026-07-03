@@ -267,6 +267,10 @@ impl PegaRdmaV1Engine {
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors the NIXL read_async_indices FFI signature 1:1"
+    )]
     fn read_async_indices(
         &self,
         py: Python<'_>,
