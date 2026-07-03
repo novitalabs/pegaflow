@@ -203,11 +203,17 @@ impl Engine for P2pTransferService {
             .engine
             .rdma_accept_handshake(&req.requester_id, &req.handshake_metadata)
             .map_err(|e| {
-                warn!("P2P rdma_handshake failed: requester={} {e}", req.requester_id);
+                warn!(
+                    "P2P rdma_handshake failed: requester={} {e}",
+                    req.requester_id
+                );
                 Status::internal(format!("RDMA handshake failed: {e}"))
             })?;
 
-        info!("P2P rdma_handshake accepted: requester={}", req.requester_id);
+        info!(
+            "P2P rdma_handshake accepted: requester={}",
+            req.requester_id
+        );
         Ok(Response::new(RdmaHandshakeResponse {
             status: Some(Self::ok_status()),
             handshake_metadata: server_meta,
