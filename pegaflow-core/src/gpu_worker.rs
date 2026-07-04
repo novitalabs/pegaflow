@@ -401,13 +401,14 @@ fn build_copy_descs(layers: &[LayerTransferData]) -> Result<(Vec<CopyDesc>, usiz
                     if let Some(seg1) = raw.segment_mapped_ptr(1) {
                         let k_bytes = raw.segment_size(0).unwrap();
                         let v_bytes = raw.segment_size(1).unwrap();
-                        if raw.num_segments() != 2 || k_bytes + v_bytes != c.bytes {
+                        let c_bytes = c.bytes;
+                        if raw.num_segments() != 2 || k_bytes + v_bytes != c_bytes {
                             return Err(EngineError::Storage(format!(
-                                "layer {layer_name}: stored block segments ({} x {k_bytes}+{v_bytes} bytes) \
-                                 do not span the contiguous device block ({} bytes): \
-                                 namespace is shared by incompatible KV layouts",
+                                "layer {layer_name}: stored block has {} segments \
+                                 ({k_bytes}+{v_bytes} bytes) but contiguous device block \
+                                 is {c_bytes} bytes: namespace is shared by incompatible \
+                                 KV layouts",
                                 raw.num_segments(),
-                                c.bytes
                             )));
                         }
                         let k_ptr = raw.segment_mapped_ptr(0).unwrap().add(host_offset);
@@ -540,4 +541,113 @@ fn process_save_task(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::num::NonZeroU64;
+
+    use crate::block::Segment;
+    use crate::storage::{StorageConfig, StorageEngine};
+
+    fn cuda_available() -> bool {
+        cudarc::driver::CudaContext::new(0).is_ok()
+    }
+
+    fn alloc_segment(storage: &StorageEngine, size: usize) -> Segment {
+        let alloc = storage
+            .allocate(NonZeroU64::new(size as u64).unwrap(), None)
+            .expect("test pool should have space");
+        let ptr = alloc.as_non_null();
+        Segment::new(ptr, size, alloc)
+    }
+
+    /// A contiguous-layout device block paired with a split-host block (K and V
+    /// as separate segments) must emit two copies: K to the device base, V right
+    /// after K. This is the P/D disaggregation scenario where a split-KV prefill
+    /// instance seals blocks and a contiguous-layout decode instance loads them.
+    #[test]
+    fn contiguous_device_with_split_host_emits_two_copies() {
+        if !cuda_available() {
+            return;
+        }
+        let storage =
+            StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]).unwrap();
+
+        let seg_size = 512;
+        let block_size = seg_size * 2;
+
+        let raw = RawBlock::two_segments(
+            alloc_segment(&storage, seg_size),
+            alloc_segment(&storage, seg_size),
+        );
+
+        let layout = KVCacheLayout::new(0x1000, block_size * 100, 100, block_size, 0, 1).unwrap();
+
+        let layer = LayerTransferData {
+            layer_name: "test".into(),
+            layout,
+            blocks: vec![TransferBlock {
+                block_idx: 0,
+                block: HostBlock::Owned(raw),
+            }],
+        };
+
+        let (copies, total) = build_copy_descs(&[layer]).unwrap();
+
+        assert_eq!(copies.len(), 2, "split host must produce two copies");
+        assert_eq!(total, block_size);
+        assert_eq!(copies[0].device, 0x1000);
+        assert_eq!(copies[0].size, seg_size);
+        assert_eq!(copies[1].device, 0x1000 + seg_size as u64);
+        assert_eq!(copies[1].size, seg_size);
+    }
+
+    /// When the two host segments do not exactly span the contiguous device
+    /// block, `build_copy_descs` must reject instead of copying misaligned bytes.
+    #[test]
+    fn contiguous_device_rejects_mismatched_split_host() {
+        if !cuda_available() {
+            return;
+        }
+        let storage =
+            StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]).unwrap();
+
+        let k_size = 512;
+        let v_size = 256;
+        let device_block_size = 1024; // != k_size + v_size
+
+        let raw = RawBlock::two_segments(
+            alloc_segment(&storage, k_size),
+            alloc_segment(&storage, v_size),
+        );
+
+        let layout = KVCacheLayout::new(
+            0x1000,
+            device_block_size * 100,
+            100,
+            device_block_size,
+            0,
+            1,
+        )
+        .unwrap();
+
+        let layer = LayerTransferData {
+            layer_name: "test".into(),
+            layout,
+            blocks: vec![TransferBlock {
+                block_idx: 0,
+                block: HostBlock::Owned(raw),
+            }],
+        };
+
+        let err = build_copy_descs(&[layer])
+            .err()
+            .expect("mismatched sizes should error");
+        assert!(
+            err.to_string().contains("incompatible KV layouts"),
+            "expected incompatible-layout error, got: {err}"
+        );
+    }
 }
