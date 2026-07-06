@@ -267,6 +267,10 @@ impl PegaRdmaV1Engine {
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "PyO3 binding mirroring the NIXL descriptor-list call shape"
+    )]
     fn read_async_indices(
         &self,
         py: Python<'_>,
