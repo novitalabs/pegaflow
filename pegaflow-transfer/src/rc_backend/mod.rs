@@ -13,7 +13,7 @@ use sideway::ibverbs::AccessFlags;
 
 use self::runtime::RcRuntime;
 use self::session::{RcSession, RdmaOp};
-use self::state::{AddrConnection, RcBackendState, RegisteredMemoryEntry};
+use self::state::{AddrConnection, RcBackendState, RegisteredMemoryEntry, RemoteMemorySnapshot};
 use std::ptr::NonNull;
 
 use mea::oneshot;
@@ -163,14 +163,11 @@ impl RcBackend {
         }
 
         let mut state = self.state.lock();
-        state.registered.insert(
-            raw,
-            RegisteredMemoryEntry {
-                base_ptr: raw,
-                len,
-                mrs,
-            },
-        );
+        Arc::make_mut(&mut state.registered).insert(RegisteredMemoryEntry {
+            base_ptr: raw,
+            len,
+            mrs,
+        })?;
         debug!(
             "memory registered: ptr={:#x}, len={}, nics={}",
             raw,
@@ -183,7 +180,7 @@ impl RcBackend {
     pub(crate) fn unregister_memory(&self, ptr: NonNull<u8>) -> Result<()> {
         let raw = ptr.as_ptr() as u64;
         let mut state = self.state.lock();
-        let removed = state.registered.remove(&raw);
+        let removed = Arc::make_mut(&mut state.registered).remove(raw);
         if removed.is_none() {
             return Err(TransferError::MemoryNotRegistered { ptr: raw });
         }
@@ -196,17 +193,16 @@ impl RcBackend {
         let state = self.state.lock();
         (0..self.nic_count())
             .map(|nic_idx| {
-                let mut regions: Vec<RegisteredMemoryRegion> = state
+                // LocalMemoryMap iterates in base_ptr order already.
+                state
                     .registered
-                    .values()
+                    .iter()
                     .map(|entry| RegisteredMemoryRegion {
                         base_ptr: entry.base_ptr,
                         len: entry.len as u64,
                         rkey: entry.mrs[nic_idx].rkey(),
                     })
-                    .collect();
-                regions.sort_unstable_by_key(|entry| entry.base_ptr);
-                regions
+                    .collect()
             })
             .collect()
     }
@@ -337,10 +333,15 @@ impl RcBackend {
         for (nic_idx, sessions) in pending.into_iter().enumerate() {
             let remote = &remote_nics[nic_idx];
             let remote_first_qpn = remote.endpoints[0].qp_num;
-            state.nics[nic_idx].cache_remote_memory(remote_first_qpn, &remote.memory_regions)?;
+            let snapshot = Arc::new(RemoteMemorySnapshot::from_handshake(
+                &remote.memory_regions,
+            )?);
+            state.nics[nic_idx]
+                .remote_memory
+                .insert(remote_first_qpn, snapshot);
             state.nics[nic_idx]
                 .sessions
-                .insert(remote_first_qpn, sessions);
+                .insert(remote_first_qpn, Arc::new(sessions));
             remote_first_qpns.push(remote_first_qpn);
         }
         let removed = state.connecting.remove(remote_addr);
@@ -440,10 +441,16 @@ impl RcBackend {
             }
         }
 
-        // --- Lock: look up connection + prepare ops ---
+        // --- Short lock: snapshot connection state (sessions, remote memory,
+        // local MR map are all Arc snapshots; lookups happen outside the lock) ---
         let lookup_start = Instant::now();
-        let mut nic_work: Vec<(Arc<RcSession>, Vec<RdmaOp>)> = Vec::new();
-        {
+        struct NicWork {
+            nic_idx: usize,
+            sessions: Arc<Vec<Arc<RcSession>>>,
+            remote_memory: Arc<RemoteMemorySnapshot>,
+            rot: usize,
+        }
+        let (registered, nic_snapshots) = {
             let state = self.state.lock();
 
             let conn = state
@@ -453,62 +460,79 @@ impl RcBackend {
                     "no connection for remote addr {remote_addr}"
                 )))?;
 
-            // Per-WQE round-robin across the N sessions per NIC so a single
-            // batch can fill all N QPs (per-call RR would leave the rest idle).
+            let mut snapshots = Vec::new();
             for (nic_idx, nic_descs) in per_nic.iter().enumerate() {
                 if nic_descs.is_empty() {
                     continue;
                 }
-
                 let remote_first_qpn = conn.remote_first_qpns[nic_idx];
-                let sessions = state.nics[nic_idx]
-                    .sessions
-                    .get(&remote_first_qpn)
-                    .expect("session vec must exist for established connection");
-                let n = sessions.len();
+                let nic = &state.nics[nic_idx];
+                let sessions = nic.sessions.get(&remote_first_qpn).ok_or_else(|| {
+                    TransferError::Backend(format!(
+                        "session vec missing for established connection: remote={remote_addr}, nic={nic_idx}"
+                    ))
+                })?;
+                let remote_memory = nic.remote_memory.get(&remote_first_qpn).ok_or_else(|| {
+                    TransferError::Backend(format!(
+                        "remote memory snapshot missing for established connection: remote={remote_addr}, nic={nic_idx}"
+                    ))
+                })?;
                 // Rotate the starting bucket each call so small batches still
                 // hit different QPs across calls.
                 let rot = conn.rr_counters[nic_idx].fetch_add(1, Ordering::Relaxed);
+                snapshots.push(NicWork {
+                    nic_idx,
+                    sessions: Arc::clone(sessions),
+                    remote_memory: Arc::clone(remote_memory),
+                    rot,
+                });
+            }
+            (Arc::clone(&state.registered), snapshots)
+        };
 
-                let per_bucket = nic_descs.len().div_ceil(n);
-                let mut buckets: Vec<Vec<RdmaOp>> =
-                    (0..n).map(|_| Vec::with_capacity(per_bucket)).collect();
+        // --- Build ops outside the lock ---
+        let mut nic_work: Vec<(Arc<RcSession>, Vec<RdmaOp>)> = Vec::new();
+        for nic in nic_snapshots {
+            let nic_descs = &per_nic[nic.nic_idx];
+            // Per-WQE round-robin across the N sessions per NIC so a single
+            // batch can fill all N QPs (per-call RR would leave the rest idle).
+            let n = nic.sessions.len();
+            let per_bucket = nic_descs.len().div_ceil(n);
+            let mut buckets: Vec<Vec<RdmaOp>> =
+                (0..n).map(|_| Vec::with_capacity(per_bucket)).collect();
 
-                for (i, desc) in nic_descs.iter().enumerate() {
-                    let local_ptr = desc.local_ptr.as_ptr() as u64;
-                    let remote_ptr = desc.remote_ptr.as_ptr() as u64;
-                    let len = desc.len;
+            for (i, desc) in nic_descs.iter().enumerate() {
+                let local_ptr = desc.local_ptr.as_ptr() as u64;
+                let remote_ptr = desc.remote_ptr.as_ptr() as u64;
+                let len = desc.len;
 
-                    if len == 0 {
-                        return Err(TransferError::InvalidArgument("len must be non-zero"));
-                    }
-
-                    let local_mr = state
-                        .find_local_mr(nic_idx, local_ptr, len)
-                        .ok_or(TransferError::MemoryNotRegistered { ptr: local_ptr })?;
-
-                    let remote_rkey = state.nics[nic_idx]
-                        .find_remote_rkey(remote_first_qpn, remote_ptr, len)
-                        .ok_or(TransferError::InvalidArgument(
-                            "remote memory not found in handshake snapshot",
-                        ))?;
-
-                    let bucket = rot.wrapping_add(i) % n;
-                    buckets[bucket].push(RdmaOp {
-                        local_mr,
-                        local_ptr,
-                        remote_ptr,
-                        len,
-                        remote_rkey,
-                    });
+                if len == 0 {
+                    return Err(TransferError::InvalidArgument("len must be non-zero"));
                 }
 
-                for (q_idx, prepared) in buckets.into_iter().enumerate() {
-                    if prepared.is_empty() {
-                        continue;
-                    }
-                    nic_work.push((Arc::clone(&sessions[q_idx]), prepared));
+                let local_mr = registered
+                    .find_mr(nic.nic_idx, local_ptr, len)
+                    .ok_or(TransferError::MemoryNotRegistered { ptr: local_ptr })?;
+
+                let remote_rkey = nic.remote_memory.find_rkey(remote_ptr, len).ok_or(
+                    TransferError::InvalidArgument("remote memory not found in handshake snapshot"),
+                )?;
+
+                let bucket = nic.rot.wrapping_add(i) % n;
+                buckets[bucket].push(RdmaOp {
+                    local_mr,
+                    local_ptr,
+                    remote_ptr,
+                    len,
+                    remote_rkey,
+                });
+            }
+
+            for (q_idx, prepared) in buckets.into_iter().enumerate() {
+                if prepared.is_empty() {
+                    continue;
                 }
+                nic_work.push((Arc::clone(&nic.sessions[q_idx]), prepared));
             }
         }
         let lookup_dur = lookup_start.elapsed();

@@ -27,9 +27,9 @@ use crate::error::{Result, TransferError};
 const MAX_WR_CHAIN_OPS: usize = 4;
 const MAX_SEND_WR: u32 = 128;
 // One QP per CQ; all WRs are signaled, so CQ depth = SQ depth suffices.
+// One-sided RDMA only: no recvs are ever posted, so the send CQ doubles as
+// the recv CQ and the recv queue stays at the minimal depth drivers accept.
 const SEND_CQ_SIZE: u32 = MAX_SEND_WR;
-// Recv queue unused (one-sided RDMA only), keep minimal for driver compatibility.
-const RECV_CQ_SIZE: u32 = 2;
 const MAX_RECV_WR: u32 = 1;
 const MAX_RD_ATOMIC: u8 = 16;
 const PSN_MASK: u32 = 0x00ff_ffff;
@@ -53,7 +53,6 @@ enum SessionCommand {
 pub(crate) struct RcSession {
     qp: Mutex<GenericQueuePair>,
     send_cq: GenericCompletionQueue,
-    _recv_cq: GenericCompletionQueue,
     pub(crate) local_endpoint: RcEndpoint,
     cmd_tx: std_mpsc::Sender<SessionCommand>,
 }
@@ -67,17 +66,12 @@ impl RcSession {
             .build()
             .map_err(|error| TransferError::Backend(error.to_string()))?
             .into();
-        cq_builder.setup_cqe(RECV_CQ_SIZE);
-        let recv_cq: GenericCompletionQueue = cq_builder
-            .build()
-            .map_err(|error| TransferError::Backend(error.to_string()))?
-            .into();
 
         let mut qp_builder = runtime.pd.create_qp_builder();
         qp_builder
             .setup_qp_type(QueuePairType::ReliableConnection)
             .setup_send_cq(send_cq.clone())
-            .setup_recv_cq(recv_cq.clone())
+            .setup_recv_cq(send_cq.clone())
             .setup_max_send_wr(MAX_SEND_WR)
             .setup_max_recv_wr(MAX_RECV_WR)
             .setup_max_send_sge(1)
@@ -110,7 +104,6 @@ impl RcSession {
         let session = Arc::new(Self {
             qp: Mutex::new(qp),
             send_cq,
-            _recv_cq: recv_cq,
             local_endpoint,
             cmd_tx,
         });
