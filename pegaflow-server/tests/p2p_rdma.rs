@@ -288,6 +288,12 @@ async fn wait_for_prefetch_done(
     }
 }
 
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+fn ib_device() -> String {
+    std::env::var("PEGAFLOW_IB_DEVICE").unwrap_or_else(|_| "mlx5_1".into())
+}
+
 // ── Test ────────────────────────────────────────────────────────────────────
 
 const NUM_BLOCKS: usize = 4;
@@ -298,7 +304,7 @@ const LAYER: &str = "layer_0";
 const DEVICE_ID: i32 = 0;
 
 #[tokio::test]
-#[ignore] // Requires RDMA hardware (mlx5_1), CUDA GPU, and Python+torch
+#[ignore] // Requires RDMA hardware (PEGAFLOW_IB_DEVICE env var, default: mlx5_1), CUDA GPU, and Python+torch
 async fn p2p_rdma_remote_fetch_roundtrip() {
     pegaflow_common::logging::init_stdout_colored("debug");
     let _cuda_ctx = CudaContext::new(0).expect("CUDA init");
@@ -314,7 +320,7 @@ async fn p2p_rdma_remote_fetch_roundtrip() {
     let config_a = StorageConfig {
         metaserver_addr: Some(format!("http://127.0.0.1:{meta_port}")),
         advertise_addr: Some(format!("127.0.0.1:{port_a}")),
-        rdma_nic_names: Some(vec!["mlx5_1".into()]),
+        rdma_nic_names: Some(vec![ib_device()]),
         ..StorageConfig::default()
     };
     let engine_a = Arc::new(
@@ -394,7 +400,7 @@ async fn p2p_rdma_remote_fetch_roundtrip() {
     let config_b = StorageConfig {
         metaserver_addr: Some(format!("http://127.0.0.1:{meta_port}")),
         advertise_addr: Some(format!("127.0.0.1:{port_b}")),
-        rdma_nic_names: Some(vec!["mlx5_1".into()]),
+        rdma_nic_names: Some(vec![ib_device()]),
         ..StorageConfig::default()
     };
     let engine_b =
