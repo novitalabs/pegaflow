@@ -42,6 +42,9 @@ pub(crate) struct RdmaFetchStore {
     rdma_transport: Arc<RdmaTransport>,
     allocate_fn: AllocateFn,
     advertise_addr: String,
+    /// Local NUMA nodes with pinned pools (sorted); empty for global allocators.
+    /// Remote slots advertising other nodes are remapped onto these.
+    local_numa_nodes: Vec<NumaNode>,
     /// Lazy gRPC channel cache keyed by remote address. Tonic channels multiplex
     /// requests over a single HTTP/2 connection; cloning is cheap.
     grpc_channels: Arc<DashMap<String, EngineClient<Channel>>>,
@@ -58,13 +61,18 @@ impl RdmaFetchStore {
         rdma_transport: Arc<RdmaTransport>,
         allocate_fn: AllocateFn,
         advertise_addr: String,
+        local_numa_nodes: Vec<NumaNode>,
     ) -> Self {
-        info!("RDMA remote fetch enabled (advertise={})", advertise_addr);
+        info!(
+            "RDMA remote fetch enabled (advertise={}, local_numa_nodes={:?})",
+            advertise_addr, local_numa_nodes
+        );
         Self {
             metaserver_client,
             rdma_transport,
             allocate_fn,
             advertise_addr,
+            local_numa_nodes,
             grpc_channels: Arc::new(DashMap::new()),
             connect_group: Arc::new(Group::new()),
         }
@@ -126,6 +134,7 @@ impl RdmaFetchStore {
             &self.advertise_addr,
             namespace,
             hashes,
+            &self.local_numa_nodes,
         )
         .await
     }
@@ -151,6 +160,7 @@ async fn rdma_fetch_task(
     advertise_addr: &str,
     namespace: &str,
     block_hashes: &[Vec<u8>],
+    local_numa_nodes: &[NumaNode],
 ) -> PrefetchResult {
     let t0 = Instant::now();
 
@@ -199,7 +209,15 @@ async fn rdma_fetch_task(
 
     // 3. RDMA READ all blocks + build SealedBlocks
     let transfer_timeout = transfer_timeout_from_server(response.lock_timeout_secs);
-    let blocks = response.blocks;
+    let mut blocks = response.blocks;
+    // Expected steady state in heterogeneous clusters: counted in the fetch
+    // summary log + metric, not warned per fetch.
+    let numa_remapped = resolve_block_numas(&mut blocks, local_numa_nodes);
+    if numa_remapped > 0 {
+        core_metrics()
+            .rdma_fetch_numa_remapped
+            .add(numa_remapped as u64, &[]);
+    }
     let total_bytes: u64 = blocks
         .iter()
         .flat_map(|b| &b.slots)
@@ -239,7 +257,7 @@ async fn rdma_fetch_task(
         0.0
     };
     info!(
-        "RDMA fetch summary: req_id={req_id} remote={remote_addr} blocks={}/{} slots={} descs={} slabs={} bytes_mib={mb:.1} total_ms={elapsed_ms:.2} tp_mib_s={throughput_mib_s:.0}",
+        "RDMA fetch summary: req_id={req_id} remote={remote_addr} blocks={}/{} slots={} descs={} slabs={} numa_remapped={numa_remapped} bytes_mib={mb:.1} total_ms={elapsed_ms:.2} tp_mib_s={throughput_mib_s:.0}",
         result.len(),
         block_hashes.len(),
         transfer_timing.slot_count,
@@ -471,6 +489,36 @@ async fn fetch_blocks_via_rdma(
     timing.rebuild = rebuild_start.elapsed();
 
     Ok((result, timing))
+}
+
+/// Rewrite each slot's advertised NUMA node onto this machine's topology.
+///
+/// The remote node advertises where a block lives in *its* topology; that is a
+/// placement hint, not a valid key into local pools. Slots on nodes we don't
+/// have are spread deterministically across local nodes; with no NUMA pools
+/// (global allocator) they collapse to `UNKNOWN`. Returns the remapped count.
+fn resolve_block_numas(blocks: &mut [TransferBlockInfo], local_nodes: &[NumaNode]) -> usize {
+    let mut remapped = 0;
+    for (idx, slot) in blocks.iter_mut().flat_map(|b| &mut b.slots).enumerate() {
+        let advertised = NumaNode(slot.numa_node);
+        let resolved = if local_nodes.is_empty() {
+            NumaNode::UNKNOWN
+        } else if local_nodes.contains(&advertised) {
+            advertised
+        } else if advertised.is_unknown() {
+            // UNKNOWN is "no placement hint", not a node id: round-robin by
+            // slot position so a batch spreads across local pools instead of
+            // collapsing onto one node.
+            local_nodes[idx % local_nodes.len()]
+        } else {
+            local_nodes[slot.numa_node as usize % local_nodes.len()]
+        };
+        if resolved != advertised {
+            slot.numa_node = resolved.0;
+            remapped += 1;
+        }
+    }
+    remapped
 }
 
 fn sum_segment_bytes_by_numa(
@@ -715,6 +763,68 @@ mod tests {
             calls.fetch_add(1, Ordering::Relaxed);
             allocator.allocate(NonZeroU64::new(size)?, NumaNode::UNKNOWN)
         })
+    }
+
+    #[test]
+    fn resolve_block_numas_maps_foreign_nodes_onto_local_topology() {
+        let local = [NumaNode(0), NumaNode(1)];
+        let mut blocks = vec![TransferBlockInfo {
+            block_hash: vec![1],
+            slots: vec![
+                slot(1, 0, 0, 0),        // local node: kept
+                slot(1, 0, 0, 3),        // foreign node: remapped
+                slot(1, 0, 0, u32::MAX), // remote had no NUMA info: remapped
+            ],
+        }];
+
+        let remapped = resolve_block_numas(&mut blocks, &local);
+
+        assert_eq!(remapped, 2);
+        let numas: Vec<u32> = blocks[0].slots.iter().map(|s| s.numa_node).collect();
+        assert_eq!(numas[0], 0, "local node must be kept");
+        for numa in &numas[1..] {
+            assert!(
+                local.contains(&NumaNode(*numa)),
+                "foreign node must land on a local node, got {numa}"
+            );
+        }
+
+        // Resolution is idempotent: a second pass changes nothing.
+        assert_eq!(resolve_block_numas(&mut blocks, &local), 0);
+    }
+
+    #[test]
+    fn resolve_block_numas_spreads_unknown_slots_across_local_nodes() {
+        // UNKNOWN carries no placement hint; a batch of such slots must spread
+        // across local pools, not collapse onto a single node's slab.
+        let local = [NumaNode(0), NumaNode(1)];
+        let mut blocks = vec![TransferBlockInfo {
+            block_hash: vec![1],
+            slots: vec![slot(1, 0, 0, u32::MAX), slot(1, 0, 0, u32::MAX)],
+        }];
+
+        assert_eq!(resolve_block_numas(&mut blocks, &local), 2);
+
+        let numas: Vec<u32> = blocks[0].slots.iter().map(|s| s.numa_node).collect();
+        assert!(local.contains(&NumaNode(numas[0])));
+        assert!(local.contains(&NumaNode(numas[1])));
+        assert_ne!(
+            numas[0], numas[1],
+            "UNKNOWN slots must not pile onto one node"
+        );
+    }
+
+    #[test]
+    fn resolve_block_numas_without_local_pools_collapses_to_unknown() {
+        let mut blocks = vec![TransferBlockInfo {
+            block_hash: vec![1],
+            slots: vec![slot(1, 0, 0, 3)],
+        }];
+
+        let remapped = resolve_block_numas(&mut blocks, &[]);
+
+        assert_eq!(remapped, 1);
+        assert_eq!(blocks[0].slots[0].numa_node, NumaNode::UNKNOWN.0);
     }
 
     #[test]

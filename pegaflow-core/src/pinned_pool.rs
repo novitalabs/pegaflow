@@ -75,7 +75,10 @@ impl PinnedAllocation {
     }
 
     /// Get the underlying NonNull pointer.
-    #[cfg_attr(not(feature = "rdma"), allow(dead_code))]
+    #[cfg_attr(
+        not(feature = "rdma"),
+        allow(dead_code, reason = "only the RDMA fetch path builds raw segments")
+    )]
     pub(crate) fn as_non_null(&self) -> NonNull<u8> {
         self.ptr
     }
@@ -432,6 +435,18 @@ impl ShardedPinnedPool {
             .unwrap_or(0)
     }
 
+    /// Upper bound for a single allocation: one allocation lives in one shard,
+    /// so nothing larger than the biggest shard can ever be satisfied.
+    /// Reads a constant set at construction; takes no allocator locks (this
+    /// sits on the allocation hot path).
+    fn max_allocation_capacity(&self) -> u64 {
+        self.shards
+            .iter()
+            .map(|s| s.allocatable_bytes)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Return all backing memory regions (one per shard).
     fn memory_regions(&self) -> Vec<(NonNull<u8>, usize)> {
         self.shards.iter().map(|s| s.memory_region()).collect()
@@ -581,6 +596,29 @@ impl NumaAwarePinnedPools {
             .unwrap_or(0)
     }
 
+    /// Upper bound for a single allocation on a specific NUMA node.
+    /// Zero when the node has no pool: no amount of eviction can help.
+    fn max_allocation_capacity_for_node(&self, numa_node: NumaNode) -> u64 {
+        if numa_node.is_unknown() {
+            return 0;
+        }
+        self.pools
+            .get(&numa_node.0)
+            .map(|pool| pool.max_allocation_capacity())
+            .unwrap_or(0)
+    }
+
+    /// NUMA nodes that have pools, sorted for deterministic iteration.
+    #[cfg_attr(
+        not(feature = "rdma"),
+        allow(dead_code, reason = "only the RDMA fetch path consumes topology")
+    )]
+    fn node_ids(&self) -> Vec<NumaNode> {
+        let mut ids: Vec<NumaNode> = self.pools.keys().map(|id| NumaNode(*id)).collect();
+        ids.sort_by_key(|node| node.0);
+        ids
+    }
+
     /// Return all backing memory regions across all NUMA nodes and shards.
     fn memory_regions(&self) -> Vec<(NonNull<u8>, usize)> {
         self.pools
@@ -697,6 +735,28 @@ impl PinnedAllocator {
         match self {
             Self::Global(pool) => pool.largest_free_allocation(),
             Self::Numa(pools) => pools.largest_free_allocation_for_node(numa_node),
+        }
+    }
+
+    /// Upper bound for a single allocation on the requested target: what the
+    /// target pool could satisfy if it were completely empty. A request above
+    /// this bound can never succeed, no matter how much the cache evicts.
+    pub(crate) fn max_allocation_capacity_for_node(&self, numa_node: NumaNode) -> u64 {
+        match self {
+            Self::Global(pool) => pool.max_allocation_capacity(),
+            Self::Numa(pools) => pools.max_allocation_capacity_for_node(numa_node),
+        }
+    }
+
+    /// NUMA nodes with pools, sorted. Empty for global allocators.
+    #[cfg_attr(
+        not(feature = "rdma"),
+        allow(dead_code, reason = "only the RDMA fetch path consumes topology")
+    )]
+    pub(crate) fn numa_node_ids(&self) -> Vec<NumaNode> {
+        match self {
+            Self::Global(_) => Vec::new(),
+            Self::Numa(pools) => pools.node_ids(),
         }
     }
 
