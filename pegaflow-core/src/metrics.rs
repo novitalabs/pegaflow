@@ -28,6 +28,9 @@ pub(crate) struct CoreMetrics {
     pub pool_capacity_bytes: UpDownCounter<i64>,
     pub pool_used_bytes: UpDownCounter<i64>,
     pub pool_alloc_failures: Counter<u64>,
+    /// Allocations rejected up front because the target NUMA pool could never
+    /// satisfy them (missing pool or request above pool capacity).
+    pub pool_alloc_unsatisfiable: Counter<u64>,
 
     // Inflight (write path safety/health)
     pub inflight_bytes: UpDownCounter<i64>,
@@ -98,6 +101,10 @@ pub(crate) struct CoreMetrics {
     pub rdma_fetch_duration_seconds: Histogram<f64>,
     #[cfg(feature = "rdma")]
     pub rdma_fetch_bytes: Counter<u64>,
+    /// Fetched slots whose advertised NUMA node does not exist locally and was
+    /// remapped onto this machine's topology (heterogeneous cluster).
+    #[cfg(feature = "rdma")]
+    pub rdma_fetch_numa_remapped: Counter<u64>,
 }
 
 fn init_meter() -> Meter {
@@ -221,6 +228,13 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
             pool_alloc_failures: meter
                 .u64_counter("pegaflow_pool_alloc_failures")
                 .with_description("Pinned pool allocation failures after eviction retries")
+                .build(),
+            pool_alloc_unsatisfiable: meter
+                .u64_counter("pegaflow_pool_alloc_unsatisfiable")
+                .with_description(
+                    "Allocations rejected without eviction because the target \
+                     NUMA pool could never satisfy them",
+                )
                 .build(),
 
             // Inflight
@@ -445,6 +459,14 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
                 .u64_counter("pegaflow_rdma_fetch_bytes")
                 .with_unit("bytes")
                 .with_description("Total bytes fetched via RDMA from remote nodes")
+                .build(),
+            #[cfg(feature = "rdma")]
+            rdma_fetch_numa_remapped: meter
+                .u64_counter("pegaflow_rdma_fetch_numa_remapped")
+                .with_description(
+                    "Fetched slots whose advertised NUMA node was remapped \
+                     onto local topology (heterogeneous cluster)",
+                )
                 .build(),
         }
     })

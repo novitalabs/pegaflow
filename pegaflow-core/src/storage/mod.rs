@@ -5,8 +5,6 @@ pub(crate) mod transfer_lock;
 mod write_path;
 
 use bytesize::ByteSize;
-#[cfg(not(feature = "rdma"))]
-use log::warn;
 use log::{debug, info, warn};
 use std::collections::HashSet;
 use std::num::NonZeroU64;
@@ -200,6 +198,8 @@ impl StorageEngine {
         }
 
         let is_numa = allocator.is_numa();
+        #[cfg(feature = "rdma")]
+        let local_numa_nodes = allocator.numa_node_ids();
         let engine = Arc::new_cyclic(move |weak_engine: &Weak<Self>| {
             // Build shared allocate_fn for backing stores.
             let alloc_weak = weak_engine.clone();
@@ -224,6 +224,7 @@ impl StorageEngine {
                     Arc::clone(rdma),
                     allocate_fn.clone(),
                     advertise,
+                    local_numa_nodes.clone(),
                 ))))
             });
             #[cfg(not(feature = "rdma"))]
@@ -298,6 +299,24 @@ impl StorageEngine {
     ) -> Option<Arc<PinnedAllocation>> {
         let requested_bytes = size.get();
         let node = numa_node.unwrap_or(NumaNode::UNKNOWN);
+
+        // A request beyond what the target pool could hold when empty can
+        // never be satisfied (missing NUMA pool, or size above pool capacity).
+        // Bail out before reclaim: evicting would wipe the read cache for
+        // nothing (a remote block advertising a NUMA node this machine does
+        // not have used to evict the entire resident cache per attempt).
+        let max_capacity = self.allocator.max_allocation_capacity_for_node(node);
+        if requested_bytes > max_capacity {
+            log::error!(
+                "Pinned allocation can never be satisfied; skipping cache reclaim: \
+                 requested={} max_single_allocation={} numa={:?}",
+                ByteSize(requested_bytes),
+                ByteSize(max_capacity),
+                numa_node
+            );
+            core_metrics().pool_alloc_unsatisfiable.add(1, &[]);
+            return None;
+        }
 
         loop {
             if let Some(alloc) = self.allocator.allocate(size, node) {
@@ -670,13 +689,65 @@ mod tests {
     #[tokio::test]
     async fn allocate_bounded_reclaim_terminates() {
         // With a tiny pool, allocation of a huge block should fail fast
-        // (not loop forever) thanks to MAX_RECLAIM_ROUNDS.
+        // (not loop forever): the request exceeds what the pool could ever
+        // hold, so it is rejected before any reclaim.
         let storage =
             StorageEngine::new_with_config(4096, false, StorageConfig::default(), &[]).unwrap();
 
         // Try to allocate more than the entire pool
         let result = storage.allocate(NonZeroU64::new(1 << 30).unwrap(), None);
         assert!(result.is_none(), "should fail, not loop forever");
+    }
+
+    #[tokio::test]
+    async fn alloc_for_missing_numa_pool_fails_fast_without_evicting() {
+        // A remote block can advertise a NUMA node that does not exist on this
+        // machine. The allocation must fail without touching the read cache:
+        // reclaim can never make room on a pool that does not exist.
+        let storage = StorageEngine::new_with_config(
+            1 << 20,
+            false,
+            StorageConfig::default(),
+            &[NumaNode(0)],
+        )
+        .unwrap();
+
+        let key1 = BlockKey::new("ns".into(), vec![1]);
+        let key2 = BlockKey::new("ns".into(), vec![2]);
+        storage.test_insert_cache(key1.clone(), Arc::new(SealedBlock::from_slots(Vec::new())));
+        storage.test_insert_cache(key2.clone(), Arc::new(SealedBlock::from_slots(Vec::new())));
+
+        let result = storage.allocate(NonZeroU64::new(4096).unwrap(), Some(NumaNode(3)));
+        assert!(result.is_none());
+
+        assert_eq!(
+            storage.read_cache.contains_keys(&[key1, key2]),
+            vec![true, true],
+            "unsatisfiable allocation must not evict resident blocks"
+        );
+    }
+
+    #[tokio::test]
+    async fn alloc_larger_than_node_capacity_fails_fast_without_evicting() {
+        let storage = StorageEngine::new_with_config(
+            1 << 20,
+            false,
+            StorageConfig::default(),
+            &[NumaNode(0)],
+        )
+        .unwrap();
+
+        let key = BlockKey::new("ns".into(), vec![1]);
+        storage.test_insert_cache(key.clone(), Arc::new(SealedBlock::from_slots(Vec::new())));
+
+        let result = storage.allocate(NonZeroU64::new(1 << 30).unwrap(), Some(NumaNode(0)));
+        assert!(result.is_none());
+
+        assert_eq!(
+            storage.read_cache.contains_keys(&[key]),
+            vec![true],
+            "oversized allocation must not evict resident blocks"
+        );
     }
 
     #[tokio::test]
