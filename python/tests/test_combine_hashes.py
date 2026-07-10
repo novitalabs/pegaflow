@@ -196,7 +196,7 @@ def test_page_first_block_shard_is_a_partition():
 
     block_ids = tuple(range(13))
     block_hashes = tuple(bytes([i]) for i in block_ids)
-    intent = SaveIntent(block_ids=block_ids, block_hashes=block_hashes)
+    intent = SaveIntent(group_block_ids=(tuple(block_ids),), block_hashes=block_hashes)
     tp_size = 4
 
     seen: list[int] = []
@@ -230,7 +230,7 @@ def test_page_first_saves_all_layers_for_this_ranks_block_stripe():
     meta = PegaConnectorMetadata(
         save_intents={
             "r1": SaveIntent(
-                block_ids=(0, 1, 2, 3),
+                group_block_ids=((0, 1, 2, 3),),
                 block_hashes=(b"h0", b"h1", b"h2", b"h3"),
             )
         }
@@ -272,7 +272,7 @@ def test_page_first_layer_split_saves_own_layers_for_all_blocks():
     meta = PegaConnectorMetadata(
         save_intents={
             "r1": SaveIntent(
-                block_ids=(0, 1, 2, 3),
+                group_block_ids=((0, 1, 2, 3),),
                 block_hashes=(b"h0", b"h1", b"h2", b"h3"),
             )
         }
@@ -334,12 +334,12 @@ class TestDecodeHashRefresh:
         blocks = _make_fake_blocks([10, 11, 12, 13])
 
         sc.update_state_after_alloc(req, blocks, num_external_tokens=0)
-        sc._allocated_blocks["r1"] = [10, 11, 12, 13]
+        sc._allocated_blocks["r1"] = [[10, 11, 12, 13]]
         sc._scheduled_tokens["r1"] = 128  # 4 * 32
 
         intent = sc._consume_save_intent("r1")
         assert intent is not None
-        assert len(intent.block_ids) == 4
+        assert len(intent.group_block_ids[0]) == 4
         assert len(intent.block_hashes) == 4
 
     def test_decode_blocks_saved_after_refresh(self):
@@ -350,18 +350,18 @@ class TestDecodeHashRefresh:
         blocks = _make_fake_blocks([10, 11, 12, 13])
 
         sc.update_state_after_alloc(req, blocks, num_external_tokens=0)
-        sc._allocated_blocks["r1"] = [10, 11, 12, 13]
+        sc._allocated_blocks["r1"] = [[10, 11, 12, 13]]
         sc._scheduled_tokens["r1"] = 128  # 4 * 32
 
         # Save initial 4 blocks
         intent = sc._consume_save_intent("r1")
         assert intent is not None
-        assert len(intent.block_ids) == 4
+        assert len(intent.group_block_ids[0]) == 4
 
         # Simulate decode: request grows by 2 blocks
         new_hashes = [_hash(i) for i in range(4, 6)]
         req.block_hashes.extend(new_hashes)  # live Request grows
-        sc._allocated_blocks["r1"].extend([14, 15])  # new block_ids
+        sc._allocated_blocks["r1"][0].extend([14, 15])  # new block_ids
         sc._scheduled_tokens["r1"] += 64  # 2 * 32 more tokens
 
         # Before refresh: _block_hashes is stale (4 entries) → no new saves
@@ -374,8 +374,8 @@ class TestDecodeHashRefresh:
         # Now the 2 decode blocks become saveable
         intent2 = sc._consume_save_intent("r1")
         assert intent2 is not None
-        assert len(intent2.block_ids) == 2
-        assert intent2.block_ids == (14, 15)
+        assert len(intent2.group_block_ids[0]) == 2
+        assert intent2.group_block_ids == ((14, 15),)
         assert intent2.block_hashes == (new_hashes[0], new_hashes[1])
 
     def test_cleanup_removes_request_ref(self):
@@ -401,23 +401,206 @@ class TestDecodeHashRefresh:
         sc._block_index_offsets["r1"] = 6
         sc._next_stored_block_idx["r1"] = 6
         sc._scheduled_tokens["r1"] = 48  # 3 virtual blocks beyond the external hit
+        sc._allocated_blocks["r1"] = [[100, 101, 102, 103, 104, 105, 200, 201, 202]]
+
+        intent = sc._consume_save_intent("r1")
+
+        assert intent is not None
+        assert intent.block_hashes == block_hashes[6:9]
+        assert intent.group_block_ids == ((200, 201, 202),)
+
+    @staticmethod
+    def _pool_block(plain_hash, group_idx, refs=None):
+        """Fake KVCacheBlock with vLLM's packed BlockHashWithGroupId bytes
+        (plain content hash + 4-byte big-endian group id) and the ref-pin
+        API the save path requires."""
+
+        class Blk:
+            def __init__(self):
+                self.is_null = False
+                self.block_hash = (
+                    plain_hash + group_idx.to_bytes(4, "big") if plain_hash is not None else None
+                )
+                self.ref_cnt = 1
+
+            def incr_ref(self):
+                self.ref_cnt += 1
+                if refs is not None:
+                    refs.append(self)
+
+            def decr_ref(self):
+                self.ref_cnt -= 1
+
+        return Blk()
+
+    def _six_group_pool(self, hashes, refs=None):
+        pool_blocks = {}
+        for g in range(6):
+            for p in range(len(hashes)):
+                bid = g * len(hashes) + p + 1
+                pool_blocks[bid] = self._pool_block(hashes[p], g, refs)
+        return pool_blocks
+
+    def test_six_group_swa_hybrid_save_skips_stale_positions(self):
+        """A Gemma-style hybrid yields 6 kv_cache_groups (5 SWA + 1 FA, FA
+        last). A position is stored only when EVERY group's block still
+        holds the expected content (pool hashes carry a 4-byte group-id
+        suffix); a slid-out SWA block whose slot was reused drops that
+        position for all groups, permanently."""
+        from types import SimpleNamespace as NS
+
+        sc = self._make_connector()
+        sc._num_groups = 6
+        hashes = tuple(_hash(i) for i in range(3))
+
+        pool_blocks = self._six_group_pool(hashes)
+        # An SWA group's position-0 block was freed and reused -> foreign hash.
+        pool_blocks[7] = self._pool_block(b"foreign-content-hash", 2)
+        sc.bind_gpu_block_pool(NS(blocks=pool_blocks, null_block=NS(block_id=0)))
+
+        sc._block_hashes["r1"] = hashes
+        sc._block_index_offsets["r1"] = 0
+        sc._next_stored_block_idx["r1"] = 0
+        sc._scheduled_tokens["r1"] = 3 * 32
+        sc._allocated_blocks["r1"] = [[g * 3 + p + 1 for p in range(3)] for g in range(6)]
+
+        intent = sc._consume_save_intent("r1")
+
+        assert intent is not None
+        # Position 0 dropped (group 2's block 7 was reused); 1 and 2 saved.
+        assert intent.block_hashes == hashes[1:3]
+        assert intent.group_block_ids == tuple((g * 3 + 2, g * 3 + 3) for g in range(6))
+        # Cursor advanced past the dead position: it is never revisited.
+        assert sc._next_stored_block_idx["r1"] == 3
+        assert sc._consume_save_intent("r1") is None
+
+    def test_six_group_save_stops_at_unsealed_position(self):
+        """A block that exists but is not hashed yet (freshly scheduled) is
+        TRANSIENT: the save stops there and the cursor does not advance, so
+        the position is retried next round instead of becoming a permanent
+        hole in the stored hash chain."""
+        from types import SimpleNamespace as NS
+
+        sc = self._make_connector()
+        sc._num_groups = 6
+        hashes = tuple(_hash(i) for i in range(3))
+
+        pool_blocks = self._six_group_pool(hashes)
+        pool_blocks[8] = self._pool_block(None, 2)  # position 1: not sealed yet
+        sc.bind_gpu_block_pool(NS(blocks=pool_blocks, null_block=NS(block_id=0)))
+
+        sc._block_hashes["r1"] = hashes
+        sc._block_index_offsets["r1"] = 0
+        sc._next_stored_block_idx["r1"] = 0
+        sc._scheduled_tokens["r1"] = 3 * 32
+        sc._allocated_blocks["r1"] = [[g * 3 + p + 1 for p in range(3)] for g in range(6)]
+
+        intent = sc._consume_save_intent("r1")
+
+        assert intent is not None
+        assert intent.block_hashes == hashes[0:1]
+        assert sc._next_stored_block_idx["r1"] == 1  # retry position 1 later
+
+        # The block seals -> the next round resumes from position 1.
+        pool_blocks[8].block_hash = hashes[1] + (2).to_bytes(4, "big")
+        intent2 = sc._consume_save_intent("r1")
+        assert intent2 is not None
+        assert intent2.block_hashes == hashes[1:3]
+        assert sc._next_stored_block_idx["r1"] == 3
+
+    def test_six_group_save_pins_blocks_until_send_completes(self):
+        """Saved positions are ref-pinned across the async copy and released
+        exactly once on finished_sending — the window where a slid-out SWA
+        block could be reused mid-DMA."""
+        from types import SimpleNamespace as NS
+
+        sc = self._make_connector()
+        sc._num_groups = 6
+        hashes = tuple(_hash(i) for i in range(2))
+
+        refs: list = []
+        pool_blocks = self._six_group_pool(hashes, refs)
+        sc.bind_gpu_block_pool(NS(blocks=pool_blocks, null_block=NS(block_id=0)))
+
+        sc._block_hashes["r1"] = hashes
+        sc._block_index_offsets["r1"] = 0
+        sc._next_stored_block_idx["r1"] = 0
+        sc._scheduled_tokens["r1"] = 2 * 32
+        sc._allocated_blocks["r1"] = [[g * 2 + p + 1 for p in range(2)] for g in range(6)]
+
+        intent = sc._consume_save_intent("r1")
+        assert intent is not None
+        assert len(refs) == 12  # 2 positions x 6 groups
+        assert all(b.ref_cnt == 2 for b in refs)
+
+        sc.update_connector_output(NS(finished_sending=["r1"], finished_recving=None))
+        assert all(b.ref_cnt == 1 for b in refs)
+        assert "r1" not in sc._pinned_save_blocks
+
+    def test_hybrid_save_positional_groups(self):
+        """Groups are positionally parallel: entry p of every group covers
+        the same token range as block_hashes[p] (vLLM 0.22 semantics —
+        SWA groups stay full-length with null padding, never suffix-only)."""
+        sc = self._make_connector()
+        block_hashes = tuple(_hash(i) for i in range(6))
+
+        sc._block_hashes["r1"] = block_hashes
+        sc._block_index_offsets["r1"] = 0
+        sc._next_stored_block_idx["r1"] = 0
+        sc._scheduled_tokens["r1"] = 6 * 32
         sc._allocated_blocks["r1"] = [
-            100,
-            101,
-            102,
-            103,
-            104,
-            105,
-            200,
-            201,
-            202,
+            [10, 11, 12, 13, 14, 15],
+            [30, 31, 32, 33, 34, 35],
+        ]
+
+        intent = sc._consume_save_intent("r1")
+
+        assert intent is not None
+        assert intent.block_hashes == block_hashes[0:6]
+        assert intent.group_block_ids == (
+            (10, 11, 12, 13, 14, 15),
+            (30, 31, 32, 33, 34, 35),
+        )
+
+    def test_hybrid_save_capped_by_shortest_group(self):
+        """A group that has fewer positional entries caps the save range."""
+        sc = self._make_connector()
+        block_hashes = tuple(_hash(i) for i in range(6))
+
+        sc._block_hashes["r1"] = block_hashes
+        sc._block_index_offsets["r1"] = 0
+        sc._next_stored_block_idx["r1"] = 0
+        sc._scheduled_tokens["r1"] = 6 * 32
+        sc._allocated_blocks["r1"] = [
+            [10, 11, 12, 13, 14, 15],
+            [30, 31, 32],
+        ]
+
+        intent = sc._consume_save_intent("r1")
+
+        assert intent is not None
+        assert intent.block_hashes == block_hashes[0:3]
+        assert intent.group_block_ids == ((10, 11, 12), (30, 31, 32))
+
+    def test_external_hit_hybrid_save_positional(self):
+        """External-hit save indexes every group by GLOBAL block position."""
+        sc = self._make_connector(dcp_world_size=1)
+        block_hashes = tuple(_hash(i) for i in range(9))
+
+        sc._block_hashes["r1"] = block_hashes
+        sc._block_index_offsets["r1"] = 6
+        sc._next_stored_block_idx["r1"] = 6
+        sc._scheduled_tokens["r1"] = 48
+        sc._allocated_blocks["r1"] = [
+            [100, 101, 102, 103, 104, 105, 200, 201, 202],
+            [300, 301, 302, 303, 304, 305, 306, 307, 308],
         ]
 
         intent = sc._consume_save_intent("r1")
 
         assert intent is not None
         assert intent.block_hashes == block_hashes[6:9]
-        assert intent.block_ids == (200, 201, 202)
+        assert intent.group_block_ids == ((200, 201, 202), (306, 307, 308))
 
     def test_save_only_mode_counts_precomputed_prefix_as_saveable(self):
         """NIXL-loaded prefix should be saveable in Pega save-only mode."""
@@ -450,7 +633,7 @@ class TestDecodeHashRefresh:
         metadata = sc.build_connector_meta(scheduler_output)
 
         intent = metadata.save_intents["r1"]
-        assert intent.block_ids == (10, 11, 12)
+        assert intent.group_block_ids[0] == (10, 11, 12)
         assert intent.block_hashes == tuple(block_hashes[:3])
 
     def test_save_only_mode_handles_full_prompt_hit_recompute_token(self):
@@ -481,7 +664,7 @@ class TestDecodeHashRefresh:
         metadata = sc.build_connector_meta(scheduler_output)
 
         intent = metadata.save_intents["r1"]
-        assert intent.block_ids == (10, 11, 12, 13)
+        assert intent.group_block_ids[0] == (10, 11, 12, 13)
         assert intent.block_hashes == tuple(block_hashes)
 
     def test_read_write_mode_does_not_save_unowned_precomputed_prefix(self):
@@ -540,7 +723,7 @@ class TestDecodeHashRefresh:
 
         intent = metadata.save_intents["r1"]
         assert intent.block_hashes == tuple(block_hashes[2:3])
-        assert intent.block_ids == (12,)
+        assert intent.group_block_ids[0] == (12,)
 
 
 class TestSchedulerQueryProbeReuse:
@@ -618,16 +801,36 @@ class TestSchedulerQueryProbeReuse:
 
         engine_client.release.assert_not_called()
 
-    def test_load_block_mismatch_releases_probe_and_raises(self):
+    def test_partial_accept_pads_destinations_to_lease_length(self):
+        """vLLM may accept fewer blocks than the leased hit (full-prompt
+        hits are trimmed so the last token is computed for logits). The
+        lease still covers the full hit, so destinations are padded with
+        the null block id (0) to satisfy the server's count contract."""
         sc, engine_client = self._make_connector()
         req = _make_fake_request("r1", [_hash(i) for i in range(2)])
         blocks = _make_fake_blocks([10, 11])
         blocks.blocks = [[SimpleNamespace(block_hash=None), SimpleNamespace(block_hash=None)]]
 
         assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (32, True)
+        sc.update_state_after_alloc(req, blocks, num_external_tokens=16)
+
+        intent = sc._pending_load_intents["r1"]
+        assert intent.group_block_ids == ((10, 0),)
+        assert intent.num_tokens == 16
+        engine_client.release.assert_not_called()
+
+    def test_load_block_mismatch_releases_probe_and_raises(self):
+        """Allocation SHORTER than the accepted external range is a real
+        contract violation and still raises."""
+        sc, engine_client = self._make_connector()
+        req = _make_fake_request("r1", [_hash(i) for i in range(2)])
+        blocks = _make_fake_blocks([10])
+        blocks.blocks = [[SimpleNamespace(block_hash=None)]]
+
+        assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (32, True)
 
         with pytest.raises(RuntimeError, match="load block mismatch"):
-            sc.update_state_after_alloc(req, blocks, num_external_tokens=16)
+            sc.update_state_after_alloc(req, blocks, num_external_tokens=32)
 
         engine_client.release.assert_called_once_with(b"lease-1")
         assert "r1" not in sc._pending_query_probes

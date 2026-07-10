@@ -136,8 +136,8 @@ def _load_metadata(req_id: str, block_ids: tuple[int, ...]) -> PegaConnectorMeta
     return PegaConnectorMetadata(
         load_intents={
             req_id: LoadIntent(
-                block_ids=block_ids,
-                lease=f"lease-{req_id}".encode(),
+                group_block_ids=(block_ids,),
+                group_leases=(f"lease-{req_id}".encode(),),
                 num_tokens=len(block_ids) * 16,
             )
         }
@@ -440,3 +440,92 @@ def test_register_version_mismatch_rpc_error_stops_startup(monkeypatch):
     assert len(client.register_calls) == 1
 
     worker.shutdown()
+
+
+def test_partial_group_failure_reports_request_exactly_once(monkeypatch):
+    """HMA loads are one RPC per kv_cache_group. When one group fails
+    (e.g. its lease mint failed) while another group's load is in flight,
+    the request must surface in finished_recving exactly ONCE — after the
+    in-flight group drains — with the failed group's blocks reported for
+    recomputation. A premature duplicate report trips vLLM's scheduler
+    asserts."""
+
+    class ControllableLoadState:
+        instances: list = []
+
+        def __init__(self):
+            self.ready = False
+            ControllableLoadState.instances.append(self)
+
+        def shm_name(self) -> str:
+            return f"shm-{id(self)}"
+
+        def is_ready(self) -> bool:
+            return self.ready
+
+        def get_state(self) -> int:
+            return 1 if self.ready else 0
+
+    from pegaflow.connector import worker as worker_mod
+
+    monkeypatch.setattr(worker_mod, "PyLoadState", ControllableLoadState)
+
+    worker, client, _ = _make_worker()
+    worker._cross_layer_mode = False
+    worker._registered_layers = ["layer_a", "layer_b"]
+
+    meta = PegaConnectorMetadata(
+        load_intents={
+            "r1": LoadIntent(
+                group_block_ids=((1, 2), (3, 4)),
+                group_leases=(b"lease-0", b""),  # group-1 mint failed
+                num_tokens=32,
+            )
+        },
+        layer_to_group={"layer_a": 0, "layer_b": 1},
+        group_layer_names=[["layer_a"], ["layer_b"]],
+    )
+    worker.start_load_kv(meta, _stub_forward_context())
+
+    # Only the leased group launched an RPC.
+    assert len(client.load_calls) == 1
+    assert client.load_calls[0][4] == ["layer_a"]
+
+    # The failed group's blocks are recompute-marked immediately...
+    assert worker.get_block_ids_with_load_errors() == {3, 4}
+    # ...but the request is NOT reported while group-0 is still in flight.
+    _, recving = worker.get_finished(set())
+    assert not recving
+
+    # Group-0 completes -> exactly one finished_recving report.
+    ControllableLoadState.instances[0].ready = True
+    _, recving = worker.get_finished(set())
+    assert recving == {"r1"}
+    _, recving = worker.get_finished(set())
+    assert not recving
+
+
+def test_all_null_group_slice_releases_lease_without_rpc(monkeypatch):
+    """A group slice whose destinations are all the null block (a fully
+    out-of-window SWA window) moves no useful bytes: no RPC is issued and
+    the minted lease is released instead of leaking server-side."""
+    worker, client, _ = _make_worker()
+    worker._cross_layer_mode = False
+    worker._registered_layers = ["layer_a", "layer_b"]
+
+    meta = PegaConnectorMetadata(
+        load_intents={
+            "r1": LoadIntent(
+                group_block_ids=((1, 2), (0, 0)),
+                group_leases=(b"lease-0", b"lease-1"),
+                num_tokens=32,
+            )
+        },
+        layer_to_group={"layer_a": 0, "layer_b": 1},
+        group_layer_names=[["layer_a"], ["layer_b"]],
+    )
+    worker.start_load_kv(meta, _stub_forward_context())
+
+    assert len(client.load_calls) == 1
+    assert client.load_calls[0][4] == ["layer_a"]
+    assert client.release_calls == [b"lease-1"]
