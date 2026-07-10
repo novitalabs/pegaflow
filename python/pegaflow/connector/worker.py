@@ -183,8 +183,11 @@ class WorkerConnector:
         self._save_completion_events: dict[str, threading.Event] = {}
         self._current_metadata: PegaConnectorMetadata | None = None
 
-        self._pending_loads: dict[str, PyLoadState] = {}
-        self._pending_load_reqs: dict[str, set[str]] = {}
+        # _pending_loads[req_id] = list of PyLoadState objects, one per kv_cache_group.
+        # A request is done loading only when ALL group states are ready.
+        self._pending_loads: dict[str, list[PyLoadState]] = {}
+        self._shm_to_load_state: dict[str, PyLoadState] = {}  # shm_name -> load_state
+        self._pending_load_reqs: dict[str, set[str]] = {}  # shm_name -> req_ids
         self._pending_load_meta: dict[
             str, tuple[float, int, list[int]]
         ] = {}  # shm_name -> (start_time, num_blocks, block_ids)
@@ -392,10 +395,10 @@ class WorkerConnector:
             load_stats_to_record: list[tuple[float, int, bool]] = []
             now = time.perf_counter()
 
-            for shm_name, req_ids in self._pending_load_reqs.items():
-                sample_req_id = next(iter(req_ids))
-                load_state = self._pending_loads.get(sample_req_id)
+            for shm_name, req_ids in list(self._pending_load_reqs.items()):
+                load_state = self._shm_to_load_state.get(shm_name)
                 if load_state is None:
+                    completed_shms.append(shm_name)
                     continue
 
                 meta = self._pending_load_meta.get(shm_name)
@@ -426,7 +429,6 @@ class WorkerConnector:
                         duration = now - start_time
                         load_stats_to_record.append((duration, num_blocks, success))
 
-                    completed_reqs.update(req_ids)
                     completed_shms.append(shm_name)
                 elif timed_out:
                     assert meta is not None
@@ -442,15 +444,25 @@ class WorkerConnector:
                     )
                     self._failed_load_block_ids.update(block_ids)
                     load_stats_to_record.append((duration, num_blocks, False))
-                    completed_reqs.update(req_ids)
                     completed_shms.append(shm_name)
                     timeout_triggered = True
+                else:
+                    continue
+
+                # Remove this group's load_state from each req's pending list.
+                # A request is fully done only when all group states are terminal.
+                for req_id in req_ids:
+                    states = self._pending_loads.get(req_id)
+                    if states is not None:
+                        self._pending_loads[req_id] = [ls for ls in states if ls is not load_state]
+                        if not self._pending_loads[req_id]:
+                            del self._pending_loads[req_id]
+                            completed_reqs.add(req_id)
 
             for shm_name in completed_shms:
-                shm_req_ids = self._pending_load_reqs.pop(shm_name, set())
+                self._pending_load_reqs.pop(shm_name, None)
+                self._shm_to_load_state.pop(shm_name, None)
                 self._pending_load_meta.pop(shm_name, None)
-                for req_id in shm_req_ids:
-                    self._pending_loads.pop(req_id, None)
 
             # Drain sync-failure reqs recorded by start_load_kv so they also
             # reach vLLM as finished_recving in this pass.
@@ -496,96 +508,170 @@ class WorkerConnector:
         total_requests = len(metadata.load_intents)
         load_start = time.perf_counter()
 
-        all_block_ids: list[int] = []
-        loads: list[tuple[bytes, list[int]]] = []
-        request_ids: list[str] = []
-
-        for req_id, load_intent in metadata.load_intents.items():
-            block_ids = list(load_intent.block_ids)
-            all_block_ids.extend(block_ids)
-            loads.append((load_intent.lease, block_ids))
-            request_ids.append(req_id)
-
-        if not all_block_ids:
-            return
-
+        # Layers per kv_cache_group. Without HMA metadata every layer maps
+        # to group 0 and this degenerates to the legacy single-RPC path.
+        # Cross-layer mode is only reachable single-group (the facade
+        # forces per-layer registration when kv_cache_groups > 1).
+        layer_to_group = metadata.layer_to_group
         if self._cross_layer_mode:
-            target_layers = [self._cross_layer_key]
+            layers_by_group: dict[int, list[str]] = {0: [self._cross_layer_key]}
+            num_groups = 1
         else:
             assert self._registered_layers, (
                 "KV caches must be registered before submitting load intents"
             )
-            target_layers = list(self._registered_layers)
+            if layer_to_group:
+                layers_by_group = {}
+                for layer_name in self._registered_layers:
+                    layers_by_group.setdefault(layer_to_group.get(layer_name, 0), []).append(
+                        layer_name
+                    )
+                num_groups = max(
+                    (len(li.group_block_ids) for li in metadata.load_intents.values()),
+                    default=1,
+                )
+            else:
+                layers_by_group = {0: list(self._registered_layers)}
+                num_groups = 1
 
-        if not target_layers:
-            return
+        def _real_ids(ids: list[int]) -> list[int]:
+            # Block 0 is vLLM's reserved null block: SWA groups carry it at
+            # out-of-window positions and the scheduler pads with it to match
+            # the lease length. It is never read, so it must not be reported
+            # as a failed (recompute-me) block.
+            return [b for b in ids if b != 0]
 
-        load_state = PyLoadState()
-        shm_name = load_state.shm_name()
+        # Per-request failure ids are gathered across ALL group RPCs and
+        # resolved only after the loop: a request whose other groups have
+        # in-flight loads must NOT be reported failed immediately, or
+        # get_finished reports it in finished_recving twice (once from the
+        # sync-failure drain, again when the pending shm completes) — vLLM
+        # asserts on the duplicate. Deferred requests surface exactly once,
+        # when their pending group states drain; their failed block ids are
+        # recorded immediately so vLLM recomputes those blocks either way.
+        failed_ids_by_req: dict[str, list[int]] = {}
+        states_by_req: dict[str, list[PyLoadState]] = {}
+        launched: list[tuple[str, PyLoadState, int, list[int], set[str]]] = []
 
-        try:
-            ok, message = self._ctx.engine_client.load(
-                self._ctx.instance_id,
-                self._ctx.effective_tp_rank,
-                self._ctx.device_id,
-                shm_name,
-                target_layers,
-                loads,
-            )
-        except Exception as e:
-            logger.error(
-                "[PegaKVConnector] Load RPC exception: %s (reqs=%s blocks=%d, "
-                "marking blocks as load errors)",
-                e,
-                request_ids,
-                len(all_block_ids),
-            )
-            self._release_load_leases(loads)
-            self._record_load_failure(request_ids, all_block_ids, load_start)
-            self._ctx.state_manager.mark_unavailable(f"load rpc exception: {e}")
-            return
+        groups_launched = 0
+        for g_idx in range(num_groups):
+            target_layers = layers_by_group.get(g_idx, [])
+            if not target_layers:
+                continue
 
-        if not ok:
-            logger.error(
-                "[PegaKVConnector] Load RPC failed: %s (reqs=%s blocks=%d, "
-                "marking blocks as load errors)",
-                message,
-                request_ids,
-                len(all_block_ids),
-            )
-            self._release_load_leases(loads)
-            self._record_load_failure(request_ids, all_block_ids, load_start)
-            self._ctx.state_manager.mark_unavailable(f"load rpc failed: {message}")
-            return
+            all_block_ids: list[int] = []
+            loads: list[tuple[bytes, list[int]]] = []
+            contribs: list[tuple[str, list[int]]] = []
+            for req_id, load_intent in metadata.load_intents.items():
+                groups = load_intent.group_block_ids
+                if g_idx >= len(groups):
+                    # This intent has no data for the group. Never clamp to
+                    # group 0: its lease was already consumed by the group-0
+                    # RPC and resubmitting it would fail the whole RPC.
+                    continue
+                block_ids = list(groups[g_idx])
+                if not block_ids:
+                    continue
+                lease = (
+                    load_intent.group_leases[g_idx]
+                    if g_idx < len(load_intent.group_leases)
+                    else b""
+                )
+                real = _real_ids(block_ids)
+                if not lease:
+                    # Lease mint failed scheduler-side.
+                    failed_ids_by_req.setdefault(req_id, []).extend(real)
+                    continue
+                if not real:
+                    # Every destination is the null block (a fully
+                    # out-of-window SWA slice): loading it moves no useful
+                    # bytes. Skip the work and release the lease.
+                    try:
+                        self._ctx.engine_client.release(lease)
+                    except Exception:
+                        logger.exception("[PegaKVConnector] null-slice lease release failed")
+                    continue
+                all_block_ids.extend(block_ids)
+                loads.append((lease, block_ids))
+                contribs.append((req_id, real))
 
-        num_layers = len(target_layers)
-        num_blocks = len(all_block_ids)
+            if not loads:
+                continue
 
-        schedule_end = time.perf_counter()
-        schedule_time_us = (schedule_end - load_start) * 1e6
+            load_state = PyLoadState()
+            shm_name = load_state.shm_name()
+            num_blocks = len(all_block_ids)
+
+            try:
+                ok, message = self._ctx.engine_client.load(
+                    self._ctx.instance_id,
+                    self._ctx.effective_tp_rank,
+                    self._ctx.device_id,
+                    shm_name,
+                    target_layers,
+                    loads,
+                )
+            except Exception as e:
+                ok, message = False, repr(e)
+
+            if not ok:
+                logger.error(
+                    "[PegaKVConnector] Load RPC failed: %s (group=%d blocks=%d, "
+                    "marking blocks as load errors)",
+                    message,
+                    g_idx,
+                    num_blocks,
+                )
+                self._release_load_leases(loads)
+                for req_id, real in contribs:
+                    failed_ids_by_req.setdefault(req_id, []).extend(real)
+                with self._stats_lock:
+                    self._stats.record_load(
+                        time.perf_counter() - load_start, num_blocks, success=False
+                    )
+                self._ctx.state_manager.mark_unavailable(f"load rpc failed: {message}")
+                continue
+
+            req_ids = {req_id for req_id, _ in contribs}
+            for req_id in req_ids:
+                states_by_req.setdefault(req_id, []).append(load_state)
+            launched.append((shm_name, load_state, load_start, all_block_ids, req_ids))
+            groups_launched += 1
 
         with self._load_completion_lock:
-            for req_id in request_ids:
-                self._pending_loads[req_id] = load_state
-            self._pending_load_reqs[shm_name] = set(request_ids)
-            # Keep load_start as the shared baseline so timeout and stats duration
-            # are comparable to the sync-failure path (which also uses load_start).
-            # all_block_ids is not mutated after this point; keep the reference
-            # instead of an extra defensive copy.
-            self._pending_load_meta[shm_name] = (
-                load_start,
-                num_blocks,
-                all_block_ids,
-            )
+            for shm_name, load_state, started, block_ids, req_ids in launched:
+                for req_id in req_ids:
+                    self._pending_loads.setdefault(req_id, []).append(load_state)
+                self._pending_load_reqs[shm_name] = set(req_ids)
+                self._shm_to_load_state[shm_name] = load_state
+                self._pending_load_meta[shm_name] = (
+                    started,
+                    len(block_ids),
+                    _real_ids(block_ids),
+                )
+            for req_id, ids in failed_ids_by_req.items():
+                # Recompute these blocks no matter what.
+                self._failed_load_block_ids.update(ids)
+                if not self._pending_loads.get(req_id):
+                    # No other group in flight: report the failure now.
+                    self._failed_load_reqs.add(req_id)
+                # else: the request completes exactly once when its pending
+                # group states drain in get_finished.
 
+        if failed_ids_by_req:
+            with self._stats_lock:
+                self._stats.record_load(
+                    time.perf_counter() - load_start,
+                    sum(len(v) for v in failed_ids_by_req.values()),
+                    success=False,
+                )
+
+        schedule_time_us = (time.perf_counter() - load_start) * 1e6
         logger.debug(
-            "[PegaKVConnector] started async load: %d blocks across %d layers for %d reqs, "
-            "schedule %.0f us, shm=%s",
-            num_blocks,
-            num_layers,
+            "[PegaKVConnector] started async load: %d group RPCs for %d reqs, schedule %.0f us",
+            groups_launched,
             total_requests,
             schedule_time_us,
-            shm_name,
         )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -694,11 +780,16 @@ class WorkerConnector:
         for task in batch:
             all_request_ids.extend(task.request_ids)
 
+            layer_to_group = task.metadata.layer_to_group
             for save_intent in task.metadata.save_intents.values():
-                if not save_intent.block_ids:
+                if not save_intent.group_block_ids:
                     continue
 
-                block_ids = save_intent.block_ids
+                # Group-0 view feeds the legacy single-group paths
+                # (cross-layer, page-first MLA striping); HMA metadata
+                # overrides per layer below. Multi-group never reaches
+                # cross-layer/page-first (both are single-group only).
+                block_ids = save_intent.group_block_ids[0]
                 block_hashes = save_intent.block_hashes
 
                 if self._cross_layer_mode:
@@ -722,15 +813,41 @@ class WorkerConnector:
                     )
                     target_layers = tuple(self._registered_layers)
 
-                if not block_ids:
+                if not block_ids and not layer_to_group:
                     continue
 
                 for layer_name in target_layers:
+                    if layer_to_group:
+                        # HMA: this layer's group decides which physical
+                        # blocks hold its KV; hashes are shared (positional).
+                        g_idx = layer_to_group.get(layer_name, 0)
+                        if g_idx >= len(save_intent.group_block_ids):
+                            g_idx = 0
+                        layer_ids = save_intent.group_block_ids[g_idx]
+                        layer_hashes = save_intent.block_hashes
+                    else:
+                        layer_ids = block_ids
+                        layer_hashes = block_hashes
+
+                    if not layer_ids:
+                        continue
+
+                    if len(layer_ids) != len(layer_hashes):
+                        logger.warning(
+                            "[PegaKVConnector] save_intent mismatch layer=%s "
+                            "block_count=%d hash_count=%d reqs=%s",
+                            layer_name,
+                            len(layer_ids),
+                            len(layer_hashes),
+                            task.request_ids,
+                        )
+                        continue
+
                     if layer_name not in saves_by_layer:
                         saves_by_layer[layer_name] = ([], [])
 
-                    saves_by_layer[layer_name][0].extend(block_ids)
-                    saves_by_layer[layer_name][1].extend(block_hashes)
+                    saves_by_layer[layer_name][0].extend(layer_ids)
+                    saves_by_layer[layer_name][1].extend(layer_hashes)
 
         if saves_by_layer:
             # Ensure all GPU kernels have completed before reading KV cache
@@ -844,12 +961,12 @@ class WorkerConnector:
         """
         tp_size = self._ctx.tp_size
         if tp_size <= 1:
-            return list(save_intent.block_ids), list(save_intent.block_hashes)
+            return list(save_intent.group_block_ids[0]), list(save_intent.block_hashes)
         tp_rank = self._ctx.tp_rank or 0
         ids: list[int] = []
         hashes: list[bytes] = []
         for block_id, block_hash in zip(
-            save_intent.block_ids, save_intent.block_hashes, strict=True
+            save_intent.group_block_ids[0], save_intent.block_hashes, strict=True
         ):
             if block_id % tp_size == tp_rank:
                 ids.append(block_id)

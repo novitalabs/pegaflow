@@ -103,18 +103,44 @@ class ConnectorContext:
 
 @dataclass(frozen=True)
 class LoadIntent:
-    """Intent for a KV load operation."""
+    """Intent for a KV load operation.
 
-    block_ids: tuple[int, ...]
-    lease: bytes
+    group_block_ids[i] holds the destination pool slot indices for
+    kv_cache_group i, POSITIONALLY aligned with the leased hash range —
+    all groups share one block granularity (enforced at init), so entry p
+    of every group is the same token range. Sliding-window groups carry
+    the null block id (vLLM reserves that slot and never reads it) at
+    out-of-window positions; loading into it is harmless, and keeping the
+    full-length list preserves the load RPC's len(lease hashes) ==
+    len(destination ids) contract.
+
+    group_leases[i] is a server lease over the SAME hash range for group
+    i's load RPC. The server consumes a lease on first use
+    (query_leases.consume), so per-group load RPCs cannot share one — the
+    scheduler mints one per group. An empty lease marks a group whose
+    mint failed; the worker reports that group's real destinations as
+    load errors so vLLM recomputes them.
+    """
+
+    group_block_ids: tuple[tuple[int, ...], ...]
+    group_leases: tuple[bytes, ...]
     num_tokens: int
 
 
 @dataclass(frozen=True)
 class SaveIntent:
-    """Intent for a KV save operation."""
+    """Intent for a KV save operation.
 
-    block_ids: tuple[int, ...]
+    group_block_ids[i] holds the pool slot indices for kv_cache_group i,
+    positionally parallel to block_hashes (shared across groups — same
+    token ranges). A position is included only when EVERY group still
+    holds a live, hash-matching block for it (checked against the bound
+    GPU block pool), so every stored hash is complete across all layers;
+    sliding-window positions that slid out before saving are skipped for
+    all groups together.
+    """
+
+    group_block_ids: tuple[tuple[int, ...], ...]
     block_hashes: tuple[bytes, ...]
 
 
@@ -126,12 +152,18 @@ class PegaConnectorMetadata(KVConnectorMetadata):
         load_intents: dict[str, LoadIntent] | None = None,
         save_intents: dict[str, SaveIntent] | None = None,
         preempted_req_ids: set[str] | None = None,
+        layer_to_group: dict[str, int] | None = None,
+        group_layer_names: list[list[str]] | None = None,
     ):
         super().__init__()
         # Maps request_id -> intent
         self.load_intents: dict[str, LoadIntent] = load_intents or {}
         self.save_intents: dict[str, SaveIntent] = save_intents or {}
         self.preempted_req_ids: set[str] = preempted_req_ids or set()
+        # Maps layer_name -> kv_cache_group index (built from KVCacheConfig)
+        self.layer_to_group: dict[str, int] = layer_to_group or {}
+        # group_layer_names[i] = list of layer names in kv_cache_group i
+        self.group_layer_names: list[list[str]] = group_layer_names or []
 
     def __repr__(self) -> str:
         return (
@@ -200,6 +232,7 @@ def derive_namespace(
     dcp_world_size: int = 1,
     pcp_world_size: int = 1,
     cross_layer_blocks: bool = False,
+    kv_group_signature: str = "",
 ) -> str:
     """
     Derive namespace for storage isolation.
@@ -233,6 +266,10 @@ def derive_namespace(
         "pcp_world_size": pcp_world_size,
         "cross_layer_blocks": cross_layer_blocks,
         "mla_layer_split_kv_cache": bool(additional_config.get("mla_layer_split_kv_cache", False)),
+        # HMA group layout (spec type / block_size / window per group):
+        # which positions each save/load covers depends on it, so two
+        # layouts must never share stored blocks.
+        "kv_group_signature": kv_group_signature,
     }
 
     factor_str = str(sorted(factors.items()))
