@@ -199,7 +199,7 @@ class SchedulerConnector:
             return "transient"
         try:
             blk = pool.blocks[block_id]
-        except (IndexError, TypeError, AttributeError):
+        except (KeyError, IndexError, TypeError, AttributeError):
             return "dead"
         if getattr(blk, "is_null", False):
             return "dead"
@@ -684,10 +684,10 @@ class SchedulerConnector:
             # block slid out (and its slot got reused) before this save —
             # saving it would poison the store under a valid hash.
             logger.warning(
-                "[PegaKVConnector] req=%s multi-group save skipped: GPU block pool not bound",
+                "[PegaKVConnector] req=%s multi-group save deferred: GPU block "
+                "pool not bound (cursor kept; retried once it binds)",
                 req_id,
             )
-            self._next_stored_block_idx[req_id] = saveable_block_idx
             return None
 
         # A position is saved only when EVERY group still holds a live,

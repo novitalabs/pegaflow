@@ -550,7 +550,6 @@ class WorkerConnector:
         # when their pending group states drain; their failed block ids are
         # recorded immediately so vLLM recomputes those blocks either way.
         failed_ids_by_req: dict[str, list[int]] = {}
-        states_by_req: dict[str, list[PyLoadState]] = {}
         launched: list[tuple[str, PyLoadState, int, list[int], set[str]]] = []
 
         groups_launched = 0
@@ -633,8 +632,6 @@ class WorkerConnector:
                 continue
 
             req_ids = {req_id for req_id, _ in contribs}
-            for req_id in req_ids:
-                states_by_req.setdefault(req_id, []).append(load_state)
             launched.append((shm_name, load_state, load_start, all_block_ids, req_ids))
             groups_launched += 1
 
@@ -822,7 +819,16 @@ class WorkerConnector:
                         # blocks hold its KV; hashes are shared (positional).
                         g_idx = layer_to_group.get(layer_name, 0)
                         if g_idx >= len(save_intent.group_block_ids):
-                            g_idx = 0
+                            # Remapping to group 0 would save the WRONG
+                            # physical blocks under valid hashes.
+                            logger.warning(
+                                "[PegaKVConnector] save skipped for layer %s: "
+                                "group %d not in intent (%d groups)",
+                                layer_name,
+                                g_idx,
+                                len(save_intent.group_block_ids),
+                            )
+                            continue
                         layer_ids = save_intent.group_block_ids[g_idx]
                         layer_hashes = save_intent.block_hashes
                     else:
