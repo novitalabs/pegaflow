@@ -121,7 +121,15 @@ class _FdServer:
                 # kill (broad except) this thread — a dead handoff thread
                 # hangs every later registration.
                 conn.settimeout(5.0)
-                token = conn.recv(64).decode(errors="replace")
+                # SOCK_STREAM is not message-framed: read the fixed-length
+                # 32-byte token (uuid4().hex) fully before the lookup.
+                buf = b""
+                while len(buf) < 32:
+                    chunk = conn.recv(32 - len(buf))
+                    if not chunk:
+                        break
+                    buf += chunk
+                token = buf.decode(errors="replace")
                 with self._exports_lock:
                     exp = self._exports.get(token)
                     # Send under the lock with a dup: close_all may close
@@ -161,10 +169,25 @@ class _FdServer:
                 return token
         fd = export_fd()
         with self._exports_lock:
+            # Re-check: a concurrent publisher may have won while we
+            # minted; keeping both would leak a memory-pinning FD.
+            token = self._token_by_dmem.get(d_mem)
+            if token is not None and token in self._exports:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+                return token
             token = uuid.uuid4().hex
             self._exports[token] = _Export(fd=fd, d_mem=d_mem, size=size)
             self._token_by_dmem[d_mem] = token
             return token
+
+    def close(self) -> None:
+        """Close exports and the listening socket, ending the accept loop
+        (tests create private instances; the process singleton lives for
+        the worker lifetime)."""
+        self.close_all()
+        with contextlib.suppress(OSError):
+            self._sock.close()
 
     def close_all(self) -> None:
         """Drop every exported FD. MUST run before vLLM sleeps: an exported
@@ -312,15 +335,19 @@ def _import_mapping(uds_path: str, token: str, size: int, device_index: int) -> 
         if cached is not None:
             return cached
 
+    fd_size = array.array("i").itemsize
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
+        # A wedged/dead handoff peer must fail the registration, not hang
+        # the server's embedded interpreter.
+        s.settimeout(10.0)
         s.connect(uds_path)
         s.sendall(token.encode())
-        msg, ancillary, _, _ = s.recvmsg(1, socket.CMSG_SPACE(4))
+        msg, ancillary, _, _ = s.recvmsg(1, socket.CMSG_SPACE(fd_size))
         if msg != b"F" or not ancillary:
             raise RuntimeError(f"FD handoff failed for token {token!r}")
         fds = array.array("i")
-        fds.frombytes(ancillary[0][2][:4])
+        fds.frombytes(ancillary[0][2][:fd_size])
         fd = fds[0]
     finally:
         s.close()
@@ -331,8 +358,10 @@ def _import_mapping(uds_path: str, token: str, size: int, device_index: int) -> 
     mapped = False
     try:
         _check(
+            # osHandle is a void*-sized parameter carrying the fd value;
+            # c_void_p keeps the call ABI-correct on all platforms.
             cuda.cuMemImportFromShareableHandle(
-                ctypes.byref(handle), ctypes.c_int(fd), _CU_MEM_HANDLE_TYPE_POSIX_FD
+                ctypes.byref(handle), ctypes.c_void_p(fd), _CU_MEM_HANDLE_TYPE_POSIX_FD
             ),
             "cuMemImportFromShareableHandle",
         )
@@ -363,8 +392,15 @@ def _import_mapping(uds_path: str, token: str, size: int, device_index: int) -> 
         raise
 
     mapping = _Mapping(va.value, size, handle.value, fd)
+
+    def _drop_entry(_ref, _token=token):
+        with _mappings_lock:
+            if _mappings.get(_token) is _ref:
+                del _mappings[_token]
+
     with _mappings_lock:
-        _mappings[token] = weakref.ref(mapping)
+        ref = weakref.ref(mapping, _drop_entry)
+        _mappings[token] = ref
     logger.info(
         "[pegaflow.vmm] imported %d bytes on device %d (token %s)", size, device_index, token[:8]
     )

@@ -28,14 +28,14 @@ from pegaflow.vmm_ipc import (
 def fd_server():
     server = _FdServer()
     yield server
-    server.close_all()
+    server.close()  # ends the accept loop; per-test instances must not leak threads
 
 
 def _receive_fd(uds_path: str, token: str) -> tuple[bytes, int | None]:
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         s.connect(uds_path)
-        s.sendall(token.encode())
+        s.sendall(token.encode().ljust(32))
         msg, ancillary, _, _ = s.recvmsg(1, socket.CMSG_SPACE(4))
         if not ancillary:
             return msg, None
