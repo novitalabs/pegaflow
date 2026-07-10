@@ -16,6 +16,10 @@ version = "0.23.2"
 edition = "2024"
 license = "Apache-2.0"
 
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
 [workspace.dependencies]
 # Workspace members
 pegaflow-common = { path = "pegaflow-common" }
