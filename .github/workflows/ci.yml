@@ -103,9 +103,8 @@ jobs:
         with:
           persist-credentials: false
       - name: Install rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@1.97.0
         with:
-          toolchain: stable
           components: rustfmt
       - name: Run rust format check
         run: |
@@ -124,9 +123,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libibverbs-dev
       - name: Install rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@1.97.0
         with:
-          toolchain: stable
           components: clippy
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -193,9 +191,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libibverbs-dev
       - name: Install rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: stable
+        uses: dtolnay/rust-toolchain@1.97.0
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: Run cargo check
@@ -261,7 +257,7 @@ jobs:
           sudo apt-get install -y protobuf-compiler libibverbs-dev
 
       - name: Install rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.0
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
