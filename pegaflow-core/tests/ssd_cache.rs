@@ -40,6 +40,9 @@ fn io_uring_available() -> bool {
 macro_rules! skip_without_io_uring {
     () => {
         if !io_uring_available() {
+            if std::env::var_os("PEGAFLOW_REQUIRE_IO_URING").is_some_and(|v| v == "1") {
+                panic!("PEGAFLOW_REQUIRE_IO_URING=1 but io_uring is unavailable");
+            }
             eprintln!("Skipping test: io_uring is not available in this environment");
             return;
         }
