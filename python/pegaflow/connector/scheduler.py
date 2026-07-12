@@ -93,17 +93,16 @@ class SchedulerConnector:
         # saves the partial tail block under a key derived with vLLM's OWN
         # hash function over (last_full_hash, tail_prompt_token_ids, None) —
         # well-defined, and independently derivable by the decode peer.
-        # Requires a replicable hash algo (the `_cbor` variants); the pickle
-        # variants cannot be derived outside this process and are rejected.
+        # Only xxhash_cbor is validated cross-engine; everything else is
+        # rejected (the pickle-based algos aren't even derivable elsewhere).
         self._tail_hash_fn = None
         if pd_tail_save:
-            if vllm_config is None:
-                raise ValueError("pd_tail_save requires vllm_config")
+            assert vllm_config is not None
             algo = vllm_config.cache_config.prefix_caching_hash_algo
-            if "cbor" not in str(algo):
+            if algo != "xxhash_cbor":
                 raise ValueError(
-                    f"pegaflow.pd_tail_save requires a cbor prefix-caching hash algo "
-                    f"(cross-engine derivable); got {algo!r} — "
+                    f"pegaflow.pd_tail_save requires prefix_caching_hash_algo "
+                    f"'xxhash_cbor' (cross-engine derivable, validated); got {algo!r} — "
                     f"run vLLM with --prefix-caching-hash-algo xxhash_cbor"
                 )
             from vllm.utils.hashing import get_hash_fn_by_name
@@ -480,11 +479,7 @@ class SchedulerConnector:
         # decode peer cannot know lora / cache_salt / multimodal dimensions
         # that vLLM folds into block 0's extra_keys. Saving would alias
         # differently-salted prompts onto one key — refuse instead.
-        if (
-            getattr(req, "lora_request", None) is not None
-            or getattr(req, "cache_salt", None)
-            or getattr(req, "mm_features", None)
-        ):
+        if req.lora_request is not None or req.cache_salt or req.mm_features:
             return None
         vbs = self._ctx.virtual_block_size
         prompt_len = req.num_prompt_tokens

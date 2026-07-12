@@ -148,10 +148,8 @@ class PegaKVConnector(KVConnectorBase_V1):
         self._scheduler: SchedulerConnector | None = None
         self._worker: WorkerConnector | None = None
         if role == KVConnectorRole.SCHEDULER:
-            pd_tail_save = os.environ.get("PEGAFLOW_PD_TAIL_SAVE") == "1" or bool(
-                vllm_config.kv_transfer_config.get_from_extra_config(
-                    "pegaflow.pd_tail_save", False
-                )
+            pd_tail_save = bool(
+                vllm_config.kv_transfer_config.get_from_extra_config("pegaflow.pd_tail_save", False)
             )
             self._scheduler = SchedulerConnector(
                 self._ctx, pd_tail_save=pd_tail_save, vllm_config=vllm_config
