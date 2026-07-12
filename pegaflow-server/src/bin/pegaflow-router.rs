@@ -5,6 +5,17 @@
 //! 1. Receive request
 //! 2. Send to P node (max_tokens=1)
 //! 3. Forward to D node (P response means KV is ready)
+//!
+//! `--pd-first-token` (variant A, for decode nodes that refuse ALL prompt
+//! compute — GLM5.2 openinfer-D): P's single generated token is returned to
+//! the client as part of the merged response AND appended to the token-id
+//! prompt forwarded to D, so D's first forward is a true one-token decode.
+//! P runs with `return_token_ids`; D is always driven through
+//! `/v1/completions` with pre-tokenized ids (chat templates apply only on P),
+//! and its SSE stream is re-shaped to the client's API. A D failure (e.g. the
+//! strict no-prefill decode node rejecting a request whose remote KV never
+//! landed) retries the whole P→D flow — content-addressed KV makes the P leg
+//! idempotent.
 
 use std::sync::{
     Arc,
@@ -38,6 +49,10 @@ struct RouterState {
     // Track in-flight requests per node
     p_inflight: Arc<Vec<AtomicUsize>>,
     d_inflight: Arc<Vec<AtomicUsize>>,
+    // Variant A: forward P's first token into D's context (see module doc).
+    pd_first_token: bool,
+    // Full P->D flow retries on a D failure in variant A.
+    pd_flow_retries: usize,
 }
 
 impl RouterState {
@@ -78,6 +93,8 @@ impl RouterState {
             d_index: Arc::new(AtomicUsize::new(0)),
             p_inflight: Arc::new(p_inflight),
             d_inflight: Arc::new(d_inflight),
+            pd_first_token: false,
+            pd_flow_retries: 1,
         }
     }
 
@@ -126,6 +143,420 @@ impl RouterState {
     }
 }
 
+/// What the variant-A flow extracted from the P leg.
+struct PrefillLeg {
+    /// P's full prompt token ids (post chat template on the chat API).
+    prompt_token_ids: Vec<u32>,
+    /// The single generated token.
+    t1_id: u32,
+    /// Its detokenized text (chat: message.content; completions: text).
+    t1_text: String,
+    /// P's finish reason for that token ("stop" = EOS at t1: skip D).
+    finish_reason: Option<String>,
+    /// P's full response (the client envelope when D is skipped).
+    response: Value,
+}
+
+/// One P->D attempt of the variant-A flow. `Err(msg)` means the caller may
+/// retry the whole flow (the P leg is idempotent: same prompt, same
+/// content-addressed KV).
+async fn pd_first_token_flow(
+    state: &RouterState,
+    body: &Value,
+    api_path: &str,
+    req_id: &str,
+    arrive_time: Instant,
+) -> Result<Response, String> {
+    let is_chat = api_path.ends_with("/chat/completions");
+    let org_stream = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let org_max_tokens = ["max_completion_tokens", "max_tokens"]
+        .iter()
+        .find_map(|k| body.get(*k).and_then(|v| v.as_u64()));
+
+    // ---- P leg: prefill + exactly one generated token, with token ids ----
+    let mut p_body = body.clone();
+    p_body["max_tokens"] = json!(1);
+    if p_body.get("max_completion_tokens").is_some() {
+        p_body["max_completion_tokens"] = json!(1);
+    }
+    p_body["stream"] = json!(false);
+    p_body["request_id"] = json!(req_id);
+    p_body["return_token_ids"] = json!(true);
+    // The appended-token contract needs t1 to exist even at instant EOS.
+    p_body["min_tokens"] = json!(1);
+    if let Some(obj) = p_body.as_object_mut() {
+        obj.remove("stream_options");
+    }
+
+    let (p_client, p_url, p_idx) = state.get_next_p();
+    let p_url = format!("{}{}", p_url, api_path);
+    let p_response = p_client
+        .post(&p_url)
+        .header("X-Request-Id", req_id)
+        .json(&p_body)
+        .send()
+        .await;
+    state.finish_p(p_idx);
+    let p_response = p_response.map_err(|e| format!("prefill request: {e}"))?;
+    let p_status = p_response.status();
+    let p_result: Value = p_response
+        .json()
+        .await
+        .map_err(|e| format!("prefill response parse: {e}"))?;
+    if !p_status.is_success() {
+        return Err(format!("prefill status {p_status}: {p_result}"));
+    }
+    let leg = extract_prefill_leg(p_result)?;
+    info!(
+        "prefill done: req={} P[{}] prompt_tokens={} t1={} latency={}ms",
+        req_id,
+        p_idx,
+        leg.prompt_token_ids.len(),
+        leg.t1_id,
+        arrive_time.elapsed().as_millis()
+    );
+
+    // EOS at t1, or the client only asked for one token: P's response IS the
+    // final answer — no decode leg.
+    if leg.finish_reason.as_deref() == Some("stop") || org_max_tokens == Some(1) {
+        return Ok(reshape_single_token_response(&leg, is_chat, org_stream));
+    }
+
+    // ---- D leg: pre-tokenized prompt + t1, always /v1/completions ----
+    let mut d_body = body.clone();
+    if let Some(obj) = d_body.as_object_mut() {
+        obj.remove("messages");
+        obj.remove("max_completion_tokens");
+        obj.remove("echo");
+    }
+    let mut d_prompt = leg.prompt_token_ids.clone();
+    d_prompt.push(leg.t1_id);
+    d_body["prompt"] = json!(d_prompt);
+    if let Some(max) = org_max_tokens {
+        d_body["max_tokens"] = json!(max.saturating_sub(1).max(1));
+    }
+    if let Some(min_tokens) = body.get("min_tokens").and_then(|v| v.as_u64()) {
+        d_body["min_tokens"] = json!(min_tokens.saturating_sub(1));
+    }
+    d_body["stream"] = json!(org_stream);
+    d_body["request_id"] = json!(req_id);
+    if org_stream {
+        // Usage patching (t1 + P-side prompt length) needs the final counts.
+        d_body["stream_options"] = json!({"include_usage": true});
+    }
+
+    let (d_client, d_url, d_idx) = state.get_next_d();
+    let d_url = format!("{}/v1/completions", d_url);
+    let d_response = match d_client
+        .post(&d_url)
+        .header("X-Request-Id", req_id)
+        .json(&d_body)
+        .send()
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            state.finish_d(d_idx);
+            return Err(format!("decode request: {e}"));
+        }
+    };
+    let d_status = d_response.status();
+    if !d_status.is_success() {
+        let detail = d_response.text().await.unwrap_or_default();
+        state.finish_d(d_idx);
+        return Err(format!("decode status {d_status}: {detail}"));
+    }
+
+    if org_stream {
+        Ok(stream_spliced_response(
+            state.clone(),
+            d_response,
+            leg,
+            is_chat,
+            body.get("stream_options").cloned(),
+            req_id.to_string(),
+            d_idx,
+            arrive_time,
+        ))
+    } else {
+        let d_result: Value = d_response
+            .json()
+            .await
+            .map_err(|e| format!("decode response parse: {e}"))?;
+        state.finish_d(d_idx);
+        info!(
+            "done: req={} D[{}] total={}ms inflight=[{}]",
+            req_id,
+            d_idx,
+            arrive_time.elapsed().as_millis(),
+            state.get_inflight_summary()
+        );
+        Ok(merge_final_response(&leg, d_result, is_chat))
+    }
+}
+
+/// Pull prompt ids + the single token out of P's chat/completions response.
+fn extract_prefill_leg(p_result: Value) -> Result<PrefillLeg, String> {
+    let choice = p_result
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .ok_or("prefill response has no choices")?;
+    // Completions responses carry prompt_token_ids on the choice; chat
+    // responses carry it at the top level.
+    let prompt_token_ids: Vec<u32> = choice
+        .get("prompt_token_ids")
+        .or_else(|| p_result.get("prompt_token_ids"))
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .ok_or("prefill response missing prompt_token_ids (P must support return_token_ids)")?;
+    let token_ids: Vec<u32> = choice
+        .get("token_ids")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .ok_or("prefill response missing token_ids")?;
+    let t1_id = *token_ids
+        .first()
+        .ok_or("prefill generated no token (min_tokens=1 expected)")?;
+    let t1_text = choice
+        .get("text")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            choice
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|v| v.as_str())
+        })
+        .unwrap_or_default()
+        .to_string();
+    let finish_reason = choice
+        .get("finish_reason")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    Ok(PrefillLeg {
+        prompt_token_ids,
+        t1_id,
+        t1_text,
+        finish_reason,
+        response: p_result,
+    })
+}
+
+/// The no-D-leg case: P's non-streaming response answers the client. A
+/// streaming client gets it re-shaped as a minimal SSE exchange.
+fn reshape_single_token_response(leg: &PrefillLeg, is_chat: bool, org_stream: bool) -> Response {
+    if !org_stream {
+        return (StatusCode::OK, Json(leg.response.clone())).into_response();
+    }
+    let id = leg
+        .response
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("pd-1")
+        .to_string();
+    let model = leg
+        .response
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let finish = leg.finish_reason.clone().unwrap_or_else(|| "stop".into());
+    let chunks = if is_chat {
+        vec![
+            chat_chunk(&id, &model, json!({"role": "assistant", "content": leg.t1_text}), None),
+            chat_chunk(&id, &model, json!({}), Some(&finish)),
+        ]
+    } else {
+        vec![completion_chunk(&id, &model, &leg.t1_text, Some(&finish))]
+    };
+    let mut sse = String::new();
+    for chunk in chunks {
+        sse.push_str(&format!("data: {chunk}\n\n"));
+    }
+    sse.push_str("data: [DONE]\n\n");
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/event-stream")
+        .body(Body::from(sse))
+        .unwrap()
+}
+
+fn chat_chunk(id: &str, model: &str, delta: Value, finish: Option<&str>) -> Value {
+    json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "model": model,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+    })
+}
+
+fn completion_chunk(id: &str, model: &str, text: &str, finish: Option<&str>) -> Value {
+    json!({
+        "id": id,
+        "object": "text_completion",
+        "model": model,
+        "choices": [{"index": 0, "text": text, "finish_reason": finish}],
+    })
+}
+
+/// Non-streaming merge: t1 + D's completion, with usage covering both legs.
+fn merge_final_response(leg: &PrefillLeg, d_result: Value, is_chat: bool) -> Response {
+    let d_choice = &d_result["choices"][0];
+    let d_text = d_choice["text"].as_str().unwrap_or_default();
+    let finish = d_choice.get("finish_reason").cloned().unwrap_or(Value::Null);
+    let d_completion_tokens = d_result["usage"]["completion_tokens"].as_u64().unwrap_or(0);
+    let usage = json!({
+        "prompt_tokens": leg.prompt_token_ids.len(),
+        "completion_tokens": d_completion_tokens + 1,
+        "total_tokens": leg.prompt_token_ids.len() as u64 + d_completion_tokens + 1,
+    });
+    let mut out = leg.response.clone();
+    out["usage"] = usage;
+    if is_chat {
+        out["choices"][0]["message"]["content"] = json!(format!("{}{}", leg.t1_text, d_text));
+    } else {
+        out["choices"][0]["text"] = json!(format!("{}{}", leg.t1_text, d_text));
+    }
+    out["choices"][0]["finish_reason"] = finish;
+    (StatusCode::OK, Json(out)).into_response()
+}
+
+/// Streaming splice: one synthetic chunk carrying t1, then D's completions
+/// SSE re-shaped to the client's API (chat delta chunks when the client
+/// spoke chat), with usage patched to cover both legs.
+#[allow(clippy::too_many_arguments)]
+fn stream_spliced_response(
+    state: RouterState,
+    d_response: reqwest::Response,
+    leg: PrefillLeg,
+    is_chat: bool,
+    client_stream_options: Option<Value>,
+    req_id: String,
+    d_idx: usize,
+    arrive_time: Instant,
+) -> Response {
+    let include_usage = client_stream_options
+        .as_ref()
+        .and_then(|o| o.get("include_usage"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(100);
+    tokio::spawn(async move {
+        let id = leg
+            .response
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("pd-1")
+            .to_string();
+        let model = leg
+            .response
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let first = if is_chat {
+            chat_chunk(&id, &model, json!({"role": "assistant", "content": leg.t1_text}), None)
+        } else {
+            completion_chunk(&id, &model, &leg.t1_text, None)
+        };
+        let _ = tx
+            .send(Ok(format!("data: {first}\n\n").into()))
+            .await;
+
+        let mut buffer = String::new();
+        let mut stream = Box::pin(d_response.bytes_stream());
+        'outer: while let Some(chunk) = stream.next().await {
+            let Ok(bytes) = chunk else {
+                error!("stream error: req={req_id}");
+                break;
+            };
+            buffer.push_str(&String::from_utf8_lossy(&bytes));
+            // SSE events are \n\n-delimited; hold the trailing partial event.
+            while let Some(pos) = buffer.find("\n\n") {
+                let event = buffer[..pos].to_string();
+                buffer.drain(..pos + 2);
+                let Some(data) = event
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data: "))
+                else {
+                    continue;
+                };
+                if data.trim() == "[DONE]" {
+                    let _ = tx.send(Ok("data: [DONE]\n\n".into())).await;
+                    break 'outer;
+                }
+                let Ok(mut value) = serde_json::from_str::<Value>(data) else {
+                    continue;
+                };
+                // Patch usage to cover both legs (P's prompt + t1).
+                let is_usage_chunk = value.get("usage").is_some_and(|u| !u.is_null());
+                if is_usage_chunk {
+                    let d_completion =
+                        value["usage"]["completion_tokens"].as_u64().unwrap_or(0);
+                    value["usage"] = json!({
+                        "prompt_tokens": leg.prompt_token_ids.len(),
+                        "completion_tokens": d_completion + 1,
+                        "total_tokens": leg.prompt_token_ids.len() as u64 + d_completion + 1,
+                    });
+                    if !include_usage {
+                        // We forced include_usage on the D leg; a client that
+                        // didn't ask for it must not see a usage-only chunk.
+                        if value
+                            .get("choices")
+                            .and_then(|c| c.as_array())
+                            .is_none_or(|c| c.is_empty())
+                        {
+                            continue;
+                        }
+                        value.as_object_mut().map(|o| o.remove("usage"));
+                    }
+                }
+                let out = if is_chat {
+                    let text = value["choices"][0]["text"].as_str().unwrap_or_default();
+                    let finish = value["choices"][0]
+                        .get("finish_reason")
+                        .and_then(|v| v.as_str());
+                    let delta = if text.is_empty() {
+                        json!({})
+                    } else {
+                        json!({"content": text})
+                    };
+                    let mut chunk = chat_chunk(&id, &model, delta, finish);
+                    if is_usage_chunk && include_usage {
+                        chunk["usage"] = value["usage"].clone();
+                        chunk["choices"] = json!([]);
+                    }
+                    chunk
+                } else {
+                    value
+                };
+                if tx
+                    .send(Ok(format!("data: {out}\n\n").into()))
+                    .await
+                    .is_err()
+                {
+                    break 'outer;
+                }
+            }
+        }
+        state.finish_d(d_idx);
+        info!(
+            "done (stream): req={} D[{}] total={}ms inflight=[{}]",
+            req_id,
+            d_idx,
+            arrive_time.elapsed().as_millis(),
+            state.get_inflight_summary()
+        );
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/event-stream")
+        .body(Body::from_stream(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        ))
+        .unwrap()
+}
+
 async fn handle_completion(
     State(state): State<RouterState>,
     _headers: HeaderMap,
@@ -146,6 +577,24 @@ async fn handle_completion(
         req_id,
         state.get_inflight_summary()
     );
+
+    if state.pd_first_token {
+        let mut last_err = String::new();
+        for attempt in 0..=state.pd_flow_retries {
+            match pd_first_token_flow(&state, &body, api_path, &req_id, arrive_time).await {
+                Ok(response) => return response,
+                Err(err) => {
+                    error!("P/D flow attempt {attempt} failed: req={req_id} {err}");
+                    last_err = err;
+                }
+            }
+        }
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("P/D flow failed after retries: {last_err}")})),
+        )
+            .into_response();
+    }
 
     // Save original values to restore for D request
     let org_max_tokens = body.get("max_tokens").cloned();
@@ -392,6 +841,19 @@ struct Args {
     /// Decode endpoints
     #[arg(long, required = true, num_args = 1..)]
     decode: Vec<String>,
+
+    /// Variant A first-token forwarding: return P's single token to the
+    /// client and append it (as a token id) to the prompt D receives, so a
+    /// strict no-prefill decode node's first forward is a one-token decode.
+    /// Requires P to support `return_token_ids` and D to accept token-id
+    /// prompts on /v1/completions.
+    #[arg(long, default_value_t = false)]
+    pd_first_token: bool,
+
+    /// Full P->D flow retries when the D leg fails in --pd-first-token mode
+    /// (a strict decode node rejects when the remote KV never lands).
+    #[arg(long, default_value_t = 1)]
+    pd_flow_retries: usize,
 }
 
 #[tokio::main]
@@ -401,7 +863,15 @@ async fn main() {
 
     let args = Args::parse();
 
-    let state = RouterState::new(args.prefill.clone(), args.decode.clone());
+    let mut state = RouterState::new(args.prefill.clone(), args.decode.clone());
+    state.pd_first_token = args.pd_first_token;
+    state.pd_flow_retries = args.pd_flow_retries;
+    if state.pd_first_token {
+        info!(
+            "P/D first-token forwarding on (flow retries: {})",
+            state.pd_flow_retries
+        );
+    }
 
     let app = Router::new()
         .route("/v1/chat/completions", post(chat_completions))

@@ -78,8 +78,39 @@ class _QueryProbe:
 class SchedulerConnector:
     """Holds scheduler-only state and behaviors."""
 
-    def __init__(self, context: ConnectorContext):
+    def __init__(
+        self,
+        context: ConnectorContext,
+        pd_tail_save: bool = False,
+        vllm_config=None,
+    ):
         self._ctx = context
+
+        # P/D tail-block extension (`pegaflow.pd_tail_save`): vLLM only hashes
+        # full blocks, so a prompt's partial tail block never enters the tier
+        # and a strict no-prefill decode peer would have to recompute it.
+        # When enabled, the step that schedules the final prompt chunk also
+        # saves the partial tail block under a key derived with vLLM's OWN
+        # hash function over (last_full_hash, tail_prompt_token_ids, None) —
+        # well-defined, and independently derivable by the decode peer.
+        # Requires a replicable hash algo (the `_cbor` variants); the pickle
+        # variants cannot be derived outside this process and are rejected.
+        self._tail_hash_fn = None
+        if pd_tail_save:
+            if vllm_config is None:
+                raise ValueError("pd_tail_save requires vllm_config")
+            algo = vllm_config.cache_config.prefix_caching_hash_algo
+            if "cbor" not in str(algo):
+                raise ValueError(
+                    f"pegaflow.pd_tail_save requires a cbor prefix-caching hash algo "
+                    f"(cross-engine derivable); got {algo!r} — "
+                    f"run vLLM with --prefix-caching-hash-algo xxhash_cbor"
+                )
+            from vllm.utils.hashing import get_hash_fn_by_name
+
+            self._tail_hash_fn = get_hash_fn_by_name(algo)
+            logger.info("[PegaKVConnector] P/D tail-block save enabled (algo=%s)", algo)
+        self._tail_saved: set[str] = set()
 
         # Load state
         self._pending_load_intents: dict[str, LoadIntent] = {}
@@ -404,6 +435,59 @@ class SchedulerConnector:
 
     def _consume_save_intent(self, req_id: str) -> SaveIntent | None:
         """Calculate and return SaveIntent for new blocks that need saving."""
+        regular = self._consume_full_block_saves(req_id)
+        tail = self._consume_tail_save(req_id)
+        if tail is None:
+            return regular
+        if regular is None:
+            return tail
+        return SaveIntent(
+            block_ids=regular.block_ids + tail.block_ids,
+            block_hashes=regular.block_hashes + tail.block_hashes,
+        )
+
+    def _consume_tail_save(self, req_id: str) -> SaveIntent | None:
+        """P/D tail extension: save the prompt's partial tail block once its
+        prompt rows are final (the step scheduling the final prompt chunk).
+
+        The saved page may contain rows past the prompt (the first generated
+        token lands in it on the next step, racing the async D2H) — harmless:
+        the key covers only the tail *prompt* tokens, and the decode peer
+        recomputes every position past them anyway.
+        """
+        if self._tail_hash_fn is None or req_id in self._tail_saved:
+            return None
+        req = self._requests.get(req_id)
+        if req is None:
+            return None
+        vbs = self._ctx.virtual_block_size
+        prompt_len = req.num_prompt_tokens
+        tail_len = prompt_len % vbs
+        if tail_len == 0:
+            return None
+        if self._scheduled_tokens.get(req_id, 0) < prompt_len:
+            return None  # tail prompt rows not written yet
+        tail_idx = prompt_len // vbs
+        allocated = self._allocated_blocks.get(req_id, [])
+        block_hashes = self._block_hashes.get(req_id) or ()
+        if tail_idx >= len(allocated) or tail_idx > len(block_hashes):
+            return None  # tail block not allocated / full-block hashes lagging
+        from vllm.v1.core.kv_cache_utils import NONE_HASH, hash_block_tokens
+
+        parent = block_hashes[tail_idx - 1] if tail_idx > 0 else NONE_HASH
+        tail_tokens = list(req.prompt_token_ids[tail_idx * vbs : prompt_len])
+        tail_key = bytes(hash_block_tokens(self._tail_hash_fn, parent, tail_tokens, None))
+        self._tail_saved.add(req_id)
+        logger.info(
+            "[PegaKVConnector] req=%s pd_tail_save: block_id=%d tail_tokens=%d key=%s",
+            req_id,
+            allocated[tail_idx],
+            tail_len,
+            tail_key.hex(),
+        )
+        return SaveIntent(block_ids=(allocated[tail_idx],), block_hashes=(tail_key,))
+
+    def _consume_full_block_saves(self, req_id: str) -> SaveIntent | None:
         # block_hashes are at virtual_block_size granularity, 1-to-1 with block_ids.
         block_hashes = self._block_hashes.get(req_id)
         if block_hashes is None:
@@ -490,6 +574,7 @@ class SchedulerConnector:
         self._scheduled_tokens.pop(req_id, None)
         self._next_stored_block_idx.pop(req_id, None)
         self._pending_saves.discard(req_id)
+        self._tail_saved.discard(req_id)
 
     def _count_available_block_prefix(
         self, block_hashes: Iterable[bytes], req_id: str
