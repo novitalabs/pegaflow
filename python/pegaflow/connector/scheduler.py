@@ -107,11 +107,14 @@ class SchedulerConnector:
                     f"run vLLM with --prefix-caching-hash-algo xxhash_cbor"
                 )
             from vllm.utils.hashing import get_hash_fn_by_name
-            from vllm.v1.core.kv_cache_utils import NONE_HASH, hash_block_tokens
+            from vllm.v1.core import kv_cache_utils
 
             self._tail_hash_fn = get_hash_fn_by_name(algo)
-            self._none_hash = NONE_HASH
-            self._hash_block_tokens = hash_block_tokens
+            self._hash_block_tokens = kv_cache_utils.hash_block_tokens
+            # NONE_HASH is only assigned by vLLM's init_none_hash(), which
+            # runs after connector construction — it must be read lazily
+            # through the module, never imported by name here.
+            self._kv_cache_utils = kv_cache_utils
             logger.info("[PegaKVConnector] P/D tail-block save enabled (algo=%s)", algo)
         self._tail_saved: set[str] = set()
 
@@ -495,7 +498,7 @@ class SchedulerConnector:
         block_hashes = self._block_hashes.get(req_id) or ()
         if tail_idx >= len(allocated) or tail_idx > len(block_hashes):
             return None  # tail block not allocated / full-block hashes lagging
-        parent = block_hashes[tail_idx - 1] if tail_idx > 0 else self._none_hash
+        parent = block_hashes[tail_idx - 1] if tail_idx > 0 else self._kv_cache_utils.NONE_HASH
         tail_tokens = list(req.prompt_token_ids[tail_idx * vbs : prompt_len])
         tail_key = bytes(self._hash_block_tokens(self._tail_hash_fn, parent, tail_tokens, None))
         self._tail_saved.add(req_id)

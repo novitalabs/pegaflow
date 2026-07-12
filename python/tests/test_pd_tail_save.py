@@ -68,7 +68,7 @@ def _make_connector(req, allocated: list[int]) -> SchedulerConnector:
     # Inject the tail machinery directly: these tests pin the TRIGGER, not
     # vLLM's hash function (covered by the cross-engine e2e gates).
     sc._tail_hash_fn = object()
-    sc._none_hash = b"\x00" * 32
+    sc._kv_cache_utils = SimpleNamespace(NONE_HASH=b"\x00" * 32)
     sc._hash_block_tokens = lambda fn, parent, tokens, extra: b"tail:%d" % len(tokens)
     sc._requests[req.request_id] = req
     sc._block_hashes[req.request_id] = tuple(req.block_hashes)
