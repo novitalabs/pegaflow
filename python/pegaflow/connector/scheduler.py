@@ -111,6 +111,10 @@ class SchedulerConnector:
             self._tail_hash_fn = get_hash_fn_by_name(algo)
             logger.info("[PegaKVConnector] P/D tail-block save enabled (algo=%s)", algo)
         self._tail_saved: set[str] = set()
+        # req_id -> prompt tokens covered by caches at admission (local
+        # prefix hit + pegaflow load) — positions that are never scheduled.
+        self._local_computed_at_admission: dict[str, int] = {}
+        self._unscheduled_prompt_tokens: dict[str, int] = {}
 
         # Load state
         self._pending_load_intents: dict[str, LoadIntent] = {}
@@ -142,6 +146,12 @@ class SchedulerConnector:
         num_computed_tokens: int,
     ) -> tuple[int | None, bool]:
         req_id = request.request_id
+
+        # Prompt positions the local prefix cache already covers — they are
+        # never scheduled, so the tail save's completeness condition must
+        # count them (request.num_computed_tokens is not yet set when
+        # update_state_after_alloc runs).
+        self._local_computed_at_admission[req_id] = num_computed_tokens
 
         if not self._ctx.read_enabled:
             logger.debug(
@@ -300,6 +310,18 @@ class SchedulerConnector:
             self._allocated_blocks[req_id] = []
             self._scheduled_tokens[req_id] = 0
             self._next_stored_block_idx[req_id] = base_block_idx
+            # Prompt positions that will never be *scheduled*: the local
+            # prefix-cache hit plus the pegaflow-loaded prefix. The tail
+            # save's "prompt rows all written" condition must count them, or
+            # a request whose prompt shares a cached prefix (every multi-turn
+            # turn >= 2) never fires its tail save. Only the read-enabled
+            # branch needs this — the write-only branch folds computed tokens
+            # into _scheduled_tokens directly.
+            self._unscheduled_prompt_tokens[req_id] = (
+                self._local_computed_at_admission.get(req_id, 0) + num_external_tokens
+                if self._ctx.read_enabled
+                else 0
+            )
 
         if num_external_tokens > 0:
             block_ids = list(blocks.get_block_ids()[0]) if blocks else []
@@ -465,7 +487,10 @@ class SchedulerConnector:
         tail_len = prompt_len % vbs
         if tail_len == 0:
             return None
-        if self._scheduled_tokens.get(req_id, 0) < prompt_len:
+        written = self._unscheduled_prompt_tokens.get(req_id, 0) + self._scheduled_tokens.get(
+            req_id, 0
+        )
+        if written < prompt_len:
             return None  # tail prompt rows not written yet
         tail_idx = prompt_len // vbs
         allocated = self._allocated_blocks.get(req_id, [])
@@ -575,6 +600,8 @@ class SchedulerConnector:
         self._next_stored_block_idx.pop(req_id, None)
         self._pending_saves.discard(req_id)
         self._tail_saved.discard(req_id)
+        self._local_computed_at_admission.pop(req_id, None)
+        self._unscheduled_prompt_tokens.pop(req_id, None)
 
     def _count_available_block_prefix(
         self, block_hashes: Iterable[bytes], req_id: str
