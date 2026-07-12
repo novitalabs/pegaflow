@@ -228,7 +228,8 @@ async fn pd_first_token_flow(
         .send()
         .await;
     state.finish_p(p_idx);
-    let p_response = p_response.map_err(|e| FlowError::transient(format!("prefill request: {e}")))?;
+    let p_response =
+        p_response.map_err(|e| FlowError::transient(format!("prefill request: {e}")))?;
     let p_status = p_response.status();
     let p_result: Value = p_response
         .json()
@@ -277,11 +278,13 @@ async fn pd_first_token_flow(
     d_body["prompt"] = json!(d_prompt);
     // An absent max_tokens must be made explicit: engines default it to 16,
     // silently truncating every open-ended request.
-    let d_max = org_max_tokens.map(|max| max.saturating_sub(1).max(1)).unwrap_or_else(|| {
-        (state.pd_max_model_len as u64)
-            .saturating_sub(d_prompt.len() as u64)
-            .max(1)
-    });
+    let d_max = org_max_tokens
+        .map(|max| max.saturating_sub(1).max(1))
+        .unwrap_or_else(|| {
+            (state.pd_max_model_len as u64)
+                .saturating_sub(d_prompt.len() as u64)
+                .max(1)
+        });
     d_body["max_tokens"] = json!(d_max);
     if let Some(min_tokens) = body.get("min_tokens").and_then(|v| v.as_u64()) {
         d_body["min_tokens"] = json!(min_tokens.saturating_sub(1));
@@ -432,7 +435,12 @@ fn reshape_single_token_response(leg: &PrefillLeg, is_chat: bool, org_stream: bo
     let finish = leg.finish_reason.clone().unwrap_or_else(|| "stop".into());
     let chunks = if is_chat {
         vec![
-            chat_chunk(&id, &model, json!({"role": "assistant", "content": leg.t1_text}), None),
+            chat_chunk(
+                &id,
+                &model,
+                json!({"role": "assistant", "content": leg.t1_text}),
+                None,
+            ),
             chat_chunk(&id, &model, json!({}), Some(&finish)),
         ]
     } else {
@@ -472,7 +480,10 @@ fn completion_chunk(id: &str, model: &str, text: &str, finish: Option<&str>) -> 
 fn merge_final_response(leg: &PrefillLeg, d_result: Value, is_chat: bool) -> Response {
     let d_choice = &d_result["choices"][0];
     let d_text = d_choice["text"].as_str().unwrap_or_default();
-    let finish = d_choice.get("finish_reason").cloned().unwrap_or(Value::Null);
+    let finish = d_choice
+        .get("finish_reason")
+        .cloned()
+        .unwrap_or(Value::Null);
     let d_completion_tokens = d_result["usage"]["completion_tokens"].as_u64().unwrap_or(0);
     let usage = json!({
         "prompt_tokens": leg.prompt_token_ids.len(),
@@ -493,7 +504,10 @@ fn merge_final_response(leg: &PrefillLeg, d_result: Value, is_chat: bool) -> Res
 /// Streaming splice: one synthetic chunk carrying t1, then D's completions
 /// SSE re-shaped to the client's API (chat delta chunks when the client
 /// spoke chat), with usage patched to cover both legs.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one-shot splice helper; bundling into a struct buys nothing"
+)]
 fn stream_spliced_response(
     state: RouterState,
     d_response: reqwest::Response,
@@ -524,13 +538,16 @@ fn stream_spliced_response(
             .unwrap_or_default()
             .to_string();
         let first = if is_chat {
-            chat_chunk(&id, &model, json!({"role": "assistant", "content": leg.t1_text}), None)
+            chat_chunk(
+                &id,
+                &model,
+                json!({"role": "assistant", "content": leg.t1_text}),
+                None,
+            )
         } else {
             completion_chunk(&id, &model, &leg.t1_text, None)
         };
-        let _ = tx
-            .send(Ok(format!("data: {first}\n\n").into()))
-            .await;
+        let _ = tx.send(Ok(format!("data: {first}\n\n").into())).await;
 
         let mut buffer = String::new();
         let mut stream = Box::pin(d_response.bytes_stream());
@@ -548,10 +565,7 @@ fn stream_spliced_response(
             while let Some(pos) = buffer.find("\n\n") {
                 let event = buffer[..pos].to_string();
                 buffer.drain(..pos + 2);
-                let Some(data) = event
-                    .lines()
-                    .find_map(|line| line.strip_prefix("data: "))
-                else {
+                let Some(data) = event.lines().find_map(|line| line.strip_prefix("data: ")) else {
                     continue;
                 };
                 if data.trim() == "[DONE]" {
@@ -565,8 +579,7 @@ fn stream_spliced_response(
                 // Patch usage to cover both legs (P's prompt + t1).
                 let is_usage_chunk = value.get("usage").is_some_and(|u| !u.is_null());
                 if is_usage_chunk {
-                    let d_completion =
-                        value["usage"]["completion_tokens"].as_u64().unwrap_or(0);
+                    let d_completion = value["usage"]["completion_tokens"].as_u64().unwrap_or(0);
                     value["usage"] = json!({
                         "prompt_tokens": leg.prompt_token_ids.len(),
                         "completion_tokens": d_completion + 1,
@@ -665,18 +678,26 @@ async fn handle_completion(
     if state.pd_first_token {
         // The splice takes choices[0] of a single prompt; anything else
         // would be silently mangled — refuse instead.
-        if body.get("n").and_then(|v| v.as_u64()).is_some_and(|n| n > 1) {
+        if body
+            .get("n")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|n| n > 1)
+        {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": "P/D first-token routing does not support n > 1"})),
             )
                 .into_response();
         }
-        if body.get("prompt").and_then(|v| v.as_array()).is_some_and(|arr| {
-            // A flat array of ints is ONE pre-tokenized prompt; anything
-            // string-or-array-valued is a multi-prompt batch.
-            arr.iter().any(|v| v.is_string() || v.is_array())
-        }) {
+        if body
+            .get("prompt")
+            .and_then(|v| v.as_array())
+            .is_some_and(|arr| {
+                // A flat array of ints is ONE pre-tokenized prompt; anything
+                // string-or-array-valued is a multi-prompt batch.
+                arr.iter().any(|v| v.is_string() || v.is_array())
+            })
+        {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": "P/D first-token routing does not support batched prompts"})),

@@ -140,13 +140,9 @@ class TestTailSaveThroughBuildConnectorMeta:
                 req_ids=[r["id"] for r in cached],
                 new_block_ids=[r.get("new_blocks") for r in cached],
                 num_computed_tokens=[r["computed"] for r in cached],
-                resumed_req_ids=set(
-                    r["id"] for r in cached if r.get("resumed", False)
-                ),
+                resumed_req_ids={r["id"] for r in cached if r.get("resumed", False)},
             ),
-            num_scheduled_tokens={
-                r["id"]: r["scheduled"] for r in (list(new) + list(cached))
-            },
+            num_scheduled_tokens={r["id"]: r["scheduled"] for r in (list(new) + list(cached))},
             preempted_req_ids=set(),
         )
         return sc.build_connector_meta(scheduler_output)
