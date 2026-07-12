@@ -53,6 +53,10 @@ struct RouterState {
     pd_first_token: bool,
     // Full P->D flow retries on a D failure in variant A.
     pd_flow_retries: usize,
+    // Model context limit: bounds the D leg's max_tokens when the client
+    // sent none (both vLLM and openinfer default an absent max_tokens to 16,
+    // which would silently truncate every open-ended chat request).
+    pd_max_model_len: usize,
 }
 
 impl RouterState {
@@ -95,6 +99,7 @@ impl RouterState {
             d_inflight: Arc::new(d_inflight),
             pd_first_token: false,
             pd_flow_retries: 1,
+            pd_max_model_len: 32768,
         }
     }
 
@@ -157,16 +162,39 @@ struct PrefillLeg {
     response: Value,
 }
 
-/// One P->D attempt of the variant-A flow. `Err(msg)` means the caller may
-/// retry the whole flow (the P leg is idempotent: same prompt, same
-/// content-addressed KV).
+/// A failed P->D attempt. `retryable` marks transient failures (network,
+/// 5xx/429) — the whole flow may re-run because the P leg is idempotent
+/// (same prompt, same content-addressed KV). Deterministic 4xx must not
+/// retry: it would burn P compute on a guaranteed-identical failure.
+struct FlowError {
+    retryable: bool,
+    msg: String,
+}
+
+impl FlowError {
+    fn transient(msg: String) -> Self {
+        Self {
+            retryable: true,
+            msg,
+        }
+    }
+
+    fn from_status(status: StatusCode, msg: String) -> Self {
+        Self {
+            retryable: !status.is_client_error() || status == StatusCode::TOO_MANY_REQUESTS,
+            msg,
+        }
+    }
+}
+
+/// One P->D attempt of the variant-A flow.
 async fn pd_first_token_flow(
     state: &RouterState,
     body: &Value,
     api_path: &str,
     req_id: &str,
     arrive_time: Instant,
-) -> Result<Response, String> {
+) -> Result<Response, FlowError> {
     let is_chat = api_path.ends_with("/chat/completions");
     let org_stream = body
         .get("stream")
@@ -200,16 +228,19 @@ async fn pd_first_token_flow(
         .send()
         .await;
     state.finish_p(p_idx);
-    let p_response = p_response.map_err(|e| format!("prefill request: {e}"))?;
+    let p_response = p_response.map_err(|e| FlowError::transient(format!("prefill request: {e}")))?;
     let p_status = p_response.status();
     let p_result: Value = p_response
         .json()
         .await
-        .map_err(|e| format!("prefill response parse: {e}"))?;
+        .map_err(|e| FlowError::transient(format!("prefill response parse: {e}")))?;
     if !p_status.is_success() {
-        return Err(format!("prefill status {p_status}: {p_result}"));
+        return Err(FlowError::from_status(
+            p_status,
+            format!("prefill status {p_status}: {p_result}"),
+        ));
     }
-    let leg = extract_prefill_leg(p_result)?;
+    let leg = extract_prefill_leg(p_result).map_err(FlowError::transient)?;
     info!(
         "prefill done: req={} P[{}] prompt_tokens={} t1={} latency={}ms",
         req_id,
@@ -231,13 +262,27 @@ async fn pd_first_token_flow(
         obj.remove("messages");
         obj.remove("max_completion_tokens");
         obj.remove("echo");
+        if is_chat {
+            // Chat-only field shapes that /v1/completions rejects
+            // (`logprobs` is a bool in chat, an int in completions).
+            obj.remove("logprobs");
+            obj.remove("top_logprobs");
+            obj.remove("response_format");
+            obj.remove("tools");
+            obj.remove("tool_choice");
+        }
     }
     let mut d_prompt = leg.prompt_token_ids.clone();
     d_prompt.push(leg.t1_id);
     d_body["prompt"] = json!(d_prompt);
-    if let Some(max) = org_max_tokens {
-        d_body["max_tokens"] = json!(max.saturating_sub(1).max(1));
-    }
+    // An absent max_tokens must be made explicit: engines default it to 16,
+    // silently truncating every open-ended request.
+    let d_max = org_max_tokens.map(|max| max.saturating_sub(1).max(1)).unwrap_or_else(|| {
+        (state.pd_max_model_len as u64)
+            .saturating_sub(d_prompt.len() as u64)
+            .max(1)
+    });
+    d_body["max_tokens"] = json!(d_max);
     if let Some(min_tokens) = body.get("min_tokens").and_then(|v| v.as_u64()) {
         d_body["min_tokens"] = json!(min_tokens.saturating_sub(1));
     }
@@ -260,14 +305,17 @@ async fn pd_first_token_flow(
         Ok(resp) => resp,
         Err(e) => {
             state.finish_d(d_idx);
-            return Err(format!("decode request: {e}"));
+            return Err(FlowError::transient(format!("decode request: {e}")));
         }
     };
     let d_status = d_response.status();
     if !d_status.is_success() {
         let detail = d_response.text().await.unwrap_or_default();
         state.finish_d(d_idx);
-        return Err(format!("decode status {d_status}: {detail}"));
+        return Err(FlowError::from_status(
+            d_status,
+            format!("decode status {d_status}: {detail}"),
+        ));
     }
 
     if org_stream {
@@ -282,11 +330,10 @@ async fn pd_first_token_flow(
             arrive_time,
         ))
     } else {
-        let d_result: Value = d_response
-            .json()
-            .await
-            .map_err(|e| format!("decode response parse: {e}"))?;
+        let d_result: Result<Value, _> = d_response.json().await;
         state.finish_d(d_idx);
+        let d_result =
+            d_result.map_err(|e| FlowError::transient(format!("decode response parse: {e}")))?;
         info!(
             "done: req={} D[{}] total={}ms inflight=[{}]",
             req_id,
@@ -342,11 +389,33 @@ fn extract_prefill_leg(p_result: Value) -> Result<PrefillLeg, String> {
     })
 }
 
+/// Strip the router-requested token-id fields (`return_token_ids`) from a
+/// P response before it reaches the client — internal splice protocol, not
+/// part of the public API the client called.
+fn strip_internal_token_fields(mut response: Value) -> Value {
+    if let Some(obj) = response.as_object_mut() {
+        obj.remove("prompt_token_ids");
+    }
+    if let Some(choices) = response.get_mut("choices").and_then(|c| c.as_array_mut()) {
+        for choice in choices {
+            if let Some(obj) = choice.as_object_mut() {
+                obj.remove("prompt_token_ids");
+                obj.remove("token_ids");
+            }
+        }
+    }
+    response
+}
+
 /// The no-D-leg case: P's non-streaming response answers the client. A
 /// streaming client gets it re-shaped as a minimal SSE exchange.
 fn reshape_single_token_response(leg: &PrefillLeg, is_chat: bool, org_stream: bool) -> Response {
     if !org_stream {
-        return (StatusCode::OK, Json(leg.response.clone())).into_response();
+        return (
+            StatusCode::OK,
+            Json(strip_internal_token_fields(leg.response.clone())),
+        )
+            .into_response();
     }
     let id = leg
         .response
@@ -410,7 +479,7 @@ fn merge_final_response(leg: &PrefillLeg, d_result: Value, is_chat: bool) -> Res
         "completion_tokens": d_completion_tokens + 1,
         "total_tokens": leg.prompt_token_ids.len() as u64 + d_completion_tokens + 1,
     });
-    let mut out = leg.response.clone();
+    let mut out = strip_internal_token_fields(leg.response.clone());
     out["usage"] = usage;
     if is_chat {
         out["choices"][0]["message"]["content"] = json!(format!("{}{}", leg.t1_text, d_text));
@@ -465,6 +534,10 @@ fn stream_spliced_response(
 
         let mut buffer = String::new();
         let mut stream = Box::pin(d_response.bytes_stream());
+        // t1 is already on the wire, so a mid-stream D failure cannot retry.
+        // The client must still be able to tell "finished" from "truncated":
+        // emit an error frame instead of a clean-looking EOF.
+        let mut saw_done = false;
         'outer: while let Some(chunk) = stream.next().await {
             let Ok(bytes) = chunk else {
                 error!("stream error: req={req_id}");
@@ -482,6 +555,7 @@ fn stream_spliced_response(
                     continue;
                 };
                 if data.trim() == "[DONE]" {
+                    saw_done = true;
                     let _ = tx.send(Ok("data: [DONE]\n\n".into())).await;
                     break 'outer;
                 }
@@ -539,6 +613,16 @@ fn stream_spliced_response(
                 }
             }
         }
+        if !saw_done {
+            let err = json!({
+                "error": {
+                    "message": "decode stream ended before completion",
+                    "type": "server_error",
+                    "code": "pd_decode_interrupted",
+                }
+            });
+            let _ = tx.send(Ok(format!("data: {err}\n\n").into())).await;
+        }
         state.finish_d(d_idx);
         info!(
             "done (stream): req={} D[{}] total={}ms inflight=[{}]",
@@ -579,13 +663,39 @@ async fn handle_completion(
     );
 
     if state.pd_first_token {
+        // The splice takes choices[0] of a single prompt; anything else
+        // would be silently mangled — refuse instead.
+        if body.get("n").and_then(|v| v.as_u64()).is_some_and(|n| n > 1) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "P/D first-token routing does not support n > 1"})),
+            )
+                .into_response();
+        }
+        if body.get("prompt").and_then(|v| v.as_array()).is_some_and(|arr| {
+            // A flat array of ints is ONE pre-tokenized prompt; anything
+            // string-or-array-valued is a multi-prompt batch.
+            arr.iter().any(|v| v.is_string() || v.is_array())
+        }) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "P/D first-token routing does not support batched prompts"})),
+            )
+                .into_response();
+        }
         let mut last_err = String::new();
         for attempt in 0..=state.pd_flow_retries {
             match pd_first_token_flow(&state, &body, api_path, &req_id, arrive_time).await {
                 Ok(response) => return response,
                 Err(err) => {
-                    error!("P/D flow attempt {attempt} failed: req={req_id} {err}");
-                    last_err = err;
+                    error!(
+                        "P/D flow attempt {attempt} failed: req={req_id} retryable={} {}",
+                        err.retryable, err.msg
+                    );
+                    last_err = err.msg;
+                    if !err.retryable {
+                        break;
+                    }
                 }
             }
         }
@@ -854,6 +964,11 @@ struct Args {
     /// (a strict decode node rejects when the remote KV never lands).
     #[arg(long, default_value_t = 1)]
     pd_flow_retries: usize,
+
+    /// Model context limit, bounding the D leg's max_tokens when the client
+    /// sent none (engines default an absent max_tokens to 16).
+    #[arg(long, default_value_t = 32768)]
+    pd_max_model_len: usize,
 }
 
 #[tokio::main]
@@ -866,6 +981,7 @@ async fn main() {
     let mut state = RouterState::new(args.prefill.clone(), args.decode.clone());
     state.pd_first_token = args.pd_first_token;
     state.pd_flow_retries = args.pd_flow_retries;
+    state.pd_max_model_len = args.pd_max_model_len;
     if state.pd_first_token {
         info!(
             "P/D first-token forwarding on (flow retries: {})",

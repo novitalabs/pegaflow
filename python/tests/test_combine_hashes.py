@@ -337,7 +337,7 @@ class TestDecodeHashRefresh:
         sc._allocated_blocks["r1"] = [10, 11, 12, 13]
         sc._scheduled_tokens["r1"] = 128  # 4 * 32
 
-        intent = sc._consume_save_intent("r1")
+        intent = sc._consume_save_intent("r1", 0)
         assert intent is not None
         assert len(intent.block_ids) == 4
         assert len(intent.block_hashes) == 4
@@ -354,7 +354,7 @@ class TestDecodeHashRefresh:
         sc._scheduled_tokens["r1"] = 128  # 4 * 32
 
         # Save initial 4 blocks
-        intent = sc._consume_save_intent("r1")
+        intent = sc._consume_save_intent("r1", 0)
         assert intent is not None
         assert len(intent.block_ids) == 4
 
@@ -365,14 +365,14 @@ class TestDecodeHashRefresh:
         sc._scheduled_tokens["r1"] += 64  # 2 * 32 more tokens
 
         # Before refresh: _block_hashes is stale (4 entries) → no new saves
-        stale_intent = sc._consume_save_intent("r1")
+        stale_intent = sc._consume_save_intent("r1", 0)
         assert stale_intent is None  # still capped at 4
 
         # Refresh hashes (simulates what build_connector_meta does)
         sc._block_hashes["r1"] = tuple(req.block_hashes)
 
         # Now the 2 decode blocks become saveable
-        intent2 = sc._consume_save_intent("r1")
+        intent2 = sc._consume_save_intent("r1", 0)
         assert intent2 is not None
         assert len(intent2.block_ids) == 2
         assert intent2.block_ids == (14, 15)
@@ -413,7 +413,7 @@ class TestDecodeHashRefresh:
             202,
         ]
 
-        intent = sc._consume_save_intent("r1")
+        intent = sc._consume_save_intent("r1", 0)
 
         assert intent is not None
         assert intent.block_hashes == block_hashes[6:9]

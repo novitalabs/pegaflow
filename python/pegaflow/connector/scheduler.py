@@ -107,14 +107,13 @@ class SchedulerConnector:
                     f"run vLLM with --prefix-caching-hash-algo xxhash_cbor"
                 )
             from vllm.utils.hashing import get_hash_fn_by_name
+            from vllm.v1.core.kv_cache_utils import NONE_HASH, hash_block_tokens
 
             self._tail_hash_fn = get_hash_fn_by_name(algo)
+            self._none_hash = NONE_HASH
+            self._hash_block_tokens = hash_block_tokens
             logger.info("[PegaKVConnector] P/D tail-block save enabled (algo=%s)", algo)
         self._tail_saved: set[str] = set()
-        # req_id -> prompt tokens covered by caches at admission (local
-        # prefix hit + pegaflow load) — positions that are never scheduled.
-        self._local_computed_at_admission: dict[str, int] = {}
-        self._unscheduled_prompt_tokens: dict[str, int] = {}
 
         # Load state
         self._pending_load_intents: dict[str, LoadIntent] = {}
@@ -146,12 +145,6 @@ class SchedulerConnector:
         num_computed_tokens: int,
     ) -> tuple[int | None, bool]:
         req_id = request.request_id
-
-        # Prompt positions the local prefix cache already covers — they are
-        # never scheduled, so the tail save's completeness condition must
-        # count them (request.num_computed_tokens is not yet set when
-        # update_state_after_alloc runs).
-        self._local_computed_at_admission[req_id] = num_computed_tokens
 
         if not self._ctx.read_enabled:
             logger.debug(
@@ -310,18 +303,6 @@ class SchedulerConnector:
             self._allocated_blocks[req_id] = []
             self._scheduled_tokens[req_id] = 0
             self._next_stored_block_idx[req_id] = base_block_idx
-            # Prompt positions that will never be *scheduled*: the local
-            # prefix-cache hit plus the pegaflow-loaded prefix. The tail
-            # save's "prompt rows all written" condition must count them, or
-            # a request whose prompt shares a cached prefix (every multi-turn
-            # turn >= 2) never fires its tail save. Only the read-enabled
-            # branch needs this — the write-only branch folds computed tokens
-            # into _scheduled_tokens directly.
-            self._unscheduled_prompt_tokens[req_id] = (
-                self._local_computed_at_admission.get(req_id, 0) + num_external_tokens
-                if self._ctx.read_enabled
-                else 0
-            )
 
         if num_external_tokens > 0:
             block_ids = list(blocks.get_block_ids()[0]) if blocks else []
@@ -402,7 +383,12 @@ class SchedulerConnector:
                     req.num_computed_tokens + num_tokens,
                 )
 
-            if save_intent := self._consume_save_intent(req_id):
+            # Positions with valid KV after this step, from the scheduler's
+            # own invariant (num_computed_tokens covers prefix-cache hits and
+            # is reset on preemption — no connector-side bookkeeping can be
+            # trusted across a preempt/resume cycle).
+            written = req.num_computed_tokens + num_tokens
+            if save_intent := self._consume_save_intent(req_id, written):
                 potential_saves[req_id] = save_intent
 
         # Process cached (running) requests
@@ -435,7 +421,8 @@ class SchedulerConnector:
                     prior_computed_tokens + num_tokens,
                 )
 
-            if save_intent := self._consume_save_intent(req_id):
+            written = cached_reqs.num_computed_tokens[idx] + num_tokens
+            if save_intent := self._consume_save_intent(req_id, written):
                 potential_saves[req_id] = save_intent
 
         save_intents = potential_saves
@@ -455,10 +442,14 @@ class SchedulerConnector:
             preempted_req_ids=scheduler_output.preempted_req_ids or None,
         )
 
-    def _consume_save_intent(self, req_id: str) -> SaveIntent | None:
-        """Calculate and return SaveIntent for new blocks that need saving."""
+    def _consume_save_intent(self, req_id: str, written: int) -> SaveIntent | None:
+        """Calculate and return SaveIntent for new blocks that need saving.
+
+        `written` = positions with valid KV once this step's schedule runs
+        (scheduler-authoritative num_computed_tokens + this step's tokens).
+        """
         regular = self._consume_full_block_saves(req_id)
-        tail = self._consume_tail_save(req_id)
+        tail = self._consume_tail_save(req_id, written)
         if tail is None:
             return regular
         if regular is None:
@@ -468,7 +459,7 @@ class SchedulerConnector:
             block_hashes=regular.block_hashes + tail.block_hashes,
         )
 
-    def _consume_tail_save(self, req_id: str) -> SaveIntent | None:
+    def _consume_tail_save(self, req_id: str, written: int) -> SaveIntent | None:
         """P/D tail extension: save the prompt's partial tail block once its
         prompt rows are final (the step scheduling the final prompt chunk).
 
@@ -482,14 +473,21 @@ class SchedulerConnector:
         req = self._requests.get(req_id)
         if req is None:
             return None
+        # The tail key is derived from (parent hash, token ids) alone; the
+        # decode peer cannot know lora / cache_salt / multimodal dimensions
+        # that vLLM folds into block 0's extra_keys. Saving would alias
+        # differently-salted prompts onto one key — refuse instead.
+        if (
+            getattr(req, "lora_request", None) is not None
+            or getattr(req, "cache_salt", None)
+            or getattr(req, "mm_features", None)
+        ):
+            return None
         vbs = self._ctx.virtual_block_size
         prompt_len = req.num_prompt_tokens
         tail_len = prompt_len % vbs
         if tail_len == 0:
             return None
-        written = self._unscheduled_prompt_tokens.get(req_id, 0) + self._scheduled_tokens.get(
-            req_id, 0
-        )
         if written < prompt_len:
             return None  # tail prompt rows not written yet
         tail_idx = prompt_len // vbs
@@ -497,11 +495,9 @@ class SchedulerConnector:
         block_hashes = self._block_hashes.get(req_id) or ()
         if tail_idx >= len(allocated) or tail_idx > len(block_hashes):
             return None  # tail block not allocated / full-block hashes lagging
-        from vllm.v1.core.kv_cache_utils import NONE_HASH, hash_block_tokens
-
-        parent = block_hashes[tail_idx - 1] if tail_idx > 0 else NONE_HASH
+        parent = block_hashes[tail_idx - 1] if tail_idx > 0 else self._none_hash
         tail_tokens = list(req.prompt_token_ids[tail_idx * vbs : prompt_len])
-        tail_key = bytes(hash_block_tokens(self._tail_hash_fn, parent, tail_tokens, None))
+        tail_key = bytes(self._hash_block_tokens(self._tail_hash_fn, parent, tail_tokens, None))
         self._tail_saved.add(req_id)
         logger.info(
             "[PegaKVConnector] req=%s pd_tail_save: block_id=%d tail_tokens=%d key=%s",
@@ -600,8 +596,6 @@ class SchedulerConnector:
         self._next_stored_block_idx.pop(req_id, None)
         self._pending_saves.discard(req_id)
         self._tail_saved.discard(req_id)
-        self._local_computed_at_admission.pop(req_id, None)
-        self._unscheduled_prompt_tokens.pop(req_id, None)
 
     def _count_available_block_prefix(
         self, block_hashes: Iterable[bytes], req_id: str
