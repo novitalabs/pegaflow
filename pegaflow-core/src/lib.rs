@@ -879,6 +879,9 @@ impl PegaEngine {
         };
         rdma.engine()
             .complete_handshake(client_addr, &server_meta, &client_meta)
+            // Without the abort, the client stays in `connecting` forever and
+            // every retry fails with "already in progress".
+            .inspect_err(|_| rdma.engine().abort_handshake(client_addr, &server_meta))
             .map_err(|e| format!("complete_handshake failed: {e}"))?;
         info!("RDMA handshake accepted: client={client_addr}");
         Ok(server_meta.to_bytes())

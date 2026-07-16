@@ -152,18 +152,12 @@ impl RemoteMemorySnapshot {
     }
 }
 
-/// Per-NIC state: pending/connected sessions and remote memory cache.
-///
-/// With per-peer N QPs, `sessions` and `remote_memory` are keyed by the
-/// **first** remote QPN of that NIC pair — this is the stable connection id.
+/// Per-NIC state: sessions awaiting handshake completion. Established
+/// sessions live inside their `AddrConnection`.
 #[derive(Default)]
 pub(super) struct PerNicState {
     /// Pre-connect sessions in FIFO order (first prepared, first connected).
     pub(super) pending: VecDeque<Arc<RcSession>>,
-    /// Connected session vectors keyed by first remote QPN; each Vec has N sessions.
-    pub(super) sessions: HashMap<u32, Arc<Vec<Arc<RcSession>>>>,
-    /// Remote memory snapshots keyed by first remote QPN (shared across the N sessions).
-    pub(super) remote_memory: HashMap<u32, Arc<RemoteMemorySnapshot>>,
 }
 
 impl PerNicState {
@@ -175,19 +169,26 @@ impl PerNicState {
             .position(|s| s.local_endpoint.qp_num == qpn)?;
         self.pending.remove(pos)
     }
-
-    pub(super) fn cleanup_connection(&mut self, remote_first_qpn: u32) {
-        self.sessions.remove(&remote_first_qpn);
-        self.remote_memory.remove(&remote_first_qpn);
-    }
 }
 
+/// One NIC's slice of an established connection: the N connected sessions
+/// and the remote memory snapshot from the handshake.
+pub(super) struct ConnNic {
+    pub(super) sessions: Arc<Vec<Arc<RcSession>>>,
+    pub(super) remote_memory: Arc<RemoteMemorySnapshot>,
+    /// Round-robin counter for picking among the N sessions.
+    pub(super) rr_counter: AtomicUsize,
+}
+
+/// The connection owns its sessions and snapshots directly. Keying them in a
+/// shared map by remote QPN is unsound: QPNs are only unique within one
+/// remote HCA, so two peers can collide, and the second handshake would
+/// silently overwrite the first peer's sessions (and invalidating one peer
+/// would destroy the other's).
 pub(super) struct AddrConnection {
-    /// First remote QPN per NIC — stable id used to key sessions/remote_memory.
-    pub(super) remote_first_qpns: Vec<u32>,
+    /// Indexed by nic_idx.
+    pub(super) nics: Vec<ConnNic>,
     pub(super) local_nics: Vec<NicHandshake>,
-    /// Round-robin counter per NIC for picking among the N sessions of that pair.
-    pub(super) rr_counters: Vec<AtomicUsize>,
 }
 
 pub(super) struct RcBackendState {
@@ -202,7 +203,11 @@ pub(super) struct RcBackendState {
 
 impl RcBackendState {
     pub(super) fn num_qps(&self) -> usize {
-        self.nics.iter().map(|n| n.sessions.len()).sum()
+        self.addr_connections
+            .values()
+            .flat_map(|conn| conn.nics.iter())
+            .map(|nic| nic.sessions.len())
+            .sum()
     }
 
     pub(super) fn new(nic_count: usize) -> Self {

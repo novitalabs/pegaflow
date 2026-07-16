@@ -13,7 +13,9 @@ use sideway::ibverbs::AccessFlags;
 
 use self::runtime::RcRuntime;
 use self::session::{RcSession, RdmaOp};
-use self::state::{AddrConnection, RcBackendState, RegisteredMemoryEntry, RemoteMemorySnapshot};
+use self::state::{
+    AddrConnection, ConnNic, RcBackendState, RegisteredMemoryEntry, RemoteMemorySnapshot,
+};
 use std::ptr::NonNull;
 
 use mea::oneshot;
@@ -327,23 +329,20 @@ impl RcBackend {
             }
         }
 
-        // Store sessions + addr_connections
-        let mut state = self.state.lock();
-        let mut remote_first_qpns = Vec::with_capacity(nic_count);
-        for (nic_idx, sessions) in pending.into_iter().enumerate() {
-            let remote = &remote_nics[nic_idx];
-            let remote_first_qpn = remote.endpoints[0].qp_num;
+        // Validate snapshots and assemble the connection before locking.
+        let mut conn_nics = Vec::with_capacity(nic_count);
+        for (sessions, remote) in pending.into_iter().zip(remote_nics) {
             let snapshot = Arc::new(RemoteMemorySnapshot::from_handshake(
                 &remote.memory_regions,
             )?);
-            state.nics[nic_idx]
-                .remote_memory
-                .insert(remote_first_qpn, snapshot);
-            state.nics[nic_idx]
-                .sessions
-                .insert(remote_first_qpn, Arc::new(sessions));
-            remote_first_qpns.push(remote_first_qpn);
+            conn_nics.push(ConnNic {
+                sessions: Arc::new(sessions),
+                remote_memory: snapshot,
+                rr_counter: AtomicUsize::new(0),
+            });
         }
+
+        let mut state = self.state.lock();
         let removed = state.connecting.remove(remote_addr);
         debug_assert!(removed, "connecting set should contain {remote_addr}");
         let local_qpns: Vec<Vec<u32>> = local_nics
@@ -358,13 +357,11 @@ impl RcBackend {
             "RDMA connection established: remote={remote_addr}, qps_per_peer={}, local_qpns={local_qpns:?}, remote_qpns={remote_qpns:?}",
             self.qps_per_peer
         );
-        let rr_counters = (0..nic_count).map(|_| AtomicUsize::new(0)).collect();
         state.addr_connections.insert(
             remote_addr.to_string(),
             AddrConnection {
-                remote_first_qpns,
+                nics: conn_nics,
                 local_nics,
-                rr_counters,
             },
         );
         Ok(())
@@ -392,13 +389,11 @@ impl RcBackend {
             .map(|c| c.local_nics.clone())
     }
 
-    /// Remove connection state on transfer failure.
+    /// Remove connection state on transfer failure. The connection owns its
+    /// sessions, so in-flight work keeps its QPs alive through their Arcs.
     pub(crate) fn invalidate_connection(&self, remote_addr: &str) {
         let mut state = self.state.lock();
-        if let Some(conn) = state.addr_connections.remove(remote_addr) {
-            for (nic_idx, &remote_first_qpn) in conn.remote_first_qpns.iter().enumerate() {
-                state.nics[nic_idx].cleanup_connection(remote_first_qpn);
-            }
+        if state.addr_connections.remove(remote_addr).is_some() {
             info!("connection invalidated: remote={remote_addr}");
         }
     }
@@ -465,25 +460,14 @@ impl RcBackend {
                 if nic_descs.is_empty() {
                     continue;
                 }
-                let remote_first_qpn = conn.remote_first_qpns[nic_idx];
-                let nic = &state.nics[nic_idx];
-                let sessions = nic.sessions.get(&remote_first_qpn).ok_or_else(|| {
-                    TransferError::Backend(format!(
-                        "session vec missing for established connection: remote={remote_addr}, nic={nic_idx}"
-                    ))
-                })?;
-                let remote_memory = nic.remote_memory.get(&remote_first_qpn).ok_or_else(|| {
-                    TransferError::Backend(format!(
-                        "remote memory snapshot missing for established connection: remote={remote_addr}, nic={nic_idx}"
-                    ))
-                })?;
+                let nic = &conn.nics[nic_idx];
                 // Rotate the starting bucket each call so small batches still
                 // hit different QPs across calls.
-                let rot = conn.rr_counters[nic_idx].fetch_add(1, Ordering::Relaxed);
+                let rot = nic.rr_counter.fetch_add(1, Ordering::Relaxed);
                 snapshots.push(NicWork {
                     nic_idx,
-                    sessions: Arc::clone(sessions),
-                    remote_memory: Arc::clone(remote_memory),
+                    sessions: Arc::clone(&nic.sessions),
+                    remote_memory: Arc::clone(&nic.remote_memory),
                     rot,
                 });
             }
