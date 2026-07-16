@@ -108,7 +108,12 @@ impl RcSession {
             cmd_tx,
         });
 
-        Self::spawn_worker(Arc::downgrade(&session), cmd_rx, runtime.numa_node)?;
+        Self::spawn_worker(
+            Arc::downgrade(&session),
+            cmd_rx,
+            runtime.numa_node,
+            local_endpoint.qp_num,
+        )?;
         Ok(session)
     }
 
@@ -204,6 +209,7 @@ impl RcSession {
         session: Weak<Self>,
         cmd_rx: std_mpsc::Receiver<SessionCommand>,
         numa_node: NumaNode,
+        qpn: u32,
     ) -> Result<()> {
         thread::Builder::new()
             .name("pegaflow-rc-session".to_string())
@@ -213,14 +219,13 @@ impl RcSession {
                 {
                     warn!("Failed to pin rc session worker to {}: {}", numa_node, e);
                 }
-                let mut qpn = 0;
+                debug!("session worker started: local_qpn={qpn}, numa={numa_node}");
                 while let Ok(command) = cmd_rx.recv() {
                     // The upgraded Arc pins the session (and its QP) for the
                     // duration of the batch.
                     let Some(session) = session.upgrade() else {
                         break;
                     };
-                    qpn = session.local_endpoint.qp_num;
                     match command {
                         SessionCommand::Transfer { ops, op, done_tx } => {
                             let result = Self::execute_batch(&session, ops, op);
