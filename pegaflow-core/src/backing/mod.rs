@@ -4,6 +4,8 @@ pub(super) mod rdma;
 pub(super) mod rdma_fetch;
 pub(super) mod ssd;
 pub(super) mod ssd_cache;
+#[cfg(feature = "rdma")]
+mod transfer_lock_guard;
 pub(super) mod uring;
 
 use std::sync::Arc;
