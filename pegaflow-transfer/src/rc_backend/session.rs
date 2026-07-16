@@ -224,6 +224,13 @@ impl RcSession {
                     // The upgraded Arc pins the session (and its QP) for the
                     // duration of the batch.
                     let Some(session) = session.upgrade() else {
+                        // The session died between enqueue and execution: fail
+                        // accepted commands explicitly instead of dropping
+                        // them as a generic channel-closed error.
+                        Self::reply_session_invalidated(command);
+                        while let Ok(queued) = cmd_rx.try_recv() {
+                            Self::reply_session_invalidated(queued);
+                        }
                         break;
                     };
                     match command {
@@ -239,6 +246,13 @@ impl RcSession {
             })
             .map_err(|e| TransferError::Backend(format!("failed to spawn session worker: {e}")))?;
         Ok(())
+    }
+
+    fn reply_session_invalidated(command: SessionCommand) {
+        let SessionCommand::Transfer { done_tx, .. } = command;
+        let _ = done_tx.send(Err(TransferError::Backend(
+            "session invalidated before batch execution".to_string(),
+        )));
     }
 
     fn post_rdma_wr_chain(
