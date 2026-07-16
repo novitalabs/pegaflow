@@ -348,7 +348,11 @@ async fn fetch_blocks_via_rdma(
         return Ok((Vec::new(), TransferTiming::default()));
     }
 
-    let mut slabs = ChunkedSlabs::new(allocate_fn, FETCH_CHUNK_BYTES);
+    let mut slabs = ChunkedSlabs::new(
+        allocate_fn,
+        FETCH_CHUNK_BYTES,
+        sum_segment_bytes_by_numa(blocks)?,
+    );
 
     // (block_hash, Vec<(slot_segments, slot_numa)>) — for building SealedBlock afterwards.
     // The per-slot NUMA is preserved so a re-served fetched block advertises real topology.
@@ -484,23 +488,62 @@ async fn fetch_blocks_via_rdma(
     Ok((result, timing))
 }
 
+/// Total staged bytes per NUMA node for one fetch batch. Used to right-size
+/// the last chunk of each NUMA so small fetches don't over-allocate.
+fn sum_segment_bytes_by_numa(
+    blocks: &[TransferBlockInfo],
+) -> Result<HashMap<NumaNode, u64>, String> {
+    let mut bytes_per_numa: HashMap<NumaNode, u64> = HashMap::new();
+    for block_info in blocks {
+        for slot in &block_info.slots {
+            let numa = NumaNode(slot.numa_node);
+            let mut add = 0u64;
+            if slot.k_size > 0 {
+                add += slot.k_size;
+            }
+            if slot.v_size > 0 && slot.v_ptr != 0 {
+                add = add
+                    .checked_add(slot.v_size)
+                    .ok_or_else(|| format!("segment bytes overflow on {numa}"))?;
+            }
+            let total = bytes_per_numa.entry(numa).or_insert(0);
+            *total = total
+                .checked_add(add)
+                .ok_or_else(|| format!("numa bytes overflow while summing segments on {numa}"))?;
+        }
+    }
+    Ok(bytes_per_numa)
+}
+
 /// Bump allocator over bounded pinned chunks, one active chunk per NUMA node.
 /// Each staged segment holds an Arc to its own chunk, so starting a fresh
 /// chunk never invalidates previously staged segments, and fetched blocks are
 /// freed chunk-by-chunk on eviction instead of all-or-nothing per fetch.
+///
+/// A chunk is sized `min(remaining bytes on that NUMA, chunk_bytes)`: the cap
+/// bounds LRU-reclaim amplification on large fetches, the remaining-bytes
+/// clamp keeps small fetches from grabbing a whole `chunk_bytes` slab (which
+/// would fail outright on pools smaller than the cap).
 struct ChunkedSlabs<'a> {
     allocate_fn: &'a AllocateFn,
     chunk_bytes: u64,
     current: HashMap<NumaNode, NumaSlab>,
+    /// Bytes of this batch not yet staged, per NUMA.
+    remaining: HashMap<NumaNode, u64>,
     chunk_count: usize,
 }
 
 impl<'a> ChunkedSlabs<'a> {
-    fn new(allocate_fn: &'a AllocateFn, chunk_bytes: u64) -> Self {
+    fn new(
+        allocate_fn: &'a AllocateFn,
+        chunk_bytes: u64,
+        remaining: HashMap<NumaNode, u64>,
+    ) -> Self {
         Self {
             allocate_fn,
             chunk_bytes,
             current: HashMap::new(),
+            remaining,
             chunk_count: 0,
         }
     }
@@ -514,11 +557,16 @@ impl<'a> ChunkedSlabs<'a> {
         if let Some(slab) = self.current.get_mut(&numa)
             && let Ok(seg) = slab.allocate(len, segment_kind)
         {
+            self.consume_remaining(numa, len);
             return Ok(seg);
         }
 
         // No chunk on this NUMA yet, or the current one can't fit the segment.
-        let chunk = self.chunk_bytes.max(len as u64);
+        let remaining = *self
+            .remaining
+            .get(&numa)
+            .expect("remaining bytes tracked for every NUMA in the batch");
+        let chunk = remaining.min(self.chunk_bytes).max(len as u64);
         let allocation = (self.allocate_fn)(chunk, Some(numa)).ok_or_else(|| {
             format!("failed to allocate fetch chunk ({chunk} bytes) on {numa} for {segment_kind}")
         })?;
@@ -533,10 +581,19 @@ impl<'a> ChunkedSlabs<'a> {
                 capacity,
             },
         );
+        self.consume_remaining(numa, len);
         self.current
             .get_mut(&numa)
             .expect("chunk just inserted")
             .allocate(len, segment_kind)
+    }
+
+    fn consume_remaining(&mut self, numa: NumaNode, len: usize) {
+        let rem = self
+            .remaining
+            .get_mut(&numa)
+            .expect("remaining bytes tracked for every NUMA in the batch");
+        *rem = rem.saturating_sub(len as u64);
     }
 }
 
@@ -744,8 +801,8 @@ impl Drop for TransferLockGuard {
 mod tests {
     use super::*;
     use std::num::NonZeroU64;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     fn test_allocate_fn(calls: Arc<AtomicUsize>) -> AllocateFn {
         let allocator = Arc::new(crate::pinned_pool::PinnedAllocator::new_global(
@@ -761,11 +818,15 @@ mod tests {
         })
     }
 
+    fn remaining(bytes: u64) -> HashMap<NumaNode, u64> {
+        HashMap::from([(NumaNode(0), bytes)])
+    }
+
     #[test]
     fn chunked_slabs_bump_within_chunk_then_refill() {
         let calls = Arc::new(AtomicUsize::new(0));
         let allocate_fn = test_allocate_fn(Arc::clone(&calls));
-        let mut slabs = ChunkedSlabs::new(&allocate_fn, 1024);
+        let mut slabs = ChunkedSlabs::new(&allocate_fn, 1024, remaining(1536));
 
         let (p1, a1) = slabs.alloc_segment(NumaNode(0), 512, "K").expect("first");
         let (p2, _a2) = slabs.alloc_segment(NumaNode(0), 512, "V").expect("second");
@@ -784,7 +845,7 @@ mod tests {
     fn chunked_slabs_oversized_segment_gets_dedicated_chunk() {
         let calls = Arc::new(AtomicUsize::new(0));
         let allocate_fn = test_allocate_fn(Arc::clone(&calls));
-        let mut slabs = ChunkedSlabs::new(&allocate_fn, 1024);
+        let mut slabs = ChunkedSlabs::new(&allocate_fn, 1024, remaining(4096));
 
         slabs
             .alloc_segment(NumaNode(0), 4096, "K")
@@ -796,13 +857,34 @@ mod tests {
     #[test]
     fn chunked_slabs_allocation_failure_is_an_error() {
         let allocate_fn: AllocateFn = Arc::new(|_, _| None);
-        let mut slabs = ChunkedSlabs::new(&allocate_fn, 1024);
+        let mut slabs = ChunkedSlabs::new(&allocate_fn, 1024, remaining(512));
 
         let err = match slabs.alloc_segment(NumaNode(0), 512, "K") {
             Ok(_) => panic!("allocation should fail"),
             Err(err) => err,
         };
         assert!(err.contains("failed to allocate fetch chunk"));
+    }
+
+    #[test]
+    fn chunked_slabs_chunk_clamped_to_batch_remaining() {
+        // A small fetch must not request the whole chunk_bytes cap — that
+        // fails outright on pools smaller than the cap (jz p2p IT regression).
+        let sizes = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&sizes);
+        let inner = test_allocate_fn(Arc::new(AtomicUsize::new(0)));
+        let allocate_fn: AllocateFn = Arc::new(move |size, numa| {
+            recorded.lock().unwrap().push(size);
+            inner(size, numa)
+        });
+        let mut slabs = ChunkedSlabs::new(&allocate_fn, 256 << 20, remaining(4096));
+
+        slabs.alloc_segment(NumaNode(0), 1024, "K").expect("first");
+        slabs.alloc_segment(NumaNode(0), 3072, "V").expect("second");
+
+        // One chunk sized to the batch total, not to the 256 MiB cap.
+        assert_eq!(*sizes.lock().unwrap(), vec![4096]);
+        assert_eq!(slabs.chunk_count, 1);
     }
 
     mod lock_guard {
