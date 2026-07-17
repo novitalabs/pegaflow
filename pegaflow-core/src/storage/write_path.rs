@@ -199,8 +199,8 @@ fn process_insert_batch(
     if !sealed_blocks.is_empty()
         && let Some(deps) = &deps
     {
-        deps.read_cache.batch_insert_refs(&sealed_blocks);
-        send_backing_batches(deps, namespace, &sealed_blocks);
+        let locally_inserted = deps.read_cache.batch_insert_refs(&sealed_blocks);
+        send_backing_batches(deps, namespace, &sealed_blocks, locally_inserted);
     }
 
     ordered_fast_path_seals
@@ -269,6 +269,7 @@ fn send_backing_batches(
     deps: &InsertDeps,
     namespace: &str,
     blocks: &[(BlockKey, Arc<SealedBlock>)],
+    locally_inserted: Vec<BlockKey>,
 ) {
     if blocks.is_empty() {
         return;
@@ -286,17 +287,28 @@ fn send_backing_batches(
     }
 
     if let Some(client) = &deps.metaserver_client {
-        register_block_hashes(client, namespace, blocks);
+        register_block_hashes(client, namespace, locally_inserted, &deps.read_cache);
     }
 }
 
 fn register_block_hashes(
     client: &MetaServerClient,
     namespace: &str,
-    blocks: &[(BlockKey, Arc<SealedBlock>)],
+    locally_inserted: Vec<BlockKey>,
+    read_cache: &Arc<ReadCache>,
 ) {
-    let hashes: Vec<Vec<u8>> = blocks.iter().map(|(key, _)| key.hash.clone()).collect();
-    client.try_register_namespace(namespace.to_string(), hashes);
+    if locally_inserted.is_empty() {
+        return;
+    }
+    let hashes: Vec<Vec<u8>> = locally_inserted
+        .iter()
+        .map(|key| key.hash.clone())
+        .collect();
+
+    let read_cache = Arc::clone(read_cache);
+    client.try_register_namespace_with_hint(namespace.to_string(), hashes, move |owner_counts| {
+        read_cache.apply_owner_hints(&locally_inserted, &owner_counts);
+    });
 }
 
 fn gc_inflight(

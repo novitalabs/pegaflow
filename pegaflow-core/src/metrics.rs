@@ -22,10 +22,10 @@ static TIER_RAM: LazyLock<[KeyValue; 1]> = LazyLock::new(|| [KeyValue::new("tier
 static TIER_RDMA: LazyLock<[KeyValue; 1]> = LazyLock::new(|| [KeyValue::new("tier", "rdma")]);
 static TIER_SSD: LazyLock<[KeyValue; 1]> = LazyLock::new(|| [KeyValue::new("tier", "ssd")]);
 static TIER_MISS: LazyLock<[KeyValue; 1]> = LazyLock::new(|| [KeyValue::new("tier", "miss")]);
-pub(crate) static CACHE_CLASS_COLD: LazyLock<[KeyValue; 1]> =
-    LazyLock::new(|| [KeyValue::new("class", "cold")]);
-pub(crate) static CACHE_CLASS_WARM: LazyLock<[KeyValue; 1]> =
-    LazyLock::new(|| [KeyValue::new("class", "warm")]);
+pub(crate) static CACHE_CLASS_RECLAIMABLE: LazyLock<[KeyValue; 1]> =
+    LazyLock::new(|| [KeyValue::new("class", "reclaimable")]);
+pub(crate) static CACHE_CLASS_RETAINED: LazyLock<[KeyValue; 1]> =
+    LazyLock::new(|| [KeyValue::new("class", "retained")]);
 
 pub(crate) struct CoreMetrics {
     // Pinned pool (allocator-level)
@@ -53,7 +53,6 @@ pub(crate) struct CoreMetrics {
     pub cache_block_evictions: Counter<u64>,
     pub cache_resident_blocks: UpDownCounter<i64>,
     pub cache_block_evictions_by_class: Counter<u64>,
-    pub cache_block_promotions: Counter<u64>,
     pub cache_block_demotions: Counter<u64>,
     pub cache_block_evictions_still_referenced: Counter<u64>,
     pub cache_eviction_reclaimed_bytes: Counter<u64>,
@@ -293,13 +292,9 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
                 .u64_counter("pegaflow_cache_block_evictions_by_class")
                 .with_description("Cache block evictions by replacement class")
                 .build(),
-            cache_block_promotions: meter
-                .u64_counter("pegaflow_cache_block_promotions")
-                .with_description("Cold cache blocks promoted to warm after a local hit")
-                .build(),
             cache_block_demotions: meter
                 .u64_counter("pegaflow_cache_block_demotions")
-                .with_description("Warm cache blocks demoted after external transfer completion")
+                .with_description("Retained cache blocks marked reclaimable")
                 .build(),
             cache_block_evictions_still_referenced: meter
                 .u64_counter("pegaflow_cache_block_evictions_still_referenced")

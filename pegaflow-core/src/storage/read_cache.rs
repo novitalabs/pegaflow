@@ -5,7 +5,7 @@ use parking_lot::Mutex;
 
 use crate::block::{BlockKey, SealedBlock};
 use crate::cache::{CacheInsertOutcome, TinyLfuCache};
-use crate::metrics::{CACHE_CLASS_COLD, CACHE_CLASS_WARM, core_metrics};
+use crate::metrics::{CACHE_CLASS_RECLAIMABLE, CACHE_CLASS_RETAINED, core_metrics};
 
 pub(super) struct ReadCache {
     inner: Mutex<ReadCacheInner>,
@@ -13,14 +13,14 @@ pub(super) struct ReadCache {
 
 struct ReadCacheInner {
     cache: TinyLfuCache<BlockKey, Arc<SealedBlock>>,
-    cold: LruCache<BlockKey, ()>,
-    warm: LruCache<BlockKey, ()>,
+    reclaimable: LruCache<BlockKey, ()>,
+    retained: LruCache<BlockKey, ()>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(super) enum ResidentClass {
-    Cold,
-    Warm,
+    Reclaimable,
+    Retained,
 }
 
 impl ReadCache {
@@ -34,8 +34,8 @@ impl ReadCache {
         Self {
             inner: Mutex::new(ReadCacheInner {
                 cache,
-                cold: LruCache::new_unbounded(),
-                warm: LruCache::new_unbounded(),
+                reclaimable: LruCache::new_unbounded(),
+                retained: LruCache::new_unbounded(),
             }),
         }
     }
@@ -53,7 +53,7 @@ impl ReadCache {
             let mut inner = self.inner.lock();
             for key in keys {
                 if let Some(block) = inner.cache.get(key) {
-                    promote_on_local_hit(&mut inner, key);
+                    refresh_recency(&mut inner, key);
                     hit += 1;
                     blocks.push(block);
                 } else {
@@ -67,7 +67,7 @@ impl ReadCache {
     pub(super) fn batch_insert(&self, blocks: Vec<(BlockKey, Arc<SealedBlock>)>) {
         let mut inner = self.inner.lock();
         for (key, block) in blocks {
-            insert_block(&mut inner, key, block, ResidentClass::Warm);
+            insert_block(&mut inner, key, block, ResidentClass::Retained);
         }
     }
 
@@ -78,7 +78,7 @@ impl ReadCache {
         let mut inner = self.inner.lock();
         let mut resident_keys = Vec::new();
         for (key, block) in blocks {
-            match insert_block(&mut inner, key.clone(), block, ResidentClass::Cold) {
+            match insert_block(&mut inner, key.clone(), block, ResidentClass::Reclaimable) {
                 CacheInsertOutcome::InsertedNew | CacheInsertOutcome::AlreadyExists => {
                     resident_keys.push(key);
                 }
@@ -88,16 +88,24 @@ impl ReadCache {
         resident_keys
     }
 
-    pub(super) fn batch_insert_refs(&self, blocks: &[(BlockKey, Arc<SealedBlock>)]) {
+    pub(super) fn batch_insert_refs(
+        &self,
+        blocks: &[(BlockKey, Arc<SealedBlock>)],
+    ) -> Vec<BlockKey> {
         let mut inner = self.inner.lock();
+        let mut inserted = Vec::new();
         for (key, block) in blocks {
-            insert_block(
+            if insert_block(
                 &mut inner,
                 key.clone(),
                 Arc::clone(block),
-                ResidentClass::Warm,
-            );
+                ResidentClass::Retained,
+            ) == CacheInsertOutcome::InsertedNew
+            {
+                inserted.push(key.clone());
+            }
         }
+        inserted
     }
 
     /// Look up specific blocks by key without prefix-scan semantics (does not
@@ -119,14 +127,14 @@ impl ReadCache {
         let mut evicted = Vec::with_capacity(batch_size);
         while evicted.len() < batch_size {
             let candidate = inner
-                .cold
+                .reclaimable
                 .remove_lru()
-                .map(|(key, _)| (key, ResidentClass::Cold))
+                .map(|(key, _)| (key, ResidentClass::Reclaimable))
                 .or_else(|| {
                     inner
-                        .warm
+                        .retained
                         .remove_lru()
-                        .map(|(key, _)| (key, ResidentClass::Warm))
+                        .map(|(key, _)| (key, ResidentClass::Retained))
                 });
             let Some((key, class)) = candidate else {
                 break;
@@ -144,25 +152,34 @@ impl ReadCache {
 
     pub(super) fn remove_all(&self) -> Vec<(BlockKey, Arc<SealedBlock>)> {
         let mut inner = self.inner.lock();
-        let cold_blocks = inner.cold.len() as i64;
-        let warm_blocks = inner.warm.len() as i64;
-        inner.cold.clear();
-        inner.warm.clear();
+        let reclaimable_blocks = inner.reclaimable.len() as i64;
+        let retained_blocks = inner.retained.len() as i64;
+        inner.reclaimable.clear();
+        inner.retained.clear();
         let metrics = core_metrics();
         metrics
             .cache_resident_blocks
-            .add(-cold_blocks, &*CACHE_CLASS_COLD);
+            .add(-reclaimable_blocks, &*CACHE_CLASS_RECLAIMABLE);
         metrics
             .cache_resident_blocks
-            .add(-warm_blocks, &*CACHE_CLASS_WARM);
+            .add(-retained_blocks, &*CACHE_CLASS_RETAINED);
         inner.cache.remove_all()
     }
 
-    pub(super) fn demote(&self, keys: &[BlockKey]) {
+    pub(super) fn mark_reclaimable(&self, keys: &[BlockKey]) {
         let mut inner = self.inner.lock();
         for key in keys {
             if inner.cache.contains_key(key) {
-                demote(&mut inner, key);
+                mark_reclaimable(&mut inner, key);
+            }
+        }
+    }
+
+    pub(super) fn apply_owner_hints(&self, keys: &[BlockKey], owner_counts: &[u32]) {
+        let mut inner = self.inner.lock();
+        for (key, owner_count) in keys.iter().zip(owner_counts) {
+            if *owner_count > 1 && inner.cache.contains_key(key) {
+                mark_reclaimable(&mut inner, key);
             }
         }
     }
@@ -171,8 +188,8 @@ impl ReadCache {
 impl ResidentClass {
     fn attributes(self) -> &'static [opentelemetry::KeyValue] {
         match self {
-            Self::Cold => &*CACHE_CLASS_COLD,
-            Self::Warm => &*CACHE_CLASS_WARM,
+            Self::Reclaimable => &*CACHE_CLASS_RECLAIMABLE,
+            Self::Retained => &*CACHE_CLASS_RETAINED,
         }
     }
 }
@@ -188,11 +205,11 @@ fn insert_block(
     match outcome {
         CacheInsertOutcome::InsertedNew => {
             match class {
-                ResidentClass::Cold => {
-                    inner.cold.insert(key, ());
+                ResidentClass::Reclaimable => {
+                    inner.reclaimable.insert(key, ());
                 }
-                ResidentClass::Warm => {
-                    inner.warm.insert(key, ());
+                ResidentClass::Retained => {
+                    inner.retained.insert(key, ());
                 }
             }
             let m = core_metrics();
@@ -200,9 +217,7 @@ fn insert_block(
             m.cache_resident_bytes.add(footprint_bytes as i64, &[]);
             m.cache_resident_blocks.add(1, class.attributes());
         }
-        CacheInsertOutcome::AlreadyExists => {
-            promote(&mut *inner, &key);
-        }
+        CacheInsertOutcome::AlreadyExists => refresh_recency(inner, &key),
         CacheInsertOutcome::Rejected => {
             core_metrics().cache_block_admission_rejections.add(1, &[]);
         }
@@ -210,41 +225,27 @@ fn insert_block(
     outcome
 }
 
-fn promote_on_local_hit(inner: &mut ReadCacheInner, key: &BlockKey) {
-    if inner.cold.contains_key(key) {
-        promote(inner, key);
-    } else if inner.warm.contains_key(key) {
-        inner.warm.get(key);
-    }
-}
-
 fn refresh_recency(inner: &mut ReadCacheInner, key: &BlockKey) {
-    if inner.cold.contains_key(key) {
-        inner.cold.get(key);
-    } else if inner.warm.contains_key(key) {
-        inner.warm.get(key);
+    if inner.reclaimable.contains_key(key) {
+        inner.reclaimable.get(key);
+    } else if inner.retained.contains_key(key) {
+        inner.retained.get(key);
     }
 }
 
-fn promote(inner: &mut ReadCacheInner, key: &BlockKey) {
-    if inner.cold.remove(key).is_some() && inner.cache.contains_key(key) {
-        inner.warm.insert(key.clone(), ());
+fn mark_reclaimable(inner: &mut ReadCacheInner, key: &BlockKey) {
+    if inner.retained.remove(key).is_some() && inner.cache.contains_key(key) {
+        inner.reclaimable.insert(key.clone(), ());
         let metrics = core_metrics();
-        metrics.cache_resident_blocks.add(-1, &*CACHE_CLASS_COLD);
-        metrics.cache_resident_blocks.add(1, &*CACHE_CLASS_WARM);
-        metrics.cache_block_promotions.add(1, &[]);
-    } else if inner.warm.contains_key(key) {
-        inner.warm.get(key);
-    }
-}
-
-fn demote(inner: &mut ReadCacheInner, key: &BlockKey) {
-    if inner.warm.remove(key).is_some() && inner.cache.contains_key(key) {
-        inner.cold.insert(key.clone(), ());
-        let metrics = core_metrics();
-        metrics.cache_resident_blocks.add(-1, &*CACHE_CLASS_WARM);
-        metrics.cache_resident_blocks.add(1, &*CACHE_CLASS_COLD);
+        metrics
+            .cache_resident_blocks
+            .add(-1, &*CACHE_CLASS_RETAINED);
+        metrics
+            .cache_resident_blocks
+            .add(1, &*CACHE_CLASS_RECLAIMABLE);
         metrics.cache_block_demotions.add(1, &[]);
+    } else if inner.reclaimable.contains_key(key) {
+        inner.reclaimable.get(key);
     }
 }
 
@@ -319,8 +320,8 @@ mod tests {
         let _ = cache.get_blocks(std::slice::from_ref(&key));
 
         let inner = cache.inner.lock();
-        assert!(inner.cold.contains_key(&key));
-        assert!(!inner.warm.contains_key(&key));
+        assert!(inner.reclaimable.contains_key(&key));
+        assert!(!inner.retained.contains_key(&key));
     }
 
     #[test]
@@ -346,43 +347,46 @@ mod tests {
     }
 
     #[test]
-    fn cold_blocks_are_evicted_before_warm_blocks() {
+    fn reclaimable_blocks_are_evicted_before_retained_blocks() {
         let cache = make_cache();
-        let warm = BlockKey::new("ns".into(), vec![1]);
-        let cold = BlockKey::new("ns".into(), vec![2]);
+        let retained = BlockKey::new("ns".into(), vec![1]);
+        let reclaimable = BlockKey::new("ns".into(), vec![2]);
 
-        cache.batch_insert(vec![(warm.clone(), make_block())]);
+        cache.batch_insert(vec![(retained.clone(), make_block())]);
         assert_eq!(
-            cache.batch_insert_resident_keys(vec![(cold.clone(), make_block())]),
-            vec![cold.clone()]
+            cache.batch_insert_resident_keys(vec![(reclaimable.clone(), make_block())]),
+            vec![reclaimable.clone()]
         );
 
         let evicted = cache.remove_lru_batch(1);
         assert_eq!(evicted.len(), 1);
-        assert_eq!(evicted[0].0, cold);
-        assert!(cache.contains_keys(&[warm])[0]);
+        assert_eq!(evicted[0].0, reclaimable);
+        assert!(cache.contains_keys(&[retained])[0]);
     }
 
     #[test]
-    fn local_hit_promotes_cold_block_to_warm() {
+    fn local_hit_refreshes_reclaimable_without_changing_class() {
         let cache = make_cache();
-        let cold_hit = BlockKey::new("ns".into(), vec![1]);
-        let cold_miss = BlockKey::new("ns".into(), vec![2]);
+        let reclaimable_hit = BlockKey::new("ns".into(), vec![1]);
+        let reclaimable_miss = BlockKey::new("ns".into(), vec![2]);
 
         cache.batch_insert_resident_keys(vec![
-            (cold_hit.clone(), make_block()),
-            (cold_miss.clone(), make_block()),
+            (reclaimable_hit.clone(), make_block()),
+            (reclaimable_miss.clone(), make_block()),
         ]);
-        let (hit, _) = cache.get_prefix_blocks(std::slice::from_ref(&cold_hit));
+        let (hit, _) = cache.get_prefix_blocks(std::slice::from_ref(&reclaimable_hit));
         assert_eq!(hit, 1);
 
         let evicted = cache.remove_lru_batch(1);
-        assert_eq!(evicted[0].0, cold_miss);
-        assert!(cache.contains_keys(&[cold_hit])[0]);
+        assert_eq!(evicted[0].0, reclaimable_miss);
+        assert!(cache.contains_keys(&[reclaimable_hit.clone()])[0]);
+        let inner = cache.inner.lock();
+        assert!(inner.reclaimable.contains_key(&reclaimable_hit));
+        assert!(!inner.retained.contains_key(&reclaimable_hit));
     }
 
     #[test]
-    fn rdma_fetch_of_existing_cold_block_promotes_to_warm() {
+    fn rdma_fetch_of_existing_block_keeps_existing_class() {
         let cache = make_cache();
         let existing = BlockKey::new("ns".into(), vec![1]);
         let other = BlockKey::new("ns".into(), vec![2]);
@@ -393,11 +397,14 @@ mod tests {
 
         let evicted = cache.remove_lru_batch(1);
         assert_eq!(evicted[0].0, other);
-        assert!(cache.contains_keys(&[existing])[0]);
+        assert!(cache.contains_keys(&[existing.clone()])[0]);
+        let inner = cache.inner.lock();
+        assert!(inner.reclaimable.contains_key(&existing));
+        assert!(!inner.retained.contains_key(&existing));
     }
 
     #[test]
-    fn repeated_warm_insert_refreshes_lru_recency() {
+    fn repeated_retained_insert_refreshes_lru_recency() {
         let cache = make_cache();
         let first = BlockKey::new("ns".into(), vec![1]);
         let second = BlockKey::new("ns".into(), vec![2]);
@@ -411,13 +418,40 @@ mod tests {
     }
 
     #[test]
-    fn demote_moves_warm_block_to_cold() {
+    fn mark_reclaimable_moves_retained_block() {
         let cache = make_cache();
         let key = BlockKey::new("ns".into(), vec![1]);
         cache.batch_insert(vec![(key.clone(), make_block())]);
 
-        cache.demote(std::slice::from_ref(&key));
+        cache.mark_reclaimable(std::slice::from_ref(&key));
         assert_eq!(cache.remove_lru_batch(1)[0].0, key);
+    }
+
+    #[test]
+    fn owner_hint_marks_only_new_local_insert_as_reclaimable() {
+        let cache = make_cache();
+        let hinted = BlockKey::new("ns".into(), vec![1]);
+        let unique = BlockKey::new("ns".into(), vec![2]);
+
+        cache.batch_insert(vec![(hinted.clone(), make_block())]);
+        cache.batch_insert(vec![(unique.clone(), make_block())]);
+        cache.apply_owner_hints(&[hinted.clone(), unique.clone()], &[2, 1]);
+
+        let evicted = cache.remove_lru_batch(1);
+        assert_eq!(evicted[0].0, hinted);
+        assert!(cache.contains_keys(&[unique])[0]);
+    }
+
+    #[test]
+    fn already_existing_insert_does_not_change_class() {
+        let cache = make_cache();
+        let retained = BlockKey::new("ns".into(), vec![1]);
+        cache.batch_insert(vec![(retained.clone(), make_block())]);
+
+        cache.batch_insert_resident_keys(vec![(retained.clone(), make_block())]);
+        let inner = cache.inner.lock();
+        assert!(inner.retained.contains_key(&retained));
+        assert!(!inner.reclaimable.contains_key(&retained));
     }
 
     #[test]

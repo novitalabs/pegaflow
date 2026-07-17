@@ -378,13 +378,13 @@ impl StorageEngine {
         }
     }
 
-    pub(crate) fn set_cold_blocks(&self, namespace: &str, hashes: &[Vec<u8>]) {
+    pub(crate) fn set_reclaimable_blocks(&self, namespace: &str, hashes: &[Vec<u8>]) {
         let namespace = namespace.to_string();
         let keys = hashes
             .iter()
             .map(|hash| BlockKey::new(namespace.clone(), hash.clone()))
             .collect::<Vec<_>>();
-        self.read_cache.demote(&keys);
+        self.read_cache.mark_reclaimable(&keys);
     }
 
     /// Evict all blocks from the resident in-memory read cache.

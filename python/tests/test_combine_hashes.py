@@ -566,12 +566,12 @@ class TestSchedulerQueryProbeReuse:
         sc.update_connector_output(SimpleNamespace(finished_sending={"r1"}))
         sc.update_connector_output(SimpleNamespace(finished_sending={"r1"}))
 
-        engine_client.set_cold_blocks.assert_called_once()
-        args = engine_client.set_cold_blocks.call_args.args
+        engine_client.set_reclaimable_blocks.assert_called_once()
+        args = engine_client.set_reclaimable_blocks.call_args.args
         assert args[0] == "ns"
         assert set(args[1]) == hashes
 
-    def test_save_only_finished_sending_keeps_saved_hashes_warm(self):
+    def test_save_only_finished_sending_marks_saved_hashes_reclaimable(self):
         engine_client = MagicMock()
         ctx = _make_ctx(
             engine_client=engine_client,
@@ -584,7 +584,7 @@ class TestSchedulerQueryProbeReuse:
 
         sc.update_connector_output(SimpleNamespace(finished_sending={"r1"}))
 
-        engine_client.set_cold_blocks.assert_not_called()
+        engine_client.set_reclaimable_blocks.assert_not_called()
         assert "r1" not in sc._pending_saves
         assert "r1" not in sc._pending_save_hashes
 

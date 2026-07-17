@@ -123,12 +123,12 @@ message UnregisterResponse {
   ResponseStatus status = 1;
 }
 
-message SetColdBlocksRequest {
+message SetReclaimableBlocksRequest {
   string namespace = 1;
   repeated bytes block_hashes = 2;
 }
 
-message SetColdBlocksResponse {
+message SetReclaimableBlocksResponse {
   ResponseStatus status = 1;
 }
 
@@ -216,7 +216,7 @@ service Engine {
   rpc QueryPrefetch(QueryRequest) returns (QueryResponse);
   rpc Release(ReleaseRequest) returns (ReleaseResponse);
   rpc UnregisterContext(UnregisterRequest) returns (UnregisterResponse);
-  rpc SetColdBlocks(SetColdBlocksRequest) returns (SetColdBlocksResponse);
+  rpc SetReclaimableBlocks(SetReclaimableBlocksRequest) returns (SetReclaimableBlocksResponse);
   // Cross-node transfer: get RDMA metadata for specific blocks (serving side)
   rpc QueryBlocksForTransfer(QueryBlocksForTransferRequest) returns (QueryBlocksForTransferResponse);
   // Cross-node transfer: release block locks after RDMA transfer completes
@@ -243,6 +243,9 @@ message InsertBlockHashesRequest {
 message InsertBlockHashesResponse {
   ResponseStatus status = 1;
   uint64 inserted_count = 2;
+  // Owner count for each requested hash after this insert, aligned with
+  // InsertBlockHashesRequest.block_hashes.
+  repeated uint32 owner_counts = 3;
 }
 
 message RemoveBlockHashesRequest {

@@ -560,7 +560,7 @@ class SchedulerConnector:
             hashes = self._pending_save_hashes.pop(req_id, set())
             if hashes and self._ctx.read_enabled:
                 try:
-                    self._ctx.engine_client.set_cold_blocks(
+                    self._ctx.engine_client.set_reclaimable_blocks(
                         self._ctx.namespace, list(hashes)
                     )
                 except Exception as exc:  # noqa: BLE001 - demotion is best effort

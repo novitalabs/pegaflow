@@ -252,10 +252,10 @@ class EngineRpcClient:
         """
         ...
 
-    def set_cold_blocks(
+    def set_reclaimable_blocks(
         self, namespace: str, block_hashes: list[bytes]
     ) -> tuple[bool, str]:
-        """Mark resident blocks as cold for replacement."""
+        """Mark resident blocks as reclaimable for replacement."""
         ...
 
     def unregister_context(self, instance_id: str) -> tuple[bool, str]:

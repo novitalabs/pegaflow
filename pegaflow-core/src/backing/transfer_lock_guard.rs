@@ -85,7 +85,7 @@ mod tests {
         QueryBlocksForTransferResponse, QueryRequest, QueryResponse, RdmaHandshakeRequest,
         RdmaHandshakeResponse, RegisterContextRequest, RegisterContextResponse, ReleaseRequest,
         ReleaseResponse, ReleaseTransferLockResponse, SaveRequest, SaveResponse, SessionEvent,
-        SessionRequest, SetColdBlocksRequest, SetColdBlocksResponse, ShutdownRequest,
+        SessionRequest, SetReclaimableBlocksRequest, SetReclaimableBlocksResponse, ShutdownRequest,
         ShutdownResponse, UnregisterRequest, UnregisterResponse,
     };
     use tokio_stream::wrappers::TcpListenerStream;
@@ -162,10 +162,10 @@ mod tests {
         ) -> Result<Response<UnregisterResponse>, Status> {
             Err(Status::unimplemented("stub"))
         }
-        async fn set_cold_blocks(
+        async fn set_reclaimable_blocks(
             &self,
-            _request: Request<SetColdBlocksRequest>,
-        ) -> Result<Response<SetColdBlocksResponse>, Status> {
+            _request: Request<SetReclaimableBlocksRequest>,
+        ) -> Result<Response<SetReclaimableBlocksResponse>, Status> {
             Err(Status::unimplemented("stub"))
         }
         async fn shutdown(

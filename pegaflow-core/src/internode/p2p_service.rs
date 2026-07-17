@@ -24,9 +24,9 @@ use pegaflow_proto::proto::engine::{
     QueryBlocksForTransferResponse, QueryRequest, QueryResponse, RdmaHandshakeRequest,
     RdmaHandshakeResponse, RegisterContextRequest, RegisterContextResponse, ReleaseRequest,
     ReleaseResponse, ReleaseTransferLockRequest, ReleaseTransferLockResponse, ResponseStatus,
-    SaveRequest, SaveResponse, SessionEvent, SessionRequest, SetColdBlocksRequest,
-    SetColdBlocksResponse, ShutdownRequest, ShutdownResponse, TransferBlockInfo, TransferSlotInfo,
-    UnregisterRequest, UnregisterResponse,
+    SaveRequest, SaveResponse, SessionEvent, SessionRequest, SetReclaimableBlocksRequest,
+    SetReclaimableBlocksResponse, ShutdownRequest, ShutdownResponse, TransferBlockInfo,
+    TransferSlotInfo, UnregisterRequest, UnregisterResponse,
 };
 
 use crate::{LayerBlock, PegaEngine};
@@ -268,11 +268,11 @@ impl Engine for P2pTransferService {
         Self::not_served("unregister_context")
     }
 
-    async fn set_cold_blocks(
+    async fn set_reclaimable_blocks(
         &self,
-        _request: Request<SetColdBlocksRequest>,
-    ) -> Result<Response<SetColdBlocksResponse>, Status> {
-        Self::not_served("set_cold_blocks")
+        _request: Request<SetReclaimableBlocksRequest>,
+    ) -> Result<Response<SetReclaimableBlocksResponse>, Status> {
+        Self::not_served("set_reclaimable_blocks")
     }
 
     async fn shutdown(
