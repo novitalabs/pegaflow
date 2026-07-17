@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
+use hashlink::LruCache;
 use parking_lot::Mutex;
 
 use crate::block::{BlockKey, SealedBlock};
 use crate::cache::{CacheInsertOutcome, TinyLfuCache};
-use crate::metrics::core_metrics;
+use crate::metrics::{CACHE_CLASS_COLD, CACHE_CLASS_WARM, core_metrics};
 
 pub(super) struct ReadCache {
     inner: Mutex<ReadCacheInner>,
@@ -12,6 +13,14 @@ pub(super) struct ReadCache {
 
 struct ReadCacheInner {
     cache: TinyLfuCache<BlockKey, Arc<SealedBlock>>,
+    cold: LruCache<BlockKey, ()>,
+    warm: LruCache<BlockKey, ()>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum ResidentClass {
+    Cold,
+    Warm,
 }
 
 impl ReadCache {
@@ -23,7 +32,11 @@ impl ReadCache {
         let cache =
             TinyLfuCache::new_unbounded(capacity_bytes, enable_lfu_admission, value_size_hint);
         Self {
-            inner: Mutex::new(ReadCacheInner { cache }),
+            inner: Mutex::new(ReadCacheInner {
+                cache,
+                cold: LruCache::new_unbounded(),
+                warm: LruCache::new_unbounded(),
+            }),
         }
     }
 
@@ -40,6 +53,7 @@ impl ReadCache {
             let mut inner = self.inner.lock();
             for key in keys {
                 if let Some(block) = inner.cache.get(key) {
+                    promote_on_local_hit(&mut inner, key);
                     hit += 1;
                     blocks.push(block);
                 } else {
@@ -53,7 +67,7 @@ impl ReadCache {
     pub(super) fn batch_insert(&self, blocks: Vec<(BlockKey, Arc<SealedBlock>)>) {
         let mut inner = self.inner.lock();
         for (key, block) in blocks {
-            insert_block(&mut inner, key, block);
+            insert_block(&mut inner, key, block, ResidentClass::Warm);
         }
     }
 
@@ -64,7 +78,7 @@ impl ReadCache {
         let mut inner = self.inner.lock();
         let mut resident_keys = Vec::new();
         for (key, block) in blocks {
-            match insert_block(&mut inner, key.clone(), block) {
+            match insert_block(&mut inner, key.clone(), block, ResidentClass::Cold) {
                 CacheInsertOutcome::InsertedNew | CacheInsertOutcome::AlreadyExists => {
                     resident_keys.push(key);
                 }
@@ -77,7 +91,12 @@ impl ReadCache {
     pub(super) fn batch_insert_refs(&self, blocks: &[(BlockKey, Arc<SealedBlock>)]) {
         let mut inner = self.inner.lock();
         for (key, block) in blocks {
-            insert_block(&mut inner, key.clone(), Arc::clone(block));
+            insert_block(
+                &mut inner,
+                key.clone(),
+                Arc::clone(block),
+                ResidentClass::Warm,
+            );
         }
     }
 
@@ -96,13 +115,64 @@ impl ReadCache {
 
     pub(super) fn remove_lru_batch(&self, batch_size: usize) -> Vec<(BlockKey, Arc<SealedBlock>)> {
         let mut inner = self.inner.lock();
-        (0..batch_size)
-            .map_while(|_| inner.cache.remove_lru())
-            .collect()
+        let mut evicted = Vec::with_capacity(batch_size);
+        while evicted.len() < batch_size {
+            let candidate = inner
+                .cold
+                .remove_lru()
+                .map(|(key, _)| (key, ResidentClass::Cold))
+                .or_else(|| {
+                    inner
+                        .warm
+                        .remove_lru()
+                        .map(|(key, _)| (key, ResidentClass::Warm))
+                });
+            let Some((key, class)) = candidate else {
+                break;
+            };
+            if let Some(block) = inner.cache.remove(&key) {
+                let attributes = class.attributes();
+                let metrics = core_metrics();
+                metrics.cache_resident_blocks.add(-1, attributes);
+                metrics.cache_block_evictions_by_class.add(1, attributes);
+                evicted.push((key, block));
+            }
+        }
+        evicted
     }
 
     pub(super) fn remove_all(&self) -> Vec<(BlockKey, Arc<SealedBlock>)> {
-        self.inner.lock().cache.remove_all()
+        let mut inner = self.inner.lock();
+        let cold_blocks = inner.cold.len() as i64;
+        let warm_blocks = inner.warm.len() as i64;
+        inner.cold.clear();
+        inner.warm.clear();
+        let metrics = core_metrics();
+        metrics
+            .cache_resident_blocks
+            .add(-cold_blocks, &*CACHE_CLASS_COLD);
+        metrics
+            .cache_resident_blocks
+            .add(-warm_blocks, &*CACHE_CLASS_WARM);
+        inner.cache.remove_all()
+    }
+
+    pub(super) fn demote(&self, keys: &[BlockKey]) {
+        let mut inner = self.inner.lock();
+        for key in keys {
+            if inner.cache.contains_key(key) {
+                demote(&mut inner, key);
+            }
+        }
+    }
+}
+
+impl ResidentClass {
+    fn attributes(self) -> &'static [opentelemetry::KeyValue] {
+        match self {
+            Self::Cold => &*CACHE_CLASS_COLD,
+            Self::Warm => &*CACHE_CLASS_WARM,
+        }
     }
 }
 
@@ -110,21 +180,63 @@ fn insert_block(
     inner: &mut ReadCacheInner,
     key: BlockKey,
     block: Arc<SealedBlock>,
+    class: ResidentClass,
 ) -> CacheInsertOutcome {
     let footprint_bytes = block.memory_footprint();
-    let outcome = inner.cache.insert(key, block);
+    let outcome = inner.cache.insert(key.clone(), block);
     match outcome {
         CacheInsertOutcome::InsertedNew => {
+            match class {
+                ResidentClass::Cold => {
+                    inner.cold.insert(key, ());
+                }
+                ResidentClass::Warm => {
+                    inner.warm.insert(key, ());
+                }
+            }
             let m = core_metrics();
             m.cache_block_insertions.add(1, &[]);
             m.cache_resident_bytes.add(footprint_bytes as i64, &[]);
+            m.cache_resident_blocks.add(1, class.attributes());
         }
-        CacheInsertOutcome::AlreadyExists => {}
+        CacheInsertOutcome::AlreadyExists => {
+            promote(&mut *inner, &key);
+        }
         CacheInsertOutcome::Rejected => {
             core_metrics().cache_block_admission_rejections.add(1, &[]);
         }
     }
     outcome
+}
+
+fn promote_on_local_hit(inner: &mut ReadCacheInner, key: &BlockKey) {
+    if inner.cold.contains_key(key) {
+        promote(inner, key);
+    } else if inner.warm.contains_key(key) {
+        inner.warm.get(key);
+    }
+}
+
+fn promote(inner: &mut ReadCacheInner, key: &BlockKey) {
+    if inner.cold.remove(key).is_some() && inner.cache.contains_key(key) {
+        inner.warm.insert(key.clone(), ());
+        let metrics = core_metrics();
+        metrics.cache_resident_blocks.add(-1, &*CACHE_CLASS_COLD);
+        metrics.cache_resident_blocks.add(1, &*CACHE_CLASS_WARM);
+        metrics.cache_block_promotions.add(1, &[]);
+    } else if inner.warm.contains_key(key) {
+        inner.warm.get(key);
+    }
+}
+
+fn demote(inner: &mut ReadCacheInner, key: &BlockKey) {
+    if inner.warm.remove(key).is_some() && inner.cache.contains_key(key) {
+        inner.cold.insert(key.clone(), ());
+        let metrics = core_metrics();
+        metrics.cache_resident_blocks.add(-1, &*CACHE_CLASS_WARM);
+        metrics.cache_resident_blocks.add(1, &*CACHE_CLASS_COLD);
+        metrics.cache_block_demotions.add(1, &[]);
+    }
 }
 
 #[cfg(test)]
@@ -209,6 +321,81 @@ mod tests {
         // get_prefix_blocks: stops at key 1 (first miss), returns only key 0
         let (prefix_hit, _) = cache.get_prefix_blocks(&keys);
         assert_eq!(prefix_hit, 1);
+    }
+
+    #[test]
+    fn cold_blocks_are_evicted_before_warm_blocks() {
+        let cache = make_cache();
+        let warm = BlockKey::new("ns".into(), vec![1]);
+        let cold = BlockKey::new("ns".into(), vec![2]);
+
+        cache.batch_insert(vec![(warm.clone(), make_block())]);
+        assert_eq!(
+            cache.batch_insert_resident_keys(vec![(cold.clone(), make_block())]),
+            vec![cold.clone()]
+        );
+
+        let evicted = cache.remove_lru_batch(1);
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].0, cold);
+        assert!(cache.contains_keys(&[warm])[0]);
+    }
+
+    #[test]
+    fn local_hit_promotes_cold_block_to_warm() {
+        let cache = make_cache();
+        let cold_hit = BlockKey::new("ns".into(), vec![1]);
+        let cold_miss = BlockKey::new("ns".into(), vec![2]);
+
+        cache.batch_insert_resident_keys(vec![
+            (cold_hit.clone(), make_block()),
+            (cold_miss.clone(), make_block()),
+        ]);
+        let (hit, _) = cache.get_prefix_blocks(std::slice::from_ref(&cold_hit));
+        assert_eq!(hit, 1);
+
+        let evicted = cache.remove_lru_batch(1);
+        assert_eq!(evicted[0].0, cold_miss);
+        assert!(cache.contains_keys(&[cold_hit])[0]);
+    }
+
+    #[test]
+    fn rdma_fetch_of_existing_cold_block_promotes_to_warm() {
+        let cache = make_cache();
+        let existing = BlockKey::new("ns".into(), vec![1]);
+        let other = BlockKey::new("ns".into(), vec![2]);
+
+        cache.batch_insert_resident_keys(vec![(existing.clone(), make_block())]);
+        cache.batch_insert_resident_keys(vec![(other.clone(), make_block())]);
+        cache.batch_insert_resident_keys(vec![(existing.clone(), make_block())]);
+
+        let evicted = cache.remove_lru_batch(1);
+        assert_eq!(evicted[0].0, other);
+        assert!(cache.contains_keys(&[existing])[0]);
+    }
+
+    #[test]
+    fn repeated_warm_insert_refreshes_lru_recency() {
+        let cache = make_cache();
+        let first = BlockKey::new("ns".into(), vec![1]);
+        let second = BlockKey::new("ns".into(), vec![2]);
+        let first_block = make_block();
+
+        cache.batch_insert(vec![(first.clone(), Arc::clone(&first_block))]);
+        cache.batch_insert(vec![(second.clone(), make_block())]);
+        cache.batch_insert(vec![(first, first_block)]);
+
+        assert_eq!(cache.remove_lru_batch(1)[0].0, second);
+    }
+
+    #[test]
+    fn demote_moves_warm_block_to_cold() {
+        let cache = make_cache();
+        let key = BlockKey::new("ns".into(), vec![1]);
+        cache.batch_insert(vec![(key.clone(), make_block())]);
+
+        cache.demote(std::slice::from_ref(&key));
+        assert_eq!(cache.remove_lru_batch(1)[0].0, key);
     }
 
     #[test]

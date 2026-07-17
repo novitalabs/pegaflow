@@ -252,6 +252,12 @@ class EngineRpcClient:
         """
         ...
 
+    def set_cold_blocks(
+        self, namespace: str, block_hashes: list[bytes]
+    ) -> tuple[bool, str]:
+        """Mark resident blocks as cold for replacement."""
+        ...
+
     def unregister_context(self, instance_id: str) -> tuple[bool, str]:
         """Unregister a context/instance.
 

@@ -2,8 +2,8 @@ use pegaflow_common::grpc::{GRPC_CLIENT_HTTP2_KEEPALIVE_INTERVAL, GRPC_CONNECT_T
 use pegaflow_core::LoadState;
 use pegaflow_proto::proto::engine::{
     HealthRequest, LeaseLoad, LoadRequest, QueryRequest, RegisterContextRequest, ReleaseRequest,
-    ResponseStatus, SaveLayer, SaveRequest, SessionEvent, SessionRequest, ShutdownRequest,
-    TransferMode, UnregisterRequest, engine_client::EngineClient, query_response,
+    ResponseStatus, SaveLayer, SaveRequest, SessionEvent, SessionRequest, SetColdBlocksRequest,
+    ShutdownRequest, TransferMode, UnregisterRequest, engine_client::EngineClient, query_response,
 };
 use pyo3::{
     create_exception,
@@ -508,6 +508,24 @@ impl EngineRpcClient {
             .await?;
             Ok(())
         })
+    }
+
+    fn set_cold_blocks(
+        &self,
+        py: Python<'_>,
+        namespace: String,
+        block_hashes: Vec<Vec<u8>>,
+    ) -> PyResult<(bool, String)> {
+        self.call(py, "set_cold_blocks", |mut c| async move {
+            let resp = c
+                .set_cold_blocks(SetColdBlocksRequest {
+                    namespace,
+                    block_hashes,
+                })
+                .await?;
+            Ok(resp.into_inner())
+        })
+        .and_then(|r| status_tuple("set_cold_blocks", r.status))
     }
 
     /// Unregister a context/instance.

@@ -378,6 +378,14 @@ impl StorageEngine {
         }
     }
 
+    pub(crate) fn set_cold_blocks(&self, namespace: &str, hashes: &[Vec<u8>]) {
+        let keys = hashes
+            .iter()
+            .map(|hash| BlockKey::new(namespace.to_string(), hash.clone()))
+            .collect::<Vec<_>>();
+        self.read_cache.demote(&keys);
+    }
+
     /// Evict all blocks from the resident in-memory read cache.
     ///
     /// This preserves backing-store copies. Blocks with

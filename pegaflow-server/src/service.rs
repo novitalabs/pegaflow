@@ -7,9 +7,10 @@ use crate::proto::engine::{
     QueryBlocksForTransferResponse, QueryLoading, QueryReady, QueryRequest, QueryResponse,
     RdmaHandshakeRequest, RdmaHandshakeResponse, RegisterContextRequest, RegisterContextResponse,
     ReleaseRequest, ReleaseResponse, ReleaseTransferLockRequest, ReleaseTransferLockResponse,
-    ResponseStatus, SaveRequest, SaveResponse, SessionEvent, SessionRequest, ShutdownRequest,
-    ShutdownResponse, TransferBlockInfo, TransferMode as ProtoTransferMode, TransferSlotInfo,
-    UnregisterRequest, UnregisterResponse, query_response,
+    ResponseStatus, SaveRequest, SaveResponse, SessionEvent, SessionRequest, SetColdBlocksRequest,
+    SetColdBlocksResponse, ShutdownRequest, ShutdownResponse, TransferBlockInfo,
+    TransferMode as ProtoTransferMode, TransferSlotInfo, UnregisterRequest, UnregisterResponse,
+    query_response,
 };
 use crate::registry::RegistryHandle;
 use crate::session::SessionRegistry;
@@ -691,6 +692,21 @@ impl Engine for GrpcEngineService {
         }
         record_rpc_result("unregister_context", &result, start);
         result
+    }
+
+    async fn set_cold_blocks(
+        &self,
+        request: Request<SetColdBlocksRequest>,
+    ) -> Result<Response<SetColdBlocksResponse>, Status> {
+        let req = request.into_inner();
+        if req.namespace.is_empty() {
+            return Err(Status::invalid_argument("namespace must not be empty"));
+        }
+        self.engine
+            .set_cold_blocks(&req.namespace, &req.block_hashes);
+        Ok(Response::new(SetColdBlocksResponse {
+            status: Some(Self::build_simple_response()),
+        }))
     }
 
     async fn query_blocks_for_transfer(

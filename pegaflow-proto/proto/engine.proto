@@ -123,6 +123,15 @@ message UnregisterResponse {
   ResponseStatus status = 1;
 }
 
+message SetColdBlocksRequest {
+  string namespace = 1;
+  repeated bytes block_hashes = 2;
+}
+
+message SetColdBlocksResponse {
+  ResponseStatus status = 1;
+}
+
 message ShutdownRequest {}
 
 message ShutdownResponse {
@@ -207,6 +216,7 @@ service Engine {
   rpc QueryPrefetch(QueryRequest) returns (QueryResponse);
   rpc Release(ReleaseRequest) returns (ReleaseResponse);
   rpc UnregisterContext(UnregisterRequest) returns (UnregisterResponse);
+  rpc SetColdBlocks(SetColdBlocksRequest) returns (SetColdBlocksResponse);
   // Cross-node transfer: get RDMA metadata for specific blocks (serving side)
   rpc QueryBlocksForTransfer(QueryBlocksForTransferRequest) returns (QueryBlocksForTransferResponse);
   // Cross-node transfer: release block locks after RDMA transfer completes

@@ -534,6 +534,10 @@ impl PegaEngine {
         self.storage.cleanup_memory_cache()
     }
 
+    pub fn set_cold_blocks(&self, namespace: &str, hashes: &[Vec<u8>]) {
+        self.storage.set_cold_blocks(namespace, hashes);
+    }
+
     /// Best-effort graceful unregister from MetaServer, if configured.
     pub async fn shutdown_metaserver_client(&self) {
         self.storage.shutdown_metaserver_client().await;

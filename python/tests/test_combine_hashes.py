@@ -557,6 +557,37 @@ class TestSchedulerQueryProbeReuse:
         )
         return SchedulerConnector(ctx), engine_client
 
+    def test_finished_sending_demotes_saved_hashes_once(self):
+        sc, engine_client = self._make_connector()
+        hashes = {b"a", b"b"}
+        sc._pending_saves.add("r1")
+        sc._pending_save_hashes["r1"] = hashes
+
+        sc.update_connector_output(SimpleNamespace(finished_sending={"r1"}))
+        sc.update_connector_output(SimpleNamespace(finished_sending={"r1"}))
+
+        engine_client.set_cold_blocks.assert_called_once()
+        args = engine_client.set_cold_blocks.call_args.args
+        assert args[0] == "ns"
+        assert set(args[1]) == hashes
+
+    def test_save_only_finished_sending_keeps_saved_hashes_warm(self):
+        engine_client = MagicMock()
+        ctx = _make_ctx(
+            engine_client=engine_client,
+            state_manager=MagicMock(),
+            mode=PegaConnectorMode.SAVE_ONLY,
+        )
+        sc = SchedulerConnector(ctx)
+        sc._pending_saves.add("r1")
+        sc._pending_save_hashes["r1"] = {b"a", b"b"}
+
+        sc.update_connector_output(SimpleNamespace(finished_sending={"r1"}))
+
+        engine_client.set_cold_blocks.assert_not_called()
+        assert "r1" not in sc._pending_saves
+        assert "r1" not in sc._pending_save_hashes
+
     def test_repeated_same_probe_reuses_query_result(self):
         sc, engine_client = self._make_connector()
         req = _make_fake_request("r1", [_hash(i) for i in range(4)])

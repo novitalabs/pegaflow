@@ -139,6 +139,7 @@ class SchedulerConnector:
 
         # Completion tracking
         self._pending_saves: set[str] = set()
+        self._pending_save_hashes: dict[str, set[bytes]] = {}
         self._held_requests: set[str] = set()
 
     def get_num_new_matched_tokens(
@@ -431,6 +432,8 @@ class SchedulerConnector:
 
         # Track requests with pending saves
         self._pending_saves.update(save_intents.keys())
+        for req_id, intent in save_intents.items():
+            self._pending_save_hashes.setdefault(req_id, set()).update(intent.block_hashes)
 
         logger.debug(
             "[PegaKVConnector] build_connector_meta: %d loads, %d saves",
@@ -554,6 +557,18 @@ class SchedulerConnector:
 
     def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
         for req_id in connector_output.finished_sending or []:
+            hashes = self._pending_save_hashes.pop(req_id, set())
+            if hashes and self._ctx.read_enabled:
+                try:
+                    self._ctx.engine_client.set_cold_blocks(
+                        self._ctx.namespace, list(hashes)
+                    )
+                except Exception as exc:  # noqa: BLE001 - demotion is best effort
+                    logger.warning(
+                        "[PegaKVConnector] Failed to demote saved blocks for request %s: %s",
+                        req_id,
+                        exc,
+                    )
             self._pending_saves.discard(req_id)
             logger.debug("[PegaKVConnector] Request %s save completed", req_id)
 
@@ -593,6 +608,7 @@ class SchedulerConnector:
         self._scheduled_tokens.pop(req_id, None)
         self._next_stored_block_idx.pop(req_id, None)
         self._pending_saves.discard(req_id)
+        self._pending_save_hashes.pop(req_id, None)
         self._tail_saved.discard(req_id)
 
     def _count_available_block_prefix(
