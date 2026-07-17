@@ -174,15 +174,6 @@ impl ReadCache {
             }
         }
     }
-
-    pub(super) fn apply_owner_hints(&self, keys: &[BlockKey], owner_counts: &[u32]) {
-        let mut inner = self.inner.lock();
-        for (key, owner_count) in keys.iter().zip(owner_counts) {
-            if *owner_count > 1 && inner.cache.contains_key(key) {
-                mark_reclaimable(&mut inner, key);
-            }
-        }
-    }
 }
 
 impl ResidentClass {
@@ -425,21 +416,6 @@ mod tests {
 
         cache.mark_reclaimable(std::slice::from_ref(&key));
         assert_eq!(cache.remove_lru_batch(1)[0].0, key);
-    }
-
-    #[test]
-    fn owner_hint_marks_only_new_local_insert_as_reclaimable() {
-        let cache = make_cache();
-        let hinted = BlockKey::new("ns".into(), vec![1]);
-        let unique = BlockKey::new("ns".into(), vec![2]);
-
-        cache.batch_insert(vec![(hinted.clone(), make_block())]);
-        cache.batch_insert(vec![(unique.clone(), make_block())]);
-        cache.apply_owner_hints(&[hinted.clone(), unique.clone()], &[2, 1]);
-
-        let evicted = cache.remove_lru_batch(1);
-        assert_eq!(evicted[0].0, hinted);
-        assert!(cache.contains_keys(&[unique])[0]);
     }
 
     #[test]

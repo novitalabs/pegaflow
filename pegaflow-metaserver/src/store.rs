@@ -205,24 +205,21 @@ impl BlockHashStore {
         hashes: &[Vec<u8>],
         node: &str,
         node_id: Uuid,
-    ) -> Result<Vec<u32>, StoreError> {
+    ) -> Result<usize, StoreError> {
         self.touch_node_session(node, node_id)?;
         let node: Arc<str> = Arc::from(node);
         let now = Instant::now();
-        let mut owner_counts = Vec::with_capacity(hashes.len());
         for hash in hashes {
             let key = BlockKey::new(namespace.to_string(), hash.clone());
-            let mut owners = self.blocks.entry(key).or_default();
-            owners.insert(
+            self.blocks.entry(key).or_default().insert(
                 Arc::clone(&node),
                 OwnerRecord {
                     node_id,
                     key_register_time: now,
                 },
             );
-            owner_counts.push(owners.len() as u32);
         }
-        Ok(owner_counts)
+        Ok(hashes.len())
     }
 
     pub fn remove_hashes(
@@ -470,7 +467,7 @@ mod tests {
         let inserted = store
             .insert_hashes(namespace, &hashes, node, node_id)
             .unwrap();
-        assert_eq!(inserted, vec![1, 1, 1]);
+        assert_eq!(inserted, 3);
 
         let existing = store.query_prefix(namespace, &hashes);
         assert_eq!(existing.len(), 3);
@@ -511,27 +508,6 @@ mod tests {
         let mut node_names: Vec<&str> = existing[0].nodes.iter().map(|n| n.as_ref()).collect();
         node_names.sort();
         assert_eq!(node_names, vec!["node-a:50055", "node-b:50055"]);
-    }
-
-    #[test]
-    fn insert_returns_owner_count_aligned_with_hashes() {
-        let store = BlockHashStore::new();
-        let node_a = heartbeat_node(&store, "node-a:50055");
-        let node_b = heartbeat_node(&store, "node-b:50055");
-        let hashes = vec![vec![1], vec![2]];
-
-        assert_eq!(
-            store
-                .insert_hashes("ns", &hashes, "node-a:50055", node_a)
-                .unwrap(),
-            vec![1, 1]
-        );
-        assert_eq!(
-            store
-                .insert_hashes("ns", &hashes, "node-b:50055", node_b)
-                .unwrap(),
-            vec![2, 2]
-        );
     }
 
     #[test]

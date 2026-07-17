@@ -243,9 +243,6 @@ message InsertBlockHashesRequest {
 message InsertBlockHashesResponse {
   ResponseStatus status = 1;
   uint64 inserted_count = 2;
-  // Owner count for each requested hash after this insert, aligned with
-  // InsertBlockHashesRequest.block_hashes.
-  repeated uint32 owner_counts = 3;
 }
 
 message RemoveBlockHashesRequest {

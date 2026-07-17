@@ -287,7 +287,7 @@ fn send_backing_batches(
     }
 
     if let Some(client) = &deps.metaserver_client {
-        register_block_hashes(client, namespace, locally_inserted, &deps.read_cache);
+        register_block_hashes(client, namespace, locally_inserted);
     }
 }
 
@@ -295,7 +295,6 @@ fn register_block_hashes(
     client: &MetaServerClient,
     namespace: &str,
     locally_inserted: Vec<BlockKey>,
-    read_cache: &Arc<ReadCache>,
 ) {
     if locally_inserted.is_empty() {
         return;
@@ -305,10 +304,7 @@ fn register_block_hashes(
         .map(|key| key.hash.clone())
         .collect();
 
-    let read_cache = Arc::clone(read_cache);
-    client.try_register_namespace_with_hint(namespace.to_string(), hashes, move |owner_counts| {
-        read_cache.apply_owner_hints(&locally_inserted, &owner_counts);
-    });
+    client.try_register_namespace(namespace.to_string(), hashes);
 }
 
 fn gc_inflight(
