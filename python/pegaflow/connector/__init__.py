@@ -165,6 +165,7 @@ class PegaKVConnector(KVConnectorBase_V1):
                 vllm_config=vllm_config,
                 kv_cache_config=kv_cache_config,
             )
+            _install_worker_sleep_rpc()
 
         logger.debug(
             "[PegaKVConnector] Initialized role=%s instance_id=%s device=%s "
@@ -233,6 +234,22 @@ class PegaKVConnector(KVConnectorBase_V1):
     def unregister_context(self) -> None:
         if self._worker:
             self._worker.unregister_context()
+
+    # Sleep/wake lifecycle for VMM-IPC (sleep-mode) KV: call through
+    # vLLM's /collective_rpc via a thin Worker passthrough, e.g.
+    #   def pegaflow_sleep_unregister(self):
+    #       return get_kv_transfer_group().pegaflow_sleep_unregister()
+    def pegaflow_sleep_unregister(self) -> str:
+        if self._worker:
+            self._worker.unregister_for_sleep()
+            return "ok"
+        return "no-worker"
+
+    def pegaflow_wake_reregister(self) -> str:
+        if self._worker:
+            self._worker.reregister_after_wake()
+            return "ok"
+        return "no-worker"
 
     def handle_preemptions(self, preempted) -> None:
         if not self._worker:
@@ -390,6 +407,48 @@ class NoopKVConnector(KVConnectorBase_V1):
 
     def build_connector_meta(self, scheduler_output) -> PegaConnectorMetadata:
         return PegaConnectorMetadata()
+
+
+def _install_worker_sleep_rpc() -> None:
+    """Expose the VMM-IPC sleep/wake lifecycle over vLLM's /collective_rpc.
+
+    collective_rpc dispatches string method names on the Worker object, so
+    without these passthroughs pegaflow_sleep_unregister /
+    pegaflow_wake_reregister would be unreachable and a sleeping engine
+    would keep its KV VRAM pinned by the server's imported VMM mappings.
+    Installed at worker-role connector construction: the Worker class is
+    already imported there, and processes without PegaFlow pay nothing."""
+    try:
+        from vllm.v1.worker.gpu_worker import Worker
+    except ImportError:
+        return
+    if hasattr(Worker, "pegaflow_sleep_unregister"):
+        return
+
+    def pegaflow_sleep_unregister(self):
+        from vllm.distributed.kv_transfer.kv_transfer_state import (
+            get_kv_transfer_group,
+            has_kv_transfer_group,
+        )
+
+        if not has_kv_transfer_group():
+            return "no-connector"
+        fn = getattr(get_kv_transfer_group(), "pegaflow_sleep_unregister", None)
+        return fn() if fn else "unsupported"
+
+    def pegaflow_wake_reregister(self):
+        from vllm.distributed.kv_transfer.kv_transfer_state import (
+            get_kv_transfer_group,
+            has_kv_transfer_group,
+        )
+
+        if not has_kv_transfer_group():
+            return "no-connector"
+        fn = getattr(get_kv_transfer_group(), "pegaflow_wake_reregister", None)
+        return fn() if fn else "unsupported"
+
+    Worker.pegaflow_sleep_unregister = pegaflow_sleep_unregister
+    Worker.pegaflow_wake_reregister = pegaflow_wake_reregister
 
 
 def _resolve_device_id() -> int:
