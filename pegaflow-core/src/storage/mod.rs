@@ -379,9 +379,10 @@ impl StorageEngine {
     }
 
     pub(crate) fn set_cold_blocks(&self, namespace: &str, hashes: &[Vec<u8>]) {
+        let namespace = namespace.to_string();
         let keys = hashes
             .iter()
-            .map(|hash| BlockKey::new(namespace.to_string(), hash.clone()))
+            .map(|hash| BlockKey::new(namespace.clone(), hash.clone()))
             .collect::<Vec<_>>();
         self.read_cache.demote(&keys);
     }

@@ -107,7 +107,9 @@ impl ReadCache {
         let mut found = Vec::new();
         for key in keys {
             if let Some(block) = inner.cache.get(key) {
-                found.push((key.clone(), Arc::clone(&block)));
+                let block = Arc::clone(block);
+                refresh_recency(&mut inner, key);
+                found.push((key.clone(), block));
             }
         }
         found
@@ -217,6 +219,14 @@ fn promote_on_local_hit(inner: &mut ReadCacheInner, key: &BlockKey) {
     }
 }
 
+fn refresh_recency(inner: &mut ReadCacheInner, key: &BlockKey) {
+    if inner.cold.contains_key(key) {
+        inner.cold.get(key);
+    } else if inner.warm.contains_key(key) {
+        inner.warm.get(key);
+    }
+}
+
 fn promote(inner: &mut ReadCacheInner, key: &BlockKey) {
     if inner.cold.remove(key).is_some() && inner.cache.contains_key(key) {
         inner.warm.insert(key.clone(), ());
@@ -299,6 +309,19 @@ mod tests {
         assert_eq!(result1.len(), 1);
         assert_eq!(result2.len(), 1);
         assert_eq!(result1[0].0, result2[0].0);
+    }
+
+    #[test]
+    fn get_blocks_refreshes_recency_without_changing_class() {
+        let cache = make_cache();
+        let key = BlockKey::new("ns".into(), vec![1]);
+        cache.batch_insert_resident_keys(vec![(key.clone(), make_block())]);
+
+        let _ = cache.get_blocks(std::slice::from_ref(&key));
+
+        let inner = cache.inner.lock();
+        assert!(inner.cold.contains_key(&key));
+        assert!(!inner.warm.contains_key(&key));
     }
 
     #[test]

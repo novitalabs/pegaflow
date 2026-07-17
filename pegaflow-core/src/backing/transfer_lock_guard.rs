@@ -85,7 +85,8 @@ mod tests {
         QueryBlocksForTransferResponse, QueryRequest, QueryResponse, RdmaHandshakeRequest,
         RdmaHandshakeResponse, RegisterContextRequest, RegisterContextResponse, ReleaseRequest,
         ReleaseResponse, ReleaseTransferLockResponse, SaveRequest, SaveResponse, SessionEvent,
-        SessionRequest, ShutdownRequest, ShutdownResponse, UnregisterRequest, UnregisterResponse,
+        SessionRequest, SetColdBlocksRequest, SetColdBlocksResponse, ShutdownRequest,
+        ShutdownResponse, UnregisterRequest, UnregisterResponse,
     };
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::Endpoint;
@@ -159,6 +160,12 @@ mod tests {
             &self,
             _request: Request<UnregisterRequest>,
         ) -> Result<Response<UnregisterResponse>, Status> {
+            Err(Status::unimplemented("stub"))
+        }
+        async fn set_cold_blocks(
+            &self,
+            _request: Request<SetColdBlocksRequest>,
+        ) -> Result<Response<SetColdBlocksResponse>, Status> {
             Err(Status::unimplemented("stub"))
         }
         async fn shutdown(
