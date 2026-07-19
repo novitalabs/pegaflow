@@ -4,7 +4,8 @@ use log::{debug, error, info, warn};
 use pegaflow_common::grpc::{GRPC_CLIENT_HTTP2_KEEPALIVE_INTERVAL, GRPC_CONNECT_TIMEOUT};
 use pegaflow_proto::proto::engine::meta_server_client::MetaServerClient as MetaServerGrpcClient;
 use pegaflow_proto::proto::engine::{
-    HeartbeatNodeRequest, InsertBlockHashesRequest, RemoveBlockHashesRequest, UnregisterNodeRequest,
+    HeartbeatNodeRequest, InsertBlockHashesRequest, InsertBlockHashesResponse,
+    RemoveBlockHashesRequest, UnregisterNodeRequest,
 };
 #[cfg(feature = "rdma")]
 use pegaflow_proto::proto::engine::{NodePrefixResult, QueryPrefixBlocksRequest};
@@ -541,19 +542,11 @@ async fn registration_loop(
         'insert: for (i, (namespace, hashes)) in insert_namespaces.iter().enumerate() {
             for (chunk_idx, chunk) in hashes.chunks(MAX_HASHES_PER_RPC).enumerate() {
                 let count = chunk.len();
-                let request = InsertBlockHashesRequest {
-                    namespace: namespace.clone(),
-                    block_hashes: chunk.to_vec(),
-                    node: advertise_addr.clone(),
-                    node_id: node_id.clone(),
-                };
-
-                match c.insert_block_hashes(request).await {
+                match send_insert_chunk(c, namespace, chunk, &advertise_addr, &node_id).await {
                     Ok(resp) => {
-                        let inner = resp.into_inner();
                         debug!(
                             "Registered {} block hashes with MetaServer (namespace={}, inserted={})",
-                            count, namespace, inner.inserted_count
+                            count, namespace, resp.inserted_count
                         );
                     }
                     Err(e) => {
@@ -604,25 +597,18 @@ async fn registration_loop(
             let mut failed = false;
             for (namespace, hashes) in batch.groups {
                 for chunk in hashes.chunks(MAX_HASHES_PER_RPC) {
-                    let request = InsertBlockHashesRequest {
-                        namespace: namespace.clone(),
-                        block_hashes: chunk.to_vec(),
-                        node: advertise_addr.clone(),
-                        node_id: node_id.clone(),
-                    };
-                    match c.insert_block_hashes(request).await {
+                    match send_insert_chunk(c, &namespace, chunk, &advertise_addr, &node_id).await {
                         Ok(resp) => {
-                            let inner = resp.into_inner();
-                            if inner.owner_counts.len() != chunk.len() {
+                            if resp.owner_counts.len() != chunk.len() {
                                 error!(
                                     "MetaServer owner hint length mismatch: expected={} got={}",
                                     chunk.len(),
-                                    inner.owner_counts.len()
+                                    resp.owner_counts.len()
                                 );
                                 failed = true;
                                 break;
                             }
-                            owner_counts.extend(inner.owner_counts);
+                            owner_counts.extend(resp.owner_counts);
                         }
                         Err(e) => {
                             error!(
@@ -652,12 +638,6 @@ async fn registration_loop(
                 hinted_insert_failed = true;
                 break 'hinted;
             }
-        }
-
-        if hinted_insert_failed {
-            client = None;
-            ack_flushes(flush_acks);
-            continue;
         }
 
         // Process removes
@@ -709,10 +689,32 @@ async fn registration_loop(
                 .add(dropped as u64, &[]);
             client = None;
         }
+        if hinted_insert_failed {
+            client = None;
+        }
         ack_flushes(flush_acks);
     }
 
     info!("MetaServer registration loop shutting down");
+}
+
+async fn send_insert_chunk(
+    client: &mut MetaServerGrpcClient<Channel>,
+    namespace: &str,
+    hashes: &[Vec<u8>],
+    advertise_addr: &str,
+    node_id: &str,
+) -> Result<InsertBlockHashesResponse, tonic::Status> {
+    let request = InsertBlockHashesRequest {
+        namespace: namespace.to_string(),
+        block_hashes: hashes.to_vec(),
+        node: advertise_addr.to_string(),
+        node_id: node_id.to_string(),
+    };
+    client
+        .insert_block_hashes(request)
+        .await
+        .map(|response| response.into_inner())
 }
 
 fn ack_flushes(acks: Vec<oneshot::Sender<()>>) {
@@ -983,6 +985,7 @@ mod tests {
         remove_count: AtomicUsize,
         unregister_count: AtomicUsize,
         fail_insert_with_stale_session: AtomicUsize,
+        malformed_owner_counts: AtomicUsize,
         insert_requests: RequestLog,
         remove_requests: RequestLog,
         heartbeat_notify: Notify,
@@ -1041,13 +1044,25 @@ mod tests {
                 .unwrap()
                 .push((request.namespace, request.block_hashes));
             self.state.insert_notify.notify_waiters();
+            let owner_counts = if self
+                .state
+                .malformed_owner_counts
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    (remaining > 0).then(|| remaining - 1)
+                })
+                .is_ok()
+            {
+                Vec::new()
+            } else {
+                vec![1; inserted_count as usize]
+            };
             Ok(Response::new(InsertBlockHashesResponse {
                 status: Some(ResponseStatus {
                     ok: true,
                     message: String::new(),
                 }),
                 inserted_count,
-                owner_counts: vec![1; inserted_count as usize],
+                owner_counts,
             }))
         }
 
@@ -1440,6 +1455,46 @@ mod tests {
         assert_eq!(
             collect_requests(&service.remove_requests),
             expected_requests(&[("ns-evicted", evicted)])
+        );
+
+        let (done_tx, done_rx) = oneshot::channel();
+        tx.send(MetaServerCommand::Shutdown(done_tx)).await.unwrap();
+        done_rx.await.unwrap();
+        loop_task.await.unwrap();
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn hinted_insert_failure_does_not_skip_remove() {
+        let (addr, service, shutdown_tx) = start_fake_metaserver().await;
+        service.malformed_owner_counts.store(1, Ordering::SeqCst);
+        let (tx, rx) = mpsc::channel(16);
+        let hash = vec![0xa1];
+
+        tx.try_send(MetaServerCommand::InsertWithHint {
+            batch: BlockHashBatch::single_namespace("ns".to_string(), vec![hash.clone()]),
+            callback: Box::new(|_| panic!("failed hint must not invoke callback")),
+        })
+        .unwrap();
+        tx.try_send(MetaServerCommand::Remove(BlockHashBatch::from_entries(
+            vec![("ns".to_string(), hash.clone())],
+        )))
+        .unwrap();
+        let (flush_tx, flush_rx) = oneshot::channel();
+        tx.try_send(MetaServerCommand::Flush(flush_tx)).unwrap();
+
+        let endpoint = metaserver_endpoint(addr.clone());
+        let loop_task = tokio::spawn(registration_loop(
+            rx,
+            addr,
+            endpoint,
+            "node-a:50055".to_string(),
+        ));
+        flush_rx.await.unwrap();
+
+        assert_eq!(
+            collect_requests(&service.remove_requests),
+            expected_requests(&[("ns", hash)])
         );
 
         let (done_tx, done_rx) = oneshot::channel();

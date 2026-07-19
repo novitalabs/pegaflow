@@ -93,21 +93,24 @@ impl ReadCache {
     pub(super) fn batch_insert_refs(
         &self,
         blocks: &[(BlockKey, Arc<SealedBlock>)],
-    ) -> Vec<BlockKey> {
+    ) -> Vec<(BlockKey, CacheInsertOutcome)> {
         let mut inner = self.inner.lock();
-        let mut inserted = Vec::new();
+        let mut resident = Vec::new();
         for (key, block) in blocks {
-            if insert_block(
+            let outcome = insert_block(
                 &mut inner,
                 key.clone(),
                 Arc::clone(block),
                 ResidentClass::Retained,
-            ) == CacheInsertOutcome::InsertedNew
-            {
-                inserted.push(key.clone());
+            );
+            if matches!(
+                outcome,
+                CacheInsertOutcome::InsertedNew | CacheInsertOutcome::AlreadyExists
+            ) {
+                resident.push((key.clone(), outcome));
             }
         }
-        inserted
+        resident
     }
 
     /// Look up specific blocks by key without prefix-scan semantics (does not
@@ -228,15 +231,17 @@ fn insert_block(
 }
 
 fn refresh_recency(inner: &mut ReadCacheInner, key: &BlockKey) {
-    if inner.reclaimable.contains_key(key) {
-        inner.reclaimable.get(key);
-    } else if inner.retained.contains_key(key) {
+    if inner.reclaimable.get(key).is_none() {
         inner.retained.get(key);
     }
 }
 
 fn mark_reclaimable(inner: &mut ReadCacheInner, key: &BlockKey) {
-    if inner.retained.remove(key).is_some() && inner.cache.contains_key(key) {
+    if !inner.cache.contains_key(key) {
+        return;
+    }
+
+    if inner.retained.remove(key).is_some() {
         inner.reclaimable.insert(key.clone(), ());
         let metrics = core_metrics();
         metrics
@@ -417,6 +422,18 @@ mod tests {
         cache.batch_insert(vec![(first, first_block)]);
 
         assert_eq!(cache.remove_lru_batch(1)[0].0, second);
+    }
+
+    #[test]
+    fn local_save_reports_existing_resident_for_owner_refresh() {
+        let cache = make_cache();
+        let key = BlockKey::new("ns".into(), vec![1]);
+
+        let first = cache.batch_insert_refs(&[(key.clone(), make_block())]);
+        assert_eq!(first, vec![(key.clone(), CacheInsertOutcome::InsertedNew)]);
+
+        let second = cache.batch_insert_refs(&[(key.clone(), make_block())]);
+        assert_eq!(second, vec![(key, CacheInsertOutcome::AlreadyExists)]);
     }
 
     #[test]

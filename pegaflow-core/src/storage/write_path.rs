@@ -7,6 +7,7 @@ use tokio::sync::oneshot;
 
 use crate::backing::SsdBackingStore;
 use crate::block::{BlockKey, InflightBlock, SealedBlock, SlotInsertResult};
+use crate::cache::CacheInsertOutcome;
 use crate::internode::MetaServerClient;
 use crate::metrics::core_metrics;
 use crate::offload::InsertEntries;
@@ -199,8 +200,8 @@ fn process_insert_batch(
     if !sealed_blocks.is_empty()
         && let Some(deps) = &deps
     {
-        let locally_inserted = deps.read_cache.batch_insert_refs(&sealed_blocks);
-        send_backing_batches(deps, namespace, &sealed_blocks, locally_inserted);
+        let resident_saves = deps.read_cache.batch_insert_refs(&sealed_blocks);
+        send_backing_batches(deps, namespace, &sealed_blocks, resident_saves);
     }
 
     ordered_fast_path_seals
@@ -269,7 +270,7 @@ fn send_backing_batches(
     deps: &InsertDeps,
     namespace: &str,
     blocks: &[(BlockKey, Arc<SealedBlock>)],
-    locally_inserted: Vec<BlockKey>,
+    resident_saves: Vec<(BlockKey, CacheInsertOutcome)>,
 ) {
     if blocks.is_empty() {
         return;
@@ -287,27 +288,35 @@ fn send_backing_batches(
     }
 
     if let Some(client) = &deps.metaserver_client {
-        register_block_hashes(client, namespace, locally_inserted, &deps.read_cache);
+        register_block_hashes(client, namespace, resident_saves, &deps.read_cache);
     }
 }
 
 fn register_block_hashes(
     client: &MetaServerClient,
     namespace: &str,
-    locally_inserted: Vec<BlockKey>,
+    resident_saves: Vec<(BlockKey, CacheInsertOutcome)>,
     read_cache: &Arc<ReadCache>,
 ) {
-    if locally_inserted.is_empty() {
+    if resident_saves.is_empty() {
         return;
     }
-    let hashes: Vec<Vec<u8>> = locally_inserted
+    let hashes: Vec<Vec<u8>> = resident_saves
         .iter()
-        .map(|key| key.hash.clone())
+        .map(|(key, _)| key.hash.clone())
         .collect();
 
     let read_cache = Arc::clone(read_cache);
     client.try_register_namespace_with_hint(namespace.to_string(), hashes, move |owner_counts| {
-        read_cache.apply_owner_hints(&locally_inserted, &owner_counts);
+        let mut new_keys = Vec::new();
+        let mut new_owner_counts = Vec::new();
+        for ((key, outcome), owner_count) in resident_saves.iter().zip(owner_counts) {
+            if *outcome == CacheInsertOutcome::InsertedNew {
+                new_keys.push(key.clone());
+                new_owner_counts.push(owner_count);
+            }
+        }
+        read_cache.apply_owner_hints(&new_keys, &new_owner_counts);
     });
 }
 
