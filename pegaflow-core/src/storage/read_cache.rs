@@ -174,16 +174,20 @@ impl ReadCache {
     pub(super) fn mark_reclaimable(&self, keys: &[BlockKey]) {
         let mut inner = self.inner.lock();
         for key in keys {
-            if inner.cache.contains_key(key) {
-                mark_reclaimable(&mut inner, key);
-            }
+            mark_reclaimable(&mut inner, key);
         }
     }
 
-    pub(super) fn apply_owner_hints(&self, keys: &[BlockKey], owner_counts: &[u32]) {
+    pub(super) fn apply_owner_hints(
+        &self,
+        resident_saves: &[(BlockKey, CacheInsertOutcome)],
+        owner_counts: &[u32],
+    ) {
         let mut inner = self.inner.lock();
-        for (key, owner_count) in keys.iter().zip(owner_counts) {
-            if *owner_count >= MIN_RECLAIMABLE_OWNER_COUNT && inner.cache.contains_key(key) {
+        for ((key, outcome), owner_count) in resident_saves.iter().zip(owner_counts) {
+            if *outcome == CacheInsertOutcome::InsertedNew
+                && *owner_count >= MIN_RECLAIMABLE_OWNER_COUNT
+            {
                 mark_reclaimable(&mut inner, key);
             }
         }
@@ -455,7 +459,10 @@ mod tests {
         cache.batch_insert(vec![(second_owner.clone(), make_block())]);
         cache.batch_insert(vec![(third_owner.clone(), make_block())]);
         cache.apply_owner_hints(
-            &[second_owner.clone(), third_owner.clone()],
+            &[
+                (second_owner.clone(), CacheInsertOutcome::InsertedNew),
+                (third_owner.clone(), CacheInsertOutcome::InsertedNew),
+            ],
             &[2, MIN_RECLAIMABLE_OWNER_COUNT],
         );
 
@@ -471,9 +478,28 @@ mod tests {
         cache.batch_insert(vec![(key.clone(), make_block())]);
         cache.remove_lru_batch(1);
 
-        cache.apply_owner_hints(&[key], &[MIN_RECLAIMABLE_OWNER_COUNT]);
+        cache.apply_owner_hints(
+            &[(key, CacheInsertOutcome::InsertedNew)],
+            &[MIN_RECLAIMABLE_OWNER_COUNT],
+        );
 
         assert!(cache.remove_lru_batch(1).is_empty());
+    }
+
+    #[test]
+    fn owner_hint_does_not_demote_existing_local_save() {
+        let cache = make_cache();
+        let key = BlockKey::new("ns".into(), vec![1]);
+        cache.batch_insert(vec![(key.clone(), make_block())]);
+
+        cache.apply_owner_hints(
+            &[(key.clone(), CacheInsertOutcome::AlreadyExists)],
+            &[MIN_RECLAIMABLE_OWNER_COUNT],
+        );
+
+        let inner = cache.inner.lock();
+        assert!(inner.retained.contains_key(&key));
+        assert!(!inner.reclaimable.contains_key(&key));
     }
 
     #[test]

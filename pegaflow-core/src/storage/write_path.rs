@@ -308,15 +308,7 @@ fn register_block_hashes(
 
     let read_cache = Arc::clone(read_cache);
     client.try_register_namespace_with_hint(namespace.to_string(), hashes, move |owner_counts| {
-        let mut new_keys = Vec::new();
-        let mut new_owner_counts = Vec::new();
-        for ((key, outcome), owner_count) in resident_saves.iter().zip(owner_counts) {
-            if *outcome == CacheInsertOutcome::InsertedNew {
-                new_keys.push(key.clone());
-                new_owner_counts.push(owner_count);
-            }
-        }
-        read_cache.apply_owner_hints(&new_keys, &new_owner_counts);
+        read_cache.apply_owner_hints(&resident_saves, &owner_counts);
     });
 }
 
