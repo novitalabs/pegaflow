@@ -308,7 +308,7 @@ impl EngineRpcClient {
                 .register_context_batch(RegisterContextRequest {
                     instance_id,
                     namespace,
-                    client_version: env!("CARGO_PKG_VERSION").to_string(),
+                    client_version: pegaflow_proto::VERSION.to_string(),
                     tp_rank,
                     tp_size,
                     world_size,
@@ -322,6 +322,7 @@ impl EngineRpcClient {
                     pp_rank,
                     transfer_mode: transfer_mode as i32,
                     page_first,
+                    cuda_ipc_tensors: Vec::new(),
                 })
                 .await?;
             Ok(resp.into_inner())
@@ -419,6 +420,7 @@ impl EngineRpcClient {
                     load_state_shm,
                     layer_names,
                     loads,
+                    wait_for_completion: false,
                 })
                 .await?;
             Ok(resp.into_inner())

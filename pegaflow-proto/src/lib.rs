@@ -7,3 +7,5 @@ pub mod proto {
         tonic::include_proto!("pegaflow");
     }
 }
+
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+native-cuda-ipc-v1");

@@ -3,15 +3,16 @@ use pegaflow_core::{trace_in_span, trace_root};
 use crate::metric::record_rpc_result;
 use crate::proto::engine::engine_server::Engine;
 use crate::proto::engine::{
-    HealthRequest, HealthResponse, LoadRequest, LoadResponse, QueryBlocksForTransferRequest,
-    QueryBlocksForTransferResponse, QueryLoading, QueryReady, QueryRequest, QueryResponse,
-    RdmaHandshakeRequest, RdmaHandshakeResponse, RegisterContextRequest, RegisterContextResponse,
-    ReleaseRequest, ReleaseResponse, ReleaseTransferLockRequest, ReleaseTransferLockResponse,
-    ResponseStatus, SaveRequest, SaveResponse, SessionEvent, SessionRequest, ShutdownRequest,
-    ShutdownResponse, TransferBlockInfo, TransferMode as ProtoTransferMode, TransferSlotInfo,
-    UnregisterRequest, UnregisterResponse, query_response,
+    FlushRequest, FlushResponse, HealthRequest, HealthResponse, LoadRequest, LoadResponse,
+    QueryBlocksForTransferRequest, QueryBlocksForTransferResponse, QueryLoading, QueryReady,
+    QueryRequest, QueryResponse, RdmaHandshakeRequest, RdmaHandshakeResponse,
+    RegisterContextRequest, RegisterContextResponse, ReleaseRequest, ReleaseResponse,
+    ReleaseTransferLockRequest, ReleaseTransferLockResponse, ResponseStatus, SaveRequest,
+    SaveResponse, SessionEvent, SessionRequest, ShutdownRequest, ShutdownResponse,
+    TransferBlockInfo, TransferMode as ProtoTransferMode, TransferSlotInfo, UnregisterRequest,
+    UnregisterResponse, query_response,
 };
-use crate::registry::RegistryHandle;
+use crate::registry::{RegistryHandle, TensorRegistration};
 use crate::session::SessionRegistry;
 use log::{debug, info, warn};
 use pegaflow_core::{EngineError, LayerSave, PegaEngine, PrefetchStatus, QueryLeaseId};
@@ -20,6 +21,8 @@ use std::time::Instant;
 use tokio::sync::{Notify, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, async_trait};
+
+mod validation;
 
 #[derive(Clone)]
 pub struct GrpcEngineService {
@@ -116,34 +119,6 @@ impl GrpcEngineService {
         Ok(())
     }
 
-    fn validate_register_context_request(req: &RegisterContextRequest) -> Result<(), Status> {
-        let server_version = env!("CARGO_PKG_VERSION");
-        if req.client_version != server_version {
-            return Err(Status::failed_precondition(format!(
-                "PegaFlow version mismatch: client={} server={server_version}",
-                if req.client_version.is_empty() {
-                    "<missing>"
-                } else {
-                    &req.client_version
-                }
-            )));
-        }
-        Self::validate_device_id(req.device_id)?;
-        if req.tp_size == 0 {
-            return Err(Status::invalid_argument("tp_size must be > 0"));
-        }
-        if req.world_size == 0 {
-            return Err(Status::invalid_argument("world_size must be > 0"));
-        }
-        if req.tp_rank >= req.tp_size {
-            return Err(Status::invalid_argument(format!(
-                "tp_rank {} out of range (tp_size {})",
-                req.tp_rank, req.tp_size
-            )));
-        }
-        Ok(())
-    }
-
     fn validate_save_layers(saves: &[crate::proto::engine::SaveLayer]) -> Result<(), Status> {
         for layer in saves {
             if layer.block_ids.len() != layer.block_hashes.len() {
@@ -226,7 +201,7 @@ impl Engine for GrpcEngineService {
                 req.wrapper_bytes.iter().map(|b| b.len()).collect::<Vec<_>>()
             );
 
-            Self::validate_register_context_request(&req)?;
+            validation::register_context(&req)?;
 
             // The connector picks the H2D/D2H backend per model and sends it
             // here. Read it before `req` is partially moved below.
@@ -238,7 +213,6 @@ impl Engine for GrpcEngineService {
             // Validate array lengths are consistent with each other.
             let batch_len = req.layer_names.len();
             if batch_len == 0
-                || req.wrapper_bytes.len() != batch_len
                 || req.num_blocks.len() != batch_len
                 || req.bytes_per_block.len() != batch_len
                 || req.kv_stride_bytes.len() != batch_len
@@ -280,14 +254,38 @@ impl Engine for GrpcEngineService {
                 Self::context_key(&req.instance_id, req.tp_rank, req.pp_rank, req.device_id);
             // Materialize on the dedicated registry thread (GIL + CUDA IPC) and
             // await the result, so this RPC never blocks an async worker. Move
-            // the (large) wrapper bytes over; clone the layer names since the
+            // the registration payloads over; clone the layer names since the
             // engine call below still needs them.
-            let layers: Vec<(String, Vec<u8>)> = req
-                .layer_names
-                .iter()
-                .cloned()
-                .zip(req.wrapper_bytes)
-                .collect();
+            let native = !req.cuda_ipc_tensors.is_empty();
+            let mut block_stride_bytes = Vec::with_capacity(batch_len);
+            let layers = if native {
+                req.layer_names
+                    .iter()
+                    .cloned()
+                    .zip(req.cuda_ipc_tensors)
+                    .map(|(name, tensor)| {
+                        block_stride_bytes.push(Self::usize_from_u64(
+                            tensor.block_stride_bytes,
+                            "block_stride_bytes",
+                        )?);
+                        Ok((
+                            name,
+                            TensorRegistration::CudaIpc {
+                                handle: tensor.handle,
+                                offset_bytes: tensor.offset_bytes,
+                                size_bytes: tensor.size_bytes,
+                            },
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, Status>>()?
+            } else {
+                req.layer_names
+                    .iter()
+                    .cloned()
+                    .zip(req.wrapper_bytes)
+                    .map(|(name, bytes)| (name, TensorRegistration::Python(bytes)))
+                    .collect()
+            };
             let metadatas = self
                 .registry
                 .register_layers(context_key.clone(), req.device_id, layers)
@@ -301,7 +299,7 @@ impl Engine for GrpcEngineService {
             }
 
             // Call engine batch registration
-            if let Err(err) = self.engine.register_context_layer_batch(
+            if let Err(err) = self.engine.register_context_layer_batch_strided(
                 &req.instance_id,
                 &req.namespace,
                 req.device_id,
@@ -316,6 +314,7 @@ impl Engine for GrpcEngineService {
                 &bytes_per_block_list,
                 &kv_stride_bytes_list,
                 &segments_list,
+                native.then_some(block_stride_bytes.as_slice()),
                 transfer_mode,
                 req.page_first,
             ) {
@@ -450,6 +449,7 @@ impl Engine for GrpcEngineService {
                 layer_names,
                 loads,
                 load_state_shm,
+                wait_for_completion,
                 ..
             } = req;
             Self::validate_device_id(device_id)?;
@@ -475,16 +475,36 @@ impl Engine for GrpcEngineService {
                 })
                 .collect::<Result<_, _>>()?;
 
-            self.engine
-                .batch_load_kv_blocks_multi_layer(
-                    &instance_id,
-                    tp_rank,
-                    device_id,
-                    &load_state_shm,
-                    &layer_refs,
-                    &loads,
-                )
-                .map_err(Self::map_engine_error)?;
+            if wait_for_completion {
+                if !load_state_shm.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "synchronous load must not include load_state_shm",
+                    ));
+                }
+                self.engine
+                    .batch_load_kv_blocks_multi_layer_inproc(
+                        &instance_id,
+                        tp_rank,
+                        device_id,
+                        &layer_refs,
+                        &loads,
+                    )
+                    .map_err(Self::map_engine_error)?
+                    .await
+                    .map_err(|_| Status::internal("load worker dropped completion"))?
+                    .map_err(Self::map_engine_error)?;
+            } else {
+                self.engine
+                    .batch_load_kv_blocks_multi_layer(
+                        &instance_id,
+                        tp_rank,
+                        device_id,
+                        &load_state_shm,
+                        &layer_refs,
+                        &loads,
+                    )
+                    .map_err(Self::map_engine_error)?;
+            }
 
             Ok(Response::new(LoadResponse {
                 status: Some(Self::build_simple_response()),
@@ -648,6 +668,16 @@ impl Engine for GrpcEngineService {
         }
         record_rpc_result("release", &result, start);
         result
+    }
+
+    async fn flush(
+        &self,
+        _request: Request<FlushRequest>,
+    ) -> Result<Response<FlushResponse>, Status> {
+        self.engine.flush_saves_and_registrations().await;
+        Ok(Response::new(FlushResponse {
+            status: Some(Self::build_simple_response()),
+        }))
     }
 
     async fn unregister_context(
@@ -958,110 +988,4 @@ impl Engine for GrpcEngineService {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::proto::engine::SaveLayer;
-    use tonic::Code;
-
-    #[test]
-    fn validate_query_prefetch_rejects_empty_req_id() {
-        let err = GrpcEngineService::validate_query_prefetch_request(&QueryRequest {
-            instance_id: "instance".to_string(),
-            block_hashes: Vec::new(),
-            req_id: String::new(),
-        })
-        .expect_err("empty req_id must be rejected before engine lookup");
-
-        assert_eq!(err.code(), Code::InvalidArgument);
-        assert!(err.message().contains("req_id"));
-    }
-
-    #[test]
-    fn validate_query_prefetch_allows_empty_hashes() {
-        GrpcEngineService::validate_query_prefetch_request(&QueryRequest {
-            instance_id: "instance".to_string(),
-            block_hashes: Vec::new(),
-            req_id: "request".to_string(),
-        })
-        .expect("empty block_hashes are a valid zero-hit query");
-    }
-
-    #[test]
-    fn validate_register_context_rejects_pure_argument_errors() {
-        let err = GrpcEngineService::validate_register_context_request(&RegisterContextRequest {
-            instance_id: "instance".to_string(),
-            namespace: "namespace".to_string(),
-            client_version: env!("CARGO_PKG_VERSION").to_string(),
-            tp_rank: 1,
-            tp_size: 1,
-            world_size: 1,
-            device_id: 0,
-            layer_names: Vec::new(),
-            wrapper_bytes: Vec::new(),
-            num_blocks: Vec::new(),
-            bytes_per_block: Vec::new(),
-            kv_stride_bytes: Vec::new(),
-            segments: Vec::new(),
-            pp_rank: 0,
-            transfer_mode: ProtoTransferMode::Direct as i32,
-            page_first: false,
-        })
-        .expect_err("tp_rank outside tp_size must be rejected at RPC boundary");
-
-        assert_eq!(err.code(), Code::InvalidArgument);
-        assert!(err.message().contains("tp_rank"));
-    }
-
-    #[test]
-    fn validate_register_context_rejects_client_version_mismatch() {
-        let err = GrpcEngineService::validate_register_context_request(&RegisterContextRequest {
-            instance_id: "instance".to_string(),
-            namespace: "namespace".to_string(),
-            client_version: "0.0.0-test-mismatch".to_string(),
-            tp_rank: 0,
-            tp_size: 1,
-            world_size: 1,
-            device_id: 0,
-            layer_names: Vec::new(),
-            wrapper_bytes: Vec::new(),
-            num_blocks: Vec::new(),
-            bytes_per_block: Vec::new(),
-            kv_stride_bytes: Vec::new(),
-            segments: Vec::new(),
-            pp_rank: 0,
-            transfer_mode: ProtoTransferMode::Direct as i32,
-            page_first: false,
-        })
-        .expect_err("client/server version mismatch must be rejected before registration");
-
-        assert_eq!(err.code(), Code::FailedPrecondition);
-        assert!(err.message().contains("PegaFlow version mismatch"));
-        assert!(err.message().contains("client=0.0.0-test-mismatch"));
-        assert!(
-            err.message()
-                .contains(concat!("server=", env!("CARGO_PKG_VERSION")))
-        );
-    }
-
-    #[test]
-    fn validate_save_layers_rejects_mismatched_block_shapes() {
-        let err = GrpcEngineService::validate_save_layers(&[SaveLayer {
-            layer_name: "layer_0".to_string(),
-            block_ids: vec![0, 1],
-            block_hashes: vec![vec![1]],
-        }])
-        .expect_err("service must reject malformed save shape");
-
-        assert_eq!(err.code(), Code::InvalidArgument);
-        assert!(err.message().contains("does not match"));
-    }
-
-    #[test]
-    fn validate_device_id_rejects_negative_values() {
-        let err = GrpcEngineService::validate_device_id(-1)
-            .expect_err("negative device_id must be rejected at RPC boundary");
-
-        assert_eq!(err.code(), Code::InvalidArgument);
-        assert!(err.message().contains("device_id"));
-    }
-}
+mod tests;

@@ -1,7 +1,10 @@
-use pyo3::exceptions::PyValueError;
+use cudarc::driver::{CudaContext, result::DriverError, sys};
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::collections::{HashMap, HashSet};
+use std::mem::MaybeUninit;
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone)]
@@ -11,22 +14,117 @@ pub struct TensorMetadata {
     pub device_id: i32,
 }
 
+pub(crate) enum TensorRegistration {
+    Python(Vec<u8>),
+    CudaIpc {
+        handle: Vec<u8>,
+        offset_bytes: u64,
+        size_bytes: u64,
+    },
+}
+
+#[allow(dead_code, reason = "owners keep registered CUDA addresses valid")]
+enum TensorOwner {
+    Python(Py<PyAny>),
+    CudaIpc(Arc<CudaIpcMapping>),
+}
+
 struct LayerTensor {
-    #[allow(
-        dead_code,
-        reason = "holding the Python tensor keeps CUDA IPC memory mapped"
-    )]
-    tensor: Py<PyAny>,
+    owner: TensorOwner,
     metadata: TensorMetadata,
 }
 
-// Note: No custom Drop impl needed for LayerTensor.
-// PyO3's Py<PyAny> will automatically:
-// 1. Acquire the GIL when dropped
-// 2. Decrement the Python object's reference count
-// 3. Let Python's garbage collector handle the actual cleanup
-// This is the correct way to release CUDA IPC tensors - the mapped memory
-// will be unmapped when the tensor's storage is garbage collected.
+struct CudaIpcMapping {
+    context: Arc<CudaContext>,
+    base_ptr: u64,
+    size_bytes: usize,
+}
+
+impl CudaIpcMapping {
+    fn open(device_id: i32, bytes: &[u8]) -> PyResult<Arc<Self>> {
+        if bytes.len() != std::mem::size_of::<sys::CUipcMemHandle>() {
+            return Err(PyValueError::new_err("invalid CUDA IPC handle size"));
+        }
+        let device = usize::try_from(device_id)
+            .map_err(|_| PyValueError::new_err("device_id must be non-negative"))?;
+        let context = CudaContext::new(device).map_err(|e| cuda_error("retain context", e))?;
+        context
+            .bind_to_thread()
+            .map_err(|e| cuda_error("bind context", e))?;
+
+        let mut handle = MaybeUninit::<sys::CUipcMemHandle>::uninit();
+        // SAFETY: the length check above covers the entire opaque handle.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                handle.as_mut_ptr().cast::<u8>(),
+                bytes.len(),
+            );
+        }
+        let mut base_ptr = 0;
+        // SAFETY: CUDA initializes base_ptr from the fully copied handle.
+        unsafe {
+            sys::cuIpcOpenMemHandle_v2(
+                &mut base_ptr,
+                handle.assume_init(),
+                sys::CUipcMem_flags::CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS as u32,
+            )
+            .result()
+            .map_err(|e| cuda_error("open CUDA IPC handle", e))?;
+        }
+        let mut mapping = Self {
+            context,
+            base_ptr,
+            size_bytes: 0,
+        };
+
+        let mut actual_device = -1i32;
+        // SAFETY: base_ptr is a live CUDA mapping and output storage is valid.
+        unsafe {
+            sys::cuPointerGetAttribute(
+                (&mut actual_device as *mut i32).cast(),
+                sys::CUpointer_attribute::CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
+                base_ptr,
+            )
+            .result()
+            .map_err(|e| cuda_error("query mapping device", e))?;
+        }
+        if actual_device != device_id {
+            return Err(PyValueError::new_err(format!(
+                "CUDA IPC allocation belongs to device {actual_device}, not {device_id}"
+            )));
+        }
+
+        let mut allocation_base = 0;
+        // SAFETY: base_ptr is a live CUDA mapping and output storage is valid.
+        unsafe {
+            sys::cuMemGetAddressRange_v2(&mut allocation_base, &mut mapping.size_bytes, base_ptr)
+                .result()
+                .map_err(|e| cuda_error("query mapping range", e))?;
+        }
+        if allocation_base != base_ptr {
+            return Err(PyRuntimeError::new_err(
+                "CUDA IPC mapping is not allocation-aligned",
+            ));
+        }
+        Ok(Arc::new(mapping))
+    }
+}
+
+impl Drop for CudaIpcMapping {
+    fn drop(&mut self) {
+        self.context
+            .bind_to_thread()
+            .expect("bind CUDA context before closing IPC mapping");
+        // SAFETY: this object owns one successful CUDA IPC open.
+        unsafe { sys::cuIpcCloseMemHandle(self.base_ptr).result() }
+            .expect("close CUDA IPC mapping");
+    }
+}
+
+fn cuda_error(operation: &str, error: DriverError) -> PyErr {
+    PyRuntimeError::new_err(format!("{operation}: {error}"))
+}
 
 struct ContextState {
     device_id: i32,
@@ -68,7 +166,7 @@ impl CudaTensorRegistry {
         &mut self,
         context_key: &str,
         device_id: i32,
-        layers: Vec<(String, Vec<u8>)>,
+        layers: Vec<(String, TensorRegistration)>,
     ) -> PyResult<Vec<TensorMetadata>> {
         if self.contexts.contains_key(context_key) {
             return Err(PyValueError::new_err(format!(
@@ -87,8 +185,24 @@ impl CudaTensorRegistry {
 
         let mut context = ContextState::new(device_id);
         let mut metadatas = Vec::with_capacity(layers.len());
-        for (layer_name, wrapper_bytes) in layers {
-            let layer_tensor = Self::materialize_tensor(device_id, &wrapper_bytes)?;
+        let mut mappings = HashMap::new();
+        for (layer_name, registration) in layers {
+            let layer_tensor = match registration {
+                TensorRegistration::Python(bytes) => {
+                    Self::materialize_python_tensor(device_id, &bytes)?
+                }
+                TensorRegistration::CudaIpc {
+                    handle,
+                    offset_bytes,
+                    size_bytes,
+                } => Self::materialize_cuda_ipc_tensor(
+                    device_id,
+                    handle,
+                    offset_bytes,
+                    size_bytes,
+                    &mut mappings,
+                )?,
+            };
             let metadata = layer_tensor.metadata.clone();
 
             if context.device_id != metadata.device_id {
@@ -150,26 +264,32 @@ impl CudaTensorRegistry {
             return 0;
         }
 
-        // Remove contexts under the GIL so each `Py<PyAny>` is dropped (decref)
-        // there, then force gc + empty_cache to actually unmap the CUDA IPC
-        // memory immediately instead of letting Python's GC defer it.
-        Python::attach(|py| {
-            for key in &keys {
-                self.contexts.remove(key);
-            }
+        let needs_python = keys
+            .iter()
+            .filter_map(|key| self.contexts.get(key))
+            .flat_map(|context| context.tensors.values())
+            .any(|tensor| matches!(&tensor.owner, TensorOwner::Python(_)));
+        let removed: Vec<_> = keys
+            .iter()
+            .filter_map(|key| self.contexts.remove(key))
+            .collect();
 
-            let gc = py.import("gc").expect("gc module");
-            let _ = gc.call_method0("collect");
+        if needs_python {
+            Python::attach(|py| {
+                drop(removed);
+                let gc = py.import("gc").expect("gc module");
+                let _ = gc.call_method0("collect");
 
-            let torch = py.import("torch").expect("torch module");
-            let cuda = torch.getattr("cuda").expect("torch.cuda");
-            let _ = cuda.call_method0("empty_cache");
-        });
+                let torch = py.import("torch").expect("torch module");
+                let cuda = torch.getattr("cuda").expect("torch.cuda");
+                let _ = cuda.call_method0("empty_cache");
+            });
+        }
 
         tensor_count
     }
 
-    fn materialize_tensor(device_id: i32, wrapper_bytes: &[u8]) -> PyResult<LayerTensor> {
+    fn materialize_python_tensor(device_id: i32, wrapper_bytes: &[u8]) -> PyResult<LayerTensor> {
         Python::attach(|py| {
             let torch = py.import("torch")?;
             let pickle = py.import("pickle")?;
@@ -192,13 +312,53 @@ impl CudaTensorRegistry {
             let tensor_owned = tensor.unbind();
 
             Ok(LayerTensor {
-                tensor: tensor_owned,
+                owner: TensorOwner::Python(tensor_owned),
                 metadata: TensorMetadata {
                     data_ptr,
                     size_bytes,
                     device_id: resolved_device,
                 },
             })
+        })
+    }
+
+    fn materialize_cuda_ipc_tensor(
+        device_id: i32,
+        handle: Vec<u8>,
+        offset_bytes: u64,
+        size_bytes: u64,
+        mappings: &mut HashMap<Vec<u8>, Arc<CudaIpcMapping>>,
+    ) -> PyResult<LayerTensor> {
+        let offset = usize::try_from(offset_bytes)
+            .map_err(|_| PyValueError::new_err("CUDA IPC offset does not fit usize"))?;
+        let size = usize::try_from(size_bytes)
+            .map_err(|_| PyValueError::new_err("CUDA IPC size does not fit usize"))?;
+        let mapping = if let Some(mapping) = mappings.get(&handle) {
+            Arc::clone(mapping)
+        } else {
+            let mapping = CudaIpcMapping::open(device_id, &handle)?;
+            mappings.insert(handle, Arc::clone(&mapping));
+            mapping
+        };
+        let end = offset
+            .checked_add(size)
+            .ok_or_else(|| PyValueError::new_err("CUDA IPC view range overflows usize"))?;
+        if size == 0 || end > mapping.size_bytes {
+            return Err(PyValueError::new_err(
+                "CUDA IPC view is outside its allocation",
+            ));
+        }
+        let data_ptr = mapping
+            .base_ptr
+            .checked_add(offset_bytes)
+            .ok_or_else(|| PyValueError::new_err("CUDA IPC view pointer overflows u64"))?;
+        Ok(LayerTensor {
+            owner: TensorOwner::CudaIpc(mapping),
+            metadata: TensorMetadata {
+                data_ptr,
+                size_bytes: size,
+                device_id,
+            },
         })
     }
 }
@@ -209,8 +369,7 @@ enum RegistryCommand {
     RegisterLayers {
         context_key: String,
         device_id: i32,
-        /// `(layer_name, wrapper_bytes)` for each layer in the batch.
-        layers: Vec<(String, Vec<u8>)>,
+        layers: Vec<(String, TensorRegistration)>,
         // The `PyErr` is stringified on the actor thread (which holds the GIL),
         // so callers never need to touch the GIL to read an error message.
         reply: oneshot::Sender<Result<Vec<TensorMetadata>, String>>,
@@ -263,11 +422,11 @@ impl RegistryHandle {
     /// respect to the registry: an existing context is rejected before any
     /// tensor is materialized, and a materialization failure does not publish a
     /// partial context.
-    pub async fn register_layers(
+    pub(crate) async fn register_layers(
         &self,
         context_key: String,
         device_id: i32,
-        layers: Vec<(String, Vec<u8>)>,
+        layers: Vec<(String, TensorRegistration)>,
     ) -> Result<Vec<TensorMetadata>, String> {
         let (reply, rx) = oneshot::channel();
         self.dispatch(RegistryCommand::RegisterLayers {

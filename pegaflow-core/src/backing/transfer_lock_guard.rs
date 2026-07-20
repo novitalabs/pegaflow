@@ -81,11 +81,12 @@ mod tests {
 
     use pegaflow_proto::proto::engine::engine_server::{Engine, EngineServer};
     use pegaflow_proto::proto::engine::{
-        HealthRequest, HealthResponse, LoadRequest, LoadResponse, QueryBlocksForTransferRequest,
-        QueryBlocksForTransferResponse, QueryRequest, QueryResponse, RdmaHandshakeRequest,
-        RdmaHandshakeResponse, RegisterContextRequest, RegisterContextResponse, ReleaseRequest,
-        ReleaseResponse, ReleaseTransferLockResponse, SaveRequest, SaveResponse, SessionEvent,
-        SessionRequest, ShutdownRequest, ShutdownResponse, UnregisterRequest, UnregisterResponse,
+        FlushRequest, FlushResponse, HealthRequest, HealthResponse, LoadRequest, LoadResponse,
+        QueryBlocksForTransferRequest, QueryBlocksForTransferResponse, QueryRequest, QueryResponse,
+        RdmaHandshakeRequest, RdmaHandshakeResponse, RegisterContextRequest,
+        RegisterContextResponse, ReleaseRequest, ReleaseResponse, ReleaseTransferLockResponse,
+        SaveRequest, SaveResponse, SessionEvent, SessionRequest, ShutdownRequest, ShutdownResponse,
+        UnregisterRequest, UnregisterResponse,
     };
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::Endpoint;
@@ -153,6 +154,12 @@ mod tests {
             &self,
             _request: Request<ReleaseRequest>,
         ) -> Result<Response<ReleaseResponse>, Status> {
+            Err(Status::unimplemented("stub"))
+        }
+        async fn flush(
+            &self,
+            _request: Request<FlushRequest>,
+        ) -> Result<Response<FlushResponse>, Status> {
             Err(Status::unimplemented("stub"))
         }
         async fn unregister_context(
