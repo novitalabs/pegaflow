@@ -1,6 +1,7 @@
+use log::warn;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict};
+use pyo3::types::PyBytes;
 use std::collections::{HashMap, HashSet};
 use tokio::sync::{mpsc, oneshot};
 
@@ -85,8 +86,6 @@ impl CudaTensorRegistry {
             }
         }
 
-        Self::activate_device(device_id)?;
-
         let mut context = ContextState::new(device_id);
         let mut metadatas = Vec::with_capacity(layers.len());
         for (layer_name, wrapper_bytes) in layers {
@@ -106,19 +105,6 @@ impl CudaTensorRegistry {
 
         self.contexts.insert(context_key.to_string(), context);
         Ok(metadatas)
-    }
-
-    fn activate_device(device_id: i32) -> PyResult<()> {
-        Python::attach(|py| {
-            let torch = py.import("torch")?;
-            let cuda = torch.getattr("cuda")?;
-            cuda.call_method1("set_device", (device_id,))?;
-
-            let kwargs = PyDict::new(py);
-            kwargs.set_item("device", format!("cuda:{device_id}"))?;
-            torch.call_method("empty", ([1],), Some(&kwargs))?;
-            Ok(())
-        })
     }
 
     fn drop_context(&mut self, context_key: &str) -> usize {
@@ -192,9 +178,27 @@ impl CudaTensorRegistry {
 
             cuda.call_method1("set_device", (device_id,))?;
 
-            let py_bytes = PyBytes::new(py, wrapper_bytes);
-            let wrapper = pickle.call_method1("loads", (py_bytes,))?;
-            let tensor = wrapper.call_method0("to_tensor")?;
+            let wrapper = pickle.call_method1("loads", (PyBytes::new(py, wrapper_bytes),))?;
+            let tensor = match wrapper.call_method0("to_tensor") {
+                Ok(tensor) => tensor,
+                Err(err) => {
+                    let message = err.value(py).to_string();
+                    if !message.contains("invalid device context")
+                        && !message.contains("cudaErrorDeviceUninitialized")
+                    {
+                        return Err(err);
+                    }
+
+                    warn!(
+                        "Retrying CUDA IPC tensor materialization after device context initialization failed: device={device_id}"
+                    );
+                    drop(wrapper);
+                    cuda.call_method1("set_device", (device_id,))?;
+                    let wrapper =
+                        pickle.call_method1("loads", (PyBytes::new(py, wrapper_bytes),))?;
+                    wrapper.call_method0("to_tensor")?
+                }
+            };
 
             let data_ptr: u64 = tensor.call_method0("data_ptr")?.extract()?;
             let device_attr = tensor.getattr("device")?;
