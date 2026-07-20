@@ -1,5 +1,6 @@
 use pegaflow_core::{trace_in_span, trace_root};
 
+use crate::lifecycle::InstanceCoordinator;
 use crate::metric::record_rpc_result;
 use crate::proto::engine::engine_server::Engine;
 use crate::proto::engine::{
@@ -12,7 +13,6 @@ use crate::proto::engine::{
     UnregisterRequest, UnregisterResponse, query_response,
 };
 use crate::registry::RegistryHandle;
-use crate::session::SessionRegistry;
 use log::{debug, info, warn};
 use pegaflow_core::{EngineError, LayerSave, PegaEngine, PrefetchStatus, QueryLeaseId};
 use std::sync::Arc;
@@ -27,7 +27,7 @@ pub struct GrpcEngineService {
     registry: RegistryHandle,
     shutdown: Arc<Notify>,
     hll_tracker: Arc<std::sync::Mutex<pegaflow_common::hll::MultiWindowHllTracker>>,
-    session_registry: Arc<SessionRegistry>,
+    instances: InstanceCoordinator,
 }
 
 impl GrpcEngineService {
@@ -42,33 +42,12 @@ impl GrpcEngineService {
             registry,
             shutdown,
             hll_tracker,
-            session_registry: SessionRegistry::new(),
+            instances: InstanceCoordinator::default(),
         }
     }
 
-    /// Drop CUDA IPC tensors and engine-side instance state for `instance_id`.
-    /// Idempotent — safe to call after the instance is already gone.
-    async fn cleanup_instance(
-        engine: &PegaEngine,
-        registry: &RegistryHandle,
-        instance_id: &str,
-        reason: &'static str,
-    ) {
-        let removed = registry.drop_instance(instance_id.to_string()).await;
-        if removed > 0 {
-            info!(
-                "Session cleanup ({}): dropped {} CUDA tensors for instance {}",
-                reason, removed, instance_id
-            );
-        }
-        if let Err(err) = engine.unregister_instance(instance_id) {
-            // `InstanceMissing` is normal if the instance was never registered
-            // (vllm died before any register_context_batch). Log at debug.
-            debug!(
-                "Session cleanup ({}): engine.unregister_instance({}) returned {}",
-                reason, instance_id, err
-            );
-        }
+    pub fn instance_coordinator(&self) -> InstanceCoordinator {
+        self.instances.clone()
     }
 
     fn context_key(instance_id: &str, tp_rank: u32, pp_rank: u32, device_id: i32) -> String {
@@ -274,6 +253,8 @@ impl Engine for GrpcEngineService {
             let pp_rank = Self::usize_from_u32(req.pp_rank, "pp_rank")?;
             let tp_size = Self::usize_from_u32(req.tp_size, "tp_size")?;
             let world_size = Self::usize_from_u32(req.world_size, "world_size")?;
+
+            let _registration = self.instances.registration().await;
 
             // Materialize tensors and collect data_ptr/size_bytes
             let context_key =
@@ -658,17 +639,26 @@ impl Engine for GrpcEngineService {
         let result: Result<Response<UnregisterResponse>, Status> = async {
             let req = request.into_inner();
             debug!("RPC [unregister_context]: instance_id={}", req.instance_id);
-            let removed = self.registry.drop_instance(req.instance_id.clone()).await;
-            if removed > 0 {
+            let cleanup = self
+                .instances
+                .cleanup_instance(
+                    Arc::clone(&self.engine),
+                    self.registry.clone(),
+                    req.instance_id.clone(),
+                )
+                .await
+                .map_err(Self::map_engine_error)?;
+            if cleanup.removed_tensors > 0 {
                 info!(
                     "Dropped {} CUDA tensors for instance {}",
-                    removed, req.instance_id
+                    cleanup.removed_tensors, req.instance_id
                 );
             }
-
-            self.engine
-                .unregister_instance(&req.instance_id)
-                .map_err(Self::map_engine_error)?;
+            if !cleanup.engine_found {
+                return Err(Self::map_engine_error(EngineError::InstanceMissing(
+                    req.instance_id,
+                )));
+            }
 
             Ok(Response::new(UnregisterResponse {
                 status: Some(Self::build_simple_response()),
@@ -909,12 +899,15 @@ impl Engine for GrpcEngineService {
             return Err(Status::invalid_argument("instance_id must not be empty"));
         }
 
-        let token = self.session_registry.install(
-            instance_id.clone(),
-            req.namespace.clone(),
-            req.tp_size,
-            req.world_size,
-        );
+        let token = self
+            .instances
+            .open_session(
+                instance_id.clone(),
+                req.namespace.clone(),
+                req.tp_size,
+                req.world_size,
+            )
+            .await;
         info!(
             "Session opened: instance_id={} namespace={} tp_size={} world_size={} token={}",
             instance_id, req.namespace, req.tp_size, req.world_size, token
@@ -931,25 +924,31 @@ impl Engine for GrpcEngineService {
         // `rx` are dropped → `cleanup_tx.closed()` resolves.
         let cleanup_tx = tx.clone();
 
-        let session_registry = Arc::clone(&self.session_registry);
         let engine = Arc::clone(&self.engine);
         let cuda_registry = self.registry.clone();
+        let instances = self.instances.clone();
         let id_for_watcher = instance_id.clone();
 
         tokio::spawn(async move {
             cleanup_tx.closed().await;
-            if session_registry.take(&id_for_watcher, token) {
-                info!(
-                    "Session closed: instance_id={} token={} — running cleanup",
-                    id_for_watcher, token
-                );
-                Self::cleanup_instance(&engine, &cuda_registry, &id_for_watcher, "stream closed")
-                    .await;
-            } else {
-                debug!(
+            match instances
+                .cleanup_session(engine, cuda_registry, id_for_watcher.clone(), token)
+                .await
+            {
+                Ok(Some(removed)) => {
+                    info!(
+                        "Session closed: instance_id={} token={} — cleanup removed {} CUDA tensors",
+                        id_for_watcher, token, removed
+                    );
+                }
+                Ok(None) => debug!(
                     "Session closed: instance_id={} token={} superseded — skip cleanup",
                     id_for_watcher, token
-                );
+                ),
+                Err(err) => warn!(
+                    "Session cleanup failed: instance_id={} token={} error={}",
+                    id_for_watcher, token, err
+                ),
             }
         });
 

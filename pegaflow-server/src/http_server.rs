@@ -10,12 +10,14 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 
+use crate::lifecycle::InstanceCoordinator;
 use crate::registry::RegistryHandle;
 
 #[derive(Clone)]
 struct AppState {
     engine: Arc<PegaEngine>,
     registry: RegistryHandle,
+    instances: InstanceCoordinator,
     prometheus_registry: Option<Registry>,
 }
 
@@ -82,8 +84,10 @@ async fn cleanup_handler(
 ) -> impl IntoResponse {
     match query.id {
         None => {
-            let removed_tensors = state.registry.clear().await;
-            let removed_instances = state.engine.unregister_all_instances();
+            let (removed_instances, removed_tensors) = state
+                .instances
+                .cleanup_all(Arc::clone(&state.engine), state.registry.clone())
+                .await;
 
             if !removed_instances.is_empty() || removed_tensors > 0 {
                 warn!(
@@ -104,23 +108,40 @@ async fn cleanup_handler(
             )
         }
         Some(instance_id) => {
-            let removed_tensors = state.registry.drop_instance(instance_id.clone()).await;
-            match state.engine.unregister_instance(&instance_id) {
-                Ok(()) => {
+            match state
+                .instances
+                .cleanup_instance(
+                    Arc::clone(&state.engine),
+                    state.registry.clone(),
+                    instance_id.clone(),
+                )
+                .await
+            {
+                Ok(cleanup) if cleanup.engine_found => {
                     warn!(
                         "Cleanup instance {}: {} CUDA tensor(s) released",
-                        instance_id, removed_tensors
+                        instance_id, cleanup.removed_tensors
                     );
-                    cleanup_ok_response(instance_id, removed_tensors)
+                    cleanup_ok_response(instance_id, cleanup.removed_tensors)
                 }
-                Err(_) if removed_tensors > 0 => {
-                    warn!(
-                        "Instance {} not in engine but cleaned {} CUDA tensor(s)",
-                        instance_id, removed_tensors
-                    );
-                    cleanup_ok_response(instance_id, removed_tensors)
+                Ok(cleanup) => {
+                    if cleanup.removed_tensors == 0 {
+                        (
+                            StatusCode::NOT_FOUND,
+                            format!("instance {instance_id} not found").into_response(),
+                        )
+                    } else {
+                        warn!(
+                            "Instance {} not in engine but cleaned {} CUDA tensor(s)",
+                            instance_id, cleanup.removed_tensors
+                        );
+                        cleanup_ok_response(instance_id, cleanup.removed_tensors)
+                    }
                 }
-                Err(e) => (StatusCode::NOT_FOUND, format!("{e}").into_response()),
+                Err(err) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to clean instance {instance_id}: {err}").into_response(),
+                ),
             }
         }
     }
@@ -160,6 +181,7 @@ pub async fn start_http_server(
     addr: std::net::SocketAddr,
     engine: Arc<PegaEngine>,
     registry: RegistryHandle,
+    instances: InstanceCoordinator,
     enable_prometheus: bool,
     prometheus_registry: Option<Registry>,
     shutdown: Arc<Notify>,
@@ -169,6 +191,7 @@ pub async fn start_http_server(
     let state = AppState {
         engine,
         registry,
+        instances,
         prometheus_registry: if enable_prometheus {
             prometheus_registry
         } else {

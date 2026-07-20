@@ -448,3 +448,21 @@ fn seal_rejects_inconsistent_layer_geometry() {
         .expect_err("same name with different geometry must fail the seal");
     assert!(err.to_string().contains("inconsistent geometry"));
 }
+
+#[tokio::test]
+async fn concurrent_close_waits_for_one_shared_drain() {
+    let instance =
+        Arc::new(InstanceContext::new("closing".into(), "namespace".into(), 1, 1, false).unwrap());
+    let first = {
+        let instance = Arc::clone(&instance);
+        tokio::spawn(async move { instance.close_and_drain().await })
+    };
+    let second = {
+        let instance = Arc::clone(&instance);
+        tokio::spawn(async move { instance.close_and_drain().await })
+    };
+
+    first.await.unwrap();
+    second.await.unwrap();
+    assert!(instance.ensure_open().is_err());
+}

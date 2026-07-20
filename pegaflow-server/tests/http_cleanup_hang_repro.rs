@@ -278,6 +278,7 @@ fn start_cluster(worker_threads: usize) -> TestCluster {
         Arc::clone(&shutdown),
         hll_tracker,
     );
+    let instance_coordinator = service.instance_coordinator();
     rt.spawn(async move {
         Server::builder()
             .add_service(EngineServer::new(service))
@@ -291,6 +292,7 @@ fn start_cluster(worker_threads: usize) -> TestCluster {
             http_addr,
             Arc::clone(&engine),
             registry.clone(),
+            instance_coordinator,
             true,
             Some(Registry::new()),
             Arc::clone(&shutdown),

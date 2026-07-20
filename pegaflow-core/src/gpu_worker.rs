@@ -3,6 +3,7 @@ use std::sync::{Arc, mpsc as std_mpsc};
 use cudarc::driver::{CudaContext, CudaStream};
 use log::{debug, error, info, warn};
 use logforth::diagnostic::ThreadLocalDiagnostic;
+use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::EngineError;
@@ -112,11 +113,38 @@ pub(crate) struct SaveTask {
     pub trace_ctx: Option<::fastrace::prelude::SpanContext>,
 }
 
+enum LoadCommand {
+    Run(LoadTask),
+    Drain(oneshot::Sender<()>),
+}
+
+enum SaveCommand {
+    Run(SaveTask),
+    Drain(oneshot::Sender<()>),
+}
+
+pub(crate) struct WorkerDrain {
+    load: oneshot::Receiver<()>,
+    save: oneshot::Receiver<()>,
+}
+
+impl WorkerDrain {
+    pub(crate) async fn wait(self) {
+        self.load
+            .await
+            .unwrap_or_else(|_| panic!("load worker exited before acknowledging drain barrier"));
+        self.save
+            .await
+            .unwrap_or_else(|_| panic!("save worker exited before acknowledging drain barrier"));
+    }
+}
+
 /// Per-GPU worker pool with dedicated load and save threads
 pub(crate) struct GpuWorkerPool {
     device_id: i32,
-    load_tx: mpsc::UnboundedSender<LoadTask>,
-    save_tx: mpsc::UnboundedSender<SaveTask>,
+    load_tx: mpsc::UnboundedSender<LoadCommand>,
+    save_tx: mpsc::UnboundedSender<SaveCommand>,
+    closed: Mutex<bool>,
 }
 
 impl GpuWorkerPool {
@@ -197,12 +225,20 @@ impl GpuWorkerPool {
             device_id,
             load_tx,
             save_tx,
+            closed: Mutex::new(false),
         })
     }
 
     /// Submit a load task (CPU -> GPU) - fire and forget
     pub(crate) fn submit_load(&self, task: LoadTask) -> Result<(), EngineError> {
-        self.load_tx.send(task).map_err(|_| {
+        let closed = self.closed.lock();
+        if *closed {
+            return Err(EngineError::Storage(format!(
+                "GPU worker pool is closing for device {}",
+                self.device_id
+            )));
+        }
+        self.load_tx.send(LoadCommand::Run(task)).map_err(|_| {
             EngineError::Storage(format!(
                 "Load worker channel closed for device {}",
                 self.device_id
@@ -225,12 +261,21 @@ impl GpuWorkerPool {
             trace_ctx: ::fastrace::prelude::SpanContext::current_local_parent(),
         };
 
-        self.save_tx.send(task).map_err(|_| {
-            EngineError::Storage(format!(
-                "Save worker channel closed for device {}",
-                self.device_id
-            ))
-        })?;
+        {
+            let closed = self.closed.lock();
+            if *closed {
+                return Err(EngineError::Storage(format!(
+                    "GPU worker pool is closing for device {}",
+                    self.device_id
+                )));
+            }
+            self.save_tx.send(SaveCommand::Run(task)).map_err(|_| {
+                EngineError::Storage(format!(
+                    "Save worker channel closed for device {}",
+                    self.device_id
+                ))
+            })?;
+        }
 
         // Await the result (this is async, won't block tokio runtime)
         reply_rx.await.map_err(|_| {
@@ -239,6 +284,31 @@ impl GpuWorkerPool {
                 self.device_id
             ))
         })?
+    }
+
+    /// Reject new transfers and place one barrier behind every transfer that
+    /// was accepted before this call.
+    pub(crate) fn close_and_drain(&self) -> WorkerDrain {
+        let mut closed = self.closed.lock();
+        assert!(!*closed, "GPU worker pool closed twice");
+        *closed = true;
+
+        let (load_tx, load_rx) = oneshot::channel();
+        let (save_tx, save_rx) = oneshot::channel();
+        let load_send = self.load_tx.send(LoadCommand::Drain(load_tx));
+        let save_send = self.save_tx.send(SaveCommand::Drain(save_tx));
+        assert!(
+            load_send.is_ok(),
+            "load worker exited before accepting drain barrier"
+        );
+        assert!(
+            save_send.is_ok(),
+            "save worker exited before accepting drain barrier"
+        );
+        WorkerDrain {
+            load: load_rx,
+            save: save_rx,
+        }
     }
 }
 
@@ -300,18 +370,28 @@ fn init_worker(device_id: i32, transfer_mode: TransferMode) -> Result<WorkerRunt
 /// Load worker thread main loop
 fn load_worker_loop(
     device_id: i32,
-    mut rx: mpsc::UnboundedReceiver<LoadTask>,
+    mut rx: mpsc::UnboundedReceiver<LoadCommand>,
     runtime: WorkerRuntime,
 ) {
-    while let Some(task) = rx.blocking_recv() {
-        let LoadTask { layers, completion } = task;
-        let result = process_load_task(&layers, &runtime.stream, runtime.backend.as_ref());
+    while let Some(command) = rx.blocking_recv() {
+        match command {
+            LoadCommand::Run(task) => {
+                let LoadTask { layers, completion } = task;
+                let result = process_load_task(&layers, &runtime.stream, runtime.backend.as_ref());
 
-        if let Err(ref e) = result {
-            error!("Load task failed: device={device_id} error={e:?}");
-            core_metrics().load_failures.add(1, &[]);
+                if let Err(ref e) = result {
+                    error!("Load task failed: device={device_id} error={e:?}");
+                    core_metrics().load_failures.add(1, &[]);
+                }
+                completion.signal(result);
+            }
+            LoadCommand::Drain(done) => {
+                runtime.stream.synchronize().unwrap_or_else(|err| {
+                    panic!("load stream drain failed for device {device_id}: {err:?}")
+                });
+                let _ = done.send(());
+            }
         }
-        completion.signal(result);
     }
 
     info!("Load worker shutting down: device={}", device_id);
@@ -320,25 +400,35 @@ fn load_worker_loop(
 /// Save worker thread main loop
 fn save_worker_loop(
     device_id: i32,
-    mut rx: mpsc::UnboundedReceiver<SaveTask>,
+    mut rx: mpsc::UnboundedReceiver<SaveCommand>,
     runtime: WorkerRuntime,
 ) {
-    while let Some(task) = rx.blocking_recv() {
-        let SaveTask {
-            layers,
-            reply,
-            #[cfg(feature = "tracing")]
-            trace_ctx,
-        } = task;
-        let result = process_save_task(
-            &layers,
-            &runtime.stream,
-            runtime.backend.as_ref(),
-            #[cfg(feature = "tracing")]
-            trace_ctx,
-        )
-        .map(|()| layers);
-        let _ = reply.send(result);
+    while let Some(command) = rx.blocking_recv() {
+        match command {
+            SaveCommand::Run(task) => {
+                let SaveTask {
+                    layers,
+                    reply,
+                    #[cfg(feature = "tracing")]
+                    trace_ctx,
+                } = task;
+                let result = process_save_task(
+                    &layers,
+                    &runtime.stream,
+                    runtime.backend.as_ref(),
+                    #[cfg(feature = "tracing")]
+                    trace_ctx,
+                )
+                .map(|()| layers);
+                let _ = reply.send(result);
+            }
+            SaveCommand::Drain(done) => {
+                runtime.stream.synchronize().unwrap_or_else(|err| {
+                    panic!("save stream drain failed for device {device_id}: {err:?}")
+                });
+                let _ = done.send(());
+            }
+        }
     }
 
     info!("Save worker shutting down: device={}", device_id);
@@ -414,6 +504,46 @@ fn build_copy_descs(layers: &[LayerTransferData]) -> Result<(Vec<CopyDesc>, usiz
     Ok((copies, total_bytes))
 }
 
+fn wait_for_transfer(
+    stream: &Arc<CudaStream>,
+    submitted: Result<(), String>,
+) -> Result<(), EngineError> {
+    if let Err(submit_error) = submitted {
+        stream.synchronize().map_err(|sync_error| {
+            EngineError::Storage(format!(
+                "Failed to synchronize after transfer submission error ({submit_error}): {sync_error:?}"
+            ))
+        })?;
+        return Err(EngineError::Storage(submit_error));
+    }
+
+    match stream.record_event(None) {
+        Ok(event) => match event.synchronize() {
+            Ok(()) => Ok(()),
+            Err(event_error) => {
+                stream.synchronize().map_err(|stream_error| {
+                    EngineError::Storage(format!(
+                        "Event synchronization failed ({event_error:?}); stream synchronization also failed: {stream_error:?}"
+                    ))
+                })?;
+                Err(EngineError::Storage(format!(
+                    "Failed to synchronize event: {event_error:?}"
+                )))
+            }
+        },
+        Err(record_error) => {
+            stream.synchronize().map_err(|sync_error| {
+                EngineError::Storage(format!(
+                    "Failed to synchronize after event record failure ({record_error:?}): {sync_error:?}"
+                ))
+            })?;
+            Err(EngineError::Storage(format!(
+                "Failed to record event: {record_error:?}"
+            )))
+        }
+    }
+}
+
 /// Process a load task: copy blocks from CPU pinned memory to GPU for multiple
 /// layers. All layers and segments are collected into one descriptor batch,
 /// handed to a single backend (memcpy or kernel), then synchronized once.
@@ -430,15 +560,7 @@ fn process_load_task(
 
     let (copies, total_bytes) = build_copy_descs(layers)?;
 
-    backend.h2d(&copies, stream).map_err(EngineError::Storage)?;
-
-    // Wait for all transfers to complete
-    let event = stream
-        .record_event(None)
-        .map_err(|e| EngineError::Storage(format!("Failed to record event: {e:?}")))?;
-    event
-        .synchronize()
-        .map_err(|e| EngineError::Storage(format!("Failed to synchronize: {e:?}")))?;
+    wait_for_transfer(stream, backend.h2d(&copies, stream))?;
 
     let elapsed = start.elapsed();
     let bandwidth_gbps = if elapsed.as_secs_f64() > 0.0 {
@@ -483,15 +605,7 @@ fn process_save_task(
 
     let (copies, total_bytes) = build_copy_descs(layers)?;
 
-    backend.d2h(&copies, stream).map_err(EngineError::Storage)?;
-
-    // Single synchronization for all layers
-    let event = stream
-        .record_event(None)
-        .map_err(|e| EngineError::Storage(format!("Failed to record event: {e:?}")))?;
-    event
-        .synchronize()
-        .map_err(|e| EngineError::Storage(format!("Failed to synchronize: {e:?}")))?;
+    wait_for_transfer(stream, backend.d2h(&copies, stream))?;
 
     let elapsed = start.elapsed();
     let bandwidth_gbps = if elapsed.as_secs_f64() > 0.0 {

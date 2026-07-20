@@ -63,6 +63,14 @@ impl SessionRegistry {
             .map(|entry| entry.topology.clone())
     }
 
+    pub(crate) fn remove(&self, instance_id: &str) {
+        self.sessions.remove(instance_id);
+    }
+
+    pub(crate) fn clear(&self) {
+        self.sessions.clear();
+    }
+
     /// CAS-remove: only removes if `token` is still the current one.
     /// Returns true if this caller owns the cleanup.
     pub fn take(&self, instance_id: &str, token: u64) -> bool {

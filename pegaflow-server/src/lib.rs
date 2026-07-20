@@ -1,5 +1,6 @@
 mod check_cuda_version;
 pub mod http_server;
+pub mod lifecycle;
 pub mod metric;
 pub mod proto;
 pub mod registry;
@@ -608,6 +609,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             Arc::clone(&shutdown),
             Arc::clone(&hll_tracker),
         );
+        let instance_coordinator = service.instance_coordinator();
 
         // Spawn background GC task for stale inflight blocks and expired transfer locks
         {
@@ -653,6 +655,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             cli.http_addr,
             Arc::clone(&engine),
             registry,
+            instance_coordinator,
             cli.enable_prometheus,
             metrics_state.prometheus_registry.clone(),
             Arc::clone(&shutdown),

@@ -31,10 +31,18 @@ use std::{
 
 use cudarc::driver::CudaContext;
 use log::info;
+use tokio::sync::Notify;
 
 use crate::layout::KVCacheLayout;
 use crate::{EngineError, TransferMode, gpu_worker::GpuWorkerPool};
 use pegaflow_common::NumaNode;
+
+#[derive(PartialEq, Eq)]
+enum InstanceLifecycle {
+    Open,
+    Draining,
+    Drained,
+}
 
 /// Registration state protected by a single mutex.
 struct RegistrationState {
@@ -43,6 +51,8 @@ struct RegistrationState {
 
     /// Sealed layer-id space. `None` while workers are still registering.
     topology: Option<Arc<LayerTopology>>,
+
+    lifecycle: InstanceLifecycle,
 }
 
 /// Dense layer-id space sealed from the union of registered layers.
@@ -347,6 +357,10 @@ pub struct InstanceContext {
 
     /// Registration state and GPU contexts protected by a single mutex.
     state: Mutex<RegistrationState>,
+
+    /// Wakes concurrent unregister callers after the elected closer drains all
+    /// GPU queues.
+    drain_complete: Notify,
 }
 
 impl InstanceContext {
@@ -374,8 +388,32 @@ impl InstanceContext {
             state: Mutex::new(RegistrationState {
                 gpu_contexts: HashMap::new(),
                 topology: None,
+                lifecycle: InstanceLifecycle::Open,
             }),
+            drain_complete: Notify::new(),
         })
+    }
+
+    /// Reject new work after unregister has started.
+    pub(crate) fn ensure_open(&self) -> Result<(), EngineError> {
+        if self.state.lock().lifecycle != InstanceLifecycle::Open {
+            return Err(EngineError::InvalidArgument(format!(
+                "instance {} is closing",
+                self.id
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn run_if_open<T>(&self, operation: impl FnOnce() -> T) -> Result<T, EngineError> {
+        let state = self.state.lock();
+        if state.lifecycle != InstanceLifecycle::Open {
+            return Err(EngineError::InvalidArgument(format!(
+                "instance {} is closing",
+                self.id
+            )));
+        }
+        Ok(operation())
     }
 
     /// Access the sealed layer topology.
@@ -400,6 +438,12 @@ impl InstanceContext {
         state: &RegistrationState,
         device_id: i32,
     ) -> Result<(), EngineError> {
+        if state.lifecycle != InstanceLifecycle::Open {
+            return Err(EngineError::InvalidArgument(format!(
+                "instance {} is closing",
+                self.id
+            )));
+        }
         // Check the duplicate device first: a restarted worker re-registering
         // against a stale sealed instance should hear "device already exists"
         // (the instance must be unregistered first), not a generic "fully
@@ -589,6 +633,51 @@ impl InstanceContext {
     pub(crate) fn get_gpu(&self, device_id: i32) -> Option<Arc<GpuContext>> {
         let state = self.state.lock();
         state.gpu_contexts.get(&device_id).cloned()
+    }
+
+    /// Reject new transfers and queue a barrier after every accepted task.
+    pub(crate) fn begin_close(&self) -> Option<Vec<crate::gpu_worker::WorkerDrain>> {
+        let mut state = self.state.lock();
+        match state.lifecycle {
+            InstanceLifecycle::Drained | InstanceLifecycle::Draining => None,
+            InstanceLifecycle::Open => {
+                state.lifecycle = InstanceLifecycle::Draining;
+                Some(
+                    state
+                        .gpu_contexts
+                        .values()
+                        .map(|gpu| gpu.worker_pool().close_and_drain())
+                        .collect(),
+                )
+            }
+        }
+    }
+
+    /// Wait for this instance's elected drain, or for the caller that elected
+    /// it to publish completion.
+    pub(crate) async fn finish_close(&self, drains: Option<Vec<crate::gpu_worker::WorkerDrain>>) {
+        if let Some(drains) = drains {
+            for drain in drains {
+                drain.wait().await;
+            }
+            self.state.lock().lifecycle = InstanceLifecycle::Drained;
+            self.drain_complete.notify_waiters();
+            return;
+        }
+
+        loop {
+            let notified = self.drain_complete.notified();
+            if self.state.lock().lifecycle == InstanceLifecycle::Drained {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn close_and_drain(&self) {
+        let drains = self.begin_close();
+        self.finish_close(drains).await;
     }
 
     /// Get a GPU context and verify it belongs to the requested save group.

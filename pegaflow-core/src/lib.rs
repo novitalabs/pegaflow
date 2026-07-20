@@ -28,6 +28,7 @@ mod seal_offload;
 mod storage;
 pub mod sync_state;
 pub mod transfer;
+mod unregister;
 
 pub use backing::{
     DEFAULT_SSD_PREFETCH_INFLIGHT, DEFAULT_SSD_PREFETCH_QUEUE_DEPTH, DEFAULT_SSD_WRITE_INFLIGHT,
@@ -127,7 +128,7 @@ pub struct PegaEngine {
     /// GPU-NUMA topology for memory allocation decisions.
     topology: Arc<NumaTopology>,
     /// Query-ready blocks owned by opaque scheduler leases.
-    query_leases: QueryLeaseManager,
+    query_leases: Arc<QueryLeaseManager>,
 }
 
 impl PegaEngine {
@@ -171,7 +172,7 @@ impl PegaEngine {
             instances: Arc::new(RwLock::new(HashMap::new())),
             storage,
             topology,
-            query_leases: QueryLeaseManager::default(),
+            query_leases: Arc::new(QueryLeaseManager::default()),
         })
     }
 
@@ -220,10 +221,12 @@ impl PegaEngine {
     /// Look up an instance by ID.
     fn get_instance(&self, instance_id: &str) -> Result<Arc<InstanceContext>, EngineError> {
         let instances = self.instances.read().expect("instances read lock poisoned");
-        instances
+        let instance = instances
             .get(instance_id)
             .cloned()
-            .ok_or_else(|| EngineError::InstanceMissing(instance_id.to_string()))
+            .ok_or_else(|| EngineError::InstanceMissing(instance_id.to_string()))?;
+        instance.ensure_open()?;
+        Ok(instance)
     }
 
     /// Batch register multiple KV cache layers for a single GPU.
@@ -419,40 +422,6 @@ impl PegaEngine {
         Ok(())
     }
 
-    /// Unregister an instance and release all associated resources.
-    pub fn unregister_instance(&self, instance_id: &str) -> Result<(), EngineError> {
-        let removed = self
-            .instances
-            .write()
-            .expect("instances write lock poisoned")
-            .remove(instance_id);
-
-        if removed.is_none() {
-            return Err(EngineError::InstanceMissing(instance_id.to_string()));
-        }
-        self.query_leases.release_instance(instance_id);
-        info!("Unregistered instance: {}", instance_id);
-        Ok(())
-    }
-
-    /// Unregister all instances, returning the IDs that were removed.
-    pub fn unregister_all_instances(&self) -> Vec<String> {
-        let mut instances = self
-            .instances
-            .write()
-            .expect("instances write lock poisoned");
-        let ids: Vec<String> = instances.keys().cloned().collect();
-        instances.clear();
-        drop(instances);
-        for id in &ids {
-            self.query_leases.release_instance(id);
-        }
-        if !ids.is_empty() {
-            info!("Unregistered all instances: {:?}", ids);
-        }
-        ids
-    }
-
     /// List all registered instance IDs.
     pub fn list_instance_ids(&self) -> Vec<String> {
         self.instances
@@ -518,9 +487,10 @@ impl PegaEngine {
                 "query lease requires at least one block".to_string(),
             ));
         }
-        Ok(self
-            .query_leases
-            .create(instance_id, blocks, instance.world_size()))
+        instance.run_if_open(|| {
+            self.query_leases
+                .create(instance_id, blocks, instance.world_size())
+        })
     }
 
     /// Release a query lease. Returns false when the lease is unknown or expired.
@@ -901,6 +871,71 @@ impl PegaEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn canceled_drained_unregister_finishes_owned_cleanup() {
+        let engine = Arc::new(
+            PegaEngine::new_with_config(1 << 20, false, storage::StorageConfig::default())
+                .expect("create engine"),
+        );
+        let instance = engine
+            .get_or_create_instance("cancel-cleanup", "namespace", 1, 1, false)
+            .expect("create instance");
+        let elected = instance.begin_close().expect("elect test drain");
+
+        let caller = {
+            let engine = Arc::clone(&engine);
+            tokio::spawn(async move { engine.unregister_instance_drained("cancel-cleanup").await })
+        };
+        while Arc::strong_count(&instance) < 3 {
+            tokio::task::yield_now().await;
+        }
+        caller.abort();
+        let _ = caller.await;
+
+        instance.finish_close(Some(elected)).await;
+        for _ in 0..100 {
+            if engine.list_instance_ids().is_empty() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("owned cleanup did not remove the drained instance");
+    }
+
+    #[test]
+    fn stale_unregister_cannot_release_new_generation_lease() {
+        let engine = PegaEngine::new_with_config(1 << 20, false, storage::StorageConfig::default())
+            .expect("create engine");
+        let old = engine
+            .get_or_create_instance("reused", "old", 1, 1, false)
+            .expect("create old generation");
+
+        engine
+            .unregister_instance("reused")
+            .expect("remove old generation");
+        assert!(old.run_if_open(|| ()).is_err());
+
+        engine
+            .get_or_create_instance("reused", "new", 1, 1, false)
+            .expect("create new generation");
+        let lease = engine
+            .create_query_lease(
+                "reused",
+                vec![Arc::new(SealedBlock::from_slots(Vec::new()))],
+            )
+            .expect("create new generation lease");
+
+        let mut instances = engine.instances.write().expect("instances lock");
+        assert!(!unregister::remove_generation(
+            &mut instances,
+            &engine.query_leases,
+            "reused",
+            &old,
+        ));
+        drop(instances);
+        assert!(engine.release_query_lease(&lease));
+    }
 
     #[cfg(feature = "rdma")]
     #[test]
