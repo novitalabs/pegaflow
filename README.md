@@ -98,6 +98,7 @@ The warm-start path achieves **~9x faster TTFT** compared to cold-start, demonst
 ## Documentation
 
 - [Server Configuration](./docs/server.md) — full CLI options, SSD cache, multi-node setup
+- [P/D with NIXL](./docs/deployment.md) — GLM-5.2 FP8 deployment with MTP and MultiConnector
 - [Python Package](./python/README.md) — Python bindings and vLLM connector configuration
 - [P2P KV Cache Sharing](./docs/p2p.md) — cross-node RDMA setup, tuning, and troubleshooting
 - [P/D Router](./docs/pd.md) — prefill/decode disaggregation
