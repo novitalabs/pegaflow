@@ -7,14 +7,21 @@ handles P-to-D transfer; PegaFlow uses `read_write` on P and `save_only` on D
 to reuse KV produced by earlier requests without competing with NIXL loads.
 
 Run one PegaFlow server beside each vLLM instance, backed by the same metaserver,
-and use a P/D-aware NIXL router. P and D must use compatible model, tokenizer,
-block size, KV dtype, KV layout, and `PYTHONHASHSEED`. The example uses seed 42
-and a local PegaFlow server at `http://127.0.0.1:50055`.
+and use a P/D-aware NIXL router. Configure each server's routable `--addr`,
+`--nics`, and `--metaserver-addr` as described in the [P2P guide](./p2p.md).
+P and D must use compatible model, tokenizer, block size, KV dtype, KV layout,
+and `PYTHONHASHSEED`.
+
+The commands use the documentation addresses `192.0.2.10` for P and
+`192.0.2.11` for D; replace them with addresses assigned to the target nodes.
+The distinct NIXL ports also avoid a collision if P and D are colocated.
 
 ### Prefill
 
 ```bash
 PYTHONHASHSEED=42 \
+VLLM_NIXL_SIDE_CHANNEL_HOST=192.0.2.10 \
+VLLM_NIXL_SIDE_CHANNEL_PORT=5600 \
 vllm serve GLM-5.2-FP8 \
   --served-model-name glm-5.2 \
   --host 0.0.0.0 \
@@ -40,7 +47,7 @@ vllm serve GLM-5.2-FP8 \
           "kv_role": "kv_both",
           "kv_connector_module_path": "pegaflow.connector",
           "kv_connector_extra_config": {
-            "pegaflow.host": "http://127.0.0.1",
+            "pegaflow.host": "http://192.0.2.10",
             "pegaflow.port": 50055,
             "pegaflow.mode": "read_write"
           }
@@ -54,6 +61,8 @@ vllm serve GLM-5.2-FP8 \
 
 ```bash
 PYTHONHASHSEED=42 \
+VLLM_NIXL_SIDE_CHANNEL_HOST=192.0.2.11 \
+VLLM_NIXL_SIDE_CHANNEL_PORT=5601 \
 vllm serve GLM-5.2-FP8 \
   --served-model-name glm-5.2 \
   --host 0.0.0.0 \
@@ -82,7 +91,7 @@ vllm serve GLM-5.2-FP8 \
           "kv_role": "kv_both",
           "kv_connector_module_path": "pegaflow.connector",
           "kv_connector_extra_config": {
-            "pegaflow.host": "http://127.0.0.1",
+            "pegaflow.host": "http://192.0.2.11",
             "pegaflow.port": 50055,
             "pegaflow.mode": "save_only"
           }
