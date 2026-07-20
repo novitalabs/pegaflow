@@ -1,9 +1,7 @@
-use log::warn;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone)]
@@ -179,7 +177,8 @@ impl CudaTensorRegistry {
 
             cuda.call_method1("set_device", (device_id,))?;
 
-            let wrapper = pickle.call_method1("loads", (PyBytes::new(py, wrapper_bytes),))?;
+            let py_bytes = PyBytes::new(py, wrapper_bytes);
+            let wrapper = pickle.call_method1("loads", (py_bytes,))?;
             let tensor = wrapper.call_method0("to_tensor")?;
 
             let data_ptr: u64 = tensor.call_method0("data_ptr")?.extract()?;
@@ -265,34 +264,6 @@ impl RegistryHandle {
     /// tensor is materialized, and a materialization failure does not publish a
     /// partial context.
     pub async fn register_layers(
-        &self,
-        context_key: String,
-        device_id: i32,
-        layers: Vec<(String, Vec<u8>)>,
-    ) -> Result<Vec<TensorMetadata>, String> {
-        let retry_context_key = context_key.clone();
-        let retry_layers = layers.clone();
-        let result = self
-            .register_layers_once(context_key, device_id, layers)
-            .await;
-
-        match result {
-            Err(message)
-                if message.contains("invalid device context")
-                    || message.contains("cudaErrorDeviceUninitialized") =>
-            {
-                warn!(
-                    "Retrying CUDA IPC tensor registration after initialization backoff: device={device_id}"
-                );
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                self.register_layers_once(retry_context_key, device_id, retry_layers)
-                    .await
-            }
-            result => result,
-        }
-    }
-
-    async fn register_layers_once(
         &self,
         context_key: String,
         device_id: i32,
