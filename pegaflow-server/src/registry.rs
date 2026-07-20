@@ -179,26 +179,7 @@ impl CudaTensorRegistry {
             cuda.call_method1("set_device", (device_id,))?;
 
             let wrapper = pickle.call_method1("loads", (PyBytes::new(py, wrapper_bytes),))?;
-            let tensor = match wrapper.call_method0("to_tensor") {
-                Ok(tensor) => tensor,
-                Err(err) => {
-                    let message = err.value(py).to_string();
-                    if !message.contains("invalid device context")
-                        && !message.contains("cudaErrorDeviceUninitialized")
-                    {
-                        return Err(err);
-                    }
-
-                    warn!(
-                        "Retrying CUDA IPC tensor materialization after device context initialization failed: device={device_id}"
-                    );
-                    drop(wrapper);
-                    cuda.call_method1("set_device", (device_id,))?;
-                    let wrapper =
-                        pickle.call_method1("loads", (PyBytes::new(py, wrapper_bytes),))?;
-                    wrapper.call_method0("to_tensor")?
-                }
-            };
+            let tensor = wrapper.call_method0("to_tensor")?;
 
             let data_ptr: u64 = tensor.call_method0("data_ptr")?.extract()?;
             let device_attr = tensor.getattr("device")?;
@@ -283,6 +264,33 @@ impl RegistryHandle {
     /// tensor is materialized, and a materialization failure does not publish a
     /// partial context.
     pub async fn register_layers(
+        &self,
+        context_key: String,
+        device_id: i32,
+        layers: Vec<(String, Vec<u8>)>,
+    ) -> Result<Vec<TensorMetadata>, String> {
+        let retry_context_key = context_key.clone();
+        let retry_layers = layers.clone();
+        let result = self
+            .register_layers_once(context_key, device_id, layers)
+            .await;
+
+        match result {
+            Err(message)
+                if message.contains("invalid device context")
+                    || message.contains("cudaErrorDeviceUninitialized") =>
+            {
+                warn!(
+                    "Retrying CUDA IPC tensor registration after yielding to queued contexts: device={device_id}"
+                );
+                self.register_layers_once(retry_context_key, device_id, retry_layers)
+                    .await
+            }
+            result => result,
+        }
+    }
+
+    async fn register_layers_once(
         &self,
         context_key: String,
         device_id: i32,
