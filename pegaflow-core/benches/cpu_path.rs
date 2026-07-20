@@ -186,7 +186,7 @@ impl BenchFixture {
     async fn query_lease(&self, req_id: &str, hashes: &[Vec<u8>]) -> QueryLeaseId {
         match self
             .engine
-            .count_prefix_hit_blocks_with_prefetch(INSTANCE_ID, req_id, hashes)
+            .count_prefix_hit_blocks_with_prefetch(INSTANCE_ID, req_id, hashes, false)
             .await
             .expect("query")
         {

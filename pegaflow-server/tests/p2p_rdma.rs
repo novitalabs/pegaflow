@@ -183,7 +183,12 @@ async fn wait_for_cache(
     let deadline = Instant::now() + timeout;
     loop {
         let status = engine
-            .count_prefix_hit_blocks_with_prefetch(instance_id, "wait-for-cache", block_hashes)
+            .count_prefix_hit_blocks_with_prefetch(
+                instance_id,
+                "wait-for-cache",
+                block_hashes,
+                false,
+            )
             .await
             .expect("count_prefix_hit_blocks_with_prefetch");
         let hit = match status {
@@ -257,11 +262,17 @@ async fn wait_for_prefetch_done(
     block_hashes: &[Vec<u8>],
     expected_hit: usize,
     timeout: Duration,
+    wait_for_remote: bool,
 ) -> QueryLeaseId {
     let deadline = Instant::now() + timeout;
     loop {
         let status = engine
-            .count_prefix_hit_blocks_with_prefetch(instance_id, req_id, block_hashes)
+            .count_prefix_hit_blocks_with_prefetch(
+                instance_id,
+                req_id,
+                block_hashes,
+                wait_for_remote,
+            )
             .await
             .expect("count_prefix_hit_blocks_with_prefetch");
         match status {
@@ -430,31 +441,69 @@ async fn p2p_rdma_remote_fetch_roundtrip() {
         )
         .expect("register layer on engine B");
 
-    // ── 8. Remote fetch: Engine B discovers blocks via MetaServer → RDMA READ ──
-    let lease = wait_for_prefetch_done(
-        &engine_b,
-        "inst-b",
-        "req-1",
-        &block_hashes,
+    // ── 8. Start the remote query before the producer registers the blocks ──
+    let delayed_hashes = make_block_hashes(NUM_BLOCKS, 43);
+    let status = engine_b
+        .count_prefix_hit_blocks_with_prefetch(
+            "inst-b",
+            "req-wait-for-producer",
+            &delayed_hashes,
+            true,
+        )
+        .await
+        .expect("start producer wait");
+    assert!(matches!(status, PrefetchStatus::Loading));
+
+    engine_a
+        .batch_save_kv_blocks_from_ipc(
+            "inst-a",
+            0,
+            0,
+            DEVICE_ID,
+            vec![LayerSave {
+                layer_name: LAYER.to_string(),
+                block_ids: block_ids.clone(),
+                block_hashes: delayed_hashes.clone(),
+            }],
+        )
+        .await
+        .expect("save delayed blocks on engine A");
+
+    wait_for_metaserver_registration(
+        &meta_store,
+        NAMESPACE,
+        &delayed_hashes,
         NUM_BLOCKS,
-        Duration::from_secs(30),
+        Duration::from_secs(10),
     )
     .await;
 
-    // ── 8b. Verify Engine B re-registered fetched blocks to MetaServer ──
+    // ── 9. Engine B observes the producer and fetches via RDMA READ ──
+    let lease = wait_for_prefetch_done(
+        &engine_b,
+        "inst-b",
+        "req-wait-for-producer",
+        &delayed_hashes,
+        NUM_BLOCKS,
+        Duration::from_secs(30),
+        true,
+    )
+    .await;
+
+    // ── 9b. Verify Engine B re-registered fetched blocks to MetaServer ──
     // RDMA-fetched blocks are now resident on B, so B must advertise them so
     // other nodes can discover and fetch from B (not just from A).
     wait_for_metaserver_ownership(
         &meta_store,
         NAMESPACE,
-        &block_hashes,
+        &delayed_hashes,
         &format!("127.0.0.1:{port_b}"),
         NUM_BLOCKS,
         Duration::from_secs(10),
     )
     .await;
 
-    // ── 9. Load from Engine B cache → GPU ──
+    // ── 10. Load from Engine B cache → GPU ──
     let load_state = LoadState::new().expect("create LoadState");
     let shm_name = load_state.shm_name().to_string();
 
@@ -480,7 +529,7 @@ async fn p2p_rdma_remote_fetch_roundtrip() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    // ── 10. Verify data integrity ──
+    // ── 11. Verify data integrity ──
     let loaded = gpu_b.copy_to_host();
     assert_eq!(
         loaded, host_data,

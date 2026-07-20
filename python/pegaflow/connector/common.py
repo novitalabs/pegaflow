@@ -61,6 +61,7 @@ class ConnectorContext:
     pp_rank: int = 0
     pp_size: int = 1
     mode: PegaConnectorMode = PegaConnectorMode.READ_WRITE
+    wait_for_remote: bool = False
 
     @property
     def read_enabled(self) -> bool:

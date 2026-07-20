@@ -106,6 +106,9 @@ class PegaKVConnector(KVConnectorBase_V1):
             is_mla,
             vllm_config.kv_transfer_config.get_from_extra_config("pegaflow.transfer_backend", None),
         )
+        wait_for_remote = bool(
+            vllm_config.kv_transfer_config.get_from_extra_config("pegaflow.wait_for_remote", False)
+        )
         self._engine_endpoint = f"{server_host}:{server_port}"
         engine_client = EngineRpcClient(self._engine_endpoint)
         logger.debug("[PegaKVConnector] Connected to engine server at %s", self._engine_endpoint)
@@ -130,6 +133,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             pp_rank=pp_rank,
             pp_size=pp_size,
             mode=mode,
+            wait_for_remote=wait_for_remote,
         )
 
         # MLA attention backends expose no num-layers stride dimension, so vLLM
@@ -169,7 +173,8 @@ class PegaKVConnector(KVConnectorBase_V1):
         logger.debug(
             "[PegaKVConnector] Initialized role=%s instance_id=%s device=%s "
             "tp_rank=%s tp_size=%d pp_rank=%d pp_size=%d world_size=%d namespace=%s "
-            "is_mla=%s transfer_backend=%s dcp_world_size=%d pcp_world_size=%d dcp_rank=%d mode=%s",
+            "is_mla=%s transfer_backend=%s dcp_world_size=%d pcp_world_size=%d dcp_rank=%d "
+            "mode=%s wait_for_remote=%s",
             role.name,
             instance_id,
             device_id if device_id is not None else "cpu",
@@ -185,6 +190,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             pcp_world_size,
             dcp_rank,
             mode.value,
+            wait_for_remote,
         )
 
     # ==============================

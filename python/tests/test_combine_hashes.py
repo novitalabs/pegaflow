@@ -572,8 +572,29 @@ class TestSchedulerQueryProbeReuse:
     def test_query_loading_returns_retry(self):
         sc, engine_client = self._make_connector()
         engine_client.query_prefetch.return_value = QueryLoading()
+        hashes = [_hash(i) for i in range(4)]
 
-        assert sc._count_available_block_prefix([_hash(i) for i in range(4)], "r1") is None
+        assert sc._count_available_block_prefix(hashes, "r1") is None
+        engine_client.query_prefetch.assert_called_once_with(
+            sc._ctx.instance_id,
+            hashes,
+            req_id="r1",
+            wait_for_remote=False,
+        )
+
+    def test_wait_for_remote_is_forwarded(self):
+        engine_client = MagicMock()
+        engine_client.query_prefetch.return_value = QueryLoading()
+        sc = SchedulerConnector(_make_ctx(engine_client=engine_client, wait_for_remote=True))
+        hashes = [_hash(i) for i in range(4)]
+
+        assert sc._count_available_block_prefix(hashes, "r1") is None
+        engine_client.query_prefetch.assert_called_once_with(
+            sc._ctx.instance_id,
+            hashes,
+            req_id="r1",
+            wait_for_remote=True,
+        )
 
     def test_prefetch_loading_cancelled_on_request_cleanup(self):
         sc, engine_client = self._make_connector()

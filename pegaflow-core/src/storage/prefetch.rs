@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use log::{info, warn};
 use parking_lot::Mutex;
@@ -20,6 +20,9 @@ use super::read_cache::ReadCache;
 use super::tier_attribution::{
     AttributionSource, TierAttribution, record_cache_tier_block_requests,
 };
+
+const REMOTE_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const REMOTE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg(feature = "rdma")]
 #[derive(Clone)]
@@ -39,12 +42,19 @@ impl RdmaFetch {
         req_id: &str,
         namespace: &str,
         remaining_hashes: &[Vec<u8>],
+        require_full_prefix: bool,
     ) -> Option<(usize, PrefetchResult)> {
         let (node, found) = self.0.query_prefix(namespace, remaining_hashes).await?;
+        if require_full_prefix && found != remaining_hashes.len() {
+            return None;
+        }
         let blocks = self
             .0
             .fetch_blocks(&node, req_id, namespace, &remaining_hashes[..found])
             .await;
+        if require_full_prefix && blocks.len() != found {
+            return None;
+        }
         Some((found, blocks))
     }
 }
@@ -56,6 +66,7 @@ impl RdmaFetch {
         _req_id: &str,
         _namespace: &str,
         _remaining_hashes: &[Vec<u8>],
+        _require_full_prefix: bool,
     ) -> Option<(usize, PrefetchResult)> {
         None
     }
@@ -94,6 +105,7 @@ struct PrefixScan<'a> {
     namespace: &'a str,
     hashes: &'a [Vec<u8>],
     emit_tier_metrics: bool,
+    wait_for_remote: bool,
 }
 
 struct PrefetchStart<'a> {
@@ -104,6 +116,7 @@ struct PrefetchStart<'a> {
     total: usize,
     hit: usize,
     emit_tier_metrics: bool,
+    wait_for_remote: bool,
 }
 
 struct PrefetchTaskDeps {
@@ -121,6 +134,7 @@ struct PrefetchTaskInput {
     total: usize,
     hit: usize,
     emit_tier_metrics: bool,
+    wait_for_remote: bool,
 }
 
 struct PrefetchState {
@@ -186,6 +200,7 @@ impl PrefetchScheduler {
         req_id: &str,
         namespace: &str,
         hashes: &[Vec<u8>],
+        wait_for_remote: bool,
     ) -> PrefetchStatus {
         // Default: this call may be the first decision and should attribute.
         match self.poll_existing(read_cache, req_id).await {
@@ -203,6 +218,7 @@ impl PrefetchScheduler {
                 namespace,
                 hashes,
                 emit_tier_metrics: true,
+                wait_for_remote,
             },
         )
         .await
@@ -309,6 +325,7 @@ impl PrefetchScheduler {
                 total: keys.len(),
                 hit,
                 emit_tier_metrics: scan.emit_tier_metrics,
+                wait_for_remote: scan.wait_for_remote,
             });
         let task_schedule = task_start.elapsed();
 
@@ -387,6 +404,7 @@ impl PrefetchScheduler {
             total: start.total,
             hit: start.hit,
             emit_tier_metrics: start.emit_tier_metrics,
+            wait_for_remote: start.wait_for_remote,
         };
 
         let handle = tokio::spawn(async move { run_prefetch_task(deps, input).await });
@@ -447,6 +465,10 @@ fn reserve_ssd_prefetch_slots(
     max_prefetch_blocks: usize,
     requested: usize,
 ) -> Option<(usize, SsdPrefetchReservation)> {
+    if requested == 0 {
+        return None;
+    }
+
     let mut guard = state.lock();
     let available = max_prefetch_blocks.saturating_sub(guard.reserved_ssd_prefetch_blocks);
 
@@ -527,12 +549,13 @@ async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> 
         total,
         hit,
         emit_tier_metrics,
+        wait_for_remote,
     } = input;
     let remaining_hashes: Vec<Vec<u8>> = remaining_keys.iter().map(|k| k.hash.clone()).collect();
 
-    if let Some(rdma) = deps.rdma_fetch
+    if let Some(rdma) = deps.rdma_fetch.as_ref()
         && let Some((found, blocks)) = rdma
-            .try_fetch_prefix(&req_id, &namespace, &remaining_hashes)
+            .try_fetch_prefix(&req_id, &namespace, &remaining_hashes, wait_for_remote)
             .await
     {
         record_tier_attribution(
@@ -552,37 +575,67 @@ async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> 
         );
     }
 
-    if let Some(ssd) = deps.ssd_store {
+    if let Some(ssd) = deps.ssd_store.as_ref() {
         let found = ssd.prefix_len(&remaining_keys);
-        if found == 0 {
-            record_tier_attribution(total, hit, 0, None, emit_tier_metrics);
-            return build_ready_result(prefix_blocks, total, None, 0, &[], Vec::new());
-        }
-        let Some((reserved, _reservation)) =
-            reserve_ssd_prefetch_slots(deps.prefetch_state, deps.max_prefetch_blocks, found)
-        else {
-            record_tier_attribution(total, hit, 0, None, emit_tier_metrics);
-            return build_ready_result(prefix_blocks, total, None, 0, &[], Vec::new());
-        };
-        let keys = remaining_keys[..reserved].to_vec();
-        let (found, blocks) = ssd.prefetch_prefix(keys).await;
-        if found > 0 {
-            record_tier_attribution(
-                total,
-                hit,
+        if (!wait_for_remote || found == remaining_keys.len())
+            && let Some((reserved, _reservation)) = reserve_ssd_prefetch_slots(
+                Arc::clone(&deps.prefetch_state),
+                deps.max_prefetch_blocks,
                 found,
-                Some(PrefetchSource::Ssd.as_attribution()),
-                emit_tier_metrics,
-            );
-            return build_ready_result(
-                prefix_blocks,
-                total,
-                Some(PrefetchSource::Ssd),
-                found,
-                &remaining_keys[..found],
-                blocks,
-            );
+            )
+        {
+            let keys = remaining_keys[..reserved].to_vec();
+            let (found, blocks) = ssd.prefetch_prefix(keys).await;
+            if found > 0 {
+                record_tier_attribution(
+                    total,
+                    hit,
+                    found,
+                    Some(PrefetchSource::Ssd.as_attribution()),
+                    emit_tier_metrics,
+                );
+                return build_ready_result(
+                    prefix_blocks,
+                    total,
+                    Some(PrefetchSource::Ssd),
+                    found,
+                    &remaining_keys[..found],
+                    blocks,
+                );
+            }
         }
+    }
+
+    if wait_for_remote && let Some(rdma) = deps.rdma_fetch {
+        let started_at = Instant::now();
+        while started_at.elapsed() < REMOTE_WAIT_TIMEOUT {
+            tokio::time::sleep(REMOTE_WAIT_POLL_INTERVAL).await;
+            if let Some((found, blocks)) = rdma
+                .try_fetch_prefix(&req_id, &namespace, &remaining_hashes, true)
+                .await
+            {
+                record_tier_attribution(
+                    total,
+                    hit,
+                    found,
+                    Some(PrefetchSource::Rdma.as_attribution()),
+                    emit_tier_metrics,
+                );
+                return build_ready_result(
+                    prefix_blocks,
+                    total,
+                    Some(PrefetchSource::Rdma),
+                    found,
+                    &remaining_keys[..found],
+                    blocks,
+                );
+            }
+        }
+        warn!(
+            "Timed out waiting for remote prefix: req_id={} timeout_secs={}",
+            req_id,
+            REMOTE_WAIT_TIMEOUT.as_secs()
+        );
     }
 
     record_tier_attribution(total, hit, 0, None, emit_tier_metrics);
