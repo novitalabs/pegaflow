@@ -1,6 +1,6 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyDict};
 use std::collections::{HashMap, HashSet};
 use tokio::sync::{mpsc, oneshot};
 
@@ -85,6 +85,8 @@ impl CudaTensorRegistry {
             }
         }
 
+        Self::activate_device(device_id)?;
+
         let mut context = ContextState::new(device_id);
         let mut metadatas = Vec::with_capacity(layers.len());
         for (layer_name, wrapper_bytes) in layers {
@@ -104,6 +106,19 @@ impl CudaTensorRegistry {
 
         self.contexts.insert(context_key.to_string(), context);
         Ok(metadatas)
+    }
+
+    fn activate_device(device_id: i32) -> PyResult<()> {
+        Python::attach(|py| {
+            let torch = py.import("torch")?;
+            let cuda = torch.getattr("cuda")?;
+            cuda.call_method1("set_device", (device_id,))?;
+
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("device", format!("cuda:{device_id}"))?;
+            torch.call_method("empty", ([1],), Some(&kwargs))?;
+            Ok(())
+        })
     }
 
     fn drop_context(&mut self, context_key: &str) -> usize {
