@@ -12,15 +12,17 @@ and use a P/D-aware NIXL router. Configure each server's routable `--addr`,
 P and D must use compatible model, tokenizer, block size, KV dtype, KV layout,
 and `PYTHONHASHSEED`.
 
-The commands use the documentation addresses `192.0.2.10` for P and
-`192.0.2.11` for D; replace them with addresses assigned to the target nodes.
-The distinct NIXL ports also avoid a collision if P and D are colocated.
+Replace `<p_node_ip>` and `<d_node_ip>` with the addresses assigned to the P
+and D nodes. The example assumes P and D run on separate nodes; to colocate
+them on one host, keep the distinct NIXL side-channel ports and also give the
+decode-side PegaFlow server and connector a different port, since one PegaFlow
+server runs beside each vLLM instance.
 
 ### Prefill
 
 ```bash
 PYTHONHASHSEED=42 \
-VLLM_NIXL_SIDE_CHANNEL_HOST=192.0.2.10 \
+VLLM_NIXL_SIDE_CHANNEL_HOST=<p_node_ip> \
 VLLM_NIXL_SIDE_CHANNEL_PORT=5600 \
 vllm serve GLM-5.2-FP8 \
   --served-model-name glm-5.2 \
@@ -47,7 +49,7 @@ vllm serve GLM-5.2-FP8 \
           "kv_role": "kv_both",
           "kv_connector_module_path": "pegaflow.connector",
           "kv_connector_extra_config": {
-            "pegaflow.host": "http://192.0.2.10",
+            "pegaflow.host": "http://<p_node_ip>",
             "pegaflow.port": 50055,
             "pegaflow.mode": "read_write"
           }
@@ -61,7 +63,7 @@ vllm serve GLM-5.2-FP8 \
 
 ```bash
 PYTHONHASHSEED=42 \
-VLLM_NIXL_SIDE_CHANNEL_HOST=192.0.2.11 \
+VLLM_NIXL_SIDE_CHANNEL_HOST=<d_node_ip> \
 VLLM_NIXL_SIDE_CHANNEL_PORT=5601 \
 vllm serve GLM-5.2-FP8 \
   --served-model-name glm-5.2 \
@@ -91,7 +93,7 @@ vllm serve GLM-5.2-FP8 \
           "kv_role": "kv_both",
           "kv_connector_module_path": "pegaflow.connector",
           "kv_connector_extra_config": {
-            "pegaflow.host": "http://192.0.2.11",
+            "pegaflow.host": "http://<d_node_ip>",
             "pegaflow.port": 50055,
             "pegaflow.mode": "save_only"
           }
