@@ -99,8 +99,8 @@ impl TinyLfuCache<BlockKey, ArcSealedBlock> {
         CacheInsertOutcome::InsertedNew
     }
 
-    pub(crate) fn remove_lru(&mut self) -> Option<(BlockKey, ArcSealedBlock)> {
-        self.lru.remove_lru()
+    pub(crate) fn remove(&mut self, key: &BlockKey) -> Option<ArcSealedBlock> {
+        self.lru.remove(key)
     }
 
     pub(crate) fn remove_all(&mut self) -> Vec<(BlockKey, ArcSealedBlock)> {

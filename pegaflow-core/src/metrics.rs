@@ -22,6 +22,10 @@ static TIER_RAM: LazyLock<[KeyValue; 1]> = LazyLock::new(|| [KeyValue::new("tier
 static TIER_RDMA: LazyLock<[KeyValue; 1]> = LazyLock::new(|| [KeyValue::new("tier", "rdma")]);
 static TIER_SSD: LazyLock<[KeyValue; 1]> = LazyLock::new(|| [KeyValue::new("tier", "ssd")]);
 static TIER_MISS: LazyLock<[KeyValue; 1]> = LazyLock::new(|| [KeyValue::new("tier", "miss")]);
+pub(crate) static CACHE_CLASS_RECLAIMABLE: LazyLock<[KeyValue; 1]> =
+    LazyLock::new(|| [KeyValue::new("class", "reclaimable")]);
+pub(crate) static CACHE_CLASS_RETAINED: LazyLock<[KeyValue; 1]> =
+    LazyLock::new(|| [KeyValue::new("class", "retained")]);
 
 pub(crate) struct CoreMetrics {
     // Pinned pool (allocator-level)
@@ -47,6 +51,8 @@ pub(crate) struct CoreMetrics {
     pub cache_block_insertions: Counter<u64>,
     pub cache_block_admission_rejections: Counter<u64>,
     pub cache_block_evictions: Counter<u64>,
+    pub cache_resident_blocks: UpDownCounter<i64>,
+    pub cache_block_evictions_by_class: Counter<u64>,
     pub cache_block_evictions_still_referenced: Counter<u64>,
     pub cache_eviction_reclaimed_bytes: Counter<u64>,
 
@@ -276,6 +282,14 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
             cache_block_evictions: meter
                 .u64_counter("pegaflow_cache_block_evictions")
                 .with_description("Blocks evicted from cache due to memory pressure")
+                .build(),
+            cache_resident_blocks: meter
+                .i64_up_down_counter("pegaflow_cache_resident_blocks")
+                .with_description("Current cache blocks by replacement class")
+                .build(),
+            cache_block_evictions_by_class: meter
+                .u64_counter("pegaflow_cache_block_evictions_by_class")
+                .with_description("Cache block evictions by replacement class")
                 .build(),
             cache_block_evictions_still_referenced: meter
                 .u64_counter("pegaflow_cache_block_evictions_still_referenced")
