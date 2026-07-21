@@ -14,9 +14,9 @@ and `PYTHONHASHSEED`.
 
 Replace `<p_node_ip>` and `<d_node_ip>` with the addresses assigned to the P
 and D nodes. The example assumes P and D run on separate nodes; to colocate
-them on one host, keep the distinct NIXL side-channel ports and also give the
-decode-side PegaFlow server and connector a different port, since one PegaFlow
-server runs beside each vLLM instance.
+them on one host, keep the distinct NIXL side-channel ports and point both
+connectors at a single shared PegaFlow server — each vLLM instance registers
+with its own instance id, so one server can serve both.
 
 ### Prefill
 
