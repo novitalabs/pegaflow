@@ -262,7 +262,7 @@ async fn wait_for_prefetch_done(
     block_hashes: &[Vec<u8>],
     expected_hit: usize,
     timeout: Duration,
-    wait_for_remote: bool,
+    wait_for_full_prefix: bool,
 ) -> QueryLeaseId {
     let deadline = Instant::now() + timeout;
     loop {
@@ -271,7 +271,7 @@ async fn wait_for_prefetch_done(
                 instance_id,
                 req_id,
                 block_hashes,
-                wait_for_remote,
+                wait_for_full_prefix,
             )
             .await
             .expect("count_prefix_hit_blocks_with_prefetch");

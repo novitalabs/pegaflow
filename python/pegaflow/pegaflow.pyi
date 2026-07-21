@@ -215,7 +215,7 @@ class EngineRpcClient:
         instance_id: str,
         block_hashes: list[bytes],
         req_id: str,
-        wait_for_remote: bool = False,
+        wait_for_full_prefix: bool = False,
     ) -> QueryLoading | QueryReady:
         """Query prefix cache hits with SSD prefetch support.
 
@@ -229,7 +229,7 @@ class EngineRpcClient:
             instance_id: Model instance ID.
             block_hashes: List of block hashes to check.
             req_id: Request ID for tracking and prefetch correlation.
-            wait_for_remote: Keep the query loading while waiting for a remote producer.
+            wait_for_full_prefix: Keep the query loading until the remaining prefix is complete.
 
         Returns:
             QueryLoading while backing fetch is in progress, otherwise QueryReady.

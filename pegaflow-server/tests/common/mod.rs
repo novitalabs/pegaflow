@@ -260,7 +260,7 @@ impl MockVllmRpcHarness {
             instance_id: instance_id.to_string(),
             block_hashes: hashes.to_vec(),
             req_id: req_id.to_string(),
-            wait_for_remote: false,
+            wait_for_full_prefix: false,
         };
         match self.scheduler.query_prefetch(request.clone()).await {
             Ok(response) => Ok(RpcExchange {

@@ -674,7 +674,7 @@ class SchedulerConnector:
             self._ctx.instance_id,
             block_hash_list,
             req_id=req_id,
-            wait_for_remote=self._ctx.wait_for_remote,
+            wait_for_full_prefix=self._ctx.wait_for_full_prefix,
         )
 
         if isinstance(result, QueryLoading):

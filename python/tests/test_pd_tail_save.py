@@ -221,7 +221,7 @@ class TestTailLoad:
             "test",
             [*req.block_hashes, b"tail:2"],
             req_id="r1",
-            wait_for_remote=False,
+            wait_for_full_prefix=False,
         )
 
     def test_tail_hit_allocates_and_loads_the_partial_page(self):

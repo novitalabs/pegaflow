@@ -579,13 +579,13 @@ class TestSchedulerQueryProbeReuse:
             sc._ctx.instance_id,
             hashes,
             req_id="r1",
-            wait_for_remote=False,
+            wait_for_full_prefix=False,
         )
 
-    def test_wait_for_remote_is_forwarded(self):
+    def test_wait_for_full_prefix_is_forwarded(self):
         engine_client = MagicMock()
         engine_client.query_prefetch.return_value = QueryLoading()
-        sc = SchedulerConnector(_make_ctx(engine_client=engine_client, wait_for_remote=True))
+        sc = SchedulerConnector(_make_ctx(engine_client=engine_client, wait_for_full_prefix=True))
         hashes = [_hash(i) for i in range(4)]
 
         assert sc._count_available_block_prefix(hashes, "r1") is None
@@ -593,7 +593,7 @@ class TestSchedulerQueryProbeReuse:
             sc._ctx.instance_id,
             hashes,
             req_id="r1",
-            wait_for_remote=True,
+            wait_for_full_prefix=True,
         )
 
     def test_prefetch_loading_cancelled_on_request_cleanup(self):

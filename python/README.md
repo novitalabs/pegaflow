@@ -118,7 +118,7 @@ the same explicit `PYTHONHASHSEED` and `--prefix-caching-hash-algo xxhash_cbor`.
 
 Prefill: `{"pegaflow.pd_tail_save": true}`
 
-Decode: `{"pegaflow.pd_tail_load": true, "pegaflow.wait_for_remote": true}`
+Decode: `{"pegaflow.pd_tail_load": true, "pegaflow.wait_for_full_prefix": true}`
 
 ## Development
 

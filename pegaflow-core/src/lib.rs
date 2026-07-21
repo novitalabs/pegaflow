@@ -483,14 +483,14 @@ impl PegaEngine {
         instance_id: &str,
         req_id: &str,
         block_hashes: &[Vec<u8>],
-        wait_for_remote: bool,
+        wait_for_full_prefix: bool,
     ) -> Result<PrefetchStatus, EngineError> {
         let instance = self.get_instance(instance_id)?;
         let namespace = instance.namespace();
 
         let status = self
             .storage
-            .check_prefix_and_prefetch(req_id, namespace, block_hashes, wait_for_remote)
+            .check_prefix_and_prefetch(req_id, namespace, block_hashes, wait_for_full_prefix)
             .await;
 
         match &status {

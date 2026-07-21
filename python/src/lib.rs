@@ -443,14 +443,14 @@ impl EngineRpcClient {
     ///
     /// Returns:
     ///     QueryLoading while backing fetch is in progress, otherwise QueryReady.
-    #[pyo3(signature = (instance_id, block_hashes, req_id, wait_for_remote=false))]
+    #[pyo3(signature = (instance_id, block_hashes, req_id, wait_for_full_prefix=false))]
     fn query_prefetch(
         &self,
         py: Python<'_>,
         instance_id: String,
         block_hashes: Vec<Vec<u8>>,
         req_id: String,
-        wait_for_remote: bool,
+        wait_for_full_prefix: bool,
     ) -> PyResult<Py<PyAny>> {
         let result = py.detach(|| {
             self.rt_handle.block_on(async {
@@ -460,7 +460,7 @@ impl EngineRpcClient {
                         instance_id,
                         block_hashes,
                         req_id,
-                        wait_for_remote,
+                        wait_for_full_prefix,
                     })
                     .await
                     .map(|resp| resp.into_inner())
