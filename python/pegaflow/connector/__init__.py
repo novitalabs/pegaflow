@@ -155,8 +155,14 @@ class PegaKVConnector(KVConnectorBase_V1):
             pd_tail_save = bool(
                 vllm_config.kv_transfer_config.get_from_extra_config("pegaflow.pd_tail_save", False)
             )
+            pd_tail_load = bool(
+                vllm_config.kv_transfer_config.get_from_extra_config("pegaflow.pd_tail_load", False)
+            )
             self._scheduler = SchedulerConnector(
-                self._ctx, pd_tail_save=pd_tail_save, vllm_config=vllm_config
+                self._ctx,
+                pd_tail_save=pd_tail_save,
+                pd_tail_load=pd_tail_load,
+                vllm_config=vllm_config,
             )
             # Open the liveness stream from the scheduler process only. One
             # stream per vllm replica is enough — if any tp worker crashes,

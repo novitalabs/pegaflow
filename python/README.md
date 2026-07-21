@@ -109,6 +109,17 @@ vllm serve Qwen/Qwen3-0.6B \
 
 Valid values are `read_write` and `save_only`.
 
+#### P/D Partial Tail Blocks
+
+vLLM normally exposes hashes only for complete KV blocks. In a P/D deployment,
+enable `pegaflow.pd_tail_save` on prefill and `pegaflow.pd_tail_load` on decode
+to reuse the final partial prompt block as well. Start both vLLM processes with
+the same explicit `PYTHONHASHSEED` and `--prefix-caching-hash-algo xxhash_cbor`.
+
+Prefill: `{"pegaflow.pd_tail_save": true}`
+
+Decode: `{"pegaflow.pd_tail_load": true, "pegaflow.wait_for_remote": true}`
+
 ## Development
 
 See the [examples](../examples/) directory for more usage examples.

@@ -42,6 +42,7 @@ class _QueryProbe:
 
     computed_blocks: int
     query_hashes: tuple[bytes, ...]
+    tail_tokens: int = 0
 
     # ``None`` means the backend is still loading.
     hit_blocks: int | None = None
@@ -51,8 +52,17 @@ class _QueryProbe:
     def is_ready(self) -> bool:
         return self.hit_blocks is not None
 
-    def matches(self, computed_blocks: int, query_hashes: tuple[bytes, ...]) -> bool:
-        return self.computed_blocks == computed_blocks and self.query_hashes == query_hashes
+    def matches(
+        self,
+        computed_blocks: int,
+        query_hashes: tuple[bytes, ...],
+        tail_tokens: int,
+    ) -> bool:
+        return (
+            self.computed_blocks == computed_blocks
+            and self.query_hashes == query_hashes
+            and self.tail_tokens == tail_tokens
+        )
 
     def mark_ready(self, ready: QueryReady) -> None:
         hit_blocks = ready.num_hit_blocks
@@ -82,6 +92,7 @@ class SchedulerConnector:
         self,
         context: ConnectorContext,
         pd_tail_save: bool = False,
+        pd_tail_load: bool = False,
         vllm_config=None,
     ):
         self._ctx = context
@@ -95,13 +106,18 @@ class SchedulerConnector:
         # well-defined, and independently derivable by the decode peer.
         # Only xxhash_cbor is validated cross-engine; everything else is
         # rejected (the pickle-based algos aren't even derivable elsewhere).
+        self._tail_save_enabled = pd_tail_save
+        self._tail_load_enabled = pd_tail_load
         self._tail_hash_fn = None
-        if pd_tail_save:
+        if pd_tail_save or pd_tail_load:
             assert vllm_config is not None
             algo = vllm_config.cache_config.prefix_caching_hash_algo
             if algo != "xxhash_cbor":
+                enabled_option = (
+                    "pegaflow.pd_tail_save" if pd_tail_save else "pegaflow.pd_tail_load"
+                )
                 raise ValueError(
-                    f"pegaflow.pd_tail_save requires prefix_caching_hash_algo "
+                    f"{enabled_option} requires prefix_caching_hash_algo "
                     f"'xxhash_cbor' (cross-engine derivable, validated); got {algo!r} — "
                     f"run vLLM with --prefix-caching-hash-algo xxhash_cbor"
                 )
@@ -114,7 +130,12 @@ class SchedulerConnector:
             # runs after connector construction — it must be read lazily
             # through the module, never imported by name here.
             self._kv_cache_utils = kv_cache_utils
-            logger.info("[PegaKVConnector] P/D tail-block save enabled (algo=%s)", algo)
+            logger.info(
+                "[PegaKVConnector] P/D tail-block cache enabled (save=%s load=%s algo=%s)",
+                pd_tail_save,
+                pd_tail_load,
+                algo,
+            )
         self._tail_saved: set[str] = set()
 
         # Load state
@@ -157,7 +178,7 @@ class SchedulerConnector:
             return (0, False)
 
         computed_blocks = num_computed_tokens // self._ctx.virtual_block_size
-        query_hashes = tuple(request.block_hashes[computed_blocks:])
+        query_hashes, tail_tokens = self._build_query(request, computed_blocks)
 
         # Everything is already computed locally.
         if not query_hashes:
@@ -170,7 +191,7 @@ class SchedulerConnector:
         # Ready result already cached.  Reuse it only if the request identity
         # has not drifted since the query was issued.
         if probe is not None and probe.is_ready:
-            if probe.matches(computed_blocks, query_hashes):
+            if probe.matches(computed_blocks, query_hashes, tail_tokens):
                 return self._finish_cache_lookup(
                     req_id=req_id,
                     num_tokens=request.num_tokens,
@@ -194,12 +215,13 @@ class SchedulerConnector:
                 self._pending_query_probes[req_id] = _QueryProbe(
                     computed_blocks=computed_blocks,
                     query_hashes=query_hashes,
+                    tail_tokens=tail_tokens,
                 )
             return (None, False)
 
         # A previous Loading probe exists, but the request has moved on.
         # This Ready belongs to the old query.  Do not consume it.
-        if probe is not None and not probe.matches(computed_blocks, query_hashes):
+        if probe is not None and not probe.matches(computed_blocks, query_hashes, tail_tokens):
             logger.warning(
                 "[PegaKVConnector] req=%s query identity drifted: "
                 "snapshot computed=%d/%d hashes, current computed=%d/%d hashes "
@@ -222,6 +244,7 @@ class SchedulerConnector:
             probe = _QueryProbe(
                 computed_blocks=computed_blocks,
                 query_hashes=query_hashes,
+                tail_tokens=tail_tokens,
             )
             self._pending_query_probes[req_id] = probe
 
@@ -245,25 +268,38 @@ class SchedulerConnector:
     ) -> tuple[int, bool]:
         hit_blocks = probe.require_hit_blocks()
         computed_blocks = probe.computed_blocks
-        hit_tokens = hit_blocks * self._ctx.virtual_block_size
+        vbs = self._ctx.virtual_block_size
+        tail_hit = probe.tail_tokens > 0 and hit_blocks == len(probe.query_hashes)
+        hit_tokens = (hit_blocks - 1) * vbs + probe.tail_tokens if tail_hit else hit_blocks * vbs
 
-        self._external_matched_blocks[req_id] = computed_blocks + hit_blocks
+        # A request still needs one forward token to produce logits. The last
+        # loaded page may contain that token's KV, but vLLM must recompute and
+        # overwrite it unless a P/D router supplied a separate decode token.
+        locally_computed_tokens = computed_blocks * vbs
+        hit_tokens = min(hit_tokens, max(0, num_tokens - locally_computed_tokens - 1))
+
+        loaded_blocks = (hit_tokens + vbs - 1) // vbs
+        self._external_matched_blocks[req_id] = computed_blocks + loaded_blocks
 
         if reused:
             logger.debug(
                 "[PegaKVConnector] req=%s cache_lookup_reuse: hit_blocks=%d "
-                "computed_blocks=%d hit_tokens=%d num_tokens=%d total_query_hashes=%d",
+                "computed_blocks=%d hit_tokens=%d num_tokens=%d total_query_hashes=%d "
+                "tail_hit=%s tail_tokens=%d",
                 req_id,
                 hit_blocks,
                 computed_blocks,
                 hit_tokens,
                 num_tokens,
                 len(probe.query_hashes),
+                tail_hit,
+                probe.tail_tokens,
             )
         else:
             logger.info(
                 "[PegaKVConnector] req=%s cache_lookup: hit_blocks=%d computed_blocks=%d "
-                "hit_tokens=%d num_tokens=%d lookup_us=%.0f total_query_hashes=%d",
+                "hit_tokens=%d num_tokens=%d lookup_us=%.0f total_query_hashes=%d "
+                "tail_hit=%s tail_tokens=%d",
                 req_id,
                 hit_blocks,
                 computed_blocks,
@@ -271,6 +307,8 @@ class SchedulerConnector:
                 num_tokens,
                 lookup_us or 0.0,
                 len(probe.query_hashes),
+                tail_hit,
+                probe.tail_tokens,
             )
 
         if hit_tokens <= 0:
@@ -312,12 +350,10 @@ class SchedulerConnector:
                 sum(block.block_hash is not None for block in blocks.blocks[0]) if blocks else 0
             )
             start_block_idx = num_computed_blocks
-            num_load_blocks = num_external_tokens // self._ctx.virtual_block_size
+            vbs = self._ctx.virtual_block_size
+            num_load_blocks = (num_external_tokens + vbs - 1) // vbs
             expected_load_blocks = len(block_ids) - num_computed_blocks
-            if (
-                num_external_tokens % self._ctx.virtual_block_size != 0
-                or num_load_blocks != expected_load_blocks
-            ):
+            if num_load_blocks != expected_load_blocks:
                 self._release_pending_query_probe(req_id)
                 raise RuntimeError(
                     f"req {req_id} load block mismatch: external={num_load_blocks} "
@@ -330,15 +366,14 @@ class SchedulerConnector:
                 lease=pending_probe.lease if pending_probe is not None else b"",
                 num_tokens=num_external_tokens,
             )
-            if (
-                pending_probe is not None
-                and tuple(
-                    self._block_hashes[req_id][start_block_idx : start_block_idx + num_load_blocks]
-                )
-                != pending_probe.leased_hashes
-            ):
-                self._release_pending_query_probe(req_id)
-                raise RuntimeError(f"req {req_id} load hashes do not match pending query probe")
+            if pending_probe is not None:
+                query_hashes, tail_tokens = self._build_query(request, num_computed_blocks)
+                if (
+                    not pending_probe.matches(num_computed_blocks, query_hashes, tail_tokens)
+                    or pending_probe.leased_hashes != query_hashes[:num_load_blocks]
+                ):
+                    self._release_pending_query_probe(req_id)
+                    raise RuntimeError(f"req {req_id} load hashes do not match pending query probe")
             if not load_intent.lease:
                 raise RuntimeError(f"req {req_id} missing query lease for external load")
             self._pending_load_intents[req_id] = load_intent
@@ -470,22 +505,17 @@ class SchedulerConnector:
         the key covers only the tail *prompt* tokens, and the decode peer
         recomputes every position past them anyway.
         """
-        if self._tail_hash_fn is None or req_id in self._tail_saved:
+        if not self._tail_save_enabled or req_id in self._tail_saved:
             return None
         req = self._requests.get(req_id)
         if req is None:
             return None
-        # The tail key is derived from (parent hash, token ids) alone; the
-        # decode peer cannot know lora / cache_salt / multimodal dimensions
-        # that vLLM folds into block 0's extra_keys. Saving would alias
-        # differently-salted prompts onto one key — refuse instead.
-        if req.lora_request is not None or req.cache_salt or req.mm_features:
-            return None
         vbs = self._ctx.virtual_block_size
         prompt_len = req.num_prompt_tokens
-        tail_len = prompt_len % vbs
-        if tail_len == 0:
+        tail = self._derive_tail_block(req)
+        if tail is None:
             return None
+        tail_key, tail_len = tail
         if written < prompt_len:
             return None  # tail prompt rows not written yet
         tail_idx = prompt_len // vbs
@@ -493,9 +523,6 @@ class SchedulerConnector:
         block_hashes = self._block_hashes.get(req_id) or ()
         if tail_idx >= len(allocated) or tail_idx > len(block_hashes):
             return None  # tail block not allocated / full-block hashes lagging
-        parent = block_hashes[tail_idx - 1] if tail_idx > 0 else self._kv_cache_utils.NONE_HASH
-        tail_tokens = list(req.prompt_token_ids[tail_idx * vbs : prompt_len])
-        tail_key = bytes(self._hash_block_tokens(self._tail_hash_fn, parent, tail_tokens, None))
         self._tail_saved.add(req_id)
         logger.info(
             "[PegaKVConnector] req=%s pd_tail_save: block_id=%d tail_tokens=%d key=%s",
@@ -505,6 +532,44 @@ class SchedulerConnector:
             tail_key.hex(),
         )
         return SaveIntent(block_ids=(allocated[tail_idx],), block_hashes=(tail_key,))
+
+    def _derive_tail_block(self, request: "Request") -> tuple[bytes, int] | None:
+        if self._tail_hash_fn is None:
+            return None
+        # The tail key carries no extra_keys. Reusing it for salted, LoRA, or
+        # multimodal requests would alias distinct vLLM cache identities.
+        if request.lora_request is not None or request.cache_salt or request.mm_features:
+            return None
+        vbs = self._ctx.virtual_block_size
+        prompt_len = request.num_prompt_tokens
+        tail_len = prompt_len % vbs
+        if tail_len == 0:
+            return None
+        tail_idx = prompt_len // vbs
+        block_hashes = tuple(request.block_hashes)
+        if tail_idx > len(block_hashes):
+            raise RuntimeError(
+                f"req {request.request_id} missing parent hash for tail block: "
+                f"tail_idx={tail_idx} full_hashes={len(block_hashes)}"
+            )
+        parent = block_hashes[tail_idx - 1] if tail_idx > 0 else self._kv_cache_utils.NONE_HASH
+        tail_tokens = list(request.prompt_token_ids[tail_idx * vbs : prompt_len])
+        tail_key = bytes(self._hash_block_tokens(self._tail_hash_fn, parent, tail_tokens, None))
+        return tail_key, tail_len
+
+    def _build_query(
+        self, request: "Request", computed_blocks: int
+    ) -> tuple[tuple[bytes, ...], int]:
+        query_hashes = tuple(request.block_hashes[computed_blocks:])
+        if not self._tail_load_enabled:
+            return query_hashes, 0
+
+        tail = self._derive_tail_block(request)
+        # Loading a one-token tail cannot reduce local work: vLLM must always
+        # execute at least the final prompt token to produce logits.
+        if tail is None or tail[1] <= 1:
+            return query_hashes, 0
+        return query_hashes + (tail[0],), tail[1]
 
     def _consume_full_block_saves(self, req_id: str) -> SaveIntent | None:
         # block_hashes are at virtual_block_size granularity, 1-to-1 with block_ids.

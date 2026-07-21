@@ -20,6 +20,7 @@ install_connector_unit_stubs()
 
 from pegaflow.connector.common import ConnectorContext
 from pegaflow.connector.scheduler import SchedulerConnector
+from pegaflow.pegaflow import QueryReady
 
 VBS = 16  # virtual block size for these tests
 
@@ -67,6 +68,7 @@ def _make_connector(req, allocated: list[int]) -> SchedulerConnector:
     sc = SchedulerConnector(_make_ctx())
     # Inject the tail machinery directly: these tests pin the TRIGGER, not
     # vLLM's hash function (covered by the cross-engine e2e gates).
+    sc._tail_save_enabled = True
     sc._tail_hash_fn = object()
     sc._kv_cache_utils = SimpleNamespace(NONE_HASH=b"\x00" * 32)
     sc._hash_block_tokens = lambda fn, parent, tokens, extra: b"tail:%d" % len(tokens)
@@ -76,6 +78,17 @@ def _make_connector(req, allocated: list[int]) -> SchedulerConnector:
     sc._scheduled_tokens[req.request_id] = 0
     sc._block_index_offsets[req.request_id] = 0
     sc._next_stored_block_idx[req.request_id] = 0
+    return sc
+
+
+def _make_load_connector(req, hit_blocks: int) -> SchedulerConnector:
+    ctx = _make_ctx()
+    ctx.engine_client.query_prefetch.return_value = QueryReady(hit_blocks, b"lease")
+    sc = SchedulerConnector(ctx)
+    sc._tail_load_enabled = True
+    sc._tail_hash_fn = object()
+    sc._kv_cache_utils = SimpleNamespace(NONE_HASH=b"\x00" * 32)
+    sc._hash_block_tokens = lambda fn, parent, tokens, extra: b"tail:%d" % len(tokens)
     return sc
 
 
@@ -196,3 +209,78 @@ class TestTailSaveThroughBuildConnectorMeta:
         intent = meta.save_intents.get("r1")
         assert intent is not None
         assert 13 in intent.block_ids
+
+
+class TestTailLoad:
+    def test_tail_hit_returns_prompt_minus_one_tokens(self):
+        req = _make_request("r1", prompt_len=50, full_hashes=3)
+        sc = _make_load_connector(req, hit_blocks=4)
+
+        assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (49, True)
+        sc._ctx.engine_client.query_prefetch.assert_called_once_with(
+            "test",
+            [*req.block_hashes, b"tail:2"],
+            req_id="r1",
+            wait_for_remote=False,
+        )
+
+    def test_tail_hit_allocates_and_loads_the_partial_page(self):
+        req = _make_request("r1", prompt_len=50, full_hashes=3)
+        sc = _make_load_connector(req, hit_blocks=4)
+        assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (49, True)
+        blocks = SimpleNamespace(
+            get_block_ids=lambda: ([10, 11, 12, 13],),
+            blocks=[[SimpleNamespace(block_hash=None) for _ in range(4)]],
+        )
+
+        sc.update_state_after_alloc(req, blocks, num_external_tokens=49)
+
+        intent = sc._pending_load_intents["r1"]
+        assert intent.block_ids == (10, 11, 12, 13)
+        assert intent.num_tokens == 49
+        assert intent.lease == b"lease"
+
+    def test_tail_hit_starts_after_the_local_block_prefix(self):
+        req = _make_request("r1", prompt_len=50, full_hashes=3)
+        sc = _make_load_connector(req, hit_blocks=3)
+
+        assert sc.get_num_new_matched_tokens(req, num_computed_tokens=16) == (33, True)
+        blocks = SimpleNamespace(
+            get_block_ids=lambda: ([10, 11, 12, 13],),
+            blocks=[
+                [SimpleNamespace(block_hash=b"local")]
+                + [SimpleNamespace(block_hash=None) for _ in range(3)]
+            ],
+        )
+
+        sc.update_state_after_alloc(req, blocks, num_external_tokens=33)
+
+        intent = sc._pending_load_intents["r1"]
+        assert intent.block_ids == (11, 12, 13)
+        assert intent.num_tokens == 33
+
+    def test_missing_tail_keeps_the_full_block_prefix(self):
+        req = _make_request("r1", prompt_len=50, full_hashes=3)
+        sc = _make_load_connector(req, hit_blocks=3)
+
+        assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (48, True)
+
+    def test_one_token_tail_is_not_queried(self):
+        req = _make_request("r1", prompt_len=49, full_hashes=3)
+        sc = _make_load_connector(req, hit_blocks=3)
+
+        assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (48, True)
+        queried_hashes = sc._ctx.engine_client.query_prefetch.call_args.args[1]
+        assert queried_hashes == req.block_hashes
+
+    def test_sub_block_prompt_loads_one_page_and_recomputes_last_token(self):
+        req = _make_request("r1", prompt_len=10, full_hashes=0)
+        sc = _make_load_connector(req, hit_blocks=1)
+
+        assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (9, True)
+
+    def test_block_aligned_full_hit_recomputes_last_token(self):
+        req = _make_request("r1", prompt_len=48, full_hashes=3)
+        sc = _make_load_connector(req, hit_blocks=3)
+
+        assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (47, True)
