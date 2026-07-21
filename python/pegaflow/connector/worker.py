@@ -318,7 +318,6 @@ class WorkerConnector:
                     registration.num_blocks,
                 )
 
-        torch.cuda.synchronize(self._torch_device)
         ok, message = self._ctx.engine_client.register_context_batch(
             self._ctx.instance_id,
             self._ctx.namespace,

@@ -52,6 +52,7 @@ def main() -> int:
         [kv_stride_bytes],
         [segments],
         "direct",
+        False,
     )
     if not ok:
         print(f"register_context_batch failed: {msg}", file=sys.stderr)
