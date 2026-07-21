@@ -5,8 +5,6 @@ pub(crate) mod transfer_lock;
 mod write_path;
 
 use bytesize::ByteSize;
-#[cfg(not(feature = "rdma"))]
-use log::warn;
 use log::{debug, info, warn};
 use std::collections::HashSet;
 use std::num::NonZeroU64;

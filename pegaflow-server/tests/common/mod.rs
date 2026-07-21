@@ -377,6 +377,7 @@ impl MockVllmRpcHarness {
                 lease,
                 block_ids: (0..block_count as u32).collect(),
             }],
+            wait_for_completion: false,
         };
         match self.worker.load(request.clone()).await {
             Ok(response) => Ok(LoadRpcExchange {
