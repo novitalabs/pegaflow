@@ -53,7 +53,17 @@ impl RdmaFetch {
             .fetch_blocks(&node, req_id, namespace, &remaining_hashes[..found])
             .await;
         if require_full_prefix && blocks.len() != found {
-            return None;
+            // The advertised owner served fewer blocks than the MetaServer
+            // promised (stale advertisement or failed fetch). Keep the partial
+            // result so poll_existing blacklists RDMA for this request instead
+            // of the wait loop retrying the same fetch until timeout.
+            warn!(
+                "RDMA fetch returned fewer blocks than advertised: req_id={} node={} returned={} advertised={}",
+                req_id,
+                node,
+                blocks.len(),
+                found
+            );
         }
         Some((found, blocks))
     }
@@ -141,8 +151,9 @@ struct PrefetchState {
     active: HashMap<String, PrefetchEntry>,
     /// Reserved SSD prefetch budget for active background tasks.
     reserved_ssd_prefetch_blocks: usize,
-    /// req_ids where RDMA remote fetch returned zero blocks (remote evicted).
-    /// Prevents re-triggering RDMA on every subsequent poll for the same request.
+    /// req_ids where the advertised RDMA owner served fewer blocks than the
+    /// MetaServer promised (stale advertisement or failed fetch). Prevents
+    /// re-triggering RDMA on every subsequent poll for the same request.
     failed_remote: HashMap<String, Instant>,
 }
 
@@ -464,6 +475,7 @@ fn reserve_ssd_prefetch_slots(
     state: Arc<Mutex<PrefetchState>>,
     max_prefetch_blocks: usize,
     requested: usize,
+    require_full: bool,
 ) -> Option<(usize, SsdPrefetchReservation)> {
     if requested == 0 {
         return None;
@@ -472,7 +484,7 @@ fn reserve_ssd_prefetch_slots(
     let mut guard = state.lock();
     let available = max_prefetch_blocks.saturating_sub(guard.reserved_ssd_prefetch_blocks);
 
-    if available == 0 {
+    if available == 0 || (require_full && available < requested) {
         core_metrics()
             .ssd_prefetch_backpressure_blocks
             .add(requested as u64, &[]);
@@ -582,11 +594,15 @@ async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> 
                 Arc::clone(&deps.prefetch_state),
                 deps.max_prefetch_blocks,
                 found,
+                wait_for_full_prefix,
             )
         {
             let keys = remaining_keys[..reserved].to_vec();
             let (found, blocks) = ssd.prefetch_prefix(keys).await;
-            if found > 0 {
+            // wait_for_full_prefix is all-or-nothing: a partial SSD result
+            // (backpressured reservation or short read) must not let the
+            // caller proceed with a partial prefix.
+            if found > 0 && (!wait_for_full_prefix || found == remaining_keys.len()) {
                 record_tier_attribution(
                     total,
                     hit,
@@ -735,5 +751,99 @@ mod tests {
         assert!(rdma_registration_from_resident_keys(Some(PrefetchSource::Ssd), &[k1]).is_none());
         assert!(rdma_registration_from_resident_keys(Some(PrefetchSource::Rdma), &[]).is_none());
         assert!(rdma_registration_from_resident_keys(None, &[]).is_none());
+    }
+
+    /// Feed a finished prefetch task with the given outcome through
+    /// `poll_existing` and report whether the request got blacklisted.
+    async fn poll_outcome_blacklists_req(
+        source: Option<PrefetchSource>,
+        found: usize,
+        inserts: usize,
+    ) -> bool {
+        let scheduler = PrefetchScheduler::new(None, None, None, 16);
+        let read_cache = ReadCache::new(1 << 20, false, None);
+        let result = PrefetchTaskResult {
+            source,
+            found,
+            cache_inserts: (0..inserts).map(|i| (key(i as u8), block())).collect(),
+            ready_blocks: Vec::new(),
+            missing: 0,
+        };
+        let handle = tokio::spawn(async move { result });
+        while !handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        scheduler.state.lock().active.insert(
+            "req".to_string(),
+            PrefetchEntry {
+                handle,
+                started_at: Instant::now(),
+            },
+        );
+
+        let _ = scheduler.poll_existing(&read_cache, "req").await;
+
+        scheduler.state.lock().failed_remote.contains_key("req")
+    }
+
+    #[tokio::test]
+    async fn short_rdma_result_blacklists_request() {
+        // Partial prefix and total failure both mean the advertised owner
+        // could not serve what the MetaServer promised.
+        assert!(poll_outcome_blacklists_req(Some(PrefetchSource::Rdma), 3, 2).await);
+        assert!(poll_outcome_blacklists_req(Some(PrefetchSource::Rdma), 3, 0).await);
+    }
+
+    #[tokio::test]
+    async fn full_or_non_rdma_result_does_not_blacklist() {
+        assert!(!poll_outcome_blacklists_req(Some(PrefetchSource::Rdma), 3, 3).await);
+        assert!(!poll_outcome_blacklists_req(Some(PrefetchSource::Ssd), 3, 2).await);
+        assert!(!poll_outcome_blacklists_req(None, 0, 0).await);
+    }
+
+    #[test]
+    fn gc_sweeps_only_expired_failed_remote_entries() {
+        let scheduler = PrefetchScheduler::new(None, None, None, 16);
+        scheduler
+            .state
+            .lock()
+            .failed_remote
+            .insert("req".to_string(), Instant::now());
+
+        let (_, swept) = scheduler.gc_stale_entries(Duration::ZERO, Duration::from_secs(60));
+        assert_eq!(swept, 0);
+
+        let (_, swept) = scheduler.gc_stale_entries(Duration::ZERO, Duration::ZERO);
+        assert_eq!(swept, 1);
+        assert!(scheduler.state.lock().failed_remote.is_empty());
+    }
+
+    #[test]
+    fn strict_ssd_reservation_is_all_or_nothing() {
+        let state = Arc::new(Mutex::new(PrefetchState {
+            active: HashMap::new(),
+            reserved_ssd_prefetch_blocks: 0,
+            failed_remote: HashMap::new(),
+        }));
+        let (_n, hold) = reserve_ssd_prefetch_slots(Arc::clone(&state), 10, 6, false)
+            .expect("reservation within capacity should succeed");
+        // 4 of 10 slots remain.
+
+        // Strict request above availability is denied and reserves nothing.
+        assert!(reserve_ssd_prefetch_slots(Arc::clone(&state), 10, 5, true).is_none());
+        assert_eq!(state.lock().reserved_ssd_prefetch_blocks, 6);
+
+        // Strict request within availability reserves the full amount.
+        let (reserved, hold2) = reserve_ssd_prefetch_slots(Arc::clone(&state), 10, 4, true)
+            .expect("exact reservation should succeed");
+        assert_eq!(reserved, 4);
+        assert_eq!(state.lock().reserved_ssd_prefetch_blocks, 10);
+        drop(hold2);
+
+        // Non-strict still reserves partially when the full amount is denied.
+        let (reserved, _hold3) = reserve_ssd_prefetch_slots(Arc::clone(&state), 10, 5, false)
+            .expect("partial reservation should succeed");
+        assert_eq!(reserved, 4);
+        drop(hold);
     }
 }
