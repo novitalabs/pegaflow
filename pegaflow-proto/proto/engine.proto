@@ -46,6 +46,30 @@ message RegisterContextRequest {
   // Set by the connector for MLA; the engine derives per-layer page offsets
   // from the registered layouts. See spec.md.
   bool page_first = 18;
+  // Native VMM registration. Each layer is a strided view into one fused,
+  // GPU-resident VMM allocation the client exported as a POSIX file descriptor.
+  // The fd itself does NOT travel here — it is a host-local kernel object that
+  // cannot cross gRPC. The client sends it over the server's fd side-channel
+  // (Unix domain socket, SCM_RIGHTS; see HealthResponse.fd_socket_path) keyed
+  // by (instance_id, device_id) BEFORE issuing this RPC. Unlike a CUDA IPC
+  // handle, a VMM POSIX-fd allocation can be registered into the NIC for
+  // GPUDirect RDMA — which is why native clients use VMM, not cuIpcGetMemHandle.
+  repeated NativeKvTensor native_kv_tensors = 19;
+  // Total byte size of the fused VMM allocation the client exported, already
+  // rounded up to the CUDA VMM granularity. The server reserves and maps
+  // exactly this size; deriving it from layer extents would not be
+  // granularity-aligned and `cuMemAddressReserve` would reject it. Zero for
+  // non-native (Python) registrations.
+  uint64 native_alloc_size = 20;
+}
+
+// One strided layer view into a client's fused VMM allocation. The backing fd
+// arrives out-of-band over the fd side-channel; all tensors of one registration
+// batch share the single allocation identified by (instance_id, device_id).
+message NativeKvTensor {
+  uint64 offset_bytes = 1;
+  uint64 size_bytes = 2;
+  uint64 block_stride_bytes = 3;
 }
 
 message RegisterContextResponse {
@@ -77,6 +101,7 @@ message LoadRequest {
   string load_state_shm = 4;
   repeated string layer_names = 5;
   repeated LeaseLoad loads = 6;
+  bool wait_for_completion = 7;
 }
 
 message LeaseLoad {
@@ -85,6 +110,12 @@ message LeaseLoad {
 }
 
 message LoadResponse {
+  ResponseStatus status = 1;
+}
+
+message FlushRequest {}
+
+message FlushResponse {
   ResponseStatus status = 1;
 }
 
@@ -133,6 +164,11 @@ message HealthRequest {}
 
 message HealthResponse {
   ResponseStatus status = 1;
+  // Absolute path to the server's fd side-channel (Unix domain socket). Native
+  // VMM clients connect here and send their exported allocation fd via
+  // SCM_RIGHTS, keyed by (instance_id, device_id), before register_context_batch.
+  // Empty if the server has no local fd channel (e.g. Python-only deployments).
+  string fd_socket_path = 2;
 }
 
 // Liveness session: vllm opens a server-streaming RPC at startup and holds
@@ -203,6 +239,7 @@ service Engine {
   rpc RegisterContextBatch(RegisterContextRequest) returns (RegisterContextResponse);
   rpc Save(SaveRequest) returns (SaveResponse);
   rpc Load(LoadRequest) returns (LoadResponse);
+  rpc Flush(FlushRequest) returns (FlushResponse);
   // Prefetch query: check memory + trigger SSD prefetch or cross-node RDMA fetch for missing blocks
   rpc QueryPrefetch(QueryRequest) returns (QueryResponse);
   rpc Release(ReleaseRequest) returns (ReleaseResponse);

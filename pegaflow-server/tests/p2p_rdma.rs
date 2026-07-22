@@ -161,7 +161,7 @@ async fn spawn_engine_server(engine: Arc<PegaEngine>, port: u16) {
             14,
         ),
     ));
-    let service = GrpcEngineService::new(engine, registry, shutdown, hll_tracker);
+    let service = GrpcEngineService::new(engine, registry, shutdown, hll_tracker, None);
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
     tokio::spawn(async move {
         Server::builder()

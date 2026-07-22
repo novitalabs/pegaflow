@@ -235,7 +235,7 @@ fn wedge_register_request(i: usize) -> RegisterContextRequest {
     RegisterContextRequest {
         instance_id: format!("wedge-{i}"),
         namespace: "wedge".to_string(),
-        client_version: env!("CARGO_PKG_VERSION").to_string(),
+        client_version: pegaflow_proto::VERSION.to_string(),
         tp_rank: 0,
         tp_size: 1,
         world_size: 1,
@@ -249,6 +249,8 @@ fn wedge_register_request(i: usize) -> RegisterContextRequest {
         pp_rank: 0,
         transfer_mode: TransferMode::Direct as i32,
         page_first: false,
+        native_kv_tensors: Vec::new(),
+        native_alloc_size: 0,
     }
 }
 
@@ -277,6 +279,7 @@ fn start_cluster(worker_threads: usize) -> TestCluster {
         registry.clone(),
         Arc::clone(&shutdown),
         hll_tracker,
+        None,
     );
     rt.spawn(async move {
         Server::builder()

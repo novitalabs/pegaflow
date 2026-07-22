@@ -1,4 +1,5 @@
 mod check_cuda_version;
+pub mod fd_channel;
 pub mod http_server;
 pub mod metric;
 pub mod proto;
@@ -91,6 +92,20 @@ pub struct Cli {
     /// Enable Prometheus /metrics endpoint on the HTTP server.
     #[arg(long, default_value_t = true)]
     pub enable_prometheus: bool,
+
+    /// Unix socket path for the native-VMM fd side-channel. Native clients send
+    /// their exported allocation fd here (SCM_RIGHTS) before registration; the
+    /// path is advertised back via HealthResponse. Empty disables native VMM
+    /// registration (Python clients are unaffected).
+    #[arg(long, default_value = "/tmp/pegaflow-fd.sock")]
+    pub fd_socket_path: String,
+
+    /// Initialize the Python/torch CUDA registry at startup. Required for the
+    /// Python (vLLM) connector, whose tensors arrive as pickled torch wrappers.
+    /// Native VMM clients do not need it — pass `--python-registry false` for a
+    /// torch-free deployment that serves only native clients.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub python_registry: bool,
 
     /// Enable OTLP metrics export over gRPC (e.g. http://127.0.0.1:4317).
     #[arg(long)]
@@ -370,6 +385,27 @@ fn init_python_cuda(device_ids: &[i32]) -> Result<(), std::io::Error> {
     })
 }
 
+/// Create each device's primary CUDA context via cudarc — the torch-free
+/// equivalent of `init_python_cuda`, used when `--python-registry false`.
+/// Native VMM clients bind these contexts when importing their allocations.
+fn init_cudarc_cuda(device_ids: &[i32]) -> Result<(), std::io::Error> {
+    if device_ids.is_empty() {
+        return Err(std::io::Error::other("no CUDA devices to initialize"));
+    }
+    for &device_id in device_ids {
+        let ordinal = usize::try_from(device_id)
+            .map_err(|_| std::io::Error::other(format!("device_id {device_id} must be >= 0")))?;
+        let ctx = cudarc::driver::CudaContext::new(ordinal).map_err(|e| {
+            std::io::Error::other(format!("cudarc init device {device_id}: {e}"))
+        })?;
+        ctx.bind_to_thread().map_err(|e| {
+            std::io::Error::other(format!("cudarc bind device {device_id}: {e}"))
+        })?;
+        info!("Initialized CUDA context for device {device_id} (cudarc, torch-free)");
+    }
+    Ok(())
+}
+
 struct MetricsState {
     meter_provider: Option<SdkMeterProvider>,
     prometheus_registry: Option<Registry>,
@@ -463,17 +499,31 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         return Err("No CUDA devices available".into());
     }
 
-    init_python_cuda(&devices)?;
+    if cli.python_registry {
+        init_python_cuda(&devices)?;
+    } else {
+        // Torch-free path: create each device's CUDA context via cudarc instead
+        // of forcing torch to do it. Native VMM import binds these contexts.
+        init_cudarc_cuda(&devices)?;
+    }
     info!(
         "CUDA runtime initialized for {} device(s): {:?}",
         devices.len(),
         devices
     );
 
-    let registry = CudaTensorRegistry::new().map_err(|err| {
-        let msg = format_py_err(err);
-        std::io::Error::other(format!("failed to initialize torch CUDA context: {msg}"))
-    })?;
+    // The Python registry initializes torch's CUDA context for the vLLM
+    // connector. Native VMM clients import their own allocations without torch,
+    // so a native-only deployment can skip it entirely (no torch dependency).
+    let registry = if cli.python_registry {
+        CudaTensorRegistry::new().map_err(|err| {
+            let msg = format_py_err(err);
+            std::io::Error::other(format!("failed to initialize torch CUDA context: {msg}"))
+        })?
+    } else {
+        info!("Python/torch registry disabled; serving native VMM clients only");
+        CudaTensorRegistry::empty()
+    };
     // Confine the registry to its own thread: GIL + CUDA work now happens off
     // the async runtime, so a wedged `empty_cache` can't starve tokio workers.
     let registry = RegistryHandle::spawn(registry);
@@ -602,11 +652,24 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             storage_config,
         )?);
 
+        // Bind the native-VMM fd side-channel before serving, so a client that
+        // connects the moment gRPC comes up finds the socket ready. Empty path
+        // disables it (Python-only deployments).
+        let fd_channel = if cli.fd_socket_path.is_empty() {
+            None
+        } else {
+            Some(
+                crate::fd_channel::FdChannel::bind(cli.fd_socket_path.clone())
+                    .map_err(|e| format!("bind fd side-channel {}: {e}", cli.fd_socket_path))?,
+            )
+        };
+
         let service = GrpcEngineService::new(
             Arc::clone(&engine),
             registry.clone(),
             Arc::clone(&shutdown),
             Arc::clone(&hll_tracker),
+            fd_channel,
         );
 
         // Spawn background GC task for stale inflight blocks and expired transfer locks
