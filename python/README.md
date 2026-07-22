@@ -120,6 +120,12 @@ Prefill: `{"pegaflow.pd_tail_save": true}`
 
 Decode: `{"pegaflow.pd_tail_load": true, "pegaflow.wait_for_full_prefix": true}`
 
+`pegaflow.wait_for_full_prefix` makes decode wait (up to 30s) until the full
+prompt prefix is fetchable from a remote node via MetaServer + RDMA. It only
+applies when prefill and decode run separate engines; it does not observe
+saves landing in a shared/local engine and has no effect when RDMA is not
+configured.
+
 ## Development
 
 See the [examples](../examples/) directory for more usage examples.
