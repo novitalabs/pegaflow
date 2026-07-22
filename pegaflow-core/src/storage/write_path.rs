@@ -7,7 +7,6 @@ use tokio::sync::oneshot;
 
 use crate::backing::SsdBackingStore;
 use crate::block::{BlockKey, InflightBlock, SealedBlock, SlotInsertResult};
-use crate::cache::CacheInsertOutcome;
 use crate::internode::MetaServerClient;
 use crate::metrics::core_metrics;
 use crate::offload::InsertEntries;
@@ -200,8 +199,8 @@ fn process_insert_batch(
     if !sealed_blocks.is_empty()
         && let Some(deps) = &deps
     {
-        let resident_saves = deps.read_cache.batch_insert_refs(&sealed_blocks);
-        send_backing_batches(deps, namespace, &sealed_blocks, resident_saves);
+        let resident_keys = deps.read_cache.batch_insert_refs(&sealed_blocks);
+        send_backing_batches(deps, namespace, &sealed_blocks, resident_keys);
     }
 
     ordered_fast_path_seals
@@ -270,7 +269,7 @@ fn send_backing_batches(
     deps: &InsertDeps,
     namespace: &str,
     blocks: &[(BlockKey, Arc<SealedBlock>)],
-    resident_saves: Vec<(BlockKey, CacheInsertOutcome)>,
+    resident_keys: Vec<BlockKey>,
 ) {
     if blocks.is_empty() {
         return;
@@ -288,28 +287,16 @@ fn send_backing_batches(
     }
 
     if let Some(client) = &deps.metaserver_client {
-        register_block_hashes(client, namespace, resident_saves, &deps.read_cache);
+        register_block_hashes(client, namespace, resident_keys);
     }
 }
 
-fn register_block_hashes(
-    client: &MetaServerClient,
-    namespace: &str,
-    resident_saves: Vec<(BlockKey, CacheInsertOutcome)>,
-    read_cache: &Arc<ReadCache>,
-) {
-    if resident_saves.is_empty() {
+fn register_block_hashes(client: &MetaServerClient, namespace: &str, resident_keys: Vec<BlockKey>) {
+    if resident_keys.is_empty() {
         return;
     }
-    let hashes: Vec<Vec<u8>> = resident_saves
-        .iter()
-        .map(|(key, _)| key.hash.clone())
-        .collect();
-
-    let read_cache = Arc::clone(read_cache);
-    client.try_register_namespace_with_hint(namespace.to_string(), hashes, move |owner_counts| {
-        read_cache.apply_owner_hints(&resident_saves, &owner_counts);
-    });
+    let hashes = resident_keys.into_iter().map(|key| key.hash).collect();
+    client.try_register_namespace(namespace.to_string(), hashes);
 }
 
 fn gc_inflight(

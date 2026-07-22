@@ -7,9 +7,7 @@ use crate::block::{BlockKey, SealedBlock};
 use crate::cache::{CacheInsertOutcome, TinyLfuCache};
 use crate::metrics::{CACHE_CLASS_RECLAIMABLE, CACHE_CLASS_RETAINED, core_metrics};
 
-const MIN_RECLAIMABLE_OWNER_COUNT: u32 = 3;
-
-pub(super) struct ReadCache {
+pub(crate) struct ReadCache {
     inner: Mutex<ReadCacheInner>,
 }
 
@@ -26,7 +24,7 @@ enum ResidentClass {
 }
 
 impl ReadCache {
-    pub(super) fn new(
+    pub(crate) fn new(
         capacity_bytes: usize,
         enable_lfu_admission: bool,
         value_size_hint: Option<usize>,
@@ -93,9 +91,9 @@ impl ReadCache {
     pub(super) fn batch_insert_refs(
         &self,
         blocks: &[(BlockKey, Arc<SealedBlock>)],
-    ) -> Vec<(BlockKey, CacheInsertOutcome)> {
+    ) -> Vec<BlockKey> {
         let mut inner = self.inner.lock();
-        let mut resident = Vec::new();
+        let mut resident_keys = Vec::new();
         for (key, block) in blocks {
             let outcome = insert_block(
                 &mut inner,
@@ -107,10 +105,10 @@ impl ReadCache {
                 outcome,
                 CacheInsertOutcome::InsertedNew | CacheInsertOutcome::AlreadyExists
             ) {
-                resident.push((key.clone(), outcome));
+                resident_keys.push(key.clone());
             }
         }
-        resident
+        resident_keys
     }
 
     /// Look up specific blocks by key without prefix-scan semantics (does not
@@ -163,20 +161,23 @@ impl ReadCache {
         removed
     }
 
-    pub(super) fn apply_owner_hints(
-        &self,
-        resident_saves: &[(BlockKey, CacheInsertOutcome)],
-        owner_counts: &[u32],
-    ) {
-        debug_assert_eq!(resident_saves.len(), owner_counts.len());
+    pub(crate) fn mark_reclaimable_hashes(&self, namespace: &str, hashes: &[Vec<u8>]) {
         let mut inner = self.inner.lock();
-        for ((key, outcome), owner_count) in resident_saves.iter().zip(owner_counts) {
-            if *outcome == CacheInsertOutcome::InsertedNew
-                && *owner_count >= MIN_RECLAIMABLE_OWNER_COUNT
-            {
-                mark_reclaimable(&mut inner, key);
-            }
+        for hash in hashes {
+            let key = BlockKey::new(namespace.to_string(), hash.clone());
+            mark_reclaimable(&mut inner, &key);
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_retained_for_test(&self, key: BlockKey, block: Arc<SealedBlock>) {
+        let mut inner = self.inner.lock();
+        insert_block(&mut inner, key, block, ResidentClass::Retained);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_reclaimable_for_test(&self, key: &BlockKey) -> bool {
+        self.inner.lock().reclaimable.contains_key(key)
     }
 }
 
@@ -387,58 +388,47 @@ mod tests {
     }
 
     #[test]
-    fn local_save_reports_resident_insert_outcomes() {
+    fn local_save_reports_resident_keys() {
         let cache = make_cache();
         let key = BlockKey::new("ns".into(), vec![1]);
 
         assert_eq!(
             cache.batch_insert_refs(&[(key.clone(), make_block())]),
-            vec![(key.clone(), CacheInsertOutcome::InsertedNew)]
+            vec![key.clone()]
         );
         assert_eq!(
             cache.batch_insert_refs(&[(key.clone(), make_block())]),
-            vec![(key, CacheInsertOutcome::AlreadyExists)]
+            vec![key]
         );
     }
 
     #[test]
-    fn owner_hint_marks_only_new_third_owner_as_reclaimable() {
+    fn reclaimable_hashes_move_only_matching_residents() {
         let cache = make_cache();
-        let second_owner = BlockKey::new("ns".into(), vec![1]);
-        let third_owner = BlockKey::new("ns".into(), vec![2]);
-        let existing = BlockKey::new("ns".into(), vec![3]);
+        let retained = BlockKey::new("ns".into(), vec![1]);
+        let reclaimable = BlockKey::new("ns".into(), vec![2]);
+        let other_namespace = BlockKey::new("other".into(), vec![1]);
 
         cache.batch_insert(vec![
-            (second_owner.clone(), make_block()),
-            (third_owner.clone(), make_block()),
-            (existing.clone(), make_block()),
+            (retained.clone(), make_block()),
+            (other_namespace.clone(), make_block()),
         ]);
-        cache.apply_owner_hints(
-            &[
-                (second_owner.clone(), CacheInsertOutcome::InsertedNew),
-                (third_owner.clone(), CacheInsertOutcome::InsertedNew),
-                (existing.clone(), CacheInsertOutcome::AlreadyExists),
-            ],
-            &[2, MIN_RECLAIMABLE_OWNER_COUNT, MIN_RECLAIMABLE_OWNER_COUNT],
-        );
+        cache.batch_insert_resident_keys(vec![(reclaimable.clone(), make_block())]);
+        cache.mark_reclaimable_hashes("ns", &[vec![1], vec![2], vec![3]]);
 
-        assert_class(&cache, &second_owner, ResidentClass::Retained);
-        assert_class(&cache, &third_owner, ResidentClass::Reclaimable);
-        assert_class(&cache, &existing, ResidentClass::Retained);
-        assert_eq!(cache.remove_lru_batch(1)[0].0, third_owner);
+        assert_class(&cache, &retained, ResidentClass::Reclaimable);
+        assert_class(&cache, &reclaimable, ResidentClass::Reclaimable);
+        assert_class(&cache, &other_namespace, ResidentClass::Retained);
     }
 
     #[test]
-    fn owner_hint_for_evicted_block_is_noop() {
+    fn reclaimable_hash_for_evicted_block_is_noop() {
         let cache = make_cache();
         let key = BlockKey::new("ns".into(), vec![1]);
         cache.batch_insert(vec![(key.clone(), make_block())]);
         cache.remove_lru_batch(1);
 
-        cache.apply_owner_hints(
-            &[(key, CacheInsertOutcome::InsertedNew)],
-            &[MIN_RECLAIMABLE_OWNER_COUNT],
-        );
+        cache.mark_reclaimable_hashes("ns", &[key.hash]);
 
         assert!(cache.remove_lru_batch(1).is_empty());
     }

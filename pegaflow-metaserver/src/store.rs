@@ -6,6 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+const MIN_RECLAIMABLE_OWNER_COUNT: usize = 3;
+
 pub const DEFAULT_NODE_STALE_SECS: u64 = 30;
 pub const DEFAULT_TTL_MINUTES: u64 = 120;
 
@@ -205,24 +207,26 @@ impl BlockHashStore {
         hashes: &[Vec<u8>],
         node: &str,
         node_id: Uuid,
-    ) -> Result<Vec<u32>, StoreError> {
+    ) -> Result<Vec<Vec<u8>>, StoreError> {
         self.touch_node_session(node, node_id)?;
         let node: Arc<str> = Arc::from(node);
         let now = Instant::now();
-        let mut owner_counts = Vec::with_capacity(hashes.len());
+        let mut reclaimable_hashes = Vec::new();
         for hash in hashes {
             let key = BlockKey::new(namespace.to_string(), hash.clone());
             let mut owners = self.blocks.entry(key).or_default();
-            owners.insert(
+            let previous = owners.insert(
                 Arc::clone(&node),
                 OwnerRecord {
                     node_id,
                     key_register_time: now,
                 },
             );
-            owner_counts.push(owners.len() as u32);
+            if previous.is_none() && owners.len() >= MIN_RECLAIMABLE_OWNER_COUNT {
+                reclaimable_hashes.push(hash.clone());
+            }
         }
-        Ok(owner_counts)
+        Ok(reclaimable_hashes)
     }
 
     pub fn remove_hashes(
@@ -467,10 +471,10 @@ mod tests {
 
         let hashes = vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8], vec![9, 10, 11, 12]];
 
-        let inserted = store
+        let reclaimable = store
             .insert_hashes(namespace, &hashes, node, node_id)
             .unwrap();
-        assert_eq!(inserted, vec![1, 1, 1]);
+        assert!(reclaimable.is_empty());
 
         let existing = store.query_prefix(namespace, &hashes);
         assert_eq!(existing.len(), 3);
@@ -514,30 +518,43 @@ mod tests {
     }
 
     #[test]
-    fn insert_returns_owner_counts_aligned_with_hashes() {
+    fn insert_returns_only_new_third_owner_hashes() {
         let store = BlockHashStore::new();
         let node_a = heartbeat_node(&store, "node-a:50055");
         let node_b = heartbeat_node(&store, "node-b:50055");
         let node_c = heartbeat_node(&store, "node-c:50055");
+        let node_d = heartbeat_node(&store, "node-d:50055");
         let hashes = vec![vec![1], vec![2], vec![1]];
 
         assert_eq!(
             store
                 .insert_hashes("ns", &hashes, "node-a:50055", node_a)
                 .unwrap(),
-            vec![1, 1, 1]
+            Vec::<Vec<u8>>::new()
         );
         assert_eq!(
             store
                 .insert_hashes("ns", &hashes, "node-b:50055", node_b)
                 .unwrap(),
-            vec![2, 2, 2]
+            Vec::<Vec<u8>>::new()
         );
         assert_eq!(
             store
                 .insert_hashes("ns", &hashes, "node-c:50055", node_c)
                 .unwrap(),
-            vec![3, 3, 3]
+            vec![vec![1], vec![2]]
+        );
+        assert_eq!(
+            store
+                .insert_hashes("ns", &hashes, "node-c:50055", node_c)
+                .unwrap(),
+            Vec::<Vec<u8>>::new()
+        );
+        assert_eq!(
+            store
+                .insert_hashes("ns", &hashes, "node-d:50055", node_d)
+                .unwrap(),
+            vec![vec![1], vec![2]]
         );
     }
 
