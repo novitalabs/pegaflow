@@ -260,6 +260,7 @@ impl MockVllmRpcHarness {
             instance_id: instance_id.to_string(),
             block_hashes: hashes.to_vec(),
             req_id: req_id.to_string(),
+            wait_for_full_prefix: false,
         };
         match self.scheduler.query_prefetch(request.clone()).await {
             Ok(response) => Ok(RpcExchange {
@@ -402,7 +403,7 @@ impl MockVllmRpcHarness {
         loop {
             match self
                 ._engine
-                .count_prefix_hit_blocks_with_prefetch(INSTANCE_ID, &req_id, hashes)
+                .count_prefix_hit_blocks_with_prefetch(INSTANCE_ID, &req_id, hashes, false)
                 .await
                 .expect("direct save visibility query")
             {

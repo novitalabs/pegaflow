@@ -383,7 +383,7 @@ impl TestEnv {
     /// Query prefix hits. Returns raw PrefetchStatus.
     pub async fn query(&self, hashes: &[Vec<u8>]) -> PrefetchStatus {
         self.engine
-            .count_prefix_hit_blocks_with_prefetch(&self.instance_id, "test", hashes)
+            .count_prefix_hit_blocks_with_prefetch(&self.instance_id, "test", hashes, false)
             .await
             .expect("query")
     }

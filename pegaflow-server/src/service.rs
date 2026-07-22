@@ -538,6 +538,7 @@ impl Engine for GrpcEngineService {
                     &req.instance_id,
                     &req.req_id,
                     &req.block_hashes,
+                    req.wait_for_full_prefix,
                 )
                 .await
                 .map_err(Self::map_engine_error)?;
@@ -969,6 +970,7 @@ mod tests {
             instance_id: "instance".to_string(),
             block_hashes: Vec::new(),
             req_id: String::new(),
+            wait_for_full_prefix: false,
         })
         .expect_err("empty req_id must be rejected before engine lookup");
 
@@ -982,6 +984,7 @@ mod tests {
             instance_id: "instance".to_string(),
             block_hashes: Vec::new(),
             req_id: "request".to_string(),
+            wait_for_full_prefix: false,
         })
         .expect("empty block_hashes are a valid zero-hit query");
     }

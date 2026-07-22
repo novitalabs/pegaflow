@@ -92,6 +92,10 @@ message QueryRequest {
   string instance_id = 1;
   repeated bytes block_hashes = 2;
   string req_id = 3;
+  // Keep the query in Loading until the full remaining prefix is fetchable
+  // from a remote node via MetaServer + RDMA. Does not observe saves landing
+  // in the local engine; no effect when RDMA is not configured.
+  bool wait_for_full_prefix = 4;
 }
 
 message QueryResponse {
