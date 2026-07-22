@@ -29,11 +29,14 @@ if TYPE_CHECKING:
 class _QueryProbe:
     """One remote prefix-query snapshot.
 
-    A probe is keyed by:
+    A probe snapshots:
 
     * ``computed_blocks`` — blocks already computed locally when the query was
       issued
-    * ``query_hashes`` — remaining block hashes sent to the backend
+    * ``query_hashes`` — remaining full-block hashes plus at most one derived
+      tail key sent to the backend
+    * ``tail_tokens`` — valid rows in that tail block, used for token accounting
+      and request-drift validation
 
     If the request keeps making local progress while the backend is loading,
     the current query key may drift.  A *Ready* result is accepted only if the
@@ -79,11 +82,6 @@ class _QueryProbe:
             raise RuntimeError("query probe is still loading")
         return self.hit_blocks
 
-    @property
-    def leased_hashes(self) -> tuple[bytes, ...]:
-        """Hashes covered by the lease. Only valid after Ready."""
-        return self.query_hashes[: self.require_hit_blocks()]
-
 
 class SchedulerConnector:
     """Holds scheduler-only state and behaviors."""
@@ -113,12 +111,18 @@ class SchedulerConnector:
             assert vllm_config is not None
             algo = vllm_config.cache_config.prefix_caching_hash_algo
             if algo != "xxhash_cbor":
-                enabled_option = (
-                    "pegaflow.pd_tail_save" if pd_tail_save else "pegaflow.pd_tail_load"
+                enabled_options = ", ".join(
+                    option
+                    for enabled, option in (
+                        (pd_tail_save, "pegaflow.pd_tail_save"),
+                        (pd_tail_load, "pegaflow.pd_tail_load"),
+                    )
+                    if enabled
                 )
                 raise ValueError(
-                    f"{enabled_option} requires prefix_caching_hash_algo "
+                    "P/D tail-block caching requires prefix_caching_hash_algo "
                     f"'xxhash_cbor' (cross-engine derivable, validated); got {algo!r} — "
+                    f"enabled options: {enabled_options}; "
                     f"run vLLM with --prefix-caching-hash-algo xxhash_cbor"
                 )
             from vllm.utils.hashing import get_hash_fn_by_name
@@ -180,7 +184,7 @@ class SchedulerConnector:
         computed_blocks = num_computed_tokens // self._ctx.virtual_block_size
         query_hashes, tail_tokens = self._build_query(request, computed_blocks)
 
-        # Everything is already computed locally.
+        # Nothing remains to query remotely.
         if not query_hashes:
             self._release_pending_query_probe(req_id)
             self._external_matched_blocks[req_id] = computed_blocks
@@ -270,7 +274,10 @@ class SchedulerConnector:
         computed_blocks = probe.computed_blocks
         vbs = self._ctx.virtual_block_size
         tail_hit = probe.tail_tokens > 0 and hit_blocks == len(probe.query_hashes)
-        hit_tokens = (hit_blocks - 1) * vbs + probe.tail_tokens if tail_hit else hit_blocks * vbs
+        # _build_query appends the tail key last and the backend reports prefix
+        # hits, so a full query hit makes the final block the partial tail.
+        last_block_tokens = probe.tail_tokens if tail_hit else vbs
+        hit_tokens = (hit_blocks - 1) * vbs + last_block_tokens
 
         # A request still needs one forward token to produce logits. The last
         # loaded page may contain that token's KV, but vLLM must recompute and
@@ -278,6 +285,8 @@ class SchedulerConnector:
         locally_computed_tokens = computed_blocks * vbs
         hit_tokens = min(hit_tokens, max(0, num_tokens - locally_computed_tokens - 1))
 
+        # Cacheable tails contain at least two tokens, so recomputing the final
+        # prompt token cannot remove the last leased block from the load.
         loaded_blocks = (hit_tokens + vbs - 1) // vbs
         self._external_matched_blocks[req_id] = computed_blocks + loaded_blocks
 
@@ -368,12 +377,16 @@ class SchedulerConnector:
             )
             if pending_probe is not None:
                 query_hashes, tail_tokens = self._build_query(request, num_computed_blocks)
-                if (
-                    not pending_probe.matches(num_computed_blocks, query_hashes, tail_tokens)
-                    or pending_probe.leased_hashes != query_hashes[:num_load_blocks]
-                ):
+                if not pending_probe.matches(num_computed_blocks, query_hashes, tail_tokens):
                     self._release_pending_query_probe(req_id)
-                    raise RuntimeError(f"req {req_id} load hashes do not match pending query probe")
+                    raise RuntimeError(f"req {req_id} query identity changed before external load")
+                leased_blocks = pending_probe.require_hit_blocks()
+                if leased_blocks != num_load_blocks:
+                    self._release_pending_query_probe(req_id)
+                    raise RuntimeError(
+                        f"req {req_id} leased block mismatch: "
+                        f"leased={leased_blocks} load={num_load_blocks}"
+                    )
             if not load_intent.lease:
                 raise RuntimeError(f"req {req_id} missing query lease for external load")
             self._pending_load_intents[req_id] = load_intent
@@ -543,7 +556,10 @@ class SchedulerConnector:
         vbs = self._ctx.virtual_block_size
         prompt_len = request.num_prompt_tokens
         tail_len = prompt_len % vbs
-        if tail_len == 0:
+        # vLLM must recompute the final prompt token to produce logits. A
+        # one-token tail therefore cannot reduce local work; treating it as a
+        # hit would also lease one more hash than vLLM allocates load blocks.
+        if tail_len <= 1:
             return None
         tail_idx = prompt_len // vbs
         block_hashes = tuple(request.block_hashes)
@@ -565,9 +581,7 @@ class SchedulerConnector:
             return query_hashes, 0
 
         tail = self._derive_tail_block(request)
-        # Loading a one-token tail cannot reduce local work: vLLM must always
-        # execute at least the final prompt token to produce logits.
-        if tail is None or tail[1] <= 1:
+        if tail is None:
             return query_hashes, 0
         return query_hashes + (tail[0],), tail[1]
 

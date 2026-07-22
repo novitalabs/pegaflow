@@ -14,6 +14,8 @@ import hashlib
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from .unit_stubs import install_connector_unit_stubs
 
 install_connector_unit_stubs()
@@ -110,6 +112,11 @@ class TestTailSaveTrigger:
         req = _make_request("r1", prompt_len=48, full_hashes=3)
         sc = _make_connector(req, allocated=[10, 11, 12])
         assert sc._consume_tail_save("r1", written=48) is None
+
+    def test_one_token_tail_is_not_saved(self):
+        req = _make_request("r1", prompt_len=49, full_hashes=3)
+        sc = _make_connector(req, allocated=[10, 11, 12, 13])
+        assert sc._consume_tail_save("r1", written=49) is None
 
     def test_sub_block_prompt_uses_none_hash_parent(self):
         req = _make_request("r1", prompt_len=10, full_hashes=0)
@@ -258,6 +265,31 @@ class TestTailLoad:
         intent = sc._pending_load_intents["r1"]
         assert intent.block_ids == (11, 12, 13)
         assert intent.num_tokens == 33
+
+    def test_request_drift_is_reported_separately_from_lease_count(self):
+        req = _make_request("r1", prompt_len=50, full_hashes=3)
+        sc = _make_load_connector(req, hit_blocks=4)
+        assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (49, True)
+        req.block_hashes[0] = _hash(99)
+        blocks = SimpleNamespace(
+            get_block_ids=lambda: ([10, 11, 12, 13],),
+            blocks=[[SimpleNamespace(block_hash=None) for _ in range(4)]],
+        )
+
+        with pytest.raises(RuntimeError, match="query identity changed before external load"):
+            sc.update_state_after_alloc(req, blocks, num_external_tokens=49)
+
+    def test_lease_count_must_match_allocated_load_blocks(self):
+        req = _make_request("r1", prompt_len=50, full_hashes=3)
+        sc = _make_load_connector(req, hit_blocks=4)
+        assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (49, True)
+        blocks = SimpleNamespace(
+            get_block_ids=lambda: ([10, 11, 12],),
+            blocks=[[SimpleNamespace(block_hash=None) for _ in range(3)]],
+        )
+
+        with pytest.raises(RuntimeError, match="leased block mismatch: leased=4 load=3"):
+            sc.update_state_after_alloc(req, blocks, num_external_tokens=33)
 
     def test_missing_tail_keeps_the_full_block_prefix(self):
         req = _make_request("r1", prompt_len=50, full_hashes=3)
