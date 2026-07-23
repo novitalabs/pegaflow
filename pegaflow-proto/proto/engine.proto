@@ -46,6 +46,17 @@ message RegisterContextRequest {
   // Set by the connector for MLA; the engine derives per-layer page offsets
   // from the registered layouts. See spec.md.
   bool page_first = 18;
+  // Native VMM layer views; empty for Python. Fd via --fd-socket-path (SCM_RIGHTS).
+  repeated NativeKvTensor native_kv_tensors = 19;
+  // Fused VMM allocation size (granularity-aligned). Zero for Python.
+  uint64 native_alloc_size = 20;
+}
+
+// Layer view into a shared VMM allocation.
+message NativeKvTensor {
+  uint64 offset_bytes = 1;
+  uint64 size_bytes = 2;
+  uint64 block_stride_bytes = 3;
 }
 
 message RegisterContextResponse {
@@ -77,6 +88,7 @@ message LoadRequest {
   string load_state_shm = 4;
   repeated string layer_names = 5;
   repeated LeaseLoad loads = 6;
+  bool wait_for_completion = 7;
 }
 
 message LeaseLoad {
@@ -85,6 +97,12 @@ message LeaseLoad {
 }
 
 message LoadResponse {
+  ResponseStatus status = 1;
+}
+
+message FlushRequest {}
+
+message FlushResponse {
   ResponseStatus status = 1;
 }
 
@@ -207,6 +225,7 @@ service Engine {
   rpc RegisterContextBatch(RegisterContextRequest) returns (RegisterContextResponse);
   rpc Save(SaveRequest) returns (SaveResponse);
   rpc Load(LoadRequest) returns (LoadResponse);
+  rpc Flush(FlushRequest) returns (FlushResponse);
   // Prefetch query: check memory + trigger SSD prefetch or cross-node RDMA fetch for missing blocks
   rpc QueryPrefetch(QueryRequest) returns (QueryResponse);
   rpc Release(ReleaseRequest) returns (ReleaseResponse);

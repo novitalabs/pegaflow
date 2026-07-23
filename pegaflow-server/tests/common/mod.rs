@@ -378,6 +378,7 @@ impl MockVllmRpcHarness {
                 lease,
                 block_ids: (0..block_count as u32).collect(),
             }],
+            wait_for_completion: false,
         };
         match self.worker.load(request.clone()).await {
             Ok(response) => Ok(LoadRpcExchange {
@@ -444,7 +445,7 @@ async fn spawn_engine_server(
             14,
         ),
     ));
-    let service = GrpcEngineService::new(engine, registry, shutdown, hll_tracker);
+    let service = GrpcEngineService::new(engine, registry, shutdown, hll_tracker, None);
 
     let handle = tokio::spawn(async move {
         Server::builder()
