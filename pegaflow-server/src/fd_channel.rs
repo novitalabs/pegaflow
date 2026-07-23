@@ -10,6 +10,11 @@ use std::time::Duration;
 use tokio::net::UnixListener;
 use tokio::sync::Notify;
 
+/// `instance_id\0device_id` payload; generous so long instance ids do not truncate.
+const MAX_KEY_PAYLOAD: usize = 4096;
+/// Bytes for one SCM_RIGHTS fd (`CMSG_SPACE(sizeof(int))` with margin).
+const CMSG_SPACE_FOR_FD: usize = 64;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct RegistrationKey {
     pub(crate) instance_id: String,
@@ -173,8 +178,3 @@ fn parse_key(payload: &[u8]) -> std::io::Result<RegistrationKey> {
         device_id,
     })
 }
-
-/// `instance_id\0device_id` payload; generous so long instance ids do not truncate.
-const MAX_KEY_PAYLOAD: usize = 4096;
-/// Bytes for one SCM_RIGHTS fd (`CMSG_SPACE(sizeof(int))` with margin).
-const CMSG_SPACE_FOR_FD: usize = 64;
