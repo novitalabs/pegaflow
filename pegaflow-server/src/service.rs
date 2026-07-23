@@ -309,7 +309,10 @@ impl Engine for GrpcEngineService {
                 }
                 let fd = channel
                     .take(
-                        (req.instance_id.clone(), req.device_id),
+                        crate::fd_channel::FdKey {
+                            instance_id: req.instance_id.clone(),
+                            device_id: req.device_id,
+                        },
                         std::time::Duration::from_secs(5),
                     )
                     .await

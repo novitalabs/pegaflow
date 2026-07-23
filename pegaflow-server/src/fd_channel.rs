@@ -20,9 +20,13 @@ use std::time::Duration;
 use tokio::net::UnixListener;
 use tokio::sync::Notify;
 
-/// Key identifying which registration an fd belongs to. Matches the tuple the
-/// gRPC `register_context_batch` handler reconstructs from its request.
-type FdKey = (String, i32);
+/// Key identifying which registration an fd belongs to. Matches the
+/// `(instance_id, device_id)` the gRPC `register_context_batch` handler uses.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct FdKey {
+    pub(crate) instance_id: String,
+    pub(crate) device_id: i32,
+}
 
 /// Received fds waiting to be claimed by their registration RPC, plus a waker so
 /// a handler that arrives before its fd can await it instead of racing.
@@ -78,7 +82,7 @@ impl FdChannel {
 
     /// Claim the fd registered for `key`, waiting up to `timeout` for it to
     /// arrive if the registration RPC beat its fd. Returns `None` on timeout.
-    pub async fn take(&self, key: FdKey, timeout: Duration) -> Option<OwnedFd> {
+    pub(crate) async fn take(&self, key: FdKey, timeout: Duration) -> Option<OwnedFd> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let notify = {
@@ -175,7 +179,7 @@ fn recv_fd_with_key(sock: RawFd) -> std::io::Result<(FdKey, OwnedFd)> {
     Ok((key, fd))
 }
 
-/// Parse `"<instance_id>\0<device_id>"` into an `(instance_id, device_id)` key.
+/// Parse `"<instance_id>\0<device_id>"` into an [`FdKey`].
 fn parse_key(payload: &[u8]) -> std::io::Result<FdKey> {
     let mut parts = payload.splitn(2, |&b| b == 0);
     let instance = parts
@@ -191,7 +195,10 @@ fn parse_key(payload: &[u8]) -> std::io::Result<FdKey> {
         .ok()
         .and_then(|s| s.trim_end_matches('\0').parse().ok())
         .ok_or_else(|| std::io::Error::other("fd side-channel: bad device_id"))?;
-    Ok((instance_id, device_id))
+    Ok(FdKey {
+        instance_id,
+        device_id,
+    })
 }
 
 /// `CMSG_SPACE(size_of::<RawFd>())` as a const for the control buffer. Wrapped
