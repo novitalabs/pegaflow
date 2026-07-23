@@ -16,33 +16,40 @@ pub(crate) struct RegistrationKey {
     pub(crate) device_id: i32,
 }
 
-/// Bound UDS path plus fds waiting to be claimed by `register_context_batch`.
-#[derive(Clone)]
-pub struct FdChannel {
+struct Inner {
     path: String,
-    pending: Arc<Mutex<HashMap<RegistrationKey, OwnedFd>>>,
-    arrived: Arc<Notify>,
+    pending: Mutex<HashMap<RegistrationKey, OwnedFd>>,
+    arrived: Notify,
 }
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        remove_stale_socket(&self.path);
+    }
+}
+
+/// Bound UDS path plus fds waiting to be claimed by `register_context_batch`.
+/// Cloning only bumps the `Arc`; the socket file is removed when the last clone drops.
+#[derive(Clone)]
+pub struct FdChannel(Arc<Inner>);
 
 impl FdChannel {
     pub fn bind(path: String) -> std::io::Result<Self> {
         remove_stale_socket(&path);
         let listener = UnixListener::bind(&path)?;
-        let channel = Self {
+        let channel = Self(Arc::new(Inner {
             path,
-            pending: Arc::new(Mutex::new(HashMap::new())),
-            arrived: Arc::new(Notify::new()),
-        };
-        let pending = Arc::clone(&channel.pending);
-        let arrived = Arc::clone(&channel.arrived);
+            pending: Mutex::new(HashMap::new()),
+            arrived: Notify::new(),
+        }));
+        let inner = Arc::clone(&channel.0);
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
-                        let pending = Arc::clone(&pending);
-                        let arrived = Arc::clone(&arrived);
+                        let inner = Arc::clone(&inner);
                         tokio::spawn(async move {
-                            if let Err(err) = recv_one(stream, &pending, &arrived).await {
+                            if let Err(err) = recv_one(stream, &inner).await {
                                 log::warn!("fd side-channel: dropping connection: {err}");
                             }
                         });
@@ -62,24 +69,18 @@ impl FdChannel {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             {
-                let mut pending = self.pending.lock().expect("fd pending map poisoned");
+                let mut pending = self.0.pending.lock().expect("fd pending map poisoned");
                 if let Some(fd) = pending.remove(&key) {
                     return Some(fd);
                 }
             }
-            if tokio::time::timeout_at(deadline, self.arrived.notified())
+            if tokio::time::timeout_at(deadline, self.0.arrived.notified())
                 .await
                 .is_err()
             {
                 return None;
             }
         }
-    }
-}
-
-impl Drop for FdChannel {
-    fn drop(&mut self) {
-        remove_stale_socket(&self.path);
     }
 }
 
@@ -91,11 +92,7 @@ fn remove_stale_socket(path: &str) {
     }
 }
 
-async fn recv_one(
-    stream: tokio::net::UnixStream,
-    pending: &Mutex<HashMap<RegistrationKey, OwnedFd>>,
-    arrived: &Notify,
-) -> std::io::Result<()> {
+async fn recv_one(stream: tokio::net::UnixStream, inner: &Inner) -> std::io::Result<()> {
     // SCM_RIGHTS needs recvmsg; wait until readable then use a blocking std socket.
     stream.readable().await?;
     let std_stream = stream.into_std()?;
@@ -104,11 +101,12 @@ async fn recv_one(
     let (key, fd) = recv_fd_with_key(raw)?;
     drop(std_stream);
 
-    pending
+    inner
+        .pending
         .lock()
         .expect("fd pending map poisoned")
         .insert(key, fd);
-    arrived.notify_waiters();
+    inner.arrived.notify_waiters();
     Ok(())
 }
 
