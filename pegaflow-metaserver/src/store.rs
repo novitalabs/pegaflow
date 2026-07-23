@@ -227,8 +227,9 @@ impl BlockHashStore {
                 && owners
                     .iter()
                     .filter(|(node, owner)| self.is_owner_visible(node, owner, now))
+                    .take(MIN_RECLAIMABLE_OWNER_COUNT)
                     .count()
-                    >= MIN_RECLAIMABLE_OWNER_COUNT
+                    == MIN_RECLAIMABLE_OWNER_COUNT
             {
                 reclaimable_hashes.push(hash.clone());
             }

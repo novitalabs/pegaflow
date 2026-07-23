@@ -488,7 +488,9 @@ async fn registration_loop(
                 match c.insert_block_hashes(request).await {
                     Ok(resp) => {
                         let inner = resp.into_inner();
-                        if let Some(cache) = read_cache.upgrade() {
+                        if !inner.reclaimable_hashes.is_empty()
+                            && let Some(cache) = read_cache.upgrade()
+                        {
                             cache.mark_reclaimable_hashes(namespace, &inner.reclaimable_hashes);
                         }
                         debug!(

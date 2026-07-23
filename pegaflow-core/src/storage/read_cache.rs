@@ -162,10 +162,26 @@ impl ReadCache {
     }
 
     pub(crate) fn mark_reclaimable_hashes(&self, namespace: &str, hashes: &[Vec<u8>]) {
+        if hashes.is_empty() {
+            return;
+        }
+
         let mut inner = self.inner.lock();
+        let mut moved = 0;
         for hash in hashes {
             let key = BlockKey::new(namespace.to_string(), hash.clone());
-            mark_reclaimable(&mut inner, &key);
+            if mark_reclaimable(&mut inner, &key) {
+                moved += 1;
+            }
+        }
+        if moved > 0 {
+            let metrics = core_metrics();
+            metrics
+                .cache_resident_blocks
+                .add(-moved, &*CACHE_CLASS_RETAINED);
+            metrics
+                .cache_resident_blocks
+                .add(moved, &*CACHE_CLASS_RECLAIMABLE);
         }
     }
 
@@ -229,24 +245,19 @@ fn refresh_recency(inner: &mut ReadCacheInner, key: &BlockKey) {
     );
 }
 
-fn mark_reclaimable(inner: &mut ReadCacheInner, key: &BlockKey) {
+fn mark_reclaimable(inner: &mut ReadCacheInner, key: &BlockKey) -> bool {
     if !inner.cache.contains_key(key) {
-        return;
+        return false;
     }
     if inner.retained.remove(key).is_some() {
         inner.reclaimable.insert(key.clone(), ());
-        let metrics = core_metrics();
-        metrics
-            .cache_resident_blocks
-            .add(-1, &*CACHE_CLASS_RETAINED);
-        metrics
-            .cache_resident_blocks
-            .add(1, &*CACHE_CLASS_RECLAIMABLE);
+        true
     } else {
         debug_assert!(
             inner.reclaimable.contains_key(key),
             "resident block is missing its replacement class"
         );
+        false
     }
 }
 
