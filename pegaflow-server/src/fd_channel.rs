@@ -111,7 +111,7 @@ async fn recv_one(stream: tokio::net::UnixStream, inner: &Inner) -> std::io::Res
 }
 
 fn recv_fd_with_key(sock: RawFd) -> std::io::Result<(RegistrationKey, OwnedFd)> {
-    let mut buf = [0u8; 512];
+    let mut buf = [0u8; MAX_KEY_PAYLOAD];
     let mut iov = libc::iovec {
         iov_base: buf.as_mut_ptr().cast(),
         iov_len: buf.len(),
@@ -174,5 +174,7 @@ fn parse_key(payload: &[u8]) -> std::io::Result<RegistrationKey> {
     })
 }
 
+/// `instance_id\0device_id` payload; generous so long instance ids do not truncate.
+const MAX_KEY_PAYLOAD: usize = 4096;
 /// Bytes for one SCM_RIGHTS fd (`CMSG_SPACE(sizeof(int))` with margin).
 const CMSG_SPACE_FOR_FD: usize = 64;
