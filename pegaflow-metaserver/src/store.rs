@@ -6,6 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+const MIN_RECLAIMABLE_OWNER_COUNT: usize = 3;
+
 pub const DEFAULT_NODE_STALE_SECS: u64 = 30;
 pub const DEFAULT_TTL_MINUTES: u64 = 120;
 
@@ -205,21 +207,34 @@ impl BlockHashStore {
         hashes: &[Vec<u8>],
         node: &str,
         node_id: Uuid,
-    ) -> Result<usize, StoreError> {
+    ) -> Result<Vec<Vec<u8>>, StoreError> {
         self.touch_node_session(node, node_id)?;
         let node: Arc<str> = Arc::from(node);
         let now = Instant::now();
+        let mut reclaimable_hashes = Vec::new();
         for hash in hashes {
             let key = BlockKey::new(namespace.to_string(), hash.clone());
-            self.blocks.entry(key).or_default().insert(
+            let mut owners = self.blocks.entry(key).or_default();
+            let previous = owners.insert(
                 Arc::clone(&node),
                 OwnerRecord {
                     node_id,
                     key_register_time: now,
                 },
             );
+            let is_new_owner = previous.is_none_or(|owner| owner.node_id != node_id);
+            if is_new_owner
+                && owners
+                    .iter()
+                    .filter(|(node, owner)| self.is_owner_visible(node, owner, now))
+                    .take(MIN_RECLAIMABLE_OWNER_COUNT)
+                    .count()
+                    == MIN_RECLAIMABLE_OWNER_COUNT
+            {
+                reclaimable_hashes.push(hash.clone());
+            }
         }
-        Ok(hashes.len())
+        Ok(reclaimable_hashes)
     }
 
     pub fn remove_hashes(
@@ -464,10 +479,10 @@ mod tests {
 
         let hashes = vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8], vec![9, 10, 11, 12]];
 
-        let inserted = store
+        let reclaimable = store
             .insert_hashes(namespace, &hashes, node, node_id)
             .unwrap();
-        assert_eq!(inserted, 3);
+        assert!(reclaimable.is_empty());
 
         let existing = store.query_prefix(namespace, &hashes);
         assert_eq!(existing.len(), 3);
@@ -508,6 +523,115 @@ mod tests {
         let mut node_names: Vec<&str> = existing[0].nodes.iter().map(|n| n.as_ref()).collect();
         node_names.sort();
         assert_eq!(node_names, vec!["node-a:50055", "node-b:50055"]);
+    }
+
+    #[test]
+    fn insert_returns_only_new_third_owner_hashes() {
+        let store = BlockHashStore::new();
+        let node_a = heartbeat_node(&store, "node-a:50055");
+        let node_b = heartbeat_node(&store, "node-b:50055");
+        let node_c = heartbeat_node(&store, "node-c:50055");
+        let node_d = heartbeat_node(&store, "node-d:50055");
+        let hashes = vec![vec![1], vec![2], vec![1]];
+
+        assert_eq!(
+            store
+                .insert_hashes("ns", &hashes, "node-a:50055", node_a)
+                .unwrap(),
+            Vec::<Vec<u8>>::new()
+        );
+        assert_eq!(
+            store
+                .insert_hashes("ns", &hashes, "node-b:50055", node_b)
+                .unwrap(),
+            Vec::<Vec<u8>>::new()
+        );
+        assert_eq!(
+            store
+                .insert_hashes("ns", &hashes, "node-c:50055", node_c)
+                .unwrap(),
+            vec![vec![1], vec![2]]
+        );
+        assert_eq!(
+            store
+                .insert_hashes("ns", &hashes, "node-c:50055", node_c)
+                .unwrap(),
+            Vec::<Vec<u8>>::new()
+        );
+        assert_eq!(
+            store
+                .insert_hashes("ns", &hashes, "node-d:50055", node_d)
+                .unwrap(),
+            vec![vec![1], vec![2]]
+        );
+    }
+
+    #[test]
+    fn stale_owner_does_not_count_toward_reclaim_hint() {
+        let store = BlockHashStore::with_config(StoreConfig {
+            node_stale_after: Duration::from_secs(30),
+            ttl: Duration::from_secs(60),
+        });
+        let hash = vec![1];
+        let node_a = heartbeat_node(&store, "node-a");
+        let node_b = heartbeat_node(&store, "node-b");
+        let node_c = heartbeat_node(&store, "node-c");
+        let node_d = heartbeat_node(&store, "node-d");
+
+        store
+            .insert_hashes("ns", std::slice::from_ref(&hash), "node-a", node_a)
+            .unwrap();
+        store.nodes.get_mut("node-a").unwrap().last_seen = Instant::now() - Duration::from_secs(31);
+
+        store
+            .insert_hashes("ns", std::slice::from_ref(&hash), "node-b", node_b)
+            .unwrap();
+        assert!(
+            store
+                .insert_hashes("ns", std::slice::from_ref(&hash), "node-c", node_c)
+                .unwrap()
+                .is_empty(),
+            "the stale owner must not make node-c the third live owner"
+        );
+        assert_eq!(
+            store
+                .insert_hashes("ns", std::slice::from_ref(&hash), "node-d", node_d)
+                .unwrap(),
+            vec![hash]
+        );
+    }
+
+    #[test]
+    fn new_session_at_same_address_counts_as_new_owner() {
+        let store = BlockHashStore::with_config(StoreConfig {
+            node_stale_after: Duration::from_secs(30),
+            ttl: Duration::from_secs(60),
+        });
+        let hash = vec![1];
+        let old_node_a = heartbeat_node(&store, "node-a");
+        let node_b = heartbeat_node(&store, "node-b");
+        let node_c = heartbeat_node(&store, "node-c");
+
+        for (node, node_id) in [
+            ("node-a", old_node_a),
+            ("node-b", node_b),
+            ("node-c", node_c),
+        ] {
+            store
+                .insert_hashes("ns", std::slice::from_ref(&hash), node, node_id)
+                .unwrap();
+        }
+
+        store.nodes.get_mut("node-a").unwrap().last_seen = Instant::now() - Duration::from_secs(31);
+        let new_node_a = heartbeat_node(&store, "node-a");
+        assert_ne!(old_node_a, new_node_a);
+
+        assert_eq!(
+            store
+                .insert_hashes("ns", std::slice::from_ref(&hash), "node-a", new_node_a,)
+                .unwrap(),
+            vec![hash]
+        );
     }
 
     #[test]

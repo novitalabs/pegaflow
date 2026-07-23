@@ -26,7 +26,7 @@ use pegaflow_common::NumaNode;
 use prefetch::PrefetchScheduler;
 #[cfg(feature = "rdma")]
 use prefetch::RdmaFetch;
-use read_cache::ReadCache;
+pub(crate) use read_cache::ReadCache;
 use write_path::{InsertDeps, WritePipeline};
 
 // Each reclaim iteration emits one MetaServer removal command; a small batch
@@ -123,21 +123,6 @@ impl StorageEngine {
         let blockwise_alloc = config.blockwise_alloc;
         let transfer_lock_timeout = config.transfer_lock_timeout;
 
-        // Create MetaServer client if configured
-        let metaserver_client = config.metaserver_addr.as_ref().map(|addr| {
-            let advertise = config
-                .advertise_addr
-                .clone()
-                .unwrap_or_else(|| "127.0.0.1:50055".to_string());
-            info!(
-                "MetaServer client enabled: metaserver={}, advertise={}, queue_depth={}",
-                addr, advertise, config.metaserver_queue_depth
-            );
-            let ms_config = MetaServerClientConfig::new(addr.clone(), advertise)
-                .with_queue_depth(config.metaserver_queue_depth);
-            Arc::new(MetaServerClient::new(ms_config))
-        });
-
         if blockwise_alloc {
             info!("Blockwise allocation enabled for batch_save");
         }
@@ -176,6 +161,23 @@ impl StorageEngine {
             config.enable_lfu_admission,
             value_size_hint,
         ));
+
+        let metaserver_client = config.metaserver_addr.as_ref().map(|addr| {
+            let advertise = config
+                .advertise_addr
+                .clone()
+                .unwrap_or_else(|| "127.0.0.1:50055".to_string());
+            info!(
+                "MetaServer client enabled: metaserver={}, advertise={}, queue_depth={}",
+                addr, advertise, config.metaserver_queue_depth
+            );
+            let ms_config = MetaServerClientConfig::new(addr.clone(), advertise)
+                .with_queue_depth(config.metaserver_queue_depth);
+            Arc::new(MetaServerClient::new(
+                ms_config,
+                Arc::downgrade(&read_cache),
+            ))
+        });
 
         let (write_pipeline, insert_rx) = WritePipeline::new();
         let write_pipeline = Arc::new(write_pipeline);

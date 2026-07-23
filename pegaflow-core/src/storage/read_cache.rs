@@ -7,7 +7,7 @@ use crate::block::{BlockKey, SealedBlock};
 use crate::cache::{CacheInsertOutcome, TinyLfuCache};
 use crate::metrics::{CACHE_CLASS_RECLAIMABLE, CACHE_CLASS_RETAINED, core_metrics};
 
-pub(super) struct ReadCache {
+pub(crate) struct ReadCache {
     inner: Mutex<ReadCacheInner>,
 }
 
@@ -24,7 +24,7 @@ enum ResidentClass {
 }
 
 impl ReadCache {
-    pub(super) fn new(
+    pub(crate) fn new(
         capacity_bytes: usize,
         enable_lfu_admission: bool,
         value_size_hint: Option<usize>,
@@ -88,16 +88,27 @@ impl ReadCache {
         resident_keys
     }
 
-    pub(super) fn batch_insert_refs(&self, blocks: &[(BlockKey, Arc<SealedBlock>)]) {
+    pub(super) fn batch_insert_refs(
+        &self,
+        blocks: &[(BlockKey, Arc<SealedBlock>)],
+    ) -> Vec<BlockKey> {
         let mut inner = self.inner.lock();
+        let mut resident_keys = Vec::new();
         for (key, block) in blocks {
-            insert_block(
+            let outcome = insert_block(
                 &mut inner,
                 key.clone(),
                 Arc::clone(block),
                 ResidentClass::Retained,
             );
+            if matches!(
+                outcome,
+                CacheInsertOutcome::InsertedNew | CacheInsertOutcome::AlreadyExists
+            ) {
+                resident_keys.push(key.clone());
+            }
         }
+        resident_keys
     }
 
     /// Look up specific blocks by key without prefix-scan semantics (does not
@@ -149,6 +160,41 @@ impl ReadCache {
             .add(-retained_blocks, &*CACHE_CLASS_RETAINED);
         removed
     }
+
+    pub(crate) fn mark_reclaimable_hashes(&self, namespace: &str, hashes: &[Vec<u8>]) {
+        if hashes.is_empty() {
+            return;
+        }
+
+        let mut inner = self.inner.lock();
+        let mut moved = 0;
+        for hash in hashes {
+            let key = BlockKey::new(namespace.to_string(), hash.clone());
+            if mark_reclaimable(&mut inner, &key) {
+                moved += 1;
+            }
+        }
+        if moved > 0 {
+            let metrics = core_metrics();
+            metrics
+                .cache_resident_blocks
+                .add(-moved, &*CACHE_CLASS_RETAINED);
+            metrics
+                .cache_resident_blocks
+                .add(moved, &*CACHE_CLASS_RECLAIMABLE);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_retained_for_test(&self, key: BlockKey, block: Arc<SealedBlock>) {
+        let mut inner = self.inner.lock();
+        insert_block(&mut inner, key, block, ResidentClass::Retained);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_reclaimable_for_test(&self, key: &BlockKey) -> bool {
+        self.inner.lock().reclaimable.contains_key(key)
+    }
 }
 
 impl ResidentClass {
@@ -197,6 +243,22 @@ fn refresh_recency(inner: &mut ReadCacheInner, key: &BlockKey) {
         classified || !inner.cache.contains_key(key),
         "resident block is missing its replacement class"
     );
+}
+
+fn mark_reclaimable(inner: &mut ReadCacheInner, key: &BlockKey) -> bool {
+    if !inner.cache.contains_key(key) {
+        return false;
+    }
+    if inner.retained.remove(key).is_some() {
+        inner.reclaimable.insert(key.clone(), ());
+        true
+    } else {
+        debug_assert!(
+            inner.reclaimable.contains_key(key),
+            "resident block is missing its replacement class"
+        );
+        false
+    }
 }
 
 fn remove_lru(
@@ -334,6 +396,52 @@ mod tests {
         assert_eq!(cache.remove_lru_batch(1)[0].0, remote_first);
         assert_eq!(cache.remove_lru_batch(1)[0].0, local_other);
         assert_class(&cache, &local_first, ResidentClass::Retained);
+    }
+
+    #[test]
+    fn local_save_reports_resident_keys() {
+        let cache = make_cache();
+        let key = BlockKey::new("ns".into(), vec![1]);
+
+        assert_eq!(
+            cache.batch_insert_refs(&[(key.clone(), make_block())]),
+            vec![key.clone()]
+        );
+        assert_eq!(
+            cache.batch_insert_refs(&[(key.clone(), make_block())]),
+            vec![key]
+        );
+    }
+
+    #[test]
+    fn reclaimable_hashes_move_only_matching_residents() {
+        let cache = make_cache();
+        let retained = BlockKey::new("ns".into(), vec![1]);
+        let reclaimable = BlockKey::new("ns".into(), vec![2]);
+        let other_namespace = BlockKey::new("other".into(), vec![1]);
+
+        cache.batch_insert(vec![
+            (retained.clone(), make_block()),
+            (other_namespace.clone(), make_block()),
+        ]);
+        cache.batch_insert_resident_keys(vec![(reclaimable.clone(), make_block())]);
+        cache.mark_reclaimable_hashes("ns", &[vec![1], vec![2], vec![3]]);
+
+        assert_class(&cache, &retained, ResidentClass::Reclaimable);
+        assert_class(&cache, &reclaimable, ResidentClass::Reclaimable);
+        assert_class(&cache, &other_namespace, ResidentClass::Retained);
+    }
+
+    #[test]
+    fn reclaimable_hash_for_evicted_block_is_noop() {
+        let cache = make_cache();
+        let key = BlockKey::new("ns".into(), vec![1]);
+        cache.batch_insert(vec![(key.clone(), make_block())]);
+        cache.remove_lru_batch(1);
+
+        cache.mark_reclaimable_hashes("ns", &[key.hash]);
+
+        assert!(cache.remove_lru_batch(1).is_empty());
     }
 
     #[test]

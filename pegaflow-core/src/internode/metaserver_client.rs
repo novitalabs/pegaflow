@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Weak;
 
 use log::{debug, error, info, warn};
 use pegaflow_common::grpc::{GRPC_CLIENT_HTTP2_KEEPALIVE_INTERVAL, GRPC_CONNECT_TIMEOUT};
@@ -15,6 +16,7 @@ use tonic::transport::{Channel, Endpoint};
 use uuid::Uuid;
 
 use crate::metrics::core_metrics;
+use crate::storage::ReadCache;
 
 // Shared insert/remove command channel depth. Eviction bursts outrun the single
 // consumer's per-RPC drain, so a shallow queue silently drops removals.
@@ -151,7 +153,7 @@ impl MetaServerClient {
     /// Create a new client and spawn the background registration loop.
     ///
     /// Must be called from within a tokio runtime context.
-    pub fn new(config: MetaServerClientConfig) -> Self {
+    pub(crate) fn new(config: MetaServerClientConfig, read_cache: Weak<ReadCache>) -> Self {
         let endpoint = metaserver_endpoint(config.metaserver_addr.clone());
         let (command_tx, rx) = mpsc::channel(config.queue_depth);
 
@@ -160,6 +162,7 @@ impl MetaServerClient {
             config.metaserver_addr.clone(),
             endpoint.clone(),
             config.advertise_addr,
+            read_cache,
         ));
 
         // Lazy-connect query client: connects on first RPC, not here
@@ -189,10 +192,7 @@ impl MetaServerClient {
         if hashes.is_empty() {
             return;
         }
-        self.try_send_register_batch(BlockHashBatch::single_namespace(namespace, hashes));
-    }
-
-    fn try_send_register_batch(&self, batch: BlockHashBatch) {
+        let batch = BlockHashBatch::single_namespace(namespace, hashes);
         let count = batch.count();
         match self.command_tx.try_send(MetaServerCommand::Insert(batch)) {
             Ok(()) => {
@@ -332,6 +332,7 @@ async fn registration_loop(
     metaserver_addr: String,
     endpoint: Endpoint,
     advertise_addr: String,
+    read_cache: Weak<ReadCache>,
 ) {
     let mut client: Option<MetaServerGrpcClient<Channel>> = None;
     let node_id = Uuid::new_v4().to_string();
@@ -487,9 +488,17 @@ async fn registration_loop(
                 match c.insert_block_hashes(request).await {
                     Ok(resp) => {
                         let inner = resp.into_inner();
+                        if !inner.reclaimable_hashes.is_empty()
+                            && let Some(cache) = read_cache.upgrade()
+                        {
+                            cache.mark_reclaimable_hashes(namespace, &inner.reclaimable_hashes);
+                        }
                         debug!(
-                            "Registered {} block hashes with MetaServer (namespace={}, inserted={})",
-                            count, namespace, inner.inserted_count
+                            "Registered {} block hashes with MetaServer (namespace={}, inserted={}, reclaimable={})",
+                            count,
+                            namespace,
+                            inner.inserted_count,
+                            inner.reclaimable_hashes.len()
                         );
                     }
                     Err(e) => {
@@ -810,6 +819,7 @@ async fn unregister_current_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block::{BlockKey, SealedBlock};
     use pegaflow_proto::proto::engine::meta_server_server::{MetaServer, MetaServerServer};
     use pegaflow_proto::proto::engine::{
         HeartbeatNodeResponse, InsertBlockHashesResponse, QueryPrefixBlocksRequest,
@@ -837,6 +847,7 @@ mod tests {
         remove_count: AtomicUsize,
         unregister_count: AtomicUsize,
         fail_insert_with_stale_session: AtomicUsize,
+        reclaimable_hashes: Mutex<Vec<Vec<u8>>>,
         insert_requests: RequestLog,
         remove_requests: RequestLog,
         heartbeat_notify: Notify,
@@ -889,6 +900,15 @@ mod tests {
                 return Err(Status::failed_precondition("stale node session"));
             }
             let inserted_count = request.block_hashes.len() as u64;
+            let reclaimable_hashes = self
+                .state
+                .reclaimable_hashes
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|hash| request.block_hashes.contains(hash))
+                .cloned()
+                .collect();
             self.state
                 .insert_requests
                 .lock()
@@ -901,6 +921,7 @@ mod tests {
                     message: String::new(),
                 }),
                 inserted_count,
+                reclaimable_hashes,
             }))
         }
 
@@ -999,10 +1020,10 @@ mod tests {
     #[tokio::test]
     async fn heartbeat_loop_sends_initial_heartbeat_and_unregisters_on_shutdown() {
         let (addr, service, shutdown_tx) = start_fake_metaserver().await;
-        let client = MetaServerClient::new(MetaServerClientConfig::new(
-            addr,
-            "node-a:50055".to_string(),
-        ));
+        let client = MetaServerClient::new(
+            MetaServerClientConfig::new(addr, "node-a:50055".to_string()),
+            Weak::new(),
+        );
 
         wait_for_count(&service.heartbeat_notify, &service.heartbeat_count, 1).await;
         client.shutdown().await;
@@ -1017,10 +1038,10 @@ mod tests {
         service
             .fail_insert_with_stale_session
             .store(1, Ordering::SeqCst);
-        let client = MetaServerClient::new(MetaServerClientConfig::new(
-            addr,
-            "node-a:50055".to_string(),
-        ));
+        let client = MetaServerClient::new(
+            MetaServerClientConfig::new(addr, "node-a:50055".to_string()),
+            Weak::new(),
+        );
 
         wait_for_count(&service.heartbeat_notify, &service.heartbeat_count, 1).await;
         client.try_register_namespace("ns".to_string(), vec![vec![1]]);
@@ -1033,10 +1054,10 @@ mod tests {
     #[tokio::test]
     async fn flush_barrier_waits_for_prior_registrations() {
         let (addr, service, shutdown_tx) = start_fake_metaserver().await;
-        let client = MetaServerClient::new(MetaServerClientConfig::new(
-            addr,
-            "node-a:50055".to_string(),
-        ));
+        let client = MetaServerClient::new(
+            MetaServerClientConfig::new(addr, "node-a:50055".to_string()),
+            Weak::new(),
+        );
 
         client.try_register_namespace("ns".to_string(), vec![vec![1], vec![2]]);
         // On return, the insert enqueued above must have been delivered — no
@@ -1057,6 +1078,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registration_applies_reclaimable_hashes() {
+        let (addr, service, shutdown_tx) = start_fake_metaserver().await;
+        let read_cache = Arc::new(ReadCache::new(1 << 20, false, None));
+        let hashes: Vec<Vec<u8>> = (0..=MAX_HASHES_PER_RPC as u32)
+            .map(|value| value.to_le_bytes().to_vec())
+            .collect();
+        let hinted_hash = hashes[0].clone();
+        let hinted_key = BlockKey::new("ns".to_string(), hinted_hash.clone());
+        read_cache.insert_retained_for_test(
+            hinted_key.clone(),
+            Arc::new(SealedBlock::from_slots(Vec::new())),
+        );
+        *service.reclaimable_hashes.lock().unwrap() = vec![hinted_hash];
+        let client = MetaServerClient::new(
+            MetaServerClientConfig::new(addr, "node-a:50055".to_string()),
+            Arc::downgrade(&read_cache),
+        );
+
+        client.try_register_namespace("ns".to_string(), hashes);
+        client.flush().await;
+
+        assert!(read_cache.is_reclaimable_for_test(&hinted_key));
+        assert_eq!(service.insert_count.load(Ordering::SeqCst), 2);
+        client.shutdown().await;
+        let _ = shutdown_tx.send(());
+        drop(service);
+    }
+
+    #[tokio::test]
     async fn flush_barrier_acks_even_when_insert_fails() {
         let (addr, service, shutdown_tx) = start_fake_metaserver().await;
         // Fail both the insert attempt and the session-reset retry heartbeat
@@ -1064,10 +1114,10 @@ mod tests {
         service
             .fail_insert_with_stale_session
             .store(usize::MAX, Ordering::SeqCst);
-        let client = MetaServerClient::new(MetaServerClientConfig::new(
-            addr,
-            "node-a:50055".to_string(),
-        ));
+        let client = MetaServerClient::new(
+            MetaServerClientConfig::new(addr, "node-a:50055".to_string()),
+            Weak::new(),
+        );
 
         client.try_register_namespace("ns".to_string(), vec![vec![1]]);
         // The contract is "delivered or dropped": a failed insert drops the
@@ -1096,10 +1146,10 @@ mod tests {
     #[tokio::test]
     async fn large_namespace_removal_splits_into_bounded_rpcs() {
         let (addr, service, shutdown_tx) = start_fake_metaserver().await;
-        let client = MetaServerClient::new(MetaServerClientConfig::new(
-            addr,
-            "node-a:50055".to_string(),
-        ));
+        let client = MetaServerClient::new(
+            MetaServerClientConfig::new(addr, "node-a:50055".to_string()),
+            Weak::new(),
+        );
         wait_for_count(&service.heartbeat_notify, &service.heartbeat_count, 1).await;
 
         // One namespace coalesced past the per-RPC cap. Use sha256-sized (32B)
@@ -1193,6 +1243,7 @@ mod tests {
             addr,
             endpoint,
             "node-a:50055".to_string(),
+            Weak::new(),
         ));
 
         wait_for_count(&service.insert_notify, &service.insert_count, 2).await;
