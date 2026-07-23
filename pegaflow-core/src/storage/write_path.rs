@@ -199,8 +199,8 @@ fn process_insert_batch(
     if !sealed_blocks.is_empty()
         && let Some(deps) = &deps
     {
-        deps.read_cache.batch_insert_refs(&sealed_blocks);
-        send_backing_batches(deps, namespace, &sealed_blocks);
+        let resident_keys = deps.read_cache.batch_insert_refs(&sealed_blocks);
+        send_backing_batches(deps, namespace, &sealed_blocks, resident_keys);
     }
 
     ordered_fast_path_seals
@@ -269,6 +269,7 @@ fn send_backing_batches(
     deps: &InsertDeps,
     namespace: &str,
     blocks: &[(BlockKey, Arc<SealedBlock>)],
+    resident_keys: Vec<BlockKey>,
 ) {
     if blocks.is_empty() {
         return;
@@ -286,16 +287,15 @@ fn send_backing_batches(
     }
 
     if let Some(client) = &deps.metaserver_client {
-        register_block_hashes(client, namespace, blocks);
+        register_block_hashes(client, namespace, resident_keys);
     }
 }
 
-fn register_block_hashes(
-    client: &MetaServerClient,
-    namespace: &str,
-    blocks: &[(BlockKey, Arc<SealedBlock>)],
-) {
-    let hashes: Vec<Vec<u8>> = blocks.iter().map(|(key, _)| key.hash.clone()).collect();
+fn register_block_hashes(client: &MetaServerClient, namespace: &str, resident_keys: Vec<BlockKey>) {
+    if resident_keys.is_empty() {
+        return;
+    }
+    let hashes = resident_keys.into_iter().map(|key| key.hash).collect();
     client.try_register_namespace(namespace.to_string(), hashes);
 }
 

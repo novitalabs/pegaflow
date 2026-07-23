@@ -127,6 +127,7 @@ impl MetaServer for GrpcMetaService {
                     "block_hashes cannot be empty".to_string(),
                 )),
                 inserted_count: 0,
+                reclaimable_hashes: Vec::new(),
             }));
             record_rpc_result("insert_block_hashes", &result, start);
             return result;
@@ -141,12 +142,13 @@ impl MetaServer for GrpcMetaService {
             }
         };
 
-        let inserted =
+        let inserted_count = req.block_hashes.len() as u64;
+        let reclaimable_hashes =
             match self
                 .store
                 .insert_hashes(&req.namespace, &req.block_hashes, &req.node, node_id)
             {
-                Ok(inserted) => inserted,
+                Ok(reclaimable_hashes) => reclaimable_hashes,
                 Err(err) => {
                     let result = Err(Self::store_error_status(err));
                     record_rpc_result("insert_block_hashes", &result, start);
@@ -156,13 +158,18 @@ impl MetaServer for GrpcMetaService {
 
         let elapsed = start.elapsed();
         debug!(
-            "RPC [insert_block_hashes]: namespace={} node={} inserted={} hashes in {:?}",
-            req.namespace, req.node, inserted, elapsed
+            "RPC [insert_block_hashes]: namespace={} node={} inserted={} reclaimable={} in {:?}",
+            req.namespace,
+            req.node,
+            inserted_count,
+            reclaimable_hashes.len(),
+            elapsed
         );
 
         let result = Ok(Response::new(InsertBlockHashesResponse {
             status: Some(Self::ok_status()),
-            inserted_count: inserted as u64,
+            inserted_count,
+            reclaimable_hashes,
         }));
         record_rpc_result("insert_block_hashes", &result, start);
         result
@@ -310,6 +317,33 @@ mod tests {
         .await
         .unwrap();
         node_id
+    }
+
+    #[tokio::test]
+    async fn test_insert_block_hashes_returns_new_third_owner_hashes() {
+        let svc = make_service();
+        let hashes = vec![vec![1], vec![2], vec![1]];
+
+        for (node, expected) in [
+            ("node-a", vec![]),
+            ("node-b", vec![]),
+            ("node-c", vec![vec![1], vec![2]]),
+        ] {
+            let node_id = heartbeat_node(&svc, node).await;
+            let response = svc
+                .insert_block_hashes(Request::new(InsertBlockHashesRequest {
+                    namespace: "ns".into(),
+                    block_hashes: hashes.clone(),
+                    node: node.into(),
+                    node_id,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+
+            assert_eq!(response.inserted_count, hashes.len() as u64);
+            assert_eq!(response.reclaimable_hashes, expected);
+        }
     }
 
     #[tokio::test]

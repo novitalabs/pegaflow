@@ -136,6 +136,7 @@ message InsertBlockHashesRequest {
 message InsertBlockHashesResponse {
   ResponseStatus status = 1;    // Success/error status
   uint64 inserted_count = 2;    // Number of hashes inserted
+  repeated bytes reclaimable_hashes = 3; // New third-or-later owner hashes
 }
 ```
 
