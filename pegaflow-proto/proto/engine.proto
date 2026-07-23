@@ -47,7 +47,7 @@ message RegisterContextRequest {
   // from the registered layouts. See spec.md.
   bool page_first = 18;
   // Per-layer views into the client's fused VMM allocation. Empty for Python.
-  // Allocation fd is out-of-band (see HealthResponse.fd_socket_path).
+  // Allocation fd is out-of-band (Unix socket + SCM_RIGHTS, --fd-socket-path).
   repeated NativeKvTensor native_kv_tensors = 19;
   // Fused VMM allocation size (granularity-aligned). Zero for Python.
   uint64 native_alloc_size = 20;
@@ -156,9 +156,6 @@ message HealthRequest {}
 
 message HealthResponse {
   ResponseStatus status = 1;
-  // Unix socket for native clients to pass VMM allocation fds (SCM_RIGHTS).
-  // Empty when the fd channel is disabled.
-  string fd_socket_path = 2;
 }
 
 // Liveness session: vllm opens a server-streaming RPC at startup and holds

@@ -76,11 +76,6 @@ impl FdChannel {
         Ok(channel)
     }
 
-    /// Absolute socket path to advertise to clients (via `HealthResponse`).
-    pub fn path(&self) -> &str {
-        &self.path
-    }
-
     /// Claim the fd registered for `key`, waiting up to `timeout` for it to
     /// arrive if the registration RPC beat its fd. Returns `None` on timeout.
     pub async fn take(&self, key: FdKey, timeout: Duration) -> Option<OwnedFd> {

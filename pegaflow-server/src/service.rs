@@ -948,11 +948,6 @@ impl Engine for GrpcEngineService {
             debug!("RPC [health]");
             Ok(Response::new(HealthResponse {
                 status: Some(Self::build_simple_response()),
-                fd_socket_path: self
-                    .fd_channel
-                    .as_ref()
-                    .map(|c| c.path().to_string())
-                    .unwrap_or_default(),
             }))
         }
         .await;

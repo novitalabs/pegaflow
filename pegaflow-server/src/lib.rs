@@ -94,9 +94,8 @@ pub struct Cli {
     pub enable_prometheus: bool,
 
     /// Unix socket path for the native-VMM fd side-channel. Native clients send
-    /// their exported allocation fd here (SCM_RIGHTS) before registration; the
-    /// path is advertised back via HealthResponse. Empty disables native VMM
-    /// registration (Python clients are unaffected).
+    /// their exported allocation fd here (SCM_RIGHTS) before registration.
+    /// Empty disables native VMM registration (Python clients are unaffected).
     #[arg(long, default_value = "/tmp/pegaflow-fd.sock")]
     pub fd_socket_path: String,
 
