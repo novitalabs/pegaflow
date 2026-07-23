@@ -302,7 +302,7 @@ impl Engine for GrpcEngineService {
                             instance_id: req.instance_id.clone(),
                             device_id: req.device_id,
                         },
-                        std::time::Duration::from_secs(5),
+                        std::time::Duration::from_secs(60),
                     )
                     .await
                     .ok_or_else(|| {
