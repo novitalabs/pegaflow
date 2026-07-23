@@ -6,8 +6,8 @@
 //! `pegaflow-server` binary provides them alongside the CUDA-IPC registration
 //! surface — which an in-process Rust embedder (one that registers raw device
 //! pointers and drives saves/loads through `PegaEngine` directly) has no use
-//! for. This service is that minimal serving surface: the three transfer RPCs
-//! plus `Health`, everything else answered with `unimplemented`.
+//! for. This service is that minimal serving surface: those three transfer RPCs,
+//! everything else answered with `unimplemented`.
 //!
 //! The embedder remains responsible for periodic GC of expired transfer locks
 //! (`PegaEngine::gc_expired_transfer_locks`), mirroring pegaflow-server's
@@ -220,19 +220,14 @@ impl Engine for P2pTransferService {
         }))
     }
 
+    // ── In-process embedders drive these through `PegaEngine` directly ──
+
     async fn health(
         &self,
         _request: Request<HealthRequest>,
     ) -> Result<Response<HealthResponse>, Status> {
-        Ok(Response::new(HealthResponse {
-            status: Some(Self::ok_status()),
-            // p2p peers never send fds; the fd side-channel is a server-local
-            // concern of the engine gRPC service, not this cross-node service.
-            fd_socket_path: String::new(),
-        }))
+        Self::not_served("health")
     }
-
-    // ── In-process embedders drive these through `PegaEngine` directly ──
 
     async fn register_context_batch(
         &self,
