@@ -43,7 +43,9 @@ pub(super) fn register_context(req: &RegisterContextRequest) -> Result<(), Statu
             || tensor.block_stride_bytes == 0
             || tensor.offset_bytes.checked_add(tensor.size_bytes).is_none()
         {
-            return Err(Status::invalid_argument("invalid native KV tensor metadata"));
+            return Err(Status::invalid_argument(
+                "invalid native KV tensor metadata",
+            ));
         }
     }
     Ok(())

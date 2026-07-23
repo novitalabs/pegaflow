@@ -18,7 +18,10 @@ pub(crate) enum TensorRegistration {
     /// One strided layer view into the batch's shared VMM allocation. The
     /// backing fd is not here — it arrives out-of-band on the fd side-channel
     /// and is imported once per batch (see [`CudaTensorRegistry::register_layers`]).
-    Native { offset_bytes: u64, size_bytes: u64 },
+    Native {
+        offset_bytes: u64,
+        size_bytes: u64,
+    },
 }
 
 #[allow(dead_code, reason = "owners keep registered CUDA addresses valid")]
@@ -75,9 +78,9 @@ impl VmmMapping {
         // Reserve a VA range and map the physical handle into it.
         let mut base_ptr: sys::CUdeviceptr = 0;
         // SAFETY: standard VMM reserve; outputs are valid, alignment 0 = default.
-        if let Err(e) = unsafe {
-            sys::cuMemAddressReserve(&mut base_ptr, alloc_size, 0, 0, 0).result()
-        } {
+        if let Err(e) =
+            unsafe { sys::cuMemAddressReserve(&mut base_ptr, alloc_size, 0, 0, 0).result() }
+        {
             // SAFETY: handle was successfully imported above and not yet mapped.
             unsafe { sys::cuMemRelease(handle).result().ok() };
             return Err(cuda_error("reserve VMM address range", e));
@@ -221,16 +224,9 @@ impl CudaTensorRegistry {
                     size_bytes,
                 } => {
                     let mapping = mapping.as_ref().ok_or_else(|| {
-                        PyValueError::new_err(
-                            "native tensor registration without an imported fd",
-                        )
+                        PyValueError::new_err("native tensor registration without an imported fd")
                     })?;
-                    Self::materialize_native_tensor(
-                        device_id,
-                        mapping,
-                        offset_bytes,
-                        size_bytes,
-                    )?
+                    Self::materialize_native_tensor(device_id, mapping, offset_bytes, size_bytes)?
                 }
             };
             let metadata = layer_tensor.metadata.clone();
@@ -518,9 +514,7 @@ fn registry_actor(mut registry: CudaTensorRegistry, mut rx: mpsc::Receiver<Regis
                 // Borrow the raw fd for the import; `OwnedFd` closes our copy
                 // when it drops at the end of this arm (CUDA dups it internally).
                 use std::os::fd::AsRawFd;
-                let native = native_fd
-                    .as_ref()
-                    .map(|(fd, size)| (fd.as_raw_fd(), *size));
+                let native = native_fd.as_ref().map(|(fd, size)| (fd.as_raw_fd(), *size));
                 let result = registry
                     .register_layers(&context_key, device_id, layers, native)
                     // Stringify here, on the GIL-owning thread, so the gRPC

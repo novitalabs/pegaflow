@@ -322,7 +322,8 @@ impl EngineRpcClient {
                     pp_rank,
                     transfer_mode: transfer_mode as i32,
                     page_first,
-                    cuda_ipc_tensors: Vec::new(),
+                    native_kv_tensors: Vec::new(),
+                    native_alloc_size: 0,
                 })
                 .await?;
             Ok(resp.into_inner())

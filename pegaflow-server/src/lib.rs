@@ -395,12 +395,10 @@ fn init_cudarc_cuda(device_ids: &[i32]) -> Result<(), std::io::Error> {
     for &device_id in device_ids {
         let ordinal = usize::try_from(device_id)
             .map_err(|_| std::io::Error::other(format!("device_id {device_id} must be >= 0")))?;
-        let ctx = cudarc::driver::CudaContext::new(ordinal).map_err(|e| {
-            std::io::Error::other(format!("cudarc init device {device_id}: {e}"))
-        })?;
-        ctx.bind_to_thread().map_err(|e| {
-            std::io::Error::other(format!("cudarc bind device {device_id}: {e}"))
-        })?;
+        let ctx = cudarc::driver::CudaContext::new(ordinal)
+            .map_err(|e| std::io::Error::other(format!("cudarc init device {device_id}: {e}")))?;
+        ctx.bind_to_thread()
+            .map_err(|e| std::io::Error::other(format!("cudarc bind device {device_id}: {e}")))?;
         info!("Initialized CUDA context for device {device_id} (cudarc, torch-free)");
     }
     Ok(())

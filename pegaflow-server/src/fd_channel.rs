@@ -166,7 +166,9 @@ fn recv_fd_with_key(sock: RawFd) -> std::io::Result<(FdKey, OwnedFd)> {
     // SAFETY: cmsg points into our control buffer.
     let (level, ctype) = unsafe { ((*cmsg).cmsg_level, (*cmsg).cmsg_type) };
     if level != libc::SOL_SOCKET || ctype != libc::SCM_RIGHTS {
-        return Err(std::io::Error::other("fd side-channel: unexpected control message"));
+        return Err(std::io::Error::other(
+            "fd side-channel: unexpected control message",
+        ));
     }
     // SAFETY: CMSG_DATA points at the fd payload of a SCM_RIGHTS message.
     let raw_fd = unsafe { std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<RawFd>()) };
