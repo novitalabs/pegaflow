@@ -15,9 +15,7 @@ pub struct TensorMetadata {
 
 pub(crate) enum TensorRegistration {
     Python(Vec<u8>),
-    /// One strided layer view into the batch's shared VMM allocation. The
-    /// backing fd is not here — it arrives out-of-band on the fd side-channel
-    /// and is imported once per batch (see [`CudaTensorRegistry::register_layers`]).
+    /// Strided view into the batch's shared VMM allocation (fd arrives out-of-band).
     Native {
         offset_bytes: u64,
         size_bytes: u64,
@@ -35,11 +33,7 @@ struct LayerTensor {
     metadata: TensorMetadata,
 }
 
-/// A VMM allocation imported from a client's exported POSIX file descriptor and
-/// mapped into this process's address space. Owns the reserved VA range and the
-/// imported physical handle; `base_ptr` is the mapped device pointer other
-/// layers offset into. Unlike a CUDA IPC mapping, this pointer can be handed to
-/// `ibv_reg_dmabuf_mr` for GPUDirect RDMA (registration wiring is a follow-up).
+/// Imported client VMM allocation mapped into this process (`base_ptr` + size).
 struct VmmMapping {
     context: Arc<CudaContext>,
     handle: sys::CUmemGenericAllocationHandle,
@@ -48,10 +42,7 @@ struct VmmMapping {
 }
 
 impl VmmMapping {
-    /// Import `fd` (a `CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR` exported by the
-    /// client), reserve a VA range of `alloc_size`, map the physical memory in,
-    /// and grant this device read/write access. `alloc_size` must match the
-    /// client's allocation (already rounded up to the VMM granularity).
+    /// Import POSIX-fd VMM handle, reserve/map `alloc_size`, set device access.
     fn import(device_id: i32, fd: i32, alloc_size: usize) -> PyResult<Arc<Self>> {
         let device = usize::try_from(device_id)
             .map_err(|_| PyValueError::new_err("device_id must be non-negative"))?;
@@ -60,11 +51,8 @@ impl VmmMapping {
             .bind_to_thread()
             .map_err(|e| cuda_error("bind context", e))?;
 
-        // Import the physical allocation from the client's fd. CUDA dups the fd
-        // internally, so the caller still owns (and closes) its own copy.
         let mut handle: sys::CUmemGenericAllocationHandle = 0;
-        // SAFETY: `handle` is valid output storage; `fd` is a live POSIX fd for a
-        // VMM allocation the client exported; the type tag matches the export.
+        // SAFETY: live VMM POSIX fd; CUDA dups it so the caller still owns `fd`.
         unsafe {
             sys::cuMemImportFromShareableHandle(
                 &mut handle,
@@ -75,24 +63,22 @@ impl VmmMapping {
             .map_err(|e| cuda_error("import VMM shareable handle", e))?;
         }
 
-        // Reserve a VA range and map the physical handle into it.
         let mut base_ptr: sys::CUdeviceptr = 0;
-        // SAFETY: standard VMM reserve; outputs are valid, alignment 0 = default.
+        // SAFETY: reserve output is written to base_ptr.
         if let Err(e) =
             unsafe { sys::cuMemAddressReserve(&mut base_ptr, alloc_size, 0, 0, 0).result() }
         {
-            // SAFETY: handle was successfully imported above and not yet mapped.
+            // SAFETY: handle imported, not yet mapped.
             unsafe { sys::cuMemRelease(handle).result().ok() };
             return Err(cuda_error("reserve VMM address range", e));
         }
-        // SAFETY: base_ptr..+alloc_size is freshly reserved; handle is imported.
+        // SAFETY: base_ptr reserved; handle imported.
         if let Err(e) = unsafe { sys::cuMemMap(base_ptr, alloc_size, 0, handle, 0).result() } {
             unsafe { sys::cuMemAddressFree(base_ptr, alloc_size).result().ok() };
             unsafe { sys::cuMemRelease(handle).result().ok() };
             return Err(cuda_error("map VMM allocation", e));
         }
 
-        // Grant this device read/write access to the mapped range.
         let access = sys::CUmemAccessDesc {
             location: sys::CUmemLocation {
                 type_: sys::CUmemLocationType_enum::CU_MEM_LOCATION_TYPE_DEVICE,
@@ -100,7 +86,7 @@ impl VmmMapping {
             },
             flags: sys::CUmemAccess_flags_enum::CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
         };
-        // SAFETY: base_ptr..+alloc_size is mapped; one access descriptor.
+        // SAFETY: range is mapped; one access desc.
         if let Err(e) = unsafe { sys::cuMemSetAccess(base_ptr, alloc_size, &access, 1).result() } {
             unsafe { sys::cuMemUnmap(base_ptr, alloc_size).result().ok() };
             unsafe { sys::cuMemAddressFree(base_ptr, alloc_size).result().ok() };
@@ -122,8 +108,7 @@ impl Drop for VmmMapping {
         self.context
             .bind_to_thread()
             .expect("bind CUDA context before releasing VMM mapping");
-        // SAFETY: this object owns one successful import+reserve+map, torn down
-        // in reverse order: unmap, free VA, release physical handle.
+        // SAFETY: reverse of import: unmap, free VA, release handle.
         unsafe {
             sys::cuMemUnmap(self.base_ptr, self.size_bytes)
                 .result()
@@ -178,11 +163,6 @@ impl CudaTensorRegistry {
         }
     }
 
-    /// Register a batch of layers under `context_key`.
-    ///
-    /// `native_fd` is `Some((fd, alloc_size))` for native VMM clients: the whole
-    /// batch shares one fused allocation imported once from that fd. It is `None`
-    /// for Python clients, whose per-layer tensors carry their own storage.
     fn register_layers(
         &mut self,
         context_key: &str,
@@ -205,8 +185,6 @@ impl CudaTensorRegistry {
             }
         }
 
-        // Native batches import their one shared allocation up front; every layer
-        // is a strided view offsetting into it.
         let mapping = match native_fd {
             Some((fd, alloc_size)) => Some(VmmMapping::import(device_id, fd, alloc_size)?),
             None => None,
@@ -348,9 +326,6 @@ impl CudaTensorRegistry {
         })
     }
 
-    /// Build one layer view as a strided window into the batch's shared VMM
-    /// mapping. `offset_bytes`/`size_bytes` are validated against the mapping's
-    /// imported size so a malformed client can't point us outside the allocation.
     fn materialize_native_tensor(
         device_id: i32,
         mapping: &Arc<VmmMapping>,
@@ -384,18 +359,14 @@ impl CudaTensorRegistry {
     }
 }
 
-/// Work submitted to the dedicated registry thread. Each carries a `oneshot`
-/// the actor uses to hand the result back to the awaiting caller.
 enum RegistryCommand {
     RegisterLayers {
         context_key: String,
         device_id: i32,
         layers: Vec<(String, TensorRegistration)>,
-        /// `Some((fd, alloc_size))` for native VMM batches; the actor imports the
-        /// shared allocation from `fd` and closes its own fd copy afterward.
+        /// `Some((fd, alloc_size))` for native VMM; `None` for Python.
         native_fd: Option<(std::os::fd::OwnedFd, usize)>,
-        // The `PyErr` is stringified on the actor thread (which holds the GIL),
-        // so callers never need to touch the GIL to read an error message.
+        // Stringified on the actor thread (holds GIL).
         reply: oneshot::Sender<Result<Vec<TensorMetadata>, String>>,
     },
     DropInstance {
@@ -441,13 +412,7 @@ impl RegistryHandle {
         Self { tx }
     }
 
-    /// Materialize and register a batch of layers under `context_key`. Returns
-    /// per-layer metadata in input order. The batch is transactional with
-    /// respect to the registry: an existing context is rejected before any
-    /// tensor is materialized, and a materialization failure does not publish a
-    /// partial context. `native_fd` is `Some` for native VMM clients (the fused
-    /// allocation's fd, already received over the fd side-channel) and `None`
-    /// for Python clients.
+    /// Register layers under `context_key`. `native_fd`: VMM fd + size, or `None` for Python.
     pub(crate) async fn register_layers(
         &self,
         context_key: String,
@@ -511,14 +476,10 @@ fn registry_actor(mut registry: CudaTensorRegistry, mut rx: mpsc::Receiver<Regis
                 native_fd,
                 reply,
             } => {
-                // Borrow the raw fd for the import; `OwnedFd` closes our copy
-                // when it drops at the end of this arm (CUDA dups it internally).
                 use std::os::fd::AsRawFd;
                 let native = native_fd.as_ref().map(|(fd, size)| (fd.as_raw_fd(), *size));
                 let result = registry
                     .register_layers(&context_key, device_id, layers, native)
-                    // Stringify here, on the GIL-owning thread, so the gRPC
-                    // handler never needs `Python::attach` just to read the message.
                     .map_err(|err| Python::attach(|py| err.value(py).to_string()));
                 let _ = reply.send(result);
             }

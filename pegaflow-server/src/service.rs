@@ -31,8 +31,6 @@ pub struct GrpcEngineService {
     shutdown: Arc<Notify>,
     hll_tracker: Arc<std::sync::Mutex<pegaflow_common::hll::MultiWindowHllTracker>>,
     session_registry: Arc<SessionRegistry>,
-    /// Host-local fd side-channel for native VMM clients. `None` in Python-only
-    /// deployments (no `--fd-socket-path`).
     fd_channel: Option<crate::fd_channel::FdChannel>,
 }
 
@@ -254,13 +252,8 @@ impl Engine for GrpcEngineService {
             let tp_size = Self::usize_from_u32(req.tp_size, "tp_size")?;
             let world_size = Self::usize_from_u32(req.world_size, "world_size")?;
 
-            // Materialize tensors and collect data_ptr/size_bytes
             let context_key =
                 Self::context_key(&req.instance_id, req.tp_rank, req.pp_rank, req.device_id);
-            // Materialize on the dedicated registry thread (GIL + CUDA) and
-            // await the result, so this RPC never blocks an async worker. Move
-            // the registration payloads over; clone the layer names since the
-            // engine call below still needs them.
             let native = !req.native_kv_tensors.is_empty();
             let mut block_stride_bytes = Vec::with_capacity(batch_len);
             let layers = if native {
@@ -291,16 +284,12 @@ impl Engine for GrpcEngineService {
                     .collect()
             };
 
-            // Native clients hand us the allocation fd out-of-band on the fd
-            // side-channel; claim it by (instance_id, device_id). The client
-            // sends the fd before this RPC, but a small wait covers reordering.
             let native_fd = if native {
                 let channel = self.fd_channel.as_ref().ok_or_else(|| {
                     Status::failed_precondition(
                         "native VMM registration requires --fd-socket-path on the server",
                     )
                 })?;
-                // The client's fused allocation size, already granularity-aligned.
                 let alloc_size = Self::usize_from_u64(req.native_alloc_size, "native_alloc_size")?;
                 if alloc_size == 0 {
                     return Err(Status::invalid_argument(

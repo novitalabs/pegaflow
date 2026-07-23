@@ -3,6 +3,7 @@
 //! one fd per connection.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -12,8 +13,11 @@ use tokio::sync::Notify;
 
 /// `instance_id\0device_id` payload; generous so long instance ids do not truncate.
 const MAX_KEY_PAYLOAD: usize = 4096;
-/// Bytes for one SCM_RIGHTS fd (`CMSG_SPACE(sizeof(int))` with margin).
-const CMSG_SPACE_FOR_FD: usize = 64;
+/// Control buffer for one SCM_RIGHTS fd.
+const CMSG_SPACE_FOR_FD: usize = unsafe {
+    // SAFETY: CMSG_SPACE is a pure layout calculation from the payload length.
+    libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as libc::c_uint) as usize
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct RegistrationKey {
@@ -33,8 +37,7 @@ impl Drop for Inner {
     }
 }
 
-/// Bound UDS path plus fds waiting to be claimed by `register_context_batch`.
-/// Cloning only bumps the `Arc`; the socket file is removed when the last clone drops.
+/// UDS side-channel; last `Arc` drop unlinks the socket file.
 #[derive(Clone)]
 pub struct FdChannel(Arc<Inner>);
 
@@ -106,13 +109,22 @@ async fn recv_one(stream: tokio::net::UnixStream, inner: &Inner) -> std::io::Res
     let (key, fd) = recv_fd_with_key(raw)?;
     drop(std_stream);
 
-    inner
-        .pending
-        .lock()
-        .expect("fd pending map poisoned")
-        .insert(key, fd);
-    inner.arrived.notify_waiters();
-    Ok(())
+    let mut pending = inner.pending.lock().expect("fd pending map poisoned");
+    match pending.entry(key) {
+        Entry::Vacant(slot) => {
+            slot.insert(fd);
+            drop(pending);
+            inner.arrived.notify_waiters();
+            Ok(())
+        }
+        Entry::Occupied(slot) => {
+            let key = slot.key();
+            Err(std::io::Error::other(format!(
+                "duplicate pending fd for instance_id={} device_id={}",
+                key.instance_id, key.device_id
+            )))
+        }
+    }
 }
 
 fn recv_fd_with_key(sock: RawFd) -> std::io::Result<(RegistrationKey, OwnedFd)> {
@@ -177,4 +189,170 @@ fn parse_key(payload: &[u8]) -> std::io::Result<RegistrationKey> {
         instance_id,
         device_id,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream as StdUnixStream;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_sock_path(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("pegaflow-fd-test-{label}-{nanos}.sock"))
+    }
+
+    fn key(instance_id: &str, device_id: i32) -> RegistrationKey {
+        RegistrationKey {
+            instance_id: instance_id.to_string(),
+            device_id,
+        }
+    }
+
+    /// Pipe whose read end carries `tag` once written on the write end.
+    /// Returns `(read_end_to_send, write_end_keep_alive)`.
+    fn tagged_pipe(tag: u8) -> (OwnedFd, std::fs::File) {
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: pipe(2) with a two-slot output array.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: pipe ends are open and owned here.
+        let (read_end, write_end) =
+            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        let mut write_file = std::fs::File::from(write_end);
+        write_file.write_all(&[tag]).expect("write tag into pipe");
+        (read_end, write_file)
+    }
+
+    fn send_fd(sock_path: &str, reg: &RegistrationKey, pass: RawFd) {
+        let stream = StdUnixStream::connect(sock_path).expect("connect fd side-channel");
+        let payload = format!("{}\0{}", reg.instance_id, reg.device_id);
+        let mut payload_bytes = payload.into_bytes();
+        let mut iov = libc::iovec {
+            iov_base: payload_bytes.as_mut_ptr().cast(),
+            iov_len: payload_bytes.len(),
+        };
+        let mut cmsg_buf = vec![0u8; CMSG_SPACE_FOR_FD];
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsg_buf.as_mut_ptr().cast();
+        msg.msg_controllen = cmsg_buf.len();
+
+        // SAFETY: msg_control points at cmsg_buf; CMSG_* walk that buffer only.
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            assert!(!cmsg.is_null());
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as libc::c_uint) as _;
+            std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<RawFd>(), pass);
+            msg.msg_controllen = (*cmsg).cmsg_len;
+            let n = libc::sendmsg(stream.as_raw_fd(), &msg, 0);
+            assert!(n >= 0, "sendmsg: {}", std::io::Error::last_os_error());
+        }
+    }
+
+    fn read_tag(fd: &OwnedFd) -> u8 {
+        let mut buf = [0u8; 1];
+        let mut file = std::fs::File::from(fd.try_clone().expect("clone fd"));
+        file.read_exact(&mut buf).expect("read tag");
+        buf[0]
+    }
+
+    #[test]
+    fn parse_key_splits_instance_and_device() {
+        // "engine-abc" + NUL + "3" (\x00 is null; next char is '3')
+        let k = parse_key(b"engine-abc\x003").unwrap();
+        assert_eq!(k.instance_id, "engine-abc");
+        assert_eq!(k.device_id, 3);
+    }
+
+    #[test]
+    fn parse_key_rejects_missing_nul() {
+        assert!(parse_key(b"no-separator").is_err());
+    }
+
+    #[tokio::test]
+    async fn fd_before_take_delivers_tagged_pipe() {
+        let path = temp_sock_path("before");
+        let channel = FdChannel::bind(path.to_string_lossy().into_owned()).unwrap();
+        let reg = key("inst-a", 0);
+        let (pass, _hold_write) = tagged_pipe(0xA1);
+        send_fd(path.to_str().unwrap(), &reg, pass.as_raw_fd());
+
+        let got = channel
+            .take(reg, Duration::from_secs(2))
+            .await
+            .expect("fd should be pending");
+        assert_eq!(read_tag(&got), 0xA1);
+    }
+
+    #[tokio::test]
+    async fn take_waits_when_fd_arrives_later() {
+        let path = temp_sock_path("wait");
+        let channel = FdChannel::bind(path.to_string_lossy().into_owned()).unwrap();
+        let reg = key("inst-b", 1);
+        let path_str = path.to_string_lossy().into_owned();
+        let reg_send = reg.clone();
+
+        let take = tokio::spawn({
+            let channel = channel.clone();
+            async move { channel.take(reg, Duration::from_secs(2)).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let (pass, _hold_write) = tagged_pipe(0xB2);
+        tokio::task::spawn_blocking(move || {
+            send_fd(&path_str, &reg_send, pass.as_raw_fd());
+            // Keep pass alive until sendmsg returns (SCM_RIGHTS dups the fd).
+            drop(pass);
+        })
+        .await
+        .unwrap();
+
+        let got = take.await.unwrap().expect("fd after wait");
+        assert_eq!(read_tag(&got), 0xB2);
+    }
+
+    #[tokio::test]
+    async fn take_times_out_without_fd() {
+        let path = temp_sock_path("timeout");
+        let channel = FdChannel::bind(path.to_string_lossy().into_owned()).unwrap();
+        let got = channel
+            .take(key("missing", 0), Duration::from_millis(80))
+            .await;
+        assert!(got.is_none());
+    }
+
+    #[tokio::test]
+    async fn duplicate_key_keeps_first_fd() {
+        let path = temp_sock_path("dup");
+        let path_str = path.to_string_lossy().into_owned();
+        let channel = FdChannel::bind(path_str.clone()).unwrap();
+        let reg = key("inst-dup", 0);
+
+        let (first, _w1) = tagged_pipe(0x11);
+        let (second, _w2) = tagged_pipe(0x22);
+        send_fd(&path_str, &reg, first.as_raw_fd());
+        // Allow the first connection to be accepted and inserted.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        send_fd(&path_str, &reg, second.as_raw_fd());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let got = channel
+            .take(reg, Duration::from_secs(1))
+            .await
+            .expect("first fd remains");
+        assert_eq!(
+            read_tag(&got),
+            0x11,
+            "duplicate must not replace pending fd"
+        );
+    }
 }

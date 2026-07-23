@@ -93,16 +93,11 @@ pub struct Cli {
     #[arg(long, default_value_t = true)]
     pub enable_prometheus: bool,
 
-    /// Unix socket path for the native-VMM fd side-channel. Native clients send
-    /// their exported allocation fd here (SCM_RIGHTS) before registration.
-    /// Empty disables native VMM registration (Python clients are unaffected).
+    /// UDS path for native clients to send VMM allocation fds (SCM_RIGHTS). Empty disables.
     #[arg(long, default_value = "/tmp/pegaflow-fd.sock")]
     pub fd_socket_path: String,
 
-    /// Initialize the Python/torch CUDA registry at startup. Required for the
-    /// Python (vLLM) connector, whose tensors arrive as pickled torch wrappers.
-    /// Native VMM clients do not need it — pass `--python-registry false` for a
-    /// torch-free deployment that serves only native clients.
+    /// Init torch CUDA registry (vLLM path). False = torch-free, native VMM only.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub python_registry: bool,
 
@@ -384,9 +379,7 @@ fn init_python_cuda(device_ids: &[i32]) -> Result<(), std::io::Error> {
     })
 }
 
-/// Create each device's primary CUDA context via cudarc — the torch-free
-/// equivalent of `init_python_cuda`, used when `--python-registry false`.
-/// Native VMM clients bind these contexts when importing their allocations.
+/// Primary CUDA contexts via cudarc when `--python-registry false`.
 fn init_cudarc_cuda(device_ids: &[i32]) -> Result<(), std::io::Error> {
     if device_ids.is_empty() {
         return Err(std::io::Error::other("no CUDA devices to initialize"));
@@ -499,8 +492,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     if cli.python_registry {
         init_python_cuda(&devices)?;
     } else {
-        // Torch-free path: create each device's CUDA context via cudarc instead
-        // of forcing torch to do it. Native VMM import binds these contexts.
         init_cudarc_cuda(&devices)?;
     }
     info!(
@@ -509,9 +500,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         devices
     );
 
-    // The Python registry initializes torch's CUDA context for the vLLM
-    // connector. Native VMM clients import their own allocations without torch,
-    // so a native-only deployment can skip it entirely (no torch dependency).
     let registry = if cli.python_registry {
         CudaTensorRegistry::new().map_err(|err| {
             let msg = format_py_err(err);
@@ -649,9 +637,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             storage_config,
         )?);
 
-        // Bind the native-VMM fd side-channel before serving, so a client that
-        // connects the moment gRPC comes up finds the socket ready. Empty path
-        // disables it (Python-only deployments).
         let fd_channel = if cli.fd_socket_path.is_empty() {
             None
         } else {

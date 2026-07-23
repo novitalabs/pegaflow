@@ -510,7 +510,6 @@ async fn run_holder(cli: &Cli, shape: &Shape, pool_bytes: usize) {
             14,
         ),
     ));
-    // Bench saves in-process; no native VMM clients, so no fd side-channel.
     let service = GrpcEngineService::new(Arc::clone(&engine), registry, shutdown, hll, None);
     let listen: SocketAddr = ([0, 0, 0, 0], cli.port).into();
     tokio::spawn(async move {

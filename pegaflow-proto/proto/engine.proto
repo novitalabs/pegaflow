@@ -46,14 +46,13 @@ message RegisterContextRequest {
   // Set by the connector for MLA; the engine derives per-layer page offsets
   // from the registered layouts. See spec.md.
   bool page_first = 18;
-  // Per-layer views into the client's fused VMM allocation. Empty for Python.
-  // Allocation fd is out-of-band (Unix socket + SCM_RIGHTS, --fd-socket-path).
+  // Native VMM layer views; empty for Python. Fd via --fd-socket-path (SCM_RIGHTS).
   repeated NativeKvTensor native_kv_tensors = 19;
   // Fused VMM allocation size (granularity-aligned). Zero for Python.
   uint64 native_alloc_size = 20;
 }
 
-// One layer's offset/size/stride inside a shared VMM allocation.
+// Layer view into a shared VMM allocation.
 message NativeKvTensor {
   uint64 offset_bytes = 1;
   uint64 size_bytes = 2;
