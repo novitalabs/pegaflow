@@ -309,7 +309,7 @@ impl Engine for GrpcEngineService {
                 }
                 let fd = channel
                     .take(
-                        crate::fd_channel::FdKey {
+                        crate::fd_channel::RegistrationKey {
                             instance_id: req.instance_id.clone(),
                             device_id: req.device_id,
                         },

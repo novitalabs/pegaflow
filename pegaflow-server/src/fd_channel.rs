@@ -1,16 +1,6 @@
-//! Host-local fd side-channel for native VMM clients.
-//!
-//! A native client exports its fused KV allocation as a POSIX file descriptor
-//! (`CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR`). That fd is a kernel object with
-//! process-local meaning — it cannot travel inside a gRPC message. The client
-//! sends it here over a Unix domain socket via `SCM_RIGHTS`, tagged with its
-//! `(instance_id, device_id)`, before it issues `register_context_batch`. The
-//! gRPC handler then claims the fd by the same key and imports the VMM
-//! allocation from it.
-//!
-//! This is why native clients can offer GPUDirect RDMA where CUDA IPC cannot: a
-//! VMM POSIX-fd allocation can be handed to `ibv_reg_dmabuf_mr`, an imported
-//! `cuIpcOpenMemHandle` pointer cannot.
+//! Host-local Unix socket that receives VMM allocation fds (SCM_RIGHTS) for
+//! native `register_context_batch`. Wire payload: `instance_id\0device_id` plus
+//! one fd per connection.
 
 use std::collections::HashMap;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
@@ -20,52 +10,39 @@ use std::time::Duration;
 use tokio::net::UnixListener;
 use tokio::sync::Notify;
 
-/// Key identifying which registration an fd belongs to. Matches the
-/// `(instance_id, device_id)` the gRPC `register_context_batch` handler uses.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct FdKey {
+pub(crate) struct RegistrationKey {
     pub(crate) instance_id: String,
     pub(crate) device_id: i32,
 }
 
-/// Received fds waiting to be claimed by their registration RPC, plus a waker so
-/// a handler that arrives before its fd can await it instead of racing.
-#[derive(Default)]
-struct Inbox {
-    fds: HashMap<FdKey, OwnedFd>,
-    arrived: Arc<Notify>,
-}
-
-/// Server-side endpoint of the fd side-channel. Holds received fds until the
-/// matching registration RPC claims them.
+/// Bound UDS path plus fds waiting to be claimed by `register_context_batch`.
 #[derive(Clone)]
 pub struct FdChannel {
     path: String,
-    inbox: Arc<Mutex<Inbox>>,
+    pending: Arc<Mutex<HashMap<RegistrationKey, OwnedFd>>>,
+    arrived: Arc<Notify>,
 }
 
 impl FdChannel {
-    /// Bind the Unix socket at `path` and spawn an accept loop. Each connection
-    /// carries exactly one fd plus its `instance_id\0device_id` key.
     pub fn bind(path: String) -> std::io::Result<Self> {
-        // A stale socket file from a previous run would make bind fail with
-        // EADDRINUSE; the server owns this path exclusively, so clear it.
-        let _ = std::fs::remove_file(&path);
+        remove_stale_socket(&path);
         let listener = UnixListener::bind(&path)?;
         let channel = Self {
             path,
-            inbox: Arc::new(Mutex::new(Inbox::default())),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            arrived: Arc::new(Notify::new()),
         };
-        let inbox = Arc::clone(&channel.inbox);
+        let pending = Arc::clone(&channel.pending);
+        let arrived = Arc::clone(&channel.arrived);
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
-                        let inbox = Arc::clone(&inbox);
-                        // One fd per connection; handle concurrently so a slow
-                        // sender can't head-of-line block others.
+                        let pending = Arc::clone(&pending);
+                        let arrived = Arc::clone(&arrived);
                         tokio::spawn(async move {
-                            if let Err(err) = recv_one(stream, &inbox).await {
+                            if let Err(err) = recv_one(stream, &pending, &arrived).await {
                                 log::warn!("fd side-channel: dropping connection: {err}");
                             }
                         });
@@ -80,20 +57,17 @@ impl FdChannel {
         Ok(channel)
     }
 
-    /// Claim the fd registered for `key`, waiting up to `timeout` for it to
-    /// arrive if the registration RPC beat its fd. Returns `None` on timeout.
-    pub(crate) async fn take(&self, key: FdKey, timeout: Duration) -> Option<OwnedFd> {
+    /// Wait up to `timeout` for the fd tagged with `key`.
+    pub(crate) async fn take(&self, key: RegistrationKey, timeout: Duration) -> Option<OwnedFd> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let notify = {
-                let mut inbox = self.inbox.lock().expect("fd inbox poisoned");
-                if let Some(fd) = inbox.fds.remove(&key) {
+            {
+                let mut pending = self.pending.lock().expect("fd pending map poisoned");
+                if let Some(fd) = pending.remove(&key) {
                     return Some(fd);
                 }
-                Arc::clone(&inbox.arrived)
-            };
-            // Wait for the next arrival or the deadline, then re-check the map.
-            if tokio::time::timeout_at(deadline, notify.notified())
+            }
+            if tokio::time::timeout_at(deadline, self.arrived.notified())
                 .await
                 .is_err()
             {
@@ -105,49 +79,53 @@ impl FdChannel {
 
 impl Drop for FdChannel {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        remove_stale_socket(&self.path);
     }
 }
 
-/// Read one `(key, fd)` from a connection and deposit it in the inbox.
-async fn recv_one(stream: tokio::net::UnixStream, inbox: &Mutex<Inbox>) -> std::io::Result<()> {
-    // SCM_RIGHTS requires recvmsg; tokio has no wrapper, so drive the raw fd
-    // through a std socket once it is readable. The payload is small and arrives
-    // in one datagram-sized write, so a single readable notification suffices.
+fn remove_stale_socket(path: &str) {
+    match std::fs::remove_file(path) {
+        Ok(()) => log::info!("fd side-channel: removed existing socket {path}"),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => log::warn!("fd side-channel: failed to remove socket {path}: {err}"),
+    }
+}
+
+async fn recv_one(
+    stream: tokio::net::UnixStream,
+    pending: &Mutex<HashMap<RegistrationKey, OwnedFd>>,
+    arrived: &Notify,
+) -> std::io::Result<()> {
+    // SCM_RIGHTS needs recvmsg; wait until readable then use a blocking std socket.
     stream.readable().await?;
     let std_stream = stream.into_std()?;
     std_stream.set_nonblocking(false)?;
     let raw = std::os::fd::AsRawFd::as_raw_fd(&std_stream);
     let (key, fd) = recv_fd_with_key(raw)?;
-    // std_stream owns `raw` and closes it on drop; the received `fd` is separate.
     drop(std_stream);
-    let notify = {
-        let mut guard = inbox.lock().expect("fd inbox poisoned");
-        guard.fds.insert(key, fd);
-        Arc::clone(&guard.arrived)
-    };
-    notify.notify_waiters();
+
+    pending
+        .lock()
+        .expect("fd pending map poisoned")
+        .insert(key, fd);
+    arrived.notify_waiters();
     Ok(())
 }
 
-/// Blocking `recvmsg` that pulls one fd (SCM_RIGHTS) plus a
-/// `instance_id\0device_id` payload off `sock`.
-fn recv_fd_with_key(sock: RawFd) -> std::io::Result<(FdKey, OwnedFd)> {
-    // Payload: "<instance_id>\0<device_id>", capped generously.
+fn recv_fd_with_key(sock: RawFd) -> std::io::Result<(RegistrationKey, OwnedFd)> {
     let mut buf = [0u8; 512];
     let mut iov = libc::iovec {
         iov_base: buf.as_mut_ptr().cast(),
         iov_len: buf.len(),
     };
-    // Control buffer sized for exactly one fd.
-    let mut cmsg_space = [0u8; unsafe_cmsg_space()];
+    let mut cmsg_space = [0u8; CMSG_SPACE_FOR_FD];
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = cmsg_space.as_mut_ptr().cast();
     msg.msg_controllen = cmsg_space.len();
 
-    // SAFETY: msg is fully initialized with valid iov/control buffers.
+    // SAFETY: iov and control buffers are valid for the duration of recvmsg.
     let n = unsafe { libc::recvmsg(sock, &mut msg, 0) };
     if n < 0 {
         return Err(std::io::Error::last_os_error());
@@ -156,31 +134,28 @@ fn recv_fd_with_key(sock: RawFd) -> std::io::Result<(FdKey, OwnedFd)> {
         return Err(std::io::Error::other("fd control message truncated"));
     }
 
-    // Extract the single fd from the first SCM_RIGHTS control message.
-    // SAFETY: msg has a valid control buffer populated by recvmsg above.
+    // SAFETY: control buffer was filled by recvmsg.
     let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
     if cmsg.is_null() {
         return Err(std::io::Error::other("fd side-channel: no control message"));
     }
-    // SAFETY: cmsg points into our control buffer.
+    // SAFETY: cmsg points into cmsg_space.
     let (level, ctype) = unsafe { ((*cmsg).cmsg_level, (*cmsg).cmsg_type) };
     if level != libc::SOL_SOCKET || ctype != libc::SCM_RIGHTS {
         return Err(std::io::Error::other(
             "fd side-channel: unexpected control message",
         ));
     }
-    // SAFETY: CMSG_DATA points at the fd payload of a SCM_RIGHTS message.
+    // SAFETY: SCM_RIGHTS payload is one RawFd.
     let raw_fd = unsafe { std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<RawFd>()) };
-    // SAFETY: recvmsg transferred ownership of this fd to us.
+    // SAFETY: ownership transferred by recvmsg.
     let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
 
-    let payload = &buf[..n as usize];
-    let key = parse_key(payload)?;
+    let key = parse_key(&buf[..n as usize])?;
     Ok((key, fd))
 }
 
-/// Parse `"<instance_id>\0<device_id>"` into an [`FdKey`].
-fn parse_key(payload: &[u8]) -> std::io::Result<FdKey> {
+fn parse_key(payload: &[u8]) -> std::io::Result<RegistrationKey> {
     let mut parts = payload.splitn(2, |&b| b == 0);
     let instance = parts
         .next()
@@ -195,16 +170,11 @@ fn parse_key(payload: &[u8]) -> std::io::Result<FdKey> {
         .ok()
         .and_then(|s| s.trim_end_matches('\0').parse().ok())
         .ok_or_else(|| std::io::Error::other("fd side-channel: bad device_id"))?;
-    Ok(FdKey {
+    Ok(RegistrationKey {
         instance_id,
         device_id,
     })
 }
 
-/// `CMSG_SPACE(size_of::<RawFd>())` as a const for the control buffer. Wrapped
-/// in a const fn since `CMSG_SPACE` is not const in libc.
-const fn unsafe_cmsg_space() -> usize {
-    // CMSG_SPACE(4) rounds the header + 4-byte fd up to the alignment boundary;
-    // 64 bytes covers it on all supported platforms with margin.
-    64
-}
+/// Bytes for one SCM_RIGHTS fd (`CMSG_SPACE(sizeof(int))` with margin).
+const CMSG_SPACE_FOR_FD: usize = 64;
