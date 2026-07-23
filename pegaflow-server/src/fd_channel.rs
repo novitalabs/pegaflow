@@ -86,6 +86,12 @@ impl FdChannel {
                 .await
                 .is_err()
             {
+                log::warn!(
+                    "fd side-channel: timed out waiting for fd instance_id={} device_id={}; \
+                     a late-arriving fd may stay pending until process exit",
+                    key.instance_id,
+                    key.device_id
+                );
                 return None;
             }
         }
