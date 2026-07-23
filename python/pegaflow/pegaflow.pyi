@@ -215,6 +215,7 @@ class EngineRpcClient:
         instance_id: str,
         block_hashes: list[bytes],
         req_id: str,
+        wait_for_full_prefix: bool = False,
     ) -> QueryLoading | QueryReady:
         """Query prefix cache hits with SSD prefetch support.
 
@@ -228,6 +229,11 @@ class EngineRpcClient:
             instance_id: Model instance ID.
             block_hashes: List of block hashes to check.
             req_id: Request ID for tracking and prefetch correlation.
+            wait_for_full_prefix: Keep the query loading until the remaining
+                prefix is fetchable in full from a remote node. Only waits on
+                remote producers discovered via MetaServer (RDMA fetch); does
+                not observe saves landing in the local/shared engine, and has
+                no effect when RDMA is not configured.
 
         Returns:
             QueryLoading while backing fetch is in progress, otherwise QueryReady.

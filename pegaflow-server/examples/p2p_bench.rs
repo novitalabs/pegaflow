@@ -444,7 +444,7 @@ async fn wait_until<F: FnMut() -> Option<usize>>(
 
 async fn cached_blocks(engine: &PegaEngine, req_id: &str, hashes: &[Vec<u8>]) -> usize {
     match engine
-        .count_prefix_hit_blocks_with_prefetch(INSTANCE, req_id, hashes)
+        .count_prefix_hit_blocks_with_prefetch(INSTANCE, req_id, hashes, false)
         .await
         .expect("count_prefix_hit_blocks_with_prefetch")
     {
@@ -677,7 +677,7 @@ async fn verify_set(
     ranks: &[RankBuffers],
 ) {
     let blocks = match engine
-        .count_prefix_hit_blocks_with_prefetch(INSTANCE, &format!("verify-{set}"), hashes)
+        .count_prefix_hit_blocks_with_prefetch(INSTANCE, &format!("verify-{set}"), hashes, false)
         .await
         .expect("verify query")
     {

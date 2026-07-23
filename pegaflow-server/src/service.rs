@@ -596,6 +596,7 @@ impl Engine for GrpcEngineService {
                     &req.instance_id,
                     &req.req_id,
                     &req.block_hashes,
+                    req.wait_for_full_prefix,
                 )
                 .await
                 .map_err(Self::map_engine_error)?;

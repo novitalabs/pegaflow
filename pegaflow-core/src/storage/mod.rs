@@ -449,9 +449,16 @@ impl StorageEngine {
         req_id: &str,
         namespace: &str,
         hashes: &[Vec<u8>],
+        wait_for_full_prefix: bool,
     ) -> PrefetchStatus {
         self.prefetch
-            .check_and_prefetch(&self.read_cache, req_id, namespace, hashes)
+            .check_and_prefetch(
+                &self.read_cache,
+                req_id,
+                namespace,
+                hashes,
+                wait_for_full_prefix,
+            )
             .await
     }
 

@@ -272,6 +272,7 @@ class ClientContext:
             kv_stride_bytes_list,
             segments_list,
             "direct",
+            False,
         )
 
         if not ok:

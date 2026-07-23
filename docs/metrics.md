@@ -82,6 +82,10 @@ PegaFlow exposes the following metrics for monitoring KV cache operations:
   - Blocks evicted from cache due to memory pressure
   - Use case: Monitor eviction frequency, tune pool size
 
+- **pegaflow_cache_block_evictions_by_class_total** (Counter)
+  - Blocks evicted from cache due to memory pressure, labelled by replacement class (`reclaimable` or `retained`)
+  - Use case: Verify remote-fetched replicas are reclaimed before locally produced blocks
+
 - **pegaflow_cache_block_evictions_still_referenced_total** (Counter)
   - Evicted blocks that still had external references (eviction did not immediately reclaim pinned memory)
   - Use case: Explain "evictions spike but pool_used_bytes doesn't drop"
@@ -91,8 +95,8 @@ PegaFlow exposes the following metrics for monitoring KV cache operations:
   - Use case: Measure effectiveness of eviction under real reference patterns
 
 - **pegaflow_cache_resident_blocks** (Gauge)
-  - Current number of sealed blocks resident in cache
-  - Use case: Track cache size in blocks
+  - Current number of sealed blocks resident in cache, labelled by replacement class (`reclaimable` or `retained`)
+  - Use case: Track cache size and source-based replacement pressure in blocks
 
 - **pegaflow_cache_resident_bytes** (Gauge)
   - Current sealed block bytes resident in cache (sum of footprints)

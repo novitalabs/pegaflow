@@ -86,6 +86,11 @@ The P/D setup trades higher TTFT for **significantly more stable decode latency*
 
 ## Limitations
 
+- Decode's `query_prefetch` may race prefill's async save. The
+  `wait_for_full_prefix` option does not cover this topology: it only waits
+  on remote producers discovered via MetaServer + RDMA, and a shared
+  engine's own blocks are never remote. It is also a no-op when RDMA is not
+  configured.
 - Router uses synchronous P→D handoff (no async KV-ready callback yet)
 - No built-in timeout/retry for P or D node failures
 - No Prometheus metrics for P/D latency breakdown

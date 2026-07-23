@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
+use hashlink::LruCache;
 use parking_lot::Mutex;
 
 use crate::block::{BlockKey, SealedBlock};
 use crate::cache::{CacheInsertOutcome, TinyLfuCache};
-use crate::metrics::core_metrics;
+use crate::metrics::{CACHE_CLASS_RECLAIMABLE, CACHE_CLASS_RETAINED, core_metrics};
 
 pub(super) struct ReadCache {
     inner: Mutex<ReadCacheInner>,
@@ -12,6 +13,14 @@ pub(super) struct ReadCache {
 
 struct ReadCacheInner {
     cache: TinyLfuCache<BlockKey, Arc<SealedBlock>>,
+    reclaimable: LruCache<BlockKey, ()>,
+    retained: LruCache<BlockKey, ()>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ResidentClass {
+    Reclaimable,
+    Retained,
 }
 
 impl ReadCache {
@@ -23,7 +32,11 @@ impl ReadCache {
         let cache =
             TinyLfuCache::new_unbounded(capacity_bytes, enable_lfu_admission, value_size_hint);
         Self {
-            inner: Mutex::new(ReadCacheInner { cache }),
+            inner: Mutex::new(ReadCacheInner {
+                cache,
+                reclaimable: LruCache::new_unbounded(),
+                retained: LruCache::new_unbounded(),
+            }),
         }
     }
 
@@ -40,6 +53,7 @@ impl ReadCache {
             let mut inner = self.inner.lock();
             for key in keys {
                 if let Some(block) = inner.cache.get(key) {
+                    refresh_recency(&mut inner, key);
                     hit += 1;
                     blocks.push(block);
                 } else {
@@ -53,7 +67,7 @@ impl ReadCache {
     pub(super) fn batch_insert(&self, blocks: Vec<(BlockKey, Arc<SealedBlock>)>) {
         let mut inner = self.inner.lock();
         for (key, block) in blocks {
-            insert_block(&mut inner, key, block);
+            insert_block(&mut inner, key, block, ResidentClass::Retained);
         }
     }
 
@@ -64,7 +78,7 @@ impl ReadCache {
         let mut inner = self.inner.lock();
         let mut resident_keys = Vec::new();
         for (key, block) in blocks {
-            match insert_block(&mut inner, key.clone(), block) {
+            match insert_block(&mut inner, key.clone(), block, ResidentClass::Reclaimable) {
                 CacheInsertOutcome::InsertedNew | CacheInsertOutcome::AlreadyExists => {
                     resident_keys.push(key);
                 }
@@ -77,7 +91,12 @@ impl ReadCache {
     pub(super) fn batch_insert_refs(&self, blocks: &[(BlockKey, Arc<SealedBlock>)]) {
         let mut inner = self.inner.lock();
         for (key, block) in blocks {
-            insert_block(&mut inner, key.clone(), Arc::clone(block));
+            insert_block(
+                &mut inner,
+                key.clone(),
+                Arc::clone(block),
+                ResidentClass::Retained,
+            );
         }
     }
 
@@ -88,7 +107,8 @@ impl ReadCache {
         let mut found = Vec::new();
         for key in keys {
             if let Some(block) = inner.cache.get(key) {
-                found.push((key.clone(), Arc::clone(&block)));
+                refresh_recency(&mut inner, key);
+                found.push((key.clone(), block));
             }
         }
         found
@@ -96,13 +116,47 @@ impl ReadCache {
 
     pub(super) fn remove_lru_batch(&self, batch_size: usize) -> Vec<(BlockKey, Arc<SealedBlock>)> {
         let mut inner = self.inner.lock();
-        (0..batch_size)
-            .map_while(|_| inner.cache.remove_lru())
-            .collect()
+        let mut evicted = Vec::with_capacity(batch_size);
+        while evicted.len() < batch_size {
+            let next = remove_lru(&mut inner, ResidentClass::Reclaimable)
+                .or_else(|| remove_lru(&mut inner, ResidentClass::Retained));
+            let Some(block) = next else {
+                break;
+            };
+            evicted.push(block);
+        }
+        evicted
     }
 
     pub(super) fn remove_all(&self) -> Vec<(BlockKey, Arc<SealedBlock>)> {
-        self.inner.lock().cache.remove_all()
+        let mut inner = self.inner.lock();
+        let reclaimable_blocks = inner.reclaimable.len() as i64;
+        let retained_blocks = inner.retained.len() as i64;
+        inner.reclaimable.clear();
+        inner.retained.clear();
+        let removed = inner.cache.remove_all();
+        debug_assert_eq!(
+            removed.len() as i64,
+            reclaimable_blocks + retained_blocks,
+            "resident cache and replacement classes diverged"
+        );
+        let metrics = core_metrics();
+        metrics
+            .cache_resident_blocks
+            .add(-reclaimable_blocks, &*CACHE_CLASS_RECLAIMABLE);
+        metrics
+            .cache_resident_blocks
+            .add(-retained_blocks, &*CACHE_CLASS_RETAINED);
+        removed
+    }
+}
+
+impl ResidentClass {
+    fn attributes(self) -> &'static [opentelemetry::KeyValue] {
+        match self {
+            Self::Reclaimable => &*CACHE_CLASS_RECLAIMABLE,
+            Self::Retained => &*CACHE_CLASS_RETAINED,
+        }
     }
 }
 
@@ -110,21 +164,62 @@ fn insert_block(
     inner: &mut ReadCacheInner,
     key: BlockKey,
     block: Arc<SealedBlock>,
+    class: ResidentClass,
 ) -> CacheInsertOutcome {
     let footprint_bytes = block.memory_footprint();
-    let outcome = inner.cache.insert(key, block);
+    let outcome = inner.cache.insert(key.clone(), block);
     match outcome {
         CacheInsertOutcome::InsertedNew => {
+            class_lru(inner, class).insert(key, ());
             let m = core_metrics();
             m.cache_block_insertions.add(1, &[]);
             m.cache_resident_bytes.add(footprint_bytes as i64, &[]);
+            m.cache_resident_blocks.add(1, class.attributes());
         }
-        CacheInsertOutcome::AlreadyExists => {}
+        CacheInsertOutcome::AlreadyExists => refresh_recency(inner, &key),
         CacheInsertOutcome::Rejected => {
             core_metrics().cache_block_admission_rejections.add(1, &[]);
         }
     }
     outcome
+}
+
+fn class_lru(inner: &mut ReadCacheInner, class: ResidentClass) -> &mut LruCache<BlockKey, ()> {
+    match class {
+        ResidentClass::Reclaimable => &mut inner.reclaimable,
+        ResidentClass::Retained => &mut inner.retained,
+    }
+}
+
+fn refresh_recency(inner: &mut ReadCacheInner, key: &BlockKey) {
+    let classified = inner.reclaimable.get(key).is_some() || inner.retained.get(key).is_some();
+    debug_assert!(
+        classified || !inner.cache.contains_key(key),
+        "resident block is missing its replacement class"
+    );
+}
+
+fn remove_lru(
+    inner: &mut ReadCacheInner,
+    class: ResidentClass,
+) -> Option<(BlockKey, Arc<SealedBlock>)> {
+    while let Some((key, ())) = class_lru(inner, class).remove_lru() {
+        let block = inner.cache.remove(&key);
+        debug_assert!(
+            block.is_some(),
+            "replacement class contains a non-resident block"
+        );
+        let Some(block) = block else {
+            continue;
+        };
+        let metrics = core_metrics();
+        metrics.cache_resident_blocks.add(-1, class.attributes());
+        metrics
+            .cache_block_evictions_by_class
+            .add(1, class.attributes());
+        return Some((key, block));
+    }
+    None
 }
 
 #[cfg(test)]
@@ -137,6 +232,108 @@ mod tests {
 
     fn make_block() -> Arc<SealedBlock> {
         Arc::new(SealedBlock::from_slots(Vec::new()))
+    }
+
+    fn assert_class(cache: &ReadCache, key: &BlockKey, expected: ResidentClass) {
+        let inner = cache.inner.lock();
+        assert!(inner.cache.contains_key(key));
+        assert_eq!(
+            inner.reclaimable.contains_key(key),
+            expected == ResidentClass::Reclaimable
+        );
+        assert_eq!(
+            inner.retained.contains_key(key),
+            expected == ResidentClass::Retained
+        );
+    }
+
+    #[test]
+    fn new_blocks_are_classified_by_source() {
+        let cache = make_cache();
+        let local = BlockKey::new("ns".into(), vec![1]);
+        let ssd = BlockKey::new("ns".into(), vec![2]);
+        let remote = BlockKey::new("ns".into(), vec![3]);
+        let local_block = make_block();
+
+        cache.batch_insert_refs(&[(local.clone(), local_block)]);
+        cache.batch_insert(vec![(ssd.clone(), make_block())]);
+        cache.batch_insert_resident_keys(vec![(remote.clone(), make_block())]);
+
+        assert_class(&cache, &local, ResidentClass::Retained);
+        assert_class(&cache, &ssd, ResidentClass::Retained);
+        assert_class(&cache, &remote, ResidentClass::Reclaimable);
+    }
+
+    #[test]
+    fn reclaimable_blocks_are_evicted_before_retained_blocks() {
+        let cache = make_cache();
+        let retained = BlockKey::new("ns".into(), vec![1]);
+        let reclaimable = BlockKey::new("ns".into(), vec![2]);
+
+        cache.batch_insert(vec![(retained.clone(), make_block())]);
+        cache.batch_insert_resident_keys(vec![(reclaimable.clone(), make_block())]);
+
+        let evicted = cache.remove_lru_batch(2);
+        assert_eq!(
+            evicted.into_iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            vec![reclaimable, retained]
+        );
+    }
+
+    #[test]
+    fn local_hit_refreshes_recency_without_changing_class() {
+        let cache = make_cache();
+        let hit = BlockKey::new("ns".into(), vec![1]);
+        let oldest = BlockKey::new("ns".into(), vec![2]);
+
+        cache.batch_insert_resident_keys(vec![
+            (hit.clone(), make_block()),
+            (oldest.clone(), make_block()),
+        ]);
+        let (count, _) = cache.get_prefix_blocks(std::slice::from_ref(&hit));
+
+        assert_eq!(count, 1);
+        assert_eq!(cache.remove_lru_batch(1)[0].0, oldest);
+        assert_class(&cache, &hit, ResidentClass::Reclaimable);
+    }
+
+    #[test]
+    fn serving_hit_refreshes_recency_without_changing_class() {
+        let cache = make_cache();
+        let hit = BlockKey::new("ns".into(), vec![1]);
+        let oldest = BlockKey::new("ns".into(), vec![2]);
+
+        cache.batch_insert(vec![
+            (hit.clone(), make_block()),
+            (oldest.clone(), make_block()),
+        ]);
+        assert_eq!(cache.get_blocks(std::slice::from_ref(&hit)).len(), 1);
+
+        assert_eq!(cache.remove_lru_batch(1)[0].0, oldest);
+        assert_class(&cache, &hit, ResidentClass::Retained);
+    }
+
+    #[test]
+    fn already_existing_insert_keeps_original_class() {
+        let cache = make_cache();
+        let remote_first = BlockKey::new("ns".into(), vec![1]);
+        let remote_other = BlockKey::new("ns".into(), vec![2]);
+        let local_first = BlockKey::new("ns".into(), vec![3]);
+        let local_other = BlockKey::new("ns".into(), vec![4]);
+
+        cache.batch_insert_resident_keys(vec![(remote_first.clone(), make_block())]);
+        cache.batch_insert_resident_keys(vec![(remote_other.clone(), make_block())]);
+        cache.batch_insert(vec![(remote_first.clone(), make_block())]);
+        cache.batch_insert(vec![(local_first.clone(), make_block())]);
+        cache.batch_insert(vec![(local_other.clone(), make_block())]);
+        cache.batch_insert_resident_keys(vec![(local_first.clone(), make_block())]);
+
+        assert_class(&cache, &remote_first, ResidentClass::Reclaimable);
+        assert_class(&cache, &local_first, ResidentClass::Retained);
+        assert_eq!(cache.remove_lru_batch(1)[0].0, remote_other);
+        assert_eq!(cache.remove_lru_batch(1)[0].0, remote_first);
+        assert_eq!(cache.remove_lru_batch(1)[0].0, local_other);
+        assert_class(&cache, &local_first, ResidentClass::Retained);
     }
 
     #[test]
@@ -225,6 +422,10 @@ mod tests {
         let removed = cache.remove_all();
         assert_eq!(removed.len(), 2);
         assert_eq!(cache.get_blocks(&[key1, key2]).len(), 0);
+        let inner = cache.inner.lock();
+        assert!(inner.reclaimable.is_empty());
+        assert!(inner.retained.is_empty());
+        drop(inner);
         assert!(cache.remove_all().is_empty());
     }
 
@@ -248,6 +449,7 @@ mod tests {
                 .batch_insert_resident_keys(vec![(cold_key.clone(), make_block())])
                 .is_empty()
         );
+        assert!(!cache.inner.lock().reclaimable.contains_key(&cold_key));
         assert_eq!(cache.get_blocks(&[hot_key]).len(), 1);
         assert_eq!(cache.get_blocks(&[cold_key]).len(), 0);
     }
