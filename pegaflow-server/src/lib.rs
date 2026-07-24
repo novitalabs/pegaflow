@@ -94,7 +94,7 @@ pub struct Cli {
     pub enable_prometheus: bool,
 
     /// UDS path for native clients to send VMM allocation fds (SCM_RIGHTS). Empty disables.
-    #[arg(long, default_value = "/tmp/pegaflow-fd.sock")]
+    #[arg(long, default_value = "")]
     pub fd_socket_path: String,
 
     /// Init torch CUDA registry (vLLM path). False = torch-free, native VMM only.
@@ -306,7 +306,7 @@ fn init_cuda_driver() -> Result<(), std::io::Error> {
         .map_err(|err| std::io::Error::other(format!("failed to initialize CUDA driver: {err}")))
 }
 
-fn detect_cuda_devices() -> Result<Vec<i32>, std::io::Error> {
+fn detect_python_cuda_devices() -> Result<Vec<i32>, std::io::Error> {
     Python::attach(|py| -> pyo3::PyResult<Vec<i32>> {
         let torch = py.import("torch")?;
         let cuda = torch.getattr("cuda")?;
@@ -329,6 +329,15 @@ fn detect_cuda_devices() -> Result<Vec<i32>, std::io::Error> {
             format_py_err(err)
         ))
     })
+}
+
+fn detect_native_cuda_devices() -> Result<Vec<i32>, std::io::Error> {
+    let device_count = cudarc::driver::CudaContext::device_count().map_err(|err| {
+        std::io::Error::other(format!(
+            "failed to detect CUDA devices with the CUDA driver: {err}"
+        ))
+    })?;
+    Ok((0..device_count).collect())
 }
 
 fn init_python_cuda(device_ids: &[i32]) -> Result<(), std::io::Error> {
@@ -473,7 +482,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     // Determine which devices to initialize
     let devices = if cli.devices.is_empty() {
         // Auto-detect all available devices
-        let detected = detect_cuda_devices()?;
+        let detected = if cli.python_registry {
+            detect_python_cuda_devices()?
+        } else {
+            detect_native_cuda_devices()?
+        };
         info!(
             "Auto-detected {} CUDA device(s): {:?}",
             detected.len(),
@@ -777,6 +790,13 @@ mod tests {
             parse_hll_windows(&cli.metric_hll_windows).unwrap(),
             expected_hll_windows()
         );
+    }
+
+    #[test]
+    fn cli_defaults_native_fd_side_channel_off() {
+        let cli = Cli::try_parse_from(["pegaflow-server"]).unwrap();
+
+        assert!(cli.fd_socket_path.is_empty());
     }
 
     #[test]

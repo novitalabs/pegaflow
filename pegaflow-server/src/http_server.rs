@@ -82,8 +82,17 @@ async fn cleanup_handler(
 ) -> impl IntoResponse {
     match query.id {
         None => {
-            let removed_tensors = state.registry.clear().await;
-            let removed_instances = state.engine.unregister_all_instances();
+            let engine = Arc::clone(&state.engine);
+            let registry = state.registry.clone();
+            let (removed_instances, removed_tensors) = tokio::spawn(async move {
+                let cleanup = registry.clear().await;
+                let removed_instances = engine.unregister_all_instances();
+                let removed_tensors = cleanup.tensor_count();
+                registry.finish_cleanup(cleanup).await;
+                (removed_instances, removed_tensors)
+            })
+            .await
+            .expect("cleanup-all task failed");
 
             if !removed_instances.is_empty() || removed_tensors > 0 {
                 warn!(
@@ -104,8 +113,19 @@ async fn cleanup_handler(
             )
         }
         Some(instance_id) => {
-            let removed_tensors = state.registry.drop_instance(instance_id.clone()).await;
-            match state.engine.unregister_instance(&instance_id) {
+            let engine = Arc::clone(&state.engine);
+            let registry = state.registry.clone();
+            let cleanup_id = instance_id.clone();
+            let (removed_tensors, unregister) = tokio::spawn(async move {
+                let cleanup = registry.drop_instance(cleanup_id.clone()).await;
+                let removed_tensors = cleanup.tensor_count();
+                let unregister = engine.unregister_instance(&cleanup_id);
+                registry.finish_cleanup(cleanup).await;
+                (removed_tensors, unregister)
+            })
+            .await
+            .expect("instance cleanup task failed");
+            match unregister {
                 Ok(()) => {
                     warn!(
                         "Cleanup instance {}: {} CUDA tensor(s) released",

@@ -15,14 +15,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cudarc::driver::CudaContext;
 use cudarc::driver::sys;
-use pegaflow_core::sync_state::{LOAD_STATE_ERROR, LOAD_STATE_SUCCESS};
-use pegaflow_core::{LoadState, PegaEngine, StorageConfig};
+use pegaflow_core::{PegaEngine, StorageConfig};
 use pegaflow_server::fd_channel::FdChannel;
 use pegaflow_server::proto::engine::engine_client::EngineClient;
 use pegaflow_server::proto::engine::engine_server::EngineServer;
 use pegaflow_server::proto::engine::{
     LeaseLoad, LoadRequest, NativeKvTensor, QueryRequest, RegisterContextRequest, SaveLayer,
-    SaveRequest, TransferMode, query_response,
+    SaveRequest, TransferMode, UnregisterRequest, query_response,
 };
 use pegaflow_server::{CudaTensorRegistry, GrpcEngineService, RegistryHandle};
 use tokio::sync::Notify;
@@ -139,21 +138,18 @@ async fn native_vmm_register_save_load_roundtrip() {
             h
         })
         .collect();
-    let save = client
-        .save(SaveRequest {
-            instance_id: INSTANCE_ID.to_string(),
-            tp_rank: 0,
-            device_id: 0,
-            pp_rank: 0,
-            saves: vec![SaveLayer {
-                layer_name: LAYER_NAME.to_string(),
-                block_ids: (0..BLOCK_COUNT as u32).collect(),
-                block_hashes: hashes.clone(),
-            }],
-        })
-        .await
-        .expect("save")
-        .into_inner();
+    let save_request = SaveRequest {
+        instance_id: INSTANCE_ID.to_string(),
+        tp_rank: 0,
+        device_id: 0,
+        pp_rank: 0,
+        saves: vec![SaveLayer {
+            layer_name: LAYER_NAME.to_string(),
+            block_ids: (0..BLOCK_COUNT as u32).collect(),
+            block_hashes: hashes.clone(),
+        }],
+    };
+    let save = client.save(save_request).await.expect("save").into_inner();
     assert!(
         save.status.as_ref().is_some_and(|s| s.ok),
         "{:?}",
@@ -183,19 +179,18 @@ async fn native_vmm_register_save_load_roundtrip() {
     client_alloc.zero();
     assert!(client_alloc.copy_to_host().iter().all(|&b| b == 0));
 
-    let load_state = LoadState::new().expect("LoadState");
     let load = client
         .load(LoadRequest {
             instance_id: INSTANCE_ID.to_string(),
             tp_rank: 0,
             device_id: 0,
-            load_state_shm: load_state.shm_name().to_string(),
+            load_state_shm: String::new(),
             layer_names: vec![LAYER_NAME.to_string()],
             loads: vec![LeaseLoad {
                 lease: ready.lease,
                 block_ids: (0..BLOCK_COUNT as u32).collect(),
             }],
-            wait_for_completion: false,
+            wait_for_completion: true,
         })
         .await
         .expect("load")
@@ -205,12 +200,23 @@ async fn native_vmm_register_save_load_roundtrip() {
         "{:?}",
         load.status
     );
-    wait_load(&load_state).await;
-
     assert_eq!(
         client_alloc.copy_to_host(),
         expected,
         "H2D restore must match pre-save GPU pattern"
+    );
+
+    let unregister = client
+        .unregister_context(UnregisterRequest {
+            instance_id: INSTANCE_ID.to_string(),
+        })
+        .await
+        .expect("unregister_context")
+        .into_inner();
+    assert!(
+        unregister.status.as_ref().is_some_and(|status| status.ok),
+        "{:?}",
+        unregister.status
     );
 
     server.abort();
@@ -431,19 +437,6 @@ async fn connect(endpoint: &str) -> EngineClient<tonic::transport::Channel> {
             }
             Err(e) => panic!("connect: {e}"),
         }
-    }
-}
-
-async fn wait_load(state: &LoadState) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let s = state.get();
-        if s == LOAD_STATE_SUCCESS {
-            return;
-        }
-        assert_ne!(s, LOAD_STATE_ERROR, "load ERROR");
-        assert!(Instant::now() < deadline, "load timeout");
-        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 

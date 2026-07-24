@@ -107,7 +107,6 @@ fn wait_until_serving(addr: SocketAddr) {
 struct TestCluster {
     http_addr: SocketAddr,
     client: EngineClient<Channel>,
-    registry: RegistryHandle,
     shutdown: Arc<Notify>,
     rt: tokio::runtime::Runtime,
     // Kept alive so the engine's pinned pool stays valid for the whole test.
@@ -176,10 +175,9 @@ impl TestCluster {
     }
 
     fn wait_for_registry_drain(&self, timeout: Duration) {
-        let registry = self.registry.clone();
-        self.rt
-            .block_on(async move { tokio::time::timeout(timeout, registry.clear()).await })
-            .expect("registry actor did not drain after releasing the GIL wedge");
+        let response = http_request(self.http_addr, "POST", "/instances/cleanup", timeout)
+            .expect("HTTP cleanup did not finish after releasing the GIL wedge");
+        assert!(response.contains("200"), "cleanup failed: {response:?}");
     }
 
     fn shutdown(self) {
@@ -320,7 +318,6 @@ fn start_cluster(worker_threads: usize) -> TestCluster {
     TestCluster {
         http_addr,
         client,
-        registry,
         shutdown,
         rt,
         _ctx: ctx,
