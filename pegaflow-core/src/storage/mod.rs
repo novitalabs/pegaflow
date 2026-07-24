@@ -1,3 +1,4 @@
+mod backing_tier;
 mod prefetch;
 mod read_cache;
 mod tier_attribution;
@@ -5,8 +6,6 @@ pub(crate) mod transfer_lock;
 mod write_path;
 
 use bytesize::ByteSize;
-#[cfg(not(feature = "rdma"))]
-use log::warn;
 use log::{debug, info, warn};
 use std::collections::HashSet;
 use std::num::NonZeroU64;
@@ -23,9 +22,9 @@ use crate::metrics::core_metrics;
 use crate::pinned_pool::{PinnedAllocation, PinnedAllocator};
 use pegaflow_common::NumaNode;
 
-use prefetch::PrefetchScheduler;
 #[cfg(feature = "rdma")]
-use prefetch::RdmaFetch;
+use backing_tier::RdmaFetch;
+use prefetch::{PrefetchDeps, PrefixScan, Scheduler};
 pub(crate) use read_cache::ReadCache;
 use write_path::{InsertDeps, WritePipeline};
 
@@ -96,7 +95,7 @@ impl Default for StorageConfig {
 pub(crate) struct StorageEngine {
     allocator: Arc<PinnedAllocator>,
     read_cache: Arc<ReadCache>,
-    prefetch: PrefetchScheduler,
+    prefetch: Scheduler,
     write_pipeline: Arc<WritePipeline>,
     ssd_store: Option<Arc<SsdBackingStore>>,
     #[cfg(feature = "rdma")]
@@ -231,12 +230,12 @@ impl StorageEngine {
             #[cfg(not(feature = "rdma"))]
             let rdma_fetch = None;
 
-            let prefetch = PrefetchScheduler::new(
-                ssd_store.clone(),
+            let prefetch = Scheduler::new(PrefetchDeps {
+                ssd_store: ssd_store.clone(),
                 rdma_fetch,
-                metaserver_client.clone(),
+                metaserver_client: metaserver_client.clone(),
                 max_prefetch_blocks,
-            );
+            });
 
             let transfer_lock = Arc::new(transfer_lock::TransferLockManager::new(
                 transfer_lock_timeout,
@@ -456,12 +455,9 @@ impl StorageEngine {
         wait_for_full_prefix: bool,
     ) -> PrefetchStatus {
         self.prefetch
-            .check_and_prefetch(
+            .query(
                 &self.read_cache,
-                req_id,
-                namespace,
-                hashes,
-                wait_for_full_prefix,
+                PrefixScan::new(req_id, namespace, hashes).require_full(wait_for_full_prefix),
             )
             .await
     }
@@ -550,7 +546,7 @@ impl StorageEngine {
         (freed_blocks, freed_bytes, largest_free)
     }
 
-    /// Remove stale inflight blocks and failed_remote entries.
+    /// Remove stale inflight blocks and stale rdma-failed entries.
     pub(crate) async fn gc_stale_inflight(
         &self,
         inflight_max_age: std::time::Duration,
@@ -562,7 +558,7 @@ impl StorageEngine {
             .await;
         let (stale_prefetch, failed) = self
             .prefetch
-            .gc_stale_entries(inflight_max_age, failed_remote_max_age);
+            .gc_stale(inflight_max_age, failed_remote_max_age);
         if stale_prefetch > 0 {
             core_metrics()
                 .prefetch_stale_gc_total
@@ -570,7 +566,7 @@ impl StorageEngine {
             warn!("Prefetch GC: removed {stale_prefetch} stale active entries (age > threshold)");
         }
         if failed > 0 {
-            log::debug!("gc: cleared {failed} stale failed_remote entries");
+            log::debug!("gc: cleared {failed} stale rdma-failed entries");
         }
         (cleaned, failed)
     }
