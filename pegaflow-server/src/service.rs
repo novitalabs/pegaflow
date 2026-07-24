@@ -1,5 +1,6 @@
 use pegaflow_core::{trace_in_span, trace_root};
 
+use crate::fd_channel::RegistrationKey;
 use crate::metric::record_rpc_result;
 use crate::proto::engine::engine_server::Engine;
 use crate::proto::engine::{
@@ -7,21 +8,22 @@ use crate::proto::engine::{
     QueryBlocksForTransferRequest, QueryBlocksForTransferResponse, QueryLoading, QueryReady,
     QueryRequest, QueryResponse, RdmaHandshakeRequest, RdmaHandshakeResponse,
     RegisterContextRequest, RegisterContextResponse, ReleaseRequest, ReleaseResponse,
-    ReleaseTransferLockRequest, ReleaseTransferLockResponse, ResponseStatus, SaveRequest,
-    SaveResponse, SessionEvent, SessionRequest, ShutdownRequest, ShutdownResponse,
-    TransferBlockInfo, TransferMode as ProtoTransferMode, TransferSlotInfo, UnregisterRequest,
-    UnregisterResponse, query_response,
+    ReleaseTransferLockRequest, ReleaseTransferLockResponse, SaveRequest, SaveResponse,
+    SessionEvent, SessionRequest, ShutdownRequest, ShutdownResponse, TransferBlockInfo,
+    TransferMode as ProtoTransferMode, TransferSlotInfo, UnregisterRequest, UnregisterResponse,
+    query_response,
 };
 use crate::registry::{RegistryHandle, TensorRegistration};
 use crate::session::SessionRegistry;
 use log::{debug, info, warn};
-use pegaflow_core::{EngineError, LayerSave, PegaEngine, PrefetchStatus, QueryLeaseId};
+use pegaflow_core::{LayerSave, PegaEngine, PrefetchStatus, QueryLeaseId};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Notify, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, async_trait};
 
+mod helpers;
 mod validation;
 
 #[derive(Clone)]
@@ -49,131 +51,6 @@ impl GrpcEngineService {
             hll_tracker,
             session_registry: SessionRegistry::new(),
             fd_channel,
-        }
-    }
-
-    /// Drop CUDA IPC tensors and engine-side instance state for `instance_id`.
-    /// Idempotent — safe to call after the instance is already gone.
-    async fn cleanup_instance(
-        engine: &PegaEngine,
-        registry: &RegistryHandle,
-        instance_id: &str,
-        reason: &'static str,
-    ) {
-        let removed = registry.drop_instance(instance_id.to_string()).await;
-        if removed > 0 {
-            info!(
-                "Session cleanup ({}): dropped {} CUDA tensors for instance {}",
-                reason, removed, instance_id
-            );
-        }
-        if let Err(err) = engine.unregister_instance(instance_id) {
-            // `InstanceMissing` is normal if the instance was never registered
-            // (vllm died before any register_context_batch). Log at debug.
-            debug!(
-                "Session cleanup ({}): engine.unregister_instance({}) returned {}",
-                reason, instance_id, err
-            );
-        }
-    }
-
-    fn context_key(instance_id: &str, tp_rank: u32, pp_rank: u32, device_id: i32) -> String {
-        format!("{instance_id}:tp{tp_rank}:pp{pp_rank}:dev{device_id}")
-    }
-
-    fn ok_status() -> ResponseStatus {
-        ResponseStatus {
-            ok: true,
-            message: String::new(),
-        }
-    }
-
-    fn map_engine_error(err: EngineError) -> Status {
-        match err {
-            EngineError::InvalidArgument(_) => Status::invalid_argument(err.to_string()),
-            EngineError::InstanceMissing(_) | EngineError::WorkerMissing(_, _) => {
-                Status::failed_precondition(err.to_string())
-            }
-            EngineError::TopologyMismatch(_) => Status::failed_precondition(err.to_string()),
-            EngineError::CudaInit(_) | EngineError::Storage(_) | EngineError::Poisoned(_) => {
-                Status::internal(err.to_string())
-            }
-        }
-    }
-
-    fn usize_from_u64(value: u64, field: &str) -> Result<usize, Status> {
-        usize::try_from(value).map_err(|_| {
-            Status::invalid_argument(format!("{field}={value} does not fit into usize"))
-        })
-    }
-
-    fn usize_from_u32(value: u32, field: &str) -> Result<usize, Status> {
-        usize::try_from(value).map_err(|_| {
-            Status::invalid_argument(format!("{field}={value} does not fit into usize"))
-        })
-    }
-
-    fn validate_device_id(device_id: i32) -> Result<(), Status> {
-        if device_id < 0 {
-            return Err(Status::invalid_argument(format!(
-                "device_id {device_id} must be >= 0"
-            )));
-        }
-        Ok(())
-    }
-
-    fn validate_save_layers(saves: &[crate::proto::engine::SaveLayer]) -> Result<(), Status> {
-        for layer in saves {
-            if layer.block_ids.len() != layer.block_hashes.len() {
-                return Err(Status::invalid_argument(format!(
-                    "block_ids length {} does not match block_hashes {} for layer {}",
-                    layer.block_ids.len(),
-                    layer.block_hashes.len(),
-                    layer.layer_name
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_query_prefetch_request(req: &QueryRequest) -> Result<(), Status> {
-        if req.req_id.is_empty() {
-            return Err(Status::invalid_argument("req_id must not be empty"));
-        }
-        Ok(())
-    }
-
-    fn build_register_context_response() -> RegisterContextResponse {
-        RegisterContextResponse {
-            status: Some(Self::ok_status()),
-        }
-    }
-
-    fn build_simple_response() -> ResponseStatus {
-        Self::ok_status()
-    }
-
-    fn build_transfer_slot_info(
-        raw_block: &pegaflow_core::RawBlock,
-        numa_node: pegaflow_common::NumaNode,
-    ) -> TransferSlotInfo {
-        let layer_block = pegaflow_core::LayerBlock::new(raw_block);
-        if let Some(v_ptr) = layer_block.v_ptr() {
-            TransferSlotInfo {
-                k_ptr: layer_block.k_ptr() as u64,
-                k_size: layer_block.k_size() as u64,
-                v_ptr: v_ptr as u64,
-                v_size: layer_block.v_size().unwrap_or(0) as u64,
-                numa_node: numa_node.0,
-            }
-        } else {
-            TransferSlotInfo {
-                k_ptr: layer_block.k_ptr() as u64,
-                k_size: layer_block.k_size() as u64,
-                v_ptr: 0,
-                v_size: 0,
-                numa_node: numa_node.0,
-            }
         }
     }
 }
@@ -298,7 +175,7 @@ impl Engine for GrpcEngineService {
                 }
                 let fd = channel
                     .take(
-                        crate::fd_channel::RegistrationKey {
+                        RegistrationKey {
                             instance_id: req.instance_id.clone(),
                             device_id: req.device_id,
                         },
@@ -307,8 +184,8 @@ impl Engine for GrpcEngineService {
                     .await
                     .ok_or_else(|| {
                         Status::failed_precondition(format!(
-                            "no allocation fd received on the side-channel for instance {} device {}",
-                            req.instance_id, req.device_id
+                            "no allocation fd received on the side-channel for instance {}",
+                            req.instance_id
                         ))
                     })?;
                 Some((fd, alloc_size))
@@ -316,49 +193,69 @@ impl Engine for GrpcEngineService {
                 None
             };
 
-            let metadatas = self
-                .registry
-                .register_layers(context_key.clone(), req.device_id, layers, native_fd)
-                .await
-                .map_err(|message| Status::internal(format!("register tensor failed: {message}")))?;
-            let mut data_ptrs = Vec::with_capacity(batch_len);
-            let mut size_bytes_list = Vec::with_capacity(batch_len);
-            for metadata in &metadatas {
-                data_ptrs.push(metadata.data_ptr);
-                size_bytes_list.push(metadata.size_bytes);
-            }
-
-            // Call engine batch registration
-            if let Err(err) = self.engine.register_context_layer_batch_strided(
-                &req.instance_id,
-                &req.namespace,
-                req.device_id,
-                tp_rank,
-                pp_rank,
-                tp_size,
-                world_size,
-                &req.layer_names,
-                &data_ptrs,
-                &size_bytes_list,
-                &num_blocks_list,
-                &bytes_per_block_list,
-                &kv_stride_bytes_list,
-                &segments_list,
-                native.then_some(block_stride_bytes.as_slice()),
-                transfer_mode,
-                req.page_first,
-            ) {
-                let status = Self::map_engine_error(err);
-                let removed = self.registry.drop_context(context_key.clone()).await;
-                if removed > 0 {
-                    warn!(
-                        "Rolled back {} CUDA tensor(s) for failed register_context_batch context {}",
-                        removed, context_key
-                    );
+            let registry = self.registry.clone();
+            let engine = Arc::clone(&self.engine);
+            // Finish registry + engine publication, or rollback both, even if
+            // tonic cancels the request after the actor accepted registration.
+            tokio::spawn(async move {
+                let (metadatas, registration_guard, registration_permit) = registry
+                    .register_layers(
+                        context_key.clone(),
+                        req.instance_id.clone(),
+                        req.device_id,
+                        layers,
+                        native_fd,
+                    )
+                    .await
+                    .map_err(|message| {
+                        Status::internal(format!("register tensor failed: {message}"))
+                    })?;
+                let mut data_ptrs = Vec::with_capacity(batch_len);
+                let mut size_bytes_list = Vec::with_capacity(batch_len);
+                for metadata in &metadatas {
+                    data_ptrs.push(metadata.data_ptr);
+                    size_bytes_list.push(metadata.size_bytes);
                 }
-                return Err(status);
-            }
 
+                if let Err(err) = engine.register_context_layer_batch_strided(
+                    &req.instance_id,
+                    &req.namespace,
+                    req.device_id,
+                    tp_rank,
+                    pp_rank,
+                    tp_size,
+                    world_size,
+                    &req.layer_names,
+                    &data_ptrs,
+                    &size_bytes_list,
+                    &num_blocks_list,
+                    &bytes_per_block_list,
+                    &kv_stride_bytes_list,
+                    &segments_list,
+                    native.then_some(block_stride_bytes.as_slice()),
+                    transfer_mode,
+                    req.page_first,
+                ) {
+                    let status = Self::map_engine_error(err);
+                    drop(registration_guard);
+                    let cleanup = registry.drop_context(context_key.clone()).await;
+                    if cleanup.tensor_count() > 0 {
+                        warn!(
+                            "Rolled back {} CUDA tensor(s) for failed register_context_batch context {}",
+                            cleanup.tensor_count(),
+                            context_key
+                        );
+                    }
+                    registry.finish_cleanup(cleanup).await;
+                    drop(registration_permit);
+                    return Err(status);
+                }
+
+                drop(registration_permit);
+                Ok::<(), Status>(())
+            })
+            .await
+            .map_err(|err| Status::internal(format!("registration task failed: {err}")))??;
             Ok(Response::new(Self::build_register_context_response()))
         }
         .await;
@@ -411,6 +308,11 @@ impl Engine for GrpcEngineService {
             Self::validate_save_layers(&saves)?;
             let tp_rank = Self::usize_from_u32(tp_rank, "tp_rank")?;
             let pp_rank = Self::usize_from_u32(pp_rank, "pp_rank")?;
+            let registration = self
+                .registry
+                .acquire_registration(instance_id.clone(), device_id)
+                .await
+                .map_err(Status::failed_precondition)?;
 
             let saves: Vec<LayerSave> = saves
                 .into_iter()
@@ -426,10 +328,16 @@ impl Engine for GrpcEngineService {
                 instance_id, tp_rank, pp_rank, device_id, layer_count, total_blocks, total_hashes
             );
 
-            self.engine
-                .batch_save_kv_blocks_from_ipc(&instance_id, tp_rank, pp_rank, device_id, saves)
-                .await
-                .map_err(Self::map_engine_error)?;
+            let engine = Arc::clone(&self.engine);
+            tokio::spawn(async move {
+                let _registration = registration;
+                engine
+                    .batch_save_kv_blocks_from_ipc(&instance_id, tp_rank, pp_rank, device_id, saves)
+                    .await
+                    .map_err(Self::map_engine_error)
+            })
+            .await
+            .map_err(|err| Status::internal(format!("save operation task failed: {err}")))??;
 
             Ok(Response::new(SaveResponse {
                 status: Some(Self::build_simple_response()),
@@ -484,6 +392,16 @@ impl Engine for GrpcEngineService {
             } = req;
             Self::validate_device_id(device_id)?;
             let tp_rank = Self::usize_from_u32(tp_rank, "tp_rank")?;
+            let registration = self
+                .registry
+                .acquire_registration(instance_id.clone(), device_id)
+                .await
+                .map_err(Status::failed_precondition)?;
+            if registration.is_some() && !wait_for_completion {
+                return Err(Status::invalid_argument(
+                    "native VMM loads require wait_for_completion",
+                ));
+            }
             debug!(
                 "RPC [load]: instance_id={} tp_rank={} device_id={} layers={} loads={} blocks={} load_state_shm_len={}",
                 instance_id,
@@ -494,7 +412,6 @@ impl Engine for GrpcEngineService {
                 block_count,
                 load_state_shm.len()
             );
-            let layer_refs: Vec<&str> = layer_names.iter().map(|s| s.as_str()).collect();
             let loads: Vec<(QueryLeaseId, Vec<usize>)> = loads
                 .into_iter()
                 .map(|load| {
@@ -511,19 +428,27 @@ impl Engine for GrpcEngineService {
                         "synchronous load must not include load_state_shm",
                     ));
                 }
-                self.engine
-                    .batch_load_kv_blocks_multi_layer_inproc(
-                        &instance_id,
-                        tp_rank,
-                        device_id,
-                        &layer_refs,
-                        &loads,
-                    )
-                    .map_err(Self::map_engine_error)?
-                    .await
-                    .map_err(|_| Status::internal("load worker dropped completion"))?
-                    .map_err(Self::map_engine_error)?;
+                let engine = Arc::clone(&self.engine);
+                tokio::spawn(async move {
+                    let _registration = registration;
+                    let layer_refs: Vec<&str> = layer_names.iter().map(String::as_str).collect();
+                    engine
+                        .batch_load_kv_blocks_multi_layer_inproc(
+                            &instance_id,
+                            tp_rank,
+                            device_id,
+                            &layer_refs,
+                            &loads,
+                        )
+                        .map_err(Self::map_engine_error)?
+                        .await
+                        .map_err(|_| Status::internal("load worker dropped completion"))?
+                        .map_err(Self::map_engine_error)
+                })
+                .await
+                .map_err(|err| Status::internal(format!("load operation task failed: {err}")))??;
             } else {
+                let layer_refs: Vec<&str> = layer_names.iter().map(String::as_str).collect();
                 self.engine
                     .batch_load_kv_blocks_multi_layer(
                         &instance_id,
@@ -719,17 +644,24 @@ impl Engine for GrpcEngineService {
         let result: Result<Response<UnregisterResponse>, Status> = async {
             let req = request.into_inner();
             debug!("RPC [unregister_context]: instance_id={}", req.instance_id);
-            let removed = self.registry.drop_instance(req.instance_id.clone()).await;
-            if removed > 0 {
-                info!(
-                    "Dropped {} CUDA tensors for instance {}",
-                    removed, req.instance_id
-                );
-            }
-
-            self.engine
-                .unregister_instance(&req.instance_id)
-                .map_err(Self::map_engine_error)?;
+            let engine = Arc::clone(&self.engine);
+            let registry = self.registry.clone();
+            let instance_id = req.instance_id.clone();
+            tokio::spawn(async move {
+                let cleanup = registry.drop_instance(instance_id.clone()).await;
+                if cleanup.tensor_count() > 0 {
+                    info!(
+                        "Dropped {} CUDA tensors for instance {}",
+                        cleanup.tensor_count(),
+                        instance_id
+                    );
+                }
+                let unregister = engine.unregister_instance(&instance_id);
+                registry.finish_cleanup(cleanup).await;
+                unregister.map_err(Self::map_engine_error)
+            })
+            .await
+            .map_err(|err| Status::internal(format!("unregister task failed: {err}")))??;
 
             Ok(Response::new(UnregisterResponse {
                 status: Some(Self::build_simple_response()),

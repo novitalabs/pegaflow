@@ -359,6 +359,9 @@ class PegaServerProcess:
         self._binary_path = find_server_binary()
         self._log_path: Path | None = None
         self._log_file = None
+        self._fd_socket_path = Path(tempfile.gettempdir()) / (
+            f"pegaflow-fd-test-{port}-{uuid.uuid4().hex}.sock"
+        )
 
     def start(self) -> bool:
         """Start the server process. Returns True if successful."""
@@ -386,6 +389,8 @@ class PegaServerProcess:
             self.pool_size,
             "--devices",
             self.devices,
+            "--fd-socket-path",
+            str(self._fd_socket_path),
         ]
 
         # Route logs to a tempfile so the pipe buffer cannot fill up and
@@ -447,6 +452,9 @@ class PegaServerProcess:
         if self._log_path and self._log_path.exists():
             with contextlib.suppress(OSError):
                 self._log_path.unlink()
+        if self._fd_socket_path.exists():
+            with contextlib.suppress(OSError):
+                self._fd_socket_path.unlink()
 
 
 @pytest.fixture(scope="session")

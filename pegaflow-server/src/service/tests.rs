@@ -1,5 +1,5 @@
 use super::*;
-use crate::proto::engine::SaveLayer;
+use crate::proto::engine::{NativeKvTensor, SaveLayer};
 use tonic::Code;
 
 #[test]
@@ -82,6 +82,53 @@ fn validate_register_context_rejects_client_version_mismatch() {
     assert_eq!(err.code(), Code::FailedPrecondition);
     assert!(err.message().contains("PegaFlow version mismatch"));
     assert!(err.message().contains("client=0.0.0-test-mismatch"));
+}
+
+#[test]
+fn native_registration_requires_side_channel_safe_instance_id() {
+    let err = validation::register_context(&native_register_request("instance/with/slashes"))
+        .expect_err("native fd correlation must use a side-channel-safe instance id");
+
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert!(err.message().contains("instance_id"));
+}
+
+#[test]
+fn native_registration_rejects_multi_gpu_topology() {
+    let mut request = native_register_request("qwen3-dev0-018f8f75-b82e-7c10-a7d4-01abc2345678");
+    request.world_size = 2;
+    let err = validation::register_context(&request)
+        .expect_err("v1 native ownership supports one fused allocation on one GPU");
+
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert!(err.message().contains("world_size=1"));
+}
+
+fn native_register_request(instance_id: &str) -> RegisterContextRequest {
+    RegisterContextRequest {
+        instance_id: instance_id.to_string(),
+        namespace: "namespace".to_string(),
+        client_version: pegaflow_proto::VERSION.to_string(),
+        tp_rank: 0,
+        tp_size: 1,
+        world_size: 1,
+        device_id: 0,
+        layer_names: vec!["layer".to_string()],
+        wrapper_bytes: Vec::new(),
+        num_blocks: vec![1],
+        bytes_per_block: vec![16],
+        kv_stride_bytes: vec![0],
+        segments: vec![1],
+        pp_rank: 0,
+        transfer_mode: ProtoTransferMode::Direct as i32,
+        page_first: false,
+        native_kv_tensors: vec![NativeKvTensor {
+            offset_bytes: 0,
+            size_bytes: 16,
+            block_stride_bytes: 16,
+        }],
+        native_alloc_size: 16,
+    }
 }
 
 #[test]

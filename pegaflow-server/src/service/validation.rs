@@ -38,6 +38,16 @@ pub(super) fn register_context(req: &RegisterContextRequest) -> Result<(), Statu
             "exactly one tensor payload must match layer_names",
         ));
     }
+    if native && !crate::fd_channel::valid_instance_id(&req.instance_id) {
+        return Err(Status::invalid_argument(
+            "native registration requires a side-channel-safe instance_id",
+        ));
+    }
+    if native && (req.tp_size != 1 || req.world_size != 1) {
+        return Err(Status::invalid_argument(
+            "native VMM registration currently requires tp_size=1 and world_size=1",
+        ));
+    }
     for tensor in &req.native_kv_tensors {
         if tensor.size_bytes == 0
             || tensor.block_stride_bytes == 0
