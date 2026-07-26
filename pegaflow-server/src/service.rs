@@ -1,15 +1,17 @@
 use pegaflow_core::{trace_in_span, trace_root};
 
 use crate::metric::record_rpc_result;
+use crate::native_arena::NativeLayerView;
 use crate::proto::engine::engine_server::Engine;
 use crate::proto::engine::{
-    HealthRequest, HealthResponse, LoadRequest, LoadResponse, QueryBlocksForTransferRequest,
-    QueryBlocksForTransferResponse, QueryLoading, QueryReady, QueryRequest, QueryResponse,
-    RdmaHandshakeRequest, RdmaHandshakeResponse, RegisterContextRequest, RegisterContextResponse,
-    ReleaseRequest, ReleaseResponse, ReleaseTransferLockRequest, ReleaseTransferLockResponse,
-    ResponseStatus, SaveRequest, SaveResponse, SessionEvent, SessionRequest, ShutdownRequest,
-    ShutdownResponse, TransferBlockInfo, TransferMode as ProtoTransferMode, TransferSlotInfo,
-    UnregisterRequest, UnregisterResponse, query_response,
+    FlushRequest, FlushResponse, HealthRequest, HealthResponse, LoadRequest, LoadResponse,
+    QueryBlocksForTransferRequest, QueryBlocksForTransferResponse, QueryLoading, QueryReady,
+    QueryRequest, QueryResponse, RdmaHandshakeRequest, RdmaHandshakeResponse,
+    RegisterContextRequest, RegisterContextResponse, ReleaseRequest, ReleaseResponse,
+    ReleaseTransferLockRequest, ReleaseTransferLockResponse, ResponseStatus, SaveRequest,
+    SaveResponse, SessionEvent, SessionRequest, ShutdownRequest, ShutdownResponse,
+    TransferBlockInfo, TransferMode as ProtoTransferMode, TransferSlotInfo, UnregisterRequest,
+    UnregisterResponse, query_response,
 };
 use crate::registry::RegistryHandle;
 use crate::session::SessionRegistry;
@@ -54,19 +56,22 @@ impl GrpcEngineService {
         instance_id: &str,
         reason: &'static str,
     ) {
-        let removed = registry.drop_instance(instance_id.to_string()).await;
-        if removed > 0 {
-            info!(
-                "Session cleanup ({}): dropped {} CUDA tensors for instance {}",
-                reason, removed, instance_id
-            );
-        }
+        // Engine first: it must forget raw device pointers before the registry
+        // drop frees the memory behind them (server-owned native arenas are
+        // cuMemFree'd right there; Python IPC imports are unmapped by GC).
         if let Err(err) = engine.unregister_instance(instance_id) {
             // `InstanceMissing` is normal if the instance was never registered
             // (vllm died before any register_context_batch). Log at debug.
             debug!(
                 "Session cleanup ({}): engine.unregister_instance({}) returned {}",
                 reason, instance_id, err
+            );
+        }
+        let removed = registry.drop_instance(instance_id.to_string()).await;
+        if removed > 0 {
+            info!(
+                "Session cleanup ({}): dropped {} CUDA tensors for instance {}",
+                reason, removed, instance_id
             );
         }
     }
@@ -117,7 +122,7 @@ impl GrpcEngineService {
     }
 
     fn validate_register_context_request(req: &RegisterContextRequest) -> Result<(), Status> {
-        let server_version = env!("CARGO_PKG_VERSION");
+        let server_version = pegaflow_proto::VERSION;
         if req.client_version != server_version {
             return Err(Status::failed_precondition(format!(
                 "PegaFlow version mismatch: client={} server={server_version}",
@@ -141,6 +146,60 @@ impl GrpcEngineService {
                 req.tp_rank, req.tp_size
             )));
         }
+        let batch_len = req.layer_names.len();
+        if req.native_kv_tensors.is_empty() {
+            if req.native_alloc_size != 0 {
+                return Err(Status::invalid_argument(
+                    "native_alloc_size requires native_kv_tensors",
+                ));
+            }
+            if req.wrapper_bytes.len() != batch_len {
+                return Err(Status::invalid_argument(format!(
+                    "wrapper_bytes length {} does not match layer_names {batch_len}",
+                    req.wrapper_bytes.len()
+                )));
+            }
+        } else {
+            if !req.wrapper_bytes.is_empty() {
+                return Err(Status::invalid_argument(
+                    "a registration is either native or Python, not both",
+                ));
+            }
+            if req.native_kv_tensors.len() != batch_len {
+                return Err(Status::invalid_argument(format!(
+                    "native_kv_tensors length {} does not match layer_names {batch_len}",
+                    req.native_kv_tensors.len()
+                )));
+            }
+            if req.native_alloc_size == 0 {
+                return Err(Status::invalid_argument(
+                    "native registration requires a non-zero native_alloc_size",
+                ));
+            }
+            // Native v1 scope: one process, one GPU, one arena.
+            if req.tp_size != 1 || req.world_size != 1 {
+                return Err(Status::invalid_argument(
+                    "native registration supports tp_size=1 world_size=1 only",
+                ));
+            }
+            for tensor in &req.native_kv_tensors {
+                if tensor.size_bytes == 0 || tensor.block_stride_bytes == 0 {
+                    return Err(Status::invalid_argument(
+                        "native layer views need non-zero size_bytes and block_stride_bytes",
+                    ));
+                }
+                let inside = tensor
+                    .offset_bytes
+                    .checked_add(tensor.size_bytes)
+                    .is_some_and(|end| end <= req.native_alloc_size);
+                if !inside {
+                    return Err(Status::invalid_argument(format!(
+                        "native layer view [{} +{}] is outside the {}-byte arena",
+                        tensor.offset_bytes, tensor.size_bytes, req.native_alloc_size
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -163,12 +222,6 @@ impl GrpcEngineService {
             return Err(Status::invalid_argument("req_id must not be empty"));
         }
         Ok(())
-    }
-
-    fn build_register_context_response() -> RegisterContextResponse {
-        RegisterContextResponse {
-            status: Some(Self::ok_status()),
-        }
     }
 
     fn build_simple_response() -> ResponseStatus {
@@ -235,10 +288,11 @@ impl Engine for GrpcEngineService {
                 ProtoTransferMode::Kernel => pegaflow_core::TransferMode::Kernel,
             };
 
-            // Validate array lengths are consistent with each other.
+            // Validate array lengths are consistent with each other. The
+            // payload arrays (wrapper_bytes / native_kv_tensors) are already
+            // checked in validate_register_context_request.
             let batch_len = req.layer_names.len();
             if batch_len == 0
-                || req.wrapper_bytes.len() != batch_len
                 || req.num_blocks.len() != batch_len
                 || req.bytes_per_block.len() != batch_len
                 || req.kv_stride_bytes.len() != batch_len
@@ -275,24 +329,62 @@ impl Engine for GrpcEngineService {
             let tp_size = Self::usize_from_u32(req.tp_size, "tp_size")?;
             let world_size = Self::usize_from_u32(req.world_size, "world_size")?;
 
-            // Materialize tensors and collect data_ptr/size_bytes
             let context_key =
                 Self::context_key(&req.instance_id, req.tp_rank, req.pp_rank, req.device_id);
-            // Materialize on the dedicated registry thread (GIL + CUDA IPC) and
-            // await the result, so this RPC never blocks an async worker. Move
-            // the (large) wrapper bytes over; clone the layer names since the
-            // engine call below still needs them.
-            let layers: Vec<(String, Vec<u8>)> = req
-                .layer_names
-                .iter()
-                .cloned()
-                .zip(req.wrapper_bytes)
-                .collect();
-            let metadatas = self
-                .registry
-                .register_layers(context_key.clone(), req.device_id, layers)
-                .await
-                .map_err(|message| Status::internal(format!("register tensor failed: {message}")))?;
+            let native = !req.native_kv_tensors.is_empty();
+            // Registry work (torch materialization or arena allocation) runs on
+            // the dedicated registry thread, so this RPC never blocks an async
+            // worker.
+            let (metadatas, arena_ipc_handle, block_stride_bytes) = if native {
+                let alloc_size = Self::usize_from_u64(req.native_alloc_size, "native_alloc_size")?;
+                let mut block_stride_bytes = Vec::with_capacity(batch_len);
+                let layers: Vec<NativeLayerView> = req
+                    .layer_names
+                    .iter()
+                    .cloned()
+                    .zip(&req.native_kv_tensors)
+                    .map(|(layer_name, tensor)| {
+                        block_stride_bytes.push(Self::usize_from_u64(
+                            tensor.block_stride_bytes,
+                            "block_stride_bytes",
+                        )?);
+                        Ok(NativeLayerView {
+                            layer_name,
+                            offset_bytes: tensor.offset_bytes,
+                            size_bytes: tensor.size_bytes,
+                        })
+                    })
+                    .collect::<Result<_, Status>>()?;
+                let registration = self
+                    .registry
+                    .register_native(context_key.clone(), req.device_id, layers, alloc_size)
+                    .await
+                    .map_err(|message| {
+                        Status::internal(format!("register native arena failed: {message}"))
+                    })?;
+                (
+                    registration.metadatas,
+                    registration.arena_ipc_handle,
+                    Some(block_stride_bytes),
+                )
+            } else {
+                // Move the (large) wrapper bytes over; clone the layer names
+                // since the engine call below still needs them.
+                let layers: Vec<(String, Vec<u8>)> = req
+                    .layer_names
+                    .iter()
+                    .cloned()
+                    .zip(req.wrapper_bytes)
+                    .collect();
+                let metadatas = self
+                    .registry
+                    .register_layers(context_key.clone(), req.device_id, layers)
+                    .await
+                    .map_err(|message| {
+                        Status::internal(format!("register tensor failed: {message}"))
+                    })?;
+                (metadatas, Vec::new(), None)
+            };
             let mut data_ptrs = Vec::with_capacity(batch_len);
             let mut size_bytes_list = Vec::with_capacity(batch_len);
             for metadata in &metadatas {
@@ -301,7 +393,7 @@ impl Engine for GrpcEngineService {
             }
 
             // Call engine batch registration
-            if let Err(err) = self.engine.register_context_layer_batch(
+            if let Err(err) = self.engine.register_context_layer_batch_strided(
                 &req.instance_id,
                 &req.namespace,
                 req.device_id,
@@ -316,6 +408,7 @@ impl Engine for GrpcEngineService {
                 &bytes_per_block_list,
                 &kv_stride_bytes_list,
                 &segments_list,
+                block_stride_bytes.as_deref(),
                 transfer_mode,
                 req.page_first,
             ) {
@@ -330,7 +423,10 @@ impl Engine for GrpcEngineService {
                 return Err(status);
             }
 
-            Ok(Response::new(Self::build_register_context_response()))
+            Ok(Response::new(RegisterContextResponse {
+                status: Some(Self::ok_status()),
+                arena_ipc_handle,
+            }))
         }
         .await;
 
@@ -450,6 +546,7 @@ impl Engine for GrpcEngineService {
                 layer_names,
                 loads,
                 load_state_shm,
+                wait_for_completion,
                 ..
             } = req;
             Self::validate_device_id(device_id)?;
@@ -475,16 +572,38 @@ impl Engine for GrpcEngineService {
                 })
                 .collect::<Result<_, _>>()?;
 
-            self.engine
-                .batch_load_kv_blocks_multi_layer(
-                    &instance_id,
-                    tp_rank,
-                    device_id,
-                    &load_state_shm,
-                    &layer_refs,
-                    &loads,
-                )
-                .map_err(Self::map_engine_error)?;
+            if wait_for_completion {
+                // Native clients have no load_state_shm completion flag to
+                // poll; run the in-process load and reply once DMA finished.
+                if !load_state_shm.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "synchronous load must not include load_state_shm",
+                    ));
+                }
+                self.engine
+                    .batch_load_kv_blocks_multi_layer_inproc(
+                        &instance_id,
+                        tp_rank,
+                        device_id,
+                        &layer_refs,
+                        &loads,
+                    )
+                    .map_err(Self::map_engine_error)?
+                    .await
+                    .map_err(|_| Status::internal("load worker dropped completion"))?
+                    .map_err(Self::map_engine_error)?;
+            } else {
+                self.engine
+                    .batch_load_kv_blocks_multi_layer(
+                        &instance_id,
+                        tp_rank,
+                        device_id,
+                        &load_state_shm,
+                        &layer_refs,
+                        &loads,
+                    )
+                    .map_err(Self::map_engine_error)?;
+            }
 
             Ok(Response::new(LoadResponse {
                 status: Some(Self::build_simple_response()),
@@ -508,6 +627,16 @@ impl Engine for GrpcEngineService {
         }
         record_rpc_result("load", &result, start);
         result
+    }
+
+    async fn flush(
+        &self,
+        _request: Request<FlushRequest>,
+    ) -> Result<Response<FlushResponse>, Status> {
+        self.engine.flush_saves_and_registrations().await;
+        Ok(Response::new(FlushResponse {
+            status: Some(Self::build_simple_response()),
+        }))
     }
 
     async fn query_prefetch(
@@ -659,6 +788,12 @@ impl Engine for GrpcEngineService {
         let result: Result<Response<UnregisterResponse>, Status> = async {
             let req = request.into_inner();
             debug!("RPC [unregister_context]: instance_id={}", req.instance_id);
+            // Engine first: it must forget raw device pointers before the
+            // registry drop frees the memory behind them (native arenas are
+            // cuMemFree'd there). The registry drop still runs if the engine
+            // never saw the instance.
+            let engine_result = self.engine.unregister_instance(&req.instance_id);
+
             let removed = self.registry.drop_instance(req.instance_id.clone()).await;
             if removed > 0 {
                 info!(
@@ -666,10 +801,7 @@ impl Engine for GrpcEngineService {
                     removed, req.instance_id
                 );
             }
-
-            self.engine
-                .unregister_instance(&req.instance_id)
-                .map_err(Self::map_engine_error)?;
+            engine_result.map_err(Self::map_engine_error)?;
 
             Ok(Response::new(UnregisterResponse {
                 status: Some(Self::build_simple_response()),
@@ -994,7 +1126,7 @@ mod tests {
         let err = GrpcEngineService::validate_register_context_request(&RegisterContextRequest {
             instance_id: "instance".to_string(),
             namespace: "namespace".to_string(),
-            client_version: env!("CARGO_PKG_VERSION").to_string(),
+            client_version: pegaflow_proto::VERSION.to_string(),
             tp_rank: 1,
             tp_size: 1,
             world_size: 1,
@@ -1008,6 +1140,8 @@ mod tests {
             pp_rank: 0,
             transfer_mode: ProtoTransferMode::Direct as i32,
             page_first: false,
+            native_kv_tensors: Vec::new(),
+            native_alloc_size: 0,
         })
         .expect_err("tp_rank outside tp_size must be rejected at RPC boundary");
 
@@ -1034,6 +1168,8 @@ mod tests {
             pp_rank: 0,
             transfer_mode: ProtoTransferMode::Direct as i32,
             page_first: false,
+            native_kv_tensors: Vec::new(),
+            native_alloc_size: 0,
         })
         .expect_err("client/server version mismatch must be rejected before registration");
 

@@ -20,12 +20,12 @@ use tonic::{Request, Response, Status, async_trait};
 
 use pegaflow_proto::proto::engine::engine_server::{Engine, EngineServer};
 use pegaflow_proto::proto::engine::{
-    HealthRequest, HealthResponse, LoadRequest, LoadResponse, QueryBlocksForTransferRequest,
-    QueryBlocksForTransferResponse, QueryRequest, QueryResponse, RdmaHandshakeRequest,
-    RdmaHandshakeResponse, RegisterContextRequest, RegisterContextResponse, ReleaseRequest,
-    ReleaseResponse, ReleaseTransferLockRequest, ReleaseTransferLockResponse, ResponseStatus,
-    SaveRequest, SaveResponse, SessionEvent, SessionRequest, ShutdownRequest, ShutdownResponse,
-    TransferBlockInfo, TransferSlotInfo, UnregisterRequest, UnregisterResponse,
+    FlushRequest, FlushResponse, HealthRequest, HealthResponse, LoadRequest, LoadResponse,
+    QueryBlocksForTransferRequest, QueryBlocksForTransferResponse, QueryRequest, QueryResponse,
+    RdmaHandshakeRequest, RdmaHandshakeResponse, RegisterContextRequest, RegisterContextResponse,
+    ReleaseRequest, ReleaseResponse, ReleaseTransferLockRequest, ReleaseTransferLockResponse,
+    ResponseStatus, SaveRequest, SaveResponse, SessionEvent, SessionRequest, ShutdownRequest,
+    ShutdownResponse, TransferBlockInfo, TransferSlotInfo, UnregisterRequest, UnregisterResponse,
 };
 
 use crate::{LayerBlock, PegaEngine};
@@ -244,6 +244,13 @@ impl Engine for P2pTransferService {
 
     async fn load(&self, _request: Request<LoadRequest>) -> Result<Response<LoadResponse>, Status> {
         Self::not_served("load")
+    }
+
+    async fn flush(
+        &self,
+        _request: Request<FlushRequest>,
+    ) -> Result<Response<FlushResponse>, Status> {
+        Self::not_served("flush")
     }
 
     async fn query_prefetch(

@@ -1,6 +1,7 @@
 mod check_cuda_version;
 pub mod http_server;
 pub mod metric;
+mod native_arena;
 pub mod proto;
 pub mod registry;
 pub mod service;
@@ -60,6 +61,11 @@ pub struct Cli {
     /// If not specified, auto-detects and initializes all available GPUs.
     #[arg(long, value_delimiter = ',')]
     pub devices: Vec<i32>,
+
+    /// Initialize the torch CUDA registry for Python (vLLM connector) clients.
+    /// `false` runs torch-free and serves native clients only.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub python_registry: bool,
 
     /// Pinned memory pool size (supports units: kb, mb, gb, tb)
     /// Examples: "10gb", "500mb", "1tb"
@@ -322,6 +328,30 @@ fn detect_cuda_devices() -> Result<Vec<i32>, std::io::Error> {
     })
 }
 
+/// Torch-free device enumeration for native-only deployments.
+fn detect_native_cuda_devices() -> Result<Vec<i32>, std::io::Error> {
+    let count = cudarc::driver::CudaContext::device_count()
+        .map_err(|e| std::io::Error::other(format!("cudarc device_count: {e}")))?;
+    Ok((0..count).collect())
+}
+
+/// Torch-free CUDA context initialization for native-only deployments.
+fn init_cudarc_cuda(device_ids: &[i32]) -> Result<(), std::io::Error> {
+    if device_ids.is_empty() {
+        return Err(std::io::Error::other("no CUDA devices to initialize"));
+    }
+    for &device_id in device_ids {
+        let ordinal = usize::try_from(device_id)
+            .map_err(|_| std::io::Error::other(format!("device_id {device_id} must be >= 0")))?;
+        let ctx = cudarc::driver::CudaContext::new(ordinal)
+            .map_err(|e| std::io::Error::other(format!("cudarc init device {device_id}: {e}")))?;
+        ctx.bind_to_thread()
+            .map_err(|e| std::io::Error::other(format!("cudarc bind device {device_id}: {e}")))?;
+        info!("Initialized CUDA context for device {device_id} (cudarc, torch-free)");
+    }
+    Ok(())
+}
+
 fn init_python_cuda(device_ids: &[i32]) -> Result<(), std::io::Error> {
     if device_ids.is_empty() {
         return Err(std::io::Error::other("no CUDA devices to initialize"));
@@ -447,7 +477,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     // Determine which devices to initialize
     let devices = if cli.devices.is_empty() {
         // Auto-detect all available devices
-        let detected = detect_cuda_devices()?;
+        let detected = if cli.python_registry {
+            detect_cuda_devices()?
+        } else {
+            detect_native_cuda_devices()?
+        };
         info!(
             "Auto-detected {} CUDA device(s): {:?}",
             detected.len(),
@@ -463,17 +497,26 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         return Err("No CUDA devices available".into());
     }
 
-    init_python_cuda(&devices)?;
+    if cli.python_registry {
+        init_python_cuda(&devices)?;
+    } else {
+        init_cudarc_cuda(&devices)?;
+    }
     info!(
         "CUDA runtime initialized for {} device(s): {:?}",
         devices.len(),
         devices
     );
 
-    let registry = CudaTensorRegistry::new().map_err(|err| {
-        let msg = format_py_err(err);
-        std::io::Error::other(format!("failed to initialize torch CUDA context: {msg}"))
-    })?;
+    let registry = if cli.python_registry {
+        CudaTensorRegistry::new().map_err(|err| {
+            let msg = format_py_err(err);
+            std::io::Error::other(format!("failed to initialize torch CUDA context: {msg}"))
+        })?
+    } else {
+        info!("Python/torch registry disabled; serving native clients only");
+        CudaTensorRegistry::empty()
+    };
     // Confine the registry to its own thread: GIL + CUDA work now happens off
     // the async runtime, so a wedged `empty_cache` can't starve tokio workers.
     let registry = RegistryHandle::spawn(registry);

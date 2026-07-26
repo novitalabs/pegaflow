@@ -1,3 +1,4 @@
+use crate::native_arena::{NativeArenaMap, NativeLayerView, NativeRegistration};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -44,6 +45,9 @@ impl ContextState {
 
 pub struct CudaTensorRegistry {
     contexts: HashMap<String, ContextState>,
+    /// Server-allocated arenas for native clients; disjoint keyspace from
+    /// `contexts` (enforced at registration).
+    native: NativeArenaMap,
 }
 
 impl CudaTensorRegistry {
@@ -54,6 +58,7 @@ impl CudaTensorRegistry {
             cuda.call_method0("init")?;
             Ok(Self {
                 contexts: HashMap::new(),
+                native: NativeArenaMap::default(),
             })
         })
     }
@@ -61,6 +66,7 @@ impl CudaTensorRegistry {
     pub fn empty() -> Self {
         Self {
             contexts: HashMap::new(),
+            native: NativeArenaMap::default(),
         }
     }
 
@@ -70,7 +76,7 @@ impl CudaTensorRegistry {
         device_id: i32,
         layers: Vec<(String, Vec<u8>)>,
     ) -> PyResult<Vec<TensorMetadata>> {
-        if self.contexts.contains_key(context_key) {
+        if self.contexts.contains_key(context_key) || self.native.contains(context_key) {
             return Err(PyValueError::new_err(format!(
                 "context {context_key} is already registered"
             )));
@@ -106,8 +112,25 @@ impl CudaTensorRegistry {
         Ok(metadatas)
     }
 
+    /// Allocate a server-owned arena and register its layer views. Native
+    /// contexts share the registry keyspace with Python contexts but none of
+    /// the Python (GIL/torch) machinery.
+    fn register_native(
+        &mut self,
+        context_key: &str,
+        device_id: i32,
+        layers: &[NativeLayerView],
+        alloc_size: usize,
+    ) -> Result<NativeRegistration, String> {
+        if self.contexts.contains_key(context_key) {
+            return Err(format!("context {context_key} is already registered"));
+        }
+        self.native
+            .register(context_key, device_id, layers, alloc_size)
+    }
+
     fn drop_context(&mut self, context_key: &str) -> usize {
-        self.release_contexts(vec![context_key.to_string()])
+        self.native.drop_context(context_key) + self.release_contexts(vec![context_key.to_string()])
     }
 
     fn drop_instance(&mut self, instance_id: &str) -> usize {
@@ -118,13 +141,13 @@ impl CudaTensorRegistry {
             .filter(|key| key.starts_with(&prefix))
             .cloned()
             .collect();
-        self.release_contexts(keys)
+        self.native.drop_instance(instance_id) + self.release_contexts(keys)
     }
 
     /// Clear all contexts and return the total number of tensors removed.
     fn clear_and_count(&mut self) -> usize {
         let keys: Vec<String> = self.contexts.keys().cloned().collect();
-        self.release_contexts(keys)
+        self.native.clear() + self.release_contexts(keys)
     }
 
     /// Remove `keys` from the registry, returning the number of CUDA IPC tensors
@@ -215,6 +238,13 @@ enum RegistryCommand {
         // so callers never need to touch the GIL to read an error message.
         reply: oneshot::Sender<Result<Vec<TensorMetadata>, String>>,
     },
+    RegisterNative {
+        context_key: String,
+        device_id: i32,
+        layers: Vec<NativeLayerView>,
+        alloc_size: usize,
+        reply: oneshot::Sender<Result<NativeRegistration, String>>,
+    },
     DropInstance {
         instance_id: String,
         reply: oneshot::Sender<usize>,
@@ -280,6 +310,28 @@ impl RegistryHandle {
         rx.await.expect("cuda-registry thread dropped reply")
     }
 
+    /// Allocate a server-owned arena on the registry thread and register its
+    /// layer views under `context_key`. Returns per-layer metadata plus the
+    /// CUDA IPC handle the client imports.
+    pub(crate) async fn register_native(
+        &self,
+        context_key: String,
+        device_id: i32,
+        layers: Vec<NativeLayerView>,
+        alloc_size: usize,
+    ) -> Result<NativeRegistration, String> {
+        let (reply, rx) = oneshot::channel();
+        self.dispatch(RegistryCommand::RegisterNative {
+            context_key,
+            device_id,
+            layers,
+            alloc_size,
+            reply,
+        })
+        .await;
+        rx.await.expect("cuda-registry thread dropped reply")
+    }
+
     /// Drop all CUDA tensors belonging to `instance_id`; returns the count
     /// released.
     pub async fn drop_instance(&self, instance_id: String) -> usize {
@@ -328,6 +380,16 @@ fn registry_actor(mut registry: CudaTensorRegistry, mut rx: mpsc::Receiver<Regis
                     // Stringify here, on the GIL-owning thread, so the gRPC
                     // handler never needs `Python::attach` just to read the message.
                     .map_err(|err| Python::attach(|py| err.value(py).to_string()));
+                let _ = reply.send(result);
+            }
+            RegistryCommand::RegisterNative {
+                context_key,
+                device_id,
+                layers,
+                alloc_size,
+                reply,
+            } => {
+                let result = registry.register_native(&context_key, device_id, &layers, alloc_size);
                 let _ = reply.send(result);
             }
             RegistryCommand::DropInstance { instance_id, reply } => {
