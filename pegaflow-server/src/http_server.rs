@@ -82,8 +82,13 @@ async fn cleanup_handler(
 ) -> impl IntoResponse {
     match query.id {
         None => {
-            let removed_tensors = state.registry.clear().await;
+            // Engine first, then a save-pipeline barrier, then the registry
+            // drop: the registry drop frees native arenas (cuMemFree), so the
+            // engine must forget its raw pointers and drain accepted saves
+            // before the memory behind them goes away.
             let removed_instances = state.engine.unregister_all_instances();
+            state.engine.flush_saves().await;
+            let removed_tensors = state.registry.clear().await;
 
             if !removed_instances.is_empty() || removed_tensors > 0 {
                 warn!(
@@ -104,8 +109,11 @@ async fn cleanup_handler(
             )
         }
         Some(instance_id) => {
+            // Same ordering as the clear-all branch above.
+            let engine_result = state.engine.unregister_instance(&instance_id);
+            state.engine.flush_saves().await;
             let removed_tensors = state.registry.drop_instance(instance_id.clone()).await;
-            match state.engine.unregister_instance(&instance_id) {
+            match engine_result {
                 Ok(()) => {
                     warn!(
                         "Cleanup instance {}: {} CUDA tensor(s) released",

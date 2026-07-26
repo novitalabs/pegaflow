@@ -58,7 +58,10 @@ impl GrpcEngineService {
     ) {
         // Engine first: it must forget raw device pointers before the registry
         // drop frees the memory behind them (server-owned native arenas are
-        // cuMemFree'd right there; Python IPC imports are unmapped by GC).
+        // cuMemFree'd right there; Python IPC imports are unmapped by GC). The
+        // flush barrier then drains saves already handed to the write pipeline.
+        // Saves still queued inside a GPU worker are NOT fenced — closing that
+        // residual window needs the engine-level drain-before-unregister work.
         if let Err(err) = engine.unregister_instance(instance_id) {
             // `InstanceMissing` is normal if the instance was never registered
             // (vllm died before any register_context_batch). Log at debug.
@@ -67,6 +70,7 @@ impl GrpcEngineService {
                 reason, instance_id, err
             );
         }
+        engine.flush_saves().await;
         let removed = registry.drop_instance(instance_id.to_string()).await;
         if removed > 0 {
             info!(
@@ -119,6 +123,27 @@ impl GrpcEngineService {
             )));
         }
         Ok(())
+    }
+
+    /// Per-layer arena views plus the engine's block-stride list, from the
+    /// wire representation. Lengths are already validated.
+    fn native_layer_views(
+        req: &RegisterContextRequest,
+    ) -> Result<(Vec<NativeLayerView>, Vec<usize>), Status> {
+        let mut layers = Vec::with_capacity(req.native_kv_tensors.len());
+        let mut block_stride_bytes = Vec::with_capacity(req.native_kv_tensors.len());
+        for (layer_name, tensor) in req.layer_names.iter().zip(&req.native_kv_tensors) {
+            block_stride_bytes.push(Self::usize_from_u64(
+                tensor.block_stride_bytes,
+                "block_stride_bytes",
+            )?);
+            layers.push(NativeLayerView {
+                layer_name: layer_name.clone(),
+                offset_bytes: tensor.offset_bytes,
+                size_bytes: tensor.size_bytes,
+            });
+        }
+        Ok((layers, block_stride_bytes))
     }
 
     fn validate_register_context_request(req: &RegisterContextRequest) -> Result<(), Status> {
@@ -303,6 +328,15 @@ impl Engine for GrpcEngineService {
                 )));
             }
 
+            let native = !req.native_kv_tensors.is_empty();
+            // Extract native views before the conversions below consume `req`
+            // fields by value.
+            let native_views = if native {
+                Some(Self::native_layer_views(&req)?)
+            } else {
+                None
+            };
+
             let num_blocks_list: Vec<usize> = req
                 .num_blocks
                 .into_iter()
@@ -331,30 +365,13 @@ impl Engine for GrpcEngineService {
 
             let context_key =
                 Self::context_key(&req.instance_id, req.tp_rank, req.pp_rank, req.device_id);
-            let native = !req.native_kv_tensors.is_empty();
             // Registry work (torch materialization or arena allocation) runs on
             // the dedicated registry thread, so this RPC never blocks an async
             // worker.
             let (metadatas, arena_ipc_handle, block_stride_bytes) = if native {
                 let alloc_size = Self::usize_from_u64(req.native_alloc_size, "native_alloc_size")?;
-                let mut block_stride_bytes = Vec::with_capacity(batch_len);
-                let layers: Vec<NativeLayerView> = req
-                    .layer_names
-                    .iter()
-                    .cloned()
-                    .zip(&req.native_kv_tensors)
-                    .map(|(layer_name, tensor)| {
-                        block_stride_bytes.push(Self::usize_from_u64(
-                            tensor.block_stride_bytes,
-                            "block_stride_bytes",
-                        )?);
-                        Ok(NativeLayerView {
-                            layer_name,
-                            offset_bytes: tensor.offset_bytes,
-                            size_bytes: tensor.size_bytes,
-                        })
-                    })
-                    .collect::<Result<_, Status>>()?;
+                let (layers, block_stride_bytes) =
+                    native_views.expect("native_views populated when native");
                 let registration = self
                     .registry
                     .register_native(context_key.clone(), req.device_id, layers, alloc_size)
@@ -421,6 +438,18 @@ impl Engine for GrpcEngineService {
                     );
                 }
                 return Err(status);
+            }
+
+            // A session/HTTP cleanup that raced this RPC between the registry
+            // step and the engine step has already freed the arena; the engine
+            // registration published above would point at freed memory. Confirm
+            // the context survived, or roll the engine back and fail.
+            if native && !self.registry.contains_context(context_key.clone()).await {
+                let _ = self.engine.unregister_instance(&req.instance_id);
+                return Err(Status::aborted(format!(
+                    "instance {} was cleaned up while registering",
+                    req.instance_id
+                )));
             }
 
             Ok(Response::new(RegisterContextResponse {
@@ -790,9 +819,12 @@ impl Engine for GrpcEngineService {
             debug!("RPC [unregister_context]: instance_id={}", req.instance_id);
             // Engine first: it must forget raw device pointers before the
             // registry drop frees the memory behind them (native arenas are
-            // cuMemFree'd there). The registry drop still runs if the engine
-            // never saw the instance.
+            // cuMemFree'd there); the flush barrier drains saves already in
+            // the write pipeline (see cleanup_instance for the residual
+            // GPU-worker-queue window). The registry drop still runs if the
+            // engine never saw the instance.
             let engine_result = self.engine.unregister_instance(&req.instance_id);
+            self.engine.flush_saves().await;
 
             let removed = self.registry.drop_instance(req.instance_id.clone()).await;
             if removed > 0 {

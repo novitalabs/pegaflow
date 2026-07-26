@@ -245,6 +245,10 @@ enum RegistryCommand {
         alloc_size: usize,
         reply: oneshot::Sender<Result<NativeRegistration, String>>,
     },
+    ContainsContext {
+        context_key: String,
+        reply: oneshot::Sender<bool>,
+    },
     DropInstance {
         instance_id: String,
         reply: oneshot::Sender<usize>,
@@ -332,6 +336,14 @@ impl RegistryHandle {
         rx.await.expect("cuda-registry thread dropped reply")
     }
 
+    /// Whether `context_key` is currently registered (Python or native).
+    pub(crate) async fn contains_context(&self, context_key: String) -> bool {
+        let (reply, rx) = oneshot::channel();
+        self.dispatch(RegistryCommand::ContainsContext { context_key, reply })
+            .await;
+        rx.await.expect("cuda-registry thread dropped reply")
+    }
+
     /// Drop all CUDA tensors belonging to `instance_id`; returns the count
     /// released.
     pub async fn drop_instance(&self, instance_id: String) -> usize {
@@ -391,6 +403,11 @@ fn registry_actor(mut registry: CudaTensorRegistry, mut rx: mpsc::Receiver<Regis
             } => {
                 let result = registry.register_native(&context_key, device_id, &layers, alloc_size);
                 let _ = reply.send(result);
+            }
+            RegistryCommand::ContainsContext { context_key, reply } => {
+                let present = registry.contexts.contains_key(&context_key)
+                    || registry.native.contains(&context_key);
+                let _ = reply.send(present);
             }
             RegistryCommand::DropInstance { instance_id, reply } => {
                 let _ = reply.send(registry.drop_instance(&instance_id));

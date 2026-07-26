@@ -60,9 +60,14 @@ impl NativeArena {
         unsafe { sys::cuMemAlloc_v2(&mut base_ptr, size_bytes).result() }
             .map_err(|e| cuda_error("allocate KV arena", e))?;
 
-        // Zero the arena so a KV hit never reads stale device memory.
+        // Zero the arena so a KV hit never reads stale device memory. The
+        // memset is async with respect to the host and CUDA IPC gives the
+        // importing process no cross-process stream ordering, so synchronize
+        // before the handle leaves this function.
         // SAFETY: base_ptr..base_ptr+size_bytes was just allocated.
-        if let Err(e) = unsafe { sys::cuMemsetD8_v2(base_ptr, 0, size_bytes).result() } {
+        let zeroed = unsafe { sys::cuMemsetD8_v2(base_ptr, 0, size_bytes).result() }
+            .and_then(|_| unsafe { sys::cuCtxSynchronize().result() });
+        if let Err(e) = zeroed {
             unsafe { sys::cuMemFree_v2(base_ptr).result().ok() };
             return Err(cuda_error("zero KV arena", e));
         }
