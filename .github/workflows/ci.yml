@@ -142,6 +142,11 @@ jobs:
           persist-credentials: false
       - name: Run ruff check
         uses: astral-sh/ruff-action@v3
+        with:
+          # Unpinned, this floats to the newest ruff and every new lint rule
+          # breaks CI on untouched files (0.16.0 did exactly that). Bump
+          # deliberately, together with the fixes it demands.
+          version: "0.15.4"
 
   python-unit-tests:
     name: python unit tests
