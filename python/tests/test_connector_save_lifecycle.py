@@ -107,3 +107,41 @@ def test_later_save_reopens_completed_request():
     assert second_completion.is_set()
     finished_sending, _ = worker.get_finished({"request"})
     assert finished_sending == {"request"}
+
+
+def test_preemption_waits_for_every_save_task():
+    worker = make_worker()
+    completion = enqueue_save(worker)
+    enqueue_save(worker)
+    wait_started = threading.Event()
+    preemption_returned = threading.Event()
+    original_wait = completion.wait
+
+    def wait_for_completion(timeout: float | None = None) -> bool:
+        wait_started.set()
+        return original_wait(timeout)
+
+    def handle_preemption() -> None:
+        worker.handle_preemptions({"request"})
+        preemption_returned.set()
+
+    completed_tasks = 0
+    with patch.object(completion, "wait", side_effect=wait_for_completion):
+        preemption_thread = threading.Thread(target=handle_preemption)
+        preemption_thread.start()
+        try:
+            assert wait_started.wait(timeout=1)
+
+            complete_next_save(worker)
+            completed_tasks += 1
+            assert not preemption_returned.wait(timeout=0.1)
+
+            complete_next_save(worker)
+            completed_tasks += 1
+            assert preemption_returned.wait(timeout=1)
+        finally:
+            for _ in range(2 - completed_tasks):
+                complete_next_save(worker)
+            preemption_thread.join(timeout=1)
+
+    assert not preemption_thread.is_alive()
