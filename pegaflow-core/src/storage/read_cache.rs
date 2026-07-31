@@ -1,11 +1,14 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use hashlink::LruCache;
 use parking_lot::Mutex;
 
 use crate::block::{BlockKey, SealedBlock};
 use crate::cache::{CacheInsertOutcome, TinyLfuCache};
-use crate::metrics::{CACHE_CLASS_RECLAIMABLE, CACHE_CLASS_RETAINED, core_metrics};
+use crate::metrics::{
+    CACHE_CLASS_RECLAIMABLE, CACHE_CLASS_RETAINED, CACHE_RESIDENCE_REASON_CLEANUP,
+    CACHE_RESIDENCE_REASON_PRESSURE, core_metrics,
+};
 
 pub(crate) struct ReadCache {
     inner: Mutex<ReadCacheInner>,
@@ -13,8 +16,19 @@ pub(crate) struct ReadCache {
 
 struct ReadCacheInner {
     cache: TinyLfuCache<BlockKey, Arc<SealedBlock>>,
-    reclaimable: LruCache<BlockKey, ()>,
-    retained: LruCache<BlockKey, ()>,
+    reclaimable: LruCache<BlockKey, ResidentMetadata>,
+    retained: LruCache<BlockKey, ResidentMetadata>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct ResidentMetadata {
+    inserted_at: Instant,
+}
+
+struct RemovedResident {
+    key: BlockKey,
+    block: Arc<SealedBlock>,
+    inserted_at: Option<Instant>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -126,39 +140,61 @@ impl ReadCache {
     }
 
     pub(super) fn remove_lru_batch(&self, batch_size: usize) -> Vec<(BlockKey, Arc<SealedBlock>)> {
-        let mut inner = self.inner.lock();
-        let mut evicted = Vec::with_capacity(batch_size);
-        while evicted.len() < batch_size {
-            let next = remove_lru(&mut inner, ResidentClass::Reclaimable)
-                .or_else(|| remove_lru(&mut inner, ResidentClass::Retained));
-            let Some(block) = next else {
-                break;
-            };
-            evicted.push(block);
-        }
-        evicted
+        let removed = {
+            let mut inner = self.inner.lock();
+            let mut removed = Vec::with_capacity(batch_size);
+            while removed.len() < batch_size {
+                let next = remove_lru(&mut inner, ResidentClass::Reclaimable)
+                    .or_else(|| remove_lru(&mut inner, ResidentClass::Retained));
+                let Some(block) = next else {
+                    break;
+                };
+                removed.push(block);
+            }
+            removed
+        };
+        record_residence_durations(removed, &*CACHE_RESIDENCE_REASON_PRESSURE)
     }
 
     pub(super) fn remove_all(&self) -> Vec<(BlockKey, Arc<SealedBlock>)> {
-        let mut inner = self.inner.lock();
-        let reclaimable_blocks = inner.reclaimable.len() as i64;
-        let retained_blocks = inner.retained.len() as i64;
-        inner.reclaimable.clear();
-        inner.retained.clear();
-        let removed = inner.cache.remove_all();
-        debug_assert_eq!(
-            removed.len() as i64,
-            reclaimable_blocks + retained_blocks,
-            "resident cache and replacement classes diverged"
-        );
-        let metrics = core_metrics();
-        metrics
-            .cache_resident_blocks
-            .add(-reclaimable_blocks, &*CACHE_CLASS_RECLAIMABLE);
-        metrics
-            .cache_resident_blocks
-            .add(-retained_blocks, &*CACHE_CLASS_RETAINED);
-        removed
+        let removed = {
+            let mut inner = self.inner.lock();
+            let reclaimable_blocks = inner.reclaimable.len() as i64;
+            let retained_blocks = inner.retained.len() as i64;
+            let mut metadata = HashMap::with_capacity(
+                inner.reclaimable.len().saturating_add(inner.retained.len()),
+            );
+            metadata.extend(inner.reclaimable.drain());
+            metadata.extend(inner.retained.drain());
+            let removed = inner
+                .cache
+                .remove_all()
+                .into_iter()
+                .map(|(key, block)| RemovedResident {
+                    inserted_at: metadata.remove(&key).map(|entry| entry.inserted_at),
+                    key,
+                    block,
+                })
+                .collect::<Vec<_>>();
+            debug_assert_eq!(
+                removed.len() as i64,
+                reclaimable_blocks + retained_blocks,
+                "resident cache and replacement classes diverged"
+            );
+            debug_assert!(
+                metadata.is_empty() && removed.iter().all(|entry| entry.inserted_at.is_some()),
+                "resident cache and replacement metadata diverged"
+            );
+            let metrics = core_metrics();
+            metrics
+                .cache_resident_blocks
+                .add(-reclaimable_blocks, &*CACHE_CLASS_RECLAIMABLE);
+            metrics
+                .cache_resident_blocks
+                .add(-retained_blocks, &*CACHE_CLASS_RETAINED);
+            removed
+        };
+        record_residence_durations(removed, &*CACHE_RESIDENCE_REASON_CLEANUP)
     }
 
     pub(crate) fn mark_reclaimable_hashes(&self, namespace: &str, hashes: &[Vec<u8>]) {
@@ -216,7 +252,12 @@ fn insert_block(
     let outcome = inner.cache.insert(key.clone(), block);
     match outcome {
         CacheInsertOutcome::InsertedNew => {
-            class_lru(inner, class).insert(key, ());
+            class_lru(inner, class).insert(
+                key,
+                ResidentMetadata {
+                    inserted_at: Instant::now(),
+                },
+            );
             let m = core_metrics();
             m.cache_block_insertions.add(1, &[]);
             m.cache_resident_bytes.add(footprint_bytes as i64, &[]);
@@ -230,7 +271,10 @@ fn insert_block(
     outcome
 }
 
-fn class_lru(inner: &mut ReadCacheInner, class: ResidentClass) -> &mut LruCache<BlockKey, ()> {
+fn class_lru(
+    inner: &mut ReadCacheInner,
+    class: ResidentClass,
+) -> &mut LruCache<BlockKey, ResidentMetadata> {
     match class {
         ResidentClass::Reclaimable => &mut inner.reclaimable,
         ResidentClass::Retained => &mut inner.retained,
@@ -249,8 +293,8 @@ fn mark_reclaimable(inner: &mut ReadCacheInner, key: &BlockKey) -> bool {
     if !inner.cache.contains_key(key) {
         return false;
     }
-    if inner.retained.remove(key).is_some() {
-        inner.reclaimable.insert(key.clone(), ());
+    if let Some(metadata) = inner.retained.remove(key) {
+        inner.reclaimable.insert(key.clone(), metadata);
         true
     } else {
         debug_assert!(
@@ -261,11 +305,8 @@ fn mark_reclaimable(inner: &mut ReadCacheInner, key: &BlockKey) -> bool {
     }
 }
 
-fn remove_lru(
-    inner: &mut ReadCacheInner,
-    class: ResidentClass,
-) -> Option<(BlockKey, Arc<SealedBlock>)> {
-    while let Some((key, ())) = class_lru(inner, class).remove_lru() {
+fn remove_lru(inner: &mut ReadCacheInner, class: ResidentClass) -> Option<RemovedResident> {
+    while let Some((key, metadata)) = class_lru(inner, class).remove_lru() {
         let block = inner.cache.remove(&key);
         debug_assert!(
             block.is_some(),
@@ -279,13 +320,45 @@ fn remove_lru(
         metrics
             .cache_block_evictions_by_class
             .add(1, class.attributes());
-        return Some((key, block));
+        return Some(RemovedResident {
+            key,
+            block,
+            inserted_at: Some(metadata.inserted_at),
+        });
     }
     None
 }
 
+fn record_residence_durations(
+    removed: Vec<RemovedResident>,
+    attributes: &[opentelemetry::KeyValue],
+) -> Vec<(BlockKey, Arc<SealedBlock>)> {
+    let removed_at = Instant::now();
+    let metrics = core_metrics();
+    removed
+        .into_iter()
+        .map(|entry| {
+            if let Some(inserted_at) = entry.inserted_at {
+                metrics.cache_residence_duration_seconds.record(
+                    residence_duration_seconds(inserted_at, removed_at),
+                    attributes,
+                );
+            }
+            (entry.key, entry.block)
+        })
+        .collect()
+}
+
+fn residence_duration_seconds(inserted_at: Instant, removed_at: Instant) -> f64 {
+    removed_at
+        .saturating_duration_since(inserted_at)
+        .as_secs_f64()
+}
+
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     fn make_cache() -> ReadCache {
@@ -307,6 +380,30 @@ mod tests {
             inner.retained.contains_key(key),
             expected == ResidentClass::Retained
         );
+    }
+
+    fn resident_metadata(cache: &ReadCache, key: &BlockKey) -> Option<ResidentMetadata> {
+        let inner = cache.inner.lock();
+        inner
+            .reclaimable
+            .peek(key)
+            .or_else(|| inner.retained.peek(key))
+            .copied()
+    }
+
+    fn backdate_resident(cache: &ReadCache, key: &BlockKey, age: Duration) -> Instant {
+        let inserted_at = Instant::now() - age;
+        let mut inner = cache.inner.lock();
+        let metadata = if let Some(metadata) = inner.reclaimable.peek_mut(key) {
+            metadata
+        } else {
+            inner
+                .retained
+                .peek_mut(key)
+                .expect("test resident must have replacement metadata")
+        };
+        metadata.inserted_at = inserted_at;
+        inserted_at
     }
 
     #[test]
@@ -352,9 +449,14 @@ mod tests {
             (hit.clone(), make_block()),
             (oldest.clone(), make_block()),
         ]);
+        let inserted_at = backdate_resident(&cache, &hit, Duration::from_secs(60));
         let (count, _) = cache.get_prefix_blocks(std::slice::from_ref(&hit));
 
         assert_eq!(count, 1);
+        assert_eq!(
+            resident_metadata(&cache, &hit).unwrap().inserted_at,
+            inserted_at
+        );
         assert_eq!(cache.remove_lru_batch(1)[0].0, oldest);
         assert_class(&cache, &hit, ResidentClass::Reclaimable);
     }
@@ -369,8 +471,13 @@ mod tests {
             (hit.clone(), make_block()),
             (oldest.clone(), make_block()),
         ]);
+        let inserted_at = backdate_resident(&cache, &hit, Duration::from_secs(60));
         assert_eq!(cache.get_blocks(std::slice::from_ref(&hit)).len(), 1);
 
+        assert_eq!(
+            resident_metadata(&cache, &hit).unwrap().inserted_at,
+            inserted_at
+        );
         assert_eq!(cache.remove_lru_batch(1)[0].0, oldest);
         assert_class(&cache, &hit, ResidentClass::Retained);
     }
@@ -396,6 +503,62 @@ mod tests {
         assert_eq!(cache.remove_lru_batch(1)[0].0, remote_first);
         assert_eq!(cache.remove_lru_batch(1)[0].0, local_other);
         assert_class(&cache, &local_first, ResidentClass::Retained);
+    }
+
+    #[test]
+    fn already_existing_insert_preserves_residence_start() {
+        let cache = make_cache();
+        let key = BlockKey::new("ns".into(), vec![1]);
+        cache.batch_insert(vec![(key.clone(), make_block())]);
+        let inserted_at = backdate_resident(&cache, &key, Duration::from_secs(60));
+
+        cache.batch_insert_resident_keys(vec![(key.clone(), make_block())]);
+
+        assert_eq!(
+            resident_metadata(&cache, &key).unwrap().inserted_at,
+            inserted_at
+        );
+        assert_class(&cache, &key, ResidentClass::Retained);
+    }
+
+    #[test]
+    fn class_migration_preserves_residence_start() {
+        let cache = make_cache();
+        let key = BlockKey::new("ns".into(), vec![1]);
+        cache.batch_insert(vec![(key.clone(), make_block())]);
+        let inserted_at = backdate_resident(&cache, &key, Duration::from_secs(60));
+
+        cache.mark_reclaimable_hashes("ns", std::slice::from_ref(&key.hash));
+
+        assert_eq!(
+            resident_metadata(&cache, &key).unwrap().inserted_at,
+            inserted_at
+        );
+        assert_class(&cache, &key, ResidentClass::Reclaimable);
+    }
+
+    #[test]
+    fn reinsert_after_eviction_starts_new_residence_episode() {
+        let cache = make_cache();
+        let key = BlockKey::new("ns".into(), vec![1]);
+        cache.batch_insert(vec![(key.clone(), make_block())]);
+        let first_inserted_at = backdate_resident(&cache, &key, Duration::from_secs(60));
+
+        cache.remove_lru_batch(1);
+        cache.batch_insert(vec![(key.clone(), make_block())]);
+
+        let second_inserted_at = resident_metadata(&cache, &key).unwrap().inserted_at;
+        assert!(second_inserted_at > first_inserted_at);
+    }
+
+    #[test]
+    fn residence_duration_is_non_negative_and_finite() {
+        let removed_at = Instant::now();
+        let inserted_at = removed_at - Duration::from_secs(60);
+
+        assert_eq!(residence_duration_seconds(inserted_at, removed_at), 60.0);
+        assert_eq!(residence_duration_seconds(removed_at, inserted_at), 0.0);
+        assert!(residence_duration_seconds(inserted_at, removed_at).is_finite());
     }
 
     #[test]
