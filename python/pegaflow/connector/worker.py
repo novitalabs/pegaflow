@@ -177,7 +177,7 @@ class WorkerConnector:
         )
         self._save_thread.start()
 
-        self._req_pending_saves: set[str] = set()
+        self._req_pending_save_tasks: dict[str, int] = {}
         self._completed_saves: set[str] = set()
         self._save_completion_lock = threading.Lock()
         self._save_completion_events: dict[str, threading.Event] = {}
@@ -374,7 +374,9 @@ class WorkerConnector:
 
         with self._save_completion_lock:
             # 1. Add newly finished requests (if they have pending saves) to tracking
-            self._finished_requests.update(finished_req_ids & self._req_pending_saves)
+            self._finished_requests.update(
+                finished_req_ids.intersection(self._req_pending_save_tasks)
+            )
             # 2. Identify requests whose saves have completed
             done_saves = self._completed_saves & self._finished_requests
             done_saves.update(self._completed_saves & finished_req_ids)
@@ -653,9 +655,11 @@ class WorkerConnector:
 
         with self._save_completion_lock:
             for req_id in request_ids:
-                if req_id not in self._req_pending_saves:
-                    self._req_pending_saves.add(req_id)
+                pending_tasks = self._req_pending_save_tasks.get(req_id, 0)
+                if pending_tasks == 0:
+                    self._completed_saves.discard(req_id)
                     self._save_completion_events[req_id] = threading.Event()
+                self._req_pending_save_tasks[req_id] = pending_tasks + 1
 
         self._save_queue.put(SaveTask(metadata=metadata, request_ids=request_ids))
 
@@ -784,13 +788,19 @@ class WorkerConnector:
 
         with self._save_completion_lock:
             for req_id in request_ids:
-                if req_id in self._req_pending_saves:
-                    self._req_pending_saves.discard(req_id)
-                    self._completed_saves.add(req_id)
-                    completed_reqs.append(req_id)
-                    event = self._save_completion_events.pop(req_id, None)
-                    if event:
-                        event.set()
+                pending_tasks = self._req_pending_save_tasks.get(req_id)
+                if pending_tasks is None:
+                    continue
+                if pending_tasks > 1:
+                    self._req_pending_save_tasks[req_id] = pending_tasks - 1
+                    continue
+
+                del self._req_pending_save_tasks[req_id]
+                self._completed_saves.add(req_id)
+                completed_reqs.append(req_id)
+                event = self._save_completion_events.pop(req_id, None)
+                if event:
+                    event.set()
 
         self._handle_save_completion(completed_reqs)
 
@@ -893,7 +903,7 @@ class WorkerConnector:
         with self._stats_lock:
             # Add current queue depth as gauge
             with self._save_completion_lock:
-                self._stats.data["pending_save_requests"] = len(self._req_pending_saves)
+                self._stats.data["pending_save_requests"] = len(self._req_pending_save_tasks)
 
             if self._stats.is_empty():
                 return None

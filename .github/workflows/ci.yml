@@ -142,6 +142,8 @@ jobs:
           persist-credentials: false
       - name: Run ruff check
         uses: astral-sh/ruff-action@v3
+        with:
+          version: "0.14.14"
 
   python-unit-tests:
     name: python unit tests
