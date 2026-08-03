@@ -26,6 +26,10 @@ pub(crate) static CACHE_CLASS_RECLAIMABLE: LazyLock<[KeyValue; 1]> =
     LazyLock::new(|| [KeyValue::new("class", "reclaimable")]);
 pub(crate) static CACHE_CLASS_RETAINED: LazyLock<[KeyValue; 1]> =
     LazyLock::new(|| [KeyValue::new("class", "retained")]);
+pub(crate) static CACHE_RESIDENCE_REASON_PRESSURE: LazyLock<[KeyValue; 1]> =
+    LazyLock::new(|| [KeyValue::new("reason", "pressure")]);
+pub(crate) static CACHE_RESIDENCE_REASON_CLEANUP: LazyLock<[KeyValue; 1]> =
+    LazyLock::new(|| [KeyValue::new("reason", "cleanup")]);
 
 pub(crate) struct CoreMetrics {
     // Pinned pool (allocator-level)
@@ -55,6 +59,7 @@ pub(crate) struct CoreMetrics {
     pub cache_block_evictions_by_class: Counter<u64>,
     pub cache_block_evictions_still_referenced: Counter<u64>,
     pub cache_eviction_reclaimed_bytes: Counter<u64>,
+    pub cache_residence_duration: Histogram<f64>,
 
     // GPU <-> CPU transfer
     pub save_bytes: Counter<u64>,
@@ -154,6 +159,13 @@ fn duration_seconds_boundaries() -> Vec<f64> {
         15.0,  // 15s
         30.0,  // 30s
         60.0,  // 60s
+    ]
+}
+
+fn cache_residence_duration_seconds_boundaries() -> Vec<f64> {
+    vec![
+        1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1_800.0, 3_600.0, 7_200.0, 21_600.0,
+        43_200.0, 86_400.0,
     ]
 }
 
@@ -299,6 +311,14 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
                 .u64_counter("pegaflow_cache_eviction_reclaimed_bytes")
                 .with_unit("bytes")
                 .with_description("Estimated bytes actually reclaimed in pinned allocator after cache eviction")
+                .build(),
+            cache_residence_duration: meter
+                .f64_histogram("pegaflow_cache_residence_duration")
+                .with_unit("s")
+                .with_description(
+                    "RAM cache block residence duration from first insertion to removal",
+                )
+                .with_boundaries(cache_residence_duration_seconds_boundaries())
                 .build(),
 
             // Transfer
@@ -462,4 +482,32 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
                 .build(),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_residence_duration_boundaries_cover_one_second_to_one_day() {
+        assert_eq!(
+            cache_residence_duration_seconds_boundaries(),
+            vec![
+                1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1_800.0, 3_600.0, 7_200.0,
+                21_600.0, 43_200.0, 86_400.0,
+            ]
+        );
+    }
+
+    #[test]
+    fn cache_residence_reason_attributes_are_fixed_and_low_cardinality() {
+        assert_eq!(
+            &*CACHE_RESIDENCE_REASON_PRESSURE,
+            &[KeyValue::new("reason", "pressure")]
+        );
+        assert_eq!(
+            &*CACHE_RESIDENCE_REASON_CLEANUP,
+            &[KeyValue::new("reason", "cleanup")]
+        );
+    }
 }
