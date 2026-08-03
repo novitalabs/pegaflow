@@ -331,9 +331,7 @@ def test_register_non_version_failure_reports_batch_layers(monkeypatch):
 
 def test_register_kv_caches_ignores_shared_by_without_layer_split_opt_in(monkeypatch):
     kv_cache_config = MagicMock()
-    kv_cache_config.kv_cache_groups = [
-        MagicMock(layer_names=("layer.0", "layer.1", "layer.2"))
-    ]
+    kv_cache_config.kv_cache_groups = [MagicMock(layer_names=("layer.0", "layer.1", "layer.2"))]
     kv_cache_config.kv_cache_tensors = [
         MagicMock(shared_by=("layer.1",)),
     ]
@@ -360,9 +358,7 @@ def test_register_kv_caches_ignores_shared_by_without_layer_split_opt_in(monkeyp
 
 def test_register_kv_caches_uses_layer_split_shared_by_plan(monkeypatch):
     kv_cache_config = MagicMock()
-    kv_cache_config.kv_cache_groups = [
-        MagicMock(layer_names=("layer.0", "layer.1", "layer.2"))
-    ]
+    kv_cache_config.kv_cache_groups = [MagicMock(layer_names=("layer.0", "layer.1", "layer.2"))]
     kv_cache_config.kv_cache_tensors = [
         MagicMock(shared_by=("layer.1",)),
         MagicMock(shared_by=()),
@@ -440,3 +436,52 @@ def test_register_version_mismatch_rpc_error_stops_startup(monkeypatch):
     assert len(client.register_calls) == 1
 
     worker.shutdown()
+
+
+class _PickleableStubWrapper:
+    """Module-level so pickle.dumps in register_kv_caches accepts it."""
+
+    def __init__(self, tensor):
+        pass
+
+
+def test_unregister_for_sleep_raises_when_server_unregister_fails():
+    """Sleeping with live server-side VMM mappings frees no VRAM, so a
+    failed unregister must surface as an exception (a non-OK
+    /collective_rpc response), not a logged-and-ignored warning."""
+    worker, client, _ = _make_worker()
+    worker._registered_layers = ["layer_a"]
+    client.unregister_context = lambda instance_id: (False, "server busy")
+
+    with pytest.raises(RuntimeError, match="unregister failed"):
+        worker.unregister_for_sleep()
+
+
+def test_registration_failure_closes_exported_fds(monkeypatch):
+    """Exported VMM FDs pin physical memory: a failed register RPC must
+    close them, or every retry leaks descriptors that also block sleep
+    from freeing VRAM."""
+    closed = []
+
+    class FakeServer:
+        def close_all(self):
+            closed.append(True)
+
+    from pegaflow import vmm_ipc
+
+    monkeypatch.setattr(vmm_ipc._FdServer, "has_instance", classmethod(lambda cls: True))
+    monkeypatch.setattr(vmm_ipc._FdServer, "instance", classmethod(lambda cls: FakeServer()))
+
+    import torch
+
+    from pegaflow.connector import worker as worker_mod
+
+    monkeypatch.setattr(worker_mod, "CudaIPCWrapper", _PickleableStubWrapper)
+
+    worker, client, _ = _make_worker()
+    client.register_response = (False, "boom")
+    kv = {"layer_a": torch.zeros(2, 4, 16, dtype=torch.uint8)}
+
+    with pytest.raises(RuntimeError, match="boom"):
+        worker.register_kv_caches(kv)
+    assert closed

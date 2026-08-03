@@ -217,16 +217,74 @@ class WorkerConnector:
         self._save_queue.put(None)
         self._save_thread.join()
 
-    def unregister_context(self) -> None:
+    def unregister_context(self) -> bool:
+        # Exported VMM FDs belong to the registration lifetime: they pin
+        # the cumem physical memory, so EVERY teardown path must close
+        # them, not just the explicit sleep path.
+        self._close_exported_fds()
         if not self._registered_layers:
-            return
+            return True
 
+        ok = True
         if self._ctx.tp_rank == 0:
             ok, message = self._ctx.engine_client.unregister_context(self._ctx.instance_id)
             if not ok:
                 logger.warning("[PegaKVConnector] Unregister context failed: %s", message)
 
         self._registered_layers.clear()
+        return ok
+
+    @staticmethod
+    def _close_exported_fds() -> None:
+        from pegaflow.vmm_ipc import _FdServer
+
+        if _FdServer.has_instance():
+            _FdServer.instance().close_all()
+
+    def _drain_saves(self, timeout: float = 60.0) -> bool:
+        """Block until every queued save batch has been processed (the save
+        RPC inside _process_save_batch is synchronous, so afterwards the
+        server is not reading this worker's GPU memory for saves)."""
+        deadline = time.perf_counter() + timeout
+        while self._save_queue.unfinished_tasks:
+            if time.perf_counter() >= deadline:
+                return False
+            time.sleep(0.05)
+        return True
+
+    # --- sleep/wake lifecycle (invoked via vLLM's /collective_rpc) -------
+    # An imported VMM handle refcounts the exporter's physical memory, so
+    # BEFORE vLLM sleeps the server must drop its mappings (unregister) and
+    # this worker must close its exported FDs — otherwise sleep frees
+    # nothing. Wake maps fresh physical chunks into the SAME virtual
+    # addresses, so re-registration re-exports the same tensor objects.
+
+    def unregister_for_sleep(self) -> None:
+        """Raises on failure so the /collective_rpc caller sees a non-OK
+        response and refuses to sleep — sleeping with live server mappings
+        would free no VRAM while reporting success."""
+        if not self._drain_saves():
+            raise RuntimeError(
+                "pegaflow: async saves did not drain; refusing to unregister "
+                "for sleep while the server may still read GPU memory"
+            )
+        if not self.unregister_context():
+            raise RuntimeError(
+                "pegaflow: server unregister failed; sleeping now would keep "
+                "the server's imported VMM mappings pinning KV VRAM"
+            )
+        logger.info(
+            "[PegaKVConnector] unregistered for sleep "
+            "(saves drained, server mappings dropped, exported FDs closed)"
+        )
+
+    def reregister_after_wake(self) -> None:
+        kv_caches = getattr(self, "_last_registered_kv_caches", None)
+        if not kv_caches:
+            logger.warning("[PegaKVConnector] reregister_after_wake: no cached kv_caches; skipping")
+            return
+        self.register_kv_caches(kv_caches)
+        logger.info("[PegaKVConnector] re-registered %d KV caches after wake", len(kv_caches))
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register exactly the KV caches vLLM built on this device.
@@ -238,6 +296,10 @@ class WorkerConnector:
         assert self._ctx.device_id is not None, (
             "CUDA device id is unknown; cannot register KV caches"
         )
+        # Cached for reregister_after_wake: the cumem allocator keeps
+        # virtual addresses stable across sleep/wake, so the SAME tensor
+        # objects re-register with fresh physical handles.
+        self._last_registered_kv_caches = dict(kv_caches)
 
         if self._use_mla_layer_split_registration:
             kv_cache_tensors = getattr(self._kv_cache_config, "kv_cache_tensors", None)
@@ -288,7 +350,16 @@ class WorkerConnector:
                 f"KV cache for {layer_name} must have zero storage offset"
             )
 
-            wrapper = CudaIPCWrapper(kv_cache)
+            # Sleep-mode (cumem/VMM) tensors have no legacy IPC handles —
+            # share them via exported POSIX-FD handles instead. On any
+            # registration failure the caller's except path below closes
+            # the published exports (they pin physical memory).
+            from pegaflow.vmm_ipc import VmmCudaIPCWrapper, is_cumem_tensor
+
+            if is_cumem_tensor(kv_cache):
+                wrapper = VmmCudaIPCWrapper(kv_cache)
+            else:
+                wrapper = CudaIPCWrapper(kv_cache)
             wrapper_bytes = pickle.dumps(wrapper)
 
             registration = _infer_kv_cache_registration(
@@ -318,28 +389,35 @@ class WorkerConnector:
                     registration.num_blocks,
                 )
 
-        ok, message = self._ctx.engine_client.register_context_batch(
-            self._ctx.instance_id,
-            self._ctx.namespace,
-            self._ctx.effective_tp_rank,
-            self._ctx.pp_rank,
-            self._ctx.effective_tp_size,
-            self._ctx.world_size,
-            self._ctx.device_id,
-            layer_names,
-            ipc_wrappers,
-            layer_num_blocks,
-            layer_bytes_per_block,
-            layer_kv_stride_bytes,
-            layer_segments,
-            self._ctx.transfer_backend,
-            self._page_first,
-        )
-
-        if not ok:
-            if "PegaFlow version mismatch" in message:
-                raise RuntimeError(f"Register context failed: {message}")
-            raise RuntimeError(f"Register context batch failed for layers {layer_names}: {message}")
+        try:
+            ok, message = self._ctx.engine_client.register_context_batch(
+                self._ctx.instance_id,
+                self._ctx.namespace,
+                self._ctx.effective_tp_rank,
+                self._ctx.pp_rank,
+                self._ctx.effective_tp_size,
+                self._ctx.world_size,
+                self._ctx.device_id,
+                layer_names,
+                ipc_wrappers,
+                layer_num_blocks,
+                layer_bytes_per_block,
+                layer_kv_stride_bytes,
+                layer_segments,
+                self._ctx.transfer_backend,
+                self._page_first,
+            )
+            if not ok:
+                if "PegaFlow version mismatch" in message:
+                    raise RuntimeError(f"Register context failed: {message}")
+                raise RuntimeError(
+                    f"Register context batch failed for layers {layer_names}: {message}"
+                )
+        except Exception:
+            # Exported VMM FDs pin the cumem physical memory; a failed (or
+            # retried) registration must not leak them.
+            self._close_exported_fds()
+            raise
 
         if split_layer_count:
             logger.info(
