@@ -510,7 +510,7 @@ async fn run_holder(cli: &Cli, shape: &Shape, pool_bytes: usize) {
             14,
         ),
     ));
-    let service = GrpcEngineService::new(Arc::clone(&engine), registry, shutdown, hll);
+    let service = GrpcEngineService::new(Arc::clone(&engine), registry, shutdown, hll, None);
     let listen: SocketAddr = ([0, 0, 0, 0], cli.port).into();
     tokio::spawn(async move {
         Server::builder()

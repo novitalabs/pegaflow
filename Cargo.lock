@@ -2002,6 +2002,7 @@ dependencies = [
  "cudarc",
  "dashmap",
  "fastrace",
+ "libc",
  "log",
  "opentelemetry",
  "opentelemetry-otlp",

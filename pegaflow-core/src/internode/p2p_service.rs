@@ -6,8 +6,8 @@
 //! `pegaflow-server` binary provides them alongside the CUDA-IPC registration
 //! surface — which an in-process Rust embedder (one that registers raw device
 //! pointers and drives saves/loads through `PegaEngine` directly) has no use
-//! for. This service is that minimal serving surface: the three transfer RPCs
-//! plus `Health`, everything else answered with `unimplemented`.
+//! for. This service is that minimal serving surface: those three transfer RPCs,
+//! everything else answered with `unimplemented`.
 //!
 //! The embedder remains responsible for periodic GC of expired transfer locks
 //! (`PegaEngine::gc_expired_transfer_locks`), mirroring pegaflow-server's
@@ -20,12 +20,12 @@ use tonic::{Request, Response, Status, async_trait};
 
 use pegaflow_proto::proto::engine::engine_server::{Engine, EngineServer};
 use pegaflow_proto::proto::engine::{
-    HealthRequest, HealthResponse, LoadRequest, LoadResponse, QueryBlocksForTransferRequest,
-    QueryBlocksForTransferResponse, QueryRequest, QueryResponse, RdmaHandshakeRequest,
-    RdmaHandshakeResponse, RegisterContextRequest, RegisterContextResponse, ReleaseRequest,
-    ReleaseResponse, ReleaseTransferLockRequest, ReleaseTransferLockResponse, ResponseStatus,
-    SaveRequest, SaveResponse, SessionEvent, SessionRequest, ShutdownRequest, ShutdownResponse,
-    TransferBlockInfo, TransferSlotInfo, UnregisterRequest, UnregisterResponse,
+    FlushRequest, FlushResponse, HealthRequest, HealthResponse, LoadRequest, LoadResponse,
+    QueryBlocksForTransferRequest, QueryBlocksForTransferResponse, QueryRequest, QueryResponse,
+    RdmaHandshakeRequest, RdmaHandshakeResponse, RegisterContextRequest, RegisterContextResponse,
+    ReleaseRequest, ReleaseResponse, ReleaseTransferLockRequest, ReleaseTransferLockResponse,
+    ResponseStatus, SaveRequest, SaveResponse, SessionEvent, SessionRequest, ShutdownRequest,
+    ShutdownResponse, TransferBlockInfo, TransferSlotInfo, UnregisterRequest, UnregisterResponse,
 };
 
 use crate::{LayerBlock, PegaEngine};
@@ -220,16 +220,14 @@ impl Engine for P2pTransferService {
         }))
     }
 
+    // ── In-process embedders drive these through `PegaEngine` directly ──
+
     async fn health(
         &self,
         _request: Request<HealthRequest>,
     ) -> Result<Response<HealthResponse>, Status> {
-        Ok(Response::new(HealthResponse {
-            status: Some(Self::ok_status()),
-        }))
+        Self::not_served("health")
     }
-
-    // ── In-process embedders drive these through `PegaEngine` directly ──
 
     async fn register_context_batch(
         &self,
@@ -258,6 +256,13 @@ impl Engine for P2pTransferService {
         _request: Request<ReleaseRequest>,
     ) -> Result<Response<ReleaseResponse>, Status> {
         Self::not_served("release")
+    }
+
+    async fn flush(
+        &self,
+        _request: Request<FlushRequest>,
+    ) -> Result<Response<FlushResponse>, Status> {
+        Self::not_served("flush")
     }
 
     async fn unregister_context(
