@@ -28,7 +28,8 @@ struct ResidentMetadata {
 struct RemovedResident {
     key: BlockKey,
     block: Arc<SealedBlock>,
-    inserted_at: Option<Instant>,
+    /// Insertion time taken from the block's replacement-class metadata.
+    inserted_at: Instant,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -170,10 +171,17 @@ impl ReadCache {
                 .cache
                 .remove_all()
                 .into_iter()
-                .map(|(key, block)| RemovedResident {
-                    inserted_at: metadata.remove(&key).map(|entry| entry.inserted_at),
-                    key,
-                    block,
+                .map(|(key, block)| {
+                    let inserted_at = metadata.remove(&key).map(|entry| entry.inserted_at);
+                    debug_assert!(
+                        inserted_at.is_some(),
+                        "resident block is missing its replacement metadata"
+                    );
+                    RemovedResident {
+                        inserted_at: inserted_at.unwrap_or_else(Instant::now),
+                        key,
+                        block,
+                    }
                 })
                 .collect::<Vec<_>>();
             debug_assert_eq!(
@@ -182,8 +190,8 @@ impl ReadCache {
                 "resident cache and replacement classes diverged"
             );
             debug_assert!(
-                metadata.is_empty() && removed.iter().all(|entry| entry.inserted_at.is_some()),
-                "resident cache and replacement metadata diverged"
+                metadata.is_empty(),
+                "replacement metadata outlives its resident block"
             );
             let metrics = core_metrics();
             metrics
@@ -323,7 +331,7 @@ fn remove_lru(inner: &mut ReadCacheInner, class: ResidentClass) -> Option<Remove
         return Some(RemovedResident {
             key,
             block,
-            inserted_at: Some(metadata.inserted_at),
+            inserted_at: metadata.inserted_at,
         });
     }
     None
@@ -338,12 +346,10 @@ fn record_residence_durations(
     removed
         .into_iter()
         .map(|entry| {
-            if let Some(inserted_at) = entry.inserted_at {
-                metrics.cache_residence_duration_seconds.record(
-                    residence_duration_seconds(inserted_at, removed_at),
-                    attributes,
-                );
-            }
+            metrics.cache_residence_duration.record(
+                residence_duration_seconds(entry.inserted_at, removed_at),
+                attributes,
+            );
             (entry.key, entry.block)
         })
         .collect()

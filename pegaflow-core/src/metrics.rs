@@ -59,7 +59,7 @@ pub(crate) struct CoreMetrics {
     pub cache_block_evictions_by_class: Counter<u64>,
     pub cache_block_evictions_still_referenced: Counter<u64>,
     pub cache_eviction_reclaimed_bytes: Counter<u64>,
-    pub cache_residence_duration_seconds: Histogram<f64>,
+    pub cache_residence_duration: Histogram<f64>,
 
     // GPU <-> CPU transfer
     pub save_bytes: Counter<u64>,
@@ -312,7 +312,7 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
                 .with_unit("bytes")
                 .with_description("Estimated bytes actually reclaimed in pinned allocator after cache eviction")
                 .build(),
-            cache_residence_duration_seconds: meter
+            cache_residence_duration: meter
                 .f64_histogram("pegaflow_cache_residence_duration")
                 .with_unit("s")
                 .with_description(
