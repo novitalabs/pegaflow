@@ -3,6 +3,7 @@
 Extracted from test_vllm_e2e_correctness.py to enable reuse across test modules.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -16,6 +17,30 @@ from pathlib import Path
 import requests
 
 DEFAULT_VLLM_SEED = 42
+
+
+def _uses_linear_attention(model: str) -> bool:
+    config_path = Path(model) / "config.json"
+    if not config_path.is_file():
+        return False
+    try:
+        config = json.loads(config_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    text_config = config.get("text_config", config)
+    return "linear_attention" in (text_config.get("layer_types") or ())
+
+
+def adapt_prompt_for_hybrid_cache(model: str, prompt: str) -> str:
+    if not _uses_linear_attention(model):
+        return prompt
+    family = hashlib.sha256(prompt[:80].encode()).hexdigest()[:8]
+    prefix = f"Hybrid cache boundary {family} contains deterministic background context. " * 80
+    return prefix + prompt
+
+
+def e2e_max_tokens(model: str) -> int:
+    return 8 if _uses_linear_attention(model) else 50
 
 
 def _detect_pegaflow_cargo_features() -> list[str]:
@@ -89,7 +114,10 @@ class VLLMServer:
 
         env = os.environ.copy()
         env["PYTHONHASHSEED"] = "0"
-        env["VLLM_BATCH_INVARIANT"] = "1"
+        if _uses_linear_attention(self.model):
+            env.pop("VLLM_BATCH_INVARIANT", None)
+        else:
+            env["VLLM_BATCH_INVARIANT"] = "1"
 
         if self.pegaflow_port is not None:
             env["PEGAFLOW_PORT"] = str(self.pegaflow_port)
@@ -108,7 +136,11 @@ class VLLMServer:
             "--port",
             str(self.port),
             "--trust-remote-code",
-            "--no-enable-prefix-caching",
+            (
+                "--enable-prefix-caching"
+                if _uses_linear_attention(self.model)
+                else "--no-enable-prefix-caching"
+            ),
             "--gpu-memory-utilization",
             str(self.gpu_memory_utilization),
             "--attention-backend",
@@ -127,6 +159,15 @@ class VLLMServer:
 
         if self.max_model_len is not None:
             cmd.extend(["--max-model-len", str(self.max_model_len)])
+        if _uses_linear_attention(self.model):
+            cmd.extend(
+                [
+                    "--max-num-seqs",
+                    "1",
+                    "--max-num-batched-tokens",
+                    "528",
+                ]
+            )
 
         if self.kv_transfer_config is not None:
             cmd.extend(["--kv-transfer-config", json.dumps(self.kv_transfer_config)])
@@ -140,10 +181,11 @@ class VLLMServer:
             # The server no longer selects a transfer backend; the connector
             # does. Force it here so --pegaflow-transfer-backend still exercises
             # the chosen path end-to-end, regardless of the model's MLA default.
+            extra_config: dict[str, object] = {}
             if self.use_pegaflow and self.transfer_backend is not None:
-                kv_config["kv_connector_extra_config"] = {
-                    "pegaflow.transfer_backend": self.transfer_backend,
-                }
+                extra_config["pegaflow.transfer_backend"] = self.transfer_backend
+            if extra_config:
+                kv_config["kv_connector_extra_config"] = extra_config
             cmd.extend(["--kv-transfer-config", json.dumps(kv_config)])
 
         cmd.extend(self.extra_args)
@@ -371,7 +413,7 @@ class PegaFlowServer:
         if libdir := sysconfig.get_config_var("LIBDIR"):
             env["LD_LIBRARY_PATH"] = f"{libdir}:{env.get('LD_LIBRARY_PATH', '')}"
         python_dir = str(Path(__file__).parent.parent)
-        site_packages = next((p for p in sys.path if "site-packages" in p), None)
+        site_packages = sysconfig.get_path("purelib")
         env["PYTHONPATH"] = f"{python_dir}" + (f":{site_packages}" if site_packages else "")
 
         feature_label = ",".join(self.cargo_features) or "default"

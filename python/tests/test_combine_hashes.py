@@ -12,7 +12,10 @@ from .unit_stubs import install_connector_unit_stubs
 
 install_connector_unit_stubs()
 
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec  # noqa: E402
+
 from pegaflow.connector.common import (  # noqa: E402
+    CacheGroupLayout,
     ConnectorContext,
     PegaConnectorMetadata,
     PegaConnectorMode,
@@ -53,6 +56,131 @@ def _make_ctx(
     }
     defaults.update(kwargs)
     return ConnectorContext(**defaults)  # type: ignore[arg-type]
+
+
+def _make_recurrent_scheduler() -> SchedulerConnector:
+    scheduler = SchedulerConnector(_make_ctx())
+    scheduler._cache_groups = SimpleNamespace(
+        group_count=2,
+        hash_group_index=0,
+        has_recurrent_state=True,
+    )
+    scheduler._block_hashes["r1"] = (_hash(0), _hash(1))
+    scheduler._allocated_blocks["r1"] = [[11, 12], [21, 22]]
+    scheduler._block_index_offsets["r1"] = 0
+    scheduler._next_stored_block_idx["r1"] = 0
+    return scheduler
+
+
+def test_cache_group_layout_accepts_structurally_compatible_mixed_specs():
+    attention = FullAttentionSpec()
+    attention.block_size = 528
+    recurrent = MambaSpec()
+    recurrent.block_size = 528
+    config = SimpleNamespace(
+        kv_cache_groups=(
+            SimpleNamespace(layer_names=("attention",), kv_cache_spec=attention),
+            SimpleNamespace(layer_names=("recurrent",), kv_cache_spec=recurrent),
+        )
+    )
+
+    layout = CacheGroupLayout.from_config(config)
+
+    assert layout.layer_names == (("attention",), ("recurrent",))
+    assert layout.hash_group_index == 0
+    assert layout.has_recurrent_state
+
+
+def test_cache_group_layout_rejects_misaligned_logical_block_sizes():
+    first = FullAttentionSpec()
+    first.block_size = 16
+    second = FullAttentionSpec()
+    second.block_size = 32
+    config = SimpleNamespace(
+        kv_cache_groups=(
+            SimpleNamespace(layer_names=("first",), kv_cache_spec=first),
+            SimpleNamespace(layer_names=("second",), kv_cache_spec=second),
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="identical logical block sizes"):
+        CacheGroupLayout.from_config(config)
+
+
+def test_cache_group_layout_rejects_missing_dense_hash_group():
+    recurrent = MambaSpec()
+    recurrent.block_size = 528
+    config = SimpleNamespace(
+        kv_cache_groups=(
+            SimpleNamespace(layer_names=("recurrent.0",), kv_cache_spec=recurrent),
+            SimpleNamespace(layer_names=("recurrent.1",), kv_cache_spec=recurrent),
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="dense FullAttention"):
+        CacheGroupLayout.from_config(config)
+
+
+def test_recurrent_save_accepts_one_exact_state_boundary_per_step():
+    scheduler = _make_recurrent_scheduler()
+
+    scheduler._scheduled_tokens["r1"] = 16
+    first = scheduler._consume_full_block_saves("r1", written=16)
+    scheduler._scheduled_tokens["r1"] = 32
+    second = scheduler._consume_full_block_saves("r1", written=32)
+
+    assert first == SaveIntent(
+        block_ids_by_group=((11,), (21,)),
+        block_hashes=(_hash(0),),
+    )
+    assert second == SaveIntent(
+        block_ids_by_group=((12,), (22,)),
+        block_hashes=(_hash(1),),
+    )
+
+
+def test_recurrent_save_disables_request_after_skipping_a_state_boundary():
+    scheduler = _make_recurrent_scheduler()
+    scheduler._scheduled_tokens["r1"] = 32
+
+    assert scheduler._consume_full_block_saves("r1", written=32) is None
+    assert "r1" in scheduler._unsafe_recurrent_saves
+    assert scheduler._next_stored_block_idx["r1"] == 0
+
+
+def test_recurrent_save_preserves_vllm_null_block_for_worker_filtering():
+    scheduler = _make_recurrent_scheduler()
+    scheduler._allocated_blocks["r1"][1][0] = 0
+    scheduler._scheduled_tokens["r1"] = 16
+
+    intent = scheduler._consume_full_block_saves("r1", written=16)
+
+    assert intent == SaveIntent(
+        block_ids_by_group=((11,), (0,)),
+        block_hashes=(_hash(0),),
+    )
+
+
+def test_hma_binding_disables_local_prefix_lookup_before_scheduling():
+    scheduler = _make_recurrent_scheduler()
+    block_pool = SimpleNamespace(get_cached_block=lambda *_args: object())
+    scheduler.bind_gpu_block_pool(block_pool)
+
+    assert block_pool.get_cached_block(b"hash", [0, 1]) is None
+
+
+def test_non_recurrent_hma_accepts_sparse_sliding_window_targets():
+    scheduler = SchedulerConnector(_make_ctx())
+    scheduler._cache_groups = SimpleNamespace(
+        group_count=2,
+        hash_group_index=0,
+        has_recurrent_state=False,
+    )
+
+    assert scheduler._copy_block_ids_by_group([[11, 12], [0, 21]]) == (
+        (11, 12),
+        (0, 21),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +324,7 @@ def test_page_first_block_shard_is_a_partition():
 
     block_ids = tuple(range(13))
     block_hashes = tuple(bytes([i]) for i in block_ids)
-    intent = SaveIntent(block_ids=block_ids, block_hashes=block_hashes)
+    intent = SaveIntent(block_ids_by_group=(block_ids,), block_hashes=block_hashes)
     tp_size = 4
 
     seen: list[int] = []
@@ -204,7 +332,7 @@ def test_page_first_block_shard_is_a_partition():
         ctx = _make_ctx(is_mla=True, tp_rank=tp_rank, tp_size=tp_size)
         worker = WorkerConnector(ctx, vllm_config=SimpleNamespace(additional_config={}))
         try:
-            ids, hashes = worker._block_shard(intent)
+            ids, hashes = worker._block_shard(intent.block_ids_by_group[0], intent.block_hashes)
         finally:
             worker.shutdown()
         # block_ids and block_hashes stay aligned after striping.
@@ -230,8 +358,8 @@ def test_page_first_saves_all_layers_for_this_ranks_block_stripe():
     meta = PegaConnectorMetadata(
         save_intents={
             "r1": SaveIntent(
-                block_ids=(0, 1, 2, 3),
-                block_hashes=(b"h0", b"h1", b"h2", b"h3"),
+                block_ids_by_group=((1, 2, 3, 4),),
+                block_hashes=(b"h1", b"h2", b"h3", b"h4"),
             )
         }
     )
@@ -250,6 +378,36 @@ def test_page_first_saves_all_layers_for_this_ranks_block_stripe():
     for _name, ids, hashes in saves_list:
         assert list(ids) == [1, 3]
         assert list(hashes) == [b"h1", b"h3"]
+
+
+def test_recurrent_save_omits_null_group_target():
+    from pegaflow.connector.worker import SaveTask, WorkerConnector
+
+    ctx = _make_ctx()
+    worker = WorkerConnector(ctx, vllm_config=SimpleNamespace(additional_config={}))
+    worker._cache_groups = SimpleNamespace(has_recurrent_state=True)
+    worker._registered_layers = ["attention", "recurrent"]
+    worker._layer_to_group = {"attention": 0, "recurrent": 1}
+    worker._torch_device = None
+    ctx.engine_client.save.return_value = (True, "")
+    metadata = PegaConnectorMetadata(
+        save_intents={
+            "r1": SaveIntent(
+                block_ids_by_group=((11,), (0,)),
+                block_hashes=(b"h0",),
+            )
+        }
+    )
+
+    try:
+        with patch("torch.cuda.synchronize"):
+            worker._process_save_batch([SaveTask(metadata=metadata, request_ids=["r1"])])
+    finally:
+        worker._registered_layers = []
+        worker.shutdown()
+
+    saves = ctx.engine_client.save.call_args.args[4]
+    assert saves == [("attention", [11], [b"h0"])]
 
 
 def test_page_first_layer_split_saves_own_layers_for_all_blocks():
@@ -272,8 +430,8 @@ def test_page_first_layer_split_saves_own_layers_for_all_blocks():
     meta = PegaConnectorMetadata(
         save_intents={
             "r1": SaveIntent(
-                block_ids=(0, 1, 2, 3),
-                block_hashes=(b"h0", b"h1", b"h2", b"h3"),
+                block_ids_by_group=((1, 2, 3, 4),),
+                block_hashes=(b"h1", b"h2", b"h3", b"h4"),
             )
         }
     )
@@ -290,8 +448,8 @@ def test_page_first_layer_split_saves_own_layers_for_all_blocks():
     assert {name for name, _ids, _hashes in saves_list} == {"b", "d"}
     # ...and every block (no striping), hashes kept aligned.
     for _name, ids, hashes in saves_list:
-        assert list(ids) == [0, 1, 2, 3]
-        assert list(hashes) == [b"h0", b"h1", b"h2", b"h3"]
+        assert list(ids) == [1, 2, 3, 4]
+        assert list(hashes) == [b"h1", b"h2", b"h3", b"h4"]
 
 
 # ---------------------------------------------------------------------------
@@ -334,12 +492,12 @@ class TestDecodeHashRefresh:
         blocks = _make_fake_blocks([10, 11, 12, 13])
 
         sc.update_state_after_alloc(req, blocks, num_external_tokens=0)
-        sc._allocated_blocks["r1"] = [10, 11, 12, 13]
+        sc._allocated_blocks["r1"] = [[10, 11, 12, 13]]
         sc._scheduled_tokens["r1"] = 128  # 4 * 32
 
         intent = sc._consume_save_intent("r1", 0)
         assert intent is not None
-        assert len(intent.block_ids) == 4
+        assert len(intent.block_ids_by_group[0]) == 4
         assert len(intent.block_hashes) == 4
 
     def test_decode_blocks_saved_after_refresh(self):
@@ -350,18 +508,18 @@ class TestDecodeHashRefresh:
         blocks = _make_fake_blocks([10, 11, 12, 13])
 
         sc.update_state_after_alloc(req, blocks, num_external_tokens=0)
-        sc._allocated_blocks["r1"] = [10, 11, 12, 13]
+        sc._allocated_blocks["r1"] = [[10, 11, 12, 13]]
         sc._scheduled_tokens["r1"] = 128  # 4 * 32
 
         # Save initial 4 blocks
         intent = sc._consume_save_intent("r1", 0)
         assert intent is not None
-        assert len(intent.block_ids) == 4
+        assert len(intent.block_ids_by_group[0]) == 4
 
         # Simulate decode: request grows by 2 blocks
         new_hashes = [_hash(i) for i in range(4, 6)]
         req.block_hashes.extend(new_hashes)  # live Request grows
-        sc._allocated_blocks["r1"].extend([14, 15])  # new block_ids
+        sc._allocated_blocks["r1"][0].extend([14, 15])  # new block_ids
         sc._scheduled_tokens["r1"] += 64  # 2 * 32 more tokens
 
         # Before refresh: _block_hashes is stale (4 entries) → no new saves
@@ -374,8 +532,8 @@ class TestDecodeHashRefresh:
         # Now the 2 decode blocks become saveable
         intent2 = sc._consume_save_intent("r1", 0)
         assert intent2 is not None
-        assert len(intent2.block_ids) == 2
-        assert intent2.block_ids == (14, 15)
+        assert len(intent2.block_ids_by_group[0]) == 2
+        assert intent2.block_ids_by_group == ((14, 15),)
         assert intent2.block_hashes == (new_hashes[0], new_hashes[1])
 
     def test_cleanup_removes_request_ref(self):
@@ -401,23 +559,13 @@ class TestDecodeHashRefresh:
         sc._block_index_offsets["r1"] = 6
         sc._next_stored_block_idx["r1"] = 6
         sc._scheduled_tokens["r1"] = 48  # 3 virtual blocks beyond the external hit
-        sc._allocated_blocks["r1"] = [
-            100,
-            101,
-            102,
-            103,
-            104,
-            105,
-            200,
-            201,
-            202,
-        ]
+        sc._allocated_blocks["r1"] = [[100, 101, 102, 103, 104, 105, 200, 201, 202]]
 
         intent = sc._consume_save_intent("r1", 0)
 
         assert intent is not None
         assert intent.block_hashes == block_hashes[6:9]
-        assert intent.block_ids == (200, 201, 202)
+        assert intent.block_ids_by_group == ((200, 201, 202),)
 
     def test_save_only_mode_counts_precomputed_prefix_as_saveable(self):
         """NIXL-loaded prefix should be saveable in Pega save-only mode."""
@@ -450,7 +598,7 @@ class TestDecodeHashRefresh:
         metadata = sc.build_connector_meta(scheduler_output)
 
         intent = metadata.save_intents["r1"]
-        assert intent.block_ids == (10, 11, 12)
+        assert intent.block_ids_by_group == ((10, 11, 12),)
         assert intent.block_hashes == tuple(block_hashes[:3])
 
     def test_save_only_mode_handles_full_prompt_hit_recompute_token(self):
@@ -481,7 +629,7 @@ class TestDecodeHashRefresh:
         metadata = sc.build_connector_meta(scheduler_output)
 
         intent = metadata.save_intents["r1"]
-        assert intent.block_ids == (10, 11, 12, 13)
+        assert intent.block_ids_by_group == ((10, 11, 12, 13),)
         assert intent.block_hashes == tuple(block_hashes)
 
     def test_read_write_mode_does_not_save_unowned_precomputed_prefix(self):
@@ -520,7 +668,7 @@ class TestDecodeHashRefresh:
         req = _make_fake_request("r1", list(block_hashes))
 
         sc.update_state_after_alloc(req, _make_fake_blocks([]), num_external_tokens=0)
-        sc._allocated_blocks["r1"] = [1, 2]
+        sc._allocated_blocks["r1"] = [[1, 2]]
         sc._next_stored_block_idx["r1"] = 2
         sc._scheduled_tokens["r1"] = 32
 
@@ -540,7 +688,7 @@ class TestDecodeHashRefresh:
 
         intent = metadata.save_intents["r1"]
         assert intent.block_hashes == tuple(block_hashes[2:3])
-        assert intent.block_ids == (12,)
+        assert intent.block_ids_by_group == ((12,),)
 
 
 class TestSchedulerQueryProbeReuse:

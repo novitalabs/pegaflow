@@ -1,9 +1,10 @@
 use pegaflow_common::grpc::{GRPC_CLIENT_HTTP2_KEEPALIVE_INTERVAL, GRPC_CONNECT_TIMEOUT};
 use pegaflow_core::LoadState;
 use pegaflow_proto::proto::engine::{
-    HealthRequest, LeaseLoad, LoadRequest, QueryRequest, RegisterContextRequest, ReleaseRequest,
-    ResponseStatus, SaveLayer, SaveRequest, SessionEvent, SessionRequest, ShutdownRequest,
-    TransferMode, UnregisterRequest, engine_client::EngineClient, query_response,
+    HealthRequest, LeaseLoad, LoadBlockIds, LoadBlockTarget, LoadGroup, LoadRequest, QueryRequest,
+    RegisterContextRequest, ReleaseRequest, ResponseStatus, SaveLayer, SaveRequest, SessionEvent,
+    SessionRequest, ShutdownRequest, TransferMode, UnregisterRequest, engine_client::EngineClient,
+    query_response,
 };
 use pyo3::{
     create_exception,
@@ -30,6 +31,7 @@ create_exception!(pegaflow, PegaFlowError, PyException);
 create_exception!(pegaflow, PegaflowInternal, PegaFlowError);
 
 static TOKIO_RUNTIME: OnceLock<Runtime> = OnceLock::new();
+type PyLeaseLoad = (Vec<u8>, Vec<Vec<Option<u32>>>);
 
 /// Get or create the global Tokio runtime (shared across all RPC calls)
 fn get_runtime() -> PyResult<&'static Runtime> {
@@ -388,8 +390,8 @@ impl EngineRpcClient {
     ///     tp_rank: Tensor parallel rank
     ///     device_id: CUDA device ID
     ///     load_state_shm: Shared memory name for load state sync
-    ///     layer_names: List of layer names to load
-    ///     loads: List of (lease, block_ids) pairs
+    ///     layer_groups: Cache-group ordered lists of layer names
+    ///     loads: List of (lease, block_ids_by_group) pairs
     ///
     /// Returns: (ok: bool, message: str)
     #[allow(
@@ -403,12 +405,27 @@ impl EngineRpcClient {
         tp_rank: u32,
         device_id: i32,
         load_state_shm: String,
-        layer_names: Vec<String>,
-        loads: Vec<(Vec<u8>, Vec<u32>)>,
+        layer_groups: Vec<Vec<String>>,
+        loads: Vec<PyLeaseLoad>,
     ) -> PyResult<(bool, String)> {
         let loads = loads
             .into_iter()
-            .map(|(lease, block_ids)| LeaseLoad { lease, block_ids })
+            .map(|(lease, block_ids_by_group)| LeaseLoad {
+                lease,
+                block_ids_by_group: block_ids_by_group
+                    .into_iter()
+                    .map(|targets| LoadBlockIds {
+                        targets: targets
+                            .into_iter()
+                            .map(|block_id| LoadBlockTarget { block_id })
+                            .collect(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        let groups = layer_groups
+            .into_iter()
+            .map(|layer_names| LoadGroup { layer_names })
             .collect();
         self.call(py, "load", |mut c| async move {
             let resp = c
@@ -417,7 +434,7 @@ impl EngineRpcClient {
                     tp_rank,
                     device_id,
                     load_state_shm,
-                    layer_names,
+                    groups,
                     loads,
                 })
                 .await?;

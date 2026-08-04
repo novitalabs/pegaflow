@@ -711,8 +711,8 @@ async fn verify_set(
                 tp_rank,
                 rb.device as i32,
                 load_state.shm_name(),
-                &layer_name_refs,
-                &[(lease, block_ids.clone())],
+                std::slice::from_ref(&layer_name_refs),
+                &[(lease, vec![block_ids.iter().copied().map(Some).collect()])],
             )
             .expect("batch_load");
         let deadline = Instant::now() + Duration::from_secs(30);

@@ -94,6 +94,10 @@ impl TestGpuData {
         assert_eq!(self.gpu.copy_to_host(), self.expected, "GPU data mismatch");
     }
 
+    pub fn assert_gpu_matches(&self, expected: &[u8]) {
+        assert_eq!(self.gpu.copy_to_host(), expected, "GPU data mismatch");
+    }
+
     pub fn ptr(&self) -> u64 {
         self.gpu.as_u64()
     }
@@ -426,8 +430,9 @@ impl TestEnv {
 
     /// Load blocks from cache to GPU (lease must be held).
     pub async fn load_to_gpu(&self, lease: QueryLeaseId, block_count: usize) {
-        let block_ids: Vec<usize> = (0..block_count).collect();
+        let block_ids: Vec<Option<usize>> = (0..block_count).map(Some).collect();
         let layer_names: Vec<&str> = self.layers.iter().map(|l| l.name.as_str()).collect();
+        let layer_groups = vec![layer_names];
         let load_state = LoadState::new().expect("create LoadState");
         let shm_name = load_state.shm_name().to_string();
         self.engine
@@ -436,8 +441,8 @@ impl TestEnv {
                 0,
                 0,
                 &shm_name,
-                &layer_names,
-                &[(lease, block_ids)],
+                &layer_groups,
+                &[(lease, vec![block_ids])],
             )
             .expect("submit load");
         wait_for_load(&load_state, LOAD_WAIT_TIMEOUT).await;
@@ -445,8 +450,9 @@ impl TestEnv {
 
     /// Submit load and assert it fails synchronously with `expected_msg`.
     pub fn expect_load_error(&self, lease: QueryLeaseId, block_count: usize, expected_msg: &str) {
-        let block_ids: Vec<usize> = (0..block_count).collect();
+        let block_ids: Vec<Option<usize>> = (0..block_count).map(Some).collect();
         let layer_names: Vec<&str> = self.layers.iter().map(|l| l.name.as_str()).collect();
+        let layer_groups = vec![layer_names];
         let load_state = LoadState::new().expect("create LoadState");
         let shm_name = load_state.shm_name().to_string();
         let err = self
@@ -456,8 +462,8 @@ impl TestEnv {
                 0,
                 0,
                 &shm_name,
-                &layer_names,
-                &[(lease, block_ids)],
+                &layer_groups,
+                &[(lease, vec![block_ids])],
             )
             .expect_err("load should fail");
         assert!(

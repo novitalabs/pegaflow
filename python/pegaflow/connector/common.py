@@ -106,7 +106,7 @@ class ConnectorContext:
 class LoadIntent:
     """Intent for a KV load operation."""
 
-    block_ids: tuple[int, ...]
+    block_ids_by_group: tuple[tuple[int, ...], ...]
     lease: bytes
     num_tokens: int
 
@@ -115,8 +115,64 @@ class LoadIntent:
 class SaveIntent:
     """Intent for a KV save operation."""
 
-    block_ids: tuple[int, ...]
+    block_ids_by_group: tuple[tuple[int, ...], ...]
     block_hashes: tuple[bytes, ...]
+
+
+@dataclass(frozen=True)
+class CacheGroupLayout:
+    """Stable vLLM cache-group order shared by scheduler and worker."""
+
+    layer_names: tuple[tuple[str, ...], ...]
+    hash_group_index: int
+    has_recurrent_state: bool
+
+    @classmethod
+    def from_config(cls, kv_cache_config) -> "CacheGroupLayout":
+        groups = tuple(getattr(kv_cache_config, "kv_cache_groups", ()) or ())
+        if not groups:
+            return cls(layer_names=((),), hash_group_index=0, has_recurrent_state=False)
+
+        from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+
+        block_sizes = {group.kv_cache_spec.block_size for group in groups}
+        if len(groups) > 1 and len(block_sizes) != 1:
+            raise RuntimeError(
+                "PegaFlow HMA requires cache groups with identical logical block sizes"
+            )
+
+        hash_group_index = next(
+            (
+                index
+                for index, group in enumerate(groups)
+                if isinstance(group.kv_cache_spec, FullAttentionSpec)
+            ),
+            None,
+        )
+        if hash_group_index is None and len(groups) > 1:
+            raise RuntimeError(
+                "PegaFlow requires a dense FullAttention cache group for block hashes"
+            )
+        hash_group_index = hash_group_index or 0
+
+        return cls(
+            layer_names=tuple(tuple(group.layer_names) for group in groups),
+            hash_group_index=hash_group_index,
+            has_recurrent_state=any(isinstance(group.kv_cache_spec, MambaSpec) for group in groups),
+        )
+
+    @property
+    def group_count(self) -> int:
+        return len(self.layer_names)
+
+    def layer_to_group(self) -> dict[str, int]:
+        result: dict[str, int] = {}
+        for group_index, names in enumerate(self.layer_names):
+            for name in names:
+                if name in result:
+                    raise RuntimeError(f"KV cache layer belongs to multiple groups: {name}")
+                result[name] = group_index
+        return result
 
 
 class PegaConnectorMetadata(KVConnectorMetadata):

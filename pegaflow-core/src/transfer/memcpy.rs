@@ -31,11 +31,13 @@ fn merge(copies: &[CopyDesc]) -> Vec<Merged> {
         let mut j = i + 1;
         while j < copies.len() {
             let next = copies[j];
+            let same_allocations = start.device_allocation == next.device_allocation
+                && start.host_allocation == next.host_allocation;
             let device_contiguous = start.device + size as u64 == next.device;
             // SAFETY: pointer arithmetic used only for an address-equality check;
             // the result is never dereferenced.
             let host_contiguous = unsafe { start.host.add(size) } == next.host;
-            if device_contiguous && host_contiguous {
+            if same_allocations && device_contiguous && host_contiguous {
                 size += next.size;
                 j += 1;
             } else {

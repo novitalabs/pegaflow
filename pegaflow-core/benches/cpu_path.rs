@@ -209,8 +209,11 @@ impl BenchFixture {
                 0,
                 DEVICE_ID,
                 load_state.shm_name(),
-                &[LAYER_NAME],
-                &[(lease, self.block_ids.clone())],
+                &[vec![LAYER_NAME]],
+                &[(
+                    lease,
+                    vec![self.block_ids.iter().copied().map(Some).collect()],
+                )],
             )
             .expect("submit load");
         wait_for_load(&load_state).await;

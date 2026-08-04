@@ -76,7 +76,7 @@ def _make_connector(req, allocated: list[int]) -> SchedulerConnector:
     sc._hash_block_tokens = lambda fn, parent, tokens, extra: b"tail:%d" % len(tokens)
     sc._requests[req.request_id] = req
     sc._block_hashes[req.request_id] = tuple(req.block_hashes)
-    sc._allocated_blocks[req.request_id] = allocated
+    sc._allocated_blocks[req.request_id] = [allocated]
     sc._scheduled_tokens[req.request_id] = 0
     sc._block_index_offsets[req.request_id] = 0
     sc._next_stored_block_idx[req.request_id] = 0
@@ -103,7 +103,7 @@ class TestTailSaveTrigger:
         assert sc._consume_tail_save("r1", written=49) is None
         intent = sc._consume_tail_save("r1", written=50)
         assert intent is not None
-        assert intent.block_ids == (13,)
+        assert intent.block_ids_by_group == ((13,),)
         # Once saved, never again (content-addressed dedup upstream would
         # reject a correction, so a re-save is pure waste).
         assert sc._consume_tail_save("r1", written=51) is None
@@ -123,7 +123,7 @@ class TestTailSaveTrigger:
         sc = _make_connector(req, allocated=[10])
         intent = sc._consume_tail_save("r1", written=10)
         assert intent is not None
-        assert intent.block_ids == (10,)
+        assert intent.block_ids_by_group == ((10,),)
         assert intent.block_hashes == (b"tail:10",)
 
     def test_salted_or_lora_requests_never_tail_save(self):
@@ -178,7 +178,7 @@ class TestTailSaveThroughBuildConnectorMeta:
         )
         intent = meta.save_intents.get("r1")
         assert intent is not None
-        assert 13 in intent.block_ids
+        assert 13 in intent.block_ids_by_group[0]
 
     def test_preempt_resume_does_not_fire_early(self):
         # Chunked prefill: 32 of 50 scheduled, then preempted (all progress
@@ -192,7 +192,10 @@ class TestTailSaveThroughBuildConnectorMeta:
             sc,
             new=[{"id": "r1", "blocks": [10, 11, 12, 13], "computed": 0, "scheduled": 32}],
         )
-        assert meta.save_intents.get("r1") is None or 13 not in meta.save_intents["r1"].block_ids
+        assert (
+            meta.save_intents.get("r1") is None
+            or 13 not in meta.save_intents["r1"].block_ids_by_group[0]
+        )
 
         # Preempted; resume re-schedules from scratch.
         meta = self._step(
@@ -207,7 +210,10 @@ class TestTailSaveThroughBuildConnectorMeta:
                 }
             ],
         )
-        assert meta.save_intents.get("r1") is None or 13 not in meta.save_intents["r1"].block_ids
+        assert (
+            meta.save_intents.get("r1") is None
+            or 13 not in meta.save_intents["r1"].block_ids_by_group[0]
+        )
 
         meta = self._step(
             sc,
@@ -215,7 +221,7 @@ class TestTailSaveThroughBuildConnectorMeta:
         )
         intent = meta.save_intents.get("r1")
         assert intent is not None
-        assert 13 in intent.block_ids
+        assert 13 in intent.block_ids_by_group[0]
 
 
 class TestTailLoad:
@@ -243,7 +249,7 @@ class TestTailLoad:
         sc.update_state_after_alloc(req, blocks, num_external_tokens=49)
 
         intent = sc._pending_load_intents["r1"]
-        assert intent.block_ids == (10, 11, 12, 13)
+        assert intent.block_ids_by_group == ((10, 11, 12, 13),)
         assert intent.num_tokens == 49
         assert intent.lease == b"lease"
 
@@ -263,7 +269,7 @@ class TestTailLoad:
         sc.update_state_after_alloc(req, blocks, num_external_tokens=33)
 
         intent = sc._pending_load_intents["r1"]
-        assert intent.block_ids == (11, 12, 13)
+        assert intent.block_ids_by_group == ((11, 12, 13),)
         assert intent.num_tokens == 33
 
     def test_request_drift_is_reported_separately_from_lease_count(self):

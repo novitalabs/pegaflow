@@ -51,8 +51,9 @@ async fn query_then_load_consumes_reservation_budget() {
     env.load_to_gpu(lease, hashes.len()).await;
     env.data().assert_gpu_matches_expected();
 
-    let block_ids: Vec<usize> = (0..hashes.len()).collect();
+    let block_ids: Vec<Option<usize>> = (0..hashes.len()).map(Some).collect();
     let layer_names: Vec<&str> = env.layers.iter().map(|l| l.name.as_str()).collect();
+    let layer_groups = vec![layer_names];
     let load_state = LoadState::new().expect("create LoadState");
     let err = env
         .engine
@@ -61,8 +62,8 @@ async fn query_then_load_consumes_reservation_budget() {
             0,
             0,
             load_state.shm_name(),
-            &layer_names,
-            &[(lease, block_ids)],
+            &layer_groups,
+            &[(lease, vec![block_ids])],
         )
         .expect_err("third load should fail");
     assert!(

@@ -28,7 +28,9 @@ import pytest
 from .vllm_helpers import (
     PegaFlowServer,
     VLLMServer,
+    adapt_prompt_for_hybrid_cache,
     call_openai_api,
+    e2e_max_tokens,
     fetch_pegaflow_metrics,
     fetch_pegaflow_rpc_failures,
 )
@@ -163,6 +165,8 @@ EXECUTION_PLAN: list[tuple[str, str, str]] = [
     ("prefix_base", PREFIX_BASE, "cold"),
     ("rollback_long", ROLLBACK_LONG, "cold"),
     ("multi_r1", MULTI_ROUND[0], "cold"),
+    # Same-process warm hit proves vLLM's local HMA cache cannot mask PegaFlow.
+    ("short_same_process", SHORT_PROMPT, "warm-same-process"),
     # Round 2: warm hits — exact same prompts
     ("short_warm", SHORT_PROMPT, "warm"),
     ("long_warm", LONG_PROMPT, "warm"),
@@ -194,6 +198,7 @@ _LABEL_TO_BASELINE: dict[str, str] = {
     "prefix_base": "prefix_base",
     "rollback_long": "rollback_long",
     "multi_r1": "multi_r1",
+    "short_same_process": "short",
     "short_warm": "short",
     "long_warm": "long",
     "prefix_extend": "prefix_extend",
@@ -217,8 +222,8 @@ class TestE2ECorrectness:
       Phase 1 — run all unique prompts through baseline vLLM, collect golden outputs.
       Phase 2 — run execution plan through PegaFlow vLLM, collect outputs + metrics.
     The equality test walks every execution-plan label and reports the label
-    that failed, so one expensive fixture run does not pretend to be 11
-    independent tests.
+    that failed, so one expensive fixture run does not pretend each path is an
+    independent test.
     """
 
     @pytest.fixture(scope="class")
@@ -265,7 +270,12 @@ class TestE2ECorrectness:
             max_model_len=max_model_len,
         ):
             for key, prompt in ALL_PROMPTS.items():
-                result = call_openai_api(base_port, model, prompt)
+                result = call_openai_api(
+                    base_port,
+                    model,
+                    adapt_prompt_for_hybrid_cache(model, prompt),
+                    max_tokens=e2e_max_tokens(model),
+                )
                 outputs[key] = result["text"]
                 print(f"  [{key}] {len(result['text'])} chars")
 
@@ -288,6 +298,8 @@ class TestE2ECorrectness:
         print("[Phase 2] PegaFlow vLLM — executing cache plan")
         pega_port = base_port + 1
         outputs: dict[str, str] = {}
+        metrics_port = pegaflow_server.metrics_port
+        metrics_start = fetch_pegaflow_metrics(metrics_port)
 
         with VLLMServer(
             model,
@@ -300,11 +312,41 @@ class TestE2ECorrectness:
             max_model_len=max_model_len,
             transfer_backend=pegaflow_transfer_backend,
         ):
-            metrics_port = pegaflow_server.metrics_port
-            metrics_start = fetch_pegaflow_metrics(metrics_port)
-
             for label, prompt, expectation in EXECUTION_PLAN:
-                result = call_openai_api(pega_port, model, prompt)
+                if expectation not in {"cold", "warm-same-process"}:
+                    continue
+                result = call_openai_api(
+                    pega_port,
+                    model,
+                    adapt_prompt_for_hybrid_cache(model, prompt),
+                    max_tokens=e2e_max_tokens(model),
+                )
+                outputs[label] = result["text"]
+                print(f"  [{label}] ({expectation}) {len(result['text'])} chars")
+
+            metrics_same_process = fetch_pegaflow_metrics(metrics_port)
+
+        with VLLMServer(
+            model,
+            pega_port,
+            use_pegaflow=True,
+            pegaflow_port=pegaflow_server.grpc_port,
+            log_file=log_dir / "pegaflow-load.log",
+            tensor_parallel_size=tensor_parallel_size,
+            pipeline_parallel_size=pipeline_parallel_size,
+            max_model_len=max_model_len,
+            transfer_backend=pegaflow_transfer_backend,
+            server_label="PegaFlow load",
+        ):
+            for label, prompt, expectation in EXECUTION_PLAN:
+                if expectation in {"cold", "warm-same-process"}:
+                    continue
+                result = call_openai_api(
+                    pega_port,
+                    model,
+                    adapt_prompt_for_hybrid_cache(model, prompt),
+                    max_tokens=e2e_max_tokens(model),
+                )
                 outputs[label] = result["text"]
                 print(f"  [{label}] ({expectation}) {len(result['text'])} chars")
 
@@ -314,6 +356,7 @@ class TestE2ECorrectness:
         return {
             "outputs": outputs,
             "metrics_start": metrics_start,
+            "metrics_same_process": metrics_same_process,
             "metrics_end": metrics_end,
         }
 
@@ -354,6 +397,21 @@ class TestE2ECorrectness:
         print(
             f"\n[Metrics] saves={insertions:.0f} blocks ({save_bytes / 1e6:.1f}MB), "
             f"hits={hits:.0f} blocks ({load_bytes / 1e6:.1f}MB)"
+        )
+
+    def test_same_process_hma_load_uses_pegaflow(self, pegaflow_results):
+        """The warm request in the first vLLM process must load from PegaFlow."""
+        m_start = pegaflow_results["metrics_start"]
+        m_end = pegaflow_results["metrics_same_process"]
+        hit_delta = m_end.get("pegaflow_cache_block_hits_total", 0) - m_start.get(
+            "pegaflow_cache_block_hits_total", 0
+        )
+        load_delta = m_end.get("pegaflow_load_bytes_total", 0) - m_start.get(
+            "pegaflow_load_bytes_total", 0
+        )
+        assert hit_delta > 0 or load_delta > 0, (
+            "same-process warm HMA request bypassed PegaFlow: "
+            f"hit_delta={hit_delta}, load_delta={load_delta}"
         )
 
     def test_no_data_path_rpc_failures(self, pegaflow_results, pegaflow_server: PegaFlowServer):

@@ -2,12 +2,14 @@
 Scheduler-side connector logic.
 """
 
+import os
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from pegaflow.connector.common import (
+    CacheGroupLayout,
     ConnectorContext,
     LoadIntent,
     PegaConnectorMetadata,
@@ -92,8 +94,13 @@ class SchedulerConnector:
         pd_tail_save: bool = False,
         pd_tail_load: bool = False,
         vllm_config=None,
+        kv_cache_config=None,
     ):
         self._ctx = context
+        self._cache_groups = CacheGroupLayout.from_config(kv_cache_config)
+        if self._cache_groups.has_recurrent_state and (pd_tail_save or pd_tail_load):
+            raise ValueError("P/D tail-block caching is not supported with HMA")
+        self._unsafe_recurrent_saves: set[str] = set()
 
         # P/D tail-block extension (`pegaflow.pd_tail_save`): vLLM only hashes
         # full blocks, so a prompt's partial tail block never enters the tier
@@ -102,15 +109,16 @@ class SchedulerConnector:
         # saves the partial tail block under a key derived with vLLM's OWN
         # hash function over (last_full_hash, tail_prompt_token_ids, None) —
         # well-defined, and independently derivable by the decode peer.
-        # Only xxhash_cbor is validated cross-engine; everything else is
-        # rejected (the pickle-based algos aren't even derivable elsewhere).
+        # vLLM derives NONE_HASH from PYTHONHASHSEED when it is set. A fixed
+        # seed makes the configured hash function reproducible across the
+        # scheduler processes participating in the transfer.
         self._tail_save_enabled = pd_tail_save
         self._tail_load_enabled = pd_tail_load
         self._tail_hash_fn = None
         if pd_tail_save or pd_tail_load:
             assert vllm_config is not None
             algo = vllm_config.cache_config.prefix_caching_hash_algo
-            if algo != "xxhash_cbor":
+            if os.environ.get("PYTHONHASHSEED") is None:
                 enabled_options = ", ".join(
                     option
                     for enabled, option in (
@@ -120,10 +128,8 @@ class SchedulerConnector:
                     if enabled
                 )
                 raise ValueError(
-                    "P/D tail-block caching requires prefix_caching_hash_algo "
-                    f"'xxhash_cbor' (cross-engine derivable, validated); got {algo!r} — "
-                    f"enabled options: {enabled_options}; "
-                    f"run vLLM with --prefix-caching-hash-algo xxhash_cbor"
+                    "P/D tail-block caching requires a fixed PYTHONHASHSEED "
+                    f"across vLLM processes; enabled options: {enabled_options}"
                 )
             from vllm.utils.hashing import get_hash_fn_by_name
             from vllm.v1.core import kv_cache_utils
@@ -154,7 +160,7 @@ class SchedulerConnector:
         self._block_hashes: dict[str, tuple[bytes, ...]] = {}
         self._external_matched_blocks: dict[str, int] = {}
         self._block_index_offsets: dict[str, int] = {}
-        self._allocated_blocks: dict[str, list[int]] = {}
+        self._allocated_blocks: dict[str, list[list[int]]] = {}
         self._scheduled_tokens: dict[str, int] = {}
         self._next_stored_block_idx: dict[str, int] = {}
 
@@ -165,6 +171,18 @@ class SchedulerConnector:
         # Completion tracking
         self._pending_saves: set[str] = set()
         self._held_requests: set[str] = set()
+
+    def bind_gpu_block_pool(self, gpu_block_pool) -> None:
+        if self._cache_groups.group_count <= 1:
+            return
+
+        # vLLM can cache an async-loaded dense group and expose it to a sibling
+        # before the sparse group has a usable state. PegaFlow is the sole HMA
+        # prefix index until vLLM exposes an atomic all-group cache hook.
+        def no_local_hma_prefix_hit(*_args, **_kwargs) -> None:
+            return None
+
+        gpu_block_pool.get_cached_block = no_local_hma_prefix_hit
 
     def get_num_new_matched_tokens(
         self,
@@ -349,29 +367,40 @@ class SchedulerConnector:
             # prefix. Track that global block index explicitly.
             base_block_idx = self._external_matched_blocks.get(req_id, 0)
             self._block_index_offsets[req_id] = base_block_idx
-            self._allocated_blocks[req_id] = []
+            self._allocated_blocks[req_id] = [[] for _ in range(self._cache_groups.group_count)]
             self._scheduled_tokens[req_id] = 0
             self._next_stored_block_idx[req_id] = base_block_idx
 
         if num_external_tokens > 0:
-            block_ids = list(blocks.get_block_ids()[0]) if blocks else []
+            block_ids_by_group = (
+                self._copy_block_ids_by_group(blocks.get_block_ids())
+                if blocks
+                else tuple(() for _ in range(self._cache_groups.group_count))
+            )
+            hash_group_index = self._cache_groups.hash_group_index
             num_computed_blocks = (
-                sum(block.block_hash is not None for block in blocks.blocks[0]) if blocks else 0
+                sum(block.block_hash is not None for block in blocks.blocks[hash_group_index])
+                if blocks
+                else 0
             )
             start_block_idx = num_computed_blocks
             vbs = self._ctx.virtual_block_size
             num_load_blocks = (num_external_tokens + vbs - 1) // vbs
-            expected_load_blocks = len(block_ids) - num_computed_blocks
-            if num_load_blocks != expected_load_blocks:
+            expected_load_blocks = {
+                len(block_ids) - num_computed_blocks for block_ids in block_ids_by_group
+            }
+            if expected_load_blocks != {num_load_blocks}:
                 self._release_pending_query_probe(req_id)
                 raise RuntimeError(
                     f"req {req_id} load block mismatch: external={num_load_blocks} "
-                    f"expected={expected_load_blocks}"
+                    f"expected_by_group={sorted(expected_load_blocks)}"
                 )
 
             pending_probe = self._pending_query_probes.get(req_id)
             load_intent = LoadIntent(
-                block_ids=tuple(block_ids[start_block_idx:]),
+                block_ids_by_group=tuple(
+                    block_ids[start_block_idx:] for block_ids in block_ids_by_group
+                ),
                 lease=pending_probe.lease if pending_probe is not None else b"",
                 num_tokens=num_external_tokens,
             )
@@ -395,9 +424,9 @@ class SchedulerConnector:
                 "[PegaKVConnector] req=%s alloc: total_blocks=%d computed_blocks=%d "
                 "load_blocks=%d start_block_idx=%d load_tokens=%d pending_loads=%d",
                 req_id,
-                len(block_ids),
+                len(block_ids_by_group[hash_group_index]),
                 num_computed_blocks,
-                len(load_intent.block_ids),
+                len(load_intent.block_ids_by_group[hash_group_index]),
                 start_block_idx,
                 load_intent.num_tokens,
                 len(self._pending_load_intents),
@@ -423,7 +452,9 @@ class SchedulerConnector:
             # Populate block IDs from scheduler_output — single source of
             # truth for the save path (consistent with offloading connector).
             if req.block_ids:
-                self._allocated_blocks[req_id] = list(req.block_ids[0])
+                self._allocated_blocks[req_id] = [
+                    list(group) for group in self._copy_block_ids_by_group(req.block_ids)
+                ]
 
             if self._ctx.read_enabled:
                 self._scheduled_tokens[req_id] += num_tokens
@@ -458,9 +489,18 @@ class SchedulerConnector:
             # Append newly allocated blocks
             new_block_ids = cached_reqs.new_block_ids[idx]
             if req_id in cached_reqs.resumed_req_ids:
-                self._allocated_blocks[req_id] = list(new_block_ids[0]) if new_block_ids else []
+                self._allocated_blocks[req_id] = (
+                    [list(group) for group in self._copy_block_ids_by_group(new_block_ids)]
+                    if new_block_ids
+                    else [[] for _ in range(self._cache_groups.group_count)]
+                )
             elif new_block_ids:
-                self._allocated_blocks[req_id].extend(new_block_ids[0])
+                for allocated, new_group in zip(
+                    self._allocated_blocks[req_id],
+                    self._copy_block_ids_by_group(new_block_ids),
+                    strict=True,
+                ):
+                    allocated.extend(new_group)
 
             if self._ctx.read_enabled:
                 self._scheduled_tokens[req_id] += num_tokens
@@ -498,14 +538,21 @@ class SchedulerConnector:
         `written` = positions with valid KV once this step's schedule runs
         (scheduler-authoritative num_computed_tokens + this step's tokens).
         """
-        regular = self._consume_full_block_saves(req_id)
+        regular = self._consume_full_block_saves(req_id, written)
         tail = self._consume_tail_save(req_id, written)
         if tail is None:
             return regular
         if regular is None:
             return tail
         return SaveIntent(
-            block_ids=regular.block_ids + tail.block_ids,
+            block_ids_by_group=tuple(
+                regular_ids + tail_ids
+                for regular_ids, tail_ids in zip(
+                    regular.block_ids_by_group,
+                    tail.block_ids_by_group,
+                    strict=True,
+                )
+            ),
             block_hashes=regular.block_hashes + tail.block_hashes,
         )
 
@@ -534,17 +581,24 @@ class SchedulerConnector:
         tail_idx = prompt_len // vbs
         allocated = self._allocated_blocks.get(req_id, [])
         block_hashes = self._block_hashes.get(req_id) or ()
-        if tail_idx >= len(allocated) or tail_idx > len(block_hashes):
+        if (
+            not allocated
+            or any(tail_idx >= len(group) for group in allocated)
+            or tail_idx > len(block_hashes)
+        ):
             return None  # tail block not allocated / full-block hashes lagging
         self._tail_saved.add(req_id)
         logger.info(
             "[PegaKVConnector] req=%s pd_tail_save: block_id=%d tail_tokens=%d key=%s",
             req_id,
-            allocated[tail_idx],
+            allocated[self._cache_groups.hash_group_index][tail_idx],
             tail_len,
             tail_key.hex(),
         )
-        return SaveIntent(block_ids=(allocated[tail_idx],), block_hashes=(tail_key,))
+        return SaveIntent(
+            block_ids_by_group=tuple((group[tail_idx],) for group in allocated),
+            block_hashes=(tail_key,),
+        )
 
     def _derive_tail_block(self, request: "Request") -> tuple[bytes, int] | None:
         if self._tail_hash_fn is None:
@@ -585,7 +639,7 @@ class SchedulerConnector:
             return query_hashes, 0
         return query_hashes + (tail[0],), tail[1]
 
-    def _consume_full_block_saves(self, req_id: str) -> SaveIntent | None:
+    def _consume_full_block_saves(self, req_id: str, written: int) -> SaveIntent | None:
         # block_hashes are at virtual_block_size granularity, 1-to-1 with block_ids.
         block_hashes = self._block_hashes.get(req_id)
         if block_hashes is None:
@@ -601,7 +655,7 @@ class SchedulerConnector:
         # the front, so save intents must slice by global block index rather than
         # rebasing to a local-only view.
         local_saveable = min(
-            len(allocated),
+            min((len(group) for group in allocated), default=0),
             scheduled // self._ctx.virtual_block_size,
         )
         saveable_block_idx = min(len(block_hashes), base_block_idx + local_saveable)
@@ -609,10 +663,28 @@ class SchedulerConnector:
         if new_blocks <= 0:
             return None
 
-        self._next_stored_block_idx[req_id] = saveable_block_idx
+        if self._cache_groups.has_recurrent_state:
+            if req_id in self._unsafe_recurrent_saves:
+                return None
+            state_boundary = saveable_block_idx * self._ctx.virtual_block_size
+            if new_blocks != 1 or written != state_boundary:
+                self._unsafe_recurrent_saves.add(req_id)
+                logger.warning(
+                    "[PegaKVConnector] req=%s recurrent save disabled: "
+                    "new_blocks=%d written=%d boundary=%d",
+                    req_id,
+                    new_blocks,
+                    written,
+                    state_boundary,
+                )
+                return None
+
         hash_start = start_block_idx
         save_hashes = block_hashes[hash_start : hash_start + new_blocks]
-        save_block_ids = allocated[hash_start : hash_start + new_blocks]
+        save_block_ids_by_group = tuple(
+            tuple(group[hash_start : hash_start + new_blocks]) for group in allocated
+        )
+        self._next_stored_block_idx[req_id] = saveable_block_idx
 
         logger.debug(
             "[PegaKVConnector] req=%s save_intent: start=%d hash_start=%d "
@@ -627,9 +699,25 @@ class SchedulerConnector:
         )
 
         return SaveIntent(
-            block_ids=tuple(save_block_ids),
+            block_ids_by_group=save_block_ids_by_group,
             block_hashes=save_hashes,
         )
+
+    def _copy_block_ids_by_group(self, block_ids) -> tuple[tuple[int, ...], ...]:
+        groups = tuple(tuple(group) for group in block_ids)
+        if len(groups) != self._cache_groups.group_count:
+            raise RuntimeError(
+                "KV cache group count mismatch: "
+                f"expected={self._cache_groups.group_count} actual={len(groups)}"
+            )
+        lengths = {len(group) for group in groups}
+        if len(lengths) > 1:
+            raise RuntimeError(
+                f"PegaFlow HMA requires aligned block counts across groups: {sorted(lengths)}"
+            )
+        if any(block_id < 0 for group in groups for block_id in group):
+            raise RuntimeError("KV cache block IDs must be non-negative")
+        return groups
 
     def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
         for req_id in connector_output.finished_sending or []:
@@ -644,7 +732,7 @@ class SchedulerConnector:
     def request_finished(
         self,
         request: "Request",
-        block_ids: list[int],  # noqa: ARG002 - required by vLLM interface
+        block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict | None]:
         req_id = request.request_id
 
@@ -671,6 +759,7 @@ class SchedulerConnector:
         self._allocated_blocks.pop(req_id, None)
         self._scheduled_tokens.pop(req_id, None)
         self._next_stored_block_idx.pop(req_id, None)
+        self._unsafe_recurrent_saves.discard(req_id)
         self._pending_saves.discard(req_id)
         self._tail_saved.discard(req_id)
 

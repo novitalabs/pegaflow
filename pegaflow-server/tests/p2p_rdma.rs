@@ -513,8 +513,8 @@ async fn p2p_rdma_remote_fetch_roundtrip() {
             0,
             DEVICE_ID,
             &shm_name,
-            &[LAYER],
-            &[(lease, block_ids.clone())],
+            &[vec![LAYER]],
+            &[(lease, vec![block_ids.iter().copied().map(Some).collect()])],
         )
         .expect("batch_load on engine B");
 

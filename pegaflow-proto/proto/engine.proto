@@ -75,13 +75,27 @@ message LoadRequest {
   uint32 tp_rank = 2;
   int32 device_id = 3;
   string load_state_shm = 4;
-  repeated string layer_names = 5;
+  repeated LoadGroup groups = 5;
   repeated LeaseLoad loads = 6;
+}
+
+message LoadGroup {
+  repeated string layer_names = 1;
+}
+
+message LoadBlockIds {
+  repeated LoadBlockTarget targets = 1;
+}
+
+message LoadBlockTarget {
+  // Absent for cache groups that have no physical destination for this
+  // logical block (for example historical recurrent-state blocks in HMA).
+  optional uint32 block_id = 1;
 }
 
 message LeaseLoad {
   bytes lease = 1;
-  repeated uint32 block_ids = 2;
+  repeated LoadBlockIds block_ids_by_group = 2;
 }
 
 message LoadResponse {

@@ -12,6 +12,7 @@ import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorRole,
+    SupportsHMA,
 )
 from vllm.distributed.parallel_state import get_pp_group, get_tensor_model_parallel_rank
 
@@ -33,7 +34,7 @@ from pegaflow.connector.worker import WorkerConnector
 from pegaflow.pegaflow import EngineRpcClient
 
 
-class PegaKVConnector(KVConnectorBase_V1):
+class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
     """v1 KV connector for PegaFlow with separated scheduler/worker logic."""
 
     def __init__(self, vllm_config, role: KVConnectorRole, kv_cache_config=None):
@@ -143,7 +144,8 @@ class PegaKVConnector(KVConnectorBase_V1):
         # is silently ignored upstream and falls back to per-layer — surface
         # that instead of pretending the request was honored.
         env_cross_layer = os.environ.get("PEGAFLOW_CROSS_LAYER_BLOCKS", "1") == "1"
-        self._prefer_cross_layer = env_cross_layer and not is_mla
+        cache_groups = tuple(getattr(kv_cache_config, "kv_cache_groups", ()) or ())
+        self._prefer_cross_layer = env_cross_layer and not is_mla and len(cache_groups) <= 1
         if is_mla and env_cross_layer:
             logger.warning(
                 "[PegaKVConnector] PEGAFLOW_CROSS_LAYER_BLOCKS=1 is ignored for MLA "
@@ -165,6 +167,7 @@ class PegaKVConnector(KVConnectorBase_V1):
                 pd_tail_save=pd_tail_save,
                 pd_tail_load=pd_tail_load,
                 vllm_config=vllm_config,
+                kv_cache_config=kv_cache_config,
             )
             # Open the liveness stream from the scheduler process only. One
             # stream per vllm replica is enough — if any tp worker crashes,
@@ -265,10 +268,23 @@ class PegaKVConnector(KVConnectorBase_V1):
         if self._scheduler:
             self._scheduler.update_connector_output(connector_output)
 
+    def bind_gpu_block_pool(self, gpu_block_pool) -> None:
+        if self._scheduler:
+            self._scheduler.bind_gpu_block_pool(gpu_block_pool)
+
     def request_finished(
         self,
         request,
         block_ids: list[int],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        if self._scheduler:
+            return self._scheduler.request_finished(request, (block_ids,))
+        return (False, None)
+
+    def request_finished_all_groups(
+        self,
+        request,
+        block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
         if self._scheduler:
             return self._scheduler.request_finished(request, block_ids)
@@ -366,17 +382,22 @@ class PegaKVConnector(KVConnectorBase_V1):
             self._state_manager.shutdown()
 
 
-class NoopKVConnector(KVConnectorBase_V1):
+class NoopKVConnector(KVConnectorBase_V1, SupportsHMA):
     """Connector-path baseline for tests."""
 
     def __init__(self, vllm_config, role: KVConnectorRole, kv_cache_config=None):
         super().__init__(vllm_config, role, kv_cache_config)
         self._is_mla = detect_mla(vllm_config)
+        self._cache_group_count = len(tuple(getattr(kv_cache_config, "kv_cache_groups", ()) or ()))
 
     @property
     def prefer_cross_layer_blocks(self) -> bool:
         # MLA cannot use cross-layer KV (no num-layers stride); be honest.
-        return not self._is_mla and os.environ.get("PEGAFLOW_CROSS_LAYER_BLOCKS", "1") == "1"
+        return (
+            not self._is_mla
+            and self._cache_group_count <= 1
+            and os.environ.get("PEGAFLOW_CROSS_LAYER_BLOCKS", "1") == "1"
+        )
 
     def start_load_kv(self, forward_context, **kwargs: Any) -> None:
         return
@@ -404,6 +425,13 @@ class NoopKVConnector(KVConnectorBase_V1):
 
     def build_connector_meta(self, scheduler_output) -> PegaConnectorMetadata:
         return PegaConnectorMetadata()
+
+    def request_finished_all_groups(
+        self,
+        request,
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        return (False, None)
 
 
 def _resolve_device_id() -> int:

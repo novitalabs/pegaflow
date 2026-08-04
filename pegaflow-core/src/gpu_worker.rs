@@ -354,7 +354,7 @@ fn build_copy_descs(layers: &[LayerTransferData]) -> Result<(Vec<CopyDesc>, usiz
     let mut copies: Vec<CopyDesc> = Vec::new();
     let mut total_bytes = 0usize;
 
-    for layer in layers {
+    for (layer_index, layer) in layers.iter().enumerate() {
         let layer_name = &layer.layer_name;
 
         for block in &layer.blocks {
@@ -383,12 +383,18 @@ fn build_copy_descs(layers: &[LayerTransferData]) -> Result<(Vec<CopyDesc>, usiz
                         host: k_ptr.host().as_ptr(),
                         host_device: k_ptr.device().as_ptr() as u64,
                         size: k.bytes,
+                        device_allocation: layer_index,
+                        host_allocation: raw.segment_allocation_id(0).unwrap(),
                     });
                     copies.push(CopyDesc {
                         device: v.addr,
                         host: v_ptr.host().as_ptr(),
                         host_device: v_ptr.device().as_ptr() as u64,
                         size: v.bytes,
+                        device_allocation: layer_index,
+                        host_allocation: raw
+                            .segment_allocation_id(1)
+                            .unwrap_or_else(|| raw.segment_allocation_id(0).unwrap()),
                     });
                     total_bytes += k.bytes + v.bytes;
                 }
@@ -404,6 +410,8 @@ fn build_copy_descs(layers: &[LayerTransferData]) -> Result<(Vec<CopyDesc>, usiz
                         host: ptr.host().as_ptr(),
                         host_device: ptr.device().as_ptr() as u64,
                         size: c.bytes,
+                        device_allocation: layer_index,
+                        host_allocation: block.block.raw().segment_allocation_id(0).unwrap(),
                     });
                     total_bytes += c.bytes;
                 }

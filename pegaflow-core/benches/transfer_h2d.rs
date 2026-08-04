@@ -291,6 +291,8 @@ fn copy_desc(device: u64, host: &MappedHost, device_offset: usize, host_offset: 
         host: unsafe { host.host.add(host_offset) },
         host_device: host.device + host_offset as u64,
         size: SEG,
+        device_allocation: 0,
+        host_allocation: 0,
     }
 }
 
