@@ -45,6 +45,7 @@ class FakeEngineClient:
         self.register_response: tuple[bool, str] = (True, "ok")
         self.register_exception: Exception | None = None
         self.register_calls: list[tuple] = []
+        self.unregister_calls: list[str] = []
         self.release_calls: list[bytes] = []
 
     def load(
@@ -83,6 +84,7 @@ class FakeEngineClient:
         return (True, "ok")
 
     def unregister_context(self, instance_id: str) -> tuple[bool, str]:
+        self.unregister_calls.append(instance_id)
         return (True, "ok")
 
     def release(self, lease: bytes) -> None:
@@ -222,13 +224,13 @@ def test_hma_load_rpc_failure_crashes_before_vllm_partial_recovery(failure_mode:
     worker.shutdown()
 
 
-def test_hma_load_sends_absent_target_for_historical_recurrent_state():
+def test_hma_load_distinguishes_block_zero_from_absent_recurrent_target():
     worker, client, _state_mgr = _make_worker()
     _configure_hma_worker(worker)
     metadata = PegaConnectorMetadata(
         load_intents={
             "hma-sparse": LoadIntent(
-                block_ids_by_group=((11, 12), (0, 21)),
+                block_ids_by_group=((0, 12), (None, 21)),
                 lease=b"lease-hma-sparse",
                 num_tokens=32,
             )
@@ -237,7 +239,7 @@ def test_hma_load_sends_absent_target_for_historical_recurrent_state():
 
     worker.start_load_kv(metadata, _stub_forward_context())
 
-    assert client.load_calls[0][5] == [11, 12, None, 21]
+    assert client.load_calls[0][5] == [0, 12, None, 21]
     worker.shutdown()
 
 
@@ -376,8 +378,10 @@ def test_register_version_mismatch_raises_startup_error(monkeypatch):
     assert "server=0.22.5" in str(exc_info.value)
     assert "for layer.0" not in str(exc_info.value)
     assert len(client.register_calls) == 1
+    assert client.unregister_calls == []
 
     worker.shutdown()
+    assert client.unregister_calls == []
 
 
 def test_register_non_version_failure_reports_batch_layers(monkeypatch):

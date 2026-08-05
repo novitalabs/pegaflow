@@ -4,7 +4,7 @@ use pegaflow_proto::proto::engine::{
     HealthRequest, LeaseLoad, LoadBlockIds, LoadBlockTarget, LoadGroup, LoadRequest, QueryRequest,
     RegisterContextRequest, ReleaseRequest, ResponseStatus, SaveLayer, SaveRequest, SessionEvent,
     SessionRequest, ShutdownRequest, TransferMode, UnregisterRequest, engine_client::EngineClient,
-    query_response,
+    load_block_target, query_response,
 };
 use pyo3::{
     create_exception,
@@ -417,7 +417,9 @@ impl EngineRpcClient {
                     .map(|targets| LoadBlockIds {
                         targets: targets
                             .into_iter()
-                            .map(|block_id| LoadBlockTarget { block_id })
+                            .map(|block_id| LoadBlockTarget {
+                                target: block_id.map(load_block_target::Target::BlockId),
+                            })
                             .collect(),
                     })
                     .collect(),

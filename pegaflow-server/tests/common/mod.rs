@@ -12,7 +12,7 @@ use pegaflow_server::proto::engine::engine_server::EngineServer;
 use pegaflow_server::proto::engine::{
     LeaseLoad, LoadBlockIds, LoadBlockTarget, LoadGroup, LoadRequest, LoadResponse, QueryRequest,
     QueryResponse, ReleaseRequest, ReleaseResponse, SaveLayer, SaveRequest, SaveResponse,
-    SessionEvent, SessionRequest,
+    SessionEvent, SessionRequest, load_block_target,
 };
 use pegaflow_server::{CudaTensorRegistry, GrpcEngineService, RegistryHandle};
 use tokio::sync::Notify;
@@ -382,7 +382,7 @@ impl MockVllmRpcHarness {
                 block_ids_by_group: vec![LoadBlockIds {
                     targets: (0..block_count as u32)
                         .map(|block_id| LoadBlockTarget {
-                            block_id: Some(block_id),
+                            target: Some(load_block_target::Target::BlockId(block_id)),
                         })
                         .collect(),
                 }],

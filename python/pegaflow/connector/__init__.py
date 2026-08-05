@@ -44,13 +44,15 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
         tp_size = vllm_config.parallel_config.tensor_parallel_size
         world_size = vllm_config.parallel_config.world_size
         is_mla = detect_mla(vllm_config)
+        cache_groups = tuple(getattr(kv_cache_config, "kv_cache_groups", ()) or ())
+        collapse_mla_tp = is_mla and len(cache_groups) <= 1
         dcp_world_size = (
             getattr(vllm_config.parallel_config, "decode_context_parallel_size", 1) or 1
         )
         pcp_world_size = (
             getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1) or 1
         )
-        effective_tp_size = max(1, dcp_world_size) if is_mla else tp_size
+        effective_tp_size = max(1, dcp_world_size) if collapse_mla_tp else tp_size
 
         if dcp_world_size > 1 and not is_mla:
             logger.warning(
@@ -129,6 +131,7 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
             engine_client=engine_client,
             state_manager=self._state_manager,
             is_mla=is_mla,
+            collapse_mla_tp=collapse_mla_tp,
             transfer_backend=transfer_backend,
             dcp_world_size=dcp_world_size,
             pcp_world_size=pcp_world_size,
@@ -144,7 +147,6 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
         # is silently ignored upstream and falls back to per-layer — surface
         # that instead of pretending the request was honored.
         env_cross_layer = os.environ.get("PEGAFLOW_CROSS_LAYER_BLOCKS", "1") == "1"
-        cache_groups = tuple(getattr(kv_cache_config, "kv_cache_groups", ()) or ())
         self._prefer_cross_layer = env_cross_layer and not is_mla and len(cache_groups) <= 1
         if is_mla and env_cross_layer:
             logger.warning(
@@ -184,7 +186,8 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
         logger.debug(
             "[PegaKVConnector] Initialized role=%s instance_id=%s device=%s "
             "tp_rank=%s tp_size=%d pp_rank=%d pp_size=%d world_size=%d namespace=%s "
-            "is_mla=%s transfer_backend=%s dcp_world_size=%d pcp_world_size=%d dcp_rank=%d "
+            "is_mla=%s collapse_mla_tp=%s transfer_backend=%s dcp_world_size=%d "
+            "pcp_world_size=%d dcp_rank=%d "
             "mode=%s wait_for_full_prefix=%s",
             role.name,
             instance_id,
@@ -196,6 +199,7 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
             world_size,
             namespace,
             is_mla,
+            collapse_mla_tp,
             transfer_backend,
             dcp_world_size,
             pcp_world_size,

@@ -64,11 +64,17 @@ def _make_recurrent_scheduler() -> SchedulerConnector:
         group_count=2,
         hash_group_index=0,
         has_recurrent_state=True,
+        recurrent_group_indices=frozenset({1}),
     )
     scheduler._block_hashes["r1"] = (_hash(0), _hash(1))
     scheduler._allocated_blocks["r1"] = [[11, 12], [21, 22]]
     scheduler._block_index_offsets["r1"] = 0
     scheduler._next_stored_block_idx["r1"] = 0
+    blocks = {
+        _hash(0): [SimpleNamespace(block_id=11), SimpleNamespace(block_id=21)],
+        _hash(1): [SimpleNamespace(block_id=12), SimpleNamespace(block_id=22)],
+    }
+    scheduler._get_local_cached_blocks = lambda block_hash, _group_ids: blocks.get(block_hash)
     return scheduler
 
 
@@ -77,6 +83,7 @@ def test_cache_group_layout_accepts_structurally_compatible_mixed_specs():
     attention.block_size = 528
     recurrent = MambaSpec()
     recurrent.block_size = 528
+    recurrent.mamba_cache_mode = "align"
     config = SimpleNamespace(
         kv_cache_groups=(
             SimpleNamespace(layer_names=("attention",), kv_cache_spec=attention),
@@ -89,6 +96,8 @@ def test_cache_group_layout_accepts_structurally_compatible_mixed_specs():
     assert layout.layer_names == (("attention",), ("recurrent",))
     assert layout.hash_group_index == 0
     assert layout.has_recurrent_state
+    assert layout.recurrent_group_indices == frozenset({1})
+    assert layout.recurrent_layer_names == frozenset({"recurrent"})
 
 
 def test_cache_group_layout_rejects_misaligned_logical_block_sizes():
@@ -110,6 +119,7 @@ def test_cache_group_layout_rejects_misaligned_logical_block_sizes():
 def test_cache_group_layout_rejects_missing_dense_hash_group():
     recurrent = MambaSpec()
     recurrent.block_size = 528
+    recurrent.mamba_cache_mode = "align"
     config = SimpleNamespace(
         kv_cache_groups=(
             SimpleNamespace(layer_names=("recurrent.0",), kv_cache_spec=recurrent),
@@ -121,13 +131,43 @@ def test_cache_group_layout_rejects_missing_dense_hash_group():
         CacheGroupLayout.from_config(config)
 
 
-def test_recurrent_save_accepts_one_exact_state_boundary_per_step():
+def test_cache_group_layout_rejects_sparse_attention_group():
+    attention = FullAttentionSpec()
+    attention.block_size = 16
+    sparse_attention = SimpleNamespace(block_size=16)
+    config = SimpleNamespace(
+        kv_cache_groups=(
+            SimpleNamespace(layer_names=("attention",), kv_cache_spec=attention),
+            SimpleNamespace(layer_names=("sliding_window",), kv_cache_spec=sparse_attention),
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="only FullAttention and Mamba"):
+        CacheGroupLayout.from_config(config)
+
+
+def test_cache_group_layout_rejects_non_align_mamba_mode():
+    attention = FullAttentionSpec()
+    attention.block_size = 16
+    recurrent = MambaSpec()
+    recurrent.block_size = 16
+    recurrent.mamba_cache_mode = "all"
+    config = SimpleNamespace(
+        kv_cache_groups=(
+            SimpleNamespace(layer_names=("attention",), kv_cache_spec=attention),
+            SimpleNamespace(layer_names=("recurrent",), kv_cache_spec=recurrent),
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="mamba_cache_mode='align'"):
+        CacheGroupLayout.from_config(config)
+
+
+def test_recurrent_save_uses_committed_local_hma_mapping():
     scheduler = _make_recurrent_scheduler()
 
-    scheduler._scheduled_tokens["r1"] = 16
-    first = scheduler._consume_full_block_saves("r1", written=16)
-    scheduler._scheduled_tokens["r1"] = 32
-    second = scheduler._consume_full_block_saves("r1", written=32)
+    first = scheduler._consume_full_block_saves("r1", written=23, computed_before_step=16)
+    second = scheduler._consume_full_block_saves("r1", written=39, computed_before_step=32)
 
     assert first == SaveIntent(
         block_ids_by_group=((11,), (21,)),
@@ -139,21 +179,29 @@ def test_recurrent_save_accepts_one_exact_state_boundary_per_step():
     )
 
 
-def test_recurrent_save_disables_request_after_skipping_a_state_boundary():
+def test_recurrent_save_waits_until_vllm_commits_all_groups():
     scheduler = _make_recurrent_scheduler()
-    scheduler._scheduled_tokens["r1"] = 32
+    scheduler._get_local_cached_blocks = lambda _block_hash, _group_ids: None
 
-    assert scheduler._consume_full_block_saves("r1", written=32) is None
-    assert "r1" in scheduler._unsafe_recurrent_saves
+    assert scheduler._consume_full_block_saves("r1", written=23, computed_before_step=16) is None
+    assert scheduler._next_stored_block_idx["r1"] == 0
+
+
+def test_recurrent_save_does_not_predict_current_step_state():
+    scheduler = _make_recurrent_scheduler()
+
+    assert scheduler._consume_full_block_saves("r1", written=16, computed_before_step=0) is None
     assert scheduler._next_stored_block_idx["r1"] == 0
 
 
 def test_recurrent_save_preserves_vllm_null_block_for_worker_filtering():
     scheduler = _make_recurrent_scheduler()
-    scheduler._allocated_blocks["r1"][1][0] = 0
-    scheduler._scheduled_tokens["r1"] = 16
+    scheduler._get_local_cached_blocks = lambda _block_hash, _group_ids: [
+        SimpleNamespace(block_id=11),
+        SimpleNamespace(block_id=0),
+    ]
 
-    intent = scheduler._consume_full_block_saves("r1", written=16)
+    intent = scheduler._consume_full_block_saves("r1", written=23, computed_before_step=16)
 
     assert intent == SaveIntent(
         block_ids_by_group=((11,), (0,)),
@@ -169,17 +217,25 @@ def test_hma_binding_disables_local_prefix_lookup_before_scheduling():
     assert block_pool.get_cached_block(b"hash", [0, 1]) is None
 
 
-def test_non_recurrent_hma_accepts_sparse_sliding_window_targets():
-    scheduler = SchedulerConnector(_make_ctx())
-    scheduler._cache_groups = SimpleNamespace(
-        group_count=2,
-        hash_group_index=0,
-        has_recurrent_state=False,
+def test_hma_accepts_different_allocator_block_counts():
+    scheduler = _make_recurrent_scheduler()
+
+    assert scheduler._copy_block_ids_by_group([[11, 12], [21, 22, 23, 24, 25, 26, 27, 28]]) == (
+        (11, 12),
+        (21, 22, 23, 24, 25, 26, 27, 28),
     )
 
-    assert scheduler._copy_block_ids_by_group([[11, 12], [0, 21]]) == (
-        (11, 12),
-        (0, 21),
+
+def test_hma_loads_only_final_recurrent_state():
+    scheduler = _make_recurrent_scheduler()
+    groups = (
+        (11, 12, 13, 14),
+        (21, 22, 23, 24, 25, 26, 27, 28, 29, 30),
+    )
+
+    assert scheduler._load_block_ids_by_group(groups, 1, 2) == (
+        (12, 13),
+        (None, 23),
     )
 
 
@@ -237,6 +293,13 @@ def test_virtual_block_size_cases(case: str, kwargs: dict, expected: int):
             1,
             2,
             id="mla_with_dcp_uses_dcp",
+        ),
+        pytest.param(
+            "hybrid_mla_keeps_tp",
+            {"is_mla": True, "collapse_mla_tp": False, "tp_rank": 3, "tp_size": 4},
+            3,
+            4,
+            id="hybrid_mla_keeps_tp",
         ),
     ],
 )
@@ -312,6 +375,31 @@ def test_use_page_first_detection(case: str, kwargs: dict, additional_config: di
     )
     try:
         assert worker._use_page_first() is expected, case
+    finally:
+        worker.shutdown()
+
+
+def test_hma_disables_page_first_registration():
+    from pegaflow.connector.worker import WorkerConnector
+
+    attention = FullAttentionSpec()
+    attention.block_size = 16
+    recurrent = MambaSpec()
+    recurrent.block_size = 16
+    recurrent.mamba_cache_mode = "align"
+    kv_cache_config = SimpleNamespace(
+        kv_cache_groups=(
+            SimpleNamespace(layer_names=("attention",), kv_cache_spec=attention),
+            SimpleNamespace(layer_names=("recurrent",), kv_cache_spec=recurrent),
+        )
+    )
+    worker = WorkerConnector(
+        _make_ctx(is_mla=True),
+        vllm_config=SimpleNamespace(additional_config={}),
+        kv_cache_config=kv_cache_config,
+    )
+    try:
+        assert not worker._use_page_first()
     finally:
         worker.shutdown()
 
@@ -795,7 +883,7 @@ class TestSchedulerQueryProbeReuse:
 
         assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (32, True)
 
-        with pytest.raises(RuntimeError, match="load block mismatch"):
+        with pytest.raises(RuntimeError, match="leased block mismatch"):
             sc.update_state_after_alloc(req, blocks, num_external_tokens=16)
 
         engine_client.release.assert_called_once_with(b"lease-1")

@@ -66,6 +66,7 @@ def _infer_kv_cache_registration(
     logical_block_size: int,
     *,
     is_mla: bool = False,
+    is_recurrent_state: bool = False,
 ) -> _KVCacheRegistrationInfo:
     """Infer the PegaFlow registration from a vLLM KV cache tensor.
 
@@ -83,8 +84,8 @@ def _infer_kv_cache_registration(
     if logical_block_size <= 0:
         raise ValueError(f"logical block size must be > 0, got {logical_block_size}")
 
-    if not is_mla:
-        if len(shape) >= 2 and shape[0] == 2:
+    if is_recurrent_state or not is_mla:
+        if not is_recurrent_state and len(shape) >= 2 and shape[0] == 2:
             layout = "KV-first"
             num_blocks = shape[1]
             bytes_per_block = stride[1] * element_size
@@ -295,7 +296,6 @@ class WorkerConnector:
         if not kv_caches:
             raise RuntimeError("No KV cache layers were selected for registration")
 
-        self._registered_layers = list(kv_caches.keys())
         self._page_first = self._use_page_first()
         first_tensor = _registration_tensor(next(iter(kv_caches.values())))
         self._torch_device = first_tensor.device
@@ -320,6 +320,10 @@ class WorkerConnector:
         split_logical_blocks = 0
 
         for layer_name, kv_cache in kv_caches.items():
+            is_recurrent_state = (
+                layer_name in self._cache_groups.recurrent_layer_names
+                or isinstance(kv_cache, (tuple, list))
+            )
             registration_tensor = _registration_tensor(kv_cache)
             assert registration_tensor.storage_offset() == 0, (
                 f"KV cache for {layer_name} must have zero storage offset"
@@ -332,6 +336,7 @@ class WorkerConnector:
                 registration_tensor,
                 self._ctx.block_size,
                 is_mla=self._ctx.is_mla,
+                is_recurrent_state=is_recurrent_state,
             )
             layout = registration.layout
 
@@ -377,6 +382,8 @@ class WorkerConnector:
             if "PegaFlow version mismatch" in message:
                 raise RuntimeError(f"Register context failed: {message}")
             raise RuntimeError(f"Register context batch failed for layers {layer_names}: {message}")
+
+        self._registered_layers = layer_names
 
         if split_layer_count:
             logger.info(
@@ -551,12 +558,9 @@ class WorkerConnector:
         request_ids: list[str] = []
 
         for req_id, load_intent in metadata.load_intents.items():
-            block_ids_by_group = [
-                [None if block_id == 0 else block_id for block_id in group]
-                for group in load_intent.block_ids_by_group
-            ]
-            for block_ids in load_intent.block_ids_by_group:
-                all_block_ids.extend(block_id for block_id in block_ids if block_id != 0)
+            block_ids_by_group = [list(group) for group in load_intent.block_ids_by_group]
+            for block_ids in block_ids_by_group:
+                all_block_ids.extend(block_id for block_id in block_ids if block_id is not None)
             loads.append((load_intent.lease, block_ids_by_group))
             request_ids.append(req_id)
 
@@ -903,26 +907,17 @@ class WorkerConnector:
     def _use_page_first(self) -> bool:
         """Whether this instance stores blocks page-first.
 
-        Page-first packs each block's layers into contiguous host pages — one
-        slot per *shard* (the set of layers one worker holds) instead of one
-        slot per layer — cutting per-block metadata by ~num_layers / num_shards.
-        Two MLA shapes qualify:
-
-        * full-replica (every rank holds all layers): one shard, so a block's
-          whole page is a single slot and ranks block-stripe the writes.
-        * layer-split (each rank holds a disjoint subset): one shard per rank,
-          and each rank writes its own sub-page as a slot.
-
-        Pipeline parallelism is excluded: with pp_size > 1 each stage holds only
-        some layers, but the engine seals one topology spanning the union of all
-        stages, so the layers a single worker holds are not one of the sealed
-        shards. The first save would seal a partial page and the other stages'
-        same-hash saves dedup instead of repairing it. Page-first requires that
-        one worker can write each shard's entire page. DCP is excluded because a
-        DCP rank stores a different token slice of every layer, not a layer
-        partition.
+        Page-first requires one worker to write every layer in its page shard.
+        PP workers hold only part of a sealed shard, DCP workers hold different
+        token slices, and HMA groups can save different block sets, so none can
+        safely use one common block set across every layer in a page.
         """
-        return self._ctx.is_mla and self._ctx.dcp_world_size == 1 and self._ctx.pp_size == 1
+        return (
+            self._ctx.is_mla
+            and self._cache_groups.group_count == 1
+            and self._ctx.dcp_world_size == 1
+            and self._ctx.pp_size == 1
+        )
 
     def _block_shard(
         self,

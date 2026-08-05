@@ -9,13 +9,17 @@ use common::{
     BLOCK_COUNT, INSTANCE_ID, LAYER_NAME, MockVllmRpcHarness, SECOND_INSTANCE_ID,
     cuda_device_count, make_block_hashes,
 };
-use pegaflow_server::proto::engine::{LoadBlockIds, QueryReady, query_response};
+use pegaflow_server::proto::engine::{LoadBlockIds, QueryReady, load_block_target, query_response};
 
 fn load_targets(block_ids: &LoadBlockIds) -> Vec<Option<u32>> {
     block_ids
         .targets
         .iter()
-        .map(|target| target.block_id)
+        .map(|target| {
+            target
+                .target
+                .map(|load_block_target::Target::BlockId(block_id)| block_id)
+        })
         .collect()
 }
 

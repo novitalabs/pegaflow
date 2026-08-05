@@ -9,7 +9,7 @@ use crate::proto::engine::{
     ReleaseRequest, ReleaseResponse, ReleaseTransferLockRequest, ReleaseTransferLockResponse,
     ResponseStatus, SaveRequest, SaveResponse, SessionEvent, SessionRequest, ShutdownRequest,
     ShutdownResponse, TransferBlockInfo, TransferMode as ProtoTransferMode, TransferSlotInfo,
-    UnregisterRequest, UnregisterResponse, query_response,
+    UnregisterRequest, UnregisterResponse, load_block_target, query_response,
 };
 use crate::registry::RegistryHandle;
 use crate::session::SessionRegistry;
@@ -485,7 +485,11 @@ impl Engine for GrpcEngineService {
                             block_ids
                                 .targets
                                 .into_iter()
-                                .map(|target| target.block_id.map(|id| id as usize))
+                                .map(|target| {
+                                    target
+                                        .target
+                                        .map(|load_block_target::Target::BlockId(id)| id as usize)
+                                })
                                 .collect()
                         })
                         .collect();

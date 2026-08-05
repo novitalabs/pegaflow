@@ -54,6 +54,7 @@ class ConnectorContext:
     engine_client: EngineRpcClient
     state_manager: "ServiceStateManager"
     is_mla: bool = False
+    collapse_mla_tp: bool = True
     transfer_backend: str = "direct"
     dcp_world_size: int = 1
     pcp_world_size: int = 1
@@ -83,9 +84,10 @@ class ConnectorContext:
 
         - MLA without DCP: 0 (data identical across TP ranks).
         - MLA with DCP: dcp_rank (each DCP rank stores different interleaved tokens).
+        - Hybrid MLA: tp_rank (non-MLA cache groups differ across TP ranks).
         - Non-MLA: tp_rank (each TP rank has different KV heads, already unique).
         """
-        if self.is_mla:
+        if self.is_mla and self.collapse_mla_tp:
             return self.dcp_rank
         return self.tp_rank or 0
 
@@ -95,9 +97,10 @@ class ConnectorContext:
 
         - MLA without DCP: 1.
         - MLA with DCP: dcp_world_size.
+        - Hybrid MLA: tp_size.
         - Non-MLA: tp_size (unique per TP rank regardless of DCP).
         """
-        if self.is_mla:
+        if self.is_mla and self.collapse_mla_tp:
             return max(1, self.dcp_world_size)
         return self.tp_size
 
@@ -106,7 +109,7 @@ class ConnectorContext:
 class LoadIntent:
     """Intent for a KV load operation."""
 
-    block_ids_by_group: tuple[tuple[int, ...], ...]
+    block_ids_by_group: tuple[tuple[int | None, ...], ...]
     lease: bytes
     num_tokens: int
 
@@ -126,14 +129,33 @@ class CacheGroupLayout:
     layer_names: tuple[tuple[str, ...], ...]
     hash_group_index: int
     has_recurrent_state: bool
+    recurrent_group_indices: frozenset[int]
+    recurrent_layer_names: frozenset[str]
 
     @classmethod
     def from_config(cls, kv_cache_config) -> "CacheGroupLayout":
         groups = tuple(getattr(kv_cache_config, "kv_cache_groups", ()) or ())
         if not groups:
-            return cls(layer_names=((),), hash_group_index=0, has_recurrent_state=False)
+            return cls(
+                layer_names=((),),
+                hash_group_index=0,
+                has_recurrent_state=False,
+                recurrent_group_indices=frozenset(),
+                recurrent_layer_names=frozenset(),
+            )
 
         from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+
+        if len(groups) > 1 and any(
+            not isinstance(group.kv_cache_spec, (FullAttentionSpec, MambaSpec)) for group in groups
+        ):
+            raise RuntimeError("PegaFlow HMA supports only FullAttention and Mamba cache groups")
+        if len(groups) > 1 and any(
+            isinstance(group.kv_cache_spec, MambaSpec)
+            and group.kv_cache_spec.mamba_cache_mode != "align"
+            for group in groups
+        ):
+            raise RuntimeError("PegaFlow HMA requires mamba_cache_mode='align'")
 
         block_sizes = {group.kv_cache_spec.block_size for group in groups}
         if len(groups) > 1 and len(block_sizes) != 1:
@@ -159,6 +181,17 @@ class CacheGroupLayout:
             layer_names=tuple(tuple(group.layer_names) for group in groups),
             hash_group_index=hash_group_index,
             has_recurrent_state=any(isinstance(group.kv_cache_spec, MambaSpec) for group in groups),
+            recurrent_group_indices=frozenset(
+                index
+                for index, group in enumerate(groups)
+                if isinstance(group.kv_cache_spec, MambaSpec)
+            ),
+            recurrent_layer_names=frozenset(
+                layer_name
+                for group in groups
+                if isinstance(group.kv_cache_spec, MambaSpec)
+                for layer_name in group.layer_names
+            ),
         )
 
     @property

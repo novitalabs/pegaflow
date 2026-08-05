@@ -90,7 +90,9 @@ message LoadBlockIds {
 message LoadBlockTarget {
   // Absent for cache groups that have no physical destination for this
   // logical block (for example historical recurrent-state blocks in HMA).
-  optional uint32 block_id = 1;
+  oneof target {
+    uint32 block_id = 1;
+  }
 }
 
 message LeaseLoad {
