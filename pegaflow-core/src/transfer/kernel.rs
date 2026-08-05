@@ -47,6 +47,13 @@ extern "C" __global__ void pega_batch_copy(const unsigned long long* __restrict_
 
 const BLOCK_DIM: u32 = 256;
 const MAX_GRID: u32 = 65535;
+/// Upper bound on bytes moved per kernel launch. A single launch covering a
+/// whole multi-GB restore parks one CTA per fragment across every SM for
+/// hundreds of ms; CUDA never preempts running CTAs, so co-resident decode
+/// kernels starve for the full duration — and on an EP fleet one starved rank
+/// stalls every peer's dispatch. Chunked launches bound that monopoly window
+/// to ~10-20ms; queued kernels from other streams interleave between chunks.
+const CHUNK_BYTES: usize = 64 << 20;
 
 /// Single-launch transfer backend. Compiled once per worker; the descriptor
 /// scratch buffer is reused across calls.
@@ -75,8 +82,49 @@ impl KernelBackend {
     }
 
     /// Enqueue the batch. `host_is_src` selects the direction: H2D reads the
-    /// host address and writes the device address, D2H is reversed.
+    /// host address and writes the device address, D2H is reversed. Split into
+    /// `CHUNK_BYTES` launches; same-stream ordering makes the scratch reuse
+    /// across chunks safe (chunk k+1's descriptor upload queues behind chunk
+    /// k's kernel).
     fn submit(
+        &self,
+        copies: &[CopyDesc],
+        host_is_src: bool,
+        stream: &Arc<CudaStream>,
+    ) -> Result<(), String> {
+        let mut chunks = Vec::new();
+        let mut start = 0;
+        while start < copies.len() {
+            let mut end = start;
+            let mut bytes = 0usize;
+            while end < copies.len() && (end == start || bytes + copies[end].size <= CHUNK_BYTES) {
+                bytes += copies[end].size;
+                end += 1;
+            }
+            chunks.push((start, end));
+            start = end;
+        }
+        // Grow the scratch to the largest chunk BEFORE the first launch: a
+        // grow mid-loop would free the buffer the in-flight chunk still reads.
+        // (Between submit calls the worker has synchronized, so this free is
+        // safe.)
+        if let Some(max_descs) = chunks.iter().map(|(s, e)| (e - s) * 3).max() {
+            let mut guard = self.scratch.borrow_mut();
+            if guard.as_ref().is_none_or(|s| s.len() < max_descs) {
+                *guard = Some(
+                    stream
+                        .alloc_zeros::<u64>(max_descs)
+                        .map_err(|e| format!("scratch alloc failed: {e:?}"))?,
+                );
+            }
+        }
+        for (s, e) in chunks {
+            self.submit_chunk(&copies[s..e], host_is_src, stream)?;
+        }
+        Ok(())
+    }
+
+    fn submit_chunk(
         &self,
         copies: &[CopyDesc],
         host_is_src: bool,
