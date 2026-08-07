@@ -163,11 +163,19 @@ def _install_vllm_stubs() -> None:
     class FullAttentionSpec:
         pass
 
+    class MLAAttentionSpec(FullAttentionSpec):
+        pass
+
     class MambaSpec:
         pass
 
+    class SlidingWindowSpec:
+        pass
+
     kv_cache_interface.FullAttentionSpec = FullAttentionSpec
+    kv_cache_interface.MLAAttentionSpec = MLAAttentionSpec
     kv_cache_interface.MambaSpec = MambaSpec
+    kv_cache_interface.SlidingWindowSpec = SlidingWindowSpec
     _ensure_module("vllm.v1.metrics")
     _ensure_module("vllm.v1.metrics.utils").create_metric_per_engine = lambda *_args, **_kwargs: {}
 

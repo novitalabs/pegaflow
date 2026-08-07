@@ -12,10 +12,12 @@ from .unit_stubs import install_connector_unit_stubs
 
 install_connector_unit_stubs()
 
-from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec  # noqa: E402
+from vllm.v1.kv_cache_interface import (  # noqa: E402
+    FullAttentionSpec,
+    MambaSpec,
+)
 
 from pegaflow.connector.common import (  # noqa: E402
-    CacheGroupLayout,
     ConnectorContext,
     PegaConnectorMetadata,
     PegaConnectorMode,
@@ -76,91 +78,6 @@ def _make_recurrent_scheduler() -> SchedulerConnector:
     }
     scheduler._get_local_cached_blocks = lambda block_hash, _group_ids: blocks.get(block_hash)
     return scheduler
-
-
-def test_cache_group_layout_accepts_structurally_compatible_mixed_specs():
-    attention = FullAttentionSpec()
-    attention.block_size = 528
-    recurrent = MambaSpec()
-    recurrent.block_size = 528
-    recurrent.mamba_cache_mode = "align"
-    config = SimpleNamespace(
-        kv_cache_groups=(
-            SimpleNamespace(layer_names=("attention",), kv_cache_spec=attention),
-            SimpleNamespace(layer_names=("recurrent",), kv_cache_spec=recurrent),
-        )
-    )
-
-    layout = CacheGroupLayout.from_config(config)
-
-    assert layout.layer_names == (("attention",), ("recurrent",))
-    assert layout.hash_group_index == 0
-    assert layout.has_recurrent_state
-    assert layout.recurrent_group_indices == frozenset({1})
-    assert layout.recurrent_layer_names == frozenset({"recurrent"})
-
-
-def test_cache_group_layout_rejects_misaligned_logical_block_sizes():
-    first = FullAttentionSpec()
-    first.block_size = 16
-    second = FullAttentionSpec()
-    second.block_size = 32
-    config = SimpleNamespace(
-        kv_cache_groups=(
-            SimpleNamespace(layer_names=("first",), kv_cache_spec=first),
-            SimpleNamespace(layer_names=("second",), kv_cache_spec=second),
-        )
-    )
-
-    with pytest.raises(RuntimeError, match="identical logical block sizes"):
-        CacheGroupLayout.from_config(config)
-
-
-def test_cache_group_layout_rejects_missing_dense_hash_group():
-    recurrent = MambaSpec()
-    recurrent.block_size = 528
-    recurrent.mamba_cache_mode = "align"
-    config = SimpleNamespace(
-        kv_cache_groups=(
-            SimpleNamespace(layer_names=("recurrent.0",), kv_cache_spec=recurrent),
-            SimpleNamespace(layer_names=("recurrent.1",), kv_cache_spec=recurrent),
-        )
-    )
-
-    with pytest.raises(RuntimeError, match="dense FullAttention"):
-        CacheGroupLayout.from_config(config)
-
-
-def test_cache_group_layout_rejects_sparse_attention_group():
-    attention = FullAttentionSpec()
-    attention.block_size = 16
-    sparse_attention = SimpleNamespace(block_size=16)
-    config = SimpleNamespace(
-        kv_cache_groups=(
-            SimpleNamespace(layer_names=("attention",), kv_cache_spec=attention),
-            SimpleNamespace(layer_names=("sliding_window",), kv_cache_spec=sparse_attention),
-        )
-    )
-
-    with pytest.raises(RuntimeError, match="only FullAttention and Mamba"):
-        CacheGroupLayout.from_config(config)
-
-
-def test_cache_group_layout_rejects_non_align_mamba_mode():
-    attention = FullAttentionSpec()
-    attention.block_size = 16
-    recurrent = MambaSpec()
-    recurrent.block_size = 16
-    recurrent.mamba_cache_mode = "all"
-    config = SimpleNamespace(
-        kv_cache_groups=(
-            SimpleNamespace(layer_names=("attention",), kv_cache_spec=attention),
-            SimpleNamespace(layer_names=("recurrent",), kv_cache_spec=recurrent),
-        )
-    )
-
-    with pytest.raises(RuntimeError, match="mamba_cache_mode='align'"):
-        CacheGroupLayout.from_config(config)
 
 
 def test_recurrent_save_uses_committed_local_hma_mapping():

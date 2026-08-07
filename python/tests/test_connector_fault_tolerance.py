@@ -23,6 +23,8 @@ from .unit_stubs import install_connector_unit_stubs
 
 install_connector_unit_stubs()
 
+from vllm.v1.kv_cache_interface import FullAttentionSpec  # noqa: E402
+
 from pegaflow.connector.common import (  # noqa: E402
     ConnectorContext,
     LoadIntent,
@@ -132,6 +134,12 @@ def _stub_forward_context() -> MagicMock:
     ctx = MagicMock()
     ctx.no_compile_layers = {}
     return ctx
+
+
+def _single_attention_cache_group(*layer_names: str) -> MagicMock:
+    spec = FullAttentionSpec()
+    spec.block_size = 16
+    return MagicMock(layer_names=layer_names, kv_cache_spec=spec)
 
 
 def _load_metadata(req_id: str, block_ids: tuple[int, ...]) -> PegaConnectorMetadata:
@@ -409,7 +417,9 @@ def test_register_non_version_failure_reports_batch_layers(monkeypatch):
 
 def test_register_kv_caches_ignores_shared_by_without_layer_split_opt_in(monkeypatch):
     kv_cache_config = MagicMock()
-    kv_cache_config.kv_cache_groups = [MagicMock(layer_names=("layer.0", "layer.1", "layer.2"))]
+    kv_cache_config.kv_cache_groups = [
+        _single_attention_cache_group("layer.0", "layer.1", "layer.2")
+    ]
     kv_cache_config.kv_cache_tensors = [
         MagicMock(shared_by=("layer.1",)),
     ]
@@ -436,7 +446,9 @@ def test_register_kv_caches_ignores_shared_by_without_layer_split_opt_in(monkeyp
 
 def test_register_kv_caches_uses_layer_split_shared_by_plan(monkeypatch):
     kv_cache_config = MagicMock()
-    kv_cache_config.kv_cache_groups = [MagicMock(layer_names=("layer.0", "layer.1", "layer.2"))]
+    kv_cache_config.kv_cache_groups = [
+        _single_attention_cache_group("layer.0", "layer.1", "layer.2")
+    ]
     kv_cache_config.kv_cache_tensors = [
         MagicMock(shared_by=("layer.1",)),
         MagicMock(shared_by=()),
@@ -467,7 +479,7 @@ def test_register_kv_caches_uses_layer_split_shared_by_plan(monkeypatch):
 
 def test_register_kv_caches_requires_shared_by_layers(monkeypatch):
     kv_cache_config = MagicMock()
-    kv_cache_config.kv_cache_groups = [MagicMock(layer_names=("layer.0", "layer.1"))]
+    kv_cache_config.kv_cache_groups = [_single_attention_cache_group("layer.0", "layer.1")]
     kv_cache_config.kv_cache_tensors = [MagicMock(shared_by=("layer.1",))]
     worker, _, _ = _make_worker(
         kv_cache_config=kv_cache_config,

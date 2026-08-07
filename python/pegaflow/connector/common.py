@@ -144,18 +144,41 @@ class CacheGroupLayout:
                 recurrent_layer_names=frozenset(),
             )
 
-        from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+        from vllm.v1.kv_cache_interface import (
+            FullAttentionSpec,
+            MambaSpec,
+            MLAAttentionSpec,
+        )
 
-        if len(groups) > 1 and any(
-            not isinstance(group.kv_cache_spec, (FullAttentionSpec, MambaSpec)) for group in groups
-        ):
-            raise RuntimeError("PegaFlow HMA supports only FullAttention and Mamba cache groups")
-        if len(groups) > 1 and any(
-            isinstance(group.kv_cache_spec, MambaSpec)
-            and group.kv_cache_spec.mamba_cache_mode != "align"
-            for group in groups
-        ):
-            raise RuntimeError("PegaFlow HMA requires mamba_cache_mode='align'")
+        specs = tuple(group.kv_cache_spec for group in groups)
+        if len(specs) == 1:
+            if type(specs[0]) not in (FullAttentionSpec, MLAAttentionSpec):
+                raise RuntimeError(
+                    "PegaFlow supports a single cache group only for FullAttention or MLA"
+                )
+        else:
+            if any(
+                type(spec) is not FullAttentionSpec and not isinstance(spec, MambaSpec)
+                for spec in specs
+            ):
+                raise RuntimeError(
+                    "PegaFlow HMA supports only FullAttention and Mamba cache groups"
+                )
+
+            has_full_attention = any(type(spec) is FullAttentionSpec for spec in specs)
+            has_mamba = any(isinstance(spec, MambaSpec) for spec in specs)
+            if not has_full_attention:
+                raise RuntimeError(
+                    "PegaFlow requires a dense FullAttention cache group for block hashes"
+                )
+            if not has_mamba:
+                raise RuntimeError(
+                    "PegaFlow HMA requires both FullAttention and Mamba cache groups"
+                )
+            if any(
+                isinstance(spec, MambaSpec) and spec.mamba_cache_mode != "align" for spec in specs
+            ):
+                raise RuntimeError("PegaFlow HMA requires mamba_cache_mode='align'")
 
         block_sizes = {group.kv_cache_spec.block_size for group in groups}
         if len(groups) > 1 and len(block_sizes) != 1:
@@ -171,11 +194,10 @@ class CacheGroupLayout:
             ),
             None,
         )
-        if hash_group_index is None and len(groups) > 1:
+        if hash_group_index is None:
             raise RuntimeError(
                 "PegaFlow requires a dense FullAttention cache group for block hashes"
             )
-        hash_group_index = hash_group_index or 0
 
         return cls(
             layer_names=tuple(tuple(group.layer_names) for group in groups),
@@ -305,6 +327,8 @@ def derive_namespace(
     - `mla_layer_split_kv_cache`: MLA layer-split registration shards each
       block's slots across ranks, a different per-block layout than the
       default full-slot registration.
+    - `is_hma_enabled`: vLLM's hybrid cache manager changes whether hybrid
+      cache layouts can share one logical block namespace.
     """
     model_config = vllm_config.model_config
     cache_config = vllm_config.cache_config
@@ -319,6 +343,7 @@ def derive_namespace(
         "head_size": model_config.get_head_size(),
         "num_hidden_layers": model_config.get_total_num_hidden_layers(),
         "cache_dtype": str(cache_config.cache_dtype),
+        "is_hma_enabled": not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager,
         "dcp_world_size": dcp_world_size,
         "pcp_world_size": pcp_world_size,
         "cross_layer_blocks": cross_layer_blocks,
