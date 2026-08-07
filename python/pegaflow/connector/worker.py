@@ -250,7 +250,7 @@ class WorkerConnector:
         if not self._registered_layers:
             return
 
-        if self._ctx.tp_rank == 0:
+        if self._ctx.local_physical_tp_rank == 0:
             ok, message = self._ctx.engine_client.unregister_context(self._ctx.instance_id)
             if not ok:
                 logger.warning("[PegaKVConnector] Unregister context failed: %s", message)
@@ -366,7 +366,7 @@ class WorkerConnector:
             self._ctx.effective_tp_rank,
             self._ctx.pp_rank,
             self._ctx.effective_tp_size,
-            self._ctx.world_size,
+            self._ctx.effective_world_size,
             self._ctx.device_id,
             layer_names,
             ipc_wrappers,
@@ -558,10 +558,15 @@ class WorkerConnector:
         request_ids: list[str] = []
 
         for req_id, load_intent in metadata.load_intents.items():
+            if len(load_intent.leases) != self._ctx.tp_shard_count:
+                raise RuntimeError(
+                    f"load intent has {len(load_intent.leases)} TP shard leases; "
+                    f"expected {self._ctx.tp_shard_count}"
+                )
             block_ids_by_group = [list(group) for group in load_intent.block_ids_by_group]
             for block_ids in block_ids_by_group:
                 all_block_ids.extend(block_id for block_id in block_ids if block_id is not None)
-            loads.append((load_intent.lease, block_ids_by_group))
+            loads.append((load_intent.leases[self._ctx.tp_shard_index], block_ids_by_group))
             request_ids.append(req_id)
 
         if not all_block_ids:
@@ -932,10 +937,10 @@ class WorkerConnector:
         disjoint and complete, so every block's page is written exactly once.
         With tp_size == 1 this is the whole set.
         """
-        tp_size = self._ctx.tp_size
+        tp_size = self._ctx.local_physical_tp_size
         if tp_size <= 1:
             return list(block_ids), list(block_hashes)
-        tp_rank = self._ctx.tp_rank or 0
+        tp_rank = self._ctx.local_physical_tp_rank
         ids: list[int] = []
         hashes: list[bytes] = []
         for block_id, block_hash in zip(block_ids, block_hashes, strict=True):

@@ -41,6 +41,83 @@ class PegaConnectorMode(str, Enum):
 
 
 @dataclass(frozen=True)
+class TpShardTopology:
+    """Equal contiguous TP shards served by node-local PegaFlow instances."""
+
+    endpoints: tuple[str, ...]
+    global_tp_size: int
+    global_world_size: int
+
+    @classmethod
+    def from_config(
+        cls,
+        default_endpoint: str,
+        configured_endpoints: object,
+        global_tp_size: int,
+        global_world_size: int,
+    ) -> "TpShardTopology":
+        if configured_endpoints is None:
+            endpoints = (default_endpoint,)
+        elif not isinstance(configured_endpoints, (list, tuple)):
+            raise ValueError("pegaflow.tp_shard_endpoints must be a list of endpoints")
+        else:
+            endpoints = tuple(configured_endpoints)
+
+        if not endpoints or any(
+            not isinstance(endpoint, str) or not endpoint for endpoint in endpoints
+        ):
+            raise ValueError("pegaflow.tp_shard_endpoints must contain non-empty strings")
+        if len(set(endpoints)) != len(endpoints):
+            raise ValueError("pegaflow.tp_shard_endpoints must not contain duplicates")
+        if global_tp_size <= 0 or global_tp_size % len(endpoints) != 0:
+            raise ValueError(
+                f"tensor_parallel_size={global_tp_size} must be divisible by "
+                f"the {len(endpoints)} PegaFlow TP shards"
+            )
+        if global_world_size <= 0 or global_world_size % len(endpoints) != 0:
+            raise ValueError(
+                f"world_size={global_world_size} must be divisible by "
+                f"the {len(endpoints)} PegaFlow TP shards"
+            )
+        return cls(
+            endpoints=endpoints,
+            global_tp_size=global_tp_size,
+            global_world_size=global_world_size,
+        )
+
+    @property
+    def shard_count(self) -> int:
+        return len(self.endpoints)
+
+    @property
+    def local_tp_size(self) -> int:
+        return self.global_tp_size // self.shard_count
+
+    @property
+    def local_world_size(self) -> int:
+        return self.global_world_size // self.shard_count
+
+    def shard_index(self, tp_rank: int) -> int:
+        if tp_rank < 0 or tp_rank >= self.global_tp_size:
+            raise ValueError(
+                f"tp_rank={tp_rank} is outside tensor_parallel_size={self.global_tp_size}"
+            )
+        return tp_rank // self.local_tp_size
+
+    def local_tp_rank(self, tp_rank: int) -> int:
+        return tp_rank % self.local_tp_size
+
+    def namespace(self, base_namespace: str, shard_index: int) -> str:
+        if self.shard_count == 1:
+            return base_namespace
+        if shard_index < 0 or shard_index >= self.shard_count:
+            raise ValueError(
+                f"TP shard index {shard_index} is outside shard_count={self.shard_count}"
+            )
+        return f"{base_namespace}:tp-shard-{shard_index}-of-{self.shard_count}"
+
+
+@dataclass(frozen=True)
 class ConnectorContext:
     """Shared configuration for scheduler/worker connectors."""
 
@@ -63,6 +140,7 @@ class ConnectorContext:
     pp_size: int = 1
     mode: PegaConnectorMode = PegaConnectorMode.READ_WRITE
     wait_for_full_prefix: bool = False
+    tp_shards: TpShardTopology | None = None
 
     @property
     def read_enabled(self) -> bool:
@@ -89,7 +167,10 @@ class ConnectorContext:
         """
         if self.is_mla and self.collapse_mla_tp:
             return self.dcp_rank
-        return self.tp_rank or 0
+        tp_rank = self.tp_rank or 0
+        if self.tp_shards is not None:
+            return self.tp_shards.local_tp_rank(tp_rank)
+        return tp_rank
 
     @property
     def effective_tp_size(self) -> int:
@@ -102,7 +183,38 @@ class ConnectorContext:
         """
         if self.is_mla and self.collapse_mla_tp:
             return max(1, self.dcp_world_size)
+        if self.tp_shards is not None:
+            return self.tp_shards.local_tp_size
         return self.tp_size
+
+    @property
+    def effective_world_size(self) -> int:
+        if self.tp_shards is not None:
+            return self.tp_shards.local_world_size
+        return self.world_size
+
+    @property
+    def local_physical_tp_rank(self) -> int:
+        tp_rank = self.tp_rank or 0
+        if self.tp_shards is not None:
+            return self.tp_shards.local_tp_rank(tp_rank)
+        return tp_rank
+
+    @property
+    def local_physical_tp_size(self) -> int:
+        if self.tp_shards is not None:
+            return self.tp_shards.local_tp_size
+        return self.tp_size
+
+    @property
+    def tp_shard_index(self) -> int:
+        if self.tp_shards is None or self.tp_rank is None:
+            return 0
+        return self.tp_shards.shard_index(self.tp_rank)
+
+    @property
+    def tp_shard_count(self) -> int:
+        return self.tp_shards.shard_count if self.tp_shards is not None else 1
 
 
 @dataclass(frozen=True)
@@ -110,7 +222,7 @@ class LoadIntent:
     """Intent for a KV load operation."""
 
     block_ids_by_group: tuple[tuple[int | None, ...], ...]
-    lease: bytes
+    leases: tuple[bytes, ...]
     num_tokens: int
 
 
@@ -392,6 +504,7 @@ __all__ = [
     "PegaKVConnectorStats",
     "PegaPromMetrics",
     "SaveIntent",
+    "TpShardTopology",
     "derive_namespace",
     "detect_mla",
     "logger",

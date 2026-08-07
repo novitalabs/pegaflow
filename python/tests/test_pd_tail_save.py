@@ -251,7 +251,7 @@ class TestTailLoad:
         intent = sc._pending_load_intents["r1"]
         assert intent.block_ids_by_group == ((10, 11, 12, 13),)
         assert intent.num_tokens == 49
-        assert intent.lease == b"lease"
+        assert intent.leases == (b"lease",)
 
     def test_tail_hit_starts_after_the_local_block_prefix(self):
         req = _make_request("r1", prompt_len=50, full_hashes=3)
