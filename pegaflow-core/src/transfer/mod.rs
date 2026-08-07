@@ -39,6 +39,8 @@ pub struct CopyDesc {
     pub host: *mut u8,
     pub host_device: u64,
     pub size: usize,
+    pub device_allocation: usize,
+    pub host_allocation: usize,
 }
 
 // SAFETY: `host` points into pinned memory owned by the caller, who guarantees

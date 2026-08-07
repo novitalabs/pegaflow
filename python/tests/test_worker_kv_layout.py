@@ -96,6 +96,26 @@ def test_mla_equal_physical_and_logical_block_size_is_unchanged():
     assert info.physical_blocks_per_logical_block == 1
 
 
+def test_recurrent_state_uses_one_page_per_logical_block():
+    info = _infer_kv_cache_registration(
+        FakeTensor(
+            shape=(2, 1, 4096),
+            stride=(4096, 4096, 1),
+            element_size=2,
+        ),
+        logical_block_size=1536,
+        is_mla=True,
+        is_recurrent_state=True,
+    )
+
+    assert info.layout == "blocks-first"
+    assert info.num_blocks == 2
+    assert info.bytes_per_block == 4096 * 2
+    assert info.kv_stride_bytes == 0
+    assert info.segments == 1
+    assert info.physical_blocks_per_logical_block == 1
+
+
 def test_non_mla_cross_layer_layout_uses_legacy_block_stride():
     info = _infer_kv_cache_registration(
         FakeTensor(

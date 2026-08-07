@@ -57,6 +57,72 @@ async fn page_first_multi_layer_roundtrip() {
     }
 }
 
+/// HMA cache groups use different physical block tables for the same logical
+/// request. Each layer group must therefore load into its own destination IDs.
+#[tokio::test]
+async fn hybrid_groups_load_to_distinct_block_ids() {
+    let mut env = TestEnvBuilder::new("test-hybrid-groups", "test-ns")
+        .layer("full_attention", 4, 1024)
+        .layer("gdn", 4, 1024)
+        .build();
+    env.layers[1].data.overwrite(0x40);
+
+    let hashes = make_block_hashes(2, 0xAC);
+    let saves = vec![
+        LayerSave {
+            layer_name: env.layers[0].name.clone(),
+            block_ids: vec![0, 1],
+            block_hashes: hashes.clone(),
+        },
+        LayerSave {
+            layer_name: env.layers[1].name.clone(),
+            block_ids: vec![2, 3],
+            block_hashes: hashes.clone(),
+        },
+    ];
+    env.engine
+        .batch_save_kv_blocks_from_ipc(&env.instance_id, 0, 0, 0, saves)
+        .await
+        .expect("save hybrid groups");
+    env.engine.flush_saves().await;
+
+    for layer in &env.layers {
+        layer.data.zero_gpu();
+    }
+    let lease = env.assert_all_hit_lease(&hashes).await;
+    let layer_groups = vec![vec!["full_attention"], vec![], vec!["gdn"]];
+    let completion = env
+        .engine
+        .batch_load_kv_blocks_multi_layer_inproc(
+            &env.instance_id,
+            0,
+            0,
+            &layer_groups,
+            &[(
+                lease,
+                vec![
+                    vec![Some(2), Some(3)],
+                    vec![None, None],
+                    vec![None, Some(0)],
+                ],
+            )],
+        )
+        .expect("load hybrid groups");
+    completion
+        .await
+        .expect("load worker must reply")
+        .expect("load hybrid groups");
+
+    let mut full_expected = vec![0; 4 * 1024];
+    full_expected[2 * 1024..3 * 1024].fill(1);
+    full_expected[3 * 1024..4 * 1024].fill(2);
+    env.layers[0].data.assert_gpu_matches(&full_expected);
+
+    let mut gdn_expected = vec![0; 4 * 1024];
+    gdn_expected[0..1024].fill(4 + 0x40);
+    env.layers[1].data.assert_gpu_matches(&gdn_expected);
+}
+
 /// Page-first seals a block's single slot on the first save, so one save must
 /// carry EVERY layer of the page. A save covering only some layers (e.g. a
 /// pipeline stage holding a subset) would seal a page whose other offsets are

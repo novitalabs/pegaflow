@@ -194,6 +194,8 @@ mod tests {
                 host: unsafe { host_base.host.add(k * seg) },
                 host_device: host_base.device + (k * seg) as u64,
                 size: seg,
+                device_allocation: 0,
+                host_allocation: 0,
             })
             .collect()
     }

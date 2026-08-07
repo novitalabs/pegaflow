@@ -184,22 +184,22 @@ class EngineRpcClient:
         tp_rank: int,
         device_id: int,
         load_state_shm: str,
-        layer_names: list[str],
-        loads: list[tuple[bytes, list[int]]],
+        layer_groups: list[list[str]],
+        loads: list[tuple[bytes, list[list[int | None]]]],
     ) -> tuple[bool, str]:
         """Load KV blocks from the engine.
 
         Contract: device_id must be non-negative; each lease must be returned
-        by query_prefetch; each lease's block count must match its destination
-        block_ids count.
+        by query_prefetch; each lease's block count must match the destination
+        block_ids count in every cache group.
 
         Args:
             instance_id: Model instance ID.
             tp_rank: Tensor parallel rank.
             device_id: CUDA device ID.
             load_state_shm: Shared memory name from PyLoadState.shm_name().
-            layer_names: List of layer names to load.
-            loads: List of (lease, destination block IDs) pairs.
+            layer_groups: Cache-group ordered lists of layer names to load.
+            loads: List of (lease, destination block IDs by group) pairs.
 
         Returns:
             Tuple of (ok, message) indicating success/failure.

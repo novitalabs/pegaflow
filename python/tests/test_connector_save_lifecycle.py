@@ -43,7 +43,7 @@ def enqueue_save(
     worker._current_metadata = PegaConnectorMetadata(
         save_intents={
             "request": SaveIntent(
-                block_ids=(block_id,),
+                block_ids_by_group=((block_id,),),
                 block_hashes=(block_hash,),
             )
         }

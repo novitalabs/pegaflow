@@ -75,6 +75,10 @@ impl Segment {
             _allocation: allocation,
         }
     }
+
+    fn allocation_id(&self) -> usize {
+        Arc::as_ptr(&self._allocation) as usize
+    }
 }
 
 // Safety: Segment holds NonNull<u8> pointing to pinned memory whose lifetime
@@ -166,6 +170,13 @@ impl RawBlock {
     /// Get mapped host/device pointer pair by index.
     pub(crate) fn segment_mapped_ptr(&self, index: usize) -> Option<MappedPinnedPtr> {
         self.segments.as_slice().get(index).map(|s| s.ptr)
+    }
+
+    pub(crate) fn segment_allocation_id(&self, index: usize) -> Option<usize> {
+        self.segments
+            .as_slice()
+            .get(index)
+            .map(Segment::allocation_id)
     }
 
     /// Get segment size by index.

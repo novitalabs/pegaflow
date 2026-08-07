@@ -554,8 +554,8 @@ impl PegaEngine {
         tp_rank: usize,
         device_id: i32,
         load_state_shm: &str,
-        layer_names: &[&str],
-        loads: &[(QueryLeaseId, Vec<usize>)],
+        layer_groups: &[Vec<&str>],
+        loads: &[(QueryLeaseId, Vec<Vec<Option<usize>>>)],
     ) -> Result<(), EngineError> {
         let load_state = LoadState::attach(load_state_shm)?;
 
@@ -563,7 +563,7 @@ impl PegaEngine {
             instance_id,
             tp_rank,
             device_id,
-            layer_names,
+            layer_groups,
             loads,
             LoadCompletion::Shm(load_state_shm.to_string()),
         );
@@ -590,15 +590,15 @@ impl PegaEngine {
         instance_id: &str,
         tp_rank: usize,
         device_id: i32,
-        layer_names: &[&str],
-        loads: &[(QueryLeaseId, Vec<usize>)],
+        layer_groups: &[Vec<&str>],
+        loads: &[(QueryLeaseId, Vec<Vec<Option<usize>>>)],
     ) -> Result<oneshot::Receiver<Result<(), EngineError>>, EngineError> {
         let (reply, rx) = oneshot::channel();
         self.batch_load_kv_blocks_multi_layer_inner(
             instance_id,
             tp_rank,
             device_id,
-            layer_names,
+            layer_groups,
             loads,
             LoadCompletion::Channel(reply),
         )?;
@@ -614,8 +614,8 @@ impl PegaEngine {
         instance_id: &str,
         tp_rank: usize,
         device_id: i32,
-        layer_names: &[&str],
-        loads: &[(QueryLeaseId, Vec<usize>)],
+        layer_groups: &[Vec<&str>],
+        loads: &[(QueryLeaseId, Vec<Vec<Option<usize>>>)],
         completion: LoadCompletion,
     ) -> Result<(), EngineError> {
         let instance = self.get_instance(instance_id)?;
@@ -624,21 +624,57 @@ impl PegaEngine {
             .get_gpu(device_id)
             .ok_or_else(|| EngineError::WorkerMissing(instance_id.to_string(), device_id))?;
 
+        if layer_groups.is_empty() {
+            return Err(EngineError::InvalidArgument(
+                "load requires at least one layer group".to_string(),
+            ));
+        }
+        let layer_count: usize = layer_groups.iter().map(Vec::len).sum();
+        let unique_layer_count = layer_groups
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        if unique_layer_count != layer_count {
+            return Err(EngineError::InvalidArgument(
+                "load layer names must be unique across groups".to_string(),
+            ));
+        }
+
         // Consume query leases reserved for this load.
         trace_scope!("load.cache_lookup", _s);
-        let mut block_ids = Vec::new();
+        let mut block_targets_by_group = vec![Vec::new(); layer_groups.len()];
         let mut block_cache = Vec::new();
-        for (lease, lease_block_ids) in loads {
+        for (lease, lease_block_ids_by_group) in loads {
             let blocks = self
                 .query_leases
                 .consume(instance_id, lease)
                 .map_err(EngineError::Storage)?;
-            if blocks.len() != lease_block_ids.len() {
+            if lease_block_ids_by_group.len() != layer_groups.len() {
                 return Err(EngineError::InvalidArgument(format!(
-                    "query lease block count {} does not match destination block count {}",
-                    blocks.len(),
-                    lease_block_ids.len()
+                    "load group count {} does not match layer group count {}",
+                    lease_block_ids_by_group.len(),
+                    layer_groups.len()
                 )));
+            }
+            let block_cache_start = block_cache.len();
+            for (group_index, lease_block_targets) in lease_block_ids_by_group.iter().enumerate() {
+                if blocks.len() != lease_block_targets.len() {
+                    return Err(EngineError::InvalidArgument(format!(
+                        "query lease block count {} does not match destination block count {} for group {}",
+                        blocks.len(),
+                        lease_block_targets.len(),
+                        group_index
+                    )));
+                }
+                block_targets_by_group[group_index].extend(
+                    lease_block_targets.iter().enumerate().filter_map(
+                        |(source_index, destination)| {
+                            destination.map(|block_id| (block_id, block_cache_start + source_index))
+                        },
+                    ),
+                );
             }
             // A stored block must carry exactly this instance's slot layout.
             // A mismatch means the namespace is shared by instances with
@@ -655,55 +691,58 @@ impl PegaEngine {
                     )));
                 }
             }
-            block_ids.extend_from_slice(lease_block_ids);
             block_cache.extend(blocks);
         }
         trace_drop!(_s);
 
         // Build load tasks for each layer
         trace_scope!("load.build_tasks");
-        let mut layers = Vec::with_capacity(layer_names.len());
+        let mut layers = Vec::with_capacity(layer_count);
 
-        for layer_name in layer_names {
-            let layer_id = topology.layer_id(layer_name)?;
+        for (group_index, layer_names) in layer_groups.iter().enumerate() {
+            let group_block_targets = &block_targets_by_group[group_index];
+            for layer_name in layer_names {
+                let layer_id = topology.layer_id(layer_name)?;
 
-            let layout = gpu.get_layout(layer_name).ok_or_else(|| {
-                EngineError::InvalidArgument(format!(
-                    "layer {layer_name} not registered on device {device_id}"
-                ))
-            })?;
+                let layout = gpu.get_layout(layer_name).ok_or_else(|| {
+                    EngineError::InvalidArgument(format!(
+                        "layer {layer_name} not registered on device {device_id}"
+                    ))
+                })?;
 
-            let slot_id = topology.slot_index(layer_id, tp_rank)?;
-            // Page-first: every layer reads from the one page slot (tp_rank) at
-            // its sealed byte offset. Layer-first: offset 0 (the whole slot
-            // RawBlock is the layer).
-            let host_offset = topology
-                .page_placement(layer_id)
-                .map_or(0, |(offset, _)| offset);
+                let slot_id = topology.slot_index(layer_id, tp_rank)?;
+                // Page-first: every layer reads from the one page slot (tp_rank) at
+                // its sealed byte offset. Layer-first: offset 0 (the whole slot
+                // RawBlock is the layer).
+                let host_offset = topology
+                    .page_placement(layer_id)
+                    .map_or(0, |(offset, _)| offset);
 
-            let mut blocks = Vec::with_capacity(block_ids.len());
-            for (block_idx, block_entry) in block_ids.iter().copied().zip(block_cache.iter()) {
-                if block_entry.get_slot(slot_id).is_none() {
-                    return Err(EngineError::InvalidArgument(format!(
-                        "stored block is missing slot {slot_id} for layer {layer_name}"
-                    )));
+                let mut blocks = Vec::with_capacity(group_block_targets.len());
+                for &(block_idx, source_index) in group_block_targets {
+                    let block_entry = &block_cache[source_index];
+                    if block_entry.get_slot(slot_id).is_none() {
+                        return Err(EngineError::InvalidArgument(format!(
+                            "stored block is missing slot {slot_id} for layer {layer_name}"
+                        )));
+                    }
+                    blocks.push(TransferBlock {
+                        block_idx,
+                        block: HostBlock::Cached {
+                            sealed: Arc::clone(block_entry),
+                            slot_id,
+                            offset: host_offset,
+                        },
+                    });
                 }
-                blocks.push(TransferBlock {
-                    block_idx,
-                    block: HostBlock::Cached {
-                        sealed: Arc::clone(block_entry),
-                        slot_id,
-                        offset: host_offset,
-                    },
-                });
-            }
 
-            if !blocks.is_empty() {
-                layers.push(LayerTransferData {
-                    layer_name: (*layer_name).to_string(),
-                    layout,
-                    blocks,
-                });
+                if !blocks.is_empty() {
+                    layers.push(LayerTransferData {
+                        layer_name: (*layer_name).to_string(),
+                        layout,
+                        blocks,
+                    });
+                }
             }
         }
 

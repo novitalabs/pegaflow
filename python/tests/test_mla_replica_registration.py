@@ -214,8 +214,8 @@ def test_mla_replica_devices_save_and_load(dual_device_server):
             workers[1].ctx.effective_tp_rank,
             workers[1].ctx.device_id,
             load_state.shm_name(),
-            layer_names,
-            [(lease, LOAD_DST_BLOCK_IDS)],
+            [layer_names],
+            [(lease, [LOAD_DST_BLOCK_IDS])],
         )
         assert ok, f"load into the second MLA replica device must succeed, got: {message}"
 

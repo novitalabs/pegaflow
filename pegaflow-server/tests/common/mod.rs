@@ -10,8 +10,9 @@ use pegaflow_core::{LoadState, PegaEngine, PrefetchStatus, StorageConfig, Transf
 use pegaflow_server::proto::engine::engine_client::EngineClient;
 use pegaflow_server::proto::engine::engine_server::EngineServer;
 use pegaflow_server::proto::engine::{
-    LeaseLoad, LoadRequest, LoadResponse, QueryRequest, QueryResponse, ReleaseRequest,
-    ReleaseResponse, SaveLayer, SaveRequest, SaveResponse, SessionEvent, SessionRequest,
+    LeaseLoad, LoadBlockIds, LoadBlockTarget, LoadGroup, LoadRequest, LoadResponse, QueryRequest,
+    QueryResponse, ReleaseRequest, ReleaseResponse, SaveLayer, SaveRequest, SaveResponse,
+    SessionEvent, SessionRequest, load_block_target,
 };
 use pegaflow_server::{CudaTensorRegistry, GrpcEngineService, RegistryHandle};
 use tokio::sync::Notify;
@@ -373,10 +374,18 @@ impl MockVllmRpcHarness {
             tp_rank: worker.tp_rank,
             device_id: worker.device_id,
             load_state_shm: state.shm_name().to_string(),
-            layer_names: vec![LAYER_NAME.to_string()],
+            groups: vec![LoadGroup {
+                layer_names: vec![LAYER_NAME.to_string()],
+            }],
             loads: vec![LeaseLoad {
                 lease,
-                block_ids: (0..block_count as u32).collect(),
+                block_ids_by_group: vec![LoadBlockIds {
+                    targets: (0..block_count as u32)
+                        .map(|block_id| LoadBlockTarget {
+                            target: Some(load_block_target::Target::BlockId(block_id)),
+                        })
+                        .collect(),
+                }],
             }],
         };
         match self.worker.load(request.clone()).await {

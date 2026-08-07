@@ -54,6 +54,7 @@ class ConnectorContext:
     engine_client: EngineRpcClient
     state_manager: "ServiceStateManager"
     is_mla: bool = False
+    collapse_mla_tp: bool = True
     transfer_backend: str = "direct"
     dcp_world_size: int = 1
     pcp_world_size: int = 1
@@ -83,9 +84,10 @@ class ConnectorContext:
 
         - MLA without DCP: 0 (data identical across TP ranks).
         - MLA with DCP: dcp_rank (each DCP rank stores different interleaved tokens).
+        - Hybrid MLA: tp_rank (non-MLA cache groups differ across TP ranks).
         - Non-MLA: tp_rank (each TP rank has different KV heads, already unique).
         """
-        if self.is_mla:
+        if self.is_mla and self.collapse_mla_tp:
             return self.dcp_rank
         return self.tp_rank or 0
 
@@ -95,9 +97,10 @@ class ConnectorContext:
 
         - MLA without DCP: 1.
         - MLA with DCP: dcp_world_size.
+        - Hybrid MLA: tp_size.
         - Non-MLA: tp_size (unique per TP rank regardless of DCP).
         """
-        if self.is_mla:
+        if self.is_mla and self.collapse_mla_tp:
             return max(1, self.dcp_world_size)
         return self.tp_size
 
@@ -106,7 +109,7 @@ class ConnectorContext:
 class LoadIntent:
     """Intent for a KV load operation."""
 
-    block_ids: tuple[int, ...]
+    block_ids_by_group: tuple[tuple[int | None, ...], ...]
     lease: bytes
     num_tokens: int
 
@@ -115,8 +118,116 @@ class LoadIntent:
 class SaveIntent:
     """Intent for a KV save operation."""
 
-    block_ids: tuple[int, ...]
+    block_ids_by_group: tuple[tuple[int, ...], ...]
     block_hashes: tuple[bytes, ...]
+
+
+@dataclass(frozen=True)
+class CacheGroupLayout:
+    """Stable vLLM cache-group order shared by scheduler and worker."""
+
+    layer_names: tuple[tuple[str, ...], ...]
+    hash_group_index: int
+    has_recurrent_state: bool
+    recurrent_group_indices: frozenset[int]
+    recurrent_layer_names: frozenset[str]
+
+    @classmethod
+    def from_config(cls, kv_cache_config) -> "CacheGroupLayout":
+        groups = tuple(getattr(kv_cache_config, "kv_cache_groups", ()) or ())
+        if not groups:
+            return cls(
+                layer_names=((),),
+                hash_group_index=0,
+                has_recurrent_state=False,
+                recurrent_group_indices=frozenset(),
+                recurrent_layer_names=frozenset(),
+            )
+
+        from vllm.v1.kv_cache_interface import (
+            FullAttentionSpec,
+            MambaSpec,
+            MLAAttentionSpec,
+        )
+
+        specs = tuple(group.kv_cache_spec for group in groups)
+        if len(specs) == 1:
+            if type(specs[0]) not in (FullAttentionSpec, MLAAttentionSpec):
+                raise RuntimeError(
+                    "PegaFlow supports a single cache group only for FullAttention or MLA"
+                )
+        else:
+            if any(
+                type(spec) is not FullAttentionSpec and not isinstance(spec, MambaSpec)
+                for spec in specs
+            ):
+                raise RuntimeError(
+                    "PegaFlow HMA supports only FullAttention and Mamba cache groups"
+                )
+
+            has_full_attention = any(type(spec) is FullAttentionSpec for spec in specs)
+            has_mamba = any(isinstance(spec, MambaSpec) for spec in specs)
+            if not has_full_attention:
+                raise RuntimeError(
+                    "PegaFlow requires a dense FullAttention cache group for block hashes"
+                )
+            if not has_mamba:
+                raise RuntimeError(
+                    "PegaFlow HMA requires both FullAttention and Mamba cache groups"
+                )
+            if any(
+                isinstance(spec, MambaSpec) and spec.mamba_cache_mode != "align" for spec in specs
+            ):
+                raise RuntimeError("PegaFlow HMA requires mamba_cache_mode='align'")
+
+        block_sizes = {group.kv_cache_spec.block_size for group in groups}
+        if len(groups) > 1 and len(block_sizes) != 1:
+            raise RuntimeError(
+                "PegaFlow HMA requires cache groups with identical logical block sizes"
+            )
+
+        hash_group_index = next(
+            (
+                index
+                for index, group in enumerate(groups)
+                if isinstance(group.kv_cache_spec, FullAttentionSpec)
+            ),
+            None,
+        )
+        if hash_group_index is None:
+            raise RuntimeError(
+                "PegaFlow requires a dense FullAttention cache group for block hashes"
+            )
+
+        return cls(
+            layer_names=tuple(tuple(group.layer_names) for group in groups),
+            hash_group_index=hash_group_index,
+            has_recurrent_state=any(isinstance(group.kv_cache_spec, MambaSpec) for group in groups),
+            recurrent_group_indices=frozenset(
+                index
+                for index, group in enumerate(groups)
+                if isinstance(group.kv_cache_spec, MambaSpec)
+            ),
+            recurrent_layer_names=frozenset(
+                layer_name
+                for group in groups
+                if isinstance(group.kv_cache_spec, MambaSpec)
+                for layer_name in group.layer_names
+            ),
+        )
+
+    @property
+    def group_count(self) -> int:
+        return len(self.layer_names)
+
+    def layer_to_group(self) -> dict[str, int]:
+        result: dict[str, int] = {}
+        for group_index, names in enumerate(self.layer_names):
+            for name in names:
+                if name in result:
+                    raise RuntimeError(f"KV cache layer belongs to multiple groups: {name}")
+                result[name] = group_index
+        return result
 
 
 class PegaConnectorMetadata(KVConnectorMetadata):
@@ -216,6 +327,8 @@ def derive_namespace(
     - `mla_layer_split_kv_cache`: MLA layer-split registration shards each
       block's slots across ranks, a different per-block layout than the
       default full-slot registration.
+    - `is_hma_enabled`: vLLM's hybrid cache manager changes whether hybrid
+      cache layouts can share one logical block namespace.
     """
     model_config = vllm_config.model_config
     cache_config = vllm_config.cache_config
@@ -230,6 +343,7 @@ def derive_namespace(
         "head_size": model_config.get_head_size(),
         "num_hidden_layers": model_config.get_total_num_hidden_layers(),
         "cache_dtype": str(cache_config.cache_dtype),
+        "is_hma_enabled": not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager,
         "dcp_world_size": dcp_world_size,
         "pcp_world_size": pcp_world_size,
         "cross_layer_blocks": cross_layer_blocks,

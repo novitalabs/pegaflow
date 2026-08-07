@@ -31,11 +31,13 @@ fn merge(copies: &[CopyDesc]) -> Vec<Merged> {
         let mut j = i + 1;
         while j < copies.len() {
             let next = copies[j];
+            let same_allocations = start.device_allocation == next.device_allocation
+                && start.host_allocation == next.host_allocation;
             let device_contiguous = start.device + size as u64 == next.device;
             // SAFETY: pointer arithmetic used only for an address-equality check;
             // the result is never dereferenced.
             let host_contiguous = unsafe { start.host.add(size) } == next.host;
-            if device_contiguous && host_contiguous {
+            if same_allocations && device_contiguous && host_contiguous {
                 size += next.size;
                 j += 1;
             } else {
@@ -96,5 +98,42 @@ impl TransferBackend for MemcpyBackend {
 
     fn name(&self) -> &'static str {
         "direct"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn copy(
+        device: u64,
+        host: *mut u8,
+        device_allocation: usize,
+        host_allocation: usize,
+    ) -> CopyDesc {
+        CopyDesc {
+            device,
+            host,
+            host_device: 0,
+            size: 4,
+            device_allocation,
+            host_allocation,
+        }
+    }
+
+    #[test]
+    fn merge_requires_contiguous_ranges_from_the_same_allocations() {
+        let mut host = [0_u8; 8];
+        let first_host = host.as_mut_ptr();
+        // SAFETY: `host` contains eight bytes, so this points to its second half.
+        let second_host = unsafe { first_host.add(4) };
+
+        let merged = merge(&[copy(100, first_host, 1, 2), copy(104, second_host, 1, 2)]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].size, 8);
+
+        for second in [copy(104, second_host, 3, 2), copy(104, second_host, 1, 4)] {
+            assert_eq!(merge(&[copy(100, first_host, 1, 2), second]).len(), 2);
+        }
     }
 }

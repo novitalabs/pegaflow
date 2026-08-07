@@ -20,6 +20,7 @@ def _make_vllm_config(
     *,
     pp_size: int = 1,
     mla_layer_split: bool = False,
+    disable_hma: bool = False,
 ) -> SimpleNamespace:
     model_config = SimpleNamespace(
         model="/data/models/GLM-5.2-FP8",
@@ -31,6 +32,9 @@ def _make_vllm_config(
     return SimpleNamespace(
         model_config=model_config,
         cache_config=SimpleNamespace(cache_dtype="fp8"),
+        scheduler_config=SimpleNamespace(
+            disable_hybrid_kv_cache_manager=disable_hma,
+        ),
         parallel_config=SimpleNamespace(pipeline_parallel_size=pp_size),
         additional_config={"mla_layer_split_kv_cache": mla_layer_split},
     )
@@ -50,6 +54,10 @@ def test_mla_layer_split_isolates_namespace():
     # Layer-split registration shards each block's slots differently from the
     # default full-slot layout (the haitao GLM-5.2 99-vs-156 collision).
     assert _ns(mla_layer_split=False) != _ns(mla_layer_split=True)
+
+
+def test_hma_enablement_isolates_namespace():
+    assert _ns(disable_hma=False) != _ns(disable_hma=True)
 
 
 def test_namespace_is_stable_for_same_config():

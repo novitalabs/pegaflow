@@ -23,6 +23,8 @@ from .unit_stubs import install_connector_unit_stubs
 
 install_connector_unit_stubs()
 
+from vllm.v1.kv_cache_interface import FullAttentionSpec  # noqa: E402
+
 from pegaflow.connector.common import (  # noqa: E402
     ConnectorContext,
     LoadIntent,
@@ -45,6 +47,7 @@ class FakeEngineClient:
         self.register_response: tuple[bool, str] = (True, "ok")
         self.register_exception: Exception | None = None
         self.register_calls: list[tuple] = []
+        self.unregister_calls: list[str] = []
         self.release_calls: list[bytes] = []
 
     def load(
@@ -53,17 +56,17 @@ class FakeEngineClient:
         tp_rank: int,
         device_id: int,
         load_state_shm: str,
-        layer_names,
+        layer_groups,
         loads,
     ) -> tuple[bool, str]:
-        block_ids = [block_id for _, ids in loads for block_id in ids]
+        block_ids = [block_id for _, groups in loads for ids in groups for block_id in ids]
         self.load_calls.append(
             (
                 instance_id,
                 tp_rank,
                 device_id,
                 load_state_shm,
-                list(layer_names),
+                [list(group) for group in layer_groups],
                 list(block_ids),
             )
         )
@@ -83,6 +86,7 @@ class FakeEngineClient:
         return (True, "ok")
 
     def unregister_context(self, instance_id: str) -> tuple[bool, str]:
+        self.unregister_calls.append(instance_id)
         return (True, "ok")
 
     def release(self, lease: bytes) -> None:
@@ -132,13 +136,38 @@ def _stub_forward_context() -> MagicMock:
     return ctx
 
 
+def _single_attention_cache_group(*layer_names: str) -> MagicMock:
+    spec = FullAttentionSpec()
+    spec.block_size = 16
+    return MagicMock(layer_names=layer_names, kv_cache_spec=spec)
+
+
 def _load_metadata(req_id: str, block_ids: tuple[int, ...]) -> PegaConnectorMetadata:
     return PegaConnectorMetadata(
         load_intents={
             req_id: LoadIntent(
-                block_ids=block_ids,
+                block_ids_by_group=(block_ids,),
                 lease=f"lease-{req_id}".encode(),
                 num_tokens=len(block_ids) * 16,
+            )
+        }
+    )
+
+
+def _configure_hma_worker(worker: WorkerConnector) -> None:
+    worker._cross_layer_mode = False
+    worker._cache_groups = MagicMock(group_count=2, has_recurrent_state=True)
+    worker._registered_layers = ["attention", "recurrent"]
+    worker._layer_to_group = {"attention": 0, "recurrent": 1}
+
+
+def _hma_load_metadata(req_id: str) -> PegaConnectorMetadata:
+    return PegaConnectorMetadata(
+        load_intents={
+            req_id: LoadIntent(
+                block_ids_by_group=((11,), (21,)),
+                lease=f"lease-{req_id}".encode(),
+                num_tokens=16,
             )
         }
     )
@@ -182,6 +211,61 @@ def test_load_rpc_failure_reports_failures_without_raise(
     assert worker._pending_load_reqs == {}
     assert worker._pending_load_meta == {}
 
+    worker.shutdown()
+
+
+@pytest.mark.parametrize("failure_mode", ["ok_false", "exception"])
+def test_hma_load_rpc_failure_crashes_before_vllm_partial_recovery(failure_mode: str):
+    worker, client, state_mgr = _make_worker()
+    _configure_hma_worker(worker)
+    if failure_mode == "ok_false":
+        client.fail_load_with_ok_false = True
+    else:
+        client.fail_load_with_exception = ConnectionError("server gone")
+
+    with pytest.raises(RuntimeError, match="cannot recover failed loads"):
+        worker.start_load_kv(_hma_load_metadata("hma-failure"), _stub_forward_context())
+
+    assert state_mgr.mark_unavailable.called
+    assert client.release_calls == [b"lease-hma-failure"]
+    assert worker._pending_loads == {}
+    worker.shutdown()
+
+
+def test_hma_load_distinguishes_block_zero_from_absent_recurrent_target():
+    worker, client, _state_mgr = _make_worker()
+    _configure_hma_worker(worker)
+    metadata = PegaConnectorMetadata(
+        load_intents={
+            "hma-sparse": LoadIntent(
+                block_ids_by_group=((0, 12), (None, 21)),
+                lease=b"lease-hma-sparse",
+                num_tokens=32,
+            )
+        }
+    )
+
+    worker.start_load_kv(metadata, _stub_forward_context())
+
+    assert client.load_calls[0][5] == [0, 12, None, 21]
+    worker.shutdown()
+
+
+def test_hma_load_timeout_crashes_before_vllm_partial_recovery(monkeypatch):
+    worker, _client, state_mgr = _make_worker()
+    _configure_hma_worker(worker)
+    clock = {"now": 10_000.0}
+    monkeypatch.setattr("pegaflow.connector.worker.time.perf_counter", lambda: clock["now"])
+    worker.start_load_kv(_hma_load_metadata("hma-timeout"), _stub_forward_context())
+    clock["now"] += worker.LOAD_TIMEOUT_SECONDS + 1
+
+    with pytest.raises(RuntimeError, match="cannot recover failed loads"):
+        worker.get_finished(set())
+
+    assert state_mgr.mark_unavailable.called
+    assert worker._pending_loads == {}
+    assert worker._pending_load_reqs == {}
+    assert worker._pending_load_meta == {}
     worker.shutdown()
 
 
@@ -259,7 +343,7 @@ def test_load_uses_registered_layer_names_before_forward_context_names():
     worker.start_load_kv(_load_metadata("req_registered_layers", (1, 2)), forward_context)
 
     assert len(client.load_calls) == 1
-    assert client.load_calls[0][4] == ["registered.layer.0", "registered.layer.1"]
+    assert client.load_calls[0][4] == [["registered.layer.0", "registered.layer.1"]]
 
     worker.shutdown()
 
@@ -302,8 +386,10 @@ def test_register_version_mismatch_raises_startup_error(monkeypatch):
     assert "server=0.22.5" in str(exc_info.value)
     assert "for layer.0" not in str(exc_info.value)
     assert len(client.register_calls) == 1
+    assert client.unregister_calls == []
 
     worker.shutdown()
+    assert client.unregister_calls == []
 
 
 def test_register_non_version_failure_reports_batch_layers(monkeypatch):
@@ -332,7 +418,7 @@ def test_register_non_version_failure_reports_batch_layers(monkeypatch):
 def test_register_kv_caches_ignores_shared_by_without_layer_split_opt_in(monkeypatch):
     kv_cache_config = MagicMock()
     kv_cache_config.kv_cache_groups = [
-        MagicMock(layer_names=("layer.0", "layer.1", "layer.2"))
+        _single_attention_cache_group("layer.0", "layer.1", "layer.2")
     ]
     kv_cache_config.kv_cache_tensors = [
         MagicMock(shared_by=("layer.1",)),
@@ -361,7 +447,7 @@ def test_register_kv_caches_ignores_shared_by_without_layer_split_opt_in(monkeyp
 def test_register_kv_caches_uses_layer_split_shared_by_plan(monkeypatch):
     kv_cache_config = MagicMock()
     kv_cache_config.kv_cache_groups = [
-        MagicMock(layer_names=("layer.0", "layer.1", "layer.2"))
+        _single_attention_cache_group("layer.0", "layer.1", "layer.2")
     ]
     kv_cache_config.kv_cache_tensors = [
         MagicMock(shared_by=("layer.1",)),
@@ -393,7 +479,7 @@ def test_register_kv_caches_uses_layer_split_shared_by_plan(monkeypatch):
 
 def test_register_kv_caches_requires_shared_by_layers(monkeypatch):
     kv_cache_config = MagicMock()
-    kv_cache_config.kv_cache_groups = [MagicMock(layer_names=("layer.0", "layer.1"))]
+    kv_cache_config.kv_cache_groups = [_single_attention_cache_group("layer.0", "layer.1")]
     kv_cache_config.kv_cache_tensors = [MagicMock(shared_by=("layer.1",))]
     worker, _, _ = _make_worker(
         kv_cache_config=kv_cache_config,

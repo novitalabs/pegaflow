@@ -9,7 +9,7 @@ use crate::proto::engine::{
     ReleaseRequest, ReleaseResponse, ReleaseTransferLockRequest, ReleaseTransferLockResponse,
     ResponseStatus, SaveRequest, SaveResponse, SessionEvent, SessionRequest, ShutdownRequest,
     ShutdownResponse, TransferBlockInfo, TransferMode as ProtoTransferMode, TransferSlotInfo,
-    UnregisterRequest, UnregisterResponse, query_response,
+    UnregisterRequest, UnregisterResponse, load_block_target, query_response,
 };
 use crate::registry::RegistryHandle;
 use crate::session::SessionRegistry;
@@ -430,9 +430,14 @@ impl Engine for GrpcEngineService {
         let start = Instant::now();
 
         let req = request.into_inner();
-        let layer_count = req.layer_names.len();
+        let layer_count: usize = req.groups.iter().map(|group| group.layer_names.len()).sum();
         let load_count = req.loads.len();
-        let block_count: usize = req.loads.iter().map(|load| load.block_ids.len()).sum();
+        let block_count: usize = req
+            .loads
+            .iter()
+            .flat_map(|load| &load.block_ids_by_group)
+            .map(|block_ids| block_ids.targets.len())
+            .sum();
 
         trace_root!("rpc.load", root, || {
             [
@@ -447,7 +452,7 @@ impl Engine for GrpcEngineService {
                 instance_id,
                 tp_rank,
                 device_id,
-                layer_names,
+                groups,
                 loads,
                 load_state_shm,
                 ..
@@ -464,14 +469,31 @@ impl Engine for GrpcEngineService {
                 block_count,
                 load_state_shm.len()
             );
-            let layer_refs: Vec<&str> = layer_names.iter().map(|s| s.as_str()).collect();
-            let loads: Vec<(QueryLeaseId, Vec<usize>)> = loads
+            let layer_groups: Vec<Vec<&str>> = groups
+                .iter()
+                .map(|group| group.layer_names.iter().map(String::as_str).collect())
+                .collect();
+            let loads: Vec<(QueryLeaseId, Vec<Vec<Option<usize>>>)> = loads
                 .into_iter()
                 .map(|load| {
                     let lease =
                         QueryLeaseId::from_bytes(&load.lease).map_err(Status::invalid_argument)?;
-                    let block_ids = load.block_ids.into_iter().map(|id| id as usize).collect();
-                    Ok::<_, Status>((lease, block_ids))
+                    let block_ids_by_group = load
+                        .block_ids_by_group
+                        .into_iter()
+                        .map(|block_ids| {
+                            block_ids
+                                .targets
+                                .into_iter()
+                                .map(|target| {
+                                    target
+                                        .target
+                                        .map(|load_block_target::Target::BlockId(id)| id as usize)
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    Ok::<_, Status>((lease, block_ids_by_group))
                 })
                 .collect::<Result<_, _>>()?;
 
@@ -481,7 +503,7 @@ impl Engine for GrpcEngineService {
                     tp_rank,
                     device_id,
                     &load_state_shm,
-                    &layer_refs,
+                    &layer_groups,
                     &loads,
                 )
                 .map_err(Self::map_engine_error)?;

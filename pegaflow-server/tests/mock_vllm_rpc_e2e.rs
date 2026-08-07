@@ -9,7 +9,19 @@ use common::{
     BLOCK_COUNT, INSTANCE_ID, LAYER_NAME, MockVllmRpcHarness, SECOND_INSTANCE_ID,
     cuda_device_count, make_block_hashes,
 };
-use pegaflow_server::proto::engine::{QueryReady, query_response};
+use pegaflow_server::proto::engine::{LoadBlockIds, QueryReady, load_block_target, query_response};
+
+fn load_targets(block_ids: &LoadBlockIds) -> Vec<Option<u32>> {
+    block_ids
+        .targets
+        .iter()
+        .map(|target| {
+            target
+                .target
+                .map(|load_block_target::Target::BlockId(block_id)| block_id)
+        })
+        .collect()
+}
 
 #[tokio::test]
 async fn mock_vllm_save_query_load_roundtrip_over_rpc() {
@@ -50,8 +62,14 @@ async fn mock_vllm_save_query_load_roundtrip_over_rpc() {
     assert_eq!(load.request.tp_rank, 0);
     assert_eq!(load.request.device_id, 0);
     assert!(!load.request.load_state_shm.is_empty());
-    assert_eq!(load.request.layer_names, vec![LAYER_NAME.to_string()]);
-    assert_eq!(load.request.loads[0].block_ids, vec![0, 1, 2, 3]);
+    assert_eq!(
+        load.request.groups[0].layer_names,
+        vec![LAYER_NAME.to_string()]
+    );
+    assert_eq!(
+        load_targets(&load.request.loads[0].block_ids_by_group[0]),
+        vec![Some(0), Some(1), Some(2), Some(3)]
+    );
     assert_response_ok(load.response.status.as_ref(), "load");
 
     harness.wait_for_load(&load.state).await;
@@ -173,7 +191,10 @@ async fn mock_vllm_prefix_partial_query_returns_prefix_lease() {
 
     harness.gpus[0].zero();
     let load = harness.submit_load(ready.lease, 2).await;
-    assert_eq!(load.request.loads[0].block_ids, vec![0, 1]);
+    assert_eq!(
+        load_targets(&load.request.loads[0].block_ids_by_group[0]),
+        vec![Some(0), Some(1)]
+    );
     assert_response_ok(load.response.status.as_ref(), "prefix load");
     harness.wait_for_load(&load.state).await;
     harness.gpus[0].assert_prefix_loaded_and_suffix_zero(2);
@@ -202,7 +223,10 @@ async fn mock_vllm_load_rejects_lease_block_count_mismatch() {
         Ok(_) => panic!("load block count mismatch should fail"),
         Err(err) => err,
     };
-    assert_eq!(mismatch.request.loads[0].block_ids, vec![0, 1, 2, 3]);
+    assert_eq!(
+        load_targets(&mismatch.request.loads[0].block_ids_by_group[0]),
+        vec![Some(0), Some(1), Some(2), Some(3)]
+    );
     assert_eq!(mismatch.status.code(), tonic::Code::InvalidArgument);
     assert!(
         mismatch
@@ -343,7 +367,10 @@ async fn mock_vllm_naive_tp2_load_roundtrip_over_rpc() {
         .await;
     assert_eq!(load_tp0.request.tp_rank, 0);
     assert_eq!(load_tp0.request.device_id, 0);
-    assert_eq!(load_tp0.request.loads[0].block_ids, vec![0, 1, 2, 3]);
+    assert_eq!(
+        load_targets(&load_tp0.request.loads[0].block_ids_by_group[0]),
+        vec![Some(0), Some(1), Some(2), Some(3)]
+    );
     assert_response_ok(load_tp0.response.status.as_ref(), "load tp0");
 
     let load_tp1 = harness
@@ -351,7 +378,10 @@ async fn mock_vllm_naive_tp2_load_roundtrip_over_rpc() {
         .await;
     assert_eq!(load_tp1.request.tp_rank, 1);
     assert_eq!(load_tp1.request.device_id, 1);
-    assert_eq!(load_tp1.request.loads[0].block_ids, vec![0, 1, 2, 3]);
+    assert_eq!(
+        load_targets(&load_tp1.request.loads[0].block_ids_by_group[0]),
+        vec![Some(0), Some(1), Some(2), Some(3)]
+    );
     assert_response_ok(load_tp1.response.status.as_ref(), "load tp1");
 
     harness.wait_for_load(&load_tp0.state).await;
