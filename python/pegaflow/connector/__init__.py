@@ -22,6 +22,7 @@ from pegaflow.connector.common import (
     PegaConnectorMode,
     PegaKVConnectorStats,
     PegaPromMetrics,
+    TpShardTopology,
     derive_namespace,
     detect_mla,
     logger,
@@ -64,7 +65,7 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
             )
 
         cross_layer_blocks = os.environ.get("PEGAFLOW_CROSS_LAYER_BLOCKS", "1") == "1"
-        namespace = derive_namespace(
+        base_namespace = derive_namespace(
             vllm_config,
             effective_tp_size,
             dcp_world_size,
@@ -114,7 +115,26 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
                 "pegaflow.wait_for_full_prefix", False
             )
         )
-        self._engine_endpoint = f"{server_host}:{server_port}"
+        default_endpoint = f"{server_host}:{server_port}"
+        tp_shards = TpShardTopology.from_config(
+            default_endpoint=default_endpoint,
+            configured_endpoints=vllm_config.kv_transfer_config.get_from_extra_config(
+                "pegaflow.tp_shard_endpoints", None
+            ),
+            global_tp_size=tp_size,
+            global_world_size=world_size,
+        )
+        if tp_shards.shard_count > 1 and (
+            world_size != tp_size or dcp_world_size != 1 or pcp_world_size != 1
+        ):
+            raise ValueError(
+                "pegaflow.tp_shard_endpoints currently supports TP-only parallelism; "
+                f"got tp_size={tp_size}, world_size={world_size}, "
+                f"dcp_world_size={dcp_world_size}, pcp_world_size={pcp_world_size}"
+            )
+        shard_index = tp_shards.shard_index(tp_rank) if tp_rank is not None else 0
+        namespace = tp_shards.namespace(base_namespace, shard_index)
+        self._engine_endpoint = tp_shards.endpoints[shard_index]
         engine_client = EngineRpcClient(self._engine_endpoint)
         logger.debug("[PegaKVConnector] Connected to engine server at %s", self._engine_endpoint)
 
@@ -140,6 +160,7 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
             pp_size=pp_size,
             mode=mode,
             wait_for_full_prefix=wait_for_full_prefix,
+            tp_shards=tp_shards,
         )
 
         # MLA attention backends expose no num-layers stride dimension, so vLLM
@@ -164,8 +185,13 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
             pd_tail_load = bool(
                 vllm_config.kv_transfer_config.get_from_extra_config("pegaflow.pd_tail_load", False)
             )
+            query_clients = tuple(
+                engine_client if index == shard_index else EngineRpcClient(endpoint)
+                for index, endpoint in enumerate(tp_shards.endpoints)
+            )
             self._scheduler = SchedulerConnector(
                 self._ctx,
+                engine_clients=query_clients,
                 pd_tail_save=pd_tail_save,
                 pd_tail_load=pd_tail_load,
                 vllm_config=vllm_config,
@@ -175,7 +201,13 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
             # stream per vllm replica is enough — if any tp worker crashes,
             # the scheduler dies too, closing this stream and triggering
             # server-side cleanup of the instance's CUDA IPC mappings.
-            engine_client.start_session_watcher(instance_id, namespace, tp_size, world_size)
+            for index, client in enumerate(query_clients):
+                client.start_session_watcher(
+                    instance_id,
+                    tp_shards.namespace(base_namespace, index),
+                    self._ctx.effective_tp_size,
+                    self._ctx.effective_world_size,
+                )
         else:
             self._worker = WorkerConnector(
                 self._ctx,
@@ -187,7 +219,7 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
             "[PegaKVConnector] Initialized role=%s instance_id=%s device=%s "
             "tp_rank=%s tp_size=%d pp_rank=%d pp_size=%d world_size=%d namespace=%s "
             "is_mla=%s collapse_mla_tp=%s transfer_backend=%s dcp_world_size=%d "
-            "pcp_world_size=%d dcp_rank=%d "
+            "pcp_world_size=%d dcp_rank=%d tp_shard=%d/%d "
             "mode=%s wait_for_full_prefix=%s",
             role.name,
             instance_id,
@@ -204,6 +236,8 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
             dcp_world_size,
             pcp_world_size,
             dcp_rank,
+            shard_index,
+            tp_shards.shard_count,
             mode.value,
             wait_for_full_prefix,
         )

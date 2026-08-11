@@ -109,6 +109,40 @@ vllm serve Qwen/Qwen3-0.6B \
 
 Valid values are `read_write` and `save_only`.
 
+#### TP Shards Across Hosts
+
+CUDA IPC is host-local. When one tensor-parallel replica spans multiple hosts,
+run one PegaFlow server on each host and configure the connector with every
+server endpoint in global TP-rank order:
+
+```json
+{
+  "kv_connector": "PegaKVConnector",
+  "kv_role": "kv_both",
+  "kv_connector_module_path": "pegaflow.connector",
+  "kv_connector_extra_config": {
+    "pegaflow.tp_shard_endpoints": [
+      "http://host-a:50055",
+      "http://host-b:50055"
+    ]
+  }
+}
+```
+
+For TP8 and two endpoints, global ranks 0-3 register with the first server and
+ranks 4-7 register with the second. Each server sees a local TP4 topology and
+must manage the four GPUs on its own host. Every vLLM process must receive the
+same ordered endpoint list.
+
+The scheduler queries every shard and only reuses the prefix available from all
+of them. Each worker loads with the lease issued by its local server. The
+connector gives every shard a distinct namespace, so deployments with a
+different host split cannot reuse an incompatible cache layout.
+
+TP sharding currently requires equal contiguous shards and TP-only parallelism.
+Pipeline, decode-context, and prefill-context parallelism are rejected when
+more than one endpoint is configured.
+
 #### P/D Partial Tail Blocks
 
 vLLM normally exposes hashes only for complete KV blocks. In a P/D deployment,

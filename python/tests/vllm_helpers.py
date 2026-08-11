@@ -349,12 +349,16 @@ class PegaFlowServer:
         log_level: str | None = None,
         cargo_features: list[str] | None = None,
         use_hugepages: bool = False,
+        devices: str | None = None,
+        server_binary: str | None = None,
     ):
         self.grpc_port = find_available_port()
         self.http_port = find_available_port()
         self.pool_size = pool_size
         self.log_level = log_level
         self.use_hugepages = use_hugepages
+        self.devices = devices
+        self.server_binary = server_binary
         self.cargo_features = (
             cargo_features if cargo_features is not None else _detect_pegaflow_cargo_features()
         )
@@ -369,19 +373,16 @@ class PegaFlowServer:
     def __enter__(self):
         project_root = Path(__file__).parent.parent.parent
 
-        cmd = [
-            "cargo",
-            "run",
-            "-r",
-        ]
-        if self.cargo_features:
-            cmd.append("--no-default-features")
-            cmd.extend(["--features", ",".join(self.cargo_features)])
+        if self.server_binary is None:
+            cmd = ["cargo", "run", "-r"]
+            if self.cargo_features:
+                cmd.append("--no-default-features")
+                cmd.extend(["--features", ",".join(self.cargo_features)])
+            cmd.extend(["--bin", "pegaflow-server", "--"])
+        else:
+            cmd = [self.server_binary]
         cmd.extend(
             [
-                "--bin",
-                "pegaflow-server",
-                "--",
                 "--addr",
                 f"127.0.0.1:{self.grpc_port}",
                 "--http-addr",
@@ -393,6 +394,8 @@ class PegaFlowServer:
         )
         if self.use_hugepages:
             cmd.append("--use-hugepages")
+        if self.devices is not None:
+            cmd.extend(["--devices", self.devices])
         if self.log_level is not None:
             cmd.extend(["--log-level", self.log_level])
 
@@ -411,16 +414,19 @@ class PegaFlowServer:
         env["PYO3_PYTHON"] = sys.executable
         env["PYTHONHOME"] = sys.base_prefix
         if libdir := sysconfig.get_config_var("LIBDIR"):
-            env["LD_LIBRARY_PATH"] = f"{libdir}:{env.get('LD_LIBRARY_PATH', '')}"
+            existing_library_path = env.get("LD_LIBRARY_PATH")
+            env["LD_LIBRARY_PATH"] = (
+                f"{existing_library_path}:{libdir}" if existing_library_path else libdir
+            )
         python_dir = str(Path(__file__).parent.parent)
         site_packages = sysconfig.get_path("purelib")
         env["PYTHONPATH"] = f"{python_dir}" + (f":{site_packages}" if site_packages else "")
 
-        feature_label = ",".join(self.cargo_features) or "default"
-        print(
-            f"\n[PegaFlow Server] cargo run -r features={feature_label} "
-            f"on gRPC={self.grpc_port}, HTTP={self.http_port}"
-        )
+        if self.server_binary is None:
+            launch_label = f"cargo run -r features={','.join(self.cargo_features) or 'default'}"
+        else:
+            launch_label = self.server_binary
+        print(f"\n[PegaFlow Server] {launch_label} on gRPC={self.grpc_port}, HTTP={self.http_port}")
 
         if self.log_file:
             print(f"[PegaFlow Server] Logging to: {self.log_file}")

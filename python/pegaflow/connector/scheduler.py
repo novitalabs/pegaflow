@@ -18,7 +18,8 @@ from pegaflow.connector.common import (
     logger,
 )
 from pegaflow.connector.connector_metrics import PrefetchTracker
-from pegaflow.pegaflow import QueryLoading, QueryReady
+from pegaflow.connector.tp_shards import ShardedQueryReady, TpShardQueryClient
+from pegaflow.pegaflow import EngineRpcClient
 
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -51,7 +52,7 @@ class _QueryProbe:
 
     # ``None`` means the backend is still loading.
     hit_blocks: int | None = None
-    lease: bytes = b""
+    leases: tuple[bytes, ...] = ()
 
     @property
     def is_ready(self) -> bool:
@@ -69,7 +70,7 @@ class _QueryProbe:
             and self.tail_tokens == tail_tokens
         )
 
-    def mark_ready(self, ready: QueryReady) -> None:
+    def mark_ready(self, ready: ShardedQueryReady) -> None:
         hit_blocks = ready.num_hit_blocks
         if hit_blocks > len(self.query_hashes):
             raise RuntimeError(
@@ -77,7 +78,7 @@ class _QueryProbe:
                 f"{len(self.query_hashes)} hashes"
             )
         self.hit_blocks = hit_blocks
-        self.lease = ready.lease
+        self.leases = ready.leases
 
     def require_hit_blocks(self) -> int:
         if self.hit_blocks is None:
@@ -91,12 +92,21 @@ class SchedulerConnector:
     def __init__(
         self,
         context: ConnectorContext,
+        engine_clients: tuple[EngineRpcClient, ...] | None = None,
         pd_tail_save: bool = False,
         pd_tail_load: bool = False,
         vllm_config=None,
         kv_cache_config=None,
     ):
         self._ctx = context
+        engine_clients = tuple(engine_clients or (context.engine_client,))
+        expected_shards = context.tp_shards.shard_count if context.tp_shards is not None else 1
+        if len(engine_clients) != expected_shards:
+            raise ValueError(
+                f"scheduler has {len(engine_clients)} PegaFlow clients for "
+                f"{expected_shards} TP shards"
+            )
+        self._tp_shard_client = TpShardQueryClient(engine_clients)
         self._cache_groups = CacheGroupLayout.from_config(kv_cache_config)
         if self._cache_groups.has_recurrent_state and (pd_tail_save or pd_tail_load):
             raise ValueError("P/D tail-block caching is not supported with HMA")
@@ -255,8 +265,7 @@ class SchedulerConnector:
                 computed_blocks,
                 len(query_hashes),
             )
-            if ready.lease:
-                self._ctx.engine_client.release(ready.lease)
+            self._release_leases(ready.leases, req_id)
             self._pending_query_probes.pop(req_id, None)
             return (None, False)
 
@@ -400,7 +409,7 @@ class SchedulerConnector:
             pending_probe = self._pending_query_probes.get(req_id)
             load_intent = LoadIntent(
                 block_ids_by_group=load_block_ids_by_group,
-                lease=pending_probe.lease if pending_probe is not None else b"",
+                leases=pending_probe.leases if pending_probe is not None else (),
                 num_tokens=num_external_tokens,
             )
             if pending_probe is not None:
@@ -415,7 +424,7 @@ class SchedulerConnector:
                         f"req {req_id} leased block mismatch: "
                         f"leased={leased_blocks} load={num_load_blocks}"
                     )
-            if not load_intent.lease:
+            if not load_intent.leases or any(not lease for lease in load_intent.leases):
                 raise RuntimeError(f"req {req_id} missing query lease for external load")
             self._pending_load_intents[req_id] = load_intent
             self._pending_query_probes.pop(req_id, None)
@@ -812,22 +821,21 @@ class SchedulerConnector:
 
     def _count_available_block_prefix(
         self, block_hashes: Iterable[bytes], req_id: str
-    ) -> QueryReady | None:
+    ) -> ShardedQueryReady | None:
         """Query available blocks with prefetch support.
 
         Returns:
-            QueryReady: Ready block count and lease
+            ShardedQueryReady: Common ready block count and one lease per TP shard
             None: Blocks are being prefetched from DFS, retry later
         """
         block_hash_list = list(block_hashes)
-        result = self._ctx.engine_client.query_prefetch(
+        ready = self._tp_shard_client.query(
             self._ctx.instance_id,
             block_hash_list,
-            req_id=req_id,
-            wait_for_full_prefix=self._ctx.wait_for_full_prefix,
+            req_id,
+            self._ctx.wait_for_full_prefix,
         )
-
-        if isinstance(result, QueryLoading):
+        if ready is None:
             if req_id not in self._prefetch_start_times:
                 self._prefetch_start_times[req_id] = time.perf_counter()
                 self._prefetch_tracker.on_prefetch_start()
@@ -838,26 +846,22 @@ class SchedulerConnector:
                 )
             return None
 
-        if not isinstance(result, QueryReady):
-            raise TypeError(f"query_prefetch returned unexpected outcome {type(result)!r}")
-
-        hit_blocks = result.num_hit_blocks
         if req_id in self._prefetch_start_times:
             prefetch_duration_ms = (
                 time.perf_counter() - self._prefetch_start_times.pop(req_id)
             ) * 1000
-            self._prefetch_tracker.on_prefetch_complete(prefetch_duration_ms, hit_blocks)
+            self._prefetch_tracker.on_prefetch_complete(prefetch_duration_ms, ready.num_hit_blocks)
 
             logger.debug(
                 "[PegaKVConnector] Prefetch completed: req=%s hit_blocks=%d "
                 "prefetch_duration_ms=%.2f pending_prefetches=%d",
                 req_id,
-                hit_blocks,
+                ready.num_hit_blocks,
                 prefetch_duration_ms,
                 self._prefetch_tracker.pending_prefetches,
             )
 
-        return result
+        return ready
 
     def _cancel_prefetch_tracking(self, req_id: str) -> None:
         """Drop in-flight prefetch metrics when polling stops before QueryReady."""
@@ -903,18 +907,13 @@ class SchedulerConnector:
         return self._release_query_probe(req_id, probe)
 
     def _release_query_probe(self, req_id: str, probe: _QueryProbe) -> bool:
-        if not probe.lease:
+        if not probe.leases or not any(probe.leases):
             self._cancel_prefetch_tracking(req_id)
             return True  # nothing leased server-side (still loading, or zero-hit Ready)
-        try:
-            self._ctx.engine_client.release(probe.lease)
-        except Exception:
-            logger.exception(
-                "[PegaKVConnector] pending query lease release exception: req=%s",
-                req_id,
-            )
-            return False
-        return True
+        return self._release_leases(probe.leases, req_id)
+
+    def _release_leases(self, leases: tuple[bytes, ...], req_id: str) -> bool:
+        return self._tp_shard_client.release(leases, req_id)
 
 
 __all__ = ["SchedulerConnector"]

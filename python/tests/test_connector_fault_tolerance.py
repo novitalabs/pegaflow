@@ -147,7 +147,7 @@ def _load_metadata(req_id: str, block_ids: tuple[int, ...]) -> PegaConnectorMeta
         load_intents={
             req_id: LoadIntent(
                 block_ids_by_group=(block_ids,),
-                lease=f"lease-{req_id}".encode(),
+                leases=(f"lease-{req_id}".encode(),),
                 num_tokens=len(block_ids) * 16,
             )
         }
@@ -166,7 +166,7 @@ def _hma_load_metadata(req_id: str) -> PegaConnectorMetadata:
         load_intents={
             req_id: LoadIntent(
                 block_ids_by_group=((11,), (21,)),
-                lease=f"lease-{req_id}".encode(),
+                leases=(f"lease-{req_id}".encode(),),
                 num_tokens=16,
             )
         }
@@ -239,7 +239,7 @@ def test_hma_load_distinguishes_block_zero_from_absent_recurrent_target():
         load_intents={
             "hma-sparse": LoadIntent(
                 block_ids_by_group=((0, 12), (None, 21)),
-                lease=b"lease-hma-sparse",
+                leases=(b"lease-hma-sparse",),
                 num_tokens=32,
             )
         }
