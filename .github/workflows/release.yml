@@ -128,6 +128,8 @@ jobs:
           cp target/wheels/*.whl dist/
         env:
           CUDA_PATH: /usr/local/cuda-13.0
+          # Grace systems commonly use 64 KiB kernel pages, while the runner uses 4 KiB.
+          JEMALLOC_SYS_WITH_LG_PAGE: "16"
 
       - name: Generate artifact tag
         id: generate_tag
