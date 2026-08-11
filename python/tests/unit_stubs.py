@@ -172,10 +172,16 @@ def _install_vllm_stubs() -> None:
     class SlidingWindowSpec:
         pass
 
+    class UniformTypeKVCacheSpecs:
+        def __init__(self, block_size, kv_cache_specs):
+            self.block_size = block_size
+            self.kv_cache_specs = kv_cache_specs
+
     kv_cache_interface.FullAttentionSpec = FullAttentionSpec
     kv_cache_interface.MLAAttentionSpec = MLAAttentionSpec
     kv_cache_interface.MambaSpec = MambaSpec
     kv_cache_interface.SlidingWindowSpec = SlidingWindowSpec
+    kv_cache_interface.UniformTypeKVCacheSpecs = UniformTypeKVCacheSpecs
     _ensure_module("vllm.v1.metrics")
     _ensure_module("vllm.v1.metrics.utils").create_metric_per_engine = lambda *_args, **_kwargs: {}
 

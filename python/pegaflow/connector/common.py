@@ -260,13 +260,24 @@ class CacheGroupLayout:
             FullAttentionSpec,
             MambaSpec,
             MLAAttentionSpec,
+            UniformTypeKVCacheSpecs,
         )
 
         specs = tuple(group.kv_cache_spec for group in groups)
         if len(specs) == 1:
-            if type(specs[0]) not in (FullAttentionSpec, MLAAttentionSpec):
+            spec = specs[0]
+            is_uniform_mla = (
+                type(spec) is UniformTypeKVCacheSpecs
+                and bool(spec.kv_cache_specs)
+                and all(
+                    type(layer_spec) is MLAAttentionSpec
+                    for layer_spec in spec.kv_cache_specs.values()
+                )
+            )
+            if type(spec) not in (FullAttentionSpec, MLAAttentionSpec) and not is_uniform_mla:
                 raise RuntimeError(
-                    "PegaFlow supports a single cache group only for FullAttention or MLA"
+                    "PegaFlow supports a single cache group only for FullAttention, MLA, "
+                    "or uniformly grouped MLA layers"
                 )
         else:
             if any(
@@ -298,13 +309,17 @@ class CacheGroupLayout:
                 "PegaFlow HMA requires cache groups with identical logical block sizes"
             )
 
-        hash_group_index = next(
-            (
-                index
-                for index, group in enumerate(groups)
-                if isinstance(group.kv_cache_spec, FullAttentionSpec)
-            ),
-            None,
+        hash_group_index = (
+            0
+            if len(groups) == 1
+            else next(
+                (
+                    index
+                    for index, group in enumerate(groups)
+                    if type(group.kv_cache_spec) is FullAttentionSpec
+                ),
+                None,
+            )
         )
         if hash_group_index is None:
             raise RuntimeError(

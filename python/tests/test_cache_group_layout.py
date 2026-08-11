@@ -15,6 +15,7 @@ from vllm.v1.kv_cache_interface import (  # noqa: E402
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
 )
 
 from pegaflow.connector.common import CacheGroupLayout  # noqa: E402
@@ -38,6 +39,13 @@ def _mamba(block_size=16, mode="align"):
     spec = MambaSpec()
     spec.block_size = block_size
     spec.mamba_cache_mode = mode
+    return spec
+
+
+def _mla(block_size=16, head_size=128):
+    spec = MLAAttentionSpec()
+    spec.block_size = block_size
+    spec.head_size = head_size
     return spec
 
 
@@ -65,6 +73,45 @@ def test_accepts_single_attention_group(spec_type):
 
     assert layout.hash_group_index == 0
     assert not layout.has_recurrent_state
+
+
+def test_accepts_single_uniform_mla_group():
+    group = SimpleNamespace(
+        layer_names=("model.layers.0.self_attn.attn", "model.layers.0.self_attn.indexer.k_cache"),
+        kv_cache_spec=UniformTypeKVCacheSpecs(
+            block_size=16,
+            kv_cache_specs={
+                "model.layers.0.self_attn.attn": _mla(head_size=576),
+                "model.layers.0.self_attn.indexer.k_cache": _mla(head_size=128),
+            },
+        ),
+    )
+
+    layout = CacheGroupLayout.from_config(_config(group))
+
+    assert layout.layer_names == (group.layer_names,)
+    assert layout.hash_group_index == 0
+    assert not layout.has_recurrent_state
+
+
+@pytest.mark.parametrize("other_spec_type", [FullAttentionSpec, SlidingWindowSpec])
+def test_rejects_uniform_group_with_non_mla_layer(other_spec_type):
+    other_spec = other_spec_type()
+    other_spec.block_size = 16
+    spec = UniformTypeKVCacheSpecs(
+        block_size=16,
+        kv_cache_specs={"attention": _mla(), "other": other_spec},
+    )
+
+    with pytest.raises(RuntimeError, match="single cache group"):
+        CacheGroupLayout.from_config(_config(_group("attention", spec)))
+
+
+def test_rejects_empty_uniform_mla_group():
+    spec = UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs={})
+
+    with pytest.raises(RuntimeError, match="single cache group"):
+        CacheGroupLayout.from_config(_config(_group("attention", spec)))
 
 
 @pytest.mark.parametrize("mode", ["align", "all"])
