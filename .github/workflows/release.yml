@@ -4,9 +4,11 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 jobs:
   build:
+    if: github.event_name == 'push'
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -73,7 +75,65 @@ jobs:
         id: generate_tag
         run: |
           PYTAG=$(echo "py${{ matrix.python-version }}" | tr -d '.')
-          echo "artifact_tag=${PYTAG}-${{ matrix.cuda-variant }}" >> $GITHUB_OUTPUT
+          echo "artifact_tag=${PYTAG}-${{ matrix.cuda-variant }}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pegaflow-wheel-${{ steps.generate_tag.outputs.artifact_tag }}
+          path: dist/*.whl
+
+  build-arm-cu13:
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11', '3.12', '3.13', '3.14']
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install CUDA 13 toolkit and build dependencies
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y \
+            cuda-cudart-dev-13-0 \
+            cuda-nvcc-13-0 \
+            cuda-nvrtc-dev-13-0 \
+            libibverbs-dev \
+            pkg-config \
+            protobuf-compiler
+
+      - name: Install rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.0
+
+      - name: Install maturin
+        run: pip install maturin
+
+      - name: Patch package name for cu13
+        run: |
+          sed -i 's/^name = "pegaflow-llm"$/name = "pegaflow-llm-cu13"/' python/pyproject.toml
+          sed -i 's/"pegaflow-llm\[/"pegaflow-llm-cu13\[/g' python/pyproject.toml
+
+      - name: Build wheel
+        run: |
+          ./scripts/build-wheel.sh --release --no-default-features --features cuda-13,rdma
+          mkdir -p dist
+          cp target/wheels/*.whl dist/
+        env:
+          CUDA_PATH: /usr/local/cuda-13.0
+
+      - name: Generate artifact tag
+        id: generate_tag
+        run: |
+          PYTAG=$(echo "py${{ matrix.python-version }}" | tr -d '.')
+          echo "artifact_tag=${PYTAG}-arm64-cu13" >> "$GITHUB_OUTPUT"
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
@@ -82,7 +142,8 @@ jobs:
           path: dist/*.whl
 
   publish-release:
-    needs: build
+    if: github.event_name == 'push'
+    needs: [build, build-arm-cu13]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
