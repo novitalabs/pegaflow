@@ -539,6 +539,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         None
     };
 
+    let hll_tracker = Arc::new(std::sync::Mutex::new(
+        pegaflow_common::hll::MultiWindowHllTracker::new(
+            parse_hll_windows(&cli.metric_hll_windows)
+                .map_err(|err| format!("invalid --metric-hll-windows: {err}"))?,
+            cli.metric_hll_bucket_bits,
+        ),
+    ));
+
     let storage_config = pegaflow_core::StorageConfig {
         enable_lfu_admission: cli.enable_lfu_admission,
         hint_value_size_bytes: cli.hint_value_size,
@@ -553,6 +561,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         advertise_addr,
         metaserver_queue_depth: cli.metaserver_queue_depth,
         pool_shards: cli.pool_shards,
+        hll_tracker: Arc::clone(&hll_tracker),
     };
 
     if cli.pool_shards > 1 {
@@ -583,13 +592,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         )
     })?;
 
-    let hll_tracker = Arc::new(std::sync::Mutex::new(
-        pegaflow_common::hll::MultiWindowHllTracker::new(
-            parse_hll_windows(&cli.metric_hll_windows)
-                .map_err(|err| format!("invalid --metric-hll-windows: {err}"))?,
-            cli.metric_hll_bucket_bits,
-        ),
-    ));
     crate::metric::register_hll_gauges(&hll_tracker);
 
     let shutdown = Arc::new(Notify::new());
@@ -606,7 +608,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             Arc::clone(&engine),
             registry.clone(),
             Arc::clone(&shutdown),
-            Arc::clone(&hll_tracker),
         );
 
         // Spawn background GC task for stale inflight blocks and expired transfer locks

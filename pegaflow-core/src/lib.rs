@@ -495,6 +495,11 @@ impl PegaEngine {
 
         match &status {
             PrefetchStatus::Ready { blocks, missing } => {
+                let ready_len = blocks.len().min(block_hashes.len());
+                let miss_hashes = &block_hashes[ready_len..];
+                debug_assert_eq!(*missing, miss_hashes.len());
+                self.storage
+                    .record_hll_misses(namespace, block_hashes.len() as u64, miss_hashes);
                 let metrics = core_metrics();
                 metrics.cache_block_hits.add(blocks.len() as u64, &[]);
                 if *missing > 0 {

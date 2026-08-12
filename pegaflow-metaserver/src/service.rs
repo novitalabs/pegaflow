@@ -1,13 +1,14 @@
 use crate::metric::record_rpc_result;
 use crate::proto::engine::meta_server_server::MetaServer;
 use crate::proto::engine::{
-    HeartbeatNodeRequest, HeartbeatNodeResponse, InsertBlockHashesRequest,
+    HeartbeatNodeRequest, HeartbeatNodeResponse, HllSnapshotReport, InsertBlockHashesRequest,
     InsertBlockHashesResponse, NodePrefixResult, QueryPrefixBlocksRequest,
     QueryPrefixBlocksResponse, RemoveBlockHashesRequest, RemoveBlockHashesResponse, ResponseStatus,
     UnregisterNodeRequest, UnregisterNodeResponse,
 };
-use crate::store::{BlockHashStore, StoreError};
+use crate::store::{BlockHashStore, HllNodeReport, StoreError};
 use log::debug;
+use pegaflow_common::hll::HllWindowSnapshot as CommonHllWindowSnapshot;
 use std::sync::Arc;
 use std::time::Instant;
 use tonic::{Request, Response, Status, async_trait};
@@ -43,7 +44,38 @@ impl GrpcMetaService {
         match err {
             StoreError::UnknownNode => Status::failed_precondition("unknown node"),
             StoreError::StaleSession => Status::failed_precondition("stale node session"),
+            StoreError::InvalidHllReport(message) => Status::invalid_argument(message),
+            StoreError::IncompatibleHllSchema => {
+                Status::failed_precondition("incompatible cluster HLL schema")
+            }
         }
+    }
+
+    fn parse_hll_report(report: Option<HllSnapshotReport>) -> Result<HllNodeReport, Status> {
+        let report = report.ok_or_else(|| Status::invalid_argument("hll_report is required"))?;
+        let windows = report
+            .windows
+            .into_iter()
+            .map(|window| {
+                let bucket_bits = u8::try_from(window.bucket_bits).map_err(|_| {
+                    Status::invalid_argument(format!(
+                        "HLL bucket_bits does not fit into uint8: {}",
+                        window.bucket_bits
+                    ))
+                })?;
+                Ok(CommonHllWindowSnapshot {
+                    window: window.window,
+                    window_secs: window.window_secs,
+                    bucket_bits,
+                    registers: window.registers,
+                    total_requests: window.total_requests,
+                })
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+        Ok(HllNodeReport {
+            snapshot_at_unix_ms: report.snapshot_at_unix_ms,
+            windows,
+        })
     }
 }
 
@@ -61,8 +93,9 @@ impl MetaServer for GrpcMetaService {
         );
         let result = async {
             let node_id = Self::parse_node_id(&req.node_id)?;
+            let hll_report = Self::parse_hll_report(req.hll_report)?;
             self.store
-                .heartbeat_node(&req.node, node_id)
+                .heartbeat_node(&req.node, node_id, hll_report)
                 .map_err(Self::store_error_status)?;
             Ok(Response::new(HeartbeatNodeResponse {
                 stale_after_secs: self.store.config().node_stale_after.as_secs(),
@@ -302,10 +335,24 @@ impl MetaServer for GrpcMetaService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::engine::HllWindowSnapshot;
     use crate::store::BlockHashStore;
 
     fn make_service() -> GrpcMetaService {
         GrpcMetaService::new(Arc::new(BlockHashStore::new()))
+    }
+
+    fn test_hll_report() -> HllSnapshotReport {
+        HllSnapshotReport {
+            snapshot_at_unix_ms: 1,
+            windows: vec![HllWindowSnapshot {
+                window: "1m".into(),
+                window_secs: 60,
+                bucket_bits: 4,
+                registers: vec![0; 16],
+                total_requests: 0,
+            }],
+        }
     }
 
     async fn heartbeat_node(svc: &GrpcMetaService, node: &str) -> String {
@@ -313,6 +360,7 @@ mod tests {
         svc.heartbeat_node(Request::new(HeartbeatNodeRequest {
             node: node.into(),
             node_id: node_id.clone(),
+            hll_report: Some(test_hll_report()),
         }))
         .await
         .unwrap();
@@ -459,6 +507,7 @@ mod tests {
             .heartbeat_node(Request::new(HeartbeatNodeRequest {
                 node: "node-a".into(),
                 node_id,
+                hll_report: Some(test_hll_report()),
             }))
             .await
             .unwrap()
@@ -478,10 +527,47 @@ mod tests {
             .heartbeat_node(Request::new(HeartbeatNodeRequest {
                 node: "node-a".into(),
                 node_id: new_id,
+                hll_report: Some(test_hll_report()),
             }))
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_requires_hll_report() {
+        let svc = make_service();
+        let err = svc
+            .heartbeat_node(Request::new(HeartbeatNodeRequest {
+                node: "node-a".into(),
+                node_id: Uuid::new_v4().to_string(),
+                hll_report: None,
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("hll_report is required"));
+        assert_eq!(svc.store.node_counts(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_rejects_damaged_registers() {
+        let svc = make_service();
+        let mut report = test_hll_report();
+        report.windows[0].registers.pop();
+        let err = svc
+            .heartbeat_node(Request::new(HeartbeatNodeRequest {
+                node: "node-a".into(),
+                node_id: Uuid::new_v4().to_string(),
+                hll_report: Some(report),
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("registers length"));
+        assert_eq!(svc.store.node_counts(), (0, 0));
     }
 
     #[tokio::test]

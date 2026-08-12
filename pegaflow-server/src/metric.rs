@@ -26,7 +26,7 @@ pub fn register_hll_gauges(tracker: &Arc<Mutex<MultiWindowHllTracker>>) {
 
         let cardinality = meter
             .f64_observable_gauge("pegaflow_hll_cardinality")
-            .with_description("Estimated distinct blocks seen in the sliding window")
+            .with_description("Estimated distinct cache-miss blocks seen in the sliding window")
             .with_callback(move |observer| {
                 if let Ok(mut t) = t_card.lock() {
                     for (label, m) in t.metrics() {
@@ -38,7 +38,7 @@ pub fn register_hll_gauges(tracker: &Arc<Mutex<MultiWindowHllTracker>>) {
 
         let total_requests = meter
             .u64_observable_gauge("pegaflow_hll_total_requests")
-            .with_description("Total block requests in the sliding window")
+            .with_description("Total queried blocks in the sliding window")
             .with_callback(move |observer| {
                 if let Ok(mut t) = t_total.lock() {
                     for (label, m) in t.metrics() {

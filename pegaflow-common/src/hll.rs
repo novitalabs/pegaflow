@@ -7,11 +7,26 @@
 //! (e.g. SHA-256, xxHash). Longer hashes give more leading-zero headroom.
 
 use std::collections::VecDeque;
+use std::hash::{BuildHasher, Hasher};
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
+
+use ahash::RandomState;
 
 /// Allowed range for `bucket_bits` (register index width).
 pub const MIN_BUCKET_BITS: u8 = 4;
 pub const MAX_BUCKET_BITS: u8 = 18;
+pub const MAX_HLL_REPORT_BYTES: usize = 1024 * 1024;
+pub const MAX_HLL_WINDOWS: usize = 32;
+
+static NAMESPACED_HASHER: LazyLock<RandomState> = LazyLock::new(|| {
+    RandomState::with_seeds(
+        0x0b43_953c_6c27_8e15,
+        0x2d8f_8d5a_3918_2e07,
+        0x98d6_d35b_76f2_9a43,
+        0xf17c_4281_594b_a7d9,
+    )
+});
 
 // ============================================================================
 // HyperLogLog core
@@ -22,6 +37,7 @@ pub const MAX_BUCKET_BITS: u8 = 18;
 /// Input hashes are expected to have good uniformity (e.g. SHA-256).
 /// The full hash is used: top `bucket_bits` bits select the register,
 /// remaining bits are scanned for leading zeros.
+#[derive(Debug)]
 pub struct HyperLogLog {
     registers: Vec<u8>,
     bucket_bits: u8,
@@ -82,6 +98,32 @@ impl HyperLogLog {
                 *a = *b;
             }
         }
+    }
+
+    /// Build an HLL from a mergeable register snapshot.
+    pub fn from_registers(bucket_bits: u8, registers: Vec<u8>) -> Result<Self, String> {
+        if !(MIN_BUCKET_BITS..=MAX_BUCKET_BITS).contains(&bucket_bits) {
+            return Err(format!(
+                "HLL bucket_bits must be in {MIN_BUCKET_BITS}..={MAX_BUCKET_BITS}, got {bucket_bits}"
+            ));
+        }
+        let expected = 1usize << bucket_bits;
+        if registers.len() != expected {
+            return Err(format!(
+                "HLL registers length must be {expected} for bucket_bits={bucket_bits}, got {}",
+                registers.len()
+            ));
+        }
+        Ok(Self {
+            registers,
+            bucket_bits,
+            lz_mask: (1u32 << (32 - bucket_bits)) - 1,
+        })
+    }
+
+    /// Registers used for mergeable snapshots.
+    pub fn registers(&self) -> &[u8] {
+        &self.registers
     }
 
     /// Reset all registers to zero.
@@ -205,7 +247,7 @@ fn alpha_m(m: usize) -> f64 {
 /// Metric snapshot returned by [`HllTracker::metric`].
 #[derive(Debug, Clone)]
 pub struct HllMetric {
-    /// Estimated number of distinct block hashes in the window.
+    /// Estimated number of distinct miss block identities in the window.
     pub cardinality: f64,
     /// Total block requests (including duplicates) in the window.
     pub total_requests: u64,
@@ -213,6 +255,16 @@ pub struct HllMetric {
     pub estimated_hit_rate: f64,
     /// Number of active time slots in the sliding window.
     pub window_slot_count: usize,
+}
+
+/// Mergeable snapshot for one configured sliding window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HllWindowSnapshot {
+    pub window: String,
+    pub window_secs: u64,
+    pub bucket_bits: u8,
+    pub registers: Vec<u8>,
+    pub total_requests: u64,
 }
 
 struct WindowSlot {
@@ -225,7 +277,7 @@ struct WindowSlot {
 ///
 /// Divides time into fixed-duration slots and maintains a ring of HLLs.
 /// The merged cardinality across all active slots approximates the number
-/// of distinct blocks requested in the window. From this we derive:
+/// of distinct miss blocks recorded in the window. From this we derive:
 ///
 /// ```text
 /// hit_rate = (total_requests - cardinality) / total_requests
@@ -268,6 +320,19 @@ impl HllTracker {
     /// time drift. For example with 1h slots: if the first slot starts at 0:00
     /// and the next request arrives at 1:30, the new slot starts at 1:00 (not 1:30).
     pub fn record(&mut self, hash: &[u8]) {
+        self.record_hashes_with_total(std::slice::from_ref(&hash.to_vec()), 1);
+    }
+
+    /// Record a batch of distinct identities while accounting for a possibly
+    /// larger observation count. The identities are inserted into HLL, while
+    /// `total_requests` is used as the denominator. This is used by the
+    /// miss-only reference: only cache misses enter HLL, but every queried
+    /// block still contributes to the total observation count.
+    pub fn record_hashes_with_total(&mut self, hashes: &[Vec<u8>], total_requests: u64) {
+        if total_requests == 0 {
+            return;
+        }
+
         let now = Instant::now();
 
         let need_new_slot = match self.slots.back() {
@@ -295,15 +360,15 @@ impl HllTracker {
         }
 
         let slot = self.slots.back_mut().unwrap();
-        slot.hll.insert(hash);
-        slot.request_count += 1;
+        for hash in hashes {
+            slot.hll.insert(hash);
+        }
+        slot.request_count += total_requests;
     }
 
     /// Record a batch of block hashes from a gRPC request.
     pub fn record_hashes(&mut self, hashes: &[Vec<u8>]) {
-        for hash in hashes {
-            self.record(hash);
-        }
+        self.record_hashes_with_total(hashes, hashes.len() as u64);
     }
 
     /// Compute and return the current metric snapshot.
@@ -331,6 +396,25 @@ impl HllTracker {
             total_requests: total,
             estimated_hit_rate: hit_rate,
             window_slot_count: self.slots.len(),
+        }
+    }
+
+    fn snapshot(&mut self, window: String) -> HllWindowSnapshot {
+        self.expire_old_slots(Instant::now());
+        self.ensure_merged();
+
+        let mut hll = HyperLogLog::new(self.bucket_bits);
+        hll.merge(&self.merged);
+        if let Some(back) = self.slots.back() {
+            hll.merge(&back.hll);
+        }
+
+        HllWindowSnapshot {
+            window,
+            window_secs: self.window_duration.as_secs(),
+            bucket_bits: self.bucket_bits,
+            registers: hll.registers,
+            total_requests: self.slots.iter().map(|slot| slot.request_count).sum(),
         }
     }
 
@@ -417,6 +501,32 @@ impl MultiWindowHllTracker {
         }
     }
 
+    /// Record cache object identities as `(namespace, raw block hash)`.
+    /// This legacy-shaped API records every supplied identity as a miss and
+    /// uses the supplied slice length as the observation denominator.
+    pub fn record_namespaced_hashes(&mut self, namespace: &str, hashes: &[Vec<u8>]) {
+        self.record_namespaced_misses(namespace, hashes.len() as u64, hashes);
+    }
+
+    /// Record all queried blocks in the denominator but insert only the
+    /// identities that were misses into HLL. Repeated misses remain deduped by
+    /// HLL, preserving the infinite-cache reuse reference without discarding
+    /// historical observations.
+    pub fn record_namespaced_misses(
+        &mut self,
+        namespace: &str,
+        total_requests: u64,
+        miss_hashes: &[Vec<u8>],
+    ) {
+        let namespaced_hashes: Vec<Vec<u8>> = miss_hashes
+            .iter()
+            .map(|hash| namespaced_hash(namespace, hash).to_be_bytes().to_vec())
+            .collect();
+        for (_, tracker) in &mut self.windows {
+            tracker.record_hashes_with_total(&namespaced_hashes, total_requests);
+        }
+    }
+
     /// Snapshot every window. Returned in insertion order.
     pub fn metrics(&mut self) -> Vec<(String, HllMetric)> {
         self.windows
@@ -424,6 +534,22 @@ impl MultiWindowHllTracker {
             .map(|(label, tracker)| (label.clone(), tracker.metric()))
             .collect()
     }
+
+    /// Snapshot every window in mergeable register form, including empty windows.
+    pub fn snapshots(&mut self) -> Vec<HllWindowSnapshot> {
+        self.windows
+            .iter_mut()
+            .map(|(label, tracker)| tracker.snapshot(label.clone()))
+            .collect()
+    }
+}
+
+fn namespaced_hash(namespace: &str, block_hash: &[u8]) -> u64 {
+    let mut hasher = NAMESPACED_HASHER.build_hasher();
+    hasher.write_u64(namespace.len() as u64);
+    hasher.write(namespace.as_bytes());
+    hasher.write(block_hash);
+    hasher.finish()
 }
 
 fn derive_slot_duration(window: Duration) -> Duration {
@@ -518,6 +644,26 @@ mod tests {
     }
 
     #[test]
+    fn hll_register_round_trip() {
+        let mut original = HyperLogLog::new(10);
+        for i in 0u32..1000 {
+            original.insert(&sha256_like(i));
+        }
+
+        let restored =
+            HyperLogLog::from_registers(original.bucket_bits(), original.registers().to_vec())
+                .unwrap();
+        assert_eq!(restored.registers(), original.registers());
+        assert_eq!(restored.cardinality(), original.cardinality());
+    }
+
+    #[test]
+    fn hll_rejects_wrong_register_length() {
+        let error = HyperLogLog::from_registers(10, vec![0; 100]).unwrap_err();
+        assert!(error.contains("registers length must be 1024"));
+    }
+
+    #[test]
     fn hll_clear() {
         let mut hll = HyperLogLog::new(14);
         for i in 0u32..100 {
@@ -608,6 +754,36 @@ mod tests {
         assert_eq!(m.total_requests, 0);
         assert_eq!(m.estimated_hit_rate, 0.0);
         assert_eq!(m.window_slot_count, 0);
+    }
+
+    #[test]
+    fn empty_tracker_snapshot_contains_zero_registers() {
+        let mut tracker =
+            MultiWindowHllTracker::new(vec![("15m".to_string(), Duration::from_secs(900))], 10);
+        let snapshots = tracker.snapshots();
+
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].window, "15m");
+        assert_eq!(snapshots[0].window_secs, 900);
+        assert_eq!(snapshots[0].total_requests, 0);
+        assert_eq!(snapshots[0].registers, vec![0; 1024]);
+    }
+
+    #[test]
+    fn namespaced_hashes_keep_equal_raw_hashes_distinct() {
+        let mut tracker =
+            MultiWindowHllTracker::new(vec![("15m".to_string(), Duration::from_secs(900))], 14);
+        let raw_hash = vec![42; 32];
+
+        tracker.record_namespaced_hashes("model-a", std::slice::from_ref(&raw_hash));
+        tracker.record_namespaced_hashes("model-b", std::slice::from_ref(&raw_hash));
+        let snapshots = tracker.snapshots();
+        let hll =
+            HyperLogLog::from_registers(snapshots[0].bucket_bits, snapshots[0].registers.clone())
+                .unwrap();
+
+        assert_eq!(snapshots[0].total_requests, 2);
+        assert!((1.5..2.5).contains(&hll.cardinality()));
     }
 
     #[test]
@@ -790,6 +966,31 @@ mod tests {
                 m.cardinality
             );
         }
+    }
+
+    #[test]
+    fn namespaced_misses_keep_all_observations_in_denominator() {
+        let mut tracker =
+            MultiWindowHllTracker::new(vec![("15m".into(), Duration::from_secs(15 * 60))], 14);
+        let miss = vec![sha256_like(1).to_vec(), sha256_like(2).to_vec()];
+        tracker.record_namespaced_misses("model", 5, &miss);
+
+        let metric = tracker.metrics().remove(0).1;
+        assert_eq!(metric.total_requests, 5);
+        assert!(metric.cardinality > 1.0 && metric.cardinality < 3.5);
+        assert!(metric.estimated_hit_rate > 0.3);
+    }
+
+    #[test]
+    fn namespaced_misses_allow_all_hit_observation_without_hll_insert() {
+        let mut tracker =
+            MultiWindowHllTracker::new(vec![("15m".into(), Duration::from_secs(15 * 60))], 14);
+        tracker.record_namespaced_misses("model", 4, &[]);
+
+        let metric = tracker.metrics().remove(0).1;
+        assert_eq!(metric.total_requests, 4);
+        assert_eq!(metric.cardinality, 0.0);
+        assert_eq!(metric.estimated_hit_rate, 1.0);
     }
 
     #[test]

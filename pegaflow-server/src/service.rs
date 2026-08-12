@@ -26,22 +26,15 @@ pub struct GrpcEngineService {
     engine: Arc<PegaEngine>,
     registry: RegistryHandle,
     shutdown: Arc<Notify>,
-    hll_tracker: Arc<std::sync::Mutex<pegaflow_common::hll::MultiWindowHllTracker>>,
     session_registry: Arc<SessionRegistry>,
 }
 
 impl GrpcEngineService {
-    pub fn new(
-        engine: Arc<PegaEngine>,
-        registry: RegistryHandle,
-        shutdown: Arc<Notify>,
-        hll_tracker: Arc<std::sync::Mutex<pegaflow_common::hll::MultiWindowHllTracker>>,
-    ) -> Self {
+    pub fn new(engine: Arc<PegaEngine>, registry: RegistryHandle, shutdown: Arc<Notify>) -> Self {
         Self {
             engine,
             registry,
             shutdown,
-            hll_tracker,
             session_registry: SessionRegistry::new(),
         }
     }
@@ -568,9 +561,6 @@ impl Engine for GrpcEngineService {
             let outcome = match status {
                 PrefetchStatus::Ready { blocks, missing } => {
                     let hit = blocks.len();
-                    if let Ok(mut t) = self.hll_tracker.lock() {
-                        t.record_hashes(&req.block_hashes);
-                    }
                     let lease = if hit == 0 {
                         Vec::new()
                     } else {
