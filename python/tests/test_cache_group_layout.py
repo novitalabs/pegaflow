@@ -49,9 +49,16 @@ def _mla(block_size=16, head_size=128):
     return spec
 
 
-def test_accepts_full_attention_with_aligned_mamba():
+class SpecializedFullAttentionSpec(FullAttentionSpec):
+    pass
+
+
+@pytest.mark.parametrize("spec_type", [FullAttentionSpec, SpecializedFullAttentionSpec])
+def test_accepts_full_attention_with_aligned_mamba(spec_type):
+    attention = spec_type()
+    attention.block_size = 528
     config = _config(
-        _group("attention", _full_attention(block_size=528)),
+        _group("attention", attention),
         _group("recurrent", _mamba(block_size=528)),
     )
 
@@ -170,7 +177,7 @@ def test_rejects_full_attention_with_sliding_window():
         CacheGroupLayout.from_config(config)
 
 
-def test_rejects_mla_with_mamba():
+def test_accepts_mla_with_mamba():
     mla = MLAAttentionSpec()
     mla.block_size = 16
     config = _config(
@@ -178,8 +185,10 @@ def test_rejects_mla_with_mamba():
         _group("recurrent", _mamba()),
     )
 
-    with pytest.raises(RuntimeError, match="only FullAttention and Mamba"):
-        CacheGroupLayout.from_config(config)
+    layout = CacheGroupLayout.from_config(config)
+
+    assert layout.hash_group_index == 0
+    assert layout.has_recurrent_state
 
 
 def test_rejects_non_align_mamba_mode():
