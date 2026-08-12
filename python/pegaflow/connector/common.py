@@ -280,15 +280,12 @@ class CacheGroupLayout:
                     "or uniformly grouped MLA layers"
                 )
         else:
-            if any(
-                type(spec) is not FullAttentionSpec and not isinstance(spec, MambaSpec)
-                for spec in specs
-            ):
+            if any(not isinstance(spec, (FullAttentionSpec, MambaSpec)) for spec in specs):
                 raise RuntimeError(
                     "PegaFlow HMA supports only FullAttention and Mamba cache groups"
                 )
 
-            has_full_attention = any(type(spec) is FullAttentionSpec for spec in specs)
+            has_full_attention = any(isinstance(spec, FullAttentionSpec) for spec in specs)
             has_mamba = any(isinstance(spec, MambaSpec) for spec in specs)
             if not has_full_attention:
                 raise RuntimeError(
@@ -316,7 +313,7 @@ class CacheGroupLayout:
                 (
                     index
                     for index, group in enumerate(groups)
-                    if type(group.kv_cache_spec) is FullAttentionSpec
+                    if isinstance(group.kv_cache_spec, FullAttentionSpec)
                 ),
                 None,
             )
