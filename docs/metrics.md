@@ -285,7 +285,7 @@ tier counters.
   - Only used when `--metrics-otel-endpoint` is set
 
 - `--metric-hll-windows`: Comma-separated HLL sliding windows for estimated
-  prefix reuse (default: `15m,1h,24h`)
+  prefix reuse (default: `15m,1h,1d`)
   - Supported units: `s`, `m`, `h`, `d`
   - Each configured duration becomes a canonical `window` label. For example,
     the default config exports `window="15m"`, `window="1h"`, and `window="1d"`.

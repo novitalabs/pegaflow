@@ -92,8 +92,6 @@ pub struct HllNodeReport {
 #[derive(Debug, Clone, Default)]
 pub struct ClusterHllSnapshot {
     pub windows: Vec<ClusterHllWindowSnapshot>,
-    refresh_after: Option<Instant>,
-    oldest_snapshot_at_unix_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -116,7 +114,6 @@ struct HllWindowSchema {
 #[derive(Default)]
 struct HllState {
     schema: Option<Vec<HllWindowSchema>>,
-    cluster: ClusterHllSnapshot,
 }
 
 /// Snapshot of the session that wrote this block ownership. Query compares it
@@ -238,12 +235,10 @@ impl BlockHashStore {
                 }
             }
         }
-        hll_state.cluster = self.compute_cluster_hll(now, &incoming_schema)?;
         Ok(())
     }
 
     pub fn unregister_node(&self, node: &str, node_id: Uuid) -> Result<usize, StoreError> {
-        let mut hll_state = self.hll_state.lock().expect("HLL state mutex poisoned");
         if self
             .nodes
             .remove_if(node, |_, record| record.node_id == node_id)
@@ -263,7 +258,6 @@ impl BlockHashStore {
             return Err(StoreError::UnknownNode);
         }
         let removed = self.remove_node_owners(node, node_id);
-        self.refresh_cluster_hll(&mut hll_state)?;
         Ok(removed)
     }
 
@@ -369,7 +363,6 @@ impl BlockHashStore {
     /// Sweep owners whose node is missing or whose ownership TTL has expired, and
     /// refresh the cached live-owner redundancy snapshot in the same walk.
     pub fn sweep_expired(&self) -> SweepStats {
-        let mut hll_state = self.hll_state.lock().expect("HLL state mutex poisoned");
         let now = Instant::now();
         let mut stats = SweepStats::default();
         let mut snapshot = RedundancySnapshot::default();
@@ -414,9 +407,6 @@ impl BlockHashStore {
             .lock()
             .expect("redundancy snapshot mutex poisoned") = snapshot;
 
-        self.refresh_cluster_hll_at(&mut hll_state, now)
-            .expect("stored HLL reports must remain valid");
-
         stats
     }
 
@@ -456,25 +446,18 @@ impl BlockHashStore {
 
     pub fn cluster_hll_snapshot(&self) -> ClusterHllSnapshot {
         let now = Instant::now();
-        let mut state = self.hll_state.lock().expect("HLL state mutex poisoned");
-        if state
-            .cluster
-            .refresh_after
-            .is_some_and(|refresh_after| now > refresh_after)
-        {
-            self.refresh_cluster_hll_at(&mut state, now)
-                .expect("stored HLL reports must remain valid");
-        }
-
-        let mut cluster = state.cluster.clone();
-        let snapshot_age_seconds = cluster
-            .oldest_snapshot_at_unix_ms
-            .map(|snapshot_at| unix_time_ms().saturating_sub(snapshot_at) as f64 / 1000.0)
-            .unwrap_or_default();
-        for window in &mut cluster.windows {
-            window.snapshot_age_seconds = snapshot_age_seconds;
-        }
-        cluster
+        let schema = self
+            .hll_state
+            .lock()
+            .expect("HLL state mutex poisoned")
+            .schema
+            .clone();
+        schema
+            .as_deref()
+            .map_or_else(ClusterHllSnapshot::default, |schema| {
+                self.compute_cluster_hll(now, schema)
+                    .expect("stored HLL reports must remain valid")
+            })
     }
 
     #[allow(
@@ -492,7 +475,7 @@ impl BlockHashStore {
     }
 
     fn touch_node_session(&self, node: &str, node_id: Uuid) -> Result<(), StoreError> {
-        let Some(mut record) = self.nodes.get_mut(node) else {
+        let Some(record) = self.nodes.get(node) else {
             warn!(
                 "MetaServer metadata write rejected unknown node: node={} node_id={}",
                 node, node_id
@@ -506,28 +489,6 @@ impl BlockHashStore {
             );
             return Err(StoreError::StaleSession);
         }
-        record.last_seen = Instant::now();
-        Ok(())
-    }
-
-    fn refresh_cluster_hll(&self, state: &mut HllState) -> Result<(), StoreError> {
-        self.refresh_cluster_hll_at(state, Instant::now())
-    }
-
-    fn refresh_cluster_hll_at(&self, state: &mut HllState, now: Instant) -> Result<(), StoreError> {
-        let has_active_nodes = self
-            .nodes
-            .iter()
-            .any(|record| now.duration_since(record.last_seen) <= self.config.node_stale_after);
-        if !has_active_nodes {
-            state.schema = None;
-            state.cluster = ClusterHllSnapshot::default();
-            return Ok(());
-        }
-        let schema = state.schema.as_ref().ok_or_else(|| {
-            StoreError::InvalidHllReport("active nodes have no HLL schema".into())
-        })?;
-        state.cluster = self.compute_cluster_hll(now, schema)?;
         Ok(())
     }
 
@@ -554,10 +515,6 @@ impl BlockHashStore {
         let snapshot_age_seconds = oldest_snapshot_at_unix_ms
             .map(|snapshot_at| now_unix_ms.saturating_sub(snapshot_at) as f64 / 1000.0)
             .unwrap_or_default();
-        let refresh_after = active
-            .iter()
-            .map(|(last_seen, _)| *last_seen + self.config.node_stale_after)
-            .min();
         let mut windows = Vec::with_capacity(schema.len());
         for (index, window_schema) in schema.iter().enumerate() {
             let mut union = HyperLogLog::new(window_schema.bucket_bits);
@@ -585,11 +542,7 @@ impl BlockHashStore {
                 snapshot_age_seconds,
             });
         }
-        Ok(ClusterHllSnapshot {
-            windows,
-            refresh_after,
-            oldest_snapshot_at_unix_ms,
-        })
+        Ok(ClusterHllSnapshot { windows })
     }
 
     fn remove_node_owners(&self, node: &str, node_id: Uuid) -> usize {
@@ -835,6 +788,22 @@ mod tests {
 
         let second_age = store.cluster_hll_snapshot().windows[0].snapshot_age_seconds;
         assert!(second_age > first_age);
+    }
+
+    #[test]
+    fn metadata_writes_do_not_extend_hll_session_liveness() {
+        let store = BlockHashStore::with_config(StoreConfig {
+            node_stale_after: Duration::from_millis(10),
+            ttl: Duration::from_secs(60),
+        });
+        let node_id = heartbeat_node(&store, "node-a");
+        std::thread::sleep(Duration::from_millis(20));
+
+        store
+            .insert_hashes("ns", &[vec![1]], "node-a", node_id)
+            .unwrap();
+
+        assert!(store.cluster_hll_snapshot().windows.is_empty());
     }
 
     #[test]
@@ -1209,10 +1178,10 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_refreshes_node_liveness() {
+    fn test_insert_does_not_refresh_node_liveness() {
         let store = BlockHashStore::with_config(StoreConfig {
             node_stale_after: Duration::from_secs(60),
-            ttl: Duration::from_secs(60),
+            ttl: Duration::from_secs(120),
         });
         let node_id = heartbeat_node(&store, "node-a");
         store.nodes.get_mut("node-a").unwrap().last_seen = Instant::now() - Duration::from_secs(61);
@@ -1221,17 +1190,16 @@ mod tests {
             .insert_hashes("ns", &[vec![1]], "node-a", node_id)
             .unwrap();
 
-        assert_eq!(store.node_counts(), (1, 0));
+        assert_eq!(store.node_counts(), (0, 1));
         let existing = store.query_prefix("ns", &[vec![1]]);
-        assert_eq!(existing.len(), 1);
-        assert_eq!(existing[0].nodes[0].as_ref(), "node-a");
+        assert!(existing.is_empty());
     }
 
     #[test]
-    fn test_remove_refreshes_node_liveness() {
+    fn test_remove_does_not_refresh_node_liveness() {
         let store = BlockHashStore::with_config(StoreConfig {
             node_stale_after: Duration::from_secs(60),
-            ttl: Duration::from_secs(60),
+            ttl: Duration::from_secs(120),
         });
         let node_id = heartbeat_node(&store, "node-a");
         store
@@ -1243,7 +1211,7 @@ mod tests {
             .remove_hashes("ns", &[vec![2]], "node-a", node_id)
             .unwrap();
 
-        assert_eq!(store.node_counts(), (1, 0));
+        assert_eq!(store.node_counts(), (0, 1));
     }
 
     #[test]

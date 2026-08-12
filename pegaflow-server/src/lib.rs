@@ -174,7 +174,7 @@ pub struct Cli {
     /// HLL sliding-window list for hit-rate estimation. Comma-separated humantime
     /// durations; each becomes a canonical `window` label in metrics (e.g. `15m,1h,1d`).
     /// Slot duration is derived as `clamp(window/24, 1min, 1h)`.
-    #[arg(long, default_value = "15m,1h,24h", value_parser = parse_hll_windows_arg)]
+    #[arg(long, default_value = "15m,1h,1d", value_parser = parse_hll_windows_arg)]
     pub metric_hll_windows: String,
 
     /// HLL bucket index bits 4–18 (default: 14 → 16384 buckets, ~0.8% error)
@@ -211,7 +211,7 @@ fn parse_hll_windows_arg(s: &str) -> Result<String, String> {
     Ok(s.to_string())
 }
 
-/// Parse a comma-separated list of humantime windows (e.g. `15m,1h,24h`).
+/// Parse a comma-separated list of humantime windows (e.g. `15m,1h,1d`).
 /// Each entry becomes `(label, duration)` where label is canonicalized from
 /// the parsed duration.
 fn parse_hll_windows(s: &str) -> Result<Vec<(String, Duration)>, String> {
@@ -790,7 +790,7 @@ mod tests {
     #[test]
     fn cli_explicit_metric_hll_windows_parses_without_panic() {
         let cli =
-            Cli::try_parse_from(["pegaflow-server", "--metric-hll-windows", "15m,1h,24h"]).unwrap();
+            Cli::try_parse_from(["pegaflow-server", "--metric-hll-windows", "15m,1h,1d"]).unwrap();
 
         assert_eq!(
             parse_hll_windows(&cli.metric_hll_windows).unwrap(),

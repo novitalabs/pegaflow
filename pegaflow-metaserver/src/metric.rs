@@ -142,7 +142,7 @@ pub fn register_store_gauges(store: &Arc<BlockHashStore>) {
             .build();
         let hll_age_store = Arc::clone(&s);
         let hll_snapshot_age_seconds = meter
-            .f64_observable_gauge("pegaflow_metaserver_hll_snapshot_age")
+            .f64_observable_gauge("pegaflow_metaserver_hll_snapshot_age_seconds")
             .with_description("Age in seconds of the oldest active-node HLL snapshot")
             .with_unit("s")
             .with_callback(move |observer| {

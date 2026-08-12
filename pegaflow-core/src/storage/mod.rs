@@ -96,7 +96,7 @@ impl Default for StorageConfig {
                 vec![
                     ("15m".to_string(), Duration::from_secs(15 * 60)),
                     ("1h".to_string(), Duration::from_secs(60 * 60)),
-                    ("24h".to_string(), Duration::from_secs(24 * 60 * 60)),
+                    ("1d".to_string(), Duration::from_secs(24 * 60 * 60)),
                 ],
                 14,
             ))),

@@ -320,7 +320,7 @@ impl HllTracker {
     /// time drift. For example with 1h slots: if the first slot starts at 0:00
     /// and the next request arrives at 1:30, the new slot starts at 1:00 (not 1:30).
     pub fn record(&mut self, hash: &[u8]) {
-        self.record_hashes_with_total(std::slice::from_ref(&hash.to_vec()), 1);
+        self.record_hashes_with_total(std::slice::from_ref(&hash), 1);
     }
 
     /// Record a batch of distinct identities while accounting for a possibly
@@ -328,7 +328,7 @@ impl HllTracker {
     /// `total_requests` is used as the denominator. This is used by the
     /// miss-only reference: only cache misses enter HLL, but every queried
     /// block still contributes to the total observation count.
-    pub fn record_hashes_with_total(&mut self, hashes: &[Vec<u8>], total_requests: u64) {
+    pub fn record_hashes_with_total<T: AsRef<[u8]>>(&mut self, hashes: &[T], total_requests: u64) {
         if total_requests == 0 {
             return;
         }
@@ -361,7 +361,7 @@ impl HllTracker {
 
         let slot = self.slots.back_mut().unwrap();
         for hash in hashes {
-            slot.hll.insert(hash);
+            slot.hll.insert(hash.as_ref());
         }
         slot.request_count += total_requests;
     }
@@ -942,7 +942,7 @@ mod tests {
             vec![
                 ("15m".into(), Duration::from_secs(15 * 60)),
                 ("1h".into(), Duration::from_secs(3600)),
-                ("24h".into(), Duration::from_secs(86400)),
+                ("1d".into(), Duration::from_secs(86400)),
             ],
             14,
         );
@@ -957,7 +957,7 @@ mod tests {
         assert_eq!(metrics.len(), 3);
         assert_eq!(metrics[0].0, "15m");
         assert_eq!(metrics[1].0, "1h");
-        assert_eq!(metrics[2].0, "24h");
+        assert_eq!(metrics[2].0, "1d");
         for (label, m) in metrics {
             assert_eq!(m.total_requests, 2000, "{label}: total");
             assert!(
