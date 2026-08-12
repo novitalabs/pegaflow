@@ -306,7 +306,7 @@ impl StorageEngine {
     ) {
         match self.hll_tracker.lock() {
             Ok(mut tracker) => {
-                tracker.record_namespaced_misses(namespace, total_observations, miss_hashes)
+                tracker.record_namespaced_misses(namespace, total_observations, miss_hashes);
             }
             Err(error) => {
                 warn!("HLL tracker lock poisoned; observations were not recorded: {error}");
