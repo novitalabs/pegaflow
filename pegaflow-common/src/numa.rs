@@ -279,15 +279,22 @@ fn get_device_numa_node(device_id: u32) -> NumaNode {
         }
     };
 
-    if let Ok(stdout) = std::str::from_utf8(&output.stdout)
-        && let Some(line) = stdout.lines().next()
-        && let Some(numa_str) = line.split(':').nth(1)
-        && let Ok(node) = numa_str.trim().parse::<u32>()
-    {
-        return NumaNode(node);
+    if let Ok(stdout) = std::str::from_utf8(&output.stdout) {
+        return parse_closest_cpu_numa_node(stdout);
     }
 
     NumaNode::UNKNOWN
+}
+
+fn parse_closest_cpu_numa_node(output: &str) -> NumaNode {
+    output
+        .lines()
+        .next()
+        .and_then(|line| line.split(':').nth(1))
+        .and_then(|numa_ids| numa_ids.split(',').next())
+        .and_then(|numa_id| numa_id.trim().parse::<u32>().ok())
+        .map(NumaNode)
+        .unwrap_or(NumaNode::UNKNOWN)
 }
 
 /// Get NUMA affinity for all available GPUs.
@@ -580,6 +587,18 @@ mod tests {
         assert_eq!(
             topology.gpu_numa_nodes(),
             vec![NumaNode(0), NumaNode(3), NumaNode(5)]
+        );
+    }
+
+    #[test]
+    fn closest_cpu_numa_node_uses_first_reported_id() {
+        assert_eq!(
+            parse_closest_cpu_numa_node("NUMA ID of closest CPU: 3\n"),
+            NumaNode(3)
+        );
+        assert_eq!(
+            parse_closest_cpu_numa_node("NUMA IDs of closest CPU: 1,18-33\n"),
+            NumaNode(1)
         );
     }
 
