@@ -102,6 +102,27 @@ PegaFlow exposes the following metrics for monitoring KV cache operations:
   - Current sealed block bytes resident in cache (sum of footprints)
   - Use case: Attribute pinned pool usage to cache residency
 
+- **pegaflow_cache_residence_duration_seconds** (Histogram)
+  - RAM resident block lifetime from its first successful cache insertion to
+    removal, measured in seconds
+  - Labels: `reason` (`pressure` or `cleanup`)
+  - `pressure`: allocator pressure removed the block through LRU reclaim
+  - `cleanup`: the memory-cache cleanup endpoint removed the block
+  - Buckets: `1s`, `5s`, `10s`, `30s`, `1m`, `2m`, `5m`, `10m`, `30m`,
+    `1h`, `2h`, `6h`, `12h`, `24h`, and `+Inf`
+  - Use case: Track typical and tail cache residence time and visualize the
+    eviction-age distribution
+  - Scope: each RAM residence is a separate lifetime. A block reinserted after
+    eviction starts a new lifetime; cache hits, duplicate inserts, and
+    replacement-class changes do not reset the original insertion time.
+  - The lifetime ends when the block leaves the resident cache, even if an
+    outstanding `Arc` keeps its pinned memory allocated. Correlate
+    `pegaflow_cache_block_evictions_still_referenced_total` and
+    `pegaflow_cache_eviction_reclaimed_bytes_total` to diagnose delayed memory
+    reclamation.
+  - SSD ring-cache overwrite and blocks still resident at server shutdown are
+    not observed.
+
 - **pegaflow_pinned_for_load_entries** (Gauge)
   - Current number of pinned_for_load entries (instance_id, block_key)
   - Use case: Diagnose load-path pins keeping evicted blocks alive
@@ -477,6 +498,33 @@ rate(pegaflow_save_bytes_total[1m]) / 1e6
 
 # Pool memory utilization
 pegaflow_pool_used_bytes / pegaflow_pool_capacity_bytes
+
+# RAM cache residence-time quantiles for pressure evictions
+histogram_quantile(
+  0.50,
+  sum by (le) (
+    rate(pegaflow_cache_residence_duration_seconds_bucket{reason="pressure"}[5m])
+  )
+)
+
+histogram_quantile(
+  0.95,
+  sum by (le) (
+    rate(pegaflow_cache_residence_duration_seconds_bucket{reason="pressure"}[5m])
+  )
+)
+
+histogram_quantile(
+  0.99,
+  sum by (le) (
+    rate(pegaflow_cache_residence_duration_seconds_bucket{reason="pressure"}[5m])
+  )
+)
+
+# RAM cache residence-time buckets for a Grafana heatmap
+sum by (le) (
+  rate(pegaflow_cache_residence_duration_seconds_bucket{reason="pressure"}[5m])
+)
 
 # Cluster HLL miss-based theoretical reuse reference for the 15m window
 pegaflow_metaserver_hll_estimated_hit_rate{job="pegaflow-metaserver",window="15m"}

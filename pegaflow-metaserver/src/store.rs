@@ -274,7 +274,7 @@ impl BlockHashStore {
         node: &str,
         node_id: Uuid,
     ) -> Result<Vec<Vec<u8>>, StoreError> {
-        self.validate_node_session(node, node_id)?;
+        self.touch_node_session(node, node_id)?;
         let node: Arc<str> = Arc::from(node);
         let now = Instant::now();
         let mut reclaimable_hashes = Vec::new();
@@ -310,7 +310,7 @@ impl BlockHashStore {
         node: &str,
         node_id: Uuid,
     ) -> Result<usize, StoreError> {
-        self.validate_node_session(node, node_id)?;
+        self.touch_node_session(node, node_id)?;
         let mut removed = 0;
         for hash in hashes {
             let key = BlockKey::new(namespace.to_string(), hash.clone());
@@ -491,8 +491,8 @@ impl BlockHashStore {
         *self.hll_state.lock().expect("HLL state mutex poisoned") = HllState::default();
     }
 
-    fn validate_node_session(&self, node: &str, node_id: Uuid) -> Result<(), StoreError> {
-        let Some(record) = self.nodes.get(node) else {
+    fn touch_node_session(&self, node: &str, node_id: Uuid) -> Result<(), StoreError> {
+        let Some(mut record) = self.nodes.get_mut(node) else {
             warn!(
                 "MetaServer metadata write rejected unknown node: node={} node_id={}",
                 node, node_id
@@ -506,6 +506,7 @@ impl BlockHashStore {
             );
             return Err(StoreError::StaleSession);
         }
+        record.last_seen = Instant::now();
         Ok(())
     }
 
@@ -1208,7 +1209,7 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_does_not_refresh_node_liveness() {
+    fn test_insert_refreshes_node_liveness() {
         let store = BlockHashStore::with_config(StoreConfig {
             node_stale_after: Duration::from_secs(60),
             ttl: Duration::from_secs(60),
@@ -1220,13 +1221,14 @@ mod tests {
             .insert_hashes("ns", &[vec![1]], "node-a", node_id)
             .unwrap();
 
-        assert_eq!(store.node_counts(), (0, 0));
+        assert_eq!(store.node_counts(), (1, 0));
         let existing = store.query_prefix("ns", &[vec![1]]);
-        assert!(existing.is_empty());
+        assert_eq!(existing.len(), 1);
+        assert_eq!(existing[0].nodes[0].as_ref(), "node-a");
     }
 
     #[test]
-    fn test_remove_does_not_refresh_node_liveness() {
+    fn test_remove_refreshes_node_liveness() {
         let store = BlockHashStore::with_config(StoreConfig {
             node_stale_after: Duration::from_secs(60),
             ttl: Duration::from_secs(60),
@@ -1241,7 +1243,7 @@ mod tests {
             .remove_hashes("ns", &[vec![2]], "node-a", node_id)
             .unwrap();
 
-        assert_eq!(store.node_counts(), (0, 0));
+        assert_eq!(store.node_counts(), (1, 0));
     }
 
     #[test]
