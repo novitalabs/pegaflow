@@ -539,13 +539,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         None
     };
 
-    let hll_tracker = Arc::new(std::sync::Mutex::new(
-        pegaflow_common::hll::MultiWindowHllTracker::new(
-            parse_hll_windows(&cli.metric_hll_windows)
-                .map_err(|err| format!("invalid --metric-hll-windows: {err}"))?,
-            cli.metric_hll_bucket_bits,
-        ),
-    ));
+    let hll_windows = parse_hll_windows(&cli.metric_hll_windows)
+        .map_err(|err| format!("invalid --metric-hll-windows: {err}"))?;
 
     let storage_config = pegaflow_core::StorageConfig {
         enable_lfu_admission: cli.enable_lfu_admission,
@@ -561,7 +556,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         advertise_addr,
         metaserver_queue_depth: cli.metaserver_queue_depth,
         pool_shards: cli.pool_shards,
-        hll_tracker: Arc::clone(&hll_tracker),
+        hll_windows,
+        hll_bucket_bits: cli.metric_hll_bucket_bits,
     };
 
     if cli.pool_shards > 1 {
@@ -592,8 +588,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         )
     })?;
 
-    crate::metric::register_hll_gauges(&hll_tracker);
-
     let shutdown = Arc::new(Notify::new());
 
     runtime.block_on(async move {
@@ -603,6 +597,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             cli.use_hugepages,
             storage_config,
         )?);
+
+        crate::metric::register_hll_gauges(engine.hll_tracker());
 
         let service = GrpcEngineService::new(
             Arc::clone(&engine),

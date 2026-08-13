@@ -44,10 +44,6 @@ impl GrpcMetaService {
         match err {
             StoreError::UnknownNode => Status::failed_precondition("unknown node"),
             StoreError::StaleSession => Status::failed_precondition("stale node session"),
-            StoreError::InvalidHllReport(message) => Status::invalid_argument(message),
-            StoreError::IncompatibleHllSchema => {
-                Status::failed_precondition("incompatible cluster HLL schema")
-            }
         }
     }
 
@@ -552,22 +548,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_heartbeat_rejects_damaged_registers() {
+    async fn test_heartbeat_accepts_damaged_registers_but_excludes_from_cluster_hll() {
         let svc = make_service();
         let mut report = test_hll_report();
         report.windows[0].registers.pop();
-        let err = svc
-            .heartbeat_node(Request::new(HeartbeatNodeRequest {
-                node: "node-a".into(),
-                node_id: Uuid::new_v4().to_string(),
-                hll_report: Some(report),
-            }))
-            .await
-            .unwrap_err();
+        svc.heartbeat_node(Request::new(HeartbeatNodeRequest {
+            node: "node-a".into(),
+            node_id: Uuid::new_v4().to_string(),
+            hll_report: Some(report),
+        }))
+        .await
+        .unwrap();
 
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        assert!(err.message().contains("registers length"));
-        assert_eq!(svc.store.node_counts(), (0, 0));
+        // Node liveness is preserved; only the HLL contribution is dropped.
+        assert_eq!(svc.store.node_counts(), (1, 0));
+        assert!(svc.store.cluster_hll_snapshot().windows.is_empty());
     }
 
     #[tokio::test]

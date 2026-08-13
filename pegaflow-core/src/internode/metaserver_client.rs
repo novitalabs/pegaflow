@@ -779,12 +779,6 @@ async fn send_heartbeat(
     }
 }
 
-pub(crate) fn validate_hll_tracker_report(
-    tracker: &Arc<Mutex<MultiWindowHllTracker>>,
-) -> Result<(), String> {
-    build_hll_report(tracker).map(drop)
-}
-
 fn build_hll_report(
     tracker: &Arc<Mutex<MultiWindowHllTracker>>,
 ) -> Result<HllSnapshotReport, String> {

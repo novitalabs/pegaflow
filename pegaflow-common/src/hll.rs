@@ -7,26 +7,13 @@
 //! (e.g. SHA-256, xxHash). Longer hashes give more leading-zero headroom.
 
 use std::collections::VecDeque;
-use std::hash::{BuildHasher, Hasher};
-use std::sync::LazyLock;
 use std::time::{Duration, Instant};
-
-use ahash::RandomState;
 
 /// Allowed range for `bucket_bits` (register index width).
 pub const MIN_BUCKET_BITS: u8 = 4;
 pub const MAX_BUCKET_BITS: u8 = 18;
 pub const MAX_HLL_REPORT_BYTES: usize = 1024 * 1024;
 pub const MAX_HLL_WINDOWS: usize = 32;
-
-static NAMESPACED_HASHER: LazyLock<RandomState> = LazyLock::new(|| {
-    RandomState::with_seeds(
-        0x0b43_953c_6c27_8e15,
-        0x2d8f_8d5a_3918_2e07,
-        0x98d6_d35b_76f2_9a43,
-        0xf17c_4281_594b_a7d9,
-    )
-});
 
 // ============================================================================
 // HyperLogLog core
@@ -124,6 +111,11 @@ impl HyperLogLog {
     /// Registers used for mergeable snapshots.
     pub fn registers(&self) -> &[u8] {
         &self.registers
+    }
+
+    /// Mutable registers for in-place merging.
+    pub fn registers_mut(&mut self) -> &mut [u8] {
+        &mut self.registers
     }
 
     /// Reset all registers to zero.
@@ -518,9 +510,9 @@ impl MultiWindowHllTracker {
         total_requests: u64,
         miss_hashes: &[Vec<u8>],
     ) {
-        let namespaced_hashes: Vec<Vec<u8>> = miss_hashes
+        let namespaced_hashes: Vec<[u8; 8]> = miss_hashes
             .iter()
-            .map(|hash| namespaced_hash(namespace, hash).to_be_bytes().to_vec())
+            .map(|hash| namespaced_hash(namespace, hash))
             .collect();
         for (_, tracker) in &mut self.windows {
             tracker.record_hashes_with_total(&namespaced_hashes, total_requests);
@@ -544,12 +536,36 @@ impl MultiWindowHllTracker {
     }
 }
 
-fn namespaced_hash(namespace: &str, block_hash: &[u8]) -> u64 {
-    let mut hasher = NAMESPACED_HASHER.build_hasher();
-    hasher.write_u64(namespace.len() as u64);
-    hasher.write(namespace.as_bytes());
-    hasher.write(block_hash);
-    hasher.finish()
+/// Stable identity hash for `(namespace, block_hash)`.
+///
+/// Cluster aggregation unions raw HLL registers across nodes, so every node
+/// must map the same object to the exact same bits regardless of platform,
+/// architecture, or build. FNV-1a with a splitmix64 finalizer is fully
+/// specified byte-by-byte; do not replace it with a hasher that does not
+/// guarantee cross-platform stability (e.g. ahash, SipHash with random keys).
+fn namespaced_hash(namespace: &str, block_hash: &[u8]) -> [u8; 8] {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = FNV_OFFSET;
+    // Length prefix keeps (namespace, hash) boundaries unambiguous.
+    for &byte in (namespace.len() as u64)
+        .to_le_bytes()
+        .iter()
+        .chain(namespace.as_bytes())
+        .chain(block_hash)
+    {
+        h = (h ^ u64::from(byte)).wrapping_mul(FNV_PRIME);
+    }
+    splitmix64(h).to_be_bytes()
+}
+
+/// splitmix64 finalizer: strengthens FNV-1a's avalanche so the top bits used
+/// for HLL bucket selection are uniformly distributed.
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
 }
 
 fn derive_slot_duration(window: Duration) -> Duration {
@@ -1049,12 +1065,5 @@ mod tests {
         let m3 = splitmix64(m2);
         hash[24..32].copy_from_slice(&m3.to_le_bytes());
         hash
-    }
-
-    fn splitmix64(mut x: u64) -> u64 {
-        x = x.wrapping_add(0x9e3779b97f4a7c15);
-        x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-        x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
-        x ^ (x >> 31)
     }
 }

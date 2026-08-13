@@ -848,6 +848,13 @@ impl PegaEngine {
         self.storage.transfer_lock_timeout()
     }
 
+    /// Shared miss-only HLL tracker, for metrics gauge registration.
+    pub fn hll_tracker(
+        &self,
+    ) -> &Arc<std::sync::Mutex<pegaflow_common::hll::MultiWindowHllTracker>> {
+        self.storage.hll_tracker()
+    }
+
     /// Release a transfer lock session. Returns the number of blocks released.
     pub fn release_transfer_lock(&self, session_id: &str) -> usize {
         self.storage.release_transfer_lock(session_id)

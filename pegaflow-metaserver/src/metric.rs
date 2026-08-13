@@ -86,6 +86,9 @@ pub fn register_store_gauges(store: &Arc<BlockHashStore>) {
                 observer.observe(avg, &[]);
             })
             .build();
+        // Each HLL gauge re-merges the cluster union in its own callback; at
+        // scrape frequency the merge cost (nodes x windows x registers) is
+        // negligible, and OTEL 0.31 no longer offers multi-instrument callbacks.
         let hll_cardinality_store = Arc::clone(&s);
         let hll_cardinality = meter
             .f64_observable_gauge("pegaflow_metaserver_hll_cardinality")
@@ -102,7 +105,7 @@ pub fn register_store_gauges(store: &Arc<BlockHashStore>) {
         let hll_total_store = Arc::clone(&s);
         let hll_total_requests = meter
             .u64_observable_gauge("pegaflow_metaserver_hll_total_requests")
-            .with_description("Total queried cache objects across active nodes")
+            .with_description("Total cache-miss objects reported across active nodes")
             .with_callback(move |observer| {
                 for window in hll_total_store.cluster_hll_snapshot().windows {
                     observer.observe(

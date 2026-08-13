@@ -5,8 +5,6 @@ pub(crate) mod transfer_lock;
 mod write_path;
 
 use bytesize::ByteSize;
-#[cfg(not(feature = "rdma"))]
-use log::warn;
 use log::{debug, info, warn};
 use std::collections::HashSet;
 use std::num::NonZeroU64;
@@ -22,7 +20,7 @@ use crate::internode::metaserver_client::MetaServerClientConfig;
 use crate::metrics::core_metrics;
 use crate::pinned_pool::{PinnedAllocation, PinnedAllocator};
 use pegaflow_common::NumaNode;
-use pegaflow_common::hll::MultiWindowHllTracker;
+use pegaflow_common::hll::{MAX_HLL_REPORT_BYTES, MAX_HLL_WINDOWS, MultiWindowHllTracker};
 
 use prefetch::PrefetchScheduler;
 #[cfg(feature = "rdma")]
@@ -34,6 +32,26 @@ use write_path::{InsertDeps, WritePipeline};
 // turns an eviction burst into a command flood that overflows the removal queue.
 const RECLAIM_BATCH_SIZE: usize = 512;
 pub const DEFAULT_RDMA_QPS_PER_PEER: usize = 2;
+
+fn validate_hll_config(windows: &[(String, Duration)], bucket_bits: u8) -> Result<(), String> {
+    if windows.is_empty() || windows.len() > MAX_HLL_WINDOWS {
+        return Err(format!(
+            "HLL window count must be in 1..={}, got {}",
+            MAX_HLL_WINDOWS,
+            windows.len()
+        ));
+    }
+    let mut tracker = MultiWindowHllTracker::new(windows.to_vec(), bucket_bits);
+    let report = tracker.snapshots();
+    let payload_bytes: usize = report.iter().map(|w| w.registers.len()).sum();
+    if payload_bytes > MAX_HLL_REPORT_BYTES {
+        return Err(format!(
+            "HLL register payload exceeds {} bytes: {payload_bytes}",
+            MAX_HLL_REPORT_BYTES
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryCacheCleanupStats {
@@ -72,8 +90,10 @@ pub struct StorageConfig {
     pub metaserver_queue_depth: usize,
     /// Number of shards for the pinned memory pool (reduces allocator lock contention).
     pub pool_shards: usize,
-    /// HLL tracker shared by query accounting, local metrics, and MetaServer heartbeats.
-    pub hll_tracker: Arc<Mutex<MultiWindowHllTracker>>,
+    /// HLL window config: (label, duration) pairs.
+    pub hll_windows: Vec<(String, Duration)>,
+    /// HLL bucket bits (register array size = 2^bucket_bits).
+    pub hll_bucket_bits: u8,
 }
 
 impl Default for StorageConfig {
@@ -92,14 +112,12 @@ impl Default for StorageConfig {
             advertise_addr: None,
             metaserver_queue_depth: crate::internode::DEFAULT_METASERVER_QUEUE_DEPTH,
             pool_shards: 1,
-            hll_tracker: Arc::new(Mutex::new(MultiWindowHllTracker::new(
-                vec![
-                    ("15m".to_string(), Duration::from_secs(15 * 60)),
-                    ("1h".to_string(), Duration::from_secs(60 * 60)),
-                    ("1d".to_string(), Duration::from_secs(24 * 60 * 60)),
-                ],
-                14,
-            ))),
+            hll_windows: vec![
+                ("15m".to_string(), Duration::from_secs(15 * 60)),
+                ("1h".to_string(), Duration::from_secs(60 * 60)),
+                ("1d".to_string(), Duration::from_secs(24 * 60 * 60)),
+            ],
+            hll_bucket_bits: 14,
         }
     }
 }
@@ -134,7 +152,11 @@ impl StorageEngine {
         let rdma_qps_per_peer = config.rdma_qps_per_peer;
         let blockwise_alloc = config.blockwise_alloc;
         let transfer_lock_timeout = config.transfer_lock_timeout;
-        let hll_tracker = Arc::clone(&config.hll_tracker);
+
+        let hll_tracker = Arc::new(Mutex::new(MultiWindowHllTracker::new(
+            config.hll_windows.clone(),
+            config.hll_bucket_bits,
+        )));
 
         if blockwise_alloc {
             info!("Blockwise allocation enabled for batch_save");
@@ -176,7 +198,7 @@ impl StorageEngine {
         ));
 
         if config.metaserver_addr.is_some() {
-            crate::internode::metaserver_client::validate_hll_tracker_report(&hll_tracker)?;
+            validate_hll_config(&config.hll_windows, config.hll_bucket_bits)?;
         }
 
         let metaserver_client = config.metaserver_addr.as_ref().map(|addr| {
@@ -312,6 +334,12 @@ impl StorageEngine {
                 warn!("HLL tracker lock poisoned; observations were not recorded: {error}");
             }
         }
+    }
+
+    /// Shared tracker: query accounting feeds it, server metrics and
+    /// MetaServer heartbeats read it.
+    pub(crate) fn hll_tracker(&self) -> &Arc<Mutex<MultiWindowHllTracker>> {
+        &self.hll_tracker
     }
 
     pub(crate) fn is_ssd_enabled(&self) -> bool {
