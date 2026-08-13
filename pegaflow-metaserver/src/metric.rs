@@ -105,7 +105,7 @@ pub fn register_store_gauges(store: &Arc<BlockHashStore>) {
         let hll_total_store = Arc::clone(&s);
         let hll_total_requests = meter
             .u64_observable_gauge("pegaflow_metaserver_hll_total_requests")
-            .with_description("Total cache-miss objects reported across active nodes")
+            .with_description("Total queried cache objects across active nodes")
             .with_callback(move |observer| {
                 for window in hll_total_store.cluster_hll_snapshot().windows {
                     observer.observe(

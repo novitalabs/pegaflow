@@ -480,7 +480,7 @@ impl BlockHashStore {
     }
 
     fn touch_node_session(&self, node: &str, node_id: Uuid) -> Result<(), StoreError> {
-        let Some(mut record) = self.nodes.get_mut(node) else {
+        let Some(record) = self.nodes.get(node) else {
             warn!(
                 "MetaServer metadata write rejected unknown node: node={} node_id={}",
                 node, node_id
@@ -494,7 +494,6 @@ impl BlockHashStore {
             );
             return Err(StoreError::StaleSession);
         }
-        record.last_seen = Instant::now();
         Ok(())
     }
 
@@ -746,7 +745,7 @@ mod tests {
         let cluster = store.cluster_hll_snapshot();
         assert_eq!(store.node_counts(), (2, 0));
         // Each window schema groups independently; they won't union together.
-        assert!(cluster.windows.len() >= 1);
+        assert!(!cluster.windows.is_empty());
     }
 
     #[test]
@@ -811,9 +810,9 @@ mod tests {
             .insert_hashes("ns", &[vec![1]], "node-a", node_id)
             .unwrap();
 
-        // Metadata write refreshes node liveness but not HLL report receipt time,
-        // so the report is stale even though the node is active.
-        assert_eq!(store.node_counts(), (1, 0));
+        // Metadata writes validate the session but do not refresh node liveness,
+        // so the node and its HLL report are stale together.
+        assert_eq!(store.node_counts(), (0, 1));
         assert!(store.cluster_hll_snapshot().windows.is_empty());
     }
 
@@ -1189,7 +1188,7 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_refreshes_node_liveness() {
+    fn test_insert_does_not_refresh_node_liveness() {
         let store = BlockHashStore::with_config(StoreConfig {
             node_stale_after: Duration::from_secs(60),
             ttl: Duration::from_secs(120),
@@ -1201,14 +1200,13 @@ mod tests {
             .insert_hashes("ns", &[vec![1]], "node-a", node_id)
             .unwrap();
 
-        assert_eq!(store.node_counts(), (1, 0));
+        assert_eq!(store.node_counts(), (0, 1));
         let existing = store.query_prefix("ns", &[vec![1]]);
-        assert_eq!(existing.len(), 1);
-        assert_eq!(existing[0].nodes[0].as_ref(), "node-a");
+        assert!(existing.is_empty());
     }
 
     #[test]
-    fn test_remove_refreshes_node_liveness() {
+    fn test_remove_does_not_refresh_node_liveness() {
         let store = BlockHashStore::with_config(StoreConfig {
             node_stale_after: Duration::from_secs(60),
             ttl: Duration::from_secs(120),
@@ -1223,7 +1221,7 @@ mod tests {
             .remove_hashes("ns", &[vec![2]], "node-a", node_id)
             .unwrap();
 
-        assert_eq!(store.node_counts(), (1, 0));
+        assert_eq!(store.node_counts(), (0, 1));
     }
 
     #[test]
