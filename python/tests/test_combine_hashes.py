@@ -104,6 +104,52 @@ def test_recurrent_save_waits_until_vllm_commits_all_groups():
     assert scheduler._next_stored_block_idx["r1"] == 0
 
 
+def test_recurrent_final_step_uses_finished_block_table():
+    scheduler = _make_recurrent_scheduler()
+    scheduler._get_local_cached_blocks = lambda _block_hash, _group_ids: None
+
+    assert scheduler._consume_full_block_saves("r1", written=32, computed_before_step=0) is None
+    request = SimpleNamespace(
+        request_id="r1",
+        num_computed_tokens=32,
+        block_hashes=[_hash(0), _hash(1)],
+    )
+
+    delay_free, params = scheduler.request_finished(
+        request,
+        ([11, 12, 13], [0, 0, 22, 30, 31, 32]),
+    )
+
+    assert delay_free is True
+    assert params is None
+
+    scheduler.update_connector_output(SimpleNamespace(finished_sending={"r1"}))
+    assert "r1" in scheduler._block_hashes
+
+    metadata = scheduler.build_connector_meta(
+        SimpleNamespace(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=SimpleNamespace(
+                req_ids=[],
+                resumed_req_ids=set(),
+                new_block_ids=[],
+                num_computed_tokens=[],
+            ),
+            num_scheduled_tokens={},
+            preempted_req_ids=set(),
+        )
+    )
+    assert metadata.ready_save_intents["r1"] == SaveIntent(
+        block_ids_by_group=((11, 12), (0, 22)),
+        block_hashes=(_hash(0), _hash(1)),
+    )
+    assert metadata.save_intents == {}
+
+    scheduler.update_connector_output(SimpleNamespace(finished_sending={"r1"}))
+    assert "r1" not in scheduler._block_hashes
+    assert "r1" not in scheduler._held_requests
+
+
 def test_recurrent_save_does_not_predict_current_step_state():
     scheduler = _make_recurrent_scheduler()
 

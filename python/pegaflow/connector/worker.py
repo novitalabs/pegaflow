@@ -17,6 +17,7 @@ from pegaflow.connector.common import (
     ConnectorContext,
     PegaConnectorMetadata,
     PegaKVConnectorStats,
+    SaveIntent,
     logger,
     parse_env_int,
 )
@@ -547,6 +548,11 @@ class WorkerConnector:
     ) -> None:
         self._current_metadata = metadata
 
+        if metadata.ready_save_intents:
+            if not self._cache_groups.has_recurrent_state:
+                raise RuntimeError("ready save intents are only valid for HMA")
+            self._process_save_batch([self._make_save_task(metadata.ready_save_intents)])
+
         if not metadata.load_intents:
             return
 
@@ -721,7 +727,17 @@ class WorkerConnector:
         if metadata is None or not metadata.save_intents:
             return
 
-        request_ids = list(metadata.save_intents.keys())
+        task = self._make_save_task(metadata.save_intents)
+        if self._cache_groups.has_recurrent_state:
+            # Align-mode recurrent states can reuse their only live block on
+            # the next scheduler step. Finish D2H before returning so the
+            # saved boundary state cannot be overwritten underneath the copy.
+            self._process_save_batch([task])
+        else:
+            self._save_queue.put(task)
+
+    def _make_save_task(self, save_intents: dict[str, SaveIntent]) -> SaveTask:
+        request_ids = list(save_intents)
 
         with self._save_completion_lock:
             for req_id in request_ids:
@@ -731,14 +747,10 @@ class WorkerConnector:
                     self._save_completion_events[req_id] = threading.Event()
                 self._req_pending_save_tasks[req_id] = pending_tasks + 1
 
-        task = SaveTask(metadata=metadata, request_ids=request_ids)
-        if self._cache_groups.has_recurrent_state:
-            # Align-mode recurrent states can reuse their only live block on
-            # the next scheduler step. Finish D2H before returning so the
-            # saved boundary state cannot be overwritten underneath the copy.
-            self._process_save_batch([task])
-        else:
-            self._save_queue.put(task)
+        return SaveTask(
+            metadata=PegaConnectorMetadata(save_intents=save_intents),
+            request_ids=request_ids,
+        )
 
     def _save_worker(self) -> None:
         logger.debug("[PegaKVConnector] Save worker thread started")

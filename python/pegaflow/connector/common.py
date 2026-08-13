@@ -361,17 +361,20 @@ class PegaConnectorMetadata(KVConnectorMetadata):
         self,
         load_intents: dict[str, LoadIntent] | None = None,
         save_intents: dict[str, SaveIntent] | None = None,
+        ready_save_intents: dict[str, SaveIntent] | None = None,
         preempted_req_ids: set[str] | None = None,
     ):
         super().__init__()
         # Maps request_id -> intent
         self.load_intents: dict[str, LoadIntent] = load_intents or {}
         self.save_intents: dict[str, SaveIntent] = save_intents or {}
+        self.ready_save_intents: dict[str, SaveIntent] = ready_save_intents or {}
         self.preempted_req_ids: set[str] = preempted_req_ids or set()
 
     def __repr__(self) -> str:
         return (
-            f"PegaConnectorMetadata(loads={len(self.load_intents)}, saves={len(self.save_intents)})"
+            f"PegaConnectorMetadata(loads={len(self.load_intents)}, "
+            f"saves={len(self.save_intents)}, ready_saves={len(self.ready_save_intents)})"
         )
 
 

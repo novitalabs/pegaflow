@@ -179,6 +179,7 @@ class SchedulerConnector:
         self._requests: dict[str, Request] = {}
 
         # Completion tracking
+        self._deferred_save_intents: dict[str, SaveIntent] = {}
         self._pending_saves: set[str] = set()
         self._held_requests: set[str] = set()
 
@@ -442,6 +443,8 @@ class SchedulerConnector:
 
     def build_connector_meta(self, scheduler_output: "SchedulerOutput") -> PegaConnectorMetadata:
         # Collect all save intents that became available this scheduler step.
+        ready_save_intents = self._deferred_save_intents
+        self._deferred_save_intents = {}
         potential_saves: dict[str, SaveIntent] = {}
 
         load_intents = self._pending_load_intents
@@ -545,6 +548,7 @@ class SchedulerConnector:
         return PegaConnectorMetadata(
             load_intents=load_intents,
             save_intents=save_intents,
+            ready_save_intents=ready_save_intents,
             preempted_req_ids=scheduler_output.preempted_req_ids or None,
         )
 
@@ -743,6 +747,54 @@ class SchedulerConnector:
                 block_ids.append(block.block_id)
         return tuple(tuple(block_ids) for block_ids in block_ids_by_group)
 
+    def _consume_finished_hma_save(
+        self,
+        req_id: str,
+        block_ids: tuple[list[int], ...],
+        written: int,
+    ) -> SaveIntent | None:
+        block_hashes = self._block_hashes.get(req_id)
+        if block_hashes is None:
+            return None
+
+        start_block_idx = self._next_stored_block_idx.get(
+            req_id, self._block_index_offsets.get(req_id, 0)
+        )
+        saveable_block_idx = min(len(block_hashes), written // self._ctx.virtual_block_size)
+        if saveable_block_idx <= start_block_idx:
+            return None
+
+        groups = self._copy_block_ids_by_group(block_ids)
+        available = tuple(len(group) for group in groups)
+        required = tuple(
+            saveable_block_idx + 1
+            if group_index in self._cache_groups.recurrent_group_indices
+            else saveable_block_idx
+            for group_index in range(self._cache_groups.group_count)
+        )
+        if any(length < minimum for length, minimum in zip(available, required, strict=True)):
+            raise RuntimeError(
+                f"req {req_id} final HMA block table is shorter than its hash prefix: "
+                f"saveable={saveable_block_idx} available_by_group={available} "
+                f"required_by_group={required}"
+            )
+
+        num_new_blocks = saveable_block_idx - start_block_idx
+        save_block_ids_by_group = []
+        for group_index, group in enumerate(groups):
+            if group_index in self._cache_groups.recurrent_group_indices:
+                save_block_ids_by_group.append(
+                    (0,) * (num_new_blocks - 1) + (group[saveable_block_idx],)
+                )
+            else:
+                save_block_ids_by_group.append(group[start_block_idx:saveable_block_idx])
+
+        self._next_stored_block_idx[req_id] = saveable_block_idx
+        return SaveIntent(
+            block_ids_by_group=tuple(save_block_ids_by_group),
+            block_hashes=block_hashes[start_block_idx:saveable_block_idx],
+        )
+
     def _copy_block_ids_by_group(self, block_ids) -> tuple[tuple[int, ...], ...]:
         groups = tuple(tuple(group) for group in block_ids)
         if len(groups) != self._cache_groups.group_count:
@@ -782,7 +834,7 @@ class SchedulerConnector:
             logger.debug("[PegaKVConnector] Request %s save completed", req_id)
 
             # Clean up if request already finished
-            if req_id in self._held_requests:
+            if req_id in self._held_requests and req_id not in self._deferred_save_intents:
                 self._cleanup_request(req_id)
                 self._held_requests.discard(req_id)
 
@@ -792,6 +844,17 @@ class SchedulerConnector:
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict | None]:
         req_id = request.request_id
+
+        if self._cache_groups.has_recurrent_state and req_id in self._block_hashes:
+            self._block_hashes[req_id] = tuple(request.block_hashes)
+            final_save = self._consume_finished_hma_save(
+                req_id,
+                block_ids,
+                request.num_computed_tokens,
+            )
+            if final_save is not None:
+                self._deferred_save_intents[req_id] = final_save
+                self._pending_saves.add(req_id)
 
         # Check if there are pending saves for this request
         if req_id in self._pending_saves:
@@ -816,6 +879,7 @@ class SchedulerConnector:
         self._allocated_blocks.pop(req_id, None)
         self._scheduled_tokens.pop(req_id, None)
         self._next_stored_block_idx.pop(req_id, None)
+        self._deferred_save_intents.pop(req_id, None)
         self._pending_saves.discard(req_id)
         self._tail_saved.discard(req_id)
 
