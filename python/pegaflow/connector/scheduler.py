@@ -237,9 +237,16 @@ class SchedulerConnector:
             self._release_pending_query_probe(req_id)
             probe = None
 
-        # No reusable Ready result.  Ask backend.
+        # A Loading task is keyed by req_id server-side. If the current query
+        # drifted, finish polling with the original identity so the TP layer can
+        # validate the stale Ready before we release it below.
+        backend_query_hashes = query_hashes
+        if probe is not None and not probe.matches(computed_blocks, query_hashes, tail_tokens):
+            backend_query_hashes = probe.query_hashes
+
+        # No reusable Ready result. Ask backend.
         lookup_start = time.perf_counter()
-        ready = self._count_available_block_prefix(query_hashes, req_id)
+        ready = self._count_available_block_prefix(backend_query_hashes, req_id)
         lookup_us = (time.perf_counter() - lookup_start) * 1e6
 
         # Backend is still loading.  Keep the original snapshot.

@@ -238,6 +238,52 @@ def test_scheduler_releases_ready_shards_when_another_shard_is_loading():
     first.release.assert_called_once_with(b"first")
 
 
+def test_scheduler_discards_drifted_prefetch_before_querying_new_hashes():
+    first = MagicMock()
+    second = MagicMock()
+    first.query_prefetch.side_effect = [
+        QueryLoading(),
+        QueryReady(4, b"first-old"),
+        QueryLoading(),
+    ]
+    second.query_prefetch.return_value = QueryReady(4, b"second-old")
+    scheduler = SchedulerConnector(_context(), engine_clients=(first, second))
+    request = SimpleNamespace(
+        request_id="request",
+        block_hashes=[b"h0", b"h1", b"h2", b"h3"],
+        num_tokens=64,
+    )
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (None, False)
+    assert scheduler.get_num_new_matched_tokens(request, 32) == (None, False)
+    assert scheduler.get_num_new_matched_tokens(request, 32) == (None, False)
+
+    original_hashes = request.block_hashes
+    current_hashes = request.block_hashes[2:]
+    assert first.query_prefetch.call_args_list == [
+        call(
+            "instance",
+            original_hashes,
+            req_id="request",
+            wait_for_full_prefix=False,
+        ),
+        call(
+            "instance",
+            original_hashes,
+            req_id="request",
+            wait_for_full_prefix=False,
+        ),
+        call(
+            "instance",
+            current_hashes,
+            req_id="request",
+            wait_for_full_prefix=False,
+        ),
+    ]
+    first.release.assert_called_once_with(b"first-old")
+    second.release.assert_called_once_with(b"second-old")
+
+
 @pytest.mark.parametrize(
     "invalid_ready",
     [
