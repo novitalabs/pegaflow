@@ -182,8 +182,9 @@ be distinct only once at cluster scope.
 - **pegaflow_metaserver_hll_active_nodes** (Gauge)
   - Number of active node sessions included in the cluster union
   - Labels: `window`
-- **pegaflow_metaserver_hll_snapshot_age_seconds** (Gauge)
+- **pegaflow_metaserver_hll_snapshot_age** (Gauge)
   - Age of the oldest active-node report in the aggregate
+  - Unit: seconds
   - Labels: `window`
 
 Every node heartbeat carries all configured windows, including all-zero
@@ -541,7 +542,7 @@ clamp_min(sum(increase(pegaflow_cache_tier_block_requests_total{job="pegaflow"}[
 
 # Cluster HLL participation and freshness
 pegaflow_metaserver_hll_active_nodes{job="pegaflow-metaserver",window="15m"}
-pegaflow_metaserver_hll_snapshot_age_seconds{job="pegaflow-metaserver",window="15m"}
+pegaflow_metaserver_hll_snapshot_age{job="pegaflow-metaserver",window="15m"}
 
 # Per-server HLL estimated reuse for every configured window
 1 - (

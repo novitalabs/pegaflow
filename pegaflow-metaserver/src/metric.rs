@@ -20,7 +20,7 @@ struct StoreGaugeHandles {
     _hll_total_requests: ObservableGauge<u64>,
     _hll_estimated_hit_rate: ObservableGauge<f64>,
     _hll_active_nodes: ObservableGauge<u64>,
-    _hll_snapshot_age_seconds: ObservableGauge<f64>,
+    _hll_snapshot_age: ObservableGauge<f64>,
 }
 
 static STORE_GAUGES: OnceLock<StoreGaugeHandles> = OnceLock::new();
@@ -141,8 +141,8 @@ pub fn register_store_gauges(store: &Arc<BlockHashStore>) {
             })
             .build();
         let hll_age_store = Arc::clone(&s);
-        let hll_snapshot_age_seconds = meter
-            .f64_observable_gauge("pegaflow_metaserver_hll_snapshot_age_seconds")
+        let hll_snapshot_age = meter
+            .f64_observable_gauge("pegaflow_metaserver_hll_snapshot_age")
             .with_description("Age in seconds of the oldest active-node HLL snapshot")
             .with_unit("s")
             .with_callback(move |observer| {
@@ -164,7 +164,7 @@ pub fn register_store_gauges(store: &Arc<BlockHashStore>) {
             _hll_total_requests: hll_total_requests,
             _hll_estimated_hit_rate: hll_estimated_hit_rate,
             _hll_active_nodes: hll_active_nodes,
-            _hll_snapshot_age_seconds: hll_snapshot_age_seconds,
+            _hll_snapshot_age: hll_snapshot_age,
         }
     });
 }
