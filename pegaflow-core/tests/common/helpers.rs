@@ -21,6 +21,8 @@ pub struct LayerInfo {
     pub block_size: usize,
     pub kv_stride: usize,
     pub segments: usize,
+    /// Hybrid-cache storage group id; 0 is the default attention group.
+    pub group: u32,
 }
 
 #[allow(
@@ -47,9 +49,10 @@ pub fn register_layers(
     let block_sizes: Vec<usize> = layers.iter().map(|l| l.block_size).collect();
     let kv_strides: Vec<usize> = layers.iter().map(|l| l.kv_stride).collect();
     let segments: Vec<usize> = layers.iter().map(|l| l.segments).collect();
+    let group_ids: Vec<u32> = layers.iter().map(|l| l.group).collect();
 
     engine
-        .register_context_layer_batch(
+        .register_context_layer_batch_strided(
             instance_id,
             namespace,
             device_id,
@@ -64,6 +67,8 @@ pub fn register_layers(
             &block_sizes,
             &kv_strides,
             &segments,
+            None,
+            Some(&group_ids),
             transfer_mode,
             page_first,
         )

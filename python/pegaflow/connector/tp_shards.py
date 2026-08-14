@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 
-from pegaflow.connector.common import logger
+from pegaflow.connector.common import RecurrentLoadHold, logger
 from pegaflow.pegaflow import EngineRpcClient, QueryLoading, QueryReady
 
 
@@ -10,6 +10,13 @@ from pegaflow.pegaflow import EngineRpcClient, QueryLoading, QueryReady
 class ShardedQueryReady:
     num_hit_blocks: int
     leases: tuple[bytes, ...]
+    # HMA only: per recurrent group, per shard membership leases and their
+    # hit positions (see RecurrentLoadHold for the wire/load contract).
+    recurrent_hold: RecurrentLoadHold | None = None
+    # HMA only: sorted query positions the hit may legally end at (every
+    # recurrent group holds a checkpoint there on every shard, below the
+    # attention prefix). Drives boundary re-derivation under token clamps.
+    usable_positions: tuple[int, ...] = ()
 
 
 class TpShardQueryClient:
@@ -82,6 +89,56 @@ class TpShardQueryClient:
             raise
 
         return ShardedQueryReady(common_blocks, tuple(leases))
+
+    def query_group_membership(
+        self,
+        instance_id: str,
+        block_hashes: list[bytes],
+        req_id: str,
+        group_id: int,
+    ) -> list[tuple[tuple[int, ...], bytes]]:
+        """Per-shard membership query over one hybrid storage group.
+
+        Returns ``(hit_positions, lease)`` per shard; the lease pins exactly
+        the hit blocks in positions order. Membership queries are local-only,
+        so every shard answers Ready immediately (never Loading).
+        """
+        results: list[tuple[tuple[int, ...], bytes]] = []
+        try:
+            for shard_index, client in enumerate(self._clients):
+                result = client.query_prefetch(
+                    instance_id,
+                    block_hashes,
+                    req_id=req_id,
+                    group_id=group_id,
+                )
+                if isinstance(result, QueryLoading):
+                    raise RuntimeError(
+                        f"TP shard {shard_index} membership query for group {group_id} "
+                        "returned Loading; membership queries are local-only"
+                    )
+                if not isinstance(result, QueryReady):
+                    raise TypeError(f"query_prefetch returned unexpected outcome {type(result)!r}")
+                positions = tuple(result.hit_positions)
+                if len(positions) != result.num_hit_blocks:
+                    raise RuntimeError(
+                        f"TP shard {shard_index} reported {result.num_hit_blocks} hits "
+                        f"but returned {len(positions)} positions"
+                    )
+                if any(position >= len(block_hashes) for position in positions):
+                    raise RuntimeError(
+                        f"TP shard {shard_index} returned hit positions outside "
+                        f"a {len(block_hashes)}-hash query"
+                    )
+                if positions and not result.lease:
+                    raise RuntimeError(
+                        f"TP shard {shard_index} returned {len(positions)} hits without a lease"
+                    )
+                results.append((positions, result.lease))
+        except Exception:
+            self.release(tuple(lease for _, lease in results), req_id)
+            raise
+        return results
 
     def release(self, leases: tuple[bytes, ...], req_id: str) -> bool:
         released = True

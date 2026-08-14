@@ -224,6 +224,65 @@ class LoadIntent:
     block_ids_by_group: tuple[tuple[int | None, ...], ...]
     leases: tuple[bytes, ...]
     num_tokens: int
+    # Hybrid-cache loads carry one membership lease per recurrent storage
+    # group (pinned checkpoints in hit-positions order) on top of the
+    # attention prefix leases. See RecurrentLoadHold.
+    recurrent_hold: "RecurrentLoadHold | None" = None
+
+
+@dataclass(frozen=True)
+class RecurrentLoadHold:
+    """Pinned recurrent checkpoints for one hybrid external load.
+
+    Indexed by ``sorted(recurrent_group_indices)`` on the outside and TP
+    shard on the inside: ``leases[g][shard]`` is the membership lease over
+    group ``g``'s hit blocks; ``hit_positions[g][shard]`` lists each leased
+    block's position in the scheduler's query hash list (lease order).
+    ``checkpoint`` is the chosen query position — the mamba state stored
+    there covers all tokens through the end of that block (vLLM convention:
+    state block ``i`` ends at token ``(i + 1) * block_size``), so the
+    resumable prefix is ``checkpoint + 1`` blocks.
+    """
+
+    leases: tuple[tuple[bytes, ...], ...]
+    hit_positions: tuple[tuple[tuple[int, ...], ...], ...]
+    checkpoint: int
+
+
+def reconcile_hybrid_hit(
+    attention_hit_blocks: int,
+    recurrent_hits: tuple[tuple[tuple[int, ...], ...], ...],
+) -> tuple[int, int | None, frozenset[int]]:
+    """Combine per-group query results into one hybrid hit.
+
+    ``attention_hit_blocks`` is the (already shard-minimized) attention prefix
+    length in blocks. ``recurrent_hits[g][s]`` lists the query positions whose
+    checkpoint block is cached in recurrent group ``g`` on shard ``s``.
+
+    HMA needs the whole prefix resumable: every recurrent group must hold a
+    checkpoint state inside the attention prefix (attention KV alone cannot
+    skip mamba's sequential prefill), and that state must exist on every TP
+    shard. Returns ``(hit_blocks, checkpoint, usable)`` where ``hit_blocks``
+    is ``checkpoint + 1`` — the checkpoint covers tokens through the end of
+    its own block — and ``usable`` is every legal boundary position (for
+    re-derivation when the token budget later shrinks the hit). ``(0, None,
+    frozenset())`` means no usable boundary: recompute from scratch.
+    """
+    if attention_hit_blocks <= 0 or not recurrent_hits:
+        return 0, None, frozenset()
+    # A checkpoint position is usable only inside the attention prefix AND
+    # present in every recurrent group on every shard.
+    usable: set[int] | None = None
+    for group_hits in recurrent_hits:
+        for shard_hits in group_hits:
+            in_prefix = {p for p in shard_hits if p < attention_hit_blocks}
+            usable = in_prefix if usable is None else usable & in_prefix
+            if not usable:
+                return 0, None, frozenset()
+    if not usable:
+        return 0, None, frozenset()
+    checkpoint = max(usable)
+    return checkpoint + 1, checkpoint, frozenset(usable)
 
 
 @dataclass(frozen=True)
@@ -236,13 +295,20 @@ class SaveIntent:
 
 @dataclass(frozen=True)
 class CacheGroupLayout:
-    """Stable vLLM cache-group order shared by scheduler and worker."""
+    """Stable vLLM cache-group order shared by scheduler and worker.
+
+    `storage_group_ids` maps each connector cache group onto the engine's
+    hybrid storage groups: every attention-like group shares storage group 0
+    (prefix cadence, raw hash keys), while each recurrent group gets its own
+    id starting at 1 (membership semantics, group-encoded keys).
+    """
 
     layer_names: tuple[tuple[str, ...], ...]
     hash_group_index: int
     has_recurrent_state: bool
     recurrent_group_indices: frozenset[int]
     recurrent_layer_names: frozenset[str]
+    storage_group_ids: tuple[int, ...] = (0,)
 
     @classmethod
     def from_config(cls, kv_cache_config) -> "CacheGroupLayout":
@@ -323,21 +389,34 @@ class CacheGroupLayout:
                 "PegaFlow requires a dense FullAttention cache group for block hashes"
             )
 
+        recurrent_group_indices = frozenset(
+            index
+            for index, group in enumerate(groups)
+            if isinstance(group.kv_cache_spec, MambaSpec)
+        )
+        # Attention-like groups all share storage group 0 (they advance in
+        # per-block prefix cadence); each recurrent group gets a dense id
+        # from 1. Engine keys are raw only for group 0, so this keeps every
+        # existing single-group cache layout bit-identical.
+        storage_group_ids = tuple(
+            0
+            if index not in recurrent_group_indices
+            else 1 + sum(1 for other in recurrent_group_indices if other < index)
+            for index in range(len(groups))
+        )
+
         return cls(
             layer_names=tuple(tuple(group.layer_names) for group in groups),
             hash_group_index=hash_group_index,
             has_recurrent_state=any(isinstance(group.kv_cache_spec, MambaSpec) for group in groups),
-            recurrent_group_indices=frozenset(
-                index
-                for index, group in enumerate(groups)
-                if isinstance(group.kv_cache_spec, MambaSpec)
-            ),
+            recurrent_group_indices=recurrent_group_indices,
             recurrent_layer_names=frozenset(
                 layer_name
                 for group in groups
                 if isinstance(group.kv_cache_spec, MambaSpec)
                 for layer_name in group.layer_names
             ),
+            storage_group_ids=storage_group_ids,
         )
 
     @property
@@ -353,6 +432,10 @@ class CacheGroupLayout:
                 result[name] = group_index
         return result
 
+    def storage_group_of(self, group_index: int) -> int:
+        """Engine storage group id for a connector cache group index."""
+        return self.storage_group_ids[group_index]
+
 
 class PegaConnectorMetadata(KVConnectorMetadata):
     """Metadata passed from scheduler to worker for KV cache operations."""
@@ -361,17 +444,20 @@ class PegaConnectorMetadata(KVConnectorMetadata):
         self,
         load_intents: dict[str, LoadIntent] | None = None,
         save_intents: dict[str, SaveIntent] | None = None,
+        ready_save_intents: dict[str, SaveIntent] | None = None,
         preempted_req_ids: set[str] | None = None,
     ):
         super().__init__()
         # Maps request_id -> intent
         self.load_intents: dict[str, LoadIntent] = load_intents or {}
         self.save_intents: dict[str, SaveIntent] = save_intents or {}
+        self.ready_save_intents: dict[str, SaveIntent] = ready_save_intents or {}
         self.preempted_req_ids: set[str] = preempted_req_ids or set()
 
     def __repr__(self) -> str:
         return (
-            f"PegaConnectorMetadata(loads={len(self.load_intents)}, saves={len(self.save_intents)})"
+            f"PegaConnectorMetadata(loads={len(self.load_intents)}, "
+            f"saves={len(self.save_intents)}, ready_saves={len(self.ready_save_intents)})"
         )
 
 
@@ -515,12 +601,14 @@ __all__ = [
     "PegaConnectorMetadata",
     "PegaKVConnectorStats",
     "PegaPromMetrics",
+    "RecurrentLoadHold",
     "SaveIntent",
     "TpShardTopology",
     "derive_namespace",
     "detect_mla",
     "logger",
     "parse_env_int",
+    "reconcile_hybrid_hit",
     "resolve_instance_id",
     "resolve_transfer_backend",
 ]

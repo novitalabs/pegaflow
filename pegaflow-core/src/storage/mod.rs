@@ -5,8 +5,6 @@ pub(crate) mod transfer_lock;
 mod write_path;
 
 use bytesize::ByteSize;
-#[cfg(not(feature = "rdma"))]
-use log::warn;
 use log::{debug, info, warn};
 use std::collections::HashSet;
 use std::num::NonZeroU64;
@@ -378,6 +376,21 @@ impl StorageEngine {
                 hashes.remove(&hash);
             }
         }
+    }
+
+    /// Position-aligned membership lookup in the resident read cache: entry
+    /// `i` is the sealed block for `hashes[i]`, or `None` on miss. Hashes must
+    /// already carry any group encoding (see `group_hash`).
+    pub(crate) fn get_membership(
+        &self,
+        namespace: &str,
+        hashes: &[Vec<u8>],
+    ) -> Vec<Option<Arc<crate::block::SealedBlock>>> {
+        let keys: Vec<BlockKey> = hashes
+            .iter()
+            .map(|hash| BlockKey::new(namespace.to_string(), hash.clone()))
+            .collect();
+        self.read_cache.get_blocks_aligned(&keys)
     }
 
     /// Evict all blocks from the resident in-memory read cache.

@@ -109,6 +109,50 @@ def test_later_save_reopens_completed_request():
     assert finished_sending == {"request"}
 
 
+def test_committed_save_runs_on_a_no_forward_step():
+    worker = make_worker()
+    worker._cache_groups = SimpleNamespace(has_recurrent_state=True)
+    worker._registered_layers = ["layer"]
+    worker._ctx.engine_client.save.return_value = (True, "")
+    metadata = PegaConnectorMetadata(
+        ready_save_intents={
+            "request": SaveIntent(
+                block_ids_by_group=((1,),),
+                block_hashes=(b"hash",),
+            )
+        }
+    )
+
+    with patch("torch.cuda.synchronize"):
+        worker.start_load_kv(metadata, None)
+
+    worker._ctx.engine_client.save.assert_called_once()
+    finished_sending, _ = worker.get_finished({"request"})
+    assert finished_sending == {"request"}
+
+
+def test_current_step_save_waits_for_forward_completion():
+    worker = make_worker()
+    worker._cache_groups = SimpleNamespace(has_recurrent_state=True)
+    worker._registered_layers = ["layer"]
+    worker._ctx.engine_client.save.return_value = (True, "")
+    metadata = PegaConnectorMetadata(
+        save_intents={
+            "request": SaveIntent(
+                block_ids_by_group=((1,),),
+                block_hashes=(b"hash",),
+            )
+        }
+    )
+
+    worker.start_load_kv(metadata, None)
+    worker._ctx.engine_client.save.assert_not_called()
+
+    with patch("torch.cuda.synchronize"):
+        worker.wait_for_save()
+    worker._ctx.engine_client.save.assert_called_once()
+
+
 def test_preemption_waits_for_every_save_task():
     worker = make_worker()
     completion = enqueue_save(worker)

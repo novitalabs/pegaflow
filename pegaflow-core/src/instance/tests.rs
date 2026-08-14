@@ -22,6 +22,23 @@ fn gpu_registration(device_id: i32, tp_rank: usize, layers: &[&str]) -> GpuRegis
     gpu_registration_with_segment_bytes(device_id, tp_rank, layers, 1024)
 }
 
+/// Build a `GpuRegistration` with explicit hybrid-cache group ids per layer.
+/// `(name, group)` pairs; group 0 is the attention default, higher groups are
+/// e.g. recurrent-state checkpoints in hybrid (mamba) models.
+fn gpu_registration_with_groups(
+    device_id: i32,
+    tp_rank: usize,
+    layers_and_groups: &[(&str, u32)],
+) -> GpuRegistration {
+    let layers: Vec<&str> = layers_and_groups.iter().map(|(name, _)| *name).collect();
+    let mut registration = gpu_registration(device_id, tp_rank, &layers);
+    registration.layer_groups = layers_and_groups
+        .iter()
+        .map(|(name, group)| ((*name).to_string(), *group))
+        .collect();
+    registration
+}
+
 fn gpu_registration_with_segment_bytes(
     device_id: i32,
     tp_rank: usize,
@@ -48,6 +65,7 @@ fn gpu_registration_with_segment_bytes(
         numa_node: NumaNode::UNKNOWN,
         transfer_mode: TransferMode::Direct,
         kv_caches,
+        layer_groups: HashMap::new(),
     }
 }
 
@@ -447,4 +465,128 @@ fn seal_rejects_inconsistent_layer_geometry() {
         ))
         .expect_err("same name with different geometry must fail the seal");
     assert!(err.to_string().contains("inconsistent geometry"));
+}
+
+/// Hybrid (mamba-style) topology: attention layers in group 0, recurrent-state
+/// layers in group 1. Each group gets its own dense slot space, which is what
+/// lets a group seal a block independently of the others — the precondition
+/// for "recurrent saves only the final block" to ever become visible.
+/// Commits device 0.
+#[test]
+fn hybrid_topology_seals_per_group_slot_spaces() {
+    // tp_size=1 keeps this single-device; the group-rank reset and per-group
+    // totals are what distinguish groups (tp_rank math is unchanged).
+    let instance = InstanceContext::new("hybrid".into(), "hybrid-ns".into(), 1, 1, false).unwrap();
+    instance
+        .register_new_gpu(gpu_registration_with_groups(
+            0,
+            0,
+            &[
+                ("attn_a", 0),
+                ("attn_b", 0),
+                ("recurrent_c", 1),
+                ("recurrent_d", 1),
+            ],
+        ))
+        .expect("register hybrid gpu");
+
+    let topology = instance.sealed_topology().expect("sealed");
+    assert_eq!(topology.num_layers(), 4);
+    assert_eq!(topology.num_groups(), 2);
+
+    // Sorted-name ids: attn_a=0, attn_b=1, recurrent_c=2, recurrent_d=3.
+    assert_eq!(topology.group_of_layer(0), 0);
+    assert_eq!(topology.group_of_layer(1), 0);
+    assert_eq!(topology.group_of_layer(2), 1);
+    assert_eq!(topology.group_of_layer(3), 1);
+
+    // Per-group seal domains: group_slots = group_layers * tp_size.
+    assert_eq!(topology.group_total_slots(0).unwrap(), 2);
+    assert_eq!(topology.group_total_slots(1).unwrap(), 2);
+    // Union across groups stays the historical denominator.
+    assert_eq!(topology.total_slots(), 4);
+
+    // Layer-first slots are dense WITHIN the group: group rank, not global id.
+    assert_eq!(topology.slot_index(0, 0).unwrap(), 0); // attn_a, group rank 0
+    assert_eq!(topology.slot_index(1, 0).unwrap(), 1); // attn_b, group rank 1
+    assert_eq!(topology.slot_index(2, 0).unwrap(), 0); // recurrent_c restarts at 0
+    assert_eq!(topology.slot_index(3, 0).unwrap(), 1);
+}
+
+/// With every layer in the default group 0 the within-group rank equals the
+/// global layer id, so all existing slot math is bit-identical. This is the
+/// backward-compat guard for current connectors. Commits device 0.
+#[test]
+fn default_groups_keep_global_slot_layout() {
+    let instance =
+        InstanceContext::new("classic".into(), "classic-ns".into(), 1, 1, false).unwrap();
+    instance
+        .register_new_gpu(gpu_registration(0, 0, &["layer_a", "layer_b", "layer_c"]))
+        .expect("register classic gpu");
+
+    let topology = instance.sealed_topology().expect("sealed");
+    assert_eq!(topology.num_groups(), 1);
+    assert_eq!(topology.group_total_slots(0).unwrap(), 3);
+    for layer_id in 0..3 {
+        assert_eq!(topology.group_of_layer(layer_id), 0);
+        assert_eq!(topology.slot_index(layer_id, 0).unwrap(), layer_id);
+    }
+    assert!(topology.group_total_slots(1).is_err());
+}
+
+/// A layer must live in the same storage group on every worker; disagreeing
+/// devices would seal blocks with different slot counts per device silently.
+/// Needs 2 CUDA devices.
+#[test]
+fn seal_rejects_inconsistent_layer_group_across_devices() {
+    if !has_cuda_devices(2) {
+        eprintln!(
+            "skipping seal_rejects_inconsistent_layer_group_across_devices: needs >= 2 CUDA devices"
+        );
+        return;
+    }
+
+    let instance =
+        InstanceContext::new("grp-conflict".into(), "grp-ns".into(), 1, 2, false).unwrap();
+    instance
+        .register_new_gpu(gpu_registration_with_groups(0, 0, &[("layer_0", 0)]))
+        .expect("first worker");
+
+    let err = instance
+        .register_new_gpu(gpu_registration_with_groups(1, 0, &[("layer_0", 1)]))
+        .expect_err("same layer in different groups must fail the seal");
+    assert!(err.to_string().contains("storage group"), "{err}");
+}
+
+/// Group ids must be dense `0..N`: a gap means a group nobody registers, whose
+/// blocks would sit inflight forever waiting for slots that cannot arrive.
+/// Commits device 0.
+#[test]
+fn seal_rejects_sparse_group_ids() {
+    let instance = InstanceContext::new("sparse".into(), "sparse-ns".into(), 1, 1, false).unwrap();
+    let err = instance
+        .register_new_gpu(gpu_registration_with_groups(
+            0,
+            0,
+            &[("layer_a", 0), ("layer_b", 2)],
+        ))
+        .expect_err("group 1 with no layers must fail the seal");
+    assert!(err.to_string().contains("dense"), "{err}");
+}
+
+/// Page-first storage packs all layers of a block into one page per shard;
+/// splitting blocks across groups contradicts that. Reject instead of
+/// silently picking one layout. Commits device 0.
+#[test]
+fn page_first_rejects_multiple_groups() {
+    let instance =
+        InstanceContext::new("page-hybrid".into(), "page-hybrid-ns".into(), 1, 1, true).unwrap();
+    let err = instance
+        .register_new_gpu(gpu_registration_with_groups(
+            0,
+            0,
+            &[("layer_a", 0), ("layer_b", 1)],
+        ))
+        .expect_err("page-first with two storage groups must be rejected");
+    assert!(err.to_string().contains("page-first"), "{err}");
 }

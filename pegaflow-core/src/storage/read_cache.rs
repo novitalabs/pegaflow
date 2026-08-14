@@ -140,6 +140,22 @@ impl ReadCache {
         found
     }
 
+    /// Position-aligned membership: entry `i` is the block for `keys[i]`, or
+    /// `None` on miss. Unlike [`Self::get_prefix_blocks`] this never stops at
+    /// the first gap — hybrid-cache checkpoint groups (recurrent state) have
+    /// sparse hit patterns by design, where the caller picks the rightmost
+    /// hit instead of a prefix.
+    pub(super) fn get_blocks_aligned(&self, keys: &[BlockKey]) -> Vec<Option<Arc<SealedBlock>>> {
+        let mut inner = self.inner.lock();
+        keys.iter()
+            .map(|key| {
+                inner.cache.get(key).inspect(|_| {
+                    refresh_recency(&mut inner, key);
+                })
+            })
+            .collect()
+    }
+
     pub(super) fn remove_lru_batch(&self, batch_size: usize) -> Vec<(BlockKey, Arc<SealedBlock>)> {
         let removed = {
             let mut inner = self.inner.lock();

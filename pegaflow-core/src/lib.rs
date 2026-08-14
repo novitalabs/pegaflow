@@ -44,7 +44,7 @@ pub use internode::{
 use layout::KVCacheLayout;
 pub use lease::QueryLeaseId;
 pub use pegaflow_common::NumaNode;
-use pegaflow_common::NumaTopology;
+use pegaflow_common::{NumaTopology, group_hash};
 pub use pinned_pool::PinnedAllocation;
 pub use seal_offload::SlotMeta;
 pub use storage::{DEFAULT_RDMA_QPS_PER_PEER, MemoryCacheCleanupStats, StorageConfig};
@@ -281,6 +281,7 @@ impl PegaEngine {
             kv_stride_bytes_list,
             segments_list,
             None,
+            None,
             transfer_mode,
             page_first,
         )
@@ -315,6 +316,7 @@ impl PegaEngine {
         kv_stride_bytes_list: &[usize],
         segments_list: &[usize],
         block_stride_bytes_list: Option<&[usize]>,
+        layer_group_ids: Option<&[u32]>,
         transfer_mode: TransferMode,
         page_first: bool,
     ) -> Result<(), EngineError> {
@@ -344,6 +346,14 @@ impl PegaEngine {
             return Err(EngineError::InvalidArgument(format!(
                 "registration metadata length mismatch: layer_names={batch_size}, block_stride_bytes={}",
                 strides.len()
+            )));
+        }
+        if let Some(group_ids) = layer_group_ids
+            && group_ids.len() != batch_size
+        {
+            return Err(EngineError::InvalidArgument(format!(
+                "registration metadata length mismatch: layer_names={batch_size}, layer_group_ids={}",
+                group_ids.len()
             )));
         }
         let mut kv_caches = HashMap::with_capacity(batch_size);
@@ -384,6 +394,15 @@ impl PegaEngine {
             }
         }
 
+        let layer_groups: HashMap<String, u32> = match layer_group_ids {
+            Some(group_ids) => layer_names
+                .iter()
+                .cloned()
+                .zip(group_ids.iter().copied())
+                .collect(),
+            None => HashMap::new(),
+        };
+
         // Get or create instance
         let instance =
             self.get_or_create_instance(instance_id, namespace, tp_size, world_size, page_first)?;
@@ -410,6 +429,7 @@ impl PegaEngine {
             numa_node,
             transfer_mode,
             kv_caches,
+            layer_groups,
         })?;
 
         info!(
@@ -505,6 +525,84 @@ impl PegaEngine {
         }
 
         Ok(status)
+    }
+
+    /// All-or-nothing membership fetch over one hybrid-cache storage group,
+    /// eligible for the same SSD prefetch and MetaServer + RDMA remote fetch
+    /// as prefix queries.
+    ///
+    /// Where [`Self::query_group_membership`] answers from the resident read
+    /// cache only, this treats `block_hashes` as an exact want-set: misses are
+    /// pulled from remote tiers, and the query stays `Loading` until the whole
+    /// set is fetchable (the prefix machinery over an explicit key list *is*
+    /// a set fetch once the full length is required). Use it when partial
+    /// state is useless — e.g. restoring a recurrent-state checkpoint on a
+    /// prefill/decode handoff, where the peer that saved the set holds every
+    /// member. A `Ready` result with fewer blocks than requested means the
+    /// set could not be completed anywhere; callers treat that as a miss.
+    pub async fn query_group_membership_with_fetch(
+        &self,
+        instance_id: &str,
+        req_id: &str,
+        group_id: u32,
+        block_hashes: &[Vec<u8>],
+    ) -> Result<PrefetchStatus, EngineError> {
+        let instance = self.get_instance(instance_id)?;
+        let topology = instance.sealed_topology()?;
+        // Same contract as the local membership query: an unknown group is a
+        // bug in the caller, not an all-miss answer.
+        topology.group_total_slots(group_id)?;
+
+        let namespace = instance.namespace();
+        let encoded: Vec<Vec<u8>> = block_hashes
+            .iter()
+            .map(|hash| group_hash(hash, group_id))
+            .collect();
+
+        let status = self
+            .storage
+            .check_prefix_and_prefetch(req_id, namespace, &encoded, true)
+            .await;
+
+        if let PrefetchStatus::Ready { blocks, missing } = &status {
+            let metrics = core_metrics();
+            metrics.cache_block_hits.add(blocks.len() as u64, &[]);
+            if *missing > 0 {
+                metrics.cache_block_misses.add(*missing as u64, &[]);
+            }
+        }
+
+        Ok(status)
+    }
+
+    /// Position-aligned membership query over one hybrid-cache storage group.
+    ///
+    /// Unlike prefix queries, every position reports independently: entry `i`
+    /// is the sealed block for `block_hashes[i]` in `group_id`, or `None` on
+    /// miss. Sparse hit patterns are the point — callers (e.g. the vLLM
+    /// connector's hybrid reconcile) pick the rightmost hit themselves.
+    /// Group 0 keeps raw-hash keys, so classic instances observe no change.
+    ///
+    /// The returned blocks hold plain `Arc` refs, not leases: pin what you
+    /// need via [`Self::create_query_lease`].
+    pub fn query_group_membership(
+        &self,
+        instance_id: &str,
+        group_id: u32,
+        block_hashes: &[Vec<u8>],
+    ) -> Result<Vec<Option<Arc<SealedBlock>>>, EngineError> {
+        let instance = self.get_instance(instance_id)?;
+        let topology = instance.sealed_topology()?;
+        // Validate the group against the sealed topology; an unknown group is
+        // a contract bug, not an answer of "all miss".
+        topology.group_total_slots(group_id)?;
+
+        let namespace = instance.namespace();
+        let encoded: Vec<Vec<u8>> = block_hashes
+            .iter()
+            .map(|hash| group_hash(hash, group_id))
+            .collect();
+        Ok(self.storage.get_membership(namespace, &encoded))
     }
 
     /// Create an opaque lease that owns query-ready blocks.
@@ -642,6 +740,32 @@ impl PegaEngine {
             ));
         }
 
+        // Resolve each load group's storage group and require homogeneity: a
+        // group's blocks seal against exactly one slot space. An empty load
+        // group owns no storage group; targets pointing at it load into
+        // nothing (it exists only to keep group indices aligned with the
+        // connector's cache-group layout).
+        let mut storage_group_of_load_group: Vec<Option<u32>> =
+            Vec::with_capacity(layer_groups.len());
+        for layer_names in layer_groups {
+            let mut group: Option<u32> = None;
+            for layer_name in layer_names {
+                let layer_id = topology.layer_id(layer_name)?;
+                let layer_group = topology.group_of_layer(layer_id);
+                match group {
+                    None => group = Some(layer_group),
+                    Some(existing) if existing == layer_group => {}
+                    Some(existing) => {
+                        return Err(EngineError::InvalidArgument(format!(
+                            "load group mixes storage groups {existing} and {layer_group} \
+                             (layer {layer_name})",
+                        )));
+                    }
+                }
+            }
+            storage_group_of_load_group.push(group);
+        }
+
         // Consume query leases reserved for this load.
         trace_scope!("load.cache_lookup", _s);
         let mut block_targets_by_group = vec![Vec::new(); layer_groups.len()];
@@ -668,6 +792,28 @@ impl PegaEngine {
                         group_index
                     )));
                 }
+                // A stored block must carry exactly the slot layout of the
+                // storage group this target group loads into. A mismatch
+                // means the namespace is shared by instances with different
+                // layer sets (e.g. MTP enabled vs disabled) — loading would
+                // silently leave layers uninitialized, so fail loudly and
+                // let vLLM recompute. Empty load groups own no storage
+                // group and skip the check entirely.
+                if let Some(storage_group) = storage_group_of_load_group[group_index] {
+                    let expected_slots = topology.group_total_slots(storage_group)?;
+                    for (source_index, destination) in lease_block_targets.iter().enumerate() {
+                        if destination.is_some()
+                            && blocks[source_index].slots().len() != expected_slots
+                        {
+                            return Err(EngineError::InvalidArgument(format!(
+                                "stored block has {} slots but storage group {storage_group} of \
+                                 instance {instance_id} expects {expected_slots}: \
+                                 namespace is shared by incompatible KV layouts",
+                                blocks[source_index].slots().len(),
+                            )));
+                        }
+                    }
+                }
                 block_targets_by_group[group_index].extend(
                     lease_block_targets.iter().enumerate().filter_map(
                         |(source_index, destination)| {
@@ -675,21 +821,6 @@ impl PegaEngine {
                         },
                     ),
                 );
-            }
-            // A stored block must carry exactly this instance's slot layout.
-            // A mismatch means the namespace is shared by instances with
-            // different layer sets (e.g. MTP enabled vs disabled) — loading
-            // would silently leave layers uninitialized, so fail loudly and
-            // let vLLM recompute.
-            for block in &blocks {
-                if block.slots().len() != topology.total_slots() {
-                    return Err(EngineError::InvalidArgument(format!(
-                        "stored block has {} slots but instance {instance_id} expects {}: \
-                         namespace is shared by incompatible KV layouts",
-                        block.slots().len(),
-                        topology.total_slots()
-                    )));
-                }
             }
             block_cache.extend(blocks);
         }

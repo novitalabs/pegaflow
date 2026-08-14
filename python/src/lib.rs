@@ -133,15 +133,22 @@ struct QueryReady {
     #[pyo3(get)]
     num_hit_blocks: usize,
     lease: PyQueryLease,
+    /// Membership queries (group_id > 0) only: indices into the queried
+    /// block_hashes whose block is cached; lease block i corresponds to
+    /// query position hit_positions[i]. Empty for prefix queries.
+    #[pyo3(get)]
+    hit_positions: Vec<u32>,
 }
 
 #[pymethods]
 impl QueryReady {
     #[new]
-    fn new(num_hit_blocks: usize, lease: PyQueryLease) -> Self {
+    #[pyo3(signature = (num_hit_blocks, lease, hit_positions=Vec::new()))]
+    fn new(num_hit_blocks: usize, lease: PyQueryLease, hit_positions: Vec<u32>) -> Self {
         Self {
             num_hit_blocks,
             lease,
+            hit_positions,
         }
     }
 
@@ -152,8 +159,9 @@ impl QueryReady {
 
     fn __repr__(&self) -> String {
         format!(
-            "QueryReady(num_hit_blocks={}, has_lease={})",
+            "QueryReady(num_hit_blocks={}, hits={:?}, has_lease={})",
             self.num_hit_blocks,
+            self.hit_positions,
             !self.lease.0.is_empty()
         )
     }
@@ -276,7 +284,11 @@ impl EngineRpcClient {
         clippy::too_many_arguments,
         reason = "PyO3 binding mirrors the public batch registration call shape"
     )]
-    #[pyo3(signature = (instance_id, namespace, tp_rank, pp_rank, tp_size, world_size, device_id, layer_names, wrapper_bytes_list, num_blocks_list, bytes_per_block_list, kv_stride_bytes_list, segments_list, transfer_backend, page_first))]
+    #[pyo3(signature = (instance_id, namespace, tp_rank, pp_rank, tp_size, world_size, device_id, layer_names, wrapper_bytes_list, num_blocks_list, bytes_per_block_list, kv_stride_bytes_list, segments_list, transfer_backend, page_first, layer_group_ids=None))]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "PyO3 binding mirrors the public batch registration call shape"
+    )]
     fn register_context_batch(
         &self,
         py: Python<'_>,
@@ -295,6 +307,7 @@ impl EngineRpcClient {
         segments_list: Vec<u32>,
         transfer_backend: &str,
         page_first: bool,
+        layer_group_ids: Option<Vec<u32>>,
     ) -> PyResult<(bool, String)> {
         let transfer_mode = match transfer_backend {
             "direct" => TransferMode::Direct,
@@ -324,6 +337,7 @@ impl EngineRpcClient {
                     pp_rank,
                     transfer_mode: transfer_mode as i32,
                     page_first,
+                    layer_group_ids: layer_group_ids.unwrap_or_default(),
                 })
                 .await?;
             Ok(resp.into_inner())
@@ -462,7 +476,7 @@ impl EngineRpcClient {
     ///
     /// Returns:
     ///     QueryLoading while backing fetch is in progress, otherwise QueryReady.
-    #[pyo3(signature = (instance_id, block_hashes, req_id, wait_for_full_prefix=false))]
+    #[pyo3(signature = (instance_id, block_hashes, req_id, wait_for_full_prefix=false, group_id=0))]
     fn query_prefetch(
         &self,
         py: Python<'_>,
@@ -470,6 +484,7 @@ impl EngineRpcClient {
         block_hashes: Vec<Vec<u8>>,
         req_id: String,
         wait_for_full_prefix: bool,
+        group_id: u32,
     ) -> PyResult<Py<PyAny>> {
         let result = py.detach(|| {
             self.rt_handle.block_on(async {
@@ -480,6 +495,7 @@ impl EngineRpcClient {
                         block_hashes,
                         req_id,
                         wait_for_full_prefix,
+                        group_id,
                     })
                     .await
                     .map(|resp| resp.into_inner())
@@ -495,6 +511,7 @@ impl EngineRpcClient {
                         QueryReady {
                             num_hit_blocks: 0,
                             lease: PyQueryLease(Vec::new()),
+                            hit_positions: Vec::new(),
                         },
                     )
                     .map(|obj| obj.into_any())
@@ -512,6 +529,7 @@ impl EngineRpcClient {
                 QueryReady {
                     num_hit_blocks: u64_to_usize(ready.num_hit_blocks, "num_hit_blocks")?,
                     lease: PyQueryLease(ready.lease),
+                    hit_positions: ready.hit_positions,
                 },
             )
             .map(|obj| obj.into_any()),
