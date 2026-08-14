@@ -5,7 +5,7 @@ Scheduler-side connector logic.
 import os
 import time
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 from pegaflow.connector.common import (
@@ -14,8 +14,10 @@ from pegaflow.connector.common import (
     LoadIntent,
     PegaConnectorMetadata,
     PegaKVConnectorStats,
+    RecurrentLoadHold,
     SaveIntent,
     logger,
+    reconcile_hybrid_hit,
 )
 from pegaflow.connector.connector_metrics import PrefetchTracker
 from pegaflow.connector.tp_shards import ShardedQueryReady, TpShardQueryClient
@@ -53,6 +55,13 @@ class _QueryProbe:
     # ``None`` means the backend is still loading.
     hit_blocks: int | None = None
     leases: tuple[bytes, ...] = ()
+    # Hybrid (HMA): pinned recurrent checkpoints from the membership queries,
+    # set together with `leases` when the hybrid reconcile found a boundary.
+    recurrent_hold: RecurrentLoadHold | None = None
+    # Sorted query positions a hybrid hit may end at (intersection over all
+    # recurrent groups and shards, below the attention prefix). Used to
+    # re-derive a legal boundary when the token budget shrinks the hit.
+    usable_positions: frozenset[int] = frozenset()
 
     @property
     def is_ready(self) -> bool:
@@ -79,6 +88,8 @@ class _QueryProbe:
             )
         self.hit_blocks = hit_blocks
         self.leases = ready.leases
+        self.recurrent_hold = ready.recurrent_hold
+        self.usable_positions = frozenset(ready.usable_positions)
 
     def require_hit_blocks(self) -> int:
         if self.hit_blocks is None:
@@ -267,6 +278,9 @@ class SchedulerConnector:
                 len(query_hashes),
             )
             self._release_leases(ready.leases, req_id)
+            if ready.recurrent_hold is not None:
+                for group_index, group_leases in enumerate(ready.recurrent_hold.leases):
+                    self._tp_shard_client.release(group_leases, f"{req_id}:g{group_index}")
             self._pending_query_probes.pop(req_id, None)
             return (None, False)
 
@@ -313,6 +327,23 @@ class SchedulerConnector:
         # overwrite it unless a P/D router supplied a separate decode token.
         locally_computed_tokens = computed_blocks * vbs
         hit_tokens = min(hit_tokens, max(0, num_tokens - locally_computed_tokens - 1))
+
+        if probe.recurrent_hold is not None:
+            # A mamba checkpoint is valid only at its own block boundary. If
+            # the token budget cut inside the reconciled span, fall back to
+            # the best earlier boundary; if none survives, drop the hit (a
+            # partial mamba resume cannot exist).
+            boundary_blocks = hit_tokens // vbs
+            usable = [p for p in probe.usable_positions if p < boundary_blocks]
+            if not usable:
+                if self._pending_query_probes.get(req_id) is probe:
+                    self._release_pending_query_probe(req_id)
+                return (0, False)
+            checkpoint = max(usable)
+            hit_blocks = checkpoint + 1
+            hit_tokens = hit_blocks * vbs
+            probe.hit_blocks = hit_blocks
+            probe.recurrent_hold = replace(probe.recurrent_hold, checkpoint=checkpoint)
 
         # Cacheable tails contain at least two tokens, so recomputing the final
         # prompt token cannot remove the last leased block from the load.
@@ -412,6 +443,9 @@ class SchedulerConnector:
                 block_ids_by_group=load_block_ids_by_group,
                 leases=pending_probe.leases if pending_probe is not None else (),
                 num_tokens=num_external_tokens,
+                recurrent_hold=(
+                    pending_probe.recurrent_hold if pending_probe is not None else None
+                ),
             )
             if pending_probe is not None:
                 query_hashes, tail_tokens = self._build_query(request, num_computed_blocks)
@@ -925,7 +959,112 @@ class SchedulerConnector:
                 self._prefetch_tracker.pending_prefetches,
             )
 
+        if self._cache_groups.has_recurrent_state:
+            return self._reconcile_hybrid(block_hash_list, ready, req_id)
         return ready
+
+    def _reconcile_hybrid(
+        self,
+        block_hashes: list[bytes],
+        ready: ShardedQueryReady,
+        req_id: str,
+    ) -> ShardedQueryReady:
+        """Gate an attention-prefix hit on a usable recurrent boundary.
+
+        HMA can resume only where every recurrent group cached its state on
+        every shard: attention KV alone cannot skip mamba's sequential
+        prefill. On success returns the reduced hit with the membership
+        leases attached; on failure every lease acquired is released and the
+        result degrades to a plain miss.
+        """
+        if ready.num_hit_blocks == 0:
+            return ready
+
+        group_ids = tuple(
+            self._cache_groups.storage_group_ids[index]
+            for index in sorted(self._cache_groups.recurrent_group_indices)
+        )
+        per_group: list[list[tuple[tuple[int, ...], bytes]]] = []
+        try:
+            for group_id in group_ids:
+                per_group.append(
+                    self._tp_shard_client.query_group_membership(
+                        self._ctx.instance_id,
+                        block_hashes,
+                        f"{req_id}:g{group_id}",
+                        group_id,
+                    )
+                )
+            hybrid_hit, checkpoint, usable = reconcile_hybrid_hit(
+                ready.num_hit_blocks,
+                tuple(
+                    tuple(positions for positions, _ in group_results)
+                    for group_results in per_group
+                ),
+            )
+        except Exception:
+            self._release_leases(ready.leases, req_id)
+            for group_id, group_results in zip(group_ids, per_group, strict=False):
+                self._tp_shard_client.release(
+                    tuple(lease for _, lease in group_results), f"{req_id}:g{group_id}"
+                )
+            raise
+
+        if hybrid_hit == 0 or checkpoint is None:
+            self._release_leases(ready.leases, req_id)
+            for group_id, group_results in zip(group_ids, per_group, strict=True):
+                self._tp_shard_client.release(
+                    tuple(lease for _, lease in group_results), f"{req_id}:g{group_id}"
+                )
+            logger.info(
+                "[PegaKVConnector] req=%s HMA attention prefix of %d blocks has no "
+                "common recurrent checkpoint; recomputing instead",
+                req_id,
+                ready.num_hit_blocks,
+            )
+            return ShardedQueryReady(0, tuple(b"" for _ in ready.leases))
+
+        if hybrid_hit < ready.num_hit_blocks:
+            # The hit shrank behind the prefix lease: re-lease the exact
+            # shortened attention prefix so lease count and load agree.
+            exact = self._tp_shard_client.query(
+                self._ctx.instance_id,
+                block_hashes[:hybrid_hit],
+                f"{req_id}:hma-exact-{hybrid_hit}",
+                False,
+            )
+            self._release_leases(ready.leases, req_id)
+            if exact is None or exact.num_hit_blocks != hybrid_hit:
+                if exact is not None:
+                    self._release_leases(exact.leases, req_id)
+                for group_id, group_results in zip(group_ids, per_group, strict=True):
+                    self._tp_shard_client.release(
+                        tuple(lease for _, lease in group_results), f"{req_id}:g{group_id}"
+                    )
+                logger.warning(
+                    "[PegaKVConnector] req=%s could not re-lease the reconciled "
+                    "%d-block HMA prefix; recomputing instead",
+                    req_id,
+                    hybrid_hit,
+                )
+                return ShardedQueryReady(0, tuple(b"" for _ in ready.leases))
+            ready = exact
+
+        return ShardedQueryReady(
+            hybrid_hit,
+            ready.leases,
+            RecurrentLoadHold(
+                leases=tuple(
+                    tuple(lease for _, lease in group_results) for group_results in per_group
+                ),
+                hit_positions=tuple(
+                    tuple(positions for positions, _ in group_results)
+                    for group_results in per_group
+                ),
+                checkpoint=checkpoint,
+            ),
+            usable_positions=tuple(sorted(usable)),
+        )
 
     def _cancel_prefetch_tracking(self, req_id: str) -> None:
         """Drop in-flight prefetch metrics when polling stops before QueryReady."""
@@ -971,10 +1110,17 @@ class SchedulerConnector:
         return self._release_query_probe(req_id, probe)
 
     def _release_query_probe(self, req_id: str, probe: _QueryProbe) -> bool:
-        if not probe.leases or not any(probe.leases):
+        released = True
+        if probe.leases and any(probe.leases):
+            released = self._release_leases(probe.leases, req_id)
+        else:
             self._cancel_prefetch_tracking(req_id)
-            return True  # nothing leased server-side (still loading, or zero-hit Ready)
-        return self._release_leases(probe.leases, req_id)
+        hold = probe.recurrent_hold
+        if hold is not None:
+            for group_index, group_leases in enumerate(hold.leases):
+                if not self._tp_shard_client.release(group_leases, f"{req_id}:g{group_index}"):
+                    released = False
+        return released
 
     def _release_leases(self, leases: tuple[bytes, ...], req_id: str) -> bool:
         return self._tp_shard_client.release(leases, req_id)

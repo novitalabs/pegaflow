@@ -361,6 +361,11 @@ class WorkerConnector:
                     registration.num_blocks,
                 )
 
+        layer_group_ids = [
+            self._cache_groups.storage_group_ids[self._layer_to_group.get(name, 0)]
+            for name in layer_names
+        ]
+
         ok, message = self._ctx.engine_client.register_context_batch(
             self._ctx.instance_id,
             self._ctx.namespace,
@@ -377,6 +382,7 @@ class WorkerConnector:
             layer_segments,
             self._ctx.transfer_backend,
             self._page_first,
+            layer_group_ids=layer_group_ids,
         )
 
         if not ok:
@@ -570,9 +576,46 @@ class WorkerConnector:
                     f"expected {self._ctx.tp_shard_count}"
                 )
             block_ids_by_group = [list(group) for group in load_intent.block_ids_by_group]
+            hold = load_intent.recurrent_hold
+            recurrent_groups = sorted(self._cache_groups.recurrent_group_indices)
+            if hold is not None:
+                # The attention lease pins group-0 (dense prefix) blocks only;
+                # recurrent destinations travel with the membership leases.
+                for group_index in recurrent_groups:
+                    block_ids_by_group[group_index] = [None] * len(block_ids_by_group[group_index])
             for block_ids in block_ids_by_group:
                 all_block_ids.extend(block_id for block_id in block_ids if block_id is not None)
             loads.append((load_intent.leases[self._ctx.tp_shard_index], block_ids_by_group))
+            if hold is not None:
+                shard = self._ctx.tp_shard_index
+                for slot, group_index in enumerate(recurrent_groups):
+                    positions = hold.hit_positions[slot][shard]
+                    if hold.checkpoint not in positions:
+                        raise RuntimeError(
+                            f"req {req_id}: recurrent group {group_index} shard {shard} "
+                            f"lease has no checkpoint at query position {hold.checkpoint}"
+                        )
+                    destination = next(
+                        (
+                            block_id
+                            for block_id in reversed(load_intent.block_ids_by_group[group_index])
+                            if block_id is not None
+                        ),
+                        None,
+                    )
+                    if destination is None:
+                        raise RuntimeError(
+                            f"req {req_id}: no recurrent destination block in group "
+                            f"{group_index} for checkpoint {hold.checkpoint}"
+                        )
+                    # The membership lease pins `[hit_positions]` blocks; only
+                    # the chosen checkpoint has a physical destination.
+                    vectors: list[list[int | None]] = [
+                        [None] * len(positions) for _ in range(self._cache_groups.group_count)
+                    ]
+                    vectors[group_index][positions.index(hold.checkpoint)] = destination
+                    loads.append((hold.leases[slot][shard], vectors))
+                    all_block_ids.append(destination)
             request_ids.append(req_id)
 
         if not all_block_ids:

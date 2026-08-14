@@ -47,6 +47,7 @@ class FakeEngineClient:
         self.register_response: tuple[bool, str] = (True, "ok")
         self.register_exception: Exception | None = None
         self.register_calls: list[tuple] = []
+        self.register_kwargs: list[dict] = []
         self.unregister_calls: list[str] = []
         self.release_calls: list[bytes] = []
 
@@ -76,8 +77,9 @@ class FakeEngineClient:
             return (False, "simulated load failure")
         return (True, "ok")
 
-    def register_context_batch(self, *args) -> tuple[bool, str]:
+    def register_context_batch(self, *args, **kwargs) -> tuple[bool, str]:
         self.register_calls.append(args)
+        self.register_kwargs.append(kwargs)
         if self.register_exception is not None:
             raise self.register_exception
         return self.register_response
