@@ -58,7 +58,13 @@ class QueryLoading:
 class QueryReady:
     num_hit_blocks: int
     lease: bytes
-    def __init__(self, num_hit_blocks: int, lease: bytes) -> None: ...
+    hit_positions: list[int]
+    def __init__(
+        self,
+        num_hit_blocks: int,
+        lease: bytes,
+        hit_positions: list[int] = ...,
+    ) -> None: ...
 
 class EngineRpcClient:
     """gRPC client for remote PegaEngine server communication.
@@ -111,6 +117,7 @@ class EngineRpcClient:
         segments_list: list[int],
         transfer_backend: str,
         page_first: bool,
+        layer_group_ids: list[int] | None = None,
     ) -> tuple[bool, str]:
         """Register all KV cache layers on a GPU with a single RPC call.
 
@@ -216,6 +223,7 @@ class EngineRpcClient:
         block_hashes: list[bytes],
         req_id: str,
         wait_for_full_prefix: bool = False,
+        group_id: int = 0,
     ) -> QueryLoading | QueryReady:
         """Query prefix cache hits with SSD prefetch support.
 

@@ -6,7 +6,7 @@
 // is deferred to the storage insert worker via `RawSaveBatch`.
 // ============================================================================
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
@@ -21,7 +21,7 @@ use crate::layout::KVCacheLayout;
 use crate::metrics::core_metrics;
 use crate::pinned_pool::PinnedAllocation;
 use crate::{EngineError, PegaEngine};
-use pegaflow_common::NumaNode;
+use pegaflow_common::{NumaNode, group_hash};
 
 // ============================================================================
 // Types sent to the insert worker (deferred Phase 4)
@@ -56,6 +56,8 @@ struct LayerContext {
     layer_name: String,
     layout: KVCacheLayout,
     slot_id: usize,
+    /// Hybrid-cache storage group of this layer; keyed and sealed per group.
+    group: u32,
     /// Blocks to save: (block_idx, hash). Filtered in Phase 1.
     blocks_to_save: Vec<(usize, Vec<u8>)>,
     /// Host-side block images, parallel to `blocks_to_save`.
@@ -136,6 +138,35 @@ fn build_hashed_insert_entries(namespace: String, layers: Vec<RawSaveLayer>) -> 
         .into_iter()
         .map(|(hash, slots)| (BlockKey::new(namespace.clone(), hash), slots))
         .collect()
+}
+
+/// Drop `(group, hash)` candidates whose group-encoded key already exists in
+/// the read cache. Filtering is per group because groups key the same content
+/// hash independently (e.g. attention block vs. recurrent checkpoint).
+fn filter_new_hashes_per_group(
+    storage: &crate::storage::StorageEngine,
+    namespace: &str,
+    candidates: HashSet<(u32, Vec<u8>)>,
+) -> HashSet<(u32, Vec<u8>)> {
+    let mut by_group: HashMap<u32, Vec<Vec<u8>>> = HashMap::new();
+    for (group, hash) in &candidates {
+        by_group.entry(*group).or_default().push(hash.clone());
+    }
+
+    let mut survivors = HashSet::with_capacity(candidates.len());
+    for (group, raw_hashes) in by_group {
+        let mut encoded: HashSet<Vec<u8>> = raw_hashes
+            .iter()
+            .map(|hash| group_hash(hash, group))
+            .collect();
+        storage.filter_hashes_not_in_cache_inplace(namespace, &mut encoded);
+        for raw in raw_hashes {
+            if encoded.contains(&group_hash(&raw, group)) {
+                survivors.insert((group, raw));
+            }
+        }
+    }
+    survivors
 }
 
 // ============================================================================
@@ -275,7 +306,6 @@ impl PegaEngine {
         let instance = self.get_instance(instance_id)?;
         let topology = instance.sealed_topology()?;
         let namespace = instance.namespace().to_string();
-        let total_slots = topology.total_slots();
 
         // ── Phase 0: Resolve per-layer metadata and build valid_blocks ──
         trace_scope!("save.resolve_metadata", _s);
@@ -283,7 +313,9 @@ impl PegaEngine {
         let gpu_context = instance.get_gpu_for_save_group(device_id, tp_rank, pp_rank)?;
 
         let mut layer_contexts: Vec<LayerContext> = Vec::with_capacity(saves.len());
-        let mut hashes_to_save: HashSet<Vec<u8>> = HashSet::new();
+        // Dedupe candidates per (group, hash): the same content hash may exist
+        // in the attention group while the recurrent group still needs it.
+        let mut hashes_to_save: HashSet<(u32, Vec<u8>)> = HashSet::new();
 
         for LayerSave {
             layer_name,
@@ -309,6 +341,7 @@ impl PegaEngine {
             })?;
 
             let slot_id = topology.slot_index(layer_id, tp_rank)?;
+            let group = topology.group_of_layer(layer_id);
 
             let num_blocks = layout.num_blocks();
 
@@ -331,13 +364,14 @@ impl PegaEngine {
             }
 
             for (_, hash) in &blocks_to_save {
-                hashes_to_save.insert(hash.clone());
+                hashes_to_save.insert((group, hash.clone()));
             }
 
             layer_contexts.push(LayerContext {
                 layer_name,
                 layout,
                 slot_id,
+                group,
                 blocks_to_save,
                 raw_blocks: Vec::new(),
             });
@@ -356,20 +390,23 @@ impl PegaEngine {
 
         trace_scope!("save.hash_filter", _s);
 
-        // Single in-place cache filter for all unique hashes
-        self.storage
-            .filter_hashes_not_in_cache_inplace(&namespace, &mut hashes_to_save);
+        let hashes_to_save = filter_new_hashes_per_group(
+            &self.storage,
+            &namespace,
+            std::mem::take(&mut hashes_to_save),
+        );
 
         if hashes_to_save.is_empty() {
             trace_drop!(_s);
             return Ok(());
         }
 
-        // Per-layer filter: keep only blocks whose hash needs saving
+        // Per-layer filter: keep only blocks whose (group, hash) needs saving
         let mut total_blocks_to_save = 0usize;
         for ctx in &mut layer_contexts {
+            let group = ctx.group;
             ctx.blocks_to_save
-                .retain(|(_, hash)| hashes_to_save.contains(hash.as_slice()));
+                .retain(|(_, hash)| hashes_to_save.contains(&(group, hash.clone())));
             total_blocks_to_save += ctx.blocks_to_save.len();
         }
         // Remove layers with no blocks to save
@@ -550,10 +587,15 @@ impl PegaEngine {
             batch_start.elapsed().as_secs_f64() * 1000.0
         );
 
-        // Build RawSaveBatch and send to insert worker (fire-and-forget).
-        // Page-first collapses a shard's layers into one page slot per block, so
-        // a whole shard is a single RawSaveLayer regardless of its layer count.
-        let raw_layers: Vec<RawSaveLayer> = if page_first {
+        // Build per-group RawSaveBatches and send to the insert worker
+        // (fire-and-forget). Each group seals blocks against its own slot
+        // count and stores them under group-encoded hashes (group 0 keeps raw
+        // hashes, so single-group instances produce byte-identical keys).
+        if page_first {
+            // Page-first collapses a shard's layers into one page slot per
+            // block, so a whole shard is a single RawSaveLayer regardless of
+            // its layer count. Sealing rejects multi-group page-first, so the
+            // whole batch is group 0.
             let slot_id = layer_contexts[0].slot_id;
             let page_size = topology
                 .shard_page_size(slot_id)
@@ -570,37 +612,48 @@ impl PegaEngine {
                     RawBlock::single_segment(Segment::new(ptr, page_size, page))
                 })
                 .collect();
-            vec![RawSaveLayer {
-                slot_id,
-                padded_block_size: page_size,
-                blocks,
-                block_hashes,
-            }]
+            self.storage.send_raw_insert(RawSaveBatch {
+                namespace,
+                total_slots: topology.total_slots(),
+                numa_node: save_numa_node,
+                layers: vec![RawSaveLayer {
+                    slot_id,
+                    padded_block_size: page_size,
+                    blocks,
+                    block_hashes,
+                }],
+            });
         } else {
-            layer_contexts
-                .into_iter()
-                .map(|ctx| {
-                    let block_hashes: Vec<Vec<u8>> = ctx
-                        .blocks_to_save
-                        .into_iter()
-                        .map(|(_, hash)| hash)
-                        .collect();
-                    RawSaveLayer {
-                        slot_id: ctx.slot_id,
-                        padded_block_size: ctx.layout.padded_block_bytes(),
-                        blocks: ctx.raw_blocks,
-                        block_hashes,
-                    }
-                })
-                .collect()
-        };
-
-        self.storage.send_raw_insert(RawSaveBatch {
-            namespace,
-            total_slots,
-            numa_node: save_numa_node,
-            layers: raw_layers,
-        });
+            let mut by_group: std::collections::BTreeMap<u32, Vec<LayerContext>> =
+                Default::default();
+            for ctx in layer_contexts {
+                by_group.entry(ctx.group).or_default().push(ctx);
+            }
+            for (group, contexts) in by_group {
+                let raw_layers: Vec<RawSaveLayer> = contexts
+                    .into_iter()
+                    .map(|ctx| {
+                        let block_hashes: Vec<Vec<u8>> = ctx
+                            .blocks_to_save
+                            .into_iter()
+                            .map(|(_, hash)| group_hash(&hash, group))
+                            .collect();
+                        RawSaveLayer {
+                            slot_id: ctx.slot_id,
+                            padded_block_size: ctx.layout.padded_block_bytes(),
+                            blocks: ctx.raw_blocks,
+                            block_hashes,
+                        }
+                    })
+                    .collect();
+                self.storage.send_raw_insert(RawSaveBatch {
+                    namespace: namespace.clone(),
+                    total_slots: topology.group_total_slots(group)?,
+                    numa_node: save_numa_node,
+                    layers: raw_layers,
+                });
+            }
+        }
 
         Ok(())
     }

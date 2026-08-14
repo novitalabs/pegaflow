@@ -162,6 +162,11 @@ impl GrpcEngineService {
         if req.req_id.is_empty() {
             return Err(Status::invalid_argument("req_id must not be empty"));
         }
+        if req.group_id > 0 && req.wait_for_full_prefix {
+            return Err(Status::invalid_argument(
+                "wait_for_full_prefix applies to prefix queries only (group_id must be 0)",
+            ));
+        }
         Ok(())
     }
 
@@ -301,7 +306,12 @@ impl Engine for GrpcEngineService {
             }
 
             // Call engine batch registration
-            if let Err(err) = self.engine.register_context_layer_batch(
+            let layer_group_ids: Option<&[u32]> = if req.layer_group_ids.is_empty() {
+                None
+            } else {
+                Some(&req.layer_group_ids)
+            };
+            if let Err(err) = self.engine.register_context_layer_batch_strided(
                 &req.instance_id,
                 &req.namespace,
                 req.device_id,
@@ -316,6 +326,8 @@ impl Engine for GrpcEngineService {
                 &bytes_per_block_list,
                 &kv_stride_bytes_list,
                 &segments_list,
+                None,
+                layer_group_ids,
                 transfer_mode,
                 req.page_first,
             ) {
@@ -553,46 +565,79 @@ impl Engine for GrpcEngineService {
                 req.block_hashes.len()
             );
 
-            // SSD prefetch-aware query
-            let status = self
-                .engine
-                .count_prefix_hit_blocks_with_prefetch(
-                    &req.instance_id,
-                    &req.req_id,
-                    &req.block_hashes,
-                    req.wait_for_full_prefix,
-                )
-                .await
-                .map_err(Self::map_engine_error)?;
-
-            let outcome = match status {
-                PrefetchStatus::Ready { blocks, missing } => {
-                    let hit = blocks.len();
-                    if let Ok(mut t) = self.hll_tracker.lock() {
-                        t.record_hashes(&req.block_hashes);
+            let outcome = if req.group_id > 0 {
+                // Membership query (hybrid-cache checkpoint groups): every
+                // position reports independently and the lease pins exactly
+                // the hit blocks, in hit_positions order.
+                let hits = self
+                    .engine
+                    .query_group_membership(&req.instance_id, req.group_id, &req.block_hashes)
+                    .map_err(Self::map_engine_error)?;
+                let mut positions = Vec::new();
+                let mut blocks = Vec::new();
+                for (pos, block) in hits.into_iter().enumerate() {
+                    if let Some(block) = block {
+                        positions.push(pos as u32);
+                        blocks.push(block);
                     }
-                    let lease = if hit == 0 {
-                        Vec::new()
-                    } else {
-                        self.engine
-                            .create_query_lease(&req.instance_id, blocks)
-                            .map_err(Self::map_engine_error)?
-                            .to_bytes()
-                            .to_vec()
-                    };
-                    debug!(
-                        "RPC [query_prefetch] ready: instance_id={} hit={} missing={} lease={}",
-                        req.instance_id,
-                        hit,
-                        missing,
-                        !lease.is_empty()
-                    );
-                    query_response::Outcome::Ready(QueryReady {
-                        num_hit_blocks: hit as u64,
-                        lease,
-                    })
                 }
-                PrefetchStatus::Loading => query_response::Outcome::Loading(QueryLoading {}),
+                let lease = if blocks.is_empty() {
+                    Vec::new()
+                } else {
+                    self.engine
+                        .create_query_lease(&req.instance_id, blocks)
+                        .map_err(Self::map_engine_error)?
+                        .to_bytes()
+                        .to_vec()
+                };
+                query_response::Outcome::Ready(QueryReady {
+                    num_hit_blocks: positions.len() as u64,
+                    lease,
+                    hit_positions: positions,
+                })
+            } else {
+                // SSD prefetch-aware query
+                let status = self
+                    .engine
+                    .count_prefix_hit_blocks_with_prefetch(
+                        &req.instance_id,
+                        &req.req_id,
+                        &req.block_hashes,
+                        req.wait_for_full_prefix,
+                    )
+                    .await
+                    .map_err(Self::map_engine_error)?;
+
+                match status {
+                    PrefetchStatus::Ready { blocks, missing } => {
+                        let hit = blocks.len();
+                        if let Ok(mut t) = self.hll_tracker.lock() {
+                            t.record_hashes(&req.block_hashes);
+                        }
+                        let lease = if hit == 0 {
+                            Vec::new()
+                        } else {
+                            self.engine
+                                .create_query_lease(&req.instance_id, blocks)
+                                .map_err(Self::map_engine_error)?
+                                .to_bytes()
+                                .to_vec()
+                        };
+                        debug!(
+                            "RPC [query_prefetch] ready: instance_id={} hit={} missing={} lease={}",
+                            req.instance_id,
+                            hit,
+                            missing,
+                            !lease.is_empty()
+                        );
+                        query_response::Outcome::Ready(QueryReady {
+                            num_hit_blocks: hit as u64,
+                            lease,
+                            hit_positions: Vec::new(),
+                        })
+                    }
+                    PrefetchStatus::Loading => query_response::Outcome::Loading(QueryLoading {}),
+                }
             };
 
             Ok(Response::new(QueryResponse {
@@ -993,6 +1038,7 @@ mod tests {
             block_hashes: Vec::new(),
             req_id: String::new(),
             wait_for_full_prefix: false,
+            group_id: 0,
         })
         .expect_err("empty req_id must be rejected before engine lookup");
 
@@ -1007,6 +1053,7 @@ mod tests {
             block_hashes: Vec::new(),
             req_id: "request".to_string(),
             wait_for_full_prefix: false,
+            group_id: 0,
         })
         .expect("empty block_hashes are a valid zero-hit query");
     }
@@ -1030,6 +1077,7 @@ mod tests {
             pp_rank: 0,
             transfer_mode: ProtoTransferMode::Direct as i32,
             page_first: false,
+            layer_group_ids: Vec::new(),
         })
         .expect_err("tp_rank outside tp_size must be rejected at RPC boundary");
 
@@ -1056,6 +1104,7 @@ mod tests {
             pp_rank: 0,
             transfer_mode: ProtoTransferMode::Direct as i32,
             page_first: false,
+            layer_group_ids: Vec::new(),
         })
         .expect_err("client/server version mismatch must be rejected before registration");
 

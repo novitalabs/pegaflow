@@ -49,11 +49,25 @@ struct RegistrationState {
 ///
 /// Layer ids are the rank of the layer name in sorted order, so every
 /// instance that registers the same layer set derives the same ids — the
-/// property block slot layout depends on.
+/// property block slot layout depends on. On top of that, each layer belongs
+/// to a hybrid-cache *storage group* (attention vs. recurrent state, mirroring
+/// vLLM's `KVCacheGroupSpec`): slots are dense *within* a group, giving each
+/// group its own seal domain. A group seals a block once every
+/// `(group layer, tp_rank)` slot of that block is saved, regardless of other
+/// groups — that is what lets a recurrent-state group seal the final block
+/// even though attention groups save every block.
 #[derive(Debug)]
 pub(crate) struct LayerTopology {
     name_to_id: HashMap<String, usize>,
     tp_size: usize,
+    /// Storage group id per layer, indexed by layer_id. All zeros for
+    /// single-group (classic) instances.
+    layer_group: Vec<u32>,
+    /// Layer count per storage group, indexed by group id.
+    group_layer_count: Vec<usize>,
+    /// Dense rank of the layer within its storage group (0..group_layer_count),
+    /// indexed by layer_id. Within-group slots are `rank * tp_size + tp_rank`.
+    layer_group_rank: Vec<usize>,
     /// Page-first layout when `Some`: each block's layers collapse into
     /// contiguous per-shard pages, so `total_slots = num_shards`. `None` is the
     /// legacy layer-first layout (`total_slots = num_layers * tp_size`).
@@ -167,11 +181,44 @@ impl LayerTopology {
 
     /// Total number of storage slots per block: `num_shards` page-first, else
     /// `num_layers * tp_size` (layer-first).
+    ///
+    /// This is the union across groups and remains the right answer for
+    /// single-group instances; multi-group callers must use
+    /// [`Self::group_total_slots`] — blocks seal per group, so one global
+    /// denominator would never fill.
     pub(crate) fn total_slots(&self) -> usize {
         match &self.page_layout {
             Some(p) => p.shard_page_sizes.len(),
             None => self.num_layers() * self.tp_size,
         }
+    }
+
+    /// Number of distinct storage groups. Always >= 1.
+    pub(crate) fn num_groups(&self) -> usize {
+        self.group_layer_count.len()
+    }
+
+    /// Storage group id of a layer.
+    pub(crate) fn group_of_layer(&self, layer_id: usize) -> u32 {
+        self.layer_group[layer_id]
+    }
+
+    /// Number of storage slots per block within one group. A block of that
+    /// group seals when exactly this many slots are saved.
+    pub(crate) fn group_total_slots(&self, group_id: u32) -> Result<usize, EngineError> {
+        let group_idx = group_id as usize;
+        if group_idx >= self.num_groups() {
+            return Err(EngineError::InvalidArgument(format!(
+                "storage group {group_id} out of range ({} groups)",
+                self.num_groups()
+            )));
+        }
+        Ok(match &self.page_layout {
+            // Page-first is seal-validated to be single-group: slots follow
+            // shards, not the layer grid.
+            Some(p) => p.shard_page_sizes.len(),
+            None => self.group_layer_count[group_idx] * self.tp_size,
+        })
     }
 
     /// Page-first only: contiguous page size in bytes of `shard` (one slot).
@@ -198,7 +245,9 @@ impl LayerTopology {
     ///
     /// Page-first collapses the layer dimension into per-shard pages, so the
     /// slot is the layer's shard; the layer's position is its page offset
-    /// ([`Self::page_placement`]). Layer-first keeps `[layer][tp_rank]`.
+    /// ([`Self::page_placement`]). Layer-first slots are dense *within* the
+    /// layer's storage group: `group_rank * tp_size + tp_rank`. Single-group
+    /// topologies degenerate to the historical `[layer][tp_rank]` grid.
     pub(crate) fn slot_index(&self, layer_id: usize, tp_rank: usize) -> Result<usize, EngineError> {
         if layer_id >= self.num_layers() {
             return Err(EngineError::InvalidArgument(format!(
@@ -215,7 +264,7 @@ impl LayerTopology {
         }
         Ok(match &self.page_layout {
             Some(p) => p.layer_shard[layer_id],
-            None => layer_id * self.tp_size + tp_rank,
+            None => self.layer_group_rank[layer_id] * self.tp_size + tp_rank,
         })
     }
 }
@@ -243,6 +292,9 @@ pub struct GpuContext {
     /// KV cache layouts by layer name.
     kv_caches: HashMap<String, KVCacheLayout>,
 
+    /// Hybrid-cache storage group id by layer name; absent = group 0.
+    layer_groups: HashMap<String, u32>,
+
     /// CUDA context handle (kept alive for the lifetime of this context).
     _cuda_ctx: Arc<CudaContext>,
 
@@ -260,6 +312,10 @@ impl GpuContext {
     /// # Errors
     /// Returns `EngineError::CudaInit` if CUDA context creation or worker
     /// pool initialization fails.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "GPU context construction mirrors one registration payload"
+    )]
     fn new(
         cuda_ctx: Arc<CudaContext>,
         device_id: i32,
@@ -268,6 +324,7 @@ impl GpuContext {
         numa_node: NumaNode,
         transfer_mode: TransferMode,
         kv_caches: HashMap<String, KVCacheLayout>,
+        layer_groups: HashMap<String, u32>,
     ) -> Result<Self, EngineError> {
         let worker_pool = GpuWorkerPool::spawn(device_id, numa_node, transfer_mode)?;
 
@@ -277,6 +334,7 @@ impl GpuContext {
             pp_rank,
             preferred_numa: numa_node,
             kv_caches,
+            layer_groups,
             _cuda_ctx: cuda_ctx,
             worker_pool,
         })
@@ -311,6 +369,12 @@ impl GpuContext {
     pub(crate) fn worker_pool(&self) -> &GpuWorkerPool {
         &self.worker_pool
     }
+
+    /// Hybrid-cache storage group of a layer; unregistered layers default to
+    /// group 0, preserving single-group behavior.
+    pub(crate) fn group_of_layer(&self, layer_name: &str) -> u32 {
+        self.layer_groups.get(layer_name).copied().unwrap_or(0)
+    }
 }
 
 pub(crate) struct GpuRegistration {
@@ -320,6 +384,8 @@ pub(crate) struct GpuRegistration {
     pub(crate) numa_node: NumaNode,
     pub(crate) transfer_mode: TransferMode,
     pub(crate) kv_caches: HashMap<String, KVCacheLayout>,
+    /// Hybrid-cache storage group id by layer name; absent = group 0.
+    pub(crate) layer_groups: HashMap<String, u32>,
 }
 
 /// Instance context for a model inference process.
@@ -483,6 +549,61 @@ impl InstanceContext {
             .map(|(id, name)| (name.clone(), id))
             .collect();
 
+        // Storage groups must agree across devices (same name ⇒ same group,
+        // checked while scanning) and be dense `0..N` so slot spaces are
+        // complete; a group nobody registers would never seal.
+        let mut group_by_name: HashMap<&str, u32> = HashMap::new();
+        for gpu in gpus() {
+            for name in gpu.kv_caches.keys() {
+                let group = gpu.group_of_layer(name);
+                match group_by_name.insert(name, group) {
+                    None => {}
+                    Some(existing) if existing == group => {}
+                    Some(existing) => {
+                        return Err(EngineError::InvalidArgument(format!(
+                            "layer {name} registered in storage group {existing} on one device \
+                             but group {group} on device {}",
+                            gpu.device_id(),
+                        )));
+                    }
+                }
+            }
+        }
+        let num_groups = 1 + group_by_name.values().copied().max().unwrap_or(0) as usize;
+        if group_by_name
+            .values()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .len()
+            != num_groups
+        {
+            return Err(EngineError::InvalidArgument(format!(
+                "storage groups must be dense 0..{num_groups}: an unregistered group \
+                 would never seal its blocks",
+            )));
+        }
+
+        let mut layer_group = vec![0u32; names.len()];
+        let mut layer_group_rank = vec![0usize; names.len()];
+        let mut group_layer_count = vec![0usize; num_groups];
+        for name in &names {
+            let layer_id = name_to_id[name];
+            let group = group_by_name[name.as_str()];
+            layer_group[layer_id] = group;
+            layer_group_rank[layer_id] = group_layer_count[group as usize];
+            group_layer_count[group as usize] += 1;
+        }
+
+        // Page-first packs every layer of a block into one page slot per
+        // shard; splitting a block across storage groups contradicts that
+        // layout, so reject instead of silently picking one.
+        if self.page_first && num_groups > 1 {
+            return Err(EngineError::InvalidArgument(format!(
+                "page-first storage does not support multiple storage groups \
+                 ({num_groups} registered)",
+            )));
+        }
+
         // Validate registration completeness on the full `[layer][tp_rank]`
         // grid, independent of how slots are stored: every (layer, tp_rank)
         // pair needs an owner regardless of page-first collapsing.
@@ -543,6 +664,9 @@ impl InstanceContext {
         Ok(LayerTopology {
             name_to_id,
             tp_size: self.tp_size,
+            layer_group,
+            group_layer_count,
+            layer_group_rank,
             page_layout,
         })
     }
@@ -555,6 +679,10 @@ impl InstanceContext {
     /// # Errors
     /// Returns `EngineError::InvalidArgument` for negative device IDs,
     /// or `EngineError::CudaInit` if CUDA context creation fails.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "GPU context construction mirrors one registration payload"
+    )]
     fn build_gpu_context(
         &self,
         device_id: i32,
@@ -563,6 +691,7 @@ impl InstanceContext {
         numa_node: NumaNode,
         transfer_mode: TransferMode,
         kv_caches: HashMap<String, KVCacheLayout>,
+        layer_groups: HashMap<String, u32>,
     ) -> Result<Arc<GpuContext>, EngineError> {
         if device_id < 0 {
             return Err(EngineError::InvalidArgument(format!(
@@ -582,6 +711,7 @@ impl InstanceContext {
             numa_node,
             transfer_mode,
             kv_caches,
+            layer_groups,
         )?))
     }
 
@@ -635,6 +765,7 @@ impl InstanceContext {
             numa_node,
             transfer_mode,
             kv_caches,
+            layer_groups,
         } = registration;
 
         if tp_rank >= self.tp_size {
@@ -661,6 +792,7 @@ impl InstanceContext {
             numa_node,
             transfer_mode,
             kv_caches,
+            layer_groups,
         )?;
 
         {

@@ -98,6 +98,11 @@ impl TestGpuData {
         assert_eq!(self.gpu.copy_to_host(), expected, "GPU data mismatch");
     }
 
+    /// The deterministic host-side pattern backing this GPU buffer.
+    pub fn expected_bytes(&self) -> &[u8] {
+        &self.expected
+    }
+
     pub fn ptr(&self) -> u64 {
         self.gpu.as_u64()
     }
@@ -131,6 +136,7 @@ struct LayerSpec {
     block_size: usize,
     kv_stride: usize,
     segments: usize,
+    group: u32,
 }
 
 pub struct TestEnvBuilder {
@@ -172,6 +178,27 @@ impl TestEnvBuilder {
             block_size,
             kv_stride: 0,
             segments: 1,
+            group: 0,
+        });
+        self
+    }
+
+    /// Add a contiguous layer in an explicit hybrid-cache storage group
+    /// (e.g. group 1 = recurrent-state checkpoints in mamba-style models).
+    pub fn grouped_layer(
+        mut self,
+        name: &'static str,
+        num_blocks: usize,
+        block_size: usize,
+        group: u32,
+    ) -> Self {
+        self.layers.push(LayerSpec {
+            name,
+            num_blocks,
+            block_size,
+            kv_stride: 0,
+            segments: 1,
+            group,
         });
         self
     }
@@ -198,6 +225,7 @@ impl TestEnvBuilder {
             block_size: segment_size,
             kv_stride,
             segments: 2,
+            group: 0,
         });
         self
     }
@@ -261,6 +289,7 @@ impl TestEnvBuilder {
                 block_size: spec.block_size,
                 kv_stride: spec.kv_stride,
                 segments: spec.segments,
+                group: spec.group,
             })
             .collect();
 

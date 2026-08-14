@@ -46,6 +46,13 @@ message RegisterContextRequest {
   // Set by the connector for MLA; the engine derives per-layer page offsets
   // from the registered layouts. See spec.md.
   bool page_first = 18;
+  // Hybrid-cache storage group per layer, parallel to layer_names (e.g.
+  // vLLM's kv-cache group index: 0 = full attention, 1 = recurrent state).
+  // Empty means every layer belongs to group 0, preserving single-group
+  // behavior. Groups key blocks independently and seal against their own
+  // slot space, so a sparse (checkpoint-only) group can seal without
+  // attention's per-block cadence. Page-first stays single-group.
+  repeated uint32 layer_group_ids = 19;
 }
 
 message RegisterContextResponse {
@@ -112,6 +119,12 @@ message QueryRequest {
   // from a remote node via MetaServer + RDMA. Does not observe saves landing
   // in the local engine; no effect when RDMA is not configured.
   bool wait_for_full_prefix = 4;
+  // Hybrid-cache storage group to query. 0 (default) is the attention group
+  // and uses prefix semantics (hit count + lease over the contiguous prefix,
+  // SSD/RDMA prefetch eligible). Groups > 0 use membership semantics: every
+  // position reports independently (QueryReady.hit_positions), hits are not
+  // prefix-clamped, and the lease pins exactly the hit blocks.
+  uint32 group_id = 5;
 }
 
 message QueryResponse {
@@ -124,8 +137,18 @@ message QueryResponse {
 message QueryLoading {}
 
 message QueryReady {
+  // Prefix query (group_id = 0): number of leading hit blocks.
+  // Membership query (group_id > 0): number of hit positions in total.
   uint64 num_hit_blocks = 1;
+  // Lease over the hit blocks: the prefix for group 0, or exactly the blocks
+  // at hit_positions (in that order) for membership queries. Empty on 0 hits.
   bytes lease = 2;
+  // Membership queries only: indices into QueryRequest.block_hashes whose
+  // block is cached, in ascending order. The lease's i-th block corresponds
+  // to query position hit_positions[i]. Position-aligned so hybrid callers
+  // can pick e.g. the rightmost recurrent checkpoint within the attention
+  // prefix without a second round trip.
+  repeated uint32 hit_positions = 3;
 }
 
 message ReleaseRequest {
