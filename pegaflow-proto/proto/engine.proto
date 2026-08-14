@@ -117,13 +117,19 @@ message QueryRequest {
   string req_id = 3;
   // Keep the query in Loading until the full remaining prefix is fetchable
   // from a remote node via MetaServer + RDMA. Does not observe saves landing
-  // in the local engine; no effect when RDMA is not configured.
+  // in the local engine; no effect when RDMA is not configured. On groups > 0
+  // this switches the membership query to an all-or-nothing set fetch: the
+  // hash list is an exact want-set, misses are pulled from SSD / remote
+  // peers, and a Ready answer shorter than the request means the set could
+  // not be completed anywhere: callers treat it as a miss, and it carries no
+  // lease (the short hit count is reported for observability only).
   bool wait_for_full_prefix = 4;
   // Hybrid-cache storage group to query. 0 (default) is the attention group
   // and uses prefix semantics (hit count + lease over the contiguous prefix,
   // SSD/RDMA prefetch eligible). Groups > 0 use membership semantics: every
   // position reports independently (QueryReady.hit_positions), hits are not
-  // prefix-clamped, and the lease pins exactly the hit blocks.
+  // prefix-clamped, and the lease pins exactly the hit blocks; local-only
+  // unless wait_for_full_prefix requests the remote-fetching set form.
   uint32 group_id = 5;
 }
 

@@ -162,11 +162,6 @@ impl GrpcEngineService {
         if req.req_id.is_empty() {
             return Err(Status::invalid_argument("req_id must not be empty"));
         }
-        if req.group_id > 0 && req.wait_for_full_prefix {
-            return Err(Status::invalid_argument(
-                "wait_for_full_prefix applies to prefix queries only (group_id must be 0)",
-            ));
-        }
         Ok(())
     }
 
@@ -565,7 +560,50 @@ impl Engine for GrpcEngineService {
                 req.block_hashes.len()
             );
 
-            let outcome = if req.group_id > 0 {
+            let outcome = if req.group_id > 0 && req.wait_for_full_prefix {
+                // All-or-nothing membership fetch: the hash list is an exact
+                // want-set and misses are pulled from SSD / remote peers, so
+                // the query may report Loading before it resolves. A Ready
+                // answer shorter than the request means the set could not be
+                // completed anywhere and the caller must treat it as a miss.
+                let status = self
+                    .engine
+                    .query_group_membership_with_fetch(
+                        &req.instance_id,
+                        &req.req_id,
+                        req.group_id,
+                        &req.block_hashes,
+                    )
+                    .await
+                    .map_err(Self::map_engine_error)?;
+                match status {
+                    PrefetchStatus::Ready { blocks, .. } => {
+                        // All-or-nothing: a short answer is a miss by
+                        // contract, so it must not pin the partial blocks —
+                        // a lease would hold them non-evictable for the full
+                        // lease TTL with no consumer. The short hit count is
+                        // still reported for observability; only a complete
+                        // want-set carries a lease.
+                        let complete = blocks.len() == req.block_hashes.len();
+                        let positions: Vec<u32> = (0..blocks.len() as u32).collect();
+                        let lease = if complete && !blocks.is_empty() {
+                            self.engine
+                                .create_query_lease(&req.instance_id, blocks)
+                                .map_err(Self::map_engine_error)?
+                                .to_bytes()
+                                .to_vec()
+                        } else {
+                            Vec::new()
+                        };
+                        query_response::Outcome::Ready(QueryReady {
+                            num_hit_blocks: positions.len() as u64,
+                            lease,
+                            hit_positions: positions,
+                        })
+                    }
+                    PrefetchStatus::Loading => query_response::Outcome::Loading(QueryLoading {}),
+                }
+            } else if req.group_id > 0 {
                 // Membership query (hybrid-cache checkpoint groups): every
                 // position reports independently and the lease pins exactly
                 // the hit blocks, in hit_positions order.

@@ -209,3 +209,115 @@ async fn single_group_instances_are_unaffected() {
             .is_err()
     );
 }
+
+/// The prefill/decode handoff shape: `query_group_membership_with_fetch`
+/// treats the hash list as an exact want-set with all-or-nothing semantics.
+/// A fully saved recurrent checkpoint set answers Ready and complete; a
+/// want-set with any absent member (no remote tier configured here) comes
+/// back short, which callers must read as a miss. Group isolation holds: a
+/// hash saved only under the attention group never satisfies the recurrent
+/// want-set.
+#[tokio::test]
+async fn recurrent_membership_fetch_is_all_or_nothing() {
+    if !has_cuda_devices(1) {
+        eprintln!("skipping recurrent_membership_fetch_is_all_or_nothing: needs >= 1 CUDA device");
+        return;
+    }
+
+    const ATTN_BLOCK: usize = 1024;
+    const RECUR_BLOCK: usize = 2048;
+
+    let env = TestEnvBuilder::new("hybrid-pd", "hybrid-pd-ns")
+        .grouped_layer("attn_0", 8, ATTN_BLOCK, 0)
+        .grouped_layer("recurrent_state", 8, RECUR_BLOCK, 1)
+        .pool_size(64 << 20)
+        .build();
+
+    let hashes = make_block_hashes(8, 21);
+
+    // Attention saves blocks 0..2; the recurrent group saves the block-1 and
+    // block-2 checkpoints (a two-member set, like a multi-component state).
+    env.engine
+        .batch_save_kv_blocks_from_ipc(
+            &env.instance_id,
+            0,
+            0,
+            0,
+            vec![LayerSave {
+                layer_name: "attn_0".into(),
+                block_ids: vec![0, 1, 2],
+                block_hashes: hashes[0..3].to_vec(),
+            }],
+        )
+        .await
+        .expect("save attention prefix");
+    env.engine
+        .batch_save_kv_blocks_from_ipc(
+            &env.instance_id,
+            0,
+            0,
+            0,
+            vec![LayerSave {
+                layer_name: "recurrent_state".into(),
+                block_ids: vec![4, 5],
+                block_hashes: vec![hashes[1].clone(), hashes[2].clone()],
+            }],
+        )
+        .await
+        .expect("save recurrent checkpoints");
+    env.engine.flush_saves().await;
+
+    // The exact want-set resolves Ready and complete, in requested order.
+    let want = vec![hashes[1].clone(), hashes[2].clone()];
+    match env
+        .engine
+        .query_group_membership_with_fetch(&env.instance_id, "pd-req-full", 1, &want)
+        .await
+        .expect("want-set query")
+    {
+        PrefetchStatus::Ready { blocks, missing } => {
+            assert_eq!(blocks.len(), 2, "full want-set must resolve completely");
+            assert_eq!(missing, 0);
+            let _lease = env
+                .engine
+                .create_query_lease(&env.instance_id, blocks)
+                .expect("lease over the fetched set");
+        }
+        other => panic!("expected Ready, got {other:?}"),
+    }
+
+    // A want-set with an absent member comes back short (no remote tier is
+    // configured in this harness): the caller must treat that as a miss.
+    let short = vec![hashes[1].clone(), hashes[5].clone(), hashes[2].clone()];
+    match env
+        .engine
+        .query_group_membership_with_fetch(&env.instance_id, "pd-req-short", 1, &short)
+        .await
+        .expect("short want-set query")
+    {
+        PrefetchStatus::Ready { blocks, missing } => {
+            assert!(
+                blocks.len() < short.len(),
+                "an incomplete want-set must not report as complete"
+            );
+            assert!(missing > 0);
+        }
+        other => panic!("expected Ready, got {other:?}"),
+    }
+
+    // Group isolation: hashes[0] exists in the attention group only, so the
+    // recurrent want-set containing it cannot complete.
+    let cross = vec![hashes[0].clone()];
+    match env
+        .engine
+        .query_group_membership_with_fetch(&env.instance_id, "pd-req-cross", 1, &cross)
+        .await
+        .expect("cross-group query")
+    {
+        PrefetchStatus::Ready { blocks, missing } => {
+            assert_eq!(blocks.len(), 0);
+            assert_eq!(missing, 1);
+        }
+        other => panic!("expected Ready, got {other:?}"),
+    }
+}

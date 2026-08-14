@@ -527,6 +527,54 @@ impl PegaEngine {
         Ok(status)
     }
 
+    /// All-or-nothing membership fetch over one hybrid-cache storage group,
+    /// eligible for the same SSD prefetch and MetaServer + RDMA remote fetch
+    /// as prefix queries.
+    ///
+    /// Where [`Self::query_group_membership`] answers from the resident read
+    /// cache only, this treats `block_hashes` as an exact want-set: misses are
+    /// pulled from remote tiers, and the query stays `Loading` until the whole
+    /// set is fetchable (the prefix machinery over an explicit key list *is*
+    /// a set fetch once the full length is required). Use it when partial
+    /// state is useless — e.g. restoring a recurrent-state checkpoint on a
+    /// prefill/decode handoff, where the peer that saved the set holds every
+    /// member. A `Ready` result with fewer blocks than requested means the
+    /// set could not be completed anywhere; callers treat that as a miss.
+    pub async fn query_group_membership_with_fetch(
+        &self,
+        instance_id: &str,
+        req_id: &str,
+        group_id: u32,
+        block_hashes: &[Vec<u8>],
+    ) -> Result<PrefetchStatus, EngineError> {
+        let instance = self.get_instance(instance_id)?;
+        let topology = instance.sealed_topology()?;
+        // Same contract as the local membership query: an unknown group is a
+        // bug in the caller, not an all-miss answer.
+        topology.group_total_slots(group_id)?;
+
+        let namespace = instance.namespace();
+        let encoded: Vec<Vec<u8>> = block_hashes
+            .iter()
+            .map(|hash| group_hash(hash, group_id))
+            .collect();
+
+        let status = self
+            .storage
+            .check_prefix_and_prefetch(req_id, namespace, &encoded, true)
+            .await;
+
+        if let PrefetchStatus::Ready { blocks, missing } = &status {
+            let metrics = core_metrics();
+            metrics.cache_block_hits.add(blocks.len() as u64, &[]);
+            if *missing > 0 {
+                metrics.cache_block_misses.add(*missing as u64, &[]);
+            }
+        }
+
+        Ok(status)
+    }
+
     /// Position-aligned membership query over one hybrid-cache storage group.
     ///
     /// Unlike prefix queries, every position reports independently: entry `i`
