@@ -378,9 +378,9 @@ fn remove_lru_batch_from_class(
         else {
             break;
         };
-        if inner.cache.is_exclusively_owned(&key) {
+        if inner.cache.is_cache_owned_only(&key) {
             let block = remove_lru(inner, class)
-                .expect("exclusive LRU candidate must remain resident while locked");
+                .expect("cache-owned LRU candidate must remain resident while locked");
             removed.push(block);
         } else {
             class_lru(inner, class).get(&key);
@@ -497,18 +497,32 @@ mod tests {
     }
 
     #[test]
-    fn pressure_reclaim_waits_for_weak_references() {
+    fn pressure_reclaim_ignores_weak_references() {
         let cache = make_cache();
         let key = BlockKey::new("ns".into(), vec![1]);
         let block = make_block();
         let weak = Arc::downgrade(&block);
         cache.batch_insert(vec![(key.clone(), block)]);
 
+        assert_eq!(cache.remove_lru_batch(1)[0].0, key);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn pressure_reclaim_waits_for_external_strong_reference() {
+        let cache = make_cache();
+        let key = BlockKey::new("ns".into(), vec![1]);
+        let block = make_block();
+        let external = Arc::clone(&block);
+        let weak = Arc::downgrade(&block);
+        cache.batch_insert(vec![(key.clone(), block)]);
+
         assert!(cache.remove_lru_batch(1).is_empty());
         assert_class(&cache, &key, ResidentClass::Retained);
 
-        drop(weak);
+        drop(external);
         assert_eq!(cache.remove_lru_batch(1)[0].0, key);
+        assert!(weak.upgrade().is_none());
     }
 
     #[test]
