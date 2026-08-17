@@ -269,7 +269,8 @@ impl HllTracker {
     /// time drift. For example with 1h slots: if the first slot starts at 0:00
     /// and the next request arrives at 1:30, the new slot starts at 1:00 (not 1:30).
     pub fn record(&mut self, hash: &[u8]) {
-        self.record_hashes_with_total(std::slice::from_ref(&hash), 1);
+        let hashes = [hash];
+        self.record_hashes_with_total(&hashes, 1);
     }
 
     /// Record a batch of distinct identities while accounting for a possibly
@@ -441,6 +442,11 @@ impl MultiWindowHllTracker {
         total_requests: u64,
         miss_hashes: &[Vec<u8>],
     ) {
+        if total_requests == 0 {
+            return;
+        }
+        debug_assert!(miss_hashes.len() as u64 <= total_requests);
+
         let namespaced_hashes: Vec<[u8; 8]> = miss_hashes
             .iter()
             .map(|hash| namespaced_hash(namespace, hash))
