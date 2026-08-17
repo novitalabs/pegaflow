@@ -21,7 +21,6 @@ const TARGET_OWNED_KEYS: usize = 10_000;
 
 fn empty_hll_report() -> HllNodeReport {
     HllNodeReport {
-        snapshot_at_unix_ms: 1,
         windows: vec![HllWindowSnapshot {
             window: "15m".into(),
             window_secs: 900,

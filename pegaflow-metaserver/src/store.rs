@@ -7,7 +7,7 @@ use pegaflow_common::hll::{
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const MIN_RECLAIMABLE_OWNER_COUNT: usize = 3;
@@ -86,7 +86,6 @@ pub enum StoreError {
 
 #[derive(Debug, Clone)]
 pub struct HllNodeReport {
-    pub snapshot_at_unix_ms: u64,
     pub windows: Vec<HllWindowSnapshot>,
 }
 
@@ -504,17 +503,13 @@ impl BlockHashStore {
     /// requires every active report to use the same window schema.
     fn compute_cluster_hll(
         &self,
-        _now: Instant,
+        now: Instant,
         active_reports: &[(Instant, HllNodeReport)],
     ) -> ClusterHllSnapshot {
-        let now_unix_ms = unix_time_ms();
-        let oldest_snapshot_at_unix_ms = active_reports
+        let snapshot_age_seconds = active_reports
             .iter()
-            .map(|(_, report)| report.snapshot_at_unix_ms)
-            .min()
-            .unwrap_or(now_unix_ms);
-        let snapshot_age_seconds =
-            now_unix_ms.saturating_sub(oldest_snapshot_at_unix_ms) as f64 / 1000.0;
+            .map(|(received_at, _)| now.duration_since(*received_at).as_secs_f64())
+            .fold(0.0, f64::max);
 
         struct WindowAccum {
             union: HyperLogLog,
@@ -655,9 +650,6 @@ fn validate_hll_report(report: &HllNodeReport) -> Result<(), String> {
             ));
         }
     }
-    if report.snapshot_at_unix_ms == 0 {
-        return Err("snapshot_at_unix_ms must be greater than zero".into());
-    }
     if payload_bytes > MAX_HLL_REPORT_BYTES {
         return Err(format!(
             "HLL register payload exceeds {MAX_HLL_REPORT_BYTES} bytes: {payload_bytes}"
@@ -675,15 +667,6 @@ fn same_hll_schema(left: &HllNodeReport, right: &HllNodeReport) -> bool {
                     && left_window.bucket_bits == right_window.bucket_bits
             })
         })
-}
-
-fn unix_time_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
 }
 
 impl Default for BlockHashStore {
@@ -706,7 +689,6 @@ mod tests {
 
     fn test_hll_report() -> HllNodeReport {
         HllNodeReport {
-            snapshot_at_unix_ms: unix_time_ms().max(1),
             windows: vec![HllWindowSnapshot {
                 window: "1m".into(),
                 window_secs: 60,
@@ -724,7 +706,6 @@ mod tests {
             hll.insert(&distributed.to_be_bytes());
         }
         HllNodeReport {
-            snapshot_at_unix_ms: unix_time_ms().max(1),
             windows: vec![HllWindowSnapshot {
                 window: "1m".into(),
                 window_secs: 60,

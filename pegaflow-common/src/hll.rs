@@ -87,27 +87,6 @@ impl HyperLogLog {
         }
     }
 
-    /// Build an HLL from a mergeable register snapshot.
-    pub fn from_registers(bucket_bits: u8, registers: Vec<u8>) -> Result<Self, String> {
-        if !(MIN_BUCKET_BITS..=MAX_BUCKET_BITS).contains(&bucket_bits) {
-            return Err(format!(
-                "HLL bucket_bits must be in {MIN_BUCKET_BITS}..={MAX_BUCKET_BITS}, got {bucket_bits}"
-            ));
-        }
-        let expected = 1usize << bucket_bits;
-        if registers.len() != expected {
-            return Err(format!(
-                "HLL registers length must be {expected} for bucket_bits={bucket_bits}, got {}",
-                registers.len()
-            ));
-        }
-        Ok(Self {
-            registers,
-            bucket_bits,
-            lz_mask: (1u32 << (32 - bucket_bits)) - 1,
-        })
-    }
-
     pub fn registers(&self) -> &[u8] {
         &self.registers
     }
@@ -654,24 +633,6 @@ mod tests {
             (800.0..1200.0).contains(&card_merged),
             "expected ~1000, got {card_merged}"
         );
-    }
-
-    #[test]
-    fn hll_register_snapshot_round_trip() {
-        let mut original = HyperLogLog::new(8);
-        for i in 0u32..100 {
-            original.insert(&sha256_like(i));
-        }
-
-        let restored = HyperLogLog::from_registers(8, original.registers().to_vec()).unwrap();
-        assert_eq!(restored.registers(), original.registers());
-        assert_eq!(restored.cardinality(), original.cardinality());
-    }
-
-    #[test]
-    fn hll_register_snapshot_rejects_wrong_length() {
-        let err = HyperLogLog::from_registers(8, vec![0; 255]).unwrap_err();
-        assert!(err.contains("registers length must be 256"));
     }
 
     #[test]

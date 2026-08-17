@@ -51,12 +51,10 @@ impl GrpcMetaService {
         let Some(report) = report else {
             warn!("MetaServer heartbeat missing HLL report; preserving node liveness");
             return HllNodeReport {
-                snapshot_at_unix_ms: 0,
                 windows: Vec::new(),
             };
         };
 
-        let snapshot_at_unix_ms = report.snapshot_at_unix_ms;
         let mut windows = Vec::with_capacity(report.windows.len());
         for window in report.windows {
             let Ok(bucket_bits) = u8::try_from(window.bucket_bits) else {
@@ -65,7 +63,6 @@ impl GrpcMetaService {
                     window.bucket_bits
                 );
                 return HllNodeReport {
-                    snapshot_at_unix_ms,
                     windows: Vec::new(),
                 };
             };
@@ -78,10 +75,7 @@ impl GrpcMetaService {
             });
         }
 
-        HllNodeReport {
-            snapshot_at_unix_ms: report.snapshot_at_unix_ms,
-            windows,
-        }
+        HllNodeReport { windows }
     }
 }
 
@@ -350,7 +344,6 @@ mod tests {
 
     fn test_hll_report() -> HllSnapshotReport {
         HllSnapshotReport {
-            snapshot_at_unix_ms: 1,
             windows: vec![HllWindowSnapshot {
                 window: "1m".into(),
                 window_secs: 60,

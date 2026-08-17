@@ -325,8 +325,7 @@ message HllWindowSnapshot {
 }
 
 message HllSnapshotReport {
-  uint64 snapshot_at_unix_ms = 1;
-  repeated HllWindowSnapshot windows = 2;
+  repeated HllWindowSnapshot windows = 1;
 }
 
 message HeartbeatNodeRequest {

@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use log::{debug, error, info, warn};
 use pegaflow_common::grpc::{GRPC_CLIENT_HTTP2_KEEPALIVE_INTERVAL, GRPC_CONNECT_TIMEOUT};
@@ -780,10 +779,7 @@ async fn send_heartbeat(
 }
 
 fn invalid_hll_report() -> HllSnapshotReport {
-    HllSnapshotReport {
-        snapshot_at_unix_ms: 0,
-        windows: Vec::new(),
-    }
+    HllSnapshotReport::default()
 }
 
 fn build_hll_report(
@@ -809,14 +805,7 @@ fn build_hll_report(
         ));
     }
 
-    let snapshot_at_unix_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| format!("system clock is before Unix epoch: {error}"))?
-        .as_millis()
-        .try_into()
-        .map_err(|_| "snapshot timestamp does not fit into uint64".to_string())?;
     Ok(HllSnapshotReport {
-        snapshot_at_unix_ms,
         windows: snapshots
             .into_iter()
             .map(|snapshot| HllWindowSnapshot {
