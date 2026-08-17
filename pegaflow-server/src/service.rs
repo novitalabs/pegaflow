@@ -30,11 +30,7 @@ pub struct GrpcEngineService {
 }
 
 impl GrpcEngineService {
-    pub fn new(
-        engine: Arc<PegaEngine>,
-        registry: RegistryHandle,
-        shutdown: Arc<Notify>,
-    ) -> Self {
+    pub fn new(engine: Arc<PegaEngine>, registry: RegistryHandle, shutdown: Arc<Notify>) -> Self {
         Self {
             engine,
             registry,
