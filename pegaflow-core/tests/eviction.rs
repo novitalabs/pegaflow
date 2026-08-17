@@ -11,7 +11,7 @@ use pegaflow_core::StorageConfig;
 
 const BLOCK_SIZE: usize = 4096;
 const NUM_BLOCKS: usize = 4;
-/// Pool fits one batch with headroom for metadata, but not two.
+/// Pool fits two batches, so a third batch must reclaim one of them.
 const POOL_SIZE: usize = NUM_BLOCKS * BLOCK_SIZE * 2;
 
 fn eviction_storage_config() -> StorageConfig {
@@ -61,11 +61,20 @@ async fn leased_blocks_survive_eviction_pressure() {
     env.save_and_wait(&hashes).await;
     let lease = env.assert_all_hit_lease(&hashes).await;
 
-    // Second batch creates eviction pressure while the first is leased.
-    let pressure = make_block_hashes(NUM_BLOCKS, 20);
-    env.save_layer(0, &pressure).await;
+    // Fill the remaining pool, then force a third batch to reclaim it while
+    // the first batch remains leased.
+    let reclaimed = make_block_hashes(NUM_BLOCKS, 20);
+    env.save_layer_and_flush(0, &reclaimed).await;
+    let pressure = make_block_hashes(NUM_BLOCKS, 21);
+    env.save_layer_and_flush(0, &pressure).await;
+    assert_eq!(env.count_hits_then_release(&reclaimed).await, 0);
 
-    // First batch is still leased — load must succeed.
+    // The lease pins both the allocation and its cache index, so an exact
+    // follow-up query must still see the same prefix after pressure.
+    let second_lease = env.assert_all_hit_lease(&hashes).await;
+    env.release(&second_lease);
+
+    // The original lease must still load the pinned data.
     env.data().zero_gpu();
     env.load_to_gpu(lease, hashes.len()).await;
     env.data().assert_gpu_matches_expected();

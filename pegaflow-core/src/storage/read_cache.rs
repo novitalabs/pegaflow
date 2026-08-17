@@ -160,13 +160,19 @@ impl ReadCache {
         let removed = {
             let mut inner = self.inner.lock();
             let mut removed = Vec::with_capacity(batch_size);
-            while removed.len() < batch_size {
-                let next = remove_lru(&mut inner, ResidentClass::Reclaimable)
-                    .or_else(|| remove_lru(&mut inner, ResidentClass::Retained));
-                let Some(block) = next else {
-                    break;
-                };
-                removed.push(block);
+            remove_lru_batch_from_class(
+                &mut inner,
+                ResidentClass::Reclaimable,
+                batch_size,
+                &mut removed,
+            );
+            if removed.len() < batch_size {
+                remove_lru_batch_from_class(
+                    &mut inner,
+                    ResidentClass::Retained,
+                    batch_size,
+                    &mut removed,
+                );
             }
             removed
         };
@@ -353,6 +359,35 @@ fn remove_lru(inner: &mut ReadCacheInner, class: ResidentClass) -> Option<Remove
     None
 }
 
+fn remove_lru_batch_from_class(
+    inner: &mut ReadCacheInner,
+    class: ResidentClass,
+    batch_size: usize,
+    removed: &mut Vec<RemovedResident>,
+) {
+    let candidates = class_lru(inner, class).len();
+    for _ in 0..candidates {
+        if removed.len() == batch_size {
+            break;
+        }
+
+        let Some(key) = class_lru(inner, class)
+            .iter()
+            .next()
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        if inner.cache.is_exclusively_owned(&key) {
+            let block = remove_lru(inner, class)
+                .expect("exclusive LRU candidate must remain resident while locked");
+            removed.push(block);
+        } else {
+            class_lru(inner, class).get(&key);
+        }
+    }
+}
+
 fn record_residence_durations(
     removed: Vec<RemovedResident>,
     attributes: &[opentelemetry::KeyValue],
@@ -459,6 +494,21 @@ mod tests {
             evicted.into_iter().map(|(key, _)| key).collect::<Vec<_>>(),
             vec![reclaimable, retained]
         );
+    }
+
+    #[test]
+    fn pressure_reclaim_waits_for_weak_references() {
+        let cache = make_cache();
+        let key = BlockKey::new("ns".into(), vec![1]);
+        let block = make_block();
+        let weak = Arc::downgrade(&block);
+        cache.batch_insert(vec![(key.clone(), block)]);
+
+        assert!(cache.remove_lru_batch(1).is_empty());
+        assert_class(&cache, &key, ResidentClass::Retained);
+
+        drop(weak);
+        assert_eq!(cache.remove_lru_batch(1)[0].0, key);
     }
 
     #[test]

@@ -515,20 +515,10 @@ impl StorageEngine {
             }
 
             let mut batch_bytes = 0u64;
-            let mut still_referenced = 0u64;
             for (_key, block) in &evicted {
                 let b = block.memory_footprint();
                 batch_bytes = batch_bytes.saturating_add(b);
-                if Arc::strong_count(block) > 1 {
-                    still_referenced += 1;
-                }
                 core_metrics().cache_resident_bytes.add(-(b as i64), &[]);
-            }
-
-            if still_referenced > 0 {
-                core_metrics()
-                    .cache_block_evictions_still_referenced
-                    .add(still_referenced, &[]);
             }
 
             freed_bytes = freed_bytes.saturating_add(batch_bytes);
