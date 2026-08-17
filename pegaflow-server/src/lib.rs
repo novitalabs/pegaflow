@@ -174,11 +174,11 @@ pub struct Cli {
     /// HLL sliding-window list for hit-rate estimation. Comma-separated humantime
     /// durations; each becomes a canonical `window` label in metrics (e.g. `15m,1h,1d`).
     /// Slot duration is derived as `clamp(window/24, 1min, 1h)`.
-    #[arg(long, default_value = "15m,1h,24h", value_parser = parse_hll_windows_arg)]
+    #[arg(long, default_value = "15m,1h,1d", value_parser = parse_hll_windows_arg)]
     pub metric_hll_windows: String,
 
-    /// HLL bucket index bits 4–18 (default: 14 → 16384 buckets, ~0.8% error)
-    #[arg(long, default_value_t = 14, value_parser = parse_hll_bucket_bits)]
+    /// HLL bucket index bits 4–18 (default: 16 → 65536 buckets, ~0.4% error)
+    #[arg(long, default_value_t = 16, value_parser = parse_hll_bucket_bits)]
     pub metric_hll_bucket_bits: u8,
 
     /// Transfer lock timeout in seconds. Blocks held for cross-node RDMA transfer are
@@ -211,7 +211,7 @@ fn parse_hll_windows_arg(s: &str) -> Result<String, String> {
     Ok(s.to_string())
 }
 
-/// Parse a comma-separated list of humantime windows (e.g. `15m,1h,24h`).
+/// Parse a comma-separated list of humantime windows (e.g. `15m,1h,1d`).
 /// Each entry becomes `(label, duration)` where label is canonicalized from
 /// the parsed duration.
 fn parse_hll_windows(s: &str) -> Result<Vec<(String, Duration)>, String> {
@@ -732,6 +732,7 @@ mod tests {
             parse_hll_windows(&cli.metric_hll_windows).unwrap(),
             expected_hll_windows()
         );
+        assert_eq!(cli.metric_hll_bucket_bits, 16);
     }
 
     #[test]

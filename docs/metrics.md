@@ -141,18 +141,25 @@ PegaFlow exposes the following metrics for monitoring KV cache operations:
 
 ### HLL Reuse Metrics
 - **pegaflow_hll_cardinality** (Gauge)
-  - Estimated distinct block hashes observed in a configured sliding window
+  - Estimated distinct `(namespace, block hash)` objects classified as misses in a configured sliding window
   - Labels: `window` (`15m`, `1h`, `1d` by default)
   - Use case: Derive approximate prefix reuse over longer windows without
     storing every block hash
 
 - **pegaflow_hll_total_requests** (Gauge)
-  - Total block hash observations in the same configured sliding window
+  - Total queried blocks in the same configured sliding window, including ready blocks and duplicates
   - Labels: `window` (`15m`, `1h`, `1d` by default)
-  - Use case: Denominator for HLL-based estimated hit-rate PromQL
+  - Use case: Denominator for HLL-based reference reuse rate
 
-PegaFlow does not export a separate HLL hit-rate gauge. Use PromQL so the
-ratio is computed from values in the same scrape:
+- **pegaflow_hll_estimated_hit_rate** (Gauge)
+  - Server-computed miss-based infinite-cache reuse reference from the same
+    HLL snapshot as the two gauges above
+  - Labels: `window`
+  - Value is clamped to `[0, 1]`
+
+The existing cardinality and total metrics are retained. Existing PromQL
+continues to work, but new dashboards should prefer the direct gauge because
+it applies the same cardinality clamp as the tracker:
 
 ```promql
 1 - (
@@ -161,6 +168,18 @@ ratio is computed from values in the same scrape:
   clamp_min(pegaflow_hll_total_requests{window="1h"}, 1)
 )
 ```
+
+```promql
+pegaflow_hll_estimated_hit_rate{window="1h"}
+```
+
+This is a metrics semantic update, not an `/metrics` protocol breaking change:
+metric names, types, existing labels, and the HTTP endpoint are unchanged;
+the new gauge is additive. The default HLL size changes from 16,384 registers
+(`bucket_bits=14`, about 0.8% standard error) to 65,536 registers
+(`bucket_bits=16`, about 0.4%). Three default windows use about 192 KiB of
+register storage; sliding slots make the live tracker a few MiB per server.
+The setting remains configurable with `--metric-hll-bucket-bits`.
 
 ### Save Metrics (GPU → CPU)
 - **pegaflow_save_bytes_total** (Counter)
@@ -245,15 +264,17 @@ tier counters.
   - Only used when `--metrics-otel-endpoint` is set
 
 - `--metric-hll-windows`: Comma-separated HLL sliding windows for estimated
-  prefix reuse (default: `15m,1h,24h`)
+  prefix reuse (default: `15m,1h,1d`)
   - Supported units: `s`, `m`, `h`, `d`
   - Each configured duration becomes a canonical `window` label. For example,
     the default config exports `window="15m"`, `window="1h"`, and `window="1d"`.
   - Empty entries such as `15m,,1h` and duplicate durations such as `1h,60m`
     are rejected at startup.
 
-- `--metric-hll-bucket-bits`: HLL bucket index bits (default: `14`)
-  - Higher values use more memory and lower estimation error.
+- `--metric-hll-bucket-bits`: HLL bucket index bits (default: `16`)
+  - `2^16 = 65,536` registers per window and about 0.4% standard error.
+  - Higher values use more memory and lower estimation error; `18` remains
+    the supported maximum.
 
 **Example: Prometheus Metrics**
 ```bash
@@ -484,7 +505,10 @@ sum by (le) (
   rate(pegaflow_cache_residence_duration_seconds_bucket{reason="pressure"}[5m])
 )
 
-# HLL estimated hit rate for the 1h window
+# HLL estimated hit rate for the 1h window (preferred)
+pegaflow_hll_estimated_hit_rate{window="1h"}
+
+# Backward-compatible derivation from the retained gauges
 1 - (
   pegaflow_hll_cardinality{window="1h"}
   /

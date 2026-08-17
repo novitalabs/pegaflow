@@ -22,6 +22,7 @@ pub const MAX_BUCKET_BITS: u8 = 18;
 /// Input hashes are expected to have good uniformity (e.g. SHA-256).
 /// The full hash is used: top `bucket_bits` bits select the register,
 /// remaining bits are scanned for leading zeros.
+#[derive(Debug)]
 pub struct HyperLogLog {
     registers: Vec<u8>,
     bucket_bits: u8,
@@ -34,8 +35,8 @@ impl HyperLogLog {
     /// Create a new HyperLogLog with the given bucket bits.
     ///
     /// `bucket_bits` determines the number of buckets (2^bucket_bits) and estimation
-    /// accuracy (~1.04 / sqrt(2^bucket_bits)).  14 gives 16384 buckets
-    /// and ~0.8% standard error.
+    /// accuracy (~1.04 / sqrt(2^bucket_bits)). 16 gives 65536 buckets
+    /// and ~0.4% standard error.
     pub fn new(bucket_bits: u8) -> Self {
         assert!(
             (MIN_BUCKET_BITS..=MAX_BUCKET_BITS).contains(&bucket_bits),
@@ -205,7 +206,7 @@ fn alpha_m(m: usize) -> f64 {
 /// Metric snapshot returned by [`HllTracker::metric`].
 #[derive(Debug, Clone)]
 pub struct HllMetric {
-    /// Estimated number of distinct block hashes in the window.
+    /// Estimated number of distinct miss block identities in the window.
     pub cardinality: f64,
     /// Total block requests (including duplicates) in the window.
     pub total_requests: u64,
@@ -225,7 +226,7 @@ struct WindowSlot {
 ///
 /// Divides time into fixed-duration slots and maintains a ring of HLLs.
 /// The merged cardinality across all active slots approximates the number
-/// of distinct blocks requested in the window. From this we derive:
+/// of distinct miss blocks recorded in the window. From this we derive:
 ///
 /// ```text
 /// hit_rate = (total_requests - cardinality) / total_requests
@@ -249,7 +250,7 @@ impl HllTracker {
     ///
     /// - `slot_duration`: how long each time slot lasts (e.g. 1 hour)
     /// - `window_duration`: total sliding window (e.g. 24 hours)
-    /// - `bucket_bits`: HLL bucket index bits (4..=18, default 14)
+    /// - `bucket_bits`: HLL bucket index bits (4..=18, default 16)
     pub fn new(slot_duration: Duration, window_duration: Duration, bucket_bits: u8) -> Self {
         Self {
             slots: VecDeque::new(),
@@ -268,6 +269,20 @@ impl HllTracker {
     /// time drift. For example with 1h slots: if the first slot starts at 0:00
     /// and the next request arrives at 1:30, the new slot starts at 1:00 (not 1:30).
     pub fn record(&mut self, hash: &[u8]) {
+        let hashes = [hash];
+        self.record_hashes_with_total(&hashes, 1);
+    }
+
+    /// Record a batch of distinct identities while accounting for a possibly
+    /// larger observation count. The identities are inserted into HLL, while
+    /// `total_requests` is used as the denominator. This is used by the
+    /// miss-only reference: only cache misses enter HLL, but every queried
+    /// block still contributes to the total observation count.
+    pub fn record_hashes_with_total<T: AsRef<[u8]>>(&mut self, hashes: &[T], total_requests: u64) {
+        if total_requests == 0 {
+            return;
+        }
+
         let now = Instant::now();
 
         let need_new_slot = match self.slots.back() {
@@ -295,15 +310,15 @@ impl HllTracker {
         }
 
         let slot = self.slots.back_mut().unwrap();
-        slot.hll.insert(hash);
-        slot.request_count += 1;
+        for hash in hashes {
+            slot.hll.insert(hash.as_ref());
+        }
+        slot.request_count += total_requests;
     }
 
     /// Record a batch of block hashes from a gRPC request.
     pub fn record_hashes(&mut self, hashes: &[Vec<u8>]) {
-        for hash in hashes {
-            self.record(hash);
-        }
+        self.record_hashes_with_total(hashes, hashes.len() as u64);
     }
 
     /// Compute and return the current metric snapshot.
@@ -417,6 +432,30 @@ impl MultiWindowHllTracker {
         }
     }
 
+    /// Record all queried blocks in the denominator but insert only the
+    /// identities that were misses into HLL. Repeated misses remain deduped by
+    /// HLL, preserving the infinite-cache reuse reference without discarding
+    /// historical observations.
+    pub fn record_namespaced_misses(
+        &mut self,
+        namespace: &str,
+        total_requests: u64,
+        miss_hashes: &[Vec<u8>],
+    ) {
+        if total_requests == 0 {
+            return;
+        }
+        debug_assert!(miss_hashes.len() as u64 <= total_requests);
+
+        let namespaced_hashes: Vec<[u8; 8]> = miss_hashes
+            .iter()
+            .map(|hash| namespaced_hash(namespace, hash))
+            .collect();
+        for (_, tracker) in &mut self.windows {
+            tracker.record_hashes_with_total(&namespaced_hashes, total_requests);
+        }
+    }
+
     /// Snapshot every window. Returned in insertion order.
     pub fn metrics(&mut self) -> Vec<(String, HllMetric)> {
         self.windows
@@ -424,6 +463,38 @@ impl MultiWindowHllTracker {
             .map(|(label, tracker)| (label.clone(), tracker.metric()))
             .collect()
     }
+}
+
+/// Stable identity hash for `(namespace, block_hash)`.
+///
+/// Cluster aggregation unions raw HLL registers across nodes, so every node
+/// must map the same object to the exact same bits regardless of platform,
+/// architecture, or build. FNV-1a with a splitmix64 finalizer is fully
+/// specified byte-by-byte; do not replace it with a hasher that does not
+/// guarantee cross-platform stability (e.g. ahash, SipHash with random keys).
+fn namespaced_hash(namespace: &str, block_hash: &[u8]) -> [u8; 8] {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = FNV_OFFSET;
+    // Length prefix keeps (namespace, hash) boundaries unambiguous.
+    for &byte in (namespace.len() as u64)
+        .to_le_bytes()
+        .iter()
+        .chain(namespace.as_bytes())
+        .chain(block_hash)
+    {
+        h = (h ^ u64::from(byte)).wrapping_mul(FNV_PRIME);
+    }
+    splitmix64(h).to_be_bytes()
+}
+
+/// splitmix64 finalizer: strengthens FNV-1a's avalanche so the top bits used
+/// for HLL bucket selection are uniformly distributed.
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
 }
 
 fn derive_slot_duration(window: Duration) -> Duration {
@@ -766,7 +837,7 @@ mod tests {
             vec![
                 ("15m".into(), Duration::from_secs(15 * 60)),
                 ("1h".into(), Duration::from_secs(3600)),
-                ("24h".into(), Duration::from_secs(86400)),
+                ("1d".into(), Duration::from_secs(86400)),
             ],
             14,
         );
@@ -781,7 +852,7 @@ mod tests {
         assert_eq!(metrics.len(), 3);
         assert_eq!(metrics[0].0, "15m");
         assert_eq!(metrics[1].0, "1h");
-        assert_eq!(metrics[2].0, "24h");
+        assert_eq!(metrics[2].0, "1d");
         for (label, m) in metrics {
             assert_eq!(m.total_requests, 2000, "{label}: total");
             assert!(
@@ -790,6 +861,44 @@ mod tests {
                 m.cardinality
             );
         }
+    }
+
+    #[test]
+    fn namespaced_misses_keep_all_observations_in_denominator() {
+        let mut tracker =
+            MultiWindowHllTracker::new(vec![("15m".into(), Duration::from_secs(15 * 60))], 14);
+        let miss = vec![sha256_like(1).to_vec(), sha256_like(2).to_vec()];
+        tracker.record_namespaced_misses("model", 5, &miss);
+
+        let metric = tracker.metrics().remove(0).1;
+        assert_eq!(metric.total_requests, 5);
+        assert!(metric.cardinality > 1.0 && metric.cardinality < 3.5);
+        assert!(metric.estimated_hit_rate > 0.3);
+    }
+
+    #[test]
+    fn namespaced_misses_allow_all_hit_observation_without_hll_insert() {
+        let mut tracker =
+            MultiWindowHllTracker::new(vec![("15m".into(), Duration::from_secs(15 * 60))], 14);
+        tracker.record_namespaced_misses("model", 4, &[]);
+
+        let metric = tracker.metrics().remove(0).1;
+        assert_eq!(metric.total_requests, 4);
+        assert_eq!(metric.cardinality, 0.0);
+        assert_eq!(metric.estimated_hit_rate, 1.0);
+    }
+
+    #[test]
+    fn namespaced_misses_separate_equal_raw_hashes() {
+        let mut tracker =
+            MultiWindowHllTracker::new(vec![("15m".into(), Duration::from_secs(15 * 60))], 16);
+        let raw_hash = vec![42; 32];
+        tracker.record_namespaced_misses("model-a", 1, std::slice::from_ref(&raw_hash));
+        tracker.record_namespaced_misses("model-b", 1, std::slice::from_ref(&raw_hash));
+
+        let metric = tracker.metrics().remove(0).1;
+        assert_eq!(metric.total_requests, 2);
+        assert!((1.5..2.5).contains(&metric.cardinality));
     }
 
     #[test]
@@ -848,12 +957,5 @@ mod tests {
         let m3 = splitmix64(m2);
         hash[24..32].copy_from_slice(&m3.to_le_bytes());
         hash
-    }
-
-    fn splitmix64(mut x: u64) -> u64 {
-        x = x.wrapping_add(0x9e3779b97f4a7c15);
-        x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-        x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
-        x ^ (x >> 31)
     }
 }
