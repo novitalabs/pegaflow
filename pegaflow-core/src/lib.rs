@@ -483,6 +483,11 @@ impl PegaEngine {
             .collect()
     }
 
+    /// Return the namespace associated with a registered instance.
+    pub fn instance_namespace(&self, instance_id: &str) -> Result<String, EngineError> {
+        Ok(self.get_instance(instance_id)?.namespace().to_string())
+    }
+
     /// Count prefix hit blocks with SSD prefetch support.
     ///
     /// Argument contract:

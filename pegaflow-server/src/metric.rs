@@ -8,6 +8,7 @@ use tonic::Status;
 struct HllGaugeHandles {
     _cardinality: ObservableGauge<f64>,
     _total_requests: ObservableGauge<u64>,
+    _estimated_hit_rate: ObservableGauge<f64>,
 }
 
 static HLL_GAUGES: OnceLock<HllGaugeHandles> = OnceLock::new();
@@ -15,18 +16,20 @@ static HLL_GAUGES: OnceLock<HllGaugeHandles> = OnceLock::new();
 /// Register HLL observable gauges backed by the multi-window tracker.
 ///
 /// Emits one time series per configured window, labeled with `window=<label>`.
-/// Hit rate is intentionally not exported — derive it in Prometheus via
-/// `1 - pegaflow_hll_cardinality / pegaflow_hll_total_requests`.
+/// The cardinality and total gauges remain available for compatibility. The
+/// direct hit-rate gauge is calculated from the same tracker snapshot and is
+/// clamped to the valid probability range.
 pub fn register_hll_gauges(tracker: &Arc<Mutex<MultiWindowHllTracker>>) {
     let t_card = Arc::clone(tracker);
     let t_total = Arc::clone(tracker);
+    let t_hit_rate = Arc::clone(tracker);
 
     HLL_GAUGES.get_or_init(|| {
         let meter = global::meter("pegaflow-core");
 
         let cardinality = meter
             .f64_observable_gauge("pegaflow_hll_cardinality")
-            .with_description("Estimated distinct blocks seen in the sliding window")
+            .with_description("Estimated distinct cache-miss blocks seen in the sliding window")
             .with_callback(move |observer| {
                 if let Ok(mut t) = t_card.lock() {
                     for (label, m) in t.metrics() {
@@ -38,7 +41,7 @@ pub fn register_hll_gauges(tracker: &Arc<Mutex<MultiWindowHllTracker>>) {
 
         let total_requests = meter
             .u64_observable_gauge("pegaflow_hll_total_requests")
-            .with_description("Total block requests in the sliding window")
+            .with_description("Total queried blocks in the sliding window")
             .with_callback(move |observer| {
                 if let Ok(mut t) = t_total.lock() {
                     for (label, m) in t.metrics() {
@@ -48,9 +51,22 @@ pub fn register_hll_gauges(tracker: &Arc<Mutex<MultiWindowHllTracker>>) {
             })
             .build();
 
+        let estimated_hit_rate = meter
+            .f64_observable_gauge("pegaflow_hll_estimated_hit_rate")
+            .with_description("Estimated infinite-cache reuse rate from HLL cache misses")
+            .with_callback(move |observer| {
+                if let Ok(mut t) = t_hit_rate.lock() {
+                    for (label, m) in t.metrics() {
+                        observer.observe(m.estimated_hit_rate, &[KeyValue::new("window", label)]);
+                    }
+                }
+            })
+            .build();
+
         HllGaugeHandles {
             _cardinality: cardinality,
             _total_requests: total_requests,
+            _estimated_hit_rate: estimated_hit_rate,
         }
     });
 }
