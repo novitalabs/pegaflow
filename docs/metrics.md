@@ -181,6 +181,8 @@ Missing or damaged HLL reports are best-effort observability failures: the
 MetaServer keeps the node live for metadata, excludes that report from the
 cluster union, and the server increments
 `pegaflow_metaserver_hll_report_failures` when it cannot build a report.
+All active reports must use the same window label, duration, and `bucket_bits`;
+an incompatible report is excluded from the union while the node remains live.
 
 The existing cardinality and total metrics are retained. Existing PromQL
 continues to work, but new dashboards should prefer the direct gauge because
