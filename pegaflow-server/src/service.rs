@@ -652,14 +652,14 @@ impl Engine for GrpcEngineService {
                         let miss_count = missing.min(req.block_hashes.len());
                         let miss_start = req.block_hashes.len() - miss_count;
                         debug_assert_eq!(hit + miss_count, req.block_hashes.len());
-                        if let Ok(namespace) = self.engine.instance_namespace(&req.instance_id) {
-                            if let Ok(mut t) = self.hll_tracker.lock() {
-                                t.record_namespaced_misses(
-                                    &namespace,
-                                    req.block_hashes.len() as u64,
-                                    &req.block_hashes[miss_start..],
-                                );
-                            }
+                        if let Ok(namespace) = self.engine.instance_namespace(&req.instance_id)
+                            && let Ok(mut t) = self.hll_tracker.lock()
+                        {
+                            t.record_namespaced_misses(
+                                &namespace,
+                                req.block_hashes.len() as u64,
+                                &req.block_hashes[miss_start..],
+                            );
                         }
                         let lease = if hit == 0 {
                             Vec::new()
