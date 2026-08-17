@@ -72,6 +72,16 @@ impl TinyLfuCache<BlockKey, ArcSealedBlock> {
         self.lru.contains_key(key)
     }
 
+    /// Returns true only when the cache owns the block exclusively.
+    ///
+    /// `Arc::get_mut` rejects both other strong references and weak references,
+    /// so no holder outside the cache can keep or reacquire the allocation.
+    pub(crate) fn is_exclusively_owned(&mut self, key: &BlockKey) -> bool {
+        self.lru
+            .peek_mut(key)
+            .is_some_and(|block| Arc::get_mut(block).is_some())
+    }
+
     /// Insert with TinyLFU admission. If the candidate is colder than the
     /// current LRU victim it is dropped.
     pub(crate) fn insert(&mut self, key: BlockKey, value: ArcSealedBlock) -> CacheInsertOutcome {
