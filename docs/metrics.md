@@ -157,6 +157,31 @@ PegaFlow exposes the following metrics for monitoring KV cache operations:
   - Labels: `window`
   - Value is clamped to `[0, 1]`
 
+The MetaServer exports the active-node register union. Do not sum per-server
+cardinality gauges: the same object observed on multiple nodes must count only
+once at cluster scope.
+
+- **pegaflow_metaserver_hll_cardinality** (Gauge)
+  - Estimated distinct cache objects in the active-node HLL register union
+  - Labels: `window`
+- **pegaflow_metaserver_hll_total_requests** (Gauge)
+  - Sum of observations in the latest reports from active node sessions
+  - Labels: `window`
+- **pegaflow_metaserver_hll_estimated_hit_rate** (Gauge)
+  - Miss-based infinite-cache reuse reference from the same aggregate snapshot
+  - Labels: `window`
+- **pegaflow_metaserver_hll_active_nodes** (Gauge)
+  - Active node sessions included in the union
+  - Labels: `window`
+- **pegaflow_metaserver_hll_snapshot_age** (Gauge, unit `s`)
+  - Age of the oldest active-node report in the aggregate
+  - Labels: `window`
+
+Missing or damaged HLL reports are best-effort observability failures: the
+MetaServer keeps the node live for metadata, excludes that report from the
+cluster union, and the server increments
+`pegaflow_metaserver_hll_report_failures` when it cannot build a report.
+
 The existing cardinality and total metrics are retained. Existing PromQL
 continues to work, but new dashboards should prefer the direct gauge because
 it applies the same cardinality clamp as the tracker:
@@ -438,6 +463,8 @@ Same as above: http://localhost:3000
 |--------------------|-------|----------|--------------------------------------|
 | PegaFlow Server    | 50055 | gRPC     | Engine service                       |
 | PegaFlow Server    | 9091  | HTTP     | Prometheus metrics endpoint          |
+| PegaFlow MetaServer | 50056 | gRPC     | Cross-node metadata and HLL reports  |
+| PegaFlow MetaServer | 9092  | HTTP     | Prometheus metrics endpoint          |
 | OTel Collector     | 4321  | gRPC     | OTLP gRPC receiver (deprecated)      |
 | OTel Collector     | 8889  | HTTP     | Prometheus exporter (deprecated)     |
 | Prometheus         | 9090  | HTTP     | Query API & Web UI                   |
@@ -507,6 +534,9 @@ sum by (le) (
 
 # HLL estimated hit rate for the 1h window (preferred)
 pegaflow_hll_estimated_hit_rate{window="1h"}
+
+# Cluster HLL estimated hit rate for the 1h window
+pegaflow_metaserver_hll_estimated_hit_rate{window="1h"}
 
 # Backward-compatible derivation from the retained gauges
 1 - (

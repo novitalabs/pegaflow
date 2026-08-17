@@ -8,7 +8,7 @@ use bytesize::ByteSize;
 use log::{debug, info, warn};
 use std::collections::HashSet;
 use std::num::NonZeroU64;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use crate::backing::{AllocateFn, DEFAULT_MAX_PREFETCH_BLOCKS, SsdBackingStore, SsdCacheConfig};
@@ -20,6 +20,7 @@ use crate::internode::metaserver_client::MetaServerClientConfig;
 use crate::metrics::core_metrics;
 use crate::pinned_pool::{PinnedAllocation, PinnedAllocator};
 use pegaflow_common::NumaNode;
+use pegaflow_common::hll::MultiWindowHllTracker;
 
 use prefetch::PrefetchScheduler;
 #[cfg(feature = "rdma")]
@@ -69,6 +70,10 @@ pub struct StorageConfig {
     pub metaserver_queue_depth: usize,
     /// Number of shards for the pinned memory pool (reduces allocator lock contention).
     pub pool_shards: usize,
+    /// HLL window config: (label, duration) pairs.
+    pub hll_windows: Vec<(String, Duration)>,
+    /// HLL bucket bits (register array size = 2^bucket_bits).
+    pub hll_bucket_bits: u8,
 }
 
 impl Default for StorageConfig {
@@ -87,6 +92,12 @@ impl Default for StorageConfig {
             advertise_addr: None,
             metaserver_queue_depth: crate::internode::DEFAULT_METASERVER_QUEUE_DEPTH,
             pool_shards: 1,
+            hll_windows: vec![
+                ("15m".to_string(), Duration::from_secs(15 * 60)),
+                ("1h".to_string(), Duration::from_secs(60 * 60)),
+                ("1d".to_string(), Duration::from_secs(24 * 60 * 60)),
+            ],
+            hll_bucket_bits: 16,
         }
     }
 }
@@ -100,6 +111,7 @@ pub(crate) struct StorageEngine {
     #[cfg(feature = "rdma")]
     rdma_transport: Option<Arc<RdmaTransport>>,
     blockwise_alloc: bool,
+    hll_tracker: Arc<Mutex<MultiWindowHllTracker>>,
     metaserver_client: Option<Arc<MetaServerClient>>,
     transfer_lock: Arc<transfer_lock::TransferLockManager>,
 }
@@ -120,6 +132,10 @@ impl StorageEngine {
         let rdma_qps_per_peer = config.rdma_qps_per_peer;
         let blockwise_alloc = config.blockwise_alloc;
         let transfer_lock_timeout = config.transfer_lock_timeout;
+        let hll_tracker = Arc::new(Mutex::new(MultiWindowHllTracker::new(
+            config.hll_windows.clone(),
+            config.hll_bucket_bits,
+        )));
 
         if blockwise_alloc {
             info!("Blockwise allocation enabled for batch_save");
@@ -174,6 +190,7 @@ impl StorageEngine {
             Arc::new(MetaServerClient::new(
                 ms_config,
                 Arc::downgrade(&read_cache),
+                Arc::clone(&hll_tracker),
             ))
         });
 
@@ -249,6 +266,7 @@ impl StorageEngine {
                 #[cfg(feature = "rdma")]
                 rdma_transport,
                 blockwise_alloc,
+                hll_tracker,
                 metaserver_client,
                 transfer_lock,
             }
@@ -288,6 +306,26 @@ impl StorageEngine {
     /// Returns true if blockwise allocation is enabled.
     pub(crate) fn blockwise_alloc(&self) -> bool {
         self.blockwise_alloc
+    }
+
+    pub(crate) fn record_hll_misses(
+        &self,
+        namespace: &str,
+        total_observations: u64,
+        miss_hashes: &[Vec<u8>],
+    ) {
+        match self.hll_tracker.lock() {
+            Ok(mut tracker) => {
+                tracker.record_namespaced_misses(namespace, total_observations, miss_hashes);
+            }
+            Err(error) => {
+                warn!("HLL tracker lock poisoned; observations were not recorded: {error}");
+            }
+        }
+    }
+
+    pub(crate) fn hll_tracker(&self) -> &Arc<Mutex<MultiWindowHllTracker>> {
+        &self.hll_tracker
     }
 
     /// Allocate pinned memory, returning `None` if the pool is exhausted after eviction.

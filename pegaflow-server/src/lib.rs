@@ -553,6 +553,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         advertise_addr,
         metaserver_queue_depth: cli.metaserver_queue_depth,
         pool_shards: cli.pool_shards,
+        hll_windows: parse_hll_windows(&cli.metric_hll_windows)
+            .map_err(|err| format!("invalid --metric-hll-windows: {err}"))?,
+        hll_bucket_bits: cli.metric_hll_bucket_bits,
     };
 
     if cli.pool_shards > 1 {
@@ -583,15 +586,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         )
     })?;
 
-    let hll_tracker = Arc::new(std::sync::Mutex::new(
-        pegaflow_common::hll::MultiWindowHllTracker::new(
-            parse_hll_windows(&cli.metric_hll_windows)
-                .map_err(|err| format!("invalid --metric-hll-windows: {err}"))?,
-            cli.metric_hll_bucket_bits,
-        ),
-    ));
-    crate::metric::register_hll_gauges(&hll_tracker);
-
     let shutdown = Arc::new(Notify::new());
 
     runtime.block_on(async move {
@@ -602,11 +596,12 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             storage_config,
         )?);
 
+        crate::metric::register_hll_gauges(engine.hll_tracker());
+
         let service = GrpcEngineService::new(
             Arc::clone(&engine),
             registry.clone(),
             Arc::clone(&shutdown),
-            Arc::clone(&hll_tracker),
         );
 
         // Spawn background GC task for stale inflight blocks and expired transfer locks

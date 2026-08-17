@@ -316,9 +316,23 @@ message QueryPrefixBlocksResponse {
   repeated NodePrefixResult nodes = 1;
 }
 
+message HllWindowSnapshot {
+  string window = 1;
+  uint64 window_secs = 2;
+  uint32 bucket_bits = 3;
+  bytes registers = 4;
+  uint64 total_requests = 5;
+}
+
+message HllSnapshotReport {
+  uint64 snapshot_at_unix_ms = 1;
+  repeated HllWindowSnapshot windows = 2;
+}
+
 message HeartbeatNodeRequest {
   string node = 1;
   string node_id = 2;
+  HllSnapshotReport hll_report = 3;
 }
 
 message HeartbeatNodeResponse {
