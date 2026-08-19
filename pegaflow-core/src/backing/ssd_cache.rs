@@ -37,6 +37,11 @@ pub const DEFAULT_SSD_WRITE_INFLIGHT: usize = 2;
 /// Default max concurrent prefetches
 pub const DEFAULT_SSD_PREFETCH_INFLIGHT: usize = 16;
 
+/// Upper bound for one pinned-pool allocation while staging an SSD prefetch.
+/// Large contiguous requests can otherwise force disproportionate LRU reclaim
+/// from a fragmented pool.
+const SSD_PREFETCH_CHUNK_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Result of a single prefetch I/O.
 type SinglePrefetchResult = (
     BlockKey,
@@ -700,10 +705,21 @@ struct SlotRef {
     size: u64,
 }
 
+struct SlotPlacement {
+    block_idx: usize,
+    slot_idx: usize,
+    offset: u64,
+}
+
+struct PrefetchChunk {
+    size: u64,
+    used: u64,
+    slots: Vec<SlotPlacement>,
+}
+
 /// Group all slots across all blocks by NUMA node.
 ///
-/// Returns a map from NUMA key (None = global/unknown) to the list of slot
-/// references that should share a single contiguous allocation.
+/// Returns a map from NUMA key (None = global/unknown) to its slot references.
 fn group_slots_by_numa(
     is_numa: bool,
     requests: &[PrefetchRequest],
@@ -727,6 +743,59 @@ fn group_slots_by_numa(
     groups
 }
 
+fn chunk_slot_refs(refs: &[SlotRef], chunk_bytes: u64) -> Result<Vec<PrefetchChunk>, String> {
+    assert!(chunk_bytes > 0, "SSD prefetch chunk size must be non-zero");
+
+    let mut remaining = refs.iter().try_fold(0u64, |total, slot| {
+        total
+            .checked_add(slot.size)
+            .ok_or_else(|| "SSD prefetch allocation size overflow".to_string())
+    })?;
+    let mut chunks = Vec::new();
+    let mut current: Option<PrefetchChunk> = None;
+
+    for slot in refs {
+        let needs_new_chunk = current.as_ref().is_none_or(|chunk| {
+            chunk
+                .used
+                .checked_add(slot.size)
+                .is_none_or(|end| end > chunk.size)
+        });
+
+        if needs_new_chunk {
+            if let Some(chunk) = current.take() {
+                chunks.push(chunk);
+            }
+            current = Some(PrefetchChunk {
+                size: remaining.min(chunk_bytes).max(slot.size),
+                used: 0,
+                slots: Vec::new(),
+            });
+        }
+
+        let chunk = current
+            .as_mut()
+            .expect("non-empty slot list must have an active prefetch chunk");
+        chunk.slots.push(SlotPlacement {
+            block_idx: slot.block_idx,
+            slot_idx: slot.slot_idx,
+            offset: chunk.used,
+        });
+        chunk.used = chunk
+            .used
+            .checked_add(slot.size)
+            .expect("new SSD prefetch chunk must fit its first slot");
+        remaining = remaining
+            .checked_sub(slot.size)
+            .expect("SSD prefetch remaining bytes must cover every slot");
+    }
+
+    if let Some(chunk) = current {
+        chunks.push(chunk);
+    }
+    Ok(chunks)
+}
+
 /// Allocate per-slot memory grouped by NUMA, build PrefetchTasks, and enqueue.
 /// Returns false if the task channel is closed (should exit).
 async fn dispatch_prefetch_batch(
@@ -739,37 +808,43 @@ async fn dispatch_prefetch_batch(
     // 1. Group all slots across all blocks by NUMA node
     let numa_groups = group_slots_by_numa(store.is_numa(), &requests);
 
-    // 2. Allocate per NUMA group, assign per-slot (allocation, offset).
-    //    All blocks in a batch share the same slot layout, so a single NUMA
-    //    group failure means every block is missing slots → fail the whole batch.
+    // 2. Allocate bounded chunks per NUMA group, assign per-slot offsets.
+    //    A failure still fails the whole batch because every requested block
+    //    must have all of its slots before it can be rebuilt.
     let mut slot_allocs: Vec<Vec<Option<SlotAlloc>>> = requests
         .iter()
         .map(|r| (0..r.entry.slots.len()).map(|_| None).collect())
         .collect();
 
     for (numa_node, refs) in &numa_groups {
-        let total_size: u64 = refs.iter().map(|r| r.size).sum();
-        let allocation = match store.allocate_prefetch(total_size, *numa_node) {
-            Some(alloc) => alloc,
-            None => {
-                warn!(
-                    "SSD prefetch dispatcher: alloc failed for {} bytes ({} slots) numa={:?}, failing entire batch",
-                    total_size,
-                    refs.len(),
-                    numa_node
-                );
+        let chunks = match chunk_slot_refs(refs, SSD_PREFETCH_CHUNK_BYTES) {
+            Ok(chunks) => chunks,
+            Err(err) => {
+                warn!("SSD prefetch dispatcher: {err}, failing entire batch");
                 let _ = done_tx.send(Vec::new());
                 return true;
             }
         };
-
-        let mut offset = 0usize;
-        for r in refs {
-            slot_allocs[r.block_idx][r.slot_idx] = Some(SlotAlloc {
-                allocation: allocation.clone(),
-                offset,
-            });
-            offset += r.size as usize;
+        for chunk in chunks {
+            let allocation = match store.allocate_prefetch(chunk.size, *numa_node) {
+                Some(alloc) => alloc,
+                None => {
+                    warn!(
+                        "SSD prefetch dispatcher: alloc failed for {} bytes numa={:?}, failing entire batch",
+                        chunk.size, numa_node
+                    );
+                    let _ = done_tx.send(Vec::new());
+                    return true;
+                }
+            };
+            for slot in chunk.slots {
+                let offset =
+                    usize::try_from(slot.offset).expect("SSD prefetch chunk offset must fit usize");
+                slot_allocs[slot.block_idx][slot.slot_idx] = Some(SlotAlloc {
+                    allocation: Arc::clone(&allocation),
+                    offset,
+                });
+            }
         }
     }
 
@@ -1293,5 +1368,59 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[&Some(NumaNode(0))].len(), 1);
         assert_eq!(groups[&None].len(), 1); // UNKNOWN → None
+    }
+
+    #[test]
+    fn test_k3_style_prefetch_uses_bounded_numa_chunks() {
+        const MIB: u64 = 1024 * 1024;
+        let slots = || {
+            (0..8)
+                .map(|slot| make_slot(NumaNode(slot / 4), 16 * MIB))
+                .collect()
+        };
+        let requests: Vec<_> = (1..=56)
+            .map(|block| make_prefetch_request(block, slots()))
+            .collect();
+
+        let groups = group_slots_by_numa(true, &requests);
+        for numa in [NumaNode(0), NumaNode(1)] {
+            let refs = &groups[&Some(numa)];
+            let whole_batch_bytes: u64 = refs.iter().map(|slot| slot.size).sum();
+            let chunks = chunk_slot_refs(refs, SSD_PREFETCH_CHUNK_BYTES).unwrap();
+
+            assert_eq!(whole_batch_bytes, 3584 * MIB);
+            assert_eq!(chunks.len(), 14);
+            assert_eq!(
+                chunks.iter().map(|chunk| chunk.size).max(),
+                Some(SSD_PREFETCH_CHUNK_BYTES)
+            );
+            assert_eq!(
+                chunks.iter().map(|chunk| chunk.slots.len()).sum::<usize>(),
+                refs.len()
+            );
+        }
+    }
+
+    #[test]
+    fn test_oversized_prefetch_slot_gets_dedicated_chunk() {
+        let refs = vec![
+            SlotRef {
+                block_idx: 0,
+                slot_idx: 0,
+                size: 300,
+            },
+            SlotRef {
+                block_idx: 0,
+                slot_idx: 1,
+                size: 100,
+            },
+        ];
+
+        let chunks = chunk_slot_refs(&refs, 256).unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].size, 300);
+        assert_eq!(chunks[0].slots[0].offset, 0);
+        assert_eq!(chunks[1].size, 100);
+        assert_eq!(chunks[1].slots[0].offset, 0);
     }
 }
