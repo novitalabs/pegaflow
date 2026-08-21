@@ -1,3 +1,4 @@
+pub mod hll;
 pub mod http_server;
 pub mod metric;
 pub mod proto;
@@ -13,6 +14,10 @@ use opentelemetry::global;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use pegaflow_common::grpc::{
     GRPC_SERVER_HTTP2_KEEPALIVE_INTERVAL, GRPC_SERVER_HTTP2_KEEPALIVE_TIMEOUT,
+};
+use pegaflow_common::hll_config::{
+    DEFAULT_HLL_BUCKET_BITS, DEFAULT_HLL_WINDOWS, parse_hll_bucket_bits, parse_hll_windows,
+    parse_hll_windows_arg,
 };
 use pegaflow_proto::proto::engine::meta_server_server::MetaServerServer;
 use prometheus::Registry;
@@ -56,6 +61,14 @@ pub struct Cli {
     /// Seconds between lifecycle sweeps.
     #[arg(long, default_value_t = DEFAULT_SWEEP_INTERVAL_SECS)]
     pub sweep_interval_secs: u64,
+
+    /// HLL sliding-window list expected from every Pega server.
+    #[arg(long, default_value = DEFAULT_HLL_WINDOWS, value_parser = parse_hll_windows_arg)]
+    pub metric_hll_windows: String,
+
+    /// HLL bucket index bits expected from every Pega server.
+    #[arg(long, default_value_t = DEFAULT_HLL_BUCKET_BITS, value_parser = parse_hll_bucket_bits)]
+    pub metric_hll_bucket_bits: u8,
 }
 
 fn init_metrics() -> Result<(SdkMeterProvider, Registry), Box<dyn Error>> {
@@ -116,6 +129,10 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         "Node lifecycle: stale_after={}s ttl={}m sweep_interval={}s",
         cli.node_stale_secs, cli.ttl_minutes, cli.sweep_interval_secs
     );
+    info!(
+        "HLL schema: windows={} bucket_bits={}",
+        cli.metric_hll_windows, cli.metric_hll_bucket_bits
+    );
     let ttl_secs = cli
         .ttl_minutes
         .checked_mul(60)
@@ -137,10 +154,17 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     // Initialize metrics
     let (meter_provider, prometheus_registry) = init_metrics()?;
 
-    let store = Arc::new(BlockHashStore::with_config(store::StoreConfig {
-        node_stale_after: Duration::from_secs(cli.node_stale_secs),
-        ttl: Duration::from_secs(ttl_secs),
-    }));
+    let hll_windows = parse_hll_windows(&cli.metric_hll_windows)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let hll_schema = hll::HllSchema::new(hll_windows, cli.metric_hll_bucket_bits)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let store = Arc::new(BlockHashStore::with_config_and_hll_schema(
+        store::StoreConfig {
+            node_stale_after: Duration::from_secs(cli.node_stale_secs),
+            ttl: Duration::from_secs(ttl_secs),
+        },
+        hll_schema,
+    ));
 
     // Register store observable gauges
     metric::register_store_gauges(&store);
@@ -201,4 +225,38 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
 
     info!("MetaServer shut down gracefully");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hll_cli_defaults_match_pegaflow_server() {
+        let cli = Cli::try_parse_from(["pegaflow-metaserver"]).unwrap();
+
+        assert_eq!(cli.metric_hll_windows, DEFAULT_HLL_WINDOWS);
+        assert_eq!(cli.metric_hll_bucket_bits, DEFAULT_HLL_BUCKET_BITS);
+    }
+
+    #[test]
+    fn hll_cli_accepts_explicit_schema() {
+        let cli = Cli::try_parse_from([
+            "pegaflow-metaserver",
+            "--metric-hll-windows",
+            "30m,2h",
+            "--metric-hll-bucket-bits",
+            "14",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            parse_hll_windows(&cli.metric_hll_windows).unwrap(),
+            vec![
+                ("30m".to_string(), Duration::from_secs(30 * 60)),
+                ("2h".to_string(), Duration::from_secs(2 * 60 * 60)),
+            ]
+        );
+        assert_eq!(cli.metric_hll_bucket_bits, 14);
+    }
 }

@@ -488,6 +488,24 @@ impl PegaEngine {
         Ok(self.get_instance(instance_id)?.namespace().to_string())
     }
 
+    /// Record the miss suffix for the shared local and MetaServer HLL tracker.
+    pub fn record_hll_misses(
+        &self,
+        namespace: &str,
+        total_observations: u64,
+        miss_hashes: &[Vec<u8>],
+    ) {
+        self.storage
+            .record_hll_misses(namespace, total_observations, miss_hashes);
+    }
+
+    /// Access the tracker shared by local metrics and MetaServer heartbeats.
+    pub fn hll_tracker(
+        &self,
+    ) -> &std::sync::Arc<std::sync::Mutex<pegaflow_common::hll::MultiWindowHllTracker>> {
+        self.storage.hll_tracker()
+    }
+
     /// Count prefix hit blocks with SSD prefetch support.
     ///
     /// Argument contract:

@@ -1,11 +1,13 @@
 use std::collections::HashMap;
-use std::sync::Weak;
+use std::sync::{Arc, Mutex, Weak};
 
 use log::{debug, error, info, warn};
 use pegaflow_common::grpc::{GRPC_CLIENT_HTTP2_KEEPALIVE_INTERVAL, GRPC_CONNECT_TIMEOUT};
+use pegaflow_common::hll::{MAX_HLL_REPORT_BYTES, MAX_HLL_WINDOWS, MultiWindowHllTracker};
 use pegaflow_proto::proto::engine::meta_server_client::MetaServerClient as MetaServerGrpcClient;
 use pegaflow_proto::proto::engine::{
-    HeartbeatNodeRequest, InsertBlockHashesRequest, RemoveBlockHashesRequest, UnregisterNodeRequest,
+    HeartbeatNodeRequest, HllSnapshotReport, HllWindowSnapshot, InsertBlockHashesRequest,
+    RemoveBlockHashesRequest, UnregisterNodeRequest,
 };
 #[cfg(feature = "rdma")]
 use pegaflow_proto::proto::engine::{NodePrefixResult, QueryPrefixBlocksRequest};
@@ -153,7 +155,11 @@ impl MetaServerClient {
     /// Create a new client and spawn the background registration loop.
     ///
     /// Must be called from within a tokio runtime context.
-    pub(crate) fn new(config: MetaServerClientConfig, read_cache: Weak<ReadCache>) -> Self {
+    pub(crate) fn new(
+        config: MetaServerClientConfig,
+        read_cache: Weak<ReadCache>,
+        hll_tracker: Arc<Mutex<MultiWindowHllTracker>>,
+    ) -> Self {
         let endpoint = metaserver_endpoint(config.metaserver_addr.clone());
         let (command_tx, rx) = mpsc::channel(config.queue_depth);
 
@@ -163,6 +169,7 @@ impl MetaServerClient {
             endpoint.clone(),
             config.advertise_addr,
             read_cache,
+            hll_tracker,
         ));
 
         // Lazy-connect query client: connects on first RPC, not here
@@ -333,6 +340,7 @@ async fn registration_loop(
     endpoint: Endpoint,
     advertise_addr: String,
     read_cache: Weak<ReadCache>,
+    hll_tracker: Arc<Mutex<MultiWindowHllTracker>>,
 ) {
     let mut client: Option<MetaServerGrpcClient<Channel>> = None;
     let node_id = Uuid::new_v4().to_string();
@@ -354,6 +362,7 @@ async fn registration_loop(
                     &endpoint,
                     &advertise_addr,
                     &node_id,
+                    &hll_tracker,
                 ).await {
                     Ok(next_period) => {
                         heartbeat.period = next_period;
@@ -453,6 +462,7 @@ async fn registration_loop(
             &advertise_addr,
             &node_id,
             &mut heartbeat,
+            &hll_tracker,
         )
         .await
         .is_err()
@@ -659,6 +669,7 @@ async fn ensure_heartbeat_registered(
     advertise_addr: &str,
     node_id: &str,
     heartbeat: &mut HeartbeatState,
+    hll_tracker: &Arc<Mutex<MultiWindowHllTracker>>,
 ) -> Result<(), ()> {
     if heartbeat.node_registered && client.is_some() {
         return Ok(());
@@ -675,6 +686,7 @@ async fn ensure_heartbeat_registered(
         endpoint,
         advertise_addr,
         node_id,
+        hll_tracker,
     )
     .await
     {
@@ -697,6 +709,7 @@ async fn send_heartbeat(
     endpoint: &Endpoint,
     advertise_addr: &str,
     node_id: &str,
+    hll_tracker: &Arc<Mutex<MultiWindowHllTracker>>,
 ) -> Result<Duration, Duration> {
     if client.is_none() {
         match connect_metaserver_client(endpoint).await {
@@ -713,11 +726,21 @@ async fn send_heartbeat(
         }
     }
 
+    let hll_report = match build_hll_report(hll_tracker) {
+        Ok(report) => report,
+        Err(error) => {
+            warn!("Failed to build HLL heartbeat report: {error}");
+            core_metrics().metaserver_hll_report_failures.add(1, &[]);
+            invalid_hll_report()
+        }
+    };
+
     let c = client.as_mut().expect("client is connected");
     match c
         .heartbeat_node(HeartbeatNodeRequest {
             node: advertise_addr.to_string(),
             node_id: node_id.to_string(),
+            hll_report: Some(hll_report),
         })
         .await
     {
@@ -753,6 +776,47 @@ async fn send_heartbeat(
             Err(heartbeat.advance_backoff())
         }
     }
+}
+
+fn invalid_hll_report() -> HllSnapshotReport {
+    HllSnapshotReport::default()
+}
+
+fn build_hll_report(
+    tracker: &Arc<Mutex<MultiWindowHllTracker>>,
+) -> Result<HllSnapshotReport, String> {
+    let snapshots = tracker
+        .lock()
+        .map_err(|error| format!("HLL tracker lock poisoned: {error}"))?
+        .snapshots();
+    if snapshots.is_empty() || snapshots.len() > MAX_HLL_WINDOWS {
+        return Err(format!(
+            "HLL report window count must be in 1..={MAX_HLL_WINDOWS}, got {}",
+            snapshots.len()
+        ));
+    }
+    let payload_bytes: usize = snapshots
+        .iter()
+        .map(|snapshot| snapshot.registers.len())
+        .sum();
+    if payload_bytes > MAX_HLL_REPORT_BYTES {
+        return Err(format!(
+            "HLL register payload exceeds {MAX_HLL_REPORT_BYTES} bytes: {payload_bytes}"
+        ));
+    }
+
+    Ok(HllSnapshotReport {
+        windows: snapshots
+            .into_iter()
+            .map(|snapshot| HllWindowSnapshot {
+                window: snapshot.window,
+                window_secs: snapshot.window_secs,
+                bucket_bits: u32::from(snapshot.bucket_bits),
+                registers: snapshot.registers,
+                total_requests: snapshot.total_requests,
+            })
+            .collect(),
+    })
 }
 
 fn heartbeat_period_from_stale_after(stale_after_secs: u64) -> Duration {
@@ -865,8 +929,15 @@ mod tests {
     impl MetaServer for FakeMetaServer {
         async fn heartbeat_node(
             &self,
-            _request: Request<HeartbeatNodeRequest>,
+            request: Request<HeartbeatNodeRequest>,
         ) -> Result<Response<HeartbeatNodeResponse>, Status> {
+            let report = request
+                .into_inner()
+                .hll_report
+                .expect("client heartbeat must include an HLL report envelope");
+            assert_eq!(report.windows.len(), 1);
+            assert_eq!(report.windows[0].window, "1m");
+            assert_eq!(report.windows[0].registers.len(), 16);
             self.state.heartbeat_count.fetch_add(1, Ordering::SeqCst);
             self.state.heartbeat_notify.notify_waiters();
             Ok(Response::new(HeartbeatNodeResponse {
@@ -1017,12 +1088,20 @@ mod tests {
         }
     }
 
+    fn test_hll_tracker() -> Arc<Mutex<MultiWindowHllTracker>> {
+        Arc::new(Mutex::new(MultiWindowHllTracker::new(
+            vec![("1m".into(), Duration::from_secs(60))],
+            4,
+        )))
+    }
+
     #[tokio::test]
     async fn heartbeat_loop_sends_initial_heartbeat_and_unregisters_on_shutdown() {
         let (addr, service, shutdown_tx) = start_fake_metaserver().await;
         let client = MetaServerClient::new(
             MetaServerClientConfig::new(addr, "node-a:50055".to_string()),
             Weak::new(),
+            test_hll_tracker(),
         );
 
         wait_for_count(&service.heartbeat_notify, &service.heartbeat_count, 1).await;
@@ -1041,6 +1120,7 @@ mod tests {
         let client = MetaServerClient::new(
             MetaServerClientConfig::new(addr, "node-a:50055".to_string()),
             Weak::new(),
+            test_hll_tracker(),
         );
 
         wait_for_count(&service.heartbeat_notify, &service.heartbeat_count, 1).await;
@@ -1057,6 +1137,7 @@ mod tests {
         let client = MetaServerClient::new(
             MetaServerClientConfig::new(addr, "node-a:50055".to_string()),
             Weak::new(),
+            test_hll_tracker(),
         );
 
         client.try_register_namespace("ns".to_string(), vec![vec![1], vec![2]]);
@@ -1094,6 +1175,7 @@ mod tests {
         let client = MetaServerClient::new(
             MetaServerClientConfig::new(addr, "node-a:50055".to_string()),
             Arc::downgrade(&read_cache),
+            test_hll_tracker(),
         );
 
         client.try_register_namespace("ns".to_string(), hashes);
@@ -1117,6 +1199,7 @@ mod tests {
         let client = MetaServerClient::new(
             MetaServerClientConfig::new(addr, "node-a:50055".to_string()),
             Weak::new(),
+            test_hll_tracker(),
         );
 
         client.try_register_namespace("ns".to_string(), vec![vec![1]]);
@@ -1149,6 +1232,7 @@ mod tests {
         let client = MetaServerClient::new(
             MetaServerClientConfig::new(addr, "node-a:50055".to_string()),
             Weak::new(),
+            test_hll_tracker(),
         );
         wait_for_count(&service.heartbeat_notify, &service.heartbeat_count, 1).await;
 
@@ -1244,6 +1328,7 @@ mod tests {
             endpoint,
             "node-a:50055".to_string(),
             Weak::new(),
+            test_hll_tracker(),
         ));
 
         wait_for_count(&service.insert_notify, &service.insert_count, 2).await;

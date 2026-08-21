@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 /// Allowed range for `bucket_bits` (register index width).
 pub const MIN_BUCKET_BITS: u8 = 4;
 pub const MAX_BUCKET_BITS: u8 = 18;
+pub const MAX_HLL_REPORT_BYTES: usize = 1024 * 1024;
+pub const MAX_HLL_WINDOWS: usize = 32;
 
 // ============================================================================
 // HyperLogLog core
@@ -83,6 +85,14 @@ impl HyperLogLog {
                 *a = *b;
             }
         }
+    }
+
+    pub fn registers(&self) -> &[u8] {
+        &self.registers
+    }
+
+    pub fn registers_mut(&mut self) -> &mut [u8] {
+        &mut self.registers
     }
 
     /// Reset all registers to zero.
@@ -216,6 +226,16 @@ pub struct HllMetric {
     pub window_slot_count: usize,
 }
 
+/// Mergeable snapshot for one configured sliding window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HllWindowSnapshot {
+    pub window: String,
+    pub window_secs: u64,
+    pub bucket_bits: u8,
+    pub registers: Vec<u8>,
+    pub total_requests: u64,
+}
+
 struct WindowSlot {
     hll: HyperLogLog,
     start: Instant,
@@ -319,6 +339,25 @@ impl HllTracker {
     /// Record a batch of block hashes from a gRPC request.
     pub fn record_hashes(&mut self, hashes: &[Vec<u8>]) {
         self.record_hashes_with_total(hashes, hashes.len() as u64);
+    }
+
+    fn snapshot(&mut self, window: String) -> HllWindowSnapshot {
+        self.expire_old_slots(Instant::now());
+        self.ensure_merged();
+
+        let mut hll = HyperLogLog::new(self.bucket_bits);
+        hll.merge(&self.merged);
+        if let Some(back) = self.slots.back() {
+            hll.merge(&back.hll);
+        }
+
+        HllWindowSnapshot {
+            window,
+            window_secs: self.window_duration.as_secs(),
+            bucket_bits: self.bucket_bits,
+            registers: hll.registers,
+            total_requests: self.slots.iter().map(|slot| slot.request_count).sum(),
+        }
     }
 
     /// Compute and return the current metric snapshot.
@@ -461,6 +500,14 @@ impl MultiWindowHllTracker {
         self.windows
             .iter_mut()
             .map(|(label, tracker)| (label.clone(), tracker.metric()))
+            .collect()
+    }
+
+    /// Snapshot every window in mergeable register form, including empty windows.
+    pub fn snapshots(&mut self) -> Vec<HllWindowSnapshot> {
+        self.windows
+            .iter_mut()
+            .map(|(label, tracker)| tracker.snapshot(label.clone()))
             .collect()
     }
 }
@@ -886,6 +933,18 @@ mod tests {
         assert_eq!(metric.total_requests, 4);
         assert_eq!(metric.cardinality, 0.0);
         assert_eq!(metric.estimated_hit_rate, 1.0);
+    }
+
+    #[test]
+    fn multi_window_snapshot_includes_empty_registers() {
+        let mut tracker =
+            MultiWindowHllTracker::new(vec![("15m".into(), Duration::from_secs(15 * 60))], 8);
+
+        let snapshots = tracker.snapshots();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].window, "15m");
+        assert_eq!(snapshots[0].total_requests, 0);
+        assert_eq!(snapshots[0].registers, vec![0; 256]);
     }
 
     #[test]

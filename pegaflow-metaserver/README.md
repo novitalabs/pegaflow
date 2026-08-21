@@ -63,6 +63,9 @@ cargo run -p pegaflow-metaserver -- --log-level debug
 # Custom node lifecycle timings
 cargo run -p pegaflow-metaserver -- --node-stale-secs 30 --ttl-minutes 120 --sweep-interval-secs 600
 
+# Match a custom Pega server HLL configuration
+cargo run -p pegaflow-metaserver -- --metric-hll-windows 15m,1h,1d --metric-hll-bucket-bits 16
+
 # All options combined
 cargo run -p pegaflow-metaserver -- --addr 0.0.0.0:50056 --node-stale-secs 30 --ttl-minutes 120 --sweep-interval-secs 600 --log-level info
 
@@ -77,6 +80,8 @@ cargo run -p pegaflow-metaserver -- --help
 - `--node-stale-secs <SECONDS>`: Hide nodes from query after this many seconds without heartbeat (default: `30`)
 - `--ttl-minutes <MINUTES>`: Purge ownership and node records after this many minutes (default: `120`)
 - `--sweep-interval-secs <SECONDS>`: Run the lifecycle sweep at this interval (default: `600`)
+- `--metric-hll-windows <WINDOWS>`: Expected HLL windows from every Pega server (default: `15m,1h,1d`)
+- `--metric-hll-bucket-bits <BITS>`: Expected HLL bucket bits from every Pega server (default: `16`)
 
 ### Storage Configuration
 
@@ -84,7 +89,8 @@ The MetaServer uses a DashMap-based in-memory store with the following character
 
 - **Multi-owner**: A block hash can be registered by multiple nodes simultaneously
 - **Node lifecycle**: Servers generate a `node_id`, announce it with `HeartbeatNode`, heartbeat periodically, and include the same `node_id` in insert/remove RPCs.
-- **Stale filtering**: Nodes stop appearing in query results after 30 seconds without heartbeat by default.
+- **Stale filtering**: Nodes stop appearing in query results after 30 seconds without heartbeat or valid metadata writes by default.
+- **HLL freshness**: Only heartbeat reports refresh cluster HLL data; metadata writes do not keep an old report in the union.
 - **TTL sweep**: A background task runs every `--sweep-interval-secs` and removes expired owners and nodes after `--ttl-minutes`.
 - **Conditional removal**: `RemoveBlockHashes` only removes the requesting node's ownership; other nodes' entries are untouched.
 - **Memory**: Scales with unique blocks across all nodes. No hard capacity cap — memory is naturally bounded by the total number of blocks in the cluster.
@@ -103,6 +109,7 @@ stale.
 message HeartbeatNodeRequest {
   string node = 1;
   string node_id = 2;
+  HllSnapshotReport hll_report = 3;
 }
 ```
 

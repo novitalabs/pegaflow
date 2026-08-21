@@ -95,6 +95,7 @@ pub(crate) struct CoreMetrics {
     pub metaserver_removal_failures: Counter<u64>,
     pub metaserver_removal_queue_full: Counter<u64>,
     pub metaserver_heartbeat_failures: Counter<u64>,
+    pub metaserver_hll_report_failures: Counter<u64>,
     pub metaserver_session_resets: Counter<u64>,
     pub metaserver_unregister_failures: Counter<u64>,
 
@@ -441,6 +442,10 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
             metaserver_heartbeat_failures: meter
                 .u64_counter("pegaflow_metaserver_heartbeat_failures")
                 .with_description("MetaServer HeartbeatNode RPC failures")
+                .build(),
+            metaserver_hll_report_failures: meter
+                .u64_counter("pegaflow_metaserver_hll_report_failures")
+                .with_description("HLL reports skipped or replaced with an invalid best-effort report")
                 .build(),
             metaserver_session_resets: meter
                 .u64_counter("pegaflow_metaserver_session_resets")
