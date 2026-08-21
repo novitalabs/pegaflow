@@ -21,6 +21,9 @@ use crate::metrics::core_metrics;
 use crate::pinned_pool::{PinnedAllocation, PinnedAllocator};
 use pegaflow_common::NumaNode;
 use pegaflow_common::hll::MultiWindowHllTracker;
+use pegaflow_common::hll_config::{
+    DEFAULT_HLL_BUCKET_BITS, DEFAULT_HLL_WINDOWS, parse_hll_windows,
+};
 
 use prefetch::PrefetchScheduler;
 #[cfg(feature = "rdma")]
@@ -92,12 +95,9 @@ impl Default for StorageConfig {
             advertise_addr: None,
             metaserver_queue_depth: crate::internode::DEFAULT_METASERVER_QUEUE_DEPTH,
             pool_shards: 1,
-            hll_windows: vec![
-                ("15m".to_string(), Duration::from_secs(15 * 60)),
-                ("1h".to_string(), Duration::from_secs(60 * 60)),
-                ("1d".to_string(), Duration::from_secs(24 * 60 * 60)),
-            ],
-            hll_bucket_bits: 16,
+            hll_windows: parse_hll_windows(DEFAULT_HLL_WINDOWS)
+                .expect("default HLL window configuration must be valid"),
+            hll_bucket_bits: DEFAULT_HLL_BUCKET_BITS,
         }
     }
 }

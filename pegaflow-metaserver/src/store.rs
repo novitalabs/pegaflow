@@ -1,14 +1,12 @@
 use dashmap::{DashMap, mapref::entry::Entry};
 use log::{info, warn};
 use pegaflow_common::BlockKey;
-use pegaflow_common::hll::{
-    HllWindowSnapshot, HyperLogLog, MAX_BUCKET_BITS, MAX_HLL_REPORT_BYTES, MAX_HLL_WINDOWS,
-    MIN_BUCKET_BITS,
-};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+use crate::hll::{ClusterHllSnapshot, HllNodeReport, HllSchema, HllState, ReceivedHllReport};
 
 const MIN_RECLAIMABLE_OWNER_COUNT: usize = 3;
 
@@ -84,26 +82,6 @@ pub enum StoreError {
     StaleSession,
 }
 
-#[derive(Debug, Clone)]
-pub struct HllNodeReport {
-    pub windows: Vec<HllWindowSnapshot>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct ClusterHllSnapshot {
-    pub windows: Vec<ClusterHllWindowSnapshot>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ClusterHllWindowSnapshot {
-    pub window: String,
-    pub cardinality: f64,
-    pub total_requests: u64,
-    pub estimated_hit_rate: f64,
-    pub active_nodes: u64,
-    pub snapshot_age_seconds: f64,
-}
-
 /// Snapshot of the session that wrote this block ownership. Query compares it
 /// with the current `NodeRecord.node_id` to filter owners left by old sessions.
 #[derive(Debug, Clone)]
@@ -112,16 +90,16 @@ struct OwnerRecord {
     key_register_time: Instant,
 }
 
-/// Authoritative current session for a node URL. `last_seen` is refreshed only
-/// by heartbeats and gates query visibility. `hll_report` is best-effort
-/// observability state carried by heartbeats; it never affects metadata
-/// liveness, and its own receipt time (not `last_seen`) gates its inclusion in
-/// the cluster union, so metadata writes cannot keep a stale report alive.
+/// Authoritative current session for a node URL. `last_seen` gates metadata
+/// query visibility and is refreshed by a valid heartbeat or metadata write.
+/// `hll_report` is best-effort observability state carried by heartbeats; its
+/// own receipt time gates inclusion in the cluster union, so metadata writes
+/// cannot keep a stale report alive.
 #[derive(Debug, Clone)]
 struct NodeRecord {
     node_id: Uuid,
     last_seen: Instant,
-    hll_report: Option<(Instant, HllNodeReport)>,
+    hll_report: Option<ReceivedHllReport>,
 }
 
 /// Both lifecycle decisions for one owner record, produced from a single `nodes`
@@ -141,6 +119,7 @@ pub struct BlockHashStore {
     blocks: DashMap<BlockKey, HashMap<Arc<str>, OwnerRecord>>,
     nodes: DashMap<Arc<str>, NodeRecord>,
     config: StoreConfig,
+    hll: HllState,
     /// Latest live-owner redundancy distribution, refreshed each sweep and read
     /// by metric callbacks. Decouples the O(N) scan from the scrape path.
     redundancy: Mutex<RedundancySnapshot>,
@@ -152,10 +131,15 @@ impl BlockHashStore {
     }
 
     pub fn with_config(config: StoreConfig) -> Self {
+        Self::with_config_and_hll_schema(config, HllSchema::default())
+    }
+
+    pub fn with_config_and_hll_schema(config: StoreConfig, hll_schema: HllSchema) -> Self {
         Self {
             blocks: DashMap::new(),
             nodes: DashMap::new(),
             config,
+            hll: HllState::new(hll_schema, config.node_stale_after),
             redundancy: Mutex::new(RedundancySnapshot::default()),
         }
     }
@@ -178,18 +162,12 @@ impl BlockHashStore {
         hll_report: HllNodeReport,
     ) -> Result<(), StoreError> {
         let now = Instant::now();
-        let validated_report = match validate_hll_report(&hll_report) {
-            Ok(()) if self.hll_schema_matches_active(&hll_report, now) => Some((now, hll_report)),
-            Ok(()) => {
-                warn!(
-                    "MetaServer heartbeat accepted with incompatible HLL window schema (observability degraded): node={node}"
-                );
-                None
-            }
-            Err(e) => {
+        let validated_report = match self.hll.receive(hll_report, now) {
+            Ok(report) => Some(report),
+            Err(error) => {
                 warn!(
                     "MetaServer heartbeat accepted with invalid HLL report (observability degraded): node={} error={}",
-                    node, e
+                    node, error
                 );
                 None
             }
@@ -228,6 +206,7 @@ impl BlockHashStore {
                 }
             }
         }
+        self.hll.mark_changed();
         Ok(())
     }
 
@@ -250,6 +229,7 @@ impl BlockHashStore {
             );
             return Err(StoreError::UnknownNode);
         }
+        self.hll.mark_changed();
         let removed = self.remove_node_owners(node, node_id);
         Ok(removed)
     }
@@ -438,34 +418,12 @@ impl BlockHashStore {
     }
 
     pub fn cluster_hll_snapshot(&self) -> ClusterHllSnapshot {
-        let now = Instant::now();
-        let active_reports: Vec<(Instant, HllNodeReport)> = self
-            .nodes
-            .iter()
-            .filter(|record| now.duration_since(record.last_seen) <= self.config.node_stale_after)
-            .filter_map(|record| record.hll_report.clone())
-            .filter(|(report_time, _)| {
-                now.duration_since(*report_time) <= self.config.node_stale_after
-            })
-            .collect();
-
-        if active_reports.is_empty() {
-            return ClusterHllSnapshot::default();
-        }
-
-        self.compute_cluster_hll(now, &active_reports)
-    }
-
-    fn hll_schema_matches_active(&self, report: &HllNodeReport, now: Instant) -> bool {
-        for record in &self.nodes {
-            if now.duration_since(record.last_seen) <= self.config.node_stale_after
-                && let Some((_, active_report)) = record.hll_report.as_ref()
-                && !same_hll_schema(active_report, report)
-            {
-                return false;
-            }
-        }
-        true
+        self.hll.snapshot(|| {
+            self.nodes
+                .iter()
+                .filter_map(|record| record.hll_report.clone())
+                .collect()
+        })
     }
 
     #[allow(
@@ -475,6 +433,7 @@ impl BlockHashStore {
     pub fn invalidate_all(&self) {
         self.blocks.clear();
         self.nodes.clear();
+        self.hll.mark_changed();
         *self
             .redundancy
             .lock()
@@ -482,7 +441,7 @@ impl BlockHashStore {
     }
 
     fn touch_node_session(&self, node: &str, node_id: Uuid) -> Result<(), StoreError> {
-        let Some(record) = self.nodes.get(node) else {
+        let Some(mut record) = self.nodes.get_mut(node) else {
             warn!(
                 "MetaServer metadata write rejected unknown node: node={} node_id={}",
                 node, node_id
@@ -496,71 +455,10 @@ impl BlockHashStore {
             );
             return Err(StoreError::StaleSession);
         }
+        // Metadata activity renews owner visibility only; HLL freshness is
+        // owned by the heartbeat report timestamp.
+        record.last_seen = Instant::now();
         Ok(())
-    }
-
-    /// Union active-node registers per configured window. Heartbeat validation
-    /// requires every active report to use the same window schema.
-    fn compute_cluster_hll(
-        &self,
-        now: Instant,
-        active_reports: &[(Instant, HllNodeReport)],
-    ) -> ClusterHllSnapshot {
-        let snapshot_age_seconds = active_reports
-            .iter()
-            .map(|(received_at, _)| now.duration_since(*received_at).as_secs_f64())
-            .fold(0.0, f64::max);
-
-        struct WindowAccum {
-            union: HyperLogLog,
-            total_requests: u64,
-            active_nodes: u64,
-        }
-        let mut groups: HashMap<String, WindowAccum> = HashMap::new();
-        for (_, report) in active_reports {
-            for window in &report.windows {
-                let key = window.window.clone();
-                let accum = groups.entry(key).or_insert_with(|| WindowAccum {
-                    union: HyperLogLog::new(window.bucket_bits),
-                    total_requests: 0,
-                    active_nodes: 0,
-                });
-                for (a, b) in accum
-                    .union
-                    .registers_mut()
-                    .iter_mut()
-                    .zip(window.registers.iter())
-                {
-                    if *b > *a {
-                        *a = *b;
-                    }
-                }
-                accum.total_requests = accum.total_requests.saturating_add(window.total_requests);
-                accum.active_nodes += 1;
-            }
-        }
-
-        let mut windows: Vec<ClusterHllWindowSnapshot> = groups
-            .into_iter()
-            .map(|(key, accum)| {
-                let cardinality = accum.union.cardinality();
-                let estimated_hit_rate = if accum.total_requests == 0 {
-                    0.0
-                } else {
-                    1.0 - cardinality.min(accum.total_requests as f64) / accum.total_requests as f64
-                };
-                ClusterHllWindowSnapshot {
-                    window: key,
-                    cardinality,
-                    total_requests: accum.total_requests,
-                    estimated_hit_rate,
-                    active_nodes: accum.active_nodes,
-                    snapshot_age_seconds,
-                }
-            })
-            .collect();
-        windows.sort_by(|a, b| a.window.cmp(&b.window));
-        ClusterHllSnapshot { windows }
     }
 
     fn remove_node_owners(&self, node: &str, node_id: Uuid) -> usize {
@@ -601,74 +499,6 @@ impl BlockHashStore {
     }
 }
 
-fn validate_hll_report(report: &HllNodeReport) -> Result<(), String> {
-    if report.windows.is_empty() || report.windows.len() > MAX_HLL_WINDOWS {
-        return Err(format!(
-            "HLL report window count must be in 1..={MAX_HLL_WINDOWS}, got {}",
-            report.windows.len()
-        ));
-    }
-
-    let mut labels = HashSet::new();
-    let mut durations = HashSet::new();
-    let mut payload_bytes = 0usize;
-    for window in &report.windows {
-        if window.window.is_empty() {
-            return Err("HLL window label must not be empty".into());
-        }
-        if window.window_secs == 0 {
-            return Err(format!(
-                "HLL window {} duration must be greater than zero",
-                window.window
-            ));
-        }
-        if !labels.insert(window.window.clone()) || !durations.insert(window.window_secs) {
-            return Err(format!(
-                "duplicate HLL window label or duration: {} ({}s)",
-                window.window, window.window_secs
-            ));
-        }
-        payload_bytes = payload_bytes.saturating_add(window.registers.len());
-        if !(MIN_BUCKET_BITS..=MAX_BUCKET_BITS).contains(&window.bucket_bits) {
-            return Err(format!(
-                "HLL bucket_bits must be in {MIN_BUCKET_BITS}..={MAX_BUCKET_BITS}, got {}",
-                window.bucket_bits
-            ));
-        }
-        let expected_registers = 1usize << window.bucket_bits;
-        if window.registers.len() != expected_registers {
-            return Err(format!(
-                "HLL registers length must be {expected_registers} for bucket_bits={}, got {}",
-                window.bucket_bits,
-                window.registers.len()
-            ));
-        }
-        if window.total_requests == 0 && window.registers.iter().any(|register| *register != 0) {
-            return Err(format!(
-                "HLL window {} has registers but zero total_requests",
-                window.window
-            ));
-        }
-    }
-    if payload_bytes > MAX_HLL_REPORT_BYTES {
-        return Err(format!(
-            "HLL register payload exceeds {MAX_HLL_REPORT_BYTES} bytes: {payload_bytes}"
-        ));
-    }
-    Ok(())
-}
-
-fn same_hll_schema(left: &HllNodeReport, right: &HllNodeReport) -> bool {
-    left.windows.len() == right.windows.len()
-        && left.windows.iter().all(|left_window| {
-            right.windows.iter().any(|right_window| {
-                left_window.window == right_window.window
-                    && left_window.window_secs == right_window.window_secs
-                    && left_window.bucket_bits == right_window.bucket_bits
-            })
-        })
-}
-
 impl Default for BlockHashStore {
     fn default() -> Self {
         Self::new()
@@ -677,7 +507,24 @@ impl Default for BlockHashStore {
 
 #[cfg(test)]
 mod tests {
+    use pegaflow_common::hll::{HllWindowSnapshot, HyperLogLog};
+    use pegaflow_common::hll_config::{
+        DEFAULT_HLL_BUCKET_BITS, DEFAULT_HLL_WINDOWS, parse_hll_windows,
+    };
+
     use super::*;
+
+    fn hll_schema(bucket_bits: u8) -> HllSchema {
+        HllSchema::new(
+            vec![("1m".to_string(), Duration::from_secs(60))],
+            bucket_bits,
+        )
+        .unwrap()
+    }
+
+    fn hll_store(config: StoreConfig, bucket_bits: u8) -> BlockHashStore {
+        BlockHashStore::with_config_and_hll_schema(config, hll_schema(bucket_bits))
+    }
 
     fn heartbeat_node(store: &BlockHashStore, node: &str) -> Uuid {
         let node_id = Uuid::new_v4();
@@ -689,13 +536,17 @@ mod tests {
 
     fn test_hll_report() -> HllNodeReport {
         HllNodeReport {
-            windows: vec![HllWindowSnapshot {
-                window: "1m".into(),
-                window_secs: 60,
-                bucket_bits: 4,
-                registers: vec![0; 16],
-                total_requests: 0,
-            }],
+            windows: parse_hll_windows(DEFAULT_HLL_WINDOWS)
+                .unwrap()
+                .into_iter()
+                .map(|(window, duration)| HllWindowSnapshot {
+                    window,
+                    window_secs: duration.as_secs(),
+                    bucket_bits: DEFAULT_HLL_BUCKET_BITS,
+                    registers: vec![0; 1 << DEFAULT_HLL_BUCKET_BITS],
+                    total_requests: 0,
+                })
+                .collect(),
         }
     }
 
@@ -718,7 +569,7 @@ mod tests {
 
     #[test]
     fn cluster_hll_unions_registers_and_sums_observations() {
-        let store = BlockHashStore::new();
+        let store = hll_store(StoreConfig::default(), 14);
         let node_a = Uuid::new_v4();
         let node_b = Uuid::new_v4();
         store
@@ -739,7 +590,7 @@ mod tests {
 
     #[test]
     fn cluster_hll_rejects_incompatible_bucket_bits_without_affecting_liveness() {
-        let store = BlockHashStore::new();
+        let store = hll_store(StoreConfig::default(), 14);
         store
             .heartbeat_node("node-a", Uuid::new_v4(), hll_report_for(&[1], 1, 14))
             .unwrap();
@@ -761,7 +612,7 @@ mod tests {
 
     #[test]
     fn unregister_removes_hll_snapshot_from_cluster() {
-        let store = BlockHashStore::new();
+        let store = hll_store(StoreConfig::default(), 14);
         let node_a = Uuid::new_v4();
         let node_b = Uuid::new_v4();
         store
@@ -780,10 +631,13 @@ mod tests {
 
     #[test]
     fn cluster_hll_snapshot_excludes_nodes_as_soon_as_they_become_stale() {
-        let store = BlockHashStore::with_config(StoreConfig {
-            node_stale_after: Duration::from_millis(10),
-            ttl: Duration::from_secs(60),
-        });
+        let store = hll_store(
+            StoreConfig {
+                node_stale_after: Duration::from_millis(10),
+                ttl: Duration::from_secs(60),
+            },
+            14,
+        );
         let node_id = Uuid::new_v4();
         store
             .heartbeat_node("node-a", node_id, hll_report_for(&[1], 1, 14))
@@ -796,7 +650,7 @@ mod tests {
 
     #[test]
     fn cluster_hll_snapshot_age_advances_between_reads() {
-        let store = BlockHashStore::new();
+        let store = hll_store(StoreConfig::default(), 14);
         store
             .heartbeat_node("node-a", Uuid::new_v4(), hll_report_for(&[1], 1, 14))
             .unwrap();
@@ -809,7 +663,37 @@ mod tests {
     }
 
     #[test]
-    fn metadata_writes_do_not_extend_hll_session_liveness() {
+    fn concurrent_initial_reports_use_the_configured_schema() {
+        let store = Arc::new(hll_store(StoreConfig::default(), 4));
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let valid_store = Arc::clone(&store);
+        let valid_barrier = Arc::clone(&barrier);
+        let valid = std::thread::spawn(move || {
+            valid_barrier.wait();
+            valid_store
+                .heartbeat_node("valid", Uuid::new_v4(), hll_report_for(&[1], 1, 4))
+                .unwrap();
+        });
+        let invalid_store = Arc::clone(&store);
+        let invalid_barrier = Arc::clone(&barrier);
+        let invalid = std::thread::spawn(move || {
+            invalid_barrier.wait();
+            invalid_store
+                .heartbeat_node("invalid", Uuid::new_v4(), hll_report_for(&[2], 1, 5))
+                .unwrap();
+        });
+        barrier.wait();
+        valid.join().unwrap();
+        invalid.join().unwrap();
+
+        assert_eq!(store.node_counts(), (2, 0));
+        let cluster = store.cluster_hll_snapshot();
+        assert_eq!(cluster.windows[0].active_nodes, 1);
+        assert_eq!(cluster.windows[0].total_requests, 1);
+    }
+
+    #[test]
+    fn metadata_writes_keep_metadata_live_without_extending_hll_liveness() {
         let store = BlockHashStore::with_config(StoreConfig {
             node_stale_after: Duration::from_millis(10),
             ttl: Duration::from_secs(60),
@@ -821,9 +705,10 @@ mod tests {
             .insert_hashes("ns", &[vec![1]], "node-a", node_id)
             .unwrap();
 
-        // Metadata writes validate the session but do not refresh node liveness,
-        // so the node and its HLL report are stale together.
-        assert_eq!(store.node_counts(), (0, 1));
+        // Metadata writes keep cache ownership visible, but only a heartbeat
+        // refreshes the HLL receipt time.
+        assert_eq!(store.node_counts(), (1, 0));
+        assert_eq!(store.query_prefix("ns", &[vec![1]]).len(), 1);
         assert!(store.cluster_hll_snapshot().windows.is_empty());
     }
 
@@ -1199,7 +1084,7 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_does_not_refresh_node_liveness() {
+    fn test_insert_refreshes_node_liveness() {
         let store = BlockHashStore::with_config(StoreConfig {
             node_stale_after: Duration::from_secs(60),
             ttl: Duration::from_secs(120),
@@ -1211,13 +1096,14 @@ mod tests {
             .insert_hashes("ns", &[vec![1]], "node-a", node_id)
             .unwrap();
 
-        assert_eq!(store.node_counts(), (0, 1));
+        assert_eq!(store.node_counts(), (1, 0));
         let existing = store.query_prefix("ns", &[vec![1]]);
-        assert!(existing.is_empty());
+        assert_eq!(existing.len(), 1);
+        assert_eq!(existing[0].nodes[0].as_ref(), "node-a");
     }
 
     #[test]
-    fn test_remove_does_not_refresh_node_liveness() {
+    fn test_remove_refreshes_node_liveness() {
         let store = BlockHashStore::with_config(StoreConfig {
             node_stale_after: Duration::from_secs(60),
             ttl: Duration::from_secs(120),
@@ -1232,7 +1118,7 @@ mod tests {
             .remove_hashes("ns", &[vec![2]], "node-a", node_id)
             .unwrap();
 
-        assert_eq!(store.node_counts(), (0, 1));
+        assert_eq!(store.node_counts(), (1, 0));
     }
 
     #[test]

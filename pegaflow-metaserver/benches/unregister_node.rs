@@ -12,7 +12,8 @@
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use pegaflow_common::hll::HllWindowSnapshot;
-use pegaflow_metaserver::store::{BlockHashStore, HllNodeReport, StoreConfig};
+use pegaflow_metaserver::hll::{HllNodeReport, HllSchema};
+use pegaflow_metaserver::store::{BlockHashStore, StoreConfig};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -32,10 +33,14 @@ fn empty_hll_report() -> HllNodeReport {
 }
 
 fn populate_store() -> (BlockHashStore, String, Uuid) {
-    let store = BlockHashStore::with_config(StoreConfig {
-        node_stale_after: Duration::from_secs(30),
-        ttl: Duration::from_secs(7_200),
-    });
+    let schema = HllSchema::new(vec![("15m".into(), Duration::from_secs(900))], 4).unwrap();
+    let store = BlockHashStore::with_config_and_hll_schema(
+        StoreConfig {
+            node_stale_after: Duration::from_secs(30),
+            ttl: Duration::from_secs(7_200),
+        },
+        schema,
+    );
     let target_node = "target-node:50055".to_string();
     let other_node = "other-node:50055".to_string();
     let target_id = Uuid::new_v4();

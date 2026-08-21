@@ -86,9 +86,8 @@ pub fn register_store_gauges(store: &Arc<BlockHashStore>) {
                 observer.observe(avg, &[]);
             })
             .build();
-        // Each HLL gauge re-merges the cluster union in its own callback; at
-        // scrape frequency the merge cost (nodes x windows x registers) is
-        // negligible, and OTEL 0.31 no longer offers multi-instrument callbacks.
+        // The store cache makes these callbacks share one cluster union while
+        // preserving separate instruments in OpenTelemetry 0.31.
         let hll_cardinality_store = Arc::clone(&s);
         let hll_cardinality = meter
             .f64_observable_gauge("pegaflow_metaserver_hll_cardinality")

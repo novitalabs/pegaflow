@@ -1,3 +1,4 @@
+use crate::hll::HllNodeReport;
 use crate::metric::record_rpc_result;
 use crate::proto::engine::meta_server_server::MetaServer;
 use crate::proto::engine::{
@@ -6,7 +7,7 @@ use crate::proto::engine::{
     QueryPrefixBlocksResponse, RemoveBlockHashesRequest, RemoveBlockHashesResponse, ResponseStatus,
     UnregisterNodeRequest, UnregisterNodeResponse,
 };
-use crate::store::{BlockHashStore, HllNodeReport, StoreError};
+use crate::store::{BlockHashStore, StoreError};
 use log::{debug, warn};
 use pegaflow_common::hll::HllWindowSnapshot as CommonHllWindowSnapshot;
 use std::sync::Arc;
@@ -335,11 +336,20 @@ impl MetaServer for GrpcMetaService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hll::HllSchema;
     use crate::proto::engine::HllWindowSnapshot;
-    use crate::store::BlockHashStore;
+    use crate::store::{BlockHashStore, StoreConfig};
 
     fn make_service() -> GrpcMetaService {
-        GrpcMetaService::new(Arc::new(BlockHashStore::new()))
+        let schema = HllSchema::new(
+            vec![("1m".to_string(), std::time::Duration::from_secs(60))],
+            4,
+        )
+        .unwrap();
+        GrpcMetaService::new(Arc::new(BlockHashStore::with_config_and_hll_schema(
+            StoreConfig::default(),
+            schema,
+        )))
     }
 
     fn test_hll_report() -> HllSnapshotReport {
@@ -571,10 +581,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_old_session_insert_is_rejected_after_stale_takeover() {
-        let store = Arc::new(BlockHashStore::with_config(crate::store::StoreConfig {
-            node_stale_after: std::time::Duration::ZERO,
-            ttl: std::time::Duration::from_secs(60),
-        }));
+        let schema = HllSchema::new(
+            vec![("1m".to_string(), std::time::Duration::from_secs(60))],
+            4,
+        )
+        .unwrap();
+        let store = Arc::new(BlockHashStore::with_config_and_hll_schema(
+            StoreConfig {
+                node_stale_after: std::time::Duration::ZERO,
+                ttl: std::time::Duration::from_secs(60),
+            },
+            schema,
+        ));
         let svc = GrpcMetaService::new(store);
         let old_id = heartbeat_node(&svc, "node-a").await;
         let new_id = heartbeat_node(&svc, "node-a").await;

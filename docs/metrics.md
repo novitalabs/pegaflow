@@ -181,8 +181,12 @@ Missing or damaged HLL reports are best-effort observability failures: the
 MetaServer keeps the node live for metadata, excludes that report from the
 cluster union, and the server increments
 `pegaflow_metaserver_hll_report_failures` when it cannot build a report.
-All active reports must use the same window label, duration, and `bucket_bits`;
-an incompatible report is excluded from the union while the node remains live.
+The MetaServer validates every report against its startup
+`--metric-hll-windows` and `--metric-hll-bucket-bits` configuration. Pega
+servers and the MetaServer must use the same values; an incompatible report is
+excluded from the union while the node remains live. Valid metadata
+insert/remove activity refreshes owner visibility but never refreshes HLL
+report age.
 
 The existing cardinality and total metrics are retained. Existing PromQL
 continues to work, but new dashboards should prefer the direct gauge because
@@ -302,6 +306,10 @@ tier counters.
   - `2^16 = 65,536` registers per window and about 0.4% standard error.
   - Higher values use more memory and lower estimation error; `18` remains
     the supported maximum.
+
+Use the same two HLL options on `pegaflow-server` and
+`pegaflow-metaserver`. The MetaServer rejects mismatched reports from the
+cluster union without failing node heartbeats.
 
 **Example: Prometheus Metrics**
 ```bash
