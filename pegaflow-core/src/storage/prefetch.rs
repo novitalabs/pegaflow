@@ -44,23 +44,23 @@ impl RdmaFetch {
         remaining_hashes: &[Vec<u8>],
         require_full_prefix: bool,
     ) -> Option<(usize, PrefetchResult)> {
-        let (node, found) = self.0.query_prefix(namespace, remaining_hashes).await?;
+        let plan = self.0.query_plan(namespace, remaining_hashes).await?;
+        let found = plan.block_count();
         if require_full_prefix && found != remaining_hashes.len() {
             return None;
         }
         let blocks = self
             .0
-            .fetch_blocks(&node, req_id, namespace, &remaining_hashes[..found])
+            .fetch_plan(&plan, req_id, namespace, remaining_hashes)
             .await;
         if require_full_prefix && blocks.len() != found {
-            // The advertised owner served fewer blocks than the MetaServer
+            // One planned segment served fewer blocks than the MetaServer
             // promised (stale advertisement or failed fetch). Keep the partial
             // result so poll_existing blacklists RDMA for this request instead
             // of the wait loop retrying the same fetch until timeout.
             warn!(
-                "RDMA fetch returned fewer blocks than advertised: req_id={} node={} returned={} advertised={}",
+                "RDMA fetch returned fewer blocks than planned: req_id={} returned={} planned={}",
                 req_id,
-                node,
                 blocks.len(),
                 found
             );

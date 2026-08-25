@@ -4,11 +4,11 @@ use std::sync::Weak;
 use log::{debug, error, info, warn};
 use pegaflow_common::grpc::{GRPC_CLIENT_HTTP2_KEEPALIVE_INTERVAL, GRPC_CONNECT_TIMEOUT};
 use pegaflow_proto::proto::engine::meta_server_client::MetaServerClient as MetaServerGrpcClient;
+#[cfg(feature = "rdma")]
+use pegaflow_proto::proto::engine::{FetchSegment, QueryPrefixBlocksRequest};
 use pegaflow_proto::proto::engine::{
     HeartbeatNodeRequest, InsertBlockHashesRequest, RemoveBlockHashesRequest, UnregisterNodeRequest,
 };
-#[cfg(feature = "rdma")]
-use pegaflow_proto::proto::engine::{NodePrefixResult, QueryPrefixBlocksRequest};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, Instant};
 use tonic::Code;
@@ -295,17 +295,18 @@ impl MetaServerClient {
         let _ = done_rx.await;
     }
 
-    /// Query MetaServer for the longest prefix of blocks that exist remotely.
-    /// Returns per-node prefix lengths.
+    /// Query MetaServer for an ordered remote fetch plan.
     #[cfg(feature = "rdma")]
-    pub(crate) async fn query_prefix(
+    pub(crate) async fn query_plan(
         &self,
         namespace: &str,
         hashes: &[Vec<u8>],
-    ) -> Result<Vec<NodePrefixResult>, ClientError> {
+        exclude_node: &str,
+    ) -> Result<Vec<FetchSegment>, ClientError> {
         let request = QueryPrefixBlocksRequest {
             namespace: namespace.to_string(),
             block_hashes: hashes.to_vec(),
+            exclude_node: exclude_node.to_string(),
         };
 
         let response = self
@@ -318,12 +319,12 @@ impl MetaServerClient {
         let resp = response.into_inner();
 
         debug!(
-            "MetaServer query_prefix: namespace={} nodes={}",
+            "MetaServer query_plan: namespace={} segments={}",
             namespace,
-            resp.nodes.len()
+            resp.segments.len()
         );
 
-        Ok(resp.nodes)
+        Ok(resp.segments)
     }
 }
 
@@ -850,6 +851,7 @@ mod tests {
         reclaimable_hashes: Mutex<Vec<Vec<u8>>>,
         insert_requests: RequestLog,
         remove_requests: RequestLog,
+        query_requests: Mutex<Vec<QueryPrefixBlocksRequest>>,
         heartbeat_notify: Notify,
         insert_notify: Notify,
         remove_notify: Notify,
@@ -949,9 +951,16 @@ mod tests {
 
         async fn query_prefix_blocks(
             &self,
-            _request: Request<QueryPrefixBlocksRequest>,
+            request: Request<QueryPrefixBlocksRequest>,
         ) -> Result<Response<QueryPrefixBlocksResponse>, Status> {
-            Ok(Response::new(QueryPrefixBlocksResponse { nodes: vec![] }))
+            self.state
+                .query_requests
+                .lock()
+                .unwrap()
+                .push(request.into_inner());
+            Ok(Response::new(QueryPrefixBlocksResponse {
+                segments: vec![],
+            }))
         }
     }
 
@@ -1124,6 +1133,34 @@ mod tests {
         // batch and the flush must still resolve instead of hanging.
         client.flush().await;
 
+        client.shutdown().await;
+        let _ = shutdown_tx.send(());
+    }
+
+    #[cfg(feature = "rdma")]
+    #[tokio::test]
+    async fn query_plan_sends_requester_as_excluded_node() {
+        let (addr, service, shutdown_tx) = start_fake_metaserver().await;
+        let client = MetaServerClient::new(
+            MetaServerClientConfig::new(addr, "node-a:50055".to_string()),
+            Weak::new(),
+        );
+        let hashes = vec![vec![1], vec![2]];
+
+        let segments = client
+            .query_plan("ns", &hashes, "node-a:50055")
+            .await
+            .expect("query should succeed");
+
+        assert!(segments.is_empty());
+        assert_eq!(
+            *service.query_requests.lock().unwrap(),
+            vec![QueryPrefixBlocksRequest {
+                namespace: "ns".to_string(),
+                block_hashes: hashes,
+                exclude_node: "node-a:50055".to_string(),
+            }]
+        );
         client.shutdown().await;
         let _ = shutdown_tx.send(());
     }

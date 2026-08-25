@@ -10,8 +10,8 @@ use log::{debug, info, warn};
 use mea::singleflight::Group;
 use pegaflow_proto::proto::engine::engine_client::EngineClient;
 use pegaflow_proto::proto::engine::{
-    QueryBlocksForTransferRequest, QueryBlocksForTransferResponse, RdmaHandshakeRequest,
-    TransferBlockInfo,
+    FetchSegment, QueryBlocksForTransferRequest, QueryBlocksForTransferResponse,
+    RdmaHandshakeRequest, TransferBlockInfo,
 };
 use pegaflow_transfer::{ConnectionStatus, HandshakeMetadata, TransferDesc, TransferOp};
 use tonic::transport::{Channel, Endpoint};
@@ -58,6 +58,138 @@ pub(crate) struct RdmaFetchStore {
     connect_group: Arc<Group<String, ()>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FetchPlanSegment {
+    node: String,
+    start: usize,
+    end: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FetchPlan {
+    segments: Vec<FetchPlanSegment>,
+    block_count: usize,
+}
+
+impl FetchPlan {
+    pub(crate) fn block_count(&self) -> usize {
+        self.block_count
+    }
+
+    fn segment_blocks_summary(&self) -> String {
+        self.segments
+            .iter()
+            .map(|segment| (segment.end - segment.start).to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+fn validate_fetch_plan(
+    segments: Vec<FetchSegment>,
+    hash_count: usize,
+    exclude_node: &str,
+) -> Result<Option<FetchPlan>, String> {
+    if segments.is_empty() {
+        return Ok(None);
+    }
+
+    let mut validated = Vec::with_capacity(segments.len());
+    let mut offset = 0usize;
+    for (index, segment) in segments.into_iter().enumerate() {
+        if segment.node.is_empty() {
+            return Err(format!("segment {index} has an empty node"));
+        }
+        if segment.node == exclude_node {
+            return Err(format!("segment {index} selects the excluded requester"));
+        }
+        if segment.block_count == 0 {
+            return Err(format!("segment {index} has zero blocks"));
+        }
+        if validated
+            .last()
+            .is_some_and(|previous: &FetchPlanSegment| previous.node == segment.node)
+        {
+            return Err(format!(
+                "segment {index} repeats the previous node instead of merging"
+            ));
+        }
+
+        let count = usize::try_from(segment.block_count)
+            .map_err(|_| format!("segment {index} block count exceeds usize"))?;
+        let end = offset
+            .checked_add(count)
+            .ok_or_else(|| format!("segment {index} block count overflows"))?;
+        if end > hash_count {
+            return Err(format!(
+                "segment {index} ends at block {end}, beyond request length {hash_count}"
+            ));
+        }
+        validated.push(FetchPlanSegment {
+            node: segment.node,
+            start: offset,
+            end,
+        });
+        offset = end;
+    }
+
+    Ok(Some(FetchPlan {
+        segments: validated,
+        block_count: offset,
+    }))
+}
+
+#[tonic::async_trait]
+trait SegmentFetcher {
+    async fn fetch_segment(&self, remote_addr: &str, hashes: &[Vec<u8>]) -> PrefetchResult;
+}
+
+struct RdmaSegmentFetcher<'a> {
+    store: &'a RdmaFetchStore,
+    req_id: &'a str,
+    namespace: &'a str,
+}
+
+#[tonic::async_trait]
+impl SegmentFetcher for RdmaSegmentFetcher<'_> {
+    async fn fetch_segment(&self, remote_addr: &str, hashes: &[Vec<u8>]) -> PrefetchResult {
+        self.store
+            .fetch_blocks(remote_addr, self.req_id, self.namespace, hashes)
+            .await
+    }
+}
+
+async fn execute_fetch_plan<F: SegmentFetcher>(
+    fetcher: &F,
+    plan: &FetchPlan,
+    namespace: &str,
+    hashes: &[Vec<u8>],
+) -> (PrefetchResult, usize, Option<(usize, usize, usize)>) {
+    let mut fetched = Vec::with_capacity(plan.block_count);
+    let mut completed_segments = 0usize;
+    let mut failed_segment = None;
+
+    for (index, segment) in plan.segments.iter().enumerate() {
+        let expected = &hashes[segment.start..segment.end];
+        let returned = fetcher.fetch_segment(&segment.node, expected).await;
+        let contiguous = returned
+            .iter()
+            .zip(expected)
+            .take_while(|((key, _), hash)| key.namespace == namespace && key.hash == **hash)
+            .count();
+        let returned_count = returned.len();
+        fetched.extend(returned.into_iter().take(contiguous));
+
+        if contiguous != expected.len() || returned_count != expected.len() {
+            failed_segment = Some((index, expected.len(), contiguous));
+            break;
+        }
+        completed_segments += 1;
+    }
+
+    (fetched, completed_segments, failed_segment)
+}
+
 impl RdmaFetchStore {
     pub(crate) fn new(
         metaserver_client: Arc<MetaServerClient>,
@@ -76,42 +208,82 @@ impl RdmaFetchStore {
         }
     }
 
-    /// Query MetaServer for the best remote node that holds a prefix of `hashes`.
-    /// Returns `(node_addr, prefix_len)`, or `None` if no remote node has any.
-    pub(crate) async fn query_prefix(
+    /// Query MetaServer for a validated ordered plan covering a prefix of `hashes`.
+    pub(crate) async fn query_plan(
         &self,
         namespace: &str,
         hashes: &[Vec<u8>],
-    ) -> Option<(String, usize)> {
+    ) -> Option<FetchPlan> {
         if hashes.is_empty() {
             return None;
         }
 
-        let nodes = match self.metaserver_client.query_prefix(namespace, hashes).await {
-            Ok(n) => n,
+        let segments = match self
+            .metaserver_client
+            .query_plan(namespace, hashes, &self.advertise_addr)
+            .await
+        {
+            Ok(segments) => segments,
             Err(e) => {
                 warn!("MetaServer query failed for remote fetch: {e}");
                 return None;
             }
         };
 
-        let best = nodes
-            .iter()
-            .filter(|n| n.node != self.advertise_addr)
-            .max_by_key(|n| n.prefix_len)?;
-
-        let prefix_len = best.prefix_len as usize;
-        if prefix_len == 0 {
-            return None;
-        }
+        let plan = match validate_fetch_plan(segments, hashes.len(), &self.advertise_addr) {
+            Ok(plan) => plan?,
+            Err(error) => {
+                warn!("MetaServer returned invalid remote fetch plan: {error}");
+                return None;
+            }
+        };
 
         debug!(
-            "Remote prefix query: namespace={namespace} best_node={} prefix={prefix_len}/{}",
-            best.node,
-            hashes.len()
+            "Remote prefix query: segments={} prefix={}/{}",
+            plan.segments.len(),
+            plan.block_count,
+            hashes.len(),
         );
 
-        Some((best.node.clone(), prefix_len))
+        Some(plan)
+    }
+
+    pub(crate) async fn fetch_plan(
+        &self,
+        plan: &FetchPlan,
+        req_id: &str,
+        namespace: &str,
+        hashes: &[Vec<u8>],
+    ) -> PrefetchResult {
+        let started_at = Instant::now();
+        let fetcher = RdmaSegmentFetcher {
+            store: self,
+            req_id,
+            namespace,
+        };
+        let (fetched, completed_segments, failure) =
+            execute_fetch_plan(&fetcher, plan, namespace, hashes).await;
+        let (failed_segment, failed_planned_blocks, failed_returned_blocks) = failure
+            .map(|(index, planned, returned)| {
+                (index.to_string(), planned.to_string(), returned.to_string())
+            })
+            .unwrap_or_else(|| ("none".into(), "none".into(), "none".into()));
+
+        info!(
+            "RDMA multi-node fetch plan summary: req_id={} planned_segments={} completed_segments={} planned_blocks={} segment_blocks={} fetched_blocks={} failed_segment={} failed_segment_planned_blocks={} failed_segment_returned_blocks={} total_ms={:.2}",
+            req_id,
+            plan.segments.len(),
+            completed_segments,
+            plan.block_count,
+            plan.segment_blocks_summary(),
+            fetched.len(),
+            failed_segment,
+            failed_planned_blocks,
+            failed_returned_blocks,
+            started_at.elapsed().as_secs_f64() * 1000.0,
+        );
+
+        fetched
     }
 
     /// Fetch `hashes` from `remote_addr`.
@@ -735,6 +907,7 @@ fn transfer_timeout_from_server(lock_timeout_secs: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::num::NonZeroU64;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -755,6 +928,153 @@ mod tests {
 
     fn remaining(bytes: u64) -> HashMap<NumaNode, u64> {
         HashMap::from([(NumaNode(0), bytes)])
+    }
+
+    fn segment(node: &str, block_count: u32) -> FetchSegment {
+        FetchSegment {
+            node: node.to_string(),
+            block_count,
+        }
+    }
+
+    fn fetched_block(hash: u8) -> (BlockKey, Arc<SealedBlock>) {
+        (
+            BlockKey::new("ns".to_string(), vec![hash]),
+            Arc::new(SealedBlock::from_slots(Vec::new())),
+        )
+    }
+
+    #[derive(Default)]
+    struct FakeSegmentFetcher {
+        calls: Mutex<Vec<(String, Vec<Vec<u8>>)>>,
+        responses: Mutex<VecDeque<PrefetchResult>>,
+    }
+
+    #[tonic::async_trait]
+    impl SegmentFetcher for FakeSegmentFetcher {
+        async fn fetch_segment(&self, remote_addr: &str, hashes: &[Vec<u8>]) -> PrefetchResult {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((remote_addr.to_string(), hashes.to_vec()));
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default()
+        }
+    }
+
+    #[test]
+    fn validates_ordered_fetch_plan_offsets() {
+        let plan = validate_fetch_plan(
+            vec![segment("node-a", 2), segment("node-b", 1)],
+            3,
+            "requester",
+        )
+        .expect("plan should be valid")
+        .expect("plan should be non-empty");
+
+        assert_eq!(plan.block_count, 3);
+        assert_eq!(plan.segment_blocks_summary(), "2,1");
+        assert_eq!(
+            plan.segments,
+            vec![
+                FetchPlanSegment {
+                    node: "node-a".into(),
+                    start: 0,
+                    end: 2,
+                },
+                FetchPlanSegment {
+                    node: "node-b".into(),
+                    start: 2,
+                    end: 3,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_fetch_plans() {
+        for (segments, expected) in [
+            (vec![segment("", 1)], "empty node"),
+            (vec![segment("node-a", 0)], "zero blocks"),
+            (vec![segment("requester", 1)], "excluded requester"),
+            (vec![segment("node-a", 2)], "beyond request length"),
+            (
+                vec![segment("node-a", 1), segment("node-a", 1)],
+                "repeats the previous node",
+            ),
+        ] {
+            let error =
+                validate_fetch_plan(segments, 1, "requester").expect_err("plan should be rejected");
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_plan_executes_segments_in_order() {
+        let plan = validate_fetch_plan(
+            vec![segment("node-a", 2), segment("node-b", 1)],
+            3,
+            "requester",
+        )
+        .unwrap()
+        .unwrap();
+        let fetcher = FakeSegmentFetcher {
+            calls: Mutex::new(Vec::new()),
+            responses: Mutex::new(VecDeque::from([
+                vec![fetched_block(1), fetched_block(2)],
+                vec![fetched_block(3)],
+            ])),
+        };
+        let hashes = vec![vec![1], vec![2], vec![3]];
+
+        let (fetched, completed, failure) =
+            execute_fetch_plan(&fetcher, &plan, "ns", &hashes).await;
+
+        assert_eq!(fetched.len(), 3);
+        assert_eq!(completed, 2);
+        assert_eq!(failure, None);
+        assert_eq!(
+            *fetcher.calls.lock().unwrap(),
+            vec![
+                ("node-a".into(), vec![vec![1], vec![2]]),
+                ("node-b".into(), vec![vec![3]]),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_plan_stops_after_first_short_segment() {
+        let plan = validate_fetch_plan(
+            vec![
+                segment("node-a", 1),
+                segment("node-b", 1),
+                segment("node-c", 1),
+            ],
+            3,
+            "requester",
+        )
+        .unwrap()
+        .unwrap();
+        let fetcher = FakeSegmentFetcher {
+            calls: Mutex::new(Vec::new()),
+            responses: Mutex::new(VecDeque::from([
+                vec![fetched_block(1)],
+                Vec::new(),
+                vec![fetched_block(3)],
+            ])),
+        };
+        let hashes = vec![vec![1], vec![2], vec![3]];
+
+        let (fetched, completed, failure) =
+            execute_fetch_plan(&fetcher, &plan, "ns", &hashes).await;
+
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(completed, 1);
+        assert_eq!(failure, Some((1, 1, 0)));
+        assert_eq!(fetcher.calls.lock().unwrap().len(), 2);
     }
 
     #[test]
