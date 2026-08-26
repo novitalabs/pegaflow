@@ -66,6 +66,12 @@ struct MemoryCacheCleanupResponse {
     still_referenced_blocks: u64,
 }
 
+#[derive(Serialize)]
+struct SsdCacheCleanupResponse {
+    removed_entries: usize,
+    invalidated_bytes: u64,
+}
+
 /// POST /instances/cleanup[?id=<instance_id>]
 ///
 /// Without `id`: remove all instances and release all CUDA IPC tensors.
@@ -155,6 +161,32 @@ async fn cleanup_memory_cache_handler(
     })
 }
 
+/// POST /cache/ssd/cleanup
+///
+/// Removes SSD cache index entries without erasing the preallocated files.
+async fn cleanup_ssd_cache_handler(State(state): State<AppState>) -> impl IntoResponse {
+    match state.engine.cleanup_ssd_cache().await {
+        Some(stats) => {
+            info!(
+                "Cleaned SSD cache index: removed_entries={} invalidated_bytes={}",
+                stats.removed_entries, stats.invalidated_bytes
+            );
+            (
+                StatusCode::OK,
+                Json(SsdCacheCleanupResponse {
+                    removed_entries: stats.removed_entries,
+                    invalidated_bytes: stats.invalidated_bytes,
+                })
+                .into_response(),
+            )
+        }
+        None => (
+            StatusCode::CONFLICT,
+            "SSD cache is not enabled".into_response(),
+        ),
+    }
+}
+
 /// Start HTTP server for health check, optional Prometheus metrics, and instance management.
 pub async fn start_http_server(
     addr: std::net::SocketAddr,
@@ -180,17 +212,18 @@ pub async fn start_http_server(
         .route("/health", get(health_handler))
         .route("/instances", get(list_instances_handler))
         .route("/instances/cleanup", post(cleanup_handler))
-        .route("/cache/memory/cleanup", post(cleanup_memory_cache_handler));
+        .route("/cache/memory/cleanup", post(cleanup_memory_cache_handler))
+        .route("/cache/ssd/cleanup", post(cleanup_ssd_cache_handler));
 
     if enable_prometheus {
         app = app.route("/metrics", get(metrics_handler));
         info!(
-            "Starting HTTP server on {} (/health, /metrics, /instances, /instances/cleanup, /cache/memory/cleanup)",
+            "Starting HTTP server on {} (/health, /metrics, /instances, /instances/cleanup, /cache/memory/cleanup, /cache/ssd/cleanup)",
             addr
         );
     } else {
         info!(
-            "Starting HTTP server on {} (/health, /instances, /instances/cleanup, /cache/memory/cleanup)",
+            "Starting HTTP server on {} (/health, /instances, /instances/cleanup, /cache/memory/cleanup, /cache/ssd/cleanup)",
             addr
         );
     }

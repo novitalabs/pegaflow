@@ -76,6 +76,12 @@ pub struct SsdCacheConfig {
     pub prefetch_inflight: usize,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SsdCacheCleanupStats {
+    pub removed_entries: usize,
+    pub invalidated_bytes: u64,
+}
+
 impl Default for SsdCacheConfig {
     fn default() -> Self {
         Self {
@@ -191,6 +197,33 @@ impl SsdRingBuffer {
             Some(SsdEntryState::Committed(e)) if self.is_offset_valid(e) => Some(e),
             _ => None,
         }
+    }
+
+    pub(super) fn clear(&mut self) -> SsdCacheCleanupStats {
+        let stats = SsdCacheCleanupStats {
+            removed_entries: self.entries.len(),
+            invalidated_bytes: self
+                .entries
+                .values()
+                .map(|state| state.entry().len)
+                .fold(0, u64::saturating_add),
+        };
+
+        self.entries.clear();
+        self.next_shard = 0;
+        for shard in &mut self.shards {
+            // Move to the next logical ring generation while preserving the
+            // physical offset. Prefetches submitted before cleanup then fail
+            // their post-I/O validity check.
+            shard.head = shard
+                .head
+                .checked_add(shard.capacity)
+                .expect("SSD ring logical offset overflow during cleanup");
+            shard.tail = shard.head;
+            shard.order.clear();
+        }
+
+        stats
     }
 
     /// Check if a logical offset is still valid (not yet overwritten).
@@ -387,6 +420,7 @@ pub(super) struct SsdWriteBatch {
 pub(super) enum SsdWriteCommand {
     Write(SsdWriteBatch),
     Flush(tokio::sync::oneshot::Sender<()>),
+    Cleanup(tokio::sync::oneshot::Sender<SsdCacheCleanupStats>),
 }
 
 /// Request to prefetch a block from SSD (metadata only, allocation done in worker)
@@ -480,6 +514,7 @@ pub(super) async fn ssd_writer_loop(
     let mut pending: VecDeque<WriteTask> = VecDeque::new();
     let mut inflight: FuturesOrdered<WriteFuture> = FuturesOrdered::new();
     let mut flush_waiters: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
+    let mut cleanup_waiter: Option<tokio::sync::oneshot::Sender<SsdCacheCleanupStats>> = None;
 
     loop {
         // If a flush is pending and all work is drained, fire it.
@@ -487,6 +522,16 @@ pub(super) async fn ssd_writer_loop(
             for tx in flush_waiters.drain(..) {
                 let _ = tx.send(());
             }
+        }
+
+        if pending.is_empty()
+            && inflight.is_empty()
+            && let Some(tx) = cleanup_waiter.take()
+        {
+            let stats = store
+                .upgrade()
+                .map_or_else(SsdCacheCleanupStats::default, |store| store.clear_index());
+            let _ = tx.send(stats);
         }
 
         tokio::select! {
@@ -519,7 +564,7 @@ pub(super) async fn ssd_writer_loop(
             }
 
             // Priority 3: Receive new command
-            cmd = rx.recv(), if pending.is_empty() && flush_waiters.is_empty() => {
+            cmd = rx.recv(), if pending.is_empty() && flush_waiters.is_empty() && cleanup_waiter.is_none() => {
                 match cmd {
                     Some(SsdWriteCommand::Write(b)) => {
                         // Dequeue metric
@@ -555,6 +600,9 @@ pub(super) async fn ssd_writer_loop(
                     Some(SsdWriteCommand::Flush(tx)) => {
                         flush_waiters.push(tx);
                     }
+                    Some(SsdWriteCommand::Cleanup(tx)) => {
+                        cleanup_waiter = Some(tx);
+                    }
                     None => break,
                 }
             }
@@ -567,6 +615,9 @@ pub(super) async fn ssd_writer_loop(
     // Fire any remaining flush waiters
     for tx in flush_waiters.drain(..) {
         let _ = tx.send(());
+    }
+    if let Some(tx) = cleanup_waiter {
+        let _ = tx.send(SsdCacheCleanupStats::default());
     }
 
     debug!("SSD writer task exiting");
@@ -1067,6 +1118,34 @@ mod tests {
         ring.shards[0].tail = 50;
         assert!(!ring.is_offset_valid(&ring.test_entry(0, 49, 10)));
         assert!(ring.is_offset_valid(&ring.test_entry(0, 50, 10)));
+    }
+
+    #[test]
+    fn test_clear_invalidates_old_offsets_and_keeps_ring_writable() {
+        let mut ring = SsdRingBuffer::new(1000);
+        let (old_begin, _) = ring.allocate_contiguous(0, 100).unwrap();
+        let old_entry = ring.test_entry(0, old_begin, 100);
+        let key = make_key(1);
+        ring.entries
+            .insert(key.clone(), SsdEntryState::Committed(old_entry.clone()));
+        ring.shards[0].order.push_back(key);
+
+        let stats = ring.clear();
+
+        assert_eq!(
+            stats,
+            SsdCacheCleanupStats {
+                removed_entries: 1,
+                invalidated_bytes: 100,
+            }
+        );
+        assert!(!ring.is_offset_valid(&old_entry));
+        assert!(ring.entries.is_empty());
+        assert!(ring.shards[0].order.is_empty());
+
+        let (new_begin, _) = ring.allocate_contiguous(0, 100).unwrap();
+        assert!(new_begin > old_begin);
+        assert!(ring.is_offset_valid(&ring.test_entry(0, new_begin, 100)));
     }
 
     // ========================================================================
