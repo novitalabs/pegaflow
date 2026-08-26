@@ -263,6 +263,13 @@ impl RdmaFetchStore {
         };
         let (fetched, completed_segments, failure) =
             execute_fetch_plan(&fetcher, plan, namespace, hashes).await;
+        let metrics = core_metrics();
+        metrics
+            .rdma_fetch_plan_segments
+            .record(plan.segments.len() as u64, &[]);
+        metrics
+            .rdma_fetch_plan_completed_segments
+            .record(completed_segments as u64, &[]);
         let (failed_segment, failed_planned_blocks, failed_returned_blocks) = failure
             .map(|(index, planned, returned)| {
                 (index.to_string(), planned.to_string(), returned.to_string())

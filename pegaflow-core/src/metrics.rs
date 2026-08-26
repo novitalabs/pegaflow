@@ -109,6 +109,10 @@ pub(crate) struct CoreMetrics {
     pub rdma_fetch_duration_seconds: Histogram<f64>,
     #[cfg(feature = "rdma")]
     pub rdma_fetch_bytes: Counter<u64>,
+    #[cfg(feature = "rdma")]
+    pub rdma_fetch_plan_segments: Histogram<u64>,
+    #[cfg(feature = "rdma")]
+    pub rdma_fetch_plan_completed_segments: Histogram<u64>,
 }
 
 fn init_meter() -> Meter {
@@ -133,6 +137,14 @@ fn rdma_fetch_duration_boundaries() -> Vec<f64> {
         0.5,  // 500ms
         1.0,  // 1s
         2.0,  // 2s
+    ]
+}
+
+/// Histogram boundaries for the number of segments in one RDMA fetch plan.
+#[cfg(feature = "rdma")]
+fn rdma_fetch_plan_segment_boundaries() -> Vec<f64> {
+    vec![
+        0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 16.0, 32.0, 64.0, 128.0,
     ]
 }
 
@@ -480,6 +492,20 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
                 .with_unit("bytes")
                 .with_description("Total bytes fetched via RDMA from remote nodes")
                 .build(),
+            #[cfg(feature = "rdma")]
+            rdma_fetch_plan_segments: meter
+                .u64_histogram("pegaflow_rdma_fetch_plan_segments")
+                .with_description("Number of segments planned per executed RDMA fetch plan")
+                .with_boundaries(rdma_fetch_plan_segment_boundaries())
+                .build(),
+            #[cfg(feature = "rdma")]
+            rdma_fetch_plan_completed_segments: meter
+                .u64_histogram("pegaflow_rdma_fetch_plan_completed_segments")
+                .with_description(
+                    "Number of segments completed before an RDMA fetch plan stopped",
+                )
+                .with_boundaries(rdma_fetch_plan_segment_boundaries())
+                .build(),
         }
     })
 }
@@ -508,6 +534,17 @@ mod tests {
         assert_eq!(
             &*CACHE_RESIDENCE_REASON_CLEANUP,
             &[KeyValue::new("reason", "cleanup")]
+        );
+    }
+
+    #[cfg(feature = "rdma")]
+    #[test]
+    fn rdma_fetch_plan_segment_boundaries_cover_failures_and_fragmented_plans() {
+        assert_eq!(
+            rdma_fetch_plan_segment_boundaries(),
+            vec![
+                0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 16.0, 32.0, 64.0, 128.0,
+            ]
         );
     }
 }
