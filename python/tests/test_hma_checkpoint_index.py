@@ -184,3 +184,40 @@ def test_aligned_written_without_spec_blocks_does_not_index_past_table():
 
     assert intent is not None
     assert [b for b in intent.block_ids_by_group[1] if b != 0] == [555]
+
+
+def test_finished_save_skips_when_prefix_already_stored():
+    """A later turn that does not cross a new block boundary must not re-save."""
+    written = 645
+    num_hashes = _cdiv(written, VBS)
+    saveable = written // VBS
+    scheduler = _make_scheduler(num_hashes, committed_boundary=saveable - 1)
+    scheduler._next_stored_block_idx["r1"] = saveable
+
+    intent = scheduler._consume_finished_hma_save(
+        "r1",
+        (list(range(100, 100 + num_hashes)), _recurrent_table(written, 1)),
+        written,
+    )
+
+    assert intent is None
+    assert scheduler._consume_full_block_saves("r1") is None
+
+
+def test_finished_save_after_prefix_only_files_the_new_boundary():
+    """After an external hit of block 0, the final save files only hash[1]."""
+    written = 32
+    num_hashes = _cdiv(written, VBS)
+    scheduler = _make_scheduler(num_hashes, committed_boundary=1)
+    scheduler._next_stored_block_idx["r1"] = 1
+    scheduler._block_index_offsets["r1"] = 1
+
+    intent = scheduler._consume_finished_hma_save(
+        "r1",
+        (list(range(100, 100 + num_hashes + 2)), _recurrent_table(written, 2)),
+        written,
+    )
+
+    assert intent is not None
+    assert intent.block_hashes == (_hash(1),)
+    assert intent.block_ids_by_group[1] == (555,)
