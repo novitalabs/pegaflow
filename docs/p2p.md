@@ -132,9 +132,11 @@ P2P-related Prometheus metrics (on `:9091/metrics` by default):
 
 | Metric | Type | Description |
 |---|---|---|
-| `pegaflow_rdma_fetch_total` | Counter | Total RDMA fetch operations |
+| `pegaflow_rdma_fetch_total` | Counter | Total per-segment RDMA fetch operations |
 | `pegaflow_rdma_fetch_duration` | Histogram | RDMA fetch latency distribution |
 | `pegaflow_rdma_fetch_bytes` | Counter | Total bytes fetched via RDMA |
+| `pegaflow_rdma_fetch_plan_segments` | Histogram | Planned segment count per executed RDMA fetch plan |
+| `pegaflow_rdma_fetch_plan_completed_segments` | Histogram | Completed segment count before a plan stops |
 | `pegaflow_rdma_qps` | Gauge | Active RDMA queue pairs |
 | `pegaflow_transfer_lock_active` | UpDownCounter | Currently held transfer locks |
 | `pegaflow_transfer_lock_timeouts_total` | Counter | Transfer lock timeout events |

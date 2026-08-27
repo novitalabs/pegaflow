@@ -164,27 +164,35 @@ message RemoveBlockHashesResponse {
 
 ### 5. QueryPrefixBlocks
 
-Query the longest contiguous prefix of block hashes that exist, with per-node prefix lengths.
+Build an ordered fetch plan for the longest contiguous prefix that is available
+from live remote nodes. The requester is excluded from the owner candidates.
 
 **Request:**
 ```protobuf
 message QueryPrefixBlocksRequest {
   string namespace = 1;
   repeated bytes block_hashes = 2;  // Ordered list of block hashes
+  string exclude_node = 3;          // Requester address
 }
 ```
 
 **Response:**
 ```protobuf
-message NodePrefixResult {
+message FetchSegment {
   string node = 1;
-  uint32 prefix_len = 2;       // Consecutive hashes from h0 this node owns
+  uint32 block_count = 2;      // Consecutive hashes fetched from this node
 }
 
 message QueryPrefixBlocksResponse {
-  repeated NodePrefixResult nodes = 1;
+  reserved 1;
+  reserved "nodes";
+  repeated FetchSegment segments = 2;
 }
 ```
+
+Segments are ordered and contiguous. Their block counts are cumulative offsets
+into the request's `block_hashes`; planning stops at the first hash with no live
+remote owner.
 
 ### 6. Health
 
@@ -215,8 +223,8 @@ Graceful shutdown trigger.
 2. **During server lifetime**: Call `HeartbeatNode` periodically with the same `node_id`
 3. **On block save**: Call `InsertBlockHashes` with `{ node, node_id }`
 4. **On cache eviction**: Call `RemoveBlockHashes` with `{ node, node_id }`
-5. **On block query**: Call `QueryPrefixBlocks` to discover which live nodes hold a prefix
-6. **On block load**: Query metaserver, then fetch from the best remote node via RDMA
+5. **On block query**: Call `QueryPrefixBlocks` to build an ordered remote fetch plan
+6. **On block load**: Fetch each plan segment in order via RDMA, stopping on the first failure
 
 ## Environment Variables
 

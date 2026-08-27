@@ -305,15 +305,18 @@ message RemoveBlockHashesResponse {
 message QueryPrefixBlocksRequest {
   string namespace = 1;
   repeated bytes block_hashes = 2;  // ordered by prefix position
+  string exclude_node = 3;          // requester address; never return it as an owner
 }
 
-message NodePrefixResult {
+message FetchSegment {
   string node = 1;
-  uint32 prefix_len = 2;
+  uint32 block_count = 2;
 }
 
 message QueryPrefixBlocksResponse {
-  repeated NodePrefixResult nodes = 1;
+  reserved 1;
+  reserved "nodes";
+  repeated FetchSegment segments = 2;
 }
 
 message HeartbeatNodeRequest {

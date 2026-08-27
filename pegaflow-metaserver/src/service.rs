@@ -1,17 +1,60 @@
 use crate::metric::record_rpc_result;
 use crate::proto::engine::meta_server_server::MetaServer;
 use crate::proto::engine::{
-    HeartbeatNodeRequest, HeartbeatNodeResponse, InsertBlockHashesRequest,
-    InsertBlockHashesResponse, NodePrefixResult, QueryPrefixBlocksRequest,
-    QueryPrefixBlocksResponse, RemoveBlockHashesRequest, RemoveBlockHashesResponse, ResponseStatus,
-    UnregisterNodeRequest, UnregisterNodeResponse,
+    FetchSegment, HeartbeatNodeRequest, HeartbeatNodeResponse, InsertBlockHashesRequest,
+    InsertBlockHashesResponse, QueryPrefixBlocksRequest, QueryPrefixBlocksResponse,
+    RemoveBlockHashesRequest, RemoveBlockHashesResponse, ResponseStatus, UnregisterNodeRequest,
+    UnregisterNodeResponse,
 };
-use crate::store::{BlockHashStore, StoreError};
+use crate::store::{BlockHashStore, PrefixEntry, StoreError};
 use log::debug;
 use std::sync::Arc;
 use std::time::Instant;
 use tonic::{Request, Response, Status, async_trait};
 use uuid::Uuid;
+
+fn plan_fetch_segments(
+    entries: &[PrefixEntry],
+    exclude_node: &str,
+) -> Result<Vec<FetchSegment>, &'static str> {
+    let mut segments = Vec::new();
+    let mut offset = 0usize;
+
+    while offset < entries.len() {
+        let mut best: Option<(&str, usize)> = None;
+        for candidate in &entries[offset].nodes {
+            let candidate = candidate.as_ref();
+            if candidate == exclude_node {
+                continue;
+            }
+
+            let end = entries[offset..]
+                .iter()
+                .take_while(|entry| entry.nodes.iter().any(|node| node.as_ref() == candidate))
+                .count()
+                + offset;
+
+            if best.is_none_or(|(best_node, best_end)| {
+                end > best_end || (end == best_end && candidate < best_node)
+            }) {
+                best = Some((candidate, end));
+            }
+        }
+
+        let Some((node, end)) = best else {
+            break;
+        };
+        let block_count =
+            u32::try_from(end - offset).map_err(|_| "fetch segment block count exceeds uint32")?;
+        segments.push(FetchSegment {
+            node: node.to_string(),
+            block_count,
+        });
+        offset = end;
+    }
+
+    Ok(segments)
+}
 
 #[derive(Clone)]
 pub struct GrpcMetaService {
@@ -236,9 +279,7 @@ impl MetaServer for GrpcMetaService {
         result
     }
 
-    /// Given an ordered list of block hashes, find the longest contiguous prefix
-    /// that exists in the store (stop at the first hash no node owns), then for
-    /// each node return how many consecutive hashes from h0 it holds.
+    /// Build an ordered plan that covers the longest remotely available prefix.
     async fn query_prefix_blocks(
         &self,
         request: Request<QueryPrefixBlocksRequest>,
@@ -271,29 +312,10 @@ impl MetaServer for GrpcMetaService {
             req.namespace, prefix_len, total_queried, elapsed
         );
 
-        // Per-node prefix: `existing[i]` maps to `block_hashes[i]`.
-        // A node's prefix = count of consecutive hashes from h0 it owns.
-        let mut node_prefix: std::collections::HashMap<&str, u32> =
-            std::collections::HashMap::new();
-        for (i, entry) in existing.iter().enumerate() {
-            for node in &entry.nodes {
-                let count = node_prefix.entry(node.as_ref()).or_insert(0);
-                // Only extend if every previous hash (0..i) was also on this node
-                if *count == i as u32 {
-                    *count += 1;
-                }
-            }
-        }
-        let nodes: Vec<NodePrefixResult> = node_prefix
-            .into_iter()
-            .filter(|(_, count)| *count > 0)
-            .map(|(node, count)| NodePrefixResult {
-                node: node.to_string(),
-                prefix_len: count,
-            })
-            .collect();
+        let segments =
+            plan_fetch_segments(&existing, &req.exclude_node).map_err(Status::invalid_argument)?;
 
-        let result = Ok(Response::new(QueryPrefixBlocksResponse { nodes }));
+        let result = Ok(Response::new(QueryPrefixBlocksResponse { segments }));
         record_rpc_result("query_prefix_blocks", &result, start);
         result
     }
@@ -381,11 +403,12 @@ mod tests {
             .query_prefix_blocks(Request::new(QueryPrefixBlocksRequest {
                 namespace: "ns".into(),
                 block_hashes: vec![vec![1, 2, 3]],
+                exclude_node: String::new(),
             }))
             .await
             .unwrap()
             .into_inner();
-        assert!(query_resp.nodes.is_empty());
+        assert!(query_resp.segments.is_empty());
     }
 
     #[tokio::test]
@@ -423,11 +446,12 @@ mod tests {
             .query_prefix_blocks(Request::new(QueryPrefixBlocksRequest {
                 namespace: "ns".into(),
                 block_hashes: vec![vec![1, 2, 3]],
+                exclude_node: String::new(),
             }))
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(query_resp.nodes.len(), 1);
+        assert_eq!(query_resp.segments.len(), 1);
     }
 
     #[tokio::test]
@@ -537,11 +561,12 @@ mod tests {
             .query_prefix_blocks(Request::new(QueryPrefixBlocksRequest {
                 namespace: "ns".into(),
                 block_hashes: vec![vec![1]],
+                exclude_node: String::new(),
             }))
             .await
             .unwrap()
             .into_inner();
-        assert!(query_resp.nodes.is_empty());
+        assert!(query_resp.segments.is_empty());
     }
 
     #[tokio::test]
@@ -582,22 +607,85 @@ mod tests {
             .query_prefix_blocks(Request::new(QueryPrefixBlocksRequest {
                 namespace: namespace.into(),
                 block_hashes: vec![h1, h2, h3, h4],
+                exclude_node: String::new(),
             }))
             .await
             .unwrap()
             .into_inner();
 
-        let mut nodes: Vec<(String, u32)> = response
-            .nodes
+        let segments: Vec<(String, u32)> = response
+            .segments
             .into_iter()
-            .map(|entry| (entry.node, entry.prefix_len))
+            .map(|entry| (entry.node, entry.block_count))
             .collect();
-        nodes.sort();
 
-        // node-a owns h1..h4 (prefix 4), node-b owns h1..h3 (prefix 3)
+        assert_eq!(segments, vec![(node_a.to_string(), 4)]);
+    }
+
+    fn prefix_entry(hash: u8, nodes: &[&str]) -> PrefixEntry {
+        PrefixEntry {
+            block_hash: vec![hash],
+            nodes: nodes.iter().map(|node| Arc::<str>::from(*node)).collect(),
+        }
+    }
+
+    fn planned(entries: &[PrefixEntry], exclude_node: &str) -> Vec<(String, u32)> {
+        plan_fetch_segments(entries, exclude_node)
+            .expect("small test plan should fit uint32")
+            .into_iter()
+            .map(|segment| (segment.node, segment.block_count))
+            .collect()
+    }
+
+    #[test]
+    fn planner_combines_fragmented_remote_prefix() {
+        let entries = vec![
+            prefix_entry(1, &["node-a"]),
+            prefix_entry(2, &["node-a"]),
+            prefix_entry(3, &["node-b"]),
+            prefix_entry(4, &["node-b"]),
+        ];
+
         assert_eq!(
-            nodes,
-            vec![(node_a.to_string(), 4), (node_b.to_string(), 3),]
+            planned(&entries, "requester"),
+            vec![("node-a".into(), 2), ("node-b".into(), 2)]
         );
+    }
+
+    #[test]
+    fn planner_chooses_farthest_owner_and_stable_tie_break() {
+        let entries = vec![
+            prefix_entry(1, &["node-c", "node-b", "node-a"]),
+            prefix_entry(2, &["node-c", "node-b", "node-a"]),
+            prefix_entry(3, &["node-c"]),
+        ];
+
+        assert_eq!(planned(&entries, "requester"), vec![("node-c".into(), 3)]);
+        assert_eq!(
+            planned(&entries[..2], "requester"),
+            vec![("node-a".into(), 2)]
+        );
+    }
+
+    #[test]
+    fn planner_excludes_requester_and_stops_at_remote_gap() {
+        let entries = vec![
+            prefix_entry(1, &["requester", "node-a"]),
+            prefix_entry(2, &["requester"]),
+            prefix_entry(3, &["node-b"]),
+        ];
+
+        assert_eq!(planned(&entries, "requester"), vec![("node-a".into(), 1)]);
+    }
+
+    #[test]
+    fn planner_keeps_single_owner_prefix_in_one_segment() {
+        let entries = vec![
+            prefix_entry(1, &["node-a"]),
+            prefix_entry(2, &["node-a"]),
+            prefix_entry(3, &["node-a"]),
+        ];
+
+        assert_eq!(planned(&entries, "requester"), vec![("node-a".into(), 3)]);
     }
 }
