@@ -712,8 +712,8 @@ struct SlotPlacement {
 }
 
 struct PrefetchChunk {
+    capacity: u64,
     size: u64,
-    used: u64,
     slots: Vec<SlotPlacement>,
 }
 
@@ -757,9 +757,9 @@ fn chunk_slot_refs(refs: &[SlotRef], chunk_bytes: u64) -> Result<Vec<PrefetchChu
     for slot in refs {
         let needs_new_chunk = current.as_ref().is_none_or(|chunk| {
             chunk
-                .used
+                .size
                 .checked_add(slot.size)
-                .is_none_or(|end| end > chunk.size)
+                .is_none_or(|end| end > chunk.capacity)
         });
 
         if needs_new_chunk {
@@ -767,8 +767,8 @@ fn chunk_slot_refs(refs: &[SlotRef], chunk_bytes: u64) -> Result<Vec<PrefetchChu
                 chunks.push(chunk);
             }
             current = Some(PrefetchChunk {
-                size: remaining.min(chunk_bytes).max(slot.size),
-                used: 0,
+                capacity: remaining.min(chunk_bytes).max(slot.size),
+                size: 0,
                 slots: Vec::new(),
             });
         }
@@ -779,10 +779,10 @@ fn chunk_slot_refs(refs: &[SlotRef], chunk_bytes: u64) -> Result<Vec<PrefetchChu
         chunk.slots.push(SlotPlacement {
             block_idx: slot.block_idx,
             slot_idx: slot.slot_idx,
-            offset: chunk.used,
+            offset: chunk.size,
         });
-        chunk.used = chunk
-            .used
+        chunk.size = chunk
+            .size
             .checked_add(slot.size)
             .expect("new SSD prefetch chunk must fit its first slot");
         remaining = remaining
@@ -1422,5 +1422,24 @@ mod tests {
         assert_eq!(chunks[0].slots[0].offset, 0);
         assert_eq!(chunks[1].size, 100);
         assert_eq!(chunks[1].slots[0].offset, 0);
+    }
+
+    #[test]
+    fn test_non_divisible_prefetch_chunks_allocate_only_slot_bytes() {
+        let refs = [200, 100, 100]
+            .into_iter()
+            .enumerate()
+            .map(|(slot_idx, size)| SlotRef {
+                block_idx: 0,
+                slot_idx,
+                size,
+            })
+            .collect::<Vec<_>>();
+
+        let chunks = chunk_slot_refs(&refs, 256).unwrap();
+        let allocation_sizes = chunks.iter().map(|chunk| chunk.size).collect::<Vec<_>>();
+
+        assert_eq!(allocation_sizes, vec![200, 200]);
+        assert_eq!(allocation_sizes.iter().sum::<u64>(), 400);
     }
 }
