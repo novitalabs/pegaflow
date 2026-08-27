@@ -150,11 +150,11 @@ class ConnectorContext:
     def virtual_block_size(self) -> int:
         """Block size as seen by the scheduler.
 
-        vLLM computes scheduler_block_size = block_size * dcp * pcp.
-        request.block_hashes has one hash per scheduler_block_size tokens,
-        so all scheduler-side arithmetic must use this value.
+        vLLM's scheduler block size is ``block_size * dcp``. PCP changes
+        which ranks process a request, but does not change the token
+        granularity of scheduler block hashes.
         """
-        return self.block_size * self.dcp_world_size * self.pcp_world_size
+        return self.block_size * self.dcp_world_size
 
     @property
     def effective_tp_rank(self) -> int:
