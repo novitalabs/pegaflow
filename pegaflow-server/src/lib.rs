@@ -26,6 +26,10 @@ use opentelemetry_sdk::metrics::SdkMeterProvider;
 use pegaflow_common::grpc::{
     GRPC_SERVER_HTTP2_KEEPALIVE_INTERVAL, GRPC_SERVER_HTTP2_KEEPALIVE_TIMEOUT,
 };
+use pegaflow_common::hll_config::{
+    DEFAULT_HLL_BUCKET_BITS, DEFAULT_HLL_WINDOWS, parse_hll_bucket_bits, parse_hll_windows,
+    parse_hll_windows_arg,
+};
 use pegaflow_core::PegaEngine;
 use prometheus::Registry;
 use proto::engine::engine_server::EngineServer;
@@ -174,11 +178,11 @@ pub struct Cli {
     /// HLL sliding-window list for hit-rate estimation. Comma-separated humantime
     /// durations; each becomes a canonical `window` label in metrics (e.g. `15m,1h,1d`).
     /// Slot duration is derived as `clamp(window/24, 1min, 1h)`.
-    #[arg(long, default_value = "15m,1h,1d", value_parser = parse_hll_windows_arg)]
+    #[arg(long, default_value = DEFAULT_HLL_WINDOWS, value_parser = parse_hll_windows_arg)]
     pub metric_hll_windows: String,
 
     /// HLL bucket index bits 4–18 (default: 16 → 65536 buckets, ~0.4% error)
-    #[arg(long, default_value_t = 16, value_parser = parse_hll_bucket_bits)]
+    #[arg(long, default_value_t = DEFAULT_HLL_BUCKET_BITS, value_parser = parse_hll_bucket_bits)]
     pub metric_hll_bucket_bits: u8,
 
     /// Transfer lock timeout in seconds. Blocks held for cross-node RDMA transfer are
@@ -187,97 +191,12 @@ pub struct Cli {
     pub transfer_lock_timeout_secs: u64,
 }
 
-fn parse_hll_bucket_bits(s: &str) -> Result<u8, String> {
-    use pegaflow_common::hll::{MAX_BUCKET_BITS, MIN_BUCKET_BITS};
-    let v: u8 = s.parse().map_err(|e| format!("{e}"))?;
-    if !(MIN_BUCKET_BITS..=MAX_BUCKET_BITS).contains(&v) {
-        return Err(format!(
-            "HLL bucket_bits must be in {MIN_BUCKET_BITS}..={MAX_BUCKET_BITS}, got {v}"
-        ));
-    }
-    Ok(v)
-}
-
 fn parse_nic_name(s: &str) -> Result<String, String> {
     let name = s.trim();
     if name.is_empty() {
         return Err("--nics contains an empty NIC name".into());
     }
     Ok(name.to_string())
-}
-
-fn parse_hll_windows_arg(s: &str) -> Result<String, String> {
-    parse_hll_windows(s)?;
-    Ok(s.to_string())
-}
-
-/// Parse a comma-separated list of humantime windows (e.g. `15m,1h,1d`).
-/// Each entry becomes `(label, duration)` where label is canonicalized from
-/// the parsed duration.
-fn parse_hll_windows(s: &str) -> Result<Vec<(String, Duration)>, String> {
-    let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for (idx, token) in s.split(',').map(str::trim).enumerate() {
-        if token.is_empty() {
-            return Err(format!(
-                "--metric-hll-windows contains an empty window at position {}",
-                idx + 1
-            ));
-        }
-        let dur = parse_humantime(token)?;
-        if dur < Duration::from_secs(60) {
-            return Err(format!("HLL window {token} must be at least 1 minute"));
-        }
-        if !seen.insert(dur) {
-            return Err(format!(
-                "duplicate HLL window duration: {token} ({})",
-                format_hll_window_label(dur)
-            ));
-        }
-        out.push((format_hll_window_label(dur), dur));
-    }
-    if out.is_empty() {
-        return Err("--metric-hll-windows must list at least one window".into());
-    }
-    Ok(out)
-}
-
-/// Minimal humantime parser: `<number><unit>` where unit ∈ {s, m, h, d}.
-fn parse_humantime(s: &str) -> Result<Duration, String> {
-    let (num_str, unit) = s.split_at(
-        s.find(|c: char| !c.is_ascii_digit())
-            .ok_or_else(|| format!("missing time unit in {s}"))?,
-    );
-    let n: u64 = num_str
-        .parse()
-        .map_err(|e| format!("invalid number in {s}: {e}"))?;
-    let unit_secs = match unit {
-        "s" => n,
-        "m" => n
-            .checked_mul(60)
-            .ok_or_else(|| format!("duration overflows seconds in {s}"))?,
-        "h" => n
-            .checked_mul(3600)
-            .ok_or_else(|| format!("duration overflows seconds in {s}"))?,
-        "d" => n
-            .checked_mul(86400)
-            .ok_or_else(|| format!("duration overflows seconds in {s}"))?,
-        _ => return Err(format!("unknown time unit {unit:?} in {s}; use s/m/h/d")),
-    };
-    Ok(Duration::from_secs(unit_secs))
-}
-
-fn format_hll_window_label(duration: Duration) -> String {
-    let secs = duration.as_secs();
-    if secs.is_multiple_of(86400) {
-        format!("{}d", secs / 86400)
-    } else if secs.is_multiple_of(3600) {
-        format!("{}h", secs / 3600)
-    } else if secs.is_multiple_of(60) {
-        format!("{}m", secs / 60)
-    } else {
-        format!("{secs}s")
-    }
 }
 
 fn parse_sample_rate(s: &str) -> Result<f64, String> {
@@ -553,6 +472,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         advertise_addr,
         metaserver_queue_depth: cli.metaserver_queue_depth,
         pool_shards: cli.pool_shards,
+        hll_windows: parse_hll_windows(&cli.metric_hll_windows)
+            .map_err(|err| format!("invalid --metric-hll-windows: {err}"))?,
+        hll_bucket_bits: cli.metric_hll_bucket_bits,
     };
 
     if cli.pool_shards > 1 {
@@ -583,15 +505,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         )
     })?;
 
-    let hll_tracker = Arc::new(std::sync::Mutex::new(
-        pegaflow_common::hll::MultiWindowHllTracker::new(
-            parse_hll_windows(&cli.metric_hll_windows)
-                .map_err(|err| format!("invalid --metric-hll-windows: {err}"))?,
-            cli.metric_hll_bucket_bits,
-        ),
-    ));
-    crate::metric::register_hll_gauges(&hll_tracker);
-
     let shutdown = Arc::new(Notify::new());
 
     runtime.block_on(async move {
@@ -602,11 +515,12 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             storage_config,
         )?);
 
+        crate::metric::register_hll_gauges(engine.hll_tracker());
+
         let service = GrpcEngineService::new(
             Arc::clone(&engine),
             registry.clone(),
             Arc::clone(&shutdown),
-            Arc::clone(&hll_tracker),
         );
 
         // Spawn background GC task for stale inflight blocks and expired transfer locks

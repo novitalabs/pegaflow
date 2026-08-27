@@ -1,13 +1,15 @@
+use crate::hll::HllNodeReport;
 use crate::metric::record_rpc_result;
 use crate::proto::engine::meta_server_server::MetaServer;
 use crate::proto::engine::{
-    HeartbeatNodeRequest, HeartbeatNodeResponse, InsertBlockHashesRequest,
+    HeartbeatNodeRequest, HeartbeatNodeResponse, HllSnapshotReport, InsertBlockHashesRequest,
     InsertBlockHashesResponse, NodePrefixResult, QueryPrefixBlocksRequest,
     QueryPrefixBlocksResponse, RemoveBlockHashesRequest, RemoveBlockHashesResponse, ResponseStatus,
     UnregisterNodeRequest, UnregisterNodeResponse,
 };
 use crate::store::{BlockHashStore, StoreError};
-use log::debug;
+use log::{debug, warn};
+use pegaflow_common::hll::HllWindowSnapshot as CommonHllWindowSnapshot;
 use std::sync::Arc;
 use std::time::Instant;
 use tonic::{Request, Response, Status, async_trait};
@@ -45,6 +47,37 @@ impl GrpcMetaService {
             StoreError::StaleSession => Status::failed_precondition("stale node session"),
         }
     }
+
+    fn parse_hll_report(report: Option<HllSnapshotReport>) -> HllNodeReport {
+        let Some(report) = report else {
+            warn!("MetaServer heartbeat missing HLL report; preserving node liveness");
+            return HllNodeReport {
+                windows: Vec::new(),
+            };
+        };
+
+        let mut windows = Vec::with_capacity(report.windows.len());
+        for window in report.windows {
+            let Ok(bucket_bits) = u8::try_from(window.bucket_bits) else {
+                warn!(
+                    "MetaServer heartbeat received invalid HLL bucket_bits={}; preserving node liveness",
+                    window.bucket_bits
+                );
+                return HllNodeReport {
+                    windows: Vec::new(),
+                };
+            };
+            windows.push(CommonHllWindowSnapshot {
+                window: window.window,
+                window_secs: window.window_secs,
+                bucket_bits,
+                registers: window.registers,
+                total_requests: window.total_requests,
+            });
+        }
+
+        HllNodeReport { windows }
+    }
 }
 
 #[async_trait]
@@ -61,8 +94,9 @@ impl MetaServer for GrpcMetaService {
         );
         let result = async {
             let node_id = Self::parse_node_id(&req.node_id)?;
+            let hll_report = Self::parse_hll_report(req.hll_report);
             self.store
-                .heartbeat_node(&req.node, node_id)
+                .heartbeat_node(&req.node, node_id, hll_report)
                 .map_err(Self::store_error_status)?;
             Ok(Response::new(HeartbeatNodeResponse {
                 stale_after_secs: self.store.config().node_stale_after.as_secs(),
@@ -302,10 +336,32 @@ impl MetaServer for GrpcMetaService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::BlockHashStore;
+    use crate::hll::HllSchema;
+    use crate::proto::engine::HllWindowSnapshot;
+    use crate::store::{BlockHashStore, StoreConfig};
 
     fn make_service() -> GrpcMetaService {
-        GrpcMetaService::new(Arc::new(BlockHashStore::new()))
+        let schema = HllSchema::new(
+            vec![("1m".to_string(), std::time::Duration::from_secs(60))],
+            4,
+        )
+        .unwrap();
+        GrpcMetaService::new(Arc::new(BlockHashStore::with_config_and_hll_schema(
+            StoreConfig::default(),
+            schema,
+        )))
+    }
+
+    fn test_hll_report() -> HllSnapshotReport {
+        HllSnapshotReport {
+            windows: vec![HllWindowSnapshot {
+                window: "1m".into(),
+                window_secs: 60,
+                bucket_bits: 4,
+                registers: vec![0; 16],
+                total_requests: 0,
+            }],
+        }
     }
 
     async fn heartbeat_node(svc: &GrpcMetaService, node: &str) -> String {
@@ -313,6 +369,7 @@ mod tests {
         svc.heartbeat_node(Request::new(HeartbeatNodeRequest {
             node: node.into(),
             node_id: node_id.clone(),
+            hll_report: Some(test_hll_report()),
         }))
         .await
         .unwrap();
@@ -459,6 +516,7 @@ mod tests {
             .heartbeat_node(Request::new(HeartbeatNodeRequest {
                 node: "node-a".into(),
                 node_id,
+                hll_report: Some(test_hll_report()),
             }))
             .await
             .unwrap()
@@ -478,6 +536,7 @@ mod tests {
             .heartbeat_node(Request::new(HeartbeatNodeRequest {
                 node: "node-a".into(),
                 node_id: new_id,
+                hll_report: Some(test_hll_report()),
             }))
             .await
             .unwrap_err();
@@ -485,11 +544,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_heartbeat_without_hll_report_preserves_node_liveness() {
+        let svc = make_service();
+        let response = svc
+            .heartbeat_node(Request::new(HeartbeatNodeRequest {
+                node: "node-a".into(),
+                node_id: Uuid::new_v4().to_string(),
+                hll_report: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.stale_after_secs, 30);
+        assert_eq!(svc.store.node_counts(), (1, 0));
+        assert!(svc.store.cluster_hll_snapshot().windows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_accepts_damaged_registers_but_excludes_from_cluster_hll() {
+        let svc = make_service();
+        let mut report = test_hll_report();
+        report.windows[0].registers.pop();
+        svc.heartbeat_node(Request::new(HeartbeatNodeRequest {
+            node: "node-a".into(),
+            node_id: Uuid::new_v4().to_string(),
+            hll_report: Some(report),
+        }))
+        .await
+        .unwrap();
+
+        // Node liveness is preserved; only the HLL contribution is dropped.
+        assert_eq!(svc.store.node_counts(), (1, 0));
+        assert!(svc.store.cluster_hll_snapshot().windows.is_empty());
+    }
+
+    #[tokio::test]
     async fn test_old_session_insert_is_rejected_after_stale_takeover() {
-        let store = Arc::new(BlockHashStore::with_config(crate::store::StoreConfig {
-            node_stale_after: std::time::Duration::ZERO,
-            ttl: std::time::Duration::from_secs(60),
-        }));
+        let schema = HllSchema::new(
+            vec![("1m".to_string(), std::time::Duration::from_secs(60))],
+            4,
+        )
+        .unwrap();
+        let store = Arc::new(BlockHashStore::with_config_and_hll_schema(
+            StoreConfig {
+                node_stale_after: std::time::Duration::ZERO,
+                ttl: std::time::Duration::from_secs(60),
+            },
+            schema,
+        ));
         let svc = GrpcMetaService::new(store);
         let old_id = heartbeat_node(&svc, "node-a").await;
         let new_id = heartbeat_node(&svc, "node-a").await;

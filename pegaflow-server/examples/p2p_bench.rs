@@ -504,13 +504,7 @@ async fn run_holder(cli: &Cli, shape: &Shape, pool_bytes: usize) {
     // a bench that never registers IPC tensors.
     let registry = RegistryHandle::spawn(CudaTensorRegistry::empty());
     let shutdown = Arc::new(Notify::new());
-    let hll = Arc::new(std::sync::Mutex::new(
-        pegaflow_common::hll::MultiWindowHllTracker::new(
-            vec![("24h".into(), Duration::from_secs(86400))],
-            14,
-        ),
-    ));
-    let service = GrpcEngineService::new(Arc::clone(&engine), registry, shutdown, hll);
+    let service = GrpcEngineService::new(Arc::clone(&engine), registry, shutdown);
     let listen: SocketAddr = ([0, 0, 0, 0], cli.port).into();
     tokio::spawn(async move {
         Server::builder()

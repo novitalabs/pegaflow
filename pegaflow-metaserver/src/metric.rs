@@ -16,6 +16,11 @@ struct StoreGaugeHandles {
     _nodes: ObservableGauge<u64>,
     _redundancy: ObservableGauge<u64>,
     _redundancy_avg: ObservableGauge<f64>,
+    _hll_cardinality: ObservableGauge<f64>,
+    _hll_total_requests: ObservableGauge<u64>,
+    _hll_estimated_hit_rate: ObservableGauge<f64>,
+    _hll_active_nodes: ObservableGauge<u64>,
+    _hll_snapshot_age: ObservableGauge<f64>,
 }
 
 static STORE_GAUGES: OnceLock<StoreGaugeHandles> = OnceLock::new();
@@ -81,12 +86,87 @@ pub fn register_store_gauges(store: &Arc<BlockHashStore>) {
                 observer.observe(avg, &[]);
             })
             .build();
+        // The store cache makes these callbacks share one cluster union while
+        // preserving separate instruments in OpenTelemetry 0.31.
+        let hll_cardinality_store = Arc::clone(&s);
+        let hll_cardinality = meter
+            .f64_observable_gauge("pegaflow_metaserver_hll_cardinality")
+            .with_description("Estimated distinct cache-miss objects in the active-node HLL union")
+            .with_callback(move |observer| {
+                for window in hll_cardinality_store.cluster_hll_snapshot().windows {
+                    observer.observe(
+                        window.cardinality,
+                        &[KeyValue::new("window", window.window)],
+                    );
+                }
+            })
+            .build();
+        let hll_total_store = Arc::clone(&s);
+        let hll_total_requests = meter
+            .u64_observable_gauge("pegaflow_metaserver_hll_total_requests")
+            .with_description("Total queried cache objects across active nodes")
+            .with_callback(move |observer| {
+                for window in hll_total_store.cluster_hll_snapshot().windows {
+                    observer.observe(
+                        window.total_requests,
+                        &[KeyValue::new("window", window.window)],
+                    );
+                }
+            })
+            .build();
+        let hll_rate_store = Arc::clone(&s);
+        let hll_estimated_hit_rate = meter
+            .f64_observable_gauge("pegaflow_metaserver_hll_estimated_hit_rate")
+            .with_description(
+                "Miss-based infinite-cache theoretical reuse reference from the active-node HLL union",
+            )
+            .with_callback(move |observer| {
+                for window in hll_rate_store.cluster_hll_snapshot().windows {
+                    observer.observe(
+                        window.estimated_hit_rate,
+                        &[KeyValue::new("window", window.window)],
+                    );
+                }
+            })
+            .build();
+        let hll_nodes_store = Arc::clone(&s);
+        let hll_active_nodes = meter
+            .u64_observable_gauge("pegaflow_metaserver_hll_active_nodes")
+            .with_description("Active node sessions included in the cluster HLL union")
+            .with_callback(move |observer| {
+                for window in hll_nodes_store.cluster_hll_snapshot().windows {
+                    observer.observe(
+                        window.active_nodes,
+                        &[KeyValue::new("window", window.window)],
+                    );
+                }
+            })
+            .build();
+        let hll_age_store = Arc::clone(&s);
+        let hll_snapshot_age = meter
+            .f64_observable_gauge("pegaflow_metaserver_hll_snapshot_age")
+            .with_description("Age in seconds of the oldest active-node HLL snapshot")
+            .with_unit("s")
+            .with_callback(move |observer| {
+                for window in hll_age_store.cluster_hll_snapshot().windows {
+                    observer.observe(
+                        window.snapshot_age_seconds,
+                        &[KeyValue::new("window", window.window)],
+                    );
+                }
+            })
+            .build();
         StoreGaugeHandles {
             _entries: entries,
             _owners: owners,
             _nodes: nodes,
             _redundancy: redundancy,
             _redundancy_avg: redundancy_avg,
+            _hll_cardinality: hll_cardinality,
+            _hll_total_requests: hll_total_requests,
+            _hll_estimated_hit_rate: hll_estimated_hit_rate,
+            _hll_active_nodes: hll_active_nodes,
+            _hll_snapshot_age: hll_snapshot_age,
         }
     });
 }

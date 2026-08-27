@@ -1,6 +1,7 @@
 pub mod block;
 pub mod grpc;
 pub mod hll;
+pub mod hll_config;
 pub mod logging;
 #[cfg(target_os = "linux")]
 pub mod numa;

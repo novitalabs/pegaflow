@@ -26,22 +26,15 @@ pub struct GrpcEngineService {
     engine: Arc<PegaEngine>,
     registry: RegistryHandle,
     shutdown: Arc<Notify>,
-    hll_tracker: Arc<std::sync::Mutex<pegaflow_common::hll::MultiWindowHllTracker>>,
     session_registry: Arc<SessionRegistry>,
 }
 
 impl GrpcEngineService {
-    pub fn new(
-        engine: Arc<PegaEngine>,
-        registry: RegistryHandle,
-        shutdown: Arc<Notify>,
-        hll_tracker: Arc<std::sync::Mutex<pegaflow_common::hll::MultiWindowHllTracker>>,
-    ) -> Self {
+    pub fn new(engine: Arc<PegaEngine>, registry: RegistryHandle, shutdown: Arc<Notify>) -> Self {
         Self {
             engine,
             registry,
             shutdown,
-            hll_tracker,
             session_registry: SessionRegistry::new(),
         }
     }
@@ -652,10 +645,8 @@ impl Engine for GrpcEngineService {
                         let miss_count = missing.min(req.block_hashes.len());
                         let miss_start = req.block_hashes.len() - miss_count;
                         debug_assert_eq!(hit + miss_count, req.block_hashes.len());
-                        if let Ok(namespace) = self.engine.instance_namespace(&req.instance_id)
-                            && let Ok(mut t) = self.hll_tracker.lock()
-                        {
-                            t.record_namespaced_misses(
+                        if let Ok(namespace) = self.engine.instance_namespace(&req.instance_id) {
+                            self.engine.record_hll_misses(
                                 &namespace,
                                 req.block_hashes.len() as u64,
                                 &req.block_hashes[miss_start..],

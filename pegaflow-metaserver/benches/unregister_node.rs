@@ -11,6 +11,8 @@
 //! leave owner cleanup to the lifecycle sweep.
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use pegaflow_common::hll::HllWindowSnapshot;
+use pegaflow_metaserver::hll::{HllNodeReport, HllSchema};
 use pegaflow_metaserver::store::{BlockHashStore, StoreConfig};
 use std::time::Duration;
 use uuid::Uuid;
@@ -18,17 +20,37 @@ use uuid::Uuid;
 const TOTAL_KEYS: usize = 1_000_000;
 const TARGET_OWNED_KEYS: usize = 10_000;
 
+fn empty_hll_report() -> HllNodeReport {
+    HllNodeReport {
+        windows: vec![HllWindowSnapshot {
+            window: "15m".into(),
+            window_secs: 900,
+            bucket_bits: 4,
+            registers: vec![0; 16],
+            total_requests: 0,
+        }],
+    }
+}
+
 fn populate_store() -> (BlockHashStore, String, Uuid) {
-    let store = BlockHashStore::with_config(StoreConfig {
-        node_stale_after: Duration::from_secs(30),
-        ttl: Duration::from_secs(7_200),
-    });
+    let schema = HllSchema::new(vec![("15m".into(), Duration::from_secs(900))], 4).unwrap();
+    let store = BlockHashStore::with_config_and_hll_schema(
+        StoreConfig {
+            node_stale_after: Duration::from_secs(30),
+            ttl: Duration::from_secs(7_200),
+        },
+        schema,
+    );
     let target_node = "target-node:50055".to_string();
     let other_node = "other-node:50055".to_string();
     let target_id = Uuid::new_v4();
     let other_id = Uuid::new_v4();
-    store.heartbeat_node(&target_node, target_id).unwrap();
-    store.heartbeat_node(&other_node, other_id).unwrap();
+    store
+        .heartbeat_node(&target_node, target_id, empty_hll_report())
+        .unwrap();
+    store
+        .heartbeat_node(&other_node, other_id, empty_hll_report())
+        .unwrap();
 
     for chunk_start in (0..TOTAL_KEYS).step_by(1_000) {
         let chunk_end = (chunk_start + 1_000).min(TOTAL_KEYS);

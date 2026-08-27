@@ -261,24 +261,14 @@ fn start_cluster(worker_threads: usize) -> TestCluster {
     let (engine, ctx) = build_engine();
     let registry = RegistryHandle::spawn(CudaTensorRegistry::empty());
     let shutdown = Arc::new(Notify::new());
-    let hll_tracker = Arc::new(std::sync::Mutex::new(
-        pegaflow_common::hll::MultiWindowHllTracker::new(
-            vec![("24h".into(), Duration::from_secs(86400))],
-            14,
-        ),
-    ));
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads)
         .enable_all()
         .build()
         .expect("build server runtime");
 
-    let service = GrpcEngineService::new(
-        Arc::clone(&engine),
-        registry.clone(),
-        Arc::clone(&shutdown),
-        hll_tracker,
-    );
+    let service =
+        GrpcEngineService::new(Arc::clone(&engine), registry.clone(), Arc::clone(&shutdown));
     rt.spawn(async move {
         Server::builder()
             .add_service(EngineServer::new(service))
