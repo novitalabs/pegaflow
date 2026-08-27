@@ -1,4 +1,4 @@
-"""Unit tests for DCP-aware block size logic in ConnectorContext."""
+"""Unit tests for scheduler block size logic in ConnectorContext."""
 
 from __future__ import annotations
 
@@ -72,11 +72,11 @@ def _make_ctx(
             16,
             id="smaller_physical_block",
         ),
-        pytest.param("pcp2", {"block_size": 16, "pcp_world_size": 2}, 32, id="pcp2"),
+        pytest.param("pcp2", {"block_size": 16, "pcp_world_size": 2}, 16, id="pcp2"),
         pytest.param(
             "dcp2_pcp2",
             {"block_size": 16, "dcp_world_size": 2, "pcp_world_size": 2},
-            64,
+            32,
             id="dcp2_pcp2",
         ),
     ],
