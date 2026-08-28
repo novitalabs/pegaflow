@@ -10,13 +10,16 @@ install_connector_unit_stubs()
 
 from pegaflow.connector.common import (  # noqa: E402
     ConnectorContext,
+    LocalRecurrentSave,
+    LocalSaveRef,
     PegaConnectorMetadata,
     SaveIntent,
 )
+from pegaflow.connector.linear_state_cache import LinearStateSlot  # noqa: E402
 from pegaflow.connector.worker import WorkerConnector  # noqa: E402
 
 
-def make_worker() -> WorkerConnector:
+def make_worker(linear_state_cache_size_bytes: int = 0) -> WorkerConnector:
     context = ConnectorContext(
         instance_id="test",
         namespace="test",
@@ -27,6 +30,7 @@ def make_worker() -> WorkerConnector:
         device_id=0,
         engine_client=MagicMock(),
         state_manager=MagicMock(),
+        linear_state_cache_size_bytes=linear_state_cache_size_bytes,
     )
     with patch("pegaflow.connector.worker.threading.Thread.start"):
         return WorkerConnector(
@@ -189,3 +193,76 @@ def test_preemption_waits_for_every_save_task():
             preemption_thread.join(timeout=1)
 
     assert not preemption_thread.is_alive()
+
+
+def _local_save_intent(req_id: str = "request"):
+    ref = LocalSaveRef(req_id, 0, 1, b"checkpoint")
+    save = LocalRecurrentSave(
+        target=LinearStateSlot(ref.slot, ref.generation, ref.block_hash),
+        source_block_ids=((1, 2),),
+    )
+    return ref, SaveIntent(
+        block_ids_by_group=((), ()),
+        block_hashes=(ref.block_hash,),
+        local_recurrent_saves=(save,),
+    )
+
+
+def test_running_local_save_ack_does_not_enter_finished_sending():
+    worker = make_worker(linear_state_cache_size_bytes=1024)
+    worker._cache_groups = SimpleNamespace(has_recurrent_state=True)
+    ref, intent = _local_save_intent()
+    worker._current_metadata = PegaConnectorMetadata(save_intents={"request": intent})
+
+    with (
+        patch("torch.cuda.synchronize"),
+        patch.object(worker, "_save_local_recurrent"),
+    ):
+        worker.wait_for_save()
+
+    finished_sending, _ = worker.get_finished(set())
+    metadata = worker.build_connector_worker_meta()
+    assert finished_sending is None
+    assert metadata is not None
+    assert metadata.succeeded == {ref: 1}
+    assert metadata.failed == {}
+
+
+def test_local_d2d_failure_acks_failure_and_reaches_request_terminal_state():
+    worker = make_worker(linear_state_cache_size_bytes=1024)
+    worker._cache_groups = SimpleNamespace(has_recurrent_state=True)
+    ref, intent = _local_save_intent()
+    worker._current_metadata = PegaConnectorMetadata(save_intents={"request": intent})
+
+    with (
+        patch("torch.cuda.synchronize"),
+        patch.object(worker, "_save_local_recurrent", side_effect=RuntimeError("copy failed")),
+    ):
+        worker.wait_for_save()
+
+    metadata = worker.build_connector_worker_meta()
+    assert metadata is not None
+    assert metadata.failed == {ref: 1}
+    assert "request" not in worker._req_pending_save_tasks
+    worker.handle_preemptions({"request"})
+    finished_sending, _ = worker.get_finished({"request"})
+    assert finished_sending == {"request"}
+
+
+def test_local_sync_failure_acks_failure_and_unblocks_preemption():
+    worker = make_worker(linear_state_cache_size_bytes=1024)
+    worker._cache_groups = SimpleNamespace(has_recurrent_state=True)
+    ref, intent = _local_save_intent()
+    worker._current_metadata = PegaConnectorMetadata(save_intents={"request": intent})
+
+    with (
+        patch("torch.cuda.synchronize", side_effect=RuntimeError("sync failed")),
+        patch.object(worker, "_save_local_recurrent"),
+    ):
+        worker.wait_for_save()
+
+    metadata = worker.build_connector_worker_meta()
+    assert metadata is not None
+    assert metadata.failed == {ref: 1}
+    assert "request" not in worker._req_pending_save_tasks
+    worker.handle_preemptions({"request"})

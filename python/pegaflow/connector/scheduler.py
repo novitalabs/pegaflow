@@ -12,14 +12,19 @@ from pegaflow.connector.common import (
     CacheGroupLayout,
     ConnectorContext,
     LoadIntent,
+    LocalRecurrentLoad,
+    LocalRecurrentSave,
+    LocalSaveRef,
     PegaConnectorMetadata,
     PegaKVConnectorStats,
+    PegaWorkerMetadata,
     RecurrentLoadHold,
     SaveIntent,
     logger,
     reconcile_hybrid_hit,
 )
 from pegaflow.connector.connector_metrics import PrefetchTracker
+from pegaflow.connector.linear_state_cache import LinearStateCache, LinearStateSlot
 from pegaflow.connector.tp_shards import ShardedQueryReady, TpShardQueryClient
 from pegaflow.pegaflow import EngineRpcClient
 
@@ -62,6 +67,8 @@ class _QueryProbe:
     # recurrent groups and shards, below the attention prefix). Used to
     # re-derive a legal boundary when the token budget shrinks the hit.
     usable_positions: frozenset[int] = frozenset()
+    # Connector-owned recurrent checkpoint pinned until local D2D load completes.
+    local_recurrent: LinearStateSlot | None = None
 
     @property
     def is_ready(self) -> bool:
@@ -90,6 +97,7 @@ class _QueryProbe:
         self.leases = ready.leases
         self.recurrent_hold = ready.recurrent_hold
         self.usable_positions = frozenset(ready.usable_positions)
+        self.local_recurrent = ready.local_recurrent
 
     def require_hit_blocks(self) -> int:
         if self.hit_blocks is None:
@@ -122,6 +130,14 @@ class SchedulerConnector:
         if self._cache_groups.has_recurrent_state and (pd_tail_save or pd_tail_load):
             raise ValueError("P/D tail-block caching is not supported with HMA")
         self._get_local_cached_blocks = None
+        self._linear_state_cache: LinearStateCache | None = None
+        if context.linear_state_cache_size_bytes:
+            compound_bytes = self._cache_groups.recurrent_compound_page_bytes
+            if compound_bytes <= 0:
+                raise ValueError("enabled linear-state cache requires MambaSpec.page_size_bytes")
+            self._linear_state_cache = LinearStateCache(
+                context.linear_state_cache_size_bytes // compound_bytes
+            )
 
         # P/D tail-block extension (`pegaflow.pd_tail_save`): vLLM only hashes
         # full blocks, so a prompt's partial tail block never enters the tier
@@ -192,6 +208,10 @@ class SchedulerConnector:
         # Completion tracking
         self._deferred_save_intents: dict[str, SaveIntent] = {}
         self._pending_saves: set[str] = set()
+        self._pending_local_saves: dict[LocalSaveRef, LinearStateSlot] = {}
+        self._local_saves_by_req: dict[str, set[LocalSaveRef]] = {}
+        self._local_save_ack_counts: dict[LocalSaveRef, int] = {}
+        self._pending_local_loads: dict[str, LinearStateSlot] = {}
         self._held_requests: set[str] = set()
 
     def bind_gpu_block_pool(self, gpu_block_pool) -> None:
@@ -288,6 +308,9 @@ class SchedulerConnector:
             if ready.recurrent_hold is not None:
                 for group_index, group_leases in enumerate(ready.recurrent_hold.leases):
                     self._tp_shard_client.release(group_leases, f"{req_id}:g{group_index}")
+            if ready.local_recurrent is not None:
+                assert self._linear_state_cache is not None
+                self._linear_state_cache.unpin(ready.local_recurrent)
             self._pending_query_probes.pop(req_id, None)
             return (None, False)
 
@@ -335,11 +358,10 @@ class SchedulerConnector:
         locally_computed_tokens = computed_blocks * vbs
         hit_tokens = min(hit_tokens, max(0, num_tokens - locally_computed_tokens - 1))
 
-        if probe.recurrent_hold is not None:
+        if probe.recurrent_hold is not None or probe.local_recurrent is not None:
             # A mamba checkpoint is valid only at its own block boundary. If
             # the token budget cut inside the reconciled span, fall back to
-            # the best earlier boundary; if none survives, drop the hit (a
-            # partial mamba resume cannot exist).
+            # the best earlier boundary; if none survives, drop the hit.
             boundary_blocks = hit_tokens // vbs
             usable = [p for p in probe.usable_positions if p < boundary_blocks]
             if not usable:
@@ -347,10 +369,38 @@ class SchedulerConnector:
                     self._release_pending_query_probe(req_id)
                 return (0, False)
             checkpoint = max(usable)
-            hit_blocks = checkpoint + 1
+            reduced_hit_blocks = checkpoint + 1
+            if reduced_hit_blocks < hit_blocks:
+                exact = self._tp_shard_client.query(
+                    self._ctx.instance_id,
+                    list(probe.query_hashes[:reduced_hit_blocks]),
+                    f"{req_id}:hma-budget-exact-{reduced_hit_blocks}",
+                    False,
+                )
+                self._release_leases(probe.leases, req_id)
+                probe.leases = ()
+                if exact is None or exact.num_hit_blocks != reduced_hit_blocks:
+                    if exact is not None:
+                        self._release_leases(exact.leases, req_id)
+                    self._release_pending_query_probe(req_id)
+                    return (0, False)
+                probe.leases = exact.leases
+            hit_blocks = reduced_hit_blocks
             hit_tokens = hit_blocks * vbs
             probe.hit_blocks = hit_blocks
-            probe.recurrent_hold = replace(probe.recurrent_hold, checkpoint=checkpoint)
+            if probe.recurrent_hold is not None:
+                probe.recurrent_hold = replace(probe.recurrent_hold, checkpoint=checkpoint)
+            elif probe.local_recurrent is not None:
+                assert self._linear_state_cache is not None
+                if probe.local_recurrent.block_hash != probe.query_hashes[checkpoint]:
+                    replacement = self._linear_state_cache.lookup(
+                        probe.query_hashes[checkpoint], pin=True
+                    )
+                    if replacement is None:
+                        self._release_pending_query_probe(req_id)
+                        return (0, False)
+                    self._linear_state_cache.unpin(probe.local_recurrent)
+                    probe.local_recurrent = replacement
 
         # Cacheable tails contain at least two tokens, so recomputing the final
         # prompt token cannot remove the last leased block from the load.
@@ -446,6 +496,27 @@ class SchedulerConnector:
                 raise
 
             pending_probe = self._pending_query_probes.get(req_id)
+            local_recurrent = None
+            if pending_probe is not None and pending_probe.local_recurrent is not None:
+                destinations = tuple(
+                    (group_index, block_ids_by_group[group_index][-1])
+                    for group_index in sorted(self._cache_groups.recurrent_group_indices)
+                    if block_ids_by_group[group_index]
+                    and block_ids_by_group[group_index][-1] is not None
+                )
+                if len(destinations) != len(self._cache_groups.recurrent_group_indices):
+                    self._release_pending_query_probe(req_id)
+                    raise RuntimeError(f"req {req_id} missing local recurrent destination")
+                local_recurrent = LocalRecurrentLoad(
+                    source=pending_probe.local_recurrent,
+                    destination_block_ids=destinations,
+                )
+                load_block_ids_by_group = tuple(
+                    (None,) * len(group)
+                    if index in self._cache_groups.recurrent_group_indices
+                    else group
+                    for index, group in enumerate(load_block_ids_by_group)
+                )
             load_intent = LoadIntent(
                 block_ids_by_group=load_block_ids_by_group,
                 leases=pending_probe.leases if pending_probe is not None else (),
@@ -453,6 +524,7 @@ class SchedulerConnector:
                 recurrent_hold=(
                     pending_probe.recurrent_hold if pending_probe is not None else None
                 ),
+                local_recurrent=local_recurrent,
             )
             if pending_probe is not None:
                 query_hashes, tail_tokens = self._build_query(request, num_computed_blocks)
@@ -469,6 +541,8 @@ class SchedulerConnector:
             if not load_intent.leases or any(not lease for lease in load_intent.leases):
                 raise RuntimeError(f"req {req_id} missing query lease for external load")
             self._pending_load_intents[req_id] = load_intent
+            if local_recurrent is not None:
+                self._pending_local_loads[req_id] = local_recurrent.source
             self._pending_query_probes.pop(req_id, None)
             logger.debug(
                 "[PegaKVConnector] req=%s alloc: total_blocks=%d computed_blocks=%d "
@@ -483,13 +557,19 @@ class SchedulerConnector:
             )
 
     def build_connector_meta(self, scheduler_output: "SchedulerOutput") -> PegaConnectorMetadata:
-        # Collect all save intents that became available this scheduler step.
-        ready_save_intents = self._deferred_save_intents
-        self._deferred_save_intents = {}
-        potential_saves: dict[str, SaveIntent] = {}
+        reservations_before = set(self._pending_local_saves)
+        try:
+            return self._build_connector_meta(scheduler_output)
+        except Exception:
+            for ref in set(self._pending_local_saves) - reservations_before:
+                self._cancel_local_save(ref)
+            raise
 
-        load_intents = self._pending_load_intents
-        self._pending_load_intents = {}
+    def _build_connector_meta(self, scheduler_output: "SchedulerOutput") -> PegaConnectorMetadata:
+        # Leave deferred work in place until metadata construction succeeds.
+        ready_save_intents = dict(self._deferred_save_intents)
+        potential_saves: dict[str, SaveIntent] = {}
+        load_intents = dict(self._pending_load_intents)
 
         # Process new requests
         for req in scheduler_output.scheduled_new_reqs:
@@ -576,9 +656,9 @@ class SchedulerConnector:
                 potential_saves[req_id] = save_intent
 
         save_intents = potential_saves
-
-        # Track requests with pending saves
         self._pending_saves.update(save_intents.keys())
+        self._pending_load_intents.clear()
+        self._deferred_save_intents.clear()
 
         logger.debug(
             "[PegaKVConnector] build_connector_meta: %d loads, %d saves",
@@ -766,9 +846,45 @@ class SchedulerConnector:
             len(block_hashes),
         )
 
+        return self._build_hma_save_intent(req_id, save_block_ids_by_group, save_hashes)
+
+    def _build_hma_save_intent(
+        self,
+        req_id: str,
+        block_ids_by_group: tuple[tuple[int, ...], ...],
+        block_hashes: tuple[bytes, ...],
+    ) -> SaveIntent:
+        if self._linear_state_cache is None:
+            return SaveIntent(block_ids_by_group=block_ids_by_group, block_hashes=block_hashes)
+
+        local_saves: list[LocalRecurrentSave] = []
+        for position, block_hash in enumerate(block_hashes):
+            ref = self._linear_state_cache.reserve(block_hash)
+            if ref is None:
+                continue
+            save_ref = LocalSaveRef(req_id, ref.slot, ref.generation, ref.block_hash)
+            self._pending_local_saves[save_ref] = ref
+            self._local_saves_by_req.setdefault(req_id, set()).add(save_ref)
+            sources = tuple(
+                (group_index, block_ids_by_group[group_index][position])
+                for group_index in sorted(self._cache_groups.recurrent_group_indices)
+                if block_ids_by_group[group_index][position] != 0
+            )
+            if len(sources) != len(self._cache_groups.recurrent_group_indices):
+                self._cancel_local_save(save_ref)
+                continue
+            local_saves.append(LocalRecurrentSave(target=ref, source_block_ids=sources))
+
+        remote_groups = tuple(
+            (0,) * len(block_hashes)
+            if index in self._cache_groups.recurrent_group_indices
+            else group
+            for index, group in enumerate(block_ids_by_group)
+        )
         return SaveIntent(
-            block_ids_by_group=save_block_ids_by_group,
-            block_hashes=save_hashes,
+            block_ids_by_group=remote_groups,
+            block_hashes=block_hashes,
+            local_recurrent_saves=tuple(local_saves),
         )
 
     def _local_cached_block_ids(
@@ -831,9 +947,10 @@ class SchedulerConnector:
                 save_block_ids_by_group.append(group[start_block_idx:saveable_block_idx])
 
         self._next_stored_block_idx[req_id] = saveable_block_idx
-        return SaveIntent(
-            block_ids_by_group=tuple(save_block_ids_by_group),
-            block_hashes=block_hashes[start_block_idx:saveable_block_idx],
+        return self._build_hma_save_intent(
+            req_id,
+            tuple(save_block_ids_by_group),
+            block_hashes[start_block_idx:saveable_block_idx],
         )
 
     def _copy_block_ids_by_group(self, block_ids) -> tuple[tuple[int, ...], ...]:
@@ -870,6 +987,18 @@ class SchedulerConnector:
         return tuple(result)
 
     def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
+        for req_id in getattr(connector_output, "finished_recving", None) or []:
+            ref = self._pending_local_loads.pop(req_id, None)
+            if ref is not None:
+                assert self._linear_state_cache is not None
+                self._linear_state_cache.unpin(ref)
+
+        worker_meta = getattr(connector_output, "kv_connector_worker_meta", None)
+        if worker_meta is not None:
+            if not isinstance(worker_meta, PegaWorkerMetadata):
+                raise TypeError(f"unexpected PegaFlow worker metadata {type(worker_meta)!r}")
+            self._apply_local_save_acks(worker_meta)
+
         for req_id in connector_output.finished_sending or []:
             self._pending_saves.discard(req_id)
             logger.debug("[PegaKVConnector] Request %s save completed", req_id)
@@ -878,6 +1007,50 @@ class SchedulerConnector:
             if req_id in self._held_requests and req_id not in self._deferred_save_intents:
                 self._cleanup_request(req_id)
                 self._held_requests.discard(req_id)
+
+    def _apply_local_save_acks(self, metadata: PegaWorkerMetadata) -> None:
+        for ref, count in metadata.failed.items():
+            if count > 0 and ref in self._pending_local_saves:
+                logger.error(
+                    "[PegaKVConnector] local recurrent save failed: req=%s slot=%d generation=%d",
+                    ref.req_id,
+                    ref.slot,
+                    ref.generation,
+                )
+                self._cancel_local_save(ref)
+
+        for ref, count in metadata.succeeded.items():
+            if ref not in self._pending_local_saves:
+                continue
+            total = self._local_save_ack_counts.get(ref, 0) + count
+            if total > self._ctx.tp_size:
+                raise RuntimeError(
+                    f"duplicate local recurrent ACKs for {ref}: "
+                    f"received={total} expected={self._ctx.tp_size}"
+                )
+            if total == self._ctx.tp_size:
+                assert self._linear_state_cache is not None
+                slot_ref = self._pending_local_saves.pop(ref)
+                self._linear_state_cache.commit(slot_ref)
+                self._forget_local_save(ref)
+            else:
+                self._local_save_ack_counts[ref] = total
+
+    def _cancel_local_save(self, ref: LocalSaveRef) -> None:
+        slot_ref = self._pending_local_saves.pop(ref, None)
+        if slot_ref is not None:
+            assert self._linear_state_cache is not None
+            self._linear_state_cache.cancel(slot_ref)
+        self._forget_local_save(ref)
+
+    def _forget_local_save(self, ref: LocalSaveRef) -> None:
+        self._local_save_ack_counts.pop(ref, None)
+        request_refs = self._local_saves_by_req.get(ref.req_id)
+        if request_refs is None:
+            return
+        request_refs.discard(ref)
+        if not request_refs:
+            self._local_saves_by_req.pop(ref.req_id, None)
 
     def request_finished(
         self,
@@ -922,6 +1095,11 @@ class SchedulerConnector:
         self._next_stored_block_idx.pop(req_id, None)
         self._deferred_save_intents.pop(req_id, None)
         self._pending_saves.discard(req_id)
+        if self._linear_state_cache is not None:
+            # A committed local load remains pinned even if the request aborts;
+            # only finished_recving proves every worker's D2D read is complete.
+            for save_ref in tuple(self._local_saves_by_req.get(req_id, ())):
+                self._cancel_local_save(save_ref)
         self._tail_saved.discard(req_id)
 
     def _count_available_block_prefix(
@@ -986,6 +1164,45 @@ class SchedulerConnector:
         """
         if ready.num_hit_blocks == 0:
             return ready
+        if self._linear_state_cache is not None:
+            usable = tuple(
+                index
+                for index, block_hash in enumerate(block_hashes[: ready.num_hit_blocks])
+                if self._linear_state_cache.lookup(block_hash) is not None
+            )
+            if not usable:
+                self._release_leases(ready.leases, req_id)
+                logger.info(
+                    "[PegaKVConnector] req=%s attention prefix of %d blocks has no "
+                    "committed local recurrent checkpoint; recomputing instead",
+                    req_id,
+                    ready.num_hit_blocks,
+                )
+                return ShardedQueryReady(0, tuple(b"" for _ in ready.leases))
+            checkpoint = max(usable)
+            local_ref = self._linear_state_cache.lookup(block_hashes[checkpoint], pin=True)
+            assert local_ref is not None
+            hybrid_hit = checkpoint + 1
+            if hybrid_hit < ready.num_hit_blocks:
+                exact = self._tp_shard_client.query(
+                    self._ctx.instance_id,
+                    block_hashes[:hybrid_hit],
+                    f"{req_id}:hma-local-exact-{hybrid_hit}",
+                    False,
+                )
+                self._release_leases(ready.leases, req_id)
+                if exact is None or exact.num_hit_blocks != hybrid_hit:
+                    if exact is not None:
+                        self._release_leases(exact.leases, req_id)
+                    self._linear_state_cache.unpin(local_ref)
+                    return ShardedQueryReady(0, tuple(b"" for _ in ready.leases))
+                ready = exact
+            return ShardedQueryReady(
+                hybrid_hit,
+                ready.leases,
+                usable_positions=usable,
+                local_recurrent=local_ref,
+            )
 
         group_ids = tuple(
             self._cache_groups.storage_group_ids[index]
@@ -1108,6 +1325,12 @@ class SchedulerConnector:
     def shutdown(self) -> None:
         for req_id in list(self._pending_query_probes):
             self._release_pending_query_probe(req_id)
+        if self._linear_state_cache is not None:
+            self._pending_local_loads.clear()
+            self._pending_local_saves.clear()
+            self._local_saves_by_req.clear()
+            self._local_save_ack_counts.clear()
+            self._linear_state_cache.clear()
 
     def _release_pending_query_probe(self, req_id: str) -> bool:
         probe = self._pending_query_probes.pop(req_id, None)
@@ -1127,6 +1350,9 @@ class SchedulerConnector:
             for group_index, group_leases in enumerate(hold.leases):
                 if not self._tp_shard_client.release(group_leases, f"{req_id}:g{group_index}"):
                     released = False
+        if probe.local_recurrent is not None:
+            assert self._linear_state_cache is not None
+            self._linear_state_cache.unpin(probe.local_recurrent)
         return released
 
     def _release_leases(self, leases: tuple[bytes, ...], req_id: str) -> bool:

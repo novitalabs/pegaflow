@@ -12,14 +12,29 @@ Pure-function contract covering the scheduler-side hit derivation:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+
 from .unit_stubs import install_connector_unit_stubs
 
 install_connector_unit_stubs()
 
+from vllm.distributed.kv_transfer.kv_connector.utils import (  # noqa: E402
+    KVOutputAggregator,
+)
+from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput  # noqa: E402
+
 from pegaflow.connector.common import (  # noqa: E402
     CacheGroupLayout,
+    ConnectorContext,
+    LocalSaveRef,
+    PegaWorkerMetadata,
     reconcile_hybrid_hit,
 )
+from pegaflow.connector.scheduler import SchedulerConnector  # noqa: E402
+from pegaflow.connector.tp_shards import ShardedQueryReady  # noqa: E402
 
 from .test_cache_group_layout import (  # noqa: E402
     _config,
@@ -126,3 +141,148 @@ class TestStorageGroupIds:
         layout = CacheGroupLayout.from_config(config)
         assert layout.storage_group_ids == (0, 1, 2)
         assert layout.recurrent_group_indices == frozenset({1, 2})
+
+
+def _local_scheduler(tp_size: int = 1) -> SchedulerConnector:
+    config = _config(
+        _group("attention", _full_attention()),
+        _group("recurrent", _mamba(page_size_bytes=1024)),
+    )
+    context = ConnectorContext(
+        instance_id="test",
+        namespace="ns",
+        block_size=16,
+        tp_size=tp_size,
+        world_size=tp_size,
+        tp_rank=0,
+        device_id=0,
+        engine_client=MagicMock(),
+        state_manager=MagicMock(),
+        linear_state_cache_size_bytes=2048,
+    )
+    return SchedulerConnector(context, kv_cache_config=config)
+
+
+def _commit_hash(scheduler: SchedulerConnector, block_hash: bytes):
+    assert scheduler._linear_state_cache is not None
+    ref = scheduler._linear_state_cache.reserve(block_hash)
+    assert ref is not None
+    scheduler._linear_state_cache.commit(ref)
+    return ref
+
+
+def test_local_recurrent_reconcile_uses_rightmost_checkpoint_inside_remote_prefix():
+    scheduler = _local_scheduler()
+    hashes = [b"h0", b"h1", b"h2"]
+    _commit_hash(scheduler, hashes[0])
+    rightmost = _commit_hash(scheduler, hashes[2])
+    scheduler._tp_shard_client = MagicMock()
+
+    result = scheduler._reconcile_hybrid(
+        hashes,
+        ShardedQueryReady(3, (b"remote-lease",)),
+        "req",
+    )
+
+    assert result.num_hit_blocks == 3
+    assert result.local_recurrent == rightmost
+    assert result.usable_positions == (0, 2)
+    scheduler._tp_shard_client.query_group_membership.assert_not_called()
+
+
+def test_remote_attention_hit_without_local_recurrent_checkpoint_is_a_miss():
+    scheduler = _local_scheduler()
+    scheduler._tp_shard_client = MagicMock()
+
+    result = scheduler._reconcile_hybrid(
+        [b"h0", b"h1"],
+        ShardedQueryReady(2, (b"remote-lease",)),
+        "req",
+    )
+
+    assert result.num_hit_blocks == 0
+    scheduler._tp_shard_client.release.assert_called_once_with((b"remote-lease",), "req")
+
+
+def _worker_output(metadata: PegaWorkerMetadata) -> ModelRunnerOutput:
+    return ModelRunnerOutput(
+        kv_connector_output=KVConnectorOutput(kv_connector_worker_meta=metadata)
+    )
+
+
+def test_tp2_interleaved_local_save_acks_commit_only_matching_refs():
+    scheduler = _local_scheduler(tp_size=2)
+    assert scheduler._linear_state_cache is not None
+    first = scheduler._build_hma_save_intent(
+        "req", ((11,), (21,)), (b"checkpoint-1",)
+    ).local_recurrent_saves[0]
+    second = scheduler._build_hma_save_intent(
+        "req", ((12,), (22,)), (b"checkpoint-2",)
+    ).local_recurrent_saves[0]
+    first_ref = LocalSaveRef.from_save("req", first)
+    second_ref = LocalSaveRef.from_save("req", second)
+    aggregator = KVOutputAggregator(expected_finished_count=2)
+
+    interleaved = aggregator.aggregate(
+        [
+            _worker_output(PegaWorkerMetadata(succeeded={first_ref: 1})),
+            _worker_output(PegaWorkerMetadata(succeeded={second_ref: 1})),
+        ]
+    ).kv_connector_output
+    assert interleaved is not None
+    assert interleaved.finished_sending is None
+    scheduler.update_connector_output(interleaved)
+    assert scheduler._linear_state_cache.lookup(b"checkpoint-1") is None
+    assert scheduler._linear_state_cache.lookup(b"checkpoint-2") is None
+
+    matched = aggregator.aggregate(
+        [
+            _worker_output(PegaWorkerMetadata(succeeded={second_ref: 1})),
+            _worker_output(PegaWorkerMetadata(succeeded={first_ref: 1})),
+        ]
+    ).kv_connector_output
+    assert matched is not None
+    assert matched.finished_sending is None
+    scheduler.update_connector_output(matched)
+    assert scheduler._linear_state_cache.lookup(b"checkpoint-1") == first.target
+    assert scheduler._linear_state_cache.lookup(b"checkpoint-2") == second.target
+
+
+def test_local_save_failure_ack_cancels_exact_reservation():
+    scheduler = _local_scheduler()
+    assert scheduler._linear_state_cache is not None
+    save = scheduler._build_hma_save_intent(
+        "req", ((11,), (21,)), (b"failed-checkpoint",)
+    ).local_recurrent_saves[0]
+    ref = LocalSaveRef.from_save("req", save)
+    other = scheduler._build_hma_save_intent(
+        "req", ((12,), (22,)), (b"other-checkpoint",)
+    ).local_recurrent_saves[0]
+    other_ref = LocalSaveRef.from_save("req", other)
+
+    scheduler.update_connector_output(
+        KVConnectorOutput(kv_connector_worker_meta=PegaWorkerMetadata(failed={ref: 1}))
+    )
+
+    assert ref not in scheduler._pending_local_saves
+    assert other_ref in scheduler._pending_local_saves
+    assert scheduler._linear_state_cache.lookup(ref.block_hash) is None
+    replacement = scheduler._linear_state_cache.reserve(b"replacement")
+    assert replacement is not None
+
+
+def test_metadata_construction_exception_rolls_back_new_reservations(monkeypatch):
+    scheduler = _local_scheduler()
+    assert scheduler._linear_state_cache is not None
+
+    def fail_after_reserve(_scheduler_output):
+        scheduler._build_hma_save_intent("req", ((11,), (21,)), (b"unpublished",))
+        raise RuntimeError("metadata failed")
+
+    monkeypatch.setattr(scheduler, "_build_connector_meta", fail_after_reserve)
+    with pytest.raises(RuntimeError, match="metadata failed"):
+        scheduler.build_connector_meta(SimpleNamespace())
+
+    assert scheduler._pending_local_saves == {}
+    assert scheduler._local_saves_by_req == {}
+    assert scheduler._linear_state_cache.lookup(b"unpublished") is None

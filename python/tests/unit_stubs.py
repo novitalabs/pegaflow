@@ -58,9 +58,11 @@ def _install_torch_stub() -> None:
     torch.cuda = _Cuda()  # type: ignore[attr-defined]
     torch.random = _Random()  # type: ignore[attr-defined]
     torch.Tensor = object  # type: ignore[attr-defined]
+    torch.OutOfMemoryError = type("OutOfMemoryError", (RuntimeError,), {})  # type: ignore[attr-defined]
     torch.dtype = object  # type: ignore[attr-defined]
     torch.device = lambda value: value  # type: ignore[attr-defined]
     torch.bfloat16 = "bfloat16"  # type: ignore[attr-defined]
+    torch.uint8 = "uint8"  # type: ignore[attr-defined]
     sys.modules["torch"] = torch
 
 
@@ -98,6 +100,69 @@ def _install_vllm_stubs() -> None:
     base.KVConnectorMetadata = KVConnectorMetadata
     base.KVConnectorWorkerMetadata = KVConnectorWorkerMetadata
     base.SupportsHMA = SupportsHMA
+
+    outputs = _ensure_module("vllm.v1.outputs")
+
+    @dataclass
+    class KVConnectorOutput:
+        finished_sending: set[str] | None = None
+        finished_recving: set[str] | None = None
+        kv_connector_stats: object | None = None
+        kv_cache_events: object | None = None
+        kv_connector_worker_meta: object | None = None
+        invalid_block_ids: set[int] = field(default_factory=set)
+        expected_finished_count: int = 0
+
+    @dataclass
+    class ModelRunnerOutput:
+        kv_connector_output: KVConnectorOutput | None = None
+
+    outputs.KVConnectorOutput = KVConnectorOutput
+    outputs.ModelRunnerOutput = ModelRunnerOutput
+
+    connector_utils = _ensure_module("vllm.distributed.kv_transfer.kv_connector.utils")
+
+    class KVOutputAggregator:
+        def __init__(self, expected_finished_count: int):
+            self._expected_finished_count = expected_finished_count
+            self._send_remaining_count: dict[str, int] = {}
+            self._recv_remaining_count: dict[str, int] = {}
+
+        def aggregate(self, model_outputs, output_rank: int = 0):
+            output = model_outputs[output_rank]
+            assert output is not None
+            worker_meta = None
+            finished_sending: set[str] = set()
+            finished_recving: set[str] = set()
+
+            def update(req_ids, counts, finished):
+                for req_id in req_ids or ():
+                    counts[req_id] = counts.get(req_id, self._expected_finished_count) - 1
+                    if counts[req_id] == 0:
+                        finished.add(req_id)
+                        del counts[req_id]
+
+            for model_output in model_outputs:
+                assert model_output is not None
+                kv_output = model_output.kv_connector_output
+                if kv_output is None:
+                    continue
+                update(kv_output.finished_sending, self._send_remaining_count, finished_sending)
+                update(kv_output.finished_recving, self._recv_remaining_count, finished_recving)
+                if worker_meta is None:
+                    worker_meta = kv_output.kv_connector_worker_meta
+                elif kv_output.kv_connector_worker_meta is not None:
+                    worker_meta = worker_meta.aggregate(kv_output.kv_connector_worker_meta)
+
+            output.kv_connector_output = KVConnectorOutput(
+                finished_sending=finished_sending or None,
+                finished_recving=finished_recving or None,
+                kv_connector_worker_meta=worker_meta,
+                expected_finished_count=self._expected_finished_count,
+            )
+            return output
+
+    connector_utils.KVOutputAggregator = KVOutputAggregator
 
     metrics = _ensure_module("vllm.distributed.kv_transfer.kv_connector.v1.metrics")
 

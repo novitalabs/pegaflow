@@ -8,7 +8,12 @@ from .unit_stubs import install_connector_unit_stubs
 
 install_connector_unit_stubs()
 
-from pegaflow.connector.worker import _infer_kv_cache_registration  # noqa: E402
+from pegaflow.connector.common import LocalRecurrentLoad, LocalRecurrentSave  # noqa: E402
+from pegaflow.connector.linear_state_cache import LinearStateSlot  # noqa: E402
+from pegaflow.connector.worker import (  # noqa: E402
+    WorkerConnector,
+    _infer_kv_cache_registration,
+)
 
 
 class FakeTensor:
@@ -215,3 +220,71 @@ def test_bytes_per_block_must_be_nonzero():
             logical_block_size=128,
             is_mla=True,
         )
+
+
+class _Page:
+    def __init__(self, value: bytes):
+        self.value = value
+
+    def copy_(self, other: _Page, non_blocking: bool = False):
+        assert non_blocking
+        self.value = other.value
+
+
+class _Pages:
+    def __init__(self, *values: bytes):
+        self.rows = [_Page(value) for value in values]
+        self.shape = (len(values), len(values[0]))
+
+    def __getitem__(self, index: int) -> _Page:
+        return self.rows[index]
+
+
+def _local_worker_for_copy():
+    worker = WorkerConnector.__new__(WorkerConnector)
+    worker._local_recurrent_layers = {
+        "recurrent": type(
+            "Layer",
+            (),
+            {
+                "group_index": 1,
+                "pages": _Pages(b"src0", b"src1", b"empty"),
+                "pool": _Pages(b"pool0", b"pool1"),
+                "generations": [1, 0],
+            },
+        )()
+    }
+    worker._pending_local_load_events = {}
+    return worker
+
+
+def test_local_recurrent_save_copies_full_page_and_advances_generation():
+    worker = _local_worker_for_copy()
+    ref = LinearStateSlot(slot=1, generation=2, block_hash=b"hash")
+
+    worker._save_local_recurrent(LocalRecurrentSave(target=ref, source_block_ids=((1, 1),)))
+
+    layer = worker._local_recurrent_layers["recurrent"]
+    assert layer.pool[0].value == b"pool0"
+    assert layer.pool[1].value == b"src1"
+    assert layer.generations == [1, 2]
+
+
+def test_local_recurrent_load_rejects_stale_generation(monkeypatch):
+    worker = _local_worker_for_copy()
+    monkeypatch.setattr(
+        "pegaflow.connector.worker.torch.cuda.Event",
+        lambda: type("Event", (), {"record": lambda self: None})(),
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="stale local recurrent slot"):
+        worker._start_local_recurrent_load(
+            "req",
+            LocalRecurrentLoad(
+                source=LinearStateSlot(slot=0, generation=2, block_hash=b"hash"),
+                destination_block_ids=((1, 2),),
+            ),
+        )
+
+    assert worker._local_recurrent_layers["recurrent"].pages[2].value == b"empty"

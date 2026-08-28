@@ -109,6 +109,39 @@ vllm serve Qwen/Qwen3-0.6B \
 
 Valid values are `read_write` and `save_only`.
 
+#### Connector-Owned Linear-State Cache
+
+`pegaflow.linear_state_cache_size_bytes` enables a worker-local GPU LRU for the
+recurrent state in vLLM hybrid models. It defaults to `0`, preserving the existing
+PegaFlow recurrent query/load/save path and GPU memory use. The value must be a
+non-negative integer in bytes.
+
+The feature currently supports only TP-only hybrid layouts (`PP=1`, no DCP/PCP)
+whose recurrent groups are vLLM `MambaSpec` groups with
+`mamba_cache_mode="align"`. One atomic checkpoint contains every recurrent group
+and recurrent layer. Its size is the sum of vLLM's padded
+`MambaSpec.page_size_bytes` for those layers; each TP worker allocates
+`floor(configured_bytes / checkpoint_bytes)` slots. Startup rejects unsupported
+parallel layouts or a budget that cannot hold one complete checkpoint.
+
+When enabled, PegaFlow continues to query, lease, load, and save all non-recurrent
+attention KV. Recurrent state never goes to the PegaFlow server: workers copy full
+pages between vLLM's cache and the local pool with GPU-to-GPU copies. A request
+can resume only at the intersection of the remote attention prefix and a committed
+local recurrent checkpoint. A local recurrent miss releases the remote lease and
+recomputes from the beginning. Each worker reports an exact
+`(request, slot, generation, hash)` result through vLLM worker metadata. The
+scheduler publishes only after every TP worker ACKs the same checkpoint; failures
+cancel that exact reservation. `finished_sending` remains reserved for completed
+requests whose held blocks may be freed. In-flight loads pin their slot until
+`finished_recving`, so eviction cannot reuse data still being copied.
+
+This pool is allocated **after and outside vLLM's KV-cache memory planning**. The
+configured bytes therefore require additional free GPU memory beyond
+`gpu_memory_utilization`; startup raises an explicit error if allocation runs out
+of memory. Example: `{"pegaflow.linear_state_cache_size_bytes": 1073741824}`
+requests an additional allocation of up to 1 GiB on every TP worker.
+
 #### TP Shards Across Hosts
 
 CUDA IPC is host-local. When one tensor-parallel replica spans multiple hosts,

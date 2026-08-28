@@ -23,7 +23,7 @@ from .unit_stubs import install_connector_unit_stubs
 
 install_connector_unit_stubs()
 
-from vllm.v1.kv_cache_interface import FullAttentionSpec  # noqa: E402
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec  # noqa: E402
 
 from pegaflow.connector.common import (  # noqa: E402
     ConnectorContext,
@@ -527,4 +527,56 @@ def test_register_version_mismatch_rpc_error_stops_startup(monkeypatch):
     assert "server=0.22.5" in str(exc_info.value)
     assert len(client.register_calls) == 1
 
+    worker.shutdown()
+
+
+def test_local_recurrent_pool_oom_is_explicit_and_cleans_partial_state(monkeypatch):
+    recurrent = MambaSpec()
+    recurrent.block_size = 16
+    recurrent.mamba_cache_mode = "align"
+    recurrent.page_size_bytes = 32
+    recurrent_2 = MambaSpec()
+    recurrent_2.block_size = 16
+    recurrent_2.mamba_cache_mode = "align"
+    recurrent_2.page_size_bytes = 32
+    attention = FullAttentionSpec()
+    attention.block_size = 16
+    kv_cache_config = MagicMock(
+        kv_cache_groups=(
+            MagicMock(layer_names=("recurrent",), kv_cache_spec=recurrent),
+            MagicMock(layer_names=("recurrent_2",), kv_cache_spec=recurrent_2),
+            MagicMock(layer_names=("attention",), kv_cache_spec=attention),
+        )
+    )
+    worker, client, _ = _make_worker(
+        kv_cache_config=kv_cache_config,
+        linear_state_cache_size_bytes=64,
+    )
+    monkeypatch.setattr(
+        "pegaflow.connector.worker._raw_page_view",
+        lambda _tensor, _page_bytes: object(),
+    )
+    monkeypatch.setattr(
+        "pegaflow.connector.worker.torch.empty",
+        MagicMock(side_effect=[object(), __import__("torch").OutOfMemoryError("oom")]),
+        raising=False,
+    )
+    empty_cache = MagicMock()
+    monkeypatch.setattr(
+        "pegaflow.connector.worker.torch.cuda.empty_cache",
+        empty_cache,
+    )
+
+    with pytest.raises(RuntimeError, match="outside vLLM KV-cache planning"):
+        worker.register_kv_caches(
+            {
+                "recurrent": FakeTensor(),
+                "recurrent_2": FakeTensor(),
+                "attention": FakeTensor(),
+            }
+        )
+
+    assert worker._local_recurrent_layers == {}
+    assert client.register_calls == []
+    empty_cache.assert_called_once()
     worker.shutdown()
