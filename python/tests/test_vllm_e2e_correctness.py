@@ -33,6 +33,7 @@ from .vllm_helpers import (
     e2e_max_tokens,
     fetch_pegaflow_metrics,
     fetch_pegaflow_rpc_failures,
+    uses_linear_attention,
 )
 
 # ---------------------------------------------------------------------------
@@ -165,7 +166,7 @@ EXECUTION_PLAN: list[tuple[str, str, str]] = [
     ("prefix_base", PREFIX_BASE, "cold"),
     ("rollback_long", ROLLBACK_LONG, "cold"),
     ("multi_r1", MULTI_ROUND[0], "cold"),
-    # Same-process warm hit proves vLLM's local HMA cache cannot mask PegaFlow.
+    # Same-process warm hit proves coherent HMA state can be reused from L1.
     ("short_same_process", SHORT_PROMPT, "warm-same-process"),
     # Round 2: warm hits — exact same prompts
     ("short_warm", SHORT_PROMPT, "warm"),
@@ -298,8 +299,10 @@ class TestE2ECorrectness:
         print("[Phase 2] PegaFlow vLLM — executing cache plan")
         pega_port = base_port + 1
         outputs: dict[str, str] = {}
+        same_process_usage: dict | None = None
         metrics_port = pegaflow_server.metrics_port
         metrics_start = fetch_pegaflow_metrics(metrics_port)
+        metrics_before_same_process: dict[str, float] | None = None
 
         with VLLMServer(
             model,
@@ -311,10 +314,13 @@ class TestE2ECorrectness:
             pipeline_parallel_size=pipeline_parallel_size,
             max_model_len=max_model_len,
             transfer_backend=pegaflow_transfer_backend,
+            extra_args=["--enable-prompt-tokens-details"],
         ):
             for label, prompt, expectation in EXECUTION_PLAN:
                 if expectation not in {"cold", "warm-same-process"}:
                     continue
+                if expectation == "warm-same-process":
+                    metrics_before_same_process = fetch_pegaflow_metrics(metrics_port)
                 result = call_openai_api(
                     pega_port,
                     model,
@@ -322,9 +328,14 @@ class TestE2ECorrectness:
                     max_tokens=e2e_max_tokens(model),
                 )
                 outputs[label] = result["text"]
+                if expectation == "warm-same-process":
+                    same_process_usage = result["usage"]
                 print(f"  [{label}] ({expectation}) {len(result['text'])} chars")
 
             metrics_same_process = fetch_pegaflow_metrics(metrics_port)
+
+        if metrics_before_same_process is None:
+            raise RuntimeError("execution plan has no same-process warm request")
 
         with VLLMServer(
             model,
@@ -337,6 +348,7 @@ class TestE2ECorrectness:
             max_model_len=max_model_len,
             transfer_backend=pegaflow_transfer_backend,
             server_label="PegaFlow load",
+            extra_args=["--enable-prompt-tokens-details"],
         ):
             for label, prompt, expectation in EXECUTION_PLAN:
                 if expectation in {"cold", "warm-same-process"}:
@@ -355,7 +367,9 @@ class TestE2ECorrectness:
         print("[Phase 2] Done\n")
         return {
             "outputs": outputs,
+            "same_process_usage": same_process_usage,
             "metrics_start": metrics_start,
+            "metrics_before_same_process": metrics_before_same_process,
             "metrics_same_process": metrics_same_process,
             "metrics_end": metrics_end,
         }
@@ -399,9 +413,15 @@ class TestE2ECorrectness:
             f"hits={hits:.0f} blocks ({load_bytes / 1e6:.1f}MB)"
         )
 
-    def test_same_process_hma_load_uses_pegaflow(self, pegaflow_results):
-        """The warm request in the first vLLM process must load from PegaFlow."""
-        m_start = pegaflow_results["metrics_start"]
+    def test_same_process_hma_hit_uses_local_cache(self, pegaflow_results, model: str):
+        """A coherent warm HMA prefix stays local instead of loading from PegaFlow."""
+        if not uses_linear_attention(model):
+            pytest.skip("model does not use the HMA cache path")
+
+        usage = pegaflow_results["same_process_usage"] or {}
+        prompt_details = usage.get("prompt_tokens_details") or {}
+        cached_tokens = prompt_details.get("cached_tokens", 0)
+        m_start = pegaflow_results["metrics_before_same_process"]
         m_end = pegaflow_results["metrics_same_process"]
         hit_delta = m_end.get("pegaflow_cache_block_hits_total", 0) - m_start.get(
             "pegaflow_cache_block_hits_total", 0
@@ -409,9 +429,10 @@ class TestE2ECorrectness:
         load_delta = m_end.get("pegaflow_load_bytes_total", 0) - m_start.get(
             "pegaflow_load_bytes_total", 0
         )
-        assert hit_delta > 0 or load_delta > 0, (
-            "same-process warm HMA request bypassed PegaFlow: "
-            f"hit_delta={hit_delta}, load_delta={load_delta}"
+        assert cached_tokens > 0, "same-process warm HMA request reported no cached tokens"
+        assert hit_delta == 0 and load_delta == 0, (
+            "same-process warm HMA request loaded from PegaFlow: "
+            f"cached_tokens={cached_tokens}, hit_delta={hit_delta}, load_delta={load_delta}"
         )
 
     def test_no_data_path_rpc_failures(self, pegaflow_results, pegaflow_server: PegaFlowServer):

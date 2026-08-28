@@ -19,7 +19,7 @@ import requests
 DEFAULT_VLLM_SEED = 42
 
 
-def _uses_linear_attention(model: str) -> bool:
+def uses_linear_attention(model: str) -> bool:
     config_path = Path(model) / "config.json"
     if not config_path.is_file():
         return False
@@ -28,11 +28,13 @@ def _uses_linear_attention(model: str) -> bool:
     except (OSError, json.JSONDecodeError):
         return False
     text_config = config.get("text_config", config)
-    return "linear_attention" in (text_config.get("layer_types") or ())
+    return "linear_attention" in (text_config.get("layer_types") or ()) or bool(
+        text_config.get("linear_attn_config")
+    )
 
 
 def adapt_prompt_for_hybrid_cache(model: str, prompt: str) -> str:
-    if not _uses_linear_attention(model):
+    if not uses_linear_attention(model):
         return prompt
     family = hashlib.sha256(prompt[:80].encode()).hexdigest()[:8]
     prefix = f"Hybrid cache boundary {family} contains deterministic background context. " * 80
@@ -40,7 +42,7 @@ def adapt_prompt_for_hybrid_cache(model: str, prompt: str) -> str:
 
 
 def e2e_max_tokens(model: str) -> int:
-    return 8 if _uses_linear_attention(model) else 50
+    return 8 if uses_linear_attention(model) else 50
 
 
 def _detect_pegaflow_cargo_features() -> list[str]:
@@ -114,7 +116,7 @@ class VLLMServer:
 
         env = os.environ.copy()
         env["PYTHONHASHSEED"] = "0"
-        if _uses_linear_attention(self.model):
+        if uses_linear_attention(self.model):
             env.pop("VLLM_BATCH_INVARIANT", None)
         else:
             env["VLLM_BATCH_INVARIANT"] = "1"
@@ -138,7 +140,7 @@ class VLLMServer:
             "--trust-remote-code",
             (
                 "--enable-prefix-caching"
-                if _uses_linear_attention(self.model)
+                if uses_linear_attention(self.model)
                 else "--no-enable-prefix-caching"
             ),
             "--gpu-memory-utilization",
@@ -159,7 +161,7 @@ class VLLMServer:
 
         if self.max_model_len is not None:
             cmd.extend(["--max-model-len", str(self.max_model_len)])
-        if _uses_linear_attention(self.model):
+        if uses_linear_attention(self.model):
             cmd.extend(
                 [
                     "--max-num-seqs",

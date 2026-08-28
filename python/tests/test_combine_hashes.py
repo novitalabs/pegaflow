@@ -172,12 +172,40 @@ def test_recurrent_save_preserves_vllm_null_block_for_worker_filtering():
     )
 
 
-def test_hma_binding_disables_local_prefix_lookup_before_scheduling():
+def test_hma_binding_reports_only_reconciled_local_prefix():
     scheduler = _make_recurrent_scheduler()
     block_pool = SimpleNamespace(get_cached_block=lambda *_args: object())
+    from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
+
+    coordinator = HybridKVCacheCoordinator()
+    coordinator.block_pool = block_pool
+    coordinator.kv_cache_config = SimpleNamespace(kv_cache_groups=(object(), object()))
+    coordinator.per_group_result = (([11, 12], [21]), (32, 16))
+    coordinator.reconciled_result = (([11], [21]), 16, 16)
+    other = HybridKVCacheCoordinator()
+    other.block_pool = SimpleNamespace(get_cached_block=lambda *_args: object())
+    other.kv_cache_config = coordinator.kv_cache_config
+    other.per_group_result = (([31, 32], [41]), (32, 16))
+    other.reconciled_result = (([31], [41]), 16, 16)
+
     scheduler.bind_gpu_block_pool(block_pool)
 
-    assert block_pool.get_cached_block(b"hash", [0, 1]) is None
+    assert coordinator.find_longest_cache_hit_per_group([_hash(0), _hash(1)], 32) == (
+        ([11], [21]),
+        (16, 16),
+    )
+    assert block_pool.get_cached_block(b"hash", [0, 1]) is not None
+    assert other.find_longest_cache_hit_per_group([_hash(0), _hash(1)], 32) == (
+        ([31, 32], [41]),
+        (32, 16),
+    )
+
+    scheduler.shutdown()
+
+    assert coordinator.find_longest_cache_hit_per_group([_hash(0), _hash(1)], 32) == (
+        ([11, 12], [21]),
+        (32, 16),
+    )
 
 
 def test_hma_accepts_different_allocator_block_counts():

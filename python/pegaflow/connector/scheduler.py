@@ -20,6 +20,10 @@ from pegaflow.connector.common import (
     reconcile_hybrid_hit,
 )
 from pegaflow.connector.connector_metrics import PrefetchTracker
+from pegaflow.connector.hma_local_cache import (
+    disable_reconciled_hma_local_hits,
+    enable_reconciled_hma_local_hits,
+)
 from pegaflow.connector.tp_shards import ShardedQueryReady, TpShardQueryClient
 from pegaflow.pegaflow import EngineRpcClient
 
@@ -122,6 +126,7 @@ class SchedulerConnector:
         if self._cache_groups.has_recurrent_state and (pd_tail_save or pd_tail_load):
             raise ValueError("P/D tail-block caching is not supported with HMA")
         self._get_local_cached_blocks = None
+        self._hma_local_cache_pool = None
 
         # P/D tail-block extension (`pegaflow.pd_tail_save`): vLLM only hashes
         # full blocks, so a prompt's partial tail block never enters the tier
@@ -195,17 +200,18 @@ class SchedulerConnector:
         self._held_requests: set[str] = set()
 
     def bind_gpu_block_pool(self, gpu_block_pool) -> None:
+        if self._hma_local_cache_pool is not None:
+            if self._hma_local_cache_pool is not gpu_block_pool:
+                raise RuntimeError("scheduler cannot bind multiple GPU block pools")
+            return
+
         self._get_local_cached_blocks = gpu_block_pool.get_cached_block
         if self._cache_groups.group_count <= 1:
             return
 
-        # vLLM can cache an async-loaded dense group and expose it to a sibling
-        # before the sparse group has a usable state. PegaFlow is the sole HMA
-        # prefix index until vLLM exposes an atomic all-group cache hook.
-        def no_local_hma_prefix_hit(*_args, **_kwargs) -> None:
-            return None
-
-        gpu_block_pool.get_cached_block = no_local_hma_prefix_hit
+        enable_reconciled_hma_local_hits(gpu_block_pool)
+        self._hma_local_cache_pool = gpu_block_pool
+        logger.info("[PegaKVConnector] enabled reconciled HMA local prefix hits")
 
     def get_num_new_matched_tokens(
         self,
@@ -1106,8 +1112,13 @@ class SchedulerConnector:
         return stats
 
     def shutdown(self) -> None:
-        for req_id in list(self._pending_query_probes):
-            self._release_pending_query_probe(req_id)
+        try:
+            for req_id in list(self._pending_query_probes):
+                self._release_pending_query_probe(req_id)
+        finally:
+            if self._hma_local_cache_pool is not None:
+                disable_reconciled_hma_local_hits(self._hma_local_cache_pool)
+                self._hma_local_cache_pool = None
 
     def _release_pending_query_probe(self, req_id: str) -> bool:
         probe = self._pending_query_probes.pop(req_id, None)

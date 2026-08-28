@@ -182,6 +182,16 @@ def _install_vllm_stubs() -> None:
     kv_cache_interface.MambaSpec = MambaSpec
     kv_cache_interface.SlidingWindowSpec = SlidingWindowSpec
     kv_cache_interface.UniformTypeKVCacheSpecs = UniformTypeKVCacheSpecs
+    kv_cache_coordinator = _ensure_module("vllm.v1.core.kv_cache_coordinator")
+
+    class HybridKVCacheCoordinator:
+        def find_longest_cache_hit_per_group(self, block_hashes, max_cache_hit_length):
+            return self.per_group_result
+
+        def find_longest_cache_hit(self, block_hashes, max_cache_hit_length):
+            return self.reconciled_result
+
+    kv_cache_coordinator.HybridKVCacheCoordinator = HybridKVCacheCoordinator
     _ensure_module("vllm.v1.metrics")
     _ensure_module("vllm.v1.metrics.utils").create_metric_per_engine = lambda *_args, **_kwargs: {}
 
