@@ -60,7 +60,16 @@ def _make_ctx(
     return ConnectorContext(**defaults)  # type: ignore[arg-type]
 
 
-def _make_recurrent_scheduler() -> SchedulerConnector:
+def _make_recurrent_scheduler(committed_recurrent: frozenset[int] | None = None):
+    """Two-group HMA scheduler over a 2-block request.
+
+    ``committed_recurrent`` is the set of hash indices whose *recurrent* block
+    vLLM has committed to its prefix cache. In align mode that is only the
+    boundaries where a scheduler step ended, not every full block, so the
+    lookup must be group-aware. Defaults to both blocks.
+    """
+    if committed_recurrent is None:
+        committed_recurrent = frozenset({0, 1})
     scheduler = SchedulerConnector(_make_ctx())
     scheduler._cache_groups = SimpleNamespace(
         group_count=2,
@@ -72,43 +81,38 @@ def _make_recurrent_scheduler() -> SchedulerConnector:
     scheduler._allocated_blocks["r1"] = [[11, 12], [21, 22]]
     scheduler._block_index_offsets["r1"] = 0
     scheduler._next_stored_block_idx["r1"] = 0
-    blocks = {
-        _hash(0): [SimpleNamespace(block_id=11), SimpleNamespace(block_id=21)],
-        _hash(1): [SimpleNamespace(block_id=12), SimpleNamespace(block_id=22)],
-    }
-    scheduler._get_local_cached_blocks = lambda block_hash, _group_ids: blocks.get(block_hash)
+    attention_ids = {_hash(0): 11, _hash(1): 12}
+    recurrent_ids = {_hash(0): 21, _hash(1): 22}
+    hash_index = {_hash(0): 0, _hash(1): 1}
+
+    def get_cached(block_hash, group_ids):
+        if block_hash not in hash_index:
+            return None
+        blocks = []
+        for group_id in group_ids:
+            if group_id == 1:
+                if hash_index[block_hash] not in committed_recurrent:
+                    return None
+                blocks.append(SimpleNamespace(block_id=recurrent_ids[block_hash]))
+            else:
+                blocks.append(SimpleNamespace(block_id=attention_ids[block_hash]))
+        return blocks
+
+    scheduler._get_local_cached_blocks = get_cached
     return scheduler
 
 
-def test_recurrent_save_uses_committed_local_hma_mapping():
+def test_recurrent_mid_request_saves_are_skipped():
     scheduler = _make_recurrent_scheduler()
 
-    first = scheduler._consume_full_block_saves("r1", written=23, computed_before_step=16)
-    second = scheduler._consume_full_block_saves("r1", written=39, computed_before_step=32)
-
-    assert first == SaveIntent(
-        block_ids_by_group=((11,), (21,)),
-        block_hashes=(_hash(0),),
-    )
-    assert second == SaveIntent(
-        block_ids_by_group=((12,), (22,)),
-        block_hashes=(_hash(1),),
-    )
-
-
-def test_recurrent_save_waits_until_vllm_commits_all_groups():
-    scheduler = _make_recurrent_scheduler()
-    scheduler._get_local_cached_blocks = lambda _block_hash, _group_ids: None
-
-    assert scheduler._consume_full_block_saves("r1", written=23, computed_before_step=16) is None
+    assert scheduler._consume_full_block_saves("r1") is None
     assert scheduler._next_stored_block_idx["r1"] == 0
 
 
-def test_recurrent_final_step_uses_finished_block_table():
+def test_recurrent_final_step_resolves_checkpoint_from_committed_cache():
     scheduler = _make_recurrent_scheduler()
-    scheduler._get_local_cached_blocks = lambda _block_hash, _group_ids: None
 
-    assert scheduler._consume_full_block_saves("r1", written=32, computed_before_step=0) is None
+    assert scheduler._consume_full_block_saves("r1") is None
     request = SimpleNamespace(
         request_id="r1",
         num_computed_tokens=32,
@@ -139,6 +143,8 @@ def test_recurrent_final_step_uses_finished_block_table():
             preempted_req_ids=set(),
         )
     )
+    # Attention ids come from the finished block table; the recurrent id is the
+    # boundary state vLLM committed under hash[1], NOT block_ids[1][2].
     assert metadata.ready_save_intents["r1"] == SaveIntent(
         block_ids_by_group=((11, 12), (0, 22)),
         block_hashes=(_hash(0), _hash(1)),
@@ -148,28 +154,6 @@ def test_recurrent_final_step_uses_finished_block_table():
     scheduler.update_connector_output(SimpleNamespace(finished_sending={"r1"}))
     assert "r1" not in scheduler._block_hashes
     assert "r1" not in scheduler._held_requests
-
-
-def test_recurrent_save_does_not_predict_current_step_state():
-    scheduler = _make_recurrent_scheduler()
-
-    assert scheduler._consume_full_block_saves("r1", written=16, computed_before_step=0) is None
-    assert scheduler._next_stored_block_idx["r1"] == 0
-
-
-def test_recurrent_save_preserves_vllm_null_block_for_worker_filtering():
-    scheduler = _make_recurrent_scheduler()
-    scheduler._get_local_cached_blocks = lambda _block_hash, _group_ids: [
-        SimpleNamespace(block_id=11),
-        SimpleNamespace(block_id=0),
-    ]
-
-    intent = scheduler._consume_full_block_saves("r1", written=23, computed_before_step=16)
-
-    assert intent == SaveIntent(
-        block_ids_by_group=((11,), (0,)),
-        block_hashes=(_hash(0),),
-    )
 
 
 def test_hma_binding_disables_local_prefix_lookup_before_scheduling():

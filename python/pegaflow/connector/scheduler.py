@@ -521,11 +521,7 @@ class SchedulerConnector:
             # is reset on preemption — no connector-side bookkeeping can be
             # trusted across a preempt/resume cycle).
             written = req.num_computed_tokens + num_tokens
-            if save_intent := self._consume_save_intent(
-                req_id,
-                written,
-                req.num_computed_tokens,
-            ):
+            if save_intent := self._consume_save_intent(req_id, written):
                 potential_saves[req_id] = save_intent
 
         # Process cached (running) requests
@@ -568,11 +564,7 @@ class SchedulerConnector:
                 )
 
             written = cached_reqs.num_computed_tokens[idx] + num_tokens
-            if save_intent := self._consume_save_intent(
-                req_id,
-                written,
-                cached_reqs.num_computed_tokens[idx],
-            ):
+            if save_intent := self._consume_save_intent(req_id, written):
                 potential_saves[req_id] = save_intent
 
         save_intents = potential_saves
@@ -597,14 +589,15 @@ class SchedulerConnector:
         self,
         req_id: str,
         written: int,
-        computed_before_step: int = 0,
     ) -> SaveIntent | None:
         """Calculate and return SaveIntent for new blocks that need saving.
 
         `written` = positions with valid KV once this step's schedule runs
         (scheduler-authoritative num_computed_tokens + this step's tokens).
+        Hybrid (HMA) requests skip mid-flight saves; their checkpoint is
+        emitted from `request_finished` instead.
         """
-        regular = self._consume_full_block_saves(req_id, written, computed_before_step)
+        regular = self._consume_full_block_saves(req_id)
         tail = self._consume_tail_save(req_id, written)
         if tail is None:
             return regular
@@ -705,12 +698,14 @@ class SchedulerConnector:
             return query_hashes, 0
         return query_hashes + (tail[0],), tail[1]
 
-    def _consume_full_block_saves(
-        self,
-        req_id: str,
-        written: int,
-        computed_before_step: int | None = None,
-    ) -> SaveIntent | None:
+    def _consume_full_block_saves(self, req_id: str) -> SaveIntent | None:
+        # Hybrid models store one recurrent checkpoint, at request_finished.
+        # Align-mode mamba tables are mostly null blocks, so a mid-request
+        # all-group lookup either misses (and stalls attention saves) or,
+        # when chunk_size == block_size, dumps a linear state every step.
+        if self._cache_groups.has_recurrent_state:
+            return None
+
         # block_hashes are at virtual_block_size granularity, 1-to-1 with block_ids.
         block_hashes = self._block_hashes.get(req_id)
         if block_hashes is None:
@@ -725,33 +720,20 @@ class SchedulerConnector:
         # In external-hit cases, the prefix-loaded block IDs are still present at
         # the front, so save intents must slice by global block index rather than
         # rebasing to a local-only view.
-        if self._cache_groups.has_recurrent_state:
-            if computed_before_step is None:
-                computed_before_step = written
-            saveable_block_idx = min(
-                len(block_hashes),
-                computed_before_step // self._ctx.virtual_block_size,
-            )
-        else:
-            local_saveable = min(
-                min((len(group) for group in allocated), default=0),
-                scheduled // self._ctx.virtual_block_size,
-            )
-            saveable_block_idx = min(len(block_hashes), base_block_idx + local_saveable)
+        local_saveable = min(
+            min((len(group) for group in allocated), default=0),
+            scheduled // self._ctx.virtual_block_size,
+        )
+        saveable_block_idx = min(len(block_hashes), base_block_idx + local_saveable)
         new_blocks = saveable_block_idx - start_block_idx
         if new_blocks <= 0:
             return None
 
         hash_start = start_block_idx
         save_hashes = block_hashes[hash_start : hash_start + new_blocks]
-        if self._cache_groups.has_recurrent_state:
-            save_block_ids_by_group = self._local_cached_block_ids(save_hashes)
-            if save_block_ids_by_group is None:
-                return None
-        else:
-            save_block_ids_by_group = tuple(
-                tuple(group[hash_start : hash_start + new_blocks]) for group in allocated
-            )
+        save_block_ids_by_group = tuple(
+            tuple(group[hash_start : hash_start + new_blocks]) for group in allocated
+        )
         self._next_stored_block_idx[req_id] = saveable_block_idx
 
         logger.debug(
@@ -771,22 +753,35 @@ class SchedulerConnector:
             block_hashes=save_hashes,
         )
 
-    def _local_cached_block_ids(
+    def _cached_recurrent_checkpoint(
         self,
         block_hashes: tuple[bytes, ...],
-    ) -> tuple[tuple[int, ...], ...] | None:
+        lower: int,
+        upper: int,
+    ) -> tuple[int, tuple[int, ...]] | None:
+        """Newest recurrent state vLLM committed under a hash in [lower, upper).
+
+        Returns ``(hash_index, block_id_per_recurrent_group)``, or None when no
+        boundary in the window was committed.
+
+        Only a *cached* block is guaranteed to still hold the state its hash
+        names. In align mode the live block table's real entry is the running
+        state for the current (typically mid-block) token count, which is not
+        the boundary state ``hash[j]`` claims — saving that would fold the tail
+        tokens into the state twice on resume. vLLM commits a recurrent block
+        under ``hash[j]`` only when a scheduler step ended at exactly
+        ``(j + 1) * virtual_block_size`` computed tokens, which is precisely
+        this connector's checkpoint convention.
+        """
         if self._get_local_cached_blocks is None:
             raise RuntimeError("HMA block pool was not bound before building save metadata")
 
-        group_ids = list(range(self._cache_groups.group_count))
-        block_ids_by_group = [[] for _ in group_ids]
-        for block_hash in block_hashes:
-            cached_blocks = self._get_local_cached_blocks(block_hash, group_ids)
-            if cached_blocks is None:
-                return None
-            for block_ids, block in zip(block_ids_by_group, cached_blocks, strict=True):
-                block_ids.append(block.block_id)
-        return tuple(tuple(block_ids) for block_ids in block_ids_by_group)
+        recurrent_group_ids = sorted(self._cache_groups.recurrent_group_indices)
+        for hash_index in range(upper - 1, lower - 1, -1):
+            cached = self._get_local_cached_blocks(block_hashes[hash_index], recurrent_group_ids)
+            if cached is not None:
+                return hash_index, tuple(block.block_id for block in cached)
+        return None
 
     def _consume_finished_hma_save(
         self,
@@ -794,6 +789,13 @@ class SchedulerConnector:
         block_ids: tuple[list[int], ...],
         written: int,
     ) -> SaveIntent | None:
+        """Final hybrid save: attention pages plus one recurrent checkpoint.
+
+        Attention block ids come from the finished block table; the recurrent
+        checkpoint is resolved through vLLM's committed prefix cache (see
+        `_cached_recurrent_checkpoint`). Recurrent groups carry block id 0
+        (vLLM's null block) on every other row, which the worker filters out.
+        """
         block_hashes = self._block_hashes.get(req_id)
         if block_hashes is None:
             return None
@@ -806,27 +808,56 @@ class SchedulerConnector:
             return None
 
         groups = self._copy_block_ids_by_group(block_ids)
+        recurrent = self._cache_groups.recurrent_group_indices
+        # Only attention groups are indexed by hash position. Recurrent groups
+        # are addressed through the cache lookup below, and in align mode their
+        # table holds a handful of live entries regardless of sequence length.
         available = tuple(len(group) for group in groups)
-        required = tuple(
-            saveable_block_idx + 1
-            if group_index in self._cache_groups.recurrent_group_indices
-            else saveable_block_idx
-            for group_index in range(self._cache_groups.group_count)
-        )
-        if any(length < minimum for length, minimum in zip(available, required, strict=True)):
-            raise RuntimeError(
-                f"req {req_id} final HMA block table is shorter than its hash prefix: "
-                f"saveable={saveable_block_idx} available_by_group={available} "
-                f"required_by_group={required}"
-            )
+        for group_index, length in enumerate(available):
+            if group_index not in recurrent and length < saveable_block_idx:
+                raise RuntimeError(
+                    f"req {req_id} final HMA attention block table is shorter than its "
+                    f"hash prefix: saveable={saveable_block_idx} "
+                    f"available_by_group={available}"
+                )
 
         num_new_blocks = saveable_block_idx - start_block_idx
+        checkpoint = self._cached_recurrent_checkpoint(
+            block_hashes, start_block_idx, saveable_block_idx
+        )
+        if checkpoint is None:
+            # No block boundary was committed inside the range this request
+            # computed, so it contributes no new resume point. Expected when a
+            # request advances less than one block; otherwise worth surfacing.
+            if num_new_blocks > 1:
+                logger.warning(
+                    "[PegaKVConnector] req=%s no recurrent checkpoint committed in "
+                    "blocks [%d,%d); saving attention pages only",
+                    req_id,
+                    start_block_idx,
+                    saveable_block_idx,
+                )
+            checkpoint_hash_idx, checkpoint_block_ids = -1, ()
+        else:
+            checkpoint_hash_idx, checkpoint_block_ids = checkpoint
+            logger.info(
+                "[PegaKVConnector] req=%s hma_checkpoint: hash_idx=%d tokens=%d "
+                "attention_blocks=%d",
+                req_id,
+                checkpoint_hash_idx,
+                (checkpoint_hash_idx + 1) * self._ctx.virtual_block_size,
+                num_new_blocks,
+            )
+
+        recurrent_order = sorted(recurrent)
         save_block_ids_by_group = []
         for group_index, group in enumerate(groups):
-            if group_index in self._cache_groups.recurrent_group_indices:
-                save_block_ids_by_group.append(
-                    (0,) * (num_new_blocks - 1) + (group[saveable_block_idx],)
-                )
+            if group_index in recurrent:
+                row = [0] * num_new_blocks
+                if checkpoint_hash_idx >= 0:
+                    slot = recurrent_order.index(group_index)
+                    row[checkpoint_hash_idx - start_block_idx] = checkpoint_block_ids[slot]
+                save_block_ids_by_group.append(tuple(row))
             else:
                 save_block_ids_by_group.append(group[start_block_idx:saveable_block_idx])
 
