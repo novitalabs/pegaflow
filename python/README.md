@@ -143,6 +143,32 @@ TP sharding currently requires equal contiguous shards and TP-only parallelism.
 Pipeline, decode-context, and prefill-context parallelism are rejected when
 more than one endpoint is configured.
 
+#### Connector-owned Recurrent GPU Cache
+
+For hybrid Mamba/recurrent models, set `pegaflow.num_linear_state_cache_slots`
+to a positive integer to keep recurrent checkpoints in a connector-owned GPU
+LRU while attention KV continues to query, load, and save through PegaFlow. The
+default value `0` keeps the remote recurrent-state behavior.
+
+A slot is a compound checkpoint: it contains one padded recurrent page for
+every recurrent layer and cache group at the same committed token boundary.
+Each worker allocates a separate `uint8` pool for each recurrent layer. This
+memory is outside vLLM's KV-cache planner, so the additional GPU memory per
+worker is exactly:
+
+```text
+num_linear_state_cache_slots * compound_page_bytes
+```
+
+where `compound_page_bytes` is the sum of `MambaSpec.page_size_bytes` over all
+recurrent layers. Pool allocation fails explicitly on CUDA OOM.
+
+Connector-owned recurrent caching currently supports TP-only deployments:
+pipeline parallel size must be 1, world size must equal TP size, and DCP/PCP
+sizes must both be 1. Different positive slot counts may share the same enabled
+PegaFlow namespace because slots do not change the server-side attention
+layout; enabled and disabled modes use separate namespaces.
+
 #### P/D Partial Tail Blocks
 
 vLLM normally exposes hashes only for complete KV blocks. In a P/D deployment,

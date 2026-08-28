@@ -15,8 +15,12 @@ import torch
 from pegaflow.connector.common import (
     CacheGroupLayout,
     ConnectorContext,
+    LocalRecurrentLoad,
+    LocalRecurrentSave,
+    LocalSaveRef,
     PegaConnectorMetadata,
     PegaKVConnectorStats,
+    PegaWorkerMetadata,
     SaveIntent,
     logger,
     parse_env_int,
@@ -60,6 +64,32 @@ class _KVCacheRegistrationInfo:
     kv_stride_bytes: int
     segments: int
     physical_blocks_per_logical_block: int
+
+
+@dataclass
+class _LocalRecurrentLayer:
+    group_index: int
+    pages: torch.Tensor
+    pool: torch.Tensor
+    generations: list[int]
+
+
+def _raw_page_view(tensor: torch.Tensor, page_size_bytes: int) -> torch.Tensor:
+    """Expose a block-first tensor allocation as ``[num_blocks, page_bytes]``."""
+    registration_tensor = _registration_tensor(tensor)
+    actual_page_bytes = registration_tensor.stride(0) * registration_tensor.element_size()
+    if actual_page_bytes != page_size_bytes:
+        raise RuntimeError(
+            "recurrent-state page stride does not match MambaSpec.page_size_bytes: "
+            f"actual={actual_page_bytes} declared={page_size_bytes}"
+        )
+    pages = torch.empty(0, dtype=torch.uint8, device=registration_tensor.device)
+    return pages.set_(
+        registration_tensor.untyped_storage(),
+        registration_tensor.storage_offset() * registration_tensor.element_size(),
+        (registration_tensor.shape[0], page_size_bytes),
+        (page_size_bytes, 1),
+    )
 
 
 def _infer_kv_cache_registration(
@@ -211,6 +241,8 @@ class WorkerConnector:
         self._completed_saves: set[str] = set()
         self._save_completion_lock = threading.Lock()
         self._save_completion_events: dict[str, threading.Event] = {}
+        self._worker_meta = PegaWorkerMetadata()
+        self._worker_meta_lock = threading.Lock()
         self._current_metadata: PegaConnectorMetadata | None = None
 
         self._pending_loads: dict[str, PyLoadState] = {}
@@ -218,6 +250,8 @@ class WorkerConnector:
         self._pending_load_meta: dict[
             str, tuple[float, int, list[int]]
         ] = {}  # shm_name -> (start_time, num_blocks, block_ids)
+        self._pending_local_load_events: dict[str, torch.cuda.Event] = {}
+        self._remote_load_completed: set[str] = set()
         self._load_completion_lock = threading.Lock()
 
         # Failure surface for vLLM's get_block_ids_with_load_errors / get_finished.
@@ -228,6 +262,7 @@ class WorkerConnector:
         self._failed_load_reqs: set[str] = set()
 
         self._registered_layers: list[str] = []
+        self._local_recurrent_layers: dict[str, _LocalRecurrentLayer] = {}
         # Page-first storage: all layers of a block in one host page, one slot
         # per tp_rank. Saves distribute by block stripe instead of by layer.
         self._page_first: bool = False
@@ -243,9 +278,15 @@ class WorkerConnector:
         self._stats_lock = threading.Lock()
 
     def shutdown(self) -> None:
-        self.unregister_context()
         self._save_queue.put(None)
         self._save_thread.join()
+        if self._pending_local_load_events:
+            torch.cuda.synchronize(self._torch_device)
+            self._pending_local_load_events.clear()
+        with self._worker_meta_lock:
+            self._worker_meta = PegaWorkerMetadata()
+        self.unregister_context()
+        self._local_recurrent_layers.clear()
 
     def unregister_context(self) -> None:
         if not self._registered_layers:
@@ -319,6 +360,9 @@ class WorkerConnector:
         split_layer_count = 0
         split_blocks_per_logical = 1
         split_logical_blocks = 0
+        local_mode = bool(self._ctx.num_linear_state_cache_slots)
+        local_slots = self._ctx.num_linear_state_cache_slots
+        groups = tuple(getattr(self._kv_cache_config, "kv_cache_groups", ()) or ())
 
         for layer_name, kv_cache in kv_caches.items():
             is_recurrent_state = (
@@ -329,6 +373,31 @@ class WorkerConnector:
             assert registration_tensor.storage_offset() == 0, (
                 f"KV cache for {layer_name} must have zero storage offset"
             )
+            if local_mode and is_recurrent_state:
+                group_index = self._layer_to_group[layer_name]
+                page_size_bytes = int(groups[group_index].kv_cache_spec.page_size_bytes)
+                pages = _raw_page_view(kv_cache, page_size_bytes)
+                try:
+                    pool = torch.empty(
+                        (local_slots, page_size_bytes),
+                        dtype=torch.uint8,
+                        device=registration_tensor.device,
+                    )
+                except torch.OutOfMemoryError as exc:
+                    self._local_recurrent_layers.clear()
+                    torch.cuda.empty_cache()
+                    raise RuntimeError(
+                        "failed to allocate connector-owned linear-state GPU pool; "
+                        "pegaflow.num_linear_state_cache_slots consumes additional "
+                        "memory outside vLLM KV-cache planning"
+                    ) from exc
+                self._local_recurrent_layers[layer_name] = _LocalRecurrentLayer(
+                    group_index=group_index,
+                    pages=pages,
+                    pool=pool,
+                    generations=[0] * local_slots,
+                )
+                continue
 
             wrapper = CudaIPCWrapper(registration_tensor)
             wrapper_bytes = pickle.dumps(wrapper)
@@ -516,8 +585,18 @@ class WorkerConnector:
                 completed_reqs.update(self._failed_load_reqs)
                 self._failed_load_reqs = set()
 
-            if completed_reqs:
-                finished_recving = completed_reqs
+            self._remote_load_completed.update(completed_reqs)
+            jointly_completed = {
+                req_id
+                for req_id in self._remote_load_completed
+                if req_id not in self._pending_local_load_events
+                or self._pending_local_load_events[req_id].query()
+            }
+            for req_id in jointly_completed:
+                self._pending_local_load_events.pop(req_id, None)
+            self._remote_load_completed -= jointly_completed
+            if jointly_completed:
+                finished_recving = jointly_completed
 
         if timeout_triggered:
             self._ctx.state_manager.mark_unavailable("load timeout")
@@ -570,6 +649,8 @@ class WorkerConnector:
         request_ids: list[str] = []
 
         for req_id, load_intent in metadata.load_intents.items():
+            if load_intent.local_recurrent is not None:
+                self._start_local_recurrent_load(req_id, load_intent.local_recurrent)
             if len(load_intent.leases) != self._ctx.tp_shard_count:
                 raise RuntimeError(
                     f"load intent has {len(load_intent.leases)} TP shard leases; "
@@ -709,6 +790,51 @@ class WorkerConnector:
             shm_name,
         )
 
+    def _start_local_recurrent_load(self, req_id: str, intent: LocalRecurrentLoad) -> None:
+        if not self._local_recurrent_layers:
+            raise RuntimeError("local recurrent load requested before GPU pool registration")
+        destinations = dict(intent.destination_block_ids)
+        for layer_name, layer in self._local_recurrent_layers.items():
+            ref = intent.source
+            if ref.slot < 0 or ref.slot >= layer.pool.shape[0]:
+                raise RuntimeError(f"req {req_id}: local recurrent slot {ref.slot} is out of range")
+            if layer.generations[ref.slot] != ref.generation:
+                raise RuntimeError(
+                    f"req {req_id}: stale local recurrent slot {ref.slot}/{ref.generation} "
+                    f"for layer {layer_name}; worker has generation {layer.generations[ref.slot]}"
+                )
+            destination = destinations.get(layer.group_index)
+            if destination is None or destination < 0 or destination >= layer.pages.shape[0]:
+                raise RuntimeError(
+                    f"req {req_id}: recurrent destination {destination} is out of range "
+                    f"for layer {layer_name}"
+                )
+            layer.pages[destination].copy_(layer.pool[ref.slot], non_blocking=True)
+        event = torch.cuda.Event()
+        event.record()
+        self._pending_local_load_events[req_id] = event
+
+    def _save_local_recurrent(self, save: LocalRecurrentSave) -> None:
+        if not self._local_recurrent_layers:
+            raise RuntimeError("local recurrent save requested before GPU pool registration")
+        sources = dict(save.source_block_ids)
+        for layer_name, layer in self._local_recurrent_layers.items():
+            ref = save.target
+            if ref.slot < 0 or ref.slot >= layer.pool.shape[0]:
+                raise RuntimeError(f"local recurrent slot {ref.slot} is out of range")
+            if ref.generation <= layer.generations[ref.slot]:
+                raise RuntimeError(
+                    f"stale local recurrent save {ref.slot}/{ref.generation} for layer "
+                    f"{layer_name}; worker has generation {layer.generations[ref.slot]}"
+                )
+            source = sources.get(layer.group_index)
+            if source is None or source < 0 or source >= layer.pages.shape[0]:
+                raise RuntimeError(
+                    f"recurrent source {source} is out of range for layer {layer_name}"
+                )
+            layer.pool[ref.slot].copy_(layer.pages[source], non_blocking=True)
+            layer.generations[ref.slot] = ref.generation
+
     def wait_for_layer_load(self, layer_name: str) -> None:
         pass
 
@@ -824,23 +950,36 @@ class WorkerConnector:
         logger.debug("[PegaKVConnector] Save worker thread stopped")
 
     def _process_save_batch(self, batch: list[SaveTask]) -> None:
+        request_ids = [req_id for task in batch for req_id in task.request_ids]
+        local_refs = [
+            LocalSaveRef.from_save(req_id, save)
+            for task in batch
+            for req_id, intent in task.metadata.save_intents.items()
+            for save in intent.local_recurrent_saves
+        ]
+        try:
+            self._process_save_batch_inner(batch)
+        except Exception:
+            logger.exception("[PegaKVConnector] local/remote save batch failed")
+            self._record_local_save_results(failed=local_refs)
+        finally:
+            self._complete_save_requests(request_ids)
+
+    def _process_save_batch_inner(self, batch: list[SaveTask]) -> None:
         saves_by_layer: dict[str, tuple[list[int], list[bytes]]] = {}
-        all_request_ids: list[str] = []
+        local_saves: list[tuple[LocalSaveRef, LocalRecurrentSave]] = []
 
         for task in batch:
-            all_request_ids.extend(task.request_ids)
-
-            for save_intent in task.metadata.save_intents.values():
+            for req_id, save_intent in task.metadata.save_intents.items():
+                local_saves.extend(
+                    (LocalSaveRef.from_save(req_id, save), save)
+                    for save in save_intent.local_recurrent_saves
+                )
                 if not any(save_intent.block_ids_by_group):
                     continue
 
                 if self._cross_layer_mode:
                     target_layers = (self._cross_layer_key,)
-                elif self._page_first:
-                    assert self._registered_layers, (
-                        "KV caches must be registered before submitting save intents"
-                    )
-                    target_layers = tuple(self._registered_layers)
                 else:
                     assert self._registered_layers, (
                         "KV caches must be registered before submitting save intents"
@@ -869,30 +1008,27 @@ class WorkerConnector:
                     block_ids = tuple(block_id for block_id, _ in non_null)
                     block_hashes = tuple(block_hash for _, block_hash in non_null)
                     if self._page_first and not self._use_mla_layer_split_registration:
-                        # Full-replica (one shard): every rank holds all layers,
-                        # so spread the whole-page writes across ranks by block
-                        # stripe. Layer-split ranks are each the sole writer of
-                        # their shard and keep the full block set (no striping).
                         block_ids, block_hashes = self._block_shard(block_ids, block_hashes)
                     if not block_ids:
                         continue
                     if layer_name not in saves_by_layer:
                         saves_by_layer[layer_name] = ([], [])
-
                     saves_by_layer[layer_name][0].extend(block_ids)
                     saves_by_layer[layer_name][1].extend(block_hashes)
 
-        if saves_by_layer:
-            # Ensure all GPU kernels have completed before reading KV cache
-            # Otherwise we may copy uninitialized memory (attention kernel is async)
+        if saves_by_layer or local_saves:
             torch.cuda.synchronize(self._torch_device)
+        for _ref, save in local_saves:
+            self._save_local_recurrent(save)
+        if local_saves:
+            torch.cuda.synchronize(self._torch_device)
+            self._record_local_save_results(succeeded=[ref for ref, _save in local_saves])
 
+        if saves_by_layer:
             saves_list = [(name, ids, hashes) for name, (ids, hashes) in saves_by_layer.items()]
             total_blocks = sum(len(ids) for _, ids, _ in saves_list)
-
             save_start = time.perf_counter()
             success = False
-
             try:
                 ok, message = self._ctx.engine_client.save(
                     self._ctx.instance_id,
@@ -901,7 +1037,6 @@ class WorkerConnector:
                     self._ctx.device_id,
                     saves_list,
                 )
-
                 if not ok:
                     logger.error(
                         "[PegaKVConnector] Save batch failed: %s (continuing without save)",
@@ -919,14 +1054,29 @@ class WorkerConnector:
                     "[PegaKVConnector] Save RPC exception: %s (continuing without save)",
                     e,
                 )
-
             save_duration = time.perf_counter() - save_start
-
             with self._stats_lock:
                 self._stats.record_save(save_duration, total_blocks, success)
 
-        # Always complete the request save lifecycle, even if save failed.
-        self._complete_save_requests(all_request_ids)
+    def _record_local_save_results(
+        self,
+        *,
+        succeeded: Iterable[LocalSaveRef] = (),
+        failed: Iterable[LocalSaveRef] = (),
+    ) -> None:
+        with self._worker_meta_lock:
+            for ref in succeeded:
+                self._worker_meta.succeeded[ref] = 1
+            for ref in failed:
+                self._worker_meta.failed[ref] = 1
+
+    def build_connector_worker_meta(self) -> PegaWorkerMetadata | None:
+        with self._worker_meta_lock:
+            if not self._worker_meta.succeeded and not self._worker_meta.failed:
+                return None
+            metadata = self._worker_meta
+            self._worker_meta = PegaWorkerMetadata()
+            return metadata
 
     def _complete_save_requests(self, request_ids: list[str]) -> None:
         completed_reqs: list[str] = []

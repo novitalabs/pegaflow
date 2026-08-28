@@ -38,6 +38,7 @@ from .unit_stubs import install_connector_unit_stubs
 install_connector_unit_stubs()
 
 from pegaflow.connector.common import ConnectorContext  # noqa: E402
+from pegaflow.connector.linear_state_cache import LinearStateCache  # noqa: E402
 from pegaflow.connector.scheduler import SchedulerConnector  # noqa: E402
 
 VBS = 16
@@ -60,7 +61,13 @@ def _recurrent_table(written: int, num_speculative_blocks: int) -> list[int]:
     return table
 
 
-def _make_scheduler(num_hashes: int, committed_boundary: int | None):
+def _make_scheduler(
+    num_hashes: int,
+    committed_boundary: int | None,
+    *,
+    local_slots: int = 0,
+    num_speculative_blocks: int = 0,
+):
     """Scheduler whose prefix cache has committed `committed_boundary`.
 
     `committed_boundary` is a hash index; vLLM commits a recurrent block there
@@ -76,6 +83,7 @@ def _make_scheduler(num_hashes: int, committed_boundary: int | None):
         device_id=0,
         engine_client=MagicMock(),
         state_manager=MagicMock(),
+        num_linear_state_cache_slots=local_slots,
     )
     scheduler = SchedulerConnector(ctx)
     scheduler._cache_groups = SimpleNamespace(
@@ -83,7 +91,13 @@ def _make_scheduler(num_hashes: int, committed_boundary: int | None):
         hash_group_index=0,
         has_recurrent_state=True,
         recurrent_group_indices=frozenset({1}),
+        recurrent_num_speculative_blocks_by_group=(0, num_speculative_blocks),
+        recurrent_running_state_index=lambda group_index, table_length: (
+            table_length - 1 - (0, num_speculative_blocks)[group_index]
+        ),
     )
+    if local_slots:
+        scheduler._linear_state_cache = LinearStateCache(local_slots)
     scheduler._block_hashes["r1"] = tuple(_hash(i) for i in range(num_hashes))
     scheduler._block_index_offsets["r1"] = 0
     scheduler._next_stored_block_idx["r1"] = 0
@@ -221,3 +235,96 @@ def test_finished_save_after_prefix_only_files_the_new_boundary():
     assert intent is not None
     assert intent.block_hashes == (_hash(1),)
     assert intent.block_ids_by_group[1] == (555,)
+
+
+@pytest.mark.parametrize(
+    ("written", "num_speculative_blocks"),
+    [
+        pytest.param(645, 0, id="mid_block_spec0"),
+        pytest.param(645, 1, id="mid_block_spec1"),
+        pytest.param(645, 2, id="mid_block_spec2"),
+        pytest.param(640, 0, id="aligned_spec0"),
+        pytest.param(640, 1, id="aligned_spec1"),
+        pytest.param(640, 2, id="aligned_spec2"),
+    ],
+)
+def test_local_mode_wraps_only_committed_checkpoint(written: int, num_speculative_blocks: int):
+    num_hashes = _cdiv(written, VBS)
+    boundary = written // VBS - 1
+    scheduler = _make_scheduler(
+        num_hashes,
+        boundary,
+        local_slots=2,
+        num_speculative_blocks=num_speculative_blocks,
+    )
+    attention = list(range(100, 100 + num_hashes + num_speculative_blocks))
+
+    raw = scheduler._consume_finished_hma_save(
+        "r1", (attention, _recurrent_table(written, num_speculative_blocks)), written
+    )
+    assert raw is not None
+    intent = scheduler._wrap_local_recurrent_save("r1", raw)
+
+    assert intent.block_ids_by_group[0] == tuple(attention[: written // VBS])
+    assert set(intent.block_ids_by_group[1]) == {0}
+    assert len(intent.local_recurrent_saves) == 1
+    local_save = intent.local_recurrent_saves[0]
+    assert local_save.source_block_ids == ((1, 555),)
+    assert local_save.target.block_hash == _hash(boundary)
+    assert len(scheduler._pending_local_saves) == 1
+
+
+def test_local_mode_without_committed_boundary_saves_remote_attention_only():
+    written = 32
+    scheduler = _make_scheduler(2, None, local_slots=2)
+
+    raw = scheduler._consume_finished_hma_save(
+        "r1", ([100, 101], _recurrent_table(written, 1)), written
+    )
+    assert raw is not None
+    intent = scheduler._wrap_local_recurrent_save("r1", raw)
+
+    assert intent.block_ids_by_group == ((100, 101), (0, 0))
+    assert intent.local_recurrent_saves == ()
+    assert scheduler._pending_local_saves == {}
+
+
+def test_local_mode_already_stored_prefix_does_not_reserve():
+    scheduler = _make_scheduler(2, 1, local_slots=2)
+    scheduler._next_stored_block_idx["r1"] = 2
+
+    intent = scheduler._consume_finished_hma_save("r1", ([100, 101], _recurrent_table(32, 0)), 32)
+
+    assert intent is None
+    assert scheduler._pending_local_saves == {}
+
+
+def test_local_mode_external_hit_reserves_only_new_boundary():
+    scheduler = _make_scheduler(2, 1, local_slots=2, num_speculative_blocks=2)
+    scheduler._next_stored_block_idx["r1"] = 1
+    scheduler._block_index_offsets["r1"] = 1
+
+    raw = scheduler._consume_finished_hma_save("r1", ([100, 101], _recurrent_table(32, 2)), 32)
+    assert raw is not None
+    intent = scheduler._wrap_local_recurrent_save("r1", raw)
+
+    assert intent.block_hashes == (_hash(1),)
+    assert intent.block_ids_by_group == ((101,), (0,))
+    assert len(intent.local_recurrent_saves) == 1
+
+
+@pytest.mark.parametrize("num_speculative_blocks", [0, 1, 2])
+def test_recurrent_load_destination_is_forward_running_state_not_draft(
+    num_speculative_blocks: int,
+):
+    scheduler = _make_scheduler(
+        2,
+        1,
+        num_speculative_blocks=num_speculative_blocks,
+    )
+    table = _recurrent_table(32, num_speculative_blocks)
+
+    destination = scheduler._recurrent_load_destination(1, tuple(table))
+
+    assert destination == 9000 + 32
+    assert destination not in {7000 + i for i in range(num_speculative_blocks)}

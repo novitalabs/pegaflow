@@ -61,6 +61,8 @@ def _install_torch_stub() -> None:
     torch.dtype = object  # type: ignore[attr-defined]
     torch.device = lambda value: value  # type: ignore[attr-defined]
     torch.bfloat16 = "bfloat16"  # type: ignore[attr-defined]
+    torch.uint8 = "uint8"  # type: ignore[attr-defined]
+    torch.OutOfMemoryError = type("OutOfMemoryError", (RuntimeError,), {})  # type: ignore[attr-defined]
     sys.modules["torch"] = torch
 
 

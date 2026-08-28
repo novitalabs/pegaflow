@@ -5,13 +5,17 @@ Shared types and helpers for the PegaFlow vLLM connector.
 import hashlib
 import os
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorMetadata,
+    KVConnectorWorkerMetadata,
+)
 
 from pegaflow.connector.connector_metrics import PegaKVConnectorStats, PegaPromMetrics
+from pegaflow.connector.linear_state_cache import LinearStateSlot
 from pegaflow.logging_utils import get_connector_logger
 from pegaflow.pegaflow import EngineRpcClient
 
@@ -141,6 +145,7 @@ class ConnectorContext:
     mode: PegaConnectorMode = PegaConnectorMode.READ_WRITE
     wait_for_full_prefix: bool = False
     tp_shards: TpShardTopology | None = None
+    num_linear_state_cache_slots: int = 0
 
     @property
     def read_enabled(self) -> bool:
@@ -218,16 +223,63 @@ class ConnectorContext:
 
 
 @dataclass(frozen=True)
+class LocalRecurrentLoad:
+    """Worker-local recurrent load selected by the scheduler."""
+
+    source: LinearStateSlot
+    destination_block_ids: tuple[tuple[int, int], ...]
+
+
+@dataclass(frozen=True)
+class LocalRecurrentSave:
+    """Worker-local recurrent save reservation awaiting worker completion."""
+
+    target: LinearStateSlot
+    source_block_ids: tuple[tuple[int, int], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class LocalSaveRef:
+    """Exact cross-process identity for one local recurrent save transaction."""
+
+    req_id: str
+    slot: int
+    generation: int
+    block_hash: bytes
+
+    @classmethod
+    def from_save(cls, req_id: str, save: LocalRecurrentSave) -> "LocalSaveRef":
+        target = save.target
+        return cls(req_id, target.slot, target.generation, target.block_hash)
+
+
+@dataclass
+class PegaWorkerMetadata(KVConnectorWorkerMetadata):
+    """Per-worker local-save terminal states aggregated by exact transaction."""
+
+    succeeded: dict[LocalSaveRef, int] = field(default_factory=dict)
+    failed: dict[LocalSaveRef, int] = field(default_factory=dict)
+
+    def aggregate(self, other: KVConnectorWorkerMetadata) -> KVConnectorWorkerMetadata:
+        assert isinstance(other, PegaWorkerMetadata)
+        succeeded = dict(self.succeeded)
+        failed = dict(self.failed)
+        for ref, count in other.succeeded.items():
+            succeeded[ref] = succeeded.get(ref, 0) + count
+        for ref, count in other.failed.items():
+            failed[ref] = failed.get(ref, 0) + count
+        return PegaWorkerMetadata(succeeded=succeeded, failed=failed)
+
+
+@dataclass(frozen=True)
 class LoadIntent:
-    """Intent for a KV load operation."""
+    """Intent for remote KV and optional worker-local recurrent loads."""
 
     block_ids_by_group: tuple[tuple[int | None, ...], ...]
     leases: tuple[bytes, ...]
     num_tokens: int
-    # Hybrid-cache loads carry one membership lease per recurrent storage
-    # group (pinned checkpoints in hit-positions order) on top of the
-    # attention prefix leases. See RecurrentLoadHold.
     recurrent_hold: "RecurrentLoadHold | None" = None
+    local_recurrent: LocalRecurrentLoad | None = None
 
 
 @dataclass(frozen=True)
@@ -287,10 +339,11 @@ def reconcile_hybrid_hit(
 
 @dataclass(frozen=True)
 class SaveIntent:
-    """Intent for a KV save operation."""
+    """Intent for remote KV and optional worker-local recurrent saves."""
 
     block_ids_by_group: tuple[tuple[int, ...], ...]
     block_hashes: tuple[bytes, ...]
+    local_recurrent_saves: tuple[LocalRecurrentSave, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -308,6 +361,8 @@ class CacheGroupLayout:
     has_recurrent_state: bool
     recurrent_group_indices: frozenset[int]
     recurrent_layer_names: frozenset[str]
+    recurrent_page_sizes_by_group: tuple[int, ...] = ()
+    recurrent_num_speculative_blocks_by_group: tuple[int, ...] = ()
     storage_group_ids: tuple[int, ...] = (0,)
 
     @classmethod
@@ -394,6 +449,18 @@ class CacheGroupLayout:
             for index, group in enumerate(groups)
             if isinstance(group.kv_cache_spec, MambaSpec)
         )
+        recurrent_page_sizes_by_group = tuple(
+            int(getattr(group.kv_cache_spec, "page_size_bytes", 0)) * len(group.layer_names)
+            if index in recurrent_group_indices
+            else 0
+            for index, group in enumerate(groups)
+        )
+        recurrent_num_speculative_blocks_by_group = tuple(
+            int(getattr(group.kv_cache_spec, "num_speculative_blocks", 0))
+            if index in recurrent_group_indices
+            else 0
+            for index, group in enumerate(groups)
+        )
         # Attention-like groups all share storage group 0 (they advance in
         # per-block prefix cadence); each recurrent group gets a dense id
         # from 1. Engine keys are raw only for group 0, so this keeps every
@@ -416,12 +483,30 @@ class CacheGroupLayout:
                 if isinstance(group.kv_cache_spec, MambaSpec)
                 for layer_name in group.layer_names
             ),
+            recurrent_page_sizes_by_group=recurrent_page_sizes_by_group,
+            recurrent_num_speculative_blocks_by_group=(recurrent_num_speculative_blocks_by_group),
             storage_group_ids=storage_group_ids,
         )
 
     @property
     def group_count(self) -> int:
         return len(self.layer_names)
+
+    @property
+    def recurrent_compound_page_bytes(self) -> int:
+        return sum(self.recurrent_page_sizes_by_group)
+
+    def recurrent_running_state_index(self, group_index: int, table_length: int) -> int:
+        """Return vLLM align mode's forward running-state table column."""
+        speculative_blocks = self.recurrent_num_speculative_blocks_by_group[group_index]
+        state_index = table_length - 1 - speculative_blocks
+        if state_index < 0:
+            raise RuntimeError(
+                "recurrent block table has no running-state destination: "
+                f"group={group_index} length={table_length} "
+                f"speculative_blocks={speculative_blocks}"
+            )
+        return state_index
 
     def layer_to_group(self) -> dict[str, int]:
         result: dict[str, int] = {}
@@ -543,6 +628,12 @@ def derive_namespace(
     model_config = vllm_config.model_config
     cache_config = vllm_config.cache_config
     additional_config = getattr(vllm_config, "additional_config", None) or {}
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    local_linear_state = (
+        kv_transfer_config.get_from_extra_config("pegaflow.num_linear_state_cache_slots", 0)
+        if kv_transfer_config is not None
+        else 0
+    )
 
     factors = {
         "model": model_config.model,
@@ -559,6 +650,8 @@ def derive_namespace(
         "cross_layer_blocks": cross_layer_blocks,
         "mla_layer_split_kv_cache": bool(additional_config.get("mla_layer_split_kv_cache", False)),
     }
+    if local_linear_state:
+        factors["connector_owned_linear_state"] = True
 
     factor_str = str(sorted(factors.items()))
     hash_suffix = hashlib.sha256(factor_str.encode()).hexdigest()[:8]
@@ -597,10 +690,14 @@ def resolve_transfer_backend(is_mla: bool, override: str | None) -> str:
 __all__ = [
     "ConnectorContext",
     "LoadIntent",
+    "LocalRecurrentLoad",
+    "LocalRecurrentSave",
+    "LocalSaveRef",
     "PegaConnectorMode",
     "PegaConnectorMetadata",
     "PegaKVConnectorStats",
     "PegaPromMetrics",
+    "PegaWorkerMetadata",
     "RecurrentLoadHold",
     "SaveIntent",
     "TpShardTopology",

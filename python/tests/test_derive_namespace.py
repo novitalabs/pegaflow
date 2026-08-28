@@ -21,6 +21,7 @@ def _make_vllm_config(
     pp_size: int = 1,
     mla_layer_split: bool = False,
     disable_hma: bool = False,
+    linear_state_slots: int = 0,
 ) -> SimpleNamespace:
     model_config = SimpleNamespace(
         model="/data/models/GLM-5.2-FP8",
@@ -37,6 +38,11 @@ def _make_vllm_config(
         ),
         parallel_config=SimpleNamespace(pipeline_parallel_size=pp_size),
         additional_config={"mla_layer_split_kv_cache": mla_layer_split},
+        kv_transfer_config=SimpleNamespace(
+            get_from_extra_config=lambda key, default: (
+                linear_state_slots if key == "pegaflow.num_linear_state_cache_slots" else default
+            )
+        ),
     )
 
 
@@ -58,6 +64,11 @@ def test_mla_layer_split_isolates_namespace():
 
 def test_hma_enablement_isolates_namespace():
     assert _ns(disable_hma=False) != _ns(disable_hma=True)
+
+
+def test_linear_state_cache_enablement_isolates_namespace_not_capacity():
+    assert _ns(linear_state_slots=0) != _ns(linear_state_slots=1)
+    assert _ns(linear_state_slots=1) == _ns(linear_state_slots=2)
 
 
 def test_namespace_is_stable_for_same_config():

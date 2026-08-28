@@ -76,6 +76,7 @@ def _make_recurrent_scheduler(committed_recurrent: frozenset[int] | None = None)
         hash_group_index=0,
         has_recurrent_state=True,
         recurrent_group_indices=frozenset({1}),
+        recurrent_running_state_index=lambda _group_index, table_length: table_length - 3,
     )
     scheduler._block_hashes["r1"] = (_hash(0), _hash(1))
     scheduler._allocated_blocks["r1"] = [[11, 12], [21, 22]]
@@ -177,7 +178,7 @@ def test_hma_loads_only_final_recurrent_state():
     scheduler = _make_recurrent_scheduler()
     groups = (
         (11, 12, 13, 14),
-        (21, 22, 23, 24, 25, 26, 27, 28, 29, 30),
+        (0, 0, 0, 0, 0, 0, 0, 23, 29, 30),
     )
 
     assert scheduler._load_block_ids_by_group(groups, 1, 2) == (

@@ -12,14 +12,24 @@ Pure-function contract covering the scheduler-side hit derivation:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+
 from .unit_stubs import install_connector_unit_stubs
 
 install_connector_unit_stubs()
 
 from pegaflow.connector.common import (  # noqa: E402
     CacheGroupLayout,
+    ConnectorContext,
+    LocalSaveRef,
+    PegaWorkerMetadata,
     reconcile_hybrid_hit,
 )
+from pegaflow.connector.scheduler import SchedulerConnector  # noqa: E402
+from pegaflow.connector.tp_shards import ShardedQueryReady  # noqa: E402
 
 from .test_cache_group_layout import (  # noqa: E402
     _config,
@@ -126,3 +136,153 @@ class TestStorageGroupIds:
         layout = CacheGroupLayout.from_config(config)
         assert layout.storage_group_ids == (0, 1, 2)
         assert layout.recurrent_group_indices == frozenset({1, 2})
+
+
+def _local_scheduler(tp_size: int = 1) -> SchedulerConnector:
+    config = _config(
+        _group("attention", _full_attention()),
+        _group("recurrent", _mamba(page_size_bytes=1024)),
+    )
+    context = ConnectorContext(
+        instance_id="test",
+        namespace="ns",
+        block_size=16,
+        tp_size=tp_size,
+        world_size=tp_size,
+        tp_rank=0,
+        device_id=0,
+        engine_client=MagicMock(),
+        state_manager=MagicMock(),
+        num_linear_state_cache_slots=2,
+    )
+    return SchedulerConnector(context, kv_cache_config=config)
+
+
+def _commit_hash(scheduler: SchedulerConnector, block_hash: bytes):
+    assert scheduler._linear_state_cache is not None
+    ref = scheduler._linear_state_cache.reserve(block_hash)
+    assert ref is not None
+    scheduler._linear_state_cache.commit(ref)
+    return ref
+
+
+def test_local_recurrent_reconcile_uses_rightmost_checkpoint_inside_remote_prefix():
+    scheduler = _local_scheduler()
+    hashes = [b"h0", b"h1", b"h2"]
+    _commit_hash(scheduler, hashes[0])
+    rightmost = _commit_hash(scheduler, hashes[2])
+    scheduler._tp_shard_client = MagicMock()
+
+    result = scheduler._reconcile_hybrid(
+        hashes,
+        ShardedQueryReady(3, (b"remote-lease",)),
+        "req",
+    )
+
+    assert result.num_hit_blocks == 3
+    assert result.local_recurrent == rightmost
+    assert result.usable_positions == (0, 2)
+    scheduler._tp_shard_client.query_group_membership.assert_not_called()
+
+
+def test_remote_attention_hit_without_local_recurrent_checkpoint_is_a_miss():
+    scheduler = _local_scheduler()
+    scheduler._tp_shard_client = MagicMock()
+
+    result = scheduler._reconcile_hybrid(
+        [b"h0", b"h1"],
+        ShardedQueryReady(2, (b"remote-lease",)),
+        "req",
+    )
+
+    assert result.num_hit_blocks == 0
+    scheduler._tp_shard_client.release.assert_called_once_with((b"remote-lease",), "req")
+
+
+def test_tp2_local_save_commits_only_after_two_matching_acks():
+    scheduler = _local_scheduler(tp_size=2)
+    intent = scheduler._wrap_local_recurrent_save(
+        "req",
+        SimpleNamespace(
+            block_ids_by_group=((11,), (21,)),
+            block_hashes=(b"checkpoint",),
+        ),
+    )
+    save = intent.local_recurrent_saves[0]
+    ref = LocalSaveRef.from_save("req", save)
+    assert scheduler._linear_state_cache is not None
+
+    scheduler._apply_local_save_acks(PegaWorkerMetadata(succeeded={ref: 1}))
+    assert scheduler._linear_state_cache.lookup(b"checkpoint") is None
+
+    scheduler._apply_local_save_acks(PegaWorkerMetadata(succeeded={ref: 1}))
+    assert scheduler._linear_state_cache.lookup(b"checkpoint") == save.target
+
+
+def test_local_save_failure_ack_cancels_exact_reservation():
+    scheduler = _local_scheduler()
+    intent = scheduler._wrap_local_recurrent_save(
+        "req",
+        SimpleNamespace(
+            block_ids_by_group=((11,), (21,)),
+            block_hashes=(b"checkpoint",),
+        ),
+    )
+    save = intent.local_recurrent_saves[0]
+    ref = LocalSaveRef.from_save("req", save)
+
+    scheduler._apply_local_save_acks(PegaWorkerMetadata(failed={ref: 1}))
+
+    assert ref not in scheduler._pending_local_saves
+    assert scheduler._local_saves_by_req == {}
+
+
+def test_metadata_construction_failure_rolls_back_reservation_and_retries(monkeypatch):
+    scheduler = _local_scheduler()
+    raw = SimpleNamespace(
+        block_ids_by_group=((11,), (21,)),
+        block_hashes=(b"checkpoint",),
+    )
+    scheduler._deferred_save_intents["req"] = raw
+    output = SimpleNamespace(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(req_ids=[]),
+        preempted_req_ids=set(),
+    )
+    original = scheduler._wrap_local_recurrent_save
+
+    def reserve_then_fail(req_id, intent):
+        original(req_id, intent)
+        raise RuntimeError("metadata failed")
+
+    monkeypatch.setattr(scheduler, "_wrap_local_recurrent_save", reserve_then_fail)
+    with pytest.raises(RuntimeError, match="metadata failed"):
+        scheduler.build_connector_meta(output)
+
+    assert scheduler._pending_local_saves == {}
+    assert scheduler._local_saves_by_req == {}
+    assert scheduler._deferred_save_intents == {"req": raw}
+
+    monkeypatch.setattr(scheduler, "_wrap_local_recurrent_save", original)
+    metadata = scheduler.build_connector_meta(output)
+    assert len(metadata.ready_save_intents["req"].local_recurrent_saves) == 1
+
+
+def test_multiple_recurrent_groups_share_one_compound_reservation():
+    scheduler = _local_scheduler()
+    scheduler._cache_groups = SimpleNamespace(
+        recurrent_group_indices=frozenset({1, 2}),
+    )
+
+    intent = scheduler._wrap_local_recurrent_save(
+        "req",
+        SimpleNamespace(
+            block_ids_by_group=((11,), (21,), (31,)),
+            block_hashes=(b"checkpoint",),
+        ),
+    )
+
+    assert len(intent.local_recurrent_saves) == 1
+    assert intent.local_recurrent_saves[0].source_block_ids == ((1, 21), (2, 31))
+    assert intent.block_ids_by_group == ((11,), (0,), (0,))
+    assert len(scheduler._pending_local_saves) == 1

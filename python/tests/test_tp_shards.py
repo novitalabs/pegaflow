@@ -14,6 +14,7 @@ install_connector_unit_stubs()
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (  # noqa: E402
     KVConnectorRole,
 )
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec  # noqa: E402
 
 from pegaflow.connector import PegaKVConnector  # noqa: E402
 from pegaflow.connector.common import (  # noqa: E402
@@ -53,12 +54,13 @@ def _context(**kwargs) -> ConnectorContext:
     return ConnectorContext(**defaults)  # type: ignore[arg-type]
 
 
-def _vllm_config(**parallel_overrides):
+def _vllm_config(extra_config_overrides=None, **parallel_overrides):
     extra_config = {
         "pegaflow.tp_shard_endpoints": [
             "http://node-a:50055",
             "http://node-b:50055",
-        ]
+        ],
+        **(extra_config_overrides or {}),
     }
     kv_transfer_config = SimpleNamespace(
         engine_id="instance",
@@ -351,3 +353,57 @@ def test_each_tp_shard_has_a_local_unregister_leader():
             engine_client.unregister_context.assert_called_once_with("instance")
         else:
             engine_client.unregister_context.assert_not_called()
+
+
+def _hma_config_value(value):
+    attention = FullAttentionSpec()
+    attention.block_size = 16
+    recurrent = MambaSpec()
+    recurrent.block_size = 16
+    recurrent.mamba_cache_mode = "align"
+    recurrent.page_size_bytes = 1024
+    recurrent.num_speculative_blocks = 0
+    return SimpleNamespace(
+        kv_cache_groups=(
+            SimpleNamespace(layer_names=("attention",), kv_cache_spec=attention),
+            SimpleNamespace(layer_names=("recurrent",), kv_cache_spec=recurrent),
+        ),
+        value=value,
+    )
+
+
+@pytest.mark.parametrize("value", [True, -1, 1.5, "2"])
+def test_linear_state_slot_config_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setattr("pegaflow.connector.EngineRpcClient", MagicMock())
+    config = _hma_config_value(value)
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        PegaKVConnector(
+            _vllm_config(
+                {
+                    "pegaflow.tp_shard_endpoints": None,
+                    "pegaflow.num_linear_state_cache_slots": value,
+                }
+            ),
+            KVConnectorRole.SCHEDULER,
+            config,
+        )
+
+
+def test_linear_state_cache_rejects_pipeline_parallelism(monkeypatch):
+    monkeypatch.setattr("pegaflow.connector.EngineRpcClient", MagicMock())
+    config = _hma_config_value(1)
+
+    with pytest.raises(ValueError, match="supports TP-only parallelism"):
+        PegaKVConnector(
+            _vllm_config(
+                {
+                    "pegaflow.tp_shard_endpoints": None,
+                    "pegaflow.num_linear_state_cache_slots": 1,
+                },
+                pipeline_parallel_size=2,
+                world_size=16,
+            ),
+            KVConnectorRole.SCHEDULER,
+            config,
+        )

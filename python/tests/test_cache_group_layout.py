@@ -35,10 +35,12 @@ def _full_attention(block_size=16):
     return spec
 
 
-def _mamba(block_size=16, mode="align"):
+def _mamba(block_size=16, mode="align", page_size_bytes=0, num_speculative_blocks=0):
     spec = MambaSpec()
     spec.block_size = block_size
     spec.mamba_cache_mode = mode
+    spec.page_size_bytes = page_size_bytes
+    spec.num_speculative_blocks = num_speculative_blocks
     return spec
 
 

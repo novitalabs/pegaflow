@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 
 from pegaflow.connector.common import RecurrentLoadHold, logger
+from pegaflow.connector.linear_state_cache import LinearStateSlot
 from pegaflow.pegaflow import EngineRpcClient, QueryLoading, QueryReady
 
 
@@ -17,6 +18,7 @@ class ShardedQueryReady:
     # recurrent group holds a checkpoint there on every shard, below the
     # attention prefix). Drives boundary re-derivation under token clamps.
     usable_positions: tuple[int, ...] = ()
+    local_recurrent: LinearStateSlot | None = None
 
 
 class TpShardQueryClient:

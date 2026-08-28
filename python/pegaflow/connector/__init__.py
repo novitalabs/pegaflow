@@ -17,6 +17,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.distributed.parallel_state import get_pp_group, get_tensor_model_parallel_rank
 
 from pegaflow.connector.common import (
+    CacheGroupLayout,
     ConnectorContext,
     PegaConnectorMetadata,
     PegaConnectorMode,
@@ -115,6 +116,26 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
                 "pegaflow.wait_for_full_prefix", False
             )
         )
+        num_linear_state_cache_slots = vllm_config.kv_transfer_config.get_from_extra_config(
+            "pegaflow.num_linear_state_cache_slots", 0
+        )
+        if type(num_linear_state_cache_slots) is not int or num_linear_state_cache_slots < 0:
+            raise ValueError("pegaflow.num_linear_state_cache_slots must be a non-negative integer")
+        cache_layout = CacheGroupLayout.from_config(kv_cache_config)
+        if num_linear_state_cache_slots:
+            if pp_size != 1 or world_size != tp_size or dcp_world_size != 1 or pcp_world_size != 1:
+                raise ValueError(
+                    "pegaflow.num_linear_state_cache_slots currently supports TP-only "
+                    f"parallelism; got tp_size={tp_size}, world_size={world_size}, "
+                    f"pp_size={pp_size}, dcp_world_size={dcp_world_size}, "
+                    f"pcp_world_size={pcp_world_size}"
+                )
+            if not cache_layout.has_recurrent_state:
+                raise ValueError(
+                    "pegaflow.num_linear_state_cache_slots requires an HMA MambaSpec layout"
+                )
+            if cache_layout.recurrent_compound_page_bytes <= 0:
+                raise ValueError("enabled linear-state cache requires MambaSpec.page_size_bytes")
         default_endpoint = f"{server_host}:{server_port}"
         tp_shards = TpShardTopology.from_config(
             default_endpoint=default_endpoint,
@@ -161,6 +182,7 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
             mode=mode,
             wait_for_full_prefix=wait_for_full_prefix,
             tp_shards=tp_shards,
+            num_linear_state_cache_slots=num_linear_state_cache_slots,
         )
 
         # MLA attention backends expose no num-layers stride dimension, so vLLM
@@ -213,6 +235,17 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
                 self._ctx,
                 vllm_config=vllm_config,
                 kv_cache_config=kv_cache_config,
+            )
+
+        if num_linear_state_cache_slots:
+            compound_page_bytes = cache_layout.recurrent_compound_page_bytes
+            logger.info(
+                "[PegaKVConnector] connector-owned linear-state cache enabled: "
+                "slots=%d compound_page_bytes=%d total_pool_bytes=%d role=%s",
+                num_linear_state_cache_slots,
+                compound_page_bytes,
+                num_linear_state_cache_slots * compound_page_bytes,
+                role.name,
             )
 
         logger.debug(
@@ -279,6 +312,11 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
         if not self._worker:
             return (None, None)
         return self._worker.get_finished(finished_req_ids)
+
+    def build_connector_worker_meta(self):
+        if not self._worker:
+            return None
+        return self._worker.build_connector_worker_meta()
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         if not self._worker:
