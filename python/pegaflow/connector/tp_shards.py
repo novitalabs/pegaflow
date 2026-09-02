@@ -17,6 +17,10 @@ class ShardedQueryReady:
     # recurrent group holds a checkpoint there on every shard, below the
     # attention prefix). Drives boundary re-derivation under token clamps.
     usable_positions: tuple[int, ...] = ()
+    # HMA only: the attention-only prefix hit before recurrent reconcile
+    # shrank it. Tells the scheduler where a shared prefix ends without a
+    # usable recurrent checkpoint (see SchedulerConnector's junction hint).
+    attention_hit_blocks: int = 0
 
 
 class TpShardQueryClient:

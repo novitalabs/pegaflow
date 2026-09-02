@@ -60,16 +60,8 @@ def _make_ctx(
     return ConnectorContext(**defaults)  # type: ignore[arg-type]
 
 
-def _make_recurrent_scheduler(committed_recurrent: frozenset[int] | None = None):
-    """Two-group HMA scheduler over a 2-block request.
-
-    ``committed_recurrent`` is the set of hash indices whose *recurrent* block
-    vLLM has committed to its prefix cache. In align mode that is only the
-    boundaries where a scheduler step ended, not every full block, so the
-    lookup must be group-aware. Defaults to both blocks.
-    """
-    if committed_recurrent is None:
-        committed_recurrent = frozenset({0, 1})
+def _make_recurrent_scheduler():
+    """Two-group HMA scheduler over a 2-block request."""
     scheduler = SchedulerConnector(_make_ctx())
     scheduler._cache_groups = SimpleNamespace(
         group_count=2,
@@ -81,38 +73,25 @@ def _make_recurrent_scheduler(committed_recurrent: frozenset[int] | None = None)
     scheduler._allocated_blocks["r1"] = [[11, 12], [21, 22]]
     scheduler._block_index_offsets["r1"] = 0
     scheduler._next_stored_block_idx["r1"] = 0
-    attention_ids = {_hash(0): 11, _hash(1): 12}
-    recurrent_ids = {_hash(0): 21, _hash(1): 22}
-    hash_index = {_hash(0): 0, _hash(1): 1}
-
-    def get_cached(block_hash, group_ids):
-        if block_hash not in hash_index:
-            return None
-        blocks = []
-        for group_id in group_ids:
-            if group_id == 1:
-                if hash_index[block_hash] not in committed_recurrent:
-                    return None
-                blocks.append(SimpleNamespace(block_id=recurrent_ids[block_hash]))
-            else:
-                blocks.append(SimpleNamespace(block_id=attention_ids[block_hash]))
-        return blocks
-
-    scheduler._get_local_cached_blocks = get_cached
     return scheduler
 
 
-def test_recurrent_mid_request_saves_are_skipped():
+def test_recurrent_mid_request_saves_keep_attention_cadence():
+    """Attention pages save per step; recurrent rows stay null (see
+    test_hma_boundary_offloads for where recurrent states come from)."""
     scheduler = _make_recurrent_scheduler()
+    scheduler._scheduled_tokens["r1"] = 32
 
+    assert scheduler._consume_full_block_saves("r1") == SaveIntent(
+        block_ids_by_group=((11, 12), (0, 0)),
+        block_hashes=(_hash(0), _hash(1)),
+    )
+    assert scheduler._next_stored_block_idx["r1"] == 2
     assert scheduler._consume_full_block_saves("r1") is None
-    assert scheduler._next_stored_block_idx["r1"] == 0
 
 
-def test_recurrent_final_step_resolves_checkpoint_from_committed_cache():
+def test_recurrent_request_finished_holds_only_for_pending_saves():
     scheduler = _make_recurrent_scheduler()
-
-    assert scheduler._consume_full_block_saves("r1") is None
     request = SimpleNamespace(
         request_id="r1",
         num_computed_tokens=32,
@@ -124,36 +103,9 @@ def test_recurrent_final_step_resolves_checkpoint_from_committed_cache():
         ([11, 12, 13], [0, 0, 22, 30, 31, 32]),
     )
 
-    assert delay_free is True
-    assert params is None
-
-    scheduler.update_connector_output(SimpleNamespace(finished_sending={"r1"}))
-    assert "r1" in scheduler._block_hashes
-
-    metadata = scheduler.build_connector_meta(
-        SimpleNamespace(
-            scheduled_new_reqs=[],
-            scheduled_cached_reqs=SimpleNamespace(
-                req_ids=[],
-                resumed_req_ids=set(),
-                new_block_ids=[],
-                num_computed_tokens=[],
-            ),
-            num_scheduled_tokens={},
-            preempted_req_ids=set(),
-        )
-    )
-    # Attention ids come from the finished block table; the recurrent id is the
-    # boundary state vLLM committed under hash[1], NOT block_ids[1][2].
-    assert metadata.ready_save_intents["r1"] == SaveIntent(
-        block_ids_by_group=((11, 12), (0, 22)),
-        block_hashes=(_hash(0), _hash(1)),
-    )
-    assert metadata.save_intents == {}
-
-    scheduler.update_connector_output(SimpleNamespace(finished_sending={"r1"}))
+    # No request-end recurrent save: nothing to wait for.
+    assert (delay_free, params) == (False, None)
     assert "r1" not in scheduler._block_hashes
-    assert "r1" not in scheduler._held_requests
 
 
 def test_hma_binding_disables_local_prefix_lookup_before_scheduling():

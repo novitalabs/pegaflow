@@ -14,6 +14,7 @@ from pegaflow.connector.common import (
     LoadIntent,
     PegaConnectorMetadata,
     PegaKVConnectorStats,
+    PegaWorkerMetadata,
     RecurrentLoadHold,
     SaveIntent,
     logger,
@@ -62,6 +63,9 @@ class _QueryProbe:
     # recurrent groups and shards, below the attention prefix). Used to
     # re-derive a legal boundary when the token budget shrinks the hit.
     usable_positions: frozenset[int] = frozenset()
+    # Hybrid (HMA): attention-only prefix hit before the recurrent reconcile
+    # shrank it; the junction hint needs it even when the hit drops to zero.
+    attention_hit_blocks: int = 0
 
     @property
     def is_ready(self) -> bool:
@@ -90,6 +94,7 @@ class _QueryProbe:
         self.leases = ready.leases
         self.recurrent_hold = ready.recurrent_hold
         self.usable_positions = frozenset(ready.usable_positions)
+        self.attention_hit_blocks = ready.attention_hit_blocks
 
     def require_hit_blocks(self) -> int:
         if self.hit_blocks is None:
@@ -121,7 +126,7 @@ class SchedulerConnector:
         self._cache_groups = CacheGroupLayout.from_config(kv_cache_config)
         if self._cache_groups.has_recurrent_state and (pd_tail_save or pd_tail_load):
             raise ValueError("P/D tail-block caching is not supported with HMA")
-        self._get_local_cached_blocks = None
+        self._gpu_block_pool = None
 
         # P/D tail-block extension (`pegaflow.pd_tail_save`): vLLM only hashes
         # full blocks, so a prompt's partial tail block never enters the tier
@@ -190,12 +195,25 @@ class SchedulerConnector:
         self._requests: dict[str, Request] = {}
 
         # Completion tracking
-        self._deferred_save_intents: dict[str, SaveIntent] = {}
         self._pending_saves: set[str] = set()
         self._held_requests: set[str] = set()
 
+        # Hybrid (HMA) recurrent boundary states. vLLM hands off every
+        # committed align-mode boundary block through
+        # `SchedulerOutput.kv_connector_block_state.boundary_state_offloads`
+        # in the step that writes it. Each hand-off becomes a boundary save
+        # job: the block is pinned in the GPU block pool until every worker
+        # reports the job done, so the save is independent of the request's
+        # own block lifetime (align-mode tables free superseded state blocks
+        # one step later, and a request may finish or be preempted first).
+        self._next_boundary_job_id = 0
+        # job id -> (pinned GPU block ids, workers yet to report)
+        self._pinned_boundary_jobs: dict[int, tuple[list[int], int]] = {}
+        # req id -> (group index, hash index) already handed off
+        self._saved_boundaries: dict[str, set[tuple[int, int]]] = {}
+
     def bind_gpu_block_pool(self, gpu_block_pool) -> None:
-        self._get_local_cached_blocks = gpu_block_pool.get_cached_block
+        self._gpu_block_pool = gpu_block_pool
         if self._cache_groups.group_count <= 1:
             return
 
@@ -237,9 +255,8 @@ class SchedulerConnector:
         # has not drifted since the query was issued.
         if probe is not None and probe.is_ready:
             if probe.matches(computed_blocks, query_hashes, tail_tokens):
-                return self._finish_cache_lookup(
-                    req_id=req_id,
-                    num_tokens=request.num_tokens,
+                return self._complete_cache_lookup(
+                    request=request,
                     probe=probe,
                     lookup_us=None,
                     reused=True,
@@ -303,12 +320,77 @@ class SchedulerConnector:
             self._pending_query_probes[req_id] = probe
 
         probe.mark_ready(ready)
-        return self._finish_cache_lookup(
-            req_id=req_id,
-            num_tokens=request.num_tokens,
+        return self._complete_cache_lookup(
+            request=request,
             probe=probe,
             lookup_us=lookup_us,
             reused=False,
+        )
+
+    def _complete_cache_lookup(
+        self,
+        *,
+        request: "Request",
+        probe: _QueryProbe,
+        lookup_us: float | None,
+        reused: bool,
+    ) -> tuple[int, bool]:
+        # `_finish_cache_lookup` may release the probe, so snapshot what the
+        # junction hint needs first.
+        computed_blocks = probe.computed_blocks
+        attention_hit_blocks = probe.attention_hit_blocks
+        hit_tokens, load_async = self._finish_cache_lookup(
+            req_id=request.request_id,
+            num_tokens=request.num_tokens,
+            probe=probe,
+            lookup_us=lookup_us,
+            reused=reused,
+        )
+        self._hint_shared_prefix_boundary(
+            request, computed_blocks, attention_hit_blocks, hit_tokens
+        )
+        return hit_tokens, load_async
+
+    def _hint_shared_prefix_boundary(
+        self,
+        request: "Request",
+        computed_blocks: int,
+        attention_hit_blocks: int,
+        hit_tokens: int,
+    ) -> None:
+        """Ask vLLM to commit a recurrent state where a shared prefix ends.
+
+        A hybrid hit resumes only at a recurrent checkpoint, so an attention
+        prefix that runs past the last usable checkpoint (a new session
+        sharing a system prompt, a sibling branching mid-history) is
+        recomputed. vLLM's own Marconi-style junction detection needs a local
+        prefix hit, which the HMA layout does not expose (see
+        `bind_gpu_block_pool`), so report the junction from the external
+        index instead: `Request.shared_prefix_boundary` makes the prefill
+        chunk stop exactly there, which commits the align-mode boundary state
+        under that block's hash and hands it to
+        `_consume_boundary_state_offloads`. The next request sharing the
+        prefix then resumes from its end.
+        """
+        if not self._cache_groups.has_recurrent_state or attention_hit_blocks <= 0:
+            return
+        if not hasattr(request, "shared_prefix_boundary"):
+            return
+        vbs = self._ctx.virtual_block_size
+        junction = (computed_blocks + attention_hit_blocks) * vbs
+        resumable = computed_blocks * vbs + hit_tokens
+        if junction <= resumable or junction >= request.num_tokens:
+            return
+        if junction <= request.shared_prefix_boundary:
+            return
+        request.shared_prefix_boundary = junction
+        logger.debug(
+            "[PegaKVConnector] req=%s shared_prefix_boundary=%d "
+            "(attention prefix %d blocks, resumable %d tokens)",
+            request.request_id,
+            junction,
+            computed_blocks + attention_hit_blocks,
+            resumable,
         )
 
     def _finish_cache_lookup(
@@ -483,9 +565,6 @@ class SchedulerConnector:
             )
 
     def build_connector_meta(self, scheduler_output: "SchedulerOutput") -> PegaConnectorMetadata:
-        # Collect all save intents that became available this scheduler step.
-        ready_save_intents = self._deferred_save_intents
-        self._deferred_save_intents = {}
         potential_saves: dict[str, SaveIntent] = {}
 
         load_intents = self._pending_load_intents
@@ -572,18 +651,137 @@ class SchedulerConnector:
         # Track requests with pending saves
         self._pending_saves.update(save_intents.keys())
 
+        boundary_save_intents = self._consume_boundary_state_offloads(scheduler_output)
+
         logger.debug(
-            "[PegaKVConnector] build_connector_meta: %d loads, %d saves",
+            "[PegaKVConnector] build_connector_meta: %d loads, %d saves, %d boundary saves",
             len(load_intents),
             len(save_intents),
+            len(boundary_save_intents),
         )
 
         return PegaConnectorMetadata(
             load_intents=load_intents,
             save_intents=save_intents,
-            ready_save_intents=ready_save_intents,
+            boundary_save_intents=boundary_save_intents,
             preempted_req_ids=scheduler_output.preempted_req_ids or None,
         )
+
+    def _consume_boundary_state_offloads(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> dict[int, SaveIntent]:
+        """Turn vLLM's recurrent boundary hand-offs into pinned save jobs.
+
+        Each entry is ``(group_id, block_id, boundary_tokens)``: the exact
+        align-mode block holding the recurrent state after ``boundary_tokens``
+        tokens, committed by this step's forward. The state is filed under
+        the request hash ending at that boundary. Only whole-block boundaries
+        are stored; a sub-block partial tail has no hash of its own here.
+
+        Every committed boundary is handed off, so a request contributes a
+        resume point at each prefill chunk end, at its junction with a shared
+        prefix, and at each block it crosses while decoding — not just one
+        at request end.
+        """
+        if not self._cache_groups.has_recurrent_state:
+            return {}
+        try:
+            block_state = scheduler_output.kv_connector_block_state
+        except AttributeError as exc:
+            raise RuntimeError(
+                "PegaFlow HMA requires a vLLM scheduler that hands off mamba "
+                "boundary states (SchedulerOutput.kv_connector_block_state)"
+            ) from exc
+        offloads = block_state.boundary_state_offloads if block_state is not None else None
+        if not offloads:
+            return {}
+
+        pool = self._gpu_block_pool
+        if pool is None:
+            raise RuntimeError("GPU block pool was not bound before a boundary-state hand-off")
+
+        vbs = self._ctx.virtual_block_size
+        recurrent = self._cache_groups.recurrent_group_indices
+        group_count = self._cache_groups.group_count
+        intents: dict[int, SaveIntent] = {}
+        for req_id, entries in offloads.items():
+            request = self._requests.get(req_id)
+            if request is None:
+                # Finished before this step's metadata; its blocks are going away.
+                continue
+            block_hashes = tuple(request.block_hashes)
+            self._block_hashes[req_id] = block_hashes
+            saved = self._saved_boundaries.setdefault(req_id, set())
+            rows: list[tuple[int, int, bytes]] = []
+            for group_index, block_id, boundary_tokens in entries:
+                if group_index not in recurrent or block_id <= 0:
+                    continue
+                if boundary_tokens <= 0 or boundary_tokens % vbs != 0:
+                    continue
+                hash_index = boundary_tokens // vbs - 1
+                if hash_index >= len(block_hashes):
+                    continue
+                key = (group_index, hash_index)
+                if key in saved:
+                    continue
+                saved.add(key)
+                rows.append((group_index, block_id, block_hashes[hash_index]))
+            if not rows:
+                continue
+
+            job_id = self._next_boundary_job_id
+            self._next_boundary_job_id += 1
+            intents[job_id] = SaveIntent(
+                block_ids_by_group=tuple(
+                    tuple(
+                        block_id if group_index == group else 0 for group_index, block_id, _ in rows
+                    )
+                    for group in range(group_count)
+                ),
+                block_hashes=tuple(block_hash for _, _, block_hash in rows),
+            )
+            pinned = list(dict.fromkeys(block_id for _, block_id, _ in rows))
+            pool.touch([pool.blocks[block_id] for block_id in pinned])
+            self._pinned_boundary_jobs[job_id] = (pinned, self._ctx.world_size)
+            logger.debug(
+                "[PegaKVConnector] req=%s boundary_save job=%d boundaries=%s blocks=%s",
+                req_id,
+                job_id,
+                [(group_index, (hash_index + 1) * vbs) for group_index, hash_index in saved],
+                pinned,
+            )
+        return intents
+
+    def _release_boundary_jobs(self, completed: dict[int, int]) -> None:
+        pool = self._gpu_block_pool
+        for job_id, count in completed.items():
+            pinned = self._pinned_boundary_jobs.get(job_id)
+            if pinned is None:
+                logger.warning(
+                    "[PegaKVConnector] boundary_save job=%d reported by a worker but not pinned",
+                    job_id,
+                )
+                continue
+            block_ids, remaining = pinned
+            remaining -= count
+            if remaining > 0:
+                self._pinned_boundary_jobs[job_id] = (block_ids, remaining)
+                continue
+            if remaining < 0:
+                raise RuntimeError(f"boundary_save job={job_id} reported by too many workers")
+            del self._pinned_boundary_jobs[job_id]
+            assert pool is not None
+            # Newest boundary first so a shared prefix is evicted last.
+            pool.free_blocks(pool.blocks[block_id] for block_id in reversed(block_ids))
+
+    def has_pending_push_work(self) -> bool:
+        """Keep the engine stepping while boundary saves still pin blocks.
+
+        Completions only reach the scheduler as worker metadata on a step; an
+        engine that quiesced with jobs in flight would hold those references
+        (and their GPU blocks) until the next request arrives.
+        """
+        return bool(self._pinned_boundary_jobs)
 
     def _consume_save_intent(
         self,
@@ -699,13 +897,6 @@ class SchedulerConnector:
         return query_hashes + (tail[0],), tail[1]
 
     def _consume_full_block_saves(self, req_id: str) -> SaveIntent | None:
-        # Hybrid models store one recurrent checkpoint, at request_finished.
-        # Align-mode mamba tables are mostly null blocks, so a mid-request
-        # all-group lookup either misses (and stalls attention saves) or,
-        # when chunk_size == block_size, dumps a linear state every step.
-        if self._cache_groups.has_recurrent_state:
-            return None
-
         # block_hashes are at virtual_block_size granularity, 1-to-1 with block_ids.
         block_hashes = self._block_hashes.get(req_id)
         if block_hashes is None:
@@ -716,12 +907,26 @@ class SchedulerConnector:
         base_block_idx = self._block_index_offsets.get(req_id, 0)
         start_block_idx = self._next_stored_block_idx.get(req_id, base_block_idx)
 
+        # Recurrent (align-mode mamba) groups never save positionally: their
+        # table is not append-only (superseded state blocks are freed and
+        # nulled, speculative blocks relocate) and mostly null, so the mirror
+        # here is neither complete nor trustworthy. Their states are saved
+        # exactly from vLLM's boundary hand-offs instead
+        # (`_consume_boundary_state_offloads`); attention groups keep the
+        # dense per-block cadence.
+        recurrent = self._cache_groups.recurrent_group_indices
+        attention_lengths = [
+            len(group)
+            for group_index, group in enumerate(allocated)
+            if group_index not in recurrent
+        ]
+
         # _allocated_blocks tracks request block IDs in global request order.
         # In external-hit cases, the prefix-loaded block IDs are still present at
         # the front, so save intents must slice by global block index rather than
         # rebasing to a local-only view.
         local_saveable = min(
-            min((len(group) for group in allocated), default=0),
+            min(attention_lengths, default=0),
             scheduled // self._ctx.virtual_block_size,
         )
         saveable_block_idx = min(len(block_hashes), base_block_idx + local_saveable)
@@ -732,7 +937,10 @@ class SchedulerConnector:
         hash_start = start_block_idx
         save_hashes = block_hashes[hash_start : hash_start + new_blocks]
         save_block_ids_by_group = tuple(
-            tuple(group[hash_start : hash_start + new_blocks]) for group in allocated
+            (0,) * new_blocks
+            if group_index in recurrent
+            else tuple(group[hash_start : hash_start + new_blocks])
+            for group_index, group in enumerate(allocated)
         )
         self._next_stored_block_idx[req_id] = saveable_block_idx
 
@@ -751,120 +959,6 @@ class SchedulerConnector:
         return SaveIntent(
             block_ids_by_group=save_block_ids_by_group,
             block_hashes=save_hashes,
-        )
-
-    def _cached_recurrent_checkpoint(
-        self,
-        block_hashes: tuple[bytes, ...],
-        lower: int,
-        upper: int,
-    ) -> tuple[int, tuple[int, ...]] | None:
-        """Newest recurrent state vLLM committed under a hash in [lower, upper).
-
-        Returns ``(hash_index, block_id_per_recurrent_group)``, or None when no
-        boundary in the window was committed.
-
-        Only a *cached* block is guaranteed to still hold the state its hash
-        names. In align mode the live block table's real entry is the running
-        state for the current (typically mid-block) token count, which is not
-        the boundary state ``hash[j]`` claims — saving that would fold the tail
-        tokens into the state twice on resume. vLLM commits a recurrent block
-        under ``hash[j]`` only when a scheduler step ended at exactly
-        ``(j + 1) * virtual_block_size`` computed tokens, which is precisely
-        this connector's checkpoint convention.
-        """
-        if self._get_local_cached_blocks is None:
-            raise RuntimeError("HMA block pool was not bound before building save metadata")
-
-        recurrent_group_ids = sorted(self._cache_groups.recurrent_group_indices)
-        for hash_index in range(upper - 1, lower - 1, -1):
-            cached = self._get_local_cached_blocks(block_hashes[hash_index], recurrent_group_ids)
-            if cached is not None:
-                return hash_index, tuple(block.block_id for block in cached)
-        return None
-
-    def _consume_finished_hma_save(
-        self,
-        req_id: str,
-        block_ids: tuple[list[int], ...],
-        written: int,
-    ) -> SaveIntent | None:
-        """Final hybrid save: attention pages plus one recurrent checkpoint.
-
-        Attention block ids come from the finished block table; the recurrent
-        checkpoint is resolved through vLLM's committed prefix cache (see
-        `_cached_recurrent_checkpoint`). Recurrent groups carry block id 0
-        (vLLM's null block) on every other row, which the worker filters out.
-        """
-        block_hashes = self._block_hashes.get(req_id)
-        if block_hashes is None:
-            return None
-
-        start_block_idx = self._next_stored_block_idx.get(
-            req_id, self._block_index_offsets.get(req_id, 0)
-        )
-        saveable_block_idx = min(len(block_hashes), written // self._ctx.virtual_block_size)
-        if saveable_block_idx <= start_block_idx:
-            return None
-
-        groups = self._copy_block_ids_by_group(block_ids)
-        recurrent = self._cache_groups.recurrent_group_indices
-        # Only attention groups are indexed by hash position. Recurrent groups
-        # are addressed through the cache lookup below, and in align mode their
-        # table holds a handful of live entries regardless of sequence length.
-        available = tuple(len(group) for group in groups)
-        for group_index, length in enumerate(available):
-            if group_index not in recurrent and length < saveable_block_idx:
-                raise RuntimeError(
-                    f"req {req_id} final HMA attention block table is shorter than its "
-                    f"hash prefix: saveable={saveable_block_idx} "
-                    f"available_by_group={available}"
-                )
-
-        num_new_blocks = saveable_block_idx - start_block_idx
-        checkpoint = self._cached_recurrent_checkpoint(
-            block_hashes, start_block_idx, saveable_block_idx
-        )
-        if checkpoint is None:
-            # No block boundary was committed inside the range this request
-            # computed, so it contributes no new resume point. Expected when a
-            # request advances less than one block; otherwise worth surfacing.
-            if num_new_blocks > 1:
-                logger.warning(
-                    "[PegaKVConnector] req=%s no recurrent checkpoint committed in "
-                    "blocks [%d,%d); saving attention pages only",
-                    req_id,
-                    start_block_idx,
-                    saveable_block_idx,
-                )
-            checkpoint_hash_idx, checkpoint_block_ids = -1, ()
-        else:
-            checkpoint_hash_idx, checkpoint_block_ids = checkpoint
-            logger.info(
-                "[PegaKVConnector] req=%s hma_checkpoint: hash_idx=%d tokens=%d "
-                "attention_blocks=%d",
-                req_id,
-                checkpoint_hash_idx,
-                (checkpoint_hash_idx + 1) * self._ctx.virtual_block_size,
-                num_new_blocks,
-            )
-
-        recurrent_order = sorted(recurrent)
-        save_block_ids_by_group = []
-        for group_index, group in enumerate(groups):
-            if group_index in recurrent:
-                row = [0] * num_new_blocks
-                if checkpoint_hash_idx >= 0:
-                    slot = recurrent_order.index(group_index)
-                    row[checkpoint_hash_idx - start_block_idx] = checkpoint_block_ids[slot]
-                save_block_ids_by_group.append(tuple(row))
-            else:
-                save_block_ids_by_group.append(group[start_block_idx:saveable_block_idx])
-
-        self._next_stored_block_idx[req_id] = saveable_block_idx
-        return SaveIntent(
-            block_ids_by_group=tuple(save_block_ids_by_group),
-            block_hashes=block_hashes[start_block_idx:saveable_block_idx],
         )
 
     def _copy_block_ids_by_group(self, block_ids) -> tuple[tuple[int, ...], ...]:
@@ -906,9 +1000,13 @@ class SchedulerConnector:
             logger.debug("[PegaKVConnector] Request %s save completed", req_id)
 
             # Clean up if request already finished
-            if req_id in self._held_requests and req_id not in self._deferred_save_intents:
+            if req_id in self._held_requests:
                 self._cleanup_request(req_id)
                 self._held_requests.discard(req_id)
+
+        worker_meta = getattr(connector_output, "kv_connector_worker_meta", None)
+        if isinstance(worker_meta, PegaWorkerMetadata) and worker_meta.completed_boundary_jobs:
+            self._release_boundary_jobs(worker_meta.completed_boundary_jobs)
 
     def request_finished(
         self,
@@ -916,17 +1014,6 @@ class SchedulerConnector:
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict | None]:
         req_id = request.request_id
-
-        if self._cache_groups.has_recurrent_state and req_id in self._block_hashes:
-            self._block_hashes[req_id] = tuple(request.block_hashes)
-            final_save = self._consume_finished_hma_save(
-                req_id,
-                block_ids,
-                request.num_computed_tokens,
-            )
-            if final_save is not None:
-                self._deferred_save_intents[req_id] = final_save
-                self._pending_saves.add(req_id)
 
         # Check if there are pending saves for this request
         if req_id in self._pending_saves:
@@ -951,7 +1038,7 @@ class SchedulerConnector:
         self._allocated_blocks.pop(req_id, None)
         self._scheduled_tokens.pop(req_id, None)
         self._next_stored_block_idx.pop(req_id, None)
-        self._deferred_save_intents.pop(req_id, None)
+        self._saved_boundaries.pop(req_id, None)
         self._pending_saves.discard(req_id)
         self._tail_saved.discard(req_id)
 
@@ -1017,6 +1104,7 @@ class SchedulerConnector:
         """
         if ready.num_hit_blocks == 0:
             return ready
+        attention_hit_blocks = ready.num_hit_blocks
 
         group_ids = tuple(
             self._cache_groups.storage_group_ids[index]
@@ -1060,7 +1148,11 @@ class SchedulerConnector:
                 req_id,
                 ready.num_hit_blocks,
             )
-            return ShardedQueryReady(0, tuple(b"" for _ in ready.leases))
+            return ShardedQueryReady(
+                0,
+                tuple(b"" for _ in ready.leases),
+                attention_hit_blocks=attention_hit_blocks,
+            )
 
         if hybrid_hit < ready.num_hit_blocks:
             # The hit shrank behind the prefix lease: re-lease the exact
@@ -1085,13 +1177,18 @@ class SchedulerConnector:
                     req_id,
                     hybrid_hit,
                 )
-                return ShardedQueryReady(0, tuple(b"" for _ in ready.leases))
+                return ShardedQueryReady(
+                    0,
+                    tuple(b"" for _ in ready.leases),
+                    attention_hit_blocks=attention_hit_blocks,
+                )
             ready = exact
 
         return ShardedQueryReady(
             hybrid_hit,
             ready.leases,
-            RecurrentLoadHold(
+            attention_hit_blocks=attention_hit_blocks,
+            recurrent_hold=RecurrentLoadHold(
                 leases=tuple(
                     tuple(lease for _, lease in group_results) for group_results in per_group
                 ),
