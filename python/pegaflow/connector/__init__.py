@@ -280,6 +280,11 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
             return (None, None)
         return self._worker.get_finished(finished_req_ids)
 
+    def build_connector_worker_meta(self):
+        if not self._worker:
+            return None
+        return self._worker.build_connector_worker_meta()
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         if not self._worker:
             return
@@ -330,6 +335,11 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
 
     def take_events(self) -> Iterable:
         return ()
+
+    def has_pending_push_work(self) -> bool:
+        if not self._scheduler:
+            return False
+        return self._scheduler.has_pending_push_work()
 
     def get_num_new_matched_tokens(
         self,

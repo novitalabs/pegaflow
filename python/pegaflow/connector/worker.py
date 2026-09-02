@@ -7,7 +7,7 @@ import queue
 import threading
 import time
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 import torch
@@ -17,6 +17,7 @@ from pegaflow.connector.common import (
     ConnectorContext,
     PegaConnectorMetadata,
     PegaKVConnectorStats,
+    PegaWorkerMetadata,
     SaveIntent,
     logger,
     parse_env_int,
@@ -47,6 +48,9 @@ if _LOAD_TIMEOUT_RAW < _LOAD_TIMEOUT_FLOOR_SECONDS:
 class SaveTask:
     metadata: PegaConnectorMetadata
     request_ids: list[str]
+    # HMA boundary-state jobs carried by this task; reported back to the
+    # scheduler through PegaWorkerMetadata once the batch is done.
+    boundary_job_ids: list[int] = field(default_factory=list)
 
 
 _KVCacheLayout = Literal["KV-first", "blocks-first"]
@@ -115,7 +119,15 @@ def _infer_kv_cache_registration(
 
     layout = "blocks-first"
     physical_num_blocks = shape[0]
-    physical_block_size = shape[1] if len(shape) >= 2 else logical_block_size
+    if len(shape) == 4:
+        # vLLM's standardized per-layer view is ``[B, H, N, C]``: kernel
+        # blocks, head slots, tokens (states) per kernel block, content.
+        physical_block_size = shape[2]
+    elif len(shape) >= 2:
+        # Legacy MLA cache: ``[num_blocks, block_size, head_dim]``.
+        physical_block_size = shape[1]
+    else:
+        physical_block_size = logical_block_size
     physical_bytes_per_block = stride[0] * element_size
     kv_stride_bytes = 0
     segments = 1
@@ -159,12 +171,13 @@ def _registration_tensor(kv_cache) -> torch.Tensor:
     if not states or not all(isinstance(state, torch.Tensor) for state in states):
         raise TypeError("KV cache must be a tensor or a non-empty sequence of state tensors")
 
-    first = states[0]
-    if first.storage_offset() != 0:
-        raise RuntimeError("the first recurrent-state tensor must start at storage offset zero")
+    # The page is registered from the state that starts it; the others must
+    # live inside that page (same allocation, same block stride).
+    first = min(states, key=lambda state: state.data_ptr())
     storage_ptr = first.untyped_storage().data_ptr()
     num_blocks = first.shape[0]
     page_bytes = first.stride(0) * first.element_size()
+    page_start = first.data_ptr()
     for state in states:
         if state.untyped_storage().data_ptr() != storage_ptr:
             raise RuntimeError("recurrent-state tensors must share one CUDA allocation")
@@ -172,6 +185,8 @@ def _registration_tensor(kv_cache) -> torch.Tensor:
             raise RuntimeError("recurrent-state tensors must have the same block count")
         if state.stride(0) * state.element_size() != page_bytes:
             raise RuntimeError("recurrent-state tensors must have one common page stride")
+        if state.data_ptr() - page_start >= page_bytes:
+            raise RuntimeError("recurrent-state tensors must share one page per block")
 
     return first
 
@@ -211,6 +226,8 @@ class WorkerConnector:
         self._completed_saves: set[str] = set()
         self._save_completion_lock = threading.Lock()
         self._save_completion_events: dict[str, threading.Event] = {}
+        # Boundary-state jobs finished since the last worker-meta report.
+        self._completed_boundary_jobs: list[int] = []
         self._current_metadata: PegaConnectorMetadata | None = None
 
         self._pending_loads: dict[str, PyLoadState] = {}
@@ -319,6 +336,7 @@ class WorkerConnector:
         split_layer_count = 0
         split_blocks_per_logical = 1
         split_logical_blocks = 0
+        logged_kinds: set[bool] = set()
 
         for layer_name, kv_cache in kv_caches.items():
             is_recurrent_state = (
@@ -326,9 +344,18 @@ class WorkerConnector:
                 or isinstance(kv_cache, (tuple, list))
             )
             registration_tensor = _registration_tensor(kv_cache)
-            assert registration_tensor.storage_offset() == 0, (
-                f"KV cache for {layer_name} must have zero storage offset"
-            )
+
+            if is_recurrent_state not in logged_kinds:
+                logged_kinds.add(is_recurrent_state)
+                logger.info(
+                    "[PegaKVConnector] %s layer %s: shape=%s stride=%s dtype=%s storage_offset=%d",
+                    "recurrent-state" if is_recurrent_state else "attention",
+                    layer_name,
+                    tuple(registration_tensor.shape),
+                    tuple(registration_tensor.stride()),
+                    registration_tensor.dtype,
+                    registration_tensor.storage_offset(),
+                )
 
             wrapper = CudaIPCWrapper(registration_tensor)
             wrapper_bytes = pickle.dumps(wrapper)
@@ -554,11 +581,6 @@ class WorkerConnector:
     ) -> None:
         self._current_metadata = metadata
 
-        if metadata.ready_save_intents:
-            if not self._cache_groups.has_recurrent_state:
-                raise RuntimeError("ready save intents are only valid for HMA")
-            self._process_save_batch([self._make_save_task(metadata.ready_save_intents)])
-
         if not metadata.load_intents:
             return
 
@@ -767,17 +789,41 @@ class WorkerConnector:
     def wait_for_save(self) -> None:
         metadata = self._current_metadata
         self._current_metadata = None
-        if metadata is None or not metadata.save_intents:
+        if metadata is None:
             return
 
-        task = self._make_save_task(metadata.save_intents)
-        if self._cache_groups.has_recurrent_state:
-            # Align-mode recurrent states can reuse their only live block on
-            # the next scheduler step. Finish D2H before returning so the
-            # saved boundary state cannot be overwritten underneath the copy.
-            self._process_save_batch([task])
-        else:
-            self._save_queue.put(task)
+        # Both kinds of save read blocks that stay allocated until this worker
+        # reports completion: request blocks are held by request_finished /
+        # handle_preemptions, boundary-state blocks are pinned by the
+        # scheduler until the job id comes back in PegaWorkerMetadata. So
+        # every save can run asynchronously behind the forward pass.
+        if metadata.save_intents:
+            self._save_queue.put(self._make_save_task(metadata.save_intents))
+        if metadata.boundary_save_intents:
+            if not self._cache_groups.has_recurrent_state:
+                raise RuntimeError("boundary-state save intents are only valid for HMA")
+            self._save_queue.put(
+                SaveTask(
+                    metadata=PegaConnectorMetadata(
+                        save_intents={
+                            f"boundary:{job_id}": intent
+                            for job_id, intent in metadata.boundary_save_intents.items()
+                        }
+                    ),
+                    request_ids=[],
+                    boundary_job_ids=list(metadata.boundary_save_intents),
+                )
+            )
+
+    def build_connector_worker_meta(self) -> PegaWorkerMetadata | None:
+        with self._save_completion_lock:
+            if not self._completed_boundary_jobs:
+                return None
+            completed = self._completed_boundary_jobs
+            self._completed_boundary_jobs = []
+        return PegaWorkerMetadata(
+            completed_boundary_jobs=dict.fromkeys(completed, 1),
+        )
 
     def _make_save_task(self, save_intents: dict[str, SaveIntent]) -> SaveTask:
         request_ids = list(save_intents)
@@ -826,9 +872,11 @@ class WorkerConnector:
     def _process_save_batch(self, batch: list[SaveTask]) -> None:
         saves_by_layer: dict[str, tuple[list[int], list[bytes]]] = {}
         all_request_ids: list[str] = []
+        all_boundary_job_ids: list[int] = []
 
         for task in batch:
             all_request_ids.extend(task.request_ids)
+            all_boundary_job_ids.extend(task.boundary_job_ids)
 
             for save_intent in task.metadata.save_intents.values():
                 if not any(save_intent.block_ids_by_group):
@@ -925,8 +973,12 @@ class WorkerConnector:
             with self._stats_lock:
                 self._stats.record_save(save_duration, total_blocks, success)
 
-        # Always complete the request save lifecycle, even if save failed.
+        # Always complete the save lifecycle, even if save failed: the
+        # scheduler releases held/pinned blocks on completion, not success.
         self._complete_save_requests(all_request_ids)
+        if all_boundary_job_ids:
+            with self._save_completion_lock:
+                self._completed_boundary_jobs.extend(all_boundary_job_ids)
 
     def _complete_save_requests(self, request_ids: list[str]) -> None:
         completed_reqs: list[str] = []

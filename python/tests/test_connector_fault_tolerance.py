@@ -352,6 +352,7 @@ def test_load_uses_registered_layer_names_before_forward_context_names():
 
 class FakeTensor:
     shape = (1, 16)
+    dtype = "float16"
 
     def storage_offset(self) -> int:
         return 0

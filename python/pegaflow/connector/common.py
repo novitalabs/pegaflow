@@ -9,7 +9,10 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorMetadata,
+    KVConnectorWorkerMetadata,
+)
 
 from pegaflow.connector.connector_metrics import PegaKVConnectorStats, PegaPromMetrics
 from pegaflow.logging_utils import get_connector_logger
@@ -444,21 +447,47 @@ class PegaConnectorMetadata(KVConnectorMetadata):
         self,
         load_intents: dict[str, LoadIntent] | None = None,
         save_intents: dict[str, SaveIntent] | None = None,
-        ready_save_intents: dict[str, SaveIntent] | None = None,
+        boundary_save_intents: dict[int, SaveIntent] | None = None,
         preempted_req_ids: set[str] | None = None,
     ):
         super().__init__()
         # Maps request_id -> intent
         self.load_intents: dict[str, LoadIntent] = load_intents or {}
         self.save_intents: dict[str, SaveIntent] = save_intents or {}
-        self.ready_save_intents: dict[str, SaveIntent] = ready_save_intents or {}
+        # HMA: recurrent boundary states handed off by vLLM this step, keyed
+        # by a scheduler-issued job id. Their blocks are pinned by the
+        # scheduler until every worker reports the job through
+        # PegaWorkerMetadata, so they are decoupled from request lifetimes.
+        self.boundary_save_intents: dict[int, SaveIntent] = boundary_save_intents or {}
         self.preempted_req_ids: set[str] = preempted_req_ids or set()
 
     def __repr__(self) -> str:
         return (
             f"PegaConnectorMetadata(loads={len(self.load_intents)}, "
-            f"saves={len(self.save_intents)}, ready_saves={len(self.ready_save_intents)})"
+            f"saves={len(self.save_intents)}, "
+            f"boundary_saves={len(self.boundary_save_intents)})"
         )
+
+
+@dataclass
+class PegaWorkerMetadata(KVConnectorWorkerMetadata):
+    """Worker -> scheduler completion report for boundary-state save jobs.
+
+    ``completed_boundary_jobs`` maps a job id to the number of workers that
+    finished it (successfully or not). vLLM aggregates one instance per
+    worker before the scheduler sees it.
+    """
+
+    completed_boundary_jobs: dict[int, int]
+
+    def aggregate(self, other: "KVConnectorWorkerMetadata") -> "PegaWorkerMetadata":
+        if not isinstance(other, PegaWorkerMetadata):
+            raise TypeError(f"cannot aggregate {type(other).__name__} into PegaWorkerMetadata")
+        for job_id, count in other.completed_boundary_jobs.items():
+            self.completed_boundary_jobs[job_id] = (
+                self.completed_boundary_jobs.get(job_id, 0) + count
+            )
+        return self
 
 
 def parse_env_int(name: str, default: int) -> int:
@@ -601,6 +630,7 @@ __all__ = [
     "PegaConnectorMetadata",
     "PegaKVConnectorStats",
     "PegaPromMetrics",
+    "PegaWorkerMetadata",
     "RecurrentLoadHold",
     "SaveIntent",
     "TpShardTopology",
