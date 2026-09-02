@@ -115,7 +115,15 @@ def _infer_kv_cache_registration(
 
     layout = "blocks-first"
     physical_num_blocks = shape[0]
-    physical_block_size = shape[1] if len(shape) >= 2 else logical_block_size
+    if len(shape) == 4:
+        # vLLM's standardized per-layer view is ``[B, H, N, C]``: kernel
+        # blocks, head slots, tokens (states) per kernel block, content.
+        physical_block_size = shape[2]
+    elif len(shape) >= 2:
+        # Legacy MLA cache: ``[num_blocks, block_size, head_dim]``.
+        physical_block_size = shape[1]
+    else:
+        physical_block_size = logical_block_size
     physical_bytes_per_block = stride[0] * element_size
     kv_stride_bytes = 0
     segments = 1
@@ -159,12 +167,13 @@ def _registration_tensor(kv_cache) -> torch.Tensor:
     if not states or not all(isinstance(state, torch.Tensor) for state in states):
         raise TypeError("KV cache must be a tensor or a non-empty sequence of state tensors")
 
-    first = states[0]
-    if first.storage_offset() != 0:
-        raise RuntimeError("the first recurrent-state tensor must start at storage offset zero")
+    # The page is registered from the state that starts it; the others must
+    # live inside that page (same allocation, same block stride).
+    first = min(states, key=lambda state: state.data_ptr())
     storage_ptr = first.untyped_storage().data_ptr()
     num_blocks = first.shape[0]
     page_bytes = first.stride(0) * first.element_size()
+    page_start = first.data_ptr()
     for state in states:
         if state.untyped_storage().data_ptr() != storage_ptr:
             raise RuntimeError("recurrent-state tensors must share one CUDA allocation")
@@ -172,6 +181,8 @@ def _registration_tensor(kv_cache) -> torch.Tensor:
             raise RuntimeError("recurrent-state tensors must have the same block count")
         if state.stride(0) * state.element_size() != page_bytes:
             raise RuntimeError("recurrent-state tensors must have one common page stride")
+        if state.data_ptr() - page_start >= page_bytes:
+            raise RuntimeError("recurrent-state tensors must share one page per block")
 
     return first
 
@@ -319,6 +330,7 @@ class WorkerConnector:
         split_layer_count = 0
         split_blocks_per_logical = 1
         split_logical_blocks = 0
+        logged_kinds: set[bool] = set()
 
         for layer_name, kv_cache in kv_caches.items():
             is_recurrent_state = (
@@ -326,9 +338,17 @@ class WorkerConnector:
                 or isinstance(kv_cache, (tuple, list))
             )
             registration_tensor = _registration_tensor(kv_cache)
-            assert registration_tensor.storage_offset() == 0, (
-                f"KV cache for {layer_name} must have zero storage offset"
-            )
+            if is_recurrent_state not in logged_kinds:
+                logged_kinds.add(is_recurrent_state)
+                logger.info(
+                    "[PegaKVConnector] %s layer %s: shape=%s stride=%s dtype=%s storage_offset=%d",
+                    "recurrent-state" if is_recurrent_state else "attention",
+                    layer_name,
+                    tuple(registration_tensor.shape),
+                    tuple(registration_tensor.stride()),
+                    registration_tensor.dtype,
+                    registration_tensor.storage_offset(),
+                )
 
             wrapper = CudaIPCWrapper(registration_tensor)
             wrapper_bytes = pickle.dumps(wrapper)

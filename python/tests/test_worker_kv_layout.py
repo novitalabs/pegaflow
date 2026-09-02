@@ -43,6 +43,23 @@ def test_mla_blocks_first_physical_rows_are_grouped_into_logical_blocks():
     assert info.physical_blocks_per_logical_block == 2
 
 
+def test_mla_standard_4d_view_reads_tokens_from_the_third_axis():
+    """vLLM's standardized view is ``[B, H, N, C]``; N is the kernel block."""
+    info = _infer_kv_cache_registration(
+        FakeTensor(
+            shape=(6, 1, 64, 576),
+            stride=(64 * 576, 64 * 576, 576, 1),
+            element_size=2,
+        ),
+        logical_block_size=128,
+        is_mla=True,
+    )
+
+    assert info.num_blocks == 3
+    assert info.bytes_per_block == 2 * 64 * 576 * 2
+    assert info.physical_blocks_per_logical_block == 2
+
+
 def test_non_mla_kv_first_uses_legacy_block_stride():
     info = _infer_kv_cache_registration(
         FakeTensor(

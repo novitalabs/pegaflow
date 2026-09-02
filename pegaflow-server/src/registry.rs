@@ -186,8 +186,20 @@ impl CudaTensorRegistry {
             let device_index: Option<i32> = device_attr.getattr("index")?.extract()?;
             let resolved_device = device_index.unwrap_or(device_id);
 
+            // The view may start partway into its allocation (vLLM hands out
+            // per-layer views of one shared KV buffer); register the bytes
+            // from the view's start to the end of the allocation.
             let storage = tensor.call_method0("untyped_storage")?;
-            let size_bytes: usize = storage.call_method0("nbytes")?.extract()?;
+            let storage_bytes: usize = storage.call_method0("nbytes")?.extract()?;
+            let storage_offset: usize = tensor.call_method0("storage_offset")?.extract()?;
+            let element_size: usize = tensor.call_method0("element_size")?.extract()?;
+            let size_bytes = storage_bytes
+                .checked_sub(storage_offset * element_size)
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err(
+                        "tensor storage offset lies past the end of its allocation",
+                    )
+                })?;
 
             let tensor_owned = tensor.unbind();
 

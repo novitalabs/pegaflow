@@ -18,7 +18,6 @@ class CudaIPCWrapper:
     """Wrapper for CUDA IPC handle with tensor metadata."""
 
     def __init__(self, tensor: torch.Tensor):
-        assert tensor.storage_offset() == 0, "Tensor must have zero storage offset"
         assert tensor.is_contiguous(), "Tensor must be contiguous"
 
         storage = tensor.untyped_storage()

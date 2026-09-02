@@ -227,9 +227,6 @@ class ClientContext:
         for layer_name, kv_cache in kv_caches.items():
             if not kv_cache.is_contiguous():
                 kv_cache = kv_cache.contiguous()
-            if kv_cache.storage_offset() != 0:
-                raise ValueError(f"KV cache for {layer_name} must have zero storage offset")
-
             wrapper = CudaIPCWrapper(kv_cache)
             wrapper_bytes = pickle.dumps(wrapper)
 
