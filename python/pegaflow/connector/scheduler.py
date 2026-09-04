@@ -66,6 +66,10 @@ class _QueryProbe:
     # Hybrid (HMA): attention-only prefix hit before the recurrent reconcile
     # shrank it; the junction hint needs it even when the hit drops to zero.
     attention_hit_blocks: int = 0
+    # Blocks pinned by `leases` on the server. `hit_blocks` may shrink below
+    # this after the hybrid reconcile or the last-token clamp; the load must
+    # still address every leased block (extra ones as `None` targets).
+    leased_blocks: int = 0
 
     @property
     def is_ready(self) -> bool:
@@ -91,6 +95,7 @@ class _QueryProbe:
                 f"{len(self.query_hashes)} hashes"
             )
         self.hit_blocks = hit_blocks
+        self.leased_blocks = hit_blocks
         self.leases = ready.leases
         self.recurrent_hold = ready.recurrent_hold
         self.usable_positions = frozenset(ready.usable_positions)
@@ -517,17 +522,22 @@ class SchedulerConnector:
             start_block_idx = num_computed_blocks
             vbs = self._ctx.virtual_block_size
             num_load_blocks = (num_external_tokens + vbs - 1) // vbs
+            pending_probe = self._pending_query_probes.get(req_id)
             try:
                 load_block_ids_by_group = self._load_block_ids_by_group(
                     block_ids_by_group,
                     start_block_idx,
                     num_load_blocks,
+                    leased_blocks=(
+                        pending_probe.leased_blocks
+                        if pending_probe is not None
+                        else num_load_blocks
+                    ),
                 )
             except RuntimeError:
                 self._release_pending_query_probe(req_id)
                 raise
 
-            pending_probe = self._pending_query_probes.get(req_id)
             load_intent = LoadIntent(
                 block_ids_by_group=load_block_ids_by_group,
                 leases=pending_probe.leases if pending_probe is not None else (),
@@ -625,6 +635,7 @@ class SchedulerConnector:
                     if new_block_ids
                     else [[] for _ in range(self._cache_groups.group_count)]
                 )
+                self._rebase_resumed_request(req_id)
             elif new_block_ids:
                 for allocated, new_group in zip(
                     self._allocated_blocks[req_id],
@@ -896,6 +907,27 @@ class SchedulerConnector:
             return query_hashes, 0
         return query_hashes + (tail[0],), tail[1]
 
+    def _rebase_resumed_request(self, req_id: str) -> None:
+        """Restart connector-side bookkeeping when vLLM resumes a preempted request.
+
+        Preemption frees the request's blocks and resets vLLM's
+        `num_computed_tokens`; on resume the request goes back through the
+        waiting queue, so `get_num_new_matched_tokens` has already refreshed
+        `_external_matched_blocks` and the block table mirror was rebuilt from
+        the resume step. Everything derived from the first life is stale:
+        the scheduled-token accumulator would place blocks the new table does
+        not hold yet (and, worse, mark a partially recomputed block as
+        saveable), and the offset of the first locally computed block may
+        have moved. Blocks already stored keep their progress: hashes did
+        not change, so `_next_stored_block_idx` only ever advances.
+        """
+        base_block_idx = self._external_matched_blocks.get(req_id, 0)
+        self._block_index_offsets[req_id] = base_block_idx
+        self._scheduled_tokens[req_id] = 0
+        self._next_stored_block_idx[req_id] = max(
+            self._next_stored_block_idx.get(req_id, 0), base_block_idx
+        )
+
     def _consume_full_block_saves(self, req_id: str) -> SaveIntent | None:
         # block_hashes are at virtual_block_size granularity, 1-to-1 with block_ids.
         block_hashes = self._block_hashes.get(req_id)
@@ -924,12 +956,16 @@ class SchedulerConnector:
         # _allocated_blocks tracks request block IDs in global request order.
         # In external-hit cases, the prefix-loaded block IDs are still present at
         # the front, so save intents must slice by global block index rather than
-        # rebasing to a local-only view.
-        local_saveable = min(
+        # rebasing to a local-only view. The table length is therefore a global
+        # bound of its own: `base_block_idx + scheduled` says which positions
+        # hold valid KV, the table says which of them we can address, and a
+        # full-block hash exists for the whole prompt from the start. Slicing
+        # past the table would silently drop block IDs but not hashes.
+        saveable_block_idx = min(
+            len(block_hashes),
             min(attention_lengths, default=0),
-            scheduled // self._ctx.virtual_block_size,
+            base_block_idx + scheduled // self._ctx.virtual_block_size,
         )
-        saveable_block_idx = min(len(block_hashes), base_block_idx + local_saveable)
         new_blocks = saveable_block_idx - start_block_idx
         if new_blocks <= 0:
             return None
@@ -977,7 +1013,16 @@ class SchedulerConnector:
         block_ids_by_group: tuple[tuple[int, ...], ...],
         start_block_idx: int,
         num_load_blocks: int,
+        leased_blocks: int | None = None,
     ) -> tuple[tuple[int | None, ...], ...]:
+        """Destination block IDs per cache group, one entry per leased block.
+
+        The engine walks the lease and the destination vector in lock step,
+        so the vector must be exactly as long as the lease. A hit can end up
+        shorter than the lease (hybrid reconcile falls back to an earlier
+        checkpoint; the final prompt token is recomputed): the leased blocks
+        past `num_load_blocks` get `None` targets and are skipped.
+        """
         end_block_idx = start_block_idx + num_load_blocks
         available = [len(group) for group in block_ids_by_group]
         if any(length < end_block_idx for length in available):
@@ -986,12 +1031,20 @@ class SchedulerConnector:
                 f"available_by_group={available}"
             )
 
+        if leased_blocks is None:
+            leased_blocks = num_load_blocks
+        if leased_blocks < num_load_blocks:
+            raise RuntimeError(
+                f"load block mismatch: leased={leased_blocks} count={num_load_blocks}"
+            )
+        padding = (None,) * (leased_blocks - num_load_blocks)
+
         result: list[tuple[int | None, ...]] = []
         for group_index, block_ids in enumerate(block_ids_by_group):
-            destinations = block_ids[start_block_idx:end_block_idx]
+            destinations: tuple[int | None, ...] = block_ids[start_block_idx:end_block_idx]
             if group_index in self._cache_groups.recurrent_group_indices and destinations:
                 destinations = (None,) * (len(destinations) - 1) + (destinations[-1],)
-            result.append(destinations)
+            result.append(destinations + padding)
         return tuple(result)
 
     def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:

@@ -223,3 +223,40 @@ def test_preemption_waits_for_every_save_task():
             preemption_thread.join(timeout=1)
 
     assert not preemption_thread.is_alive()
+
+
+def test_malformed_save_intent_is_skipped_and_still_completes():
+    """A scheduler bug must not take the save thread down with it: the
+    request's blocks are released (unsaved) and other intents in the batch
+    still reach the store."""
+    worker = make_worker()
+    worker._registered_layers = ["layer"]
+    worker._ctx.engine_client.save.return_value = (True, "")
+    worker._current_metadata = PegaConnectorMetadata(
+        save_intents={
+            "torn": SaveIntent(block_ids_by_group=((1,),), block_hashes=(b"h0", b"h1")),
+            "good": SaveIntent(block_ids_by_group=((2,),), block_hashes=(b"h2",)),
+        }
+    )
+    worker.wait_for_save()
+
+    process_next_save(worker)
+
+    (_, _, _, _, saves), _ = worker._ctx.engine_client.save.call_args
+    assert saves == [("layer", [2], [b"h2"])]
+    finished_sending, _ = worker.get_finished({"torn", "good"})
+    assert finished_sending == {"torn", "good"}
+
+
+def test_save_worker_survives_a_failing_batch():
+    worker = make_worker()
+    worker._registered_layers = ["layer"]
+    completion = enqueue_save(worker)
+    worker._save_queue.put(None)
+
+    with patch("torch.cuda.synchronize", side_effect=RuntimeError("device lost")):
+        worker._save_worker()
+
+    assert completion.is_set()
+    finished_sending, _ = worker.get_finished({"request"})
+    assert finished_sending == {"request"}
