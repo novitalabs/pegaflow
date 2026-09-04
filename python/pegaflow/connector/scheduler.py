@@ -66,6 +66,10 @@ class _QueryProbe:
     # Hybrid (HMA): attention-only prefix hit before the recurrent reconcile
     # shrank it; the junction hint needs it even when the hit drops to zero.
     attention_hit_blocks: int = 0
+    # Blocks pinned by `leases` on the server. `hit_blocks` may shrink below
+    # this after the hybrid reconcile or the last-token clamp; the load must
+    # still address every leased block (extra ones as `None` targets).
+    leased_blocks: int = 0
 
     @property
     def is_ready(self) -> bool:
@@ -91,6 +95,7 @@ class _QueryProbe:
                 f"{len(self.query_hashes)} hashes"
             )
         self.hit_blocks = hit_blocks
+        self.leased_blocks = hit_blocks
         self.leases = ready.leases
         self.recurrent_hold = ready.recurrent_hold
         self.usable_positions = frozenset(ready.usable_positions)
@@ -517,17 +522,22 @@ class SchedulerConnector:
             start_block_idx = num_computed_blocks
             vbs = self._ctx.virtual_block_size
             num_load_blocks = (num_external_tokens + vbs - 1) // vbs
+            pending_probe = self._pending_query_probes.get(req_id)
             try:
                 load_block_ids_by_group = self._load_block_ids_by_group(
                     block_ids_by_group,
                     start_block_idx,
                     num_load_blocks,
+                    leased_blocks=(
+                        pending_probe.leased_blocks
+                        if pending_probe is not None
+                        else num_load_blocks
+                    ),
                 )
             except RuntimeError:
                 self._release_pending_query_probe(req_id)
                 raise
 
-            pending_probe = self._pending_query_probes.get(req_id)
             load_intent = LoadIntent(
                 block_ids_by_group=load_block_ids_by_group,
                 leases=pending_probe.leases if pending_probe is not None else (),
@@ -1003,7 +1013,16 @@ class SchedulerConnector:
         block_ids_by_group: tuple[tuple[int, ...], ...],
         start_block_idx: int,
         num_load_blocks: int,
+        leased_blocks: int | None = None,
     ) -> tuple[tuple[int | None, ...], ...]:
+        """Destination block IDs per cache group, one entry per leased block.
+
+        The engine walks the lease and the destination vector in lock step,
+        so the vector must be exactly as long as the lease. A hit can end up
+        shorter than the lease (hybrid reconcile falls back to an earlier
+        checkpoint; the final prompt token is recomputed): the leased blocks
+        past `num_load_blocks` get `None` targets and are skipped.
+        """
         end_block_idx = start_block_idx + num_load_blocks
         available = [len(group) for group in block_ids_by_group]
         if any(length < end_block_idx for length in available):
@@ -1012,12 +1031,20 @@ class SchedulerConnector:
                 f"available_by_group={available}"
             )
 
+        if leased_blocks is None:
+            leased_blocks = num_load_blocks
+        if leased_blocks < num_load_blocks:
+            raise RuntimeError(
+                f"load block mismatch: leased={leased_blocks} count={num_load_blocks}"
+            )
+        padding = (None,) * (leased_blocks - num_load_blocks)
+
         result: list[tuple[int | None, ...]] = []
         for group_index, block_ids in enumerate(block_ids_by_group):
-            destinations = block_ids[start_block_idx:end_block_idx]
+            destinations: tuple[int | None, ...] = block_ids[start_block_idx:end_block_idx]
             if group_index in self._cache_groups.recurrent_group_indices and destinations:
                 destinations = (None,) * (len(destinations) - 1) + (destinations[-1],)
-            result.append(destinations)
+            result.append(destinations + padding)
         return tuple(result)
 
     def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:

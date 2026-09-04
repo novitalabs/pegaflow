@@ -334,3 +334,40 @@ def test_junction_hint_is_hma_only():
     scheduler._hint_shared_prefix_boundary(request, 0, 8, 0)
 
     assert request.shared_prefix_boundary == 0
+
+
+def test_load_targets_cover_every_leased_block_when_the_hit_shrinks():
+    """The server pins `num_hit_blocks` blocks under the query lease and walks
+    lease and destination vector in lock step. An exact-prompt repeat clamps
+    the hit by the recomputed final token, the reconcile drops to the
+    previous checkpoint, and the load must still send one target per leased
+    block (`None` for the ones it no longer wants) or the engine rejects it:
+    `query lease block count 5 does not match destination block count 4`."""
+    scheduler, _ = _make_scheduler()
+    scheduler._count_available_block_prefix = MagicMock(
+        return_value=ShardedQueryReady(
+            5,
+            (b"lease",),
+            recurrent_hold=RecurrentLoadHold(
+                leases=((b"membership",),),
+                hit_positions=(((3, 4),),),
+                checkpoint=4,
+            ),
+            usable_positions=(3, 4),
+            attention_hit_blocks=5,
+        )
+    )
+    request = _request(num_tokens=5 * VBS, num_hashes=5)
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (4 * VBS, True)
+
+    blocks = SimpleNamespace(
+        get_block_ids=lambda: ([10, 11, 12, 13, 14], [20, 21, 22, 23, 24]),
+        blocks=[[SimpleNamespace(block_hash=None)] * 5] * 2,
+    )
+    scheduler.update_state_after_alloc(request, blocks, 4 * VBS)
+
+    intent = scheduler._pending_load_intents["r1"]
+    assert intent.num_tokens == 4 * VBS
+    assert intent.block_ids_by_group == ((10, 11, 12, 13, None), (None, None, None, 23, None))
+    assert intent.recurrent_hold.checkpoint == 3
