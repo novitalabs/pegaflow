@@ -625,6 +625,7 @@ class SchedulerConnector:
                     if new_block_ids
                     else [[] for _ in range(self._cache_groups.group_count)]
                 )
+                self._rebase_resumed_request(req_id)
             elif new_block_ids:
                 for allocated, new_group in zip(
                     self._allocated_blocks[req_id],
@@ -896,6 +897,27 @@ class SchedulerConnector:
             return query_hashes, 0
         return query_hashes + (tail[0],), tail[1]
 
+    def _rebase_resumed_request(self, req_id: str) -> None:
+        """Restart connector-side bookkeeping when vLLM resumes a preempted request.
+
+        Preemption frees the request's blocks and resets vLLM's
+        `num_computed_tokens`; on resume the request goes back through the
+        waiting queue, so `get_num_new_matched_tokens` has already refreshed
+        `_external_matched_blocks` and the block table mirror was rebuilt from
+        the resume step. Everything derived from the first life is stale:
+        the scheduled-token accumulator would place blocks the new table does
+        not hold yet (and, worse, mark a partially recomputed block as
+        saveable), and the offset of the first locally computed block may
+        have moved. Blocks already stored keep their progress: hashes did
+        not change, so `_next_stored_block_idx` only ever advances.
+        """
+        base_block_idx = self._external_matched_blocks.get(req_id, 0)
+        self._block_index_offsets[req_id] = base_block_idx
+        self._scheduled_tokens[req_id] = 0
+        self._next_stored_block_idx[req_id] = max(
+            self._next_stored_block_idx.get(req_id, 0), base_block_idx
+        )
+
     def _consume_full_block_saves(self, req_id: str) -> SaveIntent | None:
         # block_hashes are at virtual_block_size granularity, 1-to-1 with block_ids.
         block_hashes = self._block_hashes.get(req_id)
@@ -924,12 +946,16 @@ class SchedulerConnector:
         # _allocated_blocks tracks request block IDs in global request order.
         # In external-hit cases, the prefix-loaded block IDs are still present at
         # the front, so save intents must slice by global block index rather than
-        # rebasing to a local-only view.
-        local_saveable = min(
+        # rebasing to a local-only view. The table length is therefore a global
+        # bound of its own: `base_block_idx + scheduled` says which positions
+        # hold valid KV, the table says which of them we can address, and a
+        # full-block hash exists for the whole prompt from the start. Slicing
+        # past the table would silently drop block IDs but not hashes.
+        saveable_block_idx = min(
+            len(block_hashes),
             min(attention_lengths, default=0),
-            scheduled // self._ctx.virtual_block_size,
+            base_block_idx + scheduled // self._ctx.virtual_block_size,
         )
-        saveable_block_idx = min(len(block_hashes), base_block_idx + local_saveable)
         new_blocks = saveable_block_idx - start_block_idx
         if new_blocks <= 0:
             return None

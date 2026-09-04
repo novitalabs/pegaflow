@@ -6,7 +6,7 @@ import pickle
 import queue
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -855,7 +855,7 @@ class WorkerConnector:
                 try:
                     t = self._save_queue.get_nowait()
                     if t is None:
-                        self._process_save_batch(batch)
+                        self._run_save_batch(batch)
                         self._save_queue.task_done()
                         logger.debug("[PegaKVConnector] Save worker thread stopped")
                         return
@@ -863,122 +863,147 @@ class WorkerConnector:
                 except queue.Empty:
                     break
 
-            self._process_save_batch(batch)
+            self._run_save_batch(batch)
             for _ in batch:
                 self._save_queue.task_done()
 
         logger.debug("[PegaKVConnector] Save worker thread stopped")
 
+    def _run_save_batch(self, batch: list[SaveTask]) -> None:
+        # The save thread is the only consumer of the queue and the only
+        # path that reports save completion to the scheduler. If it died on
+        # an unexpected error every later request would stay held (blocks
+        # never freed) and the engine would bleed KV cache until restart.
+        try:
+            self._process_save_batch(batch)
+        except Exception:
+            logger.exception(
+                "[PegaKVConnector] save batch failed for %d task(s); blocks released without save",
+                len(batch),
+            )
+
     def _process_save_batch(self, batch: list[SaveTask]) -> None:
+        all_request_ids = [req_id for task in batch for req_id in task.request_ids]
+        all_boundary_job_ids = [job_id for task in batch for job_id in task.boundary_job_ids]
+        try:
+            self._save_batch(batch)
+        finally:
+            # Always complete the save lifecycle, even if save failed: the
+            # scheduler releases held/pinned blocks on completion, not success.
+            self._complete_save_requests(all_request_ids)
+            if all_boundary_job_ids:
+                with self._save_completion_lock:
+                    self._completed_boundary_jobs.extend(all_boundary_job_ids)
+
+    def _save_batch(self, batch: list[SaveTask]) -> None:
         saves_by_layer: dict[str, tuple[list[int], list[bytes]]] = {}
-        all_request_ids: list[str] = []
-        all_boundary_job_ids: list[int] = []
 
         for task in batch:
-            all_request_ids.extend(task.request_ids)
-            all_boundary_job_ids.extend(task.boundary_job_ids)
-
-            for save_intent in task.metadata.save_intents.values():
-                if not any(save_intent.block_ids_by_group):
+            for req_id, save_intent in task.metadata.save_intents.items():
+                try:
+                    layer_saves = tuple(self._layer_saves(save_intent))
+                except Exception:
+                    # A malformed intent is a scheduler-side bug; drop this
+                    # request's save rather than the whole batch (or thread).
+                    logger.exception(
+                        "[PegaKVConnector] req=%s malformed save intent skipped", req_id
+                    )
                     continue
-
-                if self._cross_layer_mode:
-                    target_layers = (self._cross_layer_key,)
-                elif self._page_first:
-                    assert self._registered_layers, (
-                        "KV caches must be registered before submitting save intents"
-                    )
-                    target_layers = tuple(self._registered_layers)
-                else:
-                    assert self._registered_layers, (
-                        "KV caches must be registered before submitting save intents"
-                    )
-                    target_layers = tuple(self._registered_layers)
-
-                for layer_name in target_layers:
-                    group_index = self._layer_to_group.get(layer_name, 0)
-                    try:
-                        block_ids = save_intent.block_ids_by_group[group_index]
-                    except IndexError as exc:
-                        raise RuntimeError(
-                            f"save intent is missing cache group {group_index} for {layer_name}"
-                        ) from exc
-                    block_hashes = save_intent.block_hashes
-                    if len(block_ids) != len(block_hashes):
-                        raise RuntimeError(
-                            f"save block/hash count mismatch for {layer_name}: "
-                            f"blocks={len(block_ids)} hashes={len(block_hashes)}"
-                        )
-                    non_null = tuple(
-                        (block_id, block_hash)
-                        for block_id, block_hash in zip(block_ids, block_hashes, strict=True)
-                        if block_id != 0
-                    )
-                    block_ids = tuple(block_id for block_id, _ in non_null)
-                    block_hashes = tuple(block_hash for _, block_hash in non_null)
-                    if self._page_first and not self._use_mla_layer_split_registration:
-                        # Full-replica (one shard): every rank holds all layers,
-                        # so spread the whole-page writes across ranks by block
-                        # stripe. Layer-split ranks are each the sole writer of
-                        # their shard and keep the full block set (no striping).
-                        block_ids, block_hashes = self._block_shard(block_ids, block_hashes)
-                    if not block_ids:
-                        continue
+                for layer_name, block_ids, block_hashes in layer_saves:
                     if layer_name not in saves_by_layer:
                         saves_by_layer[layer_name] = ([], [])
-
                     saves_by_layer[layer_name][0].extend(block_ids)
                     saves_by_layer[layer_name][1].extend(block_hashes)
 
-        if saves_by_layer:
-            # Ensure all GPU kernels have completed before reading KV cache
-            # Otherwise we may copy uninitialized memory (attention kernel is async)
-            torch.cuda.synchronize(self._torch_device)
+        if not saves_by_layer:
+            return
 
-            saves_list = [(name, ids, hashes) for name, (ids, hashes) in saves_by_layer.items()]
-            total_blocks = sum(len(ids) for _, ids, _ in saves_list)
+        # Ensure all GPU kernels have completed before reading KV cache
+        # Otherwise we may copy uninitialized memory (attention kernel is async)
+        torch.cuda.synchronize(self._torch_device)
 
-            save_start = time.perf_counter()
-            success = False
+        saves_list = [(name, ids, hashes) for name, (ids, hashes) in saves_by_layer.items()]
+        total_blocks = sum(len(ids) for _, ids, _ in saves_list)
 
-            try:
-                ok, message = self._ctx.engine_client.save(
-                    self._ctx.instance_id,
-                    self._ctx.effective_tp_rank,
-                    self._ctx.pp_rank,
-                    self._ctx.device_id,
-                    saves_list,
-                )
+        save_start = time.perf_counter()
+        success = False
 
-                if not ok:
-                    logger.error(
-                        "[PegaKVConnector] Save batch failed: %s (continuing without save)",
-                        message,
-                    )
-                else:
-                    success = True
-                    logger.debug(
-                        "[PegaKVConnector] Batch saved %d layers, %d total blocks",
-                        len(saves_list),
-                        total_blocks,
-                    )
-            except Exception as e:
+        try:
+            ok, message = self._ctx.engine_client.save(
+                self._ctx.instance_id,
+                self._ctx.effective_tp_rank,
+                self._ctx.pp_rank,
+                self._ctx.device_id,
+                saves_list,
+            )
+
+            if not ok:
                 logger.error(
-                    "[PegaKVConnector] Save RPC exception: %s (continuing without save)",
-                    e,
+                    "[PegaKVConnector] Save batch failed: %s (continuing without save)",
+                    message,
                 )
+            else:
+                success = True
+                logger.debug(
+                    "[PegaKVConnector] Batch saved %d layers, %d total blocks",
+                    len(saves_list),
+                    total_blocks,
+                )
+        except Exception as e:
+            logger.error(
+                "[PegaKVConnector] Save RPC exception: %s (continuing without save)",
+                e,
+            )
 
-            save_duration = time.perf_counter() - save_start
+        save_duration = time.perf_counter() - save_start
 
-            with self._stats_lock:
-                self._stats.record_save(save_duration, total_blocks, success)
+        with self._stats_lock:
+            self._stats.record_save(save_duration, total_blocks, success)
 
-        # Always complete the save lifecycle, even if save failed: the
-        # scheduler releases held/pinned blocks on completion, not success.
-        self._complete_save_requests(all_request_ids)
-        if all_boundary_job_ids:
-            with self._save_completion_lock:
-                self._completed_boundary_jobs.extend(all_boundary_job_ids)
+    def _layer_saves(
+        self, save_intent: SaveIntent
+    ) -> Iterator[tuple[str, tuple[int, ...], tuple[bytes, ...]]]:
+        """Yield `(layer, block_ids, block_hashes)` this rank writes for one intent."""
+        if not any(save_intent.block_ids_by_group):
+            return
+
+        if self._cross_layer_mode:
+            target_layers = (self._cross_layer_key,)
+        else:
+            assert self._registered_layers, (
+                "KV caches must be registered before submitting save intents"
+            )
+            target_layers = tuple(self._registered_layers)
+
+        for layer_name in target_layers:
+            group_index = self._layer_to_group.get(layer_name, 0)
+            try:
+                block_ids = save_intent.block_ids_by_group[group_index]
+            except IndexError as exc:
+                raise RuntimeError(
+                    f"save intent is missing cache group {group_index} for {layer_name}"
+                ) from exc
+            block_hashes = save_intent.block_hashes
+            if len(block_ids) != len(block_hashes):
+                raise RuntimeError(
+                    f"save block/hash count mismatch for {layer_name}: "
+                    f"blocks={len(block_ids)} hashes={len(block_hashes)}"
+                )
+            non_null = tuple(
+                (block_id, block_hash)
+                for block_id, block_hash in zip(block_ids, block_hashes, strict=True)
+                if block_id != 0
+            )
+            block_ids = tuple(block_id for block_id, _ in non_null)
+            block_hashes = tuple(block_hash for _, block_hash in non_null)
+            if self._page_first and not self._use_mla_layer_split_registration:
+                # Full-replica (one shard): every rank holds all layers,
+                # so spread the whole-page writes across ranks by block
+                # stripe. Layer-split ranks are each the sole writer of
+                # their shard and keep the full block set (no striping).
+                block_ids, block_hashes = self._block_shard(block_ids, block_hashes)
+            if block_ids:
+                yield layer_name, block_ids, block_hashes
 
     def _complete_save_requests(self, request_ids: list[str]) -> None:
         completed_reqs: list[str] = []
