@@ -621,6 +621,10 @@ class SchedulerConnector:
                 self._allocated_blocks[req_id] = [
                     list(group) for group in self._copy_block_ids_by_group(req.block_ids)
                 ]
+            # The V2 model runner reports resumed requests here rather than in
+            # `scheduled_cached_reqs.resumed_req_ids`; for a fresh request the
+            # rebase is a no-op.
+            self._rebase_resumed_request(req_id)
 
             if self._ctx.read_enabled:
                 self._scheduled_tokens[req_id] += num_tokens
@@ -748,6 +752,12 @@ class SchedulerConnector:
             block_hashes = self._request_block_hashes(request)
             self._block_hashes[req_id] = block_hashes
             saved = self._saved_boundaries.setdefault(req_id, set())
+            # vLLM allocates a real recurrent block per externally loaded
+            # block but the load fills only the checkpoint; after the load it
+            # still caches (and offers) every block of the loaded prefix. Those
+            # blocks hold no state this request computed, so only boundaries
+            # past the loaded prefix may be saved.
+            loaded_blocks = self._external_matched_blocks.get(req_id, 0)
             rows: list[tuple[int, int, bytes]] = []
             for group_index, block_id, boundary_tokens in entries:
                 if group_index not in recurrent or block_id <= 0:
@@ -755,7 +765,7 @@ class SchedulerConnector:
                 if boundary_tokens <= 0 or boundary_tokens % vbs != 0:
                     continue
                 hash_index = boundary_tokens // vbs - 1
-                if hash_index >= len(block_hashes):
+                if hash_index < loaded_blocks or hash_index >= len(block_hashes):
                     continue
                 key = (group_index, hash_index)
                 if key in saved:

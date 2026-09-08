@@ -26,7 +26,7 @@ from .unit_stubs import install_connector_unit_stubs
 
 install_connector_unit_stubs()
 
-from pegaflow.connector.common import ConnectorContext, PegaConnectorMode
+from pegaflow.connector.common import ConnectorContext, PegaConnectorMode, SaveIntent
 from pegaflow.connector.scheduler import SchedulerConnector
 
 VBS = 16
@@ -230,3 +230,54 @@ def test_full_block_saves_never_exceed_the_mirrored_table(scheduled_tokens: int)
     _assert_consistent(intent)
     assert intent.block_ids_by_group == ((200, 201),)
     assert intent.block_hashes == hashes[6:8]
+
+
+def test_resumed_request_reported_as_new_is_rebased():
+    """The V2 model runner moves resumed requests into `scheduled_new_reqs`;
+    the first life's accumulator must not place blocks in the new table."""
+    scheduler = _make_scheduler()
+    req = _make_request("r1", 19)
+    hashes = tuple(req.block_hashes)
+
+    scheduler._external_matched_blocks["r1"] = 0
+    scheduler.update_state_after_alloc(req, None, 0)
+    intent = _step(
+        scheduler,
+        "r1",
+        block_ids=list(range(0, 5)),
+        num_tokens=4 * VBS + 8,
+        num_computed_tokens=0,
+        new=True,
+    )
+    assert intent is not None and intent.block_hashes == hashes[:4]
+
+    # Preempted; resumed as a "new" request with a table covering the first chunk only.
+    scheduler._external_matched_blocks["r1"] = 0
+    scheduler.update_state_after_alloc(req, None, 0)
+    intent = _step(
+        scheduler,
+        "r1",
+        block_ids=list(range(10, 12)),
+        num_tokens=VBS + 8,
+        num_computed_tokens=0,
+        new=True,
+    )
+    assert intent is None  # blocks 0..3 already stored, block 1 only partially recomputed
+    # Without the rebase the first life's accumulator (4 blocks + 8) plus this
+    # chunk would claim 8 full blocks and save block 4 with 8 valid rows.
+    intent = _step(
+        scheduler,
+        "r1",
+        block_ids=list(range(12, 15)),
+        num_tokens=3 * VBS,
+        num_computed_tokens=VBS + 8,
+    )
+    assert intent is None
+    intent = _step(
+        scheduler,
+        "r1",
+        block_ids=[],
+        num_tokens=VBS - 8,
+        num_computed_tokens=4 * VBS + 8,
+    )
+    assert intent == SaveIntent(block_ids_by_group=((14,),), block_hashes=(hashes[4],))

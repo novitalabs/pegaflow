@@ -371,3 +371,23 @@ def test_load_targets_cover_every_leased_block_when_the_hit_shrinks():
     assert intent.num_tokens == 4 * VBS
     assert intent.block_ids_by_group == ((10, 11, 12, 13, None), (None, None, None, 23, None))
     assert intent.recurrent_hold.checkpoint == 3
+
+
+def test_boundaries_inside_the_loaded_prefix_are_not_saved():
+    """vLLM offers every block of an externally loaded prefix after the load,
+    but only the checkpoint block was written; saving the rest would file
+    stale state under valid hashes."""
+    scheduler, pool = _make_scheduler()
+    _register_request(scheduler, "r1", 6)
+    scheduler._external_matched_blocks["r1"] = 3  # blocks 0..2 came from the store
+
+    metadata = scheduler.build_connector_meta(
+        _scheduler_output(
+            {"r1": [(1, 21, 1 * VBS), (1, 22, 2 * VBS), (1, 23, 3 * VBS), (1, 24, 4 * VBS)]}
+        )
+    )
+
+    assert metadata.boundary_save_intents == {
+        0: SaveIntent(block_ids_by_group=((0,), (24,)), block_hashes=(_hash(3),))
+    }
+    assert pool.touched == [24]

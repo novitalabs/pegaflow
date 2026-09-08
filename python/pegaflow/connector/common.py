@@ -583,7 +583,8 @@ def derive_namespace(
       default full-slot registration.
     - `is_hma_enabled`: vLLM's hybrid cache manager changes whether hybrid
       cache layouts can share one logical block namespace.
-    - `hash_block_size`: decides which chained hash keys a block.
+    - `hash_block_size` / `block_size`: decide which chained hash keys a block
+      and how many tokens it spans; `mamba_*`: recurrent state layout.
     """
     model_config = vllm_config.model_config
     cache_config = vllm_config.cache_config
@@ -604,6 +605,9 @@ def derive_namespace(
         "cross_layer_blocks": cross_layer_blocks,
         "mla_layer_split_kv_cache": bool(additional_config.get("mla_layer_split_kv_cache", False)),
         "hash_block_size": hash_block_size,
+        "block_size": getattr(cache_config, "block_size", None),
+        "mamba_cache_mode": getattr(cache_config, "mamba_cache_mode", None),
+        "mamba_ssm_cache_dtype": getattr(cache_config, "mamba_ssm_cache_dtype", None),
     }
 
     factor_str = str(sorted(factors.items()))
