@@ -144,6 +144,9 @@ class ConnectorContext:
     mode: PegaConnectorMode = PegaConnectorMode.READ_WRITE
     wait_for_full_prefix: bool = False
     tp_shards: TpShardTopology | None = None
+    # Token span of one `Request.block_hashes` entry; `None` means one per
+    # scheduler block.
+    hash_block_size: int | None = None
 
     @property
     def read_enabled(self) -> bool:
@@ -158,6 +161,17 @@ class ConnectorContext:
         granularity of scheduler block hashes.
         """
         return self.block_size * self.dcp_world_size
+
+    @property
+    def hash_scale(self) -> int:
+        """`Request.block_hashes` entries per scheduler block.
+
+        vLLM hashes every `hash_block_size` tokens, which is finer than the
+        scheduler block for hybrid models (GCD of the group block sizes, or
+        `--prefix-match-unit`). Each hash chains over its whole prefix, so the
+        last one inside a block is that block's key.
+        """
+        return self.virtual_block_size // (self.hash_block_size or self.virtual_block_size)
 
     @property
     def effective_tp_rank(self) -> int:
@@ -551,6 +565,7 @@ def derive_namespace(
     dcp_world_size: int = 1,
     pcp_world_size: int = 1,
     cross_layer_blocks: bool = False,
+    hash_block_size: int | None = None,
 ) -> str:
     """
     Derive namespace for storage isolation.
@@ -568,6 +583,7 @@ def derive_namespace(
       default full-slot registration.
     - `is_hma_enabled`: vLLM's hybrid cache manager changes whether hybrid
       cache layouts can share one logical block namespace.
+    - `hash_block_size`: decides which chained hash keys a block.
     """
     model_config = vllm_config.model_config
     cache_config = vllm_config.cache_config
@@ -587,6 +603,7 @@ def derive_namespace(
         "pcp_world_size": pcp_world_size,
         "cross_layer_blocks": cross_layer_blocks,
         "mla_layer_split_kv_cache": bool(additional_config.get("mla_layer_split_kv_cache", False)),
+        "hash_block_size": hash_block_size,
     }
 
     factor_str = str(sorted(factors.items()))

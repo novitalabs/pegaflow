@@ -64,6 +64,23 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
                 dcp_world_size,
             )
 
+        block_size = vllm_config.cache_config.block_size
+        hash_block_size: int | None = None
+        if kv_cache_config is not None:
+            from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+
+            scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
+                kv_cache_config, vllm_config
+            )
+            if (
+                scheduler_block_size != block_size * dcp_world_size
+                or scheduler_block_size % hash_block_size != 0
+            ):
+                raise ValueError(
+                    f"vLLM scheduler block {scheduler_block_size} / hash block "
+                    f"{hash_block_size} do not fit the connector block {block_size}"
+                )
+
         cross_layer_blocks = os.environ.get("PEGAFLOW_CROSS_LAYER_BLOCKS", "1") == "1"
         base_namespace = derive_namespace(
             vllm_config,
@@ -71,8 +88,8 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
             dcp_world_size,
             pcp_world_size,
             cross_layer_blocks=cross_layer_blocks,
+            hash_block_size=hash_block_size,
         )
-        block_size = vllm_config.cache_config.block_size
 
         tp_rank: int | None = None
         device_id: int | None = None
@@ -161,6 +178,7 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
             mode=mode,
             wait_for_full_prefix=wait_for_full_prefix,
             tp_shards=tp_shards,
+            hash_block_size=hash_block_size,
         )
 
         # MLA attention backends expose no num-layers stride dimension, so vLLM

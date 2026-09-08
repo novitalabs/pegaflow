@@ -31,6 +31,15 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 
+def block_hashes_per_block(block_hashes, hash_scale: int) -> tuple[bytes, ...]:
+    """One chained hash per scheduler block: the last hash inside each block.
+
+    This is vLLM's own `BlockHashListWithBlockSize` rule. Trailing hashes of an
+    incomplete block are dropped; PegaFlow stores whole blocks only.
+    """
+    return tuple(block_hashes[hash_scale - 1 :: hash_scale])
+
+
 @dataclass(slots=True)
 class _QueryProbe:
     """One remote prefix-query snapshot.
@@ -229,6 +238,25 @@ class SchedulerConnector:
             return None
 
         gpu_block_pool.get_cached_block = no_local_hma_prefix_hit
+
+    def _request_block_hashes(self, request: "Request") -> tuple[bytes, ...]:
+        """Per-block keys from `Request.block_hashes` (see `ConnectorContext.hash_scale`).
+
+        vLLM hashes full spans only, so there can never be more keys than the
+        request has full blocks. More means the hashes are finer than the
+        scale says, and keying blocks by them would file block ``i`` under the
+        hash of a shorter prefix — any request sharing that prefix would then
+        load this request's blocks. Fail loudly instead.
+        """
+        per_block = block_hashes_per_block(request.block_hashes, self._ctx.hash_scale)
+        full_blocks = getattr(request, "num_tokens", 0) // self._ctx.virtual_block_size
+        if full_blocks and len(per_block) > full_blocks:
+            raise RuntimeError(
+                f"req {request.request_id}: {len(request.block_hashes)} block hashes give "
+                f"{len(per_block)} keys at scale {self._ctx.hash_scale} for {full_blocks} "
+                f"full blocks; vLLM's hash granularity is finer than the connector's"
+            )
+        return per_block
 
     def get_num_new_matched_tokens(
         self,
@@ -493,11 +521,8 @@ class SchedulerConnector:
         # (Request.block_hashes grows as new full blocks are completed).
         self._requests[req_id] = request
 
-        # request.block_hashes are already at virtual_block_size granularity
-        # (1 hash per scheduler block =
-        # block_size * dcp_world_size * pcp_world_size tokens).
-        # They are 1-to-1 with block_ids from the scheduler.
-        self._block_hashes[req_id] = tuple(request.block_hashes)
+        # One key per scheduler block, 1-to-1 with block_ids from the scheduler.
+        self._block_hashes[req_id] = self._request_block_hashes(request)
         if req_id not in self._allocated_blocks:
             # The first locally allocated block may be after an external-hit
             # prefix. Track that global block index explicitly.
@@ -623,7 +648,7 @@ class SchedulerConnector:
             # newly completed blocks during decode are also saved.
             req = self._requests.get(req_id)
             if req is not None:
-                self._block_hashes[req_id] = tuple(req.block_hashes)
+                self._block_hashes[req_id] = self._request_block_hashes(req)
 
             num_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
 
@@ -720,7 +745,7 @@ class SchedulerConnector:
             if request is None:
                 # Finished before this step's metadata; its blocks are going away.
                 continue
-            block_hashes = tuple(request.block_hashes)
+            block_hashes = self._request_block_hashes(request)
             self._block_hashes[req_id] = block_hashes
             saved = self._saved_boundaries.setdefault(req_id, set())
             rows: list[tuple[int, int, bytes]] = []
@@ -884,7 +909,7 @@ class SchedulerConnector:
         if tail_len <= 1:
             return None
         tail_idx = prompt_len // vbs
-        block_hashes = tuple(request.block_hashes)
+        block_hashes = self._request_block_hashes(request)
         if tail_idx > len(block_hashes):
             raise RuntimeError(
                 f"req {request.request_id} missing parent hash for tail block: "
@@ -898,7 +923,7 @@ class SchedulerConnector:
     def _build_query(
         self, request: "Request", computed_blocks: int
     ) -> tuple[tuple[bytes, ...], int]:
-        query_hashes = tuple(request.block_hashes[computed_blocks:])
+        query_hashes = self._request_block_hashes(request)[computed_blocks:]
         if not self._tail_load_enabled:
             return query_hashes, 0
 
@@ -929,7 +954,6 @@ class SchedulerConnector:
         )
 
     def _consume_full_block_saves(self, req_id: str) -> SaveIntent | None:
-        # block_hashes are at virtual_block_size granularity, 1-to-1 with block_ids.
         block_hashes = self._block_hashes.get(req_id)
         if block_hashes is None:
             return None
