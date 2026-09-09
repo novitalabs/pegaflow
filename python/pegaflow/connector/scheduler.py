@@ -242,21 +242,33 @@ class SchedulerConnector:
     def _request_block_hashes(self, request: "Request") -> tuple[bytes, ...]:
         """Per-block keys from `Request.block_hashes` (see `ConnectorContext.hash_scale`).
 
-        vLLM hashes full spans only, so there can never be more keys than the
-        request has full blocks. More means the hashes are finer than the
-        scale says, and keying blocks by them would file block ``i`` under the
-        hash of a shorter prefix — any request sharing that prefix would then
-        load this request's blocks. Fail loudly instead.
+        vLLM hashes full spans only, so the hashes never reach past the
+        request's tokens — except when a connector pops the last token after
+        vLLM hashed it (NIXL / Mooncake truncate hybrid-model prompts by one
+        token on the prefiller so it computes ``h(N-1)``) without trimming
+        ``block_hashes``. A hash spanning a token the request no longer has
+        fingerprints a prefix vLLM will not compute; drop it. Anything beyond
+        that single tail hash means the hashes are finer than the scale says,
+        and keying blocks by them would file block ``i`` under the hash of a
+        shorter prefix — any request sharing that prefix would then load this
+        request's blocks. Fail loudly instead.
         """
-        per_block = block_hashes_per_block(request.block_hashes, self._ctx.hash_scale)
-        full_blocks = getattr(request, "num_tokens", 0) // self._ctx.virtual_block_size
-        if full_blocks and len(per_block) > full_blocks:
-            raise RuntimeError(
-                f"req {request.request_id}: {len(request.block_hashes)} block hashes give "
-                f"{len(per_block)} keys at scale {self._ctx.hash_scale} for {full_blocks} "
-                f"full blocks; vLLM's hash granularity is finer than the connector's"
-            )
-        return per_block
+        block_hashes = request.block_hashes
+        num_tokens = getattr(request, "num_tokens", 0)
+        if num_tokens:
+            hash_block_size = self._ctx.hash_block_size or self._ctx.virtual_block_size
+            hashed = num_tokens // hash_block_size
+            stale = len(block_hashes) - hashed
+            if stale > 1:
+                raise RuntimeError(
+                    f"req {request.request_id}: {len(block_hashes)} block hashes span "
+                    f"{len(block_hashes) * hash_block_size} tokens but the request has "
+                    f"{num_tokens}; vLLM's hash granularity is finer than the connector's "
+                    f"{hash_block_size}"
+                )
+            if stale == 1:
+                block_hashes = block_hashes[:hashed]
+        return block_hashes_per_block(block_hashes, self._ctx.hash_scale)
 
     def get_num_new_matched_tokens(
         self,

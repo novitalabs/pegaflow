@@ -133,6 +133,23 @@ def test_more_keys_than_full_blocks_is_rejected():
         _scheduler(hash_block_size=None)._build_query(_request("r1", 4 * VBS), 0)
 
 
+def test_hash_past_a_popped_last_token_is_dropped():
+    # NIXL/Mooncake pop the prefiller's last prompt token for hybrid models
+    # after vLLM hashed the full prompt: a 30-block prompt keeps 360 hashes
+    # over 29 full blocks. The hash closing the 30th block spans a token the
+    # request no longer has and must not become a key (K3 production: group
+    # restarts on every 1536-aligned prompt).
+    req = _request("r1", 30 * VBS)
+    req.num_tokens = req.num_prompt_tokens = 30 * VBS - 1
+    keys, _ = _scheduler()._build_query(req, 0)
+    assert keys == tuple(_key(i) for i in range(29))
+
+    # An unaligned prompt leaves no stale hash and is unaffected.
+    req = _request("r1", 30 * VBS + 5)
+    req.num_tokens = req.num_prompt_tokens = 30 * VBS + 4
+    assert _scheduler()._build_query(req, 0)[0] == tuple(_key(i) for i in range(30))
+
+
 def test_hash_block_size_isolates_namespace():
     cfg = SimpleNamespace(
         model_config=SimpleNamespace(
