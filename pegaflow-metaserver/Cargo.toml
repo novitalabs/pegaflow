@@ -29,9 +29,11 @@ opentelemetry_sdk.workspace = true
 opentelemetry-prometheus.workspace = true
 prometheus.workspace = true
 axum.workspace = true
+serde.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+tower = "0.5"
 
 [[bench]]
 name = "unregister_node"

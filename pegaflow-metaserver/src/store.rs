@@ -2,7 +2,10 @@ use dashmap::{DashMap, mapref::entry::Entry};
 use log::{info, warn};
 use pegaflow_common::BlockKey;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -10,6 +13,7 @@ const MIN_RECLAIMABLE_OWNER_COUNT: usize = 3;
 
 pub const DEFAULT_NODE_STALE_SECS: u64 = 30;
 pub const DEFAULT_TTL_MINUTES: u64 = 120;
+pub const MANUAL_CLEANUP_AGE_SECS: u64 = 60 * 60;
 
 /// A prefix query result: one block hash and all live nodes that own it.
 #[derive(Debug, Clone)]
@@ -21,6 +25,7 @@ pub struct PrefixEntry {
 #[derive(Debug, Clone, Copy)]
 pub struct StoreConfig {
     pub node_stale_after: Duration,
+    /// Node inactivity grace period; never applies to owner registration age.
     pub ttl: Duration,
 }
 
@@ -46,12 +51,9 @@ impl SweepStats {
     }
 }
 
-/// Live-owner redundancy distribution over block keys, recomputed each sweep and
-/// cached so metric scrapes stay O(1). Keys are bucketed by their number of
-/// query-visible owners (1, 2, 3, >=4); keys with zero visible owners are
-/// excluded from every bucket. `copies` is the exact total of visible owners, so
-/// average redundancy (the cache capacity shrink factor) is
-/// `copies / (keys_1 + keys_2 + keys_3 + keys_4plus)`.
+/// Incremental distribution of stored owner records, not query-visible owners.
+/// Stale nodes remain counted until TTL cleanup, and superseded sessions until
+/// reconciliation. Reads of separate atomic fields may straddle a mutation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RedundancySnapshot {
     pub keys_1: u64,
@@ -59,19 +61,6 @@ pub struct RedundancySnapshot {
     pub keys_3: u64,
     pub keys_4plus: u64,
     pub copies: u64,
-}
-
-impl RedundancySnapshot {
-    fn record(&mut self, visible_owners: u64) {
-        match visible_owners {
-            0 => {}
-            1 => self.keys_1 += 1,
-            2 => self.keys_2 += 1,
-            3 => self.keys_3 += 1,
-            _ => self.keys_4plus += 1,
-        }
-        self.copies += visible_owners;
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,13 +85,53 @@ struct NodeRecord {
     last_seen: Instant,
 }
 
-/// Both lifecycle decisions for one owner record, produced from a single `nodes`
-/// lookup: `keep` (survives the TTL purge) and `visible` (query-visible: current
-/// session and node still fresh). Lets the sweep tally live redundancy without
-/// probing the node map twice per owner.
-struct OwnerEval {
-    keep: bool,
-    visible: bool,
+#[derive(Default)]
+struct RedundancyCounters {
+    keys_1: AtomicU64,
+    keys_2: AtomicU64,
+    keys_3: AtomicU64,
+    keys_4plus: AtomicU64,
+    copies: AtomicU64,
+}
+
+impl RedundancyCounters {
+    fn snapshot(&self) -> RedundancySnapshot {
+        RedundancySnapshot {
+            keys_1: self.keys_1.load(Ordering::Relaxed),
+            keys_2: self.keys_2.load(Ordering::Relaxed),
+            keys_3: self.keys_3.load(Ordering::Relaxed),
+            keys_4plus: self.keys_4plus.load(Ordering::Relaxed),
+            copies: self.copies.load(Ordering::Relaxed),
+        }
+    }
+
+    fn adjust_bucket(&self, count: u64, delta: i64) {
+        let counter = match count {
+            1 => &self.keys_1,
+            2 => &self.keys_2,
+            3 => &self.keys_3,
+            _ if count >= 4 => &self.keys_4plus,
+            _ => return,
+        };
+        if delta > 0 {
+            counter.fetch_add(delta as u64, Ordering::Relaxed);
+        } else {
+            counter.fetch_sub((-delta) as u64, Ordering::Relaxed);
+        }
+    }
+
+    fn adjust(&self, before: u64, after: u64) {
+        if before == after {
+            return;
+        }
+        self.adjust_bucket(before, -1);
+        self.adjust_bucket(after, 1);
+        if after > before {
+            self.copies.fetch_add(after - before, Ordering::Relaxed);
+        } else {
+            self.copies.fetch_sub(before - after, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Async thread-safe block hash storage using DashMap.
@@ -113,9 +142,9 @@ pub struct BlockHashStore {
     blocks: DashMap<BlockKey, HashMap<Arc<str>, OwnerRecord>>,
     nodes: DashMap<Arc<str>, NodeRecord>,
     config: StoreConfig,
-    /// Latest live-owner redundancy distribution, refreshed each sweep and read
-    /// by metric callbacks. Decouples the O(N) scan from the scrape path.
-    redundancy: Mutex<RedundancySnapshot>,
+    reconcile_needed: AtomicBool,
+    /// Incremental stored-owner redundancy counters read by metric callbacks.
+    redundancy: RedundancyCounters,
 }
 
 impl BlockHashStore {
@@ -128,7 +157,8 @@ impl BlockHashStore {
             blocks: DashMap::new(),
             nodes: DashMap::new(),
             config,
-            redundancy: Mutex::new(RedundancySnapshot::default()),
+            reconcile_needed: AtomicBool::new(false),
+            redundancy: RedundancyCounters::default(),
         }
     }
 
@@ -161,6 +191,7 @@ impl BlockHashStore {
                     now.duration_since(record.last_seen) > self.config.node_stale_after;
                 if same_session || stale_session {
                     if stale_session && !same_session {
+                        self.reconcile_needed.store(true, Ordering::Release);
                         info!(
                             "MetaServer node session takeover: node={} old_node_id={} new_node_id={}",
                             node, record.node_id, node_id
@@ -180,25 +211,24 @@ impl BlockHashStore {
     }
 
     pub fn unregister_node(&self, node: &str, node_id: Uuid) -> Result<usize, StoreError> {
-        if self
-            .nodes
-            .remove_if(node, |_, record| record.node_id == node_id)
-            .is_none()
-        {
-            if self.nodes.contains_key(node) {
-                warn!(
-                    "MetaServer unregister rejected stale session: node={} rejected_node_id={}",
-                    node, node_id
-                );
-                return Err(StoreError::StaleSession);
+        match self.nodes.entry(Arc::from(node)) {
+            Entry::Vacant(_) => return Err(StoreError::UnknownNode),
+            Entry::Occupied(entry) => {
+                if entry.get().node_id != node_id {
+                    return Err(StoreError::StaleSession);
+                }
+                entry.remove();
             }
-            warn!(
-                "MetaServer unregister rejected unknown node: node={} node_id={}",
-                node, node_id
-            );
-            return Err(StoreError::UnknownNode);
         }
-        Ok(self.remove_node_owners(node, node_id))
+        // A concurrent registration may already have written new owners.
+        let removed = self.retain_owners(|owner_node, owner| {
+            owner_node.as_ref() != node
+                || self
+                    .nodes
+                    .get(node)
+                    .is_some_and(|record| record.node_id == owner.node_id)
+        });
+        Ok(removed.removed_owners)
     }
 
     pub fn insert_hashes(
@@ -214,7 +244,17 @@ impl BlockHashStore {
         let mut reclaimable_hashes = Vec::new();
         for hash in hashes {
             let key = BlockKey::new(namespace.to_string(), hash.clone());
-            let mut owners = self.blocks.entry(key).or_default();
+            // Lock blocks before nodes, and keep session validation valid through the write.
+            let entry = self.blocks.entry(key);
+            let record = self
+                .nodes
+                .get(node.as_ref())
+                .ok_or(StoreError::UnknownNode)?;
+            if record.node_id != node_id {
+                return Err(StoreError::StaleSession);
+            }
+            let mut owners = entry.or_default();
+            let before = owners.len();
             let previous = owners.insert(
                 Arc::clone(&node),
                 OwnerRecord {
@@ -222,8 +262,12 @@ impl BlockHashStore {
                     key_register_time: now,
                 },
             );
+            self.redundancy.adjust(before as u64, owners.len() as u64);
+            // Reclaim hints perform their own node lookups; never nest node guards.
+            drop(record);
             let is_new_owner = previous.is_none_or(|owner| owner.node_id != node_id);
             if is_new_owner
+                && owners.len() >= MIN_RECLAIMABLE_OWNER_COUNT
                 && owners
                     .iter()
                     .filter(|(node, owner)| self.is_owner_visible(node, owner, now))
@@ -248,7 +292,9 @@ impl BlockHashStore {
         let mut removed = 0;
         for hash in hashes {
             let key = BlockKey::new(namespace.to_string(), hash.clone());
-            let should_remove_key = if let Some(mut owners) = self.blocks.get_mut(&key) {
+            if let Entry::Occupied(mut entry) = self.blocks.entry(key) {
+                let owners = entry.get_mut();
+                let before = owners.len();
                 if owners
                     .get(node)
                     .is_some_and(|owner| owner.node_id == node_id)
@@ -256,12 +302,10 @@ impl BlockHashStore {
                     owners.remove(node);
                     removed += 1;
                 }
-                owners.is_empty()
-            } else {
-                false
-            };
-            if should_remove_key {
-                self.blocks.remove_if(&key, |_, owners| owners.is_empty());
+                self.redundancy.adjust(before as u64, owners.len() as u64);
+                if owners.is_empty() {
+                    entry.remove();
+                }
             }
         }
         Ok(removed)
@@ -300,73 +344,60 @@ impl BlockHashStore {
         result
     }
 
-    /// Sweep owners whose node is missing or whose ownership TTL has expired, and
-    /// refresh the cached live-owner redundancy snapshot in the same walk.
+    /// Healthy sweeps only inspect nodes. A takeover or node TTL expiry triggers
+    /// one block scan; owner registration age never causes background deletion.
     pub fn sweep_expired(&self) -> SweepStats {
+        // Consume before scanning so a concurrent takeover remains pending.
+        let reconcile = self.reconcile_needed.swap(false, Ordering::AcqRel);
         let now = Instant::now();
-        let mut stats = SweepStats::default();
-        let mut snapshot = RedundancySnapshot::default();
-
-        self.blocks.retain(|_, owners| {
-            let before = owners.len();
-            let mut visible = 0u64;
-            owners.retain(|node, owner| {
-                let eval = self.eval_owner(node, owner, now);
-                if eval.keep && eval.visible {
-                    visible += 1;
-                }
-                eval.keep
-            });
-            stats.removed_owners += before.saturating_sub(owners.len());
-            if owners.is_empty() {
-                stats.removed_keys += 1;
-                return false;
-            }
-            snapshot.record(visible);
-            true
-        });
-
-        let node_before = self.nodes.len();
-        let ttl = self.config.ttl;
+        let mut removed_nodes = 0;
         self.nodes.retain(|node, record| {
-            let keep = now.duration_since(record.last_seen) <= ttl;
+            let age = now.saturating_duration_since(record.last_seen);
+            let keep = age <= self.config.ttl;
             if !keep {
+                removed_nodes += 1;
                 info!(
                     "MetaServer node swept: node={} node_id={} last_seen_age_secs={}",
                     node,
                     record.node_id,
-                    now.duration_since(record.last_seen).as_secs()
+                    age.as_secs()
                 );
             }
             keep
         });
-        stats.removed_nodes = node_before.saturating_sub(self.nodes.len());
-
-        *self
-            .redundancy
-            .lock()
-            .expect("redundancy snapshot mutex poisoned") = snapshot;
-
+        if removed_nodes == 0 && !reconcile {
+            return SweepStats::default();
+        }
+        let mut stats = self.retain_owners(|node, owner| {
+            self.nodes
+                .get(node.as_ref())
+                .is_some_and(|record| record.node_id == owner.node_id)
+        });
+        stats.removed_nodes = removed_nodes;
         stats
     }
 
-    /// Latest cached live-owner redundancy distribution (refreshed each sweep).
+    /// Remove ownership records older than `max_age`, regardless of node
+    /// liveness. This is reserved for explicit operator maintenance.
+    pub fn remove_owners_older_than(&self, max_age: Duration) -> SweepStats {
+        let now = Instant::now();
+        self.retain_owners(|_, owner| {
+            now.saturating_duration_since(owner.key_register_time) <= max_age
+        })
+    }
+
+    /// Latest incrementally maintained stored-owner redundancy distribution.
     pub fn redundancy_snapshot(&self) -> RedundancySnapshot {
-        *self
-            .redundancy
-            .lock()
-            .expect("redundancy snapshot mutex poisoned")
+        self.redundancy.snapshot()
     }
 
     pub fn entry_count(&self) -> u64 {
-        self.blocks.len() as u64
+        let snap = self.redundancy.snapshot();
+        snap.keys_1 + snap.keys_2 + snap.keys_3 + snap.keys_4plus
     }
 
     pub fn owner_count(&self) -> u64 {
-        self.blocks
-            .iter()
-            .map(|entry| entry.value().len() as u64)
-            .sum()
+        self.redundancy.copies.load(Ordering::Relaxed)
     }
 
     pub fn node_counts(&self) -> (u64, u64) {
@@ -377,7 +408,7 @@ impl BlockHashStore {
             let age = now.duration_since(node.last_seen);
             if age <= self.config.node_stale_after {
                 active += 1;
-            } else if age <= self.config.ttl {
+            } else {
                 stale += 1;
             }
         }
@@ -389,12 +420,8 @@ impl BlockHashStore {
         reason = "maintenance API reserved for explicit store cleanup"
     )]
     pub fn invalidate_all(&self) {
-        self.blocks.clear();
         self.nodes.clear();
-        *self
-            .redundancy
-            .lock()
-            .expect("redundancy snapshot mutex poisoned") = RedundancySnapshot::default();
+        self.retain_owners(|_, _| false);
     }
 
     fn touch_node_session(&self, node: &str, node_id: Uuid) -> Result<(), StoreError> {
@@ -416,41 +443,29 @@ impl BlockHashStore {
         Ok(())
     }
 
-    fn remove_node_owners(&self, node: &str, node_id: Uuid) -> usize {
-        let mut removed = 0;
+    /// Owner changes and accounting share the block shard's write guard.
+    fn retain_owners(&self, mut keep: impl FnMut(&Arc<str>, &OwnerRecord) -> bool) -> SweepStats {
+        let mut stats = SweepStats::default();
         self.blocks.retain(|_, owners| {
-            if owners
-                .get(node)
-                .is_some_and(|owner| owner.node_id == node_id)
-            {
-                owners.remove(node);
-                removed += 1;
+            let before = owners.len();
+            owners.retain(|node, owner| keep(node, owner));
+            self.redundancy.adjust(before as u64, owners.len() as u64);
+            stats.removed_owners += before - owners.len();
+            if owners.is_empty() {
+                stats.removed_keys += 1;
+                return false;
             }
-            !owners.is_empty()
+            true
         });
-        removed
-    }
-
-    /// Evaluate one owner against the current node session and clocks with a
-    /// single `nodes` lookup. A missing node means the owner is neither kept nor
-    /// visible.
-    fn eval_owner(&self, node: &Arc<str>, owner: &OwnerRecord, now: Instant) -> OwnerEval {
-        let Some(record) = self.nodes.get(node.as_ref()) else {
-            return OwnerEval {
-                keep: false,
-                visible: false,
-            };
-        };
-        let node_age = now.duration_since(record.last_seen);
-        OwnerEval {
-            keep: now.duration_since(owner.key_register_time) <= self.config.ttl
-                && node_age <= self.config.ttl,
-            visible: record.node_id == owner.node_id && node_age <= self.config.node_stale_after,
-        }
+        stats
     }
 
     fn is_owner_visible(&self, node: &Arc<str>, owner: &OwnerRecord, now: Instant) -> bool {
-        self.eval_owner(node, owner, now).visible
+        let Some(record) = self.nodes.get(node.as_ref()) else {
+            return false;
+        };
+        let node_age = now.duration_since(record.last_seen);
+        record.node_id == owner.node_id && node_age <= self.config.node_stale_after
     }
 }
 
@@ -461,8 +476,243 @@ impl Default for BlockHashStore {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) fn manual_cleanup_fixture() -> BlockHashStore {
+        let store = BlockHashStore::new();
+        let a = heartbeat_node(&store, "a");
+        let b = heartbeat_node(&store, "b");
+        store
+            .insert_hashes("ns", &[vec![1], vec![2], vec![3]], "a", a)
+            .unwrap();
+        for mut owners in store.blocks.iter_mut() {
+            owners.get_mut("a").unwrap().key_register_time =
+                Instant::now() - Duration::from_secs(MANUAL_CLEANUP_AGE_SECS + 1);
+        }
+        // Refresh one old owner and add a fresh replica to another old key.
+        store.insert_hashes("ns", &[vec![3]], "a", a).unwrap();
+        store.insert_hashes("ns", &[vec![2]], "b", b).unwrap();
+        store
+    }
+
+    fn assert_stored_counts(store: &BlockHashStore) {
+        let mut expected = RedundancySnapshot::default();
+        for owners in &store.blocks {
+            match owners.len() {
+                0 => panic!("empty key retained"),
+                1 => expected.keys_1 += 1,
+                2 => expected.keys_2 += 1,
+                3 => expected.keys_3 += 1,
+                _ => expected.keys_4plus += 1,
+            }
+            expected.copies += owners.len() as u64;
+        }
+        assert_eq!(store.owner_count(), expected.copies);
+        assert_eq!(store.entry_count(), store.blocks.len() as u64);
+        assert_eq!(store.redundancy_snapshot(), expected);
+    }
+
+    fn wait_until(mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !ready() {
+            assert!(
+                Instant::now() < deadline,
+                "concurrent operation did not progress"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn insert_rechecks_session_after_waiting_for_block_lock() {
+        for occupied in [false, true] {
+            let store = BlockHashStore::new();
+            let old = heartbeat_node(&store, "a");
+            if occupied {
+                store.insert_hashes("ns", &[vec![1]], "a", old).unwrap();
+            }
+            let stale = Instant::now() - Duration::from_secs(31);
+            store.nodes.get_mut("a").unwrap().last_seen = stale;
+            std::thread::scope(|scope| {
+                let mut entry = store.blocks.entry(BlockKey::new("ns".into(), vec![1]));
+                let insert = scope.spawn(|| store.insert_hashes("ns", &[vec![1]], "a", old));
+                wait_until(|| store.nodes.get("a").unwrap().last_seen > stale);
+                store.nodes.get_mut("a").unwrap().last_seen = stale;
+                let current = heartbeat_node(&store, "a");
+                if let Entry::Occupied(ref mut entry) = entry {
+                    // Model a new-session write that wins the block lock first.
+                    entry.get_mut().get_mut("a").unwrap().node_id = current;
+                }
+                drop(entry);
+                assert_eq!(insert.join().unwrap(), Err(StoreError::StaleSession));
+                assert_eq!(
+                    store.query_prefix("ns", &[vec![1]]).len(),
+                    usize::from(occupied)
+                );
+            });
+            assert_stored_counts(&store);
+        }
+    }
+
+    #[test]
+    fn takeover_during_sweep_remains_pending() {
+        let store = BlockHashStore::new();
+        let old = heartbeat_node(&store, "a");
+        store.insert_hashes("ns", &[vec![1]], "a", old).unwrap();
+        store.reconcile_needed.store(true, Ordering::Release);
+        std::thread::scope(|scope| {
+            let guard = store
+                .blocks
+                .get_mut(&BlockKey::new("ns".into(), vec![1]))
+                .unwrap();
+            let sweep = scope.spawn(|| store.sweep_expired());
+            wait_until(|| !store.reconcile_needed.load(Ordering::Acquire));
+            store.nodes.get_mut("a").unwrap().last_seen = Instant::now() - Duration::from_secs(31);
+            heartbeat_node(&store, "a");
+            drop(guard);
+            assert_eq!(sweep.join().unwrap().removed_owners, 1);
+        });
+        assert!(store.reconcile_needed.load(Ordering::Acquire));
+        assert!(store.sweep_expired().is_empty());
+        assert!(!store.reconcile_needed.load(Ordering::Acquire));
+        assert_stored_counts(&store);
+    }
+
+    #[test]
+    fn unregister_preserves_concurrent_registration() {
+        let store = BlockHashStore::new();
+        let old = heartbeat_node(&store, "a");
+        store.insert_hashes("ns", &[vec![1]], "a", old).unwrap();
+        std::thread::scope(|scope| {
+            let mut owners = store
+                .blocks
+                .get_mut(&BlockKey::new("ns".into(), vec![1]))
+                .unwrap();
+            let unregister = scope.spawn(|| store.unregister_node("a", old));
+            wait_until(|| !store.nodes.contains_key("a"));
+            let current = heartbeat_node(&store, "a");
+            owners.get_mut("a").unwrap().node_id = current;
+            drop(owners);
+            assert_eq!(unregister.join().unwrap(), Ok(0));
+        });
+        assert_eq!(store.query_prefix("ns", &[vec![1]]).len(), 1);
+        assert_stored_counts(&store);
+    }
+
+    #[test]
+    fn stale_node_survives_sweep_and_recovers_without_insert() {
+        let store = BlockHashStore::new();
+        let id = heartbeat_node(&store, "node-a");
+        store.insert_hashes("ns", &[vec![1]], "node-a", id).unwrap();
+        store.nodes.get_mut("node-a").unwrap().last_seen = Instant::now() - Duration::from_secs(31);
+        assert!(store.query_prefix("ns", &[vec![1]]).is_empty());
+
+        // Healthy sweeps and entry metrics must not wait for block shard locks.
+        let guard = store
+            .blocks
+            .get_mut(&BlockKey::new("ns".into(), vec![1]))
+            .unwrap();
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let store_ref = &store;
+            scope.spawn(move || {
+                tx.send((store_ref.sweep_expired(), store_ref.entry_count()))
+                    .unwrap();
+            });
+            let result = rx.recv_timeout(Duration::from_secs(2));
+            drop(guard);
+            assert_eq!(result.unwrap(), (SweepStats::default(), 1));
+        });
+        assert_eq!(store.node_counts(), (0, 1));
+        assert_stored_counts(&store);
+        store.heartbeat_node("node-a", id).unwrap();
+        assert_eq!(store.query_prefix("ns", &[vec![1]]).len(), 1);
+        assert_stored_counts(&store);
+    }
+
+    #[test]
+    fn node_ttl_cleanup_preserves_old_blocks_on_active_nodes() {
+        let store = BlockHashStore::new();
+        let a = heartbeat_node(&store, "a");
+        let b = heartbeat_node(&store, "b");
+        store
+            .insert_hashes("ns", &[vec![1], vec![2]], "a", a)
+            .unwrap();
+        store.insert_hashes("ns", &[vec![1]], "b", b).unwrap();
+        let old = Instant::now() - store.config.ttl - Duration::from_secs(1);
+        for mut owners in store.blocks.iter_mut() {
+            for owner in owners.values_mut() {
+                owner.key_register_time = old;
+            }
+        }
+        store.nodes.get_mut("a").unwrap().last_seen = old;
+        assert_eq!(
+            store.sweep_expired(),
+            SweepStats {
+                removed_owners: 2,
+                removed_keys: 1,
+                removed_nodes: 1,
+            }
+        );
+        assert_eq!(
+            store.query_prefix("ns", &[vec![1]])[0].nodes[0].as_ref(),
+            "b"
+        );
+        assert_stored_counts(&store);
+    }
+
+    #[test]
+    fn mutations_between_takeovers_and_reconciliation_keep_counts_consistent() {
+        let store = BlockHashStore::new();
+        let mut a = heartbeat_node(&store, "a");
+        let b = heartbeat_node(&store, "b");
+        store
+            .insert_hashes("ns", &[vec![1], vec![2], vec![3]], "a", a)
+            .unwrap();
+        store
+            .insert_hashes("ns", &[vec![1], vec![2], vec![3]], "b", b)
+            .unwrap();
+        for _ in 0..2 {
+            store.nodes.get_mut("a").unwrap().last_seen = Instant::now() - Duration::from_secs(31);
+            a = heartbeat_node(&store, "a");
+            store
+                .insert_hashes("ns", &[vec![1], vec![1]], "a", a)
+                .unwrap();
+            store.remove_hashes("ns", &[vec![1]], "b", b).unwrap();
+            assert_stored_counts(&store);
+        }
+        assert_eq!(store.sweep_expired().removed_owners, 2);
+        assert_eq!(store.owner_count(), 3);
+        assert_stored_counts(&store);
+        // A later takeover must set a new flag, even after one sweep consumed it.
+        store.nodes.get_mut("a").unwrap().last_seen = Instant::now() - Duration::from_secs(31);
+        let new_a = heartbeat_node(&store, "a");
+        assert_ne!(a, new_a);
+        assert_eq!(store.sweep_expired().removed_owners, 1);
+        assert_stored_counts(&store);
+        assert!(store.sweep_expired().is_empty());
+    }
+
+    #[test]
+    fn unregister_after_takeover_cleans_historical_owners() {
+        let store = BlockHashStore::new();
+        let old = heartbeat_node(&store, "a");
+        store
+            .insert_hashes("ns", &[vec![1], vec![2]], "a", old)
+            .unwrap();
+        store.nodes.get_mut("a").unwrap().last_seen = Instant::now() - Duration::from_secs(31);
+        let current = heartbeat_node(&store, "a");
+        store.insert_hashes("ns", &[vec![1]], "a", current).unwrap();
+        assert_eq!(
+            store.unregister_node("a", old),
+            Err(StoreError::StaleSession)
+        );
+        assert_eq!(store.unregister_node("a", current), Ok(2));
+        assert!(store.sweep_expired().is_empty());
+        assert_stored_counts(&store);
+        assert_eq!(store.node_counts(), (0, 0));
+    }
 
     fn heartbeat_node(store: &BlockHashStore, node: &str) -> Uuid {
         let node_id = Uuid::new_v4();
@@ -748,7 +998,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sweep_keeps_superseded_owner_until_ttl() {
+    fn test_sweep_reconciles_superseded_owner_before_ttl() {
         let store = BlockHashStore::new();
         let old_id = heartbeat_node(&store, "node-a");
         store
@@ -760,35 +1010,12 @@ mod tests {
         assert_ne!(old_id, new_id);
 
         let removed = store.sweep_expired();
-        assert_eq!(removed, SweepStats::default());
-        assert_eq!(store.owner_count(), 1);
-        assert!(store.query_prefix("ns", &[vec![1]]).is_empty());
-    }
-
-    #[test]
-    fn test_sweep_removes_superseded_owner_after_key_purge_age() {
-        let store = BlockHashStore::with_config(StoreConfig {
-            node_stale_after: Duration::ZERO,
-            ttl: Duration::ZERO,
-        });
-        let old_id = heartbeat_node(&store, "node-a");
-        store
-            .insert_hashes("ns", &[vec![1]], "node-a", old_id)
-            .unwrap();
-        store.nodes.get_mut("node-a").unwrap().last_seen = Instant::now() - Duration::from_secs(1);
-        let new_id = heartbeat_node(&store, "node-a");
-        assert_ne!(old_id, new_id);
-
-        let removed = store.sweep_expired();
-        assert_eq!(
-            removed,
-            SweepStats {
-                removed_owners: 1,
-                removed_keys: 1,
-                removed_nodes: 1,
-            }
-        );
+        assert_eq!(removed.removed_owners, 1);
+        assert_eq!(removed.removed_keys, 1);
+        assert_eq!(removed.removed_nodes, 0);
         assert_eq!(store.owner_count(), 0);
+        assert_stored_counts(&store);
+        assert!(store.query_prefix("ns", &[vec![1]]).is_empty());
     }
 
     #[test]
@@ -918,7 +1145,7 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrent_insert_and_remove() {
+    fn test_concurrent_insert_remove_and_cleanup() {
         use std::sync::Arc;
 
         let store = Arc::new(BlockHashStore::new());
@@ -930,6 +1157,13 @@ mod tests {
             store
                 .insert_hashes("ns", std::slice::from_ref(&hash), "node-a", node_a_id)
                 .unwrap();
+            store
+                .blocks
+                .get_mut(&BlockKey::new("ns".into(), hash.clone()))
+                .unwrap()
+                .get_mut("node-a")
+                .unwrap()
+                .key_register_time = Instant::now() - Duration::from_secs(3601);
 
             let store_a = Arc::clone(&store);
             let store_b = Arc::clone(&store);
@@ -937,6 +1171,7 @@ mod tests {
             let hash_b = hash.clone();
 
             std::thread::scope(|s| {
+                s.spawn(|| store.remove_owners_older_than(Duration::from_secs(3600)));
                 s.spawn(|| {
                     store_a
                         .remove_hashes("ns", &[hash_a], "node-a", node_a_id)
@@ -956,7 +1191,9 @@ mod tests {
                 "node-b must be present"
             );
 
+            assert_stored_counts(&store);
             store.invalidate_all();
+            assert_stored_counts(&store);
         }
     }
 
@@ -985,53 +1222,39 @@ mod tests {
     }
 
     #[test]
-    fn test_redundancy_snapshot_buckets_live_owners() {
+    fn test_redundancy_counters_follow_owner_mutations() {
         let store = BlockHashStore::new();
-        let a = heartbeat_node(&store, "n-a");
-        let b = heartbeat_node(&store, "n-b");
-        let c = heartbeat_node(&store, "n-c");
-        let d = heartbeat_node(&store, "n-d");
-
-        // 1 owner, 2 owners, and 4 owners across three distinct keys.
-        store.insert_hashes("ns", &[vec![1]], "n-a", a).unwrap();
-        store.insert_hashes("ns", &[vec![2]], "n-a", a).unwrap();
-        store.insert_hashes("ns", &[vec![2]], "n-b", b).unwrap();
-        for (node, id) in [("n-a", a), ("n-b", b), ("n-c", c), ("n-d", d)] {
-            store.insert_hashes("ns", &[vec![3]], node, id).unwrap();
+        let nodes = ["a", "b", "c", "d", "e"];
+        let ids = nodes.map(|node| heartbeat_node(&store, node));
+        let hashes = [vec![1], vec![2], vec![3], vec![4], vec![5]];
+        assert_stored_counts(&store);
+        for (i, node) in nodes.iter().enumerate() {
+            for _ in 0..2 {
+                store
+                    .insert_hashes("ns", &hashes[i..], node, ids[i])
+                    .unwrap();
+                assert_stored_counts(&store);
+            }
         }
-
-        store.sweep_expired();
-
         assert_eq!(
             store.redundancy_snapshot(),
             RedundancySnapshot {
                 keys_1: 1,
                 keys_2: 1,
-                keys_3: 0,
-                keys_4plus: 1,
-                copies: 1 + 2 + 4,
+                keys_3: 1,
+                keys_4plus: 2,
+                copies: 15,
             }
         );
-    }
-
-    #[test]
-    fn test_redundancy_snapshot_excludes_superseded_owner() {
-        // A block whose only owner is a superseded session has zero *visible*
-        // owners, so it must not appear in any bucket even though the raw record
-        // survives until the TTL purge.
-        let store = BlockHashStore::new();
-        let old_id = heartbeat_node(&store, "node-a");
-        store
-            .insert_hashes("ns", &[vec![1]], "node-a", old_id)
-            .unwrap();
-        store.nodes.get_mut("node-a").unwrap().last_seen =
-            Instant::now() - Duration::from_secs(DEFAULT_NODE_STALE_SECS + 1);
-        let new_id = heartbeat_node(&store, "node-a");
-        assert_ne!(old_id, new_id);
-
-        store.sweep_expired();
-
-        assert_eq!(store.owner_count(), 1, "raw record still present");
+        for (i, node) in nodes.iter().enumerate() {
+            assert_eq!(
+                store
+                    .remove_hashes("ns", &hashes[i..], node, ids[i])
+                    .unwrap(),
+                hashes.len() - i
+            );
+            assert_stored_counts(&store);
+        }
         assert_eq!(store.redundancy_snapshot(), RedundancySnapshot::default());
     }
 }

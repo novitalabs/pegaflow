@@ -128,10 +128,13 @@ impl MetaServer for GrpcMetaService {
         );
         let result = async {
             let node_id = Self::parse_node_id(&req.node_id)?;
-            let removed = self
-                .store
-                .unregister_node(&req.node, node_id)
-                .map_err(Self::store_error_status)?;
+            let store = Arc::clone(&self.store);
+            let node = req.node.clone();
+            let removed =
+                tokio::task::spawn_blocking(move || store.unregister_node(&node, node_id))
+                    .await
+                    .map_err(|err| Status::internal(format!("unregister worker failed: {err}")))?
+                    .map_err(Self::store_error_status)?;
             Ok(Response::new(UnregisterNodeResponse {
                 removed_owners: removed as u64,
             }))

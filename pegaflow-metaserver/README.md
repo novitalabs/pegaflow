@@ -63,8 +63,8 @@ cargo run -p pegaflow-metaserver -- --log-level debug
 # Custom node lifecycle timings
 cargo run -p pegaflow-metaserver -- --node-stale-secs 30 --ttl-minutes 120 --sweep-interval-secs 600
 
-# All options combined
-cargo run -p pegaflow-metaserver -- --addr 0.0.0.0:50056 --node-stale-secs 30 --ttl-minutes 120 --sweep-interval-secs 600 --log-level info
+# Configure public HTTP and localhost-only maintenance ports
+cargo run -p pegaflow-metaserver -- --addr 0.0.0.0:50056 --http-addr 0.0.0.0:9092 --admin-http-addr 127.0.0.1:9093
 
 # Show all options
 cargo run -p pegaflow-metaserver -- --help
@@ -72,10 +72,12 @@ cargo run -p pegaflow-metaserver -- --help
 
 ### Server Options
 
-- `--addr <ADDR>`: Bind address (default: `127.0.0.1:50056`)
+- `--addr <ADDR>`: gRPC bind address (default: `127.0.0.1:50056`)
+- `--http-addr <ADDR>`: HTTP health and metrics bind address (default: `0.0.0.0:9092`)
+- `--admin-http-addr <ADDR>`: HTTP maintenance bind address; must be loopback (default: `127.0.0.1:9093`)
 - `--log-level <LEVEL>`: Log level: `trace`, `debug`, `info`, `warn`, `error` (default: `info`)
 - `--node-stale-secs <SECONDS>`: Hide nodes from query after this many seconds without heartbeat (default: `30`)
-- `--ttl-minutes <MINUTES>`: Purge ownership and node records after this many minutes (default: `120`)
+- `--ttl-minutes <MINUTES>`: Delete nodes and their owners after this many minutes without node activity (default: `120`); does not expire blocks by registration age
 - `--sweep-interval-secs <SECONDS>`: Run the lifecycle sweep at this interval (default: `600`)
 
 ### Storage Configuration
@@ -84,10 +86,62 @@ The MetaServer uses a DashMap-based in-memory store with the following character
 
 - **Multi-owner**: A block hash can be registered by multiple nodes simultaneously
 - **Node lifecycle**: Servers generate a `node_id`, announce it with `HeartbeatNode`, heartbeat periodically, and include the same `node_id` in insert/remove RPCs.
-- **Stale filtering**: Nodes stop appearing in query results after 30 seconds without heartbeat by default.
-- **TTL sweep**: A background task runs every `--sweep-interval-secs` and removes expired owners and nodes after `--ttl-minutes`.
+- **Stale filtering**: Nodes stop appearing in query results after 30 seconds without activity by default. Their records remain until node TTL cleanup; the same session can recover before cleanup without reinserting its blocks.
+- **Lifecycle sweep**: A background task runs every `--sweep-interval-secs`. It scans the block directory only after deleting an inactive node past `--ttl-minutes`, or when a session takeover needs reconciliation. Otherwise it only inspects nodes. Block registration age never causes automatic deletion.
 - **Conditional removal**: `RemoveBlockHashes` only removes the requesting node's ownership; other nodes' entries are untouched.
-- **Memory**: Scales with unique blocks across all nodes. No hard capacity cap — memory is naturally bounded by the total number of blocks in the cluster.
+- **Memory**: Scales with retained block and owner records; there is no hard capacity cap. Use the manual cleanup endpoint below for explicit maintenance.
+
+## HTTP APIs
+
+Health and metrics use `--http-addr`; manual cleanup uses the separate
+`--admin-http-addr` listener. The admin address must be loopback (for example,
+`127.0.0.1:9093` or `[::1]:9093`); a non-loopback address makes startup fail.
+Choose distinct available ports when running multiple MetaServers on one host.
+
+| Default address | Method and path | Purpose |
+| --- | --- | --- |
+| `0.0.0.0:9092` | `GET /health` | Returns `ok` |
+| `0.0.0.0:9092` | `GET /metrics` | Prometheus metrics |
+| `127.0.0.1:9093` | `POST /admin/cleanup-expired-blocks` | Remove owner registrations older than one hour |
+
+### Manual block cleanup
+
+Run this on the MetaServer host, or inside its container when using container
+networking. No request body or authentication is required:
+
+```bash
+curl --fail-with-body --silent --show-error --request POST \
+  http://127.0.0.1:9093/admin/cleanup-expired-blocks
+```
+
+The threshold is fixed at one hour and independent of `--ttl-minutes`. The
+cleanup pass scans all namespaces and removes owners whose last
+`InsertBlockHashes` registration was **strictly more than 3,600 seconds ago**
+when the pass started. Reinserting an owner refreshes its registration time;
+heartbeats and queries do not.
+
+Cleanup applies even to active nodes and blocks whose KV data still exists.
+It removes MetaServer metadata, leaves node records and physical KV data in
+place, and removes a block key only when its last owner is deleted. Fresh or
+refreshed owners remain. A deleted owner becomes discoverable again after
+`InsertBlockHashes` registers it; a heartbeat alone does not restore it.
+
+A successful call waits for the scan to complete and returns HTTP 200, for
+example:
+
+```json
+{"removed_owners":2,"removed_keys":1}
+```
+
+`removed_owners` counts deleted ownership records; `removed_keys` counts block
+keys left without any owner. Both are zero if no registration is old enough.
+The public HTTP listener returns 404 for this admin route; GET on the admin
+route returns 405. A cleanup worker failure returns HTTP 500.
+
+Manual cleanup scans the entire block directory on a blocking worker. It
+holds a block shard write lock while processing that shard, so concurrent
+RPCs accessing the same shard can experience increased latency. Use it for
+explicit maintenance and monitor RPC latency during the call.
 
 ## gRPC APIs
 
@@ -213,7 +267,7 @@ Graceful shutdown trigger.
 - **Data structure**: `blocks: DashMap<BlockKey, HashMap<Arc<str>, OwnerRecord>>` and `nodes: DashMap<Arc<str>, NodeRecord>`
 - **BlockKey**: `{ namespace: String, hash: Vec<u8> }` — matches pegaflow-core's BlockKey
 - **Multi-owner**: Multiple nodes can register the same block hash (e.g., after replication or shared prefill)
-- **Lifecycle sweep**: Background task runs periodically to remove owners whose node record is missing or whose ownership TTL expired; superseded sessions are hidden from queries by `node_id` matching and purged by TTL.
+- **Lifecycle sweep**: An inactive-node deletion or pending takeover triggers a block scan that removes owners with a missing node or a mismatched session. Superseded sessions are immediately hidden from queries and reconciled by the next sweep, even while the replacement session stays active.
 - **Concurrency**: DashMap uses shard-level locking for high-throughput concurrent access
 - **Persistence**: In-memory only (restart clears state)
 

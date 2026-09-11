@@ -54,7 +54,9 @@ pub fn register_store_gauges(store: &Arc<BlockHashStore>) {
         let redundancy_store = Arc::clone(&s);
         let redundancy = meter
             .u64_observable_gauge("pegaflow_metaserver_block_redundancy")
-            .with_description("Block keys bucketed by live owner count (replication factor)")
+            .with_description(
+                "Block keys by stored owner count; stale and old sessions count until cleanup",
+            )
             .with_callback(move |observer| {
                 let snap = redundancy_store.redundancy_snapshot();
                 observer.observe(snap.keys_1, &[KeyValue::new("owners", "1")]);
@@ -67,8 +69,7 @@ pub fn register_store_gauges(store: &Arc<BlockHashStore>) {
         let redundancy_avg = meter
             .f64_observable_gauge("pegaflow_metaserver_block_redundancy_avg")
             .with_description(
-                "Average live owners per block key with at least one live owner \
-                 (cluster replication factor / cache capacity shrink factor)",
+                "Average stored owners per block key; stale and old sessions count until cleanup",
             )
             .with_callback(move |observer| {
                 let snap = redundancy_avg_store.redundancy_snapshot();

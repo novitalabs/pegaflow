@@ -1952,8 +1952,10 @@ dependencies = [
  "pegaflow-common",
  "pegaflow-proto",
  "prometheus",
+ "serde",
  "tokio",
  "tonic",
+ "tower",
  "uuid",
 ]
 
