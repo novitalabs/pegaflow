@@ -31,7 +31,7 @@ pub mod transfer;
 
 pub use backing::{
     DEFAULT_SSD_PREFETCH_INFLIGHT, DEFAULT_SSD_PREFETCH_QUEUE_DEPTH, DEFAULT_SSD_WRITE_INFLIGHT,
-    DEFAULT_SSD_WRITE_QUEUE_DEPTH, SsdCacheConfig,
+    DEFAULT_SSD_WRITE_QUEUE_DEPTH, SsdCacheCleanupStats, SsdCacheConfig,
 };
 pub use block::{
     BlockHash, BlockKey, LayerBlock, LayerSave, PrefetchStatus, RawBlock, SealedBlock,
@@ -636,6 +636,14 @@ impl PegaEngine {
     pub fn cleanup_memory_cache(&self) -> MemoryCacheCleanupStats {
         self.query_leases.sweep_expired();
         self.storage.cleanup_memory_cache()
+    }
+
+    /// Remove all SSD cache index entries after draining preceding saves and writes.
+    ///
+    /// The preallocated cache files remain unchanged. Returns `None` when SSD
+    /// caching is not configured.
+    pub async fn cleanup_ssd_cache(&self) -> Option<SsdCacheCleanupStats> {
+        self.storage.cleanup_ssd_cache().await
     }
 
     /// Best-effort graceful unregister from MetaServer, if configured.
