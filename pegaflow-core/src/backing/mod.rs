@@ -27,7 +27,7 @@ use pegaflow_common::NumaNode;
 #[cfg(feature = "rdma")]
 pub(crate) use rdma::{RdmaTransport, new_rdma};
 #[cfg(feature = "rdma")]
-pub(crate) use rdma_fetch::RdmaFetchStore;
+pub(crate) use rdma_fetch::{DirectFetchPlan, GpuReadTarget, RdmaFetchStore};
 pub(crate) use ssd::SsdBackingStore;
 pub(crate) use ssd::new_ssd;
 

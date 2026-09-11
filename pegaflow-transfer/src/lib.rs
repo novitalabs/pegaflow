@@ -9,7 +9,8 @@ mod cudart_sys;
 pub mod v2;
 
 pub use engine::{
-    ConnectionStatus, HandshakeMetadata, MemoryRegion, TransferDesc, TransferEngine, TransferOp,
+    ConnectionStatus, DeviceMemoryRegion, HandshakeMetadata, MemoryRegion, TransferDesc,
+    TransferEngine, TransferOp,
 };
 pub use error::{Result, TransferError};
 

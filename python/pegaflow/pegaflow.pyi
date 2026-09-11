@@ -224,6 +224,7 @@ class EngineRpcClient:
         req_id: str,
         wait_for_full_prefix: bool = False,
         group_id: int = 0,
+        direct_gpu: bool = False,
     ) -> QueryLoading | QueryReady:
         """Query prefix cache hits with SSD prefetch support.
 

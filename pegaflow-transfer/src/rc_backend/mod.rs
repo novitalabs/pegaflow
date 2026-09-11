@@ -179,6 +179,93 @@ impl RcBackend {
         Ok(())
     }
 
+    pub(crate) fn register_device_memory(
+        &self,
+        ptr: NonNull<u8>,
+        len: usize,
+        device_id: u8,
+    ) -> Result<bool> {
+        if len == 0 {
+            return Err(TransferError::InvalidArgument("len must be non-zero"));
+        }
+
+        // Registration is instance/load retry safe. The same CUDA allocation
+        // can be used by many direct loads, but replacing its MR would
+        // invalidate rkeys already exchanged during an RDMA handshake.
+        let raw = ptr.as_ptr() as u64;
+        if self.state.lock().registered.contains_exact(raw, len) {
+            return Ok(false);
+        }
+
+        let attrs = crate::cuda_lib::rt::cudaPointerGetAttributes(ptr.cast()).map_err(|error| {
+            TransferError::Backend(format!(
+                "CUDA pointer validation failed for device {device_id}: {error}"
+            ))
+        })?;
+        if attrs.type_ != crate::cuda_lib::rt::cudaMemoryTypeDevice {
+            return Err(TransferError::Backend(
+                "direct-GPU registration requires a CUDA device pointer".to_string(),
+            ));
+        }
+        if attrs.device != i32::from(device_id) {
+            return Err(TransferError::Backend(format!(
+                "CUDA pointer belongs to device {}, requested device {device_id}",
+                attrs.device
+            )));
+        }
+
+        let dmabuf_fd =
+            crate::cuda_lib::driver::cu_get_dma_buf_fd(ptr.cast(), len).map_err(|error| {
+                TransferError::Backend(format!(
+                    "CUDA DMA-BUF export failed for device {device_id}: {error}"
+                ))
+            })?;
+
+        let mut mrs = Vec::with_capacity(self.nic_count());
+        for runtime in &self.runtimes {
+            let mr = unsafe {
+                runtime.pd.reg_dmabuf_mr(
+                    0,
+                    len,
+                    raw,
+                    dmabuf_fd,
+                    AccessFlags::LocalWrite | AccessFlags::RemoteWrite | AccessFlags::RemoteRead,
+                )
+            }
+            .map_err(|error| {
+                TransferError::Backend(format!(
+                    "GPUDirect RDMA DMA-BUF registration failed on NIC {}: {error}",
+                    runtime.nic_name
+                ))
+            });
+            match mr {
+                Ok(mr) => mrs.push(mr),
+                Err(error) => {
+                    // The fd is process-local and no longer needed after the
+                    // registration call. Existing MRs are dropped here.
+                    unsafe { libc::close(dmabuf_fd) };
+                    return Err(error);
+                }
+            }
+        }
+        unsafe { libc::close(dmabuf_fd) };
+
+        let mut state = self.state.lock();
+        Arc::make_mut(&mut state.registered).insert(RegisteredMemoryEntry {
+            base_ptr: raw,
+            len,
+            mrs,
+        })?;
+        info!(
+            "CUDA memory registered for direct RDMA: ptr={:#x}, len={}, device={}, nics={}",
+            raw,
+            len,
+            device_id,
+            self.nic_count()
+        );
+        Ok(true)
+    }
+
     pub(crate) fn unregister_memory(&self, ptr: NonNull<u8>) -> Result<()> {
         let raw = ptr.as_ptr() as u64;
         let mut state = self.state.lock();
@@ -187,6 +274,13 @@ impl RcBackend {
             return Err(TransferError::MemoryNotRegistered { ptr: raw });
         }
         debug!("memory unregistered: ptr={:#x}", raw);
+        Ok(())
+    }
+
+    pub(crate) fn unregister_memory_batch(&self, ptrs: &[NonNull<u8>]) -> Result<()> {
+        for &ptr in ptrs {
+            self.unregister_memory(ptr)?;
+        }
         Ok(())
     }
 

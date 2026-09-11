@@ -17,7 +17,9 @@ use pegaflow_core::sync_state::{LOAD_STATE_ERROR, LOAD_STATE_SUCCESS};
 use pegaflow_core::*;
 use pegaflow_metaserver::{BlockHashStore, GrpcMetaService};
 use pegaflow_proto::proto::engine::meta_server_server::MetaServerServer;
+use pegaflow_server::proto::engine::engine_client::EngineClient;
 use pegaflow_server::proto::engine::engine_server::EngineServer;
+use pegaflow_server::proto::engine::{QueryRequest, query_response};
 use pegaflow_server::{CudaTensorRegistry, GrpcEngineService, RegistryHandle};
 use tokio::sync::Notify;
 use tonic::transport::Server;
@@ -83,6 +85,18 @@ fn check_cuda(result: sys::CUresult, op: &str) {
         result == sys::CUresult::CUDA_SUCCESS,
         "{op} failed with {result:?}"
     );
+}
+
+fn skip_if_gpu_rdma_unsupported(error: &pegaflow_core::EngineError) -> bool {
+    let message = error.to_string();
+    if message.contains("CUDA DMA-BUF export")
+        || message.contains("GPUDirect")
+        || message.contains("DMA-BUF")
+    {
+        eprintln!("SKIP direct GPU RDMA E2E: {message}");
+        return true;
+    }
+    false
 }
 
 // ── Helpers (from pegaflow-core/tests/common/helpers.rs) ────────────────────
@@ -347,26 +361,29 @@ async fn p2p_rdma_remote_fetch_roundtrip() {
     fill_test_pattern(&mut host_data, BLOCK_SIZE);
     gpu_a.copy_from_host(&host_data);
 
-    engine_a
-        .register_context_layer_batch(
-            "inst-a",
-            NAMESPACE,
-            DEVICE_ID,
-            0, // tp_rank
-            0, // pp_rank
-            1, // tp_size
-            1, // world_size
-            &[LAYER.to_string()],
-            &[gpu_a.as_u64()],
-            &[TOTAL_SIZE],
-            &[NUM_BLOCKS],
-            &[BLOCK_SIZE],
-            &[0], // kv_strides
-            &[1], // segments
-            TransferMode::Direct,
-            false,
-        )
-        .expect("register layer on engine A");
+    if let Err(error) = engine_a.register_context_layer_batch(
+        "inst-a",
+        NAMESPACE,
+        DEVICE_ID,
+        0, // tp_rank
+        0, // pp_rank
+        1, // tp_size
+        1, // world_size
+        &[LAYER.to_string()],
+        &[gpu_a.as_u64()],
+        &[TOTAL_SIZE],
+        &[NUM_BLOCKS],
+        &[BLOCK_SIZE],
+        &[0], // kv_strides
+        &[1], // segments
+        TransferMode::Direct,
+        false,
+    ) {
+        if skip_if_gpu_rdma_unsupported(&error) {
+            return;
+        }
+        panic!("register layer on engine A: {error}");
+    }
 
     let block_ids = make_block_ids(NUM_BLOCKS);
     let block_hashes = make_block_hashes(NUM_BLOCKS, 42);
@@ -414,34 +431,105 @@ async fn p2p_rdma_remote_fetch_roundtrip() {
         rdma_nic_names: Some(vec![ib_device()]),
         ..StorageConfig::default()
     };
-    let engine_b =
-        PegaEngine::new_with_config(16 << 20, false, config_b).expect("engine B should start");
+    let engine_b = Arc::new(
+        PegaEngine::new_with_config(16 << 20, false, config_b).expect("engine B should start"),
+    );
+    spawn_engine_server(Arc::clone(&engine_b), port_b).await;
 
     let gpu_b = GpuBuffer::alloc(TOTAL_SIZE);
     gpu_b.zero();
 
-    engine_b
-        .register_context_layer_batch(
-            "inst-b",
-            NAMESPACE,
-            DEVICE_ID,
-            0, // tp_rank
-            0, // pp_rank
-            1, // tp_size
-            1, // world_size
-            &[LAYER.to_string()],
-            &[gpu_b.as_u64()],
-            &[TOTAL_SIZE],
-            &[NUM_BLOCKS],
-            &[BLOCK_SIZE],
-            &[0],
-            &[1],
-            TransferMode::Direct,
-            false,
-        )
-        .expect("register layer on engine B");
+    if let Err(error) = engine_b.register_context_layer_batch(
+        "inst-b",
+        NAMESPACE,
+        DEVICE_ID,
+        0, // tp_rank
+        0, // pp_rank
+        1, // tp_size
+        1, // world_size
+        &[LAYER.to_string()],
+        &[gpu_b.as_u64()],
+        &[TOTAL_SIZE],
+        &[NUM_BLOCKS],
+        &[BLOCK_SIZE],
+        &[0],
+        &[1],
+        TransferMode::Direct,
+        false,
+    ) {
+        if skip_if_gpu_rdma_unsupported(&error) {
+            return;
+        }
+        panic!("register layer on engine B: {error}");
+    }
 
-    // ── 8. Start the remote query before the producer registers the blocks ──
+    // ── 8. Query a direct-GPU lease through the gRPC server and load it ──
+    // The source blocks were advertised above. This path intentionally skips
+    // host staging: the RDMA READ targets the registered GPU allocation.
+    let mut client = EngineClient::connect(format!("http://127.0.0.1:{port_b}"))
+        .await
+        .expect("connect engine B RPC");
+    let direct_response = client
+        .query_prefetch(QueryRequest {
+            instance_id: "inst-b".to_string(),
+            block_hashes: block_hashes.clone(),
+            req_id: "direct-gpu-roundtrip".to_string(),
+            wait_for_full_prefix: false,
+            group_id: 0,
+            direct_gpu: true,
+        })
+        .await
+        .expect("direct GPU query RPC")
+        .into_inner();
+    let direct_ready = match direct_response.outcome.expect("direct query outcome") {
+        query_response::Outcome::Ready(ready) => ready,
+        query_response::Outcome::Loading(_) => panic!("direct GPU query must not load locally"),
+    };
+    assert_eq!(direct_ready.num_hit_blocks as usize, NUM_BLOCKS);
+    assert!(!direct_ready.lease.is_empty());
+    let direct_lease = QueryLeaseId::from_bytes(&direct_ready.lease).expect("direct lease token");
+
+    gpu_b.zero();
+    let direct_load_state = LoadState::new().expect("create direct load state");
+    let direct_shm_name = direct_load_state.shm_name().to_string();
+    let direct_load = engine_b.batch_load_kv_blocks_multi_layer(
+        "inst-b",
+        0,
+        DEVICE_ID,
+        &direct_shm_name,
+        &[vec![LAYER]],
+        &[(
+            direct_lease,
+            vec![block_ids.iter().copied().map(Some).collect()],
+        )],
+    );
+    if let Err(error) = direct_load {
+        assert!(
+            skip_if_gpu_rdma_unsupported(&error),
+            "direct GPU load: {error}"
+        );
+    } else {
+        let direct_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match direct_load_state.get() {
+                LOAD_STATE_SUCCESS => break,
+                LOAD_STATE_ERROR => panic!("direct GPU load reported ERROR"),
+                _ => {}
+            }
+            assert!(
+                Instant::now() < direct_deadline,
+                "timed out waiting for direct GPU load"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            gpu_b.copy_to_host(),
+            host_data,
+            "direct GPU RDMA data mismatch"
+        );
+    }
+
+    // ── 9. Start the host-staging remote query before the producer registers blocks ──
     let delayed_hashes = make_block_hashes(NUM_BLOCKS, 43);
     let status = engine_b
         .count_prefix_hit_blocks_with_prefetch(

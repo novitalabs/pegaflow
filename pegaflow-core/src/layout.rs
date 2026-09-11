@@ -61,6 +61,10 @@ pub(crate) struct KVCacheLayout {
 }
 
 impl KVCacheLayout {
+    pub(crate) fn device_region(&self) -> (u64, usize) {
+        (self.data_ptr, self.size_bytes)
+    }
+
     /// Construct and validate a layout. Rejects null/oversized regions and
     /// overlapping segment configurations (crash early instead of copying
     /// garbage later).

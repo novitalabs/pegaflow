@@ -6,6 +6,8 @@ mod write_path;
 
 use bytesize::ByteSize;
 use log::{debug, info, warn};
+#[cfg(feature = "rdma")]
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Weak};
@@ -13,13 +15,19 @@ use std::time::Duration;
 
 use crate::backing::{AllocateFn, DEFAULT_MAX_PREFETCH_BLOCKS, SsdBackingStore, SsdCacheConfig};
 #[cfg(feature = "rdma")]
-use crate::backing::{RdmaFetchStore, RdmaTransport};
+use crate::backing::{DirectFetchPlan, GpuReadTarget, RdmaFetchStore, RdmaTransport};
 use crate::block::{BlockKey, PrefetchStatus, SealedBlock};
 use crate::internode::MetaServerClient;
 use crate::internode::metaserver_client::MetaServerClientConfig;
 use crate::metrics::core_metrics;
 use crate::pinned_pool::{PinnedAllocation, PinnedAllocator};
+#[cfg(feature = "rdma")]
+use parking_lot::Mutex;
 use pegaflow_common::NumaNode;
+#[cfg(feature = "rdma")]
+use pegaflow_transfer::DeviceMemoryRegion;
+#[cfg(feature = "rdma")]
+use std::ptr::NonNull;
 
 use prefetch::PrefetchScheduler;
 #[cfg(feature = "rdma")]
@@ -99,6 +107,10 @@ pub(crate) struct StorageEngine {
     ssd_store: Option<Arc<SsdBackingStore>>,
     #[cfg(feature = "rdma")]
     rdma_transport: Option<Arc<RdmaTransport>>,
+    #[cfg(feature = "rdma")]
+    rdma_fetch: Option<Arc<RdmaFetchStore>>,
+    #[cfg(feature = "rdma")]
+    registered_device_ptrs: Mutex<HashMap<String, Vec<u64>>>,
     blockwise_alloc: bool,
     metaserver_client: Option<Arc<MetaServerClient>>,
     transfer_lock: Arc<transfer_lock::TransferLockManager>,
@@ -219,19 +231,21 @@ impl StorageEngine {
                     .advertise_addr
                     .clone()
                     .unwrap_or_else(|| "127.0.0.1:50055".to_string());
-                Some(RdmaFetch::new(Arc::new(RdmaFetchStore::new(
+                Some(Arc::new(RdmaFetchStore::new(
                     Arc::clone(ms),
                     Arc::clone(rdma),
                     allocate_fn.clone(),
                     advertise,
-                ))))
+                )))
             });
+            #[cfg(feature = "rdma")]
+            let rdma_fetch_for_prefetch = rdma_fetch.clone().map(RdmaFetch::new);
             #[cfg(not(feature = "rdma"))]
-            let rdma_fetch = None;
+            let rdma_fetch_for_prefetch = None;
 
             let prefetch = PrefetchScheduler::new(
                 ssd_store.clone(),
-                rdma_fetch,
+                rdma_fetch_for_prefetch,
                 metaserver_client.clone(),
                 max_prefetch_blocks,
             );
@@ -248,6 +262,10 @@ impl StorageEngine {
                 ssd_store,
                 #[cfg(feature = "rdma")]
                 rdma_transport,
+                #[cfg(feature = "rdma")]
+                rdma_fetch,
+                #[cfg(feature = "rdma")]
+                registered_device_ptrs: Mutex::new(HashMap::new()),
                 blockwise_alloc,
                 metaserver_client,
                 transfer_lock,
@@ -479,6 +497,41 @@ impl StorageEngine {
             .await
     }
 
+    #[cfg(feature = "rdma")]
+    pub(crate) async fn query_direct_plan(
+        &self,
+        namespace: &str,
+        hashes: &[Vec<u8>],
+    ) -> Option<DirectFetchPlan> {
+        self.rdma_fetch
+            .as_ref()?
+            .query_direct_plan(namespace, hashes)
+            .await
+    }
+
+    #[cfg(feature = "rdma")]
+    pub(crate) async fn direct_load(
+        &self,
+        plan: &DirectFetchPlan,
+        req_id: &str,
+        targets: &[GpuReadTarget],
+        device_id: i32,
+    ) -> Result<(), String> {
+        let fetch = self
+            .rdma_fetch
+            .as_ref()
+            .ok_or_else(|| "direct GPU RDMA is not configured".to_string())?;
+        fetch
+            .fetch_plan_to_gpu(
+                plan,
+                req_id,
+                targets,
+                device_id,
+                self.transfer_lock_timeout(),
+            )
+            .await
+    }
+
     fn reclaim_until_allocator_can_allocate(
         &self,
         required_bytes: u64,
@@ -625,6 +678,77 @@ impl StorageEngine {
     #[cfg(feature = "rdma")]
     pub(crate) fn rdma_transport(&self) -> Option<&Arc<RdmaTransport>> {
         self.rdma_transport.as_ref()
+    }
+
+    /// Register all CUDA KV allocations belonging to one instance.
+    ///
+    /// GPU registration is deliberately transactional: if one layer cannot
+    /// be exported as a DMA-BUF or registered on every configured NIC, all
+    /// allocations registered by this call are removed again.
+    #[cfg(feature = "rdma")]
+    pub(crate) fn register_device_memory(
+        &self,
+        instance_id: &str,
+        device_id: i32,
+        regions: &[(u64, usize)],
+    ) -> Result<(), String> {
+        let transport = self
+            .rdma_transport
+            .as_ref()
+            .ok_or_else(|| "direct-GPU registration requires RDMA transport".to_string())?;
+        if device_id < 0 || device_id > u8::MAX as i32 {
+            return Err(format!("CUDA device id {device_id} is out of range"));
+        }
+        let registered = self.registered_device_ptrs.lock();
+        let existing = registered.get(instance_id);
+        let mut descs = Vec::with_capacity(regions.len());
+        for &(ptr, len) in regions {
+            if existing.is_some_and(|ptrs| ptrs.contains(&ptr)) {
+                continue;
+            }
+            let ptr = NonNull::new(ptr as *mut u8)
+                .ok_or_else(|| "CUDA allocation pointer must not be null".to_string())?;
+            descs.push(DeviceMemoryRegion {
+                ptr,
+                len,
+                device_id: device_id as u8,
+            });
+        }
+        drop(registered);
+        if descs.is_empty() {
+            return Ok(());
+        }
+        transport
+            .engine()
+            .register_device_memory(&descs)
+            .map_err(|error| error.to_string())?;
+        let mut registered = self.registered_device_ptrs.lock();
+        let ptrs = registered.entry(instance_id.to_string()).or_default();
+        for desc in descs {
+            let ptr = desc.ptr.as_ptr() as u64;
+            if !ptrs.contains(&ptr) {
+                ptrs.push(ptr);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "rdma")]
+    pub(crate) fn unregister_device_memory(&self, instance_id: &str) {
+        let Some(ptrs) = self.registered_device_ptrs.lock().remove(instance_id) else {
+            return;
+        };
+        if let Some(transport) = &self.rdma_transport {
+            let ptrs: Vec<NonNull<u8>> = ptrs
+                .into_iter()
+                .filter_map(|ptr| NonNull::new(ptr as *mut u8))
+                .collect();
+            if let Err(error) = transport.engine().unregister_memory(&ptrs) {
+                log::error!(
+                    "Failed to unregister CUDA RDMA memory for instance {instance_id}: {error}"
+                );
+            }
+        }
     }
 
     pub(crate) async fn shutdown_metaserver_client(&self) {

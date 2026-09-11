@@ -68,6 +68,12 @@ impl LocalMemoryMap {
         self.entries.remove(&base_ptr)
     }
 
+    pub(super) fn contains_exact(&self, base_ptr: u64, len: usize) -> bool {
+        self.entries
+            .get(&base_ptr)
+            .is_some_and(|entry| entry.len == len)
+    }
+
     /// Entries in base_ptr order.
     pub(super) fn iter(&self) -> impl Iterator<Item = &RegisteredMemoryEntry> {
         self.entries.values()
@@ -287,6 +293,8 @@ mod tests {
         let mut map = LocalMemoryMap::default();
         map.insert(entry(0x1000, 0x100)).expect("first region");
         map.insert(entry(0x3000, 0x100)).expect("disjoint region");
+        assert!(map.contains_exact(0x1000, 0x100));
+        assert!(!map.contains_exact(0x1000, 0x80));
 
         // Overlap with predecessor and successor both rejected.
         assert!(map.insert(entry(0x10ff, 0x10)).is_err());

@@ -61,8 +61,10 @@ use std::{
 use log::{debug, info};
 
 use crate::backing::SSD_ALIGNMENT;
+#[cfg(feature = "rdma")]
+use crate::backing::{DirectFetchPlan, GpuReadTarget};
 use crate::gpu_worker::{HostBlock, LayerTransferData, LoadCompletion, LoadTask, TransferBlock};
-use crate::lease::QueryLeaseManager;
+use crate::lease::{QueryLeaseManager, QueryLeasePayload};
 use crate::metrics::core_metrics;
 use crate::storage::StorageEngine;
 use tokio::sync::oneshot;
@@ -450,6 +452,9 @@ impl PegaEngine {
         if removed.is_none() {
             return Err(EngineError::InstanceMissing(instance_id.to_string()));
         }
+        drop(removed);
+        #[cfg(feature = "rdma")]
+        self.storage.unregister_device_memory(instance_id);
         self.query_leases.release_instance(instance_id);
         info!("Unregistered instance: {}", instance_id);
         Ok(())
@@ -465,6 +470,8 @@ impl PegaEngine {
         instances.clear();
         drop(instances);
         for id in &ids {
+            #[cfg(feature = "rdma")]
+            self.storage.unregister_device_memory(id);
             self.query_leases.release_instance(id);
         }
         if !ids.is_empty() {
@@ -580,6 +587,34 @@ impl PegaEngine {
         Ok(status)
     }
 
+    /// Query a remote-only prefix plan for direct GPU loading. This path never
+    /// allocates pinned host memory and never holds a transfer lock while the
+    /// scheduler waits for a destination allocation.
+    #[cfg(feature = "rdma")]
+    pub async fn query_direct_gpu_plan(
+        &self,
+        instance_id: &str,
+        block_hashes: &[Vec<u8>],
+    ) -> Result<Option<crate::backing::DirectFetchPlan>, EngineError> {
+        if !self.has_rdma_transport() {
+            return Err(EngineError::Storage(
+                "direct GPU RDMA requires configured RDMA transport".to_string(),
+            ));
+        }
+        let instance = self.get_instance(instance_id)?;
+        let topology = instance.sealed_topology()?;
+        if topology.num_groups() != 1 || instance.page_first() {
+            return Err(EngineError::InvalidArgument(
+                "direct GPU RDMA only supports dense attention group 0".to_string(),
+            ));
+        }
+        let namespace = instance.namespace();
+        Ok(self
+            .storage
+            .query_direct_plan(namespace, block_hashes)
+            .await)
+    }
+
     /// Position-aligned membership query over one hybrid-cache storage group.
     ///
     /// Unlike prefix queries, every position reports independently: entry `i`
@@ -625,6 +660,25 @@ impl PegaEngine {
         Ok(self
             .query_leases
             .create(instance_id, blocks, instance.world_size()))
+    }
+
+    /// Create a lease for a remote-only GPU load plan. Unlike a cached lease,
+    /// this does not pin or own a local `SealedBlock`.
+    #[cfg(feature = "rdma")]
+    pub fn create_direct_query_lease(
+        &self,
+        instance_id: &str,
+        plan: DirectFetchPlan,
+    ) -> Result<QueryLeaseId, EngineError> {
+        let instance = self.get_instance(instance_id)?;
+        if plan.hashes.is_empty() || plan.segments.is_empty() {
+            return Err(EngineError::InvalidArgument(
+                "direct query lease requires a non-empty remote plan".to_string(),
+            ));
+        }
+        Ok(self
+            .query_leases
+            .create_direct(instance_id, plan, instance.world_size()))
     }
 
     /// Release a query lease. Returns false when the lease is unknown or expired.
@@ -727,6 +781,31 @@ impl PegaEngine {
             .get_gpu(device_id)
             .ok_or_else(|| EngineError::WorkerMissing(instance_id.to_string(), device_id))?;
 
+        let direct_mode = loads
+            .first()
+            .is_some_and(|(lease, _)| self.query_leases.is_direct(lease));
+        if direct_mode {
+            #[cfg(feature = "rdma")]
+            {
+                return self.batch_direct_load_multi_layer_inner(
+                    &instance,
+                    gpu,
+                    tp_rank,
+                    device_id,
+                    layer_groups,
+                    loads,
+                    completion,
+                );
+            }
+            #[cfg(not(feature = "rdma"))]
+            {
+                completion.signal(Err(EngineError::Storage(
+                    "direct GPU load requires an RDMA-enabled build".to_string(),
+                )));
+                return Ok(());
+            }
+        }
+
         if layer_groups.is_empty() {
             return Err(EngineError::InvalidArgument(
                 "load requires at least one layer group".to_string(),
@@ -776,10 +855,19 @@ impl PegaEngine {
         let mut block_targets_by_group = vec![Vec::new(); layer_groups.len()];
         let mut block_cache = Vec::new();
         for (lease, lease_block_ids_by_group) in loads {
-            let blocks = self
+            let blocks = match self
                 .query_leases
                 .consume(instance_id, lease)
-                .map_err(EngineError::Storage)?;
+                .map_err(EngineError::Storage)?
+            {
+                QueryLeasePayload::Cached(blocks) => blocks,
+                #[cfg(feature = "rdma")]
+                QueryLeasePayload::Direct(_) => {
+                    return Err(EngineError::InvalidArgument(
+                        "cached load received a direct GPU query lease".to_string(),
+                    ));
+                }
+            };
             if lease_block_ids_by_group.len() != layer_groups.len() {
                 return Err(EngineError::InvalidArgument(format!(
                     "load group count {} does not match layer group count {}",
@@ -892,6 +980,134 @@ impl PegaEngine {
         // Submit to worker pool (fire and forget)
         gpu.worker_pool()
             .submit_load(LoadTask { layers, completion })
+    }
+
+    #[cfg(feature = "rdma")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "direct load helper keeps the validated instance, GPU and batched load payload explicit"
+    )]
+    fn batch_direct_load_multi_layer_inner(
+        &self,
+        instance: &Arc<InstanceContext>,
+        gpu: Arc<crate::instance::GpuContext>,
+        tp_rank: usize,
+        device_id: i32,
+        layer_groups: &[Vec<&str>],
+        loads: &[(QueryLeaseId, Vec<Vec<Option<usize>>>)],
+        completion: LoadCompletion,
+    ) -> Result<(), EngineError> {
+        let metrics = core_metrics();
+        let topology = instance.sealed_topology()?;
+        if instance.page_first() || topology.num_groups() != 1 {
+            completion.signal(Err(EngineError::InvalidArgument(
+                "direct GPU load only supports dense attention group 0".to_string(),
+            )));
+            return Ok(());
+        }
+        if layer_groups.is_empty() || layer_groups.iter().skip(1).any(|group| !group.is_empty()) {
+            completion.signal(Err(EngineError::InvalidArgument(
+                "direct GPU load is limited to dense attention storage group 0".to_string(),
+            )));
+            return Ok(());
+        }
+        let mut direct_loads = Vec::with_capacity(loads.len());
+        for (lease, block_ids_by_group) in loads {
+            let payload = self
+                .query_leases
+                .consume(instance.id(), lease)
+                .map_err(EngineError::Storage)?;
+            let QueryLeasePayload::Direct(plan) = payload else {
+                return Err(EngineError::InvalidArgument(
+                    "direct load mixed cached and direct query leases".to_string(),
+                ));
+            };
+            if block_ids_by_group.len() != layer_groups.len() {
+                return Err(EngineError::InvalidArgument(format!(
+                    "direct load group count {} does not match layer group count {}",
+                    block_ids_by_group.len(),
+                    layer_groups.len()
+                )));
+            }
+            let destination_blocks = &block_ids_by_group[0];
+            if destination_blocks.len() != plan.hashes.len()
+                || destination_blocks.iter().any(Option::is_none)
+            {
+                return Err(EngineError::InvalidArgument(format!(
+                    "direct plan has {} hashes but dense destination has {} complete block ids",
+                    plan.hashes.len(),
+                    destination_blocks.iter().filter(|id| id.is_some()).count()
+                )));
+            }
+            let destination_block_ids: Vec<usize> = destination_blocks
+                .iter()
+                .map(|id| id.expect("checked above"))
+                .collect();
+            let mut targets = Vec::with_capacity(layer_groups[0].len());
+            for layer_name in &layer_groups[0] {
+                let layer_id = topology.layer_id(layer_name)?;
+                if topology.group_of_layer(layer_id) != 0 {
+                    return Err(EngineError::InvalidArgument(format!(
+                        "direct GPU layer {layer_name} is not in storage group 0"
+                    )));
+                }
+                let layout = gpu.get_layout(layer_name).ok_or_else(|| {
+                    EngineError::InvalidArgument(format!(
+                        "layer {layer_name} not registered on device {device_id}"
+                    ))
+                })?;
+                targets.push(GpuReadTarget {
+                    layer_name: layer_name.to_string(),
+                    layout,
+                    destination_block_ids: destination_block_ids.clone(),
+                    remote_slot_id: topology.slot_index(layer_id, tp_rank)?,
+                });
+            }
+            direct_loads.push((plan, targets));
+        }
+        let mut regions: Vec<(u64, usize)> = direct_loads
+            .iter()
+            .flat_map(|(_, targets)| targets.iter().map(|target| target.layout.device_region()))
+            .collect();
+        regions.sort_unstable();
+        regions.dedup();
+        self.storage
+            .register_device_memory(instance.id(), device_id, &regions)
+            .map_err(|error| {
+                metrics.direct_gpu_mr_registration_failures.add(1, &[]);
+                metrics
+                    .direct_gpu_load_total
+                    .add(1, &[opentelemetry::KeyValue::new("status", "error")]);
+                EngineError::Storage(error)
+            })?;
+        let storage = Arc::clone(&self.storage);
+        let req_id = format!("direct-load:{}", uuid::Uuid::new_v4());
+        let started_at = std::time::Instant::now();
+        tokio::spawn(async move {
+            let result = async {
+                for (plan, targets) in &direct_loads {
+                    storage
+                        .direct_load(plan, &req_id, targets, device_id)
+                        .await
+                        .map_err(EngineError::Storage)?;
+                }
+                Ok(())
+            }
+            .await;
+            let metrics = core_metrics();
+            metrics.direct_gpu_load_total.add(
+                1,
+                &[opentelemetry::KeyValue::new(
+                    "status",
+                    if result.is_ok() { "success" } else { "error" },
+                )],
+            );
+            metrics
+                .direct_gpu_load_duration_seconds
+                .record(started_at.elapsed().as_secs_f64(), &[]);
+            completion.signal(result);
+        });
+        Ok(())
     }
 
     /// Wait until all previously submitted save batches have been processed

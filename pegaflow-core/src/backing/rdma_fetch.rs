@@ -24,6 +24,7 @@ use super::transfer_lock_guard::TransferLockGuard;
 use super::{AllocateFn, PrefetchResult, RdmaTransport};
 use crate::block::{BlockKey, RawBlock, SealedBlock, Segment};
 use crate::internode::MetaServerClient;
+use crate::layout::{BlockCopies, KVCacheLayout};
 use crate::metrics::core_metrics;
 
 /// Minimum usable transfer timeout. If the server's lock timeout minus the
@@ -71,6 +72,80 @@ pub(crate) struct FetchPlan {
     block_count: usize,
 }
 
+/// Remote-only plan carried by a query lease until the destination GPU is
+/// allocated. It contains no local allocation or transfer lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectFetchPlan {
+    pub(crate) namespace: String,
+    pub(crate) hashes: Vec<Vec<u8>>,
+    pub(crate) segments: Vec<(String, usize)>,
+}
+
+impl DirectFetchPlan {
+    pub fn block_count(&self) -> usize {
+        self.hashes.len()
+    }
+}
+
+/// Build READ descriptors for one remote slot and one local GPU block.
+///
+/// The destination layout owns all pointer/range validation. Remote metadata
+/// is checked for the same K/V shape before a WQE is submitted, so a stale or
+/// incompatible owner cannot cause a short or shifted GPU write.
+pub(crate) fn build_gpu_read_descs(
+    layout: &KVCacheLayout,
+    destination_block: usize,
+    remote_slot: &pegaflow_proto::proto::engine::TransferSlotInfo,
+) -> Result<Vec<TransferDesc>, String> {
+    let copies = layout.block_copies(destination_block)?;
+    let remote_k = NonNull::new(remote_slot.k_ptr as *mut u8)
+        .ok_or_else(|| "remote K ptr is null".to_string())?;
+    let k_size = usize::try_from(remote_slot.k_size)
+        .map_err(|_| "remote K size exceeds usize".to_string())?;
+    let mut descs = Vec::with_capacity(2);
+    match copies {
+        BlockCopies::Contiguous(copy) => {
+            if remote_slot.v_ptr != 0 || remote_slot.v_size != 0 || k_size != copy.bytes {
+                return Err(format!(
+                    "remote contiguous slot shape mismatch: remote k={} v_ptr={} v_size={}, local bytes={}",
+                    k_size, remote_slot.v_ptr, remote_slot.v_size, copy.bytes
+                ));
+            }
+            descs.push(TransferDesc {
+                local_ptr: NonNull::new(copy.addr as *mut u8)
+                    .ok_or_else(|| "local GPU K ptr is null".to_string())?,
+                remote_ptr: remote_k,
+                len: copy.bytes,
+            });
+        }
+        BlockCopies::Split { k, v } => {
+            let remote_v = NonNull::new(remote_slot.v_ptr as *mut u8)
+                .ok_or_else(|| "remote V ptr is null for split slot".to_string())?;
+            let v_size = usize::try_from(remote_slot.v_size)
+                .map_err(|_| "remote V size exceeds usize".to_string())?;
+            if k_size != k.bytes || v_size != v.bytes {
+                return Err(format!(
+                    "remote split slot shape mismatch: remote k/v={k_size}/{v_size}, local k/v={}/{}",
+                    k.bytes, v.bytes
+                ));
+            }
+            descs.push(TransferDesc {
+                local_ptr: NonNull::new(k.addr as *mut u8)
+                    .ok_or_else(|| "local GPU K ptr is null".to_string())?,
+                remote_ptr: remote_k,
+                len: k.bytes,
+            });
+            descs.push(TransferDesc {
+                local_ptr: NonNull::new(v.addr as *mut u8)
+                    .ok_or_else(|| "local GPU V ptr is null".to_string())?,
+                remote_ptr: remote_v,
+                len: v.bytes,
+            });
+        }
+    }
+    Ok(descs)
+}
+
 impl FetchPlan {
     pub(crate) fn block_count(&self) -> usize {
         self.block_count
@@ -82,6 +157,19 @@ impl FetchPlan {
             .map(|segment| (segment.end - segment.start).to_string())
             .collect::<Vec<_>>()
             .join(",")
+    }
+
+    pub(crate) fn direct_plan(&self, namespace: &str, hashes: &[Vec<u8>]) -> DirectFetchPlan {
+        let covered = self.block_count.min(hashes.len());
+        DirectFetchPlan {
+            namespace: namespace.to_string(),
+            hashes: hashes[..covered].to_vec(),
+            segments: self
+                .segments
+                .iter()
+                .map(|segment| (segment.node.clone(), segment.end - segment.start))
+                .collect(),
+        }
     }
 }
 
@@ -248,6 +336,19 @@ impl RdmaFetchStore {
         Some(plan)
     }
 
+    /// Query a remote-only plan without allocating host staging memory or
+    /// taking a transfer lock. The plan is safe to keep in a query lease until
+    /// the scheduler has allocated its GPU destination blocks.
+    pub(crate) async fn query_direct_plan(
+        &self,
+        namespace: &str,
+        hashes: &[Vec<u8>],
+    ) -> Option<DirectFetchPlan> {
+        self.query_plan(namespace, hashes)
+            .await
+            .map(|plan| plan.direct_plan(namespace, hashes))
+    }
+
     pub(crate) async fn fetch_plan(
         &self,
         plan: &FetchPlan,
@@ -293,6 +394,158 @@ impl RdmaFetchStore {
         fetched
     }
 
+    /// Execute a remote plan directly into registered CUDA allocations.
+    /// `targets` contains one entry per local layer and one destination block
+    /// per planned hash. All segments are fetched in plan order so a stale
+    /// owner cannot make a later prefix segment appear valid.
+    pub(crate) async fn fetch_plan_to_gpu(
+        &self,
+        plan: &DirectFetchPlan,
+        req_id: &str,
+        remote_targets: &[GpuReadTarget],
+        device_id: i32,
+        transfer_timeout: Duration,
+    ) -> Result<(), String> {
+        if remote_targets.is_empty() {
+            return Err("direct GPU load requires at least one target layer".into());
+        }
+        for target in remote_targets {
+            if target.destination_block_ids.len() != plan.hashes.len() {
+                return Err(format!(
+                    "direct GPU layer {} has {} destination blocks for {} hashes",
+                    target.layer_name,
+                    target.destination_block_ids.len(),
+                    plan.hashes.len()
+                ));
+            }
+        }
+        let mut offset = 0usize;
+        for (segment_index, (remote_addr, block_count)) in plan.segments.iter().enumerate() {
+            let end = offset
+                .checked_add(*block_count)
+                .ok_or_else(|| "direct plan block count overflows usize".to_string())?;
+            let hashes = plan
+                .hashes
+                .get(offset..end)
+                .ok_or_else(|| format!("direct plan segment {segment_index} exceeds hash list"))?;
+
+            ensure_connected(
+                &self.connect_group,
+                &self.rdma_transport,
+                &self.grpc_channels,
+                remote_addr,
+                &self.advertise_addr,
+            )
+            .await?;
+            let (client, mut response) = query_remote_blocks(
+                &self.grpc_channels,
+                remote_addr,
+                &plan.namespace,
+                hashes,
+                &self.advertise_addr,
+            )
+            .await?;
+            if response.blocks.len() != hashes.len() {
+                return Err(format!(
+                    "direct GPU segment {segment_index} returned {} blocks for {} hashes",
+                    response.blocks.len(),
+                    hashes.len()
+                ));
+            }
+            let lock_guard = TransferLockGuard::new(
+                client,
+                std::mem::take(&mut response.transfer_session_id),
+                remote_addr,
+                req_id,
+            );
+
+            let receivers = {
+                let build_result = (|| {
+                    let mut descs = Vec::new();
+                    for (local_index, block) in response.blocks.iter().enumerate() {
+                        if block.block_hash != hashes[local_index] {
+                            return Err(format!(
+                                "direct GPU segment {segment_index} block hash mismatch at offset {}",
+                                offset + local_index
+                            ));
+                        }
+                        let destination_index = offset + local_index;
+                        for target in remote_targets {
+                            let slot = block.slots.get(target.remote_slot_id).ok_or_else(|| {
+                                format!(
+                                    "remote block has no slot {} for layer {}",
+                                    target.remote_slot_id, target.layer_name
+                                )
+                            })?;
+                            descs.extend(build_gpu_read_descs(
+                                &target.layout,
+                                target.destination_block_ids[destination_index],
+                                slot,
+                            )?);
+                        }
+                    }
+                    Ok(descs)
+                })();
+                let descs = match build_result {
+                    Ok(descs) => descs,
+                    Err(error) => {
+                        lock_guard.release();
+                        return Err(error);
+                    }
+                };
+                if descs.is_empty() {
+                    lock_guard.release();
+                    return Err(format!(
+                        "direct GPU segment {segment_index} has no descriptors"
+                    ));
+                }
+                match self.rdma_transport.engine().batch_transfer_async(
+                    TransferOp::Read,
+                    remote_addr,
+                    &descs,
+                ) {
+                    Ok(receivers) => receivers,
+                    Err(error) => {
+                        lock_guard.release();
+                        return Err(format!("direct GPU RDMA submit failed: {error}"));
+                    }
+                }
+            };
+            let wait_result = tokio::time::timeout(transfer_timeout, async {
+                for receiver in receivers {
+                    receiver
+                        .await
+                        .map_err(|_| "direct GPU completion channel closed".to_string())?
+                        .map_err(|error| format!("direct GPU RDMA completion failed: {error}"))?;
+                }
+                Ok::<(), String>(())
+            })
+            .await
+            .map_err(|_| "direct GPU RDMA transfer timed out".to_string())?;
+            if let Err(error) = wait_result {
+                lock_guard.release();
+                return Err(error);
+            }
+            let cuda_context =
+                cudarc::driver::CudaContext::new(device_id as usize).map_err(|error| {
+                    format!("direct GPU CUDA context visibility fence failed: {error:?}")
+                })?;
+            cuda_context
+                .synchronize()
+                .map_err(|error| format!("direct GPU CUDA visibility fence failed: {error:?}"))?;
+            lock_guard.release();
+            offset = end;
+        }
+        if offset != plan.hashes.len() {
+            return Err(format!(
+                "direct plan covers {} hashes but request has {}",
+                offset,
+                plan.hashes.len()
+            ));
+        }
+        Ok(())
+    }
+
     /// Fetch `hashes` from `remote_addr`.
     pub(crate) async fn fetch_blocks(
         &self,
@@ -314,6 +567,13 @@ impl RdmaFetchStore {
         )
         .await
     }
+}
+
+pub(crate) struct GpuReadTarget {
+    pub(crate) layer_name: String,
+    pub(crate) layout: KVCacheLayout,
+    pub(crate) destination_block_ids: Vec<usize>,
+    pub(crate) remote_slot_id: usize,
 }
 
 /// Execute RDMA fetch against a single remote node.
@@ -914,9 +1174,57 @@ fn transfer_timeout_from_server(lock_timeout_secs: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pegaflow_proto::proto::engine::TransferSlotInfo;
     use std::collections::VecDeque;
     use std::num::NonZeroU64;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn gpu_read_descs_validate_contiguous_shape() {
+        let layout = KVCacheLayout::new(0x1000, 0x100, 2, 0x20, 0, 1).expect("layout");
+        let slot = TransferSlotInfo {
+            k_ptr: 0x8000,
+            k_size: 0x20,
+            v_ptr: 0,
+            v_size: 0,
+            numa_node: 0,
+        };
+        let descs = build_gpu_read_descs(&layout, 1, &slot).expect("descriptor");
+        assert_eq!(descs.len(), 1);
+        assert_eq!(descs[0].local_ptr.as_ptr() as u64, 0x1020);
+        assert_eq!(descs[0].remote_ptr.as_ptr() as u64, 0x8000);
+        assert_eq!(descs[0].len, 0x20);
+    }
+
+    #[test]
+    fn gpu_read_descs_validate_split_shape() {
+        let layout = KVCacheLayout::new(0x1000, 0x200, 1, 0x20, 0x80, 2).expect("layout");
+        let slot = TransferSlotInfo {
+            k_ptr: 0x8000,
+            k_size: 0x20,
+            v_ptr: 0x9000,
+            v_size: 0x20,
+            numa_node: 0,
+        };
+        let descs = build_gpu_read_descs(&layout, 0, &slot).expect("descriptors");
+        assert_eq!(descs.len(), 2);
+        assert_eq!(descs[0].local_ptr.as_ptr() as u64, 0x1000);
+        assert_eq!(descs[1].local_ptr.as_ptr() as u64, 0x1080);
+    }
+
+    #[test]
+    fn gpu_read_descs_reject_stale_remote_shape() {
+        let layout = KVCacheLayout::new(0x1000, 0x100, 1, 0x20, 0, 1).expect("layout");
+        let slot = TransferSlotInfo {
+            k_ptr: 0x8000,
+            k_size: 0x10,
+            v_ptr: 0,
+            v_size: 0,
+            numa_node: 0,
+        };
+        let error = build_gpu_read_descs(&layout, 0, &slot).expect_err("shape mismatch");
+        assert!(error.contains("shape mismatch"));
+    }
     use std::sync::{Arc, Mutex};
 
     fn test_allocate_fn(calls: Arc<AtomicUsize>) -> AllocateFn {
@@ -998,6 +1306,34 @@ mod tests {
                     end: 3,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn direct_plan_preserves_hash_prefix_and_segment_sizes() {
+        let plan = FetchPlan {
+            segments: vec![
+                FetchPlanSegment {
+                    node: "node-a".into(),
+                    start: 0,
+                    end: 2,
+                },
+                FetchPlanSegment {
+                    node: "node-b".into(),
+                    start: 2,
+                    end: 3,
+                },
+            ],
+            block_count: 3,
+        };
+        let hashes = vec![vec![1], vec![2], vec![3], vec![4]];
+        let direct = plan.direct_plan("ns", &hashes);
+        assert_eq!(direct.namespace, "ns");
+        assert_eq!(direct.hashes, hashes[..3].to_vec());
+        assert_eq!(direct.block_count(), 3);
+        assert_eq!(
+            direct.segments,
+            vec![("node-a".into(), 2), ("node-b".into(), 1)]
         );
     }
 

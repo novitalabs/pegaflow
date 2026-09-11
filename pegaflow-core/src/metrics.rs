@@ -113,6 +113,12 @@ pub(crate) struct CoreMetrics {
     pub rdma_fetch_plan_segments: Histogram<u64>,
     #[cfg(feature = "rdma")]
     pub rdma_fetch_plan_completed_segments: Histogram<u64>,
+    #[cfg(feature = "rdma")]
+    pub direct_gpu_load_total: Counter<u64>,
+    #[cfg(feature = "rdma")]
+    pub direct_gpu_mr_registration_failures: Counter<u64>,
+    #[cfg(feature = "rdma")]
+    pub direct_gpu_load_duration_seconds: Histogram<f64>,
 }
 
 fn init_meter() -> Meter {
@@ -505,6 +511,23 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
                     "Number of segments completed before an RDMA fetch plan stopped",
                 )
                 .with_boundaries(rdma_fetch_plan_segment_boundaries())
+                .build(),
+            #[cfg(feature = "rdma")]
+            direct_gpu_load_total: meter
+                .u64_counter("pegaflow_direct_gpu_load_total")
+                .with_description("Direct GPU RDMA load attempts (status=success|error)")
+                .build(),
+            #[cfg(feature = "rdma")]
+            direct_gpu_mr_registration_failures: meter
+                .u64_counter("pegaflow_direct_gpu_mr_registration_failures")
+                .with_description("Direct GPU CUDA DMA-BUF/MR registration failures")
+                .build(),
+            #[cfg(feature = "rdma")]
+            direct_gpu_load_duration_seconds: meter
+                .f64_histogram("pegaflow_direct_gpu_load_duration")
+                .with_unit("s")
+                .with_description("Direct GPU RDMA load completion latency")
+                .with_boundaries(duration_seconds_boundaries())
                 .build(),
         }
     })

@@ -721,6 +721,16 @@ impl InstanceContext {
         state.gpu_contexts.get(&device_id).cloned()
     }
 
+    #[cfg(feature = "rdma")]
+    pub(crate) fn page_first(&self) -> bool {
+        self.page_first
+    }
+
+    #[cfg(feature = "rdma")]
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
     /// Get a GPU context and verify it belongs to the requested save group.
     pub(crate) fn get_gpu_for_save_group(
         &self,

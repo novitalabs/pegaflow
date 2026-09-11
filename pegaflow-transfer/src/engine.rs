@@ -19,6 +19,18 @@ pub struct MemoryRegion {
     pub len: usize,
 }
 
+/// A CUDA allocation to register for direct RDMA access.
+///
+/// This is intentionally separate from [`MemoryRegion`]: host registration is
+/// supported by the reference path, while GPU registration must use the
+/// GPUDirect RDMA DMA-BUF flow and must never silently fall back to `ibv_reg_mr`.
+#[derive(Clone, Copy, Debug)]
+pub struct DeviceMemoryRegion {
+    pub ptr: NonNull<u8>,
+    pub len: usize,
+    pub device_id: u8,
+}
+
 /// A single RDMA transfer descriptor.
 #[derive(Clone, Copy, Debug)]
 pub struct TransferDesc {
@@ -121,6 +133,29 @@ impl TransferEngine {
         Ok(())
     }
 
+    /// Register CUDA allocations for RDMA READ destinations.
+    ///
+    /// The backend rejects allocations without CUDA DMA-BUF support instead of
+    /// treating them as host memory. This keeps direct-GPU capability failures
+    /// explicit and prevents an accidental host-staging path.
+    pub fn register_device_memory(&self, regions: &[DeviceMemoryRegion]) -> Result<()> {
+        let mut registered = Vec::with_capacity(regions.len());
+        for region in regions {
+            match self
+                .backend
+                .register_device_memory(region.ptr, region.len, region.device_id)
+            {
+                Ok(true) => registered.push(region.ptr),
+                Ok(false) => {}
+                Err(error) => {
+                    let _ = self.backend.unregister_memory_batch(&registered);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn unregister_memory(&self, ptrs: &[NonNull<u8>]) -> Result<()> {
         for &ptr in ptrs {
             self.backend.unregister_memory(ptr)?;
@@ -192,7 +227,21 @@ impl TransferEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{HandshakeMetadata, NicHandshake, RcEndpoint, RegisteredMemoryRegion};
+    use super::{
+        DeviceMemoryRegion, HandshakeMetadata, NicHandshake, RcEndpoint, RegisteredMemoryRegion,
+    };
+    use std::ptr::NonNull;
+
+    #[test]
+    fn device_memory_region_keeps_gpu_registration_explicit() {
+        let region = DeviceMemoryRegion {
+            ptr: NonNull::new(0x1000usize as *mut u8).expect("non-null test pointer"),
+            len: 4096,
+            device_id: 3,
+        };
+        assert_eq!(region.ptr.as_ptr() as usize, 0x1000);
+        assert_eq!(region.device_id, 3);
+    }
 
     #[test]
     fn handshake_metadata_roundtrip() {
