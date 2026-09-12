@@ -136,7 +136,7 @@ struct SsdShardRing {
     capacity: u64,
     head: u64,
     tail: u64,
-    order: VecDeque<BlockKey>,
+    order: VecDeque<(BlockKey, u64)>,
 }
 
 /// SSD ring buffer: unified state for space allocation + block index.
@@ -153,6 +153,7 @@ pub(super) struct SsdRingBuffer {
     next_shard: usize,
     /// Fast lookup: key -> state (Writing or Committed)
     entries: HashMap<BlockKey, SsdEntryState>,
+    evictions: Vec<BlockKey>,
 }
 
 impl SsdRingBuffer {
@@ -178,6 +179,7 @@ impl SsdRingBuffer {
                 .collect(),
             next_shard: 0,
             entries: HashMap::new(),
+            evictions: Vec::new(),
         }
     }
 
@@ -238,45 +240,38 @@ impl SsdRingBuffer {
         }
         self.shards[shard_id].tail = new_tail;
 
-        while let Some(key) = self.shards[shard_id].order.front() {
-            match self.entries.get(key) {
-                Some(state) if state.entry().begin >= new_tail => break,
-                _ => {
-                    let key = self.shards[shard_id]
-                        .order
-                        .pop_front()
-                        .expect("front key exists");
-                    self.entries.remove(&key);
+        while let Some((_, begin)) = self.shards[shard_id].order.front() {
+            if *begin >= new_tail {
+                break;
+            }
+            let Some((key, begin)) = self.shards[shard_id].order.pop_front() else {
+                break;
+            };
+            if self.entries.get(&key).is_some_and(|state| {
+                state.entry().shard_id == shard_id && state.entry().begin == begin
+            }) {
+                if matches!(self.entries.remove(&key), Some(SsdEntryState::Committed(_))) {
+                    self.evictions.push(key);
                 }
             }
         }
     }
 
     /// Commit a write: success=true transitions Writing→Committed, success=false removes.
-    /// Returns false if entry was already expired or missing.
-    pub(super) fn commit(&mut self, key: &BlockKey, success: bool) -> bool {
-        let Some(state) = self.entries.get(key) else {
-            // Already removed by advance_tail or previous abort
+    /// Only the matching, still-live generation may become an SSD owner.
+    pub(super) fn commit(
+        &mut self,
+        key: &BlockKey,
+        written: &SsdIndexEntry,
+        success: bool,
+    ) -> bool {
+        let Some(SsdEntryState::Writing(entry)) = self.entries.get(key) else {
             return false;
         };
-
-        // Only process Writing state
-        let entry = match state {
-            SsdEntryState::Writing(e) => e,
-            SsdEntryState::Committed(_) => {
-                warn!("SSD commit: key already committed, ignoring");
-                return true;
-            }
-        };
-
-        // Check if expired (eviction faster than write)
-        if !self.is_offset_valid(entry) {
-            warn!("SSD commit: entry expired before IO completed");
-            self.entries.remove(key);
+        if entry.shard_id != written.shard_id || entry.begin != written.begin {
             return false;
         }
-
-        if success {
+        if success && self.is_offset_valid(entry) {
             // Writing → Committed
             let entry = entry.clone();
             self.entries
@@ -287,6 +282,10 @@ impl SsdRingBuffer {
             self.entries.remove(key);
             false
         }
+    }
+
+    pub(super) fn take_evictions(&mut self) -> Vec<BlockKey> {
+        std::mem::take(&mut self.evictions)
     }
 
     /// Prepare a batch for writing: filter, allocate space, advance tail, insert Writing.
@@ -308,6 +307,9 @@ impl SsdRingBuffer {
         // 2. Insert Writing state and build WriteInfo
         let mut writes = Vec::with_capacity(to_write.len());
         for (key, block) in to_write {
+            if self.entries.contains_key(&key) {
+                continue;
+            }
             let size = block.memory_footprint();
             let shard_id = self.next_shard;
             let Some((begin, file_offset)) = self.allocate_contiguous(shard_id, size) else {
@@ -346,7 +348,7 @@ impl SsdRingBuffer {
             // Insert Writing state
             self.entries
                 .insert(key.clone(), SsdEntryState::Writing(entry.clone()));
-            self.shards[shard_id].order.push_back(key.clone());
+            self.shards[shard_id].order.push_back((key.clone(), begin));
 
             writes.push(WriteInfo { key, block, entry });
         }
@@ -460,7 +462,7 @@ struct WriteTask {
 }
 
 /// Result of a single write operation: (key, success, duration_secs, block_size)
-type WriteResult = (BlockKey, bool, f64, u64);
+type WriteResult = (BlockKey, SsdIndexEntry, bool, f64, u64);
 
 // ============================================================================
 // SSD Writer Loop
@@ -498,12 +500,12 @@ pub(super) async fn ssd_writer_loop(
             biased;
 
             // Priority 1: Complete writes
-            Some((key, success, duration_secs, block_size)) = inflight.next(), if !inflight.is_empty() => {
+            Some((key, entry, success, duration_secs, block_size)) = inflight.next(), if !inflight.is_empty() => {
                 metrics.ssd_write_inflight.add(-1, &[]);
 
                 // Commit result to ring buffer (Writing→Committed or remove)
                 if let Some(s) = store.upgrade() {
-                    s.commit_write(&key, success);
+                    s.commit_write(&key, &entry, success);
                 }
 
                 if success {
@@ -584,11 +586,11 @@ async fn drain_inflight(
         std::pin::Pin<Box<dyn std::future::Future<Output = WriteResult> + Send>>,
     >,
 ) {
-    while let Some((key, success, duration_secs, block_size)) = inflight.next().await {
+    while let Some((key, entry, success, duration_secs, block_size)) = inflight.next().await {
         metrics.ssd_write_inflight.add(-1, &[]);
 
         if let Some(s) = store.upgrade() {
-            s.commit_write(&key, success);
+            s.commit_write(&key, &entry, success);
         }
 
         if success {
@@ -619,7 +621,7 @@ async fn execute_write(task: WriteTask, io: Arc<UringIoEngine>) -> WriteResult {
     .await;
 
     let duration_secs = start.elapsed().as_secs_f64();
-    (key, result.is_ok(), duration_secs, block_size)
+    (key, task.entry, result.is_ok(), duration_secs, block_size)
 }
 
 /// Write a sealed block to SSD file using writev.
@@ -1070,7 +1072,7 @@ mod tests {
             let entry = self.test_entry(0, begin, len);
             self.entries
                 .insert(key.clone(), SsdEntryState::Committed(entry));
-            self.shards[0].order.push_back(key.clone());
+            self.shards[0].order.push_back((key.clone(), begin));
             key
         }
 
@@ -1080,7 +1082,7 @@ mod tests {
             let entry = self.test_entry(0, begin, len);
             self.entries
                 .insert(key.clone(), SsdEntryState::Writing(entry));
-            self.shards[0].order.push_back(key.clone());
+            self.shards[0].order.push_back((key.clone(), begin));
             key
         }
     }
@@ -1153,7 +1155,7 @@ mod tests {
         let mut ring = SsdRingBuffer::new(1000);
         let key = ring.insert_writing(1, 100, 50);
 
-        assert!(ring.commit(&key, true));
+        assert!(ring.commit(&key, &ring.test_entry(0, 100, 50), true));
         assert!(matches!(
             ring.entries.get(&key),
             Some(SsdEntryState::Committed(_))
@@ -1165,7 +1167,7 @@ mod tests {
         let mut ring = SsdRingBuffer::new(1000);
         let key = ring.insert_writing(1, 100, 50);
 
-        assert!(!ring.commit(&key, false));
+        assert!(!ring.commit(&key, &ring.test_entry(0, 100, 50), false));
         assert!(!ring.entries.contains_key(&key));
         assert_eq!(ring.shards[0].order.len(), 1); // order cleaned by advance_tail later
     }
@@ -1176,7 +1178,7 @@ mod tests {
         let key = ring.insert_writing(1, 100, 50);
         ring.shards[0].tail = 200; // expire it
 
-        assert!(!ring.commit(&key, true));
+        assert!(!ring.commit(&key, &ring.test_entry(0, 100, 50), true));
         assert!(!ring.entries.contains_key(&key));
     }
 
@@ -1185,11 +1187,11 @@ mod tests {
         let mut ring = SsdRingBuffer::new(1000);
 
         // Missing key
-        assert!(!ring.commit(&make_key(99), true));
+        assert!(!ring.commit(&make_key(99), &ring.test_entry(0, 100, 50), true));
 
         // Already committed (idempotent)
         let key = ring.insert_committed(1, 100, 50);
-        assert!(ring.commit(&key, true));
+        assert!(!ring.commit(&key, &ring.test_entry(0, 100, 50), true));
     }
 
     // ========================================================================
@@ -1238,13 +1240,13 @@ mod tests {
     fn test_advance_tail_cleans_ghost_entries() {
         let mut ring = SsdRingBuffer::new(1000);
         // Ghost: in order but not in entries (aborted write)
-        ring.shards[0].order.push_back(make_key(1));
+        ring.shards[0].order.push_back((make_key(1), 0));
         ring.insert_committed(2, 200, 50);
 
         ring.advance_tail(0, 100);
 
         assert_eq!(ring.shards[0].order.len(), 1);
-        assert_eq!(ring.shards[0].order.front(), Some(&make_key(2)));
+        assert_eq!(ring.shards[0].order.front(), Some(&(make_key(2), 200)));
     }
 
     #[test]

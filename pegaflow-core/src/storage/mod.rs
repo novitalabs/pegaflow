@@ -6,12 +6,15 @@ mod write_path;
 
 use bytesize::ByteSize;
 use log::{debug, info, warn};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU64;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use crate::backing::{AllocateFn, DEFAULT_MAX_PREFETCH_BLOCKS, SsdBackingStore, SsdCacheConfig};
+use crate::backing::{
+    AllocateFn, DEFAULT_MAX_PREFETCH_BLOCKS, SsdBackingStore, SsdCacheConfig, SsdOwnerTierMutation,
+};
+use pegaflow_proto::proto::engine::TransferSourceRequirement;
 #[cfg(feature = "rdma")]
 use crate::backing::{RdmaFetchStore, RdmaTransport};
 use crate::block::{BlockKey, PrefetchStatus, SealedBlock};
@@ -177,6 +180,14 @@ impl StorageEngine {
             ))
         });
 
+        let owner_mutation_callback = metaserver_client.as_ref().map(|client| {
+            let client = Arc::clone(client);
+            Arc::new(move |mutation: SsdOwnerTierMutation| match mutation {
+                SsdOwnerTierMutation::Committed(keys) => client.try_register_ssd(keys),
+                SsdOwnerTierMutation::Evicted(keys) => client.try_unregister_ssd(keys),
+            }) as crate::backing::SsdOwnerMutationCallback
+        });
+
         let (write_pipeline, insert_rx) = WritePipeline::new();
         let write_pipeline = Arc::new(write_pipeline);
 
@@ -209,8 +220,14 @@ impl StorageEngine {
                     .and_then(|engine| engine.allocate(NonZeroU64::new(size)?, numa_node))
             });
 
-            let ssd_store = ssd_cache_config
-                .map(|cfg| crate::backing::new_ssd(cfg, allocate_fn.clone(), is_numa));
+            let ssd_store = ssd_cache_config.map(|cfg| {
+                crate::backing::new_ssd(
+                    cfg,
+                    allocate_fn.clone(),
+                    is_numa,
+                    owner_mutation_callback.clone(),
+                )
+            });
 
             #[cfg(feature = "rdma")]
             let rdma_fetch = rdma_transport.as_ref().and_then(|rdma| {
@@ -581,11 +598,59 @@ impl StorageEngine {
     // ---- Cross-node transfer: serving side ----
 
     /// Look up specific blocks by key (non-prefix). For cross-node transfer.
-    pub(crate) fn get_blocks_for_transfer(
+    pub(crate) async fn get_blocks_for_transfer(
         &self,
         keys: &[BlockKey],
+        source_requirement: TransferSourceRequirement,
     ) -> Vec<(BlockKey, Arc<SealedBlock>)> {
-        self.read_cache.get_blocks(keys)
+        let use_ram = matches!(
+            source_requirement,
+            TransferSourceRequirement::RamOnly
+                | TransferSourceRequirement::RamOrSsd
+                | TransferSourceRequirement::Unspecified
+        );
+        let use_ssd = matches!(
+            source_requirement,
+            TransferSourceRequirement::SsdOnly | TransferSourceRequirement::RamOrSsd
+        );
+        let ram = if use_ram {
+            self.read_cache.get_blocks_aligned(keys)
+        } else {
+            vec![None; keys.len()]
+        };
+        let mut found = Vec::with_capacity(keys.len());
+        let mut index = 0;
+        while index < keys.len() {
+            if let Some(block) = ram[index].as_ref() {
+                found.push((keys[index].clone(), Arc::clone(block)));
+                index += 1;
+                continue;
+            }
+            if !use_ssd {
+                break;
+            }
+            let Some(ssd) = self.ssd_store.as_ref() else {
+                break;
+            };
+            let end = ram[index..]
+                .iter()
+                .position(Option::is_some)
+                .map_or(keys.len(), |offset| index + offset);
+            let run = keys[index..end].to_vec();
+            let (committed, prefetched) = ssd.prefetch_prefix(run.clone()).await;
+            if prefetched.len() < committed {
+                break;
+            }
+            let mut by_key: HashMap<_, _> = prefetched.into_iter().collect();
+            for key in run {
+                let Some(block) = by_key.remove(&key) else {
+                    return found;
+                };
+                found.push((key, block));
+                index += 1;
+            }
+        }
+        found
     }
 
     /// Lock blocks for a transfer session, returning the session ID.
@@ -735,17 +800,23 @@ mod tests {
         storage.test_insert_cache(key1.clone(), block.clone());
         storage.test_insert_cache(key3.clone(), block.clone());
 
-        // Request keys 1, 2, 3 — only 1 and 3 are present (non-prefix semantics)
-        let result = storage.get_blocks_for_transfer(&[key1.clone(), key2, key3.clone()]);
-        assert_eq!(result.len(), 2);
+        // Serving must stop at the first missing block.
+        let result = storage
+            .get_blocks_for_transfer(
+                &[key1.clone(), key2, key3.clone()],
+                TransferSourceRequirement::RamOnly,
+            )
+            .await;
+        assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, key1);
-        assert_eq!(result[1].0, key3);
     }
 
     #[tokio::test]
     async fn get_blocks_for_transfer_empty_keys() {
         let storage = make_engine();
-        let result = storage.get_blocks_for_transfer(&[]);
+        let result = storage
+            .get_blocks_for_transfer(&[], TransferSourceRequirement::RamOnly)
+            .await;
         assert!(result.is_empty());
     }
 

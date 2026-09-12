@@ -217,6 +217,14 @@ message QueryBlocksForTransferRequest {
   string namespace = 1;
   repeated bytes block_hashes = 2;
   string requester_id = 3;             // For lock tracking / logging
+  TransferSourceRequirement source_requirement = 4;
+}
+
+enum TransferSourceRequirement {
+  TRANSFER_SOURCE_REQUIREMENT_UNSPECIFIED = 0;
+  TRANSFER_SOURCE_REQUIREMENT_RAM_ONLY = 1;
+  TRANSFER_SOURCE_REQUIREMENT_RAM_OR_SSD = 2;
+  TRANSFER_SOURCE_REQUIREMENT_SSD_ONLY = 3;
 }
 
 message QueryBlocksForTransferResponse {
@@ -277,6 +285,7 @@ message InsertBlockHashesRequest {
   string node = 3;
   // Server-generated session id announced by HeartbeatNode.
   string node_id = 4;
+  uint32 tier_mask = 5;
 }
 
 message InsertBlockHashesResponse {
@@ -295,6 +304,7 @@ message RemoveBlockHashesRequest {
   string node = 3;
   // Server-generated session id announced by HeartbeatNode.
   string node_id = 4;
+  uint32 tier_mask = 5;
 }
 
 message RemoveBlockHashesResponse {
@@ -306,6 +316,13 @@ message QueryPrefixBlocksRequest {
   string namespace = 1;
   repeated bytes block_hashes = 2;  // ordered by prefix position
   string exclude_node = 3;          // requester address; never return it as an owner
+  uint32 required_tier_mask = 4;
+}
+
+enum CacheTier {
+  CACHE_TIER_UNSPECIFIED = 0;
+  CACHE_TIER_RAM = 1;
+  CACHE_TIER_SSD = 2;
 }
 
 message FetchSegment {

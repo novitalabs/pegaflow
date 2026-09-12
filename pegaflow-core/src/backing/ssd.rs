@@ -19,6 +19,14 @@ use super::ssd_cache::{
 use super::uring::{UringConfig, UringIoEngine};
 use super::{AllocateFn, PrefetchResult};
 
+pub(crate) enum SsdOwnerTierMutation {
+    Committed(Vec<BlockKey>),
+    Evicted(Vec<BlockKey>),
+}
+
+pub(crate) type SsdOwnerMutationCallback =
+    Arc<dyn Fn(SsdOwnerTierMutation) + Send + Sync + 'static>;
+
 struct SsdInner {
     ring: SsdRingBuffer,
 }
@@ -32,6 +40,7 @@ pub(crate) struct SsdBackingStore {
     inner: Mutex<SsdInner>,
     allocate_fn: AllocateFn,
     is_numa: bool,
+    owner_mutation_callback: Option<SsdOwnerMutationCallback>,
 }
 
 impl SsdBackingStore {
@@ -39,6 +48,7 @@ impl SsdBackingStore {
         config: SsdCacheConfig,
         allocate_fn: AllocateFn,
         is_numa: bool,
+        owner_mutation_callback: Option<SsdOwnerMutationCallback>,
     ) -> std::io::Result<Arc<Self>> {
         use std::fs::OpenOptions;
         use std::os::unix::io::AsRawFd;
@@ -86,6 +96,7 @@ impl SsdBackingStore {
             }),
             allocate_fn,
             is_numa,
+            owner_mutation_callback,
         });
 
         Self::spawn_workers(
@@ -115,11 +126,30 @@ impl SsdBackingStore {
         &self,
         candidates: Vec<(BlockKey, Arc<SealedBlock>)>,
     ) -> PreparedBatch {
-        self.inner.lock().ring.prepare_batch(candidates)
+        let mut inner = self.inner.lock();
+        let prepared = inner.ring.prepare_batch(candidates);
+        let evicted = inner.ring.take_evictions();
+        if !evicted.is_empty() {
+            if let Some(callback) = &self.owner_mutation_callback {
+                callback(SsdOwnerTierMutation::Evicted(evicted));
+            }
+        }
+        prepared
     }
 
-    pub(super) fn commit_write(&self, key: &BlockKey, success: bool) {
-        self.inner.lock().ring.commit(key, success);
+    pub(super) fn commit_write(
+        &self,
+        key: &BlockKey,
+        entry: &super::ssd_cache::SsdIndexEntry,
+        success: bool,
+    ) {
+        let mut inner = self.inner.lock();
+        let committed = inner.ring.commit(key, entry, success);
+        if committed {
+            if let Some(callback) = &self.owner_mutation_callback {
+                callback(SsdOwnerTierMutation::Committed(vec![key.clone()]));
+            }
+        }
     }
 
     pub(super) fn is_numa(&self) -> bool {
@@ -325,8 +355,9 @@ pub(crate) fn new_ssd(
     config: SsdCacheConfig,
     allocate_fn: AllocateFn,
     is_numa: bool,
+    owner_mutation_callback: Option<SsdOwnerMutationCallback>,
 ) -> Arc<SsdBackingStore> {
-    SsdBackingStore::new(config, allocate_fn, is_numa)
+    SsdBackingStore::new(config, allocate_fn, is_numa, owner_mutation_callback)
         .unwrap_or_else(|e| panic!("failed to initialise SSD backing store: {e}"))
 }
 

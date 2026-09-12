@@ -9,7 +9,8 @@ use crate::proto::engine::{
     ReleaseRequest, ReleaseResponse, ReleaseTransferLockRequest, ReleaseTransferLockResponse,
     ResponseStatus, SaveRequest, SaveResponse, SessionEvent, SessionRequest, ShutdownRequest,
     ShutdownResponse, TransferBlockInfo, TransferMode as ProtoTransferMode, TransferSlotInfo,
-    UnregisterRequest, UnregisterResponse, load_block_target, query_response,
+    TransferSourceRequirement, UnregisterRequest, UnregisterResponse, load_block_target,
+    query_response,
 };
 use crate::registry::RegistryHandle;
 use crate::session::SessionRegistry;
@@ -828,11 +829,17 @@ impl Engine for GrpcEngineService {
         }
 
         let result: Result<Response<QueryBlocksForTransferResponse>, Status> = async {
-            let (session_id, found_blocks) = self.engine.query_blocks_for_transfer(
-                &req.namespace,
-                &req.block_hashes,
-                &req.requester_id,
-            );
+            let source_requirement = TransferSourceRequirement::try_from(req.source_requirement)
+                .unwrap_or(TransferSourceRequirement::Unspecified);
+            let (session_id, found_blocks) = self
+                .engine
+                .query_blocks_for_transfer(
+                    &req.namespace,
+                    &req.block_hashes,
+                    &req.requester_id,
+                    source_requirement,
+                )
+                .await;
 
             let blocks: Vec<TransferBlockInfo> = found_blocks
                 .iter()

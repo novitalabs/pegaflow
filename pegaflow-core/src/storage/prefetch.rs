@@ -9,9 +9,9 @@ use log::{info, warn};
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 
-#[cfg(feature = "rdma")]
-use crate::backing::RdmaFetchStore;
 use crate::backing::{PrefetchResult, SsdBackingStore};
+#[cfg(feature = "rdma")]
+use crate::backing::{RdmaFetchStore, RemoteSourceRequirement};
 use crate::block::{BlockKey, PrefetchStatus, SealedBlock};
 use crate::internode::MetaServerClient;
 use crate::metrics::core_metrics;
@@ -43,8 +43,16 @@ impl RdmaFetch {
         namespace: &str,
         remaining_hashes: &[Vec<u8>],
         require_full_prefix: bool,
+        source_requirement: RemoteSourceRequirement,
     ) -> Option<(usize, PrefetchResult)> {
-        let plan = self.0.query_plan(namespace, remaining_hashes).await?;
+        let plan = self
+            .0
+            .query_plan(
+                namespace,
+                remaining_hashes,
+                source_requirement,
+            )
+            .await?;
         let found = plan.block_count();
         if require_full_prefix && found != remaining_hashes.len() {
             return None;
@@ -77,6 +85,7 @@ impl RdmaFetch {
         _namespace: &str,
         _remaining_hashes: &[Vec<u8>],
         _require_full_prefix: bool,
+        _source_requirement: RemoteSourceRequirement,
     ) -> Option<(usize, PrefetchResult)> {
         None
     }
@@ -567,13 +576,20 @@ async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> 
 
     if let Some(rdma) = deps.rdma_fetch.as_ref()
         && let Some((found, blocks)) = rdma
-            .try_fetch_prefix(&req_id, &namespace, &remaining_hashes, wait_for_full_prefix)
+            .try_fetch_prefix(
+                &req_id,
+                &namespace,
+                &remaining_hashes,
+                wait_for_full_prefix,
+                RemoteSourceRequirement::RamOnly,
+            )
             .await
     {
+        let actual_found = blocks.len().min(found);
         record_tier_attribution(
             total,
             hit,
-            found,
+            actual_found,
             Some(PrefetchSource::Rdma.as_attribution()),
             emit_tier_metrics,
         );
@@ -581,8 +597,8 @@ async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> 
             prefix_blocks,
             total,
             Some(PrefetchSource::Rdma),
-            found,
-            &remaining_keys[..found],
+            actual_found,
+            &remaining_keys[..actual_found],
             blocks,
         );
     }
@@ -599,14 +615,15 @@ async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> 
         {
             let keys = remaining_keys[..reserved].to_vec();
             let (found, blocks) = ssd.prefetch_prefix(keys).await;
+            let actual_found = blocks.len().min(found);
             // wait_for_full_prefix is all-or-nothing: a partial SSD result
             // (backpressured reservation or short read) must not let the
             // caller proceed with a partial prefix.
-            if found > 0 && (!wait_for_full_prefix || found == remaining_keys.len()) {
+            if actual_found > 0 && (!wait_for_full_prefix || actual_found == remaining_keys.len()) {
                 record_tier_attribution(
                     total,
                     hit,
-                    found,
+                    actual_found,
                     Some(PrefetchSource::Ssd.as_attribution()),
                     emit_tier_metrics,
                 );
@@ -614,12 +631,41 @@ async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> 
                     prefix_blocks,
                     total,
                     Some(PrefetchSource::Ssd),
-                    found,
-                    &remaining_keys[..found],
+                    actual_found,
+                    &remaining_keys[..actual_found],
                     blocks,
                 );
             }
         }
+    }
+
+    if let Some(rdma) = deps.rdma_fetch.as_ref()
+        && let Some((found, blocks)) = rdma
+            .try_fetch_prefix(
+                &req_id,
+                &namespace,
+                &remaining_hashes,
+                wait_for_full_prefix,
+                RemoteSourceRequirement::SsdOnly,
+            )
+            .await
+    {
+        let actual_found = blocks.len().min(found);
+        record_tier_attribution(
+            total,
+            hit,
+            actual_found,
+            Some(PrefetchSource::Rdma.as_attribution()),
+            emit_tier_metrics,
+        );
+        return build_ready_result(
+            prefix_blocks,
+            total,
+            Some(PrefetchSource::Rdma),
+            actual_found,
+            &remaining_keys[..actual_found],
+            blocks,
+        );
     }
 
     if wait_for_full_prefix && let Some(rdma) = deps.rdma_fetch {
@@ -627,13 +673,20 @@ async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> 
         while started_at.elapsed() < REMOTE_WAIT_TIMEOUT {
             tokio::time::sleep(REMOTE_WAIT_POLL_INTERVAL).await;
             if let Some((found, blocks)) = rdma
-                .try_fetch_prefix(&req_id, &namespace, &remaining_hashes, true)
+                .try_fetch_prefix(
+                    &req_id,
+                    &namespace,
+                    &remaining_hashes,
+                    true,
+                    RemoteSourceRequirement::RamOrSsd,
+                )
                 .await
             {
+                let actual_found = blocks.len().min(found);
                 record_tier_attribution(
                     total,
                     hit,
-                    found,
+                    actual_found,
                     Some(PrefetchSource::Rdma.as_attribution()),
                     emit_tier_metrics,
                 );
@@ -641,8 +694,8 @@ async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> 
                     prefix_blocks,
                     total,
                     Some(PrefetchSource::Rdma),
-                    found,
-                    &remaining_keys[..found],
+                    actual_found,
+                    &remaining_keys[..actual_found],
                     blocks,
                 );
             }

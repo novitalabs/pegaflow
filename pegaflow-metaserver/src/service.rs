@@ -6,7 +6,7 @@ use crate::proto::engine::{
     RemoveBlockHashesRequest, RemoveBlockHashesResponse, ResponseStatus, UnregisterNodeRequest,
     UnregisterNodeResponse,
 };
-use crate::store::{BlockHashStore, PrefixEntry, StoreError};
+use crate::store::{BlockHashStore, CACHE_TIER_ALL, CACHE_TIER_RAM, PrefixEntry, StoreError};
 use log::debug;
 use std::sync::Arc;
 use std::time::Instant;
@@ -16,21 +16,30 @@ use uuid::Uuid;
 fn plan_fetch_segments(
     entries: &[PrefixEntry],
     exclude_node: &str,
+    required_tier_mask: u32,
 ) -> Result<Vec<FetchSegment>, &'static str> {
     let mut segments = Vec::new();
     let mut offset = 0usize;
 
     while offset < entries.len() {
         let mut best: Option<(&str, usize)> = None;
-        for candidate in &entries[offset].nodes {
-            let candidate = candidate.as_ref();
+        for owner in &entries[offset].owners {
+            if owner.tier_mask & required_tier_mask == 0 {
+                continue;
+            }
+            let candidate = owner.node.as_ref();
             if candidate == exclude_node {
                 continue;
             }
 
             let end = entries[offset..]
                 .iter()
-                .take_while(|entry| entry.nodes.iter().any(|node| node.as_ref() == candidate))
+                .take_while(|entry| {
+                    entry.owners.iter().any(|owner| {
+                        owner.node.as_ref() == candidate
+                            && owner.tier_mask & required_tier_mask != 0
+                    })
+                })
                 .count()
                 + offset;
 
@@ -87,6 +96,28 @@ impl GrpcMetaService {
             StoreError::UnknownNode => Status::failed_precondition("unknown node"),
             StoreError::StaleSession => Status::failed_precondition("stale node session"),
         }
+    }
+
+    fn insert_tier_mask(mask: u32) -> Result<u32, Status> {
+        let mask = if mask == 0 { CACHE_TIER_RAM } else { mask };
+        Self::validate_tier_mask(mask)
+    }
+
+    fn remove_tier_mask(mask: u32) -> Result<u32, Status> {
+        let mask = if mask == 0 { CACHE_TIER_ALL } else { mask };
+        Self::validate_tier_mask(mask)
+    }
+
+    fn query_tier_mask(mask: u32) -> Result<u32, Status> {
+        let mask = if mask == 0 { CACHE_TIER_ALL } else { mask };
+        Self::validate_tier_mask(mask)
+    }
+
+    fn validate_tier_mask(mask: u32) -> Result<u32, Status> {
+        if mask == 0 || mask & !CACHE_TIER_ALL != 0 {
+            return Err(Status::invalid_argument("tier mask contains unknown bits"));
+        }
+        Ok(mask)
     }
 }
 
@@ -184,20 +215,23 @@ impl MetaServer for GrpcMetaService {
                 return result;
             }
         };
+        let tier_mask = Self::insert_tier_mask(req.tier_mask)?;
 
         let inserted_count = req.block_hashes.len() as u64;
-        let reclaimable_hashes =
-            match self
-                .store
-                .insert_hashes(&req.namespace, &req.block_hashes, &req.node, node_id)
-            {
-                Ok(reclaimable_hashes) => reclaimable_hashes,
-                Err(err) => {
-                    let result = Err(Self::store_error_status(err));
-                    record_rpc_result("insert_block_hashes", &result, start);
-                    return result;
-                }
-            };
+        let insert_result = match self.store.add_hash_tiers(
+            &req.namespace,
+            &req.block_hashes,
+            &req.node,
+            node_id,
+            tier_mask,
+        ) {
+            Ok(result) => result,
+            Err(err) => {
+                let result = Err(Self::store_error_status(err));
+                record_rpc_result("insert_block_hashes", &result, start);
+                return result;
+            }
+        };
 
         let elapsed = start.elapsed();
         debug!(
@@ -205,14 +239,14 @@ impl MetaServer for GrpcMetaService {
             req.namespace,
             req.node,
             inserted_count,
-            reclaimable_hashes.len(),
+            insert_result.reclaimable_hashes.len(),
             elapsed
         );
 
         let result = Ok(Response::new(InsertBlockHashesResponse {
             status: Some(Self::ok_status()),
             inserted_count,
-            reclaimable_hashes,
+            reclaimable_hashes: insert_result.reclaimable_hashes,
         }));
         record_rpc_result("insert_block_hashes", &result, start);
         result
@@ -251,19 +285,22 @@ impl MetaServer for GrpcMetaService {
                 return result;
             }
         };
+        let tier_mask = Self::remove_tier_mask(req.tier_mask)?;
 
-        let removed =
-            match self
-                .store
-                .remove_hashes(&req.namespace, &req.block_hashes, &req.node, node_id)
-            {
-                Ok(removed) => removed,
-                Err(err) => {
-                    let result = Err(Self::store_error_status(err));
-                    record_rpc_result("remove_block_hashes", &result, start);
-                    return result;
-                }
-            };
+        let removed = match self.store.remove_hash_tiers(
+            &req.namespace,
+            &req.block_hashes,
+            &req.node,
+            node_id,
+            tier_mask,
+        ) {
+            Ok(removed) => removed,
+            Err(err) => {
+                let result = Err(Self::store_error_status(err));
+                record_rpc_result("remove_block_hashes", &result, start);
+                return result;
+            }
+        };
 
         let elapsed = start.elapsed();
         debug!(
@@ -302,6 +339,7 @@ impl MetaServer for GrpcMetaService {
 
         // Returns entries up to the first globally-missing hash.
         let existing = self.store.query_prefix(&req.namespace, &req.block_hashes);
+        let required_tier_mask = Self::query_tier_mask(req.required_tier_mask)?;
 
         let total_queried = req.block_hashes.len();
         let prefix_len = existing.len();
@@ -312,8 +350,8 @@ impl MetaServer for GrpcMetaService {
             req.namespace, prefix_len, total_queried, elapsed
         );
 
-        let segments =
-            plan_fetch_segments(&existing, &req.exclude_node).map_err(Status::invalid_argument)?;
+        let segments = plan_fetch_segments(&existing, &req.exclude_node, required_tier_mask)
+            .map_err(Status::invalid_argument)?;
 
         let result = Ok(Response::new(QueryPrefixBlocksResponse { segments }));
         record_rpc_result("query_prefix_blocks", &result, start);
@@ -325,6 +363,7 @@ impl MetaServer for GrpcMetaService {
 mod tests {
     use super::*;
     use crate::store::BlockHashStore;
+    use crate::store::{CACHE_TIER_SSD, PrefixOwner};
 
     fn make_service() -> GrpcMetaService {
         GrpcMetaService::new(Arc::new(BlockHashStore::new()))
@@ -358,6 +397,7 @@ mod tests {
                     block_hashes: hashes.clone(),
                     node: node.into(),
                     node_id,
+                    tier_mask: 0,
                 }))
                 .await
                 .unwrap()
@@ -379,6 +419,7 @@ mod tests {
             block_hashes: vec![vec![1, 2, 3]],
             node: "node-a".into(),
             node_id: node_id.clone(),
+            tier_mask: 0,
         }))
         .await
         .unwrap();
@@ -390,6 +431,7 @@ mod tests {
                 block_hashes: vec![vec![1, 2, 3]],
                 node: "node-a".into(),
                 node_id,
+                tier_mask: 0,
             }))
             .await
             .unwrap()
@@ -404,6 +446,7 @@ mod tests {
                 namespace: "ns".into(),
                 block_hashes: vec![vec![1, 2, 3]],
                 exclude_node: String::new(),
+                required_tier_mask: 0,
             }))
             .await
             .unwrap()
@@ -422,6 +465,7 @@ mod tests {
             block_hashes: vec![vec![1, 2, 3]],
             node: "node-b".into(),
             node_id: node_b_id,
+            tier_mask: 0,
         }))
         .await
         .unwrap();
@@ -433,6 +477,7 @@ mod tests {
                 block_hashes: vec![vec![1, 2, 3]],
                 node: "node-a".into(),
                 node_id: node_a_id,
+                tier_mask: 0,
             }))
             .await
             .unwrap()
@@ -447,6 +492,7 @@ mod tests {
                 namespace: "ns".into(),
                 block_hashes: vec![vec![1, 2, 3]],
                 exclude_node: String::new(),
+                required_tier_mask: 0,
             }))
             .await
             .unwrap()
@@ -465,6 +511,7 @@ mod tests {
                 block_hashes: vec![],
                 node: "node-a".into(),
                 node_id,
+                tier_mask: 0,
             }))
             .await
             .unwrap()
@@ -525,6 +572,7 @@ mod tests {
                 block_hashes: vec![vec![1]],
                 node: "node-a".into(),
                 node_id: old_id,
+                tier_mask: 0,
             }))
             .await
             .unwrap_err();
@@ -542,6 +590,7 @@ mod tests {
             block_hashes: vec![vec![1], vec![2]],
             node: "node-a".into(),
             node_id: node_id.clone(),
+            tier_mask: 0,
         }))
         .await
         .unwrap();
@@ -562,6 +611,7 @@ mod tests {
                 namespace: "ns".into(),
                 block_hashes: vec![vec![1]],
                 exclude_node: String::new(),
+                required_tier_mask: 0,
             }))
             .await
             .unwrap()
@@ -590,6 +640,7 @@ mod tests {
             block_hashes: vec![h1.clone(), h2.clone(), h3.clone(), h4.clone()],
             node: node_a.into(),
             node_id: node_a_id,
+            tier_mask: 0,
         }))
         .await
         .unwrap();
@@ -599,6 +650,7 @@ mod tests {
             block_hashes: vec![h1.clone(), h2.clone(), h3.clone(), h5],
             node: node_b.into(),
             node_id: node_b_id,
+            tier_mask: 0,
         }))
         .await
         .unwrap();
@@ -608,6 +660,7 @@ mod tests {
                 namespace: namespace.into(),
                 block_hashes: vec![h1, h2, h3, h4],
                 exclude_node: String::new(),
+                required_tier_mask: 0,
             }))
             .await
             .unwrap()
@@ -623,14 +676,38 @@ mod tests {
     }
 
     fn prefix_entry(hash: u8, nodes: &[&str]) -> PrefixEntry {
+        tiered_prefix_entry(
+            hash,
+            &nodes
+                .iter()
+                .map(|node| (*node, CACHE_TIER_ALL))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn tiered_prefix_entry(hash: u8, owners: &[(&str, u32)]) -> PrefixEntry {
         PrefixEntry {
             block_hash: vec![hash],
-            nodes: nodes.iter().map(|node| Arc::<str>::from(*node)).collect(),
+            nodes: owners
+                .iter()
+                .map(|(node, _)| Arc::<str>::from(*node))
+                .collect(),
+            owners: owners
+                .iter()
+                .map(|(node, tier_mask)| PrefixOwner {
+                    node: Arc::<str>::from(*node),
+                    tier_mask: *tier_mask,
+                })
+                .collect(),
         }
     }
 
-    fn planned(entries: &[PrefixEntry], exclude_node: &str) -> Vec<(String, u32)> {
-        plan_fetch_segments(entries, exclude_node)
+    fn planned(
+        entries: &[PrefixEntry],
+        exclude_node: &str,
+        required_tier_mask: u32,
+    ) -> Vec<(String, u32)> {
+        plan_fetch_segments(entries, exclude_node, required_tier_mask)
             .expect("small test plan should fit uint32")
             .into_iter()
             .map(|segment| (segment.node, segment.block_count))
@@ -647,7 +724,7 @@ mod tests {
         ];
 
         assert_eq!(
-            planned(&entries, "requester"),
+            planned(&entries, "requester", CACHE_TIER_ALL),
             vec![("node-a".into(), 2), ("node-b".into(), 2)]
         );
     }
@@ -660,9 +737,12 @@ mod tests {
             prefix_entry(3, &["node-c"]),
         ];
 
-        assert_eq!(planned(&entries, "requester"), vec![("node-c".into(), 3)]);
         assert_eq!(
-            planned(&entries[..2], "requester"),
+            planned(&entries, "requester", CACHE_TIER_ALL),
+            vec![("node-c".into(), 3)]
+        );
+        assert_eq!(
+            planned(&entries[..2], "requester", CACHE_TIER_ALL),
             vec![("node-a".into(), 2)]
         );
     }
@@ -675,7 +755,10 @@ mod tests {
             prefix_entry(3, &["node-b"]),
         ];
 
-        assert_eq!(planned(&entries, "requester"), vec![("node-a".into(), 1)]);
+        assert_eq!(
+            planned(&entries, "requester", CACHE_TIER_ALL),
+            vec![("node-a".into(), 1)]
+        );
     }
 
     #[test]
@@ -686,6 +769,28 @@ mod tests {
             prefix_entry(3, &["node-a"]),
         ];
 
-        assert_eq!(planned(&entries, "requester"), vec![("node-a".into(), 3)]);
+        assert_eq!(
+            planned(&entries, "requester", CACHE_TIER_ALL),
+            vec![("node-a".into(), 3)]
+        );
+    }
+
+    #[test]
+    fn planner_filters_tiers_without_losing_multi_node_segments() {
+        let entries = vec![
+            tiered_prefix_entry(1, &[("ram-a", CACHE_TIER_RAM), ("ssd-a", CACHE_TIER_SSD)]),
+            tiered_prefix_entry(2, &[("ram-a", CACHE_TIER_RAM), ("ssd-a", CACHE_TIER_SSD)]),
+            tiered_prefix_entry(3, &[("ssd-a", CACHE_TIER_SSD)]),
+            tiered_prefix_entry(4, &[("ssd-b", CACHE_TIER_SSD)]),
+        ];
+
+        assert_eq!(
+            planned(&entries, "requester", CACHE_TIER_RAM),
+            vec![("ram-a".into(), 2)]
+        );
+        assert_eq!(
+            planned(&entries, "requester", CACHE_TIER_ALL),
+            vec![("ssd-a".into(), 3), ("ssd-b".into(), 1)]
+        );
     }
 }

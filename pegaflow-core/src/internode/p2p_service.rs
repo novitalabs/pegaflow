@@ -25,7 +25,8 @@ use pegaflow_proto::proto::engine::{
     RdmaHandshakeResponse, RegisterContextRequest, RegisterContextResponse, ReleaseRequest,
     ReleaseResponse, ReleaseTransferLockRequest, ReleaseTransferLockResponse, ResponseStatus,
     SaveRequest, SaveResponse, SessionEvent, SessionRequest, ShutdownRequest, ShutdownResponse,
-    TransferBlockInfo, TransferSlotInfo, UnregisterRequest, UnregisterResponse,
+    TransferBlockInfo, TransferSlotInfo, TransferSourceRequirement, UnregisterRequest,
+    UnregisterResponse,
 };
 
 use crate::{LayerBlock, PegaEngine};
@@ -133,11 +134,17 @@ impl Engine for P2pTransferService {
             ));
         }
 
-        let (session_id, found_blocks) = self.engine.query_blocks_for_transfer(
-            &req.namespace,
-            &req.block_hashes,
-            &req.requester_id,
-        );
+        let source_requirement = TransferSourceRequirement::try_from(req.source_requirement)
+            .unwrap_or(TransferSourceRequirement::Unspecified);
+        let (session_id, found_blocks) = self
+            .engine
+            .query_blocks_for_transfer(
+                &req.namespace,
+                &req.block_hashes,
+                &req.requester_id,
+                source_requirement,
+            )
+            .await;
 
         let blocks: Vec<TransferBlockInfo> = found_blocks
             .iter()
