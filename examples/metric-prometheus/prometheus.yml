@@ -3,6 +3,25 @@ global:
   evaluation_interval: 5s
 
 scrape_configs:
+  # Pegaflow 服务
   - job_name: 'pegaflow'
     static_configs:
       - targets: ['host.docker.internal:9091']
+
+  # vLLM 服务 (8个实例，端口 9000-9007)
+  - job_name: 'vllm'
+    static_configs:
+      - targets:
+          - 'host.docker.internal:9000'
+          - 'host.docker.internal:9001'
+          - 'host.docker.internal:9002'
+          - 'host.docker.internal:9003'
+          - 'host.docker.internal:9004'
+          - 'host.docker.internal:9005'
+          - 'host.docker.internal:9006'
+          - 'host.docker.internal:9007'
+
+  # Router-int 服务
+  - job_name: 'router-int'
+    static_configs:
+      - targets: ['host.docker.internal:22000']
