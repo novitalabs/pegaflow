@@ -128,6 +128,7 @@ impl ReadCache {
 
     /// Look up specific blocks by key without prefix-scan semantics (does not
     /// stop at first miss). Used by the serving side of cross-node transfer.
+    #[cfg(test)]
     pub(super) fn get_blocks(&self, keys: &[BlockKey]) -> Vec<(BlockKey, Arc<SealedBlock>)> {
         let mut inner = self.inner.lock();
         let mut found = Vec::new();

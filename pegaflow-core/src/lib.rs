@@ -45,6 +45,7 @@ use layout::KVCacheLayout;
 pub use lease::QueryLeaseId;
 pub use pegaflow_common::NumaNode;
 use pegaflow_common::{NumaTopology, group_hash};
+use pegaflow_proto::proto::engine::TransferSourceRequirement;
 pub use pinned_pool::PinnedAllocation;
 pub use seal_offload::SlotMeta;
 pub use storage::{DEFAULT_RDMA_QPS_PER_PEER, MemoryCacheCleanupStats, StorageConfig};
@@ -951,18 +952,22 @@ impl PegaEngine {
 
     /// Look up blocks and lock them for RDMA transfer. Returns metadata
     /// for each found block plus a session ID for later unlock.
-    pub fn query_blocks_for_transfer(
+    pub async fn query_blocks_for_transfer(
         &self,
         namespace: &str,
         block_hashes: &[Vec<u8>],
         requester_id: &str,
+        source_requirement: TransferSourceRequirement,
     ) -> (String, Vec<(BlockKey, Arc<SealedBlock>)>) {
         let keys: Vec<BlockKey> = block_hashes
             .iter()
             .map(|h| BlockKey::new(namespace.to_string(), h.clone()))
             .collect();
 
-        let found = self.storage.get_blocks_for_transfer(&keys);
+        let found = self
+            .storage
+            .get_blocks_for_transfer(&keys, source_requirement)
+            .await;
         let session_id = self.storage.lock_blocks_for_transfer(requester_id, &found);
 
         debug!(

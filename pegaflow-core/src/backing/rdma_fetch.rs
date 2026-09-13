@@ -11,7 +11,7 @@ use mea::singleflight::Group;
 use pegaflow_proto::proto::engine::engine_client::EngineClient;
 use pegaflow_proto::proto::engine::{
     FetchSegment, QueryBlocksForTransferRequest, QueryBlocksForTransferResponse,
-    RdmaHandshakeRequest, TransferBlockInfo,
+    RdmaHandshakeRequest, TransferBlockInfo, TransferSourceRequirement,
 };
 use pegaflow_transfer::{ConnectionStatus, HandshakeMetadata, TransferDesc, TransferOp};
 use tonic::transport::{Channel, Endpoint};
@@ -24,6 +24,7 @@ use super::transfer_lock_guard::TransferLockGuard;
 use super::{AllocateFn, PrefetchResult, RdmaTransport};
 use crate::block::{BlockKey, RawBlock, SealedBlock, Segment};
 use crate::internode::MetaServerClient;
+use crate::internode::metaserver_client::{CACHE_TIER_RAM, CACHE_TIER_SSD};
 use crate::metrics::core_metrics;
 
 /// Minimum usable transfer timeout. If the server's lock timeout minus the
@@ -69,6 +70,32 @@ struct FetchPlanSegment {
 pub(crate) struct FetchPlan {
     segments: Vec<FetchPlanSegment>,
     block_count: usize,
+    source_requirement: RemoteSourceRequirement,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteSourceRequirement {
+    RamOnly,
+    RamOrSsd,
+    SsdOnly,
+}
+
+impl RemoteSourceRequirement {
+    const fn metaserver_tier_mask(self) -> u32 {
+        match self {
+            Self::RamOnly => CACHE_TIER_RAM,
+            Self::RamOrSsd => CACHE_TIER_RAM | CACHE_TIER_SSD,
+            Self::SsdOnly => CACHE_TIER_SSD,
+        }
+    }
+
+    const fn transfer_requirement(self) -> TransferSourceRequirement {
+        match self {
+            Self::RamOnly => TransferSourceRequirement::RamOnly,
+            Self::RamOrSsd => TransferSourceRequirement::RamOrSsd,
+            Self::SsdOnly => TransferSourceRequirement::SsdOnly,
+        }
+    }
 }
 
 impl FetchPlan {
@@ -89,6 +116,7 @@ fn validate_fetch_plan(
     segments: Vec<FetchSegment>,
     hash_count: usize,
     exclude_node: &str,
+    source_requirement: RemoteSourceRequirement,
 ) -> Result<Option<FetchPlan>, String> {
     if segments.is_empty() {
         return Ok(None);
@@ -136,12 +164,18 @@ fn validate_fetch_plan(
     Ok(Some(FetchPlan {
         segments: validated,
         block_count: offset,
+        source_requirement,
     }))
 }
 
 #[tonic::async_trait]
 trait SegmentFetcher {
-    async fn fetch_segment(&self, remote_addr: &str, hashes: &[Vec<u8>]) -> PrefetchResult;
+    async fn fetch_segment(
+        &self,
+        remote_addr: &str,
+        hashes: &[Vec<u8>],
+        source_requirement: RemoteSourceRequirement,
+    ) -> PrefetchResult;
 }
 
 struct RdmaSegmentFetcher<'a> {
@@ -152,9 +186,20 @@ struct RdmaSegmentFetcher<'a> {
 
 #[tonic::async_trait]
 impl SegmentFetcher for RdmaSegmentFetcher<'_> {
-    async fn fetch_segment(&self, remote_addr: &str, hashes: &[Vec<u8>]) -> PrefetchResult {
+    async fn fetch_segment(
+        &self,
+        remote_addr: &str,
+        hashes: &[Vec<u8>],
+        source_requirement: RemoteSourceRequirement,
+    ) -> PrefetchResult {
         self.store
-            .fetch_blocks(remote_addr, self.req_id, self.namespace, hashes)
+            .fetch_blocks(
+                remote_addr,
+                self.req_id,
+                self.namespace,
+                hashes,
+                source_requirement,
+            )
             .await
     }
 }
@@ -171,7 +216,9 @@ async fn execute_fetch_plan<F: SegmentFetcher>(
 
     for (index, segment) in plan.segments.iter().enumerate() {
         let expected = &hashes[segment.start..segment.end];
-        let returned = fetcher.fetch_segment(&segment.node, expected).await;
+        let returned = fetcher
+            .fetch_segment(&segment.node, expected, plan.source_requirement)
+            .await;
         let contiguous = returned
             .iter()
             .zip(expected)
@@ -213,6 +260,7 @@ impl RdmaFetchStore {
         &self,
         namespace: &str,
         hashes: &[Vec<u8>],
+        source_requirement: RemoteSourceRequirement,
     ) -> Option<FetchPlan> {
         if hashes.is_empty() {
             return None;
@@ -220,7 +268,12 @@ impl RdmaFetchStore {
 
         let segments = match self
             .metaserver_client
-            .query_plan(namespace, hashes, &self.advertise_addr)
+            .query_plan(
+                namespace,
+                hashes,
+                &self.advertise_addr,
+                source_requirement.metaserver_tier_mask(),
+            )
             .await
         {
             Ok(segments) => segments,
@@ -230,7 +283,12 @@ impl RdmaFetchStore {
             }
         };
 
-        let plan = match validate_fetch_plan(segments, hashes.len(), &self.advertise_addr) {
+        let plan = match validate_fetch_plan(
+            segments,
+            hashes.len(),
+            &self.advertise_addr,
+            source_requirement,
+        ) {
             Ok(plan) => plan?,
             Err(error) => {
                 warn!("MetaServer returned invalid remote fetch plan: {error}");
@@ -300,6 +358,7 @@ impl RdmaFetchStore {
         req_id: &str,
         namespace: &str,
         hashes: &[Vec<u8>],
+        source_requirement: RemoteSourceRequirement,
     ) -> PrefetchResult {
         rdma_fetch_task(
             &self.rdma_transport,
@@ -311,6 +370,7 @@ impl RdmaFetchStore {
             &self.advertise_addr,
             namespace,
             hashes,
+            source_requirement,
         )
         .await
     }
@@ -336,6 +396,7 @@ async fn rdma_fetch_task(
     advertise_addr: &str,
     namespace: &str,
     block_hashes: &[Vec<u8>],
+    source_requirement: RemoteSourceRequirement,
 ) -> PrefetchResult {
     let t0 = Instant::now();
 
@@ -366,6 +427,7 @@ async fn rdma_fetch_task(
         namespace,
         block_hashes,
         advertise_addr,
+        source_requirement,
     )
     .await
     {
@@ -860,6 +922,7 @@ async fn query_remote_blocks(
     namespace: &str,
     block_hashes: &[Vec<u8>],
     advertise_addr: &str,
+    source_requirement: RemoteSourceRequirement,
 ) -> Result<(EngineClient<Channel>, QueryBlocksForTransferResponse), String> {
     let mut client = get_or_create_channel(grpc_channels, remote_addr)?;
 
@@ -867,6 +930,7 @@ async fn query_remote_blocks(
         namespace: namespace.to_string(),
         block_hashes: block_hashes.to_vec(),
         requester_id: advertise_addr.to_string(),
+        source_requirement: source_requirement.transfer_requirement() as i32,
     };
 
     let response = client
@@ -959,7 +1023,12 @@ mod tests {
 
     #[tonic::async_trait]
     impl SegmentFetcher for FakeSegmentFetcher {
-        async fn fetch_segment(&self, remote_addr: &str, hashes: &[Vec<u8>]) -> PrefetchResult {
+        async fn fetch_segment(
+            &self,
+            remote_addr: &str,
+            hashes: &[Vec<u8>],
+            _source_requirement: RemoteSourceRequirement,
+        ) -> PrefetchResult {
             self.calls
                 .lock()
                 .unwrap()
@@ -978,6 +1047,7 @@ mod tests {
             vec![segment("node-a", 2), segment("node-b", 1)],
             3,
             "requester",
+            RemoteSourceRequirement::RamOrSsd,
         )
         .expect("plan should be valid")
         .expect("plan should be non-empty");
@@ -1014,7 +1084,8 @@ mod tests {
             ),
         ] {
             let error =
-                validate_fetch_plan(segments, 1, "requester").expect_err("plan should be rejected");
+                validate_fetch_plan(segments, 1, "requester", RemoteSourceRequirement::RamOrSsd)
+                    .expect_err("plan should be rejected");
             assert!(error.contains(expected), "unexpected error: {error}");
         }
     }
@@ -1025,6 +1096,7 @@ mod tests {
             vec![segment("node-a", 2), segment("node-b", 1)],
             3,
             "requester",
+            RemoteSourceRequirement::RamOrSsd,
         )
         .unwrap()
         .unwrap();
@@ -1062,6 +1134,7 @@ mod tests {
             ],
             3,
             "requester",
+            RemoteSourceRequirement::RamOrSsd,
         )
         .unwrap()
         .unwrap();

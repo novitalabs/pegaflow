@@ -27,9 +27,8 @@ use pegaflow_common::NumaNode;
 #[cfg(feature = "rdma")]
 pub(crate) use rdma::{RdmaTransport, new_rdma};
 #[cfg(feature = "rdma")]
-pub(crate) use rdma_fetch::RdmaFetchStore;
-pub(crate) use ssd::SsdBackingStore;
-pub(crate) use ssd::new_ssd;
+pub(crate) use rdma_fetch::{RdmaFetchStore, RemoteSourceRequirement};
+pub(crate) use ssd::{SsdBackingStore, SsdOwnerMutationCallback, SsdOwnerTierMutation, new_ssd};
 
 pub(crate) type PrefetchResult = Vec<(BlockKey, Arc<SealedBlock>)>;
 

@@ -10,12 +10,22 @@ const MIN_RECLAIMABLE_OWNER_COUNT: usize = 3;
 
 pub const DEFAULT_NODE_STALE_SECS: u64 = 30;
 pub const DEFAULT_TTL_MINUTES: u64 = 120;
+pub const CACHE_TIER_RAM: u32 = 1;
+pub const CACHE_TIER_SSD: u32 = 1 << 1;
+pub const CACHE_TIER_ALL: u32 = CACHE_TIER_RAM | CACHE_TIER_SSD;
+
+#[derive(Debug, Clone)]
+pub struct PrefixOwner {
+    pub node: Arc<str>,
+    pub tier_mask: u32,
+}
 
 /// A prefix query result: one block hash and all live nodes that own it.
 #[derive(Debug, Clone)]
 pub struct PrefixEntry {
     pub block_hash: Vec<u8>,
     pub nodes: Vec<Arc<str>>,
+    pub owners: Vec<PrefixOwner>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -86,6 +96,7 @@ pub enum StoreError {
 struct OwnerRecord {
     node_id: Uuid,
     key_register_time: Instant,
+    tier_mask: u32,
 }
 
 /// Authoritative current session for a node URL. `last_seen` is bumped on
@@ -116,6 +127,11 @@ pub struct BlockHashStore {
     /// Latest live-owner redundancy distribution, refreshed each sweep and read
     /// by metric callbacks. Decouples the O(N) scan from the scrape path.
     redundancy: Mutex<RedundancySnapshot>,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct AddHashTiersResult {
+    pub reclaimable_hashes: Vec<Vec<u8>>,
 }
 
 impl BlockHashStore {
@@ -208,6 +224,19 @@ impl BlockHashStore {
         node: &str,
         node_id: Uuid,
     ) -> Result<Vec<Vec<u8>>, StoreError> {
+        self.add_hash_tiers(namespace, hashes, node, node_id, CACHE_TIER_RAM)
+            .map(|result| result.reclaimable_hashes)
+    }
+
+    pub fn add_hash_tiers(
+        &self,
+        namespace: &str,
+        hashes: &[Vec<u8>],
+        node: &str,
+        node_id: Uuid,
+        tier_mask: u32,
+    ) -> Result<AddHashTiersResult, StoreError> {
+        debug_assert_ne!(tier_mask & CACHE_TIER_ALL, 0);
         self.touch_node_session(node, node_id)?;
         let node: Arc<str> = Arc::from(node);
         let now = Instant::now();
@@ -215,18 +244,33 @@ impl BlockHashStore {
         for hash in hashes {
             let key = BlockKey::new(namespace.to_string(), hash.clone());
             let mut owners = self.blocks.entry(key).or_default();
-            let previous = owners.insert(
-                Arc::clone(&node),
-                OwnerRecord {
-                    node_id,
-                    key_register_time: now,
-                },
-            );
-            let is_new_owner = previous.is_none_or(|owner| owner.node_id != node_id);
-            if is_new_owner
+            let adds_ram = tier_mask & CACHE_TIER_RAM != 0;
+            let is_new_ram_owner = match owners.get_mut(node.as_ref()) {
+                Some(owner) if owner.node_id == node_id => {
+                    let is_new_ram_owner = adds_ram && owner.tier_mask & CACHE_TIER_RAM == 0;
+                    owner.tier_mask |= tier_mask & CACHE_TIER_ALL;
+                    owner.key_register_time = now;
+                    is_new_ram_owner
+                }
+                _ => {
+                    owners.insert(
+                        Arc::clone(&node),
+                        OwnerRecord {
+                            node_id,
+                            key_register_time: now,
+                            tier_mask: tier_mask & CACHE_TIER_ALL,
+                        },
+                    );
+                    adds_ram
+                }
+            };
+            if is_new_ram_owner
                 && owners
                     .iter()
-                    .filter(|(node, owner)| self.is_owner_visible(node, owner, now))
+                    .filter(|(node, owner)| {
+                        owner.tier_mask & CACHE_TIER_RAM != 0
+                            && self.is_owner_visible(node, owner, now)
+                    })
                     .take(MIN_RECLAIMABLE_OWNER_COUNT)
                     .count()
                     == MIN_RECLAIMABLE_OWNER_COUNT
@@ -234,7 +278,7 @@ impl BlockHashStore {
                 reclaimable_hashes.push(hash.clone());
             }
         }
-        Ok(reclaimable_hashes)
+        Ok(AddHashTiersResult { reclaimable_hashes })
     }
 
     pub fn remove_hashes(
@@ -244,17 +288,37 @@ impl BlockHashStore {
         node: &str,
         node_id: Uuid,
     ) -> Result<usize, StoreError> {
+        self.remove_hash_tiers(namespace, hashes, node, node_id, CACHE_TIER_ALL)
+    }
+
+    pub fn remove_hash_tiers(
+        &self,
+        namespace: &str,
+        hashes: &[Vec<u8>],
+        node: &str,
+        node_id: Uuid,
+        tier_mask: u32,
+    ) -> Result<usize, StoreError> {
         self.touch_node_session(node, node_id)?;
         let mut removed = 0;
         for hash in hashes {
             let key = BlockKey::new(namespace.to_string(), hash.clone());
             let should_remove_key = if let Some(mut owners) = self.blocks.get_mut(&key) {
-                if owners
-                    .get(node)
-                    .is_some_and(|owner| owner.node_id == node_id)
+                let remove_owner = if let Some(owner) = owners
+                    .get_mut(node)
+                    .filter(|owner| owner.node_id == node_id)
                 {
+                    let previous = owner.tier_mask;
+                    owner.tier_mask &= !(tier_mask & CACHE_TIER_ALL);
+                    if owner.tier_mask != previous {
+                        removed += 1;
+                    }
+                    owner.tier_mask == 0
+                } else {
+                    false
+                };
+                if remove_owner {
                     owners.remove(node);
-                    removed += 1;
                 }
                 owners.is_empty()
             } else {
@@ -277,24 +341,31 @@ impl BlockHashStore {
                 break;
             };
 
-            let live_nodes: Vec<Arc<str>> = owners
+            let live_owners: Vec<PrefixOwner> = owners
                 .iter()
                 .filter_map(|(node, owner)| {
                     if self.is_owner_visible(node, owner, now) {
-                        Some(Arc::clone(node))
+                        Some(PrefixOwner {
+                            node: Arc::clone(node),
+                            tier_mask: owner.tier_mask,
+                        })
                     } else {
                         None
                     }
                 })
                 .collect();
 
-            if live_nodes.is_empty() {
+            if live_owners.is_empty() {
                 break;
             }
 
             result.push(PrefixEntry {
                 block_hash: hash.clone(),
-                nodes: live_nodes,
+                nodes: live_owners
+                    .iter()
+                    .map(|owner| Arc::clone(&owner.node))
+                    .collect(),
+                owners: live_owners,
             });
         }
         result
@@ -450,7 +521,7 @@ impl BlockHashStore {
     }
 
     fn is_owner_visible(&self, node: &Arc<str>, owner: &OwnerRecord, now: Instant) -> bool {
-        self.eval_owner(node, owner, now).visible
+        owner.tier_mask != 0 && self.eval_owner(node, owner, now).visible
     }
 }
 
@@ -564,6 +635,112 @@ mod tests {
                 .unwrap(),
             vec![vec![1], vec![2]]
         );
+    }
+
+    #[test]
+    fn tiers_are_independent_without_increasing_owner_count() {
+        let store = BlockHashStore::new();
+        let hash = vec![1];
+        let node_a = heartbeat_node(&store, "node-a");
+        let node_b = heartbeat_node(&store, "node-b");
+        let node_c = heartbeat_node(&store, "node-c");
+
+        store
+            .add_hash_tiers(
+                "ns",
+                std::slice::from_ref(&hash),
+                "node-a",
+                node_a,
+                CACHE_TIER_RAM,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .add_hash_tiers(
+                    "ns",
+                    std::slice::from_ref(&hash),
+                    "node-a",
+                    node_a,
+                    CACHE_TIER_SSD,
+                )
+                .unwrap(),
+            AddHashTiersResult::default()
+        );
+        assert_eq!(store.owner_count(), 1);
+
+        let prefix = store.query_prefix("ns", std::slice::from_ref(&hash));
+        assert_eq!(prefix[0].owners.len(), 1);
+        assert_eq!(prefix[0].owners[0].tier_mask, CACHE_TIER_ALL);
+
+        store
+            .add_hash_tiers(
+                "ns",
+                std::slice::from_ref(&hash),
+                "node-b",
+                node_b,
+                CACHE_TIER_RAM,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .add_hash_tiers(
+                    "ns",
+                    std::slice::from_ref(&hash),
+                    "node-c",
+                    node_c,
+                    CACHE_TIER_SSD,
+                )
+                .unwrap(),
+            AddHashTiersResult::default()
+        );
+        assert_eq!(
+            store
+                .add_hash_tiers(
+                    "ns",
+                    std::slice::from_ref(&hash),
+                    "node-c",
+                    node_c,
+                    CACHE_TIER_RAM,
+                )
+                .unwrap(),
+            AddHashTiersResult {
+                reclaimable_hashes: vec![hash.clone()],
+            }
+        );
+
+        assert_eq!(
+            store
+                .remove_hash_tiers(
+                    "ns",
+                    std::slice::from_ref(&hash),
+                    "node-a",
+                    node_a,
+                    CACHE_TIER_RAM,
+                )
+                .unwrap(),
+            1
+        );
+        let prefix = store.query_prefix("ns", std::slice::from_ref(&hash));
+        let owner = prefix[0]
+            .owners
+            .iter()
+            .find(|owner| owner.node.as_ref() == "node-a")
+            .unwrap();
+        assert_eq!(owner.tier_mask, CACHE_TIER_SSD);
+
+        assert_eq!(
+            store
+                .remove_hash_tiers(
+                    "ns",
+                    std::slice::from_ref(&hash),
+                    "node-a",
+                    node_a,
+                    CACHE_TIER_SSD,
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(store.owner_count(), 2);
     }
 
     #[test]

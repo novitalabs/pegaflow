@@ -15,12 +15,15 @@ use tonic::Code;
 use tonic::transport::{Channel, Endpoint};
 use uuid::Uuid;
 
+use crate::block::BlockKey;
 use crate::metrics::core_metrics;
 use crate::storage::ReadCache;
 
 // Shared insert/remove command channel depth. Eviction bursts outrun the single
 // consumer's per-RPC drain, so a shallow queue silently drops removals.
 pub const DEFAULT_METASERVER_QUEUE_DEPTH: usize = 4096;
+pub(crate) const CACHE_TIER_RAM: u32 = 1;
+pub(crate) const CACHE_TIER_SSD: u32 = 1 << 1;
 
 // Cap hashes per insert/remove RPC. The consumer coalesces a whole queue drain
 // per namespace, so without a cap one RPC could reach queue_depth * batch_size
@@ -28,6 +31,8 @@ pub const DEFAULT_METASERVER_QUEUE_DEPTH: usize = 4096;
 // keep a full chunk near 0.5 MiB, well under tonic's 4 MiB default.
 const MAX_HASHES_PER_RPC: usize = 16_384;
 
+type TieredBlockMutationKey = (u32, String, Vec<u8>);
+type TieredBlockMutationNet = HashMap<TieredBlockMutationKey, bool>;
 /// Error type for MetaServer client operations.
 #[cfg(feature = "rdma")]
 #[derive(Debug)]
@@ -117,8 +122,8 @@ impl BlockHashBatch {
 
 /// Command sent to the background MetaServer loop.
 enum MetaServerCommand {
-    Insert(BlockHashBatch),
-    Remove(BlockHashBatch),
+    Insert(BlockHashBatch, u32),
+    Remove(BlockHashBatch, u32),
     /// Barrier: acked once every insert/remove enqueued before it has been
     /// delivered to the MetaServer (or dropped after a failed attempt).
     Flush(oneshot::Sender<()>),
@@ -189,12 +194,39 @@ impl MetaServerClient {
     /// Accepts one namespace and its block hashes so callers can preserve their
     /// hot-path grouping and enqueue a single MetaServer command.
     pub(crate) fn try_register_namespace(&self, namespace: String, hashes: Vec<Vec<u8>>) {
+        self.try_register_tier(namespace, hashes, CACHE_TIER_RAM);
+    }
+
+    pub(crate) fn try_register_ssd(&self, keys: Vec<BlockKey>) {
+        let entries = keys
+            .into_iter()
+            .map(|key| (key.namespace, key.hash))
+            .collect();
+        let batch = BlockHashBatch::from_entries(entries);
+        for (namespace, hashes) in batch.groups {
+            self.try_register_tier(namespace, hashes, CACHE_TIER_SSD);
+        }
+    }
+
+    pub(crate) fn try_unregister_ssd(&self, keys: Vec<BlockKey>) {
+        self.try_unregister_tier(
+            keys.into_iter()
+                .map(|key| (key.namespace, key.hash))
+                .collect(),
+            CACHE_TIER_SSD,
+        );
+    }
+
+    fn try_register_tier(&self, namespace: String, hashes: Vec<Vec<u8>>, tier_mask: u32) {
         if hashes.is_empty() {
             return;
         }
         let batch = BlockHashBatch::single_namespace(namespace, hashes);
         let count = batch.count();
-        match self.command_tx.try_send(MetaServerCommand::Insert(batch)) {
+        match self
+            .command_tx
+            .try_send(MetaServerCommand::Insert(batch, tier_mask))
+        {
             Ok(()) => {
                 core_metrics()
                     .metaserver_registration_blocks
@@ -227,15 +259,22 @@ impl MetaServerClient {
     /// holds these blocks. Losing an occasional remove message is acceptable;
     /// the node lifecycle sweep is the fallback for node failures.
     pub(crate) fn try_unregister(&self, entries: Vec<(String, Vec<u8>)>) {
+        self.try_unregister_tier(entries, CACHE_TIER_RAM);
+    }
+
+    fn try_unregister_tier(&self, entries: Vec<(String, Vec<u8>)>, tier_mask: u32) {
         if entries.is_empty() {
             return;
         }
-        self.try_send_unregister_batch(BlockHashBatch::from_entries(entries));
+        self.try_send_unregister_batch(BlockHashBatch::from_entries(entries), tier_mask);
     }
 
-    fn try_send_unregister_batch(&self, batch: BlockHashBatch) {
+    fn try_send_unregister_batch(&self, batch: BlockHashBatch, tier_mask: u32) {
         let count = batch.count();
-        match self.command_tx.try_send(MetaServerCommand::Remove(batch)) {
+        match self
+            .command_tx
+            .try_send(MetaServerCommand::Remove(batch, tier_mask))
+        {
             Ok(()) => {
                 core_metrics()
                     .metaserver_removal_blocks
@@ -302,11 +341,13 @@ impl MetaServerClient {
         namespace: &str,
         hashes: &[Vec<u8>],
         exclude_node: &str,
+        required_tier_mask: u32,
     ) -> Result<Vec<FetchSegment>, ClientError> {
         let request = QueryPrefixBlocksRequest {
             namespace: namespace.to_string(),
             block_hashes: hashes.to_vec(),
             exclude_node: exclude_node.to_string(),
+            required_tier_mask,
         };
 
         let response = self
@@ -381,9 +422,9 @@ async fn registration_loop(
             break;
         }
 
-        let mut inserts: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
-        let mut removes: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
-        let mut mixed_ops: Option<HashMap<(String, Vec<u8>), bool>> = None; // true=insert
+        let mut inserts: HashMap<(u32, String), Vec<Vec<u8>>> = HashMap::new();
+        let mut removes: HashMap<(u32, String), Vec<Vec<u8>>> = HashMap::new();
+        let mut mixed_ops: Option<TieredBlockMutationNet> = None;
         let mut saw_insert = false;
         let mut saw_remove = false;
         // Flush barriers drained in this batch; acked after the sends below, so
@@ -394,26 +435,26 @@ async fn registration_loop(
         // namespace; mixed streams switch to last-write-wins netting.
         for cmd in std::iter::once(cmd).chain(std::iter::from_fn(|| rx.try_recv().ok())) {
             match cmd {
-                MetaServerCommand::Insert(batch) => {
+                MetaServerCommand::Insert(batch, tier_mask) => {
                     saw_insert = true;
                     if saw_remove {
                         let net = mixed_ops.get_or_insert_with(|| {
                             build_net(std::mem::take(&mut inserts), std::mem::take(&mut removes))
                         });
-                        insert_groups_into_net(net, batch.groups, true);
+                        insert_groups_into_net(net, batch.groups, tier_mask, true);
                     } else {
-                        append_groups(&mut inserts, batch.groups);
+                        append_groups(&mut inserts, batch.groups, tier_mask);
                     }
                 }
-                MetaServerCommand::Remove(batch) => {
+                MetaServerCommand::Remove(batch, tier_mask) => {
                     saw_remove = true;
                     if saw_insert {
                         let net = mixed_ops.get_or_insert_with(|| {
                             build_net(std::mem::take(&mut inserts), std::mem::take(&mut removes))
                         });
-                        insert_groups_into_net(net, batch.groups, false);
+                        insert_groups_into_net(net, batch.groups, tier_mask, false);
                     } else {
-                        append_groups(&mut removes, batch.groups);
+                        append_groups(&mut removes, batch.groups, tier_mask);
                     }
                 }
                 MetaServerCommand::Flush(done) => {
@@ -436,16 +477,22 @@ async fn registration_loop(
         }
 
         if let Some(net) = mixed_ops {
-            for ((namespace, hash), is_insert) in net {
+            for ((tier_mask, namespace, hash), is_insert) in net {
                 if is_insert {
-                    inserts.entry(namespace).or_default().push(hash);
+                    inserts
+                        .entry((tier_mask, namespace))
+                        .or_default()
+                        .push(hash);
                 } else {
-                    removes.entry(namespace).or_default().push(hash);
+                    removes
+                        .entry((tier_mask, namespace))
+                        .or_default()
+                        .push(hash);
                 }
             }
         }
 
-        let insert_total: usize = inserts.values().map(|v| v.len()).sum();
+        let insert_total: usize = inserts.values().map(Vec::len).sum();
         let remove_total: usize = removes.values().map(|v| v.len()).sum();
         if ensure_heartbeat_registered(
             &mut client,
@@ -473,10 +520,13 @@ async fn registration_loop(
         let c = client.as_mut().expect("client is Some after lazy-connect");
 
         // Process inserts
-        let insert_namespaces: Vec<(String, Vec<Vec<u8>>)> = inserts.into_iter().collect();
+        let insert_namespaces: Vec<(u32, String, Vec<Vec<u8>>)> = inserts
+            .into_iter()
+            .map(|((tier_mask, namespace), hashes)| (tier_mask, namespace, hashes))
+            .collect();
         let mut insert_failed_at: Option<(usize, usize)> = None;
 
-        'insert: for (i, (namespace, hashes)) in insert_namespaces.iter().enumerate() {
+        'insert: for (i, (tier_mask, namespace, hashes)) in insert_namespaces.iter().enumerate() {
             for (chunk_idx, chunk) in hashes.chunks(MAX_HASHES_PER_RPC).enumerate() {
                 let count = chunk.len();
                 let request = InsertBlockHashesRequest {
@@ -484,6 +534,7 @@ async fn registration_loop(
                     block_hashes: chunk.to_vec(),
                     node: advertise_addr.clone(),
                     node_id: node_id.clone(),
+                    tier_mask: *tier_mask,
                 };
 
                 match c.insert_block_hashes(request).await {
@@ -539,10 +590,13 @@ async fn registration_loop(
         }
 
         // Process removes
-        let remove_namespaces: Vec<(String, Vec<Vec<u8>>)> = removes.into_iter().collect();
+        let remove_namespaces: Vec<(u32, String, Vec<Vec<u8>>)> = removes
+            .into_iter()
+            .map(|((tier_mask, namespace), hashes)| (tier_mask, namespace, hashes))
+            .collect();
         let mut remove_failed_at: Option<(usize, usize)> = None;
 
-        'remove: for (i, (namespace, hashes)) in remove_namespaces.iter().enumerate() {
+        'remove: for (i, (tier_mask, namespace, hashes)) in remove_namespaces.iter().enumerate() {
             for (chunk_idx, chunk) in hashes.chunks(MAX_HASHES_PER_RPC).enumerate() {
                 let count = chunk.len();
                 let request = RemoveBlockHashesRequest {
@@ -550,6 +604,7 @@ async fn registration_loop(
                     block_hashes: chunk.to_vec(),
                     node: advertise_addr.clone(),
                     node_id: node_id.clone(),
+                    tier_mask: *tier_mask,
                 };
 
                 match c.remove_block_hashes(request).await {
@@ -603,28 +658,35 @@ fn ack_flushes(acks: Vec<oneshot::Sender<()>>) {
 /// `failed_offset` within namespace `failed_idx`: the unsent tail of that
 /// namespace (earlier chunks already landed) plus every later namespace.
 fn unsent_after_failure(
-    namespaces: &[(String, Vec<Vec<u8>>)],
+    namespaces: &[(u32, String, Vec<Vec<u8>>)],
     failed_idx: usize,
     failed_offset: usize,
 ) -> usize {
-    let unsent_in_ns = namespaces[failed_idx].1.len().saturating_sub(failed_offset);
+    let unsent_in_ns = namespaces[failed_idx].2.len().saturating_sub(failed_offset);
     let later: usize = namespaces[failed_idx + 1..]
         .iter()
-        .map(|(_, h)| h.len())
+        .map(|(_, _, h)| h.len())
         .sum();
     unsent_in_ns + later
 }
 
-fn append_groups(target: &mut HashMap<String, Vec<Vec<u8>>>, groups: Vec<(String, Vec<Vec<u8>>)>) {
+fn append_groups(
+    target: &mut HashMap<(u32, String), Vec<Vec<u8>>>,
+    groups: Vec<(String, Vec<Vec<u8>>)>,
+    tier_mask: u32,
+) {
     for (namespace, mut hashes) in groups {
-        target.entry(namespace).or_default().append(&mut hashes);
+        target
+            .entry((tier_mask, namespace))
+            .or_default()
+            .append(&mut hashes);
     }
 }
 
 fn build_net(
-    inserts: HashMap<String, Vec<Vec<u8>>>,
-    removes: HashMap<String, Vec<Vec<u8>>>,
-) -> HashMap<(String, Vec<u8>), bool> {
+    inserts: HashMap<(u32, String), Vec<Vec<u8>>>,
+    removes: HashMap<(u32, String), Vec<Vec<u8>>>,
+) -> TieredBlockMutationNet {
     let mut net = HashMap::new();
     insert_map_into_net(&mut net, inserts, true);
     insert_map_into_net(&mut net, removes, false);
@@ -632,23 +694,24 @@ fn build_net(
 }
 
 fn insert_map_into_net(
-    net: &mut HashMap<(String, Vec<u8>), bool>,
-    grouped: HashMap<String, Vec<Vec<u8>>>,
+    net: &mut TieredBlockMutationNet,
+    grouped: HashMap<(u32, String), Vec<Vec<u8>>>,
     is_insert: bool,
 ) {
-    for (namespace, hashes) in grouped {
-        insert_groups_into_net(net, vec![(namespace, hashes)], is_insert);
+    for ((tier_mask, namespace), hashes) in grouped {
+        insert_groups_into_net(net, vec![(namespace, hashes)], tier_mask, is_insert);
     }
 }
 
 fn insert_groups_into_net(
-    net: &mut HashMap<(String, Vec<u8>), bool>,
+    net: &mut TieredBlockMutationNet,
     groups: Vec<(String, Vec<Vec<u8>>)>,
+    tier_mask: u32,
     is_insert: bool,
 ) {
     for (namespace, hashes) in groups {
         for hash in hashes {
-            net.insert((namespace.clone(), hash), is_insert);
+            net.insert((tier_mask, namespace.clone(), hash), is_insert);
         }
     }
 }
@@ -1148,7 +1211,7 @@ mod tests {
         let hashes = vec![vec![1], vec![2]];
 
         let segments = client
-            .query_plan("ns", &hashes, "node-a:50055")
+            .query_plan("ns", &hashes, "node-a:50055", CACHE_TIER_RAM)
             .await
             .expect("query should succeed");
 
@@ -1159,6 +1222,7 @@ mod tests {
                 namespace: "ns".to_string(),
                 block_hashes: hashes,
                 exclude_node: "node-a:50055".to_string(),
+                required_tier_mask: CACHE_TIER_RAM,
             }]
         );
         client.shutdown().await;
@@ -1167,7 +1231,7 @@ mod tests {
 
     #[test]
     fn unsent_after_failure_counts_only_unsent_tail() {
-        let ns = |name: &str, n: usize| (name.to_string(), vec![vec![0u8]; n]);
+        let ns = |name: &str, n: usize| (CACHE_TIER_RAM, name.to_string(), vec![vec![0u8]; n]);
         let namespaces = vec![ns("a", 100), ns("b", 50), ns("c", 30)];
 
         // First chunk of "b" failed (nothing of b sent yet): all of b + c.
@@ -1178,6 +1242,40 @@ mod tests {
         assert_eq!(unsent_after_failure(&namespaces, 2, 20), 10);
         // Offset past the namespace length saturates to zero unsent.
         assert_eq!(unsent_after_failure(&namespaces, 2, 999), 0);
+    }
+
+    #[test]
+    fn mixed_operation_netting_keeps_ram_and_ssd_bits_independent() {
+        let mut net = HashMap::new();
+        let hash = vec![1];
+        insert_groups_into_net(
+            &mut net,
+            vec![("ns".to_string(), vec![hash.clone()])],
+            CACHE_TIER_RAM,
+            true,
+        );
+        insert_groups_into_net(
+            &mut net,
+            vec![("ns".to_string(), vec![hash.clone()])],
+            CACHE_TIER_SSD,
+            true,
+        );
+        insert_groups_into_net(
+            &mut net,
+            vec![("ns".to_string(), vec![hash.clone()])],
+            CACHE_TIER_RAM,
+            false,
+        );
+
+        assert_eq!(net.len(), 2);
+        assert_eq!(
+            net.get(&(CACHE_TIER_RAM, "ns".to_string(), hash.clone())),
+            Some(&false)
+        );
+        assert_eq!(
+            net.get(&(CACHE_TIER_SSD, "ns".to_string(), hash)),
+            Some(&true)
+        );
     }
 
     #[tokio::test]
@@ -1247,31 +1345,42 @@ mod tests {
         let remove_only = vec![0xc0];
         let insert_only = vec![0xd0];
 
-        tx.try_send(MetaServerCommand::Insert(BlockHashBatch::single_namespace(
-            "ns-first".to_string(),
-            vec![insert_then_remove.clone()],
-        )))
+        tx.try_send(MetaServerCommand::Insert(
+            BlockHashBatch::single_namespace(
+                "ns-first".to_string(),
+                vec![insert_then_remove.clone()],
+            ),
+            CACHE_TIER_RAM,
+        ))
         .unwrap();
-        tx.try_send(MetaServerCommand::Remove(BlockHashBatch::from_entries(
-            vec![("ns-first".to_string(), insert_then_remove.clone())],
-        )))
+        tx.try_send(MetaServerCommand::Remove(
+            BlockHashBatch::from_entries(vec![(
+                "ns-first".to_string(),
+                insert_then_remove.clone(),
+            )]),
+            CACHE_TIER_RAM,
+        ))
         .unwrap();
-        tx.try_send(MetaServerCommand::Remove(BlockHashBatch::from_entries(
-            vec![
+        tx.try_send(MetaServerCommand::Remove(
+            BlockHashBatch::from_entries(vec![
                 ("ns-second".to_string(), remove_then_insert.clone()),
                 ("ns-remove".to_string(), remove_only.clone()),
-            ],
-        )))
+            ]),
+            CACHE_TIER_RAM,
+        ))
         .unwrap();
-        tx.try_send(MetaServerCommand::Insert(BlockHashBatch::single_namespace(
-            "ns-second".to_string(),
-            vec![remove_then_insert.clone()],
-        )))
+        tx.try_send(MetaServerCommand::Insert(
+            BlockHashBatch::single_namespace(
+                "ns-second".to_string(),
+                vec![remove_then_insert.clone()],
+            ),
+            CACHE_TIER_RAM,
+        ))
         .unwrap();
-        tx.try_send(MetaServerCommand::Insert(BlockHashBatch::single_namespace(
-            "ns-insert".to_string(),
-            vec![insert_only.clone()],
-        )))
+        tx.try_send(MetaServerCommand::Insert(
+            BlockHashBatch::single_namespace("ns-insert".to_string(), vec![insert_only.clone()]),
+            CACHE_TIER_RAM,
+        ))
         .unwrap();
 
         let endpoint = metaserver_endpoint(addr.clone());
