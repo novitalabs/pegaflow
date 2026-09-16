@@ -66,8 +66,7 @@ class _QueryProbe:
     hit_blocks: int | None = None
     leases: tuple[bytes, ...] = ()
     leases_by_group: tuple[tuple[bytes, ...], ...] | None = None
-    hit_positions_by_group: tuple[tuple[int, ...], ...] | None = None
-    block_starts_by_group: tuple[int, ...] | None = None
+    block_ranges_by_group: tuple[tuple[int, int], ...] | None = None
     # Hybrid (HMA): pinned recurrent checkpoints from the membership queries,
     # set together with `leases` when the hybrid reconcile found a boundary.
     recurrent_hold: RecurrentLoadHold | None = None
@@ -110,8 +109,7 @@ class _QueryProbe:
         self.leased_blocks = hit_blocks
         self.leases = ready.leases
         self.leases_by_group = ready.leases_by_group
-        self.hit_positions_by_group = ready.hit_positions_by_group
-        self.block_starts_by_group = ready.block_starts_by_group
+        self.block_ranges_by_group = ready.block_ranges_by_group
         self.recurrent_hold = ready.recurrent_hold
         self.usable_positions = frozenset(ready.usable_positions)
         self.attention_hit_blocks = ready.attention_hit_blocks
@@ -257,7 +255,9 @@ class SchedulerConnector:
 
         gpu_block_pool.get_cached_block = no_local_hma_prefix_hit
 
-    def _request_block_hashes(self, request: "Request") -> tuple[bytes, ...]:
+    def _request_block_hashes(
+        self, request: "Request", group_index: int | None = None
+    ) -> tuple[bytes, ...]:
         """Per-block keys from `Request.block_hashes` (see `ConnectorContext.hash_scale`).
 
         vLLM hashes full spans only, so the hashes never reach past the
@@ -286,35 +286,14 @@ class SchedulerConnector:
                 )
             if stale == 1:
                 block_hashes = block_hashes[:hashed]
-        return block_hashes_per_block(block_hashes, self._ctx.hash_scale)
-
-    def _request_group_block_hashes(
-        self, request: "Request", group_index: int
-    ) -> tuple[bytes, ...]:
-        """Return hashes at one cache group's logical block cadence."""
-        hash_block_size = self._ctx.hash_block_size
-        if hash_block_size is None:
-            return self._request_block_hashes(request)
-        group_block_size = self._cache_groups.block_size_of(group_index) * self._ctx.dcp_world_size
-        if group_block_size % hash_block_size:
-            raise RuntimeError(
-                f"cache group {group_index} block size {group_block_size} is not aligned "
-                f"to hash block size {hash_block_size}"
+        scale = self._ctx.hash_scale
+        if group_index is not None and self._ctx.hash_block_size is not None:
+            scale = (
+                self._cache_groups.block_size_of(group_index)
+                * self._ctx.dcp_world_size
+                // self._ctx.hash_block_size
             )
-        raw_hashes = request.block_hashes
-        num_tokens = getattr(request, "num_tokens", 0)
-        if num_tokens:
-            hashed = num_tokens // hash_block_size
-            stale = len(raw_hashes) - hashed
-            if stale > 1:
-                raise RuntimeError(
-                    f"req {request.request_id}: {len(raw_hashes)} group hashes span "
-                    f"more than the request's {num_tokens} tokens at hash granularity "
-                    f"{hash_block_size}"
-                )
-            if stale == 1:
-                raw_hashes = raw_hashes[:hashed]
-        return block_hashes_per_block(raw_hashes, group_block_size // hash_block_size)
+        return block_hashes_per_block(block_hashes, scale)
 
     def get_num_new_matched_tokens(
         self,
@@ -623,41 +602,13 @@ class SchedulerConnector:
                         if pending_probe is not None
                         else num_load_blocks
                     ),
-                    sparse_groups=(
-                        getattr(self._cache_groups, "sliding_window_group_indices", frozenset())
-                        if leases_by_group is not None
-                        else frozenset()
+                    block_ranges_by_group=(
+                        pending_probe.block_ranges_by_group if pending_probe is not None else None
                     ),
                 )
             except RuntimeError:
                 self._release_pending_query_probe(req_id)
                 raise
-
-            if leases_by_group is not None and pending_probe.hit_positions_by_group is not None:
-                # Sliding groups have their own block cadence.  Their lease
-                # order is the membership-query position order, rather than
-                # the dense group's global block slice.
-                for group_index in getattr(
-                    self._cache_groups, "sliding_window_group_indices", frozenset()
-                ):
-                    if group_index == self._cache_groups.hash_group_index:
-                        continue
-                    positions = pending_probe.hit_positions_by_group[group_index]
-                    group = block_ids_by_group[group_index]
-                    group_vbs = (
-                        self._cache_groups.block_size_of(group_index) * self._ctx.dcp_world_size
-                    )
-                    full_vbs = self._ctx.virtual_block_size
-                    if pending_probe.block_starts_by_group is not None:
-                        start = pending_probe.block_starts_by_group[group_index]
-                    else:
-                        start = (num_computed_blocks * full_vbs) // group_vbs
-                    load_block_ids_by_group = tuple(
-                        tuple(group[start + position] for position in positions)
-                        if index == group_index
-                        else values
-                        for index, values in enumerate(load_block_ids_by_group)
-                    )
 
             load_intent = LoadIntent(
                 block_ids_by_group=load_block_ids_by_group,
@@ -969,18 +920,6 @@ class SchedulerConnector:
             return regular
         if regular is None:
             return tail
-        hashes_by_group = None
-        if regular.block_hashes_by_group is not None or tail.block_hashes_by_group is not None:
-            group_count = self._cache_groups.group_count
-            regular_groups = regular.block_hashes_by_group or tuple(
-                regular.block_hashes for _ in range(group_count)
-            )
-            tail_groups = tail.block_hashes_by_group or tuple(
-                tail.block_hashes for _ in range(group_count)
-            )
-            hashes_by_group = tuple(
-                regular_groups[index] + tail_groups[index] for index in range(group_count)
-            )
         return SaveIntent(
             block_ids_by_group=tuple(
                 regular_ids + tail_ids
@@ -991,7 +930,6 @@ class SchedulerConnector:
                 )
             ),
             block_hashes=regular.block_hashes + tail.block_hashes,
-            block_hashes_by_group=hashes_by_group,
         )
 
     def _consume_tail_save(self, req_id: str, written: int) -> SaveIntent | None:
@@ -1155,32 +1093,15 @@ class SchedulerConnector:
         )
         block_hashes_by_group = None
         if getattr(self._cache_groups, "requires_group_specific_block_mapping", False):
-            request = self._requests.get(req_id)
-            if request is None:
-                raise RuntimeError(f"req {req_id} is missing while building a save intent")
+            request = self._requests[req_id]
             mapped_ids: list[tuple[int, ...]] = []
             mapped_hashes: list[tuple[bytes, ...]] = []
             full_vbs = self._ctx.virtual_block_size
             for group_index, group in enumerate(allocated):
-                if group_index in recurrent:
-                    mapped_ids.append(())
-                    mapped_hashes.append(())
-                    continue
                 group_vbs = self._cache_groups.block_size_of(group_index) * self._ctx.dcp_world_size
-                if group_vbs % full_vbs and full_vbs % group_vbs:
-                    raise RuntimeError(
-                        f"cache group {group_index} block size {group_vbs} cannot align "
-                        f"with scheduler block size {full_vbs}"
-                    )
-                group_hashes = self._request_group_block_hashes(request, group_index)
-                if group_vbs >= full_vbs:
-                    ratio = group_vbs // full_vbs
-                    start = hash_start * ratio
-                    count = new_blocks * ratio
-                else:
-                    ratio = full_vbs // group_vbs
-                    start = hash_start * ratio
-                    count = new_blocks * ratio
+                group_hashes = self._request_block_hashes(request, group_index)
+                ratio = full_vbs // group_vbs
+                start, count = hash_start * ratio, new_blocks * ratio
                 mapped_ids.append(tuple(group[start : start + count]))
                 mapped_hashes.append(tuple(group_hashes[start : start + count]))
             save_block_ids_by_group = tuple(mapped_ids)
@@ -1222,7 +1143,7 @@ class SchedulerConnector:
         start_block_idx: int,
         num_load_blocks: int,
         leased_blocks: int | None = None,
-        sparse_groups: frozenset[int] = frozenset(),
+        block_ranges_by_group: tuple[tuple[int, int], ...] | None = None,
     ) -> tuple[tuple[int | None, ...], ...]:
         """Destination block IDs per cache group, one entry per leased block.
 
@@ -1234,10 +1155,11 @@ class SchedulerConnector:
         """
         end_block_idx = start_block_idx + num_load_blocks
         available = [len(group) for group in block_ids_by_group]
-        if any(
-            length < end_block_idx and group_index not in sparse_groups
-            for group_index, length in enumerate(available)
-        ):
+        ranges = [(start_block_idx, end_block_idx)] * len(block_ids_by_group)
+        if block_ranges_by_group is not None:
+            for index in self._cache_groups.sliding_window_group_indices:
+                ranges[index] = block_ranges_by_group[index]
+        if any(length < end for length, (_, end) in zip(available, ranges, strict=True)):
             raise RuntimeError(
                 f"load block mismatch: start={start_block_idx} count={num_load_blocks} "
                 f"available_by_group={available}"
@@ -1253,7 +1175,14 @@ class SchedulerConnector:
 
         result: list[tuple[int | None, ...]] = []
         for group_index, block_ids in enumerate(block_ids_by_group):
-            destinations: tuple[int | None, ...] = block_ids[start_block_idx:end_block_idx]
+            start, end = ranges[group_index]
+            destinations: tuple[int | None, ...] = block_ids[start:end]
+            if (
+                block_ranges_by_group is not None
+                and group_index in self._cache_groups.sliding_window_group_indices
+            ):
+                result.append(destinations)
+                continue
             if group_index in self._cache_groups.recurrent_group_indices and destinations:
                 destinations = (None,) * (len(destinations) - 1) + (destinations[-1],)
             result.append(destinations + padding)
@@ -1375,9 +1304,7 @@ class SchedulerConnector:
             return ready
 
         layout = self._cache_groups
-        sliding_groups = sorted(layout.sliding_window_group_indices - {layout.hash_group_index})
-        if not sliding_groups:
-            return ready
+        sliding_groups = sorted(layout.sliding_window_group_indices)
         full_vbs = self._ctx.virtual_block_size
         computed_tokens = computed_blocks * full_vbs
         group_sizes = {
@@ -1403,7 +1330,7 @@ class SchedulerConnector:
             storage_group = layout.storage_group_of(group_index)
             key = (storage_group, group_sizes[group_index], start, end)
             if key not in queries:
-                hashes = self._request_group_block_hashes(request, group_index)
+                hashes = self._request_block_hashes(request, group_index)
                 results = self._tp_shard_client.query_group_membership(
                     self._ctx.instance_id,
                     list(hashes[start:end]),
@@ -1419,13 +1346,6 @@ class SchedulerConnector:
             return queries[key]
 
         try:
-            for group_index, size in group_sizes.items():
-                if size <= 0 or full_vbs % size:
-                    raise RuntimeError(
-                        f"sliding group {group_index} block size {size} is not aligned "
-                        f"with scheduler block size {full_vbs}"
-                    )
-
             candidate = ready.num_hit_blocks
             complete = True
             for group_index in sliding_groups:
@@ -1473,27 +1393,23 @@ class SchedulerConnector:
                 ready = dense
 
             leases_by_group: list[tuple[bytes, ...]] = [() for _ in range(layout.group_count)]
-            positions_by_group: list[tuple[int, ...]] = [() for _ in range(layout.group_count)]
-            starts_by_group = [0 for _ in range(layout.group_count)]
+            ranges = [(computed_blocks, computed_blocks + candidate)] * layout.group_count
             for group_index in range(layout.group_count):
                 if layout.storage_group_of(group_index) == 0:
                     leases_by_group[group_index] = ready.leases
-                    positions_by_group[group_index] = tuple(range(candidate))
             for group_index in sliding_groups:
                 start, end = span(group_index, candidate)
                 positions, leases = query(group_index, start, end)
                 if positions != frozenset(range(end - start)):
                     return ShardedQueryReady(0, tuple(b"" for _ in ready.leases))
-                starts_by_group[group_index] = start
-                positions_by_group[group_index] = tuple(range(end - start))
+                ranges[group_index] = (start, end)
                 leases_by_group[group_index] = leases
 
             retained = set(leases_by_group)
             return replace(
                 ready,
                 leases_by_group=tuple(leases_by_group),
-                hit_positions_by_group=tuple(positions_by_group),
-                block_starts_by_group=tuple(starts_by_group),
+                block_ranges_by_group=tuple(ranges),
             )
         finally:
             for leases in acquired - retained:

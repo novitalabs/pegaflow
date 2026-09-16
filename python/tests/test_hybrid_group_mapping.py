@@ -35,7 +35,6 @@ def _layout() -> CacheGroupLayout:
         group_sliding_windows=(None, 32),
         storage_group_ids=(0, 1),
         group_block_sizes=(32, 16),
-        layer_block_sizes=((("full", 32),), (("sliding", 16),)),
     )
 
 
@@ -137,8 +136,7 @@ def test_saved_sliding_suffix_hits_without_null_placeholders():
             request, 0, list(hashes[1::2]), ShardedQueryReady(4, (b"dense",)), "r1"
         )
         assert ready.num_hit_blocks == 4
-        assert ready.block_starts_by_group == (0, 6)
-        assert ready.hit_positions_by_group == ((0, 1, 2, 3), (0, 1))
+        assert ready.block_ranges_by_group == ((0, 4), (6, 8))
     finally:
         worker._registered_layers = []
         worker.shutdown()
@@ -164,9 +162,14 @@ def test_sliding_query_uses_retained_window_suffix(window):
     )
 
     assert results == [hashes[4:6]]
-    assert attached.block_starts_by_group == (0, 4)
-    assert attached.hit_positions_by_group == ((0,), (0, 1))
+    assert attached.block_ranges_by_group == ((2, 3), (4, 6))
     assert attached.leases_by_group == ((b"dense",), (b"lease",))
+    assert scheduler._load_block_ids_by_group(
+        ((10, 11, 12), (20, 21, 22, 23, 24, 25)),
+        2,
+        1,
+        block_ranges_by_group=attached.block_ranges_by_group,
+    ) == ((12,), (24, 25))
 
 
 def test_sliding_query_shrinks_to_latest_common_boundary_on_partial_hit():
@@ -210,9 +213,21 @@ def test_sliding_query_shrinks_to_latest_common_boundary_on_partial_hit():
 
     assert attached.num_hit_blocks == 3
     assert attached.leases == (b"dense-shrunk",)
-    assert attached.block_starts_by_group == (0, 4)
-    assert attached.hit_positions_by_group == ((0, 1, 2), (0, 1))
+    assert attached.block_ranges_by_group == ((0, 3), (4, 6))
     assert attached.leases_by_group == ((b"dense-shrunk",), (b"final",))
+    assert scheduler._load_block_ids_by_group(
+        ((10, 11, 12), (0, 0, 0, 0, 24, 25)),
+        0,
+        3,
+        block_ranges_by_group=attached.block_ranges_by_group,
+    ) == ((10, 11, 12), (24, 25))
+    with pytest.raises(RuntimeError, match="load block mismatch"):
+        scheduler._load_block_ids_by_group(
+            ((10, 11, 12), (0, 0, 0, 0, 24)),
+            0,
+            3,
+            block_ranges_by_group=attached.block_ranges_by_group,
+        )
 
     released = [args[0][0] for args in scheduler._tp_shard_client.release.call_args_list]
     assert sorted(released) == [(b"dense",), (b"initial",), (b"wide",)]
@@ -245,8 +260,7 @@ def test_sliding_groups_intersect_windows_after_boundary_shrinks():
     )
     # Group 1 serves boundaries 4 and 2, group 2 serves 3 and 2.
     assert result.num_hit_blocks == 2
-    assert result.block_starts_by_group == (0, 2, 2)
-    assert result.hit_positions_by_group == ((0, 1), (0, 1), (0, 1))
+    assert result.block_ranges_by_group == ((0, 2), (2, 4), (2, 4))
 
 
 @pytest.mark.parametrize("extra_dense", [False, True], ids=["shared-sliding", "shared-dense"])

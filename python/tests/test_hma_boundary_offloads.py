@@ -159,7 +159,6 @@ def test_sliding_window_sources_stay_pinned_per_job_until_all_workers_finish():
         sliding_window_group_indices=frozenset({1}),
         group_sliding_windows=(None, 32),
         group_block_sizes=(16, 16),
-        layer_block_sizes=((("full", 16),), (("sliding", 16),)),
     )
     _register_request(scheduler, "r1", 2)
     for block_id in (10, 11, 21, 22, 23):

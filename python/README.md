@@ -143,15 +143,6 @@ TP sharding currently requires equal contiguous shards and TP-only parallelism.
 Pipeline, decode-context, and prefill-context parallelism are rejected when
 more than one endpoint is configured.
 
-#### Load Scheduling
-
-PegaFlow always uses vLLM's asynchronous remote-KV lifecycle for loads. A cache
-hit enters `WAITING_FOR_REMOTE_KVS`; the worker starts the transfer after the
-forward boundary and reports completion through `finished_recving`. This is
-also the load path for hybrid cache groups, where full-attention and
-sliding-window groups can have different retained ranges. Failed or timed-out
-loads are reported to vLLM for local recomputation.
-
 #### P/D Partial Tail Blocks
 
 vLLM normally exposes hashes only for complete KV blocks. In a P/D deployment,

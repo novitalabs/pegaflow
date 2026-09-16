@@ -371,18 +371,11 @@ class WorkerConnector:
             wrapper = CudaIPCWrapper(registration_tensor)
             wrapper_bytes = pickle.dumps(wrapper)
 
-            group_index = self._layer_to_group.get(layer_name, 0)
-            try:
-                logical_block_size = self._cache_groups.block_size_of(group_index, layer_name)
-            except KeyError:
-                # Synthetic cross-layer registrations and legacy test doubles
-                # are not represented in vLLM's per-layer group table.
-                logical_block_size = self._cache_groups.block_size_of(group_index)
-            # Older connector construction paths do not pass a vLLM
-            # KVCacheConfig.  Their synthetic one-group layout has no spec
-            # block size; retain the context's scheduler block size there.
-            if logical_block_size <= 0:
-                logical_block_size = self._ctx.block_size
+            logical_block_size = self._ctx.block_size
+            if self._cache_groups.sliding_window_group_indices:
+                logical_block_size = self._cache_groups.block_size_of(
+                    self._layer_to_group[layer_name]
+                )
             registration = _infer_kv_cache_registration(
                 registration_tensor,
                 logical_block_size,
@@ -1057,17 +1050,7 @@ class WorkerConnector:
                     raise RuntimeError(
                         f"save intent is missing hashes for cache group {group_index}"
                     ) from exc
-            recurrent_groups = getattr(self._cache_groups, "recurrent_group_indices", None)
-            is_recurrent_placeholder = (
-                group_index in recurrent_groups
-                if recurrent_groups is not None
-                else bool(
-                    getattr(self._cache_groups, "has_recurrent_state", False) and group_index > 0
-                )
-            )
             if len(block_ids) != len(block_hashes):
-                if is_recurrent_placeholder and not block_ids:
-                    continue
                 raise RuntimeError(
                     f"save block/hash count mismatch for {layer_name}: "
                     f"blocks={len(block_ids)} hashes={len(block_hashes)}"

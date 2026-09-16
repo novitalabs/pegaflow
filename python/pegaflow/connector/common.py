@@ -341,7 +341,6 @@ class CacheGroupLayout:
     group_sliding_windows: tuple[int | None, ...] = ()
     storage_group_ids: tuple[int, ...] = (0,)
     group_block_sizes: tuple[int, ...] = ()
-    layer_block_sizes: tuple[tuple[tuple[str, int], ...], ...] = ()
 
     @classmethod
     def from_config(
@@ -362,7 +361,6 @@ class CacheGroupLayout:
                 sliding_window_group_indices=frozenset(),
                 group_sliding_windows=(None,),
                 group_block_sizes=(0,),
-                layer_block_sizes=((),),
             )
 
         from vllm.v1.kv_cache_interface import (
@@ -374,228 +372,107 @@ class CacheGroupLayout:
         )
 
         specs = tuple(group.kv_cache_spec for group in groups)
-
-        attention_specs = (FullAttentionSpec, MLAAttentionSpec, SlidingWindowSpec)
-
-        def _is_uniform_attention(spec) -> bool:
-            if not isinstance(spec, UniformTypeKVCacheSpecs) or not spec.kv_cache_specs:
-                return False
-            layer_specs = tuple(spec.kv_cache_specs.values())
-            # Full and sliding attention share the same KV layout contract;
-            # MLA has a distinct registration format and cannot be mixed into
-            # that uniform group.
-            if all(
-                isinstance(layer_spec, (FullAttentionSpec, SlidingWindowSpec))
-                and not isinstance(layer_spec, MLAAttentionSpec)
-                for layer_spec in layer_specs
-            ):
-                return True
-            return all(isinstance(layer_spec, MLAAttentionSpec) for layer_spec in layer_specs)
-
-        def has_layer_spec(spec, spec_type) -> bool:
-            return isinstance(spec, spec_type) or (
-                isinstance(spec, UniformTypeKVCacheSpecs)
-                and any(
-                    isinstance(layer_spec, spec_type) for layer_spec in spec.kv_cache_specs.values()
+        layer_specs = tuple(
+            tuple(spec.kv_cache_specs.values())
+            if isinstance(spec, UniformTypeKVCacheSpecs)
+            else (spec,)
+            for spec in specs
+        )
+        uniform_attention = tuple(
+            isinstance(spec, UniformTypeKVCacheSpecs)
+            and bool(layers)
+            and (
+                all(isinstance(layer, MLAAttentionSpec) for layer in layers)
+                or all(
+                    isinstance(layer, (FullAttentionSpec, SlidingWindowSpec))
+                    and not isinstance(layer, MLAAttentionSpec)
+                    for layer in layers
                 )
             )
-
-        if not allow_sliding_window:
-            unsupported_sliding = any(
-                isinstance(spec, SlidingWindowSpec)
-                or (
-                    isinstance(spec, UniformTypeKVCacheSpecs)
-                    and any(
-                        isinstance(layer_spec, SlidingWindowSpec)
-                        for layer_spec in spec.kv_cache_specs.values()
-                    )
-                )
-                for spec in specs
+            for spec, layers in zip(specs, layer_specs, strict=True)
+        )
+        recurrent_group_indices = frozenset(
+            index for index, spec in enumerate(specs) if isinstance(spec, MambaSpec)
+        )
+        sliding_window_group_indices = frozenset(
+            index
+            for index, layers in enumerate(layer_specs)
+            if any(isinstance(layer, SlidingWindowSpec) for layer in layers)
+        )
+        if sliding_window_group_indices and not allow_sliding_window:
+            raise RuntimeError(
+                "PegaFlow SlidingWindowSpec requires the vLLM hybrid KV cache manager"
             )
-            if unsupported_sliding:
-                raise RuntimeError(
-                    "PegaFlow SlidingWindowSpec requires the vLLM hybrid KV cache manager"
-                )
 
         if len(specs) == 1:
-            spec = specs[0]
-            is_uniform_mla = (
-                type(spec) is UniformTypeKVCacheSpecs
-                and bool(spec.kv_cache_specs)
-                and all(
-                    type(layer_spec) is MLAAttentionSpec
-                    for layer_spec in spec.kv_cache_specs.values()
-                )
-            )
-            is_uniform_attention = _is_uniform_attention(spec)
-            if isinstance(spec, SlidingWindowSpec):
+            if isinstance(specs[0], SlidingWindowSpec):
                 raise RuntimeError(
-                    "PegaFlow requires a dense FullAttention cache group alongside "
-                    "SlidingWindowSpec"
+                    "PegaFlow requires a dense FullAttention cache group alongside SlidingWindowSpec"
                 )
-            if is_uniform_attention and any(
-                isinstance(layer_spec, SlidingWindowSpec)
-                for layer_spec in spec.kv_cache_specs.values()
-            ):
+            if uniform_attention[0] and sliding_window_group_indices:
                 raise RuntimeError(
                     "PegaFlow requires SlidingWindowSpec layers to use a separate "
                     "cache group from FullAttention layers"
                 )
             if (
-                type(spec) not in (FullAttentionSpec, MLAAttentionSpec, SlidingWindowSpec)
-                and not is_uniform_mla
-                and not is_uniform_attention
+                type(specs[0]) not in (FullAttentionSpec, MLAAttentionSpec)
+                and not uniform_attention[0]
             ):
                 raise RuntimeError(
-                    "PegaFlow supports a single cache group only for FullAttention, "
-                    "SlidingWindow, MLA, or uniformly grouped attention layers"
+                    "PegaFlow supports a single cache group only for FullAttention, MLA, "
+                    "or uniformly grouped attention layers"
                 )
+            hash_group_index = 0
         else:
             if any(
-                not (
-                    isinstance(spec, attention_specs + (MambaSpec,)) or _is_uniform_attention(spec)
-                )
-                for spec in specs
+                not isinstance(spec, (FullAttentionSpec, SlidingWindowSpec, MambaSpec))
+                and not uniform
+                for spec, uniform in zip(specs, uniform_attention, strict=True)
             ):
                 raise RuntimeError("PegaFlow HMA supports only attention and Mamba cache groups")
-
-            has_dense_full_attention = any(
-                has_layer_spec(spec, FullAttentionSpec) for spec in specs
+            hash_group_index = next(
+                (
+                    index
+                    for index, layers in enumerate(layer_specs)
+                    if any(isinstance(layer, FullAttentionSpec) for layer in layers)
+                ),
+                None,
             )
-            has_sliding_window = any(has_layer_spec(spec, SlidingWindowSpec) for spec in specs)
-            has_mamba = any(isinstance(spec, MambaSpec) for spec in specs)
-            if has_sliding_window and has_mamba:
-                raise RuntimeError(
-                    "PegaFlow does not support combining SlidingWindowSpec with Mamba cache groups"
-                )
-            if not has_dense_full_attention:
+            if hash_group_index is None:
                 raise RuntimeError(
                     "PegaFlow requires a dense FullAttention cache group for block hashes"
                 )
-            if not has_mamba and not has_sliding_window:
+            if sliding_window_group_indices and recurrent_group_indices:
+                raise RuntimeError(
+                    "PegaFlow does not support combining SlidingWindowSpec with Mamba cache groups"
+                )
+            if not sliding_window_group_indices and not recurrent_group_indices:
                 raise RuntimeError(
                     "PegaFlow HMA requires FullAttention with SlidingWindow or Mamba cache groups"
                 )
-            if any(
-                isinstance(spec, MambaSpec) and spec.mamba_cache_mode != "align" for spec in specs
-            ):
+            if any(specs[index].mamba_cache_mode != "align" for index in recurrent_group_indices):
                 raise RuntimeError("PegaFlow HMA requires mamba_cache_mode='align'")
 
-        group_block_sizes = tuple(int(group.kv_cache_spec.block_size) for group in groups)
+        group_block_sizes = tuple(int(spec.block_size) for spec in specs)
         if any(size <= 0 for size in group_block_sizes):
             raise RuntimeError("PegaFlow cache groups require positive logical block sizes")
-        layer_sizes = tuple(
-            int(
-                getattr(
-                    (getattr(group.kv_cache_spec, "kv_cache_specs", None) or {}).get(
-                        layer_name, group.kv_cache_spec
-                    ),
-                    "block_size",
-                    group_block_sizes[group_index],
-                )
-            )
-            for group_index, group in enumerate(groups)
-            for layer_name in group.layer_names
-        )
-        if any(size <= 0 for size in layer_sizes):
-            raise RuntimeError("PegaFlow cache layers require positive logical block sizes")
-        if hash_block_size is not None and hash_block_size <= 0:
-            raise ValueError(f"hash block size must be > 0, got {hash_block_size}")
-        # A single group's hash can span multiple physical blocks under DCP.
-        # vLLM resolves that cadence in scheduler token units, not spec units.
-        if hash_block_size is not None and len(groups) > 1:
-            invalid = [size for size in group_block_sizes + layer_sizes if size % hash_block_size]
-            if invalid:
-                raise RuntimeError(
-                    "PegaFlow cache group block sizes must be integer multiples of "
-                    f"hash block size {hash_block_size}; got {invalid}"
-                )
-
-        hash_group_index = next(
-            (
-                index
-                for index, group in enumerate(groups)
-                if has_layer_spec(group.kv_cache_spec, FullAttentionSpec)
-            ),
-            next(
-                (
-                    index
-                    for index, group in enumerate(groups)
-                    if isinstance(group.kv_cache_spec, attention_specs)
-                    or _is_uniform_attention(group.kv_cache_spec)
-                ),
-                None,
-            ),
-        )
-        if hash_group_index is None:
-            raise RuntimeError(
-                "PegaFlow requires a dense FullAttention cache group for block hashes"
-            )
-
-        recurrent_group_indices = frozenset(
-            index
-            for index, group in enumerate(groups)
-            if isinstance(group.kv_cache_spec, MambaSpec)
-        )
-        sliding_window_group_indices = frozenset(
-            index
-            for index, group in enumerate(groups)
-            if has_layer_spec(group.kv_cache_spec, SlidingWindowSpec)
-        )
-        group_sliding_windows = tuple(
-            next(
-                (
-                    int(layer_spec.sliding_window)
-                    for layer_spec in (
-                        getattr(group.kv_cache_spec, "kv_cache_specs", None) or {}
-                    ).values()
-                    if isinstance(layer_spec, SlidingWindowSpec)
-                ),
-                int(group.kv_cache_spec.sliding_window)
-                if isinstance(group.kv_cache_spec, SlidingWindowSpec)
-                else None,
-            )
-            for group in groups
-        )
-        # All dense attention groups share the prefix query in storage group 0.
-        # Sliding groups share group 1; recurrent groups get subsequent ids.
-        storage_group_ids = tuple(
-            int(index in sliding_window_group_indices)
-            if index not in recurrent_group_indices
-            else 1
-            + int(bool(sliding_window_group_indices))
-            + sum(1 for other in recurrent_group_indices if other < index)
-            for index in range(len(groups))
-        )
-
-        layer_block_sizes: list[tuple[tuple[str, int], ...]] = []
-        for group_index, group in enumerate(groups):
-            group_spec = group.kv_cache_spec
-            per_layer_specs = getattr(group_spec, "kv_cache_specs", None) or {}
-            layer_block_sizes.append(
-                tuple(
-                    (
-                        layer_name,
-                        int(
-                            getattr(
-                                per_layer_specs.get(layer_name, group_spec),
-                                "block_size",
-                                group_block_sizes[group_index],
-                            )
-                        ),
-                    )
-                    for layer_name in group.layer_names
-                )
-            )
-
         if any(
-            size != group_block_sizes[group_index]
-            for group_index, layer_sizes in enumerate(layer_block_sizes)
-            for _, size in layer_sizes
+            int(layer.block_size) != size
+            for size, layers in zip(group_block_sizes, layer_specs, strict=True)
+            for layer in layers
         ):
             raise RuntimeError(
                 "PegaFlow requires layers within each cache group to share its logical block size"
             )
+        if hash_block_size is not None:
+            if hash_block_size <= 0:
+                raise ValueError(f"hash block size must be > 0, got {hash_block_size}")
+            # Single-group DCP hashes span multiple physical blocks.
+            if len(groups) > 1 and any(size % hash_block_size for size in group_block_sizes):
+                raise RuntimeError(
+                    "PegaFlow cache group block sizes must be integer multiples of "
+                    f"hash block size {hash_block_size}; got {group_block_sizes}"
+                )
         dense_block_size = group_block_sizes[hash_group_index]
         if any(
             size != dense_block_size
@@ -605,18 +482,10 @@ class CacheGroupLayout:
             raise RuntimeError(
                 "PegaFlow requires dense attention groups to share a logical block size"
             )
-
-        if recurrent_group_indices:
-            heterogeneous_recurrent = any(
-                group_block_sizes[index] != dense_block_size
-                or any(size != dense_block_size for _, size in layer_block_sizes[index])
-                for index in recurrent_group_indices
+        if any(group_block_sizes[index] != dense_block_size for index in recurrent_group_indices):
+            raise RuntimeError(
+                "PegaFlow requires recurrent cache groups to use the dense attention block size"
             )
-            if heterogeneous_recurrent:
-                raise RuntimeError(
-                    "PegaFlow requires recurrent cache groups to use the dense attention block size"
-                )
-
         if any(
             dense_block_size % group_block_sizes[index] for index in sliding_window_group_indices
         ):
@@ -625,10 +494,30 @@ class CacheGroupLayout:
                 "block size so dense KV blocks match the scheduler alignment"
             )
 
+        group_sliding_windows = tuple(
+            next(
+                (
+                    int(layer.sliding_window)
+                    for layer in layers
+                    if isinstance(layer, SlidingWindowSpec)
+                ),
+                None,
+            )
+            for layers in layer_specs
+        )
+        # Dense groups share the prefix; sliding groups share membership keys.
+        # Sliding and recurrent layouts are mutually exclusive.
+        storage_group_ids = tuple(
+            1 + sum(other < index for other in recurrent_group_indices)
+            if index in recurrent_group_indices
+            else int(index in sliding_window_group_indices)
+            for index in range(len(groups))
+        )
+
         return cls(
             layer_names=tuple(tuple(group.layer_names) for group in groups),
             hash_group_index=hash_group_index,
-            has_recurrent_state=any(isinstance(group.kv_cache_spec, MambaSpec) for group in groups),
+            has_recurrent_state=bool(recurrent_group_indices),
             recurrent_group_indices=recurrent_group_indices,
             recurrent_layer_names=frozenset(
                 layer_name
@@ -640,7 +529,6 @@ class CacheGroupLayout:
             group_sliding_windows=group_sliding_windows,
             storage_group_ids=storage_group_ids,
             group_block_sizes=group_block_sizes,
-            layer_block_sizes=tuple(layer_block_sizes),
         )
 
     @property
@@ -660,14 +548,9 @@ class CacheGroupLayout:
         """Engine storage group id for a connector cache group index."""
         return self.storage_group_ids[group_index]
 
-    def block_size_of(self, group_index: int, layer_name: str | None = None) -> int:
-        """Return the logical token block size for a group or one of its layers."""
-        if layer_name is None:
-            return self.group_block_sizes[group_index]
-        for name, size in self.layer_block_sizes[group_index]:
-            if name == layer_name:
-                return size
-        raise KeyError(f"KV cache layer is not in group {group_index}: {layer_name}")
+    def block_size_of(self, group_index: int) -> int:
+        """Return the logical token block size for a cache group."""
+        return self.group_block_sizes[group_index]
 
     def sliding_window_of(self, group_index: int) -> int | None:
         """Return the token window for a sliding group, if one is declared."""
@@ -675,22 +558,11 @@ class CacheGroupLayout:
 
     @property
     def requires_group_specific_block_mapping(self) -> bool:
-        """Whether save/load needs per-group hash and lease vectors.
-
-        Sliding-window groups may use a different logical block size from the
-        dense full-attention group.  The current connector wire intents carry
-        one hash/lease vector, so accepting this layout would pair block IDs
-        with the wrong keys and can silently corrupt model output.
-        """
-        if not self.sliding_window_group_indices:
-            return False
-        reference = self.group_block_sizes[self.hash_group_index]
-        for group_index in self.sliding_window_group_indices:
-            if self.group_block_sizes[group_index] != reference:
-                return True
-            if any(size != reference for _, size in self.layer_block_sizes[group_index]):
-                return True
-        return False
+        """Whether groups need different numbers of hashes per scheduler block."""
+        return any(
+            self.group_block_sizes[index] != self.group_block_sizes[self.hash_group_index]
+            for index in self.sliding_window_group_indices
+        )
 
 
 class PegaConnectorMetadata(KVConnectorMetadata):

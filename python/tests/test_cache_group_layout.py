@@ -29,11 +29,11 @@ def _config(*groups):
     return SimpleNamespace(kv_cache_groups=groups)
 
 
-def _full_attention(block_size=16):
+def _full_attention(block_size=16, spec_type=FullAttentionSpec):
     try:
-        return FullAttentionSpec(block_size=block_size, num_kv_heads=1, head_size=1, dtype=None)
+        return spec_type(block_size=block_size, num_kv_heads=1, head_size=1, dtype=None)
     except TypeError:
-        spec = FullAttentionSpec()
+        spec = spec_type()
         spec.block_size = block_size
         return spec
 
@@ -86,7 +86,7 @@ def _spec_of(spec_type, block_size=16):
     if spec_type is SlidingWindowSpec:
         return _sliding_window(block_size)
     if issubclass(spec_type, FullAttentionSpec):
-        return _full_attention(block_size)
+        return _full_attention(block_size, spec_type)
     return spec_type()
 
 
@@ -226,7 +226,7 @@ def test_rejects_different_recurrent_block_sizes():
 def test_rejects_non_integral_logical_block_size_ratio():
     config = _config(
         _group("attention", _full_attention(block_size=16)),
-        _group("sliding_window", _mamba(block_size=24)),
+        _group("sliding_window", _sliding_window(block_size=24)),
     )
     with pytest.raises(RuntimeError, match="integer multiples"):
         CacheGroupLayout.from_config(config, hash_block_size=16)
