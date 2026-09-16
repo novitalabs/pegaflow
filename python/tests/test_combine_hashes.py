@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -84,7 +83,7 @@ def test_recurrent_mid_request_saves_keep_attention_cadence():
     scheduler._scheduled_tokens["r1"] = 32
 
     assert scheduler._consume_full_block_saves("r1") == SaveIntent(
-        block_ids_by_group=((11, 12), ()),
+        block_ids_by_group=((11, 12), (0, 0)),
         block_hashes=(_hash(0), _hash(1)),
     )
     assert scheduler._next_stored_block_idx["r1"] == 2

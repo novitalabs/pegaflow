@@ -85,9 +85,6 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
                     f"vLLM scheduler block {scheduler_block_size} is not divisible "
                     f"by hash block {hash_block_size}"
                 )
-            # Hybrid vLLM schedulers use the LCM of per-group block sizes as
-            # their token cadence.  The cache config's block_size is the
-            # minimum allocation block and must not drive scheduler bookkeeping.
             block_size = scheduler_block_size // max(1, dcp_world_size)
 
         cross_layer_blocks = os.environ.get("PEGAFLOW_CROSS_LAYER_BLOCKS", "1") == "1"
@@ -249,7 +246,7 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
             "tp_rank=%s tp_size=%d pp_rank=%d pp_size=%d world_size=%d namespace=%s "
             "is_mla=%s collapse_mla_tp=%s transfer_backend=%s dcp_world_size=%d "
             "pcp_world_size=%d dcp_rank=%d tp_shard=%d/%d "
-            "mode=%s wait_for_full_prefix=%s load_mode=async",
+            "mode=%s wait_for_full_prefix=%s",
             role.name,
             instance_id,
             device_id if device_id is not None else "cpu",

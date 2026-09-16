@@ -249,7 +249,7 @@ class WorkerConnector:
         self._load_completion_lock = threading.Lock()
 
         # Failure surface for vLLM's get_block_ids_with_load_errors / get_finished.
-        # Populated when an asynchronous load RPC fails or when an in-flight
+        # Populated when start_load_kv fails or when an in-flight
         # load times out waiting for the server. Drained once per get_finished
         # and get_block_ids_with_load_errors call.
         self._failed_load_block_ids: set[int] = set()
@@ -812,7 +812,7 @@ class WorkerConnector:
         """Return block IDs whose load failed since the last call, then clear.
 
         vLLM calls this each forward pass and re-schedules reported blocks for
-        local recomputation. Failures may come from asynchronous RPC errors in
+        local recomputation. Failures may come from RPC errors in
         start_load_kv or from in-flight load timeouts detected in get_finished.
         """
         with self._load_completion_lock:
@@ -826,7 +826,7 @@ class WorkerConnector:
         block_ids: list[int],
         start_time: float,
     ) -> None:
-        """Record an asynchronous load RPC failure for later reporting to vLLM."""
+        """Record a load RPC failure for later reporting to vLLM."""
         duration = time.perf_counter() - start_time
         with self._load_completion_lock:
             self._failed_load_reqs.update(request_ids)
