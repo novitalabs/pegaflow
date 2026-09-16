@@ -961,12 +961,7 @@ class WorkerConnector:
         for task in batch:
             for req_id, save_intent in task.metadata.save_intents.items():
                 try:
-                    layer_saves = tuple(
-                        self._layer_saves(
-                            save_intent,
-                            is_boundary=req_id.startswith("boundary:"),
-                        )
-                    )
+                    layer_saves = tuple(self._layer_saves(save_intent))
                 except Exception:
                     # A malformed intent is a scheduler-side bug; drop this
                     # request's save rather than the whole batch (or thread).
@@ -1026,7 +1021,7 @@ class WorkerConnector:
             self._stats.record_save(save_duration, total_blocks, success)
 
     def _layer_saves(
-        self, save_intent: SaveIntent, *, is_boundary: bool = False
+        self, save_intent: SaveIntent
     ) -> Iterator[tuple[str, tuple[int, ...], tuple[bytes, ...]]]:
         """Yield `(layer, block_ids, block_hashes)` this rank writes for one intent."""
         if not any(save_intent.block_ids_by_group):
@@ -1075,16 +1070,7 @@ class WorkerConnector:
             non_null = tuple(
                 (block_id, block_hash)
                 for block_id, block_hash in zip(block_ids, block_hashes, strict=True)
-                # Physical block 0 is a valid vLLM cache slot.  ``None`` is
-                # the only empty destination marker used by load intents;
-                # filtering 0 drops the first prefix block and makes every
-                # subsequent prefix query stop at block zero.
-                if block_id is not None
-                and not (
-                    (is_recurrent_placeholder or is_boundary)
-                    and save_intent.block_hashes_by_group is None
-                    and block_id == 0
-                )
+                if block_id is not None and block_id != 0
             )
             block_ids = tuple(block_id for block_id, _ in non_null)
             block_hashes = tuple(block_hash for _, block_hash in non_null)

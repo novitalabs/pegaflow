@@ -463,8 +463,7 @@ class CacheGroupLayout:
             has_mamba = any(isinstance(spec, MambaSpec) for spec in specs)
             if has_sliding_window and has_mamba:
                 raise RuntimeError(
-                    "PegaFlow does not support combining SlidingWindowSpec with Mamba "
-                    "cache groups"
+                    "PegaFlow does not support combining SlidingWindowSpec with Mamba cache groups"
                 )
             if not has_dense_full_attention:
                 raise RuntimeError(
@@ -497,9 +496,11 @@ class CacheGroupLayout:
         )
         if any(size <= 0 for size in layer_sizes):
             raise RuntimeError("PegaFlow cache layers require positive logical block sizes")
-        if hash_block_size is not None:
-            if hash_block_size <= 0:
-                raise ValueError(f"hash block size must be > 0, got {hash_block_size}")
+        if hash_block_size is not None and hash_block_size <= 0:
+            raise ValueError(f"hash block size must be > 0, got {hash_block_size}")
+        # A single group's hash can span multiple physical blocks under DCP.
+        # vLLM resolves that cadence in scheduler token units, not spec units.
+        if hash_block_size is not None and len(groups) > 1:
             invalid = [size for size in group_block_sizes + layer_sizes if size % hash_block_size]
             if invalid:
                 raise RuntimeError(
@@ -553,22 +554,13 @@ class CacheGroupLayout:
             )
             for group in groups
         )
-        # The dense full-attention group owns storage group 0 and therefore
-        # prefix-query semantics. Sliding-window groups use one shared
-        # membership storage group (their block cadence is finer and their
-        # retained blocks are suffix-shaped). Recurrent groups get subsequent
-        # dense ids. This keeps the legacy full+Mamba layout stable while
-        # preventing sliding-window keys from colliding with full-attention
-        # keys.
-        has_secondary_attention = any(
-            index not in recurrent_group_indices and index != hash_group_index
-            for index in range(len(groups))
-        )
+        # All dense attention groups share the prefix query in storage group 0.
+        # Sliding groups share group 1; recurrent groups get subsequent ids.
         storage_group_ids = tuple(
-            (0 if index == hash_group_index else 1)
+            int(index in sliding_window_group_indices)
             if index not in recurrent_group_indices
             else 1
-            + int(has_secondary_attention)
+            + int(bool(sliding_window_group_indices))
             + sum(1 for other in recurrent_group_indices if other < index)
             for index in range(len(groups))
         )
@@ -593,8 +585,25 @@ class CacheGroupLayout:
                 )
             )
 
+        if any(
+            size != group_block_sizes[group_index]
+            for group_index, layer_sizes in enumerate(layer_block_sizes)
+            for _, size in layer_sizes
+        ):
+            raise RuntimeError(
+                "PegaFlow requires layers within each cache group to share its logical block size"
+            )
+        dense_block_size = group_block_sizes[hash_group_index]
+        if any(
+            size != dense_block_size
+            for index, size in enumerate(group_block_sizes)
+            if index not in recurrent_group_indices and index not in sliding_window_group_indices
+        ):
+            raise RuntimeError(
+                "PegaFlow requires dense attention groups to share a logical block size"
+            )
+
         if recurrent_group_indices:
-            dense_block_size = group_block_sizes[hash_group_index]
             heterogeneous_recurrent = any(
                 group_block_sizes[index] != dense_block_size
                 or any(size != dense_block_size for _, size in layer_block_sizes[index])
@@ -602,8 +611,7 @@ class CacheGroupLayout:
             )
             if heterogeneous_recurrent:
                 raise RuntimeError(
-                    "PegaFlow requires recurrent cache groups to use the dense "
-                    "attention block size"
+                    "PegaFlow requires recurrent cache groups to use the dense attention block size"
                 )
 
         return cls(
@@ -786,8 +794,7 @@ def derive_namespace(
     pcp_world_size: int = 1,
     cross_layer_blocks: bool = False,
     hash_block_size: int | None = None,
-    cache_group_block_sizes: tuple[int, ...] | None = None,
-    cache_group_layer_block_sizes: tuple[tuple[tuple[str, int], ...], ...] | None = None,
+    cache_group_layout: CacheGroupLayout | None = None,
 ) -> str:
     """
     Derive namespace for storage isolation.
@@ -831,13 +838,10 @@ def derive_namespace(
         "mamba_cache_mode": getattr(cache_config, "mamba_cache_mode", None),
         "mamba_ssm_cache_dtype": getattr(cache_config, "mamba_ssm_cache_dtype", None),
     }
-    if cache_group_block_sizes is not None:
-        factors["cache_group_block_sizes"] = tuple(cache_group_block_sizes)
-    if cache_group_layer_block_sizes is not None:
-        factors["cache_group_layer_block_sizes"] = tuple(
-            tuple((name, int(size)) for name, size in group)
-            for group in cache_group_layer_block_sizes
-        )
+    if cache_group_layout is not None and cache_group_layout.sliding_window_group_indices:
+        # Group specs are shared across PP stages; layer names are worker-local.
+        # Keep the existing namespace for layouts without sliding attention.
+        factors["cache_group_block_sizes"] = cache_group_layout.group_block_sizes
 
     factor_str = str(sorted(factors.items()))
     hash_suffix = hashlib.sha256(factor_str.encode()).hexdigest()[:8]

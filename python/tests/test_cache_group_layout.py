@@ -121,6 +121,16 @@ def test_accepts_single_attention_group(spec_type):
     assert not layout.has_recurrent_state
 
 
+@pytest.mark.parametrize("spec_type", [FullAttentionSpec, MLAAttentionSpec])
+def test_single_group_dcp_hash_spans_multiple_physical_blocks(spec_type):
+    config = _config(_group("attention", _spec_of(spec_type, block_size=64)))
+
+    layout = CacheGroupLayout.from_config(config, hash_block_size=128)
+
+    assert layout.group_block_sizes == (64,)
+    assert layout.storage_group_ids == (0,)
+
+
 def test_accepts_single_uniform_mla_group():
     group = SimpleNamespace(
         layer_names=("model.layers.0.self_attn.attn", "model.layers.0.self_attn.indexer.k_cache"),
@@ -138,6 +148,28 @@ def test_accepts_single_uniform_mla_group():
     assert layout.layer_names == (group.layer_names,)
     assert layout.hash_group_index == 0
     assert not layout.has_recurrent_state
+
+
+def test_rejects_per_layer_cadences_that_cannot_share_a_group_hash():
+    spec = UniformTypeKVCacheSpecs(
+        block_size=16,
+        kv_cache_specs={"attention": _mla(16), "other": _mla(32)},
+    )
+    group = SimpleNamespace(layer_names=("attention", "other"), kv_cache_spec=spec)
+
+    with pytest.raises(RuntimeError, match="within each cache group"):
+        CacheGroupLayout.from_config(_config(group))
+
+
+def test_rejects_dense_groups_with_different_hash_cadences():
+    config = _config(
+        _group("attention", _mla(16)),
+        _group("other_attention", _mla(32)),
+        _group("recurrent", _mamba(16)),
+    )
+
+    with pytest.raises(RuntimeError, match="dense attention groups"):
+        CacheGroupLayout.from_config(config)
 
 
 @pytest.mark.parametrize("other_spec_type", [FullAttentionSpec, SlidingWindowSpec])

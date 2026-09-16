@@ -981,8 +981,7 @@ class SchedulerConnector:
             return None
         if self._cache_groups.requires_group_specific_block_mapping:
             logger.debug(
-                "[PegaKVConnector] req=%s pd_tail_save skipped for heterogeneous "
-                "cache groups",
+                "[PegaKVConnector] req=%s pd_tail_save skipped for heterogeneous cache groups",
                 req_id,
             )
             return None
@@ -1450,8 +1449,10 @@ class SchedulerConnector:
             leases_by_group: list[tuple[bytes, ...]] = [() for _ in range(layout.group_count)]
             positions_by_group: list[tuple[int, ...]] = [() for _ in range(layout.group_count)]
             starts_by_group = [0 for _ in range(layout.group_count)]
-            leases_by_group[layout.hash_group_index] = ready.leases
-            positions_by_group[layout.hash_group_index] = tuple(range(candidate))
+            for group_index in range(layout.group_count):
+                if layout.storage_group_of(group_index) == 0:
+                    leases_by_group[group_index] = ready.leases
+                    positions_by_group[group_index] = tuple(range(candidate))
             for group_index in sliding_groups:
                 start, end = span(group_index, candidate)
                 positions, leases = query(group_index, start, end)

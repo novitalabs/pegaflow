@@ -94,16 +94,22 @@ def test_save_maps_one_full_block_to_two_sliding_blocks():
     )
 
 
-def test_worker_save_keeps_physical_block_zero():
+@pytest.mark.parametrize("per_group_hashes", [False, True], ids=["legacy", "sliding"])
+def test_worker_save_skips_vllm_null_blocks(per_group_hashes):
     worker = WorkerConnector(_scheduler()._ctx)
-    worker._registered_layers = ["full"]
-    worker._layer_to_group = {"full": 0}
+    worker._cache_groups = _layout()
+    worker._registered_layers = ["full", "sliding"]
+    worker._layer_to_group = worker._cache_groups.layer_to_group()
     save_intent = SaveIntent(
-        block_ids_by_group=((0, 7), ()),
+        block_ids_by_group=((0, 7), (0, 8)),
         block_hashes=(b"h0", b"h1"),
+        block_hashes_by_group=((b"h0", b"h1"), (b"s0", b"s1")) if per_group_hashes else None,
     )
     rows = list(worker._layer_saves(save_intent))
-    assert rows == [("full", (0, 7), (b"h0", b"h1"))]
+    assert rows == [
+        ("full", (7,), (b"h1",)),
+        ("sliding", (8,), (b"s1" if per_group_hashes else b"h1",)),
+    ]
     worker._registered_layers = []
     worker.shutdown()
 
@@ -213,15 +219,16 @@ def test_sliding_groups_intersect_windows_after_boundary_shrinks():
     assert result.hit_positions_by_group == ((0, 1), (0, 1), (0, 1))
 
 
-def test_shared_sliding_storage_uses_one_query_and_one_worker_load():
+@pytest.mark.parametrize("extra_dense", [False, True], ids=["shared-sliding", "shared-dense"])
+def test_shared_storage_uses_one_query_and_one_worker_load(extra_dense):
     scheduler = _scheduler()
     layout = replace(
         _layout(),
         layer_names=(("full",), ("sliding",), ("sliding_other",)),
-        sliding_window_group_indices=frozenset({1, 2}),
-        group_sliding_windows=(None, 32, 32),
-        storage_group_ids=(0, 1, 1),
-        group_block_sizes=(32, 16, 16),
+        sliding_window_group_indices=frozenset({1}) if extra_dense else frozenset({1, 2}),
+        group_sliding_windows=(None, 32, None if extra_dense else 32),
+        storage_group_ids=(0, 1, 0 if extra_dense else 1),
+        group_block_sizes=(32, 16, 32 if extra_dense else 16),
     )
     scheduler._cache_groups = layout
     scheduler._tp_shard_client.query_group_membership = MagicMock(
@@ -232,7 +239,11 @@ def test_shared_sliding_storage_uses_one_query_and_one_worker_load():
         request, 0, [b"h"] * 4, ShardedQueryReady(4, (b"dense",)), "r"
     )
     scheduler._tp_shard_client.query_group_membership.assert_called_once()
-    assert result.leases_by_group == ((b"dense",), (b"sliding",), (b"sliding",))
+    assert result.leases_by_group == (
+        (b"dense",),
+        (b"sliding",),
+        (b"dense" if extra_dense else b"sliding",),
+    )
 
     worker = WorkerConnector(scheduler._ctx)
     worker._cache_groups = layout
@@ -244,7 +255,11 @@ def test_shared_sliding_storage_uses_one_query_and_one_worker_load():
             PegaConnectorMetadata(
                 load_intents={
                     "r": LoadIntent(
-                        block_ids_by_group=((10, 11, 12, 13), (20, 21), (30, 31)),
+                        block_ids_by_group=(
+                            (10, 11, 12, 13),
+                            (20, 21),
+                            (30, 31, 32, 33) if extra_dense else (30, 31),
+                        ),
                         leases=result.leases,
                         leases_by_group=result.leases_by_group,
                         num_tokens=128,
@@ -254,8 +269,11 @@ def test_shared_sliding_storage_uses_one_query_and_one_worker_load():
             SimpleNamespace(),
         )
         assert scheduler._ctx.engine_client.load.call_args.args[5] == [
-            (b"dense", [[10, 11, 12, 13], [None] * 4, [None] * 4]),
-            (b"sliding", [[None, None], [20, 21], [30, 31]]),
+            (
+                b"dense",
+                [[10, 11, 12, 13], [None] * 4, [30, 31, 32, 33] if extra_dense else [None] * 4],
+            ),
+            (b"sliding", [[None, None], [20, 21], [None, None] if extra_dense else [30, 31]]),
         ]
     finally:
         worker._registered_layers = []

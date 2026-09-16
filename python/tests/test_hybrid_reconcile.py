@@ -12,6 +12,8 @@ Pure-function contract covering the scheduler-side hit derivation:
 
 from __future__ import annotations
 
+import pytest
+
 from .unit_stubs import install_connector_unit_stubs
 
 install_connector_unit_stubs()
@@ -26,6 +28,7 @@ from .test_cache_group_layout import (  # noqa: E402
     _full_attention,
     _group,
     _mamba,
+    _mla,
 )
 
 
@@ -92,6 +95,19 @@ class TestReconcileHybridHit:
 
 
 class TestStorageGroupIds:
+    @pytest.mark.parametrize("attention", [_full_attention, _mla], ids=["full", "mla"])
+    def test_multiple_dense_groups_share_prefix_storage(self, attention):
+        config = _config(
+            _group("recurrent_a", _mamba(block_size=1536)),
+            _group("attention_a", attention(block_size=1536)),
+            _group("recurrent_b", _mamba(block_size=1536)),
+            _group("attention_b", attention(block_size=1536)),
+        )
+        layout = CacheGroupLayout.from_config(config, hash_block_size=128)
+
+        assert layout.storage_group_ids == (1, 0, 2, 0)
+        assert layout.hash_group_index == 1
+
     def test_attention_first_layout(self):
         config = _config(
             _group("attn", _full_attention()),
