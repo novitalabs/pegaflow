@@ -80,12 +80,19 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
             scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
                 kv_cache_config, vllm_config
             )
+            block_size_mismatch = scheduler_block_size != block_size * dcp_world_size
+            if block_size_mismatch and not cache_group_layout.requires_group_specific_block_mapping:
+                raise ValueError(
+                    f"vLLM scheduler block {scheduler_block_size} / hash block "
+                    f"{hash_block_size} do not fit the connector block {block_size}"
+                )
             if scheduler_block_size % hash_block_size != 0:
                 raise ValueError(
                     f"vLLM scheduler block {scheduler_block_size} is not divisible "
                     f"by hash block {hash_block_size}"
                 )
-            block_size = scheduler_block_size // max(1, dcp_world_size)
+            if block_size_mismatch:
+                block_size = scheduler_block_size // max(1, dcp_world_size)
 
         cross_layer_blocks = os.environ.get("PEGAFLOW_CROSS_LAYER_BLOCKS", "1") == "1"
         base_namespace = derive_namespace(
