@@ -23,11 +23,6 @@ use super::tier_attribution::{
 
 const REMOTE_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const REMOTE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
-// A full prefetch budget is shared by concurrent requests.  Returning a
-// completed zero-hit result when the budget is temporarily exhausted turns
-// an SSD-resident prefix into a permanent miss for that request.  Wait for a
-// slot to be released before falling back to recomputation.
-const SSD_BACKPRESSURE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg(feature = "rdma")]
 #[derive(Clone)]
@@ -48,13 +43,11 @@ impl RdmaFetch {
         namespace: &str,
         remaining_hashes: &[Vec<u8>],
         require_full_prefix: bool,
-    ) -> RdmaPrefixResult {
-        let Some(plan) = self.0.query_plan(namespace, remaining_hashes).await else {
-            return RdmaPrefixResult::NoPlan;
-        };
+    ) -> Option<(usize, PrefetchResult)> {
+        let plan = self.0.query_plan(namespace, remaining_hashes).await?;
         let found = plan.block_count();
         if require_full_prefix && found != remaining_hashes.len() {
-            return RdmaPrefixResult::Partial;
+            return None;
         }
         let blocks = self
             .0
@@ -72,7 +65,7 @@ impl RdmaFetch {
                 found
             );
         }
-        RdmaPrefixResult::Fetched { found, blocks }
+        Some((found, blocks))
     }
 }
 
@@ -84,25 +77,9 @@ impl RdmaFetch {
         _namespace: &str,
         _remaining_hashes: &[Vec<u8>],
         _require_full_prefix: bool,
-    ) -> RdmaPrefixResult {
-        RdmaPrefixResult::NoPlan
+    ) -> Option<(usize, PrefetchResult)> {
+        None
     }
-}
-
-/// Result of one MetaServer/RDMA prefix probe.
-///
-/// A missing plan means that no peer currently advertises any of the
-/// requested blocks. It is a definitive miss for this request and must not
-/// enter the remote wait loop. A partial plan means a peer has advertised a
-/// prefix, so a full-prefix load may continue waiting for the remaining
-/// blocks to be saved and advertised.
-enum RdmaPrefixResult {
-    NoPlan,
-    Partial,
-    Fetched {
-        found: usize,
-        blocks: PrefetchResult,
-    },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -534,29 +511,6 @@ fn reserve_ssd_prefetch_slots(
     ))
 }
 
-async fn reserve_ssd_prefetch_slots_wait(
-    state: Arc<Mutex<PrefetchState>>,
-    max_prefetch_blocks: usize,
-    requested: usize,
-    require_full: bool,
-) -> Option<(usize, SsdPrefetchReservation)> {
-    let deadline = Instant::now() + SSD_BACKPRESSURE_WAIT_TIMEOUT;
-    loop {
-        if let Some(reservation) = reserve_ssd_prefetch_slots(
-            Arc::clone(&state),
-            max_prefetch_blocks,
-            requested,
-            require_full,
-        ) {
-            return Some(reservation);
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        tokio::time::sleep(REMOTE_WAIT_POLL_INTERVAL).await;
-    }
-}
-
 fn build_ready_result(
     prefix_blocks: Vec<Arc<SealedBlock>>,
     total: usize,
@@ -611,44 +565,37 @@ async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> 
     } = input;
     let remaining_hashes: Vec<Vec<u8>> = remaining_keys.iter().map(|k| k.hash.clone()).collect();
 
-    let mut remote_plan_available = false;
-    if let Some(rdma) = deps.rdma_fetch.as_ref() {
-        match rdma
+    if let Some(rdma) = deps.rdma_fetch.as_ref()
+        && let Some((found, blocks)) = rdma
             .try_fetch_prefix(&req_id, &namespace, &remaining_hashes, wait_for_full_prefix)
             .await
-        {
-            RdmaPrefixResult::NoPlan => {}
-            RdmaPrefixResult::Partial => remote_plan_available = true,
-            RdmaPrefixResult::Fetched { found, blocks } => {
-                record_tier_attribution(
-                    total,
-                    hit,
-                    found,
-                    Some(PrefetchSource::Rdma.as_attribution()),
-                    emit_tier_metrics,
-                );
-                return build_ready_result(
-                    prefix_blocks,
-                    total,
-                    Some(PrefetchSource::Rdma),
-                    found,
-                    &remaining_keys[..found],
-                    blocks,
-                );
-            }
-        }
+    {
+        record_tier_attribution(
+            total,
+            hit,
+            found,
+            Some(PrefetchSource::Rdma.as_attribution()),
+            emit_tier_metrics,
+        );
+        return build_ready_result(
+            prefix_blocks,
+            total,
+            Some(PrefetchSource::Rdma),
+            found,
+            &remaining_keys[..found],
+            blocks,
+        );
     }
 
     if let Some(ssd) = deps.ssd_store.as_ref() {
         let found = ssd.prefix_len(&remaining_keys);
         if (!wait_for_full_prefix || found == remaining_keys.len())
-            && let Some((reserved, _reservation)) = reserve_ssd_prefetch_slots_wait(
+            && let Some((reserved, _reservation)) = reserve_ssd_prefetch_slots(
                 Arc::clone(&deps.prefetch_state),
                 deps.max_prefetch_blocks,
                 found,
                 wait_for_full_prefix,
             )
-            .await
         {
             let keys = remaining_keys[..reserved].to_vec();
             let (found, blocks) = ssd.prefetch_prefix(keys).await;
@@ -675,36 +622,29 @@ async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> 
         }
     }
 
-    if wait_for_full_prefix && remote_plan_available && let Some(rdma) = deps.rdma_fetch {
+    if wait_for_full_prefix && let Some(rdma) = deps.rdma_fetch {
         let started_at = Instant::now();
         while started_at.elapsed() < REMOTE_WAIT_TIMEOUT {
             tokio::time::sleep(REMOTE_WAIT_POLL_INTERVAL).await;
-            match rdma
+            if let Some((found, blocks)) = rdma
                 .try_fetch_prefix(&req_id, &namespace, &remaining_hashes, true)
                 .await
             {
-                RdmaPrefixResult::Fetched { found, blocks } => {
-                    record_tier_attribution(
-                        total,
-                        hit,
-                        found,
-                        Some(PrefetchSource::Rdma.as_attribution()),
-                        emit_tier_metrics,
-                    );
-                    return build_ready_result(
-                        prefix_blocks,
-                        total,
-                        Some(PrefetchSource::Rdma),
-                        found,
-                        &remaining_keys[..found],
-                        blocks,
-                    );
-                }
-                // Once the plan disappears, no peer advertises a usable
-                // prefix anymore. Repeating the 30 s wait would only turn a
-                // normal miss into avoidable request latency.
-                RdmaPrefixResult::NoPlan => break,
-                RdmaPrefixResult::Partial => {}
+                record_tier_attribution(
+                    total,
+                    hit,
+                    found,
+                    Some(PrefetchSource::Rdma.as_attribution()),
+                    emit_tier_metrics,
+                );
+                return build_ready_result(
+                    prefix_blocks,
+                    total,
+                    Some(PrefetchSource::Rdma),
+                    found,
+                    &remaining_keys[..found],
+                    blocks,
+                );
             }
         }
         warn!(
