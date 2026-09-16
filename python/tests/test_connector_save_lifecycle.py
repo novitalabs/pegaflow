@@ -187,6 +187,29 @@ def test_hma_request_saves_run_async():
     assert finished_sending == {"request"}
 
 
+@pytest.mark.parametrize("save_error", [False, True], ids=["success", "failure"])
+def test_sliding_save_reports_pin_job_completion_while_request_runs(save_error):
+    worker = make_worker()
+    worker._registered_layers = ["layer"]
+    worker._ctx.engine_client.save.return_value = (True, "")
+    if save_error:
+        worker._ctx.engine_client.save.side_effect = RuntimeError("save failed")
+    worker._current_metadata = PegaConnectorMetadata(
+        save_intents={"running": SaveIntent(((21,),), (b"h",), gpu_pin_job_id=7)}
+    )
+    worker.wait_for_save()
+    worker._ctx.engine_client.save.assert_not_called()
+    assert worker.build_connector_worker_meta() is None
+
+    task = worker._save_queue.get_nowait()
+    with patch("torch.cuda.synchronize"):
+        worker._run_save_batch([task])
+
+    assert worker.get_finished(set()) == (None, None)
+    assert worker.build_connector_worker_meta().completed_boundary_jobs == {7: 1}
+    assert worker.build_connector_worker_meta() is None
+
+
 def test_preemption_waits_for_every_save_task():
     worker = make_worker()
     completion = enqueue_save(worker)

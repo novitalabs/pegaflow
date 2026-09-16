@@ -276,7 +276,7 @@ def test_rejects_sliding_window_with_mamba():
         CacheGroupLayout.from_config(config)
 
 
-def test_flags_heterogeneous_sliding_window_mapping_until_per_group_intents_exist():
+def test_accepts_heterogeneous_sliding_window_mapping():
     config = _config(
         _group("attention", _full_attention(block_size=32)),
         _group("sliding_window", _sliding_window(block_size=16)),
@@ -286,6 +286,17 @@ def test_flags_heterogeneous_sliding_window_mapping_until_per_group_intents_exis
 
     assert layout.sliding_window_group_indices == frozenset({1})
     assert layout.requires_group_specific_block_mapping
+
+
+@pytest.mark.parametrize("dense_size", [16, 48], ids=["smaller-dense", "non-divisible"])
+def test_rejects_dense_cadence_smaller_than_scheduler_alignment(dense_size):
+    config = _config(
+        _group("attention", _full_attention(block_size=dense_size)),
+        _group("sliding_window", _sliding_window(block_size=32)),
+    )
+
+    with pytest.raises(RuntimeError, match="dense KV blocks match the scheduler alignment"):
+        CacheGroupLayout.from_config(config, hash_block_size=16)
 
 
 def test_rejects_uniform_attention_group_with_sliding_window_layers():

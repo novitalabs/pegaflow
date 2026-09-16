@@ -317,6 +317,9 @@ class SaveIntent:
     # Optional per-group hash vectors.  When absent, ``block_hashes`` is used
     # for every group for backwards compatibility with uniform layouts.
     block_hashes_by_group: tuple[tuple[bytes, ...], ...] | None = None
+    # Sliding source blocks can leave the window while the request runs.
+    # This job holds their GPU references until every worker finishes saving.
+    gpu_pin_job_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -614,6 +617,14 @@ class CacheGroupLayout:
                     "PegaFlow requires recurrent cache groups to use the dense attention block size"
                 )
 
+        if any(
+            dense_block_size % group_block_sizes[index] for index in sliding_window_group_indices
+        ):
+            raise RuntimeError(
+                "PegaFlow requires SlidingWindow block sizes to divide the dense attention "
+                "block size so dense KV blocks match the scheduler alignment"
+            )
+
         return cls(
             layer_names=tuple(tuple(group.layer_names) for group in groups),
             hash_group_index=hash_group_index,
@@ -713,11 +724,12 @@ class PegaConnectorMetadata(KVConnectorMetadata):
 
 @dataclass
 class PegaWorkerMetadata(KVConnectorWorkerMetadata):
-    """Worker -> scheduler completion report for boundary-state save jobs.
+    """Worker -> scheduler completion report for pinned GPU save jobs.
 
     ``completed_boundary_jobs`` maps a job id to the number of workers that
     finished it (successfully or not). vLLM aggregates one instance per
-    worker before the scheduler sees it.
+    worker before the scheduler sees it. Sliding saves use the same job
+    lifecycle as recurrent boundary-state saves.
     """
 
     completed_boundary_jobs: dict[int, int]

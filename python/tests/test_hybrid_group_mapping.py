@@ -57,12 +57,6 @@ def _scheduler() -> SchedulerConnector:
     return scheduler
 
 
-def test_sliding_layout_is_supported_by_the_async_connector_contract():
-    layout = _layout()
-    assert layout.sliding_window_group_indices == frozenset({1})
-    assert layout.group_block_sizes == (32, 16)
-
-
 def test_save_maps_one_full_block_to_two_sliding_blocks():
     scheduler = _scheduler()
     hashes = tuple(bytes([index]) for index in range(8))
@@ -101,17 +95,53 @@ def test_worker_save_skips_vllm_null_blocks(per_group_hashes):
     worker._registered_layers = ["full", "sliding"]
     worker._layer_to_group = worker._cache_groups.layer_to_group()
     save_intent = SaveIntent(
-        block_ids_by_group=((0, 7), (0, 8)),
-        block_hashes=(b"h0", b"h1"),
-        block_hashes_by_group=((b"h0", b"h1"), (b"s0", b"s1")) if per_group_hashes else None,
+        block_ids_by_group=((6, 0, 7), (0, 0, 8)),
+        block_hashes=(b"h0", b"h1", b"h2"),
+        block_hashes_by_group=(
+            ((b"h0", b"h1", b"h2"), (b"s0", b"s1", b"s2")) if per_group_hashes else None
+        ),
     )
     rows = list(worker._layer_saves(save_intent))
     assert rows == [
-        ("full", (7,), (b"h1",)),
-        ("sliding", (8,), (b"s1" if per_group_hashes else b"h1",)),
+        ("full", (6, 7), (b"h0", b"h2")),
+        ("sliding", (8,), (b"s2" if per_group_hashes else b"h2",)),
     ]
     worker._registered_layers = []
     worker.shutdown()
+
+
+def test_saved_sliding_suffix_hits_without_null_placeholders():
+    scheduler = _scheduler()
+    hashes = tuple(bytes([index]) for index in range(8))
+    request = SimpleNamespace(request_id="r1", num_tokens=128, block_hashes=list(hashes))
+    worker = WorkerConnector(scheduler._ctx)
+    worker._cache_groups = _layout()
+    worker._registered_layers = ["sliding"]
+    worker._layer_to_group = {"sliding": 1}
+    try:
+        rows = list(
+            worker._layer_saves(
+                SaveIntent(
+                    block_ids_by_group=((10, 11, 12, 13), (0, 0, 0, 0, 0, 0, 26, 27)),
+                    block_hashes=hashes[1::2],
+                    block_hashes_by_group=(hashes[1::2], hashes),
+                )
+            )
+        )
+        assert rows == [("sliding", (26, 27), hashes[6:8])]
+        saved = set(rows[0][2])
+        scheduler._tp_shard_client.query_group_membership = lambda _i, keys, _r, _g: [
+            (tuple(index for index, key in enumerate(keys) if key in saved), b"sliding")
+        ]
+        ready = scheduler._attach_sliding_group_queries(
+            request, 0, list(hashes[1::2]), ShardedQueryReady(4, (b"dense",)), "r1"
+        )
+        assert ready.num_hit_blocks == 4
+        assert ready.block_starts_by_group == (0, 6)
+        assert ready.hit_positions_by_group == ((0, 1, 2, 3), (0, 1))
+    finally:
+        worker._registered_layers = []
+        worker.shutdown()
 
 
 @pytest.mark.parametrize("window", [32, 96])

@@ -28,6 +28,7 @@ from .unit_stubs import install_connector_unit_stubs
 install_connector_unit_stubs()
 
 from pegaflow.connector.common import (  # noqa: E402
+    CacheGroupLayout,
     ConnectorContext,
     PegaWorkerMetadata,
     RecurrentLoadHold,
@@ -144,6 +145,66 @@ def test_boundary_offloads_become_pinned_recurrent_saves():
     # Released newest-first, and only after the worker reported the job.
     assert pool.freed == [22, 21]
     assert all(block.ref_cnt == 0 for block in pool.blocks)
+    assert not scheduler.has_pending_push_work()
+
+
+def test_sliding_window_sources_stay_pinned_per_job_until_all_workers_finish():
+    scheduler, pool = _make_scheduler(world_size=2)
+    scheduler._cache_groups = CacheGroupLayout(
+        layer_names=(("full",), ("sliding",)),
+        hash_group_index=0,
+        has_recurrent_state=False,
+        recurrent_group_indices=frozenset(),
+        recurrent_layer_names=frozenset(),
+        sliding_window_group_indices=frozenset({1}),
+        group_sliding_windows=(None, 32),
+        group_block_sizes=(16, 16),
+        layer_block_sizes=((("full", 16),), (("sliding", 16),)),
+    )
+    _register_request(scheduler, "r1", 2)
+    for block_id in (10, 11, 21, 22, 23):
+        pool.blocks[block_id].ref_cnt = 1
+    scheduler._scheduled_tokens["r1"] = 0
+    output = _scheduler_output({})
+    output.scheduled_new_reqs = [
+        SimpleNamespace(req_id="r1", block_ids=([10, 11], [21, 22]), num_computed_tokens=0)
+    ]
+    output.num_scheduled_tokens = {"r1": 32}
+    metadata = scheduler.build_connector_meta(output)
+    first = metadata.save_intents["r1"]
+    assert first.gpu_pin_job_id == 0
+    assert pool.touched == [21, 22]
+
+    # A later job for the same request must survive an older job's completion.
+    later = {"r1": SaveIntent(((0, 10, 11), (0, 22, 23)), (b"h0", b"h1", b"h2"))}
+    scheduler._pin_sliding_save_intents(later)
+    assert later["r1"].gpu_pin_job_id == 1
+    assert pool.blocks[0].ref_cnt == 0
+    pool.free_blocks(pool.blocks[i] for i in (21, 22, 23))
+    assert [pool.blocks[i].ref_cnt for i in (21, 22, 23)] == [1, 2, 1]
+
+    # Neither request completion nor a single TP worker releases the pins.
+    scheduler.update_connector_output(
+        SimpleNamespace(
+            finished_sending={"r1"},
+            kv_connector_worker_meta=PegaWorkerMetadata(completed_boundary_jobs={0: 1}),
+        )
+    )
+    assert [pool.blocks[i].ref_cnt for i in (21, 22, 23)] == [1, 2, 1]
+    scheduler.update_connector_output(
+        SimpleNamespace(
+            finished_sending=None,
+            kv_connector_worker_meta=PegaWorkerMetadata(completed_boundary_jobs={0: 1}),
+        )
+    )
+    assert [pool.blocks[i].ref_cnt for i in (21, 22, 23)] == [0, 1, 1]
+    assert scheduler.has_pending_push_work()
+    completed = PegaWorkerMetadata(completed_boundary_jobs={1: 1})
+    completed.aggregate(PegaWorkerMetadata(completed_boundary_jobs={1: 1}))
+    scheduler.update_connector_output(
+        SimpleNamespace(finished_sending=None, kv_connector_worker_meta=completed)
+    )
+    assert [pool.blocks[i].ref_cnt for i in (21, 22, 23)] == [0, 0, 0]
     assert not scheduler.has_pending_push_work()
 
 

@@ -238,7 +238,8 @@ class SchedulerConnector:
         # own block lifetime (align-mode tables free superseded state blocks
         # one step later, and a request may finish or be preempted first).
         self._next_boundary_job_id = 0
-        # job id -> (pinned GPU block ids, workers yet to report)
+        # Shared by recurrent boundary saves and sliding-window source pins:
+        # job id -> (pinned GPU block ids, workers yet to report).
         self._pinned_boundary_jobs: dict[int, tuple[list[int], int]] = {}
         # req id -> (group index, hash index) already handed off
         self._saved_boundaries: dict[str, set[tuple[int, int]]] = {}
@@ -788,6 +789,7 @@ class SchedulerConnector:
         self._pending_saves.update(save_intents.keys())
 
         boundary_save_intents = self._consume_boundary_state_offloads(scheduler_output)
+        self._pin_sliding_save_intents(save_intents)
 
         logger.debug(
             "[PegaKVConnector] build_connector_meta: %d loads, %d saves, %d boundary saves",
@@ -802,6 +804,30 @@ class SchedulerConnector:
             boundary_save_intents=boundary_save_intents,
             preempted_req_ids=scheduler_output.preempted_req_ids or None,
         )
+
+    def _pin_sliding_save_intents(self, intents: dict[str, SaveIntent]) -> None:
+        sliding = getattr(self._cache_groups, "sliding_window_group_indices", ())
+        if not sliding or not intents:
+            return
+        pool = self._gpu_block_pool
+        if pool is None:
+            raise RuntimeError("GPU block pool was not bound before a sliding-window save")
+        for req_id, intent in intents.items():
+            pinned = list(
+                dict.fromkeys(
+                    block_id
+                    for group_index in sorted(sliding)
+                    for block_id in intent.block_ids_by_group[group_index]
+                    if block_id != 0
+                )
+            )
+            if not pinned:
+                continue
+            job_id = self._next_boundary_job_id
+            self._next_boundary_job_id += 1
+            pool.touch([pool.blocks[block_id] for block_id in pinned])
+            self._pinned_boundary_jobs[job_id] = (pinned, self._ctx.world_size)
+            intents[req_id] = replace(intent, gpu_pin_job_id=job_id)
 
     def _consume_boundary_state_offloads(
         self, scheduler_output: "SchedulerOutput"
@@ -917,7 +943,7 @@ class SchedulerConnector:
             pool.free_blocks(pool.blocks[block_id] for block_id in reversed(block_ids))
 
     def has_pending_push_work(self) -> bool:
-        """Keep the engine stepping while boundary saves still pin blocks.
+        """Keep the engine stepping while GPU save jobs still pin blocks.
 
         Completions only reach the scheduler as worker metadata on a step; an
         engine that quiesced with jobs in flight would hold those references

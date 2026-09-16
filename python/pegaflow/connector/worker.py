@@ -48,7 +48,7 @@ if _LOAD_TIMEOUT_RAW < _LOAD_TIMEOUT_FLOOR_SECONDS:
 class SaveTask:
     metadata: PegaConnectorMetadata
     request_ids: list[str]
-    # HMA boundary-state jobs carried by this task; reported back to the
+    # Pinned GPU save jobs carried by this task; reported back to the
     # scheduler through PegaWorkerMetadata once the batch is done.
     boundary_job_ids: list[int] = field(default_factory=list)
 
@@ -249,7 +249,7 @@ class WorkerConnector:
         self._load_completion_lock = threading.Lock()
 
         # Failure surface for vLLM's get_block_ids_with_load_errors / get_finished.
-        # Populated when start_load_kv fails or when an in-flight
+        # Populated when start_load_kv fails synchronously or when an in-flight
         # load times out waiting for the server. Drained once per get_finished
         # and get_block_ids_with_load_errors call.
         self._failed_load_block_ids: set[int] = set()
@@ -812,7 +812,7 @@ class WorkerConnector:
         """Return block IDs whose load failed since the last call, then clear.
 
         vLLM calls this each forward pass and re-schedules reported blocks for
-        local recomputation. Failures may come from RPC errors in
+        local recomputation. Failures may come from synchronous RPC errors in
         start_load_kv or from in-flight load timeouts detected in get_finished.
         """
         with self._load_completion_lock:
@@ -826,7 +826,7 @@ class WorkerConnector:
         block_ids: list[int],
         start_time: float,
     ) -> None:
-        """Record a load RPC failure for later reporting to vLLM."""
+        """Record a synchronous load RPC failure for later reporting to vLLM."""
         duration = time.perf_counter() - start_time
         with self._load_completion_lock:
             self._failed_load_reqs.update(request_ids)
@@ -854,8 +854,8 @@ class WorkerConnector:
 
         # Both kinds of save read blocks that stay allocated until this worker
         # reports completion: request blocks are held by request_finished /
-        # handle_preemptions, boundary-state blocks are pinned by the
-        # scheduler until the job id comes back in PegaWorkerMetadata. So
+        # handle_preemptions, sliding and recurrent boundary blocks are pinned
+        # by the scheduler until the job id comes back in PegaWorkerMetadata. So
         # every save can run asynchronously behind the forward pass.
         if metadata.save_intents:
             self._save_queue.put(self._make_save_task(metadata.save_intents))
@@ -899,6 +899,11 @@ class WorkerConnector:
         return SaveTask(
             metadata=PegaConnectorMetadata(save_intents=save_intents),
             request_ids=request_ids,
+            boundary_job_ids=[
+                intent.gpu_pin_job_id
+                for intent in save_intents.values()
+                if intent.gpu_pin_job_id is not None
+            ],
         )
 
     def _save_worker(self) -> None:
@@ -1070,7 +1075,7 @@ class WorkerConnector:
             non_null = tuple(
                 (block_id, block_hash)
                 for block_id, block_hash in zip(block_ids, block_hashes, strict=True)
-                if block_id is not None and block_id != 0
+                if block_id != 0
             )
             block_ids = tuple(block_id for block_id, _ in non_null)
             block_hashes = tuple(block_hash for _, block_hash in non_null)
