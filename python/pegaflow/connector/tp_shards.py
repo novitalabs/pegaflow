@@ -33,16 +33,18 @@ class TpShardQueryClient:
         block_hashes: list[bytes],
         req_id: str,
         wait_for_full_prefix: bool,
+        direct_gpu: bool = False,
     ) -> ShardedQueryReady | None:
         results: list[QueryReady] = []
         try:
             for client in self._clients:
-                result = client.query_prefetch(
-                    instance_id,
-                    block_hashes,
-                    req_id=req_id,
-                    wait_for_full_prefix=wait_for_full_prefix,
-                )
+                query_kwargs = {
+                    "req_id": req_id,
+                    "wait_for_full_prefix": wait_for_full_prefix,
+                }
+                if direct_gpu:
+                    query_kwargs["direct_gpu"] = True
+                result = client.query_prefetch(instance_id, block_hashes, **query_kwargs)
                 if isinstance(result, QueryLoading):
                     self.release(tuple(ready.lease for ready in results), req_id)
                     return None
@@ -65,12 +67,13 @@ class TpShardQueryClient:
             for index, (client, result) in enumerate(zip(self._clients, results, strict=True)):
                 if result.num_hit_blocks == common_blocks:
                     continue
-                exact = client.query_prefetch(
-                    instance_id,
-                    exact_hashes,
-                    req_id=f"{req_id}:tp-common-{common_blocks}",
-                    wait_for_full_prefix=False,
-                )
+                query_kwargs = {
+                    "req_id": f"{req_id}:tp-common-{common_blocks}",
+                    "wait_for_full_prefix": False,
+                }
+                if direct_gpu:
+                    query_kwargs["direct_gpu"] = True
+                exact = client.query_prefetch(instance_id, exact_hashes, **query_kwargs)
                 if not isinstance(exact, QueryReady):
                     raise RuntimeError(
                         f"TP shard {index} could not lease the common {common_blocks}-block prefix"

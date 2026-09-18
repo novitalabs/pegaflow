@@ -169,11 +169,86 @@ impl RcBackend {
             base_ptr: raw,
             len,
             mrs,
+            owner: None,
         })?;
         debug!(
             "memory registered: ptr={:#x}, len={}, nics={}",
             raw,
             len,
+            self.nic_count()
+        );
+        Ok(())
+    }
+
+    pub(crate) fn register_dma_buf_memory(
+        &self,
+        region: Arc<crate::CudaDmaBuf>,
+        device_id: u8,
+    ) -> Result<()> {
+        let ptr = NonNull::new(region.ptr as *mut u8)
+            .ok_or(TransferError::InvalidArgument("CUDA allocation is null"))?;
+        let len = region.len;
+        if len == 0 {
+            return Err(TransferError::InvalidArgument("len must be non-zero"));
+        }
+
+        // Replacing an allocation's MR would invalidate exchanged rkeys.
+        let raw = ptr.as_ptr() as u64;
+        if self.state.lock().registered.contains_exact(raw, len) {
+            return Err(TransferError::InvalidArgument(
+                "CUDA allocation is already registered",
+            ));
+        }
+
+        let attrs = crate::cuda_lib::rt::cudaPointerGetAttributes(ptr.cast()).map_err(|error| {
+            TransferError::Backend(format!(
+                "CUDA pointer validation failed for device {device_id}: {error}"
+            ))
+        })?;
+        if attrs.type_ != crate::cuda_lib::rt::cudaMemoryTypeDevice {
+            return Err(TransferError::Backend(
+                "direct-GPU registration requires a CUDA device pointer".to_string(),
+            ));
+        }
+        if attrs.device != i32::from(device_id) {
+            return Err(TransferError::Backend(format!(
+                "CUDA pointer belongs to device {}, requested device {device_id}",
+                attrs.device
+            )));
+        }
+
+        let mut mrs = Vec::with_capacity(self.nic_count());
+        for runtime in &self.runtimes {
+            let mr = unsafe {
+                runtime.pd.reg_dmabuf_mr(
+                    0,
+                    len,
+                    raw,
+                    region.fd(),
+                    AccessFlags::LocalWrite | AccessFlags::RemoteWrite | AccessFlags::RemoteRead,
+                )
+            }
+            .map_err(|error| {
+                TransferError::Backend(format!(
+                    "GPUDirect RDMA DMA-BUF registration failed on NIC {}: {error}",
+                    runtime.nic_name
+                ))
+            });
+            mrs.push(mr?);
+        }
+
+        let mut state = self.state.lock();
+        Arc::make_mut(&mut state.registered).insert(RegisteredMemoryEntry {
+            base_ptr: raw,
+            len,
+            mrs,
+            owner: Some(region),
+        })?;
+        info!(
+            "CUDA memory registered for direct RDMA: ptr={:#x}, len={}, device={}, nics={}",
+            raw,
+            len,
+            device_id,
             self.nic_count()
         );
         Ok(())
@@ -505,6 +580,9 @@ impl RcBackend {
                 let bucket = nic.rot.wrapping_add(i) % n;
                 buckets[bucket].push(RdmaOp {
                     local_mr,
+                    _owner: registered
+                        .find_entry(local_ptr, len)
+                        .and_then(|entry| entry.owner.clone()),
                     local_ptr,
                     remote_ptr,
                     len,
@@ -533,7 +611,15 @@ impl RcBackend {
         // --- Submit outside lock ---
         let mut receivers = Vec::with_capacity(nic_work.len());
         for (session, prepared) in nic_work {
-            receivers.push(session.transfer_batch_async(prepared, op)?);
+            match session.transfer_batch_async(prepared, op) {
+                Ok(receiver) => receivers.push(receiver),
+                Err(error) => {
+                    // Return every accepted completion even if a later session rejects submission.
+                    let (tx, rx) = oneshot::channel();
+                    let _ = tx.send(Err(error));
+                    receivers.push(rx);
+                }
+            }
         }
         Ok(receivers)
     }

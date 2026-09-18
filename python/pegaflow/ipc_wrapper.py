@@ -12,6 +12,8 @@ import threading
 
 import torch
 
+from pegaflow.dma_buf import DmaBufExports, receive_dma_buf
+
 
 class CudaIPCWrapper:
     """Wrapper for CUDA IPC handle with tensor metadata.
@@ -98,7 +100,7 @@ class CudaIPCWrapper:
             )
         return device_index
 
-    def __init__(self, tensor: torch.Tensor):
+    def __init__(self, tensor: torch.Tensor, dma_buf_exports: DmaBufExports | None = None):
         """Create IPC wrapper from a CUDA tensor.
 
         Args:
@@ -122,6 +124,25 @@ class CudaIPCWrapper:
         # Store device UUID instead of device index to handle CUDA_VISIBLE_DEVICES
         device_index = tensor.device.index
         self.device_uuid = CudaIPCWrapper._get_device_uuid(device_index)
+
+        self.dma_buf = None
+        if dma_buf_exports is not None:
+            from pegaflow.pegaflow import export_cuda_dma_buf
+
+            with torch.cuda.device(tensor.device):
+                fd, base, allocation_bytes = export_cuda_dma_buf(
+                    storage.data_ptr(), storage.nbytes()
+                )
+            address, token = dma_buf_exports.add(fd)
+            self.dma_buf = (address, token, tensor.data_ptr() - base, allocation_bytes)
+
+    def detach_dma_buf(self) -> tuple[int, int, int] | None:
+        """Transfer an owned FD to the local service during registration."""
+        metadata = getattr(self, "dma_buf", None)
+        if metadata is None:
+            return None
+        address, token, offset, allocation_bytes = metadata
+        return receive_dma_buf(address, token), offset, allocation_bytes
 
     def to_tensor(self) -> torch.Tensor:
         """Reconstruct tensor from IPC handle.

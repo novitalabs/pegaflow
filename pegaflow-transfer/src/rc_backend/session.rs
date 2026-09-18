@@ -36,6 +36,7 @@ const PSN_MASK: u32 = 0x00ff_ffff;
 
 pub(crate) struct RdmaOp {
     pub(crate) local_mr: Arc<MemoryRegion>,
+    pub(crate) _owner: Option<Arc<crate::CudaDmaBuf>>,
     pub(crate) local_ptr: u64,
     pub(crate) remote_ptr: u64,
     pub(crate) len: usize,

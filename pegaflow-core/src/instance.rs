@@ -295,6 +295,9 @@ pub struct GpuContext {
     /// Hybrid-cache storage group id by layer name; absent = group 0.
     layer_groups: HashMap<String, u32>,
 
+    #[cfg(feature = "rdma")]
+    direct_memory: Mutex<Option<crate::storage::DeviceMemoryRegistration>>,
+
     /// CUDA context handle (kept alive for the lifetime of this context).
     _cuda_ctx: Arc<CudaContext>,
 
@@ -335,6 +338,8 @@ impl GpuContext {
             preferred_numa: numa_node,
             kv_caches,
             layer_groups,
+            #[cfg(feature = "rdma")]
+            direct_memory: Mutex::new(None),
             _cuda_ctx: cuda_ctx,
             worker_pool,
         })
@@ -343,6 +348,59 @@ impl GpuContext {
     /// Get the preferred NUMA node for this GPU.
     pub(crate) fn preferred_numa(&self) -> NumaNode {
         self.preferred_numa
+    }
+
+    #[cfg(feature = "rdma")]
+    pub(crate) fn register_direct_memory(
+        &self,
+        storage: &crate::storage::StorageEngine,
+        imported: Option<&[Arc<pegaflow_transfer::CudaDmaBuf>]>,
+    ) -> Result<(), EngineError> {
+        let mut registered = self.direct_memory.lock();
+        if registered.is_some() {
+            return if imported.is_some() {
+                Err(EngineError::InvalidArgument(
+                    "direct GPU memory already registered".into(),
+                ))
+            } else {
+                Ok(())
+            };
+        }
+        self._cuda_ctx
+            .bind_to_thread()
+            .map_err(|error| EngineError::CudaInit(error.to_string()))?;
+        let mut exported = Vec::new();
+        let regions = if let Some(regions) = imported {
+            regions
+        } else {
+            // Native callers own these pointers. IPC callers must supply an owner export.
+            for layout in self.kv_caches.values() {
+                let (ptr, len) = layout.device_region();
+                let (fd, base, size) = pegaflow_transfer::export_cuda_dma_buf(ptr, len)
+                    .map_err(|error| EngineError::Storage(error.to_string()))?;
+                exported.push(Arc::new(
+                    pegaflow_transfer::CudaDmaBuf::from_import(base, size, fd, Arc::new(()))
+                        .map_err(|error| EngineError::Storage(error.to_string()))?,
+                ));
+            }
+            &exported
+        };
+        for layout in self.kv_caches.values() {
+            let (ptr, len) = layout.device_region();
+            if !regions.iter().any(|region| {
+                ptr >= region.ptr && ptr + len as u64 <= region.ptr + region.len as u64
+            }) {
+                return Err(EngineError::InvalidArgument(
+                    "DMA-BUF exports do not cover every KV layer".into(),
+                ));
+            }
+        }
+        *registered = Some(
+            storage
+                .register_device_memory(self.device_id, regions)
+                .map_err(EngineError::Storage)?,
+        );
+        Ok(())
     }
 
     /// CUDA device ID represented by this shard.
@@ -719,6 +777,11 @@ impl InstanceContext {
     pub(crate) fn get_gpu(&self, device_id: i32) -> Option<Arc<GpuContext>> {
         let state = self.state.lock();
         state.gpu_contexts.get(&device_id).cloned()
+    }
+
+    #[cfg(feature = "rdma")]
+    pub(crate) fn page_first(&self) -> bool {
+        self.page_first
     }
 
     /// Get a GPU context and verify it belongs to the requested save group.

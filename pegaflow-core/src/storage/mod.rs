@@ -13,13 +13,19 @@ use std::time::Duration;
 
 use crate::backing::{AllocateFn, DEFAULT_MAX_PREFETCH_BLOCKS, SsdBackingStore, SsdCacheConfig};
 #[cfg(feature = "rdma")]
-use crate::backing::{RdmaFetchStore, RdmaTransport};
+use crate::backing::{
+    DirectFetchPlan, DirectQueryPlan, GpuReadTarget, RdmaFetchStore, RdmaTransport,
+};
 use crate::block::{BlockKey, PrefetchStatus, SealedBlock};
 use crate::internode::MetaServerClient;
 use crate::internode::metaserver_client::MetaServerClientConfig;
 use crate::metrics::core_metrics;
 use crate::pinned_pool::{PinnedAllocation, PinnedAllocator};
 use pegaflow_common::NumaNode;
+#[cfg(feature = "rdma")]
+use pegaflow_transfer::CudaDmaBuf;
+#[cfg(feature = "rdma")]
+use std::ptr::NonNull;
 
 use prefetch::PrefetchScheduler;
 #[cfg(feature = "rdma")]
@@ -99,6 +105,8 @@ pub(crate) struct StorageEngine {
     ssd_store: Option<Arc<SsdBackingStore>>,
     #[cfg(feature = "rdma")]
     rdma_transport: Option<Arc<RdmaTransport>>,
+    #[cfg(feature = "rdma")]
+    rdma_fetch: Option<Arc<RdmaFetchStore>>,
     blockwise_alloc: bool,
     metaserver_client: Option<Arc<MetaServerClient>>,
     transfer_lock: Arc<transfer_lock::TransferLockManager>,
@@ -219,19 +227,21 @@ impl StorageEngine {
                     .advertise_addr
                     .clone()
                     .unwrap_or_else(|| "127.0.0.1:50055".to_string());
-                Some(RdmaFetch::new(Arc::new(RdmaFetchStore::new(
+                Some(Arc::new(RdmaFetchStore::new(
                     Arc::clone(ms),
                     Arc::clone(rdma),
                     allocate_fn.clone(),
                     advertise,
-                ))))
+                )))
             });
+            #[cfg(feature = "rdma")]
+            let rdma_fetch_for_prefetch = rdma_fetch.clone().map(RdmaFetch::new);
             #[cfg(not(feature = "rdma"))]
-            let rdma_fetch = None;
+            let rdma_fetch_for_prefetch = None;
 
             let prefetch = PrefetchScheduler::new(
                 ssd_store.clone(),
-                rdma_fetch,
+                rdma_fetch_for_prefetch,
                 metaserver_client.clone(),
                 max_prefetch_blocks,
             );
@@ -248,6 +258,8 @@ impl StorageEngine {
                 ssd_store,
                 #[cfg(feature = "rdma")]
                 rdma_transport,
+                #[cfg(feature = "rdma")]
+                rdma_fetch,
                 blockwise_alloc,
                 metaserver_client,
                 transfer_lock,
@@ -479,6 +491,65 @@ impl StorageEngine {
             .await
     }
 
+    #[cfg(feature = "rdma")]
+    pub(crate) async fn query_direct_plan(
+        &self,
+        namespace: &str,
+        hashes: &[Vec<u8>],
+    ) -> Option<DirectQueryPlan> {
+        if hashes.is_empty() {
+            return None;
+        }
+        let keys: Vec<BlockKey> = hashes
+            .iter()
+            .map(|hash| BlockKey::new(namespace.to_string(), hash.clone()))
+            .collect();
+        let (local_count, local_blocks) = self.read_cache.get_prefix_blocks(&keys);
+        let remote = if local_count < hashes.len() {
+            match self.rdma_fetch.as_ref() {
+                Some(fetch) => {
+                    fetch
+                        .query_direct_plan(namespace, &hashes[local_count..])
+                        .await
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let remote_count = remote.as_ref().map_or(0, DirectFetchPlan::block_count);
+        if local_count == 0 && remote_count == 0 {
+            return None;
+        }
+        Some(DirectQueryPlan {
+            local_blocks,
+            remote,
+        })
+    }
+
+    #[cfg(feature = "rdma")]
+    pub(crate) async fn direct_load(
+        &self,
+        plan: &DirectFetchPlan,
+        req_id: &str,
+        targets: &[GpuReadTarget],
+        device_id: i32,
+    ) -> Result<(), String> {
+        let fetch = self
+            .rdma_fetch
+            .as_ref()
+            .ok_or_else(|| "direct GPU RDMA is not configured".to_string())?;
+        fetch
+            .fetch_plan_to_gpu(
+                plan,
+                req_id,
+                targets,
+                device_id,
+                self.transfer_lock_timeout(),
+            )
+            .await
+    }
+
     fn reclaim_until_allocator_can_allocate(
         &self,
         required_bytes: u64,
@@ -627,9 +698,56 @@ impl StorageEngine {
         self.rdma_transport.as_ref()
     }
 
+    /// Register owner-exported allocations transactionally on every NIC.
+    #[cfg(feature = "rdma")]
+    pub(crate) fn register_device_memory(
+        &self,
+        device_id: i32,
+        regions: &[Arc<CudaDmaBuf>],
+    ) -> Result<DeviceMemoryRegistration, String> {
+        let transport = self
+            .rdma_transport
+            .as_ref()
+            .ok_or_else(|| "direct-GPU registration requires RDMA transport".to_string())?;
+        if device_id < 0 || device_id > u8::MAX as i32 {
+            return Err(format!("CUDA device id {device_id} is out of range"));
+        }
+        let mut allocations = regions.to_vec();
+        allocations.sort_unstable_by_key(|region| (region.ptr, region.len));
+        allocations.dedup_by_key(|region| (region.ptr, region.len));
+        transport
+            .engine()
+            .register_dma_buf_memory(&allocations, device_id as u8)
+            .map_err(|error| error.to_string())?;
+        Ok(DeviceMemoryRegistration {
+            transport: Arc::clone(transport),
+            ptrs: allocations.iter().map(|region| region.ptr).collect(),
+        })
+    }
+
     pub(crate) async fn shutdown_metaserver_client(&self) {
         if let Some(client) = &self.metaserver_client {
             client.shutdown().await;
+        }
+    }
+}
+
+#[cfg(feature = "rdma")]
+pub(crate) struct DeviceMemoryRegistration {
+    transport: Arc<RdmaTransport>,
+    ptrs: Vec<u64>,
+}
+
+#[cfg(feature = "rdma")]
+impl Drop for DeviceMemoryRegistration {
+    fn drop(&mut self) {
+        let ptrs: Vec<_> = self
+            .ptrs
+            .iter()
+            .filter_map(|&ptr| NonNull::new(ptr as *mut u8))
+            .collect();
+        if let Err(error) = self.transport.engine().unregister_memory(&ptrs) {
+            log::error!("Failed to unregister CUDA RDMA memory: {error}");
         }
     }
 }

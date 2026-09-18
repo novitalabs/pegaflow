@@ -63,3 +63,14 @@ pub fn cu_get_dma_buf_fd(ptr: NonNull<c_void>, len: usize) -> Result<i32> {
         ))
     }
 }
+
+pub fn cu_get_address_range(ptr: u64) -> Result<(u64, usize)> {
+    let mut base = 0;
+    let mut len = 0;
+    let ret = unsafe { cuda_sys::cuMemGetAddressRange_v2(&mut base, &mut len, ptr) };
+    if ret == cuda_sys::cudaError_enum::CUDA_SUCCESS {
+        Ok((base, len))
+    } else {
+        Err(CudaDriverError::new(ret as u32, "cuMemGetAddressRange"))
+    }
+}

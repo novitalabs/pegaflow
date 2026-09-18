@@ -121,6 +121,30 @@ impl TransferEngine {
         Ok(())
     }
 
+    /// Register allocation-owner exports received over a local FD channel.
+    pub fn register_dma_buf_memory(
+        &self,
+        regions: &[std::sync::Arc<crate::CudaDmaBuf>],
+        device_id: u8,
+    ) -> Result<()> {
+        let mut registered = Vec::with_capacity(regions.len());
+        for region in regions {
+            let ptr = NonNull::new(region.ptr as *mut u8)
+                .ok_or(TransferError::InvalidArgument("CUDA allocation is null"))?;
+            match self
+                .backend
+                .register_dma_buf_memory(region.clone(), device_id)
+            {
+                Ok(()) => registered.push(ptr),
+                Err(error) => {
+                    let _ = self.unregister_memory(&registered);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn unregister_memory(&self, ptrs: &[NonNull<u8>]) -> Result<()> {
         for &ptr in ptrs {
             self.backend.unregister_memory(ptr)?;
