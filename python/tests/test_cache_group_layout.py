@@ -12,6 +12,7 @@ install_connector_unit_stubs()
 
 from vllm.v1.kv_cache_interface import (  # noqa: E402
     FullAttentionSpec,
+    KpoolTailSpec,
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowSpec,
@@ -173,8 +174,42 @@ def test_rejects_full_attention_with_sliding_window():
         _group("sliding_window", sliding_window),
     )
 
-    with pytest.raises(RuntimeError, match="only FullAttention and Mamba"):
+    with pytest.raises(RuntimeError, match="kpool-tail scratch cache groups"):
         CacheGroupLayout.from_config(config)
+
+
+def test_accepts_glm53_flash_layout_with_kpool_tail_scratch():
+    """GLM-5.3-Flash: uniform MLA + uniform KpoolTail scratch + mamba groups.
+
+    The kpool tail group has its own tiny block size and holds no prefix
+    state, so it is classified scratch: excluded from hashing, from the
+    block-size uniformity check, and from save/load.
+    """
+    tail_spec = UniformTypeKVCacheSpecs(
+        block_size=4,
+        kv_cache_specs={"tail.0": KpoolTailSpec(), "tail.1": KpoolTailSpec()},
+    )
+    config = _config(
+        SimpleNamespace(
+            layer_names=("attn.0", "idx.0"),
+            kv_cache_spec=UniformTypeKVCacheSpecs(
+                block_size=8960,
+                kv_cache_specs={"attn.0": _mla(block_size=8960), "idx.0": _mla(block_size=8960)},
+            ),
+        ),
+        SimpleNamespace(layer_names=("tail.0", "tail.1"), kv_cache_spec=tail_spec),
+        _group("recurrent.0", _mamba(block_size=8960)),
+        _group("recurrent.1", _mamba(block_size=8960)),
+    )
+
+    layout = CacheGroupLayout.from_config(config)
+
+    assert layout.hash_group_index == 0
+    assert layout.has_recurrent_state
+    assert layout.recurrent_group_indices == frozenset({2, 3})
+    assert layout.scratch_group_indices == frozenset({1})
+    assert layout.scratch_layer_names == frozenset({"tail.0", "tail.1"})
+    assert layout.storage_group_ids == (0, 0, 1, 2)
 
 
 def test_accepts_mla_with_mamba():

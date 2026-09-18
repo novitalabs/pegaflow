@@ -72,6 +72,7 @@ def _infer_kv_cache_registration(
     *,
     is_mla: bool = False,
     is_recurrent_state: bool = False,
+    tokens_per_state: int = 1,
 ) -> _KVCacheRegistrationInfo:
     """Infer the PegaFlow registration from a vLLM KV cache tensor.
 
@@ -81,6 +82,9 @@ def _infer_kv_cache_registration(
     128-token blocks. PegaFlow stores hashes at scheduler-block granularity, so
     each registered PegaFlow block must cover all physical rows for that logical
     block.
+
+    ``tokens_per_state`` converts the tensor's row (state) units into tokens:
+    kpool-compressed indexer caches store one state per several tokens.
     """
     shape = tuple(kv_cache.shape)
     stride = tuple(kv_cache.stride())
@@ -128,21 +132,25 @@ def _infer_kv_cache_registration(
         physical_block_size = shape[1]
     else:
         physical_block_size = logical_block_size
+    # Rows may be compressed states covering several tokens each (kpool
+    # indexer caches); compare against the logical block in token units.
+    physical_block_tokens = physical_block_size * max(1, tokens_per_state)
     physical_bytes_per_block = stride[0] * element_size
     kv_stride_bytes = 0
     segments = 1
 
     if physical_num_blocks <= 0:
         raise ValueError(f"physical block count must be > 0, got {physical_num_blocks}")
-    if physical_block_size <= 0:
+    if physical_block_tokens <= 0:
         raise ValueError(f"physical block size must be > 0, got {physical_block_size}")
-    if logical_block_size % physical_block_size != 0:
+    if logical_block_size % physical_block_tokens != 0:
         raise ValueError(
-            "logical block size must be a multiple of physical block size "
-            f"(logical={logical_block_size}, physical={physical_block_size})"
+            "logical block size must be a multiple of physical block tokens "
+            f"(logical={logical_block_size}, "
+            f"physical={physical_block_size}x{tokens_per_state})"
         )
 
-    physical_blocks_per_logical_block = logical_block_size // physical_block_size
+    physical_blocks_per_logical_block = logical_block_size // physical_block_tokens
     if physical_num_blocks % physical_blocks_per_logical_block != 0:
         raise ValueError(
             "physical block count must be divisible by physical/logical split ratio "
@@ -191,6 +199,28 @@ def _registration_tensor(kv_cache) -> torch.Tensor:
     return first
 
 
+def _layer_tokens_per_state(kv_cache_config) -> dict[str, int]:
+    """Tokens covered by one cache row (state) for each layer.
+
+    Kpool-compressed indexer caches store one state per ``tokens_per_state``
+    tokens, so a physical kernel block of N rows spans N * tokens_per_state
+    tokens — the registration split ratio must use token units.
+    """
+    result: dict[str, int] = {}
+    groups = tuple(getattr(kv_cache_config, "kv_cache_groups", ()) or ())
+    for group in groups:
+        spec = group.kv_cache_spec
+        inner = getattr(spec, "kv_cache_specs", None)
+        if inner:
+            for name, layer_spec in inner.items():
+                result[name] = max(1, getattr(layer_spec, "tokens_per_state", 1) or 1)
+        else:
+            tokens_per_state = max(1, getattr(spec, "tokens_per_state", 1) or 1)
+            for name in group.layer_names:
+                result[name] = tokens_per_state
+    return result
+
+
 class WorkerConnector:
     """Holds worker-only state and behaviors."""
 
@@ -211,6 +241,7 @@ class WorkerConnector:
         self._kv_cache_config = kv_cache_config
         self._cache_groups = CacheGroupLayout.from_config(kv_cache_config)
         self._layer_to_group = self._cache_groups.layer_to_group()
+        self._layer_tokens_per_state = _layer_tokens_per_state(kv_cache_config)
         additional_config = getattr(vllm_config, "additional_config", {}) or {}
         self._use_mla_layer_split_registration = context.is_mla and bool(
             additional_config.get("mla_layer_split_kv_cache", False)
@@ -311,6 +342,15 @@ class WorkerConnector:
                 )
 
             kv_caches = {layer_name: kv_caches[layer_name] for layer_name in layer_names}
+
+        scratch_layer_names = self._cache_groups.scratch_layer_names
+        if scratch_layer_names:
+            # Circular scratch caches (kpool tails) are repopulated by the
+            # recompute that follows every load; they hold no prefix state and
+            # are neither registered nor transferred.
+            kv_caches = {
+                name: cache for name, cache in kv_caches.items() if name not in scratch_layer_names
+            }
         if not kv_caches:
             raise RuntimeError("No KV cache layers were selected for registration")
 
@@ -365,6 +405,7 @@ class WorkerConnector:
                 self._ctx.block_size,
                 is_mla=self._ctx.is_mla,
                 is_recurrent_state=is_recurrent_state,
+                tokens_per_state=self._layer_tokens_per_state.get(layer_name, 1),
             )
             layout = registration.layout
 

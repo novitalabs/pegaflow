@@ -991,12 +991,16 @@ class SchedulerConnector:
         # here is neither complete nor trustworthy. Their states are saved
         # exactly from vLLM's boundary hand-offs instead
         # (`_consume_boundary_state_offloads`); attention groups keep the
-        # dense per-block cadence.
-        recurrent = self._cache_groups.recurrent_group_indices
+        # dense per-block cadence. Scratch groups (kpool tails) hold one
+        # circular block per request, so their mirror length would clamp
+        # `saveable_block_idx` — they are never saved either.
+        non_positional = (
+            self._cache_groups.recurrent_group_indices | self._cache_groups.scratch_group_indices
+        )
         attention_lengths = [
             len(group)
             for group_index, group in enumerate(allocated)
-            if group_index not in recurrent
+            if group_index not in non_positional
         ]
 
         # _allocated_blocks tracks request block IDs in global request order.
@@ -1020,7 +1024,7 @@ class SchedulerConnector:
         save_hashes = block_hashes[hash_start : hash_start + new_blocks]
         save_block_ids_by_group = tuple(
             (0,) * new_blocks
-            if group_index in recurrent
+            if group_index in non_positional
             else tuple(group[hash_start : hash_start + new_blocks])
             for group_index, group in enumerate(allocated)
         )
@@ -1070,7 +1074,12 @@ class SchedulerConnector:
         past `num_load_blocks` get `None` targets and are skipped.
         """
         end_block_idx = start_block_idx + num_load_blocks
-        available = [len(group) for group in block_ids_by_group]
+        scratch = self._cache_groups.scratch_group_indices
+        available = [
+            len(group)
+            for group_index, group in enumerate(block_ids_by_group)
+            if group_index not in scratch
+        ]
         if any(length < end_block_idx for length in available):
             raise RuntimeError(
                 f"load block mismatch: start={start_block_idx} count={num_load_blocks} "
@@ -1087,9 +1096,14 @@ class SchedulerConnector:
 
         result: list[tuple[int | None, ...]] = []
         for group_index, block_ids in enumerate(block_ids_by_group):
-            destinations: tuple[int | None, ...] = block_ids[start_block_idx:end_block_idx]
-            if group_index in self._cache_groups.recurrent_group_indices and destinations:
-                destinations = (None,) * (len(destinations) - 1) + (destinations[-1],)
+            if group_index in scratch:
+                # Circular scratch blocks hold no prefix state; never a load
+                # destination.
+                destinations: tuple[int | None, ...] = (None,) * num_load_blocks
+            else:
+                destinations = block_ids[start_block_idx:end_block_idx]
+                if group_index in self._cache_groups.recurrent_group_indices and destinations:
+                    destinations = (None,) * (len(destinations) - 1) + (destinations[-1],)
             result.append(destinations + padding)
         return tuple(result)
 
