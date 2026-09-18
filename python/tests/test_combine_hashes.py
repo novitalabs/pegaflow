@@ -68,6 +68,7 @@ def _make_recurrent_scheduler():
         hash_group_index=0,
         has_recurrent_state=True,
         recurrent_group_indices=frozenset({1}),
+        scratch_group_indices=frozenset(),
     )
     scheduler._block_hashes["r1"] = (_hash(0), _hash(1))
     scheduler._allocated_blocks["r1"] = [[11, 12], [21, 22]]

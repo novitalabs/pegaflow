@@ -156,6 +156,25 @@ def test_non_mla_cross_layer_layout_uses_legacy_block_stride():
     assert info.physical_blocks_per_logical_block == 1
 
 
+def test_kpool_indexer_cache_uses_tokens_per_state():
+    # GLM-5.3-Flash indexer K cache: 64-state kernel blocks, one state per
+    # 4 tokens, so one 8960-token logical block spans 35 physical blocks.
+    info = _infer_kv_cache_registration(
+        FakeTensor(
+            shape=(17885, 64, 128),
+            stride=(64 * 128, 128, 1),
+            element_size=1,
+        ),
+        logical_block_size=8960,
+        is_mla=True,
+        tokens_per_state=4,
+    )
+
+    assert info.num_blocks == 511
+    assert info.bytes_per_block == 35 * 64 * 128
+    assert info.physical_blocks_per_logical_block == 35
+
+
 def test_logical_block_size_must_be_multiple_of_physical_block_size():
     with pytest.raises(ValueError, match="logical block size"):
         _infer_kv_cache_registration(

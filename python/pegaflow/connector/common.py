@@ -318,6 +318,13 @@ class CacheGroupLayout:
     hybrid storage groups: every attention-like group shares storage group 0
     (prefix cadence, raw hash keys), while each recurrent group gets its own
     id starting at 1 (membership semantics, group-encoded keys).
+
+    `scratch_group_indices` are per-request circular scratch groups (vLLM
+    `KpoolTailSpec`, e.g. the GLM-5.3 sparse-attention indexer tail). They
+    are not prefix-cacheable and hold no state at pool-aligned hit
+    boundaries, so they are never registered, saved, or loaded — but they
+    stay in `layer_names` to keep connector group indices aligned with
+    vLLM's group order.
     """
 
     layer_names: tuple[tuple[str, ...], ...]
@@ -326,6 +333,8 @@ class CacheGroupLayout:
     recurrent_group_indices: frozenset[int]
     recurrent_layer_names: frozenset[str]
     storage_group_ids: tuple[int, ...] = (0,)
+    scratch_group_indices: frozenset[int] = frozenset()
+    scratch_layer_names: frozenset[str] = frozenset()
 
     @classmethod
     def from_config(cls, kv_cache_config) -> "CacheGroupLayout":
@@ -346,30 +355,64 @@ class CacheGroupLayout:
             UniformTypeKVCacheSpecs,
         )
 
-        specs = tuple(group.kv_cache_spec for group in groups)
-        if len(specs) == 1:
-            spec = specs[0]
-            is_uniform_mla = (
+        try:
+            from vllm.v1.kv_cache_interface import KpoolTailSpec
+        except ImportError:
+            KpoolTailSpec = None
+
+        def is_uniform_of(spec, kind) -> bool:
+            return (
                 type(spec) is UniformTypeKVCacheSpecs
                 and bool(spec.kv_cache_specs)
-                and all(
-                    type(layer_spec) is MLAAttentionSpec
-                    for layer_spec in spec.kv_cache_specs.values()
-                )
+                and all(type(s) is kind for s in spec.kv_cache_specs.values())
             )
+
+        specs = tuple(group.kv_cache_spec for group in groups)
+        scratch_group_indices = frozenset(
+            index
+            for index, spec in enumerate(specs)
+            if KpoolTailSpec is not None
+            and (type(spec) is KpoolTailSpec or is_uniform_of(spec, KpoolTailSpec))
+        )
+
+        # vLLM wraps sparse-MLA layers in UniformTypeKVCacheSpecs, a direct
+        # KVCacheSpec subclass; unwrap uniformly grouped MLA layers to their
+        # per-layer spec so the attention checks below recognize them.
+        def settled(spec):
+            if is_uniform_of(spec, MLAAttentionSpec):
+                return spec.first_spec
+            return spec
+
+        attention_types = (FullAttentionSpec, MLAAttentionSpec)
+        if len(specs) == 1:
+            spec = specs[0]
+            is_uniform_mla = is_uniform_of(spec, MLAAttentionSpec)
             if type(spec) not in (FullAttentionSpec, MLAAttentionSpec) and not is_uniform_mla:
                 raise RuntimeError(
                     "PegaFlow supports a single cache group only for FullAttention, MLA, "
                     "or uniformly grouped MLA layers"
                 )
         else:
-            if any(not isinstance(spec, (FullAttentionSpec, MambaSpec)) for spec in specs):
+            settled_specs = tuple(
+                settled(spec) if index not in scratch_group_indices else spec
+                for index, spec in enumerate(specs)
+            )
+            if any(
+                index not in scratch_group_indices
+                and not isinstance(spec, attention_types + (MambaSpec,))
+                for index, spec in enumerate(settled_specs)
+            ):
                 raise RuntimeError(
-                    "PegaFlow HMA supports only FullAttention and Mamba cache groups"
+                    "PegaFlow HMA supports only FullAttention, MLA, Mamba, and "
+                    "kpool-tail scratch cache groups; got "
+                    f"{[type(s).__name__ for s in specs]}"
                 )
 
-            has_full_attention = any(isinstance(spec, FullAttentionSpec) for spec in specs)
-            has_mamba = any(isinstance(spec, MambaSpec) for spec in specs)
+            has_full_attention = any(
+                index not in scratch_group_indices and isinstance(spec, attention_types)
+                for index, spec in enumerate(settled_specs)
+            )
+            has_mamba = any(isinstance(spec, MambaSpec) for spec in settled_specs)
             if not has_full_attention:
                 raise RuntimeError(
                     "PegaFlow requires a dense FullAttention cache group for block hashes"
@@ -383,8 +426,12 @@ class CacheGroupLayout:
             ):
                 raise RuntimeError("PegaFlow HMA requires mamba_cache_mode='align'")
 
-        block_sizes = {group.kv_cache_spec.block_size for group in groups}
-        if len(groups) > 1 and len(block_sizes) != 1:
+        block_sizes = {
+            group.kv_cache_spec.block_size
+            for index, group in enumerate(groups)
+            if index not in scratch_group_indices
+        }
+        if len(block_sizes) > 1:
             raise RuntimeError(
                 "PegaFlow HMA requires cache groups with identical logical block sizes"
             )
@@ -395,8 +442,9 @@ class CacheGroupLayout:
             else next(
                 (
                     index
-                    for index, group in enumerate(groups)
-                    if isinstance(group.kv_cache_spec, FullAttentionSpec)
+                    for index, spec in enumerate(specs)
+                    if index not in scratch_group_indices
+                    and isinstance(settled(spec), attention_types)
                 ),
                 None,
             )
@@ -434,6 +482,13 @@ class CacheGroupLayout:
                 for layer_name in group.layer_names
             ),
             storage_group_ids=storage_group_ids,
+            scratch_group_indices=scratch_group_indices,
+            scratch_layer_names=frozenset(
+                layer_name
+                for index, group in enumerate(groups)
+                if index in scratch_group_indices
+                for layer_name in group.layer_names
+            ),
         )
 
     @property
