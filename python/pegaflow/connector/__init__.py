@@ -17,6 +17,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.distributed.parallel_state import get_pp_group, get_tensor_model_parallel_rank
 
 from pegaflow.connector.common import (
+    CacheGroupLayout,
     ConnectorContext,
     PegaConnectorMetadata,
     PegaConnectorMode,
@@ -45,7 +46,14 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
         tp_size = vllm_config.parallel_config.tensor_parallel_size
         world_size = vllm_config.parallel_config.world_size
         is_mla = detect_mla(vllm_config)
+        hybrid_kv_enabled = not bool(
+            getattr(vllm_config.scheduler_config, "disable_hybrid_kv_cache_manager", False)
+        )
         cache_groups = tuple(getattr(kv_cache_config, "kv_cache_groups", ()) or ())
+        cache_group_layout = CacheGroupLayout.from_config(
+            kv_cache_config,
+            allow_sliding_window=hybrid_kv_enabled,
+        )
         collapse_mla_tp = is_mla and len(cache_groups) <= 1
         dcp_world_size = (
             getattr(vllm_config.parallel_config, "decode_context_parallel_size", 1) or 1
@@ -72,14 +80,19 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
             scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
                 kv_cache_config, vllm_config
             )
-            if (
-                scheduler_block_size != block_size * dcp_world_size
-                or scheduler_block_size % hash_block_size != 0
-            ):
+            block_size_mismatch = scheduler_block_size != block_size * dcp_world_size
+            if block_size_mismatch and not cache_group_layout.requires_group_specific_block_mapping:
                 raise ValueError(
                     f"vLLM scheduler block {scheduler_block_size} / hash block "
                     f"{hash_block_size} do not fit the connector block {block_size}"
                 )
+            if scheduler_block_size % hash_block_size != 0:
+                raise ValueError(
+                    f"vLLM scheduler block {scheduler_block_size} is not divisible "
+                    f"by hash block {hash_block_size}"
+                )
+            if block_size_mismatch:
+                block_size = scheduler_block_size // max(1, dcp_world_size)
 
         cross_layer_blocks = os.environ.get("PEGAFLOW_CROSS_LAYER_BLOCKS", "1") == "1"
         base_namespace = derive_namespace(
@@ -89,6 +102,7 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
             pcp_world_size,
             cross_layer_blocks=cross_layer_blocks,
             hash_block_size=hash_block_size,
+            cache_group_layout=cache_group_layout,
         )
 
         tp_rank: int | None = None

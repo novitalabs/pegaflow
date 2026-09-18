@@ -48,7 +48,7 @@ if _LOAD_TIMEOUT_RAW < _LOAD_TIMEOUT_FLOOR_SECONDS:
 class SaveTask:
     metadata: PegaConnectorMetadata
     request_ids: list[str]
-    # HMA boundary-state jobs carried by this task; reported back to the
+    # Pinned GPU save jobs carried by this task; reported back to the
     # scheduler through PegaWorkerMetadata once the batch is done.
     boundary_job_ids: list[int] = field(default_factory=list)
 
@@ -209,7 +209,18 @@ class WorkerConnector:
     ):
         self._ctx = context
         self._kv_cache_config = kv_cache_config
-        self._cache_groups = CacheGroupLayout.from_config(kv_cache_config)
+        hybrid_kv_enabled = not bool(
+            getattr(
+                getattr(vllm_config, "scheduler_config", None),
+                "disable_hybrid_kv_cache_manager",
+                False,
+            )
+        )
+        self._cache_groups = CacheGroupLayout.from_config(
+            kv_cache_config,
+            allow_sliding_window=hybrid_kv_enabled,
+            hash_block_size=context.hash_block_size,
+        )
         self._layer_to_group = self._cache_groups.layer_to_group()
         additional_config = getattr(vllm_config, "additional_config", {}) or {}
         self._use_mla_layer_split_registration = context.is_mla and bool(
@@ -360,9 +371,14 @@ class WorkerConnector:
             wrapper = CudaIPCWrapper(registration_tensor)
             wrapper_bytes = pickle.dumps(wrapper)
 
+            logical_block_size = self._ctx.block_size
+            if self._cache_groups.sliding_window_group_indices:
+                logical_block_size = self._cache_groups.block_size_of(
+                    self._layer_to_group[layer_name]
+                )
             registration = _infer_kv_cache_registration(
                 registration_tensor,
-                self._ctx.block_size,
+                logical_block_size,
                 is_mla=self._ctx.is_mla,
                 is_recurrent_state=is_recurrent_state,
             )
@@ -592,6 +608,43 @@ class WorkerConnector:
         request_ids: list[str] = []
 
         for req_id, load_intent in metadata.load_intents.items():
+            if load_intent.leases_by_group is not None:
+                if load_intent.recurrent_hold is not None:
+                    raise RuntimeError(
+                        "per-group leases cannot be combined with recurrent HMA holds yet"
+                    )
+                if len(load_intent.leases_by_group) != self._cache_groups.group_count:
+                    raise RuntimeError(
+                        f"load intent has {len(load_intent.leases_by_group)} group lease vectors; "
+                        f"expected {self._cache_groups.group_count}"
+                    )
+                destinations = [list(group) for group in load_intent.block_ids_by_group]
+                shard = self._ctx.tp_shard_index
+                shared_loads: dict[bytes, list[list[int | None]]] = {}
+                for group_index, group_leases in enumerate(load_intent.leases_by_group):
+                    if len(group_leases) != self._ctx.tp_shard_count:
+                        raise RuntimeError(
+                            f"load intent group {group_index} has {len(group_leases)} TP shard "
+                            f"leases; expected {self._ctx.tp_shard_count}"
+                        )
+                    lease = group_leases[shard]
+                    if not lease:
+                        continue
+                    count = len(destinations[group_index])
+                    if lease not in shared_loads:
+                        shared_loads[lease] = [
+                            [None] * count for _ in range(self._cache_groups.group_count)
+                        ]
+                    vectors = shared_loads[lease]
+                    if any(len(group) != count for group in vectors):
+                        raise RuntimeError("cache groups sharing a load lease have different spans")
+                    vectors[group_index] = destinations[group_index]
+                    all_block_ids.extend(
+                        block_id for block_id in destinations[group_index] if block_id is not None
+                    )
+                loads.extend(shared_loads.items())
+                request_ids.append(req_id)
+                continue
             if len(load_intent.leases) != self._ctx.tp_shard_count:
                 raise RuntimeError(
                     f"load intent has {len(load_intent.leases)} TP shard leases; "
@@ -794,8 +847,8 @@ class WorkerConnector:
 
         # Both kinds of save read blocks that stay allocated until this worker
         # reports completion: request blocks are held by request_finished /
-        # handle_preemptions, boundary-state blocks are pinned by the
-        # scheduler until the job id comes back in PegaWorkerMetadata. So
+        # handle_preemptions, sliding and recurrent boundary blocks are pinned
+        # by the scheduler until the job id comes back in PegaWorkerMetadata. So
         # every save can run asynchronously behind the forward pass.
         if metadata.save_intents:
             self._save_queue.put(self._make_save_task(metadata.save_intents))
@@ -839,6 +892,11 @@ class WorkerConnector:
         return SaveTask(
             metadata=PegaConnectorMetadata(save_intents=save_intents),
             request_ids=request_ids,
+            boundary_job_ids=[
+                intent.gpu_pin_job_id
+                for intent in save_intents.values()
+                if intent.gpu_pin_job_id is not None
+            ],
         )
 
     def _save_worker(self) -> None:
@@ -983,7 +1041,15 @@ class WorkerConnector:
                 raise RuntimeError(
                     f"save intent is missing cache group {group_index} for {layer_name}"
                 ) from exc
-            block_hashes = save_intent.block_hashes
+            if save_intent.block_hashes_by_group is None:
+                block_hashes = save_intent.block_hashes
+            else:
+                try:
+                    block_hashes = save_intent.block_hashes_by_group[group_index]
+                except IndexError as exc:
+                    raise RuntimeError(
+                        f"save intent is missing hashes for cache group {group_index}"
+                    ) from exc
             if len(block_ids) != len(block_hashes):
                 raise RuntimeError(
                     f"save block/hash count mismatch for {layer_name}: "

@@ -9,11 +9,22 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from .unit_stubs import install_connector_unit_stubs
 
 install_connector_unit_stubs()
 
-from pegaflow.connector.common import derive_namespace  # noqa: E402
+from pegaflow.connector.common import CacheGroupLayout, derive_namespace  # noqa: E402
+
+from .test_cache_group_layout import (  # noqa: E402
+    _config,
+    _full_attention,
+    _group,
+    _mamba,
+    _mla,
+    _sliding_window,
+)
 
 
 def _make_vllm_config(
@@ -68,3 +79,32 @@ def test_missing_additional_config_defaults_to_no_split():
     cfg = _make_vllm_config(pp_size=4)
     cfg.additional_config = None
     assert derive_namespace(cfg, tp_size=8) == _ns(pp_size=4, mla_layer_split=False)
+
+
+@pytest.mark.parametrize("recurrent", [False, True], ids=["uniform", "kimi-linear"])
+def test_non_sliding_namespace_preserves_master_and_pp_stage_identity(recurrent):
+    cfg = _make_vllm_config()
+    cfg.parallel_config.pipeline_parallel_size = 2
+    expected = derive_namespace(cfg, tp_size=8)
+    for stage in range(2):
+        groups = [_group(f"stage{stage}.attention", _mla())]
+        if recurrent:
+            groups.append(_group(f"stage{stage}.recurrent", _mamba()))
+        layout = CacheGroupLayout.from_config(_config(*groups))
+        assert derive_namespace(cfg, tp_size=8, cache_group_layout=layout) == expected
+
+
+def test_sliding_namespace_uses_global_group_sizes_not_pp_local_layers():
+    cfg = _make_vllm_config(pp_size=2)
+
+    def namespace(stage, sliding_block_size):
+        layout = CacheGroupLayout.from_config(
+            _config(
+                _group(f"stage{stage}.attention", _full_attention(32)),
+                _group(f"stage{stage}.sliding", _sliding_window(sliding_block_size)),
+            )
+        )
+        return derive_namespace(cfg, tp_size=8, cache_group_layout=layout)
+
+    assert namespace(0, 16) == namespace(1, 16)
+    assert namespace(0, 16) != namespace(0, 32)

@@ -281,11 +281,19 @@ def test_use_page_first_detection(case: str, kwargs: dict, additional_config: di
 def test_hma_disables_page_first_registration():
     from pegaflow.connector.worker import WorkerConnector
 
-    attention = FullAttentionSpec()
-    attention.block_size = 16
-    recurrent = MambaSpec()
-    recurrent.block_size = 16
-    recurrent.mamba_cache_mode = "align"
+    try:
+        attention = FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype=None)
+    except TypeError:
+        attention = FullAttentionSpec()
+        attention.block_size = 16
+    try:
+        recurrent = MambaSpec(
+            block_size=16, shapes=((1,),), dtypes=(None,), mamba_cache_mode="align"
+        )
+    except TypeError:
+        recurrent = MambaSpec()
+        recurrent.block_size = 16
+        recurrent.mamba_cache_mode = "align"
     kv_cache_config = SimpleNamespace(
         kv_cache_groups=(
             SimpleNamespace(layer_names=("attention",), kv_cache_spec=attention),

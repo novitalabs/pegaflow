@@ -65,6 +65,8 @@ class _QueryProbe:
     # ``None`` means the backend is still loading.
     hit_blocks: int | None = None
     leases: tuple[bytes, ...] = ()
+    leases_by_group: tuple[tuple[bytes, ...], ...] | None = None
+    block_ranges_by_group: tuple[tuple[int, int], ...] | None = None
     # Hybrid (HMA): pinned recurrent checkpoints from the membership queries,
     # set together with `leases` when the hybrid reconcile found a boundary.
     recurrent_hold: RecurrentLoadHold | None = None
@@ -106,6 +108,8 @@ class _QueryProbe:
         self.hit_blocks = hit_blocks
         self.leased_blocks = hit_blocks
         self.leases = ready.leases
+        self.leases_by_group = ready.leases_by_group
+        self.block_ranges_by_group = ready.block_ranges_by_group
         self.recurrent_hold = ready.recurrent_hold
         self.usable_positions = frozenset(ready.usable_positions)
         self.attention_hit_blocks = ready.attention_hit_blocks
@@ -137,7 +141,18 @@ class SchedulerConnector:
                 f"{expected_shards} TP shards"
             )
         self._tp_shard_client = TpShardQueryClient(engine_clients)
-        self._cache_groups = CacheGroupLayout.from_config(kv_cache_config)
+        hybrid_kv_enabled = not bool(
+            getattr(
+                getattr(vllm_config, "scheduler_config", None),
+                "disable_hybrid_kv_cache_manager",
+                False,
+            )
+        )
+        self._cache_groups = CacheGroupLayout.from_config(
+            kv_cache_config,
+            allow_sliding_window=hybrid_kv_enabled,
+            hash_block_size=context.hash_block_size,
+        )
         if self._cache_groups.has_recurrent_state and (pd_tail_save or pd_tail_load):
             raise ValueError("P/D tail-block caching is not supported with HMA")
         self._gpu_block_pool = None
@@ -221,7 +236,8 @@ class SchedulerConnector:
         # own block lifetime (align-mode tables free superseded state blocks
         # one step later, and a request may finish or be preempted first).
         self._next_boundary_job_id = 0
-        # job id -> (pinned GPU block ids, workers yet to report)
+        # Shared by recurrent boundary saves and sliding-window source pins:
+        # job id -> (pinned GPU block ids, workers yet to report).
         self._pinned_boundary_jobs: dict[int, tuple[list[int], int]] = {}
         # req id -> (group index, hash index) already handed off
         self._saved_boundaries: dict[str, set[tuple[int, int]]] = {}
@@ -239,7 +255,9 @@ class SchedulerConnector:
 
         gpu_block_pool.get_cached_block = no_local_hma_prefix_hit
 
-    def _request_block_hashes(self, request: "Request") -> tuple[bytes, ...]:
+    def _request_block_hashes(
+        self, request: "Request", group_index: int | None = None
+    ) -> tuple[bytes, ...]:
         """Per-block keys from `Request.block_hashes` (see `ConnectorContext.hash_scale`).
 
         vLLM hashes full spans only, so the hashes never reach past the
@@ -268,7 +286,14 @@ class SchedulerConnector:
                 )
             if stale == 1:
                 block_hashes = block_hashes[:hashed]
-        return block_hashes_per_block(block_hashes, self._ctx.hash_scale)
+        scale = self._ctx.hash_scale
+        if group_index is not None and self._ctx.hash_block_size is not None:
+            scale = (
+                self._cache_groups.block_size_of(group_index)
+                * self._ctx.dcp_world_size
+                // self._ctx.hash_block_size
+            )
+        return block_hashes_per_block(block_hashes, scale)
 
     def get_num_new_matched_tokens(
         self,
@@ -320,7 +345,9 @@ class SchedulerConnector:
 
         # No reusable Ready result. Ask backend.
         lookup_start = time.perf_counter()
-        ready = self._count_available_block_prefix(backend_query_hashes, req_id)
+        ready = self._count_available_block_prefix(
+            backend_query_hashes, req_id, request=request, computed_blocks=computed_blocks
+        )
         lookup_us = (time.perf_counter() - lookup_start) * 1e6
 
         # Backend is still loading.  Keep the original snapshot.
@@ -346,7 +373,11 @@ class SchedulerConnector:
                 computed_blocks,
                 len(query_hashes),
             )
-            self._release_leases(ready.leases, req_id)
+            if ready.leases_by_group is not None:
+                for leases in dict.fromkeys(ready.leases_by_group):
+                    self._release_leases(leases, req_id)
+            else:
+                self._release_leases(ready.leases, req_id)
             if ready.recurrent_hold is not None:
                 for group_index, group_leases in enumerate(ready.recurrent_hold.leases):
                     self._tp_shard_client.release(group_leases, f"{req_id}:g{group_index}")
@@ -560,6 +591,7 @@ class SchedulerConnector:
             vbs = self._ctx.virtual_block_size
             num_load_blocks = (num_external_tokens + vbs - 1) // vbs
             pending_probe = self._pending_query_probes.get(req_id)
+            leases_by_group = pending_probe.leases_by_group if pending_probe is not None else None
             try:
                 load_block_ids_by_group = self._load_block_ids_by_group(
                     block_ids_by_group,
@@ -570,6 +602,9 @@ class SchedulerConnector:
                         if pending_probe is not None
                         else num_load_blocks
                     ),
+                    block_ranges_by_group=(
+                        pending_probe.block_ranges_by_group if pending_probe is not None else None
+                    ),
                 )
             except RuntimeError:
                 self._release_pending_query_probe(req_id)
@@ -579,6 +614,7 @@ class SchedulerConnector:
                 block_ids_by_group=load_block_ids_by_group,
                 leases=pending_probe.leases if pending_probe is not None else (),
                 num_tokens=num_external_tokens,
+                leases_by_group=leases_by_group,
                 recurrent_hold=(
                     pending_probe.recurrent_hold if pending_probe is not None else None
                 ),
@@ -704,6 +740,7 @@ class SchedulerConnector:
         self._pending_saves.update(save_intents.keys())
 
         boundary_save_intents = self._consume_boundary_state_offloads(scheduler_output)
+        self._pin_sliding_save_intents(save_intents)
 
         logger.debug(
             "[PegaKVConnector] build_connector_meta: %d loads, %d saves, %d boundary saves",
@@ -718,6 +755,30 @@ class SchedulerConnector:
             boundary_save_intents=boundary_save_intents,
             preempted_req_ids=scheduler_output.preempted_req_ids or None,
         )
+
+    def _pin_sliding_save_intents(self, intents: dict[str, SaveIntent]) -> None:
+        sliding = getattr(self._cache_groups, "sliding_window_group_indices", ())
+        if not sliding or not intents:
+            return
+        pool = self._gpu_block_pool
+        if pool is None:
+            raise RuntimeError("GPU block pool was not bound before a sliding-window save")
+        for req_id, intent in intents.items():
+            pinned = list(
+                dict.fromkeys(
+                    block_id
+                    for group_index in sorted(sliding)
+                    for block_id in intent.block_ids_by_group[group_index]
+                    if block_id != 0
+                )
+            )
+            if not pinned:
+                continue
+            job_id = self._next_boundary_job_id
+            self._next_boundary_job_id += 1
+            pool.touch([pool.blocks[block_id] for block_id in pinned])
+            self._pinned_boundary_jobs[job_id] = (pinned, self._ctx.world_size)
+            intents[req_id] = replace(intent, gpu_pin_job_id=job_id)
 
     def _consume_boundary_state_offloads(
         self, scheduler_output: "SchedulerOutput"
@@ -833,7 +894,7 @@ class SchedulerConnector:
             pool.free_blocks(pool.blocks[block_id] for block_id in reversed(block_ids))
 
     def has_pending_push_work(self) -> bool:
-        """Keep the engine stepping while boundary saves still pin blocks.
+        """Keep the engine stepping while GPU save jobs still pin blocks.
 
         Completions only reach the scheduler as worker metadata on a step; an
         engine that quiesced with jobs in flight would hold those references
@@ -881,6 +942,12 @@ class SchedulerConnector:
         recomputes every position past them anyway.
         """
         if not self._tail_save_enabled or req_id in self._tail_saved:
+            return None
+        if self._cache_groups.requires_group_specific_block_mapping:
+            logger.debug(
+                "[PegaKVConnector] req=%s pd_tail_save skipped for heterogeneous cache groups",
+                req_id,
+            )
             return None
         req = self._requests.get(req_id)
         if req is None:
@@ -1024,6 +1091,21 @@ class SchedulerConnector:
             else tuple(group[hash_start : hash_start + new_blocks])
             for group_index, group in enumerate(allocated)
         )
+        block_hashes_by_group = None
+        if getattr(self._cache_groups, "requires_group_specific_block_mapping", False):
+            request = self._requests[req_id]
+            mapped_ids: list[tuple[int, ...]] = []
+            mapped_hashes: list[tuple[bytes, ...]] = []
+            full_vbs = self._ctx.virtual_block_size
+            for group_index, group in enumerate(allocated):
+                group_vbs = self._cache_groups.block_size_of(group_index) * self._ctx.dcp_world_size
+                group_hashes = self._request_block_hashes(request, group_index)
+                ratio = full_vbs // group_vbs
+                start, count = hash_start * ratio, new_blocks * ratio
+                mapped_ids.append(tuple(group[start : start + count]))
+                mapped_hashes.append(tuple(group_hashes[start : start + count]))
+            save_block_ids_by_group = tuple(mapped_ids)
+            block_hashes_by_group = tuple(mapped_hashes)
         self._next_stored_block_idx[req_id] = saveable_block_idx
 
         logger.debug(
@@ -1041,6 +1123,7 @@ class SchedulerConnector:
         return SaveIntent(
             block_ids_by_group=save_block_ids_by_group,
             block_hashes=save_hashes,
+            block_hashes_by_group=block_hashes_by_group,
         )
 
     def _copy_block_ids_by_group(self, block_ids) -> tuple[tuple[int, ...], ...]:
@@ -1060,6 +1143,7 @@ class SchedulerConnector:
         start_block_idx: int,
         num_load_blocks: int,
         leased_blocks: int | None = None,
+        block_ranges_by_group: tuple[tuple[int, int], ...] | None = None,
     ) -> tuple[tuple[int | None, ...], ...]:
         """Destination block IDs per cache group, one entry per leased block.
 
@@ -1071,7 +1155,11 @@ class SchedulerConnector:
         """
         end_block_idx = start_block_idx + num_load_blocks
         available = [len(group) for group in block_ids_by_group]
-        if any(length < end_block_idx for length in available):
+        ranges = [(start_block_idx, end_block_idx)] * len(block_ids_by_group)
+        if block_ranges_by_group is not None:
+            for index in self._cache_groups.sliding_window_group_indices:
+                ranges[index] = block_ranges_by_group[index]
+        if any(length < end for length, (_, end) in zip(available, ranges, strict=True)):
             raise RuntimeError(
                 f"load block mismatch: start={start_block_idx} count={num_load_blocks} "
                 f"available_by_group={available}"
@@ -1087,7 +1175,14 @@ class SchedulerConnector:
 
         result: list[tuple[int | None, ...]] = []
         for group_index, block_ids in enumerate(block_ids_by_group):
-            destinations: tuple[int | None, ...] = block_ids[start_block_idx:end_block_idx]
+            start, end = ranges[group_index]
+            destinations: tuple[int | None, ...] = block_ids[start:end]
+            if (
+                block_ranges_by_group is not None
+                and group_index in self._cache_groups.sliding_window_group_indices
+            ):
+                result.append(destinations)
+                continue
             if group_index in self._cache_groups.recurrent_group_indices and destinations:
                 destinations = (None,) * (len(destinations) - 1) + (destinations[-1],)
             result.append(destinations + padding)
@@ -1142,7 +1237,12 @@ class SchedulerConnector:
         self._tail_saved.discard(req_id)
 
     def _count_available_block_prefix(
-        self, block_hashes: Iterable[bytes], req_id: str
+        self,
+        block_hashes: Iterable[bytes],
+        req_id: str,
+        *,
+        request: "Request | None" = None,
+        computed_blocks: int = 0,
     ) -> ShardedQueryReady | None:
         """Query available blocks with prefetch support.
 
@@ -1185,7 +1285,135 @@ class SchedulerConnector:
 
         if self._cache_groups.has_recurrent_state:
             return self._reconcile_hybrid(block_hash_list, ready, req_id)
+        if request is not None and getattr(self._cache_groups, "sliding_window_group_indices", ()):
+            return self._attach_sliding_group_queries(
+                request, computed_blocks, block_hash_list, ready, req_id
+            )
         return ready
+
+    def _attach_sliding_group_queries(
+        self,
+        request: "Request",
+        computed_blocks: int,
+        full_hashes: list[bytes],
+        ready: ShardedQueryReady,
+        req_id: str,
+    ) -> ShardedQueryReady:
+        """Find and lease the latest boundary served by every sliding group."""
+        if ready.num_hit_blocks == 0:
+            return ready
+
+        layout = self._cache_groups
+        sliding_groups = sorted(layout.sliding_window_group_indices)
+        full_vbs = self._ctx.virtual_block_size
+        computed_tokens = computed_blocks * full_vbs
+        group_sizes = {
+            index: layout.block_size_of(index) * self._ctx.dcp_world_size
+            for index in sliding_groups
+        }
+        # Groups with the same storage id and token span share both their
+        # membership result and lease. The worker combines their destinations.
+        queries: dict[tuple[int, int, int, int], tuple[frozenset[int], tuple[bytes, ...]]] = {}
+        acquired = {ready.leases}
+        retained: set[tuple[bytes, ...]] = set()
+
+        def span(group_index: int, blocks: int) -> tuple[int, int]:
+            size = group_sizes[group_index]
+            end_token = (computed_blocks + blocks) * full_vbs
+            window = layout.sliding_window_of(group_index)
+            start_token = max(computed_tokens, end_token - window if window else 0)
+            return start_token // size, end_token // size
+
+        def query(
+            group_index: int, start: int, end: int
+        ) -> tuple[frozenset[int], tuple[bytes, ...]]:
+            storage_group = layout.storage_group_of(group_index)
+            key = (storage_group, group_sizes[group_index], start, end)
+            if key not in queries:
+                hashes = self._request_block_hashes(request, group_index)
+                results = self._tp_shard_client.query_group_membership(
+                    self._ctx.instance_id,
+                    list(hashes[start:end]),
+                    f"{req_id}:g{storage_group}:{start}-{end}",
+                    storage_group,
+                )
+                leases = tuple(lease for _, lease in results)
+                acquired.add(leases)
+                common = set(results[0][0]) if results else set()
+                for positions, _ in results[1:]:
+                    common.intersection_update(positions)
+                queries[key] = frozenset(common), leases
+            return queries[key]
+
+        try:
+            candidate = ready.num_hit_blocks
+            complete = True
+            for group_index in sliding_groups:
+                start, end = span(group_index, candidate)
+                positions, _ = query(group_index, start, end)
+                complete = complete and positions == frozenset(range(end - start))
+
+            if not complete:
+                # Sliding hits are not monotone: an earlier boundary needs a
+                # different window. Probe all groups back to the local prefix
+                # and intersect their legal boundaries, rather than taking
+                # the minimum of independently selected hits.
+                membership: dict[int, frozenset[int]] = {}
+                for group_index in sliding_groups:
+                    start = computed_tokens // group_sizes[group_index]
+                    _, end = span(group_index, candidate)
+                    positions, _ = query(group_index, start, end)
+                    membership[group_index] = frozenset(start + p for p in positions)
+                candidate = next(
+                    (
+                        blocks
+                        for blocks in range(candidate - 1, 0, -1)
+                        if all(
+                            membership[index].issuperset(range(*span(index, blocks)))
+                            for index in sliding_groups
+                        )
+                    ),
+                    0,
+                )
+                if candidate == 0:
+                    return ShardedQueryReady(0, tuple(b"" for _ in ready.leases))
+
+                # Keep the original leases pinned until their exact
+                # replacements have been acquired, including on TP shards.
+                dense = self._tp_shard_client.query(
+                    self._ctx.instance_id,
+                    list(full_hashes[:candidate]),
+                    req_id=f"{req_id}:dense-shrunk-{candidate}",
+                    wait_for_full_prefix=False,
+                )
+                if dense is not None:
+                    acquired.add(dense.leases)
+                if dense is None or dense.num_hit_blocks != candidate:
+                    return ShardedQueryReady(0, tuple(b"" for _ in ready.leases))
+                ready = dense
+
+            leases_by_group: list[tuple[bytes, ...]] = [() for _ in range(layout.group_count)]
+            ranges = [(computed_blocks, computed_blocks + candidate)] * layout.group_count
+            for group_index in range(layout.group_count):
+                if layout.storage_group_of(group_index) == 0:
+                    leases_by_group[group_index] = ready.leases
+            for group_index in sliding_groups:
+                start, end = span(group_index, candidate)
+                positions, leases = query(group_index, start, end)
+                if positions != frozenset(range(end - start)):
+                    return ShardedQueryReady(0, tuple(b"" for _ in ready.leases))
+                ranges[group_index] = (start, end)
+                leases_by_group[group_index] = leases
+
+            retained = set(leases_by_group)
+            return replace(
+                ready,
+                leases_by_group=tuple(leases_by_group),
+                block_ranges_by_group=tuple(ranges),
+            )
+        finally:
+            for leases in acquired - retained:
+                self._release_leases(leases, req_id)
 
     def _reconcile_hybrid(
         self,
@@ -1345,7 +1573,10 @@ class SchedulerConnector:
 
     def _release_query_probe(self, req_id: str, probe: _QueryProbe) -> bool:
         released = True
-        if probe.leases and any(probe.leases):
+        if probe.leases_by_group is not None:
+            for leases in dict.fromkeys(probe.leases_by_group):
+                released = self._release_leases(leases, req_id) and released
+        elif probe.leases and any(probe.leases):
             released = self._release_leases(probe.leases, req_id)
         else:
             self._cancel_prefetch_tracking(req_id)
