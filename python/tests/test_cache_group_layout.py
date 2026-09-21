@@ -63,7 +63,7 @@ def _mla(block_size=16, head_size=128):
         return spec
 
 
-def _sliding_window(block_size=16, window=1024):
+def _sliding_window(block_size=16, window=1024, extra_retained_tokens=0):
     try:
         return SlidingWindowSpec(
             block_size=block_size,
@@ -71,11 +71,13 @@ def _sliding_window(block_size=16, window=1024):
             head_size=1,
             dtype=None,
             sliding_window=window,
+            extra_retained_tokens=extra_retained_tokens,
         )
     except TypeError:
         spec = SlidingWindowSpec()
         spec.block_size = block_size
         spec.sliding_window = window
+        spec.extra_retained_tokens = extra_retained_tokens
         return spec
 
 
@@ -287,6 +289,30 @@ def test_accepts_heterogeneous_sliding_window_mapping():
 
     assert layout.sliding_window_group_indices == frozenset({1})
     assert layout.requires_group_specific_block_mapping
+
+
+def test_sliding_window_layout_preserves_extra_retained_tokens():
+    config = _config(
+        _group("attention", _full_attention()),
+        _group("sliding_window", _sliding_window(extra_retained_tokens=15)),
+    )
+
+    layout = CacheGroupLayout.from_config(config, hash_block_size=16)
+
+    assert layout.group_extra_retained_tokens == (None, 15)
+    # vLLM retains sliding_window - 1 tokens for attention plus the extra
+    # trailing speculative tokens below that window.
+    assert layout.sliding_retained_tokens_of(1) == 1024 - 1 + 15
+
+
+def test_rejects_negative_extra_retained_tokens():
+    config = _config(
+        _group("attention", _full_attention()),
+        _group("sliding_window", _sliding_window(extra_retained_tokens=-1)),
+    )
+
+    with pytest.raises(RuntimeError, match="extra_retained_tokens"):
+        CacheGroupLayout.from_config(config, hash_block_size=16)
 
 
 @pytest.mark.parametrize("dense_size", [16, 48], ids=["smaller-dense", "non-divisible"])

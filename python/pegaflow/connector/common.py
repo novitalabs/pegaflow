@@ -343,6 +343,10 @@ class CacheGroupLayout:
     recurrent_layer_names: frozenset[str]
     sliding_window_group_indices: frozenset[int] = frozenset()
     group_sliding_windows: tuple[int | None, ...] = ()
+    # Number of trailing tokens vLLM keeps below the attention window for
+    # multi-module speculative decoding.  These tokens remain resident, but
+    # are not part of the attention window itself.
+    group_extra_retained_tokens: tuple[int | None, ...] = ()
     storage_group_ids: tuple[int, ...] = (0,)
     group_block_sizes: tuple[int, ...] = ()
     scratch_group_indices: frozenset[int] = frozenset()
@@ -366,6 +370,7 @@ class CacheGroupLayout:
                 recurrent_layer_names=frozenset(),
                 sliding_window_group_indices=frozenset(),
                 group_sliding_windows=(None,),
+                group_extra_retained_tokens=(None,),
                 group_block_sizes=(0,),
             )
 
@@ -539,6 +544,40 @@ class CacheGroupLayout:
             )
             for layers in layer_specs
         )
+        if any(window is not None and window <= 0 for window in group_sliding_windows):
+            raise RuntimeError("PegaFlow SlidingWindowSpec requires a positive sliding_window")
+        group_extra_retained_tokens = tuple(
+            next(
+                (
+                    int(getattr(layer, "extra_retained_tokens", 0))
+                    for layer in layers
+                    if isinstance(layer, SlidingWindowSpec)
+                    and not (KpoolTailSpec is not None and type(layer) is KpoolTailSpec)
+                ),
+                None,
+            )
+            for layers in layer_specs
+        )
+        if any(
+            value is not None and value < 0 for value in group_extra_retained_tokens
+        ):
+            raise RuntimeError("PegaFlow SlidingWindow extra_retained_tokens must be non-negative")
+        if any(
+            len(
+                {
+                    int(getattr(layer, "extra_retained_tokens", 0))
+                    for layer in layers
+                    if isinstance(layer, SlidingWindowSpec)
+                    and not (KpoolTailSpec is not None and type(layer) is KpoolTailSpec)
+                }
+            )
+            > 1
+            for layers in layer_specs
+        ):
+            raise RuntimeError(
+                "PegaFlow requires SlidingWindow layers within each cache group to share "
+                "extra_retained_tokens"
+            )
         # Dense groups share the prefix; sliding groups share membership keys.
         # Sliding and recurrent layouts are mutually exclusive.
         storage_group_ids = tuple(
@@ -561,6 +600,7 @@ class CacheGroupLayout:
             ),
             sliding_window_group_indices=sliding_window_group_indices,
             group_sliding_windows=group_sliding_windows,
+            group_extra_retained_tokens=group_extra_retained_tokens,
             storage_group_ids=storage_group_ids,
             group_block_sizes=group_block_sizes,
             scratch_group_indices=scratch_group_indices,
@@ -595,6 +635,25 @@ class CacheGroupLayout:
     def sliding_window_of(self, group_index: int) -> int | None:
         """Return the token window for a sliding group, if one is declared."""
         return self.group_sliding_windows[group_index]
+
+    def extra_retained_tokens_of(self, group_index: int) -> int:
+        """Return vLLM's non-attended trailing retention for a sliding group."""
+        if not self.group_extra_retained_tokens:
+            return 0
+        return self.group_extra_retained_tokens[group_index] or 0
+
+    def sliding_retained_tokens_of(self, group_index: int) -> int | None:
+        """Return the physical token span vLLM keeps for a sliding group.
+
+        ``SlidingWindowManager.get_num_skipped_tokens`` retains
+        ``sliding_window - 1 + extra_retained_tokens`` tokens.  The extra
+        tokens are available for speculative re-prefill, but do not expand
+        the model's attention window.
+        """
+        window = self.sliding_window_of(group_index)
+        if window is None:
+            return None
+        return max(0, window - 1 + self.extra_retained_tokens_of(group_index))
 
     @property
     def requires_group_specific_block_mapping(self) -> bool:

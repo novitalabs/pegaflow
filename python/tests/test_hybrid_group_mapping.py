@@ -172,6 +172,37 @@ def test_sliding_query_uses_retained_window_suffix(window):
     ) == ((12,), (24, 25))
 
 
+def test_sliding_query_includes_extra_retained_suffix():
+    scheduler = _scheduler()
+    # At a 128-token endpoint, the normal 32-token window starts at token 96.
+    # With 16 extra retained tokens vLLM keeps the physical suffix from
+    # token 81, so the connector must query group blocks 5..8 rather than 6..8.
+    scheduler._cache_groups = replace(
+        _layout(),
+        group_sliding_windows=(None, 32),
+        group_extra_retained_tokens=(None, 16),
+    )
+    hashes = tuple(bytes([index]) for index in range(8))
+    request = SimpleNamespace(request_id="r1", num_tokens=128, block_hashes=list(hashes))
+    results = []
+
+    def query_group_membership(_instance, block_hashes, _req_id, _group_id):
+        results.append(tuple(block_hashes))
+        return [(tuple(range(len(block_hashes))), b"lease")]
+
+    scheduler._tp_shard_client.query_group_membership = query_group_membership
+    attached = scheduler._attach_sliding_group_queries(
+        request,
+        computed_blocks=2,
+        full_hashes=list(hashes[2:4]),
+        ready=ShardedQueryReady(num_hit_blocks=2, leases=(b"dense",)),
+        req_id="r1",
+    )
+
+    assert results == [hashes[5:8]]
+    assert attached.block_ranges_by_group == ((2, 4), (5, 8))
+
+
 def test_sliding_query_shrinks_to_latest_common_boundary_on_partial_hit():
     scheduler = _scheduler()
     hashes = tuple(bytes([index]) for index in range(8))

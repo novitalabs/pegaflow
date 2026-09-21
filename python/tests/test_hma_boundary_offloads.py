@@ -95,7 +95,12 @@ def _register_request(scheduler: SchedulerConnector, req_id: str, num_hashes: in
     scheduler._block_hashes[req_id] = tuple(request.block_hashes)
 
 
-def _scheduler_output(offloads, *, with_block_state: bool = True) -> SimpleNamespace:
+def _scheduler_output(
+    offloads,
+    *,
+    with_block_state: bool = True,
+    block_ids: dict[str, tuple[list[int], ...]] | None = None,
+) -> SimpleNamespace:
     output = SimpleNamespace(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=SimpleNamespace(
@@ -109,7 +114,7 @@ def _scheduler_output(offloads, *, with_block_state: bool = True) -> SimpleNames
     )
     if with_block_state:
         output.kv_connector_block_state = SimpleNamespace(
-            block_ids={},
+            block_ids=block_ids or {},
             boundary_state_offloads=offloads,
         )
     return output
@@ -206,6 +211,137 @@ def test_sliding_window_sources_stay_pinned_per_job_until_all_workers_finish():
     )
     assert [pool.blocks[i].ref_cnt for i in (21, 22, 23)] == [0, 0, 0]
     assert not scheduler.has_pending_push_work()
+
+
+def test_sliding_save_uses_current_block_table_before_pinning_sources():
+    """A released sliding source must not be pinned under its old hash.
+
+    The connector mirror still contains the old source block (22), while the
+    scheduler snapshot reports that vLLM replaced it with a null block and a
+    new source (23).  Pinning must use the snapshot, otherwise an intervening
+    request can reuse 22 before the asynchronous save starts.
+    """
+    scheduler, pool = _make_scheduler()
+    scheduler._cache_groups = CacheGroupLayout(
+        layer_names=(("full",), ("sliding",)),
+        hash_group_index=0,
+        has_recurrent_state=False,
+        recurrent_group_indices=frozenset(),
+        recurrent_layer_names=frozenset(),
+        sliding_window_group_indices=frozenset({1}),
+        group_sliding_windows=(None, 32),
+        group_block_sizes=(16, 16),
+    )
+    _register_request(scheduler, "r1", 2)
+    scheduler._allocated_blocks["r1"] = [[10, 11], [21, 22]]
+    scheduler._scheduled_tokens["r1"] = 32
+    output = _scheduler_output(
+        {},
+        block_ids={"r1": ([10, 11], [0, 23])},
+    )
+    output.scheduled_new_reqs = [
+        SimpleNamespace(req_id="r1", block_ids=([10, 11], [21, 22]), num_computed_tokens=0)
+    ]
+    output.num_scheduled_tokens = {"r1": 32}
+
+    metadata = scheduler.build_connector_meta(output)
+
+    assert metadata.save_intents["r1"].block_ids_by_group == ((10, 11), (0, 23))
+    assert pool.touched == [23]
+
+
+def test_sliding_save_drops_source_reallocated_to_another_request_same_step():
+    """A new allocation must invalidate an old mirror entry before pinning.
+
+    The old request is intentionally absent from the authoritative snapshot;
+    this is the late-pin case where vLLM only reports the request receiving
+    the recycled block.  The owner map built from the new allocation still
+    prevents saving that physical page under the old request's hash.
+    """
+    scheduler, pool = _make_scheduler()
+    scheduler._cache_groups = CacheGroupLayout(
+        layer_names=(("full",), ("sliding",)),
+        hash_group_index=0,
+        has_recurrent_state=False,
+        recurrent_group_indices=frozenset(),
+        recurrent_layer_names=frozenset(),
+        sliding_window_group_indices=frozenset({1}),
+        group_sliding_windows=(None, 32),
+        group_block_sizes=(16, 16),
+    )
+    _register_request(scheduler, "old", 2)
+    stale = SaveIntent(
+        block_ids_by_group=((10, 11), (21, 22)),
+        block_hashes=(_hash(0), _hash(1)),
+    )
+    filtered = scheduler._filter_reallocated_sliding_sources(
+        {"old": stale},
+        _scheduler_output({}, block_ids={"new": ([30, 31], [40, 22])}),
+        {"new": ((30, 31), (40, 22))},
+    )
+
+    assert filtered["old"].block_ids_by_group == ((10, 11), (21, 0))
+    scheduler._pin_sliding_save_intents(filtered)
+    assert pool.touched == [21]
+
+
+def test_sliding_save_keeps_a_legitimately_shared_source():
+    """A prefix block present in both tables is still owned by the saver."""
+    scheduler, pool = _make_scheduler()
+    scheduler._cache_groups = CacheGroupLayout(
+        layer_names=(("full",), ("sliding",)),
+        hash_group_index=0,
+        has_recurrent_state=False,
+        recurrent_group_indices=frozenset(),
+        recurrent_layer_names=frozenset(),
+        sliding_window_group_indices=frozenset({1}),
+        group_sliding_windows=(None, 32),
+        group_block_sizes=(16, 16),
+    )
+    _register_request(scheduler, "old", 2)
+    stale = SaveIntent(
+        block_ids_by_group=((10, 11), (21, 22)),
+        block_hashes=(_hash(0), _hash(1)),
+    )
+    snapshots = {"old": ((10, 11), (21, 22)), "shared": ((30, 31), (40, 22))}
+    filtered = scheduler._filter_reallocated_sliding_sources(
+        {"old": stale},
+        _scheduler_output({}, block_ids=snapshots),
+        snapshots,
+    )
+
+    assert filtered["old"].block_ids_by_group == stale.block_ids_by_group
+    scheduler._pin_sliding_save_intents(filtered)
+    assert pool.touched == [21, 22]
+
+
+def test_sliding_save_drops_copy_destination_without_snapshot_owner():
+    """A COW destination is fenced even when its request is absent in snapshots."""
+    scheduler, pool = _make_scheduler()
+    scheduler._cache_groups = CacheGroupLayout(
+        layer_names=(("full",), ("sliding",)),
+        hash_group_index=0,
+        has_recurrent_state=False,
+        recurrent_group_indices=frozenset(),
+        recurrent_layer_names=frozenset(),
+        sliding_window_group_indices=frozenset({1}),
+        group_sliding_windows=(None, 32),
+        group_block_sizes=(16, 16),
+    )
+    _register_request(scheduler, "old", 2)
+    stale = SaveIntent(
+        block_ids_by_group=((10, 11), (21, 22)),
+        block_hashes=(_hash(0), _hash(1)),
+    )
+    output = _scheduler_output({}, block_ids={})
+    output.kv_cache_block_copies = [SimpleNamespace(dst_block_id=22)]
+    filtered = scheduler._filter_reallocated_sliding_sources(
+        {"old": stale}, output, {}
+    )
+
+    assert filtered["old"].block_ids_by_group == ((10, 11), (21, 0))
+    scheduler._pin_sliding_save_intents(filtered)
+    assert pool.touched == [21]
 
 
 def test_boundary_job_is_released_only_after_every_worker_reports():

@@ -650,6 +650,18 @@ class SchedulerConnector:
     def build_connector_meta(self, scheduler_output: "SchedulerOutput") -> PegaConnectorMetadata:
         potential_saves: dict[str, SaveIntent] = {}
 
+        # vLLM publishes the block-table snapshot after sliding-window blocks
+        # have been released/replaced for this scheduling step.  It is the
+        # only authoritative ownership view available to a scheduler-side
+        # connector.  Refresh the mirror before deriving save intents so a
+        # stale sliding source cannot be pinned and stored under the old
+        # request hash (the late-pin corruption case).
+        authoritative_blocks = self._authoritative_block_ids(scheduler_output)
+        for req_id, block_ids in authoritative_blocks.items():
+            self._allocated_blocks[req_id] = [
+                list(group) for group in self._copy_block_ids_by_group(block_ids)
+            ]
+
         load_intents = self._pending_load_intents
         self._pending_load_intents = {}
 
@@ -665,7 +677,7 @@ class SchedulerConnector:
 
             # Populate block IDs from scheduler_output — single source of
             # truth for the save path (consistent with offloading connector).
-            if req.block_ids:
+            if req_id not in authoritative_blocks and req.block_ids:
                 self._allocated_blocks[req_id] = [
                     list(group) for group in self._copy_block_ids_by_group(req.block_ids)
                 ]
@@ -706,7 +718,13 @@ class SchedulerConnector:
 
             # Append newly allocated blocks
             new_block_ids = cached_reqs.new_block_ids[idx]
-            if req_id in cached_reqs.resumed_req_ids:
+            if req_id in authoritative_blocks:
+                # The snapshot already includes the complete current table;
+                # appending the delta would duplicate freshly allocated
+                # blocks and reintroduce the stale mirror that this snapshot
+                # is intended to replace.
+                pass
+            elif req_id in cached_reqs.resumed_req_ids:
                 self._allocated_blocks[req_id] = (
                     [list(group) for group in self._copy_block_ids_by_group(new_block_ids)]
                     if new_block_ids
@@ -734,7 +752,9 @@ class SchedulerConnector:
             if save_intent := self._consume_save_intent(req_id, written):
                 potential_saves[req_id] = save_intent
 
-        save_intents = potential_saves
+        save_intents = self._filter_reallocated_sliding_sources(
+            potential_saves, scheduler_output, authoritative_blocks
+        )
 
         # Track requests with pending saves
         self._pending_saves.update(save_intents.keys())
@@ -755,6 +775,127 @@ class SchedulerConnector:
             boundary_save_intents=boundary_save_intents,
             preempted_req_ids=scheduler_output.preempted_req_ids or None,
         )
+
+    def _authoritative_block_ids(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> dict[str, tuple[tuple[int, ...], ...]]:
+        """Return vLLM's current block tables when the scheduler provides them.
+
+        Older vLLM releases do not expose ``KVConnectorBlockState``.  The
+        empty fallback keeps those releases on the historical append-only
+        path; SlidingWindowSpec is only enabled with the hybrid manager on
+        versions that provide the snapshot.
+        """
+        state = getattr(scheduler_output, "kv_connector_block_state", None)
+        block_ids = getattr(state, "block_ids", None)
+        if not block_ids:
+            return {}
+        return {
+            req_id: tuple(tuple(group) for group in groups)
+            for req_id, groups in block_ids.items()
+        }
+
+    def _filter_reallocated_sliding_sources(
+        self,
+        intents: dict[str, SaveIntent],
+        scheduler_output: "SchedulerOutput",
+        authoritative_blocks: dict[str, tuple[tuple[int, ...], ...]],
+    ) -> dict[str, SaveIntent]:
+        """Drop sliding sources reallocated to another request this step.
+
+        A sliding source can disappear from vLLM's request table before an
+        append-only connector mirror is refreshed.  If the physical block is
+        then allocated to another request, saving the stale source under its
+        old hash would publish that request's KV under the wrong key.  vLLM's
+        offloading connector handles this with its per-step allocated-block
+        set and flushes pending jobs containing a reallocated source.  Pega's
+        save worker is intentionally asynchronous, so the equivalent safe
+        operation is to turn the stale source into a null entry before pinning
+        and queueing the intent.
+
+        ``authoritative_blocks`` contains complete tables for requests for
+        which vLLM exposed a snapshot.  The new block deltas cover older
+        scheduler outputs that do not expose such a snapshot.  Ownership is
+        keyed by cache group because different hybrid groups may use separate
+        block pools with overlapping integer IDs.
+        """
+        sliding = getattr(self._cache_groups, "sliding_window_group_indices", ())
+        if not sliding or not intents:
+            return intents
+
+        # A block can legitimately be present in more than one request's
+        # table when vLLM shares a cached prefix.  Keep the complete owner set
+        # instead of treating the last snapshot entry as the sole owner.
+        owners: dict[tuple[int, int], set[str]] = {}
+        reallocated: set[int] = set()
+
+        def record_owner(group_index: int, block_id: int, req_id: str) -> None:
+            if block_id:
+                owners.setdefault((group_index, block_id), set()).add(req_id)
+
+        for req_id, groups in authoritative_blocks.items():
+            for group_index, block_ids in enumerate(groups):
+                for block_id in block_ids:
+                    record_owner(group_index, block_id, req_id)
+
+        cached = scheduler_output.scheduled_cached_reqs
+        for req in scheduler_output.scheduled_new_reqs:
+            if req.req_id in authoritative_blocks:
+                continue
+            for group_index, block_ids in enumerate(req.block_ids or ()):
+                for block_id in block_ids:
+                    record_owner(group_index, block_id, req.req_id)
+                    if block_id:
+                        reallocated.add(block_id)
+        for index, req_id in enumerate(cached.req_ids):
+            if req_id in authoritative_blocks:
+                continue
+            block_groups = cached.new_block_ids[index]
+            if not block_groups:
+                continue
+            for group_index, block_ids in enumerate(block_groups):
+                for block_id in block_ids:
+                    record_owner(group_index, block_id, req_id)
+                    if block_id:
+                        reallocated.add(block_id)
+
+        # COW destinations are allocated pages even when the scheduler does
+        # not include their request in the block-table snapshot.  Their
+        # records do not carry a cache-group id, so match them by physical id
+        # for every sliding group, as vLLM's offloading connector does.
+        for copy in getattr(scheduler_output, "kv_cache_block_copies", ()) or ():
+            destination = getattr(copy, "dst_block_id", None)
+            if destination:
+                reallocated.add(destination)
+
+        filtered: dict[str, SaveIntent] = {}
+        for req_id, intent in intents.items():
+            groups = [list(group) for group in intent.block_ids_by_group]
+            dropped: list[tuple[int, int]] = []
+            for group_index in sliding:
+                if group_index >= len(groups):
+                    continue
+                for offset, block_id in enumerate(groups[group_index]):
+                    if not block_id:
+                        continue
+                    owner_set = owners.get((group_index, block_id), set())
+                    if (owner_set and req_id not in owner_set) or (
+                        block_id in reallocated and req_id not in owner_set
+                    ):
+                        groups[group_index][offset] = 0
+                        dropped.append((group_index, block_id))
+            if dropped:
+                logger.warning(
+                    "[PegaKVConnector] req=%s dropped %d late-pinned sliding sources "
+                    "reallocated this step: %s",
+                    req_id,
+                    len(dropped),
+                    dropped,
+                )
+            filtered[req_id] = replace(
+                intent, block_ids_by_group=tuple(tuple(group) for group in groups)
+            )
+        return filtered
 
     def _pin_sliding_save_intents(self, intents: dict[str, SaveIntent]) -> None:
         sliding = getattr(self._cache_groups, "sliding_window_group_indices", ())
@@ -1336,8 +1477,8 @@ class SchedulerConnector:
         def span(group_index: int, blocks: int) -> tuple[int, int]:
             size = group_sizes[group_index]
             end_token = (computed_blocks + blocks) * full_vbs
-            window = layout.sliding_window_of(group_index)
-            start_token = max(computed_tokens, end_token - window if window else 0)
+            retained = layout.sliding_retained_tokens_of(group_index)
+            start_token = max(computed_tokens, end_token - retained if retained else 0)
             return start_token // size, end_token // size
 
         def query(
