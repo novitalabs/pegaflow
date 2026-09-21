@@ -79,6 +79,7 @@ def _make_scheduler(world_size: int = 1) -> tuple[SchedulerConnector, _FakePool]
         hash_group_index=0,
         has_recurrent_state=True,
         recurrent_group_indices=frozenset({1}),
+        scratch_group_indices=frozenset(),
     )
     pool = _FakePool()
     scheduler._gpu_block_pool = pool
@@ -388,6 +389,7 @@ def test_junction_hint_is_hma_only():
         hash_group_index=0,
         has_recurrent_state=False,
         recurrent_group_indices=frozenset(),
+        scratch_group_indices=frozenset(),
     )
     request = _request(num_tokens=200, num_hashes=12)
 

@@ -1058,12 +1058,16 @@ class SchedulerConnector:
         # here is neither complete nor trustworthy. Their states are saved
         # exactly from vLLM's boundary hand-offs instead
         # (`_consume_boundary_state_offloads`); attention groups keep the
-        # dense per-block cadence.
-        recurrent = self._cache_groups.recurrent_group_indices
+        # dense per-block cadence. Scratch groups (kpool tails) hold one
+        # circular block per request, so their mirror length would clamp
+        # `saveable_block_idx` — they are never saved either.
+        non_positional = (
+            self._cache_groups.recurrent_group_indices | self._cache_groups.scratch_group_indices
+        )
         attention_lengths = [
             len(group)
             for group_index, group in enumerate(allocated)
-            if group_index not in recurrent
+            if group_index not in non_positional
         ]
 
         # _allocated_blocks tracks request block IDs in global request order.
@@ -1087,7 +1091,7 @@ class SchedulerConnector:
         save_hashes = block_hashes[hash_start : hash_start + new_blocks]
         save_block_ids_by_group = tuple(
             (0,) * new_blocks
-            if group_index in recurrent
+            if group_index in non_positional
             else tuple(group[hash_start : hash_start + new_blocks])
             for group_index, group in enumerate(allocated)
         )
@@ -1098,6 +1102,10 @@ class SchedulerConnector:
             mapped_hashes: list[tuple[bytes, ...]] = []
             full_vbs = self._ctx.virtual_block_size
             for group_index, group in enumerate(allocated):
+                if group_index in non_positional:
+                    mapped_ids.append(())
+                    mapped_hashes.append(())
+                    continue
                 group_vbs = self._cache_groups.block_size_of(group_index) * self._ctx.dcp_world_size
                 group_hashes = self._request_block_hashes(request, group_index)
                 ratio = full_vbs // group_vbs
@@ -1154,12 +1162,17 @@ class SchedulerConnector:
         past `num_load_blocks` get `None` targets and are skipped.
         """
         end_block_idx = start_block_idx + num_load_blocks
+        scratch = self._cache_groups.scratch_group_indices
         available = [len(group) for group in block_ids_by_group]
         ranges = [(start_block_idx, end_block_idx)] * len(block_ids_by_group)
         if block_ranges_by_group is not None:
             for index in self._cache_groups.sliding_window_group_indices:
                 ranges[index] = block_ranges_by_group[index]
-        if any(length < end for length, (_, end) in zip(available, ranges, strict=True)):
+        if any(
+            length < end
+            for index, (length, (_, end)) in enumerate(zip(available, ranges, strict=True))
+            if index not in scratch
+        ):
             raise RuntimeError(
                 f"load block mismatch: start={start_block_idx} count={num_load_blocks} "
                 f"available_by_group={available}"
@@ -1175,6 +1188,9 @@ class SchedulerConnector:
 
         result: list[tuple[int | None, ...]] = []
         for group_index, block_ids in enumerate(block_ids_by_group):
+            if group_index in scratch:
+                result.append((None,) * leased_blocks)
+                continue
             start, end = ranges[group_index]
             destinations: tuple[int | None, ...] = block_ids[start:end]
             if (

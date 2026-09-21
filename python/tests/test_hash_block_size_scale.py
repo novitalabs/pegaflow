@@ -113,6 +113,7 @@ def test_boundary_offload_uses_the_hash_closing_the_boundary_block():
         hash_group_index=0,
         has_recurrent_state=True,
         recurrent_group_indices=frozenset({1}),
+        scratch_group_indices=frozenset(),
     )
     scheduler._gpu_block_pool = SimpleNamespace(
         blocks=[SimpleNamespace(block_id=i) for i in range(64)],

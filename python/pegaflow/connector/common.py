@@ -330,6 +330,10 @@ class CacheGroupLayout:
     dense full attention uses group 0 (prefix cadence), sliding-window
     attention uses a secondary membership group, and recurrent groups get
     subsequent ids (group-encoded keys).
+
+    Scratch groups (KpoolTailSpec) hold per-request circular state and are
+    never registered, saved, or loaded. They remain in the group order so
+    connector indices match vLLM's block tables.
     """
 
     layer_names: tuple[tuple[str, ...], ...]
@@ -341,6 +345,8 @@ class CacheGroupLayout:
     group_sliding_windows: tuple[int | None, ...] = ()
     storage_group_ids: tuple[int, ...] = (0,)
     group_block_sizes: tuple[int, ...] = ()
+    scratch_group_indices: frozenset[int] = frozenset()
+    scratch_layer_names: frozenset[str] = frozenset()
 
     @classmethod
     def from_config(
@@ -371,12 +377,24 @@ class CacheGroupLayout:
             UniformTypeKVCacheSpecs,
         )
 
+        try:
+            from vllm.v1.kv_cache_interface import KpoolTailSpec
+        except ImportError:
+            KpoolTailSpec = None
+
         specs = tuple(group.kv_cache_spec for group in groups)
         layer_specs = tuple(
             tuple(spec.kv_cache_specs.values())
             if isinstance(spec, UniformTypeKVCacheSpecs)
             else (spec,)
             for spec in specs
+        )
+        scratch_group_indices = frozenset(
+            index
+            for index, layers in enumerate(layer_specs)
+            if KpoolTailSpec is not None
+            and layers
+            and all(type(layer) is KpoolTailSpec for layer in layers)
         )
         uniform_attention = tuple(
             isinstance(spec, UniformTypeKVCacheSpecs)
@@ -397,7 +415,8 @@ class CacheGroupLayout:
         sliding_window_group_indices = frozenset(
             index
             for index, layers in enumerate(layer_specs)
-            if any(isinstance(layer, SlidingWindowSpec) for layer in layers)
+            if index not in scratch_group_indices
+            and any(isinstance(layer, SlidingWindowSpec) for layer in layers)
         )
         if sliding_window_group_indices and not allow_sliding_window:
             raise RuntimeError(
@@ -425,16 +444,24 @@ class CacheGroupLayout:
             hash_group_index = 0
         else:
             if any(
-                not isinstance(spec, (FullAttentionSpec, SlidingWindowSpec, MambaSpec))
+                index not in scratch_group_indices
+                and not isinstance(
+                    spec, (FullAttentionSpec, MLAAttentionSpec, SlidingWindowSpec, MambaSpec)
+                )
                 and not uniform
-                for spec, uniform in zip(specs, uniform_attention, strict=True)
+                for index, (spec, uniform) in enumerate(zip(specs, uniform_attention, strict=True))
             ):
-                raise RuntimeError("PegaFlow HMA supports only attention and Mamba cache groups")
+                raise RuntimeError(
+                    "PegaFlow HMA supports only attention, Mamba, and kpool-tail scratch cache groups"
+                )
             hash_group_index = next(
                 (
                     index
                     for index, layers in enumerate(layer_specs)
-                    if any(isinstance(layer, FullAttentionSpec) for layer in layers)
+                    if index not in scratch_group_indices
+                    and any(
+                        isinstance(layer, (FullAttentionSpec, MLAAttentionSpec)) for layer in layers
+                    )
                 ),
                 None,
             )
@@ -457,8 +484,8 @@ class CacheGroupLayout:
         if any(size <= 0 for size in group_block_sizes):
             raise RuntimeError("PegaFlow cache groups require positive logical block sizes")
         if any(
-            int(layer.block_size) != size
-            for size, layers in zip(group_block_sizes, layer_specs, strict=True)
+            index not in scratch_group_indices and int(layer.block_size) != size
+            for index, (size, layers) in enumerate(zip(group_block_sizes, layer_specs, strict=True))
             for layer in layers
         ):
             raise RuntimeError(
@@ -468,7 +495,11 @@ class CacheGroupLayout:
             if hash_block_size <= 0:
                 raise ValueError(f"hash block size must be > 0, got {hash_block_size}")
             # Single-group DCP hashes span multiple physical blocks.
-            if len(groups) > 1 and any(size % hash_block_size for size in group_block_sizes):
+            if len(groups) > 1 and any(
+                size % hash_block_size
+                for index, size in enumerate(group_block_sizes)
+                if index not in scratch_group_indices
+            ):
                 raise RuntimeError(
                     "PegaFlow cache group block sizes must be integer multiples of "
                     f"hash block size {hash_block_size}; got {group_block_sizes}"
@@ -477,7 +508,9 @@ class CacheGroupLayout:
         if any(
             size != dense_block_size
             for index, size in enumerate(group_block_sizes)
-            if index not in recurrent_group_indices and index not in sliding_window_group_indices
+            if index not in recurrent_group_indices
+            and index not in sliding_window_group_indices
+            and index not in scratch_group_indices
         ):
             raise RuntimeError(
                 "PegaFlow requires dense attention groups to share a logical block size"
@@ -500,6 +533,7 @@ class CacheGroupLayout:
                     int(layer.sliding_window)
                     for layer in layers
                     if isinstance(layer, SlidingWindowSpec)
+                    and not (KpoolTailSpec is not None and type(layer) is KpoolTailSpec)
                 ),
                 None,
             )
@@ -529,6 +563,12 @@ class CacheGroupLayout:
             group_sliding_windows=group_sliding_windows,
             storage_group_ids=storage_group_ids,
             group_block_sizes=group_block_sizes,
+            scratch_group_indices=scratch_group_indices,
+            scratch_layer_names=frozenset(
+                layer_name
+                for index in scratch_group_indices
+                for layer_name in groups[index].layer_names
+            ),
         )
 
     @property

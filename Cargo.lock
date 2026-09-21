@@ -1896,7 +1896,7 @@ checksum = "19b17cddbe7ec3f8bc800887bab5e717348c95ea2ca0b1bf0837fb964dc67099"
 
 [[package]]
 name = "pegaflow-common"
-version = "0.24.4"
+version = "0.24.5"
 dependencies = [
  "colored",
  "libc",
@@ -1906,7 +1906,7 @@ dependencies = [
 
 [[package]]
 name = "pegaflow-core"
-version = "0.24.4"
+version = "0.24.5"
 dependencies = [
  "ahash",
  "bytesize",
@@ -1939,7 +1939,7 @@ dependencies = [
 
 [[package]]
 name = "pegaflow-metaserver"
-version = "0.24.4"
+version = "0.24.5"
 dependencies = [
  "axum",
  "clap",
@@ -1961,7 +1961,7 @@ dependencies = [
 
 [[package]]
 name = "pegaflow-pd-wire"
-version = "0.24.4"
+version = "0.24.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -1969,7 +1969,7 @@ dependencies = [
 
 [[package]]
 name = "pegaflow-proto"
-version = "0.24.4"
+version = "0.24.5"
 dependencies = [
  "prost",
  "tonic",
@@ -1979,7 +1979,7 @@ dependencies = [
 
 [[package]]
 name = "pegaflow-py"
-version = "0.24.4"
+version = "0.24.5"
 dependencies = [
  "log",
  "mea",
@@ -1997,7 +1997,7 @@ dependencies = [
 
 [[package]]
 name = "pegaflow-server"
-version = "0.24.4"
+version = "0.24.5"
 dependencies = [
  "axum",
  "clap",
@@ -2029,7 +2029,7 @@ dependencies = [
 
 [[package]]
 name = "pegaflow-transfer"
-version = "0.24.4"
+version = "0.24.5"
 dependencies = [
  "anyhow",
  "bincode",
