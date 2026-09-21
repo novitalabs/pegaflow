@@ -291,6 +291,29 @@ def test_accepts_heterogeneous_sliding_window_mapping():
     assert layout.requires_group_specific_block_mapping
 
 
+@pytest.mark.parametrize(
+    ("sliding_sizes", "storage_groups"),
+    [
+        ((32, 16), (0, 1, 2)),
+        ((16, 16), (0, 1, 1)),
+    ],
+)
+def test_sliding_groups_share_storage_only_at_the_same_block_cadence(
+    sliding_sizes, storage_groups
+):
+    config = _config(
+        _group("attention", _full_attention(block_size=32)),
+        *(
+            _group(f"sliding_{index}", _sliding_window(block_size=size))
+            for index, size in enumerate(sliding_sizes)
+        ),
+    )
+
+    layout = CacheGroupLayout.from_config(config, hash_block_size=16)
+
+    assert layout.storage_group_ids == storage_groups
+
+
 def test_sliding_window_layout_preserves_extra_retained_tokens():
     config = _config(
         _group("attention", _full_attention()),

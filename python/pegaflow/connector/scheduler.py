@@ -718,19 +718,19 @@ class SchedulerConnector:
 
             # Append newly allocated blocks
             new_block_ids = cached_reqs.new_block_ids[idx]
+            resumed = req_id in cached_reqs.resumed_req_ids
             if req_id in authoritative_blocks:
                 # The snapshot already includes the complete current table;
                 # appending the delta would duplicate freshly allocated
                 # blocks and reintroduce the stale mirror that this snapshot
                 # is intended to replace.
                 pass
-            elif req_id in cached_reqs.resumed_req_ids:
+            elif resumed:
                 self._allocated_blocks[req_id] = (
                     [list(group) for group in self._copy_block_ids_by_group(new_block_ids)]
                     if new_block_ids
                     else [[] for _ in range(self._cache_groups.group_count)]
                 )
-                self._rebase_resumed_request(req_id)
             elif new_block_ids:
                 for allocated, new_group in zip(
                     self._allocated_blocks[req_id],
@@ -738,6 +738,13 @@ class SchedulerConnector:
                     strict=True,
                 ):
                     allocated.extend(new_group)
+
+            # A block-table snapshot refreshes ownership, but it does not
+            # reset connector progress from the request's previous lifetime.
+            # Resumed requests must be rebased even when the snapshot branch
+            # above supplied the fresh table.
+            if resumed:
+                self._rebase_resumed_request(req_id)
 
             if self._ctx.read_enabled:
                 self._scheduled_tokens[req_id] += num_tokens

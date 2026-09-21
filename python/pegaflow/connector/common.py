@@ -327,9 +327,10 @@ class CacheGroupLayout:
     """Stable vLLM cache-group order shared by scheduler and worker.
 
     `storage_group_ids` maps connector groups onto engine storage groups:
-    dense full attention uses group 0 (prefix cadence), sliding-window
-    attention uses a secondary membership group, and recurrent groups get
-    subsequent ids (group-encoded keys).
+    dense full attention and scratch groups use group 0 (prefix cadence),
+    sliding-window groups share a membership group only when they have the
+    same logical block size, and recurrent groups get subsequent ids
+    (group-encoded keys).
 
     Scratch groups (KpoolTailSpec) hold per-request circular state and are
     never registered, saved, or loaded. They remain in the group order so
@@ -578,14 +579,27 @@ class CacheGroupLayout:
                 "PegaFlow requires SlidingWindow layers within each cache group to share "
                 "extra_retained_tokens"
             )
-        # Dense groups share the prefix; sliding groups share membership keys.
-        # Sliding and recurrent layouts are mutually exclusive.
-        storage_group_ids = tuple(
-            1 + sum(other < index for other in recurrent_group_indices)
-            if index in recurrent_group_indices
-            else int(index in sliding_window_group_indices)
-            for index in range(len(groups))
-        )
+        # Dense groups and scratch groups share storage group 0. Sliding
+        # groups may share membership keys only when their physical block
+        # cadence is identical; otherwise the engine would wait forever for
+        # slots that the other cadence never produces. Sliding and recurrent
+        # layouts are mutually exclusive.
+        storage_group_ids = [0] * len(groups)
+        if sliding_window_group_indices:
+            storage_group_by_block_size: dict[int, int] = {}
+            next_storage_group = 1
+            for index in sorted(sliding_window_group_indices):
+                block_size = group_block_sizes[index]
+                storage_group = storage_group_by_block_size.get(block_size)
+                if storage_group is None:
+                    storage_group = next_storage_group
+                    next_storage_group += 1
+                    storage_group_by_block_size[block_size] = storage_group
+                storage_group_ids[index] = storage_group
+        else:
+            for offset, index in enumerate(sorted(recurrent_group_indices), start=1):
+                storage_group_ids[index] = offset
+        storage_group_ids = tuple(storage_group_ids)
 
         return cls(
             layer_names=tuple(tuple(group.layer_names) for group in groups),
