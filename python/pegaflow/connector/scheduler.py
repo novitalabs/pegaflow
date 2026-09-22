@@ -155,6 +155,12 @@ class SchedulerConnector:
         )
         if self._cache_groups.has_recurrent_state and (pd_tail_save or pd_tail_load):
             raise ValueError("P/D tail-block caching is not supported with HMA")
+        if self._cache_groups.sliding_window_group_indices and (
+            pd_tail_save or pd_tail_load
+        ):
+            raise ValueError(
+                "P/D tail-block caching is not supported with SlidingWindow cache groups"
+            )
         self._gpu_block_pool = None
 
         # P/D tail-block extension (`pegaflow.pd_tail_save`): vLLM only hashes
@@ -1091,9 +1097,9 @@ class SchedulerConnector:
         """
         if not self._tail_save_enabled or req_id in self._tail_saved:
             return None
-        if self._cache_groups.requires_group_specific_block_mapping:
+        if self._cache_groups.sliding_window_group_indices:
             logger.debug(
-                "[PegaKVConnector] req=%s pd_tail_save skipped for heterogeneous cache groups",
+                "[PegaKVConnector] req=%s pd_tail_save skipped for SlidingWindow cache groups",
                 req_id,
             )
             return None
@@ -1161,7 +1167,7 @@ class SchedulerConnector:
         self, request: "Request", computed_blocks: int
     ) -> tuple[tuple[bytes, ...], int]:
         query_hashes = self._request_block_hashes(request)[computed_blocks:]
-        if not self._tail_load_enabled:
+        if not self._tail_load_enabled or self._cache_groups.sliding_window_group_indices:
             return query_hashes, 0
 
         tail = self._derive_tail_block(request)
