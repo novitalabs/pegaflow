@@ -12,12 +12,19 @@ install_connector_unit_stubs()
 
 from vllm.v1.kv_cache_interface import (  # noqa: E402
     FullAttentionSpec,
-    KpoolTailSpec,
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
+
+try:
+    from vllm.v1.kv_cache_interface import KpoolTailSpec  # noqa: E402
+except ImportError:
+    # KpoolTailSpec was added after the oldest vLLM version supported by the
+    # connector.  Keep the shared test suite collectible on those versions;
+    # the capability-specific test below is skipped there.
+    KpoolTailSpec = None
 
 from pegaflow.connector.common import CacheGroupLayout  # noqa: E402
 
@@ -363,6 +370,7 @@ def test_rejects_uniform_attention_group_with_sliding_window_layers():
         )
 
 
+@pytest.mark.skipif(KpoolTailSpec is None, reason="vLLM does not provide KpoolTailSpec")
 def test_accepts_glm53_flash_layout_with_kpool_tail_scratch():
     """GLM-5.3-Flash: uniform MLA + uniform KpoolTail scratch + mamba groups.
 
