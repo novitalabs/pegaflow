@@ -412,10 +412,11 @@ impl Engine for GrpcEngineService {
             // `batch_save_kv_blocks_from_ipc` enqueues the copied blocks on the
             // insert worker and returns before they become visible to queries.
             // The RPC response is the save completion signal consumed by the
-            // Python connector, so make that signal a cache-visibility barrier.
-            // Keep the core API asynchronous for in-process callers; only the
-            // externally observable RPC contract waits for the queued inserts.
-            self.engine.flush_saves().await;
+            // Python connector, so make it the full P/D visibility barrier:
+            // local cache insertion first, then MetaServer registration.
+            // Keep the core APIs asynchronous for in-process callers; only the
+            // externally observable RPC contract waits for the queued work.
+            self.engine.flush_saves_and_registrations().await;
 
             Ok(Response::new(SaveResponse {
                 status: Some(Self::build_simple_response()),
