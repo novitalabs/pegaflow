@@ -86,7 +86,8 @@ impl ReadCache {
         }
     }
 
-    pub(super) fn batch_insert_resident_keys(
+    #[cfg(test)]
+    fn batch_insert_resident_keys(
         &self,
         blocks: Vec<(BlockKey, Arc<SealedBlock>)>,
     ) -> Vec<BlockKey> {
@@ -232,11 +233,28 @@ impl ReadCache {
             return;
         }
 
+        let keys: Vec<BlockKey> = hashes
+            .iter()
+            .map(|hash| BlockKey::new(namespace.to_string(), hash.clone()))
+            .collect();
+        self.mark_reclaimable_keys(&keys);
+    }
+
+    /// Move resident blocks to the reclaimable replacement class.
+    ///
+    /// The caller supplies complete keys so serving-side paths can classify
+    /// the exact blocks they exposed without reconstructing namespace/hash
+    /// pairs. Missing blocks and blocks already in the reclaimable class are
+    /// ignored.
+    pub(crate) fn mark_reclaimable_keys(&self, keys: &[BlockKey]) {
+        if keys.is_empty() {
+            return;
+        }
+
         let mut inner = self.inner.lock();
         let mut moved = 0;
-        for hash in hashes {
-            let key = BlockKey::new(namespace.to_string(), hash.clone());
-            if mark_reclaimable(&mut inner, &key) {
+        for key in keys {
+            if mark_reclaimable(&mut inner, key) {
                 moved += 1;
             }
         }
@@ -473,11 +491,11 @@ mod tests {
 
         cache.batch_insert_refs(&[(local.clone(), local_block)]);
         cache.batch_insert(vec![(ssd.clone(), make_block())]);
-        cache.batch_insert_resident_keys(vec![(remote.clone(), make_block())]);
+        cache.batch_insert_refs(&[(remote.clone(), make_block())]);
 
         assert_class(&cache, &local, ResidentClass::Retained);
         assert_class(&cache, &ssd, ResidentClass::Retained);
-        assert_class(&cache, &remote, ResidentClass::Reclaimable);
+        assert_class(&cache, &remote, ResidentClass::Retained);
     }
 
     #[test]

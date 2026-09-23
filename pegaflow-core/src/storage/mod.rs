@@ -594,8 +594,12 @@ impl StorageEngine {
         requester_id: &str,
         blocks: &[(BlockKey, Arc<SealedBlock>)],
     ) -> String {
-        self.transfer_lock
-            .lock_blocks(requester_id, blocks.to_vec())
+        let session_id = self
+            .transfer_lock
+            .lock_blocks(requester_id, blocks.to_vec());
+        let keys: Vec<BlockKey> = blocks.iter().map(|(key, _)| key.clone()).collect();
+        self.read_cache.mark_reclaimable_keys(&keys);
+        session_id
     }
 
     pub(crate) fn transfer_lock_timeout(&self) -> Duration {
@@ -772,11 +776,12 @@ mod tests {
 
         storage.test_insert_cache(key.clone(), block.clone());
 
-        let session_id = storage.lock_blocks_for_transfer("node-a", &[(key, block)]);
+        let session_id = storage.lock_blocks_for_transfer("node-a", &[(key.clone(), block)]);
         assert!(
             !session_id.is_empty(),
             "lock_blocks_for_transfer should return a UUID when enabled"
         );
+        assert!(storage.read_cache.is_reclaimable_for_test(&key));
 
         let released = storage.release_transfer_lock(&session_id);
         assert_eq!(released, 1);
