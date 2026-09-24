@@ -132,6 +132,9 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
                 "pegaflow.wait_for_full_prefix", False
             )
         )
+        direct_gpu_rdma = bool(
+            vllm_config.kv_transfer_config.get_from_extra_config("pegaflow.direct_gpu_rdma", False)
+        )
         default_endpoint = f"{server_host}:{server_port}"
         tp_shards = TpShardTopology.from_config(
             default_endpoint=default_endpoint,
@@ -177,6 +180,7 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
             pp_size=pp_size,
             mode=mode,
             wait_for_full_prefix=wait_for_full_prefix,
+            direct_gpu_rdma=direct_gpu_rdma,
             tp_shards=tp_shards,
             hash_block_size=hash_block_size,
         )
@@ -238,7 +242,7 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
             "tp_rank=%s tp_size=%d pp_rank=%d pp_size=%d world_size=%d namespace=%s "
             "is_mla=%s collapse_mla_tp=%s transfer_backend=%s dcp_world_size=%d "
             "pcp_world_size=%d dcp_rank=%d tp_shard=%d/%d "
-            "mode=%s wait_for_full_prefix=%s",
+            "mode=%s wait_for_full_prefix=%s direct_gpu_rdma=%s",
             role.name,
             instance_id,
             device_id if device_id is not None else "cpu",
@@ -258,6 +262,7 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
             tp_shards.shard_count,
             mode.value,
             wait_for_full_prefix,
+            direct_gpu_rdma,
         )
 
     # ==============================

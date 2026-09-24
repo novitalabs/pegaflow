@@ -81,26 +81,107 @@ pegaflow-server \
 
 ### 3. Launch inference engine
 
-Same as single-node — PegaFlow server handles P2P transparently.
+Same as single-node — PegaFlow server handles host-staged P2P transparently.
 
 ```bash
 vllm serve Qwen/Qwen3-0.6B \
   --kv-transfer-config '{"kv_connector": "PegaKVConnector", "kv_role": "kv_both", "kv_connector_module_path": "pegaflow.connector"}'
 ```
 
+To select direct GPU reads, pass the connector option through vLLM's
+`kv_connector_extra_config`:
+
+```bash
+vllm serve Qwen/Qwen3-0.6B \
+  --kv-transfer-config '{
+    "kv_connector": "PegaKVConnector",
+    "kv_role": "kv_both",
+    "kv_connector_module_path": "pegaflow.connector",
+    "kv_connector_extra_config": {
+      "pegaflow.direct_gpu_rdma": true
+    }
+  }'
+```
+
+When enabled, the scheduler carries the remote fetch plan in the query lease
+and the worker issues RDMA READs into vLLM's registered GPU KV allocations.
+Omitting the option (or setting it to `false`) keeps the existing path of RDMA
+READ into host memory followed by host-to-GPU copy. Direct mode currently
+supports dense attention cache group 0 only. A failed direct load is surfaced
+to vLLM so the request can recompute; it is not automatically retried through
+host staging.
+
 ### 4. Verify
 
 Use `--log-level debug` to confirm P2P is working. Look for MetaServer registration, RDMA handshake, and RDMA fetch messages in the logs.
 
-## Fallback Behavior
+## Failure behavior
 
-P2P is opportunistic. Failures degrade gracefully to single-node operation — no crashes, no significant performance impact in most cases.
+Host-staged P2P is opportunistic and can proceed without a remote hit when
+discovery or transfer fails. Direct GPU mode has a stricter failure boundary:
+the failed load is reported to vLLM and the affected prefix is recomputed.
 
 | Scenario | What happens |
 |---|---|
 | MetaServer unreachable | Hash registration silently dropped. No remote discovery attempted. |
 | Remote node unreachable | gRPC handshake fails, fetch aborted. Request proceeds without remote blocks. |
 | RDMA transfer timeout | Connection invalidated, transfer lock force-released. Logged as error. |
+
+For direct GPU mode, the last two cases fail the direct load and do not invoke
+the host-staging path.
+
+## Direct GPU performance notes
+
+Direct GPU mode removes the requester-side host-to-GPU copy. It does not remove
+the other work on the critical path: MetaServer query, the per-segment gRPC
+block-metadata query, connection setup on a cold peer, descriptor construction,
+RDMA completion waits, transfer-lock release, and the CUDA GPUDirect visibility
+flush. The current implementation processes segments in order and flushes the
+CUDA context after each segment, so short prefixes or many owner segments can
+be latency-bound even when the raw GB300 GPU RDMA bandwidth is higher than the
+host-staging path.
+
+The existing 2P2D replay is not an apples-to-apples direct-load benchmark when
+NIXL is configured as the P-to-D transfer connector. NIXL performs the main
+P-to-D GPU transfer, while PegaFlow only handles the P-side cache lookup/load
+for the requests that hit a remote PegaFlow owner. The decode-side
+`save_only` connector records no PegaFlow loads. A small end-to-end difference
+in that replay therefore does not measure the direct-vs-host-staging copy in
+isolation.
+
+The GB300 replay illustrates the dilution. In one paired 8,422-request run,
+direct mode completed 1,387 direct loads in 16.322 seconds in aggregate
+(about 11.8 ms per direct load), while the host-staging control completed 735
+host RDMA fetches in 9.607 seconds (about 13.1 ms per fetch) and had one fetch
+error. The direct and host counters cover different cache histories and
+different operation boundaries, so these averages are directional evidence,
+not a throughput ratio. Overall mean TTFT was 187.527 ms versus 187.460 ms and
+throughput was 5.322 versus 5.326 requests/s. The run therefore shows why a
+faster direct data path can produce little end-to-end movement: most requests
+are misses, and the remaining hit latency includes scheduler work, P-side
+prefill, NIXL P-to-D transfer, and decode startup.
+
+To compare the two PegaFlow paths, use the same model, block count, request
+ordering, remote owner, and hit set. Make PegaKVConnector the requester-side
+`read_write` connector and run the same requests once with direct mode and
+once with host staging. For direct mode, use
+`pegaflow_direct_gpu_load_total` and
+`pegaflow_direct_gpu_load_duration_seconds`; for host staging, use the
+`pegaflow_rdma_fetch_*` metrics. The latter do not include direct GPU loads,
+and the current direct path does not export a direct-RDMA byte counter, so do
+not combine those counters into one bandwidth number. Split the measurement
+with connector timings and debug logs into query, metadata/handshake, RDMA
+transfer, visibility flush, and vLLM scheduling time.
+
+The current direct implementation has four likely latency costs after the
+query: one metadata RPC per owner segment, sequential segment processing,
+descriptor construction and completion waits, and creating/binding a CUDA
+context plus a GPUDirect visibility flush after each segment. Connection reuse
+removes the handshake from warm peers, and local RAM H2D and remote GPU RDMA
+already run concurrently. The first optimization candidates are therefore
+coalescing or parallelizing owner segments and moving the visibility flush to
+the end of a load when the CUDA/RDMA contract permits it; measure each change
+with the isolated A/B workload above before changing the data path.
 
 ## Tuning
 
@@ -137,6 +218,9 @@ P2P-related Prometheus metrics (on `:9091/metrics` by default):
 | `pegaflow_rdma_fetch_bytes` | Counter | Total bytes fetched via RDMA |
 | `pegaflow_rdma_fetch_plan_segments` | Histogram | Planned segment count per executed RDMA fetch plan |
 | `pegaflow_rdma_fetch_plan_completed_segments` | Histogram | Completed segment count before a plan stops |
+| `pegaflow_direct_gpu_load_total` | Counter | Direct GPU load attempts, labelled by success or error |
+| `pegaflow_direct_gpu_load_duration_seconds` | Histogram | End-to-end direct GPU load duration |
+| `pegaflow_direct_gpu_mr_registration_failures` | Counter | GPU memory registration failures that prevent direct loads |
 | `pegaflow_rdma_qps` | Gauge | Active RDMA queue pairs |
 | `pegaflow_transfer_lock_active` | UpDownCounter | Currently held transfer locks |
 | `pegaflow_transfer_lock_timeouts_total` | Counter | Transfer lock timeout events |
@@ -155,3 +239,6 @@ P2P-related Prometheus metrics (on `:9091/metrics` by default):
 - Enable hugepages for large pools (`--use-hugepages`).
 
 For all P2P issues, `--log-level debug` shows the full handshake and fetch flow.
+The direct load duration includes the remote query, RDMA completion, GPU
+visibility flush, and any concurrent local H2D load. It is not a raw GPU-RDMA
+bandwidth measurement.

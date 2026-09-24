@@ -1,3 +1,4 @@
+mod dma_buf;
 mod engine;
 mod error;
 mod rc_backend;
@@ -8,6 +9,7 @@ mod cuda_sys;
 mod cudart_sys;
 pub mod v2;
 
+pub use dma_buf::{CudaDmaBuf, export_cuda_dma_buf};
 pub use engine::{
     ConnectionStatus, HandshakeMetadata, MemoryRegion, TransferDesc, TransferEngine, TransferOp,
 };

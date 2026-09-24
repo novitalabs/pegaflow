@@ -14,6 +14,7 @@ pub(super) struct RegisteredMemoryEntry {
     pub(super) len: usize,
     /// One MR per NIC (different PDs → different rkeys).
     pub(super) mrs: Vec<Arc<MemoryRegion>>,
+    pub(super) owner: Option<Arc<crate::CudaDmaBuf>>,
 }
 
 /// Local registered memory, ordered by base pointer. Insertion rejects
@@ -68,24 +69,35 @@ impl LocalMemoryMap {
         self.entries.remove(&base_ptr)
     }
 
+    pub(super) fn contains_exact(&self, base_ptr: u64, len: usize) -> bool {
+        self.entries
+            .get(&base_ptr)
+            .is_some_and(|entry| entry.len == len)
+    }
+
     /// Entries in base_ptr order.
     pub(super) fn iter(&self) -> impl Iterator<Item = &RegisteredMemoryEntry> {
         self.entries.values()
     }
 
-    /// Find the MR (for `nic_idx`) of the region fully covering `[ptr, ptr+len)`.
-    pub(super) fn find_mr(
+    /// Find the MR (for `nic_idx`) and optional owner of the region fully
+    /// covering `[ptr, ptr+len)`.
+    ///
+    /// The transfer hot path needs both values for every descriptor. Resolve
+    /// the covering B-tree entry once so device batches do not pay for two
+    /// identical predecessor lookups.
+    pub(super) fn find_mr_and_owner(
         &self,
         nic_idx: usize,
         ptr: u64,
         len: usize,
-    ) -> Option<Arc<MemoryRegion>> {
+    ) -> Option<(Arc<MemoryRegion>, Option<Arc<crate::CudaDmaBuf>>)> {
         self.find_entry(ptr, len)
-            .map(|entry| Arc::clone(&entry.mrs[nic_idx]))
+            .map(|entry| (Arc::clone(&entry.mrs[nic_idx]), entry.owner.clone()))
     }
 
     /// Non-overlap makes the predecessor the only possible covering region.
-    fn find_entry(&self, ptr: u64, len: usize) -> Option<&RegisteredMemoryEntry> {
+    pub(super) fn find_entry(&self, ptr: u64, len: usize) -> Option<&RegisteredMemoryEntry> {
         let end = ptr.checked_add(len as u64)?;
         let (_, entry) = self.entries.range(..=ptr).next_back()?;
         (end <= entry.base_ptr + entry.len as u64).then_some(entry)
@@ -279,6 +291,7 @@ mod tests {
             base_ptr,
             len,
             mrs: Vec::new(),
+            owner: None,
         }
     }
 
@@ -287,6 +300,8 @@ mod tests {
         let mut map = LocalMemoryMap::default();
         map.insert(entry(0x1000, 0x100)).expect("first region");
         map.insert(entry(0x3000, 0x100)).expect("disjoint region");
+        assert!(map.contains_exact(0x1000, 0x100));
+        assert!(!map.contains_exact(0x1000, 0x80));
 
         // Overlap with predecessor and successor both rejected.
         assert!(map.insert(entry(0x10ff, 0x10)).is_err());

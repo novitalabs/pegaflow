@@ -34,6 +34,10 @@ impl NicGroup {
         let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed);
         self.nic_indices[idx % self.nic_indices.len()]
     }
+
+    fn next_position(&self) -> usize {
+        self.rr_counter.fetch_add(1, Ordering::Relaxed) % self.nic_indices.len()
+    }
 }
 
 struct NumaRoundRobin {
@@ -169,11 +173,86 @@ impl RcBackend {
             base_ptr: raw,
             len,
             mrs,
+            owner: None,
         })?;
         debug!(
             "memory registered: ptr={:#x}, len={}, nics={}",
             raw,
             len,
+            self.nic_count()
+        );
+        Ok(())
+    }
+
+    pub(crate) fn register_dma_buf_memory(
+        &self,
+        region: Arc<crate::CudaDmaBuf>,
+        device_id: u8,
+    ) -> Result<()> {
+        let ptr = NonNull::new(region.ptr as *mut u8)
+            .ok_or(TransferError::InvalidArgument("CUDA allocation is null"))?;
+        let len = region.len;
+        if len == 0 {
+            return Err(TransferError::InvalidArgument("len must be non-zero"));
+        }
+
+        // Replacing an allocation's MR would invalidate exchanged rkeys.
+        let raw = ptr.as_ptr() as u64;
+        if self.state.lock().registered.contains_exact(raw, len) {
+            return Err(TransferError::InvalidArgument(
+                "CUDA allocation is already registered",
+            ));
+        }
+
+        let attrs = crate::cuda_lib::rt::cudaPointerGetAttributes(ptr.cast()).map_err(|error| {
+            TransferError::Backend(format!(
+                "CUDA pointer validation failed for device {device_id}: {error}"
+            ))
+        })?;
+        if attrs.type_ != crate::cuda_lib::rt::cudaMemoryTypeDevice {
+            return Err(TransferError::Backend(
+                "direct-GPU registration requires a CUDA device pointer".to_string(),
+            ));
+        }
+        if attrs.device != i32::from(device_id) {
+            return Err(TransferError::Backend(format!(
+                "CUDA pointer belongs to device {}, requested device {device_id}",
+                attrs.device
+            )));
+        }
+
+        let mut mrs = Vec::with_capacity(self.nic_count());
+        for runtime in &self.runtimes {
+            let mr = unsafe {
+                runtime.pd.reg_dmabuf_mr(
+                    0,
+                    len,
+                    raw,
+                    region.fd(),
+                    AccessFlags::LocalWrite | AccessFlags::RemoteWrite | AccessFlags::RemoteRead,
+                )
+            }
+            .map_err(|error| {
+                TransferError::Backend(format!(
+                    "GPUDirect RDMA DMA-BUF registration failed on NIC {}: {error}",
+                    runtime.nic_name
+                ))
+            });
+            mrs.push(mr?);
+        }
+
+        let mut state = self.state.lock();
+        Arc::make_mut(&mut state.registered).insert(RegisteredMemoryEntry {
+            base_ptr: raw,
+            len,
+            mrs,
+            owner: Some(region),
+        })?;
+        info!(
+            "CUDA memory registered for direct RDMA: ptr={:#x}, len={}, device={}, nics={}",
+            raw,
+            len,
+            device_id,
             self.nic_count()
         );
         Ok(())
@@ -389,12 +468,23 @@ impl RcBackend {
             .map(|c| c.local_nics.clone())
     }
 
-    /// Remove connection state on transfer failure. The connection owns its
-    /// sessions, so in-flight work keeps its QPs alive through their Arcs.
+    /// Remove connection state on transfer failure and reset all of its QPs.
+    /// Resetting prevents accepted work from continuing to access caller-owned
+    /// buffers after a timeout or transport error.
     pub(crate) fn invalidate_connection(&self, remote_addr: &str) {
-        let mut state = self.state.lock();
-        if state.addr_connections.remove(remote_addr).is_some() {
+        let connection = self.state.lock().addr_connections.remove(remote_addr);
+        if let Some(connection) = connection {
             info!("connection invalidated: remote={remote_addr}");
+            for nic in connection.nics {
+                for session in nic.sessions.iter() {
+                    if let Err(error) = session.reset() {
+                        warn!(
+                            "failed to reset invalidated RC session: remote={remote_addr} qpn={} error={error}",
+                            session.local_endpoint.qp_num
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -409,6 +499,29 @@ impl RcBackend {
         remote_addr: &str,
         descs: &[TransferDesc],
     ) -> Result<Vec<oneshot::Receiver<Result<usize>>>> {
+        self.batch_transfer_async_inner(op, remote_addr, descs, true)
+    }
+
+    /// Submit a batch whose local pointers are CUDA device addresses.
+    /// `move_pages(2)` only classifies CPU pages and adds overhead (or returns
+    /// UNKNOWN) for GPU mappings, so direct GPU transfers use the same
+    /// round-robin fallback as unknown NUMA placement.
+    pub(crate) fn batch_transfer_gpu_async(
+        &self,
+        op: TransferOp,
+        remote_addr: &str,
+        descs: &[TransferDesc],
+    ) -> Result<Vec<oneshot::Receiver<Result<usize>>>> {
+        self.batch_transfer_async_inner(op, remote_addr, descs, false)
+    }
+
+    fn batch_transfer_async_inner(
+        &self,
+        op: TransferOp,
+        remote_addr: &str,
+        descs: &[TransferDesc],
+        numa_aware: bool,
+    ) -> Result<Vec<oneshot::Receiver<Result<usize>>>> {
         if descs.is_empty() {
             return Ok(Vec::new());
         }
@@ -417,9 +530,26 @@ impl RcBackend {
 
         // NUMA-aware NIC assignment: query the NUMA node of each descriptor's
         // first page and route to a NIC on the same NUMA node.
-        let mut per_nic: Vec<Vec<TransferDesc>> = (0..nic_count).map(|_| Vec::new()).collect();
-        if self.numa_rr.single_numa {
-            // All NICs on one NUMA node — skip move_pages, plain round-robin.
+        let per_nic_capacity = if numa_aware {
+            0
+        } else {
+            descs.len().div_ceil(nic_count)
+        };
+        let mut per_nic: Vec<Vec<TransferDesc>> = (0..nic_count)
+            .map(|_| Vec::with_capacity(per_nic_capacity))
+            .collect();
+        if !numa_aware {
+            // GPU addresses cannot be classified by move_pages. Reserve one
+            // atomic increment for the whole batch; per-descriptor fetch_add
+            // adds contention without improving distribution.
+            let start = self.numa_rr.fallback.next_position();
+            for (index, &desc) in descs.iter().enumerate() {
+                let nic_idx = self.numa_rr.fallback.nic_indices[(start + index) % nic_count];
+                per_nic[nic_idx].push(desc);
+            }
+        } else if self.numa_rr.single_numa {
+            // All host NICs on one NUMA node — skip move_pages, plain
+            // round-robin as in the original host staging path.
             for &desc in descs {
                 let nic_idx = self.numa_rr.fallback.next();
                 per_nic[nic_idx].push(desc);
@@ -494,9 +624,10 @@ impl RcBackend {
                     return Err(TransferError::InvalidArgument("len must be non-zero"));
                 }
 
-                let local_mr = registered
-                    .find_mr(nic.nic_idx, local_ptr, len)
-                    .ok_or(TransferError::MemoryNotRegistered { ptr: local_ptr })?;
+                let (local_mr, owner) =
+                    registered
+                        .find_mr_and_owner(nic.nic_idx, local_ptr, len)
+                        .ok_or(TransferError::MemoryNotRegistered { ptr: local_ptr })?;
 
                 let remote_rkey = nic.remote_memory.find_rkey(remote_ptr, len).ok_or(
                     TransferError::InvalidArgument("remote memory not found in handshake snapshot"),
@@ -505,6 +636,7 @@ impl RcBackend {
                 let bucket = nic.rot.wrapping_add(i) % n;
                 buckets[bucket].push(RdmaOp {
                     local_mr,
+                    _owner: owner,
                     local_ptr,
                     remote_ptr,
                     len,
@@ -533,7 +665,15 @@ impl RcBackend {
         // --- Submit outside lock ---
         let mut receivers = Vec::with_capacity(nic_work.len());
         for (session, prepared) in nic_work {
-            receivers.push(session.transfer_batch_async(prepared, op)?);
+            match session.transfer_batch_async(prepared, op) {
+                Ok(receiver) => receivers.push(receiver),
+                Err(error) => {
+                    // Return every accepted completion even if a later session rejects submission.
+                    let (tx, rx) = oneshot::channel();
+                    let _ = tx.send(Err(error));
+                    receivers.push(rx);
+                }
+            }
         }
         Ok(receivers)
     }

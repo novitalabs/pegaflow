@@ -7,6 +7,7 @@ import queue
 import threading
 import time
 from collections.abc import Iterable, Iterator
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -22,6 +23,7 @@ from pegaflow.connector.common import (
     logger,
     parse_env_int,
 )
+from pegaflow.dma_buf import DmaBufExports
 from pegaflow.ipc_wrapper import CudaIPCWrapper
 from pegaflow.pegaflow import PyLoadState
 
@@ -307,6 +309,11 @@ class WorkerConnector:
         self._registered_layers.clear()
 
     def register_kv_caches(self, kv_caches: dict[str, Any]):
+        direct = self._ctx.direct_gpu_rdma
+        with DmaBufExports() if direct else nullcontext() as exports:
+            self._register_kv_caches(kv_caches, exports)
+
+    def _register_kv_caches(self, kv_caches: dict[str, Any], exports: DmaBufExports | None):
         """Register exactly the KV caches vLLM built on this device.
 
         The engine derives the instance-wide layer-id space once every worker
@@ -397,7 +404,11 @@ class WorkerConnector:
                     registration_tensor.storage_offset(),
                 )
 
-            wrapper = CudaIPCWrapper(registration_tensor)
+            wrapper = (
+                CudaIPCWrapper(registration_tensor, exports)
+                if exports
+                else CudaIPCWrapper(registration_tensor)
+            )
             wrapper_bytes = pickle.dumps(wrapper)
 
             registration = _infer_kv_cache_registration(

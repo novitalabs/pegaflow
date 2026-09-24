@@ -71,6 +71,29 @@ llm = LLM(
 )
 ```
 
+To enable direct GPU P2P reads, add the connector extra configuration. The
+value is read from vLLM's `--kv-transfer-config` in both the scheduler and
+worker processes, so no process environment variable is required:
+
+```json
+{
+  "kv_connector": "PegaKVConnector",
+  "kv_role": "kv_both",
+  "kv_connector_module_path": "pegaflow.connector",
+  "kv_connector_extra_config": {
+    "pegaflow.direct_gpu_rdma": true
+  }
+}
+```
+
+Leave the key out, or set it to `false`, to keep the host-staging path. Direct
+GPU mode currently supports dense attention cache group 0 only. A direct load
+failure is reported to vLLM for recomputation; it is not silently retried via
+host staging. The direct load duration metric covers the full batch, including
+remote metadata/completion and any concurrent local H2D work; it is not a raw
+GPU-RDMA bandwidth measurement. See [P2P performance notes](../docs/p2p.md#direct-gpu-performance-notes)
+for the A/B comparison method.
+
 #### Connector Modes
 
 `PegaKVConnector` defaults to `read_write`: it queries PegaFlow for reusable KV

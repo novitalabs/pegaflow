@@ -49,6 +49,14 @@ def parse_args():
         help="GPU memory utilization (default: 0.9)",
     )
     parser.add_argument(
+        "--direct-gpu-rdma",
+        action="store_true",
+        help=(
+            "Read remote KV blocks directly into GPU memory with GPUDirect RDMA "
+            "(default: disabled)"
+        ),
+    )
+    parser.add_argument(
         "--kv-events",
         action="store_true",
         help="Enable KV cache events publishing via ZMQ (default port 5557)",
@@ -77,6 +85,10 @@ def main():
         "kv_role": "kv_both",  # Both scheduler and worker roles
         "kv_connector_module_path": "pegaflow.connector",
     }
+    if args.direct_gpu_rdma:
+        kv_transfer_config["kv_connector_extra_config"] = {
+            "pegaflow.direct_gpu_rdma": True
+        }
 
     # Build vllm serve command
     cmd = [
@@ -114,6 +126,7 @@ def main():
     print(f"Model: {args.model}")
     print(f"Endpoint: http://{args.host}:{args.port}")
     print(f"Tensor Parallel Size: {args.tensor_parallel_size}")
+    print(f"Direct GPU RDMA: {'enabled' if args.direct_gpu_rdma else 'disabled'}")
     if args.kv_events:
         print("Prefix Caching: enabled (required for KV events)")
         print(

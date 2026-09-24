@@ -53,12 +53,13 @@ def _context(**kwargs) -> ConnectorContext:
     return ConnectorContext(**defaults)  # type: ignore[arg-type]
 
 
-def _vllm_config(**parallel_overrides):
+def _vllm_config(extra_config=None, **parallel_overrides):
     extra_config = {
         "pegaflow.tp_shard_endpoints": [
             "http://node-a:50055",
             "http://node-b:50055",
-        ]
+        ],
+        **(extra_config or {}),
     }
     kv_transfer_config = SimpleNamespace(
         engine_id="instance",
@@ -100,6 +101,37 @@ def test_topology_maps_contiguous_global_tp_ranks_to_local_servers():
     assert topology.local_tp_rank(4) == 0
     assert topology.local_tp_rank(7) == 3
     assert topology.namespace("base", 1) == "base:tp-shard-1-of-2"
+
+
+@pytest.mark.parametrize("enabled", [None, False, True], ids=["default", "staging", "direct"])
+def test_direct_gpu_config_controls_queries_and_registration(monkeypatch, enabled):
+    monkeypatch.setattr("pegaflow.connector.get_tensor_model_parallel_rank", lambda: 0)
+    client = MagicMock()
+    client.query_prefetch.return_value = QueryReady(1, b"lease")
+    monkeypatch.setattr("pegaflow.connector.EngineRpcClient", MagicMock(return_value=client))
+    monkeypatch.setattr("pegaflow.connector.ServiceStateManager", MagicMock())
+    exports = MagicMock()
+    monkeypatch.setattr("pegaflow.connector.worker.DmaBufExports", exports)
+    register = MagicMock()
+    monkeypatch.setattr(WorkerConnector, "_register_kv_caches", register)
+    extra = {} if enabled is None else {"pegaflow.direct_gpu_rdma": enabled}
+    scheduler = PegaKVConnector(_vllm_config(extra), KVConnectorRole.SCHEDULER)
+    worker = PegaKVConnector(_vllm_config(extra), KVConnectorRole.WORKER)
+    try:
+        scheduler._scheduler._count_available_block_prefix([b"hash"], "request")
+        assert len(client.query_prefetch.call_args_list) == 2
+        for query in client.query_prefetch.call_args_list:
+            assert query.kwargs.get("direct_gpu", False) is bool(enabled)
+        worker.register_kv_caches({})
+        if enabled:
+            exports.assert_called_once_with()
+            register.assert_called_once_with({}, exports.return_value.__enter__.return_value)
+        else:
+            exports.assert_not_called()
+            register.assert_called_once_with({}, None)
+    finally:
+        scheduler.shutdown()
+        worker.shutdown()
 
 
 @pytest.mark.parametrize(

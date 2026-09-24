@@ -224,6 +224,7 @@ class EngineRpcClient:
         req_id: str,
         wait_for_full_prefix: bool = False,
         group_id: int = 0,
+        direct_gpu: bool = False,
     ) -> QueryLoading | QueryReady:
         """Query prefix cache hits with SSD prefetch support.
 
@@ -389,3 +390,10 @@ class PdRdmaEngine:
     def num_domains(self) -> int: ...
     def num_groups(self) -> int: ...
     def aggregated_link_speed(self) -> int: ...
+
+def export_cuda_dma_buf(ptr: int, len: int) -> tuple[int, int, int]:
+    """Export in the allocation owner: (owned fd, allocation base, allocation bytes).
+
+    The caller must bind the owning CUDA context and close the returned fd.
+    """
+    ...

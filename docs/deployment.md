@@ -12,6 +12,13 @@ and use a P/D-aware NIXL router. Configure each server's routable `--addr`,
 P and D must use compatible model, tokenizer, block size, KV dtype, KV layout,
 and `PYTHONHASHSEED`.
 
+The PegaKVConnector option `pegaflow.direct_gpu_rdma` is configured inside the
+connector's `kv_connector_extra_config`. Set it to `true` only on a
+`read_write` PegaFlow connector that will load remote blocks; a `save_only`
+connector has no PegaFlow load to accelerate. The option is omitted below, so
+this deployment uses the host-staging path. See [P2P](./p2p.md#direct-gpu-performance-notes)
+for the direct-load command and the benchmark caveats.
+
 Replace `<p_node_ip>` and `<d_node_ip>` with the addresses assigned to the P
 and D nodes. The example assumes P and D run on separate nodes; to colocate
 them on one host, keep the distinct NIXL side-channel ports and point both

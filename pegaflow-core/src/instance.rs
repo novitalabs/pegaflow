@@ -295,6 +295,9 @@ pub struct GpuContext {
     /// Hybrid-cache storage group id by layer name; absent = group 0.
     layer_groups: HashMap<String, u32>,
 
+    #[cfg(feature = "rdma")]
+    direct_memory: Mutex<Option<crate::storage::DeviceMemoryRegistration>>,
+
     /// CUDA context handle (kept alive for the lifetime of this context).
     _cuda_ctx: Arc<CudaContext>,
 
@@ -335,6 +338,8 @@ impl GpuContext {
             preferred_numa: numa_node,
             kv_caches,
             layer_groups,
+            #[cfg(feature = "rdma")]
+            direct_memory: Mutex::new(None),
             _cuda_ctx: cuda_ctx,
             worker_pool,
         })
@@ -343,6 +348,39 @@ impl GpuContext {
     /// Get the preferred NUMA node for this GPU.
     pub(crate) fn preferred_numa(&self) -> NumaNode {
         self.preferred_numa
+    }
+
+    #[cfg(feature = "rdma")]
+    pub(crate) fn register_direct_memory(
+        &self,
+        storage: &crate::storage::StorageEngine,
+        imported: &[Arc<pegaflow_transfer::CudaDmaBuf>],
+    ) -> Result<(), EngineError> {
+        let mut registered = self.direct_memory.lock();
+        if registered.is_some() {
+            return Err(EngineError::InvalidArgument(
+                "direct GPU memory already registered".into(),
+            ));
+        }
+        if imported.is_empty() {
+            return Err(EngineError::InvalidArgument(
+                "direct GPU memory requires owner DMA-BUF exports".into(),
+            ));
+        }
+        self._cuda_ctx
+            .bind_to_thread()
+            .map_err(|error| EngineError::CudaInit(error.to_string()))?;
+        *registered = Some(
+            storage
+                .register_device_memory(self.device_id, imported)
+                .map_err(EngineError::Storage)?,
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "rdma")]
+    pub(crate) fn direct_memory_registered(&self) -> bool {
+        self.direct_memory.lock().is_some()
     }
 
     /// CUDA device ID represented by this shard.
@@ -368,6 +406,13 @@ impl GpuContext {
     /// Access the worker pool for submitting GPU operations.
     pub(crate) fn worker_pool(&self) -> &GpuWorkerPool {
         &self.worker_pool
+    }
+
+    /// Reuse the instance CUDA context for operations that run outside the
+    /// dedicated GPU worker threads.
+    #[cfg(feature = "rdma")]
+    pub(crate) fn cuda_context(&self) -> Arc<CudaContext> {
+        Arc::clone(&self._cuda_ctx)
     }
 
     /// Hybrid-cache storage group of a layer; unregistered layers default to
