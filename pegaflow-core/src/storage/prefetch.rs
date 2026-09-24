@@ -286,18 +286,28 @@ impl PrefetchScheduler {
         // so peers can discover and fetch from here too. SSD prefetch is
         // skipped: those blocks were already registered by this node's own save
         // path, and eviction explicitly unregisters them.
-        let rdma_registration = if result.source == Some(PrefetchSource::Rdma) {
-            let resident_keys = read_cache.batch_insert_resident_keys(result.cache_inserts);
-            rdma_registration_from_resident_keys(result.source, &resident_keys)
+        let (rdma_registration, evicted_keys) = if result.source == Some(PrefetchSource::Rdma) {
+            let inserted = read_cache.batch_insert_resident_keys(result.cache_inserts);
+            (
+                rdma_registration_from_resident_keys(result.source, &inserted.resident_keys),
+                inserted.evicted_keys,
+            )
         } else {
-            read_cache.batch_insert(result.cache_inserts);
-            None
+            (None, read_cache.batch_insert(result.cache_inserts))
         };
 
-        if let Some(client) = &self.metaserver_client
-            && let Some((namespace, hashes)) = rdma_registration
-        {
-            client.try_register_namespace(namespace, hashes);
+        if let Some(client) = &self.metaserver_client {
+            if !evicted_keys.is_empty() {
+                client.try_unregister(
+                    evicted_keys
+                        .into_iter()
+                        .map(|key| (key.namespace, key.hash))
+                        .collect(),
+                );
+            }
+            if let Some((namespace, hashes)) = rdma_registration {
+                client.try_register_namespace(namespace, hashes);
+            }
         }
 
         PollResult::Ready(PrefetchStatus::Ready {
@@ -761,7 +771,7 @@ mod tests {
         inserts: usize,
     ) -> bool {
         let scheduler = PrefetchScheduler::new(None, None, None, 16);
-        let read_cache = ReadCache::new(1 << 20, false, None);
+        let read_cache = ReadCache::new(1 << 20, false, None, None);
         let result = PrefetchTaskResult {
             source,
             found,

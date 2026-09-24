@@ -199,8 +199,8 @@ fn process_insert_batch(
     if !sealed_blocks.is_empty()
         && let Some(deps) = &deps
     {
-        let resident_keys = deps.read_cache.batch_insert_refs(&sealed_blocks);
-        send_backing_batches(deps, namespace, &sealed_blocks, resident_keys);
+        let result = deps.read_cache.batch_insert_refs(&sealed_blocks);
+        send_backing_batches(deps, namespace, &sealed_blocks, result);
     }
 
     ordered_fast_path_seals
@@ -269,7 +269,7 @@ fn send_backing_batches(
     deps: &InsertDeps,
     namespace: &str,
     blocks: &[(BlockKey, Arc<SealedBlock>)],
-    resident_keys: Vec<BlockKey>,
+    result: super::read_cache::CacheInsertResult,
 ) {
     if blocks.is_empty() {
         return;
@@ -287,7 +287,16 @@ fn send_backing_batches(
     }
 
     if let Some(client) = &deps.metaserver_client {
-        register_block_hashes(client, namespace, resident_keys);
+        if !result.evicted_keys.is_empty() {
+            client.try_unregister(
+                result
+                    .evicted_keys
+                    .into_iter()
+                    .map(|key| (key.namespace, key.hash))
+                    .collect(),
+            );
+        }
+        register_block_hashes(client, namespace, result.resident_keys);
     }
 }
 

@@ -32,6 +32,13 @@ use write_path::{InsertDeps, WritePipeline};
 const RECLAIM_BATCH_SIZE: usize = 512;
 pub const DEFAULT_RDMA_QPS_PER_PEER: usize = 2;
 
+pub fn lfu_window_budget(capacity_bytes: usize, ratio: f64) -> Result<u64, String> {
+    if !ratio.is_finite() || ratio <= 0.0 || ratio >= 100.0 {
+        return Err("--lfu-window-ratio must be finite and between 0 and 100 (exclusive)".into());
+    }
+    Ok(((capacity_bytes as f64 * ratio / 100.0).floor() as u64).max(1))
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryCacheCleanupStats {
     pub evicted_blocks: usize,
@@ -43,6 +50,8 @@ pub struct MemoryCacheCleanupStats {
 #[derive(Clone)]
 pub struct StorageConfig {
     pub enable_lfu_admission: bool,
+    /// W-TinyLFU window percentage of the total pinned-memory pool.
+    pub lfu_window_ratio: f64,
     /// Optional hint for expected value size in bytes (tunes cache + allocator granularity).
     pub hint_value_size_bytes: Option<usize>,
     /// Max blocks allowed in prefetching state (backpressure for SSD prefetch).
@@ -75,6 +84,7 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             enable_lfu_admission: false,
+            lfu_window_ratio: 1.0,
             hint_value_size_bytes: None,
             max_prefetch_blocks: DEFAULT_MAX_PREFETCH_BLOCKS,
             ssd_cache_config: None,
@@ -111,6 +121,7 @@ impl StorageEngine {
         config: StorageConfig,
         numa_nodes: &[NumaNode],
     ) -> Result<Arc<Self>, String> {
+        let window_budget = lfu_window_budget(capacity_bytes, config.lfu_window_ratio)?;
         let value_size_hint = config.hint_value_size_bytes.filter(|size| *size > 0);
         let unit_hint = value_size_hint.and_then(|size| NonZeroU64::new(size as u64));
         let max_prefetch_blocks = config.max_prefetch_blocks;
@@ -158,7 +169,14 @@ impl StorageEngine {
             capacity_bytes,
             config.enable_lfu_admission,
             value_size_hint,
+            config.enable_lfu_admission.then_some(window_budget),
         ));
+        if config.enable_lfu_admission {
+            info!(
+                "W-TinyLFU admission enabled: window_ratio={}%, window_budget={} bytes",
+                config.lfu_window_ratio, window_budget
+            );
+        }
 
         let metaserver_client = config.metaserver_addr.as_ref().map(|addr| {
             let advertise = config
@@ -638,7 +656,7 @@ impl StorageEngine {
 impl StorageEngine {
     /// Insert a block directly into the in-memory cache (test only).
     pub(crate) fn test_insert_cache(&self, key: BlockKey, block: Arc<SealedBlock>) {
-        self.read_cache.batch_insert(vec![(key, block)]);
+        let _ = self.read_cache.batch_insert(vec![(key, block)]);
     }
 }
 
@@ -648,6 +666,14 @@ mod tests {
 
     fn make_engine() -> Arc<StorageEngine> {
         StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]).unwrap()
+    }
+
+    #[test]
+    fn lfu_window_budget_uses_pool_percentage() {
+        assert_eq!(lfu_window_budget(10_000, 1.0).unwrap(), 100);
+        assert_eq!(lfu_window_budget(10_000, 0.001).unwrap(), 1);
+        assert!(lfu_window_budget(10_000, 0.0).is_err());
+        assert!(lfu_window_budget(10_000, 100.0).is_err());
     }
 
     #[tokio::test]

@@ -1089,7 +1089,7 @@ mod tests {
     #[tokio::test]
     async fn registration_applies_reclaimable_hashes() {
         let (addr, service, shutdown_tx) = start_fake_metaserver().await;
-        let read_cache = Arc::new(ReadCache::new(1 << 20, false, None));
+        let read_cache = Arc::new(ReadCache::new(1 << 20, false, None, None));
         let hashes: Vec<Vec<u8>> = (0..=MAX_HASHES_PER_RPC as u32)
             .map(|value| value.to_le_bytes().to_vec())
             .collect();
