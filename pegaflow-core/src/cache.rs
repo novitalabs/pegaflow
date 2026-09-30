@@ -23,10 +23,10 @@ const WINDOW_LIMIT_MULTIPLIER: usize = 8;
 /// Number of bits to right-shift counters during aging
 const AGE_SHIFT_BITS: u8 = 1;
 
-/// LRU cache with TinyLFU-based admission. Keeps API surface tiny to avoid
-/// bloating storage.rs.
-pub(crate) struct TinyLfuCache<K, V> {
-    lru: LruCache<K, V>,
+/// Resident values and the TinyLFU frequency estimator. ReadCache owns the
+/// window and source-class replacement order under the same lock.
+pub(crate) struct TinyLfuCache {
+    lru: LruCache<BlockKey, ArcSealedBlock>,
     freq: Option<TinyLfu>,
 }
 
@@ -36,11 +36,9 @@ pub(crate) enum CacheInsertOutcome {
     InsertedNew,
     /// Key already exists; candidate was ignored (no overwrite).
     AlreadyExists,
-    /// Candidate was rejected by admission policy.
-    Rejected,
 }
 
-impl TinyLfuCache<BlockKey, ArcSealedBlock> {
+impl TinyLfuCache {
     pub(crate) fn new_unbounded(
         capacity_bytes: usize,
         enable_lfu_admission: bool,
@@ -82,31 +80,23 @@ impl TinyLfuCache<BlockKey, ArcSealedBlock> {
             .is_some_and(|block| Arc::strong_count(block) == 1)
     }
 
-    /// Insert with TinyLFU admission. If the candidate is colder than the
-    /// current LRU victim it is dropped.
+    /// Insert without admission. A window overflow is compared later by ReadCache.
     pub(crate) fn insert(&mut self, key: BlockKey, value: ArcSealedBlock) -> CacheInsertOutcome {
-        // Always record the access so future attempts have a chance.
         if let Some(freq) = &self.freq {
             freq.incr(&key);
         }
 
-        // Key is content-addressed (hash); if it already exists, do not overwrite.
         if self.lru.contains_key(&key) {
             return CacheInsertOutcome::AlreadyExists;
         }
-
-        if let Some(freq) = &self.freq {
-            let candidate_freq = freq.get(&key);
-            if let Some((victim_key, _)) = self.lru.iter().next() {
-                let victim_freq = freq.get(victim_key);
-                if candidate_freq < victim_freq {
-                    return CacheInsertOutcome::Rejected;
-                }
-            }
-        }
-
         self.lru.insert(key, value);
         CacheInsertOutcome::InsertedNew
+    }
+
+    pub(crate) fn admits(&self, candidate: &BlockKey, victim: &BlockKey) -> bool {
+        self.freq
+            .as_ref()
+            .is_none_or(|freq| freq.get(candidate) >= freq.get(victim))
     }
 
     pub(crate) fn remove(&mut self, key: &BlockKey) -> Option<ArcSealedBlock> {
