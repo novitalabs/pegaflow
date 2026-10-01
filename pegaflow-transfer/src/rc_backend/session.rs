@@ -24,7 +24,10 @@ use super::runtime::RcRuntime;
 use crate::engine::{RcEndpoint, TransferOp};
 use crate::error::{Result, TransferError};
 
-const MAX_WR_CHAIN_OPS: usize = 4;
+// Keep each post_send chain within the QP's read-atomic window. A longer
+// chain amortizes ibv_post_send setup while the surrounding loop still caps
+// total outstanding WRs at MAX_SEND_WR.
+const MAX_WR_CHAIN_OPS: usize = 16;
 const MAX_SEND_WR: u32 = 128;
 // One QP per CQ; all WRs are signaled, so CQ depth = SQ depth suffices.
 // One-sided RDMA only: no recvs are ever posted, so the send CQ doubles as
@@ -36,6 +39,7 @@ const PSN_MASK: u32 = 0x00ff_ffff;
 
 pub(crate) struct RdmaOp {
     pub(crate) local_mr: Arc<MemoryRegion>,
+    pub(crate) _owner: Option<Arc<crate::CudaDmaBuf>>,
     pub(crate) local_ptr: u64,
     pub(crate) remote_ptr: u64,
     pub(crate) len: usize,
@@ -202,6 +206,16 @@ impl RcSession {
         Ok(done_rx)
     }
 
+    /// Move the QP to RESET so outstanding work cannot continue writing to a
+    /// caller-owned buffer. The next transfer will establish a fresh session.
+    pub(crate) fn reset(&self) -> Result<()> {
+        let mut qp = self.qp.lock();
+        let mut attr = QueuePairAttribute::new();
+        attr.setup_state(QueuePairState::Reset);
+        qp.modify(&attr)
+            .map_err(|error| TransferError::Backend(format!("failed to reset RC QP: {error}")))
+    }
+
     // The worker holds only a Weak ref: a strong Arc here would keep the
     // session (and its cmd_tx) alive forever, so recv() could never
     // disconnect and every invalidated connection would leak its thread + QP.
@@ -301,22 +315,41 @@ impl RcSession {
 
         let mut next_idx = 0usize;
         let mut next_wr_id = 1_u64;
-        let mut inflight: HashMap<u64, usize> = HashMap::new();
+        // The send window is capped at MAX_SEND_WR, so reserve the complete
+        // window once instead of growing and rehashing while completions are
+        // being tracked.
+        let mut inflight: HashMap<u64, usize> =
+            HashMap::with_capacity(total_ops.min(MAX_SEND_WR as usize));
         let mut transferred = 0usize;
+        let mut first_error = None;
 
-        while next_idx < total_ops || !inflight.is_empty() {
-            while next_idx < total_ops && inflight.len() < MAX_SEND_WR as usize {
+        // After the first error no new work is posted. Keep polling only to
+        // drain completions that were accepted before the error, then return.
+        while (first_error.is_none() && next_idx < total_ops) || !inflight.is_empty() {
+            while first_error.is_none()
+                && next_idx < total_ops
+                && inflight.len() < MAX_SEND_WR as usize
+            {
                 let available = MAX_SEND_WR as usize - inflight.len();
                 let remaining = total_ops - next_idx;
                 let chain_len = MAX_WR_CHAIN_OPS.min(available).min(remaining);
-                let mut qp = session.qp.lock();
-                let posted = Self::post_rdma_wr_chain(
-                    &mut qp,
-                    &ops[next_idx..next_idx + chain_len],
-                    next_wr_id,
-                    op,
-                )?;
-                drop(qp);
+                let posted_result = {
+                    let mut qp = session.qp.lock();
+                    Self::post_rdma_wr_chain(
+                        &mut qp,
+                        &ops[next_idx..next_idx + chain_len],
+                        next_wr_id,
+                        op,
+                    )
+                };
+                let posted = match posted_result {
+                    Ok(posted) => posted,
+                    Err(error) => {
+                        first_error = Some(error);
+                        let _ = session.reset();
+                        break;
+                    }
+                };
                 if posted == 0 {
                     break;
                 }
@@ -335,16 +368,26 @@ impl RcSession {
                         let Some(bytes) = inflight.remove(&wc.wr_id()) else {
                             continue;
                         };
-                        if wc.status() != WorkCompletionStatus::Success as u32 {
-                            return Err(TransferError::Backend(format!(
+                        if wc.status() != WorkCompletionStatus::Success as u32
+                            && first_error.is_none()
+                        {
+                            first_error = Some(TransferError::Backend(format!(
                                 "send completion failed: local_qpn={}, status={}, opcode={}, vendor_err={}",
                                 session.local_endpoint.qp_num,
                                 wc.status(),
                                 wc.opcode(),
                                 wc.vendor_err()
                             )));
+                            if let Err(error) = session.reset() {
+                                warn!(
+                                    "failed to reset RC QP after send completion error: local_qpn={} error={error}",
+                                    session.local_endpoint.qp_num
+                                );
+                            }
                         }
-                        transferred = transferred.saturating_add(bytes);
+                        if wc.status() == WorkCompletionStatus::Success as u32 {
+                            transferred = transferred.saturating_add(bytes);
+                        }
                     }
                     if !did_work {
                         std::hint::spin_loop();
@@ -354,14 +397,18 @@ impl RcSession {
                     std::hint::spin_loop();
                 }
                 Err(error) => {
-                    return Err(TransferError::Backend(format!(
-                        "poll send CQ failed: local_qpn={}, {error}",
-                        session.local_endpoint.qp_num
-                    )));
+                    first_error.get_or_insert_with(|| {
+                        TransferError::Backend(format!(
+                            "poll send CQ failed: local_qpn={}, {error}",
+                            session.local_endpoint.qp_num
+                        ))
+                    });
+                    let _ = session.reset();
+                    inflight.clear();
                 }
             }
         }
 
-        Ok(transferred)
+        first_error.map_or(Ok(transferred), Err)
     }
 }

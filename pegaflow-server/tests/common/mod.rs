@@ -263,6 +263,7 @@ impl MockVllmRpcHarness {
             req_id: req_id.to_string(),
             wait_for_full_prefix: false,
             group_id: 0,
+            direct_gpu: false,
         };
         match self.scheduler.query_prefetch(request.clone()).await {
             Ok(response) => Ok(RpcExchange {

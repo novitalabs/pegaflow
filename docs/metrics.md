@@ -193,7 +193,7 @@ The setting remains configurable with `--metric-hll-bucket-bits`.
 ### Load Metrics (CPU → GPU)
 - **pegaflow_load_bytes_total** (Counter)
   - Total bytes loaded from CPU storage to GPU
-  - Use case: Monitor load throughput
+  - Use case: Monitor host-staging load throughput
 
 - **pegaflow_load_duration_seconds** (Histogram)
   - Load operation latency distribution
@@ -202,6 +202,36 @@ The setting remains configurable with `--metric-hll-bucket-bits`.
 - **pegaflow_load_failures_total** (Counter)
   - Load operation failures (e.g., transfer errors)
   - Use case: Detect data transfer issues
+
+### Direct GPU RDMA Load Metrics
+
+These metrics cover the opt-in `pegaflow.direct_gpu_rdma` path. A direct
+remote read bypasses requester host staging, so it is not included in
+`pegaflow_load_bytes_total` or `pegaflow_load_duration_seconds`. A mixed load
+can still emit the ordinary load metrics for its local RAM prefix while the
+remote suffix is represented by the direct metrics below.
+
+- **pegaflow_direct_gpu_load_total** (Counter, `status=success|error`)
+  - Number of direct GPU load batches reaching a terminal state
+  - Use case: Confirm that the direct path was exercised and detect failures
+
+- **pegaflow_direct_gpu_load_duration_seconds** (Histogram)
+  - End-to-end direct load batch duration
+  - Includes remote block metadata queries, RDMA completion, GPU visibility
+    flush, and any concurrent local H2D work
+  - Use case: Compare direct and host-staging load latency for the same hit set
+
+- **pegaflow_direct_gpu_mr_registration_failures** (Counter)
+  - CUDA DMA-BUF or RDMA memory-registration failures
+  - Use case: Detect capability or allocation-registration problems before a
+    direct load can start
+
+The current direct path does not export direct-RDMA bytes or per-stage
+histograms. Do not compare `pegaflow_direct_gpu_load_duration_seconds` with
+`pegaflow_rdma_fetch_duration` as if they had identical boundaries, and do not
+use `pegaflow_rdma_fetch_bytes` to infer direct-GPU bandwidth. Use the direct
+load counters together with request-level timings and debug logs for an A/B
+comparison.
 
 ### SSD Cache Metrics
 - **pegaflow_ssd_write_bytes_total** (Counter) - Bytes written to SSD cache
@@ -229,6 +259,7 @@ This metric intentionally records decisions, not completed service outcomes.
 For backing failure correlation, use:
 
 - `pegaflow_rdma_fetch_total{status="error"}` for RDMA fetch failures
+- `pegaflow_direct_gpu_load_total{status="error"}` for direct GPU load failures
 - `pegaflow_ssd_prefetch_failures_total` for SSD prefetch failures
 
 The legacy `pegaflow_cache_block_hits_total` and

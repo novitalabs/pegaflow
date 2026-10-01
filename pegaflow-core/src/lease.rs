@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+#[cfg(feature = "rdma")]
+use crate::backing::DirectQueryPlan;
 use crate::block::SealedBlock;
 
 const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(600);
@@ -42,9 +44,15 @@ impl fmt::Debug for QueryLeaseId {
 
 struct QueryLease {
     instance_id: String,
-    blocks: Vec<Arc<SealedBlock>>,
+    payload: QueryLeasePayload,
     remaining_consumers: usize,
     expires_at: Instant,
+}
+
+pub(crate) enum QueryLeasePayload {
+    Cached(Vec<Arc<SealedBlock>>),
+    #[cfg(feature = "rdma")]
+    Direct(DirectQueryPlan),
 }
 
 pub(crate) struct QueryLeaseManager {
@@ -94,7 +102,26 @@ impl QueryLeaseManager {
         let token = QueryLeaseId::fresh();
         let lease = QueryLease {
             instance_id: instance_id.to_string(),
-            blocks,
+            payload: QueryLeasePayload::Cached(blocks),
+            remaining_consumers: consumers.max(1),
+            expires_at: Instant::now() + DEFAULT_LEASE_TTL,
+        };
+        self.inner.insert(token, lease);
+        token
+    }
+
+    #[cfg(feature = "rdma")]
+    pub(crate) fn create_direct(
+        &self,
+        instance_id: &str,
+        plan: DirectQueryPlan,
+        consumers: usize,
+    ) -> QueryLeaseId {
+        self.sweep_expired();
+        let token = QueryLeaseId::fresh();
+        let lease = QueryLease {
+            instance_id: instance_id.to_string(),
+            payload: QueryLeasePayload::Direct(plan),
             remaining_consumers: consumers.max(1),
             expires_at: Instant::now() + DEFAULT_LEASE_TTL,
         };
@@ -106,7 +133,7 @@ impl QueryLeaseManager {
         &self,
         instance_id: &str,
         token: &QueryLeaseId,
-    ) -> Result<Vec<Arc<SealedBlock>>, String> {
+    ) -> Result<QueryLeasePayload, String> {
         self.sweep_expired();
         let mut leases = self
             .inner
@@ -124,13 +151,17 @@ impl QueryLeaseManager {
         }
         if lease.remaining_consumers > 1 {
             lease.remaining_consumers -= 1;
-            return Ok(lease.blocks.clone());
+            return Ok(match &lease.payload {
+                QueryLeasePayload::Cached(blocks) => QueryLeasePayload::Cached(blocks.clone()),
+                #[cfg(feature = "rdma")]
+                QueryLeasePayload::Direct(plan) => QueryLeasePayload::Direct(plan.clone()),
+            });
         }
 
         Ok(leases
             .remove(token)
             .expect("query lease disappeared during consume")
-            .blocks)
+            .payload)
     }
 
     pub(crate) fn release(&self, token: &QueryLeaseId) -> bool {
@@ -202,7 +233,7 @@ mod tests {
                 lease_id,
                 QueryLease {
                     instance_id: "inst-a".to_string(),
-                    blocks: Vec::new(),
+                    payload: QueryLeasePayload::Cached(Vec::new()),
                     remaining_consumers: 1,
                     expires_at: Instant::now() + DEFAULT_LEASE_TTL,
                 },
@@ -225,13 +256,100 @@ mod tests {
         let blocks = vec![Arc::new(SealedBlock::from_slots(Vec::new()))];
         let lease_id = manager.create("inst-a", blocks, 2);
 
-        assert_eq!(manager.consume("inst-a", &lease_id).unwrap().len(), 1);
-        assert_eq!(manager.consume("inst-a", &lease_id).unwrap().len(), 1);
+        assert!(
+            matches!(manager.consume("inst-a", &lease_id).unwrap(), QueryLeasePayload::Cached(blocks) if blocks.len() == 1)
+        );
+        assert!(
+            matches!(manager.consume("inst-a", &lease_id).unwrap(), QueryLeasePayload::Cached(blocks) if blocks.len() == 1)
+        );
 
         let err = manager
             .consume("inst-a", &lease_id)
             .err()
             .expect("lease should be exhausted");
         assert!(err.contains("query lease is unknown or expired"));
+    }
+
+    #[cfg(feature = "rdma")]
+    #[test]
+    fn direct_lease_round_trips_plan_for_each_consumer() {
+        for (local_count, remote_count) in [(1, 0), (0, 2), (1, 2)] {
+            let manager = QueryLeaseManager::default();
+            let block = Arc::new(SealedBlock::from_slots(Vec::new()));
+            let remote = (remote_count > 0).then(|| crate::backing::DirectFetchPlan {
+                namespace: "ns".into(),
+                hashes: vec![vec![1], vec![2]],
+                fetch_plan: crate::backing::rdma_fetch::FetchPlan {
+                    segments: vec![
+                        crate::backing::rdma_fetch::FetchPlanSegment {
+                            node: "node-a".into(),
+                            start: 0,
+                            end: 1,
+                        },
+                        crate::backing::rdma_fetch::FetchPlanSegment {
+                            node: "node-b".into(),
+                            start: 1,
+                            end: 2,
+                        },
+                    ],
+                    block_count: 2,
+                },
+            });
+            let plan = DirectQueryPlan {
+                local_blocks: vec![Arc::clone(&block); local_count],
+                remote: remote.clone(),
+            };
+            let lease_id = manager.create_direct("inst-a", plan.clone(), 2);
+            drop(plan);
+            assert!(manager.consume("inst-b", &lease_id).is_err());
+            for _ in 0..2 {
+                let QueryLeasePayload::Direct(received) =
+                    manager.consume("inst-a", &lease_id).unwrap()
+                else {
+                    panic!("expected direct query plan");
+                };
+                assert_eq!(received.block_count(), local_count + remote_count);
+                assert_eq!(received.remote, remote);
+                assert_eq!(received.local_blocks.len(), local_count);
+                for local in &received.local_blocks {
+                    assert!(Arc::ptr_eq(local, &block));
+                }
+            }
+            assert!(manager.consume("inst-a", &lease_id).is_err());
+            assert_eq!(Arc::strong_count(&block), 1);
+        }
+    }
+
+    #[cfg(feature = "rdma")]
+    #[test]
+    fn direct_lease_release_and_expiry_drop_local_pins() {
+        let manager = QueryLeaseManager::default();
+        let block = Arc::new(SealedBlock::from_slots(Vec::new()));
+        for expire in [false, true] {
+            let lease = manager.create_direct(
+                "inst-a",
+                DirectQueryPlan {
+                    local_blocks: vec![Arc::clone(&block)],
+                    remote: None,
+                },
+                2,
+            );
+            assert_eq!(Arc::strong_count(&block), 2);
+            if expire {
+                manager
+                    .inner
+                    .leases
+                    .lock()
+                    .unwrap()
+                    .get_mut(&lease)
+                    .unwrap()
+                    .expires_at = Instant::now();
+                manager.sweep_expired();
+            } else {
+                assert!(manager.release(&lease));
+            }
+            assert_eq!(Arc::strong_count(&block), 1);
+            assert!(manager.consume("inst-a", &lease).is_err());
+        }
     }
 }

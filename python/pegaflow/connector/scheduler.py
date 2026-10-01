@@ -138,6 +138,9 @@ class SchedulerConnector:
             )
         self._tp_shard_client = TpShardQueryClient(engine_clients)
         self._cache_groups = CacheGroupLayout.from_config(kv_cache_config)
+        self._direct_gpu_rdma = context.direct_gpu_rdma
+        if self._direct_gpu_rdma and self._cache_groups.has_recurrent_state:
+            raise ValueError("pegaflow.direct_gpu_rdma only supports dense attention cache group 0")
         if self._cache_groups.has_recurrent_state and (pd_tail_save or pd_tail_load):
             raise ValueError("P/D tail-block caching is not supported with HMA")
         self._gpu_block_pool = None
@@ -1170,6 +1173,7 @@ class SchedulerConnector:
             block_hash_list,
             req_id,
             self._ctx.wait_for_full_prefix,
+            self._direct_gpu_rdma,
         )
         if ready is None:
             if req_id not in self._prefetch_start_times:

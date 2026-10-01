@@ -2,6 +2,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone)]
@@ -9,6 +10,8 @@ pub struct TensorMetadata {
     pub data_ptr: u64,
     pub size_bytes: usize,
     pub device_id: i32,
+    #[cfg(feature = "rdma")]
+    pub dma_buf: Option<Arc<pegaflow_core::CudaDmaBuf>>,
 }
 
 struct LayerTensor {
@@ -16,7 +19,7 @@ struct LayerTensor {
         dead_code,
         reason = "holding the Python tensor keeps CUDA IPC memory mapped"
     )]
-    tensor: Py<PyAny>,
+    tensor: Arc<Py<PyAny>>,
     metadata: TensorMetadata,
 }
 
@@ -201,7 +204,54 @@ impl CudaTensorRegistry {
                     )
                 })?;
 
-            let tensor_owned = tensor.unbind();
+            let tensor_owned = Arc::new(tensor.unbind());
+            #[cfg(feature = "rdma")]
+            let dma_buf = {
+                use std::os::fd::{FromRawFd, OwnedFd};
+                let metadata = if wrapper.hasattr("detach_dma_buf")? {
+                    wrapper
+                        .call_method0("detach_dma_buf")?
+                        .extract::<Option<(i32, u64, usize)>>()?
+                } else {
+                    None
+                };
+                if let Some((raw_fd, view_offset, allocation_bytes)) = metadata {
+                    if raw_fd < 0 {
+                        return Err(PyValueError::new_err("invalid DMA-BUF descriptor"));
+                    }
+                    // detach_dma_buf transfers a fresh descriptor to this process.
+                    let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+                    let base = data_ptr
+                        .checked_sub(view_offset)
+                        .ok_or_else(|| PyValueError::new_err("invalid DMA-BUF view offset"))?;
+                    if view_offset
+                        .checked_add(size_bytes as u64)
+                        .is_none_or(|end| end > allocation_bytes as u64)
+                    {
+                        return Err(PyValueError::new_err(
+                            "CUDA tensor exceeds DMA-BUF allocation",
+                        ));
+                    }
+                    cuda.call_method1("set_device", (resolved_device,))?;
+                    Some(Arc::new(
+                        pegaflow_core::CudaDmaBuf::from_import(
+                            base,
+                            allocation_bytes,
+                            fd,
+                            tensor_owned.clone(),
+                        )
+                        .map_err(|error| PyValueError::new_err(error.to_string()))?,
+                    ))
+                } else {
+                    None
+                }
+            };
+            #[cfg(not(feature = "rdma"))]
+            if wrapper.hasattr("dma_buf")? && !wrapper.getattr("dma_buf")?.is_none() {
+                return Err(PyValueError::new_err(
+                    "DMA-BUF registration requires an RDMA-enabled server",
+                ));
+            }
 
             Ok(LayerTensor {
                 tensor: tensor_owned,
@@ -209,6 +259,8 @@ impl CudaTensorRegistry {
                     data_ptr,
                     size_bytes,
                     device_id: resolved_device,
+                    #[cfg(feature = "rdma")]
+                    dma_buf,
                 },
             })
         })

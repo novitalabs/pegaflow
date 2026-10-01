@@ -54,8 +54,19 @@ pegaflow-server
 
 ```bash
 vllm serve Qwen/Qwen3-0.6B \
-  --kv-transfer-config '{"kv_connector": "PegaKVConnector", "kv_role": "kv_both", "kv_connector_module_path": "pegaflow.connector"}'
+  --kv-transfer-config '{
+    "kv_connector": "PegaKVConnector",
+    "kv_role": "kv_both",
+    "kv_connector_module_path": "pegaflow.connector"
+  }'
 ```
+
+To enable direct GPU P2P reads, add
+`"kv_connector_extra_config": {"pegaflow.direct_gpu_rdma": true}` to that
+JSON. When it is omitted or set to `false`, remote reads use the host-staging
+path. Direct mode currently supports dense attention cache group 0 only and
+does not fall back to staging if a direct transfer fails. The same setting can
+be passed to `examples/run_vllm_with_pega.py` with `--direct-gpu-rdma`.
 
 > For full server options, multi-node setup, and advanced configuration, see [Server Configuration](./docs/server.md).
 

@@ -143,6 +143,7 @@ class ConnectorContext:
     pp_size: int = 1
     mode: PegaConnectorMode = PegaConnectorMode.READ_WRITE
     wait_for_full_prefix: bool = False
+    direct_gpu_rdma: bool = False
     tp_shards: TpShardTopology | None = None
     # Token span of one `Request.block_hashes` entry; `None` means one per
     # scheduler block.
