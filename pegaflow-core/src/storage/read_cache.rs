@@ -18,6 +18,9 @@ struct ReadCacheInner {
     cache: TinyLfuCache<BlockKey, Arc<SealedBlock>>,
     reclaimable: LruCache<BlockKey, ResidentMetadata>,
     retained: LruCache<BlockKey, ResidentMetadata>,
+    /// Footprint of the reclaimable class: memory eviction can free without
+    /// dropping the last copy of a block. The spill source keeps this topped up.
+    reclaimable_bytes: u64,
     next_generation: u64,
 }
 
@@ -25,6 +28,8 @@ struct ReadCacheInner {
 struct ResidentMetadata {
     inserted_at: Instant,
     generation: u64,
+    /// Block footprint, so class moves can account bytes without a cache lookup.
+    footprint_bytes: u64,
 }
 
 struct RemovedResident {
@@ -53,9 +58,87 @@ impl ReadCache {
                 cache,
                 reclaimable: LruCache::new_unbounded(),
                 retained: LruCache::new_unbounded(),
+                reclaimable_bytes: 0,
                 next_generation: 0,
             }),
         }
+    }
+
+    /// Bytes held by reclaimable blocks (another node has a copy).
+    #[cfg(any(feature = "rdma", test))]
+    pub(super) fn reclaimable_bytes(&self) -> u64 {
+        self.inner.lock().reclaimable_bytes
+    }
+
+    /// Coldest retained blocks, LRU first, until their footprint reaches
+    /// `max_bytes` (at least one block when any is retained). These are the
+    /// blocks pressure eviction would drop next without another copy.
+    #[cfg(any(feature = "rdma", test))]
+    pub(super) fn coldest_retained(&self, max_bytes: u64) -> Vec<(BlockKey, u64)> {
+        let inner = self.inner.lock();
+        let mut picked = Vec::new();
+        let mut picked_bytes = 0u64;
+        for (key, metadata) in &inner.retained {
+            if !picked.is_empty() && picked_bytes >= max_bytes {
+                break;
+            }
+            picked_bytes = picked_bytes.saturating_add(metadata.footprint_bytes);
+            picked.push((key.clone(), metadata.footprint_bytes));
+        }
+        picked
+    }
+
+    /// Take custody of resident blocks: move reclaimable ones back to the
+    /// retained class and refresh recency of all of them. Returns the keys
+    /// that are resident.
+    #[cfg(any(feature = "rdma", test))]
+    pub(super) fn retain_keys(&self, keys: &[BlockKey]) -> Vec<BlockKey> {
+        let mut inner = self.inner.lock();
+        let mut resident = Vec::new();
+        let mut moved = 0;
+        for key in keys {
+            if !inner.cache.contains_key(key) {
+                continue;
+            }
+            if let Some(metadata) = inner.reclaimable.remove(key) {
+                inner.reclaimable_bytes = inner
+                    .reclaimable_bytes
+                    .saturating_sub(metadata.footprint_bytes);
+                inner.retained.insert(key.clone(), metadata);
+                moved += 1;
+            } else {
+                inner.retained.get(key);
+            }
+            resident.push(key.clone());
+        }
+        record_class_moves(moved, ResidentClass::Reclaimable, ResidentClass::Retained);
+        resident
+    }
+
+    /// Undo a reclaimable demotion whose other copy never materialized. The
+    /// blocks go back to the cold end of the retained class so a retry offers
+    /// them first and eviction order stays as if nothing happened.
+    #[cfg(any(feature = "rdma", test))]
+    pub(super) fn restore_retained_cold(&self, keys: &[BlockKey]) {
+        let mut inner = self.inner.lock();
+        let mut moved = 0;
+        // Each block moves to the front, so walk backwards to keep keys[0] coldest.
+        for key in keys.iter().rev() {
+            let Some(metadata) = inner.reclaimable.remove(key) else {
+                continue;
+            };
+            inner.reclaimable_bytes = inner
+                .reclaimable_bytes
+                .saturating_sub(metadata.footprint_bytes);
+            inner.retained.insert(key.clone(), metadata);
+            if let hashlink::linked_hash_map::RawEntryMut::Occupied(mut entry) =
+                inner.retained.raw_entry_mut().from_key(key)
+            {
+                entry.to_front();
+            }
+            moved += 1;
+        }
+        record_class_moves(moved, ResidentClass::Reclaimable, ResidentClass::Retained);
     }
 
     pub(super) fn contains_keys(&self, keys: &[BlockKey]) -> Vec<bool> {
@@ -173,6 +256,11 @@ impl ReadCache {
             .collect()
     }
 
+    /// Remove up to `batch_size` LRU blocks for pressure eviction.
+    ///
+    /// A batch takes reclaimable blocks only, whenever any can be evicted, so
+    /// the caller re-checks the allocator before a later batch drops retained
+    /// blocks, the last copies of their data.
     pub(super) fn remove_lru_batch(&self, batch_size: usize) -> Vec<(BlockKey, Arc<SealedBlock>)> {
         let removed = {
             let mut inner = self.inner.lock();
@@ -183,7 +271,7 @@ impl ReadCache {
                 batch_size,
                 &mut removed,
             );
-            if removed.len() < batch_size {
+            if removed.is_empty() {
                 remove_lru_batch_from_class(
                     &mut inner,
                     ResidentClass::Retained,
@@ -206,6 +294,7 @@ impl ReadCache {
             );
             metadata.extend(inner.reclaimable.drain());
             metadata.extend(inner.retained.drain());
+            inner.reclaimable_bytes = 0;
             let removed = inner
                 .cache
                 .remove_all()
@@ -276,15 +365,7 @@ impl ReadCache {
                 moved += 1;
             }
         }
-        if moved > 0 {
-            let metrics = core_metrics();
-            metrics
-                .cache_resident_blocks
-                .add(-moved, &*CACHE_CLASS_RETAINED);
-            metrics
-                .cache_resident_blocks
-                .add(moved, &*CACHE_CLASS_RECLAIMABLE);
-        }
+        record_class_moves(moved, ResidentClass::Retained, ResidentClass::Reclaimable);
     }
 
     /// Move resident blocks to the reclaimable replacement class.
@@ -305,15 +386,7 @@ impl ReadCache {
                 moved += 1;
             }
         }
-        if moved > 0 {
-            let metrics = core_metrics();
-            metrics
-                .cache_resident_blocks
-                .add(-moved, &*CACHE_CLASS_RETAINED);
-            metrics
-                .cache_resident_blocks
-                .add(moved, &*CACHE_CLASS_RECLAIMABLE);
-        }
+        record_class_moves(moved, ResidentClass::Retained, ResidentClass::Reclaimable);
     }
 
     #[cfg(test)]
@@ -364,8 +437,12 @@ fn insert_block(
                 ResidentMetadata {
                     inserted_at: Instant::now(),
                     generation,
+                    footprint_bytes,
                 },
             );
+            if class == ResidentClass::Reclaimable {
+                inner.reclaimable_bytes = inner.reclaimable_bytes.saturating_add(footprint_bytes);
+            }
             let m = core_metrics();
             m.cache_block_insertions.add(1, &[]);
             m.cache_resident_bytes.add(footprint_bytes as i64, &[]);
@@ -386,6 +463,14 @@ fn class_lru(
     match class {
         ResidentClass::Reclaimable => &mut inner.reclaimable,
         ResidentClass::Retained => &mut inner.retained,
+    }
+}
+
+fn record_class_moves(moved: i64, from: ResidentClass, to: ResidentClass) {
+    if moved > 0 {
+        let metrics = core_metrics();
+        metrics.cache_resident_blocks.add(-moved, from.attributes());
+        metrics.cache_resident_blocks.add(moved, to.attributes());
     }
 }
 
@@ -416,6 +501,9 @@ fn mark_reclaimable_with_generation(
         }
     }
     if let Some(metadata) = inner.retained.remove(key) {
+        inner.reclaimable_bytes = inner
+            .reclaimable_bytes
+            .saturating_add(metadata.footprint_bytes);
         inner.reclaimable.insert(key.clone(), metadata);
         true
     } else {
@@ -429,6 +517,11 @@ fn mark_reclaimable_with_generation(
 
 fn remove_lru(inner: &mut ReadCacheInner, class: ResidentClass) -> Option<RemovedResident> {
     while let Some((key, metadata)) = class_lru(inner, class).remove_lru() {
+        if class == ResidentClass::Reclaimable {
+            inner.reclaimable_bytes = inner
+                .reclaimable_bytes
+                .saturating_sub(metadata.footprint_bytes);
+        }
         let block = inner.cache.remove(&key);
         debug_assert!(
             block.is_some(),
@@ -581,11 +674,13 @@ mod tests {
         cache.batch_insert(vec![(retained.clone(), make_block())]);
         cache.batch_insert_resident_keys(vec![(reclaimable.clone(), make_block())]);
 
-        let evicted = cache.remove_lru_batch(2);
-        assert_eq!(
-            evicted.into_iter().map(|(key, _)| key).collect::<Vec<_>>(),
-            vec![reclaimable, retained]
-        );
+        // A batch stops at the class boundary, so the allocator re-checks
+        // before any retained block is dropped.
+        let keys = |batch: Vec<(BlockKey, Arc<SealedBlock>)>| {
+            batch.into_iter().map(|(key, _)| key).collect::<Vec<_>>()
+        };
+        assert_eq!(keys(cache.remove_lru_batch(2)), vec![reclaimable]);
+        assert_eq!(keys(cache.remove_lru_batch(2)), vec![retained]);
     }
 
     #[test]
@@ -935,5 +1030,91 @@ mod tests {
             cache.batch_insert_resident_keys(vec![(key.clone(), make_block())]),
             vec![key]
         );
+    }
+
+    fn insert_sized(cache: &ReadCache, id: u8, footprint: u64) -> BlockKey {
+        let key = BlockKey::new("ns".into(), vec![id]);
+        cache.batch_insert(vec![(
+            key.clone(),
+            Arc::new(SealedBlock::with_footprint_for_test(footprint)),
+        )]);
+        key
+    }
+
+    fn evict_order(cache: &ReadCache) -> Vec<BlockKey> {
+        std::iter::from_fn(|| cache.remove_lru_batch(1).pop().map(|(key, _)| key)).collect()
+    }
+
+    #[test]
+    fn reclaimable_bytes_follow_class_moves_and_removal() {
+        let cache = make_cache();
+        let a = insert_sized(&cache, 1, 100);
+        let b = insert_sized(&cache, 2, 200);
+        assert_eq!(cache.reclaimable_bytes(), 0);
+
+        cache.mark_reclaimable_keys(&[a.clone(), b.clone()]);
+        assert_eq!(cache.reclaimable_bytes(), 300);
+
+        cache.retain_keys(std::slice::from_ref(&b));
+        assert_eq!(cache.reclaimable_bytes(), 100);
+        cache.mark_reclaimable_keys(std::slice::from_ref(&b));
+        cache.restore_retained_cold(std::slice::from_ref(&b));
+        assert_eq!(cache.reclaimable_bytes(), 100);
+
+        assert_eq!(cache.remove_lru_batch(1)[0].0, a);
+        assert_eq!(cache.reclaimable_bytes(), 0);
+
+        cache.mark_reclaimable_keys(std::slice::from_ref(&b));
+        cache.remove_all();
+        assert_eq!(cache.reclaimable_bytes(), 0);
+    }
+
+    #[test]
+    fn coldest_retained_walks_retained_lru_up_to_byte_budget() {
+        let cache = make_cache();
+        let a = insert_sized(&cache, 1, 100);
+        let b = insert_sized(&cache, 2, 100);
+        let c = insert_sized(&cache, 3, 100);
+        cache.mark_reclaimable_keys(std::slice::from_ref(&b));
+
+        let keys = |budget| {
+            cache
+                .coldest_retained(budget)
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys(150), vec![a.clone(), c.clone()]);
+        assert_eq!(keys(0), vec![a.clone()], "always offers at least one block");
+
+        cache.get_blocks(std::slice::from_ref(&a));
+        assert_eq!(keys(1), vec![c]);
+    }
+
+    #[test]
+    fn custody_moves_place_blocks_at_opposite_lru_ends() {
+        // Target side: re-offered blocks become retained and most recent.
+        let target = make_cache();
+        let a = insert_sized(&target, 1, 1);
+        let b = insert_sized(&target, 2, 1);
+        let c = insert_sized(&target, 3, 1);
+        target.mark_reclaimable_keys(std::slice::from_ref(&a));
+        let missing = BlockKey::new("ns".into(), vec![9]);
+        assert_eq!(
+            target.retain_keys(&[a.clone(), b.clone(), missing]),
+            vec![a.clone(), b.clone()]
+        );
+        assert_class(&target, &a, ResidentClass::Retained);
+        assert_eq!(evict_order(&target), vec![c.clone(), a.clone(), b.clone()]);
+
+        // Source side: a failed spill returns blocks to the cold end.
+        let source = make_cache();
+        let a = insert_sized(&source, 1, 1);
+        let b = insert_sized(&source, 2, 1);
+        let c = insert_sized(&source, 3, 1);
+        source.mark_reclaimable_keys(&[b.clone(), c.clone()]);
+        source.restore_retained_cold(&[c.clone(), b.clone(), a.clone()]);
+        assert_class(&source, &b, ResidentClass::Retained);
+        assert_eq!(evict_order(&source), vec![c, b, a], "offer order kept");
     }
 }

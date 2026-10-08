@@ -113,6 +113,18 @@ pub(crate) struct CoreMetrics {
     pub rdma_fetch_plan_segments: Histogram<u64>,
     #[cfg(feature = "rdma")]
     pub rdma_fetch_plan_completed_segments: Histogram<u64>,
+
+    // Spill tier (source offers and target adoptions)
+    #[cfg(feature = "rdma")]
+    pub spill_offers: Counter<u64>,
+    #[cfg(feature = "rdma")]
+    pub spill_offered_bytes: Counter<u64>,
+    #[cfg(feature = "rdma")]
+    pub spill_blocks: Counter<u64>,
+    #[cfg(feature = "rdma")]
+    pub spill_adoptions: Counter<u64>,
+    #[cfg(feature = "rdma")]
+    pub spill_adopted_bytes: Counter<u64>,
 }
 
 fn init_meter() -> Meter {
@@ -505,6 +517,41 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
                     "Number of segments completed before an RDMA fetch plan stopped",
                 )
                 .with_boundaries(rdma_fetch_plan_segment_boundaries())
+                .build(),
+
+            // Spill tier
+            #[cfg(feature = "rdma")]
+            spill_offers: meter
+                .u64_counter("pegaflow_spill_offers")
+                .with_description(
+                    "Spill offers sent by this node as a spill source (result=accepted|rejected|error)",
+                )
+                .build(),
+            #[cfg(feature = "rdma")]
+            spill_offered_bytes: meter
+                .u64_counter("pegaflow_spill_offered_bytes")
+                .with_unit("bytes")
+                .with_description("Block bytes offered to spill targets")
+                .build(),
+            #[cfg(feature = "rdma")]
+            spill_blocks: meter
+                .u64_counter("pegaflow_spill_blocks")
+                .with_description(
+                    "Offered blocks by outcome (outcome=adopted|already_held|unclaimed)",
+                )
+                .build(),
+            #[cfg(feature = "rdma")]
+            spill_adoptions: meter
+                .u64_counter("pegaflow_spill_adoptions")
+                .with_description(
+                    "Spill offers handled by this node as a spill target (result=accepted|throttled|disabled)",
+                )
+                .build(),
+            #[cfg(feature = "rdma")]
+            spill_adopted_bytes: meter
+                .u64_counter("pegaflow_spill_adopted_bytes")
+                .with_unit("bytes")
+                .with_description("Block bytes pulled and retained as a spill target")
                 .build(),
         }
     })

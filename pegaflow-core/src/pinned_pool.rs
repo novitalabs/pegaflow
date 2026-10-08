@@ -602,6 +602,11 @@ impl NumaAwarePinnedPools {
 
         (used, total)
     }
+
+    #[cfg(feature = "rdma")]
+    fn node_usages(&self) -> Vec<(u64, u64)> {
+        self.pools.values().map(|pool| pool.usage()).collect()
+    }
 }
 
 // ============================================================================
@@ -686,6 +691,17 @@ impl PinnedAllocator {
         match self {
             Self::Global(pool) => pool.usage(),
             Self::Numa(pools) => pools.total_usage(),
+        }
+    }
+
+    /// Per-pool usage, `(used_bytes, total_bytes)`: one entry for the global
+    /// pool, one per NUMA node otherwise. Pressure eviction runs per pool, so
+    /// a busy node can evict while another node's pool sits idle.
+    #[cfg(feature = "rdma")]
+    pub(crate) fn pool_usages(&self) -> Vec<(u64, u64)> {
+        match self {
+            Self::Global(pool) => vec![pool.usage()],
+            Self::Numa(pools) => pools.node_usages(),
         }
     }
 

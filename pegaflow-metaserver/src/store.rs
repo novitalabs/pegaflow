@@ -3,7 +3,7 @@ use log::{info, warn};
 use pegaflow_common::BlockKey;
 use std::collections::HashMap;
 use std::sync::{
-    Arc,
+    Arc, Mutex, PoisonError,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -14,6 +14,8 @@ const MIN_RECLAIMABLE_OWNER_COUNT: usize = 3;
 pub const DEFAULT_NODE_STALE_SECS: u64 = 30;
 pub const DEFAULT_TTL_MINUTES: u64 = 120;
 pub const MANUAL_CLEANUP_AGE_SECS: u64 = 60 * 60;
+/// Spill targets returned besides the primary, for the source to fail over to.
+const SPILL_FAILOVER_TARGETS: usize = 2;
 
 /// A prefix query result: one block hash and all live nodes that own it.
 #[derive(Debug, Clone)]
@@ -83,6 +85,8 @@ struct OwnerRecord {
 struct NodeRecord {
     node_id: Uuid,
     last_seen: Instant,
+    /// Pool bytes the node offers as a spill target (0 = not a target).
+    spill_capacity: u64,
 }
 
 #[derive(Default)]
@@ -145,6 +149,9 @@ pub struct BlockHashStore {
     reconcile_needed: AtomicBool,
     /// Incremental stored-owner redundancy counters read by metric callbacks.
     redundancy: RedundancyCounters,
+    /// Spill source → its primary spill target. One lock keeps balance
+    /// decisions consistent; nodes heartbeat every few seconds.
+    spill_assignments: Mutex<HashMap<Arc<str>, Arc<str>>>,
 }
 
 impl BlockHashStore {
@@ -159,6 +166,7 @@ impl BlockHashStore {
             config,
             reconcile_needed: AtomicBool::new(false),
             redundancy: RedundancyCounters::default(),
+            spill_assignments: Mutex::new(HashMap::new()),
         }
     }
 
@@ -181,6 +189,7 @@ impl BlockHashStore {
                 entry.insert(NodeRecord {
                     node_id,
                     last_seen: now,
+                    spill_capacity: 0,
                 });
                 Ok(())
             }
@@ -220,6 +229,10 @@ impl BlockHashStore {
                 entry.remove();
             }
         }
+        self.spill_assignments
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|source, target| source.as_ref() != node && target.as_ref() != node);
         // A concurrent registration may already have written new owners.
         let removed = self.retain_owners(|owner_node, owner| {
             owner_node.as_ref() != node
@@ -229,6 +242,114 @@ impl BlockHashStore {
                     .is_some_and(|record| record.node_id == owner.node_id)
         });
         Ok(removed.removed_owners)
+    }
+
+    /// Record the pool bytes `node` offers as a spill target (0 withdraws it).
+    pub fn set_spill_capacity(&self, node: &str, capacity_bytes: u64) {
+        if let Some(mut record) = self.nodes.get_mut(node) {
+            record.spill_capacity = capacity_bytes;
+        }
+    }
+
+    /// Forget `source`'s spill assignment once it stops asking for one, so its
+    /// old target does not keep counting it as load.
+    pub fn release_spill_assignment(&self, source: &str) {
+        self.spill_assignments
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(source);
+    }
+
+    /// Spill targets for `source`: its primary first, then failover candidates.
+    ///
+    /// The primary is sticky, so one source keeps sending to one target and
+    /// recalls stay single-segment. Balance is assigned sources per byte of
+    /// target capacity; a source moves only when that strictly improves the
+    /// balance, e.g. after a new target joins. Sources of targets that stopped
+    /// heartbeating or withdrew are reassigned on their next heartbeat.
+    pub fn assign_spill_targets(&self, source: &str) -> Vec<String> {
+        let now = Instant::now();
+        let mut targets: Vec<(Arc<str>, u64)> = self
+            .nodes
+            .iter()
+            .filter(|record| {
+                record.spill_capacity > 0
+                    && record.key().as_ref() != source
+                    && now.duration_since(record.last_seen) <= self.config.node_stale_after
+            })
+            .map(|record| (Arc::clone(record.key()), record.spill_capacity))
+            .collect();
+        targets.sort();
+
+        let mut assignments = self
+            .spill_assignments
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        assignments.retain(|assigned_source, target| {
+            targets.iter().any(|(live, _)| live == target)
+                && self
+                    .nodes
+                    .get(assigned_source.as_ref())
+                    .is_some_and(|record| {
+                        now.duration_since(record.last_seen) <= self.config.node_stale_after
+                    })
+        });
+        if targets.is_empty() {
+            assignments.remove(source);
+            return Vec::new();
+        }
+
+        let current = assignments.get(source).cloned();
+        let mut load: HashMap<&str, u64> = HashMap::new();
+        for (assigned_source, target) in assignments.iter() {
+            if assigned_source.as_ref() != source {
+                *load.entry(target.as_ref()).or_default() += 1;
+            }
+        }
+        // Candidates by the balance they would have with this source added.
+        let mut ranked: Vec<&(Arc<str>, u64)> = targets.iter().collect();
+        ranked.sort_by(|a, b| {
+            let a_load = u128::from(load.get(a.0.as_ref()).copied().unwrap_or(0) + 1);
+            let b_load = u128::from(load.get(b.0.as_ref()).copied().unwrap_or(0) + 1);
+            (a_load * u128::from(b.1))
+                .cmp(&(b_load * u128::from(a.1)))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let best = &ranked[0].0;
+        // Keep the current target unless moving strictly improves the balance:
+        // leaving it must not make the best target busier than it was.
+        let primary = match current {
+            Some(current) if current != *best => {
+                let (_, current_cap) = targets
+                    .iter()
+                    .find(|(target, _)| *target == current)
+                    .expect("assignments only keep live targets");
+                let best_cap = ranked[0].1;
+                let current_load = u128::from(load.get(current.as_ref()).copied().unwrap_or(0));
+                let best_load = u128::from(load.get(best.as_ref()).copied().unwrap_or(0) + 1);
+                if current_load * u128::from(best_cap) >= best_load * u128::from(*current_cap) {
+                    Arc::clone(best)
+                } else {
+                    current
+                }
+            }
+            Some(current) => current,
+            None => Arc::clone(best),
+        };
+        if assignments.get(source) != Some(&primary) {
+            info!("MetaServer spill target assigned: source={source} target={primary}");
+        }
+        assignments.insert(Arc::from(source), Arc::clone(&primary));
+
+        std::iter::once(primary.to_string())
+            .chain(
+                ranked
+                    .iter()
+                    .filter(|(target, _)| *target != primary)
+                    .take(SPILL_FAILOVER_TARGETS)
+                    .map(|(target, _)| target.to_string()),
+            )
+            .collect()
     }
 
     pub fn insert_hashes(
@@ -718,6 +839,83 @@ pub(crate) mod tests {
         let node_id = Uuid::new_v4();
         store.heartbeat_node(node, node_id).unwrap();
         node_id
+    }
+
+    fn spill_target(store: &BlockHashStore, node: &str, capacity: u64) {
+        heartbeat_node(store, node);
+        store.set_spill_capacity(node, capacity);
+    }
+
+    fn primary(store: &BlockHashStore, source: &str) -> Option<String> {
+        store.assign_spill_targets(source).first().cloned()
+    }
+
+    #[test]
+    fn spill_targets_balance_by_capacity_and_stay_sticky() {
+        let store = BlockHashStore::new();
+        spill_target(&store, "big", 200);
+        spill_target(&store, "small", 100);
+        let sources = ["p0", "p1", "p2"];
+        for source in sources {
+            heartbeat_node(&store, source);
+        }
+
+        let primaries: Vec<_> = sources
+            .iter()
+            .map(|s| primary(&store, s).unwrap())
+            .collect();
+        assert_eq!(
+            primaries,
+            ["big", "big", "small"],
+            "two-thirds of sources on the 2x target"
+        );
+        for (source, expected) in sources.iter().zip(&primaries) {
+            assert_eq!(primary(&store, source).as_ref(), Some(expected), "sticky");
+        }
+        assert_eq!(
+            store.assign_spill_targets("p2"),
+            ["small", "big"],
+            "failover lists the other target"
+        );
+
+        // A source that stops asking no longer counts as load on its target.
+        store.release_spill_assignment("p2");
+        heartbeat_node(&store, "p3");
+        assert_eq!(primary(&store, "p3").as_deref(), Some("small"));
+        assert!(
+            !store
+                .assign_spill_targets("big")
+                .contains(&"big".to_string()),
+            "a node is never its own spill target"
+        );
+    }
+
+    #[test]
+    fn spill_targets_follow_joins_and_departures() {
+        let store = BlockHashStore::with_config(StoreConfig {
+            node_stale_after: Duration::from_millis(300),
+            ..StoreConfig::default()
+        });
+        spill_target(&store, "a", 100);
+        heartbeat_node(&store, "p0");
+        heartbeat_node(&store, "p1");
+        assert_eq!(primary(&store, "p0").as_deref(), Some("a"));
+        assert_eq!(primary(&store, "p1").as_deref(), Some("a"));
+
+        // A new target takes one source without churning the other.
+        spill_target(&store, "b", 100);
+        assert_eq!(primary(&store, "p0").as_deref(), Some("b"));
+        assert_eq!(primary(&store, "p1").as_deref(), Some("a"));
+
+        // A withdrawn target loses its sources.
+        store.set_spill_capacity("b", 0);
+        assert_eq!(primary(&store, "p0").as_deref(), Some("a"));
+
+        // A target that stops heartbeating is skipped.
+        std::thread::sleep(Duration::from_millis(400));
+        spill_target(&store, "b", 100);
+        heartbeat_node(&store, "p0");
+        assert_eq!(store.assign_spill_targets("p0"), ["b"]);
     }
 
     #[test]

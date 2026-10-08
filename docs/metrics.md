@@ -238,6 +238,15 @@ does not enter the legacy denominator. New dashboards should use
 `pegaflow_cache_tier_block_requests_total{tier}` instead of mixing legacy and
 tier counters.
 
+### Spill Tier Metrics
+- **pegaflow_spill_offers_total** (Counter) - Spill offers sent by a spill source, by `result` (`accepted`, `rejected`, `error`)
+- **pegaflow_spill_offered_bytes_total** (Counter) - Block bytes offered to spill targets
+- **pegaflow_spill_blocks_total** (Counter) - Offered blocks by `outcome` (`adopted`, `already_held`, `unclaimed`)
+- **pegaflow_spill_adoptions_total** (Counter) - Spill offers handled by a spill target, by `result` (`accepted`, `throttled`, `disabled`)
+- **pegaflow_spill_adopted_bytes_total** (Counter) - Block bytes a spill target pulled and retained
+
+On a spill source, `pegaflow_cache_block_evictions_by_class_total{class="retained"}` counts blocks evicted before they could be spilled; a steadily growing value means `--spill-reserve` is too small for the save rate or the target throttles.
+
 ### RPC Metrics
 - **pegaflow_rpc_requests_total** (Counter) - Total RPC requests by method and status
 - **pegaflow_rpc_duration_seconds** (Histogram) - RPC latency distribution

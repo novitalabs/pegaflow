@@ -9,7 +9,7 @@ use pegaflow_proto::proto::engine::{FetchSegment, QueryPrefixBlocksRequest};
 use pegaflow_proto::proto::engine::{
     HeartbeatNodeRequest, InsertBlockHashesRequest, RemoveBlockHashesRequest, UnregisterNodeRequest,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Duration, Instant};
 use tonic::Code;
 use tonic::transport::{Channel, Endpoint};
@@ -57,23 +57,37 @@ struct HeartbeatState {
     backoff_ms: u64,
     period: Duration,
     next_at: Instant,
+    spill: SpillHeartbeat,
 }
 
 impl HeartbeatState {
-    fn new() -> Self {
+    fn new(spill: SpillHeartbeat) -> Self {
         Self {
             node_registered: false,
             backoff_ms: INITIAL_BACKOFF_MS,
             period: Duration::from_secs(MIN_HEARTBEAT_INTERVAL_SECS),
             next_at: Instant::now(),
+            spill,
         }
     }
+}
+
+/// Spill tier fields announced on every heartbeat, and the channel that
+/// publishes the spill targets the MetaServer assigns in return.
+struct SpillHeartbeat {
+    target_capacity_bytes: u64,
+    wants_targets: bool,
+    targets: watch::Sender<Vec<String>>,
 }
 
 pub struct MetaServerClientConfig {
     pub metaserver_addr: String,
     pub advertise_addr: String,
     pub queue_depth: usize,
+    /// Spill tier: pool bytes this node offers as a spill target (0 = not a target).
+    pub spill_target_capacity_bytes: u64,
+    /// Spill tier: ask the MetaServer to assign this node's spill targets.
+    pub wants_spill_targets: bool,
 }
 
 impl MetaServerClientConfig {
@@ -82,11 +96,19 @@ impl MetaServerClientConfig {
             metaserver_addr,
             advertise_addr,
             queue_depth: DEFAULT_METASERVER_QUEUE_DEPTH,
+            spill_target_capacity_bytes: 0,
+            wants_spill_targets: false,
         }
     }
 
     pub fn with_queue_depth(mut self, depth: usize) -> Self {
         self.queue_depth = depth;
+        self
+    }
+
+    pub fn with_spill(mut self, target_capacity_bytes: u64, wants_targets: bool) -> Self {
+        self.spill_target_capacity_bytes = target_capacity_bytes;
+        self.wants_spill_targets = wants_targets;
         self
     }
 }
@@ -154,6 +176,9 @@ pub struct MetaServerClient {
     /// Lazy-connect query client
     #[cfg(feature = "rdma")]
     query_client: MetaServerGrpcClient<Channel>,
+    /// Spill targets the MetaServer assigned to this node, primary first.
+    #[cfg(feature = "rdma")]
+    spill_targets: watch::Receiver<Vec<String>>,
 }
 
 impl MetaServerClient {
@@ -163,6 +188,9 @@ impl MetaServerClient {
     pub(crate) fn new(config: MetaServerClientConfig, read_cache: Weak<ReadCache>) -> Self {
         let endpoint = metaserver_endpoint(config.metaserver_addr.clone());
         let (command_tx, rx) = mpsc::channel(config.queue_depth);
+        let (spill_targets_tx, spill_targets) = watch::channel(Vec::new());
+        #[cfg(not(feature = "rdma"))]
+        drop(spill_targets);
 
         tokio::spawn(registration_loop(
             rx,
@@ -170,6 +198,11 @@ impl MetaServerClient {
             endpoint.clone(),
             config.advertise_addr,
             read_cache,
+            SpillHeartbeat {
+                target_capacity_bytes: config.spill_target_capacity_bytes,
+                wants_targets: config.wants_spill_targets,
+                targets: spill_targets_tx,
+            },
         ));
 
         // Lazy-connect query client: connects on first RPC, not here
@@ -188,7 +221,16 @@ impl MetaServerClient {
             command_tx,
             #[cfg(feature = "rdma")]
             query_client,
+            #[cfg(feature = "rdma")]
+            spill_targets,
         }
+    }
+
+    /// Spill targets the MetaServer assigned to this node, primary first.
+    /// Empty until a heartbeat returns an assignment.
+    #[cfg(feature = "rdma")]
+    pub(crate) fn spill_targets(&self) -> watch::Receiver<Vec<String>> {
+        self.spill_targets.clone()
     }
 
     /// Fire-and-forget registration of block hashes.
@@ -396,10 +438,11 @@ async fn registration_loop(
     endpoint: Endpoint,
     advertise_addr: String,
     read_cache: Weak<ReadCache>,
+    spill: SpillHeartbeat,
 ) {
     let mut client: Option<MetaServerGrpcClient<Channel>> = None;
     let node_id = Uuid::new_v4().to_string();
-    let mut heartbeat = HeartbeatState::new();
+    let mut heartbeat = HeartbeatState::new(spill);
 
     loop {
         let heartbeat_sleep = tokio::time::sleep_until(heartbeat.next_at);
@@ -786,12 +829,27 @@ async fn send_heartbeat(
         .heartbeat_node(HeartbeatNodeRequest {
             node: advertise_addr.to_string(),
             node_id: node_id.to_string(),
+            spill_target_capacity_bytes: heartbeat.spill.target_capacity_bytes,
+            wants_spill_targets: heartbeat.spill.wants_targets,
         })
         .await
     {
         Ok(resp) => {
-            let heartbeat_period =
-                heartbeat_period_from_stale_after(resp.into_inner().stale_after_secs);
+            let resp = resp.into_inner();
+            let heartbeat_period = heartbeat_period_from_stale_after(resp.stale_after_secs);
+            if heartbeat.spill.wants_targets {
+                heartbeat.spill.targets.send_if_modified(|targets| {
+                    if *targets == resp.spill_targets {
+                        return false;
+                    }
+                    info!(
+                        "MetaServer assigned spill targets: {:?}",
+                        resp.spill_targets
+                    );
+                    targets.clone_from(&resp.spill_targets);
+                    true
+                });
+            }
             if !heartbeat.node_registered {
                 info!(
                     "MetaServer heartbeat established: node={advertise_addr} node_id={node_id} next_in={:?}",
@@ -920,6 +978,8 @@ mod tests {
         insert_requests: RequestLog,
         remove_requests: RequestLog,
         query_requests: Mutex<Vec<QueryPrefixBlocksRequest>>,
+        spill_targets: Mutex<Vec<String>>,
+        heartbeat_spill: Mutex<Option<(u64, bool)>>,
         heartbeat_notify: Notify,
         insert_notify: Notify,
         release_insert_response: Notify,
@@ -936,12 +996,18 @@ mod tests {
     impl MetaServer for FakeMetaServer {
         async fn heartbeat_node(
             &self,
-            _request: Request<HeartbeatNodeRequest>,
+            request: Request<HeartbeatNodeRequest>,
         ) -> Result<Response<HeartbeatNodeResponse>, Status> {
+            let request = request.into_inner();
+            *self.state.heartbeat_spill.lock().unwrap() = Some((
+                request.spill_target_capacity_bytes,
+                request.wants_spill_targets,
+            ));
             self.state.heartbeat_count.fetch_add(1, Ordering::SeqCst);
             self.state.heartbeat_notify.notify_waiters();
             Ok(Response::new(HeartbeatNodeResponse {
                 stale_after_secs: 2,
+                spill_targets: self.state.spill_targets.lock().unwrap().clone(),
             }))
         }
 
@@ -1110,6 +1176,32 @@ mod tests {
         client.shutdown().await;
         wait_for_count(&service.unregister_notify, &service.unregister_count, 1).await;
 
+        let _ = shutdown_tx.send(());
+    }
+
+    #[cfg(feature = "rdma")]
+    #[tokio::test]
+    async fn heartbeat_announces_spill_capacity_and_publishes_assigned_targets() {
+        let (addr, service, shutdown_tx) = start_fake_metaserver().await;
+        let assigned = vec!["decode-0:50055".to_string(), "decode-1:50055".to_string()];
+        *service.spill_targets.lock().unwrap() = assigned.clone();
+        let client = MetaServerClient::new(
+            MetaServerClientConfig::new(addr, "node-a:50055".to_string()).with_spill(4096, true),
+            Weak::new(),
+        );
+
+        let mut targets = client.spill_targets();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            targets.wait_for(|targets| !targets.is_empty()),
+        )
+        .await
+        .expect("assignment published")
+        .expect("heartbeat loop alive");
+        assert_eq!(*targets.borrow(), assigned);
+        assert_eq!(*service.heartbeat_spill.lock().unwrap(), Some((4096, true)));
+
+        client.shutdown().await;
         let _ = shutdown_tx.send(());
     }
 
@@ -1445,6 +1537,11 @@ mod tests {
             endpoint,
             "node-a:50055".to_string(),
             Weak::new(),
+            SpillHeartbeat {
+                target_capacity_bytes: 0,
+                wants_targets: false,
+                targets: watch::channel(Vec::new()).0,
+            },
         ));
 
         wait_for_count(&service.insert_notify, &service.insert_count, 2).await;

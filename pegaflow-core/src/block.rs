@@ -311,6 +311,12 @@ impl SealedBlock {
         }
     }
 
+    /// Slot-less block that still reports `footprint` bytes, for cache accounting tests.
+    #[cfg(test)]
+    pub(crate) fn with_footprint_for_test(footprint: u64) -> Self {
+        Self::from_slots_with_footprint(Box::new([]), footprint, Vec::new())
+    }
+
     /// Create from a fully populated, slot-id ordered insert batch.
     pub(crate) fn from_ordered_slot_inserts(
         slots: Vec<(usize, RawBlock)>,

@@ -61,6 +61,7 @@ cargo bench --bench uds_latency
      - `mod.rs`: `StorageEngine` — aggregates allocator, read cache, prefetch, write pipeline, SSD store, RDMA fetch
      - `read_cache.rs`: Pin/unpin/consume operations on sealed blocks
      - `prefetch.rs`: Per-request SSD/RDMA prefetch state machine
+     - `spill.rs`: Spill tier — hands cold blocks to a peer (e.g. a decode node) before eviction, and adopts peers' blocks as a spill target
      - `transfer_lock.rs`: Transfer lock manager — prevents LRU eviction during RDMA transfer
      - `write_path.rs`: Async insert worker thread for batched writes
    - `backing/`: SSD backing store
@@ -173,6 +174,7 @@ vLLM Worker <--gRPC--> PegaEngine Server <--CUDA IPC--> GPU Memory
 - `pegaflow-core/src/storage/mod.rs`: StorageEngine (allocator, read cache, prefetch, write pipeline, RDMA fetch)
 - `pegaflow-core/src/storage/read_cache.rs`: Pin/unpin/consume operations
 - `pegaflow-core/src/storage/prefetch.rs`: SSD/RDMA prefetch state machine
+- `pegaflow-core/src/storage/spill.rs`: Spill tier source loop and target adoption
 - `pegaflow-core/src/storage/transfer_lock.rs`: Transfer lock manager for RDMA transfers
 - `pegaflow-core/src/storage/write_path.rs`: Async insert worker thread
 - `pegaflow-core/src/backing/ssd.rs`: SSD backing store coordinator

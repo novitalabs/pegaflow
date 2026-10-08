@@ -1,5 +1,7 @@
 mod prefetch;
 mod read_cache;
+#[cfg(feature = "rdma")]
+mod spill;
 mod tier_attribution;
 pub(crate) mod transfer_lock;
 mod write_path;
@@ -10,6 +12,11 @@ use std::collections::HashSet;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
+#[cfg(feature = "rdma")]
+use std::time::Instant;
+
+#[cfg(feature = "rdma")]
+use tokio::sync::Notify;
 
 use crate::backing::{AllocateFn, DEFAULT_MAX_PREFETCH_BLOCKS, SsdBackingStore, SsdCacheConfig};
 #[cfg(feature = "rdma")]
@@ -38,6 +45,51 @@ pub struct MemoryCacheCleanupStats {
     pub evicted_bytes: u64,
     pub reclaimed_bytes: u64,
     pub still_referenced_blocks: u64,
+}
+
+/// Where a spill source sends its offers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SpillTargetSelection {
+    /// Spill target advertise addresses (`ip:port`). Offers go to the first
+    /// target that is not backing off, so later entries act as failover.
+    Static(Vec<String>),
+    /// Targets assigned by the MetaServer among nodes that accept spills,
+    /// balanced by their capacity and followed as targets join or leave.
+    MetaServer,
+}
+
+/// Spill tier, source side: hand cold retained blocks to a spill target
+/// before pressure eviction would drop the last copy.
+#[derive(Clone, Debug)]
+pub struct SpillSourceConfig {
+    pub targets: SpillTargetSelection,
+    /// Keep at least this many pool bytes free or reclaimable.
+    pub reserve_bytes: u64,
+    /// Upper bound on the block bytes offered in one request.
+    pub batch_bytes: u64,
+}
+
+/// Spill tier, target side: accept spill offers and take custody of peers'
+/// blocks by pulling them over RDMA.
+#[derive(Clone, Debug)]
+pub struct SpillTargetConfig {
+    /// Sustained pull budget in bytes per second (`None` = no rate limit).
+    pub max_bandwidth_bytes_per_sec: Option<u64>,
+    /// Upper bound on bytes being pulled at once.
+    pub max_inflight_bytes: u64,
+}
+
+/// Outcome of a spill offer on the target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpillAdoption {
+    /// The target now keeps these blocks: `adopted` were pulled from the
+    /// source, `already_held` were resident before the offer.
+    Accepted {
+        adopted: Vec<Vec<u8>>,
+        already_held: Vec<Vec<u8>>,
+    },
+    /// The target pulled nothing; the source should back off.
+    Rejected(&'static str),
 }
 
 #[derive(Clone)]
@@ -69,6 +121,10 @@ pub struct StorageConfig {
     pub metaserver_queue_depth: usize,
     /// Number of shards for the pinned memory pool (reduces allocator lock contention).
     pub pool_shards: usize,
+    /// Spill tier source: offer cold blocks to spill targets (requires RDMA + MetaServer).
+    pub spill_source: Option<SpillSourceConfig>,
+    /// Spill tier target: accept spill offers from peers (requires RDMA + MetaServer).
+    pub spill_target: Option<SpillTargetConfig>,
 }
 
 impl Default for StorageConfig {
@@ -87,6 +143,8 @@ impl Default for StorageConfig {
             advertise_addr: None,
             metaserver_queue_depth: crate::internode::DEFAULT_METASERVER_QUEUE_DEPTH,
             pool_shards: 1,
+            spill_source: None,
+            spill_target: None,
         }
     }
 }
@@ -99,6 +157,14 @@ pub(crate) struct StorageEngine {
     ssd_store: Option<Arc<SsdBackingStore>>,
     #[cfg(feature = "rdma")]
     rdma_transport: Option<Arc<RdmaTransport>>,
+    /// Shared with prefetch; the spill target pulls through it as well.
+    #[cfg(feature = "rdma")]
+    rdma_fetch_store: Option<Arc<RdmaFetchStore>>,
+    #[cfg(feature = "rdma")]
+    spill_admission: Option<Arc<spill::SpillAdmission>>,
+    /// Wakes the spill source after pressure eviction.
+    #[cfg(feature = "rdma")]
+    spill_wake: Option<Arc<Notify>>,
     blockwise_alloc: bool,
     metaserver_client: Option<Arc<MetaServerClient>>,
     transfer_lock: Arc<transfer_lock::TransferLockManager>,
@@ -120,6 +186,36 @@ impl StorageEngine {
         let rdma_qps_per_peer = config.rdma_qps_per_peer;
         let blockwise_alloc = config.blockwise_alloc;
         let transfer_lock_timeout = config.transfer_lock_timeout;
+        let spill_source = config.spill_source;
+        let spill_target = config.spill_target;
+
+        // The spill tier rides on P2P: targets pull over RDMA and advertise
+        // adopted blocks through the MetaServer.
+        let p2p_configured = config.metaserver_addr.is_some()
+            && config.advertise_addr.is_some()
+            && rdma_nic_names
+                .as_deref()
+                .is_some_and(|nics| !nics.is_empty());
+        if (spill_source.is_some() || spill_target.is_some()) && !p2p_configured {
+            return Err(
+                "spill tier requires RDMA NICs, a MetaServer address and an advertise address"
+                    .to_string(),
+            );
+        }
+        if let (Some(source), Some(own_addr)) = (&spill_source, &config.advertise_addr)
+            && let SpillTargetSelection::Static(targets) = &source.targets
+            && targets.contains(own_addr)
+        {
+            return Err(format!(
+                "spill source lists its own address {own_addr} as a spill target"
+            ));
+        }
+        #[cfg(not(feature = "rdma"))]
+        if spill_source.is_some() || spill_target.is_some() {
+            warn!(
+                "Spill tier was configured, but this binary was built without the `rdma` feature; ignoring spill config"
+            );
+        }
 
         if blockwise_alloc {
             info!("Blockwise allocation enabled for batch_save");
@@ -160,6 +256,22 @@ impl StorageEngine {
             value_size_hint,
         ));
 
+        // Spill targets announce their capacity and sources ask for an
+        // assignment through the MetaServer heartbeat.
+        #[cfg(feature = "rdma")]
+        let (spill_capacity, wants_spill_targets) = (
+            if spill_target.is_some() {
+                capacity_bytes as u64
+            } else {
+                0
+            },
+            spill_source
+                .as_ref()
+                .is_some_and(|source| source.targets == SpillTargetSelection::MetaServer),
+        );
+        #[cfg(not(feature = "rdma"))]
+        let (spill_capacity, wants_spill_targets) = (0, false);
+
         let metaserver_client = config.metaserver_addr.as_ref().map(|addr| {
             let advertise = config
                 .advertise_addr
@@ -170,7 +282,8 @@ impl StorageEngine {
                 addr, advertise, config.metaserver_queue_depth
             );
             let ms_config = MetaServerClientConfig::new(addr.clone(), advertise)
-                .with_queue_depth(config.metaserver_queue_depth);
+                .with_queue_depth(config.metaserver_queue_depth)
+                .with_spill(spill_capacity, wants_spill_targets);
             Arc::new(MetaServerClient::new(
                 ms_config,
                 Arc::downgrade(&read_cache),
@@ -199,6 +312,49 @@ impl StorageEngine {
             );
         }
 
+        #[cfg(feature = "rdma")]
+        let spill_admission =
+            spill_target.as_ref().map(|target| {
+                info!(
+                    "Spill target enabled: max_bandwidth={}, max_inflight={}",
+                    target.max_bandwidth_bytes_per_sec.map_or(
+                        "unlimited".to_string(),
+                        |rate| format!("{}/s", ByteSize(rate))
+                    ),
+                    ByteSize(target.max_inflight_bytes)
+                );
+                Arc::new(spill::SpillAdmission::new(
+                    target,
+                    config.advertise_addr.clone().unwrap_or_default(),
+                    Instant::now(),
+                ))
+            });
+        #[cfg(feature = "rdma")]
+        if spill_source.is_some() && !blockwise_alloc {
+            warn!(
+                "Spill source uses batch allocation: blocks saved together share pinned memory, so evicting a spilled block frees memory only once its batch-mates are evicted too; use --blockwise-alloc for an exact spill reserve"
+            );
+        }
+        #[cfg(feature = "rdma")]
+        let spill_wake = spill_source.as_ref().map(|_| Arc::new(Notify::new()));
+        #[cfg(feature = "rdma")]
+        let spill_source_task = spill_source.zip(spill_wake.clone()).map(|(source, wake)| {
+            info!(
+                "Spill source enabled: targets={:?}, reserve={}, batch={}",
+                source.targets,
+                ByteSize(source.reserve_bytes),
+                ByteSize(source.batch_bytes)
+            );
+            let assigned = match source.targets {
+                SpillTargetSelection::Static(_) => None,
+                SpillTargetSelection::MetaServer => metaserver_client
+                    .as_ref()
+                    .map(|client| client.spill_targets()),
+            };
+            let advertise = config.advertise_addr.clone().unwrap_or_default();
+            (spill::SpillSource::new(source, advertise, assigned), wake)
+        });
+
         let is_numa = allocator.is_numa();
         let engine = Arc::new_cyclic(move |weak_engine: &Weak<Self>| {
             // Build shared allocate_fn for backing stores.
@@ -213,19 +369,21 @@ impl StorageEngine {
                 .map(|cfg| crate::backing::new_ssd(cfg, allocate_fn.clone(), is_numa));
 
             #[cfg(feature = "rdma")]
-            let rdma_fetch = rdma_transport.as_ref().and_then(|rdma| {
+            let rdma_fetch_store = rdma_transport.as_ref().and_then(|rdma| {
                 let ms = metaserver_client.as_ref()?;
                 let advertise = config
                     .advertise_addr
                     .clone()
                     .unwrap_or_else(|| "127.0.0.1:50055".to_string());
-                Some(RdmaFetch::new(Arc::new(RdmaFetchStore::new(
+                Some(Arc::new(RdmaFetchStore::new(
                     Arc::clone(ms),
                     Arc::clone(rdma),
                     allocate_fn.clone(),
                     advertise,
-                ))))
+                )))
             });
+            #[cfg(feature = "rdma")]
+            let rdma_fetch = rdma_fetch_store.clone().map(RdmaFetch::new);
             #[cfg(not(feature = "rdma"))]
             let rdma_fetch = None;
 
@@ -248,6 +406,12 @@ impl StorageEngine {
                 ssd_store,
                 #[cfg(feature = "rdma")]
                 rdma_transport,
+                #[cfg(feature = "rdma")]
+                rdma_fetch_store,
+                #[cfg(feature = "rdma")]
+                spill_admission,
+                #[cfg(feature = "rdma")]
+                spill_wake,
                 blockwise_alloc,
                 metaserver_client,
                 transfer_lock,
@@ -272,6 +436,15 @@ impl StorageEngine {
                     write_path::insert_worker_loop(insert_rx, weak_deps);
                 })
                 .expect("failed to spawn insert worker thread");
+        }
+
+        #[cfg(feature = "rdma")]
+        if let Some((source, wake)) = spill_source_task {
+            tokio::spawn(spill::run_spill_source(
+                Arc::downgrade(&engine),
+                source,
+                wake,
+            ));
         }
 
         Ok(engine)
@@ -548,6 +721,12 @@ impl StorageEngine {
             core_metrics()
                 .cache_block_evictions
                 .add(freed_blocks as u64, &[]);
+            // Pressure is consuming the reclaimable reserve; let the spill
+            // source top it up before eviction reaches retained blocks.
+            #[cfg(feature = "rdma")]
+            if let Some(wake) = &self.spill_wake {
+                wake.notify_one();
+            }
         }
 
         (freed_blocks, freed_bytes, largest_free)
@@ -614,6 +793,17 @@ impl StorageEngine {
     /// GC expired transfer lock sessions. Returns the number of sessions expired.
     pub(crate) fn gc_expired_transfer_locks(&self) -> usize {
         self.transfer_lock.gc_expired()
+    }
+
+    #[cfg(not(feature = "rdma"))]
+    pub(crate) async fn adopt_spill(
+        &self,
+        _source_addr: &str,
+        _namespace: &str,
+        _hashes: &[Vec<u8>],
+        _total_bytes: u64,
+    ) -> SpillAdoption {
+        SpillAdoption::Rejected("this binary was built without RDMA support")
     }
 
     /// Return `(base_ptr, size)` for each contiguous pinned memory region.

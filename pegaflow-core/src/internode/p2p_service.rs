@@ -6,8 +6,9 @@
 //! `pegaflow-server` binary provides them alongside the CUDA-IPC registration
 //! surface — which an in-process Rust embedder (one that registers raw device
 //! pointers and drives saves/loads through `PegaEngine` directly) has no use
-//! for. This service is that minimal serving surface: the three transfer RPCs
-//! plus `Health`, everything else answered with `unimplemented`.
+//! for. This service is that minimal serving surface: the three transfer RPCs,
+//! `SpillOffer` (for engines configured as spill targets), and `Health`;
+//! everything else answered with `unimplemented`.
 //!
 //! The embedder remains responsible for periodic GC of expired transfer locks
 //! (`PegaEngine::gc_expired_transfer_locks`), mirroring pegaflow-server's
@@ -25,15 +26,44 @@ use pegaflow_proto::proto::engine::{
     RdmaHandshakeResponse, RegisterContextRequest, RegisterContextResponse, ReleaseRequest,
     ReleaseResponse, ReleaseTransferLockRequest, ReleaseTransferLockResponse, ResponseStatus,
     SaveRequest, SaveResponse, SessionEvent, SessionRequest, ShutdownRequest, ShutdownResponse,
-    TransferBlockInfo, TransferSlotInfo, UnregisterRequest, UnregisterResponse,
+    SpillOfferRequest, SpillOfferResponse, TransferBlockInfo, TransferSlotInfo, UnregisterRequest,
+    UnregisterResponse,
 };
 
-use crate::{LayerBlock, PegaEngine};
+use crate::{LayerBlock, PegaEngine, SpillAdoption};
 
 /// Match pegaflow-server's cap: a `QueryBlocksForTransfer` response carries
 /// per-slot descriptors for every requested block, which overflows tonic's
 /// default 4 MiB limit on large batches.
 const MAX_GRPC_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+
+impl From<SpillAdoption> for SpillOfferResponse {
+    fn from(adoption: SpillAdoption) -> Self {
+        match adoption {
+            SpillAdoption::Accepted {
+                adopted,
+                already_held,
+            } => Self {
+                status: Some(ResponseStatus {
+                    ok: true,
+                    message: String::new(),
+                }),
+                accepted: true,
+                adopted_hashes: adopted,
+                already_held_hashes: already_held,
+            },
+            SpillAdoption::Rejected(reason) => Self {
+                status: Some(ResponseStatus {
+                    ok: true,
+                    message: reason.to_string(),
+                }),
+                accepted: false,
+                adopted_hashes: Vec::new(),
+                already_held_hashes: Vec::new(),
+            },
+        }
+    }
+}
 
 /// The minimal gRPC surface a `PegaEngine` embedder exposes so RDMA peers can
 /// fetch blocks from it. See the module docs for scope.
@@ -218,6 +248,35 @@ impl Engine for P2pTransferService {
             status: Some(Self::ok_status()),
             handshake_metadata: server_meta,
         }))
+    }
+
+    async fn spill_offer(
+        &self,
+        request: Request<SpillOfferRequest>,
+    ) -> Result<Response<SpillOfferResponse>, Status> {
+        let req = request.into_inner();
+        if req.source_addr.is_empty() {
+            return Err(Status::invalid_argument("source_addr is required"));
+        }
+        let adoption = self
+            .engine
+            .adopt_spill(
+                &req.source_addr,
+                &req.namespace,
+                &req.block_hashes,
+                req.total_bytes,
+            )
+            .await;
+        let response = SpillOfferResponse::from(adoption);
+        debug!(
+            "P2P spill_offer: source={} offered={} accepted={} adopted={} already_held={}",
+            req.source_addr,
+            req.block_hashes.len(),
+            response.accepted,
+            response.adopted_hashes.len(),
+            response.already_held_hashes.len(),
+        );
+        Ok(Response::new(response))
     }
 
     async fn health(

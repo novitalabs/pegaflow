@@ -185,6 +185,115 @@ pub struct Cli {
     /// locked for at most this duration before being force-released (crash recovery).
     #[arg(long, default_value_t = 120)]
     pub transfer_lock_timeout_secs: u64,
+
+    /// Spill tier source: pegaflow-server addresses (ip:port) that take custody of this
+    /// node's cold blocks before eviction drops them, or `auto` to let the MetaServer
+    /// assign targets among nodes started with --spill-accept. Offers go to the first
+    /// reachable target; later targets are failover. Requires --metaserver-addr and --nics.
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub spill_targets: Vec<String>,
+
+    /// Spill tier source: keep this much of the pool free or reclaimable, as a size
+    /// (e.g. 8gb) or a percentage of --pool-size (e.g. 5%).
+    #[arg(long, default_value = "5%", value_parser = parse_spill_reserve_arg)]
+    pub spill_reserve: String,
+
+    /// Spill tier source: upper bound on the block bytes offered per spill request.
+    #[arg(long, default_value = "128mb", value_parser = parse_memory_size)]
+    pub spill_batch_size: usize,
+
+    /// Spill tier target: accept spill offers and take custody of other nodes' cold
+    /// blocks. Requires --metaserver-addr and --nics.
+    #[arg(long, default_value_t = false)]
+    pub spill_accept: bool,
+
+    /// Spill tier target: sustained pull budget per second (supports units: kb, mb, gb, tb).
+    /// Unset means no rate limit; spill pulls share the NIC with the P/D KV handoff.
+    #[arg(long, value_parser = parse_memory_size)]
+    pub spill_max_bandwidth: Option<usize>,
+
+    /// Spill tier target: upper bound on bytes being pulled at once.
+    #[arg(long, default_value = "512mb", value_parser = parse_memory_size)]
+    pub spill_max_inflight: usize,
+}
+
+fn parse_spill_reserve_arg(s: &str) -> Result<String, String> {
+    parse_spill_reserve(s, 0)?;
+    Ok(s.to_string())
+}
+
+/// Resolve `--spill-reserve` to bytes: a memory size, or a percentage of the pool.
+fn parse_spill_reserve(s: &str, pool_size: usize) -> Result<u64, String> {
+    let s = s.trim();
+    let Some(percent) = s.strip_suffix('%') else {
+        return parse_memory_size(s).map(|bytes| bytes as u64);
+    };
+    let percent: f64 = percent
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid --spill-reserve percentage: {s}"))?;
+    if !(0.0..=100.0).contains(&percent) {
+        return Err(format!(
+            "--spill-reserve percentage must be within 0..=100, got {s}"
+        ));
+    }
+    Ok((pool_size as f64 * percent / 100.0) as u64)
+}
+
+type SpillConfigs = (
+    Option<pegaflow_core::SpillSourceConfig>,
+    Option<pegaflow_core::SpillTargetConfig>,
+);
+
+/// Build the spill tier config from the CLI, rejecting combinations that cannot work.
+fn spill_configs(cli: &Cli, p2p_enabled: bool) -> Result<SpillConfigs, String> {
+    let source = if cli.spill_targets.is_empty() {
+        None
+    } else {
+        if !p2p_enabled {
+            return Err("--spill-targets requires --metaserver-addr and --nics".into());
+        }
+        let own_addr = cli.addr.to_string();
+        let targets = if cli.spill_targets == ["auto"] {
+            pegaflow_core::SpillTargetSelection::MetaServer
+        } else if cli.spill_targets.iter().any(|target| target == "auto") {
+            return Err("--spill-targets auto cannot be combined with addresses".into());
+        } else if cli.spill_targets.contains(&own_addr) {
+            return Err(format!(
+                "--spill-targets must not include this node's own --addr {own_addr}"
+            ));
+        } else {
+            pegaflow_core::SpillTargetSelection::Static(cli.spill_targets.clone())
+        };
+        if cli.spill_batch_size == 0 {
+            return Err("--spill-batch-size must be greater than zero".into());
+        }
+        Some(pegaflow_core::SpillSourceConfig {
+            targets,
+            reserve_bytes: parse_spill_reserve(&cli.spill_reserve, cli.pool_size)?,
+            batch_bytes: cli.spill_batch_size as u64,
+        })
+    };
+
+    let target = if cli.spill_accept {
+        if !p2p_enabled {
+            return Err("--spill-accept requires --metaserver-addr and --nics".into());
+        }
+        if cli.spill_max_bandwidth == Some(0) {
+            return Err("--spill-max-bandwidth must be greater than zero when set".into());
+        }
+        if cli.spill_max_inflight == 0 {
+            return Err("--spill-max-inflight must be greater than zero".into());
+        }
+        Some(pegaflow_core::SpillTargetConfig {
+            max_bandwidth_bytes_per_sec: cli.spill_max_bandwidth.map(|bytes| bytes as u64),
+            max_inflight_bytes: cli.spill_max_inflight as u64,
+        })
+    } else {
+        None
+    };
+
+    Ok((source, target))
 }
 
 fn parse_hll_bucket_bits(s: &str) -> Result<u8, String> {
@@ -539,6 +648,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         None
     };
 
+    let (spill_source, spill_target) = spill_configs(&cli, has_metaserver && has_nics)?;
+
     let storage_config = pegaflow_core::StorageConfig {
         enable_lfu_admission: cli.enable_lfu_admission,
         hint_value_size_bytes: cli.hint_value_size,
@@ -553,6 +664,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         advertise_addr,
         metaserver_queue_depth: cli.metaserver_queue_depth,
         pool_shards: cli.pool_shards,
+        spill_source,
+        spill_target,
     };
 
     if cli.pool_shards > 1 {
@@ -826,5 +939,99 @@ mod tests {
         let err = parse_hll_windows("1h,60m").unwrap_err();
 
         assert!(err.contains("duplicate HLL window duration"), "{err}");
+    }
+
+    #[test]
+    fn spill_reserve_accepts_sizes_and_pool_percentages() {
+        let pool = 100 << 30;
+        assert_eq!(parse_spill_reserve("5%", pool).unwrap(), 5 << 30);
+        assert_eq!(parse_spill_reserve("8gb", pool).unwrap(), 8 << 30);
+        assert!(parse_spill_reserve("101%", pool).is_err());
+        assert!(Cli::try_parse_from(["pegaflow-server", "--spill-reserve", "x%"]).is_err());
+    }
+
+    #[test]
+    fn spill_configs_validate_flag_combinations() {
+        let target = "10.0.0.2:50055";
+        let cases: [(&[&str], bool, Option<&str>); 6] = [
+            (
+                &["--spill-targets", target],
+                false,
+                Some("requires --metaserver-addr"),
+            ),
+            (
+                &["--addr", target, "--spill-targets", target],
+                true,
+                Some("own --addr"),
+            ),
+            (
+                &["--spill-targets", "auto,10.0.0.2:50055"],
+                true,
+                Some("cannot be combined"),
+            ),
+            (
+                &["--spill-accept", "--spill-max-bandwidth", "0"],
+                true,
+                Some("greater than zero"),
+            ),
+            (
+                &["--spill-accept"],
+                false,
+                Some("requires --metaserver-addr"),
+            ),
+            (&[], false, None),
+        ];
+        for (args, p2p_enabled, expected_err) in cases {
+            let cli = Cli::try_parse_from(std::iter::once("pegaflow-server").chain(args.to_vec()))
+                .unwrap();
+            match (spill_configs(&cli, p2p_enabled), expected_err) {
+                (Ok((None, None)), None) => {}
+                (Err(err), Some(expected)) => assert!(err.contains(expected), "{args:?}: {err}"),
+                (result, expected) => panic!("{args:?}: got {result:?}, expected {expected:?}"),
+            }
+        }
+
+        let cli = Cli::try_parse_from([
+            "pegaflow-server",
+            "--pool-size",
+            "100gb",
+            "--spill-targets",
+            "10.0.0.2:50055,10.0.0.3:50055",
+            "--spill-accept",
+            "--spill-max-bandwidth",
+            "10gb",
+        ])
+        .unwrap();
+        let (source, target) = spill_configs(&cli, true).unwrap();
+        let source = source.expect("spill source config");
+        assert_eq!(
+            source.targets,
+            pegaflow_core::SpillTargetSelection::Static(vec![
+                "10.0.0.2:50055".into(),
+                "10.0.0.3:50055".into()
+            ])
+        );
+        assert_eq!(source.reserve_bytes, 5 << 30);
+        assert_eq!(source.batch_bytes, 128 << 20);
+        let target = target.expect("spill target config");
+        assert_eq!(target.max_bandwidth_bytes_per_sec, Some(10 << 30));
+        assert_eq!(target.max_inflight_bytes, 512 << 20);
+
+        let cli = Cli::try_parse_from(["pegaflow-server", "--spill-accept"]).unwrap();
+        let (_, target) = spill_configs(&cli, true).unwrap();
+        assert_eq!(
+            target
+                .expect("spill target config")
+                .max_bandwidth_bytes_per_sec,
+            None,
+            "no bandwidth flag means no rate limit"
+        );
+
+        let cli = Cli::try_parse_from(["pegaflow-server", "--spill-targets", "auto"]).unwrap();
+        let (source, _) = spill_configs(&cli, true).unwrap();
+        assert_eq!(
+            source.expect("spill source config").targets,
+            pegaflow_core::SpillTargetSelection::MetaServer
+        );
     }
 }
