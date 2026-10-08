@@ -36,7 +36,8 @@ const RECLAIM_BATCH_SIZE: usize = 512;
 // LRU order is unrelated to address order, so on a fragmented pool an
 // unbounded reclaim keeps evicting until a large enough hole happens to open,
 // which can flush most of the cache for a single request. Past the budget the
-// allocation fails instead; callers already treat that as a cache miss.
+// allocation fails instead: an RDMA fetch becomes a cache miss and a save is
+// dropped, both cheaper than evicting most of the resident cache.
 const RECLAIM_AMPLIFICATION: u64 = 32;
 const RECLAIM_MIN_BUDGET_BYTES: u64 = 1 << 30;
 
