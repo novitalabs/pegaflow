@@ -11,7 +11,7 @@ use mea::singleflight::Group;
 use pegaflow_proto::proto::engine::engine_client::EngineClient;
 use pegaflow_proto::proto::engine::{
     FetchSegment, QueryBlocksForTransferRequest, QueryBlocksForTransferResponse,
-    RdmaHandshakeRequest, TransferBlockInfo,
+    RdmaHandshakeRequest, TransferBlockInfo, TransferSlotInfo,
 };
 use pegaflow_transfer::{ConnectionStatus, HandshakeMetadata, TransferDesc, TransferOp};
 use tonic::transport::{Channel, Endpoint};
@@ -34,10 +34,16 @@ const MIN_TRANSFER_TIMEOUT: Duration = Duration::from_secs(10);
 /// finish the RDMA transfer before the server releases the lock.
 const LOCK_TIMEOUT_MARGIN: Duration = Duration::from_secs(60);
 
-/// Upper bound for a single pinned-pool allocation while staging an RDMA fetch.
-/// LRU reclaim must carve a contiguous hole of the requested size, so a
-/// whole-prefix slab can force eviction of far more bytes than the fetch needs.
-const FETCH_CHUNK_BYTES: u64 = 256 * 1024 * 1024;
+/// Slots at least this large are staged in their own pinned allocation.
+///
+/// Fetched memory must match the pool's resident allocation sizes: a fetch
+/// that asks for one large contiguous slab makes LRU reclaim evict blocks
+/// until a hole that big happens to open, which on a fragmented pool flushes
+/// most of the cache. Page-first saves allocate one page per slot, so staging
+/// per slot keeps every allocation the same size and owned by one block.
+/// Smaller (per-layer) slots are coalesced per (block, NUMA) instead, which is
+/// still fixed-size per model and keeps the allocation count bounded.
+const PER_SLOT_ALLOC_MIN_BYTES: u64 = 256 * 1024;
 
 /// RDMA remote block fetch backing store.
 ///
@@ -433,12 +439,12 @@ async fn rdma_fetch_task(
         0.0
     };
     info!(
-        "RDMA fetch summary: req_id={req_id} remote={remote_addr} blocks={}/{} slots={} descs={} slabs={} bytes_mib={mb:.1} total_ms={elapsed_ms:.2} tp_mib_s={throughput_mib_s:.0}",
+        "RDMA fetch summary: req_id={req_id} remote={remote_addr} blocks={}/{} slots={} descs={} allocs={} bytes_mib={mb:.1} total_ms={elapsed_ms:.2} tp_mib_s={throughput_mib_s:.0}",
         result.len(),
         block_hashes.len(),
         transfer_timing.slot_count,
         transfer_timing.transfer_desc_count,
-        transfer_timing.numa_slab_count,
+        transfer_timing.alloc_count,
     );
     info!(
         "RDMA fetch stages: req_id={req_id} remote={remote_addr} connect_ms={:.2} query_ms={:.2} build_transfer_tasks_ms={:.2} submit_transfer_ms={:.2} rdma_wait_ms={:.2} rebuild_ms={:.2}",
@@ -528,16 +534,11 @@ async fn fetch_blocks_via_rdma(
         return Ok((Vec::new(), TransferTiming::default()));
     }
 
-    let mut slabs = ChunkedSlabs::new(
-        allocate_fn,
-        FETCH_CHUNK_BYTES,
-        sum_segment_bytes_by_numa(blocks)?,
-    );
-
     // (block_hash, Vec<(slot_segments, slot_numa)>) — for building SealedBlock afterwards.
     // The per-slot NUMA is preserved so a re-served fetched block advertises real topology.
     let mut block_allocs: Vec<StagedBlock> = Vec::new();
     let mut slot_count = 0usize;
+    let mut alloc_count = 0usize;
     let build_start = Instant::now();
 
     // Build TransferDescs and submit RDMA READ inside a sync block so that
@@ -547,53 +548,55 @@ async fn fetch_blocks_via_rdma(
 
         for block_info in blocks {
             slot_count += block_info.slots.len();
-            let mut slot_allocs = Vec::with_capacity(block_info.slots.len());
+            let mut slot_allocs: Vec<Option<StagedSlot>> =
+                (0..block_info.slots.len()).map(|_| None).collect();
 
-            for slot in &block_info.slots {
-                let mut segments = Vec::new();
-                let numa = NumaNode(slot.numa_node);
+            for group in plan_block_allocations(&block_info.slots)? {
+                let allocation = (allocate_fn)(group.bytes, Some(group.numa)).ok_or_else(|| {
+                    format!(
+                        "failed to allocate fetch staging ({} bytes) on {}",
+                        group.bytes, group.numa
+                    )
+                })?;
+                alloc_count += 1;
+                let base = allocation.as_non_null();
+                let mut offset = 0usize;
 
-                // K segment
-                if slot.k_size > 0 {
-                    let len = usize::try_from(slot.k_size)
-                        .map_err(|_| format!("K size exceeds usize: {}", slot.k_size))?;
-                    let (local_ptr, alloc) = slabs.alloc_segment(numa, len, "K")?;
-                    let remote_ptr = NonNull::new(slot.k_ptr as *mut u8)
-                        .ok_or_else(|| "remote K ptr is null".to_string())?;
-                    all_descs.push(TransferDesc {
-                        local_ptr,
-                        remote_ptr,
-                        len,
-                    });
-                    segments.push(SegmentAlloc {
-                        ptr_addr: local_ptr.as_ptr() as u64,
-                        alloc,
-                        size: len,
-                    });
+                for slot_idx in group.slots {
+                    let slot = &block_info.slots[slot_idx];
+                    let mut segments = Vec::new();
+                    for (kind, remote, size) in slot_segments(slot) {
+                        let len = usize::try_from(size)
+                            .map_err(|_| format!("{kind} size exceeds usize: {size}"))?;
+                        let remote_ptr = NonNull::new(remote as *mut u8)
+                            .ok_or_else(|| format!("remote {kind} ptr is null"))?;
+                        // SAFETY: the group allocation is sized to the sum of its
+                        // slots' segments, so `offset + len` stays in bounds.
+                        let local_ptr = unsafe { base.add(offset) };
+                        offset += len;
+                        all_descs.push(TransferDesc {
+                            local_ptr,
+                            remote_ptr,
+                            len,
+                        });
+                        segments.push(SegmentAlloc {
+                            ptr_addr: local_ptr.as_ptr() as u64,
+                            alloc: Arc::clone(&allocation),
+                            size: len,
+                        });
+                    }
+                    slot_allocs[slot_idx] = Some((segments, group.numa));
                 }
-
-                // V segment (split KV)
-                if slot.v_size > 0 && slot.v_ptr != 0 {
-                    let len = usize::try_from(slot.v_size)
-                        .map_err(|_| format!("V size exceeds usize: {}", slot.v_size))?;
-                    let (local_ptr, alloc) = slabs.alloc_segment(numa, len, "V")?;
-                    let remote_ptr = NonNull::new(slot.v_ptr as *mut u8)
-                        .ok_or_else(|| "remote V ptr is null".to_string())?;
-                    all_descs.push(TransferDesc {
-                        local_ptr,
-                        remote_ptr,
-                        len,
-                    });
-                    segments.push(SegmentAlloc {
-                        ptr_addr: local_ptr.as_ptr() as u64,
-                        alloc,
-                        size: len,
-                    });
-                }
-
-                slot_allocs.push((segments, numa));
             }
 
+            // Slots with nothing to read keep an empty segment list.
+            let slot_allocs = slot_allocs
+                .into_iter()
+                .zip(&block_info.slots)
+                .map(|(staged, slot)| {
+                    staged.unwrap_or_else(|| (Vec::new(), NumaNode(slot.numa_node)))
+                })
+                .collect();
             block_allocs.push((block_info.block_hash.clone(), slot_allocs));
         }
 
@@ -601,7 +604,7 @@ async fn fetch_blocks_via_rdma(
             let timing = TransferTiming {
                 build_transfer_tasks: build_start.elapsed(),
                 slot_count,
-                numa_slab_count: slabs.chunk_count,
+                alloc_count,
                 ..TransferTiming::default()
             };
             return Ok((Vec::new(), timing));
@@ -622,7 +625,7 @@ async fn fetch_blocks_via_rdma(
             submit_transfer,
             transfer_desc_count,
             slot_count,
-            numa_slab_count: slabs.chunk_count,
+            alloc_count,
             ..TransferTiming::default()
         };
         (receivers, timing)
@@ -668,145 +671,67 @@ async fn fetch_blocks_via_rdma(
     Ok((result, timing))
 }
 
-/// Total staged bytes per NUMA node for one fetch batch. Used to right-size
-/// the last chunk of each NUMA so small fetches don't over-allocate.
-fn sum_segment_bytes_by_numa(
-    blocks: &[TransferBlockInfo],
-) -> Result<HashMap<NumaNode, u64>, String> {
-    let mut bytes_per_numa: HashMap<NumaNode, u64> = HashMap::new();
-    for block_info in blocks {
-        for slot in &block_info.slots {
-            let numa = NumaNode(slot.numa_node);
-            let mut add = 0u64;
-            if slot.k_size > 0 {
-                add += slot.k_size;
-            }
-            if slot.v_size > 0 && slot.v_ptr != 0 {
-                add = add
-                    .checked_add(slot.v_size)
-                    .ok_or_else(|| format!("segment bytes overflow on {numa}"))?;
-            }
-            let total = bytes_per_numa.entry(numa).or_insert(0);
-            *total = total
-                .checked_add(add)
-                .ok_or_else(|| format!("numa bytes overflow while summing segments on {numa}"))?;
-        }
-    }
-    Ok(bytes_per_numa)
+/// Remote segments of one slot that need an RDMA READ: `(kind, remote_ptr, bytes)`.
+fn slot_segments(slot: &TransferSlotInfo) -> impl Iterator<Item = (&'static str, u64, u64)> {
+    let k = (slot.k_size > 0).then_some(("K", slot.k_ptr, slot.k_size));
+    let v = (slot.v_size > 0 && slot.v_ptr != 0).then_some(("V", slot.v_ptr, slot.v_size));
+    k.into_iter().chain(v)
 }
 
-/// Bump allocator over bounded pinned chunks, one active chunk per NUMA node.
-/// Each staged segment holds an Arc to its own chunk, so starting a fresh
-/// chunk never invalidates previously staged segments, and fetched blocks are
-/// freed chunk-by-chunk on eviction instead of all-or-nothing per fetch.
+/// One pinned allocation backing some of a block's slots on a single NUMA node.
+#[derive(Debug, PartialEq, Eq)]
+struct SlotGroup {
+    numa: NumaNode,
+    bytes: u64,
+    slots: Vec<usize>,
+}
+
+/// Decide how a fetched block's slots map onto pinned allocations.
 ///
-/// A chunk is sized `min(remaining bytes on that NUMA, chunk_bytes)`: the cap
-/// bounds LRU-reclaim amplification on large fetches, the remaining-bytes
-/// clamp keeps small fetches from grabbing a whole `chunk_bytes` slab (which
-/// would fail outright on pools smaller than the cap).
-struct ChunkedSlabs<'a> {
-    allocate_fn: &'a AllocateFn,
-    chunk_bytes: u64,
-    current: HashMap<NumaNode, NumaSlab>,
-    /// Bytes of this batch not yet staged, per NUMA.
-    remaining: HashMap<NumaNode, u64>,
-    chunk_count: usize,
-}
+/// Every allocation belongs to exactly one block, so evicting the block frees
+/// its memory. Slots of at least `PER_SLOT_ALLOC_MIN_BYTES` (page-first pages)
+/// get one allocation each, matching the save path's page size. Smaller slots
+/// are coalesced into one allocation per NUMA node. Slots with nothing to read
+/// are left out.
+fn plan_block_allocations(slots: &[TransferSlotInfo]) -> Result<Vec<SlotGroup>, String> {
+    let mut groups: Vec<SlotGroup> = Vec::new();
+    // Index into `groups` of the coalesced small-slot group per NUMA node.
+    let mut small: HashMap<NumaNode, usize> = HashMap::new();
 
-impl<'a> ChunkedSlabs<'a> {
-    fn new(
-        allocate_fn: &'a AllocateFn,
-        chunk_bytes: u64,
-        remaining: HashMap<NumaNode, u64>,
-    ) -> Self {
-        Self {
-            allocate_fn,
-            chunk_bytes,
-            current: HashMap::new(),
-            remaining,
-            chunk_count: 0,
-        }
-    }
-
-    fn alloc_segment(
-        &mut self,
-        numa: NumaNode,
-        len: usize,
-        segment_kind: &str,
-    ) -> Result<(NonNull<u8>, Arc<crate::pinned_pool::PinnedAllocation>), String> {
-        if let Some(slab) = self.current.get_mut(&numa)
-            && let Ok(seg) = slab.allocate(len, segment_kind)
-        {
-            self.consume_remaining(numa, len);
-            return Ok(seg);
-        }
-
-        // No chunk on this NUMA yet, or the current one can't fit the segment.
-        let remaining = *self
-            .remaining
-            .get(&numa)
-            .expect("remaining bytes tracked for every NUMA in the batch");
-        let chunk = remaining.min(self.chunk_bytes).max(len as u64);
-        let allocation = (self.allocate_fn)(chunk, Some(numa)).ok_or_else(|| {
-            format!("failed to allocate fetch chunk ({chunk} bytes) on {numa} for {segment_kind}")
+    for (slot_idx, slot) in slots.iter().enumerate() {
+        let bytes = slot_segments(slot).try_fold(0u64, |total, (kind, _, size)| {
+            total
+                .checked_add(size)
+                .ok_or_else(|| format!("slot {slot_idx} {kind} size overflows"))
         })?;
-        let capacity = usize::try_from(chunk)
-            .map_err(|_| format!("fetch chunk size exceeds usize: {chunk}"))?;
-        self.chunk_count += 1;
-        self.current.insert(
-            numa,
-            NumaSlab {
-                allocation,
-                next_offset: 0,
-                capacity,
-            },
-        );
-        self.consume_remaining(numa, len);
-        self.current
-            .get_mut(&numa)
-            .expect("chunk just inserted")
-            .allocate(len, segment_kind)
-    }
-
-    fn consume_remaining(&mut self, numa: NumaNode, len: usize) {
-        let rem = self
-            .remaining
-            .get_mut(&numa)
-            .expect("remaining bytes tracked for every NUMA in the batch");
-        *rem = rem.saturating_sub(len as u64);
-    }
-}
-
-struct NumaSlab {
-    allocation: Arc<crate::pinned_pool::PinnedAllocation>,
-    next_offset: usize,
-    capacity: usize,
-}
-
-impl NumaSlab {
-    fn allocate(
-        &mut self,
-        len: usize,
-        segment_kind: &str,
-    ) -> Result<(NonNull<u8>, Arc<crate::pinned_pool::PinnedAllocation>), String> {
-        let end = self.next_offset.checked_add(len).ok_or_else(|| {
-            format!(
-                "slab offset overflow while allocating {segment_kind}: offset={} len={len} capacity={}",
-                self.next_offset, self.capacity
-            )
-        })?;
-        if end > self.capacity {
-            return Err(format!(
-                "slab exhausted while allocating {segment_kind}: offset={} len={len} capacity={}",
-                self.next_offset, self.capacity
-            ));
+        if bytes == 0 {
+            continue;
         }
-
-        let ptr = unsafe { self.allocation.as_non_null().as_ptr().add(self.next_offset) };
-        self.next_offset = end;
-        let ptr = NonNull::new(ptr).ok_or_else(|| "slab pointer is null".to_string())?;
-        Ok((ptr, Arc::clone(&self.allocation)))
+        let numa = NumaNode(slot.numa_node);
+        if bytes >= PER_SLOT_ALLOC_MIN_BYTES {
+            groups.push(SlotGroup {
+                numa,
+                bytes,
+                slots: vec![slot_idx],
+            });
+            continue;
+        }
+        let idx = *small.entry(numa).or_insert_with(|| {
+            groups.push(SlotGroup {
+                numa,
+                bytes: 0,
+                slots: Vec::new(),
+            });
+            groups.len() - 1
+        });
+        let group = &mut groups[idx];
+        group.bytes = group
+            .bytes
+            .checked_add(bytes)
+            .ok_or_else(|| format!("block staging bytes overflow on {numa}"))?;
+        group.slots.push(slot_idx);
     }
+    Ok(groups)
 }
 
 struct SegmentAlloc {
@@ -823,7 +748,7 @@ struct TransferTiming {
     rebuild: Duration,
     transfer_desc_count: usize,
     slot_count: usize,
-    numa_slab_count: usize,
+    alloc_count: usize,
 }
 
 fn get_or_create_channel(
@@ -915,26 +840,24 @@ fn transfer_timeout_from_server(lock_timeout_secs: u32) -> Duration {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
-    use std::num::NonZeroU64;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    fn test_allocate_fn(calls: Arc<AtomicUsize>) -> AllocateFn {
-        let allocator = Arc::new(crate::pinned_pool::PinnedAllocator::new_global(
-            32 * 1024 * 1024,
-            1,
-            false,
-            false,
-            None,
-        ));
-        Arc::new(move |size, _numa| {
-            calls.fetch_add(1, Ordering::Relaxed);
-            allocator.allocate(NonZeroU64::new(size)?, NumaNode::UNKNOWN)
-        })
+    fn slot(numa: u32, k_size: u64, v_size: u64) -> TransferSlotInfo {
+        TransferSlotInfo {
+            k_ptr: if k_size > 0 { 0x1000 } else { 0 },
+            k_size,
+            v_ptr: if v_size > 0 { 0x2000 } else { 0 },
+            v_size,
+            numa_node: numa,
+        }
     }
 
-    fn remaining(bytes: u64) -> HashMap<NumaNode, u64> {
-        HashMap::from([(NumaNode(0), bytes)])
+    fn group(numa: u32, bytes: u64, slots: &[usize]) -> SlotGroup {
+        SlotGroup {
+            numa: NumaNode(numa),
+            bytes,
+            slots: slots.to_vec(),
+        }
     }
 
     fn segment(node: &str, block_count: u32) -> FetchSegment {
@@ -1085,67 +1008,47 @@ mod tests {
     }
 
     #[test]
-    fn chunked_slabs_bump_within_chunk_then_refill() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let allocate_fn = test_allocate_fn(Arc::clone(&calls));
-        let mut slabs = ChunkedSlabs::new(&allocate_fn, 1024, remaining(1536));
-
-        let (p1, a1) = slabs.alloc_segment(NumaNode(0), 512, "K").expect("first");
-        let (p2, _a2) = slabs.alloc_segment(NumaNode(0), 512, "V").expect("second");
-        assert_eq!(p2.as_ptr() as usize - p1.as_ptr() as usize, 512);
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
-
-        // Third segment exceeds the current chunk: a fresh chunk is allocated
-        // while earlier segments stay valid through their own chunk Arc.
-        let (_p3, a3) = slabs.alloc_segment(NumaNode(0), 512, "K").expect("third");
-        assert_eq!(calls.load(Ordering::Relaxed), 2);
-        assert_eq!(slabs.chunk_count, 2);
-        assert!(!Arc::ptr_eq(&a1, &a3));
+    fn plans_block_staging_allocations() {
+        let page = PER_SLOT_ALLOC_MIN_BYTES;
+        for (name, slots, expected) in [
+            (
+                "page-first pages get one allocation each",
+                vec![slot(0, page, 0), slot(1, page, 0), slot(0, page, 0)],
+                vec![
+                    group(0, page, &[0]),
+                    group(1, page, &[1]),
+                    group(0, page, &[2]),
+                ],
+            ),
+            (
+                "small split-K/V slots coalesce per NUMA",
+                vec![slot(0, 512, 512), slot(1, 256, 0), slot(0, 512, 512)],
+                vec![group(0, 2048, &[0, 2]), group(1, 256, &[1])],
+            ),
+            (
+                "mixed sizes keep pages separate from the coalesced group",
+                vec![slot(0, 1024, 0), slot(0, page, 0), slot(0, 1024, 0)],
+                vec![group(0, 2048, &[0, 2]), group(0, page, &[1])],
+            ),
+            (
+                "empty slots are skipped",
+                vec![slot(0, 0, 0), slot(0, 512, 0)],
+                vec![group(0, 512, &[1])],
+            ),
+        ] {
+            assert_eq!(
+                plan_block_allocations(&slots).expect(name),
+                expected,
+                "{name}"
+            );
+        }
     }
 
     #[test]
-    fn chunked_slabs_oversized_segment_gets_dedicated_chunk() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let allocate_fn = test_allocate_fn(Arc::clone(&calls));
-        let mut slabs = ChunkedSlabs::new(&allocate_fn, 1024, remaining(4096));
-
-        slabs
-            .alloc_segment(NumaNode(0), 4096, "K")
-            .expect("oversized segment");
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
-        assert_eq!(slabs.chunk_count, 1);
-    }
-
-    #[test]
-    fn chunked_slabs_allocation_failure_is_an_error() {
-        let allocate_fn: AllocateFn = Arc::new(|_, _| None);
-        let mut slabs = ChunkedSlabs::new(&allocate_fn, 1024, remaining(512));
-
-        let err = match slabs.alloc_segment(NumaNode(0), 512, "K") {
-            Ok(_) => panic!("allocation should fail"),
-            Err(err) => err,
-        };
-        assert!(err.contains("failed to allocate fetch chunk"));
-    }
-
-    #[test]
-    fn chunked_slabs_chunk_clamped_to_batch_remaining() {
-        // A small fetch must not request the whole chunk_bytes cap — that
-        // fails outright on pools smaller than the cap (jz p2p IT regression).
-        let sizes = Arc::new(Mutex::new(Vec::new()));
-        let recorded = Arc::clone(&sizes);
-        let inner = test_allocate_fn(Arc::new(AtomicUsize::new(0)));
-        let allocate_fn: AllocateFn = Arc::new(move |size, numa| {
-            recorded.lock().unwrap().push(size);
-            inner(size, numa)
-        });
-        let mut slabs = ChunkedSlabs::new(&allocate_fn, 256 << 20, remaining(4096));
-
-        slabs.alloc_segment(NumaNode(0), 1024, "K").expect("first");
-        slabs.alloc_segment(NumaNode(0), 3072, "V").expect("second");
-
-        // One chunk sized to the batch total, not to the 256 MiB cap.
-        assert_eq!(*sizes.lock().unwrap(), vec![4096]);
-        assert_eq!(slabs.chunk_count, 1);
+    fn split_slot_counts_both_segments_but_skips_null_v() {
+        let mut no_v_ptr = slot(0, 512, 512);
+        no_v_ptr.v_ptr = 0;
+        let plan = plan_block_allocations(&[slot(0, 512, 512), no_v_ptr]).unwrap();
+        assert_eq!(plan, vec![group(0, 1536, &[0, 1])]);
     }
 }

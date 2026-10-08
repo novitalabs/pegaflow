@@ -30,6 +30,21 @@ use write_path::{InsertDeps, WritePipeline};
 // Each reclaim iteration emits one MetaServer removal command; a small batch
 // turns an eviction burst into a command flood that overflows the removal queue.
 const RECLAIM_BATCH_SIZE: usize = 512;
+
+// Reclaim for one allocation may evict at most
+// max(requested * RECLAIM_AMPLIFICATION, RECLAIM_MIN_BUDGET_BYTES) bytes.
+// LRU order is unrelated to address order, so on a fragmented pool an
+// unbounded reclaim keeps evicting until a large enough hole happens to open,
+// which can flush most of the cache for a single request. Past the budget the
+// allocation fails instead; callers already treat that as a cache miss.
+const RECLAIM_AMPLIFICATION: u64 = 32;
+const RECLAIM_MIN_BUDGET_BYTES: u64 = 1 << 30;
+
+fn reclaim_budget_bytes(requested_bytes: u64) -> u64 {
+    requested_bytes
+        .saturating_mul(RECLAIM_AMPLIFICATION)
+        .max(RECLAIM_MIN_BUDGET_BYTES)
+}
 pub const DEFAULT_RDMA_QPS_PER_PEER: usize = 2;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -298,14 +313,21 @@ impl StorageEngine {
     ) -> Option<Arc<PinnedAllocation>> {
         let requested_bytes = size.get();
         let node = numa_node.unwrap_or(NumaNode::UNKNOWN);
+        let budget = reclaim_budget_bytes(requested_bytes);
+        let mut evicted_bytes = 0u64;
 
         loop {
             if let Some(alloc) = self.allocator.allocate(size, node) {
                 return Some(alloc);
             }
 
-            let (freed_blocks, _freed_bytes, largest_free) =
-                self.reclaim_until_allocator_can_allocate(requested_bytes, node);
+            let (freed_blocks, freed_bytes, largest_free) = self
+                .reclaim_until_allocator_can_allocate(
+                    requested_bytes,
+                    node,
+                    budget.saturating_sub(evicted_bytes),
+                );
+            evicted_bytes = evicted_bytes.saturating_add(freed_bytes);
 
             if freed_blocks == 0 && largest_free < requested_bytes {
                 // Final retry: absorb concurrent frees that may have raced with reclaim probing.
@@ -319,11 +341,13 @@ impl StorageEngine {
         let (used, total) = self.allocator.usage();
         log::error!(
             "Pinned memory pool exhausted; cannot satisfy allocation: \
-             requested={} used={} total={} numa={:?}",
+             requested={} used={} total={} numa={:?} reclaimed={} reclaim_budget={}",
             ByteSize(requested_bytes),
             ByteSize(used),
             ByteSize(total),
-            numa_node
+            numa_node,
+            ByteSize(evicted_bytes),
+            ByteSize(budget)
         );
         core_metrics().pool_alloc_failures.add(1, &[]);
         None
@@ -479,10 +503,13 @@ impl StorageEngine {
             .await
     }
 
+    /// Evict LRU blocks until a `required_bytes` hole exists on `target_node`
+    /// or `budget_bytes` of block footprint has been evicted.
     fn reclaim_until_allocator_can_allocate(
         &self,
         required_bytes: u64,
         target_node: NumaNode,
+        budget_bytes: u64,
     ) -> (usize, u64, u64) {
         if required_bytes == 0 {
             return (
@@ -496,7 +523,7 @@ impl StorageEngine {
         let mut freed_bytes = 0u64;
         let mut largest_free = self.allocator.largest_free_allocation_for_node(target_node);
 
-        while largest_free < required_bytes {
+        while largest_free < required_bytes && freed_bytes < budget_bytes {
             let used_before = self.allocator.usage().0;
 
             let evicted = self.read_cache.remove_lru_batch(RECLAIM_BATCH_SIZE);
@@ -537,14 +564,26 @@ impl StorageEngine {
         }
 
         if freed_blocks > 0 {
-            debug!(
-                "Reclaimed cache blocks toward allocator request: \
-                 freed_blocks={} freed_bytes={} largest_free={} required={}",
-                freed_blocks,
-                ByteSize(freed_bytes),
-                ByteSize(largest_free),
-                ByteSize(required_bytes)
-            );
+            if largest_free < required_bytes && freed_bytes >= budget_bytes {
+                warn!(
+                    "Reclaim budget exhausted before a large enough hole opened: \
+                     freed_blocks={} freed_bytes={} largest_free={} required={} numa={:?}",
+                    freed_blocks,
+                    ByteSize(freed_bytes),
+                    ByteSize(largest_free),
+                    ByteSize(required_bytes),
+                    target_node
+                );
+            } else {
+                debug!(
+                    "Reclaimed cache blocks toward allocator request: \
+                     freed_blocks={} freed_bytes={} largest_free={} required={}",
+                    freed_blocks,
+                    ByteSize(freed_bytes),
+                    ByteSize(largest_free),
+                    ByteSize(required_bytes)
+                );
+            }
             core_metrics()
                 .cache_block_evictions
                 .add(freed_blocks as u64, &[]);
@@ -693,6 +732,76 @@ mod tests {
         // Try to allocate more than the entire pool
         let result = storage.allocate(NonZeroU64::new(1 << 30).unwrap(), None);
         assert!(result.is_none(), "should fail, not loop forever");
+    }
+
+    /// Fill a pool with 4 KiB blocks whose LRU order strides across addresses,
+    /// so a contiguous 16-block hole only opens after ~15/16 of the cache is
+    /// evicted. Returns the engine and the number of resident blocks.
+    fn fragmented_engine() -> (Arc<StorageEngine>, usize) {
+        use crate::block::{RawBlock, Segment};
+        const BLOCK: u64 = 4096;
+        const STRIDE: usize = 16;
+
+        let storage =
+            StorageEngine::new_with_config(8 << 20, false, StorageConfig::default(), &[]).unwrap();
+        let mut allocs = Vec::new();
+        while let Some(alloc) = storage
+            .allocator
+            .allocate(NonZeroU64::new(BLOCK).unwrap(), NumaNode::UNKNOWN)
+        {
+            allocs.push(alloc);
+        }
+        allocs.sort_by_key(|a| a.as_non_null().as_ptr() as usize);
+        let rows = allocs.len() / STRIDE;
+        let mut ordered: Vec<Option<Arc<PinnedAllocation>>> =
+            allocs.into_iter().map(Some).collect();
+
+        // Insert residue 0 of every row first, then residue 1, ... so LRU
+        // eviction frees scattered single blocks long before any full row.
+        let mut count = 0usize;
+        for residue in 0..STRIDE {
+            for row in 0..rows {
+                let alloc = ordered[row * STRIDE + residue].take().unwrap();
+                let ptr = alloc.as_non_null();
+                let raw = RawBlock::new(vec![Segment::new(ptr, BLOCK as usize, alloc)]);
+                let block = Arc::new(SealedBlock::from_slots(vec![(raw, NumaNode::UNKNOWN)]));
+                storage.test_insert_cache(
+                    BlockKey::new("ns".into(), (count as u32).to_le_bytes().to_vec()),
+                    block,
+                );
+                count += 1;
+            }
+        }
+        // Leftover tail allocations (fewer than STRIDE blocks) are freed here;
+        // that hole is too small for the test request.
+        drop(ordered);
+        (storage, count)
+    }
+
+    #[tokio::test]
+    async fn reclaim_stops_at_budget_on_fragmented_pool() {
+        let required = 16 * 4096;
+
+        // Unbounded reclaim flushes most of the cache to open one 64 KiB hole.
+        let (storage, resident) = fragmented_engine();
+        let (freed, _, largest) =
+            storage.reclaim_until_allocator_can_allocate(required, NumaNode::UNKNOWN, u64::MAX);
+        assert!(largest >= required);
+        assert!(
+            freed * 8 > resident * 7,
+            "expected unbounded reclaim to evict most blocks: freed={freed} resident={resident}"
+        );
+
+        // A budget caps eviction at one batch past the budget, leaving the
+        // rest of the cache resident even though no hole opened.
+        let (storage, resident) = fragmented_engine();
+        let budget = 4096 * 100;
+        let (freed, freed_bytes, largest) =
+            storage.reclaim_until_allocator_can_allocate(required, NumaNode::UNKNOWN, budget);
+        assert!(largest < required);
+        assert_eq!(freed, RECLAIM_BATCH_SIZE);
+        assert!(freed_bytes >= budget);
+        assert!(resident - freed > resident / 2);
     }
 
     #[tokio::test]
