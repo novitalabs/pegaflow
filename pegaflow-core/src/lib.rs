@@ -47,7 +47,10 @@ pub use pegaflow_common::NumaNode;
 use pegaflow_common::{NumaTopology, group_hash};
 pub use pinned_pool::PinnedAllocation;
 pub use seal_offload::SlotMeta;
-pub use storage::{DEFAULT_RDMA_QPS_PER_PEER, MemoryCacheCleanupStats, StorageConfig};
+pub use storage::{
+    DEFAULT_RDMA_QPS_PER_PEER, MemoryCacheCleanupStats, SpillAdoption, SpillSourceConfig,
+    SpillTargetConfig, SpillTargetSelection, StorageConfig,
+};
 pub use sync_state::{LoadState, LoadStateError};
 pub use trace::{set_trace_sample_rate, should_sample};
 pub use transfer::TransferMode;
@@ -1004,6 +1007,21 @@ impl PegaEngine {
     #[cfg(not(feature = "rdma"))]
     pub fn has_rdma_transport(&self) -> bool {
         false
+    }
+
+    /// Spill tier, target side: take custody of `block_hashes` offered by the
+    /// spill source at `source_addr`, pulling the blocks not resident here
+    /// over RDMA.
+    pub async fn adopt_spill(
+        &self,
+        source_addr: &str,
+        namespace: &str,
+        block_hashes: &[Vec<u8>],
+        total_bytes: u64,
+    ) -> SpillAdoption {
+        self.storage
+            .adopt_spill(source_addr, namespace, block_hashes, total_bytes)
+            .await
     }
 
     /// Perform server-side RDMA handshake with connection reuse.

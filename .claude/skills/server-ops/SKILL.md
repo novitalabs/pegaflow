@@ -49,6 +49,12 @@ uv run python examples/bench_kv_cache.py --model /path/to/model --num-prompts 10
 | `--max-prefetch-blocks` | `800` | Backpressure for SSD prefetch |
 | `--trace-sample-rate` | `1.0` | Sampling rate 0.0–1.0 (requires `--features tracing`) |
 | `--metaserver-addr` | — | MetaServer gRPC address for cross-node discovery (requires `--addr` to be routable) |
+| `--spill-targets` | — | Spill tier source: hand cold blocks to these PegaFlow nodes before eviction, or `auto` for MetaServer-assigned targets (requires `--nics` + `--metaserver-addr`) |
+| `--spill-reserve` | `5%` | Pool bytes the spill source keeps free or reclaimable (size or `%` of pool) |
+| `--spill-batch-size` | `128mb` | Max block bytes per spill offer |
+| `--spill-accept` | `false` | Spill tier target: accept spill offers (requires `--nics` + `--metaserver-addr`) |
+| `--spill-max-bandwidth` | unlimited | Optional spill target pull budget per second |
+| `--spill-max-inflight` | `512mb` | Max bytes a spill target pulls at once |
 
 ## Key Files
 

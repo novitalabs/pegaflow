@@ -107,8 +107,17 @@ impl MetaServer for GrpcMetaService {
             self.store
                 .heartbeat_node(&req.node, node_id)
                 .map_err(Self::store_error_status)?;
+            self.store
+                .set_spill_capacity(&req.node, req.spill_target_capacity_bytes);
+            let spill_targets = if req.wants_spill_targets {
+                self.store.assign_spill_targets(&req.node)
+            } else {
+                self.store.release_spill_assignment(&req.node);
+                Vec::new()
+            };
             Ok(Response::new(HeartbeatNodeResponse {
                 stale_after_secs: self.store.config().node_stale_after.as_secs(),
+                spill_targets,
             }))
         }
         .await;
@@ -338,6 +347,7 @@ mod tests {
         svc.heartbeat_node(Request::new(HeartbeatNodeRequest {
             node: node.into(),
             node_id: node_id.clone(),
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -486,6 +496,7 @@ mod tests {
             .heartbeat_node(Request::new(HeartbeatNodeRequest {
                 node: "node-a".into(),
                 node_id,
+                ..Default::default()
             }))
             .await
             .unwrap()
@@ -505,6 +516,7 @@ mod tests {
             .heartbeat_node(Request::new(HeartbeatNodeRequest {
                 node: "node-a".into(),
                 node_id: new_id,
+                ..Default::default()
             }))
             .await
             .unwrap_err();

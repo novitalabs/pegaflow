@@ -1,8 +1,13 @@
-//! P2P RDMA remote fetch integration test.
+//! P2P RDMA remote fetch integration tests.
 //!
-//! Verifies the end-to-end flow:
-//! Engine A saves blocks → MetaServer discovers them → Engine B fetches via RDMA READ
-//! → data integrity verified.
+//! Verifies the end-to-end flows:
+//! - Engine A saves blocks → MetaServer discovers them → Engine B fetches via RDMA READ
+//!   → data integrity verified.
+//! - Spill tier: the MetaServer assigns the spill target → the spill source offers its
+//!   blocks → the target pulls them via RDMA READ and advertises them → the source drops
+//!   its copies and recalls them from the target → data integrity verified.
+//! - Spill tier cancellation: an offer abandoned mid-pull leaves the pair usable — a
+//!   fresh offer is fully adopted and the source recalls every block intact.
 //!
 //! Run with: `cargo test -p pegaflow-server --test p2p_rdma -- --ignored`
 
@@ -16,7 +21,9 @@ use cudarc::driver::sys;
 use pegaflow_core::sync_state::{LOAD_STATE_ERROR, LOAD_STATE_SUCCESS};
 use pegaflow_core::*;
 use pegaflow_metaserver::{BlockHashStore, GrpcMetaService};
-use pegaflow_proto::proto::engine::meta_server_server::MetaServerServer;
+use pegaflow_proto::proto::engine::{
+    SpillOfferRequest, engine_client::EngineClient, meta_server_server::MetaServerServer,
+};
 use pegaflow_server::proto::engine::engine_server::EngineServer;
 use pegaflow_server::{CudaTensorRegistry, GrpcEngineService, RegistryHandle};
 use tokio::sync::Notify;
@@ -299,6 +306,38 @@ async fn wait_for_prefetch_done(
     }
 }
 
+/// Load `block_ids` of `lease` into the instance's registered layer and wait.
+async fn load_and_wait(
+    engine: &PegaEngine,
+    instance_id: &str,
+    lease: QueryLeaseId,
+    block_ids: &[usize],
+) {
+    let load_state = LoadState::new().expect("create LoadState");
+    let shm_name = load_state.shm_name().to_string();
+    engine
+        .batch_load_kv_blocks_multi_layer(
+            instance_id,
+            0,
+            DEVICE_ID,
+            &shm_name,
+            &[vec![LAYER]],
+            &[(lease, vec![block_ids.iter().copied().map(Some).collect()])],
+        )
+        .expect("batch_load");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let state = load_state.get();
+        if state == LOAD_STATE_SUCCESS {
+            return;
+        }
+        assert!(state != LOAD_STATE_ERROR, "load reported ERROR");
+        assert!(Instant::now() < deadline, "timed out waiting for load");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn ib_device() -> String {
@@ -534,5 +573,318 @@ async fn p2p_rdma_remote_fetch_roundtrip() {
     assert_eq!(
         loaded, host_data,
         "GPU data mismatch: remote-fetched blocks differ from original"
+    );
+}
+
+#[tokio::test]
+#[ignore] // Requires RDMA hardware (PEGAFLOW_IB_DEVICE env var, default: mlx5_1), CUDA GPU, and Python+torch
+async fn spill_tier_spills_before_pressure_eviction_and_recalls() {
+    // Save twice the source pool in batches. With a reserve of half the pool,
+    // the source must hand each block to the target before pressure evicts it.
+    const BLOCK: usize = 1 << 20;
+    const BLOCKS: usize = 32;
+    const BATCH: usize = 4;
+    const POOL: usize = 16 << 20;
+    const RECALLED: usize = 8;
+
+    pegaflow_common::logging::init_stdout_colored("info");
+    let _cuda_ctx = CudaContext::new(0).expect("CUDA init");
+
+    let meta_port = get_free_port();
+    let source_port = get_free_port();
+    let target_port = get_free_port();
+    let target_addr = format!("127.0.0.1:{target_port}");
+    let meta_store = spawn_metaserver(meta_port).await;
+
+    // ── 1. Spill target: accepts offers and pulls the blocks over RDMA ──
+    let target = Arc::new(
+        PegaEngine::new_with_config(
+            64 << 20,
+            false,
+            StorageConfig {
+                metaserver_addr: Some(format!("http://127.0.0.1:{meta_port}")),
+                advertise_addr: Some(target_addr.clone()),
+                rdma_nic_names: Some(vec![ib_device()]),
+                spill_target: Some(SpillTargetConfig {
+                    max_bandwidth_bytes_per_sec: Some(1 << 30),
+                    max_inflight_bytes: 64 << 20,
+                }),
+                ..StorageConfig::default()
+            },
+        )
+        .expect("spill target should start"),
+    );
+    spawn_engine_server(Arc::clone(&target), target_port).await;
+    // The source asks the MetaServer for targets; let the target announce itself first.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while meta_store.node_counts().0 < 1 {
+        assert!(Instant::now() < deadline, "spill target never heartbeated");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // ── 2. Spill source: a pool half the size of what it will save ──
+    let source = Arc::new(
+        PegaEngine::new_with_config(
+            POOL,
+            false,
+            StorageConfig {
+                metaserver_addr: Some(format!("http://127.0.0.1:{meta_port}")),
+                advertise_addr: Some(format!("127.0.0.1:{source_port}")),
+                rdma_nic_names: Some(vec![ib_device()]),
+                enable_numa_affinity: false,
+                spill_source: Some(SpillSourceConfig {
+                    targets: SpillTargetSelection::MetaServer,
+                    reserve_bytes: (POOL / 2) as u64,
+                    batch_bytes: (BATCH * BLOCK) as u64,
+                }),
+                ..StorageConfig::default()
+            },
+        )
+        .expect("spill source should start"),
+    );
+    spawn_engine_server(Arc::clone(&source), source_port).await;
+
+    let gpu = GpuBuffer::alloc(BLOCKS * BLOCK);
+    let mut host_data = vec![0u8; BLOCKS * BLOCK];
+    fill_test_pattern(&mut host_data, BLOCK);
+    gpu.copy_from_host(&host_data);
+    source
+        .register_context_layer_batch(
+            "inst-src",
+            NAMESPACE,
+            DEVICE_ID,
+            0, // tp_rank
+            0, // pp_rank
+            1, // tp_size
+            1, // world_size
+            &[LAYER.to_string()],
+            &[gpu.as_u64()],
+            &[BLOCKS * BLOCK],
+            &[BLOCKS],
+            &[BLOCK],
+            &[0], // kv_strides
+            &[1], // segments
+            TransferMode::Direct,
+            false,
+        )
+        .expect("register layer on spill source");
+
+    // ── 3. Save in batches, giving the spill source time to keep its reserve ──
+    let block_ids = make_block_ids(BLOCKS);
+    let block_hashes = make_block_hashes(BLOCKS, 77);
+    for batch in 0..BLOCKS / BATCH {
+        let range = batch * BATCH..(batch + 1) * BATCH;
+        source
+            .batch_save_kv_blocks_from_ipc(
+                "inst-src",
+                0,
+                0,
+                DEVICE_ID,
+                vec![LayerSave {
+                    layer_name: LAYER.to_string(),
+                    block_ids: block_ids[range.clone()].to_vec(),
+                    block_hashes: block_hashes[range.clone()].to_vec(),
+                }],
+            )
+            .await
+            .expect("save batch on spill source");
+        wait_for_cache(
+            &source,
+            "inst-src",
+            &block_hashes[range],
+            BATCH,
+            Duration::from_secs(5),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    // ── 4. Every block pressure evicted from the source is held by the target ──
+    let evicted = BLOCKS - POOL / BLOCK;
+    wait_for_metaserver_ownership(
+        &meta_store,
+        NAMESPACE,
+        &block_hashes[..evicted],
+        &target_addr,
+        evicted,
+        Duration::from_secs(10),
+    )
+    .await;
+
+    // ── 5. The oldest blocks are gone from the source; recall them from the target ──
+    gpu.zero();
+    let lease = wait_for_prefetch_done(
+        &source,
+        "inst-src",
+        "req-recall-from-spill-target",
+        &block_hashes[..RECALLED],
+        RECALLED,
+        Duration::from_secs(30),
+        true,
+    )
+    .await;
+    load_and_wait(&source, "inst-src", lease, &block_ids[..RECALLED]).await;
+
+    let loaded = gpu.copy_to_host();
+    assert!(
+        loaded[..RECALLED * BLOCK] == host_data[..RECALLED * BLOCK],
+        "GPU data mismatch: blocks recalled from the spill target differ from the original"
+    );
+}
+
+#[tokio::test]
+#[ignore] // Requires RDMA hardware (PEGAFLOW_IB_DEVICE env var, default: mlx5_1), CUDA GPU, and Python+torch
+async fn spill_offer_cancelled_mid_pull_leaves_peers_usable() {
+    // A source that gives up on an offer cancels the target's handler. The
+    // target's pull must still finish or fail cleanly: a pull dropped midway
+    // can strand the RDMA handshake, so every later transfer between the pair
+    // fails, or free staging memory that in-flight READs still write into.
+    const BLOCK: usize = 1 << 20;
+    const BLOCKS: usize = 16;
+
+    pegaflow_common::logging::init_stdout_colored("info");
+    let _cuda_ctx = CudaContext::new(0).expect("CUDA init");
+
+    let meta_port = get_free_port();
+    let source_port = get_free_port();
+    let target_port = get_free_port();
+    let source_addr = format!("127.0.0.1:{source_port}");
+    let target_addr = format!("127.0.0.1:{target_port}");
+    let meta_store = spawn_metaserver(meta_port).await;
+    let p2p_config = |addr: &str| StorageConfig {
+        metaserver_addr: Some(format!("http://127.0.0.1:{meta_port}")),
+        advertise_addr: Some(addr.to_string()),
+        rdma_nic_names: Some(vec![ib_device()]),
+        ..StorageConfig::default()
+    };
+
+    let target = Arc::new(
+        PegaEngine::new_with_config(
+            64 << 20,
+            false,
+            StorageConfig {
+                spill_target: Some(SpillTargetConfig {
+                    max_bandwidth_bytes_per_sec: None,
+                    max_inflight_bytes: 64 << 20,
+                }),
+                ..p2p_config(&target_addr)
+            },
+        )
+        .expect("spill target should start"),
+    );
+    spawn_engine_server(Arc::clone(&target), target_port).await;
+    // No spill source config: the test sends the offers itself.
+    let source = Arc::new(
+        PegaEngine::new_with_config(64 << 20, false, p2p_config(&source_addr))
+            .expect("source should start"),
+    );
+    spawn_engine_server(Arc::clone(&source), source_port).await;
+
+    let gpu = GpuBuffer::alloc(BLOCKS * BLOCK);
+    let mut host_data = vec![0u8; BLOCKS * BLOCK];
+    fill_test_pattern(&mut host_data, BLOCK);
+    gpu.copy_from_host(&host_data);
+    source
+        .register_context_layer_batch(
+            "inst-src",
+            NAMESPACE,
+            DEVICE_ID,
+            0, // tp_rank
+            0, // pp_rank
+            1, // tp_size
+            1, // world_size
+            &[LAYER.to_string()],
+            &[gpu.as_u64()],
+            &[BLOCKS * BLOCK],
+            &[BLOCKS],
+            &[BLOCK],
+            &[0], // kv_strides
+            &[1], // segments
+            TransferMode::Direct,
+            false,
+        )
+        .expect("register layer on source");
+    let block_ids = make_block_ids(BLOCKS);
+    let block_hashes = make_block_hashes(BLOCKS, 91);
+    source
+        .batch_save_kv_blocks_from_ipc(
+            "inst-src",
+            0,
+            0,
+            DEVICE_ID,
+            vec![LayerSave {
+                layer_name: LAYER.to_string(),
+                block_ids: block_ids.clone(),
+                block_hashes: block_hashes.clone(),
+            }],
+        )
+        .await
+        .expect("save blocks on source");
+    wait_for_cache(
+        &source,
+        "inst-src",
+        &block_hashes,
+        BLOCKS,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // ── 1. Give up on an offer while the target is still handshaking or pulling ──
+    let mut client = EngineClient::connect(format!("http://{target_addr}"))
+        .await
+        .expect("connect to spill target");
+    let offer = SpillOfferRequest {
+        source_addr: source_addr.clone(),
+        namespace: NAMESPACE.into(),
+        block_hashes: block_hashes.clone(),
+        total_bytes: (BLOCKS * BLOCK) as u64,
+    };
+    // Which phase the deadline cuts depends on timing; what follows must hold
+    // in every case.
+    drop(tokio::time::timeout(Duration::from_millis(2), client.spill_offer(offer.clone())).await);
+
+    // ── 2. A fresh offer still works: the target ends up holding every block ──
+    let response = client
+        .spill_offer(offer)
+        .await
+        .expect("second spill offer")
+        .into_inner();
+    assert!(response.accepted, "offer rejected: {:?}", response.status);
+    let mut held: Vec<Vec<u8>> = response
+        .adopted_hashes
+        .into_iter()
+        .chain(response.already_held_hashes)
+        .collect();
+    held.sort();
+    let mut expected = block_hashes.clone();
+    expected.sort();
+    assert_eq!(held, expected, "target must hold every offered block");
+    wait_for_metaserver_ownership(
+        &meta_store,
+        NAMESPACE,
+        &block_hashes,
+        &target_addr,
+        BLOCKS,
+        Duration::from_secs(10),
+    )
+    .await;
+
+    // ── 3. The reverse direction still works: recall every block from the target ──
+    assert_eq!(source.cleanup_memory_cache().evicted_blocks, BLOCKS);
+    gpu.zero();
+    let lease = wait_for_prefetch_done(
+        &source,
+        "inst-src",
+        "req-recall-after-cancel",
+        &block_hashes,
+        BLOCKS,
+        Duration::from_secs(30),
+        true,
+    )
+    .await;
+    load_and_wait(&source, "inst-src", lease, &block_ids).await;
+    assert!(
+        gpu.copy_to_host() == host_data,
+        "GPU data mismatch: blocks recalled after a cancelled spill differ from the original"
     );
 }

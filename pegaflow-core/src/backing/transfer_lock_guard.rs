@@ -85,7 +85,8 @@ mod tests {
         QueryBlocksForTransferResponse, QueryRequest, QueryResponse, RdmaHandshakeRequest,
         RdmaHandshakeResponse, RegisterContextRequest, RegisterContextResponse, ReleaseRequest,
         ReleaseResponse, ReleaseTransferLockResponse, SaveRequest, SaveResponse, SessionEvent,
-        SessionRequest, ShutdownRequest, ShutdownResponse, UnregisterRequest, UnregisterResponse,
+        SessionRequest, ShutdownRequest, ShutdownResponse, SpillOfferRequest, SpillOfferResponse,
+        UnregisterRequest, UnregisterResponse,
     };
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::Endpoint;
@@ -117,6 +118,12 @@ mod tests {
             &self,
             _request: Request<RdmaHandshakeRequest>,
         ) -> Result<Response<RdmaHandshakeResponse>, Status> {
+            Err(Status::unimplemented("stub"))
+        }
+        async fn spill_offer(
+            &self,
+            _request: Request<SpillOfferRequest>,
+        ) -> Result<Response<SpillOfferResponse>, Status> {
             Err(Status::unimplemented("stub"))
         }
         async fn health(

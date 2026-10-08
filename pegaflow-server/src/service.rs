@@ -8,8 +8,9 @@ use crate::proto::engine::{
     RdmaHandshakeRequest, RdmaHandshakeResponse, RegisterContextRequest, RegisterContextResponse,
     ReleaseRequest, ReleaseResponse, ReleaseTransferLockRequest, ReleaseTransferLockResponse,
     ResponseStatus, SaveRequest, SaveResponse, SessionEvent, SessionRequest, ShutdownRequest,
-    ShutdownResponse, TransferBlockInfo, TransferMode as ProtoTransferMode, TransferSlotInfo,
-    UnregisterRequest, UnregisterResponse, load_block_target, query_response,
+    ShutdownResponse, SpillOfferRequest, SpillOfferResponse, TransferBlockInfo,
+    TransferMode as ProtoTransferMode, TransferSlotInfo, UnregisterRequest, UnregisterResponse,
+    load_block_target, query_response,
 };
 use crate::registry::RegistryHandle;
 use crate::session::SessionRegistry;
@@ -948,6 +949,50 @@ impl Engine for GrpcEngineService {
             ),
         }
         record_rpc_result("rdma_handshake", &result, start);
+        result
+    }
+
+    async fn spill_offer(
+        &self,
+        request: Request<SpillOfferRequest>,
+    ) -> Result<Response<SpillOfferResponse>, Status> {
+        let start = Instant::now();
+        let req = request.into_inner();
+
+        debug!(
+            "RPC [spill_offer]: source={} namespace={} hashes={} bytes={}",
+            req.source_addr,
+            req.namespace,
+            req.block_hashes.len(),
+            req.total_bytes,
+        );
+
+        if req.source_addr.is_empty() {
+            return Err(Status::invalid_argument("source_addr is required"));
+        }
+
+        let adoption = self
+            .engine
+            .adopt_spill(
+                &req.source_addr,
+                &req.namespace,
+                &req.block_hashes,
+                req.total_bytes,
+            )
+            .await;
+        let response = SpillOfferResponse::from(adoption);
+
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        debug!(
+            "RPC [spill_offer] completed: source={} accepted={} adopted={} already_held={} elapsed_ms={:.2}",
+            req.source_addr,
+            response.accepted,
+            response.adopted_hashes.len(),
+            response.already_held_hashes.len(),
+            elapsed_ms
+        );
+        let result = Ok(Response::new(response));
+        record_rpc_result("spill_offer", &result, start);
         result
     }
 

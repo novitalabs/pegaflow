@@ -50,6 +50,15 @@ pegaflow-server
 - `--transfer-lock-timeout-secs`: Transfer lock timeout in seconds (default: `120`). Blocks held for cross-node RDMA transfer are locked for at most this duration before being force-released (crash recovery).
 - `--metaserver-queue-depth`: MetaServer registration queue depth, max pending registration batches
 
+### Spill Tier (see [P2P](p2p.md#spill-tier))
+
+- `--spill-targets`: Spill target addresses (e.g., `--spill-targets 10.0.0.11:50055`), or `auto` to let the MetaServer assign targets among `--spill-accept` nodes by capacity. When set, this node hands its coldest blocks to the first reachable target before evicting them; later entries are failover. Requires `--nics` and `--metaserver-addr`.
+- `--spill-reserve`: Pool bytes the spill source keeps free or reclaimable, as a size (`8gb`) or a percentage of `--pool-size` (default: `5%`). With NUMA-aware pools, each node's pool keeps its capacity share.
+- `--spill-batch-size`: Upper bound on block bytes per spill offer (default: `128mb`).
+- `--spill-accept`: Accept spill offers and take custody of other nodes' cold blocks. Requires `--nics` and `--metaserver-addr`.
+- `--spill-max-bandwidth`: Optional spill target pull budget per second (e.g., `5gb`). Unset means no rate limit; spill pulls share the NIC with the P/D KV handoff.
+- `--spill-max-inflight`: Upper bound on bytes a spill target pulls at once (default: `512mb`).
+
 ## MetaServer
 
 For multi-node setups, start a MetaServer to coordinate block hashes across nodes. Each pegaflow-server registers its block hashes with the MetaServer, enabling cross-node KV cache discovery.

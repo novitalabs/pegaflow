@@ -248,6 +248,23 @@ message ReleaseTransferLockResponse {
   uint64 released_blocks = 2;
 }
 
+// Spill tier: a spill source asks a spill target to take custody of its cold
+// blocks. The target pulls them from source_addr with QueryBlocksForTransfer +
+// RDMA READ, keeps them retained, and registers them with the MetaServer.
+message SpillOfferRequest {
+  string source_addr = 1;               // Source advertise address the target pulls from
+  string namespace = 2;
+  repeated bytes block_hashes = 3;
+  uint64 total_bytes = 4;               // Sum of offered block footprints, for target admission
+}
+
+message SpillOfferResponse {
+  ResponseStatus status = 1;
+  bool accepted = 2;                       // False: target pulled nothing (disabled or over budget)
+  repeated bytes adopted_hashes = 3;       // Pulled and now retained on the target
+  repeated bytes already_held_hashes = 4;  // Already resident on the target, now retained there
+}
+
 service Engine {
   rpc RegisterContextBatch(RegisterContextRequest) returns (RegisterContextResponse);
   rpc Save(SaveRequest) returns (SaveResponse);
@@ -262,6 +279,8 @@ service Engine {
   rpc ReleaseTransferLock(ReleaseTransferLockRequest) returns (ReleaseTransferLockResponse);
   // RDMA handshake: establish a new peer-to-peer RDMA connection
   rpc RdmaHandshake(RdmaHandshakeRequest) returns (RdmaHandshakeResponse);
+  // Spill tier: take custody of a peer's cold blocks (spill target side)
+  rpc SpillOffer(SpillOfferRequest) returns (SpillOfferResponse);
   rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
   rpc Health(HealthRequest) returns (HealthResponse);
   // Liveness channel: server drops the instance's CUDA IPC mappings when
@@ -322,10 +341,16 @@ message QueryPrefixBlocksResponse {
 message HeartbeatNodeRequest {
   string node = 1;
   string node_id = 2;
+  // Spill tier: pool bytes this node offers as a spill target (0 = not a target).
+  uint64 spill_target_capacity_bytes = 3;
+  // Spill tier: this node wants the MetaServer to assign its spill targets.
+  bool wants_spill_targets = 4;
 }
 
 message HeartbeatNodeResponse {
   uint64 stale_after_secs = 1;
+  // Spill tier: assigned spill targets, primary first (only when requested).
+  repeated string spill_targets = 2;
 }
 
 message UnregisterNodeRequest {
