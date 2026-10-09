@@ -236,12 +236,14 @@ class TestE2ECorrectness:
         log_dir: Path,
         pegaflow_use_hugepages: bool,
         pegaflow_pool_size: str,
+        pegaflow_server_binary: str | None,
     ):
         """Auto-start pegaflow-server with prometheus metrics."""
         with PegaFlowServer(
             log_file=log_dir / "pegaflow-server.log",
             pool_size=pegaflow_pool_size,
             use_hugepages=pegaflow_use_hugepages,
+            server_binary=pegaflow_server_binary,
         ) as server:
             yield server
 
@@ -254,6 +256,7 @@ class TestE2ECorrectness:
         tensor_parallel_size: int,
         pipeline_parallel_size: int,
         max_model_len: int | None,
+        prefix_match_unit: int | None,
     ) -> dict[str, str]:
         """Phase 1: collect golden outputs from baseline vLLM (no PegaFlow)."""
         print("\n[Phase 1] Baseline vLLM — collecting golden outputs")
@@ -268,6 +271,7 @@ class TestE2ECorrectness:
             tensor_parallel_size=tensor_parallel_size,
             pipeline_parallel_size=pipeline_parallel_size,
             max_model_len=max_model_len,
+            prefix_match_unit=prefix_match_unit,
         ):
             for key, prompt in ALL_PROMPTS.items():
                 result = call_openai_api(
@@ -293,6 +297,7 @@ class TestE2ECorrectness:
         tensor_parallel_size: int,
         pipeline_parallel_size: int,
         max_model_len: int | None,
+        prefix_match_unit: int | None,
     ) -> dict:
         """Phase 2: run execution plan through PegaFlow vLLM."""
         print("[Phase 2] PegaFlow vLLM — executing cache plan")
@@ -311,6 +316,7 @@ class TestE2ECorrectness:
             pipeline_parallel_size=pipeline_parallel_size,
             max_model_len=max_model_len,
             transfer_backend=pegaflow_transfer_backend,
+            prefix_match_unit=prefix_match_unit,
         ):
             for label, prompt, expectation in EXECUTION_PLAN:
                 if expectation not in {"cold", "warm-same-process"}:
@@ -337,6 +343,7 @@ class TestE2ECorrectness:
             max_model_len=max_model_len,
             transfer_backend=pegaflow_transfer_backend,
             server_label="PegaFlow load",
+            prefix_match_unit=prefix_match_unit,
         ):
             for label, prompt, expectation in EXECUTION_PLAN:
                 if expectation in {"cold", "warm-same-process"}:

@@ -82,6 +82,19 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
                 )
 
         cross_layer_blocks = os.environ.get("PEGAFLOW_CROSS_LAYER_BLOCKS", "1") == "1"
+        pd_tail_save = bool(
+            vllm_config.kv_transfer_config.get_from_extra_config("pegaflow.pd_tail_save", False)
+        )
+        pd_tail_load = bool(
+            vllm_config.kv_transfer_config.get_from_extra_config("pegaflow.pd_tail_load", False)
+        )
+        fine_tail = hash_block_size is not None and hash_block_size < block_size * dcp_world_size
+        if fine_tail:
+            tail_scheme: str | None = "vllm"
+        elif pd_tail_save or pd_tail_load:
+            tail_scheme = "derived"
+        else:
+            tail_scheme = None
         base_namespace = derive_namespace(
             vllm_config,
             effective_tp_size,
@@ -89,6 +102,7 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
             pcp_world_size,
             cross_layer_blocks=cross_layer_blocks,
             hash_block_size=hash_block_size,
+            tail_scheme=tail_scheme,
         )
 
         tp_rank: int | None = None
@@ -197,12 +211,6 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
         self._scheduler: SchedulerConnector | None = None
         self._worker: WorkerConnector | None = None
         if role == KVConnectorRole.SCHEDULER:
-            pd_tail_save = bool(
-                vllm_config.kv_transfer_config.get_from_extra_config("pegaflow.pd_tail_save", False)
-            )
-            pd_tail_load = bool(
-                vllm_config.kv_transfer_config.get_from_extra_config("pegaflow.pd_tail_load", False)
-            )
             query_clients = tuple(
                 engine_client if index == shard_index else EngineRpcClient(endpoint)
                 for index, endpoint in enumerate(tp_shards.endpoints)
@@ -350,6 +358,18 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
         if self._scheduler:
             return self._scheduler.request_finished(request, block_ids)
         return (False, None)
+
+    def register_finished_partial_tail(
+        self,
+        request,
+        block_ids: tuple[list[int], ...],
+        partial_tail_offloads: list[tuple[int, int, int]],
+    ) -> bool:
+        if self._scheduler:
+            return self._scheduler.register_finished_partial_tail(
+                request, block_ids, partial_tail_offloads
+            )
+        return False
 
     def take_events(self) -> Iterable:
         return ()

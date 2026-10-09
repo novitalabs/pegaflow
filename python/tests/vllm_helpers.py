@@ -81,6 +81,7 @@ class VLLMServer:
         server_label: str | None = None,
         env_overrides: dict[str, str] | None = None,
         transfer_backend: str | None = None,
+        prefix_match_unit: int | None = None,
     ):
         self.model = model
         self.port = port
@@ -98,6 +99,7 @@ class VLLMServer:
         self.kv_transfer_config = kv_transfer_config
         self.server_label = server_label
         self.env_overrides = env_overrides or {}
+        self.prefix_match_unit = prefix_match_unit
         self.health_endpoints = ["/health", "/v1/models"]
         self.process: subprocess.Popen | None = None
         self.log_handle = None
@@ -143,12 +145,6 @@ class VLLMServer:
             ),
             "--gpu-memory-utilization",
             str(self.gpu_memory_utilization),
-            "--attention-backend",
-            # FLASH_ATTN keeps outputs batch-invariant for the baseline/warm
-            # comparison, but it cannot serve MLA models on every GPU
-            # generation (e.g. sm_120 has no FlashMLA); allow overriding with
-            # an MLA-capable backend like TRITON_MLA there.
-            os.environ.get("VLLM_TEST_ATTN_BACKEND", "FLASH_ATTN"),
             "--generation-config",
             "vllm",
             "--tensor-parallel-size",
@@ -157,8 +153,18 @@ class VLLMServer:
             str(self.pipeline_parallel_size),
         ]
 
+        # FLASH_ATTN keeps outputs batch-invariant for the baseline/warm
+        # comparison, but it cannot serve MLA models on every GPU
+        # generation (e.g. sm_120 has no FlashMLA); allow overriding with
+        # an MLA-capable backend like TRITON_MLA, or "auto" to let vLLM pick.
+        attn_backend = os.environ.get("VLLM_TEST_ATTN_BACKEND", "FLASH_ATTN")
+        if attn_backend.lower() != "auto":
+            cmd.extend(["--attention-backend", attn_backend])
+
         if self.max_model_len is not None:
             cmd.extend(["--max-model-len", str(self.max_model_len)])
+        if self.prefix_match_unit is not None:
+            cmd.extend(["--prefix-match-unit", str(self.prefix_match_unit)])
         if _uses_linear_attention(self.model):
             cmd.extend(
                 [

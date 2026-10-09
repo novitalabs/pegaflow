@@ -573,6 +573,16 @@ def pegaflow_pool_size(request) -> str:
     return request.config.getoption("--pegaflow-pool-size")
 
 
+@pytest.fixture(scope="module")
+def prefix_match_unit(request) -> int | None:
+    return request.config.getoption("--prefix-match-unit")
+
+
+@pytest.fixture(scope="module")
+def pegaflow_server_binary(request) -> str | None:
+    return request.config.getoption("--pegaflow-server-binary")
+
+
 # =============================================================================
 # Pytest Configuration
 # =============================================================================
@@ -639,6 +649,19 @@ def pytest_addoption(parser):
         action="store",
         default="30gb",
         help="PegaFlow server pinned memory pool size for E2E tests",
+    )
+    parser.addoption(
+        "--prefix-match-unit",
+        action="store",
+        default=None,
+        type=int,
+        help="Pass --prefix-match-unit to both vLLM servers in E2E tests",
+    )
+    parser.addoption(
+        "--pegaflow-server-binary",
+        action="store",
+        default=None,
+        help="Path to a prebuilt pegaflow-server binary (default: cargo run -r)",
     )
 
 

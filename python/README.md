@@ -154,6 +154,27 @@ Prefill: `{"pegaflow.pd_tail_save": true}`
 
 Decode: `{"pegaflow.pd_tail_load": true, "pegaflow.wait_for_full_prefix": true}`
 
+When vLLM runs with `--prefix-match-unit` smaller than the KV block size, this
+happens automatically without the flags above: vLLM already hashes every
+`prefix_match_unit` tokens with chained hashes, so the connector keys the
+partial tail block by the hash closing the prompt's last full hash unit. No
+`PYTHONHASHSEED` pinning is needed, salted/LoRA/multimodal requests are
+supported, and a hit claims only the unit-aligned part of the tail — the
+trailing sub-unit tokens are always recomputed. The `pegaflow.pd_tail_*`
+flags are ignored in this mode. Note a partial tail hit requires a producer
+that saved a tail ending at the exact same hash-unit boundary (e.g. an
+earlier turn of the same conversation); divergence mid-block still hits only
+up to the last full block.
+
+Hybrid models with recurrent state (mamba/KDA-style linear attention, e.g.
+GLM-5.3) are supported in this mode: vLLM materializes the recurrent state
+at the prompt's last hash boundary and hands it to the connector
+(`boundary_state_offloads`, or `register_finished_partial_tail` when the
+request ends first), which stores it under the same fine hash key as the
+attention tail. A sub-block hit then resumes both. Speculative decoding
+(eagle/MTP) moves vLLM's tail materialization point one hash unit earlier
+than the connector's key, so tail hits degrade to full-block hits there.
+
 `pegaflow.wait_for_full_prefix` makes decode wait (up to 30s) until the full
 prompt prefix is fetchable from a remote node via MetaServer + RDMA. It only
 applies when prefill and decode run separate engines; it does not observe
