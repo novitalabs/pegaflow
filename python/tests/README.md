@@ -83,6 +83,12 @@ Requirements:
 - GPU runtime compatible with the installed wheel variant
 - enough free GPU memory for the model and configured context length
 
+Before either server starts, the correctness gate compares the Cargo server
+version with the native `pegaflow` extension imported by the Python interpreter
+behind the selected `vllm` executable. A mismatch reports both artifact paths
+and the vLLM environment to rebuild. This matters when pytest and vLLM use
+different virtual environments.
+
 ## Stress Gate
 
 ```bash
