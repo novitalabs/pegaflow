@@ -137,6 +137,7 @@ impl Engine for P2pTransferService {
             &req.namespace,
             &req.block_hashes,
             &req.requester_id,
+            req.prefix_only,
         );
 
         let blocks: Vec<TransferBlockInfo> = found_blocks
@@ -176,7 +177,9 @@ impl Engine for P2pTransferService {
         request: Request<ReleaseTransferLockRequest>,
     ) -> Result<Response<ReleaseTransferLockResponse>, Status> {
         let req = request.into_inner();
-        let released = self.engine.release_transfer_lock(&req.transfer_session_id);
+        let released = self
+            .engine
+            .release_transfer_lock(&req.transfer_session_id, req.transferred);
         debug!(
             "P2P release_transfer_lock: session={} released={released}",
             req.transfer_session_id

@@ -956,13 +956,14 @@ impl PegaEngine {
         namespace: &str,
         block_hashes: &[Vec<u8>],
         requester_id: &str,
+        prefix_only: bool,
     ) -> (String, Vec<(BlockKey, Arc<SealedBlock>)>) {
         let keys: Vec<BlockKey> = block_hashes
             .iter()
             .map(|h| BlockKey::new(namespace.to_string(), h.clone()))
             .collect();
 
-        let found = self.storage.get_blocks_for_transfer(&keys);
+        let found = self.storage.get_blocks_for_transfer(&keys, prefix_only);
         let session_id = self.storage.lock_blocks_for_transfer(requester_id, &found);
 
         debug!(
@@ -979,8 +980,9 @@ impl PegaEngine {
     }
 
     /// Release a transfer lock session. Returns the number of blocks released.
-    pub fn release_transfer_lock(&self, session_id: &str) -> usize {
-        self.storage.release_transfer_lock(session_id)
+    /// `transferred` demotes the released source copies to reclaimable.
+    pub fn release_transfer_lock(&self, session_id: &str, transferred: bool) -> usize {
+        self.storage.release_transfer_lock(session_id, transferred)
     }
 
     /// GC expired transfer lock sessions.

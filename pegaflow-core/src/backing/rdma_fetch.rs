@@ -413,7 +413,7 @@ async fn rdma_fetch_task(
         Err(e) => {
             warn!("RDMA transfer from {remote_addr} failed: {e}");
             rdma.engine().invalidate_connection(remote_addr);
-            lock_guard.release();
+            lock_guard.release(false);
             core_metrics()
                 .rdma_fetch_total
                 .add(1, &[KeyValue::new("status", "error")]);
@@ -421,8 +421,9 @@ async fn rdma_fetch_task(
         }
     };
 
-    // 4. Release transfer lock (fire-and-forget: spawns a detached task)
-    lock_guard.release();
+    // 4. Release transfer lock (fire-and-forget: spawns a detached task) and
+    // let the holder demote its now-replicated source copies.
+    lock_guard.release(true);
 
     let elapsed = t0.elapsed();
     let mb = total_bytes as f64 / (1024.0 * 1024.0);
@@ -867,6 +868,8 @@ async fn query_remote_blocks(
         namespace: namespace.to_string(),
         block_hashes: block_hashes.to_vec(),
         requester_id: advertise_addr.to_string(),
+        // Prefix fetch keeps only the contiguous prefix; never lock blocks past a gap.
+        prefix_only: true,
     };
 
     let response = client

@@ -37,11 +37,13 @@ impl TransferLockGuard {
     }
 
     /// Release on a completed fetch (success or handled error). Fire-and-forget.
-    pub(super) fn release(mut self) {
-        self.spawn_release();
+    /// `transferred` tells the holder every block arrived, so it may demote
+    /// its source copies.
+    pub(super) fn release(mut self, transferred: bool) {
+        self.spawn_release(transferred);
     }
 
-    fn spawn_release(&mut self) {
+    fn spawn_release(&mut self, transferred: bool) {
         let session_id = std::mem::take(&mut self.session_id);
         if session_id.is_empty() {
             return;
@@ -50,6 +52,7 @@ impl TransferLockGuard {
         self.handle.spawn(async move {
             let req = ReleaseTransferLockRequest {
                 transfer_session_id: session_id.clone(),
+                transferred,
             };
             if let Err(e) = client.release_transfer_lock(req).await {
                 warn!("ReleaseTransferLock failed for session {session_id}: {e}");
@@ -68,7 +71,7 @@ impl Drop for TransferLockGuard {
             "RDMA fetch aborted without releasing transfer lock; releasing via drop guard: session={} remote={} req_id={}",
             self.session_id, self.remote_addr, self.req_id
         );
-        self.spawn_release();
+        self.spawn_release(false);
     }
 }
 
@@ -76,8 +79,9 @@ impl Drop for TransferLockGuard {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    use parking_lot::Mutex;
 
     use pegaflow_proto::proto::engine::engine_server::{Engine, EngineServer};
     use pegaflow_proto::proto::engine::{
@@ -91,16 +95,16 @@ mod tests {
     use tonic::transport::Endpoint;
     use tonic::{Request, Response, Status};
 
-    /// Stub engine that only counts ReleaseTransferLock calls.
-    struct ReleaseCounter(Arc<AtomicUsize>);
+    /// Stub engine that records the `transferred` flag of each ReleaseTransferLock.
+    struct ReleaseCounter(Arc<Mutex<Vec<bool>>>);
 
     #[tonic::async_trait]
     impl Engine for ReleaseCounter {
         async fn release_transfer_lock(
             &self,
-            _request: Request<ReleaseTransferLockRequest>,
+            request: Request<ReleaseTransferLockRequest>,
         ) -> Result<Response<ReleaseTransferLockResponse>, Status> {
-            self.0.fetch_add(1, Ordering::SeqCst);
+            self.0.lock().push(request.into_inner().transferred);
             Ok(Response::new(ReleaseTransferLockResponse {
                 status: None,
                 released_blocks: 0,
@@ -178,8 +182,8 @@ mod tests {
 
     /// Serve a ReleaseCounter on an ephemeral loopback port; return a
     /// connected client and the shared counter.
-    async fn start_counter_server() -> (EngineClient<Channel>, Arc<AtomicUsize>) {
-        let counter = Arc::new(AtomicUsize::new(0));
+    async fn start_counter_server() -> (EngineClient<Channel>, Arc<Mutex<Vec<bool>>>) {
+        let counter = Arc::new(Mutex::new(Vec::new()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind loopback");
@@ -196,9 +200,9 @@ mod tests {
         (EngineClient::new(channel), counter)
     }
 
-    async fn wait_for_count(counter: &AtomicUsize, expected: usize) {
+    async fn wait_for_count(counter: &Mutex<Vec<bool>>, expected: usize) {
         tokio::time::timeout(Duration::from_secs(5), async {
-            while counter.load(Ordering::SeqCst) < expected {
+            while counter.lock().len() < expected {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -214,13 +218,17 @@ mod tests {
     async fn releases_exactly_once_on_every_exit_path() {
         let (client, counter) = start_counter_server().await;
 
-        // Explicit release on the coded path.
-        guard(&client, "explicit").release();
+        // Completed transfer on the coded path.
+        guard(&client, "transferred").release(true);
         wait_for_count(&counter, 1).await;
+
+        // Handled transfer error on the coded path.
+        guard(&client, "failed").release(false);
+        wait_for_count(&counter, 2).await;
 
         // Drop without release (future cancelled) still releases.
         drop(guard(&client, "dropped"));
-        wait_for_count(&counter, 2).await;
+        wait_for_count(&counter, 3).await;
 
         // Panic unwinding through the guard still releases.
         let g = guard(&client, "panicked");
@@ -229,16 +237,17 @@ mod tests {
             panic!("simulated fetch panic");
         });
         assert!(task.await.is_err());
-        wait_for_count(&counter, 3).await;
+        wait_for_count(&counter, 4).await;
 
-        // No double release: settle window after all three paths.
+        // No double release: settle window after all paths. Only a completed
+        // transfer may demote the holder's source copies.
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(counter.load(Ordering::SeqCst), 3);
+        assert_eq!(*counter.lock(), vec![true, false, false, false]);
 
         // Empty session (holder returned none) never sends an RPC.
-        guard(&client, "").release();
+        guard(&client, "").release(true);
         drop(guard(&client, ""));
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(counter.load(Ordering::SeqCst), 3);
+        assert_eq!(counter.lock().len(), 4);
     }
 }
