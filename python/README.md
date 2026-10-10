@@ -172,8 +172,9 @@ at the prompt's last hash boundary and hands it to the connector
 (`boundary_state_offloads`, or `register_finished_partial_tail` when the
 request ends first), which stores it under the same fine hash key as the
 attention tail. A sub-block hit then resumes both. Speculative decoding
-(eagle/MTP) moves vLLM's tail materialization point one hash unit earlier
-than the connector's key, so tail hits degrade to full-block hits there.
+(eagle/MTP) makes vLLM register the recurrent tail one hash unit earlier
+(the draft consumes the state at the last boundary); the connector keys its
+tail identically, so tail hits keep working, just anchored one unit lower.
 
 `pegaflow.wait_for_full_prefix` makes decode wait (up to 30s) until the full
 prompt prefix is fetchable from a remote node via MetaServer + RDMA. It only

@@ -170,6 +170,14 @@ class SchedulerConnector:
         self._tail_save_enabled = pd_tail_save or fine_tail
         self._tail_load_enabled = pd_tail_load or fine_tail
         self._tail_hash_fn = None
+        # Eagle-family speculation (incl. MTP) drafts from the state at the
+        # prompt's last hash boundary, so vLLM registers the recurrent tail
+        # one hash unit lower (see MambaManager's use_eagle shift). Key the
+        # connector's tail identically or the attention KV and the recurrent
+        # checkpoint are filed under different keys and never reconcile.
+        spec_config = getattr(vllm_config, "speculative_config", None)
+        use_eagle = getattr(spec_config, "use_eagle", None)
+        self._spec_drops_tail_unit = bool(use_eagle()) if callable(use_eagle) else False
         if fine_tail:
             logger.info(
                 "[PegaKVConnector] fine-grained tail-block cache enabled "
@@ -1114,19 +1122,24 @@ class SchedulerConnector:
         covers. The covered length is aligned DOWN to `hash_block_size`: the
         key says nothing about the trailing sub-unit tokens, so a hit must
         not claim them (a same-prefix peer may diverge right after the unit
-        boundary).
+        boundary). With eagle-family speculation (MTP included) the tail
+        drops one more hash unit, mirroring vLLM's own tail registration.
         """
         vbs = self._ctx.virtual_block_size
         hbs = self._ctx.hash_block_size
         assert hbs is not None  # guaranteed by fine_tail_enabled
         prompt_len = request.num_prompt_tokens
-        tail_covered = (prompt_len // hbs) * hbs - (prompt_len // vbs) * vbs
+        unit_count = prompt_len // hbs
+        if self._spec_drops_tail_unit:
+            # Mirror vLLM: eagle/MTP drafts consume the state at the last
+            # hash boundary, so the tail is registered one unit lower.
+            unit_count -= 1
+        tail_covered = unit_count * hbs - (prompt_len // vbs) * vbs
         # vLLM must recompute the final prompt token to produce logits, so a
         # covered span of one token cannot reduce local work.
         if tail_covered <= 1:
             return None
         block_hashes = request.block_hashes
-        unit_count = prompt_len // hbs
         if unit_count > len(block_hashes):
             # Fine hashes lag the prompt; the next scheduler step retries.
             return None

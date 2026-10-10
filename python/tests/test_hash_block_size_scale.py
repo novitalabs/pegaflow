@@ -179,6 +179,66 @@ def test_fine_tail_excludes_sub_unit_remainder():
     assert tail_tokens == 128
 
 
+def test_fine_tail_shifts_one_unit_under_eagle_spec():
+    # Eagle-family speculation (MTP included) drafts from the state at the
+    # prompt's last hash boundary, so vLLM registers the recurrent tail one
+    # unit lower. The connector keys its attention tail identically, or the
+    # two are filed under different keys and never reconcile.
+    ctx = ConnectorContext(
+        instance_id="i",
+        namespace="n",
+        block_size=VBS,
+        tp_size=1,
+        world_size=1,
+        tp_rank=0,
+        device_id=0,
+        engine_client=MagicMock(),
+        state_manager=MagicMock(),
+        hash_block_size=HASH_BLOCK,
+    )
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(use_eagle=lambda: True)
+    )
+    scheduler = SchedulerConnector(ctx, vllm_config=vllm_config)
+
+    # 6444 tokens = 50 full units; with the shift the tail key closes unit 49,
+    # covering 128 of the 300 tail tokens (one more unit is recomputed).
+    req = _request("r1", 4 * VBS + 300)
+    keys, tail_tokens = scheduler._build_query(req, 0)
+    assert keys == tuple(_key(i) for i in range(4)) + (_hash(48),)
+    assert tail_tokens == 128
+
+    # A prompt whose tail holds a single full unit has no keyable tail left.
+    assert scheduler._build_query(_request("r2", 4 * VBS + 128), 0) == (
+        tuple(_key(i) for i in range(4)),
+        0,
+    )
+
+
+def test_fine_tail_not_shifted_for_non_eagle_spec():
+    ctx = ConnectorContext(
+        instance_id="i",
+        namespace="n",
+        block_size=VBS,
+        tp_size=1,
+        world_size=1,
+        tp_rank=0,
+        device_id=0,
+        engine_client=MagicMock(),
+        state_manager=MagicMock(),
+        hash_block_size=HASH_BLOCK,
+    )
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(use_eagle=lambda: False)
+    )
+    scheduler = SchedulerConnector(ctx, vllm_config=vllm_config)
+    req = _request("r1", 4 * VBS + 300)
+    assert scheduler._build_query(req, 0) == (
+        tuple(_key(i) for i in range(4)) + (_hash(49),),
+        256,
+    )
+
+
 def test_fine_tail_needs_no_lora_salt_mm_exclusion():
     # The derived scheme bails on salted/LoRA/multimodal requests because its
     # key carries no extra_keys; the fine key IS the vLLM cache identity.
