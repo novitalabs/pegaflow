@@ -72,6 +72,11 @@ impl TinyLfuCache<BlockKey, ArcSealedBlock> {
         self.lru.contains_key(key)
     }
 
+    /// Returns a value without updating recency or TinyLFU frequency.
+    pub(crate) fn peek(&self, key: &BlockKey) -> Option<&ArcSealedBlock> {
+        self.lru.peek(key)
+    }
+
     /// Returns true when the cache is the only strong owner of the block.
     ///
     /// Weak references from fire-and-forget backing-store work do not pin the

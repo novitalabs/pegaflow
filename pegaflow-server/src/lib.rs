@@ -26,7 +26,7 @@ use opentelemetry_sdk::metrics::SdkMeterProvider;
 use pegaflow_common::grpc::{
     GRPC_SERVER_HTTP2_KEEPALIVE_INTERVAL, GRPC_SERVER_HTTP2_KEEPALIVE_TIMEOUT,
 };
-use pegaflow_core::PegaEngine;
+use pegaflow_core::{DEFAULT_RECLAIM_BATCH_BYTES, PegaEngine};
 use prometheus::Registry;
 use proto::engine::engine_server::EngineServer;
 use pyo3::{PyErr, Python, types::PyAnyMethods};
@@ -152,6 +152,14 @@ pub struct Cli {
     /// Reduces memory fragmentation when blocks are freed in different order.
     #[arg(long, default_value_t = false)]
     pub blockwise_alloc: bool,
+
+    /// Maximum resident bytes removed in one allocator-pressure reclaim pass. Default: 4 GiB.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_RECLAIM_BATCH_BYTES as usize,
+        value_parser = parse_memory_size
+    )]
+    pub max_reclaim_bytes: usize,
 
     /// RDMA NIC names for inter-node transfer (e.g. --nics mlx5_0,mlx5_1 or --nics mlx5_0 mlx5_1).
     /// When set, pinned memory is registered for RDMA access on these NICs.
@@ -548,6 +556,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         rdma_qps_per_peer: cli.qps_per_peer,
         enable_numa_affinity: !cli.disable_numa_affinity,
         blockwise_alloc: cli.blockwise_alloc,
+        max_reclaim_bytes: cli.max_reclaim_bytes as u64,
         transfer_lock_timeout: Duration::from_secs(cli.transfer_lock_timeout_secs),
         metaserver_addr: cli.metaserver_addr.clone(),
         advertise_addr,
@@ -567,6 +576,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     if cli.disable_numa_affinity {
         info!("NUMA-aware memory allocation disabled");
     }
+    info!(
+        "Pressure reclaim batch limit: {} bytes ({:.2} GiB)",
+        cli.max_reclaim_bytes,
+        cli.max_reclaim_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    );
 
     // Create Tokio runtime early - needed for OTLP metrics gRPC exporter
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -785,6 +799,20 @@ mod tests {
                 "mlx5_2".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn cli_default_reclaim_limit_matches_core_default() {
+        let cli = Cli::try_parse_from(["pegaflow-server"]).unwrap();
+
+        assert_eq!(cli.max_reclaim_bytes, DEFAULT_RECLAIM_BATCH_BYTES as usize);
+    }
+
+    #[test]
+    fn cli_explicit_reclaim_limit_accepts_memory_size() {
+        let cli = Cli::try_parse_from(["pegaflow-server", "--max-reclaim-bytes", "2gb"]).unwrap();
+
+        assert_eq!(cli.max_reclaim_bytes, 2 * 1024 * 1024 * 1024);
     }
 
     #[test]

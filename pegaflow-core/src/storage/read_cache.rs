@@ -173,21 +173,35 @@ impl ReadCache {
             .collect()
     }
 
+    #[cfg(test)]
     pub(super) fn remove_lru_batch(&self, batch_size: usize) -> Vec<(BlockKey, Arc<SealedBlock>)> {
+        self.remove_lru_batch_bounded(batch_size, u64::MAX)
+    }
+
+    pub(super) fn remove_lru_batch_bounded(
+        &self,
+        batch_size: usize,
+        max_bytes: u64,
+    ) -> Vec<(BlockKey, Arc<SealedBlock>)> {
         let removed = {
             let mut inner = self.inner.lock();
             let mut removed = Vec::with_capacity(batch_size);
-            remove_lru_batch_from_class(
+            let mut removed_bytes = 0;
+            let stopped_at_byte_limit = remove_lru_batch_from_class(
                 &mut inner,
                 ResidentClass::Reclaimable,
                 batch_size,
+                max_bytes,
+                &mut removed_bytes,
                 &mut removed,
             );
-            if removed.len() < batch_size {
+            if removed.len() < batch_size && !stopped_at_byte_limit {
                 remove_lru_batch_from_class(
                     &mut inner,
                     ResidentClass::Retained,
                     batch_size,
+                    max_bytes,
+                    &mut removed_bytes,
                     &mut removed,
                 );
             }
@@ -455,12 +469,14 @@ fn remove_lru_batch_from_class(
     inner: &mut ReadCacheInner,
     class: ResidentClass,
     batch_size: usize,
+    max_bytes: u64,
+    removed_bytes: &mut u64,
     removed: &mut Vec<RemovedResident>,
-) {
+) -> bool {
     let candidates = class_lru(inner, class).len();
     for _ in 0..candidates {
-        if removed.len() == batch_size {
-            break;
+        if removed.len() == batch_size || (!removed.is_empty() && *removed_bytes >= max_bytes) {
+            return true;
         }
 
         let Some(key) = class_lru(inner, class)
@@ -468,16 +484,25 @@ fn remove_lru_batch_from_class(
             .next()
             .map(|(key, _)| key.clone())
         else {
-            break;
+            return false;
         };
         if inner.cache.is_cache_owned_only(&key) {
+            let footprint = inner
+                .cache
+                .peek(&key)
+                .map_or(0, |block| block.memory_footprint());
+            if !removed.is_empty() && removed_bytes.saturating_add(footprint) > max_bytes {
+                return true;
+            }
             let block = remove_lru(inner, class)
                 .expect("cache-owned LRU candidate must remain resident while locked");
+            *removed_bytes = (*removed_bytes).saturating_add(block.block.memory_footprint());
             removed.push(block);
         } else {
             class_lru(inner, class).get(&key);
         }
     }
+    false
 }
 
 fn record_residence_durations(
@@ -578,14 +603,161 @@ mod tests {
         let retained = BlockKey::new("ns".into(), vec![1]);
         let reclaimable = BlockKey::new("ns".into(), vec![2]);
 
-        cache.batch_insert(vec![(retained.clone(), make_block())]);
-        cache.batch_insert_resident_keys(vec![(reclaimable.clone(), make_block())]);
+        cache.batch_insert(vec![(
+            retained.clone(),
+            Arc::new(SealedBlock::with_footprint_for_test(40)),
+        )]);
+        cache.batch_insert_resident_keys(vec![(
+            reclaimable.clone(),
+            Arc::new(SealedBlock::with_footprint_for_test(60)),
+        )]);
 
-        let evicted = cache.remove_lru_batch(2);
+        let evicted = cache.remove_lru_batch_bounded(2, 100);
+        let evicted_bytes: u64 = evicted
+            .iter()
+            .map(|(_, block)| block.memory_footprint())
+            .sum();
+        assert_eq!(evicted_bytes, 100);
         assert_eq!(
             evicted.into_iter().map(|(key, _)| key).collect::<Vec<_>>(),
             vec![reclaimable, retained]
         );
+    }
+
+    #[test]
+    fn bounded_pressure_reclaim_stops_at_byte_limit() {
+        let cache = make_cache();
+        let first = BlockKey::new("ns".into(), vec![1]);
+        let second = BlockKey::new("ns".into(), vec![2]);
+        let third = BlockKey::new("ns".into(), vec![3]);
+        cache.batch_insert(vec![
+            (
+                first.clone(),
+                Arc::new(SealedBlock::with_footprint_for_test(40)),
+            ),
+            (
+                second.clone(),
+                Arc::new(SealedBlock::with_footprint_for_test(60)),
+            ),
+            (
+                third.clone(),
+                Arc::new(SealedBlock::with_footprint_for_test(60)),
+            ),
+        ]);
+
+        let evicted = cache.remove_lru_batch_bounded(512, 100);
+        let evicted_bytes: u64 = evicted
+            .iter()
+            .map(|(_, block)| block.memory_footprint())
+            .sum();
+        assert_eq!(evicted_bytes, 100);
+        assert_eq!(evicted.len(), 2);
+        assert_eq!(
+            evicted.into_iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert_eq!(cache.get_blocks(std::slice::from_ref(&third)).len(), 1);
+    }
+
+    #[test]
+    fn bounded_pressure_reclaim_does_not_exceed_limit() {
+        let cache = make_cache();
+        let first = BlockKey::new("ns".into(), vec![1]);
+        let second = BlockKey::new("ns".into(), vec![2]);
+        cache.batch_insert(vec![
+            (
+                first.clone(),
+                Arc::new(SealedBlock::with_footprint_for_test(60)),
+            ),
+            (
+                second.clone(),
+                Arc::new(SealedBlock::with_footprint_for_test(60)),
+            ),
+        ]);
+
+        let evicted = cache.remove_lru_batch_bounded(512, 100);
+        let evicted_bytes: u64 = evicted
+            .iter()
+            .map(|(_, block)| block.memory_footprint())
+            .sum();
+        assert_eq!(evicted_bytes, 60);
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].0, first);
+        assert_eq!(cache.get_blocks(std::slice::from_ref(&second)).len(), 1);
+    }
+
+    #[test]
+    fn bounded_pressure_reclaim_does_not_cross_class_after_byte_limit() {
+        let cache = make_cache();
+        let reclaimable = BlockKey::new("ns".into(), vec![1]);
+        let retained = BlockKey::new("ns".into(), vec![2]);
+        cache.batch_insert_resident_keys(vec![(
+            reclaimable.clone(),
+            Arc::new(SealedBlock::with_footprint_for_test(60)),
+        )]);
+        cache.batch_insert(vec![(
+            retained.clone(),
+            Arc::new(SealedBlock::with_footprint_for_test(60)),
+        )]);
+
+        let evicted = cache.remove_lru_batch_bounded(512, 100);
+
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].0, reclaimable);
+        assert_eq!(cache.get_blocks(std::slice::from_ref(&retained)).len(), 1);
+    }
+
+    #[test]
+    fn bounded_pressure_reclaim_keeps_one_oversized_block_for_progress() {
+        let cache = make_cache();
+        let oversized = BlockKey::new("ns".into(), vec![1]);
+        let following = BlockKey::new("ns".into(), vec![2]);
+        cache.batch_insert(vec![
+            (
+                oversized.clone(),
+                Arc::new(SealedBlock::with_footprint_for_test(200)),
+            ),
+            (
+                following.clone(),
+                Arc::new(SealedBlock::with_footprint_for_test(20)),
+            ),
+        ]);
+
+        let evicted = cache.remove_lru_batch_bounded(512, 100);
+        let evicted_bytes: u64 = evicted
+            .iter()
+            .map(|(_, block)| block.memory_footprint())
+            .sum();
+        assert_eq!(evicted_bytes, 200);
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].0, oversized);
+        assert_eq!(cache.get_blocks(std::slice::from_ref(&following)).len(), 1);
+    }
+
+    #[test]
+    fn bounded_pressure_reclaim_skips_leased_blocks() {
+        let cache = make_cache();
+        let leased = BlockKey::new("ns".into(), vec![1]);
+        let following = BlockKey::new("ns".into(), vec![2]);
+        let leased_block = Arc::new(SealedBlock::with_footprint_for_test(60));
+        let _lease = Arc::clone(&leased_block);
+        cache.batch_insert(vec![
+            (leased.clone(), leased_block),
+            (
+                following.clone(),
+                Arc::new(SealedBlock::with_footprint_for_test(60)),
+            ),
+        ]);
+
+        let evicted = cache.remove_lru_batch_bounded(512, 100);
+        let evicted_bytes: u64 = evicted
+            .iter()
+            .map(|(_, block)| block.memory_footprint())
+            .sum();
+        assert_eq!(evicted_bytes, 60);
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].0, following);
+        assert_eq!(cache.get_blocks(std::slice::from_ref(&leased)).len(), 1);
     }
 
     #[test]
@@ -618,7 +790,7 @@ mod tests {
         let weak = Arc::downgrade(&block);
         cache.batch_insert(vec![(key.clone(), block)]);
 
-        assert_eq!(cache.remove_lru_batch(1)[0].0, key);
+        assert_eq!(cache.remove_lru_batch_bounded(1, 100)[0].0, key);
         assert!(weak.upgrade().is_none());
     }
 
@@ -631,11 +803,11 @@ mod tests {
         let weak = Arc::downgrade(&block);
         cache.batch_insert(vec![(key.clone(), block)]);
 
-        assert!(cache.remove_lru_batch(1).is_empty());
+        assert!(cache.remove_lru_batch_bounded(1, 100).is_empty());
         assert_class(&cache, &key, ResidentClass::Retained);
 
         drop(external);
-        assert_eq!(cache.remove_lru_batch(1)[0].0, key);
+        assert_eq!(cache.remove_lru_batch_bounded(1, 100)[0].0, key);
         assert!(weak.upgrade().is_none());
     }
 

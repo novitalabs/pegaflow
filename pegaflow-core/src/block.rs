@@ -311,6 +311,11 @@ impl SealedBlock {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_footprint_for_test(footprint: u64) -> Self {
+        Self::from_slots_with_footprint(Box::new([]), footprint, Vec::new())
+    }
+
     /// Create from a fully populated, slot-id ordered insert batch.
     pub(crate) fn from_ordered_slot_inserts(
         slots: Vec<(usize, RawBlock)>,

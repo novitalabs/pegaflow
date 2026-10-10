@@ -27,9 +27,10 @@ use prefetch::RdmaFetch;
 pub(crate) use read_cache::ReadCache;
 use write_path::{InsertDeps, WritePipeline};
 
-// Each reclaim iteration emits one MetaServer removal command; a small batch
-// turns an eviction burst into a command flood that overflows the removal queue.
+// Each reclaim iteration emits one MetaServer removal command. The block count
+// and byte limits keep one pressure pass from over-evicting large hybrid blocks.
 const RECLAIM_BATCH_SIZE: usize = 512;
+pub const DEFAULT_RECLAIM_BATCH_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 pub const DEFAULT_RDMA_QPS_PER_PEER: usize = 2;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +70,8 @@ pub struct StorageConfig {
     pub metaserver_queue_depth: usize,
     /// Number of shards for the pinned memory pool (reduces allocator lock contention).
     pub pool_shards: usize,
+    /// Maximum resident bytes removed in one allocator-pressure reclaim pass.
+    pub max_reclaim_bytes: u64,
 }
 
 impl Default for StorageConfig {
@@ -87,6 +90,7 @@ impl Default for StorageConfig {
             advertise_addr: None,
             metaserver_queue_depth: crate::internode::DEFAULT_METASERVER_QUEUE_DEPTH,
             pool_shards: 1,
+            max_reclaim_bytes: DEFAULT_RECLAIM_BATCH_BYTES,
         }
     }
 }
@@ -100,6 +104,7 @@ pub(crate) struct StorageEngine {
     #[cfg(feature = "rdma")]
     rdma_transport: Option<Arc<RdmaTransport>>,
     blockwise_alloc: bool,
+    max_reclaim_bytes: u64,
     metaserver_client: Option<Arc<MetaServerClient>>,
     transfer_lock: Arc<transfer_lock::TransferLockManager>,
 }
@@ -120,6 +125,10 @@ impl StorageEngine {
         let rdma_qps_per_peer = config.rdma_qps_per_peer;
         let blockwise_alloc = config.blockwise_alloc;
         let transfer_lock_timeout = config.transfer_lock_timeout;
+        let max_reclaim_bytes = config.max_reclaim_bytes;
+        if max_reclaim_bytes == 0 {
+            return Err("max_reclaim_bytes must be greater than zero".into());
+        }
 
         if blockwise_alloc {
             info!("Blockwise allocation enabled for batch_save");
@@ -249,6 +258,7 @@ impl StorageEngine {
                 #[cfg(feature = "rdma")]
                 rdma_transport,
                 blockwise_alloc,
+                max_reclaim_bytes,
                 metaserver_client,
                 transfer_lock,
             }
@@ -499,7 +509,9 @@ impl StorageEngine {
         while largest_free < required_bytes {
             let used_before = self.allocator.usage().0;
 
-            let evicted = self.read_cache.remove_lru_batch(RECLAIM_BATCH_SIZE);
+            let evicted = self
+                .read_cache
+                .remove_lru_batch_bounded(RECLAIM_BATCH_SIZE, self.max_reclaim_bytes);
 
             if evicted.is_empty() {
                 break;
@@ -702,6 +714,20 @@ mod tests {
         // Try to allocate more than the entire pool
         let result = storage.allocate(NonZeroU64::new(1 << 30).unwrap(), None);
         assert!(result.is_none(), "should fail, not loop forever");
+    }
+
+    #[test]
+    fn zero_reclaim_byte_limit_is_rejected() {
+        let config = StorageConfig {
+            max_reclaim_bytes: 0,
+            ..StorageConfig::default()
+        };
+
+        let error = match StorageEngine::new_with_config(1 << 20, false, config, &[]) {
+            Ok(_) => panic!("zero reclaim byte limit must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error, "max_reclaim_bytes must be greater than zero");
     }
 
     #[tokio::test]
