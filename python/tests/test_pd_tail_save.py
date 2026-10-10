@@ -20,7 +20,7 @@ from .unit_stubs import install_connector_unit_stubs
 
 install_connector_unit_stubs()
 
-from pegaflow.connector.common import ConnectorContext
+from pegaflow.connector.common import CacheGroupLayout, ConnectorContext
 from pegaflow.connector.scheduler import SchedulerConnector
 from pegaflow.pegaflow import QueryReady
 
@@ -225,6 +225,26 @@ class TestTailSaveThroughBuildConnectorMeta:
 
 
 class TestTailLoad:
+    @pytest.mark.parametrize("group_block_sizes", [(32, 16), (32, 32)])
+    def test_tail_load_is_disabled_for_sliding_groups(self, group_block_sizes):
+        req = _make_request("r1", prompt_len=50, full_hashes=3)
+        sc = _make_load_connector(req, hit_blocks=4)
+        sc._cache_groups = CacheGroupLayout(
+            layer_names=(("full",), ("sliding",)),
+            hash_group_index=0,
+            has_recurrent_state=False,
+            recurrent_group_indices=frozenset(),
+            recurrent_layer_names=frozenset(),
+            sliding_window_group_indices=frozenset({1}),
+            group_sliding_windows=(None, 32),
+            group_block_sizes=group_block_sizes,
+        )
+
+        hashes, tail_tokens = sc._build_query(req, computed_blocks=0)
+
+        assert hashes == tuple(req.block_hashes)
+        assert tail_tokens == 0
+
     def test_tail_hit_returns_prompt_minus_one_tokens(self):
         req = _make_request("r1", prompt_len=50, full_hashes=3)
         sc = _make_load_connector(req, hit_blocks=4)

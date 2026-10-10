@@ -70,6 +70,7 @@ def _step(
     num_computed_tokens: int,
     new: bool = False,
     resumed: bool = False,
+    snapshot: tuple[tuple[int, ...], ...] | None = None,
 ):
     if new:
         scheduled_new_reqs = [
@@ -96,6 +97,8 @@ def _step(
         num_scheduled_tokens={req_id: num_tokens},
         preempted_req_ids=set(),
     )
+    if snapshot is not None:
+        output.kv_connector_block_state = SimpleNamespace(block_ids={req_id: snapshot})
     return scheduler.build_connector_meta(output).save_intents.get(req_id)
 
 
@@ -169,6 +172,32 @@ def test_resume_does_not_save_partially_recomputed_block():
         num_tokens=2 * VBS + VBS // 2,
         num_computed_tokens=0,
         resumed=True,
+    )
+
+    _assert_consistent(intent)
+    assert intent.block_ids_by_group == ((10, 11),)
+    assert intent.block_hashes == hashes[:2]
+
+
+def test_snapshot_resume_rebases_before_consuming_save_window():
+    """A fresh block-table snapshot must not preserve stale resume progress."""
+    scheduler = _make_scheduler(PegaConnectorMode.SAVE_ONLY)
+    req = _make_request("r1", 4)
+    hashes = tuple(req.block_hashes)
+    scheduler.update_state_after_alloc(req, None, 0)
+
+    # The first lifetime had advanced the connector watermark before vLLM
+    # preempted the request. The resumed table is authoritative, but only the
+    # first two blocks are fully recomputed in this step.
+    scheduler._scheduled_tokens["r1"] = 4 * VBS
+    intent = _step(
+        scheduler,
+        "r1",
+        block_ids=[10, 11, 12],
+        num_tokens=2 * VBS + VBS // 2,
+        num_computed_tokens=0,
+        resumed=True,
+        snapshot=((10, 11, 12),),
     )
 
     _assert_consistent(intent)

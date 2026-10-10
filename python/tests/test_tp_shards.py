@@ -128,6 +128,7 @@ def test_context_exposes_node_local_server_topology_for_hma():
 def test_worker_connector_routes_global_tp_rank_to_its_local_server(monkeypatch):
     client = MagicMock()
     monkeypatch.setattr("pegaflow.connector.get_tensor_model_parallel_rank", lambda: 5)
+    monkeypatch.setattr("pegaflow.connector.get_pp_group", lambda: SimpleNamespace(rank_in_group=0))
     client_factory = MagicMock(return_value=client)
     monkeypatch.setattr("pegaflow.connector.EngineRpcClient", client_factory)
     monkeypatch.setattr("pegaflow.connector.ServiceStateManager", MagicMock())

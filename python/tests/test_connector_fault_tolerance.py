@@ -139,8 +139,11 @@ def _stub_forward_context() -> MagicMock:
 
 
 def _single_attention_cache_group(*layer_names: str) -> MagicMock:
-    spec = FullAttentionSpec()
-    spec.block_size = 16
+    try:
+        spec = FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype=None)
+    except TypeError:
+        spec = FullAttentionSpec()
+        spec.block_size = 16
     return MagicMock(layer_names=layer_names, kv_cache_spec=spec)
 
 

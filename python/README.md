@@ -154,6 +154,9 @@ Prefill: `{"pegaflow.pd_tail_save": true}`
 
 Decode: `{"pegaflow.pd_tail_load": true, "pegaflow.wait_for_full_prefix": true}`
 
+Partial-tail caching requires a dense attention layout and is rejected for
+HMA or SlidingWindow cache groups.
+
 `pegaflow.wait_for_full_prefix` makes decode wait (up to 30s) until the full
 prompt prefix is fetchable from a remote node via MetaServer + RDMA. It only
 applies when prefill and decode run separate engines; it does not observe
