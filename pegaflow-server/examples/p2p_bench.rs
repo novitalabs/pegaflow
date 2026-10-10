@@ -154,6 +154,19 @@ struct Cli {
     /// Requester: load every fetched block to GPU and verify every byte.
     #[arg(long)]
     verify: bool,
+
+    /// Requester pinned pool in GiB (overrides `--pool-gib` on the requester).
+    /// Set it below the fetched working set to put the requester under
+    /// eviction pressure.
+    #[arg(long, default_value_t = 0)]
+    requester_pool_gib: usize,
+
+    /// Requester churn: after each fetched set, touch every Nth block of all
+    /// earlier sets so LRU order diverges from allocation order (0 = off).
+    /// Reports how much of the pool stays resident at the end, which exposes
+    /// reclaim that evicts far more than the incoming fetch needs.
+    #[arg(long, default_value_t = 0)]
+    churn_touch_stride: usize,
 }
 
 const NAMESPACE: &str = "p2p-bench";
@@ -612,14 +625,40 @@ async fn run_requester(cli: &Cli, shape: &Shape, pool_bytes: usize) {
     let set_mib = shape.set_bytes() as f64 / (1024.0 * 1024.0);
     report_metadata(shape, cli.page_first);
 
+    let churn = cli.churn_touch_stride > 0;
+    let resident_blocks = |upto: usize| -> usize {
+        (0..upto)
+            .map(|set| {
+                engine
+                    .query_group_membership(INSTANCE, 0, &make_block_hashes(shape.blocks, set))
+                    .expect("resident count")
+                    .iter()
+                    .filter(|block| block.is_some())
+                    .count()
+            })
+            .sum()
+    };
+    // Resident blocks after each fetched set, so a single over-eviction shows
+    // up as a dip rather than only in the final count.
+    let mut resident_samples: Vec<usize> = Vec::new();
+    let mut failed_sets = 0usize;
     let mut results: Vec<(usize, f64)> = Vec::new();
     for set in 0..cli.sets {
         let hashes = make_block_hashes(shape.blocks, set);
         let t0 = Instant::now();
-        let deadline = t0 + Duration::from_secs(120);
+        // Under churn a fetch can legitimately fail (pool exhausted); record it
+        // and move on instead of aborting the run.
+        let deadline = t0 + Duration::from_secs(if churn { 30 } else { 120 });
+        let mut fetched = true;
         loop {
             let hit = cached_blocks(&engine, &format!("fetch-{set}"), &hashes).await;
             if hit >= shape.blocks {
+                break;
+            }
+            if churn && Instant::now() >= deadline {
+                println!("FETCH failed set={set} hit={hit}/{}", shape.blocks);
+                failed_sets += 1;
+                fetched = false;
                 break;
             }
             assert!(
@@ -628,6 +667,24 @@ async fn run_requester(cli: &Cli, shape: &Shape, pool_bytes: usize) {
                 shape.blocks
             );
             tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        if churn {
+            // Counting refreshes recency of every resident block in set order;
+            // doing it before the stride touch leaves the final LRU order the
+            // same as without sampling (untouched blocks keep set order).
+            resident_samples.push(resident_blocks(set + 1));
+            for prev in 0..set {
+                let touched: Vec<Vec<u8>> = make_block_hashes(shape.blocks, prev)
+                    .into_iter()
+                    .step_by(cli.churn_touch_stride)
+                    .collect();
+                engine
+                    .query_group_membership(INSTANCE, 0, &touched)
+                    .expect("churn touch");
+            }
+            if !fetched {
+                continue;
+            }
         }
         let elapsed = t0.elapsed();
         let gib_s = shape.set_bytes() as f64 / (1024.0 * 1024.0 * 1024.0) / elapsed.as_secs_f64();
@@ -646,6 +703,33 @@ async fn run_requester(cli: &Cli, shape: &Shape, pool_bytes: usize) {
         if cli.verify {
             verify_set(&engine, shape, set, &hashes, &ranks).await;
         }
+    }
+
+    if churn {
+        let block_bytes = shape.set_bytes() / shape.blocks;
+        let pool_gib = pool_bytes as f64 / (1u64 << 30) as f64;
+        let util = |blocks: usize| (blocks * block_bytes) as f64 / pool_bytes as f64;
+        let resident = resident_blocks(cli.sets);
+        // Steady state: skip the fill phase (samples before the peak).
+        let peak_at = resident_samples
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, n)| **n)
+            .map_or(0, |(i, _)| i);
+        let steady = &resident_samples[peak_at..];
+        let min = steady.iter().copied().min().unwrap_or(0);
+        let avg = steady.iter().sum::<usize>() as f64 / steady.len().max(1) as f64;
+        println!(
+            "CHURN sets={} failed_sets={failed_sets} stride={} resident_blocks={resident} \
+             pool_gib={pool_gib:.2} final_util={:.3} steady_min_util={:.3} \
+             steady_avg_util={:.3} steady_sets={}",
+            cli.sets,
+            cli.churn_touch_stride,
+            util(resident),
+            util(min),
+            avg * block_bytes as f64 / pool_bytes as f64,
+            steady.len(),
+        );
     }
 
     if !results.is_empty() {
@@ -780,6 +864,13 @@ async fn main() {
 
     match cli.role {
         Role::Holder => run_holder(&cli, &shape, pool_bytes).await,
-        Role::Requester => run_requester(&cli, &shape, pool_bytes).await,
+        Role::Requester => {
+            let pool_bytes = if cli.requester_pool_gib > 0 {
+                cli.requester_pool_gib << 30
+            } else {
+                pool_bytes
+            };
+            run_requester(&cli, &shape, pool_bytes).await;
+        }
     }
 }
