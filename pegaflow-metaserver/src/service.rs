@@ -516,6 +516,7 @@ mod tests {
         let store = Arc::new(BlockHashStore::with_config(crate::store::StoreConfig {
             node_stale_after: std::time::Duration::ZERO,
             ttl: std::time::Duration::from_secs(60),
+            ..crate::store::StoreConfig::default()
         }));
         let svc = GrpcMetaService::new(store);
         let old_id = heartbeat_node(&svc, "node-a").await;

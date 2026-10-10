@@ -78,6 +78,7 @@ cargo run -p pegaflow-metaserver -- --help
 - `--node-stale-secs <SECONDS>`: Hide nodes from query after this many seconds without heartbeat (default: `30`)
 - `--ttl-minutes <MINUTES>`: Delete nodes and their owners after this many minutes without node activity (default: `120`); does not expire blocks by registration age
 - `--sweep-interval-secs <SECONDS>`: Run the lifecycle sweep at this interval (default: `600`)
+- `--min-reclaimable-owner-count <COUNT>`: Return a reclaim hint once this many live owners hold a block (default: `3`, minimum: `2`). `2` reclaims more aggressively than the default; values below `2` are rejected.
 
 ### Storage Configuration
 
@@ -188,7 +189,7 @@ message InsertBlockHashesRequest {
 message InsertBlockHashesResponse {
   ResponseStatus status = 1;    // Success/error status
   uint64 inserted_count = 2;    // Number of hashes inserted
-  repeated bytes reclaimable_hashes = 3; // New third-or-later owner hashes
+  repeated bytes reclaimable_hashes = 3; // New threshold-or-later owner hashes
 }
 ```
 
@@ -281,6 +282,7 @@ Graceful shutdown trigger.
 ## Environment Variables
 
 - `RUST_LOG`: Control logging (e.g., `RUST_LOG=debug`)
+- `PEGAFLOW_METASERVER_MIN_RECLAIMABLE_OWNER_COUNT`: Override the minimum live-owner count for reclaim hints (default `3`, minimum `2`); `2` reclaims more aggressively than the default, and the command-line option takes precedence.
 
 ## License
 

@@ -22,6 +22,7 @@ fn populate_store() -> (BlockHashStore, String, Uuid) {
     let store = BlockHashStore::with_config(StoreConfig {
         node_stale_after: Duration::from_secs(30),
         ttl: Duration::from_secs(7_200),
+        ..StoreConfig::default()
     });
     let target_node = "target-node:50055".to_string();
     let other_node = "other-node:50055".to_string();

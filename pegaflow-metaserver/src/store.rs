@@ -9,11 +9,10 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-const MIN_RECLAIMABLE_OWNER_COUNT: usize = 3;
-
 pub const DEFAULT_NODE_STALE_SECS: u64 = 30;
 pub const DEFAULT_TTL_MINUTES: u64 = 120;
 pub const MANUAL_CLEANUP_AGE_SECS: u64 = 60 * 60;
+pub const DEFAULT_MIN_RECLAIMABLE_OWNER_COUNT: usize = 3;
 
 /// A prefix query result: one block hash and all live nodes that own it.
 #[derive(Debug, Clone)]
@@ -27,6 +26,8 @@ pub struct StoreConfig {
     pub node_stale_after: Duration,
     /// Node inactivity grace period; never applies to owner registration age.
     pub ttl: Duration,
+    /// Minimum number of live owners required for a reclaim hint.
+    pub min_reclaimable_owner_count: usize,
 }
 
 impl Default for StoreConfig {
@@ -34,6 +35,7 @@ impl Default for StoreConfig {
         Self {
             node_stale_after: Duration::from_secs(DEFAULT_NODE_STALE_SECS),
             ttl: Duration::from_secs(DEFAULT_TTL_MINUTES * 60),
+            min_reclaimable_owner_count: DEFAULT_MIN_RECLAIMABLE_OWNER_COUNT,
         }
     }
 }
@@ -164,8 +166,8 @@ impl BlockHashStore {
 
     pub fn with_ttl(ttl_minutes: u64) -> Self {
         Self::with_config(StoreConfig {
-            node_stale_after: Duration::from_secs(DEFAULT_NODE_STALE_SECS),
             ttl: Duration::from_secs(ttl_minutes * 60),
+            ..StoreConfig::default()
         })
     }
 
@@ -267,13 +269,13 @@ impl BlockHashStore {
             drop(record);
             let is_new_owner = previous.is_none_or(|owner| owner.node_id != node_id);
             if is_new_owner
-                && owners.len() >= MIN_RECLAIMABLE_OWNER_COUNT
+                && owners.len() >= self.config.min_reclaimable_owner_count
                 && owners
                     .iter()
                     .filter(|(node, owner)| self.is_owner_visible(node, owner, now))
-                    .take(MIN_RECLAIMABLE_OWNER_COUNT)
+                    .take(self.config.min_reclaimable_owner_count)
                     .count()
-                    == MIN_RECLAIMABLE_OWNER_COUNT
+                    == self.config.min_reclaimable_owner_count
             {
                 reclaimable_hashes.push(hash.clone());
             }
@@ -817,10 +819,40 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn reclaim_hint_uses_configured_owner_threshold() {
+        let store = BlockHashStore::with_config(StoreConfig {
+            min_reclaimable_owner_count: 4,
+            ..StoreConfig::default()
+        });
+        let hash = vec![1];
+        let node_a = heartbeat_node(&store, "node-a");
+        let node_b = heartbeat_node(&store, "node-b");
+        let node_c = heartbeat_node(&store, "node-c");
+        let node_d = heartbeat_node(&store, "node-d");
+
+        for (node, node_id) in [("node-a", node_a), ("node-b", node_b), ("node-c", node_c)] {
+            assert!(
+                store
+                    .insert_hashes("ns", std::slice::from_ref(&hash), node, node_id)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        assert_eq!(
+            store
+                .insert_hashes("ns", std::slice::from_ref(&hash), "node-d", node_d)
+                .unwrap(),
+            vec![hash]
+        );
+    }
+
+    #[test]
     fn stale_owner_does_not_count_toward_reclaim_hint() {
         let store = BlockHashStore::with_config(StoreConfig {
             node_stale_after: Duration::from_secs(30),
             ttl: Duration::from_secs(60),
+            ..StoreConfig::default()
         });
         let hash = vec![1];
         let node_a = heartbeat_node(&store, "node-a");
@@ -856,6 +888,7 @@ pub(crate) mod tests {
         let store = BlockHashStore::with_config(StoreConfig {
             node_stale_after: Duration::from_secs(30),
             ttl: Duration::from_secs(60),
+            ..StoreConfig::default()
         });
         let hash = vec![1];
         let old_node_a = heartbeat_node(&store, "node-a");
@@ -1053,6 +1086,7 @@ pub(crate) mod tests {
         let store = BlockHashStore::with_config(StoreConfig {
             node_stale_after: Duration::from_millis(1),
             ttl: Duration::from_secs(60),
+            ..StoreConfig::default()
         });
         let node_id = heartbeat_node(&store, "node-a");
         store
@@ -1071,6 +1105,7 @@ pub(crate) mod tests {
         let store = BlockHashStore::with_config(StoreConfig {
             node_stale_after: Duration::from_secs(60),
             ttl: Duration::from_secs(60),
+            ..StoreConfig::default()
         });
         let node_id = heartbeat_node(&store, "node-a");
         store.nodes.get_mut("node-a").unwrap().last_seen = Instant::now() - Duration::from_secs(61);
@@ -1090,6 +1125,7 @@ pub(crate) mod tests {
         let store = BlockHashStore::with_config(StoreConfig {
             node_stale_after: Duration::from_secs(60),
             ttl: Duration::from_secs(60),
+            ..StoreConfig::default()
         });
         let node_id = heartbeat_node(&store, "node-a");
         store
@@ -1109,6 +1145,7 @@ pub(crate) mod tests {
         let store = BlockHashStore::with_config(StoreConfig {
             node_stale_after: Duration::ZERO,
             ttl: Duration::ZERO,
+            ..StoreConfig::default()
         });
         let node_id = heartbeat_node(&store, "node-a");
         store

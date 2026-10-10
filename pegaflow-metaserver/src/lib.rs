@@ -56,6 +56,14 @@ pub struct Cli {
     /// Seconds between lifecycle sweeps.
     #[arg(long, default_value_t = DEFAULT_SWEEP_INTERVAL_SECS)]
     pub sweep_interval_secs: u64,
+
+    /// Minimum number of live owners before a newly registered block is marked reclaimable.
+    #[arg(
+        long,
+        env = "PEGAFLOW_METASERVER_MIN_RECLAIMABLE_OWNER_COUNT",
+        default_value_t = store::DEFAULT_MIN_RECLAIMABLE_OWNER_COUNT
+    )]
+    pub min_reclaimable_owner_count: usize,
 }
 
 fn init_metrics() -> Result<(SdkMeterProvider, Registry), Box<dyn Error>> {
@@ -112,10 +120,6 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
 
     info!("Starting PegaFlow MetaServer");
     info!("Binding to address: {}", cli.addr);
-    info!(
-        "Node lifecycle: stale_after={}s manual_cleanup_age=1h sweep_interval={}s node_ttl_minutes={}",
-        cli.node_stale_secs, cli.sweep_interval_secs, cli.ttl_minutes
-    );
     let ttl_secs = cli
         .ttl_minutes
         .checked_mul(60)
@@ -126,6 +130,9 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     if cli.sweep_interval_secs == 0 {
         return Err("sweep-interval-secs must be greater than 0".into());
     }
+    if cli.min_reclaimable_owner_count < 2 {
+        return Err("min-reclaimable-owner-count must be at least 2".into());
+    }
     if ttl_secs < cli.node_stale_secs {
         return Err(format!(
             "ttl-minutes ({}) must be >= node-stale-secs ({})",
@@ -134,12 +141,21 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         .into());
     }
 
+    info!(
+        "Node lifecycle: stale_after={}s manual_cleanup_age=1h sweep_interval={}s node_ttl_minutes={} min_reclaimable_owner_count={}",
+        cli.node_stale_secs,
+        cli.sweep_interval_secs,
+        cli.ttl_minutes,
+        cli.min_reclaimable_owner_count
+    );
+
     // Initialize metrics
     let (meter_provider, prometheus_registry) = init_metrics()?;
 
     let store = Arc::new(BlockHashStore::with_config(store::StoreConfig {
         node_stale_after: Duration::from_secs(cli.node_stale_secs),
         ttl: Duration::from_secs(ttl_secs),
+        min_reclaimable_owner_count: cli.min_reclaimable_owner_count,
     }));
 
     // Register store observable gauges
