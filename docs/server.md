@@ -72,4 +72,4 @@ pegaflow-server --metaserver-addr http://<metaserver-host>:50056
 - `--node-stale-secs`: Hide nodes from query after this many seconds without heartbeat (default: `30`)
 - `--ttl-minutes`: Delete nodes and their owners after this many minutes without node activity (default: `120`); does not expire blocks by registration age
 - `--sweep-interval-secs`: Run the lifecycle sweep at this interval (default: `600`)
-- `--min-reclaimable-owner-count`: Return a reclaim hint once this many live owners hold a block (default: `3`). Values below `3` make reclamation more aggressive; `1` hints on every newly registered owner. Overridable with `PEGAFLOW_METASERVER_MIN_RECLAIMABLE_OWNER_COUNT`, and the CLI flag takes precedence.
+- `--min-reclaimable-owner-count`: Return a reclaim hint once this many live owners hold a block (default: `3`, minimum: `2`). `2` reclaims more aggressively than the default; values below `2` are rejected. Overridable with `PEGAFLOW_METASERVER_MIN_RECLAIMABLE_OWNER_COUNT`, and the CLI flag takes precedence.

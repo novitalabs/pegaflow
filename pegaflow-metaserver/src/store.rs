@@ -166,9 +166,8 @@ impl BlockHashStore {
 
     pub fn with_ttl(ttl_minutes: u64) -> Self {
         Self::with_config(StoreConfig {
-            node_stale_after: Duration::from_secs(DEFAULT_NODE_STALE_SECS),
             ttl: Duration::from_secs(ttl_minutes * 60),
-            min_reclaimable_owner_count: DEFAULT_MIN_RECLAIMABLE_OWNER_COUNT,
+            ..StoreConfig::default()
         })
     }
 

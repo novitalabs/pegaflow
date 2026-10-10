@@ -130,8 +130,8 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     if cli.sweep_interval_secs == 0 {
         return Err("sweep-interval-secs must be greater than 0".into());
     }
-    if cli.min_reclaimable_owner_count == 0 {
-        return Err("min-reclaimable-owner-count must be greater than 0".into());
+    if cli.min_reclaimable_owner_count < 2 {
+        return Err("min-reclaimable-owner-count must be at least 2".into());
     }
     if ttl_secs < cli.node_stale_secs {
         return Err(format!(
