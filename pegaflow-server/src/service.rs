@@ -832,6 +832,7 @@ impl Engine for GrpcEngineService {
                 &req.namespace,
                 &req.block_hashes,
                 &req.requester_id,
+                req.prefix_only,
             );
 
             let blocks: Vec<TransferBlockInfo> = found_blocks
@@ -890,7 +891,9 @@ impl Engine for GrpcEngineService {
             req.transfer_session_id
         );
 
-        let released = self.engine.release_transfer_lock(&req.transfer_session_id);
+        let released = self
+            .engine
+            .release_transfer_lock(&req.transfer_session_id, req.transferred);
 
         let result = Ok(Response::new(ReleaseTransferLockResponse {
             status: Some(Self::build_simple_response()),

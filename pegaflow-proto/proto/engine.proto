@@ -217,6 +217,7 @@ message QueryBlocksForTransferRequest {
   string namespace = 1;
   repeated bytes block_hashes = 2;
   string requester_id = 3;             // For lock tracking / logging
+  bool prefix_only = 4;                // Stop at the first missing hash; lock only the contiguous prefix
 }
 
 message QueryBlocksForTransferResponse {
@@ -241,6 +242,9 @@ message RdmaHandshakeResponse {
 
 message ReleaseTransferLockRequest {
   string transfer_session_id = 1;
+  // True only when the requester received every block in this session; the
+  // holder then demotes its copies to the reclaimable class.
+  bool transferred = 2;
 }
 
 message ReleaseTransferLockResponse {

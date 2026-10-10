@@ -580,12 +580,18 @@ impl StorageEngine {
 
     // ---- Cross-node transfer: serving side ----
 
-    /// Look up specific blocks by key (non-prefix). For cross-node transfer.
+    /// Look up blocks for cross-node transfer. `prefix_only` stops at the
+    /// first miss so the holder never locks blocks a prefix requester drops.
     pub(crate) fn get_blocks_for_transfer(
         &self,
         keys: &[BlockKey],
+        prefix_only: bool,
     ) -> Vec<(BlockKey, Arc<SealedBlock>)> {
-        self.read_cache.get_blocks(keys)
+        if !prefix_only {
+            return self.read_cache.get_blocks(keys);
+        }
+        let (_, blocks) = self.read_cache.get_prefix_blocks(keys);
+        keys.iter().cloned().zip(blocks).collect()
     }
 
     /// Lock blocks for a transfer session, returning the session ID.
@@ -594,12 +600,8 @@ impl StorageEngine {
         requester_id: &str,
         blocks: &[(BlockKey, Arc<SealedBlock>)],
     ) -> String {
-        let session_id = self
-            .transfer_lock
-            .lock_blocks(requester_id, blocks.to_vec());
-        let keys: Vec<BlockKey> = blocks.iter().map(|(key, _)| key.clone()).collect();
-        self.read_cache.mark_reclaimable_keys(&keys);
-        session_id
+        self.transfer_lock
+            .lock_blocks(requester_id, blocks.to_vec())
     }
 
     pub(crate) fn transfer_lock_timeout(&self) -> Duration {
@@ -607,8 +609,15 @@ impl StorageEngine {
     }
 
     /// Release a transfer lock session. Returns the number of blocks released.
-    pub(crate) fn release_transfer_lock(&self, session_id: &str) -> usize {
-        self.transfer_lock.release(session_id)
+    ///
+    /// Source copies are demoted only after the requester reports a completed
+    /// transfer; failed, cancelled, and expired sessions keep their class.
+    pub(crate) fn release_transfer_lock(&self, session_id: &str, transferred: bool) -> usize {
+        let keys = self.transfer_lock.release(session_id);
+        if transferred {
+            self.read_cache.mark_reclaimable_keys(&keys);
+        }
+        keys.len()
     }
 
     /// GC expired transfer lock sessions. Returns the number of sessions expired.
@@ -729,7 +738,7 @@ mod tests {
     // ---- Cross-node transfer: serving side tests ----
 
     #[tokio::test]
-    async fn get_blocks_for_transfer_returns_correct_blocks() {
+    async fn get_blocks_for_transfer_respects_prefix_only() {
         let storage = make_engine();
         let key1 = BlockKey::new("ns".into(), vec![1]);
         let key2 = BlockKey::new("ns".into(), vec![2]);
@@ -739,18 +748,17 @@ mod tests {
         storage.test_insert_cache(key1.clone(), block.clone());
         storage.test_insert_cache(key3.clone(), block.clone());
 
-        // Request keys 1, 2, 3 — only 1 and 3 are present (non-prefix semantics)
-        let result = storage.get_blocks_for_transfer(&[key1.clone(), key2, key3.clone()]);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].0, key1);
-        assert_eq!(result[1].0, key3);
-    }
-
-    #[tokio::test]
-    async fn get_blocks_for_transfer_empty_keys() {
-        let storage = make_engine();
-        let result = storage.get_blocks_for_transfer(&[]);
-        assert!(result.is_empty());
+        // Only keys 1 and 3 are present.
+        let keys = [key1.clone(), key2, key3.clone()];
+        for (prefix_only, expected) in [(false, vec![key1.clone(), key3]), (true, vec![key1])] {
+            let found: Vec<BlockKey> = storage
+                .get_blocks_for_transfer(&keys, prefix_only)
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect();
+            assert_eq!(found, expected, "prefix_only={prefix_only}");
+            assert!(storage.get_blocks_for_transfer(&[], prefix_only).is_empty());
+        }
     }
 
     #[tokio::test]
@@ -769,21 +777,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lock_and_release_transfer_when_enabled() {
-        let storage = make_engine();
-        let key = BlockKey::new("ns".into(), vec![1]);
-        let block = Arc::new(SealedBlock::from_slots(Vec::new()));
+    async fn transfer_release_demotes_source_only_after_transfer() {
+        for transferred in [false, true] {
+            let storage = make_engine();
+            let key = BlockKey::new("ns".into(), vec![1]);
+            let block = Arc::new(SealedBlock::from_slots(Vec::new()));
+            storage.test_insert_cache(key.clone(), block.clone());
 
-        storage.test_insert_cache(key.clone(), block.clone());
+            let session_id = storage.lock_blocks_for_transfer("node-a", &[(key.clone(), block)]);
+            assert!(!session_id.is_empty());
+            assert!(
+                !storage.read_cache.is_reclaimable_for_test(&key),
+                "locking must not demote the source copy"
+            );
 
-        let session_id = storage.lock_blocks_for_transfer("node-a", &[(key.clone(), block)]);
-        assert!(
-            !session_id.is_empty(),
-            "lock_blocks_for_transfer should return a UUID when enabled"
-        );
-        assert!(storage.read_cache.is_reclaimable_for_test(&key));
-
-        let released = storage.release_transfer_lock(&session_id);
-        assert_eq!(released, 1);
+            assert_eq!(storage.release_transfer_lock(&session_id, transferred), 1);
+            assert_eq!(
+                storage.read_cache.is_reclaimable_for_test(&key),
+                transferred,
+                "transferred={transferred}"
+            );
+            assert_eq!(storage.release_transfer_lock(&session_id, true), 0);
+        }
     }
 }

@@ -69,14 +69,14 @@ impl TransferLockManager {
         session_id
     }
 
-    /// Release a transfer session's locks. Returns the number of blocks released.
+    /// Release a transfer session's locks. Returns the keys that were locked.
     ///
     /// # Security model
     ///
     /// Any caller with the session ID can release the lock. This relies on:
     /// 1. Session IDs are UUIDv4 (cryptographically random, unguessable)
     /// 2. The gRPC port is network-isolated (internal cluster only)
-    pub(crate) fn release(&self, session_id: &str) -> usize {
+    pub(crate) fn release(&self, session_id: &str) -> Vec<BlockKey> {
         let mut inner = self.inner.lock();
         if let Some(session) = inner.remove(session_id) {
             let count = session.blocks.len();
@@ -87,10 +87,10 @@ impl TransferLockManager {
                 "Transfer lock released: session={} requester={} blocks={}",
                 session_id, session.requester_id, count
             );
-            count
+            session.blocks.into_iter().map(|(key, _)| key).collect()
         } else {
             warn!("Transfer lock release: session not found: {}", session_id);
-            0
+            Vec::new()
         }
     }
 
@@ -171,7 +171,7 @@ mod tests {
         assert_eq!(mgr.total_locked_blocks(), 1);
 
         let released = mgr.release(&session_id);
-        assert_eq!(released, 1);
+        assert_eq!(released.len(), 1);
         assert_eq!(mgr.active_session_count(), 0);
         assert_eq!(mgr.total_locked_blocks(), 0);
     }
@@ -179,7 +179,7 @@ mod tests {
     #[test]
     fn release_unknown_session_returns_zero() {
         let mgr = TransferLockManager::new(Duration::from_secs(30));
-        assert_eq!(mgr.release("nonexistent"), 0);
+        assert!(mgr.release("nonexistent").is_empty());
     }
 
     #[test]
@@ -245,7 +245,7 @@ mod tests {
         assert_eq!(mgr.total_locked_blocks(), 0);
 
         let released = mgr.release(&session_id);
-        assert_eq!(released, 0);
+        assert!(released.is_empty());
         assert_eq!(mgr.active_session_count(), 0);
     }
 
@@ -320,10 +320,10 @@ mod tests {
         let mgr = TransferLockManager::new(Duration::from_secs(30));
         let (key, block) = make_test_block();
 
-        let session_id = mgr.lock_blocks("node-a", vec![(key, block)]);
-        assert_eq!(mgr.release(&session_id), 1);
+        let session_id = mgr.lock_blocks("node-a", vec![(key.clone(), block)]);
+        assert_eq!(mgr.release(&session_id), vec![key]);
         // Second release is a no-op
-        assert_eq!(mgr.release(&session_id), 0);
+        assert!(mgr.release(&session_id).is_empty());
         assert_eq!(mgr.active_session_count(), 0);
     }
 
@@ -347,7 +347,7 @@ mod tests {
         assert_eq!(mgr.active_session_count(), 1);
 
         // The surviving session is s2
-        assert_eq!(mgr.release(&s2), 1);
+        assert_eq!(mgr.release(&s2).len(), 1);
         assert_eq!(mgr.active_session_count(), 0);
     }
 }
