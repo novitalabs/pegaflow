@@ -138,24 +138,54 @@ class SchedulerConnector:
             )
         self._tp_shard_client = TpShardQueryClient(engine_clients)
         self._cache_groups = CacheGroupLayout.from_config(kv_cache_config)
+        fine_tail = context.fine_tail_enabled
         if self._cache_groups.has_recurrent_state and (pd_tail_save or pd_tail_load):
             raise ValueError("P/D tail-block caching is not supported with HMA")
+        if fine_tail and (pd_tail_save or pd_tail_load):
+            logger.warning(
+                "[PegaKVConnector] pegaflow.pd_tail_save/pd_tail_load are superseded by "
+                "prefix_match_unit: tail keys come from vLLM's own fine-grained hashes"
+            )
         self._gpu_block_pool = None
 
-        # P/D tail-block extension (`pegaflow.pd_tail_save`): vLLM only hashes
-        # full blocks, so a prompt's partial tail block never enters the tier
-        # and a strict no-prefill decode peer would have to recompute it.
-        # When enabled, the step that schedules the final prompt chunk also
-        # saves the partial tail block under a key derived with vLLM's OWN
-        # hash function over (last_full_hash, tail_prompt_token_ids, None) —
-        # well-defined, and independently derivable by the decode peer.
-        # vLLM derives NONE_HASH from PYTHONHASHSEED when it is set. A fixed
-        # seed makes the configured hash function reproducible across the
-        # scheduler processes participating in the transfer.
-        self._tail_save_enabled = pd_tail_save
-        self._tail_load_enabled = pd_tail_load
+        # Partial tail-block caching: a prompt's partial tail block is saved
+        # so a peer sharing the prefix can hit below block granularity. Two
+        # key schemes, picked by how vLLM hashes:
+        # - fine (`--prefix-match-unit` < block size): vLLM hashes every
+        #   `hash_block_size` tokens and each hash chains over the whole
+        #   prefix, so the hash closing the prompt's last full hash unit keys
+        #   the tail block directly. No PYTHONHASHSEED pinning, no LoRA /
+        #   salt / multimodal exclusion — vLLM's hash carries the identity.
+        #   With HMA the same fine key also keys the recurrent state: vLLM
+        #   materializes it at the prompt's last hash boundary and hands the
+        #   block over (`_consume_boundary_state_offloads`), so a sub-block
+        #   hit resumes every group.
+        # - derived (`pegaflow.pd_tail_save`): vLLM only hashes full blocks,
+        #   so the connector re-derives the key with vLLM's OWN hash function
+        #   over (last_full_hash, tail_prompt_token_ids, None) — well-defined,
+        #   and independently derivable by the decode peer. vLLM derives
+        #   NONE_HASH from PYTHONHASHSEED when it is set, so a fixed seed is
+        #   required across the scheduler processes.
+        self._fine_tail = fine_tail
+        self._tail_save_enabled = pd_tail_save or fine_tail
+        self._tail_load_enabled = pd_tail_load or fine_tail
         self._tail_hash_fn = None
-        if pd_tail_save or pd_tail_load:
+        # Eagle-family speculation (incl. MTP) drafts from the state at the
+        # prompt's last hash boundary, so vLLM registers the recurrent tail
+        # one hash unit lower (see MambaManager's use_eagle shift). Key the
+        # connector's tail identically or the attention KV and the recurrent
+        # checkpoint are filed under different keys and never reconcile.
+        spec_config = getattr(vllm_config, "speculative_config", None)
+        use_eagle = getattr(spec_config, "use_eagle", None)
+        self._spec_drops_tail_unit = bool(use_eagle()) if callable(use_eagle) else False
+        if fine_tail:
+            logger.info(
+                "[PegaKVConnector] fine-grained tail-block cache enabled "
+                "(hash_block_size=%d block_size=%d)",
+                context.hash_block_size,
+                context.virtual_block_size,
+            )
+        elif pd_tail_save or pd_tail_load:
             assert vllm_config is not None
             algo = vllm_config.cache_config.prefix_caching_hash_algo
             if os.environ.get("PYTHONHASHSEED") is None:
@@ -199,6 +229,10 @@ class SchedulerConnector:
         # Save state (per-request)
         self._block_hashes: dict[str, tuple[bytes, ...]] = {}
         self._external_matched_blocks: dict[str, int] = {}
+        # Token-exact twin of _external_matched_blocks: partial hits load a
+        # partial last block, and boundary-offload filtering must compare
+        # against the real hit boundary, not its block ceiling.
+        self._external_matched_tokens: dict[str, int] = {}
         self._block_index_offsets: dict[str, int] = {}
         self._allocated_blocks: dict[str, list[list[int]]] = {}
         self._scheduled_tokens: dict[str, int] = {}
@@ -223,8 +257,11 @@ class SchedulerConnector:
         self._next_boundary_job_id = 0
         # job id -> (pinned GPU block ids, workers yet to report)
         self._pinned_boundary_jobs: dict[int, tuple[list[int], int]] = {}
-        # req id -> (group index, hash index) already handed off
+        # req id -> (group index, boundary tokens) already handed off
         self._saved_boundaries: dict[str, set[tuple[int, int]]] = {}
+        # Finish-time partial-tail jobs (register_finished_partial_tail),
+        # flushed into the next step's boundary_save_intents.
+        self._finished_tail_jobs: dict[int, SaveIntent] = {}
 
     def bind_gpu_block_pool(self, gpu_block_pool) -> None:
         self._gpu_block_pool = gpu_block_pool
@@ -239,8 +276,8 @@ class SchedulerConnector:
 
         gpu_block_pool.get_cached_block = no_local_hma_prefix_hit
 
-    def _request_block_hashes(self, request: "Request") -> tuple[bytes, ...]:
-        """Per-block keys from `Request.block_hashes` (see `ConnectorContext.hash_scale`).
+    def _request_unit_hashes(self, request: "Request") -> tuple[bytes, ...]:
+        """Raw per-hash-unit keys from `Request.block_hashes`.
 
         vLLM hashes full spans only, so the hashes never reach past the
         request's tokens — except when a connector pops the last token after
@@ -268,7 +305,15 @@ class SchedulerConnector:
                 )
             if stale == 1:
                 block_hashes = block_hashes[:hashed]
-        return block_hashes_per_block(block_hashes, self._ctx.hash_scale)
+        return tuple(block_hashes)
+
+    def _request_block_hashes(self, request: "Request") -> tuple[bytes, ...]:
+        """Per-block keys from `Request.block_hashes` (see `ConnectorContext.hash_scale`).
+
+        The last hash unit inside each scheduler block closes that block's
+        chained hash, so it is the block's key.
+        """
+        return block_hashes_per_block(self._request_unit_hashes(request), self._ctx.hash_scale)
 
     def get_num_new_matched_tokens(
         self,
@@ -292,6 +337,7 @@ class SchedulerConnector:
         if not query_hashes:
             self._release_pending_query_probe(req_id)
             self._external_matched_blocks[req_id] = computed_blocks
+            self._external_matched_tokens[req_id] = computed_blocks * self._ctx.virtual_block_size
             return (0, False)
 
         probe = self._pending_query_probes.get(req_id)
@@ -450,7 +496,9 @@ class SchedulerConnector:
         hit_blocks = probe.require_hit_blocks()
         computed_blocks = probe.computed_blocks
         vbs = self._ctx.virtual_block_size
-        tail_hit = probe.tail_tokens > 0 and hit_blocks == len(probe.query_hashes)
+        hbs = self._ctx.hash_block_size or vbs
+        query_len = len(probe.query_hashes)
+        tail_hit = probe.tail_tokens > 0 and hit_blocks == query_len
         # _build_query appends the tail key last and the backend reports prefix
         # hits, so a full query hit makes the final block the partial tail.
         last_block_tokens = probe.tail_tokens if tail_hit else vbs
@@ -461,21 +509,31 @@ class SchedulerConnector:
         # overwrite it unless a P/D router supplied a separate decode token.
         locally_computed_tokens = computed_blocks * vbs
         hit_tokens = min(hit_tokens, max(0, num_tokens - locally_computed_tokens - 1))
+        if self._fine_tail:
+            # Partial-hash-hit engines (hybrid + `--prefix-match-unit`)
+            # consume external hits at hash-unit granularity.
+            hit_tokens -= hit_tokens % hbs
 
         if probe.recurrent_hold is not None:
-            # A mamba checkpoint is valid only at its own block boundary. If
-            # the token budget cut inside the reconciled span, fall back to
-            # the best earlier boundary; if none survives, drop the hit (a
-            # partial mamba resume cannot exist).
-            boundary_blocks = hit_tokens // vbs
-            usable = [p for p in probe.usable_positions if p < boundary_blocks]
+            # A hybrid hit resumes only where every recurrent group cached its
+            # state: usable positions are query-hash indices whose boundary the
+            # checkpoint covers (a full block, or the prompt tail unit when the
+            # tail key hit). If the token budget cut inside the reconciled
+            # span, fall back to the best earlier boundary; if none survives,
+            # drop the hit (a mamba resume cannot exist anywhere else).
+            def boundary_tokens_of(position: int) -> int:
+                if probe.tail_tokens > 0 and position == query_len - 1:
+                    return (query_len - 1) * vbs + probe.tail_tokens
+                return (position + 1) * vbs
+
+            usable = [p for p in probe.usable_positions if boundary_tokens_of(p) <= hit_tokens]
             if not usable:
                 if self._pending_query_probes.get(req_id) is probe:
                     self._release_pending_query_probe(req_id)
                 return (0, False)
             checkpoint = max(usable)
             hit_blocks = checkpoint + 1
-            hit_tokens = hit_blocks * vbs
+            hit_tokens = boundary_tokens_of(checkpoint)
             probe.hit_blocks = hit_blocks
             probe.recurrent_hold = replace(probe.recurrent_hold, checkpoint=checkpoint)
 
@@ -483,6 +541,11 @@ class SchedulerConnector:
         # prompt token cannot remove the last leased block from the load.
         loaded_blocks = (hit_tokens + vbs - 1) // vbs
         self._external_matched_blocks[req_id] = computed_blocks + loaded_blocks
+        self._external_matched_tokens[req_id] = locally_computed_tokens + hit_tokens
+
+        # Recompute after the recurrent fallback: it may have shrunk the hit
+        # below the tail boundary.
+        tail_hit = probe.tail_tokens > 0 and hit_blocks == len(probe.query_hashes)
 
         if reused:
             logger.debug(
@@ -704,6 +767,11 @@ class SchedulerConnector:
         self._pending_saves.update(save_intents.keys())
 
         boundary_save_intents = self._consume_boundary_state_offloads(scheduler_output)
+        if self._finished_tail_jobs:
+            # Finish-time partial tails were pinned when registered; flush
+            # them with this step's metadata like any other boundary job.
+            boundary_save_intents.update(self._finished_tail_jobs)
+            self._finished_tail_jobs = {}
 
         logger.debug(
             "[PegaKVConnector] build_connector_meta: %d loads, %d saves, %d boundary saves",
@@ -727,8 +795,10 @@ class SchedulerConnector:
         Each entry is ``(group_id, block_id, boundary_tokens)``: the exact
         align-mode block holding the recurrent state after ``boundary_tokens``
         tokens, committed by this step's forward. The state is filed under
-        the request hash ending at that boundary. Only whole-block boundaries
-        are stored; a sub-block partial tail has no hash of its own here.
+        the request hash ending at that boundary. Whole-block boundaries key
+        on the closing block hash; with fine hashing (`--prefix-match-unit`)
+        a sub-block boundary (the prompt's partial tail, materialized and
+        CoW-preserved by vLLM) keys on the closing hash unit instead.
 
         Every committed boundary is handed off, so a request contributes a
         resume point at each prefill chunk end, at its junction with a shared
@@ -748,67 +818,149 @@ class SchedulerConnector:
         if not offloads:
             return {}
 
-        pool = self._gpu_block_pool
-        if pool is None:
+        if self._gpu_block_pool is None:
             raise RuntimeError("GPU block pool was not bound before a boundary-state hand-off")
 
-        vbs = self._ctx.virtual_block_size
-        recurrent = self._cache_groups.recurrent_group_indices
-        group_count = self._cache_groups.group_count
         intents: dict[int, SaveIntent] = {}
         for req_id, entries in offloads.items():
             request = self._requests.get(req_id)
             if request is None:
                 # Finished before this step's metadata; its blocks are going away.
                 continue
-            block_hashes = self._request_block_hashes(request)
-            self._block_hashes[req_id] = block_hashes
+            self._block_hashes[req_id] = self._request_block_hashes(request)
             saved = self._saved_boundaries.setdefault(req_id, set())
             # vLLM allocates a real recurrent block per externally loaded
             # block but the load fills only the checkpoint; after the load it
             # still caches (and offers) every block of the loaded prefix. Those
             # blocks hold no state this request computed, so only boundaries
             # past the loaded prefix may be saved.
-            loaded_blocks = self._external_matched_blocks.get(req_id, 0)
-            rows: list[tuple[int, int, bytes]] = []
-            for group_index, block_id, boundary_tokens in entries:
-                if group_index not in recurrent or block_id <= 0:
-                    continue
-                if boundary_tokens <= 0 or boundary_tokens % vbs != 0:
-                    continue
-                hash_index = boundary_tokens // vbs - 1
-                if hash_index < loaded_blocks or hash_index >= len(block_hashes):
-                    continue
-                key = (group_index, hash_index)
-                if key in saved:
-                    continue
-                saved.add(key)
-                rows.append((group_index, block_id, block_hashes[hash_index]))
+            loaded_tokens = self._external_matched_tokens.get(req_id, 0)
+            rows = self._boundary_rows(request, entries, loaded_tokens, saved)
             if not rows:
                 continue
-
-            job_id = self._next_boundary_job_id
-            self._next_boundary_job_id += 1
-            intents[job_id] = SaveIntent(
-                block_ids_by_group=tuple(
-                    tuple(
-                        block_id if group_index == group else 0 for group_index, block_id, _ in rows
-                    )
-                    for group in range(group_count)
-                ),
-                block_hashes=tuple(block_hash for _, _, block_hash in rows),
-            )
-            pinned = list(dict.fromkeys(block_id for _, block_id, _ in rows))
-            pool.touch([pool.blocks[block_id] for block_id in pinned])
-            self._pinned_boundary_jobs[job_id] = (pinned, self._ctx.world_size)
+            job_id, intent = self._emit_boundary_job(rows)
+            intents[job_id] = intent
             logger.debug(
                 "[PegaKVConnector] req=%s boundary_save job=%d boundaries=%s blocks=%s",
                 req_id,
                 job_id,
-                [(group_index, (hash_index + 1) * vbs) for group_index, hash_index in saved],
-                pinned,
+                [(group_index, boundary_tokens) for group_index, boundary_tokens in saved],
+                [block_id for _, block_id, _ in rows],
             )
         return intents
+
+    def _boundary_rows(
+        self,
+        request: "Request",
+        entries,
+        loaded_tokens: int,
+        saved: set[tuple[int, int]],
+    ) -> list[tuple[int, int, bytes]]:
+        """Filter boundary hand-off entries into (group, block_id, key) rows.
+
+        ``saved`` (per request) both deduplicates and records which
+        (group, boundary) pairs have been accepted. Boundaries inside the
+        externally loaded prefix are skipped: those blocks hold state this
+        request loaded rather than computed.
+        """
+        vbs = self._ctx.virtual_block_size
+        hbs = self._ctx.hash_block_size
+        recurrent = self._cache_groups.recurrent_group_indices
+        block_hashes: tuple[bytes, ...] | None = None
+        unit_hashes: tuple[bytes, ...] | None = None
+        rows: list[tuple[int, int, bytes]] = []
+        for group_index, block_id, boundary_tokens in entries:
+            if group_index not in recurrent or block_id <= 0 or boundary_tokens <= 0:
+                continue
+            if boundary_tokens % vbs == 0:
+                if block_hashes is None:
+                    block_hashes = self._request_block_hashes(request)
+                index = boundary_tokens // vbs - 1
+                hashes = block_hashes
+            elif self._fine_tail and hbs is not None and boundary_tokens % hbs == 0:
+                if unit_hashes is None:
+                    unit_hashes = self._request_unit_hashes(request)
+                index = boundary_tokens // hbs - 1
+                hashes = unit_hashes
+            else:
+                logger.warning(
+                    "[PegaKVConnector] req=%s dropping unaligned boundary hand-off: "
+                    "group=%d boundary_tokens=%d block_size=%d hash_block_size=%s",
+                    request.request_id,
+                    group_index,
+                    boundary_tokens,
+                    vbs,
+                    hbs,
+                )
+                continue
+            if index >= len(hashes):
+                continue  # hashes lag the hand-off
+            if boundary_tokens <= loaded_tokens:
+                continue
+            dedup_key = (group_index, boundary_tokens)
+            if dedup_key in saved:
+                continue
+            saved.add(dedup_key)
+            rows.append((group_index, block_id, hashes[index]))
+        return rows
+
+    def _emit_boundary_job(self, rows: list[tuple[int, int, bytes]]) -> tuple[int, SaveIntent]:
+        """Pin the handed-off blocks and register a boundary save job."""
+        pool = self._gpu_block_pool
+        assert pool is not None  # checked by callers before accepting hand-offs
+        group_count = self._cache_groups.group_count
+        job_id = self._next_boundary_job_id
+        self._next_boundary_job_id += 1
+        intent = SaveIntent(
+            block_ids_by_group=tuple(
+                tuple(block_id if group_index == group else 0 for group_index, block_id, _ in rows)
+                for group in range(group_count)
+            ),
+            block_hashes=tuple(block_hash for _, _, block_hash in rows),
+        )
+        pinned = list(dict.fromkeys(block_id for _, block_id, _ in rows))
+        pool.touch([pool.blocks[block_id] for block_id in pinned])
+        self._pinned_boundary_jobs[job_id] = (pinned, self._ctx.world_size)
+        return job_id, intent
+
+    def register_finished_partial_tail(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+        partial_tail_offloads: list[tuple[int, int, int]],
+    ) -> bool:
+        """Save a finish-time partial-tail state handed off by vLLM.
+
+        This is the fallback for requests that finish before their tail
+        boundary state went through the CoW hand-off (the state slot was
+        never re-touched after the tail chunk). The handed-off blocks are
+        pinned and saved as a boundary job flushed with the next step's
+        metadata, so the request's own block lifetime does not matter and
+        vLLM may free its references immediately (hence False).
+        """
+        if not (self._fine_tail and self._cache_groups.has_recurrent_state):
+            return False
+        if not partial_tail_offloads or self._gpu_block_pool is None:
+            return False
+        req_id = request.request_id
+        saved = self._saved_boundaries.setdefault(req_id, set())
+        loaded_tokens = self._external_matched_tokens.get(req_id, 0)
+        rows = self._boundary_rows(request, partial_tail_offloads, loaded_tokens, saved)
+        if not rows:
+            return False
+        # The request is finished; its dedup set serves no further purpose
+        # (and `_cleanup_request` may already have run, so re-create-then-pop
+        # here to avoid leaking an entry per finished request).
+        self._saved_boundaries.pop(req_id, None)
+        job_id, intent = self._emit_boundary_job(rows)
+        self._finished_tail_jobs[job_id] = intent
+        logger.info(
+            "[PegaKVConnector] req=%s finished_partial_tail_save job=%d boundaries=%s",
+            req_id,
+            job_id,
+            [(group_index, boundary) for group_index, boundary in saved],
+        )
+        return False
 
     def _release_boundary_jobs(self, completed: dict[int, int]) -> None:
         pool = self._gpu_block_pool
@@ -873,12 +1025,17 @@ class SchedulerConnector:
 
     def _consume_tail_save(self, req_id: str, written: int) -> SaveIntent | None:
         """P/D tail extension: save the prompt's partial tail block once its
-        prompt rows are final (the step scheduling the final prompt chunk).
+        covered prompt rows are final.
 
-        The saved page may contain rows past the prompt (the first generated
-        token lands in it on the next step, racing the async D2H) — harmless:
-        the key covers only the tail *prompt* tokens, and the decode peer
-        recomputes every position past them anyway.
+        The saved page may contain rows past the covered span (later prompt
+        chunks and the first generated token land in it, racing the async
+        D2H) — harmless: the key covers only the tail *prompt* tokens, and
+        the decode peer recomputes every position past them anyway.
+
+        With HMA only attention groups are saved here — positional reads of
+        recurrent groups would race their in-place state updates; the
+        recurrent state at the tail boundary arrives through vLLM's boundary
+        hand-off under the same key (`_consume_boundary_state_offloads`).
         """
         if not self._tail_save_enabled or req_id in self._tail_saved:
             return None
@@ -891,14 +1048,24 @@ class SchedulerConnector:
         if tail is None:
             return None
         tail_key, tail_len = tail
-        if written < prompt_len:
-            return None  # tail prompt rows not written yet
         tail_idx = prompt_len // vbs
+        if written < tail_idx * vbs + tail_len:
+            return None  # tail prompt rows not written yet
         allocated = self._allocated_blocks.get(req_id, [])
         block_hashes = self._block_hashes.get(req_id) or ()
+        # Recurrent/scratch group mirrors are not positionally trustworthy
+        # (align-mode tables null and relocate blocks); they are excluded
+        # from both the allocation check and the save rows.
+        non_positional = (
+            self._cache_groups.recurrent_group_indices | self._cache_groups.scratch_group_indices
+        )
         if (
             not allocated
-            or any(tail_idx >= len(group) for group in allocated)
+            or any(
+                tail_idx >= len(group)
+                for group_index, group in enumerate(allocated)
+                if group_index not in non_positional
+            )
             or tail_idx > len(block_hashes)
         ):
             return None  # tail block not allocated / full-block hashes lagging
@@ -911,11 +1078,16 @@ class SchedulerConnector:
             tail_key.hex(),
         )
         return SaveIntent(
-            block_ids_by_group=tuple((group[tail_idx],) for group in allocated),
+            block_ids_by_group=tuple(
+                (0,) if group_index in non_positional else (group[tail_idx],)
+                for group_index, group in enumerate(allocated)
+            ),
             block_hashes=(tail_key,),
         )
 
     def _derive_tail_block(self, request: "Request") -> tuple[bytes, int] | None:
+        if self._fine_tail:
+            return self._fine_tail_key(request)
         if self._tail_hash_fn is None:
             return None
         # The tail key carries no extra_keys. Reusing it for salted, LoRA, or
@@ -941,6 +1113,37 @@ class SchedulerConnector:
         tail_tokens = list(request.prompt_token_ids[tail_idx * vbs : prompt_len])
         tail_key = bytes(self._hash_block_tokens(self._tail_hash_fn, parent, tail_tokens, None))
         return tail_key, tail_len
+
+    def _fine_tail_key(self, request: "Request") -> tuple[bytes, int] | None:
+        """Prompt-tail key from vLLM's own fine-grained block hashes.
+
+        Returns ``(key, covered_tokens)``: the hash closing the prompt's last
+        full hash unit, and how many tail-block tokens that unit boundary
+        covers. The covered length is aligned DOWN to `hash_block_size`: the
+        key says nothing about the trailing sub-unit tokens, so a hit must
+        not claim them (a same-prefix peer may diverge right after the unit
+        boundary). With eagle-family speculation (MTP included) the tail
+        drops one more hash unit, mirroring vLLM's own tail registration.
+        """
+        vbs = self._ctx.virtual_block_size
+        hbs = self._ctx.hash_block_size
+        assert hbs is not None  # guaranteed by fine_tail_enabled
+        prompt_len = request.num_prompt_tokens
+        unit_count = prompt_len // hbs
+        if self._spec_drops_tail_unit:
+            # Mirror vLLM: eagle/MTP drafts consume the state at the last
+            # hash boundary, so the tail is registered one unit lower.
+            unit_count -= 1
+        tail_covered = unit_count * hbs - (prompt_len // vbs) * vbs
+        # vLLM must recompute the final prompt token to produce logits, so a
+        # covered span of one token cannot reduce local work.
+        if tail_covered <= 1:
+            return None
+        block_hashes = request.block_hashes
+        if unit_count > len(block_hashes):
+            # Fine hashes lag the prompt; the next scheduler step retries.
+            return None
+        return block_hashes[unit_count - 1], tail_covered
 
     def _build_query(
         self, request: "Request", computed_blocks: int
@@ -1147,6 +1350,7 @@ class SchedulerConnector:
         self._requests.pop(req_id, None)
         self._block_hashes.pop(req_id, None)
         self._external_matched_blocks.pop(req_id, None)
+        self._external_matched_tokens.pop(req_id, None)
         self._block_index_offsets.pop(req_id, None)
         self._allocated_blocks.pop(req_id, None)
         self._scheduled_tokens.pop(req_id, None)

@@ -60,7 +60,9 @@ class _FakePool:
             self.freed.append(block.block_id)
 
 
-def _make_scheduler(world_size: int = 1) -> tuple[SchedulerConnector, _FakePool]:
+def _make_scheduler(
+    world_size: int = 1, hash_block_size: int | None = None
+) -> tuple[SchedulerConnector, _FakePool]:
     ctx = ConnectorContext(
         instance_id="i",
         namespace="n",
@@ -71,6 +73,7 @@ def _make_scheduler(world_size: int = 1) -> tuple[SchedulerConnector, _FakePool]
         device_id=0,
         engine_client=MagicMock(),
         state_manager=MagicMock(),
+        hash_block_size=hash_block_size,
     )
     scheduler = SchedulerConnector(ctx)
     scheduler._cache_groups = SimpleNamespace(
@@ -382,6 +385,7 @@ def test_boundaries_inside_the_loaded_prefix_are_not_saved():
     scheduler, pool = _make_scheduler()
     _register_request(scheduler, "r1", 6)
     scheduler._external_matched_blocks["r1"] = 3  # blocks 0..2 came from the store
+    scheduler._external_matched_tokens["r1"] = 3 * VBS
 
     metadata = scheduler.build_connector_meta(
         _scheduler_output(
@@ -393,3 +397,76 @@ def test_boundaries_inside_the_loaded_prefix_are_not_saved():
         0: SaveIntent(block_ids_by_group=((0,), (24,)), block_hashes=(_hash(3),))
     }
     assert pool.touched == [24]
+
+
+HBS = 8  # fine hash unit: two units per scheduler block
+
+
+def _make_fine_scheduler() -> tuple[SchedulerConnector, _FakePool]:
+    return _make_scheduler(hash_block_size=HBS)
+
+
+def test_sub_block_boundary_offload_uses_the_fine_hash():
+    """With `--prefix-match-unit` hashing, vLLM hands off the prompt-tail
+    state block at a sub-block boundary; it is filed under the fine hash
+    closing that unit, so a peer can resume below block granularity."""
+    scheduler, pool = _make_fine_scheduler()
+    _register_request(scheduler, "r1", 6)  # 48 tokens = 6 units = 3 blocks
+
+    metadata = scheduler.build_connector_meta(
+        _scheduler_output({"r1": [(1, 21, 2 * VBS), (1, 25, VBS + HBS)]})
+    )
+
+    # Block boundary 32 keys on the block's closing unit hash; the sub-block
+    # boundary 24 keys on unit 24 // 8 - 1 = 2.
+    assert metadata.boundary_save_intents == {
+        0: SaveIntent(
+            block_ids_by_group=((0, 0), (21, 25)),
+            block_hashes=(_hash(3), _hash(2)),
+        )
+    }
+    assert pool.touched == [21, 25]
+
+    # A boundary aligned to neither granularity is dropped with a warning.
+    metadata = scheduler.build_connector_meta(_scheduler_output({"r1": [(1, 28, 20)]}))
+    assert metadata.boundary_save_intents == {}
+    assert 28 not in pool.touched
+
+
+def test_finished_partial_tail_is_pinned_and_flushed_next_step():
+    scheduler, pool = _make_fine_scheduler()
+    request = SimpleNamespace(
+        request_id="r1", num_tokens=48, block_hashes=[_hash(i) for i in range(6)]
+    )
+
+    accepted = scheduler.register_finished_partial_tail(request, ([], []), [(1, 26, 24)])
+
+    # The pin owns the block, so vLLM may free its references immediately.
+    assert accepted is False
+    assert pool.touched == [26]
+    assert scheduler.has_pending_push_work()
+
+    metadata = scheduler.build_connector_meta(_scheduler_output({}))
+    assert metadata.boundary_save_intents == {
+        0: SaveIntent(block_ids_by_group=((0,), (26,)), block_hashes=(_hash(2),))
+    }
+    assert scheduler._finished_tail_jobs == {}
+
+    scheduler.update_connector_output(
+        SimpleNamespace(
+            finished_sending=None,
+            kv_connector_worker_meta=PegaWorkerMetadata(completed_boundary_jobs={0: 1}),
+        )
+    )
+    assert pool.freed == [26]
+    assert not scheduler.has_pending_push_work()
+
+
+def test_finished_partial_tail_requires_fine_hma():
+    scheduler, pool = _make_scheduler()  # block-granularity hashing only
+    request = SimpleNamespace(
+        request_id="r1", num_tokens=48, block_hashes=[_hash(i) for i in range(6)]
+    )
+
+    assert scheduler.register_finished_partial_tail(request, ([], []), [(1, 26, 24)]) is False
+    assert pool.touched == []
