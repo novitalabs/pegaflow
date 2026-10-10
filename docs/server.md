@@ -67,5 +67,9 @@ pegaflow-server --metaserver-addr http://<metaserver-host>:50056
 ### Options
 
 - `--addr`: Bind address (default: `127.0.0.1:50056`)
+- `--http-addr`: HTTP address for health, Prometheus metrics, and manual cleanup (default: `0.0.0.0:9092`)
 - `--log-level`: Log level: `trace`, `debug`, `info`, `warn`, `error` (default: `info`)
-- `--ttl-minutes`: Cache entry TTL in minutes (default: `120`)
+- `--node-stale-secs`: Hide nodes from query after this many seconds without heartbeat (default: `30`)
+- `--ttl-minutes`: Delete nodes and their owners after this many minutes without node activity (default: `120`); does not expire blocks by registration age
+- `--sweep-interval-secs`: Run the lifecycle sweep at this interval (default: `600`)
+- `--min-reclaimable-owner-count`: Return a reclaim hint once this many live owners hold a block (default: `3`). Values below `3` make reclamation more aggressive; `1` hints on every newly registered owner. Overridable with `PEGAFLOW_METASERVER_MIN_RECLAIMABLE_OWNER_COUNT`, and the CLI flag takes precedence.

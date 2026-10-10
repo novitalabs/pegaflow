@@ -120,13 +120,6 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
 
     info!("Starting PegaFlow MetaServer");
     info!("Binding to address: {}", cli.addr);
-    info!(
-        "Node lifecycle: stale_after={}s manual_cleanup_age=1h sweep_interval={}s node_ttl_minutes={} min_reclaimable_owner_count={}",
-        cli.node_stale_secs,
-        cli.sweep_interval_secs,
-        cli.ttl_minutes,
-        cli.min_reclaimable_owner_count
-    );
     let ttl_secs = cli
         .ttl_minutes
         .checked_mul(60)
@@ -147,6 +140,14 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
+
+    info!(
+        "Node lifecycle: stale_after={}s manual_cleanup_age=1h sweep_interval={}s node_ttl_minutes={} min_reclaimable_owner_count={}",
+        cli.node_stale_secs,
+        cli.sweep_interval_secs,
+        cli.ttl_minutes,
+        cli.min_reclaimable_owner_count
+    );
 
     // Initialize metrics
     let (meter_provider, prometheus_registry) = init_metrics()?;
