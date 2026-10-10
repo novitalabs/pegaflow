@@ -10,21 +10,63 @@ use crate::metrics::{
     CACHE_RESIDENCE_REASON_PRESSURE, core_metrics,
 };
 
+/// Why a resident block moved from retained to reclaimable.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DemotionReason {
+    /// A peer finished copying the block from this node.
+    TransferRelease,
+    /// The MetaServer reported enough other owners at registration.
+    ReclaimHint,
+    /// The MetaServer reported a live backup owner for a reported candidate.
+    BackupHint,
+}
+
+impl DemotionReason {
+    fn attributes(self) -> &'static [opentelemetry::KeyValue] {
+        use crate::metrics::{DEMOTION_BACKUP_HINT, DEMOTION_RECLAIM_HINT, DEMOTION_TRANSFER};
+        match self {
+            Self::TransferRelease => &*DEMOTION_TRANSFER,
+            Self::ReclaimHint => &*DEMOTION_RECLAIM_HINT,
+            Self::BackupHint => &*DEMOTION_BACKUP_HINT,
+        }
+    }
+}
+
+/// Resident bytes per replacement class.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+struct ClassBytes {
+    reclaimable: u64,
+    retained: u64,
+}
+
 pub(crate) struct ReadCache {
     inner: Mutex<ReadCacheInner>,
+    capacity_bytes: u64,
 }
+
+/// Backup reporting starts once resident blocks fill this share of capacity.
+const BACKUP_REPORT_USAGE_PERCENT: u64 = 90;
+/// Target reclaimable share of capacity kept ready by decode backups.
+const BACKUP_RECLAIMABLE_PERCENT: u64 = 10;
 
 struct ReadCacheInner {
     cache: TinyLfuCache<BlockKey, Arc<SealedBlock>>,
     reclaimable: LruCache<BlockKey, ResidentMetadata>,
     retained: LruCache<BlockKey, ResidentMetadata>,
     next_generation: u64,
+    class_bytes: ClassBytes,
+    /// Pressure eviction has run since the last full cleanup. Allocator
+    /// fragmentation starts eviction well below full occupancy, so this, not
+    /// resident bytes alone, marks a cache that is effectively full.
+    pressured: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct ResidentMetadata {
     inserted_at: Instant,
     generation: u64,
+    /// Footprint at insertion, used for per-class byte accounting.
+    bytes: u64,
 }
 
 struct RemovedResident {
@@ -54,7 +96,10 @@ impl ReadCache {
                 reclaimable: LruCache::new_unbounded(),
                 retained: LruCache::new_unbounded(),
                 next_generation: 0,
+                class_bytes: ClassBytes::default(),
+                pressured: false,
             }),
+            capacity_bytes: capacity_bytes as u64,
         }
     }
 
@@ -191,6 +236,7 @@ impl ReadCache {
                     &mut removed,
                 );
             }
+            inner.pressured |= !removed.is_empty();
             removed
         };
         record_residence_durations(removed, &*CACHE_RESIDENCE_REASON_PRESSURE)
@@ -239,12 +285,25 @@ impl ReadCache {
             metrics
                 .cache_resident_blocks
                 .add(-retained_blocks, &*CACHE_CLASS_RETAINED);
+            let bytes = std::mem::take(&mut inner.class_bytes);
+            inner.pressured = false;
+            metrics
+                .cache_resident_bytes_by_class
+                .add(-(bytes.reclaimable as i64), &*CACHE_CLASS_RECLAIMABLE);
+            metrics
+                .cache_resident_bytes_by_class
+                .add(-(bytes.retained as i64), &*CACHE_CLASS_RETAINED);
             removed
         };
         record_residence_durations(removed, &*CACHE_RESIDENCE_REASON_CLEANUP)
     }
 
-    pub(crate) fn mark_reclaimable_hashes(&self, namespace: &str, hashes: &[Vec<u8>]) {
+    pub(crate) fn mark_reclaimable_hashes(
+        &self,
+        namespace: &str,
+        hashes: &[Vec<u8>],
+        reason: DemotionReason,
+    ) {
         if hashes.is_empty() {
             return;
         }
@@ -253,7 +312,7 @@ impl ReadCache {
             .iter()
             .map(|hash| BlockKey::new(namespace.to_string(), hash.clone()))
             .collect();
-        self.mark_reclaimable_keys(&keys);
+        self.mark_reclaimable_keys(&keys, reason);
     }
 
     pub(crate) fn mark_reclaimable_hashes_if_generation(
@@ -267,24 +326,18 @@ impl ReadCache {
         }
 
         let mut inner = self.inner.lock();
-        let mut moved = 0;
+        let mut moved = Demoted::default();
         for hash in hashes {
             let key = BlockKey::new(namespace.to_string(), hash.clone());
-            if let Some(&generation) = generations.get(hash)
-                && mark_reclaimable_with_generation(&mut inner, &key, Some(generation))
-            {
-                moved += 1;
+            if let Some(&generation) = generations.get(hash) {
+                moved.add(mark_reclaimable_with_generation(
+                    &mut inner,
+                    &key,
+                    Some(generation),
+                ));
             }
         }
-        if moved > 0 {
-            let metrics = core_metrics();
-            metrics
-                .cache_resident_blocks
-                .add(-moved, &*CACHE_CLASS_RETAINED);
-            metrics
-                .cache_resident_blocks
-                .add(moved, &*CACHE_CLASS_RECLAIMABLE);
-        }
+        moved.record(DemotionReason::ReclaimHint);
     }
 
     /// Move resident blocks to the reclaimable replacement class.
@@ -293,27 +346,55 @@ impl ReadCache {
     /// the exact blocks they exposed without reconstructing namespace/hash
     /// pairs. Missing blocks and blocks already in the reclaimable class are
     /// ignored.
-    pub(crate) fn mark_reclaimable_keys(&self, keys: &[BlockKey]) {
+    pub(crate) fn mark_reclaimable_keys(&self, keys: &[BlockKey], reason: DemotionReason) {
         if keys.is_empty() {
             return;
         }
 
         let mut inner = self.inner.lock();
-        let mut moved = 0;
+        let mut moved = Demoted::default();
         for key in keys {
-            if mark_reclaimable(&mut inner, key) {
-                moved += 1;
+            moved.add(mark_reclaimable_with_generation(&mut inner, key, None));
+        }
+        moved.record(reason);
+    }
+
+    /// Bytes of retained blocks to offer for decode backup right now.
+    ///
+    /// Zero until the cache is full: pressure eviction has run, or resident
+    /// blocks reach 90% of capacity. Then the gap between the reclaimable
+    /// class and its 10% watermark, so a node only asks for as much backup as
+    /// it needs to keep cheap eviction victims ready.
+    pub(crate) fn backup_report_budget(&self) -> u64 {
+        let inner = self.inner.lock();
+        backup_report_budget(self.capacity_bytes, inner.class_bytes, inner.pressured)
+    }
+
+    /// Oldest retained blocks, up to `max_bytes` / `max_blocks`, that only
+    /// the cache holds.
+    ///
+    /// These are the next retained blocks pressure eviction would take, so a
+    /// decode node copying them lets this node drop them first. Blocks pinned
+    /// by an in-flight load or transfer are skipped. Does not touch recency.
+    pub(crate) fn backup_candidates(
+        &self,
+        max_bytes: u64,
+        max_blocks: usize,
+    ) -> Vec<(BlockKey, u64)> {
+        let inner = self.inner.lock();
+        let mut candidates = Vec::new();
+        let mut total = 0u64;
+        for (key, metadata) in &inner.retained {
+            if total >= max_bytes || candidates.len() >= max_blocks {
+                break;
             }
+            if !inner.cache.is_cache_owned_only(key) {
+                continue;
+            }
+            total = total.saturating_add(metadata.bytes);
+            candidates.push((key.clone(), metadata.bytes));
         }
-        if moved > 0 {
-            let metrics = core_metrics();
-            metrics
-                .cache_resident_blocks
-                .add(-moved, &*CACHE_CLASS_RETAINED);
-            metrics
-                .cache_resident_blocks
-                .add(moved, &*CACHE_CLASS_RECLAIMABLE);
-        }
+        candidates
     }
 
     #[cfg(test)]
@@ -330,6 +411,11 @@ impl ReadCache {
     #[cfg(test)]
     pub(crate) fn remove_lru_batch_for_test(&self, batch_size: usize) {
         drop(self.remove_lru_batch(batch_size));
+    }
+
+    #[cfg(test)]
+    fn class_bytes(&self) -> ClassBytes {
+        self.inner.lock().class_bytes
     }
 
     #[cfg(test)]
@@ -364,12 +450,16 @@ fn insert_block(
                 ResidentMetadata {
                     inserted_at: Instant::now(),
                     generation,
+                    bytes: footprint_bytes,
                 },
             );
+            *class_bytes(inner, class) += footprint_bytes;
             let m = core_metrics();
             m.cache_block_insertions.add(1, &[]);
             m.cache_resident_bytes.add(footprint_bytes as i64, &[]);
             m.cache_resident_blocks.add(1, class.attributes());
+            m.cache_resident_bytes_by_class
+                .add(footprint_bytes as i64, class.attributes());
         }
         CacheInsertOutcome::AlreadyExists => refresh_recency(inner, &key),
         CacheInsertOutcome::Rejected => {
@@ -389,6 +479,62 @@ fn class_lru(
     }
 }
 
+fn backup_report_budget(capacity_bytes: u64, bytes: ClassBytes, pressured: bool) -> u64 {
+    let resident = bytes.reclaimable.saturating_add(bytes.retained);
+    if !pressured
+        && resident.saturating_mul(100) < capacity_bytes.saturating_mul(BACKUP_REPORT_USAGE_PERCENT)
+    {
+        return 0;
+    }
+    (capacity_bytes / 100 * BACKUP_RECLAIMABLE_PERCENT).saturating_sub(bytes.reclaimable)
+}
+
+fn class_bytes(inner: &mut ReadCacheInner, class: ResidentClass) -> &mut u64 {
+    match class {
+        ResidentClass::Reclaimable => &mut inner.class_bytes.reclaimable,
+        ResidentClass::Retained => &mut inner.class_bytes.retained,
+    }
+}
+
+/// Blocks and bytes moved by one demotion call.
+#[derive(Default)]
+struct Demoted {
+    blocks: u64,
+    bytes: u64,
+}
+
+impl Demoted {
+    fn add(&mut self, moved: Option<u64>) {
+        if let Some(bytes) = moved {
+            self.blocks += 1;
+            self.bytes += bytes;
+        }
+    }
+
+    fn record(self, reason: DemotionReason) {
+        if self.blocks == 0 {
+            return;
+        }
+        let metrics = core_metrics();
+        let (blocks, bytes) = (self.blocks as i64, self.bytes as i64);
+        metrics
+            .cache_resident_blocks
+            .add(-blocks, &*CACHE_CLASS_RETAINED);
+        metrics
+            .cache_resident_blocks
+            .add(blocks, &*CACHE_CLASS_RECLAIMABLE);
+        metrics
+            .cache_resident_bytes_by_class
+            .add(-bytes, &*CACHE_CLASS_RETAINED);
+        metrics
+            .cache_resident_bytes_by_class
+            .add(bytes, &*CACHE_CLASS_RECLAIMABLE);
+        metrics
+            .cache_class_demotions
+            .add(self.blocks, reason.attributes());
+    }
+}
+
 fn refresh_recency(inner: &mut ReadCacheInner, key: &BlockKey) {
     let classified = inner.reclaimable.get(key).is_some() || inner.retained.get(key).is_some();
     debug_assert!(
@@ -397,33 +543,32 @@ fn refresh_recency(inner: &mut ReadCacheInner, key: &BlockKey) {
     );
 }
 
-fn mark_reclaimable(inner: &mut ReadCacheInner, key: &BlockKey) -> bool {
-    mark_reclaimable_with_generation(inner, key, None)
-}
-
+/// Move one retained resident to reclaimable; returns its bytes when moved.
 fn mark_reclaimable_with_generation(
     inner: &mut ReadCacheInner,
     key: &BlockKey,
     expected_generation: Option<u64>,
-) -> bool {
+) -> Option<u64> {
     if !inner.cache.contains_key(key) {
-        return false;
+        return None;
     }
     if let Some(expected_generation) = expected_generation {
         match inner.retained.peek(key) {
             Some(metadata) if metadata.generation == expected_generation => {}
-            _ => return false,
+            _ => return None,
         }
     }
     if let Some(metadata) = inner.retained.remove(key) {
+        inner.class_bytes.retained -= metadata.bytes;
+        inner.class_bytes.reclaimable += metadata.bytes;
         inner.reclaimable.insert(key.clone(), metadata);
-        true
+        Some(metadata.bytes)
     } else {
         debug_assert!(
             inner.reclaimable.contains_key(key),
             "resident block is missing its replacement class"
         );
-        false
+        None
     }
 }
 
@@ -437,8 +582,12 @@ fn remove_lru(inner: &mut ReadCacheInner, class: ResidentClass) -> Option<Remove
         let Some(block) = block else {
             continue;
         };
+        *class_bytes(inner, class) -= metadata.bytes;
         let metrics = core_metrics();
         metrics.cache_resident_blocks.add(-1, class.attributes());
+        metrics
+            .cache_resident_bytes_by_class
+            .add(-(metadata.bytes as i64), class.attributes());
         metrics
             .cache_block_evictions_by_class
             .add(1, class.attributes());
@@ -553,6 +702,89 @@ mod tests {
         };
         metadata.inserted_at = inserted_at;
         inserted_at
+    }
+
+    #[tokio::test]
+    async fn backup_candidates_follow_retained_tail_and_watermark() {
+        use crate::block::{RawBlock, Segment};
+        use crate::storage::{StorageConfig, StorageEngine};
+        use std::num::NonZeroU64;
+
+        const BLOCK: u64 = 100;
+        let engine =
+            StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]).unwrap();
+        let sized_block = || {
+            let alloc = engine
+                .allocate(NonZeroU64::new(BLOCK).unwrap(), None)
+                .expect("test pool should have space");
+            let ptr = alloc.as_non_null();
+            Arc::new(SealedBlock::from_slots(vec![(
+                RawBlock::new(vec![Segment::new(ptr, BLOCK as usize, alloc)]),
+                pegaflow_common::NumaNode::UNKNOWN,
+            )]))
+        };
+        // Ten 100-byte blocks fill a 1000-byte cache.
+        let cache = ReadCache::new(1000, false, None);
+        let keys: Vec<BlockKey> = (0..10u8)
+            .map(|i| BlockKey::new("ns".into(), vec![i]))
+            .collect();
+        let pinned = sized_block();
+        for (i, key) in keys.iter().enumerate() {
+            let block = if i == 1 {
+                Arc::clone(&pinned)
+            } else {
+                sized_block()
+            };
+            cache.insert_retained_for_test(key.clone(), block);
+        }
+        assert_eq!(
+            cache.class_bytes(),
+            ClassBytes {
+                reclaimable: 0,
+                retained: 1000
+            }
+        );
+
+        // Full and nothing reclaimable: ask for the 10% watermark.
+        assert_eq!(cache.backup_report_budget(), 100);
+        // Oldest first; the block pinned by a load or transfer is skipped.
+        let hashes = |candidates: Vec<(BlockKey, u64)>| -> Vec<Vec<u8>> {
+            candidates.into_iter().map(|(key, _)| key.hash).collect()
+        };
+        assert_eq!(
+            hashes(cache.backup_candidates(250, usize::MAX)),
+            [vec![0], vec![2], vec![3]]
+        );
+        assert_eq!(
+            hashes(cache.backup_candidates(u64::MAX, 2)),
+            [vec![0], vec![2]]
+        );
+
+        cache.mark_reclaimable_keys(&keys[..1], DemotionReason::BackupHint);
+        assert_eq!(
+            cache.class_bytes(),
+            ClassBytes {
+                reclaimable: 100,
+                retained: 900
+            }
+        );
+        // Watermark met: nothing to report.
+        assert_eq!(cache.backup_report_budget(), 0);
+
+        drop(pinned);
+        cache.remove_lru_batch_for_test(2);
+        assert_eq!(
+            cache.class_bytes(),
+            ClassBytes {
+                reclaimable: 0,
+                retained: 900 - BLOCK
+            }
+        );
+        // Pressure eviction ran, so the cache counts as full below 90%.
+        assert_eq!(cache.backup_report_budget(), 100);
+        drop(cache.remove_all());
+        assert_eq!(cache.class_bytes(), ClassBytes::default());
+        assert_eq!(cache.backup_report_budget(), 0);
     }
 
     #[test]
@@ -728,7 +960,11 @@ mod tests {
         cache.batch_insert(vec![(key.clone(), make_block())]);
         let inserted_at = backdate_resident(&cache, &key, Duration::from_secs(60));
 
-        cache.mark_reclaimable_hashes("ns", std::slice::from_ref(&key.hash));
+        cache.mark_reclaimable_hashes(
+            "ns",
+            std::slice::from_ref(&key.hash),
+            DemotionReason::ReclaimHint,
+        );
 
         assert_eq!(
             resident_metadata(&cache, &key).unwrap().inserted_at,
@@ -788,7 +1024,11 @@ mod tests {
             (other_namespace.clone(), make_block()),
         ]);
         cache.batch_insert_resident_keys(vec![(reclaimable.clone(), make_block())]);
-        cache.mark_reclaimable_hashes("ns", &[vec![1], vec![2], vec![3]]);
+        cache.mark_reclaimable_hashes(
+            "ns",
+            &[vec![1], vec![2], vec![3]],
+            DemotionReason::ReclaimHint,
+        );
 
         assert_class(&cache, &retained, ResidentClass::Reclaimable);
         assert_class(&cache, &reclaimable, ResidentClass::Reclaimable);
@@ -802,7 +1042,7 @@ mod tests {
         cache.batch_insert(vec![(key.clone(), make_block())]);
         cache.remove_lru_batch(1);
 
-        cache.mark_reclaimable_hashes("ns", &[key.hash]);
+        cache.mark_reclaimable_hashes("ns", &[key.hash], DemotionReason::ReclaimHint);
 
         assert!(cache.remove_lru_batch(1).is_empty());
     }

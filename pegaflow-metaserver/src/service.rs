@@ -1,8 +1,10 @@
+use crate::backup::{BackupPlanner, CandidateGroup};
 use crate::metric::record_rpc_result;
 use crate::proto::engine::meta_server_server::MetaServer;
 use crate::proto::engine::{
-    FetchSegment, HeartbeatNodeRequest, HeartbeatNodeResponse, InsertBlockHashesRequest,
-    InsertBlockHashesResponse, QueryPrefixBlocksRequest, QueryPrefixBlocksResponse,
+    BackupCandidates, FetchSegment, HeartbeatNodeRequest, HeartbeatNodeResponse,
+    InsertBlockHashesRequest, InsertBlockHashesResponse, PullBackupPlanRequest,
+    PullBackupPlanResponse, QueryPrefixBlocksRequest, QueryPrefixBlocksResponse,
     RemoveBlockHashesRequest, RemoveBlockHashesResponse, ResponseStatus, UnregisterNodeRequest,
     UnregisterNodeResponse,
 };
@@ -59,11 +61,63 @@ fn plan_fetch_segments(
 #[derive(Clone)]
 pub struct GrpcMetaService {
     store: Arc<BlockHashStore>,
+    /// Decode-node backup planner; `None` keeps backup disabled.
+    backup: Option<Arc<BackupPlanner>>,
 }
 
 impl GrpcMetaService {
     pub fn new(store: Arc<BlockHashStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            backup: None,
+        }
+    }
+
+    pub fn with_backup(store: Arc<BlockHashStore>, backup: Arc<BackupPlanner>) -> Self {
+        Self {
+            store,
+            backup: Some(backup),
+        }
+    }
+
+    /// Apply the backup side of a heartbeat: record the instance state, then
+    /// refresh the source's candidates or drop them when it is not a source.
+    fn backup_heartbeat(
+        &self,
+        req: HeartbeatNodeRequest,
+        node_id: Uuid,
+        response: &mut HeartbeatNodeResponse,
+    ) {
+        self.store
+            .set_node_has_instance(&req.node, node_id, req.has_instance);
+        let Some(planner) = &self.backup else {
+            return;
+        };
+        response.backup_enabled = true;
+        let roles = planner.roles(&self.store);
+        response.backup_target = roles.targets.iter().any(|n| n.as_ref() == req.node);
+        if !req.has_instance {
+            planner.forget_source(&req.node);
+            return;
+        }
+        let groups = req
+            .backup_candidates
+            .into_iter()
+            .map(|group| CandidateGroup {
+                namespace: group.namespace,
+                block_bytes: group.block_bytes,
+                hashes: group.block_hashes,
+            })
+            .collect();
+        response.backed_hashes = planner
+            .report(&self.store, &roles, &req.node, groups)
+            .into_iter()
+            .map(|group| BackupCandidates {
+                namespace: group.namespace,
+                block_hashes: group.hashes,
+                block_bytes: group.block_bytes,
+            })
+            .collect();
     }
 
     fn ok_status() -> ResponseStatus {
@@ -107,12 +161,54 @@ impl MetaServer for GrpcMetaService {
             self.store
                 .heartbeat_node(&req.node, node_id)
                 .map_err(Self::store_error_status)?;
-            Ok(Response::new(HeartbeatNodeResponse {
+            let mut response = HeartbeatNodeResponse {
                 stale_after_secs: self.store.config().node_stale_after.as_secs(),
-            }))
+                ..HeartbeatNodeResponse::default()
+            };
+            self.backup_heartbeat(req, node_id, &mut response);
+            Ok(Response::new(response))
         }
         .await;
         record_rpc_result("heartbeat_node", &result, start);
+        result
+    }
+
+    async fn pull_backup_plan(
+        &self,
+        request: Request<PullBackupPlanRequest>,
+    ) -> Result<Response<PullBackupPlanResponse>, Status> {
+        let start = Instant::now();
+        let req = request.into_inner();
+        let result = async {
+            let node_id = Self::parse_node_id(&req.node_id)?;
+            self.store
+                .touch_node(&req.node, node_id)
+                .map_err(Self::store_error_status)?;
+            let Some(planner) = &self.backup else {
+                return Ok(Response::new(PullBackupPlanResponse::default()));
+            };
+            let roles = planner.roles(&self.store);
+            let plan = planner.plan(&self.store, &roles, &req.node, req.max_bytes);
+            let response = plan
+                .map(|plan| {
+                    debug!(
+                        "RPC [pull_backup_plan]: target={} source={} namespace={} blocks={}",
+                        req.node,
+                        plan.source,
+                        plan.namespace,
+                        plan.hashes.len()
+                    );
+                    PullBackupPlanResponse {
+                        source_node: plan.source.to_string(),
+                        namespace: plan.namespace,
+                        block_hashes: plan.hashes,
+                    }
+                })
+                .unwrap_or_default();
+            Ok(Response::new(response))
+        }
+        .await;
+        record_rpc_result("pull_backup_plan", &result, start);
         result
     }
 
@@ -317,6 +413,20 @@ impl MetaServer for GrpcMetaService {
 
         let segments =
             plan_fetch_segments(&existing, &req.exclude_node).map_err(Status::invalid_argument)?;
+        if let Some(planner) = &self.backup
+            && !segments.is_empty()
+        {
+            let targets = planner.roles(&self.store).targets;
+            for segment in &segments {
+                if targets.iter().any(|t| t.as_ref() == segment.node) {
+                    planner.record_recall(
+                        &req.exclude_node,
+                        &segment.node,
+                        u64::from(segment.block_count),
+                    );
+                }
+            }
+        }
 
         let result = Ok(Response::new(QueryPrefixBlocksResponse { segments }));
         record_rpc_result("query_prefix_blocks", &result, start);
@@ -338,6 +448,7 @@ mod tests {
         svc.heartbeat_node(Request::new(HeartbeatNodeRequest {
             node: node.into(),
             node_id: node_id.clone(),
+            ..HeartbeatNodeRequest::default()
         }))
         .await
         .unwrap();
@@ -486,6 +597,7 @@ mod tests {
             .heartbeat_node(Request::new(HeartbeatNodeRequest {
                 node: "node-a".into(),
                 node_id,
+                ..HeartbeatNodeRequest::default()
             }))
             .await
             .unwrap()
@@ -505,6 +617,7 @@ mod tests {
             .heartbeat_node(Request::new(HeartbeatNodeRequest {
                 node: "node-a".into(),
                 node_id: new_id,
+                ..HeartbeatNodeRequest::default()
             }))
             .await
             .unwrap_err();

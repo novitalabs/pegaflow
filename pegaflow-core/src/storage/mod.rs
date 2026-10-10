@@ -1,3 +1,5 @@
+#[cfg(feature = "rdma")]
+mod backup;
 mod prefetch;
 mod read_cache;
 mod tier_attribution;
@@ -17,14 +19,14 @@ use crate::backing::{RdmaFetchStore, RdmaTransport};
 use crate::block::{BlockKey, PrefetchStatus, SealedBlock};
 use crate::internode::MetaServerClient;
 use crate::internode::metaserver_client::MetaServerClientConfig;
-use crate::metrics::core_metrics;
+use crate::metrics::{SERVED_ROLE_BACKUP_TARGET, SERVED_ROLE_SOURCE, core_metrics};
 use crate::pinned_pool::{PinnedAllocation, PinnedAllocator};
 use pegaflow_common::NumaNode;
 
 use prefetch::PrefetchScheduler;
 #[cfg(feature = "rdma")]
 use prefetch::RdmaFetch;
-pub(crate) use read_cache::ReadCache;
+pub(crate) use read_cache::{DemotionReason, ReadCache};
 use write_path::{InsertDeps, WritePipeline};
 
 // Each reclaim iteration emits one MetaServer removal command; a small batch
@@ -213,19 +215,30 @@ impl StorageEngine {
                 .map(|cfg| crate::backing::new_ssd(cfg, allocate_fn.clone(), is_numa));
 
             #[cfg(feature = "rdma")]
-            let rdma_fetch = rdma_transport.as_ref().and_then(|rdma| {
+            let rdma_fetch_store = rdma_transport.as_ref().and_then(|rdma| {
                 let ms = metaserver_client.as_ref()?;
                 let advertise = config
                     .advertise_addr
                     .clone()
                     .unwrap_or_else(|| "127.0.0.1:50055".to_string());
-                Some(RdmaFetch::new(Arc::new(RdmaFetchStore::new(
+                Some(Arc::new(RdmaFetchStore::new(
                     Arc::clone(ms),
                     Arc::clone(rdma),
                     allocate_fn.clone(),
                     advertise,
-                ))))
+                )))
             });
+            #[cfg(feature = "rdma")]
+            if let (Some(store), Some(ms)) = (&rdma_fetch_store, &metaserver_client) {
+                // Idle until the MetaServer names this node a backup target.
+                tokio::spawn(backup::backup_loop(
+                    Arc::downgrade(&read_cache),
+                    Arc::clone(store),
+                    Arc::clone(ms),
+                ));
+            }
+            #[cfg(feature = "rdma")]
+            let rdma_fetch = rdma_fetch_store.map(RdmaFetch::new);
             #[cfg(not(feature = "rdma"))]
             let rdma_fetch = None;
 
@@ -537,6 +550,13 @@ impl StorageEngine {
         }
 
         if freed_blocks > 0 {
+            // Eviction is eating into retained blocks once reclaimable drops
+            // below its watermark; ask decode backups to refill it early.
+            if let Some(client) = &self.metaserver_client
+                && self.read_cache.backup_report_budget() > 0
+            {
+                client.request_backup_refill();
+            }
             debug!(
                 "Reclaimed cache blocks toward allocator request: \
                  freed_blocks={} freed_bytes={} largest_free={} required={}",
@@ -612,12 +632,35 @@ impl StorageEngine {
     ///
     /// Source copies are demoted only after the requester reports a completed
     /// transfer; failed, cancelled, and expired sessions keep their class.
+    /// A decode backup target keeps its copies retained: serving them back to
+    /// prefill nodes is its job, and demoting would turn it into an LRU tier.
     pub(crate) fn release_transfer_lock(&self, session_id: &str, transferred: bool) -> usize {
         let keys = self.transfer_lock.release(session_id);
-        if transferred {
-            self.read_cache.mark_reclaimable_keys(&keys);
+        if transferred && !keys.is_empty() {
+            let backup_target = self
+                .metaserver_client
+                .as_ref()
+                .is_some_and(|client| client.is_backup_target());
+            let role = if backup_target {
+                &*SERVED_ROLE_BACKUP_TARGET
+            } else {
+                self.read_cache
+                    .mark_reclaimable_keys(&keys, DemotionReason::TransferRelease);
+                &*SERVED_ROLE_SOURCE
+            };
+            core_metrics()
+                .transfer_served_blocks
+                .add(keys.len() as u64, role);
         }
         keys.len()
+    }
+
+    /// Tell the MetaServer whether this node serves an inference instance;
+    /// it decides the decode backup role from this.
+    pub(crate) fn set_has_instance(&self, has_instance: bool) {
+        if let Some(client) = &self.metaserver_client {
+            client.set_has_instance(has_instance);
+        }
     }
 
     /// GC expired transfer lock sessions. Returns the number of sessions expired.
