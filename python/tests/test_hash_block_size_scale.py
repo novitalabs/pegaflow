@@ -179,6 +179,109 @@ def test_fine_tail_excludes_sub_unit_remainder():
     assert tail_tokens == 128
 
 
+def test_fine_tail_skipped_when_clamp_would_eat_it():
+    # A tail of exactly one hash unit ending exactly at the prompt end can
+    # never be claimed: the final token is always recomputed and the hit is
+    # floored to whole units, stripping the tail. Querying it anyway would
+    # lease a block the load cannot use (leased/load block mismatch).
+    req = _request("r1", 4 * VBS + HASH_BLOCK)  # 6272 = 49 units exactly
+    assert _scheduler()._build_query(req, 0) == (tuple(_key(i) for i in range(4)), 0)
+
+    # One token past the unit boundary makes the tail claimable again.
+    req = _request("r2", 4 * VBS + HASH_BLOCK + 1)
+    keys, tail_tokens = _scheduler()._build_query(req, 0)
+    assert keys == tuple(_key(i) for i in range(4)) + (_hash(48),)
+    assert tail_tokens == HASH_BLOCK
+
+
+def test_clamped_fine_tail_shrinks_the_block_hit():
+    # Safety net behind the query-side guard: if a clamped/floored hit no
+    # longer covers the tail block, hit_blocks must shrink to what the load
+    # fills (surplus leases stay pinned as None targets), otherwise
+    # update_state_after_alloc raises a leased-block mismatch.
+    scheduler = _scheduler()
+    req = _request("r1", 2 * VBS + HASH_BLOCK)  # 3200 tokens, unit-aligned end
+    probe = _QueryProbe(
+        computed_blocks=0,
+        query_hashes=(_key(0), _key(1), _hash(24)),
+        tail_tokens=HASH_BLOCK,
+        hit_blocks=3,
+        leased_blocks=3,
+    )
+    hit_tokens, _ = scheduler._finish_cache_lookup(
+        req_id="r1", num_tokens=req.num_tokens, probe=probe, lookup_us=None, reused=False
+    )
+    assert hit_tokens == 2 * VBS  # 3200 clamped to 3199, floored to 3072
+    assert probe.hit_blocks == 2
+    assert scheduler._external_matched_blocks["r1"] == 2
+    assert scheduler._external_matched_tokens["r1"] == 2 * VBS
+
+
+def test_fine_tail_opt_out():
+    # pegaflow.fine_tail=false keeps block-granularity caching but never
+    # queries or saves a partial tail.
+    ctx = ConnectorContext(
+        instance_id="i",
+        namespace="n",
+        block_size=VBS,
+        tp_size=1,
+        world_size=1,
+        tp_rank=0,
+        device_id=0,
+        engine_client=MagicMock(),
+        state_manager=MagicMock(),
+        hash_block_size=HASH_BLOCK,
+        fine_tail=False,
+    )
+    assert not ctx.fine_tail_enabled
+    scheduler = SchedulerConnector(ctx)
+    assert scheduler._build_query(_request("r1", 4 * VBS + 300), 0) == (
+        tuple(_key(i) for i in range(4)),
+        0,
+    )
+
+
+def test_residual_pd_tail_flags_warn_instead_of_raising_with_fine_hma(monkeypatch):
+    # A hybrid model on --prefix-match-unit with leftover pd_tail_save flags:
+    # fine tailing supersedes them, so warn and continue instead of failing
+    # startup with "not supported with HMA".
+    import pegaflow.connector.scheduler as scheduler_mod
+
+    monkeypatch.setattr(
+        scheduler_mod.CacheGroupLayout,
+        "from_config",
+        staticmethod(
+            lambda cfg: SimpleNamespace(
+                group_count=2,
+                hash_group_index=0,
+                has_recurrent_state=True,
+                recurrent_group_indices=frozenset({1}),
+                scratch_group_indices=frozenset(),
+            )
+        ),
+    )
+    scheduler = _scheduler_with_pd_tail()
+    assert scheduler._fine_tail is True
+    assert scheduler._tail_save_enabled is True  # via fine mode
+    assert scheduler._tail_hash_fn is None  # derived scheme not armed
+
+
+def _scheduler_with_pd_tail() -> SchedulerConnector:
+    ctx = ConnectorContext(
+        instance_id="i",
+        namespace="n",
+        block_size=VBS,
+        tp_size=1,
+        world_size=1,
+        tp_rank=0,
+        device_id=0,
+        engine_client=MagicMock(),
+        state_manager=MagicMock(),
+        hash_block_size=HASH_BLOCK,
+    )
+    return SchedulerConnector(ctx, pd_tail_save=True, pd_tail_load=True)
+
+
 def test_fine_tail_shifts_one_unit_under_eagle_spec():
     # Eagle-family speculation (MTP included) drafts from the state at the
     # prompt's last hash boundary, so vLLM registers the recurrent tail one
@@ -196,9 +299,7 @@ def test_fine_tail_shifts_one_unit_under_eagle_spec():
         state_manager=MagicMock(),
         hash_block_size=HASH_BLOCK,
     )
-    vllm_config = SimpleNamespace(
-        speculative_config=SimpleNamespace(use_eagle=lambda: True)
-    )
+    vllm_config = SimpleNamespace(speculative_config=SimpleNamespace(use_eagle=lambda: True))
     scheduler = SchedulerConnector(ctx, vllm_config=vllm_config)
 
     # 6444 tokens = 50 full units; with the shift the tail key closes unit 49,
@@ -228,9 +329,7 @@ def test_fine_tail_not_shifted_for_non_eagle_spec():
         state_manager=MagicMock(),
         hash_block_size=HASH_BLOCK,
     )
-    vllm_config = SimpleNamespace(
-        speculative_config=SimpleNamespace(use_eagle=lambda: False)
-    )
+    vllm_config = SimpleNamespace(speculative_config=SimpleNamespace(use_eagle=lambda: False))
     scheduler = SchedulerConnector(ctx, vllm_config=vllm_config)
     req = _request("r1", 4 * VBS + 300)
     assert scheduler._build_query(req, 0) == (

@@ -147,6 +147,8 @@ class ConnectorContext:
     # Token span of one `Request.block_hashes` entry; `None` means one per
     # scheduler block.
     hash_block_size: int | None = None
+    # Opt-out for fine-grained (`--prefix-match-unit`) tail caching.
+    fine_tail: bool = True
 
     @property
     def read_enabled(self) -> bool:
@@ -175,12 +177,18 @@ class ConnectorContext:
 
     @property
     def fine_tail_enabled(self) -> bool:
-        """vLLM hashes below block granularity (`--prefix-match-unit`).
+        """vLLM hashes below block granularity (`--prefix-match-unit`) and the
+        connector is allowed to cache the prompt's partial tail
+        (`pegaflow.fine_tail`, on by default).
 
         The prompt's partial tail can then be keyed by vLLM's own fine hash
         instead of a connector-derived one.
         """
-        return self.hash_block_size is not None and self.hash_block_size < self.virtual_block_size
+        return (
+            self.fine_tail
+            and self.hash_block_size is not None
+            and self.hash_block_size < self.virtual_block_size
+        )
 
     @property
     def effective_tp_rank(self) -> int:
@@ -630,7 +638,6 @@ def derive_namespace(
     pcp_world_size: int = 1,
     cross_layer_blocks: bool = False,
     hash_block_size: int | None = None,
-    tail_scheme: str | None = None,
 ) -> str:
     """
     Derive namespace for storage isolation.
@@ -650,9 +657,10 @@ def derive_namespace(
       cache layouts can share one logical block namespace.
     - `hash_block_size` / `block_size`: decide which chained hash keys a block
       and how many tokens it spans; `mamba_*`: recurrent state layout.
-    - `tail_scheme`: how a partial prompt tail is keyed (`"vllm"` fine hash vs
-      connector-`"derived"`); the schemes produce different keys for the same
-      tail, so they must not share a namespace.
+
+    The tail-keying scheme is deliberately NOT a factor: tail keys never alias
+    full-block keys, so splitting the namespace over it would only sever
+    full-block sharing between nodes with different tail settings.
     """
     model_config = vllm_config.model_config
     cache_config = vllm_config.cache_config
@@ -673,7 +681,6 @@ def derive_namespace(
         "cross_layer_blocks": cross_layer_blocks,
         "mla_layer_split_kv_cache": bool(additional_config.get("mla_layer_split_kv_cache", False)),
         "hash_block_size": hash_block_size,
-        "tail_scheme": tail_scheme,
         "block_size": getattr(cache_config, "block_size", None),
         "mamba_cache_mode": getattr(cache_config, "mamba_cache_mode", None),
         "mamba_ssm_cache_dtype": getattr(cache_config, "mamba_ssm_cache_dtype", None),

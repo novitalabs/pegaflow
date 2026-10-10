@@ -139,13 +139,15 @@ class SchedulerConnector:
         self._tp_shard_client = TpShardQueryClient(engine_clients)
         self._cache_groups = CacheGroupLayout.from_config(kv_cache_config)
         fine_tail = context.fine_tail_enabled
-        if self._cache_groups.has_recurrent_state and (pd_tail_save or pd_tail_load):
-            raise ValueError("P/D tail-block caching is not supported with HMA")
         if fine_tail and (pd_tail_save or pd_tail_load):
             logger.warning(
                 "[PegaKVConnector] pegaflow.pd_tail_save/pd_tail_load are superseded by "
                 "prefix_match_unit: tail keys come from vLLM's own fine-grained hashes"
             )
+            pd_tail_save = False
+            pd_tail_load = False
+        if self._cache_groups.has_recurrent_state and (pd_tail_save or pd_tail_load):
+            raise ValueError("P/D tail-block caching is not supported with HMA")
         self._gpu_block_pool = None
 
         # Partial tail-block caching: a prompt's partial tail block is saved
@@ -262,6 +264,10 @@ class SchedulerConnector:
         # Finish-time partial-tail jobs (register_finished_partial_tail),
         # flushed into the next step's boundary_save_intents.
         self._finished_tail_jobs: dict[int, SaveIntent] = {}
+        # (loaded_tokens, saved_boundaries) stashed at cleanup for requests
+        # whose finish-time tail hand-off arrives after their state was torn
+        # down (the vLLM hook order is not a stable API). Bounded FIFO.
+        self._finished_tail_stash: dict[str, tuple[int, set[tuple[int, int]]]] = {}
 
     def bind_gpu_block_pool(self, gpu_block_pool) -> None:
         self._gpu_block_pool = gpu_block_pool
@@ -537,14 +543,26 @@ class SchedulerConnector:
             probe.hit_blocks = hit_blocks
             probe.recurrent_hold = replace(probe.recurrent_hold, checkpoint=checkpoint)
 
-        # Cacheable tails contain at least two tokens, so recomputing the final
-        # prompt token cannot remove the last leased block from the load.
+        if hit_tokens <= 0:
+            # The clamp/floor ate the whole hit; trim to zero blocks so the
+            # lease check below cannot mismatch, then fall through to the
+            # shared release path.
+            hit_blocks = 0
+            probe.hit_blocks = 0
+
         loaded_blocks = (hit_tokens + vbs - 1) // vbs
+        if loaded_blocks < hit_blocks:
+            # Fine mode floors the hit to whole hash units, which can eat the
+            # tail block entirely (a one-unit tail ends inside the clamped
+            # token's unit). Trim the hit to the blocks the load will fill;
+            # surplus leases stay pinned and are addressed as None targets.
+            hit_blocks = loaded_blocks
+            probe.hit_blocks = loaded_blocks
         self._external_matched_blocks[req_id] = computed_blocks + loaded_blocks
         self._external_matched_tokens[req_id] = locally_computed_tokens + hit_tokens
 
-        # Recompute after the recurrent fallback: it may have shrunk the hit
-        # below the tail boundary.
+        # Recompute after the recurrent fallback and the clamp/floor trim:
+        # both may have shrunk the hit below the tail boundary.
         tail_hit = probe.tail_tokens > 0 and hit_blocks == len(probe.query_hashes)
 
         if reused:
@@ -797,13 +815,14 @@ class SchedulerConnector:
         tokens, committed by this step's forward. The state is filed under
         the request hash ending at that boundary. Whole-block boundaries key
         on the closing block hash; with fine hashing (`--prefix-match-unit`)
-        a sub-block boundary (the prompt's partial tail, materialized and
-        CoW-preserved by vLLM) keys on the closing hash unit instead.
+        only the prompt's own tail boundary keys on the closing hash unit —
+        other sub-block boundaries (prefill chunk ends) are dropped because
+        the query side never probes them.
 
         Every committed boundary is handed off, so a request contributes a
-        resume point at each prefill chunk end, at its junction with a shared
-        prefix, and at each block it crosses while decoding — not just one
-        at request end.
+        resume point at each block-aligned prefill chunk end, at its junction
+        with a shared prefix, and at each block it crosses while decoding —
+        not just one at request end.
         """
         if not self._cache_groups.has_recurrent_state:
             return {}
@@ -869,6 +888,16 @@ class SchedulerConnector:
         block_hashes: tuple[bytes, ...] | None = None
         unit_hashes: tuple[bytes, ...] | None = None
         rows: list[tuple[int, int, bytes]] = []
+        # The query side only ever probes full-block keys plus the prompt's
+        # own tail key, so the only sub-block boundary worth saving is the
+        # tail's; any other (e.g. a prefill chunk end) would be stored but
+        # never queried. `_fine_tail_key` returns None exactly when this
+        # request has no claimable tail, which then drops every sub-block
+        # hand-off.
+        tail = self._fine_tail_key(request) if self._fine_tail and hbs is not None else None
+        tail_boundary = (
+            (request.num_prompt_tokens // vbs) * vbs + tail[1] if tail is not None else None
+        )
         for group_index, block_id, boundary_tokens in entries:
             if group_index not in recurrent or block_id <= 0 or boundary_tokens <= 0:
                 continue
@@ -877,11 +906,13 @@ class SchedulerConnector:
                     block_hashes = self._request_block_hashes(request)
                 index = boundary_tokens // vbs - 1
                 hashes = block_hashes
-            elif self._fine_tail and hbs is not None and boundary_tokens % hbs == 0:
+            elif tail_boundary is not None and boundary_tokens == tail_boundary:
                 if unit_hashes is None:
                     unit_hashes = self._request_unit_hashes(request)
                 index = boundary_tokens // hbs - 1
                 hashes = unit_hashes
+            elif self._fine_tail and hbs is not None and boundary_tokens % hbs == 0:
+                continue  # unit-aligned but not the prompt tail: never queried
             else:
                 logger.warning(
                     "[PegaKVConnector] req=%s dropping unaligned boundary hand-off: "
@@ -943,8 +974,17 @@ class SchedulerConnector:
         if not partial_tail_offloads or self._gpu_block_pool is None:
             return False
         req_id = request.request_id
-        saved = self._saved_boundaries.setdefault(req_id, set())
+        # `_cleanup_request` may already have run (the hook order relative to
+        # `request_finished` is vLLM-version dependent); fall back to the
+        # state it stashed so the loaded prefix is not re-pinned and
+        # already-saved boundaries are not saved again.
+        stashed = self._finished_tail_stash.pop(req_id, None)
+        saved = self._saved_boundaries.get(req_id)
+        if saved is None:
+            saved = stashed[1] if stashed is not None else set()
         loaded_tokens = self._external_matched_tokens.get(req_id, 0)
+        if not loaded_tokens and stashed is not None:
+            loaded_tokens = stashed[0]
         rows = self._boundary_rows(request, partial_tail_offloads, loaded_tokens, saved)
         if not rows:
             return False
@@ -1134,10 +1174,17 @@ class SchedulerConnector:
             # Mirror vLLM: eagle/MTP drafts consume the state at the last
             # hash boundary, so the tail is registered one unit lower.
             unit_count -= 1
-        tail_covered = unit_count * hbs - (prompt_len // vbs) * vbs
+        covered_end = unit_count * hbs
+        tail_covered = covered_end - (prompt_len // vbs) * vbs
         # vLLM must recompute the final prompt token to produce logits, so a
         # covered span of one token cannot reduce local work.
         if tail_covered <= 1:
+            return None
+        if covered_end == prompt_len and tail_covered <= hbs:
+            # The final prompt token is recomputed and the hit is floored to
+            # whole hash units, so a tail ending exactly at the prompt end
+            # with at most one unit of coverage can never be claimed. Skip it
+            # instead of querying and leasing a block the clamp would strip.
             return None
         block_hashes = request.block_hashes
         if unit_count > len(block_hashes):
@@ -1347,6 +1394,18 @@ class SchedulerConnector:
     def _cleanup_request(self, req_id: str) -> None:
         """Clean up all state for a completed request."""
         self._release_pending_query_probe(req_id)
+        if self._fine_tail and self._cache_groups.has_recurrent_state:
+            loaded_tokens = self._external_matched_tokens.get(req_id, 0)
+            saved_boundaries = self._saved_boundaries.get(req_id)
+            if loaded_tokens or saved_boundaries:
+                # `register_finished_partial_tail` may still be called for
+                # this request (the vLLM hook order relative to
+                # `request_finished` is not a stable API); keep what it
+                # needs so a torn-down request does not re-pin the loaded
+                # tail or re-save a boundary that already went through CoW.
+                self._finished_tail_stash[req_id] = (loaded_tokens, saved_boundaries or set())
+                while len(self._finished_tail_stash) > 4096:
+                    self._finished_tail_stash.pop(next(iter(self._finished_tail_stash)))
         self._requests.pop(req_id, None)
         self._block_hashes.pop(req_id, None)
         self._external_matched_blocks.pop(req_id, None)

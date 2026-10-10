@@ -161,10 +161,11 @@ partial tail block by the hash closing the prompt's last full hash unit. No
 `PYTHONHASHSEED` pinning is needed, salted/LoRA/multimodal requests are
 supported, and a hit claims only the unit-aligned part of the tail — the
 trailing sub-unit tokens are always recomputed. The `pegaflow.pd_tail_*`
-flags are ignored in this mode. Note a partial tail hit requires a producer
-that saved a tail ending at the exact same hash-unit boundary (e.g. an
-earlier turn of the same conversation); divergence mid-block still hits only
-up to the last full block.
+flags are ignored in this mode. Set `pegaflow.fine_tail` to `false` in the
+connector's extra config to opt out (block-granularity caching only). Note a
+partial tail hit requires a producer that saved a tail ending at the exact
+same hash-unit boundary (e.g. an earlier turn of the same conversation);
+divergence mid-block still hits only up to the last full block.
 
 Hybrid models with recurrent state (mamba/KDA-style linear attention, e.g.
 GLM-5.3) are supported in this mode: vLLM materializes the recurrent state

@@ -88,13 +88,11 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
         pd_tail_load = bool(
             vllm_config.kv_transfer_config.get_from_extra_config("pegaflow.pd_tail_load", False)
         )
-        fine_tail = hash_block_size is not None and hash_block_size < block_size * dcp_world_size
-        if fine_tail:
-            tail_scheme: str | None = "vllm"
-        elif pd_tail_save or pd_tail_load:
-            tail_scheme = "derived"
-        else:
-            tail_scheme = None
+        # Opt-out for caching the prompt's partial tail at hash-unit
+        # granularity when `--prefix-match-unit` is in effect.
+        fine_tail = bool(
+            vllm_config.kv_transfer_config.get_from_extra_config("pegaflow.fine_tail", True)
+        )
         base_namespace = derive_namespace(
             vllm_config,
             effective_tp_size,
@@ -102,7 +100,6 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
             pcp_world_size,
             cross_layer_blocks=cross_layer_blocks,
             hash_block_size=hash_block_size,
-            tail_scheme=tail_scheme,
         )
 
         tp_rank: int | None = None
@@ -193,6 +190,7 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
             wait_for_full_prefix=wait_for_full_prefix,
             tp_shards=tp_shards,
             hash_block_size=hash_block_size,
+            fine_tail=fine_tail,
         )
 
         # MLA attention backends expose no num-layers stride dimension, so vLLM

@@ -88,11 +88,19 @@ def _make_scheduler(
     return scheduler, pool
 
 
-def _register_request(scheduler: SchedulerConnector, req_id: str, num_hashes: int) -> None:
+def _register_request(
+    scheduler: SchedulerConnector,
+    req_id: str,
+    num_hashes: int,
+    num_prompt_tokens: int | None = None,
+) -> None:
     request = SimpleNamespace(
         request_id=req_id,
         block_hashes=[_hash(i) for i in range(num_hashes)],
     )
+    if num_prompt_tokens is not None:
+        request.num_prompt_tokens = num_prompt_tokens
+        request.num_tokens = num_prompt_tokens
     scheduler._requests[req_id] = request
     scheduler._block_hashes[req_id] = tuple(request.block_hashes)
 
@@ -409,20 +417,24 @@ def _make_fine_scheduler() -> tuple[SchedulerConnector, _FakePool]:
 def test_sub_block_boundary_offload_uses_the_fine_hash():
     """With `--prefix-match-unit` hashing, vLLM hands off the prompt-tail
     state block at a sub-block boundary; it is filed under the fine hash
-    closing that unit, so a peer can resume below block granularity."""
+    closing that unit, so a peer can resume below block granularity. Other
+    sub-block boundaries (prefill chunk ends) are never queried, so they are
+    dropped instead of stored."""
     scheduler, pool = _make_fine_scheduler()
-    _register_request(scheduler, "r1", 6)  # 48 tokens = 6 units = 3 blocks
+    # 59 prompt tokens: the fine tail boundary is unit 7 (56 tokens).
+    _register_request(scheduler, "r1", 7, num_prompt_tokens=59)
 
     metadata = scheduler.build_connector_meta(
-        _scheduler_output({"r1": [(1, 21, 2 * VBS), (1, 25, VBS + HBS)]})
+        _scheduler_output({"r1": [(1, 21, 2 * VBS), (1, 25, 7 * HBS), (1, 26, HBS)]})
     )
 
-    # Block boundary 32 keys on the block's closing unit hash; the sub-block
-    # boundary 24 keys on unit 24 // 8 - 1 = 2.
+    # Block boundary 32 keys on the block's closing unit hash; the tail
+    # boundary 56 keys on unit 56 // 8 - 1 = 6. The chunk-end boundary at 8
+    # is unit-aligned but not the prompt tail: dropped.
     assert metadata.boundary_save_intents == {
         0: SaveIntent(
             block_ids_by_group=((0, 0), (21, 25)),
-            block_hashes=(_hash(3), _hash(2)),
+            block_hashes=(_hash(3), _hash(6)),
         )
     }
     assert pool.touched == [21, 25]
@@ -435,8 +447,12 @@ def test_sub_block_boundary_offload_uses_the_fine_hash():
 
 def test_finished_partial_tail_is_pinned_and_flushed_next_step():
     scheduler, pool = _make_fine_scheduler()
+    # 27 prompt tokens: the fine tail boundary is unit 3 (24 tokens).
     request = SimpleNamespace(
-        request_id="r1", num_tokens=48, block_hashes=[_hash(i) for i in range(6)]
+        request_id="r1",
+        num_tokens=27,
+        num_prompt_tokens=27,
+        block_hashes=[_hash(i) for i in range(4)],
     )
 
     accepted = scheduler.register_finished_partial_tail(request, ([], []), [(1, 26, 24)])
@@ -470,3 +486,38 @@ def test_finished_partial_tail_requires_fine_hma():
 
     assert scheduler.register_finished_partial_tail(request, ([], []), [(1, 26, 24)]) is False
     assert pool.touched == []
+
+
+def test_finished_partial_tail_survives_state_cleanup_order():
+    """The finish-time hand-off works even after _cleanup_request ran.
+
+    The vLLM hook order (tail registration vs request_finished) is not a
+    stable API, so cleanup stashes what the hand-off needs: the loaded-prefix
+    filter and the dedup set. Without them the loaded tail would be re-pinned
+    and a boundary already saved through CoW would be saved again.
+    """
+    scheduler, pool = _make_fine_scheduler()
+    # 27 prompt tokens: the fine tail boundary is unit 3 (24 tokens).
+    request = SimpleNamespace(
+        request_id="r1",
+        num_tokens=27,
+        num_prompt_tokens=27,
+        block_hashes=[_hash(i) for i in range(4)],
+    )
+    scheduler._requests["r1"] = request
+    scheduler._block_hashes["r1"] = tuple(request.block_hashes)
+    # The request externally loaded a 16-token prefix and already saved the
+    # boundary at 16 through the CoW hand-off.
+    scheduler._external_matched_tokens["r1"] = 16
+    scheduler._saved_boundaries["r1"] = {(1, 16)}
+    scheduler._cleanup_request("r1")
+
+    accepted = scheduler.register_finished_partial_tail(
+        request, ([], []), [(1, 21, 16), (1, 26, 24), (1, 27, 24)]
+    )
+
+    assert accepted is False
+    # 16 is inside the loaded prefix -> skipped; 24 is saved once (deduped).
+    assert pool.touched == [26]
+    assert scheduler._finished_tail_jobs[0].block_hashes == (_hash(2),)
+    assert "r1" not in scheduler._finished_tail_stash
