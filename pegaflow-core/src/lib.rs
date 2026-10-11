@@ -468,8 +468,9 @@ impl PegaEngine {
             .expect("instances write lock poisoned");
         let ids: Vec<String> = instances.keys().cloned().collect();
         instances.clear();
-        drop(instances);
+        // Under the lock, so a concurrent registration cannot be overwritten.
         self.storage.set_has_instance(false);
+        drop(instances);
         for id in &ids {
             self.query_leases.release_instance(id);
         }

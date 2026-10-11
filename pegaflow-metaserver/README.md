@@ -99,10 +99,12 @@ demand, so each source has one target and targets share sources evenly.
    below this watermark sends an extra heartbeat, at most once per second.
 2. Reported blocks that already have a live target owner come back in
    `backed_hashes`; the source moves them to its reclaimable class.
-3. A target calls `PullBackupPlan` about once a second. The MetaServer pops
-   blocks from its paired sources oldest first, skips blocks that already
-   have a target owner, whose source is gone, or that are in flight, and
-   returns one namespace from one source within the byte budget and pacing.
+3. A target calls `PullBackupPlan` back to back while it gets plans, and
+   once a second when idle. The MetaServer pops blocks from its paired
+   sources oldest first, skips blocks that already have a target owner, whose
+   source is gone, or that are in flight, and returns one namespace from one
+   source within the byte budget. When pacing holds the pair back it returns
+   an empty plan with `retry_after_ms`.
 4. The target RDMA-reads the blocks with the regular P2P transfer path,
    inserts them as retained, and registers them. On a completed transfer the
    source demotes its copies to reclaimable, so pressure evicts them first
@@ -290,7 +292,8 @@ remote owner.
 ### 6. PullBackupPlan
 
 Decode backup targets ask for the next batch of blocks to copy. Returns an
-empty response when the node is not a target or nothing is queued.
+empty response when the node is not a target or nothing is queued, and an
+empty response with `retry_after_ms` when byte pacing holds it back.
 
 ```protobuf
 message PullBackupPlanRequest {
@@ -303,6 +306,7 @@ message PullBackupPlanResponse {
   string source_node = 1;
   string namespace = 2;
   repeated bytes block_hashes = 3;
+  uint64 retry_after_ms = 4;
 }
 ```
 

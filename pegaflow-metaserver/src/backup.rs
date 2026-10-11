@@ -61,6 +61,17 @@ pub struct BackupPlan {
     pub hashes: Vec<Vec<u8>>,
 }
 
+/// Result of one `plan` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanOutcome {
+    Plan(BackupPlan),
+    /// Pacing holds this target, or every paired source with queued
+    /// candidates, back for this long.
+    Paced(Duration),
+    /// Nothing to copy for this node.
+    Idle,
+}
+
 struct QueuedGroup {
     namespace: String,
     block_bytes: u64,
@@ -213,15 +224,17 @@ impl BackupPlanner {
         roles: &NodeRoles,
         target: &str,
         max_bytes: u64,
-    ) -> Option<BackupPlan> {
-        let target = roles.targets.iter().find(|node| node.as_ref() == target)?;
+    ) -> PlanOutcome {
+        let Some(target) = roles.targets.iter().find(|node| node.as_ref() == target) else {
+            return PlanOutcome::Idle;
+        };
         let sources = pairing(&roles.sources, &roles.targets)
             .into_iter()
             .filter(|(_, paired)| paired == target)
             .map(|(source, _)| source)
             .collect::<Vec<_>>();
         if sources.is_empty() {
-            return None;
+            return PlanOutcome::Idle;
         }
 
         let now = Instant::now();
@@ -230,15 +243,29 @@ impl BackupPlanner {
         state
             .inflight
             .retain(|_, entry| now.duration_since(entry.dispatched_at) < ttl);
-        if state.next_allowed.get(target).is_some_and(|at| *at > now) {
-            return None;
+        // A source that died without reporting `has_instance=false` would
+        // otherwise keep its snapshot, and departed nodes their pacing state.
+        state
+            .candidates
+            .retain(|source, _| roles.sources.binary_search(source).is_ok());
+        state.next_allowed.retain(|_, at| *at > now);
+        state
+            .cursor
+            .retain(|node, _| roles.targets.binary_search(node).is_ok());
+        if let Some(at) = state.next_allowed.get(target) {
+            return PlanOutcome::Paced(*at - now);
         }
 
+        let mut paced: Option<Duration> = None;
         let start = state.cursor.get(target).copied().unwrap_or(0);
         for offset in 0..sources.len() {
             let index = (start + offset) % sources.len();
             let source = &sources[index];
-            if state.next_allowed.get(source).is_some_and(|at| *at > now) {
+            if let Some(at) = state.next_allowed.get(source) {
+                if state.candidates.contains_key(source) {
+                    let wait = *at - now;
+                    paced = Some(paced.map_or(wait, |p| p.min(wait)));
+                }
                 continue;
             }
             let Some((namespace, block_bytes, hashes)) =
@@ -272,13 +299,13 @@ impl BackupPlanner {
             ];
             METRICS.dispatched_blocks.add(hashes.len() as u64, &pair);
             METRICS.dispatched_bytes.add(bytes, &pair);
-            return Some(BackupPlan {
+            return PlanOutcome::Plan(BackupPlan {
                 source: Arc::clone(source),
                 namespace,
                 hashes,
             });
         }
-        None
+        paced.map_or(PlanOutcome::Idle, PlanOutcome::Paced)
     }
 
     /// Count prefix-fetch segments planned from a backup target.
@@ -579,15 +606,18 @@ mod tests {
         }
 
         fn plan(&self, target: &str, max_bytes: u64) -> Option<(String, Vec<u8>)> {
+            match self.plan_outcome(target, max_bytes) {
+                PlanOutcome::Plan(plan) => Some((
+                    plan.source.to_string(),
+                    plan.hashes.into_iter().map(|hash| hash[0]).collect(),
+                )),
+                _ => None,
+            }
+        }
+
+        fn plan_outcome(&self, target: &str, max_bytes: u64) -> PlanOutcome {
             let roles = self.planner.roles(&self.store);
-            self.planner
-                .plan(&self.store, &roles, target, max_bytes)
-                .map(|plan| {
-                    (
-                        plan.source.to_string(),
-                        plan.hashes.into_iter().map(|hash| hash[0]).collect(),
-                    )
-                })
+            self.planner.plan(&self.store, &roles, target, max_bytes)
         }
     }
 
@@ -641,9 +671,17 @@ mod tests {
         );
         fx.own("p0", &[1, 2]);
         fx.report("p0", &[1, 2]);
-        assert_eq!(fx.plan("p0", 100), None, "sources never pull");
+        assert_eq!(
+            fx.plan_outcome("p0", 100),
+            PlanOutcome::Idle,
+            "sources never pull"
+        );
         assert_eq!(fx.plan("d0", 10), Some(("p0".into(), vec![1])));
-        assert_eq!(fx.plan("d0", 10), None, "10 bytes at 1 B/s pauses the pair");
+        // 10 bytes at 1 B/s pauses the pair; the target learns how long.
+        assert!(matches!(
+            fx.plan_outcome("d0", 10),
+            PlanOutcome::Paced(wait) if wait > Duration::from_secs(9)
+        ));
     }
 
     #[test]

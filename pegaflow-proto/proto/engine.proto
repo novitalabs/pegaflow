@@ -366,6 +366,9 @@ message PullBackupPlanResponse {
   string source_node = 1;
   string namespace = 2;
   repeated bytes block_hashes = 3;
+  // Set with an empty plan when byte pacing, not a lack of candidates, holds
+  // the target back: pull again after this many milliseconds.
+  uint64 retry_after_ms = 4;
 }
 
 message UnregisterNodeRequest {
