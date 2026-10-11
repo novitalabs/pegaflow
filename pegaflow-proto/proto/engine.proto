@@ -324,13 +324,51 @@ message QueryPrefixBlocksResponse {
   repeated FetchSegment segments = 2;
 }
 
+// Block hashes of one namespace, oldest first.
+message BackupCandidates {
+  string namespace = 1;
+  repeated bytes block_hashes = 2;
+  // Average resident footprint of these blocks; lets the MetaServer budget
+  // backup traffic in bytes across models with different block sizes.
+  uint64 block_bytes = 3;
+}
+
 message HeartbeatNodeRequest {
   string node = 1;
   string node_id = 2;
+  // True while at least one inference instance is registered on this node.
+  bool has_instance = 3;
+  // Retained LRU-tail blocks this node wants backed up by a decode node.
+  // Only sent when the response's backup_enabled was true.
+  repeated BackupCandidates backup_candidates = 4;
 }
 
 message HeartbeatNodeResponse {
   uint64 stale_after_secs = 1;
+  // Decode backup is enabled on this MetaServer.
+  bool backup_enabled = 2;
+  // This node is a backup target (no instance for the configured delay):
+  // it should pull backup plans and must not demote blocks it serves.
+  bool backup_target = 3;
+  // Reported candidates that already have a live backup owner; the caller
+  // should classify matching local residents as reclaimable.
+  repeated BackupCandidates backed_hashes = 4;
+}
+
+message PullBackupPlanRequest {
+  string node = 1;
+  string node_id = 2;
+  uint64 max_bytes = 3;
+}
+
+message PullBackupPlanResponse {
+  // Empty when there is nothing to back up.
+  string source_node = 1;
+  string namespace = 2;
+  repeated bytes block_hashes = 3;
+  // Set with an empty plan when byte pacing, not a lack of candidates, holds
+  // the target back: pull again after this many milliseconds.
+  uint64 retry_after_ms = 4;
 }
 
 message UnregisterNodeRequest {
@@ -348,4 +386,5 @@ service MetaServer {
   rpc InsertBlockHashes(InsertBlockHashesRequest) returns (InsertBlockHashesResponse);
   rpc RemoveBlockHashes(RemoveBlockHashesRequest) returns (RemoveBlockHashesResponse);
   rpc QueryPrefixBlocks(QueryPrefixBlocksRequest) returns (QueryPrefixBlocksResponse);
+  rpc PullBackupPlan(PullBackupPlanRequest) returns (PullBackupPlanResponse);
 }

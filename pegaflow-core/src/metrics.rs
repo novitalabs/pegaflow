@@ -2,7 +2,7 @@
 use opentelemetry::metrics::ObservableGauge;
 use opentelemetry::{
     KeyValue, global,
-    metrics::{Counter, Histogram, Meter, UpDownCounter},
+    metrics::{Counter, Gauge, Histogram, Meter, UpDownCounter},
 };
 #[cfg(feature = "rdma")]
 use std::sync::Arc;
@@ -30,6 +30,16 @@ pub(crate) static CACHE_RESIDENCE_REASON_PRESSURE: LazyLock<[KeyValue; 1]> =
     LazyLock::new(|| [KeyValue::new("reason", "pressure")]);
 pub(crate) static CACHE_RESIDENCE_REASON_CLEANUP: LazyLock<[KeyValue; 1]> =
     LazyLock::new(|| [KeyValue::new("reason", "cleanup")]);
+pub(crate) static DEMOTION_TRANSFER: LazyLock<[KeyValue; 1]> =
+    LazyLock::new(|| [KeyValue::new("reason", "transfer_release")]);
+pub(crate) static DEMOTION_RECLAIM_HINT: LazyLock<[KeyValue; 1]> =
+    LazyLock::new(|| [KeyValue::new("reason", "reclaim_hint")]);
+pub(crate) static DEMOTION_BACKUP_HINT: LazyLock<[KeyValue; 1]> =
+    LazyLock::new(|| [KeyValue::new("reason", "backup_hint")]);
+pub(crate) static SERVED_ROLE_SOURCE: LazyLock<[KeyValue; 1]> =
+    LazyLock::new(|| [KeyValue::new("role", "source")]);
+pub(crate) static SERVED_ROLE_BACKUP_TARGET: LazyLock<[KeyValue; 1]> =
+    LazyLock::new(|| [KeyValue::new("role", "backup_target")]);
 
 pub(crate) struct CoreMetrics {
     // Pinned pool (allocator-level)
@@ -60,6 +70,14 @@ pub(crate) struct CoreMetrics {
     pub cache_block_evictions_still_referenced: Counter<u64>,
     pub cache_eviction_reclaimed_bytes: Counter<u64>,
     pub cache_residence_duration: Histogram<f64>,
+    pub cache_resident_bytes_by_class: UpDownCounter<i64>,
+    pub cache_class_demotions: Counter<u64>,
+
+    // Decode backup
+    pub backup_role: Gauge<u64>,
+    pub backup_candidates_reported: Counter<u64>,
+    #[cfg(feature = "rdma")]
+    pub backup_pull_missing_blocks: Counter<u64>,
 
     // GPU <-> CPU transfer
     pub save_bytes: Counter<u64>,
@@ -101,6 +119,7 @@ pub(crate) struct CoreMetrics {
     // Cross-node transfer lock (serving side)
     pub transfer_lock_active: UpDownCounter<i64>,
     pub transfer_lock_timeouts_total: Counter<u64>,
+    pub transfer_served_blocks: Counter<u64>,
 
     // RDMA remote fetch (client side)
     #[cfg(feature = "rdma")]
@@ -315,6 +334,35 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
                 .u64_counter("pegaflow_cache_block_evictions_by_class")
                 .with_description("Cache block evictions by replacement class")
                 .build(),
+            cache_resident_bytes_by_class: meter
+                .i64_up_down_counter("pegaflow_cache_resident_bytes_by_class")
+                .with_unit("bytes")
+                .with_description("Current cache block footprint bytes by replacement class")
+                .build(),
+            cache_class_demotions: meter
+                .u64_counter("pegaflow_cache_class_demotions")
+                .with_description(
+                    "Blocks moved from retained to reclaimable \
+                     (reason=transfer_release|reclaim_hint|backup_hint)",
+                )
+                .build(),
+            backup_role: meter
+                .u64_gauge("pegaflow_backup_role")
+                .with_description(
+                    "1 while the MetaServer treats this node as a decode backup target, else 0",
+                )
+                .build(),
+            backup_candidates_reported: meter
+                .u64_counter("pegaflow_backup_candidates_reported")
+                .with_description("Retained LRU-tail blocks reported to the MetaServer for backup")
+                .build(),
+            #[cfg(feature = "rdma")]
+            backup_pull_missing_blocks: meter
+                .u64_counter("pegaflow_backup_pull_missing_blocks")
+                .with_description(
+                    "Planned backup blocks the source no longer held when the target pulled",
+                )
+                .build(),
             cache_block_evictions_still_referenced: meter
                 .u64_counter("pegaflow_cache_block_evictions_still_referenced")
                 .with_description("Evicted cache blocks that still had external references (eviction did not immediately reclaim memory)")
@@ -471,6 +519,13 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
             transfer_lock_timeouts_total: meter
                 .u64_counter("pegaflow_transfer_lock_timeouts_total")
                 .with_description("Transfer lock sessions expired by timeout (potential issue)")
+                .build(),
+
+            transfer_served_blocks: meter
+                .u64_counter("pegaflow_transfer_served_blocks")
+                .with_description(
+                    "Blocks fully copied by a peer from this node (role=source|backup_target)",
+                )
                 .build(),
 
             // RDMA remote fetch (client side)

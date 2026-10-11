@@ -39,6 +39,31 @@ const LOCK_TIMEOUT_MARGIN: Duration = Duration::from_secs(60);
 /// whole-prefix slab can force eviction of far more bytes than the fetch needs.
 const FETCH_CHUNK_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Why a node pulls blocks from a peer; selects holder semantics and labels.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FetchPurpose {
+    /// Serve a request's missing prefix; the holder stops at the first gap.
+    Prefix,
+    /// Copy a decode-backup plan; the holder returns every block it still has.
+    Backup,
+}
+
+impl FetchPurpose {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Prefix => "prefix",
+            Self::Backup => "backup",
+        }
+    }
+
+    fn attributes(self, status: &'static str) -> [KeyValue; 2] {
+        [
+            KeyValue::new("status", status),
+            KeyValue::new("purpose", self.label()),
+        ]
+    }
+}
+
 /// RDMA remote block fetch backing store.
 ///
 /// When all requested blocks are missing locally, queries MetaServer for their
@@ -154,7 +179,13 @@ struct RdmaSegmentFetcher<'a> {
 impl SegmentFetcher for RdmaSegmentFetcher<'_> {
     async fn fetch_segment(&self, remote_addr: &str, hashes: &[Vec<u8>]) -> PrefetchResult {
         self.store
-            .fetch_blocks(remote_addr, self.req_id, self.namespace, hashes)
+            .fetch_blocks(
+                remote_addr,
+                self.req_id,
+                self.namespace,
+                hashes,
+                FetchPurpose::Prefix,
+            )
             .await
     }
 }
@@ -296,6 +327,7 @@ impl RdmaFetchStore {
         req_id: &str,
         namespace: &str,
         hashes: &[Vec<u8>],
+        purpose: FetchPurpose,
     ) -> PrefetchResult {
         rdma_fetch_task(
             &self.rdma_transport,
@@ -307,6 +339,7 @@ impl RdmaFetchStore {
             &self.advertise_addr,
             namespace,
             hashes,
+            purpose,
         )
         .await
     }
@@ -332,8 +365,10 @@ async fn rdma_fetch_task(
     advertise_addr: &str,
     namespace: &str,
     block_hashes: &[Vec<u8>],
+    purpose: FetchPurpose,
 ) -> PrefetchResult {
     let t0 = Instant::now();
+    let error_attributes = purpose.attributes("error");
 
     // 1. Ensure RDMA connection (singleflight: at most one handshake per remote_addr)
     let connect_start = Instant::now();
@@ -347,9 +382,7 @@ async fn rdma_fetch_task(
     .await
     {
         warn!("RDMA connect to {remote_addr} failed: {e}");
-        core_metrics()
-            .rdma_fetch_total
-            .add(1, &[KeyValue::new("status", "error")]);
+        core_metrics().rdma_fetch_total.add(1, &error_attributes);
         return Vec::new();
     }
     let connect_elapsed = connect_start.elapsed();
@@ -362,15 +395,14 @@ async fn rdma_fetch_task(
         namespace,
         block_hashes,
         advertise_addr,
+        purpose == FetchPurpose::Prefix,
     )
     .await
     {
         Ok(cr) => cr,
         Err(e) => {
             warn!("Remote query to {remote_addr} failed: {e}");
-            core_metrics()
-                .rdma_fetch_total
-                .add(1, &[KeyValue::new("status", "error")]);
+            core_metrics().rdma_fetch_total.add(1, &error_attributes);
             return Vec::new();
         }
     };
@@ -410,9 +442,7 @@ async fn rdma_fetch_task(
             warn!("RDMA transfer from {remote_addr} failed: {e}");
             rdma.engine().invalidate_connection(remote_addr);
             lock_guard.release(false);
-            core_metrics()
-                .rdma_fetch_total
-                .add(1, &[KeyValue::new("status", "error")]);
+            core_metrics().rdma_fetch_total.add(1, &error_attributes);
             return Vec::new();
         }
     };
@@ -430,7 +460,8 @@ async fn rdma_fetch_task(
         0.0
     };
     info!(
-        "RDMA fetch summary: req_id={req_id} remote={remote_addr} blocks={}/{} slots={} descs={} slabs={} bytes_mib={mb:.1} total_ms={elapsed_ms:.2} tp_mib_s={throughput_mib_s:.0}",
+        "RDMA fetch summary: req_id={req_id} remote={remote_addr} purpose={} blocks={}/{} slots={} descs={} slabs={} bytes_mib={mb:.1} total_ms={elapsed_ms:.2} tp_mib_s={throughput_mib_s:.0}",
+        purpose.label(),
         result.len(),
         block_hashes.len(),
         transfer_timing.slot_count,
@@ -447,7 +478,7 @@ async fn rdma_fetch_task(
         transfer_timing.rebuild.as_secs_f64() * 1000.0,
     );
     let m = core_metrics();
-    let ok = &[KeyValue::new("status", "ok")];
+    let ok = &purpose.attributes("ok");
     m.rdma_fetch_total.add(1, ok);
     m.rdma_fetch_duration_seconds
         .record(elapsed.as_secs_f64(), ok);
@@ -857,6 +888,7 @@ async fn query_remote_blocks(
     namespace: &str,
     block_hashes: &[Vec<u8>],
     advertise_addr: &str,
+    prefix_only: bool,
 ) -> Result<(EngineClient<Channel>, QueryBlocksForTransferResponse), String> {
     let mut client = get_or_create_channel(grpc_channels, remote_addr)?;
 
@@ -865,7 +897,8 @@ async fn query_remote_blocks(
         block_hashes: block_hashes.to_vec(),
         requester_id: advertise_addr.to_string(),
         // Prefix fetch keeps only the contiguous prefix; never lock blocks past a gap.
-        prefix_only: true,
+        // Backup copies are independent blocks, so a gap must not stop the rest.
+        prefix_only,
     };
 
     let response = client

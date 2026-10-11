@@ -79,6 +79,39 @@ cargo run -p pegaflow-metaserver -- --help
 - `--ttl-minutes <MINUTES>`: Delete nodes and their owners after this many minutes without node activity (default: `120`); does not expire blocks by registration age
 - `--sweep-interval-secs <SECONDS>`: Run the lifecycle sweep at this interval (default: `600`)
 - `--min-reclaimable-owner-count <COUNT>`: Return a reclaim hint once this many live owners hold a block (default: `3`, minimum: `2`). `2` reclaims more aggressively than the default; values below `2` are rejected.
+- `--enable-decode-backup`: Let idle nodes back up prefill nodes' retained LRU-tail blocks (default: off; env `PEGAFLOW_METASERVER_ENABLE_DECODE_BACKUP`). See [Decode backup](#decode-backup).
+- `--backup-target-delay-secs <SECONDS>`: A live node with no inference instance for this long becomes a backup target (default: `180`)
+- `--backup-inflight-ttl-secs <SECONDS>`: A dispatched backup block is not re-planned for this long unless a backup owner registers it (default: `180`)
+- `--backup-max-bytes-per-sec <BYTES>`: Planned backup bytes per second per source and per target; `0` disables pacing (default: 2 GiB)
+
+### Decode backup
+
+With `--enable-decode-backup`, the MetaServer splits live nodes by role:
+a node that reports an inference instance is a source immediately, and a node
+without one becomes a target after `--backup-target-delay-secs`. Sources and
+targets are paired by rendezvous hashing with bounded load, recomputed on
+demand, so each source has one target and targets share sources evenly.
+
+1. Once its cache is at least 90% full, a source sends its oldest retained
+   cache-owned blocks with each heartbeat: enough bytes to bring the
+   reclaimable class back to 10% of capacity. Each report replaces that
+   source's previous snapshot. Eviction that drains the reclaimable class
+   below this watermark sends an extra heartbeat, at most once per second.
+2. Reported blocks that already have a live target owner come back in
+   `backed_hashes`; the source moves them to its reclaimable class.
+3. A target calls `PullBackupPlan` back to back while it gets plans, and
+   once a second when idle. The MetaServer pops blocks from its paired
+   sources oldest first, skips blocks that already have a target owner, whose
+   source is gone, or that are in flight, and returns one namespace from one
+   source within the byte budget. When pacing holds the pair back it returns
+   an empty plan with `retry_after_ms`.
+4. The target RDMA-reads the blocks with the regular P2P transfer path,
+   inserts them as retained, and registers them. On a completed transfer the
+   source demotes its copies to reclaimable, so pressure evicts them first
+   and later prefix queries recall them from the target.
+
+A target does not demote blocks it serves, and it only re-pulls blocks that
+are still retained on a source, so evicted backups are not copied again.
 
 ### Storage Configuration
 
@@ -156,6 +189,15 @@ stale.
 message HeartbeatNodeRequest {
   string node = 1;
   string node_id = 2;
+  bool has_instance = 3;                            // Decides the decode backup role
+  repeated BackupCandidates backup_candidates = 4;  // Retained LRU-tail blocks, oldest first
+}
+
+message HeartbeatNodeResponse {
+  uint64 stale_after_secs = 1;
+  bool backup_enabled = 2;
+  bool backup_target = 3;                           // Pull plans; do not demote served blocks
+  repeated BackupCandidates backed_hashes = 4;      // Candidates that already have a backup
 }
 ```
 
@@ -247,14 +289,35 @@ Segments are ordered and contiguous. Their block counts are cumulative offsets
 into the request's `block_hashes`; planning stops at the first hash with no live
 remote owner.
 
-### 6. Health
+### 6. PullBackupPlan
+
+Decode backup targets ask for the next batch of blocks to copy. Returns an
+empty response when the node is not a target or nothing is queued, and an
+empty response with `retry_after_ms` when byte pacing holds it back.
+
+```protobuf
+message PullBackupPlanRequest {
+  string node = 1;
+  string node_id = 2;
+  uint64 max_bytes = 3;
+}
+
+message PullBackupPlanResponse {
+  string source_node = 1;
+  string namespace = 2;
+  repeated bytes block_hashes = 3;
+  uint64 retry_after_ms = 4;
+}
+```
+
+### 7. Health
 
 Health check endpoint.
 
 **Request:** `HealthRequest {}`
 **Response:** `HealthResponse { status }`
 
-### 7. Shutdown
+### 8. Shutdown
 
 Graceful shutdown trigger.
 

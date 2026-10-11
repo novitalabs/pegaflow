@@ -1,3 +1,4 @@
+pub mod backup;
 pub mod http_server;
 pub mod metric;
 pub mod proto;
@@ -64,6 +65,23 @@ pub struct Cli {
         default_value_t = store::DEFAULT_MIN_RECLAIMABLE_OWNER_COUNT
     )]
     pub min_reclaimable_owner_count: usize,
+
+    /// Let idle pegaflow-servers (no inference instance, e.g. decode nodes)
+    /// back up the oldest retained blocks of nodes with an instance.
+    #[arg(long, env = "PEGAFLOW_METASERVER_ENABLE_DECODE_BACKUP")]
+    pub enable_decode_backup: bool,
+
+    /// Seconds a node must report no instance before it becomes a backup target.
+    #[arg(long, default_value_t = backup::DEFAULT_TARGET_DELAY_SECS)]
+    pub backup_target_delay_secs: u64,
+
+    /// Seconds before an unfinished backup dispatch may be re-planned.
+    #[arg(long, default_value_t = backup::DEFAULT_INFLIGHT_TTL_SECS)]
+    pub backup_inflight_ttl_secs: u64,
+
+    /// Backup dispatch budget per node in bytes/s (0 = unlimited).
+    #[arg(long, default_value_t = backup::DEFAULT_MAX_BYTES_PER_SEC)]
+    pub backup_max_bytes_per_sec: u64,
 }
 
 fn init_metrics() -> Result<(SdkMeterProvider, Registry), Box<dyn Error>> {
@@ -161,6 +179,23 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     // Register store observable gauges
     metric::register_store_gauges(&store);
 
+    let backup = cli.enable_decode_backup.then(|| {
+        let config = backup::BackupConfig {
+            target_delay: Duration::from_secs(cli.backup_target_delay_secs),
+            inflight_ttl: Duration::from_secs(cli.backup_inflight_ttl_secs),
+            max_bytes_per_sec: cli.backup_max_bytes_per_sec,
+        };
+        info!(
+            "Decode backup enabled: target_delay={}s inflight_ttl={}s max_bytes_per_sec={}",
+            cli.backup_target_delay_secs,
+            cli.backup_inflight_ttl_secs,
+            cli.backup_max_bytes_per_sec
+        );
+        let planner = Arc::new(backup::BackupPlanner::new(config));
+        metric::register_backup_gauges(&store, &planner);
+        planner
+    });
+
     // Spawn background node lifecycle sweep task.
     {
         let store = Arc::clone(&store);
@@ -205,7 +240,10 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     .await?;
 
     // Create the gRPC service
-    let service = GrpcMetaService::new(store.clone());
+    let service = match backup {
+        Some(planner) => GrpcMetaService::with_backup(store.clone(), planner),
+        None => GrpcMetaService::new(store.clone()),
+    };
 
     info!("MetaServer initialized successfully");
     info!("Listening on {}", cli.addr);

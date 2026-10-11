@@ -4,6 +4,7 @@ use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Instant;
 use tonic::Status;
 
+use crate::backup::{BackupPlanner, pairing};
 use crate::store::{BlockHashStore, SweepStats};
 
 // ---------------------------------------------------------------------------
@@ -88,6 +89,85 @@ pub fn register_store_gauges(store: &Arc<BlockHashStore>) {
             _nodes: nodes,
             _redundancy: redundancy,
             _redundancy_avg: redundancy_avg,
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Decode backup gauges (roles and pairing topology)
+// ---------------------------------------------------------------------------
+
+struct BackupGaugeHandles {
+    _nodes: ObservableGauge<u64>,
+    _pairs: ObservableGauge<u64>,
+    _candidates: ObservableGauge<u64>,
+    _inflight: ObservableGauge<u64>,
+}
+
+static BACKUP_GAUGES: OnceLock<BackupGaugeHandles> = OnceLock::new();
+
+/// Register gauges describing backup roles and the current source→target
+/// pairing. Labels are node addresses, bounded by cluster size.
+pub fn register_backup_gauges(store: &Arc<BlockHashStore>, planner: &Arc<BackupPlanner>) {
+    BACKUP_GAUGES.get_or_init(|| {
+        let meter = global::meter("pegaflow_metaserver");
+        let (nodes_store, nodes_planner) = (Arc::clone(store), Arc::clone(planner));
+        let nodes = meter
+            .u64_observable_gauge("pegaflow_metaserver_backup_nodes")
+            .with_description("Live nodes by backup role (role=source|target)")
+            .with_callback(move |observer| {
+                let roles = nodes_planner.roles(&nodes_store);
+                observer.observe(
+                    roles.sources.len() as u64,
+                    &[KeyValue::new("role", "source")],
+                );
+                observer.observe(
+                    roles.targets.len() as u64,
+                    &[KeyValue::new("role", "target")],
+                );
+            })
+            .build();
+        let (pairs_store, pairs_planner) = (Arc::clone(store), Arc::clone(planner));
+        let pairs = meter
+            .u64_observable_gauge("pegaflow_metaserver_backup_pair")
+            .with_description("Current backup pairing; one series per source/target pair")
+            .with_callback(move |observer| {
+                let roles = pairs_planner.roles(&pairs_store);
+                for (source, target) in pairing(&roles.sources, &roles.targets) {
+                    observer.observe(
+                        1,
+                        &[
+                            KeyValue::new("source", source.to_string()),
+                            KeyValue::new("target", target.to_string()),
+                        ],
+                    );
+                }
+            })
+            .build();
+        let candidates_planner = Arc::clone(planner);
+        let candidates = meter
+            .u64_observable_gauge("pegaflow_metaserver_backup_candidates")
+            .with_description("Queued backup candidate blocks across all sources")
+            .with_callback(move |observer| {
+                observer.observe(candidates_planner.queued_candidates(), &[]);
+            })
+            .build();
+        let inflight_planner = Arc::clone(planner);
+        let inflight = meter
+            .u64_observable_gauge("pegaflow_metaserver_backup_inflight_bytes")
+            .with_unit("bytes")
+            .with_description("Backup bytes dispatched to each target within the in-flight TTL")
+            .with_callback(move |observer| {
+                for (target, bytes) in inflight_planner.inflight_bytes() {
+                    observer.observe(bytes, &[KeyValue::new("target", target.to_string())]);
+                }
+            })
+            .build();
+        BackupGaugeHandles {
+            _nodes: nodes,
+            _pairs: pairs,
+            _candidates: candidates,
+            _inflight: inflight,
         }
     });
 }

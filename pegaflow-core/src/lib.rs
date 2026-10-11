@@ -214,6 +214,7 @@ impl PegaEngine {
 
         let instance = Arc::new(instance);
         instances.insert(instance_id.to_string(), Arc::clone(&instance));
+        self.storage.set_has_instance(true);
         Ok(instance)
     }
 
@@ -441,11 +442,15 @@ impl PegaEngine {
 
     /// Unregister an instance and release all associated resources.
     pub fn unregister_instance(&self, instance_id: &str) -> Result<(), EngineError> {
-        let removed = self
+        let mut instances = self
             .instances
             .write()
-            .expect("instances write lock poisoned")
-            .remove(instance_id);
+            .expect("instances write lock poisoned");
+        let removed = instances.remove(instance_id);
+        if instances.is_empty() {
+            self.storage.set_has_instance(false);
+        }
+        drop(instances);
 
         if removed.is_none() {
             return Err(EngineError::InstanceMissing(instance_id.to_string()));
@@ -463,6 +468,8 @@ impl PegaEngine {
             .expect("instances write lock poisoned");
         let ids: Vec<String> = instances.keys().cloned().collect();
         instances.clear();
+        // Under the lock, so a concurrent registration cannot be overwritten.
+        self.storage.set_has_instance(false);
         drop(instances);
         for id in &ids {
             self.query_leases.release_instance(id);
