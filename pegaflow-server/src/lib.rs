@@ -75,9 +75,13 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub use_hugepages: bool,
 
-    /// Enable TinyLFU admission policy for cache (default: plain LRU)
+    /// Enable W-TinyLFU admission policy for cache (default: plain LRU)
     #[arg(long, default_value_t = false)]
     pub enable_lfu_admission: bool,
+
+    /// Admission window size as a percentage of the total pinned-memory pool (0 < ratio < 100)
+    #[arg(long, default_value_t = 1.0, value_parser = parse_lfu_window_ratio)]
+    pub lfu_window_ratio: f64,
 
     /// Disable NUMA-aware memory allocation (use single pool instead of per-node pools)
     #[arg(long, default_value_t = false)]
@@ -204,6 +208,16 @@ fn parse_nic_name(s: &str) -> Result<String, String> {
         return Err("--nics contains an empty NIC name".into());
     }
     Ok(name.to_string())
+}
+
+fn parse_lfu_window_ratio(s: &str) -> Result<f64, String> {
+    let ratio: f64 = s
+        .parse()
+        .map_err(|err| format!("invalid LFU window ratio: {err}"))?;
+    if !ratio.is_finite() || ratio <= 0.0 || ratio >= 100.0 {
+        return Err("LFU window ratio must be finite and between 0 and 100 (exclusive)".into());
+    }
+    Ok(ratio)
 }
 
 fn parse_hll_windows_arg(s: &str) -> Result<String, String> {
@@ -541,6 +555,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
     let storage_config = pegaflow_core::StorageConfig {
         enable_lfu_admission: cli.enable_lfu_admission,
+        lfu_window_ratio: cli.lfu_window_ratio,
         hint_value_size_bytes: cli.hint_value_size,
         max_prefetch_blocks: cli.max_prefetch_blocks,
         ssd_cache_config,
@@ -560,9 +575,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             "Pinned memory pool sharding enabled: {} shards",
             cli.pool_shards
         );
-    }
-    if cli.enable_lfu_admission {
-        info!("TinyLFU cache admission enabled");
     }
     if cli.disable_numa_affinity {
         info!("NUMA-aware memory allocation disabled");
@@ -733,6 +745,16 @@ mod tests {
             expected_hll_windows()
         );
         assert_eq!(cli.metric_hll_bucket_bits, 16);
+        assert_eq!(cli.lfu_window_ratio, 1.0);
+    }
+
+    #[test]
+    fn cli_rejects_invalid_lfu_window_ratio() {
+        for ratio in ["0", "100", "NaN", "inf"] {
+            let error = Cli::try_parse_from(["pegaflow-server", "--lfu-window-ratio", ratio])
+                .expect_err("invalid ratio should fail CLI parsing");
+            assert!(error.to_string().contains("LFU window ratio"), "{error}");
+        }
     }
 
     #[test]

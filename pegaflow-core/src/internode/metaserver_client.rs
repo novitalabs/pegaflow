@@ -1161,7 +1161,7 @@ mod tests {
     #[tokio::test]
     async fn registration_applies_reclaimable_hashes() {
         let (addr, service, shutdown_tx) = start_fake_metaserver().await;
-        let read_cache = Arc::new(ReadCache::new(1 << 20, false, None));
+        let read_cache = Arc::new(ReadCache::new(1 << 20, false, None, None));
         let hashes: Vec<Vec<u8>> = (0..=MAX_HASHES_PER_RPC as u32)
             .map(|value| value.to_le_bytes().to_vec())
             .collect();
@@ -1198,7 +1198,7 @@ mod tests {
     #[tokio::test]
     async fn mixed_netting_preserves_final_p2p_insert_origin() {
         let (addr, service, shutdown_tx) = start_fake_metaserver().await;
-        let read_cache = Arc::new(ReadCache::new(1 << 20, false, None));
+        let read_cache = Arc::new(ReadCache::new(1 << 20, false, None, None));
         let local_hash = vec![0xa1];
         let remote_hash = vec![0xb2];
         let local_key = BlockKey::new("ns".to_string(), local_hash.clone());
@@ -1237,7 +1237,7 @@ mod tests {
     #[tokio::test]
     async fn stale_local_hint_does_not_demote_reinserted_block() {
         let (addr, service, shutdown_tx) = start_fake_metaserver().await;
-        let read_cache = Arc::new(ReadCache::new(1 << 20, false, None));
+        let read_cache = Arc::new(ReadCache::new(1 << 20, false, None, None));
         let hash = vec![0xa1];
         let key = BlockKey::new("ns".to_string(), hash.clone());
         read_cache

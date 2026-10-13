@@ -47,7 +47,9 @@ pub use pegaflow_common::NumaNode;
 use pegaflow_common::{NumaTopology, group_hash};
 pub use pinned_pool::PinnedAllocation;
 pub use seal_offload::SlotMeta;
-pub use storage::{DEFAULT_RDMA_QPS_PER_PEER, MemoryCacheCleanupStats, StorageConfig};
+pub use storage::{
+    DEFAULT_RDMA_QPS_PER_PEER, MemoryCacheCleanupStats, StorageConfig, lfu_window_budget,
+};
 pub use sync_state::{LoadState, LoadStateError};
 pub use trace::{set_trace_sample_rate, should_sample};
 pub use transfer::TransferMode;
