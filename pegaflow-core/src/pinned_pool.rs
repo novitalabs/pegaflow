@@ -17,6 +17,12 @@ use crate::metrics::core_metrics;
 use crate::pinned_mem::PinnedMemory;
 use pegaflow_common::{NumaNode, run_on_numa};
 
+/// Bytes one `ShardedPinnedPool::allocate_many` batch takes from a single shard
+/// before rotating to the next. Spreads a large RDMA fetch across shards the
+/// way the old 256 MiB staging chunks did, and bounds how long one batch holds
+/// a shard lock.
+const ALLOCATE_MANY_BATCH_BYTES: u64 = 256 * 1024 * 1024;
+
 #[derive(Clone, Copy)]
 pub(crate) struct MappedPinnedPtr {
     host: NonNull<u8>,
@@ -443,19 +449,41 @@ impl ShardedPinnedPool {
         None
     }
 
-    /// Allocate up to `count` regions, filling from one shard per lock
-    /// acquisition and moving to the next shard when it runs out. Returns
-    /// fewer than `count` only when every shard is exhausted.
+    /// Allocate up to `count` regions in batches of at most
+    /// [`ALLOCATE_MANY_BATCH_BYTES`]. Each batch takes the next shard in
+    /// round-robin order (one lock acquisition) and falls back to the other
+    /// shards only when that shard runs short. Returns fewer than `count` only
+    /// when every shard is exhausted.
     fn allocate_many(&self, size: NonZeroU64, count: usize) -> Vec<PinnedAllocation> {
+        self.allocate_many_batched(size, count, ALLOCATE_MANY_BATCH_BYTES)
+    }
+
+    fn allocate_many_batched(
+        &self,
+        size: NonZeroU64,
+        count: usize,
+        batch_bytes: u64,
+    ) -> Vec<PinnedAllocation> {
         let n = self.shards.len();
-        let start = self.cursor.fetch_add(1, Ordering::Relaxed) % n;
+        let per_batch = usize::try_from(batch_bytes / size.get())
+            .unwrap_or(usize::MAX)
+            .max(1);
         let mut out = Vec::with_capacity(count);
-        for i in 0..n {
-            if out.len() == count {
-                break;
+        while out.len() < count {
+            let want = per_batch.min(count - out.len());
+            let batch_start = out.len();
+            let start = self.cursor.fetch_add(1, Ordering::Relaxed) % n;
+            for i in 0..n {
+                let missing = want - (out.len() - batch_start);
+                if missing == 0 {
+                    break;
+                }
+                let idx = (start + i) % n;
+                out.extend(self.shards[idx].allocate_many(size, missing));
             }
-            let idx = (start + i) % n;
-            out.extend(self.shards[idx].allocate_many(size, count - out.len()));
+            if out.len() - batch_start < want {
+                break; // every shard is exhausted
+            }
         }
         out
     }
@@ -887,6 +915,35 @@ mod tests {
         batch.swap_remove(0);
         assert_eq!(pool.usage().0, 7 * 1024);
         assert_eq!(pool.allocate_many(size, 3).len(), 1);
+    }
+
+    #[test]
+    fn allocate_many_rotates_shards_per_batch() {
+        // Four 4 KiB shards of 1 KiB units; batches of 2 regions.
+        let pool = ShardedPinnedPool::new(
+            16384,
+            4,
+            false,
+            false,
+            NonZeroU64::new(1024),
+            NumaNode::UNKNOWN,
+        );
+        let size = NonZeroU64::new(1024).unwrap();
+        let shard_used = |pool: &ShardedPinnedPool| -> Vec<u64> {
+            pool.shards.iter().map(|s| s.usage().0).collect()
+        };
+
+        // Each batch moves to the next shard instead of filling the first.
+        let first = pool.allocate_many_batched(size, 8, 2048);
+        assert_eq!(first.len(), 8);
+        assert_eq!(shard_used(&pool), vec![2048; 4]);
+
+        // A batch whose shard runs short spills into the others; past that the
+        // result is short only because every shard is exhausted.
+        let _hole = pool.shards[0].allocate(NonZeroU64::new(2048).unwrap());
+        let second = pool.allocate_many_batched(size, 8, 2048);
+        assert_eq!(second.len(), 6);
+        assert_eq!(shard_used(&pool), vec![4096; 4]);
     }
 
     #[test]

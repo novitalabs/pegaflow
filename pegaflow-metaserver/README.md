@@ -102,13 +102,13 @@ demand, so each source has one target and targets share sources evenly.
 2. Reported blocks that already have a live target owner come back in
    `backed_hashes`; the source moves them to its reclaimable class.
 3. A target calls `PullBackupPlan` with pegaflow-server's
-   `--backup-pull-max-bytes` (default 64 MiB) while it gets plans, and once
+   `--backup-pull-max-bytes` (default 256 MiB) while it gets plans, and once
    a second when idle or after a pull that fetched nothing. The MetaServer
    pops blocks from its paired sources oldest first, skips blocks that
    already have a target owner or whose source is gone, and returns one
    namespace from one source within the byte budget. When several targets
    share a source, each block belongs to one of them by rendezvous hash.
-   The target paces pulls to its `--backup-max-bandwidth` (default 1 GiB/s,
+   The target paces pulls to its `--backup-max-bandwidth` (default 2 GiB/s,
    `0` unlimited): the next pull starts `copied bytes / bandwidth` after the
    previous one started, so backup copies leave gaps for KV transfers on the
    same NICs.

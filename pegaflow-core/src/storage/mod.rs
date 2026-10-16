@@ -82,11 +82,11 @@ pub struct StorageConfig {
     pub backup_max_bandwidth: u64,
 }
 
-/// Default decode backup plan size: short enough that one pull holds the
-/// target's NICs for only a few milliseconds.
-pub const DEFAULT_BACKUP_PULL_MAX_BYTES: u64 = 64 << 20;
-/// Default decode backup bandwidth limit, 1 GiB/s.
-pub const DEFAULT_BACKUP_MAX_BANDWIDTH: u64 = 1 << 30;
+/// Default decode backup plan size, 256 MiB: one pull holds the target's NICs
+/// for only tens of milliseconds.
+pub const DEFAULT_BACKUP_PULL_MAX_BYTES: u64 = 256 << 20;
+/// Default decode backup bandwidth limit, 2 GiB/s.
+pub const DEFAULT_BACKUP_MAX_BANDWIDTH: u64 = 2 << 30;
 
 impl Default for StorageConfig {
     fn default() -> Self {

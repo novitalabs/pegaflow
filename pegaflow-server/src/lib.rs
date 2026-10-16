@@ -201,15 +201,15 @@ pub struct Cli {
     pub backup_max_candidates: usize,
 
     /// Decode backup: most bytes one pulled plan copies on a backup target
-    /// (e.g. 64mb). Smaller plans hold the NICs for shorter bursts, leaving
+    /// (e.g. 256mb). Smaller plans hold the NICs for shorter bursts, leaving
     /// room for KV transfers between them.
-    #[arg(long, default_value = "64mb", value_parser = parse_backup_pull_max_bytes)]
+    #[arg(long, default_value = "256mb", value_parser = parse_backup_pull_max_bytes)]
     pub backup_pull_max_bytes: usize,
 
     /// Decode backup: copy bandwidth limit per second on a backup target
-    /// (e.g. 1gb); `0` is unlimited. Backup traffic shares the target's NICs
+    /// (e.g. 2gb); `0` is unlimited. Backup traffic shares the target's NICs
     /// with KV transfers, so unlimited pulls add latency to them.
-    #[arg(long, default_value = "1gb", value_parser = parse_memory_size)]
+    #[arg(long, default_value = "2gb", value_parser = parse_memory_size)]
     pub backup_max_bandwidth: usize,
 }
 

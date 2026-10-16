@@ -51,8 +51,8 @@ pegaflow-server
 - `--metaserver-queue-depth`: MetaServer registration queue depth, max pending registration batches
 - `--backup-reclaimable-percent`: Decode backup: share of the RAM cache, in percent, kept as reclaimable (backed-up) blocks (default: `10`, range `0..=100`). Once the cache is full, this node offers its oldest retained blocks for backup until the reclaimable class reaches this share. Only used when the MetaServer runs with `--enable-decode-backup`.
 - `--backup-max-candidates`: Decode backup: most candidate blocks one heartbeat reports (default: `16384`, range `1..=65536`). Bounds the heartbeat size (32 bytes per sha256 hash) and the MetaServer's per-node snapshot; the next report follows as soon as targets copy half of the current one.
-- `--backup-pull-max-bytes`: Decode backup: most bytes one pulled plan copies on a backup target (default: `64mb`, must be > 0; a plan always carries at least one block). Smaller plans hold the NICs for shorter bursts.
-- `--backup-max-bandwidth`: Decode backup: copy bandwidth limit per second on a backup target (default: `1gb`, `0` = unlimited). Backup copies share the target's NICs with KV transfers; the next pull starts `copied bytes / bandwidth` after the previous one started, and idle time does not bank a burst.
+- `--backup-pull-max-bytes`: Decode backup: most bytes one pulled plan copies on a backup target (default: `256mb`, must be > 0; a plan always carries at least one block). Smaller plans hold the NICs for shorter bursts.
+- `--backup-max-bandwidth`: Decode backup: copy bandwidth limit per second on a backup target (default: `2gb`, `0` = unlimited). Backup copies share the target's NICs with KV transfers; the next pull starts `copied bytes / bandwidth` after the previous one started, and idle time does not bank a burst.
 
 ## MetaServer
 
