@@ -27,7 +27,9 @@ def _artifacts(
     server = bin_dir / "pegaflow-server"
     server.write_text(f"#!/bin/sh\nprintf '%s\\n' 'pega-engine-server {server_version}'\n")
     server.chmod(0o755)
-    env = {**os.environ, "PATH": str(bin_dir), "PYTHONPATH": str(tmp_path / "site")}
+    env = os.environ.copy()
+    for name, path in (("PATH", bin_dir), ("PYTHONPATH", tmp_path / "site")):
+        env[name] = str(path) + (os.pathsep + env[name] if env.get(name) else "")
     return server, env, package / "pegaflow.py"
 
 
