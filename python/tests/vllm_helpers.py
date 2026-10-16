@@ -7,16 +7,139 @@ import hashlib
 import json
 import os
 import re
+import shlex
+import shutil
 import signal
 import socket
 import subprocess
+import sys
+import sysconfig
 import time
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 
 import requests
 
 DEFAULT_VLLM_SEED = 42
+
+
+@dataclass(frozen=True)
+class E2EVersionCheck:
+    server_version: str
+    client_version: str
+    client_path: str
+    vllm_path: str
+
+
+def _vllm_interpreter(vllm_path: str, env: dict[str, str]) -> str:
+    with open(vllm_path, "rb") as script:
+        first_line = script.readline().decode("utf-8", errors="replace").strip()
+    if not first_line.startswith("#!"):
+        raise RuntimeError(f"Cannot identify the Python interpreter for vLLM: {vllm_path}")
+    command = shlex.split(first_line[2:])
+    if not command:
+        raise RuntimeError(f"Empty vLLM shebang: {vllm_path}")
+    if Path(command[0]).name == "env":
+        command = [part for part in command[1:] if part not in ("-S",)]
+        if not command:
+            raise RuntimeError(f"Cannot identify the Python interpreter for vLLM: {vllm_path}")
+    interpreter = shutil.which(command[0], path=env["PATH"])
+    if interpreter is None:
+        raise RuntimeError(f"vLLM Python interpreter not found: {command[0]}")
+    return interpreter
+
+
+def preflight_pegaflow_versions(
+    server_binary: str | None = None,
+    env: dict[str, str] | None = None,
+    cargo_features: list[str] | None = None,
+) -> E2EVersionCheck:
+    """Compare the server with the native extension used by the vLLM executable."""
+    launch_env = (env or os.environ).copy()
+    launch_env["PATH"] = f"{Path(sys.executable).parent}:{launch_env.get('PATH', '')}"
+    vllm_path = shutil.which("vllm", path=launch_env["PATH"])
+    if vllm_path is None:
+        raise RuntimeError("vLLM executable not found on the E2E launch PATH")
+    interpreter = _vllm_interpreter(vllm_path, launch_env)
+    feature_args = (
+        f"--no-default-features --features {','.join(cargo_features)}" if cargo_features else ""
+    )
+    rebuild_hint = (
+        "Rebuild the client into the vLLM environment:\n"
+        f"  cd python && VIRTUAL_ENV={shlex.quote(str(Path(interpreter).parent.parent))} "
+        f"uvx maturin develop --uv {feature_args}".rstrip()
+    )
+
+    project_root = Path(__file__).parents[2]
+    if server_binary is None:
+        metadata = subprocess.run(
+            ["cargo", "metadata", "--no-deps", "--format-version", "1"],
+            cwd=project_root,
+            env=launch_env,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        )
+        packages = json.loads(metadata.stdout)["packages"]
+        server_version = next(
+            pkg["version"] for pkg in packages if pkg["name"] == "pegaflow-server"
+        )
+        server_label = str(project_root / "pegaflow-server/Cargo.toml") + " (cargo run)"
+    else:
+        server_env = launch_env.copy()
+        if libdir := sysconfig.get_config_var("LIBDIR"):
+            server_env["LD_LIBRARY_PATH"] = (
+                f"{libdir}:{server_env['LD_LIBRARY_PATH']}"
+                if server_env.get("LD_LIBRARY_PATH")
+                else libdir
+            )
+        version = subprocess.run(
+            [server_binary, "--version"],
+            env=server_env,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+        match = re.search(r"\b\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?\b", version.stdout)
+        if match is None:
+            raise RuntimeError(
+                f"Cannot parse PegaFlow server version from {server_binary}: {version.stdout!r}"
+            )
+        server_version = match.group()
+        server_label = server_binary
+
+    probe = subprocess.run(
+        [
+            interpreter,
+            "-c",
+            "import importlib, json; ext = importlib.import_module('pegaflow.pegaflow'); "
+            "print(json.dumps({'version': ext.__version__, 'path': ext.__file__}))",
+        ],
+        cwd=Path(vllm_path).parent,
+        env=launch_env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if probe.returncode != 0:
+        raise RuntimeError(
+            f"vLLM's Python ({interpreter}) cannot import the pegaflow native extension: "
+            f"{probe.stderr.strip()}\n{rebuild_hint}"
+        )
+    client = json.loads(probe.stdout.splitlines()[-1])
+    client_version = client["version"]
+    client_path = client["path"]
+    if client_version != server_version:
+        raise RuntimeError(
+            "PegaFlow version mismatch before E2E startup:\n"
+            f"  server binary : {server_version}  ({server_label})\n"
+            f"  client extension: {client_version}  ({client_path})\n"
+            f"{rebuild_hint}"
+        )
+    return E2EVersionCheck(server_version, client_version, client_path, vllm_path)
 
 
 def _uses_linear_attention(model: str) -> bool:
@@ -372,6 +495,14 @@ class PegaFlowServer:
 
     def __enter__(self):
         project_root = Path(__file__).parent.parent.parent
+
+        versions = preflight_pegaflow_versions(
+            server_binary=self.server_binary, cargo_features=self.cargo_features
+        )
+        print(
+            f"[PegaFlow E2E preflight] server={versions.server_version}, "
+            f"vLLM client={versions.client_version} ({versions.client_path})"
+        )
 
         if self.server_binary is None:
             cmd = ["cargo", "run", "-r"]

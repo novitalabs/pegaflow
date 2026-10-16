@@ -33,6 +33,7 @@ from .vllm_helpers import (
     e2e_max_tokens,
     fetch_pegaflow_metrics,
     fetch_pegaflow_rpc_failures,
+    preflight_pegaflow_versions,
 )
 
 # ---------------------------------------------------------------------------
@@ -227,12 +228,17 @@ class TestE2ECorrectness:
     """
 
     @pytest.fixture(scope="class")
+    def version_preflight(self) -> None:
+        preflight_pegaflow_versions()
+
+    @pytest.fixture(scope="class")
     def log_dir(self, tmp_path_factory) -> Path:
         return tmp_path_factory.mktemp("e2e_logs")
 
     @pytest.fixture(scope="class")
     def pegaflow_server(
         self,
+        version_preflight: None,
         log_dir: Path,
         pegaflow_use_hugepages: bool,
         pegaflow_pool_size: str,
@@ -248,6 +254,7 @@ class TestE2ECorrectness:
     @pytest.fixture(scope="class")
     def baseline_outputs(
         self,
+        version_preflight: None,
         model: str,
         base_port: int,
         log_dir: Path,
