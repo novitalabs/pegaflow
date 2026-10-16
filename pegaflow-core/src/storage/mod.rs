@@ -13,7 +13,9 @@ use std::num::NonZeroU64;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use crate::backing::{AllocateFn, DEFAULT_MAX_PREFETCH_BLOCKS, SsdBackingStore, SsdCacheConfig};
+use crate::backing::{
+    AllocateFn, DEFAULT_MAX_PREFETCH_BLOCKS, SsdBackingStore, SsdCacheCleanupStats, SsdCacheConfig,
+};
 #[cfg(feature = "rdma")]
 use crate::backing::{AllocateManyFn, RdmaFetchStore, RdmaTransport};
 use crate::block::{BlockKey, PrefetchStatus, SealedBlock};
@@ -421,6 +423,12 @@ impl StorageEngine {
         if let Some(ssd) = &self.ssd_store {
             ssd.flush().await;
         }
+    }
+
+    pub(crate) async fn cleanup_ssd_cache(&self) -> Option<SsdCacheCleanupStats> {
+        let ssd = self.ssd_store.as_ref()?;
+        self.flush_write_pipeline().await;
+        Some(ssd.cleanup().await)
     }
 
     /// Flush the MetaServer registration queue: waits until every hash

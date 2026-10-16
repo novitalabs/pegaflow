@@ -199,6 +199,35 @@ async fn ssd_write_persists_to_file() {
     );
 }
 
+/// Cleanup drains preceding writes, invalidates SSD hits, and leaves the ring reusable.
+#[tokio::test]
+async fn ssd_cleanup_invalidates_index_and_allows_new_writes() {
+    skip_without_io_uring!();
+    let (env, _cache_path, _temp_dir) = ssd_env("test-ssd-cleanup");
+    let target = env.hashes(1);
+
+    env.save_and_wait(&target).await;
+    let stats = env
+        .engine
+        .cleanup_ssd_cache()
+        .await
+        .expect("SSD cache is enabled");
+    assert_eq!(stats.removed_entries, target.len());
+    assert_eq!(stats.invalidated_bytes, (target.len() * BLOCK_SIZE) as u64);
+
+    cleanup_resident_memory(&env);
+    let (hit, missing) = wait_query_ready(&env, &target).await;
+    assert_eq!(hit, 0);
+    assert_eq!(missing, target.len());
+
+    env.save_and_wait(&target).await;
+    env.engine.flush_all().await;
+    cleanup_resident_memory(&env);
+    let (hit, missing) = wait_query_ready(&env, &target).await;
+    assert_eq!(hit, target.len());
+    assert_eq!(missing, 0);
+}
+
 /// Full SSD prefetch round-trip: save → flush to SSD → evict from memory →
 /// query (triggers SSD prefetch) → load → verify data integrity.
 #[tokio::test]
