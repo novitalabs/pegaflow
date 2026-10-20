@@ -239,11 +239,11 @@ pub(crate) struct TinyLfu {
 }
 
 impl TinyLfu {
-    fn get<T: Hash>(&self, key: T) -> u8 {
+    pub(crate) fn get<T: Hash>(&self, key: T) -> u8 {
         self.estimator.get(key)
     }
 
-    fn incr<T: Hash>(&self, key: T) -> u8 {
+    pub(crate) fn incr<T: Hash>(&self, key: T) -> u8 {
         let window_size = self.window_counter.fetch_add(1, Ordering::Relaxed);
         if window_size == self.window_limit || window_size > self.window_limit * 2 {
             self.window_counter.store(0, Ordering::Relaxed);
@@ -253,7 +253,7 @@ impl TinyLfu {
     }
 
     // Because we use 8-bit counters, window size can be 256 * the cache size.
-    fn new(cache_size: usize) -> Self {
+    pub(crate) fn new(cache_size: usize) -> Self {
         Self {
             estimator: Estimator::optimal(cache_size),
             window_counter: Default::default(),

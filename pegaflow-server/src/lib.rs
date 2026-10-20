@@ -26,7 +26,7 @@ use opentelemetry_sdk::metrics::SdkMeterProvider;
 use pegaflow_common::grpc::{
     GRPC_SERVER_HTTP2_KEEPALIVE_INTERVAL, GRPC_SERVER_HTTP2_KEEPALIVE_TIMEOUT,
 };
-use pegaflow_core::PegaEngine;
+use pegaflow_core::{EvictionPolicy, PegaEngine};
 use prometheus::Registry;
 use proto::engine::engine_server::EngineServer;
 use pyo3::{PyErr, Python, types::PyAnyMethods};
@@ -75,7 +75,11 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub use_hugepages: bool,
 
-    /// Enable TinyLFU admission policy for cache (default: plain LRU)
+    /// Host-memory eviction policy: lru or clock-fifo.
+    #[arg(long, default_value_t = EvictionPolicy::Lru)]
+    pub eviction_policy: EvictionPolicy,
+
+    /// Enable TinyLFU admission independently of the eviction policy (default: disabled).
     #[arg(long, default_value_t = false)]
     pub enable_lfu_admission: bool,
 
@@ -582,6 +586,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     };
 
     let storage_config = pegaflow_core::StorageConfig {
+        eviction_policy: cli.eviction_policy,
         enable_lfu_admission: cli.enable_lfu_admission,
         hint_value_size_bytes: cli.hint_value_size,
         max_prefetch_blocks: cli.max_prefetch_blocks,

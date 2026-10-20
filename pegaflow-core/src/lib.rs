@@ -50,7 +50,7 @@ pub use pinned_pool::PinnedAllocation;
 pub use seal_offload::SlotMeta;
 pub use storage::{
     DEFAULT_BACKUP_MAX_BANDWIDTH, DEFAULT_BACKUP_PULL_MAX_BYTES, DEFAULT_RDMA_QPS_PER_PEER,
-    MemoryCacheCleanupStats, StorageConfig,
+    EvictionPolicy, MemoryCacheCleanupStats, StorageConfig,
 };
 pub use sync_state::{LoadState, LoadStateError};
 pub use trace::{set_trace_sample_rate, should_sample};

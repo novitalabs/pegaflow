@@ -13,10 +13,32 @@ pegaflow-server
 - `--pool-size`: Pinned memory pool size (default: `30gb`, supports: `kb`, `mb`, `gb`, `tb`)
 - `--hint-value-size`: Hint for typical value size to tune cache and allocator (optional, supports: `kb`, `mb`, `gb`, `tb`)
 - `--use-hugepages`: Use huge pages for pinned memory (default: `false`, requires pre-configured `/proc/sys/vm/nr_hugepages`)
-- `--enable-lfu-admission`: Enable TinyLFU cache admission policy (default: plain LRU)
+- `--eviction-policy`: Host-memory cache eviction policy: `lru` or `clock-fifo` (default: `lru`)
+- `--enable-lfu-admission`: Enable TinyLFU admission with either eviction policy (default: disabled)
 - `--disable-numa-affinity`: Disable NUMA-aware memory allocation (default: enabled)
 - `--blockwise-alloc`: Allocate each block separately instead of contiguous batch allocation. Reduces memory fragmentation when blocks are freed in different order (default: `false`)
 - `--log-level`: Log level: `trace`, `debug`, `info`, `warn`, `error` (default: `info`)
+
+### Host-Memory Eviction
+
+The default remains the upstream LRU (least recently used) implementation:
+
+```bash
+pegaflow-server --pool-size 30gb
+```
+
+Select CLOCK-FIFO explicitly to use FIFO queues with a second chance for recently
+accessed blocks:
+
+```bash
+pegaflow-server --pool-size 30gb --eviction-policy clock-fifo
+```
+
+The policy is selected at startup. Changing it requires restarting the server.
+Both policies keep reclaimable and retained classes, protect pinned blocks from
+pressure eviction, and support decode backups and memory cleanup. The
+`--enable-lfu-admission` flag is independent of this choice; it controls admission,
+not eviction order. SSD eviction remains FIFO.
 
 ### HTTP & Metrics
 
