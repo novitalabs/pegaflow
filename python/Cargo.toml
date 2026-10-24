@@ -31,6 +31,7 @@ pyo3 = { workspace = true, features = ["extension-module"] }
 pegaflow-common.workspace = true
 pegaflow-core = { workspace = true, default-features = false }
 pegaflow-proto = { path = "../pegaflow-proto" }
+pegaflow-semantics.workspace = true
 pegaflow-server = { path = "../pegaflow-server", default-features = false }
 pegaflow-metaserver = { path = "../pegaflow-metaserver", default-features = false }
 pegaflow-pd-wire = { workspace = true, optional = true }

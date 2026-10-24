@@ -1,0 +1,7 @@
+{
+ "attention_backend": null,
+ "batch_invariant": true,
+ "invariant_attention_backend": "FLASH_ATTN",
+ "vllm_args": [],
+ "notes": "Dense full attention, one KV group. Batch invariance on FLASH_ATTN makes gsm8k outputs and KV bytes comparable across runs."
+}

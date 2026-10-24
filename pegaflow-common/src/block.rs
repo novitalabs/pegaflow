@@ -30,14 +30,11 @@ impl BlockKey {
 /// (and every current connector) stay bit-identical. Groups >= 1 append the
 /// big-endian group id, which cannot collide with a raw content hash because
 /// every real hash family is fixed-length.
+///
+/// The rule itself lives in `pegaflow-semantics` so connectors and the store
+/// share one definition.
 pub fn group_hash(hash: &[u8], group_id: u32) -> Vec<u8> {
-    if group_id == 0 {
-        return hash.to_vec();
-    }
-    let mut encoded = Vec::with_capacity(hash.len() + 4);
-    encoded.extend_from_slice(hash);
-    encoded.extend_from_slice(&group_id.to_be_bytes());
-    encoded
+    pegaflow_semantics::key(hash, group_id)
 }
 
 #[cfg(test)]

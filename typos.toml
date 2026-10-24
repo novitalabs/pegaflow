@@ -1,3 +1,7 @@
+[default]
+# Git commit hashes in docs (e.g. "c330abd")
+extend-ignore-re = ["\\b[0-9a-f]{7,40}\\b"]
+
 [default.extend-words]
 # Rust std library path (std::f64::consts)
 consts = "consts"

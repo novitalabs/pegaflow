@@ -1,0 +1,14 @@
+# Policy knobs shared by every model; models/<profile>.toml overrides them.
+# Keys must be fields of pegaflow.connector_v2.policy.Policy.
+
+# How long a request may stay unscheduled while the server prefetches
+# (SSD / remote). 0 = never wait: a Loading answer counts as a miss.
+loading_wait_ms = 1000
+
+# Hits of at most this many tokens are copied before the forward of the step
+# that schedules them (no extra scheduling round trip, the step waits for the
+# copy); longer hits load asynchronously so one big copy does not stall the
+# whole batch. 0 = always asynchronous. The core only loads synchronously when
+# vLLM can recover from a failed synchronous load (one KV cache group, no
+# block zeroing); otherwise every load is asynchronous.
+sync_load_tokens = 256

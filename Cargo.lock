@@ -1902,6 +1902,7 @@ dependencies = [
  "libc",
  "log",
  "logforth",
+ "pegaflow-semantics",
 ]
 
 [[package]]
@@ -1988,11 +1989,20 @@ dependencies = [
  "pegaflow-metaserver",
  "pegaflow-pd-wire",
  "pegaflow-proto",
+ "pegaflow-semantics",
  "pegaflow-server",
  "pegaflow-transfer",
  "pyo3",
  "tokio",
  "tonic",
+]
+
+[[package]]
+name = "pegaflow-semantics"
+version = "0.25.1"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
