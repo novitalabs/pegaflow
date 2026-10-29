@@ -26,6 +26,22 @@ struct CleanupResponse {
     removed_keys: usize,
 }
 
+async fn run_cleanup(
+    store: Arc<BlockHashStore>,
+    cleanup: impl FnOnce(&BlockHashStore) -> crate::store::SweepStats + Send + 'static,
+) -> Result<Json<CleanupResponse>, StatusCode> {
+    match tokio::task::spawn_blocking(move || cleanup(&store)).await {
+        Ok(stats) => Ok(Json(CleanupResponse {
+            removed_owners: stats.removed_owners,
+            removed_keys: stats.removed_keys,
+        })),
+        Err(err) => {
+            warn!("manual cleanup worker failed: {err}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
 async fn health_handler() -> &'static str {
     "ok"
 }
@@ -44,22 +60,26 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
 async fn cleanup_expired_blocks_handler(
     State(state): State<AppState>,
 ) -> Result<Json<CleanupResponse>, StatusCode> {
-    let store = Arc::clone(&state.store);
-    let stats = match tokio::task::spawn_blocking(move || {
+    run_cleanup(Arc::clone(&state.store), |store| {
         store.remove_owners_older_than(std::time::Duration::from_secs(MANUAL_CLEANUP_AGE_SECS))
     })
     .await
-    {
-        Ok(stats) => stats,
-        Err(err) => {
-            warn!("manual cleanup worker failed: {err}");
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-    };
-    Ok(Json(CleanupResponse {
-        removed_owners: stats.removed_owners,
-        removed_keys: stats.removed_keys,
-    }))
+}
+
+/// POST /admin/clear-all-blocks
+///
+/// Drops every block ownership record regardless of age. Node sessions and the
+/// KV data held by the nodes themselves are untouched, so cleared blocks stay
+/// resident locally but become invisible to cross-node prefix queries.
+async fn clear_all_blocks_handler(
+    State(state): State<AppState>,
+) -> Result<Json<CleanupResponse>, StatusCode> {
+    let response = run_cleanup(Arc::clone(&state.store), |store| store.clear_blocks()).await?;
+    warn!(
+        "Manual clear-all-blocks: removed keys={} owners={}",
+        response.removed_keys, response.removed_owners
+    );
+    Ok(response)
 }
 
 fn public_app(state: AppState) -> Router {
@@ -70,6 +90,7 @@ fn public_app(state: AppState) -> Router {
             "/admin/cleanup-expired-blocks",
             post(cleanup_expired_blocks_handler),
         )
+        .route("/admin/clear-all-blocks", post(clear_all_blocks_handler))
         .with_state(state)
 }
 
@@ -87,7 +108,7 @@ pub async fn start_http_server(
     };
 
     info!(
-        "Starting HTTP server on {} (/health, /metrics, /admin/cleanup-expired-blocks)",
+        "Starting HTTP server on {} (/health, /metrics, /admin/cleanup-expired-blocks, /admin/clear-all-blocks)",
         addr
     );
 
@@ -156,6 +177,36 @@ mod tests {
         assert_eq!(store.entry_count(), 2);
         assert_eq!(store.node_counts(), (2, 0));
         assert_eq!(store.redundancy_snapshot().keys_1, 2);
+    }
+
+    #[tokio::test]
+    async fn clear_all_blocks_route_removes_fresh_owners_too() {
+        let store = Arc::new(crate::store::tests::manual_cleanup_fixture());
+        let app = public_app(AppState {
+            prometheus_registry: Registry::new(),
+            store: Arc::clone(&store),
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/clear-all-blocks")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .as_ref(),
+            br#"{"removed_owners":4,"removed_keys":3}"#.as_slice(),
+        );
+        assert_eq!(store.entry_count(), 0);
+        assert_eq!(store.owner_count(), 0);
     }
 
     #[tokio::test]
