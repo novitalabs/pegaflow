@@ -32,6 +32,7 @@ pegaflow-server
 - `GET /instances`: List registered instance IDs.
 - `POST /instances/cleanup[?id=<instance_id>]`: Remove one instance, or all instances when `id` is omitted.
 - `POST /cache/memory/cleanup`: Evict resident in-memory cache blocks while preserving backing-store data. `evicted_bytes` is the cache footprint removed from residency; `reclaimed_bytes` is the pinned-pool memory actually released immediately.
+- `POST /cache/ssd/cleanup`: Remove SSD cache index entries after draining preceding saves and writes. The preallocated cache files and resident memory cache remain unchanged. Returns `409 Conflict` when SSD caching is disabled.
 
 ### SSD Cache
 

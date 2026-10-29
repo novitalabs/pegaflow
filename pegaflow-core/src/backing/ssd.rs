@@ -13,8 +13,8 @@ use pegaflow_common::NumaNode;
 
 use super::SsdCacheConfig;
 use super::ssd_cache::{
-    PrefetchBatch, PrefetchRequest, PreparedBatch, SsdRingBuffer, SsdWriteBatch, SsdWriteCommand,
-    ssd_prefetch_loop, ssd_writer_loop,
+    PrefetchBatch, PrefetchRequest, PreparedBatch, SsdCacheCleanupStats, SsdRingBuffer,
+    SsdWriteBatch, SsdWriteCommand, ssd_prefetch_loop, ssd_writer_loop,
 };
 use super::uring::{UringConfig, UringIoEngine};
 use super::{AllocateFn, PrefetchResult};
@@ -122,6 +122,10 @@ impl SsdBackingStore {
         self.inner.lock().ring.commit(key, success);
     }
 
+    pub(super) fn clear_index(&self) -> SsdCacheCleanupStats {
+        self.inner.lock().ring.clear()
+    }
+
     pub(super) fn is_numa(&self) -> bool {
         self.is_numa
     }
@@ -178,6 +182,20 @@ impl SsdBackingStore {
         if self.write_tx.send(SsdWriteCommand::Flush(tx)).await.is_ok() {
             let _ = rx.await;
         }
+    }
+
+    /// Wait for preceding writes, then remove every SSD index entry.
+    pub(crate) async fn cleanup(&self) -> SsdCacheCleanupStats {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .write_tx
+            .send(SsdWriteCommand::Cleanup(tx))
+            .await
+            .is_err()
+        {
+            return SsdCacheCleanupStats::default();
+        }
+        rx.await.unwrap_or_default()
     }
 
     /// Count consecutive SSD-resident keys from the start of `keys`.
