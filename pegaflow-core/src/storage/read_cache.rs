@@ -192,6 +192,19 @@ impl ReadCache {
         resident_keys
     }
 
+    /// Insert into the reclaimable class, which pressure eviction drains first.
+    pub(super) fn batch_insert_reclaimable(&self, blocks: &[(BlockKey, Arc<SealedBlock>)]) {
+        let mut inner = self.inner.lock();
+        for (key, block) in blocks {
+            insert_block(
+                &mut inner,
+                key.clone(),
+                Arc::clone(block),
+                ResidentClass::Reclaimable,
+            );
+        }
+    }
+
     pub(super) fn resident_generations(&self, keys: &[BlockKey]) -> Vec<(BlockKey, u64)> {
         let inner = self.inner.lock();
         keys.iter()

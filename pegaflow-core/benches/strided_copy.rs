@@ -1,10 +1,10 @@
 //! Strided host<->device copies in the shape of v2 runs: `rows` rows of `width`
 //! bytes, contiguous on the device and `host_pitch` apart in the object.
 //!
-//! Compares the [`StridedCopier`] modes object copies can run (one `cuMemcpy2DAsync`
-//! per run, one strided kernel launch, auto), one `cuMemcpyAsync` per row, the
-//! v1 copy kernel with one descriptor per row, and one contiguous copy of the
-//! same bytes as the PCIe ceiling.
+//! Compares the [`StridedCopier`] kernel object copies use with one
+//! `cuMemcpy2DAsync` per run, one `cuMemcpyAsync` per row, the v1 copy kernel
+//! with one descriptor per row, and one contiguous copy of the same bytes as
+//! the PCIe ceiling.
 //!
 //! `cargo bench --bench strided_copy` (needs a GPU; `STRIDED_COPY_GPU` picks one).
 
@@ -14,8 +14,7 @@ use std::time::Instant;
 
 use cudarc::driver::{CudaContext, CudaStream, sys};
 use pegaflow_core::transfer::{
-    CopyDesc, KernelBackend, MemcpyBackend, StridedCopier, StridedCopy, StridedMode,
-    TransferBackend,
+    CopyDesc, KernelBackend, MemcpyBackend, StridedCopier, StridedCopy, TransferBackend,
 };
 
 const TOTAL: usize = 64 << 20;
@@ -160,6 +159,49 @@ fn contiguous(b: &Buffers, dir: Dir, stream: &CudaStream) {
     ok(r, "contiguous copy");
 }
 
+/// One `cuMemcpy2DAsync` of `c`, the copy-engine reference.
+fn dma_2d(c: &StridedCopy, dir: Dir, stream: &CudaStream) {
+    use sys::CUmemorytype::{CU_MEMORYTYPE_DEVICE, CU_MEMORYTYPE_HOST};
+    let (src_type, src_pitch, dst_type, dst_pitch) = match dir {
+        Dir::D2H => (
+            CU_MEMORYTYPE_DEVICE,
+            c.device_pitch,
+            CU_MEMORYTYPE_HOST,
+            c.host_pitch,
+        ),
+        Dir::H2D => (
+            CU_MEMORYTYPE_HOST,
+            c.host_pitch,
+            CU_MEMORYTYPE_DEVICE,
+            c.device_pitch,
+        ),
+    };
+    // The struct holds enums, so it is built field by field, not zeroed.
+    let p = sys::CUDA_MEMCPY2D {
+        srcXInBytes: 0,
+        srcY: 0,
+        srcMemoryType: src_type,
+        srcHost: c.host.cast_const().cast(),
+        srcDevice: c.device,
+        srcArray: std::ptr::null_mut(),
+        srcPitch: src_pitch as usize,
+        dstXInBytes: 0,
+        dstY: 0,
+        dstMemoryType: dst_type,
+        dstHost: c.host.cast(),
+        dstDevice: c.device,
+        dstArray: std::ptr::null_mut(),
+        dstPitch: dst_pitch as usize,
+        WidthInBytes: c.width as usize,
+        Height: c.rows as usize,
+    };
+    // SAFETY: the run lies inside both buffers, which outlive the copy.
+    ok(
+        unsafe { sys::cuMemcpy2DAsync_v2(&p, stream.cu_stream()) },
+        "cuMemcpy2DAsync",
+    );
+}
+
 /// Median GB/s over `ITERS` timed runs after one warmup.
 fn time(stream: &Arc<CudaStream>, mut f: impl FnMut()) -> f64 {
     f();
@@ -183,10 +225,7 @@ fn main() {
     let stream = ctx.new_stream().expect("stream");
     let kernel = KernelBackend::new(&ctx).expect("kernel backend");
     let memcpy = MemcpyBackend;
-    let mut modes: Vec<StridedCopier> = [StridedMode::Dma, StridedMode::Kernel, StridedMode::Auto]
-        .into_iter()
-        .map(|m| StridedCopier::new(&ctx, m).expect("strided copier"))
-        .collect();
+    let mut strided = StridedCopier::new(&ctx).expect("strided copier");
 
     let shape = |name, width, rows, device_pitch, host_pitch| Shape {
         name,
@@ -209,21 +248,23 @@ fn main() {
     ];
     println!("{TOTAL} bytes per measurement, GB/s (median of {ITERS})");
     println!(
-        "{:<38} {:>4} {:>7} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
-        "shape", "dir", "runs", "dma2d", "strided", "auto", "1d/row", "krn/row", "contig"
+        "{:<38} {:>4} {:>7} {:>8} {:>8} {:>8} {:>8} {:>8}",
+        "shape", "dir", "runs", "dma2d", "strided", "1d/row", "krn/row", "contig"
     );
     for s in shapes {
         let b = Buffers::new(s.host_len().max(TOTAL), s.device_len().max(TOTAL));
         let d = descs(&b, &s);
         let r = runs(&b, &s);
         for dir in [Dir::H2D, Dir::D2H] {
-            let mut by_mode = [0.0; 3];
-            for (i, m) in modes.iter_mut().enumerate() {
-                by_mode[i] = time(&stream, || match dir {
-                    Dir::H2D => m.h2d(&r, &stream).expect("h2d"),
-                    Dir::D2H => m.d2h(&r, &stream).expect("d2h"),
-                });
-            }
+            let dma2d = time(&stream, || {
+                for c in &r {
+                    dma_2d(c, dir, &stream);
+                }
+            });
+            let kernel_strided = time(&stream, || match dir {
+                Dir::H2D => strided.h2d(&r, &stream).expect("h2d"),
+                Dir::D2H => strided.d2h(&[&r], &stream).expect("d2h"),
+            });
             let rows = time(&stream, || match dir {
                 Dir::H2D => memcpy.h2d(&d, &stream).expect("h2d"),
                 Dir::D2H => memcpy.d2h(&d, &stream).expect("d2h"),
@@ -234,13 +275,12 @@ fn main() {
             });
             let flat = time(&stream, || contiguous(&b, dir, &stream));
             println!(
-                "{:<38} {:>4} {:>7} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2}",
+                "{:<38} {:>4} {:>7} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2}",
                 s.name,
                 if dir == Dir::H2D { "h2d" } else { "d2h" },
                 s.runs(),
-                by_mode[0],
-                by_mode[1],
-                by_mode[2],
+                dma2d,
+                kernel_strided,
                 rows,
                 kern,
                 flat

@@ -211,13 +211,6 @@ pub struct Cli {
     /// with KV transfers, so unlimited pulls add latency to them.
     #[arg(long, default_value = "2gb", value_parser = parse_memory_size)]
     pub backup_max_bandwidth: usize,
-
-    /// Object copy path: `dma` (cuMemcpy2D per run, on the copy engines),
-    /// `kernel` (one launch over mapped pinned memory, on the SMs) or `auto`
-    /// (loads by kernel; saves of large runs of wide rows on the copy engines,
-    /// the rest by kernel).
-    #[arg(long, default_value = "auto")]
-    pub object_copy: pegaflow_core::transfer::StridedMode,
 }
 
 fn parse_backup_pull_max_bytes(s: &str) -> Result<usize, String> {
@@ -649,10 +642,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
     runtime.block_on(async move {
         // Create PegaEngine inside tokio runtime context (needed for SSD cache tokio::spawn)
-        let engine = Arc::new(
-            PegaEngine::new_with_config(cli.pool_size, cli.use_hugepages, storage_config)?
-                .with_object_copy_mode(cli.object_copy),
-        );
+        let engine = Arc::new(PegaEngine::new_with_config(
+            cli.pool_size,
+            cli.use_hugepages,
+            storage_config,
+        )?);
 
         let service = GrpcEngineService::new(
             Arc::clone(&engine),

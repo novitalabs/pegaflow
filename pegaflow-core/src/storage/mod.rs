@@ -26,6 +26,7 @@ use pegaflow_common::NumaNode;
 use prefetch::PrefetchScheduler;
 #[cfg(feature = "rdma")]
 use prefetch::RdmaFetch;
+pub(crate) use prefetch::{FetchPart, PartsPoll};
 pub(crate) use read_cache::{DEFAULT_BACKUP_RECLAIMABLE_PERCENT, DemotionReason, ReadCache};
 use write_path::{InsertDeps, WritePipeline};
 
@@ -466,34 +467,82 @@ impl StorageEngine {
         self.read_cache.get_blocks_aligned(&keys)
     }
 
-    /// Position-aligned resident blocks for `keys`; with `stop_at_miss`, every
-    /// key after the first miss reports `None`. Hits refresh recency.
-    pub(crate) fn lookup_blocks(
-        &self,
-        keys: &[BlockKey],
-        stop_at_miss: bool,
-    ) -> Vec<Option<Arc<crate::block::SealedBlock>>> {
-        if !stop_at_miss {
-            return self.read_cache.get_blocks_aligned(keys);
-        }
-        let (_, blocks) = self.read_cache.get_prefix_blocks(keys);
-        let mut out: Vec<_> = blocks.into_iter().map(Some).collect();
-        out.resize(keys.len(), None);
-        out
+    /// Position-aligned resident blocks for `keys`, of any namespaces. Hits
+    /// refresh recency.
+    pub(crate) fn get_blocks_aligned(&self, keys: &[BlockKey]) -> Vec<Option<Arc<SealedBlock>>> {
+        self.read_cache.get_blocks_aligned(keys)
     }
 
-    /// Insert sealed objects into the read cache; returns how many are resident.
-    ///
-    /// Objects bypass the insert worker, SSD and MetaServer: they are sealed
-    /// by the caller and only read back from pinned memory.
-    pub(crate) fn insert_objects(
-        &self,
-        blocks: Vec<(BlockKey, Arc<crate::block::SealedBlock>)>,
-    ) -> usize {
-        if blocks.is_empty() {
-            return 0;
-        }
-        self.read_cache.batch_insert_refs(&blocks).len()
+    /// Bytes of the pinned pool.
+    pub(crate) fn pool_capacity(&self) -> u64 {
+        self.allocator.usage().1
+    }
+
+    /// Publish blocks sealed outside the insert worker, as it publishes its
+    /// own: into the read cache, to SSD, and resident ones to the MetaServer.
+    /// Returns how many are resident.
+    pub(crate) fn insert_sealed(&self, blocks: &[(BlockKey, Arc<SealedBlock>)]) -> usize {
+        write_path::publish_sealed(
+            &self.read_cache,
+            self.ssd_store.as_ref(),
+            self.metaserver_client.as_ref(),
+            blocks,
+        )
+        .len()
+    }
+
+    /// Insert node-local copies of resident blocks: reclaimable, so pressure
+    /// drops them first, and never written to SSD or announced to peers.
+    pub(crate) fn insert_local_copies(&self, blocks: &[(BlockKey, Arc<SealedBlock>)]) {
+        self.read_cache.batch_insert_reclaimable(blocks);
+    }
+
+    /// Resident blocks for `keys`, without refreshing recency.
+    pub(crate) fn peek_blocks(&self, keys: &[BlockKey]) -> Vec<Option<Arc<SealedBlock>>> {
+        self.read_cache.peek_blocks(keys)
+    }
+
+    /// Whether SSD or peers can serve blocks this node does not hold in memory.
+    pub(crate) fn has_backing(&self) -> bool {
+        self.ssd_store.is_some() || self.prefetch.rdma_fetch().is_some()
+    }
+
+    /// Per set of keys of one namespace, how many of its leading keys peers
+    /// and then SSD can bring in: peers serve a prefix, SSD the keys after it.
+    pub(crate) async fn reach(&self, sets: &[Vec<BlockKey>]) -> Vec<usize> {
+        let remote = match self.prefetch.rdma_fetch() {
+            Some(rdma) => {
+                futures::future::join_all(sets.iter().map(|set| async move {
+                    let Some(first) = set.first() else {
+                        return 0;
+                    };
+                    let hashes: Vec<Vec<u8>> = set.iter().map(|k| k.hash.clone()).collect();
+                    rdma.remote_prefix(&first.namespace, &hashes).await
+                }))
+                .await
+            }
+            None => vec![0; sets.len()],
+        };
+        sets.iter()
+            .zip(remote)
+            .map(|(set, n)| {
+                let n = n.min(set.len());
+                n + self
+                    .ssd_store
+                    .as_ref()
+                    .map_or(0, |ssd| ssd.prefix_len(&set[n..]))
+            })
+            .collect()
+    }
+
+    /// Start fetching `parts` for `req_id`; see [`PrefetchScheduler::start_parts`].
+    pub(crate) fn start_fetch(&self, req_id: &str, parts: Vec<FetchPart>) -> bool {
+        self.prefetch.start_parts(req_id, parts)
+    }
+
+    /// Poll the fetch [`Self::start_fetch`] started for `req_id`.
+    pub(crate) async fn poll_fetch(&self, req_id: &str) -> PartsPoll {
+        self.prefetch.poll_parts(&self.read_cache, req_id).await
     }
 
     /// Evict all blocks from the resident in-memory read cache.
