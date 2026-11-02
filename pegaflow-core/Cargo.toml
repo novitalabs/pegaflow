@@ -62,10 +62,6 @@ harness = false
 name = "transfer_h2d"
 harness = false
 
-[[bench]]
-name = "strided_copy"
-harness = false
-
 [[example]]
 name = "pinned_alloc"
 
