@@ -18,6 +18,7 @@ use std::sync::Arc;
 use log::{debug, info, warn};
 use tonic::{Request, Response, Status, async_trait};
 
+use pegaflow_proto::proto::engine as pb;
 use pegaflow_proto::proto::engine::engine_server::{Engine, EngineServer};
 use pegaflow_proto::proto::engine::{
     HealthRequest, HealthResponse, LoadRequest, LoadResponse, QueryBlocksForTransferRequest,
@@ -284,5 +285,33 @@ impl Engine for P2pTransferService {
         _request: Request<SessionRequest>,
     ) -> Result<Response<Self::SessionStream>, Status> {
         Self::not_served("session")
+    }
+
+    async fn register_object_device(
+        &self,
+        _request: Request<pb::RegisterObjectDeviceRequest>,
+    ) -> Result<Response<pb::RegisterObjectDeviceResponse>, Status> {
+        Self::not_served("register_object_device")
+    }
+
+    async fn query_objects(
+        &self,
+        _request: Request<pb::QueryObjectsRequest>,
+    ) -> Result<Response<pb::QueryObjectsResponse>, Status> {
+        Self::not_served("query_objects")
+    }
+
+    async fn save_objects(
+        &self,
+        _request: Request<pb::SaveObjectsRequest>,
+    ) -> Result<Response<pb::SaveObjectsResponse>, Status> {
+        Self::not_served("save_objects")
+    }
+
+    async fn load_objects(
+        &self,
+        _request: Request<pb::LoadObjectsRequest>,
+    ) -> Result<Response<pb::LoadObjectsResponse>, Status> {
+        Self::not_served("load_objects")
     }
 }

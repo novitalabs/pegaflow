@@ -178,6 +178,35 @@ mod tests {
         ) -> Result<Response<Self::SessionStream>, Status> {
             Err(Status::unimplemented("stub"))
         }
+
+        async fn register_object_device(
+            &self,
+            _request: Request<pegaflow_proto::proto::engine::RegisterObjectDeviceRequest>,
+        ) -> Result<Response<pegaflow_proto::proto::engine::RegisterObjectDeviceResponse>, Status>
+        {
+            Err(Status::unimplemented("stub"))
+        }
+
+        async fn query_objects(
+            &self,
+            _request: Request<pegaflow_proto::proto::engine::QueryObjectsRequest>,
+        ) -> Result<Response<pegaflow_proto::proto::engine::QueryObjectsResponse>, Status> {
+            Err(Status::unimplemented("stub"))
+        }
+
+        async fn save_objects(
+            &self,
+            _request: Request<pegaflow_proto::proto::engine::SaveObjectsRequest>,
+        ) -> Result<Response<pegaflow_proto::proto::engine::SaveObjectsResponse>, Status> {
+            Err(Status::unimplemented("stub"))
+        }
+
+        async fn load_objects(
+            &self,
+            _request: Request<pegaflow_proto::proto::engine::LoadObjectsRequest>,
+        ) -> Result<Response<pegaflow_proto::proto::engine::LoadObjectsResponse>, Status> {
+            Err(Status::unimplemented("stub"))
+        }
     }
 
     /// Serve a ReleaseCounter on an ephemeral loopback port; return a

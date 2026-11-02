@@ -17,11 +17,11 @@ mod cache;
 mod gpu_worker;
 mod instance;
 mod internode;
-pub mod kv_v2;
 mod layout;
 mod lease;
 pub use pegaflow_common::logging;
 mod metrics;
+mod objects;
 mod offload;
 mod pinned_mem;
 mod pinned_pool;
@@ -45,6 +45,7 @@ pub use internode::{
 };
 use layout::KVCacheLayout;
 pub use lease::QueryLeaseId;
+pub use objects::{ObjectKey, ObjectKeyList, ObjectRead, ObjectRun, ObjectWrite};
 pub use pegaflow_common::NumaNode;
 use pegaflow_common::{NumaTopology, group_hash};
 pub use pinned_pool::PinnedAllocation;
@@ -133,6 +134,8 @@ pub struct PegaEngine {
     topology: Arc<NumaTopology>,
     /// Query-ready blocks owned by opaque scheduler leases.
     query_leases: QueryLeaseManager,
+    /// Byte-addressed object devices and unsealed objects.
+    objects: objects::ObjectStore,
 }
 
 impl PegaEngine {
@@ -177,6 +180,7 @@ impl PegaEngine {
             storage,
             topology,
             query_leases: QueryLeaseManager::default(),
+            objects: objects::ObjectStore::new(transfer::StridedMode::default()),
         })
     }
 
@@ -452,12 +456,13 @@ impl PegaEngine {
             .write()
             .expect("instances write lock poisoned");
         let removed = instances.remove(instance_id);
-        if instances.is_empty() {
+        let devices = self.objects.remove_instance(instance_id);
+        if instances.is_empty() && !self.objects.has_devices() {
             self.storage.set_has_instance(false);
         }
         drop(instances);
 
-        if removed.is_none() {
+        if removed.is_none() && devices == 0 {
             return Err(EngineError::InstanceMissing(instance_id.to_string()));
         }
         self.query_leases.release_instance(instance_id);
@@ -471,8 +476,11 @@ impl PegaEngine {
             .instances
             .write()
             .expect("instances write lock poisoned");
-        let ids: Vec<String> = instances.keys().cloned().collect();
+        let mut ids: Vec<String> = instances.keys().cloned().collect();
         instances.clear();
+        ids.extend(self.objects.remove_all());
+        ids.sort();
+        ids.dedup();
         // Under the lock, so a concurrent registration cannot be overwritten.
         self.storage.set_has_instance(false);
         drop(instances);
