@@ -17,6 +17,7 @@ mod cache;
 mod gpu_worker;
 mod instance;
 mod internode;
+pub mod kv_v2;
 mod layout;
 mod lease;
 pub use pegaflow_common::logging;

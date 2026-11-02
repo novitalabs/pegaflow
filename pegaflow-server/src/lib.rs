@@ -4,6 +4,7 @@ pub mod metric;
 pub mod proto;
 pub mod registry;
 pub mod service;
+pub mod service_v2;
 pub mod session;
 #[cfg(feature = "tracing")]
 mod trace;
@@ -16,6 +17,7 @@ mod utils;
 
 pub use registry::{CudaTensorRegistry, RegistryHandle};
 pub use service::GrpcEngineService;
+pub use service_v2::GrpcEngineV2Service;
 
 use clap::Parser;
 use cudarc::driver::result as cuda_driver;
@@ -211,6 +213,19 @@ pub struct Cli {
     /// with KV transfers, so unlimited pulls add latency to them.
     #[arg(long, default_value = "2gb", value_parser = parse_memory_size)]
     pub backup_max_bandwidth: usize,
+
+    /// Serve only the content-addressed v2 protocol (`pegaflow.v2.EngineV2`)
+    /// over a pinned pool of `--pool-size`. The v1 `Engine` service, SSD, RDMA
+    /// and MetaServer are not started in this mode.
+    #[arg(long, default_value_t = false)]
+    pub kv_v2: bool,
+
+    /// v2 copy path: `dma` (cuMemcpy2D per run, on the copy engines), `kernel`
+    /// (one launch over mapped pinned memory, on the SMs) or `auto` (loads by
+    /// kernel; saves of large runs of wide rows on the copy engines, the rest
+    /// by kernel).
+    #[arg(long, default_value = "auto")]
+    pub kv_v2_copy: pegaflow_core::transfer::StridedMode,
 }
 
 fn parse_backup_pull_max_bytes(s: &str) -> Result<usize, String> {
@@ -474,6 +489,38 @@ fn init_metrics(
     })
 }
 
+/// Serve the v2 protocol until Ctrl+C.
+fn run_v2(cli: &Cli) -> Result<(), Box<dyn Error>> {
+    use proto::engine_v2::engine_v2_server::EngineV2Server;
+
+    const MAX_GRPC_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let store = Arc::new(pegaflow_core::kv_v2::KvV2Store::new(
+        cli.pool_size,
+        cli.use_hugepages,
+        cli.kv_v2_copy,
+    ));
+    let service = EngineV2Server::new(GrpcEngineV2Service::new(store))
+        .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
+        .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE);
+    let addr = cli.addr;
+    runtime.block_on(async move {
+        info!("PegaEngine v2 gRPC server listening on {addr}");
+        Server::builder()
+            .http2_keepalive_interval(Some(GRPC_SERVER_HTTP2_KEEPALIVE_INTERVAL))
+            .http2_keepalive_timeout(Some(GRPC_SERVER_HTTP2_KEEPALIVE_TIMEOUT))
+            .add_service(service)
+            .serve_with_shutdown(addr, async {
+                let _ = tokio::signal::ctrl_c().await;
+                info!("Ctrl+C received, shutting down");
+            })
+            .await
+    })?;
+    Ok(())
+}
+
 /// Main entry point for pegaflow-server
 pub fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
@@ -485,6 +532,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     // Initialize CUDA in the main thread before starting Tokio runtime
     init_cuda_driver()?;
     check_cuda_version::preflight()?;
+
+    if cli.kv_v2 {
+        return run_v2(&cli);
+    }
 
     // Determine which devices to initialize
     let devices = if cli.devices.is_empty() {
