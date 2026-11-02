@@ -252,6 +252,107 @@ message ReleaseTransferLockResponse {
   uint64 released_blocks = 2;
 }
 
+// ---- Byte-addressed objects ----
+//
+// An object is an opaque byte string keyed by (fingerprint, prefix). Clients
+// copy strided byte runs between registered device regions and objects; the
+// server never interprets layers, ranks or layouts. An object becomes visible
+// to QueryObjects once its writes, possibly from several devices, cover every
+// byte. Objects share the pinned pool, LRU and lease machinery with blocks.
+// Leases are released with Release; UnregisterContext and Session drop an
+// instance's object devices like its KV contexts.
+
+message ObjectKey {
+  // 32-byte digest of everything that decides the object's bytes besides the
+  // token prefix (model, state layout, dtype, ...).
+  bytes fingerprint = 1;
+  // 32-byte digest of the token prefix the object covers.
+  bytes prefix = 2;
+}
+
+message DeviceRegion {
+  // CUipcMemHandle of a cuMemAlloc allocation (64 bytes).
+  bytes ipc_handle = 1;
+  uint64 size = 2;
+}
+
+message RegisterObjectDeviceRequest {
+  // Must equal the server's version exactly.
+  string client_version = 1;
+  string instance_id = 2;
+  uint32 rank = 3;
+  int32 device_id = 4;
+  repeated DeviceRegion regions = 5;
+}
+
+message RegisterObjectDeviceResponse {}
+
+message ObjectKeyList {
+  repeated ObjectKey keys = 1;
+  // Report no hit after the first miss.
+  bool stop_at_miss = 2;
+}
+
+message QueryObjectsRequest {
+  string instance_id = 1;
+  repeated ObjectKeyList lists = 2;
+}
+
+message ObjectHits {
+  repeated bool hits = 1;
+}
+
+message QueryObjectsResponse {
+  // Holds every hit until Release or expiry; loads of this instance name
+  // keys it holds. Issued even when nothing hits.
+  bytes lease = 1;
+  repeated ObjectHits lists = 2;
+}
+
+// rows copies of width bytes: row r at region_offset + r * region_stride of
+// the device region and object_offset + r * object_stride of the object.
+message ObjectRun {
+  uint32 region = 1;
+  uint64 region_offset = 2;
+  uint64 object_offset = 3;
+  uint64 width = 4;
+  uint32 rows = 5;
+  uint64 region_stride = 6;
+  uint64 object_stride = 7;
+}
+
+message ObjectWrite {
+  ObjectKey key = 1;
+  // Bytes of the whole object; every writer of a key must agree.
+  uint64 size = 2;
+  repeated ObjectRun runs = 3;
+}
+
+message ObjectRead {
+  ObjectKey key = 1;
+  repeated ObjectRun runs = 2;
+}
+
+message SaveObjectsRequest {
+  string instance_id = 1;
+  uint32 rank = 2;
+  repeated ObjectWrite writes = 3;
+}
+
+message SaveObjectsResponse {
+  // Objects this save completed.
+  uint32 sealed = 1;
+}
+
+message LoadObjectsRequest {
+  string instance_id = 1;
+  uint32 rank = 2;
+  bytes lease = 3;
+  repeated ObjectRead reads = 4;
+}
+
+message LoadObjectsResponse {}
+
 service Engine {
   rpc RegisterContextBatch(RegisterContextRequest) returns (RegisterContextResponse);
   rpc Save(SaveRequest) returns (SaveResponse);
@@ -271,6 +372,14 @@ service Engine {
   // Liveness channel: server drops the instance's CUDA IPC mappings when
   // this stream closes (vllm process dies or disconnects).
   rpc Session(SessionRequest) returns (stream SessionEvent);
+  // Byte-addressed objects: open one device's regions for object copies.
+  rpc RegisterObjectDevice(RegisterObjectDeviceRequest) returns (RegisterObjectDeviceResponse);
+  // Report which object keys are sealed and hold the hits under one lease.
+  rpc QueryObjects(QueryObjectsRequest) returns (QueryObjectsResponse);
+  // Copy device bytes into objects; returns after the copies complete.
+  rpc SaveObjects(SaveObjectsRequest) returns (SaveObjectsResponse);
+  // Copy leased objects into device memory; returns after the copies complete.
+  rpc LoadObjects(LoadObjectsRequest) returns (LoadObjectsResponse);
 }
 
 // MetaServer service for managing block hash keys across multi-node instances

@@ -1,7 +1,7 @@
 //! Strided host<->device copies in the shape of v2 runs: `rows` rows of `width`
 //! bytes, contiguous on the device and `host_pitch` apart in the object.
 //!
-//! Compares the [`StridedCopier`] modes kv_v2 can run (one `cuMemcpy2DAsync`
+//! Compares the [`StridedCopier`] modes object copies can run (one `cuMemcpy2DAsync`
 //! per run, one strided kernel launch, auto), one `cuMemcpyAsync` per row, the
 //! v1 copy kernel with one descriptor per row, and one contiguous copy of the
 //! same bytes as the PCIe ceiling.

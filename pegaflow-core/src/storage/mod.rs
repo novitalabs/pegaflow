@@ -466,6 +466,36 @@ impl StorageEngine {
         self.read_cache.get_blocks_aligned(&keys)
     }
 
+    /// Position-aligned resident blocks for `keys`; with `stop_at_miss`, every
+    /// key after the first miss reports `None`. Hits refresh recency.
+    pub(crate) fn lookup_blocks(
+        &self,
+        keys: &[BlockKey],
+        stop_at_miss: bool,
+    ) -> Vec<Option<Arc<crate::block::SealedBlock>>> {
+        if !stop_at_miss {
+            return self.read_cache.get_blocks_aligned(keys);
+        }
+        let (_, blocks) = self.read_cache.get_prefix_blocks(keys);
+        let mut out: Vec<_> = blocks.into_iter().map(Some).collect();
+        out.resize(keys.len(), None);
+        out
+    }
+
+    /// Insert sealed objects into the read cache; returns how many are resident.
+    ///
+    /// Objects bypass the insert worker, SSD and MetaServer: they are sealed
+    /// by the caller and only read back from pinned memory.
+    pub(crate) fn insert_objects(
+        &self,
+        blocks: Vec<(BlockKey, Arc<crate::block::SealedBlock>)>,
+    ) -> usize {
+        if blocks.is_empty() {
+            return 0;
+        }
+        self.read_cache.batch_insert_refs(&blocks).len()
+    }
+
     /// Evict all blocks from the resident in-memory read cache.
     ///
     /// This preserves backing-store copies. Blocks with

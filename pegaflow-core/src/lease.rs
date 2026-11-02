@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::block::SealedBlock;
+use crate::block::{BlockKey, SealedBlock};
 
 const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(600);
 const DEFAULT_LEASE_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
@@ -43,6 +43,8 @@ impl fmt::Debug for QueryLeaseId {
 struct QueryLease {
     instance_id: String,
     blocks: Vec<Arc<SealedBlock>>,
+    /// Object leases hold their hits by key and are never consumed.
+    objects: HashMap<BlockKey, Arc<SealedBlock>>,
     remaining_consumers: usize,
     expires_at: Instant,
 }
@@ -95,11 +97,56 @@ impl QueryLeaseManager {
         let lease = QueryLease {
             instance_id: instance_id.to_string(),
             blocks,
+            objects: HashMap::new(),
             remaining_consumers: consumers.max(1),
             expires_at: Instant::now() + DEFAULT_LEASE_TTL,
         };
         self.inner.insert(token, lease);
         token
+    }
+
+    /// A lease over object hits; loads read it until release or expiry.
+    pub(crate) fn create_objects(
+        &self,
+        instance_id: &str,
+        objects: HashMap<BlockKey, Arc<SealedBlock>>,
+    ) -> QueryLeaseId {
+        self.sweep_expired();
+        let token = QueryLeaseId::fresh();
+        let lease = QueryLease {
+            instance_id: instance_id.to_string(),
+            blocks: Vec::new(),
+            objects,
+            remaining_consumers: usize::MAX,
+            expires_at: Instant::now() + DEFAULT_LEASE_TTL,
+        };
+        self.inner.insert(token, lease);
+        token
+    }
+
+    /// The objects an object lease of `instance_id` holds for `keys`, `None` where it holds none.
+    pub(crate) fn leased_objects(
+        &self,
+        instance_id: &str,
+        token: &QueryLeaseId,
+        keys: &[BlockKey],
+    ) -> Result<Vec<Option<Arc<SealedBlock>>>, String> {
+        self.sweep_expired();
+        let leases = self
+            .inner
+            .leases
+            .lock()
+            .expect("query leases lock poisoned");
+        let lease = leases
+            .get(token)
+            .ok_or_else(|| "query lease is unknown or expired".to_string())?;
+        if lease.instance_id != instance_id {
+            return Err(format!(
+                "query lease belongs to instance {}, got {}",
+                lease.instance_id, instance_id
+            ));
+        }
+        Ok(keys.iter().map(|k| lease.objects.get(k).cloned()).collect())
     }
 
     pub(crate) fn consume(
@@ -203,6 +250,7 @@ mod tests {
                 QueryLease {
                     instance_id: "inst-a".to_string(),
                     blocks: Vec::new(),
+                    objects: HashMap::new(),
                     remaining_consumers: 1,
                     expires_at: Instant::now() + DEFAULT_LEASE_TTL,
                 },
