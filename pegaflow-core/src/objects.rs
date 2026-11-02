@@ -28,7 +28,7 @@ use crate::metrics::core_metrics;
 use crate::pinned_pool::{MappedPinnedPtr, PinnedAllocation};
 use crate::seal_offload::io_len;
 use crate::storage::{FetchPart, PartsPoll};
-use crate::transfer::{StridedCopier, StridedCopy};
+use crate::transfer::{Direction, StridedCopier, StridedCopy};
 use crate::{EngineError, NumaNode, PegaEngine, QueryLeaseId};
 
 /// Most units one object may have; bounds its coverage bitmap.
@@ -133,7 +133,7 @@ pub struct ObjectLoad {
 
 /// A resume point: the first `blocks` keys of every prefix chain of its
 /// query, and `keys`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ObjectPoint {
     pub blocks: u32,
     pub keys: Vec<ObjectKey>,
@@ -141,13 +141,13 @@ pub struct ObjectPoint {
 
 /// Prefix chains, each of one fingerprint, and the points a query picks
 /// from, in ascending order of preference.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ObjectQuery {
     pub prefixes: Vec<Vec<ObjectKey>>,
     pub points: Vec<ObjectPoint>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum ObjectQueryStatus {
     /// Missing objects are being fetched; ask again with the same `req_id`.
     Loading,
@@ -620,35 +620,30 @@ impl Lane {
         self.ctx
             .bind_to_thread()
             .map_err(|e| failed(format!("{e:?}")))?;
+        let mut sorted = copies.to_vec();
+        if dir == Direction::DeviceToHost {
+            // Stable, so each node's copies keep their order.
+            sorted.sort_by_key(|(numa, _)| (*numa != self.numa, *numa));
+        }
+        let flat: Vec<StridedCopy> = sorted.iter().map(|(_, c)| *c).collect();
+        let mut groups = Vec::new();
         match dir {
+            Direction::HostToDevice => groups.push(&flat[..]),
             Direction::DeviceToHost => {
-                let mut sorted = copies.to_vec();
-                // Stable, so each node's copies keep their order.
-                sorted.sort_by_key(|(numa, _)| (*numa != self.numa, *numa));
-                let flat: Vec<StridedCopy> = sorted.iter().map(|(_, c)| *c).collect();
-                let mut groups = Vec::new();
                 let mut at = 0;
                 for group in sorted.chunk_by(|a, b| a.0 == b.0) {
                     groups.push(&flat[at..at + group.len()]);
                     at += group.len();
                 }
-                self.copier.d2h(&groups, &self.stream).map_err(failed)?;
-            }
-            Direction::HostToDevice => {
-                let all: Vec<StridedCopy> = copies.iter().map(|(_, c)| *c).collect();
-                self.copier.h2d(&all, &self.stream).map_err(failed)?;
             }
         }
+        self.copier
+            .copy(&groups, dir, &self.stream)
+            .map_err(failed)?;
         self.stream
             .synchronize()
             .map_err(|e| failed(format!("{e:?}")))
     }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Direction {
-    DeviceToHost,
-    HostToDevice,
 }
 
 struct CopyJob {
@@ -783,10 +778,6 @@ impl ObjectStore {
         !self.devices.lock().is_empty()
     }
 
-    fn has_instance(&self, instance: &str) -> bool {
-        self.devices.lock().keys().any(|(i, _)| i == instance)
-    }
-
     /// Drop every device of `instance`; returns how many.
     pub(crate) fn remove_instance(&self, instance: &str) -> usize {
         let mut devices = self.devices.lock();
@@ -795,12 +786,9 @@ impl ObjectStore {
         before - devices.len()
     }
 
-    /// Drop every device; returns the instances they belonged to.
+    /// Drop every device; returns the instance of each.
     pub(crate) fn remove_all(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self.devices.lock().drain().map(|((i, _), _)| i).collect();
-        ids.sort();
-        ids.dedup();
-        ids
+        self.devices.lock().drain().map(|((i, _), _)| i).collect()
     }
 
     /// Drop unsealed objects no save touched for `max_age`; returns how many.
@@ -878,7 +866,7 @@ impl ObjectStore {
     }
 
     fn require_instance(&self, instance: &str) -> Result<(), EngineError> {
-        if self.has_instance(instance) {
+        if self.devices.lock().keys().any(|(i, _)| i == instance) {
             Ok(())
         } else {
             Err(EngineError::InstanceMissing(instance.to_string()))
@@ -1477,7 +1465,6 @@ fn copy_of(device: &Device, at: MappedPinnedPtr, run: &ObjectRun) -> StridedCopy
     let (rp, op) = run.pitches();
     StridedCopy {
         device: device.regions.list[run.region as usize].0 + run.region_offset,
-        host: at.host().as_ptr(),
         host_device: at.device().as_ptr() as u64,
         width: run.width,
         rows: run.rows,

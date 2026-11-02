@@ -79,25 +79,18 @@ extern "C" __global__ void pega_strided_copy(const unsigned long long* __restric
     )
 }
 
-/// One strided copy between device memory and mapped pinned host memory.
-///
-/// `host` and `host_device` address the same byte, from the host and from the
-/// device. Rows are `device_pitch` and `host_pitch` apart; both are ignored
-/// when `rows == 1`.
+/// One strided copy between device memory and mapped pinned host memory,
+/// which `host_device` addresses from the device. Rows are `device_pitch` and
+/// `host_pitch` apart; both are ignored when `rows == 1`.
 #[derive(Debug, Clone, Copy)]
-pub struct StridedCopy {
-    pub device: u64,
-    pub host: *mut u8,
-    pub host_device: u64,
-    pub width: u64,
-    pub rows: u32,
-    pub device_pitch: u64,
-    pub host_pitch: u64,
+pub(crate) struct StridedCopy {
+    pub(crate) device: u64,
+    pub(crate) host_device: u64,
+    pub(crate) width: u64,
+    pub(crate) rows: u32,
+    pub(crate) device_pitch: u64,
+    pub(crate) host_pitch: u64,
 }
-
-// SAFETY: `host` points into pinned memory the caller keeps alive until the
-// stream synchronizes; only CUDA dereferences it.
-unsafe impl Send for StridedCopy {}
 
 impl StridedCopy {
     /// The same bytes as one row when the rows are back to back on both sides.
@@ -123,7 +116,7 @@ impl StridedCopy {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Dir {
+pub(crate) enum Direction {
     HostToDevice,
     DeviceToHost,
 }
@@ -131,7 +124,7 @@ enum Dir {
 /// Moves batches of [`StridedCopy`] on one device; holds the compiled kernel,
 /// a pinned staging buffer and a device buffer for descriptors, so callers
 /// serialize use per device.
-pub struct StridedCopier {
+pub(crate) struct StridedCopier {
     ctx: Arc<CudaContext>,
     func: CudaFunction,
     /// Descriptors of the last transfer, pinned so their upload is one async
@@ -146,7 +139,7 @@ pub struct StridedCopier {
 
 impl StridedCopier {
     /// Compile and load the copy kernel into `ctx`.
-    pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, String> {
+    pub(crate) fn new(ctx: &Arc<CudaContext>) -> Result<Self, String> {
         let ptx = compile_ptx(kernel_src()).map_err(|e| format!("nvrtc compile failed: {e:?}"))?;
         let module = ctx
             .load_module(ptx)
@@ -170,25 +163,12 @@ impl StridedCopier {
         })
     }
 
-    /// Enqueue host -> device copies as one launch; the caller synchronizes `stream`.
-    pub fn h2d(&mut self, copies: &[StridedCopy], stream: &Arc<CudaStream>) -> Result<(), String> {
-        self.launch(&[copies], Dir::HostToDevice, stream)
-    }
-
-    /// Enqueue device -> host copies, one launch per batch in order, behind
-    /// one descriptor upload; the caller synchronizes `stream`.
-    pub fn d2h(
+    /// Enqueue `batches`, one launch each in order, behind one descriptor
+    /// upload; the caller synchronizes `stream`.
+    pub(crate) fn copy(
         &mut self,
         batches: &[&[StridedCopy]],
-        stream: &Arc<CudaStream>,
-    ) -> Result<(), String> {
-        self.launch(batches, Dir::DeviceToHost, stream)
-    }
-
-    fn launch(
-        &mut self,
-        batches: &[&[StridedCopy]],
-        dir: Dir,
+        dir: Direction,
         stream: &Arc<CudaStream>,
     ) -> Result<(), String> {
         // (descriptor offset, descriptors, chunks) per launch.
@@ -199,8 +179,12 @@ impl StridedCopier {
             let mut chunks = 0u64;
             for c in joined(batch) {
                 let (dst, src, dst_pitch, src_pitch) = match dir {
-                    Dir::HostToDevice => (c.device, c.host_device, c.device_pitch, c.host_pitch),
-                    Dir::DeviceToHost => (c.host_device, c.device, c.host_pitch, c.device_pitch),
+                    Direction::HostToDevice => {
+                        (c.device, c.host_device, c.device_pitch, c.host_pitch)
+                    }
+                    Direction::DeviceToHost => {
+                        (c.host_device, c.device, c.host_pitch, c.device_pitch)
+                    }
                 };
                 descs.extend_from_slice(&[
                     dst,
@@ -263,8 +247,8 @@ impl StridedCopier {
         // warps only interleave scattered host rows and lose bandwidth.
         // Reads of host memory are latency-bound and want every warp.
         let max_grid = match dir {
-            Dir::HostToDevice => MAX_GRID,
-            Dir::DeviceToHost => self.d2h_grid,
+            Direction::HostToDevice => MAX_GRID,
+            Direction::DeviceToHost => self.d2h_grid,
         };
         for (at, n, chunks) in launches {
             let grid = chunks.div_ceil(warps_per_block).clamp(1, max_grid) as u32;

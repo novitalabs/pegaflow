@@ -21,7 +21,7 @@ mod strided;
 
 pub use kernel::KernelBackend;
 pub use memcpy::MemcpyBackend;
-pub use strided::{StridedCopier, StridedCopy};
+pub(crate) use strided::{Direction, StridedCopier, StridedCopy};
 
 use std::sync::Arc;
 
