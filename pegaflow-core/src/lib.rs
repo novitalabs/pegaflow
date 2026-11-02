@@ -45,7 +45,10 @@ pub use internode::{
 };
 use layout::KVCacheLayout;
 pub use lease::QueryLeaseId;
-pub use objects::{ObjectKey, ObjectKeyList, ObjectRead, ObjectRun, ObjectWrite};
+pub use objects::{
+    ObjectKey, ObjectLoad, ObjectPoint, ObjectQuery, ObjectQueryStatus, ObjectRead, ObjectRun,
+    ObjectWrite,
+};
 pub use pegaflow_common::NumaNode;
 use pegaflow_common::{NumaTopology, group_hash};
 pub use pinned_pool::PinnedAllocation;
@@ -180,7 +183,7 @@ impl PegaEngine {
             storage,
             topology,
             query_leases: QueryLeaseManager::default(),
-            objects: objects::ObjectStore::new(transfer::StridedMode::default()),
+            objects: objects::ObjectStore::default(),
         })
     }
 
@@ -960,9 +963,15 @@ impl PegaEngine {
         inflight_max_age: std::time::Duration,
         failed_remote_max_age: std::time::Duration,
     ) -> (usize, usize) {
-        self.storage
+        let (inflight, failed) = self
+            .storage
             .gc_stale_inflight(inflight_max_age, failed_remote_max_age)
-            .await
+            .await;
+        let objects = self.objects.expire_unsealed(inflight_max_age);
+        if objects > 0 {
+            core_metrics().inflight_gc_cleaned.add(objects as u64, &[]);
+        }
+        (inflight + objects, failed)
     }
 
     // =========================================================================

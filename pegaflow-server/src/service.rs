@@ -4,7 +4,7 @@ use crate::metric::record_rpc_result;
 use crate::proto::engine::engine_server::Engine;
 use crate::proto::engine::{
     HealthRequest, HealthResponse, LoadObjectsRequest, LoadObjectsResponse, LoadRequest,
-    LoadResponse, ObjectHits, QueryBlocksForTransferRequest, QueryBlocksForTransferResponse,
+    LoadResponse, ObjectsReady, QueryBlocksForTransferRequest, QueryBlocksForTransferResponse,
     QueryLoading, QueryObjectsRequest, QueryObjectsResponse, QueryReady, QueryRequest,
     QueryResponse, RdmaHandshakeRequest, RdmaHandshakeResponse, RegisterContextRequest,
     RegisterContextResponse, RegisterObjectDeviceRequest, RegisterObjectDeviceResponse,
@@ -12,14 +12,14 @@ use crate::proto::engine::{
     ResponseStatus, SaveObjectsRequest, SaveObjectsResponse, SaveRequest, SaveResponse,
     SessionEvent, SessionRequest, ShutdownRequest, ShutdownResponse, TransferBlockInfo,
     TransferMode as ProtoTransferMode, TransferSlotInfo, UnregisterRequest, UnregisterResponse,
-    load_block_target, query_response,
+    load_block_target, query_objects_response, query_response,
 };
 use crate::registry::RegistryHandle;
 use crate::session::SessionRegistry;
 use log::{debug, info, warn};
 use pegaflow_core::{
-    EngineError, LayerSave, ObjectKey, ObjectKeyList, ObjectRead, ObjectRun, ObjectWrite,
-    PegaEngine, PrefetchStatus, QueryLeaseId,
+    EngineError, LayerSave, ObjectKey, ObjectLoad, ObjectPoint, ObjectQuery, ObjectQueryStatus,
+    ObjectRead, ObjectRun, ObjectWrite, PegaEngine, PrefetchStatus, QueryLeaseId,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -203,16 +203,29 @@ impl GrpcEngineService {
             .collect()
     }
 
-    /// Run blocking engine work (CUDA calls, synchronous copies) off the async workers.
-    async fn blocking<T: Send + 'static>(
-        &self,
-        f: impl FnOnce(&PegaEngine) -> Result<T, EngineError> + Send + 'static,
-    ) -> Result<T, Status> {
-        let engine = Arc::clone(&self.engine);
-        tokio::task::spawn_blocking(move || f(&engine))
-            .await
-            .map_err(|e| Status::internal(format!("object task panicked: {e}")))?
-            .map_err(Self::map_engine_error)
+    fn object_query(req: QueryObjectsRequest) -> Result<ObjectQuery, Status> {
+        let keys = |keys: Vec<crate::proto::engine::ObjectKey>| {
+            keys.into_iter()
+                .map(|k| Self::object_key(Some(k)))
+                .collect::<Result<Vec<_>, Status>>()
+        };
+        Ok(ObjectQuery {
+            prefixes: req
+                .prefixes
+                .into_iter()
+                .map(|l| keys(l.keys))
+                .collect::<Result<_, _>>()?,
+            points: req
+                .points
+                .into_iter()
+                .map(|p| {
+                    Ok(ObjectPoint {
+                        blocks: p.blocks,
+                        keys: keys(p.keys)?,
+                    })
+                })
+                .collect::<Result<_, Status>>()?,
+        })
     }
 
     fn log_rpc<T>(name: &str, result: &Result<T, Status>, start: Instant) {
@@ -1154,10 +1167,14 @@ impl Engine for GrpcEngineService {
                 .map(|r| (r.ipc_handle, r.size))
                 .collect();
             let (instance_id, rank, device_id) = (req.instance_id, req.rank, req.device_id);
-            self.blocking(move |engine| {
+            // Opening IPC handles and starting the copy workers block.
+            let engine = Arc::clone(&self.engine);
+            tokio::task::spawn_blocking(move || {
                 engine.register_object_device(&instance_id, rank, device_id, &regions)
             })
-            .await?;
+            .await
+            .map_err(|e| Status::internal(format!("register task panicked: {e}")))?
+            .map_err(Self::map_engine_error)?;
             Ok(Response::new(RegisterObjectDeviceResponse {}))
         }
         .await;
@@ -1173,27 +1190,32 @@ impl Engine for GrpcEngineService {
         let start = Instant::now();
         let req = request.into_inner();
         let result = async {
-            let lists = req
-                .lists
-                .into_iter()
-                .map(|l| {
-                    Ok(ObjectKeyList {
-                        keys: l
-                            .keys
-                            .into_iter()
-                            .map(|k| Self::object_key(Some(k)))
-                            .collect::<Result<_, Status>>()?,
-                        stop_at_miss: l.stop_at_miss,
-                    })
-                })
-                .collect::<Result<Vec<_>, Status>>()?;
-            let (lease, hits) = self
+            if req.req_id.is_empty() {
+                return Err(Status::invalid_argument("req_id is empty"));
+            }
+            let (instance_id, req_id) = (req.instance_id.clone(), req.req_id.clone());
+            let query = Self::object_query(req)?;
+            let status = self
                 .engine
-                .query_objects(&req.instance_id, &lists)
+                .query_objects(&instance_id, &req_id, &query)
+                .await
                 .map_err(Self::map_engine_error)?;
+            let outcome = match status {
+                ObjectQueryStatus::Loading => {
+                    query_objects_response::Outcome::Loading(QueryLoading {})
+                }
+                ObjectQueryStatus::Ready {
+                    point,
+                    blocks,
+                    lease,
+                } => query_objects_response::Outcome::Ready(ObjectsReady {
+                    point: point.map_or(-1, |p| i32::try_from(p).unwrap_or(i32::MAX)),
+                    blocks,
+                    lease: lease.map(|l| l.to_bytes().to_vec()).unwrap_or_default(),
+                }),
+            };
             Ok(Response::new(QueryObjectsResponse {
-                lease: lease.to_bytes().to_vec(),
-                lists: hits.into_iter().map(|hits| ObjectHits { hits }).collect(),
+                outcome: Some(outcome),
             }))
         }
         .await;
@@ -1216,14 +1238,21 @@ impl Engine for GrpcEngineService {
                     Ok(ObjectWrite {
                         key: Self::object_key(w.key)?,
                         size: w.size,
+                        unit: w.unit,
+                        chunks: w.chunks,
                         runs: Self::object_runs(w.runs),
                     })
                 })
                 .collect::<Result<Vec<_>, Status>>()?;
             let (instance_id, rank) = (req.instance_id, req.rank);
-            let sealed = self
-                .blocking(move |engine| engine.save_objects(&instance_id, rank, &writes))
-                .await?;
+            // Run to the end even if the client goes away, so the objects
+            // it copies into can seal.
+            let engine = Arc::clone(&self.engine);
+            let sealed =
+                tokio::spawn(async move { engine.save_objects(&instance_id, rank, &writes).await })
+                    .await
+                    .map_err(|e| Status::internal(format!("save task panicked: {e}")))?
+                    .map_err(Self::map_engine_error)?;
             Ok(Response::new(SaveObjectsResponse {
                 sealed: u32::try_from(sealed).unwrap_or(u32::MAX),
             }))
@@ -1241,20 +1270,32 @@ impl Engine for GrpcEngineService {
         let start = Instant::now();
         let req = request.into_inner();
         let result = async {
-            let lease = QueryLeaseId::from_bytes(&req.lease).map_err(Status::invalid_argument)?;
-            let reads = req
-                .reads
+            let loads = req
+                .loads
                 .into_iter()
-                .map(|r| {
-                    Ok(ObjectRead {
-                        key: Self::object_key(r.key)?,
-                        runs: Self::object_runs(r.runs),
+                .map(|l| {
+                    Ok(ObjectLoad {
+                        lease: QueryLeaseId::from_bytes(&l.lease)
+                            .map_err(Status::invalid_argument)?,
+                        reads: l
+                            .reads
+                            .into_iter()
+                            .map(|r| {
+                                Ok(ObjectRead {
+                                    key: Self::object_key(r.key)?,
+                                    runs: Self::object_runs(r.runs),
+                                })
+                            })
+                            .collect::<Result<_, Status>>()?,
                     })
                 })
                 .collect::<Result<Vec<_>, Status>>()?;
-            let (instance_id, rank) = (req.instance_id, req.rank);
-            self.blocking(move |engine| engine.load_objects(&instance_id, rank, &lease, &reads))
-                .await?;
+            let (instance_id, rank, shm) = (req.instance_id, req.rank, req.load_state_shm);
+            let shm = (!shm.is_empty()).then_some(shm.as_str());
+            self.engine
+                .load_objects(&instance_id, rank, &loads, shm)
+                .await
+                .map_err(Self::map_engine_error)?;
             Ok(Response::new(LoadObjectsResponse {}))
         }
         .await;

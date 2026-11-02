@@ -196,15 +196,33 @@ fn process_insert_batch(
             .add(-(inflight_bytes_removed as i64), &[]);
     }
 
-    if !sealed_blocks.is_empty()
-        && let Some(deps) = &deps
-    {
-        let resident_keys = deps.read_cache.batch_insert_refs(&sealed_blocks);
-        let resident_registrations = deps.read_cache.resident_generations(&resident_keys);
-        send_backing_batches(deps, namespace, &sealed_blocks, resident_registrations);
+    if let Some(deps) = &deps {
+        publish_sealed(
+            &deps.read_cache,
+            deps.ssd_store.as_ref(),
+            deps.metaserver_client.as_ref(),
+            &sealed_blocks,
+        );
     }
 
     ordered_fast_path_seals
+}
+
+/// Insert sealed blocks into the read cache, queue them for SSD and announce
+/// the resident ones to the MetaServer; returns the resident keys.
+pub(super) fn publish_sealed(
+    read_cache: &ReadCache,
+    ssd_store: Option<&Arc<SsdBackingStore>>,
+    metaserver_client: Option<&Arc<MetaServerClient>>,
+    blocks: &[(BlockKey, Arc<SealedBlock>)],
+) -> Vec<BlockKey> {
+    if blocks.is_empty() {
+        return Vec::new();
+    }
+    let resident_keys = read_cache.batch_insert_refs(blocks);
+    let resident_registrations = read_cache.resident_generations(&resident_keys);
+    send_backing_batches(ssd_store, metaserver_client, blocks, resident_registrations);
+    resident_keys
 }
 
 #[allow(
@@ -267,18 +285,18 @@ fn insert_partial_slots(
 }
 
 fn send_backing_batches(
-    deps: &InsertDeps,
-    namespace: &str,
+    ssd_store: Option<&Arc<SsdBackingStore>>,
+    metaserver_client: Option<&Arc<MetaServerClient>>,
     blocks: &[(BlockKey, Arc<SealedBlock>)],
     resident_registrations: Vec<(BlockKey, u64)>,
 ) {
     if blocks.is_empty() {
         return;
     }
-    if deps.ssd_store.is_none() && deps.metaserver_client.is_none() {
+    if ssd_store.is_none() && metaserver_client.is_none() {
         return;
     }
-    if let Some(ssd) = &deps.ssd_store {
+    if let Some(ssd) = ssd_store {
         let weak_blocks: Vec<(BlockKey, Weak<SealedBlock>)> = blocks
             .iter()
             .map(|(k, b)| (k.clone(), Arc::downgrade(b)))
@@ -287,24 +305,26 @@ fn send_backing_batches(
         ssd.ingest_batch(weak_blocks);
     }
 
-    if let Some(client) = &deps.metaserver_client {
-        register_block_hashes(client, namespace, resident_registrations);
+    if let Some(client) = metaserver_client {
+        register_block_hashes(client, resident_registrations);
     }
 }
 
-fn register_block_hashes(
-    client: &MetaServerClient,
-    namespace: &str,
-    resident_registrations: Vec<(BlockKey, u64)>,
-) {
-    if resident_registrations.is_empty() {
-        return;
+/// `(hash, generation)` pairs registered under one namespace.
+type Registrations = Vec<(Vec<u8>, u64)>;
+
+/// One registration per namespace, in the order namespaces first appear.
+fn register_block_hashes(client: &MetaServerClient, resident_registrations: Vec<(BlockKey, u64)>) {
+    let mut by_namespace: Vec<(String, Registrations)> = Vec::new();
+    for (key, generation) in resident_registrations {
+        match by_namespace.iter_mut().find(|(ns, _)| *ns == key.namespace) {
+            Some((_, regs)) => regs.push((key.hash, generation)),
+            None => by_namespace.push((key.namespace, vec![(key.hash, generation)])),
+        }
     }
-    let registrations = resident_registrations
-        .into_iter()
-        .map(|(key, generation)| (key.hash, generation))
-        .collect();
-    client.try_register_namespace_with_generations(namespace.to_string(), registrations);
+    for (namespace, registrations) in by_namespace {
+        client.try_register_namespace_with_generations(namespace, registrations);
+    }
 }
 
 fn gc_inflight(

@@ -67,10 +67,22 @@ impl RdmaFetch {
         }
         Some((found, blocks))
     }
+
+    /// How many leading `hashes` peers hold, per the MetaServer.
+    pub(super) async fn remote_prefix(&self, namespace: &str, hashes: &[Vec<u8>]) -> usize {
+        self.0
+            .query_plan(namespace, hashes)
+            .await
+            .map_or(0, |plan| plan.block_count())
+    }
 }
 
 #[cfg(not(feature = "rdma"))]
 impl RdmaFetch {
+    pub(super) async fn remote_prefix(&self, _namespace: &str, _hashes: &[Vec<u8>]) -> usize {
+        0
+    }
+
     async fn try_fetch_prefix(
         &self,
         _req_id: &str,
@@ -147,8 +159,38 @@ struct PrefetchTaskInput {
     wait_for_full_prefix: bool,
 }
 
+/// Keys of one namespace a parts fetch brings in as a prefix: peers serve
+/// what they can from the first key, then SSD from where they stopped.
+pub(crate) struct FetchPart {
+    pub(crate) keys: Vec<BlockKey>,
+    /// Reserve SSD budget for every key SSD should serve, or for none.
+    pub(crate) whole: bool,
+}
+
+/// Blocks a parts fetch brought in, by the tier that served them.
+#[derive(Default)]
+struct PartsResult {
+    rdma: PrefetchResult,
+    ssd: PrefetchResult,
+}
+
+struct PartsEntry {
+    handle: JoinHandle<PartsResult>,
+    started_at: Instant,
+}
+
+pub(crate) enum PartsPoll {
+    /// No parts fetch of this request.
+    Idle,
+    Loading,
+    /// The fetch ended; its blocks are now in the read cache.
+    Done(PrefetchResult),
+}
+
 struct PrefetchState {
     active: HashMap<String, PrefetchEntry>,
+    /// Parts fetches, by request.
+    parts: HashMap<String, PartsEntry>,
     /// Reserved SSD prefetch budget for active background tasks.
     reserved_ssd_prefetch_blocks: usize,
     /// req_ids where the advertised RDMA owner served fewer blocks than the
@@ -195,6 +237,7 @@ impl PrefetchScheduler {
         Self {
             state: Arc::new(Mutex::new(PrefetchState {
                 active: HashMap::new(),
+                parts: HashMap::new(),
                 reserved_ssd_prefetch_blocks: 0,
                 failed_remote: HashMap::new(),
             })),
@@ -203,6 +246,81 @@ impl PrefetchScheduler {
             metaserver_client,
             max_prefetch_blocks,
         }
+    }
+
+    /// The RDMA fetcher, if this node fetches from peers.
+    pub(super) fn rdma_fetch(&self) -> Option<&RdmaFetch> {
+        self.rdma_fetch.as_ref()
+    }
+
+    /// Start fetching `parts` for `req_id`, each peers first and then SSD.
+    /// False when nothing can serve them; true as well when a fetch of
+    /// `req_id` already runs.
+    pub(super) fn start_parts(&self, req_id: &str, parts: Vec<FetchPart>) -> bool {
+        let parts: Vec<FetchPart> = parts.into_iter().filter(|p| !p.keys.is_empty()).collect();
+        if parts.is_empty() || (self.rdma_fetch.is_none() && self.ssd_store.is_none()) {
+            return false;
+        }
+        let mut state = self.state.lock();
+        if state.parts.contains_key(req_id) {
+            return true;
+        }
+        let deps = PrefetchTaskDeps {
+            rdma_fetch: self.rdma_fetch.clone(),
+            ssd_store: self.ssd_store.clone(),
+            prefetch_state: Arc::clone(&self.state),
+            max_prefetch_blocks: self.max_prefetch_blocks,
+        };
+        let req = req_id.to_string();
+        let handle = tokio::spawn(async move { run_parts_task(deps, req, parts).await });
+        state.parts.insert(
+            req_id.to_string(),
+            PartsEntry {
+                handle,
+                started_at: Instant::now(),
+            },
+        );
+        true
+    }
+
+    /// Poll the parts fetch of `req_id`. A finished one enters the read
+    /// cache, and the blocks peers served are announced like local ones.
+    pub(super) async fn poll_parts(&self, read_cache: &ReadCache, req_id: &str) -> PartsPoll {
+        let entry = {
+            let mut state = self.state.lock();
+            match state.parts.get(req_id) {
+                None => return PartsPoll::Idle,
+                Some(e) if !e.handle.is_finished() => return PartsPoll::Loading,
+                Some(_) => state.parts.remove(req_id).expect("checked above"),
+            }
+        };
+        let result = entry.handle.await.unwrap_or_else(|e| {
+            warn!("Parts prefetch task failed for req_id={req_id}: {e}");
+            PartsResult::default()
+        });
+        // As in `poll_prefetch`: peer-served blocks stay retained and are
+        // re-advertised; SSD-served ones were registered when saved here.
+        let resident = read_cache.batch_insert_refs(&result.rdma);
+        if let Some(client) = &self.metaserver_client {
+            let mut by_namespace: HashMap<&str, Vec<BlockKey>> = HashMap::new();
+            for key in &resident {
+                by_namespace
+                    .entry(key.namespace.as_str())
+                    .or_default()
+                    .push(key.clone());
+            }
+            for keys in by_namespace.into_values() {
+                if let Some((namespace, hashes)) =
+                    rdma_registration_from_resident_keys(Some(PrefetchSource::Rdma), &keys)
+                {
+                    client.try_register_namespace_without_reclaim_hint(namespace, hashes);
+                }
+            }
+        }
+        read_cache.batch_insert(result.ssd.clone());
+        let mut fetched = result.rdma;
+        fetched.extend(result.ssd);
+        PartsPoll::Done(fetched)
     }
 
     pub(super) async fn check_and_prefetch(
@@ -446,7 +564,11 @@ impl PrefetchScheduler {
         state
             .active
             .retain(|_, entry| entry.started_at.elapsed() < active_max_age);
-        let active_removed = active_before - state.active.len();
+        let parts_before = state.parts.len();
+        state
+            .parts
+            .retain(|_, entry| entry.started_at.elapsed() < active_max_age);
+        let active_removed = active_before - state.active.len() + parts_before - state.parts.len();
 
         let failed_before = state.failed_remote.len();
         state
@@ -660,6 +782,65 @@ async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> 
     build_ready_result(prefix_blocks, total, None, 0, &[], Vec::new())
 }
 
+async fn run_parts_task(
+    deps: PrefetchTaskDeps,
+    req_id: String,
+    parts: Vec<FetchPart>,
+) -> PartsResult {
+    let mut out = PartsResult::default();
+    let from_peers =
+        futures::future::join_all(parts.iter().map(|p| fetch_from_peers(&deps, &req_id, p))).await;
+    let Some(ssd) = &deps.ssd_store else {
+        out.rdma = from_peers.into_iter().flatten().collect();
+        return out;
+    };
+    // Every part's SSD reads go in one batch, like one KV prefetch: the SSD
+    // prefetch queue is shallow and drops batches past its depth.
+    let mut reads = Vec::new();
+    let mut reservations = Vec::new();
+    for (part, peers) in parts.iter().zip(&from_peers) {
+        let got: std::collections::HashSet<&BlockKey> = peers.iter().map(|(k, _)| k).collect();
+        let rest = &part.keys[part.keys.iter().take_while(|k| got.contains(k)).count()..];
+        let found = ssd.prefix_len(rest);
+        if (part.whole && found < rest.len()) || found == 0 {
+            continue;
+        }
+        if let Some((reserved, reservation)) = reserve_ssd_prefetch_slots(
+            Arc::clone(&deps.prefetch_state),
+            deps.max_prefetch_blocks,
+            found,
+            part.whole,
+        ) {
+            reads.extend_from_slice(&rest[..reserved]);
+            reservations.push(reservation);
+        }
+    }
+    out.rdma = from_peers.into_iter().flatten().collect();
+    if !reads.is_empty() {
+        out.ssd = ssd.prefetch_prefix(reads).await.1;
+    }
+    drop(reservations);
+    out
+}
+
+/// What peers serve of `part`, from its first key.
+async fn fetch_from_peers(
+    deps: &PrefetchTaskDeps,
+    req_id: &str,
+    part: &FetchPart,
+) -> PrefetchResult {
+    let Some(rdma) = &deps.rdma_fetch else {
+        return Vec::new();
+    };
+    let namespace = &part.keys[0].namespace;
+    debug_assert!(part.keys.iter().all(|k| &k.namespace == namespace));
+    let hashes: Vec<Vec<u8>> = part.keys.iter().map(|k| k.hash.clone()).collect();
+    rdma.try_fetch_prefix(req_id, namespace, &hashes, false)
+        .await
+        .map(|(_, blocks)| blocks)
+        .unwrap_or_default()
+}
+
 enum PollResult {
     NoActivePrefetch,
     StillLoading,
@@ -824,6 +1005,7 @@ mod tests {
     fn strict_ssd_reservation_is_all_or_nothing() {
         let state = Arc::new(Mutex::new(PrefetchState {
             active: HashMap::new(),
+            parts: HashMap::new(),
             reserved_ssd_prefetch_blocks: 0,
             failed_remote: HashMap::new(),
         }));

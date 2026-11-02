@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use smallvec::SmallVec;
 
+use crate::backing::SSD_ALIGNMENT;
 use crate::block::{RawBlock, Segment};
 use crate::pinned_pool::PinnedAllocation;
 use pegaflow_common::NumaNode;
@@ -47,12 +48,27 @@ impl SlotMeta {
     pub fn num_segments(&self) -> usize {
         self.segment_sizes.len()
     }
+
+    /// Bytes the slot takes on SSD and in a prefetch buffer: every segment
+    /// rounded up to [`SSD_ALIGNMENT`].
+    pub fn io_size(&self) -> u64 {
+        self.segment_sizes.iter().map(|&s| io_len(s)).sum()
+    }
+}
+
+/// `len` rounded up to the O_DIRECT alignment.
+///
+/// KV layouts pad segments themselves, so this is the identity for them.
+/// Object segments keep their logical size; their allocation is padded, so
+/// the rounded tail stays inside it.
+pub(crate) fn io_len(len: u64) -> u64 {
+    len.next_multiple_of(SSD_ALIGNMENT as u64)
 }
 
 /// Reconstruct a `RawBlock` from a pinned allocation at a given offset.
 ///
 /// # Safety
-/// Caller must ensure `allocation.as_ptr() + offset + meta.total_size()` is within bounds.
+/// Caller must ensure `allocation.as_ptr() + offset + meta.io_size()` is within bounds.
 pub(crate) unsafe fn reconstruct_raw_block(
     meta: &SlotMeta,
     allocation: Arc<PinnedAllocation>,
@@ -64,10 +80,8 @@ pub(crate) unsafe fn reconstruct_raw_block(
         "reconstruct_raw_block: allocation pointer must be non-null"
     );
     debug_assert!(
-        base_offset
-            .checked_add(meta.total_size() as usize)
-            .is_some(),
-        "reconstruct_raw_block: offset + total_size overflows usize"
+        base_offset.checked_add(meta.io_size() as usize).is_some(),
+        "reconstruct_raw_block: offset + io_size overflows usize"
     );
     let mut offset = base_offset;
     let mut segments = Vec::with_capacity(meta.segment_sizes.len());
@@ -83,16 +97,17 @@ pub(crate) unsafe fn reconstruct_raw_block(
             seg_size as usize,
             Arc::clone(&allocation),
         ));
-        offset += seg_size as usize;
+        offset += io_len(seg_size) as usize;
     }
     RawBlock::new(segments)
 }
 
-/// Build iovecs for writing a slot's RawBlock to SSD.
+/// Build iovecs for writing a slot's RawBlock to SSD, each segment's length
+/// rounded by [`io_len`].
 #[inline]
 pub(crate) fn write_iovecs(slot: &RawBlock) -> Vec<(*const u8, usize)> {
     slot.segment_iovecs()
-        .map(|(ptr, size)| (ptr.as_ptr() as *const u8, size))
+        .map(|(ptr, size)| (ptr.as_ptr() as *const u8, io_len(size as u64) as usize))
         .collect()
 }
 
@@ -100,7 +115,7 @@ pub(crate) fn write_iovecs(slot: &RawBlock) -> Vec<(*const u8, usize)> {
 /// `base` is the buffer base pointer, `offset` is the slot's offset within the buffer.
 ///
 /// # Safety
-/// Caller must ensure `base + offset + total_size` is within a valid allocation.
+/// Caller must ensure `base + offset + io_size` is within a valid allocation.
 #[inline]
 pub(crate) unsafe fn read_iovecs(
     meta: &SlotMeta,
@@ -114,7 +129,7 @@ pub(crate) unsafe fn read_iovecs(
     let mut current_offset = offset;
     let mut result = Vec::with_capacity(meta.segment_sizes.len());
     for &seg_size in &meta.segment_sizes {
-        let size = seg_size as usize;
+        let size = io_len(seg_size) as usize;
         // Safety: caller ensures base + current_offset + size is within valid allocation.
         let ptr = unsafe { base.add(current_offset) };
         result.push((ptr, size));
@@ -122,7 +137,7 @@ pub(crate) unsafe fn read_iovecs(
     }
     debug_assert_eq!(
         current_offset - offset,
-        meta.total_size() as usize,
+        meta.io_size() as usize,
         "read_iovecs: accumulated offset mismatch"
     );
     result

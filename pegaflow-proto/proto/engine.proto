@@ -258,9 +258,11 @@ message ReleaseTransferLockResponse {
 // copy strided byte runs between registered device regions and objects; the
 // server never interprets layers, ranks or layouts. An object becomes visible
 // to QueryObjects once its writes, possibly from several devices, cover every
-// byte. Objects share the pinned pool, LRU and lease machinery with blocks.
-// Leases are released with Release; UnregisterContext and Session drop an
-// instance's object devices like its KV contexts.
+// unit. Objects share the pinned pool, LRU, lease machinery, SSD cache and
+// MetaServer registration with blocks: QueryObjects brings an object evicted
+// from memory back from a peer or SSD. Leases are released with Release;
+// UnregisterContext and Session drop an instance's object devices like its KV
+// contexts.
 
 message ObjectKey {
   // 32-byte digest of everything that decides the object's bytes besides the
@@ -289,24 +291,47 @@ message RegisterObjectDeviceResponse {}
 
 message ObjectKeyList {
   repeated ObjectKey keys = 1;
-  // Report no hit after the first miss.
-  bool stop_at_miss = 2;
 }
 
+// A resume point: the first `blocks` keys of every prefix chain, and `keys`.
+message ObjectPoint {
+  uint32 blocks = 1;
+  repeated ObjectKey keys = 2;
+}
+
+// Like QueryPrefetch, over objects. Prefix chains have prefix semantics; a
+// point's keys have membership semantics. The first call of a req_id finds
+// the last point whose blocks every chain and whose keys can reach in memory,
+// from a peer or on this node's SSD (no points: the longest prefix every
+// chain reaches), brings the missing objects in, peers first and then SSD,
+// and answers loading until that ends; poll with the same req_id and the same
+// request. Ready answers from what is then held: a shorter point when the
+// fetch fell short.
 message QueryObjectsRequest {
   string instance_id = 1;
-  repeated ObjectKeyList lists = 2;
+  string req_id = 2;
+  // Each of one fingerprint, block 0 first.
+  repeated ObjectKeyList prefixes = 3;
+  // In ascending order of preference; blocks at most the shortest chain.
+  repeated ObjectPoint points = 4;
 }
 
-message ObjectHits {
-  repeated bool hits = 1;
+message ObjectsReady {
+  // The point found, or -1.
+  int32 point = 1;
+  // Leading blocks of every chain the lease holds: the point's, or with no
+  // points the longest prefix every chain holds.
+  uint32 blocks = 2;
+  // Holds those blocks and the point's keys until Release or expiry; empty
+  // when it would hold nothing.
+  bytes lease = 3;
 }
 
 message QueryObjectsResponse {
-  // Holds every hit until Release or expiry; loads of this instance name
-  // keys it holds. Issued even when nothing hits.
-  bytes lease = 1;
-  repeated ObjectHits lists = 2;
+  oneof outcome {
+    QueryLoading loading = 1;
+    ObjectsReady ready = 2;
+  }
 }
 
 // rows copies of width bytes: row r at region_offset + r * region_stride of
@@ -323,9 +348,18 @@ message ObjectRun {
 
 message ObjectWrite {
   ObjectKey key = 1;
-  // Bytes of the whole object; every writer of a key must agree.
+  // Bytes of the whole object.
   uint64 size = 2;
   repeated ObjectRun runs = 3;
+  // Coverage granule in bytes: it divides every chunk and every run's object
+  // offset, width and object stride. A run whose units are all written
+  // already copies nothing.
+  uint64 unit = 4;
+  // Sizes of the object's chunks in order, summing to size; empty for one
+  // chunk. Each chunk is stored apart and every run lies inside one.
+  repeated uint64 chunks = 5;
+  // size, unit and chunks are decided by the client and every writer of a
+  // key must send the same ones.
 }
 
 message ObjectRead {
@@ -344,11 +378,20 @@ message SaveObjectsResponse {
   uint32 sealed = 1;
 }
 
+message ObjectLoad {
+  // A lease of this instance holding every key read.
+  bytes lease = 1;
+  repeated ObjectRead reads = 2;
+}
+
 message LoadObjectsRequest {
   string instance_id = 1;
   uint32 rank = 2;
-  bytes lease = 3;
-  repeated ObjectRead reads = 4;
+  repeated ObjectLoad loads = 3;
+  // A LoadState the server sets once the copies finish or fail; the reply
+  // then comes as soon as the request is validated. Empty: reply after the
+  // copies finish.
+  string load_state_shm = 4;
 }
 
 message LoadObjectsResponse {}
@@ -374,7 +417,8 @@ service Engine {
   rpc Session(SessionRequest) returns (stream SessionEvent);
   // Byte-addressed objects: open one device's regions for object copies.
   rpc RegisterObjectDevice(RegisterObjectDeviceRequest) returns (RegisterObjectDeviceResponse);
-  // Report which object keys are sealed and hold the hits under one lease.
+  // Find the last resume point whose objects exist, bring them into memory
+  // and lease them.
   rpc QueryObjects(QueryObjectsRequest) returns (QueryObjectsResponse);
   // Copy device bytes into objects; returns after the copies complete.
   rpc SaveObjects(SaveObjectsRequest) returns (SaveObjectsResponse);

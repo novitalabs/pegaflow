@@ -1,32 +1,21 @@
 //! Strided host<->device copies: `rows` rows of `width` bytes, `device_pitch`
 //! apart on the device and `host_pitch` apart in mapped pinned host memory.
 //!
-//! [`StridedMode::Dma`] issues one `cuMemcpy2DAsync` per copy (one 1D copy when
-//! the rows are back to back); the copy engines run it beside compute, but each
-//! call costs a few microseconds, so small copies are call-bound.
-//! [`StridedMode::Kernel`] moves every copy in one launch: each warp copies a
-//! chunk of a row through the mapped host address, so fragments cost no driver
-//! call but the copy occupies SMs. [`StridedMode::Auto`] loads with the kernel,
-//! which reads mapped host memory at the PCIe rate for every shape, and saves
-//! copies of at least `DMA_MIN_BYTES` in rows of at least `DMA_MIN_WIDTH` on
-//! the copy engines, which write host memory faster than the kernel, and the
-//! rest with the kernel.
+//! Every batch is one kernel launch: each warp copies a chunk of a row through
+//! the mapped host address, so fragments cost no driver call and no shape
+//! needs a heuristic, at the price of occupying SMs during the copy.
 
 use std::sync::Arc;
 
+use cudarc::driver::sys::CUdevice_attribute;
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg, sys,
+    CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, DevicePtrMut, LaunchConfig,
+    PinnedHostSlice, PushKernelArg, result,
 };
 use cudarc::nvrtc::compile_ptx;
 
 /// Bytes one warp copies per work item.
 const CHUNK: u64 = 4096;
-/// Copies at least this large go to the copy engines in `Auto`.
-const DMA_MIN_BYTES: u64 = 256 << 10;
-/// ... if their rows are at least this wide (2D copies of narrow rows are slow).
-const DMA_MIN_WIDTH: u64 = 2 << 10;
-/// cuMemcpy2D rejects pitches at or above this; such copies go row by row.
-const MAX_PITCH: u64 = 1 << 31;
 const BLOCK_DIM: u32 = 256;
 const MAX_GRID: u64 = 65_535;
 /// u64 words per copy descriptor.
@@ -65,13 +54,16 @@ extern "C" __global__ void pega_strided_copy(const unsigned long long* __restric
             int4* __restrict__ d4 = (int4*)dst;
             const int4* __restrict__ s4 = (const int4*)src;
             unsigned long long j = lane;
-            // Four loads in flight per lane: reads of mapped host memory are latency-bound.
+            // Four loads in flight per lane: reads of mapped host memory are
+            // latency-bound. Streaming stores keep the copy from evicting L2,
+            // which speeds up scattered writes into host memory.
             for (; j + 96 < n16; j += 128) {{
                 const int4 a = s4[j], b = s4[j + 32], c = s4[j + 64], e = s4[j + 96];
-                d4[j] = a; d4[j + 32] = b; d4[j + 64] = c; d4[j + 96] = e;
+                __stcs(d4 + j, a); __stcs(d4 + j + 32, b);
+                __stcs(d4 + j + 64, c); __stcs(d4 + j + 96, e);
             }}
             for (; j < n16; j += 32) {{
-                d4[j] = s4[j];
+                __stcs(d4 + j, s4[j]);
             }}
             for (unsigned long long j = (n16 << 4) + lane; j < size; j += 32) {{
                 dst[j] = src[j];
@@ -85,32 +77,6 @@ extern "C" __global__ void pega_strided_copy(const unsigned long long* __restric
 }}
 "#
     )
-}
-
-/// How a [`StridedCopier`] moves copies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum StridedMode {
-    /// One `cuMemcpy2DAsync` (or 1D copy) per copy.
-    Dma,
-    /// One kernel launch for every copy.
-    Kernel,
-    /// Loads in one launch; saves of large copies of wide rows on the copy
-    /// engines, the rest in one launch.
-    #[default]
-    Auto,
-}
-
-impl std::str::FromStr for StridedMode {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, String> {
-        match s {
-            "dma" => Ok(Self::Dma),
-            "kernel" => Ok(Self::Kernel),
-            "auto" => Ok(Self::Auto),
-            _ => Err(format!("unknown copy mode {s:?} (dma, kernel, auto)")),
-        }
-    }
 }
 
 /// One strided copy between device memory and mapped pinned host memory.
@@ -147,10 +113,6 @@ impl StridedCopy {
         }
     }
 
-    fn bytes(&self) -> u64 {
-        self.width * u64::from(self.rows)
-    }
-
     /// `next` continues this single-row copy on both sides.
     fn joins(&self, next: &Self) -> bool {
         self.rows == 1
@@ -160,239 +122,177 @@ impl StridedCopy {
     }
 }
 
-/// A copy `Auto` sends to the copy engines when saving.
-fn large(c: &StridedCopy) -> bool {
-    c.bytes() >= DMA_MIN_BYTES && c.width >= DMA_MIN_WIDTH
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Dir {
     HostToDevice,
     DeviceToHost,
 }
 
-/// Moves batches of [`StridedCopy`] on one device; holds the compiled kernel
-/// and a reusable descriptor buffer, so callers serialize use per device.
+/// Moves batches of [`StridedCopy`] on one device; holds the compiled kernel,
+/// a pinned staging buffer and a device buffer for descriptors, so callers
+/// serialize use per device.
 pub struct StridedCopier {
-    mode: StridedMode,
-    func: Option<CudaFunction>,
+    ctx: Arc<CudaContext>,
+    func: CudaFunction,
+    /// Descriptors of the last transfer, pinned so their upload is one async
+    /// DMA instead of a driver-staged pageable copy.
+    staged: Option<PinnedHostSlice<u64>>,
+    /// Marks the end of the last upload from `staged`.
+    uploaded: CudaEvent,
     scratch: Option<CudaSlice<u64>>,
+    /// Most blocks a device -> host launch uses: one per SM.
+    d2h_grid: u64,
 }
 
 impl StridedCopier {
-    /// A copier for `ctx`; the kernel is compiled unless `mode` is `Dma`.
-    pub fn new(ctx: &Arc<CudaContext>, mode: StridedMode) -> Result<Self, String> {
-        let func = if mode == StridedMode::Dma {
-            None
-        } else {
-            let ptx =
-                compile_ptx(kernel_src()).map_err(|e| format!("nvrtc compile failed: {e:?}"))?;
-            let module = ctx
-                .load_module(ptx)
-                .map_err(|e| format!("load_module failed: {e:?}"))?;
-            Some(
-                module
-                    .load_function("pega_strided_copy")
-                    .map_err(|e| format!("load_function failed: {e:?}"))?,
-            )
-        };
+    /// Compile and load the copy kernel into `ctx`.
+    pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, String> {
+        let ptx = compile_ptx(kernel_src()).map_err(|e| format!("nvrtc compile failed: {e:?}"))?;
+        let module = ctx
+            .load_module(ptx)
+            .map_err(|e| format!("load_module failed: {e:?}"))?;
+        let func = module
+            .load_function("pega_strided_copy")
+            .map_err(|e| format!("load_function failed: {e:?}"))?;
+        let sms = ctx
+            .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+            .map_err(|e| format!("SM count query failed: {e:?}"))?;
+        let uploaded = ctx
+            .new_event(None)
+            .map_err(|e| format!("event create failed: {e:?}"))?;
         Ok(Self {
-            mode,
+            ctx: Arc::clone(ctx),
             func,
+            staged: None,
+            uploaded,
             scratch: None,
+            d2h_grid: u64::try_from(sms).unwrap_or(1).max(1),
         })
     }
 
-    pub fn mode(&self) -> StridedMode {
-        self.mode
-    }
-
-    /// Enqueue host -> device copies; the caller synchronizes `stream`.
+    /// Enqueue host -> device copies as one launch; the caller synchronizes `stream`.
     pub fn h2d(&mut self, copies: &[StridedCopy], stream: &Arc<CudaStream>) -> Result<(), String> {
-        self.submit(copies, Dir::HostToDevice, stream)
+        self.launch(&[copies], Dir::HostToDevice, stream)
     }
 
-    /// Enqueue device -> host copies; the caller synchronizes `stream`.
-    pub fn d2h(&mut self, copies: &[StridedCopy], stream: &Arc<CudaStream>) -> Result<(), String> {
-        self.submit(copies, Dir::DeviceToHost, stream)
-    }
-
-    fn submit(
+    /// Enqueue device -> host copies, one launch per batch in order, behind
+    /// one descriptor upload; the caller synchronizes `stream`.
+    pub fn d2h(
         &mut self,
-        copies: &[StridedCopy],
-        dir: Dir,
+        batches: &[&[StridedCopy]],
         stream: &Arc<CudaStream>,
     ) -> Result<(), String> {
-        let mut dma: Vec<StridedCopy> = Vec::new();
-        let mut kernel: Vec<StridedCopy> = Vec::new();
-        for c in copies.iter().map(|c| c.flattened()) {
-            let to_dma = match self.mode {
-                StridedMode::Dma => true,
-                StridedMode::Kernel => false,
-                StridedMode::Auto => dir == Dir::DeviceToHost && large(&c),
-            };
-            let out = if to_dma { &mut dma } else { &mut kernel };
-            match out.last_mut() {
-                Some(prev) if prev.joins(&c) => prev.width += c.width,
-                _ => out.push(c),
-            }
-        }
-        // Small copies `Auto` set aside may join into a large one.
-        if self.mode == StridedMode::Auto && dir == Dir::DeviceToHost {
-            kernel.retain(|c| {
-                if large(c) {
-                    dma.push(*c);
-                }
-                !large(c)
-            });
-        }
-        for c in &dma {
-            dma_copy(c, dir, stream)?;
-        }
-        self.launch(&kernel, dir, stream)
+        self.launch(batches, Dir::DeviceToHost, stream)
     }
 
     fn launch(
         &mut self,
-        copies: &[StridedCopy],
+        batches: &[&[StridedCopy]],
         dir: Dir,
         stream: &Arc<CudaStream>,
     ) -> Result<(), String> {
-        if copies.is_empty() {
+        // (descriptor offset, descriptors, chunks) per launch.
+        let mut launches = Vec::with_capacity(batches.len());
+        let mut descs: Vec<u64> = Vec::new();
+        for batch in batches {
+            let at = descs.len();
+            let mut chunks = 0u64;
+            for c in joined(batch) {
+                let (dst, src, dst_pitch, src_pitch) = match dir {
+                    Dir::HostToDevice => (c.device, c.host_device, c.device_pitch, c.host_pitch),
+                    Dir::DeviceToHost => (c.host_device, c.device, c.host_pitch, c.device_pitch),
+                };
+                descs.extend_from_slice(&[
+                    dst,
+                    src,
+                    c.width,
+                    u64::from(c.rows),
+                    dst_pitch,
+                    src_pitch,
+                    chunks,
+                ]);
+                chunks += c.width.div_ceil(CHUNK) * u64::from(c.rows);
+            }
+            if chunks > 0 {
+                launches.push((at, ((descs.len() - at) / DESC_WORDS) as u64, chunks));
+            }
+        }
+        if launches.is_empty() {
             return Ok(());
         }
-        let func = self
-            .func
-            .as_ref()
-            .ok_or("kernel copy requested in dma mode")?;
-        let mut descs = Vec::with_capacity(copies.len() * DESC_WORDS);
-        let mut chunks = 0u64;
-        for c in copies {
-            let (dst, src, dst_pitch, src_pitch) = match dir {
-                Dir::HostToDevice => (c.device, c.host_device, c.device_pitch, c.host_pitch),
-                Dir::DeviceToHost => (c.host_device, c.device, c.host_pitch, c.device_pitch),
-            };
-            descs.extend_from_slice(&[
-                dst,
-                src,
-                c.width,
-                u64::from(c.rows),
-                dst_pitch,
-                src_pitch,
-                chunks,
-            ]);
-            chunks += c.width.div_ceil(CHUNK) * u64::from(c.rows);
+        // The last upload from the staging buffer must end before it is
+        // rewritten or freed.
+        self.uploaded
+            .synchronize()
+            .map_err(|e| format!("descriptor upload wait failed: {e:?}"))?;
+        let len = descs.len().next_power_of_two();
+        if self.staged.as_ref().is_none_or(|s| s.len() < descs.len()) {
+            // SAFETY: only words written below are uploaded.
+            self.staged = Some(
+                unsafe { self.ctx.alloc_pinned::<u64>(len) }
+                    .map_err(|e| format!("descriptor staging alloc failed: {e:?}"))?,
+            );
         }
         if self.scratch.as_ref().is_none_or(|s| s.len() < descs.len()) {
             self.scratch = Some(
                 stream
-                    .alloc_zeros::<u64>(descs.len().next_power_of_two())
+                    .alloc_zeros::<u64>(len)
                     .map_err(|e| format!("descriptor alloc failed: {e:?}"))?,
             );
         }
+        let staged = self
+            .staged
+            .as_mut()
+            .expect("allocated above")
+            .as_mut_slice()
+            .map_err(|e| format!("descriptor staging failed: {e:?}"))?;
+        staged[..descs.len()].copy_from_slice(&descs);
         let scratch = self.scratch.as_mut().expect("allocated above");
-        // The source is pageable: the driver stages it before returning.
-        stream
-            .memcpy_htod(&descs, scratch)
-            .map_err(|e| format!("descriptor upload failed: {e:?}"))?;
-        let warps_per_block = u64::from(BLOCK_DIM / 32);
-        let grid = chunks.div_ceil(warps_per_block).clamp(1, MAX_GRID) as u32;
-        let cfg = LaunchConfig {
-            grid_dim: (grid, 1, 1),
-            block_dim: (BLOCK_DIM, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let n = copies.len() as u64;
-        let mut builder = stream.launch_builder(func);
-        builder.arg(&*scratch).arg(&n).arg(&chunks);
-        // SAFETY: the kernel reads `n` descriptors of `scratch` and copies
-        // validated rows between device memory and mapped pinned memory, which
-        // the caller keeps alive until it synchronizes the stream.
-        unsafe { builder.launch(cfg) }.map_err(|e| format!("kernel launch failed: {e:?}"))?;
-        Ok(())
-    }
-}
-
-fn dma_copy(c: &StridedCopy, dir: Dir, stream: &CudaStream) -> Result<(), String> {
-    if c.rows == 1 {
-        // SAFETY: both sides were validated by the caller; the host side is
-        // pinned memory kept alive until the stream synchronizes.
-        let r = unsafe {
-            match dir {
-                Dir::HostToDevice => sys::cuMemcpyHtoDAsync_v2(
-                    c.device,
-                    c.host.cast_const().cast(),
-                    c.width as usize,
-                    stream.cu_stream(),
-                ),
-                Dir::DeviceToHost => sys::cuMemcpyDtoHAsync_v2(
-                    c.host.cast(),
-                    c.device,
-                    c.width as usize,
-                    stream.cu_stream(),
-                ),
-            }
-        };
-        return check(r, "cuMemcpyAsync");
-    }
-    if c.device_pitch >= MAX_PITCH || c.host_pitch >= MAX_PITCH {
-        for r in 0..u64::from(c.rows) {
-            let row = StridedCopy {
-                device: c.device + r * c.device_pitch,
-                // SAFETY: row `r` lies inside the copy, validated by the caller.
-                host: unsafe { c.host.add((r * c.host_pitch) as usize) },
-                host_device: c.host_device + r * c.host_pitch,
-                rows: 1,
-                ..*c
-            };
-            dma_copy(&row, dir, stream)?;
+        {
+            let (dst, _written) = scratch.device_ptr_mut(stream);
+            // SAFETY: `dst` holds at least `descs.len()` words; the staging
+            // buffer outlives the copy, which `uploaded` tracks.
+            unsafe { result::memcpy_htod_async(dst, &staged[..descs.len()], stream.cu_stream()) }
+                .map_err(|e| format!("descriptor upload failed: {e:?}"))?;
         }
-        return Ok(());
+        self.uploaded
+            .record(stream)
+            .map_err(|e| format!("descriptor upload record failed: {e:?}"))?;
+        let warps_per_block = u64::from(BLOCK_DIM / 32);
+        // Writes into host memory saturate PCIe with one block per SM; more
+        // warps only interleave scattered host rows and lose bandwidth.
+        // Reads of host memory are latency-bound and want every warp.
+        let max_grid = match dir {
+            Dir::HostToDevice => MAX_GRID,
+            Dir::DeviceToHost => self.d2h_grid,
+        };
+        for (at, n, chunks) in launches {
+            let grid = chunks.div_ceil(warps_per_block).clamp(1, max_grid) as u32;
+            let cfg = LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (BLOCK_DIM, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let view = scratch.slice(at..);
+            let mut builder = stream.launch_builder(&self.func);
+            builder.arg(&view).arg(&n).arg(&chunks);
+            // SAFETY: the kernel reads `n` descriptors from `view` and copies
+            // validated rows between device memory and mapped pinned memory,
+            // which the caller keeps alive until it synchronizes the stream.
+            unsafe { builder.launch(cfg) }.map_err(|e| format!("kernel launch failed: {e:?}"))?;
+        }
+        Ok(())
     }
-    use sys::CUmemorytype::{CU_MEMORYTYPE_DEVICE, CU_MEMORYTYPE_HOST};
-    let (src_type, src_pitch, dst_type, dst_pitch) = match dir {
-        Dir::DeviceToHost => (
-            CU_MEMORYTYPE_DEVICE,
-            c.device_pitch,
-            CU_MEMORYTYPE_HOST,
-            c.host_pitch,
-        ),
-        Dir::HostToDevice => (
-            CU_MEMORYTYPE_HOST,
-            c.host_pitch,
-            CU_MEMORYTYPE_DEVICE,
-            c.device_pitch,
-        ),
-    };
-    // CUDA reads only the pointer fields matching each side's memory type.
-    // The struct holds enums, so it is built field by field, not zeroed.
-    let p = sys::CUDA_MEMCPY2D {
-        srcXInBytes: 0,
-        srcY: 0,
-        srcMemoryType: src_type,
-        srcHost: c.host.cast_const().cast(),
-        srcDevice: c.device,
-        srcArray: std::ptr::null_mut(),
-        srcPitch: src_pitch as usize,
-        dstXInBytes: 0,
-        dstY: 0,
-        dstMemoryType: dst_type,
-        dstHost: c.host.cast(),
-        dstDevice: c.device,
-        dstArray: std::ptr::null_mut(),
-        dstPitch: dst_pitch as usize,
-        WidthInBytes: c.width as usize,
-        Height: c.rows as usize,
-    };
-    // SAFETY: as above.
-    let r = unsafe { sys::cuMemcpy2DAsync_v2(&p, stream.cu_stream()) };
-    check(r, "cuMemcpy2DAsync")
 }
 
-fn check(r: sys::CUresult, what: &str) -> Result<(), String> {
-    if r == sys::cudaError_enum::CUDA_SUCCESS {
-        Ok(())
-    } else {
-        Err(format!("{what}: {r:?}"))
+/// `copies` with back-to-back rows flattened and adjacent single rows joined.
+fn joined(copies: &[StridedCopy]) -> Vec<StridedCopy> {
+    let mut out: Vec<StridedCopy> = Vec::with_capacity(copies.len());
+    for c in copies.iter().map(|c| c.flattened()) {
+        match out.last_mut() {
+            Some(prev) if prev.joins(&c) => prev.width += c.width,
+            _ => out.push(c),
+        }
     }
+    out
 }

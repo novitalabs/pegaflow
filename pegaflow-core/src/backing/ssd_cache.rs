@@ -308,16 +308,6 @@ impl SsdRingBuffer {
         // 2. Insert Writing state and build WriteInfo
         let mut writes = Vec::with_capacity(to_write.len());
         for (key, block) in to_write {
-            let size = block.memory_footprint();
-            let shard_id = self.next_shard;
-            let Some((begin, file_offset)) = self.allocate_contiguous(shard_id, size) else {
-                warn!(
-                    "SSD cache: dropping block {:?}, size {} exceeds shard capacity {}",
-                    key, size, self.shards[shard_id].capacity
-                );
-                continue;
-            };
-            self.next_shard = (self.next_shard + 1) % self.shards.len();
             let slot_numas = block.slot_numas();
             assert_eq!(
                 slot_numas.len(),
@@ -335,6 +325,16 @@ impl SsdRingBuffer {
                     SlotMeta::new(segment_sizes, slot_numas[i])
                 })
                 .collect();
+            let size: u64 = slots.iter().map(SlotMeta::io_size).sum();
+            let shard_id = self.next_shard;
+            let Some((begin, file_offset)) = self.allocate_contiguous(shard_id, size) else {
+                warn!(
+                    "SSD cache: dropping block {:?}, size {} exceeds shard capacity {}",
+                    key, size, self.shards[shard_id].capacity
+                );
+                continue;
+            };
+            self.next_shard = (self.next_shard + 1) % self.shards.len();
             let entry = SsdIndexEntry {
                 shard_id,
                 begin,
@@ -736,7 +736,7 @@ fn group_slots_by_numa(
             groups.entry(numa_key).or_default().push(SlotRef {
                 block_idx,
                 slot_idx,
-                size: meta.total_size(),
+                size: meta.io_size(),
             });
         }
     }
@@ -1318,14 +1318,14 @@ mod tests {
         // TP8: 4 slots on NUMA0, 4 on NUMA1, 2 blocks
         let slots = |n0, n1| {
             vec![
-                make_slot(NumaNode(0), 64),
-                make_slot(NumaNode(0), 64),
-                make_slot(NumaNode(0), 64),
-                make_slot(NumaNode(0), 64),
-                make_slot(NumaNode(n0), 64),
-                make_slot(NumaNode(n0), 64),
-                make_slot(NumaNode(n1), 64),
-                make_slot(NumaNode(n1), 64),
+                make_slot(NumaNode(0), 512),
+                make_slot(NumaNode(0), 512),
+                make_slot(NumaNode(0), 512),
+                make_slot(NumaNode(0), 512),
+                make_slot(NumaNode(n0), 512),
+                make_slot(NumaNode(n0), 512),
+                make_slot(NumaNode(n1), 512),
+                make_slot(NumaNode(n1), 512),
             ]
         };
         let requests = vec![
@@ -1343,11 +1343,11 @@ mod tests {
         assert_eq!(numa0.len(), 8);
         assert_eq!(numa1.len(), 8);
 
-        // Total size: 8 * 64 = 512 per group
+        // Total size: 8 * 512 = 4096 per group
         let total_0: u64 = numa0.iter().map(|r| r.size).sum();
         let total_1: u64 = numa1.iter().map(|r| r.size).sum();
-        assert_eq!(total_0, 512);
-        assert_eq!(total_1, 512);
+        assert_eq!(total_0, 4096);
+        assert_eq!(total_1, 4096);
 
         // Verify slots reference correct slot indices
         assert!(numa0.iter().all(|r| r.slot_idx < 4));
