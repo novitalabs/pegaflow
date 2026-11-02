@@ -1,0 +1,119 @@
+syntax = "proto3";
+
+// Content-addressed KV storage. The server stores opaque objects keyed by
+// (fingerprint, prefix) and copies byte runs between registered device regions
+// and those objects; it knows nothing about layers, ranks or layouts.
+package pegaflow.v2;
+
+service EngineV2 {
+  // Open one device's memory regions; must precede Save/Load from that device.
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  // Drop every region of an instance.
+  rpc Unregister(UnregisterRequest) returns (UnregisterResponse);
+  // Report which keys are sealed and hold them under one lease.
+  rpc Query(QueryRequest) returns (QueryResponse);
+  // Copy device bytes into objects; returns after the copies complete.
+  rpc Save(SaveRequest) returns (SaveResponse);
+  // Copy leased objects into device memory; returns after the copies complete.
+  rpc Load(LoadRequest) returns (LoadResponse);
+  rpc Release(ReleaseRequest) returns (ReleaseResponse);
+}
+
+message Region {
+  // CUipcMemHandle of a cuMemAlloc allocation (64 bytes).
+  bytes ipc_handle = 1;
+  uint64 size = 2;
+}
+
+message RegisterRequest {
+  // Must equal the server's version exactly.
+  string version = 1;
+  string instance_id = 2;
+  uint32 rank = 3;
+  int32 device_id = 4;
+  repeated Region regions = 5;
+}
+
+message RegisterResponse {}
+
+message UnregisterRequest {
+  string instance_id = 1;
+}
+
+message UnregisterResponse {
+  uint32 removed_devices = 1;
+}
+
+message ObjectKey {
+  bytes fingerprint = 1;
+  bytes prefix = 2;
+}
+
+message KeyList {
+  repeated ObjectKey keys = 1;
+  // Report no hit after the first miss.
+  bool stop_at_miss = 2;
+}
+
+message QueryRequest {
+  repeated KeyList lists = 1;
+}
+
+message HitList {
+  repeated bool hits = 1;
+}
+
+message QueryResponse {
+  uint64 lease = 1;
+  repeated HitList lists = 2;
+}
+
+// rows copies of width bytes: row r at region_offset + r * region_stride of
+// the device region and object_offset + r * object_stride of the object.
+message Run {
+  uint32 region = 1;
+  uint64 region_offset = 2;
+  uint64 object_offset = 3;
+  uint64 width = 4;
+  uint32 rows = 5;
+  uint64 region_stride = 6;
+  uint64 object_stride = 7;
+}
+
+message ObjectWrite {
+  ObjectKey key = 1;
+  // Bytes of the whole object; every writer of a key must agree.
+  uint64 size = 2;
+  repeated Run runs = 3;
+}
+
+message ObjectRead {
+  ObjectKey key = 1;
+  repeated Run runs = 2;
+}
+
+message SaveRequest {
+  string instance_id = 1;
+  uint32 rank = 2;
+  repeated ObjectWrite writes = 3;
+}
+
+message SaveResponse {
+  // Objects this save completed.
+  uint32 sealed = 1;
+}
+
+message LoadRequest {
+  string instance_id = 1;
+  uint32 rank = 2;
+  uint64 lease = 3;
+  repeated ObjectRead reads = 4;
+}
+
+message LoadResponse {}
+
+message ReleaseRequest {
+  uint64 lease = 1;
+}
+
+message ReleaseResponse {}
