@@ -453,8 +453,8 @@ impl StorageEngine {
     }
 
     /// Position-aligned membership lookup in the resident read cache: entry
-    /// `i` is the sealed block for `keys[i]`, or `None` on miss. Hashes must
-    /// already carry any group encoding (see `group_hash`).
+    /// `i` is the sealed block for `keys[i]`, or `None` on miss. Key hashes
+    /// must already carry any group encoding (see `group_hash`).
     pub(crate) fn get_blocks_aligned(&self, keys: &[BlockKey]) -> Vec<Option<Arc<SealedBlock>>> {
         self.read_cache.get_blocks_aligned(keys)
     }
