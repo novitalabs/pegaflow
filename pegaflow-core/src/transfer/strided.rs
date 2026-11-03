@@ -9,8 +9,7 @@ use std::sync::Arc;
 
 use cudarc::driver::sys::CUdevice_attribute;
 use cudarc::driver::{
-    CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, DevicePtrMut, LaunchConfig,
-    PinnedHostSlice, PushKernelArg, result,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::compile_ptx;
 
@@ -121,17 +120,10 @@ pub(crate) enum Direction {
     DeviceToHost,
 }
 
-/// Moves batches of [`StridedCopy`] on one device; holds the compiled kernel,
-/// a pinned staging buffer and a device buffer for descriptors, so callers
-/// serialize use per device.
+/// Moves batches of [`StridedCopy`] on one device; holds the compiled kernel
+/// and a device buffer for descriptors, so callers serialize use per device.
 pub(crate) struct StridedCopier {
-    ctx: Arc<CudaContext>,
     func: CudaFunction,
-    /// Descriptors of the last transfer, pinned so their upload is one async
-    /// DMA instead of a driver-staged pageable copy.
-    staged: Option<PinnedHostSlice<u64>>,
-    /// Marks the end of the last upload from `staged`.
-    uploaded: CudaEvent,
     scratch: Option<CudaSlice<u64>>,
     /// Most blocks a device -> host launch uses: one per SM.
     d2h_grid: u64,
@@ -150,14 +142,8 @@ impl StridedCopier {
         let sms = ctx
             .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
             .map_err(|e| format!("SM count query failed: {e:?}"))?;
-        let uploaded = ctx
-            .new_event(None)
-            .map_err(|e| format!("event create failed: {e:?}"))?;
         Ok(Self {
-            ctx: Arc::clone(ctx),
             func,
-            staged: None,
-            uploaded,
             scratch: None,
             d2h_grid: u64::try_from(sms).unwrap_or(1).max(1),
         })
@@ -204,44 +190,19 @@ impl StridedCopier {
         if launches.is_empty() {
             return Ok(());
         }
-        // The last upload from the staging buffer must end before it is
-        // rewritten or freed.
-        self.uploaded
-            .synchronize()
-            .map_err(|e| format!("descriptor upload wait failed: {e:?}"))?;
-        let len = descs.len().next_power_of_two();
-        if self.staged.as_ref().is_none_or(|s| s.len() < descs.len()) {
-            // SAFETY: only words written below are uploaded.
-            self.staged = Some(
-                unsafe { self.ctx.alloc_pinned::<u64>(len) }
-                    .map_err(|e| format!("descriptor staging alloc failed: {e:?}"))?,
-            );
-        }
         if self.scratch.as_ref().is_none_or(|s| s.len() < descs.len()) {
             self.scratch = Some(
                 stream
-                    .alloc_zeros::<u64>(len)
+                    .alloc_zeros::<u64>(descs.len().next_power_of_two())
                     .map_err(|e| format!("descriptor alloc failed: {e:?}"))?,
             );
         }
-        let staged = self
-            .staged
-            .as_mut()
-            .expect("allocated above")
-            .as_mut_slice()
-            .map_err(|e| format!("descriptor staging failed: {e:?}"))?;
-        staged[..descs.len()].copy_from_slice(&descs);
         let scratch = self.scratch.as_mut().expect("allocated above");
-        {
-            let (dst, _written) = scratch.device_ptr_mut(stream);
-            // SAFETY: `dst` holds at least `descs.len()` words; the staging
-            // buffer outlives the copy, which `uploaded` tracks.
-            unsafe { result::memcpy_htod_async(dst, &staged[..descs.len()], stream.cu_stream()) }
-                .map_err(|e| format!("descriptor upload failed: {e:?}"))?;
-        }
-        self.uploaded
-            .record(stream)
-            .map_err(|e| format!("descriptor upload record failed: {e:?}"))?;
+        // One upload for every launch of the transfer. The source is pageable,
+        // so the driver consumes it before returning, as in `KernelBackend`.
+        stream
+            .memcpy_htod(&descs, scratch)
+            .map_err(|e| format!("descriptor upload failed: {e:?}"))?;
         let warps_per_block = u64::from(BLOCK_DIM / 32);
         // Writes into host memory saturate PCIe with one block per SM; more
         // warps only interleave scattered host rows and lose bandwidth.
