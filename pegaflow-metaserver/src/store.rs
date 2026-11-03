@@ -463,6 +463,13 @@ impl BlockHashStore {
         })
     }
 
+    /// Drop every ownership record regardless of age, keeping node sessions so
+    /// live nodes keep registering without a session reset. Reserved for
+    /// explicit operator maintenance.
+    pub fn clear_blocks(&self) -> SweepStats {
+        self.retain_owners(|_, _| false)
+    }
+
     /// Latest incrementally maintained stored-owner redundancy distribution.
     pub fn redundancy_snapshot(&self) -> RedundancySnapshot {
         self.redundancy.snapshot()
@@ -490,15 +497,6 @@ impl BlockHashStore {
             }
         }
         (active, stale)
-    }
-
-    #[allow(
-        dead_code,
-        reason = "maintenance API reserved for explicit store cleanup"
-    )]
-    pub fn invalidate_all(&self) {
-        self.nodes.clear();
-        self.retain_owners(|_, _| false);
     }
 
     /// Validate and refresh the node's current session.
@@ -1263,10 +1261,10 @@ pub(crate) mod tests {
 
         let store = Arc::new(BlockHashStore::new());
         let hash = vec![1, 2, 3, 4];
+        let node_a_id = heartbeat_node(&store, "node-a");
+        let node_b_id = heartbeat_node(&store, "node-b");
 
         for _ in 0..100 {
-            let node_a_id = heartbeat_node(&store, "node-a");
-            let node_b_id = heartbeat_node(&store, "node-b");
             store
                 .insert_hashes("ns", std::slice::from_ref(&hash), "node-a", node_a_id)
                 .unwrap();
@@ -1305,13 +1303,13 @@ pub(crate) mod tests {
             );
 
             assert_stored_counts(&store);
-            store.invalidate_all();
+            store.clear_blocks();
             assert_stored_counts(&store);
         }
     }
 
     #[test]
-    fn test_invalidate_all() {
+    fn clear_blocks_drops_all_owners_and_keeps_node_sessions() {
         let store = BlockHashStore::new();
         let namespace = "model-test";
         let node = "10.0.0.1:50055";
@@ -1325,13 +1323,20 @@ pub(crate) mod tests {
         let existing = store.query_prefix(namespace, &hashes);
         assert_eq!(existing.len(), 2);
 
-        store.invalidate_all();
+        let stats = store.clear_blocks();
+        assert_eq!(stats.removed_owners, 2);
+        assert_eq!(stats.removed_keys, 2);
+        assert_eq!(stats.removed_nodes, 0);
 
-        let existing = store.query_prefix(namespace, &hashes);
-        assert_eq!(existing.len(), 0);
+        assert!(store.query_prefix(namespace, &hashes).is_empty());
         assert_eq!(store.entry_count(), 0);
         assert_eq!(store.owner_count(), 0);
-        assert_eq!(store.node_counts(), (0, 0));
+        // The session survives, so the node keeps registering without a reset.
+        assert_eq!(store.node_counts(), (1, 0));
+        store
+            .insert_hashes(namespace, &hashes, node, node_id)
+            .unwrap();
+        assert_eq!(store.query_prefix(namespace, &hashes).len(), 2);
     }
 
     #[test]

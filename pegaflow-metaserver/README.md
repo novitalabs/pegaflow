@@ -149,6 +149,7 @@ available ports when running multiple MetaServers on one host.
 | `0.0.0.0:9092` | `GET /health` | Returns `ok` |
 | `0.0.0.0:9092` | `GET /metrics` | Prometheus metrics |
 | `0.0.0.0:9092` | `POST /admin/cleanup-expired-blocks` | Remove owner registrations older than one hour |
+| `0.0.0.0:9092` | `POST /admin/clear-all-blocks` | Remove every owner registration regardless of age |
 
 ### Manual block cleanup
 
@@ -188,6 +189,28 @@ Manual cleanup scans the entire block directory on a blocking worker. It
 holds a block shard write lock while processing that shard, so concurrent
 RPCs accessing the same shard can experience increased latency. Use it for
 explicit maintenance and monitor RPC latency during the call.
+
+### Clearing all blocks
+
+`POST /admin/clear-all-blocks` is the age-independent form of the same
+operation, equivalent to `pegaflow-server`'s `POST /cache/memory/cleanup` but
+acting on cross-node metadata instead of resident KV blocks:
+
+```bash
+curl --fail-with-body --silent --show-error --request POST \
+  http://127.0.0.1:9092/admin/clear-all-blocks
+```
+
+It empties the block directory in every namespace and returns the same
+`{"removed_owners":N,"removed_keys":M}` shape, scan behavior, and error codes
+as the expiry-based route.
+
+Node sessions are preserved, so live nodes keep serving heartbeats and
+`InsertBlockHashes` without a session reset. Physical KV data is also
+preserved: cleared blocks stay resident on their nodes and still serve local
+hits, but become invisible to `QueryPrefix` until an owner reinserts them.
+Clearing does not trigger reinsertion, so to drop both tiers call this route
+together with `POST /cache/memory/cleanup` on each `pegaflow-server`.
 
 ## gRPC APIs
 
