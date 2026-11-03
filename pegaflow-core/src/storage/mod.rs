@@ -453,58 +453,29 @@ impl StorageEngine {
     }
 
     /// Position-aligned membership lookup in the resident read cache: entry
-    /// `i` is the sealed block for `hashes[i]`, or `None` on miss. Hashes must
+    /// `i` is the sealed block for `keys[i]`, or `None` on miss. Hashes must
     /// already carry any group encoding (see `group_hash`).
-    pub(crate) fn get_membership(
-        &self,
-        namespace: &str,
-        hashes: &[Vec<u8>],
-    ) -> Vec<Option<Arc<crate::block::SealedBlock>>> {
-        let keys: Vec<BlockKey> = hashes
-            .iter()
-            .map(|hash| BlockKey::new(namespace.to_string(), hash.clone()))
-            .collect();
-        self.read_cache.get_blocks_aligned(&keys)
-    }
-
-    /// Position-aligned resident blocks for `keys`, of any namespaces. Hits
-    /// refresh recency.
     pub(crate) fn get_blocks_aligned(&self, keys: &[BlockKey]) -> Vec<Option<Arc<SealedBlock>>> {
         self.read_cache.get_blocks_aligned(keys)
     }
 
-    /// Bytes of the pinned pool.
-    pub(crate) fn pool_capacity(&self) -> u64 {
-        self.allocator.usage().1
-    }
-
     /// Publish blocks sealed outside the insert worker, as it publishes its
     /// own: into the read cache, to SSD, and resident ones to the MetaServer.
-    /// Returns how many are resident.
-    pub(crate) fn insert_sealed(&self, blocks: &[(BlockKey, Arc<SealedBlock>)]) -> usize {
-        write_path::publish_sealed(
+    /// `local_copies` only enter the cache, reclaimable so pressure drops them
+    /// first. Returns how many of `blocks` are resident.
+    pub(crate) fn insert_sealed(
+        &self,
+        blocks: &[(BlockKey, Arc<SealedBlock>)],
+        local_copies: Vec<(BlockKey, Arc<SealedBlock>)>,
+    ) -> usize {
+        let resident = write_path::publish_sealed(
             &self.read_cache,
             self.ssd_store.as_ref(),
             self.metaserver_client.as_ref(),
             blocks,
-        )
-        .len()
-    }
-
-    /// Insert node-local copies of resident blocks: reclaimable, so pressure
-    /// drops them first, and never written to SSD or announced to peers.
-    pub(crate) fn insert_local_copies(&self, blocks: &[(BlockKey, Arc<SealedBlock>)]) {
-        self.read_cache.batch_insert_reclaimable(blocks);
-    }
-
-    /// Resident blocks for `keys`, without refreshing recency.
-    pub(crate) fn peek_blocks(&self, keys: &[BlockKey]) -> Vec<Option<Arc<SealedBlock>>> {
-        self.read_cache.peek_blocks(keys)
-    }
-
-    /// Whether SSD or peers can serve blocks this node does not hold in memory.
-    pub(crate) fn has_backing(&self) -> bool {
-        self.ssd_store.is_some() || self.prefetch.rdma_fetch().is_some()
+        );
+        self.read_cache.batch_insert_resident_keys(local_copies);
+        resident.len()
     }
 
     /// Per set of keys of one namespace, how many of its leading keys peers
