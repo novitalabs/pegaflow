@@ -35,8 +35,6 @@ use crate::{EngineError, NumaNode, PegaEngine, QueryLeaseId};
 const MAX_UNITS: u64 = 1 << 22;
 /// Most chunks one object may have.
 const MAX_CHUNKS: usize = 1 << 12;
-/// Share of the pinned pool, in percent, unsealed objects may hold.
-const UNSEALED_POOL_PERCENT: u64 = 50;
 /// Most keys and points one query may carry.
 const MAX_QUERY_KEYS: usize = 1 << 16;
 const MAX_QUERY_POINTS: usize = 1 << 12;
@@ -518,21 +516,17 @@ impl Pending {
 #[derive(Default)]
 struct PendingObjects {
     objects: HashMap<BlockKey, Pending>,
-    /// Bytes of every object in `objects`.
-    bytes: u64,
     next_id: u64,
 }
 
 impl PendingObjects {
     fn insert(&mut self, key: BlockKey, p: Pending) {
-        self.bytes += p.bytes();
         core_metrics().inflight_bytes.add(p.bytes() as i64, &[]);
         self.objects.insert(key, p);
     }
 
     fn take(&mut self, key: &BlockKey) -> Option<Pending> {
         let p = self.objects.remove(key)?;
-        self.bytes -= p.bytes();
         core_metrics().inflight_bytes.add(-(p.bytes() as i64), &[]);
         Some(p)
     }
@@ -985,7 +979,7 @@ impl PegaEngine {
         let chains: Vec<Vec<Option<Arc<SealedBlock>>>> = plan
             .prefixes
             .iter()
-            .map(|c| self.storage.peek_blocks(c))
+            .map(|c| self.storage.get_blocks_aligned(c))
             .collect();
         let resident: Vec<usize> = chains
             .iter()
@@ -1000,7 +994,7 @@ impl PegaEngine {
             .collect();
         let held: std::collections::HashSet<BlockKey> = point_keys
             .iter()
-            .zip(self.storage.peek_blocks(&point_keys))
+            .zip(self.storage.get_blocks_aligned(&point_keys))
             .filter_map(|(k, b)| b.map(|_| k.clone()))
             .collect();
         let in_memory = plan.best(|c| resident[c], |k| held.contains(k));
@@ -1012,7 +1006,7 @@ impl PegaEngine {
                 .all(|(c, &r)| r == c.len()),
             n => in_memory.0 == Some(n - 1),
         };
-        if full || !self.storage.has_backing() {
+        if full {
             return Ok(self.ready_objects(instance_id, &plan, Vec::new()));
         }
 
@@ -1172,7 +1166,6 @@ impl PegaEngine {
         let keys: Vec<BlockKey> = writes.iter().map(|w| w.key.block_key()).collect();
         let resident = self.storage.get_blocks_aligned(&keys);
         let nodes = self.objects.instance_nodes(instance_id);
-        let cap = self.storage.pool_capacity() / 100 * UNSEALED_POOL_PERCENT;
         let mut copies = Vec::new();
         let mut bytes = 0;
         // (write, pending id) of every object this save copies into.
@@ -1183,7 +1176,6 @@ impl PegaEngine {
             let mut pending = self.objects.pending.lock();
             // Check every write before allocating or claiming anything.
             let mut plan = Vec::with_capacity(writes.len());
-            let mut new_bytes = 0;
             for (i, block) in resident.iter().enumerate() {
                 let shape = &shapes[i];
                 let target = if let Some(block) = block {
@@ -1212,7 +1204,6 @@ impl PegaEngine {
                     Target::Pending
                 } else {
                     let copies = self.objects.placement(&keys[i].namespace, &device, &nodes);
-                    new_bytes += shape.size * copies.len() as u64;
                     Target::New(
                         shape
                             .chunks
@@ -1223,12 +1214,6 @@ impl PegaEngine {
                     )
                 };
                 plan.push((i, target));
-            }
-            if new_bytes > 0 && pending.bytes + new_bytes > cap {
-                return Err(EngineError::Storage(format!(
-                    "unsealed objects would hold {} of at most {cap} bytes",
-                    pending.bytes + new_bytes
-                )));
             }
             for (i, target) in plan {
                 let key = &keys[i];
@@ -1321,13 +1306,13 @@ impl PegaEngine {
             }
         }
         result?;
-        let n = self.storage.insert_sealed(&sealed);
-        self.storage.insert_local_copies(&replicas);
+        let n_replicas = replicas.len();
+        let n = self.storage.insert_sealed(&sealed, replicas);
         debug!(
             "save_objects {instance_id}/{rank}: {n_copies} copies, {bytes} bytes: prep {prep:?} \
              copy {copied:?} finish {:?}, sealed {n} with {} socket copies",
             copy.elapsed() - copied,
-            replicas.len()
+            n_replicas
         );
         Ok(n)
     }

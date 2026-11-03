@@ -626,11 +626,11 @@ impl PegaEngine {
         topology.group_total_slots(group_id)?;
 
         let namespace = instance.namespace();
-        let encoded: Vec<Vec<u8>> = block_hashes
+        let keys: Vec<BlockKey> = block_hashes
             .iter()
-            .map(|hash| group_hash(hash, group_id))
+            .map(|hash| BlockKey::new(namespace.to_string(), group_hash(hash, group_id)))
             .collect();
-        Ok(self.storage.get_membership(namespace, &encoded))
+        Ok(self.storage.get_blocks_aligned(&keys))
     }
 
     /// Create an opaque lease that owns query-ready blocks.
