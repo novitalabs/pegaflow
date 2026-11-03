@@ -461,21 +461,21 @@ impl StorageEngine {
 
     /// Publish blocks sealed outside the insert worker, as it publishes its
     /// own: into the read cache, to SSD, and resident ones to the MetaServer.
-    /// `local_copies` only enter the cache, reclaimable so pressure drops them
-    /// first. Returns how many of `blocks` are resident.
+    /// `local_copies` only enter the cache. Returns how many of `blocks` are
+    /// resident.
     pub(crate) fn insert_sealed(
         &self,
         blocks: &[(BlockKey, Arc<SealedBlock>)],
-        local_copies: Vec<(BlockKey, Arc<SealedBlock>)>,
+        local_copies: &[(BlockKey, Arc<SealedBlock>)],
     ) -> usize {
-        let resident = write_path::publish_sealed(
+        self.read_cache.batch_insert_refs(local_copies);
+        write_path::publish_sealed(
             &self.read_cache,
             self.ssd_store.as_ref(),
             self.metaserver_client.as_ref(),
             blocks,
-        );
-        self.read_cache.batch_insert_resident_keys(local_copies);
-        resident.len()
+        )
+        .len()
     }
 
     /// Per set of keys of one namespace, how many of its leading keys peers

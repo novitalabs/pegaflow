@@ -320,13 +320,8 @@ impl Shape {
                 w.unit
             ));
         }
-        let mut starts = Vec::with_capacity(chunks.len());
-        let mut at = 0u64;
-        for &c in &chunks {
-            starts.push(at);
-            at = at.saturating_add(c);
-        }
-        if at != w.size {
+        let starts = starts(&chunks);
+        if chunks.iter().try_fold(0u64, |a, &c| a.checked_add(c)) != Some(w.size) {
             return bad(format!("chunks {chunks:?} do not sum to size {}", w.size));
         }
         Ok(Self {
@@ -358,6 +353,18 @@ impl Shape {
                 ))
             })
     }
+}
+
+/// Object offset of each of `chunks`.
+fn starts(chunks: &[u64]) -> Vec<u64> {
+    chunks
+        .iter()
+        .scan(0u64, |at, &c| {
+            let s = *at;
+            *at = at.saturating_add(c);
+            Some(s)
+        })
+        .collect()
 }
 
 /// The chunk holding object bytes `[lo, hi)`, if one does.
@@ -1306,13 +1313,12 @@ impl PegaEngine {
             }
         }
         result?;
-        let n_replicas = replicas.len();
-        let n = self.storage.insert_sealed(&sealed, replicas);
+        let n = self.storage.insert_sealed(&sealed, &replicas);
         debug!(
             "save_objects {instance_id}/{rank}: {n_copies} copies, {bytes} bytes: prep {prep:?} \
              copy {copied:?} finish {:?}, sealed {n} with {} socket copies",
             copy.elapsed() - copied,
-            n_replicas
+            replicas.len()
         );
         Ok(n)
     }
@@ -1356,11 +1362,7 @@ impl PegaEngine {
                     .iter()
                     .map(RawBlock::memory_footprint)
                     .collect();
-                let mut starts = Vec::with_capacity(sizes.len());
-                sizes.iter().fold(0, |at, &s| {
-                    starts.push(at);
-                    at + s
-                });
+                let starts = starts(&sizes);
                 let mut read = vec![0u64; sizes.len()];
                 for run in &r.runs {
                     device.check(run)?;

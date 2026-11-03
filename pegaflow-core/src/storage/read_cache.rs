@@ -151,9 +151,8 @@ impl ReadCache {
         }
     }
 
-    /// Insert into the reclaimable class, which pressure eviction drains
-    /// first; returns the keys now resident.
-    pub(super) fn batch_insert_resident_keys(
+    #[cfg(test)]
+    fn batch_insert_resident_keys(
         &self,
         blocks: Vec<(BlockKey, Arc<SealedBlock>)>,
     ) -> Vec<BlockKey> {
