@@ -28,7 +28,7 @@ use crate::metrics::core_metrics;
 use crate::pinned_pool::{MappedPinnedPtr, PinnedAllocation};
 use crate::seal_offload::io_len;
 use crate::storage::{FetchPart, PartsPoll};
-use crate::transfer::{Direction, StridedCopier, StridedCopy};
+use crate::transfer::{Dim, Direction, MAX_DIMS, StridedCopier, StridedCopy};
 use crate::{EngineError, NumaNode, PegaEngine, QueryLeaseId};
 
 /// Most units one object may have; bounds its coverage bitmap.
@@ -60,46 +60,92 @@ impl ObjectKey {
     }
 }
 
-/// `rows` copies of `width` bytes; row `r` is at `region_offset + r * region_stride`
-/// of the device region and `object_offset + r * object_stride` of the object.
+/// One dimension of an [`ObjectRun`]: `count` steps of `region_stride` bytes
+/// in the device region and `object_stride` bytes in the object; the strides
+/// are ignored when `count == 1`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectDim {
+    pub count: u32,
+    pub region_stride: u64,
+    pub object_stride: u64,
+}
+
+/// Rows of `width` bytes over up to [`MAX_DIMS`] dimensions, the first
+/// fastest: row `(i_0, i_1, ..)` is at `region_offset + sum(i_d * region_stride_d)`
+/// of the device region and `object_offset + sum(i_d * object_stride_d)` of
+/// the object. No dimensions is one row.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectRun {
     pub region: u32,
     pub region_offset: u64,
     pub object_offset: u64,
     pub width: u64,
-    pub rows: u32,
-    pub region_stride: u64,
-    pub object_stride: u64,
+    pub dims: Vec<ObjectDim>,
 }
 
 impl ObjectRun {
-    /// Strides with `rows == 1` normalized to `width`.
-    fn pitches(&self) -> (u64, u64) {
-        if self.rows == 1 {
-            (self.width, self.width)
-        } else {
-            (self.region_stride, self.object_stride)
-        }
+    /// Rows the run copies.
+    fn rows(&self) -> u64 {
+        self.dims
+            .iter()
+            .fold(1u64, |n, d| n.saturating_mul(u64::from(d.count)))
     }
 
-    /// One past the last byte on the region and object side, if the run is well formed.
+    fn bytes(&self) -> u64 {
+        self.width.saturating_mul(self.rows())
+    }
+
+    /// Region and object offset of every row, the first dimension fastest.
+    fn row_offsets(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        offsets((self.region_offset, self.object_offset), &self.dims)
+    }
+
+    /// Object bytes per block and the dimensions over blocks: with the
+    /// dimensions ordered by object stride, a block is the rows of those that
+    /// are back to back in the object. Only valid for a well formed run.
+    fn object_blocks(&self) -> (u64, Vec<ObjectDim>) {
+        let mut dims: Vec<ObjectDim> = self.dims.iter().filter(|d| d.count > 1).copied().collect();
+        dims.sort_unstable_by_key(|d| d.object_stride);
+        let mut len = self.width;
+        let mut k = 0;
+        while let Some(d) = dims.get(k)
+            && d.object_stride == len
+        {
+            len *= u64::from(d.count);
+            k += 1;
+        }
+        dims.drain(..k);
+        (len, dims)
+    }
+
+    /// One past the last byte on the region and object side, if the run is
+    /// well formed: nonempty, at most [`MAX_DIMS`] dimensions, and on each
+    /// side, with its dimensions ordered by stride, every stride at least the
+    /// extent of the rows below it, so no two rows overlap.
     fn ends(&self) -> Option<(u64, u64)> {
-        if self.width == 0 || self.rows == 0 {
+        if self.width == 0 || self.dims.len() > MAX_DIMS || self.dims.iter().any(|d| d.count == 0) {
             return None;
         }
-        let (rp, op) = self.pitches();
-        if rp < self.width || op < self.width {
-            return None;
-        }
-        let last = u64::from(self.rows - 1);
+        let end = |base: u64, stride: fn(&ObjectDim) -> u64| {
+            let mut dims: Vec<(u64, u64)> = self
+                .dims
+                .iter()
+                .filter(|d| d.count > 1)
+                .map(|d| (stride(d), u64::from(d.count)))
+                .collect();
+            dims.sort_unstable();
+            let mut extent = self.width;
+            for (s, n) in dims {
+                if s < extent {
+                    return None;
+                }
+                extent = (n - 1).checked_mul(s)?.checked_add(extent)?;
+            }
+            base.checked_add(extent)
+        };
         Some((
-            last.checked_mul(rp)?
-                .checked_add(self.region_offset)?
-                .checked_add(self.width)?,
-            last.checked_mul(op)?
-                .checked_add(self.object_offset)?
-                .checked_add(self.width)?,
+            end(self.region_offset, |d| d.region_stride)?,
+            end(self.object_offset, |d| d.object_stride)?,
         ))
     }
 }
@@ -335,10 +381,12 @@ impl Shape {
     /// The run's units are whole and lie in one chunk; returns that chunk.
     fn check(&self, run: &ObjectRun) -> Result<usize, EngineError> {
         let u = self.unit;
-        let (_, op) = run.pitches();
         let aligned = run.object_offset.is_multiple_of(u)
             && run.width.is_multiple_of(u)
-            && (run.rows == 1 || op.is_multiple_of(u));
+            && run
+                .dims
+                .iter()
+                .all(|d| d.count == 1 || d.object_stride.is_multiple_of(u));
         if !aligned {
             return Err(EngineError::InvalidArgument(format!(
                 "run {run:?} is not on whole units of {u} bytes"
@@ -353,6 +401,36 @@ impl Shape {
                 ))
             })
     }
+}
+
+/// `base` advanced to every index of `dims`, the first fastest, on the region
+/// and the object side.
+fn offsets(base: (u64, u64), dims: &[ObjectDim]) -> impl Iterator<Item = (u64, u64)> + '_ {
+    let total: u64 = dims.iter().map(|d| u64::from(d.count)).product();
+    let mut index = [0u32; MAX_DIMS];
+    let mut at = base;
+    (0..total).map(move |_| {
+        let cur = at;
+        // Wrapping: a single-step dimension's strides are arbitrary, and
+        // stepping past the last row may leave u64; both undo exactly.
+        for (i, d) in dims.iter().enumerate() {
+            index[i] += 1;
+            at = (
+                at.0.wrapping_add(d.region_stride),
+                at.1.wrapping_add(d.object_stride),
+            );
+            if index[i] < d.count {
+                break;
+            }
+            index[i] = 0;
+            let n = u64::from(d.count);
+            at = (
+                at.0.wrapping_sub(n.wrapping_mul(d.region_stride)),
+                at.1.wrapping_sub(n.wrapping_mul(d.object_stride)),
+            );
+        }
+        cur
+    })
 }
 
 /// Object offset of each of `chunks`.
@@ -433,41 +511,26 @@ impl Pending {
     ) -> u64 {
         let copies = 1 + self.replicas.len() as u64;
         let u = self.shape.unit;
-        let (rp, op) = run.pitches();
-        let rows = u64::from(run.rows);
-        let units = |r: u64| {
-            let lo = (run.object_offset + r * op) / u;
-            (lo, lo + run.width / u)
-        };
-        let whole = if op == run.width {
-            // Rows back to back in the object cover one range of units.
-            let (lo, _) = units(0);
-            let hi = lo + rows * run.width / u;
-            let free = self.claimed.none(lo, hi);
-            if free {
-                self.claimed.mark(lo, hi);
-            }
-            free
-        } else if (0..rows).all(|r| {
-            let (lo, hi) = units(r);
-            self.claimed.none(lo, hi)
-        }) {
-            for r in 0..rows {
-                let (lo, hi) = units(r);
-                self.claimed.mark(lo, hi);
-            }
-            true
-        } else {
-            false
-        };
+        // Blocks in units: the run's object offset, width and strides are
+        // whole units (checked).
+        let (len, mut outer) = run.object_blocks();
+        for d in &mut outer {
+            d.object_stride /= u;
+        }
+        let (first, len) = (run.object_offset / u, len / u);
+        let blocks = || offsets((0, first), &outer).map(|(_, lo)| (lo, lo + len));
+        let whole = blocks().all(|(lo, hi)| self.claimed.none(lo, hi));
         if whole {
+            for (lo, hi) in blocks() {
+                self.claimed.mark(lo, hi);
+            }
             self.queue(device, run, chunk, out);
-            return run.width * rows * copies;
+            return run.bytes() * copies;
         }
         // Another save claimed some of these units: copy the rest piece by piece.
         let mut bytes = 0;
-        for r in 0..rows {
-            let (lo, hi) = units(r);
+        for (at, object_at) in run.row_offsets() {
+            let (lo, hi) = (object_at / u, (object_at + run.width) / u);
             let mut g = lo;
             while g < hi {
                 if self.claimed.get(g) {
@@ -481,12 +544,10 @@ impl Pending {
                 self.claimed.mark(start, g);
                 let piece = ObjectRun {
                     region: run.region,
-                    region_offset: run.region_offset + r * rp + (start - lo) * u,
+                    region_offset: at + (start - lo) * u,
                     object_offset: start * u,
                     width: (g - start) * u,
-                    rows: 1,
-                    region_stride: 0,
-                    object_stride: 0,
+                    dims: Vec::new(),
                 };
                 self.queue(device, &piece, chunk, out);
                 bytes += piece.width * copies;
@@ -1380,7 +1441,7 @@ impl PegaEngine {
                             ))
                         })?;
                     copies.push((numa, copy_of(&device, at, run)));
-                    let n = run.width * u64::from(run.rows);
+                    let n = run.bytes();
                     read[c] += n;
                     bytes += n;
                 }
@@ -1449,15 +1510,21 @@ fn mismatch(w: &ObjectWrite, stored: String) -> EngineError {
 
 /// The copy of `run` between its device region and pinned memory at `at`.
 fn copy_of(device: &Device, at: MappedPinnedPtr, run: &ObjectRun) -> StridedCopy {
-    let (rp, op) = run.pitches();
-    StridedCopy {
-        device: device.regions.list[run.region as usize].0 + run.region_offset,
-        host_device: at.device().as_ptr() as u64,
-        width: run.width,
-        rows: run.rows,
-        device_pitch: rp,
-        host_pitch: op,
-    }
+    let dims: Vec<Dim> = run
+        .dims
+        .iter()
+        .map(|d| Dim {
+            count: u64::from(d.count),
+            device_pitch: d.region_stride,
+            host_pitch: d.object_stride,
+        })
+        .collect();
+    StridedCopy::new(
+        device.regions.list[run.region as usize].0 + run.region_offset,
+        at.device().as_ptr() as u64,
+        run.width,
+        &dims,
+    )
 }
 
 fn open_ipc(handle: &[u8]) -> Result<sys::CUdeviceptr, String> {
@@ -1500,15 +1567,21 @@ fn mapped_size(ptr: sys::CUdeviceptr) -> Result<u64, String> {
 mod tests {
     use super::*;
 
+    fn dim(count: u32, region_stride: u64, object_stride: u64) -> ObjectDim {
+        ObjectDim {
+            count,
+            region_stride,
+            object_stride,
+        }
+    }
+
     fn run(object_offset: u64, width: u64, rows: u32, object_stride: u64) -> ObjectRun {
         ObjectRun {
             region: 0,
             region_offset: 0,
             object_offset,
             width,
-            rows,
-            region_stride: width,
-            object_stride,
+            dims: vec![dim(rows, width, object_stride)],
         }
     }
 
@@ -1613,19 +1686,44 @@ mod tests {
 
     #[test]
     fn runs_reject_overlap_and_overflow() {
-        let run = |width, rows, rs, os| ObjectRun {
+        let run = |width, dims: &[ObjectDim]| ObjectRun {
             region: 0,
             region_offset: 0,
             object_offset: 0,
             width,
-            rows,
-            region_stride: rs,
-            object_stride: os,
+            dims: dims.to_vec(),
         };
-        assert_eq!(run(8, 3, 16, 8).ends(), Some((40, 24)));
-        assert_eq!(run(8, 1, 0, 0).ends(), Some((8, 8)));
-        assert!(run(8, 2, 4, 8).ends().is_none());
-        assert!(run(0, 1, 0, 0).ends().is_none());
-        assert!(run(8, 2, u64::MAX, 8).ends().is_none());
+        assert_eq!(run(8, &[dim(3, 16, 8)]).ends(), Some((40, 24)));
+        assert_eq!(run(8, &[]).ends(), Some((8, 8)));
+        // A single step ignores its strides.
+        let one = run(8, &[dim(1, u64::MAX, u64::MAX), dim(2, 8, 8)]);
+        assert_eq!(one.ends(), Some((16, 16)));
+        assert_eq!(one.row_offsets().collect::<Vec<_>>(), [(0, 0), (8, 8)]);
+        // Heads 64 apart in the region, interleaved with rows in the object.
+        let hnd = run(8, &[dim(4, 8, 16), dim(2, 64, 8)]);
+        assert_eq!(hnd.ends(), Some((96, 64)));
+        let rows: Vec<_> = hnd.row_offsets().collect();
+        let naive: Vec<_> = (0..8u64)
+            .map(|r| (r % 4 * 8 + r / 4 * 64, r % 4 * 16 + r / 4 * 8))
+            .collect();
+        assert_eq!(rows, naive);
+        // Heads interleave with rows in the object: one block in object order.
+        assert_eq!(hnd.object_blocks(), (64, vec![]));
+        // Rows back to back in the object form one block per outer step.
+        let nhd = run(8, &[dim(4, 64, 8), dim(2, 8, 64)]);
+        assert_eq!(nhd.object_blocks(), (32, nhd.dims[1..].to_vec()));
+        for (case, r) in [
+            ("overlapping rows", run(8, &[dim(2, 4, 8)])),
+            ("empty", run(0, &[])),
+            ("zero count", run(8, &[dim(0, 8, 8)])),
+            ("overflow", run(8, &[dim(2, u64::MAX, 8)])),
+            (
+                "outer inside inner",
+                run(8, &[dim(4, 8, 8), dim(2, 16, 64)]),
+            ),
+            ("too many dims", run(8, &[dim(2, 8, 8); MAX_DIMS + 1])),
+        ] {
+            assert!(r.ends().is_none(), "{case}");
+        }
     }
 }

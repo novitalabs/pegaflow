@@ -18,8 +18,9 @@ use crate::registry::RegistryHandle;
 use crate::session::SessionRegistry;
 use log::{debug, info, warn};
 use pegaflow_core::{
-    EngineError, LayerSave, ObjectKey, ObjectLoad, ObjectPoint, ObjectQuery, ObjectQueryStatus,
-    ObjectRead, ObjectRun, ObjectWrite, PegaEngine, PrefetchStatus, QueryLeaseId,
+    EngineError, LayerSave, ObjectDim, ObjectKey, ObjectLoad, ObjectPoint, ObjectQuery,
+    ObjectQueryStatus, ObjectRead, ObjectRun, ObjectWrite, PegaEngine, PrefetchStatus,
+    QueryLeaseId,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -196,9 +197,15 @@ impl GrpcEngineService {
                 region_offset: r.region_offset,
                 object_offset: r.object_offset,
                 width: r.width,
-                rows: r.rows,
-                region_stride: r.region_stride,
-                object_stride: r.object_stride,
+                dims: r
+                    .dims
+                    .into_iter()
+                    .map(|d| ObjectDim {
+                        count: d.count,
+                        region_stride: d.region_stride,
+                        object_stride: d.object_stride,
+                    })
+                    .collect(),
             })
             .collect()
     }

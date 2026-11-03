@@ -334,16 +334,24 @@ message QueryObjectsResponse {
   }
 }
 
-// rows copies of width bytes: row r at region_offset + r * region_stride of
-// the device region and object_offset + r * object_stride of the object.
+// count steps of region_stride bytes in the device region and object_stride
+// bytes in the object; the strides are ignored when count is 1.
+message ObjectDim {
+  uint32 count = 1;
+  uint64 region_stride = 2;
+  uint64 object_stride = 3;
+}
+
+// Rows of width bytes over at most 4 dims, the first fastest: row
+// (i_0, i_1, ..) is at region_offset + sum(i_d * region_stride_d) of the
+// device region and object_offset + sum(i_d * object_stride_d) of the object.
+// No dims is one row. On each side no two rows may overlap.
 message ObjectRun {
   uint32 region = 1;
   uint64 region_offset = 2;
   uint64 object_offset = 3;
   uint64 width = 4;
-  uint32 rows = 5;
-  uint64 region_stride = 6;
-  uint64 object_stride = 7;
+  repeated ObjectDim dims = 5;
 }
 
 message ObjectWrite {
