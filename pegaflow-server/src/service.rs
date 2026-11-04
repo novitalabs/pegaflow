@@ -18,8 +18,8 @@ use crate::registry::RegistryHandle;
 use crate::session::SessionRegistry;
 use log::{debug, info, warn};
 use pegaflow_core::{
-    EngineError, LayerSave, ObjectDim, ObjectKey, ObjectLoad, ObjectPoint, ObjectQuery,
-    ObjectQueryStatus, ObjectRead, ObjectRun, ObjectWrite, PegaEngine, PrefetchStatus,
+    EngineError, LayerSave, MAX_RUN_DIMS, ObjectDim, ObjectKey, ObjectLoad, ObjectPoint,
+    ObjectQuery, ObjectQueryStatus, ObjectRead, ObjectRun, ObjectWrite, PegaEngine, PrefetchStatus,
     QueryLeaseId, SlotRead, SlotWrite,
 };
 use std::sync::Arc;
@@ -210,6 +210,7 @@ impl GrpcEngineService {
                 Ok(ObjectWrite {
                     key: Self::object_key(w.key)?,
                     slots: w.slots,
+                    meta: w.meta,
                     writes: slots,
                 })
             })
@@ -243,6 +244,7 @@ impl GrpcEngineService {
                             })
                         })
                         .collect::<Result<_, Status>>()?,
+                    consumers: l.consumers,
                 })
             })
             .collect()
@@ -955,6 +957,7 @@ impl Engine for GrpcEngineService {
                     TransferBlockInfo {
                         block_hash: key.hash.clone(),
                         slots,
+                        meta: block.meta(),
                     }
                 })
                 .collect();
@@ -1222,6 +1225,7 @@ impl Engine for GrpcEngineService {
                     -1
                 },
                 socket,
+                max_run_dims: MAX_RUN_DIMS as u32,
             }))
         };
 
@@ -1286,11 +1290,13 @@ impl Engine for GrpcEngineService {
                     blocks,
                     lease,
                     slots,
+                    metas,
                 } => query_objects_response::Outcome::Ready(ObjectsReady {
                     point: point.map_or(-1, |p| i32::try_from(p).unwrap_or(i32::MAX)),
                     blocks,
                     lease: lease.map(|l| l.to_bytes().to_vec()).unwrap_or_default(),
                     slots,
+                    metas,
                 }),
             };
             Ok(Response::new(QueryObjectsResponse {

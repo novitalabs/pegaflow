@@ -111,10 +111,18 @@ fn process_raw_save_batch(
     let namespace = batch.namespace.clone();
     let numa_node = batch.numa_node;
     let total_slots = batch.total_slots;
+    let meta = batch.meta;
 
     let (entries, total_bytes, total_blocks) = crate::offload::build_insert_entries(batch);
 
-    process_insert_batch(inflight, deps, entries, total_slots, numa_node, &namespace);
+    process_insert_batch(
+        inflight,
+        deps,
+        entries,
+        (total_slots, meta),
+        numa_node,
+        &namespace,
+    );
 
     debug!(
         "insert_worker: batch sealed blocks={} bytes={} ms={:.2}",
@@ -128,7 +136,7 @@ fn process_insert_batch(
     inflight: &mut HashMap<BlockKey, InflightBlock>,
     deps: &Weak<InsertDeps>,
     entries: InsertEntries,
-    total_slots: usize,
+    (total_slots, meta): (usize, u64),
     numa_node: NumaNode,
     namespace: &str,
 ) -> usize {
@@ -149,7 +157,7 @@ fn process_insert_batch(
         }
 
         if !inflight.contains_key(&key) {
-            match SealedBlock::from_ordered_slot_inserts(slots, total_slots, numa_node) {
+            match SealedBlock::from_ordered_slot_inserts(slots, total_slots, numa_node, meta) {
                 Ok(sealed) => {
                     ordered_fast_path_seals += 1;
                     sealed_blocks.push((key, Arc::new(sealed)));
@@ -160,7 +168,7 @@ fn process_insert_batch(
                         inflight,
                         key,
                         slots,
-                        total_slots,
+                        (total_slots, meta),
                         numa_node,
                         namespace,
                         &mut sealed_blocks,
@@ -176,7 +184,7 @@ fn process_insert_batch(
             inflight,
             key,
             slots,
-            total_slots,
+            (total_slots, meta),
             numa_node,
             namespace,
             &mut sealed_blocks,
@@ -215,7 +223,7 @@ fn insert_partial_slots(
     inflight: &mut HashMap<BlockKey, InflightBlock>,
     key: BlockKey,
     slots: Vec<(usize, crate::block::RawBlock)>,
-    total_slots: usize,
+    (total_slots, meta): (usize, u64),
     numa_node: NumaNode,
     namespace: &str,
     sealed_blocks: &mut Vec<(BlockKey, Arc<SealedBlock>)>,
@@ -223,15 +231,17 @@ fn insert_partial_slots(
     inflight_bytes_removed: &mut u64,
 ) {
     let inflight_block = match inflight.entry(key.clone()) {
-        Entry::Vacant(v) => v.insert(InflightBlock::new(total_slots)),
+        Entry::Vacant(v) => v.insert(InflightBlock::new(total_slots, meta)),
         Entry::Occupied(o) => {
             let ib = o.into_mut();
-            if ib.total_slots() != total_slots {
+            if ib.total_slots() != total_slots || ib.meta() != meta {
                 error!(
-                    "insert worker: slot count mismatch: key namespace={} expected={} got={}",
+                    "insert worker: slot count or meta mismatch: key namespace={} expected={}/{:#x} got={}/{:#x}",
                     namespace,
                     ib.total_slots(),
-                    total_slots
+                    ib.meta(),
+                    total_slots,
+                    meta
                 );
                 return;
             }
@@ -381,7 +391,7 @@ mod tests {
             &mut inflight,
             &weak_deps,
             entries,
-            1,
+            (1, 0),
             NumaNode::UNKNOWN,
             "ns",
         );
@@ -411,8 +421,14 @@ mod tests {
             vec![(key.clone(), vec![(0, block0), (1, block1), (2, block2)])];
         let mut inflight: HashMap<BlockKey, InflightBlock> = HashMap::new();
 
-        let ordered_fast_path_seals =
-            process_insert_batch(&mut inflight, &weak_deps, entries, 3, NumaNode(1), "ns");
+        let ordered_fast_path_seals = process_insert_batch(
+            &mut inflight,
+            &weak_deps,
+            entries,
+            (3, 0),
+            NumaNode(1),
+            "ns",
+        );
 
         assert_eq!(ordered_fast_path_seals, 1);
         assert!(
@@ -444,7 +460,7 @@ mod tests {
             &mut inflight,
             &weak_deps,
             entries,
-            3,
+            (3, 0),
             NumaNode::UNKNOWN,
             "ns",
         );
@@ -457,7 +473,7 @@ mod tests {
             &mut inflight,
             &weak_deps,
             entries,
-            3,
+            (3, 0),
             NumaNode::UNKNOWN,
             "ns",
         );
@@ -469,7 +485,7 @@ mod tests {
             &mut inflight,
             &weak_deps,
             entries,
-            3,
+            (3, 0),
             NumaNode::UNKNOWN,
             "ns",
         );
@@ -498,7 +514,7 @@ mod tests {
             &mut inflight,
             &weak_deps,
             entries,
-            2,
+            (2, 0),
             NumaNode::UNKNOWN,
             "ns",
         );
@@ -509,40 +525,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slot_count_mismatch_skips_key() {
-        let engine =
-            StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[]).unwrap();
-        let deps = make_deps(&engine);
-        let weak_deps = Arc::downgrade(&deps);
+    async fn slots_of_another_count_or_meta_are_dropped() {
+        fn insert(
+            engine: &StorageEngine,
+            inflight: &mut HashMap<BlockKey, InflightBlock>,
+            deps: &Weak<InsertDeps>,
+            key: &BlockKey,
+            slot: usize,
+            shape: (usize, u64),
+        ) {
+            let entries: InsertEntries =
+                vec![(key.clone(), vec![(slot, make_raw_block(engine, 64))])];
+            process_insert_batch(inflight, deps, entries, shape, NumaNode::UNKNOWN, "ns");
+        }
+        for (case, late) in [("slot count", (4, 7)), ("meta", (2, 8))] {
+            let engine =
+                StorageEngine::new_with_config(1 << 20, false, StorageConfig::default(), &[])
+                    .unwrap();
+            let deps = make_deps(&engine);
+            let weak_deps = Arc::downgrade(&deps);
+            let key = BlockKey::new("ns".into(), vec![1]);
+            let mut inflight: HashMap<BlockKey, InflightBlock> = HashMap::new();
 
-        let key = BlockKey::new("ns".into(), vec![1]);
-        let mut inflight: HashMap<BlockKey, InflightBlock> = HashMap::new();
-
-        let block0 = make_raw_block(&engine, 64);
-        let entries: InsertEntries = vec![(key.clone(), vec![(0, block0)])];
-        process_insert_batch(
-            &mut inflight,
-            &weak_deps,
-            entries,
-            2,
-            NumaNode::UNKNOWN,
-            "ns",
-        );
-        assert_eq!(inflight.len(), 1);
-
-        let block1 = make_raw_block(&engine, 64);
-        let entries: InsertEntries = vec![(key.clone(), vec![(1, block1)])];
-        process_insert_batch(
-            &mut inflight,
-            &weak_deps,
-            entries,
-            4, // mismatch
-            NumaNode::UNKNOWN,
-            "ns",
-        );
-
-        let inflight_block = inflight.get(&key).unwrap();
-        assert_eq!(inflight_block.filled_count(), 1);
+            insert(&engine, &mut inflight, &weak_deps, &key, 0, (2, 7));
+            insert(&engine, &mut inflight, &weak_deps, &key, 1, late);
+            assert_eq!(
+                inflight[&key].filled_count(),
+                1,
+                "{case}: late slot dropped"
+            );
+            insert(&engine, &mut inflight, &weak_deps, &key, 1, (2, 7));
+            assert!(inflight.is_empty(), "{case}: matching slot seals");
+            let cached = engine.read_cache.get_blocks(std::slice::from_ref(&key));
+            assert_eq!(cached[0].1.meta(), 7, "{case}: sealed with the first meta");
+        }
     }
 
     #[tokio::test]
@@ -566,7 +582,7 @@ mod tests {
             &mut inflight,
             &weak_deps,
             entries,
-            2,
+            (2, 0),
             NumaNode::UNKNOWN,
             "ns",
         );
@@ -585,7 +601,7 @@ mod tests {
             &mut inflight,
             &weak_deps,
             entries,
-            2,
+            (2, 0),
             NumaNode::UNKNOWN,
             "ns",
         );
@@ -600,7 +616,7 @@ mod tests {
     async fn gc_inflight_removes_old_blocks() {
         let key = BlockKey::new("ns".into(), vec![1]);
         let mut inflight: HashMap<BlockKey, InflightBlock> = HashMap::new();
-        inflight.insert(key, InflightBlock::new(2));
+        inflight.insert(key, InflightBlock::new(2, 0));
 
         let cleaned = gc_inflight(&mut inflight, std::time::Duration::from_secs(60));
         assert_eq!(cleaned, 0);
@@ -627,7 +643,7 @@ mod tests {
             &mut inflight,
             &weak_deps,
             entries,
-            1,
+            (1, 0),
             NumaNode::UNKNOWN,
             "ns",
         );

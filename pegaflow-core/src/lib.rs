@@ -46,8 +46,8 @@ pub use internode::{
 use layout::KVCacheLayout;
 pub use lease::QueryLeaseId;
 pub use objects::{
-    ObjectDim, ObjectKey, ObjectLoad, ObjectPoint, ObjectQuery, ObjectQueryStatus, ObjectRead,
-    ObjectRun, ObjectWrite, SlotRead, SlotWrite,
+    MAX_RUN_DIMS, ObjectDim, ObjectKey, ObjectLoad, ObjectPoint, ObjectQuery, ObjectQueryStatus,
+    ObjectRead, ObjectRun, ObjectWrite, SlotRead, SlotWrite,
 };
 pub use pegaflow_common::NumaNode;
 use pegaflow_common::{NumaTopology, group_hash};

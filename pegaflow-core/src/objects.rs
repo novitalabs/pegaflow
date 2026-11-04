@@ -6,7 +6,10 @@
 //! pinned memory on that device's NUMA node, and hands them to the insert
 //! worker like a KV save; the object seals once all of its slots arrived. The
 //! engine never interprets layers, ranks or layouts: the client decides how
-//! many slots an object has, which device writes each, and what bytes go where.
+//! many slots an object has, which device writes each, and what bytes go where,
+//! and records that choice in the object's opaque `meta` word. The first
+//! writer's slot count and meta stand; slots of a writer whose count or meta
+//! differ are dropped. A query lease is consumed by the loads that name it.
 //!
 //! Sealed objects are [`SealedBlock`]s under the [`BlockKey`]
 //! `(hex(fingerprint), prefix)`, one single-segment slot per object slot, so
@@ -36,6 +39,8 @@ use crate::{EngineError, NumaNode, PegaEngine, QueryLeaseId};
 
 /// Most slots one object may have.
 const MAX_SLOTS: u32 = 1 << 12;
+/// Most dims one object run may have.
+pub const MAX_RUN_DIMS: usize = MAX_DIMS;
 /// Most keys and points one query may carry.
 const MAX_QUERY_KEYS: usize = 1 << 16;
 const MAX_QUERY_POINTS: usize = 1 << 12;
@@ -137,11 +142,13 @@ pub struct SlotWrite {
     pub runs: Vec<ObjectRun>,
 }
 
-/// Slots of an object of `slots` slots one device writes.
+/// Slots of an object of `slots` slots and layout word `meta` one device
+/// writes.
 #[derive(Debug, Clone)]
 pub struct ObjectWrite {
     pub key: ObjectKey,
     pub slots: u32,
+    pub meta: u64,
     pub writes: Vec<SlotWrite>,
 }
 
@@ -157,11 +164,12 @@ pub struct ObjectRead {
     pub reads: Vec<SlotRead>,
 }
 
-/// Reads of objects one lease holds.
+/// Reads of objects one lease holds, by one of the lease's `consumers` loads.
 #[derive(Debug, Clone)]
 pub struct ObjectLoad {
     pub lease: QueryLeaseId,
     pub reads: Vec<ObjectRead>,
+    pub consumers: u32,
 }
 
 /// A resume point: the first `blocks` keys of every prefix chain of its
@@ -187,14 +195,15 @@ pub enum ObjectQueryStatus {
     /// The point found, if any, and how many leading blocks of every chain
     /// the lease holds: those of the point, or with no points the longest
     /// prefix every chain holds. The lease also holds the point's keys; none
-    /// is issued when it would hold nothing. `slots` has the slot count of
-    /// every object leased: the leading `blocks` of each chain in turn, then
-    /// the point's keys.
+    /// is issued when it would hold nothing. `slots` and `metas` have the
+    /// slot count and meta of every object leased: the leading `blocks` of
+    /// each chain in turn, then the point's keys.
     Ready {
         point: Option<usize>,
         blocks: u32,
         lease: Option<QueryLeaseId>,
         slots: Vec<u32>,
+        metas: Vec<u64>,
     },
 }
 
@@ -708,8 +717,10 @@ impl PegaEngine {
         );
         let mut objects: HashMap<BlockKey, Arc<SealedBlock>> = HashMap::new();
         let mut slots = Vec::new();
+        let mut metas = Vec::new();
         let mut lease = |k: &BlockKey, b: &Arc<SealedBlock>| {
             slots.push(b.slots().len() as u32);
+            metas.push(b.meta());
             objects.insert(k.clone(), Arc::clone(b));
         };
         for (keys, held) in plan.prefixes.iter().zip(&chains) {
@@ -733,6 +744,7 @@ impl PegaEngine {
             lease: (!objects.is_empty())
                 .then(|| self.query_leases.create_objects(instance_id, objects)),
             slots,
+            metas,
         }
     }
 
@@ -850,13 +862,13 @@ impl PegaEngine {
             start.elapsed().as_secs_f64() * 1000.0,
         );
 
-        // One batch per (namespace, slot count), one layer per slot, as KV
-        // saves send one batch per group.
+        // One batch per (namespace, slot count, meta), one layer per slot, as
+        // KV saves send one batch per group.
         type Layers = BTreeMap<u32, RawSaveLayer>;
-        let mut batches: BTreeMap<(&str, u32), Layers> = BTreeMap::new();
+        let mut batches: BTreeMap<(&str, u32, u64), Layers> = BTreeMap::new();
         for (i, slot, block, len) in saved {
             let layer = batches
-                .entry((keys[i].namespace.as_str(), writes[i].slots))
+                .entry((keys[i].namespace.as_str(), writes[i].slots, writes[i].meta))
                 .or_default()
                 .entry(slot)
                 .or_insert_with(|| RawSaveLayer {
@@ -868,10 +880,11 @@ impl PegaEngine {
             layer.blocks.push(block);
             layer.block_hashes.push(keys[i].hash.clone());
         }
-        for ((namespace, slots), layers) in batches {
+        for ((namespace, slots, meta), layers) in batches {
             self.storage.send_raw_insert(RawSaveBatch {
                 namespace: namespace.to_string(),
                 total_slots: slots as usize,
+                meta,
                 numa_node: device.numa,
                 layers: layers.into_values().collect(),
             });
@@ -883,7 +896,8 @@ impl PegaEngine {
     /// of `instance_id`, as a KV load: returns once the request is checked
     /// and sets the `LoadState` at `load_state_shm` when the copies finish,
     /// or right away if checking fails. Loads of a device run in order on
-    /// their own stream. Leases stay valid until released or expired.
+    /// their own stream. Each lease a checked request reads counts one of
+    /// its consumers; the last releases it.
     pub fn load_objects(
         &self,
         instance_id: &str,
@@ -911,7 +925,7 @@ impl PegaEngine {
             let keys: Vec<BlockKey> = l.reads.iter().map(|r| r.key.block_key()).collect();
             let leased = self
                 .query_leases
-                .leased_objects(instance_id, &l.lease, &keys)
+                .leased_objects(instance_id, &l.lease, &keys, l.consumers as usize)
                 .map_err(EngineError::InvalidArgument)?;
             for ((r, block), key) in l.reads.iter().zip(leased).zip(&keys) {
                 let block = block.ok_or_else(|| {
@@ -946,7 +960,13 @@ impl PegaEngine {
                 bytes,
                 done,
             },
-        )
+        )?;
+        // The copy job holds the objects; the leases may go now.
+        let leases: HashSet<&QueryLeaseId> = loads.iter().map(|l| &l.lease).collect();
+        for lease in leases {
+            self.query_leases.consume_objects(lease);
+        }
+        Ok(())
     }
 }
 

@@ -823,8 +823,8 @@ mod tests {
         let storage = make_engine();
         let key1 = BlockKey::new("ns".into(), vec![1]);
         let key2 = BlockKey::new("ns".into(), vec![2]);
-        let block1 = Arc::new(SealedBlock::from_slots(Vec::new()));
-        let block2 = Arc::new(SealedBlock::from_slots(Vec::new()));
+        let block1 = Arc::new(SealedBlock::from_slots(Vec::new(), 0));
+        let block2 = Arc::new(SealedBlock::from_slots(Vec::new(), 0));
 
         storage.test_insert_cache(key1, Arc::clone(&block1));
         storage.test_insert_cache(key2, block2);
@@ -866,7 +866,7 @@ mod tests {
             let raw = RawBlock::new(vec![Segment::new(ptr, REGION as usize, alloc)]);
             storage.test_insert_cache(
                 BlockKey::new("ns".into(), vec![i as u8]),
-                Arc::new(SealedBlock::from_slots(vec![(raw, NumaNode::UNKNOWN)])),
+                Arc::new(SealedBlock::from_slots(vec![(raw, NumaNode::UNKNOWN)], 0)),
             );
         }
         assert_eq!(storage.allocator.usage().0, 16 * REGION);
@@ -899,7 +899,7 @@ mod tests {
         let storage = make_engine();
         let key1 = BlockKey::new("ns".into(), vec![1]);
         let key2 = BlockKey::new("ns".into(), vec![2]);
-        let block = Arc::new(SealedBlock::from_slots(Vec::new()));
+        let block = Arc::new(SealedBlock::from_slots(Vec::new(), 0));
 
         storage.test_insert_cache(key1, block.clone());
         storage.test_insert_cache(key2, block);
@@ -920,7 +920,7 @@ mod tests {
         let key1 = BlockKey::new("ns".into(), vec![1]);
         let key2 = BlockKey::new("ns".into(), vec![2]);
         let key3 = BlockKey::new("ns".into(), vec![3]);
-        let block = Arc::new(SealedBlock::from_slots(Vec::new()));
+        let block = Arc::new(SealedBlock::from_slots(Vec::new(), 0));
 
         storage.test_insert_cache(key1.clone(), block.clone());
         storage.test_insert_cache(key3.clone(), block.clone());
@@ -958,7 +958,7 @@ mod tests {
         for transferred in [false, true] {
             let storage = make_engine();
             let key = BlockKey::new("ns".into(), vec![1]);
-            let block = Arc::new(SealedBlock::from_slots(Vec::new()));
+            let block = Arc::new(SealedBlock::from_slots(Vec::new(), 0));
             storage.test_insert_cache(key.clone(), block.clone());
 
             let session_id = storage.lock_blocks_for_transfer("node-a", &[(key.clone(), block)]);

@@ -1428,11 +1428,11 @@ mod tests {
         let remote_key = BlockKey::new("ns".to_string(), remote_hash.clone());
         read_cache.insert_retained_for_test(
             hinted_key.clone(),
-            Arc::new(SealedBlock::from_slots(Vec::new())),
+            Arc::new(SealedBlock::from_slots(Vec::new(), 0)),
         );
         read_cache.insert_retained_for_test(
             remote_key.clone(),
-            Arc::new(SealedBlock::from_slots(Vec::new())),
+            Arc::new(SealedBlock::from_slots(Vec::new(), 0)),
         );
         *service.reclaimable_hashes.lock().unwrap() = vec![hinted_hash, remote_hash.clone()];
         let client = MetaServerClient::new(
@@ -1462,11 +1462,11 @@ mod tests {
         let remote_key = BlockKey::new("ns".to_string(), remote_hash.clone());
         read_cache.insert_retained_for_test(
             local_key.clone(),
-            Arc::new(SealedBlock::from_slots(Vec::new())),
+            Arc::new(SealedBlock::from_slots(Vec::new(), 0)),
         );
         read_cache.insert_retained_for_test(
             remote_key.clone(),
-            Arc::new(SealedBlock::from_slots(Vec::new())),
+            Arc::new(SealedBlock::from_slots(Vec::new(), 0)),
         );
         *service.reclaimable_hashes.lock().unwrap() = vec![local_hash.clone(), remote_hash.clone()];
 
@@ -1497,8 +1497,10 @@ mod tests {
         let read_cache = Arc::new(ReadCache::new(1 << 20, false, None));
         let hash = vec![0xa1];
         let key = BlockKey::new("ns".to_string(), hash.clone());
-        read_cache
-            .insert_retained_for_test(key.clone(), Arc::new(SealedBlock::from_slots(Vec::new())));
+        read_cache.insert_retained_for_test(
+            key.clone(),
+            Arc::new(SealedBlock::from_slots(Vec::new(), 0)),
+        );
         let old_generation = read_cache.resident_generation_for_test(&key);
         *service.reclaimable_hashes.lock().unwrap() = vec![hash.clone()];
         service.block_insert_responses.store(true, Ordering::SeqCst);
@@ -1514,8 +1516,10 @@ mod tests {
         wait_for_count(&service.insert_notify, &service.insert_count, 1).await;
 
         read_cache.remove_lru_batch_for_test(1);
-        read_cache
-            .insert_retained_for_test(key.clone(), Arc::new(SealedBlock::from_slots(Vec::new())));
+        read_cache.insert_retained_for_test(
+            key.clone(),
+            Arc::new(SealedBlock::from_slots(Vec::new(), 0)),
+        );
         service.release_insert_response.notify_one();
         client.flush().await;
 
