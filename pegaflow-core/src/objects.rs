@@ -33,12 +33,17 @@ use crate::gpu_worker::{LoadCompletion, spawn_pinned_worker, wait_worker_ready};
 use crate::metrics::core_metrics;
 use crate::offload::{RawSaveBatch, RawSaveLayer};
 use crate::pinned_pool::{MappedPinnedPtr, PinnedAllocation};
-use crate::storage::{FetchPart, PartsPoll};
+use crate::storage::{FetchPart, PartsPoll, by_namespace};
 use crate::transfer::{Dim, Direction, MAX_DIMS, StridedCopier, StridedCopy};
 use crate::{EngineError, NumaNode, PegaEngine, QueryLeaseId};
 
 /// Most slots one object may have.
 const MAX_SLOTS: u32 = 1 << 12;
+/// Most bytes of one slot: far above one layer of any object, and a bound
+/// on what checking a write costs.
+const MAX_SLOT_BYTES: u64 = 256 << 20;
+/// Most rows the overlap check of one slot walks.
+const MAX_CHECKED_ROWS: u64 = 1 << 24;
 /// Most dims one object run may have.
 pub const MAX_RUN_DIMS: usize = MAX_DIMS;
 /// Most keys and points one query may carry.
@@ -290,7 +295,11 @@ struct Regions {
 
 impl Drop for Regions {
     fn drop(&mut self) {
-        if self.ctx.bind_to_thread().is_err() {
+        if let Err(e) = self.ctx.bind_to_thread() {
+            warn!(
+                "objects: leaking {} IPC regions, cannot bind context: {e:?}",
+                self.list.len()
+            );
             return;
         }
         for &(ptr, _) in &self.list {
@@ -392,7 +401,7 @@ fn copy_worker(
 /// One registered device: its regions and a save and a load worker, each
 /// pinned to the GPU's node with its own stream, so a load never queues
 /// behind a save.
-struct Device {
+pub(crate) struct Device {
     regions: Arc<Regions>,
     /// The GPU's NUMA node; saves allocate there.
     numa: NumaNode,
@@ -462,21 +471,19 @@ impl ObjectStore {
         !self.devices.lock().is_empty()
     }
 
-    /// Drop every device of `instance`; returns how many.
-    pub(crate) fn remove_instance(&self, instance: &str) -> usize {
-        // Collected so the regions close after the lock is released.
-        let removed: Vec<_> = self
-            .devices
+    /// Take every device of `instance` out; dropping them closes their
+    /// regions once no copy holds them, so callers drop them outside locks.
+    pub(crate) fn remove_instance(&self, instance: &str) -> Vec<Arc<Device>> {
+        self.devices
             .lock()
             .extract_if(|(i, _), _| i == instance)
-            .collect();
-        removed.len()
+            .map(|(_, d)| d)
+            .collect()
     }
 
-    /// Drop every device; returns the instance of each.
-    pub(crate) fn remove_all(&self) -> Vec<String> {
-        let devices = std::mem::take(&mut *self.devices.lock());
-        devices.into_keys().map(|(i, _)| i).collect()
+    /// Take every device out; as [`Self::remove_instance`].
+    pub(crate) fn remove_all(&self) -> HashMap<(String, u32), Arc<Device>> {
+        std::mem::take(&mut *self.devices.lock())
     }
 
     fn device(&self, instance: &str, rank: u32) -> Result<Arc<Device>, EngineError> {
@@ -649,25 +656,23 @@ impl PegaEngine {
         }
 
         // What peers and SSD add: each chain past its resident prefix, and
-        // every point key not in memory, each on its own.
+        // any point key not in memory.
         let missing: Vec<BlockKey> = point_keys
             .into_iter()
             .filter(|k| !held.contains(k))
             .collect();
-        let mut sets: Vec<Vec<BlockKey>> = plan
+        let rests: Vec<Vec<BlockKey>> = plan
             .prefixes
             .iter()
             .zip(&resident)
             .map(|(c, &r)| c[r..].to_vec())
             .collect();
-        sets.extend(missing.iter().map(|k| vec![k.clone()]));
-        let reach = self.storage.reach(&sets).await;
+        let (reach, found) = self.storage.reach(&rests, &missing).await;
         let chain_reach: Vec<usize> = resident.iter().zip(&reach).map(|(r, n)| r + n).collect();
         let reachable: HashSet<&BlockKey> = missing
             .iter()
-            .zip(&reach[plan.prefixes.len()..])
-            .filter(|(_, n)| **n == 1)
-            .map(|(k, _)| k)
+            .zip(found)
+            .filter_map(|(k, f)| f.then_some(k))
             .collect();
         let target = plan.best(
             |c| chain_reach[c],
@@ -687,20 +692,22 @@ impl PegaEngine {
             .map(|(c, &r)| FetchPart {
                 keys: c[r..target.1].to_vec(),
                 whole,
+                members: false,
             })
             .collect();
         if let Some(p) = target.0 {
             let mut seen = HashSet::new();
-            parts.extend(
-                plan.points[p]
-                    .1
-                    .iter()
-                    .filter(|k| !held.contains(*k) && seen.insert(*k))
-                    .map(|k| FetchPart {
-                        keys: vec![k.clone()],
-                        whole: true,
-                    }),
-            );
+            let keys: Vec<BlockKey> = plan.points[p]
+                .1
+                .iter()
+                .filter(|k| !held.contains(*k) && seen.insert(*k))
+                .cloned()
+                .collect();
+            parts.extend(by_namespace(&keys).into_iter().map(|at| FetchPart {
+                keys: at.into_iter().map(|i| keys[i].clone()).collect(),
+                whole: true,
+                members: true,
+            }));
         }
         debug!(
             "query_objects {instance_id}/{req_id}: point {:?} at {} blocks fetches {} keys",
@@ -973,9 +980,26 @@ impl PegaEngine {
         loads: &[ObjectLoad],
         load_state_shm: &str,
     ) -> Result<(), EngineError> {
-        crate::submit_with_load_state(load_state_shm, "load_objects", |done| {
+        let result = crate::submit_with_load_state(load_state_shm, "load_objects", |done| {
             self.submit_object_loads(instance_id, rank, loads, done)
-        })
+        });
+        if result.is_err() {
+            // The restore these leases serve cannot complete, and no later
+            // load may consume them: drop them now, not at expiry.
+            self.release_object_leases(instance_id, loads.iter().map(|l| &l.lease));
+        }
+        result
+    }
+
+    /// Drop `leases` of `instance_id`: the loads they serve cannot happen.
+    pub fn release_object_leases<'a>(
+        &self,
+        instance_id: &str,
+        leases: impl IntoIterator<Item = &'a QueryLeaseId>,
+    ) {
+        for lease in leases {
+            self.query_leases.release_objects(instance_id, lease);
+        }
     }
 
     fn submit_object_loads(
@@ -985,21 +1009,14 @@ impl PegaEngine {
         loads: &[ObjectLoad],
         done: LoadCompletion,
     ) -> Result<(), EngineError> {
-        let submitted = self.objects.device(instance_id, rank).and_then(|device| {
-            let job = self.object_load_job(instance_id, &device, loads, done)?;
-            device.submit(Direction::HostToDevice, job)
-        });
+        let device = self.objects.device(instance_id, rank)?;
+        let job = self.object_load_job(instance_id, &device, loads, done)?;
+        device.submit(Direction::HostToDevice, job)?;
+        // The copy job holds the objects; the leases may go now.
         for l in loads {
-            if submitted.is_ok() {
-                // The copy job holds the objects; the lease may go now.
-                self.query_leases.consume_objects(&l.lease);
-            } else {
-                // The restore these leases serve cannot complete, and no
-                // later load may consume them: drop them now, not at expiry.
-                self.query_leases.release_objects(instance_id, &l.lease);
-            }
+            self.query_leases.consume_objects(&l.lease);
         }
-        submitted
+        Ok(())
     }
 
     /// The copies of `loads` into `device`, each read checked against its
@@ -1078,8 +1095,11 @@ fn check_write(device: &Device, w: &ObjectWrite) -> Result<(), EngineError> {
         if s.slot >= w.slots || std::mem::replace(&mut seen[s.slot as usize], true) {
             return bad(format!("slot {} is out of range or written twice", s.slot));
         }
-        if s.size == 0 {
-            return bad(format!("slot {} is empty", s.slot));
+        if s.size == 0 || s.size > MAX_SLOT_BYTES {
+            return bad(format!(
+                "slot {} has {} bytes, expected 1 to {MAX_SLOT_BYTES}",
+                s.slot, s.size
+            ));
         }
         let mut copied = 0u64;
         let mut extents = Vec::with_capacity(s.runs.len());
@@ -1103,11 +1123,19 @@ fn check_write(device: &Device, w: &ObjectWrite) -> Result<(), EngineError> {
 /// No two of `runs`, checked runs of a `size` byte slot with slot
 /// `extents`, write the same byte; a run's own rows never overlap. Runs with
 /// disjoint extents pass without looking at rows; otherwise every row marks
-/// a bitmap of the slot, `size / 8` bytes whatever the row count.
+/// a bitmap of the slot, `size / 8` bytes, and more than
+/// [`MAX_CHECKED_ROWS`] rows fail.
 fn writes_once(size: u64, runs: &[ObjectRun], mut extents: Vec<(u64, u64)>) -> bool {
     extents.sort_unstable();
     if extents.windows(2).all(|w| w[0].1 <= w[1].0) {
         return true;
+    }
+    let rows = runs
+        .iter()
+        .map(ObjectRun::rows)
+        .fold(0u64, u64::saturating_add);
+    if rows > MAX_CHECKED_ROWS {
+        return false;
     }
     let mut bits = vec![0u64; size.div_ceil(64) as usize];
     runs.iter()

@@ -469,32 +469,56 @@ impl StorageEngine {
         self.read_cache.peek_blocks(keys)
     }
 
-    /// Per set of keys of one namespace, how many of its leading keys peers
-    /// and then SSD can bring in: peers serve a prefix, SSD the keys after it.
-    pub(crate) async fn reach(&self, sets: &[Vec<BlockKey>]) -> Vec<usize> {
-        let remote = match self.prefetch.rdma_fetch() {
+    /// Per chain of keys of one namespace, how many of its leading keys peers
+    /// and then SSD can bring in: peers serve a prefix, SSD the keys after
+    /// it. And whether peers or SSD can bring in each of `members`, asked with
+    /// one MetaServer query per namespace.
+    pub(crate) async fn reach(
+        &self,
+        chains: &[Vec<BlockKey>],
+        members: &[BlockKey],
+    ) -> (Vec<usize>, Vec<bool>) {
+        let ssd = self.ssd_store.as_deref();
+        let groups = by_namespace(members);
+        let (chain_remote, member_remote) = match self.prefetch.rdma_fetch() {
             Some(rdma) => {
-                futures::future::join_all(sets.iter().map(|set| async move {
+                let chains = futures::future::join_all(chains.iter().map(|set| async move {
                     let Some(first) = set.first() else {
                         return 0;
                     };
                     let hashes: Vec<Vec<u8>> = set.iter().map(|k| k.hash.clone()).collect();
                     rdma.remote_prefix(&first.namespace, &hashes).await
-                }))
-                .await
+                }));
+                let members = futures::future::join_all(groups.iter().map(|at| async move {
+                    let hashes: Vec<Vec<u8>> =
+                        at.iter().map(|&i| members[i].hash.clone()).collect();
+                    let found = rdma
+                        .remote_members(&members[at[0]].namespace, &hashes)
+                        .await;
+                    found.into_iter().map(|j| at[j]).collect::<Vec<_>>()
+                }));
+                tokio::join!(chains, members)
             }
-            None => vec![0; sets.len()],
+            None => (vec![0; chains.len()], Vec::new()),
         };
-        sets.iter()
-            .zip(remote)
+        let chains = chains
+            .iter()
+            .zip(chain_remote)
             .map(|(set, n)| {
                 let n = n.min(set.len());
-                n + self
-                    .ssd_store
-                    .as_ref()
-                    .map_or(0, |ssd| ssd.prefix_len(&set[n..]))
+                n + ssd.map_or(0, |ssd| ssd.prefix_len(&set[n..]))
             })
-            .collect()
+            .collect();
+        let mut held = vec![false; members.len()];
+        for i in member_remote.into_iter().flatten() {
+            held[i] = true;
+        }
+        if let Some(ssd) = ssd {
+            for (h, on_ssd) in held.iter_mut().zip(ssd.contains_keys(members)) {
+                *h |= on_ssd;
+            }
+        }
+        (chains, held)
     }
 
     /// Start fetching `parts` for `req_id`; see [`PrefetchScheduler::start_parts`].
@@ -796,6 +820,21 @@ impl StorageEngine {
             client.shutdown().await;
         }
     }
+}
+
+/// Indexes of `keys` grouped by namespace, in first-seen order.
+pub(crate) fn by_namespace(keys: &[BlockKey]) -> Vec<Vec<usize>> {
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (i, k) in keys.iter().enumerate() {
+        match groups
+            .iter_mut()
+            .find(|g| keys[g[0]].namespace == k.namespace)
+        {
+            Some(g) => g.push(i),
+            None => groups.push(vec![i]),
+        }
+    }
+    groups
 }
 
 #[cfg(test)]

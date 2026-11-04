@@ -375,16 +375,29 @@ impl MetaServer for GrpcMetaService {
             return result;
         }
 
-        // Returns entries up to the first globally-missing hash.
-        let existing = self.store.query_prefix(&req.namespace, &req.block_hashes);
+        // Prefix: entries up to the first globally-missing hash. Members:
+        // every hash a peer other than the requester holds, with its index.
+        let (existing, found) = if req.members {
+            let (found, existing): (Vec<u32>, Vec<PrefixEntry>) = self
+                .store
+                .query_members(&req.namespace, &req.block_hashes)
+                .into_iter()
+                .filter(|(_, e)| e.nodes.iter().any(|n| n.as_ref() != req.exclude_node))
+                .map(|(i, e)| (i as u32, e))
+                .unzip();
+            (existing, found)
+        } else {
+            let existing = self.store.query_prefix(&req.namespace, &req.block_hashes);
+            (existing, Vec::new())
+        };
 
-        let total_queried = req.block_hashes.len();
-        let prefix_len = existing.len();
-
-        let elapsed = start.elapsed();
         debug!(
-            "RPC [query_prefix_blocks]: namespace={} prefix={}/{} in {:?}",
-            req.namespace, prefix_len, total_queried, elapsed
+            "RPC [query_prefix_blocks]: namespace={} members={} found={}/{} in {:?}",
+            req.namespace,
+            req.members,
+            existing.len(),
+            req.block_hashes.len(),
+            start.elapsed()
         );
 
         let segments =
@@ -404,7 +417,7 @@ impl MetaServer for GrpcMetaService {
             }
         }
 
-        let result = Ok(Response::new(QueryPrefixBlocksResponse { segments }));
+        let result = Ok(Response::new(QueryPrefixBlocksResponse { segments, found }));
         record_rpc_result("query_prefix_blocks", &result, start);
         result
     }
@@ -494,6 +507,7 @@ mod tests {
                 namespace: "ns".into(),
                 block_hashes: vec![vec![1, 2, 3]],
                 exclude_node: String::new(),
+                members: false,
             }))
             .await
             .unwrap()
@@ -537,6 +551,7 @@ mod tests {
                 namespace: "ns".into(),
                 block_hashes: vec![vec![1, 2, 3]],
                 exclude_node: String::new(),
+                members: false,
             }))
             .await
             .unwrap()
@@ -655,6 +670,7 @@ mod tests {
                 namespace: "ns".into(),
                 block_hashes: vec![vec![1]],
                 exclude_node: String::new(),
+                members: false,
             }))
             .await
             .unwrap()
@@ -701,6 +717,7 @@ mod tests {
                 namespace: namespace.into(),
                 block_hashes: vec![h1, h2, h3, h4],
                 exclude_node: String::new(),
+                members: false,
             }))
             .await
             .unwrap()
@@ -713,6 +730,42 @@ mod tests {
             .collect();
 
         assert_eq!(segments, vec![(node_a.to_string(), 4)]);
+    }
+
+    #[tokio::test]
+    async fn test_query_members_skips_missing_and_requester_only_hashes() {
+        let svc = make_service();
+        let (node_a, me) = ("node-a:50055", "me:50055");
+        for (node, hashes) in [(node_a, vec![vec![1], vec![3]]), (me, vec![vec![4]])] {
+            let node_id = heartbeat_node(&svc, node).await;
+            svc.insert_block_hashes(Request::new(InsertBlockHashesRequest {
+                namespace: "ns".into(),
+                block_hashes: hashes,
+                node: node.into(),
+                node_id,
+            }))
+            .await
+            .unwrap();
+        }
+
+        let response = svc
+            .query_prefix_blocks(Request::new(QueryPrefixBlocksRequest {
+                namespace: "ns".into(),
+                block_hashes: vec![vec![1], vec![2], vec![3], vec![4]],
+                exclude_node: me.into(),
+                members: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.found, vec![0, 2]);
+        let segments: Vec<(String, u32)> = response
+            .segments
+            .into_iter()
+            .map(|s| (s.node, s.block_count))
+            .collect();
+        assert_eq!(segments, vec![(node_a.to_string(), 2)]);
     }
 
     fn prefix_entry(hash: u8, nodes: &[&str]) -> PrefixEntry {
