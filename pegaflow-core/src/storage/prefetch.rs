@@ -75,12 +75,50 @@ impl RdmaFetch {
             .await
             .map_or(0, |plan| plan.block_count())
     }
+
+    /// Indexes of the `hashes` peers hold, per the MetaServer.
+    pub(super) async fn remote_members(&self, namespace: &str, hashes: &[Vec<u8>]) -> Vec<usize> {
+        self.0
+            .query_members(namespace, hashes)
+            .await
+            .map_or_else(Vec::new, |(found, plan)| {
+                found.into_iter().take(plan.block_count()).collect()
+            })
+    }
+
+    /// What peers serve of `hashes`, each on its own: one MetaServer query
+    /// and one fetch per holder for all of them.
+    async fn fetch_members(
+        &self,
+        req_id: &str,
+        namespace: &str,
+        hashes: &[Vec<u8>],
+    ) -> PrefetchResult {
+        let Some((found, plan)) = self.0.query_members(namespace, hashes).await else {
+            return Vec::new();
+        };
+        let held: Vec<Vec<u8>> = found.iter().map(|&i| hashes[i].clone()).collect();
+        self.0.fetch_plan(&plan, req_id, namespace, &held).await
+    }
 }
 
 #[cfg(not(feature = "rdma"))]
 impl RdmaFetch {
     pub(super) async fn remote_prefix(&self, _namespace: &str, _hashes: &[Vec<u8>]) -> usize {
         0
+    }
+
+    pub(super) async fn remote_members(&self, _namespace: &str, _hashes: &[Vec<u8>]) -> Vec<usize> {
+        Vec::new()
+    }
+
+    async fn fetch_members(
+        &self,
+        _req_id: &str,
+        _namespace: &str,
+        _hashes: &[Vec<u8>],
+    ) -> PrefetchResult {
+        Vec::new()
     }
 
     async fn try_fetch_prefix(
@@ -159,12 +197,14 @@ struct PrefetchTaskInput {
     wait_for_full_prefix: bool,
 }
 
-/// Keys of one namespace a parts fetch brings in as a prefix: peers serve
-/// what they can from the first key, then SSD from where they stopped.
+/// Keys of one namespace a parts fetch brings in: as a prefix, peers serve
+/// what they can from the first key, then SSD from where they stopped; as
+/// members, peers serve any of them and SSD any of the rest.
 pub(crate) struct FetchPart {
     pub(crate) keys: Vec<BlockKey>,
     /// Reserve SSD budget for every key SSD should serve, or for none.
     pub(crate) whole: bool,
+    pub(crate) members: bool,
 }
 
 /// Blocks a parts fetch brought in, by the tier that served them.
@@ -654,14 +694,16 @@ fn build_ready_result(
 /// The hashes of `keys` per namespace, in first-seen order: a KV fetch has
 /// one namespace, an object fetch may span several.
 fn hashes_by_namespace(keys: Vec<BlockKey>) -> Vec<(String, Vec<Vec<u8>>)> {
-    let mut out: Vec<(String, Vec<Vec<u8>>)> = Vec::new();
-    for key in keys {
-        match out.iter_mut().find(|(ns, _)| *ns == key.namespace) {
-            Some((_, hashes)) => hashes.push(key.hash),
-            None => out.push((key.namespace, vec![key.hash])),
-        }
-    }
-    out
+    super::by_namespace(&keys)
+        .into_iter()
+        .map(|at| {
+            let namespace = keys[at[0]].namespace.clone();
+            (
+                namespace,
+                at.into_iter().map(|i| keys[i].hash.clone()).collect(),
+            )
+        })
+        .collect()
 }
 
 async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> PrefetchTaskResult {
@@ -788,15 +830,27 @@ async fn run_parts_task(
     let mut reservations = Vec::new();
     for (part, peers) in parts.iter().zip(&from_peers) {
         let got: std::collections::HashSet<&BlockKey> = peers.iter().map(|(k, _)| k).collect();
-        let rest = &part.keys[part.keys.iter().take_while(|k| got.contains(k)).count()..];
-        let found = ssd.prefix_len(rest);
-        if (part.whole && found < rest.len()) || found == 0 {
+        // What SSD should serve, and of that what it holds, read in order.
+        let (want, rest): (usize, Vec<BlockKey>) = if part.members {
+            let want: Vec<&BlockKey> = part.keys.iter().filter(|k| !got.contains(k)).collect();
+            let held = ssd.contains_keys(want.iter().copied());
+            let rest = want
+                .iter()
+                .zip(held)
+                .filter(|(_, h)| *h)
+                .map(|(k, _)| (*k).clone());
+            (want.len(), rest.collect())
+        } else {
+            let rest = &part.keys[part.keys.iter().take_while(|k| got.contains(k)).count()..];
+            (rest.len(), rest[..ssd.prefix_len(rest)].to_vec())
+        };
+        if (part.whole && rest.len() < want) || rest.is_empty() {
             continue;
         }
         if let Some((reserved, reservation)) = reserve_ssd_prefetch_slots(
             Arc::clone(&deps.prefetch_state),
             deps.max_prefetch_blocks,
-            found,
+            rest.len(),
             part.whole,
         ) {
             reads.extend_from_slice(&rest[..reserved]);
@@ -811,7 +865,7 @@ async fn run_parts_task(
     out
 }
 
-/// What peers serve of `part`, from its first key.
+/// What peers serve of `part`: from its first key, or any of its members.
 async fn fetch_from_peers(
     deps: &PrefetchTaskDeps,
     req_id: &str,
@@ -823,6 +877,9 @@ async fn fetch_from_peers(
     let namespace = &part.keys[0].namespace;
     debug_assert!(part.keys.iter().all(|k| &k.namespace == namespace));
     let hashes: Vec<Vec<u8>> = part.keys.iter().map(|k| k.hash.clone()).collect();
+    if part.members {
+        return rdma.fetch_members(req_id, namespace, &hashes).await;
+    }
     rdma.try_fetch_prefix(req_id, namespace, &hashes, false)
         .await
         .map(|(_, blocks)| blocks)

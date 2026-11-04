@@ -1413,9 +1413,6 @@ impl Engine for GrpcEngineService {
                 loads,
                 load_state_shm,
             } = req;
-            if load_state_shm.is_empty() {
-                return Err(Status::invalid_argument("load_state_shm must not be empty"));
-            }
             debug!(
                 "RPC [load_objects]: instance_id={} rank={} loads={} objects={} load_state_shm_len={}",
                 instance_id,
@@ -1424,7 +1421,22 @@ impl Engine for GrpcEngineService {
                 object_count,
                 load_state_shm.len()
             );
-            let loads = Self::object_loads(loads)?;
+            // A request that fails before the engine checks it still ends
+            // the leases it names: the restore they serve cannot happen.
+            let leases: Vec<QueryLeaseId> = loads
+                .iter()
+                .filter_map(|l| QueryLeaseId::from_bytes(&l.lease).ok())
+                .collect();
+            let release = |e: Status| {
+                self.engine.release_object_leases(&instance_id, &leases);
+                e
+            };
+            if load_state_shm.is_empty() {
+                return Err(release(Status::invalid_argument(
+                    "load_state_shm must not be empty",
+                )));
+            }
+            let loads = Self::object_loads(loads).map_err(release)?;
             self.engine
                 .load_objects(&instance_id, rank, &loads, &load_state_shm)
                 .map_err(Self::map_engine_error)?;

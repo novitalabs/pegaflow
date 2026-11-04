@@ -11,7 +11,8 @@ use pegaflow_proto::proto::engine::{
 };
 #[cfg(feature = "rdma")]
 use pegaflow_proto::proto::engine::{
-    FetchSegment, PullBackupPlanRequest, PullBackupPlanResponse, QueryPrefixBlocksRequest,
+    PullBackupPlanRequest, PullBackupPlanResponse, QueryPrefixBlocksRequest,
+    QueryPrefixBlocksResponse,
 };
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::{Duration, Instant};
@@ -576,36 +577,40 @@ impl MetaServerClient {
         let _ = done_rx.await;
     }
 
-    /// Query MetaServer for an ordered remote fetch plan.
+    /// Query MetaServer for an ordered remote fetch plan; with `members`,
+    /// over the hashes peers hold rather than their leading run.
     #[cfg(feature = "rdma")]
     pub(crate) async fn query_plan(
         &self,
         namespace: &str,
         hashes: &[Vec<u8>],
         exclude_node: &str,
-    ) -> Result<Vec<FetchSegment>, ClientError> {
+        members: bool,
+    ) -> Result<QueryPrefixBlocksResponse, ClientError> {
         let request = QueryPrefixBlocksRequest {
             namespace: namespace.to_string(),
             block_hashes: hashes.to_vec(),
             exclude_node: exclude_node.to_string(),
+            members,
         };
 
-        let response = self
+        let resp = self
             .query_client
             .clone()
             .query_prefix_blocks(request)
             .await
-            .map_err(|e| ClientError::RpcFailed(format!("MetaServer query failed: {e}")))?;
-
-        let resp = response.into_inner();
+            .map_err(|e| ClientError::RpcFailed(format!("MetaServer query failed: {e}")))?
+            .into_inner();
 
         debug!(
-            "MetaServer query_plan: namespace={} segments={}",
+            "MetaServer query_plan: namespace={} members={} segments={} found={}",
             namespace,
-            resp.segments.len()
+            members,
+            resp.segments.len(),
+            resp.found.len()
         );
 
-        Ok(resp.segments)
+        Ok(resp)
     }
 }
 
@@ -1280,9 +1285,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(request.into_inner());
-            Ok(Response::new(QueryPrefixBlocksResponse {
-                segments: vec![],
-            }))
+            Ok(Response::new(QueryPrefixBlocksResponse::default()))
         }
 
         async fn pull_backup_plan(
@@ -1560,18 +1563,19 @@ mod tests {
         );
         let hashes = vec![vec![1], vec![2]];
 
-        let segments = client
-            .query_plan("ns", &hashes, "node-a:50055")
+        let resp = client
+            .query_plan("ns", &hashes, "node-a:50055", false)
             .await
             .expect("query should succeed");
 
-        assert!(segments.is_empty());
+        assert!(resp.segments.is_empty());
         assert_eq!(
             *service.query_requests.lock().unwrap(),
             vec![QueryPrefixBlocksRequest {
                 namespace: "ns".to_string(),
                 block_hashes: hashes,
                 exclude_node: "node-a:50055".to_string(),
+                members: false,
             }]
         );
         client.shutdown().await;

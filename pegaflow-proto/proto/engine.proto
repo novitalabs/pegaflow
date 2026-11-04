@@ -484,6 +484,9 @@ message QueryPrefixBlocksRequest {
   string namespace = 1;
   repeated bytes block_hashes = 2;  // ordered by prefix position
   string exclude_node = 3;          // requester address; never return it as an owner
+  // Membership instead of prefix semantics: hashes no peer holds are skipped
+  // rather than ending the plan, and `found` lists the hashes it covers.
+  bool members = 4;
 }
 
 message FetchSegment {
@@ -494,7 +497,10 @@ message FetchSegment {
 message QueryPrefixBlocksResponse {
   reserved 1;
   reserved "nodes";
+  // Over the leading hashes, or with `members` over the `found` ones in order.
   repeated FetchSegment segments = 2;
+  // With `members`: ascending indexes into `block_hashes` the segments cover.
+  repeated uint32 found = 3;
 }
 
 // Block hashes of one namespace, oldest first.

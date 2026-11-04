@@ -391,34 +391,34 @@ impl BlockHashStore {
     /// Query the longest prefix of `hashes` with at least one live owner.
     pub fn query_prefix(&self, namespace: &str, hashes: &[Vec<u8>]) -> Vec<PrefixEntry> {
         let now = Instant::now();
-        let mut result = Vec::new();
-        for hash in hashes {
-            let key = BlockKey::new(namespace.to_string(), hash.clone());
-            let Some(owners) = self.blocks.get(&key) else {
-                break;
-            };
+        hashes
+            .iter()
+            .map_while(|hash| self.live_entry(namespace, hash, now))
+            .collect()
+    }
 
-            let live_nodes: Vec<Arc<str>> = owners
-                .iter()
-                .filter_map(|(node, owner)| {
-                    if self.is_owner_visible(node, owner, now) {
-                        Some(Arc::clone(node))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+    /// Each of `hashes` with at least one live owner, with its index.
+    pub fn query_members(&self, namespace: &str, hashes: &[Vec<u8>]) -> Vec<(usize, PrefixEntry)> {
+        let now = Instant::now();
+        hashes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, hash)| Some((i, self.live_entry(namespace, hash, now)?)))
+            .collect()
+    }
 
-            if live_nodes.is_empty() {
-                break;
-            }
-
-            result.push(PrefixEntry {
-                block_hash: hash.clone(),
-                nodes: live_nodes,
-            });
-        }
-        result
+    fn live_entry(&self, namespace: &str, hash: &[u8], now: Instant) -> Option<PrefixEntry> {
+        let key = BlockKey::new(namespace.to_string(), hash.to_vec());
+        let owners = self.blocks.get(&key)?;
+        let nodes: Vec<Arc<str>> = owners
+            .iter()
+            .filter(|(node, owner)| self.is_owner_visible(node, owner, now))
+            .map(|(node, _)| Arc::clone(node))
+            .collect();
+        (!nodes.is_empty()).then(|| PrefixEntry {
+            block_hash: hash.to_vec(),
+            nodes,
+        })
     }
 
     /// Healthy sweeps only inspect nodes. A takeover or node TTL expiry triggers

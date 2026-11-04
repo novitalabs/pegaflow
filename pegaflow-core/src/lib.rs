@@ -479,13 +479,14 @@ impl PegaEngine {
             .write()
             .expect("instances write lock poisoned");
         let removed = instances.remove(instance_id);
+        // Dropped on return, outside the lock: that closes idle devices' regions.
         let devices = self.objects.remove_instance(instance_id);
         if instances.is_empty() && !self.objects.has_devices() {
             self.storage.set_has_instance(false);
         }
         drop(instances);
 
-        if removed.is_none() && devices == 0 {
+        if removed.is_none() && devices.is_empty() {
             return Err(EngineError::InstanceMissing(instance_id.to_string()));
         }
         self.query_leases.release_instance(instance_id);
@@ -501,7 +502,9 @@ impl PegaEngine {
             .expect("instances write lock poisoned");
         let mut ids: Vec<String> = instances.keys().cloned().collect();
         instances.clear();
-        ids.extend(self.objects.remove_all());
+        // Dropped on return, outside the lock, as in `unregister_instance`.
+        let devices = self.objects.remove_all();
+        ids.extend(devices.keys().map(|(i, _)| i.clone()));
         ids.sort();
         ids.dedup();
         // Under the lock, so a concurrent registration cannot be overwritten.
