@@ -459,23 +459,9 @@ impl StorageEngine {
         self.read_cache.get_blocks_aligned(keys)
     }
 
-    /// Publish blocks sealed outside the insert worker, as it publishes its
-    /// own: into the read cache, to SSD, and resident ones to the MetaServer.
-    /// `local_copies` only enter the cache. Returns how many of `blocks` are
-    /// resident.
-    pub(crate) fn insert_sealed(
-        &self,
-        blocks: &[(BlockKey, Arc<SealedBlock>)],
-        local_copies: &[(BlockKey, Arc<SealedBlock>)],
-    ) -> usize {
-        self.read_cache.batch_insert_refs(local_copies);
-        write_path::publish_sealed(
-            &self.read_cache,
-            self.ssd_store.as_ref(),
-            self.metaserver_client.as_ref(),
-            blocks,
-        )
-        .len()
+    /// Whether each of `keys` is resident, without touching the LRU.
+    pub(crate) fn contains_keys(&self, keys: &[BlockKey]) -> Vec<bool> {
+        self.read_cache.contains_keys(keys)
     }
 
     /// Per set of keys of one namespace, how many of its leading keys peers

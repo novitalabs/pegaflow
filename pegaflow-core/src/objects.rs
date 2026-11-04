@@ -1,40 +1,41 @@
 //! Byte-addressed objects on the block store.
 //!
-//! An object is an opaque byte string keyed by `(fingerprint, prefix)`. Clients
-//! copy strided byte runs between their registered device regions and objects;
-//! the engine never interprets layers, ranks or layouts. The client fixes each
-//! object's size, coverage unit and chunks; the engine only checks that every
-//! writer agrees and that runs respect them. Several devices may each write
-//! part of one object: a save claims the units it copies, skips units another
-//! save already claimed, and the object seals once every unit is claimed and
-//! no copy is in flight. It is stored as a [`SealedBlock`] with one slot per
-//! chunk under the [`BlockKey`] `(hex(fingerprint), prefix)`, so objects share
-//! the pinned pool, LRU eviction, query leases, the SSD cache and MetaServer
-//! registration with KV blocks, and a query brings an evicted object back.
+//! An object is an opaque byte string keyed by `(fingerprint, prefix)` and cut
+//! into slots, as a KV block is cut into `layers x ranks` slots. Each save
+//! copies strided runs of one device's registered regions into whole slots of
+//! pinned memory on that device's NUMA node, and hands them to the insert
+//! worker like a KV save; the object seals once all of its slots arrived. The
+//! engine never interprets layers, ranks or layouts: the client decides how
+//! many slots an object has, which device writes each, and what bytes go where.
+//!
+//! Sealed objects are [`SealedBlock`]s under the [`BlockKey`]
+//! `(hex(fingerprint), prefix)`, one single-segment slot per object slot, so
+//! they share the pinned pool, LRU eviction, query leases, the SSD cache and
+//! MetaServer registration with KV blocks, and a query brings an evicted
+//! object back from a peer or SSD.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
 use std::num::NonZeroU64;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use cudarc::driver::{CudaContext, CudaStream, sys};
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::backing::SSD_ALIGNMENT;
 use crate::block::{BlockKey, RawBlock, SealedBlock, Segment};
 use crate::gpu_worker::{LoadCompletion, spawn_pinned_worker, wait_worker_ready};
 use crate::metrics::core_metrics;
+use crate::offload::{RawSaveBatch, RawSaveLayer};
 use crate::pinned_pool::{MappedPinnedPtr, PinnedAllocation};
-use crate::seal_offload::io_len;
 use crate::storage::{FetchPart, PartsPoll};
 use crate::transfer::{Dim, Direction, MAX_DIMS, StridedCopier, StridedCopy};
 use crate::{EngineError, NumaNode, PegaEngine, QueryLeaseId};
 
-/// Most units one object may have; bounds its coverage bitmap.
-const MAX_UNITS: u64 = 1 << 22;
-/// Most chunks one object may have.
-const MAX_CHUNKS: usize = 1 << 12;
+/// Most slots one object may have.
+const MAX_SLOTS: u32 = 1 << 12;
 /// Most keys and points one query may carry.
 const MAX_QUERY_KEYS: usize = 1 << 16;
 const MAX_QUERY_POINTS: usize = 1 << 12;
@@ -61,24 +62,24 @@ impl ObjectKey {
 }
 
 /// One dimension of an [`ObjectRun`]: `count` steps of `region_stride` bytes
-/// in the device region and `object_stride` bytes in the object; the strides
-/// are ignored when `count == 1`.
+/// in the device region and `slot_stride` bytes in the slot; the strides are
+/// ignored when `count == 1`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjectDim {
     pub count: u32,
     pub region_stride: u64,
-    pub object_stride: u64,
+    pub slot_stride: u64,
 }
 
 /// Rows of `width` bytes over up to [`MAX_DIMS`] dimensions, the first
 /// fastest: row `(i_0, i_1, ..)` is at `region_offset + sum(i_d * region_stride_d)`
-/// of the device region and `object_offset + sum(i_d * object_stride_d)` of
-/// the object. No dimensions is one row.
+/// of the device region and `slot_offset + sum(i_d * slot_stride_d)` of the
+/// slot. No dimensions is one row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectRun {
     pub region: u32,
     pub region_offset: u64,
-    pub object_offset: u64,
+    pub slot_offset: u64,
     pub width: u64,
     pub dims: Vec<ObjectDim>,
 }
@@ -95,30 +96,7 @@ impl ObjectRun {
         self.width.saturating_mul(self.rows())
     }
 
-    /// Region and object offset of every row, the first dimension fastest.
-    fn row_offsets(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
-        offsets((self.region_offset, self.object_offset), &self.dims)
-    }
-
-    /// Object bytes per block and the dimensions over blocks: with the
-    /// dimensions ordered by object stride, a block is the rows of those that
-    /// are back to back in the object. Only valid for a well formed run.
-    fn object_blocks(&self) -> (u64, Vec<ObjectDim>) {
-        let mut dims: Vec<ObjectDim> = self.dims.iter().filter(|d| d.count > 1).copied().collect();
-        dims.sort_unstable_by_key(|d| d.object_stride);
-        let mut len = self.width;
-        let mut k = 0;
-        while let Some(d) = dims.get(k)
-            && d.object_stride == len
-        {
-            len *= u64::from(d.count);
-            k += 1;
-        }
-        dims.drain(..k);
-        (len, dims)
-    }
-
-    /// One past the last byte on the region and object side, if the run is
+    /// One past the last byte on the region and slot side, if the run is
     /// well formed: nonempty, at most [`MAX_DIMS`] dimensions, and on each
     /// side, with its dimensions ordered by stride, every stride at least the
     /// extent of the rows below it, so no two rows overlap.
@@ -145,27 +123,38 @@ impl ObjectRun {
         };
         Some((
             end(self.region_offset, |d| d.region_stride)?,
-            end(self.object_offset, |d| d.object_stride)?,
+            end(self.slot_offset, |d| d.slot_stride)?,
         ))
     }
 }
 
+/// One slot of an object, written whole by one save: its runs copy every one
+/// of its `size` bytes once.
+#[derive(Debug, Clone)]
+pub struct SlotWrite {
+    pub slot: u32,
+    pub size: u64,
+    pub runs: Vec<ObjectRun>,
+}
+
+/// Slots of an object of `slots` slots one device writes.
 #[derive(Debug, Clone)]
 pub struct ObjectWrite {
     pub key: ObjectKey,
-    pub size: u64,
-    /// Coverage granule: divides every chunk and every run's object offset,
-    /// width and object stride.
-    pub unit: u64,
-    /// Chunk sizes in order, summing to `size`; empty for one chunk.
-    pub chunks: Vec<u64>,
+    pub slots: u32,
+    pub writes: Vec<SlotWrite>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SlotRead {
+    pub slot: u32,
     pub runs: Vec<ObjectRun>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ObjectRead {
     pub key: ObjectKey,
-    pub runs: Vec<ObjectRun>,
+    pub reads: Vec<SlotRead>,
 }
 
 /// Reads of objects one lease holds.
@@ -198,11 +187,14 @@ pub enum ObjectQueryStatus {
     /// The point found, if any, and how many leading blocks of every chain
     /// the lease holds: those of the point, or with no points the longest
     /// prefix every chain holds. The lease also holds the point's keys; none
-    /// is issued when it would hold nothing.
+    /// is issued when it would hold nothing. `slots` has the slot count of
+    /// every object leased: the leading `blocks` of each chain in turn, then
+    /// the point's keys.
     Ready {
         point: Option<usize>,
         blocks: u32,
         lease: Option<QueryLeaseId>,
+        slots: Vec<u32>,
     },
 }
 
@@ -266,357 +258,6 @@ impl Plan {
     }
 }
 
-/// Set bits `[lo, hi)` as `(word, mask)` pairs.
-fn masks(lo: u64, hi: u64) -> impl Iterator<Item = (usize, u64)> {
-    let mut g = lo;
-    std::iter::from_fn(move || {
-        if g >= hi {
-            return None;
-        }
-        let (w, b) = ((g / 64) as usize, g % 64);
-        let n = (64 - b).min(hi - g);
-        let mask = if n == 64 {
-            u64::MAX
-        } else {
-            ((1u64 << n) - 1) << b
-        };
-        g += n;
-        Some((w, mask))
-    })
-}
-
-/// One bit per unit.
-struct Bits {
-    words: Vec<u64>,
-    set: u64,
-    len: u64,
-}
-
-impl Bits {
-    fn new(len: u64) -> Self {
-        Self {
-            words: vec![0; len.div_ceil(64) as usize],
-            set: 0,
-            len,
-        }
-    }
-
-    fn get(&self, i: u64) -> bool {
-        self.words[(i / 64) as usize] >> (i % 64) & 1 == 1
-    }
-
-    fn none(&self, lo: u64, hi: u64) -> bool {
-        masks(lo, hi).all(|(w, m)| self.words[w] & m == 0)
-    }
-
-    fn mark(&mut self, lo: u64, hi: u64) {
-        for (w, m) in masks(lo, hi) {
-            self.set += u64::from((m & !self.words[w]).count_ones());
-            self.words[w] |= m;
-        }
-    }
-
-    fn complete(&self) -> bool {
-        self.set == self.len
-    }
-}
-
-/// Size, unit and chunk sizes of an object; every writer sends the same ones.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Shape {
-    size: u64,
-    unit: u64,
-    chunks: Vec<u64>,
-    /// Object offset of each chunk.
-    starts: Vec<u64>,
-}
-
-impl Shape {
-    fn of(w: &ObjectWrite) -> Result<Self, EngineError> {
-        let bad = |why: String| {
-            Err(EngineError::InvalidArgument(format!(
-                "object {:?}: {why}",
-                w.key
-            )))
-        };
-        let chunks = if w.chunks.is_empty() {
-            vec![w.size]
-        } else {
-            w.chunks.clone()
-        };
-        if w.size == 0 {
-            return bad("size is zero".into());
-        }
-        if w.unit == 0 || !w.size.is_multiple_of(w.unit) {
-            return bad(format!("unit {} does not divide size {}", w.unit, w.size));
-        }
-        if w.size / w.unit > MAX_UNITS {
-            return bad(format!(
-                "{} units of {} bytes exceed {MAX_UNITS}",
-                w.size / w.unit,
-                w.unit
-            ));
-        }
-        if chunks.len() > MAX_CHUNKS {
-            return bad(format!("{} chunks exceed {MAX_CHUNKS}", chunks.len()));
-        }
-        if chunks.iter().any(|&c| c == 0 || !c.is_multiple_of(w.unit)) {
-            return bad(format!(
-                "chunks {chunks:?} are not whole units of {}",
-                w.unit
-            ));
-        }
-        let starts = starts(&chunks);
-        if chunks.iter().try_fold(0u64, |a, &c| a.checked_add(c)) != Some(w.size) {
-            return bad(format!("chunks {chunks:?} do not sum to size {}", w.size));
-        }
-        Ok(Self {
-            size: w.size,
-            unit: w.unit,
-            chunks,
-            starts,
-        })
-    }
-
-    /// The run's units are whole and lie in one chunk; returns that chunk.
-    fn check(&self, run: &ObjectRun) -> Result<usize, EngineError> {
-        let u = self.unit;
-        let aligned = run.object_offset.is_multiple_of(u)
-            && run.width.is_multiple_of(u)
-            && run
-                .dims
-                .iter()
-                .all(|d| d.count == 1 || d.object_stride.is_multiple_of(u));
-        if !aligned {
-            return Err(EngineError::InvalidArgument(format!(
-                "run {run:?} is not on whole units of {u} bytes"
-            )));
-        }
-        run.ends()
-            .and_then(|(_, oe)| chunk_of(&self.starts, &self.chunks, run.object_offset, oe))
-            .ok_or_else(|| {
-                EngineError::InvalidArgument(format!(
-                    "run {run:?} is out of bounds or crosses a chunk of {:?}",
-                    self.chunks
-                ))
-            })
-    }
-}
-
-/// `base` advanced to every index of `dims`, the first fastest, on the region
-/// and the object side.
-fn offsets(base: (u64, u64), dims: &[ObjectDim]) -> impl Iterator<Item = (u64, u64)> + '_ {
-    let total: u64 = dims.iter().map(|d| u64::from(d.count)).product();
-    let mut index = [0u32; MAX_DIMS];
-    let mut at = base;
-    (0..total).map(move |_| {
-        let cur = at;
-        // Wrapping: a single-step dimension's strides are arbitrary, and
-        // stepping past the last row may leave u64; both undo exactly.
-        for (i, d) in dims.iter().enumerate() {
-            index[i] += 1;
-            at = (
-                at.0.wrapping_add(d.region_stride),
-                at.1.wrapping_add(d.object_stride),
-            );
-            if index[i] < d.count {
-                break;
-            }
-            index[i] = 0;
-            let n = u64::from(d.count);
-            at = (
-                at.0.wrapping_sub(n.wrapping_mul(d.region_stride)),
-                at.1.wrapping_sub(n.wrapping_mul(d.object_stride)),
-            );
-        }
-        cur
-    })
-}
-
-/// Object offset of each of `chunks`.
-fn starts(chunks: &[u64]) -> Vec<u64> {
-    chunks
-        .iter()
-        .scan(0u64, |at, &c| {
-            let s = *at;
-            *at = at.saturating_add(c);
-            Some(s)
-        })
-        .collect()
-}
-
-/// The chunk holding object bytes `[lo, hi)`, if one does.
-fn chunk_of(starts: &[u64], sizes: &[u64], lo: u64, hi: u64) -> Option<usize> {
-    let i = starts.partition_point(|&s| s <= lo).checked_sub(1)?;
-    (hi <= starts[i] + sizes[i]).then_some(i)
-}
-
-/// One allocation per chunk of an object, padded for SSD I/O, and its NUMA node.
-type Chunks = Vec<(Arc<PinnedAllocation>, NumaNode)>;
-
-/// An object still being written.
-struct Pending {
-    /// Tells this object from one under the same key started after it was dropped.
-    id: u64,
-    shape: Shape,
-    /// The copy that is cached, written to SSD and announced to peers.
-    chunks: Chunks,
-    /// Node-local copies on further sockets, by socket, for content devices
-    /// read whole across sockets; every save writes them too.
-    replicas: Vec<(u32, Chunks)>,
-    /// Units a save copies or copied.
-    claimed: Bits,
-    /// Saves whose copies into the object are in flight.
-    copying: usize,
-    touched: Instant,
-}
-
-impl Pending {
-    /// Pinned bytes of every copy.
-    fn bytes(&self) -> u64 {
-        self.shape.size * (1 + self.replicas.len() as u64)
-    }
-
-    /// Every allocation, kept alive while a save copies into them.
-    fn allocations(&self) -> Vec<Arc<PinnedAllocation>> {
-        std::iter::once(&self.chunks)
-            .chain(self.replicas.iter().map(|(_, c)| c))
-            .flat_map(|c| c.iter().map(|(a, _)| Arc::clone(a)))
-            .collect()
-    }
-
-    /// Queue `run`, inside `chunk`, into every copy, each tagged with its node.
-    fn queue(
-        &self,
-        device: &Device,
-        run: &ObjectRun,
-        chunk: usize,
-        out: &mut Vec<(NumaNode, StridedCopy)>,
-    ) {
-        let offset = (run.object_offset - self.shape.starts[chunk]) as usize;
-        for chunks in std::iter::once(&self.chunks).chain(self.replicas.iter().map(|(_, c)| c)) {
-            let (alloc, numa) = &chunks[chunk];
-            out.push((*numa, copy_of(device, alloc.mapped_ptr().add(offset), run)));
-        }
-    }
-
-    /// Claim the units of `run` (in `chunk`) no save claimed yet and queue
-    /// their copies; returns the bytes queued.
-    fn claim(
-        &mut self,
-        device: &Device,
-        run: &ObjectRun,
-        chunk: usize,
-        out: &mut Vec<(NumaNode, StridedCopy)>,
-    ) -> u64 {
-        let copies = 1 + self.replicas.len() as u64;
-        let u = self.shape.unit;
-        // Blocks in units: the run's object offset, width and strides are
-        // whole units (checked).
-        let (len, mut outer) = run.object_blocks();
-        for d in &mut outer {
-            d.object_stride /= u;
-        }
-        let (first, len) = (run.object_offset / u, len / u);
-        let blocks = || offsets((0, first), &outer).map(|(_, lo)| (lo, lo + len));
-        let whole = blocks().all(|(lo, hi)| self.claimed.none(lo, hi));
-        if whole {
-            for (lo, hi) in blocks() {
-                self.claimed.mark(lo, hi);
-            }
-            self.queue(device, run, chunk, out);
-            return run.bytes() * copies;
-        }
-        // Another save claimed some of these units: copy the rest piece by piece.
-        let mut bytes = 0;
-        for (at, object_at) in run.row_offsets() {
-            let (lo, hi) = (object_at / u, (object_at + run.width) / u);
-            let mut g = lo;
-            while g < hi {
-                if self.claimed.get(g) {
-                    g += 1;
-                    continue;
-                }
-                let start = g;
-                while g < hi && !self.claimed.get(g) {
-                    g += 1;
-                }
-                self.claimed.mark(start, g);
-                let piece = ObjectRun {
-                    region: run.region,
-                    region_offset: at + (start - lo) * u,
-                    object_offset: start * u,
-                    width: (g - start) * u,
-                    dims: Vec::new(),
-                };
-                self.queue(device, &piece, chunk, out);
-                bytes += piece.width * copies;
-            }
-        }
-        bytes
-    }
-
-    /// The primary and every replica by socket, one slot per chunk, each a
-    /// single segment of the chunk's bytes.
-    fn seal(self) -> (SealedBlock, Vec<(u32, SealedBlock)>) {
-        let sizes = self.shape.chunks;
-        let block = |chunks: Chunks| {
-            SealedBlock::from_slots(
-                chunks
-                    .into_iter()
-                    .zip(&sizes)
-                    .map(|((alloc, numa), &size)| {
-                        let segment = Segment::new(alloc.as_non_null(), size as usize, alloc);
-                        (RawBlock::single_segment(segment), numa)
-                    })
-                    .collect(),
-            )
-        };
-        let replicas = self
-            .replicas
-            .into_iter()
-            .map(|(socket, c)| (socket, block(c)))
-            .collect();
-        (block(self.chunks), replicas)
-    }
-}
-
-#[derive(Default)]
-struct PendingObjects {
-    objects: HashMap<BlockKey, Pending>,
-    next_id: u64,
-}
-
-impl PendingObjects {
-    fn insert(&mut self, key: BlockKey, p: Pending) {
-        core_metrics().inflight_bytes.add(p.bytes() as i64, &[]);
-        self.objects.insert(key, p);
-    }
-
-    fn take(&mut self, key: &BlockKey) -> Option<Pending> {
-        let p = self.objects.remove(key)?;
-        core_metrics().inflight_bytes.add(-(p.bytes() as i64), &[]);
-        Some(p)
-    }
-
-    /// Drop objects no save touched for `max_age`; returns how many. A copy
-    /// still in flight keeps its memory alive, and its save then finds the
-    /// object gone.
-    fn expire(&mut self, max_age: Duration) -> usize {
-        let stale: Vec<BlockKey> = self
-            .objects
-            .iter()
-            .filter(|(_, p)| p.touched.elapsed() > max_age)
-            .map(|(k, _)| k.clone())
-            .collect();
-        for key in &stale {
-            warn!("objects: dropping unsealed {key:?}, idle for over {max_age:?}");
-            self.take(key);
-        }
-        stale.len()
-    }
-}
-
 /// A device's IPC-opened regions; closed when the last holder drops them.
 struct Regions {
     ctx: Arc<CudaContext>,
@@ -641,14 +282,12 @@ impl Drop for Regions {
 /// A copy stream of one device and the copier that owns its descriptor buffers.
 struct Lane {
     ctx: Arc<CudaContext>,
-    /// The device's NUMA node.
-    numa: NumaNode,
     stream: Arc<CudaStream>,
     copier: StridedCopier,
 }
 
 impl Lane {
-    fn new(ctx: &Arc<CudaContext>, numa: NumaNode) -> Result<Self, EngineError> {
+    fn new(ctx: &Arc<CudaContext>) -> Result<Self, EngineError> {
         ctx.bind_to_thread()
             .map_err(|e| EngineError::CudaInit(format!("{e:?}")))?;
         let stream = ctx
@@ -657,24 +296,12 @@ impl Lane {
         let copier = StridedCopier::new(ctx).map_err(EngineError::CudaInit)?;
         Ok(Self {
             ctx: Arc::clone(ctx),
-            numa,
             stream,
             copier,
         })
     }
 
-    /// Run `copies`, each tagged with the node of its pinned memory.
-    ///
-    /// Writes into host memory go one launch per node, the lane's own node
-    /// first: a launch whose writes alternate between nodes moves a fraction
-    /// of what one writing a single node does, and ranks of one instance
-    /// then start on different nodes. Reads from several nodes overlap well,
-    /// so a load is one launch.
-    fn transfer(
-        &mut self,
-        copies: &[(NumaNode, StridedCopy)],
-        dir: Direction,
-    ) -> Result<(), EngineError> {
+    fn transfer(&mut self, copies: &[StridedCopy], dir: Direction) -> Result<(), EngineError> {
         if copies.is_empty() {
             return Ok(());
         }
@@ -682,25 +309,8 @@ impl Lane {
         self.ctx
             .bind_to_thread()
             .map_err(|e| failed(format!("{e:?}")))?;
-        let mut sorted = copies.to_vec();
-        if dir == Direction::DeviceToHost {
-            // Stable, so each node's copies keep their order.
-            sorted.sort_by_key(|(numa, _)| (*numa != self.numa, *numa));
-        }
-        let flat: Vec<StridedCopy> = sorted.iter().map(|(_, c)| *c).collect();
-        let mut groups = Vec::new();
-        match dir {
-            Direction::HostToDevice => groups.push(&flat[..]),
-            Direction::DeviceToHost => {
-                let mut at = 0;
-                for group in sorted.chunk_by(|a, b| a.0 == b.0) {
-                    groups.push(&flat[at..at + group.len()]);
-                    at += group.len();
-                }
-            }
-        }
         self.copier
-            .copy(&groups, dir, &self.stream)
+            .copy(copies, dir, &self.stream)
             .map_err(failed)?;
         self.stream
             .synchronize()
@@ -709,16 +319,19 @@ impl Lane {
 }
 
 struct CopyJob {
-    copies: Vec<(NumaNode, StridedCopy)>,
+    copies: Vec<StridedCopy>,
     /// Pinned memory the copies touch, kept alive until they finish.
     keep: Box<dyn Send>,
     bytes: u64,
     done: LoadCompletion,
 }
 
-/// Run a device's copies of one direction in order until the device is dropped.
+/// Run a device's copies of one direction in order until the device is
+/// dropped. Records load metrics as the KV load worker does; saves record
+/// theirs on the RPC path.
 fn copy_worker(
     mut lane: Lane,
+    device_id: i32,
     dir: Direction,
     _regions: Arc<Regions>,
     mut jobs: mpsc::UnboundedReceiver<CopyJob>,
@@ -727,35 +340,30 @@ fn copy_worker(
         let start = Instant::now();
         let result = lane.transfer(&job.copies, dir);
         let elapsed = start.elapsed();
-        let m = core_metrics();
-        match (&result, dir) {
-            (Ok(()), Direction::DeviceToHost) => {
-                m.save_bytes.add(job.bytes, &[]);
-                m.save_duration_seconds.record(elapsed.as_secs_f64(), &[]);
+        if dir == Direction::HostToDevice {
+            let m = core_metrics();
+            match &result {
+                Ok(()) if job.bytes > 0 => {
+                    m.load_bytes.add(job.bytes, &[]);
+                    m.load_duration_seconds.record(elapsed.as_secs_f64(), &[]);
+                }
+                Ok(()) => {}
+                Err(e) => {
+                    error!("Object load task failed: device={device_id} error={e:?}");
+                    m.load_failures.add(1, &[]);
+                }
             }
-            (Ok(()), Direction::HostToDevice) => {
-                m.load_bytes.add(job.bytes, &[]);
-                m.load_duration_seconds.record(elapsed.as_secs_f64(), &[]);
-            }
-            (Err(e), Direction::HostToDevice) => {
-                m.load_failures.add(1, &[]);
-                warn!("load_objects failed: {e}");
-            }
-            (Err(e), Direction::DeviceToHost) => warn!("save_objects failed: {e}"),
         }
         debug!(
-            "object copy {}: {} copies, {} bytes in {elapsed:?}",
-            if dir == Direction::DeviceToHost {
-                "d2h"
-            } else {
-                "h2d"
-            },
+            "Object copy completed: device={device_id} dir={dir:?} copies={} bytes={} elapsed_ms={:.2}",
             job.copies.len(),
             job.bytes,
+            elapsed.as_secs_f64() * 1000.0,
         );
         drop(job.keep);
         job.done.signal(result);
     }
+    info!("Object {dir:?} worker shutting down: device={device_id}");
 }
 
 /// One registered device: its regions and a save and a load worker, each
@@ -763,31 +371,26 @@ fn copy_worker(
 /// behind a save.
 struct Device {
     regions: Arc<Regions>,
-    /// The GPU's NUMA node and its socket.
+    /// The GPU's NUMA node; saves allocate there.
     numa: NumaNode,
-    socket: u32,
-    /// Whether object memory is placed by node: the pool is NUMA-aware and
-    /// the GPU's node is known.
-    placed: bool,
     save: mpsc::UnboundedSender<CopyJob>,
     load: mpsc::UnboundedSender<CopyJob>,
 }
 
 impl Device {
-    /// The run is well formed and inside its region.
-    fn check(&self, run: &ObjectRun) -> Result<(), EngineError> {
-        let (_, size) = self.regions.list.get(run.region as usize).ok_or_else(|| {
+    /// The run is well formed, inside its region, and inside a slot of `size` bytes.
+    fn check(&self, run: &ObjectRun, size: u64) -> Result<(), EngineError> {
+        let (_, region) = self.regions.list.get(run.region as usize).ok_or_else(|| {
             EngineError::InvalidArgument(format!("unknown region {}", run.region))
         })?;
         match run.ends() {
-            Some((re, _)) if re <= *size => Ok(()),
+            Some((re, se)) if re <= *region && se <= size => Ok(()),
             _ => Err(EngineError::InvalidArgument(format!(
-                "run {run:?} is empty, overlapping or out of bounds"
+                "run {run:?} is empty, overlapping or out of bounds of a {size} byte slot"
             ))),
         }
     }
 
-    /// Queue `job` on the save or the load worker.
     fn submit(&self, dir: Direction, job: CopyJob) -> Result<(), EngineError> {
         let worker = match dir {
             Direction::DeviceToHost => &self.save,
@@ -798,41 +401,30 @@ impl Device {
             .map_err(|_| EngineError::Storage("object copy worker exited".into()))
     }
 
-    /// Run `copies` on the worker of `dir` and wait for them.
-    async fn run(
-        &self,
-        dir: Direction,
-        copies: Vec<(NumaNode, StridedCopy)>,
-        keep: Box<dyn Send>,
-        bytes: u64,
-    ) -> Result<(), EngineError> {
-        let (reply, done) = oneshot::channel();
-        self.submit(
-            dir,
-            CopyJob {
-                copies,
-                keep,
-                bytes,
-                done: LoadCompletion::Channel(reply),
-            },
-        )?;
-        done.await
-            .map_err(|_| EngineError::Storage("object copy worker exited".into()))?
+    /// The copy of `run` between its device region and pinned memory at `at`.
+    fn copy_of(&self, at: MappedPinnedPtr, run: &ObjectRun) -> StridedCopy {
+        let dims: Vec<Dim> = run
+            .dims
+            .iter()
+            .map(|d| Dim {
+                count: u64::from(d.count),
+                device_pitch: d.region_stride,
+                host_pitch: d.slot_stride,
+            })
+            .collect();
+        StridedCopy::new(
+            self.regions.list[run.region as usize].0 + run.region_offset,
+            at.device().as_ptr() as u64,
+            run.width,
+            &dims,
+        )
     }
 }
 
-/// Object devices, unsealed objects, and which contents to copy per socket;
-/// sealed objects live in the block store.
+/// Registered object devices by `(instance, rank)`; objects live in the block store.
 #[derive(Default)]
 pub(crate) struct ObjectStore {
     devices: Mutex<HashMap<(String, u32), Arc<Device>>>,
-    pending: Mutex<PendingObjects>,
-    /// Per fingerprint namespace and socket, the ranks there that read its
-    /// objects whole from another socket: content devices hold replicated,
-    /// such as a latent every rank keeps. New objects of it get a copy on
-    /// every socket two such ranks share: one rank alone reads across
-    /// sockets as fast as locally, so a copy would only slow saves down.
-    replicated: Mutex<HashMap<String, BTreeMap<u32, BTreeSet<u32>>>>,
 }
 
 impl ObjectStore {
@@ -851,70 +443,6 @@ impl ObjectStore {
     /// Drop every device; returns the instance of each.
     pub(crate) fn remove_all(&self) -> Vec<String> {
         self.devices.lock().drain().map(|((i, _), _)| i).collect()
-    }
-
-    /// Drop unsealed objects no save touched for `max_age`; returns how many.
-    pub(crate) fn expire_unsealed(&self, max_age: Duration) -> usize {
-        self.pending.lock().expire(max_age)
-    }
-
-    /// The nodes of `instance`'s placed devices, by socket.
-    fn instance_nodes(&self, instance: &str) -> BTreeMap<u32, Vec<NumaNode>> {
-        let mut by_socket: BTreeMap<u32, Vec<NumaNode>> = BTreeMap::new();
-        for ((i, _), d) in self.devices.lock().iter() {
-            if i == instance && d.placed {
-                by_socket.entry(d.socket).or_default().push(d.numa);
-            }
-        }
-        for nodes in by_socket.values_mut() {
-            nodes.sort_unstable();
-            nodes.dedup();
-        }
-        by_socket
-    }
-
-    /// Where a new object of `namespace` that `device` writes keeps its
-    /// copies: the primary first, each a socket and the nodes its chunks
-    /// stripe over (none: wherever the pool allocates).
-    ///
-    /// Striping over the nodes of the instance's devices lets its ranks
-    /// share every node's read bandwidth instead of all reading the node of
-    /// whichever rank saved first. Contents read whole across sockets keep
-    /// one copy per socket instead, each striped within it, so no rank reads
-    /// across sockets.
-    fn placement(
-        &self,
-        namespace: &str,
-        device: &Device,
-        nodes: &BTreeMap<u32, Vec<NumaNode>>,
-    ) -> Vec<(u32, Vec<NumaNode>)> {
-        if !device.placed {
-            return vec![(device.socket, Vec::new())];
-        }
-        let readers: BTreeSet<u32> = self
-            .replicated
-            .lock()
-            .get(namespace)
-            .map(|by_socket| {
-                by_socket
-                    .iter()
-                    .filter(|(_, ranks)| ranks.len() >= 2)
-                    .map(|(s, _)| *s)
-                    .collect()
-            })
-            .unwrap_or_default();
-        if readers.is_empty() {
-            return vec![(device.socket, nodes.values().flatten().copied().collect())];
-        }
-        let local = nodes.get(&device.socket).cloned().unwrap_or_default();
-        std::iter::once((device.socket, local))
-            .chain(
-                nodes
-                    .iter()
-                    .filter(|(s, _)| **s != device.socket && readers.contains(s))
-                    .map(|(s, n)| (*s, n.clone())),
-            )
-            .collect()
     }
 
     fn device(&self, instance: &str, rank: u32) -> Result<Arc<Device>, EngineError> {
@@ -936,35 +464,32 @@ impl ObjectStore {
     }
 }
 
-/// The key of `key`'s node-local copy on `socket`. Hex namespaces hold no
-/// `@`, so it never names a primary object.
-fn replica_key(key: &BlockKey, socket: u32) -> BlockKey {
-    BlockKey::new(format!("{}@{socket}", key.namespace), key.hash.clone())
-}
-
-/// What a save does with one write.
-enum Target {
-    /// Sealed already: nothing to copy.
-    Resident,
-    Pending,
-    /// A new object of this many padded bytes per chunk, with these copies.
-    New(Vec<NonZeroU64>, Vec<(u32, Vec<NumaNode>)>),
+fn already_registered(instance: &str, rank: u32) -> EngineError {
+    EngineError::InvalidArgument(format!(
+        "object device rank {rank} of {instance} is already registered"
+    ))
 }
 
 impl PegaEngine {
     /// Open `regions` (IPC handle, size) of device `device_id` as object
-    /// device `rank` of `instance_id`, replacing an earlier registration.
+    /// device `rank` of `instance_id`. A rank registers once until its
+    /// instance is unregistered or its session ends. Returns the GPU's NUMA
+    /// node, where saves of the device allocate, and its CPU socket.
     pub fn register_object_device(
         &self,
         instance_id: &str,
         rank: u32,
         device_id: i32,
         regions: &[(Vec<u8>, u64)],
-    ) -> Result<(), EngineError> {
+    ) -> Result<(NumaNode, u32), EngineError> {
+        let key = (instance_id.to_string(), rank);
+        if self.objects.devices.lock().contains_key(&key) {
+            return Err(already_registered(instance_id, rank));
+        }
         let cuda = |e: cudarc::driver::DriverError| EngineError::CudaInit(format!("{e:?}"));
         let ordinal = usize::try_from(device_id)
             .map_err(|_| EngineError::InvalidArgument(format!("device_id {device_id}")))?;
-        let numa = self.topology.numa_for_gpu(device_id);
+        let numa = self.gpu_numa(device_id)?;
         let ctx = CudaContext::new(ordinal).map_err(cuda)?;
         ctx.bind_to_thread().map_err(cuda)?;
         let mut opened = Regions {
@@ -989,34 +514,34 @@ impl PegaEngine {
             let ready = spawn_pinned_worker(
                 format!("gpu{device_id}-obj{name}"),
                 numa,
-                move || Lane::new(&ctx, numa),
-                move |lane| copy_worker(lane, dir, held, rx),
+                move || Lane::new(&ctx),
+                move |lane| copy_worker(lane, device_id, dir, held, rx),
             )?;
             wait_worker_ready(&format!("object {name}"), device_id, ready)?;
             Ok::<_, EngineError>(tx)
         };
         let save = spawn(Direction::DeviceToHost, "save")?;
         let load = spawn(Direction::HostToDevice, "load")?;
-        let socket = self.topology.socket_of(numa);
-        info!(
-            "Registered object device: instance={instance_id} rank={rank} device={device_id} \
-             regions={} numa={numa:?} socket={socket}",
-            regions.list.len(),
-        );
+        let region_count = regions.list.len();
         let device = Device {
             regions,
             numa,
-            socket,
-            placed: self.storage.is_numa_enabled() && numa.is_valid(),
             save,
             load,
         };
-        self.objects
-            .devices
-            .lock()
-            .insert((instance_id.to_string(), rank), Arc::new(device));
+        match self.objects.devices.lock().entry(key) {
+            Entry::Occupied(_) => return Err(already_registered(instance_id, rank)),
+            Entry::Vacant(v) => {
+                v.insert(Arc::new(device));
+            }
+        }
         self.storage.set_has_instance(true);
-        Ok(())
+        let socket = self.topology.socket_of(numa);
+        info!(
+            "Registered object device: instance={instance_id} rank={rank} device={device_id} \
+             regions={region_count} numa={numa} socket={socket}"
+        );
+        Ok((numa, socket))
     }
 
     /// Answer `query` for request `req_id` of `instance_id`, as `QueryPrefetch`
@@ -1044,26 +569,29 @@ impl PegaEngine {
             }
             PartsPoll::Idle => {}
         }
-        let chains: Vec<Vec<Option<Arc<SealedBlock>>>> = plan
+        let resident: Vec<usize> = plan
             .prefixes
             .iter()
-            .map(|c| self.storage.get_blocks_aligned(c))
-            .collect();
-        let resident: Vec<usize> = chains
-            .iter()
-            .map(|c| c.iter().take_while(|b| b.is_some()).count())
+            .map(|c| {
+                self.storage
+                    .contains_keys(c)
+                    .iter()
+                    .take_while(|&&b| b)
+                    .count()
+            })
             .collect();
         let point_keys: Vec<BlockKey> = plan
             .points
             .iter()
             .flat_map(|(_, keys)| keys.iter().cloned())
-            .collect::<std::collections::HashSet<_>>()
+            .collect::<HashSet<_>>()
             .into_iter()
             .collect();
-        let held: std::collections::HashSet<BlockKey> = point_keys
+        let held: HashSet<BlockKey> = point_keys
             .iter()
-            .zip(self.storage.get_blocks_aligned(&point_keys))
-            .filter_map(|(k, b)| b.map(|_| k.clone()))
+            .zip(self.storage.contains_keys(&point_keys))
+            .filter(|&(_, b)| b)
+            .map(|(k, _)| k.clone())
             .collect();
         let in_memory = plan.best(|c| resident[c], |k| held.contains(k));
         let full = match plan.points.len() {
@@ -1093,7 +621,7 @@ impl PegaEngine {
         sets.extend(missing.iter().map(|k| vec![k.clone()]));
         let reach = self.storage.reach(&sets).await;
         let chain_reach: Vec<usize> = resident.iter().zip(&reach).map(|(r, n)| r + n).collect();
-        let reachable: std::collections::HashSet<&BlockKey> = missing
+        let reachable: HashSet<&BlockKey> = missing
             .iter()
             .zip(&reach[plan.prefixes.len()..])
             .filter(|(_, n)| **n == 1)
@@ -1120,7 +648,7 @@ impl PegaEngine {
             })
             .collect();
         if let Some(p) = target.0 {
-            let mut seen = std::collections::HashSet::new();
+            let mut seen = HashSet::new();
             parts.extend(
                 plan.points[p]
                     .1
@@ -1179,17 +707,19 @@ impl PegaEngine {
             |k| points.contains_key(k),
         );
         let mut objects: HashMap<BlockKey, Arc<SealedBlock>> = HashMap::new();
+        let mut slots = Vec::new();
+        let mut lease = |k: &BlockKey, b: &Arc<SealedBlock>| {
+            slots.push(b.slots().len() as u32);
+            objects.insert(k.clone(), Arc::clone(b));
+        };
         for (keys, held) in plan.prefixes.iter().zip(&chains) {
             for (k, b) in keys[..blocks].iter().zip(held) {
-                objects.insert(
-                    k.clone(),
-                    Arc::clone(b.as_ref().expect("leading blocks held")),
-                );
+                lease(k, b.as_ref().expect("leading blocks held"));
             }
         }
         if let Some(p) = point {
             for k in &plan.points[p].1 {
-                objects.insert(k.clone(), Arc::clone(&points[k]));
+                lease(k, &points[k]);
             }
         }
         let metrics = core_metrics();
@@ -1202,329 +732,257 @@ impl PegaEngine {
             blocks: blocks as u32,
             lease: (!objects.is_empty())
                 .then(|| self.query_leases.create_objects(instance_id, objects)),
+            slots,
         }
     }
 
-    /// Copy `writes` from object device `rank` of `instance_id`; returns how
-    /// many objects this save sealed into the cache. Units already claimed by
-    /// another save, and writes to sealed objects, copy nothing.
-    ///
-    /// Dropping the future before it finishes leaves the objects it copies
-    /// into unsealed until [`Self::gc_stale_inflight`] expires them.
+    /// Copy `writes` from object device `rank` of `instance_id` into pinned
+    /// memory on the device's NUMA node and queue them for the insert worker,
+    /// as a KV save does; returns once the copies finish. Writes to objects
+    /// already cached copy nothing. An object seals once all of its slots
+    /// arrived; one whose writers disagree on its slot count keeps the first
+    /// count, and unsealed objects expire with KV inflight blocks.
     pub async fn save_objects(
         &self,
         instance_id: &str,
         rank: u32,
         writes: &[ObjectWrite],
-    ) -> Result<usize, EngineError> {
+    ) -> Result<(), EngineError> {
+        self.query_leases.sweep_expired();
         let start = Instant::now();
         let device = self.objects.device(instance_id, rank)?;
-        let mut shapes = Vec::with_capacity(writes.len());
-        let mut chunks = Vec::with_capacity(writes.len());
         for w in writes {
-            let shape = Shape::of(w)?;
-            let mut of_runs = Vec::with_capacity(w.runs.len());
-            for run in &w.runs {
-                device.check(run)?;
-                of_runs.push(shape.check(run)?);
-            }
-            shapes.push(shape);
-            chunks.push(of_runs);
+            check_write(&device, w)?;
         }
         let keys: Vec<BlockKey> = writes.iter().map(|w| w.key.block_key()).collect();
-        let resident = self.storage.get_blocks_aligned(&keys);
-        let nodes = self.objects.instance_nodes(instance_id);
-        let mut copies = Vec::new();
-        let mut bytes = 0;
-        // (write, pending id) of every object this save copies into.
-        let mut targets = Vec::new();
-        let mut keep: Vec<Arc<PinnedAllocation>> = Vec::new();
-        {
-            let now = Instant::now();
-            let mut pending = self.objects.pending.lock();
-            // Check every write before allocating or claiming anything.
-            let mut plan = Vec::with_capacity(writes.len());
-            for (i, block) in resident.iter().enumerate() {
-                let shape = &shapes[i];
-                let target = if let Some(block) = block {
-                    let stored: Vec<u64> = block
-                        .slots()
-                        .iter()
-                        .map(RawBlock::memory_footprint)
-                        .collect();
-                    if stored != shape.chunks {
-                        return Err(mismatch(&writes[i], format!("chunks {stored:?}")));
-                    }
-                    Target::Resident
-                } else if let Some(p) = pending.objects.get(&keys[i]) {
-                    if p.shape != *shape {
-                        return Err(mismatch(&writes[i], format!("{:?}", p.shape)));
-                    }
-                    Target::Pending
-                } else if let Some((j, _)) = plan
-                    .iter()
-                    .find(|(j, t)| matches!(t, Target::New(..)) && keys[*j] == keys[i])
-                {
-                    // A second write of the same new object in this save.
-                    if shapes[*j] != *shape {
-                        return Err(mismatch(&writes[i], format!("{:?}", shapes[*j])));
-                    }
-                    Target::Pending
-                } else {
-                    let copies = self.objects.placement(&keys[i].namespace, &device, &nodes);
-                    Target::New(
-                        shape
-                            .chunks
-                            .iter()
-                            .map(|&c| NonZeroU64::new(io_len(c)).expect("chunks are nonzero"))
-                            .collect(),
-                        copies,
-                    )
-                };
-                plan.push((i, target));
-            }
-            for (i, target) in plan {
-                let key = &keys[i];
-                match target {
-                    Target::Resident => continue,
-                    Target::Pending => {}
-                    Target::New(sizes, placement) => {
-                        let seed = stripe_seed(&writes[i].key);
-                        let mut copies = Vec::with_capacity(placement.len());
-                        for (socket, nodes) in placement {
-                            let mut allocs = Vec::with_capacity(sizes.len());
-                            for (c, &size) in sizes.iter().enumerate() {
-                                let numa = match nodes.as_slice() {
-                                    [] => None,
-                                    n => Some(n[(seed + c) % n.len()]),
-                                };
-                                let alloc = self.storage.allocate(size, numa).ok_or_else(|| {
-                                    EngineError::Storage(format!(
-                                        "pinned pool cannot hold a {} byte object",
-                                        shapes[i].size
-                                    ))
-                                })?;
-                                allocs.push((alloc, numa.unwrap_or(device.numa)));
-                            }
-                            copies.push((socket, allocs));
-                        }
-                        let (_, chunks) = copies.remove(0);
-                        pending.next_id += 1;
-                        let p = Pending {
-                            id: pending.next_id,
-                            claimed: Bits::new(shapes[i].size / shapes[i].unit),
-                            shape: shapes[i].clone(),
-                            chunks,
-                            replicas: copies,
-                            copying: 0,
-                            touched: now,
-                        };
-                        pending.insert(key.clone(), p);
-                    }
-                }
-                let p = pending.objects.get_mut(key).expect("present above");
-                let before = copies.len();
-                for (run, &chunk) in writes[i].runs.iter().zip(&chunks[i]) {
-                    bytes += p.claim(&device, run, chunk, &mut copies);
-                }
-                if copies.len() > before {
-                    p.copying += 1;
-                    p.touched = now;
-                    targets.push((i, p.id));
-                    keep.extend(p.allocations());
-                }
-            }
+        let resident = self.storage.contains_keys(&keys);
+        let todo: Vec<usize> = (0..writes.len()).filter(|&i| !resident[i]).collect();
+        if todo.is_empty() {
+            return Ok(());
         }
-        let copy = Instant::now();
-        let prep = copy.duration_since(start);
-        let n_copies = copies.len();
-        let result = device
-            .run(Direction::DeviceToHost, copies, Box::new(keep), bytes)
-            .await;
-        let copied = copy.elapsed();
 
-        let mut sealed = Vec::new();
-        let mut replicas = Vec::new();
-        {
-            let mut pending = self.objects.pending.lock();
-            for &(i, id) in &targets {
-                let Some(p) = pending.objects.get_mut(&keys[i]) else {
-                    continue;
-                };
-                // Dropped as stale or failed, and started again while this save copied.
-                if p.id != id {
-                    continue;
-                }
-                if result.is_err() {
-                    // Its claims no longer say which units hold data.
-                    pending.take(&keys[i]);
-                    continue;
-                }
-                p.copying -= 1;
-                p.touched = Instant::now();
-                if p.copying == 0 && p.claimed.complete() {
-                    let (block, copies) = pending.take(&keys[i]).expect("present above").seal();
-                    replicas.extend(
-                        copies
-                            .into_iter()
-                            .map(|(socket, b)| (replica_key(&keys[i], socket), Arc::new(b))),
-                    );
-                    sealed.push((keys[i].clone(), Arc::new(block)));
-                }
+        // Like KV saves: SSD-aligned strides when SSD is on, and one
+        // allocation per (namespace, slot) across this save's objects unless
+        // blockwise, as a KV save allocates once per layer.
+        let pad = self.storage.is_ssd_enabled();
+        let stride = |size: u64| {
+            if pad {
+                size.next_multiple_of(SSD_ALIGNMENT as u64)
+            } else {
+                size
+            }
+        };
+        let mut by_slot: BTreeMap<(&str, u32), Vec<(usize, &SlotWrite)>> = BTreeMap::new();
+        for &i in &todo {
+            for s in &writes[i].writes {
+                by_slot
+                    .entry((keys[i].namespace.as_str(), s.slot))
+                    .or_default()
+                    .push((i, s));
             }
         }
-        result?;
-        let n = self.storage.insert_sealed(&sealed, &replicas);
+        let numa = Some(device.numa);
+        let blockwise = self.storage.blockwise_alloc();
+        let mut copies = Vec::new();
+        let mut keep: Vec<Arc<PinnedAllocation>> = Vec::new();
+        // (write, slot, block, stride) of every slot copied.
+        let mut saved: Vec<(usize, u32, RawBlock, u64)> = Vec::new();
+        let (mut bytes, mut padded) = (0u64, 0u64);
+        for (&(_, slot), list) in &by_slot {
+            let groups: Vec<&[(usize, &SlotWrite)]> = if blockwise {
+                list.chunks(1).collect()
+            } else {
+                vec![&list[..]]
+            };
+            for group in groups {
+                let total: u64 = group.iter().map(|(_, s)| stride(s.size)).sum();
+                let alloc = NonZeroU64::new(total)
+                    .and_then(|n| self.storage.allocate(n, numa))
+                    .ok_or_else(|| {
+                        EngineError::Storage(format!(
+                            "pinned pool exhausted while allocating {total} bytes of object slot {slot}"
+                        ))
+                    })?;
+                let mut at = 0usize;
+                for &(i, s) in group {
+                    let base = alloc.mapped_ptr().add(at);
+                    copies.extend(
+                        s.runs
+                            .iter()
+                            .map(|r| device.copy_of(base.add(r.slot_offset as usize), r)),
+                    );
+                    let len = stride(s.size);
+                    let segment = Segment::new(base.host(), len as usize, Arc::clone(&alloc));
+                    saved.push((i, slot, RawBlock::single_segment(segment), len));
+                    bytes += s.size;
+                    padded += len;
+                    at += len as usize;
+                }
+                keep.push(alloc);
+            }
+        }
+        let prep = start.elapsed();
+        let (reply, done) = oneshot::channel();
+        device.submit(
+            Direction::DeviceToHost,
+            CopyJob {
+                copies,
+                keep: Box::new(keep),
+                bytes,
+                done: LoadCompletion::Channel(reply),
+            },
+        )?;
+        done.await
+            .map_err(|_| EngineError::Storage("object copy worker exited".into()))??;
+
+        let metrics = core_metrics();
+        metrics.save_bytes.add(padded, &[]);
+        metrics
+            .save_duration_seconds
+            .record(start.elapsed().as_secs_f64(), &[]);
         debug!(
-            "save_objects {instance_id}/{rank}: {n_copies} copies, {bytes} bytes: prep {prep:?} \
-             copy {copied:?} finish {:?}, sealed {n} with {} socket copies",
-            copy.elapsed() - copied,
-            replicas.len()
+            "save_objects completed: instance_id={instance_id} rank={rank} objects={} slots={} \
+             bytes={padded} numa={} prep_ms={:.2} total_ms={:.2}",
+            todo.len(),
+            saved.len(),
+            device.numa,
+            prep.as_secs_f64() * 1000.0,
+            start.elapsed().as_secs_f64() * 1000.0,
         );
-        Ok(n)
+
+        // One batch per (namespace, slot count), one layer per slot, as KV
+        // saves send one batch per group.
+        type Layers = BTreeMap<u32, RawSaveLayer>;
+        let mut batches: BTreeMap<(&str, u32), Layers> = BTreeMap::new();
+        for (i, slot, block, len) in saved {
+            let layer = batches
+                .entry((keys[i].namespace.as_str(), writes[i].slots))
+                .or_default()
+                .entry(slot)
+                .or_insert_with(|| RawSaveLayer {
+                    slot_id: slot as usize,
+                    padded_block_size: len as usize,
+                    blocks: Vec::new(),
+                    block_hashes: Vec::new(),
+                });
+            layer.blocks.push(block);
+            layer.block_hashes.push(keys[i].hash.clone());
+        }
+        for ((namespace, slots), layers) in batches {
+            self.storage.send_raw_insert(RawSaveBatch {
+                namespace: namespace.to_string(),
+                total_slots: slots as usize,
+                numa_node: device.numa,
+                layers: layers.into_values().collect(),
+            });
+        }
+        Ok(())
     }
 
     /// Copy objects held by the leases of `loads` into object device `rank`
-    /// of `instance_id`. With `load_state_shm`, returns once the request is
-    /// checked and sets that `LoadState` when the copies finish; otherwise
-    /// returns after them. Loads of a device run in order on their own stream.
-    /// Leases stay valid until released or expired.
-    ///
-    /// A read takes the copy on the device's socket when there is one. Ranks
-    /// reading a whole chunk from another socket mark the object's content
-    /// as one to copy on their socket from then on.
-    pub async fn load_objects(
+    /// of `instance_id`, as a KV load: returns once the request is checked
+    /// and sets the `LoadState` at `load_state_shm` when the copies finish,
+    /// or right away if checking fails. Loads of a device run in order on
+    /// their own stream. Leases stay valid until released or expired.
+    pub fn load_objects(
         &self,
         instance_id: &str,
         rank: u32,
         loads: &[ObjectLoad],
-        load_state_shm: Option<&str>,
+        load_state_shm: &str,
+    ) -> Result<(), EngineError> {
+        crate::submit_with_load_state(load_state_shm, "load_objects", |done| {
+            self.submit_object_loads(instance_id, rank, loads, done)
+        })
+    }
+
+    fn submit_object_loads(
+        &self,
+        instance_id: &str,
+        rank: u32,
+        loads: &[ObjectLoad],
+        done: LoadCompletion,
     ) -> Result<(), EngineError> {
         let device = self.objects.device(instance_id, rank)?;
         let mut copies = Vec::new();
         let mut objects = Vec::new();
         let mut bytes = 0;
-        let mut learned: Vec<String> = Vec::new();
         for l in loads {
             let keys: Vec<BlockKey> = l.reads.iter().map(|r| r.key.block_key()).collect();
             let leased = self
                 .query_leases
                 .leased_objects(instance_id, &l.lease, &keys)
                 .map_err(EngineError::InvalidArgument)?;
-            let local: Vec<BlockKey> = keys.iter().map(|k| replica_key(k, device.socket)).collect();
-            let local = self.storage.get_blocks_aligned(&local);
-            for (((r, leased), local), key) in l.reads.iter().zip(leased).zip(local).zip(&keys) {
-                let leased = leased.ok_or_else(|| {
+            for ((r, block), key) in l.reads.iter().zip(leased).zip(&keys) {
+                let block = block.ok_or_else(|| {
                     EngineError::InvalidArgument(format!("{:?} does not hold {key:?}", l.lease))
                 })?;
-                let block = local.unwrap_or(leased);
-                let sizes: Vec<u64> = block
-                    .slots()
-                    .iter()
-                    .map(RawBlock::memory_footprint)
-                    .collect();
-                let starts = starts(&sizes);
-                let mut read = vec![0u64; sizes.len()];
-                for run in &r.runs {
-                    device.check(run)?;
-                    let (c, numa, at) = run
-                        .ends()
-                        .and_then(|(_, oe)| chunk_of(&starts, &sizes, run.object_offset, oe))
-                        .and_then(|c| {
-                            let base = block.slots()[c].segment_mapped_ptr(0)?;
-                            let at = base.add((run.object_offset - starts[c]) as usize);
-                            Some((c, block.slot_numas()[c], at))
-                        })
-                        .ok_or_else(|| {
-                            EngineError::InvalidArgument(format!(
-                                "run {run:?} is out of bounds or crosses a chunk of {key:?}"
-                            ))
-                        })?;
-                    copies.push((numa, copy_of(&device, at, run)));
-                    let n = run.bytes();
-                    read[c] += n;
-                    bytes += n;
-                }
-                let remote_whole = device.placed
-                    && block.slot_numas().iter().zip(&read).zip(&sizes).any(
-                        |((&numa, &got), &size)| {
-                            got >= size && self.topology.socket_of(numa) != device.socket
-                        },
-                    );
-                if remote_whole {
-                    learned.push(key.namespace.clone());
+                for s in &r.reads {
+                    let slot = block
+                        .slots()
+                        .get(s.slot as usize)
+                        .and_then(|b| Some((b.segment_mapped_ptr(0)?, b.memory_footprint())));
+                    let Some((base, size)) = slot else {
+                        return Err(EngineError::InvalidArgument(format!(
+                            "{key:?} has {} slots, read asks for slot {}",
+                            block.slots().len(),
+                            s.slot
+                        )));
+                    };
+                    for run in &s.runs {
+                        device.check(run, size)?;
+                        copies.push(device.copy_of(base.add(run.slot_offset as usize), run));
+                        bytes += run.bytes();
+                    }
                 }
                 objects.push(block);
             }
         }
-        if !learned.is_empty() {
-            let mut replicated = self.objects.replicated.lock();
-            for namespace in learned {
-                let ranks = replicated
-                    .entry(namespace.clone())
-                    .or_default()
-                    .entry(device.socket)
-                    .or_default();
-                if ranks.insert(rank) && ranks.len() == 2 {
-                    info!(
-                        "objects: ranks on socket {} read {namespace} whole from another \
-                         socket; copying it per socket",
-                        device.socket
-                    );
-                }
-            }
-        }
-        let keep = Box::new(objects);
-        match load_state_shm {
-            Some(name) => device.submit(
-                Direction::HostToDevice,
-                CopyJob {
-                    copies,
-                    keep,
-                    bytes,
-                    done: LoadCompletion::Shm(name.to_string()),
-                },
-            ),
-            None => {
-                device
-                    .run(Direction::HostToDevice, copies, keep, bytes)
-                    .await
-            }
-        }
+        device.submit(
+            Direction::HostToDevice,
+            CopyJob {
+                copies,
+                keep: Box::new(objects),
+                bytes,
+                done,
+            },
+        )
     }
 }
 
-/// Where an object's chunks start striping, so one-chunk objects alternate nodes.
-fn stripe_seed(key: &ObjectKey) -> usize {
-    let mut b = [0; 8];
-    b.copy_from_slice(&key.prefix[..8]);
-    u64::from_le_bytes(b) as usize
-}
-
-fn mismatch(w: &ObjectWrite, stored: String) -> EngineError {
-    EngineError::InvalidArgument(format!(
-        "object {:?} is {stored}, write says size {} unit {} chunks {:?}",
-        w.key, w.size, w.unit, w.chunks
-    ))
-}
-
-/// The copy of `run` between its device region and pinned memory at `at`.
-fn copy_of(device: &Device, at: MappedPinnedPtr, run: &ObjectRun) -> StridedCopy {
-    let dims: Vec<Dim> = run
-        .dims
-        .iter()
-        .map(|d| Dim {
-            count: u64::from(d.count),
-            device_pitch: d.region_stride,
-            host_pitch: d.object_stride,
-        })
-        .collect();
-    StridedCopy::new(
-        device.regions.list[run.region as usize].0 + run.region_offset,
-        at.device().as_ptr() as u64,
-        run.width,
-        &dims,
-    )
+/// `w` names valid slots once each, and every slot's runs lie in the device's
+/// regions and the slot and copy as many bytes as it has.
+fn check_write(device: &Device, w: &ObjectWrite) -> Result<(), EngineError> {
+    let bad = |why: String| {
+        Err(EngineError::InvalidArgument(format!(
+            "object {:?}: {why}",
+            w.key
+        )))
+    };
+    if w.slots == 0 || w.slots > MAX_SLOTS {
+        return bad(format!("{} slots, expected 1 to {MAX_SLOTS}", w.slots));
+    }
+    let mut seen = vec![false; w.slots as usize];
+    for s in &w.writes {
+        if s.slot >= w.slots || std::mem::replace(&mut seen[s.slot as usize], true) {
+            return bad(format!("slot {} is out of range or written twice", s.slot));
+        }
+        if s.size == 0 {
+            return bad(format!("slot {} is empty", s.slot));
+        }
+        let mut copied = 0u64;
+        for run in &s.runs {
+            device.check(run, s.size)?;
+            copied = copied.saturating_add(run.bytes());
+        }
+        if copied != s.size {
+            return bad(format!(
+                "slot {} has {} bytes but its runs copy {copied}",
+                s.slot, s.size
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn open_ipc(handle: &[u8]) -> Result<sys::CUdeviceptr, String> {
@@ -1567,61 +1025,12 @@ fn mapped_size(ptr: sys::CUdeviceptr) -> Result<u64, String> {
 mod tests {
     use super::*;
 
-    fn dim(count: u32, region_stride: u64, object_stride: u64) -> ObjectDim {
+    fn dim(count: u32, region_stride: u64, slot_stride: u64) -> ObjectDim {
         ObjectDim {
             count,
             region_stride,
-            object_stride,
+            slot_stride,
         }
-    }
-
-    fn run(object_offset: u64, width: u64, rows: u32, object_stride: u64) -> ObjectRun {
-        ObjectRun {
-            region: 0,
-            region_offset: 0,
-            object_offset,
-            width,
-            dims: vec![dim(rows, width, object_stride)],
-        }
-    }
-
-    fn write(size: u64, unit: u64, chunks: &[u64]) -> ObjectWrite {
-        ObjectWrite {
-            key: ObjectKey {
-                fingerprint: [0; 32],
-                prefix: [0; 32],
-            },
-            size,
-            unit,
-            chunks: chunks.to_vec(),
-            runs: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn shapes_check_units_and_chunks() {
-        let s = Shape::of(&write(192, 32, &[64, 128])).expect("valid");
-        // Two interleaved heads of 32 bytes, rows 64 apart, inside chunk 1.
-        assert_eq!(s.check(&run(64, 32, 2, 64)).ok(), Some(1));
-        assert_eq!(s.check(&run(0, 64, 1, 0)).ok(), Some(0));
-        for (case, r) in [
-            ("off unit", run(16, 32, 1, 0)),
-            ("crosses chunks", run(32, 64, 1, 0)),
-            ("past the end", run(160, 32, 2, 64)),
-            ("overlapping rows", run(64, 64, 2, 32)),
-        ] {
-            assert!(s.check(&r).is_err(), "{case}");
-        }
-        for (case, w) in [
-            ("unit does not divide", write(192, 40, &[])),
-            ("chunk off unit", write(192, 32, &[48, 144])),
-            ("chunks short", write(192, 32, &[64, 64])),
-            ("zero unit", write(192, 0, &[])),
-            ("too many units", write(MAX_UNITS + 1, 1, &[])),
-        ] {
-            assert!(Shape::of(&w).is_err(), "{case}");
-        }
-        assert_eq!(Shape::of(&write(96, 32, &[])).unwrap().chunks, vec![96]);
     }
 
     #[test]
@@ -1671,25 +1080,11 @@ mod tests {
     }
 
     #[test]
-    fn bits_track_ranges_across_words() {
-        let mut b = Bits::new(130);
-        assert!(b.none(0, 130));
-        b.mark(60, 70);
-        b.mark(65, 128);
-        assert_eq!(b.set, 68);
-        assert!(b.get(60) && b.get(127) && !b.get(59) && !b.get(128));
-        assert!(!b.none(0, 61) && b.none(0, 60) && b.none(128, 130));
-        b.mark(0, 60);
-        b.mark(128, 130);
-        assert!(b.complete());
-    }
-
-    #[test]
     fn runs_reject_overlap_and_overflow() {
         let run = |width, dims: &[ObjectDim]| ObjectRun {
             region: 0,
             region_offset: 0,
-            object_offset: 0,
+            slot_offset: 0,
             width,
             dims: dims.to_vec(),
         };
@@ -1698,20 +1093,11 @@ mod tests {
         // A single step ignores its strides.
         let one = run(8, &[dim(1, u64::MAX, u64::MAX), dim(2, 8, 8)]);
         assert_eq!(one.ends(), Some((16, 16)));
-        assert_eq!(one.row_offsets().collect::<Vec<_>>(), [(0, 0), (8, 8)]);
-        // Heads 64 apart in the region, interleaved with rows in the object.
-        let hnd = run(8, &[dim(4, 8, 16), dim(2, 64, 8)]);
-        assert_eq!(hnd.ends(), Some((96, 64)));
-        let rows: Vec<_> = hnd.row_offsets().collect();
-        let naive: Vec<_> = (0..8u64)
-            .map(|r| (r % 4 * 8 + r / 4 * 64, r % 4 * 16 + r / 4 * 8))
-            .collect();
-        assert_eq!(rows, naive);
-        // Heads interleave with rows in the object: one block in object order.
-        assert_eq!(hnd.object_blocks(), (64, vec![]));
-        // Rows back to back in the object form one block per outer step.
-        let nhd = run(8, &[dim(4, 64, 8), dim(2, 8, 64)]);
-        assert_eq!(nhd.object_blocks(), (32, nhd.dims[1..].to_vec()));
+        // Heads 64 apart in the region, interleaved with rows in the slot.
+        assert_eq!(
+            run(8, &[dim(4, 8, 16), dim(2, 64, 8)]).ends(),
+            Some((96, 64))
+        );
         for (case, r) in [
             ("overlapping rows", run(8, &[dim(2, 4, 8)])),
             ("empty", run(0, &[])),
