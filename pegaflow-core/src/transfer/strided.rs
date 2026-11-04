@@ -2,9 +2,11 @@
 //! [`MAX_DIMS`] dimensions, each with its own pitch on the device and in
 //! mapped pinned host memory.
 //!
-//! Every batch is one kernel launch: each warp copies a chunk of a row through
-//! the mapped host address, so fragments cost no driver call and no shape
-//! needs a heuristic, at the price of occupying SMs during the copy.
+//! Every call is one kernel launch: each warp copies a chunk of a row through
+//! the mapped host address, or, for rows narrower than a chunk, a chunk's
+//! worth of consecutive rows of the first dimension, so fragments cost no
+//! driver call and narrow rows still keep every lane's loads in flight, at
+//! the price of occupying SMs during the copy.
 
 use std::sync::Arc;
 
@@ -26,8 +28,10 @@ const DESC_WORDS: usize = 4 + 3 * MAX_DIMS;
 /// Descriptor `i` is `descs[16 i ..][..16]`: `dst, src, width, first`, then
 /// `count, dst_pitch, src_pitch` per dimension, the first fastest and unused
 /// ones a single step. `first` is the index of its first chunk; chunks of a
-/// row are `CHUNK` bytes, the last one shorter. Warps take chunks in a grid
-/// stride and find their copy by binary search on `first`.
+/// row are `CHUNK` bytes, the last one shorter, and a chunk of a copy whose
+/// rows are narrower than `CHUNK` is `CHUNK / width` consecutive rows of the
+/// first dimension (see [`chunks_of`]). Warps take chunks in a grid stride
+/// and find their copy by binary search on `first`.
 fn kernel_src() -> String {
     format!(
         r#"
@@ -47,8 +51,60 @@ extern "C" __global__ void pega_strided_copy(const unsigned long long* __restric
         }}
         const unsigned long long* r = d + WORDS * lo;
         const unsigned long long width = r[2];
-        const unsigned long long per_row = (width + CHUNK - 1) / CHUNK;
         const unsigned long long k = c - r[3];
+        const unsigned long long d0 = r[4];
+        if (width < CHUNK && d0 > 1) {{
+            // Narrow rows: `per` consecutive rows of dimension 0 per chunk.
+            unsigned long long per = CHUNK / width;
+            if (per > d0) per = d0;
+            const unsigned long long items = (d0 + per - 1) / per;
+            unsigned long long row = k / items;
+            const unsigned long long first = (k - row * items) * per;
+            const unsigned long long rows = d0 - first < per ? d0 - first : per;
+            const unsigned long long dp = r[5], sp = r[6];
+            unsigned long long dst_at = r[0] + first * dp, src_at = r[1] + first * sp;
+            #pragma unroll
+            for (int i = 1; i < DIMS; ++i) {{
+                const unsigned long long* m = r + 4 + 3 * i;
+                if (m[0] == 1) break;
+                const unsigned long long q = row / m[0];
+                const unsigned long long x = row - q * m[0];
+                row = q;
+                dst_at += x * m[1];
+                src_at += x * m[2];
+            }}
+            if (((dst_at | src_at | width | dp | sp) & 15ULL) == 0ULL) {{
+                const unsigned upr = (unsigned)(width >> 4);
+                const unsigned units = (unsigned)rows * upr;
+                unsigned j = lane;
+                for (; j + 96 < units; j += 128) {{
+                    int4 v[4];
+                    int4* to[4];
+                    #pragma unroll
+                    for (int t = 0; t < 4; ++t) {{
+                        const unsigned u = j + 32 * t, q = u / upr;
+                        const unsigned long long off = (unsigned long long)(u - q * upr) << 4;
+                        v[t] = *(const int4*)(src_at + q * sp + off);
+                        to[t] = (int4*)(dst_at + q * dp + off);
+                    }}
+                    #pragma unroll
+                    for (int t = 0; t < 4; ++t) __stcs(to[t], v[t]);
+                }}
+                for (; j < units; j += 32) {{
+                    const unsigned q = j / upr;
+                    const unsigned long long off = (unsigned long long)(j - q * upr) << 4;
+                    __stcs((int4*)(dst_at + q * dp + off), *(const int4*)(src_at + q * sp + off));
+                }}
+            }} else {{
+                for (unsigned long long q = 0; q < rows; ++q) {{
+                    char* __restrict__ dst = (char*)(dst_at + q * dp);
+                    const char* __restrict__ src = (const char*)(src_at + q * sp);
+                    for (unsigned long long j = lane; j < width; j += 32) dst[j] = src[j];
+                }}
+            }}
+            continue;
+        }}
+        const unsigned long long per_row = (width + CHUNK - 1) / CHUNK;
         unsigned long long row = k / per_row;
         const unsigned long long at = (k - row * per_row) * CHUNK;
         const unsigned long long size = width - at < CHUNK ? width - at : CHUNK;
@@ -171,7 +227,7 @@ impl StridedCopy {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Direction {
     HostToDevice,
     DeviceToHost,
@@ -206,45 +262,37 @@ impl StridedCopier {
         })
     }
 
-    /// Enqueue `batches`, one launch each in order, behind one descriptor
-    /// upload; the caller synchronizes `stream`.
+    /// Enqueue `copies` as one launch; the caller synchronizes `stream`.
     pub(crate) fn copy(
         &mut self,
-        batches: &[&[StridedCopy]],
+        copies: &[StridedCopy],
         dir: Direction,
         stream: &Arc<CudaStream>,
     ) -> Result<(), String> {
-        // (descriptor offset, descriptors, chunks) per launch.
-        let mut launches = Vec::with_capacity(batches.len());
+        let h2d = dir == Direction::HostToDevice;
         let mut descs: Vec<u64> = Vec::new();
-        for batch in batches {
-            let at = descs.len();
-            let mut chunks = 0u64;
-            for c in joined(batch) {
-                let h2d = dir == Direction::HostToDevice;
-                let (dst, src) = if h2d {
-                    (c.device, c.host_device)
+        let mut chunks = 0u64;
+        for c in joined(copies) {
+            let (dst, src) = if h2d {
+                (c.device, c.host_device)
+            } else {
+                (c.host_device, c.device)
+            };
+            descs.extend_from_slice(&[dst, src, c.width, chunks]);
+            for d in &c.dims {
+                let (dp, sp) = if h2d {
+                    (d.device_pitch, d.host_pitch)
                 } else {
-                    (c.host_device, c.device)
+                    (d.host_pitch, d.device_pitch)
                 };
-                descs.extend_from_slice(&[dst, src, c.width, chunks]);
-                for d in &c.dims {
-                    let (dp, sp) = if h2d {
-                        (d.device_pitch, d.host_pitch)
-                    } else {
-                        (d.host_pitch, d.device_pitch)
-                    };
-                    descs.extend_from_slice(&[d.count, dp, sp]);
-                }
-                chunks += c.width.div_ceil(CHUNK) * c.rows();
+                descs.extend_from_slice(&[d.count, dp, sp]);
             }
-            if chunks > 0 {
-                launches.push((at, ((descs.len() - at) / DESC_WORDS) as u64, chunks));
-            }
+            chunks += chunks_of(&c);
         }
-        if launches.is_empty() {
+        if chunks == 0 {
             return Ok(());
         }
+        let n = (descs.len() / DESC_WORDS) as u64;
         if self.scratch.as_ref().is_none_or(|s| s.len() < descs.len()) {
             self.scratch = Some(
                 stream
@@ -253,8 +301,8 @@ impl StridedCopier {
             );
         }
         let scratch = self.scratch.as_mut().expect("allocated above");
-        // One upload for every launch of the transfer. The source is pageable,
-        // so the driver consumes it before returning, as in `KernelBackend`.
+        // The source is pageable, so the driver consumes it before returning,
+        // as in `KernelBackend`.
         stream
             .memcpy_htod(&descs, scratch)
             .map_err(|e| format!("descriptor upload failed: {e:?}"))?;
@@ -266,22 +314,32 @@ impl StridedCopier {
             Direction::HostToDevice => MAX_GRID,
             Direction::DeviceToHost => self.d2h_grid,
         };
-        for (at, n, chunks) in launches {
-            let grid = chunks.div_ceil(warps_per_block).clamp(1, max_grid) as u32;
-            let cfg = LaunchConfig {
-                grid_dim: (grid, 1, 1),
-                block_dim: (BLOCK_DIM, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            let view = scratch.slice(at..);
-            let mut builder = stream.launch_builder(&self.func);
-            builder.arg(&view).arg(&n).arg(&chunks);
-            // SAFETY: the kernel reads `n` descriptors from `view` and copies
-            // validated rows between device memory and mapped pinned memory,
-            // which the caller keeps alive until it synchronizes the stream.
-            unsafe { builder.launch(cfg) }.map_err(|e| format!("kernel launch failed: {e:?}"))?;
-        }
+        let grid = chunks.div_ceil(warps_per_block).clamp(1, max_grid) as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (BLOCK_DIM, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = stream.launch_builder(&self.func);
+        builder.arg(&*scratch).arg(&n).arg(&chunks);
+        // SAFETY: the kernel reads `n` descriptors from `scratch` and copies
+        // validated rows between device memory and mapped pinned memory,
+        // which the caller keeps alive until it synchronizes the stream.
+        unsafe { builder.launch(cfg) }.map_err(|e| format!("kernel launch failed: {e:?}"))?;
         Ok(())
+    }
+}
+
+/// Work items of `c` as the kernel cuts it: rows narrower than [`CHUNK`]
+/// go `CHUNK / width` consecutive rows of the first dimension to an item,
+/// wider ones a [`CHUNK`] of one row.
+fn chunks_of(c: &StridedCopy) -> u64 {
+    let d0 = if c.ndims > 0 { c.dims[0].count } else { 1 };
+    if c.width < CHUNK && d0 > 1 {
+        let per = (CHUNK / c.width).min(d0);
+        d0.div_ceil(per) * (c.rows() / d0)
+    } else {
+        c.width.div_ceil(CHUNK) * c.rows()
     }
 }
 
