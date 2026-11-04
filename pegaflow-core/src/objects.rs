@@ -497,15 +497,15 @@ fn already_registered(instance: &str, rank: u32) -> EngineError {
 impl PegaEngine {
     /// Open `regions` (IPC handle, size) of device `device_id` as object
     /// device `rank` of `instance_id`. A rank registers once until its
-    /// instance is unregistered or its session ends. Returns the CPU socket
-    /// of the GPU's NUMA node, where saves of the device allocate.
+    /// instance is unregistered or its session ends. Returns the GPU's NUMA
+    /// node, where saves of the device allocate, and its CPU socket.
     pub fn register_object_device(
         &self,
         instance_id: &str,
         rank: u32,
         device_id: i32,
         regions: &[(Vec<u8>, u64)],
-    ) -> Result<u32, EngineError> {
+    ) -> Result<(NumaNode, u32), EngineError> {
         let key = (instance_id.to_string(), rank);
         if self.objects.devices.lock().contains_key(&key) {
             return Err(already_registered(instance_id, rank));
@@ -573,7 +573,7 @@ impl PegaEngine {
             "Registered object device: instance={instance_id} rank={rank} device={device_id} \
              regions={region_count} numa={numa} socket={socket}"
         );
-        Ok(socket)
+        Ok((numa, socket))
     }
 
     /// Answer `query` for request `req_id` of `instance_id`, as `QueryPrefetch`
