@@ -20,7 +20,7 @@ use log::{debug, info, warn};
 use pegaflow_core::{
     EngineError, LayerSave, ObjectDim, ObjectKey, ObjectLoad, ObjectPoint, ObjectQuery,
     ObjectQueryStatus, ObjectRead, ObjectRun, ObjectWrite, PegaEngine, PrefetchStatus,
-    QueryLeaseId,
+    QueryLeaseId, SlotRead, SlotWrite,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -190,22 +190,60 @@ impl GrpcEngineService {
         })
     }
 
-    fn object_runs(runs: Vec<crate::proto::engine::ObjectRun>) -> Vec<ObjectRun> {
-        runs.into_iter()
-            .map(|r| ObjectRun {
-                region: r.region,
-                region_offset: r.region_offset,
-                object_offset: r.object_offset,
-                width: r.width,
-                dims: r
-                    .dims
-                    .into_iter()
-                    .map(|d| ObjectDim {
-                        count: d.count,
-                        region_stride: d.region_stride,
-                        object_stride: d.object_stride,
-                    })
-                    .collect(),
+    fn object_writes(
+        writes: Vec<crate::proto::engine::ObjectWrite>,
+    ) -> Result<Vec<ObjectWrite>, Status> {
+        writes
+            .into_iter()
+            .map(|w| {
+                let mut words = Words::new(&w.writes);
+                let mut slots = Vec::new();
+                while !words.done() {
+                    let slot = words.u32("slot")?;
+                    let size = words.next("slot size")?;
+                    slots.push(SlotWrite {
+                        slot,
+                        size,
+                        runs: words.runs()?,
+                    });
+                }
+                Ok(ObjectWrite {
+                    key: Self::object_key(w.key)?,
+                    slots: w.slots,
+                    writes: slots,
+                })
+            })
+            .collect()
+    }
+
+    fn object_loads(
+        loads: Vec<crate::proto::engine::ObjectLoad>,
+    ) -> Result<Vec<ObjectLoad>, Status> {
+        loads
+            .into_iter()
+            .map(|l| {
+                Ok(ObjectLoad {
+                    lease: QueryLeaseId::from_bytes(&l.lease).map_err(Status::invalid_argument)?,
+                    reads: l
+                        .reads
+                        .into_iter()
+                        .map(|r| {
+                            let mut words = Words::new(&r.reads);
+                            let mut slots = Vec::new();
+                            while !words.done() {
+                                let slot = words.u32("slot")?;
+                                slots.push(SlotRead {
+                                    slot,
+                                    runs: words.runs()?,
+                                });
+                            }
+                            Ok(ObjectRead {
+                                key: Self::object_key(r.key)?,
+                                reads: slots,
+                            })
+                        })
+                        .collect::<Result<_, Status>>()?,
+                })
             })
             .collect()
     }
@@ -233,18 +271,6 @@ impl GrpcEngineService {
                 })
                 .collect::<Result<_, Status>>()?,
         })
-    }
-
-    fn log_rpc<T>(name: &str, result: &Result<T, Status>, start: Instant) {
-        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-        match result {
-            Ok(_) => debug!("RPC [{name}] completed: ok elapsed_ms={elapsed_ms:.2}"),
-            Err(status) => warn!(
-                "RPC [{name}] failed: code={} message={} elapsed_ms={elapsed_ms:.2}",
-                status.code(),
-                status.message(),
-            ),
-        }
     }
 
     fn build_register_context_response() -> RegisterContextResponse {
@@ -1162,30 +1188,57 @@ impl Engine for GrpcEngineService {
     ) -> Result<Response<RegisterObjectDeviceResponse>, Status> {
         let start = Instant::now();
         let req = request.into_inner();
-        let result = async {
+        let (instance_id, rank, device_id) = (req.instance_id, req.rank, req.device_id);
+        let region_count = req.regions.len();
+
+        let fut = async {
             Self::validate_client_version(&req.client_version)?;
-            Self::validate_device_id(req.device_id)?;
-            if req.instance_id.is_empty() {
+            Self::validate_device_id(device_id)?;
+            if instance_id.is_empty() {
                 return Err(Status::invalid_argument("instance_id must not be empty"));
             }
+            info!(
+                "RPC [register_object_device]: instance_id={} rank={} device_id={} regions={}",
+                instance_id, rank, device_id, region_count
+            );
             let regions: Vec<(Vec<u8>, u64)> = req
                 .regions
                 .into_iter()
                 .map(|r| (r.ipc_handle, r.size))
                 .collect();
-            let (instance_id, rank, device_id) = (req.instance_id, req.rank, req.device_id);
             // Opening IPC handles and starting the copy workers block.
             let engine = Arc::clone(&self.engine);
-            tokio::task::spawn_blocking(move || {
-                engine.register_object_device(&instance_id, rank, device_id, &regions)
+            let instance = instance_id.clone();
+            let (numa, socket) = tokio::task::spawn_blocking(move || {
+                engine.register_object_device(&instance, rank, device_id, &regions)
             })
             .await
             .map_err(|e| Status::internal(format!("register task panicked: {e}")))?
             .map_err(Self::map_engine_error)?;
-            Ok(Response::new(RegisterObjectDeviceResponse {}))
+            Ok(Response::new(RegisterObjectDeviceResponse {
+                numa_node: if numa.is_valid() {
+                    i32::try_from(numa.0).unwrap_or(-1)
+                } else {
+                    -1
+                },
+                socket,
+            }))
+        };
+
+        let result = fut.await;
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        match &result {
+            Ok(_) => info!(
+                "RPC [register_object_device] completed: ok instance_id={} rank={} elapsed_ms={:.2}",
+                instance_id, rank, elapsed_ms
+            ),
+            Err(status) => warn!(
+                "RPC [register_object_device] failed: code={} message={} elapsed_ms={:.2}",
+                status.code(),
+                status.message(),
+                elapsed_ms
+            ),
         }
-        .await;
-        Self::log_rpc("register_object_device", &result, start);
         record_rpc_result("register_object_device", &result, start);
         result
     }
@@ -1194,13 +1247,30 @@ impl Engine for GrpcEngineService {
         &self,
         request: Request<QueryObjectsRequest>,
     ) -> Result<Response<QueryObjectsResponse>, Status> {
-        let start = Instant::now();
         let req = request.into_inner();
-        let result = async {
-            if req.req_id.is_empty() {
-                return Err(Status::invalid_argument("req_id is empty"));
+        let chain_keys: usize = req.prefixes.iter().map(|c| c.keys.len()).sum();
+        trace_root!("rpc.query_objects", root, || {
+            [
+                ("instance_id", req.instance_id.clone()),
+                ("chain_keys", chain_keys.to_string()),
+                ("points", req.points.len().to_string()),
+            ]
+        });
+
+        let start = Instant::now();
+        let (instance_id, req_id) = (req.instance_id.clone(), req.req_id.clone());
+        let fut = async {
+            if req_id.is_empty() {
+                return Err(Status::invalid_argument("req_id must not be empty"));
             }
-            let (instance_id, req_id) = (req.instance_id.clone(), req.req_id.clone());
+            debug!(
+                "RPC [query_objects]: instance_id={} req_id={} chains={} chain_keys={} points={}",
+                instance_id,
+                req_id,
+                req.prefixes.len(),
+                chain_keys,
+                req.points.len()
+            );
             let query = Self::object_query(req)?;
             let status = self
                 .engine
@@ -1215,18 +1285,44 @@ impl Engine for GrpcEngineService {
                     point,
                     blocks,
                     lease,
+                    slots,
                 } => query_objects_response::Outcome::Ready(ObjectsReady {
                     point: point.map_or(-1, |p| i32::try_from(p).unwrap_or(i32::MAX)),
                     blocks,
                     lease: lease.map(|l| l.to_bytes().to_vec()).unwrap_or_default(),
+                    slots,
                 }),
             };
             Ok(Response::new(QueryObjectsResponse {
                 outcome: Some(outcome),
             }))
+        };
+
+        let result: Result<Response<QueryObjectsResponse>, Status> =
+            trace_in_span!(root, fut).await;
+
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        match &result {
+            Ok(resp) => match &resp.get_ref().outcome {
+                Some(query_objects_response::Outcome::Ready(ready)) => debug!(
+                    "RPC [query_objects] completed: ready point={} blocks={} objects={} elapsed_ms={:.2}",
+                    ready.point,
+                    ready.blocks,
+                    ready.slots.len(),
+                    elapsed_ms
+                ),
+                _ => debug!(
+                    "RPC [query_objects] completed: loading elapsed_ms={:.2}",
+                    elapsed_ms
+                ),
+            },
+            Err(status) => warn!(
+                "RPC [query_objects] failed: code={} message={} elapsed_ms={:.2}",
+                status.code(),
+                status.message(),
+                elapsed_ms
+            ),
         }
-        .await;
-        Self::log_rpc("query_objects", &result, start);
         record_rpc_result("query_objects", &result, start);
         result
     }
@@ -1236,36 +1332,52 @@ impl Engine for GrpcEngineService {
         request: Request<SaveObjectsRequest>,
     ) -> Result<Response<SaveObjectsResponse>, Status> {
         let start = Instant::now();
+
         let req = request.into_inner();
-        let result = async {
-            let writes = req
-                .writes
-                .into_iter()
-                .map(|w| {
-                    Ok(ObjectWrite {
-                        key: Self::object_key(w.key)?,
-                        size: w.size,
-                        unit: w.unit,
-                        chunks: w.chunks,
-                        runs: Self::object_runs(w.runs),
-                    })
-                })
-                .collect::<Result<Vec<_>, Status>>()?;
-            let (instance_id, rank) = (req.instance_id, req.rank);
-            // Run to the end even if the client goes away, so the objects
-            // it copies into can seal.
-            let engine = Arc::clone(&self.engine);
-            let sealed =
-                tokio::spawn(async move { engine.save_objects(&instance_id, rank, &writes).await })
-                    .await
-                    .map_err(|e| Status::internal(format!("save task panicked: {e}")))?
-                    .map_err(Self::map_engine_error)?;
-            Ok(Response::new(SaveObjectsResponse {
-                sealed: u32::try_from(sealed).unwrap_or(u32::MAX),
-            }))
+        let object_count = req.writes.len();
+        let slot_count: usize = req.writes.iter().map(|w| w.writes.len()).sum();
+
+        trace_root!("rpc.save_objects", root, || {
+            [
+                ("instance_id", req.instance_id.clone()),
+                ("objects", object_count.to_string()),
+                ("slots", slot_count.to_string()),
+            ]
+        });
+
+        let fut = async {
+            let SaveObjectsRequest {
+                instance_id,
+                rank,
+                writes,
+            } = req;
+            debug!(
+                "RPC [save_objects]: instance_id={} rank={} objects={} slots={}",
+                instance_id, rank, object_count, slot_count
+            );
+            let writes = Self::object_writes(writes)?;
+            self.engine
+                .save_objects(&instance_id, rank, &writes)
+                .await
+                .map_err(Self::map_engine_error)?;
+            Ok(Response::new(SaveObjectsResponse {}))
+        };
+
+        let result: Result<Response<SaveObjectsResponse>, Status> = trace_in_span!(root, fut).await;
+
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        match &result {
+            Ok(_) => debug!(
+                "RPC [save_objects] completed: ok objects={} slots={} elapsed_ms={:.2}",
+                object_count, slot_count, elapsed_ms
+            ),
+            Err(status) => warn!(
+                "RPC [save_objects] failed: code={} message={} elapsed_ms={:.2}",
+                status.code(),
+                status.message(),
+                elapsed_ms
+            ),
         }
-        .await;
-        Self::log_rpc("save_objects", &result, start);
         record_rpc_result("save_objects", &result, start);
         result
     }
@@ -1275,40 +1387,137 @@ impl Engine for GrpcEngineService {
         request: Request<LoadObjectsRequest>,
     ) -> Result<Response<LoadObjectsResponse>, Status> {
         let start = Instant::now();
+
         let req = request.into_inner();
-        let result = async {
-            let loads = req
-                .loads
-                .into_iter()
-                .map(|l| {
-                    Ok(ObjectLoad {
-                        lease: QueryLeaseId::from_bytes(&l.lease)
-                            .map_err(Status::invalid_argument)?,
-                        reads: l
-                            .reads
-                            .into_iter()
-                            .map(|r| {
-                                Ok(ObjectRead {
-                                    key: Self::object_key(r.key)?,
-                                    runs: Self::object_runs(r.runs),
-                                })
-                            })
-                            .collect::<Result<_, Status>>()?,
-                    })
-                })
-                .collect::<Result<Vec<_>, Status>>()?;
-            let (instance_id, rank, shm) = (req.instance_id, req.rank, req.load_state_shm);
-            let shm = (!shm.is_empty()).then_some(shm.as_str());
+        let load_count = req.loads.len();
+        let object_count: usize = req.loads.iter().map(|l| l.reads.len()).sum();
+
+        trace_root!("rpc.load_objects", root, || {
+            [
+                ("instance_id", req.instance_id.clone()),
+                ("loads", load_count.to_string()),
+                ("objects", object_count.to_string()),
+            ]
+        });
+
+        let fut = async {
+            let LoadObjectsRequest {
+                instance_id,
+                rank,
+                loads,
+                load_state_shm,
+            } = req;
+            if load_state_shm.is_empty() {
+                return Err(Status::invalid_argument("load_state_shm must not be empty"));
+            }
+            debug!(
+                "RPC [load_objects]: instance_id={} rank={} loads={} objects={} load_state_shm_len={}",
+                instance_id,
+                rank,
+                load_count,
+                object_count,
+                load_state_shm.len()
+            );
+            let loads = Self::object_loads(loads)?;
             self.engine
-                .load_objects(&instance_id, rank, &loads, shm)
-                .await
+                .load_objects(&instance_id, rank, &loads, &load_state_shm)
                 .map_err(Self::map_engine_error)?;
             Ok(Response::new(LoadObjectsResponse {}))
+        };
+
+        let result: Result<Response<LoadObjectsResponse>, Status> = trace_in_span!(root, fut).await;
+
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        match &result {
+            Ok(_) => debug!(
+                "RPC [load_objects] completed: ok loads={} objects={} elapsed_ms={:.2}",
+                load_count, object_count, elapsed_ms
+            ),
+            Err(status) => warn!(
+                "RPC [load_objects] failed: code={} message={} elapsed_ms={:.2}",
+                status.code(),
+                status.message(),
+                elapsed_ms
+            ),
         }
-        .await;
-        Self::log_rpc("load_objects", &result, start);
         record_rpc_result("load_objects", &result, start);
         result
+    }
+}
+
+/// Words of a run without dimensions, and per dimension.
+const RUN_WORDS: usize = 5;
+const DIM_WORDS: usize = 3;
+
+/// A reader of the packed slot words of an object write or read.
+struct Words<'a> {
+    words: &'a [u64],
+}
+
+impl<'a> Words<'a> {
+    fn new(words: &'a [u64]) -> Self {
+        Self { words }
+    }
+
+    fn done(&self) -> bool {
+        self.words.is_empty()
+    }
+
+    fn next(&mut self, what: &str) -> Result<u64, Status> {
+        let (&w, rest) = self
+            .words
+            .split_first()
+            .ok_or_else(|| Status::invalid_argument(format!("slot words end before {what}")))?;
+        self.words = rest;
+        Ok(w)
+    }
+
+    fn u32(&mut self, what: &str) -> Result<u32, Status> {
+        let w = self.next(what)?;
+        u32::try_from(w)
+            .map_err(|_| Status::invalid_argument(format!("{what} {w} does not fit 32 bits")))
+    }
+
+    /// A run count and that many runs.
+    fn runs(&mut self) -> Result<Vec<ObjectRun>, Status> {
+        let n = self.next("run count")?;
+        // Every run takes at least RUN_WORDS words: a count past what is left is malformed.
+        if n > (self.words.len() / RUN_WORDS) as u64 {
+            return Err(Status::invalid_argument(format!(
+                "run count {n} exceeds the slot words left"
+            )));
+        }
+        (0..n).map(|_| self.run()).collect()
+    }
+
+    fn run(&mut self) -> Result<ObjectRun, Status> {
+        let region = self.u32("run region")?;
+        let region_offset = self.next("run region offset")?;
+        let slot_offset = self.next("run slot offset")?;
+        let width = self.next("run width")?;
+        // The engine bounds the dims; here only the words left bound them.
+        let ndims = self.next("run dims")?;
+        if ndims > (self.words.len() / DIM_WORDS) as u64 {
+            return Err(Status::invalid_argument(format!(
+                "run has {ndims} dims, past the slot words left"
+            )));
+        }
+        let dims = (0..ndims)
+            .map(|_| {
+                Ok(ObjectDim {
+                    count: self.u32("dim count")?,
+                    region_stride: self.next("dim region stride")?,
+                    slot_stride: self.next("dim slot stride")?,
+                })
+            })
+            .collect::<Result<_, Status>>()?;
+        Ok(ObjectRun {
+            region,
+            region_offset,
+            slot_offset,
+            width,
+            dims,
+        })
     }
 }
 

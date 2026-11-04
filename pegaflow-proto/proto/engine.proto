@@ -254,15 +254,17 @@ message ReleaseTransferLockResponse {
 
 // ---- Byte-addressed objects ----
 //
-// An object is an opaque byte string keyed by (fingerprint, prefix). Clients
-// copy strided byte runs between registered device regions and objects; the
-// server never interprets layers, ranks or layouts. An object becomes visible
-// to QueryObjects once its writes, possibly from several devices, cover every
-// unit. Objects share the pinned pool, LRU, lease machinery, SSD cache and
-// MetaServer registration with blocks: QueryObjects brings an object evicted
-// from memory back from a peer or SSD. Leases are released with Release;
-// UnregisterContext and Session drop an instance's object devices like its KV
-// contexts.
+// An object is an opaque byte string keyed by (fingerprint, prefix) and cut
+// into slots, as a KV block is cut into layers x ranks slots. Clients copy
+// strided byte runs between registered device regions and slots; the server
+// never interprets layers, ranks or layouts. A save writes whole slots into
+// pinned memory on the saving device's NUMA node, and an object becomes
+// visible to QueryObjects once all of its slots arrived, possibly from
+// several devices. Objects share the pinned pool, LRU, lease machinery, SSD
+// cache and MetaServer registration with blocks: QueryObjects brings an
+// object evicted from memory back from a peer or SSD. Leases are released
+// with Release; UnregisterContext and Session drop an instance's object
+// devices like its KV contexts.
 
 message ObjectKey {
   // 32-byte digest of everything that decides the object's bytes besides the
@@ -278,6 +280,7 @@ message DeviceRegion {
   uint64 size = 2;
 }
 
+// Registers a rank once until its instance is unregistered or its session ends.
 message RegisterObjectDeviceRequest {
   // Must equal the server's version exactly.
   string client_version = 1;
@@ -287,7 +290,13 @@ message RegisterObjectDeviceRequest {
   repeated DeviceRegion regions = 5;
 }
 
-message RegisterObjectDeviceResponse {}
+message RegisterObjectDeviceResponse {
+  // NUMA node of the GPU, where saves of this device allocate; -1 when
+  // unknown (NUMA-aware allocation off and no affinity detected).
+  int32 numa_node = 1;
+  // CPU socket of that node; 0 when unknown.
+  uint32 socket = 2;
+}
 
 message ObjectKeyList {
   repeated ObjectKey keys = 1;
@@ -325,6 +334,9 @@ message ObjectsReady {
   // Holds those blocks and the point's keys until Release or expiry; empty
   // when it would hold nothing.
   bytes lease = 3;
+  // Slot count of every object the lease holds: the leading `blocks` keys
+  // of each chain in turn, then the point's keys.
+  repeated uint32 slots = 4;
 }
 
 message QueryObjectsResponse {
@@ -334,45 +346,31 @@ message QueryObjectsResponse {
   }
 }
 
-// count steps of region_stride bytes in the device region and object_stride
-// bytes in the object; the strides are ignored when count is 1.
-message ObjectDim {
-  uint32 count = 1;
-  uint64 region_stride = 2;
-  uint64 object_stride = 3;
-}
-
-// Rows of width bytes over at most 4 dims, the first fastest: row
-// (i_0, i_1, ..) is at region_offset + sum(i_d * region_stride_d) of the
-// device region and object_offset + sum(i_d * object_stride_d) of the object.
-// No dims is one row. On each side no two rows may overlap.
-message ObjectRun {
-  uint32 region = 1;
-  uint64 region_offset = 2;
-  uint64 object_offset = 3;
-  uint64 width = 4;
-  repeated ObjectDim dims = 5;
-}
+// Slots and their runs travel as packed words, as KV saves send block ids:
+// one message per slot and run costs more to encode and decode than the
+// copy plan is worth at tens of thousands of slots per request.
+//
+// A run is `region, region_offset, slot_offset, width, ndims` and then
+// `count, region_stride, slot_stride` per dim, at most 4 dims, the first
+// fastest: row (i_0, i_1, ..) is at region_offset + sum(i_d * region_stride_d)
+// of the device region and slot_offset + sum(i_d * slot_stride_d) of the
+// slot. No dims is one row. On each side no two rows may overlap.
 
 message ObjectWrite {
   ObjectKey key = 1;
-  // Bytes of the whole object.
-  uint64 size = 2;
-  repeated ObjectRun runs = 3;
-  // Coverage granule in bytes: it divides every chunk and every run's object
-  // offset, width and object stride. A run whose units are all written
-  // already copies nothing.
-  uint64 unit = 4;
-  // Sizes of the object's chunks in order, summing to size; empty for one
-  // chunk. Each chunk is stored apart and every run lies inside one.
-  repeated uint64 chunks = 5;
-  // size, unit and chunks are decided by the client and every writer of a
-  // key must send the same ones.
+  // Slots of the whole object; every writer of a key sends the same count.
+  uint32 slots = 2;
+  // The slots this device writes, each once, back to back: `slot, size,
+  // nruns` and then `nruns` runs. A slot's runs copy each of its size bytes
+  // once.
+  repeated uint64 writes = 3;
 }
 
 message ObjectRead {
   ObjectKey key = 1;
-  repeated ObjectRun runs = 2;
+  // The slots this device reads, back to back: `slot, nruns` and then
+  // `nruns` runs.
+  repeated uint64 reads = 2;
 }
 
 message SaveObjectsRequest {
@@ -381,10 +379,7 @@ message SaveObjectsRequest {
   repeated ObjectWrite writes = 3;
 }
 
-message SaveObjectsResponse {
-  // Objects this save completed.
-  uint32 sealed = 1;
-}
+message SaveObjectsResponse {}
 
 message ObjectLoad {
   // A lease of this instance holding every key read.
@@ -397,8 +392,7 @@ message LoadObjectsRequest {
   uint32 rank = 2;
   repeated ObjectLoad loads = 3;
   // A LoadState the server sets once the copies finish or fail; the reply
-  // then comes as soon as the request is validated. Empty: reply after the
-  // copies finish.
+  // comes as soon as the request is checked.
   string load_state_shm = 4;
 }
 
@@ -428,9 +422,10 @@ service Engine {
   // Find the last resume point whose objects exist, bring them into memory
   // and lease them.
   rpc QueryObjects(QueryObjectsRequest) returns (QueryObjectsResponse);
-  // Copy device bytes into objects; returns after the copies complete.
+  // Copy device bytes into object slots; returns after the copies complete,
+  // and the objects seal asynchronously as KV blocks do.
   rpc SaveObjects(SaveObjectsRequest) returns (SaveObjectsResponse);
-  // Copy leased objects into device memory; returns after the copies complete.
+  // Copy leased objects into device memory, completing a LoadState as Load does.
   rpc LoadObjects(LoadObjectsRequest) returns (LoadObjectsResponse);
 }
 

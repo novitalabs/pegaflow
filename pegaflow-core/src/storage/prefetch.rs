@@ -298,29 +298,36 @@ impl PrefetchScheduler {
             warn!("Parts prefetch task failed for req_id={req_id}: {e}");
             PartsResult::default()
         });
-        // As in `poll_prefetch`: peer-served blocks stay retained and are
-        // re-advertised; SSD-served ones were registered when saved here.
-        let resident = read_cache.batch_insert_refs(&result.rdma);
-        if let Some(client) = &self.metaserver_client {
-            let mut by_namespace: HashMap<&str, Vec<BlockKey>> = HashMap::new();
-            for key in &resident {
-                by_namespace
-                    .entry(key.namespace.as_str())
-                    .or_default()
-                    .push(key.clone());
-            }
-            for keys in by_namespace.into_values() {
-                if let Some((namespace, hashes)) =
-                    rdma_registration_from_resident_keys(Some(PrefetchSource::Rdma), &keys)
-                {
-                    client.try_register_namespace_without_reclaim_hint(namespace, hashes);
-                }
-            }
-        }
+        // As in `poll_existing`: SSD-served blocks were registered when saved here.
+        self.admit_rdma(read_cache, &result.rdma);
         read_cache.batch_insert(result.ssd.clone());
         let mut fetched = result.rdma;
         fetched.extend(result.ssd);
         PartsPoll::Done(fetched)
+    }
+
+    /// Admit blocks peers served: retained like local inserts, so cache
+    /// pressure does not prefer them over blocks exposed as P2P sources, and
+    /// the resident ones re-advertised so peers can fetch them from here too.
+    fn admit_rdma(&self, read_cache: &ReadCache, blocks: &PrefetchResult) {
+        let resident = read_cache.batch_insert_refs(blocks);
+        let Some(client) = &self.metaserver_client else {
+            return;
+        };
+        let mut by_namespace: Vec<(&str, Vec<BlockKey>)> = Vec::new();
+        for key in &resident {
+            match by_namespace.iter_mut().find(|(ns, _)| *ns == key.namespace) {
+                Some((_, keys)) => keys.push(key.clone()),
+                None => by_namespace.push((key.namespace.as_str(), vec![key.clone()])),
+            }
+        }
+        for (_, keys) in by_namespace {
+            if let Some((namespace, hashes)) =
+                rdma_registration_from_resident_keys(Some(PrefetchSource::Rdma), &keys)
+            {
+                client.try_register_namespace_without_reclaim_hint(namespace, hashes);
+            }
+        }
     }
 
     pub(super) async fn check_and_prefetch(
@@ -406,18 +413,10 @@ impl PrefetchScheduler {
         // so peers can discover and fetch from here too. SSD prefetch is
         // skipped: those blocks were already registered by this node's own save
         // path, and eviction explicitly unregisters them.
-        let rdma_registration = if result.source == Some(PrefetchSource::Rdma) {
-            let resident_keys = read_cache.batch_insert_refs(&result.cache_inserts);
-            rdma_registration_from_resident_keys(result.source, &resident_keys)
+        if result.source == Some(PrefetchSource::Rdma) {
+            self.admit_rdma(read_cache, &result.cache_inserts);
         } else {
             read_cache.batch_insert(result.cache_inserts);
-            None
-        };
-
-        if let Some(client) = &self.metaserver_client
-            && let Some((namespace, hashes)) = rdma_registration
-        {
-            client.try_register_namespace_without_reclaim_hint(namespace, hashes);
         }
 
         PollResult::Ready(PrefetchStatus::Ready {

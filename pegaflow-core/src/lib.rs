@@ -47,7 +47,7 @@ use layout::KVCacheLayout;
 pub use lease::QueryLeaseId;
 pub use objects::{
     ObjectDim, ObjectKey, ObjectLoad, ObjectPoint, ObjectQuery, ObjectQueryStatus, ObjectRead,
-    ObjectRun, ObjectWrite,
+    ObjectRun, ObjectWrite, SlotRead, SlotWrite,
 };
 pub use pegaflow_common::NumaNode;
 use pegaflow_common::{NumaTopology, group_hash};
@@ -119,6 +119,23 @@ impl From<LoadStateError> for EngineError {
     }
 }
 
+/// Attach the `LoadState` at `load_state_shm` and run `submit` with a
+/// completion that sets it; marks it failed if `submit` fails before
+/// handing the load to a worker.
+fn submit_with_load_state(
+    load_state_shm: &str,
+    what: &str,
+    submit: impl FnOnce(LoadCompletion) -> Result<(), EngineError>,
+) -> Result<(), EngineError> {
+    let load_state = LoadState::attach(load_state_shm)?;
+    let result = submit(LoadCompletion::Shm(load_state_shm.to_string()));
+    if let Err(ref e) = result {
+        log::error!("{what} pre-submit error: {e:?}");
+        load_state.set_error();
+    }
+    result
+}
+
 /// Main engine for managing KV cache offloading.
 ///
 /// `PegaEngine` is the top-level orchestrator that:
@@ -137,7 +154,7 @@ pub struct PegaEngine {
     topology: Arc<NumaTopology>,
     /// Query-ready blocks owned by opaque scheduler leases.
     query_leases: QueryLeaseManager,
-    /// Byte-addressed object devices and unsealed objects.
+    /// Byte-addressed object devices.
     objects: objects::ObjectStore,
 }
 
@@ -228,6 +245,20 @@ impl PegaEngine {
         instances.insert(instance_id.to_string(), Arc::clone(&instance));
         self.storage.set_has_instance(true);
         Ok(instance)
+    }
+
+    /// NUMA affinity of GPU `device_id`; known whenever NUMA-aware allocation is on.
+    fn gpu_numa(&self, device_id: i32) -> Result<NumaNode, EngineError> {
+        let numa_node = self.topology.numa_for_gpu(device_id);
+        if self.storage.is_numa_enabled() && numa_node.is_unknown() {
+            return Err(EngineError::InvalidArgument(format!(
+                "NUMA-aware allocation is enabled, but GPU {} NUMA affinity is unknown. \
+                 Please ensure nvidia-smi is available and GPU NUMA topology is detectable, \
+                 or disable NUMA-aware allocation.",
+                device_id
+            )));
+        }
+        Ok(numa_node)
     }
 
     /// Look up an instance by ID.
@@ -420,18 +451,7 @@ impl PegaEngine {
         let instance =
             self.get_or_create_instance(instance_id, namespace, tp_size, world_size, page_first)?;
 
-        // Get NUMA affinity for this GPU
-        let numa_node = self.topology.numa_for_gpu(device_id);
-
-        // Validate NUMA topology if NUMA-aware allocation is enabled
-        if self.storage.is_numa_enabled() && numa_node.is_unknown() {
-            return Err(EngineError::InvalidArgument(format!(
-                "NUMA-aware allocation is enabled, but GPU {} NUMA affinity is unknown. \
-                 Please ensure nvidia-smi is available and GPU NUMA topology is detectable, \
-                 or disable NUMA-aware allocation.",
-                device_id
-            )));
-        }
+        let numa_node = self.gpu_numa(device_id)?;
 
         // Register GPU with all layers. The connector picks the backend per
         // model and sends it with the registration.
@@ -683,23 +703,20 @@ impl PegaEngine {
         layer_groups: &[Vec<&str>],
         loads: &[(QueryLeaseId, Vec<Vec<Option<usize>>>)],
     ) -> Result<(), EngineError> {
-        let load_state = LoadState::attach(load_state_shm)?;
-
-        let result = self.batch_load_kv_blocks_multi_layer_inner(
-            instance_id,
-            tp_rank,
-            device_id,
-            layer_groups,
-            loads,
-            LoadCompletion::Shm(load_state_shm.to_string()),
-        );
-
-        if let Err(ref e) = result {
-            log::error!("batch_load_kv_blocks_multi_layer pre-submit error: {e:?}");
-            load_state.set_error();
-        }
-
-        result
+        submit_with_load_state(
+            load_state_shm,
+            "batch_load_kv_blocks_multi_layer",
+            |completion| {
+                self.batch_load_kv_blocks_multi_layer_inner(
+                    instance_id,
+                    tp_rank,
+                    device_id,
+                    layer_groups,
+                    loads,
+                    completion,
+                )
+            },
+        )
     }
 
     /// In-process variant of [`Self::batch_load_kv_blocks_multi_layer`]: instead
@@ -963,15 +980,9 @@ impl PegaEngine {
         inflight_max_age: std::time::Duration,
         failed_remote_max_age: std::time::Duration,
     ) -> (usize, usize) {
-        let (inflight, failed) = self
-            .storage
+        self.storage
             .gc_stale_inflight(inflight_max_age, failed_remote_max_age)
-            .await;
-        let objects = self.objects.expire_unsealed(inflight_max_age);
-        if objects > 0 {
-            core_metrics().inflight_gc_cleaned.add(objects as u64, &[]);
-        }
-        (inflight + objects, failed)
+            .await
     }
 
     // =========================================================================
