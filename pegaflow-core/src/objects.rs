@@ -281,7 +281,8 @@ impl Plan {
     }
 }
 
-/// A device's IPC-opened regions; closed when the last holder drops them.
+/// A device's IPC-opened regions; closed when the device and its last
+/// queued copy drop them.
 struct Regions {
     ctx: Arc<CudaContext>,
     list: Vec<(sys::CUdeviceptr, u64)>,
@@ -356,7 +357,6 @@ fn copy_worker(
     mut lane: Lane,
     device_id: i32,
     dir: Direction,
-    _regions: Arc<Regions>,
     mut jobs: mpsc::UnboundedReceiver<CopyJob>,
 ) {
     while let Some(job) = jobs.blocking_recv() {
@@ -416,6 +416,12 @@ impl Device {
     }
 
     fn submit(&self, dir: Direction, job: CopyJob) -> Result<(), EngineError> {
+        // A queued copy keeps the regions mapped; unregistering an idle
+        // device closes them before it returns.
+        let job = CopyJob {
+            keep: Box::new((job.keep, Arc::clone(&self.regions))),
+            ..job
+        };
         let worker = match dir {
             Direction::DeviceToHost => &self.save,
             Direction::HostToDevice => &self.load,
@@ -458,15 +464,19 @@ impl ObjectStore {
 
     /// Drop every device of `instance`; returns how many.
     pub(crate) fn remove_instance(&self, instance: &str) -> usize {
-        let mut devices = self.devices.lock();
-        let before = devices.len();
-        devices.retain(|(i, _), _| i != instance);
-        before - devices.len()
+        // Collected so the regions close after the lock is released.
+        let removed: Vec<_> = self
+            .devices
+            .lock()
+            .extract_if(|(i, _), _| i == instance)
+            .collect();
+        removed.len()
     }
 
     /// Drop every device; returns the instance of each.
     pub(crate) fn remove_all(&self) -> Vec<String> {
-        self.devices.lock().drain().map(|((i, _), _)| i).collect()
+        let devices = std::mem::take(&mut *self.devices.lock());
+        devices.into_keys().map(|(i, _)| i).collect()
     }
 
     fn device(&self, instance: &str, rank: u32) -> Result<Arc<Device>, EngineError> {
@@ -534,12 +544,12 @@ impl PegaEngine {
         let regions = Arc::new(opened);
         let spawn = |dir: Direction, name: &str| {
             let (tx, rx) = mpsc::unbounded_channel();
-            let (ctx, held) = (Arc::clone(&ctx), Arc::clone(&regions));
+            let ctx = Arc::clone(&ctx);
             let ready = spawn_pinned_worker(
                 format!("gpu{device_id}-obj{name}"),
                 numa,
                 move || Lane::new(&ctx),
-                move |lane| copy_worker(lane, device_id, dir, held, rx),
+                move |lane| copy_worker(lane, device_id, dir, rx),
             )?;
             wait_worker_ready(&format!("object {name}"), device_id, ready)?;
             Ok::<_, EngineError>(tx)
