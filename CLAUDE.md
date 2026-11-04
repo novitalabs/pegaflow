@@ -68,11 +68,11 @@ cargo bench --bench uds_latency
      - `ssd_cache.rs`: SSD-backed block storage
      - `uring.rs`: io_uring async I/O
    - `pinned_pool.rs` / `pinned_mem.rs`: NUMA-aware pinned memory allocator
-   - `transfer.rs`: GPU-CPU transfer operations via CUDA
+   - `transfer/`: GPU-CPU transfer operations via CUDA (block copy kernel, DMA copy-engine backend)
+     - `strided.rs`: Strided GPU-pinned copy kernel used by object saves and loads
    - `cache.rs`: LRU cache for blocks
    - `gpu_worker.rs`: Per-GPU worker handling async operations
    - `objects.rs`: Byte-addressed objects (v2 path): device registration, run/slot checks, save/load/query over the block store
-   - `transfer/strided.rs`: Strided GPU-pinned copy kernel used by object saves and loads
    - `lease.rs`: Query leases for KV blocks and objects (consumer counts, TTL sweep)
    - `internode/`: Cross-node communication
      - `metaserver_client.rs`: MetaServer registration, removal, query, and node heartbeat
