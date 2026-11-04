@@ -855,7 +855,7 @@ mod tests {
     }
 
     fn block() -> Arc<SealedBlock> {
-        Arc::new(SealedBlock::from_slots(Vec::new()))
+        Arc::new(SealedBlock::from_slots(Vec::new(), 0))
     }
 
     #[test]

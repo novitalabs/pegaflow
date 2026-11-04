@@ -43,9 +43,12 @@ impl fmt::Debug for QueryLeaseId {
 struct QueryLease {
     instance_id: String,
     blocks: Vec<Arc<SealedBlock>>,
-    /// Object leases hold their hits by key and are never consumed.
+    /// Object leases hold their hits by key; their loads consume them.
     objects: HashMap<BlockKey, Arc<SealedBlock>>,
+    /// Consumers left; an object lease's first load sets it from `consumers`.
     remaining_consumers: usize,
+    /// Loads an object lease takes in all, once its first load named it.
+    consumers: Option<usize>,
     expires_at: Instant,
 }
 
@@ -99,13 +102,15 @@ impl QueryLeaseManager {
             blocks,
             objects: HashMap::new(),
             remaining_consumers: consumers.max(1),
+            consumers: None,
             expires_at: Instant::now() + DEFAULT_LEASE_TTL,
         };
         self.inner.insert(token, lease);
         token
     }
 
-    /// A lease over object hits; loads read it until release or expiry.
+    /// A lease over object hits; its loads consume it, or Release or expiry
+    /// drops it.
     pub(crate) fn create_objects(
         &self,
         instance_id: &str,
@@ -117,28 +122,32 @@ impl QueryLeaseManager {
             instance_id: instance_id.to_string(),
             blocks: Vec::new(),
             objects,
-            remaining_consumers: usize::MAX,
+            remaining_consumers: 0,
+            consumers: None,
             expires_at: Instant::now() + DEFAULT_LEASE_TTL,
         };
         self.inner.insert(token, lease);
         token
     }
 
-    /// The objects an object lease of `instance_id` holds for `keys`, `None` where it holds none.
+    /// The objects an object lease of `instance_id` holds for `keys`, `None`
+    /// where it holds none, for a load of `consumers` loads in all: the
+    /// lease's first load fixes that count, and a load naming another fails.
     pub(crate) fn leased_objects(
         &self,
         instance_id: &str,
         token: &QueryLeaseId,
         keys: &[BlockKey],
+        consumers: usize,
     ) -> Result<Vec<Option<Arc<SealedBlock>>>, String> {
         self.sweep_expired();
-        let leases = self
+        let mut leases = self
             .inner
             .leases
             .lock()
             .expect("query leases lock poisoned");
         let lease = leases
-            .get(token)
+            .get_mut(token)
             .ok_or_else(|| "query lease is unknown or expired".to_string())?;
         if lease.instance_id != instance_id {
             return Err(format!(
@@ -146,7 +155,38 @@ impl QueryLeaseManager {
                 lease.instance_id, instance_id
             ));
         }
+        if consumers == 0 {
+            return Err("a load names 0 consumers".to_string());
+        }
+        match lease.consumers {
+            Some(n) if n != consumers => {
+                return Err(format!(
+                    "query lease has {n} consumers, this load names {consumers}"
+                ));
+            }
+            Some(_) => {}
+            None => {
+                lease.consumers = Some(consumers);
+                lease.remaining_consumers = consumers;
+            }
+        }
         Ok(keys.iter().map(|k| lease.objects.get(k).cloned()).collect())
+    }
+
+    /// Count one load of an object lease; the last releases it. A lease
+    /// released or expired meanwhile is already gone.
+    pub(crate) fn consume_objects(&self, token: &QueryLeaseId) {
+        let mut leases = self
+            .inner
+            .leases
+            .lock()
+            .expect("query leases lock poisoned");
+        if let Some(lease) = leases.get_mut(token) {
+            lease.remaining_consumers = lease.remaining_consumers.saturating_sub(1);
+            if lease.remaining_consumers == 0 {
+                leases.remove(token);
+            }
+        }
     }
 
     pub(crate) fn consume(
@@ -252,6 +292,7 @@ mod tests {
                     blocks: Vec::new(),
                     objects: HashMap::new(),
                     remaining_consumers: 1,
+                    consumers: None,
                     expires_at: Instant::now() + DEFAULT_LEASE_TTL,
                 },
             );
@@ -270,7 +311,7 @@ mod tests {
     #[test]
     fn consume_allows_configured_number_of_consumers() {
         let manager = QueryLeaseManager::default();
-        let blocks = vec![Arc::new(SealedBlock::from_slots(Vec::new()))];
+        let blocks = vec![Arc::new(SealedBlock::from_slots(Vec::new(), 0))];
         let lease_id = manager.create("inst-a", blocks, 2);
 
         assert_eq!(manager.consume("inst-a", &lease_id).unwrap().len(), 1);
@@ -281,5 +322,36 @@ mod tests {
             .err()
             .expect("lease should be exhausted");
         assert!(err.contains("query lease is unknown or expired"));
+    }
+
+    #[test]
+    fn object_lease_is_consumed_by_its_named_loads() {
+        let manager = QueryLeaseManager::new(Duration::from_secs(3600));
+        let key = BlockKey::new("ns".into(), vec![1]);
+        let objects = HashMap::from([(
+            key.clone(),
+            Arc::new(SealedBlock::from_slots(Vec::new(), 0)),
+        )]);
+        let lease = manager.create_objects("inst-a", objects);
+        let read = |consumers| {
+            manager.leased_objects("inst-a", &lease, std::slice::from_ref(&key), consumers)
+        };
+
+        assert!(read(0).is_err(), "0 consumers");
+        assert!(read(2).unwrap()[0].is_some(), "first load fixes 2");
+        assert!(
+            read(3).err().expect("rejected").contains("2 consumers"),
+            "another count"
+        );
+        manager.consume_objects(&lease);
+        assert!(read(2).is_ok(), "one consumer left");
+        manager.consume_objects(&lease);
+        assert!(
+            read(2)
+                .err()
+                .expect("rejected")
+                .contains("unknown or expired"),
+            "released"
+        );
     }
 }

@@ -46,6 +46,8 @@ pub(crate) struct RawSaveLayer {
 pub(crate) struct RawSaveBatch {
     pub namespace: String,
     pub total_slots: usize,
+    /// Meta every block of the batch carries; 0 for KV blocks.
+    pub meta: u64,
     pub numa_node: NumaNode,
     pub layers: Vec<RawSaveLayer>,
 }
@@ -615,6 +617,7 @@ impl PegaEngine {
             self.storage.send_raw_insert(RawSaveBatch {
                 namespace,
                 total_slots: topology.total_slots(),
+                meta: 0,
                 numa_node: save_numa_node,
                 layers: vec![RawSaveLayer {
                     slot_id,
@@ -649,6 +652,7 @@ impl PegaEngine {
                 self.storage.send_raw_insert(RawSaveBatch {
                     namespace: namespace.clone(),
                     total_slots: topology.group_total_slots(group)?,
+                    meta: 0,
                     numa_node: save_numa_node,
                     layers: raw_layers,
                 });

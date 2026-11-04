@@ -211,6 +211,7 @@ message TransferSlotInfo {
 message TransferBlockInfo {
   bytes block_hash = 1;
   repeated TransferSlotInfo slots = 2;  // One per TP slot
+  uint64 meta = 3;                      // Opaque layout word of an object; 0 for KV blocks
 }
 
 message QueryBlocksForTransferRequest {
@@ -262,9 +263,12 @@ message ReleaseTransferLockResponse {
 // visible to QueryObjects once all of its slots arrived, possibly from
 // several devices. Objects share the pinned pool, LRU, lease machinery, SSD
 // cache and MetaServer registration with blocks: QueryObjects brings an
-// object evicted from memory back from a peer or SSD. Leases are released
-// with Release; UnregisterContext and Session drop an instance's object
-// devices like its KV contexts.
+// object evicted from memory back from a peer or SSD. Every object carries
+// an opaque 64-bit `meta` its first writer chose (how the client cut it into
+// slots); the server stores and returns it and never reads it. A lease is
+// consumed by its loads, as a KV lease by its ranks, and released early with
+// Release; UnregisterContext and Session drop an instance's object devices
+// like its KV contexts.
 
 message ObjectKey {
   // 32-byte digest of everything that decides the object's bytes besides the
@@ -296,6 +300,8 @@ message RegisterObjectDeviceResponse {
   int32 numa_node = 1;
   // CPU socket of that node; 0 when unknown.
   uint32 socket = 2;
+  // Most dims one run may have.
+  uint32 max_run_dims = 3;
 }
 
 message ObjectKeyList {
@@ -331,12 +337,14 @@ message ObjectsReady {
   // Leading blocks of every chain the lease holds: the point's, or with no
   // points the longest prefix every chain holds.
   uint32 blocks = 2;
-  // Holds those blocks and the point's keys until Release or expiry; empty
-  // when it would hold nothing.
+  // Holds those blocks and the point's keys until its loads consume it,
+  // Release or expiry; empty when it would hold nothing.
   bytes lease = 3;
   // Slot count of every object the lease holds: the leading `blocks` keys
   // of each chain in turn, then the point's keys.
   repeated uint32 slots = 4;
+  // Meta of each of those objects, in the same order.
+  repeated uint64 metas = 5;
 }
 
 message QueryObjectsResponse {
@@ -354,16 +362,20 @@ message QueryObjectsResponse {
 // `count, region_stride, slot_stride` per dim, at most 4 dims, the first
 // fastest: row (i_0, i_1, ..) is at region_offset + sum(i_d * region_stride_d)
 // of the device region and slot_offset + sum(i_d * slot_stride_d) of the
-// slot. No dims is one row. On each side no two rows may overlap.
+// slot. No dims is one row. On each side no two rows may overlap. The
+// registration reply gives the most dims a run may have.
 
 message ObjectWrite {
   ObjectKey key = 1;
-  // Slots of the whole object; every writer of a key sends the same count.
+  // Slots of the whole object; every writer of a key sends the same count
+  // and meta. Slots of a writer whose count or meta differs from the first
+  // writer's are dropped.
   uint32 slots = 2;
   // The slots this device writes, each once, back to back: `slot, size,
   // nruns` and then `nruns` runs. A slot's runs copy each of its size bytes
   // once.
   repeated uint64 writes = 3;
+  uint64 meta = 4;
 }
 
 message ObjectRead {
@@ -385,6 +397,9 @@ message ObjectLoad {
   // A lease of this instance holding every key read.
   bytes lease = 1;
   repeated ObjectRead reads = 2;
+  // LoadObjects requests that read this lease in all, at least 1, the same
+  // in each. Each checked one consumes the lease once; the last releases it.
+  uint32 consumers = 3;
 }
 
 message LoadObjectsRequest {

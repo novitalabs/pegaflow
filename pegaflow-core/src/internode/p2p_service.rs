@@ -153,6 +153,7 @@ impl Engine for P2pTransferService {
                 TransferBlockInfo {
                     block_hash: key.hash.clone(),
                     slots,
+                    meta: block.meta(),
                 }
             })
             .collect();
