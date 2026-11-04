@@ -1212,18 +1212,13 @@ impl Engine for GrpcEngineService {
             // Opening IPC handles and starting the copy workers block.
             let engine = Arc::clone(&self.engine);
             let instance = instance_id.clone();
-            let (numa, socket) = tokio::task::spawn_blocking(move || {
+            let socket = tokio::task::spawn_blocking(move || {
                 engine.register_object_device(&instance, rank, device_id, &regions)
             })
             .await
             .map_err(|e| Status::internal(format!("register task panicked: {e}")))?
             .map_err(Self::map_engine_error)?;
             Ok(Response::new(RegisterObjectDeviceResponse {
-                numa_node: if numa.is_valid() {
-                    i32::try_from(numa.0).unwrap_or(-1)
-                } else {
-                    -1
-                },
                 socket,
                 max_run_dims: MAX_RUN_DIMS as u32,
             }))

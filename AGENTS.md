@@ -45,6 +45,8 @@ pegaflow/
 
 - `pegaflow-core/src/lib.rs`: main Rust engine entry
 - `pegaflow-core/src/storage/mod.rs`: storage pipeline
+- `pegaflow-core/src/objects.rs`: byte-addressed object RPCs (v2 path)
+- `pegaflow-core/src/lease.rs`: query leases for KV blocks and objects
 - `pegaflow-core/src/backing/`: SSD and RDMA backing implementations
 - `pegaflow-core/src/internode/`: cross-node coordination
 - `pegaflow-server/src/service.rs`: gRPC service
@@ -159,6 +161,12 @@ cargo run -r --bin pegaflow-metaserver
 - Heavy tests must declare their trigger: integration, e2e, stress, or release smoke. A heavy test without a trigger should not live in the main pytest surface.
 - Stub and mock tests are allowed only for local contracts and must not shadow real runtime modules during integration/e2e collection.
 - Prefer integration tests when they prove a real boundary that units cannot. Prefer units when they give faster, clearer feedback for local connector state machines.
+
+## KV Block and Object Paths
+
+- The server has two client paths: v1 KV blocks (`RegisterContextBatch`, `Save`, `Load`, `QueryPrefetch`) and v2 byte-addressed objects (`RegisterObjectDevice`, `SaveObjects`, `LoadObjects`, `QueryObjects`).
+- A deployment uses one path or the other, never both on the same server. Do not add handling for mixed v1/v2 traffic: separate metrics, SSD/prefetch budget splits, or cross-path lease checks.
+- v1 behavior must stay unchanged when touching shared code (insert worker, read cache, prefetch, SSD, RDMA); objects reuse it with KV blocks carrying meta 0.
 
 ## Git Workflow
 

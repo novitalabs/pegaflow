@@ -235,6 +235,9 @@ fn insert_partial_slots(
         Entry::Occupied(o) => {
             let ib = o.into_mut();
             if ib.total_slots() != total_slots || ib.meta() != meta {
+                core_metrics()
+                    .slot_writes_dropped
+                    .add(slots.len() as u64, &[]);
                 error!(
                     "insert worker: slot count or meta mismatch: key namespace={} expected={}/{:#x} got={}/{:#x}",
                     namespace,

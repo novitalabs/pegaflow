@@ -464,6 +464,11 @@ impl StorageEngine {
         self.read_cache.contains_keys(keys)
     }
 
+    /// Resident blocks of `keys`, position-aligned, without touching the LRU.
+    pub(crate) fn peek_blocks(&self, keys: &[BlockKey]) -> Vec<Option<Arc<SealedBlock>>> {
+        self.read_cache.peek_blocks(keys)
+    }
+
     /// Per set of keys of one namespace, how many of its leading keys peers
     /// and then SSD can bring in: peers serve a prefix, SSD the keys after it.
     pub(crate) async fn reach(&self, sets: &[Vec<BlockKey>]) -> Vec<usize> {

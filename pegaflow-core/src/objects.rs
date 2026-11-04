@@ -101,6 +101,20 @@ impl ObjectRun {
         self.width.saturating_mul(self.rows())
     }
 
+    /// Slot offset of each row, the first dimension fastest; only for a run
+    /// whose `ends` checked out.
+    fn slot_rows(&self) -> impl Iterator<Item = u64> + '_ {
+        (0..self.rows()).map(move |mut r| {
+            let mut at = self.slot_offset;
+            for d in &self.dims {
+                let n = u64::from(d.count);
+                at += r % n * d.slot_stride;
+                r /= n;
+            }
+            at
+        })
+    }
+
     /// One past the last byte on the region and slot side, if the run is
     /// well formed: nonempty, at most [`MAX_DIMS`] dimensions, and on each
     /// side, with its dimensions ordered by stride, every stride at least the
@@ -387,13 +401,14 @@ struct Device {
 }
 
 impl Device {
-    /// The run is well formed, inside its region, and inside a slot of `size` bytes.
-    fn check(&self, run: &ObjectRun, size: u64) -> Result<(), EngineError> {
+    /// The run is well formed, inside its region, and inside a slot of
+    /// `size` bytes; returns one past its last slot byte.
+    fn check(&self, run: &ObjectRun, size: u64) -> Result<u64, EngineError> {
         let (_, region) = self.regions.list.get(run.region as usize).ok_or_else(|| {
             EngineError::InvalidArgument(format!("unknown region {}", run.region))
         })?;
         match run.ends() {
-            Some((re, se)) if re <= *region && se <= size => Ok(()),
+            Some((re, se)) if re <= *region && se <= size => Ok(se),
             _ => Err(EngineError::InvalidArgument(format!(
                 "run {run:?} is empty, overlapping or out of bounds of a {size} byte slot"
             ))),
@@ -482,15 +497,15 @@ fn already_registered(instance: &str, rank: u32) -> EngineError {
 impl PegaEngine {
     /// Open `regions` (IPC handle, size) of device `device_id` as object
     /// device `rank` of `instance_id`. A rank registers once until its
-    /// instance is unregistered or its session ends. Returns the GPU's NUMA
-    /// node, where saves of the device allocate, and its CPU socket.
+    /// instance is unregistered or its session ends. Returns the CPU socket
+    /// of the GPU's NUMA node, where saves of the device allocate.
     pub fn register_object_device(
         &self,
         instance_id: &str,
         rank: u32,
         device_id: i32,
         regions: &[(Vec<u8>, u64)],
-    ) -> Result<(NumaNode, u32), EngineError> {
+    ) -> Result<u32, EngineError> {
         let key = (instance_id.to_string(), rank);
         if self.objects.devices.lock().contains_key(&key) {
             return Err(already_registered(instance_id, rank));
@@ -538,19 +553,27 @@ impl PegaEngine {
             save,
             load,
         };
-        match self.objects.devices.lock().entry(key) {
-            Entry::Occupied(_) => return Err(already_registered(instance_id, rank)),
-            Entry::Vacant(v) => {
-                v.insert(Arc::new(device));
+        {
+            // Under the instances lock, as unregistering checks for devices
+            // and clears `has_instance` there.
+            let _instances = self
+                .instances
+                .write()
+                .expect("instances write lock poisoned");
+            match self.objects.devices.lock().entry(key) {
+                Entry::Occupied(_) => return Err(already_registered(instance_id, rank)),
+                Entry::Vacant(v) => {
+                    v.insert(Arc::new(device));
+                }
             }
+            self.storage.set_has_instance(true);
         }
-        self.storage.set_has_instance(true);
         let socket = self.topology.socket_of(numa);
         info!(
             "Registered object device: instance={instance_id} rank={rank} device={device_id} \
              regions={region_count} numa={numa} socket={socket}"
         );
-        Ok((numa, socket))
+        Ok(socket)
     }
 
     /// Answer `query` for request `req_id` of `instance_id`, as `QueryPrefetch`
@@ -752,8 +775,8 @@ impl PegaEngine {
     /// memory on the device's NUMA node and queue them for the insert worker,
     /// as a KV save does; returns once the copies finish. Writes to objects
     /// already cached copy nothing. An object seals once all of its slots
-    /// arrived; one whose writers disagree on its slot count keeps the first
-    /// count, and unsealed objects expire with KV inflight blocks.
+    /// arrived; a write naming another slot count or meta than its first
+    /// writer is dropped, and unsealed objects expire with KV inflight blocks.
     pub async fn save_objects(
         &self,
         instance_id: &str,
@@ -767,8 +790,29 @@ impl PegaEngine {
             check_write(&device, w)?;
         }
         let keys: Vec<BlockKey> = writes.iter().map(|w| w.key.block_key()).collect();
-        let resident = self.storage.contains_keys(&keys);
-        let todo: Vec<usize> = (0..writes.len()).filter(|&i| !resident[i]).collect();
+        // Writes to resident objects copy nothing; one naming another slot
+        // count or meta than the object's is dropped, as at seal.
+        let mut todo = Vec::new();
+        let mut dropped = 0;
+        for (i, held) in self.storage.peek_blocks(&keys).into_iter().enumerate() {
+            match held {
+                None => todo.push(i),
+                Some(b)
+                    if b.slots().len() != writes[i].slots as usize
+                        || b.meta() != writes[i].meta =>
+                {
+                    dropped += writes[i].writes.len();
+                }
+                Some(_) => {}
+            }
+        }
+        if dropped > 0 {
+            core_metrics().slot_writes_dropped.add(dropped as u64, &[]);
+            warn!(
+                "save_objects: {dropped} slot writes of instance_id={instance_id} rank={rank} \
+                 dropped: slot count or meta differs from the resident object"
+            );
+        }
         if todo.is_empty() {
             return Ok(());
         }
@@ -824,6 +868,19 @@ impl PegaEngine {
                             .map(|r| device.copy_of(base.add(r.slot_offset as usize), r)),
                     );
                     let len = stride(s.size);
+                    if len > s.size {
+                        // SAFETY: the allocation holds `len` bytes at `base`,
+                        // and nothing else uses them yet. Zero the SSD padding
+                        // so loads and SSD writes never see a previous user's
+                        // bytes.
+                        unsafe {
+                            std::ptr::write_bytes(
+                                base.host().as_ptr().add(s.size as usize),
+                                0,
+                                (len - s.size) as usize,
+                            );
+                        }
+                    }
                     let segment = Segment::new(base.host(), len as usize, Arc::clone(&alloc));
                     saved.push((i, slot, RawBlock::single_segment(segment), len));
                     bytes += s.size;
@@ -897,7 +954,8 @@ impl PegaEngine {
     /// and sets the `LoadState` at `load_state_shm` when the copies finish,
     /// or right away if checking fails. Loads of a device run in order on
     /// their own stream. Each lease a checked request reads counts one of
-    /// its consumers; the last releases it.
+    /// its consumers and the last releases it; a request that fails checking
+    /// releases every lease it names.
     pub fn load_objects(
         &self,
         instance_id: &str,
@@ -917,11 +975,43 @@ impl PegaEngine {
         loads: &[ObjectLoad],
         done: LoadCompletion,
     ) -> Result<(), EngineError> {
-        let device = self.objects.device(instance_id, rank)?;
+        let submitted = self.objects.device(instance_id, rank).and_then(|device| {
+            let job = self.object_load_job(instance_id, &device, loads, done)?;
+            device.submit(Direction::HostToDevice, job)
+        });
+        for l in loads {
+            if submitted.is_ok() {
+                // The copy job holds the objects; the lease may go now.
+                self.query_leases.consume_objects(&l.lease);
+            } else {
+                // The restore these leases serve cannot complete, and no
+                // later load may consume them: drop them now, not at expiry.
+                self.query_leases.release_objects(instance_id, &l.lease);
+            }
+        }
+        submitted
+    }
+
+    /// The copies of `loads` into `device`, each read checked against its
+    /// lease and slot. A lease is named once per request.
+    fn object_load_job(
+        &self,
+        instance_id: &str,
+        device: &Device,
+        loads: &[ObjectLoad],
+        done: LoadCompletion,
+    ) -> Result<CopyJob, EngineError> {
+        let mut leases = HashSet::new();
         let mut copies = Vec::new();
         let mut objects = Vec::new();
         let mut bytes = 0;
         for l in loads {
+            if !leases.insert(&l.lease) {
+                return Err(EngineError::InvalidArgument(format!(
+                    "{:?} is named twice in one request",
+                    l.lease
+                )));
+            }
             let keys: Vec<BlockKey> = l.reads.iter().map(|r| r.key.block_key()).collect();
             let leased = self
                 .query_leases
@@ -952,26 +1042,17 @@ impl PegaEngine {
                 objects.push(block);
             }
         }
-        device.submit(
-            Direction::HostToDevice,
-            CopyJob {
-                copies,
-                keep: Box::new(objects),
-                bytes,
-                done,
-            },
-        )?;
-        // The copy job holds the objects; the leases may go now.
-        let leases: HashSet<&QueryLeaseId> = loads.iter().map(|l| &l.lease).collect();
-        for lease in leases {
-            self.query_leases.consume_objects(lease);
-        }
-        Ok(())
+        Ok(CopyJob {
+            copies,
+            keep: Box::new(objects),
+            bytes,
+            done,
+        })
     }
 }
 
 /// `w` names valid slots once each, and every slot's runs lie in the device's
-/// regions and the slot and copy as many bytes as it has.
+/// regions and the slot and write each of its bytes exactly once.
 fn check_write(device: &Device, w: &ObjectWrite) -> Result<(), EngineError> {
     let bad = |why: String| {
         Err(EngineError::InvalidArgument(format!(
@@ -991,8 +1072,9 @@ fn check_write(device: &Device, w: &ObjectWrite) -> Result<(), EngineError> {
             return bad(format!("slot {} is empty", s.slot));
         }
         let mut copied = 0u64;
+        let mut extents = Vec::with_capacity(s.runs.len());
         for run in &s.runs {
-            device.check(run, s.size)?;
+            extents.push((run.slot_offset, device.check(run, s.size)?));
             copied = copied.saturating_add(run.bytes());
         }
         if copied != s.size {
@@ -1001,8 +1083,45 @@ fn check_write(device: &Device, w: &ObjectWrite) -> Result<(), EngineError> {
                 s.slot, s.size
             ));
         }
+        if !writes_once(s.size, &s.runs, extents) {
+            return bad(format!("runs of slot {} overlap", s.slot));
+        }
     }
     Ok(())
+}
+
+/// No two of `runs`, checked runs of a `size` byte slot with slot
+/// `extents`, write the same byte; a run's own rows never overlap. Runs with
+/// disjoint extents pass without looking at rows; otherwise every row marks
+/// a bitmap of the slot, `size / 8` bytes whatever the row count.
+fn writes_once(size: u64, runs: &[ObjectRun], mut extents: Vec<(u64, u64)>) -> bool {
+    extents.sort_unstable();
+    if extents.windows(2).all(|w| w[0].1 <= w[1].0) {
+        return true;
+    }
+    let mut bits = vec![0u64; size.div_ceil(64) as usize];
+    runs.iter()
+        .all(|r| r.slot_rows().all(|at| mark(&mut bits, at, at + r.width)))
+}
+
+/// Set bits `[from, to)` of `bits`; false if one was set already.
+fn mark(bits: &mut [u64], from: u64, to: u64) -> bool {
+    let mut at = from;
+    while at < to {
+        let (word, bit) = ((at / 64) as usize, at % 64);
+        let n = (64 - bit).min(to - at);
+        let mask = if n == 64 {
+            u64::MAX
+        } else {
+            ((1 << n) - 1) << bit
+        };
+        if bits[word] & mask != 0 {
+            return false;
+        }
+        bits[word] |= mask;
+        at += n;
+    }
+    true
 }
 
 fn open_ipc(handle: &[u8]) -> Result<sys::CUdeviceptr, String> {
@@ -1130,6 +1249,43 @@ mod tests {
             ("too many dims", run(8, &[dim(2, 8, 8); MAX_DIMS + 1])),
         ] {
             assert!(r.ends().is_none(), "{case}");
+        }
+    }
+
+    #[test]
+    fn slot_runs_write_each_byte_once() {
+        let run = |slot_offset, width, dims: &[ObjectDim]| ObjectRun {
+            region: 0,
+            region_offset: 0,
+            slot_offset,
+            width,
+            dims: dims.to_vec(),
+        };
+        for (case, runs, once) in [
+            ("one run", vec![run(0, 64, &[])], true),
+            ("disjoint", vec![run(64, 64, &[]), run(0, 64, &[])], true),
+            (
+                "interleaved rows",
+                vec![run(0, 8, &[dim(4, 16, 16)]), run(8, 8, &[dim(4, 16, 16)])],
+                true,
+            ),
+            (
+                "same bytes twice",
+                vec![run(0, 32, &[]), run(0, 32, &[])],
+                false,
+            ),
+            (
+                "rows that collide",
+                vec![run(0, 8, &[dim(4, 16, 16)]), run(16, 8, &[])],
+                false,
+            ),
+        ] {
+            let extents: Vec<(u64, u64)> = runs
+                .iter()
+                .map(|r| (r.slot_offset, r.ends().expect("well formed").1))
+                .collect();
+            let size = extents.iter().map(|e| e.1).max().unwrap_or(0);
+            assert_eq!(writes_once(size, &runs, extents), once, "{case}");
         }
     }
 }

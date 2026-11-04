@@ -189,6 +189,23 @@ impl QueryLeaseManager {
         }
     }
 
+    /// Drop lease `token` of `instance_id`, as a failed object load does:
+    /// the restore it served cannot complete, so no later load consumes it.
+    /// A lease of another instance stays.
+    pub(crate) fn release_objects(&self, instance_id: &str, token: &QueryLeaseId) {
+        let mut leases = self
+            .inner
+            .leases
+            .lock()
+            .expect("query leases lock poisoned");
+        if leases
+            .get(token)
+            .is_some_and(|l| l.instance_id == instance_id)
+        {
+            leases.remove(token);
+        }
+    }
+
     pub(crate) fn consume(
         &self,
         instance_id: &str,
@@ -353,5 +370,21 @@ mod tests {
                 .contains("unknown or expired"),
             "released"
         );
+
+        // A failed load drops the lease, but only for its own instance.
+        let lease = manager.create_objects(
+            "inst-a",
+            HashMap::from([(
+                key.clone(),
+                Arc::new(SealedBlock::from_slots(Vec::new(), 0)),
+            )]),
+        );
+        let read = |consumers| {
+            manager.leased_objects("inst-a", &lease, std::slice::from_ref(&key), consumers)
+        };
+        manager.release_objects("inst-b", &lease);
+        assert!(read(2).is_ok(), "another instance cannot drop it");
+        manager.release_objects("inst-a", &lease);
+        assert!(read(2).is_err(), "dropped by its failed load");
     }
 }
