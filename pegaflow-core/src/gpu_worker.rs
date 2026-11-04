@@ -221,6 +221,7 @@ pub(crate) fn spawn_pinned_worker<R>(
 ) -> Result<std_mpsc::Receiver<Result<(), EngineError>>, EngineError> {
     let (ready_tx, ready_rx) = std_mpsc::channel();
     let label = name.clone();
+    let spawn_label = name.clone();
     std::thread::Builder::new()
         .name(name)
         .spawn(move || {
@@ -240,7 +241,7 @@ pub(crate) fn spawn_pinned_worker<R>(
                 }
             }
         })
-        .map_err(|e| EngineError::CudaInit(format!("Failed to spawn worker: {e}")))?;
+        .map_err(|e| EngineError::CudaInit(format!("Failed to spawn {spawn_label} worker: {e}")))?;
     Ok(ready_rx)
 }
 

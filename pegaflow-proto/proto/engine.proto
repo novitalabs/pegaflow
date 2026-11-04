@@ -295,9 +295,10 @@ message RegisterObjectDeviceRequest {
 }
 
 message RegisterObjectDeviceResponse {
-  reserved 1;
-  // CPU socket of the GPU's NUMA node, where saves of this device allocate;
-  // 0 when unknown.
+  // NUMA node of the GPU, where saves of this device allocate; -1 when
+  // unknown (NUMA-aware allocation off and no affinity detected).
+  int32 numa_node = 1;
+  // CPU socket of that node; 0 when unknown.
   uint32 socket = 2;
   // Most dims one run may have.
   uint32 max_run_dims = 3;
