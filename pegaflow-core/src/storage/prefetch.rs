@@ -314,19 +314,8 @@ impl PrefetchScheduler {
         let Some(client) = &self.metaserver_client else {
             return;
         };
-        let mut by_namespace: Vec<(&str, Vec<BlockKey>)> = Vec::new();
-        for key in &resident {
-            match by_namespace.iter_mut().find(|(ns, _)| *ns == key.namespace) {
-                Some((_, keys)) => keys.push(key.clone()),
-                None => by_namespace.push((key.namespace.as_str(), vec![key.clone()])),
-            }
-        }
-        for (_, keys) in by_namespace {
-            if let Some((namespace, hashes)) =
-                rdma_registration_from_resident_keys(Some(PrefetchSource::Rdma), &keys)
-            {
-                client.try_register_namespace_without_reclaim_hint(namespace, hashes);
-            }
+        for (namespace, hashes) in hashes_by_namespace(resident) {
+            client.try_register_namespace_without_reclaim_hint(namespace, hashes);
         }
     }
 
@@ -662,17 +651,17 @@ fn build_ready_result(
     }
 }
 
-fn rdma_registration_from_resident_keys(
-    source: Option<PrefetchSource>,
-    resident_keys: &[BlockKey],
-) -> Option<(String, Vec<Vec<u8>>)> {
-    if source != Some(PrefetchSource::Rdma) || resident_keys.is_empty() {
-        return None;
+/// The hashes of `keys` per namespace, in first-seen order: a KV fetch has
+/// one namespace, an object fetch may span several.
+fn hashes_by_namespace(keys: Vec<BlockKey>) -> Vec<(String, Vec<Vec<u8>>)> {
+    let mut out: Vec<(String, Vec<Vec<u8>>)> = Vec::new();
+    for key in keys {
+        match out.iter_mut().find(|(ns, _)| *ns == key.namespace) {
+            Some((_, hashes)) => hashes.push(key.hash),
+            None => out.push((key.namespace, vec![key.hash])),
+        }
     }
-
-    let namespace = resident_keys[0].namespace.clone();
-    let hashes = resident_keys.iter().map(|key| key.hash.clone()).collect();
-    Some((namespace, hashes))
+    out
 }
 
 async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> PrefetchTaskResult {
@@ -914,25 +903,27 @@ mod tests {
     }
 
     #[test]
-    fn rdma_registration_uses_only_resident_keys() {
-        let k1 = key(1);
-        let k3 = key(3);
-
-        let (namespace, hashes) =
-            rdma_registration_from_resident_keys(Some(PrefetchSource::Rdma), &[k1, k3])
-                .expect("RDMA resident keys should register");
-
-        assert_eq!(namespace, "ns");
-        assert_eq!(hashes, vec![vec![1], vec![3]]);
-    }
-
-    #[test]
-    fn rdma_registration_skips_ssd_and_empty_resident_keys() {
-        let k1 = key(1);
-
-        assert!(rdma_registration_from_resident_keys(Some(PrefetchSource::Ssd), &[k1]).is_none());
-        assert!(rdma_registration_from_resident_keys(Some(PrefetchSource::Rdma), &[]).is_none());
-        assert!(rdma_registration_from_resident_keys(None, &[]).is_none());
+    fn rdma_registration_groups_resident_keys_by_namespace() {
+        let other = |h: u8| BlockKey::new("other".into(), vec![h]);
+        for (case, keys, want) in [
+            ("none", vec![], vec![]),
+            (
+                "one namespace",
+                vec![key(1), key(3)],
+                vec![("ns", vec![vec![1], vec![3]])],
+            ),
+            (
+                "two namespaces",
+                vec![key(1), other(2), key(3)],
+                vec![("ns", vec![vec![1], vec![3]]), ("other", vec![vec![2]])],
+            ),
+        ] {
+            let want: Vec<(String, Vec<Vec<u8>>)> = want
+                .into_iter()
+                .map(|(ns, h)| (ns.to_string(), h))
+                .collect();
+            assert_eq!(hashes_by_namespace(keys), want, "{case}");
+        }
     }
 
     /// Feed a finished prefetch task with the given outcome through
