@@ -17,6 +17,8 @@
 //! landed) retries the whole P→D flow — content-addressed KV makes the P leg
 //! idempotent.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -103,9 +105,16 @@ impl RouterState {
         }
     }
 
-    fn get_next_p(&self) -> (Client, String, usize) {
-        let idx = self.p_index.fetch_add(1, Ordering::Relaxed);
-        let idx = idx % self.prefill_clients.len();
+    fn get_next_p(&self, body: &Value) -> (Client, String, usize) {
+        let n = self.prefill_clients.len();
+        let idx = match Self::prefix_affinity_key(body) {
+            Some(key) if n > 1 => {
+                let mut h = DefaultHasher::new();
+                key.hash(&mut h);
+                (h.finish() as usize) % n
+            }
+            _ => self.p_index.fetch_add(1, Ordering::Relaxed) % n,
+        };
         self.p_inflight[idx].fetch_add(1, Ordering::Relaxed);
         (
             self.prefill_clients[idx].clone(),
@@ -114,9 +123,45 @@ impl RouterState {
         )
     }
 
-    fn get_next_d(&self) -> (Client, String, usize) {
-        let idx = self.d_index.fetch_add(1, Ordering::Relaxed);
-        let idx = idx % self.decode_clients.len();
+    /// Turn-stable routing key so every turn of a conversation lands on the
+    /// P that already holds its prefix KV. Without this, multi-P routing
+    /// degrades into cross-node full-context prefix transfers on most turns.
+    /// Chat keys on the first message; completions keys on a fixed-length
+    /// prompt prefix (multi-turn contexts grow by appending, so the prefix
+    /// is stable across turns). Returns None (round-robin) otherwise.
+    fn prefix_affinity_key(body: &Value) -> Option<String> {
+        if let Some(first) = body
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .and_then(|a| a.first())
+        {
+            return Some(first.to_string());
+        }
+        match body.get("prompt") {
+            Some(Value::String(s)) => Some(s.chars().take(512).collect()),
+            Some(Value::Array(a)) => {
+                let head: Vec<&Value> = a.iter().take(64).collect();
+                Some(format!("{head:?}"))
+            }
+            _ => None,
+        }
+    }
+
+    /// Same affinity rule as `get_next_p`: a conversation must revisit the D
+    /// whose HBM/host tier already holds its KV, or every turn re-pulls the
+    /// full context over RDMA instead of just the fresh suffix.
+    fn get_next_d(&self, body: &Value) -> (Client, String, usize) {
+        let n = self.decode_clients.len();
+        let idx = match Self::prefix_affinity_key(body) {
+            Some(key) if n > 1 => {
+                let mut h = DefaultHasher::new();
+                key.hash(&mut h);
+                // Independent spread from the P mapping (avoid P_i => D_i lockstep).
+                1usize.hash(&mut h);
+                (h.finish() as usize) % n
+            }
+            _ => self.d_index.fetch_add(1, Ordering::Relaxed) % n,
+        };
         self.d_inflight[idx].fetch_add(1, Ordering::Relaxed);
         (
             self.decode_clients[idx].clone(),
@@ -219,7 +264,7 @@ async fn pd_first_token_flow(
         obj.remove("stream_options");
     }
 
-    let (p_client, p_url, p_idx) = state.get_next_p();
+    let (p_client, p_url, p_idx) = state.get_next_p(body);
     let p_url = format!("{}{}", p_url, api_path);
     let p_response = p_client
         .post(&p_url)
@@ -296,7 +341,7 @@ async fn pd_first_token_flow(
         d_body["stream_options"] = json!({"include_usage": true});
     }
 
-    let (d_client, d_url, d_idx) = state.get_next_d();
+    let (d_client, d_url, d_idx) = state.get_next_d(&d_body);
     let d_url = format!("{}/v1/completions", d_url);
     let d_response = match d_client
         .post(&d_url)
@@ -759,7 +804,7 @@ async fn handle_completion(
         p_body["min_tokens"] = json!(0);
     }
 
-    let (p_client, p_url, p_idx) = state.get_next_p();
+    let (p_client, p_url, p_idx) = state.get_next_p(&p_body);
     let p_url = format!("{}{}", p_url, api_path);
 
     // Send to P node
@@ -827,7 +872,7 @@ async fn handle_completion(
         d_body["stream_options"] = stream_opts;
     }
 
-    let (d_client, d_url, d_idx) = state.get_next_d();
+    let (d_client, d_url, d_idx) = state.get_next_d(&d_body);
     let d_url = format!("{}{}", d_url, api_path);
 
     if org_stream {
