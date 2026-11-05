@@ -135,59 +135,22 @@ impl GpuWorkerPool {
     ) -> Result<Self, EngineError> {
         let (load_tx, load_rx) = mpsc::unbounded_channel();
         let (save_tx, save_rx) = mpsc::unbounded_channel();
-        let (load_ready_tx, load_ready_rx) = std_mpsc::channel();
-        let (save_ready_tx, save_ready_rx) = std_mpsc::channel();
 
-        // Spawn load worker thread
-        let load_device_id = device_id;
-        let load_numa = numa_node;
-        std::thread::Builder::new()
-            .name(format!("gpu{}-load", device_id))
-            .spawn(move || {
-                // Pin thread to NUMA node before any allocations
-                if load_numa.is_valid()
-                    && let Err(e) = pin_thread_to_numa_node(load_numa)
-                {
-                    warn!("Failed to pin load worker to {}: {}", load_numa, e);
-                }
-                match init_worker(load_device_id, transfer_mode) {
-                    Ok(runtime) => {
-                        let _ = load_ready_tx.send(Ok(()));
-                        load_worker_loop(load_device_id, load_rx, runtime);
-                    }
-                    Err(e) => {
-                        let _ = load_ready_tx.send(Err(e));
-                    }
-                }
-            })
-            .map_err(|e| EngineError::CudaInit(format!("Failed to spawn load worker: {e}")))?;
+        let load_ready = spawn_pinned_worker(
+            format!("gpu{}-load", device_id),
+            numa_node,
+            move || init_worker(device_id, transfer_mode),
+            move |runtime| load_worker_loop(device_id, load_rx, runtime),
+        )?;
+        let save_ready = spawn_pinned_worker(
+            format!("gpu{}-save", device_id),
+            numa_node,
+            move || init_worker(device_id, transfer_mode),
+            move |runtime| save_worker_loop(device_id, save_rx, runtime),
+        )?;
 
-        // Spawn save worker thread
-        let save_device_id = device_id;
-        let save_numa = numa_node;
-        std::thread::Builder::new()
-            .name(format!("gpu{}-save", device_id))
-            .spawn(move || {
-                // Pin thread to NUMA node before any allocations
-                if save_numa.is_valid()
-                    && let Err(e) = pin_thread_to_numa_node(save_numa)
-                {
-                    warn!("Failed to pin save worker to {}: {}", save_numa, e);
-                }
-                match init_worker(save_device_id, transfer_mode) {
-                    Ok(runtime) => {
-                        let _ = save_ready_tx.send(Ok(()));
-                        save_worker_loop(save_device_id, save_rx, runtime);
-                    }
-                    Err(e) => {
-                        let _ = save_ready_tx.send(Err(e));
-                    }
-                }
-            })
-            .map_err(|e| EngineError::CudaInit(format!("Failed to spawn save worker: {e}")))?;
-
-        wait_worker_ready("load", device_id, load_ready_rx)?;
-        wait_worker_ready("save", device_id, save_ready_rx)?;
+        wait_worker_ready("load", device_id, load_ready)?;
+        wait_worker_ready("save", device_id, save_ready)?;
 
         info!(
             "GPU worker pool started: device={}, numa_node={}, transfer_mode={:?}",
@@ -247,7 +210,42 @@ struct WorkerRuntime {
     backend: Box<dyn TransferBackend>,
 }
 
-fn wait_worker_ready(
+/// Spawn a worker thread pinned to `numa_node` (when valid) that runs `init`
+/// and then, if it succeeded, `run` on its result. The receiver reports how
+/// `init` went; pass it to [`wait_worker_ready`].
+pub(crate) fn spawn_pinned_worker<R>(
+    name: String,
+    numa_node: NumaNode,
+    init: impl FnOnce() -> Result<R, EngineError> + Send + 'static,
+    run: impl FnOnce(R) + Send + 'static,
+) -> Result<std_mpsc::Receiver<Result<(), EngineError>>, EngineError> {
+    let (ready_tx, ready_rx) = std_mpsc::channel();
+    let label = name.clone();
+    let spawn_label = name.clone();
+    std::thread::Builder::new()
+        .name(name)
+        .spawn(move || {
+            // Pin thread to NUMA node before any allocations
+            if numa_node.is_valid()
+                && let Err(e) = pin_thread_to_numa_node(numa_node)
+            {
+                warn!("Failed to pin {label} to {numa_node}: {e}");
+            }
+            match init() {
+                Ok(state) => {
+                    let _ = ready_tx.send(Ok(()));
+                    run(state);
+                }
+                Err(e) => {
+                    let _ = ready_tx.send(Err(e));
+                }
+            }
+        })
+        .map_err(|e| EngineError::CudaInit(format!("Failed to spawn {spawn_label} worker: {e}")))?;
+    Ok(ready_rx)
+}
+
+pub(crate) fn wait_worker_ready(
     worker_name: &str,
     device_id: i32,
     rx: std_mpsc::Receiver<Result<(), EngineError>>,

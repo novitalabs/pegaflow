@@ -211,6 +211,7 @@ message TransferSlotInfo {
 message TransferBlockInfo {
   bytes block_hash = 1;
   repeated TransferSlotInfo slots = 2;  // One per TP slot
+  uint64 meta = 3;                      // Opaque layout word of an object; 0 for KV blocks
 }
 
 message QueryBlocksForTransferRequest {
@@ -252,6 +253,168 @@ message ReleaseTransferLockResponse {
   uint64 released_blocks = 2;
 }
 
+// ---- Byte-addressed objects ----
+//
+// An object is an opaque byte string keyed by (fingerprint, prefix) and cut
+// into slots, as a KV block is cut into layers x ranks slots. Clients copy
+// strided byte runs between registered device regions and slots; the server
+// never interprets layers, ranks or layouts. A save writes whole slots into
+// pinned memory on the saving device's NUMA node, and an object becomes
+// visible to QueryObjects once all of its slots arrived, possibly from
+// several devices. Objects share the pinned pool, LRU, lease machinery, SSD
+// cache and MetaServer registration with blocks: QueryObjects brings an
+// object evicted from memory back from a peer or SSD. Every object carries
+// an opaque 64-bit `meta` its first writer chose (how the client cut it into
+// slots); the server stores and returns it and never reads it. A lease is
+// consumed by its loads, as a KV lease by its ranks, and released early with
+// Release; UnregisterContext and Session drop an instance's object devices
+// like its KV contexts.
+
+message ObjectKey {
+  // 32-byte digest of everything that decides the object's bytes besides the
+  // token prefix (model, state layout, dtype, ...).
+  bytes fingerprint = 1;
+  // 32-byte digest of the token prefix the object covers.
+  bytes prefix = 2;
+}
+
+message DeviceRegion {
+  // CUipcMemHandle of a cuMemAlloc allocation (64 bytes).
+  bytes ipc_handle = 1;
+  uint64 size = 2;
+}
+
+// Registers a rank once until its instance is unregistered or its session ends.
+message RegisterObjectDeviceRequest {
+  // Must equal the server's version exactly.
+  string client_version = 1;
+  string instance_id = 2;
+  uint32 rank = 3;
+  int32 device_id = 4;
+  repeated DeviceRegion regions = 5;
+}
+
+message RegisterObjectDeviceResponse {
+  // NUMA node of the GPU, where saves of this device allocate; -1 when
+  // unknown (NUMA-aware allocation off and no affinity detected).
+  int32 numa_node = 1;
+  // CPU socket of that node; 0 when unknown.
+  uint32 socket = 2;
+  // Most dims one run may have.
+  uint32 max_run_dims = 3;
+}
+
+message ObjectKeyList {
+  repeated ObjectKey keys = 1;
+}
+
+// A resume point: the first `blocks` keys of every prefix chain, and `keys`.
+message ObjectPoint {
+  uint32 blocks = 1;
+  repeated ObjectKey keys = 2;
+}
+
+// Like QueryPrefetch, over objects. Prefix chains have prefix semantics; a
+// point's keys have membership semantics. The first call of a req_id finds
+// the last point whose blocks every chain and whose keys can reach in memory,
+// from a peer or on this node's SSD (no points: the longest prefix every
+// chain reaches), brings the missing objects in, peers first and then SSD,
+// and answers loading until that ends; poll with the same req_id and the same
+// request. Ready answers from what is then held: a shorter point when the
+// fetch fell short.
+message QueryObjectsRequest {
+  string instance_id = 1;
+  string req_id = 2;
+  // Each of one fingerprint, block 0 first.
+  repeated ObjectKeyList prefixes = 3;
+  // In ascending order of preference; blocks at most the shortest chain.
+  repeated ObjectPoint points = 4;
+}
+
+message ObjectsReady {
+  // The point found, or -1.
+  int32 point = 1;
+  // Leading blocks of every chain the lease holds: the point's, or with no
+  // points the longest prefix every chain holds.
+  uint32 blocks = 2;
+  // Holds those blocks and the point's keys until its loads consume it,
+  // Release or expiry; empty when it would hold nothing.
+  bytes lease = 3;
+  // Slot count of every object the lease holds: the leading `blocks` keys
+  // of each chain in turn, then the point's keys.
+  repeated uint32 slots = 4;
+  // Meta of each of those objects, in the same order.
+  repeated uint64 metas = 5;
+}
+
+message QueryObjectsResponse {
+  oneof outcome {
+    QueryLoading loading = 1;
+    ObjectsReady ready = 2;
+  }
+}
+
+// Slots and their runs travel as packed words, as KV saves send block ids:
+// one message per slot and run costs more to encode and decode than the
+// copy plan is worth at tens of thousands of slots per request.
+//
+// A run is `region, region_offset, slot_offset, width, ndims` and then
+// `count, region_stride, slot_stride` per dim, at most 4 dims, the first
+// fastest: row (i_0, i_1, ..) is at region_offset + sum(i_d * region_stride_d)
+// of the device region and slot_offset + sum(i_d * slot_stride_d) of the
+// slot. No dims is one row. On each side no two rows may overlap. The
+// registration reply gives the most dims a run may have.
+
+message ObjectWrite {
+  ObjectKey key = 1;
+  // Slots of the whole object; every writer of a key sends the same count
+  // and meta. Slots of a writer whose count or meta differs from the first
+  // writer's are dropped.
+  uint32 slots = 2;
+  // The slots this device writes, each once, back to back: `slot, size,
+  // nruns` and then `nruns` runs. A slot's runs copy each of its size bytes
+  // once.
+  repeated uint64 writes = 3;
+  uint64 meta = 4;
+}
+
+message ObjectRead {
+  ObjectKey key = 1;
+  // The slots this device reads, back to back: `slot, nruns` and then
+  // `nruns` runs.
+  repeated uint64 reads = 2;
+}
+
+message SaveObjectsRequest {
+  string instance_id = 1;
+  uint32 rank = 2;
+  repeated ObjectWrite writes = 3;
+}
+
+message SaveObjectsResponse {}
+
+message ObjectLoad {
+  // A lease of this instance holding every key read.
+  bytes lease = 1;
+  repeated ObjectRead reads = 2;
+  // LoadObjects requests that read this lease in all, at least 1, the same
+  // in each; a request names a lease once. Each checked one consumes the
+  // lease once and the last releases it; one that fails checking releases
+  // every lease it names.
+  uint32 consumers = 3;
+}
+
+message LoadObjectsRequest {
+  string instance_id = 1;
+  uint32 rank = 2;
+  repeated ObjectLoad loads = 3;
+  // A LoadState the server sets once the copies finish or fail; the reply
+  // comes as soon as the request is checked.
+  string load_state_shm = 4;
+}
+
+message LoadObjectsResponse {}
+
 service Engine {
   rpc RegisterContextBatch(RegisterContextRequest) returns (RegisterContextResponse);
   rpc Save(SaveRequest) returns (SaveResponse);
@@ -271,6 +434,16 @@ service Engine {
   // Liveness channel: server drops the instance's CUDA IPC mappings when
   // this stream closes (vllm process dies or disconnects).
   rpc Session(SessionRequest) returns (stream SessionEvent);
+  // Byte-addressed objects: open one device's regions for object copies.
+  rpc RegisterObjectDevice(RegisterObjectDeviceRequest) returns (RegisterObjectDeviceResponse);
+  // Find the last resume point whose objects exist, bring them into memory
+  // and lease them.
+  rpc QueryObjects(QueryObjectsRequest) returns (QueryObjectsResponse);
+  // Copy device bytes into object slots; returns after the copies complete,
+  // and the objects seal asynchronously as KV blocks do.
+  rpc SaveObjects(SaveObjectsRequest) returns (SaveObjectsResponse);
+  // Copy leased objects into device memory, completing a LoadState as Load does.
+  rpc LoadObjects(LoadObjectsRequest) returns (LoadObjectsResponse);
 }
 
 // MetaServer service for managing block hash keys across multi-node instances
@@ -311,6 +484,9 @@ message QueryPrefixBlocksRequest {
   string namespace = 1;
   repeated bytes block_hashes = 2;  // ordered by prefix position
   string exclude_node = 3;          // requester address; never return it as an owner
+  // Membership instead of prefix semantics: hashes no peer holds are skipped
+  // rather than ending the plan, and `found` lists the hashes it covers.
+  bool members = 4;
 }
 
 message FetchSegment {
@@ -321,7 +497,10 @@ message FetchSegment {
 message QueryPrefixBlocksResponse {
   reserved 1;
   reserved "nodes";
+  // Over the leading hashes, or with `members` over the `found` ones in order.
   repeated FetchSegment segments = 2;
+  // With `members`: ascending indexes into `block_hashes` the segments cover.
+  repeated uint32 found = 3;
 }
 
 // Block hashes of one namespace, oldest first.

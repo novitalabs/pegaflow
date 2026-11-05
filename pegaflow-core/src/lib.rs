@@ -21,6 +21,7 @@ mod layout;
 mod lease;
 pub use pegaflow_common::logging;
 mod metrics;
+mod objects;
 mod offload;
 mod pinned_mem;
 mod pinned_pool;
@@ -44,6 +45,10 @@ pub use internode::{
 };
 use layout::KVCacheLayout;
 pub use lease::QueryLeaseId;
+pub use objects::{
+    MAX_RUN_DIMS, ObjectDim, ObjectKey, ObjectLoad, ObjectPoint, ObjectQuery, ObjectQueryStatus,
+    ObjectRead, ObjectRun, ObjectWrite, SlotRead, SlotWrite,
+};
 pub use pegaflow_common::NumaNode;
 use pegaflow_common::{NumaTopology, group_hash};
 pub use pinned_pool::PinnedAllocation;
@@ -114,6 +119,23 @@ impl From<LoadStateError> for EngineError {
     }
 }
 
+/// Attach the `LoadState` at `load_state_shm` and run `submit` with a
+/// completion that sets it; marks it failed if `submit` fails before
+/// handing the load to a worker.
+fn submit_with_load_state(
+    load_state_shm: &str,
+    what: &str,
+    submit: impl FnOnce(LoadCompletion) -> Result<(), EngineError>,
+) -> Result<(), EngineError> {
+    let load_state = LoadState::attach(load_state_shm)?;
+    let result = submit(LoadCompletion::Shm(load_state_shm.to_string()));
+    if let Err(ref e) = result {
+        log::error!("{what} pre-submit error: {e:?}");
+        load_state.set_error();
+    }
+    result
+}
+
 /// Main engine for managing KV cache offloading.
 ///
 /// `PegaEngine` is the top-level orchestrator that:
@@ -132,6 +154,8 @@ pub struct PegaEngine {
     topology: Arc<NumaTopology>,
     /// Query-ready blocks owned by opaque scheduler leases.
     query_leases: QueryLeaseManager,
+    /// Byte-addressed object devices.
+    objects: objects::ObjectStore,
 }
 
 impl PegaEngine {
@@ -176,6 +200,7 @@ impl PegaEngine {
             storage,
             topology,
             query_leases: QueryLeaseManager::default(),
+            objects: objects::ObjectStore::default(),
         })
     }
 
@@ -220,6 +245,20 @@ impl PegaEngine {
         instances.insert(instance_id.to_string(), Arc::clone(&instance));
         self.storage.set_has_instance(true);
         Ok(instance)
+    }
+
+    /// NUMA affinity of GPU `device_id`; known whenever NUMA-aware allocation is on.
+    fn gpu_numa(&self, device_id: i32) -> Result<NumaNode, EngineError> {
+        let numa_node = self.topology.numa_for_gpu(device_id);
+        if self.storage.is_numa_enabled() && numa_node.is_unknown() {
+            return Err(EngineError::InvalidArgument(format!(
+                "NUMA-aware allocation is enabled, but GPU {} NUMA affinity is unknown. \
+                 Please ensure nvidia-smi is available and GPU NUMA topology is detectable, \
+                 or disable NUMA-aware allocation.",
+                device_id
+            )));
+        }
+        Ok(numa_node)
     }
 
     /// Look up an instance by ID.
@@ -412,18 +451,7 @@ impl PegaEngine {
         let instance =
             self.get_or_create_instance(instance_id, namespace, tp_size, world_size, page_first)?;
 
-        // Get NUMA affinity for this GPU
-        let numa_node = self.topology.numa_for_gpu(device_id);
-
-        // Validate NUMA topology if NUMA-aware allocation is enabled
-        if self.storage.is_numa_enabled() && numa_node.is_unknown() {
-            return Err(EngineError::InvalidArgument(format!(
-                "NUMA-aware allocation is enabled, but GPU {} NUMA affinity is unknown. \
-                 Please ensure nvidia-smi is available and GPU NUMA topology is detectable, \
-                 or disable NUMA-aware allocation.",
-                device_id
-            )));
-        }
+        let numa_node = self.gpu_numa(device_id)?;
 
         // Register GPU with all layers. The connector picks the backend per
         // model and sends it with the registration.
@@ -451,12 +479,14 @@ impl PegaEngine {
             .write()
             .expect("instances write lock poisoned");
         let removed = instances.remove(instance_id);
-        if instances.is_empty() {
+        // Dropped on return, outside the lock: that closes idle devices' regions.
+        let devices = self.objects.remove_instance(instance_id);
+        if instances.is_empty() && !self.objects.has_devices() {
             self.storage.set_has_instance(false);
         }
         drop(instances);
 
-        if removed.is_none() {
+        if removed.is_none() && devices.is_empty() {
             return Err(EngineError::InstanceMissing(instance_id.to_string()));
         }
         self.query_leases.release_instance(instance_id);
@@ -470,8 +500,13 @@ impl PegaEngine {
             .instances
             .write()
             .expect("instances write lock poisoned");
-        let ids: Vec<String> = instances.keys().cloned().collect();
+        let mut ids: Vec<String> = instances.keys().cloned().collect();
         instances.clear();
+        // Dropped on return, outside the lock, as in `unregister_instance`.
+        let devices = self.objects.remove_all();
+        ids.extend(devices.keys().map(|(i, _)| i.clone()));
+        ids.sort();
+        ids.dedup();
         // Under the lock, so a concurrent registration cannot be overwritten.
         self.storage.set_has_instance(false);
         drop(instances);
@@ -614,11 +649,11 @@ impl PegaEngine {
         topology.group_total_slots(group_id)?;
 
         let namespace = instance.namespace();
-        let encoded: Vec<Vec<u8>> = block_hashes
+        let keys: Vec<BlockKey> = block_hashes
             .iter()
-            .map(|hash| group_hash(hash, group_id))
+            .map(|hash| BlockKey::new(namespace.to_string(), group_hash(hash, group_id)))
             .collect();
-        Ok(self.storage.get_membership(namespace, &encoded))
+        Ok(self.storage.get_blocks_aligned(&keys))
     }
 
     /// Create an opaque lease that owns query-ready blocks.
@@ -671,23 +706,20 @@ impl PegaEngine {
         layer_groups: &[Vec<&str>],
         loads: &[(QueryLeaseId, Vec<Vec<Option<usize>>>)],
     ) -> Result<(), EngineError> {
-        let load_state = LoadState::attach(load_state_shm)?;
-
-        let result = self.batch_load_kv_blocks_multi_layer_inner(
-            instance_id,
-            tp_rank,
-            device_id,
-            layer_groups,
-            loads,
-            LoadCompletion::Shm(load_state_shm.to_string()),
-        );
-
-        if let Err(ref e) = result {
-            log::error!("batch_load_kv_blocks_multi_layer pre-submit error: {e:?}");
-            load_state.set_error();
-        }
-
-        result
+        submit_with_load_state(
+            load_state_shm,
+            "batch_load_kv_blocks_multi_layer",
+            |completion| {
+                self.batch_load_kv_blocks_multi_layer_inner(
+                    instance_id,
+                    tp_rank,
+                    device_id,
+                    layer_groups,
+                    loads,
+                    completion,
+                )
+            },
+        )
     }
 
     /// In-process variant of [`Self::batch_load_kv_blocks_multi_layer`]: instead

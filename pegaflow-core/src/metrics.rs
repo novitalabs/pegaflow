@@ -50,6 +50,9 @@ pub(crate) struct CoreMetrics {
     // Inflight (write path safety/health)
     pub inflight_bytes: UpDownCounter<i64>,
     pub inflight_gc_cleaned: Counter<u64>,
+    /// Slot writes dropped because their slot count or meta differs from the
+    /// block's first writer.
+    pub slot_writes_dropped: Counter<u64>,
     /// Prefetch tasks older than the background GC age threshold (default 5m).
     pub prefetch_stale_gc_total: Counter<u64>,
 
@@ -281,6 +284,10 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
             inflight_gc_cleaned: meter
                 .u64_counter("pegaflow_inflight_gc_cleaned")
                 .with_description("Stale inflight blocks cleaned by background GC")
+                .build(),
+            slot_writes_dropped: meter
+                .u64_counter("pegaflow_slot_writes_dropped")
+                .with_description("Slot writes dropped: slot count or meta differs from the block's first writer")
                 .build(),
             prefetch_stale_gc_total: meter
                 .u64_counter("pegaflow_prefetch_stale_gc_total")

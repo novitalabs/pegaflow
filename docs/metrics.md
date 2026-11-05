@@ -217,6 +217,19 @@ the new gauge is additive. The default HLL size changes from 16,384 registers
 register storage; sliding slots make the live tracker a few MiB per server.
 The setting remains configurable with `--metric-hll-bucket-bits`.
 
+### Write Path Metrics
+- **pegaflow_inflight_bytes** (Gauge)
+  - Bytes in blocks that are allocated but not yet sealed
+  - Use case: Spot saves whose slots never all arrive
+
+- **pegaflow_inflight_gc_cleaned_total** (Counter)
+  - Stale inflight blocks removed by the background GC
+  - Use case: Detect writers that leave blocks partial
+
+- **pegaflow_slot_writes_dropped_total** (Counter)
+  - Slot writes dropped because their slot count or meta differs from the block's first writer (inflight or resident)
+  - Use case: Detect object writers whose layouts disagree; v1 KV saves never trigger it
+
 ### Save Metrics (GPU → CPU)
 - **pegaflow_save_bytes_total** (Counter)
   - Total bytes saved from GPU to CPU storage

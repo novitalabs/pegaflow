@@ -11,7 +11,7 @@ use mea::singleflight::Group;
 use pegaflow_proto::proto::engine::engine_client::EngineClient;
 use pegaflow_proto::proto::engine::{
     FetchSegment, QueryBlocksForTransferRequest, QueryBlocksForTransferResponse,
-    RdmaHandshakeRequest, TransferBlockInfo, TransferSlotInfo,
+    QueryPrefixBlocksResponse, RdmaHandshakeRequest, TransferBlockInfo, TransferSlotInfo,
 };
 use pegaflow_transfer::{ConnectionStatus, HandshakeMetadata, TransferDesc, TransferOp};
 use tonic::transport::{Channel, Endpoint};
@@ -248,38 +248,64 @@ impl RdmaFetchStore {
         namespace: &str,
         hashes: &[Vec<u8>],
     ) -> Option<FetchPlan> {
-        if hashes.is_empty() {
-            return None;
-        }
-
-        let segments = match self
-            .metaserver_client
-            .query_plan(namespace, hashes, &self.advertise_addr)
-            .await
-        {
-            Ok(segments) => segments,
-            Err(e) => {
-                warn!("MetaServer query failed for remote fetch: {e}");
-                return None;
-            }
-        };
-
-        let plan = match validate_fetch_plan(segments, hashes.len(), &self.advertise_addr) {
-            Ok(plan) => plan?,
-            Err(error) => {
-                warn!("MetaServer returned invalid remote fetch plan: {error}");
-                return None;
-            }
-        };
-
+        let resp = self.query(namespace, hashes, false).await?;
+        let plan = self.validate(resp.segments, hashes.len())?;
         debug!(
             "Remote prefix query: segments={} prefix={}/{}",
             plan.segments.len(),
             plan.block_count,
             hashes.len(),
         );
-
         Some(plan)
+    }
+
+    /// Query MetaServer for the `hashes` peers hold, wherever they are: their
+    /// ascending indexes and a plan over those hashes in that order.
+    pub(crate) async fn query_members(
+        &self,
+        namespace: &str,
+        hashes: &[Vec<u8>],
+    ) -> Option<(Vec<usize>, FetchPlan)> {
+        let resp = self.query(namespace, hashes, true).await?;
+        let found: Vec<usize> = resp.found.iter().map(|&i| i as usize).collect();
+        if found.windows(2).any(|w| w[0] >= w[1]) || found.last() >= Some(&hashes.len()) {
+            warn!(
+                "MetaServer returned invalid member indexes for {} hashes",
+                hashes.len()
+            );
+            return None;
+        }
+        let plan = self.validate(resp.segments, found.len())?;
+        debug!(
+            "Remote member query: segments={} found={}/{} planned={}",
+            plan.segments.len(),
+            found.len(),
+            hashes.len(),
+            plan.block_count,
+        );
+        Some((found, plan))
+    }
+
+    async fn query(
+        &self,
+        namespace: &str,
+        hashes: &[Vec<u8>],
+        members: bool,
+    ) -> Option<QueryPrefixBlocksResponse> {
+        if hashes.is_empty() {
+            return None;
+        }
+        self.metaserver_client
+            .query_plan(namespace, hashes, &self.advertise_addr, members)
+            .await
+            .inspect_err(|e| warn!("MetaServer query failed for remote fetch: {e}"))
+            .ok()
+    }
+
+    fn validate(&self, segments: Vec<FetchSegment>, hash_count: usize) -> Option<FetchPlan> {
+        validate_fetch_plan(segments, hash_count, &self.advertise_addr)
+            .inspect_err(|e| warn!("MetaServer returned invalid remote fetch plan: {e}"))
+            .ok()?
     }
 
     pub(crate) async fn fetch_plan(
@@ -549,7 +575,7 @@ async fn ensure_connected(
 /// The NUMA travels with the slot so a re-served block advertises real topology.
 type StagedSlot = (Vec<SegmentAlloc>, NumaNode);
 /// A staged block awaiting SealedBlock rebuild: its hash and per-slot allocations.
-type StagedBlock = (Vec<u8>, Vec<StagedSlot>);
+type StagedBlock = (Vec<u8>, Vec<StagedSlot>, u64);
 
 /// Allocate local memory, build TransferDescs, execute RDMA READ, build SealedBlocks.
 async fn fetch_blocks_via_rdma(
@@ -629,7 +655,7 @@ async fn fetch_blocks_via_rdma(
                     staged.unwrap_or_else(|| (Vec::new(), NumaNode(slot.numa_node)))
                 })
                 .collect();
-            block_allocs.push((block_info.block_hash.clone(), slot_allocs));
+            block_allocs.push((block_info.block_hash.clone(), slot_allocs, block_info.meta));
         }
 
         if all_descs.is_empty() {
@@ -681,7 +707,7 @@ async fn fetch_blocks_via_rdma(
     // Build SealedBlocks from allocated memory
     let rebuild_start = Instant::now();
     let mut result: PrefetchResult = Vec::with_capacity(block_allocs.len());
-    for (hash, slot_allocs) in block_allocs {
+    for (hash, slot_allocs, meta) in block_allocs {
         let key = BlockKey::new(namespace.to_string(), hash);
         let slots: Vec<(RawBlock, NumaNode)> = slot_allocs
             .into_iter()
@@ -697,7 +723,7 @@ async fn fetch_blocks_via_rdma(
                 (RawBlock::new(segments), numa)
             })
             .collect();
-        let sealed = Arc::new(SealedBlock::from_slots(slots));
+        let sealed = Arc::new(SealedBlock::from_slots(slots, meta));
         result.push((key, sealed));
     }
     timing.rebuild = rebuild_start.elapsed();
@@ -949,7 +975,7 @@ mod tests {
     fn fetched_block(hash: u8) -> (BlockKey, Arc<SealedBlock>) {
         (
             BlockKey::new("ns".to_string(), vec![hash]),
-            Arc::new(SealedBlock::from_slots(Vec::new())),
+            Arc::new(SealedBlock::from_slots(Vec::new(), 0)),
         )
     }
 
