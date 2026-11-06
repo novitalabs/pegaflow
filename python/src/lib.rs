@@ -25,6 +25,7 @@ use tonic::{
 mod pd_rdma;
 #[cfg(feature = "rdma")]
 mod rdma_v1;
+mod semantics;
 
 // Custom Python exceptions for error classification
 create_exception!(pegaflow, PegaFlowError, PyException);
@@ -678,6 +679,7 @@ fn pegaflow(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("PegaflowInternal", m.py().get_type::<PegaflowInternal>())?;
     m.add_class::<QueryLoading>()?;
     m.add_class::<QueryReady>()?;
+    semantics::add_module(m)?;
 
     Ok(())
 }

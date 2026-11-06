@@ -1,0 +1,5 @@
+[
+  {"id": "group0-raw", "hash": [1, 2, 3], "group": 0, "key": [1, 2, 3]},
+  {"id": "group1-suffix", "hash": [1, 2, 3], "group": 1, "key": [1, 2, 3, 0, 0, 0, 1]},
+  {"id": "group-be-order", "hash": [255], "group": 258, "key": [255, 0, 0, 1, 2]}
+]

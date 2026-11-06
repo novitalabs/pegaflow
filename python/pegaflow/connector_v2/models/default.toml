@@ -1,0 +1,34 @@
+# Policy knobs shared by every model; models/<profile>.toml overrides them.
+# Keys must be fields of pegaflow.connector_v2.policy.Policy.
+
+# How long a request may stay unscheduled while the server prefetches
+# (SSD / remote), and, on a separate clock, while another request's async
+# load of its blocks lands (vLLM then serves them from its prefix cache).
+# 0 = never wait: a Loading answer counts as a miss and every request loads
+# its own copy.
+loading_wait_ms = 1000
+
+# Hits of at most this many tokens are copied before the forward of the step
+# that schedules them (no extra scheduling round trip, the step waits for the
+# copy); longer hits load asynchronously so one big copy does not stall the
+# whole batch. 0 = always asynchronous. The core only loads synchronously when
+# vLLM can recover from a failed synchronous load (one KV cache group, no
+# block zeroing); otherwise every load is asynchronous.
+sync_load_tokens = 256
+
+# Save batching. Each step's saves are held and merged with later steps' into
+# one save RPC, sent once the oldest held step has seen save_batch_steps steps
+# (save_batch_steps = 1 sends every step). Fewer, larger submissions cost
+# vLLM's GPU less: the server copies from its own CUDA context, which
+# time-slices with vLLM's. Finished requests are not held for it: a step
+# that reuses a block a held save still reads sends the batch and waits for
+# it (a fence). The worker also sends held saves after a fixed 1 s staleness
+# cap (checked once per step, so a hold can run about one step past it).
+# Preemption flushes and shutdown send at once.
+save_batch_steps = 32
+
+# Held saves are sent at once on steps where vLLM's GPU KV cache usage
+# (0..1, after the step's allocations) is at least this: freed blocks are
+# then reused soon, and a fence on a held save would wait for the batch.
+# > 1 disables it.
+save_batch_max_kv_usage = 0.9
