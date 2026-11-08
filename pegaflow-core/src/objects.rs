@@ -372,7 +372,7 @@ enum Direction {
     Load,
 }
 
-/// A copy stream of one device and its batch copy kernel.
+/// A copy stream of one device and the backend the rank registered with.
 struct Lane {
     ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
@@ -380,7 +380,7 @@ struct Lane {
 }
 
 impl Lane {
-    fn new(ctx: &Arc<CudaContext>) -> Result<Self, EngineError> {
+    fn new(ctx: &Arc<CudaContext>, mode: TransferMode) -> Result<Self, EngineError> {
         ctx.bind_to_thread()
             .map_err(|e| EngineError::CudaInit(format!("{e:?}")))?;
         let stream = ctx
@@ -389,7 +389,7 @@ impl Lane {
         Ok(Self {
             ctx: Arc::clone(ctx),
             stream,
-            backend: build_backend(TransferMode::Kernel, ctx)?,
+            backend: build_backend(mode, ctx)?,
         })
     }
 
@@ -625,6 +625,7 @@ impl PegaEngine {
         device_id: i32,
         namespaces: Vec<NamespaceMeta>,
         regions: &[(Vec<u8>, u64)],
+        transfer_mode: TransferMode,
     ) -> Result<(), EngineError> {
         let mut table = HashMap::with_capacity(namespaces.len());
         for meta in namespaces {
@@ -684,7 +685,7 @@ impl PegaEngine {
             let ready = spawn_pinned_worker(
                 format!("gpu{device_id}-obj{name}"),
                 numa,
-                move || Lane::new(&ctx),
+                move || Lane::new(&ctx, transfer_mode),
                 move |lane| copy_worker(lane, device_id, dir, rx),
             )?;
             wait_worker_ready(&format!("object {name}"), device_id, ready)?;
@@ -719,7 +720,7 @@ impl PegaEngine {
         }
         info!(
             "Registered context v2: instance={instance_id} rank={rank} device={device_id} \
-             namespaces={namespace_count} regions={region_count} numa={numa}"
+             namespaces={namespace_count} regions={region_count} numa={numa} mode={transfer_mode:?}"
         );
         Ok(())
     }

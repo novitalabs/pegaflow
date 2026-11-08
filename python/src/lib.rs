@@ -618,15 +618,18 @@ impl EngineRpcClient {
     ///         and optional `interleave_token`
     ///     regions: `(ipc_handle, size, name)` per whole cuMemAlloc allocation;
     ///         span `region_idx` indexes this list
+    ///     transfer_backend: "kernel" (default) or "direct"
     ///
     /// Raises:
     ///     ValueError: If the server rejects the registration.
+    #[pyo3(signature = (instance_id, namespace_metas, regions, transfer_backend = "kernel"))]
     fn register_context_v2(
         &self,
         py: Python<'_>,
         instance_id: String,
         namespace_metas: Vec<Bound<'_, PyDict>>,
         regions: Vec<(Vec<u8>, u64, String)>,
+        transfer_backend: &str,
     ) -> PyResult<()> {
         let request = RegisterContextV2 {
             instance_id,
@@ -643,7 +646,7 @@ impl EngineRpcClient {
                 })
                 .collect(),
             client_version: env!("CARGO_PKG_VERSION").to_string(),
-            transfer_mode: TransferMode::Kernel as i32,
+            transfer_mode: transfer_mode(transfer_backend)? as i32,
         };
         self.call(py, "register_context_v2", |mut c| async move {
             Ok(c.register_context_v2(request).await?.into_inner())

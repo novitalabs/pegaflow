@@ -302,7 +302,7 @@ message RegisterContextV2 {
   // Save / Load is the index into this list, in registration order.
   repeated DeviceRegion regions = 3;
   string client_version = 4;
-  // Not read yet: object copies always use the batch copy kernel.
+  // H2D/D2H transfer backend the client chose for this rank's copies.
   TransferMode transfer_mode = 5;
 }
 

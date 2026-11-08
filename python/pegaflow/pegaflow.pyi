@@ -257,6 +257,7 @@ class EngineRpcClient:
         instance_id: str,
         namespace_metas: list[dict[str, object]],
         regions: list[tuple[bytes, int, str]],
+        transfer_backend: str = "kernel",
     ) -> None:
         """RPC V2: register this rank's namespaces and device regions.
 
@@ -269,6 +270,7 @@ class EngineRpcClient:
                 ``interleave_token``.
             regions: ``(ipc_handle, size, name)`` per whole cuMemAlloc
                 allocation; span ``region_idx`` indexes this list.
+            transfer_backend: ``"kernel"`` (default) or ``"direct"``.
 
         Raises:
             ValueError: If the server rejects the registration.

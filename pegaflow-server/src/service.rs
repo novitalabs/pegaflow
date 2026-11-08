@@ -1143,6 +1143,10 @@ impl Engine for GrpcEngineService {
     ) -> Result<Response<RegisterContextV2Response>, Status> {
         let start = Instant::now();
         let req = request.into_inner();
+        let transfer_mode = match req.transfer_mode() {
+            ProtoTransferMode::Direct => pegaflow_core::TransferMode::Direct,
+            ProtoTransferMode::Kernel => pegaflow_core::TransferMode::Kernel,
+        };
         let RegisterContextV2 {
             instance_id,
             namespace_meta,
@@ -1207,6 +1211,7 @@ impl Engine for GrpcEngineService {
                     device_id,
                     namespaces,
                     &regions,
+                    transfer_mode,
                 )
             })
             .await
