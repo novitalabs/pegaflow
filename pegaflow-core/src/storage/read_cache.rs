@@ -690,7 +690,7 @@ mod tests {
     }
 
     fn make_block() -> Arc<SealedBlock> {
-        Arc::new(SealedBlock::from_slots(Vec::new(), 0))
+        Arc::new(SealedBlock::from_slots(Vec::new()))
     }
 
     fn assert_class(cache: &ReadCache, key: &BlockKey, expected: ResidentClass) {
@@ -744,13 +744,10 @@ mod tests {
                 .allocate(NonZeroU64::new(BLOCK).unwrap(), None)
                 .expect("test pool should have space");
             let ptr = alloc.as_non_null();
-            Arc::new(SealedBlock::from_slots(
-                vec![(
-                    RawBlock::new(vec![Segment::new(ptr, BLOCK as usize, alloc)]),
-                    pegaflow_common::NumaNode::UNKNOWN,
-                )],
-                0,
-            ))
+            Arc::new(SealedBlock::from_slots(vec![(
+                RawBlock::new(vec![Segment::new(ptr, BLOCK as usize, alloc)]),
+                pegaflow_common::NumaNode::UNKNOWN,
+            )]))
         };
         // Ten 100-byte blocks fill a 1000-byte cache.
         let cache = ReadCache::new(1000, false, None);

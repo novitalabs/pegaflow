@@ -575,7 +575,7 @@ async fn ensure_connected(
 /// The NUMA travels with the slot so a re-served block advertises real topology.
 type StagedSlot = (Vec<SegmentAlloc>, NumaNode);
 /// A staged block awaiting SealedBlock rebuild: its hash and per-slot allocations.
-type StagedBlock = (Vec<u8>, Vec<StagedSlot>, u64);
+type StagedBlock = (Vec<u8>, Vec<StagedSlot>);
 
 /// Allocate local memory, build TransferDescs, execute RDMA READ, build SealedBlocks.
 async fn fetch_blocks_via_rdma(
@@ -655,7 +655,7 @@ async fn fetch_blocks_via_rdma(
                     staged.unwrap_or_else(|| (Vec::new(), NumaNode(slot.numa_node)))
                 })
                 .collect();
-            block_allocs.push((block_info.block_hash.clone(), slot_allocs, block_info.meta));
+            block_allocs.push((block_info.block_hash.clone(), slot_allocs));
         }
 
         if all_descs.is_empty() {
@@ -707,7 +707,7 @@ async fn fetch_blocks_via_rdma(
     // Build SealedBlocks from allocated memory
     let rebuild_start = Instant::now();
     let mut result: PrefetchResult = Vec::with_capacity(block_allocs.len());
-    for (hash, slot_allocs, meta) in block_allocs {
+    for (hash, slot_allocs) in block_allocs {
         let key = BlockKey::new(namespace.to_string(), hash);
         let slots: Vec<(RawBlock, NumaNode)> = slot_allocs
             .into_iter()
@@ -723,7 +723,7 @@ async fn fetch_blocks_via_rdma(
                 (RawBlock::new(segments), numa)
             })
             .collect();
-        let sealed = Arc::new(SealedBlock::from_slots(slots, meta));
+        let sealed = Arc::new(SealedBlock::from_slots(slots));
         result.push((key, sealed));
     }
     timing.rebuild = rebuild_start.elapsed();
@@ -975,7 +975,7 @@ mod tests {
     fn fetched_block(hash: u8) -> (BlockKey, Arc<SealedBlock>) {
         (
             BlockKey::new("ns".to_string(), vec![hash]),
-            Arc::new(SealedBlock::from_slots(Vec::new(), 0)),
+            Arc::new(SealedBlock::from_slots(Vec::new())),
         )
     }
 

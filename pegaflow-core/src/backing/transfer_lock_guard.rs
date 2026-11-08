@@ -179,18 +179,18 @@ mod tests {
             Err(Status::unimplemented("stub"))
         }
 
-        async fn register_object_device(
+        async fn register_context_v2(
             &self,
-            _request: Request<pegaflow_proto::proto::engine::RegisterObjectDeviceRequest>,
-        ) -> Result<Response<pegaflow_proto::proto::engine::RegisterObjectDeviceResponse>, Status>
+            _request: Request<pegaflow_proto::proto::engine::RegisterContextV2>,
+        ) -> Result<Response<pegaflow_proto::proto::engine::RegisterContextV2Response>, Status>
         {
             Err(Status::unimplemented("stub"))
         }
 
-        async fn query_objects(
+        async fn query_object(
             &self,
-            _request: Request<pegaflow_proto::proto::engine::QueryObjectsRequest>,
-        ) -> Result<Response<pegaflow_proto::proto::engine::QueryObjectsResponse>, Status> {
+            _request: Request<pegaflow_proto::proto::engine::QueryObjectRequest>,
+        ) -> Result<Response<pegaflow_proto::proto::engine::QueryObjectResponse>, Status> {
             Err(Status::unimplemented("stub"))
         }
 

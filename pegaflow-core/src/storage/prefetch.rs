@@ -68,26 +68,8 @@ impl RdmaFetch {
         Some((found, blocks))
     }
 
-    /// How many leading `hashes` peers hold, per the MetaServer.
-    pub(super) async fn remote_prefix(&self, namespace: &str, hashes: &[Vec<u8>]) -> usize {
-        self.0
-            .query_plan(namespace, hashes)
-            .await
-            .map_or(0, |plan| plan.block_count())
-    }
-
-    /// Indexes of the `hashes` peers hold, per the MetaServer.
-    pub(super) async fn remote_members(&self, namespace: &str, hashes: &[Vec<u8>]) -> Vec<usize> {
-        self.0
-            .query_members(namespace, hashes)
-            .await
-            .map_or_else(Vec::new, |(found, plan)| {
-                found.into_iter().take(plan.block_count()).collect()
-            })
-    }
-
-    /// What peers serve of `hashes`, each on its own: one MetaServer query
-    /// and one fetch per holder for all of them.
+    /// What peers serve of `hashes`, each on its own: one MetaServer
+    /// membership query and one fetch per holder for all of them.
     async fn fetch_members(
         &self,
         req_id: &str,
@@ -104,14 +86,6 @@ impl RdmaFetch {
 
 #[cfg(not(feature = "rdma"))]
 impl RdmaFetch {
-    pub(super) async fn remote_prefix(&self, _namespace: &str, _hashes: &[Vec<u8>]) -> usize {
-        0
-    }
-
-    pub(super) async fn remote_members(&self, _namespace: &str, _hashes: &[Vec<u8>]) -> Vec<usize> {
-        Vec::new()
-    }
-
     async fn fetch_members(
         &self,
         _req_id: &str,
@@ -197,30 +171,21 @@ struct PrefetchTaskInput {
     wait_for_full_prefix: bool,
 }
 
-/// Keys of one namespace a parts fetch brings in: as a prefix, peers serve
-/// what they can from the first key, then SSD from where they stopped; as
-/// members, peers serve any of them and SSD any of the rest.
-pub(crate) struct FetchPart {
-    pub(crate) keys: Vec<BlockKey>,
-    /// Reserve SSD budget for every key SSD should serve, or for none.
-    pub(crate) whole: bool,
-    pub(crate) members: bool,
+/// A membership fetch: unlike a prefix fetch, every key stands on its own.
+struct MembersEntry {
+    handle: JoinHandle<MembersResult>,
+    started_at: Instant,
 }
 
-/// Blocks a parts fetch brought in, by the tier that served them.
+/// Blocks a membership fetch brought in, by the tier that served them.
 #[derive(Default)]
-struct PartsResult {
+struct MembersResult {
     rdma: PrefetchResult,
     ssd: PrefetchResult,
 }
 
-struct PartsEntry {
-    handle: JoinHandle<PartsResult>,
-    started_at: Instant,
-}
-
-pub(crate) enum PartsPoll {
-    /// No parts fetch of this request.
+pub(crate) enum MembersPoll {
+    /// No membership fetch of this id.
     Idle,
     Loading,
     /// The fetch ended; its blocks are now in the read cache.
@@ -229,8 +194,8 @@ pub(crate) enum PartsPoll {
 
 struct PrefetchState {
     active: HashMap<String, PrefetchEntry>,
-    /// Parts fetches, by request.
-    parts: HashMap<String, PartsEntry>,
+    /// Membership fetches, by query id.
+    members: HashMap<String, MembersEntry>,
     /// Reserved SSD prefetch budget for active background tasks.
     reserved_ssd_prefetch_blocks: usize,
     /// req_ids where the advertised RDMA owner served fewer blocks than the
@@ -277,7 +242,7 @@ impl PrefetchScheduler {
         Self {
             state: Arc::new(Mutex::new(PrefetchState {
                 active: HashMap::new(),
-                parts: HashMap::new(),
+                members: HashMap::new(),
                 reserved_ssd_prefetch_blocks: 0,
                 failed_remote: HashMap::new(),
             })),
@@ -288,21 +253,15 @@ impl PrefetchScheduler {
         }
     }
 
-    /// The RDMA fetcher, if this node fetches from peers.
-    pub(super) fn rdma_fetch(&self) -> Option<&RdmaFetch> {
-        self.rdma_fetch.as_ref()
-    }
-
-    /// Start fetching `parts` for `req_id`, each peers first and then SSD.
-    /// False when nothing can serve them; true as well when a fetch of
-    /// `req_id` already runs.
-    pub(super) fn start_parts(&self, req_id: &str, parts: Vec<FetchPart>) -> bool {
-        let parts: Vec<FetchPart> = parts.into_iter().filter(|p| !p.keys.is_empty()).collect();
-        if parts.is_empty() || (self.rdma_fetch.is_none() && self.ssd_store.is_none()) {
+    /// Start fetching the `keys` of one namespace for `id`, peers first and
+    /// then SSD, each key on its own. False when nothing can serve them;
+    /// true as well when a fetch of `id` already runs.
+    pub(super) fn start_members(&self, id: &str, keys: Vec<BlockKey>) -> bool {
+        if keys.is_empty() || (self.rdma_fetch.is_none() && self.ssd_store.is_none()) {
             return false;
         }
         let mut state = self.state.lock();
-        if state.parts.contains_key(req_id) {
+        if state.members.contains_key(id) {
             return true;
         }
         let deps = PrefetchTaskDeps {
@@ -311,11 +270,11 @@ impl PrefetchScheduler {
             prefetch_state: Arc::clone(&self.state),
             max_prefetch_blocks: self.max_prefetch_blocks,
         };
-        let req = req_id.to_string();
-        let handle = tokio::spawn(async move { run_parts_task(deps, req, parts).await });
-        state.parts.insert(
-            req_id.to_string(),
-            PartsEntry {
+        let task_id = id.to_string();
+        let handle = tokio::spawn(async move { run_members_task(deps, task_id, keys).await });
+        state.members.insert(
+            id.to_string(),
+            MembersEntry {
                 handle,
                 started_at: Instant::now(),
             },
@@ -323,40 +282,33 @@ impl PrefetchScheduler {
         true
     }
 
-    /// Poll the parts fetch of `req_id`. A finished one enters the read
+    /// Poll the membership fetch of `id`. A finished one enters the read
     /// cache, and the blocks peers served are announced like local ones.
-    pub(super) async fn poll_parts(&self, read_cache: &ReadCache, req_id: &str) -> PartsPoll {
+    pub(super) async fn poll_members(&self, read_cache: &ReadCache, id: &str) -> MembersPoll {
         let entry = {
             let mut state = self.state.lock();
-            match state.parts.get(req_id) {
-                None => return PartsPoll::Idle,
-                Some(e) if !e.handle.is_finished() => return PartsPoll::Loading,
-                Some(_) => state.parts.remove(req_id).expect("checked above"),
+            match state.members.get(id) {
+                None => return MembersPoll::Idle,
+                Some(e) if !e.handle.is_finished() => return MembersPoll::Loading,
+                Some(_) => state.members.remove(id).expect("checked above"),
             }
         };
         let result = entry.handle.await.unwrap_or_else(|e| {
-            warn!("Parts prefetch task failed for req_id={req_id}: {e}");
-            PartsResult::default()
+            warn!("Membership prefetch task failed for id={id}: {e}");
+            MembersResult::default()
         });
         // As in `poll_existing`: SSD-served blocks were registered when saved here.
-        self.admit_rdma(read_cache, &result.rdma);
+        let resident = read_cache.batch_insert_refs(&result.rdma);
+        if let Some(client) = &self.metaserver_client
+            && let Some((namespace, hashes)) =
+                rdma_registration_from_resident_keys(Some(PrefetchSource::Rdma), &resident)
+        {
+            client.try_register_namespace_without_reclaim_hint(namespace, hashes);
+        }
         read_cache.batch_insert(result.ssd.clone());
         let mut fetched = result.rdma;
         fetched.extend(result.ssd);
-        PartsPoll::Done(fetched)
-    }
-
-    /// Admit blocks peers served: retained like local inserts, so cache
-    /// pressure does not prefer them over blocks exposed as P2P sources, and
-    /// the resident ones re-advertised so peers can fetch them from here too.
-    fn admit_rdma(&self, read_cache: &ReadCache, blocks: &PrefetchResult) {
-        let resident = read_cache.batch_insert_refs(blocks);
-        let Some(client) = &self.metaserver_client else {
-            return;
-        };
-        for (namespace, hashes) in hashes_by_namespace(resident) {
-            client.try_register_namespace_without_reclaim_hint(namespace, hashes);
-        }
+        MembersPoll::Done(fetched)
     }
 
     pub(super) async fn check_and_prefetch(
@@ -442,10 +394,18 @@ impl PrefetchScheduler {
         // so peers can discover and fetch from here too. SSD prefetch is
         // skipped: those blocks were already registered by this node's own save
         // path, and eviction explicitly unregisters them.
-        if result.source == Some(PrefetchSource::Rdma) {
-            self.admit_rdma(read_cache, &result.cache_inserts);
+        let rdma_registration = if result.source == Some(PrefetchSource::Rdma) {
+            let resident_keys = read_cache.batch_insert_refs(&result.cache_inserts);
+            rdma_registration_from_resident_keys(result.source, &resident_keys)
         } else {
             read_cache.batch_insert(result.cache_inserts);
+            None
+        };
+
+        if let Some(client) = &self.metaserver_client
+            && let Some((namespace, hashes)) = rdma_registration
+        {
+            client.try_register_namespace_without_reclaim_hint(namespace, hashes);
         }
 
         PollResult::Ready(PrefetchStatus::Ready {
@@ -592,11 +552,12 @@ impl PrefetchScheduler {
         state
             .active
             .retain(|_, entry| entry.started_at.elapsed() < active_max_age);
-        let parts_before = state.parts.len();
+        let members_before = state.members.len();
         state
-            .parts
+            .members
             .retain(|_, entry| entry.started_at.elapsed() < active_max_age);
-        let active_removed = active_before - state.active.len() + parts_before - state.parts.len();
+        let active_removed =
+            active_before - state.active.len() + members_before - state.members.len();
 
         let failed_before = state.failed_remote.len();
         state
@@ -691,19 +652,17 @@ fn build_ready_result(
     }
 }
 
-/// The hashes of `keys` per namespace, in first-seen order: a KV fetch has
-/// one namespace, an object fetch may span several.
-fn hashes_by_namespace(keys: Vec<BlockKey>) -> Vec<(String, Vec<Vec<u8>>)> {
-    super::by_namespace(&keys)
-        .into_iter()
-        .map(|at| {
-            let namespace = keys[at[0]].namespace.clone();
-            (
-                namespace,
-                at.into_iter().map(|i| keys[i].hash.clone()).collect(),
-            )
-        })
-        .collect()
+fn rdma_registration_from_resident_keys(
+    source: Option<PrefetchSource>,
+    resident_keys: &[BlockKey],
+) -> Option<(String, Vec<Vec<u8>>)> {
+    if source != Some(PrefetchSource::Rdma) || resident_keys.is_empty() {
+        return None;
+    }
+
+    let namespace = resident_keys[0].namespace.clone();
+    let hashes = resident_keys.iter().map(|key| key.hash.clone()).collect();
+    Some((namespace, hashes))
 }
 
 async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> PrefetchTaskResult {
@@ -812,78 +771,38 @@ async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> 
     build_ready_result(prefix_blocks, total, None, 0, &[], Vec::new())
 }
 
-async fn run_parts_task(
+async fn run_members_task(
     deps: PrefetchTaskDeps,
-    req_id: String,
-    parts: Vec<FetchPart>,
-) -> PartsResult {
-    let mut out = PartsResult::default();
-    let from_peers =
-        futures::future::join_all(parts.iter().map(|p| fetch_from_peers(&deps, &req_id, p))).await;
+    id: String,
+    keys: Vec<BlockKey>,
+) -> MembersResult {
+    let mut out = MembersResult::default();
+    if let Some(rdma) = &deps.rdma_fetch {
+        let hashes: Vec<Vec<u8>> = keys.iter().map(|k| k.hash.clone()).collect();
+        out.rdma = rdma.fetch_members(&id, &keys[0].namespace, &hashes).await;
+    }
     let Some(ssd) = &deps.ssd_store else {
-        out.rdma = from_peers.into_iter().flatten().collect();
         return out;
     };
-    // Every part's SSD reads go in one batch, like one KV prefetch: the SSD
-    // prefetch queue is shallow and drops batches past its depth.
-    let mut reads = Vec::new();
-    let mut reservations = Vec::new();
-    for (part, peers) in parts.iter().zip(&from_peers) {
-        let got: std::collections::HashSet<&BlockKey> = peers.iter().map(|(k, _)| k).collect();
-        // What SSD should serve, and of that what it holds, read in order.
-        let (want, rest): (usize, Vec<BlockKey>) = if part.members {
-            let want: Vec<&BlockKey> = part.keys.iter().filter(|k| !got.contains(k)).collect();
-            let held = ssd.contains_keys(want.iter().copied());
-            let rest = want
-                .iter()
-                .zip(held)
-                .filter(|(_, h)| *h)
-                .map(|(k, _)| (*k).clone());
-            (want.len(), rest.collect())
-        } else {
-            let rest = &part.keys[part.keys.iter().take_while(|k| got.contains(k)).count()..];
-            (rest.len(), rest[..ssd.prefix_len(rest)].to_vec())
-        };
-        if (part.whole && rest.len() < want) || rest.is_empty() {
-            continue;
-        }
-        if let Some((reserved, reservation)) = reserve_ssd_prefetch_slots(
-            Arc::clone(&deps.prefetch_state),
-            deps.max_prefetch_blocks,
-            rest.len(),
-            part.whole,
-        ) {
-            reads.extend_from_slice(&rest[..reserved]);
-            reservations.push(reservation);
-        }
-    }
-    out.rdma = from_peers.into_iter().flatten().collect();
-    if !reads.is_empty() {
+    let got: std::collections::HashSet<&BlockKey> = out.rdma.iter().map(|(k, _)| k).collect();
+    let rest: Vec<&BlockKey> = keys.iter().filter(|k| !got.contains(k)).collect();
+    let on_ssd: Vec<BlockKey> = rest
+        .iter()
+        .zip(ssd.contains_keys(rest.iter().copied()))
+        .filter(|(_, held)| *held)
+        .map(|(k, _)| (*k).clone())
+        .collect();
+    if let Some((reserved, _reservation)) = reserve_ssd_prefetch_slots(
+        Arc::clone(&deps.prefetch_state),
+        deps.max_prefetch_blocks,
+        on_ssd.len(),
+        false,
+    ) {
+        let mut reads = on_ssd;
+        reads.truncate(reserved);
         out.ssd = ssd.prefetch_prefix(reads).await.1;
     }
-    drop(reservations);
     out
-}
-
-/// What peers serve of `part`: from its first key, or any of its members.
-async fn fetch_from_peers(
-    deps: &PrefetchTaskDeps,
-    req_id: &str,
-    part: &FetchPart,
-) -> PrefetchResult {
-    let Some(rdma) = &deps.rdma_fetch else {
-        return Vec::new();
-    };
-    let namespace = &part.keys[0].namespace;
-    debug_assert!(part.keys.iter().all(|k| &k.namespace == namespace));
-    let hashes: Vec<Vec<u8>> = part.keys.iter().map(|k| k.hash.clone()).collect();
-    if part.members {
-        return rdma.fetch_members(req_id, namespace, &hashes).await;
-    }
-    rdma.try_fetch_prefix(req_id, namespace, &hashes, false)
-        .await
-        .map(|(_, blocks)| blocks)
-        .unwrap_or_default()
 }
 
 enum PollResult {
@@ -901,7 +820,7 @@ mod tests {
     }
 
     fn block() -> Arc<SealedBlock> {
-        Arc::new(SealedBlock::from_slots(Vec::new(), 0))
+        Arc::new(SealedBlock::from_slots(Vec::new()))
     }
 
     #[test]
@@ -960,27 +879,25 @@ mod tests {
     }
 
     #[test]
-    fn rdma_registration_groups_resident_keys_by_namespace() {
-        let other = |h: u8| BlockKey::new("other".into(), vec![h]);
-        for (case, keys, want) in [
-            ("none", vec![], vec![]),
-            (
-                "one namespace",
-                vec![key(1), key(3)],
-                vec![("ns", vec![vec![1], vec![3]])],
-            ),
-            (
-                "two namespaces",
-                vec![key(1), other(2), key(3)],
-                vec![("ns", vec![vec![1], vec![3]]), ("other", vec![vec![2]])],
-            ),
-        ] {
-            let want: Vec<(String, Vec<Vec<u8>>)> = want
-                .into_iter()
-                .map(|(ns, h)| (ns.to_string(), h))
-                .collect();
-            assert_eq!(hashes_by_namespace(keys), want, "{case}");
-        }
+    fn rdma_registration_uses_only_resident_keys() {
+        let k1 = key(1);
+        let k3 = key(3);
+
+        let (namespace, hashes) =
+            rdma_registration_from_resident_keys(Some(PrefetchSource::Rdma), &[k1, k3])
+                .expect("RDMA resident keys should register");
+
+        assert_eq!(namespace, "ns");
+        assert_eq!(hashes, vec![vec![1], vec![3]]);
+    }
+
+    #[test]
+    fn rdma_registration_skips_ssd_and_empty_resident_keys() {
+        let k1 = key(1);
+
+        assert!(rdma_registration_from_resident_keys(Some(PrefetchSource::Ssd), &[k1]).is_none());
+        assert!(rdma_registration_from_resident_keys(Some(PrefetchSource::Rdma), &[]).is_none());
+        assert!(rdma_registration_from_resident_keys(None, &[]).is_none());
     }
 
     /// Feed a finished prefetch task with the given outcome through
@@ -1052,7 +969,7 @@ mod tests {
     fn strict_ssd_reservation_is_all_or_nothing() {
         let state = Arc::new(Mutex::new(PrefetchState {
             active: HashMap::new(),
-            parts: HashMap::new(),
+            members: HashMap::new(),
             reserved_ssd_prefetch_blocks: 0,
             failed_remote: HashMap::new(),
         }));

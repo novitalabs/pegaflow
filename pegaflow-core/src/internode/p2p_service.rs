@@ -153,7 +153,6 @@ impl Engine for P2pTransferService {
                 TransferBlockInfo {
                     block_hash: key.hash.clone(),
                     slots,
-                    meta: block.meta(),
                 }
             })
             .collect();
@@ -288,18 +287,18 @@ impl Engine for P2pTransferService {
         Self::not_served("session")
     }
 
-    async fn register_object_device(
+    async fn register_context_v2(
         &self,
-        _request: Request<pb::RegisterObjectDeviceRequest>,
-    ) -> Result<Response<pb::RegisterObjectDeviceResponse>, Status> {
-        Self::not_served("register_object_device")
+        _request: Request<pb::RegisterContextV2>,
+    ) -> Result<Response<pb::RegisterContextV2Response>, Status> {
+        Self::not_served("register_context_v2")
     }
 
-    async fn query_objects(
+    async fn query_object(
         &self,
-        _request: Request<pb::QueryObjectsRequest>,
-    ) -> Result<Response<pb::QueryObjectsResponse>, Status> {
-        Self::not_served("query_objects")
+        _request: Request<pb::QueryObjectRequest>,
+    ) -> Result<Response<pb::QueryObjectResponse>, Status> {
+        Self::not_served("query_object")
     }
 
     async fn save_objects(

@@ -127,12 +127,6 @@ pub fn read_cpu_topology_from_sysfs() -> Result<HashMap<u32, Vec<usize>>, String
     Ok(node_to_cpus)
 }
 
-/// The physical package (socket) id of `cpu`, from sysfs.
-fn read_cpu_package(cpu: usize) -> Option<u32> {
-    let path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/physical_package_id");
-    fs::read_to_string(path).ok()?.trim().parse().ok()
-}
-
 /// Parse Linux cpulist format (e.g. "0-3,8-11" -> [0,1,2,3,8,9,10,11])
 fn parse_cpulist(cpulist: &str) -> Result<Vec<usize>, String> {
     let mut cpus = Vec::new();
@@ -350,8 +344,6 @@ fn get_gpu_numa_affinity() -> Vec<(u32, NumaNode)> {
 pub struct NumaTopology {
     gpu_numa_map: HashMap<i32, NumaNode>,
     numa_nodes: Vec<NumaNode>,
-    /// CPU package (socket) of each node with CPUs.
-    node_sockets: HashMap<NumaNode, u32>,
 }
 
 impl NumaTopology {
@@ -365,25 +357,20 @@ impl NumaTopology {
             .map(|(dev, node)| (dev as i32, node))
             .collect();
 
-        let (numa_nodes, node_sockets) = match read_cpu_topology_from_sysfs() {
+        let numa_nodes = match read_cpu_topology_from_sysfs() {
             Ok(node_to_cpus) => {
                 let mut node_ids: Vec<u32> = node_to_cpus.keys().copied().collect();
                 node_ids.sort_unstable();
-                let sockets = node_to_cpus
-                    .iter()
-                    .filter_map(|(&node, cpus)| {
-                        Some((NumaNode(node), read_cpu_package(*cpus.first()?)?))
-                    })
-                    .collect();
-                (node_ids.into_iter().map(NumaNode).collect(), sockets)
+                node_ids.into_iter().map(NumaNode).collect()
             }
-            Err(_) => (vec![NumaNode(0)], HashMap::new()),
+            Err(_) => {
+                vec![NumaNode(0)]
+            }
         };
 
         Self {
             gpu_numa_map,
             numa_nodes,
-            node_sockets,
         }
     }
 
@@ -395,11 +382,6 @@ impl NumaTopology {
             .get(&device_id)
             .copied()
             .unwrap_or(NumaNode::UNKNOWN)
-    }
-
-    /// The CPU package (socket) of `node`, or 0 when unknown.
-    pub fn socket_of(&self, node: NumaNode) -> u32 {
-        self.node_sockets.get(&node).copied().unwrap_or(0)
     }
 
     /// Get all NUMA nodes in the system.
@@ -600,7 +582,6 @@ mod tests {
                 NumaNode(4),
                 NumaNode(5),
             ],
-            node_sockets: HashMap::new(),
         };
 
         assert_eq!(

@@ -259,7 +259,7 @@ pub(crate) fn wait_worker_ready(
 
 /// Build the configured transfer backend for a worker. The kernel is only
 /// compiled when actually selected.
-fn build_backend(
+pub(crate) fn build_backend(
     mode: TransferMode,
     ctx: &std::sync::Arc<CudaContext>,
 ) -> Result<Box<dyn TransferBackend>, EngineError> {

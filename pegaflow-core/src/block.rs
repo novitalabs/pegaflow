@@ -258,9 +258,6 @@ pub struct SealedBlock {
     /// Per-slot NUMA affinity; always covers every slot (`len == slots.len()`).
     /// Used by the SSD write path and advertised on cross-node transfer.
     slot_numas: Vec<NumaNode>,
-    /// Opaque layout word of an object, kept through SSD and cross-node
-    /// transfer; 0 for KV blocks.
-    meta: u64,
 }
 
 impl SealedBlock {
@@ -282,15 +279,10 @@ impl SealedBlock {
         &self.slot_numas
     }
 
-    /// Opaque layout word of an object; 0 for KV blocks.
-    pub fn meta(&self) -> u64 {
-        self.meta
-    }
-
     /// Create from per-slot `(block, NUMA)` pairs (deserialization / prefetch rebuild).
     /// Pairing keeps each slot and its advertised NUMA affinity in lockstep, so the
     /// cross-node serve path can never truncate slots against a short `slot_numas`.
-    pub(crate) fn from_slots(slots: Vec<(RawBlock, NumaNode)>, meta: u64) -> Self {
+    pub(crate) fn from_slots(slots: Vec<(RawBlock, NumaNode)>) -> Self {
         let mut blocks = Vec::with_capacity(slots.len());
         let mut slot_numas = Vec::with_capacity(slots.len());
         let mut footprint = 0u64;
@@ -303,7 +295,6 @@ impl SealedBlock {
             slots: blocks.into_boxed_slice(),
             footprint,
             slot_numas,
-            meta,
         }
     }
 
@@ -312,13 +303,11 @@ impl SealedBlock {
         slots: Box<[RawBlock]>,
         footprint: u64,
         slot_numas: Vec<NumaNode>,
-        meta: u64,
     ) -> Self {
         Self {
             slots,
             footprint,
             slot_numas,
-            meta,
         }
     }
 
@@ -327,7 +316,6 @@ impl SealedBlock {
         slots: Vec<(usize, RawBlock)>,
         total_slots: usize,
         numa_node: NumaNode,
-        meta: u64,
     ) -> Result<Self, Vec<(usize, RawBlock)>> {
         if slots.len() != total_slots
             || slots
@@ -349,7 +337,6 @@ impl SealedBlock {
             blocks.into_boxed_slice(),
             footprint,
             vec![numa_node; total_slots],
-            meta,
         ))
     }
 }
@@ -383,12 +370,10 @@ pub(crate) struct InflightBlock {
     /// Per-slot NUMA node affinity, tracked during insertion for deterministic
     /// per-block NUMA assignment when the block is sealed.
     slot_numas: Vec<NumaNode>,
-    /// Meta of the first insert; every later insert must carry the same.
-    meta: u64,
 }
 
 impl InflightBlock {
-    pub(crate) fn new(total_slots: usize, meta: u64) -> Self {
+    pub(crate) fn new(total_slots: usize) -> Self {
         Self {
             slots: (0..total_slots).map(|_| None).collect(),
             remaining: total_slots,
@@ -396,12 +381,7 @@ impl InflightBlock {
             footprint: 0,
             created_at: Instant::now(),
             slot_numas: vec![NumaNode::UNKNOWN; total_slots],
-            meta,
         }
-    }
-
-    pub(crate) fn meta(&self) -> u64 {
-        self.meta
     }
 
     /// Returns the age of this inflight block.
@@ -469,7 +449,6 @@ impl InflightBlock {
             slots.into_boxed_slice(),
             self.footprint,
             self.slot_numas,
-            self.meta,
         )
     }
 }

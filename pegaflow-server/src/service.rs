@@ -4,23 +4,22 @@ use crate::metric::record_rpc_result;
 use crate::proto::engine::engine_server::Engine;
 use crate::proto::engine::{
     HealthRequest, HealthResponse, LoadObjectsRequest, LoadObjectsResponse, LoadRequest,
-    LoadResponse, ObjectsReady, QueryBlocksForTransferRequest, QueryBlocksForTransferResponse,
-    QueryLoading, QueryObjectsRequest, QueryObjectsResponse, QueryReady, QueryRequest,
-    QueryResponse, RdmaHandshakeRequest, RdmaHandshakeResponse, RegisterContextRequest,
-    RegisterContextResponse, RegisterObjectDeviceRequest, RegisterObjectDeviceResponse,
-    ReleaseRequest, ReleaseResponse, ReleaseTransferLockRequest, ReleaseTransferLockResponse,
-    ResponseStatus, SaveObjectsRequest, SaveObjectsResponse, SaveRequest, SaveResponse,
-    SessionEvent, SessionRequest, ShutdownRequest, ShutdownResponse, TransferBlockInfo,
-    TransferMode as ProtoTransferMode, TransferSlotInfo, UnregisterRequest, UnregisterResponse,
-    load_block_target, query_objects_response, query_response,
+    LoadResponse, QueryBlocksForTransferRequest, QueryBlocksForTransferResponse, QueryLoading,
+    QueryObjectRequest, QueryObjectResponse, QueryReady, QueryRequest, QueryResponse,
+    RdmaHandshakeRequest, RdmaHandshakeResponse, RegisterContextRequest, RegisterContextResponse,
+    RegisterContextV2, RegisterContextV2Response, ReleaseRequest, ReleaseResponse,
+    ReleaseTransferLockRequest, ReleaseTransferLockResponse, ResponseStatus, SaveObjectsRequest,
+    SaveObjectsResponse, SaveRequest, SaveResponse, SessionEvent, SessionRequest, ShutdownRequest,
+    ShutdownResponse, TransferBlockInfo, TransferMode as ProtoTransferMode, TransferSlotInfo,
+    UnregisterRequest, UnregisterResponse, load_block_target, query_object_response,
+    query_response,
 };
 use crate::registry::RegistryHandle;
 use crate::session::SessionRegistry;
 use log::{debug, info, warn};
 use pegaflow_core::{
-    EngineError, LayerSave, MAX_RUN_DIMS, ObjectDim, ObjectKey, ObjectLoad, ObjectPoint,
-    ObjectQuery, ObjectQueryStatus, ObjectRead, ObjectRun, ObjectWrite, PegaEngine, PrefetchStatus,
-    QueryLeaseId, SlotRead, SlotWrite,
+    EngineError, LayerSave, NamespaceMeta, ObjectKey, ObjectQueryStatus, ObjectSpans, PegaEngine,
+    PrefetchStatus, QueryLeaseId, Span,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -177,102 +176,61 @@ impl GrpcEngineService {
         Ok(())
     }
 
+    fn digest(bytes: Vec<u8>, field: &str) -> Result<[u8; 32], Status> {
+        bytes.try_into().map_err(|b: Vec<u8>| {
+            Status::invalid_argument(format!("{field} has {} bytes, expected 32", b.len()))
+        })
+    }
+
     fn object_key(key: Option<crate::proto::engine::ObjectKey>) -> Result<ObjectKey, Status> {
         let key = key.ok_or_else(|| Status::invalid_argument("object key is missing"))?;
-        let digest = |bytes: Vec<u8>, field: &str| -> Result<[u8; 32], Status> {
-            bytes.try_into().map_err(|b: Vec<u8>| {
-                Status::invalid_argument(format!("{field} has {} bytes, expected 32", b.len()))
-            })
-        };
         Ok(ObjectKey {
-            fingerprint: digest(key.fingerprint, "fingerprint")?,
-            prefix: digest(key.prefix, "prefix")?,
+            namespace: Self::digest(key.namespace, "namespace")?,
+            prefix: Self::digest(key.prefix, "prefix")?,
         })
     }
 
-    fn object_writes(
-        writes: Vec<crate::proto::engine::ObjectWrite>,
-    ) -> Result<Vec<ObjectWrite>, Status> {
-        writes
-            .into_iter()
-            .map(|w| {
-                let mut words = Words::new(&w.writes);
-                let mut slots = Vec::new();
-                while !words.done() {
-                    let slot = words.u32("slot")?;
-                    let size = words.next("slot size")?;
-                    slots.push(SlotWrite {
-                        slot,
-                        size,
-                        runs: words.runs()?,
-                    });
-                }
-                Ok(ObjectWrite {
-                    key: Self::object_key(w.key)?,
-                    slots: w.slots,
-                    meta: w.meta,
-                    writes: slots,
+    fn object_spans(
+        list: Vec<crate::proto::engine::ObjectSpans>,
+    ) -> Result<Vec<ObjectSpans>, Status> {
+        list.into_iter()
+            .map(|o| {
+                Ok(ObjectSpans {
+                    key: Self::object_key(o.key)?,
+                    region: o.region_idx,
+                    spans: o
+                        .span
+                        .iter()
+                        .map(|raw| Span::decode(raw).map_err(Status::invalid_argument))
+                        .collect::<Result<_, _>>()?,
                 })
             })
             .collect()
     }
 
-    fn object_loads(
-        loads: Vec<crate::proto::engine::ObjectLoad>,
-    ) -> Result<Vec<ObjectLoad>, Status> {
-        loads
-            .into_iter()
-            .map(|l| {
-                Ok(ObjectLoad {
-                    lease: QueryLeaseId::from_bytes(&l.lease).map_err(Status::invalid_argument)?,
-                    reads: l
-                        .reads
-                        .into_iter()
-                        .map(|r| {
-                            let mut words = Words::new(&r.reads);
-                            let mut slots = Vec::new();
-                            while !words.done() {
-                                let slot = words.u32("slot")?;
-                                slots.push(SlotRead {
-                                    slot,
-                                    runs: words.runs()?,
-                                });
-                            }
-                            Ok(ObjectRead {
-                                key: Self::object_key(r.key)?,
-                                reads: slots,
-                            })
-                        })
-                        .collect::<Result<_, Status>>()?,
-                    consumers: l.consumers,
-                })
-            })
-            .collect()
+    /// The RPC V2 reply status of `result`: business errors travel in it,
+    /// not as a gRPC status.
+    fn v2_status<T>(result: &Result<T, Status>) -> ResponseStatus {
+        match result {
+            Ok(_) => Self::ok_status(),
+            Err(status) => ResponseStatus {
+                ok: false,
+                message: format!("{}: {}", status.code(), status.message()),
+            },
+        }
     }
 
-    fn object_query(req: QueryObjectsRequest) -> Result<ObjectQuery, Status> {
-        let keys = |keys: Vec<crate::proto::engine::ObjectKey>| {
-            keys.into_iter()
-                .map(|k| Self::object_key(Some(k)))
-                .collect::<Result<Vec<_>, Status>>()
-        };
-        Ok(ObjectQuery {
-            prefixes: req
-                .prefixes
-                .into_iter()
-                .map(|l| keys(l.keys))
-                .collect::<Result<_, _>>()?,
-            points: req
-                .points
-                .into_iter()
-                .map(|p| {
-                    Ok(ObjectPoint {
-                        blocks: p.blocks,
-                        keys: keys(p.keys)?,
-                    })
-                })
-                .collect::<Result<_, Status>>()?,
-        })
+    fn log_v2<T>(method: &'static str, result: &Result<T, Status>, start: Instant, detail: &str) {
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        match result {
+            Ok(_) => debug!("RPC [{method}] completed: ok {detail} elapsed_ms={elapsed_ms:.2}"),
+            Err(status) => warn!(
+                "RPC [{method}] failed: code={} message={} {detail} elapsed_ms={elapsed_ms:.2}",
+                status.code(),
+                status.message(),
+            ),
+        }
+        record_rpc_result(method, result, start);
     }
 
     fn build_register_context_response() -> RegisterContextResponse {
@@ -957,7 +915,6 @@ impl Engine for GrpcEngineService {
                     TransferBlockInfo {
                         block_hash: key.hash.clone(),
                         slots,
-                        meta: block.meta(),
                     }
                 })
                 .collect();
@@ -1138,15 +1095,10 @@ impl Engine for GrpcEngineService {
             return Err(Status::invalid_argument("instance_id must not be empty"));
         }
 
-        let token = self.session_registry.install(
-            instance_id.clone(),
-            req.namespace.clone(),
-            req.tp_size,
-            req.world_size,
-        );
+        let token = self.session_registry.install(instance_id.clone());
         info!(
-            "Session opened: instance_id={} namespace={} tp_size={} world_size={} token={}",
-            instance_id, req.namespace, req.tp_size, req.world_size, token
+            "Session opened: instance_id={} token={}",
+            instance_id, token
         );
 
         // Channel capacity is 1: we don't emit events yet, and a tight capacity
@@ -1185,152 +1137,148 @@ impl Engine for GrpcEngineService {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
-    async fn register_object_device(
+    async fn register_context_v2(
         &self,
-        request: Request<RegisterObjectDeviceRequest>,
-    ) -> Result<Response<RegisterObjectDeviceResponse>, Status> {
+        request: Request<RegisterContextV2>,
+    ) -> Result<Response<RegisterContextV2Response>, Status> {
         let start = Instant::now();
         let req = request.into_inner();
-        let (instance_id, rank, device_id) = (req.instance_id, req.rank, req.device_id);
-        let region_count = req.regions.len();
-
-        let fut = async {
-            Self::validate_client_version(&req.client_version)?;
-            Self::validate_device_id(device_id)?;
+        let RegisterContextV2 {
+            instance_id,
+            namespace_meta,
+            regions,
+            client_version,
+            ..
+        } = req;
+        let detail = format!(
+            "instance_id={instance_id} namespaces={} regions={}",
+            namespace_meta.len(),
+            regions.len()
+        );
+        let result: Result<(), Status> = async {
+            Self::validate_client_version(&client_version)?;
             if instance_id.is_empty() {
                 return Err(Status::invalid_argument("instance_id must not be empty"));
             }
-            info!(
-                "RPC [register_object_device]: instance_id={} rank={} device_id={} regions={}",
-                instance_id, rank, device_id, region_count
-            );
-            let regions: Vec<(Vec<u8>, u64)> = req
-                .regions
+            let first = namespace_meta
+                .first()
+                .ok_or_else(|| Status::invalid_argument("namespace_meta must not be empty"))?;
+            let (rank, device_id) = (first.rank, first.device_id);
+            if namespace_meta
+                .iter()
+                .any(|m| m.rank != rank || m.device_id != device_id)
+            {
+                return Err(Status::invalid_argument(
+                    "every namespace_meta of one request must name the same rank and device_id",
+                ));
+            }
+            let device_id = i32::try_from(device_id)
+                .map_err(|_| Status::invalid_argument(format!("device_id {device_id}")))?;
+            let namespaces = namespace_meta
                 .into_iter()
-                .map(|r| (r.ipc_handle, r.size))
-                .collect();
+                .map(|m| {
+                    Ok(NamespaceMeta {
+                        namespace: Self::digest(m.namespace, "namespace")?,
+                        world_size: m.world_size,
+                        layer_names: m.layer_names,
+                        bytes_per_block: m.bytes_per_block,
+                        block_size: m.block_size,
+                        local_hidden: m.local_hidden,
+                        interleave_token: m.interleave_token,
+                        saver_rank: m.saver_rank,
+                    })
+                })
+                .collect::<Result<Vec<_>, Status>>()?;
+            let regions: Vec<(Vec<u8>, u64)> =
+                regions.into_iter().map(|r| (r.ipc_handle, r.size)).collect();
+            info!(
+                "RPC [register_context_v2]: instance_id={instance_id} rank={rank} device_id={device_id} \
+                 namespaces={} regions={}",
+                namespaces.len(),
+                regions.len()
+            );
             // Opening IPC handles and starting the copy workers block.
             let engine = Arc::clone(&self.engine);
             let instance = instance_id.clone();
-            let (numa, socket) = tokio::task::spawn_blocking(move || {
-                engine.register_object_device(&instance, rank, device_id, &regions)
+            tokio::task::spawn_blocking(move || {
+                engine.register_context_v2(
+                    &instance,
+                    rank,
+                    device_id,
+                    namespaces,
+                    &regions,
+                )
             })
             .await
             .map_err(|e| Status::internal(format!("register task panicked: {e}")))?
-            .map_err(Self::map_engine_error)?;
-            Ok(Response::new(RegisterObjectDeviceResponse {
-                numa_node: if numa.is_valid() {
-                    i32::try_from(numa.0).unwrap_or(-1)
-                } else {
-                    -1
-                },
-                socket,
-                max_run_dims: MAX_RUN_DIMS as u32,
-            }))
-        };
-
-        let result = fut.await;
-        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-        match &result {
-            Ok(_) => info!(
-                "RPC [register_object_device] completed: ok instance_id={} rank={} elapsed_ms={:.2}",
-                instance_id, rank, elapsed_ms
-            ),
-            Err(status) => warn!(
-                "RPC [register_object_device] failed: code={} message={} elapsed_ms={:.2}",
-                status.code(),
-                status.message(),
-                elapsed_ms
-            ),
+            .map_err(Self::map_engine_error)
         }
-        record_rpc_result("register_object_device", &result, start);
-        result
+        .await;
+        Self::log_v2("register_context_v2", &result, start, &detail);
+        Ok(Response::new(RegisterContextV2Response {
+            status: Some(Self::v2_status(&result)),
+        }))
     }
 
-    async fn query_objects(
+    async fn query_object(
         &self,
-        request: Request<QueryObjectsRequest>,
-    ) -> Result<Response<QueryObjectsResponse>, Status> {
-        let req = request.into_inner();
-        let chain_keys: usize = req.prefixes.iter().map(|c| c.keys.len()).sum();
-        trace_root!("rpc.query_objects", root, || {
+        request: Request<QueryObjectRequest>,
+    ) -> Result<Response<QueryObjectResponse>, Status> {
+        let start = Instant::now();
+        let QueryObjectRequest {
+            instance_id,
+            keys,
+            prefix_search,
+            query_id,
+        } = request.into_inner();
+        trace_root!("rpc.query_object", root, || {
             [
-                ("instance_id", req.instance_id.clone()),
-                ("chain_keys", chain_keys.to_string()),
-                ("points", req.points.len().to_string()),
+                ("instance_id", instance_id.clone()),
+                ("keys", keys.len().to_string()),
+                ("prefix_search", prefix_search.to_string()),
             ]
         });
-
-        let start = Instant::now();
-        let (instance_id, req_id) = (req.instance_id.clone(), req.req_id.clone());
+        let detail = format!(
+            "instance_id={instance_id} keys={} prefix_search={prefix_search}",
+            keys.len()
+        );
         let fut = async {
-            if req_id.is_empty() {
-                return Err(Status::invalid_argument("req_id must not be empty"));
-            }
-            debug!(
-                "RPC [query_objects]: instance_id={} req_id={} chains={} chain_keys={} points={}",
-                instance_id,
-                req_id,
-                req.prefixes.len(),
-                chain_keys,
-                req.points.len()
-            );
-            let query = Self::object_query(req)?;
-            let status = self
-                .engine
-                .query_objects(&instance_id, &req_id, &query)
+            let keys = keys
+                .into_iter()
+                .map(|k| Self::object_key(Some(k)))
+                .collect::<Result<Vec<_>, Status>>()?;
+            let query_id = (!query_id.is_empty()).then_some(query_id.as_str());
+            self.engine
+                .query_object(&instance_id, query_id, &keys, prefix_search)
                 .await
-                .map_err(Self::map_engine_error)?;
-            let outcome = match status {
-                ObjectQueryStatus::Loading => {
-                    query_objects_response::Outcome::Loading(QueryLoading {})
-                }
-                ObjectQueryStatus::Ready {
-                    point,
-                    blocks,
-                    lease,
-                    slots,
-                    metas,
-                } => query_objects_response::Outcome::Ready(ObjectsReady {
-                    point: point.map_or(-1, |p| i32::try_from(p).unwrap_or(i32::MAX)),
-                    blocks,
-                    lease: lease.map(|l| l.to_bytes().to_vec()).unwrap_or_default(),
-                    slots,
-                    metas,
-                }),
-            };
-            Ok(Response::new(QueryObjectsResponse {
-                outcome: Some(outcome),
-            }))
+                .map_err(Self::map_engine_error)
         };
-
-        let result: Result<Response<QueryObjectsResponse>, Status> =
-            trace_in_span!(root, fut).await;
-
-        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-        match &result {
-            Ok(resp) => match &resp.get_ref().outcome {
-                Some(query_objects_response::Outcome::Ready(ready)) => debug!(
-                    "RPC [query_objects] completed: ready point={} blocks={} objects={} elapsed_ms={:.2}",
-                    ready.point,
-                    ready.blocks,
-                    ready.slots.len(),
-                    elapsed_ms
-                ),
-                _ => debug!(
-                    "RPC [query_objects] completed: loading elapsed_ms={:.2}",
-                    elapsed_ms
-                ),
-            },
-            Err(status) => warn!(
-                "RPC [query_objects] failed: code={} message={} elapsed_ms={:.2}",
-                status.code(),
-                status.message(),
-                elapsed_ms
-            ),
-        }
-        record_rpc_result("query_objects", &result, start);
-        result
+        let result = trace_in_span!(root, fut).await;
+        Self::log_v2("query_object", &result, start, &detail);
+        let status = Some(Self::v2_status(&result));
+        let Ok((query_id, answer)) = result else {
+            return Ok(Response::new(QueryObjectResponse {
+                status,
+                ..Default::default()
+            }));
+        };
+        let outcome = match answer {
+            ObjectQueryStatus::Loading => query_object_response::Outcome::Loading(QueryLoading {}),
+            ObjectQueryStatus::Ready {
+                hits,
+                lease,
+                hit_positions,
+            } => query_object_response::Outcome::Ready(QueryReady {
+                num_hit_blocks: hits as u64,
+                lease: lease.map(|l| l.to_bytes().to_vec()).unwrap_or_default(),
+                hit_positions,
+            }),
+        };
+        Ok(Response::new(QueryObjectResponse {
+            outcome: Some(outcome),
+            query_id,
+            status,
+        }))
     }
 
     async fn save_objects(
@@ -1338,54 +1286,33 @@ impl Engine for GrpcEngineService {
         request: Request<SaveObjectsRequest>,
     ) -> Result<Response<SaveObjectsResponse>, Status> {
         let start = Instant::now();
-
-        let req = request.into_inner();
-        let object_count = req.writes.len();
-        let slot_count: usize = req.writes.iter().map(|w| w.writes.len()).sum();
-
+        let SaveObjectsRequest {
+            instance_id,
+            rank,
+            writes,
+        } = request.into_inner();
         trace_root!("rpc.save_objects", root, || {
             [
-                ("instance_id", req.instance_id.clone()),
-                ("objects", object_count.to_string()),
-                ("slots", slot_count.to_string()),
+                ("instance_id", instance_id.clone()),
+                ("objects", writes.len().to_string()),
             ]
         });
-
+        let detail = format!(
+            "instance_id={instance_id} rank={rank} objects={}",
+            writes.len()
+        );
         let fut = async {
-            let SaveObjectsRequest {
-                instance_id,
-                rank,
-                writes,
-            } = req;
-            debug!(
-                "RPC [save_objects]: instance_id={} rank={} objects={} slots={}",
-                instance_id, rank, object_count, slot_count
-            );
-            let writes = Self::object_writes(writes)?;
+            let writes = Self::object_spans(writes)?;
             self.engine
                 .save_objects(&instance_id, rank, &writes)
                 .await
-                .map_err(Self::map_engine_error)?;
-            Ok(Response::new(SaveObjectsResponse {}))
+                .map_err(Self::map_engine_error)
         };
-
-        let result: Result<Response<SaveObjectsResponse>, Status> = trace_in_span!(root, fut).await;
-
-        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-        match &result {
-            Ok(_) => debug!(
-                "RPC [save_objects] completed: ok objects={} slots={} elapsed_ms={:.2}",
-                object_count, slot_count, elapsed_ms
-            ),
-            Err(status) => warn!(
-                "RPC [save_objects] failed: code={} message={} elapsed_ms={:.2}",
-                status.code(),
-                status.message(),
-                elapsed_ms
-            ),
-        }
-        record_rpc_result("save_objects", &result, start);
-        result
+        let result = trace_in_span!(root, fut).await;
+        Self::log_v2("save_objects", &result, start, &detail);
+        Ok(Response::new(SaveObjectsResponse {
+            status: Some(Self::v2_status(&result)),
+        }))
     }
 
     async fn load_objects(
@@ -1393,149 +1320,53 @@ impl Engine for GrpcEngineService {
         request: Request<LoadObjectsRequest>,
     ) -> Result<Response<LoadObjectsResponse>, Status> {
         let start = Instant::now();
-
-        let req = request.into_inner();
-        let load_count = req.loads.len();
-        let object_count: usize = req.loads.iter().map(|l| l.reads.len()).sum();
-
+        let LoadObjectsRequest {
+            instance_id,
+            rank,
+            device_id,
+            load_state_shm,
+            spans,
+            lease,
+        } = request.into_inner();
         trace_root!("rpc.load_objects", root, || {
             [
-                ("instance_id", req.instance_id.clone()),
-                ("loads", load_count.to_string()),
-                ("objects", object_count.to_string()),
+                ("instance_id", instance_id.clone()),
+                ("objects", spans.len().to_string()),
+                ("leases", lease.len().to_string()),
             ]
         });
-
+        let detail = format!(
+            "instance_id={instance_id} rank={rank} objects={} leases={}",
+            spans.len(),
+            lease.len()
+        );
         let fut = async {
-            let LoadObjectsRequest {
-                instance_id,
-                rank,
-                loads,
-                load_state_shm,
-            } = req;
-            debug!(
-                "RPC [load_objects]: instance_id={} rank={} loads={} objects={} load_state_shm_len={}",
-                instance_id,
-                rank,
-                load_count,
-                object_count,
-                load_state_shm.len()
-            );
-            // A request that fails before the engine checks it still ends
-            // the leases it names: the restore they serve cannot happen.
-            let leases: Vec<QueryLeaseId> = loads
-                .iter()
-                .filter_map(|l| QueryLeaseId::from_bytes(&l.lease).ok())
-                .collect();
-            let release = |e: Status| {
-                self.engine.release_object_leases(&instance_id, &leases);
-                e
-            };
             if load_state_shm.is_empty() {
-                return Err(release(Status::invalid_argument(
-                    "load_state_shm must not be empty",
-                )));
+                return Err(Status::invalid_argument("load_state_shm must not be empty"));
             }
-            let loads = Self::object_loads(loads).map_err(release)?;
+            let device_id = i32::try_from(device_id)
+                .map_err(|_| Status::invalid_argument(format!("device_id {device_id}")))?;
+            let spans = Self::object_spans(spans)?;
+            let leases = lease
+                .iter()
+                .map(|l| QueryLeaseId::from_bytes(l).map_err(Status::invalid_argument))
+                .collect::<Result<Vec<_>, _>>()?;
             self.engine
-                .load_objects(&instance_id, rank, &loads, &load_state_shm)
-                .map_err(Self::map_engine_error)?;
-            Ok(Response::new(LoadObjectsResponse {}))
+                .load_objects(
+                    &instance_id,
+                    rank,
+                    device_id,
+                    &spans,
+                    &leases,
+                    &load_state_shm,
+                )
+                .map_err(Self::map_engine_error)
         };
-
-        let result: Result<Response<LoadObjectsResponse>, Status> = trace_in_span!(root, fut).await;
-
-        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-        match &result {
-            Ok(_) => debug!(
-                "RPC [load_objects] completed: ok loads={} objects={} elapsed_ms={:.2}",
-                load_count, object_count, elapsed_ms
-            ),
-            Err(status) => warn!(
-                "RPC [load_objects] failed: code={} message={} elapsed_ms={:.2}",
-                status.code(),
-                status.message(),
-                elapsed_ms
-            ),
-        }
-        record_rpc_result("load_objects", &result, start);
-        result
-    }
-}
-
-/// Words of a run without dimensions, and per dimension.
-const RUN_WORDS: usize = 5;
-const DIM_WORDS: usize = 3;
-
-/// A reader of the packed slot words of an object write or read.
-struct Words<'a> {
-    words: &'a [u64],
-}
-
-impl<'a> Words<'a> {
-    fn new(words: &'a [u64]) -> Self {
-        Self { words }
-    }
-
-    fn done(&self) -> bool {
-        self.words.is_empty()
-    }
-
-    fn next(&mut self, what: &str) -> Result<u64, Status> {
-        let (&w, rest) = self
-            .words
-            .split_first()
-            .ok_or_else(|| Status::invalid_argument(format!("slot words end before {what}")))?;
-        self.words = rest;
-        Ok(w)
-    }
-
-    fn u32(&mut self, what: &str) -> Result<u32, Status> {
-        let w = self.next(what)?;
-        u32::try_from(w)
-            .map_err(|_| Status::invalid_argument(format!("{what} {w} does not fit 32 bits")))
-    }
-
-    /// A run count and that many runs.
-    fn runs(&mut self) -> Result<Vec<ObjectRun>, Status> {
-        let n = self.next("run count")?;
-        // Every run takes at least RUN_WORDS words: a count past what is left is malformed.
-        if n > (self.words.len() / RUN_WORDS) as u64 {
-            return Err(Status::invalid_argument(format!(
-                "run count {n} exceeds the slot words left"
-            )));
-        }
-        (0..n).map(|_| self.run()).collect()
-    }
-
-    fn run(&mut self) -> Result<ObjectRun, Status> {
-        let region = self.u32("run region")?;
-        let region_offset = self.next("run region offset")?;
-        let slot_offset = self.next("run slot offset")?;
-        let width = self.next("run width")?;
-        // The engine bounds the dims; here only the words left bound them.
-        let ndims = self.next("run dims")?;
-        if ndims > (self.words.len() / DIM_WORDS) as u64 {
-            return Err(Status::invalid_argument(format!(
-                "run has {ndims} dims, past the slot words left"
-            )));
-        }
-        let dims = (0..ndims)
-            .map(|_| {
-                Ok(ObjectDim {
-                    count: self.u32("dim count")?,
-                    region_stride: self.next("dim region stride")?,
-                    slot_stride: self.next("dim slot stride")?,
-                })
-            })
-            .collect::<Result<_, Status>>()?;
-        Ok(ObjectRun {
-            region,
-            region_offset,
-            slot_offset,
-            width,
-            dims,
-        })
+        let result = trace_in_span!(root, fut).await;
+        Self::log_v2("load_objects", &result, start, &detail);
+        Ok(Response::new(LoadObjectsResponse {
+            status: Some(Self::v2_status(&result)),
+        }))
     }
 }
 

@@ -112,8 +112,6 @@ pub(super) struct SsdIndexEntry {
     pub file_offset: u64,
     /// Per-slot metadata for rebuilding SealedBlock
     pub slots: Vec<SlotMeta>,
-    /// The block's meta word.
-    pub meta: u64,
 }
 
 /// State of an SSD index entry (two-phase commit)
@@ -343,7 +341,6 @@ impl SsdRingBuffer {
                 len: size,
                 file_offset,
                 slots,
-                meta: block.meta(),
             };
 
             // Insert Writing state
@@ -997,7 +994,7 @@ async fn execute_prefetch(task: PrefetchTask, io: Arc<UringIoEngine>) -> SingleP
     let block = match read_result {
         Ok(rx) => match rx.await {
             Ok(Ok(bytes_read)) if bytes_read == expected_len => Some(Arc::new(
-                rebuild_sealed_block_per_slot(task.slot_allocs, &task.entry.slots, task.entry.meta),
+                rebuild_sealed_block_per_slot(task.slot_allocs, &task.entry.slots),
             )),
             Ok(Ok(n)) => {
                 warn!("SSD prefetch: short read {} of {} bytes", n, expected_len);
@@ -1032,7 +1029,6 @@ async fn execute_prefetch(task: PrefetchTask, io: Arc<UringIoEngine>) -> SingleP
 fn rebuild_sealed_block_per_slot(
     slot_allocs: Vec<SlotAlloc>,
     slot_metas: &[SlotMeta],
-    meta: u64,
 ) -> SealedBlock {
     let slots: Vec<(RawBlock, NumaNode)> = slot_metas
         .iter()
@@ -1045,7 +1041,7 @@ fn rebuild_sealed_block_per_slot(
         })
         .collect();
 
-    SealedBlock::from_slots(slots, meta)
+    SealedBlock::from_slots(slots)
 }
 
 #[cfg(test)]
@@ -1065,7 +1061,6 @@ mod tests {
                 len,
                 file_offset: begin % self.shards[shard_id].capacity.max(1),
                 slots: vec![],
-                meta: 0,
             }
         }
 
@@ -1297,7 +1292,6 @@ mod tests {
                 len: total_size,
                 file_offset: 0,
                 slots,
-                meta: 0,
             },
         }
     }

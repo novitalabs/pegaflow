@@ -23,10 +23,10 @@ use crate::metrics::{SERVED_ROLE_BACKUP_TARGET, SERVED_ROLE_SOURCE, core_metrics
 use crate::pinned_pool::{PinnedAllocation, PinnedAllocator};
 use pegaflow_common::NumaNode;
 
+pub(crate) use prefetch::MembersPoll;
 use prefetch::PrefetchScheduler;
 #[cfg(feature = "rdma")]
 use prefetch::RdmaFetch;
-pub(crate) use prefetch::{FetchPart, PartsPoll};
 pub(crate) use read_cache::{DEFAULT_BACKUP_RECLAIMABLE_PERCENT, DemotionReason, ReadCache};
 use write_path::{InsertDeps, WritePipeline};
 
@@ -459,76 +459,20 @@ impl StorageEngine {
         self.read_cache.get_blocks_aligned(keys)
     }
 
-    /// Whether each of `keys` is resident, without touching the LRU.
-    pub(crate) fn contains_keys(&self, keys: &[BlockKey]) -> Vec<bool> {
-        self.read_cache.contains_keys(keys)
-    }
-
     /// Resident blocks of `keys`, position-aligned, without touching the LRU.
     pub(crate) fn peek_blocks(&self, keys: &[BlockKey]) -> Vec<Option<Arc<SealedBlock>>> {
         self.read_cache.peek_blocks(keys)
     }
 
-    /// Per chain of keys of one namespace, how many of its leading keys peers
-    /// and then SSD can bring in: peers serve a prefix, SSD the keys after
-    /// it. And whether peers or SSD can bring in each of `members`, asked with
-    /// one MetaServer query per namespace.
-    pub(crate) async fn reach(
-        &self,
-        chains: &[Vec<BlockKey>],
-        members: &[BlockKey],
-    ) -> (Vec<usize>, Vec<bool>) {
-        let ssd = self.ssd_store.as_deref();
-        let groups = by_namespace(members);
-        let (chain_remote, member_remote) = match self.prefetch.rdma_fetch() {
-            Some(rdma) => {
-                let chains = futures::future::join_all(chains.iter().map(|set| async move {
-                    let Some(first) = set.first() else {
-                        return 0;
-                    };
-                    let hashes: Vec<Vec<u8>> = set.iter().map(|k| k.hash.clone()).collect();
-                    rdma.remote_prefix(&first.namespace, &hashes).await
-                }));
-                let members = futures::future::join_all(groups.iter().map(|at| async move {
-                    let hashes: Vec<Vec<u8>> =
-                        at.iter().map(|&i| members[i].hash.clone()).collect();
-                    let found = rdma
-                        .remote_members(&members[at[0]].namespace, &hashes)
-                        .await;
-                    found.into_iter().map(|j| at[j]).collect::<Vec<_>>()
-                }));
-                tokio::join!(chains, members)
-            }
-            None => (vec![0; chains.len()], Vec::new()),
-        };
-        let chains = chains
-            .iter()
-            .zip(chain_remote)
-            .map(|(set, n)| {
-                let n = n.min(set.len());
-                n + ssd.map_or(0, |ssd| ssd.prefix_len(&set[n..]))
-            })
-            .collect();
-        let mut held = vec![false; members.len()];
-        for i in member_remote.into_iter().flatten() {
-            held[i] = true;
-        }
-        if let Some(ssd) = ssd {
-            for (h, on_ssd) in held.iter_mut().zip(ssd.contains_keys(members)) {
-                *h |= on_ssd;
-            }
-        }
-        (chains, held)
+    /// Start fetching `keys` of one namespace for `id`, each on its own;
+    /// see [`PrefetchScheduler::start_members`].
+    pub(crate) fn start_members(&self, id: &str, keys: Vec<BlockKey>) -> bool {
+        self.prefetch.start_members(id, keys)
     }
 
-    /// Start fetching `parts` for `req_id`; see [`PrefetchScheduler::start_parts`].
-    pub(crate) fn start_fetch(&self, req_id: &str, parts: Vec<FetchPart>) -> bool {
-        self.prefetch.start_parts(req_id, parts)
-    }
-
-    /// Poll the fetch [`Self::start_fetch`] started for `req_id`.
-    pub(crate) async fn poll_fetch(&self, req_id: &str) -> PartsPoll {
-        self.prefetch.poll_parts(&self.read_cache, req_id).await
+    /// Poll the fetch [`Self::start_members`] started for `id`.
+    pub(crate) async fn poll_members(&self, id: &str) -> MembersPoll {
+        self.prefetch.poll_members(&self.read_cache, id).await
     }
 
     /// Evict all blocks from the resident in-memory read cache.
@@ -822,21 +766,6 @@ impl StorageEngine {
     }
 }
 
-/// Indexes of `keys` grouped by namespace, in first-seen order.
-pub(crate) fn by_namespace(keys: &[BlockKey]) -> Vec<Vec<usize>> {
-    let mut groups: Vec<Vec<usize>> = Vec::new();
-    for (i, k) in keys.iter().enumerate() {
-        match groups
-            .iter_mut()
-            .find(|g| keys[g[0]].namespace == k.namespace)
-        {
-            Some(g) => g.push(i),
-            None => groups.push(vec![i]),
-        }
-    }
-    groups
-}
-
 #[cfg(test)]
 impl StorageEngine {
     /// Insert a block directly into the in-memory cache (test only).
@@ -867,8 +796,8 @@ mod tests {
         let storage = make_engine();
         let key1 = BlockKey::new("ns".into(), vec![1]);
         let key2 = BlockKey::new("ns".into(), vec![2]);
-        let block1 = Arc::new(SealedBlock::from_slots(Vec::new(), 0));
-        let block2 = Arc::new(SealedBlock::from_slots(Vec::new(), 0));
+        let block1 = Arc::new(SealedBlock::from_slots(Vec::new()));
+        let block2 = Arc::new(SealedBlock::from_slots(Vec::new()));
 
         storage.test_insert_cache(key1, Arc::clone(&block1));
         storage.test_insert_cache(key2, block2);
@@ -910,7 +839,7 @@ mod tests {
             let raw = RawBlock::new(vec![Segment::new(ptr, REGION as usize, alloc)]);
             storage.test_insert_cache(
                 BlockKey::new("ns".into(), vec![i as u8]),
-                Arc::new(SealedBlock::from_slots(vec![(raw, NumaNode::UNKNOWN)], 0)),
+                Arc::new(SealedBlock::from_slots(vec![(raw, NumaNode::UNKNOWN)])),
             );
         }
         assert_eq!(storage.allocator.usage().0, 16 * REGION);
@@ -943,7 +872,7 @@ mod tests {
         let storage = make_engine();
         let key1 = BlockKey::new("ns".into(), vec![1]);
         let key2 = BlockKey::new("ns".into(), vec![2]);
-        let block = Arc::new(SealedBlock::from_slots(Vec::new(), 0));
+        let block = Arc::new(SealedBlock::from_slots(Vec::new()));
 
         storage.test_insert_cache(key1, block.clone());
         storage.test_insert_cache(key2, block);
@@ -964,7 +893,7 @@ mod tests {
         let key1 = BlockKey::new("ns".into(), vec![1]);
         let key2 = BlockKey::new("ns".into(), vec![2]);
         let key3 = BlockKey::new("ns".into(), vec![3]);
-        let block = Arc::new(SealedBlock::from_slots(Vec::new(), 0));
+        let block = Arc::new(SealedBlock::from_slots(Vec::new()));
 
         storage.test_insert_cache(key1.clone(), block.clone());
         storage.test_insert_cache(key3.clone(), block.clone());
@@ -1002,7 +931,7 @@ mod tests {
         for transferred in [false, true] {
             let storage = make_engine();
             let key = BlockKey::new("ns".into(), vec![1]);
-            let block = Arc::new(SealedBlock::from_slots(Vec::new(), 0));
+            let block = Arc::new(SealedBlock::from_slots(Vec::new()));
             storage.test_insert_cache(key.clone(), block.clone());
 
             let session_id = storage.lock_blocks_for_transfer("node-a", &[(key.clone(), block)]);

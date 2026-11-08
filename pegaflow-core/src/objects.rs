@@ -1,23 +1,26 @@
-//! Byte-addressed objects on the block store.
+//! RPC V2 objects on the block store.
 //!
-//! An object is an opaque byte string keyed by `(fingerprint, prefix)` and cut
-//! into slots, as a KV block is cut into `layers x ranks` slots. Each save
-//! copies strided runs of one device's registered regions into whole slots of
-//! pinned memory on that device's NUMA node, and hands them to the insert
-//! worker like a KV save; the object seals once all of its slots arrived. The
-//! engine never interprets layers, ranks or layouts: the client decides how
-//! many slots an object has, which device writes each, and what bytes go where,
-//! and records that choice in the object's opaque `meta` word. The first
-//! writer's slot count and meta stand; slots of a writer whose count or meta
-//! differ are dropped. A query lease is consumed by the loads that name it.
+//! An object is keyed by `(namespace, prefix)`, two 32-byte digests. A
+//! namespace is one KV kind with all its layers; every rank registers the
+//! namespaces it holds and its device regions once, then saves and loads all
+//! layers of an object in one span list, `layers x L` bytes where
+//! `L = local_hidden x block_size` is one rank's slice of one layer. Each
+//! layer of the whole object (`bytes_per_block`) is `S = bytes_per_block / L`
+//! slices, and rank `r` holds slice `r x S / world_size`.
+//!
+//! Only the ranks in `saver_rank` save. The engine cuts their bytes into one
+//! slot per `(saver, layer)`, in pinned memory on the saver's NUMA node, and
+//! hands them to the insert worker like a KV save; the object seals once every
+//! slot arrived. Two savers of one slice (MLA over two NUMA nodes) keep two
+//! copies, and a load reads the copy on its own node when there is one.
 //!
 //! Sealed objects are [`SealedBlock`]s under the [`BlockKey`]
-//! `(hex(fingerprint), prefix)`, one single-segment slot per object slot, so
-//! they share the pinned pool, LRU eviction, query leases, the SSD cache and
-//! MetaServer registration with KV blocks, and a query brings an evicted
-//! object back from a peer or SSD.
+//! `(hex(namespace), prefix)`, so they share the pinned pool, LRU eviction,
+//! the SSD cache, RDMA fetch and MetaServer registration with KV blocks. The
+//! engine never interprets a namespace beyond comparing its bytes.
 
-use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Instant;
@@ -28,262 +31,313 @@ use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::backing::SSD_ALIGNMENT;
-use crate::block::{BlockKey, RawBlock, SealedBlock, Segment};
-use crate::gpu_worker::{LoadCompletion, spawn_pinned_worker, wait_worker_ready};
+use crate::block::{BlockKey, PrefetchStatus, RawBlock, SealedBlock, Segment};
+use crate::gpu_worker::{LoadCompletion, build_backend, spawn_pinned_worker, wait_worker_ready};
 use crate::metrics::core_metrics;
 use crate::offload::{RawSaveBatch, RawSaveLayer};
 use crate::pinned_pool::{MappedPinnedPtr, PinnedAllocation};
-use crate::storage::{FetchPart, PartsPoll, by_namespace};
-use crate::transfer::{Dim, Direction, MAX_DIMS, StridedCopier, StridedCopy};
+use crate::storage::MembersPoll;
+use crate::transfer::{CopyDesc, TransferBackend, TransferMode};
 use crate::{EngineError, NumaNode, PegaEngine, QueryLeaseId};
 
-/// Most slots one object may have.
-const MAX_SLOTS: u32 = 1 << 12;
-/// Most bytes of one slot: far above one layer of any object, and a bound
-/// on what checking a write costs.
-const MAX_SLOT_BYTES: u64 = 256 << 20;
-/// Most rows the overlap check of one slot walks.
-const MAX_CHECKED_ROWS: u64 = 1 << 24;
-/// Most dims one object run may have.
-pub const MAX_RUN_DIMS: usize = MAX_DIMS;
-/// Most keys and points one query may carry.
-const MAX_QUERY_KEYS: usize = 1 << 16;
-const MAX_QUERY_POINTS: usize = 1 << 12;
-
-/// `(fingerprint, prefix)`, both SHA-256 values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// `(namespace, prefix)`, both 32-byte digests.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ObjectKey {
-    pub fingerprint: [u8; 32],
+    pub namespace: [u8; 32],
     pub prefix: [u8; 32],
 }
 
 impl ObjectKey {
     /// Hex namespaces never equal a model namespace a KV connector derives.
     fn block_key(&self) -> BlockKey {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        let namespace = self
-            .fingerprint
-            .iter()
-            .flat_map(|b| [HEX[usize::from(b >> 4)], HEX[usize::from(b & 15)]])
-            .map(char::from)
-            .collect();
-        BlockKey::new(namespace, self.prefix.to_vec())
+        BlockKey::new(hex(&self.namespace), self.prefix.to_vec())
     }
 }
 
-/// One dimension of an [`ObjectRun`]: `count` steps of `region_stride` bytes
-/// in the device region and `slot_stride` bytes in the slot; the strides are
-/// ignored when `count == 1`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ObjectDim {
-    pub count: u32,
-    pub region_stride: u64,
-    pub slot_stride: u64,
+/// Keys log as the first 8 bytes of each digest.
+impl fmt::Debug for ObjectKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}/{}",
+            hex(&self.namespace[..8]),
+            hex(&self.prefix[..8])
+        )
+    }
 }
 
-/// Rows of `width` bytes over up to [`MAX_DIMS`] dimensions, the first
-/// fastest: row `(i_0, i_1, ..)` is at `region_offset + sum(i_d * region_stride_d)`
-/// of the device region and `slot_offset + sum(i_d * slot_stride_d)` of the
-/// slot. No dimensions is one row.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ObjectRun {
-    pub region: u32,
-    pub region_offset: u64,
-    pub slot_offset: u64,
-    pub width: u64,
-    pub dims: Vec<ObjectDim>,
+fn hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    bytes
+        .iter()
+        .flat_map(|b| [HEX[usize::from(b >> 4)], HEX[usize::from(b & 15)]])
+        .map(char::from)
+        .collect()
 }
 
-impl ObjectRun {
-    /// Rows the run copies.
-    fn rows(&self) -> u64 {
-        self.dims
-            .iter()
-            .fold(1u64, |n, d| n.saturating_mul(u64::from(d.count)))
-    }
+/// One `(offset, len)` pair inside a region, in bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Span {
+    pub offset: u64,
+    pub len: u64,
+}
 
-    fn bytes(&self) -> u64 {
-        self.width.saturating_mul(self.rows())
-    }
+impl Span {
+    /// Wire size of one `ObjectSpans.span` element.
+    pub const WIRE_BYTES: usize = 16;
 
-    /// Slot offset of each row, the first dimension fastest; only for a run
-    /// whose `ends` checked out.
-    fn slot_rows(&self) -> impl Iterator<Item = u64> + '_ {
-        (0..self.rows()).map(move |mut r| {
-            let mut at = self.slot_offset;
-            for d in &self.dims {
-                let n = u64::from(d.count);
-                at += r % n * d.slot_stride;
-                r /= n;
-            }
-            at
+    /// Decode one element: `offset u64 LE` then `len u64 LE`, exactly 16 bytes.
+    pub fn decode(raw: &[u8]) -> Result<Self, String> {
+        let words: &[u8; Self::WIRE_BYTES] = raw.try_into().map_err(|_| {
+            format!(
+                "span element is {} bytes, expected {}",
+                raw.len(),
+                Self::WIRE_BYTES
+            )
+        })?;
+        let (offset, len) = words.split_at(8);
+        Ok(Self {
+            offset: u64::from_le_bytes(offset.try_into().expect("8-byte half")),
+            len: u64::from_le_bytes(len.try_into().expect("8-byte half")),
         })
     }
-
-    /// One past the last byte on the region and slot side, if the run is
-    /// well formed: nonempty, at most [`MAX_DIMS`] dimensions, and on each
-    /// side, with its dimensions ordered by stride, every stride at least the
-    /// extent of the rows below it, so no two rows overlap.
-    fn ends(&self) -> Option<(u64, u64)> {
-        if self.width == 0 || self.dims.len() > MAX_DIMS || self.dims.iter().any(|d| d.count == 0) {
-            return None;
-        }
-        let end = |base: u64, stride: fn(&ObjectDim) -> u64| {
-            let mut dims: Vec<(u64, u64)> = self
-                .dims
-                .iter()
-                .filter(|d| d.count > 1)
-                .map(|d| (stride(d), u64::from(d.count)))
-                .collect();
-            dims.sort_unstable();
-            let mut extent = self.width;
-            for (s, n) in dims {
-                if s < extent {
-                    return None;
-                }
-                extent = (n - 1).checked_mul(s)?.checked_add(extent)?;
-            }
-            base.checked_add(extent)
-        };
-        Some((
-            end(self.region_offset, |d| d.region_stride)?,
-            end(self.slot_offset, |d| d.slot_stride)?,
-        ))
-    }
 }
 
-/// One slot of an object, written whole by one save: its runs copy every one
-/// of its `size` bytes once.
+/// Where one object sits in a rank's region: spans over every layer of its
+/// namespace, in `layer_names` order.
 #[derive(Debug, Clone)]
-pub struct SlotWrite {
-    pub slot: u32,
-    pub size: u64,
-    pub runs: Vec<ObjectRun>,
-}
-
-/// Slots of an object of `slots` slots and layout word `meta` one device
-/// writes.
-#[derive(Debug, Clone)]
-pub struct ObjectWrite {
+pub struct ObjectSpans {
     pub key: ObjectKey,
-    pub slots: u32,
-    pub meta: u64,
-    pub writes: Vec<SlotWrite>,
+    pub region: u32,
+    pub spans: Vec<Span>,
 }
 
-#[derive(Debug, Clone)]
-pub struct SlotRead {
-    pub slot: u32,
-    pub runs: Vec<ObjectRun>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ObjectRead {
-    pub key: ObjectKey,
-    pub reads: Vec<SlotRead>,
-}
-
-/// Reads of objects one lease holds, by one of the lease's `consumers` loads.
-#[derive(Debug, Clone)]
-pub struct ObjectLoad {
-    pub lease: QueryLeaseId,
-    pub reads: Vec<ObjectRead>,
-    pub consumers: u32,
-}
-
-/// A resume point: the first `blocks` keys of every prefix chain of its
-/// query, and `keys`.
-#[derive(Debug, Clone)]
-pub struct ObjectPoint {
-    pub blocks: u32,
-    pub keys: Vec<ObjectKey>,
-}
-
-/// Prefix chains, each of one fingerprint, and the points a query picks
-/// from, in ascending order of preference.
-#[derive(Debug, Clone)]
-pub struct ObjectQuery {
-    pub prefixes: Vec<Vec<ObjectKey>>,
-    pub points: Vec<ObjectPoint>,
+/// One namespace as a rank registers it; every rank of an instance
+/// registers the same.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamespaceMeta {
+    pub namespace: [u8; 32],
+    pub world_size: u32,
+    pub layer_names: Vec<String>,
+    pub bytes_per_block: u64,
+    pub block_size: u64,
+    pub local_hidden: u64,
+    pub interleave_token: u64,
+    pub saver_rank: Vec<u32>,
 }
 
 #[derive(Debug)]
 pub enum ObjectQueryStatus {
-    /// Missing objects are being fetched; ask again with the same `req_id`.
+    /// Missing objects are being fetched; ask again with the same query id.
     Loading,
-    /// The point found, if any, and how many leading blocks of every chain
-    /// the lease holds: those of the point, or with no points the longest
-    /// prefix every chain holds. The lease also holds the point's keys; none
-    /// is issued when it would hold nothing. `slots` and `metas` have the
-    /// slot count and meta of every object leased: the leading `blocks` of
-    /// each chain in turn, then the point's keys.
+    /// Prefix queries: `hits` leading keys. Membership queries: the keys at
+    /// `hit_positions`. The lease holds exactly those; none on 0 hits.
     Ready {
-        point: Option<usize>,
-        blocks: u32,
+        hits: usize,
         lease: Option<QueryLeaseId>,
-        slots: Vec<u32>,
-        metas: Vec<u64>,
+        hit_positions: Vec<u32>,
     },
 }
 
-/// A validated [`ObjectQuery`] over block keys.
-struct Plan {
-    prefixes: Vec<Vec<BlockKey>>,
-    points: Vec<(usize, Vec<BlockKey>)>,
+/// The slot layout of a namespace: one slot per `(saver, layer)`.
+#[derive(Debug)]
+struct Shape {
+    world_size: u32,
+    layers: usize,
+    /// One rank's slice of one layer, `L`.
+    slice_bytes: u64,
+    /// Slices of one layer, `S`.
+    slices: u32,
+    savers: Vec<u32>,
 }
 
-impl Plan {
-    fn new(q: &ObjectQuery) -> Result<Self, EngineError> {
-        let bad = |why: String| Err(EngineError::InvalidArgument(why));
-        let keys: usize = q.prefixes.iter().map(Vec::len).sum::<usize>()
-            + q.points.iter().map(|p| p.keys.len()).sum::<usize>();
-        if keys > MAX_QUERY_KEYS || q.points.len() > MAX_QUERY_POINTS {
-            return bad(format!(
-                "{keys} keys and {} points exceed {MAX_QUERY_KEYS} and {MAX_QUERY_POINTS}",
-                q.points.len()
+impl Shape {
+    fn new(meta: &NamespaceMeta, rank: u32) -> Result<Self, String> {
+        let world_size = meta.world_size;
+        if world_size == 0 || rank >= world_size {
+            return Err(format!("rank {rank} is outside world_size {world_size}"));
+        }
+        if meta.layer_names.is_empty() {
+            return Err("no layers".into());
+        }
+        let slice_bytes = meta
+            .local_hidden
+            .checked_mul(meta.block_size)
+            .filter(|&l| l > 0)
+            .ok_or("local_hidden x block_size must be positive and fit 64 bits")?;
+        if meta.bytes_per_block == 0 || !meta.bytes_per_block.is_multiple_of(slice_bytes) {
+            return Err(format!(
+                "bytes_per_block {} is not a positive multiple of local_hidden x block_size {slice_bytes}",
+                meta.bytes_per_block
             ));
         }
-        if let Some(c) = q
-            .prefixes
+        let slices = u32::try_from(meta.bytes_per_block / slice_bytes)
+            .ok()
+            .filter(|&s| s > 0 && world_size.is_multiple_of(s))
+            .ok_or_else(|| {
+                format!(
+                    "{} slices per layer do not divide world_size {world_size}",
+                    meta.bytes_per_block / slice_bytes
+                )
+            })?;
+        let mut seen = HashSet::new();
+        if let Some(r) = meta
+            .saver_rank
             .iter()
-            .position(|c| c.iter().any(|k| k.fingerprint != c[0].fingerprint))
+            .find(|&&r| r >= world_size || !seen.insert(r))
         {
-            return bad(format!("prefix chain {c} mixes fingerprints"));
-        }
-        let shortest = q.prefixes.iter().map(Vec::len).min().unwrap_or(0);
-        if let Some(i) = q.points.iter().position(|p| p.blocks as usize > shortest) {
-            return bad(format!(
-                "point {i} needs {} blocks of chains as short as {shortest}",
-                q.points[i].blocks
+            return Err(format!(
+                "saver_rank {r} is repeated or outside world_size {world_size}"
             ));
         }
-        let keys = |l: &[ObjectKey]| l.iter().map(ObjectKey::block_key).collect();
-        Ok(Self {
-            prefixes: q.prefixes.iter().map(|c| keys(c)).collect(),
-            points: q
-                .points
-                .iter()
-                .map(|p| (p.blocks as usize, keys(&p.keys)))
-                .collect(),
-        })
+        let shape = Self {
+            world_size,
+            layers: meta.layer_names.len(),
+            slice_bytes,
+            slices,
+            savers: meta.saver_rank.clone(),
+        };
+        let covered: HashSet<u32> = shape.savers.iter().map(|&r| shape.slice(r)).collect();
+        if covered.len() != slices as usize {
+            return Err(format!(
+                "saver_rank {:?} covers {} of {slices} slices",
+                shape.savers,
+                covered.len()
+            ));
+        }
+        Ok(shape)
     }
 
-    /// With `chain(c)` leading blocks of chain `c` and the point keys `has`
-    /// marks, the last point that holds, and the blocks that answer leases.
-    fn best(
-        &self,
-        chain: impl Fn(usize) -> usize,
-        has: impl Fn(&BlockKey) -> bool,
-    ) -> (Option<usize>, usize) {
-        let common = (0..self.prefixes.len()).map(chain).min().unwrap_or(0);
-        if self.points.is_empty() {
-            return (None, common);
-        }
-        self.points
-            .iter()
-            .rposition(|(blocks, keys)| *blocks <= common && keys.iter().all(&has))
-            .map_or((None, 0), |p| (Some(p), self.points[p].0))
+    fn slice(&self, rank: u32) -> u32 {
+        // u64: rank x slices may pass u32 for large worlds.
+        (u64::from(rank) * u64::from(self.slices) / u64::from(self.world_size)) as u32
     }
+
+    fn total_slots(&self) -> usize {
+        self.savers.len() * self.layers
+    }
+
+    fn slot(&self, layer: usize, saver: usize) -> usize {
+        layer * self.savers.len() + saver
+    }
+
+    /// Bytes one rank saves or loads of an object.
+    fn object_bytes(&self) -> u64 {
+        self.layers as u64 * self.slice_bytes
+    }
+
+    /// Pinned base and allocation of the slot `rank` reads in each layer of
+    /// `block`, from the copy on `numa` when there is one.
+    fn read_slots(
+        &self,
+        rank: u32,
+        block: &SealedBlock,
+        numa: NumaNode,
+    ) -> Result<Vec<(MappedPinnedPtr, usize)>, String> {
+        if block.slots().len() != self.total_slots() {
+            return Err(format!(
+                "object has {} slots, its namespace {}",
+                block.slots().len(),
+                self.total_slots()
+            ));
+        }
+        let slice = self.slice(rank);
+        let copies: Vec<usize> = (0..self.savers.len())
+            .filter(|&s| self.slice(self.savers[s]) == slice)
+            .collect();
+        // Registration checked that savers cover every slice.
+        let saver = copies
+            .iter()
+            .copied()
+            .find(|&s| block.slot_numas()[self.slot(0, s)] == numa)
+            .unwrap_or(copies[0]);
+        (0..self.layers)
+            .map(|l| {
+                let raw = &block.slots()[self.slot(l, saver)];
+                match (
+                    raw.segment_mapped_ptr(0),
+                    raw.segment_allocation_id(0),
+                    raw.segment_size(0),
+                ) {
+                    (Some(at), Some(alloc), Some(n)) if n as u64 >= self.slice_bytes => {
+                        Ok((at, alloc))
+                    }
+                    _ => Err(format!(
+                        "slot of layer {l} is shorter than {}",
+                        self.slice_bytes
+                    )),
+                }
+            })
+            .collect()
+    }
+}
+
+/// A run of one span inside one layer's slice.
+#[derive(Debug, PartialEq, Eq)]
+struct Piece {
+    layer: usize,
+    slot_offset: u64,
+    region_offset: u64,
+    len: u64,
+}
+
+/// Cut `spans`, whose lengths sum to whole slices of `slice` bytes, into
+/// pieces that never cross a layer.
+fn pieces(spans: &[Span], slice: u64) -> Vec<Piece> {
+    let mut out = Vec::with_capacity(spans.len());
+    let mut at = 0u64;
+    for s in spans {
+        let mut done = 0;
+        while done < s.len {
+            let (layer, slot_offset) = (at / slice, at % slice);
+            let len = (slice - slot_offset).min(s.len - done);
+            out.push(Piece {
+                layer: layer as usize,
+                slot_offset,
+                region_offset: s.offset + done,
+                len,
+            });
+            done += len;
+            at += len;
+        }
+    }
+    out
+}
+
+/// `o` lies inside a region of `region_size` bytes and covers every layer.
+fn check_spans(
+    o: &ObjectSpans,
+    region_size: Option<u64>,
+    shape: &Shape,
+) -> Result<(), EngineError> {
+    let bad = |why: String| {
+        Err(EngineError::InvalidArgument(format!(
+            "object {:?}: {why}",
+            o.key
+        )))
+    };
+    let Some(size) = region_size else {
+        return bad(format!("unknown region {}", o.region));
+    };
+    let mut total = 0u64;
+    for s in &o.spans {
+        match s.offset.checked_add(s.len) {
+            Some(end) if end <= size => total = total.saturating_add(s.len),
+            _ => {
+                return bad(format!(
+                    "span {s:?} is out of region {} of {size} bytes",
+                    o.region
+                ));
+            }
+        }
+    }
+    if total != shape.object_bytes() {
+        return bad(format!(
+            "spans cover {total} bytes, expected {} layers x {}",
+            shape.layers, shape.slice_bytes
+        ));
+    }
+    Ok(())
 }
 
 /// A device's IPC-opened regions; closed when the device and its last
@@ -312,11 +366,17 @@ impl Drop for Regions {
     }
 }
 
-/// A copy stream of one device and the copier that owns its descriptor buffers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Direction {
+    Save,
+    Load,
+}
+
+/// A copy stream of one device and its batch copy kernel.
 struct Lane {
     ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
-    copier: StridedCopier,
+    backend: Box<dyn TransferBackend>,
 }
 
 impl Lane {
@@ -326,15 +386,14 @@ impl Lane {
         let stream = ctx
             .new_stream()
             .map_err(|e| EngineError::CudaInit(format!("{e:?}")))?;
-        let copier = StridedCopier::new(ctx).map_err(EngineError::CudaInit)?;
         Ok(Self {
             ctx: Arc::clone(ctx),
             stream,
-            copier,
+            backend: build_backend(TransferMode::Kernel, ctx)?,
         })
     }
 
-    fn transfer(&mut self, copies: &[StridedCopy], dir: Direction) -> Result<(), EngineError> {
+    fn transfer(&self, copies: &[CopyDesc], dir: Direction) -> Result<(), EngineError> {
         if copies.is_empty() {
             return Ok(());
         }
@@ -342,9 +401,11 @@ impl Lane {
         self.ctx
             .bind_to_thread()
             .map_err(|e| failed(format!("{e:?}")))?;
-        self.copier
-            .copy(copies, dir, &self.stream)
-            .map_err(failed)?;
+        match dir {
+            Direction::Save => self.backend.d2h(copies, &self.stream),
+            Direction::Load => self.backend.h2d(copies, &self.stream),
+        }
+        .map_err(failed)?;
         self.stream
             .synchronize()
             .map_err(|e| failed(format!("{e:?}")))
@@ -352,7 +413,7 @@ impl Lane {
 }
 
 struct CopyJob {
-    copies: Vec<StridedCopy>,
+    copies: Vec<CopyDesc>,
     /// Pinned memory the copies touch, kept alive until they finish.
     keep: Box<dyn Send>,
     bytes: u64,
@@ -363,7 +424,7 @@ struct CopyJob {
 /// dropped. Records load metrics as the KV load worker does; saves record
 /// theirs on the RPC path.
 fn copy_worker(
-    mut lane: Lane,
+    lane: Lane,
     device_id: i32,
     dir: Direction,
     mut jobs: mpsc::UnboundedReceiver<CopyJob>,
@@ -372,7 +433,7 @@ fn copy_worker(
         let start = Instant::now();
         let result = lane.transfer(&job.copies, dir);
         let elapsed = start.elapsed();
-        if dir == Direction::HostToDevice {
+        if dir == Direction::Load {
             let m = core_metrics();
             match &result {
                 Ok(()) if job.bytes > 0 => {
@@ -398,10 +459,11 @@ fn copy_worker(
     info!("Object {dir:?} worker shutting down: device={device_id}");
 }
 
-/// One registered device: its regions and a save and a load worker, each
+/// One registered rank: its regions and a save and a load worker, each
 /// pinned to the GPU's node with its own stream, so a load never queues
 /// behind a save.
 pub(crate) struct Device {
+    device_id: i32,
     regions: Arc<Regions>,
     /// The GPU's NUMA node; saves allocate there.
     numa: NumaNode,
@@ -410,17 +472,21 @@ pub(crate) struct Device {
 }
 
 impl Device {
-    /// The run is well formed, inside its region, and inside a slot of
-    /// `size` bytes; returns one past its last slot byte.
-    fn check(&self, run: &ObjectRun, size: u64) -> Result<u64, EngineError> {
-        let (_, region) = self.regions.list.get(run.region as usize).ok_or_else(|| {
-            EngineError::InvalidArgument(format!("unknown region {}", run.region))
-        })?;
-        match run.ends() {
-            Some((re, se)) if re <= *region && se <= size => Ok(se),
-            _ => Err(EngineError::InvalidArgument(format!(
-                "run {run:?} is empty, overlapping or out of bounds of a {size} byte slot"
-            ))),
+    fn region_size(&self, region: u32) -> Option<u64> {
+        self.regions.list.get(region as usize).map(|r| r.1)
+    }
+
+    /// The copy of `p` of an object in `region` to or from pinned memory at
+    /// `slot` of allocation `alloc`.
+    fn copy(&self, region: u32, p: &Piece, slot: MappedPinnedPtr, alloc: usize) -> CopyDesc {
+        let at = slot.add(p.slot_offset as usize);
+        CopyDesc {
+            device: self.regions.list[region as usize].0 + p.region_offset,
+            host: at.host().as_ptr(),
+            host_device: at.device().as_ptr() as u64,
+            size: p.len as usize,
+            device_allocation: region as usize,
+            host_allocation: alloc,
         }
     }
 
@@ -432,101 +498,164 @@ impl Device {
             ..job
         };
         let worker = match dir {
-            Direction::DeviceToHost => &self.save,
-            Direction::HostToDevice => &self.load,
+            Direction::Save => &self.save,
+            Direction::Load => &self.load,
         };
         worker
             .send(job)
             .map_err(|_| EngineError::Storage("object copy worker exited".into()))
     }
+}
 
-    /// The copy of `run` between its device region and pinned memory at `at`.
-    fn copy_of(&self, at: MappedPinnedPtr, run: &ObjectRun) -> StridedCopy {
-        let dims: Vec<Dim> = run
-            .dims
-            .iter()
-            .map(|d| Dim {
-                count: u64::from(d.count),
-                device_pitch: d.region_stride,
-                host_pitch: d.slot_stride,
+struct Namespace {
+    meta: NamespaceMeta,
+    shape: Arc<Shape>,
+}
+
+/// The namespaces and ranks of one instance.
+#[derive(Default)]
+pub(crate) struct ObjectInstance {
+    namespaces: HashMap<[u8; 32], Namespace>,
+    devices: HashMap<u32, Arc<Device>>,
+}
+
+impl ObjectInstance {
+    fn shape(&self, namespace: &[u8; 32]) -> Result<Arc<Shape>, EngineError> {
+        self.namespaces
+            .get(namespace)
+            .map(|n| Arc::clone(&n.shape))
+            .ok_or_else(|| {
+                EngineError::InvalidArgument(format!(
+                    "namespace {} is not registered",
+                    hex(&namespace[..8])
+                ))
             })
-            .collect();
-        StridedCopy::new(
-            self.regions.list[run.region as usize].0 + run.region_offset,
-            at.device().as_ptr() as u64,
-            run.width,
-            &dims,
-        )
+    }
+
+    /// A rank of `namespaces` may join: its rank is new, and namespaces other
+    /// ranks registered match.
+    fn check_join(
+        &self,
+        rank: u32,
+        namespaces: &HashMap<[u8; 32], Namespace>,
+    ) -> Result<(), EngineError> {
+        if self.devices.contains_key(&rank) {
+            return Err(EngineError::InvalidArgument(format!(
+                "rank {rank} is already registered"
+            )));
+        }
+        for (ns, n) in namespaces {
+            if self
+                .namespaces
+                .get(ns)
+                .is_some_and(|known| known.meta != n.meta)
+            {
+                return Err(EngineError::InvalidArgument(format!(
+                    "namespace {} differs from what another rank registered",
+                    hex(&ns[..8])
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
-/// Registered object devices by `(instance, rank)`; objects live in the block store.
+/// Registered RPC V2 instances; objects live in the block store.
 #[derive(Default)]
 pub(crate) struct ObjectStore {
-    devices: Mutex<HashMap<(String, u32), Arc<Device>>>,
+    instances: Mutex<HashMap<String, ObjectInstance>>,
 }
 
 impl ObjectStore {
-    pub(crate) fn has_devices(&self) -> bool {
-        !self.devices.lock().is_empty()
+    pub(crate) fn has_instances(&self) -> bool {
+        !self.instances.lock().is_empty()
     }
 
-    /// Take every device of `instance` out; dropping them closes their
-    /// regions once no copy holds them, so callers drop them outside locks.
-    pub(crate) fn remove_instance(&self, instance: &str) -> Vec<Arc<Device>> {
-        self.devices
-            .lock()
-            .extract_if(|(i, _), _| i == instance)
-            .map(|(_, d)| d)
-            .collect()
+    /// Take `instance` out; dropping it closes its regions once no copy
+    /// holds them, so callers drop it outside locks.
+    pub(crate) fn remove_instance(&self, instance: &str) -> Option<ObjectInstance> {
+        self.instances.lock().remove(instance)
     }
 
-    /// Take every device out; as [`Self::remove_instance`].
-    pub(crate) fn remove_all(&self) -> HashMap<(String, u32), Arc<Device>> {
-        std::mem::take(&mut *self.devices.lock())
+    /// Take every instance out; as [`Self::remove_instance`].
+    pub(crate) fn remove_all(&self) -> HashMap<String, ObjectInstance> {
+        std::mem::take(&mut *self.instances.lock())
     }
 
-    fn device(&self, instance: &str, rank: u32) -> Result<Arc<Device>, EngineError> {
-        self.devices
-            .lock()
-            .get(&(instance.to_string(), rank))
+    /// Rank `rank` of `instance` and the shape of each of `keys`.
+    fn resolve<'a>(
+        &self,
+        instance: &str,
+        rank: u32,
+        keys: impl Iterator<Item = &'a ObjectKey>,
+    ) -> Result<(Arc<Device>, Vec<Arc<Shape>>), EngineError> {
+        let all = self.instances.lock();
+        let inst = all
+            .get(instance)
+            .ok_or_else(|| EngineError::InstanceMissing(instance.to_string()))?;
+        let device = inst
+            .devices
+            .get(&rank)
             .cloned()
-            .ok_or_else(|| {
-                EngineError::InstanceMissing(format!("{instance} (object device rank {rank})"))
-            })
+            .ok_or_else(|| EngineError::InstanceMissing(format!("{instance} (rank {rank})")))?;
+        let shapes = keys
+            .map(|k| inst.shape(&k.namespace))
+            .collect::<Result<_, _>>()?;
+        Ok((device, shapes))
     }
 
-    fn require_instance(&self, instance: &str) -> Result<(), EngineError> {
-        if self.devices.lock().keys().any(|(i, _)| i == instance) {
-            Ok(())
-        } else {
-            Err(EngineError::InstanceMissing(instance.to_string()))
-        }
+    fn shape(&self, instance: &str, namespace: &[u8; 32]) -> Result<Arc<Shape>, EngineError> {
+        self.instances
+            .lock()
+            .get(instance)
+            .ok_or_else(|| EngineError::InstanceMissing(instance.to_string()))?
+            .shape(namespace)
     }
-}
-
-fn already_registered(instance: &str, rank: u32) -> EngineError {
-    EngineError::InvalidArgument(format!(
-        "object device rank {rank} of {instance} is already registered"
-    ))
 }
 
 impl PegaEngine {
-    /// Open `regions` (IPC handle, size) of device `device_id` as object
-    /// device `rank` of `instance_id`. A rank registers once until its
-    /// instance is unregistered or its session ends. Returns the GPU's NUMA
-    /// node, where saves of the device allocate, and its CPU socket.
-    pub fn register_object_device(
+    /// Register rank `rank` of `instance_id` on device `device_id` with its
+    /// `namespaces` and `regions` (IPC handle, size). A rank registers once
+    /// until its instance is unregistered or its session ends; every rank
+    /// registers the same namespaces.
+    pub fn register_context_v2(
         &self,
         instance_id: &str,
         rank: u32,
         device_id: i32,
+        namespaces: Vec<NamespaceMeta>,
         regions: &[(Vec<u8>, u64)],
-    ) -> Result<(NumaNode, u32), EngineError> {
-        let key = (instance_id.to_string(), rank);
-        if self.objects.devices.lock().contains_key(&key) {
-            return Err(already_registered(instance_id, rank));
+    ) -> Result<(), EngineError> {
+        let mut table = HashMap::with_capacity(namespaces.len());
+        for meta in namespaces {
+            let shape = Shape::new(&meta, rank).map_err(|e| {
+                EngineError::InvalidArgument(format!(
+                    "namespace {}: {e}",
+                    hex(&meta.namespace[..8])
+                ))
+            })?;
+            let ns = meta.namespace;
+            if table
+                .insert(
+                    ns,
+                    Namespace {
+                        meta,
+                        shape: Arc::new(shape),
+                    },
+                )
+                .is_some()
+            {
+                return Err(EngineError::InvalidArgument(format!(
+                    "namespace {} is listed twice",
+                    hex(&ns[..8])
+                )));
+            }
         }
+        // Fail before opening IPC handles; checked again on insert.
+        if let Some(inst) = self.objects.instances.lock().get(instance_id) {
+            inst.check_join(rank, &table)?;
+        }
+
         let cuda = |e: cudarc::driver::DriverError| EngineError::CudaInit(format!("{e:?}"));
         let ordinal = usize::try_from(device_id)
             .map_err(|_| EngineError::InvalidArgument(format!("device_id {device_id}")))?;
@@ -561,356 +690,314 @@ impl PegaEngine {
             wait_worker_ready(&format!("object {name}"), device_id, ready)?;
             Ok::<_, EngineError>(tx)
         };
-        let save = spawn(Direction::DeviceToHost, "save")?;
-        let load = spawn(Direction::HostToDevice, "load")?;
+        let save = spawn(Direction::Save, "save")?;
+        let load = spawn(Direction::Load, "load")?;
         let region_count = regions.list.len();
-        let device = Device {
+        let namespace_count = table.len();
+        let device = Arc::new(Device {
+            device_id,
             regions,
             numa,
             save,
             load,
-        };
+        });
         {
-            // Under the instances lock, as unregistering checks for devices
-            // and clears `has_instance` there.
+            // Under the instances lock, as unregistering checks for object
+            // instances and clears `has_instance` there.
             let _instances = self
                 .instances
                 .write()
                 .expect("instances write lock poisoned");
-            match self.objects.devices.lock().entry(key) {
-                Entry::Occupied(_) => return Err(already_registered(instance_id, rank)),
-                Entry::Vacant(v) => {
-                    v.insert(Arc::new(device));
-                }
+            let mut all = self.objects.instances.lock();
+            let inst = all.entry(instance_id.to_string()).or_default();
+            inst.check_join(rank, &table)?;
+            inst.devices.insert(rank, device);
+            for (ns, n) in table {
+                inst.namespaces.entry(ns).or_insert(n);
             }
             self.storage.set_has_instance(true);
         }
-        let socket = self.topology.socket_of(numa);
         info!(
-            "Registered object device: instance={instance_id} rank={rank} device={device_id} \
-             regions={region_count} numa={numa} socket={socket}"
+            "Registered context v2: instance={instance_id} rank={rank} device={device_id} \
+             namespaces={namespace_count} regions={region_count} numa={numa}"
         );
-        Ok((numa, socket))
+        Ok(())
     }
 
-    /// Answer `query` for request `req_id` of `instance_id`, as `QueryPrefetch`
-    /// does for KV blocks.
+    /// Answer a query over `keys` of one namespace of `instance_id`.
     ///
-    /// The first call finds the last point every chain and its keys can reach
-    /// in memory, from peers or on this node's SSD; with no points, the
-    /// longest prefix every chain reaches. If that needs objects not in
-    /// memory it fetches them, peers first and then SSD, and answers
-    /// `Loading`; later calls with the same `req_id` poll the fetch. `Ready`
-    /// answers from what is then held, a shorter point if the fetch fell short.
-    pub async fn query_objects(
+    /// With `prefix_search` it is v1 `QueryPrefetch` without
+    /// `wait_for_full_prefix`: the leading keys in memory, or `Loading` while
+    /// SSD and peers bring more in. Otherwise every key stands on its own:
+    /// keys not in memory are fetched from peers and SSD, and the answer is
+    /// `Loading` until that ends. Poll with the same `query_id` and keys; a
+    /// `None` id gets a fresh one. Returns the id and the answer.
+    pub async fn query_object(
         &self,
         instance_id: &str,
-        req_id: &str,
-        query: &ObjectQuery,
-    ) -> Result<ObjectQueryStatus, EngineError> {
-        self.objects.require_instance(instance_id)?;
-        let plan = Plan::new(query)?;
-        let tag = format!("objects:{instance_id}:{req_id}");
-        match self.storage.poll_fetch(&tag).await {
-            PartsPoll::Loading => return Ok(ObjectQueryStatus::Loading),
-            PartsPoll::Done(fetched) => {
-                return Ok(self.ready_objects(instance_id, &plan, fetched));
+        query_id: Option<&str>,
+        keys: &[ObjectKey],
+        prefix_search: bool,
+    ) -> Result<(String, ObjectQueryStatus), EngineError> {
+        let query_id = query_id.map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_string);
+        let Some(first) = keys.first() else {
+            if !self.objects.instances.lock().contains_key(instance_id) {
+                return Err(EngineError::InstanceMissing(instance_id.to_string()));
             }
-            PartsPoll::Idle => {}
-        }
-        let resident: Vec<usize> = plan
-            .prefixes
-            .iter()
-            .map(|c| {
-                self.storage
-                    .contains_keys(c)
-                    .iter()
-                    .take_while(|&&b| b)
-                    .count()
-            })
-            .collect();
-        let point_keys: Vec<BlockKey> = plan
-            .points
-            .iter()
-            .flat_map(|(_, keys)| keys.iter().cloned())
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        let held: HashSet<BlockKey> = point_keys
-            .iter()
-            .zip(self.storage.contains_keys(&point_keys))
-            .filter(|&(_, b)| b)
-            .map(|(k, _)| k.clone())
-            .collect();
-        let in_memory = plan.best(|c| resident[c], |k| held.contains(k));
-        let full = match plan.points.len() {
-            0 => plan
-                .prefixes
-                .iter()
-                .zip(&resident)
-                .all(|(c, &r)| r == c.len()),
-            n => in_memory.0 == Some(n - 1),
+            let empty = ObjectQueryStatus::Ready {
+                hits: 0,
+                lease: None,
+                hit_positions: Vec::new(),
+            };
+            return Ok((query_id, empty));
         };
-        if full {
-            return Ok(self.ready_objects(instance_id, &plan, Vec::new()));
+        if keys.iter().any(|k| k.namespace != first.namespace) {
+            return Err(EngineError::InvalidArgument(
+                "query keys span more than one namespace".into(),
+            ));
         }
-
-        // What peers and SSD add: each chain past its resident prefix, and
-        // any point key not in memory.
-        let missing: Vec<BlockKey> = point_keys
-            .into_iter()
-            .filter(|k| !held.contains(k))
-            .collect();
-        let rests: Vec<Vec<BlockKey>> = plan
-            .prefixes
-            .iter()
-            .zip(&resident)
-            .map(|(c, &r)| c[r..].to_vec())
-            .collect();
-        let (reach, found) = self.storage.reach(&rests, &missing).await;
-        let chain_reach: Vec<usize> = resident.iter().zip(&reach).map(|(r, n)| r + n).collect();
-        let reachable: HashSet<&BlockKey> = missing
-            .iter()
-            .zip(found)
-            .filter_map(|(k, f)| f.then_some(k))
-            .collect();
-        let target = plan.best(
-            |c| chain_reach[c],
-            |k| held.contains(k) || reachable.contains(k),
-        );
-        if target == in_memory {
-            return Ok(self.ready_objects(instance_id, &plan, Vec::new()));
-        }
-
-        // A point is of no use partly fetched; a plain prefix is.
-        let whole = target.0.is_some();
-        let mut parts: Vec<FetchPart> = plan
-            .prefixes
-            .iter()
-            .zip(&resident)
-            .filter(|(_, r)| **r < target.1)
-            .map(|(c, &r)| FetchPart {
-                keys: c[r..target.1].to_vec(),
-                whole,
-                members: false,
-            })
-            .collect();
-        if let Some(p) = target.0 {
-            let mut seen = HashSet::new();
-            let keys: Vec<BlockKey> = plan.points[p]
-                .1
-                .iter()
-                .filter(|k| !held.contains(*k) && seen.insert(*k))
-                .cloned()
-                .collect();
-            parts.extend(by_namespace(&keys).into_iter().map(|at| FetchPart {
-                keys: at.into_iter().map(|i| keys[i].clone()).collect(),
-                whole: true,
-                members: true,
-            }));
-        }
-        debug!(
-            "query_objects {instance_id}/{req_id}: point {:?} at {} blocks fetches {} keys",
-            target.0,
-            target.1,
-            parts.iter().map(|p| p.keys.len()).sum::<usize>()
-        );
-        if !self.storage.start_fetch(&tag, parts) {
-            return Ok(self.ready_objects(instance_id, &plan, Vec::new()));
-        }
-        Ok(ObjectQueryStatus::Loading)
+        let shape = self.objects.shape(instance_id, &first.namespace)?;
+        let consumers = shape.world_size as usize;
+        let tag = format!("objects:{instance_id}:{query_id}");
+        let block_keys: Vec<BlockKey> = keys.iter().map(ObjectKey::block_key).collect();
+        let status = if prefix_search {
+            self.query_object_prefix(instance_id, &tag, &block_keys, consumers)
+                .await
+        } else {
+            self.query_object_members(instance_id, &tag, &block_keys, consumers)
+                .await
+        };
+        Ok((query_id, status))
     }
 
-    /// Lease the best point, or prefix, of what is resident or in `fetched`.
-    fn ready_objects(
+    async fn query_object_prefix(
         &self,
         instance_id: &str,
-        plan: &Plan,
-        fetched: Vec<(BlockKey, Arc<SealedBlock>)>,
+        tag: &str,
+        keys: &[BlockKey],
+        consumers: usize,
     ) -> ObjectQueryStatus {
-        let fetched: HashMap<BlockKey, Arc<SealedBlock>> = fetched.into_iter().collect();
+        let hashes: Vec<Vec<u8>> = keys.iter().map(|k| k.hash.clone()).collect();
+        let status = self
+            .storage
+            .check_prefix_and_prefetch(tag, &keys[0].namespace, &hashes, false)
+            .await;
+        let PrefetchStatus::Ready { blocks, missing } = status else {
+            return ObjectQueryStatus::Loading;
+        };
+        let metrics = core_metrics();
+        metrics.cache_block_hits.add(blocks.len() as u64, &[]);
+        metrics.cache_block_misses.add(missing as u64, &[]);
+        let hits = blocks.len();
+        let held: HashMap<BlockKey, Arc<SealedBlock>> = keys.iter().cloned().zip(blocks).collect();
+        ObjectQueryStatus::Ready {
+            hits,
+            lease: (!held.is_empty()).then(|| {
+                self.query_leases
+                    .create_objects(instance_id, held, consumers)
+            }),
+            hit_positions: Vec::new(),
+        }
+    }
+
+    async fn query_object_members(
+        &self,
+        instance_id: &str,
+        tag: &str,
+        keys: &[BlockKey],
+        consumers: usize,
+    ) -> ObjectQueryStatus {
+        let fetched: HashMap<BlockKey, Arc<SealedBlock>> =
+            match self.storage.poll_members(tag).await {
+                MembersPoll::Loading => return ObjectQueryStatus::Loading,
+                MembersPoll::Done(fetched) => fetched.into_iter().collect(),
+                MembersPoll::Idle => HashMap::new(),
+            };
+        let polled = !fetched.is_empty();
         // Touch what is resident; fetched blocks evicted since are still held here.
-        let lookup = |keys: &[BlockKey]| -> Vec<Option<Arc<SealedBlock>>> {
-            self.storage
-                .get_blocks_aligned(keys)
-                .into_iter()
-                .zip(keys)
-                .map(|(b, k)| b.or_else(|| fetched.get(k).cloned()))
-                .collect()
-        };
-        let chains: Vec<Vec<Option<Arc<SealedBlock>>>> =
-            plan.prefixes.iter().map(|c| lookup(c)).collect();
-        let point_keys: Vec<BlockKey> = plan
-            .points
-            .iter()
-            .flat_map(|(_, keys)| keys.iter().cloned())
+        let found: Vec<Option<Arc<SealedBlock>>> = self
+            .storage
+            .get_blocks_aligned(keys)
+            .into_iter()
+            .zip(keys)
+            .map(|(b, k)| b.or_else(|| fetched.get(k).cloned()))
             .collect();
-        let points: HashMap<BlockKey, Arc<SealedBlock>> = point_keys
-            .iter()
-            .cloned()
-            .zip(lookup(&point_keys))
-            .filter_map(|(k, b)| Some((k, b?)))
-            .collect();
-        let (point, blocks) = plan.best(
-            |c| chains[c].iter().take_while(|b| b.is_some()).count(),
-            |k| points.contains_key(k),
-        );
-        let mut objects: HashMap<BlockKey, Arc<SealedBlock>> = HashMap::new();
-        let mut slots = Vec::new();
-        let mut metas = Vec::new();
-        let mut lease = |k: &BlockKey, b: &Arc<SealedBlock>| {
-            slots.push(b.slots().len() as u32);
-            metas.push(b.meta());
-            objects.insert(k.clone(), Arc::clone(b));
-        };
-        for (keys, held) in plan.prefixes.iter().zip(&chains) {
-            for (k, b) in keys[..blocks].iter().zip(held) {
-                lease(k, b.as_ref().expect("leading blocks held"));
+        if !polled {
+            let mut seen = HashSet::new();
+            let missing: Vec<BlockKey> = keys
+                .iter()
+                .zip(&found)
+                .filter(|(k, b)| b.is_none() && seen.insert(*k))
+                .map(|(k, _)| k.clone())
+                .collect();
+            if self.storage.start_members(tag, missing) {
+                return ObjectQueryStatus::Loading;
             }
         }
-        if let Some(p) = point {
-            for k in &plan.points[p].1 {
-                lease(k, &points[k]);
+        let mut held = HashMap::new();
+        let mut hit_positions = Vec::new();
+        for (i, (k, b)) in keys.iter().zip(found).enumerate() {
+            if let Some(b) = b {
+                hit_positions.push(i as u32);
+                held.insert(k.clone(), b);
             }
         }
         let metrics = core_metrics();
-        let asked = plan.prefixes.iter().map(Vec::len).sum::<usize>();
-        let hit = blocks * plan.prefixes.len();
-        metrics.cache_block_hits.add(hit as u64, &[]);
-        metrics.cache_block_misses.add((asked - hit) as u64, &[]);
+        metrics
+            .cache_block_hits
+            .add(hit_positions.len() as u64, &[]);
+        metrics
+            .cache_block_misses
+            .add((keys.len() - hit_positions.len()) as u64, &[]);
         ObjectQueryStatus::Ready {
-            point,
-            blocks: blocks as u32,
-            lease: (!objects.is_empty())
-                .then(|| self.query_leases.create_objects(instance_id, objects)),
-            slots,
-            metas,
+            hits: hit_positions.len(),
+            lease: (!held.is_empty()).then(|| {
+                self.query_leases
+                    .create_objects(instance_id, held, consumers)
+            }),
+            hit_positions,
         }
     }
 
-    /// Copy `writes` from object device `rank` of `instance_id` into pinned
-    /// memory on the device's NUMA node and queue them for the insert worker,
-    /// as a KV save does; returns once the copies finish. Writes to objects
-    /// already cached copy nothing. An object seals once all of its slots
-    /// arrived; a write naming another slot count or meta than its first
-    /// writer is dropped, and unsealed objects expire with KV inflight blocks.
+    /// Copy `writes` from rank `rank` of `instance_id` into pinned memory on
+    /// the device's NUMA node and queue them for the insert worker, as a KV
+    /// save does; returns once the copies finish. Writes to objects already
+    /// cached copy nothing. An object seals once every saver wrote every
+    /// layer; unsealed objects expire with KV inflight blocks.
     pub async fn save_objects(
         &self,
         instance_id: &str,
         rank: u32,
-        writes: &[ObjectWrite],
+        writes: &[ObjectSpans],
     ) -> Result<(), EngineError> {
-        self.query_leases.sweep_expired();
         let start = Instant::now();
-        let device = self.objects.device(instance_id, rank)?;
-        for w in writes {
-            check_write(&device, w)?;
+        let (device, shapes) =
+            self.objects
+                .resolve(instance_id, rank, writes.iter().map(|w| &w.key))?;
+        let mut savers = Vec::with_capacity(writes.len());
+        for (w, shape) in writes.iter().zip(&shapes) {
+            let saver = shape
+                .savers
+                .iter()
+                .position(|&r| r == rank)
+                .ok_or_else(|| {
+                    EngineError::InvalidArgument(format!(
+                        "rank {rank} is not a saver of namespace {}",
+                        hex(&w.key.namespace[..8])
+                    ))
+                })?;
+            check_spans(w, device.region_size(w.region), shape)?;
+            savers.push(saver);
         }
         let keys: Vec<BlockKey> = writes.iter().map(|w| w.key.block_key()).collect();
-        // Writes to resident objects copy nothing; one naming another slot
-        // count or meta than the object's is dropped, as at seal.
-        let mut todo = Vec::new();
-        let mut dropped = 0;
-        for (i, held) in self.storage.peek_blocks(&keys).into_iter().enumerate() {
-            match held {
-                None => todo.push(i),
-                Some(b)
-                    if b.slots().len() != writes[i].slots as usize
-                        || b.meta() != writes[i].meta =>
-                {
-                    dropped += writes[i].writes.len();
-                }
-                Some(_) => {}
-            }
-        }
-        if dropped > 0 {
-            core_metrics().slot_writes_dropped.add(dropped as u64, &[]);
-            warn!(
-                "save_objects: {dropped} slot writes of instance_id={instance_id} rank={rank} \
-                 dropped: slot count or meta differs from the resident object"
-            );
-        }
+        let todo: Vec<usize> = self
+            .storage
+            .peek_blocks(&keys)
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| b.is_none().then_some(i))
+            .collect();
         if todo.is_empty() {
             return Ok(());
         }
 
-        // Like KV saves: SSD-aligned strides when SSD is on, and one
-        // allocation per (namespace, slot) across this save's objects unless
-        // blockwise, as a KV save allocates once per layer.
+        // Like KV saves: SSD-aligned slots when SSD is on, and one allocation
+        // per (namespace, layer) across this save's objects unless blockwise.
         let pad = self.storage.is_ssd_enabled();
-        let stride = |size: u64| {
+        let stride = |n: u64| {
             if pad {
-                size.next_multiple_of(SSD_ALIGNMENT as u64)
+                n.next_multiple_of(SSD_ALIGNMENT as u64)
             } else {
-                size
+                n
             }
         };
-        let mut by_slot: BTreeMap<(&str, u32), Vec<(usize, &SlotWrite)>> = BTreeMap::new();
+        let mut by_layer: BTreeMap<([u8; 32], usize), Vec<usize>> = BTreeMap::new();
         for &i in &todo {
-            for s in &writes[i].writes {
-                by_slot
-                    .entry((keys[i].namespace.as_str(), s.slot))
+            for l in 0..shapes[i].layers {
+                by_layer
+                    .entry((writes[i].key.namespace, l))
                     .or_default()
-                    .push((i, s));
+                    .push(i);
             }
         }
         let numa = Some(device.numa);
         let blockwise = self.storage.blockwise_alloc();
-        let mut copies = Vec::new();
         let mut keep: Vec<Arc<PinnedAllocation>> = Vec::new();
-        // (write, slot, block, stride) of every slot copied.
-        let mut saved: Vec<(usize, u32, RawBlock, u64)> = Vec::new();
-        let (mut bytes, mut padded) = (0u64, 0u64);
-        for (&(_, slot), list) in &by_slot {
-            let groups: Vec<&[(usize, &SlotWrite)]> = if blockwise {
+        // Pinned base and allocation of each (write, layer) slot.
+        let mut slots: HashMap<(usize, usize), (MappedPinnedPtr, usize)> = HashMap::new();
+        type Layers = BTreeMap<usize, RawSaveLayer>;
+        let mut batches: BTreeMap<[u8; 32], (usize, Layers)> = BTreeMap::new();
+        let mut padded = 0u64;
+        for ((ns, layer), list) in &by_layer {
+            let len = shapes[list[0]].slice_bytes;
+            let slot_len = stride(len);
+            let groups: Vec<&[usize]> = if blockwise {
                 list.chunks(1).collect()
             } else {
                 vec![&list[..]]
             };
             for group in groups {
-                let total: u64 = group.iter().map(|(_, s)| stride(s.size)).sum();
+                let total = slot_len * group.len() as u64;
                 let alloc = NonZeroU64::new(total)
                     .and_then(|n| self.storage.allocate(n, numa))
                     .ok_or_else(|| {
                         EngineError::Storage(format!(
-                            "pinned pool exhausted while allocating {total} bytes of object slot {slot}"
+                            "pinned pool exhausted while allocating {total} bytes of object layer {layer}"
                         ))
                     })?;
-                let mut at = 0usize;
-                for &(i, s) in group {
-                    let base = alloc.mapped_ptr().add(at);
-                    copies.extend(
-                        s.runs
-                            .iter()
-                            .map(|r| device.copy_of(base.add(r.slot_offset as usize), r)),
-                    );
-                    let len = stride(s.size);
-                    if len > s.size {
-                        // SAFETY: the allocation holds `len` bytes at `base`,
-                        // and nothing else uses them yet. Zero the SSD padding
-                        // so loads and SSD writes never see a previous user's
-                        // bytes.
+                for (j, &i) in group.iter().enumerate() {
+                    let base = alloc.mapped_ptr().add(j * slot_len as usize);
+                    if slot_len > len {
+                        // SAFETY: the allocation holds `slot_len` bytes at
+                        // `base`, and nothing else uses them yet. Zero the SSD
+                        // padding so loads and SSD writes never see a previous
+                        // user's bytes.
                         unsafe {
                             std::ptr::write_bytes(
-                                base.host().as_ptr().add(s.size as usize),
+                                base.host().as_ptr().add(len as usize),
                                 0,
-                                (len - s.size) as usize,
+                                (slot_len - len) as usize,
                             );
                         }
                     }
-                    let segment = Segment::new(base.host(), len as usize, Arc::clone(&alloc));
-                    saved.push((i, slot, RawBlock::single_segment(segment), len));
-                    bytes += s.size;
-                    padded += len;
-                    at += len as usize;
+                    slots.insert((i, *layer), (base, Arc::as_ptr(&alloc) as usize));
+                    let shape = &shapes[i];
+                    let saved = batches
+                        .entry(*ns)
+                        .or_insert_with(|| (shape.total_slots(), Layers::new()))
+                        .1
+                        .entry(*layer)
+                        .or_insert_with(|| RawSaveLayer {
+                            slot_id: shape.slot(*layer, savers[i]),
+                            padded_block_size: slot_len as usize,
+                            blocks: Vec::new(),
+                            block_hashes: Vec::new(),
+                        });
+                    saved.blocks.push(RawBlock::single_segment(Segment::new(
+                        base.host(),
+                        slot_len as usize,
+                        Arc::clone(&alloc),
+                    )));
+                    saved.block_hashes.push(keys[i].hash.clone());
+                    padded += slot_len;
                 }
                 keep.push(alloc);
             }
         }
+        let mut copies = Vec::new();
+        let mut bytes = 0u64;
+        for &i in &todo {
+            let w = &writes[i];
+            for p in pieces(&w.spans, shapes[i].slice_bytes) {
+                let (base, alloc) = slots[&(i, p.layer)];
+                copies.push(device.copy(w.region, &p, base, alloc));
+            }
+            bytes += shapes[i].object_bytes();
+        }
         let prep = start.elapsed();
         let (reply, done) = oneshot::channel();
         device.submit(
-            Direction::DeviceToHost,
+            Direction::Save,
             CopyJob {
                 copies,
                 keep: Box::new(keep),
@@ -927,38 +1014,17 @@ impl PegaEngine {
             .save_duration_seconds
             .record(start.elapsed().as_secs_f64(), &[]);
         debug!(
-            "save_objects completed: instance_id={instance_id} rank={rank} objects={} slots={} \
+            "save_objects completed: instance_id={instance_id} rank={rank} objects={} \
              bytes={padded} numa={} prep_ms={:.2} total_ms={:.2}",
             todo.len(),
-            saved.len(),
             device.numa,
             prep.as_secs_f64() * 1000.0,
             start.elapsed().as_secs_f64() * 1000.0,
         );
-
-        // One batch per (namespace, slot count, meta), one layer per slot, as
-        // KV saves send one batch per group.
-        type Layers = BTreeMap<u32, RawSaveLayer>;
-        let mut batches: BTreeMap<(&str, u32, u64), Layers> = BTreeMap::new();
-        for (i, slot, block, len) in saved {
-            let layer = batches
-                .entry((keys[i].namespace.as_str(), writes[i].slots, writes[i].meta))
-                .or_default()
-                .entry(slot)
-                .or_insert_with(|| RawSaveLayer {
-                    slot_id: slot as usize,
-                    padded_block_size: len as usize,
-                    blocks: Vec::new(),
-                    block_hashes: Vec::new(),
-                });
-            layer.blocks.push(block);
-            layer.block_hashes.push(keys[i].hash.clone());
-        }
-        for ((namespace, slots, meta), layers) in batches {
+        for (ns, (total_slots, layers)) in batches {
             self.storage.send_raw_insert(RawSaveBatch {
-                namespace: namespace.to_string(),
-                total_slots: slots as usize,
-                meta,
+                namespace: hex(&ns),
+                total_slots,
                 numa_node: device.numa,
                 layers: layers.into_values().collect(),
             });
@@ -966,200 +1032,82 @@ impl PegaEngine {
         Ok(())
     }
 
-    /// Copy objects held by the leases of `loads` into object device `rank`
-    /// of `instance_id`, as a KV load: returns once the request is checked
-    /// and sets the `LoadState` at `load_state_shm` when the copies finish,
-    /// or right away if checking fails. Loads of a device run in order on
-    /// their own stream. Each lease a checked request reads counts one of
-    /// its consumers and the last releases it; a request that fails checking
-    /// releases every lease it names.
+    /// Copy the objects `spans` name, held by `leases`, into rank `rank` of
+    /// `instance_id`, as a KV load: returns once the request is checked and
+    /// sets the `LoadState` at `load_state_shm` when the copies finish, or
+    /// right away if checking fails. A checked request consumes each of its
+    /// leases once; one that fails consumes none.
     pub fn load_objects(
         &self,
         instance_id: &str,
         rank: u32,
-        loads: &[ObjectLoad],
+        device_id: i32,
+        spans: &[ObjectSpans],
+        leases: &[QueryLeaseId],
         load_state_shm: &str,
     ) -> Result<(), EngineError> {
-        let result = crate::submit_with_load_state(load_state_shm, "load_objects", |done| {
-            self.submit_object_loads(instance_id, rank, loads, done)
-        });
-        if result.is_err() {
-            // The restore these leases serve cannot complete, and no later
-            // load may consume them: drop them now, not at expiry.
-            self.release_object_leases(instance_id, loads.iter().map(|l| &l.lease));
-        }
-        result
-    }
-
-    /// Drop `leases` of `instance_id`: the loads they serve cannot happen.
-    pub fn release_object_leases<'a>(
-        &self,
-        instance_id: &str,
-        leases: impl IntoIterator<Item = &'a QueryLeaseId>,
-    ) {
-        for lease in leases {
-            self.query_leases.release_objects(instance_id, lease);
-        }
+        crate::submit_with_load_state(load_state_shm, "load_objects", |done| {
+            self.submit_object_loads(instance_id, rank, device_id, spans, leases, done)
+        })
     }
 
     fn submit_object_loads(
         &self,
         instance_id: &str,
         rank: u32,
-        loads: &[ObjectLoad],
+        device_id: i32,
+        spans: &[ObjectSpans],
+        leases: &[QueryLeaseId],
         done: LoadCompletion,
     ) -> Result<(), EngineError> {
-        let device = self.objects.device(instance_id, rank)?;
-        let job = self.object_load_job(instance_id, &device, loads, done)?;
-        device.submit(Direction::HostToDevice, job)?;
+        let (device, shapes) =
+            self.objects
+                .resolve(instance_id, rank, spans.iter().map(|s| &s.key))?;
+        if device.device_id != device_id {
+            return Err(EngineError::InvalidArgument(format!(
+                "rank {rank} registered device {}, load names {device_id}",
+                device.device_id
+            )));
+        }
+        for (s, shape) in spans.iter().zip(&shapes) {
+            check_spans(s, device.region_size(s.region), shape)?;
+        }
+        let held = self
+            .query_leases
+            .leased_objects(instance_id, leases)
+            .map_err(EngineError::InvalidArgument)?;
+        let mut copies = Vec::new();
+        let mut objects = Vec::with_capacity(spans.len());
+        let mut bytes = 0;
+        for (s, shape) in spans.iter().zip(&shapes) {
+            let block = held.get(&s.key.block_key()).ok_or_else(|| {
+                EngineError::InvalidArgument(format!("no lease of this load holds {:?}", s.key))
+            })?;
+            let slots = shape
+                .read_slots(rank, block, device.numa)
+                .map_err(|e| EngineError::InvalidArgument(format!("object {:?}: {e}", s.key)))?;
+            for p in pieces(&s.spans, shape.slice_bytes) {
+                let (base, alloc) = slots[p.layer];
+                copies.push(device.copy(s.region, &p, base, alloc));
+            }
+            bytes += shape.object_bytes();
+            objects.push(Arc::clone(block));
+        }
+        device.submit(
+            Direction::Load,
+            CopyJob {
+                copies,
+                keep: Box::new(objects),
+                bytes,
+                done,
+            },
+        )?;
         // The copy job holds the objects; the leases may go now.
-        for l in loads {
-            self.query_leases.consume_objects(&l.lease);
+        for lease in leases {
+            self.query_leases.consume_objects(lease);
         }
         Ok(())
     }
-
-    /// The copies of `loads` into `device`, each read checked against its
-    /// lease and slot. A lease is named once per request.
-    fn object_load_job(
-        &self,
-        instance_id: &str,
-        device: &Device,
-        loads: &[ObjectLoad],
-        done: LoadCompletion,
-    ) -> Result<CopyJob, EngineError> {
-        let mut leases = HashSet::new();
-        let mut copies = Vec::new();
-        let mut objects = Vec::new();
-        let mut bytes = 0;
-        for l in loads {
-            if !leases.insert(&l.lease) {
-                return Err(EngineError::InvalidArgument(format!(
-                    "{:?} is named twice in one request",
-                    l.lease
-                )));
-            }
-            let keys: Vec<BlockKey> = l.reads.iter().map(|r| r.key.block_key()).collect();
-            let leased = self
-                .query_leases
-                .leased_objects(instance_id, &l.lease, &keys, l.consumers as usize)
-                .map_err(EngineError::InvalidArgument)?;
-            for ((r, block), key) in l.reads.iter().zip(leased).zip(&keys) {
-                let block = block.ok_or_else(|| {
-                    EngineError::InvalidArgument(format!("{:?} does not hold {key:?}", l.lease))
-                })?;
-                for s in &r.reads {
-                    let slot = block
-                        .slots()
-                        .get(s.slot as usize)
-                        .and_then(|b| Some((b.segment_mapped_ptr(0)?, b.memory_footprint())));
-                    let Some((base, size)) = slot else {
-                        return Err(EngineError::InvalidArgument(format!(
-                            "{key:?} has {} slots, read asks for slot {}",
-                            block.slots().len(),
-                            s.slot
-                        )));
-                    };
-                    for run in &s.runs {
-                        device.check(run, size)?;
-                        copies.push(device.copy_of(base.add(run.slot_offset as usize), run));
-                        bytes += run.bytes();
-                    }
-                }
-                objects.push(block);
-            }
-        }
-        Ok(CopyJob {
-            copies,
-            keep: Box::new(objects),
-            bytes,
-            done,
-        })
-    }
-}
-
-/// `w` names valid slots once each, and every slot's runs lie in the device's
-/// regions and the slot and write each of its bytes exactly once.
-fn check_write(device: &Device, w: &ObjectWrite) -> Result<(), EngineError> {
-    let bad = |why: String| {
-        Err(EngineError::InvalidArgument(format!(
-            "object {:?}: {why}",
-            w.key
-        )))
-    };
-    if w.slots == 0 || w.slots > MAX_SLOTS {
-        return bad(format!("{} slots, expected 1 to {MAX_SLOTS}", w.slots));
-    }
-    let mut seen = vec![false; w.slots as usize];
-    for s in &w.writes {
-        if s.slot >= w.slots || std::mem::replace(&mut seen[s.slot as usize], true) {
-            return bad(format!("slot {} is out of range or written twice", s.slot));
-        }
-        if s.size == 0 || s.size > MAX_SLOT_BYTES {
-            return bad(format!(
-                "slot {} has {} bytes, expected 1 to {MAX_SLOT_BYTES}",
-                s.slot, s.size
-            ));
-        }
-        let mut copied = 0u64;
-        let mut extents = Vec::with_capacity(s.runs.len());
-        for run in &s.runs {
-            extents.push((run.slot_offset, device.check(run, s.size)?));
-            copied = copied.saturating_add(run.bytes());
-        }
-        if copied != s.size {
-            return bad(format!(
-                "slot {} has {} bytes but its runs copy {copied}",
-                s.slot, s.size
-            ));
-        }
-        if !writes_once(s.size, &s.runs, extents) {
-            return bad(format!("runs of slot {} overlap", s.slot));
-        }
-    }
-    Ok(())
-}
-
-/// No two of `runs`, checked runs of a `size` byte slot with slot
-/// `extents`, write the same byte; a run's own rows never overlap. Runs with
-/// disjoint extents pass without looking at rows; otherwise every row marks
-/// a bitmap of the slot, `size / 8` bytes, and more than
-/// [`MAX_CHECKED_ROWS`] rows fail.
-fn writes_once(size: u64, runs: &[ObjectRun], mut extents: Vec<(u64, u64)>) -> bool {
-    extents.sort_unstable();
-    if extents.windows(2).all(|w| w[0].1 <= w[1].0) {
-        return true;
-    }
-    let rows = runs
-        .iter()
-        .map(ObjectRun::rows)
-        .fold(0u64, u64::saturating_add);
-    if rows > MAX_CHECKED_ROWS {
-        return false;
-    }
-    let mut bits = vec![0u64; size.div_ceil(64) as usize];
-    runs.iter()
-        .all(|r| r.slot_rows().all(|at| mark(&mut bits, at, at + r.width)))
-}
-
-/// Set bits `[from, to)` of `bits`; false if one was set already.
-fn mark(bits: &mut [u64], from: u64, to: u64) -> bool {
-    let mut at = from;
-    while at < to {
-        let (word, bit) = ((at / 64) as usize, at % 64);
-        let n = (64 - bit).min(to - at);
-        let mask = if n == 64 {
-            u64::MAX
-        } else {
-            ((1 << n) - 1) << bit
-        };
-        if bits[word] & mask != 0 {
-            return false;
-        }
-        bits[word] |= mask;
-        at += n;
-    }
-    true
 }
 
 fn open_ipc(handle: &[u8]) -> Result<sys::CUdeviceptr, String> {
@@ -1202,128 +1150,128 @@ fn mapped_size(ptr: sys::CUdeviceptr) -> Result<u64, String> {
 mod tests {
     use super::*;
 
-    fn dim(count: u32, region_stride: u64, slot_stride: u64) -> ObjectDim {
-        ObjectDim {
-            count,
-            region_stride,
-            slot_stride,
+    fn meta(
+        world_size: u32,
+        bytes_per_block: u64,
+        local_hidden: u64,
+        savers: &[u32],
+    ) -> NamespaceMeta {
+        NamespaceMeta {
+            namespace: [7; 32],
+            world_size,
+            layer_names: vec!["l0".into(), "l1".into()],
+            bytes_per_block,
+            block_size: 64,
+            local_hidden,
+            interleave_token: 0,
+            saver_rank: savers.to_vec(),
         }
     }
 
     #[test]
-    fn plans_pick_the_last_point_every_chain_holds() {
-        let key = |f: u8, n: u8| ObjectKey {
-            fingerprint: [f; 32],
-            prefix: [n; 32],
-        };
-        let point = |blocks, keys: &[u8]| ObjectPoint {
-            blocks,
-            keys: keys.iter().map(|&n| key(9, n)).collect(),
-        };
-        let q = ObjectQuery {
-            prefixes: vec![(0..8).map(|n| key(0, n)).collect()],
-            points: vec![point(6, &[96]), point(6, &[107]), point(8, &[140])],
-        };
-        let plan = Plan::new(&q).expect("valid");
-        let held = |ns: &'static [u8]| move |k: &BlockKey| ns.iter().any(|&n| k.hash[0] == n);
-        // 140 needs 8 blocks, the chain holds 7: 107 wins over 96.
-        assert_eq!(plan.best(|_| 7, held(&[96, 107, 140])), (Some(1), 6));
-        assert_eq!(plan.best(|_| 8, held(&[96, 140])), (Some(2), 8));
-        assert_eq!(plan.best(|_| 5, held(&[96, 107, 140])), (None, 0));
-        let prefix_only = Plan::new(&ObjectQuery {
-            prefixes: q.prefixes.clone(),
-            points: vec![],
-        })
-        .unwrap();
-        assert_eq!(prefix_only.best(|_| 5, held(&[])), (None, 5));
-        for (case, q) in [
-            (
-                "past the chain",
-                ObjectQuery {
-                    points: vec![point(9, &[])],
-                    ..q.clone()
-                },
-            ),
-            (
-                "mixed fingerprints",
-                ObjectQuery {
-                    prefixes: vec![vec![key(0, 0), key(1, 1)]],
-                    points: vec![],
-                },
-            ),
-        ] {
-            assert!(Plan::new(&q).is_err(), "{case}");
-        }
-    }
-
-    #[test]
-    fn runs_reject_overlap_and_overflow() {
-        let run = |width, dims: &[ObjectDim]| ObjectRun {
-            region: 0,
-            region_offset: 0,
-            slot_offset: 0,
-            width,
-            dims: dims.to_vec(),
-        };
-        assert_eq!(run(8, &[dim(3, 16, 8)]).ends(), Some((40, 24)));
-        assert_eq!(run(8, &[]).ends(), Some((8, 8)));
-        // A single step ignores its strides.
-        let one = run(8, &[dim(1, u64::MAX, u64::MAX), dim(2, 8, 8)]);
-        assert_eq!(one.ends(), Some((16, 16)));
-        // Heads 64 apart in the region, interleaved with rows in the slot.
+    fn shapes_map_ranks_to_slices() {
+        // GQA, 4 heads over TP4: 4 slices, one per rank.
+        let gqa = Shape::new(&meta(4, 65536, 256, &[0, 1, 2, 3]), 2).unwrap();
+        assert_eq!((gqa.slices, gqa.slice_bytes), (4, 16384));
         assert_eq!(
-            run(8, &[dim(4, 8, 16), dim(2, 64, 8)]).ends(),
-            Some((96, 64))
+            (0..4).map(|r| gqa.slice(r)).collect::<Vec<_>>(),
+            [0, 1, 2, 3]
         );
-        for (case, r) in [
-            ("overlapping rows", run(8, &[dim(2, 4, 8)])),
-            ("empty", run(0, &[])),
-            ("zero count", run(8, &[dim(0, 8, 8)])),
-            ("overflow", run(8, &[dim(2, u64::MAX, 8)])),
+        assert_eq!((gqa.total_slots(), gqa.slot(1, 2)), (8, 6));
+        // MLA over TP8: one replicated slice, two savers keep two copies.
+        let mla = Shape::new(&meta(8, 36864, 576, &[0, 4]), 7).unwrap();
+        assert_eq!((mla.slices, mla.slice(7), mla.total_slots()), (1, 0, 4));
+        // GQA, 2 heads over TP4: ranks pair up on a slice.
+        let pairs = Shape::new(&meta(4, 32768, 256, &[0, 2]), 1).unwrap();
+        assert_eq!(
+            (0..4).map(|r| pairs.slice(r)).collect::<Vec<_>>(),
+            [0, 0, 1, 1]
+        );
+
+        for (case, m, rank) in [
+            ("rank past world", meta(4, 65536, 256, &[0, 1, 2, 3]), 4),
+            ("ragged slice", meta(4, 65536 + 1, 256, &[0, 1, 2, 3]), 0),
             (
-                "outer inside inner",
-                run(8, &[dim(4, 8, 8), dim(2, 16, 64)]),
+                "slices do not divide world",
+                meta(4, 3 * 16384, 256, &[0, 1, 2]),
+                0,
             ),
-            ("too many dims", run(8, &[dim(2, 8, 8); MAX_DIMS + 1])),
+            ("uncovered slice", meta(4, 65536, 256, &[0, 1, 2]), 0),
+            ("repeated saver", meta(8, 36864, 576, &[0, 0]), 0),
+            ("saver past world", meta(8, 36864, 576, &[8]), 0),
+            ("zero hidden", meta(8, 36864, 0, &[0]), 0),
         ] {
-            assert!(r.ends().is_none(), "{case}");
+            assert!(Shape::new(&m, rank).is_err(), "{case}");
         }
     }
 
     #[test]
-    fn slot_runs_write_each_byte_once() {
-        let run = |slot_offset, width, dims: &[ObjectDim]| ObjectRun {
-            region: 0,
-            region_offset: 0,
+    fn spans_cut_at_layer_boundaries() {
+        let span = |offset, len| Span { offset, len };
+        let piece = |layer, slot_offset, region_offset, len| Piece {
+            layer,
             slot_offset,
-            width,
-            dims: dims.to_vec(),
+            region_offset,
+            len,
         };
-        for (case, runs, once) in [
-            ("one run", vec![run(0, 64, &[])], true),
-            ("disjoint", vec![run(64, 64, &[]), run(0, 64, &[])], true),
+        // Layer-first K then V: two spans per layer of 8 bytes each.
+        assert_eq!(
+            pieces(&[span(0, 8), span(100, 8), span(16, 8), span(116, 8)], 16),
+            [
+                piece(0, 0, 0, 8),
+                piece(0, 8, 100, 8),
+                piece(1, 0, 16, 8),
+                piece(1, 8, 116, 8)
+            ]
+        );
+        // One span over both layers splits in two.
+        assert_eq!(
+            pieces(&[span(40, 32)], 16),
+            [piece(0, 0, 40, 16), piece(1, 0, 56, 16)]
+        );
+        // A span that crosses a layer mid-way.
+        assert_eq!(
+            pieces(&[span(0, 12), span(50, 20)], 16),
+            [piece(0, 0, 0, 12), piece(0, 12, 50, 4), piece(1, 0, 54, 16)]
+        );
+    }
+
+    #[test]
+    fn spans_are_checked_against_region_and_layers() {
+        let shape = Shape::new(&meta(4, 65536, 256, &[0, 1, 2, 3]), 0).unwrap();
+        let obj = |spans: Vec<Span>| ObjectSpans {
+            key: ObjectKey {
+                namespace: [7; 32],
+                prefix: [1; 32],
+            },
+            region: 0,
+            spans,
+        };
+        let span = |offset, len| Span { offset, len };
+        let whole = 2 * 16384;
+        assert!(check_spans(&obj(vec![span(0, whole)]), Some(whole), &shape).is_ok());
+        for (case, o, size) in [
+            ("unknown region", obj(vec![span(0, whole)]), None),
+            ("past the region", obj(vec![span(1, whole)]), Some(whole)),
             (
-                "interleaved rows",
-                vec![run(0, 8, &[dim(4, 16, 16)]), run(8, 8, &[dim(4, 16, 16)])],
-                true,
+                "overflow",
+                obj(vec![span(u64::MAX, 2), span(0, whole - 2)]),
+                Some(whole),
             ),
-            (
-                "same bytes twice",
-                vec![run(0, 32, &[]), run(0, 32, &[])],
-                false,
-            ),
-            (
-                "rows that collide",
-                vec![run(0, 8, &[dim(4, 16, 16)]), run(16, 8, &[])],
-                false,
-            ),
+            ("short", obj(vec![span(0, whole - 1)]), Some(whole)),
+            ("long", obj(vec![span(0, whole), span(0, 1)]), Some(whole)),
         ] {
-            let extents: Vec<(u64, u64)> = runs
-                .iter()
-                .map(|r| (r.slot_offset, r.ends().expect("well formed").1))
-                .collect();
-            let size = extents.iter().map(|e| e.1).max().unwrap_or(0);
-            assert_eq!(writes_once(size, &runs, extents), once, "{case}");
+            assert!(check_spans(&o, size, &shape).is_err(), "{case}");
         }
+    }
+
+    #[test]
+    fn span_elements_are_16_bytes() {
+        let mut raw = 5u64.to_le_bytes().to_vec();
+        raw.extend(9u64.to_le_bytes());
+        assert_eq!(Span::decode(&raw), Ok(Span { offset: 5, len: 9 }));
+        assert!(Span::decode(&raw[..15]).is_err());
+        raw.push(0);
+        assert!(Span::decode(&raw).is_err());
     }
 }

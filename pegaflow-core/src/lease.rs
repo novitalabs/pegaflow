@@ -45,10 +45,7 @@ struct QueryLease {
     blocks: Vec<Arc<SealedBlock>>,
     /// Object leases hold their hits by key; their loads consume them.
     objects: HashMap<BlockKey, Arc<SealedBlock>>,
-    /// Consumers left; an object lease's first load sets it from `consumers`.
     remaining_consumers: usize,
-    /// Loads an object lease takes in all, once its first load named it.
-    consumers: Option<usize>,
     expires_at: Instant,
 }
 
@@ -102,19 +99,19 @@ impl QueryLeaseManager {
             blocks,
             objects: HashMap::new(),
             remaining_consumers: consumers.max(1),
-            consumers: None,
             expires_at: Instant::now() + DEFAULT_LEASE_TTL,
         };
         self.inner.insert(token, lease);
         token
     }
 
-    /// A lease over object hits; its loads consume it, or Release or expiry
-    /// drops it.
+    /// A lease over object hits, consumed once by each of `consumers` loads,
+    /// or dropped by Release or expiry.
     pub(crate) fn create_objects(
         &self,
         instance_id: &str,
         objects: HashMap<BlockKey, Arc<SealedBlock>>,
+        consumers: usize,
     ) -> QueryLeaseId {
         self.sweep_expired();
         let token = QueryLeaseId::fresh();
@@ -122,55 +119,41 @@ impl QueryLeaseManager {
             instance_id: instance_id.to_string(),
             blocks: Vec::new(),
             objects,
-            remaining_consumers: 0,
-            consumers: None,
+            remaining_consumers: consumers.max(1),
             expires_at: Instant::now() + DEFAULT_LEASE_TTL,
         };
         self.inner.insert(token, lease);
         token
     }
 
-    /// The objects an object lease of `instance_id` holds for `keys`, `None`
-    /// where it holds none, for a load of `consumers` loads in all: the
-    /// lease's first load fixes that count, and a load naming another fails.
+    /// Every object the object leases `tokens` of `instance_id` hold, by key.
     pub(crate) fn leased_objects(
         &self,
         instance_id: &str,
-        token: &QueryLeaseId,
-        keys: &[BlockKey],
-        consumers: usize,
-    ) -> Result<Vec<Option<Arc<SealedBlock>>>, String> {
+        tokens: &[QueryLeaseId],
+    ) -> Result<HashMap<BlockKey, Arc<SealedBlock>>, String> {
         self.sweep_expired();
-        let mut leases = self
+        let leases = self
             .inner
             .leases
             .lock()
             .expect("query leases lock poisoned");
-        let lease = leases
-            .get_mut(token)
-            .ok_or_else(|| "query lease is unknown or expired".to_string())?;
-        if lease.instance_id != instance_id {
-            return Err(format!(
-                "query lease belongs to instance {}, got {}",
-                lease.instance_id, instance_id
-            ));
-        }
-        if consumers == 0 {
-            return Err("a load names 0 consumers".to_string());
-        }
-        match lease.consumers {
-            Some(n) if n != consumers => {
+        let mut held = HashMap::new();
+        for token in tokens {
+            let lease = leases
+                .get(token)
+                .ok_or_else(|| format!("query lease {token:?} is unknown or expired"))?;
+            if lease.instance_id != instance_id {
                 return Err(format!(
-                    "query lease has {n} consumers, this load names {consumers}"
+                    "query lease belongs to instance {}, got {}",
+                    lease.instance_id, instance_id
                 ));
             }
-            Some(_) => {}
-            None => {
-                lease.consumers = Some(consumers);
-                lease.remaining_consumers = consumers;
+            for (k, b) in &lease.objects {
+                held.entry(k.clone()).or_insert_with(|| Arc::clone(b));
             }
         }
-        Ok(keys.iter().map(|k| lease.objects.get(k).cloned()).collect())
+        Ok(held)
     }
 
     /// Count one load of an object lease; the last releases it. A lease
@@ -186,23 +169,6 @@ impl QueryLeaseManager {
             if lease.remaining_consumers == 0 {
                 leases.remove(token);
             }
-        }
-    }
-
-    /// Drop lease `token` of `instance_id`, as a failed object load does:
-    /// the restore it served cannot complete, so no later load consumes it.
-    /// A lease of another instance stays.
-    pub(crate) fn release_objects(&self, instance_id: &str, token: &QueryLeaseId) {
-        let mut leases = self
-            .inner
-            .leases
-            .lock()
-            .expect("query leases lock poisoned");
-        if leases
-            .get(token)
-            .is_some_and(|l| l.instance_id == instance_id)
-        {
-            leases.remove(token);
         }
     }
 
@@ -309,7 +275,6 @@ mod tests {
                     blocks: Vec::new(),
                     objects: HashMap::new(),
                     remaining_consumers: 1,
-                    consumers: None,
                     expires_at: Instant::now() + DEFAULT_LEASE_TTL,
                 },
             );
@@ -328,7 +293,7 @@ mod tests {
     #[test]
     fn consume_allows_configured_number_of_consumers() {
         let manager = QueryLeaseManager::default();
-        let blocks = vec![Arc::new(SealedBlock::from_slots(Vec::new(), 0))];
+        let blocks = vec![Arc::new(SealedBlock::from_slots(Vec::new()))];
         let lease_id = manager.create("inst-a", blocks, 2);
 
         assert_eq!(manager.consume("inst-a", &lease_id).unwrap().len(), 1);
@@ -342,49 +307,27 @@ mod tests {
     }
 
     #[test]
-    fn object_lease_is_consumed_by_its_named_loads() {
+    fn object_lease_is_released_after_its_consumers() {
         let manager = QueryLeaseManager::new(Duration::from_secs(3600));
         let key = BlockKey::new("ns".into(), vec![1]);
-        let objects = HashMap::from([(
-            key.clone(),
-            Arc::new(SealedBlock::from_slots(Vec::new(), 0)),
-        )]);
-        let lease = manager.create_objects("inst-a", objects);
-        let read = |consumers| {
-            manager.leased_objects("inst-a", &lease, std::slice::from_ref(&key), consumers)
-        };
+        let objects = HashMap::from([(key.clone(), Arc::new(SealedBlock::from_slots(Vec::new())))]);
+        let lease = manager.create_objects("inst-a", objects, 2);
 
-        assert!(read(0).is_err(), "0 consumers");
-        assert!(read(2).unwrap()[0].is_some(), "first load fixes 2");
+        let held = manager.leased_objects("inst-a", &[lease]).unwrap();
+        assert!(held.contains_key(&key));
         assert!(
-            read(3).err().expect("rejected").contains("2 consumers"),
-            "another count"
+            manager.leased_objects("inst-b", &[lease]).is_err(),
+            "another instance"
         );
         manager.consume_objects(&lease);
-        assert!(read(2).is_ok(), "one consumer left");
+        assert!(
+            manager.leased_objects("inst-a", &[lease]).is_ok(),
+            "one left"
+        );
         manager.consume_objects(&lease);
         assert!(
-            read(2)
-                .err()
-                .expect("rejected")
-                .contains("unknown or expired"),
-            "released"
+            manager.leased_objects("inst-a", &[lease]).is_err(),
+            "released after world_size loads"
         );
-
-        // A failed load drops the lease, but only for its own instance.
-        let lease = manager.create_objects(
-            "inst-a",
-            HashMap::from([(
-                key.clone(),
-                Arc::new(SealedBlock::from_slots(Vec::new(), 0)),
-            )]),
-        );
-        let read = |consumers| {
-            manager.leased_objects("inst-a", &lease, std::slice::from_ref(&key), consumers)
-        };
-        manager.release_objects("inst-b", &lease);
-        assert!(read(2).is_ok(), "another instance cannot drop it");
-        manager.release_objects("inst-a", &lease);
-        assert!(read(2).is_err(), "dropped by its failed load");
     }
 }

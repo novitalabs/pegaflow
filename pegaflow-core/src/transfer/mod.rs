@@ -17,11 +17,9 @@
 
 mod kernel;
 mod memcpy;
-mod strided;
 
 pub use kernel::KernelBackend;
 pub use memcpy::MemcpyBackend;
-pub(crate) use strided::{Dim, Direction, MAX_DIMS, StridedCopier, StridedCopy};
 
 use std::sync::Arc;
 

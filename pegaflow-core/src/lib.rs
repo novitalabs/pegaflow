@@ -45,10 +45,7 @@ pub use internode::{
 };
 use layout::KVCacheLayout;
 pub use lease::QueryLeaseId;
-pub use objects::{
-    MAX_RUN_DIMS, ObjectDim, ObjectKey, ObjectLoad, ObjectPoint, ObjectQuery, ObjectQueryStatus,
-    ObjectRead, ObjectRun, ObjectWrite, SlotRead, SlotWrite,
-};
+pub use objects::{NamespaceMeta, ObjectKey, ObjectQueryStatus, ObjectSpans, Span};
 pub use pegaflow_common::NumaNode;
 use pegaflow_common::{NumaTopology, group_hash};
 pub use pinned_pool::PinnedAllocation;
@@ -154,7 +151,7 @@ pub struct PegaEngine {
     topology: Arc<NumaTopology>,
     /// Query-ready blocks owned by opaque scheduler leases.
     query_leases: QueryLeaseManager,
-    /// Byte-addressed object devices.
+    /// RPC V2 instances: namespaces and registered ranks.
     objects: objects::ObjectStore,
 }
 
@@ -480,13 +477,13 @@ impl PegaEngine {
             .expect("instances write lock poisoned");
         let removed = instances.remove(instance_id);
         // Dropped on return, outside the lock: that closes idle devices' regions.
-        let devices = self.objects.remove_instance(instance_id);
-        if instances.is_empty() && !self.objects.has_devices() {
+        let objects = self.objects.remove_instance(instance_id);
+        if instances.is_empty() && !self.objects.has_instances() {
             self.storage.set_has_instance(false);
         }
         drop(instances);
 
-        if removed.is_none() && devices.is_empty() {
+        if removed.is_none() && objects.is_none() {
             return Err(EngineError::InstanceMissing(instance_id.to_string()));
         }
         self.query_leases.release_instance(instance_id);
@@ -503,8 +500,8 @@ impl PegaEngine {
         let mut ids: Vec<String> = instances.keys().cloned().collect();
         instances.clear();
         // Dropped on return, outside the lock, as in `unregister_instance`.
-        let devices = self.objects.remove_all();
-        ids.extend(devices.keys().map(|(i, _)| i.clone()));
+        let objects = self.objects.remove_all();
+        ids.extend(objects.keys().cloned());
         ids.sort();
         ids.dedup();
         // Under the lock, so a concurrent registration cannot be overwritten.
