@@ -76,6 +76,7 @@ class _Hit:
     present: list[frozenset[int]]  # per namespace, local blocks included
     keys: list[list[bytes]]  # per namespace
     leases: dict[int, bytes]  # namespace index -> lease
+    n_tokens: int
 
 
 @dataclass
@@ -123,6 +124,11 @@ class Scheduler:
 
     def get_num_new_matched_tokens(self, request: Any, local: int) -> tuple[int | None, bool]:
         rec = self._rec(request)
+        hit = rec.hit
+        # vLLM asks again while the request waits for blocks: reuse the leased
+        # hit as long as the request has not moved, instead of querying again.
+        if hit is not None and hit.local == local and hit.n_tokens == request.num_tokens:
+            return hit.p - local, True
         self._drop_hit(rec)
         if rec.no_load or getattr(request, "skip_reading_prefix_cache", False):
             return 0, False
@@ -218,7 +224,7 @@ class Scheduler:
 
         p = sem.resolve(groups, present, n_tokens)
         p = max(0, min(int(self._policy.accept(p)), p))
-        hit = _Hit(p, local, present, keys, leases)
+        hit = _Hit(p, local, present, keys, leases, n_tokens)
         if p <= local or p % layout.step or not self._wanted(hit, p):
             self._release(leases.values())
             return None

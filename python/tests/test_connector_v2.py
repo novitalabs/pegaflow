@@ -169,6 +169,10 @@ def test_hit_loads_only_past_local_and_releases_unused_leases():
     req = Req("r", 25, hashes)
     # Local hit 8 tokens; store backs blocks up to 5 -> p = 20.
     assert s.get_num_new_matched_tokens(req, 8) == (12, True)
+    # vLLM asks again while the request waits for blocks: same hit, no new query.
+    n = len(rpc.queries)
+    assert s.get_num_new_matched_tokens(req, 8) == (12, True)
+    assert len(rpc.queries) == n and len(rpc.leases) == 2
     assert s.get_loaded_group_ids("r") == (0, 1)
     block_ids = ([10, 11, 12, 13, 14, 15], [0, 0, 22, 23, 24, 25])
     s.update_state_after_alloc(req, block_ids, 12)
