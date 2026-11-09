@@ -12,7 +12,7 @@ import pytest
 
 from pegaflow.connector_v2 import semantics as sem
 from pegaflow.connector_v2.layout import Layout, NsSpec, Parallel, Unsupported, build_layout
-from pegaflow.connector_v2.scheduler import Scheduler
+from pegaflow.connector_v2.scheduler import LoadPlan, Scheduler, StepPlan
 from pegaflow.connector_v2.worker import Region, Worker
 
 FULL4 = sem.Group(sem.FULL, 4)
@@ -144,6 +144,7 @@ class Req:
     request_id: str
     num_tokens: int
     block_hashes: list[bytes]
+    shared_prefix_boundary: int = 0
 
 
 def _ns(gid: int, group: sem.Group, tag: bytes) -> NsSpec:
@@ -181,6 +182,19 @@ def test_hit_loads_only_past_local_and_releases_unused_leases():
     # Full loads blocks 2..4; the window needs [(20-7)//4, 5) = [3, 5).
     loaded = sorted((i, gpu) for i, _, gpu in lp.blocks)
     assert loaded == [(0, 12), (0, 13), (0, 14), (1, 23), (1, 24)]
+
+
+def test_hybrid_hit_asks_vllm_to_checkpoint_where_the_full_prefix_ends():
+    layout = _layout(FULL4, CKPT4)
+    full, ckpt = layout.namespaces
+    hashes = _hashes(6)
+    stored = {(full.namespace, h) for h in hashes[:5]} | {(ckpt.namespace, hashes[3])}
+    s = Scheduler(layout, FakeRpc(stored), "inst")
+    req = Req("r", 25, hashes)
+    # Full blocks back 20 tokens, the only checkpoint is at 16: resume at 16,
+    # and have vLLM commit a checkpoint at 20 for the next request.
+    assert s.get_num_new_matched_tokens(req, 0) == (16, True)
+    assert req.shared_prefix_boundary == 20
 
 
 def test_loading_waits_then_gives_up():
@@ -230,12 +244,16 @@ class _Rpc:
     def __init__(self):
         self.registered = None
         self.saved = []
+        self.loaded = []
 
     def register_context_v2(self, instance_id, metas, regions, backend):
         self.registered = (metas, regions, backend)
 
     def save_objects(self, instance_id, rank, writes):
         self.saved.append(writes)
+
+    def load_objects(self, instance_id, rank, device_id, shm, objects, leases):
+        self.loaded.append((len(objects), sorted(leases)))
 
 
 class _Ready:
@@ -251,9 +269,45 @@ def test_worker_registers_one_region_and_packs_spans():
     w.register({"a": "A", "b": "B"}, {"a": 64, "b": 128}, lambda t: regions[t.lower()])
     metas, regs, backend = rpc.registered
     assert len(regs) == 1 and backend == "kernel" and metas[0]["rank"] == 0
-    w.save(type("P", (), {"saves": [(0, b"k" * 32, 2)], "step": 0})())
+    # Two requests of one step computed the same block: one write.
+    w.save(type("P", (), {"saves": [(0, b"k" * 32, 2), (0, b"k" * 32, 2)], "step": 0})())
     w.shutdown()
     ((key, region, spans),) = rpc.saved[0]
     assert key == (b"N" * 32, b"k" * 32) and region == 0
     assert struct.unpack("<4Q", spans) == (100 + 2 * 64, 64, 5_000 + 2 * 128, 64)
     assert w.saved_through() == 0
+
+
+class _State:
+    def __init__(self, state: int):
+        self.state = state
+
+    def shm_name(self):
+        return "shm"
+
+    def is_ready(self):
+        return True
+
+    def get_state(self):
+        return self.state
+
+
+def test_worker_loads_a_step_in_one_rpc_and_fails_it_as_a_whole():
+    layout = Layout((NsSpec(0, FULL4, 1, ("a",), b"N" * 32, 64, 1, (0,)),), 4)
+    rpc = _Rpc()
+    states = [_State(1), _State(-1)]
+    w = Worker(layout, rpc, "inst", 0, 1, 0, lambda: states.pop(0), _Ready)
+    w.register({"a": "A"}, {"a": 64}, lambda t: Region(b"h" * 64, 10_000, 0))
+    step = StepPlan(
+        loads=[
+            LoadPlan("r1", [b"l1"], [(0, b"x" * 32, 1)]),
+            LoadPlan("r2", [b"l2"], [(0, b"y" * 32, 2), (0, b"z" * 32, 3)]),
+            LoadPlan("r3", fail=True),
+        ]
+    )
+    w.start(step)
+    assert rpc.loaded == [(3, [b"l1", b"l2"])]
+    assert w.poll() == ({"r1", "r2", "r3"}, {"r3"})
+    w.start(StepPlan(loads=[LoadPlan("r4", [b"l4"], [(0, b"w" * 32, 4)])]))
+    assert w.poll() == ({"r4"}, {"r4"})
+    w.shutdown()

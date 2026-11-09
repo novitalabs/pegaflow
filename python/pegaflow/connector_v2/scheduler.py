@@ -86,6 +86,7 @@ class _Req:
     loading_since: float | None = None
     hit: _Hit | None = None
     saved_upto: int | None = None
+    junction: int = 0  # where the stored full-attention prefix ends
     no_load: bool = False  # a load failed: let vLLM recompute, never load again
 
 
@@ -113,6 +114,7 @@ class Scheduler:
         self._pin: Callable[[list[int]], Any] | None = None
         self._unpin: Callable[[Any], None] | None = None
         self._pins: dict[int, Any] = {}  # plan step -> pin token
+        self._has_checkpoint = any(ns.group.kind == sem.CHECKPOINT for ns in layout.namespaces)
         self.stats: dict[str, int] = {}
 
     # ------------------------------------------------------------------ hits
@@ -149,6 +151,7 @@ class Scheduler:
             hit = None
         rec.loading_since = None
         rec.query_ids.clear()
+        self._hint_junction(request, hit.p if hit is not None else local, rec.junction)
         if hit is None:
             return 0, False
         rec.hit = hit
@@ -178,6 +181,7 @@ class Scheduler:
         nss = layout.namespaces
         groups = layout.groups
         n_tokens = request.num_tokens
+        rec.junction = 0
         # vLLM computes at least the last prompt token: blocks past it are never needed.
         cap = max(n_tokens - 1, 0)
         keys = [ns.keys(request.block_hashes)[: cap // ns.group.block_tokens] for ns in nss]
@@ -199,6 +203,8 @@ class Scheduler:
                     leases[i] = lease
                 present[i] = frozenset(range(start + len(hits)))
                 top = min(top, (start + len(hits)) * ns.group.block_tokens)
+            if self._has_checkpoint:
+                rec.junction = top
             points = [p for p in sem.candidates(groups, top, n_tokens) if p > local]
             points = points[: max(self._policy.probe_points, 1)]
             if not points:
@@ -229,6 +235,17 @@ class Scheduler:
             self._release(leases.values())
             return None
         return hit
+
+    def _hint_junction(self, request: Any, resumable: int, junction: int) -> None:
+        """As v1: when the stored full-attention prefix runs past the resume
+        point, ask vLLM to end a prefill chunk at its end
+        (``Request.shared_prefix_boundary``). vLLM then commits the checkpoint
+        state there and offers it for saving, so the next request sharing the
+        prefix resumes from its end instead of an earlier checkpoint."""
+        if not hasattr(request, "shared_prefix_boundary"):
+            return
+        if resumable < junction < request.num_tokens and junction > request.shared_prefix_boundary:
+            request.shared_prefix_boundary = junction
 
     def _wanted(self, hit: _Hit, p: int) -> dict[int, list[int]] | None:
         """Blocks to load per namespace for a hit at ``p``; None if not backed."""
