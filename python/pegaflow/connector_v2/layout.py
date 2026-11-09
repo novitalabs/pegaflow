@@ -38,14 +38,25 @@ class NsSpec:
     namespace: bytes  # 32-byte digest
     page_bytes: int  # one rank's bytes of one layer of one block
     slices: int  # slices one layer is split into across TP
-    savers: tuple[int, ...]  # ranks that save this namespace
 
     def keys(self, block_hashes: Sequence[bytes]) -> list[bytes]:
         """32-byte object prefixes of this group's blocks."""
         k = self.hash_scale
         return [_digest(h) for h in block_hashes[k - 1 :: k]]
 
-    def meta(self, world_size: int, rank: int, device_id: int) -> dict[str, Any]:
+    def savers(self, sockets: Sequence[int]) -> list[int]:
+        """Ranks that save this namespace, given each rank's CPU socket: per
+        slice, the first rank holding it on each socket, so a load reads a
+        copy on its own socket. ``sockets`` is the same on every rank."""
+        replicas = len(sockets) // self.slices  # rank r holds slice r // replicas
+        out: dict[tuple[int, int], int] = {}
+        for r, socket in enumerate(sockets):
+            out.setdefault((r // replicas, socket), r)
+        return sorted(out.values())
+
+    def meta(
+        self, world_size: int, rank: int, device_id: int, savers: Sequence[int]
+    ) -> dict[str, Any]:
         """``NamespaceMeta`` for ``register_context_v2``."""
         bt = self.group.block_tokens
         # The server only uses local_hidden x block_size (one rank's slice);
@@ -60,7 +71,7 @@ class NsSpec:
             "bytes_per_block": self.page_bytes * self.slices,
             "block_size": block_size,
             "local_hidden": self.page_bytes // block_size,
-            "saver_rank": list(self.savers),
+            "saver_rank": list(savers),
         }
 
 
@@ -143,7 +154,6 @@ def build_layout(kv_cache_config: Any, par: Parallel, identity: dict[str, Any]) 
         hbs = hash_bs or bt
         if bt % hbs:
             raise Unsupported(f"group {gid}: block_size {bt} is not a multiple of hash {hbs}")
-        replicas = par.tp_size // n_slices
         doc = {
             **identity,
             "gid": gid,
@@ -162,8 +172,6 @@ def build_layout(kv_cache_config: Any, par: Parallel, identity: dict[str, Any]) 
                 namespace=hashlib.sha256(blob).digest(),
                 page_bytes=page,
                 slices=n_slices,
-                # Rank r holds slice r // replicas; the first rank of each slice saves it.
-                savers=tuple(s * replicas for s in range(n_slices)),
             )
         )
     out.sort(key=lambda ns: ns.group.kind != sem.FULL)

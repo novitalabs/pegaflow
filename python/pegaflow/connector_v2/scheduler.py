@@ -22,17 +22,25 @@ answer is kept until the lookup ends, so a poll only re-asks what is still
 loading, under the same query id and keys. There is no wait budget: as in v1
 the request waits until the server answers.
 
-Loads are always asynchronous: a failed one is reported as a failed receive
-and vLLM recomputes the request (``kv_load_failure_policy=recompute``).
+Loads are always asynchronous. A plan that cannot load (vLLM trimmed the hit
+off a resume point or handed a null block) is a failed receive like a failed
+transfer; vLLM applies its ``kv_load_failure_policy``. The request never loads
+again if it is recomputed.
 
 Saves: every block a step completes is pinned in vLLM's block pool from the
 step that plans it until every worker reports that step saved
-(``on_saved_through``), so vLLM never reuses a block a save still reads.
+(``on_saved_through``), so vLLM never reuses a block a save still reads. That
+also covers preemption, where v1 waits for the request's saves in
+``handle_preemptions``.
+
+Stats: a lookup that waited on Loading is one prefetch, as in v1
+(``take_stats``).
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable, Container, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -105,7 +113,7 @@ class _Req:
     hit: _Hit | None = None
     saved_upto: int | None = None
     junction: int = 0  # where the stored full-attention prefix ends
-    no_load: bool = False  # a load failed: let vLLM recompute, never load again
+    no_load: bool = False  # a load failed: if vLLM recomputes, never load again
 
 
 class _Loading(Exception):
@@ -131,7 +139,8 @@ class Scheduler:
         self._unpin: Callable[[Any], None] | None = None
         self._pins: dict[int, Any] = {}  # plan step -> pin token
         self._has_checkpoint = any(ns.group.kind == sem.CHECKPOINT for ns in layout.namespaces)
-        self.stats: dict[str, int] = {}
+        self._prefetching: dict[str, float] = {}  # req id -> first Loading answer
+        self._stats: dict[str, Any] = {}
 
     # ------------------------------------------------------------------ hits
     def _rec(self, request: Any) -> _Req:
@@ -153,6 +162,7 @@ class Scheduler:
         try:
             hit = self._lookup(rec, local)
         except _Loading:
+            self._prefetching.setdefault(request.request_id, time.perf_counter())
             return None, False
         except Exception:
             logger.warning(
@@ -163,10 +173,16 @@ class Scheduler:
         kept = set(hit.leases.values()) if hit is not None else set()
         self._drop_asks(rec, kept)
         self._hint_junction(request, hit.p if hit is not None else local, rec.junction)
+        since = self._prefetching.pop(request.request_id, None)
+        if since is not None:
+            blocks = sum(map(len, (self._wanted(hit, hit.p) or {}).values())) if hit else 0
+            self._stats.setdefault("prefetch_duration", []).append(
+                (time.perf_counter() - since) * 1000
+            )
+            self._stats.setdefault("prefetch_blocks", []).append(blocks)
         if hit is None:
             return 0, False
         rec.hit = hit
-        self._count("hits")
         return hit.p - local, True
 
     def _query(
@@ -352,12 +368,11 @@ class Scheduler:
         self._plan.loads.append(plan)
 
     def on_loads_failed(self, req_ids: Iterable[str]) -> None:
-        """vLLM recomputes these requests from scratch; never load them again."""
+        """If vLLM recomputes these requests, they never load again."""
         for req_id in req_ids:
             rec = self._reqs.get(req_id)
             if rec is not None:
                 rec.no_load = True
-                self._count("load_failed")
 
     # ----------------------------------------------------------------- saves
     def bind_pins(self, pin: Callable[[list[int]], Any], unpin: Callable[[Any], None]) -> None:
@@ -442,11 +457,17 @@ class Scheduler:
     # ------------------------------------------------------------- lifecycle
     def request_finished(self, req_id: str) -> None:
         rec = self._reqs.pop(req_id, None)
+        self._prefetching.pop(req_id, None)
         if rec is not None:
             self._drop_hit(rec)
             self._drop_asks(rec)
-        if not self._reqs and self.stats:
-            logger.info("[PegaKVConnectorV2] stats %s", dict(sorted(self.stats.items())))
+
+    def take_stats(self) -> dict[str, Any]:
+        """Stats since the last call, as ``PegaKVConnectorStats`` data."""
+        stats, self._stats = self._stats, {}
+        if self._prefetching:
+            stats["pending_prefetches"] = len(self._prefetching)
+        return stats
 
     def shutdown(self) -> None:
         for rec in self._reqs.values():
@@ -454,9 +475,6 @@ class Scheduler:
             self._drop_asks(rec)
         self._release(lease for lp in self._plan.loads for lease in lp.leases)
         self._plan.loads.clear()
-
-    def _count(self, key: str) -> None:
-        self.stats[key] = self.stats.get(key, 0) + 1
 
     def _drop_hit(self, rec: _Req) -> None:
         if rec.hit is not None:

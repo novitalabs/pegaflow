@@ -2,8 +2,8 @@
 
 Thin translation between vLLM's connector API and ``scheduler`` / ``worker``.
 Supported: Full, MLA, sliding-window and Mamba (``align``) cache groups, TP
-only. Load failures always recompute; run vLLM with
-``kv_load_failure_policy=recompute``.
+only. Failed loads follow vLLM's ``kv_load_failure_policy``. Stats and
+Prometheus metrics are v1's.
 """
 
 from __future__ import annotations
@@ -24,6 +24,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     SupportsHMA,
 )
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
+
+from pegaflow.connector.connector_metrics import PegaKVConnectorStats, PegaPromMetrics
 
 from .layout import Parallel, Unsupported, build_layout
 from .scheduler import Scheduler, StepPlan
@@ -114,7 +116,7 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
             role.name,
             self._instance_id,
             self._rpc.endpoint(),
-            [(ns.gid, ns.group, ns.slices, ns.savers) for ns in self._layout.namespaces],
+            [(ns.gid, ns.group, ns.slices) for ns in self._layout.namespaces],
         )
 
         self._scheduler: Scheduler | None = None
@@ -220,7 +222,7 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
             for t in self._kv_cache_config.kv_cache_tensors
             for name in t.layers
         }
-        self._worker.register(kv_caches, strides, _share)
+        self._worker.register(kv_caches, strides, _share, _tp_sockets())
 
     def start_load_kv(self, forward_context: Any, **kwargs: Any) -> None:
         assert self._worker is not None
@@ -253,6 +255,22 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
         assert self._worker is not None
         # Every step from every worker: aggregation takes the min.
         return PegaWorkerMetadata(self._worker.saved_through())
+
+    # ------------------------------------------------------------------ stats
+    def get_kv_connector_stats(self) -> PegaKVConnectorStats | None:
+        side = self._scheduler or self._worker
+        data = side.take_stats() if side is not None else {}
+        return PegaKVConnectorStats(data=data) if data else None
+
+    @classmethod
+    def build_kv_connector_stats(cls, data: dict | None = None) -> PegaKVConnectorStats | None:
+        return None if data is None else PegaKVConnectorStats(data=data)
+
+    @classmethod
+    def build_prom_metrics(
+        cls, vllm_config, metric_types, labelnames, per_engine_labelvalues
+    ) -> PegaPromMetrics:
+        return PegaPromMetrics(vllm_config, metric_types, labelnames, per_engine_labelvalues)
 
     def shutdown(self) -> None:
         if self._scheduler is not None:
@@ -307,6 +325,35 @@ def _server_device_id() -> int:
     if local >= len(entries) or not entries[local].isdigit():
         raise RuntimeError(f"cannot map CUDA device {local} through {visible!r}")
     return int(entries[local])
+
+
+def _tp_sockets() -> list[int]:
+    """Every TP rank's CPU socket, gathered over the TP group."""
+    import torch.distributed as dist
+    from vllm.distributed.parallel_state import get_tp_group
+
+    group = get_tp_group()
+    out: list[Any] = [None] * group.world_size
+    dist.all_gather_object(out, _gpu_socket(), group=group.cpu_group)
+    return [int(s) for s in out]
+
+
+def _gpu_socket() -> int:
+    """CPU socket (``physical_package_id``) next to this worker's GPU; 0 when
+    sysfs does not say, which makes every rank one socket."""
+    p = torch.cuda.get_device_properties(torch.cuda.current_device())
+    pci = f"{p.pci_domain_id:04x}:{p.pci_bus_id:02x}:{p.pci_device_id:02x}.0"
+    try:
+        with open(f"/sys/bus/pci/devices/{pci}/numa_node") as f:
+            node = int(f.read())
+        if node < 0:
+            return 0
+        with open(f"/sys/devices/system/node/node{node}/cpulist") as f:
+            cpu = f.read().strip().split(",")[0].split("-")[0]
+        with open(f"/sys/devices/system/cpu/cpu{cpu}/topology/physical_package_id") as f:
+            return int(f.read())
+    except (OSError, ValueError):
+        return 0
 
 
 def _mark_compute() -> torch.cuda.Event:

@@ -84,9 +84,13 @@ def test_layout_orders_full_first_and_splits_heads():
     layout = build_layout(cfg, Parallel(tp_size=4), {"model": "m"})
     full, win = layout.namespaces
     assert (full.gid, full.group, win.group) == (1, FULL4, WIN)
-    # Two head shards over TP4: ranks 0,1 hold shard 0; 2,3 shard 1.
-    assert full.savers == (0, 2)
-    meta = full.meta(world_size=4, rank=3, device_id=7)
+    # Two head shards over TP4: ranks 0,1 hold shard 0; 2,3 shard 1. One
+    # saver per shard per socket: a replica on the other socket saves too.
+    assert full.savers([0, 0, 1, 1]) == [0, 2]
+    assert full.savers([0, 1, 0, 1]) == [0, 1, 2, 3]
+    # One replicated slice (MLA): a copy on each socket.
+    assert _ns(0, FULL4, b"M").savers([0, 0, 1, 1]) == [0, 2]
+    meta = full.meta(world_size=4, rank=3, device_id=7, savers=[0, 2])
     assert meta["bytes_per_block"] == 2048 and meta["local_hidden"] * meta["block_size"] == 1024
     assert len(full.namespace) == 32 and full.namespace != win.namespace
     assert layout.step == 4
@@ -155,7 +159,7 @@ class Req:
 
 
 def _ns(gid: int, group: sem.Group, tag: bytes) -> NsSpec:
-    return NsSpec(gid, group, 1, ("l",), tag * 32, 64, 1, (0,))
+    return NsSpec(gid, group, 1, ("l",), tag * 32, 64, 1)
 
 
 def _hashes(n: int) -> list[bytes]:
@@ -234,6 +238,9 @@ def test_loading_polls_only_what_is_still_loading():
     # namespace polls under one query id, so the server's fetch can finish.
     assert [prefix for prefix, _ in rpc.queries] == [True, True, False, False, False]
     assert rpc.query_ids == ["", "q1", "", "q3", "q3"] and len(rpc.leases) == 2
+    # One prefetch, as v1 counts them: the 4 full blocks and 1 checkpoint load.
+    stats = s.take_stats()
+    assert stats["prefetch_blocks"] == [5] and "pending_prefetches" not in stats
 
 
 def test_drifted_loading_query_is_answered_then_dropped():
@@ -301,11 +308,11 @@ class _Ready:
 
 
 def test_worker_registers_one_region_and_packs_spans():
-    layout = Layout((NsSpec(0, FULL4, 1, ("a", "b"), b"N" * 32, 64, 1, (0,)),), 4)
+    layout = Layout((NsSpec(0, FULL4, 1, ("a", "b"), b"N" * 32, 64, 1),), 4)
     rpc = _Rpc()
     w = Worker(layout, rpc, "inst", 0, 1, 3, object, _Ready)
     regions = {"a": Region(b"h" * 64, 10_000, 100), "b": Region(b"h" * 64, 10_000, 5_000)}
-    w.register({"a": "A", "b": "B"}, {"a": 64, "b": 128}, lambda t: regions[t.lower()])
+    w.register({"a": "A", "b": "B"}, {"a": 64, "b": 128}, lambda t: regions[t.lower()], [0])
     metas, regs, backend = rpc.registered
     assert len(regs) == 1 and backend == "kernel" and metas[0]["rank"] == 0
     # Two requests of one step computed the same block: one write.
@@ -332,11 +339,11 @@ class _State:
 
 
 def test_worker_loads_a_step_in_one_rpc_and_fails_it_as_a_whole():
-    layout = Layout((NsSpec(0, FULL4, 1, ("a",), b"N" * 32, 64, 1, (0,)),), 4)
+    layout = Layout((NsSpec(0, FULL4, 1, ("a",), b"N" * 32, 64, 1),), 4)
     rpc = _Rpc()
     states = [_State(1), _State(-1)]
     w = Worker(layout, rpc, "inst", 0, 1, 0, lambda: states.pop(0), _Ready)
-    w.register({"a": "A"}, {"a": 64}, lambda t: Region(b"h" * 64, 10_000, 0))
+    w.register({"a": "A"}, {"a": 64}, lambda t: Region(b"h" * 64, 10_000, 0), [0])
     step = StepPlan(
         loads=[
             LoadPlan("r1", [b"l1"], [(0, b"x" * 32, 1)]),
@@ -349,4 +356,7 @@ def test_worker_loads_a_step_in_one_rpc_and_fails_it_as_a_whole():
     assert w.poll() == ({"r1", "r2", "r3"}, {"r3"})
     w.start(StepPlan(loads=[LoadPlan("r4", [b"l4"], [(0, b"w" * 32, 4)])]))
     assert w.poll() == ({"r4"}, {"r4"})
+    stats = w.take_stats()
+    assert stats["load_blocks"] == [3, 1]
+    assert (stats["load_success_count"], stats["load_failure_count"]) == (1, 1)
     w.shutdown()

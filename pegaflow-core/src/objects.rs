@@ -11,8 +11,9 @@
 //! Only the ranks in `saver_rank` save. The engine cuts their bytes into one
 //! slot per `(saver, layer)`, in pinned memory on the saver's NUMA node, and
 //! hands them to the insert worker like a KV save; the object seals once every
-//! slot arrived. Two savers of one slice (MLA over two NUMA nodes) keep two
-//! copies, and a load reads the copy on its own node when there is one.
+//! slot arrived. Two savers of one slice (the client picks one per CPU socket)
+//! keep two copies, and a load reads the nearest: its own NUMA node, else its
+//! own socket, else the first.
 //!
 //! Sealed objects are [`SealedBlock`]s under the [`BlockKey`]
 //! `(hex(namespace), prefix)`, so they share the pinned pool, LRU eviction,
@@ -227,7 +228,7 @@ impl Shape {
     }
 
     /// Pinned base and allocation of the slot `rank` reads in each layer of
-    /// `block`, from the copy on `numa` when there is one.
+    /// `block`, from the copy nearest `numa`.
     fn read_slots(
         &self,
         rank: u32,
@@ -246,11 +247,21 @@ impl Shape {
             .filter(|&s| self.slice(self.savers[s]) == slice)
             .collect();
         // Registration checked that savers cover every slice.
+        let socket = numa.socket();
         let saver = copies
             .iter()
             .copied()
-            .find(|&s| block.slot_numas()[self.slot(0, s)] == numa)
-            .unwrap_or(copies[0]);
+            .min_by_key(|&s| {
+                let at = block.slot_numas()[self.slot(0, s)];
+                if at == numa {
+                    0
+                } else if socket.is_some() && at.socket() == socket {
+                    1
+                } else {
+                    2
+                }
+            })
+            .expect("savers cover every slice");
         (0..self.layers)
             .map(|l| {
                 let raw = &block.slots()[self.slot(l, saver)];

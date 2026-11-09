@@ -9,13 +9,21 @@ Spans: vLLM 0.32 puts the whole KV cache of a rank in one allocation, layer
 ``l`` of block ``b`` at ``offset_l + b * block_stride_l``. One object (one
 block of one namespace) is one ``page_bytes`` span per layer.
 
-Loads: one ``load_objects`` per step for every request it loads, as v1.
+Savers: per slice, one rank on each CPU socket saves (``NsSpec.savers``), so
+a load reads a copy on its own socket.
+
+Loads: one ``load_objects`` per step for every request it loads, as v1. Every
+failure is reported as a failed receive; vLLM applies its
+``kv_load_failure_policy`` (recompute, or fail the request).
 
 Saves are asynchronous: ``save`` marks the compute stream and queues the job;
 a saver thread waits for the marks, then sends every queued job in one
 ``save_objects`` (the server replies once its copy is done). The scheduler
 keeps the blocks pinned until every worker reports the step through
 ``saved_through``.
+
+Stats: each load and save RPC is recorded under v1's
+``PegaKVConnectorStats`` keys (``take_stats``).
 """
 
 from __future__ import annotations
@@ -24,6 +32,7 @@ import collections
 import logging
 import queue
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -88,8 +97,9 @@ class Worker:
         self._mark_compute = mark_compute
         self._transfer_backend = transfer_backend
         self._geo: list[_NsGeometry] = []
-        self._saver_of = [rank in ns.savers for ns in layout.namespaces]
-        self._loads: list[tuple[Any, list[str]]] = []  # one load state per step
+        self._saver_of: list[bool] = []
+        # One load state per step: (state, req ids, start, blocks).
+        self._loads: list[tuple[Any, list[str], float, int]] = []
         self._failed: set[str] = set()
         # Async saves complete in submit order (one saver thread).
         self._cv = threading.Condition()
@@ -97,6 +107,7 @@ class Worker:
         self._completed = 0
         self._job_steps: collections.deque[tuple[int, int]] = collections.deque()
         self._last_step = -1
+        self._stats: dict[str, Any] = {}  # guarded by _cv (the saver thread records)
         self._stop = threading.Event()
         self._jobs: queue.SimpleQueue[_SaveJob | None] = queue.SimpleQueue()
         self._saver = threading.Thread(
@@ -110,9 +121,10 @@ class Worker:
         kv_caches: dict[str, Any],
         block_strides: dict[str, int],
         share: Callable[[Any], Region],
+        sockets: list[int],
     ) -> None:
         """``block_strides``: layer -> bytes between its blocks (vLLM
-        ``KVCacheTensor.block_stride``)."""
+        ``KVCacheTensor.block_stride``). ``sockets``: every rank's CPU socket."""
         handles: dict[bytes, int] = {}
         regions: list[tuple[bytes, int, str]] = []
         metas = []
@@ -147,15 +159,19 @@ class Worker:
                     ns.page_bytes,
                 )
             )
-            metas.append(ns.meta(self._world_size, self._rank, self._device_id))
+            savers = ns.savers(sockets)
+            self._saver_of.append(self._rank in savers)
+            metas.append(ns.meta(self._world_size, self._rank, self._device_id, savers))
         self._rpc.register_context_v2(self._instance_id, metas, regions, self._transfer_backend)
         logger.info(
-            "[PegaKVConnectorV2] registered instance=%s rank=%d device=%d namespaces=%d regions=%d",
+            "[PegaKVConnectorV2] registered instance=%s rank=%d device=%d regions=%d "
+            "sockets=%s savers=%s",
             self._instance_id,
             self._rank,
             self._device_id,
-            len(metas),
             len(regions),
+            sockets,
+            [m["saver_rank"] for m in metas],
         )
 
     def _spans(self, i: int, block_ids: list[int]) -> tuple[int, list[bytes]]:
@@ -183,7 +199,7 @@ class Worker:
     # ----------------------------------------------------------------- loads
     def start(self, plan: StepPlan) -> None:
         """One ``load_objects`` for all of this step's loads, as v1 does: a
-        failure fails every request of the step, and vLLM recomputes them."""
+        failure fails every request of the step."""
         req_ids: list[str] = []
         blocks: list[tuple[int, bytes, int]] = []
         leases: list[bytes] = []
@@ -196,6 +212,7 @@ class Worker:
             leases.extend(lp.leases)
         if not req_ids:
             return
+        start = time.perf_counter()
         try:
             state = self._new_load_state()
             self._rpc.load_objects(
@@ -209,23 +226,27 @@ class Worker:
         except Exception as e:
             logger.warning("[PegaKVConnectorV2] load failed reqs=%s: %r", req_ids, e)
             self._failed.update(req_ids)
+            self._record("load", time.perf_counter() - start, len(blocks), False)
             return
-        self._loads.append((state, req_ids))
+        self._loads.append((state, req_ids, start, len(blocks)))
 
     def poll(self) -> tuple[set[str], set[str]]:
         """(finished_recving, failed_recving); failed ones are in both."""
         finished: set[str] = set()
         pending = []
-        for state, req_ids in self._loads:
+        for load in self._loads:
+            state, req_ids, start, n_blocks = load
             if not state.is_ready():
-                pending.append((state, req_ids))
+                pending.append(load)
                 continue
             finished.update(req_ids)
-            if state.get_state() != 1:
+            ok = state.get_state() == 1
+            if not ok:
                 logger.warning(
                     "[PegaKVConnectorV2] load state=%s reqs=%s", state.get_state(), req_ids
                 )
                 self._failed.update(req_ids)
+            self._record("load", time.perf_counter() - start, n_blocks, ok)
         self._loads = pending
         failed, self._failed = self._failed, set()
         return finished | failed, failed
@@ -269,10 +290,12 @@ class Worker:
                     if w[0] not in seen:  # one write per object
                         seen.add(w[0])
                         writes.append(w)
+            start, ok = time.perf_counter(), False
             try:
                 for j in batch:
                     j.ready.synchronize()
                 self._rpc.save_objects(self._instance_id, self._rank, writes)
+                ok = True
             except ValueError as e:
                 # Rejected by the server before or after its copy: a future miss.
                 logger.warning("[PegaKVConnectorV2] save rejected: %s", e)
@@ -284,9 +307,27 @@ class Worker:
                     e,
                 )
                 self._stop.wait(self.SAVE_QUIESCE_S)
+            self._record("save", time.perf_counter() - start, len(writes), ok)
             with self._cv:
                 self._completed = batch[-1].seq
                 self._cv.notify_all()
+
+    # ----------------------------------------------------------------- stats
+    def _record(self, op: str, seconds: float, blocks: int, ok: bool) -> None:
+        with self._cv:
+            st = self._stats
+            st.setdefault(f"{op}_duration", []).append(seconds)
+            st.setdefault(f"{op}_blocks", []).append(blocks)
+            key = f"{op}_{'success' if ok else 'failure'}_count"
+            st[key] = st.get(key, 0) + 1
+
+    def take_stats(self) -> dict[str, Any]:
+        """Stats since the last call, as ``PegaKVConnectorStats`` data."""
+        with self._cv:
+            stats, self._stats = self._stats, {}
+            if self._submitted > self._completed:
+                stats["pending_save_requests"] = self._submitted - self._completed
+        return stats
 
     def shutdown(self) -> None:
         target = self._submitted
