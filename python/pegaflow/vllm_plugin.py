@@ -26,6 +26,13 @@ def register() -> None:
             "PegaKVConnector",
         )
     with contextlib.suppress(ValueError):
+        # MultiConnector looks children up by name to rebuild their stats.
+        KVConnectorFactory.register_connector(
+            "PegaKVConnectorV2",
+            "pegaflow.connector_v2",
+            "PegaKVConnectorV2",
+        )
+    with contextlib.suppress(ValueError):
         KVConnectorFactory.register_connector(
             "NoopKVConnector",
             "pegaflow.connector",
