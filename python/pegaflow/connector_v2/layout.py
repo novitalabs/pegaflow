@@ -25,6 +25,8 @@ class Unsupported(RuntimeError):
 @dataclass(frozen=True)
 class Parallel:
     tp_size: int = 1
+    # CPU socket next to each TP rank's GPU; empty: all on one socket.
+    sockets: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -38,25 +40,14 @@ class NsSpec:
     namespace: bytes  # 32-byte digest
     page_bytes: int  # one rank's bytes of one layer of one block
     slices: int  # slices one layer is split into across TP
+    savers: tuple[int, ...]  # ranks that save this namespace
 
     def keys(self, block_hashes: Sequence[bytes]) -> list[bytes]:
         """32-byte object prefixes of this group's blocks."""
         k = self.hash_scale
         return [_digest(h) for h in block_hashes[k - 1 :: k]]
 
-    def savers(self, sockets: Sequence[int]) -> list[int]:
-        """Ranks that save this namespace, given each rank's CPU socket: per
-        slice, the first rank holding it on each socket, so a load reads a
-        copy on its own socket. ``sockets`` is the same on every rank."""
-        replicas = len(sockets) // self.slices  # rank r holds slice r // replicas
-        out: dict[tuple[int, int], int] = {}
-        for r, socket in enumerate(sockets):
-            out.setdefault((r // replicas, socket), r)
-        return sorted(out.values())
-
-    def meta(
-        self, world_size: int, rank: int, device_id: int, savers: Sequence[int]
-    ) -> dict[str, Any]:
+    def meta(self, world_size: int, rank: int, device_id: int) -> dict[str, Any]:
         """``NamespaceMeta`` for ``register_context_v2``."""
         bt = self.group.block_tokens
         # The server only uses local_hidden x block_size (one rank's slice);
@@ -71,7 +62,7 @@ class NsSpec:
             "bytes_per_block": self.page_bytes * self.slices,
             "block_size": block_size,
             "local_hidden": self.page_bytes // block_size,
-            "saver_rank": list(savers),
+            "saver_rank": list(self.savers),
         }
 
 
@@ -83,6 +74,16 @@ class Layout:
     @property
     def groups(self) -> list[sem.Group]:
         return [ns.group for ns in self.namespaces]
+
+
+def _savers(slices: int, sockets: Sequence[int]) -> tuple[int, ...]:
+    """Per slice, the first rank holding it on each CPU socket, so a load
+    reads a copy on its own socket. Rank r holds slice r // replicas."""
+    replicas = len(sockets) // slices
+    out: dict[tuple[int, int], int] = {}
+    for r, socket in enumerate(sockets):
+        out.setdefault((r // replicas, socket), r)
+    return tuple(sorted(out.values()))
 
 
 def _digest(h: bytes) -> bytes:
@@ -154,12 +155,16 @@ def build_layout(kv_cache_config: Any, par: Parallel, identity: dict[str, Any]) 
         hbs = hash_bs or bt
         if bt % hbs:
             raise Unsupported(f"group {gid}: block_size {bt} is not a multiple of hash {hbs}")
+        savers = _savers(n_slices, par.sockets or (0,) * par.tp_size)
         doc = {
             **identity,
             "gid": gid,
             "spec": repr(kv_group.kv_cache_spec),
             "kind": [group.kind, bt, group.window_tokens],
             "slices": n_slices,
+            # The savers fix the object's slot layout: placements that save
+            # different copies cannot read each other's objects.
+            "savers": savers,
             "kv_cache_layout": getattr(kv_cache_config, "kv_cache_layout", None),
         }
         blob = json.dumps(doc, sort_keys=True, default=str).encode()
@@ -172,6 +177,7 @@ def build_layout(kv_cache_config: Any, par: Parallel, identity: dict[str, Any]) 
                 namespace=hashlib.sha256(blob).digest(),
                 page_bytes=page,
                 slices=n_slices,
+                savers=savers,
             )
         )
     out.sort(key=lambda ns: ns.group.kind != sem.FULL)

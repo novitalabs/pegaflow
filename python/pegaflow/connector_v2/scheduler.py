@@ -168,6 +168,7 @@ class Scheduler:
             logger.warning(
                 "[PegaKVConnectorV2] lookup failed req=%s", request.request_id, exc_info=True
             )
+            self._prefetching.pop(request.request_id, None)  # cancelled, as v1
             hit = None
         # The lookup is over: release every answer the hit does not keep.
         kept = set(hit.leases.values()) if hit is not None else set()
@@ -283,9 +284,10 @@ class Scheduler:
             present[i] = self._members(rec, i, keys[i], local, probe, leases, 0)
         if windows and sem.resolve(groups, present, n_tokens) < points[0]:
             # As v1: an earlier point needs another window, so ask every
-            # point back to the local hit. This answer's lease replaces the
-            # first one, which the lookup's end releases.
+            # point back to the local hit. This answer replaces the first,
+            # whose lease the lookup's end releases.
             for i in windows:
+                leases.pop(i, None)
                 present[i] = self._members(rec, i, keys[i], local, points, leases, 1)
 
         p = sem.resolve(groups, present, n_tokens)
@@ -353,7 +355,7 @@ class Scheduler:
                     break
         if wanted is None:
             logger.warning(
-                "[PegaKVConnectorV2] req=%s cannot load %d external tokens, recompute",
+                "[PegaKVConnectorV2] req=%s cannot load %d external tokens: load failed",
                 request.request_id,
                 num_external,
             )

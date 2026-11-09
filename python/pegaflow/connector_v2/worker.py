@@ -97,7 +97,7 @@ class Worker:
         self._mark_compute = mark_compute
         self._transfer_backend = transfer_backend
         self._geo: list[_NsGeometry] = []
-        self._saver_of: list[bool] = []
+        self._saver_of = [rank in ns.savers for ns in layout.namespaces]
         # One load state per step: (state, req ids, start, blocks).
         self._loads: list[tuple[Any, list[str], float, int]] = []
         self._failed: set[str] = set()
@@ -121,10 +121,9 @@ class Worker:
         kv_caches: dict[str, Any],
         block_strides: dict[str, int],
         share: Callable[[Any], Region],
-        sockets: list[int],
     ) -> None:
         """``block_strides``: layer -> bytes between its blocks (vLLM
-        ``KVCacheTensor.block_stride``). ``sockets``: every rank's CPU socket."""
+        ``KVCacheTensor.block_stride``)."""
         handles: dict[bytes, int] = {}
         regions: list[tuple[bytes, int, str]] = []
         metas = []
@@ -159,19 +158,15 @@ class Worker:
                     ns.page_bytes,
                 )
             )
-            savers = ns.savers(sockets)
-            self._saver_of.append(self._rank in savers)
-            metas.append(ns.meta(self._world_size, self._rank, self._device_id, savers))
+            metas.append(ns.meta(self._world_size, self._rank, self._device_id))
         self._rpc.register_context_v2(self._instance_id, metas, regions, self._transfer_backend)
         logger.info(
-            "[PegaKVConnectorV2] registered instance=%s rank=%d device=%d regions=%d "
-            "sockets=%s savers=%s",
+            "[PegaKVConnectorV2] registered instance=%s rank=%d device=%d namespaces=%d regions=%d",
             self._instance_id,
             self._rank,
             self._device_id,
+            len(metas),
             len(regions),
-            sockets,
-            [m["saver_rank"] for m in metas],
         )
 
     def _spans(self, i: int, block_ids: list[int]) -> tuple[int, list[bytes]]:
@@ -325,8 +320,6 @@ class Worker:
         """Stats since the last call, as ``PegaKVConnectorStats`` data."""
         with self._cv:
             stats, self._stats = self._stats, {}
-            if self._submitted > self._completed:
-                stats["pending_save_requests"] = self._submitted - self._completed
         return stats
 
     def shutdown(self) -> None:

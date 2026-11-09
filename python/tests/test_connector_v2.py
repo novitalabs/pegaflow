@@ -84,16 +84,28 @@ def test_layout_orders_full_first_and_splits_heads():
     layout = build_layout(cfg, Parallel(tp_size=4), {"model": "m"})
     full, win = layout.namespaces
     assert (full.gid, full.group, win.group) == (1, FULL4, WIN)
-    # Two head shards over TP4: ranks 0,1 hold shard 0; 2,3 shard 1. One
-    # saver per shard per socket: a replica on the other socket saves too.
-    assert full.savers([0, 0, 1, 1]) == [0, 2]
-    assert full.savers([0, 1, 0, 1]) == [0, 1, 2, 3]
-    # One replicated slice (MLA): a copy on each socket.
-    assert _ns(0, FULL4, b"M").savers([0, 0, 1, 1]) == [0, 2]
-    meta = full.meta(world_size=4, rank=3, device_id=7, savers=[0, 2])
+    # Two head shards over TP4: ranks 0,1 hold shard 0; 2,3 shard 1.
+    assert full.savers == (0, 2)
+    meta = full.meta(world_size=4, rank=3, device_id=7)
     assert meta["bytes_per_block"] == 2048 and meta["local_hidden"] * meta["block_size"] == 1024
     assert len(full.namespace) == 32 and full.namespace != win.namespace
     assert layout.step == 4
+
+
+@pytest.mark.parametrize(
+    "sockets,savers",
+    [
+        pytest.param((0, 0, 1, 1), (0, 2), id="replicas-on-one-socket"),
+        pytest.param((0, 1, 0, 1), (0, 1, 2, 3), id="replicas-across-sockets"),
+    ],
+)
+def test_layout_saves_each_shard_once_per_socket(sockets, savers):
+    cfg = _Config([_Group(["f0"], FullAttentionSpec(4, 1024, max_tp_shards=2))])
+    (ns,) = build_layout(cfg, Parallel(4, sockets), {}).namespaces
+    assert ns.savers == savers
+    # Other savers lay objects out differently: another namespace.
+    (one,) = build_layout(cfg, Parallel(4), {}).namespaces
+    assert (ns.namespace == one.namespace) == (savers == one.savers)
 
 
 def test_layout_needs_a_full_group():
@@ -159,7 +171,7 @@ class Req:
 
 
 def _ns(gid: int, group: sem.Group, tag: bytes) -> NsSpec:
-    return NsSpec(gid, group, 1, ("l",), tag * 32, 64, 1)
+    return NsSpec(gid, group, 1, ("l",), tag * 32, 64, 1, (0,))
 
 
 def _hashes(n: int) -> list[bytes]:
@@ -308,11 +320,11 @@ class _Ready:
 
 
 def test_worker_registers_one_region_and_packs_spans():
-    layout = Layout((NsSpec(0, FULL4, 1, ("a", "b"), b"N" * 32, 64, 1),), 4)
+    layout = Layout((NsSpec(0, FULL4, 1, ("a", "b"), b"N" * 32, 64, 1, (0,)),), 4)
     rpc = _Rpc()
     w = Worker(layout, rpc, "inst", 0, 1, 3, object, _Ready)
     regions = {"a": Region(b"h" * 64, 10_000, 100), "b": Region(b"h" * 64, 10_000, 5_000)}
-    w.register({"a": "A", "b": "B"}, {"a": 64, "b": 128}, lambda t: regions[t.lower()], [0])
+    w.register({"a": "A", "b": "B"}, {"a": 64, "b": 128}, lambda t: regions[t.lower()])
     metas, regs, backend = rpc.registered
     assert len(regs) == 1 and backend == "kernel" and metas[0]["rank"] == 0
     # Two requests of one step computed the same block: one write.
@@ -339,11 +351,11 @@ class _State:
 
 
 def test_worker_loads_a_step_in_one_rpc_and_fails_it_as_a_whole():
-    layout = Layout((NsSpec(0, FULL4, 1, ("a",), b"N" * 32, 64, 1),), 4)
+    layout = Layout((NsSpec(0, FULL4, 1, ("a",), b"N" * 32, 64, 1, (0,)),), 4)
     rpc = _Rpc()
     states = [_State(1), _State(-1)]
     w = Worker(layout, rpc, "inst", 0, 1, 0, lambda: states.pop(0), _Ready)
-    w.register({"a": "A"}, {"a": 64}, lambda t: Region(b"h" * 64, 10_000, 0), [0])
+    w.register({"a": "A"}, {"a": 64}, lambda t: Region(b"h" * 64, 10_000, 0))
     step = StepPlan(
         loads=[
             LoadPlan("r1", [b"l1"], [(0, b"x" * 32, 1)]),

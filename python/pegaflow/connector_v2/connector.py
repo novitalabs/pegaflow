@@ -94,7 +94,7 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
             from vllm.distributed.parallel_state import get_tp_group
 
             tp_rank = get_tp_group().rank_in_group
-        par = Parallel(pc.tensor_parallel_size)
+        par = Parallel(pc.tensor_parallel_size, _tp_sockets(pc.tensor_parallel_size))
         mc, cc = vllm_config.model_config, vllm_config.cache_config
         identity = {
             "model": mc.model,
@@ -116,7 +116,7 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
             role.name,
             self._instance_id,
             self._rpc.endpoint(),
-            [(ns.gid, ns.group, ns.slices) for ns in self._layout.namespaces],
+            [(ns.gid, ns.group, ns.slices, ns.savers) for ns in self._layout.namespaces],
         )
 
         self._scheduler: Scheduler | None = None
@@ -222,7 +222,7 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
             for t in self._kv_cache_config.kv_cache_tensors
             for name in t.layers
         }
-        self._worker.register(kv_caches, strides, _share, _tp_sockets())
+        self._worker.register(kv_caches, strides, _share)
 
     def start_load_kv(self, forward_context: Any, **kwargs: Any) -> None:
         assert self._worker is not None
@@ -327,33 +327,40 @@ def _server_device_id() -> int:
     return int(entries[local])
 
 
-def _tp_sockets() -> list[int]:
-    """Every TP rank's CPU socket, gathered over the TP group."""
-    import torch.distributed as dist
-    from vllm.distributed.parallel_state import get_tp_group
+def _tp_sockets(tp_size: int) -> tuple[int, ...]:
+    """CPU socket (``physical_package_id``) next to each TP rank's GPU, from
+    NVML and sysfs without touching CUDA, so the scheduler and every worker
+    compute the same list. Unknown: all 0, one socket."""
+    from vllm.platforms import current_platform
+    from vllm.third_party import pynvml
 
-    group = get_tp_group()
-    out: list[Any] = [None] * group.world_size
-    dist.all_gather_object(out, _gpu_socket(), group=group.cpu_group)
-    return [int(s) for s in out]
-
-
-def _gpu_socket() -> int:
-    """CPU socket (``physical_package_id``) next to this worker's GPU; 0 when
-    sysfs does not say, which makes every rank one socket."""
-    p = torch.cuda.get_device_properties(torch.cuda.current_device())
-    pci = f"{p.pci_domain_id:04x}:{p.pci_bus_id:02x}:{p.pci_device_id:02x}.0"
     try:
-        with open(f"/sys/bus/pci/devices/{pci}/numa_node") as f:
-            node = int(f.read())
-        if node < 0:
-            return 0
-        with open(f"/sys/devices/system/node/node{node}/cpulist") as f:
-            cpu = f.read().strip().split(",")[0].split("-")[0]
-        with open(f"/sys/devices/system/cpu/cpu{cpu}/topology/physical_package_id") as f:
-            return int(f.read())
-    except (OSError, ValueError):
+        pynvml.nvmlInit()
+        try:
+            out = []
+            for r in range(tp_size):
+                gpu = current_platform.device_id_to_physical_device_id(r)
+                bus = pynvml.nvmlDeviceGetPciInfo(pynvml.nvmlDeviceGetHandleByIndex(gpu)).busId
+                out.append(_pci_socket(bus.decode() if isinstance(bus, bytes) else bus))
+            return tuple(out)
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception:
+        logger.warning("[PegaKVConnectorV2] GPU sockets unknown: one socket", exc_info=True)
+        return (0,) * tp_size
+
+
+def _pci_socket(bus_id: str) -> int:
+    """Socket of a PCI device (NVML ``00000000:61:00.0``) via its NUMA node."""
+    dev = bus_id.lower()[-12:]  # sysfs names it 0000:61:00.0
+    with open(f"/sys/bus/pci/devices/{dev}/numa_node") as f:
+        node = int(f.read())
+    if node < 0:
         return 0
+    with open(f"/sys/devices/system/node/node{node}/cpulist") as f:
+        cpu = f.read().strip().split(",")[0].split("-")[0]
+    with open(f"/sys/devices/system/cpu/cpu{cpu}/topology/physical_package_id") as f:
+        return int(f.read())
 
 
 def _mark_compute() -> torch.cuda.Event:
