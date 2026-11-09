@@ -40,6 +40,7 @@ pegaflow/
 | PyO3 bindings | `python/src/lib.rs` |
 | Python package and helpers | `python/pegaflow/` |
 | vLLM connector | `python/pegaflow/connector/` |
+| vLLM connector on RPC V2 | `python/pegaflow/connector_v2/` |
 
 ## Key Entry Points
 
@@ -56,6 +57,7 @@ pegaflow/
 - `python/src/lib.rs`: PyO3 bindings
 - `python/pegaflow/connector/scheduler.py`: vLLM scheduler-side connector
 - `python/pegaflow/connector/worker.py`: vLLM worker-side connector
+- `python/pegaflow/connector_v2/`: vLLM connector on RPC V2 (`PegaKVConnectorV2`)
 - `python/pegaflow/pegaflow.pyi`: Python type stubs
 
 ## Build, Check, Test

@@ -99,6 +99,7 @@ cargo bench --bench uds_latency
 7. **python/** (Rust/PyO3 + Python): Python package (`pegaflow-llm` on PyPI)
    - `src/lib.rs`: PyO3 bindings exposing `PegaEngine` and gRPC client
    - `pegaflow/connector/`: vLLM v1 KV connector (scheduler + worker split)
+   - `pegaflow/connector_v2/`: vLLM KV connector on RPC V2 objects (`semantics.py` resume rules, `layout.py` cache groups to namespaces)
    - `pegaflow/ipc_wrapper.py`: CUDA IPC handle wrapper
    - CLI binaries: `pegaflow-server`, `pegaflow-metaserver` (installed via pip)
 
@@ -196,3 +197,4 @@ vLLM Worker <--gRPC--> PegaEngine Server <--CUDA IPC--> GPU Memory
 - `python/pegaflow/pegaflow.pyi`: Type stubs for PyO3 bindings
 - `python/pegaflow/connector/scheduler.py`: vLLM scheduler-side connector
 - `python/pegaflow/connector/worker.py`: vLLM worker-side connector
+- `python/pegaflow/connector_v2/`: vLLM connector on RPC V2 (`PegaKVConnectorV2`)

@@ -35,6 +35,19 @@ A lease is consumed once per `LoadObjects` call that carries it and is released 
 
 Poll a `Loading` answer with the returned `query_id` and the same keys.
 
+## vLLM Connector
+
+`python/pegaflow/connector_v2` (`kv_connector="PegaKVConnectorV2"`, `kv_connector_module_path="pegaflow.connector_v2"`) is the vLLM client of these RPCs. It handles TP only, with full attention, MLA, sliding-window and Mamba (`align`) cache groups.
+
+- Each vLLM cache group is one namespace. The 32-byte namespace hashes the model identity and the group spec. The object prefix is the vLLM block hash of the group's last token block.
+- `semantics.py` says what resuming at token `p` needs from each group: every block for full attention, the last `W - 1` tokens for a window, and the one state at `p` for a checkpoint. `resolve` picks the largest `p` that every group can back.
+- Full groups take a prefix query from vLLM's local hit. Window and checkpoint groups take one membership query over the blocks that the largest candidate resume points need.
+- Every load is asynchronous. A failed load is reported as a failed receive, and vLLM recomputes the request, so run with `kv_load_failure_policy=recompute`.
+- Saves follow `semantics.saveable`. Mamba states are saved only from vLLM's `boundary_state_offloads`. A saved block stays pinned in vLLM's block pool until every rank reports the save done.
+- vLLM 0.32 keeps a rank's whole KV cache in one allocation, so each rank registers one region. The span of block `b` in layer `l` is `offset_l + b × block_stride_l` with length `page_size_bytes`.
+
+Run the E2E suite with `PEGAFLOW_E2E_CONNECTOR=v2` to use it.
+
 ## Known Issues and Non-goals
 
 - An RDMA fetch moves an object slot by slot, so both MLA copies cross the network. The result is correct, but the traffic is doubled.
