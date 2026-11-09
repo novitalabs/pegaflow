@@ -190,6 +190,7 @@ message HealthResponse {
 // mappings. Stream events are reserved for future server→client hints.
 message SessionRequest {
   string instance_id = 1;
+  string namespace   = 2;
 }
 
 message SessionEvent {

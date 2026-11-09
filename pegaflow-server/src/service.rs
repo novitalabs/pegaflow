@@ -1089,16 +1089,18 @@ impl Engine for GrpcEngineService {
         &self,
         request: Request<SessionRequest>,
     ) -> Result<Response<Self::SessionStream>, Status> {
-        let req = request.into_inner();
-        let instance_id = req.instance_id;
+        let SessionRequest {
+            instance_id,
+            namespace,
+        } = request.into_inner();
         if instance_id.is_empty() {
             return Err(Status::invalid_argument("instance_id must not be empty"));
         }
 
         let token = self.session_registry.install(instance_id.clone());
         info!(
-            "Session opened: instance_id={} token={}",
-            instance_id, token
+            "Session opened: instance_id={} namespace={} token={}",
+            instance_id, namespace, token
         );
 
         // Channel capacity is 1: we don't emit events yet, and a tight capacity

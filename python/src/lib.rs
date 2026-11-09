@@ -834,10 +834,18 @@ impl EngineRpcClient {
     /// Call once per client, typically from the scheduler role. Calling
     /// again replaces the previous stream (the old Streaming drops and the
     /// server's old session is superseded by the new one).
-    #[pyo3(signature = (instance_id))]
-    fn start_session_watcher(&self, py: Python<'_>, instance_id: String) -> PyResult<()> {
+    #[pyo3(signature = (instance_id, namespace))]
+    fn start_session_watcher(
+        &self,
+        py: Python<'_>,
+        instance_id: String,
+        namespace: String,
+    ) -> PyResult<()> {
         let mut client = self.client.clone();
-        let req = SessionRequest { instance_id };
+        let req = SessionRequest {
+            instance_id,
+            namespace,
+        };
         let stream = self.call(py, "session", move |_| async move {
             let resp = client.session(req).await?;
             Ok(resp.into_inner())

@@ -386,7 +386,7 @@ class EngineRpcClient:
         """
         ...
 
-    def start_session_watcher(self, instance_id: str) -> None:
+    def start_session_watcher(self, instance_id: str, namespace: str) -> None:
         """Open a liveness Session stream to the engine server.
 
         The client holds a server-streaming RPC open for the lifetime of

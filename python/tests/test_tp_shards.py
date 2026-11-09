@@ -155,8 +155,11 @@ def test_scheduler_opens_a_session_on_every_server(monkeypatch):
 
     connector = PegaKVConnector(_vllm_config(), KVConnectorRole.SCHEDULER)
     try:
-        first.start_session_watcher.assert_called_once_with("instance")
-        second.start_session_watcher.assert_called_once_with("instance")
+        for index, client in enumerate((first, second)):
+            client.start_session_watcher.assert_called_once()
+            instance_id, namespace = client.start_session_watcher.call_args.args
+            assert instance_id == "instance"
+            assert namespace.endswith(f":tp-shard-{index}-of-2")
     finally:
         connector.shutdown()
 

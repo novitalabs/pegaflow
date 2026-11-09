@@ -233,8 +233,10 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
             # stream per vllm replica is enough — if any tp worker crashes,
             # the scheduler dies too, closing this stream and triggering
             # server-side cleanup of the instance's CUDA IPC mappings.
-            for client in query_clients:
-                client.start_session_watcher(instance_id)
+            for index, client in enumerate(query_clients):
+                client.start_session_watcher(
+                    instance_id, tp_shards.namespace(base_namespace, index)
+                )
         else:
             self._worker = WorkerConnector(
                 self._ctx,

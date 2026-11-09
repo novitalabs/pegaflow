@@ -276,6 +276,7 @@ impl MockVllmRpcHarness {
     pub(crate) async fn open_session(&mut self) -> SessionRpcExchange {
         let request = SessionRequest {
             instance_id: INSTANCE_ID.to_string(),
+            namespace: NAMESPACE.to_string(),
         };
         let stream = self
             .scheduler
