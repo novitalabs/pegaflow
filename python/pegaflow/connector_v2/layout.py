@@ -25,7 +25,6 @@ class Unsupported(RuntimeError):
 @dataclass(frozen=True)
 class Parallel:
     tp_size: int = 1
-    tp_rank: int = 0  # 0 on the scheduler
 
 
 @dataclass(frozen=True)

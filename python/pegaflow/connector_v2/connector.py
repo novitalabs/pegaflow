@@ -92,7 +92,7 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
             from vllm.distributed.parallel_state import get_tp_group
 
             tp_rank = get_tp_group().rank_in_group
-        par = Parallel(pc.tensor_parallel_size, tp_rank)
+        par = Parallel(pc.tensor_parallel_size)
         mc, cc = vllm_config.model_config, vllm_config.cache_config
         identity = {
             "model": mc.model,

@@ -84,7 +84,7 @@ pub struct Span {
 
 impl Span {
     /// Wire size of one `ObjectSpans.span` element.
-    pub const WIRE_BYTES: usize = 16;
+    const WIRE_BYTES: usize = 16;
 
     /// Decode one element: `offset u64 LE` then `len u64 LE`, exactly 16 bytes.
     pub fn decode(raw: &[u8]) -> Result<Self, String> {
