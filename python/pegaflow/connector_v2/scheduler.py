@@ -7,12 +7,13 @@ Lookup, per request, with ``local`` = vLLM's own hit:
 
 1. Every full namespace gets a prefix query from block ``local / bt``. The
    shortest answer bounds every hit (``top``).
-2. Window and checkpoint namespaces get one membership query over the blocks
-   the resume points ``<= top`` need: every point for checkpoints, one block
+2. Window and checkpoint namespaces get a membership query over the blocks
+   the resume points ``<= top`` need. Checkpoints ask every point, one block
    each, as v1 asks membership over the whole prefix (checkpoints sit where
-   past prefill chunks happened to end); the few largest for windows
-   (``Policy.probe_points``). Blocks below the local hit are on the GPU
-   already and count as present.
+   past prefill chunks happened to end). Windows ask the top point first; if
+   no hit reaches it, they ask every point back to the local hit, as v1 does
+   because window hits are not monotone. Blocks below the local hit are on
+   the GPU already and count as present.
 3. ``semantics.resolve`` picks ``p``; only blocks past the local hit load.
 
 While the server fetches from SSD or peers a query answers Loading and vLLM
@@ -45,9 +46,6 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Policy:
     """Choices inside what semantics allows; can only narrow a hit."""
-
-    # Resume points (largest first) whose window blocks are queried.
-    probe_points: int = 2
 
     def accept(self, p: int) -> int:
         return p
@@ -102,8 +100,8 @@ class _Req:
     # as v1 keys prefetches by request id: SSD/RDMA fetches and the server's
     # failed-peer list follow the request across scheduler calls.
     query_ids: dict[int, str] = field(default_factory=dict)
-    # Per namespace index, the answer of the lookup in progress.
-    asks: dict[int, _Ask] = field(default_factory=dict)
+    # Per (namespace index, phase), the answer of the lookup in progress.
+    asks: dict[tuple[int, int], _Ask] = field(default_factory=dict)
     hit: _Hit | None = None
     saved_upto: int | None = None
     junction: int = 0  # where the stored full-attention prefix ends
@@ -172,7 +170,7 @@ class Scheduler:
         return hit.p - local, True
 
     def _query(
-        self, rec: _Req, i: int, keys: list[bytes], prefix: bool
+        self, rec: _Req, i: int, keys: list[bytes], prefix: bool, phase: int = 0
     ) -> tuple[list[int], bytes | None]:
         """Hit positions into ``keys`` and the lease; raises ``_Loading``.
 
@@ -181,12 +179,12 @@ class Scheduler:
         positions of the keys it was asked), then discarded, as v1 drops a
         drifted probe.
         """
-        ask = rec.asks.get(i)
+        ask = rec.asks.get((i, phase))
         if ask is not None and ask.hits is not None and (ask.keys, ask.prefix) != (keys, prefix):
             self._release([ask.lease] if ask.lease else [])
             ask = None
         if ask is None:
-            ask = rec.asks[i] = _Ask(list(keys), prefix)
+            ask = rec.asks[(i, phase)] = _Ask(list(keys), prefix)
         if ask.hits is None:
             ns = self._layout.namespaces[i].namespace
             query_id, ans = self._rpc.query_object(
@@ -204,8 +202,30 @@ class Scheduler:
             if hits and not ask.lease:
                 raise RuntimeError(f"namespace {i}: {len(hits)} hits without a lease")
         if (ask.keys, ask.prefix) != (keys, prefix):
-            return self._query(rec, i, keys, prefix)
+            return self._query(rec, i, keys, prefix, phase)
         return ask.hits, ask.lease
+
+    def _members(
+        self,
+        rec: _Req,
+        i: int,
+        keys: list[bytes],
+        local: int,
+        points: Sequence[int],
+        leases: dict[int, bytes],
+        phase: int,
+    ) -> frozenset[int]:
+        """Blocks of namespace ``i`` present for ``points``, GPU ones included."""
+        g = self._layout.namespaces[i].group
+        on_gpu = frozenset(range(min(local // g.block_tokens, len(keys))))
+        want = sorted({b for p in points for b in sem.needed(g, p)} - on_gpu)
+        want = [b for b in want if b < len(keys)]
+        if not want:
+            return on_gpu
+        hits, lease = self._query(rec, i, [keys[b] for b in want], False, phase)
+        if lease:
+            leases[i] = lease
+        return on_gpu | {want[h] for h in hits}
 
     def _lookup(self, rec: _Req, local: int) -> _Hit | None:
         request = rec.request
@@ -239,23 +259,18 @@ class Scheduler:
         points = [p for p in sem.candidates(groups, top, n_tokens) if p > local]
         if not points:
             return None
+        windows = [i for i, ns in enumerate(nss) if ns.group.kind == sem.WINDOW]
         for i, ns in enumerate(nss):
-            g = ns.group
-            if g.kind == sem.FULL:
+            if ns.group.kind == sem.FULL:
                 continue
-            on_gpu = frozenset(range(min(local // g.block_tokens, len(keys[i]))))
-            probe = (
-                points if g.kind == sem.CHECKPOINT else points[: max(self._policy.probe_points, 1)]
-            )
-            want = sorted({b for p in probe for b in sem.needed(g, p)} - on_gpu)
-            want = [b for b in want if b < len(keys[i])]
-            found: set[int] = set()
-            if want:
-                hits, lease = self._query(rec, i, [keys[i][b] for b in want], False)
-                if lease:
-                    leases[i] = lease
-                found = {want[h] for h in hits}
-            present[i] = on_gpu | found
+            probe = points if ns.group.kind == sem.CHECKPOINT else points[:1]
+            present[i] = self._members(rec, i, keys[i], local, probe, leases, 0)
+        if windows and sem.resolve(groups, present, n_tokens) < points[0]:
+            # As v1: an earlier point needs another window, so ask every
+            # point back to the local hit. This answer's lease replaces the
+            # first one, which the lookup's end releases.
+            for i in windows:
+                present[i] = self._members(rec, i, keys[i], local, points, leases, 1)
 
         p = sem.resolve(groups, present, n_tokens)
         p = max(0, min(int(self._policy.accept(p)), p))

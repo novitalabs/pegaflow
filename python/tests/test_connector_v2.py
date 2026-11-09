@@ -191,6 +191,19 @@ def test_hit_loads_only_past_local_and_releases_unused_leases():
     assert loaded == [(0, 12), (0, 13), (0, 14), (1, 23), (1, 24)]
 
 
+def test_window_falls_back_to_every_point_when_the_top_misses():
+    layout = _layout(FULL4, WIN)
+    full, win = layout.namespaces
+    hashes = _hashes(6)
+    # Full blocks back 20 tokens; the window holds only blocks 1 and 2, the
+    # window of p = 12 ([(12-7)//4, 3) = {1, 2}), far below the top point.
+    stored = {(full.namespace, h) for h in hashes[:5]} | {(win.namespace, h) for h in hashes[1:3]}
+    rpc = FakeRpc(stored)
+    s = Scheduler(layout, rpc, "inst")
+    assert s.get_num_new_matched_tokens(Req("r", 25, hashes), 0) == (12, True)
+    assert rpc.queries == [(True, 6), (False, 2), (False, 5)] and len(rpc.leases) == 2
+
+
 @pytest.mark.parametrize("ckpt_block,expected", [(3, 16), (0, 4)], ids=["near-top", "deep"])
 def test_hybrid_hit_asks_vllm_to_checkpoint_where_the_full_prefix_ends(ckpt_block, expected):
     layout = _layout(FULL4, CKPT4)
